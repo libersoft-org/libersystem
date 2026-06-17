@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mkimage.sh - assemble bootable LiberSystem images from the kernel ELF.
+# mkimage.sh - assemble bootable OS images from the kernel ELF.
 #
 # Subcommands:
 #   mkimage.sh iso <kernel-elf>          build a hybrid BIOS+UEFI CD image (.iso)

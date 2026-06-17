@@ -28,21 +28,39 @@ const USER_DS: u64 = (gdt::USER_DATA_SELECTOR | 3) as u64;
 // Initial user RFLAGS: only IF (interrupts enabled) and the reserved bit 1 set.
 const USER_RFLAGS: u64 = 0x202;
 
+// Address the embedded fault-probe program writes to. It is intentionally left
+// unmapped in every address space, so the write raises a page fault with this
+// value in CR2. Tests assert the recorded fault address matches.
+pub const FAULT_PROBE_ADDR: u64 = 0x0dea_d000;
+
 extern "C" {
 	fn user_enter(entry: u64, user_stack: u64, arg: u64);
 	fn user_return() -> !;
 	fn user_program_start();
 	fn user_program_end();
+	fn user_fault_program_start();
+	fn user_fault_program_end();
 }
 
 // Drop the calling thread into ring 3 at `entry` with `user_stack` and `arg` (the
 // arg is delivered to user code in rdi). Returns when the user thread calls
-// SYS_USER_EXIT.
+// SYS_USER_EXIT or faults out.
 //
 // SAFETY: `entry` and `user_stack` must be valid, USER-mapped addresses; the
 // per-CPU syscall MSRs must already be programmed.
 pub unsafe fn enter(entry: u64, user_stack: u64, arg: u64) {
+	// The excursion ends by longjmping through `user_return`, which unwinds with a
+	// plain `ret` rather than `iretq`. That restores the callee-saved registers
+	// but not RFLAGS, so the interrupt flag - cleared by the syscall or exception
+	// entry that ended the excursion - would stay masked on return. Capture the
+	// caller's interrupt state and restore it afterwards so the excursion is
+	// transparent.
+	let rflags: u64;
+	core::arch::asm!("pushfq", "pop {}", out(reg) rflags, options(preserves_flags));
 	user_enter(entry, user_stack, arg);
+	if rflags & (1 << 9) != 0 {
+		super::enable_interrupts();
+	}
 }
 
 // Return from ring 3 back to the kernel thread that called `enter`. Invoked by
@@ -56,6 +74,15 @@ pub fn exit_to_kernel() -> ! {
 pub fn program_bytes() -> &'static [u8] {
 	let start = user_program_start as *const () as usize;
 	let end = user_program_end as *const () as usize;
+	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
+}
+
+// The bytes of the embedded ring-3 fault-probe program (position-independent
+// machine code, copied into a USER page before entering). It writes to an
+// unmapped address to raise a page fault from ring 3.
+pub fn program_fault_bytes() -> &'static [u8] {
+	let start = user_fault_program_start as *const () as usize;
+	let end = user_fault_program_end as *const () as usize;
 	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
 }
 
@@ -147,4 +174,21 @@ global_asm!(
 	send = const crate::syscall::SYS_CHANNEL_SEND,
 	write = const crate::syscall::SYS_DEBUG_WRITE,
 	exit = const crate::syscall::SYS_USER_EXIT,
+);
+
+// Embedded ring-3 fault-probe program. Position-independent: it writes to an
+// unmapped address, which raises a page fault from ring 3. The kernel records the
+// fault and terminates the process, so control never returns into this code; the
+// trailing spin is only a guard against running off the end.
+global_asm!(
+	".text",
+	".global user_fault_program_start",
+	"user_fault_program_start:",
+	"mov rax, {addr}",
+	"mov qword ptr [rax], rax",
+	"2:",
+	"jmp 2b",
+	".global user_fault_program_end",
+	"user_fault_program_end:",
+	addr = const FAULT_PROBE_ADDR,
 );

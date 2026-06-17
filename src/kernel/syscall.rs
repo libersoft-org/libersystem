@@ -18,6 +18,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::vec::Vec;
 
 use crate::arch;
+use crate::fault::FaultInfo;
 use crate::mem::frame::PAGE_SIZE;
 use crate::object::channel::{Channel, ChannelError, Message};
 use crate::object::event::Event;
@@ -47,6 +48,7 @@ pub const SYS_TIMER_CREATE: u64 = 14;
 pub const SYS_TIMER_SET: u64 = 15;
 pub const SYS_TIMER_POLL: u64 = 16;
 pub const SYS_USER_EXIT: u64 = 17;
+pub const SYS_FAULT_INFO_GET: u64 = 18;
 
 // Error codes (small negatives, returned in the syscall result register).
 pub const ERR_BAD_SYSCALL: i64 = -1;
@@ -123,6 +125,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_TIMER_SET => sys_timer_set(a0, a1),
 		SYS_TIMER_POLL => sys_timer_poll(a0),
 		SYS_USER_EXIT => arch::usermode::exit_to_kernel(),
+		SYS_FAULT_INFO_GET => sys_fault_info_get(a0, a1),
 		_ => ERR_BAD_SYSCALL,
 	};
 	result as u64
@@ -368,6 +371,28 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 		}
 	}
 	n as i64
+}
+
+// Copy the current process's recorded fault into the caller's buffer. Returns 1
+// if a fault was recorded and copied, 0 if none was recorded, or an error. Lets a
+// supervisor inspect why a process was terminated.
+fn sys_fault_info_get(buf_ptr: u64, buf_len: u64) -> i64 {
+	let thread = match sched::current_thread() {
+		Some(t) => t,
+		None => return ERR_NO_THREAD,
+	};
+	let info = match thread.process().fault_info() {
+		Some(i) => i,
+		None => return 0,
+	};
+	let size = core::mem::size_of::<FaultInfo>() as u64;
+	if buf_len < size || !user_buf_ok(buf_ptr, size) {
+		return ERR_INVALID;
+	}
+	unsafe {
+		(buf_ptr as *mut FaultInfo).write_unaligned(info);
+	}
+	1
 }
 
 // Create an Event and install a handle to it in the caller's table.

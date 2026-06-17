@@ -8,6 +8,7 @@
 extern crate alloc;
 
 mod arch;
+mod fault;
 mod mem;
 mod object;
 mod panic;
@@ -135,6 +136,7 @@ fn boot_main() {
 	syscall_demo();
 	channel_ipc_demo();
 	userspace_demo();
+	userspace_fault_demo();
 	ipc_bench();
 	serial_println!("boot OK, halting");
 }
@@ -391,6 +393,61 @@ fn userspace_demo() {
 	match ep1.recv() {
 		Ok(message) => serial_println!("userspace: ring-3 program sent \"{}\" over a channel", core::str::from_utf8(&message.bytes).unwrap_or("<bad>")),
 		Err(_) => serial_println!("userspace: ERROR - no message from ring 3"),
+	}
+}
+
+// Statics the fault-probe body records into; read back by the demo and the test.
+static FAULT_GOT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+static FAULT_KIND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FAULT_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Kernel-thread body that drops to ring 3 running the fault-probe program. Before
+// entering it opens a MemoryObject - charging its Domain's memory and a handle -
+// and deliberately leaves it open, so that tearing the process down (when this
+// thread is reaped) is what refunds it. The ring-3 program writes to an unmapped
+// address and faults; the kernel records the fault, terminates the process, and
+// longjmps back here, where we read the recorded fault and free the user mapping.
+extern "C" fn user_fault_thread_body(_arg: u64) {
+	use core::sync::atomic::Ordering;
+	use mem::frame::{self, PAGE_SIZE};
+	let _mo = unsafe { arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, PAGE_SIZE, 0, 0, 0) };
+	let code = frame::allocate().expect("user code frame");
+	let stack = frame::allocate().expect("user stack frame");
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
+	arch::paging::map_page(USER_CODE_VA, code, flags);
+	arch::paging::map_page(USER_STACK_VA, stack, flags);
+	let program = arch::usermode::program_fault_bytes();
+	unsafe {
+		core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
+		// Drops to ring 3; the program faults and the kernel returns control here.
+		arch::usermode::enter(USER_CODE_VA, USER_STACK_VA + PAGE_SIZE, 0);
+	}
+	// Back from the ring-3 fault: read the fault the kernel recorded for us.
+	let mut info = fault::FaultInfo { kind: 0, error_code: 0, address: 0, instruction_pointer: 0 };
+	let got = unsafe { arch::syscall::invoke(syscall::SYS_FAULT_INFO_GET, &mut info as *mut fault::FaultInfo as u64, core::mem::size_of::<fault::FaultInfo>() as u64, 0, 0) };
+	FAULT_GOT.store(got as i64, Ordering::SeqCst);
+	FAULT_KIND.store(info.kind, Ordering::SeqCst);
+	FAULT_ADDR.store(info.address, Ordering::SeqCst);
+	// Tear the user mapping down. The MemoryObject handle stays open on purpose, so
+	// process teardown is what frees it.
+	arch::paging::unmap_page(USER_CODE_VA);
+	arch::paging::unmap_page(USER_STACK_VA);
+	frame::deallocate(code);
+	frame::deallocate(stack);
+}
+
+// Run the fault-isolation demo: spawn a thread that drops to ring 3 and faults.
+// The kernel must terminate just that process and keep running; report the fault
+// it recorded to show the excursion was caught and cleaned up.
+#[cfg(not(test))]
+fn userspace_fault_demo() {
+	use core::sync::atomic::Ordering;
+	sched::spawn(user_fault_thread_body, 0);
+	sched::run_until_idle();
+	if FAULT_GOT.load(Ordering::SeqCst) == 1 {
+		serial_println!("userspace: caught a ring-3 fault (kind {}, addr {:#x}); process terminated, kernel survived", FAULT_KIND.load(Ordering::SeqCst), FAULT_ADDR.load(Ordering::SeqCst));
+	} else {
+		serial_println!("userspace: ERROR - expected a ring-3 fault but none was recorded");
 	}
 }
 
@@ -976,6 +1033,29 @@ fn userspace_runs_and_ipcs() {
 	sched::run_until_idle();
 	let message = ep1.recv().expect("ring-3 program sent a message");
 	assert_eq!(&message.bytes[..], b"OK");
+}
+
+#[cfg(test)]
+#[test_case]
+fn fault_isolation_kills_only_process() {
+	use core::sync::atomic::Ordering;
+	use object::domain::Domain;
+	// A ring-3 thread dereferences a bad pointer. The kernel must terminate only
+	// that process - not panic - and teardown must refund every resource it held to
+	// its Domain. The thread runs in a bounded Domain and is not retained here, so
+	// reaping it drops the Process and runs the refunds.
+	let domain = Domain::new(1 << 20, 8, 4);
+	sched::spawn_in(domain.clone(), user_fault_thread_body, 0).expect("spawn faulting thread");
+	sched::run_until_idle();
+	// Reaching here means the kernel survived the ring-3 fault and resumed
+	// scheduling. The fault was recorded with the expected cause and address.
+	assert_eq!(FAULT_GOT.load(Ordering::SeqCst), 1, "fault info should be recorded");
+	assert_eq!(FAULT_KIND.load(Ordering::SeqCst), fault::FAULT_PAGE);
+	assert_eq!(FAULT_ADDR.load(Ordering::SeqCst), arch::usermode::FAULT_PROBE_ADDR);
+	// Teardown refunded the open MemoryObject (memory + handle) and the thread slot.
+	assert_eq!(domain.account().memory().used(), 0, "memory refunded");
+	assert_eq!(domain.account().handles().used(), 0, "handles refunded");
+	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@ use super::domain::Domain;
 use super::handle::HandleTable;
 use super::rights::Rights;
 use super::{KernelObject, ObjectHeader, ObjectType};
+use crate::fault::FaultInfo;
 use crate::sync::SpinLock;
 
 pub struct Process {
@@ -30,6 +31,8 @@ pub struct Process {
 	handles: SpinLock<HandleTable>,
 	// The resource Domain this process and its threads are accounted to.
 	domain: Arc<Domain>,
+	// The fault that terminated this process, if any (first fault wins).
+	fault: SpinLock<Option<FaultInfo>>,
 }
 
 impl Process {
@@ -39,7 +42,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain })
+		Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None) })
 	}
 
 	pub fn address_space(&self) -> &Arc<AddressSpace> {
@@ -60,6 +63,20 @@ impl Process {
 	// way a new process is endowed with an initial bootstrap capability.
 	pub fn install(&self, object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> u64 {
 		self.handles.lock().insert_object(object, rights, badge).raw()
+	}
+
+	// Record the fault that is terminating this process. The first fault wins:
+	// once set it is not overwritten, so the original cause is preserved.
+	pub fn set_fault(&self, info: FaultInfo) {
+		let mut slot = self.fault.lock();
+		if slot.is_none() {
+			*slot = Some(info);
+		}
+	}
+
+	// The fault that terminated this process, if one was recorded.
+	pub fn fault_info(&self) -> Option<FaultInfo> {
+		*self.fault.lock()
 	}
 }
 

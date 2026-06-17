@@ -100,11 +100,13 @@ Everything is written SMP-aware from the start, so locks are not retrofitted lat
 - Result: `Process` owns the AddressSpace + handle table + Domain; `Thread` holds an `Arc<Process>` and delegates `address_space()`/`handles()`/`domain()` to it (so the syscall layer is unchanged). `AddressSpace::create` builds private page tables (empty user half, kernel higher half shared by copying PML4 entries 256..512); the scheduler reloads CR3 on every switch and restores the kernel space when a core goes idle. Each kernel thread runs in its own single-thread process. `process_isolation_and_per_process_tables` test: two processes map the same VA to different frames and each reader thread sees only its own (distinct CR3s), and a handle installed in one process is invisible to the other.
 
 ## M12 - Fault isolation and crashed-process cleanup
-- [ ] A userspace page fault / GPF terminates only the faulting `Process`, not the kernel
-- [ ] Process teardown: close all handles, free frames + address space, refund Domain accounting
-- [ ] `fault_info_get`: record and expose basic fault info for the killed process
-- [ ] Other cores and the scheduler keep running across the kill
+- [x] A userspace page fault / GPF terminates only the faulting `Process`, not the kernel
+- [x] Process teardown: close all handles, free frames + address space, refund Domain accounting
+- [x] `fault_info_get`: record and expose basic fault info for the killed process
+- [x] Other cores and the scheduler keep running across the kill
 - Done when: a userspace process that dereferences a bad pointer is killed and fully cleaned up, the kernel survives, and a test asserts the Domain's accounting returns to zero.
+- Result: the page-fault and #GP handlers check the saved code selector's CPL; a ring-3 fault records a `FaultInfo` on the running `Process` and longjmps back into the kernel thread that entered ring 3 (reusing `usermode::exit_to_kernel`, the same one-way return as a clean `SYS_USER_EXIT`), so the kernel and every other core keep running. A ring-0 fault still halts loudly. The kernel thread resumes after its `enter` call and unwinds normally; dropping the thread tears the process down, and Drop-based refunds return the Domain's memory/handle/thread quotas (`HandleTable::drop` refunds open handles, `MemoryObject::drop` frees frames + refunds memory). New `fault.rs` (`FaultInfo`, `terminate_user`); `SYS_FAULT_INFO_GET` copies the recorded fault to a user buffer. `enter` now restores the caller's interrupt flag after the excursion (the `ret`-based longjmp does not, unlike `iretq`). `fault_isolation_kills_only_process` test: a ring-3 thread in a bounded Domain writes to an unmapped address; the kernel records the page fault (addr `0xdead000`), terminates the process, survives, and the Domain's memory/handle/thread accounting all return to zero.
+
 
 ## M13 - Domain hierarchy and lifecycle
 - [ ] Domain tree (parent/child); processes hang under a Domain node

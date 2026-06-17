@@ -142,6 +142,13 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, error_code: u
 }
 
 extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, error_code: u64) {
+	// A #GP taken in ring 3 is a userspace bug: terminate that process and return
+	// to the kernel. The low two bits of the saved code selector are the CPL.
+	if frame.code_segment & 3 == 3 {
+		crate::serial_println!("fault: ring-3 #GP (code {:#x}) at {:#x} - terminating process", error_code, frame.instruction_pointer);
+		crate::fault::terminate_user(crate::fault::FaultInfo { kind: crate::fault::FAULT_GENERAL_PROTECTION, error_code, address: 0, instruction_pointer: frame.instruction_pointer });
+	}
+	// In ring 0 it is a kernel bug; halt loudly.
 	crate::serial_println!("EXCEPTION: general protection fault (code {:#x}) at {:#x}", error_code, frame.instruction_pointer);
 	super::halt_loop();
 }
@@ -151,6 +158,14 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
 	unsafe {
 		asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
 	}
+	// A page fault taken in ring 3 is a userspace bug (a bad dereference, a write
+	// to a read-only page, and so on): terminate that process and return to the
+	// kernel. The low two bits of the saved code selector are the CPL.
+	if frame.code_segment & 3 == 3 {
+		crate::serial_println!("fault: ring-3 page fault (code {:#x}) at {:#x}, CR2 = {:#x} - terminating process", error_code, frame.instruction_pointer, cr2);
+		crate::fault::terminate_user(crate::fault::FaultInfo { kind: crate::fault::FAULT_PAGE, error_code, address: cr2, instruction_pointer: frame.instruction_pointer });
+	}
+	// In ring 0 it is a kernel bug; halt loudly.
 	crate::serial_println!("EXCEPTION: page fault (code {:#x}) at {:#x}, CR2 = {:#x}", error_code, frame.instruction_pointer, cr2);
 	super::halt_loop();
 }
