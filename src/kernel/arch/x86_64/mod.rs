@@ -8,6 +8,7 @@ pub mod paging;
 pub mod percpu;
 pub mod serial;
 pub mod syscall;
+pub mod tsc;
 pub mod usermode;
 
 use core::arch::asm;
@@ -28,6 +29,12 @@ pub fn init_interrupts() {
 // Enable the fast `syscall` instruction on the current core (per-core MSRs).
 pub fn init_syscalls() {
 	syscall::init();
+}
+
+// Calibrate the time-stamp counter for fine-grained timing. Run on the BSP with
+// interrupts disabled so no timer ISR distorts the calibration window.
+pub fn init_tsc() {
+	tsc::init();
 }
 
 // Initialize per-CPU data for the bootstrap processor (CPU id 0). The BSP's

@@ -75,6 +75,7 @@ unsafe extern "C" fn kmain() -> ! {
 	arch::init();
 	init_memory();
 	arch::init_interrupts();
+	arch::init_tsc();
 	arch::enable_interrupts();
 	arch::init_syscalls();
 	init_smp();
@@ -134,6 +135,7 @@ fn boot_main() {
 	syscall_demo();
 	channel_ipc_demo();
 	userspace_demo();
+	ipc_bench();
 	serial_println!("boot OK, halting");
 }
 
@@ -230,6 +232,123 @@ extern "C" fn ipc_receiver(ch: u64) {
 			}
 			sched::yield_now();
 		}
+	}
+}
+
+// Phase-0 gate: measure IPC round-trip latency and confirm large-buffer transfer
+// is zero-copy. The concept treats a fast local call as a prerequisite before
+// services are layered on top of IPC, so the numbers are printed at boot.
+#[cfg(not(test))]
+fn ipc_bench() {
+	use object::channel::{Channel, Message};
+	serial_println!("ipc: TSC calibrated at {} MHz", arch::tsc::hz() / 1_000_000);
+
+	// Raw channel primitive: a request/reply round-trip is send + recv + send +
+	// recv. One pre-built message is bounced around the pair, so nothing is
+	// allocated inside the timed loop - this is the IPC data-path floor (lock,
+	// queue push/pop, message move), independent of the scheduler.
+	let (client, server) = Channel::create();
+	let mut msg = Some(Message::new(alloc::vec![0u8; 64], alloc::vec::Vec::new(), 0));
+	let iters: u64 = 200_000;
+	for _ in 0..1_000 {
+		client.send(msg.take().unwrap()).unwrap();
+		let bounced = server.recv().unwrap();
+		server.send(bounced).unwrap();
+		msg = Some(client.recv().unwrap());
+	}
+	let start = arch::tsc::now();
+	for _ in 0..iters {
+		client.send(msg.take().unwrap()).unwrap();
+		let bounced = server.recv().unwrap();
+		server.send(bounced).unwrap();
+		msg = Some(client.recv().unwrap());
+	}
+	report_latency("ipc: raw channel round-trip", arch::tsc::now() - start, iters);
+
+	// The same round-trip through the syscall ABI (entry, handle lookup, the IPC
+	// primitive), then an explicit zero-copy buffer transfer. Both need a current
+	// thread's handle table, so they run inside spawned kernel threads.
+	sched::spawn(ipc_bench_syscall_thread, 0);
+	sched::run_until_idle();
+	sched::spawn(ipc_zero_copy_thread, 0);
+	sched::run_until_idle();
+}
+
+// Print a per-round-trip latency line from a total cycle count.
+#[cfg(not(test))]
+fn report_latency(label: &str, total_cycles: u64, iters: u64) {
+	let per_cycles = total_cycles / iters;
+	let per_ns = arch::tsc::cycles_to_ns(total_cycles) / iters;
+	serial_println!("{}: {} ns / {} cycles per round-trip ({} iters)", label, per_ns, per_cycles, iters);
+}
+
+// Time a request/reply round-trip driven entirely through the syscall ABI. The
+// thread creates a channel pair in its own table, then loops the four calls a
+// real caller would make: client send, server recv, server send, client recv.
+#[cfg(not(test))]
+extern "C" fn ipc_bench_syscall_thread(_arg: u64) {
+	unsafe {
+		let mut client: u64 = 0;
+		let mut server: u64 = 0;
+		let created = arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, &mut client as *mut u64 as u64, &mut server as *mut u64 as u64, 0, 0);
+		if syscall::sys_is_err(created) {
+			serial_println!("ipc: syscall round-trip setup failed ({})", created as i64);
+			return;
+		}
+		let payload = *b"reqreply";
+		let pp = payload.as_ptr() as u64;
+		let pl = payload.len() as u64;
+		let mut buf = [0u8; 16];
+		let bp = buf.as_mut_ptr() as u64;
+		let bl = buf.len() as u64;
+		let mut xfer: u64 = 0;
+		let xp = &mut xfer as *mut u64 as u64;
+		let iters: u64 = 100_000;
+		for _ in 0..1_000 {
+			arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, client, pp, pl, 0);
+			arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, server, bp, bl, xp);
+			arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, server, pp, pl, 0);
+			arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, client, bp, bl, xp);
+		}
+		let start = arch::tsc::now();
+		for _ in 0..iters {
+			arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, client, pp, pl, 0);
+			arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, server, bp, bl, xp);
+			arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, server, pp, pl, 0);
+			arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, client, bp, bl, xp);
+		}
+		report_latency("ipc: syscall round-trip", arch::tsc::now() - start, iters);
+	}
+}
+
+// Demonstrate zero-copy: a large shared buffer is handed to the peer by moving a
+// capability, never by copying its bytes through the channel. Produce a 1 MiB
+// memory object, mark its far end, send the handle with a tiny note, then map it
+// on the receiving endpoint and read the mark back - same physical pages, no copy.
+#[cfg(not(test))]
+extern "C" fn ipc_zero_copy_thread(_arg: u64) {
+	const BUF_LEN: u64 = 0x10_0000; // 1 MiB
+	const MARK: u64 = 0xfeed_face_c0de_d00d;
+	unsafe {
+		let mut client: u64 = 0;
+		let mut server: u64 = 0;
+		if syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, &mut client as *mut u64 as u64, &mut server as *mut u64 as u64, 0, 0)) {
+			return;
+		}
+		let mo = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, BUF_LEN, 0, 0, 0);
+		let virt = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, mo, 0, 0, 0);
+		((virt + BUF_LEN - 8) as *mut u64).write_volatile(MARK);
+		arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, mo, 0, 0, 0);
+		let note = *b"BIG";
+		arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, client, note.as_ptr() as u64, note.len() as u64, mo);
+		let mut buf = [0u8; 8];
+		let mut xfer: u64 = 0;
+		let n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, server, buf.as_mut_ptr() as u64, buf.len() as u64, &mut xfer as *mut u64 as u64);
+		let virt2 = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, xfer, 0, 0, 0);
+		let marker = ((virt2 + BUF_LEN - 8) as *const u64).read_volatile();
+		serial_println!("ipc: zero-copy - moved a {} KiB buffer with a {}-byte message, peer read marker {:#x} at the far end", BUF_LEN / 1024, n, marker);
+		arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, xfer, 0, 0, 0);
+		arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, xfer, 0, 0, 0);
 	}
 }
 
@@ -832,4 +951,71 @@ fn domain_quota_enforced_cleanly() {
 	assert_eq!(domain.account().memory().used(), 0);
 	assert_eq!(domain.account().handles().used(), 0);
 	assert_eq!(domain.account().threads().used(), 0);
+}
+
+#[cfg(test)]
+#[test_case]
+fn ipc_round_trip_and_zero_copy() {
+	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+	use object::channel::{Channel, Message};
+
+	// Round-trip correctness: a request and a reply each deliver their exact
+	// bytes through the channel primitive (the path the latency benchmark times).
+	let (client, server) = Channel::create();
+	client.send(Message::new(alloc::vec::Vec::from(*b"req"), alloc::vec::Vec::new(), 0)).unwrap();
+	let request = server.recv().unwrap();
+	assert_eq!(&request.bytes[..], b"req");
+	server.send(Message::new(alloc::vec::Vec::from(*b"reply"), alloc::vec::Vec::new(), 0)).unwrap();
+	let reply = client.recv().unwrap();
+	assert_eq!(&reply.bytes[..], b"reply");
+
+	// Zero-copy: a 1 MiB buffer is transferred as a capability, not copied. The
+	// producer marks the far end of the buffer and sends only a 3-byte note plus
+	// the handle; the consumer maps the same object and reads the mark back. That
+	// the far-end mark survives while only 3 bytes crossed the channel proves the
+	// pages were shared, not copied. Runs in a thread (syscalls need a handle table).
+	static DONE: AtomicBool = AtomicBool::new(false);
+	static MARKER: AtomicU64 = AtomicU64::new(0);
+	static NOTE_LEN: AtomicU64 = AtomicU64::new(0);
+	extern "C" fn body(_arg: u64) {
+		const BUF_LEN: u64 = 0x10_0000; // 1 MiB
+		const MARK: u64 = 0xa5a5_0000_5a5a_1111;
+		unsafe {
+			let mut client: u64 = 0;
+			let mut server: u64 = 0;
+			let created = arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, &mut client as *mut u64 as u64, &mut server as *mut u64 as u64, 0, 0);
+			assert!(!syscall::sys_is_err(created));
+			// produce: mark the last 8 bytes of a 1 MiB object, then unmap it
+			let mo = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, BUF_LEN, 0, 0, 0);
+			assert!(!syscall::sys_is_err(mo));
+			let virt = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, mo, 0, 0, 0);
+			assert!(!syscall::sys_is_err(virt));
+			((virt + BUF_LEN - 8) as *mut u64).write_volatile(MARK);
+			arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, mo, 0, 0, 0);
+			// transfer the capability with a tiny note instead of the buffer bytes
+			let note = *b"BIG";
+			let sent = arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, client, note.as_ptr() as u64, note.len() as u64, mo);
+			assert!(!syscall::sys_is_err(sent));
+			// consume: receive the note + handle, map the object, read the far mark
+			let mut buf = [0u8; 8];
+			let mut xfer: u64 = 0;
+			let n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, server, buf.as_mut_ptr() as u64, buf.len() as u64, &mut xfer as *mut u64 as u64);
+			assert!(!syscall::sys_is_err(n));
+			NOTE_LEN.store(n as u64, Ordering::SeqCst);
+			assert_ne!(xfer, 0);
+			let virt2 = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, xfer, 0, 0, 0);
+			assert!(!syscall::sys_is_err(virt2));
+			MARKER.store(((virt2 + BUF_LEN - 8) as *const u64).read_volatile(), Ordering::SeqCst);
+			arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, xfer, 0, 0, 0);
+			arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, xfer, 0, 0, 0);
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+	// the far-end mark came through intact, and only the 3-byte note crossed the
+	// channel: the 1 MiB buffer was shared by capability, never copied.
+	assert_eq!(MARKER.load(Ordering::SeqCst), 0xa5a5_0000_5a5a_1111);
+	assert_eq!(NOTE_LEN.load(Ordering::SeqCst), 3);
 }
