@@ -85,3 +85,13 @@ pub fn read_cr3() -> u64 {
 	}
 	value
 }
+
+// Load a page-table root into CR3, switching the active address space. This
+// flushes all non-global TLB entries. The kernel half of every address space is
+// identical, so kernel code and stacks remain mapped across the switch.
+//
+// SAFETY: `cr3` must be the physical address of a valid PML4 whose kernel half
+// maps the currently executing code and stack.
+pub unsafe fn write_cr3(cr3: u64) {
+	asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+}

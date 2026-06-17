@@ -14,15 +14,6 @@ yet (that is Phase 1).
 
 Everything is written SMP-aware from the start, so locks are not retrofitted later.
 
-## M-1 - Prepare
-- [x] product + version + website + github in single source of truth file, loaded from anywhere else
-- [x] Rust, .sh code formaters
-- [x] Update .gitignore based on real directories we have
-- [x] Add README.md, INSTALL.md
-- [x] Add commit.sh + other scripts
-- [x] Bootable ISO CD image
-- [x] Bootable HDD/SD image
-
 ## M0 - Skeleton (bring-up)
 - [x] Boot via Limine
 - [x] Serial output
@@ -101,11 +92,12 @@ Everything is written SMP-aware from the start, so locks are not retrofitted lat
 - Result: raw channel round-trip ~0.76 us, full syscall round-trip ~5.1 us (both within the single-digit-us budget); zero-copy confirmed (a 1 MiB buffer transferred with a 3-byte message, far-end marker read back through the moved capability). TSC-based timing (arch::tsc), boot prints the numbers, `ipc_round_trip_and_zero_copy` test asserts it deterministically.
 
 ## M11 - Process and per-process address space
-- [ ] `Process` object (owns its AddressSpace, handle table, threads; bound to a Domain)
-- [ ] Per-process `AddressSpace` with its own page tables (switch CR3 on context switch)
-- [ ] Move the handle table from the Thread (M6 stand-in) onto the Process
-- [ ] Threads belong to a Process; `process_create` / `thread_create` wired to it
+- [x] `Process` object (owns its AddressSpace, handle table, threads; bound to a Domain)
+- [x] Per-process `AddressSpace` with its own page tables (switch CR3 on context switch)
+- [x] Move the handle table from the Thread (M6 stand-in) onto the Process
+- [x] Threads belong to a Process; `process_create` / `thread_create` wired to it
 - Done when: two processes run with isolated address spaces, a thread switch reloads CR3, and handle tables are per-process - green under `cargo test`.
+- Result: `Process` owns the AddressSpace + handle table + Domain; `Thread` holds an `Arc<Process>` and delegates `address_space()`/`handles()`/`domain()` to it (so the syscall layer is unchanged). `AddressSpace::create` builds private page tables (empty user half, kernel higher half shared by copying PML4 entries 256..512); the scheduler reloads CR3 on every switch and restores the kernel space when a core goes idle. Each kernel thread runs in its own single-thread process. `process_isolation_and_per_process_tables` test: two processes map the same VA to different frames and each reader thread sees only its own (distinct CR3s), and a handle installed in one process is invisible to the other.
 
 ## M12 - Fault isolation and crashed-process cleanup
 - [ ] A userspace page fault / GPF terminates only the faulting `Process`, not the kernel

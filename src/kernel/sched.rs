@@ -21,6 +21,7 @@ use crate::arch;
 use crate::arch::percpu::MAX_CPUS;
 use crate::object::address_space::AddressSpace;
 use crate::object::domain::Domain;
+use crate::object::process::Process;
 use crate::object::rights::Rights;
 use crate::object::thread::{Thread, ThreadState};
 use crate::object::KernelObject;
@@ -63,6 +64,11 @@ static KERNEL_AS: SpinLock<Option<Arc<AddressSpace>>> = SpinLock::new(None);
 // so existing behavior is unchanged. Bounded Domains are created explicitly.
 static ROOT_DOMAIN: SpinLock<Option<Arc<Domain>>> = SpinLock::new(None);
 
+// The kernel address space's CR3, cached for the scheduler hot path. The
+// idle/bootstrap context runs on this; the scheduler restores it when a core goes
+// idle so a dead process's page tables are freed while off their own CR3.
+static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
+
 fn current_cpu_id() -> usize {
 	arch::percpu::this_cpu().cpu_id() as usize
 }
@@ -70,7 +76,9 @@ fn current_cpu_id() -> usize {
 // Capture the kernel address space and create the root Domain so spawned threads
 // can reference them. Called on the BSP once per-CPU data is up.
 pub fn init() {
-	*KERNEL_AS.lock() = Some(AddressSpace::kernel());
+	let kernel_as = AddressSpace::kernel();
+	KERNEL_CR3.store(kernel_as.cr3(), Ordering::Release);
+	*KERNEL_AS.lock() = Some(kernel_as);
 	*ROOT_DOMAIN.lock() = Some(Domain::root());
 }
 
@@ -79,15 +87,22 @@ pub fn root_domain() -> Arc<Domain> {
 	ROOT_DOMAIN.lock().clone().expect("scheduler not initialized")
 }
 
+// A handle to the kernel address space (shared higher-half kernel mappings).
+fn kernel_as() -> Arc<AddressSpace> {
+	KERNEL_AS.lock().clone().expect("scheduler not initialized")
+}
+
 // Create a kernel thread on the current core's run queue.
 pub fn spawn(entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 	spawn_on(current_cpu_id(), entry, arg)
 }
 
-// Create a kernel thread on a specific core's run queue.
+// Create a kernel thread on a specific core's run queue. The thread gets its own
+// single-thread process in the kernel address space, accounted to the root
+// Domain - so a kernel thread's table is reclaimed when the thread is reaped.
 pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
-	let address_space = KERNEL_AS.lock().clone().expect("scheduler not initialized");
-	let thread = Thread::new(entry, arg, address_space, root_domain());
+	let process = Process::new(kernel_as(), root_domain());
+	let thread = Thread::new(entry, arg, process);
 	SCHED[cpu].inner.lock().run_queue.push_back(thread.clone());
 	thread
 }
@@ -95,8 +110,9 @@ pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> 
 // Create a kernel thread on the current core, pre-seeded with a handle to
 // `object` (delivered to the thread as its bootstrap-handle argument).
 pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Arc<Thread> {
-	let address_space = KERNEL_AS.lock().clone().expect("scheduler not initialized");
-	let thread = Thread::new_with_object(entry, address_space, object, rights, badge, root_domain());
+	let process = Process::new(kernel_as(), root_domain());
+	let arg = process.install(object, rights, badge);
+	let thread = Thread::new(entry, arg, process);
 	SCHED[current_cpu_id()].inner.lock().run_queue.push_back(thread.clone());
 	thread
 }
@@ -105,10 +121,25 @@ pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject
 // Domain's thread quota. Returns None (spawning nothing) if the Domain is at its
 // thread cap - a clean refusal rather than a crash.
 pub fn spawn_in(domain: Arc<Domain>, entry: extern "C" fn(u64), arg: u64) -> Option<Arc<Thread>> {
-	let address_space = KERNEL_AS.lock().clone().expect("scheduler not initialized");
-	let thread = Thread::new_in(entry, arg, address_space, domain)?;
+	let process = Process::new(kernel_as(), domain);
+	let thread = Thread::new_in(entry, arg, process)?;
 	SCHED[current_cpu_id()].inner.lock().run_queue.push_back(thread.clone());
 	Some(thread)
+}
+
+// Create a new process with its own address space, accounted to `domain`. Returns
+// None if no frame is available for the address space's top-level page table.
+pub fn process_create(domain: Arc<Domain>) -> Option<Arc<Process>> {
+	let address_space = AddressSpace::create()?;
+	Some(Process::new(address_space, domain))
+}
+
+// Create a thread in an existing `process` on the current core's run queue. The
+// thread shares the process's address space and handle table with its siblings.
+pub fn thread_create(process: Arc<Process>, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
+	let thread = Thread::new(entry, arg, process);
+	SCHED[current_cpu_id()].inner.lock().run_queue.push_back(thread.clone());
+	thread
 }
 
 // Yield the current core to the next ready thread, if any.
@@ -155,6 +186,16 @@ fn reap(sched: &CpuSched) {
 	drop(dead);
 }
 
+// Load `want_cr3` into CR3 unless it is already active. All kernel code and
+// stacks live in the higher half, mapped identically in every address space, so
+// switching the active address space mid-context-switch keeps the running code
+// and both stacks mapped.
+fn switch_address_space(want_cr3: u64) {
+	if arch::context::read_cr3() != want_cr3 {
+		unsafe { arch::context::write_cr3(want_cr3) };
+	}
+}
+
 // Core scheduling step: pick the next ready thread and context-switch to it.
 fn reschedule(disp: Disposition) {
 	let sched = &SCHED[current_cpu_id()];
@@ -169,8 +210,10 @@ fn reschedule(disp: Disposition) {
 			let old_sp = stash_prev(&mut guard, sched, prev, disp);
 			next.set_state(ThreadState::Running);
 			let new_sp = next.kstack_ptr_load();
+			let new_cr3 = next.address_space().cr3();
 			guard.current = Some(next);
 			drop(guard);
+			switch_address_space(new_cr3);
 			unsafe { arch::context::switch_context(old_sp, new_sp) };
 		}
 		None => match prev {
@@ -179,13 +222,16 @@ fn reschedule(disp: Disposition) {
 			Some(prev) => match disp {
 				Disposition::Retire => {
 					// Current thread exited and nothing else is ready: switch
-					// back to this core's idle context.
+					// back to this core's idle context on the kernel address
+					// space, so reaping the dead thread frees its page tables
+					// while off their own CR3.
 					let old_sp = prev.kstack_ptr_addr();
 					prev.set_state(ThreadState::Exited);
 					guard.zombie = Some(prev);
 					guard.current = None;
 					let new_sp = sched.idle_sp.load(Ordering::Acquire);
 					drop(guard);
+					switch_address_space(KERNEL_CR3.load(Ordering::Acquire));
 					unsafe { arch::context::switch_context(old_sp, new_sp) };
 				}
 				Disposition::Requeue => {

@@ -1,0 +1,78 @@
+// Process kernel object.
+//
+// A Process is the unit of isolation: it owns an address space, a handle table,
+// and is bound to a resource Domain. Its threads share all three - a handle
+// opened by one thread is visible to its siblings, and they run in the same
+// address space. A thread reaches these through its Process, so the handle table
+// that M6 parked on the Thread as a stand-in now lives here, where it belongs.
+//
+// Threads hold an Arc to their Process, so the Process (and thus its address
+// space and table) outlives them; the Process is torn down when its last thread
+// is gone. A forward process-to-threads list for bulk termination arrives with
+// fault handling and the Domain hierarchy.
+
+#![allow(dead_code)]
+
+use alloc::sync::Arc;
+use core::any::Any;
+
+use super::address_space::AddressSpace;
+use super::domain::Domain;
+use super::handle::HandleTable;
+use super::rights::Rights;
+use super::{KernelObject, ObjectHeader, ObjectType};
+use crate::sync::SpinLock;
+
+pub struct Process {
+	header: ObjectHeader,
+	address_space: Arc<AddressSpace>,
+	// The process-wide handle table, shared by all of the process's threads.
+	handles: SpinLock<HandleTable>,
+	// The resource Domain this process and its threads are accounted to.
+	domain: Arc<Domain>,
+}
+
+impl Process {
+	// Create a process with a fresh handle table bound to `domain`, running in
+	// `address_space`.
+	pub fn new(address_space: Arc<AddressSpace>, domain: Arc<Domain>) -> Arc<Self> {
+		let mut table = HandleTable::new();
+		// Bind the table to the Domain so its handles are accounted there.
+		table.set_domain(domain.clone());
+		Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain })
+	}
+
+	pub fn address_space(&self) -> &Arc<AddressSpace> {
+		&self.address_space
+	}
+
+	// The process-wide handle table (shared across the process's threads).
+	pub fn handles(&self) -> &SpinLock<HandleTable> {
+		&self.handles
+	}
+
+	// The resource Domain this process is accounted to.
+	pub fn domain(&self) -> &Arc<Domain> {
+		&self.domain
+	}
+
+	// Seed a capability to `object` into the table and return its raw handle, the
+	// way a new process is endowed with an initial bootstrap capability.
+	pub fn install(&self, object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> u64 {
+		self.handles.lock().insert_object(object, rights, badge).raw()
+	}
+}
+
+impl KernelObject for Process {
+	fn header(&self) -> &ObjectHeader {
+		&self.header
+	}
+
+	fn object_type(&self) -> ObjectType {
+		ObjectType::Process
+	}
+
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+}

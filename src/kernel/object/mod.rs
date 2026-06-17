@@ -13,6 +13,7 @@ pub mod domain;
 pub mod event;
 pub mod handle;
 pub mod memory_object;
+pub mod process;
 pub mod rights;
 pub mod thread;
 pub mod timer;

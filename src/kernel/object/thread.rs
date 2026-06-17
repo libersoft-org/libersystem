@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use super::address_space::AddressSpace;
 use super::domain::Domain;
 use super::handle::HandleTable;
-use super::rights::Rights;
+use super::process::Process;
 use super::{KernelObject, ObjectHeader, ObjectType};
 use crate::arch;
 use crate::sync::SpinLock;
@@ -52,58 +52,34 @@ pub struct Thread {
 	kstack_ptr: AtomicU64,
 	// Owns the kernel stack memory; accessed only through kstack_ptr.
 	stack: Box<[u8]>,
-	address_space: Arc<AddressSpace>,
-	// Per-process handle table. M6 places it on the thread as a stand-in until a
-	// Process object exists to own it and share it across a process's threads.
-	handles: SpinLock<HandleTable>,
-	// The resource Domain this thread is accounted to. Its thread slot is charged
-	// at creation and refunded when the thread is dropped.
-	domain: Arc<Domain>,
+	// The process this thread belongs to. It owns the address space, handle table,
+	// and Domain the thread runs under, and outlives the thread.
+	process: Arc<Process>,
 }
 
 impl Thread {
-	// Create a ready-to-run kernel thread that will start at `entry(arg)`,
-	// charging one thread slot to `domain` unconditionally (the infallible path
-	// used for the unlimited root Domain).
-	pub fn new(entry: extern "C" fn(u64), arg: u64, address_space: Arc<AddressSpace>, domain: Arc<Domain>) -> Arc<Self> {
-		domain.account().charge_thread();
-		Self::build(entry, arg, address_space, domain, HandleTable::new())
+	// Create a ready-to-run kernel thread in `process` that starts at `entry(arg)`,
+	// charging one thread slot to the process's Domain unconditionally (the
+	// infallible path used for the unlimited root Domain).
+	pub fn new(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Arc<Self> {
+		process.domain().account().charge_thread();
+		Self::build(entry, arg, process)
 	}
 
-	// Like `new`, but enforce the Domain's thread quota: returns None (charging
-	// nothing) if the Domain is already at its thread cap.
-	pub fn new_in(entry: extern "C" fn(u64), arg: u64, address_space: Arc<AddressSpace>, domain: Arc<Domain>) -> Option<Arc<Self>> {
-		if !domain.account().try_charge_thread() {
+	// Like `new`, but enforce the process Domain's thread quota: returns None
+	// (charging nothing) if the Domain is already at its thread cap.
+	pub fn new_in(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Option<Arc<Self>> {
+		if !process.domain().account().try_charge_thread() {
 			return None;
 		}
-		Some(Self::build(entry, arg, address_space, domain, HandleTable::new()))
+		Some(Self::build(entry, arg, process))
 	}
 
-	// Create a ready-to-run kernel thread pre-seeded with a single handle to
-	// `object` in its table. The thread receives that handle's raw value as its
-	// argument - a minimal bootstrap-handle hand-off, the way a new execution
-	// context is endowed with its initial capability.
-	pub fn new_with_object(entry: extern "C" fn(u64), address_space: Arc<AddressSpace>, object: Arc<dyn KernelObject>, rights: Rights, badge: u64, domain: Arc<Domain>) -> Arc<Self> {
-		domain.account().charge_thread();
-		let mut table = HandleTable::new();
-		// Bind the table to the Domain before seeding so the bootstrap handle is
-		// counted like any other.
-		table.set_domain(domain.clone());
-		let handle = table.insert_object(object, rights, badge);
-		Self::build_with_table(entry, handle.raw(), address_space, domain, table)
-	}
-
-	// Shared constructor tail: bind the table to the Domain, fabricate the initial
-	// stack, and assemble the Thread.
-	fn build(entry: extern "C" fn(u64), arg: u64, address_space: Arc<AddressSpace>, domain: Arc<Domain>, mut table: HandleTable) -> Arc<Self> {
-		table.set_domain(domain.clone());
-		Self::build_with_table(entry, arg, address_space, domain, table)
-	}
-
-	fn build_with_table(entry: extern "C" fn(u64), arg: u64, address_space: Arc<AddressSpace>, domain: Arc<Domain>, table: HandleTable) -> Arc<Self> {
+	// Shared constructor tail: fabricate the initial stack and assemble the Thread.
+	fn build(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Arc<Self> {
 		let mut stack = alloc::vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
 		let sp = arch::context::init_thread_stack(&mut stack, entry, arg);
-		Arc::new(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), stack, address_space, handles: SpinLock::new(table), domain })
+		Arc::new(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), stack, process })
 	}
 
 	pub fn tid(&self) -> u64 {
@@ -119,18 +95,22 @@ impl Thread {
 	}
 
 	pub fn address_space(&self) -> &Arc<AddressSpace> {
-		&self.address_space
+		self.process.address_space()
 	}
 
-	// The resource Domain this thread is accounted to.
+	// The resource Domain this thread is accounted to (its process's Domain).
 	pub fn domain(&self) -> &Arc<Domain> {
-		&self.domain
+		self.process.domain()
 	}
 
-	// The calling process's handle table (shared across a process's threads once
-	// a Process object owns it).
+	// The process-wide handle table, shared across the process's threads.
 	pub fn handles(&self) -> &SpinLock<HandleTable> {
-		&self.handles
+		self.process.handles()
+	}
+
+	// The process this thread belongs to.
+	pub fn process(&self) -> &Arc<Process> {
+		&self.process
 	}
 
 	// Address of the saved-stack-pointer slot, handed to switch_context.
@@ -145,10 +125,10 @@ impl Thread {
 
 impl Drop for Thread {
 	fn drop(&mut self) {
-		// Refund this thread's slot to its Domain. The handle table refunds its
-		// own remaining handles in its Drop, and the objects those handles held
-		// refund their memory as their last reference drops.
-		self.domain.account().uncharge_thread();
+		// Refund this thread's slot to its process's Domain. When the process's last
+		// thread drops, the Arc to the Process drops with it, tearing down the
+		// process's handle table (refunding its handles) and address space.
+		self.process.domain().account().uncharge_thread();
 	}
 }
 

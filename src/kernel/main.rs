@@ -637,10 +637,12 @@ fn handle_refcount_lifetime() {
 #[test_case]
 fn thread_object_basics() {
 	use object::address_space::AddressSpace;
+	use object::process::Process;
 	use object::thread::{Thread, ThreadState};
 	use object::{KernelObject, ObjectType};
 	extern "C" fn noop(_arg: u64) {}
-	let thread = Thread::new(noop, 0, AddressSpace::kernel(), sched::root_domain());
+	let process = Process::new(AddressSpace::kernel(), sched::root_domain());
+	let thread = Thread::new(noop, 0, process);
 	assert_eq!(thread.object_type(), ObjectType::Thread);
 	assert_eq!(thread.state(), ThreadState::Ready);
 	assert!(thread.tid() >= 1);
@@ -694,6 +696,77 @@ fn scheduler_runs_across_cores() {
 		assert!(spins < 2_000_000_000, "AP threads did not run");
 	}
 	assert_eq!(CROSS.load(Ordering::SeqCst) as usize, others);
+}
+
+#[cfg(test)]
+#[test_case]
+fn process_isolation_and_per_process_tables() {
+	use core::sync::atomic::{AtomicU64, Ordering};
+	use mem::frame;
+	use object::address_space::AddressSpace;
+	use object::process::Process;
+	use object::rights::Rights;
+
+	// A single user virtual address that both processes map - to different frames.
+	const VA: u64 = 0x0000_0000_3000_0000;
+	// Each reader records the CR3 it ran on and the value it saw at VA, indexed by
+	// the discriminator it is spawned with.
+	static CR3: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+	static SEEN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+	extern "C" fn reader(which: u64) {
+		let cr3 = arch::context::read_cr3();
+		let value = unsafe { (VA as *const u64).read_volatile() };
+		CR3[which as usize].store(cr3, Ordering::SeqCst);
+		SEEN[which as usize].store(value, Ordering::SeqCst);
+	}
+
+	// Two processes, each with its own page tables, in the root Domain.
+	let p1 = Process::new(AddressSpace::create().expect("address space 1"), sched::root_domain());
+	let p2 = Process::new(AddressSpace::create().expect("address space 2"), sched::root_domain());
+
+	// Back the same VA with a distinct physical frame in each process, and stamp a
+	// distinct value into each frame through the HHDM before mapping it.
+	let f1 = frame::allocate().expect("frame 1");
+	let f2 = frame::allocate().expect("frame 2");
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
+	unsafe {
+		((f1 + mem::hhdm_offset()) as *mut u64).write_volatile(0x1111_1111);
+		((f2 + mem::hhdm_offset()) as *mut u64).write_volatile(0x2222_2222);
+	}
+	p1.address_space().map(VA, f1, flags);
+	p2.address_space().map(VA, f2, flags);
+
+	// Run a reader in each process and let them both finish.
+	sched::thread_create(p1.clone(), reader, 0);
+	sched::thread_create(p2.clone(), reader, 1);
+	sched::run_until_idle();
+
+	// Same VA, different physical frames: each reader saw only its own process's
+	// memory - the address spaces are isolated.
+	assert_eq!(SEEN[0].load(Ordering::SeqCst), 0x1111_1111);
+	assert_eq!(SEEN[1].load(Ordering::SeqCst), 0x2222_2222);
+
+	// The readers ran on different page-table roots, each its own process's CR3 -
+	// proof the context switch reloaded CR3.
+	let cr3_1 = CR3[0].load(Ordering::SeqCst);
+	let cr3_2 = CR3[1].load(Ordering::SeqCst);
+	assert_ne!(cr3_1, cr3_2);
+	assert_eq!(cr3_1, p1.address_space().cr3());
+	assert_eq!(cr3_2, p2.address_space().cr3());
+
+	// Handle tables are per-process: a capability installed in one process is
+	// invisible to the other.
+	let (endpoint, _peer) = object::channel::Channel::create();
+	p1.install(endpoint, Rights::ALL, 0);
+	assert_eq!(p1.handles().lock().len(), 1);
+	assert_eq!(p2.handles().lock().len(), 0);
+
+	// Reclaim the data frames. Dropping the address spaces frees their page
+	// tables, but these leaf frames are ours to release.
+	assert_eq!(p1.address_space().unmap(VA), Some(f1));
+	assert_eq!(p2.address_space().unmap(VA), Some(f2));
+	frame::deallocate(f1);
+	frame::deallocate(f2);
 }
 
 #[cfg(test)]
