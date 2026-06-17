@@ -1,0 +1,8 @@
+# gdb-init - attaches to the QEMU GDB stub and stops at kmain
+# Usage: gdb -x boot/gdb-init <kernel-elf>
+set confirm off
+set disassembly-flavor intel
+set architecture i386:x86-64
+target remote localhost:1234
+hbreak kmain
+echo \n[gdb-init] attached, breakpoint at kmain. Type 'continue'.\n

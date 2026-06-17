@@ -1,0 +1,7 @@
+# Limine configuration (protocol v11)
+# Template: @PRODUCT_NAME@ is substituted by boot/qemu-run.sh from product.conf.
+timeout: 0
+
+/@PRODUCT_NAME@
+	protocol: limine
+	path: boot():/boot/kernel

@@ -1,0 +1,7 @@
+# Rust formatting (rustfmt; used by rust-analyzer and `cargo fmt`).
+# Mirrors the Prettier style used for other languages in Libersoft projects:
+# hard tabs for indentation and effectively no line-length wrapping.
+hard_tabs = true
+max_width = 10000
+use_small_heuristics = "Max"
+newline_style = "Unix"

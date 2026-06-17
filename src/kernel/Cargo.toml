@@ -1,0 +1,22 @@
+[package]
+name = "kernel"
+# Source of truth for product metadata is /product.conf. Keep this version in
+# sync with PRODUCT_VERSION there (Cargo requires a literal here).
+version = "0.0.1"
+edition = "2021"
+description = "OS kernel"
+
+[[bin]]
+name = "kernel"
+path = "main.rs"
+
+[dependencies]
+limine = "0.5"
+
+# Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
+# we deliberately do NOT set `panic = "abort"` per-profile. Doing so makes cargo
+# pass `-C panic=abort` for normal builds while the (ignored) test profile omits
+# it, which builds `core` twice with different hashes and breaks `cargo test`
+# with a duplicate-lang-item error.
+[profile.release]
+lto = true

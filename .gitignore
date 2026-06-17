@@ -1,0 +1,36 @@
+# Git
+.secret_git
+
+# Rust / Cargo
+target/
+**/target/
+*.rs.bk
+
+# Bootloader / ISO build output (src/boot/.build)
+.build/
+
+# Build artifacts
+*.o
+*.elf
+*.img
+*.iso
+*.bin
+*.log
+
+# Image / distribution archives
+*.zip
+*.gz
+*.xz
+*.7z
+*.tar
+
+# Editor
+*.swp
+*~
+*.bak
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

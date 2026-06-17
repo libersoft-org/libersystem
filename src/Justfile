@@ -1,0 +1,52 @@
+# Development commands
+# Run from the src/ directory (where this Justfile lives).
+
+kernel_dir := "kernel"
+target := "x86_64-unknown-none"
+kernel_elf := kernel_dir / "target" / target / "debug" / "kernel"
+
+# default: build and run in QEMU
+default: run
+
+# build the kernel
+build:
+	cd {{kernel_dir}} && cargo build
+
+# build + boot in QEMU (serial on stdout, headless)
+run:
+	cd {{kernel_dir}} && cargo run
+
+# build + boot, QEMU waits for GDB (port :1234)
+debug:
+	cd {{kernel_dir}} && DEBUG=1 NOKVM=1 cargo run
+
+# attach GDB to a running QEMU (run in a second panel after 'just debug')
+gdb:
+	gdb -x boot/gdb-init {{kernel_elf}}
+
+# run tests in QEMU (isa-debug-exit)
+test:
+	cd {{kernel_dir}} && TEST=1 cargo test
+
+# build a bootable hybrid ISO (BIOS + UEFI) -> boot/.build/<product>.iso; STRIP=debug|all
+iso strip="debug": build
+	STRIP={{strip}} boot/mkimage.sh iso {{kernel_elf}}
+
+# build a raw bootable disk image for USB / SD card / HDD (BIOS + UEFI); SIZE e.g. 128M, 1G; STRIP=debug|all
+img size="64M" strip="debug": build
+	STRIP={{strip}} boot/mkimage.sh img {{kernel_elf}} {{size}}
+
+# format all code (Rust via rustfmt, shell via shfmt)
+fmt:
+	cd {{kernel_dir}} && cargo fmt
+	shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh
+
+# check formatting without writing changes (CI-friendly)
+fmt-check:
+	cd {{kernel_dir}} && cargo fmt --check
+	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh
+
+# clean build artifacts
+clean:
+	cd {{kernel_dir}} && cargo clean
+	rm -rf boot/.build

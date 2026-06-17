@@ -1,0 +1,8 @@
+{
+	"recommendations": [
+		"rust-lang.rust-analyzer",
+		"mkhl.shfmt",
+		"esbenp.prettier-vscode",
+		"editorconfig.editorconfig"
+	]
+}

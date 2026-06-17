@@ -1,0 +1,20 @@
+{
+	"editor.tabSize": 1,
+	"editor.insertSpaces": false,
+	"editor.formatOnSave": true,
+	"editor.defaultFormatter": "esbenp.prettier-vscode",
+	"rust-analyzer.linkedProjects": ["src/kernel/Cargo.toml"],
+	"[rust]": {
+		"editor.defaultFormatter": "rust-lang.rust-analyzer",
+		"editor.tabSize": 1,
+		"editor.insertSpaces": false
+	},
+	"[shellscript]": {
+		"editor.defaultFormatter": "mkhl.shfmt",
+		"editor.tabSize": 1,
+		"editor.insertSpaces": false
+	},
+	"[markdown]": {
+		"editor.formatOnSave": false
+	}
+}
