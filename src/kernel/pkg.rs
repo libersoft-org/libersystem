@@ -4,7 +4,7 @@
 // by name. The on-disk format is produced by the kernel's build.rs.
 //
 // Layout (all integers little-endian):
-//   header  : magic [8] = b"LIBERPK1", count u32, reserved u32        (16 bytes)
+//   header  : magic [8] = b"PKGARCH1", count u32, reserved u32        (16 bytes)
 //   entries : count * { name [24] NUL-padded, offset u32, size u32 }  (32 bytes each)
 //   blobs   : the file contents, concatenated; each entry's offset/size is an
 //             absolute byte range into the package.

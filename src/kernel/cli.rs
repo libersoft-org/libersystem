@@ -153,7 +153,7 @@ fn read_line(buf: &mut String) {
 pub fn run_interactive() {
 	let mut line = String::new();
 	loop {
-		crate::serial_print!("liber> ");
+		crate::serial_print!("> ");
 		read_line(&mut line);
 		let trimmed: &str = line.trim();
 		if trimmed == "exit" || trimmed == "quit" {
@@ -173,7 +173,7 @@ pub fn demo() {
 	crate::serial_println!("cli: serial command shell ready - scripted session follows");
 	let samples: Vec<Arc<Process>> = sample_processes();
 	for line in ["help", "ls vol://system", "cat vol://system/hello.txt", "graph"] {
-		crate::serial_println!("liber> {}", line);
+		crate::serial_println!("> {}", line);
 		run_line(line);
 	}
 	drop(samples);

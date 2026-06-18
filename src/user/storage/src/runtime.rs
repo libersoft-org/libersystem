@@ -1,6 +1,6 @@
 // Shared userspace runtime for the storage programs: the ring-3 entry stub, the
 // syscall wrapper, the panic handler, and the small helpers both the
-// StorageManager and its client need (the LIBERPK1 volume parser and the vol://
+// StorageManager and its client need (the PKGARCH1 volume parser and the vol://
 // path parser). Each binary includes this module independently, so every program
 // carries its own copy of these items.
 
@@ -113,7 +113,7 @@ pub unsafe fn send_blocking(channel: u64, bytes: &[u8], xfer: u64) -> bool {
 	}
 }
 
-// The LIBERPK1 archive-layout constants (PKG_MAGIC / PKG_HEADER_LEN / ...) come
+// The PKGARCH1 archive-layout constants (PKG_MAGIC / PKG_HEADER_LEN / ...) come
 // from the shared abi crate, re-exported above.
 
 fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
@@ -121,7 +121,7 @@ fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
 	Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
-// Look up `name` in a LIBERPK1 archive, returning its blob. Every access is
+// Look up `name` in a PKGARCH1 archive, returning its blob. Every access is
 // bounds-checked, so a malformed or truncated archive yields None rather than
 // reading out of range.
 pub fn pkg_lookup<'a>(archive: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {

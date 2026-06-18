@@ -3,7 +3,7 @@
 // The kernel loads this program from the init package into a ring-3 process and
 // hands it a bootstrap channel. Over that channel the kernel sends, in order:
 //   1. "RAMDISK" + the volume length, with a MemoryObject capability backing the
-//      ramdisk (a LIBERPK1 archive of the volume's files);
+//      ramdisk (a PKGARCH1 archive of the volume's files);
 //   2. "SERVE", with a channel capability on which clients send open requests.
 // The manager maps the ramdisk, then serves open requests until the client side
 // closes. Each request is [rights u32][vol:// URI]; the reply is [status u32]

@@ -1,6 +1,6 @@
 //! Shared OS ABI - the single source of truth for the values the kernel
 //! and userspace must agree on byte-for-byte: syscall numbers, error codes,
-//! capability rights bits, and the LIBERPK1 package format. Both sides (and the
+//! capability rights bits, and the PKGARCH1 package format. Both sides (and the
 //! kernel's build script) depend on this crate, so the two halves can never drift
 //! out of sync.
 //!
@@ -78,12 +78,12 @@ pub const RIGHT_WAIT: u32 = 1 << 11;
 // Every currently defined right.
 pub const RIGHTS_ALL: u32 = 0xfff;
 
-// LIBERPK1 archive format - a 16-byte header (8-byte magic, u32 entry count, u32
+// PKGARCH1 archive format - a 16-byte header (8-byte magic, u32 entry count, u32
 // reserved), then one 32-byte entry per file (24-byte NUL-padded name, u32 blob
 // offset, u32 size), then the concatenated blobs. All integers little-endian.
 // Written by the kernel build.rs, read by the kernel pkg.rs and the userspace
 // storage runtime.
-pub const PKG_MAGIC: &[u8; 8] = b"LIBERPK1";
+pub const PKG_MAGIC: &[u8; 8] = b"PKGARCH1";
 pub const PKG_HEADER_LEN: usize = 16;
 pub const PKG_ENTRY_LEN: usize = 32;
 pub const PKG_NAME_LEN: usize = 24;
