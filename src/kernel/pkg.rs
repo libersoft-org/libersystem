@@ -49,6 +49,20 @@ impl<'a> Package<'a> {
 		self.count == 0
 	}
 
+	// The name of the `index`-th file (its stored name up to the first NUL), or
+	// None if the index is out of range. Lets a caller enumerate the archive.
+	pub fn name(&self, index: usize) -> Option<&'a [u8]> {
+		if index >= self.count {
+			return None;
+		}
+		let base = HEADER_LEN + index * ENTRY_LEN;
+		let stored = &self.bytes[base..base + NAME_LEN];
+		match stored.iter().position(|&b| b == 0) {
+			Some(end) => Some(&stored[..end]),
+			None => Some(stored),
+		}
+	}
+
 	// Find a file by name, returning its blob. The stored name is compared up to
 	// its first NUL. Returns None if absent, or if its byte range is out of bounds.
 	pub fn lookup(&self, name: &[u8]) -> Option<&'a [u8]> {

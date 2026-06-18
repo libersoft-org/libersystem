@@ -38,6 +38,43 @@ pub enum ObjectType {
 	DmaBuffer,
 }
 
+impl ObjectType {
+	// A short, stable name for this type (used by introspection and the graph).
+	pub fn name(self) -> &'static str {
+		match self {
+			ObjectType::Domain => "Domain",
+			ObjectType::Process => "Process",
+			ObjectType::Thread => "Thread",
+			ObjectType::AddressSpace => "AddressSpace",
+			ObjectType::MemoryObject => "MemoryObject",
+			ObjectType::Channel => "Channel",
+			ObjectType::Event => "Event",
+			ObjectType::Timer => "Timer",
+			ObjectType::Interrupt => "Interrupt",
+			ObjectType::DeviceMemory => "DeviceMemory",
+			ObjectType::DmaBuffer => "DmaBuffer",
+		}
+	}
+
+	// A stable numeric code for this type, carried across the syscall boundary by
+	// object_info_get (the wire-stable index, distinct from the in-memory enum).
+	pub fn code(self) -> u64 {
+		match self {
+			ObjectType::Domain => 0,
+			ObjectType::Process => 1,
+			ObjectType::Thread => 2,
+			ObjectType::AddressSpace => 3,
+			ObjectType::MemoryObject => 4,
+			ObjectType::Channel => 5,
+			ObjectType::Event => 6,
+			ObjectType::Timer => 7,
+			ObjectType::Interrupt => 8,
+			ObjectType::DeviceMemory => 9,
+			ObjectType::DmaBuffer => 10,
+		}
+	}
+}
+
 // Unique kernel object id allocator (0 is reserved as "invalid").
 static NEXT_KOID: AtomicU64 = AtomicU64::new(1);
 

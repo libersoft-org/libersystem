@@ -225,6 +225,19 @@ impl Domain {
 		list.push(Arc::downgrade(process));
 	}
 
+	// A snapshot of this Domain's live child Domains (for the System Graph). The
+	// children are owned strongly, so each is guaranteed live.
+	pub fn child_domains(&self) -> Vec<Arc<Domain>> {
+		self.children.lock().iter().cloned().collect()
+	}
+
+	// A snapshot of the processes currently accounted to this Domain (for the
+	// System Graph). Dead weak references are skipped, so only live processes are
+	// returned.
+	pub fn live_processes(&self) -> Vec<Arc<Process>> {
+		self.processes.lock().iter().filter_map(Weak::upgrade).collect()
+	}
+
 	// Kill this Domain and its entire subtree: mark every Domain killed and
 	// terminate every process accounted to them, refunding their resources. The
 	// terminated processes' threads observe the kill at their next scheduling

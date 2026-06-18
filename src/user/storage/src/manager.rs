@@ -48,6 +48,10 @@ pub extern "C" fn __storage_main(bootstrap: u64) -> ! {
 	// 3. serve until the client side closes.
 	loop {
 		match unsafe { recv_blocking(service, &mut buf) } {
+			// An empty message is an explicit quit sentinel: a client that cannot
+			// close its endpoint to signal end-of-stream (e.g. the kernel keeping the
+			// peer to read the reply) sends a zero-length message to end the session.
+			Received::Message { len, .. } if len == 0 => break,
 			Received::Message { len, .. } => unsafe { serve_open(service, volume_base, volume_len, &buf[..len]) },
 			Received::Closed => break,
 		}

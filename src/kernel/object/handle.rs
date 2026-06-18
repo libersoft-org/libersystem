@@ -80,11 +80,30 @@ impl Capability {
 		self.object.object_type()
 	}
 
+	// The kernel object this capability refers to (a new reference). Used by
+	// kernel-internal paths that receive a transferred capability and need to act
+	// on the object directly, without a handle table to install it into.
+	pub fn object(&self) -> Arc<dyn KernelObject> {
+		self.object.clone()
+	}
+
 	// A capability is stale once the object's generation has moved past the one
 	// captured at mint time (i.e. the object was revoked).
 	fn is_valid(&self) -> bool {
 		self.object.header().generation() == self.generation
 	}
+}
+
+// A read-only snapshot of one handle's capability, for introspection (the
+// object_info_get syscall and the System Graph). It names the object behind the
+// handle and the access the handle confers, without exposing the capability.
+#[derive(Clone, Copy, Debug)]
+pub struct HandleInfo {
+	pub koid: u64,
+	pub object_type: ObjectType,
+	pub rights: Rights,
+	pub badge: u64,
+	pub generation: u32,
 }
 
 struct Slot {
@@ -211,6 +230,26 @@ impl HandleTable {
 	// Inspect the badge a handle carries (stamped onto messages it sends).
 	pub fn badge_of(&self, handle: Handle) -> Result<u64, HandleError> {
 		Ok(self.cap_of(handle)?.badge)
+	}
+
+	// Introspect a handle: the identity, type, rights, and badge behind it. Like
+	// rights_of/badge_of this is a get_info-style query; it underlies the
+	// object_info_get syscall. Returns None for a bad or stale handle.
+	pub fn info(&self, handle: Handle) -> Option<HandleInfo> {
+		let cap = self.cap_of(handle).ok()?;
+		Some(HandleInfo { koid: cap.object.header().koid(), object_type: cap.object_type(), rights: cap.rights, badge: cap.badge, generation: cap.object.header().generation() })
+	}
+
+	// A snapshot of every live handle in the table, for enumeration by the System
+	// Graph. Order follows the slot indices.
+	pub fn entries(&self) -> Vec<HandleInfo> {
+		let mut out = Vec::new();
+		for slot in &self.slots {
+			if let Some(cap) = &slot.cap {
+				out.push(HandleInfo { koid: cap.object.header().koid(), object_type: cap.object_type(), rights: cap.rights, badge: cap.badge, generation: cap.object.header().generation() });
+			}
+		}
+		out
 	}
 
 	// Derive a weaker handle to the same object. Requires the DUPLICATE right,

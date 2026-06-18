@@ -53,6 +53,7 @@ pub const SYS_FAULT_INFO_GET: u64 = 18;
 pub const SYS_DOMAIN_CREATE: u64 = 19;
 pub const SYS_DOMAIN_KILL: u64 = 20;
 pub const SYS_YIELD: u64 = 21;
+pub const SYS_OBJECT_INFO_GET: u64 = 22;
 
 // Error codes (small negatives, returned in the syscall result register).
 pub const ERR_BAD_SYSCALL: i64 = -1;
@@ -69,6 +70,17 @@ pub const ERR_RESOURCE_EXHAUSTED: i64 = -10;
 // True if a syscall return value encodes an error (the range [-4095, -1]).
 pub fn sys_is_err(ret: u64) -> bool {
 	(-4095..0).contains(&(ret as i64))
+}
+
+// Introspection record filled by object_info_get: the identity and type of the
+// object behind a handle, and the access the handle confers. repr(C) with only
+// fixed-width fields so it marshals cleanly across the syscall boundary.
+#[repr(C)]
+pub struct ObjectInfo {
+	pub koid: u64,
+	pub object_type: u64,
+	pub rights: u32,
+	pub generation: u32,
 }
 
 // Exclusive upper bound of the user (lower-half) virtual-address range. A syscall
@@ -149,6 +161,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 			sched::yield_now();
 			0
 		}
+		SYS_OBJECT_INFO_GET => sys_object_info_get(a0, a1, a2),
 		_ => ERR_BAD_SYSCALL,
 	};
 	result as u64
@@ -420,6 +433,30 @@ fn sys_fault_info_get(buf_ptr: u64, buf_len: u64) -> i64 {
 	}
 	unsafe {
 		(buf_ptr as *mut FaultInfo).write_unaligned(info);
+	}
+	1
+}
+
+// Introspect a handle in the caller's table: write an ObjectInfo describing the
+// object behind it (koid, type, rights, generation) into the caller's buffer.
+// Returns 1 on success, ERR_BAD_HANDLE for an unknown/stale handle, or
+// ERR_INVALID if the buffer is too small or out of range.
+fn sys_object_info_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+	let thread = match sched::current_thread() {
+		Some(t) => t,
+		None => return ERR_NO_THREAD,
+	};
+	let info = match thread.handles().lock().info(Handle::from_raw(handle)) {
+		Some(i) => i,
+		None => return ERR_BAD_HANDLE,
+	};
+	let size = core::mem::size_of::<ObjectInfo>() as u64;
+	if buf_len < size || !user_buf_ok(buf_ptr, size) {
+		return ERR_INVALID;
+	}
+	let out = ObjectInfo { koid: info.koid, object_type: info.object_type.code(), rights: info.rights.bits(), generation: info.generation };
+	unsafe {
+		(buf_ptr as *mut ObjectInfo).write_unaligned(out);
 	}
 	1
 }

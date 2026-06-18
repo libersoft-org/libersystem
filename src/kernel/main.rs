@@ -8,9 +8,11 @@
 extern crate alloc;
 
 mod arch;
+mod cli;
 mod console;
 mod elf;
 mod fault;
+mod graph;
 mod loader;
 mod mem;
 mod object;
@@ -191,7 +193,10 @@ fn boot_main() {
 	system_manager_demo();
 	storage_demo();
 	ipc_bench();
-	serial_println!("boot OK, halting");
+	cli::demo();
+	serial_println!("boot OK - entering the serial shell (type 'help', or 'exit' to halt)");
+	cli::run_interactive();
+	serial_println!("halting");
 }
 
 // Print a product banner inside an ASCII frame (plain +/-/| so it renders on both
@@ -623,6 +628,88 @@ fn storage_demo() {
 		}
 		Err(reason) => serial_println!("storage: ERROR - {}", reason),
 	}
+}
+
+// Read a file from a vol:// volume by driving the StorageManager as the kernel's
+// own client - the path the CLI's `cat` command uses. Spawns the manager, hands
+// it the ramdisk and a service channel, sends one open request plus an empty quit
+// sentinel (so the manager exits and the cooperative schedule drains), runs the
+// schedule to completion, then receives the reply and reads the returned shared
+// buffer through the HHDM. Returns the file's bytes, or an error string.
+fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
+	use alloc::sync::Arc;
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::memory_object::MemoryObject;
+	use object::rights::Rights;
+	use object::KernelObject;
+
+	let volume = volume_package_bytes().ok_or("volume package module not found")?;
+	let init = init_package_bytes().ok_or("init package module not found")?;
+	let package = pkg::Package::parse(init).ok_or("init package is malformed")?;
+	let manager_elf = package.lookup(b"storage_manager").ok_or("storage_manager missing from the init package")?;
+
+	// the ramdisk: a MemoryObject filled with the volume archive via the HHDM
+	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
+	copy_into_object(&ramdisk, volume);
+
+	let (manager_boot_kernel, manager_boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+
+	loader::spawn_elf_process(sched::root_domain(), manager_elf, manager_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageManager")?;
+
+	// bootstrap the manager: the ramdisk (with its length) and the service endpoint
+	let mut ramdisk_msg = alloc::vec::Vec::with_capacity(7 + 8);
+	ramdisk_msg.extend_from_slice(b"RAMDISK");
+	ramdisk_msg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
+	let ramdisk_cap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP, 0);
+	manager_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap], 0)).map_err(|_| "manager ramdisk bootstrap failed")?;
+	let service_server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
+	manager_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![service_server_cap], 0)).map_err(|_| "manager serve bootstrap failed")?;
+
+	// the open request - [rights u32 LE][vol:// URI] - then an empty quit sentinel,
+	// which the manager treats as end-of-session and exits on
+	let want_rights = (Rights::READ | Rights::MAP).bits();
+	let mut request = alloc::vec::Vec::with_capacity(4 + uri.len());
+	request.extend_from_slice(&want_rights.to_le_bytes());
+	request.extend_from_slice(uri);
+	service_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).map_err(|_| "open request failed")?;
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).map_err(|_| "quit sentinel failed")?;
+
+	sched::run_until_idle();
+
+	let reply = service_client.recv().map_err(|_| "the manager sent no reply")?;
+	if reply.bytes.len() < 12 {
+		return Err("malformed reply");
+	}
+	let status = u32::from_le_bytes([reply.bytes[0], reply.bytes[1], reply.bytes[2], reply.bytes[3]]);
+	let size = u64::from_le_bytes([reply.bytes[4], reply.bytes[5], reply.bytes[6], reply.bytes[7], reply.bytes[8], reply.bytes[9], reply.bytes[10], reply.bytes[11]]) as usize;
+	if status != 0 {
+		return Err("the manager denied or could not find the file");
+	}
+	let cap = reply.caps.first().ok_or("the manager granted no buffer")?;
+	let object = cap.object();
+	let memory = object.as_any().downcast_ref::<MemoryObject>().ok_or("the granted capability was not a buffer")?;
+	Ok(read_from_object(memory, size))
+}
+
+// Read `len` bytes out of a MemoryObject's frames through the HHDM (the reverse of
+// copy_into_object). The object need not be mapped: its physical frames are read
+// directly.
+fn read_from_object(object: &object::memory_object::MemoryObject, len: usize) -> alloc::vec::Vec<u8> {
+	let hhdm = mem::hhdm_offset();
+	let page = mem::frame::PAGE_SIZE as usize;
+	let mut out = alloc::vec::Vec::with_capacity(len);
+	for (i, &phys) in object.frames().iter().enumerate() {
+		let start = i * page;
+		if start >= len {
+			break;
+		}
+		let end = core::cmp::min(start + page, len);
+		let chunk = unsafe { core::slice::from_raw_parts((hhdm + phys) as *const u8, end - start) };
+		out.extend_from_slice(chunk);
+	}
+	out
 }
 
 // Statics the fault-probe body records into; read back by the demo and the test.
@@ -1250,6 +1337,90 @@ fn storage_serves_volume_file_to_client() {
 	// an end-to-end, capability-brokered, zero-copy read across two userspace
 	// processes coordinated only by IPC.
 	let (expected, actual) = run_storage_scenario().expect("the storage scenario should run");
+	assert!(!expected.is_empty(), "the volume file should not be empty");
+	assert_eq!(actual, expected);
+}
+
+#[cfg(test)]
+#[test_case]
+fn object_info_get_reports_object() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	// object_info_get introspects a handle in the caller's table, so it runs inside
+	// a spawned kernel thread (which has one). It reports the object's identity,
+	// type, and the rights the handle confers, and rejects an unknown handle.
+	extern "C" fn body(_arg: u64) {
+		use object::rights::Rights;
+		use object::ObjectType;
+		unsafe {
+			let handle = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0);
+			assert!(!syscall::sys_is_err(handle));
+			let mut info = syscall::ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0 };
+			let info_ptr = &mut info as *mut syscall::ObjectInfo as u64;
+			let size = core::mem::size_of::<syscall::ObjectInfo>() as u64;
+			let got = arch::syscall::invoke(syscall::SYS_OBJECT_INFO_GET, handle, info_ptr, size, 0);
+			assert_eq!(got, 1);
+			assert!(info.koid >= 1);
+			assert_eq!(info.object_type, ObjectType::MemoryObject.code());
+			assert_eq!(info.rights, Rights::ALL.bits());
+			assert!(info.generation >= 1);
+			// an unknown handle is rejected with the bad-handle error
+			let bad = arch::syscall::invoke(syscall::SYS_OBJECT_INFO_GET, 0xdead_beef, info_ptr, size, 0);
+			assert_eq!(bad as i64, syscall::ERR_BAD_HANDLE);
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+}
+
+#[cfg(test)]
+#[test_case]
+fn system_graph_reflects_live_state() {
+	use object::address_space::AddressSpace;
+	use object::channel::Channel;
+	use object::domain::Domain;
+	use object::process::Process;
+	use object::rights::Rights;
+	use object::{KernelObject, ObjectType};
+	// A standalone Domain with one process holding two handles. Collecting the
+	// graph from that Domain must reflect the live structure exactly: one process
+	// with two handles, one of them the channel we installed - with its koid, type,
+	// rights, and badge intact. Dropping the process removes it from the graph.
+	let domain = Domain::new(1 << 20, 16, 8);
+	let process = Process::new(AddressSpace::kernel(), domain.clone());
+	let (endpoint, _peer) = Channel::create();
+	let channel_koid = endpoint.header().koid();
+	process.install(endpoint, Rights::READ | Rights::WRITE, 42);
+	process.install(object::event::Event::create(), Rights::ALL, 0);
+
+	let node = graph::collect_from(&domain);
+	assert_eq!(node.koid, domain.header().koid());
+	assert_eq!(node.processes.len(), 1, "the Domain has one live process");
+	let proc_node = &node.processes[0];
+	assert_eq!(proc_node.koid, process.header().koid());
+	assert_eq!(proc_node.handles.len(), 2, "the process holds two handles");
+	let channel_handle = proc_node.handles.iter().find(|h| h.koid == channel_koid).expect("the channel handle should appear in the graph");
+	assert_eq!(channel_handle.object_type, ObjectType::Channel);
+	assert_eq!(channel_handle.rights, Rights::READ | Rights::WRITE);
+	assert_eq!(channel_handle.badge, 42);
+
+	// Dropping the process removes it from the live graph.
+	drop(process);
+	let after = graph::collect_from(&domain);
+	assert_eq!(after.processes.len(), 0, "the process is gone after it drops");
+}
+
+#[cfg(test)]
+#[test_case]
+fn cli_reads_file_through_storage_service() {
+	// The CLI's `cat` path: the kernel drives the StorageManager as its own client,
+	// sending one open request and a quit sentinel, then reads the returned shared
+	// buffer. The bytes must equal the file straight from the volume archive - a
+	// command round-tripping to a real userspace service.
+	let expected = pkg::Package::parse(volume_package_bytes().expect("the volume package should be present")).and_then(|p| p.lookup(b"hello.txt").map(|b| b.to_vec())).expect("hello.txt should be in the volume");
+	let actual = storage_read(b"vol://system/hello.txt").expect("the storage read should succeed");
 	assert!(!expected.is_empty(), "the volume file should not be empty");
 	assert_eq!(actual, expected);
 }
