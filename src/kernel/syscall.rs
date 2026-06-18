@@ -52,6 +52,7 @@ pub const SYS_USER_EXIT: u64 = 17;
 pub const SYS_FAULT_INFO_GET: u64 = 18;
 pub const SYS_DOMAIN_CREATE: u64 = 19;
 pub const SYS_DOMAIN_KILL: u64 = 20;
+pub const SYS_YIELD: u64 = 21;
 
 // Error codes (small negatives, returned in the syscall result register).
 pub const ERR_BAD_SYSCALL: i64 = -1;
@@ -102,6 +103,19 @@ fn alloc_kernel_vrange(len: u64) -> u64 {
 	MMAP_NEXT.fetch_add(len, Ordering::Relaxed)
 }
 
+// User virtual-address window for ring-3 syscall-mapped MemoryObjects. Like the
+// kernel window a bump pointer hands out non-overlapping ranges and does not
+// reclaim them. The base sits far above the program and stack the loader places
+// below the 2 GiB line, yet within the user (lower) half, so user_buf_ok still
+// accepts buffers carved from it. Each process maps into its own page tables, so
+// the same range is private per address space even though the bump is global.
+const USER_MMAP_BASE: u64 = 0x0000_4000_0000_0000;
+static USER_MMAP_NEXT: AtomicU64 = AtomicU64::new(USER_MMAP_BASE);
+
+fn alloc_user_vrange(len: u64) -> u64 {
+	USER_MMAP_NEXT.fetch_add(len, Ordering::Relaxed)
+}
+
 // Entry point called by the architecture syscall stub. `num` selects the call;
 // the meaning of the arguments and the return value is per-syscall.
 #[no_mangle]
@@ -131,6 +145,10 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_FAULT_INFO_GET => sys_fault_info_get(a0, a1),
 		SYS_DOMAIN_CREATE => sys_domain_create(a0, a1, a2),
 		SYS_DOMAIN_KILL => sys_domain_kill(a0),
+		SYS_YIELD => {
+			sched::yield_now();
+			0
+		}
 		_ => ERR_BAD_SYSCALL,
 	};
 	result as u64
@@ -172,9 +190,15 @@ fn sys_memory_map(handle: u64) -> i64 {
 	if memory.mapped_at() != 0 {
 		return ERR_INVALID;
 	}
-	let base = alloc_kernel_vrange(memory.size() as u64);
+	// A ring-3 caller maps into its own (lower-half) user space with the USER bit
+	// so the program can reach the pages; a ring-0 caller maps into the shared
+	// kernel window. Either way the active page tables are the caller's, so a
+	// plain map_page lands in the right address space.
+	let user = arch::percpu::in_user_syscall();
+	let base = if user { alloc_user_vrange(memory.size() as u64) } else { alloc_kernel_vrange(memory.size() as u64) };
+	let flags = if user { arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER } else { arch::paging::PRESENT | arch::paging::WRITABLE };
 	for (i, &phys) in memory.frames().iter().enumerate() {
-		arch::paging::map_page(base + i as u64 * PAGE_SIZE, phys, arch::paging::PRESENT | arch::paging::WRITABLE);
+		arch::paging::map_page(base + i as u64 * PAGE_SIZE, phys, flags);
 	}
 	memory.set_mapped_at(base);
 	base as i64

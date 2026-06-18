@@ -56,13 +56,17 @@ global_asm!(
 	// return rip; a userspace call has a lower-half (positive) one.
 	"test rcx, rcx",
 	"js 2f",
-	// ring-3 path: park the user registers in the per-CPU block, switch to the
-	// thread's kernel stack, and flag the syscall as user-originated.
-	"mov gs:[{ursp}], rsp",
-	"mov gs:[{urip}], rcx",
-	"mov gs:[{urfl}], r11",
+	// ring-3 path: switch to the thread's kernel stack and save the user return
+	// state on it. Keeping rsp/rip/rflags on this thread's own stack (rather than a
+	// per-CPU slot) lets the handler yield to another cooperative ring-3 service on
+	// the same core without the other syscall clobbering this thread's return state.
+	"mov r9, rsp",
 	"mov rsp, gs:[{krsp}]",
 	"and rsp, -16",
+	"push r9",
+	"push r11",
+	"push rcx",
+	"sub rsp, 8",
 	"mov qword ptr gs:[{fu}], 1",
 	"mov r8, r10",
 	"mov rcx, rdx",
@@ -71,13 +75,19 @@ global_asm!(
 	"mov rdi, rax",
 	"call syscall_dispatch",
 	"mov qword ptr gs:[{fu}], 0",
-	// Restore the user registers and return to ring 3 (rip <- rcx, rflags <- r11).
-	"mov rcx, gs:[{urip}]",
-	"mov r11, gs:[{urfl}]",
-	"mov rsp, gs:[{ursp}]",
+	// Restore the user registers from this thread's stack and return to ring 3
+	// (rip <- rcx, rflags <- r11, rsp <- the saved user stack pointer).
+	"add rsp, 8",
+	"pop rcx",
+	"pop r11",
+	"pop rsp",
 	"sysretq",
 	// ring-0 self-call path: already on a kernel stack, stay on it.
 	"2:",
+	// Establish from_user = 0 explicitly: a prior ring-3 syscall that yielded may
+	// have left the per-CPU flag set, and a kernel self-call must never have its
+	// pointers treated as user pointers.
+	"mov qword ptr gs:[{fu}], 0",
 	"push rcx",
 	"push r11",
 	"push rbp",
@@ -100,9 +110,6 @@ global_asm!(
 	"popfq",
 	"jmp rcx",
 	krsp = const percpu::KERNEL_RSP_OFFSET,
-	ursp = const percpu::USER_RSP_OFFSET,
-	urip = const percpu::USER_RIP_OFFSET,
-	urfl = const percpu::USER_RFLAGS_OFFSET,
 	fu = const percpu::FROM_USER_OFFSET,
 );
 

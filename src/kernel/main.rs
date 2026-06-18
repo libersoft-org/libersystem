@@ -189,6 +189,7 @@ fn boot_main() {
 	userspace_fault_demo();
 	domain_lifecycle_demo();
 	system_manager_demo();
+	storage_demo();
 	ipc_bench();
 	serial_println!("boot OK, halting");
 }
@@ -485,6 +486,20 @@ fn init_package_bytes() -> Option<&'static [u8]> {
 	None
 }
 
+// The ramdisk volume package bytes, located among the Limine modules by filename.
+// Returns None if the bootloader passed no module whose path ends in "volume.pkg".
+fn volume_package_bytes() -> Option<&'static [u8]> {
+	let response = MODULE_REQUEST.get_response()?;
+	for module in response.modules() {
+		if module.path().to_bytes().ends_with(b"volume.pkg") {
+			// The module memory is mapped in the HHDM and is 'static for the kernel.
+			let bytes = unsafe { core::slice::from_raw_parts(module.addr(), module.size() as usize) };
+			return Some(bytes);
+		}
+	}
+	None
+}
+
 // Load SystemManager from the init package into a new ring-3 process, handing it
 // one end of a fresh channel as its bootstrap capability. Returns the kernel-held
 // peer endpoint, on which SystemManager's first message arrives. Shared by the
@@ -512,6 +527,101 @@ fn system_manager_demo() {
 			}
 		}
 		Err(reason) => serial_println!("userspace: ERROR - could not start SystemManager: {}", reason),
+	}
+}
+
+// Fill a MemoryObject's frames with `data` (the tail of the last page is left as
+// allocated) by writing through the HHDM. The object is not mapped into any
+// address space here, so its physical frames are reached directly.
+fn copy_into_object(object: &alloc::sync::Arc<object::memory_object::MemoryObject>, data: &[u8]) {
+	let hhdm = mem::hhdm_offset();
+	let page = mem::frame::PAGE_SIZE as usize;
+	for (i, &phys) in object.frames().iter().enumerate() {
+		let start = i * page;
+		if start >= data.len() {
+			break;
+		}
+		let end = core::cmp::min(start + page, data.len());
+		let chunk = &data[start..end];
+		unsafe {
+			core::ptr::copy_nonoverlapping(chunk.as_ptr(), (hhdm + phys) as *mut u8, chunk.len());
+		}
+	}
+}
+
+// Build the M16 storage topology and run it to completion. A MemoryObject holds
+// the ramdisk volume; the StorageManager process maps it and serves files over a
+// service channel; a client process opens vol://system/hello.txt through the
+// manager, receives a shared-buffer capability to the file's bytes, maps it, and
+// reports the contents back over its bootstrap channel. The kernel only brokers
+// the initial capabilities - the open, the resolve, and the zero-copy read all
+// happen in userspace. Returns (expected, actual): the file straight from the
+// volume archive, and the bytes the client read through the manager. Shared by
+// the boot demo and the test.
+fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
+	use alloc::sync::Arc;
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::memory_object::MemoryObject;
+	use object::rights::Rights;
+	use object::KernelObject;
+
+	// the volume archive backing the ramdisk, and the file we expect served
+	let volume = volume_package_bytes().ok_or("volume package module not found")?;
+	let expected = pkg::Package::parse(volume).and_then(|p| p.lookup(b"hello.txt").map(|b| b.to_vec())).ok_or("hello.txt missing from the volume package")?;
+
+	// the userspace programs, from the init package
+	let init = init_package_bytes().ok_or("init package module not found")?;
+	let package = pkg::Package::parse(init).ok_or("init package is malformed")?;
+	let manager_elf = package.lookup(b"storage_manager").ok_or("storage_manager missing from the init package")?;
+	let client_elf = package.lookup(b"storage_client").ok_or("storage_client missing from the init package")?;
+
+	// the ramdisk: a MemoryObject filled with the volume archive via the HHDM
+	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
+	copy_into_object(&ramdisk, volume);
+
+	// channels: a bootstrap per process, plus the manager<->client service channel
+	let (manager_boot_kernel, manager_boot_user) = Channel::create();
+	let (client_boot_kernel, client_boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+
+	// spawn the two processes with their bootstrap endpoints
+	let domain = sched::root_domain();
+	loader::spawn_elf_process(domain.clone(), manager_elf, manager_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageManager")?;
+	loader::spawn_elf_process(domain, client_elf, client_boot_user, Rights::ALL, 0).map_err(|_| "failed to load the storage client")?;
+
+	// hand the manager its ramdisk (with the volume length) and its service
+	// endpoint, then hand the client the other end of that service channel. These
+	// are object-level sends: the kernel attaches the capabilities directly.
+	let mut ramdisk_msg = alloc::vec::Vec::with_capacity(7 + 8);
+	ramdisk_msg.extend_from_slice(b"RAMDISK");
+	ramdisk_msg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
+	let ramdisk_cap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP, 0);
+	manager_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap], 0)).map_err(|_| "manager ramdisk bootstrap failed")?;
+	let service_server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
+	manager_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![service_server_cap], 0)).map_err(|_| "manager serve bootstrap failed")?;
+	let service_client_cap = Capability::new(service_client as Arc<dyn KernelObject>, Rights::ALL, 0);
+	client_boot_kernel.send(Message::new(b"CONNECT".to_vec(), alloc::vec![service_client_cap], 0)).map_err(|_| "client connect bootstrap failed")?;
+
+	// run the cooperative schedule until everyone is done, then read the result
+	sched::run_until_idle();
+	let result = client_boot_kernel.recv().map_err(|_| "the client reported no result")?;
+	Ok((expected, result.bytes))
+}
+
+// Run the M16 storage scenario and report whether the client read the file's
+// bytes through the StorageManager intact.
+#[cfg(not(test))]
+fn storage_demo() {
+	match run_storage_scenario() {
+		Ok((expected, actual)) => {
+			if actual == expected {
+				serial_println!("storage: client read \"{}\" from vol://system/hello.txt via StorageManager", core::str::from_utf8(&actual).unwrap_or("<bad>").trim_end());
+			} else {
+				serial_println!("storage: ERROR - client read {} bytes, expected {}", actual.len(), expected.len());
+			}
+		}
+		Err(reason) => serial_println!("storage: ERROR - {}", reason),
 	}
 }
 
@@ -1132,6 +1242,20 @@ fn init_package_starts_system_manager() {
 
 #[cfg(test)]
 #[test_case]
+fn storage_serves_volume_file_to_client() {
+	// The StorageManager (a ring-3 process) maps a ramdisk volume, and a client
+	// process opens vol://system/hello.txt through it, receives a shared-buffer
+	// capability to the file's bytes, maps it, and reports the contents back. The
+	// bytes the client read must equal the file straight from the volume archive -
+	// an end-to-end, capability-brokered, zero-copy read across two userspace
+	// processes coordinated only by IPC.
+	let (expected, actual) = run_storage_scenario().expect("the storage scenario should run");
+	assert!(!expected.is_empty(), "the volume file should not be empty");
+	assert_eq!(actual, expected);
+}
+
+#[cfg(test)]
+#[test_case]
 fn event_timer_objects() {
 	use object::event::Event;
 	use object::timer::Timer;
@@ -1203,6 +1327,54 @@ fn userspace_runs_and_ipcs() {
 	sched::run_until_idle();
 	let message = ep1.recv().expect("ring-3 program sent a message");
 	assert_eq!(&message.bytes[..], b"OK");
+}
+
+// Kernel-thread body that drops to ring 3 running the embedded cooperative-yield
+// program. Each instance takes a distinct slot so two can be alive on the same
+// core at once (their user pages share the kernel address space at non-overlapping
+// virtual addresses). The program yields several times before reporting in, so two
+// instances interleave through the scheduler.
+#[cfg(test)]
+extern "C" fn user_yield_thread_body(handle: u64) {
+	use core::sync::atomic::{AtomicU64, Ordering};
+	use mem::frame::{self, PAGE_SIZE};
+	static SLOT: AtomicU64 = AtomicU64::new(0);
+	let slot = SLOT.fetch_add(1, Ordering::Relaxed);
+	let code_va = 0x0000_0000_5000_0000 + slot * 0x0010_0000;
+	let stack_va = code_va + 0x0001_0000;
+	let code = frame::allocate().expect("user code frame");
+	let stack = frame::allocate().expect("user stack frame");
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
+	arch::paging::map_page(code_va, code, flags);
+	arch::paging::map_page(stack_va, stack, flags);
+	let program = arch::usermode::program_yield_bytes();
+	unsafe {
+		core::ptr::copy_nonoverlapping(program.as_ptr(), code_va as *mut u8, program.len());
+		arch::usermode::enter(code_va, stack_va + PAGE_SIZE, handle);
+	}
+	arch::paging::unmap_page(code_va);
+	arch::paging::unmap_page(stack_va);
+	frame::deallocate(code);
+	frame::deallocate(stack);
+}
+
+#[cfg(test)]
+#[test_case]
+fn userspace_yields_cooperatively() {
+	use object::channel::Channel;
+	// Two ring-3 threads share one core and each call SYS_YIELD several times
+	// before sending "OK". The yields interleave them through the scheduler, which
+	// only works if every syscall saves its user return state (rip/rsp/rflags) and
+	// its kernel syscall stack per thread - a single per-CPU slot would be clobbered
+	// by the sibling and one thread would return to the wrong context. Both messages
+	// arriving proves the save path is per-thread.
+	let (k0, u0) = Channel::create();
+	let (k1, u1) = Channel::create();
+	sched::spawn_with_object(user_yield_thread_body, u0, object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(user_yield_thread_body, u1, object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert_eq!(&k0.recv().expect("first ring-3 thread sent a message").bytes[..], b"OK");
+	assert_eq!(&k1.recv().expect("second ring-3 thread sent a message").bytes[..], b"OK");
 }
 
 #[cfg(test)]

@@ -80,6 +80,8 @@ make_iso() {
 	cp "$staged" "$iso_root/boot/kernel"
 	[[ -f "$BUILD/init.pkg" ]] || die "init package not found: $BUILD/init.pkg (build the kernel first)"
 	cp "$BUILD/init.pkg" "$iso_root/boot/init.pkg"
+	[[ -f "$BUILD/volume.pkg" ]] || die "volume package not found: $BUILD/volume.pkg (build the kernel first)"
+	cp "$BUILD/volume.pkg" "$iso_root/boot/volume.pkg"
 	render_conf "$iso_root/boot/limine/limine.conf"
 	cp "$LIMINE_DIR/limine-bios.sys" "$iso_root/boot/limine/"
 	cp "$LIMINE_DIR/limine-bios-cd.bin" "$iso_root/boot/limine/"
@@ -141,6 +143,8 @@ make_img() {
 	mcopy "$staged" z:/boot/kernel
 	[[ -f "$BUILD/init.pkg" ]] || die "init package not found: $BUILD/init.pkg (build the kernel first)"
 	mcopy "$BUILD/init.pkg" z:/boot/init.pkg
+	[[ -f "$BUILD/volume.pkg" ]] || die "volume package not found: $BUILD/volume.pkg (build the kernel first)"
+	mcopy "$BUILD/volume.pkg" z:/boot/volume.pkg
 	mcopy "$conf" z:/boot/limine/limine.conf
 	mcopy "$LIMINE_DIR/limine-bios.sys" z:/boot/limine/
 	mcopy "$LIMINE_DIR/BOOTX64.EFI" z:/EFI/BOOT/

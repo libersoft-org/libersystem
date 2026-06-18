@@ -21,6 +21,7 @@ use core::arch::global_asm;
 
 use super::gdt;
 use super::percpu;
+use crate::sched;
 
 // User selectors with RPL 3 (loaded by iretq into CS/SS).
 const USER_CS: u64 = (gdt::USER_CODE64_SELECTOR | 3) as u64;
@@ -34,10 +35,12 @@ const USER_RFLAGS: u64 = 0x202;
 pub const FAULT_PROBE_ADDR: u64 = 0x0dea_d000;
 
 extern "C" {
-	fn user_enter(entry: u64, user_stack: u64, arg: u64);
+	fn user_enter(entry: u64, user_stack: u64, arg: u64, ksave: u64);
 	fn user_return() -> !;
 	fn user_program_start();
 	fn user_program_end();
+	fn user_yield_program_start();
+	fn user_yield_program_end();
 	fn user_fault_program_start();
 	fn user_fault_program_end();
 }
@@ -57,7 +60,16 @@ pub unsafe fn enter(entry: u64, user_stack: u64, arg: u64) {
 	// transparent.
 	let rflags: u64;
 	core::arch::asm!("pushfq", "pop {}", out(reg) rflags, options(preserves_flags));
-	user_enter(entry, user_stack, arg);
+	// Park the kernel stack pointer in the running thread, not just the per-CPU
+	// block, so a ring-3 syscall that yields to another cooperative service on the
+	// same core finds the right stack again when the scheduler switches back.
+	let ksave: u64 = sched::current_thread().map_or(0, |thread| thread.syscall_rsp_addr() as u64);
+	user_enter(entry, user_stack, arg, ksave);
+	// The excursion is over: this thread is no longer in ring 3, so clear the
+	// parked pointer to keep a stale value out of a later scheduler restore.
+	if let Some(thread) = sched::current_thread() {
+		thread.set_syscall_rsp(0);
+	}
 	if rflags & (1 << 9) != 0 {
 		super::enable_interrupts();
 	}
@@ -86,11 +98,21 @@ pub fn program_fault_bytes() -> &'static [u8] {
 	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
 }
 
+// The bytes of the embedded ring-3 cooperative-yield program (position-
+// independent machine code, copied into a USER page before entering). It yields a
+// few times - forcing it to interleave with a sibling ring-3 thread - then sends
+// "OK" over its bootstrap channel and exits.
+pub fn program_yield_bytes() -> &'static [u8] {
+	let start = user_yield_program_start as *const () as usize;
+	let end = user_yield_program_end as *const () as usize;
+	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
+}
+
 global_asm!(
 	".text",
 	".global user_enter",
 	"user_enter:",
-	// rdi = entry, rsi = user stack top, rdx = bootstrap arg.
+	// rdi = entry, rsi = user stack top, rdx = bootstrap arg, rcx = ksave slot.
 	"push rbp",
 	"push rbx",
 	"push r12",
@@ -98,6 +120,12 @@ global_asm!(
 	"push r14",
 	"push r15",
 	"mov gs:[{krsp}], rsp",
+	// Mirror the parked kernel stack pointer into the thread's own slot (if one was
+	// supplied) so the scheduler can restore it on a later context switch.
+	"test rcx, rcx",
+	"jz 1f",
+	"mov [rcx], rsp",
+	"1:",
 	// Build the iretq frame (pushed high to low: SS, RSP, RFLAGS, CS, RIP).
 	"push {uds}",
 	"push rsi",
@@ -173,6 +201,45 @@ global_asm!(
 	"user_program_end:",
 	send = const crate::syscall::SYS_CHANNEL_SEND,
 	write = const crate::syscall::SYS_DEBUG_WRITE,
+	exit = const crate::syscall::SYS_USER_EXIT,
+);
+
+// Embedded ring-3 cooperative-yield program. Position-independent. On entry rdi
+// holds a bootstrap Channel handle. It saves the handle on its user stack, calls
+// SYS_YIELD several times (so two instances on one core interleave through the
+// scheduler), then sends "OK" over the channel and exits. A syscall preserves the
+// caller's stack and return state but not its general registers, so the handle is
+// reloaded from the stack before the send.
+global_asm!(
+	".text",
+	".global user_yield_program_start",
+	"user_yield_program_start:",
+	"push rdi",
+	"mov eax, {yld}",
+	"syscall",
+	"mov eax, {yld}",
+	"syscall",
+	"mov eax, {yld}",
+	"syscall",
+	// SYS_CHANNEL_SEND(handle = saved rdi, bytes = rsp, len = 2, xfer = 0).
+	"mov rdi, [rsp]",
+	"sub rsp, 16",
+	"mov word ptr [rsp], 0x4b4f", // 'O', 'K'
+	"mov rsi, rsp",
+	"mov edx, 2",
+	"xor r10d, r10d",
+	"mov eax, {send}",
+	"syscall",
+	"add rsp, 16",
+	// SYS_USER_EXIT - returns control to the kernel; should not come back.
+	"mov eax, {exit}",
+	"syscall",
+	"3:",
+	"jmp 3b",
+	".global user_yield_program_end",
+	"user_yield_program_end:",
+	yld = const crate::syscall::SYS_YIELD,
+	send = const crate::syscall::SYS_CHANNEL_SEND,
 	exit = const crate::syscall::SYS_USER_EXIT,
 );
 

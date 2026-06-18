@@ -1,0 +1,19 @@
+[package]
+name = "storage"
+# Source of truth for product metadata is /product.conf; this version tracks the
+# kernel's. The storage crate produces the userspace StorageManager service and a
+# small demo client, both loaded from the init package.
+version = "0.0.1"
+edition = "2021"
+description = "LiberSystem StorageManager and demo client"
+
+[[bin]]
+name = "storage_manager"
+path = "src/manager.rs"
+
+[[bin]]
+name = "storage_client"
+path = "src/client.rs"
+
+# Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
+# we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

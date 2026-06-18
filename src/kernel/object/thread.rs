@@ -50,6 +50,11 @@ pub struct Thread {
 	state: AtomicU32,
 	// Saved stack pointer while the thread is not running on a core.
 	kstack_ptr: AtomicU64,
+	// Parked kernel stack pointer a ring-3 syscall switches onto, set by
+	// usermode::enter while this thread is in ring 3 (0 otherwise). The scheduler
+	// restores it into the per-CPU block on every switch, so cooperative ring-3
+	// services that yield to one another on one core keep separate syscall stacks.
+	syscall_rsp: AtomicU64,
 	// Owns the kernel stack memory; accessed only through kstack_ptr.
 	stack: Box<[u8]>,
 	// The process this thread belongs to. It owns the address space, handle table,
@@ -79,7 +84,7 @@ impl Thread {
 	fn build(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Arc<Self> {
 		let mut stack = alloc::vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
 		let sp = arch::context::init_thread_stack(&mut stack, entry, arg);
-		Arc::new(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), stack, process })
+		Arc::new(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, process })
 	}
 
 	pub fn tid(&self) -> u64 {
@@ -120,6 +125,20 @@ impl Thread {
 
 	pub fn kstack_ptr_load(&self) -> u64 {
 		self.kstack_ptr.load(Ordering::Acquire)
+	}
+
+	// Address of the parked-syscall-stack slot, stored into by usermode::enter so
+	// the value follows this specific thread rather than the per-CPU block.
+	pub fn syscall_rsp_addr(&self) -> *mut u64 {
+		self.syscall_rsp.as_ptr()
+	}
+
+	pub fn syscall_rsp_load(&self) -> u64 {
+		self.syscall_rsp.load(Ordering::Acquire)
+	}
+
+	pub fn set_syscall_rsp(&self, value: u64) {
+		self.syscall_rsp.store(value, Ordering::Release);
 	}
 }
 

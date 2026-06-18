@@ -67,6 +67,15 @@ pub fn disable_interrupts() {
 	}
 }
 
+// True if maskable interrupts are currently enabled on the running core (RFLAGS.IF).
+pub fn interrupts_enabled() -> bool {
+	let flags: u64;
+	unsafe {
+		asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags));
+	}
+	flags & (1 << 9) != 0
+}
+
 // halt the kernel in an infinite loop, halting on each iteration
 pub fn halt_loop() -> ! {
 	loop {

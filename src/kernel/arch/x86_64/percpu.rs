@@ -79,6 +79,15 @@ pub fn this_cpu() -> &'static PerCpu {
 	unsafe { &*(base as *const PerCpu) }
 }
 
+// Set the running core's parked kernel stack pointer, the stack a ring-3 syscall
+// switches onto. The scheduler restores it from the incoming thread on every
+// context switch, so it always tracks the thread currently able to enter ring 3
+// even when cooperative services yield to one another on the same core.
+pub fn set_kernel_rsp(value: u64) {
+	let base = msr::read(IA32_GS_BASE);
+	unsafe { (*(base as *mut PerCpu)).kernel_rsp = value };
+}
+
 // True while the running core is servicing a syscall issued from ring 3.
 pub fn in_user_syscall() -> bool {
 	this_cpu().from_user != 0

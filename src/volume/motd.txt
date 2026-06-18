@@ -1,0 +1,2 @@
+LiberSystem - a capability microkernel.
+Files on this volume are served by the userspace StorageManager over vol://.

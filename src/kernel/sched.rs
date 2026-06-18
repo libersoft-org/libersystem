@@ -210,6 +210,12 @@ fn reschedule(disp: Disposition) {
 	let sched = &SCHED[current_cpu_id()];
 	reap(sched);
 
+	// The interrupt flag is not part of the saved context, so capture it here and
+	// restore it when this thread is switched back to. A ring-3 syscall runs with
+	// interrupts masked (FMASK); without this, yielding out of one would leave the
+	// next thread - and eventually the bootstrap context - running masked.
+	let resume_if = arch::interrupts_enabled();
+
 	let mut guard = sched.inner.lock();
 	let next = guard.run_queue.pop_front();
 	let prev = guard.current.take();
@@ -220,10 +226,21 @@ fn reschedule(disp: Disposition) {
 			next.set_state(ThreadState::Running);
 			let new_sp = next.kstack_ptr_load();
 			let new_cr3 = next.address_space().cr3();
+			// Track the incoming thread's parked syscall stack on this core, so a
+			// ring-3 syscall it issues after resuming lands on its own kernel stack
+			// even though cooperative services share the per-CPU block.
+			let new_syscall_rsp = next.syscall_rsp_load();
 			guard.current = Some(next);
 			drop(guard);
+			arch::percpu::set_kernel_rsp(new_syscall_rsp);
 			switch_address_space(new_cr3);
 			unsafe { arch::context::switch_context(old_sp, new_sp) };
+			// Resumed on this thread: restore the interrupt state it yielded with.
+			if resume_if {
+				arch::enable_interrupts();
+			} else {
+				arch::disable_interrupts();
+			}
 		}
 		None => match prev {
 			// Idle context with nothing to run: return to the idle loop.

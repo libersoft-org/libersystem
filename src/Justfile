@@ -3,6 +3,7 @@
 
 kernel_dir := "kernel"
 user_dir := "user/system_manager"
+storage_dir := "user/storage"
 target := "x86_64-unknown-none"
 kernel_elf := kernel_dir / "target" / target / "debug" / "kernel"
 
@@ -12,6 +13,7 @@ default: run
 # build the userspace programs that make up the init package
 user:
 	cd {{user_dir}} && cargo build
+	cd {{storage_dir}} && cargo build
 
 # build the kernel (its build.rs assembles the init package from the userspace build)
 build: user
@@ -51,16 +53,19 @@ img size="64M" strip="debug": build
 fmt:
 	cd {{kernel_dir}} && cargo fmt
 	cd {{user_dir}} && cargo fmt
+	cd {{storage_dir}} && cargo fmt
 	shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # check formatting without writing changes (CI-friendly)
 fmt-check:
 	cd {{kernel_dir}} && cargo fmt --check
 	cd {{user_dir}} && cargo fmt --check
+	cd {{storage_dir}} && cargo fmt --check
 	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # clean build artifacts
 clean:
 	cd {{kernel_dir}} && cargo clean
 	cd {{user_dir}} && cargo clean
+	cd {{storage_dir}} && cargo clean
 	rm -rf boot/.build

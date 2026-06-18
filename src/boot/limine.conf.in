@@ -6,3 +6,4 @@ timeout: 0
 	protocol: limine
 	path: boot():/boot/kernel
 	module_path: boot():/boot/init.pkg
+	module_path: boot():/boot/volume.pkg
