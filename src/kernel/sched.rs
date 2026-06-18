@@ -15,6 +15,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch;
@@ -34,6 +35,9 @@ enum Disposition {
 	Requeue,
 	// Thread has exited: move it aside to be reaped, never run it again.
 	Retire,
+	// Thread blocked in `wait`: deschedule it without requeueing. It is kept alive
+	// by the wait registry (WAITERS) and re-enqueued when woken.
+	Block,
 }
 
 struct CpuSchedInner {
@@ -56,6 +60,23 @@ impl CpuSched {
 }
 
 static SCHED: [CpuSched; MAX_CPUS] = [const { CpuSched::new() }; MAX_CPUS];
+
+// A thread blocked in `wait`, parked here (off every run queue) until the object
+// it waits on becomes ready or its deadline passes. The Arc keeps the thread
+// alive while blocked. `deadline` is an absolute LAPIC tick value; u64::MAX means
+// no timeout. `koid` is the object whose readiness wakes the thread (0 = none).
+struct Waiter {
+	thread: Arc<Thread>,
+	koid: u64,
+	deadline: u64,
+}
+
+// The global wait registry. One lock for all blocked threads is enough at this
+// scale; per-object/per-CPU wait queues are a later refinement.
+static WAITERS: SpinLock<Vec<Waiter>> = SpinLock::new(Vec::new());
+
+// No-deadline sentinel for `wait`.
+pub const NO_DEADLINE: u64 = u64::MAX;
 
 // The kernel address space shared by all kernel threads. Set once at init().
 static KERNEL_AS: SpinLock<Option<Arc<AddressSpace>>> = SpinLock::new(None);
@@ -169,18 +190,113 @@ pub fn exit() -> ! {
 	arch::halt_loop()
 }
 
+// Block the calling thread until woken: register it in the wait registry keyed on
+// `koid` (the object whose readiness will wake it) with an absolute tick
+// `deadline` (NO_DEADLINE for none), then deschedule. Returns once the thread has
+// been woken by wake_object(koid) or check_deadlines() and rescheduled onto a
+// core. The caller re-checks its wait condition after each return (a condition-
+// variable loop), so spurious or early wakes are harmless.
+//
+// Holding the current-thread Arc across reschedule(Block) is safe: unlike exit()
+// and the fault longjmp, reschedule(Block) RETURNS when the thread is woken, so
+// the Arc's destructor still runs normally.
+pub fn block_on(koid: u64, deadline: u64) {
+	let thread = match current_thread() {
+		Some(t) => t,
+		None => return,
+	};
+	thread.set_state(ThreadState::Blocked);
+	WAITERS.lock().push(Waiter { thread, koid, deadline });
+	reschedule(Disposition::Block);
+}
+
+// Wake every thread blocked on object `koid`: remove it from the wait registry,
+// mark it Ready, and enqueue it on this core's run queue.
+pub fn wake_object(koid: u64) {
+	let woken = {
+		let mut waiters = WAITERS.lock();
+		let mut woken: Vec<Arc<Thread>> = Vec::new();
+		let mut i: usize = 0;
+		while i < waiters.len() {
+			if waiters[i].koid == koid {
+				woken.push(waiters.remove(i).thread);
+			} else {
+				i += 1;
+			}
+		}
+		woken
+	};
+	for thread in woken {
+		enqueue(thread);
+	}
+}
+
+// Wake every blocked thread whose deadline has passed (timed out). Called at the
+// scheduler's idle points; with preemption (M19) the timer ISR will also call it.
+pub fn check_deadlines() {
+	let now = arch::apic::ticks();
+	let expired = {
+		let mut waiters = WAITERS.lock();
+		let mut expired: Vec<Arc<Thread>> = Vec::new();
+		let mut i: usize = 0;
+		while i < waiters.len() {
+			if waiters[i].deadline <= now {
+				expired.push(waiters.remove(i).thread);
+			} else {
+				i += 1;
+			}
+		}
+		expired
+	};
+	for thread in expired {
+		enqueue(thread);
+	}
+}
+
+// The earliest finite deadline among blocked threads, if any.
+fn min_deadline() -> Option<u64> {
+	WAITERS.lock().iter().map(|w: &Waiter| w.deadline).filter(|d: &u64| *d != NO_DEADLINE).min()
+}
+
+// Make a woken thread runnable again on the current core.
+fn enqueue(thread: Arc<Thread>) {
+	thread.set_state(ThreadState::Ready);
+	SCHED[current_cpu_id()].inner.lock().run_queue.push_back(thread);
+}
+
 // Run ready threads on the current core until the run queue drains, then return.
 // Used by the bootstrap context to drive cooperative kernel threads to completion.
+// If the queue drains while threads are blocked with a deadline, spin until the
+// nearest deadline and wake them, so a timed wait completes; threads blocked with
+// no deadline (waiting on an object nothing will signal here) are left parked and
+// this returns.
 pub fn run_until_idle() {
-	while !SCHED[current_cpu_id()].inner.lock().run_queue.is_empty() {
-		reschedule(Disposition::Requeue);
+	let cpu = current_cpu_id();
+	loop {
+		while !SCHED[cpu].inner.lock().run_queue.is_empty() {
+			reschedule(Disposition::Requeue);
+		}
+		match min_deadline() {
+			Some(deadline) => {
+				while arch::apic::ticks() < deadline {
+					core::hint::spin_loop();
+				}
+				check_deadlines();
+			}
+			None => break,
+		}
 	}
-	reap(&SCHED[current_cpu_id()]);
+	reap(&SCHED[cpu]);
 }
 
 // Idle loop for application processors: run any ready thread, otherwise spin and
 // re-check. Cores park here instead of halting so threads can be scheduled onto
 // them; a power-friendly wait (halt + wakeup IPI) is a later refinement.
+//
+// APs deliberately do NOT touch the wait registry: in this cooperative milestone
+// blocked threads and their deadlines are driven by run_until_idle on the BSP, so
+// only the BSP wakes them. A waiter blocked on the BSP must not be stolen onto an
+// AP's run queue. True per-core timed waits arrive with preemption (M19).
 pub fn cpu_idle_loop() -> ! {
 	loop {
 		reschedule(Disposition::Requeue);
@@ -265,6 +381,24 @@ fn reschedule(disp: Disposition) {
 					prev.set_state(ThreadState::Running);
 					guard.current = Some(prev);
 				}
+				Disposition::Block => {
+					// Blocked with nothing else ready: save our SP and switch to
+					// this core's idle context on the kernel address space. The
+					// wait registry keeps us alive; we resume right here when woken
+					// and rescheduled onto a core.
+					let old_sp = prev.kstack_ptr_addr();
+					guard.current = None;
+					let new_sp = sched.idle_sp.load(Ordering::Acquire);
+					drop(guard);
+					switch_address_space(KERNEL_CR3.load(Ordering::Acquire));
+					unsafe { arch::context::switch_context(old_sp, new_sp) };
+					// Woken and resumed: restore the interrupt state we blocked with.
+					if resume_if {
+						arch::enable_interrupts();
+					} else {
+						arch::disable_interrupts();
+					}
+				}
 			},
 		},
 	}
@@ -286,6 +420,11 @@ fn stash_prev(inner: &mut CpuSchedInner, sched: &CpuSched, prev: Option<Arc<Thre
 				Disposition::Requeue => {
 					prev.set_state(ThreadState::Ready);
 					inner.run_queue.push_back(prev);
+				}
+				Disposition::Block => {
+					// State is already Blocked; keep the thread off the run queue and
+					// the zombie slot. The wait registry holds the Arc that keeps it
+					// alive, so dropping this one is fine.
 				}
 			}
 			slot

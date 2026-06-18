@@ -19,6 +19,7 @@ pub const SYS_CHANNEL_SEND: u64 = 9;
 pub const SYS_CHANNEL_RECV: u64 = 10;
 pub const SYS_USER_EXIT: u64 = 17;
 pub const SYS_YIELD: u64 = 21;
+pub const SYS_WAIT: u64 = 23;
 
 // error codes (Linux-style small negatives; must match src/kernel/syscall.rs)
 pub const ERR_WOULD_BLOCK: i64 = -8;
@@ -83,6 +84,14 @@ pub unsafe fn yield_now() {
 	syscall(SYS_YIELD, 0, 0, 0, 0);
 }
 
+// Block until the object behind `handle` becomes ready (a channel readable, an
+// event signaled, a timer expired) or `deadline` (absolute ticks; 0 = no
+// timeout) passes. Returns 0 when ready, a small negative error otherwise. This
+// sleeps the thread at ~0% CPU instead of busy-yielding.
+pub unsafe fn wait(handle: u64, deadline: u64) -> i64 {
+	syscall(SYS_WAIT, handle, deadline, 0, 0) as i64
+}
+
 // The outcome of a blocking receive.
 pub enum Received {
 	// A message arrived: `len` payload bytes were written to the buffer and a
@@ -101,7 +110,9 @@ pub unsafe fn recv_blocking(channel: u64, buf: &mut [u8]) -> Received {
 		let result: u64 = syscall(SYS_CHANNEL_RECV, channel, buf.as_mut_ptr() as u64, buf.len() as u64, &mut handle as *mut u64 as u64);
 		let signed: i64 = result as i64;
 		if signed == ERR_WOULD_BLOCK {
-			yield_now();
+			// Block until the channel is readable (a message arrives or the peer
+			// closes) rather than busy-yielding. No deadline: wait indefinitely.
+			wait(channel, 0);
 			continue;
 		}
 		if signed < 0 {

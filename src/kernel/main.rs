@@ -1298,6 +1298,66 @@ fn channel_message_and_capability_transfer() {
 
 #[cfg(test)]
 #[test_case]
+fn blocking_wait_wakes_on_message() {
+	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+	static OK: AtomicBool = AtomicBool::new(false);
+	static WAIT_RET: AtomicI64 = AtomicI64::new(-999);
+	// The server blocks in SYS_WAIT on its (empty) channel - descheduled, not
+	// spinning. The client then sends, which wakes the server; it returns from
+	// wait with success and recv's the message. Exercises block_on + wake_object +
+	// the reschedule Block path end to end.
+	extern "C" fn server(ch: u64) {
+		unsafe {
+			let ret = arch::syscall::invoke(syscall::SYS_WAIT, ch, 0, 0, 0);
+			WAIT_RET.store(ret as i64, Ordering::SeqCst);
+			let mut buf = [0u8; 8];
+			let mut xfer: u64 = 0;
+			let n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, ch, buf.as_mut_ptr() as u64, buf.len() as u64, &mut xfer as *mut u64 as u64);
+			assert!(!syscall::sys_is_err(n));
+			assert_eq!(&buf[..n as usize], b"ping");
+			OK.store(true, Ordering::SeqCst);
+		}
+	}
+	extern "C" fn client(ch: u64) {
+		unsafe {
+			let payload = *b"ping";
+			let sent = arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, ch, payload.as_ptr() as u64, payload.len() as u64, 0);
+			assert!(!syscall::sys_is_err(sent));
+		}
+	}
+	let (ep0, ep1) = object::channel::Channel::create();
+	// Spawn the server first so it runs and blocks before the client sends.
+	sched::spawn_with_object(server, ep0, object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(client, ep1, object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(OK.load(Ordering::SeqCst));
+	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(test)]
+#[test_case]
+fn blocking_wait_times_out_on_deadline() {
+	use core::sync::atomic::{AtomicI64, Ordering};
+	static WAIT_RET: AtomicI64 = AtomicI64::new(-999);
+	// A thread waits on an event that is never signaled, with a short absolute
+	// deadline. The wait must wake itself when the deadline passes and report
+	// ERR_TIMED_OUT - the timed-wait path (the scheduler's deadline check).
+	extern "C" fn waiter(_arg: u64) {
+		unsafe {
+			let ev = arch::syscall::invoke(syscall::SYS_EVENT_CREATE, 0, 0, 0, 0);
+			let now = arch::syscall::invoke(syscall::SYS_CLOCK_GET, 0, 0, 0, 0);
+			let deadline = now + 3; // ~30 ms at the 100 Hz tick
+			let ret = arch::syscall::invoke(syscall::SYS_WAIT, ev, deadline, 0, 0);
+			WAIT_RET.store(ret as i64, Ordering::SeqCst);
+		}
+	}
+	sched::spawn(waiter, 0);
+	sched::run_until_idle();
+	assert_eq!(WAIT_RET.load(Ordering::SeqCst), syscall::ERR_TIMED_OUT);
+}
+
+#[cfg(test)]
+#[test_case]
 fn channel_endpoint_semantics() {
 	use object::channel::{Channel, ChannelError, Message};
 	let (a, b) = Channel::create();

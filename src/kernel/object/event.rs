@@ -13,6 +13,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{KernelObject, ObjectHeader, ObjectType};
+use crate::sched;
 
 pub struct Event {
 	header: ObjectHeader,
@@ -27,6 +28,8 @@ impl Event {
 	// Raise the signal.
 	pub fn signal(&self) {
 		self.signaled.store(true, Ordering::Release);
+		// Wake any thread blocked waiting on this event.
+		sched::wake_object(self.header.koid());
 	}
 
 	// Lower the signal.

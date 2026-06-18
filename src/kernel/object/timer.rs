@@ -40,6 +40,16 @@ impl Timer {
 	pub fn is_expired(&self) -> bool {
 		self.armed.load(Ordering::Acquire) && arch::apic::ticks() >= self.deadline.load(Ordering::Acquire)
 	}
+
+	// The armed deadline in ticks, or None if the timer is not armed. Used by `wait`
+	// to wake the caller when the timer fires.
+	pub fn deadline(&self) -> Option<u64> {
+		if self.armed.load(Ordering::Acquire) {
+			Some(self.deadline.load(Ordering::Acquire))
+		} else {
+			None
+		}
+	}
 }
 
 impl KernelObject for Timer {

@@ -21,6 +21,7 @@ use core::any::Any;
 
 use super::handle::Capability;
 use super::{KernelObject, ObjectHeader, ObjectType};
+use crate::sched;
 use crate::sync::SpinLock;
 
 // Bounded queue depth per endpoint. A full queue makes send report Full, the
@@ -79,15 +80,25 @@ impl Channel {
 		self.peer().is_none()
 	}
 
+	// True if a recv on this endpoint would not block: a message is queued, or the
+	// peer has closed (recv then reports PeerClosed). The readiness `wait` tests.
+	pub fn is_readable(&self) -> bool {
+		!self.inbox.lock().is_empty() || self.is_peer_closed()
+	}
+
 	// Deliver a message to the peer's inbox. Non-blocking: Full if the peer's
 	// queue is at its limit, PeerClosed if the peer is gone.
 	pub fn send(&self, msg: Message) -> Result<(), ChannelError> {
 		let peer = self.peer().ok_or(ChannelError::PeerClosed)?;
-		let mut inbox = peer.inbox.lock();
-		if inbox.len() >= CHANNEL_QUEUE_LIMIT {
-			return Err(ChannelError::Full);
+		{
+			let mut inbox = peer.inbox.lock();
+			if inbox.len() >= CHANNEL_QUEUE_LIMIT {
+				return Err(ChannelError::Full);
+			}
+			inbox.push_back(msg);
 		}
-		inbox.push_back(msg);
+		// The peer endpoint is now readable: wake any thread blocked waiting on it.
+		sched::wake_object(peer.header.koid());
 		Ok(())
 	}
 
@@ -117,5 +128,15 @@ impl KernelObject for Channel {
 
 	fn as_any(&self) -> &dyn Any {
 		self
+	}
+}
+
+impl Drop for Channel {
+	fn drop(&mut self) {
+		// This endpoint is closing; wake any thread blocked waiting on the peer so
+		// its recv/wait observes the now-closed channel.
+		if let Some(peer) = self.peer() {
+			sched::wake_object(peer.header.koid());
+		}
 	}
 }

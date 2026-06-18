@@ -30,6 +30,9 @@ pub enum ThreadState {
 	Ready = 0,
 	Running = 1,
 	Exited = 2,
+	// Descheduled, waiting for an object to become ready or a deadline to pass.
+	// The thread is held alive by the scheduler's wait registry, not a run queue.
+	Blocked = 3,
 }
 
 impl ThreadState {
@@ -37,6 +40,7 @@ impl ThreadState {
 		match value {
 			1 => ThreadState::Running,
 			2 => ThreadState::Exited,
+			3 => ThreadState::Blocked,
 			_ => ThreadState::Ready,
 		}
 	}

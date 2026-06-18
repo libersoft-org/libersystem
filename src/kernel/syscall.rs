@@ -15,6 +15,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::arch;
@@ -27,7 +28,7 @@ use crate::object::handle::{Capability, Handle, HandleError};
 use crate::object::memory_object::{MemoryError, MemoryObject};
 use crate::object::rights::Rights;
 use crate::object::timer::Timer;
-use crate::object::ObjectType;
+use crate::object::{KernelObject, ObjectType};
 use crate::sched;
 
 // Syscall numbers (the stable ABI index).
@@ -54,6 +55,7 @@ pub const SYS_DOMAIN_CREATE: u64 = 19;
 pub const SYS_DOMAIN_KILL: u64 = 20;
 pub const SYS_YIELD: u64 = 21;
 pub const SYS_OBJECT_INFO_GET: u64 = 22;
+pub const SYS_WAIT: u64 = 23;
 
 // Error codes (small negatives, returned in the syscall result register).
 pub const ERR_BAD_SYSCALL: i64 = -1;
@@ -66,6 +68,7 @@ pub const ERR_NOT_MAPPED: i64 = -7;
 pub const ERR_WOULD_BLOCK: i64 = -8;
 pub const ERR_PEER_CLOSED: i64 = -9;
 pub const ERR_RESOURCE_EXHAUSTED: i64 = -10;
+pub const ERR_TIMED_OUT: i64 = -11;
 
 // True if a syscall return value encodes an error (the range [-4095, -1]).
 pub fn sys_is_err(ret: u64) -> bool {
@@ -162,6 +165,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 			0
 		}
 		SYS_OBJECT_INFO_GET => sys_object_info_get(a0, a1, a2),
+		SYS_WAIT => sys_wait(a0, a1),
 		_ => ERR_BAD_SYSCALL,
 	};
 	result as u64
@@ -413,6 +417,69 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 		}
 	}
 	n as i64
+}
+
+// Block the calling thread until the object behind `handle` becomes ready (a
+// Channel readable, an Event signaled, a Timer expired) or `deadline` (an
+// absolute LAPIC tick value; 0 = no timeout) passes. Returns 0 when the object
+// became ready, ERR_TIMED_OUT on timeout. This is the kernel's one blocking
+// primitive; the non-blocking send/recv/poll calls layer the synchronous-looking
+// `call()` on top of it. The handle must carry the WAIT right.
+fn sys_wait(handle: u64, deadline: u64) -> i64 {
+	let thread = match sched::current_thread() {
+		Some(t) => t,
+		None => return ERR_NO_THREAD,
+	};
+	let object = {
+		let table = thread.handles().lock();
+		match table.lookup(Handle::from_raw(handle), Rights::WAIT) {
+			Ok(o) => o,
+			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
+			Err(_) => return ERR_BAD_HANDLE,
+		}
+	};
+	let koid = object.header().koid();
+	// Condition-variable loop: re-check readiness after each wake, so an early or
+	// spurious wake just re-blocks and a deadline is honored on re-check.
+	loop {
+		if object_ready(&object) {
+			return 0;
+		}
+		let block_deadline = wait_block_deadline(&object, deadline);
+		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
+			return ERR_TIMED_OUT;
+		}
+		sched::block_on(koid, block_deadline);
+	}
+}
+
+// Whether the waitable object behind a handle is currently ready. A non-waitable
+// object type is never ready (the wait would block until its deadline).
+fn object_ready(object: &Arc<dyn KernelObject>) -> bool {
+	let any = object.as_any();
+	if let Some(channel) = any.downcast_ref::<Channel>() {
+		return channel.is_readable();
+	}
+	if let Some(event) = any.downcast_ref::<Event>() {
+		return event.is_signaled();
+	}
+	if let Some(timer) = any.downcast_ref::<Timer>() {
+		return timer.is_expired();
+	}
+	false
+}
+
+// The tick deadline to block until: the caller's timeout (0 = none) capped by an
+// armed Timer's own deadline, so a wait on a timer wakes in time to observe it
+// expire.
+fn wait_block_deadline(object: &Arc<dyn KernelObject>, deadline: u64) -> u64 {
+	let caller = if deadline == 0 { sched::NO_DEADLINE } else { deadline };
+	if let Some(timer) = object.as_any().downcast_ref::<Timer>() {
+		if let Some(timer_deadline) = timer.deadline() {
+			return core::cmp::min(caller, timer_deadline);
+		}
+	}
+	caller
 }
 
 // Copy the current process's recorded fault into the caller's buffer. Returns 1
