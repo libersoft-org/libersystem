@@ -145,6 +145,15 @@ pub fn thread_create(process: Arc<Process>, entry: extern "C" fn(u64), arg: u64)
 // Yield the current core to the next ready thread, if any.
 pub fn yield_now() {
 	reschedule(Disposition::Requeue);
+	// A cooperative kill point: if this thread's process was terminated while it
+	// was descheduled (by a fault or a Domain kill), exit now instead of resuming.
+	// The current-thread Arc must be released before exit(): exit() never returns,
+	// so holding the Arc across it would leak a reference and pin the thread,
+	// keeping its slot from ever being refunded.
+	let killed = current_thread().map_or(false, |thread| thread.process().is_killed());
+	if killed {
+		exit();
+	}
 }
 
 // The thread currently running on this core, if any (None in the idle context).

@@ -140,7 +140,7 @@ impl HandleTable {
 	// per-create quota is enforced by `try_insert`.
 	pub fn insert(&mut self, cap: Capability) -> Handle {
 		if let Some(domain) = &self.domain {
-			domain.account().charge_handle();
+			domain.charge_handle();
 		}
 		self.place(cap)
 	}
@@ -154,7 +154,7 @@ impl HandleTable {
 	// (charging nothing) if the table's Domain is at its handle cap.
 	pub fn try_insert(&mut self, cap: Capability) -> Option<Handle> {
 		if let Some(domain) = &self.domain {
-			if !domain.account().try_charge_handle() {
+			if !domain.try_charge_handle() {
 				return None;
 			}
 		}
@@ -244,9 +244,33 @@ impl HandleTable {
 		slot.generation = slot.generation.wrapping_add(1);
 		self.free.push(index as u32);
 		if let Some(domain) = &self.domain {
-			domain.account().uncharge_handles(1);
+			domain.uncharge_handles(1);
 		}
 		Ok(())
+	}
+
+	// Close every live handle at once, refunding each to the Domain and dropping
+	// the objects they held. Used by bulk process termination so a killed process's
+	// handles (and the memory those objects pinned) are released eagerly, without
+	// the cooperation of its threads. After this the table is empty, so the Drop
+	// refund finds nothing left to return - the two paths never double-count.
+	pub fn close_all(&mut self) {
+		let mut closed: u64 = 0;
+		self.free.clear();
+		for index in 0..self.slots.len() {
+			let slot = &mut self.slots[index];
+			if slot.cap.is_some() {
+				slot.cap = None;
+				slot.generation = slot.generation.wrapping_add(1);
+				closed += 1;
+			}
+			self.free.push(index as u32);
+		}
+		if closed > 0 {
+			if let Some(domain) = &self.domain {
+				domain.uncharge_handles(closed);
+			}
+		}
 	}
 }
 
@@ -263,7 +287,7 @@ impl Drop for HandleTable {
 		if let Some(domain) = &self.domain {
 			let live = self.len() as u64;
 			if live > 0 {
-				domain.account().uncharge_handles(live);
+				domain.uncharge_handles(live);
 			}
 		}
 	}

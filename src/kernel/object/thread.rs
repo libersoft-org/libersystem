@@ -62,14 +62,14 @@ impl Thread {
 	// charging one thread slot to the process's Domain unconditionally (the
 	// infallible path used for the unlimited root Domain).
 	pub fn new(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Arc<Self> {
-		process.domain().account().charge_thread();
+		process.domain().charge_thread();
 		Self::build(entry, arg, process)
 	}
 
 	// Like `new`, but enforce the process Domain's thread quota: returns None
 	// (charging nothing) if the Domain is already at its thread cap.
 	pub fn new_in(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Option<Arc<Self>> {
-		if !process.domain().account().try_charge_thread() {
+		if !process.domain().try_charge_thread() {
 			return None;
 		}
 		Some(Self::build(entry, arg, process))
@@ -128,7 +128,7 @@ impl Drop for Thread {
 		// Refund this thread's slot to its process's Domain. When the process's last
 		// thread drops, the Arc to the Process drops with it, tearing down the
 		// process's handle table (refunding its handles) and address space.
-		self.process.domain().account().uncharge_thread();
+		self.process.domain().uncharge_thread();
 	}
 }
 

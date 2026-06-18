@@ -15,6 +15,7 @@
 
 use alloc::sync::Arc;
 use core::any::Any;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::address_space::AddressSpace;
 use super::domain::Domain;
@@ -33,6 +34,9 @@ pub struct Process {
 	domain: Arc<Domain>,
 	// The fault that terminated this process, if any (first fault wins).
 	fault: SpinLock<Option<FaultInfo>>,
+	// Set when the process is killed (by a fault or a Domain kill); its threads
+	// observe this at their next scheduling point and exit.
+	killed: AtomicBool,
 }
 
 impl Process {
@@ -42,7 +46,10 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None) })
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false) });
+		// Register with the Domain so a Domain kill can reach and terminate it.
+		process.domain.register_process(&process);
+		process
 	}
 
 	pub fn address_space(&self) -> &Arc<AddressSpace> {
@@ -77,6 +84,20 @@ impl Process {
 	// The fault that terminated this process, if one was recorded.
 	pub fn fault_info(&self) -> Option<FaultInfo> {
 		*self.fault.lock()
+	}
+
+	// Whether this process has been killed and its threads should exit.
+	pub fn is_killed(&self) -> bool {
+		self.killed.load(Ordering::Acquire)
+	}
+
+	// Terminate this process: mark it killed and close all its handles, refunding
+	// their resources (and the memory the objects pinned) to the Domain at once.
+	// Its threads observe the kill at their next scheduling point and exit,
+	// releasing the last reference to the Process.
+	pub fn terminate(&self) {
+		self.killed.store(true, Ordering::Release);
+		self.handles.lock().close_all();
 	}
 }
 

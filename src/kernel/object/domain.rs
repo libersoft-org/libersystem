@@ -14,11 +14,14 @@
 
 #![allow(dead_code)]
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use super::process::Process;
 use super::{KernelObject, ObjectHeader, ObjectType};
+use crate::sync::SpinLock;
 
 // Sentinel limit meaning "no cap" for a resource counter.
 pub const UNLIMITED: u64 = u64::MAX;
@@ -153,28 +156,170 @@ impl ResourceAccount {
 	}
 }
 
-// A Domain groups threads under a shared ResourceAccount. Holding an Arc<Domain>
-// keeps the account alive, so an object can refund its charge on drop even after
-// the owning thread is gone.
+// A Domain is a node in a tree of resource containers. It owns a ResourceAccount
+// and links to a parent and children, so limits compose hierarchically (a charge
+// counts against the Domain and every ancestor) and a whole subtree can be torn
+// down at once. Processes accounted to a Domain are tracked weakly so the Domain
+// can terminate them when it is killed. Holding an Arc<Domain> keeps the account
+// alive, so an object can refund its charge on drop even after the owning thread
+// is gone.
 pub struct Domain {
 	header: ObjectHeader,
 	account: ResourceAccount,
+	// Parent in the Domain tree, or None for a standalone/root Domain. Weak so a
+	// child does not keep its parent alive; the parent is kept alive by its own
+	// parent (up to a root the scheduler holds), so the upgrade succeeds while the
+	// child is reachable in the tree.
+	parent: Option<Weak<Domain>>,
+	// Child Domains, held strongly: a parent owns its subtree.
+	children: SpinLock<Vec<Arc<Domain>>>,
+	// Processes accounted to this Domain, tracked weakly (their threads hold the
+	// strong references). Lets the Domain reach its processes to terminate them.
+	processes: SpinLock<Vec<Weak<Process>>>,
+	// Set once the Domain is killed; its processes' threads observe this at their
+	// next scheduling point and exit.
+	killed: AtomicBool,
 }
 
 impl Domain {
-	// Create a Domain with the given resource caps (UNLIMITED for no cap).
+	// Create a standalone Domain (no parent) with the given resource caps
+	// (UNLIMITED for no cap).
 	pub fn new(memory_limit: u64, handle_limit: u64, thread_limit: u64) -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), account: ResourceAccount::new(memory_limit, handle_limit, thread_limit) })
+		Arc::new(Self { header: ObjectHeader::new(), account: ResourceAccount::new(memory_limit, handle_limit, thread_limit), parent: None, children: SpinLock::new(Vec::new()), processes: SpinLock::new(Vec::new()), killed: AtomicBool::new(false) })
 	}
 
-	// The root Domain: no caps. Kernel threads live here so existing behavior is
-	// unchanged; bounded Domains are created explicitly for sandboxed work.
+	// The root Domain: no caps, no parent. Kernel threads live here so existing
+	// behavior is unchanged; bounded Domains are created explicitly.
 	pub fn root() -> Arc<Self> {
 		Self::new(UNLIMITED, UNLIMITED, UNLIMITED)
 	}
 
+	// Create a child Domain under `parent` with the given caps, linked into the
+	// parent's subtree. The child's charges also count against the parent and
+	// every ancestor, and killing the parent kills the child.
+	pub fn new_child(parent: &Arc<Domain>, memory_limit: u64, handle_limit: u64, thread_limit: u64) -> Arc<Self> {
+		let child = Arc::new(Self { header: ObjectHeader::new(), account: ResourceAccount::new(memory_limit, handle_limit, thread_limit), parent: Some(Arc::downgrade(parent)), children: SpinLock::new(Vec::new()), processes: SpinLock::new(Vec::new()), killed: AtomicBool::new(false) });
+		parent.children.lock().push(child.clone());
+		child
+	}
+
 	pub fn account(&self) -> &ResourceAccount {
 		&self.account
+	}
+
+	// The parent Domain, if this is not a standalone/root Domain.
+	fn parent(&self) -> Option<Arc<Domain>> {
+		self.parent.as_ref().and_then(Weak::upgrade)
+	}
+
+	pub fn is_killed(&self) -> bool {
+		self.killed.load(Ordering::Acquire)
+	}
+
+	// Register a process as accounted to this Domain so it can be terminated when
+	// the Domain is killed. Dead weak entries are pruned on the way in so the list
+	// stays bounded to live processes.
+	pub fn register_process(&self, process: &Arc<Process>) {
+		let mut list = self.processes.lock();
+		list.retain(|weak| weak.strong_count() > 0);
+		list.push(Arc::downgrade(process));
+	}
+
+	// Kill this Domain and its entire subtree: mark every Domain killed and
+	// terminate every process accounted to them, refunding their resources. The
+	// terminated processes' threads observe the kill at their next scheduling
+	// point and exit, releasing the last references.
+	pub fn kill(&self) {
+		self.killed.store(true, Ordering::Release);
+		// Upgrade and act outside the lock so termination (which refunds handles
+		// to this Domain) does not re-enter a held lock.
+		let processes: Vec<Arc<Process>> = self.processes.lock().iter().filter_map(Weak::upgrade).collect();
+		for process in processes {
+			process.terminate();
+		}
+		let children: Vec<Arc<Domain>> = self.children.lock().iter().cloned().collect();
+		for child in children {
+			child.kill();
+		}
+	}
+
+	// Hierarchical charging. A charge counts against this Domain and every
+	// ancestor, so a process exceeds neither its own Domain's limit nor any
+	// ancestor's aggregate. The enforced (try_*) charges roll back the level
+	// already charged if an ancestor refuses.
+
+	pub fn try_charge_memory(&self, bytes: u64) -> bool {
+		if !self.account.try_charge_memory(bytes) {
+			return false;
+		}
+		if let Some(parent) = self.parent() {
+			if !parent.try_charge_memory(bytes) {
+				self.account.uncharge_memory(bytes);
+				return false;
+			}
+		}
+		true
+	}
+
+	pub fn uncharge_memory(&self, bytes: u64) {
+		self.account.uncharge_memory(bytes);
+		if let Some(parent) = self.parent() {
+			parent.uncharge_memory(bytes);
+		}
+	}
+
+	pub fn try_charge_handle(&self) -> bool {
+		if !self.account.try_charge_handle() {
+			return false;
+		}
+		if let Some(parent) = self.parent() {
+			if !parent.try_charge_handle() {
+				self.account.uncharge_handles(1);
+				return false;
+			}
+		}
+		true
+	}
+
+	pub fn charge_handle(&self) {
+		self.account.charge_handle();
+		if let Some(parent) = self.parent() {
+			parent.charge_handle();
+		}
+	}
+
+	pub fn uncharge_handles(&self, count: u64) {
+		self.account.uncharge_handles(count);
+		if let Some(parent) = self.parent() {
+			parent.uncharge_handles(count);
+		}
+	}
+
+	pub fn try_charge_thread(&self) -> bool {
+		if !self.account.try_charge_thread() {
+			return false;
+		}
+		if let Some(parent) = self.parent() {
+			if !parent.try_charge_thread() {
+				self.account.uncharge_thread();
+				return false;
+			}
+		}
+		true
+	}
+
+	pub fn charge_thread(&self) {
+		self.account.charge_thread();
+		if let Some(parent) = self.parent() {
+			parent.charge_thread();
+		}
+	}
+
+	pub fn uncharge_thread(&self) {
+		self.account.uncharge_thread();
+		if let Some(parent) = self.parent() {
+			parent.uncharge_thread();
+		}
 	}
 }
 

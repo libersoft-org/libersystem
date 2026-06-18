@@ -21,6 +21,7 @@ use crate::arch;
 use crate::fault::FaultInfo;
 use crate::mem::frame::PAGE_SIZE;
 use crate::object::channel::{Channel, ChannelError, Message};
+use crate::object::domain::Domain;
 use crate::object::event::Event;
 use crate::object::handle::{Capability, Handle, HandleError};
 use crate::object::memory_object::{MemoryError, MemoryObject};
@@ -49,6 +50,8 @@ pub const SYS_TIMER_SET: u64 = 15;
 pub const SYS_TIMER_POLL: u64 = 16;
 pub const SYS_USER_EXIT: u64 = 17;
 pub const SYS_FAULT_INFO_GET: u64 = 18;
+pub const SYS_DOMAIN_CREATE: u64 = 19;
+pub const SYS_DOMAIN_KILL: u64 = 20;
 
 // Error codes (small negatives, returned in the syscall result register).
 pub const ERR_BAD_SYSCALL: i64 = -1;
@@ -126,6 +129,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_TIMER_POLL => sys_timer_poll(a0),
 		SYS_USER_EXIT => arch::usermode::exit_to_kernel(),
 		SYS_FAULT_INFO_GET => sys_fault_info_get(a0, a1),
+		SYS_DOMAIN_CREATE => sys_domain_create(a0, a1, a2),
+		SYS_DOMAIN_KILL => sys_domain_kill(a0),
 		_ => ERR_BAD_SYSCALL,
 	};
 	result as u64
@@ -393,6 +398,42 @@ fn sys_fault_info_get(buf_ptr: u64, buf_len: u64) -> i64 {
 		(buf_ptr as *mut FaultInfo).write_unaligned(info);
 	}
 	1
+}
+
+// Create a child Domain of the caller's Domain with the given resource caps and
+// install a handle to it in the caller's table. The child's limits bind in
+// addition to every ancestor's, so a subdomain can only subdivide its parent's
+// budget, never exceed it. a0/a1/a2 are the memory/handle/thread caps.
+fn sys_domain_create(memory_limit: u64, handle_limit: u64, thread_limit: u64) -> i64 {
+	let thread = match sched::current_thread() {
+		Some(t) => t,
+		None => return ERR_NO_THREAD,
+	};
+	let child = Domain::new_child(thread.domain(), memory_limit, handle_limit, thread_limit);
+	let installed = thread.handles().lock().try_insert_object(child, Rights::ALL, 0);
+	match installed {
+		Some(handle) => handle.raw() as i64,
+		None => ERR_RESOURCE_EXHAUSTED,
+	}
+}
+
+// Kill the Domain named by `handle` and its whole subtree: every descendant
+// process is terminated and its resources freed. Requires the MANAGE right.
+fn sys_domain_kill(handle: u64) -> i64 {
+	let thread = match sched::current_thread() {
+		Some(t) => t,
+		None => return ERR_NO_THREAD,
+	};
+	let object = {
+		let table = thread.handles().lock();
+		match table.lookup_typed(Handle::from_raw(handle), ObjectType::Domain, Rights::MANAGE) {
+			Ok(o) => o,
+			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
+			Err(_) => return ERR_BAD_HANDLE,
+		}
+	};
+	object.as_any().downcast_ref::<Domain>().expect("type checked by lookup_typed").kill();
+	0
 }
 
 // Create an Event and install a handle to it in the caller's table.

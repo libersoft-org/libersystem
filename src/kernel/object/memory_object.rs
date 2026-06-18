@@ -61,13 +61,13 @@ impl MemoryObject {
 		let page = PAGE_SIZE as usize;
 		let pages = ((size + page - 1) / page).max(1);
 		let bytes = (pages * page) as u64;
-		if !domain.account().try_charge_memory(bytes) {
+		if !domain.try_charge_memory(bytes) {
 			return Err(MemoryError::QuotaExceeded);
 		}
 		let frames = match Self::alloc_frames(pages) {
 			Some(f) => f,
 			None => {
-				domain.account().uncharge_memory(bytes);
+				domain.uncharge_memory(bytes);
 				return Err(MemoryError::OutOfMemory);
 			}
 		};
@@ -137,7 +137,7 @@ impl Drop for MemoryObject {
 		}
 		// Refund the physical memory to the owning Domain, if any.
 		if let Some(domain) = &self.domain {
-			domain.account().uncharge_memory(self.size as u64);
+			domain.uncharge_memory(self.size as u64);
 		}
 	}
 }

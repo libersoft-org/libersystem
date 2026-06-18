@@ -137,6 +137,7 @@ fn boot_main() {
 	channel_ipc_demo();
 	userspace_demo();
 	userspace_fault_demo();
+	domain_lifecycle_demo();
 	ipc_bench();
 	serial_println!("boot OK, halting");
 }
@@ -449,6 +450,44 @@ fn userspace_fault_demo() {
 	} else {
 		serial_println!("userspace: ERROR - expected a ring-3 fault but none was recorded");
 	}
+}
+
+// A kernel thread that holds a resource and parks until its Domain is killed. It
+// opens a MemoryObject (charged to its Domain) and then yields forever; once its
+// Domain is killed, it observes the kill at the next yield and exits, releasing
+// the object. Shared by the domain-lifecycle demo and test.
+extern "C" fn domain_parker(_arg: u64) {
+	let _mo = unsafe { arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, mem::frame::PAGE_SIZE, 0, 0, 0) };
+	loop {
+		sched::yield_now();
+	}
+}
+
+// The killer thread for the domain-lifecycle demo: it is seeded with a handle to
+// a Domain and kills it (and its whole subtree) through the real syscall.
+#[cfg(not(test))]
+extern "C" fn domain_killer(domain_handle: u64) {
+	unsafe {
+		arch::syscall::invoke(syscall::SYS_DOMAIN_KILL, domain_handle, 0, 0, 0);
+	}
+}
+
+// Run the domain-lifecycle demo: build a Domain subtree, run two parked processes
+// under the child that each hold a MemoryObject, then kill the parent. The whole
+// subtree is torn down and every resource refunded - the kernel reclaims a process
+// group by killing its Domain. Report the parent's account to show it returned to
+// zero.
+#[cfg(not(test))]
+fn domain_lifecycle_demo() {
+	use object::domain::Domain;
+	use object::rights::Rights;
+	let parent = Domain::new(1 << 20, 16, 8);
+	let child = Domain::new_child(&parent, 1 << 20, 16, 8);
+	let _ = sched::spawn_in(child.clone(), domain_parker, 0);
+	let _ = sched::spawn_in(child.clone(), domain_parker, 0);
+	sched::spawn_with_object(domain_killer, parent.clone(), Rights::MANAGE, 0);
+	sched::run_until_idle();
+	serial_println!("domain: killed a subtree; parent account reclaimed (memory {}, handles {}, threads {})", parent.account().memory().used(), parent.account().handles().used(), parent.account().threads().used());
 }
 
 // test harness (custom_test_frameworks, runs under `cargo test` in QEMU)
@@ -1104,6 +1143,85 @@ fn domain_quota_enforced_cleanly() {
 	assert_eq!(domain.account().memory().used(), 0);
 	assert_eq!(domain.account().handles().used(), 0);
 	assert_eq!(domain.account().threads().used(), 0);
+}
+
+#[cfg(test)]
+#[test_case]
+fn domain_hierarchy_limits_aggregate() {
+	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+	use object::domain::{Domain, UNLIMITED};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	static THIRD: AtomicI64 = AtomicI64::new(0);
+	// A child Domain's charges also count against its parent, and the parent's
+	// aggregate limit binds even when the child itself is unbounded. The parent
+	// caps memory at two pages; the unbounded child may charge two pages but not a
+	// third. Part one checks the Domain API directly (deterministic, no thread).
+	let parent = Domain::new(8192, UNLIMITED, UNLIMITED);
+	let child = Domain::new_child(&parent, UNLIMITED, UNLIMITED, UNLIMITED);
+	assert!(child.try_charge_memory(4096));
+	assert_eq!(parent.account().memory().used(), 4096, "charge propagates to the parent");
+	assert!(child.try_charge_memory(4096)); // parent now full at two pages
+	assert!(!child.try_charge_memory(4096), "parent aggregate binds though the child is unbounded");
+	assert_eq!(child.account().memory().used(), 8192, "the refused charge was rolled back at the child");
+	assert_eq!(parent.account().memory().used(), 8192, "and left the parent unchanged");
+	child.uncharge_memory(8192);
+	assert_eq!(parent.account().memory().used(), 0, "uncharge propagates to the parent");
+	// Part two checks the same limit through the create syscall: a process in the
+	// unbounded child is refused the third page because the parent caps memory at
+	// two. It records the third result and exits; teardown refunds the rest.
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			assert!(!syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0)));
+			assert!(!syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0)));
+			THIRD.store(arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0) as i64, Ordering::SeqCst);
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	assert!(sched::spawn_in(child.clone(), body, 0).is_some());
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+	assert_eq!(THIRD.load(Ordering::SeqCst), syscall::ERR_RESOURCE_EXHAUSTED, "parent limit binds through the syscall path");
+	// The body exited without closing its objects; teardown refunds them.
+	assert_eq!(child.account().memory().used(), 0, "child memory refunded");
+	assert_eq!(parent.account().memory().used(), 0, "parent aggregate memory refunded");
+}
+
+#[cfg(test)]
+#[test_case]
+fn domain_kill_frees_subtree() {
+	use core::sync::atomic::{AtomicI64, Ordering};
+	use object::domain::Domain;
+	use object::rights::Rights;
+	static KILL_RET: AtomicI64 = AtomicI64::new(-100);
+	// Build a Domain subtree parent -> child, run two parked processes under the
+	// child that each hold a MemoryObject, then kill the PARENT through the real
+	// domain_kill syscall. The whole subtree must be torn down: the parkers'
+	// resources refunded and their threads reaped, leaving both Domains' accounts
+	// at zero. Killing a parent thus terminates every descendant process.
+	let parent = Domain::new(1 << 20, 16, 8);
+	let child = Domain::new_child(&parent, 1 << 20, 16, 8);
+	// The killer runs in the root Domain (so it is not itself killed); it is
+	// seeded with a handle to the parent Domain and kills it.
+	extern "C" fn killer(domain_handle: u64) {
+		let ret = unsafe { arch::syscall::invoke(syscall::SYS_DOMAIN_KILL, domain_handle, 0, 0, 0) };
+		KILL_RET.store(ret as i64, Ordering::SeqCst);
+	}
+	// Spawn the parkers before the killer so they run first: they create their
+	// objects and park, and only then does the killer tear the subtree down.
+	sched::spawn_in(child.clone(), domain_parker, 0).expect("spawn parker 0");
+	sched::spawn_in(child.clone(), domain_parker, 0).expect("spawn parker 1");
+	sched::spawn_with_object(killer, parent.clone(), Rights::MANAGE, 0);
+	sched::run_until_idle();
+	// The kill syscall succeeded and the subtree was fully reclaimed: the killed
+	// processes' handles (and the memory those objects pinned) were freed eagerly,
+	// and the parked threads self-terminated and were reaped.
+	assert_eq!(KILL_RET.load(Ordering::SeqCst), 0, "domain_kill returned ok");
+	assert_eq!(child.account().memory().used(), 0, "child memory refunded");
+	assert_eq!(child.account().handles().used(), 0, "child handles refunded");
+	assert_eq!(child.account().threads().used(), 0, "child threads refunded");
+	assert_eq!(parent.account().memory().used(), 0, "parent aggregate memory refunded");
+	assert_eq!(parent.account().handles().used(), 0, "parent aggregate handles refunded");
+	assert_eq!(parent.account().threads().used(), 0, "parent aggregate threads refunded");
 }
 
 #[cfg(test)]

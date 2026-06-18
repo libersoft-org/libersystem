@@ -109,11 +109,12 @@ Everything is written SMP-aware from the start, so locks are not retrofitted lat
 
 
 ## M13 - Domain hierarchy and lifecycle
-- [ ] Domain tree (parent/child); processes hang under a Domain node
-- [ ] `domain_create` / `domain_kill` syscalls
-- [ ] Bulk termination: killing a Domain tears down the whole subtree and cleans up
-- [ ] Hierarchical limits: a process may exceed neither its own limit nor its Domain's aggregate
+- [x] Domain tree (parent/child); processes hang under a Domain node
+- [x] `domain_create` / `domain_kill` syscalls
+- [x] Bulk termination: killing a Domain tears down the whole subtree and cleans up
+- [x] Hierarchical limits: a process may exceed neither its own limit nor its Domain's aggregate
 - Done when: killing a parent Domain terminates all descendant processes and frees their resources; a test verifies the subtree dies and accounting returns to zero.
+- Result: `Domain` now forms a tree - a `Weak` parent link, strong `Arc` children, and `Weak` back-references to the `Process`es that hang under each node (pruned on registration). The per-resource charge methods (`try_charge_memory`/`charge_handle`/`try_charge_thread`/...) charge the node's own `ResourceAccount` and then walk up to every ancestor via `Weak::upgrade`; a `try_*` that fails at an ancestor rolls back the levels it already charged, so a process can exceed neither its own limit nor any enclosing Domain's aggregate. `Domain::kill` does a BFS subtree teardown: it sets a `killed` flag, terminates each live process at the node (collected outside the lock), then recurses into the children. `Process::terminate` flips its own `killed` flag and eagerly runs `HandleTable::close_all` (refunding handles + dropping `MemoryObject` Arcs so frames/memory come back immediately); the threads themselves exit cooperatively - `sched::yield_now` is a kill point that calls `sched::exit()` when it observes its process was killed while descheduled. `SYS_DOMAIN_CREATE` (19) makes a bounded child under the caller's Domain and returns a handle with `Rights::ALL`; `SYS_DOMAIN_KILL` (20) looks up a `Domain` handle requiring `Rights::MANAGE` and kills its subtree. Two new tests: `domain_hierarchy_limits_aggregate` (a child with unlimited local quota still stops at the parent's 8 KiB aggregate, via both the direct API and the `SYS_MEMORY_OBJECT_CREATE` syscall path, and accounting returns to zero after teardown) and `domain_kill_frees_subtree` (two parked ring-0 processes under a child Domain plus a killer thread; after the kill the child's and parent's memory/handle/thread accounting are all zero). Gotcha fixed along the way: `yield_now` must drop its `Arc<Thread>` temporary before calling `exit()` - holding a `Drop`-bearing clone across the no-return `exit()` longjmp leaks the reference and pins the thread slot (the same class of bug as M12's `terminate_user`). 30 tests green.
 
 ## M14 - Init package and the first userspace process
 - [ ] Load a ramdisk / init package as a Limine module
