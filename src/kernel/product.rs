@@ -6,3 +6,5 @@ pub const NAME: &str = env!("PRODUCT_NAME");
 pub const VERSION: &str = env!("PRODUCT_VERSION");
 pub const WEBSITE: &str = env!("PRODUCT_WEBSITE");
 pub const GITHUB: &str = env!("PRODUCT_GITHUB");
+pub const VENDOR: &str = env!("PRODUCT_VENDOR");
+pub const VENDOR_URL: &str = env!("PRODUCT_VENDOR_URL");

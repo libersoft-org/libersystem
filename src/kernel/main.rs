@@ -150,8 +150,9 @@ fn init_smp() {
 
 #[cfg(not(test))]
 fn boot_main() {
-	serial_println!("M0: hello from the kernel");
-	serial_println!("{} {} - {}", product::NAME, product::VERSION, product::WEBSITE);
+	let title = alloc::format!("{} {}", product::NAME, product::VERSION);
+	let vendor = alloc::format!("{} - {}", product::VENDOR, product::VENDOR_URL);
+	print_banner(&[title.as_str(), product::WEBSITE, vendor.as_str()]);
 	if !BASE_REVISION.is_supported() {
 		serial_println!("ERROR: Limine base revision not supported");
 		return;
@@ -183,6 +184,29 @@ fn boot_main() {
 	system_manager_demo();
 	ipc_bench();
 	serial_println!("boot OK, halting");
+}
+
+// Print a product banner inside an ASCII frame (plain +/-/| so it renders on both
+// the serial port and the framebuffer font, which carries only basic latin). The
+// frame is sized to the longest line; each line is left-aligned and padded.
+#[cfg(not(test))]
+fn print_banner(lines: &[&str]) {
+	let mut width = 0;
+	for line in lines {
+		if line.len() > width {
+			width = line.len();
+		}
+	}
+	let mut border = alloc::string::String::from("+");
+	for _ in 0..width + 2 {
+		border.push('-');
+	}
+	border.push('.');
+	serial_println!("{}", border);
+	for line in lines {
+		serial_println!("| {:<width$} |", *line, width = width);
+	}
+	serial_println!("{}", border);
 }
 
 // Spawn a few cooperative kernel threads on this core and run them to completion,
