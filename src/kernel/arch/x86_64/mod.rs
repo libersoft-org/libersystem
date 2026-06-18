@@ -85,6 +85,56 @@ pub fn halt_loop() -> ! {
 	}
 }
 
+// Reboot the machine. Pulses the PCH reset-control register (0xCF9), then the
+// 8042 keyboard-controller reset line; on real hardware one of these resets the
+// CPU, and QEMU treats either as a machine reset (unless QEMU was started with
+// -no-reboot, in which case it exits instead). Halts if both are ignored.
+pub fn reset() -> ! {
+	unsafe {
+		// 0xCF9: set SYS_RST, then pulse RST_CPU|SYS_RST (the rising edge resets).
+		outb(0xcf9, 0x02);
+		outb(0xcf9, 0x06);
+		// 8042: drain the input buffer (status bit 1), then pulse the reset line.
+		let mut spins: u32 = 0;
+		while inb(0x64) & 0x02 != 0 && spins < 1_000_000 {
+			core::hint::spin_loop();
+			spins += 1;
+		}
+		outb(0x64, 0xfe);
+	}
+	halt_loop()
+}
+
+// Power the machine off via ACPI S5 (soft-off): write SLP_EN to the PM1a control
+// register. QEMU's q35 (ICH9) decodes it at 0x604, i440fx (PIIX4) at 0xB004; 0x600
+// is written too as a harmless fallback. (Real-hardware ACPI comes later.)
+pub fn poweroff() -> ! {
+	unsafe {
+		outw(0x604, 0x2000);
+		outw(0xb004, 0x2000);
+		outw(0x600, 0x2000);
+	}
+	halt_loop()
+}
+
+// single-byte / single-word port I/O for the reset and power-off paths
+#[inline]
+unsafe fn outb(port: u16, value: u8) {
+	asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
+}
+
+#[inline]
+unsafe fn outw(port: u16, value: u16) {
+	asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags));
+}
+
+#[inline]
+unsafe fn inb(port: u16) -> u8 {
+	let value: u8;
+	asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
+	value
+}
+
 // exit QEMU via the isa-debug-exit device (test harness only)
 #[cfg(test)]
 pub fn exit_qemu(success: bool) -> ! {

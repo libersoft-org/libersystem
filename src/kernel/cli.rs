@@ -32,6 +32,8 @@ pub fn run_line(line: &str) {
 		"graph" | "ps" => graph::render(&graph::collect()),
 		"ls" => list_volume(rest),
 		"cat" => print_file(rest),
+		"reboot" => crate::arch::reset(),
+		"poweroff" | "shutdown" => crate::arch::poweroff(),
 		other => crate::serial_println!("unknown command: {} (try 'help')", other),
 	}
 }
@@ -42,6 +44,8 @@ fn help() {
 	crate::serial_println!("  graph                 dump the live System Graph");
 	crate::serial_println!("  ls <vol://volume>     list the files on a volume");
 	crate::serial_println!("  cat <vol://vol/path>  print a file (via StorageManager)");
+	crate::serial_println!("  reboot                reboot the machine");
+	crate::serial_println!("  poweroff              power the machine off");
 	crate::serial_println!("  exit                  stop the shell and halt");
 }
 

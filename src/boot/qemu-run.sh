@@ -24,7 +24,6 @@ QEMU_ARGS=(
 	-cdrom "$ISO"
 	-boot d
 	-serial "${SERIAL:-mon:stdio}"
-	-no-reboot
 )
 
 # display backends: the DISPLAYS env is a space-separated list, any of `vnc` and
@@ -66,7 +65,8 @@ if [[ "${DEBUG:-0}" == "1" ]]; then
 fi
 
 if [[ "${TEST:-0}" == "1" ]]; then
-	QEMU_ARGS+=(-device isa-debug-exit,iobase=0xf4,iosize=0x04)
+	# -no-reboot: a triple fault in a test exits QEMU instead of reboot-looping
+	QEMU_ARGS+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
 	set +e
 	qemu-system-x86_64 "${QEMU_ARGS[@]}"
 	code=$?
