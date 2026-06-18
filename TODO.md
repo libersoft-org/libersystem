@@ -177,26 +177,135 @@ filesystem; networking; a strict app sandbox / permission manifests; more
 architectures than x86_64; real hardware; crypto/attestation/verified boot. That
 is phase 1+.
 
-## Deferred from phase 0 (cooperative workarounds, carried into phase 1)
-Every item the concept lists under Phase 0 ("Roadmap -> Phase 0") is implemented
-and tested (36 green). Two pieces of the concept's decided kernel design are NOT
-in the explicit Phase 0 checklist and are currently met with a cooperative
-workaround rather than the final mechanism; they are intentional and consistent
-with the concept's own "scheduler (SMP-aware design, running on a single core for
-now)" framing, but are recorded here so the deferral is tracked, not forgotten:
-- [ ] Blocking `wait` syscall (the concept's single blocking IPC primitive - "the
-  only place that blocks is `wait`", and `call() = send + wait + receive`).
-  Today: kernel `channel_send`/`channel_receive` are non-blocking and return
-  `WOULD_BLOCK`; callers spin on `SYS_YIELD` (cooperative poll). A real `wait`
-  needs a Blocked thread state + wait queues + wake-on-signal (readable channel /
-  signaled `Event` / expired `Timer`), with deadline support. Pairs naturally
-  with preemption.
-- [ ] Preemptive scheduling (timer-driven). Today: the scheduler is purely
-  cooperative - a thread runs until it calls `yield_now()`/`exit()`; the 100 Hz
-  LAPIC tick only advances `clock_get`, it does not preempt. A runaway CPU-bound
-  thread can monopolize its core. The per-CPU run queues and SMP wiring are
-  already in place, so this is a scheduler evolution, not new plumbing.
-- Note: `interrupt_bind` / `device_memory_map` / `dma_buffer_create` /
-  `object_property_set` / `random_get` from the concept's "minimal syscall set"
-  are deliberately absent too - they belong to the driver/service work in phase 1
-  (virtio) and are not Phase 0 scope.
+# Phase 1 - First usable userspace
+
+Phase 1 goal (from CONCEPT "Roadmap -> Phase 1"): a first usable userspace on top
+of the phase-0 microkernel. The kernel gains the blocking `wait` primitive and
+preemption; userspace gains the driver-enabling kernel calls; a ServiceManager
+brings up the core services (Process, Storage, Log, Device, Config) in dependency
+order per the concept's boot flow; virtio drivers (blk, net, console) replace the
+phase-0 ramdisk/serial stand-ins; an IDL/WIT toolchain generates the typed API
+bindings; a minimal WASI host runs the first Wasm component with only the
+capabilities it is granted; and a powerbox file picker hands a component a file
+handle. Target deployment is appliance/edge in a VM (virtio on QEMU/KVM). Per the
+concept, phases 0-2 are a real near-term goal for one person or a small team.
+
+Ordering note: the concept lists "IDL/WIT toolchain" first, but its own procedure
+says to "decide after a real trial, not in advance" - so the first services
+(M21-M24) speak hand-written protocols (as phase-0 StorageManager already does),
+the IDL/WIT toolchain (M25) is then trialled on those real interfaces, and the
+later services (M26-M27) adopt the generated bindings. The two kernel items below
+(M18-M19) were moved here from phase 0, where they were met by a cooperative
+workaround.
+
+Everything stays SMP-aware and capability-first from the start (no ambient
+authority - the HARD RULE holds from the MVP: a component gets only explicitly
+passed capabilities).
+
+## M18 - Blocking `wait` primitive
+- [ ] `Blocked` thread state + per-object wait queues (a Channel becoming readable/writable, an `Event` signaled, a `Timer` expired)
+- [ ] `SYS_WAIT`: block the calling thread until one of a set of objects is ready, with an optional deadline (a `Timer`/monotonic `clock_get`)
+- [ ] Wake-on-signal: `channel_send` / `event_signal` / timer expiry move blocked waiters back to Ready
+- [ ] Replace the cooperative `WOULD_BLOCK` + `SYS_YIELD` poll loops (StorageManager serve loop, CLI serial read) with real waits
+- Done when: a server thread sleeps in `wait` at ~0% CPU until a message arrives then runs; a deadline wakes a waiter on timeout; the M10 IPC round-trip is re-measured with real blocking (still within the single-digit-us budget).
+- Concept: IPC model ("the only place that blocks is `wait`", `call() = send + wait + receive`, backpressure via `wait`), Syscall model (`wait`).
+
+## M19 - Preemptive scheduling
+- [ ] Timer-driven preemption: the LAPIC tick can deschedule the running thread (a time slice / quantum)
+- [ ] Interrupt-safe scheduler state (the run queues are safe to touch from the timer ISR; spinlocks become interrupt-aware)
+- [ ] Full register-state save/restore on a preemptive switch (not just callee-saved, unlike the cooperative path)
+- [ ] Fair round-robin under preemption, still per-CPU
+- Done when: a CPU-bound thread that never yields is preempted and other threads on the same core keep running; the whole test suite stays green with preemption enabled.
+- Concept: phase 0 was cooperative "running on a single core for now"; preemption is the scheduler evolution ("start simple, evolve").
+
+## M20 - Driver-enabling kernel primitives
+- [ ] `interrupt_bind`: hand a device IRQ to a userspace driver (delivered as an `Event`/Channel signal)
+- [ ] `device_memory_map`: map an MMIO region into a driver's address space (capability-gated)
+- [ ] `dma_buffer_create`: allocate a DMA-safe buffer and its handle
+- [ ] `random_get` (kernel CSPRNG) and `object_property_set` (name / limit / ...)
+- [ ] Kernel-side driver-crash cleanup: on a driver fault, detach its IRQ, disable its DMA, remove its capabilities, free its memory, and send an event to ServiceManager
+- Done when: a userspace process binds a (test) interrupt, maps an MMIO page, and creates a DMA buffer; a forced driver crash is cleaned up by the kernel (IRQ detached, DMA disabled, caps removed) with an event delivered.
+- Concept: Syscall model (interrupt_bind / device_memory_map / dma_buffer_create / object_property_set / random_get), Drivers ("Driver crash" - the kernel only safely cleans up and sends an event).
+
+## M21 - ServiceManager and the boot chain
+- [ ] ServiceManager (basic): start/stop services, dependency ordering, service-state tracking
+- [ ] The boot chain per the concept: SystemManager -> ServiceManager -> DeviceManager + LogService + StorageManager, then the CLI as an ordinary component
+- [ ] SystemManager recovery: on a crash, start a recovery SystemManager / an emergency shell / safely restart userspace / reboot / panic as the last resort
+- Done when: SystemManager starts ServiceManager, which brings up the core services in dependency order, and a deliberately crashed SystemManager triggers the minimal recovery path.
+- Note: a full restart policy + heartbeat/watchdog is phase 2 (see "Out of scope for phase 1").
+- Concept: Boot flow, SystemManager + "Recovery on a SystemManager crash", ServiceManager.
+
+## M22 - LogService (structured logging)
+- [ ] `LogRecord { ts, severity, source, fields }` as the canonical object (structured data, not lines of text - the journald model, not syslog)
+- [ ] A LogService that ingests records over IPC and answers structured queries
+- [ ] Representations of the same records: human CLI, JSON, CBOR
+- Done when: services emit typed `LogRecord`s to LogService and a query returns structured results renderable as text / JSON / CBOR.
+- Concept: System API model (Logs row, "the object is canonical"), Examples of services (LogService).
+
+## M23 - DeviceManager + virtio transport
+- [ ] DeviceManager: device detection, mapping devices -> drivers, assigning each driver exactly the device capabilities it needs, device-state tracking, reacting to a driver-crash event
+- [ ] The shared virtio transport (virtio-mmio / PCI discovery, virtqueues) used by all the drivers
+- Done when: DeviceManager enumerates the QEMU virtio devices and launches the matching driver for each, handing it only its device's capabilities.
+- Concept: DeviceManager, Drivers ("MVP: only virtio on QEMU/KVM").
+
+## M24 - virtio drivers (headless): blk, net, console
+- [ ] `driver.virtio-blk` (block storage)
+- [ ] `driver.virtio-net` (the network *driver* only; the network stack is phase 2)
+- [ ] `driver.virtio-console` (serial console / log over virtio)
+- Done when: each driver runs as an isolated userspace process, drives its virtio device over virtqueues, and survives a driver-crash/restart cycle via DeviceManager + ServiceManager.
+- Concept: Drivers (virtio-blk / virtio-net / virtio-console; drivers are isolated userspace services); the net *stack* is explicitly phase 2.
+
+## M25 - IDL/WIT toolchain and generators
+- [ ] Write 5-6 REAL interfaces (not hello-world): `Storage.Volume`, `Process`, `Log`, a Channel with handle passing, an `EventStream` with backpressure
+- [ ] Generators from the IDL: the binary IPC layout, a Rust client, a CLI formatter, JSON and CBOR schemas
+- [ ] Find where WIT chafes (handle passing, zero-copy buffers, streams, ABI stability), then decide: WIT-as-IDL vs WIT types + our own binary backend vs our own IDL
+- Done when: at least one real service speaks over generated bindings, the same call renders as binary / CLI / JSON, and the "WIT vs own" decision is recorded from practice (not from the armchair).
+- Concept: IDL language, "Relationship to WIT", "Decide after a real trial, not in advance".
+
+## M26 - StorageService over virtio-blk
+- [ ] Evolve the phase-0 ramdisk StorageManager into a StorageService backed by `driver.virtio-blk`
+- [ ] `vol://` volumes over a real block device (the storage model: a path belongs to exactly one volume; if the volume is gone, the operation fails)
+- [ ] The `Storage.Volume` interface from the IDL (Open / Stat / Watch), zero-copy reads via shared buffers
+- Done when: a client opens and reads a file on a `vol://` volume backed by a virtio-blk device through the typed `Storage.Volume` API.
+- Note: a persistent native filesystem (CoW / checksums / snapshots) is phase 2; phase 1 may use a simple read-mostly on-disk layout.
+- Concept: Storage model, core services (Storage); the persistent native FS is phase 2.
+
+## M27 - Core services: Process, Device, Config
+- [ ] ProcessService: process lifecycle (create / start / exit / info) as a typed service over the kernel syscalls
+- [ ] DeviceService: typed device enumeration / info on top of DeviceManager
+- [ ] ConfigService: a typed `ConfigNode` tree with an IDL schema (no textual `/etc` parsing; text is only an editable representation)
+- Done when: the Process / Device / Config services answer typed queries over IPC, renderable as CLI / JSON / CBOR. Together with LogService (M22) and StorageService (M26) this completes the phase-1 "Process, Storage, Log, Device, Config" set.
+- Concept: Examples of services, System API model (Configuration row), core services list.
+
+## M28 - Minimal WASI host: the first Wasm component
+- [ ] A WASI host runtime process that maps `wasi:*` imports onto our typed services over IPC channels (e.g. `wasi:filesystem` -> StorageService)
+- [ ] A WASI "world" = the set of capabilities a component receives at startup (no ambient authority)
+- [ ] Run the first real Wasm component end-to-end
+- Done when: a Wasm component runs under the host, performs a capability-gated operation (e.g. reads a file it was granted) via a WASI import mapped to a native service, and has no access it was not explicitly given.
+- Note: the full Component Model + WASI preview 2 + an SDK + AOT compilation is phase 2; phase 1 is the minimal host + first component.
+- Concept: Application model ("WASI as one of several hosts on top of a stable native ABI", "How it fits into the system"), roadmap ("minimal WASI host: running the first Wasm component").
+
+## M29 - Prototype file picker (powerbox)
+- [ ] A file-picker service that returns a file *handle* (capability), granted by the user's act of picking - not ambient filesystem access
+- [ ] A Wasm component obtains file access only through the picker (the powerbox pattern)
+- Done when: a component with no filesystem capability gains access to exactly one user-picked file via the picker, and to nothing else.
+- Concept: Security model ("a file picker returning a file handle"), roadmap ("a prototype file picker (powerbox)"), the HARD RULE (no ambient authority).
+
+## Definition of done (phase 1)
+Phase 1 is done when the kernel preempts and offers a real blocking `wait`,
+userspace virtio drivers (blk / net / console) run isolated under DeviceManager +
+ServiceManager, the core services (Process, Storage, Log, Device, Config) answer
+typed queries generated from the IDL/WIT toolchain, a minimal WASI host runs the
+first Wasm component with only the capabilities it was granted, and a powerbox
+file picker hands a component a file handle - all in a VM over virtio on QEMU/KVM,
+testable under `cargo test` / QEMU.
+
+## Out of scope for phase 1 (= phase 2, the appliance/edge platform)
+A full network stack over virtio-net (the priority of phase 2 - on the edge,
+networking is the core); observability and remote admin (the full System Graph
+with tracing and counters, JSON/CBOR/CLI everywhere); security hardening (a strict
+app sandbox, permission manifests, a threat model); ServiceManager with a full
+restart policy + watchdog; the full Component Model + WASI preview 2 + a Rust/C/Go
+SDK; a package/app format with installation + AOT compilation; a simple persistent
+native filesystem. Phases 3-6 (server / real hardware / desktop / AI) are vision,
+contingent on a community forming.
