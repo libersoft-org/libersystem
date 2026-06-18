@@ -30,18 +30,13 @@ mkdir -p "$BUILD"
 rm -f "$PPM"
 
 # Drive a QEMU HMP monitor over its unix socket to dump the framebuffer to $PPM.
+# The trailing pause keeps the connection open long enough for QEMU to run the
+# screendump and flush the file before socat closes it.
 screendump_via() {
-	python3 - "$1" "$PPM" <<'PY'
-import socket, sys, time
-mon, ppm = sys.argv[1], sys.argv[2]
-s = socket.socket(socket.AF_UNIX)
-s.connect(mon)
-time.sleep(0.2)
-s.recv(65536)
-s.sendall(("screendump %s\n" % ppm).encode())
-time.sleep(1.0)
-s.close()
-PY
+	{
+		printf 'screendump %s\n' "$PPM"
+		sleep 1
+	} | socat - UNIX-CONNECT:"$1" >/dev/null 2>&1
 }
 
 # Convert the captured PPM to the requested output format (chosen by the output
@@ -77,7 +72,7 @@ emit_image() {
 # True if a process is listening on the unix socket (not just a stale file).
 socket_live() {
 	[[ -S "$1" ]] || return 1
-	python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' "$1" 2>/dev/null
+	socat -u OPEN:/dev/null UNIX-CONNECT:"$1" 2>/dev/null
 }
 
 # Fast path: a live `just run` is up - snap its current frame, no reboot.

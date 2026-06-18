@@ -26,7 +26,7 @@ The included setup script installs the entire toolchain. It is idempotent - safe
 
 It installs:
 
-- system packages: `build-essential`, `git`, `curl`, `xorriso`, `gdisk`, `mtools`, `netpbm`, `imagemagick`, `qemu-system-x86`, `qemu-utils`, `gdb`, `lld`, `llvm`, `clang`
+- system packages: `build-essential`, `git`, `curl`, `xorriso`, `gdisk`, `mtools`, `netpbm`, `imagemagick`, `socat`, `qemu-system-x86`, `qemu-utils`, `gdb`, `lld`, `llvm`, `clang`
 - `rustup` with the **nightly** toolchain plus the `rust-src` and `llvm-tools-preview` components (required for `build-std` and the kernel build)
 - `just`, the task runner
 - the Limine bootloader (binary branch) into `~/.local/share/limine`
@@ -38,7 +38,7 @@ The project pins the nightly toolchain via `rust-toolchain.toml`, so no global t
 If you prefer to install the tools yourself:
 
 ```sh
-sudo apt install build-essential git curl xorriso gdisk mtools netpbm imagemagick qemu-system-x86 qemu-utils gdb lld llvm clang
+sudo apt install build-essential git curl xorriso gdisk mtools netpbm imagemagick socat qemu-system-x86 qemu-utils gdb lld llvm clang
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
 rustup toolchain install nightly --profile minimal --component rust-src --component llvm-tools-preview
 cargo install just
