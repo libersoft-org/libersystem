@@ -1,0 +1,15 @@
+[package]
+name = "system_manager"
+# Source of truth for product metadata is /product.conf; this version tracks the
+# kernel's. SystemManager is the first userspace process loaded from the init
+# package.
+version = "0.0.1"
+edition = "2021"
+description = "LiberSystem SystemManager - the first userspace process"
+
+[[bin]]
+name = "system_manager"
+path = "src/main.rs"
+
+# Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
+# we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

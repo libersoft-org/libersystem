@@ -78,6 +78,8 @@ make_iso() {
 	rm -rf "$iso_root"
 	mkdir -p "$iso_root/boot/limine" "$iso_root/EFI/BOOT"
 	cp "$staged" "$iso_root/boot/kernel"
+	[[ -f "$BUILD/init.pkg" ]] || die "init package not found: $BUILD/init.pkg (build the kernel first)"
+	cp "$BUILD/init.pkg" "$iso_root/boot/init.pkg"
 	render_conf "$iso_root/boot/limine/limine.conf"
 	cp "$LIMINE_DIR/limine-bios.sys" "$iso_root/boot/limine/"
 	cp "$LIMINE_DIR/limine-bios-cd.bin" "$iso_root/boot/limine/"
@@ -137,6 +139,8 @@ make_img() {
 	mformat z:
 	mmd z:/EFI z:/EFI/BOOT z:/boot z:/boot/limine
 	mcopy "$staged" z:/boot/kernel
+	[[ -f "$BUILD/init.pkg" ]] || die "init package not found: $BUILD/init.pkg (build the kernel first)"
+	mcopy "$BUILD/init.pkg" z:/boot/init.pkg
 	mcopy "$conf" z:/boot/limine/limine.conf
 	mcopy "$LIMINE_DIR/limine-bios.sys" z:/boot/limine/
 	mcopy "$LIMINE_DIR/BOOTX64.EFI" z:/EFI/BOOT/

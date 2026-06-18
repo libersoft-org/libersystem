@@ -8,17 +8,20 @@
 extern crate alloc;
 
 mod arch;
+mod elf;
 mod fault;
+mod loader;
 mod mem;
 mod object;
 mod panic;
+mod pkg;
 mod product;
 mod sched;
 mod smp;
 mod sync;
 mod syscall;
 
-use limine::request::{HhdmRequest, MemoryMapRequest, MpRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::request::{HhdmRequest, MemoryMapRequest, ModuleRequest, MpRequest, RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 
 // Limine boot protocol: request declarations.
@@ -41,6 +44,12 @@ static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 #[used]
 #[link_section = ".limine_requests"]
 static MP_REQUEST: MpRequest = MpRequest::new();
+
+// Init package: a Limine module (boot/init.pkg) holding the first userspace
+// programs - SystemManager for now - which the kernel ELF-loads and runs.
+#[used]
+#[link_section = ".limine_requests"]
+static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 
 // Start/end markers delimit the request block so Limine can locate it.
 #[used]
@@ -138,6 +147,7 @@ fn boot_main() {
 	userspace_demo();
 	userspace_fault_demo();
 	domain_lifecycle_demo();
+	system_manager_demo();
 	ipc_bench();
 	serial_println!("boot OK, halting");
 }
@@ -394,6 +404,50 @@ fn userspace_demo() {
 	match ep1.recv() {
 		Ok(message) => serial_println!("userspace: ring-3 program sent \"{}\" over a channel", core::str::from_utf8(&message.bytes).unwrap_or("<bad>")),
 		Err(_) => serial_println!("userspace: ERROR - no message from ring 3"),
+	}
+}
+
+// The init package bytes, located among the Limine modules by filename. Returns
+// None if the bootloader passed no module whose path ends in "init.pkg".
+fn init_package_bytes() -> Option<&'static [u8]> {
+	let response = MODULE_REQUEST.get_response()?;
+	for module in response.modules() {
+		if module.path().to_bytes().ends_with(b"init.pkg") {
+			// The module memory is mapped in the HHDM and is 'static for the kernel.
+			let bytes = unsafe { core::slice::from_raw_parts(module.addr(), module.size() as usize) };
+			return Some(bytes);
+		}
+	}
+	None
+}
+
+// Load SystemManager from the init package into a new ring-3 process, handing it
+// one end of a fresh channel as its bootstrap capability. Returns the kernel-held
+// peer endpoint, on which SystemManager's first message arrives. Shared by the
+// boot demo and the test.
+fn spawn_system_manager() -> Result<alloc::sync::Arc<object::channel::Channel>, &'static str> {
+	let bytes = init_package_bytes().ok_or("init package module not found")?;
+	let package = pkg::Package::parse(bytes).ok_or("init package is malformed")?;
+	let elf_image = package.lookup(b"system_manager").ok_or("system_manager missing from init package")?;
+	let (kernel_ep, user_ep) = object::channel::Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), elf_image, user_ep, object::rights::Rights::ALL, 0).map_err(|_| "failed to load SystemManager")?;
+	Ok(kernel_ep)
+}
+
+// Start the first userspace process from the init package and read back the
+// message it sends in over its bootstrap channel - the first real userspace
+// service reporting in.
+#[cfg(not(test))]
+fn system_manager_demo() {
+	match spawn_system_manager() {
+		Ok(kernel_ep) => {
+			sched::run_until_idle();
+			match kernel_ep.recv() {
+				Ok(message) => serial_println!("userspace: SystemManager reported in over IPC: \"{}\"", core::str::from_utf8(&message.bytes).unwrap_or("<bad>")),
+				Err(_) => serial_println!("userspace: ERROR - SystemManager sent no message"),
+			}
+		}
+		Err(reason) => serial_println!("userspace: ERROR - could not start SystemManager: {}", reason),
 	}
 }
 
@@ -997,6 +1051,19 @@ fn channel_endpoint_semantics() {
 	drop(a);
 	assert!(b.is_peer_closed());
 	assert!(matches!(b.recv(), Err(ChannelError::PeerClosed)));
+}
+
+#[cfg(test)]
+#[test_case]
+fn init_package_starts_system_manager() {
+	// Load SystemManager from the init package as a real ring-3 process and let it
+	// report in over its bootstrap channel - the M14 path end to end. Runs on the
+	// boot context (kernel CR3 active), so AddressSpace::create copies the kernel
+	// half correctly before the new process is scheduled.
+	let kernel_ep = spawn_system_manager().expect("SystemManager should start from the init package");
+	sched::run_until_idle();
+	let message = kernel_ep.recv().expect("SystemManager should report in over IPC");
+	assert_eq!(&message.bytes[..], b"SystemManager: online");
 }
 
 #[cfg(test)]

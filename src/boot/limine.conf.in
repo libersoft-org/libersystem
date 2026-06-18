@@ -5,3 +5,4 @@ timeout: 0
 /@PRODUCT_NAME@
 	protocol: limine
 	path: boot():/boot/kernel
+	module_path: boot():/boot/init.pkg

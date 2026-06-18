@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,6 +38,11 @@ pub struct Process {
 	// Set when the process is killed (by a fault or a Domain kill); its threads
 	// observe this at their next scheduling point and exit.
 	killed: AtomicBool,
+	// Physical frames backing this process's user image and stack. The address
+	// space frees only its page-table structure, not the leaf frames its entries
+	// point at, so the Process owns those frames and frees them on drop. Empty for
+	// kernel processes (their threads run on the shared kernel mappings).
+	user_frames: SpinLock<Vec<u64>>,
 }
 
 impl Process {
@@ -46,7 +52,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()) });
 		// Register with the Domain so a Domain kill can reach and terminate it.
 		process.domain.register_process(&process);
 		process
@@ -70,6 +76,12 @@ impl Process {
 	// way a new process is endowed with an initial bootstrap capability.
 	pub fn install(&self, object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> u64 {
 		self.handles.lock().insert_object(object, rights, badge).raw()
+	}
+
+	// Take ownership of the physical frames backing this process's user image and
+	// stack, so they are freed when the process is dropped.
+	pub fn adopt_frames(&self, frames: Vec<u64>) {
+		self.user_frames.lock().extend(frames);
 	}
 
 	// Record the fault that is terminating this process. The first fault wins:
@@ -98,6 +110,17 @@ impl Process {
 	pub fn terminate(&self) {
 		self.killed.store(true, Ordering::Release);
 		self.handles.lock().close_all();
+	}
+}
+
+impl Drop for Process {
+	fn drop(&mut self) {
+		// Release the leaf data frames backing the user image and stack. The address
+		// space, dropped alongside, reclaims only the page-table structure.
+		let frames = core::mem::take(&mut *self.user_frames.lock());
+		for frame in frames {
+			crate::mem::frame::deallocate(frame);
+		}
 	}
 }
 
