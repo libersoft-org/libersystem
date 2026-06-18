@@ -482,7 +482,7 @@ fn userspace_demo() {
 fn init_package_bytes() -> Option<&'static [u8]> {
 	let response = MODULE_REQUEST.get_response()?;
 	for module in response.modules() {
-		if module.path().to_bytes().ends_with(b"init.pkg") {
+		if module.path().to_bytes().ends_with(product::INIT_PACKAGE.as_bytes()) {
 			// The module memory is mapped in the HHDM and is 'static for the kernel.
 			let bytes = unsafe { core::slice::from_raw_parts(module.addr(), module.size() as usize) };
 			return Some(bytes);
@@ -496,7 +496,7 @@ fn init_package_bytes() -> Option<&'static [u8]> {
 fn volume_package_bytes() -> Option<&'static [u8]> {
 	let response = MODULE_REQUEST.get_response()?;
 	for module in response.modules() {
-		if module.path().to_bytes().ends_with(b"volume.pkg") {
+		if module.path().to_bytes().ends_with(product::VOLUME_PACKAGE.as_bytes()) {
 			// The module memory is mapped in the HHDM and is 'static for the kernel.
 			let bytes = unsafe { core::slice::from_raw_parts(module.addr(), module.size() as usize) };
 			return Some(bytes);

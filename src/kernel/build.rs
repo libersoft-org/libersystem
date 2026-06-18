@@ -8,9 +8,10 @@ use std::path::PathBuf;
 
 fn main() {
 	select_linker_script();
-	load_product_metadata();
-	assemble_init_package();
-	assemble_volume_package();
+	let conf: Vec<(String, String)> = read_product_conf();
+	export_product_metadata(&conf);
+	assemble_init_package(&conf);
+	assemble_volume_package(&conf);
 }
 
 fn select_linker_script() {
@@ -26,12 +27,15 @@ fn select_linker_script() {
 	println!("cargo:rerun-if-changed=build.rs");
 }
 
-// Parse ../../product.conf (shell-style KEY="value") and re-export each entry as
-// a rustc env var so the kernel can read it via env!("PRODUCT_NAME") etc.
-fn load_product_metadata() {
+// Parse ../../product.conf (shell-style KEY="value") into key/value pairs (the
+// single source of truth for both the product metadata and the boot artifact
+// filenames).
+fn read_product_conf() -> Vec<(String, String)> {
 	let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
 	let path: PathBuf = PathBuf::from(&manifest_dir).join("../../product.conf");
 	let text: String = fs::read_to_string(&path).unwrap_or_else(|e: std::io::Error| panic!("cannot read {}: {e}", path.display()));
+	println!("cargo:rerun-if-changed={}", path.display());
+	let mut pairs: Vec<(String, String)> = Vec::new();
 	for line in text.lines() {
 		let trimmed: &str = line.trim();
 		if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -40,9 +44,27 @@ fn load_product_metadata() {
 		let Some((key, value)) = trimmed.split_once('=') else {
 			continue;
 		};
-		println!("cargo:rustc-env={}={}", key.trim(), value.trim().trim_matches('"'));
+		pairs.push((key.trim().to_string(), value.trim().trim_matches('"').to_string()));
 	}
-	println!("cargo:rerun-if-changed={}", path.display());
+	pairs
+}
+
+// Re-export every product.conf entry as a rustc env var so the kernel can read it
+// via env!("PRODUCT_NAME"), env!("INIT_PACKAGE"), etc.
+fn export_product_metadata(conf: &[(String, String)]) {
+	for (key, value) in conf {
+		println!("cargo:rustc-env={key}={value}");
+	}
+}
+
+// Look up a required key from the parsed product.conf.
+fn conf_get<'a>(conf: &'a [(String, String)], key: &str) -> &'a str {
+	for (k, v) in conf {
+		if k.as_str() == key {
+			return v.as_str();
+		}
+	}
+	panic!("missing {key} in product.conf");
 }
 
 // Assemble the init package that the kernel loads as a Limine module. The package
@@ -56,11 +78,11 @@ fn load_product_metadata() {
 // present. Any that are missing - e.g. a bare `cargo build` outside `just`, or
 // rust-analyzer - are skipped with a warning, so the kernel build still succeeds
 // (the kernel handles an absent program gracefully at runtime).
-fn assemble_init_package() {
+fn assemble_init_package(conf: &[(String, String)]) {
 	let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
 	let manifest: PathBuf = PathBuf::from(&manifest_dir);
 	let out_dir: PathBuf = manifest.join("../boot/.build");
-	let out_pkg: PathBuf = out_dir.join("init.pkg");
+	let out_pkg: PathBuf = out_dir.join(conf_get(conf, "INIT_PACKAGE"));
 
 	// (package entry name, ELF path). The storage crate produces two binaries.
 	let sources: [(&str, PathBuf); 3] = [("system_manager", manifest.join("../user/system_manager/target/x86_64-unknown-none/debug/system_manager")), ("storage_manager", manifest.join("../user/storage/target/x86_64-unknown-none/debug/storage_manager")), ("storage_client", manifest.join("../user/storage/target/x86_64-unknown-none/debug/storage_client"))];
@@ -84,12 +106,12 @@ fn assemble_init_package() {
 // packed into boot/.build/volume.pkg using the same archive format as the init
 // package, keyed by its file name. The kernel loads it as a second Limine module
 // and serves its files through the userspace StorageManager over vol://.
-fn assemble_volume_package() {
+fn assemble_volume_package(conf: &[(String, String)]) {
 	let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
 	let manifest: PathBuf = PathBuf::from(&manifest_dir);
 	let vol_dir: PathBuf = manifest.join("../volume");
 	let out_dir: PathBuf = manifest.join("../boot/.build");
-	let out_pkg: PathBuf = out_dir.join("volume.pkg");
+	let out_pkg: PathBuf = out_dir.join(conf_get(conf, "VOLUME_PACKAGE"));
 
 	println!("cargo:rerun-if-changed={}", vol_dir.display());
 	fs::create_dir_all(&out_dir).unwrap_or_else(|e: std::io::Error| panic!("cannot create {}: {e}", out_dir.display()));

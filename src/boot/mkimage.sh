@@ -43,9 +43,13 @@ die() {
 	exit 1
 }
 
-# render the bootloader config from its template, injecting the product name
+# render the bootloader config from its template, injecting the product name and
+# the boot artifact filenames (all from product.conf)
 render_conf() {
-	sed "s|@PRODUCT_NAME@|$PRODUCT_NAME|g" "$HERE/limine.conf.in" >"$1"
+	sed -e "s|@PRODUCT_NAME@|$PRODUCT_NAME|g" \
+		-e "s|@INIT_PACKAGE@|$INIT_PACKAGE|g" \
+		-e "s|@VOLUME_PACKAGE@|$VOLUME_PACKAGE|g" \
+		"$HERE/limine.conf.in" >"$1"
 }
 
 # resolve the strip level (STRIP=debug|all) to an objcopy flag, once and up front
@@ -78,10 +82,10 @@ make_iso() {
 	rm -rf "$iso_root"
 	mkdir -p "$iso_root/boot/limine" "$iso_root/EFI/BOOT"
 	cp "$staged" "$iso_root/boot/kernel"
-	[[ -f "$BUILD/init.pkg" ]] || die "init package not found: $BUILD/init.pkg (build the kernel first)"
-	cp "$BUILD/init.pkg" "$iso_root/boot/init.pkg"
-	[[ -f "$BUILD/volume.pkg" ]] || die "volume package not found: $BUILD/volume.pkg (build the kernel first)"
-	cp "$BUILD/volume.pkg" "$iso_root/boot/volume.pkg"
+	[[ -f "$BUILD/$INIT_PACKAGE" ]] || die "init package not found: $BUILD/$INIT_PACKAGE (build the kernel first)"
+	cp "$BUILD/$INIT_PACKAGE" "$iso_root/boot/$INIT_PACKAGE"
+	[[ -f "$BUILD/$VOLUME_PACKAGE" ]] || die "volume package not found: $BUILD/$VOLUME_PACKAGE (build the kernel first)"
+	cp "$BUILD/$VOLUME_PACKAGE" "$iso_root/boot/$VOLUME_PACKAGE"
 	render_conf "$iso_root/boot/limine/limine.conf"
 	cp "$LIMINE_DIR/limine-bios.sys" "$iso_root/boot/limine/"
 	cp "$LIMINE_DIR/limine-bios-cd.bin" "$iso_root/boot/limine/"
@@ -141,10 +145,10 @@ make_img() {
 	mformat z:
 	mmd z:/EFI z:/EFI/BOOT z:/boot z:/boot/limine
 	mcopy "$staged" z:/boot/kernel
-	[[ -f "$BUILD/init.pkg" ]] || die "init package not found: $BUILD/init.pkg (build the kernel first)"
-	mcopy "$BUILD/init.pkg" z:/boot/init.pkg
-	[[ -f "$BUILD/volume.pkg" ]] || die "volume package not found: $BUILD/volume.pkg (build the kernel first)"
-	mcopy "$BUILD/volume.pkg" z:/boot/volume.pkg
+	[[ -f "$BUILD/$INIT_PACKAGE" ]] || die "init package not found: $BUILD/$INIT_PACKAGE (build the kernel first)"
+	mcopy "$BUILD/$INIT_PACKAGE" "z:/boot/$INIT_PACKAGE"
+	[[ -f "$BUILD/$VOLUME_PACKAGE" ]] || die "volume package not found: $BUILD/$VOLUME_PACKAGE (build the kernel first)"
+	mcopy "$BUILD/$VOLUME_PACKAGE" "z:/boot/$VOLUME_PACKAGE"
 	mcopy "$conf" z:/boot/limine/limine.conf
 	mcopy "$LIMINE_DIR/limine-bios.sys" z:/boot/limine/
 	mcopy "$LIMINE_DIR/BOOTX64.EFI" z:/EFI/BOOT/
