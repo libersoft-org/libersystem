@@ -23,6 +23,7 @@ Everything is written SMP-aware from the start, so locks are not retrofitted lat
 - [x] `cargo test` -> QEMU + debug-exit
 - [x] GDB attach + single-stepping
 - Done when: "hello from the kernel" on serial, single-stepping in GDB, green `cargo test`.
+- Result: `kmain` (the linker-script ENTRY) brings up serial (COM1 16550, `arch::serial`) then the GDT+IDT - `arch::gdt` is a hand-rolled null/code/data GDT plus a TSS with an IST double-fault stack, `arch::idt` fills all 32 exception vectors. `serial_println!` drives a `SerialWriter`; `panic.rs` prints the panic to serial (and exits QEMU on the test path). A `#[test_case]` harness runs under QEMU and reports through the `isa-debug-exit` port (`arch::exit_qemu`). The breakpoint handler (`int3`) prints and RETURNS (recoverable) while the rest halt; tests `trivial_assertion` + `breakpoint_exception_returns` are green, and GDB attaches over the QEMU stub (`just debug` / `just gdb`) for single-stepping.
 
 ## M1 - Memory foundation
 - [x] Frame allocator (from the Limine memory map)
@@ -30,6 +31,7 @@ Everything is written SMP-aware from the start, so locks are not retrofitted lat
 - [x] Kernel heap (enables `alloc` - Box/Vec)
 - [x] First spinlock (shared frame allocator), written correctly from the start
 - Done when: alloc/map/free works, `alloc` collections run in a test.
+- Result: `mem::frame` is a physical frame allocator whose free list is threaded through the free frames themselves (via the HHDM), seeded from the Limine memory map's USABLE regions. `arch::paging` walks and creates the 4-level page tables on the active CR3 (`map_page`/`unmap_page`, flags PRESENT/WRITABLE/USER, no NX bit). `mem::heap` is a linked-list first-fit `#[global_allocator]` over a 1 MiB mapped window, which turns on `alloc` (Box/Vec). The first `SpinLock` (`sync.rs`, a TTAS lock) guards the shared frame allocator. Tests `frame_alloc_distinct`, `paging_map_unmap`, `heap_box_vec` are green; the boot log also prints the free-frame count and a Vec sum demo.
 
 ## M2 - Time and interrupts
 - [x] Local APIC
@@ -37,12 +39,14 @@ Everything is written SMP-aware from the start, so locks are not retrofitted lat
 - [x] Interrupt dispatch
 - [x] Handler registration
 - Done when: a periodic timer interrupt is counted, a handler can be registered.
+- Result: `arch::apic` brings up the Local APIC in xAPIC/MMIO mode (its MMIO page is mapped explicitly NO_CACHE, since Limine's HHDM does not map it), masks the legacy 8259 PICs, and starts a periodic timer calibrated against PIT channel 2 (100 Hz) that bumps a `TICKS` counter. `arch::interrupts` dispatches IRQ vectors 32..47 through a lock-free handler table (fn pointers stored as atomics, so dispatch is safe in interrupt context) and issues EOI; `register(vector, fn)` installs a handler. Tests `timer_ticks_advance` (the tick counter advances with interrupts enabled) and `handler_registration_dispatch` (a software `int 0x2f` reaches a registered handler) are green.
 
 ## M3 - SMP
 - [x] Wake AP cores (Limine SMP)
 - [x] Per-CPU data
 - [x] Per-CPU init
 - Done when: all cores reach a known idle point and report in.
+- Result: `smp::init` wakes the application processors via Limine's MP response (each AP jumps to `ap_entry` on its own Limine-provided stack), assigns per-core ids, and spins until every core has reported in. `arch::percpu` parks a per-CPU struct through the GS-base MSR; the GDT carries a per-core TSS (each core `ltr`s its own, since a busy TSS cannot be loaded twice) while the IDT is shared, and each AP programs its own LAPIC and syscall MSRs. Reporting-in happens before the online count is bumped (under a lock) so the BSP's resumed serial output never interleaves with the AP lines. Test `smp_all_cores_online` asserts `online_count() == cpu_count()` (4 cores under QEMU); the APs then park in the scheduler idle loop.
 
 ## M4 - Object and capability core
 - [x] Generic kernel-object base (lifetime, refcount)
@@ -50,6 +54,7 @@ Everything is written SMP-aware from the start, so locks are not retrofitted lat
 - [x] Capability rights
 - [x] Lookup with rights enforcement
 - Done when: create/lookup/close handle with rights checks, kernel-side unit tests.
+- Result: every kernel object embeds an `ObjectHeader` (a unique koid plus a generation counter for O(1) revocation) and implements `KernelObject` (`object/mod.rs`). `object/rights.rs` is a 12-bit `Rights` newtype bitset (READ/WRITE/MAP/SEND/RECEIVE/DUPLICATE/TRANSFER/REVOKE/.../MANAGE/WAIT) with subset checks. `object/handle.rs` holds the per-table machinery: a `Capability` (an Arc to the object + rights + badge + a generation snapshot) and a `HandleTable` of opaque `Handle`s (generation<<32 | index) with `insert` / `lookup` (rights-checked) / `lookup_typed` (type-sealed) / `duplicate` (attenuate-only) / `close` (recycles the slot and bumps its generation so the old handle value dies). Six tests cover create/lookup/close, rights enforcement, attenuating duplication, O(1) revocation, type sealing, and Arc-refcount lifetime. (Pure data-structure work - no arch or boot wiring; the table is owned by the Process from M11.)
 
 ## M5 - Threads, address spaces, scheduler
 - [x] `Thread` object
@@ -58,12 +63,14 @@ Everything is written SMP-aware from the start, so locks are not retrofitted lat
 - [x] Run queue
 - [x] Scheduler (start simple, evolve)
 - Done when: multiple kernel threads multiplex on a core (and across cores).
+- Result: `object/thread.rs` (a `Thread` owning its 16 KiB kernel stack + the saved RSP), `object/address_space.rs` (an `AddressSpace` wrapping a CR3; in M5 all kernel threads share the one kernel space), and `arch::context::switch_context` (hand-written `global_asm!` that saves/restores the callee-saved registers and swaps stacks, with a `thread_trampoline`/`thread_bootstrap` that calls the entry then `sched::exit`). `sched.rs` is a cooperative round-robin with PER-CPU run queues (SMP-correct from the start, no migration yet): `spawn`/`spawn_on`, `yield_now`, `exit`, `run_until_idle`. The switch is leak-safe - the outgoing thread is moved into a zombie/requeue slot before the stack swap, so a retiring thread's stack frees cleanly in the context switched to. Tests `thread_object_basics`, `scheduler_multiplexes_threads` (interleaved yielding threads), `scheduler_runs_across_cores`.
 
 ## M6 - Syscall ABI
 - [x] Syscall entry/exit (`syscall` instruction, register convention)
 - [x] Dispatch table
 - [x] Minimal syscall set (handle ops, object create, address-space ops)
 - Done when: a syscall round-trips there and back.
+- Result: `arch::syscall` programs the EFER/STAR/LSTAR/FMASK MSRs and a `global_asm!` `syscall_entry` (register convention: rax = number, rdi/rsi/rdx/r10 = args; FMASK clears IF so the handler runs un-preemptible). In M6 `syscall` is issued from ring 0 by `invoke()` (the ring-3 transition lands in M8); entry returns via `push r11; popfq; jmp rcx` to stay in ring 0. `syscall.rs` is the portable dispatch table with a minimal set (debug noop/write, clock_get, memory_object create/map/unmap, handle duplicate/close) using the Linux-style error convention (success = the value, error = a small negative in [-4095,-1], `sys_is_err`). Object/handle/mapping calls operate on the current thread's handle table. Tests `syscall_roundtrip_stateless` and `syscall_object_and_handle_ops` (create -> map -> write/read-back -> attenuated duplicate -> unmap -> close) are green.
 
 ## M7 - IPC
 - [x] `Channel` object
@@ -71,6 +78,7 @@ Everything is written SMP-aware from the start, so locks are not retrofitted lat
 - [x] Capability transfer over a channel
 - [x] `Event` and `Timer` objects
 - Done when: two threads exchange a message and a capability over a channel.
+- Result: `object/channel.rs` is a connected endpoint pair - each end owns its inbox and holds the peer as a `Weak` so the two ends never form a refcount cycle - with non-blocking `send` (into the peer's bounded queue -> Full/PeerClosed) and `recv` (Empty/PeerClosed); a `Message` carries a byte payload + transferred `Capability`s + a sender badge. Capability transfer over the wire (`SYS_CHANNEL_SEND`/`RECV`) validates the handle (needs TRANSFER), moves the capability into the message, and consumes the source handle only on success (so a failed send drops nothing). `object/event.rs` (a signalable latch) and `object/timer.rs` (one-shot against the LAPIC tick) are pollable objects. A spawned thread is seeded its endpoint as a bootstrap handle (`spawn_with_object`). Tests: `channel_message_and_capability_transfer` (two threads move a marked MemoryObject and read it back through the granted handle), `channel_endpoint_semantics`, `event_timer_objects`, `event_timer_syscalls`. A true blocking `wait` is deferred (consumers poll + `yield_now`).
 
 ## M8 - Userspace (ring 3)
 - [x] Transition to ring 3
@@ -78,11 +86,13 @@ Everything is written SMP-aware from the start, so locks are not retrofitted lat
 - [x] Syscall from userspace
 - [x] IPC to a kernel service
 - Done when: the first userspace program runs and makes a capability-gated syscall + channel IPC.
+- Result: the GDT gains user code/data segments (the slots mandated by SYSRET) plus a per-core RSP0 stack; `arch::usermode::enter`/`exit_to_kernel` are a setjmp/longjmp pair - `enter` parks the kernel RSP in `gs:[KERNEL_RSP]`, builds an `iretq` frame, and drops to ring 3 with the bootstrap handle in rdi. A single `LSTAR` entry serves both the ring-0 self-call (distinguished by the sign bit of the saved RCX) and the ring-3 `syscall` path (stash user rsp/rip/rflags via GS, switch to the kernel stack, `sysretq` back). Paging now propagates the USER bit down every level; the M8 user pages live in the low half of the shared kernel CR3 (per-process CR3 is M11). An embedded position-independent ring-3 program makes a capability-gated `SYS_CHANNEL_SEND` "OK" plus a debug-write, then `SYS_USER_EXIT`; user pointers are range-validated at the boundary. Test `userspace_runs_and_ipcs` asserts the ring-3 program's channel message comes back. (Diagnosed and fixed a latent M3 bug here: the per-CPU MSR const was FS_BASE, not GS_BASE.)
 
 ## M9 - Resource accounting
 - [x] Per-`Domain` accounting of kernel resources (memory, handles)
 - [x] Quota enforcement
 - Done when: a domain at its quota cap fails cleanly, not by crashing.
+- Result: `object/domain.rs` adds a `Domain` with a `ResourceAccount` of three counters (memory bytes, handle count, thread count), each an atomic check-and-add (`try_charge` is a single CAS, so it is SMP-correct). Charging happens AT THE BOUNDARY of the create paths and is enforced - an over-cap create returns a typed `ERR_RESOURCE_EXHAUSTED` rather than crashing - and cleanup is Drop-based and exactly balanced: `HandleTable::drop` refunds open handles, `MemoryObject::drop` frees frames + refunds memory, `Thread::drop` refunds the slot, so even a crashed thread leaves the account at zero. Memory is charged at object create (a mapping consumes VA, not RAM, so it is not double-counted). Test `domain_quota_enforced_cleanly`: a Domain capped at 2 pages / 4 handles / 4 threads refuses the over-cap create cleanly, and once the thread is reaped every counter is back to zero. (No Process object yet - accounting is reached through the running thread; the handle table is still the M6 Thread stand-in.)
 
 ## M10 - IPC latency benchmark (phase 0 gate)
 - [x] Measure local `call()` round-trip latency (send + wait + receive)
