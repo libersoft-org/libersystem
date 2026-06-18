@@ -176,3 +176,27 @@ The IDL/WIT toolchain and binding generators; the full core services
 filesystem; networking; a strict app sandbox / permission manifests; more
 architectures than x86_64; real hardware; crypto/attestation/verified boot. That
 is phase 1+.
+
+## Deferred from phase 0 (cooperative workarounds, carried into phase 1)
+Every item the concept lists under Phase 0 ("Roadmap -> Phase 0") is implemented
+and tested (36 green). Two pieces of the concept's decided kernel design are NOT
+in the explicit Phase 0 checklist and are currently met with a cooperative
+workaround rather than the final mechanism; they are intentional and consistent
+with the concept's own "scheduler (SMP-aware design, running on a single core for
+now)" framing, but are recorded here so the deferral is tracked, not forgotten:
+- [ ] Blocking `wait` syscall (the concept's single blocking IPC primitive - "the
+  only place that blocks is `wait`", and `call() = send + wait + receive`).
+  Today: kernel `channel_send`/`channel_receive` are non-blocking and return
+  `WOULD_BLOCK`; callers spin on `SYS_YIELD` (cooperative poll). A real `wait`
+  needs a Blocked thread state + wait queues + wake-on-signal (readable channel /
+  signaled `Event` / expired `Timer`), with deadline support. Pairs naturally
+  with preemption.
+- [ ] Preemptive scheduling (timer-driven). Today: the scheduler is purely
+  cooperative - a thread runs until it calls `yield_now()`/`exit()`; the 100 Hz
+  LAPIC tick only advances `clock_get`, it does not preempt. A runaway CPU-bound
+  thread can monopolize its core. The per-CPU run queues and SMP wiring are
+  already in place, so this is a scheduler evolution, not new plumbing.
+- Note: `interrupt_bind` / `device_memory_map` / `dma_buffer_create` /
+  `object_property_set` / `random_get` from the concept's "minimal syscall set"
+  are deliberately absent too - they belong to the driver/service work in phase 1
+  (virtio) and are not Phase 0 scope.
