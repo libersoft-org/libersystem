@@ -39,6 +39,8 @@ APT_PACKAGES=(
 	xorriso         # ISO creation for Limine
 	gdisk           # sgdisk: GPT partitioning for the disk image
 	mtools          # mformat/mcopy: populate the FAT boot partition without root
+	netpbm          # pnmtopng/pnmtojpeg: convert QEMU framebuffer screendumps
+	imagemagick     # convert: framebuffer screenshots to png/jpg/webp/...
 	qemu-system-x86 # qemu-system-x86_64
 	qemu-utils      # qemu-img
 	gdb             # debugging via GDB stub

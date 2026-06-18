@@ -26,7 +26,7 @@ The included setup script installs the entire toolchain. It is idempotent - safe
 
 It installs:
 
-- system packages: `build-essential`, `git`, `curl`, `xorriso`, `gdisk`, `mtools`, `qemu-system-x86`, `qemu-utils`, `gdb`, `lld`, `llvm`, `clang`
+- system packages: `build-essential`, `git`, `curl`, `xorriso`, `gdisk`, `mtools`, `netpbm`, `imagemagick`, `qemu-system-x86`, `qemu-utils`, `gdb`, `lld`, `llvm`, `clang`
 - `rustup` with the **nightly** toolchain plus the `rust-src` and `llvm-tools-preview` components (required for `build-std` and the kernel build)
 - `just`, the task runner
 - the Limine bootloader (binary branch) into `~/.local/share/limine`
@@ -38,7 +38,7 @@ The project pins the nightly toolchain via `rust-toolchain.toml`, so no global t
 If you prefer to install the tools yourself:
 
 ```sh
-sudo apt install build-essential git curl xorriso gdisk mtools qemu-system-x86 qemu-utils gdb lld llvm clang
+sudo apt install build-essential git curl xorriso gdisk mtools netpbm imagemagick qemu-system-x86 qemu-utils gdb lld llvm clang
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
 rustup toolchain install nightly --profile minimal --component rust-src --component llvm-tools-preview
 cargo install just
@@ -71,6 +71,38 @@ To capture the serial output to a file instead of the terminal (useful over SSH 
 ```sh
 SERIAL=file:boot.log just run
 ```
+
+### Graphical display (VNC / SPICE)
+
+`just run` is headless by default - the framebuffer is still rendered internally (the boot log is drawn onto it), but no window is shown. To watch it live, attach a display server as an argument; both can run at once:
+
+```sh
+just run vnc        # VNC server on port 5900
+just run spice      # SPICE server on port 5930
+just run vnc spice  # both at the same time
+```
+
+Then connect from your machine - for example a VNC viewer to `HOST:5900`, or `remote-viewer spice://HOST:5930`. The serial console keeps running on your terminal alongside the graphical display.
+
+The servers bind to all interfaces (`0.0.0.0`) without a password. On a machine reachable from untrusted networks, restrict the bind to localhost and connect over an SSH tunnel instead:
+
+```sh
+VNC_ADDR=127.0.0.1:0 just run vnc      # VNC on localhost:5900 only
+ssh -L 5900:localhost:5900 user@HOST   # from your machine, then point the viewer at localhost:5900
+```
+
+`VNC_ADDR` sets the VNC bind/display (default `0.0.0.0:0`); `SPICE_PORT` sets the SPICE port (default `5930`).
+
+### Screenshot
+
+To save an image of the framebuffer, pass an output path - the format is taken from the extension (`png`, `jpg`, `webp`, `gif`, `bmp`, `ppm`):
+
+```sh
+just screenshot shot.png
+just screenshot /root/screenshot.webp
+```
+
+If a `just run` instance is already up, it attaches to it and snaps the **current** frame with no reboot - so you can grab a screenshot at any moment during a live run. Otherwise it boots a throwaway headless instance, waits for the boot log to finish, snaps that, and shuts it down. Format conversion uses ImageMagick (`png`/`jpg`/`webp`/...); a `netpbm`-only system can still write `png`/`jpg`/`ppm`.
 
 ## Create bootable images
 
@@ -144,7 +176,8 @@ Run `just --list` to see every available command. The most useful ones:
 | Command | Description |
 | --- | --- |
 | `just build` | Build the kernel. |
-| `just run` | Build and boot in QEMU (headless, serial on stdout). |
+| `just run [vnc] [spice]` | Build and boot in QEMU (headless by default; add `vnc` and/or `spice` for a live VNC `:5900` / SPICE `:5930` display). |
+| `just screenshot <path>` | Save a framebuffer image to `<path>` (format by extension: png/jpg/webp/...); snaps a live `just run` if one is up, else boots a throwaway. |
 | `just iso [strip]` | Build a hybrid BIOS+UEFI ISO into `boot/.build/` (`strip` = `debug` or `all`). |
 | `just img [size] [strip]` | Build a raw GPT disk image (default `64M`) into `boot/.build/`. |
 | `just test` | Run the in-kernel test harness in QEMU. |

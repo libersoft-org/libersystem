@@ -151,8 +151,15 @@ fn init_smp() {
 #[cfg(not(test))]
 fn boot_main() {
 	let title = alloc::format!("{} {}", product::NAME, product::VERSION);
-	let vendor = alloc::format!("{} - {}", product::VENDOR, product::VENDOR_URL);
-	print_banner(&[title.as_str(), product::WEBSITE, vendor.as_str()]);
+	// Three labelled URLs with their values aligned on a common column.
+	let label_web = "Web:";
+	let label_github = "GitHub:";
+	let label_vendor = alloc::format!("by {}:", product::VENDOR);
+	let label_w = label_web.len().max(label_github.len()).max(label_vendor.len());
+	let web = alloc::format!("{:<w$} {}", label_web, product::WEBSITE, w = label_w);
+	let github = alloc::format!("{:<w$} {}", label_github, product::GITHUB, w = label_w);
+	let vendor = alloc::format!("{:<w$} {}", label_vendor, product::VENDOR_URL, w = label_w);
+	print_banner(&[title.as_str(), "", web.as_str(), github.as_str(), vendor.as_str()]);
 	if !BASE_REVISION.is_supported() {
 		serial_println!("ERROR: Limine base revision not supported");
 		return;
@@ -201,7 +208,7 @@ fn print_banner(lines: &[&str]) {
 	for _ in 0..width + 2 {
 		border.push('-');
 	}
-	border.push('.');
+	border.push('+');
 	serial_println!("{}", border);
 	for line in lines {
 		serial_println!("| {:<width$} |", *line, width = width);

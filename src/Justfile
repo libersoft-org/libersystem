@@ -17,9 +17,10 @@ user:
 build: user
 	cd {{kernel_dir}} && cargo build
 
-# build + boot in QEMU (serial on stdout, headless)
-run: user
-	cd {{kernel_dir}} && cargo run
+# build + boot in QEMU (serial on stdout). Add live displays as arguments
+# (combinable): `just run`, `just run vnc`, `just run spice`, `just run vnc spice`
+run *displays: user
+	cd {{kernel_dir}} && DISPLAYS="{{displays}}" cargo run
 
 # build + boot, QEMU waits for GDB (port :1234)
 debug: user
@@ -33,6 +34,11 @@ gdb:
 test: user
 	cd {{kernel_dir}} && TEST=1 cargo test
 
+# screenshot the framebuffer to a file (format by extension: png/jpg/webp/...);
+# snaps a live `just run` if one is up, else boots a throwaway. e.g. just screenshot shot.png
+screenshot path: build
+	boot/screenshot.sh {{path}}
+
 # build a bootable hybrid ISO (BIOS + UEFI) -> boot/.build/<product>.iso; STRIP=debug|all
 iso strip="debug": build
 	STRIP={{strip}} boot/mkimage.sh iso {{kernel_elf}}
@@ -45,13 +51,13 @@ img size="64M" strip="debug": build
 fmt:
 	cd {{kernel_dir}} && cargo fmt
 	cd {{user_dir}} && cargo fmt
-	shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh
+	shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # check formatting without writing changes (CI-friendly)
 fmt-check:
 	cd {{kernel_dir}} && cargo fmt --check
 	cd {{user_dir}} && cargo fmt --check
-	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh
+	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # clean build artifacts
 clean:
