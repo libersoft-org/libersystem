@@ -177,6 +177,13 @@ filesystem; networking; a strict app sandbox / permission manifests; more
 architectures than x86_64; real hardware; crypto/attestation/verified boot. That
 is phase 1+.
 
+Two kernel features the concept lists (kernel components: "Event/wait primitives",
+the scheduler) are intentionally met by a cooperative workaround in phase 0 and
+finished in phase 1: the blocking `wait` primitive (phase 0 uses non-blocking IPC
++ `SYS_YIELD` polling) and preemptive scheduling (phase 0 is cooperative). This is
+consistent with the concept's "scheduler ... running on a single core for now"
+framing - see phase 1, M18-M19.
+
 # Phase 1 - First usable userspace
 
 Phase 1 goal (from CONCEPT "Roadmap -> Phase 1"): a first usable userspace on top
