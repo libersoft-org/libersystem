@@ -1,23 +1,30 @@
-// Shared userspace runtime for the storage programs: the ring-3 entry stub, the
-// syscall wrapper, the panic handler, and the small helpers both the
-// StorageManager and its client need (the PKGARCH1 volume parser and the vol://
-// path parser). Each binary includes this module independently, so every program
-// carries its own copy of these items.
+// Shared ring-3 userspace runtime: the entry stub, the syscall wrapper, the panic
+// handler, and the small helpers the userspace programs need (the PKGARCH1 volume
+// parser and the vol:// path parser). Every userspace program links this crate,
+// so the boilerplate and the ABI surface live in exactly one place.
+//
+// Entry contract: the crate provides `_start` (the ELF entry the kernel jumps to
+// in ring 3, with the bootstrap channel handle in rdi). It aligns the stack and
+// calls `__user_main`, which each program must define:
+//
+//     #[no_mangle]
+//     pub extern "C" fn __user_main(bootstrap: u64) -> ! { ... }
 
+#![no_std]
 #![allow(dead_code)]
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
 // Syscall numbers, error codes, and capability rights bits all come from the
-// shared abi crate (the single source of truth), re-exported so this module
-// and the binaries that include it keep referring to them directly.
+// shared abi crate (the single source of truth), re-exported so the programs that
+// link this runtime keep referring to them directly.
 pub use abi::*;
 
 // ELF entry: the kernel drops us into ring 3 here with the bootstrap channel
 // handle in rdi. Align the stack to the SysV ABI boundary, then call the Rust
-// entry the binary defines (keeping the bootstrap handle in rdi).
-global_asm!(".text", ".global _start", "_start:", "and rsp, -16", "call __storage_main", "ud2");
+// entry the program defines (keeping the bootstrap handle in rdi).
+global_asm!(".text", ".global _start", "_start:", "and rsp, -16", "call __user_main", "ud2");
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -79,7 +86,7 @@ pub enum Received {
 	Closed,
 }
 
-// Receive one message into `buf`, yielding while the channel is empty. Returns
+// Receive one message into `buf`, blocking while the channel is empty. Returns
 // the payload length and any transferred handle, or Closed once the peer is gone.
 pub unsafe fn recv_blocking(channel: u64, buf: &mut [u8]) -> Received {
 	let mut handle: u64 = 0;

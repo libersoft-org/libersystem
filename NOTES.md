@@ -2,3 +2,4 @@
 - Can I somehow list the available volumes in console?
 - Search for "liber" everywhere
 - Search for "0.0.1" everywhere
+- Check why do we use edition = "2021" in Cargo.toml

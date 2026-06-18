@@ -14,8 +14,7 @@
 #![no_std]
 #![no_main]
 
-mod runtime;
-use runtime::*;
+use rt::*;
 
 // the single volume this manager serves; the URI's volume component must match
 const VOLUME_NAME: &[u8] = b"system";
@@ -26,7 +25,7 @@ const STATUS_NOT_FOUND: u32 = 1;
 const STATUS_DENIED: u32 = 2;
 
 #[no_mangle]
-pub extern "C" fn __storage_main(bootstrap: u64) -> ! {
+pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	// 1. ramdisk: map the volume archive and remember its extent.
 	let (volume_base, volume_len): (u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {

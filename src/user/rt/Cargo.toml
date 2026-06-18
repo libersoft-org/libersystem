@@ -1,0 +1,18 @@
+[package]
+name = "rt"
+# Source of truth for product metadata is /product.conf; this version tracks the
+# kernel's. `rt` is the shared ring-3 userspace runtime linked into every
+# userspace program (the entry stub, syscall wrapper, panic handler, and the
+# syscall/IPC/volume helpers).
+version = "0.0.1"
+edition = "2021"
+description = "Shared ring-3 userspace runtime: entry stub, syscall wrapper, panic handler, and the syscall/IPC/volume helpers"
+
+[dependencies]
+# Shared kernel/userspace ABI constants (the single source of truth), re-exported
+# so the programs reach syscall numbers, error codes, rights, and the archive
+# format through this one runtime crate.
+abi = { path = "../../abi" }
+
+# Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
+# we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

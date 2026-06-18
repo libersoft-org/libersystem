@@ -7,8 +7,15 @@ name = "abi"
 version = "0.0.1"
 
 [[package]]
-name = "system_manager"
+name = "rt"
 version = "0.0.1"
 dependencies = [
  "abi",
+]
+
+[[package]]
+name = "system_manager"
+version = "0.0.1"
+dependencies = [
+ "rt",
 ]

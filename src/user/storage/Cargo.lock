@@ -7,8 +7,15 @@ name = "abi"
 version = "0.0.1"
 
 [[package]]
-name = "storage"
+name = "rt"
 version = "0.0.1"
 dependencies = [
  "abi",
+]
+
+[[package]]
+name = "storage"
+version = "0.0.1"
+dependencies = [
+ "rt",
 ]
