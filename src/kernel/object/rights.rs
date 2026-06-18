@@ -15,21 +15,21 @@ pub struct Rights(u32);
 impl Rights {
 	pub const NONE: Rights = Rights(0);
 
-	pub const READ: Rights = Rights(1 << 0);
-	pub const WRITE: Rights = Rights(1 << 1);
-	pub const EXECUTE: Rights = Rights(1 << 2);
-	pub const MAP: Rights = Rights(1 << 3);
-	pub const SEND: Rights = Rights(1 << 4);
-	pub const RECEIVE: Rights = Rights(1 << 5);
-	pub const DUPLICATE: Rights = Rights(1 << 6);
-	pub const TRANSFER: Rights = Rights(1 << 7);
-	pub const REVOKE: Rights = Rights(1 << 8);
-	pub const GET_INFO: Rights = Rights(1 << 9);
-	pub const MANAGE: Rights = Rights(1 << 10);
-	pub const WAIT: Rights = Rights(1 << 11);
+	pub const READ: Rights = Rights(abi::RIGHT_READ);
+	pub const WRITE: Rights = Rights(abi::RIGHT_WRITE);
+	pub const EXECUTE: Rights = Rights(abi::RIGHT_EXECUTE);
+	pub const MAP: Rights = Rights(abi::RIGHT_MAP);
+	pub const SEND: Rights = Rights(abi::RIGHT_SEND);
+	pub const RECEIVE: Rights = Rights(abi::RIGHT_RECEIVE);
+	pub const DUPLICATE: Rights = Rights(abi::RIGHT_DUPLICATE);
+	pub const TRANSFER: Rights = Rights(abi::RIGHT_TRANSFER);
+	pub const REVOKE: Rights = Rights(abi::RIGHT_REVOKE);
+	pub const GET_INFO: Rights = Rights(abi::RIGHT_GET_INFO);
+	pub const MANAGE: Rights = Rights(abi::RIGHT_MANAGE);
+	pub const WAIT: Rights = Rights(abi::RIGHT_WAIT);
 
 	// Every currently defined right.
-	pub const ALL: Rights = Rights(0xfff);
+	pub const ALL: Rights = Rights(abi::RIGHTS_ALL);
 
 	pub const fn bits(self) -> u32 {
 		self.0

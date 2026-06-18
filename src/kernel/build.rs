@@ -148,13 +148,11 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 // byte offset and a u32 size), then the concatenated file blobs. All integers are
 // little-endian. Must match the parser in src/kernel/pkg.rs.
 fn build_package(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
-	const HEADER_LEN: usize = 16;
-	const ENTRY_LEN: usize = 32;
-	const NAME_LEN: usize = 24;
+	use abi::{PKG_ENTRY_LEN as ENTRY_LEN, PKG_HEADER_LEN as HEADER_LEN, PKG_NAME_LEN as NAME_LEN};
 
 	let table_len: usize = HEADER_LEN + ENTRY_LEN * entries.len();
 	let mut out: Vec<u8> = Vec::new();
-	out.extend_from_slice(b"LIBERPK1");
+	out.extend_from_slice(abi::PKG_MAGIC);
 	out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
 	out.extend_from_slice(&0u32.to_le_bytes());
 

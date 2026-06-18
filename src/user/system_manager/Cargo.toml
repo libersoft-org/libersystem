@@ -5,11 +5,15 @@ name = "system_manager"
 # package.
 version = "0.0.1"
 edition = "2021"
-description = "LiberSystem SystemManager - the first userspace process"
+description = "SystemManager - the first userspace process"
 
 [[bin]]
 name = "system_manager"
 path = "src/main.rs"
+
+[dependencies]
+# Shared kernel/userspace ABI constants (the single source of truth).
+abi = { path = "../../abi" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

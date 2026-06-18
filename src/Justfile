@@ -4,6 +4,7 @@
 kernel_dir := "kernel"
 user_dir := "user/system_manager"
 storage_dir := "user/storage"
+abi_dir := "abi"
 target := "x86_64-unknown-none"
 kernel_elf := kernel_dir / "target" / target / "debug" / "kernel"
 
@@ -51,6 +52,7 @@ img size="64M" strip="debug": build
 
 # format all code (Rust via rustfmt, shell via shfmt)
 fmt:
+	cd {{abi_dir}} && cargo fmt
 	cd {{kernel_dir}} && cargo fmt
 	cd {{user_dir}} && cargo fmt
 	cd {{storage_dir}} && cargo fmt
@@ -58,6 +60,7 @@ fmt:
 
 # check formatting without writing changes (CI-friendly)
 fmt-check:
+	cd {{abi_dir}} && cargo fmt --check
 	cd {{kernel_dir}} && cargo fmt --check
 	cd {{user_dir}} && cargo fmt --check
 	cd {{storage_dir}} && cargo fmt --check
@@ -65,6 +68,7 @@ fmt-check:
 
 # clean build artifacts
 clean:
+	cd {{abi_dir}} && cargo clean
 	cd {{kernel_dir}} && cargo clean
 	cd {{user_dir}} && cargo clean
 	cd {{storage_dir}} && cargo clean

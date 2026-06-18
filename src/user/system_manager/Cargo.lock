@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "abi"
+version = "0.0.1"
+
+[[package]]
 name = "system_manager"
 version = "0.0.1"
+dependencies = [
+ "abi",
+]

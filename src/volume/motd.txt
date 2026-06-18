@@ -1,2 +1,2 @@
-LiberSystem - a capability microkernel.
+MOTD:
 Files on this volume are served by the userspace StorageManager over vol://.

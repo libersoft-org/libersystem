@@ -31,49 +31,11 @@ use crate::object::timer::Timer;
 use crate::object::{KernelObject, ObjectType};
 use crate::sched;
 
-// Syscall numbers (the stable ABI index).
-pub const SYS_DEBUG_NOOP: u64 = 0;
-pub const SYS_CLOCK_GET: u64 = 1;
-pub const SYS_DEBUG_WRITE: u64 = 2;
-pub const SYS_MEMORY_OBJECT_CREATE: u64 = 3;
-pub const SYS_MEMORY_MAP: u64 = 4;
-pub const SYS_MEMORY_UNMAP: u64 = 5;
-pub const SYS_HANDLE_DUPLICATE: u64 = 6;
-pub const SYS_HANDLE_CLOSE: u64 = 7;
-pub const SYS_CHANNEL_CREATE: u64 = 8;
-pub const SYS_CHANNEL_SEND: u64 = 9;
-pub const SYS_CHANNEL_RECV: u64 = 10;
-pub const SYS_EVENT_CREATE: u64 = 11;
-pub const SYS_EVENT_SIGNAL: u64 = 12;
-pub const SYS_EVENT_POLL: u64 = 13;
-pub const SYS_TIMER_CREATE: u64 = 14;
-pub const SYS_TIMER_SET: u64 = 15;
-pub const SYS_TIMER_POLL: u64 = 16;
-pub const SYS_USER_EXIT: u64 = 17;
-pub const SYS_FAULT_INFO_GET: u64 = 18;
-pub const SYS_DOMAIN_CREATE: u64 = 19;
-pub const SYS_DOMAIN_KILL: u64 = 20;
-pub const SYS_YIELD: u64 = 21;
-pub const SYS_OBJECT_INFO_GET: u64 = 22;
-pub const SYS_WAIT: u64 = 23;
-
-// Error codes (small negatives, returned in the syscall result register).
-pub const ERR_BAD_SYSCALL: i64 = -1;
-pub const ERR_NO_THREAD: i64 = -2;
-pub const ERR_NO_MEMORY: i64 = -3;
-pub const ERR_BAD_HANDLE: i64 = -4;
-pub const ERR_ACCESS_DENIED: i64 = -5;
-pub const ERR_INVALID: i64 = -6;
-pub const ERR_NOT_MAPPED: i64 = -7;
-pub const ERR_WOULD_BLOCK: i64 = -8;
-pub const ERR_PEER_CLOSED: i64 = -9;
-pub const ERR_RESOURCE_EXHAUSTED: i64 = -10;
-pub const ERR_TIMED_OUT: i64 = -11;
-
-// True if a syscall return value encodes an error (the range [-4095, -1]).
-pub fn sys_is_err(ret: u64) -> bool {
-	(-4095..0).contains(&(ret as i64))
-}
+// The syscall numbers, error codes, and the sys_is_err helper are the shared
+// kernel/userspace ABI: defined once in the abi crate (the single source of
+// truth) and re-exported here so the rest of the kernel keeps referring to them
+// as `syscall::SYS_*` / `syscall::ERR_*` / `syscall::sys_is_err`.
+pub use abi::{sys_is_err, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NOT_MAPPED, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD};
 
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. repr(C) with only

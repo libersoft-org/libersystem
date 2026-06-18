@@ -11,10 +11,7 @@
 
 #![allow(dead_code)]
 
-const MAGIC: &[u8; 8] = b"LIBERPK1";
-const HEADER_LEN: usize = 16;
-const ENTRY_LEN: usize = 32;
-const NAME_LEN: usize = 24;
+use abi::{PKG_ENTRY_LEN as ENTRY_LEN, PKG_HEADER_LEN as HEADER_LEN, PKG_MAGIC as MAGIC, PKG_NAME_LEN as NAME_LEN};
 
 // A parsed init package borrowing the underlying module bytes.
 pub struct Package<'a> {

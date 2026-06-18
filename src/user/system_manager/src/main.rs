@@ -12,9 +12,8 @@
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
-// Kernel syscall numbers (must match src/kernel/syscall.rs).
-const SYS_CHANNEL_SEND: u64 = 9;
-const SYS_USER_EXIT: u64 = 17;
+// Kernel syscall numbers from the shared abi crate (the single source of truth).
+use abi::{SYS_CHANNEL_SEND, SYS_USER_EXIT};
 
 // ELF entry point. The kernel sets the ELF entry to `_start` and enters ring 3
 // here with the bootstrap channel handle in rdi. Align the stack to the SysV ABI

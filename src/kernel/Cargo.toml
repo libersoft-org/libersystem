@@ -12,6 +12,12 @@ path = "main.rs"
 
 [dependencies]
 limine = "0.5"
+# Shared kernel/userspace ABI constants (syscalls, errors, rights, package format).
+abi = { path = "../abi" }
+
+# abi is also a build-dependency so build.rs packs with the same constants.
+[build-dependencies]
+abi = { path = "../abi" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we deliberately do NOT set `panic = "abort"` per-profile. Doing so makes cargo
