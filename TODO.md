@@ -202,6 +202,13 @@ Everything stays SMP-aware and capability-first from the start (no ambient
 authority - the HARD RULE holds from the MVP: a component gets only explicitly
 passed capabilities).
 
+System Graph note: phase 0 already has the basic graph (Domains -> processes ->
+handles), and it will automatically pick up the new services/drivers as ordinary
+processes + handles the moment they run. The SEMANTIC enrichment (labeling nodes
+as Service/Driver/Device, drawing device<->driver edges and dependencies, showing
+crash/restart state) plus the JSON/CBOR/CLI representations, tracing, and counters
+are the concept's "full System Graph" = phase 2 observability, not phase 1.
+
 ## M18 - Blocking `wait` primitive
 - [ ] `Blocked` thread state + per-object wait queues (a Channel becoming readable/writable, an `Event` signaled, a `Timer` expired)
 - [ ] `SYS_WAIT`: block the calling thread until one of a set of objects is ready, with an optional deadline (a `Timer`/monotonic `clock_get`)
@@ -218,20 +225,24 @@ passed capabilities).
 - Done when: a CPU-bound thread that never yields is preempted and other threads on the same core keep running; the whole test suite stays green with preemption enabled.
 - Concept: phase 0 was cooperative "running on a single core for now"; preemption is the scheduler evolution ("start simple, evolve").
 
-## M20 - Driver-enabling kernel primitives
+## M20 - Kernel additions: driver + spawn syscalls, queue/DMA accounting
 - [ ] `interrupt_bind`: hand a device IRQ to a userspace driver (delivered as an `Event`/Channel signal)
 - [ ] `device_memory_map`: map an MMIO region into a driver's address space (capability-gated)
 - [ ] `dma_buffer_create`: allocate a DMA-safe buffer and its handle
+- [ ] These three syscalls materialize the `Interrupt` / `DeviceMemory` / `DmaBuffer` kernel objects (the `ObjectType` variants have existed since M4; phase 1 implements the objects behind them)
+- [ ] `process_create` / `thread_create` / `thread_start` exposed to userspace (capability-gated): a userspace spawner builds an empty process + address space, loads an image into it via the existing `memory_object_create` / `memory_map` syscalls, then creates and starts its thread. Phase 0 spawned ELFs only from kernel code (`loader::spawn_elf_process`); ServiceManager/ProcessService (M21/M27) need this to start services from userspace.
 - [ ] `random_get` (kernel CSPRNG) and `object_property_set` (name / limit / ...)
+- [ ] Extend resource accounting to `ipc_queue_bytes` (a queued message is charged to the SENDER's Domain until the receiver takes it - the anti-DoS / backpressure rule, with `send` returning `WOULD_BLOCK` when the receiver's queue is full) and `dma_bytes` (pinned DMA memory). Phase 0 enforces only memory/handles/threads; the concept adds queues + DMA "with IPC and drivers".
 - [ ] Kernel-side driver-crash cleanup: on a driver fault, detach its IRQ, disable its DMA, remove its capabilities, free its memory, and send an event to ServiceManager
-- Done when: a userspace process binds a (test) interrupt, maps an MMIO page, and creates a DMA buffer; a forced driver crash is cleaned up by the kernel (IRQ detached, DMA disabled, caps removed) with an event delivered.
-- Concept: Syscall model (interrupt_bind / device_memory_map / dma_buffer_create / object_property_set / random_get), Drivers ("Driver crash" - the kernel only safely cleans up and sends an event).
+- Done when: a userspace process binds a (test) interrupt, maps an MMIO page, creates a DMA buffer, and spawns a second process from userspace; queue + DMA accounting is enforced (a full queue returns `WOULD_BLOCK`, a DMA over-cap fails cleanly); a forced driver crash is cleaned up by the kernel (IRQ detached, DMA disabled, caps removed) with an event delivered.
+- Concept: Syscall model (interrupt_bind / device_memory_map / dma_buffer_create / process_create / thread_create / thread_start / object_property_set / random_get), Resource accounting ("queues and DMA will be added with IPC and drivers"; `ipc_queue_bytes`, `dma_bytes`; the in-transit message is charged to the sender), Drivers ("Driver crash" - the kernel only safely cleans up and sends an event).
 
 ## M21 - ServiceManager and the boot chain
 - [ ] ServiceManager (basic): start/stop services, dependency ordering, service-state tracking
 - [ ] The boot chain per the concept: SystemManager -> ServiceManager -> DeviceManager + LogService + StorageManager, then the CLI as an ordinary component
+- [ ] Move the CLI to a userspace shell component (phase 0's CLI is kernel-embedded in `cli.rs`): it talks to the services over IPC and is started as an ordinary component at the end of the boot chain
 - [ ] SystemManager recovery: on a crash, start a recovery SystemManager / an emergency shell / safely restart userspace / reboot / panic as the last resort
-- Done when: SystemManager starts ServiceManager, which brings up the core services in dependency order, and a deliberately crashed SystemManager triggers the minimal recovery path.
+- Done when: SystemManager starts ServiceManager, which brings up the core services in dependency order, the shell runs as a userspace component, and a deliberately crashed SystemManager triggers the minimal recovery path.
 - Note: a full restart policy + heartbeat/watchdog is phase 2 (see "Out of scope for phase 1").
 - Concept: Boot flow, SystemManager + "Recovery on a SystemManager crash", ServiceManager.
 
@@ -256,19 +267,22 @@ passed capabilities).
 - Concept: Drivers (virtio-blk / virtio-net / virtio-console; drivers are isolated userspace services); the net *stack* is explicitly phase 2.
 
 ## M25 - IDL/WIT toolchain and generators
-- [ ] Write 5-6 REAL interfaces (not hello-world): `Storage.Volume`, `Process`, `Log`, a Channel with handle passing, an `EventStream` with backpressure
-- [ ] Generators from the IDL: the binary IPC layout, a Rust client, a CLI formatter, JSON and CBOR schemas
+- [ ] Write 5-6 REAL interfaces (not hello-world): `Storage.Volume`, `Process`, `Log`, a Channel with handle passing, an `EventStream` with backpressure (+ `Transfer` across volumes)
+- [ ] Generators from the IDL: the binary IPC layout, a Rust client, a CLI formatter, JSON and CBOR schemas, generated documentation, compatibility tests (and, optionally, a C ABI binding)
+- [ ] The generated client provides the synchronous-looking `call(req) -> resp` (internally `send` + M18 `wait` + `receive`, with a correlation id and a reply-handle) on top of the non-blocking Channel; one-way `EventStream`s are read via `wait` (no polling) - the request/response and event-stream conventions from the IPC model
 - [ ] Find where WIT chafes (handle passing, zero-copy buffers, streams, ABI stability), then decide: WIT-as-IDL vs WIT types + our own binary backend vs our own IDL
-- Done when: at least one real service speaks over generated bindings, the same call renders as binary / CLI / JSON, and the "WIT vs own" decision is recorded from practice (not from the armchair).
-- Concept: IDL language, "Relationship to WIT", "Decide after a real trial, not in advance".
+- Done when: at least one real service speaks over generated bindings, the same call renders as binary / CLI / JSON, generated docs + compatibility tests exist, and the "WIT vs own" decision is recorded from practice (not from the armchair).
+- Concept: IDL language (the full generator list: binary layout, CBOR/JSON schema, Rust client, optional C ABI binding, CLI formatter, documentation, compatibility tests), IPC model (`call() = send + wait + receive`, request/response via correlation id + reply-handle, event streams via `wait`), "Relationship to WIT", "Decide after a real trial, not in advance".
 
 ## M26 - StorageService over virtio-blk
 - [ ] Evolve the phase-0 ramdisk StorageManager into a StorageService backed by `driver.virtio-blk`
 - [ ] `vol://` volumes over a real block device (the storage model: a path belongs to exactly one volume; if the volume is gone, the operation fails)
+- [ ] The path is a typed object - `VolumePath { volume: VolumeId, path: RelativePath }`, where `RelativePath` is a list of validated segments (not a string), so `..`/`/` path traversal has nowhere to arise; the URI is just a representation, authority is the capability
 - [ ] The `Storage.Volume` interface from the IDL (Open / Stat / Watch), zero-copy reads via shared buffers
 - Done when: a client opens and reads a file on a `vol://` volume backed by a virtio-blk device through the typed `Storage.Volume` API.
 - Note: a persistent native filesystem (CoW / checksums / snapshots) is phase 2; phase 1 may use a simple read-mostly on-disk layout.
-- Concept: Storage model, core services (Storage); the persistent native FS is phase 2.
+- Note: phase 1 covers `vol://` only; the broader namespace resolvers (`user://`, `appdata://`, `cache://`, `runtime://`, per-process namespace composition) and detailed `storage://` disk/partition/volume admin + cross-volume `Transfer` are deferred (the concept's storage ergonomics are "a later phase - the direction is fixed, not the API").
+- Concept: Storage model (volumes, `vol://`, "a path is an object, a URI is a representation", typed `VolumePath`/`RelativePath`), core services (Storage); the persistent native FS is phase 2.
 
 ## M27 - Core services: Process, Device, Config
 - [ ] ProcessService: process lifecycle (create / start / exit / info) as a typed service over the kernel syscalls
@@ -303,9 +317,18 @@ testable under `cargo test` / QEMU.
 ## Out of scope for phase 1 (= phase 2, the appliance/edge platform)
 A full network stack over virtio-net (the priority of phase 2 - on the edge,
 networking is the core); observability and remote admin (the full System Graph
-with tracing and counters, JSON/CBOR/CLI everywhere); security hardening (a strict
-app sandbox, permission manifests, a threat model); ServiceManager with a full
+with services/drivers/devices/dependencies labeled, crash/restart state, tracing,
+counters, and JSON/CBOR/CLI representations everywhere); security hardening (a
+strict app sandbox, permission manifests, a threat model) and the PermissionManager
+policy service; the ResourceManager policy service (the kernel already enforces
+accounting from phase 0; the policy layer is later); ServiceManager with a full
 restart policy + watchdog; the full Component Model + WASI preview 2 + a Rust/C/Go
 SDK; a package/app format with installation + AOT compilation; a simple persistent
-native filesystem. Phases 3-6 (server / real hardware / desktop / AI) are vision,
-contingent on a community forming.
+native filesystem. Also not phase 1: the `virtio-gpu` / `virtio-input` drivers
+(headless phase 1 only - they belong to the desktop, phase 5) and any POSIX-like /
+relibc compatibility layer (phase 3, server). Wall-clock time (a `TimeService`
+computing `UTC = clock_get + offset`) is also deferred - it needs an RTC driver or
+NTP, neither available in headless phase 1 (the kernel's monotonic `clock_get` is
+enough for phase-1 timeouts, deadlines, and `LogRecord` timestamps). Phases 3-6
+(server / real hardware / desktop / AI) are vision, contingent on a community
+forming.
