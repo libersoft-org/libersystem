@@ -1,8 +1,8 @@
 [package]
 name = "kernel"
-# Source of truth for product metadata is /product.conf. Keep this version in
-# sync with PRODUCT_VERSION there (Cargo requires a literal here).
-version = "0.0.1"
+# The product version is the single source of truth in /product.conf (surfaced at
+# runtime via build.rs -> env!("PRODUCT_VERSION")); Cargo's optional package
+# version is unused here and omitted (defaults to 0.0.0).
 edition = "2021"
 description = "OS kernel"
 

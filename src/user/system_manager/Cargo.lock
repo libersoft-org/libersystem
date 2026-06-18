@@ -4,18 +4,18 @@ version = 4
 
 [[package]]
 name = "abi"
-version = "0.0.1"
+version = "0.0.0"
 
 [[package]]
 name = "rt"
-version = "0.0.1"
+version = "0.0.0"
 dependencies = [
  "abi",
 ]
 
 [[package]]
 name = "system_manager"
-version = "0.0.1"
+version = "0.0.0"
 dependencies = [
  "rt",
 ]

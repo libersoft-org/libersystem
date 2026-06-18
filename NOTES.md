@@ -1,5 +1,3 @@
 - Get through the code and find if something is not repetitive (duplicities) and deserves to unify (like single source of truth stuff)
 - Can I somehow list the available volumes in console?
-- Search for "liber" everywhere
-- Search for "0.0.1" everywhere
 - Check why do we use edition = "2021" in Cargo.toml

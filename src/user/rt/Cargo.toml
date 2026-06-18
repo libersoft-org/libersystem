@@ -1,10 +1,9 @@
 [package]
 name = "rt"
-# Source of truth for product metadata is /product.conf; this version tracks the
-# kernel's. `rt` is the shared ring-3 userspace runtime linked into every
-# userspace program (the entry stub, syscall wrapper, panic handler, and the
-# syscall/IPC/volume helpers).
-version = "0.0.1"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted (defaults to 0.0.0). `rt` is the shared
+# ring-3 userspace runtime linked into every userspace program (the entry stub,
+# syscall wrapper, panic handler, and the syscall/IPC/volume helpers).
 edition = "2021"
 description = "Shared ring-3 userspace runtime: entry stub, syscall wrapper, panic handler, and the syscall/IPC/volume helpers"
 

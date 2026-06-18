@@ -1,9 +1,9 @@
 [package]
 name = "storage"
-# Source of truth for product metadata is /product.conf; this version tracks the
-# kernel's. The storage crate produces the userspace StorageManager service and a
-# small demo client, both loaded from the init package.
-version = "0.0.1"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted (defaults to 0.0.0). The storage crate
+# produces the userspace StorageManager service and a small demo client, both
+# loaded from the init package.
 edition = "2021"
 description = "StorageManager service and demo client"
 
