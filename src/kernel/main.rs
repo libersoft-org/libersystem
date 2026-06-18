@@ -8,6 +8,7 @@
 extern crate alloc;
 
 mod arch;
+mod console;
 mod elf;
 mod fault;
 mod loader;
@@ -21,7 +22,7 @@ mod smp;
 mod sync;
 mod syscall;
 
-use limine::request::{HhdmRequest, MemoryMapRequest, ModuleRequest, MpRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::request::{FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, MpRequest, RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
 
 // Limine boot protocol: request declarations.
@@ -51,6 +52,11 @@ static MP_REQUEST: MpRequest = MpRequest::new();
 #[link_section = ".limine_requests"]
 static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 
+// Framebuffer: a linear RGB video mode for the on-screen console (M15).
+#[used]
+#[link_section = ".limine_requests"]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
 // Start/end markers delimit the request block so Limine can locate it.
 #[used]
 #[link_section = ".limine_requests_start"]
@@ -63,19 +69,30 @@ static _REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
 // print macros (architecture-independent, target arch::serial::SerialWriter)
 #[macro_export]
 macro_rules! serial_print {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write as _;
-        let _ = core::write!($crate::arch::serial::SerialWriter, $($arg)*);
-    }};
+    ($($arg:tt)*) => {
+        $crate::_print(core::format_args!($($arg)*))
+    };
 }
 
 #[macro_export]
 macro_rules! serial_println {
-    () => { $crate::serial_print!("\n") };
+    () => {
+        $crate::_print(core::format_args!("\n"))
+    };
     ($($arg:tt)*) => {{
-        use core::fmt::Write as _;
-        let _ = core::writeln!($crate::arch::serial::SerialWriter, $($arg)*);
+        $crate::_print(core::format_args!($($arg)*));
+        $crate::_print(core::format_args!("\n"));
     }};
+}
+
+// Write formatted output to the serial port (always) and mirror it to the
+// framebuffer console (if one is initialized). Backs serial_print!/serial_println!
+// so every log line reaches both sinks. Hidden from docs; call via the macros.
+#[doc(hidden)]
+pub fn _print(args: core::fmt::Arguments<'_>) {
+	use core::fmt::Write as _;
+	let _ = core::write!(arch::serial::SerialWriter, "{}", args);
+	console::write_fmt(args);
 }
 
 // kernel entry point (ELF entry, see ENTRY(kmain) in the linker script)
@@ -83,6 +100,7 @@ macro_rules! serial_println {
 unsafe extern "C" fn kmain() -> ! {
 	arch::serial::init();
 	arch::init();
+	init_framebuffer();
 	init_memory();
 	arch::init_interrupts();
 	arch::init_tsc();
@@ -106,6 +124,21 @@ fn init_memory() {
 	let hhdm = HHDM_REQUEST.get_response().expect("Limine: no HHDM response");
 	let memory_map = MEMORY_MAP_REQUEST.get_response().expect("Limine: no memory map response");
 	mem::init(memory_map, hhdm.offset());
+}
+
+// Bring up the framebuffer console from the Limine framebuffer response, so the
+// kernel log is mirrored to the screen alongside serial. A no-op (serial only) if
+// the bootloader provided no framebuffer. Runs before the test/boot split so the
+// console is up for both paths; it needs no heap or paging (Limine maps the
+// framebuffer and the font is static), only that GDT/IDT are installed first.
+fn init_framebuffer() {
+	let Some(response) = FRAMEBUFFER_REQUEST.get_response() else {
+		return;
+	};
+	let Some(fb) = response.framebuffers().next() else {
+		return;
+	};
+	console::init(console::FbInfo { addr: fb.addr(), width: fb.width() as usize, height: fb.height() as usize, pitch: fb.pitch() as usize, bytes_per_pixel: fb.bpp() as usize / 8, red_shift: fb.red_mask_shift(), red_size: fb.red_mask_size(), green_shift: fb.green_mask_shift(), green_size: fb.green_mask_size(), blue_shift: fb.blue_mask_shift(), blue_size: fb.blue_mask_size() });
 }
 
 // Wake the application processors and wait for every core to report in. Runs

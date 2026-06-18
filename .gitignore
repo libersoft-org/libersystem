@@ -17,6 +17,9 @@ target/
 *.bin
 *.log
 
+# ...but the embedded console font is a required source asset, not a build output
+!src/kernel/font8x8.bin
+
 # Image / distribution archives
 *.zip
 *.gz
