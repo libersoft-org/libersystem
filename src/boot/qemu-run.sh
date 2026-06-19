@@ -40,6 +40,8 @@ QEMU_ARGS+=(
 	-netdev user,id=vnet0
 	-device virtio-net-pci,netdev=vnet0,disable-legacy=on
 	-device virtio-serial-pci,disable-legacy=on
+	-device virtconsole,chardev=vcon
+	-chardev "file,id=vcon,path=$HERE/.build/virtio-console.out"
 )
 
 # display backends: the DISPLAYS env is a space-separated list, any of `vnc` and

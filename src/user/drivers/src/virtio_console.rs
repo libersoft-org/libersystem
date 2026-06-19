@@ -1,4 +1,9 @@
 // driver.virtio-console - the userspace virtio serial/console driver.
+//
+// We do not negotiate MULTIPORT, so the device is a single console port: queue 0 is
+// the receive queue, queue 1 the transmit queue, and the port is always open. After
+// bringing the device up the driver writes a banner to the console over the
+// transmit virtqueue (it lands on QEMU's console chardev).
 
 #![no_std]
 #![no_main]
@@ -6,14 +11,48 @@
 mod common;
 mod virtio;
 
+use rt::*;
+
+use crate::virtio::Queue;
+
+// The line the driver writes over the console transmit queue.
+const BANNER: &[u8] = b"virtio-console driver online: console output over the virtqueue\n";
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		let device = common::bringup(bootstrap);
-		// set up the first queue and go live; transmitting console output over the
-		// queue is the next step.
-		let _q = device.setup_queue(0);
+		// single-port virtio-console: receiveq = 0, transmitq = 1.
+		let _rx = device.setup_queue(0);
+		let tx = device.setup_queue(1);
 		device.driver_ok();
-		common::online_and_stand(bootstrap, b"driver.virtio-console: online")
+		let ok = match tx {
+			Some(q) => write_console(&q, BANNER),
+			None => false,
+		};
+		let report: &[u8] = if ok { b"driver.virtio-console: online (console tx ok)" } else { b"driver.virtio-console: online" };
+		common::online_and_stand(bootstrap, report)
+	}
+}
+
+// Write `bytes` to the console over the transmit queue (virtio-console transmit
+// buffers are raw bytes, no header).
+unsafe fn write_console(tx: &Queue, bytes: &[u8]) -> bool {
+	unsafe {
+		let handle: i64 = dma_buffer_create(4096);
+		if handle < 0 {
+			return false;
+		}
+		let virt: i64 = dma_buffer_map(handle as u64);
+		if sys_is_err(virt as u64) {
+			return false;
+		}
+		let virt: u64 = virt as u64;
+		let phys: u64 = dma_buffer_phys(handle as u64);
+		let n: usize = if bytes.len() < 4096 { bytes.len() } else { 4096 };
+		for (i, &b) in bytes[..n].iter().enumerate() {
+			((virt + i as u64) as *mut u8).write_volatile(b);
+		}
+		tx.submit(&[(phys, n as u32, false)]).is_some()
 	}
 }
