@@ -47,6 +47,12 @@ pub const SYS_PROCESS_LOAD: u64 = 30;
 pub const SYS_THREAD_CREATE: u64 = 31;
 pub const SYS_THREAD_START: u64 = 32;
 
+// The ring-3 stack top an ELF-loaded process runs on: the kernel's loader maps a
+// stack just below this address, and a userspace spawner passes it to
+// thread_create as the new thread's stack_top. Part of the spawn ABI, so it lives
+// here next to the spawn syscall numbers.
+pub const USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
+
 // object_property_set property selectors. PROP_NAME sets an object's label (arg2 =
 // name pointer, arg3 = length); the PROP_*_LIMIT selectors set a Domain resource
 // counter's limit (arg2 = the new limit).

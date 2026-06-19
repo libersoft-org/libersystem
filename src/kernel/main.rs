@@ -506,29 +506,53 @@ fn volume_package_bytes() -> Option<&'static [u8]> {
 }
 
 // Load SystemManager from the init package into a new ring-3 process, handing it
-// one end of a fresh channel as its bootstrap capability. Returns the kernel-held
-// peer endpoint, on which SystemManager's first message arrives. Shared by the
-// boot demo and the test.
+// one end of a fresh channel as its bootstrap capability and, over that channel,
+// the init package itself as a shared buffer so it can spawn the services it
+// supervises. Returns the kernel-held peer endpoint, on which the boot chain's
+// reports arrive. Shared by the boot demo and the test.
 fn spawn_system_manager() -> Result<alloc::sync::Arc<object::channel::Channel>, &'static str> {
+	use alloc::sync::Arc;
+	use object::KernelObject;
+	use object::channel::Message;
+	use object::handle::Capability;
+	use object::memory_object::MemoryObject;
+	use object::rights::Rights;
+
 	let bytes = init_package_bytes().ok_or("init package module not found")?;
 	let package = pkg::Package::parse(bytes).ok_or("init package is malformed")?;
 	let elf_image = package.lookup(b"system_manager").ok_or("system_manager missing from init package")?;
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), elf_image, user_ep, object::rights::Rights::ALL, 0).map_err(|_| "failed to load SystemManager")?;
+	loader::spawn_elf_process(sched::root_domain(), elf_image, user_ep, Rights::ALL, 0).map_err(|_| "failed to load SystemManager")?;
+
+	// Hand SystemManager the init package as a read-only shared buffer: the kernel
+	// copies the package bytes into a MemoryObject and sends "PACKAGE" + length
+	// with that capability, so SystemManager can find and spawn ServiceManager (and
+	// later the rest of the services) from userspace.
+	let package_obj = MemoryObject::create(bytes.len()).ok_or("no memory for the init package")?;
+	copy_into_object(&package_obj, bytes);
+	let mut msg = alloc::vec::Vec::with_capacity(7 + 8);
+	msg.extend_from_slice(b"PACKAGE");
+	msg.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+	let cap = Capability::new(package_obj as Arc<dyn KernelObject>, Rights::READ | Rights::MAP, 0);
+	kernel_ep.send(Message::new(msg, alloc::vec![cap], 0)).map_err(|_| "failed to hand SystemManager the init package")?;
 	Ok(kernel_ep)
 }
 
 // Start the first userspace process from the init package and read back the
-// message it sends in over its bootstrap channel - the first real userspace
-// service reporting in.
+// reports relayed up the boot chain over its bootstrap channel - SystemManager
+// spawning ServiceManager, each reporting in.
 #[cfg(not(test))]
 fn system_manager_demo() {
 	match spawn_system_manager() {
 		Ok(kernel_ep) => {
 			sched::run_until_idle();
-			match kernel_ep.recv() {
-				Ok(message) => serial_println!("userspace: SystemManager reported in over IPC: \"{}\"", core::str::from_utf8(&message.bytes).unwrap_or("<bad>")),
-				Err(_) => serial_println!("userspace: ERROR - SystemManager sent no message"),
+			let mut any = false;
+			while let Ok(message) = kernel_ep.recv() {
+				any = true;
+				serial_println!("userspace: {}", core::str::from_utf8(&message.bytes).unwrap_or("<bad>"));
+			}
+			if !any {
+				serial_println!("userspace: ERROR - SystemManager sent no message");
 			}
 		}
 		Err(reason) => serial_println!("userspace: ERROR - could not start SystemManager: {}", reason),
@@ -1582,14 +1606,16 @@ fn channel_endpoint_semantics() {
 #[cfg(test)]
 #[test_case]
 fn init_package_starts_system_manager() {
-	// Load SystemManager from the init package as a real ring-3 process and let it
-	// report in over its bootstrap channel - the M14 path end to end. Runs on the
-	// boot context (kernel CR3 active), so AddressSpace::create copies the kernel
-	// half correctly before the new process is scheduled.
+	// SystemManager starts from the init package, spawns ServiceManager from that
+	// same package, relays ServiceManager's report, then reports in itself - the
+	// first link of the boot chain end to end (a userspace process spawning another
+	// userspace process and both reporting in).
 	let kernel_ep = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let message = kernel_ep.recv().expect("SystemManager should report in over IPC");
-	assert_eq!(&message.bytes[..], b"SystemManager: online");
+	let first = kernel_ep.recv().expect("ServiceManager should report in via SystemManager");
+	assert_eq!(&first.bytes[..], b"ServiceManager: online");
+	let second = kernel_ep.recv().expect("SystemManager should report in over IPC");
+	assert_eq!(&second.bytes[..], b"SystemManager: online");
 }
 
 #[cfg(test)]
@@ -1598,7 +1624,7 @@ fn userspace_spawn_syscalls_start_a_second_process() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	// A kernel thread drives the userspace spawn syscalls exactly as a ring-3
 	// spawner would: process_create -> process_load -> thread_create -> thread_start.
-	// The image is the embedded SystemManager ELF, which reports in over its
+	// The image is the embedded ServiceManager ELF, which reports in over its
 	// bootstrap channel and exits. The spawner hands the child the channel endpoint
 	// it received as its own bootstrap (transferred through thread_create).
 	static ELF_PTR: AtomicU64 = AtomicU64::new(0);
@@ -1617,14 +1643,14 @@ fn userspace_spawn_syscalls_start_a_second_process() {
 	}
 	let bytes = init_package_bytes().expect("init package present");
 	let package = pkg::Package::parse(bytes).expect("init package parses");
-	let elf = package.lookup(b"system_manager").expect("system_manager image");
+	let elf = package.lookup(b"service_manager").expect("service_manager image");
 	ELF_PTR.store(elf.as_ptr() as u64, Ordering::SeqCst);
 	ELF_LEN.store(elf.len() as u64, Ordering::SeqCst);
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
 	sched::spawn_with_object(spawner, user_ep, object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	let message = kernel_ep.recv().expect("the spawned process should report in over IPC");
-	assert_eq!(&message.bytes[..], b"SystemManager: online");
+	assert_eq!(&message.bytes[..], b"ServiceManager: online");
 }
 
 #[cfg(test)]

@@ -128,6 +128,45 @@ pub unsafe fn send_blocking(channel: u64, bytes: &[u8], xfer: u64) -> bool {
 	}
 }
 
+// Create a channel pair, returning its two endpoint handles, or None on failure.
+pub unsafe fn channel() -> Option<(u64, u64)> {
+	unsafe {
+		let mut a: u64 = 0;
+		let mut b: u64 = 0;
+		let result: u64 = syscall(SYS_CHANNEL_CREATE, &mut a as *mut u64 as u64, &mut b as *mut u64 as u64, 0, 0);
+		if sys_is_err(result) {
+			return None;
+		}
+		Some((a, b))
+	}
+}
+
+// Spawn a new ring-3 process from an ELF image and start it. `bootstrap` is an
+// object handle (0 = none) moved out of this process's table into the child's and
+// delivered to the child's first thread in rdi - the way a process is endowed with
+// its initial capability. Returns the child Process handle, or a negative error.
+pub unsafe fn spawn(elf: &[u8], bootstrap: u64) -> i64 {
+	unsafe {
+		let process: u64 = syscall(SYS_PROCESS_CREATE, 0, 0, 0, 0);
+		if sys_is_err(process) {
+			return process as i64;
+		}
+		let entry: u64 = syscall(SYS_PROCESS_LOAD, process, elf.as_ptr() as u64, elf.len() as u64, 0);
+		if sys_is_err(entry) {
+			return entry as i64;
+		}
+		let thread: u64 = syscall(SYS_THREAD_CREATE, process, entry, USER_STACK_TOP, bootstrap);
+		if sys_is_err(thread) {
+			return thread as i64;
+		}
+		let started: u64 = syscall(SYS_THREAD_START, thread, 0, 0, 0);
+		if sys_is_err(started) {
+			return started as i64;
+		}
+		process as i64
+	}
+}
+
 // The PKGARCH1 archive reader (`abi::Package`, re-exported above via `pub use
 // abi::*`) is the single decoder for the format, shared with the kernel.
 

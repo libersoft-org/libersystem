@@ -1,0 +1,20 @@
+[package]
+name = "services"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted. The services crate produces the userspace
+# system services started across the boot chain (ServiceManager first), loaded
+# from the init package.
+edition = "2024"
+description = "Core userspace system services (ServiceManager, ...)"
+
+[[bin]]
+name = "service_manager"
+path = "src/service_manager.rs"
+
+[dependencies]
+# Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
+# the syscall/IPC/volume helpers); it re-exports the abi constants.
+rt = { path = "../rt" }
+
+# Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
+# we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

@@ -3,6 +3,7 @@
 
 kernel_dir := "kernel"
 user_dir := "user/system_manager"
+services_dir := "user/services"
 storage_dir := "user/storage"
 rt_dir := "user/rt"
 abi_dir := "abi"
@@ -15,6 +16,7 @@ default: run
 # build the userspace programs that make up the init package
 user:
 	cd {{user_dir}} && cargo build
+	cd {{services_dir}} && cargo build
 	cd {{storage_dir}} && cargo build
 
 # build the kernel (its build.rs assembles the init package from the userspace build)
@@ -57,6 +59,7 @@ fmt:
 	cd {{rt_dir}} && cargo fmt
 	cd {{kernel_dir}} && cargo fmt
 	cd {{user_dir}} && cargo fmt
+	cd {{services_dir}} && cargo fmt
 	cd {{storage_dir}} && cargo fmt
 	shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
@@ -66,6 +69,7 @@ fmt-check:
 	cd {{rt_dir}} && cargo fmt --check
 	cd {{kernel_dir}} && cargo fmt --check
 	cd {{user_dir}} && cargo fmt --check
+	cd {{services_dir}} && cargo fmt --check
 	cd {{storage_dir}} && cargo fmt --check
 	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
@@ -75,5 +79,6 @@ clean:
 	cd {{rt_dir}} && cargo clean
 	cd {{kernel_dir}} && cargo clean
 	cd {{user_dir}} && cargo clean
+	cd {{services_dir}} && cargo clean
 	cd {{storage_dir}} && cargo clean
 	rm -rf boot/.build
