@@ -80,8 +80,8 @@ pub fn init() {
 	// Software-enable the APIC and set the spurious-interrupt vector.
 	write(REG_SVR, SVR_ENABLE | super::interrupts::SPURIOUS_VECTOR as u32);
 
-	// Count ticks on the timer vector, then start the periodic timer.
-	super::interrupts::register(super::interrupts::TIMER_VECTOR, tick);
+	// Start the periodic timer. Its IDT gate (the preemptive `timer` stub) is
+	// installed by interrupts::init; here we only program the LAPIC LVT and count.
 	start_timer();
 }
 
@@ -95,7 +95,8 @@ pub fn init_ap() {
 	write(REG_SVR, SVR_ENABLE | super::interrupts::SPURIOUS_VECTOR as u32);
 }
 
-fn tick(_vector: u8) {
+// Advance the monotonic tick counter. Called from the timer ISR.
+pub(super) fn on_timer_tick() {
 	TICKS.fetch_add(1, Ordering::Relaxed);
 }
 

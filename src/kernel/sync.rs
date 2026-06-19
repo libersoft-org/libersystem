@@ -4,14 +4,17 @@
 // a test-and-test-and-set acquire with proper acquire/release memory ordering so
 // data published under the lock is visible to the next holder on another core.
 //
-// Note: this lock is NOT interrupt-safe yet. Once we enable interrupts (M2), any
-// lock that can also be taken from an interrupt handler must additionally disable
-// interrupts while held, or a handler interrupting a holder on the same core will
-// deadlock. Locks introduced in M1 are only taken with interrupts disabled.
+// It is also interrupt-safe (since M19, preemption): `lock` disables interrupts on
+// the current core before acquiring and the guard restores the prior state on
+// drop. A lock holder therefore can never be preempted by the timer, so an
+// interrupt handler that needs the same lock can never deadlock against a holder
+// it interrupted. Nested locks restore correctly (only the outermost re-enables).
 #![allow(dead_code)]
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::arch;
 
 pub struct SpinLock<T> {
 	locked: AtomicBool,
@@ -28,6 +31,11 @@ impl<T> SpinLock<T> {
 	}
 
 	pub fn lock(&self) -> SpinLockGuard<'_, T> {
+		// Disable interrupts BEFORE acquiring, so a holder can never be preempted on
+		// this core (which would deadlock an interrupt handler needing the same
+		// lock). The prior interrupt state is restored when the guard drops.
+		let was_enabled = arch::interrupts_enabled();
+		arch::disable_interrupts();
 		while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
 			// Spin read-only (cheap, cache-friendly) until the lock looks free,
 			// then retry the atomic acquire above.
@@ -35,16 +43,28 @@ impl<T> SpinLock<T> {
 				core::hint::spin_loop();
 			}
 		}
-		SpinLockGuard { lock: self }
+		SpinLockGuard { lock: self, was_enabled }
 	}
 
 	pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
-		if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() { Some(SpinLockGuard { lock: self }) } else { None }
+		let was_enabled = arch::interrupts_enabled();
+		arch::disable_interrupts();
+		if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+			Some(SpinLockGuard { lock: self, was_enabled })
+		} else {
+			// Acquisition failed: restore the interrupt state we just disabled.
+			if was_enabled {
+				arch::enable_interrupts();
+			}
+			None
+		}
 	}
 }
 
 pub struct SpinLockGuard<'a, T> {
 	lock: &'a SpinLock<T>,
+	// Whether interrupts were enabled when this lock was taken; restored on drop.
+	was_enabled: bool,
 }
 
 impl<T> Deref for SpinLockGuard<'_, T> {
@@ -62,6 +82,11 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 
 impl<T> Drop for SpinLockGuard<'_, T> {
 	fn drop(&mut self) {
+		// Release the lock first, then restore interrupts: an interrupt handler that
+		// fires the instant interrupts come back must see the lock already free.
 		self.lock.locked.store(false, Ordering::Release);
+		if self.was_enabled {
+			arch::enable_interrupts();
+		}
 	}
 }

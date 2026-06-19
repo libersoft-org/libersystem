@@ -72,6 +72,20 @@ irq_stub!(irq15, 47);
 // Spurious LAPIC interrupts must not signal EOI, so they bypass the dispatcher.
 extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {}
 
+// The LAPIC timer vector. Unlike the generic IRQ stubs it preempts: after counting
+// the tick and signalling EOI, it rotates to the next ready thread when it
+// interrupted ring-0 thread code. EOI is sent BEFORE the switch so the LAPIC keeps
+// delivering ticks while this thread is descheduled. Ring-3 is not preempted yet:
+// its interrupt frame lands on the shared per-core RSP0 stack, so context-switching
+// from here would not travel with the thread (that needs a per-thread RSP0).
+extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
+	apic::on_timer_tick();
+	apic::eoi();
+	if frame.code_segment & 3 == 0 {
+		crate::sched::on_timer_preempt();
+	}
+}
+
 const STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); IRQ_COUNT] = [irq0, irq1, irq2, irq3, irq4, irq5, irq6, irq7, irq8, irq9, irq10, irq11, irq12, irq13, irq14, irq15];
 
 // Install the IRQ stubs and the spurious handler into the IDT.
@@ -79,5 +93,8 @@ pub fn init() {
 	for (i, stub) in STUBS.iter().enumerate() {
 		idt::set_gate(IRQ_BASE as usize + i, *stub);
 	}
+	// The timer vector preempts, so it gets a dedicated stub instead of the generic
+	// count-and-dispatch path.
+	idt::set_gate(TIMER_VECTOR as usize, timer);
 	idt::set_gate(SPURIOUS_VECTOR as usize, spurious);
 }

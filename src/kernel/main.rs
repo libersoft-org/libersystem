@@ -1086,6 +1086,35 @@ fn scheduler_multiplexes_threads() {
 
 #[cfg(test)]
 #[test_case]
+fn preemption_preempts_a_cpu_bound_thread() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static STOP: AtomicBool = AtomicBool::new(false);
+	static MATE_RAN: AtomicBool = AtomicBool::new(false);
+	// A CPU-bound thread that NEVER yields: it spins until another thread sets STOP.
+	// Only timer-driven preemption can let that other thread run, so without
+	// preemption this spins forever and hangs the test.
+	extern "C" fn hog(_arg: u64) {
+		while !STOP.load(Ordering::SeqCst) {
+			core::hint::spin_loop();
+		}
+	}
+	// The cohabiting thread: records that it ran, then releases the hog so the run
+	// queue can drain.
+	extern "C" fn mate(_arg: u64) {
+		MATE_RAN.store(true, Ordering::SeqCst);
+		STOP.store(true, Ordering::SeqCst);
+	}
+	STOP.store(false, Ordering::SeqCst);
+	MATE_RAN.store(false, Ordering::SeqCst);
+	// Both land on this core's run queue; the hog runs first and never yields.
+	sched::spawn(hog, 0);
+	sched::spawn(mate, 0);
+	sched::run_until_idle();
+	assert!(MATE_RAN.load(Ordering::SeqCst), "the cohabiting thread never ran: the never-yielding thread was not preempted");
+}
+
+#[cfg(test)]
+#[test_case]
 fn scheduler_runs_across_cores() {
 	use core::sync::atomic::{AtomicU32, Ordering};
 	static CROSS: AtomicU32 = AtomicU32::new(0);

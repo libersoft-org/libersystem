@@ -16,7 +16,7 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch;
 use crate::arch::percpu::MAX_CPUS;
@@ -90,6 +90,12 @@ static ROOT_DOMAIN: SpinLock<Option<Arc<Domain>>> = SpinLock::new(None);
 // idle so a dead process's page tables are freed while off their own CR3.
 static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 
+// Whether the timer ISR may preempt. False until init() completes, so the timer
+// fires (and counts ticks) before per-CPU state and the scheduler are ready
+// without the preempt path touching either. Set once on the BSP at the end of
+// init(), by which point init_smp() has set up per-CPU state on every core.
+static PREEMPTION_ENABLED: AtomicBool = AtomicBool::new(false);
+
 fn current_cpu_id() -> usize {
 	arch::percpu::this_cpu().cpu_id() as usize
 }
@@ -101,6 +107,8 @@ pub fn init() {
 	KERNEL_CR3.store(kernel_as.cr3(), Ordering::Release);
 	*KERNEL_AS.lock() = Some(kernel_as);
 	*ROOT_DOMAIN.lock() = Some(Domain::root());
+	// Per-CPU state and the scheduler are now up: the timer ISR may preempt.
+	PREEMPTION_ENABLED.store(true, Ordering::Release);
 }
 
 // The root (unlimited) resource Domain.
@@ -311,6 +319,27 @@ fn reap(sched: &CpuSched) {
 	drop(dead);
 }
 
+// Preempt the running thread when its time slice expires, rotating to the next
+// ready thread on this core. Called from the timer ISR (interrupts disabled, EOI
+// already sent). A no-op in the idle context (no current thread) or when no other
+// thread is ready, so a sole thread keeps running uninterrupted and the idle loop
+// is never disturbed. The quantum is one timer tick (10 ms): a fair per-core round
+// robin. Only ring-0 threads reach here (the ISR gates on the interrupted CPL), so
+// the preemptive switch runs on the thread's own kernel stack.
+pub fn on_timer_preempt() {
+	if !PREEMPTION_ENABLED.load(Ordering::Relaxed) {
+		return;
+	}
+	let sched = &SCHED[current_cpu_id()];
+	{
+		let inner = sched.inner.lock();
+		if inner.current.is_none() || inner.run_queue.is_empty() {
+			return;
+		}
+	}
+	reschedule(Disposition::Requeue);
+}
+
 // Load `want_cr3` into CR3 unless it is already active. All kernel code and
 // stacks live in the higher half, mapped identically in every address space, so
 // switching the active address space mid-context-switch keeps the running code
@@ -323,14 +352,18 @@ fn switch_address_space(want_cr3: u64) {
 
 // Core scheduling step: pick the next ready thread and context-switch to it.
 fn reschedule(disp: Disposition) {
+	// The whole switch runs with interrupts disabled so the timer ISR cannot fire
+	// between dropping the run-queue lock and completing switch_context (which would
+	// corrupt the half-switched stack). The interrupt flag is not part of the saved
+	// context, so capture it here and restore it when this thread is switched back
+	// to. A ring-3 syscall runs with interrupts masked (FMASK); a thread preempted
+	// by the timer captured resume_if = false and stays masked through the ISR tail,
+	// after which iretq restores its real flag.
+	let resume_if = arch::interrupts_enabled();
+	arch::disable_interrupts();
+
 	let sched = &SCHED[current_cpu_id()];
 	reap(sched);
-
-	// The interrupt flag is not part of the saved context, so capture it here and
-	// restore it when this thread is switched back to. A ring-3 syscall runs with
-	// interrupts masked (FMASK); without this, yielding out of one would leave the
-	// next thread - and eventually the bootstrap context - running masked.
-	let resume_if = arch::interrupts_enabled();
 
 	let mut guard = sched.inner.lock();
 	let next = guard.run_queue.pop_front();
@@ -351,16 +384,15 @@ fn reschedule(disp: Disposition) {
 			arch::percpu::set_kernel_rsp(new_syscall_rsp);
 			switch_address_space(new_cr3);
 			unsafe { arch::context::switch_context(old_sp, new_sp) };
-			// Resumed on this thread: restore the interrupt state it yielded with.
-			if resume_if {
-				arch::enable_interrupts();
-			} else {
-				arch::disable_interrupts();
-			}
+			// Resumed on this thread: restore the interrupt state it switched with.
+			restore_interrupts(resume_if);
 		}
 		None => match prev {
 			// Idle context with nothing to run: return to the idle loop.
-			None => {}
+			None => {
+				drop(guard);
+				restore_interrupts(resume_if);
+			}
 			Some(prev) => match disp {
 				Disposition::Retire => {
 					// Current thread exited and nothing else is ready: switch
@@ -377,9 +409,12 @@ fn reschedule(disp: Disposition) {
 					unsafe { arch::context::switch_context(old_sp, new_sp) };
 				}
 				Disposition::Requeue => {
-					// Sole runnable thread yielded: keep running it, no switch.
+					// Sole runnable thread yielded (or was preempted): keep running
+					// it, no switch.
 					prev.set_state(ThreadState::Running);
 					guard.current = Some(prev);
+					drop(guard);
+					restore_interrupts(resume_if);
 				}
 				Disposition::Block => {
 					// Blocked with nothing else ready: save our SP and switch to
@@ -393,14 +428,21 @@ fn reschedule(disp: Disposition) {
 					switch_address_space(KERNEL_CR3.load(Ordering::Acquire));
 					unsafe { arch::context::switch_context(old_sp, new_sp) };
 					// Woken and resumed: restore the interrupt state we blocked with.
-					if resume_if {
-						arch::enable_interrupts();
-					} else {
-						arch::disable_interrupts();
-					}
+					restore_interrupts(resume_if);
 				}
 			},
 		},
+	}
+}
+
+// Restore the interrupt flag captured at the start of a reschedule. Called after
+// the run-queue guard has been dropped (the guard's own irq-safe drop leaves
+// interrupts disabled, since reschedule disabled them up front).
+fn restore_interrupts(resume_if: bool) {
+	if resume_if {
+		arch::enable_interrupts();
+	} else {
+		arch::disable_interrupts();
 	}
 }
 

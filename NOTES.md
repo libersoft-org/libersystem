@@ -1,2 +1,4 @@
-- Can I somehow list the available volumes in console?
+- List the available volumes "ls" - change to "lsvol"?
 - Optimize the code
+- Find the dead code
+- Find the duplicate code

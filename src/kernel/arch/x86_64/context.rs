@@ -50,6 +50,12 @@ global_asm!(
 // its argument; when the entry returns, the thread exits and never comes back.
 #[unsafe(no_mangle)]
 extern "C" fn thread_bootstrap(entry: u64, arg: u64) -> ! {
+	// New threads start preemptible. The scheduler switches into a thread with
+	// interrupts disabled (it disables them across every context switch); a thread
+	// resumed from a yield gets its interrupt flag restored by the scheduler, but a
+	// brand-new thread returns straight into this trampoline instead, so it must
+	// enable interrupts itself to match.
+	crate::arch::enable_interrupts();
 	let entry_fn: extern "C" fn(u64) = unsafe { core::mem::transmute(entry) };
 	entry_fn(arg);
 	crate::sched::exit()
