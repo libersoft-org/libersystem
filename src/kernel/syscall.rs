@@ -29,6 +29,7 @@ use crate::object::dma_buffer::DmaBuffer;
 use crate::object::domain::Domain;
 use crate::object::event::Event;
 use crate::object::handle::{Capability, Handle, HandleError};
+use crate::object::interrupt::Interrupt;
 use crate::object::memory_object::{MemoryError, MemoryObject};
 use crate::object::rights::Rights;
 use crate::object::timer::Timer;
@@ -39,7 +40,7 @@ use crate::sched;
 // kernel/userspace ABI: defined once in the abi crate (the single source of
 // truth) and re-exported here so the rest of the kernel keeps referring to them
 // as `syscall::SYS_*` / `syscall::ERR_*` / `syscall::sys_is_err`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_RANDOM_GET, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_RANDOM_GET, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
 
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. repr(C) with only
@@ -117,6 +118,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_DMA_BUFFER_CREATE => sys_dma_buffer_create(a0),
 		SYS_DEVICE_MEMORY_MAP => sys_device_memory_map(a0),
 		SYS_RANDOM_GET => sys_random_get(a0, a1),
+		SYS_INTERRUPT_BIND => sys_interrupt_bind(a0),
 		SYS_MEMORY_MAP => sys_memory_map(a0),
 		SYS_MEMORY_UNMAP => sys_memory_unmap(a0),
 		SYS_HANDLE_DUPLICATE => sys_handle_duplicate(a0, a1),
@@ -235,6 +237,31 @@ fn sys_random_get(buf_ptr: u64, len: u64) -> i64 {
 		filled += n as u64;
 	}
 	filled as i64
+}
+
+// Bind a device IRQ vector to a new Interrupt object and install a handle to it in
+// the caller's table. A driver waits on the handle; the kernel marks it pending
+// and wakes the driver when the vector fires. ERR_INVALID for a non-bindable
+// vector, ERR_RESOURCE_EXHAUSTED if the vector is already bound.
+fn sys_interrupt_bind(vector: u64) -> i64 {
+	let thread = match sched::current_thread() {
+		Some(t) => t,
+		None => return ERR_NO_THREAD,
+	};
+	if vector > u8::MAX as u64 || !arch::interrupts::is_bindable(vector as u8) {
+		return ERR_INVALID;
+	}
+	let v = vector as u8;
+	let interrupt = Interrupt::new(v);
+	if !arch::interrupts::bind(v, &interrupt) {
+		return ERR_RESOURCE_EXHAUSTED;
+	}
+	// On a failed install the Interrupt is dropped here, and its Drop unbinds the
+	// vector, so no explicit rollback is needed.
+	match thread.handles().lock().try_insert_object(interrupt, Rights::ALL, 0) {
+		Some(handle) => handle.raw() as i64,
+		None => ERR_RESOURCE_EXHAUSTED,
+	}
 }
 
 // Map a MemoryObject into the kernel address space, returning its virtual base.
@@ -512,6 +539,9 @@ fn object_ready(object: &Arc<dyn KernelObject>) -> bool {
 	}
 	if let Some(timer) = any.downcast_ref::<Timer>() {
 		return timer.is_expired();
+	}
+	if let Some(interrupt) = any.downcast_ref::<Interrupt>() {
+		return interrupt.is_pending();
 	}
 	false
 }

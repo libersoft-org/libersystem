@@ -12,8 +12,12 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use alloc::sync::{Arc, Weak};
+
 use super::apic;
 use super::idt::{self, InterruptStackFrame};
+use crate::object::interrupt::Interrupt;
+use crate::sync::SpinLock;
 
 // Device-interrupt vector window (mirrors the legacy 16-IRQ layout).
 pub const IRQ_BASE: u8 = 32;
@@ -26,6 +30,38 @@ pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub type HandlerFn = fn(u8);
 
 static HANDLERS: [AtomicUsize; IRQ_COUNT] = [const { AtomicUsize::new(0) }; IRQ_COUNT];
+
+// Userspace-driver bindings: the Interrupt object to wake when each device vector
+// fires. Held weakly, so closing the driver's handle (its Interrupt's Drop) clears
+// the binding and the kernel stops delivering to a gone driver.
+static BOUND: [SpinLock<Option<Weak<Interrupt>>>; IRQ_COUNT] = [const { SpinLock::new(None) }; IRQ_COUNT];
+
+// Whether `vector` is a device-IRQ vector a driver may bind. The timer vector
+// (IRQ_BASE) is the kernel's own and is never handed out.
+pub fn is_bindable(vector: u8) -> bool {
+	vector > IRQ_BASE && vector < IRQ_BASE + IRQ_COUNT as u8
+}
+
+// Bind `intr` to `vector` so the dispatch path wakes it when the vector fires.
+// Returns false if the vector is already bound to a live Interrupt.
+pub fn bind(vector: u8, intr: &Arc<Interrupt>) -> bool {
+	let index = (vector - IRQ_BASE) as usize;
+	let mut slot = BOUND[index].lock();
+	if slot.as_ref().and_then(Weak::upgrade).is_some() {
+		return false;
+	}
+	*slot = Some(Arc::downgrade(intr));
+	intr.mark_bound();
+	true
+}
+
+// Remove any binding for `vector` (called from an Interrupt's Drop).
+pub fn unbind(vector: u8) {
+	let index = vector.wrapping_sub(IRQ_BASE) as usize;
+	if index < IRQ_COUNT {
+		*BOUND[index].lock() = None;
+	}
+}
 
 // Register `handler` for a device-interrupt `vector` (IRQ_BASE..IRQ_BASE+IRQ_COUNT).
 pub fn register(vector: u8, handler: HandlerFn) {
@@ -40,6 +76,10 @@ fn dispatch(vector: u8) {
 	if raw != 0 {
 		let handler: HandlerFn = unsafe { core::mem::transmute::<usize, HandlerFn>(raw) };
 		handler(vector);
+	}
+	// Deliver to a userspace driver bound to this vector, if any.
+	if let Some(intr) = BOUND[index].lock().as_ref().and_then(Weak::upgrade) {
+		intr.signal();
 	}
 	apic::eoi();
 }

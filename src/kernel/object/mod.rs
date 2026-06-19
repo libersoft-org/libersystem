@@ -14,6 +14,7 @@ pub mod dma_buffer;
 pub mod domain;
 pub mod event;
 pub mod handle;
+pub mod interrupt;
 pub mod memory_object;
 pub mod process;
 pub mod rights;

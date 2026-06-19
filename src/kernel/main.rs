@@ -1335,6 +1335,34 @@ fn random_get_fills_distinct_bytes() {
 
 #[cfg(test)]
 #[test_case]
+fn interrupt_bind_delivers_to_driver() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	// Vector 0x2c (IRQ 12) is a bindable device-IRQ vector (not the timer at 0x20).
+	const VECTOR: u64 = 0x2c;
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let h = arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, VECTOR, 0, 0, 0);
+			assert!(!syscall::sys_is_err(h), "interrupt_bind failed");
+			// Simulate the device IRQ firing with a software interrupt; the dispatch
+			// path marks the bound Interrupt pending and wakes any waiter.
+			core::arch::asm!("int 0x2c");
+			// The interrupt is now pending, so a wait observes it and returns.
+			let r = arch::syscall::invoke(syscall::SYS_WAIT, h, 0, 0, 0);
+			assert_eq!(r as i64, 0, "wait did not observe the delivered interrupt");
+			// Binding the same vector again while ours lives is refused.
+			let again = arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, VECTOR, 0, 0, 0);
+			assert_eq!(again as i64, syscall::ERR_RESOURCE_EXHAUSTED);
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+}
+
+#[cfg(test)]
+#[test_case]
 fn channel_message_and_capability_transfer() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	static OK: AtomicBool = AtomicBool::new(false);

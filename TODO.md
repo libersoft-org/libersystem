@@ -238,7 +238,7 @@ are the concept's "full System Graph" = phase 2 observability, not phase 1.
 - [ ] `interrupt_bind`: hand a device IRQ to a userspace driver (delivered as an `Event`/Channel signal)
 - [x] `device_memory_map`: map an MMIO region into a driver's address space (capability-gated)
 - [x] `dma_buffer_create`: allocate a DMA-safe buffer and its handle
-- [ ] These three syscalls materialize the `Interrupt` / `DeviceMemory` / `DmaBuffer` kernel objects (the `ObjectType` variants have existed since M4; phase 1 implements the objects behind them)
+- [x] These three syscalls materialize the `Interrupt` / `DeviceMemory` / `DmaBuffer` kernel objects (the `ObjectType` variants have existed since M4; phase 1 implements the objects behind them)
 - [ ] `process_create` / `thread_create` / `thread_start` exposed to userspace (capability-gated): a userspace spawner builds an empty process + address space, loads an image into it via the existing `memory_object_create` / `memory_map` syscalls, then creates and starts its thread. Phase 0 spawned ELFs only from kernel code (`loader::spawn_elf_process`); ServiceManager/ProcessService (M21/M27) need this to start services from userspace.
 - [ ] `random_get` (kernel CSPRNG) and `object_property_set` (name / limit / ...)
 - [x] Extend resource accounting to `ipc_queue_bytes` (a queued message is charged to the SENDER's Domain until the receiver takes it - the anti-DoS / backpressure rule, with `send` returning `WOULD_BLOCK` when the receiver's queue is full) and `dma_bytes` (pinned DMA memory). Phase 0 enforces only memory/handles/threads; the concept adds queues + DMA "with IPC and drivers".
