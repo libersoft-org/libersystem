@@ -3,3 +3,4 @@
 - Find the dead code
 - Find the duplicate / repetitive code
 - Nicer kernel boot - colourful terminal - is it good idea or not?
+- There is a build / target folders in "src", it should be somewhere else (a folder above)

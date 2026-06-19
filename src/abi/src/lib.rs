@@ -11,6 +11,10 @@
 #![no_std]
 #![allow(dead_code)]
 
+// The canonical structured-log record type and its representations (text, JSON,
+// CBOR), shared by emitters, LogService, and the kernel.
+pub mod log;
+
 // Syscall numbers (the stable ABI index). Handlers live in the kernel's
 // syscall.rs; userspace issues them through its syscall wrapper.
 pub const SYS_DEBUG_NOOP: u64 = 0;

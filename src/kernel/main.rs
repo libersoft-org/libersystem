@@ -1695,6 +1695,40 @@ fn channel_endpoint_semantics() {
 
 #[cfg(test)]
 #[test_case]
+fn log_record_roundtrip_and_renders() {
+	use abi::log::{LogRecord, Severity, encode, render_cbor, render_json, render_text};
+	// A LogRecord is the canonical structured object; text/JSON/CBOR are derived
+	// representations. Encode one, parse it back (the fields survive), then render
+	// the SAME record three ways and check each representation byte-for-byte.
+	let fields: [(&[u8], &[u8]); 2] = [(b"event", b"online"), (b"files", b"2")];
+	let mut wire: [u8; 128] = [0u8; 128];
+	let n: usize = encode(42, Severity::Info, b"storage_service", &fields, &mut wire).expect("encode fits");
+	let rec: LogRecord<'_> = LogRecord::parse(&wire[..n]).expect("parse round-trips");
+	assert_eq!(rec.ts(), 42);
+	assert_eq!(rec.severity(), Severity::Info);
+	assert_eq!(rec.source(), b"storage_service");
+	assert_eq!(rec.field_count(), 2);
+	let mut it = rec.fields();
+	assert_eq!(it.next(), Some((&b"event"[..], &b"online"[..])));
+	assert_eq!(it.next(), Some((&b"files"[..], &b"2"[..])));
+	assert_eq!(it.next(), None);
+	// human text
+	let mut tbuf: [u8; 128] = [0u8; 128];
+	let tn: usize = render_text(&rec, &mut tbuf).expect("text fits");
+	assert_eq!(&tbuf[..tn], b"[42] INFO storage_service: event=online files=2");
+	// JSON
+	let mut jbuf: [u8; 256] = [0u8; 256];
+	let jn: usize = render_json(&rec, &mut jbuf).expect("json fits");
+	assert_eq!(&jbuf[..jn], br#"{"ts":42,"severity":"INFO","source":"storage_service","fields":{"event":"online","files":"2"}}"#);
+	// CBOR: map(4); spot-check the head and that the source text is embedded
+	let mut cbuf: [u8; 128] = [0u8; 128];
+	let cn: usize = render_cbor(&rec, &mut cbuf).expect("cbor fits");
+	assert_eq!(cbuf[0], 0xA4, "CBOR record is a 4-entry map");
+	assert!(cbuf[..cn].windows(b"storage_service".len()).any(|w: &[u8]| w == b"storage_service"), "source string present in CBOR");
+}
+
+#[cfg(test)]
+#[test_case]
 fn init_package_starts_system_manager() {
 	// The boot chain, end to end: SystemManager starts from the init package, spawns
 	// ServiceManager and delegates the package and the ramdisk to it, and
