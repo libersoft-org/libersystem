@@ -2312,6 +2312,40 @@ fn device_manager_reacts_to_a_driver_crash() {
 
 #[cfg(test)]
 #[test_case]
+fn driver_survives_crash_and_restart() {
+	use object::KernelObject;
+	// The driver crash/restart cycle: a driver that faults is respawned by its
+	// supervisor, and the restarted driver runs cleanly. The supervisor spawns the
+	// driver, detects the fault on the crash-notify channel, and respawns it until an
+	// attempt survives - the loop DeviceManager runs over a driver's bootstrap channel
+	// (a crash there peer-closes it) and the kernel runs to recover SystemManager.
+	extern "C" fn clean_driver(_arg: u64) {}
+	let (crash_tx, crash_rx) = object::channel::Channel::create();
+	fault::set_crash_notify(crash_tx);
+	let mut restarts: u32 = 0;
+	let mut survived = false;
+	for attempt in 0..4u32 {
+		// the first start faults; each restart runs the clean driver.
+		let body: extern "C" fn(u64) = if attempt == 0 { user_fault_thread_body } else { clean_driver };
+		let koid = {
+			let driver = sched::spawn(body, 0);
+			driver.process().header().koid()
+		};
+		sched::run_until_idle();
+		if crash_seen(&crash_rx, koid) {
+			restarts += 1;
+			continue;
+		}
+		survived = true;
+		break;
+	}
+	fault::clear_crash_notify();
+	assert!(survived, "the restarted driver should run without faulting");
+	assert!(restarts >= 1, "the supervisor should have restarted the crashed driver");
+}
+
+#[cfg(test)]
+#[test_case]
 fn domain_quota_enforced_cleanly() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::domain::Domain;

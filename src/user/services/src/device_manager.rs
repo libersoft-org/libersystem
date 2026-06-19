@@ -22,6 +22,10 @@ const STATE_FAILED: u8 = 2;
 // The most devices DeviceManager tracks (QEMU exposes a handful).
 const MAX_DEVICES: usize = 8;
 
+// How many times DeviceManager restarts a driver that crashes during bring-up
+// before giving up on its device.
+const MAX_DRIVER_RESTARTS: u32 = 3;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
@@ -67,7 +71,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 unsafe fn launch_drivers(package: &Package, buf: &mut [u8]) {
 	unsafe {
 		let count: u64 = device_count();
-		let info_size: usize = core::mem::size_of::<DeviceInfo>();
 		let mut state: [u8; MAX_DEVICES] = [STATE_UNKNOWN; MAX_DEVICES];
 		let mut i: u64 = 0;
 		while i < count && i < MAX_DEVICES as u64 {
@@ -86,33 +89,61 @@ unsafe fn launch_drivers(package: &Package, buf: &mut [u8]) {
 					continue;
 				}
 			};
-			// acquire this device's MMIO capability and spawn its driver with a fresh
-			// bootstrap channel.
-			let cap: i64 = device_acquire(i);
-			let (dm_side, driver_side): (u64, u64) = match channel() {
-				Some(pair) => pair,
-				None => {
-					i += 1;
-					continue;
-				}
-			};
-			if cap >= 0 && spawn(elf, driver_side) >= 0 {
-				// hand the driver "DEVICE" + its DeviceInfo + the transferred MMIO cap.
-				buf[..6].copy_from_slice(b"DEVICE");
-				let info_bytes: &[u8] = core::slice::from_raw_parts(&info as *const DeviceInfo as *const u8, info_size);
-				buf[6..6 + info_size].copy_from_slice(info_bytes);
-				if send_blocking(dm_side, &buf[..6 + info_size], cap as u64) {
-					if let Received::Message { len, .. } = recv_blocking(dm_side, buf) {
-						print(&buf[..len]);
-						print(b"\n");
-						// the device's driver came up: mark it online.
-						state[idx] = STATE_ONLINE;
-					}
-				}
+			// launch the driver, restarting it if it crashes during bring-up.
+			if launch_one(i, &info, elf, driver_name, buf) {
+				state[idx] = STATE_ONLINE;
 			}
 			i += 1;
 		}
 		report_state(&state, count);
+	}
+}
+
+// Launch (and, on a crash during bring-up, restart) the driver for device `i`,
+// handing it only that device's MMIO capability and info. Returns true once the
+// driver reports in. If a started driver crashes before reporting, the kernel tears
+// it down and its bootstrap channel peer-closes (recv returns Closed); DeviceManager
+// then re-acquires a fresh capability and respawns it, up to a few times - the
+// driver crash/restart cycle. Drivers do not crash in normal operation, so the
+// restart path is dormant on a healthy boot.
+unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], buf: &mut [u8]) -> bool {
+	unsafe {
+		let info_size: usize = core::mem::size_of::<DeviceInfo>();
+		let mut attempt: u32 = 0;
+		loop {
+			let cap: i64 = device_acquire(i);
+			let (dm_side, driver_side): (u64, u64) = match channel() {
+				Some(pair) => pair,
+				None => return false,
+			};
+			if cap < 0 || spawn(elf, driver_side) < 0 {
+				return false;
+			}
+			// hand the driver "DEVICE" + its DeviceInfo + the transferred MMIO cap.
+			buf[..6].copy_from_slice(b"DEVICE");
+			let info_bytes: &[u8] = core::slice::from_raw_parts(info as *const DeviceInfo as *const u8, info_size);
+			buf[6..6 + info_size].copy_from_slice(info_bytes);
+			if !send_blocking(dm_side, &buf[..6 + info_size], cap as u64) {
+				return false;
+			}
+			match recv_blocking(dm_side, buf) {
+				Received::Message { len, .. } => {
+					print(&buf[..len]);
+					print(b"\n");
+					return true;
+				}
+				Received::Closed => {
+					// the driver crashed before reporting in: restart it a few times.
+					if attempt >= MAX_DRIVER_RESTARTS {
+						return false;
+					}
+					attempt += 1;
+					print(b"DeviceManager: restarting ");
+					print(driver_name);
+					print(b"\n");
+				}
+			}
+		}
 	}
 }
 
