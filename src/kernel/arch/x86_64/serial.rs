@@ -1,25 +1,9 @@
 // COM1 serial driver (16550 UART)
 
-use core::arch::asm;
+use super::port::{inb, outb};
 use core::fmt::{self, Write};
 
 const COM1: u16 = 0x3F8;
-
-#[inline]
-unsafe fn outb(port: u16, value: u8) {
-	unsafe {
-		asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
-	}
-}
-
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-	unsafe {
-		let value: u8;
-		asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
-		value
-	}
-}
 
 // UART init: 38400 baud, 8N1, FIFO enabled
 pub fn init() {

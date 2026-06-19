@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use core::arch::asm;
+use super::port::{inb, outb};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::msr;
@@ -49,22 +49,6 @@ static LAPIC_BASE: AtomicUsize = AtomicUsize::new(0);
 
 // Monotonic timer tick counter.
 static TICKS: AtomicU64 = AtomicU64::new(0);
-
-#[inline]
-unsafe fn outb(port: u16, value: u8) {
-	unsafe {
-		asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
-	}
-}
-
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-	unsafe {
-		let value: u8;
-		asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
-		value
-	}
-}
 
 fn rdmsr(msr: u32) -> u64 {
 	msr::read(msr)

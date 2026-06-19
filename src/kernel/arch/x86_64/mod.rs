@@ -6,12 +6,16 @@ pub mod interrupts;
 pub mod msr;
 pub mod paging;
 pub mod percpu;
+mod port;
 pub mod serial;
 pub mod syscall;
 pub mod tsc;
 pub mod usermode;
 
 use core::arch::asm;
+
+// Shared programmed-I/O port helpers (the reset and power-off paths use them).
+use self::port::{inb, outb, outw};
 
 // install the CPU descriptor tables (GDT + TSS, then IDT)
 pub fn init() {
@@ -115,30 +119,6 @@ pub fn poweroff() -> ! {
 		outw(0x600, 0x2000);
 	}
 	halt_loop()
-}
-
-// single-byte / single-word port I/O for the reset and power-off paths
-#[inline]
-unsafe fn outb(port: u16, value: u8) {
-	unsafe {
-		asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
-	}
-}
-
-#[inline]
-unsafe fn outw(port: u16, value: u16) {
-	unsafe {
-		asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags));
-	}
-}
-
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-	unsafe {
-		let value: u8;
-		asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
-		value
-	}
 }
 
 // exit QEMU via the isa-debug-exit device (test harness only)

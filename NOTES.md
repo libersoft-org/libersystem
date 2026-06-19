@@ -1,2 +1,4 @@
 - Get through the code and find if something is not repetitive (duplicities) and deserves to unify (like single source of truth stuff)
+- Finish deduplication / single source of truth things
 - Can I somehow list the available volumes in console?
+- Optimize the code
