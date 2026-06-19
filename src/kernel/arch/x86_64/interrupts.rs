@@ -63,6 +63,16 @@ pub fn unbind(vector: u8) {
 	}
 }
 
+// Whether `vector` currently has a live driver binding. Used to confirm that a
+// crashed driver's IRQ was detached during cleanup.
+pub fn is_bound(vector: u8) -> bool {
+	let index = vector.wrapping_sub(IRQ_BASE) as usize;
+	if index >= IRQ_COUNT {
+		return false;
+	}
+	BOUND[index].lock().as_ref().and_then(Weak::upgrade).is_some()
+}
+
 // Register `handler` for a device-interrupt `vector` (IRQ_BASE..IRQ_BASE+IRQ_COUNT).
 pub fn register(vector: u8, handler: HandlerFn) {
 	let index = (vector - IRQ_BASE) as usize;

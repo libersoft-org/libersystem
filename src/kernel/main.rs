@@ -752,6 +752,42 @@ extern "C" fn user_fault_thread_body(_arg: u64) {
 	frame::deallocate(stack);
 }
 
+// A bindable test IRQ vector (33..47, distinct from the interrupt_bind test's) a
+// crashing "driver" holds before it faults.
+#[cfg(test)]
+const DRIVER_IRQ_VECTOR: u64 = 0x2d;
+
+// Kernel-thread body for the driver-crash test: it acquires real driver resources
+// - a bound IRQ and a DMA buffer - then drops to ring 3 and faults, leaving both
+// open so the kernel's crash cleanup is what detaches the IRQ and refunds the DMA.
+// Mirrors user_fault_thread_body's ring-3 fault, plus the held driver resources.
+#[cfg(test)]
+extern "C" fn driver_crash_thread_body(_arg: u64) {
+	use mem::frame::{self, PAGE_SIZE};
+	unsafe {
+		let irq = arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, DRIVER_IRQ_VECTOR, 0, 0, 0);
+		assert!((irq as i64) > 0, "driver should bind its IRQ");
+		let dma = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, PAGE_SIZE, 0, 0, 0);
+		assert!((dma as i64) > 0, "driver should create its DMA buffer");
+	}
+	let code = frame::allocate().expect("user code frame");
+	let stack = frame::allocate().expect("user stack frame");
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
+	arch::paging::map_page(USER_CODE_VA, code, flags);
+	arch::paging::map_page(USER_STACK_VA, stack, flags);
+	let program = arch::usermode::program_fault_bytes();
+	unsafe {
+		core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
+		arch::usermode::enter(USER_CODE_VA, USER_STACK_VA + PAGE_SIZE, 0);
+	}
+	// Back from the crash: drop the raw code/stack mappings. The IRQ and DMA handles
+	// stay open, so the kernel's process teardown is what releases them.
+	arch::paging::unmap_page(USER_CODE_VA);
+	arch::paging::unmap_page(USER_STACK_VA);
+	frame::deallocate(code);
+	frame::deallocate(stack);
+}
+
 // Run the fault-isolation demo: spawn a thread that drops to ring 3 and faults.
 // The kernel must terminate just that process and keep running; report the fault
 // it recorded to show the excursion was caught and cleaned up.
@@ -1833,6 +1869,39 @@ fn fault_isolation_kills_only_process() {
 	assert_eq!(domain.account().memory().used(), 0, "memory refunded");
 	assert_eq!(domain.account().handles().used(), 0, "handles refunded");
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
+}
+
+#[cfg(test)]
+#[test_case]
+fn driver_crash_is_cleaned_up_and_notified() {
+	use object::KernelObject;
+	use object::domain::Domain;
+	// A "driver" process binds an IRQ and creates a DMA buffer, then faults. The
+	// kernel must detach the IRQ, refund the DMA, remove the caps, and deliver a
+	// crash record naming the process - all without cooperation from the driver.
+	let (notify_tx, notify_rx) = object::channel::Channel::create();
+	fault::set_crash_notify(notify_tx);
+	let domain = Domain::new(1 << 20, 8, 4);
+	let koid = {
+		let driver = sched::spawn_in(domain.clone(), driver_crash_thread_body, 0).expect("spawn driver");
+		// Capture the process identity, then drop the Arc so reaping the thread can
+		// tear the process down and run the crash cleanup.
+		driver.process().header().koid()
+	};
+	sched::run_until_idle();
+	// The IRQ binding is gone, and the DMA and handle quotas are back to zero: the
+	// crashed driver's resources were reclaimed by the kernel.
+	assert!(!arch::interrupts::is_bound(DRIVER_IRQ_VECTOR as u8), "the driver's IRQ should be detached");
+	assert_eq!(domain.account().dma().used(), 0, "the driver's DMA should be refunded");
+	assert_eq!(domain.account().handles().used(), 0, "the driver's handles should be removed");
+	// A crash record naming the driver process was delivered to the supervisor.
+	let record = notify_rx.recv().expect("a crash notification should be delivered");
+	assert_eq!(record.bytes.len(), 16, "crash record is koid + kind");
+	let got_koid = u64::from_le_bytes(record.bytes[0..8].try_into().unwrap());
+	let got_kind = u64::from_le_bytes(record.bytes[8..16].try_into().unwrap());
+	assert_eq!(got_koid, koid, "crash record names the crashed process");
+	assert_eq!(got_kind, fault::FAULT_PAGE, "crash record carries the fault kind");
+	fault::clear_crash_notify();
 }
 
 #[cfg(test)]
