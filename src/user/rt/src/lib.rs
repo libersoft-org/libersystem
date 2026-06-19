@@ -72,6 +72,16 @@ pub unsafe fn yield_now() {
 	}
 }
 
+// Write `bytes` to the debug console one byte at a time. The only output path a
+// ring-3 program has for now (a real console service arrives with virtio-console).
+pub unsafe fn print(bytes: &[u8]) {
+	unsafe {
+		for &b in bytes {
+			syscall(SYS_DEBUG_WRITE, b as u64, 0, 0, 0);
+		}
+	}
+}
+
 // Block until the object behind `handle` becomes ready (a channel readable, an
 // event signaled, a timer expired) or `deadline` (absolute ticks; 0 = no
 // timeout) passes. Returns 0 when ready, a small negative error otherwise. This

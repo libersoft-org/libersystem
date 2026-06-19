@@ -19,6 +19,10 @@ path = "src/log_service.rs"
 name = "device_manager"
 path = "src/device_manager.rs"
 
+[[bin]]
+name = "shell"
+path = "src/shell.rs"
+
 [dependencies]
 # Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
 # the syscall/IPC/volume helpers); it re-exports the abi constants.

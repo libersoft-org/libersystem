@@ -1621,14 +1621,16 @@ fn init_package_starts_system_manager() {
 	// The boot chain, end to end: SystemManager starts from the init package, spawns
 	// ServiceManager and delegates the package and the ramdisk to it, and
 	// ServiceManager brings up the core services in dependency order - LogService
-	// first (DeviceManager and StorageService both depend on it, though they are
-	// listed before it in the manifest, so the order is driven by declared
+	// first (DeviceManager, StorageService, and the shell all depend on it, though
+	// they are listed before it in the manifest, so the order is driven by declared
 	// dependencies). StorageService is handed the ramdisk and a service channel
-	// before it reports in. Every report is relayed up, so the kernel observes the
-	// services come up in dependency order followed by the two managers.
+	// before it reports in; the shell is handed the StorageService client channel
+	// and proves the round-trip by reading a file with `cat` before it reports in.
+	// Every report is relayed up, so the kernel observes the services come up in
+	// dependency order followed by the two managers.
 	let kernel_ep = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 5] = [b"LogService: online", b"DeviceManager: online", b"StorageService: online", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 6] = [b"LogService: online", b"DeviceManager: online", b"StorageService: online", b"Shell: online", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");

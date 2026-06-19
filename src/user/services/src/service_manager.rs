@@ -26,13 +26,15 @@ struct Service {
 
 // The number of managed services. (A fixed size keeps the state array on the
 // stack, which a no_std program with no heap needs.)
-const N: usize = 3;
+const N: usize = 4;
 
 // The core service manifest. The array order is deliberately NOT the start order:
-// DeviceManager and StorageService are listed before LogService but both depend on
-// it, so the dependency resolver must start LogService first. This proves the
-// ordering is driven by declared dependencies, not by manifest position.
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service"] }, Service { name: b"log_service", deps: &[] }];
+// DeviceManager, StorageService, and the shell are listed before LogService, but
+// all depend (directly or transitively) on it, so the dependency resolver must
+// start LogService first. This proves the ordering is driven by declared
+// dependencies, not by manifest position. The shell is the last component up: it
+// depends on StorageService, which it talks to over IPC.
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service"] }, Service { name: b"shell", deps: &[b"storage_service"] }, Service { name: b"log_service", deps: &[] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -98,8 +100,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 
-	// 3. report in once the set is up. Keep `storage_client` alive until exit so
-	//    StorageService's service channel does not peer-close out from under it.
+	// 3. report in once the set is up. Keep `storage_client` alive until exit in
+	//    case the shell never took it (e.g. a spawn failure), so StorageService's
+	//    service channel does not peer-close prematurely; once the shell owns it, the
+	//    shell keeps the service standing instead.
 	unsafe {
 		send_blocking(bootstrap, b"ServiceManager: online", 0);
 	}
@@ -134,10 +138,10 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // channel, wait for its "online" report, and relay that report up to `up`. Returns
 // the resulting state (Running on success, Failed otherwise).
 //
-// StorageService is bootstrapped specially: before it reports in, it needs the
-// ramdisk volume and a service channel. We transfer the ramdisk capability and one
-// end of a fresh service channel to it, keeping the client end in `*storage_client`
-// so the service stays standing (a closed client end would peer-close its service).
+// Two services are bootstrapped specially before they report in: StorageService
+// needs the ramdisk volume and a service channel (we keep the client end in
+// `*storage_client`); the shell needs that StorageService client channel, which we
+// transfer to it so its `cat` can round-trip to the service over IPC.
 unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, ramdisk_len: usize, storage_client: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
@@ -154,6 +158,9 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, r
 		if name == b"storage_service" && !bootstrap_storage(manager_side, ramdisk, ramdisk_len, storage_client, buf) {
 			return State::Failed;
 		}
+		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client) {
+			return State::Failed;
+		}
 		match recv_blocking(manager_side, buf) {
 			Received::Message { len, .. } => {
 				// Relay the service's own report up to SystemManager, in start order.
@@ -163,6 +170,13 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, r
 			Received::Closed => State::Failed,
 		}
 	}
+}
+
+// Hand the shell the StorageService client channel so it can talk to the service
+// over IPC (its `cat` round-trips through it). Transfers `storage_client` to the
+// shell over `manager_side`; the shell then owns that endpoint.
+unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64) -> bool {
+	unsafe { send_blocking(manager_side, b"STORAGE", storage_client) }
 }
 
 // Hand StorageService its ramdisk and a service channel over `manager_side`:
