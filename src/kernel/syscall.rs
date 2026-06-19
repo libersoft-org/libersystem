@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use crate::memlayout::{KERNEL_MMAP_BASE, USER_MMAP_BASE, USER_VA_END};
 
 use crate::arch;
+use crate::device;
 use crate::fault::FaultInfo;
 use crate::loader::{self, LoadError};
 use crate::mem::frame::PAGE_SIZE;
@@ -43,7 +44,7 @@ use crate::sched;
 // kernel/userspace ABI: defined once in the abi crate (the single source of
 // truth) and re-exported here so the rest of the kernel keeps referring to them
 // as `syscall::SYS_*` / `syscall::ERR_*` / `syscall::sys_is_err`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CONSOLE_ATTACH, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_RANDOM_GET, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CONSOLE_ATTACH, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_RANDOM_GET, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
 
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. repr(C) with only
@@ -128,6 +129,9 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_THREAD_CREATE => sys_thread_create(a0, a1, a2, a3),
 		SYS_THREAD_START => sys_thread_start(a0),
 		SYS_CONSOLE_ATTACH => sys_console_attach(a0),
+		SYS_DEVICE_COUNT => device::count() as i64,
+		SYS_DEVICE_INFO => sys_device_info(a0, a1, a2),
+		SYS_DEVICE_ACQUIRE => sys_device_acquire(a0),
 		SYS_MEMORY_MAP => sys_memory_map(a0),
 		SYS_MEMORY_UNMAP => sys_memory_unmap(a0),
 		SYS_HANDLE_DUPLICATE => sys_handle_duplicate(a0, a1),
@@ -221,6 +225,48 @@ fn sys_device_memory_map(handle: u64) -> i64 {
 	}
 	device.set_mapped_at(base);
 	base as i64
+}
+
+// Write the DeviceInfo for the virtio device at `index` (its type + MMIO struct
+// offsets) into the caller's buffer. Returns 0 on success, ERR_INVALID for an
+// out-of-range index or an undersized/bad buffer. The driver pairs this with a
+// device_acquire'd DeviceMemory capability to reach the device.
+fn sys_device_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+	let size = core::mem::size_of::<abi::DeviceInfo>() as u64;
+	if buf_len < size || !user_buf_ok(buf_ptr, size) {
+		return ERR_INVALID;
+	}
+	let info = device::with(index as usize, |d| abi::DeviceInfo { virtio_type: d.virtio_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset });
+	match info {
+		Some(info) => {
+			unsafe {
+				(buf_ptr as *mut abi::DeviceInfo).write_unaligned(info);
+			}
+			0
+		}
+		None => ERR_INVALID,
+	}
+}
+
+// Mint a DeviceMemory capability for the MMIO BAR of the virtio device at `index`
+// and install it in the caller's handle table, returning the handle. The caller
+// (DeviceManager) hands it to the matching driver, which maps it with
+// device_memory_map. Returns ERR_INVALID for an out-of-range index. (Gating this
+// to DeviceManager is a PermissionManager policy concern, deferred.)
+fn sys_device_acquire(index: u64) -> i64 {
+	let thread = match sched::current_thread() {
+		Some(t) => t,
+		None => return ERR_NO_THREAD,
+	};
+	let memory = match device::with(index as usize, |d| DeviceMemory::new(d.bar_phys, d.bar_len as usize)) {
+		Some(m) => m,
+		None => return ERR_INVALID,
+	};
+	let installed = thread.handles().lock().try_insert_object(memory, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER, 0);
+	match installed {
+		Some(handle) => handle.raw() as i64,
+		None => ERR_RESOURCE_EXHAUSTED,
+	}
 }
 
 // Fill a caller buffer with `len` random bytes from the kernel CSPRNG (RDRAND when

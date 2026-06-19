@@ -34,12 +34,12 @@ pub const VIRTIO_RNG: u16 = 4;
 
 // Build the CONFIG_ADDRESS value selecting a device's config dword. `offset` is
 // rounded down to a 4-byte boundary (the dword the field lives in).
-fn address(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
+fn address(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
 	0x8000_0000 | (bus as u32) << 16 | (dev as u32) << 11 | (func as u32) << 8 | (offset as u32 & 0xFC)
 }
 
 // Read a 32-bit config-space dword.
-pub fn config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
+pub fn config_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
 	unsafe {
 		outl(CONFIG_ADDRESS, address(bus, dev, func, offset));
 		inl(CONFIG_DATA)
@@ -47,7 +47,7 @@ pub fn config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
 }
 
 // Write a 32-bit config-space dword.
-pub fn config_write32(bus: u8, dev: u8, func: u8, offset: u8, value: u32) {
+pub fn config_write32(bus: u8, dev: u8, func: u8, offset: u16, value: u32) {
 	unsafe {
 		outl(CONFIG_ADDRESS, address(bus, dev, func, offset));
 		super::port::outl(CONFIG_DATA, value);
@@ -55,13 +55,13 @@ pub fn config_write32(bus: u8, dev: u8, func: u8, offset: u8, value: u32) {
 }
 
 // Read a 16-bit config-space field.
-pub fn config_read16(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
+pub fn config_read16(bus: u8, dev: u8, func: u8, offset: u16) -> u16 {
 	let dword = config_read32(bus, dev, func, offset & !3);
 	(dword >> ((offset as u32 & 2) * 8)) as u16
 }
 
 // Read an 8-bit config-space field.
-pub fn config_read8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
+pub fn config_read8(bus: u8, dev: u8, func: u8, offset: u16) -> u8 {
 	let dword = config_read32(bus, dev, func, offset & !3);
 	(dword >> ((offset as u32 & 3) * 8)) as u8
 }
@@ -103,7 +103,7 @@ fn read_function(bus: u8, dev: u8, func: u8) -> PciDevice {
 	let class_reg = config_read32(bus, dev, func, 0x08);
 	let mut bars = [0u32; 6];
 	for (i, bar) in bars.iter_mut().enumerate() {
-		*bar = config_read32(bus, dev, func, 0x10 + (i as u8) * 4);
+		*bar = config_read32(bus, dev, func, 0x10 + (i as u16) * 4);
 	}
 	PciDevice { bus, dev, func, vendor: id as u16, device_id: (id >> 16) as u16, prog_if: (class_reg >> 8) as u8, subclass: (class_reg >> 16) as u8, class: (class_reg >> 24) as u8, header_type: config_read8(bus, dev, func, 0x0E), bars, irq_line: config_read8(bus, dev, func, 0x3C) }
 }
@@ -138,4 +138,116 @@ pub fn virtio_type_name(virtio_type: u16) -> &'static str {
 		VIRTIO_RNG => "rng",
 		_ => "other",
 	}
+}
+
+// PCI status register bit 4: a capability list is present (pointer at offset 0x34).
+const STATUS_CAP_LIST: u16 = 1 << 4;
+// Vendor-specific capability id; virtio describes its MMIO structures with these.
+const CAP_ID_VENDOR: u8 = 0x09;
+
+// virtio capability cfg_type values (which structure the capability points at).
+const VIRTIO_CAP_COMMON: u8 = 1;
+const VIRTIO_CAP_NOTIFY: u8 = 2;
+const VIRTIO_CAP_ISR: u8 = 3;
+const VIRTIO_CAP_DEVICE: u8 = 4;
+
+// Decode a memory BAR's physical base, handling 64-bit BARs (which occupy two
+// adjacent slots). Returns None for an I/O BAR or an out-of-range index.
+pub fn bar_address(d: &PciDevice, bar_idx: usize) -> Option<u64> {
+	let bar = *d.bars.get(bar_idx)?;
+	if bar & 1 != 0 {
+		return None; // an I/O-space BAR, not memory
+	}
+	let base_lo = (bar & 0xFFFF_FFF0) as u64;
+	if (bar >> 1) & 3 == 2 {
+		// 64-bit memory BAR: the high half lives in the next slot.
+		let hi = *d.bars.get(bar_idx + 1)? as u64;
+		Some(hi << 32 | base_lo)
+	} else {
+		Some(base_lo)
+	}
+}
+
+// One located virtio configuration structure (resolved from a virtio PCI cap):
+// which BAR it lives in, its byte offset within that BAR, and its length.
+#[derive(Clone, Copy, Default)]
+pub struct VirtioCap {
+	pub bar: u8,
+	pub offset: u32,
+	pub length: u32,
+	// For the notify capability only: the queue_notify_off multiplier.
+	pub notify_multiplier: u32,
+}
+
+// A modern virtio-pci device with its MMIO layout resolved from its capabilities.
+// `bar_phys`/`region_len` describe the physical MMIO window a driver maps (the BAR
+// the common-config structure lives in); the per-structure offsets index into it.
+#[derive(Clone, Copy)]
+pub struct VirtioDevice {
+	pub pci: PciDevice,
+	pub virtio_type: u16,
+	pub bar: u8,
+	pub bar_phys: u64,
+	pub region_len: u64,
+	pub common: VirtioCap,
+	pub notify: VirtioCap,
+	pub isr: VirtioCap,
+	pub device: VirtioCap,
+}
+
+// Walk a device's PCI capability list and resolve its virtio configuration
+// structures. Returns None if it is not a modern virtio device, has no capability
+// list, or is missing the required common/notify/ISR structures.
+fn resolve_virtio(d: &PciDevice) -> Option<VirtioDevice> {
+	let virtio_type = d.virtio_type()?;
+	if config_read16(d.bus, d.dev, d.func, 0x06) & STATUS_CAP_LIST == 0 {
+		return None;
+	}
+	let (mut common, mut notify, mut isr, mut device) = (None, None, None, None);
+	let mut ptr: u16 = (config_read8(d.bus, d.dev, d.func, 0x34) & 0xFC) as u16;
+	// Bound the walk so a malformed (cyclic) list cannot spin forever.
+	for _ in 0..48 {
+		if ptr == 0 {
+			break;
+		}
+		let cap_id = config_read8(d.bus, d.dev, d.func, ptr);
+		let next = (config_read8(d.bus, d.dev, d.func, ptr + 1) & 0xFC) as u16;
+		if cap_id == CAP_ID_VENDOR {
+			let cfg_type = config_read8(d.bus, d.dev, d.func, ptr + 3);
+			let mut cap = VirtioCap { bar: config_read8(d.bus, d.dev, d.func, ptr + 4), offset: config_read32(d.bus, d.dev, d.func, ptr + 8), length: config_read32(d.bus, d.dev, d.func, ptr + 12), notify_multiplier: 0 };
+			match cfg_type {
+				VIRTIO_CAP_COMMON => common = Some(cap),
+				VIRTIO_CAP_NOTIFY => {
+					cap.notify_multiplier = config_read32(d.bus, d.dev, d.func, ptr + 16);
+					notify = Some(cap);
+				}
+				VIRTIO_CAP_ISR => isr = Some(cap),
+				VIRTIO_CAP_DEVICE => device = Some(cap),
+				_ => {}
+			}
+		}
+		ptr = next;
+	}
+	let common = common?;
+	let notify = notify?;
+	let isr = isr?;
+	let device = device.unwrap_or_default();
+	let bar = common.bar;
+	let bar_phys = bar_address(d, bar as usize)?;
+	// The window the driver maps is the BAR holding the common-config structure;
+	// its length is the furthest end of any virtio structure in that same BAR,
+	// rounded up to a page.
+	let mut end: u64 = 0;
+	for cap in [common, notify, isr, device] {
+		if cap.bar == bar {
+			end = end.max(cap.offset as u64 + cap.length as u64);
+		}
+	}
+	let region_len = end.div_ceil(0x1000) * 0x1000;
+	Some(VirtioDevice { pci: *d, virtio_type, bar, bar_phys, region_len, common, notify, isr, device })
+}
+
+// Scan the bus and resolve every modern virtio device's MMIO layout.
+pub fn scan_virtio() -> Vec<VirtioDevice> {
+	scan().iter().filter_map(resolve_virtio).collect()
 }

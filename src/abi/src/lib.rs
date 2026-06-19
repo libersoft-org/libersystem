@@ -51,6 +51,9 @@ pub const SYS_PROCESS_LOAD: u64 = 30;
 pub const SYS_THREAD_CREATE: u64 = 31;
 pub const SYS_THREAD_START: u64 = 32;
 pub const SYS_CONSOLE_ATTACH: u64 = 33;
+pub const SYS_DEVICE_COUNT: u64 = 34;
+pub const SYS_DEVICE_INFO: u64 = 35;
+pub const SYS_DEVICE_ACQUIRE: u64 = 36;
 
 // The ring-3 stack top an ELF-loaded process runs on: the kernel's loader maps a
 // stack just below this address, and a userspace spawner passes it to
@@ -67,6 +70,26 @@ pub const PROP_HANDLE_LIMIT: u64 = 2;
 pub const PROP_THREAD_LIMIT: u64 = 3;
 pub const PROP_DMA_LIMIT: u64 = 4;
 pub const PROP_IPC_QUEUE_LIMIT: u64 = 5;
+
+// What `device_info` writes about one discovered virtio device. The kernel
+// resolves these from the device's PCI capabilities at boot; a driver maps the
+// device's MMIO BAR (via a DeviceMemory capability from `device_acquire`) and uses
+// the offsets to reach each virtio structure within the mapping. `repr(C)` so the
+// kernel and userspace agree on the layout byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct DeviceInfo {
+	// virtio device type (net = 1, blk = 2, console = 3, ...).
+	pub virtio_type: u32,
+	// length of the MMIO window the DeviceMemory capability covers.
+	pub bar_len: u64,
+	// byte offsets of the virtio structures within that window.
+	pub common_offset: u32,
+	pub notify_offset: u32,
+	pub notify_multiplier: u32,
+	pub isr_offset: u32,
+	pub device_offset: u32,
+}
 
 // Error codes (Linux-style: a successful call returns its value, an error returns
 // a small negative in the reserved band [-4095, -1]).

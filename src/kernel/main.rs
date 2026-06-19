@@ -11,6 +11,7 @@ mod arch;
 mod cli;
 mod console;
 mod console_input;
+mod device;
 mod elf;
 mod fault;
 mod graph;
@@ -112,6 +113,7 @@ unsafe extern "C" fn kmain() -> ! {
 	arch::init_syscalls();
 	init_smp();
 	sched::init();
+	device::init();
 
 	#[cfg(test)]
 	test_main();
@@ -757,6 +759,9 @@ fn pci_demo() {
 			Some(t) => serial_println!("pci: {:02x}:{:02x}.{} virtio-{} (id {:#06x}) bar0 {:#010x}", d.bus, d.dev, d.func, arch::pci::virtio_type_name(t), d.device_id, d.bars[0]),
 			None => serial_println!("pci: {:02x}:{:02x}.{} vendor {:#06x} device {:#06x} class {:#04x}.{:#04x}", d.bus, d.dev, d.func, d.vendor, d.device_id, d.class, d.subclass),
 		}
+	}
+	for v in arch::pci::scan_virtio() {
+		serial_println!("virtio-{}: bar{} phys {:#x} len {:#x} common@{:#x} notify@{:#x}(x{}) isr@{:#x} device@{:#x}", arch::pci::virtio_type_name(v.virtio_type), v.bar, v.bar_phys, v.region_len, v.common.offset, v.notify.offset, v.notify.notify_multiplier, v.isr.offset, v.device.offset);
 	}
 }
 
@@ -1722,6 +1727,41 @@ fn pci_scan_finds_virtio_devices() {
 	for d in &virtio {
 		assert!(d.virtio_type().is_some(), "a modern virtio device should report a device type (id {:#06x})", d.device_id);
 	}
+}
+
+#[cfg(test)]
+#[test_case]
+fn device_table_exposes_virtio_mmio() {
+	use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+	// device::init() populated the table at boot from the PCI scan. A driver-like
+	// thread queries it the way DeviceManager will: count the devices, read the
+	// first one's DeviceInfo, acquire its DeviceMemory capability, and map the MMIO.
+	static COUNT: AtomicI64 = AtomicI64::new(-1);
+	static VTYPE: AtomicU64 = AtomicU64::new(0);
+	static BAR_LEN: AtomicU64 = AtomicU64::new(0);
+	static MAPPED: AtomicU64 = AtomicU64::new(0);
+	extern "C" fn body(_arg: u64) {
+		let mut info = abi::DeviceInfo::default();
+		let size = core::mem::size_of::<abi::DeviceInfo>() as u64;
+		unsafe {
+			COUNT.store(arch::syscall::invoke(syscall::SYS_DEVICE_COUNT, 0, 0, 0, 0) as i64, Ordering::SeqCst);
+			if arch::syscall::invoke(syscall::SYS_DEVICE_INFO, 0, &mut info as *mut _ as u64, size, 0) as i64 == 0 {
+				VTYPE.store(info.virtio_type as u64, Ordering::SeqCst);
+				BAR_LEN.store(info.bar_len, Ordering::SeqCst);
+			}
+			let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, 0, 0, 0);
+			if !syscall::sys_is_err(handle) {
+				MAPPED.store(arch::syscall::invoke(syscall::SYS_DEVICE_MEMORY_MAP, handle, 0, 0, 0), Ordering::SeqCst);
+			}
+		}
+	}
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(COUNT.load(Ordering::SeqCst) >= 3, "expected at least the 3 QEMU virtio devices");
+	assert!((1..=4).contains(&VTYPE.load(Ordering::SeqCst)), "device 0 should report a virtio type");
+	assert!(BAR_LEN.load(Ordering::SeqCst) > 0, "the MMIO BAR should have a non-zero length");
+	let mapped = MAPPED.load(Ordering::SeqCst);
+	assert!(mapped != 0 && !syscall::sys_is_err(mapped), "the device MMIO should map to a valid address");
 }
 
 #[cfg(test)]
