@@ -14,6 +14,14 @@
 
 use rt::*;
 
+// The state DeviceManager tracks per discovered device.
+const STATE_UNKNOWN: u8 = 0;
+const STATE_ONLINE: u8 = 1;
+const STATE_FAILED: u8 = 2;
+
+// The most devices DeviceManager tracks (QEMU exposes a handful).
+const MAX_DEVICES: usize = 8;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
@@ -52,15 +60,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 }
 
 // Enumerate the kernel device table and, for each device, spawn the matching driver
-// from the package, handing it only that device's MMIO capability and info. The
-// driver's "online" report is printed; it does not flow up the boot-chain report
-// channel (which carries only the service lifecycle).
+// from the package, handing it only that device's MMIO capability and info. Tracks
+// each device's state (online once its driver reports in, failed otherwise) and
+// prints a summary. The driver's "online" report is printed; it does not flow up
+// the boot-chain report channel (which carries only the service lifecycle).
 unsafe fn launch_drivers(package: &Package, buf: &mut [u8]) {
 	unsafe {
 		let count: u64 = device_count();
 		let info_size: usize = core::mem::size_of::<DeviceInfo>();
+		let mut state: [u8; MAX_DEVICES] = [STATE_UNKNOWN; MAX_DEVICES];
 		let mut i: u64 = 0;
-		while i < count {
+		while i < count && i < MAX_DEVICES as u64 {
+			let idx: usize = i as usize;
+			state[idx] = STATE_FAILED;
 			let mut info: DeviceInfo = DeviceInfo::default();
 			if !device_info(i, &mut info) {
 				i += 1;
@@ -93,11 +105,43 @@ unsafe fn launch_drivers(package: &Package, buf: &mut [u8]) {
 					if let Received::Message { len, .. } = recv_blocking(dm_side, buf) {
 						print(&buf[..len]);
 						print(b"\n");
+						// the device's driver came up: mark it online.
+						state[idx] = STATE_ONLINE;
 					}
 				}
 			}
 			i += 1;
 		}
+		report_state(&state, count);
+	}
+}
+
+// Print a one-line summary of how many devices are online (their driver bound and
+// reported in) out of those discovered - the device-state DeviceManager tracks.
+unsafe fn report_state(state: &[u8; MAX_DEVICES], count: u64) {
+	unsafe {
+		let mut online: u32 = 0;
+		for &s in state {
+			if s == STATE_ONLINE {
+				online += 1;
+			}
+		}
+		print(b"DeviceManager: ");
+		print_count(online);
+		print(b" of ");
+		print_count(count as u32);
+		print(b" device(s) online\n");
+	}
+}
+
+// Print a small non-negative count in decimal (one or two digits suffice for the
+// handful of devices QEMU exposes).
+unsafe fn print_count(n: u32) {
+	unsafe {
+		if n >= 10 {
+			print(&[b'0' + (n / 10) as u8]);
+		}
+		print(&[b'0' + (n % 10) as u8]);
 	}
 }
 

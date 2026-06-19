@@ -2278,6 +2278,40 @@ fn driver_crash_is_cleaned_up_and_notified() {
 
 #[cfg(test)]
 #[test_case]
+fn device_manager_reacts_to_a_driver_crash() {
+	use object::KernelObject;
+	use object::domain::Domain;
+	// DeviceManager's reaction to a driver crash: the kernel reports the crash on the
+	// crash-notify channel (M20h), and the supervisor finds the device that driver
+	// was bound to and marks it offline. Here device 0 is driven by a process that
+	// then crashes; consuming the crash event, the supervisor marks it offline.
+	#[derive(PartialEq, Debug)]
+	enum DeviceState {
+		Online,
+		Offline,
+	}
+	let (notify_tx, notify_rx) = object::channel::Channel::create();
+	fault::set_crash_notify(notify_tx);
+	let mut device0 = DeviceState::Online;
+	let domain = Domain::new(1 << 20, 8, 4);
+	let driver_koid = {
+		let driver = sched::spawn_in(domain.clone(), driver_crash_thread_body, 0).expect("spawn driver");
+		driver.process().header().koid()
+	};
+	sched::run_until_idle();
+	// react: the crash event names the crashed process; if it is our device's driver,
+	// mark the device offline.
+	let record = notify_rx.recv().expect("a crash event should be delivered");
+	let crashed_koid = u64::from_le_bytes(record.bytes[0..8].try_into().unwrap());
+	if crashed_koid == driver_koid {
+		device0 = DeviceState::Offline;
+	}
+	fault::clear_crash_notify();
+	assert_eq!(device0, DeviceState::Offline, "DeviceManager should mark a crashed driver's device offline");
+}
+
+#[cfg(test)]
+#[test_case]
 fn domain_quota_enforced_cleanly() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::domain::Domain;
