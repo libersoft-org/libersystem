@@ -22,6 +22,7 @@ use crate::memlayout::{KERNEL_MMAP_BASE, USER_MMAP_BASE, USER_VA_END};
 
 use crate::arch;
 use crate::fault::FaultInfo;
+use crate::loader::{self, LoadError};
 use crate::mem::frame::PAGE_SIZE;
 use crate::object::channel::{Channel, ChannelError, Message};
 use crate::object::device_memory::DeviceMemory;
@@ -31,7 +32,9 @@ use crate::object::event::Event;
 use crate::object::handle::{Capability, Handle, HandleError};
 use crate::object::interrupt::Interrupt;
 use crate::object::memory_object::{MemoryError, MemoryObject};
+use crate::object::process::Process;
 use crate::object::rights::Rights;
+use crate::object::thread::Thread;
 use crate::object::timer::Timer;
 use crate::object::{KernelObject, ObjectType};
 use crate::sched;
@@ -40,7 +43,7 @@ use crate::sched;
 // kernel/userspace ABI: defined once in the abi crate (the single source of
 // truth) and re-exported here so the rest of the kernel keeps referring to them
 // as `syscall::SYS_*` / `syscall::ERR_*` / `syscall::sys_is_err`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_RANDOM_GET, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_RANDOM_GET, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
 
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. repr(C) with only
@@ -120,6 +123,10 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_RANDOM_GET => sys_random_get(a0, a1),
 		SYS_INTERRUPT_BIND => sys_interrupt_bind(a0),
 		SYS_OBJECT_PROPERTY_SET => sys_object_property_set(a0, a1, a2, a3),
+		SYS_PROCESS_CREATE => sys_process_create(),
+		SYS_PROCESS_LOAD => sys_process_load(a0, a1, a2),
+		SYS_THREAD_CREATE => sys_thread_create(a0, a1, a2, a3),
+		SYS_THREAD_START => sys_thread_start(a0),
 		SYS_MEMORY_MAP => sys_memory_map(a0),
 		SYS_MEMORY_UNMAP => sys_memory_unmap(a0),
 		SYS_HANDLE_DUPLICATE => sys_handle_duplicate(a0, a1),
@@ -315,6 +322,111 @@ fn sys_object_property_set(handle: u64, prop: u64, a2: u64, a3: u64) -> i64 {
 	};
 	counter.set_limit(a2);
 	0
+}
+
+// Create an empty process with its own address space, accounted to the caller's
+// Domain, and install a handle to it in the caller's table. The process has no
+// threads until process_load gives it an image and thread_create / thread_start
+// give it a running thread. (Spawning into a different sub-Domain is deferred.)
+fn sys_process_create() -> i64 {
+	let thread = match sched::current_thread() {
+		Some(t) => t,
+		None => return ERR_NO_THREAD,
+	};
+	let process = match sched::process_create(thread.domain().clone()) {
+		Some(p) => p,
+		None => return ERR_NO_MEMORY,
+	};
+	match thread.handles().lock().try_insert_object(process, Rights::ALL, 0) {
+		Some(handle) => handle.raw() as i64,
+		None => ERR_RESOURCE_EXHAUSTED,
+	}
+}
+
+// Load an ELF image into a process created by process_create and return its entry
+// point. The image bytes are read from the caller's address space at [elf_ptr,
+// elf_ptr + elf_len) - a userspace spawner first brings them in via
+// memory_object_create + memory_map. The kernel maps the program and a ring-3
+// stack into the target process. Requires the MANAGE right on the process handle.
+fn sys_process_load(process_handle: u64, elf_ptr: u64, elf_len: u64) -> i64 {
+	if elf_len == 0 || !user_buf_ok(elf_ptr, elf_len) {
+		return ERR_INVALID;
+	}
+	let object = match current_object(process_handle, ObjectType::Process, Rights::MANAGE) {
+		Ok(o) => o,
+		Err(e) => return e,
+	};
+	let process = object.as_any().downcast_ref::<Process>().expect("type checked by lookup_typed");
+	// Read the image in place from the caller's (active) address space: the loader
+	// copies only the PT_LOAD segments into the child's fresh frames, so there is no
+	// need to buffer the whole ELF on the kernel heap. The caller's tables stay
+	// active across the load (the child is mapped through its own CR3, not switched
+	// to), so the slice remains valid.
+	let image = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_len as usize) };
+	match loader::load_image_into(process, image) {
+		Ok(entry) => entry as i64,
+		Err(LoadError::OutOfMemory) => ERR_NO_MEMORY,
+		Err(LoadError::BadImage) => ERR_INVALID,
+	}
+}
+
+// Create a ring-3 entry thread in `process_handle`, suspended (not yet running),
+// at `entry` on the stack topped at `stack_top`, and install a handle to it in the
+// caller's table. If `bootstrap_handle` is non-zero, the capability it names is
+// moved out of the caller's table into the child's and delivered to the child's
+// thread in rdi - the way a process is endowed with its initial capability.
+// Requires the MANAGE right on the process handle (and TRANSFER on the bootstrap).
+fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_handle: u64) -> i64 {
+	let thread = match sched::current_thread() {
+		Some(t) => t,
+		None => return ERR_NO_THREAD,
+	};
+	let object = match current_object(process_handle, ObjectType::Process, Rights::MANAGE) {
+		Ok(o) => o,
+		Err(e) => return e,
+	};
+	let process: Arc<Process> = object.into_any_arc().downcast::<Process>().ok().expect("type checked by lookup_typed");
+	// Move the bootstrap capability (if any) into the child, recording the handle
+	// value the child will see, so the kernel can wire it into the thread's rdi.
+	let child_bootstrap = if bootstrap_handle != 0 {
+		let cap = {
+			let table = thread.handles().lock();
+			let xobject = match table.lookup(Handle::from_raw(bootstrap_handle), Rights::TRANSFER) {
+				Ok(o) => o,
+				Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
+				Err(_) => return ERR_BAD_HANDLE,
+			};
+			let rights = table.rights_of(Handle::from_raw(bootstrap_handle)).unwrap_or(Rights::NONE);
+			let badge = table.badge_of(Handle::from_raw(bootstrap_handle)).unwrap_or(0);
+			Capability::new(xobject, rights, badge)
+		};
+		let child_handle = process.handles().lock().insert(cap).raw();
+		// The capability now lives in the child: consume the caller's handle.
+		let _ = thread.handles().lock().close(Handle::from_raw(bootstrap_handle));
+		child_handle
+	} else {
+		0
+	};
+	let new_thread = match loader::create_user_thread(&process, entry, stack_top, child_bootstrap) {
+		Some(t) => t,
+		None => return ERR_RESOURCE_EXHAUSTED,
+	};
+	match thread.handles().lock().try_insert_object(new_thread, Rights::ALL, 0) {
+		Some(handle) => handle.raw() as i64,
+		None => ERR_RESOURCE_EXHAUSTED,
+	}
+}
+
+// Start a suspended thread created by thread_create, enqueueing it to run. Exactly
+// once: a repeated start returns ERR_INVALID rather than double-enqueueing it.
+// Requires the MANAGE right on the thread handle.
+fn sys_thread_start(thread_handle: u64) -> i64 {
+	let object = match current_object(thread_handle, ObjectType::Thread, Rights::MANAGE) {
+		Ok(o) => o,
+		Err(e) => return e,
+	};
+	let target: Arc<Thread> = object.into_any_arc().downcast::<Thread>().ok().expect("type checked by lookup_typed");
+	if sched::thread_start(target) { 0 } else { ERR_INVALID }
 }
 
 // Map a MemoryObject into the kernel address space, returning its virtual base.

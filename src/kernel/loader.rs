@@ -20,6 +20,7 @@ use crate::object::address_space::AddressSpace;
 use crate::object::domain::Domain;
 use crate::object::process::Process;
 use crate::object::rights::Rights;
+use crate::object::thread::Thread;
 use crate::sched;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -84,6 +85,47 @@ pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<d
 	let ctx = Box::new(UserEntry { entry, stack_top: USER_STACK_TOP, bootstrap: handle });
 	sched::thread_create(process.clone(), user_process_trampoline, Box::into_raw(ctx) as u64);
 	Ok(process)
+}
+
+// Load `elf_image` into an already-created `process`: map its PT_LOAD segments and
+// a ring-3 stack into the process's address space and hand the leaf frames to the
+// process to own (freed on its drop, like spawn_elf_process). Returns the program
+// entry point. Unlike spawn_elf_process this neither creates the process nor
+// starts a thread: the userspace spawn path (process_create / process_load /
+// thread_create / thread_start) drives those as separate, capability-gated steps.
+pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadError> {
+	let mut frames: Vec<u64> = Vec::new();
+	let entry = match elf::load_into(elf_image, process.address_space(), &mut frames) {
+		Ok(entry) => entry,
+		Err(err) => {
+			free_frames(frames);
+			return Err(err.into());
+		}
+	};
+	if let Err(err) = map_stack(process.address_space(), &mut frames) {
+		free_frames(frames);
+		return Err(err);
+	}
+	// From here on the Process owns the frames and frees them when it is dropped.
+	process.adopt_frames(frames);
+	Ok(entry)
+}
+
+// Build a process's ring-3 entry thread, suspended (off every run queue). The
+// thread drops to ring 3 at `entry` on the stack topped at `stack_top`, with
+// `bootstrap` delivered in rdi. Returns None if the process Domain is at its
+// thread cap, reclaiming the boxed entry context. thread_start later enqueues it.
+pub fn create_user_thread(process: &Arc<Process>, entry: u64, stack_top: u64, bootstrap: u64) -> Option<Arc<Thread>> {
+	let ctx = Box::new(UserEntry { entry, stack_top, bootstrap });
+	let raw = Box::into_raw(ctx) as u64;
+	match sched::thread_create_suspended(process.clone(), user_process_trampoline, raw) {
+		Some(thread) => Some(thread),
+		None => {
+			// The thread was not created, so reclaim the leaked entry context.
+			drop(unsafe { Box::from_raw(raw as *mut UserEntry) });
+			None
+		}
+	}
 }
 
 // Map the ring-3 stack (zeroed, writable) just below USER_STACK_TOP.

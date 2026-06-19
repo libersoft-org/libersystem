@@ -11,7 +11,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::address_space::AddressSpace;
 use super::domain::Domain;
@@ -61,6 +61,10 @@ pub struct Thread {
 	syscall_rsp: AtomicU64,
 	// Owns the kernel stack memory; accessed only through kstack_ptr.
 	stack: Box<[u8]>,
+	// Set the first time the thread is enqueued through thread_start, so a thread
+	// built suspended (the userspace spawn path) can be started exactly once and a
+	// repeated start is a safe no-op rather than a double-enqueue.
+	started: AtomicBool,
 	// The process this thread belongs to. It owns the address space, handle table,
 	// and Domain the thread runs under, and outlives the thread.
 	process: Arc<Process>,
@@ -88,7 +92,7 @@ impl Thread {
 	fn build(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Arc<Self> {
 		let mut stack = alloc::vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
 		let sp = arch::context::init_thread_stack(&mut stack, entry, arg);
-		Arc::new(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, process })
+		Arc::new(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, started: AtomicBool::new(false), process })
 	}
 
 	pub fn tid(&self) -> u64 {
@@ -120,6 +124,13 @@ impl Thread {
 	// The process this thread belongs to.
 	pub fn process(&self) -> &Arc<Process> {
 		&self.process
+	}
+
+	// Atomically claim the right to enqueue this thread for the first time. Returns
+	// true exactly once; later calls return false, so thread_start cannot enqueue
+	// the same thread twice (which would corrupt the run queue).
+	pub fn try_start(&self) -> bool {
+		self.started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
 	}
 
 	// Address of the saved-stack-pointer slot, handed to switch_context.
@@ -165,6 +176,10 @@ impl KernelObject for Thread {
 	}
 
 	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
 		self
 	}
 }

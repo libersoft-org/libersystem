@@ -948,6 +948,10 @@ impl object::KernelObject for TestObject {
 	fn as_any(&self) -> &dyn core::any::Any {
 		self
 	}
+
+	fn into_any_arc(self: alloc::sync::Arc<Self>) -> alloc::sync::Arc<dyn core::any::Any + Send + Sync> {
+		self
+	}
 }
 
 #[cfg(test)]
@@ -1549,6 +1553,41 @@ fn init_package_starts_system_manager() {
 	let kernel_ep = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
 	let message = kernel_ep.recv().expect("SystemManager should report in over IPC");
+	assert_eq!(&message.bytes[..], b"SystemManager: online");
+}
+
+#[cfg(test)]
+#[test_case]
+fn userspace_spawn_syscalls_start_a_second_process() {
+	use core::sync::atomic::{AtomicU64, Ordering};
+	// A kernel thread drives the userspace spawn syscalls exactly as a ring-3
+	// spawner would: process_create -> process_load -> thread_create -> thread_start.
+	// The image is the embedded SystemManager ELF, which reports in over its
+	// bootstrap channel and exits. The spawner hands the child the channel endpoint
+	// it received as its own bootstrap (transferred through thread_create).
+	static ELF_PTR: AtomicU64 = AtomicU64::new(0);
+	static ELF_LEN: AtomicU64 = AtomicU64::new(0);
+	extern "C" fn spawner(bootstrap: u64) {
+		unsafe {
+			let child = arch::syscall::invoke(syscall::SYS_PROCESS_CREATE, 0, 0, 0, 0);
+			assert!((child as i64) > 0, "process_create");
+			let entry = arch::syscall::invoke(syscall::SYS_PROCESS_LOAD, child, ELF_PTR.load(Ordering::SeqCst), ELF_LEN.load(Ordering::SeqCst), 0);
+			assert!((entry as i64) > 0, "process_load");
+			let thread = arch::syscall::invoke(syscall::SYS_THREAD_CREATE, child, entry, memlayout::USER_STACK_TOP, bootstrap);
+			assert!((thread as i64) > 0, "thread_create");
+			let started = arch::syscall::invoke(syscall::SYS_THREAD_START, thread, 0, 0, 0);
+			assert_eq!(started as i64, 0, "thread_start");
+		}
+	}
+	let bytes = init_package_bytes().expect("init package present");
+	let package = pkg::Package::parse(bytes).expect("init package parses");
+	let elf = package.lookup(b"system_manager").expect("system_manager image");
+	ELF_PTR.store(elf.as_ptr() as u64, Ordering::SeqCst);
+	ELF_LEN.store(elf.len() as u64, Ordering::SeqCst);
+	let (kernel_ep, user_ep) = object::channel::Channel::create();
+	sched::spawn_with_object(spawner, user_ep, object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	let message = kernel_ep.recv().expect("the spawned process should report in over IPC");
 	assert_eq!(&message.bytes[..], b"SystemManager: online");
 }
 

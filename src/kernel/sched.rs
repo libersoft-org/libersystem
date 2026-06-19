@@ -171,6 +171,28 @@ pub fn thread_create(process: Arc<Process>, entry: extern "C" fn(u64), arg: u64)
 	thread
 }
 
+// Create a thread in `process` but leave it suspended - off every run queue - and
+// enforce the process Domain's thread quota. The thread does not run until
+// thread_start enqueues it. Returns None (charging nothing) if the Domain is at
+// its thread cap. The userspace spawn path builds a process's initial thread this
+// way so process_create / thread_create / thread_start stay separate, capability-
+// gated steps.
+pub fn thread_create_suspended(process: Arc<Process>, entry: extern "C" fn(u64), arg: u64) -> Option<Arc<Thread>> {
+	Thread::new_in(entry, arg, process)
+}
+
+// Enqueue a previously-suspended thread onto the current core's run queue, exactly
+// once. Returns false if the thread was already started, so a repeated call is a
+// safe no-op rather than a double-enqueue.
+pub fn thread_start(thread: Arc<Thread>) -> bool {
+	if !thread.try_start() {
+		return false;
+	}
+	thread.set_state(ThreadState::Ready);
+	SCHED[current_cpu_id()].inner.lock().run_queue.push_back(thread);
+	true
+}
+
 // Yield the current core to the next ready thread, if any.
 pub fn yield_now() {
 	reschedule(Disposition::Requeue);

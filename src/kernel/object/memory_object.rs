@@ -121,6 +121,10 @@ impl KernelObject for MemoryObject {
 	fn as_any(&self) -> &dyn Any {
 		self
 	}
+
+	fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+		self
+	}
 }
 
 impl Drop for MemoryObject {

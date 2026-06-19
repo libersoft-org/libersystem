@@ -22,6 +22,7 @@ pub mod thread;
 pub mod timer;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -141,4 +142,9 @@ pub trait KernelObject: Send + Sync + Any {
 	fn header(&self) -> &ObjectHeader;
 	fn object_type(&self) -> ObjectType;
 	fn as_any(&self) -> &dyn Any;
+	// Recover the concrete type from an owning reference: after a typed handle
+	// lookup, `obj.into_any_arc().downcast::<T>()` yields an `Arc<T>`. Needed by the
+	// handlers that must own a typed Arc (e.g. spawning a thread into a looked-up
+	// Process), which `as_any` (a borrow) cannot provide.
+	fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 }

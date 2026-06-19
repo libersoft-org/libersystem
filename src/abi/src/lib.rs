@@ -42,6 +42,10 @@ pub const SYS_DEVICE_MEMORY_MAP: u64 = 25;
 pub const SYS_RANDOM_GET: u64 = 26;
 pub const SYS_INTERRUPT_BIND: u64 = 27;
 pub const SYS_OBJECT_PROPERTY_SET: u64 = 28;
+pub const SYS_PROCESS_CREATE: u64 = 29;
+pub const SYS_PROCESS_LOAD: u64 = 30;
+pub const SYS_THREAD_CREATE: u64 = 31;
+pub const SYS_THREAD_START: u64 = 32;
 
 // object_property_set property selectors. PROP_NAME sets an object's label (arg2 =
 // name pointer, arg3 = length); the PROP_*_LIMIT selectors set a Domain resource

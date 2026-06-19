@@ -54,4 +54,8 @@ impl KernelObject for Event {
 	fn as_any(&self) -> &dyn Any {
 		self
 	}
+
+	fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+		self
+	}
 }
