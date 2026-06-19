@@ -84,8 +84,9 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	let out_dir: PathBuf = manifest.join("../boot/.build");
 	let out_pkg: PathBuf = out_dir.join(conf_get(conf, "INIT_PACKAGE"));
 
-	// (package entry name, ELF path). The storage crate produces two binaries.
-	let sources: [(&str, PathBuf); 4] = [("system_manager", manifest.join("../user/system_manager/target/x86_64-unknown-none/debug/system_manager")), ("service_manager", manifest.join("../user/services/target/x86_64-unknown-none/debug/service_manager")), ("storage_manager", manifest.join("../user/storage/target/x86_64-unknown-none/debug/storage_manager")), ("storage_client", manifest.join("../user/storage/target/x86_64-unknown-none/debug/storage_client"))];
+	// (package entry name, ELF path). The services and storage crates each produce
+	// several binaries.
+	let sources: [(&str, PathBuf); 6] = [("system_manager", manifest.join("../user/system_manager/target/x86_64-unknown-none/debug/system_manager")), ("service_manager", manifest.join("../user/services/target/x86_64-unknown-none/debug/service_manager")), ("log_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/log_service")), ("device_manager", manifest.join("../user/services/target/x86_64-unknown-none/debug/device_manager")), ("storage_manager", manifest.join("../user/storage/target/x86_64-unknown-none/debug/storage_manager")), ("storage_client", manifest.join("../user/storage/target/x86_64-unknown-none/debug/storage_client"))];
 
 	fs::create_dir_all(&out_dir).unwrap_or_else(|e: std::io::Error| panic!("cannot create {}: {e}", out_dir.display()));
 

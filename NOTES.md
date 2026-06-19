@@ -1,4 +1,5 @@
 - List the available volumes "ls" - change to "lsvol"?
 - Optimize the code
 - Find the dead code
-- Find the duplicate code
+- Find the duplicate / repetitive code
+- Nicer kernel boot - colourful terminal - is it good idea or not?

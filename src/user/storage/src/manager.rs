@@ -44,7 +44,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => handle,
 		_ => exit(),
 	};
-	// 3. serve until the client side closes.
+	// 3. report in over the bootstrap channel (the supervisor that started us is
+	//    listening there), then serve until the client side closes.
+	unsafe {
+		send_blocking(bootstrap, b"StorageManager: online", 0);
+	}
 	loop {
 		match unsafe { recv_blocking(service, &mut buf) } {
 			// An empty message is an explicit quit sentinel: a client that cannot

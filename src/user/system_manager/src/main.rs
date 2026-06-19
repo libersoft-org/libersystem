@@ -21,20 +21,30 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 
 	// 1. receive the init package shared buffer and map it.
-	let (pkg_base, pkg_len): (u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let (pkg_handle, pkg_base, pkg_len): (u64, u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"PACKAGE" => {
 			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
 			let base: u64 = unsafe { syscall(SYS_MEMORY_MAP, handle, 0, 0, 0) };
 			if sys_is_err(base) {
 				exit();
 			}
-			(base, length)
+			(handle, base, length)
+		}
+		_ => exit(),
+	};
+
+	// 1b. receive the ramdisk volume buffer to delegate to StorageManager. We never
+	//     map it ourselves - just hold the capability and its length to pass down.
+	let (ramdisk_handle, ramdisk_len): (u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"RAMDISK" => {
+			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
+			(handle, length)
 		}
 		_ => exit(),
 	};
 
 	// 2. find ServiceManager in the package and spawn it, handing it one end of a
-	//    fresh report channel as its bootstrap.
+	//    fresh control channel as its bootstrap.
 	let archive: &[u8] = unsafe { core::slice::from_raw_parts(pkg_base as *const u8, pkg_len) };
 	let svc_elf: &[u8] = match Package::parse(archive).and_then(|p| p.lookup(b"service_manager")) {
 		Some(elf) => elf,
@@ -48,10 +58,40 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		exit();
 	}
 
-	// 3. relay ServiceManager's report to the kernel, then report in ourselves.
-	if let Received::Message { len, .. } = unsafe { recv_blocking(sm_side, &mut buf) } {
-		unsafe {
-			send_blocking(bootstrap, &buf[..len], 0);
+	// 3. hand the package and the ramdisk down to ServiceManager so it can spawn the
+	//    services it supervises. Unmap the package first (a MemoryObject allows only
+	//    one active mapping, so ServiceManager could not map it otherwise), then
+	//    transfer both capabilities with the same framing the kernel used.
+	unsafe {
+		syscall(SYS_MEMORY_UNMAP, pkg_handle, 0, 0, 0);
+		let mut pkg_msg: [u8; 7 + 8] = [0u8; 7 + 8];
+		pkg_msg[..7].copy_from_slice(b"PACKAGE");
+		pkg_msg[7..].copy_from_slice(&(pkg_len as u64).to_le_bytes());
+		send_blocking(sm_side, &pkg_msg, pkg_handle);
+		let mut rd_msg: [u8; 7 + 8] = [0u8; 7 + 8];
+		rd_msg[..7].copy_from_slice(b"RAMDISK");
+		rd_msg[7..].copy_from_slice(&(ramdisk_len as u64).to_le_bytes());
+		send_blocking(sm_side, &rd_msg, ramdisk_handle);
+	}
+
+	// 4. relay every report ServiceManager sends up to the kernel. ServiceManager's
+	//    own "ServiceManager: online" is the terminal report of the boot chain: once
+	//    we have relayed it the set is up, so we stop and report in ourselves. Using
+	//    that explicit marker (rather than waiting for ServiceManager to close its
+	//    end) keeps the hand-off deterministic under the cooperative scheduler.
+	loop {
+		match unsafe { recv_blocking(sm_side, &mut buf) } {
+			Received::Message { len, .. } => {
+				let report: &[u8] = &buf[..len];
+				let terminal: bool = report == b"ServiceManager: online";
+				unsafe {
+					send_blocking(bootstrap, report, 0);
+				}
+				if terminal {
+					break;
+				}
+			}
+			Received::Closed => break,
 		}
 	}
 	unsafe {

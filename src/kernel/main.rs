@@ -526,15 +526,27 @@ fn spawn_system_manager() -> Result<alloc::sync::Arc<object::channel::Channel>, 
 
 	// Hand SystemManager the init package as a read-only shared buffer: the kernel
 	// copies the package bytes into a MemoryObject and sends "PACKAGE" + length
-	// with that capability, so SystemManager can find and spawn ServiceManager (and
-	// later the rest of the services) from userspace.
+	// with that capability, so SystemManager can find and spawn ServiceManager and
+	// then delegate the package onward to it (TRANSFER) to start the rest.
 	let package_obj = MemoryObject::create(bytes.len()).ok_or("no memory for the init package")?;
 	copy_into_object(&package_obj, bytes);
 	let mut msg = alloc::vec::Vec::with_capacity(7 + 8);
 	msg.extend_from_slice(b"PACKAGE");
 	msg.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-	let cap = Capability::new(package_obj as Arc<dyn KernelObject>, Rights::READ | Rights::MAP, 0);
+	let cap = Capability::new(package_obj as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
 	kernel_ep.send(Message::new(msg, alloc::vec![cap], 0)).map_err(|_| "failed to hand SystemManager the init package")?;
+
+	// Hand SystemManager the ramdisk volume the same way, so it can be delegated
+	// down to the StorageManager the boot chain brings up. "RAMDISK" + length with a
+	// read-only buffer capability the StorageManager will map and serve files from.
+	let volume = volume_package_bytes().ok_or("volume package module not found")?;
+	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
+	copy_into_object(&ramdisk, volume);
+	let mut rdmsg = alloc::vec::Vec::with_capacity(7 + 8);
+	rdmsg.extend_from_slice(b"RAMDISK");
+	rdmsg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
+	let rdcap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
+	kernel_ep.send(Message::new(rdmsg, alloc::vec![rdcap], 0)).map_err(|_| "failed to hand SystemManager the ramdisk")?;
 	Ok(kernel_ep)
 }
 
@@ -1606,16 +1618,21 @@ fn channel_endpoint_semantics() {
 #[cfg(test)]
 #[test_case]
 fn init_package_starts_system_manager() {
-	// SystemManager starts from the init package, spawns ServiceManager from that
-	// same package, relays ServiceManager's report, then reports in itself - the
-	// first link of the boot chain end to end (a userspace process spawning another
-	// userspace process and both reporting in).
+	// The boot chain, end to end: SystemManager starts from the init package, spawns
+	// ServiceManager and delegates the package and the ramdisk to it, and
+	// ServiceManager brings up the core services in dependency order - LogService
+	// first (DeviceManager and StorageManager both depend on it, though they are
+	// listed before it in the manifest, so the order is driven by declared
+	// dependencies). StorageManager is handed the ramdisk and a service channel
+	// before it reports in. Every report is relayed up, so the kernel observes the
+	// services come up in dependency order followed by the two managers.
 	let kernel_ep = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let first = kernel_ep.recv().expect("ServiceManager should report in via SystemManager");
-	assert_eq!(&first.bytes[..], b"ServiceManager: online");
-	let second = kernel_ep.recv().expect("SystemManager should report in over IPC");
-	assert_eq!(&second.bytes[..], b"SystemManager: online");
+	let reports: [&[u8]; 5] = [b"LogService: online", b"DeviceManager: online", b"StorageManager: online", b"ServiceManager: online", b"SystemManager: online"];
+	for expected in reports {
+		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
+		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");
+	}
 }
 
 #[cfg(test)]
@@ -1624,9 +1641,9 @@ fn userspace_spawn_syscalls_start_a_second_process() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	// A kernel thread drives the userspace spawn syscalls exactly as a ring-3
 	// spawner would: process_create -> process_load -> thread_create -> thread_start.
-	// The image is the embedded ServiceManager ELF, which reports in over its
-	// bootstrap channel and exits. The spawner hands the child the channel endpoint
-	// it received as its own bootstrap (transferred through thread_create).
+	// The image is the embedded LogService ELF, a leaf service that reports in over
+	// its bootstrap channel and exits. The spawner hands the child the channel
+	// endpoint it received as its own bootstrap (transferred through thread_create).
 	static ELF_PTR: AtomicU64 = AtomicU64::new(0);
 	static ELF_LEN: AtomicU64 = AtomicU64::new(0);
 	extern "C" fn spawner(bootstrap: u64) {
@@ -1643,14 +1660,14 @@ fn userspace_spawn_syscalls_start_a_second_process() {
 	}
 	let bytes = init_package_bytes().expect("init package present");
 	let package = pkg::Package::parse(bytes).expect("init package parses");
-	let elf = package.lookup(b"service_manager").expect("service_manager image");
+	let elf = package.lookup(b"log_service").expect("log_service image");
 	ELF_PTR.store(elf.as_ptr() as u64, Ordering::SeqCst);
 	ELF_LEN.store(elf.len() as u64, Ordering::SeqCst);
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
 	sched::spawn_with_object(spawner, user_ep, object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	let message = kernel_ep.recv().expect("the spawned process should report in over IPC");
-	assert_eq!(&message.bytes[..], b"ServiceManager: online");
+	assert_eq!(&message.bytes[..], b"LogService: online");
 }
 
 #[cfg(test)]
