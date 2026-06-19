@@ -10,6 +10,8 @@
 
 #![allow(dead_code)]
 
+use core::sync::atomic::{Ordering, fence};
+
 use rt::*;
 
 // virtio_pci_common_cfg field offsets, relative to the common-config structure.
@@ -43,6 +45,10 @@ const FEATURE_VERSION_1: u32 = 1 << 0;
 // therefore physically contiguous as the rings require.
 const QUEUE_SIZE: u16 = 16;
 
+// Descriptor flags.
+const DESC_NEXT: u16 = 1; // the buffer continues in the `next` descriptor
+const DESC_WRITE: u16 = 2; // the device writes this buffer (it is device-writable)
+
 unsafe fn r8(addr: u64) -> u8 {
 	unsafe { (addr as *const u8).read_volatile() }
 }
@@ -51,6 +57,9 @@ unsafe fn w8(addr: u64, v: u8) {
 }
 unsafe fn r16(addr: u64) -> u16 {
 	unsafe { (addr as *const u16).read_volatile() }
+}
+unsafe fn r32(addr: u64) -> u32 {
+	unsafe { (addr as *const u32).read_volatile() }
 }
 unsafe fn w16(addr: u64, v: u16) {
 	unsafe { (addr as *mut u16).write_volatile(v) }
@@ -85,6 +94,9 @@ pub struct Virtio {
 	queue_handle: i64,
 	queue_virt: u64,
 	queue_phys: u64,
+	// Byte offsets of the available and used rings within the ring page.
+	avail_off: u64,
+	used_off: u64,
 }
 
 // Bring the device up: run the init handshake and set up virtqueue 0. Returns None
@@ -171,7 +183,7 @@ unsafe fn setup_queue(common: u64, info: &DeviceInfo, mmio_base: u64) -> Option<
 		let queue_notify_off: u16 = r16(common + CFG_QUEUE_NOTIFY_OFF);
 		w16(common + CFG_QUEUE_ENABLE, 1);
 
-		Some(Virtio { common, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, queue_notify_off, queue_size: size, queue_handle: handle, queue_virt: virt as u64, queue_phys: phys })
+		Some(Virtio { common, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, queue_notify_off, queue_size: size, queue_handle: handle, queue_virt: virt as u64, queue_phys: phys, avail_off, used_off })
 	}
 }
 
@@ -183,5 +195,61 @@ impl Virtio {
 	// Whether the device reports DRIVER_OK (negotiation completed, queue live).
 	pub fn is_live(&self) -> bool {
 		unsafe { r8(self.common + CFG_DEVICE_STATUS) & STATUS_DRIVER_OK != 0 }
+	}
+
+	// Submit a descriptor chain to queue 0 and wait (by polling the used ring) for
+	// the device to complete it. Each buffer is (physical address, length, whether
+	// the device writes it). Returns the number of bytes the device reported using,
+	// or None if the queue is too small or the device never completes. This is the
+	// synchronous, single-request-in-flight path the headless drivers use.
+	pub unsafe fn submit(&self, bufs: &[(u64, u32, bool)]) -> Option<u32> {
+		unsafe {
+			let n = bufs.len();
+			if n == 0 || n > self.queue_size as usize {
+				return None;
+			}
+			// Fill descriptors 0..n as one chain (we keep a single request in flight,
+			// so the same descriptors are reused each call).
+			for (i, &(phys, len, device_writes)) in bufs.iter().enumerate() {
+				let d = self.queue_virt + i as u64 * 16;
+				w64(d, phys);
+				w32(d + 8, len);
+				let mut flags: u16 = 0;
+				if device_writes {
+					flags |= DESC_WRITE;
+				}
+				if i + 1 < n {
+					flags |= DESC_NEXT;
+				}
+				w16(d + 12, flags);
+				w16(d + 14, (i + 1) as u16);
+			}
+			// Publish the head descriptor (index 0) in the available ring, ordered
+			// before the index bump so the device never sees a half-written entry.
+			let avail = self.queue_virt + self.avail_off;
+			let old_avail = r16(avail + 2);
+			w16(avail + 4 + (old_avail % self.queue_size) as u64 * 2, 0);
+			fence(Ordering::SeqCst);
+			w16(avail + 2, old_avail.wrapping_add(1));
+			fence(Ordering::SeqCst);
+			// Notify the device that queue 0 has work.
+			w16(self.notify + self.queue_notify_off as u64 * self.notify_multiplier as u64, 0);
+			// Poll the used ring until the request completes.
+			let used = self.queue_virt + self.used_off;
+			let old_used = r16(used + 2);
+			let mut spins: u32 = 0;
+			loop {
+				fence(Ordering::SeqCst);
+				if r16(used + 2) != old_used {
+					break;
+				}
+				spins += 1;
+				if spins > 10_000_000 {
+					return None;
+				}
+			}
+			// Each used-ring element is { id u32, len u32 }; return the used length.
+			Some(r32(used + 4 + (old_used % self.queue_size) as u64 * 8 + 4))
+		}
 	}
 }

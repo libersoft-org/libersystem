@@ -8,5 +8,8 @@ mod virtio;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	common::run(bootstrap, b"driver.virtio-console: online")
+	unsafe {
+		let _device = common::bringup(bootstrap);
+		common::online_and_stand(bootstrap, b"driver.virtio-console: online")
+	}
 }
