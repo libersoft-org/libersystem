@@ -62,7 +62,7 @@ This compiles the kernel ELF into `kernel/target/x86_64-unknown-none/debug/kerne
 just run
 ```
 
-This builds a bootable Limine ISO from the kernel ELF and launches QEMU headless, with the kernel's serial console wired to your terminal. The boot log ends in `boot OK` and the kernel drops into an interactive serial shell at a `>` prompt. Type `help` to list commands (`ls <vol://volume>`, `cat <vol://vol/path>`, `graph`); type `exit` to stop the shell, after which the kernel idle-spins. To quit QEMU at any time, press <kbd>Ctrl</kbd>+<kbd>A</kbd> then <kbd>X</kbd>.
+This builds a bootable Limine ISO from the kernel ELF and launches QEMU headless, with the kernel's serial console wired to your terminal. The boot log ends in `boot OK` and the kernel drops into an interactive serial shell at a `>` prompt. Type `help` to list commands (`ls` to list volumes, `ls <vol://volume>` to list a volume's files, `cat <vol://vol/path>`, `graph`); type `exit` to stop the shell, after which the kernel idle-spins. To quit QEMU at any time, press <kbd>Ctrl</kbd>+<kbd>A</kbd> then <kbd>X</kbd>.
 
 By default QEMU uses KVM (with `-cpu host`) when `/dev/kvm` is available, and four cores (`-smp 4`).
 

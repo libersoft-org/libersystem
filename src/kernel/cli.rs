@@ -16,6 +16,10 @@ use crate::graph;
 #[cfg(not(test))]
 use crate::object::process::Process;
 
+// The single ramdisk volume served in phase 0/1. Both the volume listing and the
+// per-volume file listing resolve against this name.
+const SYSTEM_VOLUME: &str = "system";
+
 // Run one command line: split into a command word and its argument, then
 // dispatch. A blank line does nothing.
 pub fn run_line(line: &str) {
@@ -30,7 +34,7 @@ pub fn run_line(line: &str) {
 	match command {
 		"help" => help(),
 		"graph" | "ps" => graph::render(&graph::collect()),
-		"ls" => list_volume(rest),
+		"ls" => list(rest),
 		"cat" => print_file(rest),
 		"reboot" => crate::arch::reset(),
 		"poweroff" | "shutdown" => crate::arch::poweroff(),
@@ -42,11 +46,35 @@ fn help() {
 	crate::serial_println!("commands:");
 	crate::serial_println!("  help                  show this help");
 	crate::serial_println!("  graph                 dump the live System Graph");
+	crate::serial_println!("  ls                    list the available volumes");
 	crate::serial_println!("  ls <vol://volume>     list the files on a volume");
 	crate::serial_println!("  cat <vol://vol/path>  print a file (via StorageManager)");
 	crate::serial_println!("  reboot                reboot the machine");
 	crate::serial_println!("  poweroff              power the machine off");
 	crate::serial_println!("  exit                  stop the shell and halt");
+}
+
+// `ls`: with no argument list the available volumes; with `<vol://volume>` list
+// the files on that volume.
+fn list(arg: &str) {
+	if arg.is_empty() {
+		list_volumes();
+	} else {
+		list_volume(arg);
+	}
+}
+
+// `ls` with no argument: list the available volumes. Phase 0/1 serves a single
+// ramdisk volume, reported here with its file count when a volume is loaded.
+fn list_volumes() {
+	match crate::volume_package_bytes() {
+		Some(bytes) => {
+			let files: usize = crate::pkg::Package::parse(bytes).map(|p| p.len()).unwrap_or(0);
+			crate::serial_println!("volumes (1):");
+			crate::serial_println!("  vol://{} ({} files)", SYSTEM_VOLUME, files);
+		}
+		None => crate::serial_println!("no volumes are loaded"),
+	}
 }
 
 // `ls <vol://volume>`: list the files on a volume by reading the ramdisk archive.
@@ -58,7 +86,7 @@ fn list_volume(arg: &str) {
 			return;
 		}
 	};
-	if volume != "system" {
+	if volume != SYSTEM_VOLUME {
 		crate::serial_println!("ls: unknown volume '{}'", volume);
 		return;
 	}
@@ -76,7 +104,7 @@ fn list_volume(arg: &str) {
 			return;
 		}
 	};
-	crate::serial_println!("vol://system ({} files):", package.len());
+	crate::serial_println!("vol://{} ({} files):", SYSTEM_VOLUME, package.len());
 	for index in 0..package.len() {
 		if let Some(name) = package.name(index) {
 			let size: usize = package.lookup(name).map(|b| b.len()).unwrap_or(0);
@@ -172,7 +200,7 @@ pub fn run_interactive() {
 pub fn demo() {
 	crate::serial_println!("cli: serial command shell ready - scripted session follows");
 	let samples: Vec<Arc<Process>> = sample_processes();
-	for line in ["help", "ls vol://system", "cat vol://system/hello.txt", "graph"] {
+	for line in ["help", "ls", "ls vol://system", "cat vol://system/hello.txt", "graph"] {
 		crate::serial_println!("> {}", line);
 		run_line(line);
 	}
