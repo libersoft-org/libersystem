@@ -10,6 +10,7 @@ extern crate alloc;
 mod arch;
 mod cli;
 mod console;
+mod console_input;
 mod elf;
 mod fault;
 mod graph;
@@ -195,9 +196,32 @@ fn boot_main() {
 	storage_demo();
 	ipc_bench();
 	cli::demo();
-	serial_println!("boot OK - entering the serial shell (type 'help', or 'exit' to halt)");
-	cli::run_interactive();
+	serial_println!("boot OK - entering the userspace shell (type 'help', or 'exit' to halt)");
+	console_shell_loop();
 	serial_println!("halting");
+}
+
+// Drive the interactive userspace shell. The boot chain has already started it as
+// its last component and the shell has registered a console channel; this pumps
+// serial keystrokes to it a byte at a time, running the cooperative schedule after
+// each so the shell (and any service it calls) makes progress. Returns when the
+// shell exits (the user typed `exit`) or never attached.
+#[cfg(not(test))]
+fn console_shell_loop() {
+	if !console_input::shell_listening() {
+		serial_println!("shell: no interactive shell attached");
+		return;
+	}
+	// Nudge the shell to print its first prompt, then forward input until it exits.
+	console_input::feed(b'\n');
+	sched::run_until_idle();
+	while console_input::shell_listening() {
+		let byte = arch::serial::read_byte_blocking();
+		if !console_input::feed(byte) {
+			break;
+		}
+		sched::run_until_idle();
+	}
 }
 
 // Print a product banner inside an ASCII frame (plain +/-/| so it renders on both

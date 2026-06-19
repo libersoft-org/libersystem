@@ -1,12 +1,12 @@
 // A minimal command shell over the serial port: read a line, dispatch a command,
 // print a typed result. The commands cover the phase-0 surface - inspect a
-// volume, read a file (which round-trips to the StorageService service), and dump
-// the live System Graph. The shell is kernel-side for the MVP; a userspace CLI
-// component is later work.
+// volume, read a file (which round-trips to the StorageService), and dump the live
+// System Graph. The interactive REPL now lives in the userspace `shell` component
+// (M21); what remains here is the command dispatch plus a scripted boot demo that
+// shows the commands' output without requiring input.
 
 #![allow(dead_code)]
 
-use alloc::string::String;
 #[cfg(not(test))]
 use alloc::sync::Arc;
 #[cfg(not(test))]
@@ -147,49 +147,6 @@ fn parse_volume(arg: &str) -> Option<&str> {
 		return None;
 	}
 	Some(volume)
-}
-
-// Read one line from the serial port into `buf`, echoing typed characters so the
-// user sees their input. Recognises carriage return / newline as end of line and
-// backspace / delete as erase. Control characters are ignored.
-fn read_line(buf: &mut String) {
-	buf.clear();
-	loop {
-		let byte: u8 = crate::arch::serial::read_byte_blocking();
-		match byte {
-			b'\r' | b'\n' => {
-				crate::serial_println!();
-				return;
-			}
-			0x08 | 0x7f => {
-				if buf.pop().is_some() {
-					// erase the character on the terminal: back up, overwrite, back up
-					crate::serial_print!("\x08 \x08");
-				}
-			}
-			0x20..=0x7e => {
-				buf.push(byte as char);
-				crate::serial_print!("{}", byte as char);
-			}
-			_ => {}
-		}
-	}
-}
-
-// Run the interactive shell: prompt, read a line, run it, repeat. Returns when
-// the user types `exit` or `quit`.
-pub fn run_interactive() {
-	let mut line = String::new();
-	loop {
-		crate::serial_print!("> ");
-		read_line(&mut line);
-		let trimmed: &str = line.trim();
-		if trimmed == "exit" || trimmed == "quit" {
-			crate::serial_println!("shell: exiting");
-			return;
-		}
-		run_line(trimmed);
-	}
 }
 
 // A scripted shell session for the boot log: run a handful of commands as if

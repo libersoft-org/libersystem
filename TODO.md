@@ -250,8 +250,8 @@ are the concept's "full System Graph" = phase 2 observability, not phase 1.
 
 ## M21 - ServiceManager and the boot chain
 - [ ] ServiceManager (basic): start/stop services, dependency ordering, service-state tracking
-- [ ] The boot chain per the concept: SystemManager -> ServiceManager -> DeviceManager + LogService + StorageService, then the CLI as an ordinary component
-- [ ] Move the CLI to a userspace shell component (phase 0's CLI is kernel-embedded in `cli.rs`): it talks to the services over IPC and is started as an ordinary component at the end of the boot chain
+- [x] The boot chain per the concept: SystemManager -> ServiceManager -> DeviceManager + LogService + StorageService, then the CLI as an ordinary component
+- [x] Move the CLI to a userspace shell component (phase 0's CLI is kernel-embedded in `cli.rs`): it talks to the services over IPC and is started as an ordinary component at the end of the boot chain
 - [ ] SystemManager recovery: on a crash, start a recovery SystemManager / an emergency shell / safely restart userspace / reboot / panic as the last resort
 - Done when: SystemManager starts ServiceManager, which brings up the core services in dependency order, the shell runs as a userspace component, and a deliberately crashed SystemManager triggers the minimal recovery path.
 - Note: a full restart policy + heartbeat/watchdog is phase 2 (see "Out of scope for phase 1").

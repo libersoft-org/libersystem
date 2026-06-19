@@ -46,6 +46,7 @@ pub const SYS_PROCESS_CREATE: u64 = 29;
 pub const SYS_PROCESS_LOAD: u64 = 30;
 pub const SYS_THREAD_CREATE: u64 = 31;
 pub const SYS_THREAD_START: u64 = 32;
+pub const SYS_CONSOLE_ATTACH: u64 = 33;
 
 // The ring-3 stack top an ELF-loaded process runs on: the kernel's loader maps a
 // stack just below this address, and a userspace spawner passes it to
