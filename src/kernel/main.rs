@@ -1710,6 +1710,39 @@ fn domain_quota_enforced_cleanly() {
 
 #[cfg(test)]
 #[test_case]
+fn dma_buffer_quota_enforced_cleanly() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use object::domain::{Domain, UNLIMITED};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	// A thread accounted to a Domain capped at two pages of pinned DMA. The
+	// dma_buffer_create syscall charges the DMA quota at the create boundary, so a
+	// third buffer must be refused cleanly (ERR_RESOURCE_EXHAUSTED, nothing
+	// allocated) and closing the buffers must refund the quota.
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let d0 = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, 0, 0, 0);
+			assert!(!syscall::sys_is_err(d0));
+			let d1 = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, 0, 0, 0);
+			assert!(!syscall::sys_is_err(d1));
+			let d2 = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, 0, 0, 0);
+			assert_eq!(d2 as i64, syscall::ERR_RESOURCE_EXHAUSTED);
+			// Closing the buffers refunds both their DMA quota and their handles.
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, d0, 0, 0, 0) as i64, 0);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, d1, 0, 0, 0) as i64, 0);
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	let domain = Domain::new(UNLIMITED, UNLIMITED, UNLIMITED);
+	domain.account().dma().set_limit(2 * 4096);
+	assert!(sched::spawn_in(domain.clone(), body, 0).is_some());
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "DMA quota test thread did not finish");
+	// Every buffer was closed, so the pinned-DMA quota is back to zero.
+	assert_eq!(domain.account().dma().used(), 0);
+}
+
+#[cfg(test)]
+#[test_case]
 fn domain_hierarchy_limits_aggregate() {
 	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 	use object::domain::{Domain, UNLIMITED};

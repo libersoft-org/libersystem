@@ -97,15 +97,22 @@ pub struct ResourceAccount {
 	memory: ResourceCounter,
 	handles: ResourceCounter,
 	threads: ResourceCounter,
+	// Pinned DMA memory (bytes) held by this Domain's DmaBuffers. Uncapped by
+	// default; a cap is set explicitly so a DMA over-cap fails cleanly.
+	dma: ResourceCounter,
 }
 
 impl ResourceAccount {
 	const fn new(memory_limit: u64, handle_limit: u64, thread_limit: u64) -> Self {
-		Self { memory: ResourceCounter::new(memory_limit), handles: ResourceCounter::new(handle_limit), threads: ResourceCounter::new(thread_limit) }
+		Self { memory: ResourceCounter::new(memory_limit), handles: ResourceCounter::new(handle_limit), threads: ResourceCounter::new(thread_limit), dma: ResourceCounter::new(UNLIMITED) }
 	}
 
 	pub fn memory(&self) -> &ResourceCounter {
 		&self.memory
+	}
+
+	pub fn dma(&self) -> &ResourceCounter {
+		&self.dma
 	}
 
 	pub fn handles(&self) -> &ResourceCounter {
@@ -123,6 +130,15 @@ impl ResourceAccount {
 
 	pub fn uncharge_memory(&self, bytes: u64) {
 		self.memory.uncharge(bytes);
+	}
+
+	// Charge `bytes` of pinned DMA memory, enforcing the DMA cap.
+	pub fn try_charge_dma(&self, bytes: u64) -> bool {
+		self.dma.try_charge(bytes)
+	}
+
+	pub fn uncharge_dma(&self, bytes: u64) {
+		self.dma.uncharge(bytes);
 	}
 
 	// Charge one handle, enforcing the cap (for handle-creating syscalls).
@@ -278,6 +294,26 @@ impl Domain {
 		self.account.uncharge_memory(bytes);
 		if let Some(parent) = self.parent() {
 			parent.uncharge_memory(bytes);
+		}
+	}
+
+	pub fn try_charge_dma(&self, bytes: u64) -> bool {
+		if !self.account.try_charge_dma(bytes) {
+			return false;
+		}
+		if let Some(parent) = self.parent() {
+			if !parent.try_charge_dma(bytes) {
+				self.account.uncharge_dma(bytes);
+				return false;
+			}
+		}
+		true
+	}
+
+	pub fn uncharge_dma(&self, bytes: u64) {
+		self.account.uncharge_dma(bytes);
+		if let Some(parent) = self.parent() {
+			parent.uncharge_dma(bytes);
 		}
 	}
 

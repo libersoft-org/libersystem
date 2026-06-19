@@ -24,6 +24,7 @@ use crate::arch;
 use crate::fault::FaultInfo;
 use crate::mem::frame::PAGE_SIZE;
 use crate::object::channel::{Channel, ChannelError, Message};
+use crate::object::dma_buffer::DmaBuffer;
 use crate::object::domain::Domain;
 use crate::object::event::Event;
 use crate::object::handle::{Capability, Handle, HandleError};
@@ -37,7 +38,7 @@ use crate::sched;
 // kernel/userspace ABI: defined once in the abi crate (the single source of
 // truth) and re-exported here so the rest of the kernel keeps referring to them
 // as `syscall::SYS_*` / `syscall::ERR_*` / `syscall::sys_is_err`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DMA_BUFFER_CREATE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
 
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. repr(C) with only
@@ -112,6 +113,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 			0
 		}
 		SYS_MEMORY_OBJECT_CREATE => sys_memory_object_create(a0),
+		SYS_DMA_BUFFER_CREATE => sys_dma_buffer_create(a0),
 		SYS_MEMORY_MAP => sys_memory_map(a0),
 		SYS_MEMORY_UNMAP => sys_memory_unmap(a0),
 		SYS_HANDLE_DUPLICATE => sys_handle_duplicate(a0, a1),
@@ -148,6 +150,26 @@ fn sys_memory_object_create(size: u64) -> i64 {
 	};
 	// Charge the physical memory to the caller's Domain at the create boundary.
 	let object = match MemoryObject::create_in(thread.domain(), size as usize) {
+		Ok(o) => o,
+		Err(MemoryError::QuotaExceeded) => return ERR_RESOURCE_EXHAUSTED,
+		Err(MemoryError::OutOfMemory) => return ERR_NO_MEMORY,
+	};
+	let installed = thread.handles().lock().try_insert_object(object, Rights::ALL, 0);
+	match installed {
+		Some(handle) => handle.raw() as i64,
+		None => ERR_RESOURCE_EXHAUSTED,
+	}
+}
+
+// Create a DmaBuffer - pinned DMA memory charged to the caller's Domain DMA quota
+// - and install a handle to it in the caller's table. A driver maps the buffer
+// and hands its physical address to its device.
+fn sys_dma_buffer_create(size: u64) -> i64 {
+	let thread = match sched::current_thread() {
+		Some(t) => t,
+		None => return ERR_NO_THREAD,
+	};
+	let object = match DmaBuffer::create_in(thread.domain(), size as usize) {
 		Ok(o) => o,
 		Err(MemoryError::QuotaExceeded) => return ERR_RESOURCE_EXHAUSTED,
 		Err(MemoryError::OutOfMemory) => return ERR_NO_MEMORY,

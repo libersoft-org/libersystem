@@ -37,6 +37,7 @@ pub const SYS_DOMAIN_KILL: u64 = 20;
 pub const SYS_YIELD: u64 = 21;
 pub const SYS_OBJECT_INFO_GET: u64 = 22;
 pub const SYS_WAIT: u64 = 23;
+pub const SYS_DMA_BUFFER_CREATE: u64 = 24;
 
 // Error codes (Linux-style: a successful call returns its value, an error returns
 // a small negative in the reserved band [-4095, -1]).
