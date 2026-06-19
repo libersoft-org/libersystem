@@ -1,12 +1,12 @@
 // The shared virtio transport - modern virtio-pci over the device's MMIO BAR.
 //
 // A driver maps its device's MMIO window (a DeviceMemory capability from
-// DeviceManager) and calls `init`, which runs the virtio device-initialization
-// handshake (reset -> acknowledge -> driver -> feature negotiation -> features-ok
-// -> set up a virtqueue -> driver-ok) over the common-configuration structure, and
-// allocates the split virtqueue rings in a DMA buffer the device is told the
-// physical address of. After `init` the device is live; submitting buffers and
-// driving the queue's data path is the per-driver work in the next milestone.
+// DeviceManager) and calls `negotiate`, which runs the device-initialization
+// handshake up to FEATURES_OK over the common-configuration structure. The driver
+// then sets up the virtqueue(s) it needs (`setup_queue`, allocating the split-queue
+// rings in a DMA buffer the device is told the physical address of) and calls
+// `driver_ok`. After that it drives each queue with `Queue::submit` (a descriptor
+// chain, a notify, and a poll of the used ring).
 
 #![allow(dead_code)]
 
@@ -80,32 +80,40 @@ fn align_up(x: u64, a: u64) -> u64 {
 	(x + a - 1) & !(a - 1)
 }
 
-// A virtio device brought up to DRIVER_OK with one ready virtqueue.
+// A virtio device negotiated up to FEATURES_OK. The driver sets up the virtqueues
+// it needs, then calls `driver_ok`; afterwards it drives those queues.
 pub struct Virtio {
 	// Base of the common-config structure in the mapped MMIO window.
 	common: u64,
-	// Base of the notify structure and its per-queue multiplier (used by the data
-	// path in the next milestone).
+	// Base of the device-specific config structure (e.g. a NIC's MAC).
+	device: u64,
+	// Base of the notify structure and its per-queue multiplier.
 	notify: u64,
 	notify_multiplier: u32,
-	queue_notify_off: u16,
-	// The negotiated queue size and the DMA-backed split-virtqueue rings.
-	queue_size: u16,
-	queue_handle: i64,
-	queue_virt: u64,
-	queue_phys: u64,
-	// Byte offsets of the available and used rings within the ring page.
-	avail_off: u64,
-	used_off: u64,
 }
 
-// Bring the device up: run the init handshake and set up virtqueue 0. Returns None
-// (and marks the device FAILED) if negotiation does not stick or no queue exists.
-pub unsafe fn init(mmio_base: u64, info: &DeviceInfo) -> Option<Virtio> {
+// One set-up split virtqueue: its rings (in a DMA page) and the address/value used
+// to notify the device of new work.
+pub struct Queue {
+	index: u16,
+	notify_addr: u64,
+	size: u16,
+	virt: u64,
+	avail_off: u64,
+	used_off: u64,
+	// Keeps the ring DMA buffer alive (the handle stays open).
+	handle: i64,
+}
+
+// Run the device-initialization handshake up to FEATURES_OK (reset -> acknowledge
+// -> driver -> negotiate VERSION_1 -> features-ok). Returns None (marking the
+// device FAILED) if the device rejects the features. The caller then sets up its
+// queues and calls `driver_ok`.
+pub unsafe fn negotiate(mmio_base: u64, info: &DeviceInfo) -> Option<Virtio> {
 	unsafe {
 		let common: u64 = mmio_base + info.common_offset as u64;
 
-		// 1. reset, and wait for the device to acknowledge by reading status 0.
+		// reset, and wait for the device to acknowledge by reading status 0.
 		w8(common + CFG_DEVICE_STATUS, 0);
 		let mut spins: u32 = 0;
 		while r8(common + CFG_DEVICE_STATUS) != 0 {
@@ -114,104 +122,102 @@ pub unsafe fn init(mmio_base: u64, info: &DeviceInfo) -> Option<Virtio> {
 				return None;
 			}
 		}
-		// 2. acknowledge the device and signal we have a driver for it.
+		// acknowledge the device and signal we have a driver for it.
 		w8(common + CFG_DEVICE_STATUS, STATUS_ACKNOWLEDGE);
 		w8(common + CFG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
-		// 3. negotiate features: accept only VERSION_1 (the modern transport).
+		// negotiate features: accept only VERSION_1 (the modern transport).
 		w32(common + CFG_DRIVER_FEATURE_SELECT, 0);
 		w32(common + CFG_DRIVER_FEATURE, 0);
 		w32(common + CFG_DRIVER_FEATURE_SELECT, 1);
 		w32(common + CFG_DRIVER_FEATURE, FEATURE_VERSION_1);
 
-		// 4. lock the features in and confirm the device accepted them.
+		// lock the features in and confirm the device accepted them.
 		w8(common + CFG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
 		if r8(common + CFG_DEVICE_STATUS) & STATUS_FEATURES_OK == 0 {
 			w8(common + CFG_DEVICE_STATUS, STATUS_FAILED);
 			return None;
 		}
-
-		// 5. set up virtqueue 0.
-		let virtio = match setup_queue(common, info, mmio_base) {
-			Some(v) => v,
-			None => {
-				w8(common + CFG_DEVICE_STATUS, STATUS_FAILED);
-				return None;
-			}
-		};
-
-		// 6. tell the device the driver is ready.
-		w8(common + CFG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
-		Some(virtio)
-	}
-}
-
-// Select queue 0, allocate its split-virtqueue rings in a DMA page, program the
-// ring physical addresses, and enable the queue.
-unsafe fn setup_queue(common: u64, info: &DeviceInfo, mmio_base: u64) -> Option<Virtio> {
-	unsafe {
-		w16(common + CFG_QUEUE_SELECT, 0);
-		let max_size: u16 = r16(common + CFG_QUEUE_SIZE);
-		if max_size == 0 {
-			return None;
-		}
-		let size: u16 = if max_size < QUEUE_SIZE { max_size } else { QUEUE_SIZE };
-		w16(common + CFG_QUEUE_SIZE, size);
-
-		// one DMA page holds all three rings (contiguous, as the rings require).
-		let handle: i64 = dma_buffer_create(4096);
-		if handle < 0 {
-			return None;
-		}
-		let virt: i64 = dma_buffer_map(handle as u64);
-		if sys_is_err(virt as u64) {
-			return None;
-		}
-		let phys: u64 = dma_buffer_phys(handle as u64);
-		core::ptr::write_bytes(virt as *mut u8, 0, 4096);
-
-		// split-virtqueue layout within the page: descriptor table (16 bytes each),
-		// then the available ring (2-byte aligned), then the used ring (4-byte
-		// aligned). With QUEUE_SIZE = 16 all three fit well inside one page.
-		let desc_off: u64 = 0;
-		let avail_off: u64 = 16 * size as u64;
-		let used_off: u64 = align_up(avail_off + 6 + 2 * size as u64, 4);
-
-		w64(common + CFG_QUEUE_DESC, phys + desc_off);
-		w64(common + CFG_QUEUE_DRIVER, phys + avail_off);
-		w64(common + CFG_QUEUE_DEVICE, phys + used_off);
-		let queue_notify_off: u16 = r16(common + CFG_QUEUE_NOTIFY_OFF);
-		w16(common + CFG_QUEUE_ENABLE, 1);
-
-		Some(Virtio { common, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, queue_notify_off, queue_size: size, queue_handle: handle, queue_virt: virt as u64, queue_phys: phys, avail_off, used_off })
+		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier })
 	}
 }
 
 impl Virtio {
-	pub fn queue_size(&self) -> u16 {
-		self.queue_size
+	// Select queue `index`, allocate its split-virtqueue rings in a DMA page, program
+	// the ring physical addresses, and enable the queue. One DMA page holds all three
+	// rings (contiguous, as the rings require).
+	pub unsafe fn setup_queue(&self, index: u16) -> Option<Queue> {
+		unsafe {
+			w16(self.common + CFG_QUEUE_SELECT, index);
+			let max_size: u16 = r16(self.common + CFG_QUEUE_SIZE);
+			if max_size == 0 {
+				return None;
+			}
+			let size: u16 = if max_size < QUEUE_SIZE { max_size } else { QUEUE_SIZE };
+			w16(self.common + CFG_QUEUE_SIZE, size);
+
+			let handle: i64 = dma_buffer_create(4096);
+			if handle < 0 {
+				return None;
+			}
+			let virt: i64 = dma_buffer_map(handle as u64);
+			if sys_is_err(virt as u64) {
+				return None;
+			}
+			let phys: u64 = dma_buffer_phys(handle as u64);
+			core::ptr::write_bytes(virt as *mut u8, 0, 4096);
+
+			// layout within the page: descriptor table (16 bytes each), then the
+			// available ring (2-byte aligned), then the used ring (4-byte aligned).
+			let avail_off: u64 = 16 * size as u64;
+			let used_off: u64 = align_up(avail_off + 6 + 2 * size as u64, 4);
+			w64(self.common + CFG_QUEUE_DESC, phys);
+			w64(self.common + CFG_QUEUE_DRIVER, phys + avail_off);
+			w64(self.common + CFG_QUEUE_DEVICE, phys + used_off);
+			let notify_off: u16 = r16(self.common + CFG_QUEUE_NOTIFY_OFF);
+			w16(self.common + CFG_QUEUE_ENABLE, 1);
+
+			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt: virt as u64, avail_off, used_off, handle })
+		}
 	}
 
-	// Whether the device reports DRIVER_OK (negotiation completed, queue live).
+	// Tell the device the driver is ready, after the queues are set up.
+	pub unsafe fn driver_ok(&self) {
+		unsafe {
+			let status = r8(self.common + CFG_DEVICE_STATUS);
+			w8(self.common + CFG_DEVICE_STATUS, status | STATUS_DRIVER_OK);
+		}
+	}
+
+	// Whether the device reports DRIVER_OK.
 	pub fn is_live(&self) -> bool {
 		unsafe { r8(self.common + CFG_DEVICE_STATUS) & STATUS_DRIVER_OK != 0 }
 	}
 
-	// Submit a descriptor chain to queue 0 and wait (by polling the used ring) for
+	// Read one byte of the device-specific config (e.g. a NIC's MAC bytes).
+	pub unsafe fn config_read(&self, offset: u64) -> u8 {
+		unsafe { r8(self.device + offset) }
+	}
+}
+
+impl Queue {
+	pub fn size(&self) -> u16 {
+		self.size
+	}
+
+	// Submit a descriptor chain to this queue and wait (by polling the used ring) for
 	// the device to complete it. Each buffer is (physical address, length, whether
-	// the device writes it). Returns the number of bytes the device reported using,
-	// or None if the queue is too small or the device never completes. This is the
-	// synchronous, single-request-in-flight path the headless drivers use.
+	// the device writes it). Returns the bytes the device reported using, or None if
+	// the queue is too small or the device never completes. Synchronous, with a
+	// single request in flight (the same descriptors are reused each call).
 	pub unsafe fn submit(&self, bufs: &[(u64, u32, bool)]) -> Option<u32> {
 		unsafe {
 			let n = bufs.len();
-			if n == 0 || n > self.queue_size as usize {
+			if n == 0 || n > self.size as usize {
 				return None;
 			}
-			// Fill descriptors 0..n as one chain (we keep a single request in flight,
-			// so the same descriptors are reused each call).
 			for (i, &(phys, len, device_writes)) in bufs.iter().enumerate() {
-				let d = self.queue_virt + i as u64 * 16;
+				let d = self.virt + i as u64 * 16;
 				w64(d, phys);
 				w32(d + 8, len);
 				let mut flags: u16 = 0;
@@ -226,16 +232,16 @@ impl Virtio {
 			}
 			// Publish the head descriptor (index 0) in the available ring, ordered
 			// before the index bump so the device never sees a half-written entry.
-			let avail = self.queue_virt + self.avail_off;
+			let avail = self.virt + self.avail_off;
 			let old_avail = r16(avail + 2);
-			w16(avail + 4 + (old_avail % self.queue_size) as u64 * 2, 0);
+			w16(avail + 4 + (old_avail % self.size) as u64 * 2, 0);
 			fence(Ordering::SeqCst);
 			w16(avail + 2, old_avail.wrapping_add(1));
 			fence(Ordering::SeqCst);
-			// Notify the device that queue 0 has work.
-			w16(self.notify + self.queue_notify_off as u64 * self.notify_multiplier as u64, 0);
+			// Notify the device that this queue has work (the value is the queue index).
+			w16(self.notify_addr, self.index);
 			// Poll the used ring until the request completes.
-			let used = self.queue_virt + self.used_off;
+			let used = self.virt + self.used_off;
 			let old_used = r16(used + 2);
 			let mut spins: u32 = 0;
 			loop {
@@ -249,7 +255,7 @@ impl Virtio {
 				}
 			}
 			// Each used-ring element is { id u32, len u32 }; return the used length.
-			Some(r32(used + 4 + (old_used % self.queue_size) as u64 * 8 + 4))
+			Some(r32(used + 4 + (old_used % self.size) as u64 * 8 + 4))
 		}
 	}
 }

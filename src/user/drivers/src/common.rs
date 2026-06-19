@@ -14,9 +14,10 @@ use rt::*;
 
 use crate::virtio::{self, Virtio};
 
-// Receive the device from DeviceManager, map its MMIO BAR, and bring it up through
-// the virtio transport. Returns the live device, or exits the process if anything
-// fails (a driver with no working device has nothing to do).
+// Receive the device from DeviceManager, map its MMIO BAR, and negotiate it up to
+// FEATURES_OK through the virtio transport. Returns the negotiated device; the
+// caller sets up its queues and calls `driver_ok`. Exits the process on any failure
+// (a driver with no working device has nothing to do).
 pub unsafe fn bringup(bootstrap: u64) -> Virtio {
 	unsafe {
 		let mut buf: [u8; 96] = [0u8; 96];
@@ -31,10 +32,10 @@ pub unsafe fn bringup(bootstrap: u64) -> Virtio {
 		if sys_is_err(base) {
 			exit();
 		}
-		// reset -> negotiate -> virtqueue -> driver-ok.
-		match virtio::init(base, &info) {
-			Some(device) if device.is_live() => device,
-			_ => exit(),
+		// reset -> negotiate -> features-ok.
+		match virtio::negotiate(base, &info) {
+			Some(device) => device,
+			None => exit(),
 		}
 	}
 }

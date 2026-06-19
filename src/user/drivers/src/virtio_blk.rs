@@ -12,7 +12,7 @@ mod virtio;
 
 use rt::*;
 
-use crate::virtio::Virtio;
+use crate::virtio::Queue;
 
 // One disk sector.
 const SECTOR: u32 = 512;
@@ -32,14 +32,21 @@ const STATUS_OFF: u64 = 1024;
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		let device = common::bringup(bootstrap);
-		let report: &[u8] = if self_test(&device) { b"driver.virtio-blk: online (sector r/w ok)" } else { b"driver.virtio-blk: online" };
+		// virtio-blk has a single request queue (queue 0).
+		let queue = device.setup_queue(0);
+		device.driver_ok();
+		let ok = match queue {
+			Some(q) => self_test(&q),
+			None => false,
+		};
+		let report: &[u8] = if ok { b"driver.virtio-blk: online (sector r/w ok)" } else { b"driver.virtio-blk: online" };
 		common::online_and_stand(bootstrap, report)
 	}
 }
 
 // Write a recognizable pattern to sector 0 and read it back, exercising the block
 // data path end to end over the virtqueue. Returns true if the round-trip matches.
-unsafe fn self_test(device: &Virtio) -> bool {
+unsafe fn self_test(queue: &Queue) -> bool {
 	unsafe {
 		// a DMA buffer for the request header, data sector, and status byte.
 		let handle: i64 = dma_buffer_create(4096);
@@ -58,14 +65,14 @@ unsafe fn self_test(device: &Virtio) -> bool {
 			((virt + DATA_OFF + i) as *mut u8).write_volatile((i as u8) ^ 0x5a);
 		}
 		// WRITE sector 0 (device reads the data buffer).
-		if !request(device, virt, phys, BLK_T_OUT, false) {
+		if !request(queue, virt, phys, BLK_T_OUT, false) {
 			return false;
 		}
 		// clobber the buffer, then READ sector 0 back (device writes the data buffer).
 		for i in 0..SECTOR as u64 {
 			((virt + DATA_OFF + i) as *mut u8).write_volatile(0);
 		}
-		if !request(device, virt, phys, BLK_T_IN, true) {
+		if !request(queue, virt, phys, BLK_T_IN, true) {
 			return false;
 		}
 		// the pattern must have survived the disk round-trip.
@@ -81,13 +88,13 @@ unsafe fn self_test(device: &Virtio) -> bool {
 // Issue one block request for sector 0: fill the header, submit the three-buffer
 // descriptor chain (header, data, status), and check the device reported success.
 // `data_is_written` is whether the device writes the data buffer (a read).
-unsafe fn request(device: &Virtio, virt: u64, phys: u64, kind: u32, data_is_written: bool) -> bool {
+unsafe fn request(queue: &Queue, virt: u64, phys: u64, kind: u32, data_is_written: bool) -> bool {
 	unsafe {
 		(virt as *mut u32).write_volatile(kind); // type
 		((virt + 4) as *mut u32).write_volatile(0); // reserved
 		((virt + 8) as *mut u64).write_volatile(0); // sector 0
 		((virt + STATUS_OFF) as *mut u8).write_volatile(0xff); // status sentinel
 		let bufs: [(u64, u32, bool); 3] = [(phys + HDR_OFF, 16, false), (phys + DATA_OFF, SECTOR, data_is_written), (phys + STATUS_OFF, 1, true)];
-		device.submit(&bufs).is_some() && ((virt + STATUS_OFF) as *const u8).read_volatile() == BLK_S_OK
+		queue.submit(&bufs).is_some() && ((virt + STATUS_OFF) as *const u8).read_volatile() == BLK_S_OK
 	}
 }
