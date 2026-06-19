@@ -1515,6 +1515,8 @@ POSTUP:
 
 Pravděpodobný kompromis (k ověření, ne dogma): **WIT jako zdroj typů a rozhraní, vlastní binární layout + handle tabulka jako backend.** Ale potvrdí se to až praxí na reálných interface, ne předem.
 
+**Rozhodnuto (po zkoušce v M25):** zápis těchto rozhraní ve WIT odhalil pět míst, kde to drhne - předávání capability/handle (WIT `resource` own/borrow nevyjadřuje wire-level přenos capability s právy a badge, proto Fuchsia postavila vlastní FIDL), zero-copy shared buffery (WIT kopíruje `list<u8>`), streamy s backpressure (WIT `stream` je nestabilní async návrh component-modelu, naše jsou bounded Channely vyčerpávané přes `wait`), stabilita binárního ABI (binární forma WIT je WASM canonical ABI, ne stabilní layout Channelu) a nástroje (`wit-bindgen` cílí na WASM komponenty, ne na náš Channel IPC). Systémový IDL je tedy **vlastní**, s typy inspirovanými WIT (records, enums, variants, results, lists, tuples, options) plus first-class `handle`, `buffer` a `stream`, a s vlastním binárním backendem a generátory; WIT *typy* lze případně emitovat jako jeden z backendů pro hranici Wasm komponent. Tím se výše uvedený pravděpodobný kompromis potvrzuje z praxe, ne od stolu.
+
 ---
 
 ### Kompatibilita a POSIX-like vrstva (odloženo)
