@@ -537,8 +537,8 @@ fn spawn_system_manager() -> Result<alloc::sync::Arc<object::channel::Channel>, 
 	kernel_ep.send(Message::new(msg, alloc::vec![cap], 0)).map_err(|_| "failed to hand SystemManager the init package")?;
 
 	// Hand SystemManager the ramdisk volume the same way, so it can be delegated
-	// down to the StorageManager the boot chain brings up. "RAMDISK" + length with a
-	// read-only buffer capability the StorageManager will map and serve files from.
+	// down to the StorageService the boot chain brings up. "RAMDISK" + length with a
+	// read-only buffer capability the StorageService will map and serve files from.
 	let volume = volume_package_bytes().ok_or("volume package module not found")?;
 	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
 	copy_into_object(&ramdisk, volume);
@@ -591,13 +591,13 @@ fn copy_into_object(object: &alloc::sync::Arc<object::memory_object::MemoryObjec
 }
 
 // Build the M16 storage topology and run it to completion. A MemoryObject holds
-// the ramdisk volume; the StorageManager process maps it and serves files over a
+// the ramdisk volume; the StorageService process maps it and serves files over a
 // service channel; a client process opens vol://system/hello.txt through the
-// manager, receives a shared-buffer capability to the file's bytes, maps it, and
+// service, receives a shared-buffer capability to the file's bytes, maps it, and
 // reports the contents back over its bootstrap channel. The kernel only brokers
 // the initial capabilities - the open, the resolve, and the zero-copy read all
 // happen in userspace. Returns (expected, actual): the file straight from the
-// volume archive, and the bytes the client read through the manager. Shared by
+// volume archive, and the bytes the client read through the service. Shared by
 // the boot demo and the test.
 fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
 	use alloc::sync::Arc;
@@ -614,33 +614,33 @@ fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), 
 	// the userspace programs, from the init package
 	let init = init_package_bytes().ok_or("init package module not found")?;
 	let package = pkg::Package::parse(init).ok_or("init package is malformed")?;
-	let manager_elf = package.lookup(b"storage_manager").ok_or("storage_manager missing from the init package")?;
+	let service_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
 	let client_elf = package.lookup(b"storage_client").ok_or("storage_client missing from the init package")?;
 
 	// the ramdisk: a MemoryObject filled with the volume archive via the HHDM
 	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
 	copy_into_object(&ramdisk, volume);
 
-	// channels: a bootstrap per process, plus the manager<->client service channel
-	let (manager_boot_kernel, manager_boot_user) = Channel::create();
+	// channels: a bootstrap per process, plus the service<->client request channel
+	let (service_boot_kernel, service_boot_user) = Channel::create();
 	let (client_boot_kernel, client_boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
 
 	// spawn the two processes with their bootstrap endpoints
 	let domain = sched::root_domain();
-	loader::spawn_elf_process(domain.clone(), manager_elf, manager_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageManager")?;
+	loader::spawn_elf_process(domain.clone(), service_elf, service_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
 	loader::spawn_elf_process(domain, client_elf, client_boot_user, Rights::ALL, 0).map_err(|_| "failed to load the storage client")?;
 
-	// hand the manager its ramdisk (with the volume length) and its service
+	// hand the service its ramdisk (with the volume length) and its service
 	// endpoint, then hand the client the other end of that service channel. These
 	// are object-level sends: the kernel attaches the capabilities directly.
 	let mut ramdisk_msg = alloc::vec::Vec::with_capacity(7 + 8);
 	ramdisk_msg.extend_from_slice(b"RAMDISK");
 	ramdisk_msg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
 	let ramdisk_cap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP, 0);
-	manager_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap], 0)).map_err(|_| "manager ramdisk bootstrap failed")?;
+	service_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap], 0)).map_err(|_| "service ramdisk bootstrap failed")?;
 	let service_server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
-	manager_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![service_server_cap], 0)).map_err(|_| "manager serve bootstrap failed")?;
+	service_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![service_server_cap], 0)).map_err(|_| "service serve bootstrap failed")?;
 	let service_client_cap = Capability::new(service_client as Arc<dyn KernelObject>, Rights::ALL, 0);
 	client_boot_kernel.send(Message::new(b"CONNECT".to_vec(), alloc::vec![service_client_cap], 0)).map_err(|_| "client connect bootstrap failed")?;
 
@@ -651,13 +651,13 @@ fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), 
 }
 
 // Run the M16 storage scenario and report whether the client read the file's
-// bytes through the StorageManager intact.
+// bytes through the StorageService intact.
 #[cfg(not(test))]
 fn storage_demo() {
 	match run_storage_scenario() {
 		Ok((expected, actual)) => {
 			if actual == expected {
-				serial_println!("storage: client read \"{}\" from vol://system/hello.txt via StorageManager", core::str::from_utf8(&actual).unwrap_or("<bad>").trim_end());
+				serial_println!("storage: client read \"{}\" from vol://system/hello.txt via StorageService", core::str::from_utf8(&actual).unwrap_or("<bad>").trim_end());
 			} else {
 				serial_println!("storage: ERROR - client read {} bytes, expected {}", actual.len(), expected.len());
 			}
@@ -666,10 +666,10 @@ fn storage_demo() {
 	}
 }
 
-// Read a file from a vol:// volume by driving the StorageManager as the kernel's
-// own client - the path the CLI's `cat` command uses. Spawns the manager, hands
+// Read a file from a vol:// volume by driving the StorageService as the kernel's
+// own client - the path the CLI's `cat` command uses. Spawns the service, hands
 // it the ramdisk and a service channel, sends one open request plus an empty quit
-// sentinel (so the manager exits and the cooperative schedule drains), runs the
+// sentinel (so the service exits and the cooperative schedule drains), runs the
 // schedule to completion, then receives the reply and reads the returned shared
 // buffer through the HHDM. Returns the file's bytes, or an error string.
 fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
@@ -683,28 +683,28 @@ fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
 	let volume = volume_package_bytes().ok_or("volume package module not found")?;
 	let init = init_package_bytes().ok_or("init package module not found")?;
 	let package = pkg::Package::parse(init).ok_or("init package is malformed")?;
-	let manager_elf = package.lookup(b"storage_manager").ok_or("storage_manager missing from the init package")?;
+	let service_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
 
 	// the ramdisk: a MemoryObject filled with the volume archive via the HHDM
 	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
 	copy_into_object(&ramdisk, volume);
 
-	let (manager_boot_kernel, manager_boot_user) = Channel::create();
+	let (service_boot_kernel, service_boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
 
-	loader::spawn_elf_process(sched::root_domain(), manager_elf, manager_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageManager")?;
+	loader::spawn_elf_process(sched::root_domain(), service_elf, service_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
 
-	// bootstrap the manager: the ramdisk (with its length) and the service endpoint
+	// bootstrap the service: the ramdisk (with its length) and the service endpoint
 	let mut ramdisk_msg = alloc::vec::Vec::with_capacity(7 + 8);
 	ramdisk_msg.extend_from_slice(b"RAMDISK");
 	ramdisk_msg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
 	let ramdisk_cap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP, 0);
-	manager_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap], 0)).map_err(|_| "manager ramdisk bootstrap failed")?;
+	service_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap], 0)).map_err(|_| "service ramdisk bootstrap failed")?;
 	let service_server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
-	manager_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![service_server_cap], 0)).map_err(|_| "manager serve bootstrap failed")?;
+	service_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![service_server_cap], 0)).map_err(|_| "service serve bootstrap failed")?;
 
 	// the open request - [rights u32 LE][vol:// URI] - then an empty quit sentinel,
-	// which the manager treats as end-of-session and exits on
+	// which the service treats as end-of-session and exits on
 	let want_rights = (Rights::READ | Rights::MAP).bits();
 	let mut request = alloc::vec::Vec::with_capacity(4 + uri.len());
 	request.extend_from_slice(&want_rights.to_le_bytes());
@@ -714,16 +714,16 @@ fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
 
 	sched::run_until_idle();
 
-	let reply = service_client.recv().map_err(|_| "the manager sent no reply")?;
+	let reply = service_client.recv().map_err(|_| "the service sent no reply")?;
 	if reply.bytes.len() < 12 {
 		return Err("malformed reply");
 	}
 	let status = u32::from_le_bytes([reply.bytes[0], reply.bytes[1], reply.bytes[2], reply.bytes[3]]);
 	let size = u64::from_le_bytes([reply.bytes[4], reply.bytes[5], reply.bytes[6], reply.bytes[7], reply.bytes[8], reply.bytes[9], reply.bytes[10], reply.bytes[11]]) as usize;
 	if status != 0 {
-		return Err("the manager denied or could not find the file");
+		return Err("the service denied or could not find the file");
 	}
-	let cap = reply.caps.first().ok_or("the manager granted no buffer")?;
+	let cap = reply.caps.first().ok_or("the service granted no buffer")?;
 	let object = cap.object();
 	let memory = object.as_any().downcast_ref::<MemoryObject>().ok_or("the granted capability was not a buffer")?;
 	Ok(read_from_object(memory, size))
@@ -1621,14 +1621,14 @@ fn init_package_starts_system_manager() {
 	// The boot chain, end to end: SystemManager starts from the init package, spawns
 	// ServiceManager and delegates the package and the ramdisk to it, and
 	// ServiceManager brings up the core services in dependency order - LogService
-	// first (DeviceManager and StorageManager both depend on it, though they are
+	// first (DeviceManager and StorageService both depend on it, though they are
 	// listed before it in the manifest, so the order is driven by declared
-	// dependencies). StorageManager is handed the ramdisk and a service channel
+	// dependencies). StorageService is handed the ramdisk and a service channel
 	// before it reports in. Every report is relayed up, so the kernel observes the
 	// services come up in dependency order followed by the two managers.
 	let kernel_ep = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 5] = [b"LogService: online", b"DeviceManager: online", b"StorageManager: online", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 5] = [b"LogService: online", b"DeviceManager: online", b"StorageService: online", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");
@@ -1673,7 +1673,7 @@ fn userspace_spawn_syscalls_start_a_second_process() {
 #[cfg(test)]
 #[test_case]
 fn storage_serves_volume_file_to_client() {
-	// The StorageManager (a ring-3 process) maps a ramdisk volume, and a client
+	// The StorageService (a ring-3 process) maps a ramdisk volume, and a client
 	// process opens vol://system/hello.txt through it, receives a shared-buffer
 	// capability to the file's bytes, maps it, and reports the contents back. The
 	// bytes the client read must equal the file straight from the volume archive -
@@ -1758,7 +1758,7 @@ fn system_graph_reflects_live_state() {
 #[cfg(test)]
 #[test_case]
 fn cli_reads_file_through_storage_service() {
-	// The CLI's `cat` path: the kernel drives the StorageManager as its own client,
+	// The CLI's `cat` path: the kernel drives the StorageService as its own client,
 	// sending one open request and a quit sentinel, then reads the returned shared
 	// buffer. The bytes must equal the file straight from the volume archive - a
 	// command round-tripping to a real userspace service.

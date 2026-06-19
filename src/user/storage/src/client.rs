@@ -1,4 +1,4 @@
-// storage_client - a userspace demo client for the StorageManager.
+// storage_client - a userspace demo client for the StorageService.
 //
 // The kernel hands this program a bootstrap channel and sends "CONNECT" with a
 // capability to the manager's service channel. The client opens a known vol://
@@ -11,7 +11,7 @@
 
 use rt::*;
 
-// the file this client opens through the StorageManager
+// the file this client opens through the StorageService
 const TARGET_URI: &[u8] = b"vol://system/hello.txt";
 
 #[unsafe(no_mangle)]

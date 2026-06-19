@@ -172,7 +172,7 @@ pub unsafe fn spawn(elf: &[u8], bootstrap: u64) -> i64 {
 
 // A canonical location on a volume: the resolver's view of a vol:// URI, split
 // into the volume name and the path within it. The URI is just the wire form;
-// this pair is what the StorageManager resolves against.
+// this pair is what the StorageService resolves against.
 pub struct VolumePath<'a> {
 	pub volume: &'a [u8],
 	pub path: &'a [u8],

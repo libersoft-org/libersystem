@@ -1,2 +1,2 @@
 MOTD:
-Files on this volume are served by the userspace StorageManager over vol://.
+Files on this volume are served by the userspace StorageService over vol://.

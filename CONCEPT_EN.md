@@ -194,7 +194,7 @@ Allow C/C++ only exceptionally for adopted libraries, temporary ports, or large 
 - SystemManager,
 - ServiceManager,
 - DeviceManager,
-- StorageManager,
+- StorageService,
 - Log/EventService,
 - System Graph,
 - CLI tools,
@@ -427,7 +427,7 @@ For the MVP, running on a single core is enough, but **the design must be multic
 | Area | Where it lives |
 |---|---|
 | filesystems | a filesystem driver service |
-| StorageManager / volumes | a userspace service |
+| StorageService / volumes | a userspace service |
 | USB stack | `driver.usb` |
 | NVMe/SATA/AHCI | driver services |
 | GPU driver | `driver.gpu` + `GraphicsService` |
@@ -525,7 +525,7 @@ root Domain
 ├── SystemManager
 │   ├── ServiceManager
 │   │   ├── LogService
-│   │   └── StorageManager
+│   │   └── StorageService
 │   └── DeviceManager Domain
 │       ├── driver.virtio-blk
 │       └── driver.virtio-net
@@ -630,7 +630,7 @@ handle(read|write|duplicate)  --duplicate(read)-->  handle(read)
 **Revocation.** Removing a right has two levels:
 
 - *closing a handle* (`handle_close`) - local, only the given process loses access,
-- *revoking the object* - the kernel invalidates *all* handles to the object (e.g. the StorageManager revokes access to a volume that is disappearing). Implemented via a generation counter / revocation on the object, so revocation is O(1) and cannot be bypassed.
+- *revoking the object* - the kernel invalidates *all* handles to the object (e.g. the StorageService revokes access to a volume that is disappearing). Implemented via a generation counter / revocation on the object, so revocation is O(1) and cannot be bypassed.
 
 **Sealing / typing.** A capability is always bound to the object's type; you cannot send a "MemoryObject where a Channel is expected". Type checking is done by the kernel, not the client.
 
@@ -887,9 +887,9 @@ The proposed system startup:
 3. The kernel creates the first AddressSpace.
 4. The kernel starts the first userspace process: SystemManager.
 5. SystemManager starts ServiceManager.
-6. ServiceManager starts DeviceManager, LogService, StorageManager.
+6. ServiceManager starts DeviceManager, LogService, StorageService.
 7. DeviceManager starts launching drivers.
-8. StorageManager makes the first volume available.
+8. StorageService makes the first volume available.
 9. The CLI or GUI starts as an ordinary component.
 ```
 
@@ -908,7 +908,7 @@ Our own boot code is limited to the necessary *boot glue* (taking over control f
 kernel
 SystemManager
 LogService
-StorageManager over a ramdisk
+StorageService over a ramdisk
 CLI shell
 ```
 
@@ -1571,7 +1571,7 @@ send the first message over IPC
 catch a page fault of a userspace process
 clean up a crashed process
 ramdisk/init package
-StorageManager over a ramdisk
+StorageService over a ramdisk
 vol:// access
 a simple CLI
 a basic System Graph
@@ -1621,7 +1621,7 @@ physical/virtual memory, heap, address spaces
 thread, scheduler (SMP-aware design, running on a single core for now), Channel IPC, handle table, capabilities, Domain
 start SystemManager, the first IPC message
 catching a page fault, cleanup of a crashed process
-ramdisk/init package, StorageManager over a ramdisk, vol:// access
+ramdisk/init package, StorageService over a ramdisk, vol:// access
 a simple CLI, a basic System Graph
 ```
 

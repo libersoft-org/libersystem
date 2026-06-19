@@ -29,10 +29,10 @@ struct Service {
 const N: usize = 3;
 
 // The core service manifest. The array order is deliberately NOT the start order:
-// DeviceManager and StorageManager are listed before LogService but both depend on
+// DeviceManager and StorageService are listed before LogService but both depend on
 // it, so the dependency resolver must start LogService first. This proves the
 // ordering is driven by declared dependencies, not by manifest position.
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_manager", deps: &[b"log_service"] }, Service { name: b"log_service", deps: &[] }];
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service"] }, Service { name: b"log_service", deps: &[] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -67,7 +67,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		None => exit(),
 	};
 
-	// 1b. receive the ramdisk volume buffer to hand to StorageManager when it starts.
+	// 1b. receive the ramdisk volume buffer to hand to StorageService when it starts.
 	let (ramdisk_handle, ramdisk_len): (u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"RAMDISK" => {
 			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
@@ -79,8 +79,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 2. bring the services up in dependency order. Each pass starts every pending
 	//    service whose dependencies are all Running; repeat until a pass makes no
 	//    progress (everything started, or what is left is blocked on a failed or
-	//    missing dependency). StorageManager's service-channel client end is kept
-	//    alive in `storage_client` so the manager stays standing after it reports in.
+	//    missing dependency). StorageService's service-channel client end is kept
+	//    alive in `storage_client` so the service stays standing after it reports in.
 	let mut state: [State; N] = [State::Pending; N];
 	let mut storage_client: u64 = 0;
 	loop {
@@ -99,7 +99,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	// 3. report in once the set is up. Keep `storage_client` alive until exit so
-	//    StorageManager's service channel does not peer-close out from under it.
+	//    StorageService's service channel does not peer-close out from under it.
 	unsafe {
 		send_blocking(bootstrap, b"ServiceManager: online", 0);
 	}
@@ -134,10 +134,10 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // channel, wait for its "online" report, and relay that report up to `up`. Returns
 // the resulting state (Running on success, Failed otherwise).
 //
-// StorageManager is bootstrapped specially: before it reports in, it needs the
+// StorageService is bootstrapped specially: before it reports in, it needs the
 // ramdisk volume and a service channel. We transfer the ramdisk capability and one
 // end of a fresh service channel to it, keeping the client end in `*storage_client`
-// so the manager stays standing (a closed client end would peer-close its service).
+// so the service stays standing (a closed client end would peer-close its service).
 unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, ramdisk_len: usize, storage_client: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
@@ -151,7 +151,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, r
 		if spawn(elf, service_side) < 0 {
 			return State::Failed;
 		}
-		if name == b"storage_manager" && !bootstrap_storage(manager_side, ramdisk, ramdisk_len, storage_client, buf) {
+		if name == b"storage_service" && !bootstrap_storage(manager_side, ramdisk, ramdisk_len, storage_client, buf) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -165,7 +165,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, r
 	}
 }
 
-// Hand StorageManager its ramdisk and a service channel over `manager_side`:
+// Hand StorageService its ramdisk and a service channel over `manager_side`:
 // "RAMDISK" + length transferring the volume buffer, then "SERVE" transferring one
 // end of a fresh service channel. The other end is stored in `*storage_client`.
 unsafe fn bootstrap_storage(manager_side: u64, ramdisk: u64, ramdisk_len: usize, storage_client: &mut u64, buf: &mut [u8]) -> bool {

@@ -69,7 +69,7 @@ fn conf_get<'a>(conf: &'a [(String, String)], key: &str) -> &'a str {
 
 // Assemble the init package that the kernel loads as a Limine module. The package
 // is a tiny archive (a header plus fixed-size entries plus the concatenated file
-// blobs) holding the userspace programs - SystemManager plus the StorageManager
+// blobs) holding the userspace programs - SystemManager plus the StorageService
 // and its demo client. It is written to boot/.build/init.pkg, where mkimage.sh
 // picks it up.
 //
@@ -86,7 +86,7 @@ fn assemble_init_package(conf: &[(String, String)]) {
 
 	// (package entry name, ELF path). The services and storage crates each produce
 	// several binaries.
-	let sources: [(&str, PathBuf); 6] = [("system_manager", manifest.join("../user/system_manager/target/x86_64-unknown-none/debug/system_manager")), ("service_manager", manifest.join("../user/services/target/x86_64-unknown-none/debug/service_manager")), ("log_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/log_service")), ("device_manager", manifest.join("../user/services/target/x86_64-unknown-none/debug/device_manager")), ("storage_manager", manifest.join("../user/storage/target/x86_64-unknown-none/debug/storage_manager")), ("storage_client", manifest.join("../user/storage/target/x86_64-unknown-none/debug/storage_client"))];
+	let sources: [(&str, PathBuf); 6] = [("system_manager", manifest.join("../user/system_manager/target/x86_64-unknown-none/debug/system_manager")), ("service_manager", manifest.join("../user/services/target/x86_64-unknown-none/debug/service_manager")), ("log_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/log_service")), ("device_manager", manifest.join("../user/services/target/x86_64-unknown-none/debug/device_manager")), ("storage_service", manifest.join("../user/storage/target/x86_64-unknown-none/debug/storage_service")), ("storage_client", manifest.join("../user/storage/target/x86_64-unknown-none/debug/storage_client"))];
 
 	fs::create_dir_all(&out_dir).unwrap_or_else(|e: std::io::Error| panic!("cannot create {}: {e}", out_dir.display()));
 
@@ -106,7 +106,7 @@ fn assemble_init_package(conf: &[(String, String)]) {
 // Assemble the ramdisk volume package: every regular file under src/volume is
 // packed into boot/.build/volume.pkg using the same archive format as the init
 // package, keyed by its file name. The kernel loads it as a second Limine module
-// and serves its files through the userspace StorageManager over vol://.
+// and serves its files through the userspace StorageService over vol://.
 fn assemble_volume_package(conf: &[(String, String)]) {
 	let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
 	let manifest: PathBuf = PathBuf::from(&manifest_dir);

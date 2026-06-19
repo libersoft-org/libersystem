@@ -1,11 +1,11 @@
-// StorageManager - a userspace service that resolves vol:// paths on a ramdisk.
+// StorageService - a userspace service that resolves vol:// paths on a ramdisk.
 //
 // The kernel loads this program from the init package into a ring-3 process and
 // hands it a bootstrap channel. Over that channel the kernel sends, in order:
 //   1. "RAMDISK" + the volume length, with a MemoryObject capability backing the
 //      ramdisk (a PKGARCH1 archive of the volume's files);
 //   2. "SERVE", with a channel capability on which clients send open requests.
-// The manager maps the ramdisk, then serves open requests until the client side
+// The service maps the ramdisk, then serves open requests until the client side
 // closes. Each request is [rights u32][vol:// URI]; the reply is [status u32]
 // [size u64], carrying a MemoryObject capability to a freshly filled buffer of
 // the file's bytes on success (status 0). The file content crosses as a shared
@@ -16,7 +16,7 @@
 
 use rt::*;
 
-// the single volume this manager serves; the URI's volume component must match
+// the single volume this service serves; the URI's volume component must match
 const VOLUME_NAME: &[u8] = b"system";
 
 // open reply status codes
@@ -39,7 +39,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		_ => exit(),
 	};
-	// 2. service endpoint: clients reach the manager here.
+	// 2. service endpoint: clients reach the service here.
 	let service: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => handle,
 		_ => exit(),
@@ -47,7 +47,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 3. report in over the bootstrap channel (the supervisor that started us is
 	//    listening there), then serve until the client side closes.
 	unsafe {
-		send_blocking(bootstrap, b"StorageManager: online", 0);
+		send_blocking(bootstrap, b"StorageService: online", 0);
 	}
 	loop {
 		match unsafe { recv_blocking(service, &mut buf) } {

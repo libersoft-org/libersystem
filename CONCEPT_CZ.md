@@ -194,7 +194,7 @@ C/C++ připustit jen výjimečně pro převzaté knihovny, dočasné porty nebo 
 - SystemManager,
 - ServiceManager,
 - DeviceManager,
-- StorageManager,
+- StorageService,
 - Log/EventService,
 - System Graph,
 - CLI nástroje,
@@ -427,7 +427,7 @@ Pro MVP stačí běh na jednom jádře, ale **návrh musí být multicore-ready 
 | Oblast | Kde je |
 |---|---|
 | filesystémy | filesystem driver služba |
-| StorageManager / volumes | userspace služba |
+| StorageService / volumes | userspace služba |
 | USB stack | `driver.usb` |
 | NVMe/SATA/AHCI | driver služby |
 | GPU driver | `driver.gpu` + `GraphicsService` |
@@ -525,7 +525,7 @@ root Domain
 ├── SystemManager
 │   ├── ServiceManager
 │   │   ├── LogService
-│   │   └── StorageManager
+│   │   └── StorageService
 │   └── DeviceManager Domain
 │       ├── driver.virtio-blk
 │       └── driver.virtio-net
@@ -630,7 +630,7 @@ handle(read|write|duplicate)  --duplicate(read)-->  handle(read)
 **Revokace.** Odebrání práva má dvě úrovně:
 
 - *zavření handlu* (`handle_close`) - lokální, jen daný proces ztrácí přístup,
-- *revoke objektu* - kernel zneplatní *všechny* handly na objekt (např. StorageManager odvolá přístup k volume, které mizí). Implementačně přes generační čítač / revocation u objektu, aby revokace byla O(1) a nešla obejít.
+- *revoke objektu* - kernel zneplatní *všechny* handly na objekt (např. StorageService odvolá přístup k volume, které mizí). Implementačně přes generační čítač / revocation u objektu, aby revokace byla O(1) a nešla obejít.
 
 **Sealing / typovost.** Capability je vždy svázaná s typem objektu, nelze poslat „MemoryObject tam, kde se čeká Channel“. Typovou kontrolu dělá kernel, ne klient.
 
@@ -887,9 +887,9 @@ Navržený start systému:
 3. Kernel vytvoří první AddressSpace.
 4. Kernel spustí první userspace proces: SystemManager.
 5. SystemManager spustí ServiceManager.
-6. ServiceManager spustí DeviceManager, LogService, StorageManager.
+6. ServiceManager spustí DeviceManager, LogService, StorageService.
 7. DeviceManager začne spouštět drivery.
-8. StorageManager zpřístupní první volume.
+8. StorageService zpřístupní první volume.
 9. CLI nebo GUI se spustí jako běžná komponenta.
 ```
 
@@ -908,7 +908,7 @@ Vlastní boot kód se omezí na nutné *boot glue* (převzetí řízení od boot
 kernel
 SystemManager
 LogService
-StorageManager nad ramdiskem
+StorageService nad ramdiskem
 CLI shell
 ```
 
@@ -1571,7 +1571,7 @@ poslat první zprávu přes IPC
 zachytit page fault userspace procesu
 uklidit spadlý proces
 ramdisk/init package
-StorageManager nad ramdiskem
+StorageService nad ramdiskem
 vol:// přístup
 jednoduché CLI
 základní System Graph
@@ -1621,7 +1621,7 @@ physical/virtual memory, heap, address spaces
 thread, scheduler (SMP-aware návrh, běh zatím na jednom jádře), Channel IPC, handle table, capabilities, Domain
 start SystemManager, první IPC zpráva
 zachycení page faultu, úklid spadlého procesu
-ramdisk/init package, StorageManager nad ramdiskem, vol:// přístup
+ramdisk/init package, StorageService nad ramdiskem, vol:// přístup
 jednoduché CLI, základní System Graph
 ```
 

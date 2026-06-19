@@ -2,14 +2,14 @@
 name = "storage"
 # The product version lives only in /product.conf; Cargo's optional package
 # version is unused here and omitted. The storage crate
-# produces the userspace StorageManager service and a small demo client, both
+# produces the userspace StorageService service and a small demo client, both
 # loaded from the init package.
 edition = "2024"
-description = "StorageManager service and demo client"
+description = "StorageService service and demo client"
 
 [[bin]]
-name = "storage_manager"
-path = "src/manager.rs"
+name = "storage_service"
+path = "src/service.rs"
 
 [[bin]]
 name = "storage_client"

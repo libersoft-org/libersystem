@@ -1,6 +1,6 @@
 // A minimal command shell over the serial port: read a line, dispatch a command,
 // print a typed result. The commands cover the phase-0 surface - inspect a
-// volume, read a file (which round-trips to the StorageManager service), and dump
+// volume, read a file (which round-trips to the StorageService service), and dump
 // the live System Graph. The shell is kernel-side for the MVP; a userspace CLI
 // component is later work.
 
@@ -48,7 +48,7 @@ fn help() {
 	crate::serial_println!("  graph                 dump the live System Graph");
 	crate::serial_println!("  ls                    list the available volumes");
 	crate::serial_println!("  ls <vol://volume>     list the files on a volume");
-	crate::serial_println!("  cat <vol://vol/path>  print a file (via StorageManager)");
+	crate::serial_println!("  cat <vol://vol/path>  print a file (via StorageService)");
 	crate::serial_println!("  reboot                reboot the machine");
 	crate::serial_println!("  poweroff              power the machine off");
 	crate::serial_println!("  exit                  stop the shell and halt");
@@ -113,7 +113,7 @@ fn list_volume(arg: &str) {
 	}
 }
 
-// `cat <vol://volume/path>`: read a file through the StorageManager and print it.
+// `cat <vol://volume/path>`: read a file through the StorageService and print it.
 fn print_file(arg: &str) {
 	let uri: &str = arg.trim();
 	if uri.is_empty() {

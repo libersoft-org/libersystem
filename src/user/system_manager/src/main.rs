@@ -33,7 +33,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 
-	// 1b. receive the ramdisk volume buffer to delegate to StorageManager. We never
+	// 1b. receive the ramdisk volume buffer to delegate to StorageService. We never
 	//     map it ourselves - just hold the capability and its length to pass down.
 	let (ramdisk_handle, ramdisk_len): (u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"RAMDISK" => {
