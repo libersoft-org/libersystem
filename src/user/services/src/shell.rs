@@ -11,6 +11,7 @@
 #![no_std]
 #![no_main]
 
+use rt::log::{FORMAT_JSON, FORMAT_TEXT, OP_QUERY, Severity};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -32,6 +33,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 
+	// 1b. receive the LogService client channel the `log` command queries.
+	let logsvc: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if handle != 0 && len >= 3 && &buf[..3] == b"LOG" => handle,
+		_ => exit(),
+	};
+
 	// 2. self-check: prove the StorageService round-trip works by reading a file.
 	if !unsafe { cat(storage, SELF_CHECK_URI, &mut buf) } {
 		exit();
@@ -44,7 +51,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 4. become the interactive console and run the read-eval-print loop.
 	unsafe {
-		repl(storage, &mut buf);
+		repl(storage, logsvc, &mut buf);
 	}
 	exit();
 }
@@ -53,7 +60,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // kernel feeds keystrokes on the channel; we line-edit them (echoing input,
 // handling backspace) and dispatch each completed line. Returns when the user
 // types `exit`.
-unsafe fn repl(storage: u64, buf: &mut [u8]) {
+unsafe fn repl(storage: u64, logsvc: u64, buf: &mut [u8]) {
 	unsafe {
 		// The kernel sends console input on `feed`; we receive it on `input`.
 		let (feed, input): (u64, u64) = match channel() {
@@ -75,7 +82,7 @@ unsafe fn repl(storage: u64, buf: &mut [u8]) {
 				match buf[i] {
 					b'\n' | b'\r' => {
 						print(b"\n");
-						if dispatch(&line[..len], storage, &mut work) {
+						if dispatch(&line[..len], storage, logsvc, &mut work) {
 							return;
 						}
 						len = 0;
@@ -103,7 +110,7 @@ unsafe fn repl(storage: u64, buf: &mut [u8]) {
 }
 
 // Dispatch one command line. Returns true if the shell should exit.
-unsafe fn dispatch(line: &[u8], storage: u64, work: &mut [u8]) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, work: &mut [u8]) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -118,7 +125,16 @@ unsafe fn dispatch(line: &[u8], storage: u64, work: &mut [u8]) -> bool {
 			print(b"  help             show this help\n");
 			print(b"  echo <text>      print text\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
+			print(b"  log [json]       show the system journal via LogService\n");
 			print(b"  exit             stop the shell and halt\n");
+			return false;
+		}
+		if line == b"log" {
+			query_log(logsvc, FORMAT_TEXT);
+			return false;
+		}
+		if line == b"log json" {
+			query_log(logsvc, FORMAT_JSON);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
@@ -139,6 +155,28 @@ unsafe fn dispatch(line: &[u8], storage: u64, work: &mut [u8]) -> bool {
 		print(line);
 		print(b" (try 'help')\n");
 		false
+	}
+}
+
+// Query LogService for the journal and print it, rendered in `format` (text or
+// JSON). The query asks for all severities (Trace and above).
+unsafe fn query_log(logsvc: u64, format: u8) {
+	unsafe {
+		let request: [u8; 3] = [OP_QUERY, format, Severity::Trace as u8];
+		if !send_blocking(logsvc, &request, 0) {
+			print(b"log: query failed\n");
+			return;
+		}
+		let mut reply: [u8; 1024] = [0u8; 1024];
+		match recv_blocking(logsvc, &mut reply) {
+			Received::Message { len, .. } => {
+				print(&reply[..len]);
+				if len == 0 || reply[len - 1] != b'\n' {
+					print(b"\n");
+				}
+			}
+			Received::Closed => print(b"log: service unavailable\n"),
+		}
 	}
 }
 

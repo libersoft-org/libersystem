@@ -151,6 +151,17 @@ pub unsafe fn channel() -> Option<(u64, u64)> {
 	}
 }
 
+// Read the monotonic clock (LAPIC ticks since boot), used to timestamp records.
+pub unsafe fn clock() -> u64 {
+	unsafe { syscall(SYS_CLOCK_GET, 0, 0, 0, 0) }
+}
+
+// Duplicate `handle` into a new handle carrying `rights` (a subset of the
+// original's). Returns the new handle, or a negative error.
+pub unsafe fn duplicate(handle: u64, rights: u32) -> i64 {
+	unsafe { syscall(SYS_HANDLE_DUPLICATE, handle, rights as u64, 0, 0) as i64 }
+}
+
 // Spawn a new ring-3 process from an ELF image and start it. `bootstrap` is an
 // object handle (0 = none) moved out of this process's table into the child's and
 // delivered to the child's first thread in rdi - the way a process is endowed with

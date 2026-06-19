@@ -16,6 +16,7 @@
 #![no_std]
 #![no_main]
 
+use rt::log::{self, Severity};
 use rt::*;
 
 // A service in the boot manifest: its package entry name and the names of the
@@ -89,12 +90,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut state: [State; N] = [State::Pending; N];
 	let mut channels: [u64; N] = [0u64; N];
 	let mut storage_client: u64 = 0;
+	let mut log_client: u64 = 0;
 	loop {
 		let mut progress: bool = false;
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
-				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, ramdisk_handle, ramdisk_len, &mut storage_client, &mut channels[i], &mut buf) };
+				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, ramdisk_handle, ramdisk_len, &mut storage_client, &mut log_client, &mut channels[i], &mut buf) };
 				progress = true;
 			}
 			i += 1;
@@ -107,10 +109,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 3. exercise the stop path on a leaf service. DeviceManager is the safe choice:
 	//    nothing depends on it, so stopping it does not tear down the running system
 	//    (stopping log_service, storage_service, or the interactive shell would).
-	//    This proves the supervisor can stop a service and track the transition.
+	//    This proves the supervisor can stop a service and track the transition, and
+	//    the transition is recorded in the journal like the startup events.
 	if let Some(dev) = index_of(b"device_manager") {
 		if state[dev] == State::Running {
 			state[dev] = unsafe { stop_service(channels[dev], bootstrap, &mut buf) };
+			unsafe { emit_event(log_client, b"device_manager", b"stopped", &mut buf) };
 		}
 	}
 
@@ -169,11 +173,14 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // channel, wait for its "online" report, and relay that report up to `up`. Returns
 // the resulting state (Running on success, Failed otherwise).
 //
-// Two services are bootstrapped specially before they report in: StorageService
-// needs the ramdisk volume and a service channel (we keep the client end in
-// `*storage_client`); the shell needs that StorageService client channel, which we
-// transfer to it so its `cat` can round-trip to the service over IPC.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, ramdisk_len: usize, storage_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+// Three services are bootstrapped specially before they report in: LogService is
+// handed the channel its clients reach it on (we keep the client end in
+// `*log_client`); StorageService needs the ramdisk volume and a service channel
+// (we keep the client end in `*storage_client`); the shell needs both client
+// channels - the StorageService one so its `cat` round-trips, the LogService one so
+// its `log` command can query the journal. Once a service reports in, the
+// supervisor records a structured "online" event in the journal.
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, ramdisk_len: usize, storage_client: &mut u64, log_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -186,10 +193,13 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, r
 		if spawn(elf, service_side) < 0 {
 			return State::Failed;
 		}
+		if name == b"log_service" && !bootstrap_log(manager_side, log_client) {
+			return State::Failed;
+		}
 		if name == b"storage_service" && !bootstrap_storage(manager_side, ramdisk, ramdisk_len, storage_client, buf) {
 			return State::Failed;
 		}
-		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client) {
+		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -198,10 +208,37 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, r
 				// keep its report channel as the control channel used to stop it later.
 				send_blocking(up, &buf[..len], 0);
 				*control = manager_side;
+				// Record the lifecycle event in the journal (LogService is up by now).
+				emit_event(*log_client, name, b"online", buf);
 				State::Running
 			}
 			Received::Closed => State::Failed,
 		}
+	}
+}
+
+// Emit one structured LogRecord to LogService over the `log_client` channel: an
+// Info record tagged with the service `source` and an `event` field (e.g.
+// "online"/"stopped"). A no-op until LogService is up (log_client == 0). The
+// supervisor logs service lifecycle the way systemd journals unit start/stop.
+unsafe fn emit_event(log_client: u64, source: &[u8], event: &[u8], buf: &mut [u8]) {
+	unsafe {
+		if log_client == 0 {
+			return;
+		}
+		let mut wire: [u8; 160] = [0u8; 160];
+		let fields: [(&[u8], &[u8]); 1] = [(b"event", event)];
+		let n: usize = match log::encode(clock(), Severity::Info, source, &fields, &mut wire) {
+			Some(n) => n,
+			None => return,
+		};
+		// EMIT request: [OP_EMIT][record wire bytes].
+		if 1 + n > buf.len() {
+			return;
+		}
+		buf[0] = log::OP_EMIT;
+		buf[1..1 + n].copy_from_slice(&wire[..n]);
+		send_blocking(log_client, &buf[..1 + n], 0);
 	}
 }
 
@@ -220,11 +257,39 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 	}
 }
 
-// Hand the shell the StorageService client channel so it can talk to the service
-// over IPC (its `cat` round-trips through it). Transfers `storage_client` to the
-// shell over `manager_side`; the shell then owns that endpoint.
-unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64) -> bool {
-	unsafe { send_blocking(manager_side, b"STORAGE", storage_client) }
+// Hand the shell both client channels it needs: the StorageService one (so its
+// `cat` round-trips to storage over IPC) and a LogService one (so its `log`
+// command can query the journal). The StorageService client is transferred (the
+// shell becomes its sole owner); the LogService client is *duplicated* and the
+// copy transferred, since the supervisor keeps emitting on the original.
+unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64) -> bool {
+	unsafe {
+		if !send_blocking(manager_side, b"STORAGE", storage_client) {
+			return false;
+		}
+		let log_dup: i64 = duplicate(log_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		if log_dup < 0 {
+			return false;
+		}
+		send_blocking(manager_side, b"LOG", log_dup as u64)
+	}
+}
+
+// Hand LogService the channel its clients reach it on: "SERVE" transferring one end
+// of a fresh service channel. The other end is kept in `*log_client`, which the
+// supervisor emits records on and later shares with the shell.
+unsafe fn bootstrap_log(manager_side: u64, log_client: &mut u64) -> bool {
+	unsafe {
+		let (service_server, service_client): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"SERVE", service_server) {
+			return false;
+		}
+		*log_client = service_client;
+		true
+	}
 }
 
 // Hand StorageService its ramdisk and a service channel over `manager_side`:
