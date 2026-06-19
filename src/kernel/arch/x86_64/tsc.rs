@@ -8,12 +8,9 @@
 
 #![allow(dead_code)]
 
-use super::port::{inb, outb};
+use super::pit;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
-
-// The PIT runs at a fixed 1.193182 MHz.
-const PIT_FREQ: u32 = 1_193_182;
 
 // Calibrated TSC frequency in Hz (cycles per second); 0 until init() runs.
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
@@ -39,24 +36,12 @@ pub fn now() -> u64 {
 // apic::calibrate(); the two run sequentially on the BSP, never concurrently.
 pub fn init() {
 	const WINDOW_HZ: u32 = 100; // a 10 ms measurement window
-	let pit_count = (PIT_FREQ / WINDOW_HZ) as u16;
+	let pit_count = (pit::FREQ / WINDOW_HZ) as u16;
 	let cycles = unsafe {
-		// Enable the channel-2 gate, disable the speaker output.
-		outb(0x61, (inb(0x61) & 0xfc) | 0x01);
-		// Channel 2, lobyte/hibyte access, mode 0 (interrupt on terminal count).
-		outb(0x43, 0b1011_0000);
-		outb(0x42, (pit_count & 0xff) as u8);
-		outb(0x42, (pit_count >> 8) as u8);
-		// Toggle the gate low->high to start the count from the loaded value.
-		let gate = inb(0x61) & 0xfe;
-		outb(0x61, gate);
-		outb(0x61, gate | 0x01);
+		pit::arm_one_shot(pit_count);
 
 		let start = now();
-		// Wait for the PIT channel-2 output (port 0x61 bit 5) to go high.
-		while inb(0x61) & 0x20 == 0 {
-			core::hint::spin_loop();
-		}
+		pit::wait_terminal();
 		now().wrapping_sub(start)
 	};
 	// cycles elapsed in 1/WINDOW_HZ seconds, so cycles * WINDOW_HZ = cycles/sec.

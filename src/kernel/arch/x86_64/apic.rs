@@ -10,11 +10,9 @@
 
 #![allow(dead_code)]
 
-use super::port::{inb, outb};
+use super::port::outb;
+use super::{msr, paging, pit};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-
-use super::msr;
-use super::paging;
 
 // IA32_APIC_BASE model-specific register.
 const IA32_APIC_BASE_MSR: u32 = 0x1b;
@@ -36,9 +34,6 @@ const TIMER_DIVIDE_16: u32 = 0x3;
 
 // Desired periodic tick rate.
 const TIMER_HZ: u32 = 100;
-
-// PIT runs at a fixed 1.193182 MHz.
-const PIT_FREQ: u32 = 1_193_182;
 
 // Virtual address where the LAPIC MMIO page is mapped (its own dedicated page,
 // since Limine's HHDM does not cover the LAPIC MMIO region).
@@ -122,29 +117,15 @@ fn start_timer() {
 // Measure how many LAPIC timer ticks elapse in one timer period (1 / TIMER_HZ),
 // using the PIT channel 2 one-shot as the reference clock.
 fn calibrate() -> u32 {
-	let pit_count = (PIT_FREQ / TIMER_HZ) as u16;
+	let pit_count = (pit::FREQ / TIMER_HZ) as u16;
 	unsafe {
-		// Enable the channel-2 gate, disable the speaker output.
-		outb(0x61, (inb(0x61) & 0xfc) | 0x01);
-
-		// Channel 2, lobyte/hibyte access, mode 0 (interrupt on terminal count).
-		outb(0x43, 0b1011_0000);
-		outb(0x42, (pit_count & 0xff) as u8);
-		outb(0x42, (pit_count >> 8) as u8);
-
-		// Toggle the gate low->high to (re)start the count from the loaded value.
-		let gate = inb(0x61) & 0xfe;
-		outb(0x61, gate);
-		outb(0x61, gate | 0x01);
+		pit::arm_one_shot(pit_count);
 
 		// Run the LAPIC timer down from the maximum while the PIT counts.
 		write(REG_TIMER_DIVIDE, TIMER_DIVIDE_16);
 		write(REG_TIMER_INITIAL, 0xffff_ffff);
 
-		// Wait for the PIT channel-2 output (port 0x61 bit 5) to go high.
-		while inb(0x61) & 0x20 == 0 {
-			core::hint::spin_loop();
-		}
+		pit::wait_terminal();
 
 		let elapsed = 0xffff_ffff - read(REG_TIMER_CURRENT);
 		write(REG_LVT_TIMER, LVT_MASKED);

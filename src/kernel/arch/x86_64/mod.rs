@@ -6,6 +6,7 @@ pub mod interrupts;
 pub mod msr;
 pub mod paging;
 pub mod percpu;
+mod pit;
 mod port;
 pub mod serial;
 pub mod syscall;
