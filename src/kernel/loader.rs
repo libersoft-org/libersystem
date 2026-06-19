@@ -14,17 +14,13 @@ use crate::arch;
 use crate::elf::{self, ElfError};
 use crate::mem::frame::{self, PAGE_SIZE};
 use crate::mem::hhdm_offset;
+use crate::memlayout::{USER_STACK_PAGES, USER_STACK_TOP};
 use crate::object::KernelObject;
 use crate::object::address_space::AddressSpace;
 use crate::object::domain::Domain;
 use crate::object::process::Process;
 use crate::object::rights::Rights;
 use crate::sched;
-
-// The user stack lives just below the 2 GiB line, well above the program's load
-// address and clear of the kernel's higher half. It grows down from the top.
-const USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
-const USER_STACK_PAGES: u64 = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LoadError {

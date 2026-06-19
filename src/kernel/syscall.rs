@@ -18,6 +18,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::memlayout::{KERNEL_MMAP_BASE, USER_MMAP_BASE, USER_VA_END};
+
 use crate::arch;
 use crate::fault::FaultInfo;
 use crate::mem::frame::PAGE_SIZE;
@@ -48,11 +50,6 @@ pub struct ObjectInfo {
 	pub generation: u32,
 }
 
-// Exclusive upper bound of the user (lower-half) virtual-address range. A syscall
-// issued from ring 3 may only hand the kernel pointers below this; a kernel
-// self-call (invoke) is trusted and skips the check.
-const USER_VA_END: u64 = 0x0000_8000_0000_0000;
-
 // Validate a caller-supplied buffer. Always accepts kernel self-calls; for a
 // ring-3 caller it requires the whole [ptr, ptr+len) range to lie in user space.
 fn user_buf_ok(ptr: u64, len: u64) -> bool {
@@ -73,7 +70,6 @@ fn user_buf_ok(ptr: u64, len: u64) -> bool {
 
 // Kernel virtual-address window for syscall-mapped MemoryObjects. A bump pointer
 // hands out non-overlapping ranges; M6 does not reclaim this address space.
-const KERNEL_MMAP_BASE: u64 = 0xffff_e800_0000_0000;
 static MMAP_NEXT: AtomicU64 = AtomicU64::new(KERNEL_MMAP_BASE);
 
 fn alloc_kernel_vrange(len: u64) -> u64 {
@@ -82,11 +78,8 @@ fn alloc_kernel_vrange(len: u64) -> u64 {
 
 // User virtual-address window for ring-3 syscall-mapped MemoryObjects. Like the
 // kernel window a bump pointer hands out non-overlapping ranges and does not
-// reclaim them. The base sits far above the program and stack the loader places
-// below the 2 GiB line, yet within the user (lower) half, so user_buf_ok still
-// accepts buffers carved from it. Each process maps into its own page tables, so
-// the same range is private per address space even though the bump is global.
-const USER_MMAP_BASE: u64 = 0x0000_4000_0000_0000;
+// reclaim them. Each process maps into its own page tables, so the same range is
+// private per address space even though the bump is global.
 static USER_MMAP_NEXT: AtomicU64 = AtomicU64::new(USER_MMAP_BASE);
 
 fn alloc_user_vrange(len: u64) -> u64 {

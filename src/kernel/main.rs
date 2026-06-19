@@ -15,6 +15,7 @@ mod fault;
 mod graph;
 mod loader;
 mod mem;
+mod memlayout;
 mod object;
 mod panic;
 mod pkg;
@@ -438,8 +439,7 @@ extern "C" fn ipc_zero_copy_thread(_arg: u64) {
 // Userspace (ring 3) page layout for the demo and test: one USER page for the
 // program, one for its stack, mapped into the low half of the shared address
 // space (per-process page tables / CR3 isolation are a later milestone).
-const USER_CODE_VA: u64 = 0x0000_0000_4000_0000;
-const USER_STACK_VA: u64 = 0x0000_0000_4001_0000;
+use crate::memlayout::{USER_CODE_VA, USER_STACK_VA};
 
 // Kernel-thread body that runs a ring-3 program. It maps a USER code and stack
 // page, copies the embedded position-independent program in, and drops to ring 3

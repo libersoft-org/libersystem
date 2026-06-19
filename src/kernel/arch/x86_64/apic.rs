@@ -45,14 +45,6 @@ static LAPIC_BASE: AtomicUsize = AtomicUsize::new(0);
 // Monotonic timer tick counter.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
-fn rdmsr(msr: u32) -> u64 {
-	msr::read(msr)
-}
-
-fn wrmsr(msr: u32, value: u64) {
-	msr::write(msr, value);
-}
-
 fn read(reg: u32) -> u32 {
 	let base = LAPIC_BASE.load(Ordering::Relaxed);
 	unsafe { ((base + reg as usize) as *const u32).read_volatile() }
@@ -79,9 +71,9 @@ pub fn init() {
 
 	// Globally enable the LAPIC and map its MMIO page (uncacheable). The HHDM
 	// does not cover MMIO, so we map the page explicitly with our own paging.
-	let base_msr = rdmsr(IA32_APIC_BASE_MSR);
+	let base_msr = msr::read(IA32_APIC_BASE_MSR);
 	let phys = base_msr & APIC_BASE_ADDR_MASK;
-	wrmsr(IA32_APIC_BASE_MSR, base_msr | APIC_BASE_ENABLE);
+	msr::write(IA32_APIC_BASE_MSR, base_msr | APIC_BASE_ENABLE);
 	paging::map_page(LAPIC_VIRT, phys, paging::WRITABLE | paging::NO_CACHE);
 	LAPIC_BASE.store(LAPIC_VIRT as usize, Ordering::Relaxed);
 
@@ -98,8 +90,8 @@ pub fn init() {
 // software-enables its own LAPIC and sets the spurious vector. APs do not start
 // the periodic timer in M3 (the PIT calibration path is BSP-only).
 pub fn init_ap() {
-	let base_msr = rdmsr(IA32_APIC_BASE_MSR);
-	wrmsr(IA32_APIC_BASE_MSR, base_msr | APIC_BASE_ENABLE);
+	let base_msr = msr::read(IA32_APIC_BASE_MSR);
+	msr::write(IA32_APIC_BASE_MSR, base_msr | APIC_BASE_ENABLE);
 	write(REG_SVR, SVR_ENABLE | super::interrupts::SPURIOUS_VECTOR as u32);
 }
 
