@@ -1363,6 +1363,53 @@ fn interrupt_bind_delivers_to_driver() {
 
 #[cfg(test)]
 #[test_case]
+fn object_property_set_names_an_object() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use object::KernelObject;
+	use object::event::Event;
+	use object::rights::Rights;
+	static DONE: AtomicBool = AtomicBool::new(false);
+	const NAME: &[u8] = b"irq-driver";
+	extern "C" fn body(handle: u64) {
+		unsafe {
+			let r = arch::syscall::invoke(syscall::SYS_OBJECT_PROPERTY_SET, handle, syscall::PROP_NAME, NAME.as_ptr() as u64, NAME.len() as u64);
+			assert_eq!(r as i64, 0, "set name failed");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	let event = Event::create();
+	// The driver thread holds a handle to this same Event; the test keeps an Arc to
+	// read the label back after the thread names it.
+	sched::spawn_with_object(body, event.clone(), Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+	assert_eq!(event.header().name().as_deref(), Some("irq-driver"));
+}
+
+#[cfg(test)]
+#[test_case]
+fn object_property_set_bounds_a_domain() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use object::domain::{Domain, UNLIMITED};
+	use object::rights::Rights;
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(handle: u64) {
+		unsafe {
+			// Set the Domain's memory limit to 8192 bytes via the property syscall.
+			let r = arch::syscall::invoke(syscall::SYS_OBJECT_PROPERTY_SET, handle, syscall::PROP_MEMORY_LIMIT, 8192, 0);
+			assert_eq!(r as i64, 0, "set memory limit failed");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	let domain = Domain::new(UNLIMITED, UNLIMITED, UNLIMITED);
+	sched::spawn_with_object(body, domain.clone(), Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+	assert_eq!(domain.account().memory().limit(), 8192);
+}
+
+#[cfg(test)]
+#[test_case]
 fn channel_message_and_capability_transfer() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	static OK: AtomicBool = AtomicBool::new(false);

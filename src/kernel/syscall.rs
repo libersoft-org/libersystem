@@ -40,7 +40,7 @@ use crate::sched;
 // kernel/userspace ABI: defined once in the abi crate (the single source of
 // truth) and re-exported here so the rest of the kernel keeps referring to them
 // as `syscall::SYS_*` / `syscall::ERR_*` / `syscall::sys_is_err`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_RANDOM_GET, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_RANDOM_GET, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
 
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. repr(C) with only
@@ -119,6 +119,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_DEVICE_MEMORY_MAP => sys_device_memory_map(a0),
 		SYS_RANDOM_GET => sys_random_get(a0, a1),
 		SYS_INTERRUPT_BIND => sys_interrupt_bind(a0),
+		SYS_OBJECT_PROPERTY_SET => sys_object_property_set(a0, a1, a2, a3),
 		SYS_MEMORY_MAP => sys_memory_map(a0),
 		SYS_MEMORY_UNMAP => sys_memory_unmap(a0),
 		SYS_HANDLE_DUPLICATE => sys_handle_duplicate(a0, a1),
@@ -262,6 +263,58 @@ fn sys_interrupt_bind(vector: u64) -> i64 {
 		Some(handle) => handle.raw() as i64,
 		None => ERR_RESOURCE_EXHAUSTED,
 	}
+}
+
+// Set a property on an object: a human-readable name (PROP_NAME; a2 = name
+// pointer, a3 = name length, max 64 bytes UTF-8), or a Domain resource-counter
+// limit (PROP_*_LIMIT; a2 = the new limit). Both require the MANAGE right on the
+// handle; limit properties require the handle to name a Domain.
+fn sys_object_property_set(handle: u64, prop: u64, a2: u64, a3: u64) -> i64 {
+	let thread = match sched::current_thread() {
+		Some(t) => t,
+		None => return ERR_NO_THREAD,
+	};
+	if prop == PROP_NAME {
+		const MAX_NAME: u64 = 64;
+		let (ptr, len) = (a2, a3);
+		if len == 0 || len > MAX_NAME || !user_buf_ok(ptr, len) {
+			return ERR_INVALID;
+		}
+		let object = {
+			let table = thread.handles().lock();
+			match table.lookup(Handle::from_raw(handle), Rights::MANAGE) {
+				Ok(o) => o,
+				Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
+				Err(_) => return ERR_BAD_HANDLE,
+			}
+		};
+		let mut buf = [0u8; MAX_NAME as usize];
+		unsafe {
+			core::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len as usize);
+		}
+		let name = match core::str::from_utf8(&buf[..len as usize]) {
+			Ok(s) => s,
+			Err(_) => return ERR_INVALID,
+		};
+		object.header().set_name(name);
+		return 0;
+	}
+	// The remaining properties set a Domain resource limit.
+	let object = match current_object(handle, ObjectType::Domain, Rights::MANAGE) {
+		Ok(o) => o,
+		Err(e) => return e,
+	};
+	let domain = object.as_any().downcast_ref::<Domain>().expect("type checked by lookup_typed");
+	let counter = match prop {
+		PROP_MEMORY_LIMIT => domain.account().memory(),
+		PROP_HANDLE_LIMIT => domain.account().handles(),
+		PROP_THREAD_LIMIT => domain.account().threads(),
+		PROP_DMA_LIMIT => domain.account().dma(),
+		PROP_IPC_QUEUE_LIMIT => domain.account().ipc_queue(),
+		_ => return ERR_INVALID,
+	};
+	counter.set_limit(a2);
+	0
 }
 
 // Map a MemoryObject into the kernel address space, returning its virtual base.

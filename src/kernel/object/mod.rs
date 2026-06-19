@@ -21,8 +21,11 @@ pub mod rights;
 pub mod thread;
 pub mod timer;
 
+use alloc::string::String;
 use core::any::Any;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use crate::sync::SpinLock;
 
 // The set of object types the kernel knows. The type is bound into every
 // capability so the kernel can reject a wrongly-typed handle ("sealing").
@@ -89,16 +92,29 @@ fn next_koid() -> u64 {
 pub struct ObjectHeader {
 	koid: u64,
 	generation: AtomicU32,
+	// Optional human-readable label set via object_property_set, for the System
+	// Graph and debugging. None until named.
+	name: SpinLock<Option<String>>,
 }
 
 impl ObjectHeader {
 	pub fn new() -> Self {
-		Self { koid: next_koid(), generation: AtomicU32::new(1) }
+		Self { koid: next_koid(), generation: AtomicU32::new(1), name: SpinLock::new(None) }
 	}
 
 	// Stable, unique identity for this object (useful for debugging and info).
 	pub fn koid(&self) -> u64 {
 		self.koid
+	}
+
+	// Set this object's human-readable label.
+	pub fn set_name(&self, name: &str) {
+		*self.name.lock() = Some(String::from(name));
+	}
+
+	// This object's label, if one was set.
+	pub fn name(&self) -> Option<String> {
+		self.name.lock().clone()
 	}
 
 	// Current revocation generation. Capabilities snapshot this at mint time and

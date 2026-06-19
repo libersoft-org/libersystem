@@ -41,6 +41,17 @@ pub const SYS_DMA_BUFFER_CREATE: u64 = 24;
 pub const SYS_DEVICE_MEMORY_MAP: u64 = 25;
 pub const SYS_RANDOM_GET: u64 = 26;
 pub const SYS_INTERRUPT_BIND: u64 = 27;
+pub const SYS_OBJECT_PROPERTY_SET: u64 = 28;
+
+// object_property_set property selectors. PROP_NAME sets an object's label (arg2 =
+// name pointer, arg3 = length); the PROP_*_LIMIT selectors set a Domain resource
+// counter's limit (arg2 = the new limit).
+pub const PROP_NAME: u64 = 0;
+pub const PROP_MEMORY_LIMIT: u64 = 1;
+pub const PROP_HANDLE_LIMIT: u64 = 2;
+pub const PROP_THREAD_LIMIT: u64 = 3;
+pub const PROP_DMA_LIMIT: u64 = 4;
+pub const PROP_IPC_QUEUE_LIMIT: u64 = 5;
 
 // Error codes (Linux-style: a successful call returns its value, an error returns
 // a small negative in the reserved band [-4095, -1]).
