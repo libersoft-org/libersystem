@@ -1274,6 +1274,67 @@ fn syscall_object_and_handle_ops() {
 
 #[cfg(test)]
 #[test_case]
+fn device_memory_maps_mmio_region() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use object::device_memory::DeviceMemory;
+	use object::rights::Rights;
+	const MARK: u64 = 0xfeed_face_dead_beef;
+	static DONE: AtomicBool = AtomicBool::new(false);
+	// A driver maps a DeviceMemory capability (a physical MMIO region) into its
+	// address space and reads/writes through the mapping. A freshly allocated RAM
+	// frame is a controllable stand-in for device registers; only the uncacheable
+	// mapping is exercised (no concurrent cached access to the same frame).
+	extern "C" fn body(device_handle: u64) {
+		unsafe {
+			let va = arch::syscall::invoke(syscall::SYS_DEVICE_MEMORY_MAP, device_handle, 0, 0, 0);
+			assert!(!syscall::sys_is_err(va), "device memory did not map");
+			let ptr = va as *mut u64;
+			ptr.write_volatile(MARK);
+			assert_eq!(ptr.read_volatile(), MARK, "the mapped MMIO region is not read/write");
+			// A second map of the same region is rejected (one mapping per object).
+			let again = arch::syscall::invoke(syscall::SYS_DEVICE_MEMORY_MAP, device_handle, 0, 0, 0);
+			assert_eq!(again as i64, syscall::ERR_INVALID);
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	let phys = mem::frame::allocate().expect("a frame for the stand-in MMIO region");
+	let device = DeviceMemory::new(phys, mem::frame::PAGE_SIZE as usize);
+	// Hand the capability to the driver thread as its bootstrap handle.
+	sched::spawn_with_object(body, device, Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "device-memory mapping thread did not finish");
+	// The thread (and its handle table) is reaped by run_until_idle, dropping the
+	// DeviceMemory and tearing its mapping down, so the frame is free to reclaim.
+	mem::frame::deallocate(phys);
+}
+
+#[cfg(test)]
+#[test_case]
+fn random_get_fills_distinct_bytes() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let mut a = [0u8; 32];
+			let mut b = [0u8; 32];
+			let na = arch::syscall::invoke(syscall::SYS_RANDOM_GET, a.as_mut_ptr() as u64, a.len() as u64, 0, 0);
+			let nb = arch::syscall::invoke(syscall::SYS_RANDOM_GET, b.as_mut_ptr() as u64, b.len() as u64, 0, 0);
+			assert_eq!(na as usize, a.len(), "random_get did not fill the whole buffer");
+			assert_eq!(nb as usize, b.len());
+			// The buffer was actually written, and two draws differ (a false failure
+			// is a 1-in-2^256 event).
+			assert_ne!(a, [0u8; 32], "random_get left the buffer zeroed");
+			assert_ne!(a, b, "two random draws were identical");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+}
+
+#[cfg(test)]
+#[test_case]
 fn channel_message_and_capability_transfer() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	static OK: AtomicBool = AtomicBool::new(false);
@@ -1739,6 +1800,43 @@ fn dma_buffer_quota_enforced_cleanly() {
 	assert!(DONE.load(Ordering::SeqCst), "DMA quota test thread did not finish");
 	// Every buffer was closed, so the pinned-DMA quota is back to zero.
 	assert_eq!(domain.account().dma().used(), 0);
+}
+
+#[cfg(test)]
+#[test_case]
+fn ipc_queue_bytes_accounting_enforced() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use object::domain::{Domain, UNLIMITED};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	// A thread in a Domain capped at 250 bytes of in-transit IPC. Each 100-byte
+	// send charges the sender's queue, so two fit and the third is refused
+	// (WOULD_BLOCK); receiving one refunds the quota, so a send fits again.
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let mut handles = [0u64; 2];
+			let created = arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, handles.as_mut_ptr() as u64, handles.as_mut_ptr().add(1) as u64, 0, 0);
+			assert_eq!(created as i64, 0, "channel create failed");
+			let (h0, h1) = (handles[0], handles[1]);
+			let payload = [0u8; 100];
+			let p = payload.as_ptr() as u64;
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, h0, p, 100, 0) as i64, 0);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, h0, p, 100, 0) as i64, 0);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, h0, p, 100, 0) as i64, syscall::ERR_WOULD_BLOCK, "the third send should hit the queue cap");
+			// Receiving one message refunds the sender's queue, so a send fits again.
+			let mut buf = [0u8; 128];
+			let n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, h1, buf.as_mut_ptr() as u64, 128, 0);
+			assert_eq!(n as i64, 100);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, h0, p, 100, 0) as i64, 0, "a send fits after a recv refund");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	let domain = Domain::new(UNLIMITED, UNLIMITED, UNLIMITED);
+	domain.account().ipc_queue().set_limit(250);
+	assert!(sched::spawn_in(domain.clone(), body, 0).is_some());
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "ipc queue test thread did not finish");
+	// The thread and its channels are reaped, refunding every undelivered message.
+	assert_eq!(domain.account().ipc_queue().used(), 0);
 }
 
 #[cfg(test)]

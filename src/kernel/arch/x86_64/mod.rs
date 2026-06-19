@@ -8,6 +8,7 @@ pub mod paging;
 pub mod percpu;
 mod pit;
 mod port;
+pub mod random;
 pub mod serial;
 pub mod syscall;
 pub mod tsc;

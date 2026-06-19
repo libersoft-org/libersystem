@@ -100,11 +100,15 @@ pub struct ResourceAccount {
 	// Pinned DMA memory (bytes) held by this Domain's DmaBuffers. Uncapped by
 	// default; a cap is set explicitly so a DMA over-cap fails cleanly.
 	dma: ResourceCounter,
+	// Bytes of in-transit IPC messages charged to this Domain as the sender, until
+	// the receiver takes each message. Uncapped by default; a cap bounds how much a
+	// sender can queue (anti-DoS backpressure).
+	ipc_queue: ResourceCounter,
 }
 
 impl ResourceAccount {
 	const fn new(memory_limit: u64, handle_limit: u64, thread_limit: u64) -> Self {
-		Self { memory: ResourceCounter::new(memory_limit), handles: ResourceCounter::new(handle_limit), threads: ResourceCounter::new(thread_limit), dma: ResourceCounter::new(UNLIMITED) }
+		Self { memory: ResourceCounter::new(memory_limit), handles: ResourceCounter::new(handle_limit), threads: ResourceCounter::new(thread_limit), dma: ResourceCounter::new(UNLIMITED), ipc_queue: ResourceCounter::new(UNLIMITED) }
 	}
 
 	pub fn memory(&self) -> &ResourceCounter {
@@ -113,6 +117,10 @@ impl ResourceAccount {
 
 	pub fn dma(&self) -> &ResourceCounter {
 		&self.dma
+	}
+
+	pub fn ipc_queue(&self) -> &ResourceCounter {
+		&self.ipc_queue
 	}
 
 	pub fn handles(&self) -> &ResourceCounter {
@@ -139,6 +147,15 @@ impl ResourceAccount {
 
 	pub fn uncharge_dma(&self, bytes: u64) {
 		self.dma.uncharge(bytes);
+	}
+
+	// Charge `bytes` of in-transit IPC, enforcing the queue cap.
+	pub fn try_charge_ipc_queue(&self, bytes: u64) -> bool {
+		self.ipc_queue.try_charge(bytes)
+	}
+
+	pub fn uncharge_ipc_queue(&self, bytes: u64) {
+		self.ipc_queue.uncharge(bytes);
 	}
 
 	// Charge one handle, enforcing the cap (for handle-creating syscalls).
@@ -314,6 +331,26 @@ impl Domain {
 		self.account.uncharge_dma(bytes);
 		if let Some(parent) = self.parent() {
 			parent.uncharge_dma(bytes);
+		}
+	}
+
+	pub fn try_charge_ipc_queue(&self, bytes: u64) -> bool {
+		if !self.account.try_charge_ipc_queue(bytes) {
+			return false;
+		}
+		if let Some(parent) = self.parent() {
+			if !parent.try_charge_ipc_queue(bytes) {
+				self.account.uncharge_ipc_queue(bytes);
+				return false;
+			}
+		}
+		true
+	}
+
+	pub fn uncharge_ipc_queue(&self, bytes: u64) {
+		self.account.uncharge_ipc_queue(bytes);
+		if let Some(parent) = self.parent() {
+			parent.uncharge_ipc_queue(bytes);
 		}
 	}
 

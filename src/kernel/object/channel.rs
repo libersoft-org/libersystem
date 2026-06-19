@@ -19,6 +19,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 
+use super::domain::Domain;
 use super::handle::Capability;
 use super::{KernelObject, ObjectHeader, ObjectType};
 use crate::sched;
@@ -44,11 +45,35 @@ pub struct Message {
 	pub bytes: Vec<u8>,
 	pub caps: Vec<Capability>,
 	pub badge: u64,
+	// The sender's Domain charged for this message's queued bytes (and the amount),
+	// refunded when the message is taken (recv) or dropped (channel close). None when
+	// the send was not accounted (internal kernel IPC).
+	queue_charge: Option<(Arc<Domain>, u64)>,
 }
 
 impl Message {
 	pub fn new(bytes: Vec<u8>, caps: Vec<Capability>, badge: u64) -> Self {
-		Self { bytes, caps, badge }
+		Self { bytes, caps, badge, queue_charge: None }
+	}
+
+	// Charge this message's byte length to `domain`'s in-transit IPC quota, to be
+	// held until the message is taken or dropped. Returns false (charging nothing)
+	// if `domain` is at its queue cap - the backpressure signal.
+	fn charge_queue(&mut self, domain: &Arc<Domain>) -> bool {
+		let bytes = self.bytes.len() as u64;
+		if !domain.try_charge_ipc_queue(bytes) {
+			return false;
+		}
+		self.queue_charge = Some((domain.clone(), bytes));
+		true
+	}
+
+	// Refund and clear any queued-bytes charge. Called when the message leaves the
+	// queue: by recv on the way out, or when a closing endpoint drops its inbox.
+	fn take_queue_charge(&mut self) {
+		if let Some((domain, bytes)) = self.queue_charge.take() {
+			domain.uncharge_ipc_queue(bytes);
+		}
 	}
 }
 
@@ -87,13 +112,31 @@ impl Channel {
 	}
 
 	// Deliver a message to the peer's inbox. Non-blocking: Full if the peer's
-	// queue is at its limit, PeerClosed if the peer is gone.
+	// queue is at its limit, PeerClosed if the peer is gone. Internal kernel IPC;
+	// the queued bytes are not charged to any Domain.
 	pub fn send(&self, msg: Message) -> Result<(), ChannelError> {
+		self.send_inner(msg, None)
+	}
+
+	// Like `send`, but charge the queued bytes to `sender`'s in-transit IPC quota
+	// (refunded when the message is received or the channel closes). Returns Full -
+	// the backpressure signal - if `sender` is at its queue cap.
+	pub fn send_charged(&self, msg: Message, sender: &Arc<Domain>) -> Result<(), ChannelError> {
+		self.send_inner(msg, Some(sender))
+	}
+
+	fn send_inner(&self, mut msg: Message, sender: Option<&Arc<Domain>>) -> Result<(), ChannelError> {
 		let peer = self.peer().ok_or(ChannelError::PeerClosed)?;
 		{
 			let mut inbox = peer.inbox.lock();
 			if inbox.len() >= CHANNEL_QUEUE_LIMIT {
 				return Err(ChannelError::Full);
+			}
+			// Charge only once space is assured, so a refused message charges nothing.
+			if let Some(domain) = sender {
+				if !msg.charge_queue(domain) {
+					return Err(ChannelError::Full);
+				}
 			}
 			inbox.push_back(msg);
 		}
@@ -106,7 +149,9 @@ impl Channel {
 	// nothing is queued (peer still open), PeerClosed once the peer is gone and
 	// the inbox has drained. Queued messages are always delivered first.
 	pub fn recv(&self) -> Result<Message, ChannelError> {
-		if let Some(msg) = self.inbox.lock().pop_front() {
+		if let Some(mut msg) = self.inbox.lock().pop_front() {
+			// The message has left the queue: refund the sender's queued-bytes charge.
+			msg.take_queue_charge();
 			return Ok(msg);
 		}
 		if self.is_peer_closed() { Err(ChannelError::PeerClosed) } else { Err(ChannelError::Empty) }
@@ -129,6 +174,13 @@ impl KernelObject for Channel {
 
 impl Drop for Channel {
 	fn drop(&mut self) {
+		// Refund the sender's queued-bytes charge for every message left undelivered
+		// in this endpoint's inbox. Drain under the lock, then refund (the refund
+		// touches Domain counters, not this inbox).
+		let leftover: Vec<Message> = self.inbox.lock().drain(..).collect();
+		for mut msg in leftover {
+			msg.take_queue_charge();
+		}
 		// This endpoint is closing; wake any thread blocked waiting on the peer so
 		// its recv/wait observes the now-closed channel.
 		if let Some(peer) = self.peer() {

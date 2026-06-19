@@ -236,12 +236,12 @@ are the concept's "full System Graph" = phase 2 observability, not phase 1.
 
 ## M20 - Kernel additions: driver + spawn syscalls, queue/DMA accounting
 - [ ] `interrupt_bind`: hand a device IRQ to a userspace driver (delivered as an `Event`/Channel signal)
-- [ ] `device_memory_map`: map an MMIO region into a driver's address space (capability-gated)
-- [ ] `dma_buffer_create`: allocate a DMA-safe buffer and its handle
+- [x] `device_memory_map`: map an MMIO region into a driver's address space (capability-gated)
+- [x] `dma_buffer_create`: allocate a DMA-safe buffer and its handle
 - [ ] These three syscalls materialize the `Interrupt` / `DeviceMemory` / `DmaBuffer` kernel objects (the `ObjectType` variants have existed since M4; phase 1 implements the objects behind them)
 - [ ] `process_create` / `thread_create` / `thread_start` exposed to userspace (capability-gated): a userspace spawner builds an empty process + address space, loads an image into it via the existing `memory_object_create` / `memory_map` syscalls, then creates and starts its thread. Phase 0 spawned ELFs only from kernel code (`loader::spawn_elf_process`); ServiceManager/ProcessService (M21/M27) need this to start services from userspace.
 - [ ] `random_get` (kernel CSPRNG) and `object_property_set` (name / limit / ...)
-- [ ] Extend resource accounting to `ipc_queue_bytes` (a queued message is charged to the SENDER's Domain until the receiver takes it - the anti-DoS / backpressure rule, with `send` returning `WOULD_BLOCK` when the receiver's queue is full) and `dma_bytes` (pinned DMA memory). Phase 0 enforces only memory/handles/threads; the concept adds queues + DMA "with IPC and drivers".
+- [x] Extend resource accounting to `ipc_queue_bytes` (a queued message is charged to the SENDER's Domain until the receiver takes it - the anti-DoS / backpressure rule, with `send` returning `WOULD_BLOCK` when the receiver's queue is full) and `dma_bytes` (pinned DMA memory). Phase 0 enforces only memory/handles/threads; the concept adds queues + DMA "with IPC and drivers".
 - [ ] Kernel-side driver-crash cleanup: on a driver fault, detach its IRQ, disable its DMA, remove its capabilities, free its memory, and send an event to ServiceManager
 - Done when: a userspace process binds a (test) interrupt, maps an MMIO page, creates a DMA buffer, and spawns a second process from userspace; queue + DMA accounting is enforced (a full queue returns `WOULD_BLOCK`, a DMA over-cap fails cleanly); a forced driver crash is cleaned up by the kernel (IRQ detached, DMA disabled, caps removed) with an event delivered.
 - Concept: Syscall model (interrupt_bind / device_memory_map / dma_buffer_create / process_create / thread_create / thread_start / object_property_set / random_get), Resource accounting ("queues and DMA will be added with IPC and drivers"; `ipc_queue_bytes`, `dma_bytes`; the in-transit message is charged to the sender), Drivers ("Driver crash" - the kernel only safely cleans up and sends an event).

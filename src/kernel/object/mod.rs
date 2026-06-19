@@ -9,6 +9,7 @@
 
 pub mod address_space;
 pub mod channel;
+pub mod device_memory;
 pub mod dma_buffer;
 pub mod domain;
 pub mod event;

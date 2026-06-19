@@ -56,7 +56,7 @@ fi
 if [[ "${NOKVM:-0}" != "1" && -e /dev/kvm ]]; then
 	QEMU_ARGS+=(-enable-kvm -cpu host -smp 4)
 else
-	QEMU_ARGS+=(-cpu qemu64 -smp 4)
+	QEMU_ARGS+=(-cpu qemu64,+rdrand -smp 4)
 fi
 
 if [[ "${DEBUG:-0}" == "1" ]]; then

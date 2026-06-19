@@ -24,6 +24,7 @@ use crate::arch;
 use crate::fault::FaultInfo;
 use crate::mem::frame::PAGE_SIZE;
 use crate::object::channel::{Channel, ChannelError, Message};
+use crate::object::device_memory::DeviceMemory;
 use crate::object::dma_buffer::DmaBuffer;
 use crate::object::domain::Domain;
 use crate::object::event::Event;
@@ -38,7 +39,7 @@ use crate::sched;
 // kernel/userspace ABI: defined once in the abi crate (the single source of
 // truth) and re-exported here so the rest of the kernel keeps referring to them
 // as `syscall::SYS_*` / `syscall::ERR_*` / `syscall::sys_is_err`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DMA_BUFFER_CREATE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_RANDOM_GET, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
 
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. repr(C) with only
@@ -114,6 +115,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		}
 		SYS_MEMORY_OBJECT_CREATE => sys_memory_object_create(a0),
 		SYS_DMA_BUFFER_CREATE => sys_dma_buffer_create(a0),
+		SYS_DEVICE_MEMORY_MAP => sys_device_memory_map(a0),
+		SYS_RANDOM_GET => sys_random_get(a0, a1),
 		SYS_MEMORY_MAP => sys_memory_map(a0),
 		SYS_MEMORY_UNMAP => sys_memory_unmap(a0),
 		SYS_HANDLE_DUPLICATE => sys_handle_duplicate(a0, a1),
@@ -179,6 +182,59 @@ fn sys_dma_buffer_create(size: u64) -> i64 {
 		Some(handle) => handle.raw() as i64,
 		None => ERR_RESOURCE_EXHAUSTED,
 	}
+}
+
+// Map a DeviceMemory's physical MMIO region into the caller's address space,
+// uncacheable, and return its virtual base. A ring-3 caller maps into its own user
+// space (USER bit); a ring-0 caller into the shared kernel window. One mapping per
+// object: a second call returns ERR_INVALID.
+fn sys_device_memory_map(handle: u64) -> i64 {
+	let object = match current_object(handle, ObjectType::DeviceMemory, Rights::MAP) {
+		Ok(o) => o,
+		Err(e) => return e,
+	};
+	let device = object.as_any().downcast_ref::<DeviceMemory>().expect("type checked by lookup_typed");
+	if device.mapped_at() != 0 {
+		return ERR_INVALID;
+	}
+	let user = arch::percpu::in_user_syscall();
+	let pages = device.pages();
+	let len = pages as u64 * PAGE_SIZE;
+	let base = if user { alloc_user_vrange(len) } else { alloc_kernel_vrange(len) };
+	let mut flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_CACHE;
+	if user {
+		flags |= arch::paging::USER;
+	}
+	for i in 0..pages {
+		arch::paging::map_page(base + i as u64 * PAGE_SIZE, device.phys_base() + i as u64 * PAGE_SIZE, flags);
+	}
+	device.set_mapped_at(base);
+	base as i64
+}
+
+// Fill a caller buffer with `len` random bytes from the kernel CSPRNG (RDRAND when
+// available). Returns the number of bytes written, or ERR_INVALID for an
+// out-of-range buffer.
+fn sys_random_get(buf_ptr: u64, len: u64) -> i64 {
+	if len == 0 {
+		return 0;
+	}
+	if !user_buf_ok(buf_ptr, len) {
+		return ERR_INVALID;
+	}
+	// Generate into a kernel buffer in bounded chunks, then copy out to the caller.
+	const CHUNK: usize = 256;
+	let mut scratch = [0u8; CHUNK];
+	let mut filled: u64 = 0;
+	while filled < len {
+		let n = ((len - filled) as usize).min(CHUNK);
+		arch::random::fill(&mut scratch[..n]);
+		unsafe {
+			core::ptr::copy_nonoverlapping(scratch.as_ptr(), (buf_ptr + filled) as *mut u8, n);
+		}
+		filled += n as u64;
+	}
+	filled as i64
 }
 
 // Map a MemoryObject into the kernel address space, returning its virtual base.
@@ -351,7 +407,7 @@ fn sys_channel_send(ch: u64, bytes_ptr: u64, bytes_len: u64, xfer: u64) -> i64 {
 	} else {
 		Vec::new()
 	};
-	match channel.send(Message::new(bytes, caps, badge)) {
+	match channel.send_charged(Message::new(bytes, caps, badge), thread.domain()) {
 		Ok(()) => {
 			// Delivered: now consume the transferred handle.
 			if xfer != 0 {
