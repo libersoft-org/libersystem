@@ -1768,6 +1768,45 @@ fn device_table_exposes_virtio_mmio() {
 
 #[cfg(test)]
 #[test_case]
+fn dma_buffer_maps_and_reports_phys() {
+	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+	// A driver allocates a DMA buffer for its virtqueue, maps it, and programs its
+	// physical base into the device. Here a thread writes a marker through the
+	// mapping and reads it back at the reported physical address (via the HHDM),
+	// proving the mapping and the phys base name the same memory - what makes device
+	// DMA work. The check runs inside the thread, while the buffer is still alive
+	// (it is freed when the thread's process is reaped).
+	const MARK: u64 = 0xc0ffee_d00d_u64;
+	static PHYS: AtomicU64 = AtomicU64::new(0);
+	static READBACK: AtomicU64 = AtomicU64::new(0);
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let handle = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, 0, 0, 0);
+			if syscall::sys_is_err(handle) {
+				return;
+			}
+			let virt = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_MAP, handle, 0, 0, 0);
+			let phys = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_PHYS, handle, 0, 0, 0);
+			if syscall::sys_is_err(virt) {
+				return;
+			}
+			(virt as *mut u64).write_volatile(MARK);
+			let via_hhdm = ((mem::hhdm_offset() + phys) as *const u64).read_volatile();
+			PHYS.store(phys, Ordering::SeqCst);
+			READBACK.store(via_hhdm, Ordering::SeqCst);
+			DONE.store(true, Ordering::SeqCst);
+		}
+	}
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the DMA buffer thread did not complete");
+	assert!(PHYS.load(Ordering::SeqCst) != 0, "the DMA buffer should report a non-zero physical base");
+	assert_eq!(READBACK.load(Ordering::SeqCst), MARK, "the bytes written through the mapping must be visible at the physical base");
+}
+
+#[cfg(test)]
+#[test_case]
 fn log_record_roundtrip_and_renders() {
 	use abi::log::{LogRecord, Severity, encode, render_cbor, render_json, render_text};
 	// A LogRecord is the canonical structured object; text/JSON/CBOR are derived

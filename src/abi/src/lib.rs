@@ -54,6 +54,8 @@ pub const SYS_CONSOLE_ATTACH: u64 = 33;
 pub const SYS_DEVICE_COUNT: u64 = 34;
 pub const SYS_DEVICE_INFO: u64 = 35;
 pub const SYS_DEVICE_ACQUIRE: u64 = 36;
+pub const SYS_DMA_BUFFER_MAP: u64 = 37;
+pub const SYS_DMA_BUFFER_PHYS: u64 = 38;
 
 // The ring-3 stack top an ELF-loaded process runs on: the kernel's loader maps a
 // stack just below this address, and a userspace spawner passes it to

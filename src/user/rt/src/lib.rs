@@ -179,6 +179,24 @@ pub unsafe fn device_acquire(index: u64) -> i64 {
 	unsafe { syscall(SYS_DEVICE_ACQUIRE, index, 0, 0, 0) as i64 }
 }
 
+// Allocate a DmaBuffer of `size` bytes (pinned DMA memory charged to our Domain),
+// returning its handle, or a negative error.
+pub unsafe fn dma_buffer_create(size: u64) -> i64 {
+	unsafe { syscall(SYS_DMA_BUFFER_CREATE, size, 0, 0, 0) as i64 }
+}
+
+// Map a DmaBuffer into our address space, returning its virtual base (or a
+// negative error). The driver fills the virtqueue rings through this mapping.
+pub unsafe fn dma_buffer_map(handle: u64) -> i64 {
+	unsafe { syscall(SYS_DMA_BUFFER_MAP, handle, 0, 0, 0) as i64 }
+}
+
+// The physical base address of a DmaBuffer - the address a driver programs into
+// its device for DMA.
+pub unsafe fn dma_buffer_phys(handle: u64) -> u64 {
+	unsafe { syscall(SYS_DMA_BUFFER_PHYS, handle, 0, 0, 0) }
+}
+
 // Spawn a new ring-3 process from an ELF image and start it. `bootstrap` is an
 // object handle (0 = none) moved out of this process's table into the child's and
 // delivered to the child's first thread in rdi - the way a process is endowed with
