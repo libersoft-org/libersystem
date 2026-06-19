@@ -30,6 +30,21 @@ const PHDR_LEN: usize = 56;
 const PT_LOAD: u32 = 1;
 const PF_W: u32 = 0x2;
 
+// Little-endian fixed-width readers over a byte slice at a static offset. The
+// callers slice the ELF header and program headers at offsets that always fit the
+// validated length, so the fixed-size conversion never fails.
+fn rd_u16(b: &[u8], at: usize) -> u16 {
+	u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
+}
+
+fn rd_u32(b: &[u8], at: usize) -> u32 {
+	u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+fn rd_u64(b: &[u8], at: usize) -> u64 {
+	u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+
 // Load `elf` into `addr_space`, recording every physical frame it allocates into
 // `frames` so the caller can free them on teardown (frames pushed before an error
 // are left in `frames` for the caller's cleanup). Returns the entry-point virtual
@@ -46,32 +61,32 @@ pub fn load_into(elf: &[u8], addr_space: &AddressSpace, frames: &mut Vec<u64>) -
 		return Err(ElfError::BadClass);
 	}
 	// ET_EXEC (2) or ET_DYN (3); both are loaded at p_vaddr with a zero bias.
-	let e_type = u16::from_le_bytes(elf[16..18].try_into().unwrap());
+	let e_type = rd_u16(elf, 16);
 	if e_type != 2 && e_type != 3 {
 		return Err(ElfError::BadType);
 	}
 	// EM_X86_64.
-	let e_machine = u16::from_le_bytes(elf[18..20].try_into().unwrap());
+	let e_machine = rd_u16(elf, 18);
 	if e_machine != 0x3e {
 		return Err(ElfError::BadMachine);
 	}
-	let e_entry = u64::from_le_bytes(elf[24..32].try_into().unwrap());
-	let e_phoff = u64::from_le_bytes(elf[32..40].try_into().unwrap()) as usize;
-	let e_phentsize = u16::from_le_bytes(elf[54..56].try_into().unwrap()) as usize;
-	let e_phnum = u16::from_le_bytes(elf[56..58].try_into().unwrap()) as usize;
+	let e_entry = rd_u64(elf, 24);
+	let e_phoff = rd_u64(elf, 32) as usize;
+	let e_phentsize = rd_u16(elf, 54) as usize;
+	let e_phnum = rd_u16(elf, 56) as usize;
 
 	for index in 0..e_phnum {
 		let base = e_phoff + index * e_phentsize;
 		let phdr = elf.get(base..base + PHDR_LEN).ok_or(ElfError::Truncated)?;
-		let p_type = u32::from_le_bytes(phdr[0..4].try_into().unwrap());
+		let p_type = rd_u32(phdr, 0);
 		if p_type != PT_LOAD {
 			continue;
 		}
-		let p_flags = u32::from_le_bytes(phdr[4..8].try_into().unwrap());
-		let p_offset = u64::from_le_bytes(phdr[8..16].try_into().unwrap()) as usize;
-		let p_vaddr = u64::from_le_bytes(phdr[16..24].try_into().unwrap());
-		let p_filesz = u64::from_le_bytes(phdr[32..40].try_into().unwrap()) as usize;
-		let p_memsz = u64::from_le_bytes(phdr[40..48].try_into().unwrap());
+		let p_flags = rd_u32(phdr, 4);
+		let p_offset = rd_u64(phdr, 8) as usize;
+		let p_vaddr = rd_u64(phdr, 16);
+		let p_filesz = rd_u64(phdr, 32) as usize;
+		let p_memsz = rd_u64(phdr, 40);
 		map_segment(elf, addr_space, frames, p_flags, p_offset, p_vaddr, p_filesz, p_memsz)?;
 	}
 	Ok(e_entry)

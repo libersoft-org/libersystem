@@ -80,7 +80,7 @@ unsafe fn serve_open(service: u64, volume_base: u64, volume_len: usize, request:
 			return;
 		}
 		let archive: &[u8] = core::slice::from_raw_parts(volume_base as *const u8, volume_len);
-		let file: &[u8] = match pkg_lookup(archive, target.path) {
+		let file: &[u8] = match Package::parse(archive).and_then(|p| p.lookup(target.path)) {
 			Some(f) => f,
 			None => {
 				reply(service, STATUS_NOT_FOUND, 0, 0);

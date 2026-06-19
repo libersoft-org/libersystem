@@ -87,3 +87,79 @@ pub const PKG_MAGIC: &[u8; 8] = b"PKGARCH1";
 pub const PKG_HEADER_LEN: usize = 16;
 pub const PKG_ENTRY_LEN: usize = 32;
 pub const PKG_NAME_LEN: usize = 24;
+
+// A parsed PKGARCH1 archive borrowing the underlying bytes. The single reader for
+// the format: the kernel (init/volume packages) and the userspace storage runtime
+// both decode the layout above through this one implementation, so the on-disk
+// format and its parser never drift apart.
+pub struct Package<'a> {
+	bytes: &'a [u8],
+	count: usize,
+}
+
+impl<'a> Package<'a> {
+	// Parse and validate a package header. Returns None if the bytes are too
+	// short, the magic is wrong, or the entry table does not fit.
+	pub fn parse(bytes: &'a [u8]) -> Option<Self> {
+		if bytes.len() < PKG_HEADER_LEN {
+			return None;
+		}
+		if &bytes[0..8] != PKG_MAGIC {
+			return None;
+		}
+		let count = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+		let table_end = PKG_HEADER_LEN.checked_add(count.checked_mul(PKG_ENTRY_LEN)?)?;
+		if table_end > bytes.len() {
+			return None;
+		}
+		Some(Self { bytes, count })
+	}
+
+	// Number of files in the package.
+	pub fn len(&self) -> usize {
+		self.count
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.count == 0
+	}
+
+	// The name of the `index`-th file (its stored name up to the first NUL), or
+	// None if the index is out of range. Lets a caller enumerate the archive.
+	pub fn name(&self, index: usize) -> Option<&'a [u8]> {
+		if index >= self.count {
+			return None;
+		}
+		let base = PKG_HEADER_LEN + index * PKG_ENTRY_LEN;
+		let stored = &self.bytes[base..base + PKG_NAME_LEN];
+		match stored.iter().position(|&b| b == 0) {
+			Some(end) => Some(&stored[..end]),
+			None => Some(stored),
+		}
+	}
+
+	// Find a file by name, returning its blob. The stored name is compared up to
+	// its first NUL. Returns None if absent, or if its byte range is out of bounds.
+	pub fn lookup(&self, name: &[u8]) -> Option<&'a [u8]> {
+		for index in 0..self.count {
+			let base = PKG_HEADER_LEN + index * PKG_ENTRY_LEN;
+			let entry = &self.bytes[base..base + PKG_ENTRY_LEN];
+			let stored = &entry[0..PKG_NAME_LEN];
+			let stored_name = match stored.iter().position(|&b| b == 0) {
+				Some(end) => &stored[..end],
+				None => stored,
+			};
+			if stored_name != name {
+				continue;
+			}
+			let offset = u32::from_le_bytes(entry[PKG_NAME_LEN..PKG_NAME_LEN + 4].try_into().ok()?) as usize;
+			let size = u32::from_le_bytes(entry[PKG_NAME_LEN + 4..PKG_NAME_LEN + 8].try_into().ok()?) as usize;
+			let end = offset.checked_add(size)?;
+			if end > self.bytes.len() {
+				return None;
+			}
+			return Some(&self.bytes[offset..end]);
+		}
+		None
+	}
+}

@@ -128,37 +128,8 @@ pub unsafe fn send_blocking(channel: u64, bytes: &[u8], xfer: u64) -> bool {
 	}
 }
 
-// The PKGARCH1 archive-layout constants (PKG_MAGIC / PKG_HEADER_LEN / ...) come
-// from the shared abi crate, re-exported above.
-
-fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
-	let slice: &[u8] = bytes.get(at..at + 4)?;
-	Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
-}
-
-// Look up `name` in a PKGARCH1 archive, returning its blob. Every access is
-// bounds-checked, so a malformed or truncated archive yields None rather than
-// reading out of range.
-pub fn pkg_lookup<'a>(archive: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-	if archive.len() < PKG_HEADER_LEN || &archive[0..8] != PKG_MAGIC {
-		return None;
-	}
-	let count: usize = read_u32(archive, 8)? as usize;
-	for i in 0..count {
-		let base: usize = PKG_HEADER_LEN + i * PKG_ENTRY_LEN;
-		let name_field: &[u8] = archive.get(base..base + PKG_NAME_LEN)?;
-		let entry_name: &[u8] = match name_field.iter().position(|&b: &u8| b == 0) {
-			Some(end) => &name_field[..end],
-			None => name_field,
-		};
-		let offset: usize = read_u32(archive, base + PKG_NAME_LEN)? as usize;
-		let size: usize = read_u32(archive, base + PKG_NAME_LEN + 4)? as usize;
-		if entry_name == name {
-			return archive.get(offset..offset + size);
-		}
-	}
-	None
-}
+// The PKGARCH1 archive reader (`abi::Package`, re-exported above via `pub use
+// abi::*`) is the single decoder for the format, shared with the kernel.
 
 // A canonical location on a volume: the resolver's view of a vol:// URI, split
 // into the volume name and the path within it. The URI is just the wire form;

@@ -86,6 +86,20 @@ fn alloc_user_vrange(len: u64) -> u64 {
 	USER_MMAP_NEXT.fetch_add(len, Ordering::Relaxed)
 }
 
+// Fetch the current thread and look up a typed object handle on its table,
+// releasing the table lock before returning. Collapses the boilerplate shared by
+// the handlers that only need the looked-up object: a missing thread maps to
+// ERR_NO_THREAD, denied rights to ERR_ACCESS_DENIED, and a bad handle or wrong
+// type to ERR_BAD_HANDLE.
+fn current_object(handle: u64, ty: ObjectType, rights: Rights) -> Result<Arc<dyn KernelObject>, i64> {
+	let thread = sched::current_thread().ok_or(ERR_NO_THREAD)?;
+	match thread.handles().lock().lookup_typed(Handle::from_raw(handle), ty, rights) {
+		Ok(object) => Ok(object),
+		Err(HandleError::AccessDenied) => Err(ERR_ACCESS_DENIED),
+		Err(_) => Err(ERR_BAD_HANDLE),
+	}
+}
+
 // Entry point called by the architecture syscall stub. `num` selects the call;
 // the meaning of the arguments and the return value is per-syscall.
 #[unsafe(no_mangle)]
@@ -503,17 +517,9 @@ fn sys_domain_create(memory_limit: u64, handle_limit: u64, thread_limit: u64) ->
 // Kill the Domain named by `handle` and its whole subtree: every descendant
 // process is terminated and its resources freed. Requires the MANAGE right.
 fn sys_domain_kill(handle: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
-	let object = {
-		let table = thread.handles().lock();
-		match table.lookup_typed(Handle::from_raw(handle), ObjectType::Domain, Rights::MANAGE) {
-			Ok(o) => o,
-			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
-			Err(_) => return ERR_BAD_HANDLE,
-		}
+	let object = match current_object(handle, ObjectType::Domain, Rights::MANAGE) {
+		Ok(o) => o,
+		Err(e) => return e,
 	};
 	object.as_any().downcast_ref::<Domain>().expect("type checked by lookup_typed").kill();
 	0
@@ -534,17 +540,9 @@ fn sys_event_create() -> i64 {
 
 // Raise an event's signal.
 fn sys_event_signal(handle: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
-	let object = {
-		let table = thread.handles().lock();
-		match table.lookup_typed(Handle::from_raw(handle), ObjectType::Event, Rights::WRITE) {
-			Ok(o) => o,
-			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
-			Err(_) => return ERR_BAD_HANDLE,
-		}
+	let object = match current_object(handle, ObjectType::Event, Rights::WRITE) {
+		Ok(o) => o,
+		Err(e) => return e,
 	};
 	object.as_any().downcast_ref::<Event>().expect("type checked by lookup_typed").signal();
 	0
@@ -552,17 +550,9 @@ fn sys_event_signal(handle: u64) -> i64 {
 
 // Observe an event's signal: 1 if signaled, 0 if not.
 fn sys_event_poll(handle: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
-	let object = {
-		let table = thread.handles().lock();
-		match table.lookup_typed(Handle::from_raw(handle), ObjectType::Event, Rights::READ) {
-			Ok(o) => o,
-			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
-			Err(_) => return ERR_BAD_HANDLE,
-		}
+	let object = match current_object(handle, ObjectType::Event, Rights::READ) {
+		Ok(o) => o,
+		Err(e) => return e,
 	};
 	i64::from(object.as_any().downcast_ref::<Event>().expect("type checked by lookup_typed").is_signaled())
 }
@@ -582,17 +572,9 @@ fn sys_timer_create() -> i64 {
 
 // Arm a timer to fire at an absolute tick deadline.
 fn sys_timer_set(handle: u64, deadline_ticks: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
-	let object = {
-		let table = thread.handles().lock();
-		match table.lookup_typed(Handle::from_raw(handle), ObjectType::Timer, Rights::WRITE) {
-			Ok(o) => o,
-			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
-			Err(_) => return ERR_BAD_HANDLE,
-		}
+	let object = match current_object(handle, ObjectType::Timer, Rights::WRITE) {
+		Ok(o) => o,
+		Err(e) => return e,
 	};
 	object.as_any().downcast_ref::<Timer>().expect("type checked by lookup_typed").set(deadline_ticks);
 	0
@@ -600,17 +582,9 @@ fn sys_timer_set(handle: u64, deadline_ticks: u64) -> i64 {
 
 // Observe a timer: 1 if armed and expired, 0 otherwise.
 fn sys_timer_poll(handle: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
-	let object = {
-		let table = thread.handles().lock();
-		match table.lookup_typed(Handle::from_raw(handle), ObjectType::Timer, Rights::READ) {
-			Ok(o) => o,
-			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
-			Err(_) => return ERR_BAD_HANDLE,
-		}
+	let object = match current_object(handle, ObjectType::Timer, Rights::READ) {
+		Ok(o) => o,
+		Err(e) => return e,
 	};
 	i64::from(object.as_any().downcast_ref::<Timer>().expect("type checked by lookup_typed").is_expired())
 }
