@@ -1755,24 +1755,21 @@ DECIDED:
 Still open:
 
 1. The exact binary IPC/message layout (the *style* is decided - decode-cheap FIDL/Cap'n Proto; only the concrete bytes are open).
-2. IDL: our own vs. WIT vs. another ready-made one - **decide only after writing 5-6 real interfaces** (IDL section), not in advance.
-3. The event stream model in detail.
-4. Distinguishing Process vs Component vs Service vs Driver vs App in practice.
-5. ServiceManager/DeviceManager detailed design.
-6. ResourceManager policy (limits, quotas).
-7. Native filesystem (format, features).
-8. GUI/compositor/input model.
-9. Audio/video/network stack in detail.
-10. The exact form of the System Graph and later Flow metrics.
-11. Verified boot / update model (immutable, A/B, rollback).
-12. Power management (ACPI, suspend/resume, idle states) - necessary for laptops.
-13. Testing strategy (unit, integration on QEMU, syscall fuzzing, property tests of capabilities).
-14. An explicit threat model (whom we defend against: a malicious app, a compromised driver, …).
-15. The driver binding model (how DeviceManager pairs a device -> driver).
-16. Observability (counters, tracing spans, profiling across services).
-17. Behavior under memory pressure (reclaim, OOM via Domain limits).
+2. The event stream model in detail.
+3. Distinguishing Process vs Component vs Service vs Driver vs App in practice.
+4. ResourceManager policy (limits, quotas).
+5. Native filesystem (format, features).
+6. GUI/compositor/input model.
+7. Audio/video/network stack in detail.
+8. The exact form of the System Graph and later Flow metrics.
+9. Verified boot / update model (immutable, A/B, rollback).
+10. Power management (ACPI, suspend/resume, idle states) - necessary for laptops.
+11. Testing strategy (unit, integration on QEMU, syscall fuzzing, property tests of capabilities).
+12. An explicit threat model (whom we defend against: a malicious app, a compromised driver, …).
+13. Observability (counters, tracing spans, profiling across services).
+14. Behavior under memory pressure (reclaim, OOM via Domain limits).
 
-Note: items 12-17 do not need a detailed design yet - they are here deliberately as a "do not forget", not as a task for the MVP. Most of them will be decided by practice in Phase 0-1.
+Note: items 10-14 do not need a detailed design yet - they are here deliberately as a "do not forget", not as a task for the MVP. Most of them will be decided by practice in Phase 0-1.
 
 ---
 
@@ -1781,11 +1778,11 @@ Note: items 12-17 do not need a detailed design yet - they are here deliberately
 The object model, capability model, and IPC model already have a basic design (see above). Further design steps:
 
 ```text
-1. IDL/WIT: write a few real interfaces, decide based on them, then build the toolchain (binding generators).
+1. IDL/WIT: the interfaces are written and the choice decided (our own IDL) - what remains is building the toolchain (binding generators).
 2. Detailed design of the core services (Storage, Process, Log, Device).
 3. A minimal WASI host and running the first component.
 4. virtio drivers (blk, console) for real storage instead of a ramdisk.
 5. SystemManager / ServiceManager / DeviceManager detailed design.
 ```
 
-The nearest concrete step (not an armchair question): **write 5-6 real interfaces in WIT** and empirically find out where WIT chafes - only then decide: WIT, another ready-made one, or our own IDL. For the concrete list of interfaces and the procedure, see *IDL language*.
+The 5-6 real interfaces have been written in WIT and the choice decided from that practice (our own IDL with WIT-inspired types plus our own binary backend; see *IDL language*); the nearest concrete step is now building the toolchain (the binding, schema, CLI, doc, and test generators).

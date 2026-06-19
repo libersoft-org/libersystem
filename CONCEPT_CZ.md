@@ -1755,24 +1755,21 @@ ROZHODNUTO:
 Stále otevřené:
 
 1. Přesný binární IPC/message layout (*styl* rozhodnut - decode-cheap FIDL/Cap'n Proto, otevřené jsou jen konkrétní bajty).
-2. IDL: vlastní vs. WIT vs. jiné hotové - **rozhodnout až po napsání 5-6 reálných interface** (sekce IDL), ne dopředu.
-3. Event stream model do detailu.
-4. Rozlišení Process vs Component vs Service vs Driver vs App v praxi.
-5. ServiceManager/DeviceManager detailní návrh.
-6. ResourceManager policy (limity, quotas).
-7. Native filesystem (formát, vlastnosti).
-8. GUI/compositor/input model.
-9. Audio/video/network stack do detailu.
-10. Přesná podoba System Graphu a později Flow metrics.
-11. Verified boot / update model (immutable, A/B, rollback).
-12. Power management (ACPI, suspend/resume, idle states) - nutné pro laptopy.
-13. Testovací strategie (unit, integrace na QEMU, fuzzing syscallů, property testy capabilit).
-14. Explicitní threat model (proti komu se bráníme: malicious app, compromised driver, …).
-15. Driver binding model (jak DeviceManager páruje zařízení → driver).
-16. Observabilita (counters, tracing spans, profiling napříč službami).
-17. Chování při tlaku na paměť (reclaim, OOM přes Domain limity).
+2. Event stream model do detailu.
+3. Rozlišení Process vs Component vs Service vs Driver vs App v praxi.
+4. ResourceManager policy (limity, quotas).
+5. Native filesystem (formát, vlastnosti).
+6. GUI/compositor/input model.
+7. Audio/video/network stack do detailu.
+8. Přesná podoba System Graphu a později Flow metrics.
+9. Verified boot / update model (immutable, A/B, rollback).
+10. Power management (ACPI, suspend/resume, idle states) - nutné pro laptopy.
+11. Testovací strategie (unit, integrace na QEMU, fuzzing syscallů, property testy capabilit).
+12. Explicitní threat model (proti komu se bráníme: malicious app, compromised driver, …).
+13. Observabilita (counters, tracing spans, profiling napříč službami).
+14. Chování při tlaku na paměť (reclaim, OOM přes Domain limity).
 
-Pozn.: body 12-17 zatím nepotřebují detailní návrh - patří sem vědomě jako „nezapomenout", ne jako úkol do MVP. Většinu z nich rozhodne až praxe ve Fázi 0-1.
+Pozn.: body 10-14 zatím nepotřebují detailní návrh - patří sem vědomě jako „nezapomenout", ne jako úkol do MVP. Většinu z nich rozhodne až praxe ve Fázi 0-1.
 
 ---
 
@@ -1781,11 +1778,11 @@ Pozn.: body 12-17 zatím nepotřebují detailní návrh - patří sem vědomě j
 Object model, capability model i IPC model už mají základní návrh (viz výše). Další návrhové kroky:
 
 ```text
-1. IDL/WIT: napsat pár reálných interface, podle nich rozhodnout, pak postavit toolchain (generátory bindingů).
+1. IDL/WIT: interface napsány a volba rozhodnuta (vlastní IDL) - zbývá postavit toolchain (generátory bindingů).
 2. Detailní návrh core služeb (Storage, Process, Log, Device).
 3. Minimální WASI host a běh první komponenty.
 4. virtio drivery (blk, console) pro reálné úložiště místo ramdisku.
 5. SystemManager / ServiceManager / DeviceManager detailní návrh.
 ```
 
-Nejbližší konkrétní krok (ne otázka od stolu): **napsat 5-6 reálných interface ve WIT** a empiricky zjistit, kde WIT drhne - teprve pak rozhodnout: WIT, jiné hotové, nebo vlastní IDL. Konkrétní seznam interface i postup viz *IDL jazyk*.
+5-6 reálných interface už je napsáno ve WIT a podle té praxe rozhodnuto (vlastní IDL s typy inspirovanými WIT + vlastní binární backend; viz *IDL jazyk*); nejbližší konkrétní krok je teď postavit toolchain (generátory bindingů, schémat, CLI, docs a testů).
