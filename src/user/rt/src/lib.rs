@@ -162,6 +162,23 @@ pub unsafe fn duplicate(handle: u64, rights: u32) -> i64 {
 	unsafe { syscall(SYS_HANDLE_DUPLICATE, handle, rights as u64, 0, 0) as i64 }
 }
 
+// The number of devices the kernel discovered at boot.
+pub unsafe fn device_count() -> u64 {
+	unsafe { syscall(SYS_DEVICE_COUNT, 0, 0, 0, 0) }
+}
+
+// Read the DeviceInfo for device `index` (its virtio type and MMIO struct
+// offsets). Returns true on success, false for an out-of-range index.
+pub unsafe fn device_info(index: u64, info: &mut DeviceInfo) -> bool {
+	unsafe { syscall(SYS_DEVICE_INFO, index, info as *mut DeviceInfo as u64, core::mem::size_of::<DeviceInfo>() as u64, 0) as i64 == 0 }
+}
+
+// Acquire a DeviceMemory capability for device `index`'s MMIO BAR, returning the
+// handle, or a negative error. The driver maps it with device_memory_map.
+pub unsafe fn device_acquire(index: u64) -> i64 {
+	unsafe { syscall(SYS_DEVICE_ACQUIRE, index, 0, 0, 0) as i64 }
+}
+
 // Spawn a new ring-3 process from an ELF image and start it. `bootstrap` is an
 // object handle (0 = none) moved out of this process's table into the child's and
 // delivered to the child's first thread in rdi - the way a process is endowed with

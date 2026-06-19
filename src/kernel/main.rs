@@ -555,13 +555,15 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// Hand SystemManager the init package as a read-only shared buffer: the kernel
 	// copies the package bytes into a MemoryObject and sends "PACKAGE" + length
 	// with that capability, so SystemManager can find and spawn ServiceManager and
-	// then delegate the package onward to it (TRANSFER) to start the rest.
+	// then delegate the package onward to it (TRANSFER) to start the rest. DUPLICATE
+	// lets ServiceManager share it further (with DeviceManager, which spawns drivers
+	// from it) without giving up its own handle.
 	let package_obj = MemoryObject::create(bytes.len()).ok_or("no memory for the init package")?;
 	copy_into_object(&package_obj, bytes);
 	let mut msg = alloc::vec::Vec::with_capacity(7 + 8);
 	msg.extend_from_slice(b"PACKAGE");
 	msg.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-	let cap = Capability::new(package_obj as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
+	let cap = Capability::new(package_obj as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER | Rights::DUPLICATE, 0);
 	kernel_ep.send(Message::new(msg, alloc::vec![cap], 0)).map_err(|_| "failed to hand SystemManager the init package")?;
 
 	// Hand SystemManager the ramdisk volume the same way, so it can be delegated

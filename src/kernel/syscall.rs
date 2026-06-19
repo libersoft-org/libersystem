@@ -503,7 +503,11 @@ fn sys_memory_map(handle: u64) -> i64 {
 		}
 	};
 	let memory = object.as_any().downcast_ref::<MemoryObject>().expect("type checked by lookup_typed");
-	if memory.mapped_at() != 0 {
+	// Reject a duplicate map within the SAME address space; mapping into a different
+	// address space is allowed, so an object can be shared (e.g. the init package
+	// mapped by both ServiceManager and DeviceManager).
+	let cr3 = arch::context::read_cr3();
+	if memory.mapped_at() != 0 && memory.mapped_cr3() == cr3 {
 		return ERR_INVALID;
 	}
 	// A ring-3 caller maps into its own (lower-half) user space with the USER bit
@@ -517,6 +521,7 @@ fn sys_memory_map(handle: u64) -> i64 {
 		arch::paging::map_page(base + i as u64 * PAGE_SIZE, phys, flags);
 	}
 	memory.set_mapped_at(base);
+	memory.set_mapped_cr3(cr3);
 	base as i64
 }
 

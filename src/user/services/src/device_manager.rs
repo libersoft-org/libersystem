@@ -1,11 +1,13 @@
-// DeviceManager - the userspace device supervisor (stub).
+// DeviceManager - the userspace device supervisor.
 //
-// ServiceManager starts this program from the init package and hands it a
-// bootstrap channel. For this step DeviceManager reports in over that channel and
-// then stands, waiting for a control message: ServiceManager uses this to exercise
-// the supervisor's stop path, sending "STOP", to which DeviceManager replies
-// "DeviceManager: stopped" and exits. M23 grows it into device detection, driver
-// mapping, and driver-crash handling.
+// ServiceManager starts this program from the init package, hands it a bootstrap
+// channel, and over it a view of the init package (so it can spawn drivers from
+// it). DeviceManager enumerates the devices the kernel discovered on the PCI bus
+// (over the device syscalls) and launches the matching userspace driver for each,
+// handing that driver only its own device's MMIO capability. It then reports in
+// and stands; ServiceManager exercises the stop path on it (sending "STOP", to
+// which it replies "DeviceManager: stopped" and exits). Device-state tracking and
+// reacting to a driver crash grow here in later steps.
 
 #![no_std]
 #![no_main]
@@ -14,14 +16,97 @@ use rt::*;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	let mut buf: [u8; 32] = [0u8; 32];
+	let mut buf: [u8; 256] = [0u8; 256];
 	unsafe {
+		// 1. receive the init package shared buffer (to spawn drivers from) and map it.
+		let (pkg_base, pkg_len): (u64, usize) = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"PACKAGE" => {
+				let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
+				let base: u64 = syscall(SYS_MEMORY_MAP, handle, 0, 0, 0);
+				if sys_is_err(base) {
+					exit();
+				}
+				(base, length)
+			}
+			_ => exit(),
+		};
+		let archive: &[u8] = core::slice::from_raw_parts(pkg_base as *const u8, pkg_len);
+		let package: Package = match Package::parse(archive) {
+			Some(p) => p,
+			None => exit(),
+		};
+
+		// 2. launch the matching driver for each discovered device.
+		launch_drivers(&package, &mut buf);
+
+		// 3. report in once the devices are bound to drivers.
 		send_blocking(bootstrap, b"DeviceManager: online", 0);
-		// Stand until ServiceManager asks us to stop (or drops our control channel),
-		// then acknowledge the shutdown and exit.
+
+		// 4. stand until ServiceManager asks us to stop (which also drops the driver
+		//    channels, so the drivers shut down with us), then acknowledge and exit.
 		if let Received::Message { .. } = recv_blocking(bootstrap, &mut buf) {
 			send_blocking(bootstrap, b"DeviceManager: stopped", 0);
 		}
 	}
 	exit();
+}
+
+// Enumerate the kernel device table and, for each device, spawn the matching driver
+// from the package, handing it only that device's MMIO capability and info. The
+// driver's "online" report is printed; it does not flow up the boot-chain report
+// channel (which carries only the service lifecycle).
+unsafe fn launch_drivers(package: &Package, buf: &mut [u8]) {
+	unsafe {
+		let count: u64 = device_count();
+		let info_size: usize = core::mem::size_of::<DeviceInfo>();
+		let mut i: u64 = 0;
+		while i < count {
+			let mut info: DeviceInfo = DeviceInfo::default();
+			if !device_info(i, &mut info) {
+				i += 1;
+				continue;
+			}
+			let driver_name: &[u8] = driver_for(info.virtio_type);
+			let elf: &[u8] = match package.lookup(driver_name) {
+				Some(e) => e,
+				None => {
+					i += 1;
+					continue;
+				}
+			};
+			// acquire this device's MMIO capability and spawn its driver with a fresh
+			// bootstrap channel.
+			let cap: i64 = device_acquire(i);
+			let (dm_side, driver_side): (u64, u64) = match channel() {
+				Some(pair) => pair,
+				None => {
+					i += 1;
+					continue;
+				}
+			};
+			if cap >= 0 && spawn(elf, driver_side) >= 0 {
+				// hand the driver "DEVICE" + its DeviceInfo + the transferred MMIO cap.
+				buf[..6].copy_from_slice(b"DEVICE");
+				let info_bytes: &[u8] = core::slice::from_raw_parts(&info as *const DeviceInfo as *const u8, info_size);
+				buf[6..6 + info_size].copy_from_slice(info_bytes);
+				if send_blocking(dm_side, &buf[..6 + info_size], cap as u64) {
+					if let Received::Message { len, .. } = recv_blocking(dm_side, buf) {
+						print(&buf[..len]);
+						print(b"\n");
+					}
+				}
+			}
+			i += 1;
+		}
+	}
+}
+
+// The init-package binary name of the driver for a virtio device type.
+fn driver_for(virtio_type: u32) -> &'static [u8] {
+	match virtio_type {
+		1 => b"virtio_net",
+		2 => b"virtio_blk",
+		3 => b"virtio_console",
+		_ => b"",
+	}
 }

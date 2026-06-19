@@ -55,15 +55,16 @@ enum State {
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 
-	// 1. receive the init package shared buffer and map it.
-	let (pkg_base, pkg_len): (u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	// 1. receive the init package shared buffer and map it. Keep the handle so we
+	//    can share the package with DeviceManager (which spawns drivers from it).
+	let (pkg_handle, pkg_base, pkg_len): (u64, u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"PACKAGE" => {
 			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
 			let base: u64 = unsafe { syscall(SYS_MEMORY_MAP, handle, 0, 0, 0) };
 			if sys_is_err(base) {
 				exit();
 			}
-			(base, length)
+			(handle, base, length)
 		}
 		_ => exit(),
 	};
@@ -96,7 +97,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
-				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, ramdisk_handle, ramdisk_len, &mut storage_client, &mut log_client, &mut channels[i], &mut buf) };
+				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, ramdisk_handle, ramdisk_len, pkg_handle, pkg_len, &mut storage_client, &mut log_client, &mut channels[i], &mut buf) };
 				progress = true;
 			}
 			i += 1;
@@ -180,7 +181,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // channels - the StorageService one so its `cat` round-trips, the LogService one so
 // its `log` command can query the journal. Once a service reports in, the
 // supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, ramdisk_len: usize, storage_client: &mut u64, log_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, ramdisk_len: usize, pkg_handle: u64, pkg_len: usize, storage_client: &mut u64, log_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -194,6 +195,9 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, r
 			return State::Failed;
 		}
 		if name == b"log_service" && !bootstrap_log(manager_side, log_client) {
+			return State::Failed;
+		}
+		if name == b"device_manager" && !bootstrap_device(manager_side, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		if name == b"storage_service" && !bootstrap_storage(manager_side, ramdisk, ramdisk_len, storage_client, buf) {
@@ -272,6 +276,23 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 			return false;
 		}
 		send_blocking(manager_side, b"LOG", log_dup as u64)
+	}
+}
+
+// Hand DeviceManager a view of the init package so it can spawn the userspace
+// driver for each device it discovers: duplicate our package handle (read + map +
+// transfer) and send "PACKAGE" + length with the duplicate. We keep our own handle
+// and mapping; the kernel allows the same object to be mapped in both address
+// spaces.
+unsafe fn bootstrap_device(manager_side: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+	unsafe {
+		let dup: i64 = duplicate(pkg_handle, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+		if dup < 0 {
+			return false;
+		}
+		buf[..7].copy_from_slice(b"PACKAGE");
+		buf[7..15].copy_from_slice(&(pkg_len as u64).to_le_bytes());
+		send_blocking(manager_side, &buf[..15], dup as u64)
 	}
 }
 

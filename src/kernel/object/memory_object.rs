@@ -32,8 +32,13 @@ pub struct MemoryObject {
 	frames: Vec<u64>,
 	// Size in bytes (rounded up to whole pages).
 	size: usize,
-	// Kernel virtual base where this object is currently mapped (0 = unmapped).
+	// Virtual base where this object is currently mapped (0 = unmapped), and the
+	// address space (CR3) that base belongs to. Tracking the address space lets the
+	// same object be mapped into several address spaces (shared memory, e.g. the
+	// init package shared by ServiceManager and DeviceManager) while still rejecting
+	// a duplicate map within one address space.
 	mapped_at: AtomicU64,
+	mapped_cr3: AtomicU64,
 	// Domain charged for this object's physical memory, if any. The charge is
 	// refunded when the object is dropped.
 	domain: Option<Arc<Domain>>,
@@ -50,7 +55,7 @@ impl MemoryObject {
 			Some(f) => f,
 			None => return None,
 		};
-		Some(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * page, mapped_at: AtomicU64::new(0), domain: None }))
+		Some(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * page, mapped_at: AtomicU64::new(0), mapped_cr3: AtomicU64::new(0), domain: None }))
 	}
 
 	// Allocate physical frames for an object charged to `domain`. The Domain's
@@ -71,7 +76,7 @@ impl MemoryObject {
 				return Err(MemoryError::OutOfMemory);
 			}
 		};
-		Ok(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * page, mapped_at: AtomicU64::new(0), domain: Some(domain.clone()) }))
+		Ok(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * page, mapped_at: AtomicU64::new(0), mapped_cr3: AtomicU64::new(0), domain: Some(domain.clone()) }))
 	}
 
 	// Take `pages` frames, rolling back on the first failure.
@@ -106,6 +111,15 @@ impl MemoryObject {
 
 	pub fn set_mapped_at(&self, virt: u64) {
 		self.mapped_at.store(virt, Ordering::Release);
+	}
+
+	// The address space (CR3) the current mapping belongs to.
+	pub fn mapped_cr3(&self) -> u64 {
+		self.mapped_cr3.load(Ordering::Acquire)
+	}
+
+	pub fn set_mapped_cr3(&self, cr3: u64) {
+		self.mapped_cr3.store(cr3, Ordering::Release);
 	}
 }
 
