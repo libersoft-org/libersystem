@@ -193,6 +193,7 @@ fn boot_main() {
 	userspace_fault_demo();
 	domain_lifecycle_demo();
 	storage_demo();
+	pci_demo();
 	ipc_bench();
 	cli::demo();
 	serial_println!("boot OK - entering the userspace shell (type 'help', or 'exit' to halt)");
@@ -741,6 +742,21 @@ fn storage_demo() {
 			}
 		}
 		Err(reason) => serial_println!("storage: ERROR - {}", reason),
+	}
+}
+
+// Scan the PCI bus and report the devices found, flagging the virtio devices the
+// driver milestones will drive. DeviceManager will later do the same enumeration
+// over a syscall and hand each driver its device's capabilities.
+#[cfg(not(test))]
+fn pci_demo() {
+	let devices = arch::pci::scan();
+	serial_println!("pci: {} device(s) on bus 0", devices.len());
+	for d in &devices {
+		match d.virtio_type() {
+			Some(t) => serial_println!("pci: {:02x}:{:02x}.{} virtio-{} (id {:#06x}) bar0 {:#010x}", d.bus, d.dev, d.func, arch::pci::virtio_type_name(t), d.device_id, d.bars[0]),
+			None => serial_println!("pci: {:02x}:{:02x}.{} vendor {:#06x} device {:#06x} class {:#04x}.{:#04x}", d.bus, d.dev, d.func, d.vendor, d.device_id, d.class, d.subclass),
+		}
 	}
 }
 
@@ -1691,6 +1707,21 @@ fn channel_endpoint_semantics() {
 	drop(a);
 	assert!(b.is_peer_closed());
 	assert!(matches!(b.recv(), Err(ChannelError::PeerClosed)));
+}
+
+#[cfg(test)]
+#[test_case]
+fn pci_scan_finds_virtio_devices() {
+	// QEMU is launched (see qemu-run.sh) with virtio-blk, virtio-net, and a virtio
+	// serial device on the PCI bus. The kernel's PCI scan must find them: at least
+	// one device carrying virtio's PCI vendor id, and each such modern virtio device
+	// must report a recognizable device type.
+	let devices = arch::pci::scan();
+	let virtio: alloc::vec::Vec<_> = devices.iter().filter(|d| d.is_virtio()).collect();
+	assert!(!virtio.is_empty(), "the PCI scan should find the QEMU virtio devices");
+	for d in &virtio {
+		assert!(d.virtio_type().is_some(), "a modern virtio device should report a device type (id {:#06x})", d.device_id);
+	}
 }
 
 #[cfg(test)]

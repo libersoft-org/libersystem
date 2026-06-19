@@ -26,6 +26,22 @@ QEMU_ARGS=(
 	-serial "${SERIAL:-mon:stdio}"
 )
 
+# virtio devices for the driver milestones (M23/M24): a scratch block disk, a
+# user-mode NIC, and a virtio serial/console. The kernel's PCI scan discovers them
+# and userspace drivers drive them. `disable-legacy=on` forces the modern virtio
+# transport (MMIO BARs + PCI capabilities, device id 0x1040 + virtio type), which
+# fits the userspace capability-driver model. The scratch disk is created once.
+VIRTIO_DISK="$HERE/.build/virtio-blk.img"
+mkdir -p "$HERE/.build"
+[[ -f "$VIRTIO_DISK" ]] || truncate -s 16M "$VIRTIO_DISK"
+QEMU_ARGS+=(
+	-drive "file=$VIRTIO_DISK,if=none,id=vblk,format=raw"
+	-device virtio-blk-pci,drive=vblk,disable-legacy=on
+	-netdev user,id=vnet0
+	-device virtio-net-pci,netdev=vnet0,disable-legacy=on
+	-device virtio-serial-pci,disable-legacy=on
+)
+
 # display backends: the DISPLAYS env is a space-separated list, any of `vnc` and
 # `spice` (both may be given at once; empty = headless, serial only). The
 # framebuffer is always rendered and can also be screenshotted via screenshot.sh.

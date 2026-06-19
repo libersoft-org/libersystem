@@ -5,6 +5,7 @@ pub mod idt;
 pub mod interrupts;
 pub mod msr;
 pub mod paging;
+pub mod pci;
 pub mod percpu;
 mod pit;
 mod port;
