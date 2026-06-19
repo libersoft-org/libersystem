@@ -192,12 +192,11 @@ fn boot_main() {
 	userspace_demo();
 	userspace_fault_demo();
 	domain_lifecycle_demo();
-	system_manager_demo();
 	storage_demo();
 	ipc_bench();
 	cli::demo();
 	serial_println!("boot OK - entering the userspace shell (type 'help', or 'exit' to halt)");
-	console_shell_loop();
+	boot_userspace_with_recovery();
 	serial_println!("halting");
 }
 
@@ -532,9 +531,10 @@ fn volume_package_bytes() -> Option<&'static [u8]> {
 // Load SystemManager from the init package into a new ring-3 process, handing it
 // one end of a fresh channel as its bootstrap capability and, over that channel,
 // the init package itself as a shared buffer so it can spawn the services it
-// supervises. Returns the kernel-held peer endpoint, on which the boot chain's
-// reports arrive. Shared by the boot demo and the test.
-fn spawn_system_manager() -> Result<alloc::sync::Arc<object::channel::Channel>, &'static str> {
+// supervises. Returns the kernel-held peer endpoint (on which the boot chain's
+// reports arrive) and the SystemManager process's koid (which the recovery
+// supervisor watches for a fault). Shared by the boot path and the test.
+fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>, u64), &'static str> {
 	use alloc::sync::Arc;
 	use object::KernelObject;
 	use object::channel::Message;
@@ -546,7 +546,8 @@ fn spawn_system_manager() -> Result<alloc::sync::Arc<object::channel::Channel>, 
 	let package = pkg::Package::parse(bytes).ok_or("init package is malformed")?;
 	let elf_image = package.lookup(b"system_manager").ok_or("system_manager missing from init package")?;
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), elf_image, user_ep, Rights::ALL, 0).map_err(|_| "failed to load SystemManager")?;
+	let process = loader::spawn_elf_process(sched::root_domain(), elf_image, user_ep, Rights::ALL, 0).map_err(|_| "failed to load SystemManager")?;
+	let sm_koid = process.header().koid();
 
 	// Hand SystemManager the init package as a read-only shared buffer: the kernel
 	// copies the package bytes into a MemoryObject and sends "PACKAGE" + length
@@ -571,27 +572,80 @@ fn spawn_system_manager() -> Result<alloc::sync::Arc<object::channel::Channel>, 
 	rdmsg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
 	let rdcap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
 	kernel_ep.send(Message::new(rdmsg, alloc::vec![rdcap], 0)).map_err(|_| "failed to hand SystemManager the ramdisk")?;
-	Ok(kernel_ep)
+	Ok((kernel_ep, sm_koid))
 }
 
-// Start the first userspace process from the init package and read back the
-// reports relayed up the boot chain over its bootstrap channel - SystemManager
-// spawning ServiceManager, each reporting in.
-#[cfg(not(test))]
-fn system_manager_demo() {
-	match spawn_system_manager() {
-		Ok(kernel_ep) => {
-			sched::run_until_idle();
-			let mut any = false;
-			while let Ok(message) = kernel_ep.recv() {
-				any = true;
-				serial_println!("userspace: {}", core::str::from_utf8(&message.bytes).unwrap_or("<bad>"));
-			}
-			if !any {
-				serial_println!("userspace: ERROR - SystemManager sent no message");
+// Drain the crash-notify channel and report whether the process `koid` faulted.
+// Each record fault::notify_crash sends is [koid u64 LE][kind u64 LE].
+fn crash_seen(crash_rx: &object::channel::Channel, koid: u64) -> bool {
+	let mut found = false;
+	while let Ok(message) = crash_rx.recv() {
+		if message.bytes.len() >= 8 {
+			let crashed = u64::from_le_bytes([message.bytes[0], message.bytes[1], message.bytes[2], message.bytes[3], message.bytes[4], message.bytes[5], message.bytes[6], message.bytes[7]]);
+			if crashed == koid {
+				found = true;
 			}
 		}
-		Err(reason) => serial_println!("userspace: ERROR - could not start SystemManager: {}", reason),
+	}
+	found
+}
+
+// Supervise a critical process (SystemManager) through the recovery ladder: each
+// round, `spawn` it (returning its process koid, or 0 if it could not be spawned),
+// run the system to a quiescent point, and check the crash channel. Returns true
+// as soon as a round completes without the process faulting (the system is up), or
+// false once every attempt - the original plus `max_restarts` recovery restarts -
+// has faulted, at which point the caller escalates (reboot as the last resort).
+// This is the kernel's one minimal rescue mechanism, the single exception to
+// "the kernel is pure mechanism".
+fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, mut spawn: impl FnMut() -> u64) -> bool {
+	for attempt in 0..=max_restarts {
+		let koid = spawn();
+		sched::run_until_idle();
+		if koid == 0 || !crash_seen(crash_rx, koid) {
+			return true;
+		}
+		serial_println!("recovery: SystemManager (koid {}) faulted - starting a recovery SystemManager (attempt {} of {})", koid, attempt + 1, max_restarts + 1);
+	}
+	false
+}
+
+// Bring up the userspace system under SystemManager-crash recovery, then hand
+// control to the interactive shell. The kernel registers a crash-notify channel
+// and supervises SystemManager: if it faults before the system is up, the kernel
+// starts a recovery SystemManager, up to a few times, and reboots as the last
+// resort. On a clean start it prints the boot-chain reports and runs the shell.
+#[cfg(not(test))]
+fn boot_userspace_with_recovery() {
+	use alloc::sync::Arc;
+	const MAX_RESTARTS: u32 = 3;
+	let (crash_tx, crash_rx) = object::channel::Channel::create();
+	fault::set_crash_notify(crash_tx);
+	let mut kernel_ep: Option<Arc<object::channel::Channel>> = None;
+	let up = supervise(&crash_rx, MAX_RESTARTS, || match spawn_system_manager() {
+		Ok((ep, koid)) => {
+			kernel_ep = Some(ep);
+			koid
+		}
+		Err(reason) => {
+			serial_println!("recovery: could not start SystemManager: {}", reason);
+			0
+		}
+	});
+	if up {
+		// SystemManager came up without faulting: print the boot-chain reports and
+		// hand control to the interactive shell it started.
+		if let Some(ep) = &kernel_ep {
+			while let Ok(message) = ep.recv() {
+				serial_println!("userspace: {}", core::str::from_utf8(&message.bytes).unwrap_or("<bad>"));
+			}
+		}
+		console_shell_loop();
+		fault::clear_crash_notify();
+	} else {
+		fault::clear_crash_notify();
+		serial_println!("recovery: SystemManager could not be stabilized after {} attempts - rebooting", MAX_RESTARTS + 1);
+		arch::reset();
 	}
 }
 
@@ -1652,13 +1706,49 @@ fn init_package_starts_system_manager() {
 	// and proves the round-trip by reading a file with `cat` before it reports in.
 	// Every report is relayed up, so the kernel observes the services come up in
 	// dependency order followed by the two managers.
-	let kernel_ep = spawn_system_manager().expect("SystemManager should start from the init package");
+	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
 	let reports: [&[u8]; 6] = [b"LogService: online", b"DeviceManager: online", b"StorageService: online", b"Shell: online", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");
 	}
+}
+
+#[cfg(test)]
+#[test_case]
+fn system_manager_recovery_escalates_after_repeated_crashes() {
+	use object::KernelObject;
+	// The kernel supervises SystemManager: if it faults, the kernel starts a
+	// recovery SystemManager, up to a limit, then escalates (it reboots in
+	// production). Here the "SystemManager" faults on every attempt (a ring-3 page
+	// fault), so supervision detects each crash via the crash-notify channel,
+	// exhausts its restarts, and reports failure - the trigger for escalation.
+	let (crash_tx, crash_rx) = object::channel::Channel::create();
+	fault::set_crash_notify(crash_tx);
+	let up = supervise(&crash_rx, 3, || {
+		let thread = sched::spawn(user_fault_thread_body, 0);
+		thread.process().header().koid()
+	});
+	fault::clear_crash_notify();
+	assert!(!up, "a SystemManager that faults on every attempt must exhaust recovery and escalate");
+}
+
+#[cfg(test)]
+#[test_case]
+fn system_manager_recovery_survives_a_clean_start() {
+	use object::KernelObject;
+	// A SystemManager that does not fault must survive on the first attempt, so
+	// supervision returns "up" without starting a recovery SystemManager.
+	extern "C" fn clean_body(_arg: u64) {}
+	let (crash_tx, crash_rx) = object::channel::Channel::create();
+	fault::set_crash_notify(crash_tx);
+	let up = supervise(&crash_rx, 3, || {
+		let thread = sched::spawn(clean_body, 0);
+		thread.process().header().koid()
+	});
+	fault::clear_crash_notify();
+	assert!(up, "a SystemManager that does not fault should survive without recovery");
 }
 
 #[cfg(test)]
