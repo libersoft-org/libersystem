@@ -12,6 +12,17 @@
 //! Wire layout (all integers little-endian):
 //! `[ts u64][severity u8][source_len u16][source][field_count u16]( [key_len u16][key][val_len u16][val] )*`
 
+// LogService request opcodes (the first byte of a message on its serve channel).
+// EMIT carries one encoded LogRecord to store; QUERY carries a [format][min
+// severity] pair and is answered with the rendered matching records.
+pub const OP_EMIT: u8 = 1;
+pub const OP_QUERY: u8 = 2;
+
+// Representation a QUERY asks the matching records to be rendered in.
+pub const FORMAT_TEXT: u8 = 0;
+pub const FORMAT_JSON: u8 = 1;
+pub const FORMAT_CBOR: u8 = 2;
+
 // Log severity, ordered from least to most urgent. The numeric value is the
 // stable wire encoding (a single byte in the record).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
