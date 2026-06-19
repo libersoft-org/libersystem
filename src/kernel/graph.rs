@@ -12,9 +12,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::object::KernelObject;
 use crate::object::domain::{Domain, UNLIMITED};
 use crate::object::handle::HandleInfo;
-use crate::object::KernelObject;
 use crate::sched;
 
 // One process in the graph: its identity and the handles it holds.

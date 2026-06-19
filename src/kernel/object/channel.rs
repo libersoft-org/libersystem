@@ -109,11 +109,7 @@ impl Channel {
 		if let Some(msg) = self.inbox.lock().pop_front() {
 			return Ok(msg);
 		}
-		if self.is_peer_closed() {
-			Err(ChannelError::PeerClosed)
-		} else {
-			Err(ChannelError::Empty)
-		}
+		if self.is_peer_closed() { Err(ChannelError::PeerClosed) } else { Err(ChannelError::Empty) }
 	}
 }
 

@@ -14,7 +14,7 @@ use rt::*;
 // the file this client opens through the StorageManager
 const TARGET_URI: &[u8] = b"vol://system/hello.txt";
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	// 1. connect: receive the manager's service channel.

@@ -35,10 +35,12 @@ impl FrameAllocator {
 	// SAFETY: `phys` must be a page-aligned physical frame that is currently
 	// unused and mapped by the HHDM.
 	unsafe fn push(&mut self, phys: u64) {
-		let link = (self.hhdm + phys) as *mut u64;
-		link.write_volatile(self.free_head);
-		self.free_head = phys;
-		self.free_count += 1;
+		unsafe {
+			let link = (self.hhdm + phys) as *mut u64;
+			link.write_volatile(self.free_head);
+			self.free_head = phys;
+			self.free_count += 1;
+		}
 	}
 
 	fn pop(&mut self) -> Option<u64> {

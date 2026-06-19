@@ -45,7 +45,7 @@ fn dispatch(vector: u8) {
 }
 
 macro_rules! irq_stub {
-	($name:ident, $vector:expr) => {
+	($name:ident, $vector:expr_2021) => {
 		extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
 			dispatch($vector);
 		}

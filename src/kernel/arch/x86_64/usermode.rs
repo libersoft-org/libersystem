@@ -34,7 +34,7 @@ const USER_RFLAGS: u64 = 0x202;
 // value in CR2. Tests assert the recorded fault address matches.
 pub const FAULT_PROBE_ADDR: u64 = 0x0dea_d000;
 
-extern "C" {
+unsafe extern "C" {
 	fn user_enter(entry: u64, user_stack: u64, arg: u64, ksave: u64);
 	fn user_return() -> !;
 	fn user_program_start();
@@ -52,26 +52,28 @@ extern "C" {
 // SAFETY: `entry` and `user_stack` must be valid, USER-mapped addresses; the
 // per-CPU syscall MSRs must already be programmed.
 pub unsafe fn enter(entry: u64, user_stack: u64, arg: u64) {
-	// The excursion ends by longjmping through `user_return`, which unwinds with a
-	// plain `ret` rather than `iretq`. That restores the callee-saved registers
-	// but not RFLAGS, so the interrupt flag - cleared by the syscall or exception
-	// entry that ended the excursion - would stay masked on return. Capture the
-	// caller's interrupt state and restore it afterwards so the excursion is
-	// transparent.
-	let rflags: u64;
-	core::arch::asm!("pushfq", "pop {}", out(reg) rflags, options(preserves_flags));
-	// Park the kernel stack pointer in the running thread, not just the per-CPU
-	// block, so a ring-3 syscall that yields to another cooperative service on the
-	// same core finds the right stack again when the scheduler switches back.
-	let ksave: u64 = sched::current_thread().map_or(0, |thread| thread.syscall_rsp_addr() as u64);
-	user_enter(entry, user_stack, arg, ksave);
-	// The excursion is over: this thread is no longer in ring 3, so clear the
-	// parked pointer to keep a stale value out of a later scheduler restore.
-	if let Some(thread) = sched::current_thread() {
-		thread.set_syscall_rsp(0);
-	}
-	if rflags & (1 << 9) != 0 {
-		super::enable_interrupts();
+	unsafe {
+		// The excursion ends by longjmping through `user_return`, which unwinds with a
+		// plain `ret` rather than `iretq`. That restores the callee-saved registers
+		// but not RFLAGS, so the interrupt flag - cleared by the syscall or exception
+		// entry that ended the excursion - would stay masked on return. Capture the
+		// caller's interrupt state and restore it afterwards so the excursion is
+		// transparent.
+		let rflags: u64;
+		core::arch::asm!("pushfq", "pop {}", out(reg) rflags, options(preserves_flags));
+		// Park the kernel stack pointer in the running thread, not just the per-CPU
+		// block, so a ring-3 syscall that yields to another cooperative service on the
+		// same core finds the right stack again when the scheduler switches back.
+		let ksave: u64 = sched::current_thread().map_or(0, |thread| thread.syscall_rsp_addr() as u64);
+		user_enter(entry, user_stack, arg, ksave);
+		// The excursion is over: this thread is no longer in ring 3, so clear the
+		// parked pointer to keep a stale value out of a later scheduler restore.
+		if let Some(thread) = sched::current_thread() {
+			thread.set_syscall_rsp(0);
+		}
+		if rflags & (1 << 9) != 0 {
+			super::enable_interrupts();
+		}
 	}
 }
 

@@ -16,7 +16,7 @@ use rt::*;
 
 // Report in to the kernel over the bootstrap channel, then exit. `rt`'s `_start`
 // enters here with the bootstrap channel handle in rdi.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let message = b"SystemManager: online";
 	unsafe {

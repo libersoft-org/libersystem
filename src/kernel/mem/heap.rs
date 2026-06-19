@@ -65,19 +65,23 @@ impl Heap {
 	// SAFETY: the caller must give an unused, mapped region [start, start+size)
 	// and call this exactly once.
 	unsafe fn init(&mut self, start: usize, size: usize) {
-		self.add_free_region(start, size);
+		unsafe {
+			self.add_free_region(start, size);
+		}
 	}
 
 	// SAFETY: `addr` must be valid for writes and large enough to hold a node.
 	unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
-		assert_eq!(align_up(addr, mem::align_of::<FreeRegion>()), addr);
-		assert!(size >= mem::size_of::<FreeRegion>());
+		unsafe {
+			assert_eq!(align_up(addr, mem::align_of::<FreeRegion>()), addr);
+			assert!(size >= mem::size_of::<FreeRegion>());
 
-		let mut region = FreeRegion::new(size);
-		region.next = self.head.next.take();
-		let region_ptr = addr as *mut FreeRegion;
-		region_ptr.write(region);
-		self.head.next = Some(&mut *region_ptr);
+			let mut region = FreeRegion::new(size);
+			region.next = self.head.next.take();
+			let region_ptr = addr as *mut FreeRegion;
+			region_ptr.write(region);
+			self.head.next = Some(&mut *region_ptr);
+		}
 	}
 
 	// Find the first free region that fits `size`/`align`, remove it from the
@@ -133,24 +137,28 @@ impl LockedHeap {
 
 unsafe impl GlobalAlloc for LockedHeap {
 	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-		let (size, align) = Heap::size_align(layout);
-		let mut heap = self.lock();
-		match heap.find_region(size, align) {
-			Some((region, alloc_start)) => {
-				let alloc_end = alloc_start.checked_add(size).expect("alloc overflow");
-				let excess = region.end_addr() - alloc_end;
-				if excess > 0 {
-					heap.add_free_region(alloc_end, excess);
+		unsafe {
+			let (size, align) = Heap::size_align(layout);
+			let mut heap = self.lock();
+			match heap.find_region(size, align) {
+				Some((region, alloc_start)) => {
+					let alloc_end = alloc_start.checked_add(size).expect("alloc overflow");
+					let excess = region.end_addr() - alloc_end;
+					if excess > 0 {
+						heap.add_free_region(alloc_end, excess);
+					}
+					alloc_start as *mut u8
 				}
-				alloc_start as *mut u8
+				None => ptr::null_mut(),
 			}
-			None => ptr::null_mut(),
 		}
 	}
 
 	unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-		let (size, _) = Heap::size_align(layout);
-		self.lock().add_free_region(ptr as usize, size);
+		unsafe {
+			let (size, _) = Heap::size_align(layout);
+			self.lock().add_free_region(ptr as usize, size);
+		}
 	}
 }
 

@@ -20,12 +20,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch;
 use crate::arch::percpu::MAX_CPUS;
+use crate::object::KernelObject;
 use crate::object::address_space::AddressSpace;
 use crate::object::domain::Domain;
 use crate::object::process::Process;
 use crate::object::rights::Rights;
 use crate::object::thread::{Thread, ThreadState};
-use crate::object::KernelObject;
 use crate::sync::SpinLock;
 
 // How the scheduler should treat the outgoing thread when switching away.

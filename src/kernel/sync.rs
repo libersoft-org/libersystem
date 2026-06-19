@@ -39,11 +39,7 @@ impl<T> SpinLock<T> {
 	}
 
 	pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
-		if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-			Some(SpinLockGuard { lock: self })
-		} else {
-			None
-		}
+		if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() { Some(SpinLockGuard { lock: self }) } else { None }
 	}
 }
 

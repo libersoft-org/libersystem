@@ -44,11 +44,7 @@ impl Timer {
 	// The armed deadline in ticks, or None if the timer is not armed. Used by `wait`
 	// to wake the caller when the timer fires.
 	pub fn deadline(&self) -> Option<u64> {
-		if self.armed.load(Ordering::Acquire) {
-			Some(self.deadline.load(Ordering::Acquire))
-		} else {
-			None
-		}
+		if self.armed.load(Ordering::Acquire) { Some(self.deadline.load(Ordering::Acquire)) } else { None }
 	}
 }
 

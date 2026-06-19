@@ -35,7 +35,7 @@ use crate::sched;
 // kernel/userspace ABI: defined once in the abi crate (the single source of
 // truth) and re-exported here so the rest of the kernel keeps referring to them
 // as `syscall::SYS_*` / `syscall::ERR_*` / `syscall::sys_is_err`.
-pub use abi::{sys_is_err, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NOT_MAPPED, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
 
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. repr(C) with only
@@ -95,7 +95,7 @@ fn alloc_user_vrange(len: u64) -> u64 {
 
 // Entry point called by the architecture syscall stub. `num` selects the call;
 // the meaning of the arguments and the return value is per-syscall.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 	let result: i64 = match num {
 		SYS_DEBUG_NOOP => a0 as i64,

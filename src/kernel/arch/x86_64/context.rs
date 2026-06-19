@@ -10,7 +10,7 @@
 
 use core::arch::{asm, global_asm};
 
-extern "C" {
+unsafe extern "C" {
 	// Save the current context to *old_sp and resume the context at new_sp.
 	pub fn switch_context(old_sp: *mut u64, new_sp: u64);
 	// Return target baked into a new thread's initial stack frame.
@@ -48,7 +48,7 @@ global_asm!(
 
 // First Rust code a freshly scheduled thread runs. Calls the thread entry with
 // its argument; when the entry returns, the thread exits and never comes back.
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn thread_bootstrap(entry: u64, arg: u64) -> ! {
 	let entry_fn: extern "C" fn(u64) = unsafe { core::mem::transmute(entry) };
 	entry_fn(arg);
@@ -93,5 +93,7 @@ pub fn read_cr3() -> u64 {
 // SAFETY: `cr3` must be the physical address of a valid PML4 whose kernel half
 // maps the currently executing code and stack.
 pub unsafe fn write_cr3(cr3: u64) {
-	asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+	unsafe {
+		asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+	}
 }

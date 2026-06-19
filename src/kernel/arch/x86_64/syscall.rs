@@ -43,7 +43,7 @@ const EFER_SCE: u64 = 1 << 0;
 // Flags cleared from RFLAGS on entry: trap, interrupt, direction, nested, align.
 const FMASK: u64 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 18);
 
-extern "C" {
+unsafe extern "C" {
 	fn syscall_entry();
 }
 
@@ -132,18 +132,20 @@ pub fn init() {
 // SAFETY: performs a raw `syscall`; the per-core syscall MSRs must be initialized
 // first (see init()). The handler runs with interrupts masked.
 pub unsafe fn invoke(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-	let ret: u64;
-	asm!(
-		"syscall",
-		inlateout("rax") num => ret,
-		inlateout("rdi") a0 => _,
-		inlateout("rsi") a1 => _,
-		inlateout("rdx") a2 => _,
-		inlateout("r10") a3 => _,
-		lateout("rcx") _,
-		lateout("r11") _,
-		lateout("r8") _,
-		lateout("r9") _,
-	);
-	ret
+	unsafe {
+		let ret: u64;
+		asm!(
+			"syscall",
+			inlateout("rax") num => ret,
+			inlateout("rdi") a0 => _,
+			inlateout("rsi") a1 => _,
+			inlateout("rdx") a2 => _,
+			inlateout("r10") a3 => _,
+			lateout("rcx") _,
+			lateout("r11") _,
+			lateout("r8") _,
+			lateout("r9") _,
+		);
+		ret
+	}
 }

@@ -24,48 +24,48 @@ mod smp;
 mod sync;
 mod syscall;
 
-use limine::request::{FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, MpRequest, RequestsEndMarker, RequestsStartMarker};
 use limine::BaseRevision;
+use limine::request::{FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, MpRequest, RequestsEndMarker, RequestsStartMarker};
 
 // Limine boot protocol: request declarations.
 // Base revision tells the bootloader which protocol revision the kernel speaks.
 #[used]
-#[link_section = ".limine_requests"]
+#[unsafe(link_section = ".limine_requests")]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
 
 // HHDM: Limine maps all physical memory at a fixed higher-half offset.
 #[used]
-#[link_section = ".limine_requests"]
+#[unsafe(link_section = ".limine_requests")]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 // Physical memory map: usable regions become the frame allocator's free list.
 #[used]
-#[link_section = ".limine_requests"]
+#[unsafe(link_section = ".limine_requests")]
 static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 
 // Multiprocessor: ask Limine to start the other cores (parked until we wake them).
 #[used]
-#[link_section = ".limine_requests"]
+#[unsafe(link_section = ".limine_requests")]
 static MP_REQUEST: MpRequest = MpRequest::new();
 
 // Init package: a Limine module (boot/init.pkg) holding the first userspace
 // programs - SystemManager for now - which the kernel ELF-loads and runs.
 #[used]
-#[link_section = ".limine_requests"]
+#[unsafe(link_section = ".limine_requests")]
 static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 
 // Framebuffer: a linear RGB video mode for the on-screen console (M15).
 #[used]
-#[link_section = ".limine_requests"]
+#[unsafe(link_section = ".limine_requests")]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
 // Start/end markers delimit the request block so Limine can locate it.
 #[used]
-#[link_section = ".limine_requests_start"]
+#[unsafe(link_section = ".limine_requests_start")]
 static _REQUESTS_START: RequestsStartMarker = RequestsStartMarker::new();
 
 #[used]
-#[link_section = ".limine_requests_end"]
+#[unsafe(link_section = ".limine_requests_end")]
 static _REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
 
 // print macros (architecture-independent, target arch::serial::SerialWriter)
@@ -98,7 +98,7 @@ pub fn _print(args: core::fmt::Arguments<'_>) {
 }
 
 // kernel entry point (ELF entry, see ENTRY(kmain) in the linker script)
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn kmain() -> ! {
 	arch::serial::init();
 	arch::init();
@@ -565,11 +565,11 @@ fn copy_into_object(object: &alloc::sync::Arc<object::memory_object::MemoryObjec
 // the boot demo and the test.
 fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
 	use alloc::sync::Arc;
+	use object::KernelObject;
 	use object::channel::{Channel, Message};
 	use object::handle::Capability;
 	use object::memory_object::MemoryObject;
 	use object::rights::Rights;
-	use object::KernelObject;
 
 	// the volume archive backing the ramdisk, and the file we expect served
 	let volume = volume_package_bytes().ok_or("volume package module not found")?;
@@ -638,11 +638,11 @@ fn storage_demo() {
 // buffer through the HHDM. Returns the file's bytes, or an error string.
 fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
 	use alloc::sync::Arc;
+	use object::KernelObject;
 	use object::channel::{Channel, Message};
 	use object::handle::Capability;
 	use object::memory_object::MemoryObject;
 	use object::rights::Rights;
-	use object::KernelObject;
 
 	let volume = volume_package_bytes().ok_or("volume package module not found")?;
 	let init = init_package_bytes().ok_or("init package module not found")?;
@@ -1014,9 +1014,9 @@ fn handle_revocation_invalidates() {
 #[cfg(test)]
 #[test_case]
 fn handle_type_sealing() {
+	use object::ObjectType;
 	use object::handle::{HandleError, HandleTable};
 	use object::rights::Rights;
-	use object::ObjectType;
 	let mut table = HandleTable::new();
 	let h = table.insert_object(TestObject::new(5), Rights::READ, 0);
 	assert!(table.lookup_typed(h, ObjectType::Event, Rights::READ).is_ok());
@@ -1410,8 +1410,8 @@ fn object_info_get_reports_object() {
 	// a spawned kernel thread (which has one). It reports the object's identity,
 	// type, and the rights the handle confers, and rejects an unknown handle.
 	extern "C" fn body(_arg: u64) {
-		use object::rights::Rights;
 		use object::ObjectType;
+		use object::rights::Rights;
 		unsafe {
 			let handle = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0);
 			assert!(!syscall::sys_is_err(handle));

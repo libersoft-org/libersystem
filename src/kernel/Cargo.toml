@@ -2,8 +2,8 @@
 name = "kernel"
 # The product version is the single source of truth in /product.conf (surfaced at
 # runtime via build.rs -> env!("PRODUCT_VERSION")); Cargo's optional package
-# version is unused here and omitted (defaults to 0.0.0).
-edition = "2021"
+# version is unused here and omitted.
+edition = "2024"
 description = "OS kernel"
 
 [[bin]]

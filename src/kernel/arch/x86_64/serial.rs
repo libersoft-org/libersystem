@@ -7,14 +7,18 @@ const COM1: u16 = 0x3F8;
 
 #[inline]
 unsafe fn outb(port: u16, value: u8) {
-	asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
+	unsafe {
+		asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
+	}
 }
 
 #[inline]
 unsafe fn inb(port: u16) -> u8 {
-	let value: u8;
-	asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
-	value
+	unsafe {
+		let value: u8;
+		asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
+		value
+	}
 }
 
 // UART init: 38400 baud, 8N1, FIFO enabled
@@ -49,11 +53,7 @@ fn data_ready() -> bool {
 // Read one received byte without waiting: Some(byte) if one is buffered, else
 // None. Lets a poller (the serial CLI) check for input without blocking.
 pub fn read_byte() -> Option<u8> {
-	if data_ready() {
-		Some(unsafe { inb(COM1) })
-	} else {
-		None
-	}
+	if data_ready() { Some(unsafe { inb(COM1) }) } else { None }
 }
 
 // Read one received byte, spinning until one arrives. Interrupts stay enabled

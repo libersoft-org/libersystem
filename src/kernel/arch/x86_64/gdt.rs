@@ -120,12 +120,16 @@ pub fn load_ap(cpu: usize) {
 }
 
 unsafe fn load_gdt() {
-	let ptr = DescriptorPointer { limit: (size_of::<[u64; GDT_ENTRIES]>() - 1) as u16, base: addr_of!(GDT) as u64 };
-	asm!("lgdt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags));
+	unsafe {
+		let ptr = DescriptorPointer { limit: (size_of::<[u64; GDT_ENTRIES]>() - 1) as u16, base: addr_of!(GDT) as u64 };
+		asm!("lgdt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags));
+	}
 }
 
 unsafe fn load_tss(cpu: usize) {
-	asm!("ltr {0:x}", in(reg) tss_selector(cpu), options(nostack, preserves_flags));
+	unsafe {
+		asm!("ltr {0:x}", in(reg) tss_selector(cpu), options(nostack, preserves_flags));
+	}
 }
 
 // Build the two 64-bit halves of a 64-bit TSS system descriptor.
@@ -143,23 +147,25 @@ fn tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
 // Reload CS via a far return and the data/stack segments via plain moves, so the
 // CPU uses our freshly installed descriptors instead of the bootloader's.
 unsafe fn reload_segments() {
-	asm!(
-		"push {sel}",
-		"lea {tmp}, [rip + 2f]",
-		"push {tmp}",
-		"retfq",
-		"2:",
-		sel = in(reg) KERNEL_CODE_SELECTOR as u64,
-		tmp = lateout(reg) _,
-		options(preserves_flags),
-	);
-	asm!(
-		"mov ds, {0:x}",
-		"mov es, {0:x}",
-		"mov ss, {0:x}",
-		"mov fs, {0:x}",
-		"mov gs, {0:x}",
-		in(reg) KERNEL_DATA_SELECTOR,
-		options(nostack, preserves_flags),
-	);
+	unsafe {
+		asm!(
+			"push {sel}",
+			"lea {tmp}, [rip + 2f]",
+			"push {tmp}",
+			"retfq",
+			"2:",
+			sel = in(reg) KERNEL_CODE_SELECTOR as u64,
+			tmp = lateout(reg) _,
+			options(preserves_flags),
+		);
+		asm!(
+			"mov ds, {0:x}",
+			"mov es, {0:x}",
+			"mov ss, {0:x}",
+			"mov fs, {0:x}",
+			"mov gs, {0:x}",
+			in(reg) KERNEL_DATA_SELECTOR,
+			options(nostack, preserves_flags),
+		);
+	}
 }

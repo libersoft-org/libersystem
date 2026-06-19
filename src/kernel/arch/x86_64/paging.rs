@@ -52,22 +52,24 @@ fn table_ptr(phys: u64) -> *mut u64 {
 //
 // SAFETY: `table` must point at a valid 512-entry page table.
 unsafe fn next_table_create(table: *mut u64, index: usize, parent_flags: u64) -> u64 {
-	let entry = table.add(index);
-	let value = entry.read_volatile();
-	if value & PRESENT == 0 {
-		let new = frame::allocate().expect("out of frames: page table");
-		let new_table = table_ptr(new);
-		for i in 0..ENTRY_COUNT {
-			new_table.add(i).write_volatile(0);
+	unsafe {
+		let entry = table.add(index);
+		let value = entry.read_volatile();
+		if value & PRESENT == 0 {
+			let new = frame::allocate().expect("out of frames: page table");
+			let new_table = table_ptr(new);
+			for i in 0..ENTRY_COUNT {
+				new_table.add(i).write_volatile(0);
+			}
+			entry.write_volatile((new & ADDR_MASK) | PRESENT | WRITABLE | parent_flags);
+			new
+		} else {
+			// Widen an existing intermediate to also grant the requested bits.
+			if value & parent_flags != parent_flags {
+				entry.write_volatile(value | parent_flags);
+			}
+			value & ADDR_MASK
 		}
-		entry.write_volatile((new & ADDR_MASK) | PRESENT | WRITABLE | parent_flags);
-		new
-	} else {
-		// Widen an existing intermediate to also grant the requested bits.
-		if value & parent_flags != parent_flags {
-			entry.write_volatile(value | parent_flags);
-		}
-		value & ADDR_MASK
 	}
 }
 
@@ -170,31 +172,33 @@ pub fn free_address_space(pml4_phys: u64) {
 //
 // SAFETY: `phys` must be the physical address of a valid page table at `level`.
 unsafe fn free_table_level(phys: u64, level: u32) {
-	if level > 1 {
-		let table = table_ptr(phys);
-		for i in 0..ENTRY_COUNT {
-			let entry = table.add(i).read_volatile();
-			if entry & PRESENT != 0 {
-				free_table_level(entry & ADDR_MASK, level - 1);
+	unsafe {
+		if level > 1 {
+			let table = table_ptr(phys);
+			for i in 0..ENTRY_COUNT {
+				let entry = table.add(i).read_volatile();
+				if entry & PRESENT != 0 {
+					free_table_level(entry & ADDR_MASK, level - 1);
+				}
 			}
 		}
+		frame::deallocate(phys);
 	}
-	frame::deallocate(phys);
 }
 
 // Return the physical address of the next-level table, or None if not present.
 //
 // SAFETY: `table` must point at a valid 512-entry page table.
 unsafe fn next_table_walk(table: *mut u64, index: usize) -> Option<u64> {
-	let entry = table.add(index).read_volatile();
-	if entry & PRESENT == 0 {
-		None
-	} else {
-		Some(entry & ADDR_MASK)
+	unsafe {
+		let entry = table.add(index).read_volatile();
+		if entry & PRESENT == 0 { None } else { Some(entry & ADDR_MASK) }
 	}
 }
 
 // Invalidate the TLB entry for a single page.
 unsafe fn invlpg(virt: u64) {
-	asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
+	unsafe {
+		asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
+	}
 }
