@@ -5,12 +5,13 @@
 // maps the package and brings up the core services in dependency order: a service
 // is started only once every service it depends on is up. Each service is spawned
 // with its own report channel; ServiceManager waits for its "online" report,
-// records its state, and relays that report up to SystemManager. After the whole
-// set is up it reports in itself.
+// records its state, keeps that channel as the service's control channel, and
+// relays the report up to SystemManager. After the whole set is up it exercises
+// the stop path on a leaf service, then reports in itself.
 //
 // The supervisor is intentionally minimal for this milestone: start in dependency
-// order and track each service's state. A restart policy and a heartbeat/watchdog
-// are a later phase.
+// order, track each service's state, and stop a service on request. A restart
+// policy and a heartbeat/watchdog are a later phase.
 
 #![no_std]
 #![no_main]
@@ -43,6 +44,8 @@ enum State {
 	Pending,
 	// Started and reported in.
 	Running,
+	// Stopped on request after having run.
+	Stopped,
 	// Could not be started, or did not report in.
 	Failed,
 }
@@ -84,13 +87,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    missing dependency). StorageService's service-channel client end is kept
 	//    alive in `storage_client` so the service stays standing after it reports in.
 	let mut state: [State; N] = [State::Pending; N];
+	let mut channels: [u64; N] = [0u64; N];
 	let mut storage_client: u64 = 0;
 	loop {
 		let mut progress: bool = false;
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
-				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, ramdisk_handle, ramdisk_len, &mut storage_client, &mut buf) };
+				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, ramdisk_handle, ramdisk_len, &mut storage_client, &mut channels[i], &mut buf) };
 				progress = true;
 			}
 			i += 1;
@@ -100,15 +104,42 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 
-	// 3. report in once the set is up. Keep `storage_client` alive until exit in
-	//    case the shell never took it (e.g. a spawn failure), so StorageService's
-	//    service channel does not peer-close prematurely; once the shell owns it, the
-	//    shell keeps the service standing instead.
-	unsafe {
-		send_blocking(bootstrap, b"ServiceManager: online", 0);
+	// 3. exercise the stop path on a leaf service. DeviceManager is the safe choice:
+	//    nothing depends on it, so stopping it does not tear down the running system
+	//    (stopping log_service, storage_service, or the interactive shell would).
+	//    This proves the supervisor can stop a service and track the transition.
+	if let Some(dev) = index_of(b"device_manager") {
+		if state[dev] == State::Running {
+			state[dev] = unsafe { stop_service(channels[dev], bootstrap, &mut buf) };
+		}
+	}
+
+	// 4. report in once the whole set has settled - every service either Running or,
+	//    for the leaf we exercised the stop path on, Stopped, with none left Failed.
+	//    Keep `storage_client` alive until exit in case the shell never took it (e.g.
+	//    a spawn failure), so StorageService's service channel does not peer-close
+	//    prematurely; once the shell owns it, the shell keeps the service standing.
+	if all_settled(&state) {
+		unsafe {
+			send_blocking(bootstrap, b"ServiceManager: online", 0);
+		}
 	}
 	let _ = storage_client;
 	exit();
+}
+
+// Whether every service reached a healthy end state - Running, or Stopped for a
+// service the supervisor deliberately stopped - with none left Failed or Pending.
+// ServiceManager announces itself online only once its whole set is accounted for.
+fn all_settled(state: &[State; N]) -> bool {
+	let mut i: usize = 0;
+	while i < N {
+		if state[i] != State::Running && state[i] != State::Stopped {
+			return false;
+		}
+		i += 1;
+	}
+	true
 }
 
 // Whether every dependency in `deps` is in the Running state.
@@ -142,7 +173,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // needs the ramdisk volume and a service channel (we keep the client end in
 // `*storage_client`); the shell needs that StorageService client channel, which we
 // transfer to it so its `cat` can round-trip to the service over IPC.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, ramdisk_len: usize, storage_client: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, ramdisk_len: usize, storage_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -163,12 +194,29 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, r
 		}
 		match recv_blocking(manager_side, buf) {
 			Received::Message { len, .. } => {
-				// Relay the service's own report up to SystemManager, in start order.
+				// Relay the service's own report up to SystemManager, in start order, and
+				// keep its report channel as the control channel used to stop it later.
 				send_blocking(up, &buf[..len], 0);
+				*control = manager_side;
 				State::Running
 			}
 			Received::Closed => State::Failed,
 		}
+	}
+}
+
+// Stop a running service over its control channel: send the "STOP" sentinel, then
+// wait for the service's "stopped" acknowledgement and relay it up like its start
+// report. Returns Stopped on a clean shutdown (or if the service was already gone).
+unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
+	unsafe {
+		if control == 0 || !send_blocking(control, b"STOP", 0) {
+			return State::Failed;
+		}
+		if let Received::Message { len, .. } = recv_blocking(control, buf) {
+			send_blocking(up, &buf[..len], 0);
+		}
+		State::Stopped
 	}
 }
 

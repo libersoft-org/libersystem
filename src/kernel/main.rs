@@ -1705,10 +1705,12 @@ fn init_package_starts_system_manager() {
 	// before it reports in; the shell is handed the StorageService client channel
 	// and proves the round-trip by reading a file with `cat` before it reports in.
 	// Every report is relayed up, so the kernel observes the services come up in
-	// dependency order followed by the two managers.
+	// dependency order, then DeviceManager stopped (ServiceManager exercises the
+	// stop path on that leaf service - nothing depends on it), followed by the two
+	// managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 6] = [b"LogService: online", b"DeviceManager: online", b"StorageService: online", b"Shell: online", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 7] = [b"LogService: online", b"DeviceManager: online", b"StorageService: online", b"Shell: online", b"DeviceManager: stopped", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");
