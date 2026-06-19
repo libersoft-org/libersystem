@@ -1779,10 +1779,10 @@ The object model, capability model, and IPC model already have a basic design (s
 
 ```text
 1. IDL/WIT: the interfaces are written and the choice decided (our own IDL) - what remains is building the toolchain (binding generators).
-2. Detailed design of the core services (Storage, Process, Log, Device).
+2. Detailed design of the core services: Log and Device done (M22-M24), Storage and Process remain.
 3. A minimal WASI host and running the first component.
-4. virtio drivers (blk, console) for real storage instead of a ramdisk.
-5. SystemManager / ServiceManager / DeviceManager detailed design.
+4. virtio drivers (blk, net, console) instead of a ramdisk - done (M23-M24).
+5. SystemManager / ServiceManager / DeviceManager - built and running (M21-M24).
 ```
 
 The 5-6 real interfaces have been written in WIT and the choice decided from that practice (our own IDL with WIT-inspired types plus our own binary backend; see *IDL language*); the nearest concrete step is now building the toolchain (the binding, schema, CLI, doc, and test generators).
