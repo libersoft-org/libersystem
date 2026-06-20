@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::domain::Domain;
 use super::memory_object::MemoryError;
-use super::{KernelObject, ObjectHeader, ObjectType};
+use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::arch::paging;
 use crate::mem::frame::{self, PAGE_SIZE};
 
@@ -97,23 +97,7 @@ impl DmaBuffer {
 	}
 }
 
-impl KernelObject for DmaBuffer {
-	fn header(&self) -> &ObjectHeader {
-		&self.header
-	}
-
-	fn object_type(&self) -> ObjectType {
-		ObjectType::DmaBuffer
-	}
-
-	fn as_any(&self) -> &dyn Any {
-		self
-	}
-
-	fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-		self
-	}
-}
+impl_kernel_object!(DmaBuffer, DmaBuffer);
 
 impl Drop for DmaBuffer {
 	fn drop(&mut self) {

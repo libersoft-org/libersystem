@@ -17,7 +17,7 @@ use super::address_space::AddressSpace;
 use super::domain::Domain;
 use super::handle::HandleTable;
 use super::process::Process;
-use super::{KernelObject, ObjectHeader, ObjectType};
+use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::arch;
 use crate::sync::SpinLock;
 
@@ -166,20 +166,4 @@ impl Drop for Thread {
 	}
 }
 
-impl KernelObject for Thread {
-	fn header(&self) -> &ObjectHeader {
-		&self.header
-	}
-
-	fn object_type(&self) -> ObjectType {
-		ObjectType::Thread
-	}
-
-	fn as_any(&self) -> &dyn Any {
-		self
-	}
-
-	fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-		self
-	}
-}
+impl_kernel_object!(Thread, Thread);

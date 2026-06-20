@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::{KernelObject, ObjectHeader, ObjectType};
+use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::arch;
 
 pub struct Timer {
@@ -48,20 +48,4 @@ impl Timer {
 	}
 }
 
-impl KernelObject for Timer {
-	fn header(&self) -> &ObjectHeader {
-		&self.header
-	}
-
-	fn object_type(&self) -> ObjectType {
-		ObjectType::Timer
-	}
-
-	fn as_any(&self) -> &dyn Any {
-		self
-	}
-
-	fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-		self
-	}
-}
+impl_kernel_object!(Timer, Timer);

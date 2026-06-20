@@ -101,6 +101,36 @@ fn current_object(handle: u64, ty: ObjectType, rights: Rights) -> Result<Arc<dyn
 	}
 }
 
+// Bind the calling thread or return ERR_NO_THREAD from the enclosing handler. The
+// handlers that touch per-thread state (the handle table, the address space) open
+// with this; a macro, not a function, because the early return must leave the
+// handler itself, which returns the raw i64 syscall result.
+macro_rules! current_thread {
+	() => {
+		match sched::current_thread() {
+			Some(t) => t,
+			None => return ERR_NO_THREAD,
+		}
+	};
+}
+
+// Install `object` into `thread`'s handle table with `rights` and `badge`,
+// returning the new handle's raw value, or ERR_RESOURCE_EXHAUSTED if the table (or
+// the Domain's handle quota) is full. The shared tail of the create handlers.
+fn install_object(thread: &Thread, object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> i64 {
+	match thread.handles().lock().try_insert_object(object, rights, badge) {
+		Some(handle) => handle.raw() as i64,
+		None => ERR_RESOURCE_EXHAUSTED,
+	}
+}
+
+// Look up a typed object handle on the calling thread's table and recover the
+// concrete `Arc<T>`, collapsing the `current_object` + downcast the handlers
+// repeat. The downcast cannot fail because lookup_typed already checked the type.
+fn current_typed<T: KernelObject>(handle: u64, ty: ObjectType, rights: Rights) -> Result<Arc<T>, i64> {
+	Ok(current_object(handle, ty, rights)?.into_any_arc().downcast::<T>().ok().expect("type checked by lookup_typed"))
+}
+
 // Entry point called by the architecture syscall stub. `num` selects the call;
 // the meaning of the arguments and the return value is per-syscall.
 #[unsafe(no_mangle)]
@@ -158,41 +188,27 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 
 // Create a MemoryObject and install a handle to it in the caller's table.
 fn sys_memory_object_create(size: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	// Charge the physical memory to the caller's Domain at the create boundary.
 	let object = match MemoryObject::create_in(thread.domain(), size as usize) {
 		Ok(o) => o,
 		Err(MemoryError::QuotaExceeded) => return ERR_RESOURCE_EXHAUSTED,
 		Err(MemoryError::OutOfMemory) => return ERR_NO_MEMORY,
 	};
-	let installed = thread.handles().lock().try_insert_object(object, Rights::ALL, 0);
-	match installed {
-		Some(handle) => handle.raw() as i64,
-		None => ERR_RESOURCE_EXHAUSTED,
-	}
+	install_object(&thread, object, Rights::ALL, 0)
 }
 
 // Create a DmaBuffer - pinned DMA memory charged to the caller's Domain DMA quota
 // - and install a handle to it in the caller's table. A driver maps the buffer
 // and hands its physical address to its device.
 fn sys_dma_buffer_create(size: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	let object = match DmaBuffer::create_in(thread.domain(), size as usize) {
 		Ok(o) => o,
 		Err(MemoryError::QuotaExceeded) => return ERR_RESOURCE_EXHAUSTED,
 		Err(MemoryError::OutOfMemory) => return ERR_NO_MEMORY,
 	};
-	let installed = thread.handles().lock().try_insert_object(object, Rights::ALL, 0);
-	match installed {
-		Some(handle) => handle.raw() as i64,
-		None => ERR_RESOURCE_EXHAUSTED,
-	}
+	install_object(&thread, object, Rights::ALL, 0)
 }
 
 // Map a DmaBuffer into the caller's address space (cacheable RAM, unlike device
@@ -200,11 +216,10 @@ fn sys_dma_buffer_create(size: u64) -> i64 {
 // then points its device at. One mapping per buffer: a second call returns
 // ERR_INVALID.
 fn sys_dma_buffer_map(handle: u64) -> i64 {
-	let object = match current_object(handle, ObjectType::DmaBuffer, Rights::MAP) {
+	let dma = match current_typed::<DmaBuffer>(handle, ObjectType::DmaBuffer, Rights::MAP) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	let dma = object.as_any().downcast_ref::<DmaBuffer>().expect("type checked by lookup_typed");
 	if dma.mapped_at() != 0 {
 		return ERR_INVALID;
 	}
@@ -222,11 +237,10 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 // its device for DMA. (A single-page buffer is physically contiguous, so this base
 // covers the whole buffer; multi-page contiguity is a later refinement.)
 fn sys_dma_buffer_phys(handle: u64) -> i64 {
-	let object = match current_object(handle, ObjectType::DmaBuffer, Rights::READ) {
+	let dma = match current_typed::<DmaBuffer>(handle, ObjectType::DmaBuffer, Rights::READ) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	let dma = object.as_any().downcast_ref::<DmaBuffer>().expect("type checked by lookup_typed");
 	dma.phys_base() as i64
 }
 
@@ -235,11 +249,10 @@ fn sys_dma_buffer_phys(handle: u64) -> i64 {
 // space (USER bit); a ring-0 caller into the shared kernel window. One mapping per
 // object: a second call returns ERR_INVALID.
 fn sys_device_memory_map(handle: u64) -> i64 {
-	let object = match current_object(handle, ObjectType::DeviceMemory, Rights::MAP) {
+	let device = match current_typed::<DeviceMemory>(handle, ObjectType::DeviceMemory, Rights::MAP) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	let device = object.as_any().downcast_ref::<DeviceMemory>().expect("type checked by lookup_typed");
 	if device.mapped_at() != 0 {
 		return ERR_INVALID;
 	}
@@ -285,19 +298,12 @@ fn sys_device_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 // device_memory_map. Returns ERR_INVALID for an out-of-range index. (Gating this
 // to DeviceManager is a PermissionManager policy concern, deferred.)
 fn sys_device_acquire(index: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	let memory = match device::with(index as usize, |d| DeviceMemory::new(d.bar_phys, d.bar_len as usize)) {
 		Some(m) => m,
 		None => return ERR_INVALID,
 	};
-	let installed = thread.handles().lock().try_insert_object(memory, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER, 0);
-	match installed {
-		Some(handle) => handle.raw() as i64,
-		None => ERR_RESOURCE_EXHAUSTED,
-	}
+	install_object(&thread, memory, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER, 0)
 }
 
 // Fill a caller buffer with `len` random bytes from the kernel CSPRNG (RDRAND when
@@ -330,10 +336,7 @@ fn sys_random_get(buf_ptr: u64, len: u64) -> i64 {
 // and wakes the driver when the vector fires. ERR_INVALID for a non-bindable
 // vector, ERR_RESOURCE_EXHAUSTED if the vector is already bound.
 fn sys_interrupt_bind(vector: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	if vector > u8::MAX as u64 || !arch::interrupts::is_bindable(vector as u8) {
 		return ERR_INVALID;
 	}
@@ -344,10 +347,7 @@ fn sys_interrupt_bind(vector: u64) -> i64 {
 	}
 	// On a failed install the Interrupt is dropped here, and its Drop unbinds the
 	// vector, so no explicit rollback is needed.
-	match thread.handles().lock().try_insert_object(interrupt, Rights::ALL, 0) {
-		Some(handle) => handle.raw() as i64,
-		None => ERR_RESOURCE_EXHAUSTED,
-	}
+	install_object(&thread, interrupt, Rights::ALL, 0)
 }
 
 // Set a property on an object: a human-readable name (PROP_NAME; a2 = name
@@ -355,10 +355,7 @@ fn sys_interrupt_bind(vector: u64) -> i64 {
 // limit (PROP_*_LIMIT; a2 = the new limit). Both require the MANAGE right on the
 // handle; limit properties require the handle to name a Domain.
 fn sys_object_property_set(handle: u64, prop: u64, a2: u64, a3: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	if prop == PROP_NAME {
 		const MAX_NAME: u64 = 64;
 		let (ptr, len) = (a2, a3);
@@ -385,11 +382,10 @@ fn sys_object_property_set(handle: u64, prop: u64, a2: u64, a3: u64) -> i64 {
 		return 0;
 	}
 	// The remaining properties set a Domain resource limit.
-	let object = match current_object(handle, ObjectType::Domain, Rights::MANAGE) {
+	let domain = match current_typed::<Domain>(handle, ObjectType::Domain, Rights::MANAGE) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	let domain = object.as_any().downcast_ref::<Domain>().expect("type checked by lookup_typed");
 	let counter = match prop {
 		PROP_MEMORY_LIMIT => domain.account().memory(),
 		PROP_HANDLE_LIMIT => domain.account().handles(),
@@ -407,18 +403,12 @@ fn sys_object_property_set(handle: u64, prop: u64, a2: u64, a3: u64) -> i64 {
 // threads until process_load gives it an image and thread_create / thread_start
 // give it a running thread. (Spawning into a different sub-Domain is deferred.)
 fn sys_process_create() -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	let process = match sched::process_create(thread.domain().clone()) {
 		Some(p) => p,
 		None => return ERR_NO_MEMORY,
 	};
-	match thread.handles().lock().try_insert_object(process, Rights::ALL, 0) {
-		Some(handle) => handle.raw() as i64,
-		None => ERR_RESOURCE_EXHAUSTED,
-	}
+	install_object(&thread, process, Rights::ALL, 0)
 }
 
 // Load an ELF image into a process created by process_create and return its entry
@@ -430,18 +420,17 @@ fn sys_process_load(process_handle: u64, elf_ptr: u64, elf_len: u64) -> i64 {
 	if elf_len == 0 || !user_buf_ok(elf_ptr, elf_len) {
 		return ERR_INVALID;
 	}
-	let object = match current_object(process_handle, ObjectType::Process, Rights::MANAGE) {
+	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	let process = object.as_any().downcast_ref::<Process>().expect("type checked by lookup_typed");
 	// Read the image in place from the caller's (active) address space: the loader
 	// copies only the PT_LOAD segments into the child's fresh frames, so there is no
 	// need to buffer the whole ELF on the kernel heap. The caller's tables stay
 	// active across the load (the child is mapped through its own CR3, not switched
 	// to), so the slice remains valid.
 	let image = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_len as usize) };
-	match loader::load_image_into(process, image) {
+	match loader::load_image_into(&process, image) {
 		Ok(entry) => entry as i64,
 		Err(LoadError::OutOfMemory) => ERR_NO_MEMORY,
 		Err(LoadError::BadImage) => ERR_INVALID,
@@ -455,15 +444,11 @@ fn sys_process_load(process_handle: u64, elf_ptr: u64, elf_len: u64) -> i64 {
 // thread in rdi - the way a process is endowed with its initial capability.
 // Requires the MANAGE right on the process handle (and TRANSFER on the bootstrap).
 fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_handle: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
-	let object = match current_object(process_handle, ObjectType::Process, Rights::MANAGE) {
+	let thread = current_thread!();
+	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	let process: Arc<Process> = object.into_any_arc().downcast::<Process>().ok().expect("type checked by lookup_typed");
 	// Move the bootstrap capability (if any) into the child, recording the handle
 	// value the child will see, so the kernel can wire it into the thread's rdi.
 	let child_bootstrap = if bootstrap_handle != 0 {
@@ -489,21 +474,17 @@ fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_
 		Some(t) => t,
 		None => return ERR_RESOURCE_EXHAUSTED,
 	};
-	match thread.handles().lock().try_insert_object(new_thread, Rights::ALL, 0) {
-		Some(handle) => handle.raw() as i64,
-		None => ERR_RESOURCE_EXHAUSTED,
-	}
+	install_object(&thread, new_thread, Rights::ALL, 0)
 }
 
 // Start a suspended thread created by thread_create, enqueueing it to run. Exactly
 // once: a repeated start returns ERR_INVALID rather than double-enqueueing it.
 // Requires the MANAGE right on the thread handle.
 fn sys_thread_start(thread_handle: u64) -> i64 {
-	let object = match current_object(thread_handle, ObjectType::Thread, Rights::MANAGE) {
+	let target = match current_typed::<Thread>(thread_handle, ObjectType::Thread, Rights::MANAGE) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	let target: Arc<Thread> = object.into_any_arc().downcast::<Thread>().ok().expect("type checked by lookup_typed");
 	if sched::thread_start(target) { 0 } else { ERR_INVALID }
 }
 
@@ -511,21 +492,17 @@ fn sys_thread_start(thread_handle: u64) -> i64 {
 // kernel reads serial bytes and sends them on it, and the userspace shell receives
 // them on the peer endpoint. The handle must name a Channel the caller can send on.
 fn sys_console_attach(handle: u64) -> i64 {
-	let object = match current_object(handle, ObjectType::Channel, Rights::SEND) {
+	let channel = match current_typed::<Channel>(handle, ObjectType::Channel, Rights::SEND) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	let channel: Arc<Channel> = object.into_any_arc().downcast::<Channel>().ok().expect("type checked by lookup_typed");
 	crate::console_input::attach(channel);
 	0
 }
 
 // Map a MemoryObject into the kernel address space, returning its virtual base.
 fn sys_memory_map(handle: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	let object = {
 		let table = thread.handles().lock();
 		match table.lookup_typed(Handle::from_raw(handle), ObjectType::MemoryObject, Rights::MAP) {
@@ -558,10 +535,7 @@ fn sys_memory_map(handle: u64) -> i64 {
 
 // Remove a MemoryObject's mapping from the kernel address space.
 fn sys_memory_unmap(handle: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	let object = {
 		let table = thread.handles().lock();
 		match table.lookup_typed(Handle::from_raw(handle), ObjectType::MemoryObject, Rights::MAP) {
@@ -583,10 +557,7 @@ fn sys_memory_unmap(handle: u64) -> i64 {
 
 // Derive a weaker handle to the same object (attenuation only).
 fn sys_handle_duplicate(handle: u64, rights_bits: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	let new_rights = Rights::from_bits(rights_bits as u32);
 	let mut table = thread.handles().lock();
 	match table.duplicate(Handle::from_raw(handle), new_rights) {
@@ -598,10 +569,7 @@ fn sys_handle_duplicate(handle: u64, rights_bits: u64) -> i64 {
 
 // Close a handle in the caller's table.
 fn sys_handle_close(handle: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	let mut table = thread.handles().lock();
 	match table.close(Handle::from_raw(handle)) {
 		Ok(()) => 0,
@@ -623,10 +591,7 @@ fn read_bytes(ptr: u64, len: usize) -> Vec<u8> {
 // Create a connected channel pair, install a handle to each endpoint in the
 // caller's table, and write the two raw handles to *out0_ptr and *out1_ptr.
 fn sys_channel_create(out0_ptr: u64, out1_ptr: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	if out0_ptr == 0 || out1_ptr == 0 {
 		return ERR_INVALID;
 	}
@@ -663,10 +628,7 @@ fn sys_channel_create(out0_ptr: u64, out1_ptr: u64) -> i64 {
 // transferred handle is consumed only on a successful send (left intact on
 // failure, so the caller can retry on WOULD_BLOCK).
 fn sys_channel_send(ch: u64, bytes_ptr: u64, bytes_len: u64, xfer: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	let object = {
 		let table = thread.handles().lock();
 		match table.lookup_typed(Handle::from_raw(ch), ObjectType::Channel, Rights::SEND) {
@@ -713,10 +675,7 @@ fn sys_channel_send(ch: u64, bytes_ptr: u64, bytes_len: u64, xfer: u64) -> i64 {
 // the message carried a transferred capability, install it and write the new
 // handle to *out_handle_ptr (0 if none). Returns the payload byte count.
 fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	if !user_buf_ok(bytes_ptr, bytes_cap) || (out_handle_ptr != 0 && !user_buf_ok(out_handle_ptr, 8)) {
 		return ERR_INVALID;
 	}
@@ -761,10 +720,7 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 // primitive; the non-blocking send/recv/poll calls layer the synchronous-looking
 // `call()` on top of it. The handle must carry the WAIT right.
 fn sys_wait(handle: u64, deadline: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	let object = {
 		let table = thread.handles().lock();
 		match table.lookup(Handle::from_raw(handle), Rights::WAIT) {
@@ -824,10 +780,7 @@ fn wait_block_deadline(object: &Arc<dyn KernelObject>, deadline: u64) -> u64 {
 // if a fault was recorded and copied, 0 if none was recorded, or an error. Lets a
 // supervisor inspect why a process was terminated.
 fn sys_fault_info_get(buf_ptr: u64, buf_len: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	let info = match thread.process().fault_info() {
 		Some(i) => i,
 		None => return 0,
@@ -847,10 +800,7 @@ fn sys_fault_info_get(buf_ptr: u64, buf_len: u64) -> i64 {
 // Returns 1 on success, ERR_BAD_HANDLE for an unknown/stale handle, or
 // ERR_INVALID if the buffer is too small or out of range.
 fn sys_object_info_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	let info = match thread.handles().lock().info(Handle::from_raw(handle)) {
 		Some(i) => i,
 		None => return ERR_BAD_HANDLE,
@@ -871,89 +821,68 @@ fn sys_object_info_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 // addition to every ancestor's, so a subdomain can only subdivide its parent's
 // budget, never exceed it. a0/a1/a2 are the memory/handle/thread caps.
 fn sys_domain_create(memory_limit: u64, handle_limit: u64, thread_limit: u64) -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
+	let thread = current_thread!();
 	let child = Domain::new_child(thread.domain(), memory_limit, handle_limit, thread_limit);
-	let installed = thread.handles().lock().try_insert_object(child, Rights::ALL, 0);
-	match installed {
-		Some(handle) => handle.raw() as i64,
-		None => ERR_RESOURCE_EXHAUSTED,
-	}
+	install_object(&thread, child, Rights::ALL, 0)
 }
 
 // Kill the Domain named by `handle` and its whole subtree: every descendant
 // process is terminated and its resources freed. Requires the MANAGE right.
 fn sys_domain_kill(handle: u64) -> i64 {
-	let object = match current_object(handle, ObjectType::Domain, Rights::MANAGE) {
+	let domain = match current_typed::<Domain>(handle, ObjectType::Domain, Rights::MANAGE) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	object.as_any().downcast_ref::<Domain>().expect("type checked by lookup_typed").kill();
+	domain.kill();
 	0
 }
 
 // Create an Event and install a handle to it in the caller's table.
 fn sys_event_create() -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
-	let installed = thread.handles().lock().try_insert_object(Event::create(), Rights::ALL, 0);
-	match installed {
-		Some(handle) => handle.raw() as i64,
-		None => ERR_RESOURCE_EXHAUSTED,
-	}
+	let thread = current_thread!();
+	install_object(&thread, Event::create(), Rights::ALL, 0)
 }
 
 // Raise an event's signal.
 fn sys_event_signal(handle: u64) -> i64 {
-	let object = match current_object(handle, ObjectType::Event, Rights::WRITE) {
+	let event = match current_typed::<Event>(handle, ObjectType::Event, Rights::WRITE) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	object.as_any().downcast_ref::<Event>().expect("type checked by lookup_typed").signal();
+	event.signal();
 	0
 }
 
 // Observe an event's signal: 1 if signaled, 0 if not.
 fn sys_event_poll(handle: u64) -> i64 {
-	let object = match current_object(handle, ObjectType::Event, Rights::READ) {
+	let event = match current_typed::<Event>(handle, ObjectType::Event, Rights::READ) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	i64::from(object.as_any().downcast_ref::<Event>().expect("type checked by lookup_typed").is_signaled())
+	i64::from(event.is_signaled())
 }
 
 // Create a Timer and install a handle to it in the caller's table.
 fn sys_timer_create() -> i64 {
-	let thread = match sched::current_thread() {
-		Some(t) => t,
-		None => return ERR_NO_THREAD,
-	};
-	let installed = thread.handles().lock().try_insert_object(Timer::create(), Rights::ALL, 0);
-	match installed {
-		Some(handle) => handle.raw() as i64,
-		None => ERR_RESOURCE_EXHAUSTED,
-	}
+	let thread = current_thread!();
+	install_object(&thread, Timer::create(), Rights::ALL, 0)
 }
 
 // Arm a timer to fire at an absolute tick deadline.
 fn sys_timer_set(handle: u64, deadline_ticks: u64) -> i64 {
-	let object = match current_object(handle, ObjectType::Timer, Rights::WRITE) {
+	let timer = match current_typed::<Timer>(handle, ObjectType::Timer, Rights::WRITE) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	object.as_any().downcast_ref::<Timer>().expect("type checked by lookup_typed").set(deadline_ticks);
+	timer.set(deadline_ticks);
 	0
 }
 
 // Observe a timer: 1 if armed and expired, 0 otherwise.
 fn sys_timer_poll(handle: u64) -> i64 {
-	let object = match current_object(handle, ObjectType::Timer, Rights::READ) {
+	let timer = match current_typed::<Timer>(handle, ObjectType::Timer, Rights::READ) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	i64::from(object.as_any().downcast_ref::<Timer>().expect("type checked by lookup_typed").is_expired())
+	i64::from(timer.is_expired())
 }

@@ -1982,15 +1982,67 @@ fn log_record_roundtrip_and_renders() {
 	assert!(cbuf[..cn].windows(b"storage_service".len()).any(|w: &[u8]| w == b"storage_service"), "source string present in CBOR");
 }
 
+// Spawn a userspace service from the init package and hand it the channel its
+// clients reach it on ("SERVE"). Returns (boot_kernel, service_client): the report
+// channel the kernel reads the service's "online" report on, and the client end the
+// kernel-as-client drives the generated bindings over. The shared setup of the
+// service integration tests.
+#[cfg(test)]
+fn spawn_service(name: &[u8]) -> (alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::channel::Channel>) {
+	use object::channel::Channel;
+	use object::rights::Rights;
+	let init = init_package_bytes().expect("init package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = package.lookup(name).expect("service in the init package");
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn service");
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	(boot_kernel, service_client)
+}
+
+// Like `spawn_service`, but also hands the service a read-only copy of the init
+// package ("PACKAGE" + length) before the serve channel - the bootstrap a service
+// that launches programs (ProcessService) needs.
+#[cfg(test)]
+fn spawn_service_with_package(name: &[u8]) -> (alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::channel::Channel>) {
+	use object::channel::Channel;
+	use object::rights::Rights;
+	let init = init_package_bytes().expect("init package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = package.lookup(name).expect("service in the init package");
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn service");
+	let pkg_obj = object::memory_object::MemoryObject::create(init.len()).expect("memory for the package");
+	copy_into_object(&pkg_obj, init);
+	let mut pkg_msg = alloc::vec::Vec::new();
+	pkg_msg.extend_from_slice(b"PACKAGE");
+	pkg_msg.extend_from_slice(&(init.len() as u64).to_le_bytes());
+	send_cap(&boot_kernel, &pkg_msg, pkg_obj, Rights::READ | Rights::MAP | Rights::TRANSFER).expect("package bootstrap");
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	(boot_kernel, service_client)
+}
+
+// Little-endian field readers for decoding the proto reply bytes in the tests.
+#[cfg(test)]
+fn le_u16(b: &[u8], off: usize) -> u16 {
+	u16::from_le_bytes(b[off..off + 2].try_into().unwrap())
+}
+#[cfg(test)]
+fn le_u32(b: &[u8], off: usize) -> u32 {
+	u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+}
+#[cfg(test)]
+fn le_u64(b: &[u8], off: usize) -> u64 {
+	u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+}
+
 #[cfg(test)]
 #[test_case]
 fn log_service_speaks_generated_bindings() {
 	use abi::log::{self, Severity};
-	use alloc::sync::Arc;
-	use object::KernelObject;
-	use object::channel::{Channel, Message};
-	use object::handle::Capability;
-	use object::rights::Rights;
+	use object::channel::Message;
 
 	// Drive the real userspace LogService as a client over its generated Log
 	// bindings: spawn it from the init package, hand it a serve channel, EMIT two
@@ -2000,17 +2052,7 @@ fn log_service_speaks_generated_bindings() {
 	// log::encode and frame them by hand. Everything is pre-queued so the
 	// cooperative service drains it in one pass and exits, after which we read its
 	// replies (the kernel-as-client pattern).
-	let init = init_package_bytes().expect("init package module not found");
-	let package = pkg::Package::parse(init).expect("init package parses");
-	let service_elf = package.lookup(b"log_service").expect("log_service in the init package");
-
-	let (boot_kernel, boot_user) = Channel::create();
-	let (service_server, service_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn LogService");
-
-	// hand the service the channel its clients reach it on
-	let server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
-	boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![server_cap], 0)).expect("serve bootstrap");
+	let (_boot_kernel, service_client) = spawn_service(b"log_service");
 
 	// EMIT one record: [op = 1 (emit) u16][corr u32][entry bytes].
 	let emit = |corr: u32, ts: u64, severity: Severity, source: &[u8], fields: &[(&[u8], &[u8])]| {
@@ -2041,16 +2083,16 @@ fn log_service_speaks_generated_bindings() {
 	for corr in [1u32, 2] {
 		let reply = service_client.recv().expect("emit reply");
 		assert_eq!(reply.bytes.len(), 5, "emit reply is corr + ok");
-		assert_eq!(u32::from_le_bytes(reply.bytes[0..4].try_into().unwrap()), corr, "emit reply echoes the correlation id");
+		assert_eq!(le_u32(&reply.bytes, 0), corr, "emit reply echoes the correlation id");
 		assert_eq!(reply.bytes[4], 1, "emit succeeded");
 	}
 
 	// The query reply is [corr u32 = 7][ok u8 = 1][count u16 = 2][entry][entry].
 	let reply = service_client.recv().expect("query reply");
 	let b = &reply.bytes;
-	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 7, "query reply echoes the correlation id");
+	assert_eq!(le_u32(b, 0), 7, "query reply echoes the correlation id");
 	assert_eq!(b[4], 1, "query succeeded");
-	assert_eq!(u16::from_le_bytes(b[5..7].try_into().unwrap()), 2, "both records came back");
+	assert_eq!(le_u16(b, 5), 2, "both records came back");
 	// spot-check both entries are present in the structured reply
 	assert!(b.windows(b"storage_service".len()).any(|w: &[u8]| w == b"storage_service"), "first entry present");
 	assert!(b.windows(b"device_manager".len()).any(|w: &[u8]| w == b"device_manager"), "second entry present");
@@ -2059,11 +2101,7 @@ fn log_service_speaks_generated_bindings() {
 #[cfg(test)]
 #[test_case]
 fn device_service_lists_devices() {
-	use alloc::sync::Arc;
-	use object::KernelObject;
-	use object::channel::{Channel, Message};
-	use object::handle::Capability;
-	use object::rights::Rights;
+	use object::channel::Message;
 
 	// Drive the real userspace DeviceService as a client over its generated Device
 	// bindings: spawn it, hand it a serve channel, and LIST the devices the kernel
@@ -2071,17 +2109,7 @@ fn device_service_lists_devices() {
 	// u32][args], reply [corr u32][result]; `list` takes no args and replies
 	// result<list<device-entry>, error>. Everything is pre-queued so the cooperative
 	// service drains it in one pass and exits (the kernel-as-client pattern).
-	let init = init_package_bytes().expect("init package module not found");
-	let package = pkg::Package::parse(init).expect("init package parses");
-	let service_elf = package.lookup(b"device_service").expect("device_service in the init package");
-
-	let (boot_kernel, boot_user) = Channel::create();
-	let (service_server, service_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn DeviceService");
-
-	// hand the service the channel its clients reach it on
-	let server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
-	boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![server_cap], 0)).expect("serve bootstrap");
+	let (boot_kernel, service_client) = spawn_service(b"device_service");
 
 	// LIST: [op = 1 (list) u16][corr u32], no args. Then an empty quit sentinel.
 	let corr: u32 = 9;
@@ -2102,22 +2130,17 @@ fn device_service_lists_devices() {
 	// found on the bus, so the count is non-zero and the first entry is index 0.
 	let reply = service_client.recv().expect("list reply");
 	let b = &reply.bytes;
-	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), corr, "list reply echoes the correlation id");
+	assert_eq!(le_u32(b, 0), corr, "list reply echoes the correlation id");
 	assert_eq!(b[4], 1, "list succeeded");
-	let count = u16::from_le_bytes(b[5..7].try_into().unwrap());
+	let count = le_u16(b, 5);
 	assert!(count >= 1, "at least one device was enumerated");
-	assert_eq!(u32::from_le_bytes(b[7..11].try_into().unwrap()), 0, "the first device is index 0");
+	assert_eq!(le_u32(b, 7), 0, "the first device is index 0");
 }
 
 #[cfg(test)]
 #[test_case]
 fn process_service_starts_a_program() {
-	use alloc::sync::Arc;
-	use object::KernelObject;
-	use object::channel::{Channel, Message};
-	use object::handle::Capability;
-	use object::memory_object::MemoryObject;
-	use object::rights::Rights;
+	use object::channel::Message;
 
 	// Drive the real userspace ProcessService over its generated Process bindings:
 	// spawn it, hand it the init package (to launch from) and a serve channel, then
@@ -2125,26 +2148,7 @@ fn process_service_starts_a_program() {
 	// u16][corr u32][args], reply [corr u32][result]; `start` takes a string name and
 	// replies result<process-info, error> = [koid u64][name string]. Everything is
 	// pre-queued so the cooperative service drains it in one pass and exits.
-	let init = init_package_bytes().expect("init package module not found");
-	let package = pkg::Package::parse(init).expect("init package parses");
-	let service_elf = package.lookup(b"process_service").expect("process_service in the init package");
-
-	let (boot_kernel, boot_user) = Channel::create();
-	let (service_server, service_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn ProcessService");
-
-	// hand it a read-only copy of the init package to launch programs from
-	let pkg_obj = MemoryObject::create(init.len()).expect("memory for the package");
-	copy_into_object(&pkg_obj, init);
-	let mut pkg_msg = alloc::vec::Vec::new();
-	pkg_msg.extend_from_slice(b"PACKAGE");
-	pkg_msg.extend_from_slice(&(init.len() as u64).to_le_bytes());
-	let pkg_cap = Capability::new(pkg_obj as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
-	boot_kernel.send(Message::new(pkg_msg, alloc::vec![pkg_cap], 0)).expect("package bootstrap");
-
-	// then the channel its clients reach it on
-	let server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
-	boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![server_cap], 0)).expect("serve bootstrap");
+	let (boot_kernel, service_client) = spawn_service_with_package(b"process_service");
 
 	// START storage_client: [op = 1 u16][corr u32][name: [len u16][utf8]].
 	let name: &[u8] = b"storage_client";
@@ -2171,44 +2175,31 @@ fn process_service_starts_a_program() {
 	// The start reply is [corr u32 = 1][ok u8 = 1][koid u64][name: [len u16][utf8]].
 	let reply = service_client.recv().expect("start reply");
 	let b = &reply.bytes;
-	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 1, "start reply echoes the correlation id");
+	assert_eq!(le_u32(b, 0), 1, "start reply echoes the correlation id");
 	assert_eq!(b[4], 1, "start succeeded");
-	let koid = u64::from_le_bytes(b[5..13].try_into().unwrap());
+	let koid = le_u64(b, 5);
 	assert!(koid >= 1, "the started process has a koid");
-	let name_len = u16::from_le_bytes(b[13..15].try_into().unwrap()) as usize;
+	let name_len = le_u16(b, 13) as usize;
 	assert_eq!(&b[15..15 + name_len], name, "the reply echoes the launched program name");
 
 	// The list reply is [corr u32 = 2][ok u8 = 1][count u16 = 1][process-info].
 	let reply = service_client.recv().expect("list reply");
 	let b = &reply.bytes;
-	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 2, "list reply echoes the correlation id");
+	assert_eq!(le_u32(b, 0), 2, "list reply echoes the correlation id");
 	assert_eq!(b[4], 1, "list succeeded");
-	assert_eq!(u16::from_le_bytes(b[5..7].try_into().unwrap()), 1, "the started process is listed");
+	assert_eq!(le_u16(b, 5), 1, "the started process is listed");
 }
 
 #[cfg(test)]
 #[test_case]
 fn config_service_serves_the_tree() {
-	use alloc::sync::Arc;
-	use object::KernelObject;
-	use object::channel::{Channel, Message};
-	use object::handle::Capability;
-	use object::rights::Rights;
+	use object::channel::Message;
 
 	// Drive the real userspace ConfigService over its generated Config bindings:
 	// spawn it, hand it a serve channel, GET a seeded node, LIST the tree, SET a new
 	// node, and GET it back. The wire is the proto framing - request [op u16][corr
 	// u32][args], reply [corr u32][result]; strings are [len u16][utf8].
-	let init = init_package_bytes().expect("init package module not found");
-	let package = pkg::Package::parse(init).expect("init package parses");
-	let service_elf = package.lookup(b"config_service").expect("config_service in the init package");
-
-	let (boot_kernel, boot_user) = Channel::create();
-	let (service_server, service_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn ConfigService");
-
-	let server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
-	boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![server_cap], 0)).expect("serve bootstrap");
+	let (boot_kernel, service_client) = spawn_service(b"config_service");
 
 	// frame a GET: [op = 1 u16][corr u32][key: [len u16][utf8]].
 	let get = |corr: u32, key: &[u8]| -> alloc::vec::Vec<u8> {
@@ -2248,30 +2239,30 @@ fn config_service_serves_the_tree() {
 	// GET reply: [corr u32 = 1][ok u8 = 1][value: [len u16][utf8]].
 	let r = service_client.recv().expect("get reply");
 	let b = &r.bytes;
-	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 1, "get echoes the correlation id");
+	assert_eq!(le_u32(b, 0), 1, "get echoes the correlation id");
 	assert_eq!(b[4], 1, "get succeeded");
-	let vlen = u16::from_le_bytes(b[5..7].try_into().unwrap()) as usize;
+	let vlen = le_u16(b, 5) as usize;
 	assert_eq!(&b[7..7 + vlen], b"LiberSystem", "system.name is the seeded value");
 
 	// LIST reply: [corr u32 = 2][ok u8 = 1][count u16][entries...].
 	let r = service_client.recv().expect("list reply");
 	let b = &r.bytes;
-	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 2, "list echoes the correlation id");
+	assert_eq!(le_u32(b, 0), 2, "list echoes the correlation id");
 	assert_eq!(b[4], 1, "list succeeded");
-	assert!(u16::from_le_bytes(b[5..7].try_into().unwrap()) >= 4, "the seeded tree has nodes");
+	assert!(le_u16(b, 5) >= 4, "the seeded tree has nodes");
 
 	// SET reply: [corr u32 = 3][ok u8 = 1].
 	let r = service_client.recv().expect("set reply");
 	let b = &r.bytes;
-	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 3, "set echoes the correlation id");
+	assert_eq!(le_u32(b, 0), 3, "set echoes the correlation id");
 	assert_eq!(b[4], 1, "set succeeded");
 
 	// GET demo.key reply: the value we just set reads back.
 	let r = service_client.recv().expect("get-back reply");
 	let b = &r.bytes;
-	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 4, "get-back echoes the correlation id");
+	assert_eq!(le_u32(b, 0), 4, "get-back echoes the correlation id");
 	assert_eq!(b[4], 1, "get-back succeeded");
-	let vlen = u16::from_le_bytes(b[5..7].try_into().unwrap()) as usize;
+	let vlen = le_u16(b, 5) as usize;
 	assert_eq!(&b[7..7 + vlen], b"hi", "the value just set reads back");
 }
 

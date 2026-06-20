@@ -20,7 +20,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::process::Process;
-use super::{KernelObject, ObjectHeader, ObjectType};
+use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::sync::SpinLock;
 
 // Sentinel limit meaning "no cap" for a resource counter.
@@ -130,63 +130,6 @@ impl ResourceAccount {
 	pub fn threads(&self) -> &ResourceCounter {
 		&self.threads
 	}
-
-	// Charge `bytes` of physical memory, enforcing the cap.
-	pub fn try_charge_memory(&self, bytes: u64) -> bool {
-		self.memory.try_charge(bytes)
-	}
-
-	pub fn uncharge_memory(&self, bytes: u64) {
-		self.memory.uncharge(bytes);
-	}
-
-	// Charge `bytes` of pinned DMA memory, enforcing the DMA cap.
-	pub fn try_charge_dma(&self, bytes: u64) -> bool {
-		self.dma.try_charge(bytes)
-	}
-
-	pub fn uncharge_dma(&self, bytes: u64) {
-		self.dma.uncharge(bytes);
-	}
-
-	// Charge `bytes` of in-transit IPC, enforcing the queue cap.
-	pub fn try_charge_ipc_queue(&self, bytes: u64) -> bool {
-		self.ipc_queue.try_charge(bytes)
-	}
-
-	pub fn uncharge_ipc_queue(&self, bytes: u64) {
-		self.ipc_queue.uncharge(bytes);
-	}
-
-	// Charge one handle, enforcing the cap (for handle-creating syscalls).
-	pub fn try_charge_handle(&self) -> bool {
-		self.handles.try_charge(1)
-	}
-
-	// Charge one handle unconditionally (for paths that must not fail but still
-	// need to be counted, such as installing a transferred capability).
-	pub fn charge_handle(&self) {
-		self.handles.charge(1);
-	}
-
-	pub fn uncharge_handles(&self, count: u64) {
-		self.handles.uncharge(count);
-	}
-
-	// Charge one thread, enforcing the cap.
-	pub fn try_charge_thread(&self) -> bool {
-		self.threads.try_charge(1)
-	}
-
-	// Charge one thread unconditionally (for the infallible spawn paths used by
-	// kernel threads in the unlimited root Domain).
-	pub fn charge_thread(&self) {
-		self.threads.charge(1);
-	}
-
-	pub fn uncharge_thread(&self) {
-		self.threads.uncharge(1);
-	}
 }
 
 // A Domain is a node in a tree of resource containers. It owns a ResourceAccount
@@ -292,137 +235,90 @@ impl Domain {
 	// Hierarchical charging. A charge counts against this Domain and every
 	// ancestor, so a process exceeds neither its own Domain's limit nor any
 	// ancestor's aggregate. The enforced (try_*) charges roll back the level
-	// already charged if an ancestor refuses.
+	// already charged if an ancestor refuses. The per-resource methods are thin
+	// delegates over three generic walkers that take a counter selector.
 
-	pub fn try_charge_memory(&self, bytes: u64) -> bool {
-		if !self.account.try_charge_memory(bytes) {
+	// Charge `amount` against `select`'s counter on this Domain and every ancestor,
+	// enforcing each level's cap; on an ancestor's refusal, roll back the levels
+	// already charged and return false.
+	fn try_charge_hier(&self, amount: u64, select: &dyn Fn(&ResourceAccount) -> &ResourceCounter) -> bool {
+		if !select(&self.account).try_charge(amount) {
 			return false;
 		}
 		if let Some(parent) = self.parent() {
-			if !parent.try_charge_memory(bytes) {
-				self.account.uncharge_memory(bytes);
+			if !parent.try_charge_hier(amount, select) {
+				select(&self.account).uncharge(amount);
 				return false;
 			}
 		}
 		true
+	}
+
+	// Charge `amount` against `select`'s counter on this Domain and every ancestor
+	// unconditionally (the limit is enforced at the create boundaries); keeps every
+	// level's count exact.
+	fn charge_hier(&self, amount: u64, select: &dyn Fn(&ResourceAccount) -> &ResourceCounter) {
+		select(&self.account).charge(amount);
+		if let Some(parent) = self.parent() {
+			parent.charge_hier(amount, select);
+		}
+	}
+
+	// Return `amount` to `select`'s counter on this Domain and every ancestor.
+	fn uncharge_hier(&self, amount: u64, select: &dyn Fn(&ResourceAccount) -> &ResourceCounter) {
+		select(&self.account).uncharge(amount);
+		if let Some(parent) = self.parent() {
+			parent.uncharge_hier(amount, select);
+		}
+	}
+
+	pub fn try_charge_memory(&self, bytes: u64) -> bool {
+		self.try_charge_hier(bytes, &|a: &ResourceAccount| a.memory())
 	}
 
 	pub fn uncharge_memory(&self, bytes: u64) {
-		self.account.uncharge_memory(bytes);
-		if let Some(parent) = self.parent() {
-			parent.uncharge_memory(bytes);
-		}
+		self.uncharge_hier(bytes, &|a: &ResourceAccount| a.memory());
 	}
 
 	pub fn try_charge_dma(&self, bytes: u64) -> bool {
-		if !self.account.try_charge_dma(bytes) {
-			return false;
-		}
-		if let Some(parent) = self.parent() {
-			if !parent.try_charge_dma(bytes) {
-				self.account.uncharge_dma(bytes);
-				return false;
-			}
-		}
-		true
+		self.try_charge_hier(bytes, &|a: &ResourceAccount| a.dma())
 	}
 
 	pub fn uncharge_dma(&self, bytes: u64) {
-		self.account.uncharge_dma(bytes);
-		if let Some(parent) = self.parent() {
-			parent.uncharge_dma(bytes);
-		}
+		self.uncharge_hier(bytes, &|a: &ResourceAccount| a.dma());
 	}
 
 	pub fn try_charge_ipc_queue(&self, bytes: u64) -> bool {
-		if !self.account.try_charge_ipc_queue(bytes) {
-			return false;
-		}
-		if let Some(parent) = self.parent() {
-			if !parent.try_charge_ipc_queue(bytes) {
-				self.account.uncharge_ipc_queue(bytes);
-				return false;
-			}
-		}
-		true
+		self.try_charge_hier(bytes, &|a: &ResourceAccount| a.ipc_queue())
 	}
 
 	pub fn uncharge_ipc_queue(&self, bytes: u64) {
-		self.account.uncharge_ipc_queue(bytes);
-		if let Some(parent) = self.parent() {
-			parent.uncharge_ipc_queue(bytes);
-		}
+		self.uncharge_hier(bytes, &|a: &ResourceAccount| a.ipc_queue());
 	}
 
 	pub fn try_charge_handle(&self) -> bool {
-		if !self.account.try_charge_handle() {
-			return false;
-		}
-		if let Some(parent) = self.parent() {
-			if !parent.try_charge_handle() {
-				self.account.uncharge_handles(1);
-				return false;
-			}
-		}
-		true
+		self.try_charge_hier(1, &|a: &ResourceAccount| a.handles())
 	}
 
 	pub fn charge_handle(&self) {
-		self.account.charge_handle();
-		if let Some(parent) = self.parent() {
-			parent.charge_handle();
-		}
+		self.charge_hier(1, &|a: &ResourceAccount| a.handles());
 	}
 
 	pub fn uncharge_handles(&self, count: u64) {
-		self.account.uncharge_handles(count);
-		if let Some(parent) = self.parent() {
-			parent.uncharge_handles(count);
-		}
+		self.uncharge_hier(count, &|a: &ResourceAccount| a.handles());
 	}
 
 	pub fn try_charge_thread(&self) -> bool {
-		if !self.account.try_charge_thread() {
-			return false;
-		}
-		if let Some(parent) = self.parent() {
-			if !parent.try_charge_thread() {
-				self.account.uncharge_thread();
-				return false;
-			}
-		}
-		true
+		self.try_charge_hier(1, &|a: &ResourceAccount| a.threads())
 	}
 
 	pub fn charge_thread(&self) {
-		self.account.charge_thread();
-		if let Some(parent) = self.parent() {
-			parent.charge_thread();
-		}
+		self.charge_hier(1, &|a: &ResourceAccount| a.threads());
 	}
 
 	pub fn uncharge_thread(&self) {
-		self.account.uncharge_thread();
-		if let Some(parent) = self.parent() {
-			parent.uncharge_thread();
-		}
+		self.uncharge_hier(1, &|a: &ResourceAccount| a.threads());
 	}
 }
 
-impl KernelObject for Domain {
-	fn header(&self) -> &ObjectHeader {
-		&self.header
-	}
-
-	fn object_type(&self) -> ObjectType {
-		ObjectType::Domain
-	}
-
-	fn as_any(&self) -> &dyn Any {
-		self
-	}
-
-	fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-		self
-	}
-}
+impl_kernel_object!(Domain, Domain);

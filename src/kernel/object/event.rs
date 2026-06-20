@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{KernelObject, ObjectHeader, ObjectType};
+use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::sched;
 
 pub struct Event {
@@ -42,20 +42,4 @@ impl Event {
 	}
 }
 
-impl KernelObject for Event {
-	fn header(&self) -> &ObjectHeader {
-		&self.header
-	}
-
-	fn object_type(&self) -> ObjectType {
-		ObjectType::Event
-	}
-
-	fn as_any(&self) -> &dyn Any {
-		self
-	}
-
-	fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-		self
-	}
-}
+impl_kernel_object!(Event, Event);

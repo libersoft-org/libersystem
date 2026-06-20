@@ -21,7 +21,7 @@ use core::any::Any;
 
 use super::domain::Domain;
 use super::handle::Capability;
-use super::{KernelObject, ObjectHeader, ObjectType};
+use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::sched;
 use crate::sync::SpinLock;
 
@@ -158,23 +158,7 @@ impl Channel {
 	}
 }
 
-impl KernelObject for Channel {
-	fn header(&self) -> &ObjectHeader {
-		&self.header
-	}
-
-	fn object_type(&self) -> ObjectType {
-		ObjectType::Channel
-	}
-
-	fn as_any(&self) -> &dyn Any {
-		self
-	}
-
-	fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-		self
-	}
-}
+impl_kernel_object!(Channel, Channel);
 
 impl Drop for Channel {
 	fn drop(&mut self) {

@@ -46,16 +46,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // Transmit one minimal broadcast Ethernet frame on the transmit queue.
 unsafe fn transmit_frame(tx: &Queue, mac: &[u8; 6]) -> bool {
 	unsafe {
-		let handle: i64 = dma_buffer_create(4096);
-		if handle < 0 {
-			return false;
-		}
-		let virt: i64 = dma_buffer_map(handle as u64);
-		if sys_is_err(virt as u64) {
-			return false;
-		}
-		let virt: u64 = virt as u64;
-		let phys: u64 = dma_buffer_phys(handle as u64);
+		let (_handle, virt, phys): (u64, u64, u64) = match dma_buffer(4096) {
+			Some(t) => t,
+			None => return false,
+		};
 		let total: u64 = NET_HDR_LEN + FRAME_LEN;
 		core::ptr::write_bytes(virt as *mut u8, 0, total as usize);
 

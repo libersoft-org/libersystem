@@ -348,6 +348,25 @@ pub unsafe fn dma_buffer_phys(handle: u64) -> u64 {
 	unsafe { syscall(SYS_DMA_BUFFER_PHYS, handle, 0, 0, 0) }
 }
 
+// Allocate a DmaBuffer of `size` bytes and map it, returning its (handle, virtual
+// base, physical base): a driver fills the ring/buffer through `virt` and points its
+// device at `phys`. None on allocation or mapping failure. The returned handle keeps
+// the pinned buffer alive for the life of the driver.
+pub unsafe fn dma_buffer(size: u64) -> Option<(u64, u64, u64)> {
+	unsafe {
+		let handle: i64 = dma_buffer_create(size);
+		if handle < 0 {
+			return None;
+		}
+		let virt: i64 = dma_buffer_map(handle as u64);
+		if sys_is_err(virt as u64) {
+			return None;
+		}
+		let phys: u64 = dma_buffer_phys(handle as u64);
+		Some((handle as u64, virt as u64, phys))
+	}
+}
+
 // Spawn a new ring-3 process from an ELF image and start it. `bootstrap` is an
 // object handle (0 = none) moved out of this process's table into the child's and
 // delivered to the child's first thread in rdi - the way a process is endowed with

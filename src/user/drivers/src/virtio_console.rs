@@ -39,16 +39,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // buffers are raw bytes, no header).
 unsafe fn write_console(tx: &Queue, bytes: &[u8]) -> bool {
 	unsafe {
-		let handle: i64 = dma_buffer_create(4096);
-		if handle < 0 {
-			return false;
-		}
-		let virt: i64 = dma_buffer_map(handle as u64);
-		if sys_is_err(virt as u64) {
-			return false;
-		}
-		let virt: u64 = virt as u64;
-		let phys: u64 = dma_buffer_phys(handle as u64);
+		let (_handle, virt, phys): (u64, u64, u64) = match dma_buffer(4096) {
+			Some(t) => t,
+			None => return false,
+		};
 		let n: usize = if bytes.len() < 4096 { bytes.len() } else { 4096 };
 		for (i, &b) in bytes[..n].iter().enumerate() {
 			((virt + i as u64) as *mut u8).write_volatile(b);

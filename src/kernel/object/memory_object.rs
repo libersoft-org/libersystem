@@ -14,7 +14,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::domain::Domain;
-use super::{KernelObject, ObjectHeader, ObjectType};
+use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::arch::paging;
 use crate::mem::frame::{self, PAGE_SIZE};
 
@@ -123,23 +123,7 @@ impl MemoryObject {
 	}
 }
 
-impl KernelObject for MemoryObject {
-	fn header(&self) -> &ObjectHeader {
-		&self.header
-	}
-
-	fn object_type(&self) -> ObjectType {
-		ObjectType::MemoryObject
-	}
-
-	fn as_any(&self) -> &dyn Any {
-		self
-	}
-
-	fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-		self
-	}
-}
+impl_kernel_object!(MemoryObject, MemoryObject);
 
 impl Drop for MemoryObject {
 	fn drop(&mut self) {

@@ -148,3 +148,28 @@ pub trait KernelObject: Send + Sync + Any {
 	// Process), which `as_any` (a borrow) cannot provide.
 	fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 }
+
+// Implement the `KernelObject` boilerplate for a type with a `header: ObjectHeader`
+// field. Every object's `header`/`as_any`/`into_any_arc` bodies are byte-identical;
+// only `object_type` varies. Use as `impl_kernel_object!(Channel, Channel);` (the
+// type, then its `ObjectType` variant). The bodies use the names each object module
+// already imports (KernelObject, ObjectHeader, ObjectType, Any, Arc).
+macro_rules! impl_kernel_object {
+	($ty:ty, $variant:ident) => {
+		impl KernelObject for $ty {
+			fn header(&self) -> &ObjectHeader {
+				&self.header
+			}
+			fn object_type(&self) -> ObjectType {
+				ObjectType::$variant
+			}
+			fn as_any(&self) -> &dyn Any {
+				self
+			}
+			fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+				self
+			}
+		}
+	};
+}
+pub(crate) use impl_kernel_object;

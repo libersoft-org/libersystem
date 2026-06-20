@@ -102,7 +102,7 @@ pub struct Queue {
 	avail_off: u64,
 	used_off: u64,
 	// Keeps the ring DMA buffer alive (the handle stays open).
-	handle: i64,
+	handle: u64,
 }
 
 // Run the device-initialization handshake up to FEATURES_OK (reset -> acknowledge
@@ -156,15 +156,10 @@ impl Virtio {
 			let size: u16 = if max_size < QUEUE_SIZE { max_size } else { QUEUE_SIZE };
 			w16(self.common + CFG_QUEUE_SIZE, size);
 
-			let handle: i64 = dma_buffer_create(4096);
-			if handle < 0 {
-				return None;
-			}
-			let virt: i64 = dma_buffer_map(handle as u64);
-			if sys_is_err(virt as u64) {
-				return None;
-			}
-			let phys: u64 = dma_buffer_phys(handle as u64);
+			let (handle, virt, phys): (u64, u64, u64) = match dma_buffer(4096) {
+				Some(t) => t,
+				None => return None,
+			};
 			core::ptr::write_bytes(virt as *mut u8, 0, 4096);
 
 			// layout within the page: descriptor table (16 bytes each), then the
@@ -177,7 +172,7 @@ impl Virtio {
 			let notify_off: u16 = r16(self.common + CFG_QUEUE_NOTIFY_OFF);
 			w16(self.common + CFG_QUEUE_ENABLE, 1);
 
-			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt: virt as u64, avail_off, used_off, handle })
+			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt, avail_off, used_off, handle })
 		}
 	}
 
