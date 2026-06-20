@@ -5,6 +5,7 @@
 use crate::codec::{Reader, Sink, SliceWriter, VecWriter};
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -352,5 +353,133 @@ pub mod log {
 				Err(Error::read(r)?)
 			})
 		}
+	}
+}
+
+impl Error {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			Error::Denied => out.push_str("\"denied\""),
+			Error::NotFound => out.push_str("\"not-found\""),
+			Error::Invalid => out.push_str("\"invalid\""),
+			Error::Again => out.push_str("\"again\""),
+			Error::Closed => out.push_str("\"closed\""),
+		}
+	}
+}
+
+impl Severity {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			Severity::Trace => out.push_str("\"trace\""),
+			Severity::Debug => out.push_str("\"debug\""),
+			Severity::Info => out.push_str("\"info\""),
+			Severity::Warn => out.push_str("\"warn\""),
+			Severity::Error => out.push_str("\"error\""),
+			Severity::Fatal => out.push_str("\"fatal\""),
+		}
+	}
+}
+
+impl Field {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"key\":");
+		crate::codec::json_escape(&self.key, out);
+		out.push(',');
+		out.push_str("\"value\":");
+		crate::codec::json_escape(&self.value, out);
+		out.push('}');
+	}
+}
+
+impl Entry {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"timestamp\":");
+		let _ = write!(out, "{}", self.timestamp);
+		out.push(',');
+		out.push_str("\"severity\":");
+		self.severity.to_json_into(out);
+		out.push(',');
+		out.push_str("\"source\":");
+		crate::codec::json_escape(&self.source, out);
+		out.push(',');
+		out.push_str("\"fields\":");
+		out.push('[');
+		let mut v14 = true;
+		for v13 in self.fields.iter() {
+			if !v14 {
+				out.push(',');
+			}
+			v14 = false;
+			v13.to_json_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+}
+
+impl Query {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"since\":");
+		match &self.since {
+			Some(v15) => {
+				let _ = write!(out, "{}", v15);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"min-severity\":");
+		match &self.min_severity {
+			Some(v16) => {
+				v16.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"source\":");
+		match &self.source {
+			Some(v17) => {
+				crate::codec::json_escape(v17, out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"limit\":");
+		let _ = write!(out, "{}", self.limit);
+		out.push('}');
 	}
 }

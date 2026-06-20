@@ -107,3 +107,26 @@ fn client_server_round_trip() {
 	let q = Query { since: None, min_severity: None, source: None, limit: 0 };
 	assert_eq!(client.query(&q), Some(Ok(alloc::vec![e])));
 }
+
+#[test]
+fn entry_renders_json() {
+	let e = Entry { timestamp: 42, severity: Severity::Info, source: String::from("kernel"), fields: Vec::new() };
+	assert_eq!(e.to_json(), "{\"timestamp\":42,\"severity\":\"info\",\"source\":\"kernel\",\"fields\":[]}");
+}
+
+#[test]
+fn entry_renders_json_with_fields() {
+	let e = Entry { timestamp: 1, severity: Severity::Warn, source: String::from("s"), fields: alloc::vec![Field { key: String::from("k"), value: String::from("v") }] };
+	assert_eq!(e.to_json(), "{\"timestamp\":1,\"severity\":\"warn\",\"source\":\"s\",\"fields\":[{\"key\":\"k\",\"value\":\"v\"}]}");
+}
+
+#[test]
+fn query_renders_json_with_options_and_kebab_keys() {
+	let q = Query { since: Some(5), min_severity: None, source: Some(String::from("svc")), limit: 9 };
+	assert_eq!(q.to_json(), "{\"since\":5,\"min-severity\":null,\"source\":\"svc\",\"limit\":9}");
+}
+
+#[test]
+fn error_renders_json_kebab() {
+	assert_eq!(Error::NotFound.to_json(), "\"not-found\"");
+}

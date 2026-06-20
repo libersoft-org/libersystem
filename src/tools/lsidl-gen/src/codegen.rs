@@ -17,6 +17,9 @@ pub fn rust(file: &File, source: &str) -> Result<String, Error> {
 	for item in &file.items {
 		cg.item(item)?;
 	}
+	for item in &file.items {
+		cg.render_item(item)?;
+	}
 	Ok(cg.out)
 }
 
@@ -64,6 +67,7 @@ impl Cg {
 		self.line("use crate::codec::{Reader, Sink, SliceWriter, VecWriter};");
 		self.line("use alloc::string::String;");
 		self.line("use alloc::vec::Vec;");
+		self.line("use core::fmt::Write as _;");
 		self.line("");
 	}
 
@@ -400,6 +404,151 @@ impl Cg {
 			}
 			Type::Result(okty, errty) => format!("if r.u8()? != 0 {{ Ok({}) }} else {{ Err({}) }}", self.read_value(okty)?, self.read_value(errty)?),
 			Type::Handle(_) | Type::Buffer | Type::Stream(_) => return Err("handle, buffer, and stream are not yet supported in a record or value position".into()),
+		})
+	}
+
+	// Human / JSON rendering, emitted as a second impl block per type.
+	fn render_item(&mut self, item: &Item) -> Result<(), Error> {
+		match item {
+			Item::Record(r) => self.render_record(r),
+			Item::Enum(e) => {
+				self.render_enum(e);
+				Ok(())
+			}
+			Item::Variant(v) => self.render_variant(v),
+			Item::Flags(f) => {
+				self.render_flags(f);
+				Ok(())
+			}
+			Item::Resource(_) | Item::Interface(_) => Ok(()),
+		}
+	}
+
+	// The public `to_json` wrapper shared by every renderable type.
+	fn render_wrappers(&mut self) {
+		self.line("\tpub fn to_json(&self) -> String {");
+		self.line("\t\tlet mut s = String::new();");
+		self.line("\t\tself.to_json_into(&mut s);");
+		self.line("\t\ts");
+		self.line("\t}");
+	}
+
+	fn render_record(&mut self, r: &Record) -> Result<(), Error> {
+		let ty = camel(&r.name);
+		self.line(&format!("impl {ty} {{"));
+		self.render_wrappers();
+		self.line("\tpub(crate) fn to_json_into(&self, out: &mut String) {");
+		self.line("\t\tout.push('{');");
+		for (idx, f) in r.fields.iter().enumerate() {
+			if idx > 0 {
+				self.line("\t\tout.push(',');");
+			}
+			self.line(&format!("\t\tout.push_str(\"\\\"{}\\\":\");", f.name));
+			let code = self.json_value(&f.ty, &format!("self.{}", field_ident(&f.name)), false).map_err(|m| Error::new(f.span, m))?;
+			self.line(&format!("\t\t{code}"));
+		}
+		self.line("\t\tout.push('}');");
+		self.line("\t}");
+		self.line("}");
+		self.line("");
+		Ok(())
+	}
+
+	fn render_enum(&mut self, e: &Enum) {
+		let ty = camel(&e.name);
+		self.line(&format!("impl {ty} {{"));
+		self.render_wrappers();
+		self.line("\tpub(crate) fn to_json_into(&self, out: &mut String) {");
+		self.line("\t\tmatch self {");
+		for c in &e.cases {
+			self.line(&format!("\t\t\t{ty}::{} => out.push_str(\"\\\"{}\\\"\"),", camel(&c.name), c.name));
+		}
+		self.line("\t\t}");
+		self.line("\t}");
+		self.line("}");
+		self.line("");
+	}
+
+	fn render_variant(&mut self, v: &Variant) -> Result<(), Error> {
+		let ty = camel(&v.name);
+		self.line(&format!("impl {ty} {{"));
+		self.render_wrappers();
+		self.line("\tpub(crate) fn to_json_into(&self, out: &mut String) {");
+		self.line("\t\tmatch self {");
+		for c in &v.cases {
+			match &c.payload {
+				Some(p) => {
+					let b = self.fresh();
+					let body = self.json_value(p, &b, true).map_err(|m| Error::new(c.span, m))?;
+					self.line(&format!("\t\t\t{ty}::{}({b}) => {{ out.push_str(\"{{\\\"{}\\\":\"); {body} out.push('}}'); }}", camel(&c.name), c.name));
+				}
+				None => self.line(&format!("\t\t\t{ty}::{} => out.push_str(\"\\\"{}\\\"\"),", camel(&c.name), c.name)),
+			}
+		}
+		self.line("\t\t}");
+		self.line("\t}");
+		self.line("}");
+		self.line("");
+		Ok(())
+	}
+
+	fn render_flags(&mut self, f: &Flags) {
+		let ty = camel(&f.name);
+		self.line(&format!("impl {ty} {{"));
+		self.render_wrappers();
+		self.line("\tpub(crate) fn to_json_into(&self, out: &mut String) {");
+		self.line("\t\tout.push('[');");
+		self.line("\t\tlet mut first = true;");
+		for name in &f.flags {
+			self.line(&format!("\t\tif self.0 & Self::{} != 0 {{ if !first {{ out.push(','); }} first = false; out.push_str(\"\\\"{}\\\"\"); }}", screaming(name), name));
+		}
+		self.line("\t\tout.push(']');");
+		self.line("\t}");
+		self.line("}");
+		self.line("");
+	}
+
+	// Emit a statement appending the JSON of the value at `place` (`&ty` when
+	// `is_ref`, else `ty`) to the in-scope `out: &mut String`.
+	fn json_value(&mut self, ty: &Type, place: &str, is_ref: bool) -> Result<String, String> {
+		let refplace = if is_ref { place.to_string() } else { format!("&{place}") };
+		let boolexpr = if is_ref { format!("*{place}") } else { place.to_string() };
+		Ok(match ty {
+			Type::Bool => format!("if {boolexpr} {{ out.push_str(\"true\"); }} else {{ out.push_str(\"false\"); }}"),
+			Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::F32 | Type::F64 => format!("let _ = write!(out, \"{{}}\", {place});"),
+			Type::String => format!("crate::codec::json_escape({refplace}, out);"),
+			Type::Unit => "out.push_str(\"null\");".to_string(),
+			Type::Named(_) => format!("{place}.to_json_into(out);"),
+			Type::Option(inner) => {
+				let v = self.fresh();
+				let body = self.json_value(inner, &v, true)?;
+				format!("match {refplace} {{ Some({v}) => {{ {body} }} None => {{ out.push_str(\"null\"); }} }}")
+			}
+			Type::List(inner) => {
+				let v = self.fresh();
+				let first = self.fresh();
+				let body = self.json_value(inner, &v, true)?;
+				format!("out.push('['); let mut {first} = true; for {v} in {place}.iter() {{ if !{first} {{ out.push(','); }} {first} = false; {body} }} out.push(']');")
+			}
+			Type::Tuple(elems) => {
+				let binds: Vec<String> = (0..elems.len()).map(|_| self.fresh()).collect();
+				let mut body = String::new();
+				for (idx, (e, b)) in elems.iter().zip(&binds).enumerate() {
+					if idx > 0 {
+						body.push_str("out.push(','); ");
+					}
+					let _ = write!(body, "{} ", self.json_value(e, b, true)?);
+				}
+				format!("out.push('['); let ({}) = {refplace}; {body}out.push(']');", binds.join(", "))
+			}
+			Type::Result(okty, errty) => {
+				let vo = self.fresh();
+				let ve = self.fresh();
+				let okb = self.json_value(okty, &vo, true)?;
+				let errb = self.json_value(errty, &ve, true)?;
+				format!("match {refplace} {{ Ok({vo}) => {{ out.push_str(\"{{\\\"ok\\\":\"); {okb} out.push('}}'); }} Err({ve}) => {{ out.push_str(\"{{\\\"err\\\":\"); {errb} out.push('}}'); }} }}")
+			}
+			Type::Handle(_) | Type::Buffer | Type::Stream(_) => return Err("handle, buffer, and stream are not renderable".into()),
 		})
 	}
 }

@@ -8,6 +8,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 
 // A byte sink the generated codecs write into. The default methods build the
 // little-endian and length-prefixed encodings on top of `put`, so a concrete sink
@@ -210,4 +211,24 @@ impl<'a> Reader<'a> {
 		let bytes = self.bytes_lp()?;
 		String::from_utf8(bytes.to_vec()).ok()
 	}
+}
+
+// Append `s` to `out` as a JSON string literal: wrapped in quotes with the
+// mandatory characters escaped. Used by the generated `to_json` renderers.
+pub fn json_escape(s: &str, out: &mut String) {
+	out.push('"');
+	for c in s.chars() {
+		match c {
+			'"' => out.push_str("\\\""),
+			'\\' => out.push_str("\\\\"),
+			'\n' => out.push_str("\\n"),
+			'\r' => out.push_str("\\r"),
+			'\t' => out.push_str("\\t"),
+			c if (c as u32) < 0x20 => {
+				let _ = write!(out, "\\u{:04x}", c as u32);
+			}
+			c => out.push(c),
+		}
+	}
+	out.push('"');
 }
