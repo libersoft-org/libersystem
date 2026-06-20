@@ -30,7 +30,7 @@ build: user
 # generate the proto crate's bindings from the LSIDL interface definitions
 # (src/idl/*.lsidl) and format the generated source
 gen:
-	cd {{tools_dir}} && cargo run --quiet -- --rust-dir ../../{{proto_dir}}/src ../../idl/*.lsidl
+	cd {{tools_dir}} && cargo run --quiet -- --rust-dir ../../{{proto_dir}}/src --docs-dir ../../../docs/gen ../../idl/*.lsidl
 	cd {{proto_dir}} && cargo fmt
 
 # build + boot in QEMU (serial on stdout). Add live displays as arguments

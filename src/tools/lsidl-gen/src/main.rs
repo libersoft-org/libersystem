@@ -23,6 +23,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
 	let mut dump = false;
 	let mut rust_dir: Option<String> = None;
+	let mut docs_dir: Option<String> = None;
 	let mut paths: Vec<String> = Vec::new();
 	let mut args = std::env::args().skip(1);
 	while let Some(a) = args.next() {
@@ -35,21 +36,28 @@ fn main() -> ExitCode {
 					return ExitCode::FAILURE;
 				}
 			},
+			"--docs-dir" => match args.next() {
+				Some(d) => docs_dir = Some(d),
+				None => {
+					eprintln!("lsidl-gen: --docs-dir needs a directory argument");
+					return ExitCode::FAILURE;
+				}
+			},
 			"-h" | "--help" => {
-				println!("usage: lsidl-gen [--dump] [--rust-dir <dir>] <file.lsidl>...");
+				println!("usage: lsidl-gen [--dump] [--rust-dir <dir>] [--docs-dir <dir>] <file.lsidl>...");
 				return ExitCode::SUCCESS;
 			}
 			_ => paths.push(a),
 		}
 	}
 	if paths.is_empty() {
-		eprintln!("lsidl-gen: no input files (usage: lsidl-gen [--dump] [--rust-dir <dir>] <file.lsidl>...)");
+		eprintln!("lsidl-gen: no input files (usage: lsidl-gen [--dump] [--rust-dir <dir>] [--docs-dir <dir>] <file.lsidl>...)");
 		return ExitCode::FAILURE;
 	}
 
 	let mut ok = true;
 	for path in &paths {
-		if !process(path, dump, rust_dir.as_deref()) {
+		if !process(path, dump, rust_dir.as_deref(), docs_dir.as_deref()) {
 			ok = false;
 		}
 	}
@@ -58,7 +66,7 @@ fn main() -> ExitCode {
 
 // Lex, parse, and validate one file (and, when `rust_dir` is set, generate its
 // Rust bindings). Returns false (and prints diagnostics to stderr) on any error.
-fn process(path: &str, dump: bool, rust_dir: Option<&str>) -> bool {
+fn process(path: &str, dump: bool, rust_dir: Option<&str>, docs_dir: Option<&str>) -> bool {
 	let src = match std::fs::read_to_string(path) {
 		Ok(s) => s,
 		Err(e) => {
@@ -103,6 +111,19 @@ fn process(path: &str, dump: bool, rust_dir: Option<&str>) -> bool {
 				return false;
 			}
 		}
+	}
+	if let Some(dir) = docs_dir {
+		if let Err(e) = std::fs::create_dir_all(dir) {
+			eprintln!("{path}: cannot create {dir}: {e}");
+			return false;
+		}
+		let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+		let out_path = format!("{dir}/{stem}.md");
+		if let Err(e) = std::fs::write(&out_path, codegen::docs(&file, path)) {
+			eprintln!("{path}: cannot write {out_path}: {e}");
+			return false;
+		}
+		println!("{path}: wrote {out_path}");
 	}
 	if dump {
 		println!("{file:#?}");
