@@ -19,7 +19,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use proto::system::log::{self, Service};
-use proto::system::{Entry, Error, Query};
+use proto::system::{Entry, Error, Query, Severity};
 use rt::*;
 
 // The bounded journal: at most this many records, newest dropping oldest. With a
@@ -62,6 +62,25 @@ impl Service for Journal {
 		}
 		Ok(out)
 	}
+
+	// The streaming counterpart of `query`: the same bounded source, but the
+	// generated codec frames each entry onto a fresh sub-channel instead of
+	// packing them into one reply. Here the source is bounded (the journal), so
+	// we return the snapshot and the serve loop streams it frame by frame.
+	fn tail(&mut self, q: Query) -> Vec<Entry> {
+		let min: u8 = q.min_severity.map(|s: Severity| s as u8).unwrap_or(0);
+		let mut out: Vec<Entry> = Vec::new();
+		for entry in &self.entries {
+			if (entry.severity as u8) < min {
+				continue;
+			}
+			out.push(entry.clone());
+			if q.limit != 0 && out.len() as u32 >= q.limit {
+				break;
+			}
+		}
+		out
+	}
 }
 
 #[unsafe(no_mangle)]
@@ -83,6 +102,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 3. serve generated emit/query requests until the client side closes. Each
 	//    request is dispatched into the journal; the reply it produces is sent back
 	//    (emit replies `result<unit, error>`, query replies the matching entries).
+	//    OP_TAIL is special: it opens a stream. We mint a fresh sub-channel, hand
+	//    the consumer end back out-of-band alongside the correlation id, then frame
+	//    each entry onto the producer end and close it to mark end-of-stream.
 	let mut journal: Journal = Journal::new();
 	let mut request: [u8; 1024] = [0u8; 1024];
 	let mut reply: [u8; 4096] = [0u8; 4096];
@@ -91,10 +113,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// An empty message is the explicit quit sentinel.
 			Received::Message { len, .. } if len == 0 => break,
 			Received::Message { len, handle } => {
-				let mut reply_handle: u64 = 0;
-				if let Some(n) = log::dispatch(&mut journal, &request[..len], handle, &mut reply, &mut reply_handle) {
-					unsafe {
-						send_blocking(service, &reply[..n], reply_handle);
+				let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+				if op == log::OP_TAIL {
+					stream_tail(&mut journal, service, &request[..len]);
+				} else {
+					let mut reply_handle: u64 = 0;
+					if let Some(n) = log::dispatch(&mut journal, &request[..len], handle, &mut reply, &mut reply_handle) {
+						unsafe {
+							send_blocking(service, &reply[..n], reply_handle);
+						}
 					}
 				}
 			}
@@ -102,4 +129,35 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 	exit();
+}
+
+// Serve one OP_TAIL request: decode it, gather the bounded snapshot, then stream
+// the entries to the client over a fresh sub-channel. The reply on the service
+// channel carries just the correlation id and the consumer endpoint (out-of-band);
+// each entry then travels as its own framed message on the producer endpoint, and
+// closing the producer tells the client the stream has ended.
+fn stream_tail(journal: &mut Journal, service: u64, request: &[u8]) {
+	let (corr, items): (u32, Vec<Entry>) = match log::tail_open(journal, request) {
+		Some(v) => v,
+		None => return,
+	};
+	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
+		Some(pair) => pair,
+		None => return,
+	};
+	let corr_bytes: [u8; 4] = corr.to_le_bytes();
+	unsafe {
+		send_blocking(service, &corr_bytes, consumer);
+	}
+	let mut frame: [u8; 1024] = [0u8; 1024];
+	for (seq, item) in items.iter().enumerate() {
+		if let Some(n) = log::tail_frame(seq as u32, item, &mut frame) {
+			unsafe {
+				send_blocking(producer, &frame[..n], 0);
+			}
+		}
+	}
+	unsafe {
+		syscall(SYS_HANDLE_CLOSE, producer, 0, 0, 0);
+	}
 }

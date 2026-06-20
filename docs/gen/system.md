@@ -119,7 +119,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | --- | --- | --- |
 | 1 | `emit` | `emit(e: entry) -> result<unit, error>` |
 | 2 | `query` | `query(q: query) -> result<list<entry>, error>` |
-| 3 | `tail` | `tail(q: query) -> result<stream<entry>, error>` |
+| 3 | `tail` | `tail(q: query) -> stream<entry>` |
 
 ### interface `volume`
 

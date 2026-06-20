@@ -49,7 +49,7 @@ record query {
 interface log {
 	@op(1) emit:  func(e: entry) -> result<unit, error>;
 	@op(2) query: func(q: query) -> result<list<entry>, error>;
-	@op(3) tail:  func(q: query) -> result<stream<entry>, error>;
+	@op(3) tail:  func(q: query) -> stream<entry>;
 }
 
 // An opaque file object, transferred to a client as handle<file> (a capability to

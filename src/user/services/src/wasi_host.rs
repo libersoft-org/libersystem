@@ -19,7 +19,7 @@
 extern crate alloc;
 
 use proto::codec::Transport;
-use proto::system::{picker, volume, OpenOpts};
+use proto::system::{OpenOpts, picker, volume};
 use rt::*;
 use wasm::{Host, Instance, Trap, Value};
 

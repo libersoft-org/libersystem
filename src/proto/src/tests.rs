@@ -3,6 +3,7 @@
 //! The golden test pins the `entry` encoding to the existing `abi::log` wire
 //! layout, byte for byte, so the generated codec stays a drop-in replacement.
 
+use crate::codec::{Sink, VecWriter};
 use crate::system::*;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -98,6 +99,10 @@ impl log::Service for MemLog {
 	fn query(&mut self, _q: Query) -> Result<Vec<Entry>, Error> {
 		Ok(self.entries.clone())
 	}
+
+	fn tail(&mut self, _q: Query) -> Vec<Entry> {
+		self.entries.clone()
+	}
 }
 
 #[test]
@@ -107,6 +112,36 @@ fn client_server_round_trip() {
 	assert_eq!(client.emit(&e), Some(Ok(())));
 	let q = Query { since: None, min_severity: None, source: None, limit: 0 };
 	assert_eq!(client.query(&q), Some(Ok(alloc::vec![e])));
+}
+
+#[test]
+fn tail_stream_round_trip() {
+	// Drive the generated stream helpers directly: a producer opens the stream
+	// (decoding the request, calling the service), frames each item with a
+	// sequence number, and a consumer reads the frames back.
+	let mut service = MemLog::default();
+	let e0 = Entry { timestamp: 1, severity: Severity::Info, source: String::from("a"), fields: Vec::new() };
+	let e1 = Entry { timestamp: 2, severity: Severity::Warn, source: String::from("b"), fields: Vec::new() };
+	service.entries = alloc::vec![e0.clone(), e1.clone()];
+
+	// Encode a tail request the way the client does (op + corr + query).
+	let q = Query { since: None, min_severity: None, source: None, limit: 0 };
+	let mut writer = VecWriter::new();
+	let w = &mut writer;
+	w.u16(log::OP_TAIL).unwrap();
+	w.u32(7).unwrap();
+	q.write(w).unwrap();
+	let request = writer.into_inner();
+
+	let (corr, items) = log::tail_open(&mut service, &request).unwrap();
+	assert_eq!(corr, 7);
+	assert_eq!(items.len(), 2);
+
+	let mut frame = [0u8; 256];
+	for (seq, item) in items.iter().enumerate() {
+		let n = log::tail_frame(seq as u32, item, &mut frame).unwrap();
+		assert_eq!(log::tail_read(&frame[..n]), Some(item.clone()));
+	}
 }
 
 // A volume stub whose `open` returns a non-zero handle value. The wire encodes

@@ -142,6 +142,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  echo <text>      print text\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
 			print(b"  log [json]       show the system journal via LogService\n");
+			print(b"  log tail [json]  stream the journal via LogService (sub-channel)\n");
 			print(b"  dev [json]       list devices via DeviceService\n");
 			print(b"  ps               list started processes via ProcessService\n");
 			print(b"  run <name>       start a program via ProcessService\n");
@@ -156,6 +157,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		}
 		if line == b"log json" {
 			query_log(logsvc, true);
+			return false;
+		}
+		if line == b"log tail" {
+			tail_log(logsvc, false);
+			return false;
+		}
+		if line == b"log tail json" {
+			tail_log(logsvc, true);
 			return false;
 		}
 		if line == b"dev" {
@@ -258,6 +267,53 @@ unsafe fn query_log(logsvc: u64, json: bool) {
 			Some(Err(_)) => print(b"log: query error\n"),
 			None => print(b"log: service unavailable\n"),
 		}
+	}
+}
+
+// Stream the system journal via LogService's OP_TAIL. Unlike `query`, which packs
+// every matching entry into a single reply, `tail` returns a fresh sub-channel:
+// the service frames each entry as its own message on it and closes it to mark the
+// end of the stream. We drain the frames and render each entry on the client side,
+// exactly like `log`, but one streamed record at a time.
+unsafe fn tail_log(logsvc: u64, json: bool) {
+	unsafe {
+		let q = Query { since: None, min_severity: None, source: None, limit: 0 };
+		let mut client = log::Client::new(ChannelTransport { chan: logsvc });
+		let consumer: u64 = match client.tail(&q) {
+			Some(h) => h,
+			None => {
+				print(b"log: service unavailable\n");
+				return;
+			}
+		};
+		if json {
+			print(b"[");
+		}
+		let mut first: bool = true;
+		let mut frame: [u8; 1024] = [0u8; 1024];
+		loop {
+			match recv_blocking(consumer, &mut frame) {
+				Received::Message { len, .. } => {
+					if let Some(entry) = log::tail_read(&frame[..len]) {
+						if json {
+							if !first {
+								print(b",");
+							}
+							first = false;
+							print(entry.to_json().as_bytes());
+						} else {
+							print(entry.to_text().as_bytes());
+							print(b"\n");
+						}
+					}
+				}
+				Received::Closed => break,
+			}
+		}
+		if json {
+			print(b"]\n");
+		}
+		syscall(SYS_HANDLE_CLOSE, consumer, 0, 0, 0);
 	}
 }
 

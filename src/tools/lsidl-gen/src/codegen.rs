@@ -244,8 +244,13 @@ impl Cg {
 		self.line("\tpub trait Service {");
 		for m in &supported {
 			let params = trait_params(m)?;
-			let ret = rust_ty(&m.ret).map_err(|e| Error::new(m.span, e))?;
-			self.line(&format!("\t\tfn {}(&mut self{params}) -> {ret};", field_ident(&m.name)));
+			if let Type::Stream(elem) = &m.ret {
+				let et = rust_ty(elem).map_err(|e| Error::new(m.span, e))?;
+				self.line(&format!("\t\tfn {}(&mut self{params}) -> Vec<{et}>;", field_ident(&m.name)));
+			} else {
+				let ret = rust_ty(&m.ret).map_err(|e| Error::new(m.span, e))?;
+				self.line(&format!("\t\tfn {}(&mut self{params}) -> {ret};", field_ident(&m.name)));
+			}
 		}
 		self.line("\t}");
 		self.line("");
@@ -259,6 +264,9 @@ impl Cg {
 		self.line("\t\tw.u32(corr)?;");
 		self.line("\t\tmatch op {");
 		for m in &supported {
+			if matches!(&m.ret, Type::Stream(_)) {
+				continue;
+			}
 			self.line(&format!("\t\t\tOP_{} => {{", screaming(&m.name)));
 			let mut args: Vec<String> = Vec::new();
 			for p in &m.params {
@@ -278,6 +286,48 @@ impl Cg {
 		self.line("\t\tSome(writer.pos())");
 		self.line("\t}");
 		self.line("");
+		// stream methods: the wait-drained event stream. The serve loop calls
+		// `<m>_open` to decode the request and run the service, creates a sub-channel,
+		// replies with the consumer end, then frames each element with `<m>_frame`
+		// onto the producer; the client drains the consumer with ordinary receives,
+		// decoding each element with `<m>_read`, until the producer closes.
+		for m in &supported {
+			if let Type::Stream(elem) = &m.ret {
+				let mname = field_ident(&m.name);
+				let et = rust_ty(elem).map_err(|e| Error::new(m.span, e))?;
+				self.line(&format!("\tpub fn {mname}_open<S: Service>(service: &mut S, request: &[u8]) -> Option<(u32, Vec<{et}>)> {{"));
+				self.line("\t\tlet mut reader = Reader::new(request);");
+				self.line("\t\tlet r = &mut reader;");
+				self.line("\t\tlet _op = r.u16()?;");
+				self.line("\t\tlet corr = r.u32()?;");
+				let mut args: Vec<String> = Vec::new();
+				for p in &m.params {
+					let expr = self.read_value(&p.ty).map_err(|e| Error::new(p.span, e))?;
+					let pn = field_ident(&p.name);
+					self.line(&format!("\t\tlet {pn} = {expr};"));
+					args.push(pn);
+				}
+				self.line(&format!("\t\tlet items = service.{mname}({});", args.join(", ")));
+				self.line("\t\tSome((corr, items))");
+				self.line("\t}");
+				self.line(&format!("\tpub fn {mname}_frame(seq: u32, item: &{et}, out: &mut [u8]) -> Option<usize> {{"));
+				self.line("\t\tlet mut writer = SliceWriter::new(out);");
+				self.line("\t\tlet w = &mut writer;");
+				self.line("\t\tw.u32(seq)?;");
+				let code = self.write_place(elem, "item", true).map_err(|e| Error::new(m.span, e))?;
+				self.line(&format!("\t\t{code}"));
+				self.line("\t\tSome(writer.pos())");
+				self.line("\t}");
+				self.line(&format!("\tpub fn {mname}_read(msg: &[u8]) -> Option<{et}> {{"));
+				self.line("\t\tlet mut reader = Reader::new(msg);");
+				self.line("\t\tlet r = &mut reader;");
+				self.line("\t\tlet _seq = r.u32()?;");
+				let expr = self.read_value(elem).map_err(|e| Error::new(m.span, e))?;
+				self.line(&format!("\t\tSome({expr})"));
+				self.line("\t}");
+				self.line("");
+			}
+		}
 		self.line("\tpub struct Client<T: Transport> {");
 		self.line("\t\ttransport: T,");
 		self.line("\t\tcorr: u32,");
@@ -297,6 +347,28 @@ impl Cg {
 		self.line("\t\t}");
 		for m in &supported {
 			let params = client_params(m)?;
+			if let Type::Stream(_) = &m.ret {
+				self.line(&format!("\t\tpub fn {}(&mut self{params}) -> Option<u64> {{", field_ident(&m.name)));
+				self.line("\t\t\tlet corr = self.next_corr();");
+				self.line("\t\t\tlet mut writer = VecWriter::new();");
+				self.line("\t\t\tlet w = &mut writer;");
+				self.line(&format!("\t\t\tw.u16(OP_{})?;", screaming(&m.name)));
+				self.line("\t\t\tw.u32(corr)?;");
+				for p in &m.params {
+					let code = self.write_place(&p.ty, &field_ident(&p.name), true).map_err(|e| Error::new(p.span, e))?;
+					self.line(&format!("\t\t\t{code}"));
+				}
+				self.line("\t\t\tlet request = writer.into_inner();");
+				self.line("\t\t\tlet (reply, reply_handle) = self.transport.call(&request, 0)?;");
+				self.line("\t\t\tlet mut reader = Reader::new(&reply);");
+				self.line("\t\t\tlet r = &mut reader;");
+				self.line("\t\t\tif r.u32()? != corr || reply_handle == 0 {");
+				self.line("\t\t\t\treturn None;");
+				self.line("\t\t\t}");
+				self.line("\t\t\tSome(reply_handle)");
+				self.line("\t\t}");
+				continue;
+			}
 			let ret = rust_ty(&m.ret).map_err(|e| Error::new(m.span, e))?;
 			self.line(&format!("\t\tpub fn {}(&mut self{params}) -> Option<{ret}> {{", field_ident(&m.name)));
 			self.line("\t\t\tlet corr = self.next_corr();");
@@ -769,10 +841,17 @@ fn flags_width(count: usize) -> &'static str {
 	}
 }
 
-// Whether a method's parameters and return type can all be carried by the codec
-// (handle/buffer/stream are deferred to the capability-transfer framing).
+// Whether a method's parameters and return type can all be carried by the codec. A
+// `stream<T>` return is supported when its element type is (it is delivered over a
+// sub-channel, not inline); buffer is still deferred to the zero-copy framing.
 fn method_supported(m: &Method) -> bool {
-	m.params.iter().all(|p| type_codec_ok(&p.ty)) && type_codec_ok(&m.ret)
+	if !m.params.iter().all(|p| type_codec_ok(&p.ty)) {
+		return false;
+	}
+	match &m.ret {
+		Type::Stream(elem) => type_codec_ok(elem.as_ref()),
+		other => type_codec_ok(other),
+	}
 }
 
 fn type_codec_ok(ty: &Type) -> bool {

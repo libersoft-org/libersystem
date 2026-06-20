@@ -241,11 +241,11 @@ pub mod log {
 	pub const OP_EMIT: u16 = 1;
 	pub const OP_QUERY: u16 = 2;
 	pub const OP_TAIL: u16 = 3;
-	// `tail` (op 3) uses handle/buffer/stream; bindings deferred.
 
 	pub trait Service {
 		fn emit(&mut self, e: Entry) -> Result<(), Error>;
 		fn query(&mut self, q: Query) -> Result<Vec<Entry>, Error>;
+		fn tail(&mut self, q: Query) -> Vec<Entry>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -294,6 +294,29 @@ pub mod log {
 		}
 		*reply_handle = writer.handle();
 		Some(writer.pos())
+	}
+
+	pub fn tail_open<S: Service>(service: &mut S, request: &[u8]) -> Option<(u32, Vec<Entry>)> {
+		let mut reader = Reader::new(request);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		let q = Query::read(r)?;
+		let items = service.tail(q);
+		Some((corr, items))
+	}
+	pub fn tail_frame(seq: u32, item: &Entry, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(seq)?;
+		item.write(w)?;
+		Some(writer.pos())
+	}
+	pub fn tail_read(msg: &[u8]) -> Option<Entry> {
+		let mut reader = Reader::new(msg);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		Some(Entry::read(r)?)
 	}
 
 	pub struct Client<T: Transport> {
@@ -357,6 +380,22 @@ pub mod log {
 			} else {
 				Err(Error::read(r)?)
 			})
+		}
+		pub fn tail(&mut self, q: &Query) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_TAIL)?;
+			w.u32(corr)?;
+			q.write(w)?;
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, 0)?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || reply_handle == 0 {
+				return None;
+			}
+			Some(reply_handle)
 		}
 	}
 }
