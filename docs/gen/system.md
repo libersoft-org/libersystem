@@ -101,6 +101,14 @@ An opaque kernel object, transferred as `handle<file>`.
 | `key` | `string` |
 | `value` | `string` |
 
+### record `picked`
+
+| field | type |
+| --- | --- |
+| `file` | `handle<file>` |
+| `size` | `u64` |
+| `name` | `string` |
+
 ## Interfaces
 
 ### interface `log`
@@ -148,4 +156,12 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 1 | `get` | `get(key: string) -> result<string, error>` |
 | 2 | `list` | `list() -> result<list<config-entry>, error>` |
 | 3 | `set` | `set(entry: config-entry) -> result<unit, error>` |
+
+### interface `picker`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `pick` | `pick() -> result<picked, error>` |
 

@@ -19,7 +19,7 @@
 extern crate alloc;
 
 use proto::codec::Transport;
-use proto::system::{OpenOpts, volume};
+use proto::system::{OpenOpts, picker, volume};
 use rt::*;
 use wasm::{Host, Instance, Trap, Value};
 
@@ -66,10 +66,19 @@ impl Transport for ChannelTransport {
 	}
 }
 
-// The WASI host: services the component's `read` import by opening the granted file
-// over StorageService and copying its bytes into the component's linear memory.
+// How the host backs the component's `read` import - its whole granted world. With
+// `Storage` the host opens one fixed file directly over StorageService; with
+// `Picker` it has no filesystem access of its own and must ask the FilePicker,
+// which (on the user's pick) grants exactly the chosen file - the powerbox.
+enum Grant {
+	Storage(u64),
+	Picker(u64),
+}
+
+// The WASI host: services the component's `read` import from whatever it was
+// granted, copying the resulting bytes into the component's linear memory.
 struct WasiHost {
-	storage: u64,
+	grant: Grant,
 }
 
 impl Host for WasiHost {
@@ -84,14 +93,19 @@ impl Host for WasiHost {
 		if ptr > end {
 			return Err(Trap("read pointer out of bounds"));
 		}
-		let n: usize = unsafe { read_granted(self.storage, &mut memory[ptr..end]) }.ok_or(Trap("granted read failed"))?;
+		let dst: &mut [u8] = &mut memory[ptr..end];
+		let n: usize = match self.grant {
+			Grant::Storage(storage) => unsafe { read_fixed(storage, dst) },
+			Grant::Picker(picker) => unsafe { read_picked(picker, dst) },
+		}
+		.ok_or(Trap("granted read failed"))?;
 		Ok(alloc::vec![Value::I32(n as i32)])
 	}
 }
 
-// Open the granted file over StorageService and copy up to `dst.len()` bytes into
-// `dst`, returning the number copied. None on any failure.
-unsafe fn read_granted(storage: u64, dst: &mut [u8]) -> Option<usize> {
+// Open the host's one fixed granted file over StorageService and copy up to
+// `dst.len()` bytes into `dst`, returning the number copied. None on any failure.
+unsafe fn read_fixed(storage: u64, dst: &mut [u8]) -> Option<usize> {
 	unsafe {
 		let opts: OpenOpts = OpenOpts { path: alloc::string::String::from_utf8_lossy(GRANTED).into_owned(), write: false, create: false };
 		let mut client = volume::Client::new(ChannelTransport { chan: storage });
@@ -115,24 +129,54 @@ unsafe fn read_granted(storage: u64, dst: &mut [u8]) -> Option<usize> {
 	}
 }
 
+// Ask the FilePicker for the user's chosen file - the powerbox: the host has no
+// filesystem access of its own, only the picker - then copy up to `dst.len()` bytes
+// of that granted file into `dst`. The picker returns the file as a handle<file>
+// capability, which the host maps and reads. None on any failure.
+unsafe fn read_picked(picker: u64, dst: &mut [u8]) -> Option<usize> {
+	unsafe {
+		let mut client = picker::Client::new(ChannelTransport { chan: picker });
+		let picked = match client.pick() {
+			Some(Ok(p)) => p,
+			_ => return None,
+		};
+		if picked.file == 0 {
+			return None;
+		}
+		let mapped: u64 = syscall(SYS_MEMORY_MAP, picked.file, 0, 0, 0);
+		if sys_is_err(mapped) {
+			syscall(SYS_HANDLE_CLOSE, picked.file, 0, 0, 0);
+			return None;
+		}
+		let n: usize = (picked.size as usize).min(dst.len());
+		core::ptr::copy_nonoverlapping(mapped as *const u8, dst.as_mut_ptr(), n);
+		syscall(SYS_MEMORY_UNMAP, picked.file, 0, 0, 0);
+		syscall(SYS_HANDLE_CLOSE, picked.file, 0, 0, 0);
+		Some(n)
+	}
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 64] = [0u8; 64];
 
-	// 1. receive the StorageService client - the capability the host is granted.
-	let storage: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"STORAGE" => handle,
+	// 1. receive the capability the host is granted: a StorageService client (read a
+	//    fixed file) or a FilePicker client (read the user-picked file - the powerbox:
+	//    no filesystem access of our own).
+	let grant: Grant = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"STORAGE" => Grant::Storage(handle),
+		Received::Message { len, handle } if handle != 0 && len >= 6 && &buf[..6] == b"PICKER" => Grant::Picker(handle),
 		_ => exit(),
 	};
 
 	// 2. load + instantiate the component and run it. `run` calls the read import,
-	//    which the host services from the one granted file.
+	//    which the host services from whatever it was granted.
 	let module = match wasm::parse(COMPONENT) {
 		Ok(m) => m,
 		Err(_) => exit(),
 	};
 	let mut instance: Instance = Instance::new(&module);
-	let mut host: WasiHost = WasiHost { storage };
+	let mut host: WasiHost = WasiHost { grant };
 	let count: i32 = match instance.invoke("run", &[], &mut host) {
 		Ok(results) => results.first().map(|v: &Value| v.as_i32()).unwrap_or(0),
 		Err(_) => exit(),

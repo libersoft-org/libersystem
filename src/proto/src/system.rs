@@ -1056,6 +1056,121 @@ pub mod config {
 	}
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Picked {
+	pub file: u64,
+	pub size: u64,
+	pub name: String,
+}
+
+impl Picked {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Picked> {
+		Picked::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.set_handle(self.file);
+		w.u32(0)?;
+		w.u64(self.size)?;
+		w.bytes_lp(self.name.as_bytes())?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<Picked> {
+		let file = {
+			let _ = r.u32()?;
+			r.take_handle()
+		};
+		let size = r.u64()?;
+		let name = r.string_lp()?;
+		Some(Picked { file, size, name })
+	}
+}
+
+// interface `picker` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod picker {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_PICK: u16 = 1;
+
+	pub trait Service {
+		fn pick(&mut self) -> Result<Picked, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = Reader::with_handle(request, request_handle);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		match op {
+			OP_PICK => {
+				let result = service.pick();
+				match &result {
+					Ok(v38) => {
+						w.u8(1)?;
+						v38.write(w)?;
+					}
+					Err(v39) => {
+						w.u8(0)?;
+						v39.write(w)?;
+					}
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn pick(&mut self) -> Option<Result<Picked, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_PICK)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(Picked::read(r)?) } else { Err(Error::read(r)?) })
+		}
+	}
+}
+
 impl Error {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1175,13 +1290,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v39 = true;
-		for v38 in self.fields.iter() {
-			if !v39 {
+		let mut v41 = true;
+		for v40 in self.fields.iter() {
+			if !v41 {
 				out.push(',');
 			}
-			v39 = false;
-			v38.to_json_into(out);
+			v41 = false;
+			v40.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1199,13 +1314,13 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v41 = true;
-		for v40 in self.fields.iter() {
-			if !v41 {
+		let mut v43 = true;
+		for v42 in self.fields.iter() {
+			if !v43 {
 				out.push_str(", ");
 			}
-			v41 = false;
-			v40.to_text_into(out);
+			v43 = false;
+			v42.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1227,8 +1342,8 @@ impl Query {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v42) => {
-				let _ = write!(out, "{}", v42);
+			Some(v44) => {
+				let _ = write!(out, "{}", v44);
 			}
 			None => {
 				out.push_str("null");
@@ -1237,8 +1352,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v43) => {
-				v43.to_json_into(out);
+			Some(v45) => {
+				v45.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -1247,8 +1362,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v44) => {
-				crate::codec::json_escape(v44, out);
+			Some(v46) => {
+				crate::codec::json_escape(v46, out);
 			}
 			None => {
 				out.push_str("null");
@@ -1263,8 +1378,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v45) => {
-				let _ = write!(out, "{}", v45);
+			Some(v47) => {
+				let _ = write!(out, "{}", v47);
 			}
 			None => {
 				out.push('-');
@@ -1273,8 +1388,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v46) => {
-				v46.to_text_into(out);
+			Some(v48) => {
+				v48.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -1283,8 +1398,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v47) => {
-				out.push_str(v47);
+			Some(v49) => {
+				out.push_str(v49);
 			}
 			None => {
 				out.push('-');
@@ -1505,6 +1620,43 @@ impl ConfigEntry {
 		out.push_str(", ");
 		out.push_str("value=");
 		out.push_str(&self.value);
+		out.push('}');
+	}
+}
+
+impl Picked {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"file\":");
+		let _ = write!(out, "{}", self.file);
+		out.push(',');
+		out.push_str("\"size\":");
+		let _ = write!(out, "{}", self.size);
+		out.push(',');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("file=");
+		let _ = write!(out, "{}", self.file);
+		out.push_str(", ");
+		out.push_str("size=");
+		let _ = write!(out, "{}", self.size);
+		out.push_str(", ");
+		out.push_str("name=");
+		out.push_str(&self.name);
 		out.push('}');
 	}
 }

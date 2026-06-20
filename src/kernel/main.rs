@@ -196,6 +196,7 @@ fn boot_main() {
 	domain_lifecycle_demo();
 	storage_demo();
 	wasi_demo();
+	powerbox_demo();
 	pci_demo();
 	ipc_bench();
 	cli::demo();
@@ -817,6 +818,89 @@ fn wasi_demo() {
 			}
 		}
 		Err(reason) => serial_println!("wasi: ERROR - {}", reason),
+	}
+}
+
+// Build the M29 powerbox topology and run it to completion. A StorageService serves
+// the ramdisk volume; a file_picker holds the trusted storage client and serves the
+// Picker contract; the wasi_host is given ONLY a picker client - no filesystem
+// access of its own - and runs the same Wasm component. The component's read import
+// now goes through the picker: `pick` (standing in for the user's choice) opens the
+// chosen file (motd.txt) over StorageService and hands back that one file as a
+// handle<file> capability, which the host reads into the component's memory. So a
+// component with no filesystem capability reaches exactly the user-picked file and
+// nothing else. The kernel only brokers the initial capabilities. Returns
+// (expected, actual): the picked file straight from the volume, and what the
+// component read.
+fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
+	use alloc::sync::Arc;
+	use object::KernelObject;
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::memory_object::MemoryObject;
+	use object::rights::Rights;
+
+	let volume = volume_package_bytes().ok_or("volume package module not found")?;
+	let expected = pkg::Package::parse(volume).and_then(|p| p.lookup(b"motd.txt").map(|b| b.to_vec())).ok_or("motd.txt missing from the volume package")?;
+
+	let init = init_package_bytes().ok_or("init package module not found")?;
+	let package = pkg::Package::parse(init).ok_or("init package is malformed")?;
+	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
+	let picker_elf = package.lookup(b"file_picker").ok_or("file_picker missing from the init package")?;
+	let host_elf = package.lookup(b"wasi_host").ok_or("wasi_host missing from the init package")?;
+
+	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
+	copy_into_object(&ramdisk, volume);
+
+	let (storage_boot_kernel, storage_boot_user) = Channel::create();
+	let (picker_boot_kernel, picker_boot_user) = Channel::create();
+	let (host_boot_kernel, host_boot_user) = Channel::create();
+	let (storage_server, storage_client) = Channel::create();
+	let (picker_server, picker_client) = Channel::create();
+
+	let domain = sched::root_domain();
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
+	loader::spawn_elf_process(domain.clone(), picker_elf, picker_boot_user, Rights::ALL, 0).map_err(|_| "failed to load file_picker")?;
+	loader::spawn_elf_process(domain, host_elf, host_boot_user, Rights::ALL, 0).map_err(|_| "failed to load wasi_host")?;
+
+	// StorageService: the ramdisk volume (with its length) and its service channel.
+	let mut ramdisk_msg = alloc::vec::Vec::with_capacity(7 + 8);
+	ramdisk_msg.extend_from_slice(b"RAMDISK");
+	ramdisk_msg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
+	let ramdisk_cap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP, 0);
+	storage_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap], 0)).map_err(|_| "storage ramdisk bootstrap failed")?;
+	let storage_server_cap = Capability::new(storage_server as Arc<dyn KernelObject>, Rights::ALL, 0);
+	storage_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![storage_server_cap], 0)).map_err(|_| "storage serve bootstrap failed")?;
+
+	// file_picker: the trusted StorageService client and its own service channel.
+	let storage_client_cap = Capability::new(storage_client as Arc<dyn KernelObject>, Rights::ALL, 0);
+	picker_boot_kernel.send(Message::new(b"STORAGE".to_vec(), alloc::vec![storage_client_cap], 0)).map_err(|_| "picker storage bootstrap failed")?;
+	let picker_server_cap = Capability::new(picker_server as Arc<dyn KernelObject>, Rights::ALL, 0);
+	picker_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![picker_server_cap], 0)).map_err(|_| "picker serve bootstrap failed")?;
+
+	// wasi_host: only the picker client - no filesystem access of its own.
+	let picker_client_cap = Capability::new(picker_client as Arc<dyn KernelObject>, Rights::ALL, 0);
+	host_boot_kernel.send(Message::new(b"PICKER".to_vec(), alloc::vec![picker_client_cap], 0)).map_err(|_| "host picker bootstrap failed")?;
+
+	sched::run_until_idle();
+
+	let result = host_boot_kernel.recv().map_err(|_| "the host reported no result")?;
+	Ok((expected, result.bytes))
+}
+
+// Run the M29 powerbox scenario and report whether the component reached exactly the
+// user-picked file through the FilePicker, with no filesystem access of its own.
+#[cfg(not(test))]
+fn powerbox_demo() {
+	match run_powerbox_scenario() {
+		Ok((expected, actual)) => {
+			if actual == expected {
+				serial_println!("powerbox: component (no filesystem access) read the {}-byte file the user picked (motd.txt) via the FilePicker", actual.len());
+			} else {
+				serial_println!("powerbox: ERROR - component read {} bytes, expected {}", actual.len(), expected.len());
+			}
+		}
+		Err(reason) => serial_println!("powerbox: ERROR - {}", reason),
 	}
 }
 
@@ -2334,6 +2418,21 @@ fn wasi_host_runs_a_component() {
 	let (expected, actual) = run_wasi_scenario().expect("the wasi scenario should run");
 	assert!(!expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(actual, expected, "the component read the granted file's bytes through the host import");
+}
+
+#[cfg(test)]
+#[test_case]
+fn powerbox_grants_a_picked_file_to_a_component() {
+	// A Wasm component with NO filesystem access of its own runs under wasi_host,
+	// which holds only a FilePicker client. The component's read import goes through
+	// the picker, which (standing in for the user's choice) opens the chosen file
+	// over StorageService and hands back exactly that file as a handle<file>
+	// capability; the host reads it into the component's memory. The bytes must equal
+	// the picked file straight from the volume - the component gained access to
+	// exactly one user-picked file, and to nothing else (the powerbox pattern).
+	let (expected, actual) = run_powerbox_scenario().expect("the powerbox scenario should run");
+	assert!(!expected.is_empty(), "the picked file should not be empty");
+	assert_eq!(actual, expected, "the component read the user-picked file through the picker");
 }
 
 #[cfg(test)]

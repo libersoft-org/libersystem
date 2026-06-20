@@ -135,3 +135,20 @@ interface config {
 	@op(2) list: func() -> result<list<config-entry>, error>;
 	@op(3) set:  func(entry: config-entry) -> result<unit, error>;
 }
+
+// A file the user picked: a capability to its bytes (transferred out-of-band as
+// handle<file>) plus its length and name. The capability is granted by the act of
+// picking - the powerbox pattern, where authority flows from the user's choice
+// rather than from ambient filesystem access.
+record picked {
+	file: handle<file>,
+	size: u64,
+	name: string,
+}
+
+// The file-picker contract: `pick` prompts the user and hands back the chosen file
+// as a capability. A caller with no filesystem access gains access to exactly the
+// picked file, and to nothing else.
+interface picker {
+	@op(1) pick: func() -> result<picked, error>;
+}
