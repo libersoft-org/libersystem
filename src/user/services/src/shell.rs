@@ -13,7 +13,8 @@
 
 extern crate alloc;
 
-use proto::system::{ConfigEntry, OpenOpts, Query, config, device, log, process, volume};
+use alloc::string::String;
+use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, config, device, log, process, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -26,35 +27,14 @@ const LINE_MAX: usize = 128;
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 
-	// 1. receive the StorageService client channel from ServiceManager.
-	let storage: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"STORAGE" => handle,
-		_ => exit(),
-	};
-
-	// 1b. receive the LogService client channel the `log` command queries.
-	let logsvc: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 3 && &buf[..3] == b"LOG" => handle,
-		_ => exit(),
-	};
-
-	// 1c. receive the DeviceService client channel the `dev` command queries.
-	let devsvc: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 6 && &buf[..6] == b"DEVICE" => handle,
-		_ => exit(),
-	};
-
-	// 1d. receive the ProcessService client channel the `ps`/`run` commands use.
-	let procsvc: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"PROCESS" => handle,
-		_ => exit(),
-	};
-
-	// 1e. receive the ConfigService client channel the `config`/`set` commands use.
-	let cfgsvc: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 6 && &buf[..6] == b"CONFIG" => handle,
-		_ => exit(),
-	};
+	// 1. receive the per-service client channels from ServiceManager, in the order it
+	//    sends them: storage (`cat`), log (`log`), device (`dev`), process (`ps`/`run`),
+	//    config (`config`/`set`). Each is a tagged capability over the bootstrap channel.
+	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or_else(|| exit());
+	let logsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or_else(|| exit());
+	let devsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DEVICE") }.unwrap_or_else(|| exit());
+	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
+	let cfgsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONFIG") }.unwrap_or_else(|| exit());
 
 	// 2. self-check: prove the StorageService round-trip works by reading a file.
 	if !unsafe { cat(storage, SELF_CHECK_URI) } {
@@ -216,23 +196,29 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 	}
 }
 
-// A proto Transport over an rt channel: send the request, then block for the
-// reply. The generated Log client calls through this to reach LogService.
-struct ChannelTransport {
-	chan: u64,
+// Render typed records as a JSON array - each via its generated to_json(), comma-
+// separated within [ ] - the framing the `json` variants of the query commands share.
+unsafe fn print_json_array<T, F: Fn(&T) -> String>(items: &[T], to_json: F) {
+	unsafe {
+		print(b"[");
+		let mut first: bool = true;
+		for item in items {
+			if !first {
+				print(b",");
+			}
+			first = false;
+			print(to_json(item).as_bytes());
+		}
+		print(b"]\n");
+	}
 }
 
-impl proto::codec::Transport for ChannelTransport {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
-		unsafe {
-			if !send_blocking(self.chan, request, request_handle) {
-				return None;
-			}
-			let mut reply: [u8; 4096] = [0u8; 4096];
-			match recv_blocking(self.chan, &mut reply) {
-				Received::Message { len, handle } => Some((reply[..len].to_vec(), handle)),
-				Received::Closed => None,
-			}
+// Render typed records as text, one per line, each via its generated to_text().
+unsafe fn print_text_lines<T, F: Fn(&T) -> String>(items: &[T], to_text: F) {
+	unsafe {
+		for item in items {
+			print(to_text(item).as_bytes());
+			print(b"\n");
 		}
 	}
 }
@@ -247,21 +233,9 @@ unsafe fn query_log(logsvc: u64, json: bool) {
 		match client.query(&q) {
 			Some(Ok(entries)) => {
 				if json {
-					print(b"[");
-					let mut first = true;
-					for entry in &entries {
-						if !first {
-							print(b",");
-						}
-						first = false;
-						print(entry.to_json().as_bytes());
-					}
-					print(b"]\n");
+					print_json_array(&entries, |e: &Entry| -> String { e.to_json() });
 				} else {
-					for entry in &entries {
-						print(entry.to_text().as_bytes());
-						print(b"\n");
-					}
+					print_text_lines(&entries, |e: &Entry| -> String { e.to_text() });
 				}
 			}
 			Some(Err(_)) => print(b"log: query error\n"),
@@ -313,7 +287,7 @@ unsafe fn tail_log(logsvc: u64, json: bool) {
 		if json {
 			print(b"]\n");
 		}
-		syscall(SYS_HANDLE_CLOSE, consumer, 0, 0, 0);
+		close(consumer);
 	}
 }
 
@@ -325,21 +299,9 @@ unsafe fn query_devices(devsvc: u64, json: bool) {
 		match client.list() {
 			Some(Ok(entries)) => {
 				if json {
-					print(b"[");
-					let mut first = true;
-					for e in &entries {
-						if !first {
-							print(b",");
-						}
-						first = false;
-						print(e.to_json().as_bytes());
-					}
-					print(b"]\n");
+					print_json_array(&entries, |e: &DeviceEntry| -> String { e.to_json() });
 				} else {
-					for e in &entries {
-						print(e.to_text().as_bytes());
-						print(b"\n");
-					}
+					print_text_lines(&entries, |e: &DeviceEntry| -> String { e.to_text() });
 				}
 			}
 			Some(Err(_)) => print(b"dev: query error\n"),
@@ -353,12 +315,7 @@ unsafe fn query_processes(procsvc: u64) {
 	unsafe {
 		let mut client = process::Client::new(ChannelTransport { chan: procsvc });
 		match client.list() {
-			Some(Ok(procs)) => {
-				for p in &procs {
-					print(p.to_text().as_bytes());
-					print(b"\n");
-				}
-			}
+			Some(Ok(procs)) => print_text_lines(&procs, |p: &ProcessInfo| -> String { p.to_text() }),
 			Some(Err(_)) => print(b"ps: query error\n"),
 			None => print(b"ps: service unavailable\n"),
 		}
@@ -397,12 +354,7 @@ unsafe fn query_config(cfgsvc: u64) {
 	unsafe {
 		let mut client = config::Client::new(ChannelTransport { chan: cfgsvc });
 		match client.list() {
-			Some(Ok(entries)) => {
-				for e in &entries {
-					print(e.to_text().as_bytes());
-					print(b"\n");
-				}
-			}
+			Some(Ok(entries)) => print_text_lines(&entries, |e: &ConfigEntry| -> String { e.to_text() }),
 			Some(Err(_)) => print(b"config: query error\n"),
 			None => print(b"config: service unavailable\n"),
 		}
@@ -495,17 +447,17 @@ unsafe fn cat(storage: u64, uri: &[u8]) -> bool {
 			return false;
 		}
 		// map the shared buffer, print the file, then release it.
-		let mapped: u64 = syscall(SYS_MEMORY_MAP, result.file, 0, 0, 0);
-		if sys_is_err(mapped) {
-			return false;
-		}
+		let mapped: u64 = match map_object(result.file) {
+			Some(base) => base,
+			None => return false,
+		};
 		let contents: &[u8] = core::slice::from_raw_parts(mapped as *const u8, result.size as usize);
 		print(contents);
 		if contents.last() != Some(&b'\n') {
 			print(b"\n");
 		}
-		syscall(SYS_MEMORY_UNMAP, result.file, 0, 0, 0);
-		syscall(SYS_HANDLE_CLOSE, result.file, 0, 0, 0);
+		unmap_object(result.file);
+		close(result.file);
 		true
 	}
 }

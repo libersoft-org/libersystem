@@ -73,6 +73,14 @@ pub const PROP_THREAD_LIMIT: u64 = 3;
 pub const PROP_DMA_LIMIT: u64 = 4;
 pub const PROP_IPC_QUEUE_LIMIT: u64 = 5;
 
+// virtio device type codes, as written into `DeviceInfo::virtio_type` (the modern
+// virtio-pci `device_id - 0x1040`). The single source of truth for the kernel's PCI
+// enumeration and the userspace DeviceManager/DeviceService that classify devices.
+pub const VIRTIO_TYPE_NET: u32 = 1;
+pub const VIRTIO_TYPE_BLOCK: u32 = 2;
+pub const VIRTIO_TYPE_CONSOLE: u32 = 3;
+pub const VIRTIO_TYPE_RNG: u32 = 4;
+
 // What `device_info` writes about one discovered virtio device. The kernel
 // resolves these from the device's PCI capabilities at boot; a driver maps the
 // device's MMIO BAR (via a DeviceMemory capability from `device_acquire`) and uses

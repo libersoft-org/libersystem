@@ -116,20 +116,22 @@ unsafe fn make_file_buffer(file: &[u8]) -> Option<u64> {
 		if sys_is_err(buffer) {
 			return None;
 		}
-		let mapped: u64 = syscall(SYS_MEMORY_MAP, buffer, 0, 0, 0);
-		if sys_is_err(mapped) {
-			syscall(SYS_HANDLE_CLOSE, buffer, 0, 0, 0);
-			return None;
-		}
+		let mapped: u64 = match map_object(buffer) {
+			Some(base) => base,
+			None => {
+				close(buffer);
+				return None;
+			}
+		};
 		core::ptr::copy_nonoverlapping(file.as_ptr(), mapped as *mut u8, file.len());
-		syscall(SYS_MEMORY_UNMAP, buffer, 0, 0, 0);
+		unmap_object(buffer);
 		// attenuate to read + map plus the transfer right, then drop the full handle.
-		let granted: u64 = syscall(SYS_HANDLE_DUPLICATE, buffer, (RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER) as u64, 0, 0);
-		syscall(SYS_HANDLE_CLOSE, buffer, 0, 0, 0);
-		if sys_is_err(granted) {
+		let granted: i64 = duplicate(buffer, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+		close(buffer);
+		if granted < 0 {
 			return None;
 		}
-		Some(granted)
+		Some(granted as u64)
 	}
 }
 
@@ -172,7 +174,7 @@ unsafe fn load_archive_from_disk(block_client: u64) -> Option<(u64, usize)> {
 		}
 		let base: u64 = syscall(SYS_MEMORY_MAP, obj, 0, 0, 0);
 		if sys_is_err(base) {
-			syscall(SYS_HANDLE_CLOSE, obj, 0, 0, 0);
+			close(obj);
 			return None;
 		}
 		let mut filled: usize = 0;
@@ -181,14 +183,14 @@ unsafe fn load_archive_from_disk(block_client: u64) -> Option<(u64, usize)> {
 			let remaining: usize = total - filled;
 			let sectors: usize = ((remaining + SECTOR_SIZE - 1) / SECTOR_SIZE).min(MAX_SECTORS_PER_READ);
 			if !block_read(block_client, lba, sectors as u32, (base as *mut u8).add(filled)) {
-				syscall(SYS_MEMORY_UNMAP, obj, 0, 0, 0);
-				syscall(SYS_HANDLE_CLOSE, obj, 0, 0, 0);
+				unmap_object(obj);
+				close(obj);
 				return None;
 			}
 			filled += sectors * SECTOR_SIZE;
 		}
 		// the disk is no longer needed; closing it lets the driver shut down.
-		syscall(SYS_HANDLE_CLOSE, block_client, 0, 0, 0);
+		close(block_client);
 		Some((base, total))
 	}
 }
@@ -212,18 +214,20 @@ unsafe fn block_read(block_client: u64, lba: u64, count: u32, dst: *mut u8) -> b
 		};
 		if status != 0 || handle == 0 {
 			if handle != 0 {
-				syscall(SYS_HANDLE_CLOSE, handle, 0, 0, 0);
+				close(handle);
 			}
 			return false;
 		}
-		let src: u64 = syscall(SYS_MEMORY_MAP, handle, 0, 0, 0);
-		if sys_is_err(src) {
-			syscall(SYS_HANDLE_CLOSE, handle, 0, 0, 0);
-			return false;
-		}
+		let src: u64 = match map_object(handle) {
+			Some(base) => base,
+			None => {
+				close(handle);
+				return false;
+			}
+		};
 		core::ptr::copy_nonoverlapping(src as *const u8, dst, count as usize * SECTOR_SIZE);
-		syscall(SYS_MEMORY_UNMAP, handle, 0, 0, 0);
-		syscall(SYS_HANDLE_CLOSE, handle, 0, 0, 0);
+		unmap_object(handle);
+		close(handle);
 		true
 	}
 }

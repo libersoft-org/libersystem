@@ -13,6 +13,8 @@
 #![no_std]
 #![allow(dead_code)]
 
+extern crate alloc;
+
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
@@ -153,6 +155,138 @@ pub unsafe fn channel() -> Option<(u64, u64)> {
 			return None;
 		}
 		Some((a, b))
+	}
+}
+
+// Receive one message and, if its payload begins with `tag` and it carried a
+// transferred handle, return that handle. None if the channel closed, no handle
+// accompanied the message, or the payload did not begin with `tag`. This is the
+// "expect a tagged capability over a bootstrap/control channel" handshake the
+// programs share (e.g. recv_tagged(bootstrap, &mut buf, b"SERVE")).
+pub unsafe fn recv_tagged(channel: u64, buf: &mut [u8], tag: &[u8]) -> Option<u64> {
+	unsafe {
+		match recv_blocking(channel, buf) {
+			Received::Message { len, handle } if handle != 0 && len >= tag.len() && &buf[..tag.len()] == tag => Some(handle),
+			_ => None,
+		}
+	}
+}
+
+// Receive a "PACKAGE" message - the tag, a u64 little-endian byte length, and a
+// transferred MemoryObject holding a PKGARCH1 archive - then map the object and
+// return its kept handle plus the mapped archive bytes. The archive stays mapped
+// for the life of the process (these consumers never unmap it), so the slice is
+// handed back with a 'static lifetime. None if the message is not a well-formed
+// PACKAGE or the mapping fails.
+pub unsafe fn recv_package(channel: u64, buf: &mut [u8]) -> Option<(u64, &'static [u8])> {
+	unsafe {
+		match recv_blocking(channel, buf) {
+			Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"PACKAGE" => {
+				let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
+				let base: u64 = map_object(handle)?;
+				let archive: &'static [u8] = core::slice::from_raw_parts(base as *const u8, length);
+				Some((handle, archive))
+			}
+			_ => None,
+		}
+	}
+}
+
+// Run a service's request/reply loop over `service`: receive each request, hand it
+// to `handle_request` (the generated `<iface>::dispatch` shape - request bytes plus
+// the transferred handle, a reply buffer plus an out-param for the reply's handle),
+// and send back the reply it produced. A zero-length message is the explicit quit
+// sentinel; the loop also ends when the client side closes. `request` and `reply`
+// are the caller's scratch buffers, whose sizes bound the largest request/reply. A
+// request that produces no reply (the closure returns None) is simply not answered -
+// which is how a streaming op that replies out of band opts out of the byte reply.
+pub unsafe fn serve<F>(service: u64, request: &mut [u8], reply: &mut [u8], mut handle_request: F)
+where
+	F: FnMut(&[u8], u64, &mut [u8], &mut u64) -> Option<usize>,
+{
+	unsafe {
+		loop {
+			match recv_blocking(service, request) {
+				Received::Message { len, .. } if len == 0 => break,
+				Received::Message { len, handle } => {
+					let mut reply_handle: u64 = 0;
+					if let Some(n) = handle_request(&request[..len], handle, reply, &mut reply_handle) {
+						send_blocking(service, &reply[..n], reply_handle);
+					}
+				}
+				Received::Closed => break,
+			}
+		}
+	}
+}
+
+// A proto Transport over an rt channel: send the request (with any out-of-band
+// handle), then block for the reply (whose own out-of-band handle is returned
+// alongside the bytes). Every userspace program that drives a generated service
+// client - the shell, the supervisor, the demo clients - reaches its service
+// through this one implementation, instead of each repeating the send/recv glue.
+pub struct ChannelTransport {
+	pub chan: u64,
+}
+
+impl proto::codec::Transport for ChannelTransport {
+	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
+		unsafe {
+			if !send_blocking(self.chan, request, request_handle) {
+				return None;
+			}
+			let mut reply: [u8; 4096] = [0u8; 4096];
+			match recv_blocking(self.chan, &mut reply) {
+				Received::Message { len, handle } => Some((reply[..len].to_vec(), handle)),
+				Received::Closed => None,
+			}
+		}
+	}
+}
+
+// Close `handle`, releasing the object reference it names. A no-op-safe wrapper
+// over the close syscall (the kernel ignores an unknown handle), so callers need
+// not repeat the raw syscall.
+pub unsafe fn close(handle: u64) {
+	unsafe {
+		syscall(SYS_HANDLE_CLOSE, handle, 0, 0, 0);
+	}
+}
+
+// Map the object behind `handle` into our address space (the kernel picks the
+// virtual base), returning that base, or None on failure.
+pub unsafe fn map_object(handle: u64) -> Option<u64> {
+	unsafe {
+		let base: u64 = syscall(SYS_MEMORY_MAP, handle, 0, 0, 0);
+		if sys_is_err(base) { None } else { Some(base) }
+	}
+}
+
+// Unmap the object behind `handle` from our address space.
+pub unsafe fn unmap_object(handle: u64) {
+	unsafe {
+		syscall(SYS_MEMORY_UNMAP, handle, 0, 0, 0);
+	}
+}
+
+// Read a shared buffer capability into `dst`: map the object behind `file`, copy up
+// to `dst.len()` of its `size` bytes into `dst`, then unmap and close it. Returns
+// the number of bytes copied, or None if the mapping fails (the handle is still
+// closed). The canonical "consume a handed-back file handle" path.
+pub unsafe fn read_into(file: u64, size: u64, dst: &mut [u8]) -> Option<usize> {
+	unsafe {
+		let mapped: u64 = match map_object(file) {
+			Some(base) => base,
+			None => {
+				close(file);
+				return None;
+			}
+		};
+		let n: usize = (size as usize).min(dst.len());
+		core::ptr::copy_nonoverlapping(mapped as *const u8, dst.as_mut_ptr(), n);
+		unmap_object(file);
+		close(file);
+		Some(n)
 	}
 }
 

@@ -15,6 +15,7 @@ name = "rt"
 version = "0.0.0"
 dependencies = [
  "abi",
+ "proto",
 ]
 
 [[package]]

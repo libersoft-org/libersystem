@@ -18,7 +18,6 @@
 
 extern crate alloc;
 
-use proto::codec::Transport;
 use proto::system::{OpenOpts, picker, volume};
 use rt::*;
 use wasm::{Host, Instance, Trap, Value};
@@ -44,27 +43,6 @@ const COMPONENT: &[u8] = &[
 	0x07, 0x07, 0x01, 0x03, b'r', b'u', b'n', 0x00, 0x01, // export "run" -> func 1
 	0x0a, 0x0b, 0x01, 0x09, 0x00, 0x41, 0x00, 0x41, 0x80, 0x02, 0x10, 0x00, 0x0b, // code: i32.const 0; i32.const 256; call 0; end
 ];
-
-// A proto Transport over an rt channel: send the request, then block for the reply.
-// The generated volume client calls through this to reach StorageService.
-struct ChannelTransport {
-	chan: u64,
-}
-
-impl Transport for ChannelTransport {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
-		unsafe {
-			if !send_blocking(self.chan, request, request_handle) {
-				return None;
-			}
-			let mut reply: [u8; 256] = [0u8; 256];
-			match recv_blocking(self.chan, &mut reply) {
-				Received::Message { len, handle } => Some((reply[..len].to_vec(), handle)),
-				Received::Closed => None,
-			}
-		}
-	}
-}
 
 // How the host backs the component's `read` import - its whole granted world. With
 // `Storage` the host opens one fixed file directly over StorageService; with
@@ -116,16 +94,7 @@ unsafe fn read_fixed(storage: u64, dst: &mut [u8]) -> Option<usize> {
 		if result.file == 0 {
 			return None;
 		}
-		let mapped: u64 = syscall(SYS_MEMORY_MAP, result.file, 0, 0, 0);
-		if sys_is_err(mapped) {
-			syscall(SYS_HANDLE_CLOSE, result.file, 0, 0, 0);
-			return None;
-		}
-		let n: usize = (result.size as usize).min(dst.len());
-		core::ptr::copy_nonoverlapping(mapped as *const u8, dst.as_mut_ptr(), n);
-		syscall(SYS_MEMORY_UNMAP, result.file, 0, 0, 0);
-		syscall(SYS_HANDLE_CLOSE, result.file, 0, 0, 0);
-		Some(n)
+		read_into(result.file, result.size, dst)
 	}
 }
 
@@ -143,16 +112,7 @@ unsafe fn read_picked(picker: u64, dst: &mut [u8]) -> Option<usize> {
 		if picked.file == 0 {
 			return None;
 		}
-		let mapped: u64 = syscall(SYS_MEMORY_MAP, picked.file, 0, 0, 0);
-		if sys_is_err(mapped) {
-			syscall(SYS_HANDLE_CLOSE, picked.file, 0, 0, 0);
-			return None;
-		}
-		let n: usize = (picked.size as usize).min(dst.len());
-		core::ptr::copy_nonoverlapping(mapped as *const u8, dst.as_mut_ptr(), n);
-		syscall(SYS_MEMORY_UNMAP, picked.file, 0, 0, 0);
-		syscall(SYS_HANDLE_CLOSE, picked.file, 0, 0, 0);
-		Some(n)
+		read_into(picked.file, picked.size, dst)
 	}
 }
 

@@ -31,22 +31,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	unsafe {
 		// 1. receive the init package shared buffer (to spawn drivers from) and map it.
-		let (pkg_base, pkg_len): (u64, usize) = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"PACKAGE" => {
-				let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
-				let base: u64 = syscall(SYS_MEMORY_MAP, handle, 0, 0, 0);
-				if sys_is_err(base) {
-					exit();
-				}
-				(base, length)
-			}
-			_ => exit(),
-		};
-		let archive: &[u8] = core::slice::from_raw_parts(pkg_base as *const u8, pkg_len);
-		let package: Package = match Package::parse(archive) {
-			Some(p) => p,
-			None => exit(),
-		};
+		let (_pkg_handle, archive): (u64, &[u8]) = recv_package(bootstrap, &mut buf).unwrap_or_else(|| exit());
+		let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
 
 		// 2. launch the matching driver for each discovered device. The virtio-blk
 		//    driver hands back a block-read service channel, which we route up to
@@ -189,9 +175,9 @@ unsafe fn print_count(n: u32) {
 // The init-package binary name of the driver for a virtio device type.
 fn driver_for(virtio_type: u32) -> &'static [u8] {
 	match virtio_type {
-		1 => b"virtio_net",
-		2 => b"virtio_blk",
-		3 => b"virtio_console",
+		VIRTIO_TYPE_NET => b"virtio_net",
+		VIRTIO_TYPE_BLOCK => b"virtio_blk",
+		VIRTIO_TYPE_CONSOLE => b"virtio_console",
 		_ => b"",
 	}
 }

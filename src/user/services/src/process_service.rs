@@ -41,7 +41,7 @@ impl<'a> Service for Processes<'a> {
 			return Err(Error::Again);
 		}
 		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
-		unsafe { syscall(SYS_HANDLE_CLOSE, handle as u64, 0, 0, 0) };
+		unsafe { close(handle as u64) };
 		let info: ProcessInfo = ProcessInfo { koid, name };
 		self.started.push(info.clone());
 		Ok(info)
@@ -57,50 +57,23 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 
 	// 1. receive the init package shared buffer (to launch programs from) and map it.
-	let (pkg_base, pkg_len): (u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"PACKAGE" => {
-			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
-			let base: u64 = unsafe { syscall(SYS_MEMORY_MAP, handle, 0, 0, 0) };
-			if sys_is_err(base) {
-				exit();
-			}
-			(base, length)
-		}
-		_ => exit(),
-	};
-	let archive: &[u8] = unsafe { core::slice::from_raw_parts(pkg_base as *const u8, pkg_len) };
-	let package: Package = match Package::parse(archive) {
-		Some(p) => p,
-		None => exit(),
-	};
+	let (_pkg_handle, archive): (u64, &[u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| exit());
+	let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
 
 	// 2. wait for the serve channel clients reach us on.
-	let service: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => handle,
-		_ => exit(),
-	};
+	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
 
 	// 3. report in to the supervisor that started us.
 	unsafe {
 		send_blocking(bootstrap, b"ProcessService: online", 0);
 	}
 
-	// 4. serve generated start/list requests until the client side closes. A
-	//    zero-length message is the explicit quit sentinel.
+	// 4. serve generated start/list requests until the client side closes.
 	let mut procs: Processes = Processes { package, started: Vec::new() };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 1024] = [0u8; 1024];
-	loop {
-		match unsafe { recv_blocking(service, &mut request) } {
-			Received::Message { len, .. } if len == 0 => break,
-			Received::Message { len, handle } => {
-				let mut reply_handle: u64 = 0;
-				if let Some(n) = process::dispatch(&mut procs, &request[..len], handle, &mut reply, &mut reply_handle) {
-					unsafe { send_blocking(service, &reply[..n], reply_handle) };
-				}
-			}
-			Received::Closed => break,
-		}
+	unsafe {
+		serve(service, &mut request, &mut reply, |req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { process::dispatch(&mut procs, req, handle, out, reply_handle) });
 	}
 	exit();
 }

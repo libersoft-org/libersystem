@@ -20,7 +20,6 @@
 extern crate alloc;
 
 use alloc::string::String;
-use proto::codec::Transport;
 use proto::system::picker::{self, Service};
 use proto::system::{Error, OpenOpts, Picked, volume};
 use rt::*;
@@ -30,26 +29,6 @@ use rt::*;
 // granted file comes from the pick, not from the caller).
 const PICKED_PATH: &[u8] = b"vol://system/motd.txt";
 const PICKED_NAME: &[u8] = b"motd.txt";
-
-// A proto Transport over an rt channel: send the request, then block for the reply.
-struct ChannelTransport {
-	chan: u64,
-}
-
-impl Transport for ChannelTransport {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
-		unsafe {
-			if !send_blocking(self.chan, request, request_handle) {
-				return None;
-			}
-			let mut reply: [u8; 256] = [0u8; 256];
-			match recv_blocking(self.chan, &mut reply) {
-				Received::Message { len, handle } => Some((reply[..len].to_vec(), handle)),
-				Received::Closed => None,
-			}
-		}
-	}
-}
 
 // The picker, holding its trusted StorageService client.
 struct Picker {
@@ -75,16 +54,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 
 	// 1. receive the StorageService client the picker is trusted with.
-	let storage: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"STORAGE" => handle,
-		_ => exit(),
-	};
+	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or_else(|| exit());
 
 	// 2. wait for the serve channel clients reach us on.
-	let service: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => handle,
-		_ => exit(),
-	};
+	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
 
 	// 3. report in to the supervisor that started us.
 	unsafe {
@@ -96,17 +69,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut picker: Picker = Picker { storage };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 256] = [0u8; 256];
-	loop {
-		match unsafe { recv_blocking(service, &mut request) } {
-			Received::Message { len, .. } if len == 0 => break,
-			Received::Message { len, handle } => {
-				let mut reply_handle: u64 = 0;
-				if let Some(n) = picker::dispatch(&mut picker, &request[..len], handle, &mut reply, &mut reply_handle) {
-					unsafe { send_blocking(service, &reply[..n], reply_handle) };
-				}
-			}
-			Received::Closed => break,
-		}
+	unsafe {
+		serve(service, &mut request, &mut reply, |req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { picker::dispatch(&mut picker, req, handle, out, reply_handle) });
 	}
 	exit();
 }

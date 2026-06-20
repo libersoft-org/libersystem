@@ -58,9 +58,9 @@ unsafe fn device_entry(i: u64) -> Option<DeviceEntry> {
 // Map a virtio device-type code to the typed device kind.
 fn kind_of(virtio_type: u32) -> DeviceKind {
 	match virtio_type {
-		1 => DeviceKind::Net,
-		2 => DeviceKind::Block,
-		3 => DeviceKind::Console,
+		VIRTIO_TYPE_NET => DeviceKind::Net,
+		VIRTIO_TYPE_BLOCK => DeviceKind::Block,
+		VIRTIO_TYPE_CONSOLE => DeviceKind::Console,
 		_ => DeviceKind::Unknown,
 	}
 }
@@ -76,27 +76,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 2. wait for the serve channel clients reach us on. If the supervisor drops the
 	//    bootstrap channel first (no clients this boot), we are done.
-	let service: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => handle,
-		_ => exit(),
-	};
+	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
 
-	// 3. serve generated list/get requests until the client side closes. A
-	//    zero-length message is the explicit quit sentinel.
+	// 3. serve generated list/get requests until the client side closes.
 	let mut devices: Devices = Devices;
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 1024] = [0u8; 1024];
-	loop {
-		match unsafe { recv_blocking(service, &mut request) } {
-			Received::Message { len, .. } if len == 0 => break,
-			Received::Message { len, handle } => {
-				let mut reply_handle: u64 = 0;
-				if let Some(n) = device::dispatch(&mut devices, &request[..len], handle, &mut reply, &mut reply_handle) {
-					unsafe { send_blocking(service, &reply[..n], reply_handle) };
-				}
-			}
-			Received::Closed => break,
-		}
+	unsafe {
+		serve(service, &mut request, &mut reply, |req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { device::dispatch(&mut devices, req, handle, out, reply_handle) });
 	}
 	exit();
 }

@@ -148,12 +148,14 @@ unsafe fn serve_one(queue: &Queue, blk_server: u64, virt: u64, phys: u64, lba: u
 			reply_block(blk_server, STATUS_ERR, 0);
 			return;
 		}
-		let dst: u64 = syscall(SYS_MEMORY_MAP, obj, 0, 0, 0);
-		if sys_is_err(dst) {
-			syscall(SYS_HANDLE_CLOSE, obj, 0, 0, 0);
-			reply_block(blk_server, STATUS_ERR, 0);
-			return;
-		}
+		let dst: u64 = match map_object(obj) {
+			Some(base) => base,
+			None => {
+				close(obj);
+				reply_block(blk_server, STATUS_ERR, 0);
+				return;
+			}
+		};
 		// read each sector into the DMA buffer, then copy it into the shared buffer.
 		let mut s: u32 = 0;
 		let mut ok: bool = true;
@@ -165,15 +167,15 @@ unsafe fn serve_one(queue: &Queue, blk_server: u64, virt: u64, phys: u64, lba: u
 			core::ptr::copy_nonoverlapping((virt + DATA_OFF) as *const u8, (dst + s as u64 * SECTOR as u64) as *mut u8, SECTOR as usize);
 			s += 1;
 		}
-		syscall(SYS_MEMORY_UNMAP, obj, 0, 0, 0);
+		unmap_object(obj);
 		if !ok {
-			syscall(SYS_HANDLE_CLOSE, obj, 0, 0, 0);
+			close(obj);
 			reply_block(blk_server, STATUS_ERR, 0);
 			return;
 		}
 		// attenuate to read+map plus the transfer right, then hand the buffer over.
 		let granted: i64 = duplicate(obj, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
-		syscall(SYS_HANDLE_CLOSE, obj, 0, 0, 0);
+		close(obj);
 		if granted < 0 {
 			reply_block(blk_server, STATUS_ERR, 0);
 			return;

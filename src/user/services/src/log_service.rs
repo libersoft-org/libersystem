@@ -35,39 +35,11 @@ impl Journal {
 	fn new() -> Journal {
 		Journal { entries: Vec::new() }
 	}
-}
 
-// The generated Log service contract: store an emitted entry, answer a query with
-// the matching entries (filtered by minimum severity and capped by `limit`).
-impl Service for Journal {
-	fn emit(&mut self, entry: Entry) -> Result<(), Error> {
-		self.entries.push(entry);
-		if self.entries.len() > JOURNAL_CAP {
-			self.entries.remove(0);
-		}
-		Ok(())
-	}
-
-	fn query(&mut self, q: Query) -> Result<Vec<Entry>, Error> {
-		let min: u8 = q.min_severity.map(|s| s as u8).unwrap_or(0);
-		let mut out: Vec<Entry> = Vec::new();
-		for entry in &self.entries {
-			if (entry.severity as u8) < min {
-				continue;
-			}
-			out.push(entry.clone());
-			if q.limit != 0 && out.len() as u32 >= q.limit {
-				break;
-			}
-		}
-		Ok(out)
-	}
-
-	// The streaming counterpart of `query`: the same bounded source, but the
-	// generated codec frames each entry onto a fresh sub-channel instead of
-	// packing them into one reply. Here the source is bounded (the journal), so
-	// we return the snapshot and the serve loop streams it frame by frame.
-	fn tail(&mut self, q: Query) -> Vec<Entry> {
+	// Collect the entries matching `q`: at or above its minimum severity (none = all),
+	// capped by its limit (0 = no cap). Shared by `query` (one reply) and `tail`
+	// (streamed frame by frame) so both filter identically.
+	fn filtered(&self, q: &Query) -> Vec<Entry> {
 		let min: u8 = q.min_severity.map(|s: Severity| s as u8).unwrap_or(0);
 		let mut out: Vec<Entry> = Vec::new();
 		for entry in &self.entries {
@@ -83,6 +55,30 @@ impl Service for Journal {
 	}
 }
 
+// The generated Log service contract: store an emitted entry, answer a query with
+// the matching entries (filtered by minimum severity and capped by `limit`).
+impl Service for Journal {
+	fn emit(&mut self, entry: Entry) -> Result<(), Error> {
+		self.entries.push(entry);
+		if self.entries.len() > JOURNAL_CAP {
+			self.entries.remove(0);
+		}
+		Ok(())
+	}
+
+	fn query(&mut self, q: Query) -> Result<Vec<Entry>, Error> {
+		Ok(self.filtered(&q))
+	}
+
+	// The streaming counterpart of `query`: the same bounded source, but the
+	// generated codec frames each entry onto a fresh sub-channel instead of
+	// packing them into one reply. Here the source is bounded (the journal), so
+	// we return the snapshot and the serve loop streams it frame by frame.
+	fn tail(&mut self, q: Query) -> Vec<Entry> {
+		self.filtered(&q)
+	}
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
@@ -94,10 +90,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 2. wait for the serve channel clients reach us on. If the supervisor drops
 	//    the bootstrap channel first (no clients this boot), we are done.
-	let service: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => handle,
-		_ => exit(),
-	};
+	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
 
 	// 3. serve generated emit/query requests until the client side closes. Each
 	//    request is dispatched into the journal; the reply it produces is sent back
@@ -108,25 +101,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut journal: Journal = Journal::new();
 	let mut request: [u8; 1024] = [0u8; 1024];
 	let mut reply: [u8; 4096] = [0u8; 4096];
-	loop {
-		match unsafe { recv_blocking(service, &mut request) } {
-			// An empty message is the explicit quit sentinel.
-			Received::Message { len, .. } if len == 0 => break,
-			Received::Message { len, handle } => {
-				let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
-				if op == log::OP_TAIL {
-					stream_tail(&mut journal, service, &request[..len]);
-				} else {
-					let mut reply_handle: u64 = 0;
-					if let Some(n) = log::dispatch(&mut journal, &request[..len], handle, &mut reply, &mut reply_handle) {
-						unsafe {
-							send_blocking(service, &reply[..n], reply_handle);
-						}
-					}
-				}
+	unsafe {
+		serve(service, &mut request, &mut reply, |req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
+			// OP_TAIL opens a stream served out of band (no byte reply); everything else
+			// dispatches to a single reply.
+			let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
+			if op == log::OP_TAIL {
+				stream_tail(&mut journal, service, req);
+				None
+			} else {
+				log::dispatch(&mut journal, req, handle, out, reply_handle)
 			}
-			Received::Closed => break,
-		}
+		});
 	}
 	exit();
 }
@@ -158,6 +144,6 @@ fn stream_tail(journal: &mut Journal, service: u64, request: &[u8]) {
 		}
 	}
 	unsafe {
-		syscall(SYS_HANDLE_CLOSE, producer, 0, 0, 0);
+		close(producer);
 	}
 }

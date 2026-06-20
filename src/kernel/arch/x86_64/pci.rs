@@ -26,11 +26,12 @@ pub const VIRTIO_VENDOR: u16 = 0x1AF4;
 // Modern virtio-pci device ids are 0x1040 + the virtio device type.
 const VIRTIO_MODERN_BASE: u16 = 0x1040;
 
-// virtio device types (a subset; the ones QEMU gives us).
-pub const VIRTIO_NET: u16 = 1;
-pub const VIRTIO_BLK: u16 = 2;
-pub const VIRTIO_CONSOLE: u16 = 3;
-pub const VIRTIO_RNG: u16 = 4;
+// virtio device types (a subset; the ones QEMU gives us). The numeric values are
+// the single source of truth in `abi`, shared with the userspace device services.
+pub const VIRTIO_NET: u16 = abi::VIRTIO_TYPE_NET as u16;
+pub const VIRTIO_BLK: u16 = abi::VIRTIO_TYPE_BLOCK as u16;
+pub const VIRTIO_CONSOLE: u16 = abi::VIRTIO_TYPE_CONSOLE as u16;
+pub const VIRTIO_RNG: u16 = abi::VIRTIO_TYPE_RNG as u16;
 
 // Build the CONFIG_ADDRESS value selecting a device's config dword. `offset` is
 // rounded down to a 4-byte boundary (the dword the field lives in).

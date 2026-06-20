@@ -61,22 +61,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 1. receive the init package shared buffer and map it. Keep the handle so we
 	//    can share the package with DeviceManager (which spawns drivers from it).
-	let (pkg_handle, pkg_base, pkg_len): (u64, u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"PACKAGE" => {
-			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
-			let base: u64 = unsafe { syscall(SYS_MEMORY_MAP, handle, 0, 0, 0) };
-			if sys_is_err(base) {
-				exit();
-			}
-			(handle, base, length)
-		}
-		_ => exit(),
-	};
-	let archive: &[u8] = unsafe { core::slice::from_raw_parts(pkg_base as *const u8, pkg_len) };
-	let package: Package = match Package::parse(archive) {
-		Some(p) => p,
-		None => exit(),
-	};
+	let (pkg_handle, archive): (u64, &[u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| exit());
+	let pkg_len: usize = archive.len();
+	let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
 
 	// 1b. receive (and release) the legacy ramdisk volume buffer. StorageService now
 	//     reads its volume from the virtio-blk disk over the block service channel
@@ -85,7 +72,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     direct StorageService test still drives the older RAMDISK bootstrap mode.)
 	match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"RAMDISK" => unsafe {
-			syscall(SYS_HANDLE_CLOSE, handle, 0, 0, 0);
+			close(handle);
 		},
 		_ => exit(),
 	};
@@ -205,22 +192,22 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if spawn(elf, service_side) < 0 {
 			return State::Failed;
 		}
-		if name == b"log_service" && !bootstrap_log(manager_side, log_client) {
+		if name == b"log_service" && !bootstrap_serve(manager_side, log_client) {
 			return State::Failed;
 		}
-		if name == b"device_manager" && !bootstrap_device(manager_side, pkg_handle, pkg_len, buf) {
+		if name == b"device_manager" && !bootstrap_package(manager_side, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		if name == b"storage_service" && !bootstrap_storage(manager_side, *block_client, storage_client) {
 			return State::Failed;
 		}
-		if name == b"device_service" && !bootstrap_device_service(manager_side, device_client) {
+		if name == b"device_service" && !bootstrap_serve(manager_side, device_client) {
 			return State::Failed;
 		}
 		if name == b"process_service" && !bootstrap_process_service(manager_side, pkg_handle, pkg_len, process_client, buf) {
 			return State::Failed;
 		}
-		if name == b"config_service" && !bootstrap_config_service(manager_side, config_client) {
+		if name == b"config_service" && !bootstrap_serve(manager_side, config_client) {
 			return State::Failed;
 		}
 		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client) {
@@ -242,27 +229,6 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 				State::Running
 			}
 			Received::Closed => State::Failed,
-		}
-	}
-}
-
-// A proto Transport over an rt channel: send the request, then block for the
-// reply. The generated clients call through this to reach a service.
-struct ChannelTransport {
-	chan: u64,
-}
-
-impl proto::codec::Transport for ChannelTransport {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
-		unsafe {
-			if !send_blocking(self.chan, request, request_handle) {
-				return None;
-			}
-			let mut reply: [u8; 4096] = [0u8; 4096];
-			match recv_blocking(self.chan, &mut reply) {
-				Received::Message { len, handle } => Some((reply[..len].to_vec(), handle)),
-				Received::Closed => None,
-			}
 		}
 	}
 }
@@ -326,12 +292,12 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 	}
 }
 
-// Hand DeviceManager a view of the init package so it can spawn the userspace
-// driver for each device it discovers: duplicate our package handle (read + map +
-// transfer) and send "PACKAGE" + length with the duplicate. We keep our own handle
-// and mapping; the kernel allows the same object to be mapped in both address
-// spaces.
-unsafe fn bootstrap_device(manager_side: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+// Hand a service a read-only view of the init package so it can spawn programs from
+// it (DeviceManager spawns drivers, ProcessService launches programs): duplicate
+// our package handle (read + map + transfer) and send "PACKAGE" + the byte length
+// with the duplicate. We keep our own handle and mapping; the kernel allows the
+// same object to be mapped in both address spaces.
+unsafe fn bootstrap_package(manager_side: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		let dup: i64 = duplicate(pkg_handle, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
 		if dup < 0 {
@@ -343,10 +309,11 @@ unsafe fn bootstrap_device(manager_side: u64, pkg_handle: u64, pkg_len: usize, b
 	}
 }
 
-// Hand LogService the channel its clients reach it on: "SERVE" transferring one end
-// of a fresh service channel. The other end is kept in `*log_client`, which the
-// supervisor emits records on and later shares with the shell.
-unsafe fn bootstrap_log(manager_side: u64, log_client: &mut u64) -> bool {
+// Hand a service the channel its clients reach it on: create a fresh service channel
+// and transfer one end with the "SERVE" tag, keeping the other end in `*client` for
+// the supervisor to later hand to the shell. The shared bootstrap for every SERVE-
+// only service (Log, Device, Config) and the tail of Storage and Process.
+unsafe fn bootstrap_serve(manager_side: u64, client: &mut u64) -> bool {
 	unsafe {
 		let (service_server, service_client): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -355,24 +322,7 @@ unsafe fn bootstrap_log(manager_side: u64, log_client: &mut u64) -> bool {
 		if !send_blocking(manager_side, b"SERVE", service_server) {
 			return false;
 		}
-		*log_client = service_client;
-		true
-	}
-}
-
-// Hand DeviceService the channel its clients reach it on: "SERVE" transferring one
-// end of a fresh service channel. The other end is kept in `*device_client` and
-// later transferred to the shell for its `dev` command.
-unsafe fn bootstrap_device_service(manager_side: u64, device_client: &mut u64) -> bool {
-	unsafe {
-		let (service_server, service_client): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, b"SERVE", service_server) {
-			return false;
-		}
-		*device_client = service_client;
+		*client = service_client;
 		true
 	}
 }
@@ -381,43 +331,7 @@ unsafe fn bootstrap_device_service(manager_side: u64, device_client: &mut u64) -
 // from) and the channel its clients reach it on. The service-channel client end is
 // kept in `*process_client` and later transferred to the shell for `ps`/`run`.
 unsafe fn bootstrap_process_service(manager_side: u64, pkg_handle: u64, pkg_len: usize, process_client: &mut u64, buf: &mut [u8]) -> bool {
-	unsafe {
-		let dup: i64 = duplicate(pkg_handle, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
-		if dup < 0 {
-			return false;
-		}
-		buf[..7].copy_from_slice(b"PACKAGE");
-		buf[7..15].copy_from_slice(&(pkg_len as u64).to_le_bytes());
-		if !send_blocking(manager_side, &buf[..15], dup as u64) {
-			return false;
-		}
-		let (service_server, service_client): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, b"SERVE", service_server) {
-			return false;
-		}
-		*process_client = service_client;
-		true
-	}
-}
-
-// Hand ConfigService the channel its clients reach it on: "SERVE" transferring one
-// end of a fresh service channel. The other end is kept in `*config_client` and
-// later transferred to the shell for its `config`/`set` commands.
-unsafe fn bootstrap_config_service(manager_side: u64, config_client: &mut u64) -> bool {
-	unsafe {
-		let (service_server, service_client): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, b"SERVE", service_server) {
-			return false;
-		}
-		*config_client = service_client;
-		true
-	}
+	unsafe { bootstrap_package(manager_side, pkg_handle, pkg_len, buf) && bootstrap_serve(manager_side, process_client) }
 }
 
 // Hand StorageService its disk-backed volume and a service channel over
@@ -429,14 +343,6 @@ unsafe fn bootstrap_storage(manager_side: u64, block_client: u64, storage_client
 		if !send_blocking(manager_side, b"BLOCK", block_client) {
 			return false;
 		}
-		let (service_server, service_client): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, b"SERVE", service_server) {
-			return false;
-		}
-		*storage_client = service_client;
-		true
+		bootstrap_serve(manager_side, storage_client)
 	}
 }

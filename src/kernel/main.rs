@@ -675,6 +675,41 @@ fn copy_into_object(object: &alloc::sync::Arc<object::memory_object::MemoryObjec
 	}
 }
 
+// Load the volume archive bytes and the parsed init package - the 'static modules
+// every userspace scenario starts from.
+fn scenario_packages() -> Result<(&'static [u8], pkg::Package<'static>), &'static str> {
+	let volume = volume_package_bytes().ok_or("volume package module not found")?;
+	let init = init_package_bytes().ok_or("init package module not found")?;
+	let package = pkg::Package::parse(init).ok_or("init package is malformed")?;
+	Ok((volume, package))
+}
+
+// Look up `name` in the volume archive and return a copy of its bytes - the file a
+// scenario expects the component/client to read back.
+fn volume_file(volume: &[u8], name: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
+	pkg::Package::parse(volume).and_then(|p| p.lookup(name).map(|b| b.to_vec())).ok_or("file missing from the volume package")
+}
+
+// Send a tagged capability over a bootstrap channel: wrap `object` in a Capability
+// carrying `rights` and send it with `payload` as the message bytes. The shared
+// "hand a process one of its initial capabilities" step the scenarios repeat.
+fn send_cap(channel: &object::channel::Channel, payload: &[u8], object: alloc::sync::Arc<dyn object::KernelObject>, rights: object::rights::Rights) -> Result<(), &'static str> {
+	let cap = object::handle::Capability::new(object, rights, 0);
+	channel.send(object::channel::Message::new(payload.to_vec(), alloc::vec![cap], 0)).map_err(|_| "bootstrap capability send failed")
+}
+
+// Create a ramdisk MemoryObject from `volume`, fill it, and hand it to a service's
+// bootstrap channel as "RAMDISK" + the volume's byte length, with a read+map cap.
+fn send_ramdisk(channel: &object::channel::Channel, volume: &[u8]) -> Result<(), &'static str> {
+	use object::rights::Rights;
+	let ramdisk = object::memory_object::MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
+	copy_into_object(&ramdisk, volume);
+	let mut msg = alloc::vec::Vec::with_capacity(7 + 8);
+	msg.extend_from_slice(b"RAMDISK");
+	msg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
+	send_cap(channel, &msg, ramdisk, Rights::READ | Rights::MAP)
+}
+
 // Build the M16 storage topology and run it to completion. A MemoryObject holds
 // the ramdisk volume; the StorageService process maps it and serves files over a
 // service channel; a client process opens vol://system/hello.txt through the
@@ -685,26 +720,15 @@ fn copy_into_object(object: &alloc::sync::Arc<object::memory_object::MemoryObjec
 // volume archive, and the bytes the client read through the service. Shared by
 // the boot demo and the test.
 fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
-	use alloc::sync::Arc;
-	use object::KernelObject;
-	use object::channel::{Channel, Message};
-	use object::handle::Capability;
-	use object::memory_object::MemoryObject;
+	use object::channel::Channel;
 	use object::rights::Rights;
 
-	// the volume archive backing the ramdisk, and the file we expect served
-	let volume = volume_package_bytes().ok_or("volume package module not found")?;
-	let expected = pkg::Package::parse(volume).and_then(|p| p.lookup(b"hello.txt").map(|b| b.to_vec())).ok_or("hello.txt missing from the volume package")?;
-
-	// the userspace programs, from the init package
-	let init = init_package_bytes().ok_or("init package module not found")?;
-	let package = pkg::Package::parse(init).ok_or("init package is malformed")?;
+	// the volume archive backing the ramdisk, the file we expect served, and the
+	// userspace programs from the init package
+	let (volume, package) = scenario_packages()?;
+	let expected = volume_file(volume, b"hello.txt")?;
 	let service_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
 	let client_elf = package.lookup(b"storage_client").ok_or("storage_client missing from the init package")?;
-
-	// the ramdisk: a MemoryObject filled with the volume archive via the HHDM
-	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
-	copy_into_object(&ramdisk, volume);
 
 	// channels: a bootstrap per process, plus the service<->client request channel
 	let (service_boot_kernel, service_boot_user) = Channel::create();
@@ -717,17 +741,10 @@ fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), 
 	loader::spawn_elf_process(domain, client_elf, client_boot_user, Rights::ALL, 0).map_err(|_| "failed to load the storage client")?;
 
 	// hand the service its ramdisk (with the volume length) and its service
-	// endpoint, then hand the client the other end of that service channel. These
-	// are object-level sends: the kernel attaches the capabilities directly.
-	let mut ramdisk_msg = alloc::vec::Vec::with_capacity(7 + 8);
-	ramdisk_msg.extend_from_slice(b"RAMDISK");
-	ramdisk_msg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
-	let ramdisk_cap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP, 0);
-	service_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap], 0)).map_err(|_| "service ramdisk bootstrap failed")?;
-	let service_server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
-	service_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![service_server_cap], 0)).map_err(|_| "service serve bootstrap failed")?;
-	let service_client_cap = Capability::new(service_client as Arc<dyn KernelObject>, Rights::ALL, 0);
-	client_boot_kernel.send(Message::new(b"CONNECT".to_vec(), alloc::vec![service_client_cap], 0)).map_err(|_| "client connect bootstrap failed")?;
+	// endpoint, then hand the client the other end of that service channel.
+	send_ramdisk(&service_boot_kernel, volume)?;
+	send_cap(&service_boot_kernel, b"SERVE", service_server, Rights::ALL)?;
+	send_cap(&client_boot_kernel, b"CONNECT", service_client, Rights::ALL)?;
 
 	// run the cooperative schedule until everyone is done, then read the result
 	sched::run_until_idle();
@@ -760,23 +777,13 @@ fn storage_demo() {
 // channel. The kernel only brokers the initial capabilities. Returns (expected,
 // actual): the file straight from the volume, and the bytes the component read.
 fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
-	use alloc::sync::Arc;
-	use object::KernelObject;
-	use object::channel::{Channel, Message};
-	use object::handle::Capability;
-	use object::memory_object::MemoryObject;
+	use object::channel::Channel;
 	use object::rights::Rights;
 
-	let volume = volume_package_bytes().ok_or("volume package module not found")?;
-	let expected = pkg::Package::parse(volume).and_then(|p| p.lookup(b"hello.txt").map(|b| b.to_vec())).ok_or("hello.txt missing from the volume package")?;
-
-	let init = init_package_bytes().ok_or("init package module not found")?;
-	let package = pkg::Package::parse(init).ok_or("init package is malformed")?;
+	let (volume, package) = scenario_packages()?;
+	let expected = volume_file(volume, b"hello.txt")?;
 	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
 	let host_elf = package.lookup(b"wasi_host").ok_or("wasi_host missing from the init package")?;
-
-	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
-	copy_into_object(&ramdisk, volume);
 
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (host_boot_kernel, host_boot_user) = Channel::create();
@@ -786,21 +793,13 @@ fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'s
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
 	loader::spawn_elf_process(domain, host_elf, host_boot_user, Rights::ALL, 0).map_err(|_| "failed to load wasi_host")?;
 
-	// storage bootstrap: the ramdisk volume (with its length) and its service channel
-	let mut ramdisk_msg = alloc::vec::Vec::with_capacity(7 + 8);
-	ramdisk_msg.extend_from_slice(b"RAMDISK");
-	ramdisk_msg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
-	let ramdisk_cap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP, 0);
-	storage_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap], 0)).map_err(|_| "service ramdisk bootstrap failed")?;
-	let service_server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
-	storage_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![service_server_cap], 0)).map_err(|_| "service serve bootstrap failed")?;
-
-	// host bootstrap: the StorageService client - the one capability it is granted
-	let service_client_cap = Capability::new(service_client as Arc<dyn KernelObject>, Rights::ALL, 0);
-	host_boot_kernel.send(Message::new(b"STORAGE".to_vec(), alloc::vec![service_client_cap], 0)).map_err(|_| "host storage bootstrap failed")?;
+	// storage bootstrap: the ramdisk volume and its service channel; the host gets
+	// only the StorageService client - the one capability it is granted.
+	send_ramdisk(&storage_boot_kernel, volume)?;
+	send_cap(&storage_boot_kernel, b"SERVE", service_server, Rights::ALL)?;
+	send_cap(&host_boot_kernel, b"STORAGE", service_client, Rights::ALL)?;
 
 	sched::run_until_idle();
-
 	let result = host_boot_kernel.recv().map_err(|_| "the host reported no result")?;
 	Ok((expected, result.bytes))
 }
@@ -833,24 +832,14 @@ fn wasi_demo() {
 // (expected, actual): the picked file straight from the volume, and what the
 // component read.
 fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
-	use alloc::sync::Arc;
-	use object::KernelObject;
-	use object::channel::{Channel, Message};
-	use object::handle::Capability;
-	use object::memory_object::MemoryObject;
+	use object::channel::Channel;
 	use object::rights::Rights;
 
-	let volume = volume_package_bytes().ok_or("volume package module not found")?;
-	let expected = pkg::Package::parse(volume).and_then(|p| p.lookup(b"motd.txt").map(|b| b.to_vec())).ok_or("motd.txt missing from the volume package")?;
-
-	let init = init_package_bytes().ok_or("init package module not found")?;
-	let package = pkg::Package::parse(init).ok_or("init package is malformed")?;
+	let (volume, package) = scenario_packages()?;
+	let expected = volume_file(volume, b"motd.txt")?;
 	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
 	let picker_elf = package.lookup(b"file_picker").ok_or("file_picker missing from the init package")?;
 	let host_elf = package.lookup(b"wasi_host").ok_or("wasi_host missing from the init package")?;
-
-	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
-	copy_into_object(&ramdisk, volume);
 
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (picker_boot_kernel, picker_boot_user) = Channel::create();
@@ -863,27 +852,16 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 	loader::spawn_elf_process(domain.clone(), picker_elf, picker_boot_user, Rights::ALL, 0).map_err(|_| "failed to load file_picker")?;
 	loader::spawn_elf_process(domain, host_elf, host_boot_user, Rights::ALL, 0).map_err(|_| "failed to load wasi_host")?;
 
-	// StorageService: the ramdisk volume (with its length) and its service channel.
-	let mut ramdisk_msg = alloc::vec::Vec::with_capacity(7 + 8);
-	ramdisk_msg.extend_from_slice(b"RAMDISK");
-	ramdisk_msg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
-	let ramdisk_cap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP, 0);
-	storage_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap], 0)).map_err(|_| "storage ramdisk bootstrap failed")?;
-	let storage_server_cap = Capability::new(storage_server as Arc<dyn KernelObject>, Rights::ALL, 0);
-	storage_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![storage_server_cap], 0)).map_err(|_| "storage serve bootstrap failed")?;
-
-	// file_picker: the trusted StorageService client and its own service channel.
-	let storage_client_cap = Capability::new(storage_client as Arc<dyn KernelObject>, Rights::ALL, 0);
-	picker_boot_kernel.send(Message::new(b"STORAGE".to_vec(), alloc::vec![storage_client_cap], 0)).map_err(|_| "picker storage bootstrap failed")?;
-	let picker_server_cap = Capability::new(picker_server as Arc<dyn KernelObject>, Rights::ALL, 0);
-	picker_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![picker_server_cap], 0)).map_err(|_| "picker serve bootstrap failed")?;
-
-	// wasi_host: only the picker client - no filesystem access of its own.
-	let picker_client_cap = Capability::new(picker_client as Arc<dyn KernelObject>, Rights::ALL, 0);
-	host_boot_kernel.send(Message::new(b"PICKER".to_vec(), alloc::vec![picker_client_cap], 0)).map_err(|_| "host picker bootstrap failed")?;
+	// StorageService: the ramdisk volume and its service channel. file_picker: the
+	// trusted StorageService client and its own service channel. wasi_host: only the
+	// picker client - no filesystem access of its own.
+	send_ramdisk(&storage_boot_kernel, volume)?;
+	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL)?;
+	send_cap(&picker_boot_kernel, b"STORAGE", storage_client, Rights::ALL)?;
+	send_cap(&picker_boot_kernel, b"SERVE", picker_server, Rights::ALL)?;
+	send_cap(&host_boot_kernel, b"PICKER", picker_client, Rights::ALL)?;
 
 	sched::run_until_idle();
-
 	let result = host_boot_kernel.recv().map_err(|_| "the host reported no result")?;
 	Ok((expected, result.bytes))
 }

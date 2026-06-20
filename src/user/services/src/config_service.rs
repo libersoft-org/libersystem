@@ -79,27 +79,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 2. wait for the serve channel clients reach us on. If the supervisor drops the
 	//    bootstrap channel first (no clients this boot), we are done.
-	let service: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => handle,
-		_ => exit(),
-	};
+	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
 
-	// 3. serve generated get/list/set requests until the client side closes. A
-	//    zero-length message is the explicit quit sentinel.
+	// 3. serve generated get/list/set requests until the client side closes.
 	let mut config: Config = Config::seeded();
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 1024] = [0u8; 1024];
-	loop {
-		match unsafe { recv_blocking(service, &mut request) } {
-			Received::Message { len, .. } if len == 0 => break,
-			Received::Message { len, handle } => {
-				let mut reply_handle: u64 = 0;
-				if let Some(n) = config::dispatch(&mut config, &request[..len], handle, &mut reply, &mut reply_handle) {
-					unsafe { send_blocking(service, &reply[..n], reply_handle) };
-				}
-			}
-			Received::Closed => break,
-		}
+	unsafe {
+		serve(service, &mut request, &mut reply, |req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { config::dispatch(&mut config, req, handle, out, reply_handle) });
 	}
 	exit();
 }
