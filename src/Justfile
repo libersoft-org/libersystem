@@ -10,6 +10,7 @@ rt_dir := "user/rt"
 abi_dir := "abi"
 tools_dir := "tools/lsidl-gen"
 proto_dir := "proto"
+wasm_dir := "wasm"
 target := "x86_64-unknown-none"
 kernel_elf := kernel_dir / "target" / target / "debug" / "kernel"
 
@@ -74,6 +75,7 @@ fmt:
 	cd {{drivers_dir}} && cargo fmt
 	cd {{tools_dir}} && cargo fmt
 	cd {{proto_dir}} && cargo fmt
+	cd {{wasm_dir}} && cargo fmt
 	shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # check formatting without writing changes (CI-friendly)
@@ -87,6 +89,7 @@ fmt-check:
 	cd {{drivers_dir}} && cargo fmt --check
 	cd {{tools_dir}} && cargo fmt --check
 	cd {{proto_dir}} && cargo fmt --check
+	cd {{wasm_dir}} && cargo fmt --check
 	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # clean build artifacts

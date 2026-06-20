@@ -1,0 +1,9 @@
+[package]
+name = "wasm"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "A minimal WebAssembly parser and interpreter for the LiberSystem WASI host"
+
+# Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
+# we do not set `panic = "abort"` per-profile (same reasoning as the other crates).
