@@ -1925,22 +1925,73 @@ fn log_service_speaks_generated_bindings() {
 
 #[cfg(test)]
 #[test_case]
+fn device_service_lists_devices() {
+	use alloc::sync::Arc;
+	use object::KernelObject;
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::rights::Rights;
+
+	// Drive the real userspace DeviceService as a client over its generated Device
+	// bindings: spawn it, hand it a serve channel, and LIST the devices the kernel
+	// discovered on the bus. The wire is the proto framing - request [op u16][corr
+	// u32][args], reply [corr u32][result]; `list` takes no args and replies
+	// result<list<device-entry>, error>. Everything is pre-queued so the cooperative
+	// service drains it in one pass and exits (the kernel-as-client pattern).
+	let init = init_package_bytes().expect("init package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = package.lookup(b"device_service").expect("device_service in the init package");
+
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn DeviceService");
+
+	// hand the service the channel its clients reach it on
+	let server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
+	boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![server_cap], 0)).expect("serve bootstrap");
+
+	// LIST: [op = 1 (list) u16][corr u32], no args. Then an empty quit sentinel.
+	let corr: u32 = 9;
+	let mut req = alloc::vec::Vec::new();
+	req.extend_from_slice(&1u16.to_le_bytes());
+	req.extend_from_slice(&corr.to_le_bytes());
+	service_client.send(Message::new(req, alloc::vec::Vec::new(), 0)).expect("list request");
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+
+	sched::run_until_idle();
+
+	// the service reports in on its bootstrap channel before it serves
+	let online = boot_kernel.recv().expect("DeviceService online report");
+	assert_eq!(&online.bytes[..], b"DeviceService: online", "DeviceService reports in");
+
+	// The list reply is [corr u32][ok u8 = 1][count u16][device-entry...], each entry
+	// [index u32][kind u8][mmio-len u64]. QEMU exposes the virtio devices the kernel
+	// found on the bus, so the count is non-zero and the first entry is index 0.
+	let reply = service_client.recv().expect("list reply");
+	let b = &reply.bytes;
+	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), corr, "list reply echoes the correlation id");
+	assert_eq!(b[4], 1, "list succeeded");
+	let count = u16::from_le_bytes(b[5..7].try_into().unwrap());
+	assert!(count >= 1, "at least one device was enumerated");
+	assert_eq!(u32::from_le_bytes(b[7..11].try_into().unwrap()), 0, "the first device is index 0");
+}
+
+#[cfg(test)]
+#[test_case]
 fn init_package_starts_system_manager() {
 	// The boot chain, end to end: SystemManager starts from the init package, spawns
 	// ServiceManager and delegates the package and the ramdisk to it, and
 	// ServiceManager brings up the core services in dependency order - LogService
-	// first (DeviceManager, StorageService, and the shell all depend on it, though
-	// they are listed before it in the manifest, so the order is driven by declared
-	// dependencies). StorageService is handed the ramdisk and a service channel
-	// before it reports in; the shell is handed the StorageService client channel
-	// and proves the round-trip by reading a file with `cat` before it reports in.
+	// first, then DeviceService (it depends only on LogService, so it comes up right
+	// after), then DeviceManager, StorageService (handed the disk block channel
+	// DeviceManager routes up), and finally the shell (which proves the
+	// StorageService round-trip by reading a file with `cat` before it reports in).
 	// Every report is relayed up, so the kernel observes the services come up in
 	// dependency order, then DeviceManager stopped (ServiceManager exercises the
-	// stop path on that leaf service - nothing depends on it), followed by the two
-	// managers.
+	// stop path on that service), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 7] = [b"LogService: online", b"DeviceManager: online", b"StorageService: online", b"Shell: online", b"DeviceManager: stopped", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 8] = [b"LogService: online", b"DeviceService: online", b"DeviceManager: online", b"StorageService: online", b"Shell: online", b"DeviceManager: stopped", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");

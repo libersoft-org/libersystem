@@ -13,7 +13,7 @@
 
 extern crate alloc;
 
-use proto::system::{log, volume, OpenOpts, Query};
+use proto::system::{OpenOpts, Query, device, log, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -38,6 +38,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 
+	// 1c. receive the DeviceService client channel the `dev` command queries.
+	let devsvc: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if handle != 0 && len >= 6 && &buf[..6] == b"DEVICE" => handle,
+		_ => exit(),
+	};
+
 	// 2. self-check: prove the StorageService round-trip works by reading a file.
 	if !unsafe { cat(storage, SELF_CHECK_URI) } {
 		exit();
@@ -50,7 +56,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 4. become the interactive console and run the read-eval-print loop.
 	unsafe {
-		repl(storage, logsvc, &mut buf);
+		repl(storage, logsvc, devsvc, &mut buf);
 	}
 	exit();
 }
@@ -59,7 +65,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // kernel feeds keystrokes on the channel; we line-edit them (echoing input,
 // handling backspace) and dispatch each completed line. Returns when the user
 // types `exit`.
-unsafe fn repl(storage: u64, logsvc: u64, buf: &mut [u8]) {
+unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, buf: &mut [u8]) {
 	unsafe {
 		// The kernel sends console input on `feed`; we receive it on `input`.
 		let (feed, input): (u64, u64) = match channel() {
@@ -80,7 +86,7 @@ unsafe fn repl(storage: u64, logsvc: u64, buf: &mut [u8]) {
 				match buf[i] {
 					b'\n' | b'\r' => {
 						print(b"\n");
-						if dispatch(&line[..len], storage, logsvc) {
+						if dispatch(&line[..len], storage, logsvc, devsvc) {
 							return;
 						}
 						len = 0;
@@ -108,7 +114,7 @@ unsafe fn repl(storage: u64, logsvc: u64, buf: &mut [u8]) {
 }
 
 // Dispatch one command line. Returns true if the shell should exit.
-unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -124,6 +130,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64) -> bool {
 			print(b"  echo <text>      print text\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
 			print(b"  log [json]       show the system journal via LogService\n");
+			print(b"  dev [json]       list devices via DeviceService\n");
 			print(b"  exit             stop the shell and halt\n");
 			return false;
 		}
@@ -133,6 +140,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64) -> bool {
 		}
 		if line == b"log json" {
 			query_log(logsvc, true);
+			return false;
+		}
+		if line == b"dev" {
+			query_devices(devsvc, false);
+			return false;
+		}
+		if line == b"dev json" {
+			query_devices(devsvc, true);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
@@ -206,6 +221,37 @@ unsafe fn query_log(logsvc: u64, json: bool) {
 			}
 			Some(Err(_)) => print(b"log: query error\n"),
 			None => print(b"log: service unavailable\n"),
+		}
+	}
+}
+
+// Query DeviceService for the discovered devices over the generated Device client
+// and print them, rendering each typed entry to text or JSON on the client side.
+unsafe fn query_devices(devsvc: u64, json: bool) {
+	unsafe {
+		let mut client = device::Client::new(ChannelTransport { chan: devsvc });
+		match client.list() {
+			Some(Ok(entries)) => {
+				if json {
+					print(b"[");
+					let mut first = true;
+					for e in &entries {
+						if !first {
+							print(b",");
+						}
+						first = false;
+						print(e.to_json().as_bytes());
+					}
+					print(b"]\n");
+				} else {
+					for e in &entries {
+						print(e.to_text().as_bytes());
+						print(b"\n");
+					}
+				}
+			}
+			Some(Err(_)) => print(b"dev: query error\n"),
+			None => print(b"dev: service unavailable\n"),
 		}
 	}
 }

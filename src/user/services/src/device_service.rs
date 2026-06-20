@@ -1,0 +1,102 @@
+// DeviceService - the userspace typed device-enumeration service.
+//
+// ServiceManager starts this program from the init package and hands it a
+// bootstrap channel. DeviceService reports in, then waits for a "SERVE" message
+// carrying the channel its clients reach it on. Over that channel clients speak the
+// generated `liber:system` Device bindings: they LIST the devices the kernel
+// discovered on the bus (read from the kernel device table over the device
+// syscalls - the same table DeviceManager binds drivers to) or GET one by index,
+// receiving typed `device-entry` records that render as CLI / JSON on the client.
+//
+// When the supervisor that started it drops the bootstrap channel, the service
+// exits.
+
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
+use proto::system::device::{self, Service};
+use proto::system::{DeviceEntry, DeviceKind, Error};
+use rt::*;
+
+// The kernel device table, behind the generated Device contract.
+struct Devices;
+
+impl Service for Devices {
+	fn list(&mut self) -> Result<Vec<DeviceEntry>, Error> {
+		let mut out: Vec<DeviceEntry> = Vec::new();
+		let count: u64 = unsafe { device_count() };
+		let mut i: u64 = 0;
+		while i < count {
+			if let Some(entry) = unsafe { device_entry(i) } {
+				out.push(entry);
+			}
+			i += 1;
+		}
+		Ok(out)
+	}
+
+	fn get(&mut self, index: u32) -> Result<DeviceEntry, Error> {
+		unsafe { device_entry(index as u64) }.ok_or(Error::NotFound)
+	}
+}
+
+// Read device `i` from the kernel table and map it to a typed entry, or None if the
+// index is out of range.
+unsafe fn device_entry(i: u64) -> Option<DeviceEntry> {
+	unsafe {
+		let mut info: DeviceInfo = DeviceInfo::default();
+		if !device_info(i, &mut info) {
+			return None;
+		}
+		Some(DeviceEntry { index: i as u32, kind: kind_of(info.virtio_type), mmio_len: info.bar_len })
+	}
+}
+
+// Map a virtio device-type code to the typed device kind.
+fn kind_of(virtio_type: u32) -> DeviceKind {
+	match virtio_type {
+		1 => DeviceKind::Net,
+		2 => DeviceKind::Block,
+		3 => DeviceKind::Console,
+		_ => DeviceKind::Unknown,
+	}
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __user_main(bootstrap: u64) -> ! {
+	let mut buf: [u8; 256] = [0u8; 256];
+
+	// 1. report in to the supervisor that started us.
+	unsafe {
+		send_blocking(bootstrap, b"DeviceService: online", 0);
+	}
+
+	// 2. wait for the serve channel clients reach us on. If the supervisor drops the
+	//    bootstrap channel first (no clients this boot), we are done.
+	let service: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => handle,
+		_ => exit(),
+	};
+
+	// 3. serve generated list/get requests until the client side closes. A
+	//    zero-length message is the explicit quit sentinel.
+	let mut devices: Devices = Devices;
+	let mut request: [u8; 256] = [0u8; 256];
+	let mut reply: [u8; 1024] = [0u8; 1024];
+	loop {
+		match unsafe { recv_blocking(service, &mut request) } {
+			Received::Message { len, .. } if len == 0 => break,
+			Received::Message { len, handle } => {
+				let mut reply_handle: u64 = 0;
+				if let Some(n) = device::dispatch(&mut devices, &request[..len], handle, &mut reply, &mut reply_handle) {
+					unsafe { send_blocking(service, &reply[..n], reply_handle) };
+				}
+			}
+			Received::Closed => break,
+		}
+	}
+	exit();
+}

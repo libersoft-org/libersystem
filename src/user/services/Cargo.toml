@@ -20,6 +20,10 @@ name = "device_manager"
 path = "src/device_manager.rs"
 
 [[bin]]
+name = "device_service"
+path = "src/device_service.rs"
+
+[[bin]]
 name = "shell"
 path = "src/shell.rs"
 

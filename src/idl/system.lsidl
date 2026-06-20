@@ -78,3 +78,27 @@ record open-result {
 interface volume {
 	@op(1) open: func(o: open-opts) -> result<open-result, error>;
 }
+
+// The class of a discovered device, mirroring the kernel's virtio type codes.
+enum device-kind {
+	unknown = 0,
+	net     = 1,
+	block   = 2,
+	console = 3,
+}
+
+// One discovered device: its kernel-table index, class, and the size of the MMIO
+// window its driver maps.
+record device-entry {
+	index:    u32,
+	kind:     device-kind,
+	mmio-len: u64,
+}
+
+// The Device service contract: enumerate the devices the kernel discovered on the
+// bus, or look one up by its table index. Typed enumeration over the kernel device
+// table (the same table DeviceManager binds drivers to).
+interface device {
+	@op(1) list: func() -> result<list<device-entry>, error>;
+	@op(2) get:  func(index: u32) -> result<device-entry, error>;
+}

@@ -70,6 +70,23 @@ An opaque kernel object, transferred as `handle<file>`.
 | `file` | `handle<file>` |
 | `size` | `u64` |
 
+### enum `device-kind`
+
+| case | ordinal |
+| --- | --- |
+| `unknown` | 0 |
+| `net` | 1 |
+| `block` | 2 |
+| `console` | 3 |
+
+### record `device-entry`
+
+| field | type |
+| --- | --- |
+| `index` | `u32` |
+| `kind` | `device-kind` |
+| `mmio-len` | `u64` |
+
 ## Interfaces
 
 ### interface `log`
@@ -89,4 +106,13 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `open` | `open(o: open-opts) -> result<open-result, error>` |
+
+### interface `device`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `list` | `list() -> result<list<device-entry>, error>` |
+| 2 | `get` | `get(index: u32) -> result<device-entry, error>` |
 

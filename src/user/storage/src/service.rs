@@ -18,7 +18,7 @@
 #![no_std]
 #![no_main]
 
-use proto::system::{volume, Error, OpenOpts, OpenResult};
+use proto::system::{Error, OpenOpts, OpenResult, volume};
 use rt::*;
 
 // the single volume this service serves; the URI's volume component must match

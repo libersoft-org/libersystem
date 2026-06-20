@@ -510,6 +510,204 @@ pub mod volume {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DeviceKind {
+	Unknown = 0,
+	Net = 1,
+	Block = 2,
+	Console = 3,
+}
+
+impl DeviceKind {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<DeviceKind> {
+		DeviceKind::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<DeviceKind> {
+		match r.u8()? {
+			0 => Some(DeviceKind::Unknown),
+			1 => Some(DeviceKind::Net),
+			2 => Some(DeviceKind::Block),
+			3 => Some(DeviceKind::Console),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeviceEntry {
+	pub index: u32,
+	pub kind: DeviceKind,
+	pub mmio_len: u64,
+}
+
+impl DeviceEntry {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<DeviceEntry> {
+		DeviceEntry::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.index)?;
+		self.kind.write(w)?;
+		w.u64(self.mmio_len)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<DeviceEntry> {
+		let index = r.u32()?;
+		let kind = DeviceKind::read(r)?;
+		let mmio_len = r.u64()?;
+		Some(DeviceEntry { index, kind, mmio_len })
+	}
+}
+
+// interface `device` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod device {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_LIST: u16 = 1;
+	pub const OP_GET: u16 = 2;
+
+	pub trait Service {
+		fn list(&mut self) -> Result<Vec<DeviceEntry>, Error>;
+		fn get(&mut self, index: u32) -> Result<DeviceEntry, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = Reader::with_handle(request, request_handle);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		match op {
+			OP_LIST => {
+				let result = service.list();
+				match &result {
+					Ok(v15) => {
+						w.u8(1)?;
+						if v15.len() > u16::MAX as usize {
+							return None;
+						}
+						w.u16(v15.len() as u16)?;
+						for v17 in v15.iter() {
+							v17.write(w)?;
+						}
+					}
+					Err(v16) => {
+						w.u8(0)?;
+						v16.write(w)?;
+					}
+				}
+			}
+			OP_GET => {
+				let index = r.u32()?;
+				let result = service.get(index);
+				match &result {
+					Ok(v18) => {
+						w.u8(1)?;
+						v18.write(w)?;
+					}
+					Err(v19) => {
+						w.u8(0)?;
+						v19.write(w)?;
+					}
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn list(&mut self) -> Option<Result<Vec<DeviceEntry>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LIST)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 {
+				Ok({
+					let v20 = r.u16()? as usize;
+					let mut v21 = Vec::new();
+					for _ in 0..v20 {
+						v21.push(DeviceEntry::read(r)?);
+					}
+					v21
+				})
+			} else {
+				Err(Error::read(r)?)
+			})
+		}
+		pub fn get(&mut self, index: &u32) -> Option<Result<DeviceEntry, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_GET)?;
+			w.u32(corr)?;
+			w.u32(*index)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(DeviceEntry::read(r)?) } else { Err(Error::read(r)?) })
+		}
+	}
+}
+
 impl Error {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -629,13 +827,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v16 = true;
-		for v15 in self.fields.iter() {
-			if !v16 {
+		let mut v23 = true;
+		for v22 in self.fields.iter() {
+			if !v23 {
 				out.push(',');
 			}
-			v16 = false;
-			v15.to_json_into(out);
+			v23 = false;
+			v22.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -653,13 +851,13 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v18 = true;
-		for v17 in self.fields.iter() {
-			if !v18 {
+		let mut v25 = true;
+		for v24 in self.fields.iter() {
+			if !v25 {
 				out.push_str(", ");
 			}
-			v18 = false;
-			v17.to_text_into(out);
+			v25 = false;
+			v24.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -681,8 +879,8 @@ impl Query {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v19) => {
-				let _ = write!(out, "{}", v19);
+			Some(v26) => {
+				let _ = write!(out, "{}", v26);
 			}
 			None => {
 				out.push_str("null");
@@ -691,8 +889,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v20) => {
-				v20.to_json_into(out);
+			Some(v27) => {
+				v27.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -701,8 +899,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v21) => {
-				crate::codec::json_escape(v21, out);
+			Some(v28) => {
+				crate::codec::json_escape(v28, out);
 			}
 			None => {
 				out.push_str("null");
@@ -717,8 +915,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v22) => {
-				let _ = write!(out, "{}", v22);
+			Some(v29) => {
+				let _ = write!(out, "{}", v29);
 			}
 			None => {
 				out.push('-');
@@ -727,8 +925,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v23) => {
-				v23.to_text_into(out);
+			Some(v30) => {
+				v30.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -737,8 +935,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v24) => {
-				out.push_str(v24);
+			Some(v31) => {
+				out.push_str(v31);
 			}
 			None => {
 				out.push('-');
@@ -835,6 +1033,72 @@ impl OpenResult {
 	}
 }
 
+impl DeviceKind {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			DeviceKind::Unknown => out.push_str("\"unknown\""),
+			DeviceKind::Net => out.push_str("\"net\""),
+			DeviceKind::Block => out.push_str("\"block\""),
+			DeviceKind::Console => out.push_str("\"console\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			DeviceKind::Unknown => out.push_str("unknown"),
+			DeviceKind::Net => out.push_str("net"),
+			DeviceKind::Block => out.push_str("block"),
+			DeviceKind::Console => out.push_str("console"),
+		}
+	}
+}
+
+impl DeviceEntry {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"index\":");
+		let _ = write!(out, "{}", self.index);
+		out.push(',');
+		out.push_str("\"kind\":");
+		self.kind.to_json_into(out);
+		out.push(',');
+		out.push_str("\"mmio-len\":");
+		let _ = write!(out, "{}", self.mmio_len);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("index=");
+		let _ = write!(out, "{}", self.index);
+		out.push_str(", ");
+		out.push_str("kind=");
+		self.kind.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("mmio-len=");
+		let _ = write!(out, "{}", self.mmio_len);
+		out.push('}');
+	}
+}
+
 #[cfg(test)]
 mod compat {
 	use super::*;
@@ -887,5 +1151,21 @@ mod compat {
 		let golden: &[u8] = &[1, 0, 120, 1, 1];
 		assert_eq!(bytes, golden);
 		assert_eq!(OpenOpts::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn device_kind_wire_is_stable() {
+		let sample = DeviceKind::Unknown;
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[0];
+		assert_eq!(bytes, golden);
+		assert_eq!(DeviceKind::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn device_entry_wire_is_stable() {
+		let sample = DeviceEntry { index: 7, kind: DeviceKind::Unknown, mmio_len: 7 };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[7, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0];
+		assert_eq!(bytes, golden);
+		assert_eq!(DeviceEntry::decode(&bytes).unwrap(), sample);
 	}
 }

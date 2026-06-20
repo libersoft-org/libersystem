@@ -13,7 +13,7 @@
 extern crate alloc;
 
 use proto::codec::Transport;
-use proto::system::{volume, OpenOpts};
+use proto::system::{OpenOpts, volume};
 use rt::*;
 
 // the file this client opens through the StorageService
