@@ -53,11 +53,7 @@ fn main() -> ExitCode {
 			ok = false;
 		}
 	}
-	if ok {
-		ExitCode::SUCCESS
-	} else {
-		ExitCode::FAILURE
-	}
+	if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 // Lex, parse, and validate one file (and, when `rust_dir` is set, generate its

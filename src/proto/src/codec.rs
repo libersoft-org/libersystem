@@ -7,89 +7,132 @@
 //! decoded `String`.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
-// A cursor that appends to a caller-provided buffer.
-pub struct Writer<'a> {
-	buf: &'a mut [u8],
-	pos: usize,
-}
+// A byte sink the generated codecs write into. The default methods build the
+// little-endian and length-prefixed encodings on top of `put`, so a concrete sink
+// only implements `put`.
+pub trait Sink {
+	// Append one byte, or return None if the sink is full.
+	fn put(&mut self, b: u8) -> Option<()>;
 
-impl<'a> Writer<'a> {
-	pub fn new(buf: &'a mut [u8]) -> Writer<'a> {
-		Writer { buf, pos: 0 }
-	}
-
-	// The number of bytes written so far.
-	pub fn pos(&self) -> usize {
-		self.pos
-	}
-
-	fn put(&mut self, b: u8) -> Option<()> {
-		*self.buf.get_mut(self.pos)? = b;
-		self.pos += 1;
-		Some(())
-	}
-
-	pub fn raw(&mut self, s: &[u8]) -> Option<()> {
+	fn raw(&mut self, s: &[u8]) -> Option<()> {
 		for &b in s {
 			self.put(b)?;
 		}
 		Some(())
 	}
 
-	pub fn boolean(&mut self, v: bool) -> Option<()> {
+	fn boolean(&mut self, v: bool) -> Option<()> {
 		self.put(v as u8)
 	}
 
-	pub fn u8(&mut self, v: u8) -> Option<()> {
+	fn u8(&mut self, v: u8) -> Option<()> {
 		self.put(v)
 	}
 
-	pub fn u16(&mut self, v: u16) -> Option<()> {
+	fn u16(&mut self, v: u16) -> Option<()> {
 		self.raw(&v.to_le_bytes())
 	}
 
-	pub fn u32(&mut self, v: u32) -> Option<()> {
+	fn u32(&mut self, v: u32) -> Option<()> {
 		self.raw(&v.to_le_bytes())
 	}
 
-	pub fn u64(&mut self, v: u64) -> Option<()> {
+	fn u64(&mut self, v: u64) -> Option<()> {
 		self.raw(&v.to_le_bytes())
 	}
 
-	pub fn i8(&mut self, v: i8) -> Option<()> {
+	fn i8(&mut self, v: i8) -> Option<()> {
 		self.raw(&v.to_le_bytes())
 	}
 
-	pub fn i16(&mut self, v: i16) -> Option<()> {
+	fn i16(&mut self, v: i16) -> Option<()> {
 		self.raw(&v.to_le_bytes())
 	}
 
-	pub fn i32(&mut self, v: i32) -> Option<()> {
+	fn i32(&mut self, v: i32) -> Option<()> {
 		self.raw(&v.to_le_bytes())
 	}
 
-	pub fn i64(&mut self, v: i64) -> Option<()> {
+	fn i64(&mut self, v: i64) -> Option<()> {
 		self.raw(&v.to_le_bytes())
 	}
 
-	pub fn f32(&mut self, v: f32) -> Option<()> {
+	fn f32(&mut self, v: f32) -> Option<()> {
 		self.raw(&v.to_le_bytes())
 	}
 
-	pub fn f64(&mut self, v: f64) -> Option<()> {
+	fn f64(&mut self, v: f64) -> Option<()> {
 		self.raw(&v.to_le_bytes())
 	}
 
 	// A length-prefixed byte string: `[len u16][bytes]`. Refuses strings longer
 	// than `u16::MAX`.
-	pub fn bytes_lp(&mut self, s: &[u8]) -> Option<()> {
+	fn bytes_lp(&mut self, s: &[u8]) -> Option<()> {
 		if s.len() > u16::MAX as usize {
 			return None;
 		}
 		self.u16(s.len() as u16)?;
 		self.raw(s)
 	}
+}
+
+// A sink over a fixed caller buffer; `put` fails once the buffer is full. This is
+// the heap-free path the kernel and IPC send use.
+pub struct SliceWriter<'a> {
+	buf: &'a mut [u8],
+	pos: usize,
+}
+
+impl<'a> SliceWriter<'a> {
+	pub fn new(buf: &'a mut [u8]) -> SliceWriter<'a> {
+		SliceWriter { buf, pos: 0 }
+	}
+
+	// The number of bytes written so far.
+	pub fn pos(&self) -> usize {
+		self.pos
+	}
+}
+
+impl<'a> Sink for SliceWriter<'a> {
+	fn put(&mut self, b: u8) -> Option<()> {
+		*self.buf.get_mut(self.pos)? = b;
+		self.pos += 1;
+		Some(())
+	}
+}
+
+// A growable sink, used by the generated clients to build a request without
+// sizing a buffer up front.
+#[derive(Default)]
+pub struct VecWriter {
+	buf: Vec<u8>,
+}
+
+impl VecWriter {
+	pub fn new() -> VecWriter {
+		VecWriter { buf: Vec::new() }
+	}
+
+	// The bytes written so far, consuming the writer.
+	pub fn into_inner(self) -> Vec<u8> {
+		self.buf
+	}
+}
+
+impl Sink for VecWriter {
+	fn put(&mut self, b: u8) -> Option<()> {
+		self.buf.push(b);
+		Some(())
+	}
+}
+
+// A request/reply channel the generated clients call over. The userspace impl
+// sends on a channel and blocks for the reply; tests use an in-memory loopback.
+pub trait Transport {
+	fn call(&mut self, request: &[u8]) -> Option<Vec<u8>>;
 }
 
 // A cursor that reads from a borrowed buffer.

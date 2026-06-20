@@ -67,3 +67,43 @@ fn encode_rejects_small_buffer() {
 	let mut buf = [0u8; 4];
 	assert_eq!(e.encode(&mut buf), None);
 }
+
+// An in-memory loopback transport that dispatches a request straight into a
+// Service and returns the encoded reply - the host stand-in for a channel.
+struct Loopback<S: log::Service> {
+	service: S,
+}
+
+impl<S: log::Service> crate::codec::Transport for Loopback<S> {
+	fn call(&mut self, request: &[u8]) -> Option<Vec<u8>> {
+		let mut out = [0u8; 4096];
+		let n = log::dispatch(&mut self.service, request, &mut out)?;
+		Some(out[..n].to_vec())
+	}
+}
+
+// A trivial in-memory Log service for the round-trip test.
+#[derive(Default)]
+struct MemLog {
+	entries: Vec<Entry>,
+}
+
+impl log::Service for MemLog {
+	fn emit(&mut self, e: Entry) -> Result<(), Error> {
+		self.entries.push(e);
+		Ok(())
+	}
+
+	fn query(&mut self, _q: Query) -> Result<Vec<Entry>, Error> {
+		Ok(self.entries.clone())
+	}
+}
+
+#[test]
+fn client_server_round_trip() {
+	let mut client = log::Client::new(Loopback { service: MemLog::default() });
+	let e = Entry { timestamp: 9, severity: Severity::Error, source: String::from("svc"), fields: Vec::new() };
+	assert_eq!(client.emit(&e), Some(Ok(())));
+	let q = Query { since: None, min_severity: None, source: None, limit: 0 };
+	assert_eq!(client.query(&q), Some(Ok(alloc::vec![e])));
+}
