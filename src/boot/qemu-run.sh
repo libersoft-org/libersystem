@@ -32,8 +32,15 @@ QEMU_ARGS=(
 # transport (MMIO BARs + PCI capabilities, device id 0x1040 + virtio type), which
 # fits the userspace capability-driver model. The scratch disk is created once.
 VIRTIO_DISK="$HERE/.build/virtio-blk.img"
+VOLUME_PKG="$HERE/.build/volume.pkg"
 mkdir -p "$HERE/.build"
 [[ -f "$VIRTIO_DISK" ]] || truncate -s 16M "$VIRTIO_DISK"
+# StorageService (M26) backs its `vol://system` volume with this block device, so
+# lay the packed volume archive down at LBA 0 on every boot (conv=notrunc keeps the
+# disk at its full size; the kernel's build.rs produces volume.pkg next to it).
+if [[ -f "$VOLUME_PKG" ]]; then
+	dd if="$VOLUME_PKG" of="$VIRTIO_DISK" bs=512 conv=notrunc status=none
+fi
 QEMU_ARGS+=(
 	-drive "file=$VIRTIO_DISK,if=none,id=vblk,format=raw"
 	-device virtio-blk-pci,drive=vblk,disable-legacy=on
