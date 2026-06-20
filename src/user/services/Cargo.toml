@@ -28,6 +28,10 @@ name = "process_service"
 path = "src/process_service.rs"
 
 [[bin]]
+name = "config_service"
+path = "src/config_service.rs"
+
+[[bin]]
 name = "shell"
 path = "src/shell.rs"
 

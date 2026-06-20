@@ -118,3 +118,20 @@ interface process {
 	@op(1) start: func(name: string) -> result<process-info, error>;
 	@op(2) list:  func() -> result<list<process-info>, error>;
 }
+
+// One configuration node: a dotted-path key (the tree path, e.g. "system.name")
+// and its string value. The hierarchy lives in the key; the typed entry is the
+// node - configuration is structured data, never parsed from text.
+record config-entry {
+	key:   string,
+	value: string,
+}
+
+// The Config service contract: read a node by key, enumerate the whole tree, or
+// write a node. Configuration is a typed tree, not a parsed text file; a textual
+// form would only ever be an editable representation of these nodes.
+interface config {
+	@op(1) get:  func(key: string) -> result<string, error>;
+	@op(2) list: func() -> result<list<config-entry>, error>;
+	@op(3) set:  func(entry: config-entry) -> result<unit, error>;
+}

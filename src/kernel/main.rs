@@ -2055,20 +2055,109 @@ fn process_service_starts_a_program() {
 
 #[cfg(test)]
 #[test_case]
+fn config_service_serves_the_tree() {
+	use alloc::sync::Arc;
+	use object::KernelObject;
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::rights::Rights;
+
+	// Drive the real userspace ConfigService over its generated Config bindings:
+	// spawn it, hand it a serve channel, GET a seeded node, LIST the tree, SET a new
+	// node, and GET it back. The wire is the proto framing - request [op u16][corr
+	// u32][args], reply [corr u32][result]; strings are [len u16][utf8].
+	let init = init_package_bytes().expect("init package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = package.lookup(b"config_service").expect("config_service in the init package");
+
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn ConfigService");
+
+	let server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
+	boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![server_cap], 0)).expect("serve bootstrap");
+
+	// frame a GET: [op = 1 u16][corr u32][key: [len u16][utf8]].
+	let get = |corr: u32, key: &[u8]| -> alloc::vec::Vec<u8> {
+		let mut m = alloc::vec::Vec::new();
+		m.extend_from_slice(&1u16.to_le_bytes());
+		m.extend_from_slice(&corr.to_le_bytes());
+		m.extend_from_slice(&(key.len() as u16).to_le_bytes());
+		m.extend_from_slice(key);
+		m
+	};
+	service_client.send(Message::new(get(1, b"system.name"), alloc::vec::Vec::new(), 0)).expect("get");
+
+	// LIST: [op = 2 u16][corr u32].
+	let mut list = alloc::vec::Vec::new();
+	list.extend_from_slice(&2u16.to_le_bytes());
+	list.extend_from_slice(&2u32.to_le_bytes());
+	service_client.send(Message::new(list, alloc::vec::Vec::new(), 0)).expect("list");
+
+	// SET demo.key = hi: [op = 3 u16][corr u32][config-entry: key string + value string].
+	let (k, v): (&[u8], &[u8]) = (b"demo.key", b"hi");
+	let mut set = alloc::vec::Vec::new();
+	set.extend_from_slice(&3u16.to_le_bytes());
+	set.extend_from_slice(&3u32.to_le_bytes());
+	set.extend_from_slice(&(k.len() as u16).to_le_bytes());
+	set.extend_from_slice(k);
+	set.extend_from_slice(&(v.len() as u16).to_le_bytes());
+	set.extend_from_slice(v);
+	service_client.send(Message::new(set, alloc::vec::Vec::new(), 0)).expect("set");
+	service_client.send(Message::new(get(4, b"demo.key"), alloc::vec::Vec::new(), 0)).expect("get-back");
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+
+	sched::run_until_idle();
+
+	let online = boot_kernel.recv().expect("ConfigService online report");
+	assert_eq!(&online.bytes[..], b"ConfigService: online", "ConfigService reports in");
+
+	// GET reply: [corr u32 = 1][ok u8 = 1][value: [len u16][utf8]].
+	let r = service_client.recv().expect("get reply");
+	let b = &r.bytes;
+	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 1, "get echoes the correlation id");
+	assert_eq!(b[4], 1, "get succeeded");
+	let vlen = u16::from_le_bytes(b[5..7].try_into().unwrap()) as usize;
+	assert_eq!(&b[7..7 + vlen], b"LiberSystem", "system.name is the seeded value");
+
+	// LIST reply: [corr u32 = 2][ok u8 = 1][count u16][entries...].
+	let r = service_client.recv().expect("list reply");
+	let b = &r.bytes;
+	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 2, "list echoes the correlation id");
+	assert_eq!(b[4], 1, "list succeeded");
+	assert!(u16::from_le_bytes(b[5..7].try_into().unwrap()) >= 4, "the seeded tree has nodes");
+
+	// SET reply: [corr u32 = 3][ok u8 = 1].
+	let r = service_client.recv().expect("set reply");
+	let b = &r.bytes;
+	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 3, "set echoes the correlation id");
+	assert_eq!(b[4], 1, "set succeeded");
+
+	// GET demo.key reply: the value we just set reads back.
+	let r = service_client.recv().expect("get-back reply");
+	let b = &r.bytes;
+	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 4, "get-back echoes the correlation id");
+	assert_eq!(b[4], 1, "get-back succeeded");
+	let vlen = u16::from_le_bytes(b[5..7].try_into().unwrap()) as usize;
+	assert_eq!(&b[7..7 + vlen], b"hi", "the value just set reads back");
+}
+
+#[cfg(test)]
+#[test_case]
 fn init_package_starts_system_manager() {
 	// The boot chain, end to end: SystemManager starts from the init package, spawns
 	// ServiceManager and delegates the package and the ramdisk to it, and
 	// ServiceManager brings up the core services in dependency order - LogService
-	// first, then DeviceService and ProcessService (they depend only on LogService,
-	// so they come up right after), then DeviceManager, StorageService (handed the
-	// disk block channel DeviceManager routes up), and finally the shell (which
-	// proves the StorageService round-trip by reading a file with `cat` before it
-	// reports in). Every report is relayed up, so the kernel observes the services
+	// first, then DeviceService, ProcessService, and ConfigService (they depend only
+	// on LogService, so they come up right after), then DeviceManager, StorageService
+	// (handed the disk block channel DeviceManager routes up), and finally the shell
+	// (which proves the StorageService round-trip by reading a file with `cat` before
+	// it reports in). Every report is relayed up, so the kernel observes the services
 	// come up in dependency order, then DeviceManager stopped (ServiceManager
 	// exercises the stop path on that service), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 9] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"DeviceManager: online", b"StorageService: online", b"Shell: online", b"DeviceManager: stopped", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 10] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"DeviceManager: online", b"StorageService: online", b"Shell: online", b"DeviceManager: stopped", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");

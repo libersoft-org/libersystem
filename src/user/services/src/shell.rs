@@ -13,7 +13,7 @@
 
 extern crate alloc;
 
-use proto::system::{OpenOpts, Query, device, log, process, volume};
+use proto::system::{ConfigEntry, OpenOpts, Query, config, device, log, process, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -50,6 +50,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 
+	// 1e. receive the ConfigService client channel the `config`/`set` commands use.
+	let cfgsvc: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if handle != 0 && len >= 6 && &buf[..6] == b"CONFIG" => handle,
+		_ => exit(),
+	};
+
 	// 2. self-check: prove the StorageService round-trip works by reading a file.
 	if !unsafe { cat(storage, SELF_CHECK_URI) } {
 		exit();
@@ -62,7 +68,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 4. become the interactive console and run the read-eval-print loop.
 	unsafe {
-		repl(storage, logsvc, devsvc, procsvc, &mut buf);
+		repl(storage, logsvc, devsvc, procsvc, cfgsvc, &mut buf);
 	}
 	exit();
 }
@@ -71,7 +77,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // kernel feeds keystrokes on the channel; we line-edit them (echoing input,
 // handling backspace) and dispatch each completed line. Returns when the user
 // types `exit`.
-unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, buf: &mut [u8]) {
+unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, buf: &mut [u8]) {
 	unsafe {
 		// The kernel sends console input on `feed`; we receive it on `input`.
 		let (feed, input): (u64, u64) = match channel() {
@@ -92,7 +98,7 @@ unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, buf: &mut [
 				match buf[i] {
 					b'\n' | b'\r' => {
 						print(b"\n");
-						if dispatch(&line[..len], storage, logsvc, devsvc, procsvc) {
+						if dispatch(&line[..len], storage, logsvc, devsvc, procsvc, cfgsvc) {
 							return;
 						}
 						len = 0;
@@ -120,7 +126,7 @@ unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, buf: &mut [
 }
 
 // Dispatch one command line. Returns true if the shell should exit.
-unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -139,6 +145,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  dev [json]       list devices via DeviceService\n");
 			print(b"  ps               list started processes via ProcessService\n");
 			print(b"  run <name>       start a program via ProcessService\n");
+			print(b"  config [<key>]   list the config tree or read one key via ConfigService\n");
+			print(b"  set <key> <val>  write a config key via ConfigService\n");
 			print(b"  exit             stop the shell and halt\n");
 			return false;
 		}
@@ -164,6 +172,18 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		}
 		if let Some(rest) = line.strip_prefix(b"run ") {
 			run_process(procsvc, trim(rest));
+			return false;
+		}
+		if line == b"config" {
+			query_config(cfgsvc);
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"config ") {
+			get_config(cfgsvc, trim(rest));
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"set ") {
+			set_config(cfgsvc, trim(rest));
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
@@ -312,6 +332,83 @@ unsafe fn run_process(procsvc: u64, name: &[u8]) {
 				print(b"\n");
 			}
 			None => print(b"run: service unavailable\n"),
+		}
+	}
+}
+
+// Query ConfigService for the whole configuration tree and print each typed node.
+unsafe fn query_config(cfgsvc: u64) {
+	unsafe {
+		let mut client = config::Client::new(ChannelTransport { chan: cfgsvc });
+		match client.list() {
+			Some(Ok(entries)) => {
+				for e in &entries {
+					print(e.to_text().as_bytes());
+					print(b"\n");
+				}
+			}
+			Some(Err(_)) => print(b"config: query error\n"),
+			None => print(b"config: service unavailable\n"),
+		}
+	}
+}
+
+// Read one configuration node by key via ConfigService and print its value.
+unsafe fn get_config(cfgsvc: u64, key: &[u8]) {
+	unsafe {
+		let key = match core::str::from_utf8(key) {
+			Ok(s) => s,
+			Err(_) => {
+				print(b"config: invalid key\n");
+				return;
+			}
+		};
+		let mut client = config::Client::new(ChannelTransport { chan: cfgsvc });
+		match client.get(key) {
+			Some(Ok(value)) => {
+				print(value.as_bytes());
+				print(b"\n");
+			}
+			Some(Err(_)) => {
+				print(b"config: no such key ");
+				print(key.as_bytes());
+				print(b"\n");
+			}
+			None => print(b"config: service unavailable\n"),
+		}
+	}
+}
+
+// Write a configuration node via ConfigService: `rest` is "<key> <value>".
+unsafe fn set_config(cfgsvc: u64, rest: &[u8]) {
+	unsafe {
+		let (key, value): (&[u8], &[u8]) = match rest.iter().position(|&b: &u8| b == b' ') {
+			Some(i) => (&rest[..i], trim(&rest[i + 1..])),
+			None => {
+				print(b"usage: set <key> <value>\n");
+				return;
+			}
+		};
+		let key = match core::str::from_utf8(key) {
+			Ok(s) => s,
+			Err(_) => {
+				print(b"set: invalid key\n");
+				return;
+			}
+		};
+		let value = match core::str::from_utf8(value) {
+			Ok(s) => s,
+			Err(_) => {
+				print(b"set: invalid value\n");
+				return;
+			}
+		};
+		let entry = ConfigEntry { key: alloc::string::String::from(key), value: alloc::string::String::from(value) };
+		let mut client = config::Client::new(ChannelTransport { chan: cfgsvc });
+		match client.set(&entry) {
+			Some(Ok(())) => print(b"ok\n"),
+			Some(Err(_)) => print(b"set: error\n"),
+			None => print(b"set: service unavailable\n"),
 		}
 	}
 }

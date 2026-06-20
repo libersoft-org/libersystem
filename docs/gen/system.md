@@ -94,6 +94,13 @@ An opaque kernel object, transferred as `handle<file>`.
 | `koid` | `u64` |
 | `name` | `string` |
 
+### record `config-entry`
+
+| field | type |
+| --- | --- |
+| `key` | `string` |
+| `value` | `string` |
+
 ## Interfaces
 
 ### interface `log`
@@ -131,4 +138,14 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | --- | --- | --- |
 | 1 | `start` | `start(name: string) -> result<process-info, error>` |
 | 2 | `list` | `list() -> result<list<process-info>, error>` |
+
+### interface `config`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `get` | `get(key: string) -> result<string, error>` |
+| 2 | `list` | `list() -> result<list<config-entry>, error>` |
+| 3 | `set` | `set(entry: config-entry) -> result<unit, error>` |
 

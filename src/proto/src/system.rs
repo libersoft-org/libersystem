@@ -866,6 +866,196 @@ pub mod process {
 	}
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigEntry {
+	pub key: String,
+	pub value: String,
+}
+
+impl ConfigEntry {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ConfigEntry> {
+		ConfigEntry::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.key.as_bytes())?;
+		w.bytes_lp(self.value.as_bytes())?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<ConfigEntry> {
+		let key = r.string_lp()?;
+		let value = r.string_lp()?;
+		Some(ConfigEntry { key, value })
+	}
+}
+
+// interface `config` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod config {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_GET: u16 = 1;
+	pub const OP_LIST: u16 = 2;
+	pub const OP_SET: u16 = 3;
+
+	pub trait Service {
+		fn get(&mut self, key: String) -> Result<String, Error>;
+		fn list(&mut self) -> Result<Vec<ConfigEntry>, Error>;
+		fn set(&mut self, entry: ConfigEntry) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = Reader::with_handle(request, request_handle);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		match op {
+			OP_GET => {
+				let key = r.string_lp()?;
+				let result = service.get(key);
+				match &result {
+					Ok(v29) => {
+						w.u8(1)?;
+						w.bytes_lp(v29.as_bytes())?;
+					}
+					Err(v30) => {
+						w.u8(0)?;
+						v30.write(w)?;
+					}
+				}
+			}
+			OP_LIST => {
+				let result = service.list();
+				match &result {
+					Ok(v31) => {
+						w.u8(1)?;
+						if v31.len() > u16::MAX as usize {
+							return None;
+						}
+						w.u16(v31.len() as u16)?;
+						for v33 in v31.iter() {
+							v33.write(w)?;
+						}
+					}
+					Err(v32) => {
+						w.u8(0)?;
+						v32.write(w)?;
+					}
+				}
+			}
+			OP_SET => {
+				let entry = ConfigEntry::read(r)?;
+				let result = service.set(entry);
+				match &result {
+					Ok(v34) => {
+						w.u8(1)?;
+					}
+					Err(v35) => {
+						w.u8(0)?;
+						v35.write(w)?;
+					}
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn get(&mut self, key: &str) -> Option<Result<String, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_GET)?;
+			w.u32(corr)?;
+			w.bytes_lp(key.as_bytes())?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(r.string_lp()?) } else { Err(Error::read(r)?) })
+		}
+		pub fn list(&mut self) -> Option<Result<Vec<ConfigEntry>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LIST)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 {
+				Ok({
+					let v36 = r.u16()? as usize;
+					let mut v37 = Vec::new();
+					for _ in 0..v36 {
+						v37.push(ConfigEntry::read(r)?);
+					}
+					v37
+				})
+			} else {
+				Err(Error::read(r)?)
+			})
+		}
+		pub fn set(&mut self, entry: &ConfigEntry) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET)?;
+			w.u32(corr)?;
+			entry.write(w)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+		}
+	}
+}
+
 impl Error {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -985,13 +1175,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v30 = true;
-		for v29 in self.fields.iter() {
-			if !v30 {
+		let mut v39 = true;
+		for v38 in self.fields.iter() {
+			if !v39 {
 				out.push(',');
 			}
-			v30 = false;
-			v29.to_json_into(out);
+			v39 = false;
+			v38.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1009,13 +1199,13 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v32 = true;
-		for v31 in self.fields.iter() {
-			if !v32 {
+		let mut v41 = true;
+		for v40 in self.fields.iter() {
+			if !v41 {
 				out.push_str(", ");
 			}
-			v32 = false;
-			v31.to_text_into(out);
+			v41 = false;
+			v40.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1037,8 +1227,8 @@ impl Query {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v33) => {
-				let _ = write!(out, "{}", v33);
+			Some(v42) => {
+				let _ = write!(out, "{}", v42);
 			}
 			None => {
 				out.push_str("null");
@@ -1047,8 +1237,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v34) => {
-				v34.to_json_into(out);
+			Some(v43) => {
+				v43.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -1057,8 +1247,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v35) => {
-				crate::codec::json_escape(v35, out);
+			Some(v44) => {
+				crate::codec::json_escape(v44, out);
 			}
 			None => {
 				out.push_str("null");
@@ -1073,8 +1263,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v36) => {
-				let _ = write!(out, "{}", v36);
+			Some(v45) => {
+				let _ = write!(out, "{}", v45);
 			}
 			None => {
 				out.push('-');
@@ -1083,8 +1273,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v37) => {
-				v37.to_text_into(out);
+			Some(v46) => {
+				v46.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -1093,8 +1283,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v38) => {
-				out.push_str(v38);
+			Some(v47) => {
+				out.push_str(v47);
 			}
 			None => {
 				out.push('-');
@@ -1288,6 +1478,37 @@ impl ProcessInfo {
 	}
 }
 
+impl ConfigEntry {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"key\":");
+		crate::codec::json_escape(&self.key, out);
+		out.push(',');
+		out.push_str("\"value\":");
+		crate::codec::json_escape(&self.value, out);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("key=");
+		out.push_str(&self.key);
+		out.push_str(", ");
+		out.push_str("value=");
+		out.push_str(&self.value);
+		out.push('}');
+	}
+}
+
 #[cfg(test)]
 mod compat {
 	use super::*;
@@ -1364,5 +1585,13 @@ mod compat {
 		let golden: &[u8] = &[7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 120];
 		assert_eq!(bytes, golden);
 		assert_eq!(ProcessInfo::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn config_entry_wire_is_stable() {
+		let sample = ConfigEntry { key: String::from("x"), value: String::from("x") };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[1, 0, 120, 1, 0, 120];
+		assert_eq!(bytes, golden);
+		assert_eq!(ConfigEntry::decode(&bytes).unwrap(), sample);
 	}
 }
