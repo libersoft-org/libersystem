@@ -4,6 +4,7 @@ name = "system_manager"
 # version is unused here and omitted. SystemManager is the
 # first userspace process loaded from the init package.
 edition = "2024"
+build = "../build.rs"
 description = "SystemManager - the first userspace process"
 
 [[bin]]

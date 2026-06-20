@@ -752,20 +752,30 @@ fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), 
 	Ok((expected, result.bytes))
 }
 
+// Report a userspace scenario's outcome on the serial console: on success run
+// `on_ok` with the bytes read; on a byte mismatch or a setup error print a
+// `<label>: ERROR ...` line. The shared shell of the boot-time scenario demos.
+#[cfg(not(test))]
+fn report_scenario(label: &str, result: Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str>, on_ok: impl FnOnce(&[u8])) {
+	match result {
+		Ok((expected, actual)) => {
+			if actual == expected {
+				on_ok(&actual);
+			} else {
+				serial_println!("{}: ERROR - read {} bytes, expected {}", label, actual.len(), expected.len());
+			}
+		}
+		Err(reason) => serial_println!("{}: ERROR - {}", label, reason),
+	}
+}
+
 // Run the M16 storage scenario and report whether the client read the file's
 // bytes through the StorageService intact.
 #[cfg(not(test))]
 fn storage_demo() {
-	match run_storage_scenario() {
-		Ok((expected, actual)) => {
-			if actual == expected {
-				serial_println!("storage: client read \"{}\" from vol://system/hello.txt via StorageService", core::str::from_utf8(&actual).unwrap_or("<bad>").trim_end());
-			} else {
-				serial_println!("storage: ERROR - client read {} bytes, expected {}", actual.len(), expected.len());
-			}
-		}
-		Err(reason) => serial_println!("storage: ERROR - {}", reason),
-	}
+	report_scenario("storage", run_storage_scenario(), |actual: &[u8]| {
+		serial_println!("storage: client read \"{}\" from vol://system/hello.txt via StorageService", core::str::from_utf8(actual).unwrap_or("<bad>").trim_end());
+	});
 }
 
 // Build the M28 WASI topology and run it to completion. A StorageService serves the
@@ -808,16 +818,9 @@ fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'s
 // file's bytes through a host import on StorageService.
 #[cfg(not(test))]
 fn wasi_demo() {
-	match run_wasi_scenario() {
-		Ok((expected, actual)) => {
-			if actual == expected {
-				serial_println!("wasi: component read \"{}\" from vol://system/hello.txt via a host import on StorageService", core::str::from_utf8(&actual).unwrap_or("<bad>").trim_end());
-			} else {
-				serial_println!("wasi: ERROR - component read {} bytes, expected {}", actual.len(), expected.len());
-			}
-		}
-		Err(reason) => serial_println!("wasi: ERROR - {}", reason),
-	}
+	report_scenario("wasi", run_wasi_scenario(), |actual: &[u8]| {
+		serial_println!("wasi: component read \"{}\" from vol://system/hello.txt via a host import on StorageService", core::str::from_utf8(actual).unwrap_or("<bad>").trim_end());
+	});
 }
 
 // Build the M29 powerbox topology and run it to completion. A StorageService serves
@@ -870,16 +873,9 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 // user-picked file through the FilePicker, with no filesystem access of its own.
 #[cfg(not(test))]
 fn powerbox_demo() {
-	match run_powerbox_scenario() {
-		Ok((expected, actual)) => {
-			if actual == expected {
-				serial_println!("powerbox: component (no filesystem access) read the {}-byte file the user picked (motd.txt) via the FilePicker", actual.len());
-			} else {
-				serial_println!("powerbox: ERROR - component read {} bytes, expected {}", actual.len(), expected.len());
-			}
-		}
-		Err(reason) => serial_println!("powerbox: ERROR - {}", reason),
-	}
+	report_scenario("powerbox", run_powerbox_scenario(), |actual: &[u8]| {
+		serial_println!("powerbox: component (no filesystem access) read the {}-byte file the user picked (motd.txt) via the FilePicker", actual.len());
+	});
 }
 
 // Scan the PCI bus and report the devices found, flagging the virtio devices the

@@ -4,6 +4,7 @@ name = "drivers"
 # version is unused here and omitted. The drivers crate produces the userspace
 # virtio drivers DeviceManager launches, one isolated process per device.
 edition = "2024"
+build = "../build.rs"
 description = "Userspace virtio drivers (blk, net, console)"
 
 [[bin]]

@@ -5,6 +5,7 @@ name = "services"
 # system services started across the boot chain (ServiceManager first), loaded
 # from the init package.
 edition = "2024"
+build = "../build.rs"
 description = "Core userspace system services (ServiceManager, ...)"
 
 [[bin]]

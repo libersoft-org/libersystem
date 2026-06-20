@@ -106,6 +106,14 @@ pub struct HandleInfo {
 	pub generation: u32,
 }
 
+impl HandleInfo {
+	// Snapshot a capability's introspection fields, so the info / entries queries
+	// map them in exactly one place.
+	fn from_cap(cap: &Capability) -> HandleInfo {
+		HandleInfo { koid: cap.object.header().koid(), object_type: cap.object_type(), rights: cap.rights, badge: cap.badge, generation: cap.object.header().generation() }
+	}
+}
+
 struct Slot {
 	cap: Option<Capability>,
 	generation: u32,
@@ -237,7 +245,7 @@ impl HandleTable {
 	// object_info_get syscall. Returns None for a bad or stale handle.
 	pub fn info(&self, handle: Handle) -> Option<HandleInfo> {
 		let cap = self.cap_of(handle).ok()?;
-		Some(HandleInfo { koid: cap.object.header().koid(), object_type: cap.object_type(), rights: cap.rights, badge: cap.badge, generation: cap.object.header().generation() })
+		Some(HandleInfo::from_cap(cap))
 	}
 
 	// A snapshot of every live handle in the table, for enumeration by the System
@@ -246,7 +254,7 @@ impl HandleTable {
 		let mut out = Vec::new();
 		for slot in &self.slots {
 			if let Some(cap) = &slot.cap {
-				out.push(HandleInfo { koid: cap.object.header().koid(), object_type: cap.object_type(), rights: cap.rights, badge: cap.badge, generation: cap.object.header().generation() });
+				out.push(HandleInfo::from_cap(cap));
 			}
 		}
 		out

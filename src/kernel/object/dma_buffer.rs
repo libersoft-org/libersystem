@@ -42,37 +42,19 @@ impl DmaBuffer {
 	// is taken, so an over-cap request fails cleanly (QuotaExceeded) with nothing
 	// allocated or charged, and an out-of-memory rolls the charge back.
 	pub fn create_in(domain: &Arc<Domain>, size: usize) -> Result<Arc<Self>, MemoryError> {
-		let page = PAGE_SIZE as usize;
-		let pages = size.div_ceil(page).max(1);
-		let bytes = (pages * page) as u64;
+		let pages = frame::pages_for(size);
+		let bytes = pages as u64 * PAGE_SIZE;
 		if !domain.try_charge_dma(bytes) {
 			return Err(MemoryError::QuotaExceeded);
 		}
-		let frames = match Self::alloc_frames(pages) {
+		let frames = match frame::allocate_pages(pages) {
 			Some(f) => f,
 			None => {
 				domain.uncharge_dma(bytes);
 				return Err(MemoryError::OutOfMemory);
 			}
 		};
-		Ok(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * page, mapped_at: AtomicU64::new(0), domain: domain.clone() }))
-	}
-
-	// Take `pages` frames, rolling back on the first failure.
-	fn alloc_frames(pages: usize) -> Option<Vec<u64>> {
-		let mut frames = Vec::with_capacity(pages);
-		for _ in 0..pages {
-			match frame::allocate() {
-				Some(phys) => frames.push(phys),
-				None => {
-					for phys in &frames {
-						frame::deallocate(*phys);
-					}
-					return None;
-				}
-			}
-		}
-		Some(frames)
+		Ok(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mapped_at: AtomicU64::new(0), domain: domain.clone() }))
 	}
 
 	pub fn size(&self) -> usize {
@@ -104,13 +86,9 @@ impl Drop for DmaBuffer {
 		// Tear down any leftover mapping so freed frames are never left mapped.
 		let base = self.mapped_at.load(Ordering::Acquire);
 		if base != 0 {
-			for i in 0..self.frames.len() {
-				paging::unmap_page(base + i as u64 * PAGE_SIZE);
-			}
+			paging::unmap_pages(base, self.frames.len());
 		}
-		for phys in &self.frames {
-			frame::deallocate(*phys);
-		}
+		frame::free_pages(&self.frames);
 		// Refund the pinned DMA memory to the owning Domain.
 		self.domain.uncharge_dma(self.size as u64);
 	}

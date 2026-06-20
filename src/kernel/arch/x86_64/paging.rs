@@ -102,6 +102,15 @@ pub fn unmap_page(virt: u64) -> Option<u64> {
 	unmap_page_in(active_pml4_phys(), virt)
 }
 
+// Unmap `count` consecutive pages starting at `base` in the active address space -
+// the contiguous-virtual mapping a frame-backed object holds. The frames are not
+// freed here; the caller owns them.
+pub fn unmap_pages(base: u64, count: usize) {
+	for i in 0..count {
+		unmap_page(base + i as u64 * frame::PAGE_SIZE);
+	}
+}
+
 // Unmap `virt` in the address space rooted at `pml4_phys` if it is mapped,
 // returning the physical frame it pointed at. Intermediate tables are left in
 // place (not reclaimed here); free_address_space reclaims them wholesale.

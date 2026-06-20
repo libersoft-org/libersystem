@@ -548,9 +548,7 @@ fn sys_memory_unmap(handle: u64) -> i64 {
 	if base == 0 {
 		return ERR_NOT_MAPPED;
 	}
-	for i in 0..memory.frames().len() {
-		arch::paging::unmap_page(base + i as u64 * PAGE_SIZE);
-	}
+	arch::paging::unmap_pages(base, memory.frames().len());
 	memory.set_mapped_at(0);
 	0
 }

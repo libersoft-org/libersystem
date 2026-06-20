@@ -14,6 +14,8 @@
 use limine::memory_map::EntryType;
 use limine::response::MemoryMapResponse;
 
+use alloc::vec::Vec;
+
 use crate::sync::SpinLock;
 
 pub const PAGE_SIZE: u64 = 4096;
@@ -87,6 +89,35 @@ pub fn allocate() -> Option<u64> {
 // longer in use (and no longer mapped anywhere it could be written through).
 pub fn deallocate(phys: u64) {
 	unsafe { ALLOCATOR.lock().push(phys) };
+}
+
+// The number of whole pages needed to hold `bytes` (at least one).
+pub fn pages_for(bytes: usize) -> usize {
+	bytes.div_ceil(PAGE_SIZE as usize).max(1)
+}
+
+// Allocate `pages` physical frames, returning their addresses, or None if not
+// enough are available (any frames already taken are returned on failure). The
+// shared multi-frame allocation the frame-backed kernel objects use.
+pub fn allocate_pages(pages: usize) -> Option<Vec<u64>> {
+	let mut frames = Vec::with_capacity(pages);
+	for _ in 0..pages {
+		match allocate() {
+			Some(phys) => frames.push(phys),
+			None => {
+				free_pages(&frames);
+				return None;
+			}
+		}
+	}
+	Some(frames)
+}
+
+// Return a set of frames to the free list.
+pub fn free_pages(frames: &[u64]) {
+	for &phys in frames {
+		deallocate(phys);
+	}
 }
 
 // Number of frames currently free.

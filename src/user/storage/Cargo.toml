@@ -5,6 +5,7 @@ name = "storage"
 # produces the userspace StorageService service and a small demo client, both
 # loaded from the init package.
 edition = "2024"
+build = "../build.rs"
 description = "StorageService service and demo client"
 
 [[bin]]
