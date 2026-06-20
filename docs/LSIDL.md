@@ -52,11 +52,8 @@ enum severity {
 	trace, debug, info, warn, error, fatal,
 }
 
-record entry {
-	timestamp: u64,
-	severity:  severity,
-	source:    string,
-	fields:    list<field>,
+enum error {
+	denied, not-found, invalid, again, closed,
 }
 
 record field {
@@ -64,9 +61,16 @@ record field {
 	value: string,
 }
 
+record entry {
+	timestamp: u64,
+	severity:  severity,
+	source:    string,
+	fields:    list<field>,
+}
+
 interface log {
 	@op(1) emit:  func(e: entry) -> result<unit, error>;
-	@op(2) query: func(q: query) -> result<list<entry>, error>;
+	@op(2) query: func(min: severity) -> result<list<entry>, error>;
 }
 ```
 
@@ -183,6 +187,11 @@ serialized by value - it only ever crosses the wire as a `handle<T>`:
 resource file;
 resource process;
 ```
+
+The kernel's own object types are available as **built-in resources** without a
+declaration - most importantly `channel`, which `stream<T>` builds on (a stream is
+returned as `handle<channel>`). A package declares its own resources as above and
+refers to the built-in ones by name.
 
 ---
 
@@ -430,25 +439,27 @@ version     = digit+ ;
 use         = "use" package-path "." "{" ident ( "," ident )* "}" ";" ;
 package-path= ident ( ":" ident )* ;
 
-item        = record | enum | variant | flags | resource | interface ;
+item        = annotation* ( record | enum | variant | flags | resource | interface ) ;
 
 record      = "record" ident "{" field ( "," field )* ","? "}" ;
-field       = ident ":" type ;
+field       = annotation* ident ":" type ;
 
-enum        = "enum" ident "{" enum-case ( "," enum-case )* ","? "}" ;
-enum-case   = ident ( "=" digit+ )? ;
+enum        = "enum" ident "{" enum-entry ( "," enum-entry )* ","? "}" ;
+enum-entry  = annotation* ident ( "=" digit+ )? | reserved ;
 
 variant     = "variant" ident "{" var-case ( "," var-case )* ","? "}" ;
-var-case    = ident ( "(" type ")" )? ;
+var-case    = annotation* ident ( "(" type ")" )? ;
 
 flags       = "flags" ident "{" ident ( "," ident )* ","? "}" ;
 
 resource    = "resource" ident ";" ;
 
-interface   = "interface" ident "{" method* "}" ;
+interface   = "interface" ident "{" ( method | reserved ";" )* "}" ;
 method      = annotation* ident ":" "func" "(" params? ")" "->" type ";" ;
 params      = param ( "," param )* ;
 param       = annotation* ident ":" type ;
+
+reserved    = "@reserved" "(" digit+ ")" ;
 
 type        = prim
             | "option" "<" type ">"
@@ -486,14 +497,15 @@ without changing a single stored byte.
 ```lsidl
 package liber:system@1;
 
-// A common error, rendered identically in binary / JSON / CLI.
-// The ordinals mirror the kernel's ERR_* codes where they overlap.
+// A common error, rendered identically in binary / JSON / CLI. Each case names a
+// kernel ERR_* condition, but the wire value is the enum's own 0-based ordinal
+// (denied = 0, not-found = 1, ...), not the negative ERR_* number.
 enum error {
-	denied,     // ERR_ACCESS_DENIED
-	not-found,
-	invalid,    // ERR_INVALID
-	again,      // ERR_WOULD_BLOCK
-	closed,     // ERR_PEER_CLOSED
+	denied,     // ~ ERR_ACCESS_DENIED
+	not-found,  // no such object
+	invalid,    // ~ ERR_INVALID
+	again,      // ~ ERR_WOULD_BLOCK
+	closed,     // ~ ERR_PEER_CLOSED
 }
 
 enum severity {
