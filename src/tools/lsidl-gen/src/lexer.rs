@@ -17,11 +17,7 @@ impl<'a> Lexer<'a> {
 	// The byte `k` positions ahead, or 0 (treated as end-of-input) past the end.
 	fn at(&self, k: usize) -> u8 {
 		let j = self.i + k;
-		if j < self.b.len() {
-			self.b[j]
-		} else {
-			0
-		}
+		if j < self.b.len() { self.b[j] } else { 0 }
 	}
 
 	fn bump(&mut self) -> u8 {

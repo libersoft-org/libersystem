@@ -9,6 +9,7 @@ drivers_dir := "user/drivers"
 rt_dir := "user/rt"
 abi_dir := "abi"
 tools_dir := "tools/lsidl-gen"
+proto_dir := "proto"
 target := "x86_64-unknown-none"
 kernel_elf := kernel_dir / "target" / target / "debug" / "kernel"
 
@@ -26,10 +27,11 @@ user:
 build: user
 	cd {{kernel_dir}} && cargo build
 
-# parse, validate (and later generate bindings from) the LSIDL interface
-# definitions in src/idl/*.lsidl
+# generate the proto crate's bindings from the LSIDL interface definitions
+# (src/idl/*.lsidl) and format the generated source
 gen:
-	cd {{tools_dir}} && cargo run --quiet -- ../../idl/*.lsidl
+	cd {{tools_dir}} && cargo run --quiet -- --rust-dir ../../{{proto_dir}}/src ../../idl/*.lsidl
+	cd {{proto_dir}} && cargo fmt
 
 # build + boot in QEMU (serial on stdout). Add live displays as arguments
 # (combinable): `just run`, `just run vnc`, `just run spice`, `just run vnc spice`
@@ -71,6 +73,7 @@ fmt:
 	cd {{storage_dir}} && cargo fmt
 	cd {{drivers_dir}} && cargo fmt
 	cd {{tools_dir}} && cargo fmt
+	cd {{proto_dir}} && cargo fmt
 	shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # check formatting without writing changes (CI-friendly)
@@ -83,6 +86,7 @@ fmt-check:
 	cd {{storage_dir}} && cargo fmt --check
 	cd {{drivers_dir}} && cargo fmt --check
 	cd {{tools_dir}} && cargo fmt --check
+	cd {{proto_dir}} && cargo fmt --check
 	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # clean build artifacts
@@ -95,4 +99,5 @@ clean:
 	cd {{storage_dir}} && cargo clean
 	cd {{drivers_dir}} && cargo clean
 	cd {{tools_dir}} && cargo clean
+	cd {{proto_dir}} && cargo clean
 	rm -rf boot/.build

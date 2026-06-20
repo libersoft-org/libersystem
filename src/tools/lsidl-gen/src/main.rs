@@ -3,11 +3,12 @@
 //! For now it lexes, parses, and validates the `.lsidl` files given on the
 //! command line, printing a one-line summary per file and a non-zero exit code on
 //! any error. Code generation (the `proto` crate, CLI/JSON/CBOR, docs, and compat
-//! tests) lands in a later step.
+//! tests) is being added incrementally.
 //!
-//! Usage: `lsidl-gen [--dump] <file.lsidl>...`
+//! Usage: `lsidl-gen [--dump] [--rust-dir <dir>] <file.lsidl>...`
 
 mod ast;
+mod codegen;
 mod lexer;
 mod parser;
 mod token;
@@ -16,38 +17,52 @@ mod validate;
 #[cfg(test)]
 mod tests;
 
+use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
 	let mut dump = false;
+	let mut rust_dir: Option<String> = None;
 	let mut paths: Vec<String> = Vec::new();
-	for a in std::env::args().skip(1) {
+	let mut args = std::env::args().skip(1);
+	while let Some(a) = args.next() {
 		match a.as_str() {
 			"--dump" => dump = true,
+			"--rust-dir" => match args.next() {
+				Some(d) => rust_dir = Some(d),
+				None => {
+					eprintln!("lsidl-gen: --rust-dir needs a directory argument");
+					return ExitCode::FAILURE;
+				}
+			},
 			"-h" | "--help" => {
-				println!("usage: lsidl-gen [--dump] <file.lsidl>...");
+				println!("usage: lsidl-gen [--dump] [--rust-dir <dir>] <file.lsidl>...");
 				return ExitCode::SUCCESS;
 			}
 			_ => paths.push(a),
 		}
 	}
 	if paths.is_empty() {
-		eprintln!("lsidl-gen: no input files (usage: lsidl-gen [--dump] <file.lsidl>...)");
+		eprintln!("lsidl-gen: no input files (usage: lsidl-gen [--dump] [--rust-dir <dir>] <file.lsidl>...)");
 		return ExitCode::FAILURE;
 	}
 
 	let mut ok = true;
 	for path in &paths {
-		if !process(path, dump) {
+		if !process(path, dump, rust_dir.as_deref()) {
 			ok = false;
 		}
 	}
-	if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+	if ok {
+		ExitCode::SUCCESS
+	} else {
+		ExitCode::FAILURE
+	}
 }
 
-// Lex, parse, and validate one file. Returns false (and prints diagnostics to
-// stderr) on any error.
-fn process(path: &str, dump: bool) -> bool {
+// Lex, parse, and validate one file (and, when `rust_dir` is set, generate its
+// Rust bindings). Returns false (and prints diagnostics to stderr) on any error.
+fn process(path: &str, dump: bool, rust_dir: Option<&str>) -> bool {
 	let src = match std::fs::read_to_string(path) {
 		Ok(s) => s,
 		Err(e) => {
@@ -75,6 +90,23 @@ fn process(path: &str, dump: bool) -> bool {
 			eprintln!("{path}:{}: error: {}", e.span, e.msg);
 		}
 		return false;
+	}
+	if let Some(dir) = rust_dir {
+		let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+		let out_path = format!("{dir}/{stem}.rs");
+		match codegen::rust(&file, path) {
+			Ok(code) => {
+				if let Err(e) = std::fs::write(&out_path, code) {
+					eprintln!("{path}: cannot write {out_path}: {e}");
+					return false;
+				}
+				println!("{path}: wrote {out_path}");
+			}
+			Err(e) => {
+				eprintln!("{path}:{}: error: {}", e.span, e.msg);
+				return false;
+			}
+		}
 	}
 	if dump {
 		println!("{file:#?}");

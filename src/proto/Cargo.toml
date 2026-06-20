@@ -1,0 +1,6 @@
+[package]
+name = "proto"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "Generated LSIDL bindings (wire codec, clients, servers) for LiberSystem"
