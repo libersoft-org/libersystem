@@ -21,6 +21,11 @@ use core::panic::PanicInfo;
 // link this runtime keep referring to them directly.
 pub use abi::*;
 
+// The global allocator: a lazily-mapped per-process heap that enables `alloc`
+// (Box, Vec, String) for programs that need it. Registers itself as the
+// #[global_allocator]; dormant until the first allocation.
+mod heap;
+
 // ELF entry: the kernel drops us into ring 3 here with the bootstrap channel
 // handle in rdi. Align the stack to the SysV ABI boundary, then call the Rust
 // entry the program defines (keeping the bootstrap handle in rdi).
