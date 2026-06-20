@@ -93,6 +93,20 @@ pub struct DeviceInfo {
 	pub device_offset: u32,
 }
 
+// The introspection view object_info_get returns for a handle: the identity (koid)
+// of the object behind it, its stable type code (ObjectType::code - Domain = 0,
+// Process = 1, Thread = 2, ...), the rights the handle confers, and the object's
+// generation. repr(C) with fixed-width fields so it marshals cleanly across the
+// syscall boundary; the kernel writes it, userspace reads it.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ObjectInfo {
+	pub koid: u64,
+	pub object_type: u64,
+	pub rights: u32,
+	pub generation: u32,
+}
+
 // Error codes (Linux-style: a successful call returns its value, an error returns
 // a small negative in the reserved band [-4095, -1]).
 pub const ERR_BAD_SYSCALL: i64 = -1;

@@ -167,6 +167,18 @@ pub unsafe fn duplicate(handle: u64, rights: u32) -> i64 {
 	unsafe { syscall(SYS_HANDLE_DUPLICATE, handle, rights as u64, 0, 0) as i64 }
 }
 
+// Introspect the object behind `handle`: its koid, stable type code (Process = 1,
+// ...), the rights the handle confers, and its generation. Returns None if the
+// handle is unknown.
+pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
+	unsafe {
+		let mut info: ObjectInfo = ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0 };
+		let size: u64 = core::mem::size_of::<ObjectInfo>() as u64;
+		let ok: i64 = syscall(SYS_OBJECT_INFO_GET, handle, &mut info as *mut ObjectInfo as u64, size, 0) as i64;
+		if ok == 1 { Some(info) } else { None }
+	}
+}
+
 // The number of devices the kernel discovered at boot.
 pub unsafe fn device_count() -> u64 {
 	unsafe { syscall(SYS_DEVICE_COUNT, 0, 0, 0, 0) }

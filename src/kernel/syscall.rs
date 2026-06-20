@@ -47,15 +47,9 @@ use crate::sched;
 pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CONSOLE_ATTACH, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_RANDOM_GET, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
 
 // Introspection record filled by object_info_get: the identity and type of the
-// object behind a handle, and the access the handle confers. repr(C) with only
-// fixed-width fields so it marshals cleanly across the syscall boundary.
-#[repr(C)]
-pub struct ObjectInfo {
-	pub koid: u64,
-	pub object_type: u64,
-	pub rights: u32,
-	pub generation: u32,
-}
+// object behind a handle, and the access the handle confers. Defined in `abi` (the
+// SSOT shared with userspace) and re-exported here next to its syscall.
+pub use abi::ObjectInfo;
 
 // Validate a caller-supplied buffer. Always accepts kernel self-calls; for a
 // ring-3 caller it requires the whole [ptr, ptr+len) range to lie in user space.

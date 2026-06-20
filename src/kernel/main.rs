@@ -1978,20 +1978,97 @@ fn device_service_lists_devices() {
 
 #[cfg(test)]
 #[test_case]
+fn process_service_starts_a_program() {
+	use alloc::sync::Arc;
+	use object::KernelObject;
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::memory_object::MemoryObject;
+	use object::rights::Rights;
+
+	// Drive the real userspace ProcessService over its generated Process bindings:
+	// spawn it, hand it the init package (to launch from) and a serve channel, then
+	// START a program and LIST it back. The wire is the proto framing - request [op
+	// u16][corr u32][args], reply [corr u32][result]; `start` takes a string name and
+	// replies result<process-info, error> = [koid u64][name string]. Everything is
+	// pre-queued so the cooperative service drains it in one pass and exits.
+	let init = init_package_bytes().expect("init package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = package.lookup(b"process_service").expect("process_service in the init package");
+
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+
+	// hand it a read-only copy of the init package to launch programs from
+	let pkg_obj = MemoryObject::create(init.len()).expect("memory for the package");
+	copy_into_object(&pkg_obj, init);
+	let mut pkg_msg = alloc::vec::Vec::new();
+	pkg_msg.extend_from_slice(b"PACKAGE");
+	pkg_msg.extend_from_slice(&(init.len() as u64).to_le_bytes());
+	let pkg_cap = Capability::new(pkg_obj as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
+	boot_kernel.send(Message::new(pkg_msg, alloc::vec![pkg_cap], 0)).expect("package bootstrap");
+
+	// then the channel its clients reach it on
+	let server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
+	boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![server_cap], 0)).expect("serve bootstrap");
+
+	// START storage_client: [op = 1 u16][corr u32][name: [len u16][utf8]].
+	let name: &[u8] = b"storage_client";
+	let mut start = alloc::vec::Vec::new();
+	start.extend_from_slice(&1u16.to_le_bytes());
+	start.extend_from_slice(&1u32.to_le_bytes());
+	start.extend_from_slice(&(name.len() as u16).to_le_bytes());
+	start.extend_from_slice(name);
+	service_client.send(Message::new(start, alloc::vec::Vec::new(), 0)).expect("start request");
+
+	// LIST: [op = 2 u16][corr u32]. Then an empty quit sentinel.
+	let mut list = alloc::vec::Vec::new();
+	list.extend_from_slice(&2u16.to_le_bytes());
+	list.extend_from_slice(&2u32.to_le_bytes());
+	service_client.send(Message::new(list, alloc::vec::Vec::new(), 0)).expect("list request");
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+
+	sched::run_until_idle();
+
+	// the service reports in on its bootstrap channel before it serves
+	let online = boot_kernel.recv().expect("ProcessService online report");
+	assert_eq!(&online.bytes[..], b"ProcessService: online", "ProcessService reports in");
+
+	// The start reply is [corr u32 = 1][ok u8 = 1][koid u64][name: [len u16][utf8]].
+	let reply = service_client.recv().expect("start reply");
+	let b = &reply.bytes;
+	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 1, "start reply echoes the correlation id");
+	assert_eq!(b[4], 1, "start succeeded");
+	let koid = u64::from_le_bytes(b[5..13].try_into().unwrap());
+	assert!(koid >= 1, "the started process has a koid");
+	let name_len = u16::from_le_bytes(b[13..15].try_into().unwrap()) as usize;
+	assert_eq!(&b[15..15 + name_len], name, "the reply echoes the launched program name");
+
+	// The list reply is [corr u32 = 2][ok u8 = 1][count u16 = 1][process-info].
+	let reply = service_client.recv().expect("list reply");
+	let b = &reply.bytes;
+	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 2, "list reply echoes the correlation id");
+	assert_eq!(b[4], 1, "list succeeded");
+	assert_eq!(u16::from_le_bytes(b[5..7].try_into().unwrap()), 1, "the started process is listed");
+}
+
+#[cfg(test)]
+#[test_case]
 fn init_package_starts_system_manager() {
 	// The boot chain, end to end: SystemManager starts from the init package, spawns
 	// ServiceManager and delegates the package and the ramdisk to it, and
 	// ServiceManager brings up the core services in dependency order - LogService
-	// first, then DeviceService (it depends only on LogService, so it comes up right
-	// after), then DeviceManager, StorageService (handed the disk block channel
-	// DeviceManager routes up), and finally the shell (which proves the
-	// StorageService round-trip by reading a file with `cat` before it reports in).
-	// Every report is relayed up, so the kernel observes the services come up in
-	// dependency order, then DeviceManager stopped (ServiceManager exercises the
-	// stop path on that service), followed by the two managers.
+	// first, then DeviceService and ProcessService (they depend only on LogService,
+	// so they come up right after), then DeviceManager, StorageService (handed the
+	// disk block channel DeviceManager routes up), and finally the shell (which
+	// proves the StorageService round-trip by reading a file with `cat` before it
+	// reports in). Every report is relayed up, so the kernel observes the services
+	// come up in dependency order, then DeviceManager stopped (ServiceManager
+	// exercises the stop path on that service), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 8] = [b"LogService: online", b"DeviceService: online", b"DeviceManager: online", b"StorageService: online", b"Shell: online", b"DeviceManager: stopped", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 9] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"DeviceManager: online", b"StorageService: online", b"Shell: online", b"DeviceManager: stopped", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");

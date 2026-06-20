@@ -708,6 +708,164 @@ pub mod device {
 	}
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcessInfo {
+	pub koid: u64,
+	pub name: String,
+}
+
+impl ProcessInfo {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProcessInfo> {
+		ProcessInfo::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u64(self.koid)?;
+		w.bytes_lp(self.name.as_bytes())?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<ProcessInfo> {
+		let koid = r.u64()?;
+		let name = r.string_lp()?;
+		Some(ProcessInfo { koid, name })
+	}
+}
+
+// interface `process` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod process {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_START: u16 = 1;
+	pub const OP_LIST: u16 = 2;
+
+	pub trait Service {
+		fn start(&mut self, name: String) -> Result<ProcessInfo, Error>;
+		fn list(&mut self) -> Result<Vec<ProcessInfo>, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = Reader::with_handle(request, request_handle);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		match op {
+			OP_START => {
+				let name = r.string_lp()?;
+				let result = service.start(name);
+				match &result {
+					Ok(v22) => {
+						w.u8(1)?;
+						v22.write(w)?;
+					}
+					Err(v23) => {
+						w.u8(0)?;
+						v23.write(w)?;
+					}
+				}
+			}
+			OP_LIST => {
+				let result = service.list();
+				match &result {
+					Ok(v24) => {
+						w.u8(1)?;
+						if v24.len() > u16::MAX as usize {
+							return None;
+						}
+						w.u16(v24.len() as u16)?;
+						for v26 in v24.iter() {
+							v26.write(w)?;
+						}
+					}
+					Err(v25) => {
+						w.u8(0)?;
+						v25.write(w)?;
+					}
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn start(&mut self, name: &str) -> Option<Result<ProcessInfo, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_START)?;
+			w.u32(corr)?;
+			w.bytes_lp(name.as_bytes())?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(ProcessInfo::read(r)?) } else { Err(Error::read(r)?) })
+		}
+		pub fn list(&mut self) -> Option<Result<Vec<ProcessInfo>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LIST)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 {
+				Ok({
+					let v27 = r.u16()? as usize;
+					let mut v28 = Vec::new();
+					for _ in 0..v27 {
+						v28.push(ProcessInfo::read(r)?);
+					}
+					v28
+				})
+			} else {
+				Err(Error::read(r)?)
+			})
+		}
+	}
+}
+
 impl Error {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -827,13 +985,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v23 = true;
-		for v22 in self.fields.iter() {
-			if !v23 {
+		let mut v30 = true;
+		for v29 in self.fields.iter() {
+			if !v30 {
 				out.push(',');
 			}
-			v23 = false;
-			v22.to_json_into(out);
+			v30 = false;
+			v29.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -851,13 +1009,13 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v25 = true;
-		for v24 in self.fields.iter() {
-			if !v25 {
+		let mut v32 = true;
+		for v31 in self.fields.iter() {
+			if !v32 {
 				out.push_str(", ");
 			}
-			v25 = false;
-			v24.to_text_into(out);
+			v32 = false;
+			v31.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -879,8 +1037,8 @@ impl Query {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v26) => {
-				let _ = write!(out, "{}", v26);
+			Some(v33) => {
+				let _ = write!(out, "{}", v33);
 			}
 			None => {
 				out.push_str("null");
@@ -889,8 +1047,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v27) => {
-				v27.to_json_into(out);
+			Some(v34) => {
+				v34.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -899,8 +1057,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v28) => {
-				crate::codec::json_escape(v28, out);
+			Some(v35) => {
+				crate::codec::json_escape(v35, out);
 			}
 			None => {
 				out.push_str("null");
@@ -915,8 +1073,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v29) => {
-				let _ = write!(out, "{}", v29);
+			Some(v36) => {
+				let _ = write!(out, "{}", v36);
 			}
 			None => {
 				out.push('-');
@@ -925,8 +1083,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v30) => {
-				v30.to_text_into(out);
+			Some(v37) => {
+				v37.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -935,8 +1093,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v31) => {
-				out.push_str(v31);
+			Some(v38) => {
+				out.push_str(v38);
 			}
 			None => {
 				out.push('-');
@@ -1099,6 +1257,37 @@ impl DeviceEntry {
 	}
 }
 
+impl ProcessInfo {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"koid\":");
+		let _ = write!(out, "{}", self.koid);
+		out.push(',');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("koid=");
+		let _ = write!(out, "{}", self.koid);
+		out.push_str(", ");
+		out.push_str("name=");
+		out.push_str(&self.name);
+		out.push('}');
+	}
+}
+
 #[cfg(test)]
 mod compat {
 	use super::*;
@@ -1167,5 +1356,13 @@ mod compat {
 		let golden: &[u8] = &[7, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0];
 		assert_eq!(bytes, golden);
 		assert_eq!(DeviceEntry::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn process_info_wire_is_stable() {
+		let sample = ProcessInfo { koid: 7, name: String::from("x") };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 120];
+		assert_eq!(bytes, golden);
+		assert_eq!(ProcessInfo::decode(&bytes).unwrap(), sample);
 	}
 }

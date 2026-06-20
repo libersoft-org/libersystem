@@ -102,3 +102,19 @@ interface device {
 	@op(1) list: func() -> result<list<device-entry>, error>;
 	@op(2) get:  func(index: u32) -> result<device-entry, error>;
 }
+
+// One process the ProcessService has started: the kernel object id of the new
+// process and the init-package entry name it was launched from.
+record process-info {
+	koid: u64,
+	name: string,
+}
+
+// The Process service contract: start a program from the init package and report
+// the processes it has started. (Phase 1: started processes get no bootstrap
+// capability, so they run unattended; the typed create/info lifecycle is the
+// deliverable, not a full job launcher.)
+interface process {
+	@op(1) start: func(name: string) -> result<process-info, error>;
+	@op(2) list:  func() -> result<list<process-info>, error>;
+}

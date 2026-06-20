@@ -87,6 +87,13 @@ An opaque kernel object, transferred as `handle<file>`.
 | `kind` | `device-kind` |
 | `mmio-len` | `u64` |
 
+### record `process-info`
+
+| field | type |
+| --- | --- |
+| `koid` | `u64` |
+| `name` | `string` |
+
 ## Interfaces
 
 ### interface `log`
@@ -115,4 +122,13 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | --- | --- | --- |
 | 1 | `list` | `list() -> result<list<device-entry>, error>` |
 | 2 | `get` | `get(index: u32) -> result<device-entry, error>` |
+
+### interface `process`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `start` | `start(name: string) -> result<process-info, error>` |
+| 2 | `list` | `list() -> result<list<process-info>, error>` |
 
