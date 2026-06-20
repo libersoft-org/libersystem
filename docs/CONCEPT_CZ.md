@@ -1775,14 +1775,14 @@ Pozn.: body 10-14 zatím nepotřebují detailní návrh - patří sem vědomě j
 
 ### Doporučený další krok
 
-Object model, capability model i IPC model už mají základní návrh (viz výše). Další návrhové kroky:
+Fáze 0 a 1 jsou hotové (kernel MVP a první použitelný userspace - viz *Roadmapa*). Co je postavené a běží:
 
 ```text
-1. IDL/WIT: interface napsány a volba rozhodnuta (vlastní IDL) - zbývá postavit toolchain (generátory bindingů).
-2. Detailní návrh core služeb: Log a Device hotové (M22-M24), Storage a Process zbývají.
-3. Minimální WASI host a běh první komponenty.
-4. virtio drivery (blk, net, console) místo ramdisku - hotové (M23-M24).
-5. SystemManager / ServiceManager / DeviceManager - postaveno a běží (M21-M24).
+1. Kernel: SMP-aware, preemptivní, s blokujícím `wait`; objekty, capabilities, Domény, Channel IPC, izolace pádů + úklid spadlého procesu.
+2. Boot chain: SystemManager -> ServiceManager -> DeviceManager + core služby, s recovery.
+3. IDL toolchain (vlastní, LSIDL) a jeho generátory: binární kodek, Rust client/server, JSON + CLI renderery, docs, kompatibilní testy.
+4. Core služby přes generované bindingy: Log, Storage (nad reálným virtio-blk zařízením), Process, Device, Config.
+5. virtio drivery (blk, net, console) izolované pod DeviceManagerem; minimální WASI host spouštějící první Wasm komponentu; powerbox file picker předávající jednu file capability.
 ```
 
-5-6 reálných interface už je napsáno ve WIT a podle té praxe rozhodnuto (vlastní IDL s typy inspirovanými WIT + vlastní binární backend; viz *IDL jazyk*); nejbližší konkrétní krok je teď postavit toolchain (generátory bindingů, schémat, CLI, docs a testů).
+Doporučený další krok je tedy **Fáze 2 (appliance/edge platforma)**. Její prioritou je síťový stack nad virtio-net - na edge je síť jádrem - následovaný zbytkem fáze (plný System Graph + observabilita, security hardening + PermissionManager, ResourceManager policy, ServiceManager restart/watchdog, plný Component Model + WASI preview 2 + SDK, package/AOT cesta a jednoduchý perzistentní nativní filesystem); viz *Roadmapa*.

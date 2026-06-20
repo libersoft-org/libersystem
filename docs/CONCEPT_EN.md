@@ -1775,14 +1775,14 @@ Note: items 10-14 do not need a detailed design yet - they are here deliberately
 
 ### Recommended next step
 
-The object model, capability model, and IPC model already have a basic design (see above). Further design steps:
+Phases 0 and 1 are complete (the kernel MVP and the first usable userspace - see the *Roadmap*). What is built and running:
 
 ```text
-1. IDL/WIT: the interfaces are written and the choice decided (our own IDL) - what remains is building the toolchain (binding generators).
-2. Detailed design of the core services: Log and Device done (M22-M24), Storage and Process remain.
-3. A minimal WASI host and running the first component.
-4. virtio drivers (blk, net, console) instead of a ramdisk - done (M23-M24).
-5. SystemManager / ServiceManager / DeviceManager - built and running (M21-M24).
+1. Kernel: SMP-aware, preemptive, with a blocking `wait`; objects, capabilities, Domains, Channel IPC, fault isolation + crashed-process cleanup.
+2. Boot chain: SystemManager -> ServiceManager -> DeviceManager + the core services, with recovery.
+3. The IDL toolchain (our own, LSIDL) and its generators: binary codec, Rust client/server, JSON + CLI renderers, docs, compatibility tests.
+4. Core services over generated bindings: Log, Storage (over a real virtio-blk device), Process, Device, Config.
+5. virtio drivers (blk, net, console) isolated under DeviceManager; a minimal WASI host running the first Wasm component; a powerbox file picker handing out a single file capability.
 ```
 
-The 5-6 real interfaces have been written in WIT and the choice decided from that practice (our own IDL with WIT-inspired types plus our own binary backend; see *IDL language*); the nearest concrete step is now building the toolchain (the binding, schema, CLI, doc, and test generators).
+The recommended next step is therefore **Phase 2 (the appliance/edge platform)**. Its priority is a network stack over virtio-net - on the edge, networking is the core - followed by the rest of the phase (full System Graph + observability, security hardening + PermissionManager, the ResourceManager policy, ServiceManager restart/watchdog, the full Component Model + WASI preview 2 + an SDK, a package/AOT path, and a simple persistent native filesystem); see the *Roadmap*.
