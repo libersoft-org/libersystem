@@ -1,0 +1,6 @@
+[package]
+name = "lsidl-gen"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "LSIDL (LiberSystem Interface Definition Language) front-end and binding generator"

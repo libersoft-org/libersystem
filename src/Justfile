@@ -8,6 +8,7 @@ storage_dir := "user/storage"
 drivers_dir := "user/drivers"
 rt_dir := "user/rt"
 abi_dir := "abi"
+tools_dir := "tools/lsidl-gen"
 target := "x86_64-unknown-none"
 kernel_elf := kernel_dir / "target" / target / "debug" / "kernel"
 
@@ -24,6 +25,11 @@ user:
 # build the kernel (its build.rs assembles the init package from the userspace build)
 build: user
 	cd {{kernel_dir}} && cargo build
+
+# parse, validate (and later generate bindings from) the LSIDL interface
+# definitions in src/idl/*.lsidl
+gen:
+	cd {{tools_dir}} && cargo run --quiet -- ../../idl/*.lsidl
 
 # build + boot in QEMU (serial on stdout). Add live displays as arguments
 # (combinable): `just run`, `just run vnc`, `just run spice`, `just run vnc spice`
@@ -64,6 +70,7 @@ fmt:
 	cd {{services_dir}} && cargo fmt
 	cd {{storage_dir}} && cargo fmt
 	cd {{drivers_dir}} && cargo fmt
+	cd {{tools_dir}} && cargo fmt
 	shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # check formatting without writing changes (CI-friendly)
@@ -75,6 +82,7 @@ fmt-check:
 	cd {{services_dir}} && cargo fmt --check
 	cd {{storage_dir}} && cargo fmt --check
 	cd {{drivers_dir}} && cargo fmt --check
+	cd {{tools_dir}} && cargo fmt --check
 	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # clean build artifacts
@@ -86,4 +94,5 @@ clean:
 	cd {{services_dir}} && cargo clean
 	cd {{storage_dir}} && cargo clean
 	cd {{drivers_dir}} && cargo clean
+	cd {{tools_dir}} && cargo clean
 	rm -rf boot/.build
