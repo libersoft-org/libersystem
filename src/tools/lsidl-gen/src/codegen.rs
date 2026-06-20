@@ -8,6 +8,7 @@
 
 use crate::ast::*;
 use crate::token::Error;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 // Generate the Rust source of the `proto` module for one file.
@@ -20,6 +21,7 @@ pub fn rust(file: &File, source: &str) -> Result<String, Error> {
 	for item in &file.items {
 		cg.render_item(item)?;
 	}
+	cg.compat_tests(file);
 	Ok(cg.out)
 }
 
@@ -640,6 +642,42 @@ impl Cg {
 			Type::Handle(_) | Type::Buffer | Type::Stream(_) => return Err("handle, buffer, and stream are not renderable".into()),
 		})
 	}
+
+	// Emit a `#[cfg(test)] mod compat` pinning each type's wire bytes: a
+	// deterministic sample, its golden encoding, and a round-trip check. The golden
+	// bytes are computed here (host) and the test checks the generated codec agrees,
+	// so an accidental ABI change shows up as a byte diff in review.
+	fn compat_tests(&mut self, file: &File) {
+		let defs = Defs::build(file);
+		self.line("#[cfg(test)]");
+		self.line("mod compat {");
+		self.line("\tuse super::*;");
+		self.line("\tuse alloc::string::String;");
+		self.line("");
+		for item in &file.items {
+			let name = match item {
+				Item::Record(r) => &r.name,
+				Item::Enum(e) => &e.name,
+				Item::Variant(v) => &v.name,
+				Item::Flags(f) => &f.name,
+				Item::Resource(_) | Item::Interface(_) => continue,
+			};
+			if let Some((expr, bytes)) = sample(&Type::Named(name.clone()), &defs) {
+				let ty = camel(name);
+				let golden = bytes.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", ");
+				self.line("\t#[test]");
+				self.line(&format!("\tfn {}_wire_is_stable() {{", field_ident(name)));
+				self.line(&format!("\t\tlet sample = {expr};"));
+				self.line("\t\tlet bytes = sample.encode_vec();");
+				self.line(&format!("\t\tlet golden: &[u8] = &[{golden}];"));
+				self.line("\t\tassert_eq!(bytes, golden);");
+				self.line(&format!("\t\tassert_eq!({ty}::decode(&bytes).unwrap(), sample);"));
+				self.line("\t}");
+			}
+		}
+		self.line("}");
+		self.line("");
+	}
 }
 
 // Map a kebab-case name to a Rust type/variant identifier (CamelCase).
@@ -903,4 +941,124 @@ pub fn docs(file: &File, source: &str) -> String {
 	}
 
 	out
+}
+
+// The named-type definitions of a file, for building deterministic samples.
+struct Defs<'a> {
+	records: HashMap<&'a str, &'a Record>,
+	enums: HashMap<&'a str, &'a Enum>,
+	variants: HashMap<&'a str, &'a Variant>,
+	flags: HashMap<&'a str, &'a Flags>,
+}
+
+impl<'a> Defs<'a> {
+	fn build(file: &'a File) -> Defs<'a> {
+		let mut d = Defs { records: HashMap::new(), enums: HashMap::new(), variants: HashMap::new(), flags: HashMap::new() };
+		for item in &file.items {
+			match item {
+				Item::Record(r) => {
+					d.records.insert(r.name.as_str(), r);
+				}
+				Item::Enum(e) => {
+					d.enums.insert(e.name.as_str(), e);
+				}
+				Item::Variant(v) => {
+					d.variants.insert(v.name.as_str(), v);
+				}
+				Item::Flags(f) => {
+					d.flags.insert(f.name.as_str(), f);
+				}
+				Item::Resource(_) | Item::Interface(_) => {}
+			}
+		}
+		d
+	}
+}
+
+// Build a deterministic sample of `ty`: its Rust literal expression and the exact
+// bytes that expression must encode to. Returns None for types the codec cannot
+// carry (handle/buffer/stream) or that reference an unknown/imported type.
+fn sample(ty: &Type, defs: &Defs) -> Option<(String, Vec<u8>)> {
+	Some(match ty {
+		Type::Bool => ("true".into(), vec![1]),
+		Type::U8 => ("7".into(), vec![7]),
+		Type::U16 => ("7".into(), vec![7, 0]),
+		Type::U32 => ("7".into(), vec![7, 0, 0, 0]),
+		Type::U64 => ("7".into(), vec![7, 0, 0, 0, 0, 0, 0, 0]),
+		Type::I8 => ("7".into(), vec![7]),
+		Type::I16 => ("7".into(), vec![7, 0]),
+		Type::I32 => ("7".into(), vec![7, 0, 0, 0]),
+		Type::I64 => ("7".into(), vec![7, 0, 0, 0, 0, 0, 0, 0]),
+		Type::F32 => ("1.5f32".into(), 1.5f32.to_le_bytes().to_vec()),
+		Type::F64 => ("1.5f64".into(), 1.5f64.to_le_bytes().to_vec()),
+		Type::String => ("String::from(\"x\")".into(), vec![1, 0, b'x']),
+		Type::Unit => ("()".into(), Vec::new()),
+		Type::Option(inner) => {
+			let (e, mut b) = sample(inner, defs)?;
+			let mut bytes = vec![1u8];
+			bytes.append(&mut b);
+			(format!("Some({e})"), bytes)
+		}
+		Type::List(inner) => {
+			let (e, mut b) = sample(inner, defs)?;
+			let mut bytes = vec![1u8, 0u8];
+			bytes.append(&mut b);
+			(format!("alloc::vec![{e}]"), bytes)
+		}
+		Type::Tuple(elems) => {
+			let mut exprs = Vec::new();
+			let mut bytes = Vec::new();
+			for e in elems {
+				let (ex, mut b) = sample(e, defs)?;
+				exprs.push(ex);
+				bytes.append(&mut b);
+			}
+			(format!("({})", exprs.join(", ")), bytes)
+		}
+		Type::Result(okty, _errty) => {
+			let (e, mut b) = sample(okty, defs)?;
+			let mut bytes = vec![1u8];
+			bytes.append(&mut b);
+			(format!("Ok({e})"), bytes)
+		}
+		Type::Handle(_) | Type::Buffer | Type::Stream(_) => return None,
+		Type::Named(n) => {
+			if let Some(e) = defs.enums.get(n.as_str()) {
+				let ords = effective_ordinals(e);
+				let first = e.cases.first()?;
+				let ord = *ords.first()?;
+				(format!("{}::{}", camel(n), camel(&first.name)), vec![ord as u8])
+			} else if let Some(r) = defs.records.get(n.as_str()) {
+				let mut parts = Vec::new();
+				let mut bytes = Vec::new();
+				for f in &r.fields {
+					let (ex, mut b) = sample(&f.ty, defs)?;
+					parts.push(format!("{}: {}", field_ident(&f.name), ex));
+					bytes.append(&mut b);
+				}
+				(format!("{} {{ {} }}", camel(n), parts.join(", ")), bytes)
+			} else if let Some(v) = defs.variants.get(n.as_str()) {
+				let first = v.cases.first()?;
+				match &first.payload {
+					Some(p) => {
+						let (ex, mut b) = sample(p, defs)?;
+						let mut bytes = vec![0u8];
+						bytes.append(&mut b);
+						(format!("{}::{}({ex})", camel(n), camel(&first.name)), bytes)
+					}
+					None => (format!("{}::{}", camel(n), camel(&first.name)), vec![0u8]),
+				}
+			} else if let Some(f) = defs.flags.get(n.as_str()) {
+				let width_bytes = match flags_width(f.flags.len()) {
+					"u8" => 1,
+					"u16" => 2,
+					"u32" => 4,
+					_ => 8,
+				};
+				(format!("{}(0)", camel(n)), vec![0u8; width_bytes])
+			} else {
+				return None;
+			}
+		}
+	})
 }
