@@ -168,14 +168,14 @@ struct ChannelTransport {
 }
 
 impl proto::codec::Transport for ChannelTransport {
-	fn call(&mut self, request: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
 		unsafe {
-			if !send_blocking(self.chan, request, 0) {
+			if !send_blocking(self.chan, request, request_handle) {
 				return None;
 			}
 			let mut reply: [u8; 4096] = [0u8; 4096];
 			match recv_blocking(self.chan, &mut reply) {
-				Received::Message { len, .. } => Some(reply[..len].to_vec()),
+				Received::Message { len, handle } => Some((reply[..len].to_vec(), handle)),
 				Received::Closed => None,
 			}
 		}

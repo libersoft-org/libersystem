@@ -17,6 +17,10 @@ pub trait Sink {
 	// Append one byte, or return None if the sink is full.
 	fn put(&mut self, b: u8) -> Option<()>;
 
+	// Record the out-of-band handle to transfer with this message (at most one per
+	// message, matching the kernel channel's single-handle limit).
+	fn set_handle(&mut self, h: u64);
+
 	fn raw(&mut self, s: &[u8]) -> Option<()> {
 		for &b in s {
 			self.put(b)?;
@@ -84,16 +88,22 @@ pub trait Sink {
 pub struct SliceWriter<'a> {
 	buf: &'a mut [u8],
 	pos: usize,
+	handle: u64,
 }
 
 impl<'a> SliceWriter<'a> {
 	pub fn new(buf: &'a mut [u8]) -> SliceWriter<'a> {
-		SliceWriter { buf, pos: 0 }
+		SliceWriter { buf, pos: 0, handle: 0 }
 	}
 
 	// The number of bytes written so far.
 	pub fn pos(&self) -> usize {
 		self.pos
+	}
+
+	// The out-of-band handle recorded during encoding (0 = none).
+	pub fn handle(&self) -> u64 {
+		self.handle
 	}
 }
 
@@ -103,6 +113,10 @@ impl<'a> Sink for SliceWriter<'a> {
 		self.pos += 1;
 		Some(())
 	}
+
+	fn set_handle(&mut self, h: u64) {
+		self.handle = h;
+	}
 }
 
 // A growable sink, used by the generated clients to build a request without
@@ -110,11 +124,17 @@ impl<'a> Sink for SliceWriter<'a> {
 #[derive(Default)]
 pub struct VecWriter {
 	buf: Vec<u8>,
+	handle: u64,
 }
 
 impl VecWriter {
 	pub fn new() -> VecWriter {
-		VecWriter { buf: Vec::new() }
+		VecWriter { buf: Vec::new(), handle: 0 }
+	}
+
+	// The out-of-band handle recorded during encoding (0 = none).
+	pub fn handle(&self) -> u64 {
+		self.handle
 	}
 
 	// The bytes written so far, consuming the writer.
@@ -128,23 +148,40 @@ impl Sink for VecWriter {
 		self.buf.push(b);
 		Some(())
 	}
+
+	fn set_handle(&mut self, h: u64) {
+		self.handle = h;
+	}
 }
 
 // A request/reply channel the generated clients call over. The userspace impl
 // sends on a channel and blocks for the reply; tests use an in-memory loopback.
 pub trait Transport {
-	fn call(&mut self, request: &[u8]) -> Option<Vec<u8>>;
+	// Send a request (bytes plus an optional transferred handle, 0 = none) and
+	// receive the reply (bytes plus an optional transferred handle).
+	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)>;
 }
 
 // A cursor that reads from a borrowed buffer.
 pub struct Reader<'a> {
 	buf: &'a [u8],
 	pos: usize,
+	handle: u64,
 }
 
 impl<'a> Reader<'a> {
 	pub fn new(buf: &'a [u8]) -> Reader<'a> {
-		Reader { buf, pos: 0 }
+		Reader { buf, pos: 0, handle: 0 }
+	}
+
+	// A reader for a message that arrived with an out-of-band transferred handle.
+	pub fn with_handle(buf: &'a [u8], handle: u64) -> Reader<'a> {
+		Reader { buf, pos: 0, handle }
+	}
+
+	// The out-of-band handle that arrived with the message (0 = none).
+	pub fn take_handle(&self) -> u64 {
+		self.handle
 	}
 
 	// The number of bytes consumed so far.

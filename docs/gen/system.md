@@ -51,6 +51,18 @@ Generated reference for the `liber:system` package (`system.lsidl`). See [the LS
 | `source` | `option<string>` |
 | `limit` | `u32` |
 
+### resource `file`
+
+An opaque kernel object, transferred as `handle<file>`.
+
+### record `open-opts`
+
+| field | type |
+| --- | --- |
+| `path` | `string` |
+| `write` | `bool` |
+| `create` | `bool` |
+
 ## Interfaces
 
 ### interface `log`
@@ -62,4 +74,12 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 1 | `emit` | `emit(e: entry) -> result<unit, error>` |
 | 2 | `query` | `query(q: query) -> result<list<entry>, error>` |
 | 3 | `tail` | `tail(q: query) -> result<stream<entry>, error>` |
+
+### interface `volume`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `open` | `open(o: open-opts) -> result<handle<file>, error>` |
 

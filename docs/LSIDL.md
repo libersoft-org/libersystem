@@ -263,12 +263,21 @@ flags open-mode { read, write, create, truncate }
 These three types are the reason LSIDL exists; they do not appear in WIT.
 
 **`handle<R>`** - the transfer of a kernel capability to a resource `R`. A handle
-is **not** part of the byte stream. Instead, the message carries an out-of-band
-*handle table*; in the byte stream a `handle<R>` is a `u32` index into that table.
-On receipt the kernel installs the capability - with its rights and badge intact -
-in the receiver's handle space and patches the index. This is the same split
-between data and handles that Binder, Mach ports, and FIDL use, and it is how a
-capability keeps its unforgeable authority across the boundary.
+is **not** part of the byte stream. Instead, the message carries the capability
+out-of-band; in the byte stream a `handle<R>` is a `u32` placeholder. On receipt
+the kernel installs the capability - with its rights and badge intact - in the
+receiver's handle space. This is the same split between data and handles that
+Binder, Mach ports, and FIDL use, and it is how a capability keeps its unforgeable
+authority across the boundary.
+
+The generator implements `handle<R>` today, with one restriction set by the
+kernel channel: **at most one handle travels per message** (the channel's single
+out-of-band slot). Encoding a `handle<R>` calls `set_handle` on the writer and
+writes the `u32` placeholder; the dispatch/client glue threads that single handle
+through `Transport::call(request, request_handle) -> (reply, reply_handle)`, and
+decoding recovers it with `take_handle` (ignoring the placeholder). A future
+multi-handle message would reintroduce the index-table form; the placeholder is
+already a `u32` so that change is wire-compatible.
 
 ```lsidl
 interface volume {
@@ -360,7 +369,7 @@ the layout is exactly as written.
 | `record` | fields in declaration order |
 | `variant` | `[tag u8][payload?]` |
 | `result<T,E>` | `[is-ok u8][T or E]` |
-| `handle<R>` | `[index u32]` into the out-of-band handle table |
+| `handle<R>` | `[placeholder u32]`; the capability rides the message's out-of-band handle slot |
 | `buffer` | `[dma-id u32][offset u64][len u64]` |
 | `stream<T>` | returned as `handle<channel>` |
 

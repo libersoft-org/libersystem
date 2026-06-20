@@ -249,8 +249,8 @@ impl Cg {
 		}
 		self.line("\t}");
 		self.line("");
-		self.line("\tpub fn dispatch<S: Service>(service: &mut S, request: &[u8], out: &mut [u8]) -> Option<usize> {");
-		self.line("\t\tlet mut reader = Reader::new(request);");
+		self.line("\tpub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {");
+		self.line("\t\tlet mut reader = Reader::with_handle(request, request_handle);");
 		self.line("\t\tlet r = &mut reader;");
 		self.line("\t\tlet op = r.u16()?;");
 		self.line("\t\tlet corr = r.u32()?;");
@@ -274,6 +274,7 @@ impl Cg {
 		}
 		self.line("\t\t\t_ => return None,");
 		self.line("\t\t}");
+		self.line("\t\t*reply_handle = writer.handle();");
 		self.line("\t\tSome(writer.pos())");
 		self.line("\t}");
 		self.line("");
@@ -307,8 +308,10 @@ impl Cg {
 				let code = self.write_place(&p.ty, &field_ident(&p.name), true).map_err(|e| Error::new(p.span, e))?;
 				self.line(&format!("\t\t\t{code}"));
 			}
-			self.line("\t\t\tlet reply = self.transport.call(&writer.into_inner())?;");
-			self.line("\t\t\tlet mut reader = Reader::new(&reply);");
+			self.line("\t\t\tlet request_handle = writer.handle();");
+			self.line("\t\t\tlet request = writer.into_inner();");
+			self.line("\t\t\tlet (reply, reply_handle) = self.transport.call(&request, request_handle)?;");
+			self.line("\t\t\tlet mut reader = Reader::with_handle(&reply, reply_handle);");
 			self.line("\t\t\tlet r = &mut reader;");
 			self.line("\t\t\tif r.u32()? != corr {");
 			self.line("\t\t\t\treturn None;");
@@ -370,7 +373,8 @@ impl Cg {
 				let errb = self.write_place(errty, &be, true)?;
 				format!("match {refp} {{ Ok({bo}) => {{ w.u8(1)?; {okb} }} Err({be}) => {{ w.u8(0)?; {errb} }} }}")
 			}
-			Type::Handle(_) | Type::Buffer | Type::Stream(_) => return Err("handle, buffer, and stream are not yet supported in a record or value position".into()),
+			Type::Handle(_) => format!("w.set_handle({val}); w.u32(0)?;"),
+			Type::Buffer | Type::Stream(_) => return Err("buffer and stream are not yet supported in a value position".into()),
 		})
 	}
 
@@ -405,7 +409,8 @@ impl Cg {
 				format!("({})", parts.join(", "))
 			}
 			Type::Result(okty, errty) => format!("if r.u8()? != 0 {{ Ok({}) }} else {{ Err({}) }}", self.read_value(okty)?, self.read_value(errty)?),
-			Type::Handle(_) | Type::Buffer | Type::Stream(_) => return Err("handle, buffer, and stream are not yet supported in a record or value position".into()),
+			Type::Handle(_) => "{ let _ = r.u32()?; r.take_handle() }".into(),
+			Type::Buffer | Type::Stream(_) => return Err("buffer and stream are not yet supported in a value position".into()),
 		})
 	}
 
@@ -732,7 +737,8 @@ fn rust_ty(ty: &Type) -> Result<String, String> {
 		}
 		Type::Result(a, b) => format!("Result<{}, {}>", rust_ty(a)?, rust_ty(b)?),
 		Type::Named(n) => camel(n),
-		Type::Handle(_) | Type::Buffer | Type::Stream(_) => return Err("handle, buffer, and stream are not yet supported in a record or value position".into()),
+		Type::Handle(_) => "u64".into(),
+		Type::Buffer | Type::Stream(_) => return Err("buffer and stream are not yet supported in a value position".into()),
 	})
 }
 
@@ -769,7 +775,8 @@ fn method_supported(m: &Method) -> bool {
 
 fn type_codec_ok(ty: &Type) -> bool {
 	match ty {
-		Type::Handle(_) | Type::Buffer | Type::Stream(_) => false,
+		Type::Buffer | Type::Stream(_) => false,
+		Type::Handle(_) => true,
 		Type::Option(t) | Type::List(t) => type_codec_ok(t),
 		Type::Tuple(ts) => ts.iter().all(type_codec_ok),
 		Type::Result(a, b) => type_codec_ok(a) && type_codec_ok(b),

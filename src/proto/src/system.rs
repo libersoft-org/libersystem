@@ -248,8 +248,8 @@ pub mod log {
 		fn query(&mut self, q: Query) -> Result<Vec<Entry>, Error>;
 	}
 
-	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], out: &mut [u8]) -> Option<usize> {
-		let mut reader = Reader::new(request);
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = Reader::with_handle(request, request_handle);
 		let r = &mut reader;
 		let op = r.u16()?;
 		let corr = r.u32()?;
@@ -292,6 +292,7 @@ pub mod log {
 			}
 			_ => return None,
 		}
+		*reply_handle = writer.handle();
 		Some(writer.pos())
 	}
 
@@ -319,8 +320,10 @@ pub mod log {
 			w.u16(OP_EMIT)?;
 			w.u32(corr)?;
 			e.write(w)?;
-			let reply = self.transport.call(&writer.into_inner())?;
-			let mut reader = Reader::new(&reply);
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
 			let r = &mut reader;
 			if r.u32()? != corr {
 				return None;
@@ -334,8 +337,10 @@ pub mod log {
 			w.u16(OP_QUERY)?;
 			w.u32(corr)?;
 			q.write(w)?;
-			let reply = self.transport.call(&writer.into_inner())?;
-			let mut reader = Reader::new(&reply);
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
 			let r = &mut reader;
 			if r.u32()? != corr {
 				return None;
@@ -348,6 +353,127 @@ pub mod log {
 						v12.push(Entry::read(r)?);
 					}
 					v12
+				})
+			} else {
+				Err(Error::read(r)?)
+			})
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenOpts {
+	pub path: String,
+	pub write: bool,
+	pub create: bool,
+}
+
+impl OpenOpts {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<OpenOpts> {
+		OpenOpts::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.path.as_bytes())?;
+		w.boolean(self.write)?;
+		w.boolean(self.create)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<OpenOpts> {
+		let path = r.string_lp()?;
+		let write = r.boolean()?;
+		let create = r.boolean()?;
+		Some(OpenOpts { path, write, create })
+	}
+}
+
+// interface `volume` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod volume {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_OPEN: u16 = 1;
+
+	pub trait Service {
+		fn open(&mut self, o: OpenOpts) -> Result<u64, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = Reader::with_handle(request, request_handle);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		match op {
+			OP_OPEN => {
+				let o = OpenOpts::read(r)?;
+				let result = service.open(o);
+				match &result {
+					Ok(v13) => {
+						w.u8(1)?;
+						w.set_handle(*v13);
+						w.u32(0)?;
+					}
+					Err(v14) => {
+						w.u8(0)?;
+						v14.write(w)?;
+					}
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn open(&mut self, o: &OpenOpts) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OPEN)?;
+			w.u32(corr)?;
+			o.write(w)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 {
+				Ok({
+					let _ = r.u32()?;
+					r.take_handle()
 				})
 			} else {
 				Err(Error::read(r)?)
@@ -475,13 +601,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v14 = true;
-		for v13 in self.fields.iter() {
-			if !v14 {
+		let mut v16 = true;
+		for v15 in self.fields.iter() {
+			if !v16 {
 				out.push(',');
 			}
-			v14 = false;
-			v13.to_json_into(out);
+			v16 = false;
+			v15.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -499,13 +625,13 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v16 = true;
-		for v15 in self.fields.iter() {
-			if !v16 {
+		let mut v18 = true;
+		for v17 in self.fields.iter() {
+			if !v18 {
 				out.push_str(", ");
 			}
-			v16 = false;
-			v15.to_text_into(out);
+			v18 = false;
+			v17.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -527,8 +653,8 @@ impl Query {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v17) => {
-				let _ = write!(out, "{}", v17);
+			Some(v19) => {
+				let _ = write!(out, "{}", v19);
 			}
 			None => {
 				out.push_str("null");
@@ -537,8 +663,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v18) => {
-				v18.to_json_into(out);
+			Some(v20) => {
+				v20.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -547,8 +673,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v19) => {
-				crate::codec::json_escape(v19, out);
+			Some(v21) => {
+				crate::codec::json_escape(v21, out);
 			}
 			None => {
 				out.push_str("null");
@@ -563,8 +689,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v20) => {
-				let _ = write!(out, "{}", v20);
+			Some(v22) => {
+				let _ = write!(out, "{}", v22);
 			}
 			None => {
 				out.push('-');
@@ -573,8 +699,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v21) => {
-				v21.to_text_into(out);
+			Some(v23) => {
+				v23.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -583,8 +709,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v22) => {
-				out.push_str(v22);
+			Some(v24) => {
+				out.push_str(v24);
 			}
 			None => {
 				out.push('-');
@@ -593,6 +719,59 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("limit=");
 		let _ = write!(out, "{}", self.limit);
+		out.push('}');
+	}
+}
+
+impl OpenOpts {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"path\":");
+		crate::codec::json_escape(&self.path, out);
+		out.push(',');
+		out.push_str("\"write\":");
+		if self.write {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"create\":");
+		if self.create {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("path=");
+		out.push_str(&self.path);
+		out.push_str(", ");
+		out.push_str("write=");
+		if self.write {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("create=");
+		if self.create {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 }
@@ -641,5 +820,13 @@ mod compat {
 		let golden: &[u8] = &[1, 7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 120, 7, 0, 0, 0];
 		assert_eq!(bytes, golden);
 		assert_eq!(Query::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn open_opts_wire_is_stable() {
+		let sample = OpenOpts { path: String::from("x"), write: true, create: true };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[1, 0, 120, 1, 1];
+		assert_eq!(bytes, golden);
+		assert_eq!(OpenOpts::decode(&bytes).unwrap(), sample);
 	}
 }

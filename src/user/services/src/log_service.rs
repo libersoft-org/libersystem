@@ -90,10 +90,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		match unsafe { recv_blocking(service, &mut request) } {
 			// An empty message is the explicit quit sentinel.
 			Received::Message { len, .. } if len == 0 => break,
-			Received::Message { len, .. } => {
-				if let Some(n) = log::dispatch(&mut journal, &request[..len], &mut reply) {
+			Received::Message { len, handle } => {
+				let mut reply_handle: u64 = 0;
+				if let Some(n) = log::dispatch(&mut journal, &request[..len], handle, &mut reply, &mut reply_handle) {
 					unsafe {
-						send_blocking(service, &reply[..n], 0);
+						send_blocking(service, &reply[..n], reply_handle);
 					}
 				}
 			}

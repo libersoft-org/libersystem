@@ -51,3 +51,21 @@ interface log {
 	@op(2) query: func(q: query) -> result<list<entry>, error>;
 	@op(3) tail:  func(q: query) -> result<stream<entry>, error>;
 }
+
+// An opaque file object, transferred to a client as handle<file> (a capability to
+// a shared buffer of the file's bytes).
+resource file;
+
+// Options for opening a path on a volume.
+record open-opts {
+	path:   string,
+	write:  bool,
+	create: bool,
+}
+
+// The Storage volume contract: resolve a path on a volume and hand back a file
+// capability. `open` returns the file as a handle (the M26 capability-return case
+// that exercises the handle<T> wire transfer).
+interface volume {
+	@op(1) open: func(o: open-opts) -> result<handle<file>, error>;
+}

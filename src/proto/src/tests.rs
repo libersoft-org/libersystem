@@ -75,10 +75,11 @@ struct Loopback<S: log::Service> {
 }
 
 impl<S: log::Service> crate::codec::Transport for Loopback<S> {
-	fn call(&mut self, request: &[u8]) -> Option<Vec<u8>> {
+	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)> {
 		let mut out = [0u8; 4096];
-		let n = log::dispatch(&mut self.service, request, &mut out)?;
-		Some(out[..n].to_vec())
+		let mut reply_handle = 0u64;
+		let n = log::dispatch(&mut self.service, request, request_handle, &mut out, &mut reply_handle)?;
+		Some((out[..n].to_vec(), reply_handle))
 	}
 }
 
@@ -106,6 +107,39 @@ fn client_server_round_trip() {
 	assert_eq!(client.emit(&e), Some(Ok(())));
 	let q = Query { since: None, min_severity: None, source: None, limit: 0 };
 	assert_eq!(client.query(&q), Some(Ok(alloc::vec![e])));
+}
+
+// A volume stub whose `open` returns a non-zero handle value. The wire encodes
+// only a u32 placeholder for the handle, so if the client recovers this value it
+// must have travelled out-of-band (set_handle -> reply_handle -> take_handle).
+struct VolStub;
+
+impl volume::Service for VolStub {
+	fn open(&mut self, o: OpenOpts) -> Result<u64, Error> {
+		if o.path.is_empty() { Err(Error::NotFound) } else { Ok(0xCAFE) }
+	}
+}
+
+struct VolLoopback<S: volume::Service> {
+	service: S,
+}
+
+impl<S: volume::Service> crate::codec::Transport for VolLoopback<S> {
+	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)> {
+		let mut out = [0u8; 256];
+		let mut reply_handle = 0u64;
+		let n = volume::dispatch(&mut self.service, request, request_handle, &mut out, &mut reply_handle)?;
+		Some((out[..n].to_vec(), reply_handle))
+	}
+}
+
+#[test]
+fn handle_return_crosses_out_of_band() {
+	let mut client = volume::Client::new(VolLoopback { service: VolStub });
+	let opts = OpenOpts { path: String::from("/x"), write: false, create: false };
+	assert_eq!(client.open(&opts), Some(Ok(0xCAFE)));
+	let empty = OpenOpts { path: String::new(), write: false, create: false };
+	assert_eq!(client.open(&empty), Some(Err(Error::NotFound)));
 }
 
 #[test]
