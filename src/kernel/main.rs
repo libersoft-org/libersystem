@@ -1841,7 +1841,7 @@ fn log_record_roundtrip_and_renders() {
 
 #[cfg(test)]
 #[test_case]
-fn log_service_ingests_queries_and_renders() {
+fn log_service_speaks_generated_bindings() {
 	use abi::log::{self, Severity};
 	use alloc::sync::Arc;
 	use object::KernelObject;
@@ -1849,11 +1849,14 @@ fn log_service_ingests_queries_and_renders() {
 	use object::handle::Capability;
 	use object::rights::Rights;
 
-	// Drive the real userspace LogService as a client: spawn it from the init
-	// package, hand it a serve channel, EMIT two structured records, then QUERY them
-	// back in each representation. The queries and a quit sentinel are pre-queued so
-	// the cooperative service drains them in one pass and exits, after which we read
-	// its replies (the M16/M17 kernel-as-client pattern).
+	// Drive the real userspace LogService as a client over its generated Log
+	// bindings: spawn it from the init package, hand it a serve channel, EMIT two
+	// records and QUERY them back. The wire is the proto framing - request
+	// [op u16][corr u32][args], reply [corr u32][result] - and the proto Entry
+	// encoding is byte-for-byte the abi::log record, so we build entries with
+	// log::encode and frame them by hand. Everything is pre-queued so the
+	// cooperative service drains it in one pass and exits, after which we read its
+	// replies (the kernel-as-client pattern).
 	let init = init_package_bytes().expect("init package module not found");
 	let package = pkg::Package::parse(init).expect("init package parses");
 	let service_elf = package.lookup(b"log_service").expect("log_service in the init package");
@@ -1866,42 +1869,48 @@ fn log_service_ingests_queries_and_renders() {
 	let server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
 	boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![server_cap], 0)).expect("serve bootstrap");
 
-	// helper: build and send an EMIT for one record
-	let emit = |ts: u64, severity: Severity, source: &[u8], fields: &[(&[u8], &[u8])]| {
+	// EMIT one record: [op = 1 (emit) u16][corr u32][entry bytes].
+	let emit = |corr: u32, ts: u64, severity: Severity, source: &[u8], fields: &[(&[u8], &[u8])]| {
 		let mut wire = [0u8; 128];
-		let n = log::encode(ts, severity, source, fields, &mut wire).expect("encode record");
-		let mut msg = alloc::vec::Vec::with_capacity(1 + n);
-		msg.push(log::OP_EMIT);
+		let n = log::encode(ts, severity, source, fields, &mut wire).expect("encode entry");
+		let mut msg = alloc::vec::Vec::new();
+		msg.extend_from_slice(&1u16.to_le_bytes());
+		msg.extend_from_slice(&corr.to_le_bytes());
 		msg.extend_from_slice(&wire[..n]);
 		service_client.send(Message::new(msg, alloc::vec::Vec::new(), 0)).expect("emit");
 	};
-	emit(10, Severity::Info, b"storage_service", &[(b"event" as &[u8], b"online" as &[u8])]);
-	emit(11, Severity::Error, b"device_manager", &[(b"code" as &[u8], b"5" as &[u8])]);
+	emit(1, 10, Severity::Info, b"storage_service", &[(b"event" as &[u8], b"online" as &[u8])]);
+	emit(2, 11, Severity::Error, b"device_manager", &[(b"code" as &[u8], b"5" as &[u8])]);
 
-	// queries: all severities in each representation, then a filtered text query
-	let query = |format: u8, min: Severity| {
-		service_client.send(Message::new(alloc::vec![log::OP_QUERY, format, min as u8], alloc::vec::Vec::new(), 0)).expect("query");
-	};
-	query(log::FORMAT_TEXT, Severity::Trace);
-	query(log::FORMAT_JSON, Severity::Trace);
-	query(log::FORMAT_CBOR, Severity::Trace);
-	query(log::FORMAT_TEXT, Severity::Error);
+	// QUERY all severities: [op = 2 (query) u16][corr u32][query bytes]. The query
+	// record is since:option<u64> min-severity:option<severity> source:option<string>
+	// limit:u32; all-absent with limit 0 is seven zero bytes.
+	let mut q = alloc::vec::Vec::new();
+	q.extend_from_slice(&2u16.to_le_bytes());
+	q.extend_from_slice(&7u32.to_le_bytes());
+	q.extend_from_slice(&[0u8; 7]);
+	service_client.send(Message::new(q, alloc::vec::Vec::new(), 0)).expect("query");
 	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
 
 	sched::run_until_idle();
 
-	// text: both records, one per line
-	let text = service_client.recv().expect("text reply");
-	assert_eq!(&text.bytes[..], b"[10] INFO storage_service: event=online\n[11] ERROR device_manager: code=5\n");
-	// JSON: an array of two objects
-	let json = service_client.recv().expect("json reply");
-	assert_eq!(&json.bytes[..], br#"[{"ts":10,"severity":"INFO","source":"storage_service","fields":{"event":"online"}},{"ts":11,"severity":"ERROR","source":"device_manager","fields":{"code":"5"}}]"#);
-	// CBOR: an array of two records
-	let cbor = service_client.recv().expect("cbor reply");
-	assert_eq!(cbor.bytes[0], 0x82, "CBOR reply is an array of two records");
-	// filtered: only Error and above -> just the device_manager record
-	let filtered = service_client.recv().expect("filtered reply");
-	assert_eq!(&filtered.bytes[..], b"[11] ERROR device_manager: code=5\n");
+	// Each emit is a round-trip replying result<unit, error> = [corr u32][ok u8 = 1].
+	for corr in [1u32, 2] {
+		let reply = service_client.recv().expect("emit reply");
+		assert_eq!(reply.bytes.len(), 5, "emit reply is corr + ok");
+		assert_eq!(u32::from_le_bytes(reply.bytes[0..4].try_into().unwrap()), corr, "emit reply echoes the correlation id");
+		assert_eq!(reply.bytes[4], 1, "emit succeeded");
+	}
+
+	// The query reply is [corr u32 = 7][ok u8 = 1][count u16 = 2][entry][entry].
+	let reply = service_client.recv().expect("query reply");
+	let b = &reply.bytes;
+	assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 7, "query reply echoes the correlation id");
+	assert_eq!(b[4], 1, "query succeeded");
+	assert_eq!(u16::from_le_bytes(b[5..7].try_into().unwrap()), 2, "both records came back");
+	// spot-check both entries are present in the structured reply
+	assert!(b.windows(b"storage_service".len()).any(|w: &[u8]| w == b"storage_service"), "first entry present");
+	assert!(b.windows(b"device_manager".len()).any(|w: &[u8]| w == b"device_manager"), "second entry present");
 }
 
 #[cfg(test)]

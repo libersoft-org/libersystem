@@ -16,7 +16,11 @@
 #![no_std]
 #![no_main]
 
-use rt::log::{self, Severity};
+extern crate alloc;
+
+use alloc::string::String;
+use proto::system::log;
+use proto::system::{Entry, Field, Severity};
 use rt::*;
 
 // A service in the boot manifest: its package entry name and the names of the
@@ -115,7 +119,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	if let Some(dev) = index_of(b"device_manager") {
 		if state[dev] == State::Running {
 			state[dev] = unsafe { stop_service(channels[dev], bootstrap, &mut buf) };
-			unsafe { emit_event(log_client, b"device_manager", b"stopped", &mut buf) };
+			unsafe { emit_event(log_client, b"device_manager", b"stopped") };
 		}
 	}
 
@@ -213,7 +217,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, r
 				send_blocking(up, &buf[..len], 0);
 				*control = manager_side;
 				// Record the lifecycle event in the journal (LogService is up by now).
-				emit_event(*log_client, name, b"online", buf);
+				emit_event(*log_client, name, b"online");
 				State::Running
 			}
 			Received::Closed => State::Failed,
@@ -221,29 +225,40 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, r
 	}
 }
 
-// Emit one structured LogRecord to LogService over the `log_client` channel: an
-// Info record tagged with the service `source` and an `event` field (e.g.
+// A proto Transport over an rt channel: send the request, then block for the
+// reply. The generated clients call through this to reach a service.
+struct ChannelTransport {
+	chan: u64,
+}
+
+impl proto::codec::Transport for ChannelTransport {
+	fn call(&mut self, request: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+		unsafe {
+			if !send_blocking(self.chan, request, 0) {
+				return None;
+			}
+			let mut reply: [u8; 4096] = [0u8; 4096];
+			match recv_blocking(self.chan, &mut reply) {
+				Received::Message { len, .. } => Some(reply[..len].to_vec()),
+				Received::Closed => None,
+			}
+		}
+	}
+}
+
+// Emit one structured Entry to LogService over the `log_client` channel: an Info
+// record tagged with the service `source` and an `event` field (e.g.
 // "online"/"stopped"). A no-op until LogService is up (log_client == 0). The
 // supervisor logs service lifecycle the way systemd journals unit start/stop.
-unsafe fn emit_event(log_client: u64, source: &[u8], event: &[u8], buf: &mut [u8]) {
-	unsafe {
-		if log_client == 0 {
-			return;
-		}
-		let mut wire: [u8; 160] = [0u8; 160];
-		let fields: [(&[u8], &[u8]); 1] = [(b"event", event)];
-		let n: usize = match log::encode(clock(), Severity::Info, source, &fields, &mut wire) {
-			Some(n) => n,
-			None => return,
-		};
-		// EMIT request: [OP_EMIT][record wire bytes].
-		if 1 + n > buf.len() {
-			return;
-		}
-		buf[0] = log::OP_EMIT;
-		buf[1..1 + n].copy_from_slice(&wire[..n]);
-		send_blocking(log_client, &buf[..1 + n], 0);
+unsafe fn emit_event(log_client: u64, source: &[u8], event: &[u8]) {
+	if log_client == 0 {
+		return;
 	}
+	let entry = Entry { timestamp: unsafe { clock() }, severity: Severity::Info, source: String::from_utf8_lossy(source).into_owned(), fields: alloc::vec![Field { key: String::from("event"), value: String::from_utf8_lossy(event).into_owned() }] };
+	// Emit the record through the generated Log client (a round-trip over the log
+	// channel); best-effort, so the result is ignored.
+	let mut client = log::Client::new(ChannelTransport { chan: log_client });
+	let _ = client.emit(&entry);
 }
 
 // Stop a running service over its control channel: send the "STOP" sentinel, then

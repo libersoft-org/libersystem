@@ -11,7 +11,10 @@
 #![no_std]
 #![no_main]
 
-use rt::log::{FORMAT_JSON, FORMAT_TEXT, OP_QUERY, Severity};
+extern crate alloc;
+
+use proto::system::Query;
+use proto::system::log;
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -130,11 +133,11 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, work: &mut [u8]) -> b
 			return false;
 		}
 		if line == b"log" {
-			query_log(logsvc, FORMAT_TEXT);
+			query_log(logsvc, false);
 			return false;
 		}
 		if line == b"log json" {
-			query_log(logsvc, FORMAT_JSON);
+			query_log(logsvc, true);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
@@ -158,24 +161,56 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, work: &mut [u8]) -> b
 	}
 }
 
-// Query LogService for the journal and print it, rendered in `format` (text or
-// JSON). The query asks for all severities (Trace and above).
-unsafe fn query_log(logsvc: u64, format: u8) {
-	unsafe {
-		let request: [u8; 3] = [OP_QUERY, format, Severity::Trace as u8];
-		if !send_blocking(logsvc, &request, 0) {
-			print(b"log: query failed\n");
-			return;
+// A proto Transport over an rt channel: send the request, then block for the
+// reply. The generated Log client calls through this to reach LogService.
+struct ChannelTransport {
+	chan: u64,
+}
+
+impl proto::codec::Transport for ChannelTransport {
+	fn call(&mut self, request: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+		unsafe {
+			if !send_blocking(self.chan, request, 0) {
+				return None;
+			}
+			let mut reply: [u8; 4096] = [0u8; 4096];
+			match recv_blocking(self.chan, &mut reply) {
+				Received::Message { len, .. } => Some(reply[..len].to_vec()),
+				Received::Closed => None,
+			}
 		}
-		let mut reply: [u8; 1024] = [0u8; 1024];
-		match recv_blocking(logsvc, &mut reply) {
-			Received::Message { len, .. } => {
-				print(&reply[..len]);
-				if len == 0 || reply[len - 1] != b'\n' {
-					print(b"\n");
+	}
+}
+
+// Query LogService for the journal over the generated Log client and print it,
+// rendering each returned entry to text or JSON on the client side. The query
+// asks for all severities (no minimum) and no limit.
+unsafe fn query_log(logsvc: u64, json: bool) {
+	unsafe {
+		let q = Query { since: None, min_severity: None, source: None, limit: 0 };
+		let mut client = log::Client::new(ChannelTransport { chan: logsvc });
+		match client.query(&q) {
+			Some(Ok(entries)) => {
+				if json {
+					print(b"[");
+					let mut first = true;
+					for entry in &entries {
+						if !first {
+							print(b",");
+						}
+						first = false;
+						print(entry.to_json().as_bytes());
+					}
+					print(b"]\n");
+				} else {
+					for entry in &entries {
+						print(entry.to_text().as_bytes());
+						print(b"\n");
+					}
 				}
 			}
-			Received::Closed => print(b"log: service unavailable\n"),
+			Some(Err(_)) => print(b"log: query error\n"),
+			None => print(b"log: service unavailable\n"),
 		}
 	}
 }

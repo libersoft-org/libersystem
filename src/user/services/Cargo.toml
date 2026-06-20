@@ -28,5 +28,9 @@ path = "src/shell.rs"
 # the syscall/IPC/volume helpers); it re-exports the abi constants.
 rt = { path = "../rt" }
 
+# Generated LSIDL bindings (the proto codec, clients, and servers) - LogService
+# serves them and the shell + ServiceManager speak them over the log channel.
+proto = { path = "../../proto" }
+
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).
