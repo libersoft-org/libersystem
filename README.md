@@ -3,6 +3,7 @@
 ## Table of contents
 
 - [**About**](#about)
+- [**Documentation**](#documentation)
 - [**Installation**](#installation)
 - [**License**](#license)
 - [**Contribution**](#contribution)
@@ -16,6 +17,11 @@
 The kernel is a small, safe arbiter; system services and drivers run as isolated, restartable components that talk to each other over stable, typed contracts. Security is capability-based and least-privilege by construction, the system is SMP-aware from the ground up, and memory safety comes from the Rust language itself rather than from discipline.
 
 This is an early-stage project under active development. The kernel bring-up MVP (phase 0) is complete - see [**Project status**](#project-status) - but LiberSystem is not yet a general-purpose OS you can install and use.
+
+## Documentation
+
+- [**Concept**](./docs/CONCEPT_EN.md) - the design document: object and capability model, IPC, services, and the roadmap.
+- [**LSIDL**](./docs/LSIDL.md) - the LiberSystem Interface Definition Language: the language services are described in, from which the wire codec, clients, servers, and docs are generated.
 
 ## Installation
 
