@@ -22,7 +22,7 @@ extern crate alloc;
 use alloc::string::String;
 use proto::codec::Transport;
 use proto::system::picker::{self, Service};
-use proto::system::{Error, OpenOpts, Picked, volume};
+use proto::system::{volume, Error, OpenOpts, Picked};
 use rt::*;
 
 // The file the picker grants. Phase 1 stands in for the user's choice with a fixed
