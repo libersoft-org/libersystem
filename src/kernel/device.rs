@@ -24,6 +24,9 @@ pub struct DeviceEntry {
 	pub notify_multiplier: u32,
 	pub isr_offset: u32,
 	pub device_offset: u32,
+	// The device's interrupt line (the GSI its INTx pin is routed to), so a driver
+	// can acquire an Interrupt the kernel routes through the I/O APIC.
+	pub irq: u8,
 }
 
 static DEVICES: SpinLock<Vec<DeviceEntry>> = SpinLock::new(Vec::new());
@@ -33,7 +36,7 @@ pub fn init() {
 	let mut table = DEVICES.lock();
 	table.clear();
 	for v in crate::arch::pci::scan_virtio() {
-		table.push(DeviceEntry { virtio_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.offset });
+		table.push(DeviceEntry { virtio_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.offset, irq: v.pci.irq_line });
 	}
 }
 

@@ -330,6 +330,22 @@ pub unsafe fn device_acquire(index: u64) -> i64 {
 	unsafe { syscall(SYS_DEVICE_ACQUIRE, index, 0, 0, 0) as i64 }
 }
 
+// Acquire an Interrupt capability for device `index`'s IRQ: the kernel routes the
+// device's GSI through the I/O APIC to a CPU vector and binds an Interrupt to it.
+// Returns the Interrupt handle, or a negative error. The driver `wait`s on the
+// handle for its device, then `interrupt_ack`s to re-arm for the next interrupt.
+pub unsafe fn device_interrupt_acquire(index: u64) -> i64 {
+	unsafe { syscall(SYS_DEVICE_INTERRUPT_ACQUIRE, index, 0, 0, 0) as i64 }
+}
+
+// Acknowledge a serviced device interrupt, re-arming its source so the next `wait`
+// on the Interrupt handle blocks until the device interrupts again.
+pub unsafe fn interrupt_ack(handle: u64) {
+	unsafe {
+		syscall(SYS_INTERRUPT_ACK, handle, 0, 0, 0);
+	}
+}
+
 // Allocate a DmaBuffer of `size` bytes (pinned DMA memory charged to our Domain),
 // returning its handle, or a negative error.
 pub unsafe fn dma_buffer_create(size: u64) -> i64 {

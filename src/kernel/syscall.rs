@@ -44,7 +44,7 @@ use crate::sched;
 // kernel/userspace ABI: defined once in the abi crate (the single source of
 // truth) and re-exported here so the rest of the kernel keeps referring to them
 // as `syscall::SYS_*` / `syscall::ERR_*` / `syscall::sys_is_err`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CONSOLE_ATTACH, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_RANDOM_GET, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CONSOLE_ATTACH, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_INTERRUPT_ACQUIRE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_RANDOM_GET, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
 
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. Defined in `abi` (the
@@ -149,6 +149,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_DEVICE_MEMORY_MAP => sys_device_memory_map(a0),
 		SYS_RANDOM_GET => sys_random_get(a0, a1),
 		SYS_INTERRUPT_BIND => sys_interrupt_bind(a0),
+		SYS_DEVICE_INTERRUPT_ACQUIRE => sys_device_interrupt_acquire(a0),
+		SYS_INTERRUPT_ACK => sys_interrupt_ack(a0),
 		SYS_OBJECT_PROPERTY_SET => sys_object_property_set(a0, a1, a2, a3),
 		SYS_PROCESS_CREATE => sys_process_create(),
 		SYS_PROCESS_LOAD => sys_process_load(a0, a1, a2),
@@ -348,6 +350,44 @@ fn sys_interrupt_bind(vector: u64) -> i64 {
 	// On a failed install the Interrupt is dropped here, and its Drop unbinds the
 	// vector, so no explicit rollback is needed.
 	install_object(&thread, interrupt, Rights::ALL, 0)
+}
+
+// Acquire an Interrupt for the discovered device at `index`: route its IRQ (the GSI
+// its INTx pin uses) through the I/O APIC to a free device vector, mint an Interrupt
+// bound to that vector, and install a handle. The driver waits on the handle for its
+// device and acks each interrupt (interrupt_ack) to re-arm. ERR_INVALID for an
+// out-of-range index or a device with no usable IRQ.
+fn sys_device_interrupt_acquire(index: u64) -> i64 {
+	let thread = current_thread!();
+	let gsi = match device::with(index as usize, |d| d.irq) {
+		Some(irq) if irq != 0 => irq as u32,
+		_ => return ERR_INVALID,
+	};
+	let dest = arch::percpu::this_cpu().lapic_id() as u8;
+	let vector = match arch::interrupts::acquire(gsi, dest) {
+		Some(v) => v,
+		None => return ERR_RESOURCE_EXHAUSTED,
+	};
+	let interrupt = Interrupt::new(vector);
+	if !arch::interrupts::bind(vector, &interrupt) {
+		// The vector raced to another binder; release the routing we reserved.
+		arch::interrupts::unbind(vector);
+		return ERR_RESOURCE_EXHAUSTED;
+	}
+	install_object(&thread, interrupt, Rights::ALL, 0)
+}
+
+// Acknowledge a serviced interrupt: clear the Interrupt's pending flag and re-arm
+// its device source (unmask the GSI), so the driver's next `wait` blocks until the
+// device interrupts again. Requires the WRITE right on the Interrupt handle.
+fn sys_interrupt_ack(handle: u64) -> i64 {
+	let interrupt = match current_typed::<Interrupt>(handle, ObjectType::Interrupt, Rights::WRITE) {
+		Ok(i) => i,
+		Err(e) => return e,
+	};
+	interrupt.clear();
+	arch::interrupts::ack(interrupt.vector());
+	0
 }
 
 // Set a property on an object: a human-readable name (PROP_NAME; a2 = name

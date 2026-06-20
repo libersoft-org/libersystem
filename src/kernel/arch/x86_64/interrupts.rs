@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use alloc::sync::{Arc, Weak};
 
@@ -36,6 +36,12 @@ static HANDLERS: [AtomicUsize; IRQ_COUNT] = [const { AtomicUsize::new(0) }; IRQ_
 // the binding and the kernel stops delivering to a gone driver.
 static BOUND: [SpinLock<Option<Weak<Interrupt>>>; IRQ_COUNT] = [const { SpinLock::new(None) }; IRQ_COUNT];
 
+// The GSI routed to each device-IRQ vector (NO_GSI = none). Tracked so the kernel
+// can mask the source on delivery (until the driver acks, so a level-triggered
+// device cannot re-storm) and on release (a gone driver's device falls silent).
+const NO_GSI: u32 = u32::MAX;
+static ROUTED_GSI: [AtomicU32; IRQ_COUNT] = [const { AtomicU32::new(NO_GSI) }; IRQ_COUNT];
+
 // Whether `vector` is a device-IRQ vector a driver may bind. The timer vector
 // (IRQ_BASE) is the kernel's own and is never handed out.
 pub fn is_bindable(vector: u8) -> bool {
@@ -60,6 +66,44 @@ pub fn unbind(vector: u8) {
 	let index = vector.wrapping_sub(IRQ_BASE) as usize;
 	if index < IRQ_COUNT {
 		*BOUND[index].lock() = None;
+		// If this vector routed a device GSI, mask the source so the gone driver's
+		// device cannot keep interrupting, and free the slot.
+		let gsi = ROUTED_GSI[index].swap(NO_GSI, Ordering::AcqRel);
+		if gsi != NO_GSI {
+			super::ioapic::mask(gsi);
+		}
+	}
+}
+
+// Route a device's `gsi` to a free device-IRQ vector delivered to LAPIC `dest`, and
+// return that vector (None if every slot is taken). The vector lands in the
+// IRQ_BASE.. window the IDT stubs cover; PCI INTx is level-triggered active-low.
+pub fn acquire(gsi: u32, dest: u8) -> Option<u8> {
+	for index in 1..IRQ_COUNT {
+		if BOUND[index].lock().as_ref().and_then(Weak::upgrade).is_some() {
+			continue;
+		}
+		// Reserve this slot's GSI atomically; skip it if another acquire took it first.
+		if ROUTED_GSI[index].compare_exchange(NO_GSI, gsi, Ordering::AcqRel, Ordering::Acquire).is_err() {
+			continue;
+		}
+		let vector = IRQ_BASE + index as u8;
+		super::ioapic::route(gsi, vector, dest, true);
+		return Some(vector);
+	}
+	None
+}
+
+// Re-arm a device vector after its driver has serviced the interrupt: unmask its
+// GSI so the device can interrupt again (a no-op for a vector with no routed GSI).
+pub fn ack(vector: u8) {
+	let index = vector.wrapping_sub(IRQ_BASE) as usize;
+	if index >= IRQ_COUNT {
+		return;
+	}
+	let gsi = ROUTED_GSI[index].load(Ordering::Acquire);
+	if gsi != NO_GSI {
+		super::ioapic::unmask(gsi);
 	}
 }
 
@@ -89,6 +133,12 @@ fn dispatch(vector: u8) {
 	}
 	// Deliver to a userspace driver bound to this vector, if any.
 	if let Some(intr) = BOUND[index].lock().as_ref().and_then(Weak::upgrade) {
+		// Mask a routed device source until the driver acks, so a level-triggered
+		// device cannot re-storm before its driver has serviced it.
+		let gsi = ROUTED_GSI[index].load(Ordering::Acquire);
+		if gsi != NO_GSI {
+			super::ioapic::mask(gsi);
+		}
 		intr.signal();
 	}
 	apic::eoi();

@@ -56,6 +56,10 @@ pub const SYS_DEVICE_INFO: u64 = 35;
 pub const SYS_DEVICE_ACQUIRE: u64 = 36;
 pub const SYS_DMA_BUFFER_MAP: u64 = 37;
 pub const SYS_DMA_BUFFER_PHYS: u64 = 38;
+// Acquire an Interrupt capability for a discovered device's IRQ (the kernel routes
+// its GSI through the I/O APIC), and acknowledge/re-arm a serviced interrupt.
+pub const SYS_DEVICE_INTERRUPT_ACQUIRE: u64 = 39;
+pub const SYS_INTERRUPT_ACK: u64 = 40;
 
 // The ring-3 stack top an ELF-loaded process runs on: the kernel's loader maps a
 // stack just below this address, and a userspace spawner passes it to

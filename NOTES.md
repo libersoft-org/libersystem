@@ -1,3 +1,4 @@
+- Where are poweroff / reboot commands - they disappeared
 - Console doesn't react on keyboard, only debug does
 - List the available volumes "ls" - change to "lsvol"?
 - Optimize the code

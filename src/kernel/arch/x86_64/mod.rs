@@ -3,6 +3,7 @@ pub mod context;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
+pub mod ioapic;
 pub mod msr;
 pub mod paging;
 pub mod pci;
@@ -31,6 +32,7 @@ pub fn init() {
 pub fn init_interrupts() {
 	interrupts::init();
 	apic::init();
+	ioapic::init();
 }
 
 // Enable the fast `syscall` instruction on the current core (per-core MSRs).
