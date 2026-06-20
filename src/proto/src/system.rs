@@ -362,6 +362,11 @@ impl Error {
 		self.to_json_into(&mut s);
 		s
 	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		match self {
 			Error::Denied => out.push_str("\"denied\""),
@@ -371,12 +376,26 @@ impl Error {
 			Error::Closed => out.push_str("\"closed\""),
 		}
 	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			Error::Denied => out.push_str("denied"),
+			Error::NotFound => out.push_str("not-found"),
+			Error::Invalid => out.push_str("invalid"),
+			Error::Again => out.push_str("again"),
+			Error::Closed => out.push_str("closed"),
+		}
+	}
 }
 
 impl Severity {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
 		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
 		s
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
@@ -389,12 +408,27 @@ impl Severity {
 			Severity::Fatal => out.push_str("\"fatal\""),
 		}
 	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			Severity::Trace => out.push_str("trace"),
+			Severity::Debug => out.push_str("debug"),
+			Severity::Info => out.push_str("info"),
+			Severity::Warn => out.push_str("warn"),
+			Severity::Error => out.push_str("error"),
+			Severity::Fatal => out.push_str("fatal"),
+		}
+	}
 }
 
 impl Field {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
 		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
 		s
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
@@ -406,12 +440,26 @@ impl Field {
 		crate::codec::json_escape(&self.value, out);
 		out.push('}');
 	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("key=");
+		out.push_str(&self.key);
+		out.push_str(", ");
+		out.push_str("value=");
+		out.push_str(&self.value);
+		out.push('}');
+	}
 }
 
 impl Entry {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
 		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
 		s
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
@@ -438,6 +486,30 @@ impl Entry {
 		out.push(']');
 		out.push('}');
 	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("timestamp=");
+		let _ = write!(out, "{}", self.timestamp);
+		out.push_str(", ");
+		out.push_str("severity=");
+		self.severity.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("source=");
+		out.push_str(&self.source);
+		out.push_str(", ");
+		out.push_str("fields=");
+		out.push('[');
+		let mut v16 = true;
+		for v15 in self.fields.iter() {
+			if !v16 {
+				out.push_str(", ");
+			}
+			v16 = false;
+			v15.to_text_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
 }
 
 impl Query {
@@ -446,12 +518,17 @@ impl Query {
 		self.to_json_into(&mut s);
 		s
 	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v15) => {
-				let _ = write!(out, "{}", v15);
+			Some(v17) => {
+				let _ = write!(out, "{}", v17);
 			}
 			None => {
 				out.push_str("null");
@@ -460,8 +537,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v16) => {
-				v16.to_json_into(out);
+			Some(v18) => {
+				v18.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -470,8 +547,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v17) => {
-				crate::codec::json_escape(v17, out);
+			Some(v19) => {
+				crate::codec::json_escape(v19, out);
 			}
 			None => {
 				out.push_str("null");
@@ -479,6 +556,42 @@ impl Query {
 		}
 		out.push(',');
 		out.push_str("\"limit\":");
+		let _ = write!(out, "{}", self.limit);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("since=");
+		match &self.since {
+			Some(v20) => {
+				let _ = write!(out, "{}", v20);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("min-severity=");
+		match &self.min_severity {
+			Some(v21) => {
+				v21.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("source=");
+		match &self.source {
+			Some(v22) => {
+				out.push_str(v22);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("limit=");
 		let _ = write!(out, "{}", self.limit);
 		out.push('}');
 	}

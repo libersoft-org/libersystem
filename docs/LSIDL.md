@@ -573,10 +573,11 @@ canonical bytes, and replies `[ corr u32 ][ is-ok u8 = 1 ]` for
 
 ### 10.4 The same call as other backends
 
-From the one `entry` value the generators also produce:
+From the one `entry` value the generators also produce, via `to_text` and
+`to_json`:
 
 ```text
-CLI : 42 INFO kernel
+CLI : {timestamp=42, severity=info, source=kernel, fields=[]}
 JSON: {"timestamp":42,"severity":"info","source":"kernel","fields":[]}
 ```
 

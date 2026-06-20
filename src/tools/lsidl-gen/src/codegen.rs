@@ -431,6 +431,11 @@ impl Cg {
 		self.line("\t\tself.to_json_into(&mut s);");
 		self.line("\t\ts");
 		self.line("\t}");
+		self.line("\tpub fn to_text(&self) -> String {");
+		self.line("\t\tlet mut s = String::new();");
+		self.line("\t\tself.to_text_into(&mut s);");
+		self.line("\t\ts");
+		self.line("\t}");
 	}
 
 	fn render_record(&mut self, r: &Record) -> Result<(), Error> {
@@ -449,6 +454,18 @@ impl Cg {
 		}
 		self.line("\t\tout.push('}');");
 		self.line("\t}");
+		self.line("\tpub(crate) fn to_text_into(&self, out: &mut String) {");
+		self.line("\t\tout.push('{');");
+		for (idx, f) in r.fields.iter().enumerate() {
+			if idx > 0 {
+				self.line("\t\tout.push_str(\", \");");
+			}
+			self.line(&format!("\t\tout.push_str(\"{}=\");", f.name));
+			let code = self.text_value(&f.ty, &format!("self.{}", field_ident(&f.name)), false).map_err(|m| Error::new(f.span, m))?;
+			self.line(&format!("\t\t{code}"));
+		}
+		self.line("\t\tout.push('}');");
+		self.line("\t}");
 		self.line("}");
 		self.line("");
 		Ok(())
@@ -462,6 +479,13 @@ impl Cg {
 		self.line("\t\tmatch self {");
 		for c in &e.cases {
 			self.line(&format!("\t\t\t{ty}::{} => out.push_str(\"\\\"{}\\\"\"),", camel(&c.name), c.name));
+		}
+		self.line("\t\t}");
+		self.line("\t}");
+		self.line("\tpub(crate) fn to_text_into(&self, out: &mut String) {");
+		self.line("\t\tmatch self {");
+		for c in &e.cases {
+			self.line(&format!("\t\t\t{ty}::{} => out.push_str(\"{}\"),", camel(&c.name), c.name));
 		}
 		self.line("\t\t}");
 		self.line("\t}");
@@ -487,6 +511,20 @@ impl Cg {
 		}
 		self.line("\t\t}");
 		self.line("\t}");
+		self.line("\tpub(crate) fn to_text_into(&self, out: &mut String) {");
+		self.line("\t\tmatch self {");
+		for c in &v.cases {
+			match &c.payload {
+				Some(p) => {
+					let b = self.fresh();
+					let body = self.text_value(p, &b, true).map_err(|m| Error::new(c.span, m))?;
+					self.line(&format!("\t\t\t{ty}::{}({b}) => {{ out.push_str(\"{}(\"); {body} out.push(')'); }}", camel(&c.name), c.name));
+				}
+				None => self.line(&format!("\t\t\t{ty}::{} => out.push_str(\"{}\"),", camel(&c.name), c.name)),
+			}
+		}
+		self.line("\t\t}");
+		self.line("\t}");
 		self.line("}");
 		self.line("");
 		Ok(())
@@ -503,6 +541,13 @@ impl Cg {
 			self.line(&format!("\t\tif self.0 & Self::{} != 0 {{ if !first {{ out.push(','); }} first = false; out.push_str(\"\\\"{}\\\"\"); }}", screaming(name), name));
 		}
 		self.line("\t\tout.push(']');");
+		self.line("\t}");
+		self.line("\tpub(crate) fn to_text_into(&self, out: &mut String) {");
+		self.line("\t\tlet mut any = false;");
+		for name in &f.flags {
+			self.line(&format!("\t\tif self.0 & Self::{} != 0 {{ if any {{ out.push('|'); }} any = true; out.push_str(\"{}\"); }}", screaming(name), name));
+		}
+		self.line("\t\tif !any { out.push('-'); }");
 		self.line("\t}");
 		self.line("}");
 		self.line("");
@@ -547,6 +592,50 @@ impl Cg {
 				let okb = self.json_value(okty, &vo, true)?;
 				let errb = self.json_value(errty, &ve, true)?;
 				format!("match {refplace} {{ Ok({vo}) => {{ out.push_str(\"{{\\\"ok\\\":\"); {okb} out.push('}}'); }} Err({ve}) => {{ out.push_str(\"{{\\\"err\\\":\"); {errb} out.push('}}'); }} }}")
+			}
+			Type::Handle(_) | Type::Buffer | Type::Stream(_) => return Err("handle, buffer, and stream are not renderable".into()),
+		})
+	}
+
+	// Emit a statement appending the human-readable text of the value at `place`
+	// (`&ty` when `is_ref`, else `ty`) to the in-scope `out: &mut String`.
+	fn text_value(&mut self, ty: &Type, place: &str, is_ref: bool) -> Result<String, String> {
+		let refplace = if is_ref { place.to_string() } else { format!("&{place}") };
+		let boolexpr = if is_ref { format!("*{place}") } else { place.to_string() };
+		Ok(match ty {
+			Type::Bool => format!("if {boolexpr} {{ out.push_str(\"true\"); }} else {{ out.push_str(\"false\"); }}"),
+			Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::F32 | Type::F64 => format!("let _ = write!(out, \"{{}}\", {place});"),
+			Type::String => format!("out.push_str({refplace});"),
+			Type::Unit => String::new(),
+			Type::Named(_) => format!("{place}.to_text_into(out);"),
+			Type::Option(inner) => {
+				let v = self.fresh();
+				let body = self.text_value(inner, &v, true)?;
+				format!("match {refplace} {{ Some({v}) => {{ {body} }} None => {{ out.push('-'); }} }}")
+			}
+			Type::List(inner) => {
+				let v = self.fresh();
+				let first = self.fresh();
+				let body = self.text_value(inner, &v, true)?;
+				format!("out.push('['); let mut {first} = true; for {v} in {place}.iter() {{ if !{first} {{ out.push_str(\", \"); }} {first} = false; {body} }} out.push(']');")
+			}
+			Type::Tuple(elems) => {
+				let binds: Vec<String> = (0..elems.len()).map(|_| self.fresh()).collect();
+				let mut body = String::new();
+				for (idx, (e, b)) in elems.iter().zip(&binds).enumerate() {
+					if idx > 0 {
+						body.push_str("out.push_str(\", \"); ");
+					}
+					let _ = write!(body, "{} ", self.text_value(e, b, true)?);
+				}
+				format!("out.push('('); let ({}) = {refplace}; {body}out.push(')');", binds.join(", "))
+			}
+			Type::Result(okty, errty) => {
+				let vo = self.fresh();
+				let ve = self.fresh();
+				let okb = self.text_value(okty, &vo, true)?;
+				let errb = self.text_value(errty, &ve, true)?;
+				format!("match {refplace} {{ Ok({vo}) => {{ out.push_str(\"ok(\"); {okb} out.push(')'); }} Err({ve}) => {{ out.push_str(\"err(\"); {errb} out.push(')'); }} }}")
 			}
 			Type::Handle(_) | Type::Buffer | Type::Stream(_) => return Err("handle, buffer, and stream are not renderable".into()),
 		})
