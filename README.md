@@ -20,8 +20,8 @@ This is an early-stage project under active development. The kernel bring-up MVP
 
 ## Documentation
 
-- [**Concept**](./docs/CONCEPT_EN.md) - the design document: object and capability model, IPC, services, and the roadmap.
-- [**LSIDL**](./docs/LSIDL.md) - the LiberSystem Interface Definition Language: the language services are described in, from which the wire codec, clients, servers, and docs are generated.
+- [**Concept**](./docs/CONCEPT_EN.md) - the **LiberSystem design document**: object and capability model, IPC, services, and the roadmap.
+- [**LSIDL**](./docs/LSIDL.md) - the **LiberSystem Interface Definition Language**: the language services are described in, from which the wire codec, clients, servers, and docs are generated.
 
 ## Installation
 
