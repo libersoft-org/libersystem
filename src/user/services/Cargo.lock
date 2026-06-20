@@ -23,4 +23,9 @@ version = "0.0.0"
 dependencies = [
  "proto",
  "rt",
+ "wasm",
 ]
+
+[[package]]
+name = "wasm"
+version = "0.0.0"

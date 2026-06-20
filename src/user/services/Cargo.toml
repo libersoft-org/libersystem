@@ -32,6 +32,10 @@ name = "config_service"
 path = "src/config_service.rs"
 
 [[bin]]
+name = "wasi_host"
+path = "src/wasi_host.rs"
+
+[[bin]]
 name = "shell"
 path = "src/shell.rs"
 
@@ -43,6 +47,9 @@ rt = { path = "../rt" }
 # Generated LSIDL bindings (the proto codec, clients, and servers) - LogService
 # serves them and the shell + ServiceManager speak them over the log channel.
 proto = { path = "../../proto" }
+
+# The minimal WebAssembly runtime, used by the wasi_host component runner.
+wasm = { path = "../../wasm" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

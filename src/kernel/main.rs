@@ -195,6 +195,7 @@ fn boot_main() {
 	userspace_fault_demo();
 	domain_lifecycle_demo();
 	storage_demo();
+	wasi_demo();
 	pci_demo();
 	ipc_bench();
 	cli::demo();
@@ -746,6 +747,76 @@ fn storage_demo() {
 			}
 		}
 		Err(reason) => serial_println!("storage: ERROR - {}", reason),
+	}
+}
+
+// Build the M28 WASI topology and run it to completion. A StorageService serves the
+// ramdisk volume; the wasi_host process loads the embedded Wasm component and runs
+// it, and the component's only import (`liber.read`) is wired by the host to read
+// the granted file vol://system/hello.txt through StorageService into the
+// component's linear memory. The component has no other capability - no ambient
+// authority. The host reports the bytes the component read back over its bootstrap
+// channel. The kernel only brokers the initial capabilities. Returns (expected,
+// actual): the file straight from the volume, and the bytes the component read.
+fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
+	use alloc::sync::Arc;
+	use object::KernelObject;
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::memory_object::MemoryObject;
+	use object::rights::Rights;
+
+	let volume = volume_package_bytes().ok_or("volume package module not found")?;
+	let expected = pkg::Package::parse(volume).and_then(|p| p.lookup(b"hello.txt").map(|b| b.to_vec())).ok_or("hello.txt missing from the volume package")?;
+
+	let init = init_package_bytes().ok_or("init package module not found")?;
+	let package = pkg::Package::parse(init).ok_or("init package is malformed")?;
+	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
+	let host_elf = package.lookup(b"wasi_host").ok_or("wasi_host missing from the init package")?;
+
+	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
+	copy_into_object(&ramdisk, volume);
+
+	let (storage_boot_kernel, storage_boot_user) = Channel::create();
+	let (host_boot_kernel, host_boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+
+	let domain = sched::root_domain();
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
+	loader::spawn_elf_process(domain, host_elf, host_boot_user, Rights::ALL, 0).map_err(|_| "failed to load wasi_host")?;
+
+	// storage bootstrap: the ramdisk volume (with its length) and its service channel
+	let mut ramdisk_msg = alloc::vec::Vec::with_capacity(7 + 8);
+	ramdisk_msg.extend_from_slice(b"RAMDISK");
+	ramdisk_msg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
+	let ramdisk_cap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP, 0);
+	storage_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap], 0)).map_err(|_| "service ramdisk bootstrap failed")?;
+	let service_server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
+	storage_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![service_server_cap], 0)).map_err(|_| "service serve bootstrap failed")?;
+
+	// host bootstrap: the StorageService client - the one capability it is granted
+	let service_client_cap = Capability::new(service_client as Arc<dyn KernelObject>, Rights::ALL, 0);
+	host_boot_kernel.send(Message::new(b"STORAGE".to_vec(), alloc::vec![service_client_cap], 0)).map_err(|_| "host storage bootstrap failed")?;
+
+	sched::run_until_idle();
+
+	let result = host_boot_kernel.recv().map_err(|_| "the host reported no result")?;
+	Ok((expected, result.bytes))
+}
+
+// Run the M28 WASI scenario and report whether the Wasm component read the granted
+// file's bytes through a host import on StorageService.
+#[cfg(not(test))]
+fn wasi_demo() {
+	match run_wasi_scenario() {
+		Ok((expected, actual)) => {
+			if actual == expected {
+				serial_println!("wasi: component read \"{}\" from vol://system/hello.txt via a host import on StorageService", core::str::from_utf8(&actual).unwrap_or("<bad>").trim_end());
+			} else {
+				serial_println!("wasi: ERROR - component read {} bytes, expected {}", actual.len(), expected.len());
+			}
+		}
+		Err(reason) => serial_println!("wasi: ERROR - {}", reason),
 	}
 }
 
@@ -2247,6 +2318,22 @@ fn storage_serves_volume_file_to_client() {
 	let (expected, actual) = run_storage_scenario().expect("the storage scenario should run");
 	assert!(!expected.is_empty(), "the volume file should not be empty");
 	assert_eq!(actual, expected);
+}
+
+#[cfg(test)]
+#[test_case]
+fn wasi_host_runs_a_component() {
+	// The wasi_host (a ring-3 process) loads an embedded Wasm component and runs it
+	// on the `wasm` runtime. The component's only import, `liber.read`, is wired by
+	// the host to read the one granted file (vol://system/hello.txt) through
+	// StorageService into the component's linear memory - a WASI-style world: the
+	// component has no other capability and can reach nothing it was not given. The
+	// bytes the component read must equal the file straight from the volume, proving
+	// a Wasm component performed a capability-gated operation via a host import
+	// mapped to a native service.
+	let (expected, actual) = run_wasi_scenario().expect("the wasi scenario should run");
+	assert!(!expected.is_empty(), "the granted file should not be empty");
+	assert_eq!(actual, expected, "the component read the granted file's bytes through the host import");
 }
 
 #[cfg(test)]

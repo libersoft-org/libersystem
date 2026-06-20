@@ -208,6 +208,16 @@ fn rejects_a_non_module() {
 }
 
 #[test]
+fn decodes_a_multibyte_constant() {
+	// i32.const 256 is the two-byte LEB128 0x80 0x02 - exercise multi-byte decoding
+	// (the WASI host's component passes a buffer size this way).
+	let wasm: Vec<u8> = build(&Spec { types: &[(&[], &[I32])], imports: &[], funcs: &[0], mem_pages: 0, exports: &[("run", 0x00, 0)], codes: &[(&[], &[0x41, 0x80, 0x02, 0x0b])] });
+	let m: Module = parse(&wasm).unwrap();
+	let mut inst: Instance = Instance::new(&m);
+	assert_eq!(inst.invoke("run", &[], &mut NoHost).unwrap(), alloc::vec![Value::I32(256)]);
+}
+
+#[test]
 fn rejects_an_unsupported_opcode() {
 	// body: i32.const 0  block(0x02) ... - block is unsupported control flow.
 	let wasm: Vec<u8> = build(&Spec { types: &[(&[], &[I32])], imports: &[], funcs: &[0], mem_pages: 0, exports: &[("run", 0x00, 0)], codes: &[(&[], &[0x41, 0, 0x02, 0x40, 0x0b, 0x0b])] });
