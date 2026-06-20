@@ -48,11 +48,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		};
 
-		// 2. launch the matching driver for each discovered device.
-		launch_drivers(&package, &mut buf);
+		// 2. launch the matching driver for each discovered device. The virtio-blk
+		//    driver hands back a block-read service channel, which we route up to
+		//    ServiceManager (it forwards it to StorageService).
+		let mut block_client: u64 = 0;
+		launch_drivers(&package, &mut buf, &mut block_client);
 
-		// 3. report in once the devices are bound to drivers.
-		send_blocking(bootstrap, b"DeviceManager: online", 0);
+		// 3. report in once the devices are bound to drivers, transferring the block
+		//    service channel up the boot chain.
+		send_blocking(bootstrap, b"DeviceManager: online", block_client);
 
 		// 4. stand until ServiceManager asks us to stop (which also drops the driver
 		//    channels, so the drivers shut down with us), then acknowledge and exit.
@@ -68,7 +72,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // each device's state (online once its driver reports in, failed otherwise) and
 // prints a summary. The driver's "online" report is printed; it does not flow up
 // the boot-chain report channel (which carries only the service lifecycle).
-unsafe fn launch_drivers(package: &Package, buf: &mut [u8]) {
+unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u64) {
 	unsafe {
 		let count: u64 = device_count();
 		let mut state: [u8; MAX_DEVICES] = [STATE_UNKNOWN; MAX_DEVICES];
@@ -89,9 +93,14 @@ unsafe fn launch_drivers(package: &Package, buf: &mut [u8]) {
 					continue;
 				}
 			};
-			// launch the driver, restarting it if it crashes during bring-up.
-			if launch_one(i, &info, elf, driver_name, buf) {
+			// launch the driver, restarting it if it crashes during bring-up. The
+			// block driver's report carries a service channel we route upward.
+			let mut handle: u64 = 0;
+			if launch_one(i, &info, elf, driver_name, buf, &mut handle) {
 				state[idx] = STATE_ONLINE;
+				if driver_name == b"virtio_blk" {
+					*block_client = handle;
+				}
 			}
 			i += 1;
 		}
@@ -106,7 +115,7 @@ unsafe fn launch_drivers(package: &Package, buf: &mut [u8]) {
 // then re-acquires a fresh capability and respawns it, up to a few times - the
 // driver crash/restart cycle. Drivers do not crash in normal operation, so the
 // restart path is dormant on a healthy boot.
-unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], buf: &mut [u8]) -> bool {
+unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], buf: &mut [u8], service_handle: &mut u64) -> bool {
 	unsafe {
 		let info_size: usize = core::mem::size_of::<DeviceInfo>();
 		let mut attempt: u32 = 0;
@@ -127,7 +136,8 @@ unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], 
 				return false;
 			}
 			match recv_blocking(dm_side, buf) {
-				Received::Message { len, .. } => {
+				Received::Message { len, handle } => {
+					*service_handle = handle;
 					print(&buf[..len]);
 					print(b"\n");
 					return true;

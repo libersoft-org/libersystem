@@ -22,6 +22,13 @@ const SECTOR: u32 = 512;
 const BLK_T_IN: u32 = 0; // read (device writes the data buffer)
 const BLK_S_OK: u8 = 0;
 
+// The most sectors served per block-read request (one DMA page).
+const MAX_SECTORS: u32 = 8;
+
+// Block-read reply status codes.
+const STATUS_OK: u32 = 0;
+const STATUS_ERR: u32 = 1;
+
 // Request-buffer layout within one DMA page: a 16-byte header, the 512-byte data
 // sector, then the 1-byte status.
 const HDR_OFF: u64 = 0;
@@ -35,12 +42,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// virtio-blk has a single request queue (queue 0).
 		let queue = device.setup_queue(0);
 		device.driver_ok();
-		let ok = match queue {
-			Some(q) => verify_archive(&q),
-			None => false,
+		let queue: Queue = match queue {
+			Some(q) => q,
+			None => common::online_and_stand(bootstrap, b"driver.virtio-blk: online"),
+		};
+		let ok: bool = verify_archive(&queue);
+		// create the block-read service channel; hand the client end up to
+		// DeviceManager with our report (it routes it on to StorageService), then
+		// serve block reads on the server end until that client closes.
+		let (blk_server, blk_client): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => common::online_and_stand(bootstrap, b"driver.virtio-blk: online"),
 		};
 		let report: &[u8] = if ok { b"driver.virtio-blk: online (volume archive on disk)" } else { b"driver.virtio-blk: online" };
-		common::online_and_stand(bootstrap, report)
+		send_blocking(bootstrap, report, blk_client);
+		serve_blocks(&queue, blk_server)
 	}
 }
 
@@ -87,5 +103,88 @@ unsafe fn request(queue: &Queue, virt: u64, phys: u64, lba: u64, kind: u32, data
 		((virt + STATUS_OFF) as *mut u8).write_volatile(0xff); // status sentinel
 		let bufs: [(u64, u32, bool); 3] = [(phys + HDR_OFF, 16, false), (phys + DATA_OFF, SECTOR, data_is_written), (phys + STATUS_OFF, 1, true)];
 		queue.submit(&bufs).is_some() && ((virt + STATUS_OFF) as *const u8).read_volatile() == BLK_S_OK
+	}
+}
+
+// Serve block-read requests on `blk_server` until the client closes its end. Each
+// request is [lba u64][count u32] (count clamped to one DMA page = 8 sectors); the
+// reply is [status u32] carrying, on success, a MemoryObject capability to a freshly
+// filled buffer of count*512 bytes - the sectors read off the disk. The data crosses
+// as a shared buffer handle, never copied through the channel.
+unsafe fn serve_blocks(queue: &Queue, blk_server: u64) -> ! {
+	unsafe {
+		// one reusable DMA buffer the device reads each sector into.
+		let dma: i64 = dma_buffer_create(4096);
+		if dma < 0 {
+			exit();
+		}
+		let virt: i64 = dma_buffer_map(dma as u64);
+		if sys_is_err(virt as u64) {
+			exit();
+		}
+		let virt: u64 = virt as u64;
+		let phys: u64 = dma_buffer_phys(dma as u64);
+		let mut req: [u8; 16] = [0u8; 16];
+		loop {
+			match recv_blocking(blk_server, &mut req) {
+				Received::Message { len, .. } if len >= 12 => {
+					let lba: u64 = u64::from_le_bytes([req[0], req[1], req[2], req[3], req[4], req[5], req[6], req[7]]);
+					let count: u32 = u32::from_le_bytes([req[8], req[9], req[10], req[11]]).clamp(1, MAX_SECTORS);
+					serve_one(queue, blk_server, virt, phys, lba, count);
+				}
+				_ => exit(),
+			}
+		}
+	}
+}
+
+// Read `count` sectors starting at `lba` into a fresh shared buffer and hand it to
+// the client, or reply with an error status and no buffer on any failure.
+unsafe fn serve_one(queue: &Queue, blk_server: u64, virt: u64, phys: u64, lba: u64, count: u32) {
+	unsafe {
+		let bytes: u64 = count as u64 * SECTOR as u64;
+		let obj: u64 = syscall(SYS_MEMORY_OBJECT_CREATE, bytes, 0, 0, 0);
+		if sys_is_err(obj) {
+			reply_block(blk_server, STATUS_ERR, 0);
+			return;
+		}
+		let dst: u64 = syscall(SYS_MEMORY_MAP, obj, 0, 0, 0);
+		if sys_is_err(dst) {
+			syscall(SYS_HANDLE_CLOSE, obj, 0, 0, 0);
+			reply_block(blk_server, STATUS_ERR, 0);
+			return;
+		}
+		// read each sector into the DMA buffer, then copy it into the shared buffer.
+		let mut s: u32 = 0;
+		let mut ok: bool = true;
+		while s < count {
+			if !request(queue, virt, phys, lba + s as u64, BLK_T_IN, true) {
+				ok = false;
+				break;
+			}
+			core::ptr::copy_nonoverlapping((virt + DATA_OFF) as *const u8, (dst + s as u64 * SECTOR as u64) as *mut u8, SECTOR as usize);
+			s += 1;
+		}
+		syscall(SYS_MEMORY_UNMAP, obj, 0, 0, 0);
+		if !ok {
+			syscall(SYS_HANDLE_CLOSE, obj, 0, 0, 0);
+			reply_block(blk_server, STATUS_ERR, 0);
+			return;
+		}
+		// attenuate to read+map plus the transfer right, then hand the buffer over.
+		let granted: i64 = duplicate(obj, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+		syscall(SYS_HANDLE_CLOSE, obj, 0, 0, 0);
+		if granted < 0 {
+			reply_block(blk_server, STATUS_ERR, 0);
+			return;
+		}
+		reply_block(blk_server, STATUS_OK, granted as u64);
+	}
+}
+
+// Send a block-read reply: [status u32 LE] carrying the handle `xfer` (0 = none).
+unsafe fn reply_block(blk_server: u64, status: u32, xfer: u64) {
+	unsafe {
+		send_blocking(blk_server, &status.to_le_bytes(), xfer);
 	}
 }

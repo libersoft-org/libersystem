@@ -40,7 +40,7 @@ const N: usize = 4;
 // start LogService first. This proves the ordering is driven by declared
 // dependencies, not by manifest position. The shell is the last component up: it
 // depends on StorageService, which it talks to over IPC.
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service"] }, Service { name: b"shell", deps: &[b"storage_service"] }, Service { name: b"log_service", deps: &[] }];
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service"] }, Service { name: b"log_service", deps: &[] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -78,12 +78,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		None => exit(),
 	};
 
-	// 1b. receive the ramdisk volume buffer to hand to StorageService when it starts.
-	let (ramdisk_handle, ramdisk_len): (u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"RAMDISK" => {
-			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
-			(handle, length)
-		}
+	// 1b. receive (and release) the legacy ramdisk volume buffer. StorageService now
+	//     reads its volume from the virtio-blk disk over the block service channel
+	//     routed up from DeviceManager, so the embedded ramdisk is no longer used in
+	//     the boot path; we drop the capability rather than delegate it. (The kernel's
+	//     direct StorageService test still drives the older RAMDISK bootstrap mode.)
+	match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"RAMDISK" => unsafe {
+			syscall(SYS_HANDLE_CLOSE, handle, 0, 0, 0);
+		},
 		_ => exit(),
 	};
 
@@ -95,13 +98,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut state: [State; N] = [State::Pending; N];
 	let mut channels: [u64; N] = [0u64; N];
 	let mut storage_client: u64 = 0;
+	let mut block_client: u64 = 0;
 	let mut log_client: u64 = 0;
 	loop {
 		let mut progress: bool = false;
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
-				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, ramdisk_handle, ramdisk_len, pkg_handle, pkg_len, &mut storage_client, &mut log_client, &mut channels[i], &mut buf) };
+				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut storage_client, &mut log_client, &mut channels[i], &mut buf) };
 				progress = true;
 			}
 			i += 1;
@@ -180,12 +184,12 @@ fn index_of(name: &[u8]) -> Option<usize> {
 //
 // Three services are bootstrapped specially before they report in: LogService is
 // handed the channel its clients reach it on (we keep the client end in
-// `*log_client`); StorageService needs the ramdisk volume and a service channel
-// (we keep the client end in `*storage_client`); the shell needs both client
-// channels - the StorageService one so its `cat` round-trips, the LogService one so
-// its `log` command can query the journal. Once a service reports in, the
-// supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, ramdisk_len: usize, pkg_handle: u64, pkg_len: usize, storage_client: &mut u64, log_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+// `*log_client`); StorageService needs the disk-backed block service channel and a
+// service channel (we keep the client end in `*storage_client`); the shell needs
+// both client channels - the StorageService one so its `cat` round-trips, the
+// LogService one so its `log` command can query the journal. Once a service reports
+// in, the supervisor records a structured "online" event in the journal.
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, storage_client: &mut u64, log_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -204,14 +208,19 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, ramdisk: u64, r
 		if name == b"device_manager" && !bootstrap_device(manager_side, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
-		if name == b"storage_service" && !bootstrap_storage(manager_side, ramdisk, ramdisk_len, storage_client, buf) {
+		if name == b"storage_service" && !bootstrap_storage(manager_side, *block_client, storage_client) {
 			return State::Failed;
 		}
 		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
-			Received::Message { len, .. } => {
+			Received::Message { len, handle } => {
+				// DeviceManager hands its block-read service channel up with its report;
+				// keep it so StorageService can be bootstrapped against the disk.
+				if name == b"device_manager" {
+					*block_client = handle;
+				}
 				// Relay the service's own report up to SystemManager, in start order, and
 				// keep its report channel as the control channel used to stop it later.
 				send_blocking(up, &buf[..len], 0);
@@ -328,14 +337,13 @@ unsafe fn bootstrap_log(manager_side: u64, log_client: &mut u64) -> bool {
 	}
 }
 
-// Hand StorageService its ramdisk and a service channel over `manager_side`:
-// "RAMDISK" + length transferring the volume buffer, then "SERVE" transferring one
-// end of a fresh service channel. The other end is stored in `*storage_client`.
-unsafe fn bootstrap_storage(manager_side: u64, ramdisk: u64, ramdisk_len: usize, storage_client: &mut u64, buf: &mut [u8]) -> bool {
+// Hand StorageService its disk-backed volume and a service channel over
+// `manager_side`: "BLOCK" transferring the block-read service channel (routed up
+// from the virtio-blk driver via DeviceManager), then "SERVE" transferring one end
+// of a fresh service channel. The other end is stored in `*storage_client`.
+unsafe fn bootstrap_storage(manager_side: u64, block_client: u64, storage_client: &mut u64) -> bool {
 	unsafe {
-		buf[..7].copy_from_slice(b"RAMDISK");
-		buf[7..15].copy_from_slice(&(ramdisk_len as u64).to_le_bytes());
-		if !send_blocking(manager_side, &buf[..15], ramdisk) {
+		if !send_blocking(manager_side, b"BLOCK", block_client) {
 			return false;
 		}
 		let (service_server, service_client): (u64, u64) = match channel() {
