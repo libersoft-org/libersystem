@@ -7,6 +7,10 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "proto"
+version = "0.0.0"
+
+[[package]]
 name = "rt"
 version = "0.0.0"
 dependencies = [
@@ -17,5 +21,6 @@ dependencies = [
 name = "storage"
 version = "0.0.0"
 dependencies = [
+ "proto",
  "rt",
 ]

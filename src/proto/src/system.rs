@@ -396,6 +396,42 @@ impl OpenOpts {
 	}
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenResult {
+	pub file: u64,
+	pub size: u64,
+}
+
+impl OpenResult {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<OpenResult> {
+		OpenResult::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.set_handle(self.file);
+		w.u32(0)?;
+		w.u64(self.size)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<OpenResult> {
+		let file = {
+			let _ = r.u32()?;
+			r.take_handle()
+		};
+		let size = r.u64()?;
+		Some(OpenResult { file, size })
+	}
+}
+
 // interface `volume` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod volume {
 	use super::*;
@@ -405,7 +441,7 @@ pub mod volume {
 	pub const OP_OPEN: u16 = 1;
 
 	pub trait Service {
-		fn open(&mut self, o: OpenOpts) -> Result<u64, Error>;
+		fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -423,8 +459,7 @@ pub mod volume {
 				match &result {
 					Ok(v13) => {
 						w.u8(1)?;
-						w.set_handle(*v13);
-						w.u32(0)?;
+						v13.write(w)?;
 					}
 					Err(v14) => {
 						w.u8(0)?;
@@ -455,7 +490,7 @@ pub mod volume {
 			self.corr = self.corr.wrapping_add(1);
 			c
 		}
-		pub fn open(&mut self, o: &OpenOpts) -> Option<Result<u64, Error>> {
+		pub fn open(&mut self, o: &OpenOpts) -> Option<Result<OpenResult, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -470,14 +505,7 @@ pub mod volume {
 			if r.u32()? != corr {
 				return None;
 			}
-			Some(if r.u8()? != 0 {
-				Ok({
-					let _ = r.u32()?;
-					r.take_handle()
-				})
-			} else {
-				Err(Error::read(r)?)
-			})
+			Some(if r.u8()? != 0 { Ok(OpenResult::read(r)?) } else { Err(Error::read(r)?) })
 		}
 	}
 }
@@ -772,6 +800,37 @@ impl OpenOpts {
 		} else {
 			out.push_str("false");
 		}
+		out.push('}');
+	}
+}
+
+impl OpenResult {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"file\":");
+		let _ = write!(out, "{}", self.file);
+		out.push(',');
+		out.push_str("\"size\":");
+		let _ = write!(out, "{}", self.size);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("file=");
+		let _ = write!(out, "{}", self.file);
+		out.push_str(", ");
+		out.push_str("size=");
+		let _ = write!(out, "{}", self.size);
 		out.push('}');
 	}
 }

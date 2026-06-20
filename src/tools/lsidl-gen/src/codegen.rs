@@ -600,7 +600,8 @@ impl Cg {
 				let errb = self.json_value(errty, &ve, true)?;
 				format!("match {refplace} {{ Ok({vo}) => {{ out.push_str(\"{{\\\"ok\\\":\"); {okb} out.push('}}'); }} Err({ve}) => {{ out.push_str(\"{{\\\"err\\\":\"); {errb} out.push('}}'); }} }}")
 			}
-			Type::Handle(_) | Type::Buffer | Type::Stream(_) => return Err("handle, buffer, and stream are not renderable".into()),
+			Type::Handle(_) => format!("let _ = write!(out, \"{{}}\", {place});"),
+			Type::Buffer | Type::Stream(_) => return Err("buffer and stream are not renderable".into()),
 		})
 	}
 
@@ -644,7 +645,8 @@ impl Cg {
 				let errb = self.text_value(errty, &ve, true)?;
 				format!("match {refplace} {{ Ok({vo}) => {{ out.push_str(\"ok(\"); {okb} out.push(')'); }} Err({ve}) => {{ out.push_str(\"err(\"); {errb} out.push(')'); }} }}")
 			}
-			Type::Handle(_) | Type::Buffer | Type::Stream(_) => return Err("handle, buffer, and stream are not renderable".into()),
+			Type::Handle(_) => format!("let _ = write!(out, \"{{}}\", {place});"),
+			Type::Buffer | Type::Stream(_) => return Err("buffer and stream are not renderable".into()),
 		})
 	}
 

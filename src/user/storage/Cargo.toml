@@ -20,5 +20,9 @@ path = "src/client.rs"
 # the syscall/IPC/volume helpers); it re-exports the abi constants.
 rt = { path = "../rt" }
 
+# Generated LSIDL bindings: StorageService serves the Storage.Volume contract and
+# the demo client speaks it, both via the proto codec + dispatch/client.
+proto = { path = "../../proto" }
+
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

@@ -804,26 +804,36 @@ fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
 	let service_server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
 	service_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![service_server_cap], 0)).map_err(|_| "service serve bootstrap failed")?;
 
-	// the open request - [rights u32 LE][vol:// URI] - then an empty quit sentinel,
-	// which the service treats as end-of-session and exits on
-	let want_rights = (Rights::READ | Rights::MAP).bits();
-	let mut request = alloc::vec::Vec::with_capacity(4 + uri.len());
-	request.extend_from_slice(&want_rights.to_le_bytes());
+	// the generated volume.open request - [op u16][corr u32][open-opts] where
+	// open-opts = [path: [len u16][utf8]][write u8][create u8] - then an empty quit
+	// sentinel, which the service treats as end-of-session and exits on.
+	let corr: u32 = 1;
+	let mut request = alloc::vec::Vec::new();
+	request.extend_from_slice(&1u16.to_le_bytes()); // OP_OPEN
+	request.extend_from_slice(&corr.to_le_bytes());
+	request.extend_from_slice(&(uri.len() as u16).to_le_bytes());
 	request.extend_from_slice(uri);
+	request.push(0); // write = false
+	request.push(0); // create = false
 	service_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).map_err(|_| "open request failed")?;
 	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).map_err(|_| "quit sentinel failed")?;
 
 	sched::run_until_idle();
 
 	let reply = service_client.recv().map_err(|_| "the service sent no reply")?;
-	if reply.bytes.len() < 12 {
+	// the generated reply - [corr u32][is_ok u8] then, on ok, the open-result record
+	// [file placeholder u32][size u64] with the file capability transferred
+	// out-of-band; the handle itself rides reply.caps, not the byte stream.
+	if reply.bytes.len() < 5 {
 		return Err("malformed reply");
 	}
-	let status = u32::from_le_bytes([reply.bytes[0], reply.bytes[1], reply.bytes[2], reply.bytes[3]]);
-	let size = u64::from_le_bytes([reply.bytes[4], reply.bytes[5], reply.bytes[6], reply.bytes[7], reply.bytes[8], reply.bytes[9], reply.bytes[10], reply.bytes[11]]) as usize;
-	if status != 0 {
+	if reply.bytes[4] != 1 {
 		return Err("the service denied or could not find the file");
 	}
+	if reply.bytes.len() < 17 {
+		return Err("malformed reply");
+	}
+	let size = u64::from_le_bytes([reply.bytes[9], reply.bytes[10], reply.bytes[11], reply.bytes[12], reply.bytes[13], reply.bytes[14], reply.bytes[15], reply.bytes[16]]) as usize;
 	let cap = reply.caps.first().ok_or("the service granted no buffer")?;
 	let object = cap.object();
 	let memory = object.as_any().downcast_ref::<MemoryObject>().ok_or("the granted capability was not a buffer")?;

@@ -115,8 +115,12 @@ fn client_server_round_trip() {
 struct VolStub;
 
 impl volume::Service for VolStub {
-	fn open(&mut self, o: OpenOpts) -> Result<u64, Error> {
-		if o.path.is_empty() { Err(Error::NotFound) } else { Ok(0xCAFE) }
+	fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error> {
+		if o.path.is_empty() {
+			Err(Error::NotFound)
+		} else {
+			Ok(OpenResult { file: 0xCAFE, size: 42 })
+		}
 	}
 }
 
@@ -137,7 +141,8 @@ impl<S: volume::Service> crate::codec::Transport for VolLoopback<S> {
 fn handle_return_crosses_out_of_band() {
 	let mut client = volume::Client::new(VolLoopback { service: VolStub });
 	let opts = OpenOpts { path: String::from("/x"), write: false, create: false };
-	assert_eq!(client.open(&opts), Some(Ok(0xCAFE)));
+	// the file handle (0xCAFE) crosses out-of-band; the size travels in the byte stream.
+	assert_eq!(client.open(&opts), Some(Ok(OpenResult { file: 0xCAFE, size: 42 })));
 	let empty = OpenOpts { path: String::new(), write: false, create: false };
 	assert_eq!(client.open(&empty), Some(Err(Error::NotFound)));
 }

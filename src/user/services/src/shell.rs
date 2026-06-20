@@ -13,15 +13,11 @@
 
 extern crate alloc;
 
-use proto::system::Query;
-use proto::system::log;
+use proto::system::{log, volume, OpenOpts, Query};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
 const SELF_CHECK_URI: &[u8] = b"vol://system/hello.txt";
-
-// the open reply status that means the buffer capability is present
-const STATUS_OK: u32 = 0;
 
 // maximum length of a typed command line
 const LINE_MAX: usize = 128;
@@ -43,7 +39,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	};
 
 	// 2. self-check: prove the StorageService round-trip works by reading a file.
-	if !unsafe { cat(storage, SELF_CHECK_URI, &mut buf) } {
+	if !unsafe { cat(storage, SELF_CHECK_URI) } {
 		exit();
 	}
 
@@ -75,7 +71,6 @@ unsafe fn repl(storage: u64, logsvc: u64, buf: &mut [u8]) {
 		}
 		let mut line: [u8; LINE_MAX] = [0u8; LINE_MAX];
 		let mut len: usize = 0;
-		let mut work: [u8; 256] = [0u8; 256];
 		loop {
 			let n: usize = match recv_blocking(input, buf) {
 				Received::Message { len, .. } => len,
@@ -85,7 +80,7 @@ unsafe fn repl(storage: u64, logsvc: u64, buf: &mut [u8]) {
 				match buf[i] {
 					b'\n' | b'\r' => {
 						print(b"\n");
-						if dispatch(&line[..len], storage, logsvc, &mut work) {
+						if dispatch(&line[..len], storage, logsvc) {
 							return;
 						}
 						len = 0;
@@ -113,7 +108,7 @@ unsafe fn repl(storage: u64, logsvc: u64, buf: &mut [u8]) {
 }
 
 // Dispatch one command line. Returns true if the shell should exit.
-unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, work: &mut [u8]) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -147,7 +142,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, work: &mut [u8]) -> b
 		}
 		if let Some(rest) = line.strip_prefix(b"cat ") {
 			let uri = trim(rest);
-			if !cat(storage, uri, work) {
+			if !cat(storage, uri) {
 				print(b"cat: could not read ");
 				print(uri);
 				print(b"\n");
@@ -226,45 +221,32 @@ fn trim(mut s: &[u8]) -> &[u8] {
 	s
 }
 
-// Open `uri` through the StorageService channel `storage`, map the returned shared
-// buffer, print its bytes to the console, and release it. Returns true on success.
-unsafe fn cat(storage: u64, uri: &[u8], buf: &mut [u8]) -> bool {
+// Open `uri` through the StorageService channel `storage` over the generated volume
+// client, map the returned shared buffer, print its bytes to the console, and
+// release it. Returns true on success.
+unsafe fn cat(storage: u64, uri: &[u8]) -> bool {
 	unsafe {
-		// open request: [rights u32 LE][vol:// URI]. Ask for a read-only view.
-		let want_rights: u32 = RIGHT_READ | RIGHT_MAP;
-		let mut request: [u8; 64] = [0u8; 64];
-		if 4 + uri.len() > request.len() {
-			return false;
-		}
-		request[0..4].copy_from_slice(&want_rights.to_le_bytes());
-		request[4..4 + uri.len()].copy_from_slice(uri);
-		if !send_blocking(storage, &request[..4 + uri.len()], 0) {
-			return false;
-		}
-		// reply: [status u32 LE][size u64 LE] + shared-buffer capability.
-		let (status, size, buffer): (u32, usize, u64) = match recv_blocking(storage, buf) {
-			Received::Message { len, handle } if len >= 12 => {
-				let status: u32 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-				let size: u64 = u64::from_le_bytes([buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]]);
-				(status, size as usize, handle)
-			}
+		let opts: OpenOpts = OpenOpts { path: alloc::string::String::from_utf8_lossy(uri).into_owned(), write: false, create: false };
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let result = match client.open(&opts) {
+			Some(Ok(r)) => r,
 			_ => return false,
 		};
-		if status != STATUS_OK || buffer == 0 || size == 0 {
+		if result.file == 0 || result.size == 0 {
 			return false;
 		}
 		// map the shared buffer, print the file, then release it.
-		let mapped: u64 = syscall(SYS_MEMORY_MAP, buffer, 0, 0, 0);
+		let mapped: u64 = syscall(SYS_MEMORY_MAP, result.file, 0, 0, 0);
 		if sys_is_err(mapped) {
 			return false;
 		}
-		let contents: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
+		let contents: &[u8] = core::slice::from_raw_parts(mapped as *const u8, result.size as usize);
 		print(contents);
 		if contents.last() != Some(&b'\n') {
 			print(b"\n");
 		}
-		syscall(SYS_MEMORY_UNMAP, buffer, 0, 0, 0);
-		syscall(SYS_HANDLE_CLOSE, buffer, 0, 0, 0);
+		syscall(SYS_MEMORY_UNMAP, result.file, 0, 0, 0);
+		syscall(SYS_HANDLE_CLOSE, result.file, 0, 0, 0);
 		true
 	}
 }

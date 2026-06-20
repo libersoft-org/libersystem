@@ -63,9 +63,18 @@ record open-opts {
 	create: bool,
 }
 
-// The Storage volume contract: resolve a path on a volume and hand back a file
-// capability. `open` returns the file as a handle (the M26 capability-return case
-// that exercises the handle<T> wire transfer).
+// The result of opening a file: a capability to the file's bytes (transferred
+// out-of-band as handle<file>) plus the file's length, so the client knows how many
+// bytes the shared buffer holds.
+record open-result {
+	file: handle<file>,
+	size: u64,
+}
+
+// The Storage volume contract: resolve a path on a volume and hand back the file's
+// bytes as a shared-buffer capability. `open` returns the capability out-of-band
+// (handle<file>) alongside its length - the M26 capability-return case that
+// exercises the handle<T> wire transfer.
 interface volume {
-	@op(1) open: func(o: open-opts) -> result<handle<file>, error>;
+	@op(1) open: func(o: open-opts) -> result<open-result, error>;
 }

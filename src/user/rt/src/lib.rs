@@ -236,12 +236,12 @@ pub unsafe fn spawn(elf: &[u8], bootstrap: u64) -> i64 {
 // this pair is what the StorageService resolves against.
 pub struct VolumePath<'a> {
 	pub volume: &'a [u8],
-	pub path: &'a [u8],
+	pub path: RelativePath<'a>,
 }
 
 impl<'a> VolumePath<'a> {
-	// Parse "vol://<volume>/<path>" into its components. Returns None if the
-	// scheme is missing or either component is empty.
+	// Parse "vol://<volume>/<path>" into its components. Returns None if the scheme
+	// is missing, the volume is empty, or the path is not a valid relative path.
 	pub fn parse(uri: &'a [u8]) -> Option<VolumePath<'a>> {
 		const SCHEME: &[u8] = b"vol://";
 		if uri.len() < SCHEME.len() || &uri[..SCHEME.len()] != SCHEME {
@@ -250,10 +250,50 @@ impl<'a> VolumePath<'a> {
 		let rest: &[u8] = &uri[SCHEME.len()..];
 		let slash: usize = rest.iter().position(|&b: &u8| b == b'/')?;
 		let volume: &[u8] = &rest[..slash];
-		let path: &[u8] = &rest[slash + 1..];
-		if volume.is_empty() || path.is_empty() {
+		if volume.is_empty() {
 			return None;
 		}
+		let path: RelativePath<'a> = RelativePath::parse(&rest[slash + 1..])?;
 		Some(VolumePath { volume, path })
+	}
+}
+
+// A path within a volume: a sequence of validated, non-empty segments separated by
+// '/'. It is constructed only through validation, so it can never hold an empty
+// segment, "." or ".." - path traversal has nowhere to arise. The authority to read
+// is the capability, not the string; this is just the canonical name to resolve.
+pub struct RelativePath<'a> {
+	raw: &'a [u8],
+}
+
+impl<'a> RelativePath<'a> {
+	// Validate `raw` as a relative path: one or more '/'-separated segments, each
+	// non-empty and neither "." nor "..", with no NUL or backslash byte. Returns
+	// None if any segment is invalid.
+	pub fn parse(raw: &'a [u8]) -> Option<RelativePath<'a>> {
+		if raw.is_empty() {
+			return None;
+		}
+		for seg in raw.split(|&b: &u8| b == b'/') {
+			if seg.is_empty() || seg == b"." || seg == b".." {
+				return None;
+			}
+			for &c in seg {
+				if c == 0 || c == b'\\' {
+					return None;
+				}
+			}
+		}
+		Some(RelativePath { raw })
+	}
+
+	// The path's canonical bytes, e.g. for an exact archive lookup.
+	pub fn as_bytes(&self) -> &'a [u8] {
+		self.raw
+	}
+
+	// The path's segments, in order.
+	pub fn segments(&self) -> impl Iterator<Item = &'a [u8]> {
+		self.raw.split(|&b: &u8| b == b'/')
 	}
 }

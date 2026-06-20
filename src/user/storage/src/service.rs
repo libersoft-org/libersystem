@@ -9,24 +9,20 @@
 //          service, from which the archive is read off the disk (the boot path);
 //   2. "SERVE", with a channel capability on which clients send open requests.
 // Either way the volume's PKGARCH1 archive ends up mapped in this process; the
-// service then serves open requests until the client side closes. Each request is
-// [rights u32][vol:// URI]; the reply is [status u32][size u64], carrying a
-// MemoryObject capability to a freshly filled buffer of the file's bytes on success
-// (status 0). The file content crosses as a shared buffer handle, never copied
-// through the channel - a zero-copy read.
+// service then serves the generated Storage.Volume contract (`volume.open`) until
+// the client side closes. `open` resolves a vol:// path and replies with the file's
+// length plus a MemoryObject capability to its bytes, transferred out-of-band as
+// handle<file> - the content crosses as a shared buffer handle, never copied through
+// the channel (a zero-copy read).
 
 #![no_std]
 #![no_main]
 
+use proto::system::{volume, Error, OpenOpts, OpenResult};
 use rt::*;
 
 // the single volume this service serves; the URI's volume component must match
 const VOLUME_NAME: &[u8] = b"system";
-
-// open reply status codes
-const STATUS_OK: u32 = 0;
-const STATUS_NOT_FOUND: u32 = 1;
-const STATUS_DENIED: u32 = 2;
 
 // block-read protocol with driver.virtio-blk: request [lba u64][count u32], reply
 // [status u32] carrying a MemoryObject of count*512 bytes. A single request reads at
@@ -61,92 +57,79 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 	// 3. report in over the bootstrap channel (the supervisor that started us is
-	//    listening there), then serve until the client side closes.
+	//    listening there), then serve generated volume.open requests until the
+	//    client side closes.
 	unsafe {
 		send_blocking(bootstrap, b"StorageService: online", 0);
 	}
+	let mut vol: Volume = Volume { base: volume_base, len: volume_len };
+	let mut reply: [u8; 64] = [0u8; 64];
 	loop {
 		match unsafe { recv_blocking(service, &mut buf) } {
 			// An empty message is an explicit quit sentinel: a client that cannot
 			// close its endpoint to signal end-of-stream (e.g. the kernel keeping the
 			// peer to read the reply) sends a zero-length message to end the session.
 			Received::Message { len, .. } if len == 0 => break,
-			Received::Message { len, .. } => unsafe { serve_open(service, volume_base, volume_len, &buf[..len]) },
+			Received::Message { len, handle } => {
+				let mut reply_handle: u64 = 0;
+				if let Some(n) = volume::dispatch(&mut vol, &buf[..len], handle, &mut reply, &mut reply_handle) {
+					unsafe { send_blocking(service, &reply[..n], reply_handle) };
+				}
+			}
 			Received::Closed => break,
 		}
 	}
 	exit();
 }
 
-// Resolve one open request and answer on the service channel.
-unsafe fn serve_open(service: u64, volume_base: u64, volume_len: usize, request: &[u8]) {
-	unsafe {
-		// request: [rights u32 LE][vol:// URI]
-		if request.len() < 4 {
-			reply(service, STATUS_DENIED, 0, 0);
-			return;
+// The volume's mapped PKGARCH1 archive, behind the generated Storage.Volume
+// contract. `open` resolves a vol:// path to the file's bytes as a shared buffer.
+struct Volume {
+	base: u64,
+	len: usize,
+}
+
+impl volume::Service for Volume {
+	fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error> {
+		// the volume is read-only: refuse any write or create request.
+		if o.write || o.create {
+			return Err(Error::Denied);
 		}
-		let want_rights: u32 = u32::from_le_bytes([request[0], request[1], request[2], request[3]]);
-		let uri: &[u8] = &request[4..];
-		let target: VolumePath = match VolumePath::parse(uri) {
-			Some(t) => t,
-			None => {
-				reply(service, STATUS_NOT_FOUND, 0, 0);
-				return;
-			}
-		};
+		let target: VolumePath = VolumePath::parse(o.path.as_bytes()).ok_or(Error::NotFound)?;
 		if target.volume != VOLUME_NAME {
-			reply(service, STATUS_NOT_FOUND, 0, 0);
-			return;
+			return Err(Error::NotFound);
 		}
-		let archive: &[u8] = core::slice::from_raw_parts(volume_base as *const u8, volume_len);
-		let file: &[u8] = match Package::parse(archive).and_then(|p| p.lookup(target.path)) {
-			Some(f) => f,
-			None => {
-				reply(service, STATUS_NOT_FOUND, 0, 0);
-				return;
-			}
-		};
-		// the ramdisk is read-only: grant at most read+map, deny anything more.
-		let allowed: u32 = RIGHT_READ | RIGHT_MAP;
-		if want_rights & !allowed != 0 {
-			reply(service, STATUS_DENIED, 0, 0);
-			return;
-		}
-		// fill a fresh shared buffer with the file's bytes, then hand it over.
+		let archive: &[u8] = unsafe { core::slice::from_raw_parts(self.base as *const u8, self.len) };
+		let file: &[u8] = Package::parse(archive).and_then(|p| p.lookup(target.path.as_bytes())).ok_or(Error::NotFound)?;
+		// fill a fresh read-only shared buffer with the file's bytes and hand it back
+		// as a capability (transferred out-of-band); the length travels in-stream.
+		let handle: u64 = unsafe { make_file_buffer(file) }.ok_or(Error::Again)?;
+		Ok(OpenResult { file: handle, size: file.len() as u64 })
+	}
+}
+
+// Create a read-only shared buffer holding `file`'s bytes and return a transferable
+// capability to it (read + map + transfer), or None on failure.
+unsafe fn make_file_buffer(file: &[u8]) -> Option<u64> {
+	unsafe {
 		let buffer: u64 = syscall(SYS_MEMORY_OBJECT_CREATE, file.len() as u64, 0, 0, 0);
 		if sys_is_err(buffer) {
-			reply(service, STATUS_DENIED, 0, 0);
-			return;
+			return None;
 		}
 		let mapped: u64 = syscall(SYS_MEMORY_MAP, buffer, 0, 0, 0);
 		if sys_is_err(mapped) {
 			syscall(SYS_HANDLE_CLOSE, buffer, 0, 0, 0);
-			reply(service, STATUS_DENIED, 0, 0);
-			return;
+			return None;
 		}
 		core::ptr::copy_nonoverlapping(file.as_ptr(), mapped as *mut u8, file.len());
 		syscall(SYS_MEMORY_UNMAP, buffer, 0, 0, 0);
-		// attenuate to exactly what was asked for, plus the transfer right needed to
-		// hand the capability across, then transfer that weaker handle.
-		let granted: u64 = syscall(SYS_HANDLE_DUPLICATE, buffer, (want_rights | RIGHT_TRANSFER) as u64, 0, 0);
+		// attenuate to read + map plus the transfer right, then drop the full handle.
+		let granted: u64 = syscall(SYS_HANDLE_DUPLICATE, buffer, (RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER) as u64, 0, 0);
 		syscall(SYS_HANDLE_CLOSE, buffer, 0, 0, 0);
 		if sys_is_err(granted) {
-			reply(service, STATUS_DENIED, 0, 0);
-			return;
+			return None;
 		}
-		reply(service, STATUS_OK, file.len() as u64, granted);
-	}
-}
-
-// Send an open reply: [status u32 LE][size u64 LE], carrying the handle `xfer`
-// (0 = none). On success the handle is the shared buffer of the file's bytes.
-unsafe fn reply(service: u64, status: u32, size: u64, xfer: u64) {
-	unsafe {
-		let mut out: [u8; 12] = [0u8; 12];
-		out[0..4].copy_from_slice(&status.to_le_bytes());
-		out[4..12].copy_from_slice(&size.to_le_bytes());
-		send_blocking(service, &out, xfer);
+		Some(granted)
 	}
 }
 

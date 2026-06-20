@@ -63,6 +63,13 @@ An opaque kernel object, transferred as `handle<file>`.
 | `write` | `bool` |
 | `create` | `bool` |
 
+### record `open-result`
+
+| field | type |
+| --- | --- |
+| `file` | `handle<file>` |
+| `size` | `u64` |
+
 ## Interfaces
 
 ### interface `log`
@@ -81,5 +88,5 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 
 | op | method | signature |
 | --- | --- | --- |
-| 1 | `open` | `open(o: open-opts) -> result<handle<file>, error>` |
+| 1 | `open` | `open(o: open-opts) -> result<open-result, error>` |
 
