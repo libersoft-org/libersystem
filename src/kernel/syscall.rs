@@ -145,7 +145,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_MEMORY_OBJECT_CREATE => sys_memory_object_create(a0),
 		SYS_DMA_BUFFER_CREATE => sys_dma_buffer_create(a0),
 		SYS_DMA_BUFFER_MAP => sys_dma_buffer_map(a0),
-		SYS_DMA_BUFFER_PHYS => sys_dma_buffer_phys(a0),
+		SYS_DMA_BUFFER_PHYS => sys_dma_buffer_phys(a0, a1),
 		SYS_DEVICE_MEMORY_MAP => sys_device_memory_map(a0),
 		SYS_RANDOM_GET => sys_random_get(a0, a1),
 		SYS_INTERRUPT_BIND => sys_interrupt_bind(a0),
@@ -237,15 +237,23 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 	base as i64
 }
 
-// Return a DmaBuffer's physical base address - the address a driver programs into
-// its device for DMA. (A single-page buffer is physically contiguous, so this base
-// covers the whole buffer; multi-page contiguity is a later refinement.)
-fn sys_dma_buffer_phys(handle: u64) -> i64 {
+// Return the physical address backing byte `offset` of a DmaBuffer - the address a
+// driver programs into its device for DMA. A multi-page buffer is not physically
+// contiguous (it is mapped contiguously in virtual space but its frames are
+// scattered), so a driver that splits the buffer into device buffers spanning more
+// than the first page must query each one's true physical address by its offset.
+// Offset 0 returns the physical base.
+fn sys_dma_buffer_phys(handle: u64, offset: u64) -> i64 {
 	let dma = match current_typed::<DmaBuffer>(handle, ObjectType::DmaBuffer, Rights::READ) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	dma.phys_base() as i64
+	let frames = dma.frames();
+	let page = (offset / PAGE_SIZE) as usize;
+	if page >= frames.len() {
+		return ERR_INVALID;
+	}
+	(frames[page] + offset % PAGE_SIZE) as i64
 }
 
 // Map a DeviceMemory's physical MMIO region into the caller's address space,

@@ -131,6 +131,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  set <key> <val>  write a config key via ConfigService\n");
 			print(b"  ip | net         show the network interface and ARP cache\n");
 			print(b"  ping <ip>        send an ICMP echo via the net driver\n");
+			print(b"  nslookup <name>  resolve a name to an address via DNS\n");
 			print(b"  exit             stop the shell and halt\n");
 			return false;
 		}
@@ -184,6 +185,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		}
 		if let Some(rest) = line.strip_prefix(b"ping ") {
 			ping_host(netsvc, trim(rest));
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"nslookup ") {
+			dns_lookup(netsvc, trim(rest));
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"host ") {
+			dns_lookup(netsvc, trim(rest));
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
@@ -293,6 +302,43 @@ unsafe fn ping_host(netsvc: u64, target: &[u8]) {
 			1 => print(b": reply\n"),
 			2 => print(b": unreachable (no ARP reply)\n"),
 			_ => print(b": no reply (timeout)\n"),
+		}
+	}
+}
+
+// Resolve `name` through the net driver's DNS client (`nslookup` / `host`) and render
+// the result: the resolved address, or a not-found message.
+unsafe fn dns_lookup(netsvc: u64, name: &[u8]) {
+	unsafe {
+		if netsvc == 0 {
+			print(b"nslookup: no network interface\n");
+			return;
+		}
+		if name.is_empty() || name.len() > 120 {
+			print(b"nslookup: invalid name\n");
+			return;
+		}
+		let mut req: [u8; 128] = [0u8; 128];
+		req[..3].copy_from_slice(b"DNS");
+		req[3..3 + name.len()].copy_from_slice(name);
+		if !send_blocking(netsvc, &req[..3 + name.len()], 0) {
+			print(b"nslookup: request failed\n");
+			return;
+		}
+		let mut buf: [u8; 16] = [0u8; 16];
+		match recv_blocking(netsvc, &mut buf) {
+			Received::Message { len, .. } if len >= 5 && buf[0] == 1 => {
+				print(name);
+				print(b" has address ");
+				print_ip(&buf[1..5]);
+				print(b"\n");
+			}
+			Received::Message { .. } => {
+				print(b"nslookup: could not resolve ");
+				print(name);
+				print(b"\n");
+			}
+			Received::Closed => print(b"nslookup: network driver gone\n"),
 		}
 	}
 }

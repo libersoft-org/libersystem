@@ -19,16 +19,21 @@ const ARP_OP_REPLY: u16 = 2;
 
 // IPv4 protocol numbers.
 const IP_PROTO_ICMP: u8 = 1;
+const IP_PROTO_UDP: u8 = 17;
 
 // ICMP message types.
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
+
+// The DNS server port (UDP).
+const DNS_PORT: u16 = 53;
 
 // Header sizes (bytes).
 const ETH_HDR: usize = 14;
 const ARP_LEN: usize = 28;
 const IPV4_HDR: usize = 20;
 const ICMP_HDR: usize = 8;
+const UDP_HDR: usize = 8;
 
 // A 48-bit Ethernet MAC address.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,6 +76,26 @@ fn checksum(data: &[u8]) -> u16 {
 	!(sum as u16)
 }
 
+// The UDP checksum over the IPv4 pseudo-header (src, dst, proto, length) plus the
+// UDP header and payload `udp` (whose own checksum field must be zero). A computed
+// 0 is sent as 0xffff (0 means "no checksum").
+fn udp_checksum(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
+	let mut sum: u32 = be16(&src.0, 0) as u32 + be16(&src.0, 2) as u32 + be16(&dst.0, 0) as u32 + be16(&dst.0, 2) as u32 + IP_PROTO_UDP as u32 + udp.len() as u32;
+	let mut i: usize = 0;
+	while i + 1 < udp.len() {
+		sum += be16(udp, i) as u32;
+		i += 2;
+	}
+	if i < udp.len() {
+		sum += (udp[i] as u32) << 8;
+	}
+	while sum >> 16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16);
+	}
+	let c: u16 = !(sum as u16);
+	if c == 0 { 0xffff } else { c }
+}
+
 // One entry of the small ARP neighbor cache (IPv4 -> MAC).
 #[derive(Clone, Copy)]
 struct Neigh {
@@ -82,12 +107,15 @@ struct Neigh {
 const NEIGH_MAX: usize = 8;
 
 // The notable thing a received frame did, for the driver to log or react to.
+#[derive(Clone, Copy)]
 pub enum Event {
 	None,
 	// We learned a neighbor's MAC (from an ARP reply for an address we asked about).
 	Learned(Ipv4Addr, MacAddr),
 	// An ICMP echo reply arrived (a `ping` we sent was answered).
 	EchoReply(Ipv4Addr),
+	// A DNS response resolved a name to this address.
+	DnsReply(Ipv4Addr),
 }
 
 // The result of feeding one frame to the stack: an optional reply to transmit
@@ -240,11 +268,30 @@ impl Stack {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
 		let dst_ip: Ipv4Addr = Ipv4Addr([ip[16], ip[17], ip[18], ip[19]]);
-		if dst_ip != self.ip || ip[9] != IP_PROTO_ICMP {
+		if dst_ip != self.ip {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
 		let src_ip: Ipv4Addr = Ipv4Addr([ip[12], ip[13], ip[14], ip[15]]);
-		self.on_icmp(frame, ihl, src_ip, out)
+		match ip[9] {
+			IP_PROTO_ICMP => self.on_icmp(frame, ihl, src_ip, out),
+			IP_PROTO_UDP => self.on_udp(frame, ihl),
+			_ => Outcome { reply_len: 0, event: Event::None },
+		}
+	}
+
+	// Handle an inbound UDP datagram. Only DNS responses (source port 53) are
+	// recognized for now: the payload is parsed into the resolved address.
+	fn on_udp(&mut self, frame: &[u8], ihl: usize) -> Outcome {
+		let udp: &[u8] = &frame[ETH_HDR + ihl..];
+		if udp.len() < UDP_HDR {
+			return Outcome { reply_len: 0, event: Event::None };
+		}
+		if be16(udp, 0) == DNS_PORT {
+			if let Some(addr) = parse_dns_response(&udp[UDP_HDR..]) {
+				return Outcome { reply_len: 0, event: Event::DnsReply(addr) };
+			}
+		}
+		Outcome { reply_len: 0, event: Event::None }
 	}
 
 	// Handle an ICMP message: reply to an echo request, report an echo reply.
@@ -322,4 +369,122 @@ impl Stack {
 		put16(icmp, 2, csum2);
 		ETH_HDR + total
 	}
+
+	// Build an Ethernet + IPv4 + UDP + DNS A-record query for `name` (sent to the DNS
+	// server at `server_ip`, MAC `server_mac`) into `out`, returning its length, or 0
+	// if the name does not fit. `txn` is the DNS transaction id and `src_port` our UDP
+	// source port (echoed back by the response). The UDP checksum is left 0 (optional
+	// for IPv4).
+	pub fn build_dns_query(&self, server_mac: MacAddr, server_ip: Ipv4Addr, name: &[u8], txn: u16, src_port: u16, out: &mut [u8]) -> usize {
+		let dns_off: usize = ETH_HDR + IPV4_HDR + UDP_HDR;
+		if dns_off + 12 + name.len() + 6 > out.len() {
+			return 0;
+		}
+		// DNS header: id, flags (recursion desired), one question, no answers.
+		put16(out, dns_off, txn);
+		put16(out, dns_off + 2, 0x0100);
+		put16(out, dns_off + 4, 1);
+		put16(out, dns_off + 6, 0);
+		put16(out, dns_off + 8, 0);
+		put16(out, dns_off + 10, 0);
+		let mut p: usize = dns_off + 12;
+		// Question name, encoded as length-prefixed labels split on '.'.
+		let mut start: usize = 0;
+		for i in 0..=name.len() {
+			if i == name.len() || name[i] == b'.' {
+				let label: usize = i - start;
+				if label == 0 || label > 63 {
+					return 0;
+				}
+				out[p] = label as u8;
+				out[p + 1..p + 1 + label].copy_from_slice(&name[start..i]);
+				p += 1 + label;
+				start = i + 1;
+			}
+		}
+		out[p] = 0;
+		p += 1;
+		put16(out, p, 1); // qtype A
+		put16(out, p + 2, 1); // qclass IN
+		p += 4;
+		let dns_len: usize = p - dns_off;
+		// UDP header.
+		let udp_off: usize = ETH_HDR + IPV4_HDR;
+		put16(out, udp_off, src_port);
+		put16(out, udp_off + 2, DNS_PORT);
+		put16(out, udp_off + 4, (UDP_HDR + dns_len) as u16);
+		put16(out, udp_off + 6, 0);
+		let udp_csum: u16 = udp_checksum(self.ip, server_ip, &out[udp_off..udp_off + UDP_HDR + dns_len]);
+		put16(out, udp_off + 6, udp_csum);
+		// IPv4 header.
+		let total: usize = IPV4_HDR + UDP_HDR + dns_len;
+		let ip: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + IPV4_HDR];
+		ip[0] = 0x45;
+		ip[1] = 0;
+		put16(ip, 2, total as u16);
+		put16(ip, 4, 0);
+		put16(ip, 6, 0);
+		ip[8] = 64;
+		ip[9] = IP_PROTO_UDP;
+		put16(ip, 10, 0);
+		ip[12..16].copy_from_slice(&self.ip.0);
+		ip[16..20].copy_from_slice(&server_ip.0);
+		let csum: u16 = checksum(&ip[..IPV4_HDR]);
+		put16(ip, 10, csum);
+		// Ethernet header.
+		out[0..6].copy_from_slice(&server_mac.0);
+		out[6..12].copy_from_slice(&self.mac.0);
+		put16(out, 12, ETHERTYPE_IPV4);
+		ETH_HDR + total
+	}
+}
+
+// Skip a DNS name starting at `off` in `buf`, returning the offset just past it.
+// Handles both label sequences (terminated by a zero byte) and the 2-byte
+// compression pointer (top two bits set). None if it runs off the end.
+fn skip_name(buf: &[u8], mut off: usize) -> Option<usize> {
+	loop {
+		let b: u8 = *buf.get(off)?;
+		if b == 0 {
+			return Some(off + 1);
+		}
+		if b & 0xc0 == 0xc0 {
+			return Some(off + 2);
+		}
+		off += 1 + b as usize;
+	}
+}
+
+// Parse a DNS response message and return the first A record's address, if any.
+fn parse_dns_response(dns: &[u8]) -> Option<Ipv4Addr> {
+	if dns.len() < 12 {
+		return None;
+	}
+	let qdcount: u16 = be16(dns, 4);
+	let ancount: u16 = be16(dns, 6);
+	let mut off: usize = 12;
+	for _ in 0..qdcount {
+		off = skip_name(dns, off)?;
+		off += 4;
+		if off > dns.len() {
+			return None;
+		}
+	}
+	for _ in 0..ancount {
+		off = skip_name(dns, off)?;
+		if off + 10 > dns.len() {
+			return None;
+		}
+		let rtype: u16 = be16(dns, off);
+		let rdlen: usize = be16(dns, off + 8) as usize;
+		off += 10;
+		if rtype == 1 && rdlen == 4 && off + 4 <= dns.len() {
+			return Some(Ipv4Addr([dns[off], dns[off + 1], dns[off + 2], dns[off + 3]]));
+		}
+		off += rdlen;
+		if off > dns.len() {
+			return None;
+		}
+	}
+	None
 }

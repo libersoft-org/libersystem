@@ -380,6 +380,14 @@ pub unsafe fn dma_buffer_phys(handle: u64) -> u64 {
 	unsafe { syscall(SYS_DMA_BUFFER_PHYS, handle, 0, 0, 0) }
 }
 
+// The physical address backing byte `offset` of a DmaBuffer. A buffer larger than
+// one page is mapped contiguously in virtual space but its physical frames are
+// scattered, so a driver that carves it into several device buffers asks for each
+// one's true physical address by its offset rather than adding to the base.
+pub unsafe fn dma_buffer_phys_at(handle: u64, offset: u64) -> u64 {
+	unsafe { syscall(SYS_DMA_BUFFER_PHYS, handle, offset, 0, 0) }
+}
+
 // Allocate a DmaBuffer of `size` bytes and map it, returning its (handle, virtual
 // base, physical base): a driver fills the ring/buffer through `virt` and points its
 // device at `phys`. None on allocation or mapping failure. The returned handle keeps
