@@ -164,6 +164,11 @@ impl Console {
 		match byte {
 			b'\n' => self.newline(),
 			b'\r' => self.col = 0,
+			0x08 => {
+				if self.col > 0 {
+					self.col -= 1;
+				}
+			}
 			b'\t' => {
 				let next = (self.col / 4 + 1) * 4;
 				while self.col < next && self.col < self.cols {
