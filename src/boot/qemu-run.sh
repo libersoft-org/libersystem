@@ -101,6 +101,12 @@ if [[ "${TEST:-0}" == "1" ]]; then
 	exit "$code"
 fi
 
+# virtio-input keyboard (M31): interactive runs only. The userspace virtio_input
+# driver takes this device's interrupt and feeds key presses to the console shell,
+# so typing in the SPICE/VNC window drives the system. Left out of the test path to
+# keep that device set deterministic (the test boot exercises only blk/net/console).
+QEMU_ARGS+=(-device virtio-keyboard-pci,disable-legacy=on)
+
 # Expose a control monitor on a unix socket (alongside the stdio monitor) so
 # boot/screenshot.sh can attach to this running instance and snap the live
 # framebuffer at any time. Only for interactive runs (not the test path above).

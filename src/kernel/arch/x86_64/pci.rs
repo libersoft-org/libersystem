@@ -83,6 +83,8 @@ pub struct PciDevice {
 	pub bars: [u32; 6],
 	// The interrupt line (legacy INTx routing), 0xFF = none.
 	pub irq_line: u8,
+	// The interrupt pin this function drives: 1 = INTA .. 4 = INTD, 0 = none.
+	pub irq_pin: u8,
 }
 
 impl PciDevice {
@@ -96,6 +98,18 @@ impl PciDevice {
 	pub fn virtio_type(&self) -> Option<u16> {
 		if self.is_virtio() && (VIRTIO_MODERN_BASE..VIRTIO_MODERN_BASE + 0x40).contains(&self.device_id) { Some(self.device_id - VIRTIO_MODERN_BASE) } else { None }
 	}
+
+	// The IOAPIC GSI this function's INTx pin is wired to, or None if it drives no
+	// pin. The PCI Interrupt Line register (0x3C) holds the legacy 8259 IRQ, not a
+	// GSI; under the IOAPIC the q35 (ICH9) chipset routes each slot's INTx pin to a
+	// PIRQ link (PIRQ pin = (slot + pin_index) % 8) and the firmware maps PIRQ[A..H]
+	// to GSI 16..23. So GSI = 16 + (slot + (pin - 1)) % 8.
+	pub fn intx_gsi(&self) -> Option<u32> {
+		if self.irq_pin == 0 {
+			return None;
+		}
+		Some(16 + (self.dev as u32 + (self.irq_pin as u32 - 1)) % 8)
+	}
 }
 
 // Read the full identity of one present function.
@@ -106,7 +120,7 @@ fn read_function(bus: u8, dev: u8, func: u8) -> PciDevice {
 	for (i, bar) in bars.iter_mut().enumerate() {
 		*bar = config_read32(bus, dev, func, 0x10 + (i as u16) * 4);
 	}
-	PciDevice { bus, dev, func, vendor: id as u16, device_id: (id >> 16) as u16, prog_if: (class_reg >> 8) as u8, subclass: (class_reg >> 16) as u8, class: (class_reg >> 24) as u8, header_type: config_read8(bus, dev, func, 0x0E), bars, irq_line: config_read8(bus, dev, func, 0x3C) }
+	PciDevice { bus, dev, func, vendor: id as u16, device_id: (id >> 16) as u16, prog_if: (class_reg >> 8) as u8, subclass: (class_reg >> 16) as u8, class: (class_reg >> 24) as u8, header_type: config_read8(bus, dev, func, 0x0E), bars, irq_line: config_read8(bus, dev, func, 0x3C), irq_pin: config_read8(bus, dev, func, 0x3D) }
 }
 
 // Enumerate every present function on bus 0. Multi-function devices (header-type

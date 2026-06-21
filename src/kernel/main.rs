@@ -216,15 +216,22 @@ fn console_shell_loop() {
 		serial_println!("shell: no interactive shell attached");
 		return;
 	}
-	// Nudge the shell to print its first prompt, then forward input until it exits.
+	// Nudge the shell to print its first prompt, then pump both input sources until
+	// it exits. Each round forwards any waiting serial byte and runs the cooperative
+	// schedule, so threads a device interrupt woke also make progress: the
+	// virtio-input keyboard driver feeds console input from its own IRQ handler, so
+	// the shell must be pumped whenever an interrupt arrives, not only when a serial
+	// byte does. Polling serial (rather than blocking on it) keeps that interrupt
+	// path live while no one is typing on the wire.
 	console_input::feed(b'\n');
-	sched::run_until_idle();
 	while console_input::shell_listening() {
-		let byte = arch::serial::read_byte_blocking();
-		if !console_input::feed(byte) {
-			break;
+		if let Some(byte) = arch::serial::read_byte() {
+			if !console_input::feed(byte) {
+				break;
+			}
 		}
 		sched::run_until_idle();
+		core::hint::spin_loop();
 	}
 }
 

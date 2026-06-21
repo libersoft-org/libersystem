@@ -42,18 +42,6 @@ pub fn read_byte() -> Option<u8> {
 	if data_ready() { Some(unsafe { inb(COM1) }) } else { None }
 }
 
-// Read one received byte, spinning until one arrives. Interrupts stay enabled
-// while spinning, so the timer and other cores keep running.
-#[cfg(not(test))]
-pub fn read_byte_blocking() -> u8 {
-	loop {
-		if let Some(byte) = read_byte() {
-			return byte;
-		}
-		core::hint::spin_loop();
-	}
-}
-
 pub struct SerialWriter;
 
 impl Write for SerialWriter {

@@ -49,6 +49,12 @@ const QUEUE_SIZE: u16 = 16;
 const DESC_NEXT: u16 = 1; // the buffer continues in the `next` descriptor
 const DESC_WRITE: u16 = 2; // the device writes this buffer (it is device-writable)
 
+// Available-ring flag: ask the device not to raise an interrupt when it consumes a
+// buffer. The polling drivers set this (they busy-poll the used ring and want no
+// interrupts, so their PCI INTx line - which may be shared with another device -
+// never asserts); an interrupt-driven driver clears it on its event queue.
+const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
+
 unsafe fn r8(addr: u64) -> u8 {
 	unsafe { (addr as *const u8).read_volatile() }
 }
@@ -90,6 +96,9 @@ pub struct Virtio {
 	// Base of the notify structure and its per-queue multiplier.
 	notify: u64,
 	notify_multiplier: u32,
+	// The ISR-status register: reading it returns the pending-interrupt reason and
+	// deasserts the device's (level-triggered INTx) line.
+	isr: u64,
 }
 
 // One set-up split virtqueue: its rings (in a DMA page) and the address/value used
@@ -101,8 +110,68 @@ pub struct Queue {
 	virt: u64,
 	avail_off: u64,
 	used_off: u64,
+	// The used-ring index consumed so far, so `take_used` knows what is new (the RX
+	// flow; unused by the synchronous `submit` path).
+	last_used: u16,
 	// Keeps the ring DMA buffer alive (the handle stays open).
 	handle: u64,
+}
+
+// The RX / event-queue flow: the device pushes to the driver. The driver posts a
+// pool of device-writable buffers once, then on each interrupt drains the buffers
+// the device filled and re-posts them. Unlike `submit` (one synchronous
+// request/response, busy-polled) this never blocks - the driver waits on its IRQ.
+impl Queue {
+	// Add a device-writable buffer (descriptor `id`, at physical `phys`, `len` bytes)
+	// to the available ring so the device can fill it. Used to seed the pool and to
+	// re-post each buffer after it is drained. Call `notify` after a batch.
+	pub unsafe fn post_recv(&self, id: u16, phys: u64, len: u32) {
+		unsafe {
+			let d = self.virt + id as u64 * 16;
+			w64(d, phys);
+			w32(d + 8, len);
+			w16(d + 12, DESC_WRITE);
+			w16(d + 14, 0);
+			let avail = self.virt + self.avail_off;
+			let idx = r16(avail + 2);
+			w16(avail + 4 + (idx % self.size) as u64 * 2, id);
+			fence(Ordering::SeqCst);
+			w16(avail + 2, idx.wrapping_add(1));
+		}
+	}
+
+	// Tell the device this queue has freshly posted buffers.
+	pub unsafe fn notify(&self) {
+		unsafe {
+			w16(self.notify_addr, self.index);
+		}
+	}
+
+	// Clear the available-ring NO_INTERRUPT flag, so the device interrupts when it
+	// fills a buffer on this queue (the interrupt-driven RX flow).
+	pub unsafe fn enable_interrupts(&self) {
+		unsafe {
+			w16(self.virt + self.avail_off, 0);
+		}
+	}
+
+	// Take the next buffer the device filled, as (descriptor id, bytes written), or
+	// None if nothing new since the last take. The driver reads buffer `id`, then
+	// re-posts it with `post_recv`.
+	pub unsafe fn take_used(&mut self) -> Option<(u16, u32)> {
+		unsafe {
+			let used = self.virt + self.used_off;
+			fence(Ordering::SeqCst);
+			if r16(used + 2) == self.last_used {
+				return None;
+			}
+			let elem = used + 4 + (self.last_used % self.size) as u64 * 8;
+			let id = r32(elem) as u16;
+			let len = r32(elem + 4);
+			self.last_used = self.last_used.wrapping_add(1);
+			Some((id, len))
+		}
+	}
 }
 
 // Run the device-initialization handshake up to FEATURES_OK (reset -> acknowledge
@@ -138,7 +207,7 @@ pub unsafe fn negotiate(mmio_base: u64, info: &DeviceInfo) -> Option<Virtio> {
 			w8(common + CFG_DEVICE_STATUS, STATUS_FAILED);
 			return None;
 		}
-		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier })
+		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, isr: mmio_base + info.isr_offset as u64 })
 	}
 }
 
@@ -166,13 +235,16 @@ impl Virtio {
 			// available ring (2-byte aligned), then the used ring (4-byte aligned).
 			let avail_off: u64 = 16 * size as u64;
 			let used_off: u64 = align_up(avail_off + 6 + 2 * size as u64, 4);
+			// suppress device interrupts by default: a polling driver wants none, and an
+			// interrupt-driven one re-enables them on its queue with `enable_interrupts`.
+			w16(virt + avail_off, VIRTQ_AVAIL_F_NO_INTERRUPT);
 			w64(self.common + CFG_QUEUE_DESC, phys);
 			w64(self.common + CFG_QUEUE_DRIVER, phys + avail_off);
 			w64(self.common + CFG_QUEUE_DEVICE, phys + used_off);
 			let notify_off: u16 = r16(self.common + CFG_QUEUE_NOTIFY_OFF);
 			w16(self.common + CFG_QUEUE_ENABLE, 1);
 
-			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt, avail_off, used_off, handle })
+			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt, avail_off, used_off, last_used: 0, handle })
 		}
 	}
 
@@ -192,6 +264,13 @@ impl Virtio {
 	// Read one byte of the device-specific config (e.g. a NIC's MAC bytes).
 	pub unsafe fn config_read(&self, offset: u64) -> u8 {
 		unsafe { r8(self.device + offset) }
+	}
+
+	// Read (and so acknowledge) the ISR-status register, deasserting the device's
+	// level-triggered INTx line. An interrupt-driven driver must do this each time it
+	// services an interrupt, or the line stays asserted and the IRQ storms.
+	pub unsafe fn isr_ack(&self) -> u8 {
+		unsafe { r8(self.isr) }
 	}
 }
 

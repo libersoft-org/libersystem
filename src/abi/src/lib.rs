@@ -60,6 +60,9 @@ pub const SYS_DMA_BUFFER_PHYS: u64 = 38;
 // its GSI through the I/O APIC), and acknowledge/re-arm a serviced interrupt.
 pub const SYS_DEVICE_INTERRUPT_ACQUIRE: u64 = 39;
 pub const SYS_INTERRUPT_ACK: u64 = 40;
+// Inject one byte into the kernel console input (a userspace input driver feeds the
+// interactive shell the same way the kernel's serial loop does).
+pub const SYS_CONSOLE_FEED: u64 = 41;
 
 // The ring-3 stack top an ELF-loaded process runs on: the kernel's loader maps a
 // stack just below this address, and a userspace spawner passes it to
@@ -84,6 +87,7 @@ pub const VIRTIO_TYPE_NET: u32 = 1;
 pub const VIRTIO_TYPE_BLOCK: u32 = 2;
 pub const VIRTIO_TYPE_CONSOLE: u32 = 3;
 pub const VIRTIO_TYPE_RNG: u32 = 4;
+pub const VIRTIO_TYPE_INPUT: u32 = 18;
 
 // What `device_info` writes about one discovered virtio device. The kernel
 // resolves these from the device's PCI capabilities at boot; a driver maps the

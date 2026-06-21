@@ -346,6 +346,14 @@ pub unsafe fn interrupt_ack(handle: u64) {
 	}
 }
 
+// Inject one byte into the kernel console input, feeding the interactive shell the
+// same way the kernel's serial loop does - used by the virtio-input keyboard driver.
+pub unsafe fn console_feed(byte: u8) {
+	unsafe {
+		syscall(SYS_CONSOLE_FEED, byte as u64, 0, 0, 0);
+	}
+}
+
 // Allocate a DmaBuffer of `size` bytes (pinned DMA memory charged to our Domain),
 // returning its handle, or a negative error.
 pub unsafe fn dma_buffer_create(size: u64) -> i64 {
