@@ -1210,6 +1210,457 @@ pub mod picker {
 	}
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ipv4Addr {
+	pub a: u8,
+	pub b: u8,
+	pub c: u8,
+	pub d: u8,
+}
+
+impl Ipv4Addr {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Ipv4Addr> {
+		Ipv4Addr::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(self.a)?;
+		w.u8(self.b)?;
+		w.u8(self.c)?;
+		w.u8(self.d)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<Ipv4Addr> {
+		let a = r.u8()?;
+		let b = r.u8()?;
+		let c = r.u8()?;
+		let d = r.u8()?;
+		Some(Ipv4Addr { a, b, c, d })
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Endpoint {
+	pub addr: Ipv4Addr,
+	pub port: u16,
+}
+
+impl Endpoint {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Endpoint> {
+		Endpoint::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.addr.write(w)?;
+		w.u16(self.port)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<Endpoint> {
+		let addr = Ipv4Addr::read(r)?;
+		let port = r.u16()?;
+		Some(Endpoint { addr, port })
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Neighbor {
+	pub addr: Ipv4Addr,
+	pub mac: Vec<u8>,
+}
+
+impl Neighbor {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Neighbor> {
+		Neighbor::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.addr.write(w)?;
+		if self.mac.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.mac.len() as u16)?;
+		for v40 in self.mac.iter() {
+			w.u8(*v40)?;
+		}
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<Neighbor> {
+		let addr = Ipv4Addr::read(r)?;
+		let mac = {
+			let v41 = r.u16()? as usize;
+			let mut v42 = Vec::new();
+			for _ in 0..v41 {
+				v42.push(r.u8()?);
+			}
+			v42
+		};
+		Some(Neighbor { addr, mac })
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetInfo {
+	pub addr: Ipv4Addr,
+	pub mac: Vec<u8>,
+	pub gateway: Ipv4Addr,
+	pub neighbors: Vec<Neighbor>,
+}
+
+impl NetInfo {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<NetInfo> {
+		NetInfo::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.addr.write(w)?;
+		if self.mac.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.mac.len() as u16)?;
+		for v43 in self.mac.iter() {
+			w.u8(*v43)?;
+		}
+		self.gateway.write(w)?;
+		if self.neighbors.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.neighbors.len() as u16)?;
+		for v44 in self.neighbors.iter() {
+			v44.write(w)?;
+		}
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<NetInfo> {
+		let addr = Ipv4Addr::read(r)?;
+		let mac = {
+			let v45 = r.u16()? as usize;
+			let mut v46 = Vec::new();
+			for _ in 0..v45 {
+				v46.push(r.u8()?);
+			}
+			v46
+		};
+		let gateway = Ipv4Addr::read(r)?;
+		let neighbors = {
+			let v47 = r.u16()? as usize;
+			let mut v48 = Vec::new();
+			for _ in 0..v47 {
+				v48.push(Neighbor::read(r)?);
+			}
+			v48
+		};
+		Some(NetInfo { addr, mac, gateway, neighbors })
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PingStatus {
+	Reply = 0,
+	Timeout = 1,
+	Unreachable = 2,
+}
+
+impl PingStatus {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PingStatus> {
+		PingStatus::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<PingStatus> {
+		match r.u8()? {
+			0 => Some(PingStatus::Reply),
+			1 => Some(PingStatus::Timeout),
+			2 => Some(PingStatus::Unreachable),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TcpRequest {
+	pub ep: Endpoint,
+	pub request: Vec<u8>,
+}
+
+impl TcpRequest {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<TcpRequest> {
+		TcpRequest::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.ep.write(w)?;
+		if self.request.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.request.len() as u16)?;
+		for v49 in self.request.iter() {
+			w.u8(*v49)?;
+		}
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<TcpRequest> {
+		let ep = Endpoint::read(r)?;
+		let request = {
+			let v50 = r.u16()? as usize;
+			let mut v51 = Vec::new();
+			for _ in 0..v50 {
+				v51.push(r.u8()?);
+			}
+			v51
+		};
+		Some(TcpRequest { ep, request })
+	}
+}
+
+// interface `network` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod network {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_INFO: u16 = 1;
+	pub const OP_RESOLVE: u16 = 2;
+	pub const OP_PING: u16 = 3;
+	pub const OP_FETCH: u16 = 4;
+
+	pub trait Service {
+		fn info(&mut self) -> Result<NetInfo, Error>;
+		fn resolve(&mut self, name: String) -> Result<Ipv4Addr, Error>;
+		fn ping(&mut self, addr: Ipv4Addr) -> Result<PingStatus, Error>;
+		fn fetch(&mut self, req: TcpRequest) -> Result<Vec<u8>, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = Reader::with_handle(request, request_handle);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		match op {
+			OP_INFO => {
+				let result = service.info();
+				match &result {
+					Ok(v52) => {
+						w.u8(1)?;
+						v52.write(w)?;
+					}
+					Err(v53) => {
+						w.u8(0)?;
+						v53.write(w)?;
+					}
+				}
+			}
+			OP_RESOLVE => {
+				let name = r.string_lp()?;
+				let result = service.resolve(name);
+				match &result {
+					Ok(v54) => {
+						w.u8(1)?;
+						v54.write(w)?;
+					}
+					Err(v55) => {
+						w.u8(0)?;
+						v55.write(w)?;
+					}
+				}
+			}
+			OP_PING => {
+				let addr = Ipv4Addr::read(r)?;
+				let result = service.ping(addr);
+				match &result {
+					Ok(v56) => {
+						w.u8(1)?;
+						v56.write(w)?;
+					}
+					Err(v57) => {
+						w.u8(0)?;
+						v57.write(w)?;
+					}
+				}
+			}
+			OP_FETCH => {
+				let req = TcpRequest::read(r)?;
+				let result = service.fetch(req);
+				match &result {
+					Ok(v58) => {
+						w.u8(1)?;
+						if v58.len() > u16::MAX as usize {
+							return None;
+						}
+						w.u16(v58.len() as u16)?;
+						for v60 in v58.iter() {
+							w.u8(*v60)?;
+						}
+					}
+					Err(v59) => {
+						w.u8(0)?;
+						v59.write(w)?;
+					}
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn info(&mut self) -> Option<Result<NetInfo, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_INFO)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(NetInfo::read(r)?) } else { Err(Error::read(r)?) })
+		}
+		pub fn resolve(&mut self, name: &str) -> Option<Result<Ipv4Addr, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RESOLVE)?;
+			w.u32(corr)?;
+			w.bytes_lp(name.as_bytes())?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(Ipv4Addr::read(r)?) } else { Err(Error::read(r)?) })
+		}
+		pub fn ping(&mut self, addr: &Ipv4Addr) -> Option<Result<PingStatus, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_PING)?;
+			w.u32(corr)?;
+			addr.write(w)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(PingStatus::read(r)?) } else { Err(Error::read(r)?) })
+		}
+		pub fn fetch(&mut self, req: &TcpRequest) -> Option<Result<Vec<u8>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_FETCH)?;
+			w.u32(corr)?;
+			req.write(w)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 {
+				Ok({
+					let v61 = r.u16()? as usize;
+					let mut v62 = Vec::new();
+					for _ in 0..v61 {
+						v62.push(r.u8()?);
+					}
+					v62
+				})
+			} else {
+				Err(Error::read(r)?)
+			})
+		}
+	}
+}
+
 impl Error {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1329,13 +1780,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v41 = true;
-		for v40 in self.fields.iter() {
-			if !v41 {
+		let mut v64 = true;
+		for v63 in self.fields.iter() {
+			if !v64 {
 				out.push(',');
 			}
-			v41 = false;
-			v40.to_json_into(out);
+			v64 = false;
+			v63.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1353,13 +1804,13 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v43 = true;
-		for v42 in self.fields.iter() {
-			if !v43 {
+		let mut v66 = true;
+		for v65 in self.fields.iter() {
+			if !v66 {
 				out.push_str(", ");
 			}
-			v43 = false;
-			v42.to_text_into(out);
+			v66 = false;
+			v65.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1381,8 +1832,8 @@ impl Query {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v44) => {
-				let _ = write!(out, "{}", v44);
+			Some(v67) => {
+				let _ = write!(out, "{}", v67);
 			}
 			None => {
 				out.push_str("null");
@@ -1391,8 +1842,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v45) => {
-				v45.to_json_into(out);
+			Some(v68) => {
+				v68.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -1401,8 +1852,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v46) => {
-				crate::codec::json_escape(v46, out);
+			Some(v69) => {
+				crate::codec::json_escape(v69, out);
 			}
 			None => {
 				out.push_str("null");
@@ -1417,8 +1868,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v47) => {
-				let _ = write!(out, "{}", v47);
+			Some(v70) => {
+				let _ = write!(out, "{}", v70);
 			}
 			None => {
 				out.push('-');
@@ -1427,8 +1878,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v48) => {
-				v48.to_text_into(out);
+			Some(v71) => {
+				v71.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -1437,8 +1888,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v49) => {
-				out.push_str(v49);
+			Some(v72) => {
+				out.push_str(v72);
 			}
 			None => {
 				out.push('-');
@@ -1700,6 +2151,284 @@ impl Picked {
 	}
 }
 
+impl Ipv4Addr {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"a\":");
+		let _ = write!(out, "{}", self.a);
+		out.push(',');
+		out.push_str("\"b\":");
+		let _ = write!(out, "{}", self.b);
+		out.push(',');
+		out.push_str("\"c\":");
+		let _ = write!(out, "{}", self.c);
+		out.push(',');
+		out.push_str("\"d\":");
+		let _ = write!(out, "{}", self.d);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("a=");
+		let _ = write!(out, "{}", self.a);
+		out.push_str(", ");
+		out.push_str("b=");
+		let _ = write!(out, "{}", self.b);
+		out.push_str(", ");
+		out.push_str("c=");
+		let _ = write!(out, "{}", self.c);
+		out.push_str(", ");
+		out.push_str("d=");
+		let _ = write!(out, "{}", self.d);
+		out.push('}');
+	}
+}
+
+impl Endpoint {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"addr\":");
+		self.addr.to_json_into(out);
+		out.push(',');
+		out.push_str("\"port\":");
+		let _ = write!(out, "{}", self.port);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("addr=");
+		self.addr.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("port=");
+		let _ = write!(out, "{}", self.port);
+		out.push('}');
+	}
+}
+
+impl Neighbor {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"addr\":");
+		self.addr.to_json_into(out);
+		out.push(',');
+		out.push_str("\"mac\":");
+		out.push('[');
+		let mut v74 = true;
+		for v73 in self.mac.iter() {
+			if !v74 {
+				out.push(',');
+			}
+			v74 = false;
+			let _ = write!(out, "{}", v73);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("addr=");
+		self.addr.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("mac=");
+		out.push('[');
+		let mut v76 = true;
+		for v75 in self.mac.iter() {
+			if !v76 {
+				out.push_str(", ");
+			}
+			v76 = false;
+			let _ = write!(out, "{}", v75);
+		}
+		out.push(']');
+		out.push('}');
+	}
+}
+
+impl NetInfo {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"addr\":");
+		self.addr.to_json_into(out);
+		out.push(',');
+		out.push_str("\"mac\":");
+		out.push('[');
+		let mut v78 = true;
+		for v77 in self.mac.iter() {
+			if !v78 {
+				out.push(',');
+			}
+			v78 = false;
+			let _ = write!(out, "{}", v77);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"gateway\":");
+		self.gateway.to_json_into(out);
+		out.push(',');
+		out.push_str("\"neighbors\":");
+		out.push('[');
+		let mut v80 = true;
+		for v79 in self.neighbors.iter() {
+			if !v80 {
+				out.push(',');
+			}
+			v80 = false;
+			v79.to_json_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("addr=");
+		self.addr.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("mac=");
+		out.push('[');
+		let mut v82 = true;
+		for v81 in self.mac.iter() {
+			if !v82 {
+				out.push_str(", ");
+			}
+			v82 = false;
+			let _ = write!(out, "{}", v81);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("gateway=");
+		self.gateway.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("neighbors=");
+		out.push('[');
+		let mut v84 = true;
+		for v83 in self.neighbors.iter() {
+			if !v84 {
+				out.push_str(", ");
+			}
+			v84 = false;
+			v83.to_text_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+}
+
+impl PingStatus {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			PingStatus::Reply => out.push_str("\"reply\""),
+			PingStatus::Timeout => out.push_str("\"timeout\""),
+			PingStatus::Unreachable => out.push_str("\"unreachable\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			PingStatus::Reply => out.push_str("reply"),
+			PingStatus::Timeout => out.push_str("timeout"),
+			PingStatus::Unreachable => out.push_str("unreachable"),
+		}
+	}
+}
+
+impl TcpRequest {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"ep\":");
+		self.ep.to_json_into(out);
+		out.push(',');
+		out.push_str("\"request\":");
+		out.push('[');
+		let mut v86 = true;
+		for v85 in self.request.iter() {
+			if !v86 {
+				out.push(',');
+			}
+			v86 = false;
+			let _ = write!(out, "{}", v85);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("ep=");
+		self.ep.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("request=");
+		out.push('[');
+		let mut v88 = true;
+		for v87 in self.request.iter() {
+			if !v88 {
+				out.push_str(", ");
+			}
+			v88 = false;
+			let _ = write!(out, "{}", v87);
+		}
+		out.push(']');
+		out.push('}');
+	}
+}
+
 #[cfg(test)]
 mod compat {
 	use super::*;
@@ -1784,5 +2513,53 @@ mod compat {
 		let golden: &[u8] = &[1, 0, 120, 1, 0, 120];
 		assert_eq!(bytes, golden);
 		assert_eq!(ConfigEntry::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn ipv4_addr_wire_is_stable() {
+		let sample = Ipv4Addr { a: 7, b: 7, c: 7, d: 7 };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[7, 7, 7, 7];
+		assert_eq!(bytes, golden);
+		assert_eq!(Ipv4Addr::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn endpoint_wire_is_stable() {
+		let sample = Endpoint { addr: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, port: 7 };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[7, 7, 7, 7, 7, 0];
+		assert_eq!(bytes, golden);
+		assert_eq!(Endpoint::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn neighbor_wire_is_stable() {
+		let sample = Neighbor { addr: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, mac: alloc::vec![7] };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[7, 7, 7, 7, 1, 0, 7];
+		assert_eq!(bytes, golden);
+		assert_eq!(Neighbor::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn net_info_wire_is_stable() {
+		let sample = NetInfo { addr: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, mac: alloc::vec![7], gateway: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, neighbors: alloc::vec![Neighbor { addr: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, mac: alloc::vec![7] }] };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[7, 7, 7, 7, 1, 0, 7, 7, 7, 7, 7, 1, 0, 7, 7, 7, 7, 1, 0, 7];
+		assert_eq!(bytes, golden);
+		assert_eq!(NetInfo::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn ping_status_wire_is_stable() {
+		let sample = PingStatus::Reply;
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[0];
+		assert_eq!(bytes, golden);
+		assert_eq!(PingStatus::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn tcp_request_wire_is_stable() {
+		let sample = TcpRequest { ep: Endpoint { addr: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, port: 7 }, request: alloc::vec![7] };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[7, 7, 7, 7, 7, 0, 1, 0, 7];
+		assert_eq!(bytes, golden);
+		assert_eq!(TcpRequest::decode(&bytes).unwrap(), sample);
 	}
 }

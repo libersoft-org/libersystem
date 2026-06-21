@@ -109,6 +109,53 @@ An opaque kernel object, transferred as `handle<file>`.
 | `size` | `u64` |
 | `name` | `string` |
 
+### record `ipv4-addr`
+
+| field | type |
+| --- | --- |
+| `a` | `u8` |
+| `b` | `u8` |
+| `c` | `u8` |
+| `d` | `u8` |
+
+### record `endpoint`
+
+| field | type |
+| --- | --- |
+| `addr` | `ipv4-addr` |
+| `port` | `u16` |
+
+### record `neighbor`
+
+| field | type |
+| --- | --- |
+| `addr` | `ipv4-addr` |
+| `mac` | `list<u8>` |
+
+### record `net-info`
+
+| field | type |
+| --- | --- |
+| `addr` | `ipv4-addr` |
+| `mac` | `list<u8>` |
+| `gateway` | `ipv4-addr` |
+| `neighbors` | `list<neighbor>` |
+
+### enum `ping-status`
+
+| case | ordinal |
+| --- | --- |
+| `reply` | 0 |
+| `timeout` | 1 |
+| `unreachable` | 2 |
+
+### record `tcp-request`
+
+| field | type |
+| --- | --- |
+| `ep` | `endpoint` |
+| `request` | `list<u8>` |
+
 ## Interfaces
 
 ### interface `log`
@@ -164,4 +211,15 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `pick` | `pick() -> result<picked, error>` |
+
+### interface `network`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `info` | `info() -> result<net-info, error>` |
+| 2 | `resolve` | `resolve(name: string) -> result<ipv4-addr, error>` |
+| 3 | `ping` | `ping(addr: ipv4-addr) -> result<ping-status, error>` |
+| 4 | `fetch` | `fetch(req: tcp-request) -> result<list<u8>, error>` |
 

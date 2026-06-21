@@ -14,7 +14,7 @@
 extern crate alloc;
 
 use alloc::string::String;
-use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, config, device, log, process, volume};
+use proto::system::{ConfigEntry, DeviceEntry, Endpoint, Entry, Error, Ipv4Addr, OpenOpts, PingStatus, ProcessInfo, Query, TcpRequest, config, device, log, network, process, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -221,58 +221,44 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 	}
 }
 
-// Query the net driver for its interface state (`ip` / `net`) and render it: our
-// address, MAC, gateway, and the ARP neighbor cache. The reply is the packed state
-// the driver builds from net::Stack::write_state.
+// Query NetworkService for its interface state (`ip` / `net`) over the typed
+// `network` interface and render it: our address, MAC, gateway, and the neighbor
+// cache (each a typed object, not a packed byte blob).
 unsafe fn query_ip(netsvc: u64) {
 	unsafe {
 		if netsvc == 0 {
 			print(b"ip: no network interface\n");
 			return;
 		}
-		if !send_blocking(netsvc, b"IP", 0) {
-			print(b"ip: request failed\n");
-			return;
-		}
-		let mut buf: [u8; 256] = [0u8; 256];
-		let n: usize = match recv_blocking(netsvc, &mut buf) {
-			Received::Message { len, .. } => len,
-			Received::Closed => {
-				print(b"ip: network driver gone\n");
-				return;
-			}
-		};
-		if n < 15 {
-			print(b"ip: short reply\n");
-			return;
-		}
-		print(b"net0: ");
-		print_ip(&buf[0..4]);
-		print(b"  mac ");
-		print_mac(&buf[4..10]);
-		print(b"  gateway ");
-		print_ip(&buf[10..14]);
-		print(b"\n");
-		let count: usize = buf[14] as usize;
-		if count > 0 {
-			print(b"neighbors:\n");
-			let mut i: usize = 0;
-			while i < count && 15 + i * 10 + 10 <= n {
-				let off: usize = 15 + i * 10;
-				print(b"  ");
-				print_ip(&buf[off..off + 4]);
-				print(b"  ");
-				print_mac(&buf[off + 4..off + 10]);
+		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
+		match client.info() {
+			Some(Ok(info)) => {
+				print(b"net0: ");
+				print_ip(&[info.addr.a, info.addr.b, info.addr.c, info.addr.d]);
+				print(b"  mac ");
+				print_mac(&info.mac);
+				print(b"  gateway ");
+				print_ip(&[info.gateway.a, info.gateway.b, info.gateway.c, info.gateway.d]);
 				print(b"\n");
-				i += 1;
+				if !info.neighbors.is_empty() {
+					print(b"neighbors:\n");
+					for n in &info.neighbors {
+						print(b"  ");
+						print_ip(&[n.addr.a, n.addr.b, n.addr.c, n.addr.d]);
+						print(b"  ");
+						print_mac(&n.mac);
+						print(b"\n");
+					}
+				}
 			}
+			Some(Err(_)) => print(b"ip: network error\n"),
+			None => print(b"ip: service unavailable\n"),
 		}
 	}
 }
 
-// Send a `ping` to `target` (a dotted-decimal address) through the net driver and
-// render the result (the driver does the ARP + echo round-trip and replies with a
-// status byte).
+// Send a `ping` to `target` (a dotted-decimal address) through NetworkService over
+// the typed `network` interface and render the outcome.
 unsafe fn ping_host(netsvc: u64, target: &[u8]) {
 	unsafe {
 		if netsvc == 0 {
@@ -286,33 +272,22 @@ unsafe fn ping_host(netsvc: u64, target: &[u8]) {
 				return;
 			}
 		};
-		let mut req: [u8; 8] = [0u8; 8];
-		req[..4].copy_from_slice(b"PING");
-		req[4..8].copy_from_slice(&ip);
-		if !send_blocking(netsvc, &req, 0) {
-			print(b"ping: request failed\n");
-			return;
-		}
-		let mut buf: [u8; 16] = [0u8; 16];
-		let status: u8 = match recv_blocking(netsvc, &mut buf) {
-			Received::Message { len, .. } if len >= 1 => buf[0],
-			_ => {
-				print(b"ping: no response from driver\n");
-				return;
-			}
-		};
+		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
+		let addr: Ipv4Addr = Ipv4Addr { a: ip[0], b: ip[1], c: ip[2], d: ip[3] };
 		print(b"ping ");
 		print(target);
-		match status {
-			1 => print(b": reply\n"),
-			2 => print(b": unreachable (no ARP reply)\n"),
-			_ => print(b": no reply (timeout)\n"),
+		match client.ping(&addr) {
+			Some(Ok(PingStatus::Reply)) => print(b": reply\n"),
+			Some(Ok(PingStatus::Unreachable)) => print(b": unreachable (no route)\n"),
+			Some(Ok(PingStatus::Timeout)) => print(b": no reply (timeout)\n"),
+			Some(Err(_)) => print(b": error\n"),
+			None => print(b": service unavailable\n"),
 		}
 	}
 }
 
-// Resolve `name` through the net driver's DNS client (`nslookup` / `host`) and render
-// the result: the resolved address, or a not-found message.
+// Resolve `name` through NetworkService's DNS client (`nslookup` / `host`) over the
+// typed `network` interface and render the resolved address or a not-found message.
 unsafe fn dns_lookup(netsvc: u64, name: &[u8]) {
 	unsafe {
 		if netsvc == 0 {
@@ -323,33 +298,34 @@ unsafe fn dns_lookup(netsvc: u64, name: &[u8]) {
 			print(b"nslookup: invalid name\n");
 			return;
 		}
-		let mut req: [u8; 128] = [0u8; 128];
-		req[..3].copy_from_slice(b"DNS");
-		req[3..3 + name.len()].copy_from_slice(name);
-		if !send_blocking(netsvc, &req[..3 + name.len()], 0) {
-			print(b"nslookup: request failed\n");
-			return;
-		}
-		let mut buf: [u8; 16] = [0u8; 16];
-		match recv_blocking(netsvc, &mut buf) {
-			Received::Message { len, .. } if len >= 5 && buf[0] == 1 => {
+		let name_str: &str = match core::str::from_utf8(name) {
+			Ok(s) => s,
+			Err(_) => {
+				print(b"nslookup: invalid name\n");
+				return;
+			}
+		};
+		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
+		match client.resolve(name_str) {
+			Some(Ok(addr)) => {
 				print(name);
 				print(b" has address ");
-				print_ip(&buf[1..5]);
+				print_ip(&[addr.a, addr.b, addr.c, addr.d]);
 				print(b"\n");
 			}
-			Received::Message { .. } => {
+			Some(Err(_)) => {
 				print(b"nslookup: could not resolve ");
 				print(name);
 				print(b"\n");
 			}
-			Received::Closed => print(b"nslookup: network driver gone\n"),
+			None => print(b"nslookup: network service gone\n"),
 		}
 	}
 }
 
-// Open a TCP connection to `<ip> <port>` through NetworkService, send a minimal
-// HTTP/1.0 GET probe, and print the connection result and any response received.
+// Open a TCP connection to `<ip> <port>` through NetworkService over the typed
+// `network` interface, send a minimal HTTP/1.0 GET probe, and print the connection
+// result and any response received.
 unsafe fn tcp_connect(netsvc: u64, args: &[u8]) {
 	unsafe {
 		if netsvc == 0 {
@@ -378,36 +354,24 @@ unsafe fn tcp_connect(netsvc: u64, args: &[u8]) {
 				return;
 			}
 		};
-		const REQ: &[u8] = b"GET / HTTP/1.0\r\n\r\n";
-		let mut msg: [u8; 64] = [0u8; 64];
-		msg[..3].copy_from_slice(b"TCP");
-		msg[3..7].copy_from_slice(&ip);
-		msg[7] = (port >> 8) as u8;
-		msg[8] = port as u8;
-		msg[9..9 + REQ.len()].copy_from_slice(REQ);
-		if !send_blocking(netsvc, &msg[..9 + REQ.len()], 0) {
-			print(b"tcp: request failed\n");
-			return;
-		}
-		let mut buf: [u8; 600] = [0u8; 600];
-		match recv_blocking(netsvc, &mut buf) {
-			Received::Message { len, .. } if len >= 1 => match buf[0] {
-				1 => {
-					print(b"tcp ");
-					print(host);
-					if len > 1 {
-						print(b": connected\n");
-						print(&buf[1..len]);
-						print(b"\n");
-					} else {
-						print(b": connected (no data)\n");
-					}
+		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
+		let req: TcpRequest = TcpRequest { ep: Endpoint { addr: Ipv4Addr { a: ip[0], b: ip[1], c: ip[2], d: ip[3] }, port }, request: b"GET / HTTP/1.0\r\n\r\n".to_vec() };
+		match client.fetch(&req) {
+			Some(Ok(data)) => {
+				print(b"tcp ");
+				print(host);
+				if data.is_empty() {
+					print(b": connected (no data)\n");
+				} else {
+					print(b": connected\n");
+					print(&data);
+					print(b"\n");
 				}
-				2 => print(b"tcp: unreachable (no route)\n"),
-				3 => print(b"tcp: connection refused\n"),
-				_ => print(b"tcp: connection timed out\n"),
-			},
-			_ => print(b"tcp: no response\n"),
+			}
+			Some(Err(Error::NotFound)) => print(b"tcp: unreachable (no route)\n"),
+			Some(Err(Error::Denied)) => print(b"tcp: connection refused\n"),
+			Some(Err(_)) => print(b"tcp: connection timed out\n"),
+			None => print(b"tcp: service unavailable\n"),
 		}
 	}
 }

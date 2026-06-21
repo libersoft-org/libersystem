@@ -152,3 +152,59 @@ record picked {
 interface picker {
 	@op(1) pick: func() -> result<picked, error>;
 }
+
+// A 32-bit IPv4 address as four octets - the canonical typed network address, never
+// a parsed string on the wire (a textual form is only ever a rendering of these
+// octets).
+record ipv4-addr {
+	a: u8,
+	b: u8,
+	c: u8,
+	d: u8,
+}
+
+// A transport endpoint: an IPv4 address and a port.
+record endpoint {
+	addr: ipv4-addr,
+	port: u16,
+}
+
+// A neighbor-cache entry: an on-link address and the MAC (6 bytes) it resolved to.
+record neighbor {
+	addr: ipv4-addr,
+	mac:  list<u8>,
+}
+
+// The interface's L3 state: our address, our MAC (6 bytes), the gateway, and the
+// neighbor cache - the typed form of what the `ip` / `net` command renders.
+record net-info {
+	addr:      ipv4-addr,
+	mac:       list<u8>,
+	gateway:   ipv4-addr,
+	neighbors: list<neighbor>,
+}
+
+// The outcome of a ping: a reply arrived, it timed out, or the target was
+// unreachable (no route / no ARP).
+enum ping-status {
+	reply,
+	timeout,
+	unreachable,
+}
+
+// A one-shot TCP exchange: connect to `ep`, send `request`, and read the response.
+record tcp-request {
+	ep:      endpoint,
+	request: list<u8>,
+}
+
+// The NetworkService contract: the interface state, name resolution, ping, and a
+// one-shot TCP fetch - the network reachable through the typed API like every other
+// service. Sockets handed out as capabilities and a received-data stream<T> land in
+// M33 step 4b.
+interface network {
+	@op(1) info:    func() -> result<net-info, error>;
+	@op(2) resolve: func(name: string) -> result<ipv4-addr, error>;
+	@op(3) ping:    func(addr: ipv4-addr) -> result<ping-status, error>;
+	@op(4) fetch:   func(req: tcp-request) -> result<list<u8>, error>;
+}

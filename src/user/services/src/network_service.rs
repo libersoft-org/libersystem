@@ -5,21 +5,26 @@
 // single channel, forwards each received Ethernet frame to this service and
 // transmits each frame this service hands back. NetworkService owns the stack
 // (`net`): it learns the NIC's MAC from the driver, answers ARP and ICMP, and
-// serves clients (the shell, later the net tools) the `ip` / `ping` / `nslookup`
-// control protocol - the same raw protocol M32's shell spoke to the driver, moved
-// behind the service. It stands on the driver's frame channel and its client
-// channel at once with `wait_any`, so an inbound frame and a client request never
-// block each other. The typed sockets API (Endpoint/SocketAddr, listen/accept/
-// connect) and many-client serving land on top of this seam next.
+// serves clients (the shell, later the net tools) the typed `network` interface -
+// `info` / `resolve` / `ping` / `fetch` over generated `liber:system` bindings, so
+// the network is reachable through the typed API like every other service. It
+// stands on the driver's frame channel and its client channel at once with
+// `wait_any`, so an inbound frame and a client request never block each other.
+// Sockets handed out as capabilities and a received-data stream<T> land here next.
 
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod net;
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use rt::*;
 
 use crate::net::{Event, Ipv4Addr, MacAddr, Stack};
+use proto::system::{Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingStatus, TcpRequest, network};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -47,6 +52,10 @@ const TCP_REPLY_MAX: usize = 512;
 // The frame-buffer size: one full Ethernet frame (1514 bytes) with slack. The
 // driver forwards frames without the virtio_net_hdr, so this is the L2 frame only.
 const FRAME_MAX: usize = 2048;
+// The typed request and reply buffers for one client call (a `fetch` reply carries
+// up to TCP_REPLY_MAX response bytes plus the codec framing).
+const REQ_MAX: usize = 256;
+const REPLY_MAX: usize = 1024;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -64,13 +73,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			_ => exit(),
 		};
 		let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP);
-		// 3. report in, then announce ourselves on the link with a gratuitous ARP for
-		//    the gateway (the driver transmits it).
+		// 3. report in, then serve the network and the client at once (serve announces
+		//    us on the link with a gratuitous ARP first).
 		send_blocking(bootstrap, b"NetworkService: online", 0);
-		let mut tx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
-		let arp: usize = stack.build_arp_request(GATEWAY_IP, &mut tx);
-		send_frame(frames, &tx[..arp]);
-		// 4. serve the network and the client at once.
 		serve(frames, client, &mut stack);
 	}
 }
@@ -101,17 +106,20 @@ unsafe fn pump(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> 
 	}
 }
 
-// Stand on the driver's frame channel and the client's control channel at once
-// (wait_any): a frame from the driver is parsed (answering ARP / ICMP, any reply
-// sent back to transmit); a control message is answered (`ip` interface state,
-// `ping` an echo, `nslookup` a DNS lookup). The client channel closing (the shell
-// exited) drops us back to serving only the network.
+// Stand on the driver's frame channel and the client's typed request channel at
+// once (wait_any): a frame from the driver is parsed (answering ARP / ICMP, any
+// reply sent back to transmit); a client request is decoded, dispatched to the
+// generated `network` server, and answered. The client channel closing (the shell
+// exited) drops us back to serving only the network. The gratuitous ARP that
+// announces us on the link goes out first.
 unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 	unsafe {
 		let mut rx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
 		let mut tx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
-		let mut ctl: [u8; 128] = [0u8; 128];
-		let mut seq: u16 = 0;
+		let mut req: [u8; REQ_MAX] = [0u8; REQ_MAX];
+		let mut out: [u8; REPLY_MAX] = [0u8; REPLY_MAX];
+		let arp: usize = stack.build_arp_request(GATEWAY_IP, &mut tx);
+		send_frame(frames, &tx[..arp]);
 		let mut client_open: bool = true;
 		loop {
 			let ready: i64 = if client_open {
@@ -123,8 +131,14 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 			if ready == 0 {
 				pump(frames, stack, &mut rx, &mut tx);
 			} else if ready == 1 {
-				match recv_blocking(client, &mut ctl) {
-					Received::Message { len, .. } => handle_control(&ctl[..len], client, frames, stack, &mut seq, &mut rx, &mut tx),
+				match recv_blocking(client, &mut req) {
+					Received::Message { len, handle } => {
+						let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx, tx: &mut tx };
+						let mut reply_handle: u64 = 0;
+						if let Some(n) = network::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
+							send_blocking(client, &out[..n], reply_handle);
+						}
+					}
 					Received::Closed => client_open = false,
 				}
 			}
@@ -132,40 +146,72 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 	}
 }
 
-// Answer one control request: `ip` replies with the serialized interface state;
-// `PING` + a 4-byte address sends an echo request and reports the reply; `DNS` + a
-// name resolves it. Each reply leads with a status byte.
-#[allow(clippy::too_many_arguments)]
-unsafe fn handle_control(req: &[u8], client: u64, frames: u64, stack: &mut Stack, seq: &mut u16, rx: &mut [u8], tx: &mut [u8]) {
-	unsafe {
-		let mut out: [u8; 128] = [0u8; 128];
-		if req == b"IP" {
-			let n: usize = stack.write_state(&mut out);
-			send_blocking(client, &out[..n], 0);
-		} else if req.len() >= 8 && &req[..4] == b"PING" {
-			let ip: Ipv4Addr = Ipv4Addr([req[4], req[5], req[6], req[7]]);
-			let status: u8 = do_ping(ip, frames, stack, seq, rx, tx);
-			out[0] = status;
-			out[1..5].copy_from_slice(&ip.0);
-			send_blocking(client, &out[..5], 0);
-		} else if req.len() > 3 && &req[..3] == b"DNS" {
-			match do_dns(&req[3..], frames, stack, seq, rx, tx) {
-				Some(addr) => {
-					out[0] = 1;
-					out[1..5].copy_from_slice(&addr.0);
-					send_blocking(client, &out[..5], 0);
-				}
-				None => {
-					out[0] = 0;
-					send_blocking(client, &out[..1], 0);
-				}
+// The state the typed `network` service operates on for one client request: the
+// driver frame channel, an ICMP/DNS sequence counter, the stack, and the frame
+// scratch buffers - the stack and buffers are borrowed from the serve loop, so the
+// connection state and the 2 KiB frame buffers are not duplicated on the stack.
+struct Net<'a> {
+	frames: u64,
+	seq: u16,
+	stack: &'a mut Stack,
+	rx: &'a mut [u8],
+	tx: &'a mut [u8],
+}
+
+// Convert the stack's internal address to the wire (canonical) form, and back.
+fn to_wire(ip: Ipv4Addr) -> WireIp {
+	WireIp { a: ip.0[0], b: ip.0[1], c: ip.0[2], d: ip.0[3] }
+}
+
+fn from_wire(ip: &WireIp) -> Ipv4Addr {
+	Ipv4Addr([ip.a, ip.b, ip.c, ip.d])
+}
+
+impl network::Service for Net<'_> {
+	// The interface state: our address, MAC, gateway, and the neighbor cache.
+	fn info(&mut self) -> Result<NetInfo, Error> {
+		let mut neighbors: Vec<Neighbor> = Vec::new();
+		let mut i: usize = 0;
+		while let Some((nip, nmac)) = self.stack.neigh_at(i) {
+			neighbors.push(Neighbor { addr: to_wire(nip), mac: nmac.0.to_vec() });
+			i += 1;
+		}
+		Ok(NetInfo { addr: to_wire(self.stack.ip()), mac: self.stack.mac().0.to_vec(), gateway: to_wire(self.stack.gateway()), neighbors })
+	}
+
+	// Resolve a name to an address via the DNS client.
+	fn resolve(&mut self, name: String) -> Result<WireIp, Error> {
+		unsafe {
+			match do_dns(name.as_bytes(), self.frames, self.stack, &mut self.seq, self.rx, self.tx) {
+				Some(addr) => Ok(to_wire(addr)),
+				None => Err(Error::NotFound),
 			}
-		} else if req.len() >= 9 && &req[..3] == b"TCP" {
-			let ip: Ipv4Addr = Ipv4Addr([req[3], req[4], req[5], req[6]]);
-			let port: u16 = ((req[7] as u16) << 8) | req[8] as u16;
-			let mut reply: [u8; 1 + TCP_REPLY_MAX] = [0u8; 1 + TCP_REPLY_MAX];
-			let n: usize = do_tcp(ip, port, &req[9..], frames, stack, rx, tx, &mut reply);
-			send_blocking(client, &reply[..n], 0);
+		}
+	}
+
+	// Ping an address: a reply, a timeout, or unreachable (no route / no ARP).
+	fn ping(&mut self, addr: WireIp) -> Result<PingStatus, Error> {
+		unsafe {
+			Ok(match do_ping(from_wire(&addr), self.frames, self.stack, &mut self.seq, self.rx, self.tx) {
+				1 => PingStatus::Reply,
+				2 => PingStatus::Unreachable,
+				_ => PingStatus::Timeout,
+			})
+		}
+	}
+
+	// A one-shot TCP exchange: connect, send the request, read the response, close.
+	// Maps the connect failure modes onto the error enum.
+	fn fetch(&mut self, req: TcpRequest) -> Result<Vec<u8>, Error> {
+		unsafe {
+			let mut data: [u8; 1 + TCP_REPLY_MAX] = [0u8; 1 + TCP_REPLY_MAX];
+			let n: usize = do_tcp(from_wire(&req.ep.addr), req.ep.port, &req.request, self.frames, self.stack, self.rx, self.tx, &mut data);
+			match data[0] {
+				1 => Ok(data[1..n].to_vec()),
+				2 => Err(Error::NotFound),
+				3 => Err(Error::Denied),
+				_ => Err(Error::Again),
+			}
 		}
 	}
 }

@@ -296,6 +296,12 @@ impl Stack {
 		None
 	}
 
+	// The `idx`-th valid neighbor (address + MAC), or None past the end - the
+	// iteration the typed `info` interface state is built from.
+	pub fn neigh_at(&self, idx: usize) -> Option<(Ipv4Addr, MacAddr)> {
+		self.neigh.iter().filter(|n: &&Neigh| n.valid).nth(idx).map(|n: &Neigh| (n.ip, n.mac))
+	}
+
 	// Serialize the interface state for the `ip` / `net` command into `out`, returning
 	// its length: our address (4), MAC (6), gateway (4), the neighbor count (1), then
 	// that many (ip 4, mac 6) cache entries. The shell parses and renders it.
