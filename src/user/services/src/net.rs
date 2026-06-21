@@ -130,13 +130,14 @@ pub struct Outcome {
 pub struct Stack {
 	mac: MacAddr,
 	ip: Ipv4Addr,
+	mask: Ipv4Addr,
 	gateway: Ipv4Addr,
 	neigh: [Neigh; NEIGH_MAX],
 }
 
 impl Stack {
-	pub fn new(mac: MacAddr, ip: Ipv4Addr, gateway: Ipv4Addr) -> Stack {
-		Stack { mac, ip, gateway, neigh: [Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; NEIGH_MAX] }
+	pub fn new(mac: MacAddr, ip: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr) -> Stack {
+		Stack { mac, ip, mask, gateway, neigh: [Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; NEIGH_MAX] }
 	}
 
 	pub fn mac(&self) -> MacAddr {
@@ -149,6 +150,26 @@ impl Stack {
 
 	pub fn gateway(&self) -> Ipv4Addr {
 		self.gateway
+	}
+
+	// The next-hop address for reaching `dst`: `dst` itself when it shares our subnet
+	// (on-link, reached by direct ARP), otherwise the gateway (off-link, routed). The
+	// L3 destination of the packet is still `dst`; only the L2 MAC we resolve changes.
+	pub fn next_hop(&self, dst: Ipv4Addr) -> Ipv4Addr {
+		if self.on_link(dst) { dst } else { self.gateway }
+	}
+
+	// Whether `dst` is on our local subnet (its network part matches ours under the
+	// mask), so it is reachable by a direct ARP rather than through the gateway.
+	fn on_link(&self, dst: Ipv4Addr) -> bool {
+		let mut i: usize = 0;
+		while i < 4 {
+			if (dst.0[i] & self.mask.0[i]) != (self.ip.0[i] & self.mask.0[i]) {
+				return false;
+			}
+			i += 1;
+		}
+		true
 	}
 
 	// Record (or refresh) a neighbor's MAC, evicting the oldest slot when full.

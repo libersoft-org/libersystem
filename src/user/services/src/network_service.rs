@@ -25,6 +25,7 @@ use crate::net::{Event, Ipv4Addr, MacAddr, Stack};
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
 // client (M33) later replaces this static configuration.
 const OUR_IP: Ipv4Addr = Ipv4Addr([10, 0, 2, 15]);
+const OUR_MASK: Ipv4Addr = Ipv4Addr([255, 255, 255, 0]);
 const GATEWAY_IP: Ipv4Addr = Ipv4Addr([10, 0, 2, 2]);
 const DNS_SERVER: Ipv4Addr = Ipv4Addr([10, 0, 2, 3]);
 // The UDP source port we send DNS queries from.
@@ -53,7 +54,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Message { len, .. } if len >= 9 && &buf[..3] == b"MAC" => MacAddr([buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]]),
 			_ => exit(),
 		};
-		let mut stack: Stack = Stack::new(mac, OUR_IP, GATEWAY_IP);
+		let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP);
 		// 3. report in, then announce ourselves on the link with a gratuitous ARP for
 		//    the gateway (the driver transmits it).
 		send_blocking(bootstrap, b"NetworkService: online", 0);
@@ -177,7 +178,8 @@ unsafe fn resolve(ip: Ipv4Addr, frames: u64, stack: &mut Stack, rx: &mut [u8], t
 // as they arrive. Returns 1 = reply received, 0 = timed out, 2 = unresolved.
 unsafe fn do_ping(ip: Ipv4Addr, frames: u64, stack: &mut Stack, seq: &mut u16, rx: &mut [u8], tx: &mut [u8]) -> u8 {
 	unsafe {
-		let mac: MacAddr = match resolve(ip, frames, stack, rx, tx) {
+		let hop: Ipv4Addr = stack.next_hop(ip);
+		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
 			Some(m) => m,
 			None => return 2,
 		};
@@ -203,7 +205,8 @@ unsafe fn do_ping(ip: Ipv4Addr, frames: u64, stack: &mut Stack, seq: &mut u16, r
 // server, pumping received frames for the response. None on timeout or failure.
 unsafe fn do_dns(name: &[u8], frames: u64, stack: &mut Stack, txn: &mut u16, rx: &mut [u8], tx: &mut [u8]) -> Option<Ipv4Addr> {
 	unsafe {
-		let mac: MacAddr = match resolve(DNS_SERVER, frames, stack, rx, tx) {
+		let hop: Ipv4Addr = stack.next_hop(DNS_SERVER);
+		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
 			Some(m) => m,
 			None => return None,
 		};
