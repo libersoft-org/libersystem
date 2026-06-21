@@ -14,7 +14,7 @@
 extern crate alloc;
 
 use alloc::string::String;
-use proto::system::{ConfigEntry, DeviceEntry, Endpoint, Entry, Error, Ipv4Addr, OpenOpts, ProcessInfo, Query, config, device, log, network, process, socket, volume};
+use proto::system::{config, device, log, network, process, socket, volume, ConfigEntry, DeviceEntry, Endpoint, Entry, Error, Ipv4Addr, OpenOpts, ProcessInfo, Query};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
