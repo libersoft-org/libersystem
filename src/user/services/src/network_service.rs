@@ -34,6 +34,15 @@ const DNS_SRC_PORT: u16 = 0x9876;
 // How long a `ping` waits for its reply, and DNS for its response (100 Hz ticks).
 const PING_TIMEOUT_TICKS: u64 = 50;
 const DNS_TIMEOUT_TICKS: u64 = 300;
+// TCP: total time to establish, the SYN/segment retransmit interval, and how long to
+// read a response (100 Hz ticks).
+const TCP_SYN_TIMEOUT_TICKS: u64 = 300;
+const TCP_RETX_TICKS: u64 = 50;
+const TCP_RECV_TIMEOUT_TICKS: u64 = 300;
+// The base ephemeral local port for outgoing connections, and the cap on response
+// bytes returned to the client.
+const TCP_LOCAL_PORT_BASE: u16 = 0xc000;
+const TCP_REPLY_MAX: usize = 512;
 
 // The frame-buffer size: one full Ethernet frame (1514 bytes) with slack. The
 // driver forwards frames without the virtio_net_hdr, so this is the L2 frame only.
@@ -151,6 +160,12 @@ unsafe fn handle_control(req: &[u8], client: u64, frames: u64, stack: &mut Stack
 					send_blocking(client, &out[..1], 0);
 				}
 			}
+		} else if req.len() >= 9 && &req[..3] == b"TCP" {
+			let ip: Ipv4Addr = Ipv4Addr([req[3], req[4], req[5], req[6]]);
+			let port: u16 = ((req[7] as u16) << 8) | req[8] as u16;
+			let mut reply: [u8; 1 + TCP_REPLY_MAX] = [0u8; 1 + TCP_REPLY_MAX];
+			let n: usize = do_tcp(ip, port, &req[9..], frames, stack, rx, tx, &mut reply);
+			send_blocking(client, &reply[..n], 0);
 		}
 	}
 }
@@ -226,5 +241,77 @@ unsafe fn do_dns(name: &[u8], frames: u64, stack: &mut Stack, txn: &mut u16, rx:
 			}
 		}
 		None
+	}
+}
+
+// Open a TCP connection to `ip`:`port` (next-hop via the gateway when off-link),
+// send `request`, read the response, and close. Writes a status byte then the
+// received bytes into `reply` (status 1 = connected with data, 0 = no SYN-ACK in
+// time, 2 = unreachable / no ARP, 3 = refused / reset) and returns the total length.
+#[allow(clippy::too_many_arguments)]
+unsafe fn do_tcp(ip: Ipv4Addr, port: u16, request: &[u8], frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], reply: &mut [u8]) -> usize {
+	unsafe {
+		let hop: Ipv4Addr = stack.next_hop(ip);
+		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
+			Some(m) => m,
+			None => {
+				reply[0] = 2;
+				return 1;
+			}
+		};
+		// Open and send the SYN, retransmitting it until the handshake completes.
+		let iss: u32 = clock() as u32;
+		let local_port: u16 = TCP_LOCAL_PORT_BASE | (clock() as u16 & 0x0fff);
+		stack.tcp_open(ip, port, mac, local_port, iss);
+		let syn: usize = stack.tcp_build_syn(tx);
+		send_frame(frames, &tx[..syn]);
+		let overall: u64 = clock() + TCP_SYN_TIMEOUT_TICKS;
+		while clock() < overall && !stack.tcp_established() && !stack.tcp_aborted() {
+			let attempt: u64 = clock() + TCP_RETX_TICKS;
+			let until: u64 = if attempt < overall { attempt } else { overall };
+			if wait(frames, until) != 0 {
+				let s: usize = stack.tcp_build_syn(tx);
+				send_frame(frames, &tx[..s]);
+			} else {
+				pump(frames, stack, rx, tx);
+			}
+		}
+		if stack.tcp_aborted() {
+			reply[0] = 3;
+			return 1;
+		}
+		if !stack.tcp_established() {
+			reply[0] = 0;
+			return 1;
+		}
+		// Send the request, then read the response until the peer closes, the buffer
+		// fills, or it falls quiet.
+		if !request.is_empty() {
+			let d: usize = stack.tcp_build_data(request, tx);
+			send_frame(frames, &tx[..d]);
+		}
+		let cap: usize = reply.len() - 1;
+		let mut got: usize = 0;
+		let recv_deadline: u64 = clock() + TCP_RECV_TIMEOUT_TICKS;
+		while clock() < recv_deadline && !stack.tcp_peer_fin() && !stack.tcp_aborted() && got < cap {
+			if wait(frames, recv_deadline) != 0 {
+				break;
+			}
+			pump(frames, stack, rx, tx);
+			got += stack.tcp_take_rx(&mut reply[1 + got..]);
+		}
+		got += stack.tcp_take_rx(&mut reply[1 + got..]);
+		// Close our half and briefly pump to acknowledge the peer's FIN.
+		let fin: usize = stack.tcp_build_fin(tx);
+		send_frame(frames, &tx[..fin]);
+		let close_deadline: u64 = clock() + TCP_RETX_TICKS;
+		while clock() < close_deadline && !stack.tcp_aborted() && !stack.tcp_peer_fin() {
+			if wait(frames, close_deadline) != 0 {
+				break;
+			}
+			pump(frames, stack, rx, tx);
+		}
+		reply[0] = 1;
+		1 + got
 	}
 }

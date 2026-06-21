@@ -132,6 +132,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  ip | net         show the network interface and ARP cache\n");
 			print(b"  ping <ip>        send an ICMP echo via the net driver\n");
 			print(b"  nslookup <name>  resolve a name to an address via DNS\n");
+			print(b"  tcp <ip> <port>  open a TCP connection and probe it (HTTP GET)\n");
 			print(b"  exit             stop the shell and halt\n");
 			return false;
 		}
@@ -193,6 +194,10 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		}
 		if let Some(rest) = line.strip_prefix(b"host ") {
 			dns_lookup(netsvc, trim(rest));
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"tcp ") {
+			tcp_connect(netsvc, trim(rest));
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
@@ -341,6 +346,88 @@ unsafe fn dns_lookup(netsvc: u64, name: &[u8]) {
 			Received::Closed => print(b"nslookup: network driver gone\n"),
 		}
 	}
+}
+
+// Open a TCP connection to `<ip> <port>` through NetworkService, send a minimal
+// HTTP/1.0 GET probe, and print the connection result and any response received.
+unsafe fn tcp_connect(netsvc: u64, args: &[u8]) {
+	unsafe {
+		if netsvc == 0 {
+			print(b"tcp: no network interface\n");
+			return;
+		}
+		let sp: usize = match args.iter().position(|&b: &u8| b == b' ') {
+			Some(i) => i,
+			None => {
+				print(b"tcp: usage: tcp <ip> <port>\n");
+				return;
+			}
+		};
+		let host: &[u8] = trim(&args[..sp]);
+		let ip: [u8; 4] = match parse_ip(host) {
+			Some(a) => a,
+			None => {
+				print(b"tcp: invalid address\n");
+				return;
+			}
+		};
+		let port: u16 = match parse_port(trim(&args[sp + 1..])) {
+			Some(p) => p,
+			None => {
+				print(b"tcp: invalid port\n");
+				return;
+			}
+		};
+		const REQ: &[u8] = b"GET / HTTP/1.0\r\n\r\n";
+		let mut msg: [u8; 64] = [0u8; 64];
+		msg[..3].copy_from_slice(b"TCP");
+		msg[3..7].copy_from_slice(&ip);
+		msg[7] = (port >> 8) as u8;
+		msg[8] = port as u8;
+		msg[9..9 + REQ.len()].copy_from_slice(REQ);
+		if !send_blocking(netsvc, &msg[..9 + REQ.len()], 0) {
+			print(b"tcp: request failed\n");
+			return;
+		}
+		let mut buf: [u8; 600] = [0u8; 600];
+		match recv_blocking(netsvc, &mut buf) {
+			Received::Message { len, .. } if len >= 1 => match buf[0] {
+				1 => {
+					print(b"tcp ");
+					print(host);
+					if len > 1 {
+						print(b": connected\n");
+						print(&buf[1..len]);
+						print(b"\n");
+					} else {
+						print(b": connected (no data)\n");
+					}
+				}
+				2 => print(b"tcp: unreachable (no route)\n"),
+				3 => print(b"tcp: connection refused\n"),
+				_ => print(b"tcp: connection timed out\n"),
+			},
+			_ => print(b"tcp: no response\n"),
+		}
+	}
+}
+
+// Parse a decimal port number (0-65535), or None if malformed or out of range.
+fn parse_port(s: &[u8]) -> Option<u16> {
+	if s.is_empty() || s.len() > 5 {
+		return None;
+	}
+	let mut v: u32 = 0;
+	for &b in s {
+		if !b.is_ascii_digit() {
+			return None;
+		}
+		v = v * 10 + (b - b'0') as u32;
+		if v > 65535 {
+			return None;
+		}
+	}
+	Some(v as u16)
 }
 
 // Parse a dotted-decimal IPv4 address into 4 octets, or None if malformed.
