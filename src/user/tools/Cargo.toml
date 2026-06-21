@@ -1,0 +1,21 @@
+[package]
+name = "tools"
+# The product version lives only in /product.conf; Cargo's optional package version
+# is unused here and omitted. The tools crate produces the standalone foreground
+# programs the shell spawns (the Unix small-tools split) - loaded from the init
+# package, run as separate processes, and waited on by the shell.
+edition = "2024"
+build = "../build.rs"
+description = "Standalone foreground tools the shell spawns"
+
+[[bin]]
+name = "echo"
+path = "src/echo.rs"
+
+[dependencies]
+# Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
+# the syscall/IPC helpers); it re-exports the abi constants.
+rt = { path = "../rt" }
+
+# Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so we
+# do not set `panic = "abort"` per-profile (same reasoning as the kernel).

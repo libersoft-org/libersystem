@@ -215,7 +215,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"network_service" && !bootstrap_network_service(manager_side, *net_frames, net_client) {
 			return State::Failed;
 		}
-		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client) {
+		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -282,7 +282,7 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 // client are transferred (the shell becomes their sole owner); the LogService
 // client is *duplicated* and the copy transferred, since the supervisor keeps
 // emitting on the original.
-unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64) -> bool {
+unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"STORAGE", storage_client) {
 			return false;
@@ -303,7 +303,12 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 		if !send_blocking(manager_side, b"CONFIG", config_client) {
 			return false;
 		}
-		send_blocking(manager_side, b"NET", net_client)
+		if !send_blocking(manager_side, b"NET", net_client) {
+			return false;
+		}
+		// The shell spawns foreground programs (echo, later the net tools) from the
+		// init package, so hand it a read-only view of it like the other launchers.
+		bootstrap_package(manager_side, pkg_handle, pkg_len, buf)
 	}
 }
 

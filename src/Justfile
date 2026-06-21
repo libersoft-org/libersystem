@@ -6,6 +6,7 @@ user_dir := "user/system_manager"
 services_dir := "user/services"
 storage_dir := "user/storage"
 drivers_dir := "user/drivers"
+usertools_dir := "user/tools"
 rt_dir := "user/rt"
 abi_dir := "abi"
 tools_dir := "tools/lsidl-gen"
@@ -23,6 +24,7 @@ user:
 	cd {{services_dir}} && cargo build
 	cd {{storage_dir}} && cargo build
 	cd {{drivers_dir}} && cargo build
+	cd {{usertools_dir}} && cargo build
 
 # build the kernel (its build.rs assembles the init package from the userspace build)
 build: user
@@ -73,6 +75,7 @@ fmt:
 	cd {{services_dir}} && cargo fmt
 	cd {{storage_dir}} && cargo fmt
 	cd {{drivers_dir}} && cargo fmt
+	cd {{usertools_dir}} && cargo fmt
 	cd {{tools_dir}} && cargo fmt
 	cd {{proto_dir}} && cargo fmt
 	cd {{wasm_dir}} && cargo fmt
@@ -87,6 +90,7 @@ fmt-check:
 	cd {{services_dir}} && cargo fmt --check
 	cd {{storage_dir}} && cargo fmt --check
 	cd {{drivers_dir}} && cargo fmt --check
+	cd {{usertools_dir}} && cargo fmt --check
 	cd {{tools_dir}} && cargo fmt --check
 	cd {{proto_dir}} && cargo fmt --check
 	cd {{wasm_dir}} && cargo fmt --check
@@ -101,6 +105,7 @@ clean:
 	cd {{services_dir}} && cargo clean
 	cd {{storage_dir}} && cargo clean
 	cd {{drivers_dir}} && cargo clean
+	cd {{usertools_dir}} && cargo clean
 	cd {{tools_dir}} && cargo clean
 	cd {{proto_dir}} && cargo clean
 	rm -rf boot/.build

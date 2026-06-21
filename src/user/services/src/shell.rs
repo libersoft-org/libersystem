@@ -29,13 +29,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 1. receive the per-service client channels from ServiceManager, in the order it
 	//    sends them: storage (`cat`), log (`log`), device (`dev`), process (`ps`/`run`),
-	//    config (`config`/`set`). Each is a tagged capability over the bootstrap channel.
+	//    config (`config`/`set`), network (`ip`/`ping`/...), then a read-only view of
+	//    the init package. Each is a tagged capability over the bootstrap channel.
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or_else(|| exit());
 	let logsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or_else(|| exit());
 	let devsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DEVICE") }.unwrap_or_else(|| exit());
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
 	let cfgsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONFIG") }.unwrap_or_else(|| exit());
 	let netsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NET") }.unwrap_or_else(|| exit());
+	// The init package lets the shell spawn foreground programs (echo, later the net
+	// tools); the archive is mapped 'static and parsed once.
+	let (_pkg_handle, archive): (u64, &'static [u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| exit());
+	let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
 
 	// 2. self-check: prove the StorageService round-trip works by reading a file.
 	if !unsafe { cat(storage, SELF_CHECK_URI) } {
@@ -49,7 +54,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 4. become the interactive console and run the read-eval-print loop.
 	unsafe {
-		repl(storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, &mut buf);
+		repl(storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, &package, &mut buf);
 	}
 	exit();
 }
@@ -58,7 +63,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // kernel feeds keystrokes on the channel; we line-edit them (echoing input,
 // handling backspace) and dispatch each completed line. Returns when the user
 // types `exit`.
-unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, buf: &mut [u8]) {
+unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
 		// The kernel sends console input on `feed`; we receive it on `input`.
 		let (feed, input): (u64, u64) = match channel() {
@@ -79,7 +84,7 @@ unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64
 				match buf[i] {
 					b'\n' | b'\r' => {
 						print(b"\n");
-						if dispatch(&line[..len], storage, logsvc, devsvc, procsvc, cfgsvc, netsvc) {
+						if dispatch(&line[..len], storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, package) {
 							return;
 						}
 						len = 0;
@@ -107,7 +112,7 @@ unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64
 }
 
 // Dispatch one command line. Returns true if the shell should exit.
-unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, package: &Package) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -200,9 +205,12 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			tcp_connect(netsvc, trim(rest));
 			return false;
 		}
+		if line == b"echo" {
+			exec(package, b"echo", b"");
+			return false;
+		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
-			print(rest);
-			print(b"\n");
+			exec(package, b"echo", trim(rest));
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"cat ") {
@@ -218,6 +226,44 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		print(line);
 		print(b" (try 'help')\n");
 		false
+	}
+}
+
+// Spawn a standalone program `name` from the init package as a foreground child,
+// hand it `args` over a bootstrap channel, and wait for it to finish. The child
+// runs as its own process and prints its output to the console directly (a
+// program's stdout reaches the console via SYS_DEBUG_WRITE); it sends a completion
+// message just before it exits, which we wait on - an exited process is briefly a
+// zombie whose channel has not yet closed, so we cannot rely on the channel closing
+// to detect exit. This is the foreground exec primitive the net tools build on.
+unsafe fn exec(package: &Package, name: &[u8], args: &[u8]) {
+	unsafe {
+		let elf: &[u8] = match package.lookup(name) {
+			Some(e) => e,
+			None => {
+				print(name);
+				print(b": program not found\n");
+				return;
+			}
+		};
+		let (parent, child): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return,
+		};
+		// `spawn` moves the child end into the new process as its bootstrap handle.
+		if spawn(elf, child) < 0 {
+			print(name);
+			print(b": could not start\n");
+			close(parent);
+			return;
+		}
+		// Hand the child its arguments, then block until it signals completion.
+		send_blocking(parent, args, 0);
+		let mut done: [u8; 16] = [0u8; 16];
+		match recv_blocking(parent, &mut done) {
+			Received::Message { .. } | Received::Closed => {}
+		}
+		close(parent);
 	}
 }
 
