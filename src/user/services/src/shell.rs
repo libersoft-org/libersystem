@@ -14,7 +14,7 @@
 extern crate alloc;
 
 use alloc::string::String;
-use proto::system::{config, device, log, network, process, socket, volume, ConfigEntry, DeviceEntry, Endpoint, Entry, Error, Ipv4Addr, OpenOpts, ProcessInfo, Query};
+use proto::system::{ConfigEntry, DeviceEntry, Endpoint, Entry, Error, Ipv4Addr, OpenOpts, ProcessInfo, Query, config, device, log, network, process, socket, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -186,7 +186,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			return false;
 		}
 		if line == b"ip" || line == b"net" {
-			query_ip(netsvc);
+			spawn_net_tool(netsvc, package, b"ip", b"");
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"ping ") {
@@ -194,11 +194,11 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"nslookup ") {
-			dns_lookup(netsvc, trim(rest));
+			spawn_net_tool(netsvc, package, b"nslookup", trim(rest));
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"host ") {
-			dns_lookup(netsvc, trim(rest));
+			spawn_net_tool(netsvc, package, b"nslookup", trim(rest));
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"tcp ") {
@@ -269,42 +269,6 @@ unsafe fn exec(package: &Package, name: &[u8], args: &[u8], cap: u64) {
 	}
 }
 
-// Query NetworkService for its interface state (`ip` / `net`) over the typed
-// `network` interface and render it: our address, MAC, gateway, and the neighbor
-// cache (each a typed object, not a packed byte blob).
-unsafe fn query_ip(netsvc: u64) {
-	unsafe {
-		if netsvc == 0 {
-			print(b"ip: no network interface\n");
-			return;
-		}
-		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
-		match client.info() {
-			Some(Ok(info)) => {
-				print(b"net0: ");
-				print_ip(&[info.addr.a, info.addr.b, info.addr.c, info.addr.d]);
-				print(b"  mac ");
-				print_mac(&info.mac);
-				print(b"  gateway ");
-				print_ip(&[info.gateway.a, info.gateway.b, info.gateway.c, info.gateway.d]);
-				print(b"\n");
-				if !info.neighbors.is_empty() {
-					print(b"neighbors:\n");
-					for n in &info.neighbors {
-						print(b"  ");
-						print_ip(&[n.addr.a, n.addr.b, n.addr.c, n.addr.d]);
-						print(b"  ");
-						print_mac(&n.mac);
-						print(b"\n");
-					}
-				}
-			}
-			Some(Err(_)) => print(b"ip: network error\n"),
-			None => print(b"ip: service unavailable\n"),
-		}
-	}
-}
-
 // Spawn a network tool as a foreground program, giving it its OWN NetworkService
 // client channel: `network.open` mints a fresh client channel, which we transfer to
 // the tool alongside its arguments. Each tool talks to NetworkService over its own
@@ -327,43 +291,6 @@ unsafe fn spawn_net_tool(netsvc: u64, package: &Package, name: &[u8], args: &[u8
 			}
 		};
 		exec(package, name, args, tool_netsvc);
-	}
-}
-
-// Resolve `name` through NetworkService's DNS client (`nslookup` / `host`) over the
-// typed `network` interface and render the resolved address or a not-found message.
-unsafe fn dns_lookup(netsvc: u64, name: &[u8]) {
-	unsafe {
-		if netsvc == 0 {
-			print(b"nslookup: no network interface\n");
-			return;
-		}
-		if name.is_empty() || name.len() > 120 {
-			print(b"nslookup: invalid name\n");
-			return;
-		}
-		let name_str: &str = match core::str::from_utf8(name) {
-			Ok(s) => s,
-			Err(_) => {
-				print(b"nslookup: invalid name\n");
-				return;
-			}
-		};
-		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
-		match client.resolve(name_str) {
-			Some(Ok(addr)) => {
-				print(name);
-				print(b" has address ");
-				print_ip(&[addr.a, addr.b, addr.c, addr.d]);
-				print(b"\n");
-			}
-			Some(Err(_)) => {
-				print(b"nslookup: could not resolve ");
-				print(name);
-				print(b"\n");
-			}
-			None => print(b"nslookup: network service gone\n"),
-		}
 	}
 }
 
@@ -499,44 +426,6 @@ fn parse_ip(s: &[u8]) -> Option<[u8; 4]> {
 	}
 	octets[3] = value as u8;
 	Some(octets)
-}
-
-// Print an IPv4 address (4 octets) in dotted-decimal form.
-unsafe fn print_ip(ip: &[u8]) {
-	unsafe {
-		for (i, octet) in ip.iter().enumerate() {
-			if i != 0 {
-				print(b".");
-			}
-			print_dec(*octet);
-		}
-	}
-}
-
-// Print a MAC address (6 bytes) as colon-separated hex.
-unsafe fn print_mac(mac: &[u8]) {
-	unsafe {
-		for (i, b) in mac.iter().enumerate() {
-			if i != 0 {
-				print(b":");
-			}
-			let hex: &[u8; 16] = b"0123456789abcdef";
-			print(&[hex[(*b >> 4) as usize], hex[(*b & 0xf) as usize]]);
-		}
-	}
-}
-
-// Print a byte in decimal (0-255), no leading zeros.
-unsafe fn print_dec(n: u8) {
-	unsafe {
-		if n >= 100 {
-			print(&[b'0' + n / 100]);
-		}
-		if n >= 10 {
-			print(&[b'0' + (n / 10) % 10]);
-		}
-		print(&[b'0' + n % 10]);
-	}
 }
 
 // Render typed records as a JSON array - each via its generated to_json(), comma-

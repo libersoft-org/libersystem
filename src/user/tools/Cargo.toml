@@ -16,6 +16,14 @@ path = "src/echo.rs"
 name = "ping"
 path = "src/ping.rs"
 
+[[bin]]
+name = "ip"
+path = "src/ip.rs"
+
+[[bin]]
+name = "nslookup"
+path = "src/nslookup.rs"
+
 [dependencies]
 # Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
 # the syscall/IPC helpers); it re-exports the abi constants.
