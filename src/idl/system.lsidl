@@ -214,11 +214,17 @@ interface network {
 }
 
 // A connected TCP socket, served on the channel `network.connect` hands back as a
-// capability: send bytes, receive the next bytes available (an empty result means
-// the peer closed - end of stream), and close. The socket is the canonical object;
-// each net tool asks NetworkService for the socket it needs and talks this contract.
+// capability: send bytes, receive incoming bytes as a wait-drained event stream of
+// chunks (the producer closes when the peer closes - end of stream), and close. The
+// socket is the canonical object; each net tool asks NetworkService for the socket
+// it needs and talks this contract.
 interface socket {
 	@op(1) send:  func(data: list<u8>) -> result<u32, error>;
-	@op(2) recv:  func() -> result<list<u8>, error>;
+	@op(2) recv:  func() -> stream<chunk>;
 	@op(3) close: func() -> result<unit, error>;
+}
+
+// One chunk of received socket data, the element of the `socket.recv` stream.
+record chunk {
+	data: list<u8>,
 }

@@ -14,7 +14,7 @@
 extern crate alloc;
 
 use alloc::string::String;
-use proto::system::{config, device, log, network, process, socket, volume, ConfigEntry, DeviceEntry, Endpoint, Entry, Error, Ipv4Addr, OpenOpts, PingStatus, ProcessInfo, Query};
+use proto::system::{ConfigEntry, DeviceEntry, Endpoint, Entry, Error, Ipv4Addr, OpenOpts, PingStatus, ProcessInfo, Query, config, device, log, network, process, socket, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -381,13 +381,22 @@ unsafe fn tcp_connect(netsvc: u64, args: &[u8]) {
 		print(b"tcp ");
 		print(host);
 		print(b": connected\n");
-		// Send the probe, then drain the response a chunk at a time until EOF.
+		// Send the probe, then drain the received-data stream (a sub-channel of framed
+		// chunks) until the producer closes - end of stream.
 		if let Some(Ok(_)) = sock.send(&b"GET / HTTP/1.0\r\n\r\n".to_vec()) {
-			loop {
-				match sock.recv() {
-					Some(Ok(data)) if !data.is_empty() => print(&data),
-					_ => break,
+			if let Some(rxstream) = sock.recv() {
+				let mut frame: [u8; 1024] = [0u8; 1024];
+				loop {
+					match recv_blocking(rxstream, &mut frame) {
+						Received::Message { len, .. } => {
+							if let Some(chunk) = socket::recv_read(&frame[..len]) {
+								print(&chunk.data);
+							}
+						}
+						Received::Closed => break,
+					}
 				}
+				close(rxstream);
 			}
 			print(b"\n");
 		} else {

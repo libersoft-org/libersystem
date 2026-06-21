@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 use rt::*;
 
 use crate::net::{Event, Ipv4Addr, MacAddr, Stack};
-use proto::system::{network, socket, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingStatus, TcpRequest};
+use proto::system::{network, socket, Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingStatus, TcpRequest};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -130,6 +130,11 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 		// The server end of the one active socket (0 = none). The stack has a single
 		// TCP connection, so at most one socket is open at a time.
 		let mut sock: u64 = 0;
+		// The producer end of the active received-data stream (0 = none) and its frame
+		// sequence counter: the loop frames each newly received chunk onto it and closes
+		// it when the peer closes, marking end of stream.
+		let mut stream_prod: u64 = 0;
+		let mut stream_seq: u32 = 0;
 		loop {
 			// Build the wait set: the driver frame channel always, the client channel
 			// while the shell is connected, and the socket channel while one is open.
@@ -154,6 +159,15 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 			let ready: usize = wait_any(&waits[..n], 0) as usize;
 			if ready == 0 {
 				pump(frames, stack, &mut rx, &mut tx);
+				// Feed any newly received bytes to the active recv stream, and close the
+				// producer (signalling end of stream) once the peer closes or resets.
+				if stream_prod != 0 {
+					stream_prod = stream_pump(stack, &mut out, stream_prod, &mut stream_seq);
+					if stream_prod != 0 && (stack.tcp_peer_fin() || stack.tcp_aborted()) {
+						close(stream_prod);
+						stream_prod = 0;
+					}
+				}
 			} else if ready == client_idx {
 				match recv_blocking(client, &mut req) {
 					Received::Message { len, handle } => {
@@ -172,13 +186,44 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 			} else if ready == sock_idx {
 				match recv_blocking(sock, &mut req) {
 					Received::Message { len, handle } => {
+						let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
 						let mut closing: bool = false;
-						let mut svc: Sock = Sock { frames, stack: &mut *stack, rx: &mut rx, tx: &mut tx, closing: &mut closing };
-						let mut reply_handle: u64 = 0;
-						if let Some(n2) = socket::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
-							send_blocking(sock, &out[..n2], reply_handle);
+						{
+							let mut svc: Sock = Sock { frames, stack: &mut *stack, tx: &mut tx, closing: &mut closing };
+							if op == socket::OP_RECV {
+								// OP_RECV opens the received-data stream out of band: mint a
+								// sub-channel, hand the consumer end back with the correlation
+								// id, then frame any already-buffered bytes onto the producer
+								// (the serve loop streams everything that arrives afterwards).
+								if let Some((corr, items)) = socket::recv_open(&mut svc, &req[..len]) {
+									if stream_prod != 0 {
+										close(stream_prod);
+										stream_prod = 0;
+									}
+									if let Some((producer, consumer)) = channel() {
+										send_blocking(sock, &corr.to_le_bytes(), consumer);
+										stream_seq = 0;
+										for item in &items {
+											if let Some(fl) = socket::recv_frame(stream_seq, item, &mut out) {
+												send_blocking(producer, &out[..fl], 0);
+												stream_seq += 1;
+											}
+										}
+										stream_prod = producer;
+									}
+								}
+							} else {
+								let mut reply_handle: u64 = 0;
+								if let Some(n2) = socket::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
+									send_blocking(sock, &out[..n2], reply_handle);
+								}
+							}
 						}
 						if closing {
+							if stream_prod != 0 {
+								close(stream_prod);
+								stream_prod = 0;
+							}
 							socket_teardown(frames, stack, &mut rx, &mut tx);
 							close(sock);
 							sock = 0;
@@ -187,6 +232,10 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 					// The client dropped its socket without calling close(): tear the
 					// connection down so the next `connect` starts clean.
 					Received::Closed => {
+						if stream_prod != 0 {
+							close(stream_prod);
+							stream_prod = 0;
+						}
 						socket_teardown(frames, stack, &mut rx, &mut tx);
 						close(sock);
 						sock = 0;
@@ -298,13 +347,12 @@ impl network::Service for Net<'_> {
 }
 
 // The state the typed `socket` service operates on for one connected socket: the
-// frame channel, the stack (holding the single TCP connection), and the frame
-// buffers - all borrowed from the serve loop. `closing` is set by `close` so the
+// frame channel, the stack (holding the single TCP connection), and the transmit
+// buffer - all borrowed from the serve loop. `closing` is set by `close` so the
 // loop tears the connection down after replying.
 struct Sock<'a> {
 	frames: u64,
 	stack: &'a mut Stack,
-	rx: &'a mut [u8],
 	tx: &'a mut [u8],
 	closing: &'a mut bool,
 }
@@ -320,17 +368,16 @@ impl socket::Service for Sock<'_> {
 		Ok(data.len() as u32)
 	}
 
-	// Read the next bytes available on the connection. An empty result means the peer
-	// closed (FIN) or nothing arrived in time - end of stream.
-	fn recv(&mut self) -> Result<Vec<u8>, Error> {
-		if self.stack.tcp_aborted() {
-			return Err(Error::Closed);
+	// The snapshot of bytes already buffered when the recv stream opens; the serve
+	// loop streams everything that arrives afterwards. One chunk, or empty.
+	fn recv(&mut self) -> Vec<Chunk> {
+		let mut chunks: Vec<Chunk> = Vec::new();
+		let mut buf: [u8; SOCK_RECV_MAX] = [0u8; SOCK_RECV_MAX];
+		let n: usize = self.stack.tcp_take_rx(&mut buf);
+		if n > 0 {
+			chunks.push(Chunk { data: buf[..n].to_vec() });
 		}
-		unsafe {
-			let mut buf: [u8; SOCK_RECV_MAX] = [0u8; SOCK_RECV_MAX];
-			let n: usize = socket_recv(self.frames, self.stack, self.rx, self.tx, &mut buf);
-			Ok(buf[..n].to_vec())
-		}
+		chunks
 	}
 
 	// Mark the socket for teardown; the serve loop sends the FIN and drops the channel
@@ -511,23 +558,29 @@ unsafe fn socket_send(data: &[u8], frames: u64, stack: &mut Stack, tx: &mut [u8]
 	}
 }
 
-// Read the next bytes available on the connection into `dst`: drain anything already
-// buffered, else pump received frames until some data arrives, the peer closes
-// (FIN), or it falls quiet. Returns the byte count (0 = the peer closed or nothing
-// arrived in time).
-unsafe fn socket_recv(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], dst: &mut [u8]) -> usize {
+// Drain newly received bytes from the connection and frame each chunk onto the recv
+// stream `producer`. Returns the producer handle, or 0 if the consumer was dropped
+// (in which case the producer is closed here).
+unsafe fn stream_pump(stack: &mut Stack, out: &mut [u8], producer: u64, seq: &mut u32) -> u64 {
 	unsafe {
-		let mut got: usize = stack.tcp_take_rx(dst);
-		let deadline: u64 = clock() + TCP_RECV_TIMEOUT_TICKS;
-		while got == 0 && clock() < deadline && !stack.tcp_peer_fin() && !stack.tcp_aborted() {
-			if wait(frames, deadline) != 0 {
-				break;
+		let mut buf: [u8; SOCK_RECV_MAX] = [0u8; SOCK_RECV_MAX];
+		loop {
+			let n: usize = stack.tcp_take_rx(&mut buf);
+			if n == 0 {
+				return producer;
 			}
-			pump(frames, stack, rx, tx);
-			got += stack.tcp_take_rx(&mut dst[got..]);
+			let chunk: Chunk = Chunk { data: buf[..n].to_vec() };
+			match socket::recv_frame(*seq, &chunk, out) {
+				Some(fl) => {
+					if !send_blocking(producer, &out[..fl], 0) {
+						close(producer);
+						return 0;
+					}
+					*seq += 1;
+				}
+				None => return producer,
+			}
 		}
-		got += stack.tcp_take_rx(&mut dst[got..]);
-		got
 	}
 }
 

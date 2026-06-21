@@ -156,6 +156,12 @@ An opaque kernel object, transferred as `handle<file>`.
 | `ep` | `endpoint` |
 | `request` | `list<u8>` |
 
+### record `chunk`
+
+| field | type |
+| --- | --- |
+| `data` | `list<u8>` |
+
 ## Interfaces
 
 ### interface `log`
@@ -231,6 +237,6 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `send` | `send(data: list<u8>) -> result<u32, error>` |
-| 2 | `recv` | `recv() -> result<list<u8>, error>` |
+| 2 | `recv` | `recv() -> stream<chunk>` |
 | 3 | `close` | `close() -> result<unit, error>` |
 
