@@ -14,7 +14,7 @@
 extern crate alloc;
 
 use alloc::string::String;
-use proto::system::{ConfigEntry, DeviceEntry, Endpoint, Entry, Error, Ipv4Addr, OpenOpts, PingStatus, ProcessInfo, Query, TcpRequest, config, device, log, network, process, volume};
+use proto::system::{ConfigEntry, DeviceEntry, Endpoint, Entry, Error, Ipv4Addr, OpenOpts, PingStatus, ProcessInfo, Query, config, device, log, network, process, socket, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -323,9 +323,10 @@ unsafe fn dns_lookup(netsvc: u64, name: &[u8]) {
 	}
 }
 
-// Open a TCP connection to `<ip> <port>` through NetworkService over the typed
-// `network` interface, send a minimal HTTP/1.0 GET probe, and print the connection
-// result and any response received.
+// Open a TCP connection to `<ip> <port>` through NetworkService, which hands back a
+// socket as a capability (the channel a `socket` is served on); drive it with the
+// typed `socket` interface - send a minimal HTTP/1.0 GET probe, drain the response
+// with repeated `recv` until end of stream, then close.
 unsafe fn tcp_connect(netsvc: u64, args: &[u8]) {
 	unsafe {
 		if netsvc == 0 {
@@ -354,25 +355,46 @@ unsafe fn tcp_connect(netsvc: u64, args: &[u8]) {
 				return;
 			}
 		};
-		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
-		let req: TcpRequest = TcpRequest { ep: Endpoint { addr: Ipv4Addr { a: ip[0], b: ip[1], c: ip[2], d: ip[3] }, port }, request: b"GET / HTTP/1.0\r\n\r\n".to_vec() };
-		match client.fetch(&req) {
-			Some(Ok(data)) => {
-				print(b"tcp ");
-				print(host);
-				if data.is_empty() {
-					print(b": connected (no data)\n");
-				} else {
-					print(b": connected\n");
-					print(&data);
-					print(b"\n");
+		// connect() returns the socket as a capability (the channel it is served on).
+		let mut net = network::Client::new(ChannelTransport { chan: netsvc });
+		let ep: Endpoint = Endpoint { addr: Ipv4Addr { a: ip[0], b: ip[1], c: ip[2], d: ip[3] }, port };
+		let sockh: u64 = match net.connect(&ep) {
+			Some(Ok(h)) => h,
+			Some(Err(Error::NotFound)) => {
+				print(b"tcp: unreachable (no route)\n");
+				return;
+			}
+			Some(Err(Error::Denied)) => {
+				print(b"tcp: connection refused\n");
+				return;
+			}
+			Some(Err(_)) => {
+				print(b"tcp: connection timed out\n");
+				return;
+			}
+			None => {
+				print(b"tcp: service unavailable\n");
+				return;
+			}
+		};
+		let mut sock = socket::Client::new(ChannelTransport { chan: sockh });
+		print(b"tcp ");
+		print(host);
+		print(b": connected\n");
+		// Send the probe, then drain the response a chunk at a time until EOF.
+		if let Some(Ok(_)) = sock.send(&b"GET / HTTP/1.0\r\n\r\n".to_vec()) {
+			loop {
+				match sock.recv() {
+					Some(Ok(data)) if !data.is_empty() => print(&data),
+					_ => break,
 				}
 			}
-			Some(Err(Error::NotFound)) => print(b"tcp: unreachable (no route)\n"),
-			Some(Err(Error::Denied)) => print(b"tcp: connection refused\n"),
-			Some(Err(_)) => print(b"tcp: connection timed out\n"),
-			None => print(b"tcp: service unavailable\n"),
+			print(b"\n");
+		} else {
+			print(b"tcp: send failed\n");
 		}
+		let _ = sock.close();
+		close(sockh);
 	}
 }
 

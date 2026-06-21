@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 use rt::*;
 
 use crate::net::{Event, Ipv4Addr, MacAddr, Stack};
-use proto::system::{Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingStatus, TcpRequest, network};
+use proto::system::{Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingStatus, TcpRequest, network, socket};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -56,6 +56,9 @@ const FRAME_MAX: usize = 2048;
 // up to TCP_REPLY_MAX response bytes plus the codec framing).
 const REQ_MAX: usize = 256;
 const REPLY_MAX: usize = 1024;
+// How many bytes a single socket `recv` returns (the client calls `recv` repeatedly
+// to drain a larger response); kept small for the 16 KiB user stack.
+const SOCK_RECV_MAX: usize = 512;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -106,12 +109,15 @@ unsafe fn pump(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> 
 	}
 }
 
-// Stand on the driver's frame channel and the client's typed request channel at
-// once (wait_any): a frame from the driver is parsed (answering ARP / ICMP, any
-// reply sent back to transmit); a client request is decoded, dispatched to the
-// generated `network` server, and answered. The client channel closing (the shell
-// exited) drops us back to serving only the network. The gratuitous ARP that
-// announces us on the link goes out first.
+// Stand on the driver's frame channel, the client's typed request channel, and the
+// active socket's channel at once (wait_any): a frame from the driver is parsed
+// (answering ARP / ICMP, any reply sent back to transmit); a client request is
+// decoded, dispatched to the generated `network` server, and answered; a socket
+// request (send / recv / close) is dispatched to the `socket` server for the one
+// connection `network.connect` opened. The client channel closing (the shell
+// exited) drops us back to serving only the network; the socket channel closing
+// (the client dropped its socket) tears the connection down. The gratuitous ARP
+// that announces us on the link goes out first.
 unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 	unsafe {
 		let mut rx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
@@ -121,25 +127,70 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 		let arp: usize = stack.build_arp_request(GATEWAY_IP, &mut tx);
 		send_frame(frames, &tx[..arp]);
 		let mut client_open: bool = true;
+		// The server end of the one active socket (0 = none). The stack has a single
+		// TCP connection, so at most one socket is open at a time.
+		let mut sock: u64 = 0;
 		loop {
-			let ready: i64 = if client_open {
-				wait_any(&[frames, client], 0)
+			// Build the wait set: the driver frame channel always, the client channel
+			// while the shell is connected, and the socket channel while one is open.
+			let mut waits: [u64; 3] = [frames, 0, 0];
+			let mut n: usize = 1;
+			let client_idx: usize = if client_open {
+				waits[n] = client;
+				let i: usize = n;
+				n += 1;
+				i
 			} else {
-				wait(frames, 0);
-				0
+				usize::MAX
 			};
+			let sock_idx: usize = if sock != 0 {
+				waits[n] = sock;
+				let i: usize = n;
+				n += 1;
+				i
+			} else {
+				usize::MAX
+			};
+			let ready: usize = wait_any(&waits[..n], 0) as usize;
 			if ready == 0 {
 				pump(frames, stack, &mut rx, &mut tx);
-			} else if ready == 1 {
+			} else if ready == client_idx {
 				match recv_blocking(client, &mut req) {
 					Received::Message { len, handle } => {
-						let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx, tx: &mut tx };
+						let mut new_sock: u64 = 0;
+						let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx, tx: &mut tx, cur_sock: sock, new_sock: &mut new_sock };
 						let mut reply_handle: u64 = 0;
-						if let Some(n) = network::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
-							send_blocking(client, &out[..n], reply_handle);
+						if let Some(n2) = network::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
+							send_blocking(client, &out[..n2], reply_handle);
+						}
+						if new_sock != 0 {
+							sock = new_sock;
 						}
 					}
 					Received::Closed => client_open = false,
+				}
+			} else if ready == sock_idx {
+				match recv_blocking(sock, &mut req) {
+					Received::Message { len, handle } => {
+						let mut closing: bool = false;
+						let mut svc: Sock = Sock { frames, stack: &mut *stack, rx: &mut rx, tx: &mut tx, closing: &mut closing };
+						let mut reply_handle: u64 = 0;
+						if let Some(n2) = socket::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
+							send_blocking(sock, &out[..n2], reply_handle);
+						}
+						if closing {
+							socket_teardown(frames, stack, &mut rx, &mut tx);
+							close(sock);
+							sock = 0;
+						}
+					}
+					// The client dropped its socket without calling close(): tear the
+					// connection down so the next `connect` starts clean.
+					Received::Closed => {
+						socket_teardown(frames, stack, &mut rx, &mut tx);
+						close(sock);
+						sock = 0;
+					}
 				}
 			}
 		}
@@ -150,12 +201,17 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 // driver frame channel, an ICMP/DNS sequence counter, the stack, and the frame
 // scratch buffers - the stack and buffers are borrowed from the serve loop, so the
 // connection state and the 2 KiB frame buffers are not duplicated on the stack.
+// `cur_sock` is the server end of an already-open socket (0 = none), so `connect`
+// can refuse a second concurrent socket; `new_sock` is where `connect` parks the
+// server end of the socket it opens, for the serve loop to pick up.
 struct Net<'a> {
 	frames: u64,
 	seq: u16,
 	stack: &'a mut Stack,
 	rx: &'a mut [u8],
 	tx: &'a mut [u8],
+	cur_sock: u64,
+	new_sock: &'a mut u64,
 }
 
 // Convert the stack's internal address to the wire (canonical) form, and back.
@@ -213,6 +269,75 @@ impl network::Service for Net<'_> {
 				_ => Err(Error::Again),
 			}
 		}
+	}
+
+	// Open a TCP connection to `ep` and hand the client the socket as a capability:
+	// the client end of a fresh channel on which we serve the `socket` interface. The
+	// server end is parked in `new_sock` for the serve loop to start waiting on. One
+	// socket at a time (the stack has a single connection), so a second `connect`
+	// while one is open is refused with `Again`.
+	fn connect(&mut self, ep: Endpoint) -> Result<u64, Error> {
+		if self.cur_sock != 0 {
+			return Err(Error::Again);
+		}
+		unsafe {
+			match tcp_establish(from_wire(&ep.addr), ep.port, self.frames, self.stack, self.rx, self.tx) {
+				1 => match channel() {
+					Some((server, peer)) => {
+						*self.new_sock = server;
+						Ok(peer)
+					}
+					None => Err(Error::Again),
+				},
+				2 => Err(Error::NotFound),
+				3 => Err(Error::Denied),
+				_ => Err(Error::Again),
+			}
+		}
+	}
+}
+
+// The state the typed `socket` service operates on for one connected socket: the
+// frame channel, the stack (holding the single TCP connection), and the frame
+// buffers - all borrowed from the serve loop. `closing` is set by `close` so the
+// loop tears the connection down after replying.
+struct Sock<'a> {
+	frames: u64,
+	stack: &'a mut Stack,
+	rx: &'a mut [u8],
+	tx: &'a mut [u8],
+	closing: &'a mut bool,
+}
+
+impl socket::Service for Sock<'_> {
+	// Send bytes on the connection (one TCP data segment); the ack arrives via the
+	// serve loop's frame pump. Closed once the connection is reset or gone.
+	fn send(&mut self, data: Vec<u8>) -> Result<u32, Error> {
+		if !self.stack.tcp_established() || self.stack.tcp_aborted() {
+			return Err(Error::Closed);
+		}
+		unsafe { socket_send(&data, self.frames, self.stack, self.tx) };
+		Ok(data.len() as u32)
+	}
+
+	// Read the next bytes available on the connection. An empty result means the peer
+	// closed (FIN) or nothing arrived in time - end of stream.
+	fn recv(&mut self) -> Result<Vec<u8>, Error> {
+		if self.stack.tcp_aborted() {
+			return Err(Error::Closed);
+		}
+		unsafe {
+			let mut buf: [u8; SOCK_RECV_MAX] = [0u8; SOCK_RECV_MAX];
+			let n: usize = socket_recv(self.frames, self.stack, self.rx, self.tx, &mut buf);
+			Ok(buf[..n].to_vec())
+		}
+	}
+
+	// Mark the socket for teardown; the serve loop sends the FIN and drops the channel
+	// after this reply.
+	fn close(&mut self) -> Result<(), Error> {
+		*self.closing = true;
+		Ok(())
 	}
 }
 
@@ -297,38 +422,14 @@ unsafe fn do_dns(name: &[u8], frames: u64, stack: &mut Stack, txn: &mut u16, rx:
 #[allow(clippy::too_many_arguments)]
 unsafe fn do_tcp(ip: Ipv4Addr, port: u16, request: &[u8], frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], reply: &mut [u8]) -> usize {
 	unsafe {
-		let hop: Ipv4Addr = stack.next_hop(ip);
-		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
-			Some(m) => m,
-			None => {
-				reply[0] = 2;
+		// Establish the connection; on failure write the status byte and stop (the
+		// establish status bytes 2 / 3 / 0 map straight onto the reply status).
+		match tcp_establish(ip, port, frames, stack, rx, tx) {
+			1 => {}
+			other => {
+				reply[0] = other;
 				return 1;
 			}
-		};
-		// Open and send the SYN, retransmitting it until the handshake completes.
-		let iss: u32 = clock() as u32;
-		let local_port: u16 = TCP_LOCAL_PORT_BASE | (clock() as u16 & 0x0fff);
-		stack.tcp_open(ip, port, mac, local_port, iss);
-		let syn: usize = stack.tcp_build_syn(tx);
-		send_frame(frames, &tx[..syn]);
-		let overall: u64 = clock() + TCP_SYN_TIMEOUT_TICKS;
-		while clock() < overall && !stack.tcp_established() && !stack.tcp_aborted() {
-			let attempt: u64 = clock() + TCP_RETX_TICKS;
-			let until: u64 = if attempt < overall { attempt } else { overall };
-			if wait(frames, until) != 0 {
-				let s: usize = stack.tcp_build_syn(tx);
-				send_frame(frames, &tx[..s]);
-			} else {
-				pump(frames, stack, rx, tx);
-			}
-		}
-		if stack.tcp_aborted() {
-			reply[0] = 3;
-			return 1;
-		}
-		if !stack.tcp_established() {
-			reply[0] = 0;
-			return 1;
 		}
 		// Send the request, then read the response until the peer closes, the buffer
 		// fills, or it falls quiet.
@@ -359,5 +460,92 @@ unsafe fn do_tcp(ip: Ipv4Addr, port: u16, request: &[u8], frames: u64, stack: &m
 		}
 		reply[0] = 1;
 		1 + got
+	}
+}
+
+// Establish a TCP connection to `ip`:`port` (next-hop via the gateway when off-link):
+// resolve the next hop, open the connection, and send the SYN, retransmitting it
+// until the handshake completes. Returns 1 = established, 2 = unreachable (no ARP),
+// 3 = refused (reset), 0 = timed out. Shared by `fetch` (do_tcp) and `connect`.
+unsafe fn tcp_establish(ip: Ipv4Addr, port: u16, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> u8 {
+	unsafe {
+		let hop: Ipv4Addr = stack.next_hop(ip);
+		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
+			Some(m) => m,
+			None => return 2,
+		};
+		let iss: u32 = clock() as u32;
+		let local_port: u16 = TCP_LOCAL_PORT_BASE | (clock() as u16 & 0x0fff);
+		stack.tcp_open(ip, port, mac, local_port, iss);
+		let syn: usize = stack.tcp_build_syn(tx);
+		send_frame(frames, &tx[..syn]);
+		let overall: u64 = clock() + TCP_SYN_TIMEOUT_TICKS;
+		while clock() < overall && !stack.tcp_established() && !stack.tcp_aborted() {
+			let attempt: u64 = clock() + TCP_RETX_TICKS;
+			let until: u64 = if attempt < overall { attempt } else { overall };
+			if wait(frames, until) != 0 {
+				let s: usize = stack.tcp_build_syn(tx);
+				send_frame(frames, &tx[..s]);
+			} else {
+				pump(frames, stack, rx, tx);
+			}
+		}
+		if stack.tcp_aborted() {
+			return 3;
+		}
+		if !stack.tcp_established() {
+			return 0;
+		}
+		1
+	}
+}
+
+// Send `data` on the established connection as a single TCP data segment; the ack
+// arrives later via the serve loop's frame pump.
+unsafe fn socket_send(data: &[u8], frames: u64, stack: &mut Stack, tx: &mut [u8]) {
+	unsafe {
+		if !data.is_empty() {
+			let d: usize = stack.tcp_build_data(data, tx);
+			send_frame(frames, &tx[..d]);
+		}
+	}
+}
+
+// Read the next bytes available on the connection into `dst`: drain anything already
+// buffered, else pump received frames until some data arrives, the peer closes
+// (FIN), or it falls quiet. Returns the byte count (0 = the peer closed or nothing
+// arrived in time).
+unsafe fn socket_recv(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], dst: &mut [u8]) -> usize {
+	unsafe {
+		let mut got: usize = stack.tcp_take_rx(dst);
+		let deadline: u64 = clock() + TCP_RECV_TIMEOUT_TICKS;
+		while got == 0 && clock() < deadline && !stack.tcp_peer_fin() && !stack.tcp_aborted() {
+			if wait(frames, deadline) != 0 {
+				break;
+			}
+			pump(frames, stack, rx, tx);
+			got += stack.tcp_take_rx(&mut dst[got..]);
+		}
+		got += stack.tcp_take_rx(&mut dst[got..]);
+		got
+	}
+}
+
+// Close our half of the connection: send a FIN (unless already reset) and briefly
+// pump to acknowledge the peer's FIN, so the connection winds down before the next
+// `connect` reopens the stack's single TCP connection.
+unsafe fn socket_teardown(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) {
+	unsafe {
+		if !stack.tcp_aborted() {
+			let fin: usize = stack.tcp_build_fin(tx);
+			send_frame(frames, &tx[..fin]);
+		}
+		let deadline: u64 = clock() + TCP_RETX_TICKS;
+		while clock() < deadline && !stack.tcp_aborted() && !stack.tcp_peer_fin() {
+			if wait(frames, deadline) != 0 {
+				break;
+			}
+			pump(frames, stack, rx, tx);
+		}
 	}
 }

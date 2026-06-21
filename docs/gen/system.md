@@ -222,4 +222,15 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 2 | `resolve` | `resolve(name: string) -> result<ipv4-addr, error>` |
 | 3 | `ping` | `ping(addr: ipv4-addr) -> result<ping-status, error>` |
 | 4 | `fetch` | `fetch(req: tcp-request) -> result<list<u8>, error>` |
+| 5 | `connect` | `connect(ep: endpoint) -> result<handle<channel>, error>` |
+
+### interface `socket`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `send` | `send(data: list<u8>) -> result<u32, error>` |
+| 2 | `recv` | `recv() -> result<list<u8>, error>` |
+| 3 | `close` | `close() -> result<unit, error>` |
 

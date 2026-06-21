@@ -1479,12 +1479,14 @@ pub mod network {
 	pub const OP_RESOLVE: u16 = 2;
 	pub const OP_PING: u16 = 3;
 	pub const OP_FETCH: u16 = 4;
+	pub const OP_CONNECT: u16 = 5;
 
 	pub trait Service {
 		fn info(&mut self) -> Result<NetInfo, Error>;
 		fn resolve(&mut self, name: String) -> Result<Ipv4Addr, Error>;
 		fn ping(&mut self, addr: Ipv4Addr) -> Result<PingStatus, Error>;
 		fn fetch(&mut self, req: TcpRequest) -> Result<Vec<u8>, Error>;
+		fn connect(&mut self, ep: Endpoint) -> Result<u64, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -1554,6 +1556,21 @@ pub mod network {
 					Err(v59) => {
 						w.u8(0)?;
 						v59.write(w)?;
+					}
+				}
+			}
+			OP_CONNECT => {
+				let ep = Endpoint::read(r)?;
+				let result = service.connect(ep);
+				match &result {
+					Ok(v61) => {
+						w.u8(1)?;
+						w.set_handle(*v61);
+						w.u32(0)?;
+					}
+					Err(v62) => {
+						w.u8(0)?;
+						v62.write(w)?;
 					}
 				}
 			}
@@ -1647,16 +1664,209 @@ pub mod network {
 			}
 			Some(if r.u8()? != 0 {
 				Ok({
-					let v61 = r.u16()? as usize;
-					let mut v62 = Vec::new();
-					for _ in 0..v61 {
-						v62.push(r.u8()?);
+					let v63 = r.u16()? as usize;
+					let mut v64 = Vec::new();
+					for _ in 0..v63 {
+						v64.push(r.u8()?);
 					}
-					v62
+					v64
 				})
 			} else {
 				Err(Error::read(r)?)
 			})
+		}
+		pub fn connect(&mut self, ep: &Endpoint) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_CONNECT)?;
+			w.u32(corr)?;
+			ep.write(w)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 {
+				Ok({
+					let _ = r.u32()?;
+					r.take_handle()
+				})
+			} else {
+				Err(Error::read(r)?)
+			})
+		}
+	}
+}
+
+// interface `socket` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod socket {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_SEND: u16 = 1;
+	pub const OP_RECV: u16 = 2;
+	pub const OP_CLOSE: u16 = 3;
+
+	pub trait Service {
+		fn send(&mut self, data: Vec<u8>) -> Result<u32, Error>;
+		fn recv(&mut self) -> Result<Vec<u8>, Error>;
+		fn close(&mut self) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = Reader::with_handle(request, request_handle);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		match op {
+			OP_SEND => {
+				let data = {
+					let v65 = r.u16()? as usize;
+					let mut v66 = Vec::new();
+					for _ in 0..v65 {
+						v66.push(r.u8()?);
+					}
+					v66
+				};
+				let result = service.send(data);
+				match &result {
+					Ok(v67) => {
+						w.u8(1)?;
+						w.u32(*v67)?;
+					}
+					Err(v68) => {
+						w.u8(0)?;
+						v68.write(w)?;
+					}
+				}
+			}
+			OP_RECV => {
+				let result = service.recv();
+				match &result {
+					Ok(v69) => {
+						w.u8(1)?;
+						if v69.len() > u16::MAX as usize {
+							return None;
+						}
+						w.u16(v69.len() as u16)?;
+						for v71 in v69.iter() {
+							w.u8(*v71)?;
+						}
+					}
+					Err(v70) => {
+						w.u8(0)?;
+						v70.write(w)?;
+					}
+				}
+			}
+			OP_CLOSE => {
+				let result = service.close();
+				match &result {
+					Ok(v72) => {
+						w.u8(1)?;
+					}
+					Err(v73) => {
+						w.u8(0)?;
+						v73.write(w)?;
+					}
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn send(&mut self, data: &Vec<u8>) -> Option<Result<u32, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SEND)?;
+			w.u32(corr)?;
+			if data.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(data.len() as u16)?;
+			for v74 in data.iter() {
+				w.u8(*v74)?;
+			}
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(r.u32()?) } else { Err(Error::read(r)?) })
+		}
+		pub fn recv(&mut self) -> Option<Result<Vec<u8>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RECV)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 {
+				Ok({
+					let v75 = r.u16()? as usize;
+					let mut v76 = Vec::new();
+					for _ in 0..v75 {
+						v76.push(r.u8()?);
+					}
+					v76
+				})
+			} else {
+				Err(Error::read(r)?)
+			})
+		}
+		pub fn close(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_CLOSE)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
 		}
 	}
 }
@@ -1780,13 +1990,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v64 = true;
-		for v63 in self.fields.iter() {
-			if !v64 {
+		let mut v78 = true;
+		for v77 in self.fields.iter() {
+			if !v78 {
 				out.push(',');
 			}
-			v64 = false;
-			v63.to_json_into(out);
+			v78 = false;
+			v77.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1804,13 +2014,13 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v66 = true;
-		for v65 in self.fields.iter() {
-			if !v66 {
+		let mut v80 = true;
+		for v79 in self.fields.iter() {
+			if !v80 {
 				out.push_str(", ");
 			}
-			v66 = false;
-			v65.to_text_into(out);
+			v80 = false;
+			v79.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1832,8 +2042,8 @@ impl Query {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v67) => {
-				let _ = write!(out, "{}", v67);
+			Some(v81) => {
+				let _ = write!(out, "{}", v81);
 			}
 			None => {
 				out.push_str("null");
@@ -1842,8 +2052,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v68) => {
-				v68.to_json_into(out);
+			Some(v82) => {
+				v82.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -1852,8 +2062,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v69) => {
-				crate::codec::json_escape(v69, out);
+			Some(v83) => {
+				crate::codec::json_escape(v83, out);
 			}
 			None => {
 				out.push_str("null");
@@ -1868,8 +2078,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v70) => {
-				let _ = write!(out, "{}", v70);
+			Some(v84) => {
+				let _ = write!(out, "{}", v84);
 			}
 			None => {
 				out.push('-');
@@ -1878,8 +2088,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v71) => {
-				v71.to_text_into(out);
+			Some(v85) => {
+				v85.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -1888,8 +2098,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v72) => {
-				out.push_str(v72);
+			Some(v86) => {
+				out.push_str(v86);
 			}
 			None => {
 				out.push('-');
@@ -2243,13 +2453,13 @@ impl Neighbor {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v74 = true;
-		for v73 in self.mac.iter() {
-			if !v74 {
+		let mut v88 = true;
+		for v87 in self.mac.iter() {
+			if !v88 {
 				out.push(',');
 			}
-			v74 = false;
-			let _ = write!(out, "{}", v73);
+			v88 = false;
+			let _ = write!(out, "{}", v87);
 		}
 		out.push(']');
 		out.push('}');
@@ -2261,13 +2471,13 @@ impl Neighbor {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v76 = true;
-		for v75 in self.mac.iter() {
-			if !v76 {
+		let mut v90 = true;
+		for v89 in self.mac.iter() {
+			if !v90 {
 				out.push_str(", ");
 			}
-			v76 = false;
-			let _ = write!(out, "{}", v75);
+			v90 = false;
+			let _ = write!(out, "{}", v89);
 		}
 		out.push(']');
 		out.push('}');
@@ -2292,13 +2502,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v78 = true;
-		for v77 in self.mac.iter() {
-			if !v78 {
+		let mut v92 = true;
+		for v91 in self.mac.iter() {
+			if !v92 {
 				out.push(',');
 			}
-			v78 = false;
-			let _ = write!(out, "{}", v77);
+			v92 = false;
+			let _ = write!(out, "{}", v91);
 		}
 		out.push(']');
 		out.push(',');
@@ -2307,13 +2517,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"neighbors\":");
 		out.push('[');
-		let mut v80 = true;
-		for v79 in self.neighbors.iter() {
-			if !v80 {
+		let mut v94 = true;
+		for v93 in self.neighbors.iter() {
+			if !v94 {
 				out.push(',');
 			}
-			v80 = false;
-			v79.to_json_into(out);
+			v94 = false;
+			v93.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2325,13 +2535,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v82 = true;
-		for v81 in self.mac.iter() {
-			if !v82 {
+		let mut v96 = true;
+		for v95 in self.mac.iter() {
+			if !v96 {
 				out.push_str(", ");
 			}
-			v82 = false;
-			let _ = write!(out, "{}", v81);
+			v96 = false;
+			let _ = write!(out, "{}", v95);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -2340,13 +2550,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("neighbors=");
 		out.push('[');
-		let mut v84 = true;
-		for v83 in self.neighbors.iter() {
-			if !v84 {
+		let mut v98 = true;
+		for v97 in self.neighbors.iter() {
+			if !v98 {
 				out.push_str(", ");
 			}
-			v84 = false;
-			v83.to_text_into(out);
+			v98 = false;
+			v97.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2398,13 +2608,13 @@ impl TcpRequest {
 		out.push(',');
 		out.push_str("\"request\":");
 		out.push('[');
-		let mut v86 = true;
-		for v85 in self.request.iter() {
-			if !v86 {
+		let mut v100 = true;
+		for v99 in self.request.iter() {
+			if !v100 {
 				out.push(',');
 			}
-			v86 = false;
-			let _ = write!(out, "{}", v85);
+			v100 = false;
+			let _ = write!(out, "{}", v99);
 		}
 		out.push(']');
 		out.push('}');
@@ -2416,13 +2626,13 @@ impl TcpRequest {
 		out.push_str(", ");
 		out.push_str("request=");
 		out.push('[');
-		let mut v88 = true;
-		for v87 in self.request.iter() {
-			if !v88 {
+		let mut v102 = true;
+		for v101 in self.request.iter() {
+			if !v102 {
 				out.push_str(", ");
 			}
-			v88 = false;
-			let _ = write!(out, "{}", v87);
+			v102 = false;
+			let _ = write!(out, "{}", v101);
 		}
 		out.push(']');
 		out.push('}');
