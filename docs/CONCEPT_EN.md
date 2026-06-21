@@ -1643,7 +1643,7 @@ a prototype file picker (powerbox)
 a network stack over virtio-net (a priority - on the edge, networking is the core)
 an interactive console: keyboard input + a userspace line editor (command history, cursor movement, in-line editing, ANSI key sequences for arrows) - the kernel console stays a dumb byte sink, the line editor lives in the shell
 simple pointer/mouse plumbing over virtio-input (text-cell pointer + button events for TUI apps such as a file manager); no mouse stack or touch yet (those are the desktop phase)
-observability and remote admin: full System Graph, JSON/CBOR/CLI representations, tracing, counters
+observability: full System Graph, JSON/CBOR/CLI representations, tracing, counters (the JSON/CBOR forms are network-friendly; exposing and administering it over the network is phase 3)
 security hardening: app sandbox, permission manifests, threat model
 ServiceManager with restart policy and watchdog
 full Component Model + WASI preview 2, an SDK for Rust/C/Go
@@ -1655,6 +1655,7 @@ a simple persistent native filesystem
 
 ```text
 user accounts / identities (multi-user management, remote access) - userspace identity over capabilities, not kernel uid/gid
+remote admin: the System Graph / logs / counters exposed and administered over the network, authenticated against the identity model (phase 2 keeps observability local + network-friendly representations)
 localization (locale, language, time zone, formatting) - relevant already in the CLI and in logs
 a wider network stack and server-class workloads
 immutable signed system, A/B updates, rollback, verified boot

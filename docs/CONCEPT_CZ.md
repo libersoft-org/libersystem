@@ -1643,7 +1643,7 @@ prototyp file pickeru (powerbox)
 síťový stack nad virtio-net (priorita - na edge je síť jádro)
 interaktivní konzole: vstup z klávesnice + userspace řádkový editor (historie příkazů, pohyb kurzoru, editace uvnitř řádku, ANSI sekvence pro šipky) - kernel konzole zůstává hloupým bajtovým kanálem, řádkový editor žije v shellu
 jednoduché pointer/myš plumbing nad virtio-input (pointer v textových buňkách + události tlačítek pro TUI aplikace typu správce souborů); zatím žádný myší stack ani touch (ty jsou až desktopová fáze)
-observabilita a remote admin: plný System Graph, JSON/CBOR/CLI reprezentace, tracing, counters
+observabilita: plný System Graph, JSON/CBOR/CLI reprezentace, tracing, counters (JSON/CBOR formy jsou network-friendly; vystavení a správa po síti je fáze 3)
 bezpečnostní hardening: app sandbox, permission manifesty, threat model
 ServiceManager s restart policy a watchdog
 plný Component Model + WASI preview 2, SDK pro Rust/C/Go
@@ -1655,6 +1655,7 @@ jednoduchý perzistentní nativní filesystem
 
 ```text
 uživatelské účty / identity (víceuživatelská správa, vzdálený přístup) - userspace identita nad capabilitami, ne kernel uid/gid
+remote admin: System Graph / logy / countery vystavené a spravované po síti, autentizované vůči identitnímu modelu (fáze 2 drží observabilitu lokální + network-friendly reprezentace)
 lokalizace (locale, jazyk, časová zóna, formátování) - relevantní už v CLI a v logách
 širší síťový stack a server-class workloady
 immutable signed systém, A/B updates, rollback, verified boot
