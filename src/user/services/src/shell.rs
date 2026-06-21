@@ -14,7 +14,7 @@
 extern crate alloc;
 
 use alloc::string::String;
-use proto::system::{ConfigEntry, DeviceEntry, Endpoint, Entry, Error, Ipv4Addr, OpenOpts, ProcessInfo, Query, config, device, log, network, process, socket, volume};
+use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, config, device, log, network, process, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -202,7 +202,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"tcp ") {
-			tcp_connect(netsvc, trim(rest));
+			spawn_net_tool(netsvc, package, b"tcp", trim(rest));
 			return false;
 		}
 		if line == b"echo" {
@@ -292,140 +292,6 @@ unsafe fn spawn_net_tool(netsvc: u64, package: &Package, name: &[u8], args: &[u8
 		};
 		exec(package, name, args, tool_netsvc);
 	}
-}
-
-// Open a TCP connection to `<ip> <port>` through NetworkService, which hands back a
-// socket as a capability (the channel a `socket` is served on); drive it with the
-// typed `socket` interface - send a minimal HTTP/1.0 GET probe, drain the response
-// with repeated `recv` until end of stream, then close.
-unsafe fn tcp_connect(netsvc: u64, args: &[u8]) {
-	unsafe {
-		if netsvc == 0 {
-			print(b"tcp: no network interface\n");
-			return;
-		}
-		let sp: usize = match args.iter().position(|&b: &u8| b == b' ') {
-			Some(i) => i,
-			None => {
-				print(b"tcp: usage: tcp <ip> <port>\n");
-				return;
-			}
-		};
-		let host: &[u8] = trim(&args[..sp]);
-		let ip: [u8; 4] = match parse_ip(host) {
-			Some(a) => a,
-			None => {
-				print(b"tcp: invalid address\n");
-				return;
-			}
-		};
-		let port: u16 = match parse_port(trim(&args[sp + 1..])) {
-			Some(p) => p,
-			None => {
-				print(b"tcp: invalid port\n");
-				return;
-			}
-		};
-		// connect() returns the socket as a capability (the channel it is served on).
-		let mut net = network::Client::new(ChannelTransport { chan: netsvc });
-		let ep: Endpoint = Endpoint { addr: Ipv4Addr { a: ip[0], b: ip[1], c: ip[2], d: ip[3] }, port };
-		let sockh: u64 = match net.connect(&ep) {
-			Some(Ok(h)) => h,
-			Some(Err(Error::NotFound)) => {
-				print(b"tcp: unreachable (no route)\n");
-				return;
-			}
-			Some(Err(Error::Denied)) => {
-				print(b"tcp: connection refused\n");
-				return;
-			}
-			Some(Err(_)) => {
-				print(b"tcp: connection timed out\n");
-				return;
-			}
-			None => {
-				print(b"tcp: service unavailable\n");
-				return;
-			}
-		};
-		let mut sock = socket::Client::new(ChannelTransport { chan: sockh });
-		print(b"tcp ");
-		print(host);
-		print(b": connected\n");
-		// Send the probe, then drain the received-data stream (a sub-channel of framed
-		// chunks) until the producer closes - end of stream.
-		if let Some(Ok(_)) = sock.send(&b"GET / HTTP/1.0\r\n\r\n".to_vec()) {
-			if let Some(rxstream) = sock.recv() {
-				let mut frame: [u8; 1024] = [0u8; 1024];
-				loop {
-					match recv_blocking(rxstream, &mut frame) {
-						Received::Message { len, .. } => {
-							if let Some(chunk) = socket::recv_read(&frame[..len]) {
-								print(&chunk.data);
-							}
-						}
-						Received::Closed => break,
-					}
-				}
-				close(rxstream);
-			}
-			print(b"\n");
-		} else {
-			print(b"tcp: send failed\n");
-		}
-		let _ = sock.close();
-		close(sockh);
-	}
-}
-
-// Parse a decimal port number (0-65535), or None if malformed or out of range.
-fn parse_port(s: &[u8]) -> Option<u16> {
-	if s.is_empty() || s.len() > 5 {
-		return None;
-	}
-	let mut v: u32 = 0;
-	for &b in s {
-		if !b.is_ascii_digit() {
-			return None;
-		}
-		v = v * 10 + (b - b'0') as u32;
-		if v > 65535 {
-			return None;
-		}
-	}
-	Some(v as u16)
-}
-
-// Parse a dotted-decimal IPv4 address into 4 octets, or None if malformed.
-fn parse_ip(s: &[u8]) -> Option<[u8; 4]> {
-	let mut octets: [u8; 4] = [0u8; 4];
-	let mut idx: usize = 0;
-	let mut value: u32 = 0;
-	let mut digits: u32 = 0;
-	for &b in s {
-		if b == b'.' {
-			if digits == 0 || idx >= 3 {
-				return None;
-			}
-			octets[idx] = value as u8;
-			idx += 1;
-			value = 0;
-			digits = 0;
-		} else if b.is_ascii_digit() {
-			value = value * 10 + (b - b'0') as u32;
-			digits += 1;
-			if value > 255 || digits > 3 {
-				return None;
-			}
-		} else {
-			return None;
-		}
-	}
-	if idx != 3 || digits == 0 {
-		return None;
-	}
-	octets[3] = value as u8;
-	Some(octets)
 }
 
 // Render typed records as a JSON array - each via its generated to_json(), comma-
