@@ -1,9 +1,10 @@
-// A minimal userspace network stack for driver.virtio-net: Ethernet II framing,
-// ARP, IPv4, and ICMP echo. It is deliberately housed inside the net driver for
-// phase-2 M32 (the receive path plus the lowest layers); M33 extracts it into a
-// standing NetworkService with typed sockets. The driver hands each received
-// Ethernet frame to `Stack::on_frame`, which parses it, updates the neighbor cache,
-// and writes an optional reply frame for the driver to transmit.
+// A minimal userspace network stack: Ethernet II framing, ARP, IPv4, ICMP echo,
+// and a UDP/DNS client. It is the core of NetworkService (M33): the standing
+// service owns this stack and receives each Ethernet frame from the frame-mover
+// `driver.virtio-net` over a channel, hands it to `Stack::on_frame` (which parses
+// it, updates the neighbor cache, and writes an optional reply frame), and sends
+// any reply back to the driver to transmit. It carries no device knowledge - the
+// driver owns the NIC; the service owns the protocol.
 
 #![allow(dead_code)]
 

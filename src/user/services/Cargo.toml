@@ -33,6 +33,10 @@ name = "config_service"
 path = "src/config_service.rs"
 
 [[bin]]
+name = "network_service"
+path = "src/network_service.rs"
+
+[[bin]]
 name = "wasi_host"
 path = "src/wasi_host.rs"
 
