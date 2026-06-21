@@ -99,16 +99,19 @@ impl PciDevice {
 		if self.is_virtio() && (VIRTIO_MODERN_BASE..VIRTIO_MODERN_BASE + 0x40).contains(&self.device_id) { Some(self.device_id - VIRTIO_MODERN_BASE) } else { None }
 	}
 
-	// The IOAPIC GSI this function's INTx pin is wired to, or None if it drives no
-	// pin. The PCI Interrupt Line register (0x3C) holds the legacy 8259 IRQ, not a
-	// GSI; under the IOAPIC the q35 (ICH9) chipset routes each slot's INTx pin to a
-	// PIRQ link (PIRQ pin = (slot + pin_index) % 8) and the firmware maps PIRQ[A..H]
-	// to GSI 16..23. So GSI = 16 + (slot + (pin - 1)) % 8.
+	// The IOAPIC GSI this function's INTx pin is delivered on, or None if it drives no
+	// pin. QEMU's q35 mirrors every PCI INTx onto the ISA-compatible I/O APIC input
+	// whose GSI equals the legacy 8259 IRQ in the PCI Interrupt Line register (0x3C) -
+	// e.g. the NIC's line 11 arrives on GSI 11, the keyboard's line 10 on GSI 10 -
+	// alongside the chipset's PIRQ pins (GSI 16..23). The PIRQ pin would isolate
+	// shared lines better, but its slot->link swizzle is firmware-defined (the ACPI
+	// _PRT), so we route the directly-readable legacy line; parsing the _PRT for real
+	// hardware (where the legacy mirror may be absent under the APIC) is a later phase.
 	pub fn intx_gsi(&self) -> Option<u32> {
 		if self.irq_pin == 0 {
 			return None;
 		}
-		Some(16 + (self.dev as u32 + (self.irq_pin as u32 - 1)) % 8)
+		Some(self.irq_line as u32)
 	}
 }
 

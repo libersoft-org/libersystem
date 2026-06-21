@@ -121,11 +121,11 @@ unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], 
 			if !send_blocking(dm_side, &buf[..6 + info_size], cap as u64) {
 				return false;
 			}
-			// the interrupt-driven input driver also needs its device's Interrupt
-			// capability: acquire it (which routes the IOAPIC) and transfer it as a
-			// second "IRQ" message. The polling drivers (blk/net/console) get none, so
-			// their device IRQs stay masked and never storm.
-			if driver_name == b"virtio_input" {
+			// the interrupt-driven drivers (input, net) also need their device's
+			// Interrupt capability: acquire it (which routes the IOAPIC) and transfer it
+			// as a second "IRQ" message. The purely polling drivers (blk/console) get
+			// none, so their device IRQs stay masked and never storm.
+			if driver_name == b"virtio_input" || driver_name == b"virtio_net" {
 				let irq: i64 = device_interrupt_acquire(i);
 				if irq < 0 {
 					return false;

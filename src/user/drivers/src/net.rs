@@ -1,0 +1,304 @@
+// A minimal userspace network stack for driver.virtio-net: Ethernet II framing,
+// ARP, IPv4, and ICMP echo. It is deliberately housed inside the net driver for
+// phase-2 M32 (the receive path plus the lowest layers); M33 extracts it into a
+// standing NetworkService with typed sockets. The driver hands each received
+// Ethernet frame to `Stack::on_frame`, which parses it, updates the neighbor cache,
+// and writes an optional reply frame for the driver to transmit.
+
+#![allow(dead_code)]
+
+// EtherType values (the 2-byte type field of an Ethernet II frame).
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const ETHERTYPE_ARP: u16 = 0x0806;
+
+// ARP fields.
+const ARP_HTYPE_ETHERNET: u16 = 1;
+const ARP_PTYPE_IPV4: u16 = 0x0800;
+const ARP_OP_REQUEST: u16 = 1;
+const ARP_OP_REPLY: u16 = 2;
+
+// IPv4 protocol numbers.
+const IP_PROTO_ICMP: u8 = 1;
+
+// ICMP message types.
+const ICMP_ECHO_REQUEST: u8 = 8;
+const ICMP_ECHO_REPLY: u8 = 0;
+
+// Header sizes (bytes).
+const ETH_HDR: usize = 14;
+const ARP_LEN: usize = 28;
+const IPV4_HDR: usize = 20;
+const ICMP_HDR: usize = 8;
+
+// A 48-bit Ethernet MAC address.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MacAddr(pub [u8; 6]);
+
+impl MacAddr {
+	pub const BROADCAST: MacAddr = MacAddr([0xff; 6]);
+	pub const ZERO: MacAddr = MacAddr([0; 6]);
+}
+
+// A 32-bit IPv4 address.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Ipv4Addr(pub [u8; 4]);
+
+// Read a big-endian u16 at `off` within `b` (the caller guarantees the bounds).
+fn be16(b: &[u8], off: usize) -> u16 {
+	((b[off] as u16) << 8) | b[off + 1] as u16
+}
+
+// Write a big-endian u16 `v` at `off` within `b`.
+fn put16(b: &mut [u8], off: usize, v: u16) {
+	b[off] = (v >> 8) as u8;
+	b[off + 1] = v as u8;
+}
+
+// The internet checksum (ones-complement sum of 16-bit words) of `data`.
+fn checksum(data: &[u8]) -> u16 {
+	let mut sum: u32 = 0;
+	let mut i: usize = 0;
+	while i + 1 < data.len() {
+		sum += be16(data, i) as u32;
+		i += 2;
+	}
+	if i < data.len() {
+		sum += (data[i] as u32) << 8;
+	}
+	while sum >> 16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16);
+	}
+	!(sum as u16)
+}
+
+// One entry of the small ARP neighbor cache (IPv4 -> MAC).
+#[derive(Clone, Copy)]
+struct Neigh {
+	ip: Ipv4Addr,
+	mac: MacAddr,
+	valid: bool,
+}
+
+const NEIGH_MAX: usize = 8;
+
+// The notable thing a received frame did, for the driver to log or react to.
+pub enum Event {
+	None,
+	// We learned a neighbor's MAC (from an ARP reply for an address we asked about).
+	Learned(Ipv4Addr, MacAddr),
+	// An ICMP echo reply arrived (a `ping` we sent was answered).
+	EchoReply(Ipv4Addr),
+}
+
+// The result of feeding one frame to the stack: an optional reply to transmit
+// (`reply_len` bytes written to the caller's output buffer, 0 = none) and an event.
+pub struct Outcome {
+	pub reply_len: usize,
+	pub event: Event,
+}
+
+// The interface's L2/L3 state: our addresses and the neighbor cache.
+pub struct Stack {
+	mac: MacAddr,
+	ip: Ipv4Addr,
+	gateway: Ipv4Addr,
+	neigh: [Neigh; NEIGH_MAX],
+}
+
+impl Stack {
+	pub fn new(mac: MacAddr, ip: Ipv4Addr, gateway: Ipv4Addr) -> Stack {
+		Stack { mac, ip, gateway, neigh: [Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; NEIGH_MAX] }
+	}
+
+	pub fn mac(&self) -> MacAddr {
+		self.mac
+	}
+
+	pub fn ip(&self) -> Ipv4Addr {
+		self.ip
+	}
+
+	pub fn gateway(&self) -> Ipv4Addr {
+		self.gateway
+	}
+
+	// Record (or refresh) a neighbor's MAC, evicting the oldest slot when full.
+	fn learn(&mut self, ip: Ipv4Addr, mac: MacAddr) {
+		for n in self.neigh.iter_mut() {
+			if n.valid && n.ip == ip {
+				n.mac = mac;
+				return;
+			}
+		}
+		for n in self.neigh.iter_mut() {
+			if !n.valid {
+				*n = Neigh { ip, mac, valid: true };
+				return;
+			}
+		}
+		self.neigh[0] = Neigh { ip, mac, valid: true };
+	}
+
+	// The cached MAC for `ip`, if known.
+	pub fn lookup(&self, ip: Ipv4Addr) -> Option<MacAddr> {
+		for n in self.neigh.iter() {
+			if n.valid && n.ip == ip {
+				return Some(n.mac);
+			}
+		}
+		None
+	}
+
+	// Parse one received Ethernet frame, update the neighbor cache, and write an
+	// optional reply frame to `out`. Any malformed or unhandled frame yields no reply.
+	pub fn on_frame(&mut self, frame: &[u8], out: &mut [u8]) -> Outcome {
+		if frame.len() < ETH_HDR {
+			return Outcome { reply_len: 0, event: Event::None };
+		}
+		match be16(frame, 12) {
+			ETHERTYPE_ARP => self.on_arp(frame, out),
+			ETHERTYPE_IPV4 => self.on_ipv4(frame, out),
+			_ => Outcome { reply_len: 0, event: Event::None },
+		}
+	}
+
+	// Handle an ARP packet: learn the sender, reply to a request for our address, and
+	// report a reply as a learned neighbor.
+	fn on_arp(&mut self, frame: &[u8], out: &mut [u8]) -> Outcome {
+		let a: &[u8] = &frame[ETH_HDR..];
+		if a.len() < ARP_LEN || be16(a, 0) != ARP_HTYPE_ETHERNET || be16(a, 2) != ARP_PTYPE_IPV4 {
+			return Outcome { reply_len: 0, event: Event::None };
+		}
+		let op: u16 = be16(a, 6);
+		let sender_mac: MacAddr = MacAddr([a[8], a[9], a[10], a[11], a[12], a[13]]);
+		let sender_ip: Ipv4Addr = Ipv4Addr([a[14], a[15], a[16], a[17]]);
+		let target_ip: Ipv4Addr = Ipv4Addr([a[24], a[25], a[26], a[27]]);
+		self.learn(sender_ip, sender_mac);
+		if op == ARP_OP_REQUEST && target_ip == self.ip {
+			let len: usize = self.build_arp(ARP_OP_REPLY, sender_mac, sender_ip, out);
+			return Outcome { reply_len: len, event: Event::None };
+		}
+		if op == ARP_OP_REPLY {
+			return Outcome { reply_len: 0, event: Event::Learned(sender_ip, sender_mac) };
+		}
+		Outcome { reply_len: 0, event: Event::None }
+	}
+
+	// Build an Ethernet + ARP frame (request or reply) into `out`, returning its length.
+	fn build_arp(&self, op: u16, target_mac: MacAddr, target_ip: Ipv4Addr, out: &mut [u8]) -> usize {
+		let dst: MacAddr = if op == ARP_OP_REQUEST { MacAddr::BROADCAST } else { target_mac };
+		out[0..6].copy_from_slice(&dst.0);
+		out[6..12].copy_from_slice(&self.mac.0);
+		put16(out, 12, ETHERTYPE_ARP);
+		let a: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + ARP_LEN];
+		put16(a, 0, ARP_HTYPE_ETHERNET);
+		put16(a, 2, ARP_PTYPE_IPV4);
+		a[4] = 6;
+		a[5] = 4;
+		put16(a, 6, op);
+		a[8..14].copy_from_slice(&self.mac.0);
+		a[14..18].copy_from_slice(&self.ip.0);
+		a[18..24].copy_from_slice(&target_mac.0);
+		a[24..28].copy_from_slice(&target_ip.0);
+		ETH_HDR + ARP_LEN
+	}
+
+	// Build a broadcast ARP request asking who has `target`, into `out`.
+	pub fn build_arp_request(&self, target: Ipv4Addr, out: &mut [u8]) -> usize {
+		self.build_arp(ARP_OP_REQUEST, MacAddr::ZERO, target, out)
+	}
+
+	// Handle an IPv4 packet addressed to us; only ICMP is processed.
+	fn on_ipv4(&mut self, frame: &[u8], out: &mut [u8]) -> Outcome {
+		let ip: &[u8] = &frame[ETH_HDR..];
+		if ip.len() < IPV4_HDR || ip[0] >> 4 != 4 {
+			return Outcome { reply_len: 0, event: Event::None };
+		}
+		let ihl: usize = (ip[0] & 0x0f) as usize * 4;
+		if ihl < IPV4_HDR || ip.len() < ihl {
+			return Outcome { reply_len: 0, event: Event::None };
+		}
+		let dst_ip: Ipv4Addr = Ipv4Addr([ip[16], ip[17], ip[18], ip[19]]);
+		if dst_ip != self.ip || ip[9] != IP_PROTO_ICMP {
+			return Outcome { reply_len: 0, event: Event::None };
+		}
+		let src_ip: Ipv4Addr = Ipv4Addr([ip[12], ip[13], ip[14], ip[15]]);
+		self.on_icmp(frame, ihl, src_ip, out)
+	}
+
+	// Handle an ICMP message: reply to an echo request, report an echo reply.
+	fn on_icmp(&mut self, frame: &[u8], ihl: usize, src_ip: Ipv4Addr, out: &mut [u8]) -> Outcome {
+		let icmp: &[u8] = &frame[ETH_HDR + ihl..];
+		if icmp.len() < ICMP_HDR {
+			return Outcome { reply_len: 0, event: Event::None };
+		}
+		if icmp[0] == ICMP_ECHO_REQUEST {
+			let len: usize = self.build_echo_reply(frame, ihl, src_ip, out);
+			return Outcome { reply_len: len, event: Event::None };
+		}
+		if icmp[0] == ICMP_ECHO_REPLY {
+			return Outcome { reply_len: 0, event: Event::EchoReply(src_ip) };
+		}
+		Outcome { reply_len: 0, event: Event::None }
+	}
+
+	// Turn a received ICMP echo request into its echo reply in `out`: swap the L2/L3
+	// addresses, flip the ICMP type, and recompute both checksums.
+	fn build_echo_reply(&self, frame: &[u8], ihl: usize, src_ip: Ipv4Addr, out: &mut [u8]) -> usize {
+		let ip_total: usize = be16(&frame[ETH_HDR..], 2) as usize;
+		let frame_len: usize = ETH_HDR + ip_total;
+		if ip_total < ihl + ICMP_HDR || frame_len > frame.len() || frame_len > out.len() {
+			return 0;
+		}
+		// Ethernet: destination = the requester, source = us.
+		out[0..6].copy_from_slice(&frame[6..12]);
+		out[6..12].copy_from_slice(&self.mac.0);
+		put16(out, 12, ETHERTYPE_IPV4);
+		out[ETH_HDR..frame_len].copy_from_slice(&frame[ETH_HDR..frame_len]);
+		let ip: &mut [u8] = &mut out[ETH_HDR..frame_len];
+		// Swap source/destination IP, then recompute the header checksum.
+		ip[12..16].copy_from_slice(&self.ip.0);
+		ip[16..20].copy_from_slice(&src_ip.0);
+		put16(ip, 10, 0);
+		let csum: u16 = checksum(&ip[..ihl]);
+		put16(ip, 10, csum);
+		// ICMP: echo reply, recompute its checksum over type/code/rest + payload.
+		let icmp: &mut [u8] = &mut ip[ihl..];
+		icmp[0] = ICMP_ECHO_REPLY;
+		put16(icmp, 2, 0);
+		let csum2: u16 = checksum(icmp);
+		put16(icmp, 2, csum2);
+		frame_len
+	}
+
+	// Build an ICMP echo request to `dst_ip` (whose MAC is `dst_mac`) with the given
+	// identifier and sequence, into `out`, returning its length.
+	pub fn build_icmp_echo(&self, dst_mac: MacAddr, dst_ip: Ipv4Addr, ident: u16, seq: u16, out: &mut [u8]) -> usize {
+		let total: usize = IPV4_HDR + ICMP_HDR;
+		out[0..6].copy_from_slice(&dst_mac.0);
+		out[6..12].copy_from_slice(&self.mac.0);
+		put16(out, 12, ETHERTYPE_IPV4);
+		let ip: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + total];
+		ip[0] = 0x45;
+		ip[1] = 0;
+		put16(ip, 2, total as u16);
+		put16(ip, 4, 0);
+		put16(ip, 6, 0);
+		ip[8] = 64;
+		ip[9] = IP_PROTO_ICMP;
+		put16(ip, 10, 0);
+		ip[12..16].copy_from_slice(&self.ip.0);
+		ip[16..20].copy_from_slice(&dst_ip.0);
+		let csum: u16 = checksum(&ip[..IPV4_HDR]);
+		put16(ip, 10, csum);
+		let icmp: &mut [u8] = &mut ip[IPV4_HDR..];
+		icmp[0] = ICMP_ECHO_REQUEST;
+		icmp[1] = 0;
+		put16(icmp, 2, 0);
+		put16(icmp, 4, ident);
+		put16(icmp, 6, seq);
+		let csum2: u16 = checksum(icmp);
+		put16(icmp, 2, csum2);
+		ETH_HDR + total
+	}
+}
