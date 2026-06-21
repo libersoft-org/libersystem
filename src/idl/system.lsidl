@@ -211,6 +211,7 @@ interface network {
 	@op(3) ping:    func(addr: ipv4-addr) -> result<ping-status, error>;
 	@op(4) fetch:   func(req: tcp-request) -> result<list<u8>, error>;
 	@op(5) connect: func(ep: endpoint) -> result<handle<channel>, error>;
+	@op(6) open:    func() -> result<handle<channel>, error>;
 }
 
 // A connected TCP socket, served on the channel `network.connect` hands back as a

@@ -14,7 +14,7 @@
 extern crate alloc;
 
 use alloc::string::String;
-use proto::system::{ConfigEntry, DeviceEntry, Endpoint, Entry, Error, Ipv4Addr, OpenOpts, PingStatus, ProcessInfo, Query, config, device, log, network, process, socket, volume};
+use proto::system::{ConfigEntry, DeviceEntry, Endpoint, Entry, Error, Ipv4Addr, OpenOpts, ProcessInfo, Query, config, device, log, network, process, socket, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -190,7 +190,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"ping ") {
-			ping_host(netsvc, trim(rest));
+			spawn_net_tool(netsvc, package, b"ping", trim(rest));
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"nslookup ") {
@@ -206,11 +206,11 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			return false;
 		}
 		if line == b"echo" {
-			exec(package, b"echo", b"");
+			exec(package, b"echo", b"", 0);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
-			exec(package, b"echo", trim(rest));
+			exec(package, b"echo", trim(rest), 0);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"cat ") {
@@ -236,7 +236,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 // message just before it exits, which we wait on - an exited process is briefly a
 // zombie whose channel has not yet closed, so we cannot rely on the channel closing
 // to detect exit. This is the foreground exec primitive the net tools build on.
-unsafe fn exec(package: &Package, name: &[u8], args: &[u8]) {
+unsafe fn exec(package: &Package, name: &[u8], args: &[u8], cap: u64) {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -257,8 +257,10 @@ unsafe fn exec(package: &Package, name: &[u8], args: &[u8]) {
 			close(parent);
 			return;
 		}
-		// Hand the child its arguments, then block until it signals completion.
-		send_blocking(parent, args, 0);
+		// Hand the child its arguments (and an optional inherited capability, e.g. a
+		// NetworkService client channel for a net tool), then block until it signals
+		// completion.
+		send_blocking(parent, args, cap);
 		let mut done: [u8; 16] = [0u8; 16];
 		match recv_blocking(parent, &mut done) {
 			Received::Message { .. } | Received::Closed => {}
@@ -303,32 +305,28 @@ unsafe fn query_ip(netsvc: u64) {
 	}
 }
 
-// Send a `ping` to `target` (a dotted-decimal address) through NetworkService over
-// the typed `network` interface and render the outcome.
-unsafe fn ping_host(netsvc: u64, target: &[u8]) {
+// Spawn a network tool as a foreground program, giving it its OWN NetworkService
+// client channel: `network.open` mints a fresh client channel, which we transfer to
+// the tool alongside its arguments. Each tool talks to NetworkService over its own
+// channel rather than sharing the shell's (a shared channel would race), and the
+// shell keeps its own `netsvc`.
+unsafe fn spawn_net_tool(netsvc: u64, package: &Package, name: &[u8], args: &[u8]) {
 	unsafe {
 		if netsvc == 0 {
-			print(b"ping: no network interface\n");
+			print(name);
+			print(b": no network interface\n");
 			return;
 		}
-		let ip: [u8; 4] = match parse_ip(target) {
-			Some(a) => a,
-			None => {
-				print(b"ping: invalid address\n");
+		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
+		let tool_netsvc: u64 = match client.open() {
+			Some(Ok(h)) => h,
+			_ => {
+				print(name);
+				print(b": network service unavailable\n");
 				return;
 			}
 		};
-		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
-		let addr: Ipv4Addr = Ipv4Addr { a: ip[0], b: ip[1], c: ip[2], d: ip[3] };
-		print(b"ping ");
-		print(target);
-		match client.ping(&addr) {
-			Some(Ok(PingStatus::Reply)) => print(b": reply\n"),
-			Some(Ok(PingStatus::Unreachable)) => print(b": unreachable (no route)\n"),
-			Some(Ok(PingStatus::Timeout)) => print(b": no reply (timeout)\n"),
-			Some(Err(_)) => print(b": error\n"),
-			None => print(b": service unavailable\n"),
-		}
+		exec(package, name, args, tool_netsvc);
 	}
 }
 

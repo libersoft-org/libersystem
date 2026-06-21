@@ -14,5 +14,8 @@ extern crate alloc;
 pub mod codec;
 pub mod system;
 
+// Hand-written helpers on the generated wire types (e.g. `Ipv4Addr::parse`).
+mod addr;
+
 #[cfg(test)]
 mod tests;

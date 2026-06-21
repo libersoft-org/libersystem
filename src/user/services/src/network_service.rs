@@ -59,6 +59,10 @@ const REPLY_MAX: usize = 1024;
 // How many bytes a single socket `recv` returns (the client calls `recv` repeatedly
 // to drain a larger response); kept small for the 16 KiB user stack.
 const SOCK_RECV_MAX: usize = 512;
+// The most client channels we serve at once: the shell plus one per spawned net
+// tool. Bounded so the wait set (frames + clients + socket) stays within the
+// kernel's wait_any limit of 8.
+const MAX_CLIENTS: usize = 4;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -109,15 +113,27 @@ unsafe fn pump(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> 
 	}
 }
 
-// Stand on the driver's frame channel, the client's typed request channel, and the
-// active socket's channel at once (wait_any): a frame from the driver is parsed
+// The first empty slot in the client set, or None if it is full.
+fn first_empty(clients: &[u64; MAX_CLIENTS]) -> Option<usize> {
+	let mut i: usize = 0;
+	while i < MAX_CLIENTS {
+		if clients[i] == 0 {
+			return Some(i);
+		}
+		i += 1;
+	}
+	None
+}
+
+// Stand on the driver's frame channel, every client's typed request channel, and
+// the active socket's channel at once (wait_any): a frame from the driver is parsed
 // (answering ARP / ICMP, any reply sent back to transmit); a client request is
 // decoded, dispatched to the generated `network` server, and answered; a socket
 // request (send / recv / close) is dispatched to the `socket` server for the one
-// connection `network.connect` opened. The client channel closing (the shell
-// exited) drops us back to serving only the network; the socket channel closing
-// (the client dropped its socket) tears the connection down. The gratuitous ARP
-// that announces us on the link goes out first.
+// connection `network.connect` opened. `network.open` mints a fresh client channel
+// (one per spawned net tool) added to the client set; a client channel closing
+// drops it from the set, the socket channel closing tears the connection down. The
+// gratuitous ARP that announces us on the link goes out first.
 unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 	unsafe {
 		let mut rx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
@@ -126,7 +142,10 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 		let mut out: [u8; REPLY_MAX] = [0u8; REPLY_MAX];
 		let arp: usize = stack.build_arp_request(GATEWAY_IP, &mut tx);
 		send_frame(frames, &tx[..arp]);
-		let mut client_open: bool = true;
+		// The client channels we serve the `network` interface on: the shell's
+		// (clients[0]) plus any minted by `network.open` for a spawned net tool.
+		let mut clients: [u64; MAX_CLIENTS] = [0u64; MAX_CLIENTS];
+		clients[0] = client;
 		// The server end of the one active socket (0 = none). The stack has a single
 		// TCP connection, so at most one socket is open at a time.
 		let mut sock: u64 = 0;
@@ -136,18 +155,22 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 		let mut stream_prod: u64 = 0;
 		let mut stream_seq: u32 = 0;
 		loop {
-			// Build the wait set: the driver frame channel always, the client channel
-			// while the shell is connected, and the socket channel while one is open.
-			let mut waits: [u64; 3] = [frames, 0, 0];
+			// Build the wait set: the driver frame channel always, every active client
+			// channel, and the socket channel while one is open. `slot_of` maps a wait
+			// index back to its client slot.
+			let mut waits: [u64; 1 + MAX_CLIENTS + 1] = [0u64; 1 + MAX_CLIENTS + 1];
+			let mut slot_of: [usize; 1 + MAX_CLIENTS + 1] = [usize::MAX; 1 + MAX_CLIENTS + 1];
+			waits[0] = frames;
 			let mut n: usize = 1;
-			let client_idx: usize = if client_open {
-				waits[n] = client;
-				let i: usize = n;
-				n += 1;
-				i
-			} else {
-				usize::MAX
-			};
+			let mut ci: usize = 0;
+			while ci < MAX_CLIENTS {
+				if clients[ci] != 0 {
+					waits[n] = clients[ci];
+					slot_of[n] = ci;
+					n += 1;
+				}
+				ci += 1;
+			}
 			let sock_idx: usize = if sock != 0 {
 				waits[n] = sock;
 				let i: usize = n;
@@ -167,21 +190,6 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 						close(stream_prod);
 						stream_prod = 0;
 					}
-				}
-			} else if ready == client_idx {
-				match recv_blocking(client, &mut req) {
-					Received::Message { len, handle } => {
-						let mut new_sock: u64 = 0;
-						let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx, tx: &mut tx, cur_sock: sock, new_sock: &mut new_sock };
-						let mut reply_handle: u64 = 0;
-						if let Some(n2) = network::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
-							send_blocking(client, &out[..n2], reply_handle);
-						}
-						if new_sock != 0 {
-							sock = new_sock;
-						}
-					}
-					Received::Closed => client_open = false,
 				}
 			} else if ready == sock_idx {
 				match recv_blocking(sock, &mut req) {
@@ -241,6 +249,37 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 						sock = 0;
 					}
 				}
+			} else {
+				// A client request on clients[slot_of[ready]]: dispatch the `network`
+				// interface. `open` may mint another client channel and `connect` may open
+				// the socket; a closed channel is dropped from the client set.
+				let slot: usize = slot_of[ready];
+				let chan: u64 = clients[slot];
+				match recv_blocking(chan, &mut req) {
+					Received::Message { len, handle } => {
+						let mut new_sock: u64 = 0;
+						let mut new_client: u64 = 0;
+						let room: bool = first_empty(&clients).is_some();
+						let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx, tx: &mut tx, cur_sock: sock, new_sock: &mut new_sock, new_client: &mut new_client, clients_room: room };
+						let mut reply_handle: u64 = 0;
+						if let Some(n2) = network::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
+							send_blocking(chan, &out[..n2], reply_handle);
+						}
+						if new_sock != 0 {
+							sock = new_sock;
+						}
+						if new_client != 0 {
+							match first_empty(&clients) {
+								Some(slot2) => clients[slot2] = new_client,
+								None => close(new_client),
+							}
+						}
+					}
+					Received::Closed => {
+						close(chan);
+						clients[slot] = 0;
+					}
+				}
 			}
 		}
 	}
@@ -261,6 +300,10 @@ struct Net<'a> {
 	tx: &'a mut [u8],
 	cur_sock: u64,
 	new_sock: &'a mut u64,
+	// Where `open` parks the server end of a freshly minted client channel for the
+	// serve loop to pick up, and whether the client set has room for another.
+	new_client: &'a mut u64,
+	clients_room: bool,
 }
 
 // Convert the stack's internal address to the wire (canonical) form, and back.
@@ -341,6 +384,26 @@ impl network::Service for Net<'_> {
 				2 => Err(Error::NotFound),
 				3 => Err(Error::Denied),
 				_ => Err(Error::Again),
+			}
+		}
+	}
+
+	// Mint a fresh client channel and hand the caller its client end; the server end
+	// is parked in `new_client` for the serve loop to start serving. The shell calls
+	// this to give each net tool it spawns its own NetworkService capability rather
+	// than sharing one channel (a shared channel would race). Refused with `Again`
+	// when the client set is full.
+	fn open(&mut self) -> Result<u64, Error> {
+		if !self.clients_room {
+			return Err(Error::Again);
+		}
+		unsafe {
+			match channel() {
+				Some((server, peer)) => {
+					*self.new_client = server;
+					Ok(peer)
+				}
+				None => Err(Error::Again),
 			}
 		}
 	}

@@ -229,6 +229,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 3 | `ping` | `ping(addr: ipv4-addr) -> result<ping-status, error>` |
 | 4 | `fetch` | `fetch(req: tcp-request) -> result<list<u8>, error>` |
 | 5 | `connect` | `connect(ep: endpoint) -> result<handle<channel>, error>` |
+| 6 | `open` | `open() -> result<handle<channel>, error>` |
 
 ### interface `socket`
 
