@@ -240,20 +240,40 @@ pub fn block_on(koid: u64, deadline: u64) {
 	reschedule(Disposition::Block);
 }
 
+// Block the calling thread until ANY of `koids` becomes ready (or `deadline`
+// passes): register it once per koid, so a wake on any of them returns it. The
+// caller re-checks which object is actually ready after each wake (the wait_any
+// condition loop), so an early or spurious wake just re-blocks.
+pub fn block_on_any(koids: &[u64], deadline: u64) {
+	let thread = match current_thread() {
+		Some(t) => t,
+		None => return,
+	};
+	thread.set_state(ThreadState::Blocked);
+	{
+		let mut waiters = WAITERS.lock();
+		for &koid in koids {
+			waiters.push(Waiter { thread: thread.clone(), koid, deadline });
+		}
+	}
+	reschedule(Disposition::Block);
+}
+
 // Wake every thread blocked on object `koid`: remove it from the wait registry,
-// mark it Ready, and enqueue it on this core's run queue.
+// mark it Ready, and enqueue it on this core's run queue. A thread that waited on
+// several objects at once (`block_on_any`) has several registry entries; all of
+// them are removed when it wakes, so a later wake on another of its objects cannot
+// re-enqueue an already-running thread.
 pub fn wake_object(koid: u64) {
 	let woken = {
 		let mut waiters = WAITERS.lock();
 		let mut woken: Vec<Arc<Thread>> = Vec::new();
-		let mut i: usize = 0;
-		while i < waiters.len() {
-			if waiters[i].koid == koid {
-				woken.push(waiters.remove(i).thread);
-			} else {
-				i += 1;
+		for w in waiters.iter() {
+			if w.koid == koid && !woken.iter().any(|t: &Arc<Thread>| Arc::ptr_eq(t, &w.thread)) {
+				woken.push(w.thread.clone());
 			}
 		}
+		waiters.retain(|w: &Waiter| !woken.iter().any(|t: &Arc<Thread>| Arc::ptr_eq(t, &w.thread)));
 		woken
 	};
 	for thread in woken {
@@ -268,14 +288,12 @@ pub fn check_deadlines() {
 	let expired = {
 		let mut waiters = WAITERS.lock();
 		let mut expired: Vec<Arc<Thread>> = Vec::new();
-		let mut i: usize = 0;
-		while i < waiters.len() {
-			if waiters[i].deadline <= now {
-				expired.push(waiters.remove(i).thread);
-			} else {
-				i += 1;
+		for w in waiters.iter() {
+			if w.deadline <= now && !expired.iter().any(|t: &Arc<Thread>| Arc::ptr_eq(t, &w.thread)) {
+				expired.push(w.thread.clone());
 			}
 		}
+		waiters.retain(|w: &Waiter| !expired.iter().any(|t: &Arc<Thread>| Arc::ptr_eq(t, &w.thread)));
 		expired
 	};
 	for thread in expired {
@@ -308,7 +326,12 @@ pub fn run_until_idle() {
 		}
 		match min_deadline() {
 			Some(deadline) => {
-				while arch::apic::ticks() < deadline {
+				// Spin until the nearest deadline, but stop early if an interrupt wakes
+				// a thread in the meantime, so an IRQ-woken driver (e.g. a virtio RX
+				// completion arriving mid-wait) runs promptly instead of being held up
+				// for the whole timeout. The run-queue check drops its lock each pass,
+				// so the ISR that enqueues the woken thread can run between checks.
+				while arch::apic::ticks() < deadline && SCHED[cpu].inner.lock().run_queue.is_empty() {
 					core::hint::spin_loop();
 				}
 				check_deadlines();

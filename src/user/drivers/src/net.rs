@@ -149,6 +149,27 @@ impl Stack {
 		None
 	}
 
+	// Serialize the interface state for the `ip` / `net` command into `out`, returning
+	// its length: our address (4), MAC (6), gateway (4), the neighbor count (1), then
+	// that many (ip 4, mac 6) cache entries. The shell parses and renders it.
+	pub fn write_state(&self, out: &mut [u8]) -> usize {
+		out[0..4].copy_from_slice(&self.ip.0);
+		out[4..10].copy_from_slice(&self.mac.0);
+		out[10..14].copy_from_slice(&self.gateway.0);
+		let mut count: u8 = 0;
+		let mut off: usize = 15;
+		for n in self.neigh.iter() {
+			if n.valid && off + 10 <= out.len() {
+				out[off..off + 4].copy_from_slice(&n.ip.0);
+				out[off + 4..off + 10].copy_from_slice(&n.mac.0);
+				off += 10;
+				count += 1;
+			}
+		}
+		out[14] = count;
+		off
+	}
+
 	// Parse one received Ethernet frame, update the neighbor cache, and write an
 	// optional reply frame to `out`. Any malformed or unhandled frame yields no reply.
 	pub fn on_frame(&mut self, frame: &[u8], out: &mut [u8]) -> Outcome {

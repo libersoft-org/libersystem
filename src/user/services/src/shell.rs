@@ -35,6 +35,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let devsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DEVICE") }.unwrap_or_else(|| exit());
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
 	let cfgsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONFIG") }.unwrap_or_else(|| exit());
+	let netsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NET") }.unwrap_or_else(|| exit());
 
 	// 2. self-check: prove the StorageService round-trip works by reading a file.
 	if !unsafe { cat(storage, SELF_CHECK_URI) } {
@@ -48,7 +49,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 4. become the interactive console and run the read-eval-print loop.
 	unsafe {
-		repl(storage, logsvc, devsvc, procsvc, cfgsvc, &mut buf);
+		repl(storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, &mut buf);
 	}
 	exit();
 }
@@ -57,7 +58,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // kernel feeds keystrokes on the channel; we line-edit them (echoing input,
 // handling backspace) and dispatch each completed line. Returns when the user
 // types `exit`.
-unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, buf: &mut [u8]) {
+unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, buf: &mut [u8]) {
 	unsafe {
 		// The kernel sends console input on `feed`; we receive it on `input`.
 		let (feed, input): (u64, u64) = match channel() {
@@ -78,7 +79,7 @@ unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64
 				match buf[i] {
 					b'\n' | b'\r' => {
 						print(b"\n");
-						if dispatch(&line[..len], storage, logsvc, devsvc, procsvc, cfgsvc) {
+						if dispatch(&line[..len], storage, logsvc, devsvc, procsvc, cfgsvc, netsvc) {
 							return;
 						}
 						len = 0;
@@ -106,7 +107,7 @@ unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64
 }
 
 // Dispatch one command line. Returns true if the shell should exit.
-unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -128,6 +129,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  run <name>       start a program via ProcessService\n");
 			print(b"  config [<key>]   list the config tree or read one key via ConfigService\n");
 			print(b"  set <key> <val>  write a config key via ConfigService\n");
+			print(b"  ip | net         show the network interface and ARP cache\n");
+			print(b"  ping <ip>        send an ICMP echo via the net driver\n");
 			print(b"  exit             stop the shell and halt\n");
 			return false;
 		}
@@ -175,6 +178,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			set_config(cfgsvc, trim(rest));
 			return false;
 		}
+		if line == b"ip" || line == b"net" {
+			query_ip(netsvc);
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"ping ") {
+			ping_host(netsvc, trim(rest));
+			return false;
+		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
 			print(rest);
 			print(b"\n");
@@ -193,6 +204,166 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		print(line);
 		print(b" (try 'help')\n");
 		false
+	}
+}
+
+// Query the net driver for its interface state (`ip` / `net`) and render it: our
+// address, MAC, gateway, and the ARP neighbor cache. The reply is the packed state
+// the driver builds from net::Stack::write_state.
+unsafe fn query_ip(netsvc: u64) {
+	unsafe {
+		if netsvc == 0 {
+			print(b"ip: no network interface\n");
+			return;
+		}
+		if !send_blocking(netsvc, b"IP", 0) {
+			print(b"ip: request failed\n");
+			return;
+		}
+		let mut buf: [u8; 256] = [0u8; 256];
+		let n: usize = match recv_blocking(netsvc, &mut buf) {
+			Received::Message { len, .. } => len,
+			Received::Closed => {
+				print(b"ip: network driver gone\n");
+				return;
+			}
+		};
+		if n < 15 {
+			print(b"ip: short reply\n");
+			return;
+		}
+		print(b"net0: ");
+		print_ip(&buf[0..4]);
+		print(b"  mac ");
+		print_mac(&buf[4..10]);
+		print(b"  gateway ");
+		print_ip(&buf[10..14]);
+		print(b"\n");
+		let count: usize = buf[14] as usize;
+		if count > 0 {
+			print(b"neighbors:\n");
+			let mut i: usize = 0;
+			while i < count && 15 + i * 10 + 10 <= n {
+				let off: usize = 15 + i * 10;
+				print(b"  ");
+				print_ip(&buf[off..off + 4]);
+				print(b"  ");
+				print_mac(&buf[off + 4..off + 10]);
+				print(b"\n");
+				i += 1;
+			}
+		}
+	}
+}
+
+// Send a `ping` to `target` (a dotted-decimal address) through the net driver and
+// render the result (the driver does the ARP + echo round-trip and replies with a
+// status byte).
+unsafe fn ping_host(netsvc: u64, target: &[u8]) {
+	unsafe {
+		if netsvc == 0 {
+			print(b"ping: no network interface\n");
+			return;
+		}
+		let ip: [u8; 4] = match parse_ip(target) {
+			Some(a) => a,
+			None => {
+				print(b"ping: invalid address\n");
+				return;
+			}
+		};
+		let mut req: [u8; 8] = [0u8; 8];
+		req[..4].copy_from_slice(b"PING");
+		req[4..8].copy_from_slice(&ip);
+		if !send_blocking(netsvc, &req, 0) {
+			print(b"ping: request failed\n");
+			return;
+		}
+		let mut buf: [u8; 16] = [0u8; 16];
+		let status: u8 = match recv_blocking(netsvc, &mut buf) {
+			Received::Message { len, .. } if len >= 1 => buf[0],
+			_ => {
+				print(b"ping: no response from driver\n");
+				return;
+			}
+		};
+		print(b"ping ");
+		print(target);
+		match status {
+			1 => print(b": reply\n"),
+			2 => print(b": unreachable (no ARP reply)\n"),
+			_ => print(b": no reply (timeout)\n"),
+		}
+	}
+}
+
+// Parse a dotted-decimal IPv4 address into 4 octets, or None if malformed.
+fn parse_ip(s: &[u8]) -> Option<[u8; 4]> {
+	let mut octets: [u8; 4] = [0u8; 4];
+	let mut idx: usize = 0;
+	let mut value: u32 = 0;
+	let mut digits: u32 = 0;
+	for &b in s {
+		if b == b'.' {
+			if digits == 0 || idx >= 3 {
+				return None;
+			}
+			octets[idx] = value as u8;
+			idx += 1;
+			value = 0;
+			digits = 0;
+		} else if b.is_ascii_digit() {
+			value = value * 10 + (b - b'0') as u32;
+			digits += 1;
+			if value > 255 || digits > 3 {
+				return None;
+			}
+		} else {
+			return None;
+		}
+	}
+	if idx != 3 || digits == 0 {
+		return None;
+	}
+	octets[3] = value as u8;
+	Some(octets)
+}
+
+// Print an IPv4 address (4 octets) in dotted-decimal form.
+unsafe fn print_ip(ip: &[u8]) {
+	unsafe {
+		for (i, octet) in ip.iter().enumerate() {
+			if i != 0 {
+				print(b".");
+			}
+			print_dec(*octet);
+		}
+	}
+}
+
+// Print a MAC address (6 bytes) as colon-separated hex.
+unsafe fn print_mac(mac: &[u8]) {
+	unsafe {
+		for (i, b) in mac.iter().enumerate() {
+			if i != 0 {
+				print(b":");
+			}
+			let hex: &[u8; 16] = b"0123456789abcdef";
+			print(&[hex[(*b >> 4) as usize], hex[(*b & 0xf) as usize]]);
+		}
+	}
+}
+
+// Print a byte in decimal (0-255), no leading zeros.
+unsafe fn print_dec(n: u8) {
+	unsafe {
+		if n >= 100 {
+			print(&[b'0' + n / 100]);
+		}
+		if n >= 10 {
+			print(&[b'0' + (n / 10) % 10]);
+		}
+		print(&[b'0' + n % 10]);
 	}
 }
 

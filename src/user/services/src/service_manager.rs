@@ -86,6 +86,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut channels: [u64; N] = [0u64; N];
 	let mut storage_client: u64 = 0;
 	let mut block_client: u64 = 0;
+	let mut net_client: u64 = 0;
 	let mut log_client: u64 = 0;
 	let mut device_client: u64 = 0;
 	let mut process_client: u64 = 0;
@@ -95,7 +96,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
-				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut channels[i], &mut buf) };
+				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_client, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut channels[i], &mut buf) };
 				progress = true;
 			}
 			i += 1;
@@ -179,7 +180,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_client: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -210,7 +211,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"config_service" && !bootstrap_serve(manager_side, config_client) {
 			return State::Failed;
 		}
-		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client) {
+		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -226,6 +227,13 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 				*control = manager_side;
 				// Record the lifecycle event in the journal (LogService is up by now).
 				emit_event(*log_client, name, b"online");
+				// DeviceManager sends a follow-up "NET" message carrying the net driver's
+				// control channel; keep it to bootstrap the shell's network commands.
+				if name == b"device_manager" {
+					if let Received::Message { handle: net, .. } = recv_blocking(manager_side, buf) {
+						*net_client = net;
+					}
+				}
 				State::Running
 			}
 			Received::Closed => State::Failed,
@@ -270,7 +278,7 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 // client are transferred (the shell becomes their sole owner); the LogService
 // client is *duplicated* and the copy transferred, since the supervisor keeps
 // emitting on the original.
-unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64) -> bool {
+unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"STORAGE", storage_client) {
 			return false;
@@ -288,7 +296,10 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 		if !send_blocking(manager_side, b"PROCESS", process_client) {
 			return false;
 		}
-		send_blocking(manager_side, b"CONFIG", config_client)
+		if !send_blocking(manager_side, b"CONFIG", config_client) {
+			return false;
+		}
+		send_blocking(manager_side, b"NET", net_client)
 	}
 }
 

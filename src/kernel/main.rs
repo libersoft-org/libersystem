@@ -1846,6 +1846,52 @@ fn blocking_wait_times_out_on_deadline() {
 
 #[cfg(test)]
 #[test_case]
+fn wait_any_wakes_on_the_ready_handle() {
+	use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+	static HB: AtomicU64 = AtomicU64::new(0);
+	static WAIT_RET: AtomicI64 = AtomicI64::new(-999);
+	static OK: AtomicBool = AtomicBool::new(false);
+	// The server blocks in SYS_WAIT_ANY on TWO channels at once. Only the second
+	// (hb) ever receives a message, so wait_any must wake, return index 1, and the
+	// server then recv's that message - exercising block_on_any and the multi-koid
+	// waiter cleanup (the thread is parked under both koids, woken via one, and must
+	// leave no stale entry under the other).
+	extern "C" fn server(ha: u64) {
+		unsafe {
+			let hb = HB.load(Ordering::SeqCst);
+			let handles = [ha, hb];
+			let ret = arch::syscall::invoke(syscall::SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, 0, 0);
+			WAIT_RET.store(ret as i64, Ordering::SeqCst);
+			let mut buf = [0u8; 8];
+			let mut xfer: u64 = 0;
+			let n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, hb, buf.as_mut_ptr() as u64, buf.len() as u64, &mut xfer as *mut u64 as u64);
+			OK.store(!syscall::sys_is_err(n) && &buf[..n as usize] == b"pong", Ordering::SeqCst);
+		}
+	}
+	extern "C" fn client(ch: u64) {
+		unsafe {
+			let payload = *b"pong";
+			let _ = arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, ch, payload.as_ptr() as u64, payload.len() as u64, 0);
+		}
+	}
+	let (a0, a1) = object::channel::Channel::create();
+	let (b0, b1) = object::channel::Channel::create();
+	// Spawn the server with the first channel (its arg is that handle), then install
+	// the second channel as a second handle and record its value for the server.
+	let server = sched::spawn_with_object(server, a0, object::rights::Rights::ALL, 0);
+	let hb = server.handles().lock().insert(object::handle::Capability::new(b0, object::rights::Rights::ALL, 0)).raw();
+	HB.store(hb, Ordering::SeqCst);
+	sched::spawn_with_object(client, b1, object::rights::Rights::ALL, 0);
+	// Hold the first channel's peer open so that handle stays silent (not closed),
+	// otherwise its peer-close would make it ready and wait_any could return 0.
+	let _keep_a1 = a1;
+	sched::run_until_idle();
+	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 1);
+	assert!(OK.load(Ordering::SeqCst));
+}
+
+#[cfg(test)]
+#[test_case]
 fn channel_endpoint_semantics() {
 	use object::channel::{Channel, ChannelError, Message};
 	let (a, b) = Channel::create();

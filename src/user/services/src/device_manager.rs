@@ -38,11 +38,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    driver hands back a block-read service channel, which we route up to
 		//    ServiceManager (it forwards it to StorageService).
 		let mut block_client: u64 = 0;
-		launch_drivers(&package, &mut buf, &mut block_client);
+		let mut net_client: u64 = 0;
+		launch_drivers(&package, &mut buf, &mut block_client, &mut net_client);
 
 		// 3. report in once the devices are bound to drivers, transferring the block
-		//    service channel up the boot chain.
+		//    service channel up the boot chain, then the net driver's control channel in a
+		//    follow-up message (the report already carries one handle).
 		send_blocking(bootstrap, b"DeviceManager: online", block_client);
+		send_blocking(bootstrap, b"NET", net_client);
 
 		// 4. stand until ServiceManager asks us to stop (which also drops the driver
 		//    channels, so the drivers shut down with us), then acknowledge and exit.
@@ -58,7 +61,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // each device's state (online once its driver reports in, failed otherwise) and
 // prints a summary. The driver's "online" report is printed; it does not flow up
 // the boot-chain report channel (which carries only the service lifecycle).
-unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u64) {
+unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u64, net_client: &mut u64) {
 	unsafe {
 		let count: u64 = device_count();
 		let mut state: [u8; MAX_DEVICES] = [STATE_UNKNOWN; MAX_DEVICES];
@@ -86,6 +89,9 @@ unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u
 				state[idx] = STATE_ONLINE;
 				if driver_name == b"virtio_blk" {
 					*block_client = handle;
+				}
+				if driver_name == b"virtio_net" {
+					*net_client = handle;
 				}
 			}
 			i += 1;

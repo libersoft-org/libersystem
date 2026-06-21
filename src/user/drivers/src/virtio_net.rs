@@ -29,6 +29,8 @@ const RX_SLOTS: u16 = 8;
 const RX_SLOT: u64 = 2048;
 // The transmit scratch buffer (one frame at a time, built then submitted).
 const TX_BUF: u64 = 4096;
+// How long a `ping` waits for its reply before reporting a timeout (100 Hz ticks).
+const PING_TIMEOUT_TICKS: u64 = 50;
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24 and the gateway/host is 10.0.2.2, which answers ARP and ICMP. A DHCP
@@ -73,13 +75,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		rx.notify();
 		device.driver_ok();
-		send_blocking(bootstrap, b"driver.virtio-net: online", 0);
-		// 4. discover the gateway (an ARP request that also proves the receive path),
-		//    then stand on the interrupt serving the network.
+		// 4. create the control channel the shell reaches us on (the `ip` / `ping`
+		//    commands), hand its far end up with the online report (DeviceManager routes
+		//    it to the shell), discover the gateway, then serve the network and control.
+		let (control, control_far): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => exit(),
+		};
+		send_blocking(bootstrap, b"driver.virtio-net: online", control_far);
 		let mut stack: Stack = Stack::new(MacAddr(mac), OUR_IP, GATEWAY_IP);
 		let arp_len: usize = stack.build_arp_request(GATEWAY_IP, frame_out(tx_virt));
 		transmit(&tx, tx_virt, tx_phys, arp_len);
-		event_loop(irq, &device, &mut rx, &tx, &mut stack, rx_virt, rx_phys, tx_virt, tx_phys)
+		serve(irq, control, &device, &mut rx, &tx, &mut stack, rx_virt, rx_phys, tx_virt, tx_phys)
 	}
 }
 
@@ -114,78 +121,113 @@ unsafe fn transmit(tx: &Queue, tx_virt: u64, tx_phys: u64, len: usize) {
 	}
 }
 
-// Block on the device interrupt forever: on each wake deassert the ISR line, drain
-// every frame the device received, feed each to the stack, transmit any reply,
-// re-post the drained buffer, and re-arm the interrupt.
-unsafe fn event_loop(irq: u64, device: &Virtio, rx: &mut Queue, tx: &Queue, stack: &mut Stack, rx_virt: u64, rx_phys: u64, tx_virt: u64, tx_phys: u64) -> ! {
+// Stand on the device interrupt and the shell's control channel at once (wait_any):
+// on an interrupt, deassert and drain the receive ring (answering ARP/ICMP); on a
+// control message, answer the shell's `ip` (interface state) or `ping` (send an echo
+// request and report the reply). The control channel closing (the shell exited)
+// drops us back to serving only the network.
+#[allow(clippy::too_many_arguments)]
+unsafe fn serve(irq: u64, control: u64, device: &Virtio, rx: &mut Queue, tx: &Queue, stack: &mut Stack, rx_virt: u64, rx_phys: u64, tx_virt: u64, tx_phys: u64) -> ! {
 	unsafe {
-		let mut pinged: bool = false;
+		let mut buf: [u8; 128] = [0u8; 128];
+		let mut seq: u16 = 0;
+		let mut control_open: bool = true;
 		loop {
-			wait(irq, 0);
-			device.isr_ack();
-			while let Some((id, len)) = rx.take_used() {
-				if id < RX_SLOTS && len as u64 > NET_HDR_LEN {
-					let frame: &[u8] = core::slice::from_raw_parts((rx_virt + id as u64 * RX_SLOT + NET_HDR_LEN) as *const u8, (len as u64 - NET_HDR_LEN) as usize);
-					let outcome: net::Outcome = stack.on_frame(frame, frame_out(tx_virt));
-					handle_event(&outcome.event, tx, stack, tx_virt, tx_phys, &mut pinged);
-					transmit(tx, tx_virt, tx_phys, outcome.reply_len);
-				}
-				rx.post_recv(id, rx_phys + id as u64 * RX_SLOT, RX_SLOT as u32);
-			}
-			rx.notify();
-			interrupt_ack(irq);
-		}
-	}
-}
-
-// React to a stack event: log it, and on first learning the gateway's MAC send it
-// one ICMP echo request (a self-test proving the transmit + receive ICMP path).
-unsafe fn handle_event(event: &Event, tx: &Queue, stack: &Stack, tx_virt: u64, tx_phys: u64, pinged: &mut bool) {
-	unsafe {
-		match event {
-			Event::Learned(ip, _mac) => {
-				print(b"net: arp reply from ");
-				print_ip(*ip);
-				print(b"\n");
-				if !*pinged && *ip == GATEWAY_IP {
-					if let Some(mac) = stack.lookup(GATEWAY_IP) {
-						*pinged = true;
-						let len: usize = stack.build_icmp_echo(mac, GATEWAY_IP, 1, 1, frame_out(tx_virt));
-						transmit(tx, tx_virt, tx_phys, len);
-					}
+			let ready: i64 = if control_open {
+				wait_any(&[irq, control], 0)
+			} else {
+				wait(irq, 0);
+				0
+			};
+			if ready == 0 {
+				drain_rx(irq, device, rx, tx, stack, rx_virt, rx_phys, tx_virt, tx_phys);
+			} else if ready == 1 {
+				match recv_blocking(control, &mut buf) {
+					Received::Message { len, .. } => handle_control(&buf[..len], control, irq, device, rx, tx, stack, &mut seq, rx_virt, rx_phys, tx_virt, tx_phys),
+					Received::Closed => control_open = false,
 				}
 			}
-			Event::EchoReply(ip) => {
-				print(b"net: echo reply from ");
-				print_ip(*ip);
-				print(b"\n");
-			}
-			Event::None => {}
 		}
 	}
 }
 
-// Print an IPv4 address in dotted-decimal form.
-unsafe fn print_ip(ip: Ipv4Addr) {
+// Drain every frame the device received: feed each to the stack, transmit any reply,
+// and re-post the buffer. Deasserts the ISR line first and re-arms the interrupt
+// after. Returns the source of the last ICMP echo reply seen (so an in-flight `ping`
+// detects its answer), or None.
+#[allow(clippy::too_many_arguments)]
+unsafe fn drain_rx(irq: u64, device: &Virtio, rx: &mut Queue, tx: &Queue, stack: &mut Stack, rx_virt: u64, rx_phys: u64, tx_virt: u64, tx_phys: u64) -> Option<Ipv4Addr> {
 	unsafe {
-		for (i, octet) in ip.0.iter().enumerate() {
-			if i != 0 {
-				print(b".");
+		device.isr_ack();
+		let mut echo: Option<Ipv4Addr> = None;
+		while let Some((id, len)) = rx.take_used() {
+			if id < RX_SLOTS && len as u64 > NET_HDR_LEN {
+				let frame: &[u8] = core::slice::from_raw_parts((rx_virt + id as u64 * RX_SLOT + NET_HDR_LEN) as *const u8, (len as u64 - NET_HDR_LEN) as usize);
+				let outcome: net::Outcome = stack.on_frame(frame, frame_out(tx_virt));
+				if let Event::EchoReply(ip) = outcome.event {
+					echo = Some(ip);
+				}
+				transmit(tx, tx_virt, tx_phys, outcome.reply_len);
 			}
-			print_dec(*octet);
+			rx.post_recv(id, rx_phys + id as u64 * RX_SLOT, RX_SLOT as u32);
+		}
+		rx.notify();
+		interrupt_ack(irq);
+		echo
+	}
+}
+
+// Answer one control request from the shell: `ip` replies with the serialized
+// interface state; `ping` + a 4-byte address sends an echo request and replies with
+// a status byte (1 = reply, 0 = timeout, 2 = unresolved) and the address.
+#[allow(clippy::too_many_arguments)]
+unsafe fn handle_control(req: &[u8], control: u64, irq: u64, device: &Virtio, rx: &mut Queue, tx: &Queue, stack: &mut Stack, seq: &mut u16, rx_virt: u64, rx_phys: u64, tx_virt: u64, tx_phys: u64) {
+	unsafe {
+		let mut out: [u8; 128] = [0u8; 128];
+		if req == b"IP" {
+			let n: usize = stack.write_state(&mut out);
+			send_blocking(control, &out[..n], 0);
+		} else if req.len() >= 8 && &req[..4] == b"PING" {
+			let ip: Ipv4Addr = Ipv4Addr([req[4], req[5], req[6], req[7]]);
+			let status: u8 = do_ping(ip, irq, device, rx, tx, stack, seq, rx_virt, rx_phys, tx_virt, tx_phys);
+			out[0] = status;
+			out[1..5].copy_from_slice(&ip.0);
+			send_blocking(control, &out[..5], 0);
 		}
 	}
 }
 
-// Print a byte as decimal (0-255), no leading zeros.
-unsafe fn print_dec(n: u8) {
+// Send an ICMP echo request to `ip` (ARP-resolving it first if its MAC is unknown)
+// and wait for the reply, draining receive frames as they arrive. Returns 1 = reply
+// received, 0 = timed out, 2 = the address could not be resolved.
+#[allow(clippy::too_many_arguments)]
+unsafe fn do_ping(ip: Ipv4Addr, irq: u64, device: &Virtio, rx: &mut Queue, tx: &Queue, stack: &mut Stack, seq: &mut u16, rx_virt: u64, rx_phys: u64, tx_virt: u64, tx_phys: u64) -> u8 {
 	unsafe {
-		if n >= 100 {
-			print(&[b'0' + n / 100]);
+		if stack.lookup(ip).is_none() {
+			let arp: usize = stack.build_arp_request(ip, frame_out(tx_virt));
+			transmit(tx, tx_virt, tx_phys, arp);
+			let deadline: u64 = clock() + PING_TIMEOUT_TICKS;
+			while clock() < deadline && stack.lookup(ip).is_none() {
+				wait(irq, deadline);
+				drain_rx(irq, device, rx, tx, stack, rx_virt, rx_phys, tx_virt, tx_phys);
+			}
 		}
-		if n >= 10 {
-			print(&[b'0' + (n / 10) % 10]);
+		let mac: MacAddr = match stack.lookup(ip) {
+			Some(m) => m,
+			None => return 2,
+		};
+		*seq = seq.wrapping_add(1);
+		let echo: usize = stack.build_icmp_echo(mac, ip, 1, *seq, frame_out(tx_virt));
+		transmit(tx, tx_virt, tx_phys, echo);
+		let deadline: u64 = clock() + PING_TIMEOUT_TICKS;
+		while clock() < deadline {
+			wait(irq, deadline);
+			if let Some(reply) = drain_rx(irq, device, rx, tx, stack, rx_virt, rx_phys, tx_virt, tx_phys) {
+				if reply == ip {
+					return 1;
+				}
+			}
 		}
-		print(&[b'0' + n % 10]);
+		0
 	}
 }

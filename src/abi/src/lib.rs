@@ -63,6 +63,10 @@ pub const SYS_INTERRUPT_ACK: u64 = 40;
 // Inject one byte into the kernel console input (a userspace input driver feeds the
 // interactive shell the same way the kernel's serial loop does).
 pub const SYS_CONSOLE_FEED: u64 = 41;
+// Block until ANY handle in a caller-supplied array is ready (or the deadline
+// passes), returning the ready handle's index - `wait` over a set, so a driver can
+// wait on its device interrupt and a control channel at once.
+pub const SYS_WAIT_ANY: u64 = 42;
 
 // The ring-3 stack top an ELF-loaded process runs on: the kernel's loader maps a
 // stack just below this address, and a userspace spawner passes it to

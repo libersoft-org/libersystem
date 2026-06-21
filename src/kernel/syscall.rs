@@ -44,7 +44,7 @@ use crate::sched;
 // kernel/userspace ABI: defined once in the abi crate (the single source of
 // truth) and re-exported here so the rest of the kernel keeps referring to them
 // as `syscall::SYS_*` / `syscall::ERR_*` / `syscall::sys_is_err`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_INTERRUPT_ACQUIRE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_RANDOM_GET, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_YIELD, sys_is_err};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_INTERRUPT_ACQUIRE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_RANDOM_GET, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD, sys_is_err};
 
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. Defined in `abi` (the
@@ -184,6 +184,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		}
 		SYS_OBJECT_INFO_GET => sys_object_info_get(a0, a1, a2),
 		SYS_WAIT => sys_wait(a0, a1),
+		SYS_WAIT_ANY => sys_wait_any(a0, a1, a2),
 		_ => ERR_BAD_SYSCALL,
 	};
 	result as u64
@@ -789,6 +790,55 @@ fn sys_wait(handle: u64, deadline: u64) -> i64 {
 			return ERR_TIMED_OUT;
 		}
 		sched::block_on(koid, block_deadline);
+	}
+}
+
+// The most handles `wait_any` accepts at once (enough for a driver's IRQ plus a few
+// control channels).
+const MAX_WAIT_ANY: usize = 8;
+
+// Block until ANY handle in the caller's array `[handles_ptr; count]` is ready,
+// returning that handle's index, or ERR_TIMED_OUT at `deadline` (absolute ticks,
+// 0 = none). Like `wait` but over a set: a driver waits on its device interrupt and
+// a control channel at once, waking on whichever is ready first. Each handle needs
+// the WAIT right.
+fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64) -> i64 {
+	let thread = current_thread!();
+	let n = count as usize;
+	if n == 0 || n > MAX_WAIT_ANY || !user_buf_ok(handles_ptr, count * 8) {
+		return ERR_INVALID;
+	}
+	let raw = unsafe { core::slice::from_raw_parts(handles_ptr as *const u64, n) };
+	// Resolve every handle once up front, recording each object and its koid.
+	let mut objects: [Option<Arc<dyn KernelObject>>; MAX_WAIT_ANY] = core::array::from_fn(|_| None);
+	let mut koids: [u64; MAX_WAIT_ANY] = [0; MAX_WAIT_ANY];
+	{
+		let table = thread.handles().lock();
+		for i in 0..n {
+			let object = match table.lookup(Handle::from_raw(raw[i]), Rights::WAIT) {
+				Ok(o) => o,
+				Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
+				Err(_) => return ERR_BAD_HANDLE,
+			};
+			koids[i] = object.header().koid();
+			objects[i] = Some(object);
+		}
+	}
+	// Condition-variable loop: re-check every object after each wake, blocking on the
+	// whole set until one is ready or the deadline passes.
+	loop {
+		for (i, slot) in objects.iter().enumerate().take(n) {
+			if let Some(object) = slot {
+				if object_ready(object) {
+					return i as i64;
+				}
+			}
+		}
+		let block_deadline = if deadline == 0 { sched::NO_DEADLINE } else { deadline };
+		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
+			return ERR_TIMED_OUT;
+		}
+		sched::block_on_any(&koids[..n], block_deadline);
 	}
 }
 

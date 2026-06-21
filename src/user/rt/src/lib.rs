@@ -97,6 +97,14 @@ pub unsafe fn wait(handle: u64, deadline: u64) -> i64 {
 	unsafe { syscall(SYS_WAIT, handle, deadline, 0, 0) as i64 }
 }
 
+// Block until any handle in `handles` is ready, returning the index of the ready
+// handle, or a negative error (ERR_TIMED_OUT at `deadline`; absolute ticks, 0 = no
+// timeout). Lets a driver wait on its device interrupt and a control channel at
+// once, waking on whichever fires first.
+pub unsafe fn wait_any(handles: &[u64], deadline: u64) -> i64 {
+	unsafe { syscall(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, deadline, 0) as i64 }
+}
+
 // The outcome of a blocking receive.
 pub enum Received {
 	// A message arrived: `len` payload bytes were written to the buffer and a
