@@ -165,7 +165,7 @@ Besides layering *in time* (who), the project also has a clear order of *deploym
 
 Key rules of this ordering:
 
-- **Each target is a superset of the previous one.** From embedded to server you mainly add networking and POSIX compatibility (because of external software); from server to desktop you add GUI, input, audio, and a wider range of drivers. These are not three independent from-scratch starts, but building in layers (see *Layering principle*).
+- **Each target is a superset of the previous one.** From embedded to server you mainly add networking (and, later, POSIX compatibility for foreign software); from server to desktop you add the GUI/compositor, the full input and audio stacks (basic console input and a headless audio service already arrive earlier), and a wider range of drivers. These are not three independent from-scratch starts, but building in layers (see *Layering principle*).
 - **Each target is valuable on its own, not merely a stepping stone.** Even the appliance/edge target is a full product in its own right (a secure edge node), so the system delivers real value from the very first phase - not only at the end of the journey. Server and desktop build on this foundation as full-fledged extensions the system is heading toward.
 
 ### Language policy
@@ -1641,6 +1641,8 @@ a prototype file picker (powerbox)
 
 ```text
 a network stack over virtio-net (a priority - on the edge, networking is the core)
+an interactive console: keyboard input + a userspace line editor (command history, cursor movement, in-line editing, ANSI key sequences for arrows) - the kernel console stays a dumb byte sink, the line editor lives in the shell
+simple pointer/mouse plumbing over virtio-input (text-cell pointer + button events for TUI apps such as a file manager); no mouse stack or touch yet (those are the desktop phase)
 observability and remote admin: full System Graph, JSON/CBOR/CLI representations, tracing, counters
 security hardening: app sandbox, permission manifests, threat model
 ServiceManager with restart policy and watchdog
@@ -1649,25 +1651,24 @@ package/app format, installation, AOT compilation
 a simple persistent native filesystem
 ```
 
----
-
-> **From this point onward: vision only.** Phases 3-6 below hold only on the assumption that a community forms around the project. It is merely a map of the direction in which the system *can* grow as more contributors arrive, not a firm plan.
-
 #### Phase 3 - Server platform
 
 ```text
-a POSIX-like compatibility layer (relibc-style) - for foreign server software
 user accounts / identities (multi-user management, remote access) - userspace identity over capabilities, not kernel uid/gid
 localization (locale, language, time zone, formatting) - relevant already in the CLI and in logs
 a wider network stack and server-class workloads
 immutable signed system, A/B updates, rollback, verified boot
 encrypted user volumes
 a native modern FS (CoW, checksums, snapshots, compression)
+first first-party services: a simple static-file web server and similar small services - dogfooding the network stack + storage + service model on our own / WASI layer (no POSIX needed)
+a minimal headless AudioService over virtio-sound (playback, optionally capture) - so audio works from the console too (e.g. for a headless voice assistant); the full desktop audio stack stays Phase 5
+a CLI package manager (search / install / update / remove of first-party packages, built on the Phase 2 package/app format) - the end-user app store stays Phase 5
 ```
 
-#### Phase 4 - Real hardware (deployment on real servers/SBCs)
+#### Phase 4 - Real hardware and foreign-software compatibility
 
 ```text
+a POSIX-like compatibility layer (relibc-style) - for foreign server software
 the driver binding model in practice: DeviceManager pairs real devices -> drivers
 selective real-HW drivers per deployment (NVMe, NIC, storage, buses)
 support for specific servers and SBCs (single-board computers)
@@ -1681,9 +1682,9 @@ the transition from virtio/VM to bare metal
 ```text
 GUI/compositor (virtio-gpu and real GPUs), input: keyboard/mouse/touch
 a window manager, a desktop shell, and a complete user environment
-an audio stack (playback and recording)
+the full audio stack (mixing, per-app routing, recording, real-HW drivers) - building on the headless Phase 3 AudioService
 portals: mic/cam/screenshot, screen sharing, file selection
-a package manager / app store for end users
+a package manager / app store for end users (GUI) - on top of the Phase 3 CLI package manager
 user profiles and desktop settings, accessibility (screen readers, etc.)
 notifications, clipboard, drag-and-drop, multi-monitor support
 accelerated graphics and multimedia
