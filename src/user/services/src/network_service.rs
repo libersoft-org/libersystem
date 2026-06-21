@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 use rt::*;
 
 use crate::net::{Event, Ipv4Addr, MacAddr, Stack};
-use proto::system::{Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingStatus, TcpRequest, network, socket};
+use proto::system::{network, socket, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingStatus, TcpRequest};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
