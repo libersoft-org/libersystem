@@ -388,6 +388,7 @@ The network stack is the priority of phase 2 (on the edge, networking is the cor
 - [ ] virtio-net RX over the M31 event-queue mode: post device-writable buffers to the receive virtqueue, drain frames on `wait(irq)` (no polling) and re-post them - the M24 driver only transmitted (`frame tx ok`); now it receives.
 - [ ] An Ethernet + ARP layer in userspace: parse and emit Ethernet II frames, answer and issue ARP, keep a small neighbor cache - the L2 the IP layer rides on.
 - [ ] An IPv4 + ICMP layer: parse and emit IPv4 (header checksum; fragmentation rejected for now) and answer ICMP echo, so the guest replies to `ping` over the virtio-net link.
+- [ ] Interface address configuration: the interface comes up with a static IPv4 address + netmask (the hook a later DHCP client plugs into), so the guest is actually addressable on the link.
 - [ ] Typed network primitives per *the object is canonical*: `MacAddr` / `Ipv4Addr` / `Endpoint` as typed objects (never parsed strings), the seam the NetworkService API (M33) is built on.
 - [ ] First network CLI over the stack: `ping` (outbound ICMP echo from the guest) and `ip` / `net` (show interfaces, addresses, and the ARP/neighbor cache) - thin shell front-ends that render the typed network objects as CLI / JSON, not text scrapers (subsuming the legacy `ifconfig` / `arp` / `route`).
 - Done when: the virtio-net driver receives frames over the M31 RX path, a userspace L2/L3 stack answers ARP and replies to ICMP echo (the host can `ping` the guest and the guest's own `ping` reaches the host), `ip` / `net` shows the interface and neighbor state, and the suite stays green - the receive half of networking the whole phase-2 stack is built on.
@@ -401,8 +402,10 @@ With frames flowing in (M32), this builds the transport layer and the service th
 - [ ] A minimal TCP: the state machine (handshake, in-order data with ack + retransmit, ordered teardown), enough for a server to accept a connection and exchange a byte stream - the hard core of the stack.
 - [ ] A DNS resolver (a UDP client) returning a typed `Ipv4Addr` from a name.
 - [ ] NetworkService: a standing userspace service exposing typed sockets over generated `liber:system` bindings - `Endpoint`/`SocketAddr` typed objects, `listen`/`accept`/`connect`/`send`/`recv`, sockets handed out as capabilities, received data delivered as an event `stream<T>` (M30).
+- [ ] The `buffer` zero-copy codec in the IDL toolchain (the deferred first-class IDL type, sibling to M30's `stream`): a typed `buffer` field carries bulk payload as a `handle` to a SharedBuffer / DmaBuffer (metadata in-stream, bytes out-of-band), so NetworkService send/recv - and later the M43 write path and a static-file web server - move data zero-copy through generated bindings instead of an ad-hoc raw handle.
+- [ ] (optional) A DHCP client over UDP, so the box can take a dynamic address rather than only the M32 static config.
 - [ ] Network client + diagnostic CLI over NetworkService: `nc` / `connect` (a raw TCP/UDP client over sockets-as-capabilities), a DNS lookup (`host` / `nslookup` style), and `ss` / `netstat` (list the service's live sockets and connections) - plus optional `traceroute` (needs TTL + ICMP time-exceeded); all thin front-ends rendering the typed objects as CLI / JSON, modern equivalents only (no legacy `telnet`).
-- Done when: a userspace TCP/IP stack does UDP plus a minimal TCP, NetworkService answers typed socket calls over IPC and hands sockets out as capabilities, a client opens a connection through it (`nc` to a host TCP/UDP endpoint, plus a DNS lookup) and `ss` lists the live sockets, tests green - the network stack the edge platform is centered on.
+- Done when: a userspace TCP/IP stack does UDP plus a minimal TCP, NetworkService answers typed socket calls over IPC and hands sockets out as capabilities, a client opens a connection through it (`nc` to a host TCP/UDP endpoint, plus a DNS lookup) and `ss` lists the live sockets, bulk data moving zero-copy through the `buffer` codec, tests green - the network stack the edge platform is centered on.
 - Concept: examples of services (NetworkService), System API model (`Endpoint`/`SocketAddr` typed; sockets are capabilities; one API, many representations), IPC model (received data as `stream<T>`, backpressure = bounded channel).
 
 ## M34 - TimeService: wall-clock time (RTC + NTP)
@@ -444,8 +447,8 @@ Phase 1 has a basic System Graph (M17). The appliance/edge platform is operated 
 - [ ] Add the CBOR renderer to the IDL toolchain (the M25-deferred binding), so every typed record renders binary / CBOR / JSON / CLI as the *one API, many representations* rule promises.
 - [ ] A SystemGraphService exposing the full live graph over generated bindings: services, drivers, devices, and their dependencies and capabilities as typed nodes/edges, each component carrying its state (running / failed / restarting) - extending the M17 snapshot to the labeled live graph.
 - [ ] Counters + tracing: per-component counters (IPC volume, restarts, resource usage) and lightweight trace spans across service calls, queryable over the typed API.
-- [ ] The shell / a remote-admin path renders the graph and counters as CLI + JSON + CBOR.
-- Done when: a SystemGraphService serves the full live graph (components, devices, dependencies, crash/restart state) plus counters and tracing over the typed API in CLI / JSON / CBOR, the CBOR renderer is generated by the toolchain, tests green - the observability an edge node is operated through.
+- [ ] Local + remote admin rendering: the shell renders the graph and counters as CLI / JSON / CBOR, and a remote-admin endpoint exposes the same over the network via NetworkService (M33), so an operator can query an unattended edge node remotely - the *remote admin* half of the phase-2 goal (authenticated multi-user remote access proper is phase 3).
+- Done when: a SystemGraphService serves the full live graph (components, devices, dependencies, crash/restart state) plus counters and tracing over the typed API in CLI / JSON / CBOR, queryable both locally and over the remote-admin endpoint (M33), the CBOR renderer is generated by the toolchain, tests green - the observability an edge node is operated through.
 - Concept: System Graph (a graph of typed object references; the Flow Graph stays later), System API model (one API, four representations - CBOR added here), examples of services (SystemGraphService, LogService).
 
 ## M38 - Security hardening: app sandbox, permission manifests, PermissionManager
@@ -456,7 +459,8 @@ Phase 0+ already forbids ambient authority (a component gets only the capabiliti
 - [ ] A PermissionManager policy service: grant a launching component its capabilities per its manifest, mediate sensitive grants, and keep an audit trail - the policy over the kernel's mechanism.
 - [ ] A strict app sandbox: a launched component starts with only its manifest's capabilities, verified that it can reach nothing it was not granted - hardening the M28 WASI-world property to every component.
 - [ ] A written threat model (malicious app, compromised driver) recorded in the docs, with the enforced boundaries called out.
-- Done when: components launch under a typed permission manifest enforced by a PermissionManager, a sandboxed component provably reaches only its granted capabilities, a threat model is written down, tests green - the security hardening that makes the edge node trustworthy.
+- [ ] Security testing: syscall fuzzing and property tests of the capability rules (a handle grants no operation beyond its rights, attenuation only narrows, no ambient authority) - turning the threat model into executable checks (concept open question #11).
+- Done when: components launch under a typed permission manifest enforced by a PermissionManager, a sandboxed component provably reaches only its granted capabilities, a threat model is written down and backed by fuzzing + capability property tests, tests green - the security hardening that makes the edge node trustworthy.
 - Concept: Security model (current decisions; what is deferred is the granularity of policy + manifests; `PermissionSet` / `Manifest` are typed objects), PermissionManager, the powerbox file picker (M29).
 
 ## M39 - ResourceManager policy service
@@ -466,7 +470,8 @@ The kernel enforces resource accounting from phase 0 (memory, handles, threads, 
 - [ ] A ResourceManager service that sets per-Domain / per-component limits (memory, handles, threads, IPC queue bytes, DMA) over the typed API, on top of the kernel's existing enforcement.
 - [ ] Quotas / budgets policy: assign a budget to a Domain (e.g. all apps share N MB), adjust it at runtime, and observe usage (ties into the M37 counters).
 - [ ] Graceful pressure handling: a component over budget gets `RESOURCE_EXHAUSTED` (already a first-class kernel error) and the policy reacts (throttle, ask to release) rather than the component crashing.
-- Done when: a ResourceManager sets and adjusts Domain / component resource budgets over the typed API, the kernel enforces them (as it already does), usage is observable, and over-budget is handled as a typed error, tests green - the policy half of resource control.
+- [ ] Memory-pressure / OOM behavior via Domain limits: under pressure the policy asks services to reclaim (drop caches) and, at a Domain's hard limit, contains the OOM to that Domain rather than the whole system (concept open question #14).
+- Done when: a ResourceManager sets and adjusts Domain / component resource budgets over the typed API, the kernel enforces them (as it already does), usage is observable, over-budget is handled as a typed error, and memory pressure is contained to the offending Domain, tests green - the policy half of resource control.
 - Concept: ResourceManager, Resource accounting (the kernel enforces, the policy is later; per-Domain hierarchical limits; `RESOURCE_EXHAUSTED` is first-class), Domain.
 
 ## M40 - ServiceManager: restart policy and watchdog
