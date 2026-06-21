@@ -1,8 +1,8 @@
+- Remove the mess from the console after bootup
 - Where are poweroff / reboot commands - they disappeared
-- Console doesn't react on keyboard, only debug does
 - List the available volumes "ls" - change to "lsvol"?
 - Optimize the code
 - Find the dead code
 - Find the duplicate / repetitive code
 - Nicer kernel boot - colourful terminal - is it good idea or not?
-- There is a build / target folders in "src", it should be somewhere else (a folder above)
+- There are "build" / "target" folders in "src", should it be somewhere else (a folder above)?

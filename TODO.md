@@ -380,3 +380,160 @@ Today's three drivers (blk/net/console) are synchronous request/response: they b
 - Done when: a userspace driver can acquire and `wait` on its device's interrupt (no busy-poll), the virtio transport drains a device-pushed event queue, a `virtio_input` driver translates keypresses to console bytes, and typing in the graphical display drives the interactive shell - proving the driver framework is comfortable for interrupt-driven RX devices, which is exactly what the phase-2 virtio-net RX path also needs.
 - Concept: driver model (isolated userspace driver per device, capability-scoped MMIO + interrupt), IPC model (`wait` on an Interrupt object, no polling), the deployment-target ordering (input is normally a desktop-tier concern, pulled forward because the appliance/edge console deserves a real keyboard and the RX/interrupt machinery is shared with the edge network stack).
 - Result: the kernel device table now records each virtio device's IOAPIC GSI, not its legacy PIC line: `arch::pci` reads PCI config 0x3D (Interrupt Pin) alongside 0x3C (Interrupt Line) and `PciDevice::intx_gsi()` computes `GSI = 16 + (slot + (pin - 1)) % 8` - the q35/ICH9 PIRQ swizzle - because config 0x3C holds the 8259 IRQ (e.g. the keyboard's 10), which is not the I/O APIC GSI the line actually arrives on (21). `device_interrupt_acquire(index)` (`syscall.rs`) routes that GSI through the I/O APIC to a free device vector (`arch::interrupts::acquire` + `ioapic::route`, level-triggered active-low) and mints an `Interrupt` bound to it; the dispatch path masks the GSI on each fire and the driver's `interrupt_ack` unmasks it, so a level-triggered INTx cannot re-storm before it is serviced. The shared virtio transport (`user/drivers/src/virtio.rs`) gained an RX/event-queue mode: `setup_queue` posts device-writable buffers and sets `VIRTQ_AVAIL_F_NO_INTERRUPT` by default (the blk/net/console pollers stay silent), `enable_interrupts()` opts a queue into IRQs, `post_recv`/`notify`/`take_used` post and drain the used ring, and `isr_ack()` reads the ISR-status register to deassert the line. `driver.virtio-input` (`user/drivers/src/virtio_input.rs`) brings the device up, sets up event queue 0 with a DMA buffer pool, then stands on its IRQ - `wait(irq)` -> `isr_ack` -> drain `virtio_input_event` records -> translate KEY_* codes via a `KEYMAP` -> `console_feed` (the new `SYS_CONSOLE_FEED`, which injects a byte into `console_input` exactly as a serial keystroke would) -> re-post -> `interrupt_ack`. The BSP's `console_shell_loop` now polls serial non-blockingly and pumps the cooperative schedule every round (not only when a serial byte arrives), so the keyboard driver thread its IRQ wakes actually gets scheduled and its bytes reach the shell. The QEMU runner adds `-device virtio-keyboard-pci` on interactive runs only (tests keep their deterministic blk/net/console set). Verified live: injecting keystrokes in the display types into the shell and runs commands (`help` echoes and prints its listing); 62 kernel tests stay green.
+
+## M32 - virtio-net receive path + the link/IP layer (Ethernet, ARP, IPv4, ICMP)
+
+The network stack is the priority of phase 2 (on the edge, networking is the core). M31 built the RX/interrupt machinery - a device-writable queue drained on `wait`, with an ISR ack - originally for the keyboard, deliberately because the NIC needs exactly the same plumbing. This milestone turns it on the wire: virtio-net's receive queue, then the lowest userspace network layers, ending with the guest answering an ICMP echo (ping) over virtio-net.
+
+- [ ] virtio-net RX over the M31 event-queue mode: post device-writable buffers to the receive virtqueue, drain frames on `wait(irq)` (no polling) and re-post them - the M24 driver only transmitted (`frame tx ok`); now it receives.
+- [ ] An Ethernet + ARP layer in userspace: parse and emit Ethernet II frames, answer and issue ARP, keep a small neighbor cache - the L2 the IP layer rides on.
+- [ ] An IPv4 + ICMP layer: parse and emit IPv4 (header checksum; fragmentation rejected for now) and answer ICMP echo, so the guest replies to `ping` over the virtio-net link.
+- [ ] Typed network primitives per *the object is canonical*: `MacAddr` / `Ipv4Addr` / `Endpoint` as typed objects (never parsed strings), the seam the NetworkService API (M33) is built on.
+- [ ] First network CLI over the stack: `ping` (outbound ICMP echo from the guest) and `ip` / `net` (show interfaces, addresses, and the ARP/neighbor cache) - thin shell front-ends that render the typed network objects as CLI / JSON, not text scrapers (subsuming the legacy `ifconfig` / `arp` / `route`).
+- Done when: the virtio-net driver receives frames over the M31 RX path, a userspace L2/L3 stack answers ARP and replies to ICMP echo (the host can `ping` the guest and the guest's own `ping` reaches the host), `ip` / `net` shows the interface and neighbor state, and the suite stays green - the receive half of networking the whole phase-2 stack is built on.
+- Concept: Drivers (`driver.virtio-net`; the net *stack* is phase 2), IPC model (RX over `wait`, no polling, backpressure = the bounded queue), System API model (`Endpoint`/`SocketAddr`/addresses are typed objects, not parsed strings).
+
+## M33 - UDP, TCP, and NetworkService (typed sockets)
+
+With frames flowing in (M32), this builds the transport layer and the service that exposes it. NetworkService hands sockets out as capabilities and delivers received data as an event `stream<T>` (M30) - so the appliance/edge platform's defining capability, the network, is reachable through the typed API like every other service.
+
+- [ ] UDP over the M32 IPv4 layer: datagram send/receive, ports, checksums.
+- [ ] A minimal TCP: the state machine (handshake, in-order data with ack + retransmit, ordered teardown), enough for a server to accept a connection and exchange a byte stream - the hard core of the stack.
+- [ ] A DNS resolver (a UDP client) returning a typed `Ipv4Addr` from a name.
+- [ ] NetworkService: a standing userspace service exposing typed sockets over generated `liber:system` bindings - `Endpoint`/`SocketAddr` typed objects, `listen`/`accept`/`connect`/`send`/`recv`, sockets handed out as capabilities, received data delivered as an event `stream<T>` (M30).
+- [ ] Network client + diagnostic CLI over NetworkService: `nc` / `connect` (a raw TCP/UDP client over sockets-as-capabilities), a DNS lookup (`host` / `nslookup` style), and `ss` / `netstat` (list the service's live sockets and connections) - plus optional `traceroute` (needs TTL + ICMP time-exceeded); all thin front-ends rendering the typed objects as CLI / JSON, modern equivalents only (no legacy `telnet`).
+- Done when: a userspace TCP/IP stack does UDP plus a minimal TCP, NetworkService answers typed socket calls over IPC and hands sockets out as capabilities, a client opens a connection through it (`nc` to a host TCP/UDP endpoint, plus a DNS lookup) and `ss` lists the live sockets, tests green - the network stack the edge platform is centered on.
+- Concept: examples of services (NetworkService), System API model (`Endpoint`/`SocketAddr` typed; sockets are capabilities; one API, many representations), IPC model (received data as `stream<T>`, backpressure = bounded channel).
+
+## M34 - TimeService: wall-clock time (RTC + NTP)
+
+Phase 1 deferred wall-clock time because it needs an RTC driver or NTP, neither available headless (the kernel's monotonic `clock_get` covered timeouts and `LogRecord` timestamps). With the network stack (M33), NTP is now possible, so this closes the gap: real UTC, as a capability-gated userspace policy, never a kernel concern.
+
+- [ ] An RTC source (read the CMOS / virtio RTC) for an initial UTC offset at boot.
+- [ ] An SNTP client over UDP (M33) to discipline the offset against a time server.
+- [ ] TimeService computing `UTC = clock_get (monotonic) + offset` and exposing a typed `Timestamp`; setting the offset is a capability-gated service op (no global "root sets the clock") - only the NTP client / RTC driver hold the `write` right.
+- [ ] LogService timestamps and the CLI render real wall-clock time (ISO-8601 / epoch / human as representations of the `Timestamp` object), not just monotonic ticks.
+- Done when: TimeService serves wall-clock UTC from RTC + NTP over the typed API, setting it is capability-gated, log records carry real timestamps, tests green - closing the phase-1-deferred wall-clock gap now that networking enables NTP.
+- Concept: Syscall model (what `clock_get` returns; wall-clock is a userspace TimeService policy, capability-gated; `Timestamp` is the canonical object), System API model (`the object is canonical`).
+
+## M35 - Interactive console: line editor, history, and cursor
+
+M31 gave the shell raw keystrokes (and a backspace fix); a usable appliance/edge console - the box is administered from it - needs readline-style editing: command history (up/down), a movable cursor (left/right, Home/End), and mid-line insert/delete. Per the microkernel split, this lives in the userspace shell; the kernel console stays a dumb byte sink.
+
+- [ ] Convey the non-ASCII navigation keys to the shell: `driver.virtio-input` emits ANSI escape sequences for arrows / Home / End / Delete - the same convention serial terminals use, so the serial and framebuffer consoles behave identically - and the shell parses them.
+- [ ] A line editor in the shell: a cursor moved with left/right + Home/End, insert and delete mid-line, redraw of the edited line, replacing the current append-only `read_line`.
+- [ ] Command history: keep recent command lines, recall them with up/down, edit a recalled line before running it.
+- [ ] The framebuffer console renders the editing correctly (cursor position, mid-line redraw) - extending the M15/M31 console past simple append + backspace.
+- Done when: the shell offers a real line editor - history with up/down, a cursor moved with left/right + Home/End, mid-line insert/delete - working on both the serial and the framebuffer/virtio-input console, the editing logic in userspace and the kernel console still a byte sink, tests green.
+- Concept: deployment targets (the appliance/edge box is administered from its console), driver model (the kernel console is a dumb sink; the line editor is userspace), System API model.
+
+## M36 - Pointer/mouse plumbing (virtio-input pointer + InputService)
+
+M31's virtio-input transport carries pointer devices on the same RX path. This wires a `virtio-input` pointer to a typed input service delivering text-cell pointer + button events - the plumbing a future TUI app (a file manager) will consume. Deliberately just the plumbing: no mouse-driven UI stack and no touch (those are the desktop phase, pulled no further forward than the shared input transport justifies).
+
+- [ ] Extend `driver.virtio-input` (or a sibling binary) to a pointer device: drain relative/absolute pointer + button events from its event queue over the same M31 RX path.
+- [ ] Map pointer motion to text-cell coordinates (row/col) for the framebuffer console grid, optionally emitting xterm-style SGR mouse reports so a future TUI gets a standard stream.
+- [ ] An `InputService` (or a console subscription) delivering typed pointer/button events as an event `stream<T>` (M30); no consumer UI yet - the plumbing is proven with a test/echo.
+- Done when: a `virtio-input` pointer device is discovered and launched, its events drain over the M31 RX path into typed text-cell pointer/button events delivered as a stream, with no mouse-driven UI and no touch - the input plumbing a phase-2 TUI can later build on.
+- Concept: Drivers (`driver.virtio-input` - keyboard/mouse), deployment targets (mouse/touch are desktop-tier; only the text-cell plumbing is pulled forward, sharing the input transport), IPC model (events as `stream<T>`).
+
+## M37 - Observability and remote admin (full System Graph, tracing, counters, CBOR)
+
+Phase 1 has a basic System Graph (M17). The appliance/edge platform is operated remotely and unattended, so phase 2 needs real observability: the full graph (services / drivers / devices / dependencies labeled, with crash/restart state), per-component counters and tracing, all renderable as JSON / CBOR / CLI - including the CBOR renderer the M25 toolchain deferred.
+
+- [ ] Add the CBOR renderer to the IDL toolchain (the M25-deferred binding), so every typed record renders binary / CBOR / JSON / CLI as the *one API, many representations* rule promises.
+- [ ] A SystemGraphService exposing the full live graph over generated bindings: services, drivers, devices, and their dependencies and capabilities as typed nodes/edges, each component carrying its state (running / failed / restarting) - extending the M17 snapshot to the labeled live graph.
+- [ ] Counters + tracing: per-component counters (IPC volume, restarts, resource usage) and lightweight trace spans across service calls, queryable over the typed API.
+- [ ] The shell / a remote-admin path renders the graph and counters as CLI + JSON + CBOR.
+- Done when: a SystemGraphService serves the full live graph (components, devices, dependencies, crash/restart state) plus counters and tracing over the typed API in CLI / JSON / CBOR, the CBOR renderer is generated by the toolchain, tests green - the observability an edge node is operated through.
+- Concept: System Graph (a graph of typed object references; the Flow Graph stays later), System API model (one API, four representations - CBOR added here), examples of services (SystemGraphService, LogService).
+
+## M38 - Security hardening: app sandbox, permission manifests, PermissionManager
+
+Phase 0+ already forbids ambient authority (a component gets only the capabilities it is handed). Phase 2 adds the *policy* layer on top of that mechanism: typed permission manifests, a PermissionManager that grants and audits capabilities against them, a strict app sandbox, and a written threat model - the hardening that makes the edge node trustworthy.
+
+- [ ] Permission manifests as a typed `PermissionSet` / `Manifest` object (not a text / JSON file as the source of truth), declaring what a component may be granted.
+- [ ] A PermissionManager policy service: grant a launching component its capabilities per its manifest, mediate sensitive grants, and keep an audit trail - the policy over the kernel's mechanism.
+- [ ] A strict app sandbox: a launched component starts with only its manifest's capabilities, verified that it can reach nothing it was not granted - hardening the M28 WASI-world property to every component.
+- [ ] A written threat model (malicious app, compromised driver) recorded in the docs, with the enforced boundaries called out.
+- Done when: components launch under a typed permission manifest enforced by a PermissionManager, a sandboxed component provably reaches only its granted capabilities, a threat model is written down, tests green - the security hardening that makes the edge node trustworthy.
+- Concept: Security model (current decisions; what is deferred is the granularity of policy + manifests; `PermissionSet` / `Manifest` are typed objects), PermissionManager, the powerbox file picker (M29).
+
+## M39 - ResourceManager policy service
+
+The kernel enforces resource accounting from phase 0 (memory, handles, threads, IPC queue bytes, DMA). Phase 2 adds the userspace *policy* layer that sets and adjusts those budgets per Domain / component - mechanism in the kernel, policy in a service, the same split as PermissionManager.
+
+- [ ] A ResourceManager service that sets per-Domain / per-component limits (memory, handles, threads, IPC queue bytes, DMA) over the typed API, on top of the kernel's existing enforcement.
+- [ ] Quotas / budgets policy: assign a budget to a Domain (e.g. all apps share N MB), adjust it at runtime, and observe usage (ties into the M37 counters).
+- [ ] Graceful pressure handling: a component over budget gets `RESOURCE_EXHAUSTED` (already a first-class kernel error) and the policy reacts (throttle, ask to release) rather than the component crashing.
+- Done when: a ResourceManager sets and adjusts Domain / component resource budgets over the typed API, the kernel enforces them (as it already does), usage is observable, and over-budget is handled as a typed error, tests green - the policy half of resource control.
+- Concept: ResourceManager, Resource accounting (the kernel enforces, the policy is later; per-Domain hierarchical limits; `RESOURCE_EXHAUSTED` is first-class), Domain.
+
+## M40 - ServiceManager: restart policy and watchdog
+
+Phase 1's ServiceManager (M21) starts and stops services in dependency order and tracks state; M23 added a per-driver restart loop. Phase 2 completes the supervisor an unattended edge node relies on: a real restart policy with backoff/escalation, a heartbeat/watchdog for hung (not just crashed) services, reverse-dependency teardown, and a client-driven stop.
+
+- [ ] A restart policy: on a service crash, restart per policy (limits / backoff) and escalate when restarts are exhausted - generalizing the M23 per-driver restart loop to all services.
+- [ ] A heartbeat / watchdog: detect a hung (not merely crashed) service and act on it.
+- [ ] Reverse-dependency teardown + a client-driven `stop <service>` shell command (the M21 deferral), stopping dependents before their dependencies.
+- [ ] Surface the supervisor state to observability (M37): restart counts, last failure, watchdog trips.
+- Done when: ServiceManager restarts crashed services per a policy with backoff/escalation, a watchdog catches hung services, reverse-dependency stop and a client-driven `stop` both work, the state is observable, tests green - the supervisor an unattended edge node relies on.
+- Concept: ServiceManager (restart policy, heartbeat/watchdog, dependency management), Driver crash (restart policy lives in ServiceManager/DeviceManager), the M21/M23 deferrals.
+
+## M41 - Full Component Model + WASI preview 2 + an SDK
+
+M28 ran a first minimal Wasm component over an integer-subset interpreter with a single host import. Phase 2 grows the host into a real application runtime: the full Component Model + WASI preview 2 worlds, the wider instruction set (or a mature engine adopted behind the same host seam), components loaded from storage, and an SDK so Rust/C/Go developers can build them.
+
+- [ ] Grow the Wasm runtime to a usable subset - control flow, floats, the wider instruction set and validation - or adopt a mature engine (e.g. Wasmtime) behind the same `Host` seam (the *layering principle*: the engine is a replaceable implementation).
+- [ ] WASI preview 2 worlds mapped onto our services: `wasi:filesystem` -> StorageService, `wasi:sockets` -> NetworkService (M33), `wasi:cli` -> the console - each import wired to a typed service, no ambient authority.
+- [ ] Load components from storage (a `vol://` / `apps://` package) and launch them as ordinary capability-scoped components, rather than embedding them in the kernel image.
+- [ ] An SDK for Rust/C/Go: build a component against our WIT worlds and run it on the host.
+- Done when: the WASI host runs real components (control flow / floats / WASI preview 2 worlds) loaded from storage, their imports wired to our services with no ambient authority, and an SDK builds a component in at least one language, tests green - the application runtime the platform's apps target.
+- Concept: Application model (WASI is one host over the stable native ABI; the layering principle - the engine is replaceable; a WASI world = the capabilities granted), IDL language (the WIT relationship), the M28 deferrals.
+
+## M42 - Package/app format, installation, and AOT compilation
+
+With a real component runtime (M41), the platform needs a way to ship, install, and accelerate components: a typed package/app format, an install path that places a component and its manifest into the system, and AOT compilation at install time for speed - the foundation the phase-3 CLI package manager and the phase-5 app store later build on.
+
+- [ ] A typed package/app format: a component plus its permission manifest (M38) and metadata, as a typed object (not an ad-hoc archive treated as the source of truth).
+- [ ] An install path: place a package into the system (a `vol://apps` / `apps://` namespace), register it with ServiceManager / PermissionManager, and list / remove it.
+- [ ] AOT compilation at install time: compile the component to native for speed (the M28/M41 "interpret or AOT-compile at install" option), cached on the volume.
+- [ ] A CLI to install / list / remove a first-party package.
+- Done when: a component ships as a typed package with its manifest, installs into the system (registered, listed, removable), is AOT-compiled at install for speed, and launches from storage, tests green - the packaging / installation foundation for the platform's apps.
+- Concept: Application model (AOT-compile at install; the package/app format), Security model (the manifest is a typed object), Storage model (the `apps://` namespace).
+
+## M43 - A simple persistent native filesystem
+
+Phase 1's StorageService serves a read-mostly `vol://` off virtio-blk (M26). An appliance keeps state, so phase 2 needs writable persistence: a simple on-disk filesystem behind the same Volume API, so data survives a reboot. The modern CoW / checksum / snapshot filesystem stays phase 3 - here the direction is fixed, not the full feature set.
+
+- [ ] A simple writable on-disk filesystem (block allocation, directories, file read / write / create / delete) behind the existing `Storage.Volume` API - the service and its typed interface stay the same; only the backend gains writes.
+- [ ] Persistence across reboot on the virtio-blk device, with enough integrity (ordered writes / a minimal journal) that a crash mid-write does not corrupt the volume.
+- [ ] `Storage.Volume` write operations wired through the generated bindings (the M26-deferred `Stat` / `Watch` may come too); the shell can create / write / read / delete a file that survives a reboot.
+- Done when: a writable native filesystem behind the Volume API persists files across reboot on virtio-blk with basic crash integrity, the typed Storage interface gains writes, the shell round-trips a file across a reboot, tests green - the persistent storage an appliance keeps state on (the CoW / checksum / snapshot FS is phase 3).
+- Concept: Native filesystem (a simple FS for phase 2; the modern CoW FS is phase 3; multiple FS backends behind one Volume API - the layering principle), Storage model, the M26 deferral.
+
+## Definition of done (phase 2)
+Phase 2 is done when the appliance/edge platform stands on its own: a userspace
+network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
+typed NetworkService whose sockets are capabilities; wall-clock time from RTC + NTP;
+an interactive console with a real line editor (history + cursor) and pointer
+plumbing; full observability (the live System Graph + counters + tracing in
+CLI/JSON/CBOR); security hardening (typed permission manifests + a PermissionManager
++ a strict sandbox + a threat model); the ResourceManager policy layer; a
+ServiceManager with a restart policy + watchdog; the full Component Model + WASI
+preview 2 + an SDK running components loaded from storage; a package/app format with
+installation + AOT; and a simple writable persistent filesystem - all in a VM over
+virtio on QEMU/KVM, testable under `cargo test` / QEMU.
+
+## Out of scope for phase 2 (= phase 3, the server platform)
+A POSIX-like / relibc compatibility layer for foreign software (phase 4, with real
+hardware); user accounts / identities and multi-user remote access; localization
+(locale, language, time zone, formatting); a wider network stack and server-class
+workloads; immutable signed system + A/B updates + rollback + verified boot;
+encrypted user volumes; a modern native filesystem with CoW / checksums / snapshots
+/ compression (phase 2 ships only a simple writable FS); first-party server apps (a
+static-file web server and the like); a minimal headless AudioService over
+virtio-sound; and a CLI package manager over the phase-2 package format. The desktop
+concerns (GUI / compositor, a full input + audio stack, the end-user app store) are
+phases 4-5. Phases 3-6 (server / real hardware / desktop / AI) remain a vision,
+contingent on a community forming.
