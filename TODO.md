@@ -436,15 +436,112 @@ M31 gave the shell raw keystrokes (and a backspace fix); a usable appliance/edge
 - Concept: deployment targets (the appliance/edge box is administered from its console), driver model (the kernel console is a dumb sink; the line editor is userspace), System API model.
 - Result: the shell now offers a readline-style line editor, and cursor moves are visible on both consoles. `driver.virtio-input` maps the navigation keycodes (KEY_LEFT/RIGHT/UP/DOWN/HOME/END/DELETE, all above its 64-entry ASCII KEYMAP) to the standard xterm escape sequences (`ESC [ D/C/A/B`, `ESC [ H`, `ESC [ F`, `ESC [ 3 ~`) via a `nav_sequence` table, feeding each byte to the console - so the framebuffer keyboard delivers the same bytes a serial terminal sends for those keys, and one parser handles both. The shell's `Editor` (replacing the append-only `read_line`) holds the line, a cursor, and a command history, with a small state machine decoding the escape sequences: printable bytes insert at the cursor (shifting the tail right and redrawing it), Backspace / Delete remove before / at the cursor (shifting the tail left), Left/Right/Home/End move the cursor, and Up/Down recall history (a heap `Vec<Vec<u8>>`, capped at 32, skipping empty lines and immediate duplicates; recall replaces and redraws the line). All redraw uses only carriage return, backspace (a non-destructive cursor-left), spaces, and reprinting - the primitives the framebuffer console already renders - so the editing logic stays entirely in userspace and the kernel console remains a dumb byte sink. The one console change is a visible cursor: the framebuffer console draws an underline caret (the bottom two pixel rows of the cursor cell, toggled by XOR so it needs no glyph buffer) that it hides before processing each byte and redraws after, so the caret follows the cursor and arrow-key moves are visible on screen (a serial terminal shows its own hardware caret). Verified live over the virtio-input keyboard: typing `echo helo`, moving Left and inserting `l` yields `echo hello` -> `hello`; Up recalls and re-runs it; `xecho hi` with Home + Delete becomes `echo hi` -> `hi`; `echo upzz` with End + two Backspaces becomes `echo up` -> `up`; submitting with the cursor mid-line still dispatches the whole line; and a framebuffer screenshot shows the underline caret under a mid-line position. 63 kernel tests green (the cooperative test path drives no input, so the editor is exercised only live), 0 warnings, fmt clean. NOT committed (user runs ./commit.sh).
 
-## M35a - Console polish: blinking cursor + ANSI colours (follow-up to M35)
+## Console subsystem track (M35a-M35k)
 
-M35 gave the framebuffer console a static underline caret and a line editor. Two follow-ups make the console feel like a real terminal: a blinking cursor, and colour. Both keep the microkernel split - colour travels as the standard ANSI bytes a serial terminal already interprets, so programs stay console-agnostic and the two consoles render identically (the same common-convention split as the M35 navigation keys).
+M35 gave the console a line editor, history, and a cursor. This track grows it into a proper modern terminal. The ordering principle: cheap high-value wins in the current kernel console first (so the console is usable fast), then the architectural pivot to a userspace ConsoleService with a cell-buffer terminal emulator (the foundation everything rich needs), then multi-session and richness on top, then the deep tty / signal layer (the heaviest, a real kernel change), and finally per-session security. Each step is in-band and convention-based - keys and colour travel as the standard ANSI bytes a serial terminal already speaks - so the serial and framebuffer consoles stay identical and programs stay console-agnostic.
+
+## M35a - Input fidelity: modifier keys + keyboard layout
+
+Today `driver.virtio-input` maps bare keycodes through a fixed unshifted ASCII table, so there is no way to type a capital letter, a shifted symbol (`|`, `>`, `~`, `"`...), or a control key. This is the first gap to close - without it the console cannot type the character set the shell and programs need - and it is cheap and self-contained.
+
+- [ ] Track the modifier keys (Shift, Ctrl, Alt, Caps Lock) from their press / release events, keeping a live modifier state in the driver.
+- [ ] A keyboard layout (US to start): an unshifted + shifted table so Shift / Caps Lock produce capitals and the shifted symbols; Ctrl maps a letter to its control code (Ctrl+A = 0x01 ... Ctrl+C = 0x03), and Alt prefixes the byte with ESC (the meta convention) - exactly what a serial terminal sends, so one path serves both consoles.
+- [ ] (optional, later) Pluggable non-US layouts and dead-key / compose handling for accented characters.
+- Done when: the keyboard types the full US character set over the framebuffer - capitals, shifted symbols, and control codes (Ctrl+C / D / L reach programs as 0x03 / 0x04 / 0x0c) - matching the serial terminal, tests green.
+- Concept: Drivers (the input driver owns key decoding; the layout is policy, the emitted bytes are the canonical interface), deployment targets (the box is typed at from its console).
+
+## M35b - Colour + a blinking cursor (the kernel console as a minimal terminal)
+
+Two cheap polish wins in the current kernel framebuffer console: a blinking cursor, and colour. Both keep the microkernel split - colour travels as the standard ANSI bytes a serial terminal already interprets, so programs stay console-agnostic and the two consoles render identically (the same common-convention split as the M35 navigation keys). (When the console moves to a userspace ConsoleService in M35c, this logic moves with it - it is small and portable.)
 
 - [ ] Blink the framebuffer caret: a timer-driven on/off toggle (off the kernel's 100 Hz LAPIC tick) inverts the underline caret at a steady interval (~0.5 s) while the console is idle, so the cursor blinks like a real terminal. The interactive pump (`console_shell_loop`, which already spins every round) drives the toggle by tick count; output (`put_char`) still hides/shows the caret around each byte, so blinking and editing never fight (re-sync the blink phase on output). The serial terminal already blinks its own hardware cursor, so this is framebuffer-only.
 - [ ] ANSI colours in the console: the framebuffer console parses SGR escape sequences (`ESC [ <n> ; ... m`) and renders the standard 16-colour ANSI palette - reset/default (`0`), the 8 normal foregrounds (`30-37`) and backgrounds (`40-47`), the 8 bright ones (`90-97` / `100-107`), and bold (`1`) as the bright variant. The console gains a small SGR output parser (it already ignores other ESC sequences after M35), a packed 16-entry palette, and a current fg/bg pair that `draw_glyph` uses instead of the fixed grey-on-black. Then programs emit standard codes (the shell prompt, `log` severity colouring, error messages, `ip`/`ss` headers) and BOTH the serial terminal and the framebuffer show colour identically - no per-console colour API, the kernel console just becomes a minimal ANSI terminal emulator.
 - Done when: the framebuffer cursor blinks at a steady rate while idle (without disturbing editing or output), the console interprets SGR colour sequences and renders the 16-colour ANSI palette, at least one program emits colour (e.g. the shell prompt or `log` severities) and it shows identically on serial and framebuffer, tests green.
 - Concept: deployment targets (the console is the admin surface), driver model (the console is a minimal terminal; colour is policy expressed as standard ANSI in the byte stream, not a bespoke API), System API model (one representation, many renderers - here the same ANSI bytes on two consoles).
 - Approach for colour (decided): do it the terminal way - colour is carried in-band as ANSI SGR escape sequences, NOT as a structured colour syscall/IPC API. The kernel framebuffer console (which already has `pack(r,g,b)` and a fixed `fg`/`bg`) grows: (1) a 16-entry palette of packed pixels (the conventional ANSI RGB values), (2) `cur_fg`/`cur_bg` indices defaulting to the M15 grey/black, (3) an output escape-state machine that recognises `ESC [` ... `m`, parses the `;`-separated numeric params, and updates `cur_fg`/`cur_bg` (and a bold flag mapping to bright); `draw_glyph` reads `cur_fg`/`cur_bg`. The serial side needs nothing - a real terminal already interprets the same bytes. So a service prints `\x1b[32m` for green and both consoles agree; this is the *one API, many representations* rule applied to the console itself.
+
+## M35c - ConsoleService + a cell-buffer terminal emulator
+
+The architectural pivot. The richest console features (scrollback, full-screen apps, multiple terminals, mouse, resize) all want a cell-buffer model - a grid where each cell stores its glyph and attributes - inside a userspace terminal emulator. So move the console out of the kernel into a ConsoleService (the same extraction StorageService / NetworkService did), model the screen as a cell buffer, implement the full VT100 / ECMA-48 escape set, and render it efficiently. M35a / M35b fold into it.
+
+- [ ] Extract the console into a userspace ConsoleService that owns the framebuffer (a capability / `device_memory_map`) and the keyboard stream (from `driver.virtio-input` + serial); the kernel's framebuffer console shrinks to the boot log and hands the display to ConsoleService once userspace is up - the console becomes a service like NetworkService / StorageService.
+- [ ] A cell-buffer model: a grid of cells (glyph + fg/bg + attributes), the screen rendered from it; the full VT100 / ECMA-48 escape set - absolute cursor positioning (CUP), erase (ED / EL), insert / delete line & character, scroll regions (DECSTBM), save / restore cursor, and the SGR attributes (reverse, underline, italic, bold) - so real TUI programs drive the screen.
+- [ ] An alternate screen buffer (`ESC [ ? 1049 h/l`) so a full-screen program (an editor / pager) does not clobber the scrollback and the prior screen is restored on exit.
+- [ ] Damage tracking + double buffering: redraw only the cells that changed and present a complete frame, so scrolling and full redraws are fast and flicker-free.
+- [ ] Size reporting + resize: a program can query the terminal size (rows x cols), and a resolution / window change delivers a resize event and reflows wrapped lines.
+- Done when: a userspace ConsoleService renders a cell-buffer terminal that interprets the core VT100 / ECMA-48 escapes (positioning, erase, scroll regions, alternate screen, SGR), redraws only damaged cells without flicker, reports its size and handles resize, and a TUI-style program drives it, tests green - the real terminal emulator the rest of the track builds on.
+- Concept: examples of services (ConsoleService over the framebuffer + input drivers), the driver/service split (the terminal emulator is userspace), System API model.
+
+## M35d - Multiple virtual terminals + switching
+
+With the ConsoleService and its cell-buffer emulator (M35c) in place, run several of them at once - the Linux virtual-terminal model (Ctrl+Alt+F1..F6): independent sessions, a hotkey to switch the foreground, background sessions still running.
+
+- [ ] N virtual terminals, each an independent session: its own cell buffer (+ scrollback) and a console channel to a client program (one shell per VT). Background VTs keep running and render to their own off-screen buffer; only the foreground VT is shown. A VT is the typed object a session is built on.
+- [ ] Input routing + a switch hotkey: keystrokes go to the foreground VT only; a reserved chord (Alt+F1..Fn or Ctrl+Alt+Fn) switches which VT is foreground, presenting its buffer. The serial console is one more terminal in the set (or stays bound to VT 1).
+- [ ] Spawn a shell per VT; let the user create / switch / close terminals; prove two shells run concurrently on different VTs with independent history and output.
+- Done when: ConsoleService multiplexes several virtual terminals each running its own shell, a hotkey switches the foreground VT (background VTs keep running and retain their screen), and the serial console participates, tests green - the multi-session console an admin expects.
+- Concept: examples of services (a ConsoleService / terminal multiplexer), deployment targets (multiple sessions are table stakes), System API model (a virtual terminal is a typed object; a session is a capability to one).
+
+## M35e - Scrollback, selection, and clipboard
+
+- [ ] Per-VT scrollback: keep a history of scrolled-off lines and a scroll view (Shift+PageUp / PageDown) to read back, returning to the live screen on new input.
+- [ ] Text selection: select a range by keyboard (and, once M35g lands, by mouse), highlighting it in the cell buffer.
+- [ ] A clipboard: copy the selection and paste it (a small ClipboardService, or the console holds it), with bracketed paste (`ESC [ ? 2004 h`) so a program can tell pasted text from typed text; OSC 52 for terminal-driven clipboard access.
+- Done when: each VT keeps scrollback the user can page through, text can be selected and copied / pasted, paste is bracketed, tests green.
+- Concept: deployment targets, System API model (the clipboard is a capability-gated service, not ambient state).
+
+## M35f - Unicode (UTF-8) + richer colour (256 / truecolour)
+
+- [ ] UTF-8 decoding on input and output, plus a Unicode-capable font (beyond the 128-glyph ASCII font), so non-ASCII text renders.
+- [ ] Wide (double-width CJK) characters and combining marks / grapheme clusters occupy the correct number of cells.
+- [ ] 256-colour and 24-bit truecolour SGR (`ESC [ 38 ; 5 ; n m` and `ESC [ 38 ; 2 ; r ; g ; b m`), extending the 16-colour palette from M35b.
+- Done when: the console renders UTF-8 text (including a wide character) with a Unicode font, and 256-colour / truecolour SGR works, tests green.
+- Concept: System API model (text is Unicode; colour is in-band ANSI, just deeper).
+
+## M35g - Mouse reporting in the terminal
+
+Builds on M36 (the pointer driver). The terminal delivers mouse events to the program in the standard SGR mouse encoding, so TUI apps get clicks, drag, and the scroll wheel.
+
+- [ ] SGR mouse mode (`ESC [ ? 1006 h` + the `ESC [ < b ; x ; y M/m` reports): translate pointer events (M36) to text-cell mouse reports and deliver them to the foreground program when it has enabled mouse tracking.
+- [ ] Route the scroll wheel to scrollback (M35e) when no program is tracking the mouse, and to selection (click-drag) otherwise.
+- Done when: a program that enables mouse tracking receives SGR click / drag / wheel reports in cell coordinates, and the wheel scrolls back when no program is tracking, tests green.
+- Concept: Drivers (pointer), IPC model (events as a stream), System API model.
+
+## M35h - Terminal niceties: OSC, cursor styles, and the bell
+
+- [ ] OSC sequences: set the terminal title (OSC 0 / 2), hyperlinks (OSC 8), and query / set the palette (OSC 4 / 10 / 11).
+- [ ] Configurable cursor: block / underline / bar, blink on / off, via DECSCUSR (`ESC [ <n> q`).
+- [ ] The bell (BEL): a visual flash (and an audible bell where a beeper exists).
+- Done when: the console honours the common OSC sequences, DECSCUSR cursor styles, and the bell, tests green.
+- Concept: System API model.
+
+## M35i - The TTY / line-discipline layer
+
+Today the line editor lives in the shell. A real system has a tty layer between the terminal and the program, so every program gets line editing (cooked mode) or raw key access without reimplementing it, and the control / signal keys are interpreted in one place.
+
+- [ ] A line discipline between the terminal and a program: canonical (cooked) mode does the M35 line editing + echo on the program's behalf; raw mode passes keys straight through; echo is toggleable.
+- [ ] The control keys map here: Ctrl+C / Ctrl+\ raise a signal (M35j), Ctrl+D is EOF, Ctrl+Z suspends, Ctrl+L / Ctrl+U / Ctrl+W are editing - generated by the discipline, not hard-coded in the shell.
+- [ ] Move the shell's editing onto the tty so any program (not only the shell) gets a line editor for free.
+- [ ] A PTY (pseudo-terminal) abstraction: the console channel generalises to a master / slave pair, so a program can host a terminal it is not the hardware console for - a nested terminal multiplexer, a future `ssh`, a test harness. A VT (M35d) is then just a pty whose master is bound to the display + keyboard; everything else (line discipline, signals, size) works the same over any pty.
+- Done when: a tty line discipline provides cooked / raw modes and echo control, the shell's editing runs through it, the control keys are interpreted by the discipline, and a pty pair can host a program with no hardware console, tests green.
+- Concept: the Unix tty / pty model adapted (the line discipline is a userspace policy over a console channel; a pty is a tty whose device is another program), IPC model.
+
+## M35j - Signals, process groups, and job control
+
+The control keys and `&` need a real signal mechanism: asynchronous delivery to a process (or process group), so Ctrl+C interrupts the foreground job and Ctrl+Z suspends it. This is a kernel + IPC primitive used beyond the console, and the heaviest item in the track.
+
+- [ ] A signal primitive: deliver an asynchronous, capability-gated signal to a process / process group (the typed equivalent of POSIX signals), with default and handled dispositions.
+- [ ] Process groups + a foreground group per terminal, so a signal from the tty (Ctrl+C / Ctrl+Z) reaches the right jobs.
+- [ ] Job control in the shell: run a job in the background (`&`), list jobs, and move one to the foreground / background (`fg` / `bg` / `jobs`); Ctrl+Z suspends, Ctrl+C interrupts.
+- Done when: Ctrl+C interrupts and Ctrl+Z suspends the foreground job, `&` / `fg` / `bg` / `jobs` work, signals deliver to process groups, tests green.
+- Concept: Syscall model (a typed, capability-gated signal mechanism, not ambient `kill`), Process model (process groups), the tty model.
+
+## M35k - Console sessions: lock and login
+
+- [ ] A session per VT with a lock (require re-auth to resume) and an idle timeout.
+- [ ] A login / authentication step gating access to a console session, tied to the identity / permission work (M38).
+- Done when: a console session can be locked and unlocked with authentication, gated by the permission model, tests green.
+- Concept: Security model (sessions + auth, capability-scoped), PermissionManager (M38).
 
 ## M36 - Pointer/mouse plumbing (virtio-input pointer + InputService)
 
