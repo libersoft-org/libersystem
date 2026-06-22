@@ -15,7 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{config, device, log, network, process, time, volume, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp};
+use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, config, device, log, network, process, time, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -596,11 +596,7 @@ unsafe fn send_stdout(parent: u64) {
 		let so: u64 = stdout();
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, RIGHT_SEND | RIGHT_TRANSFER);
-			if d > 0 {
-				d as u64
-			} else {
-				0
-			}
+			if d > 0 { d as u64 } else { 0 }
 		} else {
 			0
 		};

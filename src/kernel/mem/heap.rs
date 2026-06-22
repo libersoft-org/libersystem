@@ -2,8 +2,12 @@
 //
 // A dedicated higher-half virtual region is backed by physical frames mapped in
 // on init, and a linked-list first-fit allocator hands out memory within it.
-// Freed blocks are pushed back onto the free list and reused (no coalescing in
-// M1, which is correct but can fragment - good enough for the foundation).
+// The free list is kept sorted by address and freed blocks are coalesced with
+// their immediate neighbours, so contiguous free memory is merged back into one
+// region - this keeps the heap from fragmenting under churn (without it a long
+// run of allocations/frees could leave no single block big enough for a large
+// contiguous request - e.g. a 16 KiB kernel thread stack - even with plenty of
+// total free space).
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem;
@@ -71,16 +75,54 @@ impl Heap {
 	}
 
 	// SAFETY: `addr` must be valid for writes and large enough to hold a node.
+	//
+	// Inserts the freed block into the address-sorted free list, then coalesces it
+	// with the immediately adjacent neighbours (right first, then left) so touching
+	// free blocks are merged into one. The free list is always maximally coalesced,
+	// so a single insert can merge with at most its left and right neighbour.
 	unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
 		unsafe {
 			assert_eq!(align_up(addr, mem::align_of::<FreeRegion>()), addr);
 			assert!(size >= mem::size_of::<FreeRegion>());
 
+			// Walk to the insertion point: `current` is the last node whose start
+			// address is <= addr, so the new block belongs between `current` and
+			// `current.next`. The list stays sorted by ascending start address.
+			let mut current = &mut self.head;
+			while let Some(ref next) = current.next {
+				if next.start_addr() > addr {
+					break;
+				}
+				current = current.next.as_mut().unwrap();
+			}
+
+			// Link the new node in between `current` and the rest of the list.
 			let mut region = FreeRegion::new(size);
-			region.next = self.head.next.take();
+			region.next = current.next.take();
 			let region_ptr = addr as *mut FreeRegion;
 			region_ptr.write(region);
-			self.head.next = Some(&mut *region_ptr);
+			current.next = Some(&mut *region_ptr);
+
+			// Coalesce the new node with its right neighbour if they touch.
+			let new_node = current.next.as_mut().unwrap();
+			let merge_right = match &new_node.next {
+				Some(next) => new_node.end_addr() == next.start_addr(),
+				None => false,
+			};
+			if merge_right {
+				let absorbed = new_node.next.take().unwrap();
+				new_node.size += absorbed.size;
+				new_node.next = absorbed.next.take();
+			}
+
+			// Coalesce `current` (the left neighbour) with the new node if they
+			// touch. The dummy `head` lives in the kernel image, never adjacent to a
+			// heap block, so this address check naturally skips it.
+			if current.end_addr() == addr {
+				let absorbed = current.next.take().unwrap();
+				current.size += absorbed.size;
+				current.next = absorbed.next.take();
+			}
 		}
 	}
 

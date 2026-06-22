@@ -313,11 +313,7 @@ pub unsafe fn memory_object_create(size: u64) -> i64 {
 pub unsafe fn map_object(handle: u64) -> Option<u64> {
 	unsafe {
 		let base: u64 = syscall(SYS_MEMORY_MAP, handle, 0, 0, 0);
-		if sys_is_err(base) {
-			None
-		} else {
-			Some(base)
-		}
+		if sys_is_err(base) { None } else { Some(base) }
 	}
 }
 
@@ -375,11 +371,7 @@ pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
 		let mut info: ObjectInfo = ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0 };
 		let size: u64 = core::mem::size_of::<ObjectInfo>() as u64;
 		let ok: i64 = syscall(SYS_OBJECT_INFO_GET, handle, &mut info as *mut ObjectInfo as u64, size, 0) as i64;
-		if ok == 1 {
-			Some(info)
-		} else {
-			None
-		}
+		if ok == 1 { Some(info) } else { None }
 	}
 }
 
