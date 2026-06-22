@@ -14,7 +14,7 @@
 extern crate alloc;
 
 use alloc::string::String;
-use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, config, device, log, network, process, volume};
+use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, config, device, log, network, process, time, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -37,6 +37,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
 	let cfgsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONFIG") }.unwrap_or_else(|| exit());
 	let netsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NET") }.unwrap_or_else(|| exit());
+	let timesvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"TIME") }.unwrap_or_else(|| exit());
 	// The init package lets the shell spawn foreground programs (echo, later the net
 	// tools); the archive is mapped 'static and parsed once.
 	let (_pkg_handle, archive): (u64, &'static [u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| exit());
@@ -54,7 +55,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 4. become the interactive console and run the read-eval-print loop.
 	unsafe {
-		repl(storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, &package, &mut buf);
+		repl(storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, &package, &mut buf);
 	}
 	exit();
 }
@@ -63,7 +64,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // kernel feeds keystrokes on the channel; we line-edit them (echoing input,
 // handling backspace) and dispatch each completed line. Returns when the user
 // types `exit`.
-unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, package: &Package, buf: &mut [u8]) {
+unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
 		// The kernel sends console input on `feed`; we receive it on `input`.
 		let (feed, input): (u64, u64) = match channel() {
@@ -84,7 +85,7 @@ unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64
 				match buf[i] {
 					b'\n' | b'\r' => {
 						print(b"\n");
-						if dispatch(&line[..len], storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, package) {
+						if dispatch(&line[..len], storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, package) {
 							return;
 						}
 						len = 0;
@@ -112,7 +113,7 @@ unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64
 }
 
 // Dispatch one command line. Returns true if the shell should exit.
-unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, package: &Package) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -146,19 +147,19 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			return false;
 		}
 		if line == b"log" {
-			query_log(logsvc, false);
+			query_log(logsvc, timesvc, false);
 			return false;
 		}
 		if line == b"log json" {
-			query_log(logsvc, true);
+			query_log(logsvc, timesvc, true);
 			return false;
 		}
 		if line == b"log tail" {
-			tail_log(logsvc, false);
+			tail_log(logsvc, timesvc, false);
 			return false;
 		}
 		if line == b"log tail json" {
-			tail_log(logsvc, true);
+			tail_log(logsvc, timesvc, true);
 			return false;
 		}
 		if line == b"dev" {
@@ -187,6 +188,10 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		}
 		if let Some(rest) = line.strip_prefix(b"set ") {
 			set_config(cfgsvc, trim(rest));
+			return false;
+		}
+		if line == b"date" {
+			show_date(timesvc);
 			return false;
 		}
 		if line == b"ip" || line == b"net" {
@@ -397,16 +402,64 @@ unsafe fn print_text_lines<T, F: Fn(&T) -> String>(items: &[T], to_text: F) {
 // Query LogService for the journal over the generated Log client and print it,
 // rendering each returned entry to text or JSON on the client side. The query
 // asks for all severities (no minimum) and no limit.
-unsafe fn query_log(logsvc: u64, json: bool) {
+// Show the current wall-clock time via TimeService, rendered as ISO-8601 UTC.
+unsafe fn show_date(timesvc: u64) {
+	unsafe {
+		let mut client = time::Client::new(ChannelTransport { chan: timesvc });
+		match client.now() {
+			Some(Ok(ts)) => {
+				let mut out: [u8; 24] = [0u8; 24];
+				let n: usize = ts.render(&mut out);
+				print(&out[..n]);
+				print(b"\n");
+			}
+			Some(Err(_)) => print(b"date: time error\n"),
+			None => print(b"date: service unavailable\n"),
+		}
+	}
+}
+
+// The Unix epoch (seconds) at monotonic tick 0, from TimeService: the current wall
+// time minus the seconds elapsed since boot. Lets the shell render a log record's
+// monotonic timestamp as wall-clock. None if TimeService is unavailable.
+unsafe fn boot_epoch(timesvc: u64) -> Option<u64> {
+	unsafe {
+		let mut client = time::Client::new(ChannelTransport { chan: timesvc });
+		match client.now() {
+			Some(Ok(ts)) => Some(ts.unix_secs.saturating_sub(clock() / 100)),
+			_ => None,
+		}
+	}
+}
+
+// Render one log entry as text, prefixed with its wall-clock time when the boot epoch
+// is known (the record's monotonic tick converted to UTC), else the bare record.
+fn entry_text(e: &Entry, epoch: Option<u64>) -> String {
+	match epoch {
+		Some(base) => {
+			let wall: u64 = base + e.timestamp / 100;
+			let mut iso: [u8; 24] = [0u8; 24];
+			let n: usize = Timestamp { unix_secs: wall }.render(&mut iso);
+			let mut s: String = String::from(core::str::from_utf8(&iso[..n]).unwrap_or(""));
+			s.push(' ');
+			s.push_str(&e.to_text());
+			s
+		}
+		None => e.to_text(),
+	}
+}
+
+unsafe fn query_log(logsvc: u64, timesvc: u64, json: bool) {
 	unsafe {
 		let q = Query { since: None, min_severity: None, source: None, limit: 0 };
+		let epoch: Option<u64> = boot_epoch(timesvc);
 		let mut client = log::Client::new(ChannelTransport { chan: logsvc });
 		match client.query(&q) {
 			Some(Ok(entries)) => {
 				if json {
 					print_json_array(&entries, |e: &Entry| -> String { e.to_json() });
 				} else {
-					print_text_lines(&entries, |e: &Entry| -> String { e.to_text() });
+					print_text_lines(&entries, |e: &Entry| -> String { entry_text(e, epoch) });
 				}
 			}
 			Some(Err(_)) => print(b"log: query error\n"),
@@ -420,9 +473,10 @@ unsafe fn query_log(logsvc: u64, json: bool) {
 // the service frames each entry as its own message on it and closes it to mark the
 // end of the stream. We drain the frames and render each entry on the client side,
 // exactly like `log`, but one streamed record at a time.
-unsafe fn tail_log(logsvc: u64, json: bool) {
+unsafe fn tail_log(logsvc: u64, timesvc: u64, json: bool) {
 	unsafe {
 		let q = Query { since: None, min_severity: None, source: None, limit: 0 };
+		let epoch: Option<u64> = boot_epoch(timesvc);
 		let mut client = log::Client::new(ChannelTransport { chan: logsvc });
 		let consumer: u64 = match client.tail(&q) {
 			Some(h) => h,
@@ -447,7 +501,7 @@ unsafe fn tail_log(logsvc: u64, json: bool) {
 							first = false;
 							print(entry.to_json().as_bytes());
 						} else {
-							print(entry.to_text().as_bytes());
+							print(entry_text(&entry, epoch).as_bytes());
 							print(b"\n");
 						}
 					}

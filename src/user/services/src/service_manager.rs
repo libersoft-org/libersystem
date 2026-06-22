@@ -20,6 +20,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use proto::system::log;
+use proto::system::network;
 use proto::system::{Entry, Field, Severity};
 use rt::*;
 
@@ -32,7 +33,7 @@ struct Service {
 
 // The number of managed services. (A fixed size keeps the state array on the
 // stack, which a no_std program with no heap needs.)
-const N: usize = 8;
+const N: usize = 9;
 
 // The core service manifest. The array order is deliberately NOT the start order:
 // DeviceManager, StorageService, and the shell are listed before LogService, but
@@ -40,7 +41,7 @@ const N: usize = 8;
 // start LogService first. This proves the ordering is driven by declared
 // dependencies, not by manifest position. The shell is the last component up: it
 // depends on StorageService, which it talks to over IPC.
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"device_service", b"process_service", b"config_service", b"network_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }];
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -88,6 +89,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut block_client: u64 = 0;
 	let mut net_frames: u64 = 0;
 	let mut net_client: u64 = 0;
+	let mut time_client: u64 = 0;
 	let mut log_client: u64 = 0;
 	let mut device_client: u64 = 0;
 	let mut process_client: u64 = 0;
@@ -97,7 +99,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
-				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut channels[i], &mut buf) };
+				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut time_client, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut channels[i], &mut buf) };
 				progress = true;
 			}
 			i += 1;
@@ -181,7 +183,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, time_client: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -215,7 +217,10 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"network_service" && !bootstrap_network_service(manager_side, *net_frames, net_client) {
 			return State::Failed;
 		}
-		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, pkg_handle, pkg_len, buf) {
+		if name == b"time_service" && !bootstrap_time_service(manager_side, *net_client, time_client) {
+			return State::Failed;
+		}
+		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -282,7 +287,7 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 // client are transferred (the shell becomes their sole owner); the LogService
 // client is *duplicated* and the copy transferred, since the supervisor keeps
 // emitting on the original.
-unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"STORAGE", storage_client) {
 			return false;
@@ -304,6 +309,9 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 			return false;
 		}
 		if !send_blocking(manager_side, b"NET", net_client) {
+			return false;
+		}
+		if !send_blocking(manager_side, b"TIME", time_client) {
 			return false;
 		}
 		// The shell spawns foreground programs (echo, later the net tools) from the
@@ -378,5 +386,26 @@ unsafe fn bootstrap_network_service(manager_side: u64, net_frames: u64, net_clie
 			return false;
 		}
 		bootstrap_serve(manager_side, net_client)
+	}
+}
+
+// Hand TimeService its own NetworkService client (for the SNTP query) and the channel
+// its clients reach it on. The network client is minted from the multi-client
+// `network.open()` on the supervisor's NetworkService channel and transferred as
+// "NET"; then "SERVE" transfers one end of a fresh service channel, the other kept in
+// `*time_client` and later handed to the shell for the `date` command and `log`
+// wall-clock rendering. (TimeService depends on network_service, so `net_client` is
+// already set by the time this runs.)
+unsafe fn bootstrap_time_service(manager_side: u64, net_client: u64, time_client: &mut u64) -> bool {
+	unsafe {
+		let mut net = network::Client::new(ChannelTransport { chan: net_client });
+		let time_net: u64 = match net.open() {
+			Some(Ok(h)) => h,
+			_ => return false,
+		};
+		if !send_blocking(manager_side, b"NET", time_net) {
+			return false;
+		}
+		bootstrap_serve(manager_side, time_client)
 	}
 }

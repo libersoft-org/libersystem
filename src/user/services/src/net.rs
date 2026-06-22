@@ -32,6 +32,11 @@ const ICMP_ECHO_REPLY: u8 = 0;
 // The DNS server port (UDP).
 const DNS_PORT: u16 = 53;
 
+// The NTP / SNTP server port (UDP), and the offset between the NTP epoch (1900) and
+// the Unix epoch (1970) in seconds (70 years, 17 of them leap).
+const NTP_PORT: u16 = 123;
+const NTP_UNIX_OFFSET: u32 = 2_208_988_800;
+
 // DHCP / BOOTP: a UDP client on port 68 talking to a server on port 67. The client
 // broadcasts a DISCOVER, the server OFFERs an address, the client REQUESTs it, and
 // the server ACKs - the client learning its address and the subnet mask / gateway /
@@ -228,6 +233,8 @@ pub enum Event {
 	// A DHCP reply arrived with this message type (OFFER or ACK); the learned lease is
 	// stored in the stack.
 	DhcpReply(u8),
+	// An SNTP reply arrived carrying this Unix timestamp (seconds since 1970, UTC).
+	SntpReply(u64),
 }
 
 // The result of feeding one frame to the stack: an optional reply to transmit
@@ -552,6 +559,10 @@ impl Stack {
 		} else if src_port == DHCP_SERVER_PORT {
 			if let Some(msg_type) = self.parse_dhcp(&udp[UDP_HDR..]) {
 				return Outcome { reply_len: 0, event: Event::DhcpReply(msg_type) };
+			}
+		} else if src_port == NTP_PORT {
+			if let Some(unix) = parse_sntp(&udp[UDP_HDR..]) {
+				return Outcome { reply_len: 0, event: Event::SntpReply(unix) };
 			}
 		}
 		Outcome { reply_len: 0, event: Event::None }
@@ -1014,6 +1025,49 @@ impl Stack {
 		ETH_HDR + total
 	}
 
+	// Build an SNTP (NTP) client request to `server_ip` from `src_port` into `out`,
+	// returning its length: a 48-byte NTP payload (only the first byte set - LI 0,
+	// version 4, mode 3 = client; the rest zero) over UDP / IPv4 / Ethernet.
+	pub fn build_sntp_request(&self, server_mac: MacAddr, server_ip: Ipv4Addr, src_port: u16, out: &mut [u8]) -> usize {
+		let ntp_off: usize = ETH_HDR + IPV4_HDR + UDP_HDR;
+		let ntp_len: usize = 48;
+		if ntp_off + ntp_len > out.len() {
+			return 0;
+		}
+		for b in out[ntp_off..ntp_off + ntp_len].iter_mut() {
+			*b = 0;
+		}
+		out[ntp_off] = 0x23; // LI 0, VN 4, Mode 3 (client)
+		// UDP header.
+		let udp_off: usize = ETH_HDR + IPV4_HDR;
+		put16(out, udp_off, src_port);
+		put16(out, udp_off + 2, NTP_PORT);
+		put16(out, udp_off + 4, (UDP_HDR + ntp_len) as u16);
+		put16(out, udp_off + 6, 0);
+		let udp_csum: u16 = udp_checksum(self.ip, server_ip, &out[udp_off..udp_off + UDP_HDR + ntp_len]);
+		put16(out, udp_off + 6, udp_csum);
+		// IPv4 header.
+		let total: usize = IPV4_HDR + UDP_HDR + ntp_len;
+		let ip: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + IPV4_HDR];
+		ip[0] = 0x45;
+		ip[1] = 0;
+		put16(ip, 2, total as u16);
+		put16(ip, 4, 0);
+		put16(ip, 6, 0);
+		ip[8] = 64;
+		ip[9] = IP_PROTO_UDP;
+		put16(ip, 10, 0);
+		ip[12..16].copy_from_slice(&self.ip.0);
+		ip[16..20].copy_from_slice(&server_ip.0);
+		let csum: u16 = checksum(&ip[..IPV4_HDR]);
+		put16(ip, 10, csum);
+		// Ethernet header.
+		out[0..6].copy_from_slice(&server_mac.0);
+		out[6..12].copy_from_slice(&self.mac.0);
+		put16(out, 12, ETHERTYPE_IPV4);
+		ETH_HDR + total
+	}
+
 	// Build a DHCP DISCOVER (broadcast, no address yet) into `out`, returning its
 	// length.
 	pub fn build_dhcp_discover(&self, out: &mut [u8]) -> usize {
@@ -1214,4 +1268,18 @@ fn parse_dns_response(dns: &[u8]) -> Option<Ipv4Addr> {
 		}
 	}
 	None
+}
+
+// Parse an SNTP response payload and return the transmit timestamp as a Unix time
+// (seconds, UTC): the 64-bit transmit timestamp sits at offset 40, its integer-
+// seconds half (since the NTP 1900 epoch) in the first 4 bytes. None if too short.
+fn parse_sntp(ntp: &[u8]) -> Option<u64> {
+	if ntp.len() < 44 {
+		return None;
+	}
+	let ntp_secs: u32 = be32(ntp, 40);
+	if ntp_secs < NTP_UNIX_OFFSET {
+		return None;
+	}
+	Some((ntp_secs - NTP_UNIX_OFFSET) as u64)
 }

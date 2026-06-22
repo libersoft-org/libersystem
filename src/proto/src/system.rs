@@ -1559,6 +1559,7 @@ pub mod network {
 	pub const OP_OPEN: u16 = 6;
 	pub const OP_LISTEN: u16 = 7;
 	pub const OP_SOCKETS: u16 = 8;
+	pub const OP_SNTP: u16 = 9;
 
 	pub trait Service {
 		fn info(&mut self) -> Result<NetInfo, Error>;
@@ -1569,6 +1570,7 @@ pub mod network {
 		fn open(&mut self) -> Result<u64, Error>;
 		fn listen(&mut self, port: u16) -> Result<u64, Error>;
 		fn sockets(&mut self) -> Result<Vec<SockInfo>, Error>;
+		fn sntp(&mut self, server: Ipv4Addr) -> Result<u64, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -1704,6 +1706,20 @@ pub mod network {
 					}
 				}
 			}
+			OP_SNTP => {
+				let server = Ipv4Addr::read(r)?;
+				let result = service.sntp(server);
+				match &result {
+					Ok(v70) => {
+						w.u8(1)?;
+						w.u64(*v70)?;
+					}
+					Err(v71) => {
+						w.u8(0)?;
+						v71.write(w)?;
+					}
+				}
+			}
 			_ => return None,
 		}
 		*reply_handle = writer.handle();
@@ -1794,12 +1810,12 @@ pub mod network {
 			}
 			Some(if r.u8()? != 0 {
 				Ok({
-					let v70 = r.u16()? as usize;
-					let mut v71 = Vec::new();
-					for _ in 0..v70 {
-						v71.push(r.u8()?);
+					let v72 = r.u16()? as usize;
+					let mut v73 = Vec::new();
+					for _ in 0..v72 {
+						v73.push(r.u8()?);
 					}
-					v71
+					v73
 				})
 			} else {
 				Err(Error::read(r)?)
@@ -1892,16 +1908,33 @@ pub mod network {
 			}
 			Some(if r.u8()? != 0 {
 				Ok({
-					let v72 = r.u16()? as usize;
-					let mut v73 = Vec::new();
-					for _ in 0..v72 {
-						v73.push(SockInfo::read(r)?);
+					let v74 = r.u16()? as usize;
+					let mut v75 = Vec::new();
+					for _ in 0..v74 {
+						v75.push(SockInfo::read(r)?);
 					}
-					v73
+					v75
 				})
 			} else {
 				Err(Error::read(r)?)
 			})
+		}
+		pub fn sntp(&mut self, server: &Ipv4Addr) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SNTP)?;
+			w.u32(corr)?;
+			server.write(w)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(r.u64()?) } else { Err(Error::read(r)?) })
 		}
 	}
 }
@@ -1939,25 +1972,25 @@ pub mod socket {
 				};
 				let result = service.send(data);
 				match &result {
-					Ok(v74) => {
+					Ok(v76) => {
 						w.u8(1)?;
-						w.u32(*v74)?;
+						w.u32(*v76)?;
 					}
-					Err(v75) => {
+					Err(v77) => {
 						w.u8(0)?;
-						v75.write(w)?;
+						v77.write(w)?;
 					}
 				}
 			}
 			OP_CLOSE => {
 				let result = service.close();
 				match &result {
-					Ok(v76) => {
+					Ok(v78) => {
 						w.u8(1)?;
 					}
-					Err(v77) => {
+					Err(v79) => {
 						w.u8(0)?;
-						v77.write(w)?;
+						v79.write(w)?;
 					}
 				}
 			}
@@ -2082,19 +2115,19 @@ impl Chunk {
 			return None;
 		}
 		w.u16(self.data.len() as u16)?;
-		for v78 in self.data.iter() {
-			w.u8(*v78)?;
+		for v80 in self.data.iter() {
+			w.u8(*v80)?;
 		}
 		Some(())
 	}
 	pub(crate) fn read(r: &mut Reader) -> Option<Chunk> {
 		let data = {
-			let v79 = r.u16()? as usize;
-			let mut v80 = Vec::new();
-			for _ in 0..v79 {
-				v80.push(r.u8()?);
+			let v81 = r.u16()? as usize;
+			let mut v82 = Vec::new();
+			for _ in 0..v81 {
+				v82.push(r.u8()?);
 			}
-			v80
+			v82
 		};
 		Some(Chunk { data })
 	}
@@ -2124,14 +2157,14 @@ pub mod listener {
 			OP_ACCEPT => {
 				let result = service.accept();
 				match &result {
-					Ok(v81) => {
+					Ok(v83) => {
 						w.u8(1)?;
-						w.set_handle(*v81);
+						w.set_handle(*v83);
 						w.u32(0)?;
 					}
-					Err(v82) => {
+					Err(v84) => {
 						w.u8(0)?;
-						v82.write(w)?;
+						v84.write(w)?;
 					}
 				}
 			}
@@ -2180,6 +2213,111 @@ pub mod listener {
 			} else {
 				Err(Error::read(r)?)
 			})
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Timestamp {
+	pub unix_secs: u64,
+}
+
+impl Timestamp {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Timestamp> {
+		Timestamp::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u64(self.unix_secs)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<Timestamp> {
+		let unix_secs = r.u64()?;
+		Some(Timestamp { unix_secs })
+	}
+}
+
+// interface `time` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod time {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_NOW: u16 = 1;
+
+	pub trait Service {
+		fn now(&mut self) -> Result<Timestamp, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = Reader::with_handle(request, request_handle);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		match op {
+			OP_NOW => {
+				let result = service.now();
+				match &result {
+					Ok(v85) => {
+						w.u8(1)?;
+						v85.write(w)?;
+					}
+					Err(v86) => {
+						w.u8(0)?;
+						v86.write(w)?;
+					}
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn now(&mut self) -> Option<Result<Timestamp, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_NOW)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(Timestamp::read(r)?) } else { Err(Error::read(r)?) })
 		}
 	}
 }
@@ -2303,13 +2441,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v84 = true;
-		for v83 in self.fields.iter() {
-			if !v84 {
+		let mut v88 = true;
+		for v87 in self.fields.iter() {
+			if !v88 {
 				out.push(',');
 			}
-			v84 = false;
-			v83.to_json_into(out);
+			v88 = false;
+			v87.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2327,13 +2465,13 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v86 = true;
-		for v85 in self.fields.iter() {
-			if !v86 {
+		let mut v90 = true;
+		for v89 in self.fields.iter() {
+			if !v90 {
 				out.push_str(", ");
 			}
-			v86 = false;
-			v85.to_text_into(out);
+			v90 = false;
+			v89.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2355,8 +2493,8 @@ impl Query {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v87) => {
-				let _ = write!(out, "{}", v87);
+			Some(v91) => {
+				let _ = write!(out, "{}", v91);
 			}
 			None => {
 				out.push_str("null");
@@ -2365,8 +2503,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v88) => {
-				v88.to_json_into(out);
+			Some(v92) => {
+				v92.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -2375,8 +2513,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v89) => {
-				crate::codec::json_escape(v89, out);
+			Some(v93) => {
+				crate::codec::json_escape(v93, out);
 			}
 			None => {
 				out.push_str("null");
@@ -2391,8 +2529,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v90) => {
-				let _ = write!(out, "{}", v90);
+			Some(v94) => {
+				let _ = write!(out, "{}", v94);
 			}
 			None => {
 				out.push('-');
@@ -2401,8 +2539,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v91) => {
-				v91.to_text_into(out);
+			Some(v95) => {
+				v95.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -2411,8 +2549,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v92) => {
-				out.push_str(v92);
+			Some(v96) => {
+				out.push_str(v96);
 			}
 			None => {
 				out.push('-');
@@ -2766,13 +2904,13 @@ impl Neighbor {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v94 = true;
-		for v93 in self.mac.iter() {
-			if !v94 {
+		let mut v98 = true;
+		for v97 in self.mac.iter() {
+			if !v98 {
 				out.push(',');
 			}
-			v94 = false;
-			let _ = write!(out, "{}", v93);
+			v98 = false;
+			let _ = write!(out, "{}", v97);
 		}
 		out.push(']');
 		out.push('}');
@@ -2784,13 +2922,13 @@ impl Neighbor {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v96 = true;
-		for v95 in self.mac.iter() {
-			if !v96 {
+		let mut v100 = true;
+		for v99 in self.mac.iter() {
+			if !v100 {
 				out.push_str(", ");
 			}
-			v96 = false;
-			let _ = write!(out, "{}", v95);
+			v100 = false;
+			let _ = write!(out, "{}", v99);
 		}
 		out.push(']');
 		out.push('}');
@@ -2815,13 +2953,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v98 = true;
-		for v97 in self.mac.iter() {
-			if !v98 {
+		let mut v102 = true;
+		for v101 in self.mac.iter() {
+			if !v102 {
 				out.push(',');
 			}
-			v98 = false;
-			let _ = write!(out, "{}", v97);
+			v102 = false;
+			let _ = write!(out, "{}", v101);
 		}
 		out.push(']');
 		out.push(',');
@@ -2830,13 +2968,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"neighbors\":");
 		out.push('[');
-		let mut v100 = true;
-		for v99 in self.neighbors.iter() {
-			if !v100 {
+		let mut v104 = true;
+		for v103 in self.neighbors.iter() {
+			if !v104 {
 				out.push(',');
 			}
-			v100 = false;
-			v99.to_json_into(out);
+			v104 = false;
+			v103.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2848,13 +2986,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v102 = true;
-		for v101 in self.mac.iter() {
-			if !v102 {
+		let mut v106 = true;
+		for v105 in self.mac.iter() {
+			if !v106 {
 				out.push_str(", ");
 			}
-			v102 = false;
-			let _ = write!(out, "{}", v101);
+			v106 = false;
+			let _ = write!(out, "{}", v105);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -2863,13 +3001,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("neighbors=");
 		out.push('[');
-		let mut v104 = true;
-		for v103 in self.neighbors.iter() {
-			if !v104 {
+		let mut v108 = true;
+		for v107 in self.neighbors.iter() {
+			if !v108 {
 				out.push_str(", ");
 			}
-			v104 = false;
-			v103.to_text_into(out);
+			v108 = false;
+			v107.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2921,13 +3059,13 @@ impl TcpRequest {
 		out.push(',');
 		out.push_str("\"request\":");
 		out.push('[');
-		let mut v106 = true;
-		for v105 in self.request.iter() {
-			if !v106 {
+		let mut v110 = true;
+		for v109 in self.request.iter() {
+			if !v110 {
 				out.push(',');
 			}
-			v106 = false;
-			let _ = write!(out, "{}", v105);
+			v110 = false;
+			let _ = write!(out, "{}", v109);
 		}
 		out.push(']');
 		out.push('}');
@@ -2939,13 +3077,13 @@ impl TcpRequest {
 		out.push_str(", ");
 		out.push_str("request=");
 		out.push('[');
-		let mut v108 = true;
-		for v107 in self.request.iter() {
-			if !v108 {
+		let mut v112 = true;
+		for v111 in self.request.iter() {
+			if !v112 {
 				out.push_str(", ");
 			}
-			v108 = false;
-			let _ = write!(out, "{}", v107);
+			v112 = false;
+			let _ = write!(out, "{}", v111);
 		}
 		out.push(']');
 		out.push('}');
@@ -3037,13 +3175,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("\"data\":");
 		out.push('[');
-		let mut v110 = true;
-		for v109 in self.data.iter() {
-			if !v110 {
+		let mut v114 = true;
+		for v113 in self.data.iter() {
+			if !v114 {
 				out.push(',');
 			}
-			v110 = false;
-			let _ = write!(out, "{}", v109);
+			v114 = false;
+			let _ = write!(out, "{}", v113);
 		}
 		out.push(']');
 		out.push('}');
@@ -3052,15 +3190,40 @@ impl Chunk {
 		out.push('{');
 		out.push_str("data=");
 		out.push('[');
-		let mut v112 = true;
-		for v111 in self.data.iter() {
-			if !v112 {
+		let mut v116 = true;
+		for v115 in self.data.iter() {
+			if !v116 {
 				out.push_str(", ");
 			}
-			v112 = false;
-			let _ = write!(out, "{}", v111);
+			v116 = false;
+			let _ = write!(out, "{}", v115);
 		}
 		out.push(']');
+		out.push('}');
+	}
+}
+
+impl Timestamp {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"unix-secs\":");
+		let _ = write!(out, "{}", self.unix_secs);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("unix-secs=");
+		let _ = write!(out, "{}", self.unix_secs);
 		out.push('}');
 	}
 }
@@ -3221,5 +3384,13 @@ mod compat {
 		let golden: &[u8] = &[1, 0, 7];
 		assert_eq!(bytes, golden);
 		assert_eq!(Chunk::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn timestamp_wire_is_stable() {
+		let sample = Timestamp { unix_secs: 7 };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[7, 0, 0, 0, 0, 0, 0, 0];
+		assert_eq!(bytes, golden);
+		assert_eq!(Timestamp::decode(&bytes).unwrap(), sample);
 	}
 }

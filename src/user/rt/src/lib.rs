@@ -310,6 +310,13 @@ pub unsafe fn clock() -> u64 {
 	unsafe { syscall(SYS_CLOCK_GET, 0, 0, 0, 0) }
 }
 
+// Read the hardware real-time clock as a Unix timestamp (seconds since the epoch,
+// UTC), or 0 if the RTC reports an implausible date. The wall-clock policy
+// (NTP discipline, the monotonic combination) lives in the userspace TimeService.
+pub unsafe fn clock_rtc() -> u64 {
+	unsafe { syscall(SYS_CLOCK_RTC, 0, 0, 0, 0) }
+}
+
 // Duplicate `handle` into a new handle carrying `rights` (a subset of the
 // original's). Returns the new handle, or a negative error.
 pub unsafe fn duplicate(handle: u64, rights: u32) -> i64 {

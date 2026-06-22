@@ -181,6 +181,12 @@ An opaque kernel object, transferred as `handle<file>`.
 | --- | --- |
 | `data` | `list<u8>` |
 
+### record `timestamp`
+
+| field | type |
+| --- | --- |
+| `unix-secs` | `u64` |
+
 ## Interfaces
 
 ### interface `log`
@@ -251,6 +257,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 6 | `open` | `open() -> result<handle<channel>, error>` |
 | 7 | `listen` | `listen(port: u16) -> result<handle<channel>, error>` |
 | 8 | `sockets` | `sockets() -> result<list<sock-info>, error>` |
+| 9 | `sntp` | `sntp(server: ipv4-addr) -> result<u64, error>` |
 
 ### interface `socket`
 
@@ -269,4 +276,12 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `accept` | `accept() -> result<handle<channel>, error>` |
+
+### interface `time`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `now` | `now() -> result<timestamp, error>` |
 

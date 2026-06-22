@@ -67,6 +67,9 @@ pub const SYS_CONSOLE_FEED: u64 = 41;
 // passes), returning the ready handle's index - `wait` over a set, so a driver can
 // wait on its device interrupt and a control channel at once.
 pub const SYS_WAIT_ANY: u64 = 42;
+// Read the hardware real-time clock as a Unix timestamp (seconds since the epoch,
+// UTC). Raw mechanism; the userspace TimeService is the wall-clock policy.
+pub const SYS_CLOCK_RTC: u64 = 43;
 
 // The ring-3 stack top an ELF-loaded process runs on: the kernel's loader maps a
 // stack just below this address, and a userspace spawner passes it to

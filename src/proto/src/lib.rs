@@ -18,5 +18,8 @@ pub mod system;
 // `Ipv4Addr::render` and MAC rendering).
 pub mod addr;
 
+// Hand-written ISO-8601 rendering for the generated `Timestamp` type.
+pub mod clock;
+
 #[cfg(test)]
 mod tests;

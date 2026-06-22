@@ -233,6 +233,7 @@ interface network {
 	@op(6) open:    func() -> result<handle<channel>, error>;
 	@op(7) listen:  func(port: u16) -> result<handle<channel>, error>;
 	@op(8) sockets: func() -> result<list<sock-info>, error>;
+	@op(9) sntp:    func(server: ipv4-addr) -> result<u64, error>;
 }
 
 // A connected TCP socket, served on the channel `network.connect` hands back as a
@@ -259,4 +260,20 @@ record chunk {
 // each call yielding the next connection.
 interface listener {
 	@op(1) accept: func() -> result<handle<channel>, error>;
+}
+
+// A wall-clock instant: seconds since the Unix epoch (1970-01-01 UTC). The canonical
+// time object - the CLI renders it as ISO-8601 / epoch / human, all representations
+// of these seconds.
+record timestamp {
+	unix-secs: u64,
+}
+
+// TimeService: the wall clock. `now` returns the current UTC instant, computed as the
+// monotonic clock plus an offset disciplined at boot from the RTC and an SNTP query.
+// The offset is set only by TimeService's own RTC/NTP logic (it alone holds the
+// network capability it needs) - there is no client-facing "set the clock" op, so no
+// ambient authority can move wall time.
+interface time {
+	@op(1) now: func() -> result<timestamp, error>;
 }

@@ -36,10 +36,14 @@ const GATEWAY_IP: Ipv4Addr = Ipv4Addr([10, 0, 2, 2]);
 const DNS_SERVER: Ipv4Addr = Ipv4Addr([10, 0, 2, 3]);
 // The UDP source port we send DNS queries from.
 const DNS_SRC_PORT: u16 = 0x9876;
+// The UDP source port we send SNTP queries from.
+const NTP_SRC_PORT: u16 = 0x7b7b;
 
 // How long a `ping` waits for its reply, and DNS for its response (100 Hz ticks).
 const PING_TIMEOUT_TICKS: u64 = 50;
 const DNS_TIMEOUT_TICKS: u64 = 300;
+// How long an SNTP query waits for its reply (100 Hz ticks).
+const NTP_TIMEOUT_TICKS: u64 = 300;
 // How long DHCP waits for each of the OFFER and the ACK before falling back to the
 // static configuration (100 Hz ticks).
 const DHCP_TIMEOUT_TICKS: u64 = 200;
@@ -682,6 +686,17 @@ impl network::Service for Net<'_> {
 	fn sockets(&mut self) -> Result<Vec<SockInfo>, Error> {
 		Ok(self.stack.sockets().into_iter().map(to_sock_info).collect())
 	}
+
+	// Query an NTP server for the wall-clock time, returning the Unix epoch seconds from
+	// its reply. The TimeService combines this with the monotonic clock and the RTC.
+	fn sntp(&mut self, server: WireIp) -> Result<u64, Error> {
+		unsafe {
+			match do_sntp(from_wire(&server), self.frames, self.stack, self.rx, self.tx) {
+				Some(unix) => Ok(unix),
+				None => Err(Error::Again),
+			}
+		}
+	}
 }
 
 // The state the typed `socket` service operates on for one connected socket: the
@@ -857,6 +872,33 @@ unsafe fn do_dns(name: &[u8], frames: u64, stack: &mut Stack, txn: &mut u16, rx:
 			}
 			if let Event::DnsReply(addr) = pump(frames, stack, rx, tx) {
 				return Some(addr);
+			}
+		}
+		None
+	}
+}
+
+// Send an SNTP request to `server` and return the Unix epoch seconds from its reply,
+// or None on timeout / no route. A one-shot UDP query/response, mirroring do_dns.
+unsafe fn do_sntp(server: Ipv4Addr, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Option<u64> {
+	unsafe {
+		let hop: Ipv4Addr = stack.next_hop(server);
+		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
+			Some(m) => m,
+			None => return None,
+		};
+		let query: usize = stack.build_sntp_request(mac, server, NTP_SRC_PORT, tx);
+		if query == 0 {
+			return None;
+		}
+		send_frame(frames, &tx[..query]);
+		let deadline: u64 = clock() + NTP_TIMEOUT_TICKS;
+		while clock() < deadline {
+			if wait(frames, deadline) != 0 {
+				break;
+			}
+			if let Event::SntpReply(unix) = pump(frames, stack, rx, tx) {
+				return Some(unix);
 			}
 		}
 		None
