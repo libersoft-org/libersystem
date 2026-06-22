@@ -496,7 +496,7 @@ Result (multi-VT console done; size-reporting / resize from M35c still the only 
 
 ## M35e - Scrollback, selection, and clipboard
 
-- [ ] Per-VT scrollback: keep a history of scrolled-off lines and a scroll view (Shift+PageUp / PageDown) to read back, returning to the live screen on new input.
+- [x] Per-VT scrollback: keep a history of scrolled-off lines and a scroll view (Shift+PageUp / PageDown) to read back, returning to the live screen on new input.
 - [ ] Text selection: select a range by keyboard (and, once M35g lands, by mouse), highlighting it in the cell buffer.
 - [ ] A clipboard: copy the selection and paste it (a small ClipboardService, or the console holds it), with bracketed paste (`ESC [ ? 2004 h`) so a program can tell pasted text from typed text; OSC 52 for terminal-driven clipboard access.
 - Done when: each VT keeps scrollback the user can page through, text can be selected and copied / pasted, paste is bracketed, tests green.

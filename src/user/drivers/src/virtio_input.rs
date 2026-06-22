@@ -36,6 +36,8 @@ const KEY_RIGHT: u16 = 106;
 const KEY_END: u16 = 107;
 const KEY_DOWN: u16 = 108;
 const KEY_DELETE: u16 = 111;
+const KEY_PAGEUP: u16 = 104;
+const KEY_PAGEDOWN: u16 = 109;
 
 // Linux keycodes for the modifier keys (tracked across press/release, not emitted).
 const KEY_LEFTCTRL: u16 = 29;
@@ -192,6 +194,20 @@ unsafe fn feed_event(addr: u64, mods: &mut Mods) {
 		}
 		// 1 = press, 2 = autorepeat (both emit); 0 = release is ignored.
 		if value != 1 && value != 2 {
+			return;
+		}
+		// PageUp / PageDown: Shift pages the console's own scrollback (a private control
+		// byte the console intercepts); unshifted sends the standard ANSI sequence to the
+		// client. Collapsing the chord here means the console needs no input escape parser.
+		if code == KEY_PAGEUP || code == KEY_PAGEDOWN {
+			if mods.shift {
+				console_feed(if code == KEY_PAGEUP { 0x1e } else { 0x1f });
+			} else {
+				let seq: &[u8] = if code == KEY_PAGEUP { b"\x1b[5~" } else { b"\x1b[6~" };
+				for &b in seq {
+					console_feed(b);
+				}
+			}
 			return;
 		}
 		// Navigation keys (arrows / Home / End / Delete) carry no ASCII glyph; emit the

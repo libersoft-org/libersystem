@@ -31,6 +31,12 @@ const SCALE: usize = 2;
 const CELL_W: usize = FONT_W * SCALE;
 const CELL_H: usize = FONT_H * SCALE;
 
+// Per-VT scrollback: rows that scroll off the top of the primary screen are kept in a
+// fixed ring so the user can page back through them (Shift+PageUp / PageDown). 100 rows
+// ~= two screenfuls; the ring is allocated once per VT (deterministic memory: at the
+// 4-VT cap this plus the cell grids stays within the rt 1 MiB heap).
+const SCROLLBACK_ROWS: usize = 100;
+
 // Light-grey on near-black, matching the kernel console's boot-log colours.
 const FG: (u8, u8, u8) = (0xc8, 0xc8, 0xc8);
 const BG: (u8, u8, u8) = (0x0a, 0x0a, 0x12);
@@ -106,13 +112,18 @@ struct Term {
 	alt_active: bool,
 	dirty: Vec<bool>,
 	last_caret: Option<(usize, usize)>,
+	scrollback: Vec<Cell>,
+	sb_cap: usize,
+	sb_head: usize,
+	sb_len: usize,
+	view_offset: usize,
 }
 
 impl Term {
 	fn new(addr: u64, fb: &Framebuffer) -> Term {
 		let cols = fb.width as usize / CELL_W;
 		let rows = fb.height as usize / CELL_H;
-		let mut t = Term { addr, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), fg: 0, bg: 0, palette: [0; 16], cur_fg: 0, cur_bg: 0, cur_underline: false, fg_idx: None, bg_idx: None, bold: false, underline: false, reverse: false, saved_fg_idx: None, saved_bg_idx: None, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, primary: Vec::new(), alt: Vec::new(), alt_active: false, dirty: Vec::new(), last_caret: None };
+		let mut t = Term { addr, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), fg: 0, bg: 0, palette: [0; 16], cur_fg: 0, cur_bg: 0, cur_underline: false, fg_idx: None, bg_idx: None, bold: false, underline: false, reverse: false, saved_fg_idx: None, saved_bg_idx: None, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, primary: Vec::new(), alt: Vec::new(), alt_active: false, dirty: Vec::new(), last_caret: None, scrollback: Vec::new(), sb_cap: 0, sb_head: 0, sb_len: 0, view_offset: 0 };
 		t.fg = t.pack(FG.0, FG.1, FG.2);
 		t.bg = t.pack(BG.0, BG.1, BG.2);
 		for (i, &(r, g, b)) in ANSI_PALETTE.iter().enumerate() {
@@ -124,6 +135,8 @@ impl Term {
 		t.primary = alloc::vec![blank; cols * rows];
 		t.alt = alloc::vec![blank; cols * rows];
 		t.dirty = alloc::vec![true; cols * rows];
+		t.scrollback = alloc::vec![blank; SCROLLBACK_ROWS * cols];
+		t.sb_cap = SCROLLBACK_ROWS;
 		t
 	}
 
@@ -154,11 +167,7 @@ impl Term {
 
 	// The active cell buffer: the alternate screen while it is up, else the primary.
 	fn cells(&self) -> &[Cell] {
-		if self.alt_active {
-			&self.alt
-		} else {
-			&self.primary
-		}
+		if self.alt_active { &self.alt } else { &self.primary }
 	}
 
 	// A blank cell in the current background (so erase/scroll paint the SGR bg).
@@ -207,7 +216,12 @@ impl Term {
 
 	// Paint one cell from the grid to the framebuffer.
 	fn draw_cell(&self, col: usize, row: usize) {
-		let cell = self.cells()[row * self.cols + col];
+		self.draw_cell_at(col, row, self.cells()[row * self.cols + col]);
+	}
+
+	// Paint a given cell value at (col, row) - used by the live flush (reading the grid)
+	// and the scrollback view flush (reading the scrollback ring).
+	fn draw_cell_at(&self, col: usize, row: usize, cell: Cell) {
 		let base = (cell.glyph as usize) * FONT_H;
 		let x0 = col * CELL_W;
 		let y0 = row * CELL_H;
@@ -246,6 +260,10 @@ impl Term {
 	// Push the changed cells to the framebuffer, then draw the caret. Called once per
 	// output batch: many bytes edit the grid, one flush paints it (double buffering).
 	fn flush(&mut self) {
+		if self.view_offset > 0 {
+			self.flush_view();
+			return;
+		}
 		if let Some((c, r)) = self.last_caret {
 			let idx = r * self.cols + c;
 			if idx < self.dirty.len() {
@@ -266,6 +284,80 @@ impl Term {
 			self.last_caret = Some((self.col, self.row));
 		} else {
 			self.last_caret = None;
+		}
+	}
+
+	// Copy primary screen row `screen_row` into the scrollback ring (oldest first); the
+	// oldest row is dropped once the ring is full.
+	fn push_scrollback(&mut self, screen_row: usize) {
+		if self.sb_cap == 0 {
+			return;
+		}
+		let cols = self.cols;
+		let dst = ((self.sb_head + self.sb_len) % self.sb_cap) * cols;
+		let src = screen_row * cols;
+		for col in 0..cols {
+			self.scrollback[dst + col] = self.primary[src + col];
+		}
+		if self.sb_len < self.sb_cap {
+			self.sb_len += 1;
+		} else {
+			self.sb_head = (self.sb_head + 1) % self.sb_cap;
+		}
+	}
+
+	// The cell shown at viewport (col, row) for the current scrollback view offset: a
+	// scrollback row while the viewport reaches above the live screen, else a live cell.
+	fn view_cell(&self, col: usize, row: usize) -> Cell {
+		let g = (self.sb_len - self.view_offset) + row;
+		if g < self.sb_len {
+			let ring = (self.sb_head + g) % self.sb_cap;
+			self.scrollback[ring * self.cols + col]
+		} else {
+			self.primary[(g - self.sb_len) * self.cols + col]
+		}
+	}
+
+	// Repaint the whole screen from the scrollback view (no caret while scrolled back).
+	fn flush_view(&mut self) {
+		for row in 0..self.rows {
+			for col in 0..self.cols {
+				let cell = self.view_cell(col, row);
+				self.draw_cell_at(col, row, cell);
+			}
+		}
+		self.last_caret = None;
+	}
+
+	// Page the scrollback view up (toward older lines) by one screen. A no-op on the
+	// alternate screen or with no history.
+	fn scroll_view_up(&mut self) {
+		if self.alt_active || self.sb_len == 0 {
+			return;
+		}
+		let page = self.rows.saturating_sub(1).max(1);
+		self.view_offset = (self.view_offset + page).min(self.sb_len);
+	}
+
+	// Page the scrollback view down (toward the live screen) by one screen; on reaching the
+	// live screen the whole grid is marked dirty so the next flush repaints it.
+	fn scroll_view_down(&mut self) {
+		let page = self.rows.saturating_sub(1).max(1);
+		let new = self.view_offset.saturating_sub(page);
+		if new == 0 && self.view_offset > 0 {
+			self.mark_all_dirty();
+		}
+		self.view_offset = new;
+	}
+
+	// Snap back to the live screen; returns whether the view actually moved.
+	fn snap_live(&mut self) -> bool {
+		if self.view_offset > 0 {
+			self.view_offset = 0;
+			self.mark_all_dirty();
+			true
+		} else {
+			false
 		}
 	}
 
@@ -311,6 +403,18 @@ impl Term {
 	}
 
 	fn scroll_up(&mut self, n: usize) {
+		// Lines that scroll off the top of the full primary screen go to scrollback (not
+		// when a program set a scroll region, nor on the alternate screen). A held scroll
+		// view is nudged up by the same amount so its content stays anchored.
+		if !self.alt_active && self.scroll_top == 0 {
+			let n = n.min(self.rows);
+			for i in 0..n {
+				self.push_scrollback(i);
+			}
+			if self.view_offset > 0 {
+				self.view_offset = (self.view_offset + n).min(self.sb_len);
+			}
+		}
 		self.region_up(self.scroll_top, self.scroll_bottom, n);
 	}
 
@@ -464,11 +568,7 @@ impl Term {
 	fn param(&self, i: usize, default: usize) -> usize {
 		if i <= self.nparams {
 			let v = self.params[i] as usize;
-			if v == 0 {
-				default
-			} else {
-				v
-			}
+			if v == 0 { default } else { v }
 		} else {
 			default
 		}
@@ -700,6 +800,7 @@ impl Term {
 		}
 		self.save_cursor();
 		self.alt_active = true;
+		self.view_offset = 0;
 		let blank = self.blank();
 		for c in self.alt.iter_mut() {
 			*c = blank;
@@ -729,6 +830,9 @@ impl Term {
 		self.scroll_top = 0;
 		self.scroll_bottom = self.rows.saturating_sub(1);
 		self.alt_active = false;
+		self.view_offset = 0;
+		self.sb_head = 0;
+		self.sb_len = 0;
 		self.recompute_colors();
 		self.clear();
 	}
@@ -792,6 +896,12 @@ const NVT: usize = 4;
 // sequences, so single control bytes are the unambiguous, unobtrusive switch keys.
 const CHORD_NEW: u8 = 0x0e;
 const CHORD_NEXT: u8 = 0x1d;
+
+// Shift+PageUp / Shift+PageDown: the virtio-input driver collapses each to a single
+// private byte (0x1e / 0x1f, which its layout never produces otherwise), so the console
+// pages the foreground VT's scrollback view without a multi-byte input parser.
+const CHORD_SCROLL_UP: u8 = 0x1e;
+const CHORD_SCROLL_DOWN: u8 = 0x1f;
 
 // One virtual terminal: its render state (a cell grid; None when headless) and the
 // service end of the console channel its shell writes output to and reads keys from.
@@ -953,7 +1063,13 @@ unsafe fn handle_keys(console: &mut Console, keys: &[u8]) {
 				create_vt(console);
 			} else if b == CHORD_NEXT {
 				switch_next(console);
+			} else if b == CHORD_SCROLL_UP {
+				scroll_fg(console, true);
+			} else if b == CHORD_SCROLL_DOWN {
+				scroll_fg(console, false);
 			} else {
+				// any other keystroke returns the foreground VT to its live screen first.
+				snap_fg_live(console);
 				send_blocking(console.vts[console.fg].client, &[b], 0);
 			}
 		}
@@ -982,6 +1098,28 @@ unsafe fn switch_next(console: &mut Console) {
 	}
 	console.fg = (console.fg + 1) % console.vts.len();
 	repaint(console);
+}
+
+// Page the foreground VT's scrollback view up (older) or down (newer) and repaint it.
+fn scroll_fg(console: &mut Console, up: bool) {
+	if let Some(t) = console.vts[console.fg].term.as_mut() {
+		if up {
+			t.scroll_view_up();
+		} else {
+			t.scroll_view_down();
+		}
+		t.flush();
+	}
+}
+
+// Return the foreground VT to its live screen if it was scrolled back, so typing always
+// brings the cursor row back into view.
+fn snap_fg_live(console: &mut Console) {
+	if let Some(t) = console.vts[console.fg].term.as_mut() {
+		if t.snap_live() {
+			t.flush();
+		}
+	}
 }
 
 // A VT's shell exited (its console channel closed): drop the VT and its connection. If it
