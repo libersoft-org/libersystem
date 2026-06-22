@@ -147,6 +147,15 @@ fn init_framebuffer() {
 	console::init(console::FbInfo { addr: fb.addr(), width: fb.width() as usize, height: fb.height() as usize, pitch: fb.pitch() as usize, bytes_per_pixel: fb.bpp() as usize / 8, red_shift: fb.red_mask_shift(), red_size: fb.red_mask_size(), green_shift: fb.green_mask_shift(), green_size: fb.green_mask_size(), blue_shift: fb.blue_mask_shift(), blue_size: fb.blue_mask_size() });
 }
 
+// The boot framebuffer's virtual base + geometry, for the framebuffer_map syscall to
+// hand the display to a userspace ConsoleService. Re-queries the Limine response
+// (it is 'static), or None if there is no framebuffer (headless / no video mode).
+pub fn framebuffer_geometry() -> Option<(u64, abi::Framebuffer)> {
+	let fb = FRAMEBUFFER_REQUEST.get_response()?.framebuffers().next()?;
+	let geom = abi::Framebuffer { width: fb.width() as u32, height: fb.height() as u32, pitch: fb.pitch() as u32, bytes_per_pixel: (fb.bpp() / 8) as u32, red_shift: fb.red_mask_shift(), red_size: fb.red_mask_size(), green_shift: fb.green_mask_shift(), green_size: fb.green_mask_size(), blue_shift: fb.blue_mask_shift(), blue_size: fb.blue_mask_size(), _pad: [0; 2] };
+	Some((fb.addr() as u64, geom))
+}
+
 // Wake the application processors and wait for every core to report in. Runs
 // before the test/boot split so SMP is up for both paths.
 fn init_smp() {

@@ -13,6 +13,8 @@
 
 use core::fmt::{self, Write};
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::sync::SpinLock;
 
 // Public-domain 8x8 bitmap font (dhepper/font8x8, basic latin U+0000..U+007F):
@@ -106,6 +108,11 @@ struct Console {
 unsafe impl Send for Console {}
 
 static CONSOLE: SpinLock<Option<Console>> = SpinLock::new(None);
+
+// Set once a userspace ConsoleService maps the framebuffer and takes over the
+// display: the kernel console then stops drawing (boot-log output still reaches the
+// serial port, but the framebuffer belongs to ConsoleService).
+static DISABLED: AtomicBool = AtomicBool::new(false);
 
 impl Console {
 	fn new(info: FbInfo) -> Self {
@@ -378,6 +385,9 @@ pub fn init(info: FbInfo) {
 // Best-effort: try_lock means a print that interrupts a held lock (a panic
 // mid-print) skips the console rather than deadlocking - serial still shows it.
 pub fn write_fmt(args: fmt::Arguments<'_>) {
+	if DISABLED.load(Ordering::Relaxed) {
+		return;
+	}
 	if let Some(mut guard) = CONSOLE.try_lock() {
 		if let Some(console) = guard.as_mut() {
 			let _ = console.write_fmt(args);
@@ -389,6 +399,9 @@ pub fn write_fmt(args: fmt::Arguments<'_>) {
 // last toggle or output. The interactive loop calls this every round with the
 // monotonic tick; output resets the timer so the caret stays solid while typing.
 pub fn blink_tick(now: u64) {
+	if DISABLED.load(Ordering::Relaxed) {
+		return;
+	}
 	if let Some(mut guard) = CONSOLE.try_lock() {
 		if let Some(console) = guard.as_mut() {
 			if now.wrapping_sub(console.last_blink) >= BLINK_TICKS {
@@ -398,4 +411,17 @@ pub fn blink_tick(now: u64) {
 			}
 		}
 	}
+}
+
+// Hand the framebuffer to a userspace ConsoleService: the kernel console stops
+// drawing (its boot-log job is done; serial output continues). Called by the
+// framebuffer_map syscall when ConsoleService maps the display.
+pub fn disable() {
+	DISABLED.store(true, Ordering::Relaxed);
+}
+
+// Whether the framebuffer has been handed to userspace (so a second framebuffer_map
+// is refused - the first mapper owns the display).
+pub fn is_disabled() -> bool {
+	DISABLED.load(Ordering::Relaxed)
 }

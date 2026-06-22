@@ -44,7 +44,7 @@ use crate::sched;
 // kernel/userspace ABI: defined once in the abi crate (the single source of
 // truth) and re-exported here so the rest of the kernel keeps referring to them
 // as `syscall::SYS_*` / `syscall::ERR_*` / `syscall::sys_is_err`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_INTERRUPT_ACQUIRE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_RANDOM_GET, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD, sys_is_err};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_INTERRUPT_ACQUIRE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_RANDOM_GET, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD, sys_is_err};
 
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. Defined in `abi` (the
@@ -153,6 +153,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_DEVICE_INTERRUPT_ACQUIRE => sys_device_interrupt_acquire(a0),
 		SYS_INTERRUPT_ACK => sys_interrupt_ack(a0),
 		SYS_CONSOLE_FEED => sys_console_feed(a0),
+		SYS_FRAMEBUFFER_MAP => sys_framebuffer_map(a0, a1),
 		SYS_OBJECT_PROPERTY_SET => sys_object_property_set(a0, a1, a2, a3),
 		SYS_PROCESS_CREATE => sys_process_create(),
 		SYS_PROCESS_LOAD => sys_process_load(a0, a1, a2),
@@ -255,6 +256,46 @@ fn sys_dma_buffer_phys(handle: u64, offset: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	(frames[page] + offset % PAGE_SIZE) as i64
+}
+
+// Map the boot framebuffer into the caller's address space and write its geometry
+// into the caller's buffer, returning the mapped virtual base; the kernel console
+// then stops drawing (the display belongs to the caller). Once-only: a second call
+// (after the display is handed out) returns ERR_INVALID. Intended for a single
+// userspace ConsoleService; capability-gating it is a later (M38) hardening.
+fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64) -> i64 {
+	let size = core::mem::size_of::<abi::Framebuffer>() as u64;
+	if buf_len < size || !user_buf_ok(buf_ptr, size) {
+		return ERR_INVALID;
+	}
+	if crate::console::is_disabled() {
+		return ERR_INVALID;
+	}
+	let (addr, geom) = match crate::framebuffer_geometry() {
+		Some(t) => t,
+		None => return ERR_INVALID,
+	};
+	let base_phys = match arch::paging::translate(addr) {
+		Some(p) => p,
+		None => return ERR_INVALID,
+	};
+	let total = geom.height as u64 * geom.pitch as u64;
+	let pages = total.div_ceil(PAGE_SIZE);
+	let user = arch::percpu::in_user_syscall();
+	let base = if user { alloc_user_vrange(total) } else { alloc_kernel_vrange(total) };
+	let mut flags = arch::paging::PRESENT | arch::paging::WRITABLE;
+	if user {
+		flags |= arch::paging::USER;
+	}
+	for i in 0..pages {
+		arch::paging::map_page(base + i * PAGE_SIZE, base_phys + i * PAGE_SIZE, flags);
+	}
+	unsafe {
+		(buf_ptr as *mut abi::Framebuffer).write_unaligned(geom);
+	}
+	// Hand the display to the caller: the kernel console stops drawing to it.
+	crate::console::disable();
+	base as i64
 }
 
 // Map a DeviceMemory's physical MMIO region into the caller's address space,

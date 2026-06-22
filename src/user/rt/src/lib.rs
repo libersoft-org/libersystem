@@ -273,7 +273,11 @@ pub unsafe fn memory_object_create(size: u64) -> i64 {
 pub unsafe fn map_object(handle: u64) -> Option<u64> {
 	unsafe {
 		let base: u64 = syscall(SYS_MEMORY_MAP, handle, 0, 0, 0);
-		if sys_is_err(base) { None } else { Some(base) }
+		if sys_is_err(base) {
+			None
+		} else {
+			Some(base)
+		}
 	}
 }
 
@@ -331,7 +335,11 @@ pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
 		let mut info: ObjectInfo = ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0 };
 		let size: u64 = core::mem::size_of::<ObjectInfo>() as u64;
 		let ok: i64 = syscall(SYS_OBJECT_INFO_GET, handle, &mut info as *mut ObjectInfo as u64, size, 0) as i64;
-		if ok == 1 { Some(info) } else { None }
+		if ok == 1 {
+			Some(info)
+		} else {
+			None
+		}
 	}
 }
 
@@ -392,6 +400,14 @@ pub unsafe fn dma_buffer_map(handle: u64) -> i64 {
 // its device for DMA.
 pub unsafe fn dma_buffer_phys(handle: u64) -> u64 {
 	unsafe { syscall(SYS_DMA_BUFFER_PHYS, handle, 0, 0, 0) }
+}
+
+// Map the boot framebuffer into this process and read its geometry into `fb`,
+// returning the mapped virtual base (the raw pixel buffer pointer), or a negative
+// error. Hands the display to the caller - the kernel console stops drawing to it -
+// so only the ConsoleService should call it (once; a second call fails).
+pub unsafe fn framebuffer_map(fb: &mut Framebuffer) -> i64 {
+	unsafe { syscall(SYS_FRAMEBUFFER_MAP, fb as *mut Framebuffer as u64, core::mem::size_of::<Framebuffer>() as u64, 0, 0) as i64 }
 }
 
 // The physical address backing byte `offset` of a DmaBuffer. A buffer larger than

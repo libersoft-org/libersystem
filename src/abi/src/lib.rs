@@ -70,6 +70,9 @@ pub const SYS_WAIT_ANY: u64 = 42;
 // Read the hardware real-time clock as a Unix timestamp (seconds since the epoch,
 // UTC). Raw mechanism; the userspace TimeService is the wall-clock policy.
 pub const SYS_CLOCK_RTC: u64 = 43;
+// Map the boot framebuffer into the caller and report its geometry, handing the
+// display to a userspace ConsoleService (the kernel console stops drawing to it).
+pub const SYS_FRAMEBUFFER_MAP: u64 = 44;
 
 // The ring-3 stack top an ELF-loaded process runs on: the kernel's loader maps a
 // stack just below this address, and a userspace spawner passes it to
@@ -114,6 +117,26 @@ pub struct DeviceInfo {
 	pub notify_multiplier: u32,
 	pub isr_offset: u32,
 	pub device_offset: u32,
+}
+
+// The framebuffer geometry framebuffer_map writes into the caller's buffer (the
+// mapped virtual base is the syscall's return value): the pixel dimensions, the row
+// stride in bytes, the bytes per pixel, and the per-channel shift/size of the pixel
+// format. repr(C) so the kernel and a userspace ConsoleService agree byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Framebuffer {
+	pub width: u32,
+	pub height: u32,
+	pub pitch: u32,
+	pub bytes_per_pixel: u32,
+	pub red_shift: u8,
+	pub red_size: u8,
+	pub green_shift: u8,
+	pub green_size: u8,
+	pub blue_shift: u8,
+	pub blue_size: u8,
+	pub _pad: [u8; 2],
 }
 
 // The introspection view object_info_get returns for a handle: the identity (koid)

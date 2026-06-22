@@ -205,6 +205,40 @@ unsafe fn next_table_walk(table: *mut u64, index: usize) -> Option<u64> {
 	}
 }
 
+// Translate a virtual address to its physical address in the active address space,
+// or None if unmapped. Walks the 4-level table and handles a huge-page leaf at the
+// PDPT (1 GiB) or PD (2 MiB) level - Limine often maps the framebuffer with 2 MiB
+// pages, so a 4 KiB-only walk would misread it. The returned phys carries the
+// in-page offset.
+pub fn translate(virt: u64) -> Option<u64> {
+	const PS: u64 = 1 << 7;
+	unsafe {
+		let pml4 = table_ptr(active_pml4_phys());
+		let pdpt = table_ptr(next_table_walk(pml4, table_index(virt, 39))?);
+		let pdpt_e = pdpt.add(table_index(virt, 30)).read_volatile();
+		if pdpt_e & PRESENT == 0 {
+			return None;
+		}
+		if pdpt_e & PS != 0 {
+			return Some((pdpt_e & 0x000f_ffff_c000_0000) | (virt & 0x3fff_ffff));
+		}
+		let pd = table_ptr(pdpt_e & ADDR_MASK);
+		let pd_e = pd.add(table_index(virt, 21)).read_volatile();
+		if pd_e & PRESENT == 0 {
+			return None;
+		}
+		if pd_e & PS != 0 {
+			return Some((pd_e & 0x000f_ffff_ffe0_0000) | (virt & 0x001f_ffff));
+		}
+		let pt = table_ptr(pd_e & ADDR_MASK);
+		let pt_e = pt.add(table_index(virt, 12)).read_volatile();
+		if pt_e & PRESENT == 0 {
+			return None;
+		}
+		Some((pt_e & ADDR_MASK) | (virt & 0xfff))
+	}
+}
+
 // Invalidate the TLB entry for a single page.
 unsafe fn invlpg(virt: u64) {
 	unsafe {
