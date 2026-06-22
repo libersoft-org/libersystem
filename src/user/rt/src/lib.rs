@@ -17,6 +17,7 @@ extern crate alloc;
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 // Syscall numbers, error codes, and capability rights bits all come from the
 // shared abi crate (the single source of truth), re-exported so the programs that
@@ -83,10 +84,28 @@ pub unsafe fn yield_now() {
 // ring-3 program has for now (a real console service arrives with virtio-console).
 pub unsafe fn print(bytes: &[u8]) {
 	unsafe {
+		// If a stdout console channel is set, the program's terminal output goes there
+		// (to the userspace ConsoleService, which renders it and mirrors it to serial)
+		// as one message; otherwise it falls back to the kernel debug port byte by byte.
+		let out: u64 = STDOUT.load(Ordering::Relaxed);
+		if out != 0 && send_blocking(out, bytes, 0) {
+			return;
+		}
 		for &b in bytes {
 			syscall(SYS_DEBUG_WRITE, b as u64, 0, 0, 0);
 		}
 	}
+}
+
+// The console channel a program's `print` output is routed to (the ConsoleService
+// end), or 0 for the kernel debug port. Set by `set_stdout`; inherited by spawned
+// programs through their bootstrap.
+static STDOUT: AtomicU64 = AtomicU64::new(0);
+
+// Route this program's `print` output to a console channel (a ConsoleService client),
+// instead of the kernel debug port. 0 restores the debug-port fallback.
+pub fn set_stdout(channel: u64) {
+	STDOUT.store(channel, Ordering::Relaxed);
 }
 
 // Block until the object behind `handle` becomes ready (a channel readable, an

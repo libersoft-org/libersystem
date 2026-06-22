@@ -15,7 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, config, device, log, network, process, time, volume};
+use proto::system::{config, device, log, network, process, time, volume, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -42,6 +42,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let cfgsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONFIG") }.unwrap_or_else(|| exit());
 	let netsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NET") }.unwrap_or_else(|| exit());
 	let timesvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"TIME") }.unwrap_or_else(|| exit());
+	// The console channel to ConsoleService: the shell writes its output to it (routed
+	// via stdout) and reads its keystrokes from it. The userspace terminal renders the
+	// output and forwards the input, so the shell talks to the console, not the kernel.
+	let console: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONSOLE") }.unwrap_or_else(|| exit());
+	set_stdout(console);
 	// The init package lets the shell spawn foreground programs (echo, later the net
 	// tools); the archive is mapped 'static and parsed once.
 	let (_pkg_handle, archive): (u64, &'static [u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| exit());
@@ -59,28 +64,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 4. become the interactive console and run the read-eval-print loop.
 	unsafe {
-		repl(storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, &package, &mut buf);
+		repl(console, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, &package, &mut buf);
 	}
 	exit();
 }
 
-// Register a console channel with the kernel and run the read-eval-print loop. The
-// kernel feeds keystrokes on the channel; an `Editor` line-edits them (a movable
-// cursor, mid-line insert/delete, command history) and we dispatch each completed
-// line. Returns when the user types `exit`.
-unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package, buf: &mut [u8]) {
+// Run the read-eval-print loop over the console channel from ConsoleService: it
+// forwards keystrokes (which an `Editor` line-edits - a movable cursor, mid-line
+// insert/delete, command history) and renders our output (routed there via stdout).
+// Returns when the user types `exit`.
+unsafe fn repl(console: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
-		// The kernel sends console input on `feed`; we receive it on `input`.
-		let (feed, input): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return,
-		};
-		if sys_is_err(syscall(SYS_CONSOLE_ATTACH, feed, 0, 0, 0)) {
-			return;
-		}
 		let mut ed: Editor = Editor::new();
 		loop {
-			let n: usize = match recv_blocking(input, buf) {
+			let n: usize = match recv_blocking(console, buf) {
 				Received::Message { len, .. } => len,
 				Received::Closed => return,
 			};
