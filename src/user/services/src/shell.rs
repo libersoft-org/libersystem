@@ -140,6 +140,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  tcp <ip> <port>  open a TCP connection and probe it (HTTP GET)\n");
 			print(b"  nc <ip> <port>   open a raw TCP connection (optional request to send)\n");
 			print(b"  arp              show the ARP / neighbor cache\n");
+			print(b"  ss | netstat     list the live sockets\n");
+			print(b"  httpd            serve HTTP on port 80 (background)\n");
 			print(b"  exit             stop the shell and halt\n");
 			return false;
 		}
@@ -211,8 +213,16 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			spawn_net_tool(netsvc, package, b"arp", b"");
 			return false;
 		}
+		if line == b"ss" || line == b"netstat" {
+			spawn_net_tool(netsvc, package, b"ss", b"");
+			return false;
+		}
 		if let Some(rest) = line.strip_prefix(b"nc ") {
 			spawn_net_tool(netsvc, package, b"nc", trim(rest));
+			return false;
+		}
+		if line == b"httpd" {
+			spawn_net_tool_bg(netsvc, package, b"httpd");
 			return false;
 		}
 		if line == b"echo" {
@@ -279,6 +289,36 @@ unsafe fn exec(package: &Package, name: &[u8], args: &[u8], cap: u64) {
 	}
 }
 
+// Spawn a standalone program `name` as a background child (no wait): hand it `args`
+// and an optional capability over a bootstrap channel, then detach. Unlike `exec`, the
+// shell does not wait for completion - the child runs on its own until it exits (e.g.
+// a background server running until its service channel closes). The child receives
+// its arguments + capability in its first recv before we drop our end.
+unsafe fn exec_bg(package: &Package, name: &[u8], args: &[u8], cap: u64) {
+	unsafe {
+		let elf: &[u8] = match package.lookup(name) {
+			Some(e) => e,
+			None => {
+				print(name);
+				print(b": program not found\n");
+				return;
+			}
+		};
+		let (parent, child): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return,
+		};
+		if spawn(elf, child) < 0 {
+			print(name);
+			print(b": could not start\n");
+			close(parent);
+			return;
+		}
+		send_blocking(parent, args, cap);
+		close(parent);
+	}
+}
+
 // Spawn a network tool as a foreground program, giving it its OWN NetworkService
 // client channel: `network.open` mints a fresh client channel, which we transfer to
 // the tool alongside its arguments. Each tool talks to NetworkService over its own
@@ -301,6 +341,29 @@ unsafe fn spawn_net_tool(netsvc: u64, package: &Package, name: &[u8], args: &[u8
 			}
 		};
 		exec(package, name, args, tool_netsvc);
+	}
+}
+
+// Spawn a network tool as a background program (no wait), giving it its OWN
+// NetworkService client channel - like `spawn_net_tool` but detached, for a
+// long-running server (httpd) that should not block the interactive shell.
+unsafe fn spawn_net_tool_bg(netsvc: u64, package: &Package, name: &[u8]) {
+	unsafe {
+		if netsvc == 0 {
+			print(name);
+			print(b": no network interface\n");
+			return;
+		}
+		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
+		let tool_netsvc: u64 = match client.open() {
+			Some(Ok(h)) => h,
+			_ => {
+				print(name);
+				print(b": network service unavailable\n");
+				return;
+			}
+		};
+		exec_bg(package, name, b"", tool_netsvc);
 	}
 }
 

@@ -23,9 +23,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use rt::*;
 
-use crate::net::{DHCP_ACK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, Stack};
+use crate::net::{DHCP_ACK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, SockEntry, SockEntryState, Stack};
 use proto::codec::Buffer;
-use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingStatus, TcpRequest, network, socket};
+use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingStatus, SockInfo, SockState, TcpRequest, listener, network, socket};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -64,9 +64,16 @@ const REPLY_MAX: usize = 1024;
 // to drain a larger response); kept small for the 16 KiB user stack.
 const SOCK_RECV_MAX: usize = 512;
 // The most client channels we serve at once: the shell plus one per spawned net
-// tool. Bounded so the wait set (frames + clients + socket) stays within the
-// kernel's wait_any limit of 8.
+// tool. Bounded so the wait set (frames + clients + sockets) stays within the
+// kernel's wait_any limit (16).
 const MAX_CLIENTS: usize = 4;
+// The most sockets open at once - the stack's connection pool size, so each accepted
+// or connected socket has a slot. frames(1) + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN <=
+// wait_any(16).
+const MAX_SOCKS: usize = 4;
+// The most listening sockets open at once (passive open); matches the stack's listen
+// table.
+const MAX_LISTEN: usize = 2;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -165,127 +172,131 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 		// (clients[0]) plus any minted by `network.open` for a spawned net tool.
 		let mut clients: [u64; MAX_CLIENTS] = [0u64; MAX_CLIENTS];
 		clients[0] = client;
-		// The server end of the one active socket (0 = none). The stack has a single
-		// TCP connection, so at most one socket is open at a time.
-		let mut sock: u64 = 0;
-		// The producer end of the active received-data stream (0 = none) and its frame
-		// sequence counter: the loop frames each newly received chunk onto it and closes
-		// it when the peer closes, marking end of stream.
-		let mut stream_prod: u64 = 0;
-		let mut stream_seq: u32 = 0;
+		// The active sockets (chan 0 = empty slot). Each is handed out by `network.connect`
+		// (later `listener.accept`): its channel, the stack connection index it drives, and
+		// its received-data stream producer (0 = none) plus that stream's frame sequence.
+		// The serve loop waits on every active socket channel at once.
+		let mut socks: [SockSlot; MAX_SOCKS] = [SockSlot { chan: 0, ci: 0, stream_prod: 0, stream_seq: 0 }; MAX_SOCKS];
+		// The active listeners (chan 0 = empty), each from `network.listen`: its channel,
+		// the port it accepts on, and a deferred `accept` (the correlation id to answer
+		// once an inbound connection completes, if accept was called with none pending).
+		let mut listeners: [Listener; MAX_LISTEN] = [Listener { chan: 0, port: 0, pending_corr: 0, pending: false }; MAX_LISTEN];
 		loop {
-			// Build the wait set: the driver frame channel always, every active client
-			// channel, and the socket channel while one is open. `slot_of` maps a wait
-			// index back to its client slot.
-			let mut waits: [u64; 1 + MAX_CLIENTS + 1] = [0u64; 1 + MAX_CLIENTS + 1];
-			let mut slot_of: [usize; 1 + MAX_CLIENTS + 1] = [usize::MAX; 1 + MAX_CLIENTS + 1];
+			// Build the wait set: the driver frame channel always (index 0), every active
+			// client channel, then every active socket channel, then every listener. `kind`
+			// tags each wait index (0 = client, 1 = socket, 2 = listener) and `slot_of` maps
+			// it back to its slot.
+			let mut waits: [u64; 1 + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN] = [0u64; 1 + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN];
+			let mut kind: [u8; 1 + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN] = [0u8; 1 + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN];
+			let mut slot_of: [usize; 1 + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN] = [usize::MAX; 1 + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN];
 			waits[0] = frames;
 			let mut n: usize = 1;
-			let mut ci: usize = 0;
-			while ci < MAX_CLIENTS {
-				if clients[ci] != 0 {
-					waits[n] = clients[ci];
-					slot_of[n] = ci;
+			let mut i: usize = 0;
+			while i < MAX_CLIENTS {
+				if clients[i] != 0 {
+					waits[n] = clients[i];
+					kind[n] = 0;
+					slot_of[n] = i;
 					n += 1;
 				}
-				ci += 1;
+				i += 1;
 			}
-			let sock_idx: usize = if sock != 0 {
-				waits[n] = sock;
-				let i: usize = n;
-				n += 1;
-				i
-			} else {
-				usize::MAX
-			};
+			let mut i: usize = 0;
+			while i < MAX_SOCKS {
+				if socks[i].chan != 0 {
+					waits[n] = socks[i].chan;
+					kind[n] = 1;
+					slot_of[n] = i;
+					n += 1;
+				}
+				i += 1;
+			}
+			let mut i: usize = 0;
+			while i < MAX_LISTEN {
+				if listeners[i].chan != 0 {
+					waits[n] = listeners[i].chan;
+					kind[n] = 2;
+					slot_of[n] = i;
+					n += 1;
+				}
+				i += 1;
+			}
 			let ready: usize = wait_any(&waits[..n], 0) as usize;
 			if ready == 0 {
 				pump(frames, stack, &mut rx, &mut tx);
-				// Feed any newly received bytes to the active recv stream, and close the
-				// producer (signalling end of stream) once the peer closes or resets.
-				if stream_prod != 0 {
-					stream_prod = stream_pump(stack, &mut out, stream_prod, &mut stream_seq);
-					if stream_prod != 0 && (stack.tcp_peer_fin() || stack.tcp_aborted()) {
-						close(stream_prod);
-						stream_prod = 0;
+				// Feed any newly received bytes to each active recv stream, closing the
+				// producer (end of stream) once that connection's peer closes or resets.
+				let mut si: usize = 0;
+				while si < MAX_SOCKS {
+					if socks[si].chan != 0 && socks[si].stream_prod != 0 {
+						let ci: usize = socks[si].ci;
+						let prod: u64 = stream_pump(ci, stack, &mut out, socks[si].stream_prod, &mut socks[si].stream_seq);
+						socks[si].stream_prod = prod;
+						if prod != 0 && (stack.tcp_peer_fin(ci) || stack.tcp_aborted(ci)) {
+							close(prod);
+							socks[si].stream_prod = 0;
+						}
 					}
+					si += 1;
 				}
-			} else if ready == sock_idx {
-				match recv_blocking(sock, &mut req) {
-					Received::Message { len, handle } => {
-						let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
-						let mut closing: bool = false;
-						{
-							let mut svc: Sock = Sock { frames, stack: &mut *stack, tx: &mut tx[..], closing: &mut closing };
-							if op == socket::OP_RECV {
-								// OP_RECV opens the received-data stream out of band: mint a
-								// sub-channel, hand the consumer end back with the correlation
-								// id, then frame any already-buffered bytes onto the producer
-								// (the serve loop streams everything that arrives afterwards).
-								if let Some((corr, items)) = socket::recv_open(&mut svc, &req[..len]) {
-									if stream_prod != 0 {
-										close(stream_prod);
-										stream_prod = 0;
-									}
-									if let Some((producer, consumer)) = channel() {
-										send_blocking(sock, &corr.to_le_bytes(), consumer);
-										stream_seq = 0;
-										for item in &items {
-											if let Some(fl) = socket::recv_frame(stream_seq, item, &mut out) {
-												send_blocking(producer, &out[..fl], 0);
-												stream_seq += 1;
-											}
-										}
-										stream_prod = producer;
-									}
-								}
-							} else {
-								let mut reply_handle: u64 = 0;
-								if let Some(n2) = socket::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
-									send_blocking(sock, &out[..n2], reply_handle);
-								}
+				// Answer any deferred `accept`: a frame may have completed an inbound
+				// handshake, so a listener that was waiting for a connection gets one now.
+				let mut li: usize = 0;
+				while li < MAX_LISTEN {
+					if listeners[li].chan != 0 && listeners[li].pending {
+						if let Some(ci) = stack.take_accepted(listeners[li].port) {
+							if accept_handoff(listeners[li].chan, listeners[li].pending_corr, ci, &mut socks, stack) {
+								listeners[li].pending = false;
 							}
 						}
-						if closing {
-							if stream_prod != 0 {
-								close(stream_prod);
-								stream_prod = 0;
-							}
-							socket_teardown(frames, stack, &mut rx, &mut tx);
-							close(sock);
-							sock = 0;
-						}
 					}
-					// The client dropped its socket without calling close(): tear the
-					// connection down so the next `connect` starts clean.
-					Received::Closed => {
-						if stream_prod != 0 {
-							close(stream_prod);
-							stream_prod = 0;
-						}
-						socket_teardown(frames, stack, &mut rx, &mut tx);
-						close(sock);
-						sock = 0;
-					}
+					li += 1;
 				}
+			} else if kind[ready] == 1 {
+				serve_socket(&mut socks[slot_of[ready]], frames, stack, &mut rx, &mut tx, &mut out, &mut req);
+			} else if kind[ready] == 2 {
+				serve_listener(&mut listeners[slot_of[ready]], &mut socks, stack, &mut req);
 			} else {
 				// A client request on clients[slot_of[ready]]: dispatch the `network`
-				// interface. `open` may mint another client channel and `connect` may open
-				// the socket; a closed channel is dropped from the client set.
+				// interface. `open` may mint another client channel, `connect` may open a
+				// socket, `listen` a listener; a closed channel is dropped from the set.
 				let slot: usize = slot_of[ready];
 				let chan: u64 = clients[slot];
 				match recv_blocking(chan, &mut req) {
 					Received::Message { len, handle } => {
 						let mut new_sock: u64 = 0;
+						let mut new_sock_ci: usize = 0;
 						let mut new_client: u64 = 0;
-						let room: bool = first_empty(&clients).is_some();
-						let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], cur_sock: sock, new_sock: &mut new_sock, new_client: &mut new_client, clients_room: room };
-						let mut reply_handle: u64 = 0;
-						if let Some(n2) = network::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
-							send_blocking(chan, &out[..n2], reply_handle);
+						let mut new_listener: u64 = 0;
+						let mut new_listener_port: u16 = 0;
+						let client_room: bool = first_empty(&clients).is_some();
+						let sock_room: bool = first_empty_sock(&socks).is_some();
+						let listener_room: bool = first_empty_listener(&listeners).is_some();
+						{
+							let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], new_sock: &mut new_sock, new_sock_ci: &mut new_sock_ci, new_client: &mut new_client, new_listener: &mut new_listener, new_listener_port: &mut new_listener_port, sock_room, client_room, listener_room };
+							let mut reply_handle: u64 = 0;
+							if let Some(n2) = network::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
+								send_blocking(chan, &out[..n2], reply_handle);
+							}
 						}
 						if new_sock != 0 {
-							sock = new_sock;
+							match first_empty_sock(&socks) {
+								Some(si) => socks[si] = SockSlot { chan: new_sock, ci: new_sock_ci, stream_prod: 0, stream_seq: 0 },
+								None => {
+									socket_teardown(new_sock_ci, frames, stack, &mut rx, &mut tx);
+									stack.tcp_free(new_sock_ci);
+									close(new_sock);
+								}
+							}
+						}
+						if new_listener != 0 {
+							match first_empty_listener(&listeners) {
+								Some(li) => listeners[li] = Listener { chan: new_listener, port: new_listener_port, pending_corr: 0, pending: false },
+								None => {
+									stack.unlisten(new_listener_port);
+									close(new_listener);
+								}
+							}
 						}
 						if new_client != 0 {
 							match first_empty(&clients) {
@@ -304,25 +315,204 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 	}
 }
 
+// One active socket the serve loop multiplexes: the channel the `socket` interface is
+// served on, the stack connection index it drives, and its received-data stream (the
+// producer end, 0 = none, plus that stream's frame sequence).
+#[derive(Clone, Copy)]
+struct SockSlot {
+	chan: u64,
+	ci: usize,
+	stream_prod: u64,
+	stream_seq: u32,
+}
+
+// The first free socket slot, or None when the pool is full.
+fn first_empty_sock(socks: &[SockSlot; MAX_SOCKS]) -> Option<usize> {
+	let mut i: usize = 0;
+	while i < MAX_SOCKS {
+		if socks[i].chan == 0 {
+			return Some(i);
+		}
+		i += 1;
+	}
+	None
+}
+
+// Service one ready socket slot: decode the request and dispatch it to the `socket`
+// server for this slot's connection, or tear the slot down on close / peer-drop.
+// OP_RECV opens the received-data stream out of band (a fresh sub-channel handed back
+// with the correlation id, then any already-buffered bytes framed onto the producer;
+// the serve loop streams everything that arrives afterwards).
+unsafe fn serve_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], out: &mut [u8], req: &mut [u8]) {
+	unsafe {
+		let chan: u64 = slot.chan;
+		let ci: usize = slot.ci;
+		match recv_blocking(chan, req) {
+			Received::Message { len, handle } => {
+				let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
+				let mut closing: bool = false;
+				{
+					let mut svc: Sock = Sock { ci, frames, stack: &mut *stack, tx, closing: &mut closing };
+					if op == socket::OP_RECV {
+						if let Some((corr, items)) = socket::recv_open(&mut svc, &req[..len]) {
+							if slot.stream_prod != 0 {
+								close(slot.stream_prod);
+								slot.stream_prod = 0;
+							}
+							if let Some((producer, consumer)) = channel() {
+								send_blocking(chan, &corr.to_le_bytes(), consumer);
+								slot.stream_seq = 0;
+								for item in &items {
+									if let Some(fl) = socket::recv_frame(slot.stream_seq, item, out) {
+										send_blocking(producer, &out[..fl], 0);
+										slot.stream_seq += 1;
+									}
+								}
+								slot.stream_prod = producer;
+							}
+						}
+					} else {
+						let mut reply_handle: u64 = 0;
+						if let Some(n2) = socket::dispatch(&mut svc, &req[..len], handle, out, &mut reply_handle) {
+							send_blocking(chan, &out[..n2], reply_handle);
+						}
+					}
+				}
+				if closing {
+					teardown_socket(slot, frames, stack, rx, tx);
+				}
+			}
+			// The client dropped its socket without calling close(): tear it down.
+			Received::Closed => {
+				teardown_socket(slot, frames, stack, rx, tx);
+			}
+		}
+	}
+}
+
+// Tear a socket slot down: close its recv stream, send the connection's FIN, free the
+// stack connection, close the channel, and empty the slot.
+unsafe fn teardown_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) {
+	unsafe {
+		if slot.stream_prod != 0 {
+			close(slot.stream_prod);
+			slot.stream_prod = 0;
+		}
+		socket_teardown(slot.ci, frames, stack, rx, tx);
+		stack.tcp_free(slot.ci);
+		close(slot.chan);
+		slot.chan = 0;
+	}
+}
+
+// One active listening socket the serve loop multiplexes: the channel the `listener`
+// interface is served on, the port it accepts inbound connections on, and a deferred
+// `accept` (the correlation id to answer once a connection completes, when `accept`
+// was called with none pending).
+#[derive(Clone, Copy)]
+struct Listener {
+	chan: u64,
+	port: u16,
+	pending_corr: u32,
+	pending: bool,
+}
+
+// The first free listener slot, or None when the pool is full.
+fn first_empty_listener(listeners: &[Listener; MAX_LISTEN]) -> Option<usize> {
+	let mut i: usize = 0;
+	while i < MAX_LISTEN {
+		if listeners[i].chan == 0 {
+			return Some(i);
+		}
+		i += 1;
+	}
+	None
+}
+
+// Service one ready listener: an `accept` request is answered now (an inbound
+// connection has completed its handshake) or deferred (its correlation id remembered)
+// to be answered when one does. A closed listener channel stops listening on its port.
+unsafe fn serve_listener(listener: &mut Listener, socks: &mut [SockSlot; MAX_SOCKS], stack: &mut Stack, req: &mut [u8]) {
+	unsafe {
+		match recv_blocking(listener.chan, req) {
+			Received::Message { len, .. } => {
+				// The request frames as [op u16][corr u32]; OP_ACCEPT is the only op.
+				if len >= 6 {
+					let op: u16 = u16::from_le_bytes([req[0], req[1]]);
+					let corr: u32 = u32::from_le_bytes([req[2], req[3], req[4], req[5]]);
+					if op == listener::OP_ACCEPT {
+						match stack.take_accepted(listener.port) {
+							Some(ci) if accept_handoff(listener.chan, corr, ci, socks, stack) => {}
+							_ => {
+								listener.pending_corr = corr;
+								listener.pending = true;
+							}
+						}
+					}
+				}
+			}
+			Received::Closed => {
+				stack.unlisten(listener.port);
+				close(listener.chan);
+				listener.chan = 0;
+			}
+		}
+	}
+}
+
+// Hand accepted connection `ci` to the listener as a socket: mint the socket channel,
+// record it in a free socket slot, and reply to the pending `accept` (correlation
+// `corr`) with the client end out of band. The reply frames a `result<handle<channel>,
+// error>` Ok: [corr u32][tag 1][u32 0] inline, the channel out of band. False (retry
+// later) if no socket slot is free, or the connection is dropped if the channel cannot
+// be minted.
+unsafe fn accept_handoff(listener_chan: u64, corr: u32, ci: usize, socks: &mut [SockSlot; MAX_SOCKS], stack: &mut Stack) -> bool {
+	unsafe {
+		let si: usize = match first_empty_sock(socks) {
+			Some(i) => i,
+			None => return false,
+		};
+		match channel() {
+			Some((server, peer)) => {
+				socks[si] = SockSlot { chan: server, ci, stream_prod: 0, stream_seq: 0 };
+				let mut reply: [u8; 9] = [0u8; 9];
+				reply[0..4].copy_from_slice(&corr.to_le_bytes());
+				reply[4] = 1;
+				send_blocking(listener_chan, &reply, peer);
+				true
+			}
+			None => {
+				stack.tcp_free(ci);
+				false
+			}
+		}
+	}
+}
+
 // The state the typed `network` service operates on for one client request: the
 // driver frame channel, an ICMP/DNS sequence counter, the stack, and the frame
 // scratch buffers - the stack and buffers are borrowed from the serve loop, so the
 // connection state and the 2 KiB frame buffers are not duplicated on the stack.
-// `cur_sock` is the server end of an already-open socket (0 = none), so `connect`
-// can refuse a second concurrent socket; `new_sock` is where `connect` parks the
-// server end of the socket it opens, for the serve loop to pick up.
+// `connect` parks the server end of the socket it opens in `new_sock` (and its stack
+// connection index in `new_sock_ci`) for the serve loop to pick up; `sock_room` is
+// whether a socket slot is free.
 struct Net<'a> {
 	frames: u64,
 	seq: u16,
 	stack: &'a mut Stack,
 	rx: &'a mut [u8],
 	tx: &'a mut [u8],
-	cur_sock: u64,
 	new_sock: &'a mut u64,
-	// Where `open` parks the server end of a freshly minted client channel for the
-	// serve loop to pick up, and whether the client set has room for another.
+	new_sock_ci: &'a mut usize,
+	// Where `open` parks the server end of a freshly minted client channel, and `listen`
+	// the server end of a listener channel (with its port), for the serve loop to pick
+	// up; plus whether the client / socket / listener sets have room.
 	new_client: &'a mut u64,
-	clients_room: bool,
+	new_listener: &'a mut u64,
+	new_listener_port: &'a mut u16,
+	sock_room: bool,
+	client_room: bool,
+	listener_room: bool,
 }
 
 // Convert the stack's internal address to the wire (canonical) form, and back.
@@ -332,6 +522,19 @@ fn to_wire(ip: Ipv4Addr) -> WireIp {
 
 fn from_wire(ip: &WireIp) -> Ipv4Addr {
 	Ipv4Addr([ip.a, ip.b, ip.c, ip.d])
+}
+
+// Map a stack socket snapshot to the typed `sock-info` the `ss` tool renders.
+fn to_sock_info(s: SockEntry) -> SockInfo {
+	let state: SockState = match s.state {
+		SockEntryState::Closed => SockState::Closed,
+		SockEntryState::SynSent => SockState::SynSent,
+		SockEntryState::SynRcvd => SockState::SynRcvd,
+		SockEntryState::Established => SockState::Established,
+		SockEntryState::FinWait => SockState::FinWait,
+		SockEntryState::Listen => SockState::Listen,
+	};
+	SockInfo { local_port: s.local_port, remote: Endpoint { addr: to_wire(s.remote_ip), port: s.remote_port }, state }
 }
 
 impl network::Service for Net<'_> {
@@ -371,8 +574,13 @@ impl network::Service for Net<'_> {
 	// Maps the connect failure modes onto the error enum.
 	fn fetch(&mut self, req: TcpRequest) -> Result<Vec<u8>, Error> {
 		unsafe {
+			let ci: usize = match self.stack.tcp_alloc() {
+				Some(i) => i,
+				None => return Err(Error::Again),
+			};
 			let mut data: [u8; 1 + TCP_REPLY_MAX] = [0u8; 1 + TCP_REPLY_MAX];
-			let n: usize = do_tcp(from_wire(&req.ep.addr), req.ep.port, &req.request, self.frames, self.stack, self.rx, self.tx, &mut data);
+			let n: usize = do_tcp(ci, from_wire(&req.ep.addr), req.ep.port, &req.request, self.frames, self.stack, self.rx, self.tx, &mut data);
+			self.stack.tcp_free(ci);
 			match data[0] {
 				1 => Ok(data[1..n].to_vec()),
 				2 => Err(Error::NotFound),
@@ -384,25 +592,42 @@ impl network::Service for Net<'_> {
 
 	// Open a TCP connection to `ep` and hand the client the socket as a capability:
 	// the client end of a fresh channel on which we serve the `socket` interface. The
-	// server end is parked in `new_sock` for the serve loop to start waiting on. One
-	// socket at a time (the stack has a single connection), so a second `connect`
-	// while one is open is refused with `Again`.
+	// server end (and its stack connection index) are parked in `new_sock`/`new_sock_ci`
+	// for the serve loop to start waiting on. Refused with `Again` when the socket pool
+	// or the connection pool is full.
 	fn connect(&mut self, ep: Endpoint) -> Result<u64, Error> {
-		if self.cur_sock != 0 {
+		if !self.sock_room {
 			return Err(Error::Again);
 		}
 		unsafe {
-			match tcp_establish(from_wire(&ep.addr), ep.port, self.frames, self.stack, self.rx, self.tx) {
+			let ci: usize = match self.stack.tcp_alloc() {
+				Some(i) => i,
+				None => return Err(Error::Again),
+			};
+			match tcp_establish(ci, from_wire(&ep.addr), ep.port, self.frames, self.stack, self.rx, self.tx) {
 				1 => match channel() {
 					Some((server, peer)) => {
 						*self.new_sock = server;
+						*self.new_sock_ci = ci;
 						Ok(peer)
 					}
-					None => Err(Error::Again),
+					None => {
+						self.stack.tcp_free(ci);
+						Err(Error::Again)
+					}
 				},
-				2 => Err(Error::NotFound),
-				3 => Err(Error::Denied),
-				_ => Err(Error::Again),
+				2 => {
+					self.stack.tcp_free(ci);
+					Err(Error::NotFound)
+				}
+				3 => {
+					self.stack.tcp_free(ci);
+					Err(Error::Denied)
+				}
+				_ => {
+					self.stack.tcp_free(ci);
+					Err(Error::Again)
+				}
 			}
 		}
 	}
@@ -413,7 +638,7 @@ impl network::Service for Net<'_> {
 	// than sharing one channel (a shared channel would race). Refused with `Again`
 	// when the client set is full.
 	fn open(&mut self) -> Result<u64, Error> {
-		if !self.clients_room {
+		if !self.client_room {
 			return Err(Error::Again);
 		}
 		unsafe {
@@ -426,13 +651,45 @@ impl network::Service for Net<'_> {
 			}
 		}
 	}
+
+	// Open a listening socket on `port` (passive open) and hand the caller a `listener`
+	// capability: the client end of a fresh channel on which we serve `accept`. The
+	// server end (and its port) are parked in `new_listener`/`new_listener_port` for the
+	// serve loop to start waiting on, and the stack starts accepting inbound connections
+	// on the port. Refused with `Again` when the listener set or the listen table is
+	// full.
+	fn listen(&mut self, port: u16) -> Result<u64, Error> {
+		if !self.listener_room || !self.stack.listen(port) {
+			return Err(Error::Again);
+		}
+		unsafe {
+			match channel() {
+				Some((server, peer)) => {
+					*self.new_listener = server;
+					*self.new_listener_port = port;
+					Ok(peer)
+				}
+				None => {
+					self.stack.unlisten(port);
+					Err(Error::Again)
+				}
+			}
+		}
+	}
+
+	// The live sockets in the stack's table: the listening ports and every open
+	// connection, with its local port, remote endpoint, and TCP state - what `ss` lists.
+	fn sockets(&mut self) -> Result<Vec<SockInfo>, Error> {
+		Ok(self.stack.sockets().into_iter().map(to_sock_info).collect())
+	}
 }
 
 // The state the typed `socket` service operates on for one connected socket: the
-// frame channel, the stack (holding the single TCP connection), and the transmit
-// buffer - all borrowed from the serve loop. `closing` is set by `close` so the
-// loop tears the connection down after replying.
+// stack connection index `ci` it drives, the frame channel, the stack, and the
+// transmit buffer - all borrowed from the serve loop. `closing` is set by `close` so
+// the loop tears the connection down after replying.
 struct Sock<'a> {
+	ci: usize,
 	frames: u64,
 	stack: &'a mut Stack,
 	tx: &'a mut [u8],
@@ -445,7 +702,7 @@ impl socket::Service for Sock<'_> {
 	// bytes onto the wire, then unmap and close the handle. The ack arrives via the
 	// serve loop's frame pump. Closed once the connection is reset or gone.
 	fn send(&mut self, data: Buffer) -> Result<u32, Error> {
-		if !self.stack.tcp_established() || self.stack.tcp_aborted() {
+		if !self.stack.tcp_established(self.ci) || self.stack.tcp_aborted(self.ci) {
 			unsafe { close(data.handle) };
 			return Err(Error::Closed);
 		}
@@ -461,7 +718,7 @@ impl socket::Service for Sock<'_> {
 			// page, so this slice never runs past the mapping even for a bogus length.
 			let n: usize = (data.len as usize).min(FRAME_MAX);
 			let bytes: &[u8] = core::slice::from_raw_parts(base as *const u8, n);
-			socket_send(bytes, self.frames, self.stack, self.tx);
+			socket_send(self.ci, bytes, self.frames, self.stack, self.tx);
 			unmap_object(data.handle);
 			close(data.handle);
 			Ok(n as u32)
@@ -473,7 +730,7 @@ impl socket::Service for Sock<'_> {
 	fn recv(&mut self) -> Vec<Chunk> {
 		let mut chunks: Vec<Chunk> = Vec::new();
 		let mut buf: [u8; SOCK_RECV_MAX] = [0u8; SOCK_RECV_MAX];
-		let n: usize = self.stack.tcp_take_rx(&mut buf);
+		let n: usize = self.stack.tcp_take_rx(self.ci, &mut buf);
 		if n > 0 {
 			chunks.push(Chunk { data: buf[..n].to_vec() });
 		}
@@ -611,11 +868,11 @@ unsafe fn do_dns(name: &[u8], frames: u64, stack: &mut Stack, txn: &mut u16, rx:
 // received bytes into `reply` (status 1 = connected with data, 0 = no SYN-ACK in
 // time, 2 = unreachable / no ARP, 3 = refused / reset) and returns the total length.
 #[allow(clippy::too_many_arguments)]
-unsafe fn do_tcp(ip: Ipv4Addr, port: u16, request: &[u8], frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], reply: &mut [u8]) -> usize {
+unsafe fn do_tcp(ci: usize, ip: Ipv4Addr, port: u16, request: &[u8], frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], reply: &mut [u8]) -> usize {
 	unsafe {
 		// Establish the connection; on failure write the status byte and stop (the
 		// establish status bytes 2 / 3 / 0 map straight onto the reply status).
-		match tcp_establish(ip, port, frames, stack, rx, tx) {
+		match tcp_establish(ci, ip, port, frames, stack, rx, tx) {
 			1 => {}
 			other => {
 				reply[0] = other;
@@ -625,25 +882,25 @@ unsafe fn do_tcp(ip: Ipv4Addr, port: u16, request: &[u8], frames: u64, stack: &m
 		// Send the request, then read the response until the peer closes, the buffer
 		// fills, or it falls quiet.
 		if !request.is_empty() {
-			let d: usize = stack.tcp_build_data(request, tx);
+			let d: usize = stack.tcp_build_data(ci, request, tx);
 			send_frame(frames, &tx[..d]);
 		}
 		let cap: usize = reply.len() - 1;
 		let mut got: usize = 0;
 		let recv_deadline: u64 = clock() + TCP_RECV_TIMEOUT_TICKS;
-		while clock() < recv_deadline && !stack.tcp_peer_fin() && !stack.tcp_aborted() && got < cap {
+		while clock() < recv_deadline && !stack.tcp_peer_fin(ci) && !stack.tcp_aborted(ci) && got < cap {
 			if wait(frames, recv_deadline) != 0 {
 				break;
 			}
 			pump(frames, stack, rx, tx);
-			got += stack.tcp_take_rx(&mut reply[1 + got..]);
+			got += stack.tcp_take_rx(ci, &mut reply[1 + got..]);
 		}
-		got += stack.tcp_take_rx(&mut reply[1 + got..]);
+		got += stack.tcp_take_rx(ci, &mut reply[1 + got..]);
 		// Close our half and briefly pump to acknowledge the peer's FIN.
-		let fin: usize = stack.tcp_build_fin(tx);
+		let fin: usize = stack.tcp_build_fin(ci, tx);
 		send_frame(frames, &tx[..fin]);
 		let close_deadline: u64 = clock() + TCP_RETX_TICKS;
-		while clock() < close_deadline && !stack.tcp_aborted() && !stack.tcp_peer_fin() {
+		while clock() < close_deadline && !stack.tcp_aborted(ci) && !stack.tcp_peer_fin(ci) {
 			if wait(frames, close_deadline) != 0 {
 				break;
 			}
@@ -658,7 +915,7 @@ unsafe fn do_tcp(ip: Ipv4Addr, port: u16, request: &[u8], frames: u64, stack: &m
 // resolve the next hop, open the connection, and send the SYN, retransmitting it
 // until the handshake completes. Returns 1 = established, 2 = unreachable (no ARP),
 // 3 = refused (reset), 0 = timed out. Shared by `fetch` (do_tcp) and `connect`.
-unsafe fn tcp_establish(ip: Ipv4Addr, port: u16, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> u8 {
+unsafe fn tcp_establish(ci: usize, ip: Ipv4Addr, port: u16, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> u8 {
 	unsafe {
 		let hop: Ipv4Addr = stack.next_hop(ip);
 		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
@@ -667,36 +924,36 @@ unsafe fn tcp_establish(ip: Ipv4Addr, port: u16, frames: u64, stack: &mut Stack,
 		};
 		let iss: u32 = clock() as u32;
 		let local_port: u16 = TCP_LOCAL_PORT_BASE | (clock() as u16 & 0x0fff);
-		stack.tcp_open(ip, port, mac, local_port, iss);
-		let syn: usize = stack.tcp_build_syn(tx);
+		stack.tcp_open(ci, ip, port, mac, local_port, iss);
+		let syn: usize = stack.tcp_build_syn(ci, tx);
 		send_frame(frames, &tx[..syn]);
 		let overall: u64 = clock() + TCP_SYN_TIMEOUT_TICKS;
-		while clock() < overall && !stack.tcp_established() && !stack.tcp_aborted() {
+		while clock() < overall && !stack.tcp_established(ci) && !stack.tcp_aborted(ci) {
 			let attempt: u64 = clock() + TCP_RETX_TICKS;
 			let until: u64 = if attempt < overall { attempt } else { overall };
 			if wait(frames, until) != 0 {
-				let s: usize = stack.tcp_build_syn(tx);
+				let s: usize = stack.tcp_build_syn(ci, tx);
 				send_frame(frames, &tx[..s]);
 			} else {
 				pump(frames, stack, rx, tx);
 			}
 		}
-		if stack.tcp_aborted() {
+		if stack.tcp_aborted(ci) {
 			return 3;
 		}
-		if !stack.tcp_established() {
+		if !stack.tcp_established(ci) {
 			return 0;
 		}
 		1
 	}
 }
 
-// Send `data` on the established connection as a single TCP data segment; the ack
-// arrives later via the serve loop's frame pump.
-unsafe fn socket_send(data: &[u8], frames: u64, stack: &mut Stack, tx: &mut [u8]) {
+// Send `data` on connection `ci` as a single TCP data segment; the ack arrives later
+// via the serve loop's frame pump.
+unsafe fn socket_send(ci: usize, data: &[u8], frames: u64, stack: &mut Stack, tx: &mut [u8]) {
 	unsafe {
 		if !data.is_empty() {
-			let d: usize = stack.tcp_build_data(data, tx);
+			let d: usize = stack.tcp_build_data(ci, data, tx);
 			send_frame(frames, &tx[..d]);
 		}
 	}
@@ -705,11 +962,11 @@ unsafe fn socket_send(data: &[u8], frames: u64, stack: &mut Stack, tx: &mut [u8]
 // Drain newly received bytes from the connection and frame each chunk onto the recv
 // stream `producer`. Returns the producer handle, or 0 if the consumer was dropped
 // (in which case the producer is closed here).
-unsafe fn stream_pump(stack: &mut Stack, out: &mut [u8], producer: u64, seq: &mut u32) -> u64 {
+unsafe fn stream_pump(ci: usize, stack: &mut Stack, out: &mut [u8], producer: u64, seq: &mut u32) -> u64 {
 	unsafe {
 		let mut buf: [u8; SOCK_RECV_MAX] = [0u8; SOCK_RECV_MAX];
 		loop {
-			let n: usize = stack.tcp_take_rx(&mut buf);
+			let n: usize = stack.tcp_take_rx(ci, &mut buf);
 			if n == 0 {
 				return producer;
 			}
@@ -728,17 +985,17 @@ unsafe fn stream_pump(stack: &mut Stack, out: &mut [u8], producer: u64, seq: &mu
 	}
 }
 
-// Close our half of the connection: send a FIN (unless already reset) and briefly
-// pump to acknowledge the peer's FIN, so the connection winds down before the next
-// `connect` reopens the stack's single TCP connection.
-unsafe fn socket_teardown(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) {
+// Close our half of connection `ci`: send a FIN (unless already reset) and briefly
+// pump to acknowledge the peer's FIN, so the connection winds down before its slot is
+// freed.
+unsafe fn socket_teardown(ci: usize, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) {
 	unsafe {
-		if !stack.tcp_aborted() {
-			let fin: usize = stack.tcp_build_fin(tx);
+		if !stack.tcp_aborted(ci) {
+			let fin: usize = stack.tcp_build_fin(ci, tx);
 			send_frame(frames, &tx[..fin]);
 		}
 		let deadline: u64 = clock() + TCP_RETX_TICKS;
-		while clock() < deadline && !stack.tcp_aborted() && !stack.tcp_peer_fin() {
+		while clock() < deadline && !stack.tcp_aborted(ci) && !stack.tcp_peer_fin(ci) {
 			if wait(frames, deadline) != 0 {
 				break;
 			}

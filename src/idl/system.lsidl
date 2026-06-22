@@ -198,13 +198,32 @@ record tcp-request {
 	request: list<u8>,
 }
 
+// A live socket's TCP state - the typed form of the state column `ss` prints.
+enum sock-state {
+	closed,
+	syn-sent,
+	syn-rcvd,
+	established,
+	fin-wait,
+	listen,
+}
+
+// A live socket in the NetworkService table: its local port, the remote endpoint it
+// talks to (zeros for a listening socket), and its TCP state - the typed form of one
+// row `ss` lists.
+record sock-info {
+	local-port: u16,
+	remote:     endpoint,
+	state:      sock-state,
+}
+
 // The NetworkService contract: the interface state, name resolution, ping, a
-// one-shot TCP fetch, and `connect` - which opens a TCP connection and hands the
-// client a socket as a capability (the channel a `socket` interface is served on),
-// so the network is reachable through the typed API like every other service.
-// `connect` returns the socket out-of-band as a `handle<channel>`; the client wraps
-// it in a `socket` client. A received-data stream<T> and `listen` / `accept` land
-// in M33 step 4c.
+// one-shot TCP fetch, `connect` - which opens a TCP connection and hands the client a
+// socket as a capability (the channel a `socket` interface is served on) - and
+// `listen`, which opens a listening socket for inbound connections. `connect` /
+// `listen` return their channel out-of-band as a `handle<channel>`; the client wraps
+// it in a `socket` / `listener` client. So the network is reachable through the typed
+// API like every other service.
 interface network {
 	@op(1) info:    func() -> result<net-info, error>;
 	@op(2) resolve: func(name: string) -> result<ipv4-addr, error>;
@@ -212,6 +231,8 @@ interface network {
 	@op(4) fetch:   func(req: tcp-request) -> result<list<u8>, error>;
 	@op(5) connect: func(ep: endpoint) -> result<handle<channel>, error>;
 	@op(6) open:    func() -> result<handle<channel>, error>;
+	@op(7) listen:  func(port: u16) -> result<handle<channel>, error>;
+	@op(8) sockets: func() -> result<list<sock-info>, error>;
 }
 
 // A connected TCP socket, served on the channel `network.connect` hands back as a
@@ -229,4 +250,13 @@ interface socket {
 // One chunk of received socket data, the element of the `socket.recv` stream.
 record chunk {
 	data: list<u8>,
+}
+
+// A listening socket from `network.listen`, served on the channel it hands back.
+// `accept` waits until an inbound connection completes its handshake, then hands it
+// back as a `socket` capability (the channel a `socket` interface is served on) - the
+// passive-open counterpart to `network.connect`. The server calls `accept` in a loop,
+// each call yielding the next connection.
+interface listener {
+	@op(1) accept: func() -> result<handle<channel>, error>;
 }

@@ -41,10 +41,17 @@ mkdir -p "$HERE/.build"
 if [[ -f "$VOLUME_PKG" ]]; then
 	dd if="$VOLUME_PKG" of="$VIRTIO_DISK" bs=512 conv=notrunc status=none
 fi
+# Forward host 127.0.0.1:5555 to the guest's port 80, so a host HTTP client can reach
+# the guest's httpd (passive open / inbound) - SLIRP gives no inbound route otherwise.
+# Interactive runs only: the test path keeps a fixed device set and binds no host port.
+NET_USER="user,id=vnet0"
+if [[ "${TEST:-0}" != "1" ]]; then
+	NET_USER="$NET_USER,hostfwd=tcp:127.0.0.1:5555-:80"
+fi
 QEMU_ARGS+=(
 	-drive "file=$VIRTIO_DISK,if=none,id=vblk,format=raw"
 	-device virtio-blk-pci,drive=vblk,disable-legacy=on
-	-netdev user,id=vnet0
+	-netdev "$NET_USER"
 	-device virtio-net-pci,netdev=vnet0,disable-legacy=on
 	-device virtio-serial-pci,disable-legacy=on
 	-device virtconsole,chardev=vcon

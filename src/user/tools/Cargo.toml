@@ -36,6 +36,14 @@ path = "src/nc.rs"
 name = "arp"
 path = "src/arp.rs"
 
+[[bin]]
+name = "httpd"
+path = "src/httpd.rs"
+
+[[bin]]
+name = "ss"
+path = "src/ss.rs"
+
 [dependencies]
 # Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
 # the syscall/IPC helpers); it re-exports the abi constants.

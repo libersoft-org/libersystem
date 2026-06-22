@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+use alloc::vec::Vec;
+
 // EtherType values (the 2-byte type field of an Ethernet II frame).
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
@@ -72,9 +74,16 @@ const TCP_RST: u8 = 0x04;
 const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
 
-// The receive buffer / advertised window for the one TCP connection. Kept small (we
-// drain it after every segment) so the connection state fits the modest user stack.
+// The receive buffer / advertised window for one TCP connection. Kept small (we drain
+// it after every segment) so a pool of connection states stays modest.
 const TCP_RX_MAX: usize = 1024;
+
+// How many TCP connections the stack tracks at once: outbound `connect`s and inbound
+// accepted connections share this pool (a listener can hand out several at a time).
+const TCP_CONN_MAX: usize = 4;
+
+// How many ports the stack listens on at once (passive open).
+const LISTEN_MAX: usize = 2;
 
 // A 48-bit Ethernet MAC address.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -228,26 +237,36 @@ pub struct Outcome {
 	pub event: Event,
 }
 
-// The TCP connection state machine, for the single active client connection.
+// The TCP connection state machine (per pooled connection, client or server side).
 #[derive(Clone, Copy, PartialEq)]
 enum TcpState {
 	// No connection.
 	Closed,
-	// SYN sent, awaiting the peer's SYN-ACK.
+	// SYN sent (active open), awaiting the peer's SYN-ACK.
 	SynSent,
+	// SYN received (passive open), our SYN-ACK sent, awaiting the completing ACK.
+	SynRcvd,
 	// Handshake complete, data may flow.
 	Established,
 	// We sent a FIN and are tearing the connection down.
 	FinWait,
 }
 
-// The one TCP connection the stack tracks (a minimal single-socket client).
+// One TCP connection in the stack's pool. A slot is free when `in_use` is false; with
+// our IP fixed, the (local_port, remote_ip, remote_port) tuple demuxes inbound
+// segments to it.
 struct TcpConn {
+	// Whether this pool slot is allocated to a live connection (an outbound connect or an
+	// inbound accepted connection). A free slot is reused by the next open.
+	in_use: bool,
 	state: TcpState,
 	// The peer sent a RST (the connection was refused or reset).
 	aborted: bool,
 	// The peer sent a FIN (it closed its half).
 	peer_fin: bool,
+	// Accepted via a listener (passive open), established, and not yet handed to a
+	// socket - awaiting the listener's `accept`.
+	pending_accept: bool,
 	local_port: u16,
 	remote_ip: Ipv4Addr,
 	remote_port: u16,
@@ -264,12 +283,33 @@ struct TcpConn {
 
 impl TcpConn {
 	const fn closed() -> TcpConn {
-		TcpConn { state: TcpState::Closed, aborted: false, peer_fin: false, local_port: 0, remote_ip: Ipv4Addr([0; 4]), remote_port: 0, remote_mac: MacAddr::ZERO, snd_una: 0, snd_nxt: 0, rcv_nxt: 0, rx: [0; TCP_RX_MAX], rx_len: 0 }
+		TcpConn { in_use: false, state: TcpState::Closed, aborted: false, peer_fin: false, pending_accept: false, local_port: 0, remote_ip: Ipv4Addr([0; 4]), remote_port: 0, remote_mac: MacAddr::ZERO, snd_una: 0, snd_nxt: 0, rcv_nxt: 0, rx: [0; TCP_RX_MAX], rx_len: 0 }
 	}
 }
 
-// The interface's L2/L3 state: our addresses, the neighbor cache, and the one TCP
-// connection.
+// A snapshot of one live socket for enumeration (`ss`): its local port, the remote
+// endpoint it talks to (zeros for a listening socket), and a small state tag.
+pub struct SockEntry {
+	pub local_port: u16,
+	pub remote_ip: Ipv4Addr,
+	pub remote_port: u16,
+	pub state: SockEntryState,
+}
+
+// The position of a socket in the connection lifecycle, for `ss` to label each row.
+#[derive(Clone, Copy)]
+pub enum SockEntryState {
+	Closed,
+	SynSent,
+	SynRcvd,
+	Established,
+	FinWait,
+	Listen,
+}
+
+// The interface's L2/L3 state: our addresses, the neighbor cache, and the pool of TCP
+// connections (on the heap - each carries a kilobyte receive buffer, too large for the
+// 16 KiB user stack).
 pub struct Stack {
 	mac: MacAddr,
 	ip: Ipv4Addr,
@@ -277,13 +317,22 @@ pub struct Stack {
 	gateway: Ipv4Addr,
 	dns: Ipv4Addr,
 	neigh: [Neigh; NEIGH_MAX],
-	tcp: TcpConn,
+	conns: Vec<TcpConn>,
+	// The ports we accept inbound connections on (passive open); 0 = unused slot.
+	listen_ports: [u16; LISTEN_MAX],
+	// The next initial send sequence to hand a passively-opened connection (bumped per
+	// accept; predictability is not a concern for this stack).
+	next_iss: u32,
 	dhcp: DhcpLease,
 }
 
 impl Stack {
 	pub fn new(mac: MacAddr, ip: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr, dns: Ipv4Addr) -> Stack {
-		Stack { mac, ip, mask, gateway, dns, neigh: [Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; NEIGH_MAX], tcp: TcpConn::closed(), dhcp: DhcpLease::empty() }
+		let mut conns: Vec<TcpConn> = Vec::with_capacity(TCP_CONN_MAX);
+		for _ in 0..TCP_CONN_MAX {
+			conns.push(TcpConn::closed());
+		}
+		Stack { mac, ip, mask, gateway, dns, neigh: [Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; NEIGH_MAX], conns, listen_ports: [0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
 	}
 
 	pub fn mac(&self) -> MacAddr {
@@ -354,6 +403,32 @@ impl Stack {
 	// iteration the typed `info` interface state is built from.
 	pub fn neigh_at(&self, idx: usize) -> Option<(Ipv4Addr, MacAddr)> {
 		self.neigh.iter().filter(|n: &&Neigh| n.valid).nth(idx).map(|n: &Neigh| (n.ip, n.mac))
+	}
+
+	// Snapshot the live sockets for `ss`: the listening ports first (as Listen rows),
+	// then every in-use pooled connection with its local port, remote endpoint, and TCP
+	// state. NetworkService maps these to the typed `sock-info` the tool renders.
+	pub fn sockets(&self) -> Vec<SockEntry> {
+		let mut out: Vec<SockEntry> = Vec::new();
+		for &p in self.listen_ports.iter() {
+			if p != 0 {
+				out.push(SockEntry { local_port: p, remote_ip: Ipv4Addr([0; 4]), remote_port: 0, state: SockEntryState::Listen });
+			}
+		}
+		for c in self.conns.iter() {
+			if !c.in_use {
+				continue;
+			}
+			let state: SockEntryState = match c.state {
+				TcpState::Closed => SockEntryState::Closed,
+				TcpState::SynSent => SockEntryState::SynSent,
+				TcpState::SynRcvd => SockEntryState::SynRcvd,
+				TcpState::Established => SockEntryState::Established,
+				TcpState::FinWait => SockEntryState::FinWait,
+			};
+			out.push(SockEntry { local_port: c.local_port, remote_ip: c.remote_ip, remote_port: c.remote_port, state });
+		}
+		out
 	}
 
 	// Serialize the interface state for the `ip` / `net` command into `out`, returning
@@ -482,22 +557,29 @@ impl Stack {
 		Outcome { reply_len: 0, event: Event::None }
 	}
 
-	// Handle an inbound TCP segment for our single client connection: complete the
-	// handshake (SYN-ACK -> ACK), accept in-order data and acknowledge it, note a peer
-	// FIN, and abort on RST. Segments not matching the active connection are ignored.
+	// Handle an inbound TCP segment: demux it to the live connection it belongs to (by
+	// its 4-tuple), complete the handshake (SYN-ACK -> ACK), accept in-order data and
+	// acknowledge it, note a peer FIN, and abort on RST. Segments for no live
+	// connection are ignored.
 	fn on_tcp(&mut self, frame: &[u8], ihl: usize, src_ip: Ipv4Addr, out: &mut [u8]) -> Outcome {
-		if self.tcp.state == TcpState::Closed {
-			return Outcome { reply_len: 0, event: Event::None };
-		}
 		let tcp: &[u8] = &frame[ETH_HDR + ihl..];
 		if tcp.len() < TCP_HDR {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
 		let src_port: u16 = be16(tcp, 0);
 		let dst_port: u16 = be16(tcp, 2);
-		if src_ip != self.tcp.remote_ip || src_port != self.tcp.remote_port || dst_port != self.tcp.local_port {
-			return Outcome { reply_len: 0, event: Event::None };
-		}
+		let ci: usize = match self.find_conn(src_ip, src_port, dst_port) {
+			Some(i) => i,
+			None => {
+				// A SYN to a listening port opens a new inbound connection (passive open).
+				let flags: u8 = tcp[13];
+				if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 && self.is_listening(dst_port) {
+					let seg_seq: u32 = be32(tcp, 4);
+					return self.passive_open(frame, src_ip, src_port, dst_port, seg_seq, out);
+				}
+				return Outcome { reply_len: 0, event: Event::None };
+			}
+		};
 		let seg_seq: u32 = be32(tcp, 4);
 		let seg_ack: u32 = be32(tcp, 8);
 		let data_off: usize = ((tcp[12] >> 4) as usize) * 4;
@@ -508,64 +590,114 @@ impl Stack {
 		let payload: &[u8] = &tcp[data_off..];
 		// A reset aborts the connection (a refused connect, or a reset peer).
 		if flags & TCP_RST != 0 {
-			self.tcp.state = TcpState::Closed;
-			self.tcp.aborted = true;
+			self.conns[ci].state = TcpState::Closed;
+			self.conns[ci].aborted = true;
 			return Outcome { reply_len: 0, event: Event::None };
 		}
 		// Complete the handshake: a SYN-ACK acknowledging our SYN.
-		if self.tcp.state == TcpState::SynSent {
-			if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 && seg_ack == self.tcp.snd_nxt {
-				self.tcp.rcv_nxt = seg_seq.wrapping_add(1);
-				self.tcp.snd_una = seg_ack;
-				self.tcp.state = TcpState::Established;
-				let len: usize = self.build_tcp(TCP_ACK, self.tcp.snd_nxt, self.tcp.rcv_nxt, &[], out);
+		if self.conns[ci].state == TcpState::SynSent {
+			if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 && seg_ack == self.conns[ci].snd_nxt {
+				self.conns[ci].rcv_nxt = seg_seq.wrapping_add(1);
+				self.conns[ci].snd_una = seg_ack;
+				self.conns[ci].state = TcpState::Established;
+				let len: usize = self.build_tcp(ci, TCP_ACK, self.conns[ci].snd_nxt, self.conns[ci].rcv_nxt, &[], out);
 				return Outcome { reply_len: len, event: Event::None };
 			}
 			return Outcome { reply_len: 0, event: Event::None };
 		}
+		// Complete a passive-open handshake: the ACK of our SYN-ACK establishes the
+		// connection, which then awaits the listener's accept. Falls through so a
+		// data-bearing ACK (the request piggybacked on the handshake) is handled below.
+		if self.conns[ci].state == TcpState::SynRcvd {
+			if flags & TCP_ACK != 0 && seg_ack == self.conns[ci].snd_nxt {
+				self.conns[ci].snd_una = seg_ack;
+				self.conns[ci].state = TcpState::Established;
+				self.conns[ci].pending_accept = true;
+			} else {
+				return Outcome { reply_len: 0, event: Event::None };
+			}
+		}
 		// Established (or tearing down): advance our send window from the ack.
-		if flags & TCP_ACK != 0 && seq_gt(seg_ack, self.tcp.snd_una) && seq_le(seg_ack, self.tcp.snd_nxt) {
-			self.tcp.snd_una = seg_ack;
+		if flags & TCP_ACK != 0 && seq_gt(seg_ack, self.conns[ci].snd_una) && seq_le(seg_ack, self.conns[ci].snd_nxt) {
+			self.conns[ci].snd_una = seg_ack;
 		}
 		// Accept in-order data into the receive buffer (bounded by the window).
 		let mut progressed: bool = false;
-		if !payload.is_empty() && seg_seq == self.tcp.rcv_nxt {
-			let space: usize = TCP_RX_MAX - self.tcp.rx_len;
-			let n: usize = payload.len().min(space);
-			self.tcp.rx[self.tcp.rx_len..self.tcp.rx_len + n].copy_from_slice(&payload[..n]);
-			self.tcp.rx_len += n;
-			self.tcp.rcv_nxt = self.tcp.rcv_nxt.wrapping_add(n as u32);
+		if !payload.is_empty() && seg_seq == self.conns[ci].rcv_nxt {
+			let rx_len: usize = self.conns[ci].rx_len;
+			let n: usize = payload.len().min(TCP_RX_MAX - rx_len);
+			self.conns[ci].rx[rx_len..rx_len + n].copy_from_slice(&payload[..n]);
+			self.conns[ci].rx_len += n;
+			self.conns[ci].rcv_nxt = self.conns[ci].rcv_nxt.wrapping_add(n as u32);
 			progressed = true;
 		}
 		// A FIN occupies the sequence just past the segment's data.
-		if flags & TCP_FIN != 0 && seg_seq.wrapping_add(payload.len() as u32) == self.tcp.rcv_nxt {
-			self.tcp.rcv_nxt = self.tcp.rcv_nxt.wrapping_add(1);
-			self.tcp.peer_fin = true;
+		if flags & TCP_FIN != 0 && seg_seq.wrapping_add(payload.len() as u32) == self.conns[ci].rcv_nxt {
+			self.conns[ci].rcv_nxt = self.conns[ci].rcv_nxt.wrapping_add(1);
+			self.conns[ci].peer_fin = true;
 			progressed = true;
 		}
 		// Acknowledge any data or FIN we consumed.
 		if progressed {
-			let len: usize = self.build_tcp(TCP_ACK, self.tcp.snd_nxt, self.tcp.rcv_nxt, &[], out);
+			let len: usize = self.build_tcp(ci, TCP_ACK, self.conns[ci].snd_nxt, self.conns[ci].rcv_nxt, &[], out);
 			return Outcome { reply_len: len, event: Event::None };
 		}
 		Outcome { reply_len: 0, event: Event::None }
 	}
 
-	// Build an Ethernet + IPv4 + TCP segment to the connection's peer with `flags`,
+	// Find the live connection an inbound segment belongs to (matched by its 4-tuple;
+	// our address is fixed, so local_port plus the remote address/port), or None.
+	fn find_conn(&self, remote_ip: Ipv4Addr, remote_port: u16, local_port: u16) -> Option<usize> {
+		for (i, c) in self.conns.iter().enumerate() {
+			if c.in_use && c.state != TcpState::Closed && c.remote_ip == remote_ip && c.remote_port == remote_port && c.local_port == local_port {
+				return Some(i);
+			}
+		}
+		None
+	}
+
+	// Open an inbound connection from a SYN to a listening port: allocate a pool slot,
+	// record the peer (its address and source MAC), enter SynRcvd, and build the SYN-ACK
+	// into `out`. No reply if the pool is full.
+	fn passive_open(&mut self, frame: &[u8], src_ip: Ipv4Addr, src_port: u16, dst_port: u16, seg_seq: u32, out: &mut [u8]) -> Outcome {
+		let ci: usize = match self.tcp_alloc() {
+			Some(i) => i,
+			None => return Outcome { reply_len: 0, event: Event::None },
+		};
+		let remote_mac: MacAddr = MacAddr([frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]]);
+		let iss: u32 = self.next_iss;
+		self.next_iss = self.next_iss.wrapping_add(0x1000);
+		let c: &mut TcpConn = &mut self.conns[ci];
+		c.state = TcpState::SynRcvd;
+		c.local_port = dst_port;
+		c.remote_ip = src_ip;
+		c.remote_port = src_port;
+		c.remote_mac = remote_mac;
+		c.rcv_nxt = seg_seq.wrapping_add(1);
+		c.snd_una = iss;
+		c.snd_nxt = iss.wrapping_add(1);
+		c.rx_len = 0;
+		let snd: u32 = self.conns[ci].snd_una;
+		let rcv: u32 = self.conns[ci].rcv_nxt;
+		let len: usize = self.build_tcp(ci, TCP_SYN | TCP_ACK, snd, rcv, &[], out);
+		Outcome { reply_len: len, event: Event::None }
+	}
+
+	// Build an Ethernet + IPv4 + TCP segment to connection `ci`'s peer with `flags`,
 	// sequence `seq`, acknowledgement `ack`, and `payload`, into `out`, returning its
 	// length (0 if it does not fit). No TCP options are emitted (a 20-byte header).
-	fn build_tcp(&self, flags: u8, seq: u32, ack: u32, payload: &[u8], out: &mut [u8]) -> usize {
+	fn build_tcp(&self, ci: usize, flags: u8, seq: u32, ack: u32, payload: &[u8], out: &mut [u8]) -> usize {
 		let total: usize = IPV4_HDR + TCP_HDR + payload.len();
 		if ETH_HDR + total > out.len() {
 			return 0;
 		}
-		out[0..6].copy_from_slice(&self.tcp.remote_mac.0);
+		out[0..6].copy_from_slice(&self.conns[ci].remote_mac.0);
 		out[6..12].copy_from_slice(&self.mac.0);
 		put16(out, 12, ETHERTYPE_IPV4);
 		// TCP header + payload.
 		let t: usize = ETH_HDR + IPV4_HDR;
-		put16(out, t, self.tcp.local_port);
-		put16(out, t + 2, self.tcp.remote_port);
+		put16(out, t, self.conns[ci].local_port);
+		put16(out, t + 2, self.conns[ci].remote_port);
 		put32(out, t + 4, seq);
 		put32(out, t + 8, ack);
 		out[t + 12] = (TCP_HDR as u8 / 4) << 4;
@@ -574,7 +706,7 @@ impl Stack {
 		put16(out, t + 16, 0);
 		put16(out, t + 18, 0);
 		out[t + TCP_HDR..t + TCP_HDR + payload.len()].copy_from_slice(payload);
-		let tcp_csum: u16 = tcp_checksum(self.ip, self.tcp.remote_ip, &out[t..t + TCP_HDR + payload.len()]);
+		let tcp_csum: u16 = tcp_checksum(self.ip, self.conns[ci].remote_ip, &out[t..t + TCP_HDR + payload.len()]);
 		put16(out, t + 16, tcp_csum);
 		// IPv4 header.
 		let ip: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + IPV4_HDR];
@@ -587,76 +719,154 @@ impl Stack {
 		ip[9] = IP_PROTO_TCP;
 		put16(ip, 10, 0);
 		ip[12..16].copy_from_slice(&self.ip.0);
-		ip[16..20].copy_from_slice(&self.tcp.remote_ip.0);
+		ip[16..20].copy_from_slice(&self.conns[ci].remote_ip.0);
 		let csum: u16 = checksum(&ip[..IPV4_HDR]);
 		put16(ip, 10, csum);
 		ETH_HDR + total
 	}
 
-	// Open the TCP connection to `ip`:`port` (next-hop MAC `mac`) from `local_port`
-	// with initial send sequence `iss`, entering SynSent. The caller then sends the SYN.
-	// Fields are reset in place (no large by-value temporary on the caller's stack).
-	pub fn tcp_open(&mut self, ip: Ipv4Addr, port: u16, mac: MacAddr, local_port: u16, iss: u32) {
-		self.tcp.state = TcpState::SynSent;
-		self.tcp.aborted = false;
-		self.tcp.peer_fin = false;
-		self.tcp.local_port = local_port;
-		self.tcp.remote_ip = ip;
-		self.tcp.remote_port = port;
-		self.tcp.remote_mac = mac;
-		self.tcp.snd_una = iss;
-		self.tcp.snd_nxt = iss.wrapping_add(1); // the SYN consumes one sequence number
-		self.tcp.rcv_nxt = 0;
-		self.tcp.rx_len = 0;
-	}
-
-	// Build the connection's SYN (seq = the initial send sequence) into `out`.
-	pub fn tcp_build_syn(&self, out: &mut [u8]) -> usize {
-		self.build_tcp(TCP_SYN, self.tcp.snd_una, 0, &[], out)
-	}
-
-	// Build a data segment carrying `data` (PSH|ACK) into `out` and advance the send
-	// sequence past it.
-	pub fn tcp_build_data(&mut self, data: &[u8], out: &mut [u8]) -> usize {
-		let seq: u32 = self.tcp.snd_nxt;
-		let len: usize = self.build_tcp(TCP_PSH | TCP_ACK, seq, self.tcp.rcv_nxt, data, out);
-		self.tcp.snd_nxt = self.tcp.snd_nxt.wrapping_add(data.len() as u32);
-		len
-	}
-
-	// Build a FIN|ACK to close our half into `out`, advancing the send sequence and
-	// entering FinWait.
-	pub fn tcp_build_fin(&mut self, out: &mut [u8]) -> usize {
-		let seq: u32 = self.tcp.snd_nxt;
-		let len: usize = self.build_tcp(TCP_FIN | TCP_ACK, seq, self.tcp.rcv_nxt, &[], out);
-		self.tcp.snd_nxt = self.tcp.snd_nxt.wrapping_add(1);
-		self.tcp.state = TcpState::FinWait;
-		len
-	}
-
-	// Whether the handshake completed.
-	pub fn tcp_established(&self) -> bool {
-		self.tcp.state == TcpState::Established
-	}
-
-	// Whether the peer reset the connection (refused / aborted).
-	pub fn tcp_aborted(&self) -> bool {
-		self.tcp.aborted
-	}
-
-	// Whether the peer has closed its half (sent a FIN).
-	pub fn tcp_peer_fin(&self) -> bool {
-		self.tcp.peer_fin
-	}
-
-	// Drain buffered received data into `dst`, returning the byte count moved.
-	pub fn tcp_take_rx(&mut self, dst: &mut [u8]) -> usize {
-		let n: usize = self.tcp.rx_len.min(dst.len());
-		dst[..n].copy_from_slice(&self.tcp.rx[..n]);
-		if n < self.tcp.rx_len {
-			self.tcp.rx.copy_within(n..self.tcp.rx_len, 0);
+	// Allocate a free connection slot for a new open (outbound or accepted), marking it
+	// in use and reset to a clean Closed state, or None if the pool is full.
+	pub fn tcp_alloc(&mut self) -> Option<usize> {
+		for (i, c) in self.conns.iter_mut().enumerate() {
+			if !c.in_use {
+				c.in_use = true;
+				c.state = TcpState::Closed;
+				c.aborted = false;
+				c.peer_fin = false;
+				c.pending_accept = false;
+				c.rx_len = 0;
+				return Some(i);
+			}
 		}
-		self.tcp.rx_len -= n;
+		None
+	}
+
+	// Release connection slot `ci` back to the pool (closed and free for reuse).
+	pub fn tcp_free(&mut self, ci: usize) {
+		let c: &mut TcpConn = &mut self.conns[ci];
+		c.in_use = false;
+		c.state = TcpState::Closed;
+		c.aborted = false;
+		c.peer_fin = false;
+		c.pending_accept = false;
+		c.rx_len = 0;
+	}
+
+	// Start accepting inbound connections on `port` (passive open). Idempotent; false
+	// only if the listen table is full.
+	pub fn listen(&mut self, port: u16) -> bool {
+		for p in self.listen_ports.iter() {
+			if *p == port {
+				return true;
+			}
+		}
+		for p in self.listen_ports.iter_mut() {
+			if *p == 0 {
+				*p = port;
+				return true;
+			}
+		}
+		false
+	}
+
+	// Stop accepting inbound connections on `port`.
+	pub fn unlisten(&mut self, port: u16) {
+		for p in self.listen_ports.iter_mut() {
+			if *p == port {
+				*p = 0;
+			}
+		}
+	}
+
+	// Whether we accept inbound connections on `port`.
+	fn is_listening(&self, port: u16) -> bool {
+		self.listen_ports.iter().any(|&p: &u16| p == port)
+	}
+
+	// Take the next established-but-not-yet-handed-out connection accepted on `port`
+	// (clearing its pending flag), for the listener's `accept` to hand to a socket.
+	pub fn take_accepted(&mut self, port: u16) -> Option<usize> {
+		for (i, c) in self.conns.iter_mut().enumerate() {
+			if c.in_use && c.pending_accept && c.local_port == port && c.state == TcpState::Established {
+				c.pending_accept = false;
+				return Some(i);
+			}
+		}
+		None
+	}
+
+	// Open connection `ci` to `ip`:`port` (next-hop MAC `mac`) from `local_port` with
+	// initial send sequence `iss`, entering SynSent. The caller then sends the SYN.
+	// Fields are reset in place (no large by-value temporary on the caller's stack).
+	pub fn tcp_open(&mut self, ci: usize, ip: Ipv4Addr, port: u16, mac: MacAddr, local_port: u16, iss: u32) {
+		let c: &mut TcpConn = &mut self.conns[ci];
+		c.in_use = true;
+		c.state = TcpState::SynSent;
+		c.aborted = false;
+		c.peer_fin = false;
+		c.pending_accept = false;
+		c.local_port = local_port;
+		c.remote_ip = ip;
+		c.remote_port = port;
+		c.remote_mac = mac;
+		c.snd_una = iss;
+		c.snd_nxt = iss.wrapping_add(1); // the SYN consumes one sequence number
+		c.rcv_nxt = 0;
+		c.rx_len = 0;
+	}
+
+	// Build connection `ci`'s SYN (seq = the initial send sequence) into `out`.
+	pub fn tcp_build_syn(&self, ci: usize, out: &mut [u8]) -> usize {
+		self.build_tcp(ci, TCP_SYN, self.conns[ci].snd_una, 0, &[], out)
+	}
+
+	// Build a data segment carrying `data` (PSH|ACK) on connection `ci` into `out` and
+	// advance its send sequence past it.
+	pub fn tcp_build_data(&mut self, ci: usize, data: &[u8], out: &mut [u8]) -> usize {
+		let seq: u32 = self.conns[ci].snd_nxt;
+		let ack: u32 = self.conns[ci].rcv_nxt;
+		let len: usize = self.build_tcp(ci, TCP_PSH | TCP_ACK, seq, ack, data, out);
+		self.conns[ci].snd_nxt = self.conns[ci].snd_nxt.wrapping_add(data.len() as u32);
+		len
+	}
+
+	// Build a FIN|ACK to close our half of connection `ci` into `out`, advancing its
+	// send sequence and entering FinWait.
+	pub fn tcp_build_fin(&mut self, ci: usize, out: &mut [u8]) -> usize {
+		let seq: u32 = self.conns[ci].snd_nxt;
+		let ack: u32 = self.conns[ci].rcv_nxt;
+		let len: usize = self.build_tcp(ci, TCP_FIN | TCP_ACK, seq, ack, &[], out);
+		self.conns[ci].snd_nxt = self.conns[ci].snd_nxt.wrapping_add(1);
+		self.conns[ci].state = TcpState::FinWait;
+		len
+	}
+
+	// Whether connection `ci`'s handshake completed.
+	pub fn tcp_established(&self, ci: usize) -> bool {
+		self.conns[ci].state == TcpState::Established
+	}
+
+	// Whether the peer reset connection `ci` (refused / aborted).
+	pub fn tcp_aborted(&self, ci: usize) -> bool {
+		self.conns[ci].aborted
+	}
+
+	// Whether the peer has closed its half of connection `ci` (sent a FIN).
+	pub fn tcp_peer_fin(&self, ci: usize) -> bool {
+		self.conns[ci].peer_fin
+	}
+
+	// Drain buffered received data from connection `ci` into `dst`, returning the byte
+	// count moved.
+	pub fn tcp_take_rx(&mut self, ci: usize, dst: &mut [u8]) -> usize {
+		let rx_len: usize = self.conns[ci].rx_len;
+		let n: usize = rx_len.min(dst.len());
+		dst[..n].copy_from_slice(&self.conns[ci].rx[..n]);
+		if n < rx_len {
+			self.conns[ci].rx.copy_within(n..rx_len, 0);
+		}
+		self.conns[ci].rx_len -= n;
 		n
 	}
 

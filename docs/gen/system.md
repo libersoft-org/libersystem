@@ -156,6 +156,25 @@ An opaque kernel object, transferred as `handle<file>`.
 | `ep` | `endpoint` |
 | `request` | `list<u8>` |
 
+### enum `sock-state`
+
+| case | ordinal |
+| --- | --- |
+| `closed` | 0 |
+| `syn-sent` | 1 |
+| `syn-rcvd` | 2 |
+| `established` | 3 |
+| `fin-wait` | 4 |
+| `listen` | 5 |
+
+### record `sock-info`
+
+| field | type |
+| --- | --- |
+| `local-port` | `u16` |
+| `remote` | `endpoint` |
+| `state` | `sock-state` |
+
 ### record `chunk`
 
 | field | type |
@@ -230,6 +249,8 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 4 | `fetch` | `fetch(req: tcp-request) -> result<list<u8>, error>` |
 | 5 | `connect` | `connect(ep: endpoint) -> result<handle<channel>, error>` |
 | 6 | `open` | `open() -> result<handle<channel>, error>` |
+| 7 | `listen` | `listen(port: u16) -> result<handle<channel>, error>` |
+| 8 | `sockets` | `sockets() -> result<list<sock-info>, error>` |
 
 ### interface `socket`
 
@@ -240,4 +261,12 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 1 | `send` | `send(data: buffer) -> result<u32, error>` |
 | 2 | `recv` | `recv() -> stream<chunk>` |
 | 3 | `close` | `close() -> result<unit, error>` |
+
+### interface `listener`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `accept` | `accept() -> result<handle<channel>, error>` |
 
