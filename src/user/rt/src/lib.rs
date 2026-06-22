@@ -268,6 +268,94 @@ where
 	}
 }
 
+// The reserved control opcode a holder of a multi-client service's channel sends to
+// mint its own independent client connection (the generic equivalent of
+// NetworkService's typed `open`). `serve_multi` intercepts it before the typed
+// dispatch and replies with a fresh client endpoint; the matching service endpoint
+// joins its wait set. No typed interface uses opcode 0xffff, so it never collides
+// with a real request.
+pub const CONNECT_OP: u16 = 0xffff;
+
+// Multi-client serve loop: like `serve`, but multiplexes a growing set of client
+// channels (starting with `root`) with `wait_any`, so several independent clients
+// share one service while each keeps its own request/reply stream. A `CONNECT_OP`
+// request mints a fresh channel pair, keeps the service end in the set, and replies
+// with the client end (so a holder of any channel here can spawn another connection);
+// every other request is passed to `handle_request` - the generated `<iface>::dispatch`
+// shape, plus the channel it arrived on as the first argument (for ops that stream
+// out of band on that connection). A sub-client channel closing (or sending the empty
+// quit sentinel) is dropped from the set; the loop ends when the root closes.
+pub unsafe fn serve_multi<F>(root: u64, request: &mut [u8], reply: &mut [u8], mut handle_request: F)
+where
+	F: FnMut(u64, &[u8], u64, &mut [u8], &mut u64) -> Option<usize>,
+{
+	unsafe {
+		let mut chans: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+		chans.push(root);
+		while !chans.is_empty() {
+			let ready: i64 = wait_any(&chans, 0);
+			if ready < 0 {
+				continue;
+			}
+			let idx: usize = ready as usize;
+			let chan: u64 = chans[idx];
+			match recv_blocking(chan, request) {
+				// the empty quit sentinel: the root ends the service, a sub-client drops.
+				Received::Message { len, .. } if len == 0 => {
+					if idx == 0 {
+						break;
+					}
+					close(chan);
+					chans.swap_remove(idx);
+				}
+				Received::Message { len, handle } => {
+					if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == CONNECT_OP {
+						// mint a fresh independent client connection for the caller.
+						match channel() {
+							Some((mine, theirs)) => {
+								chans.push(mine);
+								send_blocking(chan, &[], theirs);
+							}
+							None => {
+								send_blocking(chan, &[], 0);
+							}
+						}
+					} else {
+						let mut reply_handle: u64 = 0;
+						if let Some(n) = handle_request(chan, &request[..len], handle, reply, &mut reply_handle) {
+							send_blocking(chan, &reply[..n], reply_handle);
+						}
+					}
+				}
+				Received::Closed => {
+					if idx == 0 {
+						break;
+					}
+					close(chan);
+					chans.swap_remove(idx);
+				}
+			}
+		}
+	}
+}
+
+// Mint an independent client connection to a multi-client service reachable on
+// `factory` (a channel served by `serve_multi`): send the reserved connect request
+// and return the fresh client channel the service handed back, or None on failure.
+pub unsafe fn service_connect(factory: u64) -> Option<u64> {
+	unsafe {
+		let req: [u8; 2] = CONNECT_OP.to_le_bytes();
+		if !send_blocking(factory, &req, 0) {
+			return None;
+		}
+		let mut buf: [u8; 16] = [0u8; 16];
+		match recv_blocking(factory, &mut buf) {
+			Received::Message { handle, .. } if handle != 0 => Some(handle),
+			_ => None,
+		}
+	}
+}
+
 // A proto Transport over an rt channel: send the request (with any out-of-band
 // handle), then block for the reply (whose own out-of-band handle is returned
 // alongside the bytes). Every userspace program that drives a generated service

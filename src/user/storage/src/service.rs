@@ -64,20 +64,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	let mut vol: Volume = Volume { base: volume_base, len: volume_len };
 	let mut reply: [u8; 64] = [0u8; 64];
-	loop {
-		match unsafe { recv_blocking(service, &mut buf) } {
-			// An empty message is an explicit quit sentinel: a client that cannot
-			// close its endpoint to signal end-of-stream (e.g. the kernel keeping the
-			// peer to read the reply) sends a zero-length message to end the session.
-			Received::Message { len, .. } if len == 0 => break,
-			Received::Message { len, handle } => {
-				let mut reply_handle: u64 = 0;
-				if let Some(n) = volume::dispatch(&mut vol, &buf[..len], handle, &mut reply, &mut reply_handle) {
-					unsafe { send_blocking(service, &reply[..n], reply_handle) };
-				}
-			}
-			Received::Closed => break,
-		}
+	unsafe {
+		serve_multi(service, &mut buf, &mut reply, |_chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { volume::dispatch(&mut vol, req, handle, out, reply_handle) });
 	}
 	exit();
 }

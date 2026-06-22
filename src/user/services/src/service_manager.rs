@@ -221,7 +221,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"time_service" && !bootstrap_time_service(manager_side, *net_client, time_client) {
 			return State::Failed;
 		}
-		if name == b"console_service" && !bootstrap_console_service(manager_side, console_client) {
+		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, console_client, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *console_client, pkg_handle, pkg_len, buf) {
@@ -333,8 +333,16 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 // with the duplicate. We keep our own handle and mapping; the kernel allows the
 // same object to be mapped in both address spaces.
 unsafe fn bootstrap_package(manager_side: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+	unsafe { bootstrap_package_rights(manager_side, pkg_handle, pkg_len, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER, buf) }
+}
+
+// The general form: hand a service the package under an explicit rights set. Most
+// launchers get read + map + transfer (enough to map it and pass it on); ConsoleService
+// additionally gets RIGHT_DUPLICATE, since it is itself a launcher and must re-grant a
+// read-only view of the package to every shell it spawns.
+unsafe fn bootstrap_package_rights(manager_side: u64, pkg_handle: u64, pkg_len: usize, rights: u32, buf: &mut [u8]) -> bool {
 	unsafe {
-		let dup: i64 = duplicate(pkg_handle, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+		let dup: i64 = duplicate(pkg_handle, rights);
 		if dup < 0 {
 			return false;
 		}
@@ -417,12 +425,18 @@ unsafe fn bootstrap_time_service(manager_side: u64, net_client: u64, time_client
 	}
 }
 
-// Hand ConsoleService the client end of a fresh console channel over "CLIENT": it is
-// the terminal the shell talks to (the shell writes its output to it and reads its
-// keystrokes from it). The other end is kept in `*console_client` and later handed to
-// the shell as "CONSOLE". ConsoleService maps the framebuffer itself (the kernel
-// console then stops drawing) and attaches to the kernel console input for keys.
-unsafe fn bootstrap_console_service(manager_side: u64, console_client: &mut u64) -> bool {
+// Hand ConsoleService the client end of a fresh console channel over "CLIENT" (VT 1's
+// terminal: the shell writes its output to it and reads its keystrokes from it), then
+// a *factory* connection to every multi-client service plus a read-only view of the
+// init package. ConsoleService is the session spawner: when it opens an additional
+// virtual terminal it mints a fresh per-VT client from each factory (`service_connect`
+// / `network.open`) and spawns that VT's shell with the full capability set, so every
+// VT runs a fully-capable shell over its own independent service connections. The
+// factories are independent connections (not the supervisor's own clients or VT 1's),
+// so minting from them never crosses the supervisor's lifecycle traffic. ConsoleService
+// maps the framebuffer itself (the kernel console then stops drawing) and attaches to
+// the kernel console input for keys.
+unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, console_client: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		let (service_end, client_end): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -432,6 +446,48 @@ unsafe fn bootstrap_console_service(manager_side: u64, console_client: &mut u64)
 			return false;
 		}
 		*console_client = client_end;
-		true
+		// A factory connection per serve_multi service, minted with `service_connect`.
+		if !send_factory(manager_side, b"FSTORAGE", storage_client) {
+			return false;
+		}
+		if !send_factory(manager_side, b"FLOG", log_client) {
+			return false;
+		}
+		if !send_factory(manager_side, b"FDEVICE", device_client) {
+			return false;
+		}
+		if !send_factory(manager_side, b"FPROCESS", process_client) {
+			return false;
+		}
+		if !send_factory(manager_side, b"FCONFIG", config_client) {
+			return false;
+		}
+		if !send_factory(manager_side, b"FTIME", time_client) {
+			return false;
+		}
+		// NetworkService is multi-client through its own typed `open`, not serve_multi.
+		let mut net = network::Client::new(ChannelTransport { chan: net_client });
+		let net_fac: u64 = match net.open() {
+			Some(Ok(h)) => h,
+			_ => return false,
+		};
+		if !send_blocking(manager_side, b"FNET", net_fac) {
+			return false;
+		}
+		// A read-only view of the init package so ConsoleService can spawn shells. It
+		// re-grants this to every VT's shell, so it needs RIGHT_DUPLICATE as well.
+		bootstrap_package_rights(manager_side, pkg_handle, pkg_len, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER | RIGHT_DUPLICATE, buf)
+	}
+}
+
+// Mint an independent factory connection to a serve_multi service and transfer it to
+// ConsoleService under `tag`. The factory is a fresh client connection, so the
+// session spawner can mint per-VT clients from it without racing other holders.
+unsafe fn send_factory(manager_side: u64, tag: &[u8], root: u64) -> bool {
+	unsafe {
+		match service_connect(root) {
+			Some(fac) => send_blocking(manager_side, tag, fac),
+			None => false,
+		}
 	}
 }

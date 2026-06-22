@@ -102,12 +102,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut request: [u8; 1024] = [0u8; 1024];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
-		serve(service, &mut request, &mut reply, |req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
+		serve_multi(service, &mut request, &mut reply, |chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
 			// OP_TAIL opens a stream served out of band (no byte reply); everything else
-			// dispatches to a single reply.
+			// dispatches to a single reply. The stream is minted on the channel the
+			// request arrived on, so each client gets its own tail.
 			let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
 			if op == log::OP_TAIL {
-				stream_tail(&mut journal, service, req);
+				stream_tail(&mut journal, chan, req);
 				None
 			} else {
 				log::dispatch(&mut journal, req, handle, out, reply_handle)

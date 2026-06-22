@@ -17,6 +17,8 @@
 
 use rt::*;
 
+use proto::system::network;
+
 extern crate alloc;
 use alloc::vec::Vec;
 
@@ -780,42 +782,107 @@ impl Term {
 	}
 }
 
+// The number of virtual terminals the console multiplexes. Each VT is an independent
+// shell over its own per-VT service connections; the foreground VT owns the display.
+const NVT: usize = 4;
+
+// Control-byte chords intercepted by the console (never forwarded to a shell): the
+// virtio-input driver maps Ctrl+N to 0x0e (open a new VT) and Ctrl+] to 0x1d (cycle the
+// foreground). F-keys are not mapped by the driver and Alt+key collides with escape
+// sequences, so single control bytes are the unambiguous, unobtrusive switch keys.
+const CHORD_NEW: u8 = 0x0e;
+const CHORD_NEXT: u8 = 0x1d;
+
+// One virtual terminal: its render state (a cell grid; None when headless) and the
+// service end of the console channel its shell writes output to and reads keys from.
+struct Vt {
+	term: Option<Term>,
+	client: u64,
+}
+
+// The capabilities ConsoleService holds to spawn a shell for any additional VT: a
+// factory connection to each multi-client service (it mints a fresh per-VT client from
+// each with `service_connect` / `network.open`) and the init package handle (it dups a
+// read-only view per shell, and looks up the shell ELF in it).
+struct Factories {
+	storage: u64,
+	log: u64,
+	device: u64,
+	process: u64,
+	config: u64,
+	net: u64,
+	time: u64,
+	pkg_handle: u64,
+}
+
+// The whole console session: the framebuffer it owns, the kernel keystroke channel, the
+// live VTs (vts[fg] is foreground and owns the display), and the spawn capabilities.
+struct Console {
+	addr: u64,
+	fb: Framebuffer,
+	has_fb: bool,
+	input: u64,
+	vts: Vec<Vt>,
+	fg: usize,
+	facs: Factories,
+	package: Package<'static>,
+	pkg_len: usize,
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	unsafe {
-		// 1. receive the client (shell) end of the console channel from the supervisor.
+		// 1. receive VT 1's console channel (its shell, spawned by ServiceManager, holds
+		//    the other end), then a factory connection per multi-client service and a
+		//    read-only view of the init package: the capabilities to spawn additional VTs.
 		let client: u64 = recv_tagged(bootstrap, &mut buf, b"CLIENT").unwrap_or_else(|| exit());
+		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"FSTORAGE").unwrap_or_else(|| exit());
+		let log: u64 = recv_tagged(bootstrap, &mut buf, b"FLOG").unwrap_or_else(|| exit());
+		let device: u64 = recv_tagged(bootstrap, &mut buf, b"FDEVICE").unwrap_or_else(|| exit());
+		let process: u64 = recv_tagged(bootstrap, &mut buf, b"FPROCESS").unwrap_or_else(|| exit());
+		let config: u64 = recv_tagged(bootstrap, &mut buf, b"FCONFIG").unwrap_or_else(|| exit());
+		let time: u64 = recv_tagged(bootstrap, &mut buf, b"FTIME").unwrap_or_else(|| exit());
+		let net: u64 = recv_tagged(bootstrap, &mut buf, b"FNET").unwrap_or_else(|| exit());
+		let (pkg_handle, archive): (u64, &'static [u8]) = recv_package(bootstrap, &mut buf).unwrap_or_else(|| exit());
+		let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
+		let pkg_len: usize = archive.len();
 
 		// 2. map the framebuffer (this hands us the display; the kernel console stops).
 		//    A headless boot has no framebuffer; we still serve so input/serial work.
 		let mut fb: Framebuffer = Framebuffer::default();
-		let addr: i64 = framebuffer_map(&mut fb);
-		let mut term: Option<Term> = if sys_is_err(addr as u64) {
-			None
-		} else {
-			let mut t = Term::new(addr as u64, &fb);
+		let addr_raw: i64 = framebuffer_map(&mut fb);
+		let has_fb: bool = !sys_is_err(addr_raw as u64);
+		let addr: u64 = addr_raw as u64;
+		let term: Option<Term> = if has_fb {
+			let mut t = Term::new(addr, &fb);
 			t.clear();
 			for &b in b"ConsoleService: online\n" {
 				t.put_byte(b);
 			}
 			t.flush();
 			Some(t)
+		} else {
+			None
 		};
 
 		// 3. report in to the supervisor.
 		send_blocking(bootstrap, b"ConsoleService: online", 0);
 
-		// 4. run the terminal loop.
-		run(&mut term, client);
+		// 4. run the multiplexing terminal loop, starting with VT 1.
+		let facs: Factories = Factories { storage, log, device, process, config, net, time, pkg_handle };
+		let mut console: Console = Console { addr, fb, has_fb, input: 0, vts: alloc::vec![Vt { term, client }], fg: 0, facs, package, pkg_len };
+		run(&mut console);
 	}
 }
 
-// The terminal loop: attach to the kernel's console input, then multiplex the
-// keystroke channel and the client's output channel. Keystrokes are forwarded to the
-// client; output bytes are rendered to the framebuffer (if any) and mirrored to the
-// serial port. A blink timeout toggles the caret while idle.
-unsafe fn run(term: &mut Option<Term>, client: u64) -> ! {
+// The session loop: attach to the kernel's console input, then multiplex the keystroke
+// channel and every live VT's output channel. Keystrokes go to the foreground VT's shell
+// unless they are a switch chord (intercepted here); a VT's output is rendered into its
+// own grid, and the foreground VT flushes to the framebuffer and mirrors to the serial
+// port. A self-driven blink timer is avoided: a thread that re-blocks on a deadline keeps
+// the cooperative `run_until_idle` (the boot driver) from ever settling.
+unsafe fn run(console: &mut Console) -> ! {
 	unsafe {
 		// attach a channel the kernel feeds keystrokes on.
 		let (feed, input): (u64, u64) = match channel() {
@@ -825,45 +892,178 @@ unsafe fn run(term: &mut Option<Term>, client: u64) -> ! {
 		if sys_is_err(syscall(SYS_CONSOLE_ATTACH, feed, 0, 0, 0)) {
 			exit();
 		}
-		let waits: [u64; 2] = [input, client];
+		console.input = input;
 		let mut keys: [u8; 64] = [0u8; 64];
 		let mut out: [u8; 1024] = [0u8; 1024];
+		let mut waits: [u64; 1 + NVT] = [0u64; 1 + NVT];
 		loop {
-			// Block (no deadline) until a keystroke or output arrives. A self-driven
-			// blink timer is avoided here: a thread that re-blocks on a deadline keeps
-			// the cooperative `run_until_idle` (the boot driver) from ever settling, so
-			// the caret stays solid for now (blinking is a later post-boot refinement).
-			let ready: i64 = wait_any(&waits, 0);
+			// wait set: the keyboard channel (index 0) then each VT's console channel.
+			waits[0] = console.input;
+			let n: usize = console.vts.len();
+			for i in 0..n {
+				waits[1 + i] = console.vts[i].client;
+			}
+			let ready: i64 = wait_any(&waits[..1 + n], 0);
 			if ready < 0 {
 				continue;
 			}
-			match ready as usize {
-				0 => {
-					// keystrokes from the kernel console input -> forward to the client.
-					match recv_blocking(input, &mut keys) {
-						Received::Message { len, .. } => {
-							send_blocking(client, &keys[..len], 0);
-						}
-						Received::Closed => {}
-					}
+			let r: usize = ready as usize;
+			if r == 0 {
+				// keystrokes from the kernel console input.
+				if let Received::Message { len, .. } = recv_blocking(console.input, &mut keys) {
+					handle_keys(console, &keys[..len]);
 				}
-				1 => {
-					// output bytes from the client -> render + mirror to the serial port.
-					match recv_blocking(client, &mut out) {
-						Received::Message { len, .. } => {
-							if let Some(t) = term.as_mut() {
-								for &b in &out[..len] {
-									t.put_byte(b);
-								}
-								t.flush();
-							}
-							print(&out[..len]);
-						}
-						Received::Closed => exit(),
-					}
+			} else {
+				// output bytes from VT (r - 1)'s shell.
+				let vi: usize = r - 1;
+				match recv_blocking(console.vts[vi].client, &mut out) {
+					Received::Message { len, .. } => render_output(console, vi, &out[..len]),
+					Received::Closed => close_vt(console, vi),
 				}
-				_ => {}
 			}
 		}
+	}
+}
+
+// Render a VT's output: append it to that VT's grid, and if it is the foreground VT flush
+// the grid to the framebuffer and mirror the bytes to the serial port.
+unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
+	unsafe {
+		let fg: bool = vi == console.fg;
+		if let Some(t) = console.vts[vi].term.as_mut() {
+			for &b in bytes {
+				t.put_byte(b);
+			}
+			if fg {
+				t.flush();
+			}
+		}
+		if fg {
+			print(bytes);
+		}
+	}
+}
+
+// Dispatch keystrokes: a switch chord opens or cycles VTs (intercepted, never seen by a
+// shell); any other byte is forwarded to the foreground VT's shell.
+unsafe fn handle_keys(console: &mut Console, keys: &[u8]) {
+	unsafe {
+		for &b in keys {
+			if b == CHORD_NEW {
+				create_vt(console);
+			} else if b == CHORD_NEXT {
+				switch_next(console);
+			} else {
+				send_blocking(console.vts[console.fg].client, &[b], 0);
+			}
+		}
+	}
+}
+
+// Open a new virtual terminal: spawn a fully-capable shell over its own per-VT service
+// connections, make it foreground, and repaint. A no-op when headless or at the VT cap.
+unsafe fn create_vt(console: &mut Console) {
+	unsafe {
+		if !console.has_fb || console.vts.len() >= NVT {
+			return;
+		}
+		if let Some(vt) = spawn_vt(&console.facs, &console.package, console.pkg_len, console.addr, &console.fb) {
+			console.vts.push(vt);
+			console.fg = console.vts.len() - 1;
+			repaint(console);
+		}
+	}
+}
+
+// Cycle the foreground to the next VT (round-robin) and repaint it. A no-op with one VT.
+unsafe fn switch_next(console: &mut Console) {
+	if console.vts.len() <= 1 {
+		return;
+	}
+	console.fg = (console.fg + 1) % console.vts.len();
+	repaint(console);
+}
+
+// A VT's shell exited (its console channel closed): drop the VT and its connection. If it
+// was the last VT, the session is over and ConsoleService exits with it.
+unsafe fn close_vt(console: &mut Console, vi: usize) {
+	unsafe {
+		if console.vts.len() <= 1 {
+			exit();
+		}
+		close(console.vts[vi].client);
+		console.vts.remove(vi);
+		if console.fg >= console.vts.len() {
+			console.fg = console.vts.len() - 1;
+		} else if console.fg > vi {
+			console.fg -= 1;
+		}
+		repaint(console);
+	}
+}
+
+// Repaint the foreground VT's whole screen from its grid (after a switch or a VT add /
+// remove changed which grid owns the display).
+fn repaint(console: &mut Console) {
+	if let Some(t) = console.vts[console.fg].term.as_mut() {
+		t.mark_all_dirty();
+		t.flush();
+	}
+}
+
+// Spawn one VT's shell: mint a fresh per-VT client from each service factory, create the
+// VT's console channel, spawn the shell ELF from the package, and hand it the full
+// capability set in the order it expects (STORAGE, LOG, DEVICE, PROCESS, CONFIG, NET,
+// TIME, CONSOLE, then PACKAGE). Wait for the shell's "online" report (it self-checks
+// storage over its own connection), then nudge it to print its first prompt. Returns the
+// VT (its cleared grid + the service end of its console channel) or None on any failure.
+unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u64, fb: &Framebuffer) -> Option<Vt> {
+	unsafe {
+		let shell_elf: &[u8] = package.lookup(b"shell")?;
+		let storage: u64 = service_connect(facs.storage)?;
+		let log: u64 = service_connect(facs.log)?;
+		let device: u64 = service_connect(facs.device)?;
+		let process: u64 = service_connect(facs.process)?;
+		let config: u64 = service_connect(facs.config)?;
+		let time: u64 = service_connect(facs.time)?;
+		let mut net = network::Client::new(ChannelTransport { chan: facs.net });
+		let net_client: u64 = match net.open() {
+			Some(Ok(h)) => h,
+			_ => return None,
+		};
+		let (vt_service, vt_client): (u64, u64) = channel()?;
+		let (boot_parent, boot_child): (u64, u64) = channel()?;
+		if spawn(shell_elf, boot_child) < 0 {
+			return None;
+		}
+		send_blocking(boot_parent, b"STORAGE", storage);
+		send_blocking(boot_parent, b"LOG", log);
+		send_blocking(boot_parent, b"DEVICE", device);
+		send_blocking(boot_parent, b"PROCESS", process);
+		send_blocking(boot_parent, b"CONFIG", config);
+		send_blocking(boot_parent, b"NET", net_client);
+		send_blocking(boot_parent, b"TIME", time);
+		send_blocking(boot_parent, b"CONSOLE", vt_client);
+		let pkg_dup: i64 = duplicate(facs.pkg_handle, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+		if pkg_dup < 0 {
+			return None;
+		}
+		let mut pbuf: [u8; 16] = [0u8; 16];
+		pbuf[..7].copy_from_slice(b"PACKAGE");
+		pbuf[7..15].copy_from_slice(&(pkg_len as u64).to_le_bytes());
+		send_blocking(boot_parent, &pbuf[..15], pkg_dup as u64);
+		// wait for the shell to self-check storage and report in, then drop its bootstrap.
+		let mut rbuf: [u8; 32] = [0u8; 32];
+		if let Received::Closed = recv_blocking(boot_parent, &mut rbuf) {
+			close(boot_parent);
+			return None;
+		}
+		close(boot_parent);
+		// nudge the new shell to print its first prompt: an empty line dispatches to a
+		// silent reprompt, the same first prompt VT 1 shows at boot.
+		send_blocking(vt_service, b"\n", 0);
+		let mut term: Term = Term::new(addr, fb);
+		term.clear();
+		Some(Vt { term: Some(term), client: vt_service })
 	}
 }
