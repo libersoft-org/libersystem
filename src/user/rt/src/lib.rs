@@ -108,6 +108,27 @@ pub fn set_stdout(channel: u64) {
 	STDOUT.store(channel, Ordering::Relaxed);
 }
 
+// This program's current stdout console channel (0 = the kernel debug port). A
+// launcher duplicates it to hand its children the same console.
+pub fn stdout() -> u64 {
+	STDOUT.load(Ordering::Relaxed)
+}
+
+// Adopt a stdout console channel a launcher sent as the first bootstrap message
+// ("STDOUT" + the channel handle), so a spawned program's `print` output is routed to
+// the same console as its parent. A no-op if the first message is not a STDOUT one
+// (the handle 0 then restores the debug-port fallback).
+pub unsafe fn inherit_stdout(bootstrap: u64) {
+	unsafe {
+		let mut buf: [u8; 16] = [0u8; 16];
+		if let Received::Message { len, handle } = recv_blocking(bootstrap, &mut buf) {
+			if len >= 6 && &buf[..6] == b"STDOUT" {
+				set_stdout(handle);
+			}
+		}
+	}
+}
+
 // Block until the object behind `handle` becomes ready (a channel readable, an
 // event signaled, a timer expired) or `deadline` (absolute ticks; 0 = no
 // timeout) passes. Returns 0 when ready, a small negative error otherwise. This

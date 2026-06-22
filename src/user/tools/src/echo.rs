@@ -18,6 +18,7 @@ use rt::*;
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	unsafe {
+		inherit_stdout(bootstrap);
 		// The parent (the shell) hands us our arguments as one message; echo them.
 		if let Received::Message { len, .. } = recv_blocking(bootstrap, &mut buf) {
 			print(&buf[..len]);

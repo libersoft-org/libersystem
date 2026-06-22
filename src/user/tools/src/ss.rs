@@ -20,6 +20,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 64] = [0u8; 64];
 	unsafe {
 		// The shell transfers our NetworkService client channel (we take no arguments).
+		inherit_stdout(bootstrap);
 		let netsvc: u64 = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { handle, .. } => handle,
 			Received::Closed => exit(),

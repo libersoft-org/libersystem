@@ -21,6 +21,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		// The shell hands us our argument (the target address) plus our NetworkService
 		// client channel as a transferred capability, in one message.
+		inherit_stdout(bootstrap);
 		let (len, netsvc): (usize, u64) = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, handle } => (len, handle),
 			Received::Closed => exit(),

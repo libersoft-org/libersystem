@@ -542,9 +542,11 @@ unsafe fn exec(package: &Package, name: &[u8], args: &[u8], cap: u64) {
 			close(parent);
 			return;
 		}
-		// Hand the child its arguments (and an optional inherited capability, e.g. a
-		// NetworkService client channel for a net tool), then block until it signals
-		// completion.
+		// Hand the child our console as its stdout (a SEND dup of our console channel),
+		// so the program's output renders on the same terminal; then its arguments (and an
+		// optional inherited capability, e.g. a NetworkService client), then block until it
+		// signals completion.
+		send_stdout(parent);
 		send_blocking(parent, args, cap);
 		let mut done: [u8; 16] = [0u8; 16];
 		match recv_blocking(parent, &mut done) {
@@ -579,8 +581,30 @@ unsafe fn exec_bg(package: &Package, name: &[u8], args: &[u8], cap: u64) {
 			close(parent);
 			return;
 		}
+		send_stdout(parent);
 		send_blocking(parent, args, cap);
 		close(parent);
+	}
+}
+
+// Hand a freshly spawned child our console as its stdout: a SEND dup of our console
+// channel transferred in a "STDOUT" message (the child's `rt::inherit_stdout` adopts
+// it), so the program's `print` output renders on the same terminal. Sent before the
+// argv/capability message. A handle of 0 (no console) leaves the child on serial.
+unsafe fn send_stdout(parent: u64) {
+	unsafe {
+		let so: u64 = stdout();
+		let dup: u64 = if so != 0 {
+			let d: i64 = duplicate(so, RIGHT_SEND | RIGHT_TRANSFER);
+			if d > 0 {
+				d as u64
+			} else {
+				0
+			}
+		} else {
+			0
+		};
+		send_blocking(parent, b"STDOUT", dup);
 	}
 }
 

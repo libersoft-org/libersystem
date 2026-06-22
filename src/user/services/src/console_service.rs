@@ -39,9 +39,6 @@ const ANSI_PALETTE: [(u8, u8, u8); 16] = [
 	(0x55, 0x55, 0xff), (0xff, 0x55, 0xff), (0x55, 0xff, 0xff), (0xff, 0xff, 0xff),
 ];
 
-// The caret blinks every this many monotonic ticks (100 Hz -> ~0.5 s) while idle.
-const BLINK_TICKS: u64 = 50;
-
 // The terminal: the mapped framebuffer + geometry, the text cursor, the current SGR
 // colours, and the output escape-parser state.
 struct Term {
@@ -298,12 +295,6 @@ impl Term {
 			}
 		}
 	}
-
-	// Toggle the caret for the blink animation.
-	fn blink(&mut self) {
-		self.invert_caret();
-		self.caret_shown = !self.caret_shown;
-	}
 }
 
 #[unsafe(no_mangle)]
@@ -354,13 +345,12 @@ unsafe fn run(term: &mut Option<Term>, client: u64) -> ! {
 		let mut keys: [u8; 64] = [0u8; 64];
 		let mut out: [u8; 1024] = [0u8; 1024];
 		loop {
-			let deadline: u64 = clock() + BLINK_TICKS;
-			let ready: i64 = wait_any(&waits, deadline);
+			// Block (no deadline) until a keystroke or output arrives. A self-driven
+			// blink timer is avoided here: a thread that re-blocks on a deadline keeps
+			// the cooperative `run_until_idle` (the boot driver) from ever settling, so
+			// the caret stays solid for now (blinking is a later post-boot refinement).
+			let ready: i64 = wait_any(&waits, 0);
 			if ready < 0 {
-				// idle: blink the caret and wait again.
-				if let Some(t) = term.as_mut() {
-					t.blink();
-				}
 				continue;
 			}
 			match ready as usize {
