@@ -27,6 +27,16 @@ use crate::virtio::{Queue, Virtio};
 const EV_KEY: u16 = 1;
 const EVENT_SIZE: u64 = 8;
 
+// Linux keycodes for the navigation keys (all above the 64-entry ASCII KEYMAP), which
+// the driver turns into ANSI escape sequences rather than glyphs.
+const KEY_HOME: u16 = 102;
+const KEY_UP: u16 = 103;
+const KEY_LEFT: u16 = 105;
+const KEY_RIGHT: u16 = 106;
+const KEY_END: u16 = 107;
+const KEY_DOWN: u16 = 108;
+const KEY_DELETE: u16 = 111;
+
 // Linux input keycode -> ASCII for the unshifted main block: the letter keys
 // (lowercase), the digit row, and the few control keys a line shell needs. 0 means
 // "no character" (modifiers, function keys, unmapped). Indices are KEY_* codes, e.g.
@@ -127,6 +137,15 @@ unsafe fn feed_event(addr: u64) {
 		if value != 1 && value != 2 {
 			return;
 		}
+		// Navigation keys (arrows / Home / End / Delete) carry no ASCII glyph; emit the
+		// ANSI escape sequence a serial terminal sends for them, so the shell's line
+		// editor decodes the framebuffer keyboard and a serial terminal identically.
+		if let Some(seq) = nav_sequence(code) {
+			for &b in seq {
+				console_feed(b);
+			}
+			return;
+		}
 		if code >= 64 {
 			return;
 		}
@@ -134,5 +153,21 @@ unsafe fn feed_event(addr: u64) {
 		if ch != 0 {
 			console_feed(ch);
 		}
+	}
+}
+
+// The ANSI escape sequence a navigation keycode maps to, or None for an ordinary key.
+// These are the standard xterm sequences (ESC [ A/B/C/D for the arrows, ESC [ H / F
+// for Home / End, ESC [ 3 ~ for Delete) the shell's editor already understands.
+fn nav_sequence(code: u16) -> Option<&'static [u8]> {
+	match code {
+		KEY_UP => Some(b"\x1b[A"),
+		KEY_DOWN => Some(b"\x1b[B"),
+		KEY_RIGHT => Some(b"\x1b[C"),
+		KEY_LEFT => Some(b"\x1b[D"),
+		KEY_HOME => Some(b"\x1b[H"),
+		KEY_END => Some(b"\x1b[F"),
+		KEY_DELETE => Some(b"\x1b[3~"),
+		_ => None,
 	}
 }

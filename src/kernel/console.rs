@@ -67,6 +67,10 @@ struct Console {
 	// Foreground/background packed into the framebuffer pixel format.
 	fg: u32,
 	bg: u32,
+	// Whether an underline caret is currently drawn at (col, row). The caret is hidden
+	// before each character is processed and redrawn after, so it follows the cursor -
+	// making cursor moves (the shell's line editor) visible on the framebuffer.
+	caret_shown: bool,
 }
 
 // The framebuffer pointer is only ever dereferenced under the console lock.
@@ -76,7 +80,7 @@ static CONSOLE: SpinLock<Option<Console>> = SpinLock::new(None);
 
 impl Console {
 	fn new(info: FbInfo) -> Self {
-		let mut console = Self { addr: info.addr, width: info.width, height: info.height, pitch: info.pitch, bytes_per_pixel: info.bytes_per_pixel, red_shift: info.red_shift, red_size: info.red_size, green_shift: info.green_shift, green_size: info.green_size, blue_shift: info.blue_shift, blue_size: info.blue_size, cols: info.width / CELL_W, rows: info.height / CELL_H, col: 0, row: 0, fg: 0, bg: 0 };
+		let mut console = Self { addr: info.addr, width: info.width, height: info.height, pitch: info.pitch, bytes_per_pixel: info.bytes_per_pixel, red_shift: info.red_shift, red_size: info.red_size, green_shift: info.green_shift, green_size: info.green_size, blue_shift: info.blue_shift, blue_size: info.blue_size, cols: info.width / CELL_W, rows: info.height / CELL_H, col: 0, row: 0, fg: 0, bg: 0, caret_shown: false };
 		console.fg = console.pack(FG.0, FG.1, FG.2);
 		console.bg = console.pack(BG.0, BG.1, BG.2);
 		console
@@ -161,6 +165,18 @@ impl Console {
 	}
 
 	fn put_char(&mut self, byte: u8) {
+		// Hide the caret before drawing (so it leaves no artifact and scroll copies a
+		// clean image), process the byte, then redraw the caret at the new cursor.
+		if self.caret_shown {
+			self.invert_caret();
+			self.caret_shown = false;
+		}
+		self.put_char_raw(byte);
+		self.invert_caret();
+		self.caret_shown = true;
+	}
+
+	fn put_char_raw(&mut self, byte: u8) {
 		match byte {
 			b'\n' => self.newline(),
 			b'\r' => self.col = 0,
@@ -172,7 +188,7 @@ impl Console {
 			b'\t' => {
 				let next = (self.col / 4 + 1) * 4;
 				while self.col < next && self.col < self.cols {
-					self.put_char(b' ');
+					self.put_char_raw(b' ');
 				}
 			}
 			_ => {
@@ -184,6 +200,36 @@ impl Console {
 				let glyph = if (0x20..0x7f).contains(&byte) { byte } else { b'?' };
 				self.draw_glyph(glyph, self.col, self.row);
 				self.col += 1;
+			}
+		}
+	}
+
+	// Toggle an underline caret (the bottom SCALE pixel rows of the cursor cell) by
+	// inverting those pixels - reversible without knowing the glyph beneath it.
+	fn invert_caret(&self) {
+		if self.col >= self.cols || self.row >= self.rows {
+			return;
+		}
+		let x0 = self.col * CELL_W;
+		let y0 = self.row * CELL_H;
+		for y in (y0 + CELL_H - SCALE)..(y0 + CELL_H) {
+			for x in x0..(x0 + CELL_W) {
+				self.invert_pixel(x, y);
+			}
+		}
+	}
+
+	#[inline]
+	fn invert_pixel(&self, x: usize, y: usize) {
+		if x >= self.width || y >= self.height {
+			return;
+		}
+		let offset = y * self.pitch + x * self.bytes_per_pixel;
+		unsafe {
+			let base = self.addr.add(offset);
+			for i in 0..self.bytes_per_pixel {
+				let v = core::ptr::read_volatile(base.add(i));
+				core::ptr::write_volatile(base.add(i), !v);
 			}
 		}
 	}
