@@ -15,7 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, config, device, log, network, process, time, volume};
+use proto::system::{config, device, log, network, process, time, volume, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -92,7 +92,7 @@ unsafe fn repl(storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64
 						return;
 					}
 					ed.commit();
-					print(b"> ");
+					print(b"\x1b[1;32m> \x1b[0m");
 				}
 			}
 		}
@@ -510,9 +510,9 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			}
 			return false;
 		}
-		print(b"unknown command: ");
+		print(b"\x1b[31munknown command: ");
 		print(line);
-		print(b" (try 'help')\n");
+		print(b" (try 'help')\x1b[0m\n");
 		false
 	}
 }

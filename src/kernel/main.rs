@@ -230,6 +230,7 @@ fn console_shell_loop() {
 				break;
 			}
 		}
+		console::blink_tick(arch::apic::ticks());
 		sched::run_until_idle();
 		core::hint::spin_loop();
 	}

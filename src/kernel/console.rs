@@ -31,6 +31,20 @@ const CELL_H: usize = FONT_H * SCALE;
 const FG: (u8, u8, u8) = (0xc8, 0xc8, 0xc8);
 const BG: (u8, u8, u8) = (0x0a, 0x0a, 0x12);
 
+// The standard 16-colour ANSI palette (the classic xterm/VGA RGB values): 0-7 the
+// normal colours, 8-15 their bright variants. SGR `30-37`/`40-47` select 0-7,
+// `90-97`/`100-107` and bold select 8-15.
+#[rustfmt::skip]
+const ANSI_PALETTE: [(u8, u8, u8); 16] = [
+	(0x00, 0x00, 0x00), (0xaa, 0x00, 0x00), (0x00, 0xaa, 0x00), (0xaa, 0x55, 0x00),
+	(0x00, 0x00, 0xaa), (0xaa, 0x00, 0xaa), (0x00, 0xaa, 0xaa), (0xaa, 0xaa, 0xaa),
+	(0x55, 0x55, 0x55), (0xff, 0x55, 0x55), (0x55, 0xff, 0x55), (0xff, 0xff, 0x55),
+	(0x55, 0x55, 0xff), (0xff, 0x55, 0xff), (0x55, 0xff, 0xff), (0xff, 0xff, 0xff),
+];
+
+// The caret blinks every this many monotonic ticks (100 Hz -> ~0.5 s) while idle.
+const BLINK_TICKS: u64 = 50;
+
 // A framebuffer description handed in from the Limine response.
 pub struct FbInfo {
 	pub addr: *mut u8,
@@ -67,10 +81,25 @@ struct Console {
 	// Foreground/background packed into the framebuffer pixel format.
 	fg: u32,
 	bg: u32,
+	// The 16-colour ANSI palette (packed) and the current SGR colours / attributes
+	// that `draw_glyph` uses; an index of None means the default fg/bg.
+	palette: [u32; 16],
+	cur_fg: u32,
+	cur_bg: u32,
+	fg_idx: Option<u8>,
+	bg_idx: Option<u8>,
+	bold: bool,
+	// Output escape-sequence parser state (0 = normal, 1 = after ESC, 2 = in CSI) and
+	// the accumulated CSI numeric parameters.
+	esc_state: u8,
+	params: [u16; 8],
+	nparams: usize,
 	// Whether an underline caret is currently drawn at (col, row). The caret is hidden
 	// before each character is processed and redrawn after, so it follows the cursor -
 	// making cursor moves (the shell's line editor) visible on the framebuffer.
 	caret_shown: bool,
+	// The monotonic tick the caret was last toggled / output happened, for blinking.
+	last_blink: u64,
 }
 
 // The framebuffer pointer is only ever dereferenced under the console lock.
@@ -80,9 +109,14 @@ static CONSOLE: SpinLock<Option<Console>> = SpinLock::new(None);
 
 impl Console {
 	fn new(info: FbInfo) -> Self {
-		let mut console = Self { addr: info.addr, width: info.width, height: info.height, pitch: info.pitch, bytes_per_pixel: info.bytes_per_pixel, red_shift: info.red_shift, red_size: info.red_size, green_shift: info.green_shift, green_size: info.green_size, blue_shift: info.blue_shift, blue_size: info.blue_size, cols: info.width / CELL_W, rows: info.height / CELL_H, col: 0, row: 0, fg: 0, bg: 0, caret_shown: false };
+		let mut console = Self { addr: info.addr, width: info.width, height: info.height, pitch: info.pitch, bytes_per_pixel: info.bytes_per_pixel, red_shift: info.red_shift, red_size: info.red_size, green_shift: info.green_shift, green_size: info.green_size, blue_shift: info.blue_shift, blue_size: info.blue_size, cols: info.width / CELL_W, rows: info.height / CELL_H, col: 0, row: 0, fg: 0, bg: 0, palette: [0; 16], cur_fg: 0, cur_bg: 0, fg_idx: None, bg_idx: None, bold: false, esc_state: 0, params: [0; 8], nparams: 0, caret_shown: false, last_blink: 0 };
 		console.fg = console.pack(FG.0, FG.1, FG.2);
 		console.bg = console.pack(BG.0, BG.1, BG.2);
+		for (i, &(r, g, b)) in ANSI_PALETTE.iter().enumerate() {
+			console.palette[i] = console.pack(r, g, b);
+		}
+		console.cur_fg = console.fg;
+		console.cur_bg = console.bg;
 		console
 	}
 
@@ -135,7 +169,7 @@ impl Console {
 		for gy in 0..FONT_H {
 			let bits = FONT[base + gy];
 			for gx in 0..FONT_W {
-				let color = if bits & (1 << gx) != 0 { self.fg } else { self.bg };
+				let color = if bits & (1 << gx) != 0 { self.cur_fg } else { self.cur_bg };
 				for sy in 0..SCALE {
 					for sx in 0..SCALE {
 						self.put_pixel(x0 + gx * SCALE + sx, y0 + gy * SCALE + sy, color);
@@ -174,10 +208,33 @@ impl Console {
 		self.put_char_raw(byte);
 		self.invert_caret();
 		self.caret_shown = true;
+		// Keep the caret solid while output / typing is happening; it blinks only after
+		// it has been idle for BLINK_TICKS (the blink timer counts from here).
+		self.last_blink = crate::arch::apic::ticks();
 	}
 
 	fn put_char_raw(&mut self, byte: u8) {
+		// Output escape-sequence parser: ESC [ ... <final>. We interpret SGR (colour) and
+		// consume any other CSI sequence, so a control sequence never renders as glyphs.
+		match self.esc_state {
+			1 => {
+				if byte == b'[' {
+					self.esc_state = 2;
+					self.params = [0; 8];
+					self.nparams = 0;
+				} else {
+					self.esc_state = 0;
+				}
+				return;
+			}
+			2 => {
+				self.csi_byte(byte);
+				return;
+			}
+			_ => {}
+		}
 		match byte {
+			0x1b => self.esc_state = 1,
 			b'\n' => self.newline(),
 			b'\r' => self.col = 0,
 			0x08 => {
@@ -202,6 +259,64 @@ impl Console {
 				self.col += 1;
 			}
 		}
+	}
+
+	// Consume one byte of a CSI sequence (after `ESC [`): accumulate the numeric
+	// parameters, apply SGR on `m`, and end (ignore) any other final byte.
+	fn csi_byte(&mut self, byte: u8) {
+		match byte {
+			b'0'..=b'9' => {
+				let p = &mut self.params[self.nparams];
+				*p = p.saturating_mul(10).saturating_add((byte - b'0') as u16);
+			}
+			b';' => {
+				if self.nparams + 1 < self.params.len() {
+					self.nparams += 1;
+				}
+			}
+			b'm' => {
+				self.apply_sgr();
+				self.esc_state = 0;
+			}
+			0x40..=0x7e => self.esc_state = 0,
+			_ => {}
+		}
+	}
+
+	// Apply the accumulated SGR parameters to the current colours / bold attribute.
+	fn apply_sgr(&mut self) {
+		for i in 0..=self.nparams {
+			match self.params[i] {
+				0 => {
+					self.fg_idx = None;
+					self.bg_idx = None;
+					self.bold = false;
+				}
+				1 => self.bold = true,
+				22 => self.bold = false,
+				30..=37 => self.fg_idx = Some((self.params[i] - 30) as u8),
+				39 => self.fg_idx = None,
+				40..=47 => self.bg_idx = Some((self.params[i] - 40) as u8),
+				49 => self.bg_idx = None,
+				90..=97 => self.fg_idx = Some((self.params[i] - 90 + 8) as u8),
+				100..=107 => self.bg_idx = Some((self.params[i] - 100 + 8) as u8),
+				_ => {}
+			}
+		}
+		self.recompute_colors();
+	}
+
+	// Recompute the packed current colours from the indices + bold (bold brightens a
+	// normal foreground); a None index means the default fg/bg.
+	fn recompute_colors(&mut self) {
+		self.cur_fg = match self.fg_idx {
+			Some(i) => self.palette[if self.bold && i < 8 { (i + 8) as usize } else { i as usize }],
+			None => self.fg,
+		};
+		self.cur_bg = match self.bg_idx {
+			Some(i) => self.palette[i as usize],
+			None => self.bg,
+		};
 	}
 
 	// Toggle an underline caret (the bottom SCALE pixel rows of the cursor cell) by
@@ -266,6 +381,21 @@ pub fn write_fmt(args: fmt::Arguments<'_>) {
 	if let Some(mut guard) = CONSOLE.try_lock() {
 		if let Some(console) = guard.as_mut() {
 			let _ = console.write_fmt(args);
+		}
+	}
+}
+
+// Drive the blinking caret: toggle it if at least BLINK_TICKS have passed since the
+// last toggle or output. The interactive loop calls this every round with the
+// monotonic tick; output resets the timer so the caret stays solid while typing.
+pub fn blink_tick(now: u64) {
+	if let Some(mut guard) = CONSOLE.try_lock() {
+		if let Some(console) = guard.as_mut() {
+			if now.wrapping_sub(console.last_blink) >= BLINK_TICKS {
+				console.last_blink = now;
+				console.invert_caret();
+				console.caret_shown = !console.caret_shown;
+			}
 		}
 	}
 }
