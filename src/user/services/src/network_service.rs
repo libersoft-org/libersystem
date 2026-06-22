@@ -23,7 +23,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use rt::*;
 
-use crate::net::{Event, Ipv4Addr, MacAddr, Stack};
+use crate::net::{DHCP_ACK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, Stack};
 use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingStatus, TcpRequest, network, socket};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
@@ -39,6 +39,9 @@ const DNS_SRC_PORT: u16 = 0x9876;
 // How long a `ping` waits for its reply, and DNS for its response (100 Hz ticks).
 const PING_TIMEOUT_TICKS: u64 = 50;
 const DNS_TIMEOUT_TICKS: u64 = 300;
+// How long DHCP waits for each of the OFFER and the ACK before falling back to the
+// static configuration (100 Hz ticks).
+const DHCP_TIMEOUT_TICKS: u64 = 200;
 // TCP: total time to establish, the SYN/segment retransmit interval, and how long to
 // read a response (100 Hz ticks).
 const TCP_SYN_TIMEOUT_TICKS: u64 = 300;
@@ -79,8 +82,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Message { len, .. } if len >= 9 && &buf[..3] == b"MAC" => MacAddr([buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]]),
 			_ => exit(),
 		};
-		let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP);
-		// 3. report in, then serve the network and the client at once (serve announces
+		let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP, DNS_SERVER);
+		// 3. learn our address / mask / gateway / DNS from DHCP, falling back to the
+		//    static config above if no server answers. The frame buffers are scoped so
+		//    they are freed before serve allocates its own (the 16 KiB user stack).
+		{
+			let mut drx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
+			let mut dtx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
+			if do_dhcp(frames, &mut stack, &mut drx, &mut dtx) {
+				print(b"network: configured via DHCP\n");
+			} else {
+				print(b"network: DHCP unanswered, using static config\n");
+			}
+		}
+		// 4. report in, then serve the network and the client at once (serve announces
 		//    us on the link with a gratuitous ARP first).
 		send_blocking(bootstrap, b"NetworkService: online", 0);
 		serve(frames, client, &mut stack);
@@ -497,17 +512,61 @@ unsafe fn do_ping(ip: Ipv4Addr, frames: u64, stack: &mut Stack, seq: &mut u16, r
 	}
 }
 
+// Run the DHCP client handshake (DISCOVER -> OFFER -> REQUEST -> ACK), pumping
+// received frames for the replies, and on success apply the learned address / mask /
+// gateway / DNS to the stack. Returns whether a lease was obtained (false = the
+// caller keeps the static configuration).
+unsafe fn do_dhcp(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> bool {
+	unsafe {
+		// Broadcast a DISCOVER and wait for the server's OFFER.
+		let discover: usize = stack.build_dhcp_discover(tx);
+		send_frame(frames, &tx[..discover]);
+		let mut offered: bool = false;
+		let deadline: u64 = clock() + DHCP_TIMEOUT_TICKS;
+		while clock() < deadline && !offered {
+			if wait(frames, deadline) != 0 {
+				break;
+			}
+			if let Event::DhcpReply(msg_type) = pump(frames, stack, rx, tx) {
+				if msg_type == DHCP_OFFER {
+					offered = true;
+				}
+			}
+		}
+		if !offered {
+			return false;
+		}
+		// REQUEST the offered address and wait for the server's ACK.
+		let request: usize = stack.build_dhcp_request(tx);
+		send_frame(frames, &tx[..request]);
+		let deadline: u64 = clock() + DHCP_TIMEOUT_TICKS;
+		while clock() < deadline {
+			if wait(frames, deadline) != 0 {
+				break;
+			}
+			if let Event::DhcpReply(msg_type) = pump(frames, stack, rx, tx) {
+				if msg_type == DHCP_ACK {
+					stack.apply_dhcp();
+					return true;
+				}
+			}
+		}
+		false
+	}
+}
+
 // Resolve `name` to an IPv4 address via a DNS A-record query to the SLIRP DNS
 // server, pumping received frames for the response. None on timeout or failure.
 unsafe fn do_dns(name: &[u8], frames: u64, stack: &mut Stack, txn: &mut u16, rx: &mut [u8], tx: &mut [u8]) -> Option<Ipv4Addr> {
 	unsafe {
-		let hop: Ipv4Addr = stack.next_hop(DNS_SERVER);
+		let dns: Ipv4Addr = stack.dns();
+		let hop: Ipv4Addr = stack.next_hop(dns);
 		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
 			Some(m) => m,
 			None => return None,
 		};
 		*txn = txn.wrapping_add(1);
-		let query: usize = stack.build_dns_query(mac, DNS_SERVER, name, *txn, DNS_SRC_PORT, tx);
+		let query: usize = stack.build_dns_query(mac, dns, name, *txn, DNS_SRC_PORT, tx);
 		if query == 0 {
 			return None;
 		}

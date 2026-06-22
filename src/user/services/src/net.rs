@@ -30,6 +30,33 @@ const ICMP_ECHO_REPLY: u8 = 0;
 // The DNS server port (UDP).
 const DNS_PORT: u16 = 53;
 
+// DHCP / BOOTP: a UDP client on port 68 talking to a server on port 67. The client
+// broadcasts a DISCOVER, the server OFFERs an address, the client REQUESTs it, and
+// the server ACKs - the client learning its address and the subnet mask / gateway /
+// DNS server from the reply options.
+const DHCP_CLIENT_PORT: u16 = 68;
+const DHCP_SERVER_PORT: u16 = 67;
+const BOOTP_REQUEST: u8 = 1;
+const BOOTP_REPLY: u8 = 2;
+const BOOTP_HDR: usize = 236;
+const DHCP_MAGIC: u32 = 0x6382_5363;
+const DHCP_DISCOVER: u8 = 1;
+pub const DHCP_OFFER: u8 = 2;
+const DHCP_REQUEST: u8 = 3;
+pub const DHCP_ACK: u8 = 5;
+const DHCP_OPT_MASK: u8 = 1;
+const DHCP_OPT_ROUTER: u8 = 3;
+const DHCP_OPT_DNS: u8 = 6;
+const DHCP_OPT_REQUESTED_IP: u8 = 50;
+const DHCP_OPT_MSG_TYPE: u8 = 53;
+const DHCP_OPT_SERVER_ID: u8 = 54;
+const DHCP_OPT_PARAM_LIST: u8 = 55;
+const DHCP_OPT_END: u8 = 255;
+
+// The limited-broadcast IPv4 address (255.255.255.255): the DHCP server addresses
+// its OFFER/ACK here when it broadcasts the reply (we have no address yet).
+const IPV4_BROADCAST: Ipv4Addr = Ipv4Addr([255, 255, 255, 255]);
+
 // Header sizes (bytes).
 const ETH_HDR: usize = 14;
 const ARP_LEN: usize = 28;
@@ -130,7 +157,11 @@ fn udp_checksum(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
 		sum = (sum & 0xffff) + (sum >> 16);
 	}
 	let c: u16 = !(sum as u16);
-	if c == 0 { 0xffff } else { c }
+	if c == 0 {
+		0xffff
+	} else {
+		c
+	}
 }
 
 // The TCP checksum over the IPv4 pseudo-header (src, dst, proto, length) plus the
@@ -162,6 +193,23 @@ struct Neigh {
 
 const NEIGH_MAX: usize = 8;
 
+// The address configuration learned from a DHCP OFFER/ACK: the offered address plus
+// the mask / gateway / DNS / server-id carried in the reply options.
+#[derive(Clone, Copy)]
+struct DhcpLease {
+	yiaddr: Ipv4Addr,
+	mask: Ipv4Addr,
+	gateway: Ipv4Addr,
+	dns: Ipv4Addr,
+	server: Ipv4Addr,
+}
+
+impl DhcpLease {
+	const fn empty() -> DhcpLease {
+		DhcpLease { yiaddr: Ipv4Addr([0; 4]), mask: Ipv4Addr([0; 4]), gateway: Ipv4Addr([0; 4]), dns: Ipv4Addr([0; 4]), server: Ipv4Addr([0; 4]) }
+	}
+}
+
 // The notable thing a received frame did, for the driver to log or react to.
 #[derive(Clone, Copy)]
 pub enum Event {
@@ -172,6 +220,9 @@ pub enum Event {
 	EchoReply(Ipv4Addr),
 	// A DNS response resolved a name to this address.
 	DnsReply(Ipv4Addr),
+	// A DHCP reply arrived with this message type (OFFER or ACK); the learned lease is
+	// stored in the stack.
+	DhcpReply(u8),
 }
 
 // The result of feeding one frame to the stack: an optional reply to transmit
@@ -228,13 +279,15 @@ pub struct Stack {
 	ip: Ipv4Addr,
 	mask: Ipv4Addr,
 	gateway: Ipv4Addr,
+	dns: Ipv4Addr,
 	neigh: [Neigh; NEIGH_MAX],
 	tcp: TcpConn,
+	dhcp: DhcpLease,
 }
 
 impl Stack {
-	pub fn new(mac: MacAddr, ip: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr) -> Stack {
-		Stack { mac, ip, mask, gateway, neigh: [Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; NEIGH_MAX], tcp: TcpConn::closed() }
+	pub fn new(mac: MacAddr, ip: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr, dns: Ipv4Addr) -> Stack {
+		Stack { mac, ip, mask, gateway, dns, neigh: [Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; NEIGH_MAX], tcp: TcpConn::closed(), dhcp: DhcpLease::empty() }
 	}
 
 	pub fn mac(&self) -> MacAddr {
@@ -249,11 +302,20 @@ impl Stack {
 		self.gateway
 	}
 
+	// The DNS server address (the static fallback, or the one learned from DHCP).
+	pub fn dns(&self) -> Ipv4Addr {
+		self.dns
+	}
+
 	// The next-hop address for reaching `dst`: `dst` itself when it shares our subnet
 	// (on-link, reached by direct ARP), otherwise the gateway (off-link, routed). The
 	// L3 destination of the packet is still `dst`; only the L2 MAC we resolve changes.
 	pub fn next_hop(&self, dst: Ipv4Addr) -> Ipv4Addr {
-		if self.on_link(dst) { dst } else { self.gateway }
+		if self.on_link(dst) {
+			dst
+		} else {
+			self.gateway
+		}
 	}
 
 	// Whether `dst` is on our local subnet (its network part matches ours under the
@@ -393,11 +455,14 @@ impl Stack {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
 		let dst_ip: Ipv4Addr = Ipv4Addr([ip[16], ip[17], ip[18], ip[19]]);
-		if dst_ip != self.ip {
+		let proto: u8 = ip[9];
+		// Accept packets addressed to us, plus limited-broadcast UDP - so the DHCP
+		// server's broadcast OFFER/ACK, sent before we have an address, reach us.
+		if dst_ip != self.ip && !(dst_ip == IPV4_BROADCAST && proto == IP_PROTO_UDP) {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
 		let src_ip: Ipv4Addr = Ipv4Addr([ip[12], ip[13], ip[14], ip[15]]);
-		match ip[9] {
+		match proto {
 			IP_PROTO_ICMP => self.on_icmp(frame, ihl, src_ip, out),
 			IP_PROTO_UDP => self.on_udp(frame, ihl),
 			IP_PROTO_TCP => self.on_tcp(frame, ihl, src_ip, out),
@@ -405,16 +470,21 @@ impl Stack {
 		}
 	}
 
-	// Handle an inbound UDP datagram. Only DNS responses (source port 53) are
-	// recognized for now: the payload is parsed into the resolved address.
+	// Handle an inbound UDP datagram: a DNS response (source port 53) is parsed into
+	// the resolved address, a DHCP reply (source port 67) into the learned lease.
 	fn on_udp(&mut self, frame: &[u8], ihl: usize) -> Outcome {
 		let udp: &[u8] = &frame[ETH_HDR + ihl..];
 		if udp.len() < UDP_HDR {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
-		if be16(udp, 0) == DNS_PORT {
+		let src_port: u16 = be16(udp, 0);
+		if src_port == DNS_PORT {
 			if let Some(addr) = parse_dns_response(&udp[UDP_HDR..]) {
 				return Outcome { reply_len: 0, event: Event::DnsReply(addr) };
+			}
+		} else if src_port == DHCP_SERVER_PORT {
+			if let Some(msg_type) = self.parse_dhcp(&udp[UDP_HDR..]) {
+				return Outcome { reply_len: 0, event: Event::DhcpReply(msg_type) };
 			}
 		}
 		Outcome { reply_len: 0, event: Event::None }
@@ -740,6 +810,157 @@ impl Stack {
 		out[6..12].copy_from_slice(&self.mac.0);
 		put16(out, 12, ETHERTYPE_IPV4);
 		ETH_HDR + total
+	}
+
+	// Build a DHCP DISCOVER (broadcast, no address yet) into `out`, returning its
+	// length.
+	pub fn build_dhcp_discover(&self, out: &mut [u8]) -> usize {
+		self.build_dhcp(DHCP_DISCOVER, out)
+	}
+
+	// Build a DHCP REQUEST for the offered address into `out` (it carries the offered
+	// address and the server id from the last parsed OFFER), returning its length.
+	pub fn build_dhcp_request(&self, out: &mut [u8]) -> usize {
+		self.build_dhcp(DHCP_REQUEST, out)
+	}
+
+	// Build a DHCP client message of `msg_type` into `out` (a broadcast Ethernet +
+	// IPv4 0.0.0.0 -> 255.255.255.255 + UDP 68 -> 67 + BOOTP request + options),
+	// returning its length (0 if it does not fit). A REQUEST additionally carries the
+	// requested-address and server-id options from the last OFFER.
+	fn build_dhcp(&self, msg_type: u8, out: &mut [u8]) -> usize {
+		let boot_off: usize = ETH_HDR + IPV4_HDR + UDP_HDR;
+		if boot_off + BOOTP_HDR + 32 > out.len() {
+			return 0;
+		}
+		// BOOTP fixed header: zero it, then set the request fields and our MAC.
+		for b in out[boot_off..boot_off + BOOTP_HDR].iter_mut() {
+			*b = 0;
+		}
+		out[boot_off] = BOOTP_REQUEST;
+		out[boot_off + 1] = 1; // htype: Ethernet
+		out[boot_off + 2] = 6; // hlen
+		put32(out, boot_off + 4, 0x3903_f326); // xid (fixed; SLIRP is the only DHCP source)
+		put16(out, boot_off + 10, 0x8000); // flags: ask the server to broadcast its reply
+		out[boot_off + 28..boot_off + 34].copy_from_slice(&self.mac.0); // chaddr
+																  // DHCP magic cookie + options.
+		let mut p: usize = boot_off + BOOTP_HDR;
+		put32(out, p, DHCP_MAGIC);
+		p += 4;
+		out[p] = DHCP_OPT_MSG_TYPE;
+		out[p + 1] = 1;
+		out[p + 2] = msg_type;
+		p += 3;
+		if msg_type == DHCP_REQUEST {
+			out[p] = DHCP_OPT_REQUESTED_IP;
+			out[p + 1] = 4;
+			out[p + 2..p + 6].copy_from_slice(&self.dhcp.yiaddr.0);
+			p += 6;
+			out[p] = DHCP_OPT_SERVER_ID;
+			out[p + 1] = 4;
+			out[p + 2..p + 6].copy_from_slice(&self.dhcp.server.0);
+			p += 6;
+		}
+		out[p] = DHCP_OPT_PARAM_LIST;
+		out[p + 1] = 3;
+		out[p + 2] = DHCP_OPT_MASK;
+		out[p + 3] = DHCP_OPT_ROUTER;
+		out[p + 4] = DHCP_OPT_DNS;
+		p += 5;
+		out[p] = DHCP_OPT_END;
+		p += 1;
+		let dhcp_len: usize = p - boot_off;
+		// UDP header: 0.0.0.0:68 -> 255.255.255.255:67.
+		let src: Ipv4Addr = Ipv4Addr([0; 4]);
+		let dst: Ipv4Addr = Ipv4Addr([255; 4]);
+		let udp_off: usize = ETH_HDR + IPV4_HDR;
+		put16(out, udp_off, DHCP_CLIENT_PORT);
+		put16(out, udp_off + 2, DHCP_SERVER_PORT);
+		put16(out, udp_off + 4, (UDP_HDR + dhcp_len) as u16);
+		put16(out, udp_off + 6, 0);
+		let udp_csum: u16 = udp_checksum(src, dst, &out[udp_off..udp_off + UDP_HDR + dhcp_len]);
+		put16(out, udp_off + 6, udp_csum);
+		// IPv4 header.
+		let total: usize = IPV4_HDR + UDP_HDR + dhcp_len;
+		let ip: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + IPV4_HDR];
+		ip[0] = 0x45;
+		ip[1] = 0;
+		put16(ip, 2, total as u16);
+		put16(ip, 4, 0);
+		put16(ip, 6, 0);
+		ip[8] = 64;
+		ip[9] = IP_PROTO_UDP;
+		put16(ip, 10, 0);
+		ip[12..16].copy_from_slice(&src.0);
+		ip[16..20].copy_from_slice(&dst.0);
+		let csum: u16 = checksum(&ip[..IPV4_HDR]);
+		put16(ip, 10, csum);
+		// Ethernet header (broadcast).
+		out[0..6].copy_from_slice(&MacAddr::BROADCAST.0);
+		out[6..12].copy_from_slice(&self.mac.0);
+		put16(out, 12, ETHERTYPE_IPV4);
+		ETH_HDR + total
+	}
+
+	// Parse a DHCP reply (a BOOTP reply with the magic cookie): record the offered
+	// address and the mask / gateway / DNS / server-id options into the stack's lease,
+	// returning the DHCP message type (OFFER or ACK), or None if it is not a usable
+	// DHCP reply.
+	fn parse_dhcp(&mut self, dhcp: &[u8]) -> Option<u8> {
+		if dhcp.len() < BOOTP_HDR + 4 || dhcp[0] != BOOTP_REPLY || be32(dhcp, BOOTP_HDR) != DHCP_MAGIC {
+			return None;
+		}
+		let mut lease: DhcpLease = DhcpLease::empty();
+		lease.yiaddr = Ipv4Addr([dhcp[16], dhcp[17], dhcp[18], dhcp[19]]);
+		let mut msg_type: u8 = 0;
+		let mut p: usize = BOOTP_HDR + 4;
+		while p < dhcp.len() {
+			let code: u8 = dhcp[p];
+			if code == DHCP_OPT_END {
+				break;
+			}
+			if code == 0 {
+				p += 1;
+				continue;
+			}
+			if p + 2 > dhcp.len() {
+				break;
+			}
+			let len: usize = dhcp[p + 1] as usize;
+			if p + 2 + len > dhcp.len() {
+				break;
+			}
+			let val: &[u8] = &dhcp[p + 2..p + 2 + len];
+			match code {
+				DHCP_OPT_MSG_TYPE if len >= 1 => msg_type = val[0],
+				DHCP_OPT_MASK if len >= 4 => lease.mask = Ipv4Addr([val[0], val[1], val[2], val[3]]),
+				DHCP_OPT_ROUTER if len >= 4 => lease.gateway = Ipv4Addr([val[0], val[1], val[2], val[3]]),
+				DHCP_OPT_DNS if len >= 4 => lease.dns = Ipv4Addr([val[0], val[1], val[2], val[3]]),
+				DHCP_OPT_SERVER_ID if len >= 4 => lease.server = Ipv4Addr([val[0], val[1], val[2], val[3]]),
+				_ => {}
+			}
+			p += 2 + len;
+		}
+		if msg_type == 0 {
+			return None;
+		}
+		self.dhcp = lease;
+		Some(msg_type)
+	}
+
+	// Apply the learned lease as our configuration: take the offered address, and the
+	// mask / gateway / DNS where the server provided them.
+	pub fn apply_dhcp(&mut self) {
+		self.ip = self.dhcp.yiaddr;
+		if self.dhcp.mask.0 != [0; 4] {
+			self.mask = self.dhcp.mask;
+		}
+		if self.dhcp.gateway.0 != [0; 4] {
+			self.gateway = self.dhcp.gateway;
+		}
+		if self.dhcp.dns.0 != [0; 4] {
+			self.dns = self.dhcp.dns;
+		}
 	}
 }
 
