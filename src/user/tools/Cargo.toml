@@ -28,6 +28,14 @@ path = "src/nslookup.rs"
 name = "tcp"
 path = "src/tcp.rs"
 
+[[bin]]
+name = "nc"
+path = "src/nc.rs"
+
+[[bin]]
+name = "arp"
+path = "src/arp.rs"
+
 [dependencies]
 # Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
 # the syscall/IPC helpers); it re-exports the abi constants.

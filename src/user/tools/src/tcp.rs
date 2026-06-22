@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+use proto::codec::Buffer;
 use proto::system::{Endpoint, Error, Ipv4Addr, network, socket};
 use rt::*;
 
@@ -84,9 +85,20 @@ unsafe fn connect(netsvc: u64, args: &[u8]) {
 		print(b"tcp ");
 		print(host);
 		print(b": connected\n");
-		// Send the probe, then drain the received-data stream (a sub-channel of framed
-		// chunks) until the producer closes - end of stream.
-		if let Some(Ok(_)) = sock.send(&b"GET / HTTP/1.0\r\n\r\n".to_vec()) {
+		// Send the probe as a zero-copy buffer - the request bytes live in a shared
+		// memory object whose handle we hand to NetworkService, so the payload never
+		// crosses the channel - then drain the received-data stream (a sub-channel of
+		// framed chunks) until the producer closes - end of stream.
+		let probe: Buffer = match make_buffer(b"GET / HTTP/1.0\r\n\r\n") {
+			Some(b) => b,
+			None => {
+				print(b"tcp: out of memory\n");
+				let _ = sock.close();
+				close(sockh);
+				return;
+			}
+		};
+		if let Some(Ok(_)) = sock.send(&probe) {
 			if let Some(rxstream) = sock.recv() {
 				let mut frame: [u8; 1024] = [0u8; 1024];
 				loop {
@@ -107,6 +119,29 @@ unsafe fn connect(netsvc: u64, args: &[u8]) {
 		}
 		let _ = sock.close();
 		close(sockh);
+	}
+}
+
+// Pack `bytes` into a fresh shared memory object and describe it as a `buffer`: the
+// returned handle is transferred when the buffer is sent (consumed by the transfer),
+// so we map-fill-unmap here but must not close it. None if the object cannot be made.
+unsafe fn make_buffer(bytes: &[u8]) -> Option<Buffer> {
+	unsafe {
+		let handle: i64 = memory_object_create(bytes.len() as u64);
+		if handle < 0 {
+			return None;
+		}
+		let handle: u64 = handle as u64;
+		let base: u64 = match map_object(handle) {
+			Some(b) => b,
+			None => {
+				close(handle);
+				return None;
+			}
+		};
+		core::ptr::copy_nonoverlapping(bytes.as_ptr(), base as *mut u8, bytes.len());
+		unmap_object(handle);
+		Some(Buffer { handle, len: bytes.len() as u64 })
 	}
 }
 

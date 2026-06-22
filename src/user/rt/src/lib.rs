@@ -261,6 +261,13 @@ pub unsafe fn close(handle: u64) {
 	}
 }
 
+// Create a memory object of `size` bytes (a shared buffer), returning its handle or
+// a negative error. Map it with `map_object` to fill or read its bytes; transfer the
+// handle to hand the buffer to another process zero-copy.
+pub unsafe fn memory_object_create(size: u64) -> i64 {
+	unsafe { syscall(SYS_MEMORY_OBJECT_CREATE, size, 0, 0, 0) as i64 }
+}
+
 // Map the object behind `handle` into our address space (the kernel picks the
 // virtual base), returning that base, or None on failure.
 pub unsafe fn map_object(handle: u64) -> Option<u64> {

@@ -1752,7 +1752,7 @@ pub mod socket {
 	pub const OP_CLOSE: u16 = 3;
 
 	pub trait Service {
-		fn send(&mut self, data: Vec<u8>) -> Result<u32, Error>;
+		fn send(&mut self, data: crate::codec::Buffer) -> Result<u32, Error>;
 		fn recv(&mut self) -> Vec<Chunk>;
 		fn close(&mut self) -> Result<(), Error>;
 	}
@@ -1768,34 +1768,31 @@ pub mod socket {
 		match op {
 			OP_SEND => {
 				let data = {
-					let v67 = r.u16()? as usize;
-					let mut v68 = Vec::new();
-					for _ in 0..v67 {
-						v68.push(r.u8()?);
-					}
-					v68
+					let len = r.u64()?;
+					let handle = r.take_handle();
+					crate::codec::Buffer { handle, len }
 				};
 				let result = service.send(data);
 				match &result {
-					Ok(v69) => {
+					Ok(v67) => {
 						w.u8(1)?;
-						w.u32(*v69)?;
+						w.u32(*v67)?;
 					}
-					Err(v70) => {
+					Err(v68) => {
 						w.u8(0)?;
-						v70.write(w)?;
+						v68.write(w)?;
 					}
 				}
 			}
 			OP_CLOSE => {
 				let result = service.close();
 				match &result {
-					Ok(v71) => {
+					Ok(v69) => {
 						w.u8(1)?;
 					}
-					Err(v72) => {
+					Err(v70) => {
 						w.u8(0)?;
-						v72.write(w)?;
+						v70.write(w)?;
 					}
 				}
 			}
@@ -1844,19 +1841,14 @@ pub mod socket {
 			self.corr = self.corr.wrapping_add(1);
 			c
 		}
-		pub fn send(&mut self, data: &Vec<u8>) -> Option<Result<u32, Error>> {
+		pub fn send(&mut self, data: &crate::codec::Buffer) -> Option<Result<u32, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
 			w.u16(OP_SEND)?;
 			w.u32(corr)?;
-			if data.len() > u16::MAX as usize {
-				return None;
-			}
-			w.u16(data.len() as u16)?;
-			for v73 in data.iter() {
-				w.u8(*v73)?;
-			}
+			w.set_handle(data.handle);
+			w.u64(data.len)?;
 			let request_handle = writer.handle();
 			let request = writer.into_inner();
 			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
@@ -1925,19 +1917,19 @@ impl Chunk {
 			return None;
 		}
 		w.u16(self.data.len() as u16)?;
-		for v74 in self.data.iter() {
-			w.u8(*v74)?;
+		for v71 in self.data.iter() {
+			w.u8(*v71)?;
 		}
 		Some(())
 	}
 	pub(crate) fn read(r: &mut Reader) -> Option<Chunk> {
 		let data = {
-			let v75 = r.u16()? as usize;
-			let mut v76 = Vec::new();
-			for _ in 0..v75 {
-				v76.push(r.u8()?);
+			let v72 = r.u16()? as usize;
+			let mut v73 = Vec::new();
+			for _ in 0..v72 {
+				v73.push(r.u8()?);
 			}
-			v76
+			v73
 		};
 		Some(Chunk { data })
 	}
@@ -2062,13 +2054,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v78 = true;
-		for v77 in self.fields.iter() {
-			if !v78 {
+		let mut v75 = true;
+		for v74 in self.fields.iter() {
+			if !v75 {
 				out.push(',');
 			}
-			v78 = false;
-			v77.to_json_into(out);
+			v75 = false;
+			v74.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2086,13 +2078,13 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v80 = true;
-		for v79 in self.fields.iter() {
-			if !v80 {
+		let mut v77 = true;
+		for v76 in self.fields.iter() {
+			if !v77 {
 				out.push_str(", ");
 			}
-			v80 = false;
-			v79.to_text_into(out);
+			v77 = false;
+			v76.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2114,8 +2106,8 @@ impl Query {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v81) => {
-				let _ = write!(out, "{}", v81);
+			Some(v78) => {
+				let _ = write!(out, "{}", v78);
 			}
 			None => {
 				out.push_str("null");
@@ -2124,8 +2116,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v82) => {
-				v82.to_json_into(out);
+			Some(v79) => {
+				v79.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -2134,8 +2126,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v83) => {
-				crate::codec::json_escape(v83, out);
+			Some(v80) => {
+				crate::codec::json_escape(v80, out);
 			}
 			None => {
 				out.push_str("null");
@@ -2150,8 +2142,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v84) => {
-				let _ = write!(out, "{}", v84);
+			Some(v81) => {
+				let _ = write!(out, "{}", v81);
 			}
 			None => {
 				out.push('-');
@@ -2160,8 +2152,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v85) => {
-				v85.to_text_into(out);
+			Some(v82) => {
+				v82.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -2170,8 +2162,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v86) => {
-				out.push_str(v86);
+			Some(v83) => {
+				out.push_str(v83);
 			}
 			None => {
 				out.push('-');
@@ -2525,13 +2517,13 @@ impl Neighbor {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v88 = true;
-		for v87 in self.mac.iter() {
-			if !v88 {
+		let mut v85 = true;
+		for v84 in self.mac.iter() {
+			if !v85 {
 				out.push(',');
 			}
-			v88 = false;
-			let _ = write!(out, "{}", v87);
+			v85 = false;
+			let _ = write!(out, "{}", v84);
 		}
 		out.push(']');
 		out.push('}');
@@ -2543,13 +2535,13 @@ impl Neighbor {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v90 = true;
-		for v89 in self.mac.iter() {
-			if !v90 {
+		let mut v87 = true;
+		for v86 in self.mac.iter() {
+			if !v87 {
 				out.push_str(", ");
 			}
-			v90 = false;
-			let _ = write!(out, "{}", v89);
+			v87 = false;
+			let _ = write!(out, "{}", v86);
 		}
 		out.push(']');
 		out.push('}');
@@ -2574,13 +2566,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v92 = true;
-		for v91 in self.mac.iter() {
-			if !v92 {
+		let mut v89 = true;
+		for v88 in self.mac.iter() {
+			if !v89 {
 				out.push(',');
 			}
-			v92 = false;
-			let _ = write!(out, "{}", v91);
+			v89 = false;
+			let _ = write!(out, "{}", v88);
 		}
 		out.push(']');
 		out.push(',');
@@ -2589,13 +2581,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"neighbors\":");
 		out.push('[');
-		let mut v94 = true;
-		for v93 in self.neighbors.iter() {
-			if !v94 {
+		let mut v91 = true;
+		for v90 in self.neighbors.iter() {
+			if !v91 {
 				out.push(',');
 			}
-			v94 = false;
-			v93.to_json_into(out);
+			v91 = false;
+			v90.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2607,13 +2599,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v96 = true;
-		for v95 in self.mac.iter() {
-			if !v96 {
+		let mut v93 = true;
+		for v92 in self.mac.iter() {
+			if !v93 {
 				out.push_str(", ");
 			}
-			v96 = false;
-			let _ = write!(out, "{}", v95);
+			v93 = false;
+			let _ = write!(out, "{}", v92);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -2622,13 +2614,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("neighbors=");
 		out.push('[');
-		let mut v98 = true;
-		for v97 in self.neighbors.iter() {
-			if !v98 {
+		let mut v95 = true;
+		for v94 in self.neighbors.iter() {
+			if !v95 {
 				out.push_str(", ");
 			}
-			v98 = false;
-			v97.to_text_into(out);
+			v95 = false;
+			v94.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2680,13 +2672,13 @@ impl TcpRequest {
 		out.push(',');
 		out.push_str("\"request\":");
 		out.push('[');
-		let mut v100 = true;
-		for v99 in self.request.iter() {
-			if !v100 {
+		let mut v97 = true;
+		for v96 in self.request.iter() {
+			if !v97 {
 				out.push(',');
 			}
-			v100 = false;
-			let _ = write!(out, "{}", v99);
+			v97 = false;
+			let _ = write!(out, "{}", v96);
 		}
 		out.push(']');
 		out.push('}');
@@ -2698,13 +2690,13 @@ impl TcpRequest {
 		out.push_str(", ");
 		out.push_str("request=");
 		out.push('[');
-		let mut v102 = true;
-		for v101 in self.request.iter() {
-			if !v102 {
+		let mut v99 = true;
+		for v98 in self.request.iter() {
+			if !v99 {
 				out.push_str(", ");
 			}
-			v102 = false;
-			let _ = write!(out, "{}", v101);
+			v99 = false;
+			let _ = write!(out, "{}", v98);
 		}
 		out.push(']');
 		out.push('}');
@@ -2726,13 +2718,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("\"data\":");
 		out.push('[');
-		let mut v104 = true;
-		for v103 in self.data.iter() {
-			if !v104 {
+		let mut v101 = true;
+		for v100 in self.data.iter() {
+			if !v101 {
 				out.push(',');
 			}
-			v104 = false;
-			let _ = write!(out, "{}", v103);
+			v101 = false;
+			let _ = write!(out, "{}", v100);
 		}
 		out.push(']');
 		out.push('}');
@@ -2741,13 +2733,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("data=");
 		out.push('[');
-		let mut v106 = true;
-		for v105 in self.data.iter() {
-			if !v106 {
+		let mut v103 = true;
+		for v102 in self.data.iter() {
+			if !v103 {
 				out.push_str(", ");
 			}
-			v106 = false;
-			let _ = write!(out, "{}", v105);
+			v103 = false;
+			let _ = write!(out, "{}", v102);
 		}
 		out.push(']');
 		out.push('}');

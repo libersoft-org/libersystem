@@ -24,6 +24,7 @@ use alloc::vec::Vec;
 use rt::*;
 
 use crate::net::{DHCP_ACK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, Stack};
+use proto::codec::Buffer;
 use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingStatus, TcpRequest, network, socket};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
@@ -151,10 +152,13 @@ fn first_empty(clients: &[u64; MAX_CLIENTS]) -> Option<usize> {
 // gratuitous ARP that announces us on the link goes out first.
 unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 	unsafe {
-		let mut rx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
-		let mut tx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
+		// The frame and reply buffers live on the heap, not in this function's frame:
+		// serve holds all of them for its whole lifetime and the connect handshake
+		// nests a deep call chain on top, which would overflow the 16 KiB user stack.
+		let mut rx: Vec<u8> = alloc::vec![0u8; FRAME_MAX];
+		let mut tx: Vec<u8> = alloc::vec![0u8; FRAME_MAX];
 		let mut req: [u8; REQ_MAX] = [0u8; REQ_MAX];
-		let mut out: [u8; REPLY_MAX] = [0u8; REPLY_MAX];
+		let mut out: Vec<u8> = alloc::vec![0u8; REPLY_MAX];
 		let arp: usize = stack.build_arp_request(GATEWAY_IP, &mut tx);
 		send_frame(frames, &tx[..arp]);
 		// The client channels we serve the `network` interface on: the shell's
@@ -212,7 +216,7 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 						let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
 						let mut closing: bool = false;
 						{
-							let mut svc: Sock = Sock { frames, stack: &mut *stack, tx: &mut tx, closing: &mut closing };
+							let mut svc: Sock = Sock { frames, stack: &mut *stack, tx: &mut tx[..], closing: &mut closing };
 							if op == socket::OP_RECV {
 								// OP_RECV opens the received-data stream out of band: mint a
 								// sub-channel, hand the consumer end back with the correlation
@@ -275,7 +279,7 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 						let mut new_sock: u64 = 0;
 						let mut new_client: u64 = 0;
 						let room: bool = first_empty(&clients).is_some();
-						let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx, tx: &mut tx, cur_sock: sock, new_sock: &mut new_sock, new_client: &mut new_client, clients_room: room };
+						let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], cur_sock: sock, new_sock: &mut new_sock, new_client: &mut new_client, clients_room: room };
 						let mut reply_handle: u64 = 0;
 						if let Some(n2) = network::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
 							send_blocking(chan, &out[..n2], reply_handle);
@@ -436,14 +440,32 @@ struct Sock<'a> {
 }
 
 impl socket::Service for Sock<'_> {
-	// Send bytes on the connection (one TCP data segment); the ack arrives via the
+	// Send the bytes carried by `data` (a zero-copy `buffer`: a handle to a shared
+	// memory object the caller filled) as one TCP data segment; we map it, copy the
+	// bytes onto the wire, then unmap and close the handle. The ack arrives via the
 	// serve loop's frame pump. Closed once the connection is reset or gone.
-	fn send(&mut self, data: Vec<u8>) -> Result<u32, Error> {
+	fn send(&mut self, data: Buffer) -> Result<u32, Error> {
 		if !self.stack.tcp_established() || self.stack.tcp_aborted() {
+			unsafe { close(data.handle) };
 			return Err(Error::Closed);
 		}
-		unsafe { socket_send(&data, self.frames, self.stack, self.tx) };
-		Ok(data.len() as u32)
+		unsafe {
+			let base: u64 = match map_object(data.handle) {
+				Some(b) => b,
+				None => {
+					close(data.handle);
+					return Err(Error::Invalid);
+				}
+			};
+			// Bound the view to a single segment - the memory object is at least one
+			// page, so this slice never runs past the mapping even for a bogus length.
+			let n: usize = (data.len as usize).min(FRAME_MAX);
+			let bytes: &[u8] = core::slice::from_raw_parts(base as *const u8, n);
+			socket_send(bytes, self.frames, self.stack, self.tx);
+			unmap_object(data.handle);
+			close(data.handle);
+			Ok(n as u32)
+		}
 	}
 
 	// The snapshot of bytes already buffered when the recv stream opens; the serve

@@ -237,7 +237,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 
 | op | method | signature |
 | --- | --- | --- |
-| 1 | `send` | `send(data: list<u8>) -> result<u32, error>` |
+| 1 | `send` | `send(data: buffer) -> result<u32, error>` |
 | 2 | `recv` | `recv() -> stream<chunk>` |
 | 3 | `close` | `close() -> result<unit, error>` |
 

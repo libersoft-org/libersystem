@@ -446,7 +446,8 @@ impl Cg {
 				format!("match {refp} {{ Ok({bo}) => {{ w.u8(1)?; {okb} }} Err({be}) => {{ w.u8(0)?; {errb} }} }}")
 			}
 			Type::Handle(_) => format!("w.set_handle({val}); w.u32(0)?;"),
-			Type::Buffer | Type::Stream(_) => return Err("buffer and stream are not yet supported in a value position".into()),
+			Type::Buffer => format!("w.set_handle({place}.handle); w.u64({place}.len)?;"),
+			Type::Stream(_) => return Err("stream is not supported in a value position".into()),
 		})
 	}
 
@@ -482,7 +483,8 @@ impl Cg {
 			}
 			Type::Result(okty, errty) => format!("if r.u8()? != 0 {{ Ok({}) }} else {{ Err({}) }}", self.read_value(okty)?, self.read_value(errty)?),
 			Type::Handle(_) => "{ let _ = r.u32()?; r.take_handle() }".into(),
-			Type::Buffer | Type::Stream(_) => return Err("buffer and stream are not yet supported in a value position".into()),
+			Type::Buffer => "{ let len = r.u64()?; let handle = r.take_handle(); crate::codec::Buffer { handle, len } }".into(),
+			Type::Stream(_) => return Err("stream is not supported in a value position".into()),
 		})
 	}
 
@@ -673,7 +675,8 @@ impl Cg {
 				format!("match {refplace} {{ Ok({vo}) => {{ out.push_str(\"{{\\\"ok\\\":\"); {okb} out.push('}}'); }} Err({ve}) => {{ out.push_str(\"{{\\\"err\\\":\"); {errb} out.push('}}'); }} }}")
 			}
 			Type::Handle(_) => format!("let _ = write!(out, \"{{}}\", {place});"),
-			Type::Buffer | Type::Stream(_) => return Err("buffer and stream are not renderable".into()),
+			Type::Buffer => format!("let _ = write!(out, \"{{}}\", {place}.len);"),
+			Type::Stream(_) => return Err("stream is not renderable".into()),
 		})
 	}
 
@@ -718,7 +721,8 @@ impl Cg {
 				format!("match {refplace} {{ Ok({vo}) => {{ out.push_str(\"ok(\"); {okb} out.push(')'); }} Err({ve}) => {{ out.push_str(\"err(\"); {errb} out.push(')'); }} }}")
 			}
 			Type::Handle(_) => format!("let _ = write!(out, \"{{}}\", {place});"),
-			Type::Buffer | Type::Stream(_) => return Err("buffer and stream are not renderable".into()),
+			Type::Buffer => format!("let _ = write!(out, \"{{}}\", {place}.len);"),
+			Type::Stream(_) => return Err("stream is not renderable".into()),
 		})
 	}
 
@@ -812,7 +816,8 @@ fn rust_ty(ty: &Type) -> Result<String, String> {
 		Type::Result(a, b) => format!("Result<{}, {}>", rust_ty(a)?, rust_ty(b)?),
 		Type::Named(n) => camel(n),
 		Type::Handle(_) => "u64".into(),
-		Type::Buffer | Type::Stream(_) => return Err("buffer and stream are not yet supported in a value position".into()),
+		Type::Buffer => "crate::codec::Buffer".into(),
+		Type::Stream(_) => return Err("stream is not supported in a value position".into()),
 	})
 }
 
@@ -843,7 +848,8 @@ fn flags_width(count: usize) -> &'static str {
 
 // Whether a method's parameters and return type can all be carried by the codec. A
 // `stream<T>` return is supported when its element type is (it is delivered over a
-// sub-channel, not inline); buffer is still deferred to the zero-copy framing.
+// sub-channel, not inline); a `buffer` is carried zero-copy as an out-of-band handle
+// plus an in-stream length.
 fn method_supported(m: &Method) -> bool {
 	if !m.params.iter().all(|p| type_codec_ok(&p.ty)) {
 		return false;
@@ -856,7 +862,8 @@ fn method_supported(m: &Method) -> bool {
 
 fn type_codec_ok(ty: &Type) -> bool {
 	match ty {
-		Type::Buffer | Type::Stream(_) => false,
+		Type::Buffer => true,
+		Type::Stream(_) => false,
 		Type::Handle(_) => true,
 		Type::Option(t) | Type::List(t) => type_codec_ok(t),
 		Type::Tuple(ts) => ts.iter().all(type_codec_ok),

@@ -250,6 +250,18 @@ impl<'a> Reader<'a> {
 	}
 }
 
+// A `buffer`: bulk payload carried zero-copy as a handle to a shared memory object
+// (a MemoryObject / SharedBuffer) plus its byte length. The length travels in-stream
+// and the handle out-of-band (the message's single transferred handle, like a
+// `handle<R>`); the bytes themselves never cross the channel - the producer fills
+// the memory object and the consumer maps it. A descriptor only: the create / map /
+// read of the actual bytes is done by the application via the runtime syscalls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Buffer {
+	pub handle: u64,
+	pub len: u64,
+}
+
 // Append `s` to `out` as a JSON string literal: wrapped in quotes with the
 // mandatory characters escaped. Used by the generated `to_json` renderers.
 pub fn json_escape(s: &str, out: &mut String) {

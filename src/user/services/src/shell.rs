@@ -138,6 +138,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  ping <ip>        send an ICMP echo via the net driver\n");
 			print(b"  nslookup <name>  resolve a name to an address via DNS\n");
 			print(b"  tcp <ip> <port>  open a TCP connection and probe it (HTTP GET)\n");
+			print(b"  nc <ip> <port>   open a raw TCP connection (optional request to send)\n");
+			print(b"  arp              show the ARP / neighbor cache\n");
 			print(b"  exit             stop the shell and halt\n");
 			return false;
 		}
@@ -203,6 +205,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		}
 		if let Some(rest) = line.strip_prefix(b"tcp ") {
 			spawn_net_tool(netsvc, package, b"tcp", trim(rest));
+			return false;
+		}
+		if line == b"arp" {
+			spawn_net_tool(netsvc, package, b"arp", b"");
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"nc ") {
+			spawn_net_tool(netsvc, package, b"nc", trim(rest));
 			return false;
 		}
 		if line == b"echo" {
