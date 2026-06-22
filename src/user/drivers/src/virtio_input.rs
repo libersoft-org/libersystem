@@ -37,11 +37,19 @@ const KEY_END: u16 = 107;
 const KEY_DOWN: u16 = 108;
 const KEY_DELETE: u16 = 111;
 
+// Linux keycodes for the modifier keys (tracked across press/release, not emitted).
+const KEY_LEFTCTRL: u16 = 29;
+const KEY_LEFTSHIFT: u16 = 42;
+const KEY_RIGHTSHIFT: u16 = 54;
+const KEY_LEFTALT: u16 = 56;
+const KEY_CAPSLOCK: u16 = 58;
+const KEY_RIGHTCTRL: u16 = 97;
+const KEY_RIGHTALT: u16 = 100;
+
 // Linux input keycode -> ASCII for the unshifted main block: the letter keys
 // (lowercase), the digit row, and the few control keys a line shell needs. 0 means
 // "no character" (modifiers, function keys, unmapped). Indices are KEY_* codes, e.g.
-// KEY_A = 30 -> 'a', KEY_ENTER = 28 -> '\n', KEY_BACKSPACE = 14 -> 0x08. Shift and
-// the other modifiers are not yet tracked (a later refinement).
+// KEY_A = 30 -> 'a', KEY_ENTER = 28 -> '\n', KEY_BACKSPACE = 14 -> 0x08.
 #[rustfmt::skip]
 const KEYMAP: [u8; 64] = [
 	0,    0,    b'1', b'2',  b'3',  b'4', b'5', b'6', b'7', b'8',
@@ -52,6 +60,29 @@ const KEYMAP: [u8; 64] = [
 	b'm', b',', b'.', b'/',  0,     b'*', 0,    b' ', 0,    0,
 	0,    0,    0,    0,
 ];
+
+// The shifted layout (US): the same indices as KEYMAP, with Shift applied - capitals
+// for letters and the shifted symbols for the digit row and punctuation. Caps Lock
+// flips only the letters (handled in `layout`).
+#[rustfmt::skip]
+const KEYMAP_SHIFT: [u8; 64] = [
+	0,    0,    b'!', b'@',  b'#',  b'$', b'%', b'^', b'&', b'*',
+	b'(', b')', b'_', b'+',  0x08,  0x09, b'Q', b'W', b'E', b'R',
+	b'T', b'Y', b'U', b'I',  b'O',  b'P', b'{', b'}', b'\n', 0,
+	b'A', b'S', b'D', b'F',  b'G',  b'H', b'J', b'K', b'L', b':',
+	b'"', b'~', 0,   b'|',  b'Z',  b'X', b'C', b'V', b'B', b'N',
+	b'M', b'<', b'>', b'?',  0,     b'*', 0,    b' ', 0,    0,
+	0,    0,    0,    0,
+];
+
+// The live modifier state, tracked across key press / release events.
+#[derive(Default)]
+struct Mods {
+	shift: bool,
+	ctrl: bool,
+	alt: bool,
+	caps: bool,
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -104,6 +135,7 @@ unsafe fn recv_irq(bootstrap: u64) -> u64 {
 // input), re-post the drained buffers, and re-arm the interrupt.
 unsafe fn event_loop(irq: u64, device: &Virtio, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16) -> ! {
 	unsafe {
+		let mut mods: Mods = Mods::default();
 		loop {
 			// block until the keyboard raises its interrupt.
 			wait(irq, 0);
@@ -112,7 +144,7 @@ unsafe fn event_loop(irq: u64, device: &Virtio, eventq: &mut Queue, pool_virt: u
 			// drain the buffers the device filled, re-posting each as we go.
 			while let Some((id, _len)) = eventq.take_used() {
 				if id < slots {
-					feed_event(pool_virt + id as u64 * EVENT_SIZE);
+					feed_event(pool_virt + id as u64 * EVENT_SIZE, &mut mods);
 					eventq.post_recv(id, pool_phys + id as u64 * EVENT_SIZE, EVENT_SIZE as u32);
 				}
 			}
@@ -123,15 +155,40 @@ unsafe fn event_loop(irq: u64, device: &Virtio, eventq: &mut Queue, pool_virt: u
 	}
 }
 
-// Decode the virtio_input_event at `addr` and, if it is a key press (or autorepeat)
-// of a key we map, feed the resulting character to the kernel console.
-unsafe fn feed_event(addr: u64) {
+// Decode the virtio_input_event at `addr`. Modifier keys update `mods` (tracked
+// across press and release); an ordinary key press / autorepeat is turned into a
+// character through the layout (Shift / Caps / Ctrl / Alt applied) and fed to the
+// console, and a navigation key into its ANSI escape sequence.
+unsafe fn feed_event(addr: u64, mods: &mut Mods) {
 	unsafe {
 		let kind: u16 = (addr as *const u16).read_volatile();
 		let code: u16 = ((addr + 2) as *const u16).read_volatile();
 		let value: u32 = ((addr + 4) as *const u32).read_volatile();
 		if kind != EV_KEY {
 			return;
+		}
+		// Modifier keys track press (1) / release (0); Caps Lock toggles on press. They
+		// emit no character, so handle them before the press-only gate below.
+		match code {
+			KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
+				mods.shift = value != 0;
+				return;
+			}
+			KEY_LEFTCTRL | KEY_RIGHTCTRL => {
+				mods.ctrl = value != 0;
+				return;
+			}
+			KEY_LEFTALT | KEY_RIGHTALT => {
+				mods.alt = value != 0;
+				return;
+			}
+			KEY_CAPSLOCK => {
+				if value == 1 {
+					mods.caps = !mods.caps;
+				}
+				return;
+			}
+			_ => {}
 		}
 		// 1 = press, 2 = autorepeat (both emit); 0 = release is ignored.
 		if value != 1 && value != 2 {
@@ -149,11 +206,42 @@ unsafe fn feed_event(addr: u64) {
 		if code >= 64 {
 			return;
 		}
-		let ch: u8 = KEYMAP[code as usize];
+		let ch: u8 = layout(code, mods);
 		if ch != 0 {
+			// Alt makes the key a "meta" key: prefix the byte with ESC, the convention a
+			// serial terminal uses (Alt+x -> ESC x).
+			if mods.alt {
+				console_feed(0x1b);
+			}
 			console_feed(ch);
 		}
 	}
+}
+
+// Resolve a main-block keycode to a character given the modifier state: Ctrl maps a
+// letter (and `[ \ ]`) to its control code; otherwise Shift (and, for letters, Caps
+// Lock) selects the shifted layout. Returns 0 for an unmapped key.
+fn layout(code: u16, mods: &Mods) -> u8 {
+	let base: u8 = KEYMAP[code as usize];
+	if base == 0 {
+		return 0;
+	}
+	if mods.ctrl {
+		// Ctrl + letter -> 0x01..0x1a; Ctrl + [ \ ] -> 0x1b..0x1d; other combos ignored.
+		let upper: u8 = base.to_ascii_uppercase();
+		if upper.is_ascii_uppercase() {
+			return upper - b'A' + 1;
+		}
+		return match base {
+			b'[' => 0x1b,
+			b'\\' => 0x1c,
+			b']' => 0x1d,
+			_ => 0,
+		};
+	}
+	// Letters flip with Shift XOR Caps Lock; symbols only with Shift.
+	let shifted: bool = if base.is_ascii_lowercase() { mods.shift ^ mods.caps } else { mods.shift };
+	if shifted { KEYMAP_SHIFT[code as usize] } else { base }
 }
 
 // The ANSI escape sequence a navigation keycode maps to, or None for an ordinary key.
