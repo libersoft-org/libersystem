@@ -386,6 +386,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		if line == b"help" {
 			print(b"commands:\n");
 			print(b"  help             show this help\n");
+			print(b"  clear            clear the screen\n");
 			print(b"  echo <text>      print text\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
 			print(b"  log [json]       show the system journal via LogService\n");
@@ -404,6 +405,12 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  ss | netstat     list the live sockets\n");
 			print(b"  httpd            serve HTTP on port 80 (background)\n");
 			print(b"  exit             stop the shell and halt\n");
+			return false;
+		}
+		if line == b"clear" {
+			// ED (erase the whole display) + CUP (home the cursor) - the console's
+			// cell-buffer terminal interprets these the same as any VT100 terminal.
+			print(b"\x1b[2J\x1b[H");
 			return false;
 		}
 		if line == b"log" {
