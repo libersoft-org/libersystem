@@ -327,6 +327,77 @@ unsafe fn bg_job(jobs: &mut Jobs, arg: &[u8]) {
 	}
 }
 
+// `size`: query the terminal size from ConsoleService over the control channel (the typed
+// winsize / TIOCGWINSZ route) and print it.
+unsafe fn show_size(control: u64) {
+	unsafe {
+		send_blocking(control, b"GET_WINSIZE", 0);
+		match recv_winsize(control, b"WINSIZE") {
+			Some((rows, cols)) if rows != 0 && cols != 0 => {
+				print(b"size: ");
+				print_usize(cols as usize);
+				print(b" cols x ");
+				print_usize(rows as usize);
+				print(b" rows\n");
+			}
+			_ => print(b"size: unavailable\n"),
+		}
+	}
+}
+
+// `resize <cols> <rows>`: ask ConsoleService to resize the terminal (the local stand-in
+// for a display mode-set until virtio-gpu drives it, M44), then report the new size from
+// the RESIZE event it sends back.
+unsafe fn resize_console(control: u64, args: &[u8]) {
+	unsafe {
+		let mut it = args.split(|&b| b == b' ').filter(|s: &&[u8]| !s.is_empty());
+		let cols = it.next().and_then(parse_usize);
+		let rows = it.next().and_then(parse_usize);
+		let (cols, rows) = match (cols, rows) {
+			(Some(c), Some(r)) if c > 0 && r > 0 => (c, r),
+			_ => {
+				print(b"usage: resize <cols> <rows>\n");
+				return;
+			}
+		};
+		let mut m: [u8; 15] = [0u8; 15];
+		m[..11].copy_from_slice(b"SET_WINSIZE");
+		m[11..13].copy_from_slice(&(cols as u16).to_le_bytes());
+		m[13..15].copy_from_slice(&(rows as u16).to_le_bytes());
+		send_blocking(control, &m, 0);
+		if let Some((rows, cols)) = recv_winsize(control, b"RESIZE") {
+			print(b"resized to ");
+			print_usize(cols as usize);
+			print(b" x ");
+			print_usize(rows as usize);
+			print(b"\n");
+		}
+	}
+}
+
+// Receive a winsize-bearing control reply with the given tag ([tag][rows u16][cols u16]),
+// skipping any unrelated control message; returns (rows, cols).
+unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
+	unsafe {
+		let mut buf: [u8; 32] = [0u8; 32];
+		loop {
+			match recv_blocking(control, &mut buf) {
+				Received::Message { len, .. } => {
+					let m: &[u8] = &buf[..len];
+					if m.starts_with(tag) && len >= tag.len() + 4 {
+						let n = tag.len();
+						let rows = u16::from_le_bytes([m[n], m[n + 1]]);
+						let cols = u16::from_le_bytes([m[n + 2], m[n + 3]]);
+						return Some((rows, cols));
+					}
+					// an unrelated control message: ignore it and keep waiting.
+				}
+				Received::Closed => return None,
+			}
+		}
+	}
+}
+
 unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
 	unsafe {
 		let line = trim(line);
@@ -369,6 +440,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"commands:\n");
 			print(b"  help             show this help\n");
 			print(b"  clear            clear the screen\n");
+			print(b"  size             show the terminal size (cols x rows)\n");
+			print(b"  resize <c> <r>   resize the terminal to c cols x r rows\n");
 			print(b"  echo <text>      print text\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
 			print(b"  log [json]       show the system journal via LogService\n");
@@ -400,6 +473,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			// ED (erase the whole display) + CUP (home the cursor) - the console's
 			// cell-buffer terminal interprets these the same as any VT100 terminal.
 			print(b"\x1b[2J\x1b[H");
+			return false;
+		}
+		if line == b"size" {
+			show_size(jobs.control);
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"resize ") {
+			resize_console(jobs.control, trim(rest));
 			return false;
 		}
 		if line == b"log" {

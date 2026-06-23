@@ -250,6 +250,64 @@ impl Term {
 		self.row = 0;
 	}
 
+	// Resize the logical grid to new_cols x new_rows (clamped to what the physical
+	// framebuffer can show), reflowing the screen: the overlapping rectangle of cells is
+	// preserved (bottom-anchored so the cursor line stays on screen), the alternate screen
+	// and scrollback are reset, and the now-unused area is cleared. This is the local
+	// stand-in for a virtio-gpu mode-set (M44); the same path runs on a real resolution
+	// change once that driver lands.
+	fn resize(&mut self, new_cols: usize, new_rows: usize) {
+		let max_cols = (self.width / CELL_W).max(1);
+		let max_rows = (self.height / CELL_H).max(1);
+		let new_cols = new_cols.clamp(1, max_cols);
+		let new_rows = new_rows.clamp(1, max_rows);
+		if new_cols == self.cols && new_rows == self.rows {
+			return;
+		}
+		let blank = Cell { glyph: b' ', fg: self.fg, bg: self.bg, underline: false };
+		let mut new_primary = alloc::vec![blank; new_cols * new_rows];
+		let copy_rows = self.rows.min(new_rows);
+		let copy_cols = self.cols.min(new_cols);
+		let src_row0 = self.rows - copy_rows; // keep the bottom rows
+		let dst_row0 = new_rows - copy_rows;
+		for r in 0..copy_rows {
+			for c in 0..copy_cols {
+				new_primary[(dst_row0 + r) * new_cols + c] = self.primary[(src_row0 + r) * self.cols + c];
+			}
+		}
+		// Track the cursor with the content (bottom-anchored), clamped into the new grid.
+		let new_row = if self.row >= src_row0 { dst_row0 + (self.row - src_row0) } else { 0 };
+		self.col = self.col.min(new_cols - 1);
+		self.row = new_row.min(new_rows - 1);
+		self.primary = new_primary;
+		self.alt = alloc::vec![blank; new_cols * new_rows];
+		self.dirty = alloc::vec![true; new_cols * new_rows];
+		// Scrollback is reset on a resize (its fixed width changed) - the Linux console
+		// likewise drops scrollback on a mode change.
+		self.scrollback = alloc::vec![blank; SCROLLBACK_ROWS * new_cols];
+		self.sb_cap = SCROLLBACK_ROWS;
+		self.sb_head = 0;
+		self.sb_len = 0;
+		self.view_offset = 0;
+		self.cols = new_cols;
+		self.rows = new_rows;
+		self.scroll_top = 0;
+		self.scroll_bottom = new_rows - 1;
+		self.alt_active = false;
+		self.last_caret = None;
+		self.clear_screen();
+	}
+
+	// Fill the whole physical framebuffer with the default background - used when the grid
+	// shrinks so the area now outside it is not left with stale pixels.
+	fn clear_screen(&self) {
+		for y in 0..self.height {
+			for x in 0..self.width {
+				self.put_pixel(x, y, self.bg);
+			}
+		}
+	}
+
 	// Paint one cell from the grid to the framebuffer.
 	fn draw_cell(&self, col: usize, row: usize) {
 		self.draw_cell_at(col, row, self.cells()[row * self.cols + col]);
@@ -1883,6 +1941,17 @@ unsafe fn handle_control(console: &mut Console, vi: usize) {
 					if let Some(p) = console.vts[vi].fg_proc.take() {
 						close(p);
 					}
+				} else if msg.starts_with(b"GET_WINSIZE") {
+					// Report this VT's terminal size (rows x cols) back over the control
+					// channel - the typed winsize query (the TIOCGWINSZ route).
+					let (rows, cols) = win_dims(console, vi);
+					send_winsize(console.vts[vi].control, b"WINSIZE", rows, cols);
+				} else if msg.starts_with(b"SET_WINSIZE") && len >= 15 {
+					// Resize this VT's terminal to the requested cols x rows (the local
+					// stand-in for a display mode-set until virtio-gpu drives it, M44).
+					let cols = u16::from_le_bytes([msg[11], msg[12]]) as usize;
+					let rows = u16::from_le_bytes([msg[13], msg[14]]) as usize;
+					resize_vt(console, vi, cols, rows);
 				} else if handle != 0 {
 					// an unexpected transferred handle would otherwise leak.
 					close(handle);
@@ -1890,6 +1959,43 @@ unsafe fn handle_control(console: &mut Console, vi: usize) {
 			}
 			Received::Closed => close_vt(console, vi),
 		}
+	}
+}
+
+// This VT's terminal size as (rows, cols), or (0, 0) when headless.
+fn win_dims(console: &Console, vi: usize) -> (u16, u16) {
+	match console.vts[vi].term.as_ref() {
+		Some(t) => (t.rows as u16, t.cols as u16),
+		None => (0, 0),
+	}
+}
+
+// Send a winsize-bearing control reply: [tag][rows u16 LE][cols u16 LE].
+unsafe fn send_winsize(control: u64, tag: &[u8], rows: u16, cols: u16) {
+	unsafe {
+		let mut r: [u8; 16] = [0u8; 16];
+		let n = tag.len();
+		r[..n].copy_from_slice(tag);
+		r[n..n + 2].copy_from_slice(&rows.to_le_bytes());
+		r[n + 2..n + 4].copy_from_slice(&cols.to_le_bytes());
+		send_blocking(control, &r[..n + 4], 0);
+	}
+}
+
+// Resize VT vi's terminal to cols x rows, repainting it if it is foreground, then send a
+// RESIZE event (the SIGWINCH equivalent) back to its program with the actual (clamped)
+// size so it can re-query and redraw.
+unsafe fn resize_vt(console: &mut Console, vi: usize, cols: usize, rows: usize) {
+	unsafe {
+		let fg: bool = vi == console.fg;
+		if let Some(t) = console.vts[vi].term.as_mut() {
+			t.resize(cols, rows);
+			if fg {
+				t.flush();
+			}
+		}
+		let (rows, cols) = win_dims(console, vi);
+		send_winsize(console.vts[vi].control, b"RESIZE", rows, cols);
 	}
 }
 
