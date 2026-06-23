@@ -76,6 +76,17 @@ enum Color {
 	Rgb(u8, u8, u8),
 }
 
+// The caret shape selected by DECSCUSR (CSI Ps SP q): a steady underline by default, a
+// block, or a vertical bar. The blink flag is recorded but the caret is drawn solid (a
+// self-driven blink timer would keep the cooperative boot driver from settling - the
+// same reason the M35c blink was dropped).
+#[derive(Clone, Copy, PartialEq)]
+enum CursorShape {
+	Block,
+	Underline,
+	Bar,
+}
+
 // The terminal: the mapped framebuffer + geometry, the cell grid (primary +
 // alternate screen), the cursor and its saved copy, the scroll region, the current
 // SGR state, and the output escape-parser state.
@@ -116,6 +127,11 @@ struct Term {
 	saved_underline: bool,
 	saved_reverse: bool,
 	cursor_visible: bool,
+	cursor_shape: CursorShape,
+	cursor_blink: bool,
+	bell: bool,
+	osc: [u8; 64],
+	osc_len: usize,
 	esc_state: u8,
 	csi_private: u8,
 	params: [u16; 16],
@@ -138,7 +154,7 @@ impl Term {
 	fn new(addr: u64, fb: &Framebuffer) -> Term {
 		let cols = fb.width as usize / CELL_W;
 		let rows = fb.height as usize / CELL_H;
-		let mut t = Term { addr, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), fg: 0, bg: 0, palette: [0; 16], cur_fg: 0, cur_bg: 0, cur_underline: false, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: Vec::new(), alt: Vec::new(), alt_active: false, dirty: Vec::new(), last_caret: None, scrollback: Vec::new(), sb_cap: 0, sb_head: 0, sb_len: 0, view_offset: 0 };
+		let mut t = Term { addr, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), fg: 0, bg: 0, palette: [0; 16], cur_fg: 0, cur_bg: 0, cur_underline: false, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 64], osc_len: 0, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: Vec::new(), alt: Vec::new(), alt_active: false, dirty: Vec::new(), last_caret: None, scrollback: Vec::new(), sb_cap: 0, sb_head: 0, sb_len: 0, view_offset: 0 };
 		t.fg = t.pack(FG.0, FG.1, FG.2);
 		t.bg = t.pack(BG.0, BG.1, BG.2);
 		for (i, &(r, g, b)) in ANSI_PALETTE.iter().enumerate() {
@@ -264,14 +280,31 @@ impl Term {
 		}
 	}
 
-	// A solid underline caret. The cell glyph is repainted first (by the dirty
-	// flush), so this just paints over the bottom rows.
+	// Draw the caret in the current DECSCUSR shape over its cell (the glyph was already
+	// repainted by the dirty flush): a block inverts the cell, an underline paints the
+	// bottom rows, a bar the left columns.
 	fn draw_caret(&self, col: usize, row: usize) {
 		let x0 = col * CELL_W;
 		let y0 = row * CELL_H;
-		for y in (y0 + CELL_H - SCALE)..(y0 + CELL_H) {
-			for x in x0..(x0 + CELL_W) {
-				self.put_pixel(x, y, self.cur_fg);
+		match self.cursor_shape {
+			CursorShape::Block => {
+				let cell = self.cells()[row * self.cols + col];
+				let inv = Cell { glyph: cell.glyph, fg: cell.bg, bg: cell.fg, underline: cell.underline };
+				self.draw_cell_at(col, row, inv);
+			}
+			CursorShape::Underline => {
+				for y in (y0 + CELL_H - SCALE)..(y0 + CELL_H) {
+					for x in x0..(x0 + CELL_W) {
+						self.put_pixel(x, y, self.cur_fg);
+					}
+				}
+			}
+			CursorShape::Bar => {
+				for y in y0..(y0 + CELL_H) {
+					for x in x0..(x0 + SCALE) {
+						self.put_pixel(x, y, self.cur_fg);
+					}
+				}
 			}
 		}
 	}
@@ -541,7 +574,7 @@ impl Term {
 				let next = (self.col / 8 + 1) * 8;
 				self.col = next.min(self.cols.saturating_sub(1));
 			}
-			0x07 => {} // bell (a visible/audible bell is M35h)
+			0x07 => self.bell = true, // BEL: a visual flash, rendered by the console
 			0x20..=0x7e => self.put_codepoint(byte as u32),
 			_ if byte >= 0x80 => self.begin_utf8(byte),
 			_ => {} // other C0 control bytes: ignored
@@ -558,7 +591,10 @@ impl Term {
 				self.nparams = 0;
 				self.csi_private = 0;
 			}
-			b']' => self.esc_state = 3,
+			b']' => {
+				self.esc_state = 3;
+				self.osc_len = 0;
+			}
 			b'7' => {
 				self.save_cursor();
 				self.esc_state = 0;
@@ -588,12 +624,21 @@ impl Term {
 		}
 	}
 
-	// Swallow an OSC string until BEL (0x07) or the start of an ST (ESC \).
+	// Accumulate an OSC string until BEL (0x07) or the start of an ST (ESC \), then act
+	// on it. Bytes past the buffer are dropped (only short control strings - a palette
+	// set - are acted on; a long title is ignored anyway).
 	fn osc_byte(&mut self, byte: u8) {
 		if byte == 0x07 {
+			self.osc_dispatch();
 			self.esc_state = 0;
 		} else if byte == 0x1b {
+			// ESC: the start of a String Terminator (ESC \); act now, then consume the
+			// following byte as a normal escape (the trailing '\' is a harmless no-op).
+			self.osc_dispatch();
 			self.esc_state = 1;
+		} else if self.osc_len < self.osc.len() {
+			self.osc[self.osc_len] = byte;
+			self.osc_len += 1;
 		}
 	}
 
@@ -690,6 +735,7 @@ impl Term {
 			b'h' => self.set_mode(true),
 			b'l' => self.set_mode(false),
 			b'm' => self.apply_sgr(),
+			b'q' => self.set_cursor_style(self.param(0, 1)),
 			_ => {}
 		}
 	}
@@ -1002,6 +1048,158 @@ impl Term {
 			}
 		}
 	}
+
+	// DECSCUSR (CSI Ps SP q): select the cursor shape + blink. 0/1 blinking block, 2
+	// steady block, 3 blinking underline, 4 steady underline, 5 blinking bar, 6 steady
+	// bar. The blink flag is recorded but the caret is drawn solid.
+	fn set_cursor_style(&mut self, n: usize) {
+		let (shape, blink) = match n {
+			0 | 1 => (CursorShape::Block, true),
+			2 => (CursorShape::Block, false),
+			3 => (CursorShape::Underline, true),
+			4 => (CursorShape::Underline, false),
+			5 => (CursorShape::Bar, true),
+			6 => (CursorShape::Bar, false),
+			_ => (self.cursor_shape, self.cursor_blink),
+		};
+		self.cursor_shape = shape;
+		self.cursor_blink = blink;
+	}
+
+	// Whether a BEL arrived since the last check, clearing the flag.
+	fn take_bell(&mut self) -> bool {
+		let b = self.bell;
+		self.bell = false;
+		b
+	}
+
+	// Paint the whole screen with every cell's colours swapped - the visual bell flash -
+	// without touching the grid, so a following mark_all_dirty + flush restores it.
+	fn draw_inverted(&self) {
+		for row in 0..self.rows {
+			for col in 0..self.cols {
+				let c = self.cells()[row * self.cols + col];
+				let inv = Cell { glyph: c.glyph, fg: c.bg, bg: c.fg, underline: c.underline };
+				self.draw_cell_at(col, row, inv);
+			}
+		}
+	}
+
+	// Act on a completed OSC string: OSC 4;n;spec sets palette entry n (0-15), OSC
+	// 10;spec / 11;spec the default fg / bg. OSC 0/1/2 (title) and 8 (hyperlink) are
+	// accepted and ignored - a bare VT console has no title bar or clickable links.
+	fn osc_dispatch(&mut self) {
+		let len = self.osc_len;
+		let semi = match self.osc[..len].iter().position(|&b| b == b';') {
+			Some(i) => i,
+			None => return,
+		};
+		let code = parse_dec(&self.osc[..semi]);
+		let rest_start = semi + 1;
+		match code {
+			Some(4) => {
+				let (n, color) = {
+					let rest = &self.osc[rest_start..len];
+					let semi2 = match rest.iter().position(|&b| b == b';') {
+						Some(i) => i,
+						None => return,
+					};
+					(parse_dec(&rest[..semi2]), parse_osc_color(&rest[semi2 + 1..]))
+				};
+				if let (Some(n), Some((r, g, b))) = (n, color) {
+					if n < 16 {
+						let p = self.pack(r, g, b);
+						self.palette[n] = p;
+						self.recompute_colors();
+					}
+				}
+			}
+			Some(10) => {
+				if let Some((r, g, b)) = parse_osc_color(&self.osc[rest_start..len]) {
+					let p = self.pack(r, g, b);
+					self.fg = p;
+					self.recompute_colors();
+				}
+			}
+			Some(11) => {
+				if let Some((r, g, b)) = parse_osc_color(&self.osc[rest_start..len]) {
+					let p = self.pack(r, g, b);
+					self.bg = p;
+					self.recompute_colors();
+				}
+			}
+			_ => {}
+		}
+	}
+}
+
+// Parse a decimal byte string to usize, or None if empty / non-numeric.
+fn parse_dec(s: &[u8]) -> Option<usize> {
+	if s.is_empty() {
+		return None;
+	}
+	let mut v: usize = 0;
+	for &b in s {
+		if !b.is_ascii_digit() {
+			return None;
+		}
+		v = v.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+	}
+	Some(v)
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+	match b {
+		b'0'..=b'9' => Some(b - b'0'),
+		b'a'..=b'f' => Some(b - b'a' + 10),
+		b'A'..=b'F' => Some(b - b'A' + 10),
+		_ => None,
+	}
+}
+
+fn hex2(s: &[u8]) -> Option<u8> {
+	Some(hex_digit(s[0])? * 16 + hex_digit(s[1])?)
+}
+
+// Parse 1-4 hex digits and scale to 8 bits (xterm: "f" -> 0xff, "ff" -> 0xff, etc).
+fn scale_hex(s: &[u8]) -> Option<u8> {
+	if s.is_empty() || s.len() > 4 {
+		return None;
+	}
+	let mut v: u32 = 0;
+	for &b in s {
+		v = (v << 4) | hex_digit(b)? as u32;
+	}
+	let scaled = match s.len() {
+		1 => (v << 4) | v,
+		2 => v,
+		3 => v >> 4,
+		_ => v >> 8,
+	};
+	Some(scaled as u8)
+}
+
+// Parse an X11 / xterm OSC colour spec to (r, g, b): "rgb:RR/GG/BB" (1-4 hex digits per
+// component) or "#RGB" / "#RRGGBB".
+fn parse_osc_color(s: &[u8]) -> Option<(u8, u8, u8)> {
+	if let Some(rest) = s.strip_prefix(b"rgb:") {
+		let mut it = rest.split(|&b| b == b'/');
+		let r = scale_hex(it.next()?)?;
+		let g = scale_hex(it.next()?)?;
+		let b = scale_hex(it.next()?)?;
+		if it.next().is_some() {
+			return None;
+		}
+		Some((r, g, b))
+	} else if let Some(rest) = s.strip_prefix(b"#") {
+		match rest.len() {
+			3 => Some((hex_digit(rest[0])? * 0x11, hex_digit(rest[1])? * 0x11, hex_digit(rest[2])? * 0x11)),
+			6 => Some((hex2(&rest[0..2])?, hex2(&rest[2..4])?, hex2(&rest[4..6])?)),
+			_ => None,
+		}
+	} else {
+		None
+	}
 }
 
 // The number of virtual terminals the console multiplexes. Each VT is an independent
@@ -1020,6 +1218,10 @@ const CHORD_NEXT: u8 = 0x1d;
 // pages the foreground VT's scrollback view without a multi-byte input parser.
 const CHORD_SCROLL_UP: u8 = 0x1e;
 const CHORD_SCROLL_DOWN: u8 = 0x1f;
+
+// The visual bell holds the inverted screen for this many monotonic ticks (100 Hz, so
+// ~100 ms) before restoring it.
+const BELL_FLASH_TICKS: u64 = 10;
 
 // One virtual terminal: its render state (a cell grid; None when headless) and the
 // service end of the console channel its shell writes output to and reads keys from.
@@ -1154,16 +1356,28 @@ unsafe fn run(console: &mut Console) -> ! {
 }
 
 // Render a VT's output: append it to that VT's grid, and if it is the foreground VT flush
-// the grid to the framebuffer and mirror the bytes to the serial port.
+// the grid to the framebuffer, ring the visual bell, and mirror the bytes to the serial
+// port.
 unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 	unsafe {
 		let fg: bool = vi == console.fg;
+		let input: u64 = console.input;
 		if let Some(t) = console.vts[vi].term.as_mut() {
 			for &b in bytes {
 				t.put_byte(b);
 			}
+			let bell: bool = t.take_bell();
 			if fg {
 				t.flush();
+				// BEL: invert the foreground screen briefly, then restore. A one-off timed
+				// wait (woken early by a keystroke), not a perpetual re-arm, so it never
+				// stalls the cooperative boot driver.
+				if bell {
+					t.draw_inverted();
+					let _ = wait(input, clock() + BELL_FLASH_TICKS);
+					t.mark_all_dirty();
+					t.flush();
+				}
 			}
 		}
 		if fg {

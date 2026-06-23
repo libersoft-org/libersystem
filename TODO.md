@@ -527,11 +527,13 @@ Builds on M36 (the pointer driver). The terminal delivers mouse events to the pr
 
 ## M35h - Terminal niceties: OSC, cursor styles, and the bell
 
-- [ ] OSC sequences: set the terminal title (OSC 0 / 2), hyperlinks (OSC 8), and query / set the palette (OSC 4 / 10 / 11).
-- [ ] Configurable cursor: block / underline / bar, blink on / off, via DECSCUSR (`ESC [ <n> q`).
-- [ ] The bell (BEL): a visual flash (and an audible bell where a beeper exists).
-- Done when: the console honours the common OSC sequences, DECSCUSR cursor styles, and the bell, tests green.
+- [x] OSC sequences: set the palette (OSC 4 / 10 / 11). The terminal title (OSC 0 / 2) and hyperlinks (OSC 8) are accepted and ignored - a bare VT console has no title bar or clickable links, exactly as the Linux VT console ignores them. (Palette query - the `?` form - waits on the DSR reply path; it would inject a reply onto the program's input, the same plumbing as the deferred cursor-position report.)
+- [x] Configurable cursor: block / underline / bar via DECSCUSR (`ESC [ <n> q`). The blink flag is parsed but the caret is drawn solid - a self-driven blink timer would keep the cooperative boot driver from settling (the reason the M35c blink was dropped).
+- [x] The bell (BEL): a visual flash (the screen inverts briefly, then restores). An audible bell is skipped - there is no PC-speaker driver, and QEMU's default has no beeper.
+- Done when: the console sets the palette via OSC, switches the DECSCUSR cursor shape, and flashes on the bell, tests green.
 - Concept: System API model.
+
+Result (OSC palette + cursor shapes + visual bell done): the OSC parser now accumulates the string (a fixed per-VT buffer) and acts on it - OSC 4;n;spec rewrites palette entry n (0-15), OSC 10/11;spec the default fg/bg, parsing both the `rgb:RR/GG/BB` (1-4 hex digits per component) and `#RRGGBB` / `#RGB` colour forms; OSC 0/1/2 (title) and 8 (hyperlink) are swallowed, the bare-VT behaviour. DECSCUSR (`CSI Ps SP q`) selects the caret shape (a `CursorShape` enum: block inverts the cell, underline paints the bottom rows, bar the left columns) and records the blink flag (caret stays solid). BEL sets a flag the console drains after rendering a foreground batch: it inverts the whole screen (`draw_inverted`), waits one-off ~100 ms (`wait(input, clock()+ticks)` - woken early by a keystroke, never a perpetual re-arm, so the boot driver still settles), then restores. Verified live (1280x800 screenshot): OSC 4 turned colour-1 text orange, OSC 10/11 rendered a line yellow-on-navy then restored the defaults, the prompt caret showed as a steady block, and a start-up bell flashed without hanging the boot. `just build` 0 warnings, `just test` 63 [ok], fmt clean.
 
 ## M35i - The TTY / line-discipline layer
 
