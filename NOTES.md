@@ -1,4 +1,5 @@
 - Remove the mess from the console after bootup
+- SSH server
 - Where are poweroff / reboot commands - they disappeared
 - List the available volumes "ls" - change to "lsvol"?
 - Optimize the code
