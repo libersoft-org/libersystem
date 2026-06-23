@@ -20,6 +20,7 @@ use rt::*;
 use proto::system::network;
 
 extern crate alloc;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 // The 8x8 bitmap font: 256 glyphs indexed by Unicode codepoint 0x00-0xFF - the kernel
@@ -132,6 +133,10 @@ struct Term {
 	bell: bool,
 	osc: [u8; 64],
 	osc_len: usize,
+	// Pending tty mode changes requested by the program via ESC[?9001h/l (raw) and
+	// ESC[?9002h/l (echo); drained by render_output into this VT's line discipline.
+	tty_raw_req: Option<bool>,
+	tty_echo_req: Option<bool>,
 	esc_state: u8,
 	csi_private: u8,
 	params: [u16; 16],
@@ -154,7 +159,7 @@ impl Term {
 	fn new(addr: u64, fb: &Framebuffer) -> Term {
 		let cols = fb.width as usize / CELL_W;
 		let rows = fb.height as usize / CELL_H;
-		let mut t = Term { addr, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), fg: 0, bg: 0, palette: [0; 16], cur_fg: 0, cur_bg: 0, cur_underline: false, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 64], osc_len: 0, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: Vec::new(), alt: Vec::new(), alt_active: false, dirty: Vec::new(), last_caret: None, scrollback: Vec::new(), sb_cap: 0, sb_head: 0, sb_len: 0, view_offset: 0 };
+		let mut t = Term { addr, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), fg: 0, bg: 0, palette: [0; 16], cur_fg: 0, cur_bg: 0, cur_underline: false, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 64], osc_len: 0, tty_raw_req: None, tty_echo_req: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: Vec::new(), alt: Vec::new(), alt_active: false, dirty: Vec::new(), last_caret: None, scrollback: Vec::new(), sb_cap: 0, sb_head: 0, sb_len: 0, view_offset: 0 };
 		t.fg = t.pack(FG.0, FG.1, FG.2);
 		t.bg = t.pack(BG.0, BG.1, BG.2);
 		for (i, &(r, g, b)) in ANSI_PALETTE.iter().enumerate() {
@@ -885,6 +890,8 @@ impl Term {
 						self.leave_alt();
 					}
 				}
+				9001 => self.tty_raw_req = Some(enable),
+				9002 => self.tty_echo_req = Some(enable),
 				_ => {}
 			}
 		}
@@ -1209,11 +1216,343 @@ const CHORD_SCROLL_DOWN: u8 = 0x1f;
 // ~100 ms) before restoring it.
 const BELL_FLASH_TICKS: u64 = 10;
 
-// One virtual terminal: its render state (a cell grid; None when headless) and the
-// service end of the console channel its shell writes output to and reads keys from.
+// The tty line discipline limits (per VT).
+const LD_LINE_MAX: usize = 128;
+const LD_HIST_MAX: usize = 32;
+
+// A small fixed buffer the line discipline accumulates echo bytes in, mirrored to the
+// serial port after a keystroke is processed (the framebuffer is echoed live).
+struct EchoBuf {
+	buf: [u8; 512],
+	len: usize,
+}
+
+impl EchoBuf {
+	fn new() -> EchoBuf {
+		EchoBuf { buf: [0u8; 512], len: 0 }
+	}
+	fn push(&mut self, bytes: &[u8]) {
+		for &b in bytes {
+			if self.len < self.buf.len() {
+				self.buf[self.len] = b;
+				self.len += 1;
+			}
+		}
+	}
+	fn as_slice(&self) -> &[u8] {
+		&self.buf[..self.len]
+	}
+}
+
+// The echo sink: line-edit feedback renders live to the VT's cell grid (if any) and is
+// collected for the serial mirror.
+struct Echo<'a> {
+	term: Option<&'a mut Term>,
+	ser: EchoBuf,
+}
+
+impl Echo<'_> {
+	fn put(&mut self, bytes: &[u8]) {
+		if let Some(t) = &mut self.term {
+			for &b in bytes {
+				t.put_byte(b);
+			}
+		}
+		self.ser.push(bytes);
+	}
+}
+
+// The tty line discipline for one VT: in cooked mode it line-edits + echoes keystrokes
+// (a movable cursor, mid-line insert/delete, command history, the editing control keys)
+// on the program's behalf and delivers a complete line on Enter; in raw mode keystrokes
+// pass straight through. This is the M35 line editor moved out of the shell into the
+// terminal, so every program reading this console gets the editor for free.
+struct Ld {
+	line: [u8; LD_LINE_MAX],
+	len: usize,
+	cursor: usize,
+	history: Vec<Vec<u8>>,
+	hist_pos: usize,
+	esc: u8,
+	csi_param: u8,
+	// false = raw mode (keystrokes pass through), true = cooked (line-edited). The
+	// program toggles it with ESC[?9001h/l in its output stream.
+	cooked: bool,
+	// whether keystrokes are echoed (ESC[?9002h/l).
+	echo: bool,
+}
+
+impl Ld {
+	fn new() -> Ld {
+		Ld { line: [0u8; LD_LINE_MAX], len: 0, cursor: 0, history: Vec::new(), hist_pos: 0, esc: 0, csi_param: 0, cooked: true, echo: true }
+	}
+
+	// Feed one cooked-mode keystroke. Returns true when the line was submitted (Enter or
+	// the Ctrl+C cancel), with the line in `self.line[..self.len]`.
+	fn feed(&mut self, b: u8, e: &mut Echo) -> bool {
+		match self.esc {
+			1 => {
+				self.esc = if b == b'[' { 2 } else { 0 };
+				return false;
+			}
+			2 => {
+				self.csi(b, e);
+				return false;
+			}
+			_ => {}
+		}
+		match b {
+			0x1b => self.esc = 1,
+			b'\n' | b'\r' => {
+				if self.echo {
+					e.put(b"\n");
+				}
+				return true;
+			}
+			0x08 | 0x7f => self.backspace(e),
+			0x01 => self.home(e),      // Ctrl+A
+			0x05 => self.end(e),       // Ctrl+E
+			0x15 => self.kill_line(e), // Ctrl+U
+			0x17 => self.kill_word(e), // Ctrl+W
+			0x03 => {
+				// Ctrl+C at the prompt: cancel the line and reprompt (deliver an empty
+				// line). A foreground job is interrupted in raw mode, not here.
+				if self.echo {
+					e.put(b"^C\n");
+				}
+				self.len = 0;
+				self.cursor = 0;
+				return true;
+			}
+			0x20..=0x7e => self.insert(b, e),
+			_ => {}
+		}
+		false
+	}
+
+	fn csi(&mut self, b: u8, e: &mut Echo) {
+		match b {
+			b'A' => self.history_prev(e),
+			b'B' => self.history_next(e),
+			b'C' => self.right(e),
+			b'D' => self.left(e),
+			b'H' => self.home(e),
+			b'F' => self.end(e),
+			b'0'..=b'9' => {
+				self.csi_param = self.csi_param.wrapping_mul(10).wrapping_add(b - b'0');
+				return;
+			}
+			b'~' => match self.csi_param {
+				1 | 7 => self.home(e),
+				4 | 8 => self.end(e),
+				3 => self.delete(e),
+				_ => {}
+			},
+			_ => {}
+		}
+		self.esc = 0;
+		self.csi_param = 0;
+	}
+
+	fn insert(&mut self, c: u8, e: &mut Echo) {
+		if self.len >= LD_LINE_MAX {
+			return;
+		}
+		let mut i = self.len;
+		while i > self.cursor {
+			self.line[i] = self.line[i - 1];
+			i -= 1;
+		}
+		self.line[self.cursor] = c;
+		self.len += 1;
+		if self.echo {
+			e.put(&self.line[self.cursor..self.len]);
+		}
+		self.cursor += 1;
+		if self.echo {
+			self.move_left(self.len - self.cursor, e);
+		}
+	}
+
+	fn backspace(&mut self, e: &mut Echo) {
+		if self.cursor == 0 {
+			return;
+		}
+		let mut i = self.cursor;
+		while i < self.len {
+			self.line[i - 1] = self.line[i];
+			i += 1;
+		}
+		self.cursor -= 1;
+		self.len -= 1;
+		if self.echo {
+			e.put(b"\x08");
+			e.put(&self.line[self.cursor..self.len]);
+			e.put(b" ");
+			self.move_left(self.len - self.cursor + 1, e);
+		}
+	}
+
+	fn delete(&mut self, e: &mut Echo) {
+		if self.cursor >= self.len {
+			return;
+		}
+		let mut i = self.cursor + 1;
+		while i < self.len {
+			self.line[i - 1] = self.line[i];
+			i += 1;
+		}
+		self.len -= 1;
+		if self.echo {
+			e.put(&self.line[self.cursor..self.len]);
+			e.put(b" ");
+			self.move_left(self.len - self.cursor + 1, e);
+		}
+	}
+
+	fn left(&mut self, e: &mut Echo) {
+		if self.cursor > 0 {
+			if self.echo {
+				e.put(b"\x08");
+			}
+			self.cursor -= 1;
+		}
+	}
+
+	fn right(&mut self, e: &mut Echo) {
+		if self.cursor < self.len {
+			if self.echo {
+				e.put(&self.line[self.cursor..self.cursor + 1]);
+			}
+			self.cursor += 1;
+		}
+	}
+
+	fn home(&mut self, e: &mut Echo) {
+		if self.echo {
+			self.move_left(self.cursor, e);
+		}
+		self.cursor = 0;
+	}
+
+	fn end(&mut self, e: &mut Echo) {
+		if self.echo {
+			e.put(&self.line[self.cursor..self.len]);
+		}
+		self.cursor = self.len;
+	}
+
+	fn move_left(&self, n: usize, e: &mut Echo) {
+		for _ in 0..n {
+			e.put(b"\x08");
+		}
+	}
+
+	// Ctrl+U: erase the whole line.
+	fn kill_line(&mut self, e: &mut Echo) {
+		self.replace_line(b"", e);
+	}
+
+	// Ctrl+W: erase the word before the cursor (trailing spaces, then the word).
+	fn kill_word(&mut self, e: &mut Echo) {
+		while self.cursor > 0 && self.line[self.cursor - 1] == b' ' {
+			self.backspace(e);
+		}
+		while self.cursor > 0 && self.line[self.cursor - 1] != b' ' {
+			self.backspace(e);
+		}
+	}
+
+	fn replace_line(&mut self, new: &[u8], e: &mut Echo) {
+		if self.echo {
+			e.put(&self.line[self.cursor..self.len]);
+			for _ in 0..self.len {
+				e.put(b"\x08 \x08");
+			}
+		}
+		let n = new.len().min(LD_LINE_MAX);
+		self.line[..n].copy_from_slice(&new[..n]);
+		self.len = n;
+		self.cursor = n;
+		if self.echo {
+			e.put(&self.line[..n]);
+		}
+	}
+
+	fn history_prev(&mut self, e: &mut Echo) {
+		if self.hist_pos == 0 {
+			return;
+		}
+		self.hist_pos -= 1;
+		let mut tmp = [0u8; LD_LINE_MAX];
+		let h = &self.history[self.hist_pos];
+		let n = h.len().min(LD_LINE_MAX);
+		tmp[..n].copy_from_slice(&h[..n]);
+		self.replace_line(&tmp[..n], e);
+	}
+
+	fn history_next(&mut self, e: &mut Echo) {
+		if self.hist_pos >= self.history.len() {
+			return;
+		}
+		self.hist_pos += 1;
+		if self.hist_pos == self.history.len() {
+			self.replace_line(b"", e);
+		} else {
+			let mut tmp = [0u8; LD_LINE_MAX];
+			let h = &self.history[self.hist_pos];
+			let n = h.len().min(LD_LINE_MAX);
+			tmp[..n].copy_from_slice(&h[..n]);
+			self.replace_line(&tmp[..n], e);
+		}
+	}
+
+	// Record the submitted line in history (skipping empty / duplicate), then reset.
+	fn commit(&mut self) {
+		let trimmed = ld_trim(&self.line[..self.len]);
+		if !trimmed.is_empty() && self.history.last().map(|h: &Vec<u8>| h.as_slice()) != Some(trimmed) {
+			if self.history.len() >= LD_HIST_MAX {
+				self.history.remove(0);
+			}
+			self.history.push(trimmed.to_vec());
+		}
+		self.len = 0;
+		self.cursor = 0;
+		self.hist_pos = self.history.len();
+		self.esc = 0;
+		self.csi_param = 0;
+	}
+}
+
+// Trim ASCII whitespace from both ends (the line discipline's history dedup).
+fn ld_trim(mut s: &[u8]) -> &[u8] {
+	while let [first, rest @ ..] = s {
+		if first.is_ascii_whitespace() {
+			s = rest;
+		} else {
+			break;
+		}
+	}
+	while let [rest @ .., last] = s {
+		if last.is_ascii_whitespace() {
+			s = rest;
+		} else {
+			break;
+		}
+	}
+	s
+}
+
+// One virtual terminal: its render state (a cell grid; None when headless), the service
+// end of the console channel its shell writes output to and reads keys from, and the
+// tty line discipline that cooks its keyboard input.
 struct Vt {
 	term: Option<Term>,
 	client: u64,
+	// Boxed: the line-discipline buffer (a 128-byte line + history) is large, and a Vt is
+	// returned by value through the deep spawn_vt call chain on a small (16 KiB) user
+	// stack; keeping it inline overflowed the stack when opening a new VT.
+	ld: Box<Ld>,
 }
 
 // The capabilities ConsoleService holds to spawn a shell for any additional VT: a
@@ -1287,7 +1626,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, pkg_handle };
-		let mut console: Console = Console { addr, fb, has_fb, input: 0, vts: alloc::vec![Vt { term, client }], fg: 0, facs, package, pkg_len };
+		let mut console: Console = Console { addr, fb, has_fb, input: 0, vts: alloc::vec![Vt { term, client, ld: Box::new(Ld::new()) }], fg: 0, facs, package, pkg_len };
 		run(&mut console);
 	}
 }
@@ -1348,10 +1687,15 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 	unsafe {
 		let fg: bool = vi == console.fg;
 		let input: u64 = console.input;
+		let mut raw_req: Option<bool> = None;
+		let mut echo_req: Option<bool> = None;
 		if let Some(t) = console.vts[vi].term.as_mut() {
 			for &b in bytes {
 				t.put_byte(b);
 			}
+			// Pick up any tty mode change the program asked for in this output.
+			raw_req = t.tty_raw_req.take();
+			echo_req = t.tty_echo_req.take();
 			let bell: bool = t.take_bell();
 			if fg {
 				t.flush();
@@ -1366,6 +1710,13 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 				}
 			}
 		}
+		// Apply the program's tty mode request to this VT's line discipline.
+		if let Some(raw) = raw_req {
+			console.vts[vi].ld.cooked = !raw;
+		}
+		if let Some(echo) = echo_req {
+			console.vts[vi].ld.echo = echo;
+		}
 		if fg {
 			print(bytes);
 		}
@@ -1373,7 +1724,9 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 }
 
 // Dispatch keystrokes: a switch chord opens or cycles VTs (intercepted, never seen by a
-// shell); any other byte is forwarded to the foreground VT's shell.
+// shell); otherwise the foreground VT's line discipline handles the byte - cooking it
+// into the line editor and delivering a whole line on Enter, or (in raw mode) passing it
+// straight through to the shell.
 unsafe fn handle_keys(console: &mut Console, keys: &[u8]) {
 	unsafe {
 		for &b in keys {
@@ -1388,8 +1741,42 @@ unsafe fn handle_keys(console: &mut Console, keys: &[u8]) {
 			} else {
 				// any other keystroke returns the foreground VT to its live screen first.
 				snap_fg_live(console);
-				send_blocking(console.vts[console.fg].client, &[b], 0);
+				feed_key(console, b);
 			}
+		}
+	}
+}
+
+// Feed one keystroke to the foreground VT. In cooked mode the line discipline edits +
+// echoes it and, on Enter, ships the whole line (plus newline) to the shell; in raw mode
+// the byte passes straight through.
+unsafe fn feed_key(console: &mut Console, b: u8) {
+	unsafe {
+		let fg: usize = console.fg;
+		let client: u64 = console.vts[fg].client;
+		let vt: &mut Vt = &mut console.vts[fg];
+		if !vt.ld.cooked {
+			send_blocking(client, &[b], 0);
+			return;
+		}
+		let submitted: bool;
+		let ser: EchoBuf;
+		{
+			let mut echo: Echo = Echo { term: vt.term.as_mut(), ser: EchoBuf::new() };
+			submitted = vt.ld.feed(b, &mut echo);
+			if let Some(t) = echo.term {
+				t.flush();
+			}
+			ser = echo.ser;
+		}
+		print(ser.as_slice());
+		if submitted {
+			let n: usize = vt.ld.len;
+			let mut out: [u8; LD_LINE_MAX + 1] = [0u8; LD_LINE_MAX + 1];
+			out[..n].copy_from_slice(&vt.ld.line[..n]);
+			out[n] = b'\n';
+			vt.ld.commit();
+			send_blocking(client, &out[..n + 1], 0);
 		}
 	}
 }
@@ -1520,6 +1907,6 @@ unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u6
 		send_blocking(vt_service, b"\n", 0);
 		let mut term: Term = Term::new(addr, fb);
 		term.clear();
-		Some(Vt { term: Some(term), client: vt_service })
+		Some(Vt { term: Some(term), client: vt_service, ld: Box::new(Ld::new()) })
 	}
 }

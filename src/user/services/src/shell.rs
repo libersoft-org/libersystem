@@ -15,17 +15,11 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{config, device, log, network, process, time, volume, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp};
+use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, config, device, log, network, process, time, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
 const SELF_CHECK_URI: &[u8] = b"vol://system/hello.txt";
-
-// maximum length of a typed command line
-const LINE_MAX: usize = 128;
-
-// how many past command lines the editor remembers for up/down recall
-const HIST_MAX: usize = 32;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -69,308 +63,28 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	exit();
 }
 
-// Run the read-eval-print loop over the console channel from ConsoleService: it
-// forwards keystrokes (which an `Editor` line-edits - a movable cursor, mid-line
-// insert/delete, command history) and renders our output (routed there via stdout).
-// Returns when the user types `exit`.
+// Run the read-eval-print loop over the console channel from ConsoleService. The
+// terminal's line discipline cooks the keyboard input - a movable cursor, mid-line
+// insert/delete, command history, the editing control keys - and hands us one finished
+// line per message; we render our output (routed there via stdout). Returns when the
+// user types `exit`.
 unsafe fn repl(console: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
-		let mut ed: Editor = Editor::new();
 		let mut jobs: Jobs = Jobs::new(console);
 		loop {
 			let n: usize = match recv_blocking(console, buf) {
 				Received::Message { len, .. } => len,
 				Received::Closed => return,
 			};
-			for i in 0..n {
-				// Feed each byte to the editor; a true return means the line was
-				// submitted (Enter), so dispatch it, record it in history, and prompt.
-				if ed.feed(buf[i]) {
-					if dispatch(&ed.line[..ed.len], storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, package, &mut jobs) {
-						return;
-					}
-					ed.commit();
-					reap_jobs(&mut jobs);
-					print(b"\x1b[1;32m> \x1b[0m");
-				}
-			}
-		}
-	}
-}
-
-// The interactive line editor: the line being typed plus a cursor, a command
-// history for up/down recall, and a small state machine that decodes the ANSI escape
-// sequences the navigation keys arrive as (ESC [ A/B/C/D for the arrows, ESC [ H / F
-// for Home / End, ESC [ 3 ~ for Delete) - the same bytes a serial terminal sends and
-// `driver.virtio-input` emits, so both consoles edit identically. Redraw uses only
-// carriage return, backspace (a non-destructive cursor-left), spaces, and reprinting,
-// which the framebuffer console already renders, so no terminal-specific output is
-// needed.
-struct Editor {
-	line: [u8; LINE_MAX],
-	len: usize,
-	cursor: usize,
-	history: Vec<Vec<u8>>,
-	// Browse position in history; equal to `history.len()` means the live (not yet
-	// recalled) line.
-	hist_pos: usize,
-	// Escape-sequence decoder state: 0 = normal, 1 = after ESC, 2 = after ESC '['.
-	esc: u8,
-	// The numeric parameter accumulated in a `ESC [ <n> ~` sequence.
-	csi_param: u8,
-}
-
-impl Editor {
-	fn new() -> Editor {
-		Editor { line: [0u8; LINE_MAX], len: 0, cursor: 0, history: Vec::new(), hist_pos: 0, esc: 0, csi_param: 0 }
-	}
-
-	// Feed one input byte. Returns true when the line is submitted (Enter): the caller
-	// reads `line[..len]`, dispatches it, then calls `commit`.
-	unsafe fn feed(&mut self, b: u8) -> bool {
-		unsafe {
-			match self.esc {
-				1 => {
-					if b == b'[' {
-						self.esc = 2;
-						self.csi_param = 0;
-					} else {
-						self.esc = 0;
-					}
-					return false;
-				}
-				2 => {
-					self.csi(b);
-					return false;
-				}
-				_ => {}
-			}
-			match b {
-				0x1b => self.esc = 1,
-				b'\n' | b'\r' => {
-					print(b"\n");
-					return true;
-				}
-				0x08 | 0x7f => self.backspace(),
-				0x20..=0x7e => self.insert(b),
-				_ => {}
-			}
-			false
-		}
-	}
-
-	// Handle the byte after `ESC [`: the final letter of an arrow / Home / End move, a
-	// digit of a `ESC [ <n> ~` parameter, or the `~` that ends one.
-	unsafe fn csi(&mut self, b: u8) {
-		unsafe {
-			match b {
-				b'A' => {
-					self.history_prev();
-					self.esc = 0;
-				}
-				b'B' => {
-					self.history_next();
-					self.esc = 0;
-				}
-				b'C' => {
-					self.right();
-					self.esc = 0;
-				}
-				b'D' => {
-					self.left();
-					self.esc = 0;
-				}
-				b'H' => {
-					self.home();
-					self.esc = 0;
-				}
-				b'F' => {
-					self.end();
-					self.esc = 0;
-				}
-				b'0'..=b'9' => self.csi_param = self.csi_param.wrapping_mul(10).wrapping_add(b - b'0'),
-				b'~' => {
-					match self.csi_param {
-						1 | 7 => self.home(),
-						4 | 8 => self.end(),
-						3 => self.delete(),
-						_ => {}
-					}
-					self.esc = 0;
-				}
-				_ => self.esc = 0,
-			}
-		}
-	}
-
-	// Insert a printable character at the cursor, shifting the tail right and redrawing
-	// it, then leaving the cursor just after the new character.
-	unsafe fn insert(&mut self, c: u8) {
-		unsafe {
-			if self.len >= LINE_MAX {
+			// The terminal delivers a whole submitted line (with a trailing newline);
+			// trim it, dispatch it, reap finished jobs, and print the next prompt.
+			let line: &[u8] = trim(&buf[..n]);
+			if dispatch(line, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, package, &mut jobs) {
 				return;
 			}
-			let mut i: usize = self.len;
-			while i > self.cursor {
-				self.line[i] = self.line[i - 1];
-				i -= 1;
-			}
-			self.line[self.cursor] = c;
-			self.len += 1;
-			print(&self.line[self.cursor..self.len]);
-			self.cursor += 1;
-			self.move_left(self.len - self.cursor);
+			reap_jobs(&mut jobs);
+			print(b"\x1b[1;32m> \x1b[0m");
 		}
-	}
-
-	// Delete the character before the cursor (Backspace), shifting the tail left.
-	unsafe fn backspace(&mut self) {
-		unsafe {
-			if self.cursor == 0 {
-				return;
-			}
-			let mut i: usize = self.cursor;
-			while i < self.len {
-				self.line[i - 1] = self.line[i];
-				i += 1;
-			}
-			self.cursor -= 1;
-			self.len -= 1;
-			print(b"\x08");
-			print(&self.line[self.cursor..self.len]);
-			print(b" ");
-			self.move_left(self.len - self.cursor + 1);
-		}
-	}
-
-	// Delete the character at the cursor (the Delete key), shifting the tail left.
-	unsafe fn delete(&mut self) {
-		unsafe {
-			if self.cursor >= self.len {
-				return;
-			}
-			let mut i: usize = self.cursor + 1;
-			while i < self.len {
-				self.line[i - 1] = self.line[i];
-				i += 1;
-			}
-			self.len -= 1;
-			print(&self.line[self.cursor..self.len]);
-			print(b" ");
-			self.move_left(self.len - self.cursor + 1);
-		}
-	}
-
-	// Move the cursor one cell left (non-destructive backspace).
-	unsafe fn left(&mut self) {
-		unsafe {
-			if self.cursor > 0 {
-				print(b"\x08");
-				self.cursor -= 1;
-			}
-		}
-	}
-
-	// Move the cursor one cell right by reprinting the character it sits on.
-	unsafe fn right(&mut self) {
-		unsafe {
-			if self.cursor < self.len {
-				print(&self.line[self.cursor..self.cursor + 1]);
-				self.cursor += 1;
-			}
-		}
-	}
-
-	// Move the cursor to the start of the line.
-	unsafe fn home(&mut self) {
-		unsafe {
-			self.move_left(self.cursor);
-			self.cursor = 0;
-		}
-	}
-
-	// Move the cursor to the end of the line.
-	unsafe fn end(&mut self) {
-		unsafe {
-			print(&self.line[self.cursor..self.len]);
-			self.cursor = self.len;
-		}
-	}
-
-	// Emit `n` backspaces to step the cursor `n` cells left.
-	unsafe fn move_left(&self, n: usize) {
-		unsafe {
-			for _ in 0..n {
-				print(b"\x08");
-			}
-		}
-	}
-
-	// Replace the whole line with `new` and redraw: walk to the end, erase the old line
-	// leftward, then echo the new one (the cursor lands at its end). Used by history.
-	unsafe fn replace_line(&mut self, new: &[u8]) {
-		unsafe {
-			print(&self.line[self.cursor..self.len]);
-			for _ in 0..self.len {
-				print(b"\x08 \x08");
-			}
-			let n: usize = new.len().min(LINE_MAX);
-			self.line[..n].copy_from_slice(&new[..n]);
-			self.len = n;
-			self.cursor = n;
-			print(&self.line[..n]);
-		}
-	}
-
-	// Recall the previous history entry (Up).
-	unsafe fn history_prev(&mut self) {
-		unsafe {
-			if self.hist_pos == 0 {
-				return;
-			}
-			self.hist_pos -= 1;
-			let mut tmp: [u8; LINE_MAX] = [0u8; LINE_MAX];
-			let h: &[u8] = &self.history[self.hist_pos];
-			let n: usize = h.len().min(LINE_MAX);
-			tmp[..n].copy_from_slice(&h[..n]);
-			self.replace_line(&tmp[..n]);
-		}
-	}
-
-	// Recall the next history entry (Down), or the empty live line past the newest.
-	unsafe fn history_next(&mut self) {
-		unsafe {
-			if self.hist_pos >= self.history.len() {
-				return;
-			}
-			self.hist_pos += 1;
-			if self.hist_pos == self.history.len() {
-				self.replace_line(b"");
-			} else {
-				let mut tmp: [u8; LINE_MAX] = [0u8; LINE_MAX];
-				let h: &[u8] = &self.history[self.hist_pos];
-				let n: usize = h.len().min(LINE_MAX);
-				tmp[..n].copy_from_slice(&h[..n]);
-				self.replace_line(&tmp[..n]);
-			}
-		}
-	}
-
-	// After a submitted line is dispatched: record it in history (skipping an empty
-	// line or an immediate duplicate), then reset for the next line.
-	fn commit(&mut self) {
-		let trimmed: &[u8] = trim(&self.line[..self.len]);
-		if !trimmed.is_empty() && self.history.last().map(|h: &Vec<u8>| h.as_slice()) != Some(trimmed) {
-			if self.history.len() >= HIST_MAX {
-				self.history.remove(0);
-			}
-			self.history.push(trimmed.to_vec());
-		}
-		self.len = 0;
-		self.cursor = 0;
-		self.hist_pos = self.history.len();
-		self.esc = 0;
-		self.csi_param = 0;
 	}
 }
 
@@ -448,7 +162,20 @@ fn job_index(jobs: &Jobs, arg: &[u8]) -> Option<usize> {
 // user can interrupt it (Ctrl+C -> SIG_INT) or suspend it (Ctrl+Z -> SIG_STOP) while
 // it runs. Returns Some(job) when it was suspended (the caller backgrounds it), or
 // None when it finished or was interrupted (its handles are closed here).
+//
+// The console's line discipline is switched to raw (ESC[?9001h) for the duration, so
+// keystrokes - including the Ctrl+C / Ctrl+Z control bytes - arrive here unedited; it
+// is restored to cooked line editing (ESC[?9001l) before returning to the prompt.
 unsafe fn run_foreground(console: u64, job: Job) -> Option<Job> {
+	unsafe {
+		print(b"\x1b[?9001h");
+		let result: Option<Job> = run_foreground_raw(console, job);
+		print(b"\x1b[?9001l");
+		result
+	}
+}
+
+unsafe fn run_foreground_raw(console: u64, job: Job) -> Option<Job> {
 	unsafe {
 		let waits: [u64; 2] = [job.done, console];
 		let mut keys: [u8; 64] = [0u8; 64];
@@ -828,11 +555,7 @@ unsafe fn send_stdout(parent: u64) {
 		let so: u64 = stdout();
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, RIGHT_SEND | RIGHT_TRANSFER);
-			if d > 0 {
-				d as u64
-			} else {
-				0
-			}
+			if d > 0 { d as u64 } else { 0 }
 		} else {
 			0
 		};
@@ -1141,11 +864,19 @@ unsafe fn set_config(cfgsvc: u64, rest: &[u8]) {
 
 // Trim leading and trailing ASCII spaces from a byte slice.
 fn trim(mut s: &[u8]) -> &[u8] {
-	while let [b' ', rest @ ..] = s {
-		s = rest;
+	while let [first, rest @ ..] = s {
+		if first.is_ascii_whitespace() {
+			s = rest;
+		} else {
+			break;
+		}
 	}
-	while let [rest @ .., b' '] = s {
-		s = rest;
+	while let [rest @ .., last] = s {
+		if last.is_ascii_whitespace() {
+			s = rest;
+		} else {
+			break;
+		}
 	}
 	s
 }
