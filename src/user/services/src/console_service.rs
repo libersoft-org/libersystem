@@ -22,8 +22,11 @@ use proto::system::network;
 extern crate alloc;
 use alloc::vec::Vec;
 
-// The 8x8 bitmap font, shared with the (now boot-log-only) kernel console.
-static FONT: &[u8; 1024] = include_bytes!("../../../kernel/font8x8.bin");
+// The 8x8 bitmap font: 256 glyphs indexed by Unicode codepoint 0x00-0xFF - the kernel
+// boot-log font (basic latin U+0000-007F) extended with the Latin-1 supplement
+// (U+00A0-00FF, U+0080-009F are the blank C1 controls), so non-ASCII Western text
+// renders. Public domain (dhepper/font8x8); the binary is built from its headers.
+static FONT: &[u8; 2048] = include_bytes!("font8x8_latin.bin");
 
 const FONT_W: usize = 8;
 const FONT_H: usize = 8;
@@ -63,6 +66,16 @@ struct Cell {
 	underline: bool,
 }
 
+// An SGR colour: the terminal default, a palette index (0-15 the ANSI base, 16-255 the
+// xterm 256-colour cube + grayscale), or a 24-bit truecolour RGB. Resolved to a packed
+// framebuffer pixel by `Term::resolve`.
+#[derive(Clone, Copy, PartialEq)]
+enum Color {
+	Default,
+	Idx(u8),
+	Rgb(u8, u8, u8),
+}
+
 // The terminal: the mapped framebuffer + geometry, the cell grid (primary +
 // alternate screen), the cursor and its saved copy, the scroll region, the current
 // SGR state, and the output escape-parser state.
@@ -92,13 +105,13 @@ struct Term {
 	cur_fg: u32,
 	cur_bg: u32,
 	cur_underline: bool,
-	fg_idx: Option<u8>,
-	bg_idx: Option<u8>,
+	fg_color: Color,
+	bg_color: Color,
 	bold: bool,
 	underline: bool,
 	reverse: bool,
-	saved_fg_idx: Option<u8>,
-	saved_bg_idx: Option<u8>,
+	saved_fg_color: Color,
+	saved_bg_color: Color,
 	saved_bold: bool,
 	saved_underline: bool,
 	saved_reverse: bool,
@@ -107,6 +120,8 @@ struct Term {
 	csi_private: u8,
 	params: [u16; 16],
 	nparams: usize,
+	utf8_acc: u32,
+	utf8_rem: u8,
 	primary: Vec<Cell>,
 	alt: Vec<Cell>,
 	alt_active: bool,
@@ -123,7 +138,7 @@ impl Term {
 	fn new(addr: u64, fb: &Framebuffer) -> Term {
 		let cols = fb.width as usize / CELL_W;
 		let rows = fb.height as usize / CELL_H;
-		let mut t = Term { addr, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), fg: 0, bg: 0, palette: [0; 16], cur_fg: 0, cur_bg: 0, cur_underline: false, fg_idx: None, bg_idx: None, bold: false, underline: false, reverse: false, saved_fg_idx: None, saved_bg_idx: None, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, primary: Vec::new(), alt: Vec::new(), alt_active: false, dirty: Vec::new(), last_caret: None, scrollback: Vec::new(), sb_cap: 0, sb_head: 0, sb_len: 0, view_offset: 0 };
+		let mut t = Term { addr, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), fg: 0, bg: 0, palette: [0; 16], cur_fg: 0, cur_bg: 0, cur_underline: false, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: Vec::new(), alt: Vec::new(), alt_active: false, dirty: Vec::new(), last_caret: None, scrollback: Vec::new(), sb_cap: 0, sb_head: 0, sb_len: 0, view_offset: 0 };
 		t.fg = t.pack(FG.0, FG.1, FG.2);
 		t.bg = t.pack(BG.0, BG.1, BG.2);
 		for (i, &(r, g, b)) in ANSI_PALETTE.iter().enumerate() {
@@ -167,7 +182,11 @@ impl Term {
 
 	// The active cell buffer: the alternate screen while it is up, else the primary.
 	fn cells(&self) -> &[Cell] {
-		if self.alt_active { &self.alt } else { &self.primary }
+		if self.alt_active {
+			&self.alt
+		} else {
+			&self.primary
+		}
 	}
 
 	// A blank cell in the current background (so erase/scroll paint the SGR bg).
@@ -440,19 +459,56 @@ impl Term {
 		}
 	}
 
-	fn put_char(&mut self, byte: u8) {
+	fn put_glyph(&mut self, glyph: u8) {
 		if self.col >= self.cols {
 			self.col = 0;
 			self.line_feed();
 		}
-		let glyph = if (0x20..0x7f).contains(&byte) { byte } else { b'?' };
 		let cell = Cell { glyph, fg: self.cur_fg, bg: self.cur_bg, underline: self.cur_underline };
 		self.set_cell(self.col, self.row, cell);
 		self.col += 1;
 	}
 
+	// Render a decoded Unicode codepoint: the font covers U+0000-U+00FF (ASCII + the
+	// Latin-1 supplement), so a codepoint in that range maps straight to its glyph; one
+	// above it falls back to '?'.
+	fn put_codepoint(&mut self, cp: u32) {
+		let glyph = if cp <= 0xff { cp as u8 } else { b'?' };
+		self.put_glyph(glyph);
+	}
+
+	// Begin a UTF-8 multi-byte sequence from its lead byte, recording how many
+	// continuation bytes follow. A stray continuation or invalid lead renders U+FFFD.
+	fn begin_utf8(&mut self, byte: u8) {
+		if byte & 0xe0 == 0xc0 {
+			self.utf8_acc = (byte & 0x1f) as u32;
+			self.utf8_rem = 1;
+		} else if byte & 0xf0 == 0xe0 {
+			self.utf8_acc = (byte & 0x0f) as u32;
+			self.utf8_rem = 2;
+		} else if byte & 0xf8 == 0xf0 {
+			self.utf8_acc = (byte & 0x07) as u32;
+			self.utf8_rem = 3;
+		} else {
+			self.put_codepoint(0xfffd);
+		}
+	}
+
 	// The output parser entry point: feed one byte from the client's output stream.
 	fn put_byte(&mut self, byte: u8) {
+		// Mid UTF-8 sequence: fold in continuation bytes until the codepoint completes.
+		if self.utf8_rem > 0 {
+			if byte & 0xc0 == 0x80 {
+				self.utf8_acc = (self.utf8_acc << 6) | (byte & 0x3f) as u32;
+				self.utf8_rem -= 1;
+				if self.utf8_rem == 0 {
+					self.put_codepoint(self.utf8_acc);
+				}
+				return;
+			}
+			// A malformed sequence: drop it and reinterpret this byte below.
+			self.utf8_rem = 0;
+		}
 		match self.esc_state {
 			1 => {
 				self.esc_intermediate(byte);
@@ -486,11 +542,9 @@ impl Term {
 				self.col = next.min(self.cols.saturating_sub(1));
 			}
 			0x07 => {} // bell (a visible/audible bell is M35h)
-			_ => {
-				if byte >= 0x20 {
-					self.put_char(byte);
-				}
-			}
+			0x20..=0x7e => self.put_codepoint(byte as u32),
+			_ if byte >= 0x80 => self.begin_utf8(byte),
+			_ => {} // other C0 control bytes: ignored
 		}
 	}
 
@@ -568,7 +622,11 @@ impl Term {
 	fn param(&self, i: usize, default: usize) -> usize {
 		if i <= self.nparams {
 			let v = self.params[i] as usize;
-			if v == 0 { default } else { v }
+			if v == 0 {
+				default
+			} else {
+				v
+			}
 		} else {
 			default
 		}
@@ -756,8 +814,8 @@ impl Term {
 	fn save_cursor(&mut self) {
 		self.saved_col = self.col;
 		self.saved_row = self.row;
-		self.saved_fg_idx = self.fg_idx;
-		self.saved_bg_idx = self.bg_idx;
+		self.saved_fg_color = self.fg_color;
+		self.saved_bg_color = self.bg_color;
 		self.saved_bold = self.bold;
 		self.saved_underline = self.underline;
 		self.saved_reverse = self.reverse;
@@ -766,8 +824,8 @@ impl Term {
 	fn restore_cursor(&mut self) {
 		self.col = self.saved_col.min(self.cols.saturating_sub(1));
 		self.row = self.saved_row.min(self.rows.saturating_sub(1));
-		self.fg_idx = self.saved_fg_idx;
-		self.bg_idx = self.saved_bg_idx;
+		self.fg_color = self.saved_fg_color;
+		self.bg_color = self.saved_bg_color;
 		self.bold = self.saved_bold;
 		self.underline = self.saved_underline;
 		self.reverse = self.saved_reverse;
@@ -821,8 +879,8 @@ impl Term {
 
 	// RIS - reset to the initial state.
 	fn reset(&mut self) {
-		self.fg_idx = None;
-		self.bg_idx = None;
+		self.fg_color = Color::Default;
+		self.bg_color = Color::Default;
 		self.bold = false;
 		self.underline = false;
 		self.reverse = false;
@@ -838,11 +896,12 @@ impl Term {
 	}
 
 	fn apply_sgr(&mut self) {
-		for i in 0..=self.nparams {
+		let mut i = 0;
+		while i <= self.nparams {
 			match self.params[i] {
 				0 => {
-					self.fg_idx = None;
-					self.bg_idx = None;
+					self.fg_color = Color::Default;
+					self.bg_color = Color::Default;
 					self.bold = false;
 					self.underline = false;
 					self.reverse = false;
@@ -854,27 +913,50 @@ impl Term {
 				24 => self.underline = false,
 				7 => self.reverse = true,
 				27 => self.reverse = false,
-				30..=37 => self.fg_idx = Some((self.params[i] - 30) as u8),
-				39 => self.fg_idx = None,
-				40..=47 => self.bg_idx = Some((self.params[i] - 40) as u8),
-				49 => self.bg_idx = None,
-				90..=97 => self.fg_idx = Some((self.params[i] - 90 + 8) as u8),
-				100..=107 => self.bg_idx = Some((self.params[i] - 100 + 8) as u8),
+				30..=37 => self.fg_color = Color::Idx((self.params[i] - 30) as u8),
+				38 => {
+					if let Some((c, adv)) = self.parse_ext_color(i) {
+						self.fg_color = c;
+						i += adv;
+					}
+				}
+				39 => self.fg_color = Color::Default,
+				40..=47 => self.bg_color = Color::Idx((self.params[i] - 40) as u8),
+				48 => {
+					if let Some((c, adv)) = self.parse_ext_color(i) {
+						self.bg_color = c;
+						i += adv;
+					}
+				}
+				49 => self.bg_color = Color::Default,
+				90..=97 => self.fg_color = Color::Idx((self.params[i] - 90 + 8) as u8),
+				100..=107 => self.bg_color = Color::Idx((self.params[i] - 100 + 8) as u8),
 				_ => {}
 			}
+			i += 1;
 		}
 		self.recompute_colors();
 	}
 
+	// Parse an extended-colour selector starting at param `i` (the 38 or 48): the
+	// `; 5 ; n` form selects 256-colour index n, the `; 2 ; r ; g ; b` form a 24-bit RGB.
+	// Returns the colour and how many extra params it consumed.
+	fn parse_ext_color(&self, i: usize) -> Option<(Color, usize)> {
+		match self.params.get(i + 1).copied() {
+			Some(5) if i + 2 <= self.nparams => Some((Color::Idx(self.params[i + 2] as u8), 2)),
+			Some(2) if i + 4 <= self.nparams => {
+				let r = self.params[i + 2] as u8;
+				let g = self.params[i + 3] as u8;
+				let b = self.params[i + 4] as u8;
+				Some((Color::Rgb(r, g, b), 4))
+			}
+			_ => None,
+		}
+	}
+
 	fn recompute_colors(&mut self) {
-		let fg = match self.fg_idx {
-			Some(i) => self.palette[if self.bold && i < 8 { (i + 8) as usize } else { i as usize }],
-			None => self.fg,
-		};
-		let bg = match self.bg_idx {
-			Some(i) => self.palette[i as usize],
-			None => self.bg,
-		};
+		let fg = self.resolve(self.fg_color, self.fg);
+		let bg = self.resolve(self.bg_color, self.bg);
 		if self.reverse {
 			self.cur_fg = bg;
 			self.cur_bg = fg;
@@ -883,6 +965,42 @@ impl Term {
 			self.cur_bg = bg;
 		}
 		self.cur_underline = self.underline;
+	}
+
+	// Resolve an SGR colour to a packed framebuffer pixel, using `default` for the
+	// terminal default colour.
+	fn resolve(&self, c: Color, default: u32) -> u32 {
+		match c {
+			Color::Default => default,
+			Color::Idx(i) => self.indexed(i),
+			Color::Rgb(r, g, b) => self.pack(r, g, b),
+		}
+	}
+
+	// The xterm 256-colour palette: 0-15 the ANSI base (bold brightens 0-7), 16-231 a
+	// 6x6x6 RGB cube, and 232-255 a 24-step grayscale ramp.
+	fn indexed(&self, i: u8) -> u32 {
+		match i {
+			0..=15 => {
+				let idx = if self.bold && i < 8 { i + 8 } else { i };
+				self.palette[idx as usize]
+			}
+			16..=231 => {
+				let n = i - 16;
+				let step = |c: u8| -> u8 {
+					if c == 0 {
+						0
+					} else {
+						55 + c * 40
+					}
+				};
+				self.pack(step(n / 36), step((n / 6) % 6), step(n % 6))
+			}
+			_ => {
+				let v = 8 + (i - 232) * 10;
+				self.pack(v, v, v)
+			}
+		}
 	}
 }
 

@@ -506,11 +506,13 @@ Result (scrollback done, Linux-faithful): each VT's `Term` keeps a fixed scrollb
 
 ## M35f - Unicode (UTF-8) + richer colour (256 / truecolour)
 
-- [ ] UTF-8 decoding on input and output, plus a Unicode-capable font (beyond the 128-glyph ASCII font), so non-ASCII text renders.
-- [ ] Wide (double-width CJK) characters and combining marks / grapheme clusters occupy the correct number of cells.
-- [ ] 256-colour and 24-bit truecolour SGR (`ESC [ 38 ; 5 ; n m` and `ESC [ 38 ; 2 ; r ; g ; b m`), extending the 16-colour palette from M35b.
-- Done when: the console renders UTF-8 text (including a wide character) with a Unicode font, and 256-colour / truecolour SGR works, tests green.
+- [x] UTF-8 decoding on output, plus a Unicode-capable font (beyond the 128-glyph ASCII font), so non-ASCII text renders. The console font is the kernel basic-latin 8x8 extended with the Latin-1 supplement (U+00A0-00FF) - the coverage of the default Linux VT console font (a Lat1 / Lat15 bitmap), so Western European text renders. (Input UTF-8 is moot until there is a non-ASCII input source: the keyboard driver is a US-ASCII layout, and entering non-ASCII needs an international layout / compose key - a later input-side milestone.)
+- [x] 256-colour and 24-bit truecolour SGR (`ESC [ 38 ; 5 ; n m` and `ESC [ 38 ; 2 ; r ; g ; b m`), extending the 16-colour palette from M35b.
+- Not doing (beyond the 8x8 bitmap VT, as on Linux): wide (double-width CJK) characters and combining marks / grapheme clusters. The bare Linux VT console (fbcon) with a bitmap font renders neither - CJK needs a Unicode-font console (fbterm / kmscon) or a GUI terminal, and combining marks are not composed in the bitmap model. With an 8x8 Latin-1 font there are no CJK / combining glyphs to place, so this is dropped unless a larger Unicode font + bigger cells ever land.
+- Done when: the console decodes UTF-8 and renders non-ASCII (Latin-1) text with a Unicode-capable font, and 256-colour / truecolour SGR works, tests green.
 - Concept: System API model (text is Unicode; colour is in-band ANSI, just deeper).
+
+Result (UTF-8 + Latin-1 + 256/truecolour done): ConsoleService's output parser gained a UTF-8 decoder (a lead byte then 1-3 continuation bytes fold into a codepoint; a malformed sequence or stray continuation renders the U+FFFD fallback). The 8x8 console font was extended from 128 to 256 glyphs - a new `font8x8_latin.bin` built from the public-domain dhepper/font8x8 basic-latin + Latin-1 supplement headers (0x80-0x9F are blank C1 slots) - so codepoints U+0000-U+00FF map straight to a glyph and anything above falls back to '?'. The kernel keeps its own 1024-byte boot-log font (unchanged). SGR colour state moved from an `Option<u8>` palette index to a `Color` enum (Default / Idx(0-255) / Rgb): `ESC[38;5;n` / `48;5;n` select the xterm 256-colour palette (16 ANSI + a 6x6x6 cube + a 24-step grayscale ramp computed in `indexed`), and `ESC[38;2;r;g;b` / `48;2;...` a 24-bit truecolour packed straight to the framebuffer pixel; the resolved colour is still stored per cell (no Cell growth). Verified live (1280x800 screenshot): a 256-colour row, a blue->red truecolour gradient, and "cafe + combining(fallback), cafe\u{301} precomposed cafe\u{e9}, sen\u{f1}or, \u{a3}100, \u{bd} \u{b1} \u{a9} \u{f7} \u{d7}" all render, and the green SGR prompt is unchanged. `just build` 0 warnings, `just test` 63 [ok], fmt clean.
 
 ## M35g - Mouse reporting, selection, and the clipboard
 
