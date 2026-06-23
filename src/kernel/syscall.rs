@@ -891,8 +891,10 @@ fn sys_wait(handle: u64, deadline: u64) -> i64 {
 
 // The most handles `wait_any` accepts at once (enough for a driver's IRQ plus a
 // service's client/listener/socket channels - NetworkService multiplexes its frame
-// channel, several clients, a listener, and a pool of sockets at once).
-const MAX_WAIT_ANY: usize = 16;
+// channel, several clients, a listener, and a pool of sockets at once; ConsoleService
+// multiplexes its keyboard, every VT's data+control channel, the gpu channel, and a
+// pool of program-hosted PTYs).
+const MAX_WAIT_ANY: usize = 20;
 
 // Block until ANY handle in the caller's array `[handles_ptr; count]` is ready,
 // returning that handle's index, or ERR_TIMED_OUT at `deadline` (absolute ticks,

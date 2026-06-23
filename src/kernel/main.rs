@@ -2387,6 +2387,71 @@ fn init_package_starts_system_manager() {
 
 #[cfg(test)]
 #[test_case]
+fn pty_hosts_a_program() {
+	use object::KernelObject;
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	// The M35i PTY abstraction: a program hosts a terminal it is not the hardware console
+	// for. ConsoleService opens a pseudo-terminal on request, spawns a slave program on it,
+	// and hands back the master channel; the host drives the slave through the line
+	// discipline over that master, exactly as the `script` tool (and a future ssh) does.
+	// Here we stand in for the host (and for VT 1's idle shell) and drive a `ptyecho` slave:
+	// a line written to the master is cooked by the line discipline, delivered to the slave,
+	// echoed back prefixed with "pty:", and forwarded out the master to us.
+	let init = init_package_bytes().expect("init package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let console_elf = package.lookup(b"console_service").expect("console_service in the init package");
+
+	// ConsoleService's bootstrap channel and the channels its __user_main expects: VT 1's
+	// data (CLIENT) + control (CONTROL), a factory per service (FSTORAGE..FNET, unused here
+	// since the ptyecho slave needs no services), then GPU (none) and PACKAGE.
+	let (boot_kernel, boot_user) = Channel::create();
+	let (vt1_console_a, _vt1_console_b) = Channel::create();
+	let (ctl_console, ctl_shell) = Channel::create();
+	let (dummy_a, _dummy_b) = Channel::create();
+
+	loader::spawn_elf_process(sched::root_domain(), console_elf, boot_user, Rights::ALL, 0).expect("spawn ConsoleService");
+
+	send_cap(&boot_kernel, b"CLIENT", vt1_console_a, Rights::ALL).expect("CLIENT bootstrap");
+	send_cap(&boot_kernel, b"CONTROL", ctl_console, Rights::ALL).expect("CONTROL bootstrap");
+	for tag in [&b"FSTORAGE"[..], &b"FLOG"[..], &b"FDEVICE"[..], &b"FPROCESS"[..], &b"FCONFIG"[..], &b"FTIME"[..], &b"FNET"[..]] {
+		send_cap(&boot_kernel, tag, dummy_a.clone(), Rights::ALL).expect("factory bootstrap");
+	}
+	boot_kernel.send(Message::new(b"GPU".to_vec(), alloc::vec::Vec::new(), 0)).expect("GPU bootstrap");
+	let pkg_obj = object::memory_object::MemoryObject::create(init.len()).expect("memory for the package");
+	copy_into_object(&pkg_obj, init);
+	let mut pkg_msg = alloc::vec::Vec::new();
+	pkg_msg.extend_from_slice(b"PACKAGE");
+	pkg_msg.extend_from_slice(&(init.len() as u64).to_le_bytes());
+	send_cap(&boot_kernel, &pkg_msg, pkg_obj, Rights::READ | Rights::MAP | Rights::TRANSFER).expect("PACKAGE bootstrap");
+
+	// stand in for the shell's PTY_OPEN request: ask the console to host a `ptyecho` slave
+	// on a new pty.
+	ctl_shell.send(Message::new(b"PTY_OPENptyecho".to_vec(), alloc::vec::Vec::new(), 0)).expect("PTY_OPEN request");
+
+	sched::run_until_idle();
+
+	// the console replies "PTY" + the master channel (the host side of the pty).
+	let reply = ctl_shell.recv().expect("a PTY reply should arrive");
+	assert_eq!(&reply.bytes[..3], b"PTY", "the console opens the pty");
+	let cap = reply.caps.first().expect("the master channel is transferred");
+	let master = cap.object().into_any_arc().downcast::<Channel>().expect("the master is a channel");
+
+	// drive the slave: a line through the master is cooked and delivered, the slave echoes
+	// it back prefixed, and the prefixed line is forwarded out the master back to us.
+	master.send(Message::new(b"hello\n".to_vec(), alloc::vec::Vec::new(), 0)).expect("write to the pty master");
+	sched::run_until_idle();
+
+	let mut captured = alloc::vec::Vec::new();
+	while let Ok(msg) = master.recv() {
+		captured.extend_from_slice(&msg.bytes);
+	}
+	assert!(captured.windows(b"pty:hello".len()).any(|w| w == b"pty:hello"), "the slave's reply is forwarded back out the master");
+}
+
+#[cfg(test)]
+#[test_case]
 fn system_manager_recovery_escalates_after_repeated_crashes() {
 	use object::KernelObject;
 	// The kernel supervises SystemManager: if it faults, the kernel starts a

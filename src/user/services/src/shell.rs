@@ -444,6 +444,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  resize <c> <r>   resize the terminal to c cols x r rows\n");
 			print(b"  echo <text>      print text\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
+			print(b"  script [<cmd>]   run a command in a fresh pty-hosted shell and record it\n");
 			print(b"  log [json]       show the system journal via LogService\n");
 			print(b"  log tail [json]  stream the journal via LogService (sub-channel)\n");
 			print(b"  dev [json]       list devices via DeviceService\n");
@@ -584,6 +585,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			}
 			return false;
 		}
+		if line == b"script" {
+			run_script(jobs, package, b"");
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"script ") {
+			run_script(jobs, package, trim(rest));
+			return false;
+		}
 		print(b"\x1b[31munknown command: ");
 		print(line);
 		print(b" (try 'help')\x1b[0m\n");
@@ -684,6 +693,30 @@ unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, package: &Package, name: 
 			}
 		};
 		exec(jobs, package, name, args, tool_netsvc, bg);
+	}
+}
+
+// Record a session: ask the console (over the tty control channel) to host a shell on a
+// fresh pseudo-terminal, then hand the master end to the `script` tool, which drives the
+// pty's shell with `cmd` and prints the captured session. This is the foreground side of
+// the PTY abstraction - a program (script) hosting a terminal it is not the hardware
+// console for (the same path a future ssh drives).
+unsafe fn run_script(jobs: &mut Jobs, package: &Package, cmd: &[u8]) {
+	unsafe {
+		// `PTY_OPEN` + the program to host (a shell); the console replies `PTY` + the master.
+		let mut req: [u8; 13] = [0u8; 13];
+		req[..8].copy_from_slice(b"PTY_OPEN");
+		req[8..13].copy_from_slice(b"shell");
+		send_blocking(jobs.control, &req[..13], 0);
+		let mut rbuf: [u8; 32] = [0u8; 32];
+		let master: u64 = match recv_blocking(jobs.control, &mut rbuf) {
+			Received::Message { len, handle } if len >= 3 && &rbuf[..3] == b"PTY" && handle != 0 => handle,
+			_ => {
+				print(b"script: the console could not open a pty\n");
+				return;
+			}
+		};
+		exec(jobs, package, b"script", cmd, master, false);
 	}
 }
 

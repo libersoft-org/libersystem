@@ -1257,6 +1257,12 @@ fn parse_osc_color(s: &[u8]) -> Option<(u8, u8, u8)> {
 // shell over its own per-VT service connections; the foreground VT owns the display.
 const NVT: usize = 4;
 
+// The number of program-hosted PTYs open at once (the `script` tool, a future `ssh`). A
+// PTY occupies three wait-set slots (its slave data + control channels and the master
+// channel), so the whole wait set - keyboard + gpu + NVT display VTs + PTY_MAX PTYs - is
+// `2 + 2*NVT + 3*PTY_MAX` = 16 <= the kernel's MAX_WAIT_ANY.
+const PTY_MAX: usize = 2;
+
 // Control-byte chords intercepted by the console (never forwarded to a shell): the
 // virtio-input driver maps Ctrl+N to 0x0e (open a new VT) and Ctrl+] to 0x1d (cycle the
 // foreground). F-keys are not mapped by the driver and Alt+key collides with escape
@@ -1633,6 +1639,14 @@ struct Vt {
 	// returned by value through the deep spawn_vt call chain on a small (16 KiB) user
 	// stack; keeping it inline overflowed the stack when opening a new VT.
 	ld: Box<Ld>,
+	// 0 for a display VT (its master is the hardware display + keyboard: it renders into
+	// `term` and the foreground one owns the screen). For a program-hosted PTY it is the
+	// console's end of the host's data channel: the line discipline cooks bytes the host
+	// writes here (the typed-keys side) and the slave program's output is forwarded back
+	// out it. A VT is thus a PTY whose master is the display; a PTY hosted by a program
+	// (a future `ssh`, the `script` tool) is the same terminal with `term` None and the
+	// master a channel instead of the framebuffer.
+	master: u64,
 }
 
 // The capabilities ConsoleService holds to spawn a shell for any additional VT: a
@@ -1667,6 +1681,13 @@ struct Console {
 	input: u64,
 	vts: Vec<Vt>,
 	fg: usize,
+	// Program-hosted PTYs: terminals whose master is another program (the `script` tool,
+	// a future `ssh`) instead of the display. Each runs a slave program (a shell) over its
+	// own console + control channels with the same line discipline / signals / winsize as a
+	// VT; the host drives it over the `master` channel. None is ever the foreground - they
+	// are not on the screen - so they are kept apart from `vts` to leave the display path
+	// (foreground, scrollback, switch, gpu-resize) untouched.
+	ptys: Vec<Vt>,
 	facs: Factories,
 	package: Package<'static>,
 	pkg_len: usize,
@@ -1791,7 +1812,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, pkg_handle };
-		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()) }], fg: 0, facs, package, pkg_len };
+		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, package, pkg_len };
 		run(&mut console);
 	}
 }
@@ -1815,26 +1836,35 @@ unsafe fn run(console: &mut Console) -> ! {
 		console.input = input;
 		let mut keys: [u8; 64] = [0u8; 64];
 		let mut out: [u8; 1024] = [0u8; 1024];
-		let mut waits: [u64; 2 + 2 * NVT] = [0u64; 2 + 2 * NVT];
+		let mut waits: [u64; 2 + 2 * NVT + 3 * PTY_MAX] = [0u64; 2 + 2 * NVT + 3 * PTY_MAX];
 		// present the initial banner (the foreground term was rendered in __user_main).
 		present(console.gpu);
 		loop {
-			// wait set: the keyboard channel (index 0), then each VT's data channel and
-			// its control channel interleaved - data at 1 + 2*i, control at 2 + 2*i - and
-			// finally, when a gpu driver is present, its display channel at 1 + 2*n (it
-			// sends RESIZE on a host-window change).
+			// wait set: the keyboard channel (index 0), then each display VT's data channel
+			// and its control channel interleaved (data at 1 + 2*i, control at 2 + 2*i),
+			// then the gpu driver's display channel (when present, it sends RESIZE on a
+			// host-window change), then each program-hosted PTY's slave-data, slave-control,
+			// and master channels interleaved (data / control / master at pty_base + 3*j).
 			waits[0] = console.input;
-			let n: usize = console.vts.len();
-			for i in 0..n {
+			let nv: usize = console.vts.len();
+			for i in 0..nv {
 				waits[1 + 2 * i] = console.vts[i].client;
 				waits[2 + 2 * i] = console.vts[i].control;
 			}
-			let gpu_idx: usize = 1 + 2 * n;
+			let gpu_idx: usize = 1 + 2 * nv;
 			let have_gpu: bool = console.gpu != 0;
 			if have_gpu {
 				waits[gpu_idx] = console.gpu;
 			}
-			let ready: i64 = wait_any(&waits[..gpu_idx + have_gpu as usize], 0);
+			let pty_base: usize = gpu_idx + have_gpu as usize;
+			let np: usize = console.ptys.len();
+			for j in 0..np {
+				waits[pty_base + 3 * j] = console.ptys[j].client;
+				waits[pty_base + 3 * j + 1] = console.ptys[j].control;
+				waits[pty_base + 3 * j + 2] = console.ptys[j].master;
+			}
+			let total: usize = pty_base + 3 * np;
+			let ready: i64 = wait_any(&waits[..total], 0);
 			if ready < 0 {
 				continue;
 			}
@@ -1847,7 +1877,7 @@ unsafe fn run(console: &mut Console) -> ! {
 			} else if have_gpu && r == gpu_idx {
 				// the gpu driver reports a host-window resize: refit every VT.
 				handle_gpu_resize(console);
-			} else {
+			} else if r < gpu_idx {
 				let vi: usize = (r - 1) / 2;
 				if (r - 1) % 2 == 0 {
 					// output bytes from VT vi's shell.
@@ -1856,8 +1886,23 @@ unsafe fn run(console: &mut Console) -> ! {
 						Received::Closed => close_vt(console, vi),
 					}
 				} else {
-					// a control message from VT vi's shell (SET_FG / CLEAR_FG).
+					// a control message from VT vi's shell (SET_FG / CLEAR_FG / winsize / PTY_OPEN).
 					handle_control(console, vi);
+				}
+			} else {
+				// a program-hosted PTY: forward the slave program's output to the host, serve
+				// its control channel, or feed the host's input through the line discipline.
+				let pj: usize = (r - pty_base) / 3;
+				match (r - pty_base) % 3 {
+					0 => match recv_blocking(console.ptys[pj].client, &mut out) {
+						Received::Message { len, .. } => pty_output(console, pj, &out[..len]),
+						Received::Closed => close_pty(console, pj),
+					},
+					1 => handle_pty_control(console, pj),
+					_ => match recv_blocking(console.ptys[pj].master, &mut out) {
+						Received::Message { len, .. } => pty_master_input(console, pj, &out[..len]),
+						Received::Closed => close_pty(console, pj),
+					},
 				}
 			}
 			// present the foreground to the display (a no-op on the boot framebuffer).
@@ -1941,26 +1986,37 @@ unsafe fn handle_keys(console: &mut Console, keys: &[u8]) {
 unsafe fn feed_key(console: &mut Console, b: u8) {
 	unsafe {
 		let fg: usize = console.fg;
-		let client: u64 = console.vts[fg].client;
-		let vt: &mut Vt = &mut console.vts[fg];
+		feed_tty(&mut console.vts[fg], b);
+	}
+}
+
+// Feed one input byte to a terminal's line discipline - shared by the foreground display
+// VT (the keyboard) and a program-hosted PTY (the host's master channel). In cooked mode
+// the discipline edits + echoes the byte and, on Enter, ships the whole line (plus a
+// newline) to the slave program; in raw mode the byte passes straight through. The echo
+// goes wherever the terminal's master is: a display VT mirrors it to the serial port (and
+// renders live into its grid), a PTY sends it back out its master channel so the host
+// (e.g. a remote terminal over ssh) sees what was typed.
+unsafe fn feed_tty(vt: &mut Vt, b: u8) {
+	unsafe {
+		let client: u64 = vt.client;
 		// A foreground job owns the tty: the signal keys become signals to it (the tty's
-		// ISIG behaviour, relocated from the shell into the line discipline). Other input
-		// is swallowed - the foreground programs do not read stdin, so type-ahead is
-		// dropped the way a Linux tty drains its queue for a non-reading program.
+		// ISIG behaviour). Other input is swallowed - foreground programs do not read stdin,
+		// so type-ahead is dropped the way a Linux tty drains its queue for a non-reader.
 		if let Some(proc) = vt.fg_proc {
 			match b {
 				0x03 => {
 					// Ctrl+C: interrupt. The job terminates, its completion channel closes,
 					// and the shell's run_foreground returns to the prompt.
 					signal(proc, SIG_INT);
-					fg_echo(vt, b"^C\n");
+					tty_echo(vt, b"^C\n");
 				}
 				0x1a => {
 					// Ctrl+Z: suspend the job and tell the shell to background it. Clear
 					// fg_proc so a second Ctrl+Z is not double-reported before CLEAR_FG.
 					signal(proc, SIG_STOP);
 					send_blocking(vt.control, b"JOB_STOPPED", 0);
-					fg_echo(vt, b"^Z\n");
+					tty_echo(vt, b"^Z\n");
 					if let Some(p) = vt.fg_proc.take() {
 						close(p);
 					}
@@ -1968,7 +2024,7 @@ unsafe fn feed_key(console: &mut Console, b: u8) {
 				0x1c => {
 					// Ctrl+\: terminate.
 					signal(proc, SIG_TERM);
-					fg_echo(vt, b"^\\\n");
+					tty_echo(vt, b"^\\\n");
 				}
 				_ => {} // swallowed: a foreground job does not read stdin here
 			}
@@ -1988,7 +2044,13 @@ unsafe fn feed_key(console: &mut Console, b: u8) {
 			}
 			ser = echo.ser;
 		}
-		print(ser.as_slice());
+		// Deliver the echoed bytes: to the serial mirror for a display VT, to the master
+		// channel for a PTY (its term, if any, was already rendered above).
+		if vt.master == 0 {
+			print(ser.as_slice());
+		} else {
+			send_blocking(vt.master, ser.as_slice(), 0);
+		}
 		if submitted {
 			if vt.ld.eof {
 				// Ctrl+D on an empty line: deliver a zero-byte read (EOF) so the shell
@@ -2007,10 +2069,11 @@ unsafe fn feed_key(console: &mut Console, b: u8) {
 	}
 }
 
-// Echo a control-key acknowledgement (e.g. "^C") on the foreground VT: render it into
-// the VT's grid and flush, then mirror it to the serial port, the way the line
-// discipline echoes an edit. Only called for the foreground VT.
-unsafe fn fg_echo(vt: &mut Vt, msg: &[u8]) {
+// Echo a control-key acknowledgement (e.g. "^C") on a terminal: render it into the VT's
+// grid and flush (a display VT), then send it on to the master - the serial port for a
+// display VT, the host's master channel for a PTY - the way the line discipline echoes an
+// edit. Only called for the foreground display VT or an active PTY.
+unsafe fn tty_echo(vt: &mut Vt, msg: &[u8]) {
 	unsafe {
 		if let Some(t) = vt.term.as_mut() {
 			for &c in msg {
@@ -2018,39 +2081,49 @@ unsafe fn fg_echo(vt: &mut Vt, msg: &[u8]) {
 			}
 			t.flush();
 		}
-		print(msg);
+		if vt.master == 0 {
+			print(msg);
+		} else {
+			send_blocking(vt.master, msg, 0);
+		}
 	}
 }
 
 // Handle a control message from VT vi's shell. SET_FG hands over the foreground job's
 // Process handle, so the tty signals it on Ctrl+C / Ctrl+Z / Ctrl+\; CLEAR_FG takes it
-// back when the job is done. The shell's end closing is driven by the data channel, so
-// here a close just tears the VT down too.
+// back when the job is done; GET / SET_WINSIZE report / change the terminal size; PTY_OPEN
+// asks the tty to host a program on a new pseudo-terminal (for the `script` tool, a future
+// ssh) and replies the master channel. The shell's end closing is driven by the data
+// channel, so here a close just tears the VT down too.
 unsafe fn handle_control(console: &mut Console, vi: usize) {
 	unsafe {
-		let mut cbuf: [u8; 32] = [0u8; 32];
+		let mut cbuf: [u8; 64] = [0u8; 64];
 		match recv_blocking(console.vts[vi].control, &mut cbuf) {
 			Received::Message { len, handle } => {
 				let msg: &[u8] = &cbuf[..len];
-				if msg.starts_with(b"SET_FG") && handle != 0 {
-					if let Some(old) = console.vts[vi].fg_proc.replace(handle) {
-						close(old);
-					}
-				} else if msg.starts_with(b"CLEAR_FG") {
-					if let Some(p) = console.vts[vi].fg_proc.take() {
-						close(p);
-					}
-				} else if msg.starts_with(b"GET_WINSIZE") {
-					// Report this VT's terminal size (rows x cols) back over the control
-					// channel - the typed winsize query (the TIOCGWINSZ route).
-					let (rows, cols) = win_dims(console, vi);
-					send_winsize(console.vts[vi].control, b"WINSIZE", rows, cols);
+				if tty_fg_winsize(&mut console.vts[vi], msg, handle) {
+					// SET_FG / CLEAR_FG / GET_WINSIZE handled identically for VTs and PTYs.
 				} else if msg.starts_with(b"SET_WINSIZE") && len >= 15 {
-					// Resize this VT's terminal to the requested cols x rows (the local
-					// stand-in for a display mode-set until virtio-gpu drives it, M44).
+					// Resize this VT's terminal to the requested cols x rows.
 					let cols = u16::from_le_bytes([msg[11], msg[12]]) as usize;
 					let rows = u16::from_le_bytes([msg[13], msg[14]]) as usize;
 					resize_vt(console, vi, cols, rows);
+				} else if msg.starts_with(b"PTY_OPEN") {
+					// `PTY_OPEN` + a program name: open a pty hosting that program and reply
+					// the master channel (the host's data side) to the shell.
+					let mut nbuf: [u8; 32] = [0u8; 32];
+					let name: &[u8] = if len > 8 { &cbuf[8..len] } else { b"shell" };
+					let nn: usize = name.len().min(nbuf.len());
+					nbuf[..nn].copy_from_slice(&name[..nn]);
+					let control: u64 = console.vts[vi].control;
+					match open_pty(console, &nbuf[..nn]) {
+						Some(master) => {
+							send_blocking(control, b"PTY", master);
+						}
+						None => {
+							send_blocking(control, b"PTY_FAIL", 0);
+						}
+					}
 				} else if handle != 0 {
 					// an unexpected transferred handle would otherwise leak.
 					close(handle);
@@ -2061,10 +2134,64 @@ unsafe fn handle_control(console: &mut Console, vi: usize) {
 	}
 }
 
-// This VT's terminal size as (rows, cols), or (0, 0) when headless.
-fn win_dims(console: &Console, vi: usize) -> (u16, u16) {
-	match console.vts[vi].term.as_ref() {
+// Handle a control message from a program-hosted PTY's slave program (its shell): the
+// same SET_FG / CLEAR_FG / GET_WINSIZE / SET_WINSIZE link as a VT (so signals and winsize
+// work over a pty exactly as over the display), but a PTY has no display to repaint and a
+// close tears the pty down rather than the session.
+unsafe fn handle_pty_control(console: &mut Console, pj: usize) {
+	unsafe {
+		let mut cbuf: [u8; 64] = [0u8; 64];
+		match recv_blocking(console.ptys[pj].control, &mut cbuf) {
+			Received::Message { len, handle } => {
+				let msg: &[u8] = &cbuf[..len];
+				if tty_fg_winsize(&mut console.ptys[pj], msg, handle) {
+					// handled
+				} else if msg.starts_with(b"SET_WINSIZE") && len >= 15 {
+					tty_resize_pty(&mut console.ptys[pj]);
+				} else if handle != 0 {
+					close(handle);
+				}
+			}
+			Received::Closed => close_pty(console, pj),
+		}
+	}
+}
+
+// SET_FG / CLEAR_FG / GET_WINSIZE: the control messages handled identically for a display
+// VT and a program PTY (they touch only the terminal's own foreground job and size).
+// Returns true if `msg` was one of them; false otherwise, so the caller handles the rest
+// (SET_WINSIZE, which repaints differently between a VT and a PTY, plus a VT's PTY_OPEN).
+unsafe fn tty_fg_winsize(vt: &mut Vt, msg: &[u8], handle: u64) -> bool {
+	unsafe {
+		if msg.starts_with(b"SET_FG") && handle != 0 {
+			if let Some(old) = vt.fg_proc.replace(handle) {
+				close(old);
+			}
+		} else if msg.starts_with(b"CLEAR_FG") {
+			if let Some(p) = vt.fg_proc.take() {
+				close(p);
+			}
+		} else if msg.starts_with(b"GET_WINSIZE") {
+			let (rows, cols) = tty_dims(vt);
+			send_winsize(vt.control, b"WINSIZE", rows, cols);
+		} else {
+			return false;
+		}
+		true
+	}
+}
+
+// A fixed default size for a program-hosted PTY (the host owns a pty's size; the slave only
+// reads it, and resizing a pty from the host is a later ssh refinement).
+const PTY_COLS: u16 = 80;
+const PTY_ROWS: u16 = 24;
+
+// A terminal's size as (rows, cols): a display VT's from its cell grid, a headless display
+// VT 0 x 0, a program PTY the fixed PTY default.
+fn tty_dims(vt: &Vt) -> (u16, u16) {
+	match vt.term.as_ref() {
 		Some(t) => (t.rows as u16, t.cols as u16),
+		None if vt.master != 0 => (PTY_ROWS, PTY_COLS),
 		None => (0, 0),
 	}
 }
@@ -2093,8 +2220,52 @@ unsafe fn resize_vt(console: &mut Console, vi: usize, cols: usize, rows: usize) 
 				t.flush();
 			}
 		}
-		let (rows, cols) = win_dims(console, vi);
+		let (rows, cols) = tty_dims(&console.vts[vi]);
 		send_winsize(console.vts[vi].control, b"RESIZE", rows, cols);
+	}
+}
+
+// Acknowledge a slave program's SET_WINSIZE on a program-hosted PTY: a pty has no display
+// to mode-set and its size is host-owned (fixed), so just reply RESIZE with the current
+// size so the slave can re-query and redraw.
+unsafe fn tty_resize_pty(vt: &mut Vt) {
+	unsafe {
+		let (rows, cols) = tty_dims(vt);
+		send_winsize(vt.control, b"RESIZE", rows, cols);
+	}
+}
+
+// Forward a PTY slave program's output bytes straight out to the host over the master
+// channel. A pty has no framebuffer; the host (the `script` tool, a future ssh) renders or
+// relays the bytes itself.
+unsafe fn pty_output(console: &mut Console, pj: usize, bytes: &[u8]) {
+	unsafe {
+		send_blocking(console.ptys[pj].master, bytes, 0);
+	}
+}
+
+// Feed bytes the host wrote on a PTY's master channel through that PTY's line discipline
+// (the typed-keys side): cooked editing + echo back out the master, delivering whole lines
+// to the slave program - exactly as the keyboard drives a display VT.
+unsafe fn pty_master_input(console: &mut Console, pj: usize, bytes: &[u8]) {
+	unsafe {
+		for &b in bytes {
+			feed_tty(&mut console.ptys[pj], b);
+		}
+	}
+}
+
+// A program-hosted PTY ended: its slave program exited (its console channel closed) or the
+// host dropped the master. Close all its channels and remove it from the pool.
+unsafe fn close_pty(console: &mut Console, pj: usize) {
+	unsafe {
+		close(console.ptys[pj].client);
+		close(console.ptys[pj].control);
+		close(console.ptys[pj].master);
+		if let Some(p) = console.ptys[pj].fg_proc.take() {
+			close(p);
+		}
+		console.ptys.remove(pj);
 	}
 }
 
@@ -2214,33 +2385,57 @@ fn repaint(console: &mut Console) {
 	}
 }
 
-// Spawn one VT's shell: mint a fresh per-VT client from each service factory, create the
-// VT's console channel, spawn the shell ELF from the package, and hand it the full
-// capability set in the order it expects (STORAGE, LOG, DEVICE, PROCESS, CONFIG, NET,
-// TIME, CONSOLE, CONTROL, then PACKAGE). Wait for the shell's "online" report (it
-// self-checks storage over its own connection), then nudge it to print its first prompt.
-// Returns the VT (its cleared grid + the service end of its console channel) or None on
-// any failure.
-unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u64, fb: &Framebuffer, cur_w: u32, cur_h: u32) -> Option<Vt> {
+// Spawn a fully-capable shell over the given console + control channels (the shell's
+// ends): mint a fresh per-session client from each service factory, spawn the shell ELF,
+// hand it the full capability set in the order it expects (STORAGE, LOG, DEVICE, PROCESS,
+// CONFIG, NET, TIME, CONSOLE, CONTROL, then PACKAGE), wait for its "online" report (it
+// self-checks storage over its own connection), then release its bootstrap + Process
+// handle. The terminal's liveness is tracked solely by its console channel closing on
+// exit; holding the Process handle would pin the shell's handle table (and that channel)
+// alive, so the terminal could never be reaped when the shell logs out or exits. Shared by
+// spawn_vt (a display VT) and open_pty (a program-hosted PTY).
+unsafe fn spawn_shell(facs: &Factories, package: &Package, pkg_len: usize, shell_console: u64, shell_control: u64) -> bool {
 	unsafe {
-		let shell_elf: &[u8] = package.lookup(b"shell")?;
-		let storage: u64 = service_connect(facs.storage)?;
-		let log: u64 = service_connect(facs.log)?;
-		let device: u64 = service_connect(facs.device)?;
-		let process: u64 = service_connect(facs.process)?;
-		let config: u64 = service_connect(facs.config)?;
-		let time: u64 = service_connect(facs.time)?;
+		let shell_elf: &[u8] = match package.lookup(b"shell") {
+			Some(e) => e,
+			None => return false,
+		};
+		let storage: u64 = match service_connect(facs.storage) {
+			Some(h) => h,
+			None => return false,
+		};
+		let log: u64 = match service_connect(facs.log) {
+			Some(h) => h,
+			None => return false,
+		};
+		let device: u64 = match service_connect(facs.device) {
+			Some(h) => h,
+			None => return false,
+		};
+		let process: u64 = match service_connect(facs.process) {
+			Some(h) => h,
+			None => return false,
+		};
+		let config: u64 = match service_connect(facs.config) {
+			Some(h) => h,
+			None => return false,
+		};
+		let time: u64 = match service_connect(facs.time) {
+			Some(h) => h,
+			None => return false,
+		};
 		let mut net = network::Client::new(ChannelTransport { chan: facs.net });
 		let net_client: u64 = match net.open() {
 			Some(Ok(h)) => h,
-			_ => return None,
+			_ => return false,
 		};
-		let (vt_service, vt_client): (u64, u64) = channel()?;
-		let (control_console, control_shell): (u64, u64) = channel()?;
-		let (boot_parent, boot_child): (u64, u64) = channel()?;
+		let (boot_parent, boot_child): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
 		let shell_proc: i64 = spawn(shell_elf, boot_child);
 		if shell_proc < 0 {
-			return None;
+			return false;
 		}
 		send_blocking(boot_parent, b"STORAGE", storage);
 		send_blocking(boot_parent, b"LOG", log);
@@ -2249,11 +2444,13 @@ unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u6
 		send_blocking(boot_parent, b"CONFIG", config);
 		send_blocking(boot_parent, b"NET", net_client);
 		send_blocking(boot_parent, b"TIME", time);
-		send_blocking(boot_parent, b"CONSOLE", vt_client);
-		send_blocking(boot_parent, b"CONTROL", control_shell);
+		send_blocking(boot_parent, b"CONSOLE", shell_console);
+		send_blocking(boot_parent, b"CONTROL", shell_control);
 		let pkg_dup: i64 = duplicate(facs.pkg_handle, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
 		if pkg_dup < 0 {
-			return None;
+			close(boot_parent);
+			close(shell_proc as u64);
+			return false;
 		}
 		let mut pbuf: [u8; 16] = [0u8; 16];
 		pbuf[..7].copy_from_slice(b"PACKAGE");
@@ -2264,20 +2461,93 @@ unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u6
 		if let Received::Closed = recv_blocking(boot_parent, &mut rbuf) {
 			close(boot_parent);
 			close(shell_proc as u64);
-			return None;
+			return false;
 		}
 		close(boot_parent);
-		// Release our handle to the shell's process. The VT's liveness is tracked solely by
-		// its console channel closing on exit; holding a Process handle would pin the shell
-		// alive (its handle table, and so that channel, never dropping), so the VT could
-		// never be reaped when the shell logs out (Ctrl+D) or exits.
 		close(shell_proc as u64);
+		true
+	}
+}
+
+// Open one VT's shell: create the VT's console + control channels, spawn a fully-capable
+// shell over them, nudge it to print its first prompt, and return the VT (its cleared grid
+// + the service ends of those channels). None on any failure.
+unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u64, fb: &Framebuffer, cur_w: u32, cur_h: u32) -> Option<Vt> {
+	unsafe {
+		let (vt_service, vt_client): (u64, u64) = channel()?;
+		let (control_console, control_shell): (u64, u64) = channel()?;
+		if !spawn_shell(facs, package, pkg_len, vt_client, control_shell) {
+			close(vt_service);
+			close(vt_client);
+			close(control_console);
+			close(control_shell);
+			return None;
+		}
 		// nudge the new shell to print its first prompt: an empty line dispatches to a
 		// silent reprompt, the same first prompt VT 1 shows at boot.
 		send_blocking(vt_service, b"\n", 0);
 		let mut term: Term = Term::new(addr, fb);
 		term.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 		term.clear();
-		Some(Vt { term: Some(term), client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new()) })
+		Some(Vt { term: Some(term), client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new()), master: 0 })
+	}
+}
+
+// Open a program-hosted PTY: a terminal whose master is another program (the `script`
+// tool, a future ssh) instead of the hardware display. Spawn the named slave program over
+// a fresh console + control channel pair - a shell gets the full capability set, any other
+// program just its console + control - and return the master channel end the host drives it
+// on. None on failure or at the PTY cap.
+unsafe fn open_pty(console: &mut Console, name: &[u8]) -> Option<u64> {
+	unsafe {
+		if console.ptys.len() >= PTY_MAX {
+			return None;
+		}
+		let (slave_service, slave_client): (u64, u64) = channel()?;
+		let (control_console, control_slave): (u64, u64) = channel()?;
+		let (master_console, master_host): (u64, u64) = channel()?;
+		let is_shell: bool = name == b"shell";
+		let ok: bool = if is_shell { spawn_shell(&console.facs, &console.package, console.pkg_len, slave_client, control_slave) } else { spawn_pty_program(&console.package, name, slave_client, control_slave) };
+		if !ok {
+			close(slave_service);
+			close(slave_client);
+			close(control_console);
+			close(control_slave);
+			close(master_console);
+			close(master_host);
+			return None;
+		}
+		// nudge a hosted shell to print its first prompt (an empty line reprompts silently).
+		if is_shell {
+			send_blocking(slave_service, b"\n", 0);
+		}
+		console.ptys.push(Vt { term: None, client: slave_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new()), master: master_console });
+		Some(master_host)
+	}
+}
+
+// Spawn a minimal (non-shell) program as a PTY slave: it gets only its console + control
+// channels (no service factories, no online handshake), the bootstrap a bare terminal
+// client needs. Used to host a simple program on a pty (the pty loopback test slave); a
+// shell uses spawn_shell.
+unsafe fn spawn_pty_program(package: &Package, name: &[u8], program_console: u64, program_control: u64) -> bool {
+	unsafe {
+		let elf: &[u8] = match package.lookup(name) {
+			Some(e) => e,
+			None => return false,
+		};
+		let (boot_parent, boot_child): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		let proc: i64 = spawn(elf, boot_child);
+		if proc < 0 {
+			return false;
+		}
+		send_blocking(boot_parent, b"CONSOLE", program_console);
+		send_blocking(boot_parent, b"CONTROL", program_control);
+		close(boot_parent);
+		close(proc as u64);
+		true
 	}
 }
