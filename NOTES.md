@@ -1,3 +1,4 @@
+- Is copilot compacting conversations?
 - Remove the mess from the console after bootup
 - Remove NOT "committed (user runs ./commit.sh)" from TODO.md
 - Virtio drivers - MSI-X only? Remove the old IRQ?

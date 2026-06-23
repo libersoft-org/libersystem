@@ -87,11 +87,14 @@ pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
 // dword-aligned config-space offset (from VirtioDevice::msix_cap).
 pub fn msix_enable(bus: u8, dev: u8, func: u8, cap: u16) {
 	const MEMORY_SPACE: u16 = 1 << 1;
+	const BUS_MASTER: u16 = 1 << 2;
 	const MSIX_ENABLE: u16 = 1 << 15;
 	const FUNCTION_MASK: u16 = 1 << 14;
-	// Ensure the device decodes memory space (so the MSI-X table BAR is reachable).
+	// Ensure the device decodes memory space (so the MSI-X table BAR is reachable) and
+	// is a bus master (MSI-X delivery is a DMA memory write to the LAPIC region, which
+	// a device can only perform with bus mastering enabled).
 	let command = config_read32(bus, dev, func, 0x04) as u16;
-	config_write32(bus, dev, func, 0x04, (command | MEMORY_SPACE) as u32);
+	config_write32(bus, dev, func, 0x04, (command | MEMORY_SPACE | BUS_MASTER) as u32);
 	// Message Control is the upper 16 bits of the dword at `cap` (cap_id/next are the
 	// low 16): enable MSI-X, clear the function mask.
 	let dword = config_read32(bus, dev, func, cap);
