@@ -91,6 +91,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut net_client: u64 = 0;
 	let mut time_client: u64 = 0;
 	let mut console_client: u64 = 0;
+	let mut console_control: u64 = 0;
 	let mut log_client: u64 = 0;
 	let mut device_client: u64 = 0;
 	let mut process_client: u64 = 0;
@@ -100,7 +101,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
-				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut time_client, &mut console_client, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut channels[i], &mut buf) };
+				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut channels[i], &mut buf) };
 				progress = true;
 			}
 			i += 1;
@@ -184,7 +185,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, time_client: &mut u64, console_client: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -194,7 +195,8 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 			Some(pair) => pair,
 			None => return State::Failed,
 		};
-		if spawn(elf, service_side) < 0 {
+		let proc: i64 = spawn(elf, service_side);
+		if proc < 0 {
 			return State::Failed;
 		}
 		if name == b"log_service" && !bootstrap_serve(manager_side, log_client) {
@@ -221,10 +223,10 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"time_service" && !bootstrap_time_service(manager_side, *net_client, time_client) {
 			return State::Failed;
 		}
-		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, console_client, pkg_handle, pkg_len, buf) {
+		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, console_client, console_control, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
-		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *console_client, pkg_handle, pkg_len, buf) {
+		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *console_client, *console_control, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -240,6 +242,14 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 				*control = manager_side;
 				// Record the lifecycle event in the journal (LogService is up by now).
 				emit_event(*log_client, name, b"online");
+				// The shell is reaped by its console channel closing when it logs out
+				// (Ctrl+D) or exits; release our Process handle to it so a clean exit
+				// drops its handle table - and thus that channel. A leaked handle would
+				// pin the shell alive forever, so the console could never reap the VT.
+				// (Every other service is meant to stand for the life of the system.)
+				if name == b"shell" {
+					close(proc as u64);
+				}
 				// DeviceManager sends a follow-up "NET" message carrying the net driver's
 				// frame channel; keep it to bootstrap NetworkService against the driver.
 				if name == b"device_manager" {
@@ -291,7 +301,7 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 // client are transferred (the shell becomes their sole owner); the LogService
 // client is *duplicated* and the copy transferred, since the supervisor keeps
 // emitting on the original.
-unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, console_client: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, console_client: u64, console_control: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"STORAGE", storage_client) {
 			return false;
@@ -319,6 +329,12 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 			return false;
 		}
 		if !send_blocking(manager_side, b"CONSOLE", console_client) {
+			return false;
+		}
+		// VT 1's control channel to ConsoleService (the shell end; the console holds the
+		// other end). Carries SET_FG / CLEAR_FG out and JOB_STOPPED back for job-control
+		// signals, sent right after CONSOLE to match the shell's receive order.
+		if !send_blocking(manager_side, b"CONTROL", console_control) {
 			return false;
 		}
 		// The shell spawns foreground programs (echo, later the net tools) from the
@@ -436,7 +452,7 @@ unsafe fn bootstrap_time_service(manager_side: u64, net_client: u64, time_client
 // so minting from them never crosses the supervisor's lifecycle traffic. ConsoleService
 // maps the framebuffer itself (the kernel console then stops drawing) and attaches to
 // the kernel console input for keys.
-unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, console_client: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, console_client: &mut u64, console_control: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		let (service_end, client_end): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -446,6 +462,17 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 			return false;
 		}
 		*console_client = client_end;
+		// VT 1's control channel: the console end goes to ConsoleService now (right after
+		// CLIENT, the order its __user_main expects), the shell end is kept for the shell's
+		// own bootstrap (it starts later in the boot order).
+		let (control_console, control_shell): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"CONTROL", control_console) {
+			return false;
+		}
+		*console_control = control_shell;
 		// A factory connection per serve_multi service, minted with `service_connect`.
 		if !send_factory(manager_side, b"FSTORAGE", storage_client) {
 			return false;

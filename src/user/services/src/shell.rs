@@ -41,6 +41,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// output and forwards the input, so the shell talks to the console, not the kernel.
 	let console: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONSOLE") }.unwrap_or_else(|| exit());
 	set_stdout(console);
+	// The per-VT control channel to ConsoleService: the shell announces its foreground
+	// job on it (SET_FG / CLEAR_FG) so the tty signals it on Ctrl+C / Ctrl+Z / Ctrl+\,
+	// and learns of a Ctrl+Z suspend (JOB_STOPPED) so it can background the job.
+	let control: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONTROL") }.unwrap_or_else(|| exit());
 	// The init package lets the shell spawn foreground programs (echo, later the net
 	// tools); the archive is mapped 'static and parsed once.
 	let (_pkg_handle, archive): (u64, &'static [u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| exit());
@@ -58,7 +62,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 4. become the interactive console and run the read-eval-print loop.
 	unsafe {
-		repl(console, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, &package, &mut buf);
+		repl(console, control, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, &package, &mut buf);
 	}
 	exit();
 }
@@ -67,15 +71,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // terminal's line discipline cooks the keyboard input - a movable cursor, mid-line
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
-// user types `exit`.
-unsafe fn repl(console: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package, buf: &mut [u8]) {
+// user types `exit` or sends EOF (Ctrl+D on an empty line).
+unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
-		let mut jobs: Jobs = Jobs::new(console);
+		let mut jobs: Jobs = Jobs::new(control);
 		loop {
 			let n: usize = match recv_blocking(console, buf) {
 				Received::Message { len, .. } => len,
 				Received::Closed => return,
 			};
+			// A zero-byte read is the tty's EOF (Ctrl+D on an empty line): log out.
+			if n == 0 {
+				print(b"\n");
+				return;
+			}
 			// The terminal delivers a whole submitted line (with a trailing newline);
 			// trim it, dispatch it, reap finished jobs, and print the next prompt.
 			let line: &[u8] = trim(&buf[..n]);
@@ -100,17 +109,18 @@ struct Job {
 	stopped: bool,
 }
 
-// The shell's job-control state: the console channel (watched for Ctrl+C / Ctrl+Z
-// while a foreground job runs), the tracked jobs, and the next id to assign.
+// The shell's job-control state: the per-VT control channel to ConsoleService (the tty
+// signals the foreground job over it and reports a Ctrl+Z suspend back), the tracked
+// jobs, and the next id to assign.
 struct Jobs {
-	console: u64,
+	control: u64,
 	list: Vec<Job>,
 	next_id: usize,
 }
 
 impl Jobs {
-	fn new(console: u64) -> Jobs {
-		Jobs { console, list: Vec::new(), next_id: 1 }
+	fn new(control: u64) -> Jobs {
+		Jobs { control, list: Vec::new(), next_id: 1 }
 	}
 }
 
@@ -158,61 +168,67 @@ fn job_index(jobs: &Jobs, arg: &[u8]) -> Option<usize> {
 	jobs.list.iter().position(|j: &Job| j.id == id)
 }
 
-// Run a foreground job: wait on BOTH its completion channel and the console, so the
-// user can interrupt it (Ctrl+C -> SIG_INT) or suspend it (Ctrl+Z -> SIG_STOP) while
-// it runs. Returns Some(job) when it was suspended (the caller backgrounds it), or
-// None when it finished or was interrupted (its handles are closed here).
-//
-// The console's line discipline is switched to raw (ESC[?9001h) for the duration, so
-// keystrokes - including the Ctrl+C / Ctrl+Z control bytes - arrive here unedited; it
-// is restored to cooked line editing (ESC[?9001l) before returning to the prompt.
-unsafe fn run_foreground(console: u64, job: Job) -> Option<Job> {
+// Run a foreground job: hand the tty this job (SET_FG, with a MANAGE+TRANSFER dup of its
+// Process handle) so the user can interrupt it (Ctrl+C -> SIG_INT), suspend it
+// (Ctrl+Z -> SIG_STOP) or quit it (Ctrl+\ -> SIG_TERM) from the keyboard, then wait on
+// BOTH its completion channel and the control channel. ConsoleService's line discipline
+// interprets the signal keys itself (the tty's ISIG behaviour, relocated there) and, on
+// a suspend, sends JOB_STOPPED back here. Returns Some(job) when it was suspended (the
+// caller backgrounds it), or None when it finished or was interrupted (its handles are
+// closed here). CLEAR_FG releases the tty's hold on the job before returning to the
+// prompt.
+unsafe fn run_foreground(control: u64, job: Job) -> Option<Job> {
 	unsafe {
-		print(b"\x1b[?9001h");
-		let result: Option<Job> = run_foreground_raw(console, job);
-		print(b"\x1b[?9001l");
-		result
-	}
-}
-
-unsafe fn run_foreground_raw(console: u64, job: Job) -> Option<Job> {
-	unsafe {
-		let waits: [u64; 2] = [job.done, console];
-		let mut keys: [u8; 64] = [0u8; 64];
+		// Discard any stale JOB_STOPPED a previous job's Ctrl+Z left queued, so the wait
+		// below cannot mistake it for this job being suspended.
+		drain_control(control);
+		// Hand the tty a MANAGE+TRANSFER dup of the job (the spawn handle carries ALL
+		// rights), so it can signal it; the shell keeps its own handle for fg / bg.
+		let dup: i64 = duplicate(job.proc, RIGHT_MANAGE | RIGHT_TRANSFER);
+		if dup >= 0 {
+			send_blocking(control, b"SET_FG", dup as u64);
+		}
+		let waits: [u64; 2] = [job.done, control];
+		let mut cbuf: [u8; 32] = [0u8; 32];
 		loop {
 			let ready: i64 = wait_any(&waits, 0);
 			if ready == 0 {
 				// The job's channel is ready: it sent its completion message or its end
-				// closed on exit. Either way the job is done.
+				// closed (a signal terminated it). Either way the job is done; release the
+				// tty and reap it.
+				send_blocking(control, b"CLEAR_FG", 0);
 				close(job.done);
 				close(job.proc);
 				return None;
 			}
-			match recv_blocking(console, &mut keys) {
-				Received::Message { len, .. } => {
-					for i in 0..len {
-						match keys[i] {
-							0x03 => {
-								// Ctrl+C: interrupt. The job terminates; its channel then
-								// closes and the next wait_any catches it.
-								signal(job.proc, SIG_INT);
-								print(b"^C\n");
-							}
-							0x1a => {
-								// Ctrl+Z: suspend the job and hand it back to be backgrounded.
-								signal(job.proc, SIG_STOP);
-								print(b"^Z\n");
-								let mut stopped = job;
-								stopped.stopped = true;
-								return Some(stopped);
-							}
-							_ => {} // a foreground job does not read stdin here; ignore
-						}
-					}
+			match recv_blocking(control, &mut cbuf) {
+				Received::Message { len, .. } if cbuf[..len].starts_with(b"JOB_STOPPED") => {
+					// The tty suspended the job (Ctrl+Z): release the tty and hand the job
+					// back to be tracked as a stopped background job.
+					send_blocking(control, b"CLEAR_FG", 0);
+					let mut stopped = job;
+					stopped.stopped = true;
+					return Some(stopped);
 				}
-				Received::Closed => return None,
+				Received::Closed => {
+					// The console is gone; treat the job as finished.
+					close(job.done);
+					close(job.proc);
+					return None;
+				}
+				_ => {} // an unknown control message; keep waiting
 			}
 		}
+	}
+}
+
+// Discard any messages queued on the control channel without blocking - used to clear a
+// stale JOB_STOPPED (a Ctrl+Z that raced a job's exit) before arming a new foreground
+// job.
+unsafe fn drain_control(control: u64) {
+	unsafe {
+		let mut cbuf: [u8; 32] = [0u8; 32];
+		while let Polled::Message { .. } = try_recv(control, &mut cbuf) {}
 	}
 }
 
@@ -281,7 +297,7 @@ unsafe fn fg_job(jobs: &mut Jobs, arg: &[u8]) {
 		}
 		print(&job.name);
 		print(b"\n");
-		if let Some(suspended) = run_foreground(jobs.console, job) {
+		if let Some(suspended) = run_foreground(jobs.control, job) {
 			jobs.list.push(suspended);
 		}
 	}
@@ -375,6 +391,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  fg [id]          resume a job in the foreground\n");
 			print(b"  bg [id]          resume a stopped job in the background\n");
 			print(b"  Ctrl+C / Ctrl+Z  interrupt / suspend the foreground job\n");
+			print(b"  Ctrl+\\           terminate the foreground job\n");
+			print(b"  Ctrl+D           end input (log out) at an empty prompt\n");
 			print(b"  exit             stop the shell and halt\n");
 			return false;
 		}
@@ -539,7 +557,7 @@ unsafe fn exec(jobs: &mut Jobs, package: &Package, name: &[u8], args: &[u8], cap
 			print(name);
 			print(b" &\n");
 			jobs.list.push(job);
-		} else if let Some(suspended) = run_foreground(jobs.console, job) {
+		} else if let Some(suspended) = run_foreground(jobs.control, job) {
 			// Suspended by Ctrl+Z: keep it as a stopped background job.
 			jobs.list.push(suspended);
 		}

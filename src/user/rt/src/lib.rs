@@ -606,6 +606,12 @@ pub unsafe fn spawn(elf: &[u8], bootstrap: u64) -> i64 {
 		if sys_is_err(started) {
 			return started as i64;
 		}
+		// The caller drives the child through its Process handle; the thread handle is
+		// not returned, so close it here rather than leaking it. A leaked thread handle
+		// would hold the child's thread (and thus its Process and handle table) alive
+		// even after the child exited cleanly, so a peer watching the child's channels
+		// would never observe them close. The scheduler already holds the started thread.
+		close(thread);
 		process as i64
 	}
 }

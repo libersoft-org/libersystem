@@ -1280,15 +1280,18 @@ struct Ld {
 	cooked: bool,
 	// whether keystrokes are echoed (ESC[?9002h/l).
 	echo: bool,
+	// set when Ctrl+D ends input on an empty line: feed_key delivers a zero-byte read
+	// (EOF) to the program instead of a line.
+	eof: bool,
 }
 
 impl Ld {
 	fn new() -> Ld {
-		Ld { line: [0u8; LD_LINE_MAX], len: 0, cursor: 0, history: Vec::new(), hist_pos: 0, esc: 0, csi_param: 0, cooked: true, echo: true }
+		Ld { line: [0u8; LD_LINE_MAX], len: 0, cursor: 0, history: Vec::new(), hist_pos: 0, esc: 0, csi_param: 0, cooked: true, echo: true, eof: false }
 	}
 
-	// Feed one cooked-mode keystroke. Returns true when the line was submitted (Enter or
-	// the Ctrl+C cancel), with the line in `self.line[..self.len]`.
+	// Feed one cooked-mode keystroke. Returns true when the line was submitted (Enter, the
+	// Ctrl+C cancel, or Ctrl+D); on a Ctrl+D EOF `self.eof` is set and the line is empty.
 	fn feed(&mut self, b: u8, e: &mut Echo) -> bool {
 		match self.esc {
 			1 => {
@@ -1314,6 +1317,16 @@ impl Ld {
 			0x05 => self.end(e),       // Ctrl+E
 			0x15 => self.kill_line(e), // Ctrl+U
 			0x17 => self.kill_word(e), // Ctrl+W
+			0x04 => {
+				// Ctrl+D: EOF on an empty line (feed_key delivers a zero-byte read so the
+				// shell logs out), otherwise submit the buffered line like Enter.
+				if self.len == 0 {
+					self.eof = true;
+				} else if self.echo {
+					e.put(b"\n");
+				}
+				return true;
+			}
 			0x03 => {
 				// Ctrl+C at the prompt: cancel the line and reprompt (deliver an empty
 				// line). A foreground job is interrupted in raw mode, not here.
@@ -1521,6 +1534,7 @@ impl Ld {
 		self.hist_pos = self.history.len();
 		self.esc = 0;
 		self.csi_param = 0;
+		self.eof = false;
 	}
 }
 
@@ -1549,6 +1563,14 @@ fn ld_trim(mut s: &[u8]) -> &[u8] {
 struct Vt {
 	term: Option<Term>,
 	client: u64,
+	// The per-VT control channel to this VT's shell: the shell sends SET_FG (with the
+	// foreground job's Process handle) / CLEAR_FG so the tty knows who owns it, and the
+	// console sends JOB_STOPPED back when the user suspends the job with Ctrl+Z.
+	control: u64,
+	// The foreground job's Process handle while one runs (set by SET_FG, cleared by
+	// CLEAR_FG / Ctrl+Z). When Some, the line discipline turns the signal keys into
+	// signals to this process instead of editing the line.
+	fg_proc: Option<u64>,
 	// Boxed: the line-discipline buffer (a 128-byte line + history) is large, and a Vt is
 	// returned by value through the deep spawn_vt call chain on a small (16 KiB) user
 	// stack; keeping it inline overflowed the stack when opening a new VT.
@@ -1592,6 +1614,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    the other end), then a factory connection per multi-client service and a
 		//    read-only view of the init package: the capabilities to spawn additional VTs.
 		let client: u64 = recv_tagged(bootstrap, &mut buf, b"CLIENT").unwrap_or_else(|| exit());
+		// VT 1's control channel (ServiceManager brokered it: the shell holds the other end).
+		let control: u64 = recv_tagged(bootstrap, &mut buf, b"CONTROL").unwrap_or_else(|| exit());
 		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"FSTORAGE").unwrap_or_else(|| exit());
 		let log: u64 = recv_tagged(bootstrap, &mut buf, b"FLOG").unwrap_or_else(|| exit());
 		let device: u64 = recv_tagged(bootstrap, &mut buf, b"FDEVICE").unwrap_or_else(|| exit());
@@ -1626,7 +1650,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, pkg_handle };
-		let mut console: Console = Console { addr, fb, has_fb, input: 0, vts: alloc::vec![Vt { term, client, ld: Box::new(Ld::new()) }], fg: 0, facs, package, pkg_len };
+		let mut console: Console = Console { addr, fb, has_fb, input: 0, vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()) }], fg: 0, facs, package, pkg_len };
 		run(&mut console);
 	}
 }
@@ -1650,15 +1674,17 @@ unsafe fn run(console: &mut Console) -> ! {
 		console.input = input;
 		let mut keys: [u8; 64] = [0u8; 64];
 		let mut out: [u8; 1024] = [0u8; 1024];
-		let mut waits: [u64; 1 + NVT] = [0u64; 1 + NVT];
+		let mut waits: [u64; 1 + 2 * NVT] = [0u64; 1 + 2 * NVT];
 		loop {
-			// wait set: the keyboard channel (index 0) then each VT's console channel.
+			// wait set: the keyboard channel (index 0), then each VT's data channel and
+			// its control channel interleaved - data at 1 + 2*i, control at 2 + 2*i.
 			waits[0] = console.input;
 			let n: usize = console.vts.len();
 			for i in 0..n {
-				waits[1 + i] = console.vts[i].client;
+				waits[1 + 2 * i] = console.vts[i].client;
+				waits[2 + 2 * i] = console.vts[i].control;
 			}
-			let ready: i64 = wait_any(&waits[..1 + n], 0);
+			let ready: i64 = wait_any(&waits[..1 + 2 * n], 0);
 			if ready < 0 {
 				continue;
 			}
@@ -1669,11 +1695,16 @@ unsafe fn run(console: &mut Console) -> ! {
 					handle_keys(console, &keys[..len]);
 				}
 			} else {
-				// output bytes from VT (r - 1)'s shell.
-				let vi: usize = r - 1;
-				match recv_blocking(console.vts[vi].client, &mut out) {
-					Received::Message { len, .. } => render_output(console, vi, &out[..len]),
-					Received::Closed => close_vt(console, vi),
+				let vi: usize = (r - 1) / 2;
+				if (r - 1) % 2 == 0 {
+					// output bytes from VT vi's shell.
+					match recv_blocking(console.vts[vi].client, &mut out) {
+						Received::Message { len, .. } => render_output(console, vi, &out[..len]),
+						Received::Closed => close_vt(console, vi),
+					}
+				} else {
+					// a control message from VT vi's shell (SET_FG / CLEAR_FG).
+					handle_control(console, vi);
 				}
 			}
 		}
@@ -1755,6 +1786,37 @@ unsafe fn feed_key(console: &mut Console, b: u8) {
 		let fg: usize = console.fg;
 		let client: u64 = console.vts[fg].client;
 		let vt: &mut Vt = &mut console.vts[fg];
+		// A foreground job owns the tty: the signal keys become signals to it (the tty's
+		// ISIG behaviour, relocated from the shell into the line discipline). Other input
+		// is swallowed - the foreground programs do not read stdin, so type-ahead is
+		// dropped the way a Linux tty drains its queue for a non-reading program.
+		if let Some(proc) = vt.fg_proc {
+			match b {
+				0x03 => {
+					// Ctrl+C: interrupt. The job terminates, its completion channel closes,
+					// and the shell's run_foreground returns to the prompt.
+					signal(proc, SIG_INT);
+					fg_echo(vt, b"^C\n");
+				}
+				0x1a => {
+					// Ctrl+Z: suspend the job and tell the shell to background it. Clear
+					// fg_proc so a second Ctrl+Z is not double-reported before CLEAR_FG.
+					signal(proc, SIG_STOP);
+					send_blocking(vt.control, b"JOB_STOPPED", 0);
+					fg_echo(vt, b"^Z\n");
+					if let Some(p) = vt.fg_proc.take() {
+						close(p);
+					}
+				}
+				0x1c => {
+					// Ctrl+\: terminate.
+					signal(proc, SIG_TERM);
+					fg_echo(vt, b"^\\\n");
+				}
+				_ => {} // swallowed: a foreground job does not read stdin here
+			}
+			return;
+		}
 		if !vt.ld.cooked {
 			send_blocking(client, &[b], 0);
 			return;
@@ -1771,12 +1833,62 @@ unsafe fn feed_key(console: &mut Console, b: u8) {
 		}
 		print(ser.as_slice());
 		if submitted {
-			let n: usize = vt.ld.len;
-			let mut out: [u8; LD_LINE_MAX + 1] = [0u8; LD_LINE_MAX + 1];
-			out[..n].copy_from_slice(&vt.ld.line[..n]);
-			out[n] = b'\n';
-			vt.ld.commit();
-			send_blocking(client, &out[..n + 1], 0);
+			if vt.ld.eof {
+				// Ctrl+D on an empty line: deliver a zero-byte read (EOF) so the shell
+				// logs out, the way a tty signals end-of-input.
+				vt.ld.commit();
+				send_blocking(client, &[], 0);
+			} else {
+				let n: usize = vt.ld.len;
+				let mut out: [u8; LD_LINE_MAX + 1] = [0u8; LD_LINE_MAX + 1];
+				out[..n].copy_from_slice(&vt.ld.line[..n]);
+				out[n] = b'\n';
+				vt.ld.commit();
+				send_blocking(client, &out[..n + 1], 0);
+			}
+		}
+	}
+}
+
+// Echo a control-key acknowledgement (e.g. "^C") on the foreground VT: render it into
+// the VT's grid and flush, then mirror it to the serial port, the way the line
+// discipline echoes an edit. Only called for the foreground VT.
+unsafe fn fg_echo(vt: &mut Vt, msg: &[u8]) {
+	unsafe {
+		if let Some(t) = vt.term.as_mut() {
+			for &c in msg {
+				t.put_byte(c);
+			}
+			t.flush();
+		}
+		print(msg);
+	}
+}
+
+// Handle a control message from VT vi's shell. SET_FG hands over the foreground job's
+// Process handle, so the tty signals it on Ctrl+C / Ctrl+Z / Ctrl+\; CLEAR_FG takes it
+// back when the job is done. The shell's end closing is driven by the data channel, so
+// here a close just tears the VT down too.
+unsafe fn handle_control(console: &mut Console, vi: usize) {
+	unsafe {
+		let mut cbuf: [u8; 32] = [0u8; 32];
+		match recv_blocking(console.vts[vi].control, &mut cbuf) {
+			Received::Message { len, handle } => {
+				let msg: &[u8] = &cbuf[..len];
+				if msg.starts_with(b"SET_FG") && handle != 0 {
+					if let Some(old) = console.vts[vi].fg_proc.replace(handle) {
+						close(old);
+					}
+				} else if msg.starts_with(b"CLEAR_FG") {
+					if let Some(p) = console.vts[vi].fg_proc.take() {
+						close(p);
+					}
+				} else if handle != 0 {
+					// an unexpected transferred handle would otherwise leak.
+					close(handle);
+				}
+			}
+			Received::Closed => close_vt(console, vi),
 		}
 	}
 }
@@ -1827,14 +1939,23 @@ fn snap_fg_live(console: &mut Console) {
 	}
 }
 
-// A VT's shell exited (its console channel closed): drop the VT and its connection. If it
-// was the last VT, the session is over and ConsoleService exits with it.
+// A VT's shell exited (its console channel closed): drop the VT and its connection. A
+// secondary VT is removed and the foreground moves to a neighbour. The primary VT is the
+// session leader (it owns the system's core service connections, brokered to it at boot),
+// so its shell exiting ends the session: ConsoleService exits with it, detaching from the
+// kernel console and bringing the machine down - the `exit`/Ctrl+D-to-halt the boot banner
+// promises. (A clean exit only reaches here now that the shell's Process handle is no
+// longer pinned by the supervisor; otherwise its console channel never closed.)
 unsafe fn close_vt(console: &mut Console, vi: usize) {
 	unsafe {
 		if console.vts.len() <= 1 {
 			exit();
 		}
 		close(console.vts[vi].client);
+		close(console.vts[vi].control);
+		if let Some(p) = console.vts[vi].fg_proc.take() {
+			close(p);
+		}
 		console.vts.remove(vi);
 		if console.fg >= console.vts.len() {
 			console.fg = console.vts.len() - 1;
@@ -1857,9 +1978,10 @@ fn repaint(console: &mut Console) {
 // Spawn one VT's shell: mint a fresh per-VT client from each service factory, create the
 // VT's console channel, spawn the shell ELF from the package, and hand it the full
 // capability set in the order it expects (STORAGE, LOG, DEVICE, PROCESS, CONFIG, NET,
-// TIME, CONSOLE, then PACKAGE). Wait for the shell's "online" report (it self-checks
-// storage over its own connection), then nudge it to print its first prompt. Returns the
-// VT (its cleared grid + the service end of its console channel) or None on any failure.
+// TIME, CONSOLE, CONTROL, then PACKAGE). Wait for the shell's "online" report (it
+// self-checks storage over its own connection), then nudge it to print its first prompt.
+// Returns the VT (its cleared grid + the service end of its console channel) or None on
+// any failure.
 unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u64, fb: &Framebuffer) -> Option<Vt> {
 	unsafe {
 		let shell_elf: &[u8] = package.lookup(b"shell")?;
@@ -1875,8 +1997,10 @@ unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u6
 			_ => return None,
 		};
 		let (vt_service, vt_client): (u64, u64) = channel()?;
+		let (control_console, control_shell): (u64, u64) = channel()?;
 		let (boot_parent, boot_child): (u64, u64) = channel()?;
-		if spawn(shell_elf, boot_child) < 0 {
+		let shell_proc: i64 = spawn(shell_elf, boot_child);
+		if shell_proc < 0 {
 			return None;
 		}
 		send_blocking(boot_parent, b"STORAGE", storage);
@@ -1887,6 +2011,7 @@ unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u6
 		send_blocking(boot_parent, b"NET", net_client);
 		send_blocking(boot_parent, b"TIME", time);
 		send_blocking(boot_parent, b"CONSOLE", vt_client);
+		send_blocking(boot_parent, b"CONTROL", control_shell);
 		let pkg_dup: i64 = duplicate(facs.pkg_handle, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
 		if pkg_dup < 0 {
 			return None;
@@ -1899,14 +2024,20 @@ unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u6
 		let mut rbuf: [u8; 32] = [0u8; 32];
 		if let Received::Closed = recv_blocking(boot_parent, &mut rbuf) {
 			close(boot_parent);
+			close(shell_proc as u64);
 			return None;
 		}
 		close(boot_parent);
+		// Release our handle to the shell's process. The VT's liveness is tracked solely by
+		// its console channel closing on exit; holding a Process handle would pin the shell
+		// alive (its handle table, and so that channel, never dropping), so the VT could
+		// never be reaped when the shell logs out (Ctrl+D) or exits.
+		close(shell_proc as u64);
 		// nudge the new shell to print its first prompt: an empty line dispatches to a
 		// silent reprompt, the same first prompt VT 1 shows at boot.
 		send_blocking(vt_service, b"\n", 0);
 		let mut term: Term = Term::new(addr, fb);
 		term.clear();
-		Some(Vt { term: Some(term), client: vt_service, ld: Box::new(Ld::new()) })
+		Some(Vt { term: Some(term), client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new()) })
 	}
 }
