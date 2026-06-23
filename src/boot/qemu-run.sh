@@ -122,6 +122,19 @@ QEMU_ARGS+=(-device virtio-keyboard-pci,disable-legacy=on)
 # framebuffer and the deterministic 4-device set is unchanged).
 QEMU_ARGS+=(-vga none -device virtio-vga)
 
+# virtio-sound (M45): interactive runs only. A virtio-sound device the userspace
+# driver.virtio-snd drives for PCM playback (the shell `beep` command, via
+# AudioService). Its host audio backend is the SPICE server when a SPICE display is
+# requested (so a connected SPICE client hears it), else a null sink (the guest still
+# plays, nothing is emitted). Left out of the test path to keep that device set
+# deterministic (the test boot exercises only blk/net/console).
+if [[ "$want_spice" == "1" ]]; then
+	QEMU_ARGS+=(-audiodev spice,id=snd0)
+else
+	QEMU_ARGS+=(-audiodev none,id=snd0)
+fi
+QEMU_ARGS+=(-device virtio-sound-pci,audiodev=snd0)
+
 # Expose a control monitor on a unix socket (alongside the stdio monitor) so
 # boot/screenshot.sh can attach to this running instance and snap the live
 # framebuffer at any time. Only for interactive runs (not the test path above).

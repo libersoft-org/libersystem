@@ -19,10 +19,12 @@ const CFG_DEVICE_FEATURE_SELECT: u64 = 0x00;
 const CFG_DEVICE_FEATURE: u64 = 0x04;
 const CFG_DRIVER_FEATURE_SELECT: u64 = 0x08;
 const CFG_DRIVER_FEATURE: u64 = 0x0c;
+const CFG_CONFIG_MSIX_VECTOR: u64 = 0x10;
 const CFG_NUM_QUEUES: u64 = 0x12;
 const CFG_DEVICE_STATUS: u64 = 0x14;
 const CFG_QUEUE_SELECT: u64 = 0x16;
 const CFG_QUEUE_SIZE: u64 = 0x18;
+const CFG_QUEUE_MSIX_VECTOR: u64 = 0x1a;
 const CFG_QUEUE_ENABLE: u64 = 0x1c;
 const CFG_QUEUE_NOTIFY_OFF: u64 = 0x1e;
 const CFG_QUEUE_DESC: u64 = 0x20;
@@ -54,6 +56,10 @@ const DESC_WRITE: u16 = 2; // the device writes this buffer (it is device-writab
 // interrupts, so their PCI INTx line - which may be shared with another device -
 // never asserts); an interrupt-driven driver clears it on its event queue.
 const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
+
+// The MSI-X vector fields' reset value: no vector mapped (the device raises legacy
+// INTx instead). A driver that has not opted into MSI-X leaves this in place.
+const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
 
 unsafe fn r8(addr: u64) -> u8 {
 	unsafe { (addr as *const u8).read_volatile() }
@@ -99,6 +105,10 @@ pub struct Virtio {
 	// The ISR-status register: reading it returns the pending-interrupt reason and
 	// deasserts the device's (level-triggered INTx) line.
 	isr: u64,
+	// The MSI-X table-entry index this device's interrupts route to (NO_VECTOR until a
+	// driver opts into MSI-X with set_msix_vector). setup_queue programs each queue's
+	// MSI-X vector field from this.
+	msix_vector: u16,
 }
 
 // One set-up split virtqueue: its rings (in a DMA page) and the address/value used
@@ -207,11 +217,23 @@ pub unsafe fn negotiate(mmio_base: u64, info: &DeviceInfo) -> Option<Virtio> {
 			w8(common + CFG_DEVICE_STATUS, STATUS_FAILED);
 			return None;
 		}
-		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, isr: mmio_base + info.isr_offset as u64 })
+		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, isr: mmio_base + info.isr_offset as u64, msix_vector: VIRTIO_MSI_NO_VECTOR })
 	}
 }
 
 impl Virtio {
+	// Route this device's config-change and queue interrupts to MSI-X table entry
+	// `vector` (the index the kernel programmed via device_msix_acquire). Must be called
+	// after the kernel has enabled MSI-X on the device and before setup_queue, so each
+	// queue is told to use this vector. INTx / polling drivers never call this and keep
+	// the reset NO_VECTOR.
+	pub unsafe fn set_msix_vector(&mut self, vector: u16) {
+		unsafe {
+			self.msix_vector = vector;
+			w16(self.common + CFG_CONFIG_MSIX_VECTOR, vector);
+		}
+	}
+
 	// Select queue `index`, allocate its split-virtqueue rings in a DMA page, program
 	// the ring physical addresses, and enable the queue. One DMA page holds all three
 	// rings (contiguous, as the rings require).
@@ -224,6 +246,9 @@ impl Virtio {
 			}
 			let size: u16 = if max_size < QUEUE_SIZE { max_size } else { QUEUE_SIZE };
 			w16(self.common + CFG_QUEUE_SIZE, size);
+			// Route this queue's interrupts to the device's MSI-X vector (NO_VECTOR for INTx /
+			// polling drivers, which is also the reset value, so this is a no-op for them).
+			w16(self.common + CFG_QUEUE_MSIX_VECTOR, self.msix_vector);
 
 			let (handle, virt, phys): (u64, u64, u64) = match dma_buffer(4096) {
 				Some(t) => t,
@@ -330,6 +355,46 @@ impl Queue {
 			}
 			// Each used-ring element is { id u32, len u32 }; return the used length.
 			Some(r32(used + 4 + (old_used % self.size) as u64 * 8 + 4))
+		}
+	}
+
+	// Post a descriptor chain to this queue and notify the device, then return without
+	// waiting - the interrupt-driven counterpart to `submit`. The caller blocks on its
+	// device's MSI-X interrupt (the queue must have had `enable_interrupts` called) and
+	// reaps the completion with `take_used`. One request in flight (descriptors 0..n
+	// reused each call, head index 0). Returns false if the chain is empty or longer
+	// than the queue.
+	pub unsafe fn submit_async(&self, bufs: &[(u64, u32, bool)]) -> bool {
+		unsafe {
+			let n = bufs.len();
+			if n == 0 || n > self.size as usize {
+				return false;
+			}
+			for (i, &(phys, len, device_writes)) in bufs.iter().enumerate() {
+				let d = self.virt + i as u64 * 16;
+				w64(d, phys);
+				w32(d + 8, len);
+				let mut flags: u16 = 0;
+				if device_writes {
+					flags |= DESC_WRITE;
+				}
+				if i + 1 < n {
+					flags |= DESC_NEXT;
+				}
+				w16(d + 12, flags);
+				w16(d + 14, (i + 1) as u16);
+			}
+			// Publish the head descriptor (index 0) in the available ring, ordered before
+			// the index bump so the device never sees a half-written entry.
+			let avail = self.virt + self.avail_off;
+			let old_avail = r16(avail + 2);
+			w16(avail + 4 + (old_avail % self.size) as u64 * 2, 0);
+			fence(Ordering::SeqCst);
+			w16(avail + 2, old_avail.wrapping_add(1));
+			fence(Ordering::SeqCst);
+			// Notify the device that this queue has work (the value is the queue index).
+			w16(self.notify_addr, self.index);
+			true
 		}
 	}
 }

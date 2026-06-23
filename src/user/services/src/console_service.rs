@@ -1661,6 +1661,7 @@ struct Factories {
 	config: u64,
 	net: u64,
 	time: u64,
+	audio: u64,
 	pkg_handle: u64,
 }
 
@@ -1780,6 +1781,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let process: u64 = recv_tagged(bootstrap, &mut buf, b"FPROCESS").unwrap_or_else(|| exit());
 		let config: u64 = recv_tagged(bootstrap, &mut buf, b"FCONFIG").unwrap_or_else(|| exit());
 		let time: u64 = recv_tagged(bootstrap, &mut buf, b"FTIME").unwrap_or_else(|| exit());
+		let audio: u64 = recv_tagged(bootstrap, &mut buf, b"FAUDIO").unwrap_or_else(|| exit());
 		let net: u64 = recv_tagged(bootstrap, &mut buf, b"FNET").unwrap_or_else(|| exit());
 		// The gpu driver's display channel (0 = no virtio-gpu device; a 0 handle is valid
 		// here, unlike the tagged factories above, so we do not use recv_tagged).
@@ -1811,7 +1813,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(bootstrap, b"ConsoleService: online", 0);
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
-		let facs: Factories = Factories { storage, log, device, process, config, net, time, pkg_handle };
+		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, pkg_handle };
 		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, package, pkg_len };
 		run(&mut console);
 	}
@@ -2388,7 +2390,7 @@ fn repaint(console: &mut Console) {
 // Spawn a fully-capable shell over the given console + control channels (the shell's
 // ends): mint a fresh per-session client from each service factory, spawn the shell ELF,
 // hand it the full capability set in the order it expects (STORAGE, LOG, DEVICE, PROCESS,
-// CONFIG, NET, TIME, CONSOLE, CONTROL, then PACKAGE), wait for its "online" report (it
+// CONFIG, NET, TIME, AUDIO, CONSOLE, CONTROL, then PACKAGE), wait for its "online" report (it
 // self-checks storage over its own connection), then release its bootstrap + Process
 // handle. The terminal's liveness is tracked solely by its console channel closing on
 // exit; holding the Process handle would pin the shell's handle table (and that channel)
@@ -2424,6 +2426,10 @@ unsafe fn spawn_shell(facs: &Factories, package: &Package, pkg_len: usize, shell
 			Some(h) => h,
 			None => return false,
 		};
+		let audio: u64 = match service_connect(facs.audio) {
+			Some(h) => h,
+			None => return false,
+		};
 		let mut net = network::Client::new(ChannelTransport { chan: facs.net });
 		let net_client: u64 = match net.open() {
 			Some(Ok(h)) => h,
@@ -2444,6 +2450,7 @@ unsafe fn spawn_shell(facs: &Factories, package: &Package, pkg_len: usize, shell
 		send_blocking(boot_parent, b"CONFIG", config);
 		send_blocking(boot_parent, b"NET", net_client);
 		send_blocking(boot_parent, b"TIME", time);
+		send_blocking(boot_parent, b"AUDIO", audio);
 		send_blocking(boot_parent, b"CONSOLE", shell_console);
 		send_blocking(boot_parent, b"CONTROL", shell_control);
 		let pkg_dup: i64 = duplicate(facs.pkg_handle, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);

@@ -277,3 +277,13 @@ record timestamp {
 interface time {
 	@op(1) now: func() -> result<timestamp, error>;
 }
+
+// AudioService: headless PCM playback over the virtio-sound device. `beep` plays a
+// tone of the given frequency (Hz) and duration (milliseconds) - the device is
+// reached as a capability (the channel this interface is served on), never as
+// ambient device access. The PCM is fixed-format (48 kHz, 2 channels, signed 16-bit)
+// and synthesized by the service; arbitrary-PCM playback over a `buffer` is a later
+// refinement.
+interface audio {
+	@op(1) beep: func(freq: u16, millis: u32) -> result<unit, error>;
+}

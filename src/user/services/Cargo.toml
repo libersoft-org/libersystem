@@ -45,6 +45,10 @@ name = "time_service"
 path = "src/time_service.rs"
 
 [[bin]]
+name = "audio_service"
+path = "src/audio_service.rs"
+
+[[bin]]
 name = "wasi_host"
 path = "src/wasi_host.rs"
 

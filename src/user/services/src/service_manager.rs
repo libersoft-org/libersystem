@@ -33,7 +33,7 @@ struct Service {
 
 // The number of managed services. (A fixed size keeps the state array on the
 // stack, which a no_std program with no heap needs.)
-const N: usize = 10;
+const N: usize = 11;
 
 // The core service manifest. The array order is deliberately NOT the start order:
 // DeviceManager, StorageService, and the shell are listed before LogService, but
@@ -41,7 +41,7 @@ const N: usize = 10;
 // start LogService first. This proves the ordering is driven by declared
 // dependencies, not by manifest position. The shell is the last component up: it
 // depends on StorageService, which it talks to over IPC.
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service"] }];
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -90,6 +90,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut net_frames: u64 = 0;
 	let mut net_client: u64 = 0;
 	let mut gpu_client: u64 = 0;
+	let mut snd_client: u64 = 0;
+	let mut audio_client: u64 = 0;
 	let mut time_client: u64 = 0;
 	let mut console_client: u64 = 0;
 	let mut console_control: u64 = 0;
@@ -102,7 +104,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
-				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut channels[i], &mut buf) };
+				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut channels[i], &mut buf) };
 				progress = true;
 			}
 			i += 1;
@@ -186,7 +188,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -224,10 +226,13 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"time_service" && !bootstrap_time_service(manager_side, *net_client, time_client) {
 			return State::Failed;
 		}
-		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, console_client, console_control, pkg_handle, pkg_len, buf) {
+		if name == b"audio_service" && !bootstrap_audio_service(manager_side, *snd_client, audio_client) {
 			return State::Failed;
 		}
-		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *console_client, *console_control, pkg_handle, pkg_len, buf) {
+		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, console_client, console_control, pkg_handle, pkg_len, buf) {
+			return State::Failed;
+		}
+		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *console_client, *console_control, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -253,14 +258,19 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 				}
 				// DeviceManager sends a follow-up "NET" message carrying the net driver's
 				// frame channel, then a "GPU" message carrying the gpu driver's display
-				// channel; keep them to bootstrap NetworkService and ConsoleService against
-				// the drivers (each handle is 0 when that device is absent, e.g. under test).
+				// channel, then a "SND" message carrying the snd driver's control channel;
+				// keep them to bootstrap NetworkService, ConsoleService, and AudioService
+				// against the drivers (each handle is 0 when that device is absent, e.g. under
+				// test).
 				if name == b"device_manager" {
 					if let Received::Message { handle: net, .. } = recv_blocking(manager_side, buf) {
 						*net_frames = net;
 					}
 					if let Received::Message { handle: gpu, .. } = recv_blocking(manager_side, buf) {
 						*gpu_client = gpu;
+					}
+					if let Received::Message { handle: snd, .. } = recv_blocking(manager_side, buf) {
+						*snd_client = snd;
 					}
 				}
 				State::Running
@@ -307,7 +317,7 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 // client are transferred (the shell becomes their sole owner); the LogService
 // client is *duplicated* and the copy transferred, since the supervisor keeps
 // emitting on the original.
-unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, console_client: u64, console_control: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, console_client: u64, console_control: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"STORAGE", storage_client) {
 			return false;
@@ -332,6 +342,9 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 			return false;
 		}
 		if !send_blocking(manager_side, b"TIME", time_client) {
+			return false;
+		}
+		if !send_blocking(manager_side, b"AUDIO", audio_client) {
 			return false;
 		}
 		if !send_blocking(manager_side, b"CONSOLE", console_client) {
@@ -447,6 +460,22 @@ unsafe fn bootstrap_time_service(manager_side: u64, net_client: u64, time_client
 	}
 }
 
+// Hand AudioService the virtio-snd driver's control channel ("SND" - a 0 handle when
+// no sound device is present, routed up from the snd driver via DeviceManager) and the
+// channel its clients reach it on ("SERVE"). The service-channel client end is kept in
+// `*audio_client` and later handed to the shell (and to ConsoleService as a factory)
+// for the `beep` command. (AudioService depends on device_manager, so `snd_client` is
+// already set by the time this runs; it is 0 when there is no sound device, and
+// AudioService then answers `beep` with a not-found error.)
+unsafe fn bootstrap_audio_service(manager_side: u64, snd_client: u64, audio_client: &mut u64) -> bool {
+	unsafe {
+		if !send_blocking(manager_side, b"SND", snd_client) {
+			return false;
+		}
+		bootstrap_serve(manager_side, audio_client)
+	}
+}
+
 // Hand ConsoleService the client end of a fresh console channel over "CLIENT" (VT 1's
 // terminal: the shell writes its output to it and reads its keystrokes from it), then
 // a *factory* connection to every multi-client service plus a read-only view of the
@@ -458,7 +487,7 @@ unsafe fn bootstrap_time_service(manager_side: u64, net_client: u64, time_client
 // so minting from them never crosses the supervisor's lifecycle traffic. ConsoleService
 // maps the framebuffer itself (the kernel console then stops drawing) and attaches to
 // the kernel console input for keys.
-unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, gpu_client: u64, time_client: u64, console_client: &mut u64, console_control: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, gpu_client: u64, time_client: u64, audio_client: u64, console_client: &mut u64, console_control: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		let (service_end, client_end): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -496,6 +525,9 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 			return false;
 		}
 		if !send_factory(manager_side, b"FTIME", time_client) {
+			return false;
+		}
+		if !send_factory(manager_side, b"FAUDIO", audio_client) {
 			return false;
 		}
 		// NetworkService is multi-client through its own typed `open`, not serve_multi.

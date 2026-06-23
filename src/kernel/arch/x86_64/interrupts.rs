@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::sync::{Arc, Weak};
 
@@ -27,6 +27,11 @@ pub const IRQ_COUNT: usize = 16;
 pub const TIMER_VECTOR: u8 = IRQ_BASE; // IRQ 0
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 
+// MSI-X vector window: per-device edge-triggered vectors delivered straight to a
+// LAPIC, with no INTx sharing. Sits just above the legacy INTx window (32..48).
+pub const MSI_BASE: u8 = IRQ_BASE + IRQ_COUNT as u8; // 48
+pub const MSI_COUNT: usize = 16;
+
 pub type HandlerFn = fn(u8);
 
 static HANDLERS: [AtomicUsize; IRQ_COUNT] = [const { AtomicUsize::new(0) }; IRQ_COUNT];
@@ -41,6 +46,27 @@ static BOUND: [SpinLock<Option<Weak<Interrupt>>>; IRQ_COUNT] = [const { SpinLock
 // device cannot re-storm) and on release (a gone driver's device falls silent).
 const NO_GSI: u32 = u32::MAX;
 static ROUTED_GSI: [AtomicU32; IRQ_COUNT] = [const { AtomicU32::new(NO_GSI) }; IRQ_COUNT];
+
+// MSI-X driver bindings (the MSI sibling of BOUND): the Interrupt to wake when each
+// MSI vector fires, held weakly so a gone driver clears its own binding.
+static MSI_BOUND: [SpinLock<Option<Weak<Interrupt>>>; MSI_COUNT] = [const { SpinLock::new(None) }; MSI_COUNT];
+
+// Reservation flag per MSI slot, set when acquire_msi hands the vector out and
+// cleared on unbind so the slot can be re-used - mirroring ROUTED_GSI's reservation
+// role for the INTx path.
+static MSI_USED: [AtomicBool; MSI_COUNT] = [const { AtomicBool::new(false) }; MSI_COUNT];
+
+// Kernel virtual base for mapping device MSI-X tables (uncacheable), clear of the
+// LAPIC (0xffff_f100) / IOAPIC (0xffff_f200) MMIO windows. One page per MSI slot; the
+// page-table chain is materialised at init (kernel PML4 active, before any process
+// address space exists) so runtime per-device mappings under it propagate to every
+// address space's shared kernel half.
+const MSIX_VIRT_BASE: u64 = 0xffff_f300_0000_0000;
+
+// Whether `vector` is a kernel MSI-X vector.
+fn is_msi(vector: u8) -> bool {
+	vector >= MSI_BASE && (vector as usize) < MSI_BASE as usize + MSI_COUNT
+}
 
 // Whether `vector` is a device-IRQ vector a driver may bind. The timer vector
 // (IRQ_BASE) is the kernel's own and is never handed out.
@@ -63,6 +89,14 @@ pub fn bind(vector: u8, intr: &Arc<Interrupt>) -> bool {
 
 // Remove any binding for `vector` (called from an Interrupt's Drop).
 pub fn unbind(vector: u8) {
+	if is_msi(vector) {
+		// MSI is edge-triggered and unshared: just drop the binding and free the slot
+		// (there is no source to mask). A gone driver's device simply stops being drained.
+		let index = (vector - MSI_BASE) as usize;
+		*MSI_BOUND[index].lock() = None;
+		MSI_USED[index].store(false, Ordering::Release);
+		return;
+	}
 	let index = vector.wrapping_sub(IRQ_BASE) as usize;
 	if index < IRQ_COUNT {
 		*BOUND[index].lock() = None;
@@ -94,6 +128,53 @@ pub fn acquire(gsi: u32, dest: u8) -> Option<u8> {
 	None
 }
 
+// Allocate a free MSI vector and program a device's MSI-X table entry 0 so the device
+// delivers it to LAPIC `dest` (edge-triggered, fixed delivery, unmasked). `table_phys`
+// is the physical address of the device's MSI-X table. Returns the vector (None if
+// every MSI slot is taken); the caller enables MSI-X on the device and binds an
+// Interrupt to the returned vector with bind_msi.
+pub fn acquire_msi(table_phys: u64, dest: u8) -> Option<u8> {
+	for index in 0..MSI_COUNT {
+		if MSI_USED[index].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+			continue;
+		}
+		let vector = MSI_BASE + index as u8;
+		program_msix_entry(index, table_phys, vector, dest);
+		return Some(vector);
+	}
+	None
+}
+
+// Map a device's MSI-X table page uncacheable and write entry 0: message address
+// 0xFEE00000 | dest<<12 (physical destination, fixed delivery), message data = the
+// allocated vector (edge-triggered), vector control = 0 (unmasked). A driver must
+// never write its own MSI-X table; only the kernel programs it here.
+fn program_msix_entry(slot: usize, table_phys: u64, vector: u8, dest: u8) {
+	let virt = MSIX_VIRT_BASE + slot as u64 * 0x1000;
+	super::paging::map_page(virt, table_phys & !0xfff, super::paging::WRITABLE | super::paging::NO_CACHE);
+	let entry = (virt + (table_phys & 0xfff)) as *mut u32;
+	let msg_addr: u32 = 0xFEE0_0000 | ((dest as u32) << 12);
+	unsafe {
+		entry.add(0).write_volatile(msg_addr); // message address low
+		entry.add(1).write_volatile(0); // message address high
+		entry.add(2).write_volatile(vector as u32); // message data
+		entry.add(3).write_volatile(0); // vector control (unmasked)
+	}
+}
+
+// Bind `intr` to an MSI `vector` so dispatch wakes it when the vector fires (the MSI
+// sibling of bind()). Returns false if the vector is already bound to a live Interrupt.
+pub fn bind_msi(vector: u8, intr: &Arc<Interrupt>) -> bool {
+	let index = (vector - MSI_BASE) as usize;
+	let mut slot = MSI_BOUND[index].lock();
+	if slot.as_ref().and_then(Weak::upgrade).is_some() {
+		return false;
+	}
+	*slot = Some(Arc::downgrade(intr));
+	intr.mark_bound();
+	true
+}
+
 // Re-arm a device vector after its driver has serviced the interrupt: unmask its
 // GSI so the device can interrupt again (a no-op for a vector with no routed GSI).
 pub fn ack(vector: u8) {
@@ -110,6 +191,10 @@ pub fn ack(vector: u8) {
 // Whether `vector` currently has a live driver binding. Used to confirm that a
 // crashed driver's IRQ was detached during cleanup.
 pub fn is_bound(vector: u8) -> bool {
+	if is_msi(vector) {
+		let index = (vector - MSI_BASE) as usize;
+		return MSI_BOUND[index].lock().as_ref().and_then(Weak::upgrade).is_some();
+	}
 	let index = vector.wrapping_sub(IRQ_BASE) as usize;
 	if index >= IRQ_COUNT {
 		return false;
@@ -144,6 +229,16 @@ fn dispatch(vector: u8) {
 	apic::eoi();
 }
 
+// MSI dispatch: edge-triggered, so just wake the bound driver and EOI - no
+// mask/unmask dance (there is no shared level line to gate, unlike the INTx path).
+fn dispatch_msi(vector: u8) {
+	let index = (vector - MSI_BASE) as usize;
+	if let Some(intr) = MSI_BOUND[index].lock().as_ref().and_then(Weak::upgrade) {
+		intr.signal();
+	}
+	apic::eoi();
+}
+
 macro_rules! irq_stub {
 	($name:ident, $vector:expr_2021) => {
 		extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
@@ -169,6 +264,31 @@ irq_stub!(irq13, 45);
 irq_stub!(irq14, 46);
 irq_stub!(irq15, 47);
 
+macro_rules! msi_stub {
+	($name:ident, $vector:expr_2021) => {
+		extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+			dispatch_msi($vector);
+		}
+	};
+}
+
+msi_stub!(msi0, 48);
+msi_stub!(msi1, 49);
+msi_stub!(msi2, 50);
+msi_stub!(msi3, 51);
+msi_stub!(msi4, 52);
+msi_stub!(msi5, 53);
+msi_stub!(msi6, 54);
+msi_stub!(msi7, 55);
+msi_stub!(msi8, 56);
+msi_stub!(msi9, 57);
+msi_stub!(msi10, 58);
+msi_stub!(msi11, 59);
+msi_stub!(msi12, 60);
+msi_stub!(msi13, 61);
+msi_stub!(msi14, 62);
+msi_stub!(msi15, 63);
+
 // Spurious LAPIC interrupts must not signal EOI, so they bypass the dispatcher.
 extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {}
 
@@ -188,11 +308,22 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
 
 const STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); IRQ_COUNT] = [irq0, irq1, irq2, irq3, irq4, irq5, irq6, irq7, irq8, irq9, irq10, irq11, irq12, irq13, irq14, irq15];
 
+const MSI_STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); MSI_COUNT] = [msi0, msi1, msi2, msi3, msi4, msi5, msi6, msi7, msi8, msi9, msi10, msi11, msi12, msi13, msi14, msi15];
+
 // Install the IRQ stubs and the spurious handler into the IDT.
 pub fn init() {
 	for (i, stub) in STUBS.iter().enumerate() {
 		idt::set_gate(IRQ_BASE as usize + i, *stub);
 	}
+	// MSI-X vectors get their own edge-triggered stubs in the band above the INTx window.
+	for (i, stub) in MSI_STUBS.iter().enumerate() {
+		idt::set_gate(MSI_BASE as usize + i, *stub);
+	}
+	// Materialise the MSI-X table mapping region's page tables now, while the kernel
+	// PML4 is active and before any process address space is created, so later per-device
+	// mappings under it land in the shared kernel half and are visible everywhere.
+	super::paging::map_page(MSIX_VIRT_BASE, 0, super::paging::WRITABLE);
+	super::paging::unmap_page(MSIX_VIRT_BASE);
 	// The timer vector preempts, so it gets a dedicated stub instead of the generic
 	// count-and-dispatch path.
 	idt::set_gate(TIMER_VECTOR as usize, timer);

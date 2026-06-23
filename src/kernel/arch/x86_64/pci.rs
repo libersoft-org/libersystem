@@ -33,6 +33,7 @@ pub const VIRTIO_BLK: u16 = abi::VIRTIO_TYPE_BLOCK as u16;
 pub const VIRTIO_CONSOLE: u16 = abi::VIRTIO_TYPE_CONSOLE as u16;
 pub const VIRTIO_RNG: u16 = abi::VIRTIO_TYPE_RNG as u16;
 pub const VIRTIO_GPU: u16 = abi::VIRTIO_TYPE_GPU as u16;
+pub const VIRTIO_SOUND: u16 = abi::VIRTIO_TYPE_SOUND as u16;
 
 // Build the CONFIG_ADDRESS value selecting a device's config dword. `offset` is
 // rounded down to a 4-byte boundary (the dword the field lives in).
@@ -78,6 +79,24 @@ pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
 	let command = config_read32(bus, dev, func, 0x04) as u16;
 	let new_command = if disabled { command | INTX_DISABLE } else { command & !INTX_DISABLE };
 	config_write32(bus, dev, func, 0x04, new_command as u32);
+}
+
+// Enable MSI-X on a device (set the MSI-X Enable bit, clear the Function Mask) and
+// make sure its memory space is decoded so the MSI-X table BAR responds. Called once
+// the kernel has programmed the device's table entry. `cap` is the MSI-X capability's
+// dword-aligned config-space offset (from VirtioDevice::msix_cap).
+pub fn msix_enable(bus: u8, dev: u8, func: u8, cap: u16) {
+	const MEMORY_SPACE: u16 = 1 << 1;
+	const MSIX_ENABLE: u16 = 1 << 15;
+	const FUNCTION_MASK: u16 = 1 << 14;
+	// Ensure the device decodes memory space (so the MSI-X table BAR is reachable).
+	let command = config_read32(bus, dev, func, 0x04) as u16;
+	config_write32(bus, dev, func, 0x04, (command | MEMORY_SPACE) as u32);
+	// Message Control is the upper 16 bits of the dword at `cap` (cap_id/next are the
+	// low 16): enable MSI-X, clear the function mask.
+	let dword = config_read32(bus, dev, func, cap);
+	let mc = (((dword >> 16) as u16) | MSIX_ENABLE) & !FUNCTION_MASK;
+	config_write32(bus, dev, func, cap, (dword & 0x0000_ffff) | ((mc as u32) << 16));
 }
 
 // One discovered PCI function.
@@ -168,6 +187,7 @@ pub fn virtio_type_name(virtio_type: u16) -> &'static str {
 		VIRTIO_CONSOLE => "console",
 		VIRTIO_RNG => "rng",
 		VIRTIO_GPU => "gpu",
+		VIRTIO_SOUND => "snd",
 		_ => "other",
 	}
 }
@@ -182,6 +202,11 @@ const VIRTIO_CAP_COMMON: u8 = 1;
 const VIRTIO_CAP_NOTIFY: u8 = 2;
 const VIRTIO_CAP_ISR: u8 = 3;
 const VIRTIO_CAP_DEVICE: u8 = 4;
+
+// MSI-X capability id. Its config layout: [2..4] Message Control (bit 15 = MSI-X
+// Enable, bit 14 = Function Mask, bits 10:0 = table size - 1), [4..8] Table
+// Offset/BIR (bits 2:0 = which BAR, bits 31:3 = byte offset into it).
+const MSIX_CAP_ID: u8 = 0x11;
 
 // Decode a memory BAR's physical base, handling 64-bit BARs (which occupy two
 // adjacent slots). Returns None for an I/O BAR or an out-of-range index.
@@ -225,6 +250,12 @@ pub struct VirtioDevice {
 	pub notify: VirtioCap,
 	pub isr: VirtioCap,
 	pub device: VirtioCap,
+	// MSI-X (when present): the config-space offset of the MSI-X capability (0 = none),
+	// the number of table entries, and the physical address of the MSI-X table. The
+	// kernel programs table entry 0 and enables MSI-X for an interrupt-driven driver.
+	pub msix_cap: u16,
+	pub msix_count: u16,
+	pub msix_table_phys: u64,
 }
 
 // Walk a device's PCI capability list and resolve its virtio configuration
@@ -236,6 +267,7 @@ fn resolve_virtio(d: &PciDevice) -> Option<VirtioDevice> {
 		return None;
 	}
 	let (mut common, mut notify, mut isr, mut device) = (None, None, None, None);
+	let (mut msix_cap, mut msix_count, mut msix_table_phys): (u16, u16, u64) = (0, 0, 0);
 	let mut ptr: u16 = (config_read8(d.bus, d.dev, d.func, 0x34) & 0xFC) as u16;
 	// Bound the walk so a malformed (cyclic) list cannot spin forever.
 	for _ in 0..48 {
@@ -257,6 +289,16 @@ fn resolve_virtio(d: &PciDevice) -> Option<VirtioDevice> {
 				VIRTIO_CAP_DEVICE => device = Some(cap),
 				_ => {}
 			}
+		} else if cap_id == MSIX_CAP_ID {
+			let mc = config_read16(d.bus, d.dev, d.func, ptr + 2);
+			let table_off_bir = config_read32(d.bus, d.dev, d.func, ptr + 4);
+			let bir = (table_off_bir & 7) as usize;
+			let table_offset = (table_off_bir & !7) as u64;
+			if let Some(base) = bar_address(d, bir) {
+				msix_cap = ptr;
+				msix_count = (mc & 0x7ff) + 1;
+				msix_table_phys = base + table_offset;
+			}
 		}
 		ptr = next;
 	}
@@ -276,7 +318,7 @@ fn resolve_virtio(d: &PciDevice) -> Option<VirtioDevice> {
 		}
 	}
 	let region_len = end.div_ceil(0x1000) * 0x1000;
-	Some(VirtioDevice { pci: *d, virtio_type, bar, bar_phys, region_len, common, notify, isr, device })
+	Some(VirtioDevice { pci: *d, virtio_type, bar, bar_phys, region_len, common, notify, isr, device, msix_cap, msix_count, msix_table_phys })
 }
 
 // Scan the bus and resolve every modern virtio device's MMIO layout.

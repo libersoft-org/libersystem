@@ -15,7 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, config, device, log, network, process, time, volume};
+use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, audio, config, device, log, network, process, time, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -27,8 +27,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 1. receive the per-service client channels from ServiceManager, in the order it
 	//    sends them: storage (`cat`), log (`log`), device (`dev`), process (`ps`/`run`),
-	//    config (`config`/`set`), network (`ip`/`ping`/...), then a read-only view of
-	//    the init package. Each is a tagged capability over the bootstrap channel.
+	//    config (`config`/`set`), network (`ip`/`ping`/...), time (`date`), audio (`beep`),
+	//    then a read-only view of the init package. Each is a tagged capability over the
+	//    bootstrap channel.
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or_else(|| exit());
 	let logsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or_else(|| exit());
 	let devsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DEVICE") }.unwrap_or_else(|| exit());
@@ -36,6 +37,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let cfgsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONFIG") }.unwrap_or_else(|| exit());
 	let netsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NET") }.unwrap_or_else(|| exit());
 	let timesvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"TIME") }.unwrap_or_else(|| exit());
+	let audiosvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"AUDIO") }.unwrap_or_else(|| exit());
 	// The console channel to ConsoleService: the shell writes its output to it (routed
 	// via stdout) and reads its keystrokes from it. The userspace terminal renders the
 	// output and forwards the input, so the shell talks to the console, not the kernel.
@@ -62,7 +64,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 4. become the interactive console and run the read-eval-print loop.
 	unsafe {
-		repl(console, control, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, &package, &mut buf);
+		repl(console, control, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, &package, &mut buf);
 	}
 	exit();
 }
@@ -72,7 +74,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package, buf: &mut [u8]) {
+unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control);
 		loop {
@@ -88,7 +90,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u6
 			// The terminal delivers a whole submitted line (with a trailing newline);
 			// trim it, dispatch it, reap finished jobs, and print the next prompt.
 			let line: &[u8] = trim(&buf[..n]);
-			if dispatch(line, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, package, &mut jobs) {
+			if dispatch(line, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, package, &mut jobs) {
 				return;
 			}
 			reap_jobs(&mut jobs);
@@ -398,7 +400,7 @@ unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -444,6 +446,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  resize <c> <r>   resize the terminal to c cols x r rows\n");
 			print(b"  echo <text>      print text\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
+			print(b"  beep [hz] [ms]   play a tone via AudioService\n");
 			print(b"  script [<cmd>]   run a command in a fresh pty-hosted shell and record it\n");
 			print(b"  log [json]       show the system journal via LogService\n");
 			print(b"  log tail [json]  stream the journal via LogService (sub-channel)\n");
@@ -530,6 +533,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		}
 		if line == b"date" {
 			show_date(timesvc);
+			return false;
+		}
+		if line == b"beep" {
+			beep_cmd(audiosvc, b"");
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"beep ") {
+			beep_cmd(audiosvc, trim(rest));
 			return false;
 		}
 		if line == b"ip" || line == b"net" {
@@ -763,6 +774,42 @@ unsafe fn show_date(timesvc: u64) {
 			}
 			Some(Err(_)) => print(b"date: time error\n"),
 			None => print(b"date: service unavailable\n"),
+		}
+	}
+}
+
+// `beep [hz] [ms]`: play a tone via AudioService. Both arguments are optional and
+// default to a 440 Hz tone for 200 ms; AudioService clamps them to its supported
+// range. A bare "no audio device" error is reported when the system has no virtio-
+// sound device (e.g. under test), so the command degrades cleanly without one.
+unsafe fn beep_cmd(audiosvc: u64, args: &[u8]) {
+	unsafe {
+		let mut freq: u16 = 440;
+		let mut millis: u32 = 200;
+		let mut parts = args.split(|&b| b == b' ').filter(|s: &&[u8]| !s.is_empty());
+		if let Some(f) = parts.next() {
+			match parse_usize(f) {
+				Some(v) => freq = v.min(u16::MAX as usize) as u16,
+				None => {
+					print(b"beep: invalid frequency\n");
+					return;
+				}
+			}
+		}
+		if let Some(m) = parts.next() {
+			match parse_usize(m) {
+				Some(v) => millis = v.min(u32::MAX as usize) as u32,
+				None => {
+					print(b"beep: invalid duration\n");
+					return;
+				}
+			}
+		}
+		let mut client = audio::Client::new(ChannelTransport { chan: audiosvc });
+		match client.beep(&freq, &millis) {
+			Some(Ok(())) => {}
+			Some(Err(_)) => print(b"beep: no audio device\n"),
+			None => print(b"beep: service unavailable\n"),
 		}
 	}
 }

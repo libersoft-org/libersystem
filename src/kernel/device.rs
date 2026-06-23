@@ -27,6 +27,12 @@ pub struct DeviceEntry {
 	// The IOAPIC GSI this device's INTx pin is routed to (0 = no interrupt pin), so a
 	// driver can acquire an Interrupt the kernel routes through the I/O APIC.
 	pub irq: u8,
+	// MSI-X (when present): the config-space offset of the device's MSI-X capability
+	// (0 = none) and the physical address of its MSI-X table. The kernel programs table
+	// entry 0 and enables MSI-X so a driver gets its own per-device edge-triggered
+	// vector instead of the shared INTx line above.
+	pub msix_cap: u16,
+	pub msix_table_phys: u64,
 	// The device's PCI address, so the interrupt-acquire path can re-enable its INTx pin
 	// (init disables every device's pin by default; see below).
 	pub bus: u8,
@@ -48,7 +54,7 @@ pub fn init() {
 		// drivers, so an unacknowledged assertion would storm. sys_device_interrupt_acquire
 		// re-enables the pin for the drivers that do take their interrupt (input, net).
 		crate::arch::pci::set_intx_disabled(v.pci.bus, v.pci.dev, v.pci.func, true);
-		table.push(DeviceEntry { virtio_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.offset, irq: v.pci.intx_gsi().unwrap_or(0) as u8, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func });
+		table.push(DeviceEntry { virtio_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.offset, irq: v.pci.intx_gsi().unwrap_or(0) as u8, msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func });
 	}
 }
 

@@ -90,9 +90,14 @@ struct Mods {
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		// 1. bring the device up (recv "DEVICE" + MMIO cap, map, negotiate to FEATURES_OK).
-		let device: Virtio = common::bringup(bootstrap);
+		let mut device: Virtio = common::bringup(bootstrap);
 		// 2. receive our device's Interrupt capability ("IRQ" + handle).
 		let irq: u64 = recv_irq(bootstrap);
+		// route this device's interrupts to MSI-X table entry 0: DeviceManager acquired
+		// an MSI-X Interrupt (device_msix_acquire), so the kernel has already programmed
+		// the table and enabled MSI-X - we just point the device's config and queue
+		// interrupts at that vector before setting the queue up.
+		device.set_msix_vector(0);
 		// 3. set up the event virtqueue (queue 0) and a pool of device-writable event
 		//    buffers (one 8-byte slot per descriptor), post them all, and go live.
 		let mut eventq: Queue = match device.setup_queue(0) {
@@ -116,7 +121,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 4. report in. We do not stand on the bootstrap channel like the polling
 		//    drivers - we stand on the interrupt in `event_loop`.
 		send_blocking(bootstrap, b"driver.virtio-input: online", 0);
-		event_loop(irq, &device, &mut eventq, pool_virt, pool_phys, slots)
+		event_loop(irq, &mut eventq, pool_virt, pool_phys, slots)
 	}
 }
 
@@ -132,17 +137,16 @@ unsafe fn recv_irq(bootstrap: u64) -> u64 {
 	}
 }
 
-// Block on the device interrupt forever: each time it fires, deassert the ISR line,
-// drain every event buffer the device filled (translating key presses to console
-// input), re-post the drained buffers, and re-arm the interrupt.
-unsafe fn event_loop(irq: u64, device: &Virtio, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16) -> ! {
+// Block on the device interrupt forever: each time it fires, drain every event buffer
+// the device filled (translating key presses to console input), re-post the drained
+// buffers, and re-arm the interrupt. MSI-X is edge-triggered, so there is no ISR line
+// to deassert and no GSI to unmask - the interrupt_ack just clears the pending flag.
+unsafe fn event_loop(irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16) -> ! {
 	unsafe {
 		let mut mods: Mods = Mods::default();
 		loop {
-			// block until the keyboard raises its interrupt.
+			// block until the keyboard raises its MSI-X interrupt.
 			wait(irq, 0);
-			// read (and so acknowledge) the ISR-status register, deasserting the line.
-			device.isr_ack();
 			// drain the buffers the device filled, re-posting each as we go.
 			while let Some((id, _len)) = eventq.take_used() {
 				if id < slots {
@@ -151,7 +155,8 @@ unsafe fn event_loop(irq: u64, device: &Virtio, eventq: &mut Queue, pool_virt: u
 				}
 			}
 			eventq.notify();
-			// clear the pending flag and unmask the GSI so the next press wakes us.
+			// clear the pending flag so the next press wakes us (edge-triggered: no source
+			// to unmask).
 			interrupt_ack(irq);
 		}
 	}

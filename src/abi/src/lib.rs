@@ -77,6 +77,10 @@ pub const SYS_FRAMEBUFFER_MAP: u64 = 44;
 // of POSIX kill): a holder of the process's MANAGE capability requests a default
 // disposition - interrupt / terminate, suspend, or resume.
 pub const SYS_PROCESS_SIGNAL: u64 = 45;
+// Acquire an MSI-X Interrupt capability for a discovered device: the kernel allocates
+// a per-device LAPIC vector and programs the device's MSI-X table entry 0, so the
+// driver gets its own edge-triggered interrupt instead of sharing a legacy INTx line.
+pub const SYS_DEVICE_MSIX_ACQUIRE: u64 = 46;
 
 // Signal numbers for SYS_PROCESS_SIGNAL (POSIX-like values, but our own typed set).
 // The kernel applies the default disposition: INT / TERM / KILL terminate the target,
@@ -113,6 +117,7 @@ pub const VIRTIO_TYPE_CONSOLE: u32 = 3;
 pub const VIRTIO_TYPE_RNG: u32 = 4;
 pub const VIRTIO_TYPE_GPU: u32 = 16;
 pub const VIRTIO_TYPE_INPUT: u32 = 18;
+pub const VIRTIO_TYPE_SOUND: u32 = 25;
 
 // What `device_info` writes about one discovered virtio device. The kernel
 // resolves these from the device's PCI capabilities at boot; a driver maps the

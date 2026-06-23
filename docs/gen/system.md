@@ -285,3 +285,11 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | --- | --- | --- |
 | 1 | `now` | `now() -> result<timestamp, error>` |
 
+### interface `audio`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `beep` | `beep(freq: u16, millis: u32) -> result<unit, error>` |
+
