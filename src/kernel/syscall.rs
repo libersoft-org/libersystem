@@ -427,6 +427,9 @@ fn sys_device_interrupt_acquire(index: u64) -> i64 {
 		arch::interrupts::unbind(vector);
 		return ERR_RESOURCE_EXHAUSTED;
 	}
+	// Re-enable this device's INTx pin now that a driver owns its interrupt (device::init
+	// disabled every device's pin by default to keep shared lines quiet).
+	device::with(index as usize, |d| arch::pci::set_intx_disabled(d.bus, d.dev, d.func, false));
 	install_object(&thread, interrupt, Rights::ALL, 0)
 }
 

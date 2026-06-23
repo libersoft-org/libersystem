@@ -1,6 +1,8 @@
 - Remove the mess from the console after bootup
-- SSH server
+- More virtio drivers?
 - Where are poweroff / reboot commands - they disappeared
+- Add CTRL+ALT+DEL for reboot
+- SSH server
 - List the available volumes "ls" - change to "lsvol"?
 - Optimize the code
 - Find the dead code

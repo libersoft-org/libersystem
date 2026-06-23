@@ -111,6 +111,7 @@ pub const VIRTIO_TYPE_NET: u32 = 1;
 pub const VIRTIO_TYPE_BLOCK: u32 = 2;
 pub const VIRTIO_TYPE_CONSOLE: u32 = 3;
 pub const VIRTIO_TYPE_RNG: u32 = 4;
+pub const VIRTIO_TYPE_GPU: u32 = 16;
 pub const VIRTIO_TYPE_INPUT: u32 = 18;
 
 // What `device_info` writes about one discovered virtio device. The kernel

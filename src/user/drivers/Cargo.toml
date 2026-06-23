@@ -23,6 +23,10 @@ path = "src/virtio_console.rs"
 name = "virtio_input"
 path = "src/virtio_input.rs"
 
+[[bin]]
+name = "virtio_gpu"
+path = "src/virtio_gpu.rs"
+
 [dependencies]
 # Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
 # the syscall/IPC helpers); it re-exports the abi constants.

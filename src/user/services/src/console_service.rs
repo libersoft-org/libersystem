@@ -1656,12 +1656,91 @@ struct Console {
 	addr: u64,
 	fb: Framebuffer,
 	has_fb: bool,
+	// The virtio-gpu driver's display channel, or 0 for the boot framebuffer (which is
+	// visible directly, no present step). `present` FLUSHes the foreground over it.
+	gpu: u64,
+	// The current display size in pixels (the visible sub-rectangle of the max `fb`
+	// geometry). New VTs are sized to it, and the gpu driver grows it toward the max on a
+	// host-window resize. Equals the full `fb` geometry for the boot framebuffer.
+	cur_w: u32,
+	cur_h: u32,
 	input: u64,
 	vts: Vec<Vt>,
 	fg: usize,
 	facs: Factories,
 	package: Package<'static>,
 	pkg_len: usize,
+}
+
+// Receive the "GPU" bootstrap message, returning the gpu driver's display channel, or 0
+// when there is no virtio-gpu device. A 0 handle is valid here (unlike the tagged
+// service factories, which require a capability), so this does not use recv_tagged.
+unsafe fn recv_gpu(bootstrap: u64, buf: &mut [u8]) -> u64 {
+	unsafe {
+		match recv_blocking(bootstrap, buf) {
+			Received::Message { len, handle } if len >= 3 && &buf[..3] == b"GPU" => handle,
+			_ => 0,
+		}
+	}
+}
+
+// Acquire the display: prefer the virtio-gpu driver's shared framebuffer (which it
+// presents on FLUSH and resizes on a host-window change), falling back to the boot
+// framebuffer the kernel maps directly when there is no virtio-gpu device or the connect
+// fails. Returns (pixel base, max geometry, whether a framebuffer was acquired, the gpu
+// channel to FLUSH - 0 for the boot framebuffer, which needs no present, and the current
+// display width/height the terminal is sized to within that max geometry).
+unsafe fn acquire_display(gpu: u64, buf: &mut [u8]) -> (u64, Framebuffer, bool, u64, u32, u32) {
+	unsafe {
+		if gpu != 0 {
+			if let Some((addr, fb, cur_w, cur_h)) = gpu_framebuffer(gpu, buf) {
+				return (addr, fb, true, gpu, cur_w, cur_h);
+			}
+		}
+		let mut fb: Framebuffer = Framebuffer::default();
+		let addr_raw: i64 = framebuffer_map(&mut fb);
+		let has_fb: bool = !sys_is_err(addr_raw as u64);
+		// the boot framebuffer does not resize: its current size is its full geometry.
+		(addr_raw as u64, fb, has_fb, 0, fb.width, fb.height)
+	}
+}
+
+// Connect to the virtio-gpu driver: ask for the framebuffer (FB), receive its max
+// geometry (the resource extent and pitch), its current display size, and a handle to
+// the shared backing it renders into, and map it. Returns (pixel base, max geometry,
+// current width, current height), or None on any failure (the caller then uses the boot
+// framebuffer). The terminal is sized to the current display but may grow to the max.
+unsafe fn gpu_framebuffer(gpu: u64, buf: &mut [u8]) -> Option<(u64, Framebuffer, u32, u32)> {
+	unsafe {
+		send_blocking(gpu, b"FB", 0);
+		let (handle, len): (u64, usize) = match recv_blocking(gpu, buf) {
+			Received::Message { len, handle } if handle != 0 => (handle, len),
+			_ => return None,
+		};
+		let fb_len: usize = core::mem::size_of::<Framebuffer>();
+		if len < fb_len + 8 {
+			return None;
+		}
+		let fb: Framebuffer = (buf.as_ptr() as *const Framebuffer).read_unaligned();
+		let cur_w: u32 = u32::from_le_bytes([buf[fb_len], buf[fb_len + 1], buf[fb_len + 2], buf[fb_len + 3]]);
+		let cur_h: u32 = u32::from_le_bytes([buf[fb_len + 4], buf[fb_len + 5], buf[fb_len + 6], buf[fb_len + 7]]);
+		let addr: i64 = dma_buffer_map(handle);
+		if sys_is_err(addr as u64) {
+			return None;
+		}
+		Some((addr as u64, fb, cur_w, cur_h))
+	}
+}
+
+// Present the foreground framebuffer through the virtio-gpu driver - a no-op for the boot
+// framebuffer, whose pixel writes are visible immediately. The driver copies the shared
+// backing to its host resource and flushes it to the display.
+unsafe fn present(gpu: u64) {
+	unsafe {
+		if gpu != 0 {
+			send_blocking(gpu, b"FLUSH", 0);
+		}
+	}
 }
 
 #[unsafe(no_mangle)]
@@ -1681,18 +1760,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let config: u64 = recv_tagged(bootstrap, &mut buf, b"FCONFIG").unwrap_or_else(|| exit());
 		let time: u64 = recv_tagged(bootstrap, &mut buf, b"FTIME").unwrap_or_else(|| exit());
 		let net: u64 = recv_tagged(bootstrap, &mut buf, b"FNET").unwrap_or_else(|| exit());
+		// The gpu driver's display channel (0 = no virtio-gpu device; a 0 handle is valid
+		// here, unlike the tagged factories above, so we do not use recv_tagged).
+		let gpu: u64 = recv_gpu(bootstrap, &mut buf);
 		let (pkg_handle, archive): (u64, &'static [u8]) = recv_package(bootstrap, &mut buf).unwrap_or_else(|| exit());
 		let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
 		let pkg_len: usize = archive.len();
 
-		// 2. map the framebuffer (this hands us the display; the kernel console stops).
-		//    A headless boot has no framebuffer; we still serve so input/serial work.
-		let mut fb: Framebuffer = Framebuffer::default();
-		let addr_raw: i64 = framebuffer_map(&mut fb);
-		let has_fb: bool = !sys_is_err(addr_raw as u64);
-		let addr: u64 = addr_raw as u64;
+		// 2. acquire the display: the virtio-gpu driver's resizable shared framebuffer if
+		//    present (it presents on FLUSH), else the boot framebuffer the kernel maps
+		//    directly (the test path). A headless boot has neither; we still serve input.
+		//    The framebuffer is the maximum (resource) geometry; the terminal is sized to
+		//    the current display, which the gpu driver grows toward the max on a resize.
+		let (addr, fb, has_fb, gpu, cur_w, cur_h): (u64, Framebuffer, bool, u64, u32, u32) = acquire_display(gpu, &mut buf);
 		let term: Option<Term> = if has_fb {
 			let mut t = Term::new(addr, &fb);
+			t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 			t.clear();
 			for &b in b"ConsoleService: online\n" {
 				t.put_byte(b);
@@ -1708,7 +1791,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, pkg_handle };
-		let mut console: Console = Console { addr, fb, has_fb, input: 0, vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()) }], fg: 0, facs, package, pkg_len };
+		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()) }], fg: 0, facs, package, pkg_len };
 		run(&mut console);
 	}
 }
@@ -1732,17 +1815,26 @@ unsafe fn run(console: &mut Console) -> ! {
 		console.input = input;
 		let mut keys: [u8; 64] = [0u8; 64];
 		let mut out: [u8; 1024] = [0u8; 1024];
-		let mut waits: [u64; 1 + 2 * NVT] = [0u64; 1 + 2 * NVT];
+		let mut waits: [u64; 2 + 2 * NVT] = [0u64; 2 + 2 * NVT];
+		// present the initial banner (the foreground term was rendered in __user_main).
+		present(console.gpu);
 		loop {
 			// wait set: the keyboard channel (index 0), then each VT's data channel and
-			// its control channel interleaved - data at 1 + 2*i, control at 2 + 2*i.
+			// its control channel interleaved - data at 1 + 2*i, control at 2 + 2*i - and
+			// finally, when a gpu driver is present, its display channel at 1 + 2*n (it
+			// sends RESIZE on a host-window change).
 			waits[0] = console.input;
 			let n: usize = console.vts.len();
 			for i in 0..n {
 				waits[1 + 2 * i] = console.vts[i].client;
 				waits[2 + 2 * i] = console.vts[i].control;
 			}
-			let ready: i64 = wait_any(&waits[..1 + 2 * n], 0);
+			let gpu_idx: usize = 1 + 2 * n;
+			let have_gpu: bool = console.gpu != 0;
+			if have_gpu {
+				waits[gpu_idx] = console.gpu;
+			}
+			let ready: i64 = wait_any(&waits[..gpu_idx + have_gpu as usize], 0);
 			if ready < 0 {
 				continue;
 			}
@@ -1752,6 +1844,9 @@ unsafe fn run(console: &mut Console) -> ! {
 				if let Received::Message { len, .. } = recv_blocking(console.input, &mut keys) {
 					handle_keys(console, &keys[..len]);
 				}
+			} else if have_gpu && r == gpu_idx {
+				// the gpu driver reports a host-window resize: refit every VT.
+				handle_gpu_resize(console);
 			} else {
 				let vi: usize = (r - 1) / 2;
 				if (r - 1) % 2 == 0 {
@@ -1765,6 +1860,8 @@ unsafe fn run(console: &mut Console) -> ! {
 					handle_control(console, vi);
 				}
 			}
+			// present the foreground to the display (a no-op on the boot framebuffer).
+			present(console.gpu);
 		}
 	}
 }
@@ -1776,6 +1873,7 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 	unsafe {
 		let fg: bool = vi == console.fg;
 		let input: u64 = console.input;
+		let gpu: u64 = console.gpu;
 		let mut raw_req: Option<bool> = None;
 		let mut echo_req: Option<bool> = None;
 		if let Some(t) = console.vts[vi].term.as_mut() {
@@ -1793,6 +1891,7 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 				// stalls the cooperative boot driver.
 				if bell {
 					t.draw_inverted();
+					present(gpu);
 					let _ = wait(input, clock() + BELL_FLASH_TICKS);
 					t.mark_all_dirty();
 					t.flush();
@@ -1999,6 +2098,40 @@ unsafe fn resize_vt(console: &mut Console, vi: usize, cols: usize, rows: usize) 
 	}
 }
 
+// Handle a display-change event from the gpu driver: on a host-window resize it rebinds
+// the scanout to the new pixel size and sends RESIZE + the new width/height. Refit every
+// VT's terminal to the new size (each shell is notified, the SIGWINCH equivalent); the
+// run loop re-presents the foreground afterwards. If the driver's channel has closed,
+// stop polling it (the display freezes on the last frame - the driver is gone).
+unsafe fn handle_gpu_resize(console: &mut Console) {
+	unsafe {
+		let mut buf: [u8; 32] = [0u8; 32];
+		let len: usize = match recv_blocking(console.gpu, &mut buf) {
+			Received::Message { len, .. } => len,
+			Received::Closed => {
+				console.gpu = 0;
+				return;
+			}
+		};
+		if len < 14 || &buf[..6] != b"RESIZE" {
+			return;
+		}
+		let new_w: u32 = u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]);
+		let new_h: u32 = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]);
+		if new_w == 0 || new_h == 0 {
+			return;
+		}
+		console.cur_w = new_w;
+		console.cur_h = new_h;
+		let cols: usize = new_w as usize / CELL_W;
+		let rows: usize = new_h as usize / CELL_H;
+		let n: usize = console.vts.len();
+		for vi in 0..n {
+			resize_vt(console, vi, cols, rows);
+		}
+	}
+}
+
 // Open a new virtual terminal: spawn a fully-capable shell over its own per-VT service
 // connections, make it foreground, and repaint. A no-op when headless or at the VT cap.
 unsafe fn create_vt(console: &mut Console) {
@@ -2006,7 +2139,7 @@ unsafe fn create_vt(console: &mut Console) {
 		if !console.has_fb || console.vts.len() >= NVT {
 			return;
 		}
-		if let Some(vt) = spawn_vt(&console.facs, &console.package, console.pkg_len, console.addr, &console.fb) {
+		if let Some(vt) = spawn_vt(&console.facs, &console.package, console.pkg_len, console.addr, &console.fb, console.cur_w, console.cur_h) {
 			console.vts.push(vt);
 			console.fg = console.vts.len() - 1;
 			repaint(console);
@@ -2088,7 +2221,7 @@ fn repaint(console: &mut Console) {
 // self-checks storage over its own connection), then nudge it to print its first prompt.
 // Returns the VT (its cleared grid + the service end of its console channel) or None on
 // any failure.
-unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u64, fb: &Framebuffer) -> Option<Vt> {
+unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u64, fb: &Framebuffer, cur_w: u32, cur_h: u32) -> Option<Vt> {
 	unsafe {
 		let shell_elf: &[u8] = package.lookup(b"shell")?;
 		let storage: u64 = service_connect(facs.storage)?;
@@ -2143,6 +2276,7 @@ unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u6
 		// silent reprompt, the same first prompt VT 1 shows at boot.
 		send_blocking(vt_service, b"\n", 0);
 		let mut term: Term = Term::new(addr, fb);
+		term.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 		term.clear();
 		Some(Vt { term: Some(term), client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new()) })
 	}

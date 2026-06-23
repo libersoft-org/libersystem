@@ -27,6 +27,11 @@ pub struct DeviceEntry {
 	// The IOAPIC GSI this device's INTx pin is routed to (0 = no interrupt pin), so a
 	// driver can acquire an Interrupt the kernel routes through the I/O APIC.
 	pub irq: u8,
+	// The device's PCI address, so the interrupt-acquire path can re-enable its INTx pin
+	// (init disables every device's pin by default; see below).
+	pub bus: u8,
+	pub dev: u8,
+	pub func: u8,
 }
 
 static DEVICES: SpinLock<Vec<DeviceEntry>> = SpinLock::new(Vec::new());
@@ -36,7 +41,14 @@ pub fn init() {
 	let mut table = DEVICES.lock();
 	table.clear();
 	for v in crate::arch::pci::scan_virtio() {
-		table.push(DeviceEntry { virtio_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.offset, irq: v.pci.intx_gsi().unwrap_or(0) as u8 });
+		// Silence this device's legacy INTx pin by default. A device whose driver does not
+		// acquire its interrupt (blk, console, gpu) must not assert a shared PCI INTx line:
+		// the gpu's configuration-change interrupt in particular shares a line with
+		// virtio-input here, and the kernel does not fan a shared line out to multiple
+		// drivers, so an unacknowledged assertion would storm. sys_device_interrupt_acquire
+		// re-enables the pin for the drivers that do take their interrupt (input, net).
+		crate::arch::pci::set_intx_disabled(v.pci.bus, v.pci.dev, v.pci.func, true);
+		table.push(DeviceEntry { virtio_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.offset, irq: v.pci.intx_gsi().unwrap_or(0) as u8, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func });
 	}
 }
 

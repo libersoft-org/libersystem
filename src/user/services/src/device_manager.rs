@@ -39,13 +39,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    ServiceManager (it forwards it to StorageService).
 		let mut block_client: u64 = 0;
 		let mut net_client: u64 = 0;
-		launch_drivers(&package, &mut buf, &mut block_client, &mut net_client);
+		let mut gpu_client: u64 = 0;
+		launch_drivers(&package, &mut buf, &mut block_client, &mut net_client, &mut gpu_client);
 
 		// 3. report in once the devices are bound to drivers, transferring the block
-		//    service channel up the boot chain, then the net driver's control channel in a
-		//    follow-up message (the report already carries one handle).
+		//    service channel up the boot chain, then the net driver's control channel and
+		//    the gpu driver's display channel in follow-up messages (the report itself
+		//    carries one handle; each `GPU`/`NET` handle is 0 when that device is absent).
 		send_blocking(bootstrap, b"DeviceManager: online", block_client);
 		send_blocking(bootstrap, b"NET", net_client);
+		send_blocking(bootstrap, b"GPU", gpu_client);
 
 		// 4. stand until ServiceManager asks us to stop (which also drops the driver
 		//    channels, so the drivers shut down with us), then acknowledge and exit.
@@ -61,7 +64,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // each device's state (online once its driver reports in, failed otherwise) and
 // prints a summary. The driver's "online" report is printed; it does not flow up
 // the boot-chain report channel (which carries only the service lifecycle).
-unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u64, net_client: &mut u64) {
+unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u64, net_client: &mut u64, gpu_client: &mut u64) {
 	unsafe {
 		let count: u64 = device_count();
 		let mut state: [u8; MAX_DEVICES] = [STATE_UNKNOWN; MAX_DEVICES];
@@ -92,6 +95,9 @@ unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u
 				}
 				if driver_name == b"virtio_net" {
 					*net_client = handle;
+				}
+				if driver_name == b"virtio_gpu" {
+					*gpu_client = handle;
 				}
 			}
 			i += 1;
@@ -127,10 +133,13 @@ unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], 
 			if !send_blocking(dm_side, &buf[..6 + info_size], cap as u64) {
 				return false;
 			}
-			// the interrupt-driven drivers (input, net) also need their device's
-			// Interrupt capability: acquire it (which routes the IOAPIC) and transfer it
-			// as a second "IRQ" message. The purely polling drivers (blk/console) get
-			// none, so their device IRQs stay masked and never storm.
+			// the interrupt-driven drivers (input, net) also need their device's Interrupt
+			// capability: acquire it (which routes the IOAPIC) and transfer it as a second
+			// "IRQ" message. The polling drivers (blk/console/gpu) get none, so their
+			// device IRQs stay masked and never storm. The gpu shares a PCI INTx line with
+			// virtio-input here, so it deliberately polls the display size for resizes
+			// rather than acquiring that shared interrupt (which would hijack input's
+			// IOAPIC routing and storm); see driver.virtio-gpu.
 			if driver_name == b"virtio_input" || driver_name == b"virtio_net" {
 				let irq: i64 = device_interrupt_acquire(i);
 				if irq < 0 {
@@ -199,6 +208,7 @@ fn driver_for(virtio_type: u32) -> &'static [u8] {
 		VIRTIO_TYPE_BLOCK => b"virtio_blk",
 		VIRTIO_TYPE_CONSOLE => b"virtio_console",
 		VIRTIO_TYPE_INPUT => b"virtio_input",
+		VIRTIO_TYPE_GPU => b"virtio_gpu",
 		_ => b"",
 	}
 }

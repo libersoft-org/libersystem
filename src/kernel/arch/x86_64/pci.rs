@@ -32,6 +32,7 @@ pub const VIRTIO_NET: u16 = abi::VIRTIO_TYPE_NET as u16;
 pub const VIRTIO_BLK: u16 = abi::VIRTIO_TYPE_BLOCK as u16;
 pub const VIRTIO_CONSOLE: u16 = abi::VIRTIO_TYPE_CONSOLE as u16;
 pub const VIRTIO_RNG: u16 = abi::VIRTIO_TYPE_RNG as u16;
+pub const VIRTIO_GPU: u16 = abi::VIRTIO_TYPE_GPU as u16;
 
 // Build the CONFIG_ADDRESS value selecting a device's config dword. `offset` is
 // rounded down to a 4-byte boundary (the dword the field lives in).
@@ -65,6 +66,18 @@ pub fn config_read16(bus: u8, dev: u8, func: u8, offset: u16) -> u16 {
 pub fn config_read8(bus: u8, dev: u8, func: u8, offset: u16) -> u8 {
 	let dword = config_read32(bus, dev, func, offset & !3);
 	(dword >> ((offset as u32 & 3) * 8)) as u8
+}
+
+// Set or clear a function's PCI command-register Interrupt Disable bit (bit 10), which
+// gates whether the device may assert its legacy INTx pin. Disabling it silences a
+// device whose driver does not service its interrupt, so it cannot storm a shared INTx
+// line. Only the command half is written; the status half is left as 0 (its write-1-to-
+// clear bits ignore a 0, and its read-only bits ignore writes), so no status is touched.
+pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
+	const INTX_DISABLE: u16 = 1 << 10;
+	let command = config_read32(bus, dev, func, 0x04) as u16;
+	let new_command = if disabled { command | INTX_DISABLE } else { command & !INTX_DISABLE };
+	config_write32(bus, dev, func, 0x04, new_command as u32);
 }
 
 // One discovered PCI function.
@@ -154,6 +167,7 @@ pub fn virtio_type_name(virtio_type: u16) -> &'static str {
 		VIRTIO_BLK => "blk",
 		VIRTIO_CONSOLE => "console",
 		VIRTIO_RNG => "rng",
+		VIRTIO_GPU => "gpu",
 		_ => "other",
 	}
 }

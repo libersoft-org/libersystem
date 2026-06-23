@@ -89,6 +89,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut block_client: u64 = 0;
 	let mut net_frames: u64 = 0;
 	let mut net_client: u64 = 0;
+	let mut gpu_client: u64 = 0;
 	let mut time_client: u64 = 0;
 	let mut console_client: u64 = 0;
 	let mut console_control: u64 = 0;
@@ -101,7 +102,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
-				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut channels[i], &mut buf) };
+				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut channels[i], &mut buf) };
 				progress = true;
 			}
 			i += 1;
@@ -185,7 +186,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -223,7 +224,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"time_service" && !bootstrap_time_service(manager_side, *net_client, time_client) {
 			return State::Failed;
 		}
-		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, console_client, console_control, pkg_handle, pkg_len, buf) {
+		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, console_client, console_control, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *console_client, *console_control, pkg_handle, pkg_len, buf) {
@@ -251,10 +252,15 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 					close(proc as u64);
 				}
 				// DeviceManager sends a follow-up "NET" message carrying the net driver's
-				// frame channel; keep it to bootstrap NetworkService against the driver.
+				// frame channel, then a "GPU" message carrying the gpu driver's display
+				// channel; keep them to bootstrap NetworkService and ConsoleService against
+				// the drivers (each handle is 0 when that device is absent, e.g. under test).
 				if name == b"device_manager" {
 					if let Received::Message { handle: net, .. } = recv_blocking(manager_side, buf) {
 						*net_frames = net;
+					}
+					if let Received::Message { handle: gpu, .. } = recv_blocking(manager_side, buf) {
+						*gpu_client = gpu;
 					}
 				}
 				State::Running
@@ -452,7 +458,7 @@ unsafe fn bootstrap_time_service(manager_side: u64, net_client: u64, time_client
 // so minting from them never crosses the supervisor's lifecycle traffic. ConsoleService
 // maps the framebuffer itself (the kernel console then stops drawing) and attaches to
 // the kernel console input for keys.
-unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, console_client: &mut u64, console_control: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, gpu_client: u64, time_client: u64, console_client: &mut u64, console_control: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		let (service_end, client_end): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -499,6 +505,11 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 			_ => return false,
 		};
 		if !send_blocking(manager_side, b"FNET", net_fac) {
+			return false;
+		}
+		// The gpu driver's display channel (0 when there is no virtio-gpu device, e.g.
+		// under test - ConsoleService then falls back to the boot framebuffer).
+		if !send_blocking(manager_side, b"GPU", gpu_client) {
 			return false;
 		}
 		// A read-only view of the init package so ConsoleService can spawn shells. It
