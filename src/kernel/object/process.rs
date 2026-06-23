@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 use alloc::sync::Arc;
+use alloc::sync::Weak;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +23,7 @@ use super::address_space::AddressSpace;
 use super::domain::Domain;
 use super::handle::HandleTable;
 use super::rights::Rights;
+use super::thread::Thread;
 use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::fault::FaultInfo;
 use crate::sync::SpinLock;
@@ -43,6 +45,13 @@ pub struct Process {
 	// point at, so the Process owns those frames and frees them on drop. Empty for
 	// kernel processes (their threads run on the shared kernel mappings).
 	user_frames: SpinLock<Vec<u64>>,
+	// Forward links to this process's threads (Weak, so they never keep a dead thread
+	// alive). Signal delivery wakes each so a blocked thread observes a kill / stop at
+	// its next scheduling point.
+	threads: SpinLock<Vec<Weak<Thread>>>,
+	// Set while the process is suspended (SIGSTOP); its threads park at their next
+	// scheduling point until resumed (SIGCONT).
+	stopped: AtomicBool,
 }
 
 impl Process {
@@ -52,7 +61,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false) });
 		// Register with the Domain so a Domain kill can reach and terminate it.
 		process.domain.register_process(&process);
 		process
@@ -101,6 +110,29 @@ impl Process {
 	// Whether this process has been killed and its threads should exit.
 	pub fn is_killed(&self) -> bool {
 		self.killed.load(Ordering::Acquire)
+	}
+
+	// Record a thread as belonging to this process (a weak forward link), so signal
+	// delivery can reach it. Called as the thread is built.
+	pub fn register_thread(&self, thread: &Arc<Thread>) {
+		self.threads.lock().push(Arc::downgrade(thread));
+	}
+
+	// This process's currently-live threads, pruning any that have been dropped.
+	pub fn live_threads(&self) -> Vec<Arc<Thread>> {
+		let mut threads = self.threads.lock();
+		threads.retain(|w: &Weak<Thread>| w.strong_count() > 0);
+		threads.iter().filter_map(Weak::upgrade).collect()
+	}
+
+	// Whether the process is currently suspended (SIGSTOP).
+	pub fn is_stopped(&self) -> bool {
+		self.stopped.load(Ordering::Acquire)
+	}
+
+	// Set or clear the suspended state (SIGSTOP sets, SIGCONT clears).
+	pub fn set_stopped(&self, stopped: bool) {
+		self.stopped.store(stopped, Ordering::Release);
 	}
 
 	// Terminate this process: mark it killed and close all its handles, refunding

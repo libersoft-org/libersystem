@@ -281,6 +281,23 @@ pub fn wake_object(koid: u64) {
 	}
 }
 
+// Wake one specific thread if it is currently blocked: remove all its wait-registry
+// entries and enqueue it. A no-op if the thread is not blocked (already running or
+// ready), so it cannot be double-enqueued. Signal delivery calls this for every
+// thread of the target process, so a blocked thread wakes and observes the kill /
+// stop / continue at its next scheduling point.
+pub fn wake_thread(thread: &Arc<Thread>) {
+	let was_blocked = {
+		let mut waiters = WAITERS.lock();
+		let before = waiters.len();
+		waiters.retain(|w: &Waiter| !Arc::ptr_eq(&w.thread, thread));
+		waiters.len() != before
+	};
+	if was_blocked {
+		enqueue(thread.clone());
+	}
+}
+
 // Wake every blocked thread whose deadline has passed (timed out). Called at the
 // scheduler's idle points; with preemption (M19) the timer ISR will also call it.
 pub fn check_deadlines() {

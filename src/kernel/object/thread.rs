@@ -92,7 +92,10 @@ impl Thread {
 	fn build(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Arc<Self> {
 		let mut stack = alloc::vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
 		let sp = arch::context::init_thread_stack(&mut stack, entry, arg);
-		Arc::new(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, started: AtomicBool::new(false), process })
+		let thread = Arc::new(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, started: AtomicBool::new(false), process });
+		// Forward-link the thread to its process so signal delivery can reach it.
+		thread.process.register_thread(&thread);
+		thread
 	}
 
 	pub fn tid(&self) -> u64 {

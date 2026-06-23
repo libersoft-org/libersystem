@@ -44,7 +44,7 @@ use crate::sched;
 // kernel/userspace ABI: defined once in the abi crate (the single source of
 // truth) and re-exported here so the rest of the kernel keeps referring to them
 // as `syscall::SYS_*` / `syscall::ERR_*` / `syscall::sys_is_err`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_INTERRUPT_ACQUIRE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_RANDOM_GET, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD, sys_is_err};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_INTERRUPT_ACQUIRE, SYS_DEVICE_MEMORY_MAP, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_PROCESS_SIGNAL, SYS_RANDOM_GET, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD, sys_is_err};
 
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. Defined in `abi` (the
@@ -157,6 +157,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_OBJECT_PROPERTY_SET => sys_object_property_set(a0, a1, a2, a3),
 		SYS_PROCESS_CREATE => sys_process_create(),
 		SYS_PROCESS_LOAD => sys_process_load(a0, a1, a2),
+		SYS_PROCESS_SIGNAL => sys_process_signal(a0, a1),
 		SYS_THREAD_CREATE => sys_thread_create(a0, a1, a2, a3),
 		SYS_THREAD_START => sys_thread_start(a0),
 		SYS_CONSOLE_ATTACH => sys_console_attach(a0),
@@ -589,6 +590,39 @@ fn sys_thread_start(thread_handle: u64) -> i64 {
 	if sched::thread_start(target) { 0 } else { ERR_INVALID }
 }
 
+// Deliver a signal to a process: the holder of its MANAGE capability requests a
+// default disposition. INT / TERM / KILL terminate the target; STOP suspends it; CONT
+// resumes a suspended one. Each case wakes the target's threads so a blocked thread
+// observes the change at once (a kill exits it, a stop parks it, a continue releases
+// it) rather than waiting on whatever it was blocked on. There are no user-installed
+// handlers in this milestone - only the default dispositions.
+fn sys_process_signal(process_handle: u64, signal: u64) -> i64 {
+	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
+		Ok(p) => p,
+		Err(e) => return e,
+	};
+	match signal {
+		SIG_INT | SIG_TERM | SIG_KILL => {
+			process.terminate();
+			for thread in process.live_threads() {
+				sched::wake_thread(&thread);
+			}
+		}
+		SIG_STOP => {
+			process.set_stopped(true);
+			for thread in process.live_threads() {
+				sched::wake_thread(&thread);
+			}
+		}
+		SIG_CONT => {
+			process.set_stopped(false);
+			sched::wake_object(process.header().koid());
+		}
+		_ => return ERR_INVALID,
+	}
+	0
+}
+
 // Register the calling thread's channel as the kernel's console input sink: the
 // kernel reads serial bytes and sends them on it, and the userspace shell receives
 // them on the peer endpoint. The handle must name a Channel the caller can send on.
@@ -830,8 +864,17 @@ fn sys_wait(handle: u64, deadline: u64) -> i64 {
 	};
 	let koid = object.header().koid();
 	// Condition-variable loop: re-check readiness after each wake, so an early or
-	// spurious wake just re-blocks and a deadline is honored on re-check.
+	// spurious wake just re-blocks and a deadline is honored on re-check. A signal that
+	// arrives while blocked is honoured first: a kill retires the thread, a stop parks it.
 	loop {
+		if thread.process().is_killed() {
+			drop(object);
+			sched::exit();
+		}
+		if thread.process().is_stopped() {
+			sched::block_on(thread.process().header().koid(), sched::NO_DEADLINE);
+			continue;
+		}
 		if object_ready(&object) {
 			return 0;
 		}
@@ -878,6 +921,16 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64) -> i64 {
 	// Condition-variable loop: re-check every object after each wake, blocking on the
 	// whole set until one is ready or the deadline passes.
 	loop {
+		if thread.process().is_killed() {
+			for slot in objects.iter_mut() {
+				slot.take();
+			}
+			sched::exit();
+		}
+		if thread.process().is_stopped() {
+			sched::block_on(thread.process().header().koid(), sched::NO_DEADLINE);
+			continue;
+		}
 		for (i, slot) in objects.iter().enumerate().take(n) {
 			if let Some(object) = slot {
 				if object_ready(object) {

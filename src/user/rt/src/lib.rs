@@ -177,6 +177,33 @@ pub unsafe fn recv_blocking(channel: u64, buf: &mut [u8]) -> Received {
 	}
 }
 
+// A non-blocking receive result: a message, an empty-but-open channel, or a closed
+// one. Lets a poller (e.g. the shell reaping finished background jobs) tell an empty
+// channel from a closed one without blocking.
+pub enum Polled {
+	Message { len: usize, handle: u64 },
+	Empty,
+	Closed,
+}
+
+// Receive one message without blocking: returns Empty immediately if the channel has
+// nothing queued (and the peer is still open), Closed once the peer is gone, else the
+// message. The shell polls a background job's channel this way to detect completion.
+pub unsafe fn try_recv(channel: u64, buf: &mut [u8]) -> Polled {
+	unsafe {
+		let mut handle: u64 = 0;
+		let result: u64 = syscall(SYS_CHANNEL_RECV, channel, buf.as_mut_ptr() as u64, buf.len() as u64, &mut handle as *mut u64 as u64);
+		let signed: i64 = result as i64;
+		if signed == ERR_WOULD_BLOCK {
+			Polled::Empty
+		} else if signed < 0 {
+			Polled::Closed
+		} else {
+			Polled::Message { len: signed as usize, handle }
+		}
+	}
+}
+
 // Send `bytes` (and optionally one transferred handle) to the peer, yielding
 // while the queue is full. Returns true on delivery.
 pub unsafe fn send_blocking(channel: u64, bytes: &[u8], xfer: u64) -> bool {
@@ -581,6 +608,14 @@ pub unsafe fn spawn(elf: &[u8], bootstrap: u64) -> i64 {
 		}
 		process as i64
 	}
+}
+
+// Deliver a signal to a process via its Process handle (which must carry the MANAGE
+// right - `spawn` returns one that does). The kernel applies the default disposition:
+// SIG_INT / SIG_TERM / SIG_KILL terminate it, SIG_STOP suspends it, SIG_CONT resumes a
+// suspended one. Returns 0 on success or a negative error.
+pub unsafe fn signal(process: u64, signal: u64) -> i64 {
+	unsafe { syscall(SYS_PROCESS_SIGNAL, process, signal, 0, 0) as i64 }
 }
 
 // The PKGARCH1 archive reader (`abi::Package`, re-exported above via `pub use

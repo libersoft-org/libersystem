@@ -1902,6 +1902,43 @@ fn wait_any_wakes_on_the_ready_handle() {
 
 #[cfg(test)]
 #[test_case]
+fn signal_terminate_wakes_a_blocked_thread() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	use object::thread::ThreadState;
+	static RAN: AtomicBool = AtomicBool::new(false);
+	static PAST_WAIT: AtomicBool = AtomicBool::new(false);
+	// The victim blocks forever in SYS_WAIT on a channel whose peer is held open, so
+	// nothing wakes it on its own. Delivering the terminate disposition (mark the
+	// process killed + wake its threads, exactly as sys_process_signal(SIG_INT)) must
+	// wake the blocked thread, have it observe the kill at the wait's checkpoint, and
+	// retire it - never running the code past the wait. This proves a signal reaches a
+	// thread blocked on something that would otherwise never become ready.
+	extern "C" fn victim(handle: u64) {
+		unsafe {
+			RAN.store(true, Ordering::SeqCst);
+			arch::syscall::invoke(syscall::SYS_WAIT, handle, 0, 0, 0);
+			PAST_WAIT.store(true, Ordering::SeqCst);
+		}
+	}
+	let (a, b) = object::channel::Channel::create();
+	let _keep = b; // hold the peer so the channel never becomes ready by itself
+	let victim_thread = sched::spawn_with_object(victim, a, object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(RAN.load(Ordering::SeqCst), "the victim ran and blocked");
+	assert!(!PAST_WAIT.load(Ordering::SeqCst), "the victim is blocked in the wait");
+	// The terminate disposition, exactly as sys_process_signal(SIG_INT) applies it.
+	let process = victim_thread.process().clone();
+	process.terminate();
+	for thread in process.live_threads() {
+		sched::wake_thread(&thread);
+	}
+	sched::run_until_idle();
+	assert!(!PAST_WAIT.load(Ordering::SeqCst), "the killed thread must retire at the wait, not resume past it");
+	assert_eq!(victim_thread.state(), ThreadState::Exited, "the victim thread has exited");
+}
+
+#[cfg(test)]
+#[test_case]
 fn channel_endpoint_semantics() {
 	use object::channel::{Channel, ChannelError, Message};
 	let (a, b) = Channel::create();

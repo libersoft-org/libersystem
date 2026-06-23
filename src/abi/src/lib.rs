@@ -73,6 +73,20 @@ pub const SYS_CLOCK_RTC: u64 = 43;
 // Map the boot framebuffer into the caller and report its geometry, handing the
 // display to a userspace ConsoleService (the kernel console stops drawing to it).
 pub const SYS_FRAMEBUFFER_MAP: u64 = 44;
+// Deliver an asynchronous signal to a process (the typed, capability-gated equivalent
+// of POSIX kill): a holder of the process's MANAGE capability requests a default
+// disposition - interrupt / terminate, suspend, or resume.
+pub const SYS_PROCESS_SIGNAL: u64 = 45;
+
+// Signal numbers for SYS_PROCESS_SIGNAL (POSIX-like values, but our own typed set).
+// The kernel applies the default disposition: INT / TERM / KILL terminate the target,
+// STOP suspends it, CONT resumes a suspended one. User-installed handlers are not
+// modelled (no async handler delivery in this milestone).
+pub const SIG_INT: u64 = 2;
+pub const SIG_KILL: u64 = 9;
+pub const SIG_TERM: u64 = 15;
+pub const SIG_CONT: u64 = 18;
+pub const SIG_STOP: u64 = 19;
 
 // The ring-3 stack top an ELF-loaded process runs on: the kernel's loader maps a
 // stack just below this address, and a userspace spawner passes it to

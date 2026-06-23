@@ -15,7 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, config, device, log, network, process, time, volume};
+use proto::system::{config, device, log, network, process, time, volume, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -76,6 +76,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 unsafe fn repl(console: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
 		let mut ed: Editor = Editor::new();
+		let mut jobs: Jobs = Jobs::new(console);
 		loop {
 			let n: usize = match recv_blocking(console, buf) {
 				Received::Message { len, .. } => len,
@@ -85,10 +86,11 @@ unsafe fn repl(console: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u6
 				// Feed each byte to the editor; a true return means the line was
 				// submitted (Enter), so dispatch it, record it in history, and prompt.
 				if ed.feed(buf[i]) {
-					if dispatch(&ed.line[..ed.len], storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, package) {
+					if dispatch(&ed.line[..ed.len], storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, package, &mut jobs) {
 						return;
 					}
 					ed.commit();
+					reap_jobs(&mut jobs);
 					print(b"\x1b[1;32m> \x1b[0m");
 				}
 			}
@@ -373,10 +375,247 @@ impl Editor {
 }
 
 // Dispatch one command line. Returns true if the shell should exit.
-unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package) -> bool {
+// A background or suspended job the shell tracks: the child Process handle (to
+// signal it), the channel the shell learns of its completion on, a display name, a
+// small id, and whether it is currently stopped (suspended by Ctrl+Z).
+struct Job {
+	id: usize,
+	proc: u64,
+	done: u64,
+	name: Vec<u8>,
+	stopped: bool,
+}
+
+// The shell's job-control state: the console channel (watched for Ctrl+C / Ctrl+Z
+// while a foreground job runs), the tracked jobs, and the next id to assign.
+struct Jobs {
+	console: u64,
+	list: Vec<Job>,
+	next_id: usize,
+}
+
+impl Jobs {
+	fn new(console: u64) -> Jobs {
+		Jobs { console, list: Vec::new(), next_id: 1 }
+	}
+}
+
+// Print a usize in decimal.
+unsafe fn print_usize(mut n: usize) {
+	unsafe {
+		if n == 0 {
+			print(b"0");
+			return;
+		}
+		let mut buf: [u8; 20] = [0u8; 20];
+		let mut i: usize = 20;
+		while n > 0 {
+			i -= 1;
+			buf[i] = b'0' + (n % 10) as u8;
+			n /= 10;
+		}
+		print(&buf[i..]);
+	}
+}
+
+// Parse a decimal job id, or None if empty / non-numeric.
+fn parse_usize(s: &[u8]) -> Option<usize> {
+	if s.is_empty() {
+		return None;
+	}
+	let mut v: usize = 0;
+	for &b in s {
+		if !b.is_ascii_digit() {
+			return None;
+		}
+		v = v.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+	}
+	Some(v)
+}
+
+// Resolve a `fg` / `bg` argument to a job-list index: an explicit id, or the most
+// recent job when no id is given.
+fn job_index(jobs: &Jobs, arg: &[u8]) -> Option<usize> {
+	let arg = trim(arg);
+	if arg.is_empty() {
+		return if jobs.list.is_empty() { None } else { Some(jobs.list.len() - 1) };
+	}
+	let id = parse_usize(arg)?;
+	jobs.list.iter().position(|j: &Job| j.id == id)
+}
+
+// Run a foreground job: wait on BOTH its completion channel and the console, so the
+// user can interrupt it (Ctrl+C -> SIG_INT) or suspend it (Ctrl+Z -> SIG_STOP) while
+// it runs. Returns Some(job) when it was suspended (the caller backgrounds it), or
+// None when it finished or was interrupted (its handles are closed here).
+unsafe fn run_foreground(console: u64, job: Job) -> Option<Job> {
+	unsafe {
+		let waits: [u64; 2] = [job.done, console];
+		let mut keys: [u8; 64] = [0u8; 64];
+		loop {
+			let ready: i64 = wait_any(&waits, 0);
+			if ready == 0 {
+				// The job's channel is ready: it sent its completion message or its end
+				// closed on exit. Either way the job is done.
+				close(job.done);
+				close(job.proc);
+				return None;
+			}
+			match recv_blocking(console, &mut keys) {
+				Received::Message { len, .. } => {
+					for i in 0..len {
+						match keys[i] {
+							0x03 => {
+								// Ctrl+C: interrupt. The job terminates; its channel then
+								// closes and the next wait_any catches it.
+								signal(job.proc, SIG_INT);
+								print(b"^C\n");
+							}
+							0x1a => {
+								// Ctrl+Z: suspend the job and hand it back to be backgrounded.
+								signal(job.proc, SIG_STOP);
+								print(b"^Z\n");
+								let mut stopped = job;
+								stopped.stopped = true;
+								return Some(stopped);
+							}
+							_ => {} // a foreground job does not read stdin here; ignore
+						}
+					}
+				}
+				Received::Closed => return None,
+			}
+		}
+	}
+}
+
+// Poll each running (not stopped) job: once its completion channel is no longer empty
+// it has finished, so announce it and drop it. Called before each prompt, the way a
+// shell reports a background job's completion.
+unsafe fn reap_jobs(jobs: &mut Jobs) {
+	unsafe {
+		let mut buf: [u8; 16] = [0u8; 16];
+		let mut i: usize = 0;
+		while i < jobs.list.len() {
+			if jobs.list[i].stopped {
+				i += 1;
+				continue;
+			}
+			match try_recv(jobs.list[i].done, &mut buf) {
+				Polled::Empty => i += 1,
+				_ => {
+					let job = jobs.list.remove(i);
+					print(b"[");
+					print_usize(job.id);
+					print(b"] done   ");
+					print(&job.name);
+					print(b"\n");
+					close(job.done);
+					close(job.proc);
+				}
+			}
+		}
+	}
+}
+
+// `jobs`: list the tracked background / stopped jobs.
+unsafe fn list_jobs(jobs: &Jobs) {
+	unsafe {
+		if jobs.list.is_empty() {
+			print(b"no jobs\n");
+			return;
+		}
+		for job in &jobs.list {
+			print(b"[");
+			print_usize(job.id);
+			print(b"] ");
+			print(if job.stopped { b"stopped  " } else { b"running  " });
+			print(&job.name);
+			print(b"\n");
+		}
+	}
+}
+
+// `fg [id]`: bring a job to the foreground - resume it if stopped (SIG_CONT), then run
+// it foreground again (so it can be interrupted / suspended once more).
+unsafe fn fg_job(jobs: &mut Jobs, arg: &[u8]) {
+	unsafe {
+		let idx: usize = match job_index(jobs, arg) {
+			Some(i) => i,
+			None => {
+				print(b"fg: no such job\n");
+				return;
+			}
+		};
+		let mut job: Job = jobs.list.remove(idx);
+		if job.stopped {
+			signal(job.proc, SIG_CONT);
+			job.stopped = false;
+		}
+		print(&job.name);
+		print(b"\n");
+		if let Some(suspended) = run_foreground(jobs.console, job) {
+			jobs.list.push(suspended);
+		}
+	}
+}
+
+// `bg [id]`: resume a stopped job in the background (SIG_CONT), leaving it tracked.
+unsafe fn bg_job(jobs: &mut Jobs, arg: &[u8]) {
+	unsafe {
+		let idx: usize = match job_index(jobs, arg) {
+			Some(i) => i,
+			None => {
+				print(b"bg: no such job\n");
+				return;
+			}
+		};
+		if !jobs.list[idx].stopped {
+			print(b"bg: job already running\n");
+			return;
+		}
+		signal(jobs.list[idx].proc, SIG_CONT);
+		jobs.list[idx].stopped = false;
+		print(b"[");
+		print_usize(jobs.list[idx].id);
+		print(b"] ");
+		print(&jobs.list[idx].name);
+		print(b" &\n");
+	}
+}
+
+unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
+			return false;
+		}
+		// A trailing `&` runs a spawnable command in the background.
+		let (line, bg): (&[u8], bool) = match line.strip_suffix(b"&") {
+			Some(rest) => (trim(rest), true),
+			None => (line, false),
+		};
+		if line.is_empty() {
+			return false;
+		}
+		if line == b"jobs" {
+			list_jobs(jobs);
+			return false;
+		}
+		if line == b"fg" {
+			fg_job(jobs, b"");
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"fg ") {
+			fg_job(jobs, trim(rest));
+			return false;
+		}
+		if line == b"bg" {
+			bg_job(jobs, b"");
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"bg ") {
+			bg_job(jobs, trim(rest));
 			return false;
 		}
 		if line == b"exit" || line == b"quit" {
@@ -404,6 +643,11 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  arp              show the ARP / neighbor cache\n");
 			print(b"  ss | netstat     list the live sockets\n");
 			print(b"  httpd            serve HTTP on port 80 (background)\n");
+			print(b"  <cmd> &          run a command in the background\n");
+			print(b"  jobs             list background / stopped jobs\n");
+			print(b"  fg [id]          resume a job in the foreground\n");
+			print(b"  bg [id]          resume a stopped job in the background\n");
+			print(b"  Ctrl+C / Ctrl+Z  interrupt / suspend the foreground job\n");
 			print(b"  exit             stop the shell and halt\n");
 			return false;
 		}
@@ -462,47 +706,47 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			return false;
 		}
 		if line == b"ip" || line == b"net" {
-			spawn_net_tool(netsvc, package, b"ip", b"");
+			spawn_net_tool(jobs, netsvc, package, b"ip", b"", bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"ping ") {
-			spawn_net_tool(netsvc, package, b"ping", trim(rest));
+			spawn_net_tool(jobs, netsvc, package, b"ping", trim(rest), bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"nslookup ") {
-			spawn_net_tool(netsvc, package, b"nslookup", trim(rest));
+			spawn_net_tool(jobs, netsvc, package, b"nslookup", trim(rest), bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"host ") {
-			spawn_net_tool(netsvc, package, b"nslookup", trim(rest));
+			spawn_net_tool(jobs, netsvc, package, b"nslookup", trim(rest), bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"tcp ") {
-			spawn_net_tool(netsvc, package, b"tcp", trim(rest));
+			spawn_net_tool(jobs, netsvc, package, b"tcp", trim(rest), bg);
 			return false;
 		}
 		if line == b"arp" {
-			spawn_net_tool(netsvc, package, b"arp", b"");
+			spawn_net_tool(jobs, netsvc, package, b"arp", b"", bg);
 			return false;
 		}
 		if line == b"ss" || line == b"netstat" {
-			spawn_net_tool(netsvc, package, b"ss", b"");
+			spawn_net_tool(jobs, netsvc, package, b"ss", b"", bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"nc ") {
-			spawn_net_tool(netsvc, package, b"nc", trim(rest));
+			spawn_net_tool(jobs, netsvc, package, b"nc", trim(rest), bg);
 			return false;
 		}
 		if line == b"httpd" {
-			spawn_net_tool_bg(netsvc, package, b"httpd");
+			spawn_net_tool(jobs, netsvc, package, b"httpd", b"", true);
 			return false;
 		}
 		if line == b"echo" {
-			exec(package, b"echo", b"", 0);
+			exec(jobs, package, b"echo", b"", 0, bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
-			exec(package, b"echo", trim(rest), 0);
+			exec(jobs, package, b"echo", trim(rest), 0, bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"cat ") {
@@ -528,7 +772,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 // message just before it exits, which we wait on - an exited process is briefly a
 // zombie whose channel has not yet closed, so we cannot rely on the channel closing
 // to detect exit. This is the foreground exec primitive the net tools build on.
-unsafe fn exec(package: &Package, name: &[u8], args: &[u8], cap: u64) {
+unsafe fn exec(jobs: &mut Jobs, package: &Package, name: &[u8], args: &[u8], cap: u64, bg: bool) {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -542,55 +786,36 @@ unsafe fn exec(package: &Package, name: &[u8], args: &[u8], cap: u64) {
 			Some(pair) => pair,
 			None => return,
 		};
-		// `spawn` moves the child end into the new process as its bootstrap handle.
-		if spawn(elf, child) < 0 {
+		// `spawn` moves the child end into the new process as its bootstrap handle and
+		// returns the child Process handle (which carries MANAGE, so the shell can signal
+		// it for job control).
+		let proc: i64 = spawn(elf, child);
+		if proc < 0 {
 			print(name);
 			print(b": could not start\n");
 			close(parent);
 			return;
 		}
-		// Hand the child our console as its stdout (a SEND dup of our console channel),
-		// so the program's output renders on the same terminal; then its arguments (and an
-		// optional inherited capability, e.g. a NetworkService client), then block until it
-		// signals completion.
+		// Hand the child our console as its stdout (a SEND dup of our console channel), then
+		// its arguments + an optional inherited capability (e.g. a NetworkService client).
 		send_stdout(parent);
 		send_blocking(parent, args, cap);
-		let mut done: [u8; 16] = [0u8; 16];
-		match recv_blocking(parent, &mut done) {
-			Received::Message { .. } | Received::Closed => {}
-		}
-		close(parent);
-	}
-}
-
-// Spawn a standalone program `name` as a background child (no wait): hand it `args`
-// and an optional capability over a bootstrap channel, then detach. Unlike `exec`, the
-// shell does not wait for completion - the child runs on its own until it exits (e.g.
-// a background server running until its service channel closes). The child receives
-// its arguments + capability in its first recv before we drop our end.
-unsafe fn exec_bg(package: &Package, name: &[u8], args: &[u8], cap: u64) {
-	unsafe {
-		let elf: &[u8] = match package.lookup(name) {
-			Some(e) => e,
-			None => {
-				print(name);
-				print(b": program not found\n");
-				return;
-			}
-		};
-		let (parent, child): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return,
-		};
-		if spawn(elf, child) < 0 {
+		let id: usize = jobs.next_id;
+		jobs.next_id += 1;
+		let job: Job = Job { id, proc: proc as u64, done: parent, name: name.to_vec(), stopped: false };
+		if bg {
+			// Background: track the job and return to the prompt; its completion is reaped
+			// before a later prompt.
+			print(b"[");
+			print_usize(id);
+			print(b"] ");
 			print(name);
-			print(b": could not start\n");
-			close(parent);
-			return;
+			print(b" &\n");
+			jobs.list.push(job);
+		} else if let Some(suspended) = run_foreground(jobs.console, job) {
+			// Suspended by Ctrl+Z: keep it as a stopped background job.
+			jobs.list.push(suspended);
 		}
-		send_stdout(parent);
-		send_blocking(parent, args, cap);
-		close(parent);
 	}
 }
 
@@ -603,7 +828,11 @@ unsafe fn send_stdout(parent: u64) {
 		let so: u64 = stdout();
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, RIGHT_SEND | RIGHT_TRANSFER);
-			if d > 0 { d as u64 } else { 0 }
+			if d > 0 {
+				d as u64
+			} else {
+				0
+			}
 		} else {
 			0
 		};
@@ -616,7 +845,7 @@ unsafe fn send_stdout(parent: u64) {
 // the tool alongside its arguments. Each tool talks to NetworkService over its own
 // channel rather than sharing the shell's (a shared channel would race), and the
 // shell keeps its own `netsvc`.
-unsafe fn spawn_net_tool(netsvc: u64, package: &Package, name: &[u8], args: &[u8]) {
+unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, package: &Package, name: &[u8], args: &[u8], bg: bool) {
 	unsafe {
 		if netsvc == 0 {
 			print(name);
@@ -632,30 +861,7 @@ unsafe fn spawn_net_tool(netsvc: u64, package: &Package, name: &[u8], args: &[u8
 				return;
 			}
 		};
-		exec(package, name, args, tool_netsvc);
-	}
-}
-
-// Spawn a network tool as a background program (no wait), giving it its OWN
-// NetworkService client channel - like `spawn_net_tool` but detached, for a
-// long-running server (httpd) that should not block the interactive shell.
-unsafe fn spawn_net_tool_bg(netsvc: u64, package: &Package, name: &[u8]) {
-	unsafe {
-		if netsvc == 0 {
-			print(name);
-			print(b": no network interface\n");
-			return;
-		}
-		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
-		let tool_netsvc: u64 = match client.open() {
-			Some(Ok(h)) => h,
-			_ => {
-				print(name);
-				print(b": network service unavailable\n");
-				return;
-			}
-		};
-		exec_bg(package, name, b"", tool_netsvc);
+		exec(jobs, package, name, args, tool_netsvc, bg);
 	}
 }
 
