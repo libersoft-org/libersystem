@@ -178,10 +178,9 @@ fn boot_main() {
 		serial_println!("ERROR: Limine base revision not supported");
 		return;
 	}
-	serial_println!("arch: x86_64 | bootloader: Limine | base revision OK");
-	serial_println!("GDT + IDT installed");
-	serial_println!("memory: {} physical frames free", mem::frame::free_count());
+	serial_println!("arch: {}", arch::NAME);
 	serial_println!("smp: {} of {} cores online", smp::online_count(), smp::cpu_count());
+	serial_println!("memory: {} physical frames free", mem::frame::free_count());
 	serial_println!("boot OK - entering the userspace shell (type 'help', or 'exit' to halt)");
 	boot_userspace_with_recovery();
 	serial_println!("halting");
