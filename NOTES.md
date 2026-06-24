@@ -1,3 +1,5 @@
+- Debug console (just run spice) in shell stopped working
+- just run spice -> run spice - it doesnt show boot log, only >
 - Is copilot compacting conversations?
 - Remove the mess from the console after bootup
 - Remove NOT "committed (user runs ./commit.sh)" from TODO.md

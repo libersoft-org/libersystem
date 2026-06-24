@@ -214,6 +214,25 @@ fn boot_main() {
 	serial_println!("halting");
 }
 
+// Pump the serial UART into the console input and nudge the shell's first prompt.
+// Registered as the scheduler's idle hook (sched::set_idle_hook) so it runs on the
+// BSP's idle spin: a polling driver (virtio-gpu's display-resize timer) keeps the BSP
+// in run_until_idle so it never reaches console_shell_loop's own pump, yet serial
+// input must stay live. The one-shot newline nudges the shell's first prompt once it
+// has attached (the keyboard path nudges the same way on its first key).
+#[cfg(not(test))]
+fn serial_console_pump() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static NUDGED: AtomicBool = AtomicBool::new(false);
+	if !NUDGED.load(Ordering::Relaxed) && console_input::shell_listening() {
+		NUDGED.store(true, Ordering::Relaxed);
+		console_input::feed(b'\n');
+	}
+	if let Some(byte) = arch::serial::read_byte() {
+		console_input::feed(byte);
+	}
+}
+
 // Drive the interactive userspace shell. The boot chain has already started it as
 // its last component and the shell has registered a console channel; this pumps
 // serial keystrokes to it a byte at a time, running the cooperative schedule after
@@ -643,6 +662,11 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, mut spawn: 
 fn boot_userspace_with_recovery() {
 	use alloc::sync::Arc;
 	const MAX_RESTARTS: u32 = 3;
+	// Pump the serial console from the scheduler's idle spin: virtio-gpu polls its
+	// display size on a short repeating timer, so run_until_idle never returns and the
+	// BSP would never reach console_shell_loop to poll the UART. The idle hook keeps
+	// serial input live regardless (the keyboard is interrupt-driven and unaffected).
+	sched::set_idle_hook(serial_console_pump);
 	let (crash_tx, crash_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(crash_tx);
 	let mut kernel_ep: Option<Arc<object::channel::Channel>> = None;
@@ -2388,7 +2412,6 @@ fn init_package_starts_system_manager() {
 #[cfg(test)]
 #[test_case]
 fn pty_hosts_a_program() {
-	use object::KernelObject;
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 

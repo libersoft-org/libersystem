@@ -329,6 +329,28 @@ fn enqueue(thread: Arc<Thread>) {
 	SCHED[current_cpu_id()].inner.lock().run_queue.push_back(thread);
 }
 
+// An optional hook the BSP runs while idle-spinning for the next timed wakeup. It
+// keeps a polled input source (the serial console) responsive even when a driver
+// keeps re-arming a short timer: virtio-gpu polls its display size every ~200ms, so
+// the run queue never stays empty long enough for run_until_idle to return, and
+// without this the BSP would spin here forever and never poll the UART. Set once at
+// boot (a bare fn pointer stored as an integer).
+static IDLE_HOOK: AtomicU64 = AtomicU64::new(0);
+
+// Register the idle hook the BSP runs while spinning for the next deadline.
+pub fn set_idle_hook(hook: fn()) {
+	IDLE_HOOK.store(hook as usize as u64, Ordering::Release);
+}
+
+// Run the registered idle hook, if any.
+fn run_idle_hook() {
+	let raw = IDLE_HOOK.load(Ordering::Acquire);
+	if raw != 0 {
+		let hook: fn() = unsafe { core::mem::transmute::<usize, fn()>(raw as usize) };
+		hook();
+	}
+}
+
 // Run ready threads on the current core until the run queue drains, then return.
 // Used by the bootstrap context to drive cooperative kernel threads to completion.
 // If the queue drains while threads are blocked with a deadline, spin until the
@@ -347,8 +369,12 @@ pub fn run_until_idle() {
 				// a thread in the meantime, so an IRQ-woken driver (e.g. a virtio RX
 				// completion arriving mid-wait) runs promptly instead of being held up
 				// for the whole timeout. The run-queue check drops its lock each pass,
-				// so the ISR that enqueues the woken thread can run between checks.
+				// so the ISR that enqueues the woken thread can run between checks. The
+				// idle hook runs each pass too, so the BSP keeps polling the serial
+				// console even while a driver re-arms a short timer (virtio-gpu's resize
+				// poll), which would otherwise keep this loop busy indefinitely.
 				while arch::apic::ticks() < deadline && SCHED[cpu].inner.lock().run_queue.is_empty() {
+					run_idle_hook();
 					core::hint::spin_loop();
 				}
 				check_deadlines();
