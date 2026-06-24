@@ -1,8 +1,7 @@
 - Debug console (just run spice) in shell stopped working
 - just run spice -> run spice - it doesnt show boot log, only >
-- Is copilot compacting conversations?
 - Remove the mess from the console after bootup
-- Remove NOT "committed (user runs ./commit.sh)" from TODO.md
+- Remove "not committed (user runs ./commit.sh)" from TODO.md
 - Virtio drivers - MSI-X only? Remove the old IRQ?
 - Where are poweroff / reboot commands - different kernel shell?
 - List the available volumes "ls" - change to "lsvol"?
