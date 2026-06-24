@@ -18,7 +18,11 @@
 #![no_std]
 #![no_main]
 
-use proto::system::{Error, OpenOpts, OpenResult, volume};
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use proto::system::{Error, FileInfo, OpenOpts, OpenResult, volume};
 use rt::*;
 
 // the single volume this service serves; the URI's volume component must match
@@ -93,6 +97,20 @@ impl volume::Service for Volume {
 		// as a capability (transferred out-of-band); the length travels in-stream.
 		let handle: u64 = unsafe { make_file_buffer(file) }.ok_or(Error::Again)?;
 		Ok(OpenResult { file: handle, size: file.len() as u64 })
+	}
+
+	// List the files in the volume's archive (each as name + byte length), for `ls`.
+	fn list(&mut self) -> Result<Vec<FileInfo>, Error> {
+		let archive: &[u8] = unsafe { core::slice::from_raw_parts(self.base as *const u8, self.len) };
+		let package = Package::parse(archive).ok_or(Error::NotFound)?;
+		let mut files: Vec<FileInfo> = Vec::new();
+		for index in 0..package.len() {
+			if let Some(name) = package.name(index) {
+				let size: u64 = package.lookup(name).map(|b| b.len()).unwrap_or(0) as u64;
+				files.push(FileInfo { name: String::from_utf8_lossy(name).into_owned(), size });
+			}
+		}
+		Ok(files)
 	}
 }
 

@@ -71,12 +71,19 @@ record open-result {
 	size: u64,
 }
 
+// One file in a volume listing: its name and byte length.
+record file-info {
+	name: string,
+	size: u64,
+}
+
 // The Storage volume contract: resolve a path on a volume and hand back the file's
 // bytes as a shared-buffer capability. `open` returns the capability out-of-band
 // (handle<file>) alongside its length - the M26 capability-return case that
 // exercises the handle<T> wire transfer.
 interface volume {
 	@op(1) open: func(o: open-opts) -> result<open-result, error>;
+	@op(2) list: func() -> result<list<file-info>, error>;
 }
 
 // The class of a discovered device, mirroring the kernel's virtio type codes.

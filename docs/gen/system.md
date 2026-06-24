@@ -70,6 +70,13 @@ An opaque kernel object, transferred as `handle<file>`.
 | `file` | `handle<file>` |
 | `size` | `u64` |
 
+### record `file-info`
+
+| field | type |
+| --- | --- |
+| `name` | `string` |
+| `size` | `u64` |
+
 ### enum `device-kind`
 
 | case | ordinal |
@@ -206,6 +213,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `open` | `open(o: open-opts) -> result<open-result, error>` |
+| 2 | `list` | `list() -> result<list<file-info>, error>` |
 
 ### interface `device`
 

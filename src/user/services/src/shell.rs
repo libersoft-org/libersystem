@@ -438,6 +438,16 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"shell: exiting\n");
 			return true;
 		}
+		if line == b"reboot" {
+			system_power(POWER_REBOOT);
+			print(b"reboot: failed\n");
+			return false;
+		}
+		if line == b"poweroff" || line == b"shutdown" {
+			system_power(POWER_OFF);
+			print(b"poweroff: failed\n");
+			return false;
+		}
 		if line == b"help" {
 			print(b"commands:\n");
 			print(b"  help             show this help\n");
@@ -446,6 +456,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  resize <c> <r>   resize the terminal to c cols x r rows\n");
 			print(b"  echo <text>      print text\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
+			print(b"  ls [vol://vol]   list volumes, or a volume's files via StorageService\n");
 			print(b"  beep [hz] [ms]   play a tone via AudioService\n");
 			print(b"  script [<cmd>]   run a command in a fresh pty-hosted shell and record it\n");
 			print(b"  log [json]       show the system journal via LogService\n");
@@ -470,6 +481,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  Ctrl+C / Ctrl+Z  interrupt / suspend the foreground job\n");
 			print(b"  Ctrl+\\           terminate the foreground job\n");
 			print(b"  Ctrl+D           end input (log out) at an empty prompt\n");
+			print(b"  reboot           reboot the machine\n");
+			print(b"  poweroff         power the machine off\n");
 			print(b"  exit             stop the shell and halt\n");
 			return false;
 		}
@@ -585,6 +598,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
 			exec(jobs, package, b"echo", trim(rest), 0, bg);
+			return false;
+		}
+		if line == b"ls" {
+			ls_cmd(storage, b"");
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"ls ") {
+			ls_cmd(storage, trim(rest));
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"cat ") {
@@ -1087,5 +1108,43 @@ unsafe fn cat(storage: u64, uri: &[u8]) -> bool {
 		unmap_object(result.file);
 		close(result.file);
 		true
+	}
+}
+
+// List the volume set via the StorageService `list` op. With no argument print the
+// volume set; with `vol://<volume>` print that volume's files (name + size). The single
+// phase-1 volume is `system`.
+unsafe fn ls_cmd(storage: u64, arg: &[u8]) {
+	unsafe {
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let files = match client.list() {
+			Some(Ok(f)) => f,
+			_ => {
+				print(b"ls: StorageService unavailable\n");
+				return;
+			}
+		};
+		if arg.is_empty() {
+			print(b"volumes (1):\n  vol://system (");
+			print_usize(files.len());
+			print(b" files)\n");
+			return;
+		}
+		let vol: &[u8] = arg.strip_prefix(b"vol://").unwrap_or(arg);
+		let vol: &[u8] = vol.strip_suffix(b"/").unwrap_or(vol);
+		if vol != b"system" {
+			print(b"ls: unknown volume\n");
+			return;
+		}
+		print(b"vol://system (");
+		print_usize(files.len());
+		print(b" files):\n");
+		for f in &files {
+			print(b"  ");
+			print(f.name.as_bytes());
+			print(b" ");
+			print_usize(f.size as usize);
+			print(b" bytes\n");
+		}
 	}
 }

@@ -8,7 +8,6 @@
 extern crate alloc;
 
 mod arch;
-mod cli;
 mod console;
 mod console_input;
 mod device;
@@ -208,7 +207,6 @@ fn boot_main() {
 	powerbox_demo();
 	pci_demo();
 	ipc_bench();
-	cli::demo();
 	serial_println!("boot OK - entering the userspace shell (type 'help', or 'exit' to halt)");
 	boot_userspace_with_recovery();
 	serial_println!("halting");
@@ -938,11 +936,12 @@ fn pci_demo() {
 }
 
 // Read a file from a vol:// volume by driving the StorageService as the kernel's
-// own client - the path the CLI's `cat` command uses. Spawns the service, hands
+// own client (the kernel storage self-test). Spawns the service, hands
 // it the ramdisk and a service channel, sends one open request plus an empty quit
 // sentinel (so the service exits and the cooperative schedule drains), runs the
 // schedule to completion, then receives the reply and reads the returned shared
 // buffer through the HHDM. Returns the file's bytes, or an error string.
+#[cfg(test)]
 fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
 	use alloc::sync::Arc;
 	use object::KernelObject;
@@ -1013,6 +1012,7 @@ fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
 // Read `len` bytes out of a MemoryObject's frames through the HHDM (the reverse of
 // copy_into_object). The object need not be mapped: its physical frames are read
 // directly.
+#[cfg(test)]
 fn read_from_object(object: &object::memory_object::MemoryObject, len: usize) -> alloc::vec::Vec<u8> {
 	let hhdm = mem::hhdm_offset();
 	let page = mem::frame::PAGE_SIZE as usize;
@@ -2662,11 +2662,11 @@ fn system_graph_reflects_live_state() {
 
 #[cfg(test)]
 #[test_case]
-fn cli_reads_file_through_storage_service() {
-	// The CLI's `cat` path: the kernel drives the StorageService as its own client,
-	// sending one open request and a quit sentinel, then reads the returned shared
-	// buffer. The bytes must equal the file straight from the volume archive - a
-	// command round-tripping to a real userspace service.
+fn kernel_reads_file_through_storage_service() {
+	// The kernel drives the StorageService as its own client, sending one open request
+	// and a quit sentinel, then reads the returned shared buffer. The bytes must equal
+	// the file straight from the volume archive - a round-trip to a real userspace
+	// service.
 	let expected = pkg::Package::parse(volume_package_bytes().expect("the volume package should be present")).and_then(|p| p.lookup(b"hello.txt").map(|b| b.to_vec())).expect("hello.txt should be in the volume");
 	let actual = storage_read(b"vol://system/hello.txt").expect("the storage read should succeed");
 	assert!(!expected.is_empty(), "the volume file should not be empty");

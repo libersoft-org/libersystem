@@ -80,6 +80,13 @@ pub const SYS_PROCESS_SIGNAL: u64 = 45;
 // a per-device LAPIC vector and programs the device's MSI-X table entry 0, so the
 // driver gets its own edge-triggered interrupt instead of sharing a legacy INTx line.
 pub const SYS_DEVICE_MSIX_ACQUIRE: u64 = 46;
+// Reboot or power the machine off (the argument is POWER_REBOOT or POWER_OFF). The
+// machine resets or enters ACPI soft-off; restricting it to an authorized component
+// is a future PermissionManager concern.
+pub const SYS_SYSTEM_POWER: u64 = 47;
+// Actions for SYS_SYSTEM_POWER.
+pub const POWER_REBOOT: u64 = 0;
+pub const POWER_OFF: u64 = 1;
 
 // Signal numbers for SYS_PROCESS_SIGNAL (POSIX-like values, but our own typed set).
 // The kernel applies the default disposition: INT / TERM / KILL terminate the target,

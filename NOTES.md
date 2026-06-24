@@ -3,7 +3,6 @@
 - just run spice -> run spice - it doesnt show boot log, only >
 - Remove the mess from the console after bootup
 - Virtio drivers - MSI-X only? Remove the old IRQ?
-- Where are poweroff / reboot commands - different kernel shell?
 - List the available volumes "ls" - change to "lsvol"?
 - Add CTRL+ALT+DEL for reboot
 - SSH server

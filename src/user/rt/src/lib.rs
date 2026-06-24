@@ -517,6 +517,12 @@ pub unsafe fn device_msix_acquire(index: u64) -> i64 {
 	unsafe { syscall(SYS_DEVICE_MSIX_ACQUIRE, index, 0, 0, 0) as i64 }
 }
 
+// Reboot or power off the machine: `action` is POWER_REBOOT or POWER_OFF. On success
+// the machine resets / powers off and this never returns; a negative error otherwise.
+pub unsafe fn system_power(action: u64) -> i64 {
+	unsafe { syscall(SYS_SYSTEM_POWER, action, 0, 0, 0) as i64 }
+}
+
 // Acknowledge a serviced device interrupt, re-arming its source so the next `wait`
 // on the Interrupt handle blocks until the device interrupts again.
 pub unsafe fn interrupt_ack(handle: u64) {
