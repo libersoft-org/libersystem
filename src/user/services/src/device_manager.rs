@@ -139,18 +139,15 @@ unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], 
 			if !send_blocking(dm_side, &buf[..6 + info_size], cap as u64) {
 				return false;
 			}
-			// the interrupt-driven drivers also need their device's Interrupt capability,
-			// transferred as a second "IRQ" message. virtio-input and virtio-snd take their
-			// own MSI-X vector (per-device, edge-triggered - no INTx sharing); virtio-net
-			// stays on the legacy INTx line. The polling drivers (blk/console/gpu) get none,
-			// so their device IRQs stay masked and never storm. The gpu shares a PCI INTx
-			// line here, so it deliberately polls the display size for resizes rather than
-			// acquiring that shared interrupt (which would storm an unfanned line); see
-			// driver.virtio-gpu.
-			let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_snd";
-			let use_intx: bool = driver_name == b"virtio_net";
-			if use_msix || use_intx {
-				let irq: i64 = if use_msix { device_msix_acquire(i) } else { device_interrupt_acquire(i) };
+			// the interrupt-driven drivers (virtio-input, virtio-net, virtio-snd) also need
+			// their device's Interrupt capability, transferred as a second "IRQ" message.
+			// Each takes its own per-device MSI-X vector (edge-triggered, with no INTx
+			// sharing). The polling drivers (blk/console/gpu) get none, so their device IRQs
+			// stay silent. The gpu takes no interrupt at all - it polls the display size for
+			// resizes rather than acquiring one; see driver.virtio-gpu.
+			let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd";
+			if use_msix {
+				let irq: i64 = device_msix_acquire(i);
 				if irq < 0 {
 					return false;
 				}

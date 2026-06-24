@@ -24,9 +24,6 @@ pub struct DeviceEntry {
 	pub notify_multiplier: u32,
 	pub isr_offset: u32,
 	pub device_offset: u32,
-	// The IOAPIC GSI this device's INTx pin is routed to (0 = no interrupt pin), so a
-	// driver can acquire an Interrupt the kernel routes through the I/O APIC.
-	pub irq: u8,
 	// MSI-X (when present): the config-space offset of the device's MSI-X capability
 	// (0 = none) and the physical address of its MSI-X table. The kernel programs table
 	// entry 0 and enables MSI-X so a driver gets its own per-device edge-triggered
@@ -47,14 +44,12 @@ pub fn init() {
 	let mut table = DEVICES.lock();
 	table.clear();
 	for v in crate::arch::pci::scan_virtio() {
-		// Silence this device's legacy INTx pin by default. A device whose driver does not
-		// acquire its interrupt (blk, console, gpu) must not assert a shared PCI INTx line:
-		// the gpu's configuration-change interrupt in particular shares a line with
-		// virtio-input here, and the kernel does not fan a shared line out to multiple
-		// drivers, so an unacknowledged assertion would storm. sys_device_interrupt_acquire
-		// re-enables the pin for the drivers that do take their interrupt (input, net).
+		// Silence every device's legacy INTx pin: the kernel takes all device interrupts via
+		// per-device MSI-X (input, net, snd) and the remaining drivers poll, so no driver uses
+		// a shared INTx line. Disabling the pins keeps a stray assertion off the (fully masked)
+		// I/O APIC by construction.
 		crate::arch::pci::set_intx_disabled(v.pci.bus, v.pci.dev, v.pci.func, true);
-		table.push(DeviceEntry { virtio_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.offset, irq: v.pci.intx_gsi().unwrap_or(0) as u8, msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func });
+		table.push(DeviceEntry { virtio_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.offset, msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func });
 	}
 }
 

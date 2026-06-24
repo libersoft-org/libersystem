@@ -1,11 +1,10 @@
-// I/O APIC: routes external (device) interrupts to CPU vectors.
+// I/O APIC: external-interrupt controller, kept fully masked.
 //
-// The LAPIC handles a core's local interrupts (the periodic timer, IPIs); external
-// device IRQs instead arrive at the I/O APIC, which we program so each device's GSI
-// is delivered to a vector in the IDT's device-IRQ window (interrupts::IRQ_BASE..).
-// Until a driver acquires its device's interrupt every redirection entry stays
-// masked, so a device can never interrupt a kernel that has not opted in - the same
-// "nothing happens until a capability is handed out" rule the object model follows.
+// Devices deliver their interrupts as per-device MSI-X messages straight to a LAPIC
+// (see arch::interrupts), so the kernel routes nothing through the I/O APIC. We still
+// map it and mask every redirection entry at boot, so a stray legacy INTx line can
+// never reach a CPU - every device interrupt source is either an MSI-X vector or a
+// pin the kernel disables (arch::pci::set_intx_disabled).
 //
 // The MMIO page (Limine's HHDM does not cover it) is mapped uncacheable, like the
 // LAPIC's. A single I/O APIC at the standard PC base covers our QEMU q35 target; a
@@ -29,9 +28,7 @@ const IOWIN: usize = 0x10;
 const REG_VERSION: u32 = 0x01;
 const REG_REDTBL: u32 = 0x10; // GSI n: low dword at REG_REDTBL + 2n, high at +1
 
-// Redirection-entry low-dword bits (delivery = fixed, dest mode = physical are 0).
-const POLARITY_ACTIVE_LOW: u32 = 1 << 13;
-const TRIGGER_LEVEL: u32 = 1 << 15;
+// Redirection-entry low-dword bit we use: every entry is left masked.
 const MASKED: u32 = 1 << 16;
 
 // Virtual base of the mapped MMIO page (0 until init maps it).
@@ -64,38 +61,12 @@ pub fn init() {
 	}
 }
 
-// Mask `gsi`'s redirection entry, leaving its routing intact (used on init and when
-// a driver releases its interrupt, so a gone driver's device cannot storm us).
+// Mask `gsi`'s redirection entry, leaving its routing intact (used at init to silence
+// every entry, since the kernel takes all device interrupts via MSI-X).
 pub fn mask(gsi: u32) {
 	if BASE.load(Ordering::Relaxed) == 0 {
 		return;
 	}
 	let lo = REG_REDTBL + 2 * gsi;
 	write(lo, read(lo) | MASKED);
-}
-
-// Clear `gsi`'s mask bit, re-arming a routed entry (used to ack a serviced IRQ).
-pub fn unmask(gsi: u32) {
-	if BASE.load(Ordering::Relaxed) == 0 {
-		return;
-	}
-	let lo = REG_REDTBL + 2 * gsi;
-	write(lo, read(lo) & !MASKED);
-}
-
-// Route `gsi` to `vector` on the LAPIC `dest`, and unmask it. PCI INTx is level-
-// triggered active-low; an ISA IRQ is edge-triggered active-high (level = false).
-pub fn route(gsi: u32, vector: u8, dest: u8, level_active_low: bool) {
-	if BASE.load(Ordering::Relaxed) == 0 {
-		return;
-	}
-	let lo = REG_REDTBL + 2 * gsi;
-	let mut value = vector as u32;
-	if level_active_low {
-		value |= TRIGGER_LEVEL | POLARITY_ACTIVE_LOW;
-	}
-	// High dword: destination LAPIC id in bits 56..63 (bits 24..31 of the high reg).
-	// Program the high dword (still masked) before the low dword that unmasks it.
-	write(lo + 1, (dest as u32) << 24);
-	write(lo, value);
 }

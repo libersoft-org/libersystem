@@ -33,9 +33,12 @@ const FRAME_MAX: usize = 2048;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
-		// 1. bring the device up and receive our device's Interrupt capability.
-		let device: Virtio = common::bringup(bootstrap);
+		// 1. bring the device up and receive our device's MSI-X Interrupt capability, then
+		//    route this device's interrupts to MSI-X table entry 0 (DeviceManager acquired it
+		//    with device_msix_acquire and the kernel programmed the table + enabled MSI-X).
+		let mut device: Virtio = common::bringup(bootstrap);
 		let irq: u64 = recv_irq(bootstrap);
+		device.set_msix_vector(0);
 		// read the NIC's MAC from device-specific config (our Ethernet source).
 		let mut mac: [u8; 6] = [0u8; 6];
 		for (i, b) in mac.iter_mut().enumerate() {
@@ -85,7 +88,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		macmsg[..3].copy_from_slice(b"MAC");
 		macmsg[3..9].copy_from_slice(&mac);
 		send_blocking(frames, &macmsg, 0);
-		move_frames(irq, frames, &device, &mut rx, &tx, rx_virt, &rx_phys, tx_virt, tx_phys)
+		move_frames(irq, frames, &mut rx, &tx, rx_virt, &rx_phys, tx_virt, tx_phys)
 	}
 }
 
@@ -116,13 +119,13 @@ unsafe fn transmit_frame(tx: &Queue, tx_virt: u64, tx_phys: u64, frame: &[u8]) {
 }
 
 // Move frames between the device and NetworkService, standing on the device IRQ and
-// the service's frame channel at once (wait_any). On an interrupt: deassert the ISR,
-// drain the receive ring (forwarding each frame to the service), then re-post the
-// buffers and re-arm. On a channel message: transmit the frame the service handed
-// back. The channel closing (NetworkService gone) leaves us draining the device
-// alone.
+// the service's frame channel at once (wait_any). On an interrupt: drain the receive
+// ring (forwarding each frame to the service), then re-post the buffers and re-arm
+// (MSI-X is edge-triggered, so there is no ISR line to deassert). On a channel
+// message: transmit the frame the service handed back. The channel closing
+// (NetworkService gone) leaves us draining the device alone.
 #[allow(clippy::too_many_arguments)]
-unsafe fn move_frames(irq: u64, frames: u64, device: &Virtio, rx: &mut Queue, tx: &Queue, rx_virt: u64, rx_phys: &[u64], tx_virt: u64, tx_phys: u64) -> ! {
+unsafe fn move_frames(irq: u64, frames: u64, rx: &mut Queue, tx: &Queue, rx_virt: u64, rx_phys: &[u64], tx_virt: u64, tx_phys: u64) -> ! {
 	unsafe {
 		let mut frame: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
 		let mut service_open: bool = true;
@@ -134,7 +137,6 @@ unsafe fn move_frames(irq: u64, frames: u64, device: &Virtio, rx: &mut Queue, tx
 				0
 			};
 			if ready == 0 {
-				device.isr_ack();
 				while let Some((id, len)) = rx.take_used() {
 					if id < RX_SLOTS && len as u64 > NET_HDR_LEN {
 						let f: &[u8] = core::slice::from_raw_parts((rx_virt + id as u64 * RX_SLOT + NET_HDR_LEN) as *const u8, (len as u64 - NET_HDR_LEN) as usize);

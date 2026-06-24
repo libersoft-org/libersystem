@@ -56,9 +56,8 @@ pub const SYS_DEVICE_INFO: u64 = 35;
 pub const SYS_DEVICE_ACQUIRE: u64 = 36;
 pub const SYS_DMA_BUFFER_MAP: u64 = 37;
 pub const SYS_DMA_BUFFER_PHYS: u64 = 38;
-// Acquire an Interrupt capability for a discovered device's IRQ (the kernel routes
-// its GSI through the I/O APIC), and acknowledge/re-arm a serviced interrupt.
-pub const SYS_DEVICE_INTERRUPT_ACQUIRE: u64 = 39;
+// Acknowledge and re-arm a serviced device interrupt (39 retired: device interrupts
+// are MSI-X now, see SYS_DEVICE_MSIX_ACQUIRE).
 pub const SYS_INTERRUPT_ACK: u64 = 40;
 // Inject one byte into the kernel console input (a userspace input driver feeds the
 // interactive shell the same way the kernel's serial loop does).

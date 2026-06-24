@@ -116,10 +116,6 @@ pub struct PciDevice {
 	pub header_type: u8,
 	// The six 32-bit base address registers (raw; only meaningful for header type 0).
 	pub bars: [u32; 6],
-	// The interrupt line (legacy INTx routing), 0xFF = none.
-	pub irq_line: u8,
-	// The interrupt pin this function drives: 1 = INTA .. 4 = INTD, 0 = none.
-	pub irq_pin: u8,
 }
 
 impl PciDevice {
@@ -133,21 +129,6 @@ impl PciDevice {
 	pub fn virtio_type(&self) -> Option<u16> {
 		if self.is_virtio() && (VIRTIO_MODERN_BASE..VIRTIO_MODERN_BASE + 0x40).contains(&self.device_id) { Some(self.device_id - VIRTIO_MODERN_BASE) } else { None }
 	}
-
-	// The IOAPIC GSI this function's INTx pin is delivered on, or None if it drives no
-	// pin. QEMU's q35 mirrors every PCI INTx onto the ISA-compatible I/O APIC input
-	// whose GSI equals the legacy 8259 IRQ in the PCI Interrupt Line register (0x3C) -
-	// e.g. the NIC's line 11 arrives on GSI 11, the keyboard's line 10 on GSI 10 -
-	// alongside the chipset's PIRQ pins (GSI 16..23). The PIRQ pin would isolate
-	// shared lines better, but its slot->link swizzle is firmware-defined (the ACPI
-	// _PRT), so we route the directly-readable legacy line; parsing the _PRT for real
-	// hardware (where the legacy mirror may be absent under the APIC) is a later phase.
-	pub fn intx_gsi(&self) -> Option<u32> {
-		if self.irq_pin == 0 {
-			return None;
-		}
-		Some(self.irq_line as u32)
-	}
 }
 
 // Read the full identity of one present function.
@@ -158,7 +139,7 @@ fn read_function(bus: u8, dev: u8, func: u8) -> PciDevice {
 	for (i, bar) in bars.iter_mut().enumerate() {
 		*bar = config_read32(bus, dev, func, 0x10 + (i as u16) * 4);
 	}
-	PciDevice { bus, dev, func, vendor: id as u16, device_id: (id >> 16) as u16, prog_if: (class_reg >> 8) as u8, subclass: (class_reg >> 16) as u8, class: (class_reg >> 24) as u8, header_type: config_read8(bus, dev, func, 0x0E), bars, irq_line: config_read8(bus, dev, func, 0x3C), irq_pin: config_read8(bus, dev, func, 0x3D) }
+	PciDevice { bus, dev, func, vendor: id as u16, device_id: (id >> 16) as u16, prog_if: (class_reg >> 8) as u8, subclass: (class_reg >> 16) as u8, class: (class_reg >> 24) as u8, header_type: config_read8(bus, dev, func, 0x0E), bars }
 }
 
 // Enumerate every present function on bus 0. Multi-function devices (header-type

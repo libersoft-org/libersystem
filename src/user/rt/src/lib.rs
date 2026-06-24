@@ -507,20 +507,12 @@ pub unsafe fn device_acquire(index: u64) -> i64 {
 	unsafe { syscall(SYS_DEVICE_ACQUIRE, index, 0, 0, 0) as i64 }
 }
 
-// Acquire an Interrupt capability for device `index`'s IRQ: the kernel routes the
-// device's GSI through the I/O APIC to a CPU vector and binds an Interrupt to it.
-// Returns the Interrupt handle, or a negative error. The driver `wait`s on the
-// handle for its device, then `interrupt_ack`s to re-arm for the next interrupt.
-pub unsafe fn device_interrupt_acquire(index: u64) -> i64 {
-	unsafe { syscall(SYS_DEVICE_INTERRUPT_ACQUIRE, index, 0, 0, 0) as i64 }
-}
-
 // Acquire an MSI-X Interrupt capability for device `index`: the kernel allocates a
 // per-device LAPIC vector, programs the device's MSI-X table entry, and enables
-// MSI-X, so the driver gets its own edge-triggered interrupt instead of a shared
-// INTx line. Returns the Interrupt handle, or a negative error. The driver `wait`s
-// on the handle the same way as device_interrupt_acquire (MSI acks are a no-op, so
-// interrupt_ack stays harmless) and writes its MSI-X vector into the virtio transport.
+// MSI-X, so the driver gets its own edge-triggered interrupt. Returns the Interrupt
+// handle, or a negative error. The driver `wait`s on the handle for its device, then
+// `interrupt_ack`s it (a no-op clear for MSI) and writes its MSI-X vector into the
+// virtio transport (set_msix_vector).
 pub unsafe fn device_msix_acquire(index: u64) -> i64 {
 	unsafe { syscall(SYS_DEVICE_MSIX_ACQUIRE, index, 0, 0, 0) as i64 }
 }
