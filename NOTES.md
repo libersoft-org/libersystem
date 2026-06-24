@@ -1,7 +1,6 @@
-- Debug console (just run spice) in shell stopped working
 - Enhance ping command
+- "exit" command should not halt the machine, but just exits the shell and shows up the parent shell (shell that started this console). If there is no parent, then, then just reload the whole shell
 - just run spice -> run spice - it doesnt show boot log, only >
-- Remove the mess from the console after bootup
 - Virtio drivers - MSI-X only? Remove the old IRQ?
 - List the available volumes "ls" - change to "lsvol"?
 - Add CTRL+ALT+DEL for reboot
@@ -9,5 +8,5 @@
 - Optimize the code
 - Find the dead code
 - Find the duplicate / repetitive code
-- Nicer kernel boot - colourful terminal - is it good idea or not?
+- Nicer OS boot - colours in shell
 - There are "build" / "target" folders in "src", should it be somewhere else (a folder above)?
