@@ -6,18 +6,20 @@
 // across every address space.
 //
 //   lower half (user, per-process page tables)
-//     0x0000_0000_4000_0000  USER_CODE_VA      M8 embedded-demo code page (1 GiB)
-//     0x0000_0000_4001_0000  USER_STACK_VA     M8 embedded-demo stack page
+//     0x0000_0000_4000_0000  USER_CODE_VA      ring-3 test code page (1 GiB)
+//     0x0000_0000_4001_0000  USER_STACK_VA     ring-3 test stack page
 //     0x0000_0000_8000_0000  USER_STACK_TOP    ELF-loaded program's ring-3 stack top (2 GiB)
 //     0x0000_4000_0000_0000  USER_MMAP_BASE    ring-3 syscall-mapped objects (bump up)
 //     0x0000_8000_0000_0000  USER_VA_END       exclusive top of the user half
 //   higher half (kernel, shared across address spaces)
 //     0xffff_e800_0000_0000  KERNEL_MMAP_BASE  kernel syscall-mapped objects (bump up)
 
-// M8 embedded ring-3 demo/test: one page for the program, one for its stack,
-// mapped into the low half of the shared address space (per-process CR3
-// isolation is a later milestone).
+// In-kernel ring-3 test: one page for the program, one for its stack, mapped into
+// the low half of the shared address space (per-process CR3 isolation is a later
+// milestone).
+#[cfg(test)]
 pub(crate) const USER_CODE_VA: u64 = 0x0000_0000_4000_0000;
+#[cfg(test)]
 pub(crate) const USER_STACK_VA: u64 = 0x0000_0000_4001_0000;
 
 // ELF-loaded process ring-3 stack: it lives just below the 2 GiB line (well above

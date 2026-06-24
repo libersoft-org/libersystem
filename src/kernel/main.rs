@@ -180,33 +180,8 @@ fn boot_main() {
 	}
 	serial_println!("arch: x86_64 | bootloader: Limine | base revision OK");
 	serial_println!("GDT + IDT installed");
-	// sanity check the IDT: trigger a breakpoint exception and recover from it
-	unsafe { core::arch::asm!("int3") };
-	serial_println!("recovered from breakpoint exception");
 	serial_println!("memory: {} physical frames free", mem::frame::free_count());
-	let mut numbers = alloc::vec::Vec::new();
-	for i in 0u64..16 {
-		numbers.push(i);
-	}
-	let sum: u64 = numbers.iter().sum();
-	serial_println!("heap: summed {} Vec elements, total {}", numbers.len(), sum);
-	let start = arch::apic::ticks();
-	while arch::apic::ticks() < start + 5 {
-		core::hint::spin_loop();
-	}
-	serial_println!("timer: LAPIC periodic timer counted {} ticks", arch::apic::ticks());
 	serial_println!("smp: {} of {} cores online", smp::online_count(), smp::cpu_count());
-	scheduler_demo();
-	syscall_demo();
-	channel_ipc_demo();
-	userspace_demo();
-	userspace_fault_demo();
-	domain_lifecycle_demo();
-	storage_demo();
-	wasi_demo();
-	powerbox_demo();
-	pci_demo();
-	ipc_bench();
 	serial_println!("boot OK - entering the userspace shell (type 'help', or 'exit' to halt)");
 	boot_userspace_with_recovery();
 	serial_println!("halting");
@@ -285,228 +260,17 @@ fn print_banner(lines: &[&str]) {
 	serial_println!("{}", border);
 }
 
-// Spawn a few cooperative kernel threads on this core and run them to completion,
-// demonstrating that multiple threads multiplex over one core via the scheduler.
-#[cfg(not(test))]
-fn scheduler_demo() {
-	use core::sync::atomic::{AtomicU32, Ordering};
-	static COMPLETED: AtomicU32 = AtomicU32::new(0);
-	extern "C" fn demo_thread(id: u64) {
-		for step in 0..2 {
-			serial_println!("kthread {}: step {}", id, step);
-			sched::yield_now();
-		}
-		COMPLETED.fetch_add(1, Ordering::SeqCst);
-	}
-	for id in 0..3 {
-		sched::spawn(demo_thread, id);
-	}
-	sched::run_until_idle();
-	serial_println!("scheduler: {} kernel threads completed", COMPLETED.load(Ordering::SeqCst));
-}
-
-// Exercise the syscall ABI. The stateless calls run directly from the boot
-// context; the object/handle/mapping calls need a current thread's handle table,
-// so they run inside a spawned kernel thread.
-#[cfg(not(test))]
-fn syscall_demo() {
-	let echo = unsafe { arch::syscall::invoke(syscall::SYS_DEBUG_NOOP, 0xabcd, 0, 0, 0) };
-	serial_println!("syscall: debug_noop echoed {:#x}", echo);
-	let ticks = unsafe { arch::syscall::invoke(syscall::SYS_CLOCK_GET, 0, 0, 0, 0) };
-	serial_println!("syscall: clock_get returned {} ticks", ticks);
-	sched::spawn(syscall_demo_thread, 0);
-	sched::run_until_idle();
-}
-
-#[cfg(not(test))]
-extern "C" fn syscall_demo_thread(_arg: u64) {
-	use object::rights::Rights;
-	unsafe {
-		let handle = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 8192, 0, 0, 0);
-		let virt = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, handle, 0, 0, 0);
-		let ptr = virt as *mut u64;
-		ptr.write_volatile(0x1234_5678);
-		serial_println!("syscall: mapped object at {:#x}, read back {:#x}", virt, ptr.read_volatile());
-		let dup = arch::syscall::invoke(syscall::SYS_HANDLE_DUPLICATE, handle, Rights::READ.bits() as u64, 0, 0);
-		arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, handle, 0, 0, 0);
-		arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle, 0, 0, 0);
-		arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, dup, 0, 0, 0);
-	}
-	serial_println!("syscall: object/handle round-trip done");
-}
-
-// Exercise IPC: two threads, each holding one end of a channel, exchange a
-// message and a capability. The sender stores a marker in a memory object and
-// transfers it; the receiver reads the marker back through its new handle.
-#[cfg(not(test))]
-fn channel_ipc_demo() {
-	let (ep0, ep1) = object::channel::Channel::create();
-	sched::spawn_with_object(ipc_sender, ep0, object::rights::Rights::ALL, 0);
-	sched::spawn_with_object(ipc_receiver, ep1, object::rights::Rights::ALL, 0);
-	sched::run_until_idle();
-}
-
-#[cfg(not(test))]
-extern "C" fn ipc_sender(ch: u64) {
-	unsafe {
-		let mo = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0);
-		let virt = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, mo, 0, 0, 0);
-		(virt as *mut u64).write_volatile(0xcafe_d00d);
-		arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, mo, 0, 0, 0);
-		let payload = *b"ping";
-		let sent = arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, ch, payload.as_ptr() as u64, payload.len() as u64, mo);
-		serial_println!("ipc: sender sent message + capability ({})", sent as i64);
-	}
-}
-
-#[cfg(not(test))]
-extern "C" fn ipc_receiver(ch: u64) {
-	unsafe {
-		let mut buf = [0u8; 16];
-		let mut xfer: u64 = 0;
-		// Non-blocking recv: cooperatively yield and retry until a message arrives.
-		loop {
-			let n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, ch, buf.as_mut_ptr() as u64, buf.len() as u64, &mut xfer as *mut u64 as u64);
-			if !syscall::sys_is_err(n) {
-				let text = core::str::from_utf8(&buf[..n as usize]).unwrap_or("<bad>");
-				let virt = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, xfer, 0, 0, 0);
-				let marker = (virt as *const u64).read_volatile();
-				serial_println!("ipc: receiver got \"{}\" + capability, marker {:#x}", text, marker);
-				arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, xfer, 0, 0, 0);
-				arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, xfer, 0, 0, 0);
-				break;
-			}
-			sched::yield_now();
-		}
-	}
-}
-
-// Phase-0 gate: measure IPC round-trip latency and confirm large-buffer transfer
-// is zero-copy. The concept treats a fast local call as a prerequisite before
-// services are layered on top of IPC, so the numbers are printed at boot.
-#[cfg(not(test))]
-fn ipc_bench() {
-	use object::channel::{Channel, Message};
-	serial_println!("ipc: TSC calibrated at {} MHz", arch::tsc::hz() / 1_000_000);
-
-	// Raw channel primitive: a request/reply round-trip is send + recv + send +
-	// recv. One pre-built message is bounced around the pair, so nothing is
-	// allocated inside the timed loop - this is the IPC data-path floor (lock,
-	// queue push/pop, message move), independent of the scheduler.
-	let (client, server) = Channel::create();
-	let mut msg = Some(Message::new(alloc::vec![0u8; 64], alloc::vec::Vec::new(), 0));
-	let iters: u64 = 200_000;
-	for _ in 0..1_000 {
-		client.send(msg.take().unwrap()).unwrap();
-		let bounced = server.recv().unwrap();
-		server.send(bounced).unwrap();
-		msg = Some(client.recv().unwrap());
-	}
-	let start = arch::tsc::now();
-	for _ in 0..iters {
-		client.send(msg.take().unwrap()).unwrap();
-		let bounced = server.recv().unwrap();
-		server.send(bounced).unwrap();
-		msg = Some(client.recv().unwrap());
-	}
-	report_latency("ipc: raw channel round-trip", arch::tsc::now() - start, iters);
-
-	// The same round-trip through the syscall ABI (entry, handle lookup, the IPC
-	// primitive), then an explicit zero-copy buffer transfer. Both need a current
-	// thread's handle table, so they run inside spawned kernel threads.
-	sched::spawn(ipc_bench_syscall_thread, 0);
-	sched::run_until_idle();
-	sched::spawn(ipc_zero_copy_thread, 0);
-	sched::run_until_idle();
-}
-
-// Print a per-round-trip latency line from a total cycle count.
-#[cfg(not(test))]
-fn report_latency(label: &str, total_cycles: u64, iters: u64) {
-	let per_cycles = total_cycles / iters;
-	let per_ns = arch::tsc::cycles_to_ns(total_cycles) / iters;
-	serial_println!("{}: {} ns / {} cycles per round-trip ({} iters)", label, per_ns, per_cycles, iters);
-}
-
-// Time a request/reply round-trip driven entirely through the syscall ABI. The
-// thread creates a channel pair in its own table, then loops the four calls a
-// real caller would make: client send, server recv, server send, client recv.
-#[cfg(not(test))]
-extern "C" fn ipc_bench_syscall_thread(_arg: u64) {
-	unsafe {
-		let mut client: u64 = 0;
-		let mut server: u64 = 0;
-		let created = arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, &mut client as *mut u64 as u64, &mut server as *mut u64 as u64, 0, 0);
-		if syscall::sys_is_err(created) {
-			serial_println!("ipc: syscall round-trip setup failed ({})", created as i64);
-			return;
-		}
-		let payload = *b"reqreply";
-		let pp = payload.as_ptr() as u64;
-		let pl = payload.len() as u64;
-		let mut buf = [0u8; 16];
-		let bp = buf.as_mut_ptr() as u64;
-		let bl = buf.len() as u64;
-		let mut xfer: u64 = 0;
-		let xp = &mut xfer as *mut u64 as u64;
-		let iters: u64 = 100_000;
-		for _ in 0..1_000 {
-			arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, client, pp, pl, 0);
-			arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, server, bp, bl, xp);
-			arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, server, pp, pl, 0);
-			arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, client, bp, bl, xp);
-		}
-		let start = arch::tsc::now();
-		for _ in 0..iters {
-			arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, client, pp, pl, 0);
-			arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, server, bp, bl, xp);
-			arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, server, pp, pl, 0);
-			arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, client, bp, bl, xp);
-		}
-		report_latency("ipc: syscall round-trip", arch::tsc::now() - start, iters);
-	}
-}
-
-// Demonstrate zero-copy: a large shared buffer is handed to the peer by moving a
-// capability, never by copying its bytes through the channel. Produce a 1 MiB
-// memory object, mark its far end, send the handle with a tiny note, then map it
-// on the receiving endpoint and read the mark back - same physical pages, no copy.
-#[cfg(not(test))]
-extern "C" fn ipc_zero_copy_thread(_arg: u64) {
-	const BUF_LEN: u64 = 0x10_0000; // 1 MiB
-	const MARK: u64 = 0xfeed_face_c0de_d00d;
-	unsafe {
-		let mut client: u64 = 0;
-		let mut server: u64 = 0;
-		if syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, &mut client as *mut u64 as u64, &mut server as *mut u64 as u64, 0, 0)) {
-			return;
-		}
-		let mo = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, BUF_LEN, 0, 0, 0);
-		let virt = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, mo, 0, 0, 0);
-		((virt + BUF_LEN - 8) as *mut u64).write_volatile(MARK);
-		arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, mo, 0, 0, 0);
-		let note = *b"BIG";
-		arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, client, note.as_ptr() as u64, note.len() as u64, mo);
-		let mut buf = [0u8; 8];
-		let mut xfer: u64 = 0;
-		let n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, server, buf.as_mut_ptr() as u64, buf.len() as u64, &mut xfer as *mut u64 as u64);
-		let virt2 = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, xfer, 0, 0, 0);
-		let marker = ((virt2 + BUF_LEN - 8) as *const u64).read_volatile();
-		serial_println!("ipc: zero-copy - moved a {} KiB buffer with a {}-byte message, peer read marker {:#x} at the far end", BUF_LEN / 1024, n, marker);
-		arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, xfer, 0, 0, 0);
-		arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, xfer, 0, 0, 0);
-	}
-}
-
-// Userspace (ring 3) page layout for the demo and test: one USER page for the
-// program, one for its stack, mapped into the low half of the shared address
-// space (per-process page tables / CR3 isolation are a later milestone).
+// Userspace (ring 3) page layout for the test: one USER page for the program,
+// one for its stack, mapped into the low half of the shared address space
+// (per-process page tables / CR3 isolation are a later milestone).
+#[cfg(test)]
 use crate::memlayout::{USER_CODE_VA, USER_STACK_VA};
 
 // Kernel-thread body that runs a ring-3 program. It maps a USER code and stack
 // page, copies the embedded position-independent program in, and drops to ring 3
 // with its bootstrap Channel handle. The program makes a capability-gated channel
 // send and a debug-write, then exits back here, where we tear the mapping down.
+#[cfg(test)]
 extern "C" fn user_thread_body(handle: u64) {
 	use mem::frame::{self, PAGE_SIZE};
 	let code = frame::allocate().expect("user code frame");
@@ -523,20 +287,6 @@ extern "C" fn user_thread_body(handle: u64) {
 	arch::paging::unmap_page(USER_STACK_VA);
 	frame::deallocate(code);
 	frame::deallocate(stack);
-}
-
-// Run the first userspace program: hand it one end of a channel as its bootstrap
-// capability, drop it to ring 3, and read back the message it sends from user
-// mode through the kernel-held peer endpoint.
-#[cfg(not(test))]
-fn userspace_demo() {
-	let (ep0, ep1) = object::channel::Channel::create();
-	sched::spawn_with_object(user_thread_body, ep0, object::rights::Rights::ALL, 0);
-	sched::run_until_idle();
-	match ep1.recv() {
-		Ok(message) => serial_println!("userspace: ring-3 program sent \"{}\" over a channel", core::str::from_utf8(&message.bytes).unwrap_or("<bad>")),
-		Err(_) => serial_println!("userspace: ERROR - no message from ring 3"),
-	}
 }
 
 // The init package bytes, located among the Limine modules by filename. Returns
@@ -716,6 +466,7 @@ fn copy_into_object(object: &alloc::sync::Arc<object::memory_object::MemoryObjec
 
 // Load the volume archive bytes and the parsed init package - the 'static modules
 // every userspace scenario starts from.
+#[cfg(test)]
 fn scenario_packages() -> Result<(&'static [u8], pkg::Package<'static>), &'static str> {
 	let volume = volume_package_bytes().ok_or("volume package module not found")?;
 	let init = init_package_bytes().ok_or("init package module not found")?;
@@ -725,6 +476,7 @@ fn scenario_packages() -> Result<(&'static [u8], pkg::Package<'static>), &'stati
 
 // Look up `name` in the volume archive and return a copy of its bytes - the file a
 // scenario expects the component/client to read back.
+#[cfg(test)]
 fn volume_file(volume: &[u8], name: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
 	pkg::Package::parse(volume).and_then(|p| p.lookup(name).map(|b| b.to_vec())).ok_or("file missing from the volume package")
 }
@@ -732,6 +484,7 @@ fn volume_file(volume: &[u8], name: &[u8]) -> Result<alloc::vec::Vec<u8>, &'stat
 // Send a tagged capability over a bootstrap channel: wrap `object` in a Capability
 // carrying `rights` and send it with `payload` as the message bytes. The shared
 // "hand a process one of its initial capabilities" step the scenarios repeat.
+#[cfg(test)]
 fn send_cap(channel: &object::channel::Channel, payload: &[u8], object: alloc::sync::Arc<dyn object::KernelObject>, rights: object::rights::Rights) -> Result<(), &'static str> {
 	let cap = object::handle::Capability::new(object, rights, 0);
 	channel.send(object::channel::Message::new(payload.to_vec(), alloc::vec![cap], 0)).map_err(|_| "bootstrap capability send failed")
@@ -739,6 +492,7 @@ fn send_cap(channel: &object::channel::Channel, payload: &[u8], object: alloc::s
 
 // Create a ramdisk MemoryObject from `volume`, fill it, and hand it to a service's
 // bootstrap channel as "RAMDISK" + the volume's byte length, with a read+map cap.
+#[cfg(test)]
 fn send_ramdisk(channel: &object::channel::Channel, volume: &[u8]) -> Result<(), &'static str> {
 	use object::rights::Rights;
 	let ramdisk = object::memory_object::MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
@@ -756,8 +510,8 @@ fn send_ramdisk(channel: &object::channel::Channel, volume: &[u8]) -> Result<(),
 // reports the contents back over its bootstrap channel. The kernel only brokers
 // the initial capabilities - the open, the resolve, and the zero-copy read all
 // happen in userspace. Returns (expected, actual): the file straight from the
-// volume archive, and the bytes the client read through the service. Shared by
-// the boot demo and the test.
+// volume archive, and the bytes the client read through the service.
+#[cfg(test)]
 fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
 	use object::channel::Channel;
 	use object::rights::Rights;
@@ -791,32 +545,6 @@ fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), 
 	Ok((expected, result.bytes))
 }
 
-// Report a userspace scenario's outcome on the serial console: on success run
-// `on_ok` with the bytes read; on a byte mismatch or a setup error print a
-// `<label>: ERROR ...` line. The shared shell of the boot-time scenario demos.
-#[cfg(not(test))]
-fn report_scenario(label: &str, result: Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str>, on_ok: impl FnOnce(&[u8])) {
-	match result {
-		Ok((expected, actual)) => {
-			if actual == expected {
-				on_ok(&actual);
-			} else {
-				serial_println!("{}: ERROR - read {} bytes, expected {}", label, actual.len(), expected.len());
-			}
-		}
-		Err(reason) => serial_println!("{}: ERROR - {}", label, reason),
-	}
-}
-
-// Run the M16 storage scenario and report whether the client read the file's
-// bytes through the StorageService intact.
-#[cfg(not(test))]
-fn storage_demo() {
-	report_scenario("storage", run_storage_scenario(), |actual: &[u8]| {
-		serial_println!("storage: client read \"{}\" from vol://system/hello.txt via StorageService", core::str::from_utf8(actual).unwrap_or("<bad>").trim_end());
-	});
-}
-
 // Build the M28 WASI topology and run it to completion. A StorageService serves the
 // ramdisk volume; the wasi_host process loads the embedded Wasm component and runs
 // it, and the component's only import (`liber.read`) is wired by the host to read
@@ -825,6 +553,7 @@ fn storage_demo() {
 // authority. The host reports the bytes the component read back over its bootstrap
 // channel. The kernel only brokers the initial capabilities. Returns (expected,
 // actual): the file straight from the volume, and the bytes the component read.
+#[cfg(test)]
 fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
 	use object::channel::Channel;
 	use object::rights::Rights;
@@ -853,15 +582,6 @@ fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'s
 	Ok((expected, result.bytes))
 }
 
-// Run the M28 WASI scenario and report whether the Wasm component read the granted
-// file's bytes through a host import on StorageService.
-#[cfg(not(test))]
-fn wasi_demo() {
-	report_scenario("wasi", run_wasi_scenario(), |actual: &[u8]| {
-		serial_println!("wasi: component read \"{}\" from vol://system/hello.txt via a host import on StorageService", core::str::from_utf8(actual).unwrap_or("<bad>").trim_end());
-	});
-}
-
 // Build the M29 powerbox topology and run it to completion. A StorageService serves
 // the ramdisk volume; a file_picker holds the trusted storage client and serves the
 // Picker contract; the wasi_host is given ONLY a picker client - no filesystem
@@ -873,6 +593,7 @@ fn wasi_demo() {
 // nothing else. The kernel only brokers the initial capabilities. Returns
 // (expected, actual): the picked file straight from the volume, and what the
 // component read.
+#[cfg(test)]
 fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
 	use object::channel::Channel;
 	use object::rights::Rights;
@@ -906,33 +627,6 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 	sched::run_until_idle();
 	let result = host_boot_kernel.recv().map_err(|_| "the host reported no result")?;
 	Ok((expected, result.bytes))
-}
-
-// Run the M29 powerbox scenario and report whether the component reached exactly the
-// user-picked file through the FilePicker, with no filesystem access of its own.
-#[cfg(not(test))]
-fn powerbox_demo() {
-	report_scenario("powerbox", run_powerbox_scenario(), |actual: &[u8]| {
-		serial_println!("powerbox: component (no filesystem access) read the {}-byte file the user picked (motd.txt) via the FilePicker", actual.len());
-	});
-}
-
-// Scan the PCI bus and report the devices found, flagging the virtio devices the
-// driver milestones will drive. DeviceManager will later do the same enumeration
-// over a syscall and hand each driver its device's capabilities.
-#[cfg(not(test))]
-fn pci_demo() {
-	let devices = arch::pci::scan();
-	serial_println!("pci: {} device(s) on bus 0", devices.len());
-	for d in &devices {
-		match d.virtio_type() {
-			Some(t) => serial_println!("pci: {:02x}:{:02x}.{} virtio-{} (id {:#06x}) bar0 {:#010x}", d.bus, d.dev, d.func, arch::pci::virtio_type_name(t), d.device_id, d.bars[0]),
-			None => serial_println!("pci: {:02x}:{:02x}.{} vendor {:#06x} device {:#06x} class {:#04x}.{:#04x}", d.bus, d.dev, d.func, d.vendor, d.device_id, d.class, d.subclass),
-		}
-	}
-	for v in arch::pci::scan_virtio() {
-		serial_println!("virtio-{}: bar{} phys {:#x} len {:#x} common@{:#x} notify@{:#x}(x{}) isr@{:#x} device@{:#x}", arch::pci::virtio_type_name(v.virtio_type), v.bar, v.bar_phys, v.region_len, v.common.offset, v.notify.offset, v.notify.notify_multiplier, v.isr.offset, v.device.offset);
-	}
 }
 
 // Read a file from a vol:// volume by driving the StorageService as the kernel's
@@ -1029,9 +723,12 @@ fn read_from_object(object: &object::memory_object::MemoryObject, len: usize) ->
 	out
 }
 
-// Statics the fault-probe body records into; read back by the demo and the test.
+// Statics the fault-probe body records into; read back by the fault-isolation test.
+#[cfg(test)]
 static FAULT_GOT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+#[cfg(test)]
 static FAULT_KIND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
 static FAULT_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // Kernel-thread body that drops to ring 3 running the fault-probe program. Before
@@ -1040,6 +737,7 @@ static FAULT_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 // thread is reaped) is what refunds it. The ring-3 program writes to an unmapped
 // address and faults; the kernel records the fault, terminates the process, and
 // longjmps back here, where we read the recorded fault and free the user mapping.
+#[cfg(test)]
 extern "C" fn user_fault_thread_body(_arg: u64) {
 	use core::sync::atomic::Ordering;
 	use mem::frame::{self, PAGE_SIZE};
@@ -1105,57 +803,16 @@ extern "C" fn driver_crash_thread_body(_arg: u64) {
 	frame::deallocate(stack);
 }
 
-// Run the fault-isolation demo: spawn a thread that drops to ring 3 and faults.
-// The kernel must terminate just that process and keep running; report the fault
-// it recorded to show the excursion was caught and cleaned up.
-#[cfg(not(test))]
-fn userspace_fault_demo() {
-	use core::sync::atomic::Ordering;
-	sched::spawn(user_fault_thread_body, 0);
-	sched::run_until_idle();
-	if FAULT_GOT.load(Ordering::SeqCst) == 1 {
-		serial_println!("userspace: caught a ring-3 fault (kind {}, addr {:#x}); process terminated, kernel survived", FAULT_KIND.load(Ordering::SeqCst), FAULT_ADDR.load(Ordering::SeqCst));
-	} else {
-		serial_println!("userspace: ERROR - expected a ring-3 fault but none was recorded");
-	}
-}
-
 // A kernel thread that holds a resource and parks until its Domain is killed. It
 // opens a MemoryObject (charged to its Domain) and then yields forever; once its
 // Domain is killed, it observes the kill at the next yield and exits, releasing
-// the object. Shared by the domain-lifecycle demo and test.
+// the object. Used by the domain-kill test.
+#[cfg(test)]
 extern "C" fn domain_parker(_arg: u64) {
 	let _mo = unsafe { arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, mem::frame::PAGE_SIZE, 0, 0, 0) };
 	loop {
 		sched::yield_now();
 	}
-}
-
-// The killer thread for the domain-lifecycle demo: it is seeded with a handle to
-// a Domain and kills it (and its whole subtree) through the real syscall.
-#[cfg(not(test))]
-extern "C" fn domain_killer(domain_handle: u64) {
-	unsafe {
-		arch::syscall::invoke(syscall::SYS_DOMAIN_KILL, domain_handle, 0, 0, 0);
-	}
-}
-
-// Run the domain-lifecycle demo: build a Domain subtree, run two parked processes
-// under the child that each hold a MemoryObject, then kill the parent. The whole
-// subtree is torn down and every resource refunded - the kernel reclaims a process
-// group by killing its Domain. Report the parent's account to show it returned to
-// zero.
-#[cfg(not(test))]
-fn domain_lifecycle_demo() {
-	use object::domain::Domain;
-	use object::rights::Rights;
-	let parent = Domain::new(1 << 20, 16, 8);
-	let child = Domain::new_child(&parent, 1 << 20, 16, 8);
-	let _ = sched::spawn_in(child.clone(), domain_parker, 0);
-	let _ = sched::spawn_in(child.clone(), domain_parker, 0);
-	sched::spawn_with_object(domain_killer, parent.clone(), Rights::MANAGE, 0);
-	sched::run_until_idle();
-	serial_println!("domain: killed a subtree; parent account reclaimed (memory {}, handles {}, threads {})", parent.account().memory().used(), parent.account().handles().used(), parent.account().threads().used());
 }
 
 // test harness (custom_test_frameworks, runs under `cargo test` in QEMU)
