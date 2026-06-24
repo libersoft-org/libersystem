@@ -201,6 +201,12 @@ unsafe fn feed_event(addr: u64, mods: &mut Mods) {
 		if value != 1 && value != 2 {
 			return;
 		}
+		// Ctrl+Alt+Delete is the reboot chord: a Delete press while both Ctrl and Alt are
+		// held reboots the machine. The keyboard is interrupt-driven, so it fires and
+		// interrupts whatever userspace is doing, even if the shell is wedged.
+		if code == KEY_DELETE && value == 1 && mods.ctrl && mods.alt {
+			system_power(POWER_REBOOT);
+		}
 		// PageUp / PageDown: Shift pages the console's own scrollback (a private control
 		// byte the console intercepts); unshifted sends the standard ANSI sequence to the
 		// client. Collapsing the chord here means the console needs no input escape parser.
