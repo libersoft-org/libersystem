@@ -41,17 +41,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut net_client: u64 = 0;
 		let mut gpu_client: u64 = 0;
 		let mut snd_client: u64 = 0;
-		launch_drivers(&package, &mut buf, &mut block_client, &mut net_client, &mut gpu_client, &mut snd_client);
+		let mut input_client: u64 = 0;
+		launch_drivers(&package, &mut buf, &mut block_client, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client);
 
 		// 3. report in once the devices are bound to drivers, transferring the block
 		//    service channel up the boot chain, then the net driver's control channel, the
-		//    gpu driver's display channel, and the snd driver's control channel in follow-up
-		//    messages (the report itself carries one handle; each `GPU`/`NET`/`SND` handle is
-		//    0 when that device is absent).
+		//    gpu driver's display channel, the snd driver's control channel, and the pointer
+		//    driver's event channel in follow-up messages (the report itself carries one
+		//    handle; each `GPU`/`NET`/`SND`/`INPUT` handle is 0 when that device is absent).
 		send_blocking(bootstrap, b"DeviceManager: online", block_client);
 		send_blocking(bootstrap, b"NET", net_client);
 		send_blocking(bootstrap, b"GPU", gpu_client);
 		send_blocking(bootstrap, b"SND", snd_client);
+		send_blocking(bootstrap, b"INPUT", input_client);
 
 		// 4. stand until ServiceManager asks us to stop (which also drops the driver
 		//    channels, so the drivers shut down with us), then acknowledge and exit.
@@ -67,7 +69,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // each device's state (online once its driver reports in, failed otherwise) and
 // prints a summary. The driver's "online" report is printed; it does not flow up
 // the boot-chain report channel (which carries only the service lifecycle).
-unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64) {
+unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64) {
 	unsafe {
 		let count: u64 = device_count();
 		let mut state: [u8; MAX_DEVICES] = [STATE_UNKNOWN; MAX_DEVICES];
@@ -104,6 +106,12 @@ unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u
 				}
 				if driver_name == b"virtio_snd" {
 					*snd_client = handle;
+				}
+				// The pointer flavour of virtio_input hands up an event channel (non-zero
+				// handle); the keyboard flavour hands up nothing (handle 0), so a non-zero
+				// virtio_input handle is the pointer's INPUT channel for InputService.
+				if driver_name == b"virtio_input" && handle != 0 {
+					*input_client = handle;
 				}
 			}
 			i += 1;

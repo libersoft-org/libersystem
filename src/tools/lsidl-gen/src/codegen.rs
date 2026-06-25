@@ -254,37 +254,46 @@ impl Cg {
 		}
 		self.line("\t}");
 		self.line("");
-		self.line("\tpub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {");
-		self.line("\t\tlet mut reader = Reader::with_handle(request, request_handle);");
-		self.line("\t\tlet r = &mut reader;");
-		self.line("\t\tlet op = r.u16()?;");
-		self.line("\t\tlet corr = r.u32()?;");
-		self.line("\t\tlet mut writer = SliceWriter::new(out);");
-		self.line("\t\tlet w = &mut writer;");
-		self.line("\t\tw.u32(corr)?;");
-		self.line("\t\tmatch op {");
-		for m in &supported {
-			if matches!(&m.ret, Type::Stream(_)) {
-				continue;
+		let has_non_stream: bool = supported.iter().any(|m| !matches!(&m.ret, Type::Stream(_)));
+		if has_non_stream {
+			self.line("\tpub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {");
+			self.line("\t\tlet mut reader = Reader::with_handle(request, request_handle);");
+			self.line("\t\tlet r = &mut reader;");
+			self.line("\t\tlet op = r.u16()?;");
+			self.line("\t\tlet corr = r.u32()?;");
+			self.line("\t\tlet mut writer = SliceWriter::new(out);");
+			self.line("\t\tlet w = &mut writer;");
+			self.line("\t\tw.u32(corr)?;");
+			self.line("\t\tmatch op {");
+			for m in &supported {
+				if matches!(&m.ret, Type::Stream(_)) {
+					continue;
+				}
+				self.line(&format!("\t\t\tOP_{} => {{", screaming(&m.name)));
+				let mut args: Vec<String> = Vec::new();
+				for p in &m.params {
+					let expr = self.read_value(&p.ty).map_err(|e| Error::new(p.span, e))?;
+					let pn = field_ident(&p.name);
+					self.line(&format!("\t\t\t\tlet {pn} = {expr};"));
+					args.push(pn);
+				}
+				self.line(&format!("\t\t\t\tlet result = service.{}({});", field_ident(&m.name), args.join(", ")));
+				let code = self.write_place(&m.ret, "result", false).map_err(|e| Error::new(m.span, e))?;
+				self.line(&format!("\t\t\t\t{code}"));
+				self.line("\t\t\t}");
 			}
-			self.line(&format!("\t\t\tOP_{} => {{", screaming(&m.name)));
-			let mut args: Vec<String> = Vec::new();
-			for p in &m.params {
-				let expr = self.read_value(&p.ty).map_err(|e| Error::new(p.span, e))?;
-				let pn = field_ident(&p.name);
-				self.line(&format!("\t\t\t\tlet {pn} = {expr};"));
-				args.push(pn);
-			}
-			self.line(&format!("\t\t\t\tlet result = service.{}({});", field_ident(&m.name), args.join(", ")));
-			let code = self.write_place(&m.ret, "result", false).map_err(|e| Error::new(m.span, e))?;
-			self.line(&format!("\t\t\t\t{code}"));
-			self.line("\t\t\t}");
+			self.line("\t\t\t_ => return None,");
+			self.line("\t\t}");
+			self.line("\t\t*reply_handle = writer.handle();");
+			self.line("\t\tSome(writer.pos())");
+			self.line("\t}");
+		} else {
+			// Every op is a stream, served out of band by the `<m>_open` helpers, so there
+			// is nothing to dispatch in band - a trivial body avoids an unreachable match.
+			self.line("\tpub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handle: u64, _out: &mut [u8], _reply_handle: &mut u64) -> Option<usize> {");
+			self.line("\t\tNone");
+			self.line("\t}");
 		}
-		self.line("\t\t\t_ => return None,");
-		self.line("\t\t}");
-		self.line("\t\t*reply_handle = writer.handle();");
-		self.line("\t\tSome(writer.pos())");
-		self.line("\t}");
 		self.line("");
 		// stream methods: the wait-drained event stream. The serve loop calls
 		// `<m>_open` to decode the request and run the service, creates a sub-channel,
@@ -780,7 +789,11 @@ fn camel(name: &str) -> String {
 // as a raw identifier if it collides with a keyword.
 fn field_ident(name: &str) -> String {
 	let s = name.replace('-', "_");
-	if is_rust_keyword(&s) { format!("r#{s}") } else { s }
+	if is_rust_keyword(&s) {
+		format!("r#{s}")
+	} else {
+		s
+	}
 }
 
 // Map a kebab-case name to a SCREAMING_SNAKE_CASE constant identifier.

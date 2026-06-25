@@ -194,6 +194,14 @@ An opaque kernel object, transferred as `handle<file>`.
 | --- | --- |
 | `unix-secs` | `u64` |
 
+### record `pointer-event`
+
+| field | type |
+| --- | --- |
+| `col` | `u16` |
+| `row` | `u16` |
+| `buttons` | `u8` |
+
 ## Interfaces
 
 ### interface `log`
@@ -300,4 +308,12 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `beep` | `beep(freq: u16, millis: u32) -> result<unit, error>` |
+
+### interface `input`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `subscribe` | `subscribe() -> stream<pointer-event>` |
 

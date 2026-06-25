@@ -291,6 +291,12 @@ impl Virtio {
 		unsafe { r8(self.device + offset) }
 	}
 
+	// Write one byte of the device-specific config (e.g. a virtio-input select/subsel
+	// pair that chooses which config block the next reads return).
+	pub unsafe fn config_write(&self, offset: u64, value: u8) {
+		unsafe { w8(self.device + offset, value) }
+	}
+
 	// Read (and so acknowledge) the ISR-status register, deasserting the device's
 	// level-triggered INTx line. An interrupt-driven driver must do this each time it
 	// services an interrupt, or the line stays asserted and the IRQ storms.

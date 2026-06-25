@@ -1915,6 +1915,74 @@ fn device_service_lists_devices() {
 
 #[cfg(test)]
 #[test_case]
+fn input_service_streams_pointer_events() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	// Drive the real userspace InputService end to end over its generated Input
+	// bindings: spawn it from the init package, hand it a SERVE channel and an INPUT
+	// raw channel (the one the virtio_input pointer driver would feed), inject a
+	// couple of normalized [x u16][y u16][buttons u8] pointer events the way the
+	// driver does, then SUBSCRIBE and read the mapped text-cell events back off the
+	// stream. The pointer device is interactive-only, so here the test plays the
+	// driver itself by sending raw events on the producer end it keeps.
+	let init = init_package_bytes().expect("init package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = package.lookup(b"input_service").expect("input_service in the init package");
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+	let (raw_producer, raw_consumer) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn InputService");
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	send_cap(&boot_kernel, b"INPUT", raw_consumer, Rights::ALL).expect("input raw bootstrap");
+
+	// Inject two normalized pointer events as the driver would. The grid is COLS = 80
+	// x ROWS = 50 over the 0..0x10000 normalized span, so col = (x * 80) / 0x10000 and
+	// row = (y * 50) / 0x10000. x = y = 0x8000 (half span) lands on col 40 / row 25
+	// with the left button held; the second event is the top-left corner, no buttons.
+	let raw_event = |x: u16, y: u16, buttons: u8| -> Message {
+		let mut bytes = alloc::vec::Vec::new();
+		bytes.extend_from_slice(&x.to_le_bytes());
+		bytes.extend_from_slice(&y.to_le_bytes());
+		bytes.push(buttons);
+		Message::new(bytes, alloc::vec::Vec::new(), 0)
+	};
+	raw_producer.send(raw_event(0x8000, 0x8000, 1)).expect("first pointer event");
+	raw_producer.send(raw_event(0, 0, 0)).expect("second pointer event");
+
+	// SUBSCRIBE: [op = 1 (subscribe) u16][corr u32], no args.
+	let corr: u32 = 7;
+	let mut req = alloc::vec::Vec::new();
+	req.extend_from_slice(&1u16.to_le_bytes());
+	req.extend_from_slice(&corr.to_le_bytes());
+	service_client.send(Message::new(req, alloc::vec::Vec::new(), 0)).expect("subscribe request");
+
+	sched::run_until_idle();
+
+	// the service reports in on its bootstrap channel before it serves
+	let online = boot_kernel.recv().expect("InputService online report");
+	assert_eq!(&online.bytes[..], b"InputService: online", "InputService reports in");
+
+	// the subscribe reply is [corr u32] with the stream consumer transferred out of band
+	let reply = service_client.recv().expect("subscribe reply");
+	assert_eq!(le_u32(&reply.bytes, 0), corr, "subscribe reply echoes the correlation id");
+	let cap = reply.caps.first().expect("the stream consumer is transferred");
+	let consumer = cap.object().into_any_arc().downcast::<Channel>().expect("the consumer is a channel");
+
+	// each event rides its own framed message [seq u32][col u16][row u16][buttons u8];
+	// closing the producer ends the stream, so recv drains to a clean close.
+	let mut events = alloc::vec::Vec::new();
+	while let Ok(frame) = consumer.recv() {
+		let f = &frame.bytes;
+		events.push((le_u16(f, 4), le_u16(f, 6), f[8]));
+	}
+	assert_eq!(events.len(), 2, "both injected pointer events stream back");
+	assert_eq!(events[0], (40, 25, 1), "the half-span event maps to the middle cell with the left button");
+	assert_eq!(events[1], (0, 0, 0), "the corner event maps to column 0, row 0, no buttons");
+}
+
+#[cfg(test)]
+#[test_case]
 fn process_service_starts_a_program() {
 	use object::channel::Message;
 
@@ -2058,7 +2126,7 @@ fn init_package_starts_system_manager() {
 	// exercises the stop path on that service), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 14] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"DeviceManager: online", b"StorageService: online", b"NetworkService: online", b"TimeService: online", b"AudioService: online", b"ConsoleService: online", b"Shell: online", b"DeviceManager: stopped", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 15] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"DeviceManager: online", b"StorageService: online", b"NetworkService: online", b"TimeService: online", b"AudioService: online", b"InputService: online", b"ConsoleService: online", b"Shell: online", b"DeviceManager: stopped", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");

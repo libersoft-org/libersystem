@@ -2481,6 +2481,114 @@ pub mod audio {
 	}
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PointerEvent {
+	pub col: u16,
+	pub row: u16,
+	pub buttons: u8,
+}
+
+impl PointerEvent {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PointerEvent> {
+		PointerEvent::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u16(self.col)?;
+		w.u16(self.row)?;
+		w.u8(self.buttons)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<PointerEvent> {
+		let col = r.u16()?;
+		let row = r.u16()?;
+		let buttons = r.u8()?;
+		Some(PointerEvent { col, row, buttons })
+	}
+}
+
+// interface `input` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod input {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_SUBSCRIBE: u16 = 1;
+
+	pub trait Service {
+		fn subscribe(&mut self) -> Vec<PointerEvent>;
+	}
+
+	pub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handle: u64, _out: &mut [u8], _reply_handle: &mut u64) -> Option<usize> {
+		None
+	}
+
+	pub fn subscribe_open<S: Service>(service: &mut S, request: &[u8]) -> Option<(u32, Vec<PointerEvent>)> {
+		let mut reader = Reader::new(request);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		let items = service.subscribe();
+		Some((corr, items))
+	}
+	pub fn subscribe_frame(seq: u32, item: &PointerEvent, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(seq)?;
+		item.write(w)?;
+		Some(writer.pos())
+	}
+	pub fn subscribe_read(msg: &[u8]) -> Option<PointerEvent> {
+		let mut reader = Reader::new(msg);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		Some(PointerEvent::read(r)?)
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn subscribe(&mut self) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SUBSCRIBE)?;
+			w.u32(corr)?;
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, 0)?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || reply_handle == 0 {
+				return None;
+			}
+			Some(reply_handle)
+		}
+	}
+}
+
 impl Error {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -3418,6 +3526,43 @@ impl Timestamp {
 	}
 }
 
+impl PointerEvent {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"col\":");
+		let _ = write!(out, "{}", self.col);
+		out.push(',');
+		out.push_str("\"row\":");
+		let _ = write!(out, "{}", self.row);
+		out.push(',');
+		out.push_str("\"buttons\":");
+		let _ = write!(out, "{}", self.buttons);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("col=");
+		let _ = write!(out, "{}", self.col);
+		out.push_str(", ");
+		out.push_str("row=");
+		let _ = write!(out, "{}", self.row);
+		out.push_str(", ");
+		out.push_str("buttons=");
+		let _ = write!(out, "{}", self.buttons);
+		out.push('}');
+	}
+}
+
 #[cfg(test)]
 mod compat {
 	use super::*;
@@ -3590,5 +3735,13 @@ mod compat {
 		let golden: &[u8] = &[7, 0, 0, 0, 0, 0, 0, 0];
 		assert_eq!(bytes, golden);
 		assert_eq!(Timestamp::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn pointer_event_wire_is_stable() {
+		let sample = PointerEvent { col: 7, row: 7, buttons: 7 };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[7, 0, 7, 0, 7];
+		assert_eq!(bytes, golden);
+		assert_eq!(PointerEvent::decode(&bytes).unwrap(), sample);
 	}
 }

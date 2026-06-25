@@ -15,7 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, audio, config, device, log, network, process, time, volume};
+use proto::system::{audio, config, device, input, log, network, process, time, volume, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -38,6 +38,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let netsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NET") }.unwrap_or_else(|| exit());
 	let timesvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"TIME") }.unwrap_or_else(|| exit());
 	let audiosvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"AUDIO") }.unwrap_or_else(|| exit());
+	// The InputService client: `mouse` subscribes to its pointer-event stream and prints
+	// the recent text-cell positions (the plumbing echo - no mouse-driven UI yet).
+	let inputsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"INPUT") }.unwrap_or_else(|| exit());
 	// The console channel to ConsoleService: the shell writes its output to it (routed
 	// via stdout) and reads its keystrokes from it. The userspace terminal renders the
 	// output and forwards the input, so the shell talks to the console, not the kernel.
@@ -64,7 +67,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 4. become the interactive console and run the read-eval-print loop.
 	unsafe {
-		repl(console, control, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, &package, &mut buf);
+		repl(console, control, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, &package, &mut buf);
 	}
 	exit();
 }
@@ -74,7 +77,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, package: &Package, buf: &mut [u8]) {
+unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control);
 		loop {
@@ -90,7 +93,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u6
 			// The terminal delivers a whole submitted line (with a trailing newline);
 			// trim it, dispatch it, reap finished jobs, and print the next prompt.
 			let line: &[u8] = trim(&buf[..n]);
-			if dispatch(line, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, package, &mut jobs) {
+			if dispatch(line, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, package, &mut jobs) {
 				return;
 			}
 			reap_jobs(&mut jobs);
@@ -400,7 +403,7 @@ unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -458,6 +461,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  cat <vol://...>  read a file via StorageService\n");
 			print(b"  ls [vol://vol]   list volumes, or a volume's files via StorageService\n");
 			print(b"  beep [hz] [ms]   play a tone via AudioService\n");
+			print(b"  mouse            show recent pointer events via InputService\n");
 			print(b"  script [<cmd>]   run a command in a fresh pty-hosted shell and record it\n");
 			print(b"  log [json]       show the system journal via LogService\n");
 			print(b"  log tail [json]  stream the journal via LogService (sub-channel)\n");
@@ -554,6 +558,10 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		}
 		if let Some(rest) = line.strip_prefix(b"beep ") {
 			beep_cmd(audiosvc, trim(rest));
+			return false;
+		}
+		if line == b"mouse" {
+			mouse_cmd(inputsvc);
 			return false;
 		}
 		if line == b"ip" || line == b"net" {
@@ -695,7 +703,11 @@ unsafe fn send_stdout(parent: u64) {
 		let so: u64 = stdout();
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, RIGHT_SEND | RIGHT_TRANSFER);
-			if d > 0 { d as u64 } else { 0 }
+			if d > 0 {
+				d as u64
+			} else {
+				0
+			}
 		} else {
 			0
 		};
@@ -831,6 +843,46 @@ unsafe fn beep_cmd(audiosvc: u64, args: &[u8]) {
 			Some(Ok(())) => {}
 			Some(Err(_)) => print(b"beep: no audio device\n"),
 			None => print(b"beep: service unavailable\n"),
+		}
+	}
+}
+
+// `mouse`: subscribe to InputService's pointer-event stream and print the recent
+// text-cell positions and button state - the plumbing echo (no mouse-driven UI yet).
+// The stream is a bounded snapshot of the recent events, so it ends on its own; move
+// the pointer in the graphical display first to populate it.
+unsafe fn mouse_cmd(inputsvc: u64) {
+	unsafe {
+		let mut client = input::Client::new(ChannelTransport { chan: inputsvc });
+		let consumer: u64 = match client.subscribe() {
+			Some(handle) => handle,
+			None => {
+				print(b"mouse: service unavailable\n");
+				return;
+			}
+		};
+		let mut buf: [u8; 32] = [0u8; 32];
+		let mut count: usize = 0;
+		loop {
+			match recv_blocking(consumer, &mut buf) {
+				Received::Message { len, .. } => {
+					if let Some(event) = input::subscribe_read(&buf[..len]) {
+						print(b"  (");
+						print_usize(event.col as usize);
+						print(b", ");
+						print_usize(event.row as usize);
+						print(b") buttons=");
+						print_usize(event.buttons as usize);
+						print(b"\n");
+						count += 1;
+					}
+				}
+				Received::Closed => break,
+			}
+		}
+		close(consumer);
+		if count == 0 {
+			print(b"mouse: no pointer events yet (move the pointer in the graphical display)\n");
 		}
 	}
 }

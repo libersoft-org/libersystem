@@ -114,6 +114,13 @@ fi
 # keep that device set deterministic (the test boot exercises only blk/net/console).
 QEMU_ARGS+=(-device virtio-keyboard-pci,disable-legacy=on)
 
+# virtio-input tablet (M36): interactive runs only. An absolute pointer device the
+# same userspace virtio_input driver self-identifies and drives, delivering text-cell
+# pointer/button events to InputService. A tablet (absolute coordinates) maps cleanly
+# to screen cells; left out of the test path with the keyboard to keep that set
+# deterministic (InputService's stream is proven by a kernel test instead).
+QEMU_ARGS+=(-device virtio-tablet-pci,disable-legacy=on)
+
 # virtio-vga (M44): interactive runs only. A virtio-gpu device that also presents a
 # VGA-compatible boot framebuffer, so Limine still renders the boot log while
 # driver.virtio-gpu drives the display (a 2D scanout, and a resize event when the host
