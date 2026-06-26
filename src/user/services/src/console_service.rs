@@ -146,6 +146,63 @@ impl Surface {
 			}
 		}
 	}
+
+	// Shift the framebuffer pixels for grid rows [top, bot] up by n cell-heights. A scroll
+	// then moves the existing pixels in one bulk copy instead of re-blitting every glyph
+	// (the full-frame glyph re-render is the dominant cost of scrolling). The vacated bottom
+	// rows are repainted from the (blanked) grid by the renderer's dirty walk.
+	fn scroll_pixels_up(&self, top: usize, bot: usize, n: usize) {
+		let dy = n * CELL_H;
+		let y_first = top * CELL_H;
+		let y_end = ((bot + 1) * CELL_H).min(self.height);
+		if dy >= y_end.saturating_sub(y_first) {
+			return;
+		}
+		let row_bytes = (self.width * self.bytes_per_pixel).min(self.pitch);
+		unsafe {
+			let base = self.addr as *mut u8;
+			let mut y = y_first;
+			while y + dy < y_end {
+				let dst = base.add(y * self.pitch);
+				let src = base.add((y + dy) * self.pitch);
+				core::ptr::copy_nonoverlapping(src, dst, row_bytes);
+				y += 1;
+			}
+		}
+	}
+
+	// Shift the framebuffer pixels for grid rows [top, bot] down by n cell-heights - the
+	// downward counterpart of scroll_pixels_up (reverse index / insert line).
+	fn scroll_pixels_down(&self, top: usize, bot: usize, n: usize) {
+		let dy = n * CELL_H;
+		let y_first = top * CELL_H;
+		let y_end = ((bot + 1) * CELL_H).min(self.height);
+		if dy >= y_end.saturating_sub(y_first) {
+			return;
+		}
+		let row_bytes = (self.width * self.bytes_per_pixel).min(self.pitch);
+		unsafe {
+			let base = self.addr as *mut u8;
+			let mut y = y_end;
+			while y > y_first + dy {
+				y -= 1;
+				let dst = base.add(y * self.pitch);
+				let src = base.add((y - dy) * self.pitch);
+				core::ptr::copy_nonoverlapping(src, dst, row_bytes);
+			}
+		}
+	}
+}
+
+// A scroll the parser performed on the grid this frame: rows [top, bot] moved by n cells,
+// up (the default) or down. The renderer replays it as one bulk framebuffer pixel copy
+// instead of re-blitting every glyph, then its dirty walk repaints only the vacated rows.
+#[derive(Clone, Copy)]
+struct ScrollOp {
+	top: usize,
+	bot: usize,
+	n: usize,
+	down: bool,
 }
 
 // The grid model (L2): the cell grid (primary + alternate screen), the cursor and its
@@ -201,22 +258,34 @@ struct Screen {
 	sb_head: usize,
 	sb_len: usize,
 	view_offset: usize,
+	// Grid scrolls performed by the parser since the last flush; the renderer replays them
+	// as bulk framebuffer pixel copies, then drains this. (L2 records geometry only - no
+	// pixels.)
+	scrolls: Vec<ScrollOp>,
 }
 
-// The terminal (L3 renderer + display target): a grid model and the pixel surface it draws
-// onto, plus the renderer's own `last_caret` (where the caret was last painted). It resolves
-// the model's logical colours to packed pixels and blits its cells; the model carries no
-// graphics.
-struct Term {
-	screen: Screen,
+// The renderer (L3): the pixel surface it draws onto plus its own `last_caret` (where the
+// caret was last painted). It is a pure consumer of the grid model - it reads the model's
+// changed cells through `Screen`'s snapshot/diff interface (`cell`, `view_cell`,
+// `dirty_take`, `take_scrolls`), resolves their logical colours to packed pixels, blits
+// them, and replays the model's recorded scrolls as bulk pixel copies. It never mutates the
+// grid and holds no terminal state.
+struct FramebufferRenderer {
 	surface: Surface,
 	last_caret: Option<(usize, usize)>,
+}
+
+// The terminal (L2 + L3): the grid model and the renderer that draws it. A thin façade that
+// owns both and wires the model's output to the renderer's framebuffer.
+struct Term {
+	screen: Screen,
+	renderer: FramebufferRenderer,
 }
 
 impl Screen {
 	fn new(cols: usize, rows: usize) -> Screen {
 		let blank = Cell { glyph: b' ', fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
-		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 64], osc_len: 0, tty_raw_req: None, tty_echo_req: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], scrollback: alloc::vec![blank; SCROLLBACK_ROWS * cols], sb_cap: SCROLLBACK_ROWS, sb_head: 0, sb_len: 0, view_offset: 0 }
+		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 64], osc_len: 0, tty_raw_req: None, tty_echo_req: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], scrollback: alloc::vec![blank; SCROLLBACK_ROWS * cols], sb_cap: SCROLLBACK_ROWS, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new() }
 	}
 
 	// The active cell buffer: the alternate screen while it is up, else the primary.
@@ -228,6 +297,11 @@ impl Screen {
 		}
 	}
 
+	// A snapshot of the live cell at (col, row): the renderer's read of the grid model.
+	fn cell(&self, col: usize, row: usize) -> Cell {
+		self.cells()[row * self.cols + col]
+	}
+
 	// A blank cell in the current background (so erase/scroll paint the SGR bg).
 	fn blank(&self) -> Cell {
 		Cell { glyph: b' ', fg: self.fg_color, bg: self.bg_color, bold: self.bold, underline: false, reverse: self.reverse }
@@ -237,6 +311,26 @@ impl Screen {
 		for d in self.dirty.iter_mut() {
 			*d = true;
 		}
+	}
+
+	// Read and clear one cell's dirty mark - the renderer consuming the diff as it paints.
+	fn dirty_take(&mut self, col: usize, row: usize) -> bool {
+		let idx = row * self.cols + col;
+		let was = self.dirty[idx];
+		self.dirty[idx] = false;
+		was
+	}
+
+	// Mark one cell dirty: the renderer flags a cell it must repaint (e.g. to erase a caret).
+	fn set_dirty(&mut self, col: usize, row: usize) {
+		if col < self.cols && row < self.rows {
+			self.dirty[row * self.cols + col] = true;
+		}
+	}
+
+	// Drain the grid scrolls recorded since the last flush (this frame's scroll diff).
+	fn take_scrolls(&mut self) -> Vec<ScrollOp> {
+		core::mem::take(&mut self.scrolls)
 	}
 
 	// Write a cell into the active buffer, marking it dirty only when it changes.
@@ -381,8 +475,9 @@ impl Screen {
 	}
 
 	// Scroll the rows [top, bot] up by n, filling the freed bottom rows with blanks. A pure
-	// grid edit: the whole band is marked dirty and the renderer repaints it on the next
-	// flush (the bulk-pixel-scroll fast path is reintroduced in the L3 renderer in M47d).
+	// grid edit: the cells and their dirty marks shift together, the vacated bottom rows are
+	// marked dirty, and the scroll is recorded so the renderer can move the framebuffer
+	// pixels in one bulk copy (the fast path) instead of re-blitting the whole band.
 	fn region_up(&mut self, top: usize, bot: usize, n: usize) {
 		let n = n.max(1);
 		let cols = self.cols;
@@ -396,14 +491,20 @@ impl Screen {
 				}
 			}
 		}
+		// Shift the dirty marks with the grid so a cell edited earlier this batch but not yet
+		// painted stays dirty at its new row (the bulk pixel copy carries stale pixels there
+		// that the dirty walk then overpaints); the vacated bottom rows become dirty.
 		for row in top..=bot {
+			let src = row + n;
 			for col in 0..cols {
-				self.dirty[row * cols + col] = true;
+				self.dirty[row * cols + col] = if src <= bot { self.dirty[src * cols + col] } else { true };
 			}
 		}
+		self.scrolls.push(ScrollOp { top, bot, n, down: false });
 	}
 
-	// Scroll the rows [top, bot] down by n, filling the freed top rows with blanks.
+	// Scroll the rows [top, bot] down by n, filling the freed top rows with blanks - the
+	// downward counterpart of region_up (reverse index / insert line).
 	fn region_down(&mut self, top: usize, bot: usize, n: usize) {
 		let n = n.max(1);
 		let cols = self.cols;
@@ -416,11 +517,12 @@ impl Screen {
 				}
 			}
 		}
-		for row in top..=bot {
+		for row in (top..=bot).rev() {
 			for col in 0..cols {
-				self.dirty[row * cols + col] = true;
+				self.dirty[row * cols + col] = if row >= top + n { self.dirty[(row - n) * cols + col] } else { true };
 			}
 		}
+		self.scrolls.push(ScrollOp { top, bot, n, down: true });
 	}
 
 	fn scroll_up(&mut self, n: usize) {
@@ -1038,37 +1140,77 @@ impl Term {
 	fn new(addr: u64, fb: &Framebuffer) -> Term {
 		let cols = fb.width as usize / CELL_W;
 		let rows = fb.height as usize / CELL_H;
-		Term { screen: Screen::new(cols, rows), surface: Surface::new(addr, fb), last_caret: None }
+		Term { screen: Screen::new(cols, rows), renderer: FramebufferRenderer::new(addr, fb) }
 	}
 
 	// Reflow the model to fit new_cols x new_rows, clamped to what the physical framebuffer
 	// can show, then clear the now-unused area (only when the grid actually changed). The
 	// local stand-in for a virtio-gpu mode-set (M44).
 	fn resize(&mut self, new_cols: usize, new_rows: usize) {
-		let max_cols = (self.surface.width / CELL_W).max(1);
-		let max_rows = (self.surface.height / CELL_H).max(1);
+		let max_cols = (self.renderer.surface.width / CELL_W).max(1);
+		let max_rows = (self.renderer.surface.height / CELL_H).max(1);
 		if self.screen.resize(new_cols, new_rows, max_cols, max_rows) {
-			self.last_caret = None;
-			self.clear_screen();
+			self.renderer.last_caret = None;
+			self.renderer.clear_screen(&self.screen);
 		}
 	}
 
-	// Fill the whole physical framebuffer with the default background - used when the grid
-	// shrinks so the area now outside it is not left with stale pixels.
-	fn clear_screen(&self) {
-		let bg = self.screen.default_bg;
+	// Paint the model's pending output to the framebuffer (the model's scroll + dirty diff;
+	// see FramebufferRenderer::flush).
+	fn flush(&mut self) {
+		self.renderer.flush(&mut self.screen);
+	}
+
+	// Flash the screen with inverted colours (the visual bell) without touching the grid.
+	fn draw_inverted(&self) {
+		self.renderer.draw_inverted(&self.screen);
+	}
+}
+
+// Follow a caret cell through this frame's grid scrolls so the renderer can erase the
+// pixels the bulk copy carried with it. Returns where the caret's pixels ended up, or None
+// if the scroll pushed them out of their band (the copy overwrote them, nothing to erase).
+fn track_caret(caret: Option<(usize, usize)>, scrolls: &[ScrollOp]) -> Option<(usize, usize)> {
+	let (c, mut r) = caret?;
+	for op in scrolls {
+		if r >= op.top && r <= op.bot {
+			if op.down {
+				if r + op.n <= op.bot {
+					r += op.n;
+				} else {
+					return None;
+				}
+			} else if r >= op.top + op.n {
+				r -= op.n;
+			} else {
+				return None;
+			}
+		}
+	}
+	Some((c, r))
+}
+
+impl FramebufferRenderer {
+	fn new(addr: u64, fb: &Framebuffer) -> FramebufferRenderer {
+		FramebufferRenderer { surface: Surface::new(addr, fb), last_caret: None }
+	}
+
+	// Fill the whole physical framebuffer with the model's default background - used when
+	// the grid shrinks so the area now outside it is not left with stale pixels.
+	fn clear_screen(&self, screen: &Screen) {
+		let bg = screen.default_bg;
 		self.surface.fill(self.surface.pack(bg.0, bg.1, bg.2));
 	}
 
 	// Paint one cell from the grid to the framebuffer.
-	fn draw_cell(&self, col: usize, row: usize) {
-		self.draw_cell_at(col, row, self.screen.cells()[row * self.screen.cols + col]);
+	fn draw_cell(&self, screen: &Screen, col: usize, row: usize) {
+		self.draw_cell_at(screen, col, row, screen.cell(col, row));
 	}
 
 	// Paint a given cell value at (col, row) - used by the live flush (reading the grid)
 	// and the scrollback view flush (reading the scrollback ring).
-	fn draw_cell_at(&self, col: usize, row: usize, cell: Cell) {
-		let (fg, bg) = self.cell_colors(&cell);
+	fn draw_cell_at(&self, screen: &Screen, col: usize, row: usize, cell: Cell) {
+		let (fg, bg) = self.cell_colors(screen, &cell);
 		self.blit_cell(col, row, cell.glyph, fg, bg, cell.underline);
 	}
 
@@ -1100,17 +1242,17 @@ impl Term {
 	// Draw the caret in the current DECSCUSR shape over its cell (the glyph was already
 	// repainted by the dirty flush): a block inverts the cell, an underline paints the
 	// bottom rows, a bar the left columns.
-	fn draw_caret(&self, col: usize, row: usize) {
+	fn draw_caret(&self, screen: &Screen, col: usize, row: usize) {
 		let x0 = col * CELL_W;
 		let y0 = row * CELL_H;
-		match self.screen.cursor_shape {
+		match screen.cursor_shape {
 			CursorShape::Block => {
-				let cell = self.screen.cells()[row * self.screen.cols + col];
-				let (fg, bg) = self.cell_colors(&cell);
+				let cell = screen.cell(col, row);
+				let (fg, bg) = self.cell_colors(screen, &cell);
 				self.blit_cell(col, row, cell.glyph, bg, fg, cell.underline);
 			}
 			CursorShape::Underline => {
-				let fg = self.cell_colors(&self.screen.blank()).0;
+				let fg = self.cell_colors(screen, &screen.blank()).0;
 				for y in (y0 + CELL_H - SCALE)..(y0 + CELL_H) {
 					for x in x0..(x0 + CELL_W) {
 						self.surface.put_pixel(x, y, fg);
@@ -1118,7 +1260,7 @@ impl Term {
 				}
 			}
 			CursorShape::Bar => {
-				let fg = self.cell_colors(&self.screen.blank()).0;
+				let fg = self.cell_colors(screen, &screen.blank()).0;
 				for y in y0..(y0 + CELL_H) {
 					for x in x0..(x0 + SCALE) {
 						self.surface.put_pixel(x, y, fg);
@@ -1128,42 +1270,51 @@ impl Term {
 		}
 	}
 
-	// Push the changed cells to the framebuffer, then draw the caret. Called once per
-	// output batch: many bytes edit the grid, one flush paints it (double buffering).
-	fn flush(&mut self) {
-		if self.screen.view_offset > 0 {
-			self.flush_view();
+	// Push the changed cells to the framebuffer, then draw the caret. Called once per output
+	// batch: many bytes edit the grid, one flush paints it (double buffering). The model's
+	// recorded scrolls are replayed as bulk framebuffer pixel copies first, so a scroll moves
+	// the existing pixels in one go instead of re-blitting every glyph; the dirty walk then
+	// repaints only the vacated rows (and any cells edited this batch).
+	fn flush(&mut self, screen: &mut Screen) {
+		let scrolls = screen.take_scrolls();
+		if screen.view_offset > 0 {
+			self.flush_view(screen);
 			return;
 		}
-		if let Some((c, r)) = self.last_caret {
-			let idx = r * self.screen.cols + c;
-			if idx < self.screen.dirty.len() {
-				self.screen.dirty[idx] = true;
+		// Move the framebuffer pixels for each grid scroll, following the old caret cell
+		// through the same shifts so its smear lands on a cell the dirty walk repaints.
+		let ghost = track_caret(self.last_caret, &scrolls);
+		for op in &scrolls {
+			if op.down {
+				self.surface.scroll_pixels_down(op.top, op.bot, op.n);
+			} else {
+				self.surface.scroll_pixels_up(op.top, op.bot, op.n);
 			}
 		}
-		for row in 0..self.screen.rows {
-			for col in 0..self.screen.cols {
-				let idx = row * self.screen.cols + col;
-				if self.screen.dirty[idx] {
-					self.draw_cell(col, row);
-					self.screen.dirty[idx] = false;
+		if let Some((c, r)) = ghost {
+			screen.set_dirty(c, r);
+		}
+		for row in 0..screen.rows {
+			for col in 0..screen.cols {
+				if screen.dirty_take(col, row) {
+					self.draw_cell(screen, col, row);
 				}
 			}
 		}
-		if self.screen.cursor_visible && self.screen.col < self.screen.cols && self.screen.row < self.screen.rows {
-			self.draw_caret(self.screen.col, self.screen.row);
-			self.last_caret = Some((self.screen.col, self.screen.row));
+		if screen.cursor_visible && screen.col < screen.cols && screen.row < screen.rows {
+			self.draw_caret(screen, screen.col, screen.row);
+			self.last_caret = Some((screen.col, screen.row));
 		} else {
 			self.last_caret = None;
 		}
 	}
 
 	// Repaint the whole screen from the scrollback view (no caret while scrolled back).
-	fn flush_view(&mut self) {
-		for row in 0..self.screen.rows {
-			for col in 0..self.screen.cols {
-				let cell = self.screen.view_cell(col, row);
-				self.draw_cell_at(col, row, cell);
+	fn flush_view(&mut self, screen: &Screen) {
+		for row in 0..screen.rows {
+			for col in 0..screen.cols {
+				let cell = screen.view_cell(col, row);
+				self.draw_cell_at(screen, col, row, cell);
 			}
 		}
 		self.last_caret = None;
@@ -1172,9 +1323,9 @@ impl Term {
 	// Resolve a cell's logical colours to packed (fg, bg) framebuffer pixels: bold brightens
 	// the ANSI base (0-7 -> 8-15), then reverse swaps fg and bg. This is the L2->L3 colour
 	// fold done at draw time (it used to be baked into the cell by `recompute_colors`).
-	fn cell_colors(&self, c: &Cell) -> (u32, u32) {
-		let fg = self.resolve(c.fg, self.screen.default_fg, c.bold);
-		let bg = self.resolve(c.bg, self.screen.default_bg, c.bold);
+	fn cell_colors(&self, screen: &Screen, c: &Cell) -> (u32, u32) {
+		let fg = self.resolve(screen, c.fg, screen.default_fg, c.bold);
+		let bg = self.resolve(screen, c.bg, screen.default_bg, c.bold);
 		if c.reverse {
 			(bg, fg)
 		} else {
@@ -1184,21 +1335,21 @@ impl Term {
 
 	// Resolve an SGR colour to a packed framebuffer pixel, using `default` for the
 	// terminal default colour; `bold` brightens the ANSI base palette.
-	fn resolve(&self, c: Color, default: (u8, u8, u8), bold: bool) -> u32 {
+	fn resolve(&self, screen: &Screen, c: Color, default: (u8, u8, u8), bold: bool) -> u32 {
 		match c {
 			Color::Default => self.surface.pack(default.0, default.1, default.2),
-			Color::Idx(i) => self.indexed(i, bold),
+			Color::Idx(i) => self.indexed(screen, i, bold),
 			Color::Rgb(r, g, b) => self.surface.pack(r, g, b),
 		}
 	}
 
 	// The xterm 256-colour palette: 0-15 the ANSI base (bold brightens 0-7), 16-231 a
 	// 6x6x6 RGB cube, and 232-255 a 24-step grayscale ramp.
-	fn indexed(&self, i: u8, bold: bool) -> u32 {
+	fn indexed(&self, screen: &Screen, i: u8, bold: bool) -> u32 {
 		match i {
 			0..=15 => {
 				let idx = if bold && i < 8 { i + 8 } else { i };
-				let (r, g, b) = self.screen.palette[idx as usize];
+				let (r, g, b) = screen.palette[idx as usize];
 				self.surface.pack(r, g, b)
 			}
 			16..=231 => {
@@ -1221,11 +1372,11 @@ impl Term {
 
 	// Paint the whole screen with every cell's colours swapped - the visual bell flash -
 	// without touching the grid, so a following mark_all_dirty + flush restores it.
-	fn draw_inverted(&self) {
-		for row in 0..self.screen.rows {
-			for col in 0..self.screen.cols {
-				let c = self.screen.cells()[row * self.screen.cols + col];
-				let (fg, bg) = self.cell_colors(&c);
+	fn draw_inverted(&self, screen: &Screen) {
+		for row in 0..screen.rows {
+			for col in 0..screen.cols {
+				let c = screen.cell(col, row);
+				let (fg, bg) = self.cell_colors(screen, &c);
 				self.blit_cell(col, row, c.glyph, bg, fg, c.underline);
 			}
 		}

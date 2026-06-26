@@ -743,7 +743,7 @@ wrap flag. Each sub-step must build and keep the test harness green (66 [ok]).
       ANSI/CSI/OSC parser, cursor, SGR attributes, scrollback) now that the grid is pixel-free;
       `Term` becomes `Screen` + the renderer. Done when: green, behaviour identical, no pixel
       field on `Screen`.
-- [ ] M47d - Carve the L3 renderer out as a separate consumer: all glyph/geometry draw code
+- [x] M47d - Carve the L3 renderer out as a separate consumer: all glyph/geometry draw code
       (`draw_cell`, `draw_caret`, `flush`, the dirty walk) moves into a `FramebufferRenderer`
       that reads the `Screen`'s dirty cells through a clean diff/snapshot interface. Done when:
       green, behaviour identical.
