@@ -735,7 +735,7 @@ wrap flag. Each sub-step must build and keep the test harness green (66 [ok]).
       `Term` holds a `surface` and delegates every pixel write. The only code that touches
       pixels and the framebuffer address now lives in one place (the L3-below display target).
       Done when: build + tests green, the console behaves identically.
-- [ ] M47b - Make the grid model graphics-free: `Cell` stores logical colour (a `Color` fg/bg
+- [x] M47b - Make the grid model graphics-free: `Cell` stores logical colour (a `Color` fg/bg
       + bold/underline/reverse) instead of packed framebuffer pixels; colour resolution
       (`palette`/`pack`/`resolve`/`indexed`) moves to draw time in the renderer. Removes the
       last pixel dependency from the cell grid. Done when: green, behaviour identical.

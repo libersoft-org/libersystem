@@ -62,9 +62,11 @@ const ANSI_PALETTE: [(u8, u8, u8); 16] = [
 #[derive(Clone, Copy, PartialEq)]
 struct Cell {
 	glyph: u8,
-	fg: u32,
-	bg: u32,
+	fg: Color,
+	bg: Color,
+	bold: bool,
 	underline: bool,
+	reverse: bool,
 }
 
 // An SGR colour: the terminal default, a palette index (0-15 the ANSI base, 16-255 the
@@ -208,9 +210,6 @@ struct Term {
 	fg: u32,
 	bg: u32,
 	palette: [u32; 16],
-	cur_fg: u32,
-	cur_bg: u32,
-	cur_underline: bool,
 	fg_color: Color,
 	bg_color: Color,
 	bold: bool,
@@ -253,15 +252,13 @@ impl Term {
 	fn new(addr: u64, fb: &Framebuffer) -> Term {
 		let cols = fb.width as usize / CELL_W;
 		let rows = fb.height as usize / CELL_H;
-		let mut t = Term { surface: Surface::new(addr, fb), cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), fg: 0, bg: 0, palette: [0; 16], cur_fg: 0, cur_bg: 0, cur_underline: false, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 64], osc_len: 0, tty_raw_req: None, tty_echo_req: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: Vec::new(), alt: Vec::new(), alt_active: false, dirty: Vec::new(), last_caret: None, scrollback: Vec::new(), sb_cap: 0, sb_head: 0, sb_len: 0, view_offset: 0 };
+		let mut t = Term { surface: Surface::new(addr, fb), cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), fg: 0, bg: 0, palette: [0; 16], fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 64], osc_len: 0, tty_raw_req: None, tty_echo_req: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: Vec::new(), alt: Vec::new(), alt_active: false, dirty: Vec::new(), last_caret: None, scrollback: Vec::new(), sb_cap: 0, sb_head: 0, sb_len: 0, view_offset: 0 };
 		t.fg = t.surface.pack(FG.0, FG.1, FG.2);
 		t.bg = t.surface.pack(BG.0, BG.1, BG.2);
 		for (i, &(r, g, b)) in ANSI_PALETTE.iter().enumerate() {
 			t.palette[i] = t.surface.pack(r, g, b);
 		}
-		t.cur_fg = t.fg;
-		t.cur_bg = t.bg;
-		let blank = Cell { glyph: b' ', fg: t.fg, bg: t.bg, underline: false };
+		let blank = Cell { glyph: b' ', fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
 		t.primary = alloc::vec![blank; cols * rows];
 		t.alt = alloc::vec![blank; cols * rows];
 		t.dirty = alloc::vec![true; cols * rows];
@@ -281,7 +278,7 @@ impl Term {
 
 	// A blank cell in the current background (so erase/scroll paint the SGR bg).
 	fn blank(&self) -> Cell {
-		Cell { glyph: b' ', fg: self.cur_fg, bg: self.cur_bg, underline: false }
+		Cell { glyph: b' ', fg: self.fg_color, bg: self.bg_color, bold: self.bold, underline: false, reverse: self.reverse }
 	}
 
 	fn mark_all_dirty(&mut self) {
@@ -337,7 +334,7 @@ impl Term {
 		if new_cols == self.cols && new_rows == self.rows {
 			return;
 		}
-		let blank = Cell { glyph: b' ', fg: self.fg, bg: self.bg, underline: false };
+		let blank = Cell { glyph: b' ', fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
 		let mut new_primary = alloc::vec![blank; new_cols * new_rows];
 		let copy_rows = self.rows.min(new_rows);
 		let copy_cols = self.cols.min(new_cols);
@@ -385,13 +382,19 @@ impl Term {
 	// Paint a given cell value at (col, row) - used by the live flush (reading the grid)
 	// and the scrollback view flush (reading the scrollback ring).
 	fn draw_cell_at(&self, col: usize, row: usize, cell: Cell) {
-		let base = (cell.glyph as usize) * FONT_H;
+		let (fg, bg) = self.cell_colors(&cell);
+		self.blit_cell(col, row, cell.glyph, fg, bg, cell.underline);
+	}
+
+	// Blit one glyph cell to the framebuffer in already-resolved colours.
+	fn blit_cell(&self, col: usize, row: usize, glyph: u8, fg: u32, bg: u32, underline: bool) {
+		let base = (glyph as usize) * FONT_H;
 		let x0 = col * CELL_W;
 		let y0 = row * CELL_H;
 		for gy in 0..FONT_H {
 			let bits = FONT[base + gy];
 			for gx in 0..FONT_W {
-				let color = if bits & (1 << gx) != 0 { cell.fg } else { cell.bg };
+				let color = if bits & (1 << gx) != 0 { fg } else { bg };
 				for sy in 0..SCALE {
 					for sx in 0..SCALE {
 						self.surface.put_pixel(x0 + gx * SCALE + sx, y0 + gy * SCALE + sy, color);
@@ -399,10 +402,10 @@ impl Term {
 				}
 			}
 		}
-		if cell.underline {
+		if underline {
 			for y in (y0 + CELL_H - SCALE)..(y0 + CELL_H) {
 				for x in x0..(x0 + CELL_W) {
-					self.surface.put_pixel(x, y, cell.fg);
+					self.surface.put_pixel(x, y, fg);
 				}
 			}
 		}
@@ -417,20 +420,22 @@ impl Term {
 		match self.cursor_shape {
 			CursorShape::Block => {
 				let cell = self.cells()[row * self.cols + col];
-				let inv = Cell { glyph: cell.glyph, fg: cell.bg, bg: cell.fg, underline: cell.underline };
-				self.draw_cell_at(col, row, inv);
+				let (fg, bg) = self.cell_colors(&cell);
+				self.blit_cell(col, row, cell.glyph, bg, fg, cell.underline);
 			}
 			CursorShape::Underline => {
+				let fg = self.cell_colors(&self.blank()).0;
 				for y in (y0 + CELL_H - SCALE)..(y0 + CELL_H) {
 					for x in x0..(x0 + CELL_W) {
-						self.surface.put_pixel(x, y, self.cur_fg);
+						self.surface.put_pixel(x, y, fg);
 					}
 				}
 			}
 			CursorShape::Bar => {
+				let fg = self.cell_colors(&self.blank()).0;
 				for y in y0..(y0 + CELL_H) {
 					for x in x0..(x0 + SCALE) {
-						self.surface.put_pixel(x, y, self.cur_fg);
+						self.surface.put_pixel(x, y, fg);
 					}
 				}
 			}
@@ -663,7 +668,7 @@ impl Term {
 			self.col = 0;
 			self.line_feed();
 		}
-		let cell = Cell { glyph, fg: self.cur_fg, bg: self.cur_bg, underline: self.cur_underline };
+		let cell = Cell { glyph, fg: self.fg_color, bg: self.bg_color, bold: self.bold, underline: self.underline, reverse: self.reverse };
 		self.set_cell(self.col, self.row, cell);
 		self.col += 1;
 	}
@@ -1041,7 +1046,6 @@ impl Term {
 		self.bold = self.saved_bold;
 		self.underline = self.saved_underline;
 		self.reverse = self.saved_reverse;
-		self.recompute_colors();
 	}
 
 	// DEC private mode set/reset (CSI ? ... h/l): cursor visibility + alternate screen.
@@ -1105,7 +1109,6 @@ impl Term {
 		self.view_offset = 0;
 		self.sb_head = 0;
 		self.sb_len = 0;
-		self.recompute_colors();
 		self.clear();
 	}
 
@@ -1149,7 +1152,6 @@ impl Term {
 			}
 			i += 1;
 		}
-		self.recompute_colors();
 	}
 
 	// Parse an extended-colour selector starting at param `i` (the 38 or 48): the
@@ -1168,35 +1170,35 @@ impl Term {
 		}
 	}
 
-	fn recompute_colors(&mut self) {
-		let fg = self.resolve(self.fg_color, self.fg);
-		let bg = self.resolve(self.bg_color, self.bg);
-		if self.reverse {
-			self.cur_fg = bg;
-			self.cur_bg = fg;
+	// Resolve a cell's logical colours to packed (fg, bg) framebuffer pixels: bold brightens
+	// the ANSI base (0-7 -> 8-15), then reverse swaps fg and bg. This is the L2->L3 colour
+	// fold done at draw time (it used to be baked into the cell by `recompute_colors`).
+	fn cell_colors(&self, c: &Cell) -> (u32, u32) {
+		let fg = self.resolve(c.fg, self.fg, c.bold);
+		let bg = self.resolve(c.bg, self.bg, c.bold);
+		if c.reverse {
+			(bg, fg)
 		} else {
-			self.cur_fg = fg;
-			self.cur_bg = bg;
+			(fg, bg)
 		}
-		self.cur_underline = self.underline;
 	}
 
 	// Resolve an SGR colour to a packed framebuffer pixel, using `default` for the
-	// terminal default colour.
-	fn resolve(&self, c: Color, default: u32) -> u32 {
+	// terminal default colour; `bold` brightens the ANSI base palette.
+	fn resolve(&self, c: Color, default: u32, bold: bool) -> u32 {
 		match c {
 			Color::Default => default,
-			Color::Idx(i) => self.indexed(i),
+			Color::Idx(i) => self.indexed(i, bold),
 			Color::Rgb(r, g, b) => self.surface.pack(r, g, b),
 		}
 	}
 
 	// The xterm 256-colour palette: 0-15 the ANSI base (bold brightens 0-7), 16-231 a
 	// 6x6x6 RGB cube, and 232-255 a 24-step grayscale ramp.
-	fn indexed(&self, i: u8) -> u32 {
+	fn indexed(&self, i: u8, bold: bool) -> u32 {
 		match i {
 			0..=15 => {
-				let idx = if self.bold && i < 8 { i + 8 } else { i };
+				let idx = if bold && i < 8 { i + 8 } else { i };
 				self.palette[idx as usize]
 			}
 			16..=231 => {
@@ -1247,8 +1249,8 @@ impl Term {
 		for row in 0..self.rows {
 			for col in 0..self.cols {
 				let c = self.cells()[row * self.cols + col];
-				let inv = Cell { glyph: c.glyph, fg: c.bg, bg: c.fg, underline: c.underline };
-				self.draw_cell_at(col, row, inv);
+				let (fg, bg) = self.cell_colors(&c);
+				self.blit_cell(col, row, c.glyph, bg, fg, c.underline);
 			}
 		}
 	}
@@ -1278,7 +1280,6 @@ impl Term {
 					if n < 16 {
 						let p = self.surface.pack(r, g, b);
 						self.palette[n] = p;
-						self.recompute_colors();
 					}
 				}
 			}
@@ -1286,14 +1287,12 @@ impl Term {
 				if let Some((r, g, b)) = parse_osc_color(&self.osc[rest_start..len]) {
 					let p = self.surface.pack(r, g, b);
 					self.fg = p;
-					self.recompute_colors();
 				}
 			}
 			Some(11) => {
 				if let Some((r, g, b)) = parse_osc_color(&self.osc[rest_start..len]) {
 					let p = self.surface.pack(r, g, b);
 					self.bg = p;
-					self.recompute_colors();
 				}
 			}
 			_ => {}
