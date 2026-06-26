@@ -739,7 +739,7 @@ wrap flag. Each sub-step must build and keep the test harness green (66 [ok]).
       + bold/underline/reverse) instead of packed framebuffer pixels; colour resolution
       (`palette`/`pack`/`resolve`/`indexed`) moves to draw time in the renderer. Removes the
       last pixel dependency from the cell grid. Done when: green, behaviour identical.
-- [ ] M47c - Extract the graphics-free L2 `Screen` (cell grid primary/alt/dirty, the
+- [x] M47c - Extract the graphics-free L2 `Screen` (cell grid primary/alt/dirty, the
       ANSI/CSI/OSC parser, cursor, SGR attributes, scrollback) now that the grid is pixel-free;
       `Term` becomes `Screen` + the renderer. Done when: green, behaviour identical, no pixel
       field on `Screen`.
