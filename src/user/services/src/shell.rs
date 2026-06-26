@@ -65,11 +65,59 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(bootstrap, b"Shell: online", 0);
 	}
 
-	// 4. become the interactive console and run the read-eval-print loop.
+	// 4. greet the operator with the product banner (the message of the day), then
+	//    become the interactive console and run the read-eval-print loop.
+	print_motd();
 	unsafe {
 		repl(console, control, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, &package, &mut buf);
 	}
 	exit();
+}
+
+// Print the product banner as the message of the day, shown once when the shell
+// becomes the interactive console, just before the first prompt. The metadata comes
+// from product.conf (the single source of truth) via the build script's compile-time
+// env vars, so it is never duplicated in the source.
+fn print_motd() {
+	let title: String = alloc::format!("{} {}", env!("PRODUCT_NAME"), env!("PRODUCT_VERSION"));
+	// Three labelled URLs with their values aligned on a common column.
+	let label_web: &str = "Web:";
+	let label_github: &str = "GitHub:";
+	let label_vendor: String = alloc::format!("by {}:", env!("PRODUCT_VENDOR"));
+	let label_w: usize = label_web.len().max(label_github.len()).max(label_vendor.len());
+	let web: String = alloc::format!("{:<w$} {}", label_web, env!("PRODUCT_WEBSITE"), w = label_w);
+	let github: String = alloc::format!("{:<w$} {}", label_github, env!("PRODUCT_GITHUB"), w = label_w);
+	let vendor: String = alloc::format!("{:<w$} {}", label_vendor, env!("PRODUCT_VENDOR_URL"), w = label_w);
+	print_banner(&[title.as_str(), "", web.as_str(), github.as_str(), vendor.as_str()]);
+}
+
+// Print a product banner inside an ASCII frame (plain +/-/| so it renders on the
+// console font, which carries only basic latin). The frame is sized to the longest
+// line; each line is left-aligned and padded, and the whole box is flushed to the
+// console in a single write.
+fn print_banner(lines: &[&str]) {
+	let mut width: usize = 0;
+	for line in lines {
+		if line.len() > width {
+			width = line.len();
+		}
+	}
+	let mut border: String = String::from("+");
+	for _ in 0..width + 2 {
+		border.push('-');
+	}
+	border.push('+');
+	let mut out: String = String::new();
+	out.push_str(&border);
+	out.push('\n');
+	for line in lines {
+		out.push_str(&alloc::format!("| {:<width$} |\n", *line, width = width));
+	}
+	out.push_str(&border);
+	out.push('\n');
+	unsafe {
+		print(out.as_bytes());
+	}
 }
 
 // Run the read-eval-print loop over the console channel from ConsoleService. The
