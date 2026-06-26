@@ -203,7 +203,11 @@ impl Term {
 
 	// The active cell buffer: the alternate screen while it is up, else the primary.
 	fn cells(&self) -> &[Cell] {
-		if self.alt_active { &self.alt } else { &self.primary }
+		if self.alt_active {
+			&self.alt
+		} else {
+			&self.primary
+		}
 	}
 
 	// A blank cell in the current background (so erase/scroll paint the SGR bg).
@@ -810,7 +814,11 @@ impl Term {
 	fn param(&self, i: usize, default: usize) -> usize {
 		if i <= self.nparams {
 			let v = self.params[i] as usize;
-			if v == 0 { default } else { v }
+			if v == 0 {
+				default
+			} else {
+				v
+			}
 		} else {
 			default
 		}
@@ -1174,7 +1182,13 @@ impl Term {
 			}
 			16..=231 => {
 				let n = i - 16;
-				let step = |c: u8| -> u8 { if c == 0 { 0 } else { 55 + c * 40 } };
+				let step = |c: u8| -> u8 {
+					if c == 0 {
+						0
+					} else {
+						55 + c * 40
+					}
+				};
 				self.pack(step(n / 36), step((n / 6) % 6), step(n % 6))
 			}
 			_ => {

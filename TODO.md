@@ -702,6 +702,68 @@ The kernel routes device interrupts only through the legacy PCI INTx line today,
 
 Result: device interrupts are MSI-X only. The bus scan parses the MSI-X capability (table size, BIR + offset -> table physical address); the kernel reserves an edge-triggered vector band (48-63) with per-vector IDT stubs and a dispatch that signals the bound `Interrupt` and issues EOI with no mask / unmask dance (MSI-X is edge-triggered, not a shared level line). `device_msix_acquire(index)` allocates a vector targeting the caller CPU, maps the device's MSI-X table page uncacheable and writes entry 0 (message address `0xFEE00000 | dest << 12`, data = the allocated vector, unmasked), enables MSI-X + sets PCI Bus Master (the MSI is a memory write, so it needs bus mastering), and mints a bound `Interrupt`; the virtio transport writes the config and per-queue MSI-X vectors (`set_msix_vector`). `virtio_input`, `virtio_net`, and `virtio_snd` each take their own per-device vector and `virtio_gpu` polls, so no driver uses INTx - and the legacy path is removed: the I/O APIC GSI routing (`interrupts::acquire` / `ROUTED_GSI` / `ioapic::route` / `ioapic::unmask`), the `device_interrupt_acquire` syscall with its rt/abi wrappers, and the PCI INTx-GSI fields (`intx_gsi` / `irq_line` / `irq_pin` / the device-table `irq`) are gone. The I/O APIC is now mapped and fully masked and every device's INTx pin is disabled (`set_intx_disabled`), so a stray legacy line can never reach a CPU. The generic interrupt-bind primitive (`SYS_INTERRUPT_BIND` / `bind` / `dispatch` + the lock-free handler table) stays for the kernel self-tests. Verified live: keyboard typing, `ping 8.8.8.8` reply (net RX via MSI-X), `beep` (snd tx via MSI-X), and serial input all work together; `just test` 65 [ok], 0 warnings, fmt clean.
 
+## M47 - Layered console: stream -> grid model -> renderer -> swappable display
+
+The console is today one monolithic `Term` (in ConsoleService) that BOTH keeps the cell
+grid AND draws pixels, duplicated again by the kernel's own framebuffer console
+(`console.rs`). This milestone splits it into three graphics-independent layers, mirroring
+the ABI "one model, many codecs" pattern (LSIDL -> CLI/JSON/CBOR):
+
+  L1 stream  - the raw byte stream programs emit (text + ANSI control codes); no grid,
+               width-agnostic (transport, not stored state).
+  L2 grid    - a graphics-free terminal model: cell grid + ANSI/CSI/OSC parser + cursor +
+               SGR attributes + scrollback + a per-row soft/hard wrap flag; knows a width,
+               has no pixels.
+  L3 render  - the only layer that knows pixels/font/geometry; turns the L2 grid into
+               glyphs on a surface.
+  display    - a swappable surface backend under L3 (boot framebuffer <-> virtio-gpu); a
+               backend handoff copies the existing content (may change resolution) and never
+               clears, so the picture survives like a Windows display-driver install.
+
+Consumers attach at the layer that fits: ssh/telnet and a raw log tap L1 (forward the
+stream; the remote end has its own grid, so they never fight over width); the screen
+renderer and a "screen as text" snapshot tap L2; pixels are L3 only. This also lands the
+long-standing "don't clear the boot log" goal (the boot log is just L2 content that
+survives the L3/display handoff) and removes the kernel/ConsoleService renderer duplication.
+Note: full-screen TUI apps (vim/htop) paint cells by coordinate, so the model is a grid,
+not reflowing text; "unbounded lines" are an export-time reconstruction from the grid + the
+wrap flag. Each sub-step must build and keep the test harness green (66 [ok]).
+
+- [ ] M47a - Extract the graphics-free L2 model out of ConsoleService's `Term`: the cell
+      grid (primary/alt/dirty), the ANSI/CSI/OSC parser, cursor, SGR attributes, and
+      scrollback move into a `Screen` type with NO `addr`/`pitch`/`put_pixel`/`pack`. The
+      pixel code stays behind a thin wrapper for now. Done when: build + tests green, the
+      console behaves identically.
+- [ ] M47b - Carve the L3 renderer out as a separate consumer: all pixel/glyph/geometry
+      code (`put_pixel`, `draw_cell`, `pack`, the pixel-scroll bulk copies) moves into a
+      `FramebufferRenderer` that reads the model's dirty cells through a clean diff/snapshot
+      interface. Done when: green, behaviour identical, no pixel field left on the L2 model.
+- [ ] M47c - Add the per-row soft/hard wrap flag to L2 and a first non-graphical consumer: a
+      `TextSink` that serializes scrollback + screen to logical lines, joining soft-wrapped
+      rows into unbounded lines and emitting `\n` only on hard breaks. Done when: a test dumps
+      a known screen to the expected text; green. (Proves L2 is graphics-independent.)
+- [ ] M47d - Surface abstraction + swappable display backend: a `Surface` (pixels + geometry
+      + `present`) with boot-framebuffer and virtio-gpu backends; the renderer targets "the
+      current surface". A backend handoff copies the existing pixels into the new backing and
+      may change resolution, but never clears. Done when: the virtio-gpu takeover preserves the
+      on-screen content (no blank/banner wipe); green.
+- [ ] M47e - One console, no duplication: the kernel boot console and the ConsoleService
+      renderer share the L2 model + L3 renderer (the kernel hands its content across at
+      takeover). The kernel boot log stays on screen after ConsoleService and the gpu take
+      over. Removes the duplicate renderer (the "find dead/duplicate code" NOTES item). Done
+      when: the boot log is visible in the running shell on both the boot-fb and gpu/spice
+      paths; green.
+- [ ] M47f - Wire an L1 stream tap (optional, foundation for ssh/telnet/script): route the raw
+      byte stream to additional sinks (a raw capture / log) alongside the L2 model. Done when:
+      a raw-capture sink records the exact emitted stream; green.
+- Done when: the console is three clean layers (stream / grid model / renderer) over a
+  swappable display backend; the boot log survives every handoff; ssh/telnet/file export have
+  a clear tap point; the kernel/ConsoleService renderer duplication is gone; tests green at
+  every sub-step.
+- Concept: the layered terminal model (stream -> grid -> render), the ABI "one model, many
+  codecs" parallel, M35c (the cell-buffer terminal this refactors), M44 (the virtio-gpu
+  surface), and the "don't clear the boot log" / "find duplicate code" NOTES items.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
