@@ -120,8 +120,8 @@ pub fn _print_byte(byte: u8) {
 unsafe extern "C" fn kmain() -> ! {
 	arch::serial::init();
 	arch::init();
-	init_framebuffer();
 	init_memory();
+	init_framebuffer();
 	arch::init_interrupts();
 	arch::init_tsc();
 	arch::enable_interrupts();
@@ -150,8 +150,8 @@ fn init_memory() {
 // Bring up the framebuffer console from the Limine framebuffer response, so the
 // kernel log is mirrored to the screen alongside serial. A no-op (serial only) if
 // the bootloader provided no framebuffer. Runs before the test/boot split so the
-// console is up for both paths; it needs no heap or paging (Limine maps the
-// framebuffer and the font is static), only that GDT/IDT are installed first.
+// console is up for both paths; it allocates its grid model (the shared `term`
+// stack), so it must run after init_memory brings up the heap.
 fn init_framebuffer() {
 	let Some(response) = FRAMEBUFFER_REQUEST.get_response() else {
 		return;
@@ -253,7 +253,6 @@ fn console_shell_loop() {
 				break;
 			}
 		}
-		console::blink_tick(arch::apic::ticks());
 		sched::run_until_idle();
 		core::hint::spin_loop();
 	}

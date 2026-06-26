@@ -84,6 +84,10 @@ pub const SYS_DEVICE_MSIX_ACQUIRE: u64 = 46;
 // machine resets or enters ACPI soft-off; restricting it to an authorized component
 // is a future PermissionManager concern.
 pub const SYS_SYSTEM_POWER: u64 = 47;
+// Read the kernel boot console's content as logical text lines into the caller's
+// buffer, returning the byte count. The kernel hands its on-screen boot log across to
+// a userspace ConsoleService at takeover, which replays it so the boot log survives.
+pub const SYS_CONSOLE_READLOG: u64 = 48;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;

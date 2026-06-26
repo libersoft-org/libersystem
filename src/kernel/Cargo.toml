@@ -14,6 +14,9 @@ path = "main.rs"
 limine = "0.5"
 # Shared kernel/userspace ABI constants (syscalls, errors, rights, package format).
 abi = { path = "../abi" }
+# The shared terminal stack (grid model + framebuffer renderer): the boot console and
+# the ConsoleService renderer are the same `term::Term`, so there is one renderer.
+term = { path = "../term" }
 
 # abi is also a build-dependency so build.rs packs with the same constants.
 [build-dependencies]

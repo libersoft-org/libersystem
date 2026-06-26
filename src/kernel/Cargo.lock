@@ -18,6 +18,7 @@ version = "0.0.0"
 dependencies = [
  "abi",
  "limine",
+ "term",
 ]
 
 [[package]]
@@ -28,3 +29,7 @@ checksum = "af6d2ee42712e7bd2c787365cd1dab06ef59a61becbf87bec7b32b970bd2594b"
 dependencies = [
  "bitflags",
 ]
+
+[[package]]
+name = "term"
+version = "0.0.0"

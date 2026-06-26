@@ -695,6 +695,14 @@ pub unsafe fn framebuffer_map(fb: &mut Framebuffer) -> i64 {
 	unsafe { syscall(SYS_FRAMEBUFFER_MAP, fb as *mut Framebuffer as u64, core::mem::size_of::<Framebuffer>() as u64, 0, 0) as i64 }
 }
 
+// Copy the kernel boot console's log text into `buf`, returning the number of bytes
+// written (0 when there is no boot console). The kernel and the ConsoleService share
+// the same `term` stack, so the boot log is handed across as logical text and replayed
+// into VT 1's model at takeover - it stays on screen and in the scrollback afterwards.
+pub unsafe fn console_readlog(buf: &mut [u8]) -> i64 {
+	unsafe { syscall(SYS_CONSOLE_READLOG, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as i64 }
+}
+
 // The physical address backing byte `offset` of a DmaBuffer. A buffer larger than
 // one page is mapped contiguously in virtual space but its physical frames are
 // scattered, so a driver that carves it into several device buffers asks for each

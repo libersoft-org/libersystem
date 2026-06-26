@@ -1,3 +1,4 @@
+- We have 2 font files (.bin) - why?
 - Boot log - [ OK ] [FAIL] [INFO] [WARN]
 - Enhance ping command
 - Don't clear console before consoleservice shows up (so user can see boot log from kernel)

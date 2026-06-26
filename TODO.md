@@ -756,7 +756,7 @@ wrap flag. Each sub-step must build and keep the test harness green (66 [ok]).
       renderer targets "the current surface". A backend handoff copies the existing pixels into
       the new backing and may change resolution, but never clears. Done when: the virtio-gpu
       takeover preserves the on-screen content (no blank/banner wipe); green.
-- [ ] M47g - One console, no duplication: the kernel boot console and the ConsoleService
+- [x] M47g - One console, no duplication: the kernel boot console and the ConsoleService
       renderer share the L2 model + L3 renderer (the kernel hands its content across at
       takeover). The kernel boot log stays on screen after ConsoleService and the gpu take
       over. Removes the duplicate renderer (the "find dead/duplicate code" NOTES item). Done
