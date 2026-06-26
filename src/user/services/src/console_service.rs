@@ -88,10 +88,11 @@ enum CursorShape {
 	Bar,
 }
 
-// The terminal: the mapped framebuffer + geometry, the cell grid (primary +
-// alternate screen), the cursor and its saved copy, the scroll region, the current
-// SGR state, and the output escape-parser state.
-struct Term {
+// The raw pixel target: the mapped framebuffer, its geometry, and its pixel format. The
+// only place that touches pixels and the framebuffer address - the renderer (`Term`) draws
+// cells through it, and a display-backend swap (boot-fb <-> virtio-gpu) replaces just this.
+// It holds no grid and no terminal state.
+struct Surface {
 	addr: u64,
 	width: usize,
 	height: usize,
@@ -103,6 +104,99 @@ struct Term {
 	green_size: u8,
 	blue_shift: u8,
 	blue_size: u8,
+}
+
+impl Surface {
+	fn new(addr: u64, fb: &Framebuffer) -> Surface {
+		Surface { addr, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size }
+	}
+
+	// Position one 8-bit colour channel into the framebuffer pixel value.
+	fn channel(&self, value: u8, size: u8, shift: u8) -> u32 {
+		let size = (size as u32).min(8);
+		((value as u32) >> (8 - size)) << (shift as u32)
+	}
+
+	fn pack(&self, r: u8, g: u8, b: u8) -> u32 {
+		self.channel(r, self.red_size, self.red_shift) | self.channel(g, self.green_size, self.green_shift) | self.channel(b, self.blue_size, self.blue_shift)
+	}
+
+	#[inline]
+	fn put_pixel(&self, x: usize, y: usize, color: u32) {
+		if x >= self.width || y >= self.height {
+			return;
+		}
+		let offset = y * self.pitch + x * self.bytes_per_pixel;
+		let bytes = color.to_le_bytes();
+		unsafe {
+			let base = (self.addr as *mut u8).add(offset);
+			for i in 0..self.bytes_per_pixel {
+				core::ptr::write_volatile(base.add(i), bytes[i]);
+			}
+		}
+	}
+
+	// Fill the whole framebuffer with one colour.
+	fn fill(&self, color: u32) {
+		for y in 0..self.height {
+			for x in 0..self.width {
+				self.put_pixel(x, y, color);
+			}
+		}
+	}
+
+	// Shift the framebuffer pixels for grid rows [top, bot] up by n cell-heights. A scroll
+	// then moves the existing pixels in one bulk copy instead of re-blitting every glyph
+	// (the full-frame glyph re-render is the dominant cost of scrolling). The vacated bottom
+	// rows are repainted from the (blanked) grid by the caller's dirty marks.
+	fn scroll_up(&self, top: usize, bot: usize, n: usize) {
+		let dy = n * CELL_H;
+		let y_first = top * CELL_H;
+		let y_end = ((bot + 1) * CELL_H).min(self.height);
+		if dy >= y_end.saturating_sub(y_first) {
+			return;
+		}
+		let row_bytes = (self.width * self.bytes_per_pixel).min(self.pitch);
+		unsafe {
+			let base = self.addr as *mut u8;
+			let mut y = y_first;
+			while y + dy < y_end {
+				let dst = base.add(y * self.pitch);
+				let src = base.add((y + dy) * self.pitch);
+				core::ptr::copy_nonoverlapping(src, dst, row_bytes);
+				y += 1;
+			}
+		}
+	}
+
+	// Shift the framebuffer pixels for grid rows [top, bot] down by n cell-heights - the
+	// downward counterpart of scroll_up (reverse index / insert line).
+	fn scroll_down(&self, top: usize, bot: usize, n: usize) {
+		let dy = n * CELL_H;
+		let y_first = top * CELL_H;
+		let y_end = ((bot + 1) * CELL_H).min(self.height);
+		if dy >= y_end.saturating_sub(y_first) {
+			return;
+		}
+		let row_bytes = (self.width * self.bytes_per_pixel).min(self.pitch);
+		unsafe {
+			let base = self.addr as *mut u8;
+			let mut y = y_end;
+			while y > y_first + dy {
+				y -= 1;
+				let dst = base.add(y * self.pitch);
+				let src = base.add((y - dy) * self.pitch);
+				core::ptr::copy_nonoverlapping(src, dst, row_bytes);
+			}
+		}
+	}
+}
+
+// The terminal: the pixel surface, the cell grid (primary + alternate screen), the cursor
+// and its saved copy, the scroll region, the current SGR state, and the output
+// escape-parser state.
+struct Term {
+	surface: Surface,
 	cols: usize,
 	rows: usize,
 	col: usize,
@@ -159,11 +253,11 @@ impl Term {
 	fn new(addr: u64, fb: &Framebuffer) -> Term {
 		let cols = fb.width as usize / CELL_W;
 		let rows = fb.height as usize / CELL_H;
-		let mut t = Term { addr, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), fg: 0, bg: 0, palette: [0; 16], cur_fg: 0, cur_bg: 0, cur_underline: false, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 64], osc_len: 0, tty_raw_req: None, tty_echo_req: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: Vec::new(), alt: Vec::new(), alt_active: false, dirty: Vec::new(), last_caret: None, scrollback: Vec::new(), sb_cap: 0, sb_head: 0, sb_len: 0, view_offset: 0 };
-		t.fg = t.pack(FG.0, FG.1, FG.2);
-		t.bg = t.pack(BG.0, BG.1, BG.2);
+		let mut t = Term { surface: Surface::new(addr, fb), cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), fg: 0, bg: 0, palette: [0; 16], cur_fg: 0, cur_bg: 0, cur_underline: false, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 64], osc_len: 0, tty_raw_req: None, tty_echo_req: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: Vec::new(), alt: Vec::new(), alt_active: false, dirty: Vec::new(), last_caret: None, scrollback: Vec::new(), sb_cap: 0, sb_head: 0, sb_len: 0, view_offset: 0 };
+		t.fg = t.surface.pack(FG.0, FG.1, FG.2);
+		t.bg = t.surface.pack(BG.0, BG.1, BG.2);
 		for (i, &(r, g, b)) in ANSI_PALETTE.iter().enumerate() {
-			t.palette[i] = t.pack(r, g, b);
+			t.palette[i] = t.surface.pack(r, g, b);
 		}
 		t.cur_fg = t.fg;
 		t.cur_bg = t.bg;
@@ -174,31 +268,6 @@ impl Term {
 		t.scrollback = alloc::vec![blank; SCROLLBACK_ROWS * cols];
 		t.sb_cap = SCROLLBACK_ROWS;
 		t
-	}
-
-	// Position one 8-bit colour channel into the framebuffer pixel value.
-	fn channel(&self, value: u8, size: u8, shift: u8) -> u32 {
-		let size = (size as u32).min(8);
-		((value as u32) >> (8 - size)) << (shift as u32)
-	}
-
-	fn pack(&self, r: u8, g: u8, b: u8) -> u32 {
-		self.channel(r, self.red_size, self.red_shift) | self.channel(g, self.green_size, self.green_shift) | self.channel(b, self.blue_size, self.blue_shift)
-	}
-
-	#[inline]
-	fn put_pixel(&self, x: usize, y: usize, color: u32) {
-		if x >= self.width || y >= self.height {
-			return;
-		}
-		let offset = y * self.pitch + x * self.bytes_per_pixel;
-		let bytes = color.to_le_bytes();
-		unsafe {
-			let base = (self.addr as *mut u8).add(offset);
-			for i in 0..self.bytes_per_pixel {
-				core::ptr::write_volatile(base.add(i), bytes[i]);
-			}
-		}
 	}
 
 	// The active cell buffer: the alternate screen while it is up, else the primary.
@@ -261,8 +330,8 @@ impl Term {
 	// stand-in for a virtio-gpu mode-set (M44); the same path runs on a real resolution
 	// change once that driver lands.
 	fn resize(&mut self, new_cols: usize, new_rows: usize) {
-		let max_cols = (self.width / CELL_W).max(1);
-		let max_rows = (self.height / CELL_H).max(1);
+		let max_cols = (self.surface.width / CELL_W).max(1);
+		let max_rows = (self.surface.height / CELL_H).max(1);
 		let new_cols = new_cols.clamp(1, max_cols);
 		let new_rows = new_rows.clamp(1, max_rows);
 		if new_cols == self.cols && new_rows == self.rows {
@@ -305,11 +374,7 @@ impl Term {
 	// Fill the whole physical framebuffer with the default background - used when the grid
 	// shrinks so the area now outside it is not left with stale pixels.
 	fn clear_screen(&self) {
-		for y in 0..self.height {
-			for x in 0..self.width {
-				self.put_pixel(x, y, self.bg);
-			}
-		}
+		self.surface.fill(self.bg);
 	}
 
 	// Paint one cell from the grid to the framebuffer.
@@ -329,7 +394,7 @@ impl Term {
 				let color = if bits & (1 << gx) != 0 { cell.fg } else { cell.bg };
 				for sy in 0..SCALE {
 					for sx in 0..SCALE {
-						self.put_pixel(x0 + gx * SCALE + sx, y0 + gy * SCALE + sy, color);
+						self.surface.put_pixel(x0 + gx * SCALE + sx, y0 + gy * SCALE + sy, color);
 					}
 				}
 			}
@@ -337,7 +402,7 @@ impl Term {
 		if cell.underline {
 			for y in (y0 + CELL_H - SCALE)..(y0 + CELL_H) {
 				for x in x0..(x0 + CELL_W) {
-					self.put_pixel(x, y, cell.fg);
+					self.surface.put_pixel(x, y, cell.fg);
 				}
 			}
 		}
@@ -358,14 +423,14 @@ impl Term {
 			CursorShape::Underline => {
 				for y in (y0 + CELL_H - SCALE)..(y0 + CELL_H) {
 					for x in x0..(x0 + CELL_W) {
-						self.put_pixel(x, y, self.cur_fg);
+						self.surface.put_pixel(x, y, self.cur_fg);
 					}
 				}
 			}
 			CursorShape::Bar => {
 				for y in y0..(y0 + CELL_H) {
 					for x in x0..(x0 + SCALE) {
-						self.put_pixel(x, y, self.cur_fg);
+						self.surface.put_pixel(x, y, self.cur_fg);
 					}
 				}
 			}
@@ -493,52 +558,6 @@ impl Term {
 		}
 	}
 
-	// Shift the framebuffer pixels for grid rows [top, bot] up by n cell-heights. A scroll
-	// then moves the existing pixels in one bulk copy instead of re-blitting every glyph
-	// (the full-frame glyph re-render is the dominant cost of scrolling). The vacated bottom
-	// rows are repainted from the (blanked) grid by the caller's dirty marks.
-	fn scroll_pixels_up(&self, top: usize, bot: usize, n: usize) {
-		let dy = n * CELL_H;
-		let y_first = top * CELL_H;
-		let y_end = ((bot + 1) * CELL_H).min(self.height);
-		if dy >= y_end.saturating_sub(y_first) {
-			return;
-		}
-		let row_bytes = (self.width * self.bytes_per_pixel).min(self.pitch);
-		unsafe {
-			let base = self.addr as *mut u8;
-			let mut y = y_first;
-			while y + dy < y_end {
-				let dst = base.add(y * self.pitch);
-				let src = base.add((y + dy) * self.pitch);
-				core::ptr::copy_nonoverlapping(src, dst, row_bytes);
-				y += 1;
-			}
-		}
-	}
-
-	// Shift the framebuffer pixels for grid rows [top, bot] down by n cell-heights - the
-	// downward counterpart of scroll_pixels_up (reverse index / insert line).
-	fn scroll_pixels_down(&self, top: usize, bot: usize, n: usize) {
-		let dy = n * CELL_H;
-		let y_first = top * CELL_H;
-		let y_end = ((bot + 1) * CELL_H).min(self.height);
-		if dy >= y_end.saturating_sub(y_first) {
-			return;
-		}
-		let row_bytes = (self.width * self.bytes_per_pixel).min(self.pitch);
-		unsafe {
-			let base = self.addr as *mut u8;
-			let mut y = y_end;
-			while y > y_first + dy {
-				y -= 1;
-				let dst = base.add(y * self.pitch);
-				let src = base.add((y - dy) * self.pitch);
-				core::ptr::copy_nonoverlapping(src, dst, row_bytes);
-			}
-		}
-	}
-
 	// Scroll the rows [top, bot] up by n, filling the freed bottom rows with blanks.
 	fn region_up(&mut self, top: usize, bot: usize, n: usize) {
 		let n = n.max(1);
@@ -553,7 +572,7 @@ impl Term {
 			if let Some((c, r)) = self.last_caret.take() {
 				self.draw_cell(c, r);
 			}
-			self.scroll_pixels_up(top, bot, n);
+			self.surface.scroll_up(top, bot, n);
 		}
 		{
 			let buf = if self.alt_active { &mut self.alt } else { &mut self.primary };
@@ -583,7 +602,7 @@ impl Term {
 			if let Some((c, r)) = self.last_caret.take() {
 				self.draw_cell(c, r);
 			}
-			self.scroll_pixels_down(top, bot, n);
+			self.surface.scroll_down(top, bot, n);
 		}
 		{
 			let buf = if self.alt_active { &mut self.alt } else { &mut self.primary };
@@ -1168,7 +1187,7 @@ impl Term {
 		match c {
 			Color::Default => default,
 			Color::Idx(i) => self.indexed(i),
-			Color::Rgb(r, g, b) => self.pack(r, g, b),
+			Color::Rgb(r, g, b) => self.surface.pack(r, g, b),
 		}
 	}
 
@@ -1189,11 +1208,11 @@ impl Term {
 						55 + c * 40
 					}
 				};
-				self.pack(step(n / 36), step((n / 6) % 6), step(n % 6))
+				self.surface.pack(step(n / 36), step((n / 6) % 6), step(n % 6))
 			}
 			_ => {
 				let v = 8 + (i - 232) * 10;
-				self.pack(v, v, v)
+				self.surface.pack(v, v, v)
 			}
 		}
 	}
@@ -1257,7 +1276,7 @@ impl Term {
 				};
 				if let (Some(n), Some((r, g, b))) = (n, color) {
 					if n < 16 {
-						let p = self.pack(r, g, b);
+						let p = self.surface.pack(r, g, b);
 						self.palette[n] = p;
 						self.recompute_colors();
 					}
@@ -1265,14 +1284,14 @@ impl Term {
 			}
 			Some(10) => {
 				if let Some((r, g, b)) = parse_osc_color(&self.osc[rest_start..len]) {
-					let p = self.pack(r, g, b);
+					let p = self.surface.pack(r, g, b);
 					self.fg = p;
 					self.recompute_colors();
 				}
 			}
 			Some(11) => {
 				if let Some((r, g, b)) = parse_osc_color(&self.osc[rest_start..len]) {
-					let p = self.pack(r, g, b);
+					let p = self.surface.pack(r, g, b);
 					self.bg = p;
 					self.recompute_colors();
 				}

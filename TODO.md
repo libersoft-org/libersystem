@@ -729,31 +729,40 @@ Note: full-screen TUI apps (vim/htop) paint cells by coordinate, so the model is
 not reflowing text; "unbounded lines" are an export-time reconstruction from the grid + the
 wrap flag. Each sub-step must build and keep the test harness green (66 [ok]).
 
-- [ ] M47a - Extract the graphics-free L2 model out of ConsoleService's `Term`: the cell
-      grid (primary/alt/dirty), the ANSI/CSI/OSC parser, cursor, SGR attributes, and
-      scrollback move into a `Screen` type with NO `addr`/`pitch`/`put_pixel`/`pack`. The
-      pixel code stays behind a thin wrapper for now. Done when: build + tests green, the
-      console behaves identically.
-- [ ] M47b - Carve the L3 renderer out as a separate consumer: all pixel/glyph/geometry
-      code (`put_pixel`, `draw_cell`, `pack`, the pixel-scroll bulk copies) moves into a
-      `FramebufferRenderer` that reads the model's dirty cells through a clean diff/snapshot
-      interface. Done when: green, behaviour identical, no pixel field left on the L2 model.
-- [ ] M47c - Add the per-row soft/hard wrap flag to L2 and a first non-graphical consumer: a
-      `TextSink` that serializes scrollback + screen to logical lines, joining soft-wrapped
-      rows into unbounded lines and emitting `\n` only on hard breaks. Done when: a test dumps
-      a known screen to the expected text; green. (Proves L2 is graphics-independent.)
-- [ ] M47d - Surface abstraction + swappable display backend: a `Surface` (pixels + geometry
-      + `present`) with boot-framebuffer and virtio-gpu backends; the renderer targets "the
-      current surface". A backend handoff copies the existing pixels into the new backing and
-      may change resolution, but never clears. Done when: the virtio-gpu takeover preserves the
-      on-screen content (no blank/banner wipe); green.
-- [ ] M47e - One console, no duplication: the kernel boot console and the ConsoleService
+- [x] M47a - Extract the raw pixel `Surface` out of ConsoleService's `Term`: addr +
+      geometry (width/height/pitch/bpp/shifts/sizes) and the pure pixel ops (`channel`,
+      `pack`, `put_pixel`, `fill`, the bulk pixel-scroll copies) move into a `Surface` struct;
+      `Term` holds a `surface` and delegates every pixel write. The only code that touches
+      pixels and the framebuffer address now lives in one place (the L3-below display target).
+      Done when: build + tests green, the console behaves identically.
+- [ ] M47b - Make the grid model graphics-free: `Cell` stores logical colour (a `Color` fg/bg
+      + bold/underline/reverse) instead of packed framebuffer pixels; colour resolution
+      (`palette`/`pack`/`resolve`/`indexed`) moves to draw time in the renderer. Removes the
+      last pixel dependency from the cell grid. Done when: green, behaviour identical.
+- [ ] M47c - Extract the graphics-free L2 `Screen` (cell grid primary/alt/dirty, the
+      ANSI/CSI/OSC parser, cursor, SGR attributes, scrollback) now that the grid is pixel-free;
+      `Term` becomes `Screen` + the renderer. Done when: green, behaviour identical, no pixel
+      field on `Screen`.
+- [ ] M47d - Carve the L3 renderer out as a separate consumer: all glyph/geometry draw code
+      (`draw_cell`, `draw_caret`, `flush`, the dirty walk) moves into a `FramebufferRenderer`
+      that reads the `Screen`'s dirty cells through a clean diff/snapshot interface. Done when:
+      green, behaviour identical.
+- [ ] M47e - Add the per-row soft/hard wrap flag to `Screen` and a first non-graphical
+      consumer: a `TextSink` that serializes scrollback + screen to logical lines, joining
+      soft-wrapped rows into unbounded lines and emitting `\n` only on hard breaks. Done when: a
+      test dumps a known screen to the expected text; green. (Proves L2 is graphics-independent.)
+- [ ] M47f - Swappable display backend under the surface: the `Surface` becomes a trait
+      (pixels + geometry + `present`) with boot-framebuffer and virtio-gpu backends; the
+      renderer targets "the current surface". A backend handoff copies the existing pixels into
+      the new backing and may change resolution, but never clears. Done when: the virtio-gpu
+      takeover preserves the on-screen content (no blank/banner wipe); green.
+- [ ] M47g - One console, no duplication: the kernel boot console and the ConsoleService
       renderer share the L2 model + L3 renderer (the kernel hands its content across at
       takeover). The kernel boot log stays on screen after ConsoleService and the gpu take
       over. Removes the duplicate renderer (the "find dead/duplicate code" NOTES item). Done
       when: the boot log is visible in the running shell on both the boot-fb and gpu/spice
       paths; green.
-- [ ] M47f - Wire an L1 stream tap (optional, foundation for ssh/telnet/script): route the raw
+- [ ] M47h - Wire an L1 stream tap (optional, foundation for ssh/telnet/script): route the raw
       byte stream to additional sinks (a raw capture / log) alongside the L2 model. Done when:
       a raw-capture sink records the exact emitted stream; green.
 - Done when: the console is three clean layers (stream / grid model / renderer) over a
