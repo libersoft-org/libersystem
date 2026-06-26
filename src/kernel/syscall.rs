@@ -56,7 +56,14 @@ pub use abi::sys_is_err;
 pub use abi::ObjectInfo;
 
 // Validate a caller-supplied buffer. Always accepts kernel self-calls; for a
-// ring-3 caller it requires the whole [ptr, ptr+len) range to lie in user space.
+// ring-3 caller it requires the whole [ptr, ptr+len) range to lie in user space
+// and every page it touches to be mapped in the active address space. The bounds
+// check alone is not enough: a ring-3 caller can pass an in-bounds pointer to an
+// unmapped page, and a kernel read or write of it then takes a ring-0 page fault.
+// On the SYS_DEBUG_WRITE path that fault strikes while the serial TX lock is held,
+// so the fault handler's own logging deadlocks on that lock and the machine hangs.
+// There is no demand paging - any ring-3 fault terminates the process - so a valid
+// buffer is always fully mapped; reject anything that is not.
 fn user_buf_ok(ptr: u64, len: u64) -> bool {
 	if !arch::percpu::in_user_syscall() {
 		return true;
@@ -67,10 +74,48 @@ fn user_buf_ok(ptr: u64, len: u64) -> bool {
 	if ptr == 0 {
 		return false;
 	}
-	match ptr.checked_add(len) {
-		Some(end) => end <= USER_VA_END,
-		None => false,
+	let end = match ptr.checked_add(len) {
+		Some(end) => end,
+		None => return false,
+	};
+	if end > USER_VA_END {
+		return false;
 	}
+	let mut page = ptr & !0xfff;
+	let last = (end - 1) & !0xfff;
+	loop {
+		if arch::paging::translate(page).is_none() {
+			return false;
+		}
+		if page == last {
+			return true;
+		}
+		page += 0x1000;
+	}
+}
+
+// Upper bound on a single bulk SYS_DEBUG_WRITE, sized to the serial TX ring so one
+// call never has to outrun the UART synchronously. A caller with more bytes chunks.
+const DEBUG_WRITE_MAX: u64 = 16384;
+
+// Write debug output to the serial port (and the kernel framebuffer console while it
+// still owns the display). Two forms keyed on `len`: a single byte when `len` is 0
+// (`arg` is the byte), or a bulk write when `len` > 0 (`arg` is a userspace pointer to
+// `len` bytes). The bulk form flushes a buffer in one syscall instead of one per byte:
+// the console service mirrors a screenful of output to serial, and the old per-byte
+// path (one char format per byte, in a debug build) stalled that thread - and the gpu
+// present queued behind it - for ~500 ms on a `help` listing.
+fn sys_debug_write(arg: u64, len: u64) -> i64 {
+	if len == 0 {
+		crate::_print_byte(arg as u8);
+		return 0;
+	}
+	if len > DEBUG_WRITE_MAX || !user_buf_ok(arg, len) {
+		return ERR_INVALID;
+	}
+	let bytes = unsafe { core::slice::from_raw_parts(arg as *const u8, len as usize) };
+	crate::_print_bytes(bytes);
+	0
 }
 
 // Kernel virtual-address window for syscall-mapped MemoryObjects. A bump pointer
@@ -143,10 +188,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_DEBUG_NOOP => a0 as i64,
 		SYS_CLOCK_GET => arch::apic::ticks() as i64,
 		SYS_CLOCK_RTC => arch::rtc::read_unix() as i64,
-		SYS_DEBUG_WRITE => {
-			crate::serial_print!("{}", a0 as u8 as char);
-			0
-		}
+		SYS_DEBUG_WRITE => sys_debug_write(a0, a1),
 		SYS_MEMORY_OBJECT_CREATE => sys_memory_object_create(a0),
 		SYS_DMA_BUFFER_CREATE => sys_dma_buffer_create(a0),
 		SYS_DMA_BUFFER_MAP => sys_dma_buffer_map(a0),
@@ -651,6 +693,13 @@ fn sys_console_attach(handle: u64) -> i64 {
 		Err(e) => return e,
 	};
 	crate::console_input::attach(channel);
+	// A userspace console service is taking over: stop the kernel framebuffer console.
+	// framebuffer_map already does this when the service maps the boot framebuffer, but a
+	// service driving a virtio-gpu display never maps it (it presents through the gpu
+	// driver), so the kernel console would otherwise keep rendering every SYS_DEBUG_WRITE
+	// byte - the console service's serial mirror among them - as a glyph into the now
+	// invisible boot framebuffer, costing ~400 ms of wasted blitting per screenful.
+	crate::console::disable();
 	0
 }
 

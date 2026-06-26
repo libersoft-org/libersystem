@@ -18,8 +18,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::input;
 use proto::system::PointerEvent;
+use proto::system::input;
 use rt::*;
 
 // The default text-cell grid the normalized pointer position maps onto: the boot

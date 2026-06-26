@@ -109,6 +109,9 @@ pub fn init() {
 	*ROOT_DOMAIN.lock() = Some(Domain::root());
 	// Per-CPU state and the scheduler are now up: the timer ISR may preempt.
 	PREEMPTION_ENABLED.store(true, Ordering::Release);
+	// The timer tick and idle loop now drain the serial ring, so switch serial
+	// transmit from synchronous (immediate boot logs) to the asynchronous ring.
+	arch::serial::enable_async();
 }
 
 // The root (unlimited) resource Domain.
@@ -365,17 +368,21 @@ pub fn run_until_idle() {
 		}
 		match min_deadline() {
 			Some(deadline) => {
-				// Spin until the nearest deadline, but stop early if an interrupt wakes
-				// a thread in the meantime, so an IRQ-woken driver (e.g. a virtio RX
-				// completion arriving mid-wait) runs promptly instead of being held up
-				// for the whole timeout. The run-queue check drops its lock each pass,
-				// so the ISR that enqueues the woken thread can run between checks. The
-				// idle hook runs each pass too, so the BSP keeps polling the serial
-				// console even while a driver re-arms a short timer (virtio-gpu's resize
-				// poll), which would otherwise keep this loop busy indefinitely.
+				// Wait for the nearest deadline by HALTING between checks, not busy-spinning.
+				// A spinning BSP pegs a host core at 100% AND - because the idle hook polls
+				// the serial UART (an `inb` on the LSR) every pass - floods KVM with port-I/O
+				// VM-exits that each grab the QEMU big lock, starving the device-emulation /
+				// display-encode thread and making the framebuffer console feel laggy. Halting
+				// yields the vCPU; the 100 Hz LAPIC timer (and any device IRQ) wakes us within
+				// one tick to re-check the run queue, so an IRQ-woken driver (e.g. a virtio RX
+				// completion) still runs promptly. The run-queue check drops its lock each pass
+				// so the ISR that enqueues the woken thread can run between checks, and the idle
+				// hook runs each wake so the BSP keeps draining serial TX and polling serial
+				// input even while a driver re-arms a short timer (virtio-gpu's resize poll).
 				while arch::apic::ticks() < deadline && SCHED[cpu].inner.lock().run_queue.is_empty() {
 					run_idle_hook();
-					core::hint::spin_loop();
+					arch::serial::drain_tx();
+					arch::idle_halt();
 				}
 				check_deadlines();
 			}
@@ -385,9 +392,13 @@ pub fn run_until_idle() {
 	reap(&SCHED[cpu]);
 }
 
-// Idle loop for application processors: run any ready thread, otherwise spin and
-// re-check. Cores park here instead of halting so threads can be scheduled onto
-// them; a power-friendly wait (halt + wakeup IPI) is a later refinement.
+// Idle loop for application processors: run any ready thread, otherwise HALT until
+// the next interrupt and re-check. Each AP runs a periodic LAPIC timer (set up in
+// arch::init_ap) only to wake it from the halt within one tick, so an idle core
+// yields its physical CPU instead of busy-spinning - which, under virtualization,
+// would steal host time from the cores doing real work and from the host's own device
+// emulation. Work another core enqueues onto this core's run queue (rare - wakeups
+// land on the waker's core, not here) is picked up at the next wake.
 //
 // APs deliberately do NOT touch the wait registry: in this cooperative milestone
 // blocked threads and their deadlines are driven by run_until_idle on the BSP, so
@@ -396,7 +407,9 @@ pub fn run_until_idle() {
 pub fn cpu_idle_loop() -> ! {
 	loop {
 		reschedule(Disposition::Requeue);
-		core::hint::spin_loop();
+		// An idle core has nothing better to do than push the serial ring to the wire.
+		arch::serial::drain_tx();
+		arch::idle_halt();
 	}
 }
 

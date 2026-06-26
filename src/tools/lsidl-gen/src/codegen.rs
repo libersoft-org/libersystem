@@ -789,11 +789,7 @@ fn camel(name: &str) -> String {
 // as a raw identifier if it collides with a keyword.
 fn field_ident(name: &str) -> String {
 	let s = name.replace('-', "_");
-	if is_rust_keyword(&s) {
-		format!("r#{s}")
-	} else {
-		s
-	}
+	if is_rust_keyword(&s) { format!("r#{s}") } else { s }
 }
 
 // Map a kebab-case name to a SCREAMING_SNAKE_CASE constant identifier.

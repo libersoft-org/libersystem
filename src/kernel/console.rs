@@ -395,6 +395,22 @@ pub fn write_fmt(args: fmt::Arguments<'_>) {
 	}
 }
 
+// Mirror raw bytes to the framebuffer console, if one is initialized. The bulk twin
+// of write_fmt for the bulk SYS_DEBUG_WRITE path, so a buffer renders without a
+// per-char format_args. A no-op once the display is handed to a userspace console.
+pub fn write_bytes(bytes: &[u8]) {
+	if DISABLED.load(Ordering::Relaxed) {
+		return;
+	}
+	if let Some(mut guard) = CONSOLE.try_lock() {
+		if let Some(console) = guard.as_mut() {
+			for &byte in bytes {
+				console.put_char(byte);
+			}
+		}
+	}
+}
+
 // Drive the blinking caret: toggle it if at least BLINK_TICKS have passed since the
 // last toggle or output. The interactive loop calls this every round with the
 // monotonic tick; output resets the timer so the caret stays solid while typing.

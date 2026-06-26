@@ -455,11 +455,7 @@ fn layout(code: u16, mods: &Mods) -> u8 {
 	}
 	// Letters flip with Shift XOR Caps Lock; symbols only with Shift.
 	let shifted: bool = if base.is_ascii_lowercase() { mods.shift ^ mods.caps } else { mods.shift };
-	if shifted {
-		KEYMAP_SHIFT[code as usize]
-	} else {
-		base
-	}
+	if shifted { KEYMAP_SHIFT[code as usize] } else { base }
 }
 
 // The ANSI escape sequence a navigation keycode maps to, or None for an ordinary key.

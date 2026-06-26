@@ -20,7 +20,7 @@ ISO="$("$HERE/mkimage.sh" iso "$KERNEL")"
 # build the QEMU arguments
 QEMU_ARGS=(
 	-machine q35
-	-m 512M
+	-m 4G
 	-cdrom "$ISO"
 	-boot d
 	-serial "${SERIAL:-mon:stdio}"
@@ -86,9 +86,9 @@ if [[ "$want_spice" == "1" ]]; then
 fi
 
 if [[ "${NOKVM:-0}" != "1" && -e /dev/kvm ]]; then
-	QEMU_ARGS+=(-enable-kvm -cpu host -smp 4)
+	QEMU_ARGS+=(-enable-kvm -cpu host -smp 8)
 else
-	QEMU_ARGS+=(-cpu qemu64,+rdrand -smp 4)
+	QEMU_ARGS+=(-cpu qemu64,+rdrand -smp 8)
 fi
 
 if [[ "${DEBUG:-0}" == "1" ]]; then

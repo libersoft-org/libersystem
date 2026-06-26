@@ -99,6 +99,22 @@ pub fn _print(args: core::fmt::Arguments<'_>) {
 	console::write_fmt(args);
 }
 
+// Write a raw byte slice to the serial port (always) and mirror it to the framebuffer
+// console (if one is initialized), without the per-char format_args _print does. Backs
+// the bulk SYS_DEBUG_WRITE path so the console service flushes a screenful of
+// serial-mirror output in one syscall instead of one (formatted) syscall per byte.
+#[doc(hidden)]
+pub fn _print_bytes(bytes: &[u8]) {
+	arch::serial::write_bytes(bytes);
+	console::write_bytes(bytes);
+}
+
+// Single-byte twin of _print_bytes, for the legacy single-byte SYS_DEBUG_WRITE form.
+#[doc(hidden)]
+pub fn _print_byte(byte: u8) {
+	_print_bytes(&[byte]);
+}
+
 // kernel entry point (ELF entry, see ENTRY(kmain) in the linker script)
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain() -> ! {
@@ -181,6 +197,9 @@ fn boot_main() {
 	serial_println!("arch: {}", arch::NAME);
 	serial_println!("smp: {} of {} cores online", smp::online_count(), smp::cpu_count());
 	serial_println!("memory: {} physical frames free", mem::frame::free_count());
+	// Perf-trace anchor: publish the calibrated TSC frequency so the host trace tool can
+	// convert the ring-3 `\x1ePERF` cycle markers to wall-clock time.
+	serial_println!("\x1ePERF tsc_hz {}", arch::tsc::hz());
 	serial_println!("boot OK - entering the userspace shell (type 'help', or 'exit' to halt)");
 	boot_userspace_with_recovery();
 	serial_println!("halting");
@@ -200,7 +219,11 @@ fn serial_console_pump() {
 		NUDGED.store(true, Ordering::Relaxed);
 		console_input::feed(b'\n');
 	}
-	if let Some(byte) = arch::serial::read_byte() {
+	// Drain the whole serial RX FIFO each wake: the BSP now halts between idle passes
+	// (~100 Hz timer wakes) instead of busy-spinning, so polling one byte per pass could
+	// let a fast paste overrun the 16-byte UART FIFO. Reading until empty keeps serial
+	// input lossless at the lower poll rate.
+	while let Some(byte) = arch::serial::read_byte() {
 		console_input::feed(byte);
 	}
 }

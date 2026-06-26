@@ -344,29 +344,41 @@ unsafe fn serve(gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u32, init_w: u32, 
 				}
 				continue;
 			}
-			match recv_blocking(service, &mut req) {
-				Received::Message { len, .. } => {
-					let m: &[u8] = &req[..len];
-					if m.starts_with(b"FB") {
-						// hand back the max framebuffer geometry (pitch and extent), the
-						// current display size, and a mappable, transferable dup of the
-						// backing handle (we keep our own handle to stay pinned).
-						let dup: i64 = duplicate(fb_handle, RIGHT_MAP | RIGHT_TRANSFER);
-						if dup < 0 {
-							exit();
+			// A message woke us: drain every queued request, coalescing FLUSHes so a backlog
+			// of deferred presents collapses into a single present of the latest backing.
+			// The console always renders the newest frame into the shared backing, so older
+			// queued FLUSHes are redundant; presenting once keeps the display from falling
+			// behind by N stale frames when a slow display client makes each present costly.
+			let mut need_present = false;
+			loop {
+				match try_recv(service, &mut req) {
+					Polled::Message { len, .. } => {
+						let m: &[u8] = &req[..len];
+						if m.starts_with(b"FB") {
+							// hand back the max framebuffer geometry (pitch and extent), the
+							// current display size, and a mappable, transferable dup of the
+							// backing handle (we keep our own handle to stay pinned).
+							let dup: i64 = duplicate(fb_handle, RIGHT_MAP | RIGHT_TRANSFER);
+							if dup < 0 {
+								exit();
+							}
+							let info = Framebuffer { width: max_w, height: max_h, pitch: max_w * 4, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] };
+							let fb_len: usize = core::mem::size_of::<Framebuffer>();
+							let mut reply: [u8; 32] = [0u8; 32];
+							core::ptr::copy_nonoverlapping(&info as *const Framebuffer as *const u8, reply.as_mut_ptr(), fb_len);
+							reply[fb_len..fb_len + 4].copy_from_slice(&cur_w.to_le_bytes());
+							reply[fb_len + 4..fb_len + 8].copy_from_slice(&cur_h.to_le_bytes());
+							send_blocking(service, &reply[..fb_len + 8], dup as u64);
+						} else if m.starts_with(b"FLUSH") {
+							need_present = true;
 						}
-						let info = Framebuffer { width: max_w, height: max_h, pitch: max_w * 4, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] };
-						let fb_len: usize = core::mem::size_of::<Framebuffer>();
-						let mut reply: [u8; 32] = [0u8; 32];
-						core::ptr::copy_nonoverlapping(&info as *const Framebuffer as *const u8, reply.as_mut_ptr(), fb_len);
-						reply[fb_len..fb_len + 4].copy_from_slice(&cur_w.to_le_bytes());
-						reply[fb_len + 4..fb_len + 8].copy_from_slice(&cur_h.to_le_bytes());
-						send_blocking(service, &reply[..fb_len + 8], dup as u64);
-					} else if m.starts_with(b"FLUSH") {
-						gpu.present(cur_w, cur_h);
 					}
+					Polled::Empty => break,
+					Polled::Closed => exit(),
 				}
-				Received::Closed => exit(),
+			}
+			if need_present {
+				gpu.present(cur_w, cur_h);
 			}
 		}
 	}

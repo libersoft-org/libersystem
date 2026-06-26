@@ -472,11 +472,85 @@ impl Term {
 		}
 	}
 
+	// Paint any pending dirty cells in grid rows [top, bot] so the framebuffer matches the
+	// grid before a bulk pixel scroll moves those rows (cells edited earlier in the same
+	// output batch are not on the framebuffer yet, so the shift would otherwise carry stale
+	// pixels). Cleared cells are no longer dirty for the end-of-batch flush.
+	fn flush_band(&mut self, top: usize, bot: usize) {
+		let cols = self.cols;
+		for row in top..=bot {
+			for col in 0..cols {
+				let idx = row * cols + col;
+				if self.dirty[idx] {
+					self.draw_cell(col, row);
+					self.dirty[idx] = false;
+				}
+			}
+		}
+	}
+
+	// Shift the framebuffer pixels for grid rows [top, bot] up by n cell-heights. A scroll
+	// then moves the existing pixels in one bulk copy instead of re-blitting every glyph
+	// (the full-frame glyph re-render is the dominant cost of scrolling). The vacated bottom
+	// rows are repainted from the (blanked) grid by the caller's dirty marks.
+	fn scroll_pixels_up(&self, top: usize, bot: usize, n: usize) {
+		let dy = n * CELL_H;
+		let y_first = top * CELL_H;
+		let y_end = ((bot + 1) * CELL_H).min(self.height);
+		if dy >= y_end.saturating_sub(y_first) {
+			return;
+		}
+		let row_bytes = (self.width * self.bytes_per_pixel).min(self.pitch);
+		unsafe {
+			let base = self.addr as *mut u8;
+			let mut y = y_first;
+			while y + dy < y_end {
+				let dst = base.add(y * self.pitch);
+				let src = base.add((y + dy) * self.pitch);
+				core::ptr::copy_nonoverlapping(src, dst, row_bytes);
+				y += 1;
+			}
+		}
+	}
+
+	// Shift the framebuffer pixels for grid rows [top, bot] down by n cell-heights - the
+	// downward counterpart of scroll_pixels_up (reverse index / insert line).
+	fn scroll_pixels_down(&self, top: usize, bot: usize, n: usize) {
+		let dy = n * CELL_H;
+		let y_first = top * CELL_H;
+		let y_end = ((bot + 1) * CELL_H).min(self.height);
+		if dy >= y_end.saturating_sub(y_first) {
+			return;
+		}
+		let row_bytes = (self.width * self.bytes_per_pixel).min(self.pitch);
+		unsafe {
+			let base = self.addr as *mut u8;
+			let mut y = y_end;
+			while y > y_first + dy {
+				y -= 1;
+				let dst = base.add(y * self.pitch);
+				let src = base.add((y - dy) * self.pitch);
+				core::ptr::copy_nonoverlapping(src, dst, row_bytes);
+			}
+		}
+	}
+
 	// Scroll the rows [top, bot] up by n, filling the freed bottom rows with blanks.
 	fn region_up(&mut self, top: usize, bot: usize, n: usize) {
 		let n = n.max(1);
 		let cols = self.cols;
 		let blank = self.blank();
+		// On the live view, move the framebuffer pixels in bulk and repaint only the vacated
+		// rows instead of re-blitting the whole region. Sync pending dirty cells and erase the
+		// caret first so the shift carries correct, caret-free pixels.
+		let live = self.view_offset == 0;
+		if live {
+			self.flush_band(top, bot);
+			if let Some((c, r)) = self.last_caret.take() {
+				self.draw_cell(c, r);
+			}
+			self.scroll_pixels_up(top, bot, n);
+		}
 		{
 			let buf = if self.alt_active { &mut self.alt } else { &mut self.primary };
 			for row in top..=bot {
@@ -486,7 +560,8 @@ impl Term {
 				}
 			}
 		}
-		for row in top..=bot {
+		let dirty_top = if live { (bot + 1).saturating_sub(n).max(top) } else { top };
+		for row in dirty_top..=bot {
 			for col in 0..cols {
 				self.dirty[row * cols + col] = true;
 			}
@@ -498,6 +573,14 @@ impl Term {
 		let n = n.max(1);
 		let cols = self.cols;
 		let blank = self.blank();
+		let live = self.view_offset == 0;
+		if live {
+			self.flush_band(top, bot);
+			if let Some((c, r)) = self.last_caret.take() {
+				self.draw_cell(c, r);
+			}
+			self.scroll_pixels_down(top, bot, n);
+		}
 		{
 			let buf = if self.alt_active { &mut self.alt } else { &mut self.primary };
 			for row in (top..=bot).rev() {
@@ -506,7 +589,8 @@ impl Term {
 				}
 			}
 		}
-		for row in top..=bot {
+		let dirty_bot = if live { (top + n - 1).min(bot) } else { bot };
+		for row in top..=dirty_bot {
 			for col in 0..cols {
 				self.dirty[row * cols + col] = true;
 			}
@@ -1680,6 +1764,11 @@ struct Console {
 	cur_w: u32,
 	cur_h: u32,
 	input: u64,
+	// Foreground VT output accumulated during one wake for the serial debug mirror, written
+	// out AFTER the display present: the emulated serial port is baud-throttled, so mirroring
+	// it after presenting keeps a slow serial console from delaying the SPICE/VNC display.
+	// Cleared after each drain.
+	serial: Vec<u8>,
 	vts: Vec<Vt>,
 	fg: usize,
 	// Program-hosted PTYs: terminals whose master is another program (the `script` tool,
@@ -1814,7 +1903,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, pkg_handle };
-		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, package, pkg_len };
+		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: Vec::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, package, pkg_len };
 		run(&mut console);
 	}
 }
@@ -1866,49 +1955,75 @@ unsafe fn run(console: &mut Console) -> ! {
 				waits[pty_base + 3 * j + 2] = console.ptys[j].master;
 			}
 			let total: usize = pty_base + 3 * np;
+			// Block (~0% CPU) until a channel is ready: a keystroke, VT output, a gpu RESIZE, or
+			// a program-hosted PTY's traffic.
 			let ready: i64 = wait_any(&waits[..total], 0);
-			if ready < 0 {
-				continue;
-			}
-			let r: usize = ready as usize;
-			if r == 0 {
-				// keystrokes from the kernel console input.
-				if let Received::Message { len, .. } = recv_blocking(console.input, &mut keys) {
-					handle_keys(console, &keys[..len]);
-				}
-			} else if have_gpu && r == gpu_idx {
-				// the gpu driver reports a host-window resize: refit every VT.
-				handle_gpu_resize(console);
-			} else if r < gpu_idx {
-				let vi: usize = (r - 1) / 2;
-				if (r - 1) % 2 == 0 {
-					// output bytes from VT vi's shell.
-					match recv_blocking(console.vts[vi].client, &mut out) {
-						Received::Message { len, .. } => render_output(console, vi, &out[..len]),
-						Received::Closed => close_vt(console, vi),
+			if ready >= 0 {
+				let r: usize = ready as usize;
+				if r == 0 {
+					// keystrokes from the kernel console input.
+					if let Received::Message { len, .. } = recv_blocking(console.input, &mut keys) {
+						handle_keys(console, &keys[..len]);
+					}
+				} else if have_gpu && r == gpu_idx {
+					// the gpu driver reports a host-window resize: refit every VT.
+					handle_gpu_resize(console);
+				} else if r < gpu_idx {
+					let vi: usize = (r - 1) / 2;
+					if (r - 1) % 2 == 0 {
+						// Output bytes from VT vi's shell: drain the whole burst into the grid
+						// before the single present below, so a multi-line command (e.g. `help`)
+						// paints in one GPU flush instead of one full-frame flush per printed line.
+						loop {
+							match try_recv(console.vts[vi].client, &mut out) {
+								Polled::Message { len, .. } => render_output(console, vi, &out[..len]),
+								Polled::Empty => break,
+								Polled::Closed => {
+									close_vt(console, vi);
+									break;
+								}
+							}
+						}
+					} else {
+						// a control message from VT vi's shell (SET_FG / CLEAR_FG / winsize / PTY_OPEN).
+						handle_control(console, vi);
 					}
 				} else {
-					// a control message from VT vi's shell (SET_FG / CLEAR_FG / winsize / PTY_OPEN).
-					handle_control(console, vi);
+					// a program-hosted PTY: forward the slave program's output to the host, serve
+					// its control channel, or feed the host's input through the line discipline.
+					let pj: usize = (r - pty_base) / 3;
+					match (r - pty_base) % 3 {
+						0 => loop {
+							// Drain the slave program's output burst before the single present below.
+							match try_recv(console.ptys[pj].client, &mut out) {
+								Polled::Message { len, .. } => pty_output(console, pj, &out[..len]),
+								Polled::Empty => break,
+								Polled::Closed => {
+									close_pty(console, pj);
+									break;
+								}
+							}
+						},
+						1 => handle_pty_control(console, pj),
+						_ => match recv_blocking(console.ptys[pj].master, &mut out) {
+							Received::Message { len, .. } => pty_master_input(console, pj, &out[..len]),
+							Received::Closed => close_pty(console, pj),
+						},
+					}
 				}
-			} else {
-				// a program-hosted PTY: forward the slave program's output to the host, serve
-				// its control channel, or feed the host's input through the line discipline.
-				let pj: usize = (r - pty_base) / 3;
-				match (r - pty_base) % 3 {
-					0 => match recv_blocking(console.ptys[pj].client, &mut out) {
-						Received::Message { len, .. } => pty_output(console, pj, &out[..len]),
-						Received::Closed => close_pty(console, pj),
-					},
-					1 => handle_pty_control(console, pj),
-					_ => match recv_blocking(console.ptys[pj].master, &mut out) {
-						Received::Message { len, .. } => pty_master_input(console, pj, &out[..len]),
-						Received::Closed => close_pty(console, pj),
-					},
+				// Present the freshly rendered foreground to the display (a no-op on the boot
+				// framebuffer), THEN drain the serial debug mirror. present() only queues a
+				// FLUSH to the gpu driver; the frame reaches the screen once that driver runs,
+				// as soon as this thread next blocks. The mirror is best-effort and
+				// non-blocking (the kernel drops it under backpressure rather than throttling
+				// this thread on the baud-paced UART), so it never stalls the framebuffer the
+				// SPICE/VNC user sees.
+				present(console.gpu);
+				if !console.serial.is_empty() {
+					print(&console.serial);
+					console.serial.clear();
 				}
 			}
-			// present the foreground to the display (a no-op on the boot framebuffer).
-			present(console.gpu);
 		}
 	}
 }
@@ -1953,7 +2068,9 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 			console.vts[vi].ld.echo = echo;
 		}
 		if fg {
-			print(bytes);
+			// Buffer for the serial mirror; the session loop writes it after the present so the
+			// baud-throttled serial port never delays the display (see `run`).
+			console.serial.extend_from_slice(bytes);
 		}
 	}
 }

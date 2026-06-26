@@ -95,6 +95,18 @@ pub fn halt_loop() -> ! {
 	}
 }
 
+// Halt the current core until the next interrupt, for the idle loop. `sti` enables
+// interrupts and, by the one-instruction delay before they take effect, lets the
+// following `hlt` execute first - so a wakeup interrupt cannot slip in between the two
+// and be lost. This yields the physical CPU instead of busy-spinning, which under
+// virtualization is essential: a spinning vCPU steals host time from the cores doing
+// real work and from the host's own device emulation.
+pub fn idle_halt() {
+	unsafe {
+		asm!("sti; hlt", options(nomem, nostack, preserves_flags));
+	}
+}
+
 // Reboot the machine. Pulses the PCH reset-control register (0xCF9), then the
 // 8042 keyboard-controller reset line; on real hardware one of these resets the
 // CPU, and QEMU treats either as a machine reset (unless QEMU was started with
@@ -130,6 +142,8 @@ pub fn poweroff() -> ! {
 // exit QEMU via the isa-debug-exit device (test harness only)
 #[cfg(test)]
 pub fn exit_qemu(success: bool) -> ! {
+	// Flush any queued serial output (the test report) before QEMU exits.
+	serial::flush_sync();
 	let code: u32 = if success { 0x10 } else { 0x11 };
 	unsafe {
 		asm!("out dx, eax", in("dx") 0xf4u16, in("eax") code, options(nomem, nostack, preserves_flags));

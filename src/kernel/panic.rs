@@ -6,6 +6,8 @@ fn panic(info: &PanicInfo) -> ! {
 	crate::serial_println!();
 	crate::serial_println!("*** KERNEL PANIC ***");
 	crate::serial_println!("{}", info);
+	// Drain the panic message to the wire before halting (serial is asynchronous).
+	crate::arch::serial::flush_sync();
 	crate::arch::halt_loop();
 }
 
@@ -15,5 +17,6 @@ fn panic(info: &PanicInfo) -> ! {
 fn panic(info: &PanicInfo) -> ! {
 	crate::serial_println!("[failed]");
 	crate::serial_println!("{}", info);
+	crate::arch::serial::flush_sync();
 	crate::arch::exit_qemu(false);
 }

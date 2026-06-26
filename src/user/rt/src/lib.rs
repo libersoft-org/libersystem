@@ -80,22 +80,28 @@ pub unsafe fn yield_now() {
 	}
 }
 
-// Write `bytes` to the debug console one byte at a time. The only output path a
-// ring-3 program has for now (a real console service arrives with virtio-console).
+// Write `bytes` to the debug console. The only output path a ring-3 program has when no
+// stdout console channel is set (the real console service routes through that channel).
 pub unsafe fn print(bytes: &[u8]) {
 	unsafe {
 		// If a stdout console channel is set, the program's terminal output goes there
 		// (to the userspace ConsoleService, which renders it and mirrors it to serial)
-		// as one message; otherwise it falls back to the kernel debug port byte by byte.
+		// as one message; otherwise it falls back to the kernel debug port in bulk -
+		// one syscall per chunk, not one per byte (the per-byte path stalled the console
+		// service's serial mirror, and the gpu present queued behind it, for ~500 ms).
 		let out: u64 = STDOUT.load(Ordering::Relaxed);
 		if out != 0 && send_blocking(out, bytes, 0) {
 			return;
 		}
-		for &b in bytes {
-			syscall(SYS_DEBUG_WRITE, b as u64, 0, 0, 0);
+		for chunk in bytes.chunks(DEBUG_WRITE_CHUNK) {
+			syscall(SYS_DEBUG_WRITE, chunk.as_ptr() as u64, chunk.len() as u64, 0, 0);
 		}
 	}
 }
+
+// Largest slice handed to one bulk SYS_DEBUG_WRITE, matching the kernel's cap (the
+// serial TX ring size). Longer output is chunked across several syscalls.
+const DEBUG_WRITE_CHUNK: usize = 16384;
 
 // The console channel a program's `print` output is routed to (the ConsoleService
 // end), or 0 for the kernel debug port. Set by `set_stdout`; inherited by spawned
@@ -112,6 +118,130 @@ pub fn set_stdout(channel: u64) {
 // launcher duplicates it to hand its children the same console.
 pub fn stdout() -> u64 {
 	STDOUT.load(Ordering::Relaxed)
+}
+
+// Lightweight cross-process perf tracing for latency hunting, off by default. `perf_mark`
+// emits a `\x1ePERF <label> <tsc>` line straight to the kernel debug serial (NOT the
+// console channel), so a marker reaches the host trace tool (boot/perf-trace.py) without
+// touching the framebuffer or the console render path. The TSC is read in ring 3 (rdtsc is
+// unprivileged) and is a global cycle clock shared by every process and the kernel, so
+// markers from the shell, the console service, and the gpu driver sit on one timeline; the
+// kernel publishes the TSC frequency at boot (the `tsc_hz` marker) so the host converts
+// cycles to time. Flip PERF to true and drop perf_mark calls around the path under study;
+// false compiles every marker out.
+pub const PERF: bool = false;
+
+// Read the time-stamp counter for a perf marker (the same cycle clock the kernel times
+// with). The lfence keeps the read from being reordered ahead of the work it brackets.
+#[inline]
+pub fn perf_now() -> u64 {
+	let lo: u32;
+	let hi: u32;
+	unsafe {
+		asm!("lfence", "rdtsc", out("eax") lo, out("edx") hi, options(nostack, preserves_flags));
+	}
+	((hi as u64) << 32) | lo as u64
+}
+
+// Emit one perf marker (`\x1ePERF <label> <tsc>\n`) to the kernel debug serial. The
+// timestamp is taken first so the bulk-syscall emit never inflates it; keep markers
+// coarse (not inside tight inner loops) to keep that emit cost off the path.
+pub fn perf_mark(label: &[u8]) {
+	if !PERF {
+		return;
+	}
+	let tsc = perf_now();
+	let mut line = [0u8; 96];
+	let mut n = 0usize;
+	line[n] = 0x1e; // ASCII record separator: flags a perf line for the host parser
+	n += 1;
+	for &b in b"PERF " {
+		line[n] = b;
+		n += 1;
+	}
+	for &b in label {
+		if n >= line.len() - 24 {
+			break;
+		}
+		line[n] = b;
+		n += 1;
+	}
+	line[n] = b' ';
+	n += 1;
+	let mut digits = [0u8; 20];
+	let mut d = 0usize;
+	let mut v = tsc;
+	if v == 0 {
+		digits[d] = b'0';
+		d += 1;
+	}
+	while v > 0 {
+		digits[d] = b'0' + (v % 10) as u8;
+		d += 1;
+		v /= 10;
+	}
+	while d > 0 {
+		d -= 1;
+		line[n] = digits[d];
+		n += 1;
+	}
+	line[n] = b'\n';
+	n += 1;
+	unsafe {
+		syscall(SYS_DEBUG_WRITE, line.as_ptr() as u64, n as u64, 0, 0);
+	}
+}
+
+// Like `perf_mark` but also records a decimal value (a spin/yield count, a byte size,
+// ...): emits `\x1ePERF <label> <tsc> <val>\n`. The host parser shows the value next to
+// the marker so a slow phase can be correlated with what it was doing (e.g. how many
+// times a queue submit yielded while waiting for the device).
+pub fn perf_mark_val(label: &[u8], val: u64) {
+	if !PERF {
+		return;
+	}
+	let tsc = perf_now();
+	let mut line = [0u8; 128];
+	let mut n = 0usize;
+	line[n] = 0x1e;
+	n += 1;
+	for &b in b"PERF " {
+		line[n] = b;
+		n += 1;
+	}
+	for &b in label {
+		if n >= line.len() - 48 {
+			break;
+		}
+		line[n] = b;
+		n += 1;
+	}
+	for v in [tsc, val] {
+		line[n] = b' ';
+		n += 1;
+		let mut digits = [0u8; 20];
+		let mut d = 0usize;
+		let mut x = v;
+		if x == 0 {
+			digits[d] = b'0';
+			d += 1;
+		}
+		while x > 0 {
+			digits[d] = b'0' + (x % 10) as u8;
+			d += 1;
+			x /= 10;
+		}
+		while d > 0 {
+			d -= 1;
+			line[n] = digits[d];
+			n += 1;
+		}
+	}
+	line[n] = b'\n';
+	n += 1;
+	unsafe {
+		syscall(SYS_DEBUG_WRITE, line.as_ptr() as u64, n as u64, 0, 0);
+	}
 }
 
 // Adopt a stdout console channel a launcher sent as the first bootstrap message

@@ -1,3 +1,4 @@
+- Boot log - [ OK ] [FAIL] [INFO] [WARN]
 - Enhance ping command
 - Don't clear console before consoleservice shows up (so user can see boot log from kernel)
 - "exit" command should not halt the machine, but just exits the shell and shows up the parent shell (shell that started this console). If there is no parent, then, then just reload the whole shell

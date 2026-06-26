@@ -358,6 +358,14 @@ impl Queue {
 				if spins > 10_000_000 {
 					return None;
 				}
+				// The fast common case completes within the spin budget below and never
+				// yields, keeping device control paths low-latency. A slow completion
+				// (e.g. a virtio-gpu RESOURCE_FLUSH stalled behind a slow/remote display
+				// client) instead yields the core cooperatively, so a co-scheduled thread
+				// (the console pipeline) is not starved while the present drains.
+				if spins % 4096 == 0 {
+					yield_now();
+				}
 			}
 			// Each used-ring element is { id u32, len u32 }; return the used length.
 			Some(r32(used + 4 + (old_used % self.size) as u64 * 8 + 4))
