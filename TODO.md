@@ -762,7 +762,7 @@ wrap flag. Each sub-step must build and keep the test harness green (66 [ok]).
       over. Removes the duplicate renderer (the "find dead/duplicate code" NOTES item). Done
       when: the boot log is visible in the running shell on both the boot-fb and gpu/spice
       paths; green.
-- [ ] M47h - Wire an L1 stream tap (optional, foundation for ssh/telnet/script): route the raw
+- [x] M47h - Wire an L1 stream tap (optional, foundation for ssh/telnet/script): route the raw
       byte stream to additional sinks (a raw capture / log) alongside the L2 model. Done when:
       a raw-capture sink records the exact emitted stream; green.
 - Done when: the console is three clean layers (stream / grid model / renderer) over a

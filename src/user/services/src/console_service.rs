@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 // display `Surface`. This service supplies the userspace display backends - the boot
 // framebuffer and the virtio-gpu shared backing - and drives `Term`; the kernel boot
 // console shares the same `Term`.
-use term::{Geometry, Raster, Surface, Term, CELL_H, CELL_W};
+use term::{CELL_H, CELL_W, Geometry, Raster, RawSink, Surface, Term};
 
 // The boot framebuffer the kernel maps directly: its pixel writes are visible immediately,
 // so present is a no-op. The fallback display (and the deterministic test path).
@@ -506,11 +506,12 @@ struct Console {
 	cur_w: u32,
 	cur_h: u32,
 	input: u64,
-	// Foreground VT output accumulated during one wake for the serial debug mirror, written
-	// out AFTER the display present: the emulated serial port is baud-throttled, so mirroring
-	// it after presenting keeps a slow serial console from delaying the SPICE/VNC display.
-	// Cleared after each drain.
-	serial: Vec<u8>,
+	// The foreground VT's raw output stream (L1), tapped during one wake for the serial debug
+	// mirror and written out AFTER the display present: the emulated serial port is
+	// baud-throttled, so mirroring it after presenting keeps a slow serial console from
+	// delaying the SPICE/VNC display. A `RawSink` - the same L1 tap a future ssh/`script` would
+	// fork the stream into - drained and cleared after each wake.
+	serial: RawSink,
 	vts: Vec<Vt>,
 	fg: usize,
 	// Program-hosted PTYs: terminals whose master is another program (the `script` tool,
@@ -658,7 +659,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, pkg_handle };
-		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: Vec::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, package, pkg_len };
+		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, package, pkg_len };
 		run(&mut console);
 	}
 }
@@ -775,7 +776,7 @@ unsafe fn run(console: &mut Console) -> ! {
 				// SPICE/VNC user sees.
 				present_fg(console);
 				if !console.serial.is_empty() {
-					print(&console.serial);
+					print(console.serial.as_bytes());
 					console.serial.clear();
 				}
 			}
@@ -822,9 +823,10 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 			console.vts[vi].ld.echo = echo;
 		}
 		if fg {
-			// Buffer for the serial mirror; the session loop writes it after the present so the
-			// baud-throttled serial port never delays the display (see `run`).
-			console.serial.extend_from_slice(bytes);
+			// Tap the raw output stream (L1) into the serial mirror, alongside the L2 model above;
+			// the session loop drains it after the present so the baud-throttled serial port never
+			// delays the display (see `run`).
+			console.serial.feed(bytes);
 		}
 	}
 }

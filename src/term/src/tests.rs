@@ -4,7 +4,7 @@
 //! the expected logical text - the model is exercised with no renderer, proving it is
 //! graphics-independent.
 
-use crate::{Screen, TextSink};
+use crate::{RawSink, Screen, TextSink};
 use alloc::vec::Vec;
 
 fn dump(screen: &Screen) -> Vec<u8> {
@@ -62,4 +62,33 @@ fn scrollback_preserves_soft_wrap() {
 	// wrapped pair up into the scrollback before the dump is taken.
 	feed(&mut s, b"abcdefghij\n1\n2\n3\n4");
 	assert_eq!(dump(&s), b"abcdefghij\n1\n2\n3\n4");
+}
+
+// The L1 stream tap records the raw bytes verbatim - ANSI control codes included - alongside
+// the L2 model: the console forks each output chunk into the `Screen` (which parses it into
+// glyphs) and the `RawSink` (which keeps the exact stream a future ssh/`script` would forward).
+#[test]
+fn raw_sink_records_the_exact_stream() {
+	let stream: &[u8] = b"\x1b[31mhi\x1b[0m\nbye";
+	let mut s = Screen::new(8, 4);
+	let mut raw = RawSink::new();
+	raw.feed(stream);
+	feed(&mut s, stream);
+	// L1: the tap holds the stream byte-for-byte, control codes and all.
+	assert_eq!(raw.as_bytes(), stream);
+	// L2: the model parsed the same stream into its glyphs (the SGR codes are consumed).
+	assert_eq!(dump(&s), b"hi\nbye");
+}
+
+// A fresh tap is empty, fills as the stream is fed, and resets on `clear` (how the serial
+// mirror drains itself each wake).
+#[test]
+fn raw_sink_clear_resets_the_capture() {
+	let mut raw = RawSink::new();
+	assert!(raw.is_empty());
+	raw.feed(b"abc");
+	assert!(!raw.is_empty());
+	raw.clear();
+	assert!(raw.is_empty());
+	assert_eq!(raw.as_bytes(), b"");
 }
