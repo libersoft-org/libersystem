@@ -156,6 +156,14 @@ An opaque kernel object, transferred as `handle<file>`.
 | `timeout` | 1 |
 | `unreachable` | 2 |
 
+### record `ping-reply`
+
+| field | type |
+| --- | --- |
+| `status` | `ping-status` |
+| `ttl` | `u8` |
+| `rtt-us` | `u32` |
+
 ### record `tcp-request`
 
 | field | type |
@@ -267,7 +275,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | --- | --- | --- |
 | 1 | `info` | `info() -> result<net-info, error>` |
 | 2 | `resolve` | `resolve(name: string) -> result<ipv4-addr, error>` |
-| 3 | `ping` | `ping(addr: ipv4-addr) -> result<ping-status, error>` |
+| 3 | `ping` | `ping(addr: ipv4-addr) -> result<ping-reply, error>` |
 | 4 | `fetch` | `fetch(req: tcp-request) -> result<list<u8>, error>` |
 | 5 | `connect` | `connect(ep: endpoint) -> result<handle<channel>, error>` |
 | 6 | `open` | `open() -> result<handle<channel>, error>` |

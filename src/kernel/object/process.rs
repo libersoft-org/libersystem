@@ -52,6 +52,13 @@ pub struct Process {
 	// Set while the process is suspended (SIGSTOP); its threads park at their next
 	// scheduling point until resumed (SIGCONT).
 	stopped: AtomicBool,
+	// Set when the process has armed itself to catch SIG_INT (SYS_SIGNAL_CATCH). While
+	// armed, a delivered SIG_INT sets `int_pending` instead of terminating the process,
+	// so a long-running tool can stop cleanly on Ctrl+C rather than being killed.
+	int_caught: AtomicBool,
+	// Set when a caught SIG_INT has been delivered and not yet consumed; the process
+	// polls and clears it with SYS_SIGNAL_TAKE.
+	int_pending: AtomicBool,
 }
 
 impl Process {
@@ -61,7 +68,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false) });
 		// Register with the Domain so a Domain kill can reach and terminate it.
 		process.domain.register_process(&process);
 		process
@@ -133,6 +140,29 @@ impl Process {
 	// Set or clear the suspended state (SIGSTOP sets, SIGCONT clears).
 	pub fn set_stopped(&self, stopped: bool) {
 		self.stopped.store(stopped, Ordering::Release);
+	}
+
+	// Arm the process to catch SIG_INT: a subsequent SIG_INT sets the pending flag
+	// rather than terminating the process. A self-service disposition; a process only
+	// arms itself.
+	pub fn catch_int(&self) {
+		self.int_caught.store(true, Ordering::Release);
+	}
+
+	// Whether the process has armed itself to catch SIG_INT.
+	pub fn is_int_caught(&self) -> bool {
+		self.int_caught.load(Ordering::Acquire)
+	}
+
+	// Record that a caught SIG_INT was delivered (set by signal delivery on an armed
+	// process in place of termination).
+	pub fn set_int_pending(&self) {
+		self.int_pending.store(true, Ordering::Release);
+	}
+
+	// Poll and clear the pending caught SIG_INT, returning whether one was pending.
+	pub fn take_int_pending(&self) -> bool {
+		self.int_pending.swap(false, Ordering::AcqRel)
 	}
 
 	// Terminate this process: mark it killed and close all its handles, refunding

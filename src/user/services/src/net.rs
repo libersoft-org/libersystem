@@ -72,6 +72,11 @@ const ICMP_HDR: usize = 8;
 const UDP_HDR: usize = 8;
 const TCP_HDR: usize = 20;
 
+// ICMP echo payload size (bytes). 56 matches the ping default, so the on-wire
+// packet is 84 bytes (20 IP + 8 ICMP + 56) and a reply reports the familiar 64
+// bytes (8 ICMP + 56 payload).
+const ICMP_PAYLOAD: usize = 56;
+
 // TCP control flags.
 const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
@@ -226,8 +231,9 @@ pub enum Event {
 	None,
 	// We learned a neighbor's MAC (from an ARP reply for an address we asked about).
 	Learned(Ipv4Addr, MacAddr),
-	// An ICMP echo reply arrived (a `ping` we sent was answered).
-	EchoReply(Ipv4Addr),
+	// An ICMP echo reply arrived (a `ping` we sent was answered): the responder's
+	// address, the reply packet's IP TTL, and the echoed sequence number.
+	EchoReply(Ipv4Addr, u8, u16),
 	// A DNS response resolved a name to this address.
 	DnsReply(Ipv4Addr),
 	// A DHCP reply arrived with this message type (OFFER or ACK); the learned lease is
@@ -892,7 +898,9 @@ impl Stack {
 			return Outcome { reply_len: len, event: Event::None };
 		}
 		if icmp[0] == ICMP_ECHO_REPLY {
-			return Outcome { reply_len: 0, event: Event::EchoReply(src_ip) };
+			let ttl: u8 = frame[ETH_HDR + 8];
+			let seq: u16 = be16(icmp, 6);
+			return Outcome { reply_len: 0, event: Event::EchoReply(src_ip, ttl, seq) };
 		}
 		Outcome { reply_len: 0, event: Event::None }
 	}
@@ -929,7 +937,7 @@ impl Stack {
 	// Build an ICMP echo request to `dst_ip` (whose MAC is `dst_mac`) with the given
 	// identifier and sequence, into `out`, returning its length.
 	pub fn build_icmp_echo(&self, dst_mac: MacAddr, dst_ip: Ipv4Addr, ident: u16, seq: u16, out: &mut [u8]) -> usize {
-		let total: usize = IPV4_HDR + ICMP_HDR;
+		let total: usize = IPV4_HDR + ICMP_HDR + ICMP_PAYLOAD;
 		out[0..6].copy_from_slice(&dst_mac.0);
 		out[6..12].copy_from_slice(&self.mac.0);
 		put16(out, 12, ETHERTYPE_IPV4);
@@ -952,6 +960,10 @@ impl Stack {
 		put16(icmp, 2, 0);
 		put16(icmp, 4, ident);
 		put16(icmp, 6, seq);
+		// Fill the payload with a recognizable pattern; the checksum below covers it.
+		for i in 0..ICMP_PAYLOAD {
+			icmp[ICMP_HDR + i] = i as u8;
+		}
 		let csum2: u16 = checksum(icmp);
 		put16(icmp, 2, csum2);
 		ETH_HDR + total

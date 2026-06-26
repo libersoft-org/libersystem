@@ -1505,6 +1505,41 @@ impl PingStatus {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct PingReply {
+	pub status: PingStatus,
+	pub ttl: u8,
+	pub rtt_us: u32,
+}
+
+impl PingReply {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PingReply> {
+		PingReply::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.status.write(w)?;
+		w.u8(self.ttl)?;
+		w.u32(self.rtt_us)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<PingReply> {
+		let status = PingStatus::read(r)?;
+		let ttl = r.u8()?;
+		let rtt_us = r.u32()?;
+		Some(PingReply { status, ttl, rtt_us })
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct TcpRequest {
 	pub ep: Endpoint,
 	pub request: Vec<u8>,
@@ -1644,7 +1679,7 @@ pub mod network {
 	pub trait Service {
 		fn info(&mut self) -> Result<NetInfo, Error>;
 		fn resolve(&mut self, name: String) -> Result<Ipv4Addr, Error>;
-		fn ping(&mut self, addr: Ipv4Addr) -> Result<PingStatus, Error>;
+		fn ping(&mut self, addr: Ipv4Addr) -> Result<PingReply, Error>;
 		fn fetch(&mut self, req: TcpRequest) -> Result<Vec<u8>, Error>;
 		fn connect(&mut self, ep: Endpoint) -> Result<u64, Error>;
 		fn open(&mut self) -> Result<u64, Error>;
@@ -1856,7 +1891,7 @@ pub mod network {
 			}
 			Some(if r.u8()? != 0 { Ok(Ipv4Addr::read(r)?) } else { Err(Error::read(r)?) })
 		}
-		pub fn ping(&mut self, addr: &Ipv4Addr) -> Option<Result<PingStatus, Error>> {
+		pub fn ping(&mut self, addr: &Ipv4Addr) -> Option<Result<PingReply, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -1871,7 +1906,7 @@ pub mod network {
 			if r.u32()? != corr {
 				return None;
 			}
-			Some(if r.u8()? != 0 { Ok(PingStatus::read(r)?) } else { Err(Error::read(r)?) })
+			Some(if r.u8()? != 0 { Ok(PingReply::read(r)?) } else { Err(Error::read(r)?) })
 		}
 		pub fn fetch(&mut self, req: &TcpRequest) -> Option<Result<Vec<u8>, Error>> {
 			let corr = self.next_corr();
@@ -3339,6 +3374,43 @@ impl PingStatus {
 	}
 }
 
+impl PingReply {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"status\":");
+		self.status.to_json_into(out);
+		out.push(',');
+		out.push_str("\"ttl\":");
+		let _ = write!(out, "{}", self.ttl);
+		out.push(',');
+		out.push_str("\"rtt-us\":");
+		let _ = write!(out, "{}", self.rtt_us);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("status=");
+		self.status.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("ttl=");
+		let _ = write!(out, "{}", self.ttl);
+		out.push_str(", ");
+		out.push_str("rtt-us=");
+		let _ = write!(out, "{}", self.rtt_us);
+		out.push('}');
+	}
+}
+
 impl TcpRequest {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -3695,6 +3767,14 @@ mod compat {
 		let golden: &[u8] = &[0];
 		assert_eq!(bytes, golden);
 		assert_eq!(PingStatus::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn ping_reply_wire_is_stable() {
+		let sample = PingReply { status: PingStatus::Reply, ttl: 7, rtt_us: 7 };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[0, 7, 7, 0, 0, 0];
+		assert_eq!(bytes, golden);
+		assert_eq!(PingReply::decode(&bytes).unwrap(), sample);
 	}
 	#[test]
 	fn tcp_request_wire_is_stable() {

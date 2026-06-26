@@ -519,7 +519,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  config [<key>]   list the config tree or read one key via ConfigService\n");
 			print(b"  set <key> <val>  write a config key via ConfigService\n");
 			print(b"  ip | net         show the network interface and ARP cache\n");
-			print(b"  ping <ip>        send an ICMP echo via the net driver\n");
+			print(b"  ping [-c n] <host>  ICMP echo a host (name or address) until Ctrl+C\n");
 			print(b"  nslookup <name>  resolve a name to an address via DNS\n");
 			print(b"  tcp <ip> <port>  open a TCP connection and probe it (HTTP GET)\n");
 			print(b"  nc <ip> <port>   open a raw TCP connection (optional request to send)\n");

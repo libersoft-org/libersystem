@@ -23,9 +23,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use rt::*;
 
-use crate::net::{DHCP_ACK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, SockEntry, SockEntryState, Stack};
+use crate::net::{Event, Ipv4Addr, MacAddr, SockEntry, SockEntryState, Stack, DHCP_ACK, DHCP_OFFER};
 use proto::codec::Buffer;
-use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingStatus, SockInfo, SockState, TcpRequest, listener, network, socket};
+use proto::system::{listener, network, socket, Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -563,14 +563,17 @@ impl network::Service for Net<'_> {
 		}
 	}
 
-	// Ping an address: a reply, a timeout, or unreachable (no route / no ARP).
-	fn ping(&mut self, addr: WireIp) -> Result<PingStatus, Error> {
+	// Ping an address: a reply (with its TTL and round-trip time), a timeout, or
+	// unreachable (no route / no ARP).
+	fn ping(&mut self, addr: WireIp) -> Result<PingReply, Error> {
 		unsafe {
-			Ok(match do_ping(from_wire(&addr), self.frames, self.stack, &mut self.seq, self.rx, self.tx) {
+			let (status, ttl, rtt_us): (u8, u8, u32) = do_ping(from_wire(&addr), self.frames, self.stack, &mut self.seq, self.rx, self.tx);
+			let status: PingStatus = match status {
 				1 => PingStatus::Reply,
 				2 => PingStatus::Unreachable,
 				_ => PingStatus::Timeout,
-			})
+			};
+			Ok(PingReply { status, ttl, rtt_us })
 		}
 	}
 
@@ -780,29 +783,34 @@ unsafe fn resolve(ip: Ipv4Addr, frames: u64, stack: &mut Stack, rx: &mut [u8], t
 }
 
 // Send an ICMP echo request to `ip` and wait for the reply, pumping received frames
-// as they arrive. Returns 1 = reply received, 0 = timed out, 2 = unresolved.
-unsafe fn do_ping(ip: Ipv4Addr, frames: u64, stack: &mut Stack, seq: &mut u16, rx: &mut [u8], tx: &mut [u8]) -> u8 {
+// as they arrive. Returns (status, ttl, rtt_us): status 1 = reply received (ttl is
+// the reply's IP TTL, rtt_us the round-trip time in microseconds), 0 = timed out,
+// 2 = unresolved (ttl/rtt 0 in both).
+unsafe fn do_ping(ip: Ipv4Addr, frames: u64, stack: &mut Stack, seq: &mut u16, rx: &mut [u8], tx: &mut [u8]) -> (u8, u8, u32) {
 	unsafe {
 		let hop: Ipv4Addr = stack.next_hop(ip);
 		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
 			Some(m) => m,
-			None => return 2,
+			None => return (2, 0, 0),
 		};
 		*seq = seq.wrapping_add(1);
-		let echo: usize = stack.build_icmp_echo(mac, ip, 1, *seq, tx);
+		let sent_seq: u16 = *seq;
+		let echo: usize = stack.build_icmp_echo(mac, ip, 1, sent_seq, tx);
+		let start: u64 = clock_ns();
 		send_frame(frames, &tx[..echo]);
 		let deadline: u64 = clock() + PING_TIMEOUT_TICKS;
 		while clock() < deadline {
 			if wait(frames, deadline) != 0 {
 				break;
 			}
-			if let Event::EchoReply(reply) = pump(frames, stack, rx, tx) {
-				if reply == ip {
-					return 1;
+			if let Event::EchoReply(reply, ttl, rseq) = pump(frames, stack, rx, tx) {
+				if reply == ip && rseq == sent_seq {
+					let rtt_us: u32 = (clock_ns().saturating_sub(start) / 1000).min(u32::MAX as u64) as u32;
+					return (1, ttl, rtt_us);
 				}
 			}
 		}
-		0
+		(0, 0, 0)
 	}
 }
 

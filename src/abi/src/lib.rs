@@ -88,6 +88,17 @@ pub const SYS_SYSTEM_POWER: u64 = 47;
 // buffer, returning the byte count. The kernel hands its on-screen boot log across to
 // a userspace ConsoleService at takeover, which replays it so the boot log survives.
 pub const SYS_CONSOLE_READLOG: u64 = 48;
+// Read the monotonic clock in nanoseconds since boot (the calibrated TSC), the
+// fine-grained companion to SYS_CLOCK_GET's 100 Hz ticks. Resolves latencies far
+// below a tick - an IPC round-trip, a ping RTT - that the tick counter cannot.
+pub const SYS_CLOCK_MONO_NS: u64 = 49;
+// Arm the calling process to catch a signal (SIG_INT only in this milestone): a
+// subsequent SIG_INT then sets a pending flag the process polls with SYS_SIGNAL_TAKE
+// instead of terminating it, so a long-running tool can stop cleanly on Ctrl+C.
+pub const SYS_SIGNAL_CATCH: u64 = 50;
+// Poll-and-clear a pending caught signal on the calling process: returns 1 if the
+// signal (SIG_INT) was delivered since the last take (clearing it), else 0.
+pub const SYS_SIGNAL_TAKE: u64 = 51;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;

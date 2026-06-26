@@ -199,6 +199,15 @@ enum ping-status {
 	unreachable,
 }
 
+// The result of one ping echo: the outcome, the reply packet's IP TTL, and the
+// measured round-trip time in microseconds. `ttl` and `rtt-us` are meaningful only
+// when `status` is `reply` (zero otherwise).
+record ping-reply {
+	status: ping-status,
+	ttl:    u8,
+	rtt-us: u32,
+}
+
 // A one-shot TCP exchange: connect to `ep`, send `request`, and read the response.
 record tcp-request {
 	ep:      endpoint,
@@ -234,7 +243,7 @@ record sock-info {
 interface network {
 	@op(1) info:    func() -> result<net-info, error>;
 	@op(2) resolve: func(name: string) -> result<ipv4-addr, error>;
-	@op(3) ping:    func(addr: ipv4-addr) -> result<ping-status, error>;
+	@op(3) ping:    func(addr: ipv4-addr) -> result<ping-reply, error>;
 	@op(4) fetch:   func(req: tcp-request) -> result<list<u8>, error>;
 	@op(5) connect: func(ep: endpoint) -> result<handle<channel>, error>;
 	@op(6) open:    func() -> result<handle<channel>, error>;

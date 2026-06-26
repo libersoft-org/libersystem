@@ -602,6 +602,27 @@ pub unsafe fn clock_rtc() -> u64 {
 	unsafe { syscall(SYS_CLOCK_RTC, 0, 0, 0, 0) }
 }
 
+// Read the monotonic clock in nanoseconds since boot (the calibrated TSC), for
+// measuring latencies finer than a `clock()` tick - an IPC round-trip, a ping RTT.
+pub unsafe fn clock_ns() -> u64 {
+	unsafe { syscall(SYS_CLOCK_MONO_NS, 0, 0, 0, 0) }
+}
+
+// Arm this process to catch Ctrl+C (SIG_INT): once armed, an interrupt sets a pending
+// flag `interrupted()` polls instead of terminating us, so a long-running tool can
+// stop cleanly and print a summary. Ctrl+\ (SIG_TERM) still force-quits.
+pub unsafe fn catch_interrupt() {
+	unsafe {
+		syscall(SYS_SIGNAL_CATCH, SIG_INT, 0, 0, 0);
+	}
+}
+
+// Poll and clear a pending caught interrupt (Ctrl+C): true if one arrived since the
+// last call. Only meaningful after `catch_interrupt()` has armed the process.
+pub unsafe fn interrupted() -> bool {
+	unsafe { syscall(SYS_SIGNAL_TAKE, SIG_INT, 0, 0, 0) != 0 }
+}
+
 // Duplicate `handle` into a new handle carrying `rights` (a subset of the
 // original's). Returns the new handle, or a negative error.
 pub unsafe fn duplicate(handle: u64, rights: u32) -> i64 {

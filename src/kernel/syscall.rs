@@ -44,7 +44,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_PROCESS_SIGNAL, SYS_RANDOM_GET, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_PROCESS_SIGNAL, SYS_RANDOM_GET, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -188,6 +188,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_DEBUG_NOOP => a0 as i64,
 		SYS_CLOCK_GET => arch::apic::ticks() as i64,
 		SYS_CLOCK_RTC => arch::rtc::read_unix() as i64,
+		SYS_CLOCK_MONO_NS => arch::tsc::cycles_to_ns(arch::tsc::now()) as i64,
 		SYS_DEBUG_WRITE => sys_debug_write(a0, a1),
 		SYS_MEMORY_OBJECT_CREATE => sys_memory_object_create(a0),
 		SYS_DMA_BUFFER_CREATE => sys_dma_buffer_create(a0),
@@ -206,6 +207,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_PROCESS_CREATE => sys_process_create(),
 		SYS_PROCESS_LOAD => sys_process_load(a0, a1, a2),
 		SYS_PROCESS_SIGNAL => sys_process_signal(a0, a1),
+		SYS_SIGNAL_CATCH => sys_signal_catch(a0),
+		SYS_SIGNAL_TAKE => sys_signal_take(a0),
 		SYS_THREAD_CREATE => sys_thread_create(a0, a1, a2, a3),
 		SYS_THREAD_START => sys_thread_start(a0),
 		SYS_CONSOLE_ATTACH => sys_console_attach(a0),
@@ -677,14 +680,23 @@ fn sys_thread_start(thread_handle: u64) -> i64 {
 // default disposition. INT / TERM / KILL terminate the target; STOP suspends it; CONT
 // resumes a suspended one. Each case wakes the target's threads so a blocked thread
 // observes the change at once (a kill exits it, a stop parks it, a continue releases
-// it) rather than waiting on whatever it was blocked on. There are no user-installed
-// handlers in this milestone - only the default dispositions.
+// it) rather than waiting on whatever it was blocked on. INT is catchable: a process
+// that armed itself with SYS_SIGNAL_CATCH gets a pending flag set (and its threads
+// woken so a blocked poll loop notices) instead of being terminated, so it can stop
+// cleanly. There are no other user-installed handlers in this milestone - only the
+// default dispositions.
 fn sys_process_signal(process_handle: u64, signal: u64) -> i64 {
 	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
 		Ok(p) => p,
 		Err(e) => return e,
 	};
 	match signal {
+		SIG_INT if process.is_int_caught() => {
+			process.set_int_pending();
+			for thread in process.live_threads() {
+				sched::wake_thread(&thread);
+			}
+		}
 		SIG_INT | SIG_TERM | SIG_KILL => {
 			process.terminate();
 			for thread in process.live_threads() {
@@ -704,6 +716,26 @@ fn sys_process_signal(process_handle: u64, signal: u64) -> i64 {
 		_ => return ERR_INVALID,
 	}
 	0
+}
+
+// Arm the calling process to catch `signal` (SIG_INT only in this milestone): a
+// later delivery of it sets a pending flag instead of terminating the process. A
+// self-service disposition - a process arms only itself - so it needs no capability.
+fn sys_signal_catch(signal: u64) -> i64 {
+	if signal != SIG_INT {
+		return ERR_INVALID;
+	}
+	current_thread!().process().catch_int();
+	0
+}
+
+// Poll and clear a pending caught `signal` on the calling process: returns 1 if it
+// was delivered since the last take (clearing it), else 0. SIG_INT only.
+fn sys_signal_take(signal: u64) -> i64 {
+	if signal != SIG_INT {
+		return ERR_INVALID;
+	}
+	if current_thread!().process().take_int_pending() { 1 } else { 0 }
 }
 
 // Register the calling thread's channel as the kernel's console input sink: the
