@@ -1,5 +1,5 @@
 - Boot log - [ OK ] [FAIL] [INFO] [WARN]
-- Enhance ping command
+- Enhance ping command (show latency, ttl etc.) - like in Linux
 - "exit" command should not halt the machine, but just exits the shell and shows up the parent shell (shell that started this console). If there is no parent, then, then just reload the whole shell
 - just run spice -> run spice - it doesnt show boot log, only >
 - Virtio drivers - MSI-X only? Remove the old IRQ?
