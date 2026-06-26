@@ -1,4 +1,3 @@
-- We have 2 font files (.bin) - why?
 - Boot log - [ OK ] [FAIL] [INFO] [WARN]
 - Enhance ping command
 - "exit" command should not halt the machine, but just exits the shell and shows up the parent shell (shell that started this console). If there is no parent, then, then just reload the whole shell
