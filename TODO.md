@@ -747,7 +747,7 @@ wrap flag. Each sub-step must build and keep the test harness green (66 [ok]).
       (`draw_cell`, `draw_caret`, `flush`, the dirty walk) moves into a `FramebufferRenderer`
       that reads the `Screen`'s dirty cells through a clean diff/snapshot interface. Done when:
       green, behaviour identical.
-- [ ] M47e - Add the per-row soft/hard wrap flag to `Screen` and a first non-graphical
+- [x] M47e - Add the per-row soft/hard wrap flag to `Screen` and a first non-graphical
       consumer: a `TextSink` that serializes scrollback + screen to logical lines, joining
       soft-wrapped rows into unbounded lines and emitting `\n` only on hard breaks. Done when: a
       test dumps a known screen to the expected text; green. (Proves L2 is graphics-independent.)

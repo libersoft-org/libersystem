@@ -73,6 +73,10 @@ rt = { path = "../rt" }
 # serves them and the shell + ServiceManager speak them over the log channel.
 proto = { path = "../../proto" }
 
+# The graphics-free terminal model (L2): the cell grid, escape parser, and text
+# serialization that ConsoleService renders to the framebuffer.
+term = { path = "../../term" }
+
 # The minimal WebAssembly runtime, used by the wasi_host component runner.
 wasm = { path = "../../wasm" }
 
