@@ -751,7 +751,7 @@ wrap flag. Each sub-step must build and keep the test harness green (66 [ok]).
       consumer: a `TextSink` that serializes scrollback + screen to logical lines, joining
       soft-wrapped rows into unbounded lines and emitting `\n` only on hard breaks. Done when: a
       test dumps a known screen to the expected text; green. (Proves L2 is graphics-independent.)
-- [ ] M47f - Swappable display backend under the surface: the `Surface` becomes a trait
+- [x] M47f - Swappable display backend under the surface: the `Surface` becomes a trait
       (pixels + geometry + `present`) with boot-framebuffer and virtio-gpu backends; the
       renderer targets "the current surface". A backend handoff copies the existing pixels into
       the new backing and may change resolution, but never clears. Done when: the virtio-gpu

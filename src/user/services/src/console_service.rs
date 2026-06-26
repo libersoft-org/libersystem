@@ -40,11 +40,11 @@ const SCALE: usize = 2;
 const CELL_W: usize = FONT_W * SCALE;
 const CELL_H: usize = FONT_H * SCALE;
 
-// The raw pixel target: the mapped framebuffer, its geometry, and its pixel format. The
-// only place that touches pixels and the framebuffer address - the renderer (`Term`) draws
-// cells through it, and a display-backend swap (boot-fb <-> virtio-gpu) replaces just this.
-// It holds no grid and no terminal state.
-struct Surface {
+// The raw pixel buffer: a mapped linear framebuffer, its geometry, and its pixel format.
+// The only place that touches pixels and the framebuffer address. Both display backends
+// (the boot framebuffer and the virtio-gpu shared backing) are a `Raster` plus how to make
+// its writes visible; it holds no grid and no terminal state.
+struct Raster {
 	addr: u64,
 	width: usize,
 	height: usize,
@@ -58,9 +58,9 @@ struct Surface {
 	blue_size: u8,
 }
 
-impl Surface {
-	fn new(addr: u64, fb: &Framebuffer) -> Surface {
-		Surface { addr, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size }
+impl Raster {
+	fn new(addr: u64, fb: &Framebuffer) -> Raster {
+		Raster { addr, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size }
 	}
 
 	// Position one 8-bit colour channel into the framebuffer pixel value.
@@ -86,6 +86,24 @@ impl Surface {
 				core::ptr::write_volatile(base.add(i), bytes[i]);
 			}
 		}
+	}
+
+	// Read one packed pixel back from the framebuffer - used by a backend handoff to copy
+	// the existing on-screen pixels into the new backing.
+	#[inline]
+	fn read_pixel(&self, x: usize, y: usize) -> u32 {
+		if x >= self.width || y >= self.height {
+			return 0;
+		}
+		let offset = y * self.pitch + x * self.bytes_per_pixel;
+		let mut bytes = [0u8; 4];
+		unsafe {
+			let base = (self.addr as *const u8).add(offset);
+			for i in 0..self.bytes_per_pixel {
+				bytes[i] = core::ptr::read_volatile(base.add(i));
+			}
+		}
+		u32::from_le_bytes(bytes)
 	}
 
 	// Fill the whole framebuffer with one colour.
@@ -144,14 +162,95 @@ impl Surface {
 	}
 }
 
-// The renderer (L3): the pixel surface it draws onto plus its own `last_caret` (where the
-// caret was last painted). It is a pure consumer of the grid model - it reads the model's
-// changed cells through `Screen`'s snapshot/diff interface (`cell`, `view_cell`,
+// The swappable display backend: a `Raster` the renderer draws into, plus how to make those
+// writes reach the screen (`present`). Two backends - the boot framebuffer, whose writes are
+// visible immediately (present is a no-op), and the virtio-gpu shared backing, which the gpu
+// driver copies to its host scanout on FLUSH (present). The renderer targets "the current
+// surface" through this trait; a backend handoff copies the existing pixels into the new
+// backing (see FramebufferRenderer::handoff). The geometry/pixel methods delegate to the
+// raster so a backend only states its backing and its present.
+trait Surface {
+	fn raster(&self) -> &Raster;
+	fn present(&self);
+
+	fn width(&self) -> usize {
+		self.raster().width
+	}
+	fn height(&self) -> usize {
+		self.raster().height
+	}
+	fn pack(&self, r: u8, g: u8, b: u8) -> u32 {
+		self.raster().pack(r, g, b)
+	}
+	fn put_pixel(&self, x: usize, y: usize, color: u32) {
+		self.raster().put_pixel(x, y, color);
+	}
+	fn read_pixel(&self, x: usize, y: usize) -> u32 {
+		self.raster().read_pixel(x, y)
+	}
+	fn fill(&self, color: u32) {
+		self.raster().fill(color);
+	}
+	fn scroll_pixels_up(&self, top: usize, bot: usize, n: usize) {
+		self.raster().scroll_pixels_up(top, bot, n);
+	}
+	fn scroll_pixels_down(&self, top: usize, bot: usize, n: usize) {
+		self.raster().scroll_pixels_down(top, bot, n);
+	}
+}
+
+// The boot framebuffer the kernel maps directly: its pixel writes are visible immediately,
+// so present is a no-op. The fallback display (and the deterministic test path).
+struct BootSurface {
+	raster: Raster,
+}
+
+impl Surface for BootSurface {
+	fn raster(&self) -> &Raster {
+		&self.raster
+	}
+	fn present(&self) {}
+}
+
+// The virtio-gpu driver's shared backing: pixel writes land in a DMA buffer the driver
+// copies to its host scanout on FLUSH, so present queues that FLUSH over the driver's
+// display channel.
+struct GpuSurface {
+	raster: Raster,
+	gpu: u64,
+}
+
+impl Surface for GpuSurface {
+	fn raster(&self) -> &Raster {
+		&self.raster
+	}
+	fn present(&self) {
+		unsafe {
+			send_blocking(self.gpu, b"FLUSH", 0);
+		}
+	}
+}
+
+// Build the display backend for a mapped framebuffer: the virtio-gpu backing when a gpu
+// channel is given (it presents on FLUSH), else the boot framebuffer (present is a no-op).
+fn make_surface(addr: u64, fb: &Framebuffer, gpu: u64) -> Box<dyn Surface> {
+	let raster = Raster::new(addr, fb);
+	if gpu != 0 {
+		Box::new(GpuSurface { raster, gpu })
+	} else {
+		Box::new(BootSurface { raster })
+	}
+}
+
+// The renderer (L3): the current display surface it draws onto plus its own `last_caret`
+// (where the caret was last painted). It is a pure consumer of the grid model - it reads the
+// model's changed cells through `Screen`'s snapshot/diff interface (`cell`, `view_cell`,
 // `dirty_take`, `take_scrolls`), resolves their logical colours to packed pixels, blits
-// them, and replays the model's recorded scrolls as bulk pixel copies. It never mutates the
+// them, and replays the model's recorded scrolls as bulk pixel copies. The surface is
+// swappable (`handoff`) so the display backend can change under it. It never mutates the
 // grid and holds no terminal state.
 struct FramebufferRenderer {
-	surface: Surface,
+	surface: Box<dyn Surface>,
 	last_caret: Option<(usize, usize)>,
 }
 
@@ -163,18 +262,18 @@ struct Term {
 }
 
 impl Term {
-	fn new(addr: u64, fb: &Framebuffer) -> Term {
-		let cols = fb.width as usize / CELL_W;
-		let rows = fb.height as usize / CELL_H;
-		Term { screen: Screen::new(cols, rows), renderer: FramebufferRenderer::new(addr, fb) }
+	fn new(surface: Box<dyn Surface>) -> Term {
+		let cols = surface.width() / CELL_W;
+		let rows = surface.height() / CELL_H;
+		Term { screen: Screen::new(cols, rows), renderer: FramebufferRenderer::new(surface) }
 	}
 
 	// Reflow the model to fit new_cols x new_rows, clamped to what the physical framebuffer
 	// can show, then clear the now-unused area (only when the grid actually changed). The
 	// local stand-in for a virtio-gpu mode-set (M44).
 	fn resize(&mut self, new_cols: usize, new_rows: usize) {
-		let max_cols = (self.renderer.surface.width / CELL_W).max(1);
-		let max_rows = (self.renderer.surface.height / CELL_H).max(1);
+		let max_cols = (self.renderer.surface.width() / CELL_W).max(1);
+		let max_rows = (self.renderer.surface.height() / CELL_H).max(1);
 		if self.screen.resize(new_cols, new_rows, max_cols, max_rows) {
 			self.renderer.last_caret = None;
 			self.renderer.clear_screen(&self.screen);
@@ -185,6 +284,18 @@ impl Term {
 	// see FramebufferRenderer::flush).
 	fn flush(&mut self) {
 		self.renderer.flush(&mut self.screen);
+	}
+
+	// Make the rendered frame visible: a no-op on the boot framebuffer, a FLUSH to the gpu
+	// driver on the virtio-gpu backing.
+	fn present(&self) {
+		self.renderer.surface.present();
+	}
+
+	// Hand the display over to a new backend, preserving the on-screen pixels, then present.
+	fn handoff(&mut self, next: Box<dyn Surface>) {
+		self.renderer.handoff(next);
+		self.renderer.surface.present();
 	}
 
 	// Flash the screen with inverted colours (the visual bell) without touching the grid.
@@ -217,8 +328,22 @@ fn track_caret(caret: Option<(usize, usize)>, scrolls: &[ScrollOp]) -> Option<(u
 }
 
 impl FramebufferRenderer {
-	fn new(addr: u64, fb: &Framebuffer) -> FramebufferRenderer {
-		FramebufferRenderer { surface: Surface::new(addr, fb), last_caret: None }
+	fn new(surface: Box<dyn Surface>) -> FramebufferRenderer {
+		FramebufferRenderer { surface, last_caret: None }
+	}
+
+	// Swap in a new display backend, copying the existing pixels into its backing (clamped to
+	// the overlapping area) so the takeover never clears the screen. The resolution may change;
+	// the renderer then targets the new surface (the caller re-sizes the model and presents).
+	fn handoff(&mut self, next: Box<dyn Surface>) {
+		let w = self.surface.width().min(next.width());
+		let h = self.surface.height().min(next.height());
+		for y in 0..h {
+			for x in 0..w {
+				next.put_pixel(x, y, self.surface.read_pixel(x, y));
+			}
+		}
+		self.surface = next;
 	}
 
 	// Fill the whole physical framebuffer with the model's default background - used when
@@ -867,24 +992,18 @@ unsafe fn recv_gpu(bootstrap: u64, buf: &mut [u8]) -> u64 {
 	}
 }
 
-// Acquire the display: prefer the virtio-gpu driver's shared framebuffer (which it
-// presents on FLUSH and resizes on a host-window change), falling back to the boot
-// framebuffer the kernel maps directly when there is no virtio-gpu device or the connect
-// fails. Returns (pixel base, max geometry, whether a framebuffer was acquired, the gpu
-// channel to FLUSH - 0 for the boot framebuffer, which needs no present, and the current
-// display width/height the terminal is sized to within that max geometry).
-unsafe fn acquire_display(gpu: u64, buf: &mut [u8]) -> (u64, Framebuffer, bool, u64, u32, u32) {
+// Map the boot framebuffer the kernel hands over (`framebuffer_map`): the display the
+// kernel drew the boot log to, whose pixel writes are visible immediately. Returns (pixel
+// base, geometry), or None when headless or the display was already handed over. This is
+// the only display on the test path, and the surface a gpu takeover hands off from.
+unsafe fn map_boot_framebuffer() -> Option<(u64, Framebuffer)> {
 	unsafe {
-		if gpu != 0 {
-			if let Some((addr, fb, cur_w, cur_h)) = gpu_framebuffer(gpu, buf) {
-				return (addr, fb, true, gpu, cur_w, cur_h);
-			}
-		}
 		let mut fb: Framebuffer = Framebuffer::default();
-		let addr_raw: i64 = framebuffer_map(&mut fb);
-		let has_fb: bool = !sys_is_err(addr_raw as u64);
-		// the boot framebuffer does not resize: its current size is its full geometry.
-		(addr_raw as u64, fb, has_fb, 0, fb.width, fb.height)
+		let addr: i64 = framebuffer_map(&mut fb);
+		if sys_is_err(addr as u64) {
+			return None;
+		}
+		Some((addr as u64, fb))
 	}
 }
 
@@ -915,14 +1034,12 @@ unsafe fn gpu_framebuffer(gpu: u64, buf: &mut [u8]) -> Option<(u64, Framebuffer,
 	}
 }
 
-// Present the foreground framebuffer through the virtio-gpu driver - a no-op for the boot
-// framebuffer, whose pixel writes are visible immediately. The driver copies the shared
-// backing to its host resource and flushes it to the display.
-unsafe fn present(gpu: u64) {
-	unsafe {
-		if gpu != 0 {
-			send_blocking(gpu, b"FLUSH", 0);
-		}
+// Present the foreground VT's freshly rendered frame to the display: a no-op on the boot
+// framebuffer (whose writes are visible immediately), a FLUSH to the gpu driver on the
+// virtio-gpu backing. Driven by the surface backend the foreground VT renders onto.
+unsafe fn present_fg(console: &Console) {
+	if let Some(t) = console.vts[console.fg].term.as_ref() {
+		t.present();
 	}
 }
 
@@ -951,20 +1068,46 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
 		let pkg_len: usize = archive.len();
 
-		// 2. acquire the display: the virtio-gpu driver's resizable shared framebuffer if
-		//    present (it presents on FLUSH), else the boot framebuffer the kernel maps
-		//    directly (the test path). A headless boot has neither; we still serve input.
-		//    The framebuffer is the maximum (resource) geometry; the terminal is sized to
-		//    the current display, which the gpu driver grows toward the max on a resize.
-		let (addr, fb, has_fb, gpu, cur_w, cur_h): (u64, Framebuffer, bool, u64, u32, u32) = acquire_display(gpu, &mut buf);
+		// 2. acquire the display backends. The boot framebuffer the kernel hands over holds
+		//    the boot log; the virtio-gpu driver's resizable shared backing is the runtime
+		//    display when present (it presents on FLUSH and resizes on a host-window change).
+		//    New VTs render on the gpu backing when present, else the boot framebuffer; a
+		//    headless boot has neither and we still serve input. The framebuffer is the
+		//    maximum (resource) geometry; the terminal is sized to the current display, which
+		//    the gpu driver grows toward the max on a resize.
+		let boot: Option<(u64, Framebuffer)> = map_boot_framebuffer();
+		let gpu_disp: Option<(u64, Framebuffer, u32, u32)> = if gpu != 0 { gpu_framebuffer(gpu, &mut buf) } else { None };
+		// 0 = no present (the boot framebuffer, or a gpu whose connect failed).
+		let gpu: u64 = if gpu_disp.is_some() { gpu } else { 0 };
+		let (addr, fb, cur_w, cur_h): (u64, Framebuffer, u32, u32) = match (gpu_disp, boot) {
+			(Some((ga, gf, gw, gh)), _) => (ga, gf, gw, gh),
+			(None, Some((ba, bf))) => (ba, bf, bf.width, bf.height),
+			(None, None) => (0, Framebuffer::default(), 0, 0),
+		};
+		let has_fb: bool = gpu_disp.is_some() || boot.is_some();
+		// Build VT 1's terminal. It starts on the boot framebuffer when present (so its
+		// on-screen pixels can be handed across to the gpu backing), else directly on the gpu
+		// backing; render the banner, then hand the display over to the gpu backend - copying
+		// the rendered pixels into its backing (never clears) and presenting - and refit to
+		// the gpu's current display.
 		let term: Option<Term> = if has_fb {
-			let mut t = Term::new(addr, &fb);
+			let start: Box<dyn Surface> = match boot {
+				Some((ba, bf)) => make_surface(ba, &bf, 0),
+				None => make_surface(addr, &fb, gpu),
+			};
+			let mut t = Term::new(start);
 			t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 			t.screen.clear();
 			for &b in b"ConsoleService: online\n" {
 				t.screen.put_byte(b);
 			}
 			t.flush();
+			if boot.is_some() {
+				if let Some((ga, gf, _, _)) = gpu_disp {
+					t.handoff(make_surface(ga, &gf, gpu));
+					t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
+				}
+			}
 			Some(t)
 		} else {
 			None
@@ -1001,7 +1144,7 @@ unsafe fn run(console: &mut Console) -> ! {
 		let mut out: [u8; 1024] = [0u8; 1024];
 		let mut waits: [u64; 2 + 2 * NVT + 3 * PTY_MAX] = [0u64; 2 + 2 * NVT + 3 * PTY_MAX];
 		// present the initial banner (the foreground term was rendered in __user_main).
-		present(console.gpu);
+		present_fg(console);
 		loop {
 			// wait set: the keyboard channel (index 0), then each display VT's data channel
 			// and its control channel interleaved (data at 1 + 2*i, control at 2 + 2*i),
@@ -1090,7 +1233,7 @@ unsafe fn run(console: &mut Console) -> ! {
 				// non-blocking (the kernel drops it under backpressure rather than throttling
 				// this thread on the baud-paced UART), so it never stalls the framebuffer the
 				// SPICE/VNC user sees.
-				present(console.gpu);
+				present_fg(console);
 				if !console.serial.is_empty() {
 					print(&console.serial);
 					console.serial.clear();
@@ -1107,7 +1250,6 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 	unsafe {
 		let fg: bool = vi == console.fg;
 		let input: u64 = console.input;
-		let gpu: u64 = console.gpu;
 		let mut raw_req: Option<bool> = None;
 		let mut echo_req: Option<bool> = None;
 		if let Some(t) = console.vts[vi].term.as_mut() {
@@ -1125,7 +1267,7 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 				// stalls the cooperative boot driver.
 				if bell {
 					t.draw_inverted();
-					present(gpu);
+					t.present();
 					let _ = wait(input, clock() + BELL_FLASH_TICKS);
 					t.screen.mark_all_dirty();
 					t.flush();
@@ -1501,7 +1643,7 @@ unsafe fn create_vt(console: &mut Console) {
 		if !console.has_fb || console.vts.len() >= NVT {
 			return;
 		}
-		if let Some(vt) = spawn_vt(&console.facs, &console.package, console.pkg_len, console.addr, &console.fb, console.cur_w, console.cur_h) {
+		if let Some(vt) = spawn_vt(&console.facs, &console.package, console.pkg_len, console.addr, &console.fb, console.gpu, console.cur_w, console.cur_h) {
 			console.vts.push(vt);
 			console.fg = console.vts.len() - 1;
 			repaint(console);
@@ -1668,7 +1810,7 @@ unsafe fn spawn_shell(facs: &Factories, package: &Package, pkg_len: usize, shell
 // Open one VT's shell: create the VT's console + control channels, spawn a fully-capable
 // shell over them, nudge it to print its first prompt, and return the VT (its cleared grid
 // + the service ends of those channels). None on any failure.
-unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u64, fb: &Framebuffer, cur_w: u32, cur_h: u32) -> Option<Vt> {
+unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u64, fb: &Framebuffer, gpu: u64, cur_w: u32, cur_h: u32) -> Option<Vt> {
 	unsafe {
 		let (vt_service, vt_client): (u64, u64) = channel()?;
 		let (control_console, control_shell): (u64, u64) = channel()?;
@@ -1682,7 +1824,7 @@ unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u6
 		// nudge the new shell to print its first prompt: an empty line dispatches to a
 		// silent reprompt, the same first prompt VT 1 shows at boot.
 		send_blocking(vt_service, b"\n", 0);
-		let mut term: Term = Term::new(addr, fb);
+		let mut term: Term = Term::new(make_surface(addr, fb, gpu));
 		term.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 		term.screen.clear();
 		Some(Vt { term: Some(term), client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new()), master: 0 })
