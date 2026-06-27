@@ -296,6 +296,31 @@ An opaque kernel object, transferred as `handle<file>`.
 | `capability` | `capability` |
 | `granted` | `bool` |
 
+### enum `resource-kind`
+
+| case | ordinal |
+| --- | --- |
+| `memory` | 0 |
+| `handles` | 1 |
+| `threads` | 2 |
+| `ipc-queue` | 3 |
+| `dma` | 4 |
+
+### record `resource-usage`
+
+| field | type |
+| --- | --- |
+| `kind` | `resource-kind` |
+| `used` | `u64` |
+| `limit` | `u64` |
+
+### record `budget`
+
+| field | type |
+| --- | --- |
+| `name` | `string` |
+| `usage` | `list<resource-usage>` |
+
 ## Interfaces
 
 ### interface `log`
@@ -435,4 +460,13 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | --- | --- | --- |
 | 1 | `lookup` | `lookup(component: string) -> result<manifest, error>` |
 | 2 | `audit` | `audit() -> result<list<audit-entry>, error>` |
+
+### interface `resources`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `usage` | `usage() -> result<list<budget>, error>` |
+| 2 | `set-limit` | `set-limit(name: string, kind: resource-kind, limit: u64) -> result<budget, error>` |
 

@@ -104,6 +104,12 @@ pub const SYS_SIGNAL_TAKE: u64 = 51;
 // volume, handle and memory usage, and liveness so a userspace SystemGraphService can
 // build the live observability graph without each component having to self-report.
 pub const SYS_PROCESS_STATS_GET: u64 = 52;
+// Read live per-Domain resource counters into the caller's buffer (a DomainStats), for a
+// Domain handle that carries RIGHT_READ. Surfaces the kernel's per-Domain used/limit pair
+// for each accounted resource - memory, handles, threads, IPC queue bytes and DMA - so a
+// userspace ResourceManager can observe usage against the budgets it sets without the
+// governed component having to self-report.
+pub const SYS_DOMAIN_STATS_GET: u64 = 53;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;
@@ -220,6 +226,27 @@ pub struct ProcessStats {
 pub const PROC_STATE_RUNNING: u64 = 0;
 pub const PROC_STATE_STOPPED: u64 = 1;
 pub const PROC_STATE_FAILED: u64 = 2;
+
+// The live per-Domain view domain_stats_get returns for a Domain handle: the used and
+// limit of each resource counter the kernel accounts - memory held, live handles, live
+// threads, in-transit IPC queue bytes and pinned DMA memory. A limit of u64::MAX means
+// the counter is uncapped. The kernel reads these straight off the Domain's account, so a
+// ResourceManager sees real consumption against the budgets it sets without the governed
+// component reporting them. repr(C) so it marshals cleanly across the syscall boundary.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct DomainStats {
+	pub memory_used: u64,
+	pub memory_limit: u64,
+	pub handles_used: u64,
+	pub handles_limit: u64,
+	pub threads_used: u64,
+	pub threads_limit: u64,
+	pub ipc_used: u64,
+	pub ipc_limit: u64,
+	pub dma_used: u64,
+	pub dma_limit: u64,
+}
 
 // Error codes (Linux-style: a successful call returns its value, an error returns
 // a small negative in the reserved band [-4095, -1]).

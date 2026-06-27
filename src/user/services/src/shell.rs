@@ -15,7 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{audio, config, device, input, log, network, permission, process, system_graph, time, volume, AuditEntry, Component, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan};
+use proto::system::{audio, config, device, input, log, network, permission, process, resources, system_graph, time, volume, AuditEntry, Budget, Component, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -50,6 +50,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// and renders it as CLI / JSON. Sent right after GRAPH, matching ServiceManager's
 	// send order.
 	let permsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PERM") }.unwrap_or_else(|| exit());
+	// The ResourceManager client: `usage` queries the live per-Domain resource budgets
+	// (memory, handles, threads, IPC queue, DMA - used and limit) and renders them as CLI
+	// / JSON. Sent right after PERM, matching ServiceManager's send order.
+	let ressvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"RESOURCE") }.unwrap_or_else(|| exit());
 	// The console channel to ConsoleService: the shell writes its output to it (routed
 	// via stdout) and reads its keystrokes from it. The userspace terminal renders the
 	// output and forwards the input, so the shell talks to the console, not the kernel.
@@ -82,7 +86,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    become the interactive console and run the read-eval-print loop.
 	print_motd();
 	unsafe {
-		repl(console, control, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, adminsvc, &package, &mut buf);
+		repl(console, control, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, &package, &mut buf);
 	}
 	exit();
 }
@@ -138,7 +142,7 @@ fn print_banner(lines: &[&str]) {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, adminsvc: u64, package: &Package, buf: &mut [u8]) {
+unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control);
 		loop {
@@ -154,7 +158,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u6
 			// The terminal delivers a whole submitted line (with a trailing newline);
 			// trim it, dispatch it, reap finished jobs, and print the next prompt.
 			let line: &[u8] = trim(&buf[..n]);
-			if dispatch(line, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, adminsvc, package, &mut jobs) {
+			if dispatch(line, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, package, &mut jobs) {
 				return;
 			}
 			reap_jobs(&mut jobs);
@@ -464,7 +468,7 @@ unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, adminsvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -529,6 +533,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  dev [json]       list devices via DeviceService\n");
 			print(b"  graph [json|cbor]  show the live system graph and counters via SystemGraphService\n");
 			print(b"  perm [json]      show the permission audit trail via PermissionManager\n");
+			print(b"  usage [json]     show per-Domain resource budgets via ResourceManager\n");
 			print(b"  stop <service>   stop a service and its dependents via ServiceManager\n");
 			print(b"  ps               list started processes via ProcessService\n");
 			print(b"  run <name>       start a program via ProcessService\n");
@@ -610,6 +615,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		}
 		if line == b"perm json" {
 			query_permission(permsvc, true);
+			return false;
+		}
+		if line == b"usage" {
+			query_resource(ressvc, false);
+			return false;
+		}
+		if line == b"usage json" {
+			query_resource(ressvc, true);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"stop ") {
@@ -1155,6 +1168,65 @@ unsafe fn query_permission(permsvc: u64, json: bool) {
 			Some(Err(_)) => print(b"perm: query error\n"),
 			None => print(b"perm: service unavailable\n"),
 		}
+	}
+}
+
+// Ask ResourceManager for the live per-Domain budgets and render them: as JSON (the
+// generated wire form, one document per budget) or as a compact text table - one line
+// per budget, each resource shown as `kind=used/limit`, with an unlimited limit
+// (u64::MAX, the kernel's UNLIMITED sentinel) shown as `unlimited` rather than the raw
+// number. A 0 handle means this shell was not granted the ResourceManager client.
+unsafe fn query_resource(ressvc: u64, json: bool) {
+	unsafe {
+		if ressvc == 0 {
+			print(b"usage: service unavailable\n");
+			return;
+		}
+		let mut client = resources::Client::new(ChannelTransport { chan: ressvc });
+		match client.usage() {
+			Some(Ok(budgets)) => {
+				if json {
+					print_json_array(&budgets, |b: &Budget| -> String { b.to_json() });
+				} else {
+					for b in budgets.iter() {
+						print_budget(b);
+					}
+				}
+			}
+			Some(Err(_)) => print(b"usage: query error\n"),
+			None => print(b"usage: service unavailable\n"),
+		}
+	}
+}
+
+// Render one budget as a compact text line: `<name>: kind=used/limit ...`, with the
+// kernel's UNLIMITED sentinel (u64::MAX) shown as `unlimited`.
+unsafe fn print_budget(budget: &Budget) {
+	unsafe {
+		let mut line = String::new();
+		line.push_str(&budget.name);
+		line.push(':');
+		for u in budget.usage.iter() {
+			line.push(' ');
+			line.push_str(&u.kind.to_text());
+			line.push('=');
+			push_amount(&mut line, u.used);
+			line.push('/');
+			push_amount(&mut line, u.limit);
+		}
+		line.push('\n');
+		print(line.as_bytes());
+	}
+}
+
+// Append a resource amount, rendering the kernel's UNLIMITED sentinel (u64::MAX) as
+// `unlimited` rather than the raw 64-bit number.
+fn push_amount(out: &mut String, value: u64) {
+	use core::fmt::Write as _;
+	if value == u64::MAX {
+		out.push_str("unlimited");
+	} else {
+		let _ = write!(out, "{value}");
 	}
 }
 

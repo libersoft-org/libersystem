@@ -43,7 +43,7 @@ struct Service {
 
 // The number of managed services. (A fixed size keeps the state array on the
 // stack, which a no_std program with no heap needs.)
-const N: usize = 14;
+const N: usize = 15;
 
 // The core service manifest. The array order is deliberately NOT the start order:
 // DeviceManager, StorageService, and the shell are listed before LogService, but
@@ -53,7 +53,7 @@ const N: usize = 14;
 // component it observes (so it holds their process handles for the live graph), and
 // the shell is the last component up: it depends on StorageService (which it talks to
 // over IPC) and on SystemGraphService (whose graph its `graph` command renders).
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"system_graph_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"network_service"] }];
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"network_service"] }, Service { name: b"resource_manager", deps: &[b"log_service"] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -175,6 +175,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The PermissionManager service-channel client end, kept after PermissionManager
 	// bootstraps and later handed to the shell for its `perm` command.
 	let mut perm_client: u64 = 0;
+	// The ResourceManager service-channel client end, kept after ResourceManager
+	// bootstraps and later handed to the shell for its `usage` command.
+	let mut res_client: u64 = 0;
 	// The admin channel the shell drives `stop <service>` over (the supervisor keeps the
 	// server end), and the channel SystemGraphService queries the `supervisor` interface
 	// on (the supervisor serves it). Both are minted when the shell and SystemGraphService
@@ -187,7 +190,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut admin_server, &mut stats_server, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut admin_server, &mut stats_server, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -333,7 +336,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, admin_server: &mut u64, stats_server: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, admin_server: &mut u64, stats_server: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -389,7 +392,10 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *log_client, *net_client, perm_client, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
-		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *input_client, *console_client, *console_control, *graph_client, *perm_client, admin_server, pkg_handle, pkg_len, buf) {
+		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, pkg_handle, pkg_len, buf) {
+			return State::Failed;
+		}
+		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *input_client, *console_client, *console_control, *graph_client, *perm_client, *res_client, admin_server, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -446,6 +452,16 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 					let _ = recv_blocking(manager_side, buf);
 					let _ = recv_blocking(manager_side, buf);
 				}
+				// ResourceManager follows its "online" report with the budget proof: a summary of
+				// the pages it granted under the cap, the over-budget refusal it contained, and the
+				// pages it regranted after raising the budget at runtime. This is the manager's
+				// internal verification (and is asserted by the kernel's resource scenario); the
+				// live budgets are served over the resources contract and read with `usage`, so it
+				// is drained here rather than relayed into the boot chain, which carries only state
+				// reports.
+				if name == b"resource_manager" {
+					let _ = recv_blocking(manager_side, buf);
+				}
 				State::Running
 			}
 			Received::Closed => State::Failed,
@@ -492,7 +508,7 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 // emitting on the original. Finally the supervisor mints a fresh ADMIN channel and
 // transfers the client end to the shell (so its `stop <service>` command can drive
 // reverse-dependency teardown), keeping the server end in `*admin_server` to serve.
-unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, input_client: u64, console_client: u64, console_control: u64, graph_client: u64, perm_client: u64, admin_server: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, input_client: u64, console_client: u64, console_control: u64, graph_client: u64, perm_client: u64, res_client: u64, admin_server: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"STORAGE", storage_client) {
 			return false;
@@ -533,6 +549,11 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 		// The PermissionManager client, so the shell's `perm` command can render the
 		// permission audit trail. Sent right after GRAPH to match the shell's receive order.
 		if !send_blocking(manager_side, b"PERM", perm_client) {
+			return false;
+		}
+		// The ResourceManager client, so the shell's `usage` command can render the live
+		// per-Domain budgets. Sent right after PERM to match the shell's receive order.
+		if !send_blocking(manager_side, b"RESOURCE", res_client) {
 			return false;
 		}
 		if !send_blocking(manager_side, b"CONSOLE", console_client) {
@@ -674,6 +695,23 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, l
 		}
 		// The channel its clients reach it on; the client end kept for the shell.
 		bootstrap_serve(manager_side, perm_client)
+	}
+}
+
+// Hand ResourceManager a read-only view of the init package (to launch the component it
+// governs from) and the channel its clients reach it on ("SERVE", the client end kept in
+// `*res_client` for the shell's `usage` command). The order matches ResourceManager's
+// receive order: PACKAGE, SERVE. The manager holds no service clients - it governs its
+// component's Domain through the kernel's resource syscalls (create the sub-Domain, set
+// its limits, read its stats), not by granting service connections.
+unsafe fn bootstrap_resource_manager(manager_side: u64, res_client: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+	unsafe {
+		// The init package, so the manager can spawn the component it governs.
+		if !bootstrap_package(manager_side, pkg_handle, pkg_len, buf) {
+			return false;
+		}
+		// The channel its clients reach it on; the client end kept for the shell.
+		bootstrap_serve(manager_side, res_client)
 	}
 }
 

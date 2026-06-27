@@ -61,12 +61,20 @@ name = "permission_manager"
 path = "src/permission_manager.rs"
 
 [[bin]]
+name = "resource_manager"
+path = "src/resource_manager.rs"
+
+[[bin]]
 name = "watchdog_probe"
 path = "src/watchdog_probe.rs"
 
 [[bin]]
 name = "sandbox_probe"
 path = "src/sandbox_probe.rs"
+
+[[bin]]
+name = "resource_probe"
+path = "src/resource_probe.rs"
 
 [[bin]]
 name = "wasi_host"

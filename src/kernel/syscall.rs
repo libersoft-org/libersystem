@@ -44,7 +44,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -58,6 +58,10 @@ pub use abi::ObjectInfo;
 // Live per-process counters and state filled by process_stats_get. Defined in `abi`
 // (the SSOT shared with userspace) and re-exported here next to its syscall.
 pub use abi::ProcessStats;
+
+// Live per-Domain resource counters filled by domain_stats_get. Defined in `abi`
+// (the SSOT shared with userspace) and re-exported here next to its syscall.
+pub use abi::DomainStats;
 
 // Validate a caller-supplied buffer. Always accepts kernel self-calls; for a
 // ring-3 caller it requires the whole [ptr, ptr+len) range to lie in user space
@@ -208,7 +212,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_FRAMEBUFFER_MAP => sys_framebuffer_map(a0, a1),
 		SYS_CONSOLE_READLOG => sys_console_readlog(a0, a1),
 		SYS_OBJECT_PROPERTY_SET => sys_object_property_set(a0, a1, a2, a3),
-		SYS_PROCESS_CREATE => sys_process_create(),
+		SYS_PROCESS_CREATE => sys_process_create(a0),
 		SYS_PROCESS_LOAD => sys_process_load(a0, a1, a2),
 		SYS_PROCESS_SIGNAL => sys_process_signal(a0, a1),
 		SYS_SIGNAL_CATCH => sys_signal_catch(a0),
@@ -236,6 +240,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_FAULT_INFO_GET => sys_fault_info_get(a0, a1),
 		SYS_DOMAIN_CREATE => sys_domain_create(a0, a1, a2),
 		SYS_DOMAIN_KILL => sys_domain_kill(a0),
+		SYS_DOMAIN_STATS_GET => sys_domain_stats_get(a0, a1, a2),
 		SYS_YIELD => {
 			sched::yield_now();
 			0
@@ -591,13 +596,24 @@ fn sys_object_property_set(handle: u64, prop: u64, a2: u64, a3: u64) -> i64 {
 	0
 }
 
-// Create an empty process with its own address space, accounted to the caller's
-// Domain, and install a handle to it in the caller's table. The process has no
-// threads until process_load gives it an image and thread_create / thread_start
-// give it a running thread. (Spawning into a different sub-Domain is deferred.)
-fn sys_process_create() -> i64 {
+// Create an empty process with its own address space and install a handle to it in
+// the caller's table. The process is accounted to a Domain: `domain_handle` of 0
+// means the caller's own Domain, otherwise it names a Domain the caller may spawn
+// into (it must carry the MANAGE right), so a manager can launch a governed
+// component under a bounded sub-Domain it controls. The process has no threads until
+// process_load gives it an image and thread_create / thread_start give it a running
+// thread.
+fn sys_process_create(domain_handle: u64) -> i64 {
 	let thread = current_thread!();
-	let process = match sched::process_create(thread.domain().clone()) {
+	let domain = if domain_handle == 0 {
+		thread.domain().clone()
+	} else {
+		match current_typed::<Domain>(domain_handle, ObjectType::Domain, Rights::MANAGE) {
+			Ok(d) => d,
+			Err(e) => return e,
+		}
+	};
+	let process = match sched::process_create(domain) {
 		Some(p) => p,
 		None => return ERR_NO_MEMORY,
 	};
@@ -1187,6 +1203,39 @@ fn sys_domain_create(memory_limit: u64, handle_limit: u64, thread_limit: u64) ->
 	let thread = current_thread!();
 	let child = Domain::new_child(thread.domain(), memory_limit, handle_limit, thread_limit);
 	install_object(&thread, child, Rights::ALL, 0)
+}
+
+// Read the live resource counters of the Domain named by `handle` into the caller's
+// buffer (a DomainStats): the used and limit of memory, handles, threads, IPC queue
+// bytes and DMA. Requires the READ right, so a ResourceManager that holds a Domain
+// can observe its usage against the budgets it set without the governed component
+// reporting them.
+fn sys_domain_stats_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+	let domain = match current_typed::<Domain>(handle, ObjectType::Domain, Rights::READ) {
+		Ok(o) => o,
+		Err(e) => return e,
+	};
+	let size = core::mem::size_of::<DomainStats>() as u64;
+	if buf_len < size || !user_buf_ok(buf_ptr, size) {
+		return ERR_INVALID;
+	}
+	let account = domain.account();
+	let out = DomainStats {
+		memory_used: account.memory().used(),
+		memory_limit: account.memory().limit(),
+		handles_used: account.handles().used(),
+		handles_limit: account.handles().limit(),
+		threads_used: account.threads().used(),
+		threads_limit: account.threads().limit(),
+		ipc_used: account.ipc_queue().used(),
+		ipc_limit: account.ipc_queue().limit(),
+		dma_used: account.dma().used(),
+		dma_limit: account.dma().limit(),
+	};
+	unsafe {
+		(buf_ptr as *mut DomainStats).write_unaligned(out);
+	}
+	1
 }
 
 // Kill the Domain named by `handle` and its whole subtree: every descendant

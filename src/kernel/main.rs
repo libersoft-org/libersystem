@@ -697,6 +697,47 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	Ok((expected, read_back.bytes, summary.bytes))
 }
 
+// Build the M39 resource topology and run it to completion. The resource_manager
+// (ResourceManager) is given the init package (to launch the component it governs from) and
+// the channel its clients reach it on - nothing more, since it governs through the kernel's
+// resource syscalls, not by brokering service connections. ResourceManager creates a
+// bounded sub-Domain, launches its one governed component (resource_probe) into that Domain,
+// caps the Domain's memory, drives the probe to fill the budget and be refused once (the
+// over-budget allocation is contained to that Domain with RESOURCE_EXHAUSTED rather than
+// crashing the probe or the system), then raises the cap at runtime and drives the probe
+// into the new headroom. The kernel only charges and enforces the per-Domain budget.
+// Returns the manager's budget summary: the pages granted under the cap, the contained
+// refusal, and the pages regranted after the runtime raise.
+#[cfg(test)]
+fn run_resource_scenario() -> Result<alloc::vec::Vec<u8>, &'static str> {
+	use object::channel::Channel;
+	use object::rights::Rights;
+
+	let (_volume, package) = scenario_packages()?;
+	let init = init_package_bytes().ok_or("init package module not found")?;
+	let rm_elf = package.lookup(b"resource_manager").ok_or("resource_manager missing from the init package")?;
+
+	let (rm_boot_kernel, rm_boot_user) = Channel::create();
+	let (resource_server, _resource_client) = Channel::create();
+
+	let domain = sched::root_domain();
+	loader::spawn_elf_process(domain, rm_elf, rm_boot_user, Rights::ALL, 0).map_err(|_| "failed to load ResourceManager")?;
+
+	// ResourceManager: the init package (to launch the probe from) and the channel its
+	// clients reach it on. The order matches ResourceManager's receive order: PACKAGE, SERVE.
+	send_package(&rm_boot_kernel, init)?;
+	send_cap(&rm_boot_kernel, b"SERVE", resource_server, Rights::ALL)?;
+
+	sched::run_until_idle();
+
+	// ResourceManager reports its "online" line, then the budget proof: the pages it granted
+	// under the cap, the contained over-budget refusal, and the pages it regranted after
+	// raising the budget at runtime.
+	let _online = rm_boot_kernel.recv().map_err(|_| "ResourceManager reported nothing")?;
+	let summary = rm_boot_kernel.recv().map_err(|_| "ResourceManager reported no budget summary")?;
+	Ok(summary.bytes)
+}
+
 // Read a file from a vol:// volume by driving the StorageService as the kernel's
 // own client (the kernel storage self-test). Spawns the service, hands
 // it the ramdisk and a service channel, sends one open request plus an empty quit
@@ -2192,21 +2233,24 @@ fn init_package_starts_system_manager() {
 	// ServiceManager and delegates the package and the ramdisk to it, and
 	// ServiceManager brings up the core services in dependency order - LogService
 	// first, then DeviceService, ProcessService, and ConfigService (they depend only
-	// on LogService, so they come up right after), then DeviceManager, StorageService
-	// (handed the disk block channel DeviceManager routes up), NetworkService (handed
-	// the net driver's frame channel the same way), then PermissionManager (which needs
-	// storage and network to grant onward, so it comes up once they are running, and in
-	// turn launches its sandboxed component before reporting in), and finally - after
-	// every component it observes - SystemGraphService, then the shell (which proves the
-	// StorageService round-trip by reading a file with `cat` before it reports in).
-	// Every report is relayed up, so the kernel observes the services come up in
-	// dependency order, then DeviceManager stopped (ServiceManager exercises the stop
-	// path on that service), then the watchdog canary brought up, restarted after a
-	// commanded crash and recovered after a missed heartbeat (ServiceManager exercises
-	// the restart policy and watchdog), followed by the two managers.
+	// on LogService, so they come up right after), then ResourceManager (which also
+	// depends only on LogService, so it comes up among them, and in turn launches the
+	// component it governs and caps its Domain before reporting in), then DeviceManager,
+	// StorageService (handed the disk block channel DeviceManager routes up),
+	// NetworkService (handed the net driver's frame channel the same way), then
+	// PermissionManager (which needs storage and network to grant onward, so it comes up
+	// once they are running, and in turn launches its sandboxed component before reporting
+	// in), and finally - after every component it observes - SystemGraphService, then the
+	// shell (which proves the StorageService round-trip by reading a file with `cat`
+	// before it reports in). Every report is relayed up, so the kernel observes the
+	// services come up in dependency order, then DeviceManager stopped (ServiceManager
+	// exercises the stop path on that service), then the watchdog canary brought up,
+	// restarted after a commanded crash and recovered after a missed heartbeat
+	// (ServiceManager exercises the restart policy and watchdog), followed by the two
+	// managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 20] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"DeviceManager: online", b"StorageService: online", b"NetworkService: online", b"TimeService: online", b"AudioService: online", b"InputService: online", b"PermissionManager: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"WatchdogProbe: online", b"WatchdogProbe: restarted", b"WatchdogProbe: recovered", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 21] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"ResourceManager: online", b"DeviceManager: online", b"StorageService: online", b"NetworkService: online", b"TimeService: online", b"AudioService: online", b"InputService: online", b"PermissionManager: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"WatchdogProbe: online", b"WatchdogProbe: restarted", b"WatchdogProbe: recovered", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");
@@ -2410,6 +2454,23 @@ fn permission_manager_sandboxes_a_component() {
 	assert!(!expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(read_back, expected, "the sandboxed component read its one granted file through the storage grant");
 	assert_eq!(summary.as_slice(), b"storage=grant log=grant network=deny", "the component was granted exactly its manifest - storage and log - and denied network");
+}
+
+#[cfg(test)]
+#[test_case]
+fn resource_manager_contains_a_domain() {
+	// The ResourceManager creates a bounded sub-Domain, launches resource_probe into it, and
+	// caps the Domain's memory at four one-page objects above the probe's baseline. It drives
+	// the probe to fill the budget (four objects fit) and be refused the fifth - that
+	// over-budget allocation fails with RESOURCE_EXHAUSTED, contained to the offending Domain
+	// rather than crashing the probe (which survives and answers) or the system. The manager
+	// then raises the cap by another four pages at runtime and drives the probe into the new
+	// headroom (four more fit). The budget summary must show exactly that: four pages granted
+	// under the cap, one contained refusal survived, and four pages regranted after the
+	// runtime raise - the kernel enforced the per-Domain budget and the policy adjusted it
+	// live.
+	let summary = run_resource_scenario().expect("the resource scenario should run");
+	assert_eq!(summary.as_slice(), b"granted=4 denied=1 regranted=4", "the kernel enforced the Domain's memory budget, contained the over-budget refusal, and honored the runtime raise");
 }
 
 #[cfg(test)]

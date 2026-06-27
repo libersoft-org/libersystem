@@ -830,8 +830,19 @@ pub unsafe fn dma_buffer(size: u64) -> Option<(u64, u64, u64)> {
 // delivered to the child's first thread in rdi - the way a process is endowed with
 // its initial capability. Returns the child Process handle, or a negative error.
 pub unsafe fn spawn(elf: &[u8], bootstrap: u64) -> i64 {
+	unsafe { spawn_in(elf, bootstrap, 0) }
+}
+
+// Spawn a new ring-3 process from an ELF image into a Domain and start it, like
+// `spawn` but accounting the child to `domain` (0 = the spawner's own Domain). The
+// Domain handle must carry the MANAGE right; the child's image, stack and every
+// allocation it later makes are charged to that Domain (and its ancestors), so a
+// manager can launch a governed component under a bounded sub-Domain it controls and
+// the kernel contains the component's resource use to that Domain. Returns the child
+// Process handle, or a negative error.
+pub unsafe fn spawn_in(elf: &[u8], bootstrap: u64, domain: u64) -> i64 {
 	unsafe {
-		let process: u64 = syscall(SYS_PROCESS_CREATE, 0, 0, 0, 0);
+		let process: u64 = syscall(SYS_PROCESS_CREATE, domain, 0, 0, 0);
 		if sys_is_err(process) {
 			return process as i64;
 		}
@@ -854,6 +865,41 @@ pub unsafe fn spawn(elf: &[u8], bootstrap: u64) -> i64 {
 		// would never observe them close. The scheduler already holds the started thread.
 		close(thread);
 		process as i64
+	}
+}
+
+// Create a child Domain of the caller's Domain with the given resource caps (memory
+// and IPC/DMA in bytes, handles and threads as counts; u64::MAX = uncapped) and
+// return its handle, or a negative error. The child's limits bind in addition to
+// every ancestor's, so it can only subdivide its parent's budget. A ResourceManager
+// makes one of these to host a governed component, then sets and adjusts its caps
+// with `domain_set_limit` and observes usage with `domain_stats`.
+pub unsafe fn domain_create(memory: u64, handles: u64, threads: u64) -> i64 {
+	unsafe { syscall(SYS_DOMAIN_CREATE, memory, handles, threads, 0) as i64 }
+}
+
+// Set one resource counter's limit on a Domain (handle must carry the MANAGE right):
+// `prop` is one of the PROP_*_LIMIT selectors and `limit` the new cap (u64::MAX =
+// uncapped). Returns 0 on success or a negative error. The cap takes effect at once -
+// the next over-budget allocation in the Domain fails with ERR_RESOURCE_EXHAUSTED.
+pub unsafe fn domain_set_limit(domain: u64, prop: u64, limit: u64) -> i64 {
+	unsafe { syscall(SYS_OBJECT_PROPERTY_SET, domain, prop, limit, 0) as i64 }
+}
+
+// Read the live per-Domain resource counters behind a Domain `handle` (the used and
+// limit of memory, handles, threads, IPC queue bytes and DMA). The handle must carry
+// RIGHT_READ. Returns None if the handle is unknown or not a Domain; a ResourceManager
+// uses this to observe a governed Domain's usage against the budgets it set.
+pub unsafe fn domain_stats(handle: u64) -> Option<DomainStats> {
+	unsafe {
+		let mut stats: DomainStats = DomainStats::default();
+		let size: u64 = core::mem::size_of::<DomainStats>() as u64;
+		let ok: i64 = syscall(SYS_DOMAIN_STATS_GET, handle, &mut stats as *mut DomainStats as u64, size, 0) as i64;
+		if ok == 1 {
+			Some(stats)
+		} else {
+			None
+		}
 	}
 }
 
