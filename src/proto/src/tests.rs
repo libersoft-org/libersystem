@@ -151,7 +151,11 @@ struct VolStub;
 
 impl volume::Service for VolStub {
 	fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error> {
-		if o.path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
+		if o.path.is_empty() {
+			Err(Error::NotFound)
+		} else {
+			Ok(OpenResult { file: 0xCAFE, size: 42 })
+		}
 	}
 
 	fn list(&mut self) -> Result<Vec<FileInfo>, Error> {
@@ -345,13 +349,7 @@ fn query_renders_cbor_with_options() {
 // encode/decode unchanged.
 #[test]
 fn graph_round_trips() {
-	let g = Graph {
-		components: alloc::vec![
-			Component { name: String::from("log-service"), kind: ComponentKind::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 7, messages_received: 3, handles: 5, memory_bytes: 8192, restarts: 0 } },
-			Component { name: String::from("device-manager"), kind: ComponentKind::Service, state: ComponentState::Stopped, deps: alloc::vec![String::from("log-service")], counters: Counters { messages_sent: 1, messages_received: 1, handles: 2, memory_bytes: 4096, restarts: 0 } },
-		],
-		spans: alloc::vec![TraceSpan { name: String::from("device.list"), duration_ns: 1234 }],
-	};
+	let g = Graph { components: alloc::vec![Component { name: String::from("log-service"), kind: ComponentKind::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 7, messages_received: 3, handles: 5, memory_bytes: 8192, restarts: 0, watchdog_trips: 0, last_failure: String::new() } }, Component { name: String::from("device-manager"), kind: ComponentKind::Service, state: ComponentState::Stopped, deps: alloc::vec![String::from("log-service")], counters: Counters { messages_sent: 1, messages_received: 1, handles: 2, memory_bytes: 4096, restarts: 1, watchdog_trips: 1, last_failure: String::from("hung") } },], spans: alloc::vec![TraceSpan { name: String::from("device.list"), duration_ns: 1234 }] };
 	let bytes = g.encode_vec();
 	assert_eq!(Graph::decode(&bytes), Some(g));
 }
@@ -360,7 +358,7 @@ fn graph_round_trips() {
 // enums, its deps as an array, and its counters as a nested map.
 #[test]
 fn component_renders_cbor_map() {
-	let c = Component { name: String::from("net"), kind: ComponentKind::Driver, state: ComponentState::Failed, deps: alloc::vec![String::from("device-manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 1, memory_bytes: 0, restarts: 2 } };
+	let c = Component { name: String::from("net"), kind: ComponentKind::Driver, state: ComponentState::Failed, deps: alloc::vec![String::from("device-manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 1, memory_bytes: 0, restarts: 2, watchdog_trips: 0, last_failure: String::new() } };
 	let mut want = Vec::new();
 	want.push(0xa5); // map(5)
 	want.push(0x64);
@@ -382,7 +380,7 @@ fn component_renders_cbor_map() {
 	want.extend_from_slice(b"device-manager");
 	want.push(0x68);
 	want.extend_from_slice(b"counters");
-	want.push(0xa5); // map(5)
+	want.push(0xa7); // map(7)
 	want.push(0x6d);
 	want.extend_from_slice(b"messages-sent");
 	want.push(0x00); // uint 0
@@ -398,6 +396,11 @@ fn component_renders_cbor_map() {
 	want.push(0x68);
 	want.extend_from_slice(b"restarts");
 	want.push(0x02); // uint 2
+	want.push(0x6e);
+	want.extend_from_slice(b"watchdog-trips");
+	want.push(0x00); // uint 0
+	want.push(0x6c);
+	want.extend_from_slice(b"last-failure");
+	want.push(0x60); // text(0)
 	assert_eq!(c.to_cbor(), want);
 }
-

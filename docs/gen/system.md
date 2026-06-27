@@ -237,6 +237,8 @@ An opaque kernel object, transferred as `handle<file>`.
 | `handles` | `u64` |
 | `memory-bytes` | `u64` |
 | `restarts` | `u32` |
+| `watchdog-trips` | `u32` |
+| `last-failure` | `string` |
 
 ### record `component`
 
@@ -261,6 +263,15 @@ An opaque kernel object, transferred as `handle<file>`.
 | --- | --- |
 | `components` | `list<component>` |
 | `spans` | `list<trace-span>` |
+
+### record `supervisor-stat`
+
+| field | type |
+| --- | --- |
+| `name` | `string` |
+| `restarts` | `u32` |
+| `watchdog-trips` | `u32` |
+| `last-failure` | `string` |
 
 ## Interfaces
 
@@ -384,4 +395,12 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `snapshot` | `snapshot() -> result<graph, error>` |
+
+### interface `supervisor`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `status` | `status() -> result<list<supervisor-stat>, error>` |
 

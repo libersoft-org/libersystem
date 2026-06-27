@@ -346,14 +346,19 @@ enum component-state {
 
 // The per-component counters the kernel tracks for a process: its IPC volume (channel
 // messages sent and received), how many handles its table holds, how many bytes of
-// user memory it has mapped, and how many times the supervisor has restarted it. The
-// typed form of the resource-usage columns the `graph` command renders.
+// user memory it has mapped, plus the supervisor's history of it - how many times it
+// has been restarted, how many times the watchdog found it hung and acted, and the
+// kind of its last failure ("" if it has never failed). The kernel-derived columns are
+// live; the supervisor columns are merged in from the `supervisor` interface. The typed
+// form of the resource-usage and supervisor columns the `graph` command renders.
 record counters {
 	messages-sent:     u64,
 	messages-received: u64,
 	handles:           u64,
 	memory-bytes:      u64,
 	restarts:          u32,
+	watchdog-trips:    u32,
+	last-failure:      string,
 }
 
 // One node in the System Graph: a component's name, its kind, its live state, the
@@ -391,6 +396,28 @@ record graph {
 // same JSON / CBOR is a later phase; this is the local edge-node observability.
 interface system-graph {
 	@op(1) snapshot: func() -> result<graph, error>;
+}
+
+// One component's supervisor state, as the ServiceManager supervisor tracks it: how
+// many times it has been restarted, how many times the watchdog found it hung (alive
+// but unresponsive) and acted, and the kind of its last failure ("" if it has never
+// failed). This is the supervisor's own view - restart counts and failure history a
+// component cannot self-report (a crashed component reports nothing) - which the
+// System Graph folds into each node's counters and the `graph` command renders.
+record supervisor-stat {
+	name:           string,
+	restarts:       u32,
+	watchdog-trips: u32,
+	last-failure:   string,
+}
+
+// The ServiceManager supervisor contract: report the live supervisor state of every
+// managed component - restart counts, watchdog trips and last failure - over the typed
+// API. SystemGraphService queries this and merges it into the live graph, so the
+// observability surface carries the supervisor's history alongside the kernel's live
+// counters. The network-exposed remote-admin surface over the same data is a later phase.
+interface supervisor {
+	@op(1) status: func() -> result<list<supervisor-stat>, error>;
 }
 
 

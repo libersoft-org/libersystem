@@ -7,11 +7,19 @@
 // with its own report channel; ServiceManager waits for its "online" report,
 // records its state, keeps that channel as the service's control channel, and
 // relays the report up to SystemManager. After the whole set is up it exercises
-// the stop path on a leaf service, then reports in itself.
+// the stop path on a leaf service, exercises the restart policy and watchdog on a
+// managed canary, reports in itself, and then stands as a supervisor for the life
+// of the system.
 //
-// The supervisor is intentionally minimal for this milestone: start in dependency
-// order, track each service's state, and stop a service on request. A restart
-// policy and a heartbeat/watchdog are a later phase.
+// As a supervisor it does not exit after bring-up: it blocks on every live control
+// channel at once and reacts when one needs it. A real service that crashes peer-
+// closes its control channel, which the supervisor observes and records. The managed
+// canary additionally proves the recovery machinery an unattended edge node depends
+// on: a crashed canary is restarted per a back-off policy (escalating once a restart
+// budget is spent), and a hung one - detected by a missed heartbeat - is killed and
+// restarted. The shell can drive a reverse-dependency `stop <service>` over an admin
+// channel (dependents stop before their dependencies), and SystemGraphService can
+// query restart / watchdog counters over the `supervisor` interface for observability.
 
 #![no_std]
 #![no_main]
@@ -19,9 +27,11 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use proto::system::log;
 use proto::system::network;
-use proto::system::{Entry, Field, Severity};
+use proto::system::supervisor;
+use proto::system::{Entry, Error, Field, Severity, SupervisorStat};
 use rt::*;
 
 // A service in the boot manifest: its package entry name and the names of the
@@ -56,6 +66,56 @@ enum State {
 	Stopped,
 	// Could not be started, or did not report in.
 	Failed,
+}
+
+// The watchdog's heartbeat deadline: a healthy service answers a probe in one
+// synchronous round-trip, far inside this window; a service that misses it is hung.
+// (~1s at the 100-ticks-per-second monotonic clock.)
+const WATCHDOG_TICKS: u64 = 100;
+
+// The restart budget the supervisor spends on a managed service before it escalates
+// (gives up and leaves it failed) rather than restarting it again.
+const MAX_RESTARTS: u32 = 3;
+
+// The base back-off between restart attempts, scaled by the attempt count so repeated
+// failures wait progressively longer. A bounded one-shot sleep, idle-friendly under the
+// test scheduler (which advances finite deadlines).
+const RESTART_BACKOFF_TICKS: u64 = 10;
+
+// What last took a managed component down, surfaced to observability as a string the
+// component itself could not report (a crashed component reports nothing).
+#[derive(Clone, Copy, PartialEq)]
+enum Failure {
+	None,
+	Crashed,
+	Hung,
+	Stopped,
+}
+
+impl Failure {
+	fn as_bytes(self) -> &'static [u8] {
+		match self {
+			Failure::None => b"",
+			Failure::Crashed => b"crashed",
+			Failure::Hung => b"hung",
+			Failure::Stopped => b"stopped",
+		}
+	}
+}
+
+// The supervisor's per-component bookkeeping: how often it has had to intervene and
+// why. Surfaced over the `supervisor` interface and folded into the System Graph.
+#[derive(Clone, Copy)]
+struct Supervised {
+	restarts: u32,
+	watchdog_trips: u32,
+	failure: Failure,
+}
+
+impl Supervised {
+	const fn new() -> Supervised {
+		Supervised { restarts: 0, watchdog_trips: 0, failure: Failure::None }
+	}
 }
 
 #[unsafe(no_mangle)]
@@ -112,13 +172,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut process_client: u64 = 0;
 	let mut config_client: u64 = 0;
 	let mut graph_client: u64 = 0;
+	// The admin channel the shell drives `stop <service>` over (the supervisor keeps the
+	// server end), and the channel SystemGraphService queries the `supervisor` interface
+	// on (the supervisor serves it). Both are minted when the shell and SystemGraphService
+	// bootstrap, and stood on in the supervise loop.
+	let mut admin_server: u64 = 0;
+	let mut stats_server: u64 = 0;
 	loop {
 		let mut progress: bool = false;
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut admin_server, &mut stats_server, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -135,24 +201,84 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    (stopping log_service, storage_service, or the interactive shell would).
 	//    This proves the supervisor can stop a service and track the transition, and
 	//    the transition is recorded in the journal like the startup events.
+	let mut sup: [Supervised; N] = [Supervised::new(); N];
 	if let Some(dev) = index_of(b"device_manager") {
 		if state[dev] == State::Running {
 			state[dev] = unsafe { stop_service(channels[dev], bootstrap, &mut buf) };
+			sup[dev].failure = Failure::Stopped;
+			channels[dev] = 0;
 			unsafe { emit_event(log_client, b"device_manager", b"stopped") };
+		}
+	}
+
+	// 3b. exercise the restart policy and the watchdog on the managed canary. The
+	//     supervisor owns the canary outright (it is not in the manifest and no other
+	//     component holds a channel to it), so it can crash it, hang it, and restart it
+	//     without disturbing the running system - proving the unattended-recovery
+	//     machinery an edge node depends on. A crash is detected by the control channel
+	//     peer-closing and recovered by a policy restart with back-off; a hang is caught
+	//     by a missed heartbeat and recovered by a kill + restart. Each transition is
+	//     reported up the boot chain and journaled. (Transparent restart of a real
+	//     service other components hold channels to needs a re-resolve/broker, deferred;
+	//     the canary stands in for the policy, while crash detection below applies to
+	//     every real service.)
+	let (park, _park_peer): (u64, u64) = match unsafe { channel() } {
+		Some(pair) => pair,
+		None => (0, 0),
+	};
+	let mut canary_proc: u64 = 0;
+	let mut canary_ctrl: u64 = 0;
+	let mut canary_sup: Supervised = Supervised::new();
+	unsafe {
+		let (proc, ctrl): (u64, u64) = spawn_canary(&package, &mut buf);
+		if proc != 0 {
+			canary_proc = proc;
+			canary_ctrl = ctrl;
+			send_blocking(bootstrap, b"WatchdogProbe: online", 0);
+			emit_event(log_client, b"watchdog_probe", b"online");
+			// prove the heartbeat path on a healthy canary: it answers the probe in time.
+			let _alive: bool = heartbeat(canary_ctrl, clock() + WATCHDOG_TICKS);
+			// crash -> restart: command a real fault, observe the peer-close, restart per policy.
+			send_blocking(canary_ctrl, b"CRASH", 0);
+			if restart_canary(&package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, Failure::Crashed, park, &mut buf) {
+				send_blocking(bootstrap, b"WatchdogProbe: restarted", 0);
+				emit_event(log_client, b"watchdog_probe", b"restarted");
+			}
+			// hang -> watchdog -> restart: command a hang, miss the heartbeat, kill the hung
+			// process, then restart per policy.
+			send_blocking(canary_ctrl, b"HANG", 0);
+			if !heartbeat(canary_ctrl, clock() + WATCHDOG_TICKS) {
+				canary_sup.watchdog_trips += 1;
+				signal(canary_proc, SIG_KILL);
+				if restart_canary(&package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, Failure::Hung, park, &mut buf) {
+					send_blocking(bootstrap, b"WatchdogProbe: recovered", 0);
+					emit_event(log_client, b"watchdog_probe", b"recovered");
+				}
+			}
 		}
 	}
 
 	// 4. report in once the whole set has settled - every service either Running or,
 	//    for the leaf we exercised the stop path on, Stopped, with none left Failed.
-	//    Keep `storage_client` alive until exit in case the shell never took it (e.g.
-	//    a spawn failure), so StorageService's service channel does not peer-close
-	//    prematurely; once the shell owns it, the shell keeps the service standing.
+	//    Keep `storage_client` alive in case the shell never took it (e.g. a spawn
+	//    failure), so StorageService's service channel does not peer-close prematurely;
+	//    once the shell owns it, the shell keeps the service standing.
 	if all_settled(&state) {
 		unsafe {
 			send_blocking(bootstrap, b"ServiceManager: online", 0);
 		}
 	}
 	let _ = storage_client;
+
+	// 5. stand as the supervisor. Unlike the earlier milestone, ServiceManager does not
+	//    exit after bring-up: it blocks on every live control channel at once so it can
+	//    react when something needs it - a real service crashing (its channel peer-closes),
+	//    the canary failing (restart per policy), the shell asking to `stop` a service
+	//    (reverse-dependency teardown), or SystemGraphService querying the supervisor state.
+	//    No timer stands here, so the loop sleeps at ~0% CPU until an event arrives.
+	unsafe {
+		supervise(&mut state, &mut channels, &mut sup, &procs, &package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, admin_server, stats_server, log_client, bootstrap, park, &mut buf);
+	}
 	exit();
 }
 
@@ -204,7 +330,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, admin_server: &mut u64, stats_server: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -254,10 +380,10 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, *pointer_console, console_client, console_control, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
-		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client) {
+		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
 			return State::Failed;
 		}
-		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *input_client, *console_client, *console_control, *graph_client, pkg_handle, pkg_len, buf) {
+		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *input_client, *console_client, *console_control, *graph_client, admin_server, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -346,8 +472,10 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 // (`ps`/`run`), and the ConfigService one (`config`/`set`). All but the LogService
 // client are transferred (the shell becomes their sole owner); the LogService
 // client is *duplicated* and the copy transferred, since the supervisor keeps
-// emitting on the original.
-unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, input_client: u64, console_client: u64, console_control: u64, graph_client: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+// emitting on the original. Finally the supervisor mints a fresh ADMIN channel and
+// transfers the client end to the shell (so its `stop <service>` command can drive
+// reverse-dependency teardown), keeping the server end in `*admin_server` to serve.
+unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, input_client: u64, console_client: u64, console_control: u64, graph_client: u64, admin_server: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"STORAGE", storage_client) {
 			return false;
@@ -396,7 +524,21 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 		}
 		// The shell spawns foreground programs (echo, later the net tools) from the
 		// init package, so hand it a read-only view of it like the other launchers.
-		bootstrap_package(manager_side, pkg_handle, pkg_len, buf)
+		if !bootstrap_package(manager_side, pkg_handle, pkg_len, buf) {
+			return false;
+		}
+		// A fresh ADMIN channel the shell drives `stop <service>` over: the supervisor
+		// keeps the server end (in `*admin_server`) and stands on it in the supervise
+		// loop; the client end is transferred to the shell, which receives it last.
+		let (admin_srv, admin_cli): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"ADMIN", admin_cli) {
+			return false;
+		}
+		*admin_server = admin_srv;
+		true
 	}
 }
 
@@ -405,11 +547,14 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 // and SystemGraphService itself), carrying the component's name and its declared
 // dependency edges as the payload and a read-only duplicate of that component's Process
 // as the transferred handle (the source of its live counters and state), then a
-// dedicated DeviceService connection ("DEVICE") for the device nodes, and finally the
-// channel its clients reach it on ("SERVE"), kept in `*graph_client` for the shell.
-// SystemGraphService comes up after every component it observes, so their handles are
-// all captured and their state is Running when its node set is built.
-unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], state: &[State; N], device_client: u64, graph_client: &mut u64) -> bool {
+// dedicated DeviceService connection ("DEVICE") for the device nodes, then a fresh
+// "SUPERVISOR" channel (the supervisor keeps the server end in `*stats_server` and
+// serves the supervisor interface on it, so SystemGraphService can merge restart /
+// watchdog counters into the graph), and finally the channel its clients reach it on
+// ("SERVE"), kept in `*graph_client` for the shell. SystemGraphService comes up after
+// every component it observes, so their handles are all captured and their state is
+// Running when its node set is built.
+unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], state: &[State; N], device_client: u64, graph_client: &mut u64, stats_server: &mut u64) -> bool {
 	unsafe {
 		let mut i: usize = 0;
 		while i < N {
@@ -447,6 +592,18 @@ unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], st
 			}
 			None => return false,
 		}
+		// A fresh SUPERVISOR channel: the supervisor keeps the server end (in
+		// `*stats_server`) and serves the supervisor interface on it, so SystemGraphService
+		// can query restart / watchdog counters and merge them into the graph. Sent right
+		// after DEVICE to match SystemGraphService's receive order.
+		let (stats_srv, stats_cli): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"SUPERVISOR", stats_cli) {
+			return false;
+		}
+		*stats_server = stats_srv;
 		// The channel its clients (the shell) reach it on; the client end is kept in
 		// `*graph_client` for the shell's own bootstrap.
 		bootstrap_serve(manager_side, graph_client)
@@ -685,5 +842,363 @@ unsafe fn send_factory(manager_side: u64, tag: &[u8], root: u64) -> bool {
 			Some(fac) => send_blocking(manager_side, tag, fac),
 			None => false,
 		}
+	}
+}
+
+// Spawn the managed watchdog canary from the init package, keeping its control channel
+// (the canary serves directly on its bootstrap channel, so the supervisor's end is both
+// the bootstrap peer and the control channel). Returns (Process, control), or (0, 0) on
+// failure. Waits for the canary's "online" report so the caller knows it is up before
+// exercising the restart and watchdog paths against it.
+unsafe fn spawn_canary(package: &Package, buf: &mut [u8]) -> (u64, u64) {
+	unsafe {
+		let elf: &[u8] = match package.lookup(b"watchdog_probe") {
+			Some(e) => e,
+			None => return (0, 0),
+		};
+		let (ctrl, probe_side): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return (0, 0),
+		};
+		let proc: i64 = spawn(elf, probe_side);
+		if proc < 0 {
+			return (0, 0);
+		}
+		match recv_blocking(ctrl, buf) {
+			Received::Message { .. } => (proc as u64, ctrl),
+			Received::Closed => {
+				close(proc as u64);
+				(0, 0)
+			}
+		}
+	}
+}
+
+// Restart the managed canary per the restart policy: record what took it down, drain
+// and release its dead endpoints, then - unless the restart budget is spent - back off
+// (longer after repeated failures) and respawn, charging one restart. Returns true if a
+// replacement is running, false if the budget is exhausted (the caller escalates). The
+// canary stands in for the policy a real service restart would follow.
+unsafe fn restart_canary(package: &Package, proc: &mut u64, ctrl: &mut u64, sup: &mut Supervised, failure: Failure, park: u64, buf: &mut [u8]) -> bool {
+	unsafe {
+		sup.failure = failure;
+		// Reap the old endpoints so the dead process is fully gone before its replacement.
+		drain_closed(*ctrl, buf);
+		if *ctrl != 0 {
+			close(*ctrl);
+			*ctrl = 0;
+		}
+		if *proc != 0 {
+			close(*proc);
+			*proc = 0;
+		}
+		// Spend from the restart budget; once exhausted, escalate rather than restart again.
+		if sup.restarts >= MAX_RESTARTS {
+			return false;
+		}
+		// Back off before the respawn, scaled by the attempt count. A bounded one-shot
+		// sleep, so the test scheduler still advances it deterministically.
+		sleep_ticks(park, RESTART_BACKOFF_TICKS * (sup.restarts as u64 + 1));
+		let (new_proc, new_ctrl): (u64, u64) = spawn_canary(package, buf);
+		if new_proc == 0 {
+			return false;
+		}
+		*proc = new_proc;
+		*ctrl = new_ctrl;
+		sup.restarts += 1;
+		true
+	}
+}
+
+// Drain a channel until its peer is gone, discarding any queued messages. Used to wait
+// out a dying process so its control channel is fully closed before it is replaced.
+unsafe fn drain_closed(channel: u64, buf: &mut [u8]) {
+	unsafe {
+		if channel == 0 {
+			return;
+		}
+		loop {
+			match recv_blocking(channel, buf) {
+				Received::Message { .. } => {}
+				Received::Closed => return,
+			}
+		}
+	}
+}
+
+// Sleep for `ticks` by waiting on the never-written `park` channel until the deadline
+// passes. A bounded one-shot wait that sleeps the thread at ~0% CPU; the test scheduler
+// advances the finite deadline, so the sleep is deterministic under test.
+unsafe fn sleep_ticks(park: u64, ticks: u64) {
+	unsafe {
+		if park == 0 {
+			return;
+		}
+		wait(park, clock() + ticks);
+	}
+}
+
+// Stand as the supervisor after bring-up. Each iteration builds a wait set from every
+// live control channel - the Running services' (kind 0), the canary's (kind 1), the
+// shell's admin channel (kind 2), and SystemGraphService's stats channel (kind 3) - and
+// blocks on all of them at once with no deadline, so the supervisor sleeps at ~0% CPU
+// until one needs attention. A service or the canary peer-closing means it crashed (the
+// canary is restarted per policy; a real service is recorded Failed and dropped from the
+// wait set so its dead channel does not busy-loop); an admin message drives a reverse-
+// dependency stop; a stats request is answered over the `supervisor` interface. Returns
+// when nothing is left to watch.
+unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], package: &Package, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, admin_server: u64, stats_server: u64, log_client: u64, up: u64, park: u64, buf: &mut [u8]) {
+	unsafe {
+		let mut admin: u64 = admin_server;
+		let mut stats: u64 = stats_server;
+		loop {
+			let mut handles: [u64; N + 3] = [0u64; N + 3];
+			let mut kinds: [u8; N + 3] = [0u8; N + 3];
+			let mut idxs: [usize; N + 3] = [0usize; N + 3];
+			let mut count: usize = 0;
+			let mut i: usize = 0;
+			while i < N {
+				if state[i] == State::Running && channels[i] != 0 {
+					handles[count] = channels[i];
+					kinds[count] = 0;
+					idxs[count] = i;
+					count += 1;
+				}
+				i += 1;
+			}
+			if *canary_ctrl != 0 {
+				handles[count] = *canary_ctrl;
+				kinds[count] = 1;
+				count += 1;
+			}
+			if admin != 0 {
+				handles[count] = admin;
+				kinds[count] = 2;
+				count += 1;
+			}
+			if stats != 0 {
+				handles[count] = stats;
+				kinds[count] = 3;
+				count += 1;
+			}
+			if count == 0 {
+				return;
+			}
+			let ready: i64 = wait_any(&handles[..count], 0);
+			if ready < 0 {
+				return;
+			}
+			let r: usize = ready as usize;
+			match kinds[r] {
+				0 => {
+					// A real service's control channel fired; a peer-close means it crashed.
+					let idx: usize = idxs[r];
+					if let Polled::Closed = try_recv(channels[idx], buf) {
+						state[idx] = State::Failed;
+						sup[idx].failure = Failure::Crashed;
+						channels[idx] = 0;
+						emit_event(log_client, MANIFEST[idx].name, b"crashed");
+					}
+				}
+				1 => {
+					// The canary's control channel fired; a peer-close means it crashed, so
+					// restart it per policy (escalating once the budget is spent).
+					if let Polled::Closed = try_recv(*canary_ctrl, buf) {
+						if restart_canary(package, canary_proc, canary_ctrl, canary_sup, Failure::Crashed, park, buf) {
+							emit_event(log_client, b"watchdog_probe", b"restarted");
+						} else {
+							emit_event(log_client, b"watchdog_probe", b"escalated");
+						}
+					}
+				}
+				2 => {
+					// The shell asked to stop a service; tear down its dependents first.
+					if !handle_admin(admin, state, channels, sup, procs, log_client, up, buf) {
+						admin = 0;
+					}
+				}
+				_ => {
+					// SystemGraphService queried the supervisor state; answer one request.
+					if !serve_stats_once(stats, sup, canary_sup, buf) {
+						stats = 0;
+					}
+				}
+			}
+		}
+	}
+}
+
+// Handle one admin request from the shell: the bare name of a service to stop. An
+// unknown name (or one already down) gets a NOTFOUND reply; otherwise the service and
+// its dependents are torn down and the newline-joined list of what stopped is replied
+// for the shell to print. Returns false once the admin channel's peer (the shell) is
+// gone, so the supervisor drops it from its wait set.
+unsafe fn handle_admin(admin: u64, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, up: u64, buf: &mut [u8]) -> bool {
+	unsafe {
+		let len: usize = match recv_blocking(admin, buf) {
+			Received::Message { len, .. } => len,
+			Received::Closed => return false,
+		};
+		// Copy the name out of `buf`, since the teardown reuses it to drain control channels.
+		let mut namebuf: [u8; 64] = [0u8; 64];
+		let nlen: usize = len.min(namebuf.len()).min(buf.len());
+		namebuf[..nlen].copy_from_slice(&buf[..nlen]);
+		let name: &[u8] = &namebuf[..nlen];
+		match index_of(name) {
+			Some(target) if state[target] == State::Running => {
+				let stopped: Vec<u8> = stop_subtree(target, state, channels, sup, procs, log_client, up, buf);
+				let mut reply: Vec<u8> = Vec::new();
+				reply.extend_from_slice(b"STOPPED\n");
+				reply.extend_from_slice(&stopped);
+				send_blocking(admin, &reply, 0);
+			}
+			_ => {
+				send_blocking(admin, b"NOTFOUND", 0);
+			}
+		}
+		true
+	}
+}
+
+// Tear down a service and every component that transitively depends on it, dependents
+// first. The scope is the target plus its reverse-dependency closure, minus the shell
+// (the controlling terminal is exempt: force-killing the issuing client is hostile, and
+// its Process handle is not held here anyway). Components are stopped in reverse-
+// topological order - repeatedly a current leaf of the scoped subgraph, one nothing in
+// scope still depends on - so a dependent always stops before its dependency. A service
+// is stopped by killing its process (services serve on their SERVE channels and ignore
+// their bootstrap, so the cooperative STOP protocol does not reach them) and draining
+// its control channel to the peer-close. Returns the newline-joined names of everything
+// stopped, in teardown order.
+unsafe fn stop_subtree(target: usize, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, up: u64, buf: &mut [u8]) -> Vec<u8> {
+	unsafe {
+		let mut scope: [bool; N] = [false; N];
+		scope[target] = true;
+		// Fixpoint: add any Running component that depends on something already in scope,
+		// until nothing new is added - the full reverse-dependency closure of the target.
+		loop {
+			let mut grew: bool = false;
+			let mut i: usize = 0;
+			while i < N {
+				if !scope[i] && state[i] == State::Running && depends_on_scoped(i, &scope) {
+					scope[i] = true;
+					grew = true;
+				}
+				i += 1;
+			}
+			if !grew {
+				break;
+			}
+		}
+		// Exempt the shell: it transitively depends on everything, so it would always be in
+		// scope, but the issuing terminal must survive (and procs[shell] == 0 regardless).
+		if let Some(sh) = index_of(b"shell") {
+			scope[sh] = false;
+		}
+		let mut stopped: Vec<u8> = Vec::new();
+		loop {
+			let mut progress: bool = false;
+			let mut i: usize = 0;
+			while i < N {
+				if scope[i] && state[i] == State::Running && !has_running_dependent(i, &scope, state) {
+					if procs[i] != 0 {
+						signal(procs[i], SIG_KILL);
+					}
+					drain_closed(channels[i], buf);
+					if channels[i] != 0 {
+						close(channels[i]);
+						channels[i] = 0;
+					}
+					state[i] = State::Stopped;
+					sup[i].failure = Failure::Stopped;
+					emit_event(log_client, MANIFEST[i].name, b"stopped");
+					if !stopped.is_empty() {
+						stopped.push(b'\n');
+					}
+					stopped.extend_from_slice(MANIFEST[i].name);
+					progress = true;
+				}
+				i += 1;
+			}
+			if !progress {
+				break;
+			}
+		}
+		let _ = up;
+		stopped
+	}
+}
+
+// Whether component `i` depends on any component currently in the teardown scope.
+fn depends_on_scoped(i: usize, scope: &[bool; N]) -> bool {
+	for &dep in MANIFEST[i].deps {
+		if let Some(d) = index_of(dep) {
+			if scope[d] {
+				return true;
+			}
+		}
+	}
+	false
+}
+
+// Whether any in-scope Running component still depends on component `i` - i.e. `i` is
+// not yet a leaf of the scoped subgraph and must not be stopped this round.
+fn has_running_dependent(i: usize, scope: &[bool; N], state: &[State; N]) -> bool {
+	let mut j: usize = 0;
+	while j < N {
+		if j != i && scope[j] && state[j] == State::Running && index_of_dep(j, i) {
+			return true;
+		}
+		j += 1;
+	}
+	false
+}
+
+// Whether component `j` declares component `i` among its dependencies.
+fn index_of_dep(j: usize, i: usize) -> bool {
+	for &dep in MANIFEST[j].deps {
+		if index_of(dep) == Some(i) {
+			return true;
+		}
+	}
+	false
+}
+
+// Answer one request on the supervisor stats channel from SystemGraphService: decode it,
+// build the per-component status list (restarts, watchdog trips, last failure for each
+// manifest service plus the canary), and reply over the `supervisor` interface. Returns
+// false once the channel's peer is gone, so the supervisor drops it from its wait set.
+unsafe fn serve_stats_once(stats: u64, sup: &[Supervised; N], canary_sup: &Supervised, buf: &mut [u8]) -> bool {
+	unsafe {
+		let (len, handle): (usize, u64) = match recv_blocking(stats, buf) {
+			Received::Message { len, handle } => (len, handle),
+			Received::Closed => return false,
+		};
+		let mut api = StatsApi { sup, canary_sup };
+		let mut reply: [u8; 2048] = [0u8; 2048];
+		let mut reply_handle: u64 = 0;
+		if let Some(n) = supervisor::dispatch(&mut api, &buf[..len], handle, &mut reply, &mut reply_handle) {
+			send_blocking(stats, &reply[..n], reply_handle);
+		}
+		true
+	}
+}
+
+// The supervisor's view of its own bookkeeping, served over the `supervisor` interface.
+struct StatsApi<'a> {
+	sup: &'a [Supervised; N],
+	canary_sup: &'a Supervised,
+}
+
+impl<'a> supervisor::Service for StatsApi<'a> {
+	fn status(&mut self) -> Result<Vec<SupervisorStat>, Error> {
+		let mut out: Vec<SupervisorStat> = Vec::new();
+		let mut i: usize = 0;
+		while i < N {
+			out.push(SupervisorStat { name: String::from_utf8_lossy(MANIFEST[i].name).into_owned(), restarts: self.sup[i].restarts, watchdog_trips: self.sup[i].watchdog_trips, last_failure: String::from_utf8_lossy(self.sup[i].failure.as_bytes()).into_owned() });
+			i += 1;
+		}
+		out.push(SupervisorStat { name: String::from("watchdog_probe"), restarts: self.canary_sup.restarts, watchdog_trips: self.canary_sup.watchdog_trips, last_failure: String::from_utf8_lossy(self.canary_sup.failure.as_bytes()).into_owned() });
+		Ok(out)
 	}
 }

@@ -2120,10 +2120,12 @@ fn init_package_starts_system_manager() {
 	// StorageService round-trip by reading a file with `cat` before it reports in).
 	// Every report is relayed up, so the kernel observes the services come up in
 	// dependency order, then DeviceManager stopped (ServiceManager exercises the stop
-	// path on that service), followed by the two managers.
+	// path on that service), then the watchdog canary brought up, restarted after a
+	// commanded crash and recovered after a missed heartbeat (ServiceManager exercises
+	// the restart policy and watchdog), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 16] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"DeviceManager: online", b"StorageService: online", b"NetworkService: online", b"TimeService: online", b"AudioService: online", b"InputService: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 19] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"DeviceManager: online", b"StorageService: online", b"NetworkService: online", b"TimeService: online", b"AudioService: online", b"InputService: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"WatchdogProbe: online", b"WatchdogProbe: restarted", b"WatchdogProbe: recovered", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");

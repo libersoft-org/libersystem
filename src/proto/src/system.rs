@@ -2705,6 +2705,8 @@ pub struct Counters {
 	pub handles: u64,
 	pub memory_bytes: u64,
 	pub restarts: u32,
+	pub watchdog_trips: u32,
+	pub last_failure: String,
 }
 
 impl Counters {
@@ -2727,6 +2729,8 @@ impl Counters {
 		w.u64(self.handles)?;
 		w.u64(self.memory_bytes)?;
 		w.u32(self.restarts)?;
+		w.u32(self.watchdog_trips)?;
+		w.bytes_lp(self.last_failure.as_bytes())?;
 		Some(())
 	}
 	pub(crate) fn read(r: &mut Reader) -> Option<Counters> {
@@ -2735,7 +2739,9 @@ impl Counters {
 		let handles = r.u64()?;
 		let memory_bytes = r.u64()?;
 		let restarts = r.u32()?;
-		Some(Counters { messages_sent, messages_received, handles, memory_bytes, restarts })
+		let watchdog_trips = r.u32()?;
+		let last_failure = r.string_lp()?;
+		Some(Counters { messages_sent, messages_received, handles, memory_bytes, restarts, watchdog_trips, last_failure })
 	}
 }
 
@@ -2959,6 +2965,137 @@ pub mod system_graph {
 	}
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SupervisorStat {
+	pub name: String,
+	pub restarts: u32,
+	pub watchdog_trips: u32,
+	pub last_failure: String,
+}
+
+impl SupervisorStat {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<SupervisorStat> {
+		SupervisorStat::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.name.as_bytes())?;
+		w.u32(self.restarts)?;
+		w.u32(self.watchdog_trips)?;
+		w.bytes_lp(self.last_failure.as_bytes())?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<SupervisorStat> {
+		let name = r.string_lp()?;
+		let restarts = r.u32()?;
+		let watchdog_trips = r.u32()?;
+		let last_failure = r.string_lp()?;
+		Some(SupervisorStat { name, restarts, watchdog_trips, last_failure })
+	}
+}
+
+// interface `supervisor` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod supervisor {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_STATUS: u16 = 1;
+
+	pub trait Service {
+		fn status(&mut self) -> Result<Vec<SupervisorStat>, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = Reader::with_handle(request, request_handle);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		match op {
+			OP_STATUS => {
+				let result = service.status();
+				match &result {
+					Ok(v105) => {
+						w.u8(1)?;
+						if v105.len() > u16::MAX as usize {
+							return None;
+						}
+						w.u16(v105.len() as u16)?;
+						for v107 in v105.iter() {
+							v107.write(w)?;
+						}
+					}
+					Err(v106) => {
+						w.u8(0)?;
+						v106.write(w)?;
+					}
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn status(&mut self) -> Option<Result<Vec<SupervisorStat>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_STATUS)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 {
+				Ok({
+					let v108 = r.u16()? as usize;
+					let mut v109 = Vec::new();
+					for _ in 0..v108 {
+						v109.push(SupervisorStat::read(r)?);
+					}
+					v109
+				})
+			} else {
+				Err(Error::read(r)?)
+			})
+		}
+	}
+}
+
 impl Error {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -3124,13 +3261,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v106 = true;
-		for v105 in self.fields.iter() {
-			if !v106 {
+		let mut v111 = true;
+		for v110 in self.fields.iter() {
+			if !v111 {
 				out.push(',');
 			}
-			v106 = false;
-			v105.to_json_into(out);
+			v111 = false;
+			v110.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -3148,13 +3285,13 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v108 = true;
-		for v107 in self.fields.iter() {
-			if !v108 {
+		let mut v113 = true;
+		for v112 in self.fields.iter() {
+			if !v113 {
 				out.push_str(", ");
 			}
-			v108 = false;
-			v107.to_text_into(out);
+			v113 = false;
+			v112.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -3169,8 +3306,8 @@ impl Entry {
 		crate::codec::cbor::text(out, &self.source);
 		crate::codec::cbor::text(out, "fields");
 		crate::codec::cbor::array(out, self.fields.len());
-		for v109 in self.fields.iter() {
-			v109.to_cbor_into(out);
+		for v114 in self.fields.iter() {
+			v114.to_cbor_into(out);
 		}
 	}
 }
@@ -3195,8 +3332,8 @@ impl Query {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v110) => {
-				let _ = write!(out, "{}", v110);
+			Some(v115) => {
+				let _ = write!(out, "{}", v115);
 			}
 			None => {
 				out.push_str("null");
@@ -3205,8 +3342,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v111) => {
-				v111.to_json_into(out);
+			Some(v116) => {
+				v116.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -3215,8 +3352,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v112) => {
-				crate::codec::json_escape(v112, out);
+			Some(v117) => {
+				crate::codec::json_escape(v117, out);
 			}
 			None => {
 				out.push_str("null");
@@ -3231,8 +3368,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v113) => {
-				let _ = write!(out, "{}", v113);
+			Some(v118) => {
+				let _ = write!(out, "{}", v118);
 			}
 			None => {
 				out.push('-');
@@ -3241,8 +3378,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v114) => {
-				v114.to_text_into(out);
+			Some(v119) => {
+				v119.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -3251,8 +3388,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v115) => {
-				out.push_str(v115);
+			Some(v120) => {
+				out.push_str(v120);
 			}
 			None => {
 				out.push('-');
@@ -3267,8 +3404,8 @@ impl Query {
 		crate::codec::cbor::map(out, 4);
 		crate::codec::cbor::text(out, "since");
 		match &self.since {
-			Some(v116) => {
-				crate::codec::cbor::uint(out, *v116 as u64);
+			Some(v121) => {
+				crate::codec::cbor::uint(out, *v121 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3276,8 +3413,8 @@ impl Query {
 		}
 		crate::codec::cbor::text(out, "min-severity");
 		match &self.min_severity {
-			Some(v117) => {
-				v117.to_cbor_into(out);
+			Some(v122) => {
+				v122.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3285,8 +3422,8 @@ impl Query {
 		}
 		crate::codec::cbor::text(out, "source");
 		match &self.source {
-			Some(v118) => {
-				crate::codec::cbor::text(out, v118);
+			Some(v123) => {
+				crate::codec::cbor::text(out, v123);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3805,13 +3942,13 @@ impl Neighbor {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v120 = true;
-		for v119 in self.mac.iter() {
-			if !v120 {
+		let mut v125 = true;
+		for v124 in self.mac.iter() {
+			if !v125 {
 				out.push(',');
 			}
-			v120 = false;
-			let _ = write!(out, "{}", v119);
+			v125 = false;
+			let _ = write!(out, "{}", v124);
 		}
 		out.push(']');
 		out.push('}');
@@ -3823,13 +3960,13 @@ impl Neighbor {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v122 = true;
-		for v121 in self.mac.iter() {
-			if !v122 {
+		let mut v127 = true;
+		for v126 in self.mac.iter() {
+			if !v127 {
 				out.push_str(", ");
 			}
-			v122 = false;
-			let _ = write!(out, "{}", v121);
+			v127 = false;
+			let _ = write!(out, "{}", v126);
 		}
 		out.push(']');
 		out.push('}');
@@ -3840,8 +3977,8 @@ impl Neighbor {
 		self.addr.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mac");
 		crate::codec::cbor::array(out, self.mac.len());
-		for v123 in self.mac.iter() {
-			crate::codec::cbor::uint(out, *v123 as u64);
+		for v128 in self.mac.iter() {
+			crate::codec::cbor::uint(out, *v128 as u64);
 		}
 	}
 }
@@ -3869,13 +4006,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v125 = true;
-		for v124 in self.mac.iter() {
-			if !v125 {
+		let mut v130 = true;
+		for v129 in self.mac.iter() {
+			if !v130 {
 				out.push(',');
 			}
-			v125 = false;
-			let _ = write!(out, "{}", v124);
+			v130 = false;
+			let _ = write!(out, "{}", v129);
 		}
 		out.push(']');
 		out.push(',');
@@ -3884,13 +4021,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"neighbors\":");
 		out.push('[');
-		let mut v127 = true;
-		for v126 in self.neighbors.iter() {
-			if !v127 {
+		let mut v132 = true;
+		for v131 in self.neighbors.iter() {
+			if !v132 {
 				out.push(',');
 			}
-			v127 = false;
-			v126.to_json_into(out);
+			v132 = false;
+			v131.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -3902,13 +4039,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v129 = true;
-		for v128 in self.mac.iter() {
-			if !v129 {
+		let mut v134 = true;
+		for v133 in self.mac.iter() {
+			if !v134 {
 				out.push_str(", ");
 			}
-			v129 = false;
-			let _ = write!(out, "{}", v128);
+			v134 = false;
+			let _ = write!(out, "{}", v133);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -3917,13 +4054,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("neighbors=");
 		out.push('[');
-		let mut v131 = true;
-		for v130 in self.neighbors.iter() {
-			if !v131 {
+		let mut v136 = true;
+		for v135 in self.neighbors.iter() {
+			if !v136 {
 				out.push_str(", ");
 			}
-			v131 = false;
-			v130.to_text_into(out);
+			v136 = false;
+			v135.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -3934,15 +4071,15 @@ impl NetInfo {
 		self.addr.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mac");
 		crate::codec::cbor::array(out, self.mac.len());
-		for v132 in self.mac.iter() {
-			crate::codec::cbor::uint(out, *v132 as u64);
+		for v137 in self.mac.iter() {
+			crate::codec::cbor::uint(out, *v137 as u64);
 		}
 		crate::codec::cbor::text(out, "gateway");
 		self.gateway.to_cbor_into(out);
 		crate::codec::cbor::text(out, "neighbors");
 		crate::codec::cbor::array(out, self.neighbors.len());
-		for v133 in self.neighbors.iter() {
-			v133.to_cbor_into(out);
+		for v138 in self.neighbors.iter() {
+			v138.to_cbor_into(out);
 		}
 	}
 }
@@ -4060,13 +4197,13 @@ impl TcpRequest {
 		out.push(',');
 		out.push_str("\"request\":");
 		out.push('[');
-		let mut v135 = true;
-		for v134 in self.request.iter() {
-			if !v135 {
+		let mut v140 = true;
+		for v139 in self.request.iter() {
+			if !v140 {
 				out.push(',');
 			}
-			v135 = false;
-			let _ = write!(out, "{}", v134);
+			v140 = false;
+			let _ = write!(out, "{}", v139);
 		}
 		out.push(']');
 		out.push('}');
@@ -4078,13 +4215,13 @@ impl TcpRequest {
 		out.push_str(", ");
 		out.push_str("request=");
 		out.push('[');
-		let mut v137 = true;
-		for v136 in self.request.iter() {
-			if !v137 {
+		let mut v142 = true;
+		for v141 in self.request.iter() {
+			if !v142 {
 				out.push_str(", ");
 			}
-			v137 = false;
-			let _ = write!(out, "{}", v136);
+			v142 = false;
+			let _ = write!(out, "{}", v141);
 		}
 		out.push(']');
 		out.push('}');
@@ -4095,8 +4232,8 @@ impl TcpRequest {
 		self.ep.to_cbor_into(out);
 		crate::codec::cbor::text(out, "request");
 		crate::codec::cbor::array(out, self.request.len());
-		for v138 in self.request.iter() {
-			crate::codec::cbor::uint(out, *v138 as u64);
+		for v143 in self.request.iter() {
+			crate::codec::cbor::uint(out, *v143 as u64);
 		}
 	}
 }
@@ -4220,13 +4357,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("\"data\":");
 		out.push('[');
-		let mut v140 = true;
-		for v139 in self.data.iter() {
-			if !v140 {
+		let mut v145 = true;
+		for v144 in self.data.iter() {
+			if !v145 {
 				out.push(',');
 			}
-			v140 = false;
-			let _ = write!(out, "{}", v139);
+			v145 = false;
+			let _ = write!(out, "{}", v144);
 		}
 		out.push(']');
 		out.push('}');
@@ -4235,13 +4372,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("data=");
 		out.push('[');
-		let mut v142 = true;
-		for v141 in self.data.iter() {
-			if !v142 {
+		let mut v147 = true;
+		for v146 in self.data.iter() {
+			if !v147 {
 				out.push_str(", ");
 			}
-			v142 = false;
-			let _ = write!(out, "{}", v141);
+			v147 = false;
+			let _ = write!(out, "{}", v146);
 		}
 		out.push(']');
 		out.push('}');
@@ -4250,8 +4387,8 @@ impl Chunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "data");
 		crate::codec::cbor::array(out, self.data.len());
-		for v143 in self.data.iter() {
-			crate::codec::cbor::uint(out, *v143 as u64);
+		for v148 in self.data.iter() {
+			crate::codec::cbor::uint(out, *v148 as u64);
 		}
 	}
 }
@@ -4458,6 +4595,12 @@ impl Counters {
 		out.push(',');
 		out.push_str("\"restarts\":");
 		let _ = write!(out, "{}", self.restarts);
+		out.push(',');
+		out.push_str("\"watchdog-trips\":");
+		let _ = write!(out, "{}", self.watchdog_trips);
+		out.push(',');
+		out.push_str("\"last-failure\":");
+		crate::codec::json_escape(&self.last_failure, out);
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -4476,10 +4619,16 @@ impl Counters {
 		out.push_str(", ");
 		out.push_str("restarts=");
 		let _ = write!(out, "{}", self.restarts);
+		out.push_str(", ");
+		out.push_str("watchdog-trips=");
+		let _ = write!(out, "{}", self.watchdog_trips);
+		out.push_str(", ");
+		out.push_str("last-failure=");
+		out.push_str(&self.last_failure);
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::map(out, 7);
 		crate::codec::cbor::text(out, "messages-sent");
 		crate::codec::cbor::uint(out, self.messages_sent as u64);
 		crate::codec::cbor::text(out, "messages-received");
@@ -4490,6 +4639,10 @@ impl Counters {
 		crate::codec::cbor::uint(out, self.memory_bytes as u64);
 		crate::codec::cbor::text(out, "restarts");
 		crate::codec::cbor::uint(out, self.restarts as u64);
+		crate::codec::cbor::text(out, "watchdog-trips");
+		crate::codec::cbor::uint(out, self.watchdog_trips as u64);
+		crate::codec::cbor::text(out, "last-failure");
+		crate::codec::cbor::text(out, &self.last_failure);
 	}
 }
 
@@ -4522,13 +4675,13 @@ impl Component {
 		out.push(',');
 		out.push_str("\"deps\":");
 		out.push('[');
-		let mut v145 = true;
-		for v144 in self.deps.iter() {
-			if !v145 {
+		let mut v150 = true;
+		for v149 in self.deps.iter() {
+			if !v150 {
 				out.push(',');
 			}
-			v145 = false;
-			crate::codec::json_escape(v144, out);
+			v150 = false;
+			crate::codec::json_escape(v149, out);
 		}
 		out.push(']');
 		out.push(',');
@@ -4549,13 +4702,13 @@ impl Component {
 		out.push_str(", ");
 		out.push_str("deps=");
 		out.push('[');
-		let mut v147 = true;
-		for v146 in self.deps.iter() {
-			if !v147 {
+		let mut v152 = true;
+		for v151 in self.deps.iter() {
+			if !v152 {
 				out.push_str(", ");
 			}
-			v147 = false;
-			out.push_str(v146);
+			v152 = false;
+			out.push_str(v151);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -4573,8 +4726,8 @@ impl Component {
 		self.state.to_cbor_into(out);
 		crate::codec::cbor::text(out, "deps");
 		crate::codec::cbor::array(out, self.deps.len());
-		for v148 in self.deps.iter() {
-			crate::codec::cbor::text(out, v148);
+		for v153 in self.deps.iter() {
+			crate::codec::cbor::text(out, v153);
 		}
 		crate::codec::cbor::text(out, "counters");
 		self.counters.to_cbor_into(out);
@@ -4644,25 +4797,25 @@ impl Graph {
 		out.push('{');
 		out.push_str("\"components\":");
 		out.push('[');
-		let mut v150 = true;
-		for v149 in self.components.iter() {
-			if !v150 {
+		let mut v155 = true;
+		for v154 in self.components.iter() {
+			if !v155 {
 				out.push(',');
 			}
-			v150 = false;
-			v149.to_json_into(out);
+			v155 = false;
+			v154.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"spans\":");
 		out.push('[');
-		let mut v152 = true;
-		for v151 in self.spans.iter() {
-			if !v152 {
+		let mut v157 = true;
+		for v156 in self.spans.iter() {
+			if !v157 {
 				out.push(',');
 			}
-			v152 = false;
-			v151.to_json_into(out);
+			v157 = false;
+			v156.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -4671,25 +4824,25 @@ impl Graph {
 		out.push('{');
 		out.push_str("components=");
 		out.push('[');
-		let mut v154 = true;
-		for v153 in self.components.iter() {
-			if !v154 {
+		let mut v159 = true;
+		for v158 in self.components.iter() {
+			if !v159 {
 				out.push_str(", ");
 			}
-			v154 = false;
-			v153.to_text_into(out);
+			v159 = false;
+			v158.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("spans=");
 		out.push('[');
-		let mut v156 = true;
-		for v155 in self.spans.iter() {
-			if !v156 {
+		let mut v161 = true;
+		for v160 in self.spans.iter() {
+			if !v161 {
 				out.push_str(", ");
 			}
-			v156 = false;
-			v155.to_text_into(out);
+			v161 = false;
+			v160.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -4698,14 +4851,73 @@ impl Graph {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "components");
 		crate::codec::cbor::array(out, self.components.len());
-		for v157 in self.components.iter() {
-			v157.to_cbor_into(out);
+		for v162 in self.components.iter() {
+			v162.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "spans");
 		crate::codec::cbor::array(out, self.spans.len());
-		for v158 in self.spans.iter() {
-			v158.to_cbor_into(out);
+		for v163 in self.spans.iter() {
+			v163.to_cbor_into(out);
 		}
+	}
+}
+
+impl SupervisorStat {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push(',');
+		out.push_str("\"restarts\":");
+		let _ = write!(out, "{}", self.restarts);
+		out.push(',');
+		out.push_str("\"watchdog-trips\":");
+		let _ = write!(out, "{}", self.watchdog_trips);
+		out.push(',');
+		out.push_str("\"last-failure\":");
+		crate::codec::json_escape(&self.last_failure, out);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("name=");
+		out.push_str(&self.name);
+		out.push_str(", ");
+		out.push_str("restarts=");
+		let _ = write!(out, "{}", self.restarts);
+		out.push_str(", ");
+		out.push_str("watchdog-trips=");
+		let _ = write!(out, "{}", self.watchdog_trips);
+		out.push_str(", ");
+		out.push_str("last-failure=");
+		out.push_str(&self.last_failure);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "restarts");
+		crate::codec::cbor::uint(out, self.restarts as u64);
+		crate::codec::cbor::text(out, "watchdog-trips");
+		crate::codec::cbor::uint(out, self.watchdog_trips as u64);
+		crate::codec::cbor::text(out, "last-failure");
+		crate::codec::cbor::text(out, &self.last_failure);
 	}
 }
 
@@ -4916,17 +5128,17 @@ mod compat {
 	}
 	#[test]
 	fn counters_wire_is_stable() {
-		let sample = Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7 };
+		let sample = Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7, watchdog_trips: 7, last_failure: String::from("x") };
 		let bytes = sample.encode_vec();
-		let golden: &[u8] = &[7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0];
+		let golden: &[u8] = &[7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120];
 		assert_eq!(bytes, golden);
 		assert_eq!(Counters::decode(&bytes).unwrap(), sample);
 	}
 	#[test]
 	fn component_wire_is_stable() {
-		let sample = Component { name: String::from("x"), kind: ComponentKind::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7 } };
+		let sample = Component { name: String::from("x"), kind: ComponentKind::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7, watchdog_trips: 7, last_failure: String::from("x") } };
 		let bytes = sample.encode_vec();
-		let golden: &[u8] = &[1, 0, 120, 0, 0, 1, 0, 1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0];
+		let golden: &[u8] = &[1, 0, 120, 0, 0, 1, 0, 1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120];
 		assert_eq!(bytes, golden);
 		assert_eq!(Component::decode(&bytes).unwrap(), sample);
 	}
@@ -4940,10 +5152,18 @@ mod compat {
 	}
 	#[test]
 	fn graph_wire_is_stable() {
-		let sample = Graph { components: alloc::vec![Component { name: String::from("x"), kind: ComponentKind::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7 } }], spans: alloc::vec![TraceSpan { name: String::from("x"), duration_ns: 7 }] };
+		let sample = Graph { components: alloc::vec![Component { name: String::from("x"), kind: ComponentKind::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7, watchdog_trips: 7, last_failure: String::from("x") } }], spans: alloc::vec![TraceSpan { name: String::from("x"), duration_ns: 7 }] };
 		let bytes = sample.encode_vec();
-		let golden: &[u8] = &[1, 0, 1, 0, 120, 0, 0, 1, 0, 1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 1, 0, 1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0];
+		let golden: &[u8] = &[1, 0, 1, 0, 120, 0, 0, 1, 0, 1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120, 1, 0, 1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0];
 		assert_eq!(bytes, golden);
 		assert_eq!(Graph::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn supervisor_stat_wire_is_stable() {
+		let sample = SupervisorStat { name: String::from("x"), restarts: 7, watchdog_trips: 7, last_failure: String::from("x") };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120];
+		assert_eq!(bytes, golden);
+		assert_eq!(SupervisorStat::decode(&bytes).unwrap(), sample);
 	}
 }

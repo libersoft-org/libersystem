@@ -57,6 +57,10 @@ name = "system_graph_service"
 path = "src/system_graph_service.rs"
 
 [[bin]]
+name = "watchdog_probe"
+path = "src/watchdog_probe.rs"
+
+[[bin]]
 name = "wasi_host"
 path = "src/wasi_host.rs"
 

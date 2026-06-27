@@ -424,6 +424,14 @@ where
 			match recv_blocking(service, request) {
 				Received::Message { len, .. } if len == 0 => break,
 				Received::Message { len, handle } => {
+					// the reserved heartbeat probe: answer it uniformly without invoking the
+					// typed dispatch, so the supervisor's watchdog can prove this service is
+					// still responsive (a service wedged inside a request never returns here
+					// to answer, so the probe times out - that is how a hang is detected).
+					if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == HEARTBEAT_OP {
+						send_blocking(service, b"PONG", 0);
+						continue;
+					}
 					let mut reply_handle: u64 = 0;
 					if let Some(n) = handle_request(&request[..len], handle, reply, &mut reply_handle) {
 						send_blocking(service, &reply[..n], reply_handle);
@@ -434,6 +442,14 @@ where
 		}
 	}
 }
+
+// The reserved control opcode the supervisor (ServiceManager) sends over a service's
+// channel to probe its liveness: serve / serve_multi answer it with a fixed b"PONG"
+// WITHOUT invoking the typed dispatch, so every service answers a heartbeat uniformly.
+// A service wedged inside a request never returns to its serve loop to answer, so the
+// probe times out - the watchdog's hung (alive-but-unresponsive) detection. No typed
+// interface uses opcode 0xfffe, so it never collides with a real request.
+pub const HEARTBEAT_OP: u16 = 0xfffe;
 
 // The reserved control opcode a holder of a multi-client service's channel sends to
 // mint its own independent client connection (the generic equivalent of
@@ -476,7 +492,10 @@ where
 					chans.swap_remove(idx);
 				}
 				Received::Message { len, handle } => {
-					if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == CONNECT_OP {
+					if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == HEARTBEAT_OP {
+						// the reserved heartbeat probe: answer uniformly, like serve (above).
+						send_blocking(chan, b"PONG", 0);
+					} else if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == CONNECT_OP {
 						// mint a fresh independent client connection for the caller.
 						match channel() {
 							Some((mine, theirs)) => {
@@ -503,6 +522,25 @@ where
 				}
 			}
 		}
+	}
+}
+
+// Probe a service for liveness over `channel` (a connection the supervisor holds to
+// it): send the reserved heartbeat opcode and wait up to `deadline` (absolute ticks,
+// 0 = forever) for the pong. Returns true if the service answered in time (alive and
+// responsive), false on a timeout (hung) or a closed channel. The watchdog's
+// hung-detection: a service wedged inside a request never returns to answer the probe.
+pub unsafe fn heartbeat(channel: u64, deadline: u64) -> bool {
+	unsafe {
+		let req: [u8; 2] = HEARTBEAT_OP.to_le_bytes();
+		if !send_blocking(channel, &req, 0) {
+			return false;
+		}
+		if wait(channel, deadline) != 0 {
+			return false;
+		}
+		let mut buf: [u8; 8] = [0u8; 8];
+		matches!(try_recv(channel, &mut buf), Polled::Message { .. })
 	}
 }
 

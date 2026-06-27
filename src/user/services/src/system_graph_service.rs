@@ -28,7 +28,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{Component, ComponentKind, ComponentState, Counters, DeviceEntry, DeviceKind, Error, Graph, TraceSpan, device, system_graph};
+use proto::system::{device, supervisor, system_graph, Component, ComponentKind, ComponentState, Counters, DeviceEntry, DeviceKind, Error, Graph, TraceSpan};
 use rt::*;
 
 // One component node the supervisor registered: its name and dependency edges (the
@@ -39,11 +39,13 @@ struct Node {
 	process: u64,
 }
 
-// The service state: the registered component nodes and a client connection to
-// DeviceService for the device nodes.
+// The service state: the registered component nodes, a client connection to
+// DeviceService for the device nodes, and a client connection to the ServiceManager
+// supervisor for each node's restart / watchdog history.
 struct GraphService {
 	nodes: Vec<Node>,
 	device_client: u64,
+	supervisor_client: u64,
 }
 
 impl system_graph::Service for GraphService {
@@ -56,8 +58,8 @@ impl system_graph::Service for GraphService {
 		let stats_start: u64 = unsafe { clock_ns() };
 		for node in &self.nodes {
 			let (state, counters): (ComponentState, Counters) = match unsafe { process_stats(node.process) } {
-				Some(s) => (map_state(s.state), Counters { messages_sent: s.messages_sent, messages_received: s.messages_received, handles: s.handle_count, memory_bytes: s.memory_bytes, restarts: 0 }),
-				None => (ComponentState::Failed, Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: 0 }),
+				Some(s) => (map_state(s.state), Counters { messages_sent: s.messages_sent, messages_received: s.messages_received, handles: s.handle_count, memory_bytes: s.memory_bytes, restarts: 0, watchdog_trips: 0, last_failure: String::new() }),
+				None => (ComponentState::Failed, Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: 0, watchdog_trips: 0, last_failure: String::new() }),
 			};
 			components.push(Component { name: node.name.clone(), kind: ComponentKind::Service, state, deps: node.deps.clone(), counters });
 		}
@@ -74,7 +76,34 @@ impl system_graph::Service for GraphService {
 		};
 		spans.push(TraceSpan { name: String::from("device.list"), duration_ns: unsafe { clock_ns() }.wrapping_sub(list_start) });
 		for d in &devices {
-			components.push(Component { name: device_name(d), kind: ComponentKind::Device, state: ComponentState::Running, deps: alloc::vec![String::from("device_manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: 0 } });
+			components.push(Component { name: device_name(d), kind: ComponentKind::Device, state: ComponentState::Running, deps: alloc::vec![String::from("device_manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: 0, watchdog_trips: 0, last_failure: String::new() } });
+		}
+
+		// Supervisor history: query the ServiceManager supervisor and fold each managed
+		// component's restart count, watchdog trips and last failure into its node (matched
+		// by name), so the kernel's live counters and the supervisor's history sit together.
+		// The managed watchdog canary has no kernel process node of its own, so it is added
+		// as a synthetic node carrying just its supervisor counters. Timed as one
+		// "supervisor.status" trace span. A 0 handle (e.g. a non-primary VT) skips the merge.
+		if self.supervisor_client != 0 {
+			let sup_start: u64 = unsafe { clock_ns() };
+			let mut sup: supervisor::Client<ChannelTransport> = supervisor::Client::new(ChannelTransport { chan: self.supervisor_client });
+			if let Some(Ok(stats)) = sup.status() {
+				for s in &stats {
+					for c in components.iter_mut() {
+						if c.name.as_bytes() == s.name.as_bytes() {
+							c.counters.restarts = s.restarts;
+							c.counters.watchdog_trips = s.watchdog_trips;
+							c.counters.last_failure = s.last_failure.clone();
+							break;
+						}
+					}
+					if s.name == "watchdog_probe" {
+						components.push(Component { name: s.name.clone(), kind: ComponentKind::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: s.restarts, watchdog_trips: s.watchdog_trips, last_failure: s.last_failure.clone() } });
+					}
+				}
+			}
+			spans.push(TraceSpan { name: String::from("supervisor.status"), duration_ns: unsafe { clock_ns() }.wrapping_sub(sup_start) });
 		}
 
 		Ok(Graph { components, spans })
@@ -106,16 +135,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	let mut nodes: Vec<Node> = Vec::new();
 	let mut device_client: u64 = 0;
+	let mut supervisor_client: u64 = 0;
 
 	// 1. receive the component registrations ("NODE"), the DeviceService connection
-	//    ("DEVICE"), and finally the channel our clients reach us on ("SERVE"), which
-	//    ends the bootstrap. Each NODE carries a component's name + dependency edges as
-	//    its payload and a read-only handle to its Process as the transferred handle.
+	//    ("DEVICE"), the supervisor connection ("SUPERVISOR"), and finally the channel
+	//    our clients reach us on ("SERVE"), which ends the bootstrap. Each NODE carries a
+	//    component's name + dependency edges as its payload and a read-only handle to its
+	//    Process as the transferred handle.
 	let service: u64 = loop {
 		match unsafe { recv_blocking(bootstrap, &mut buf) } {
 			Received::Message { len, handle } => {
 				if len >= 4 && &buf[..4] == b"NODE" {
 					nodes.push(parse_node(&buf[4..len], handle));
+				} else if len >= 10 && &buf[..10] == b"SUPERVISOR" {
+					supervisor_client = handle;
 				} else if len >= 6 && &buf[..6] == b"DEVICE" {
 					device_client = handle;
 				} else if len >= 5 && &buf[..5] == b"SERVE" {
@@ -132,7 +165,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	// 3. serve generated `snapshot` requests until the client side closes.
-	let mut graph: GraphService = GraphService { nodes, device_client };
+	let mut graph: GraphService = GraphService { nodes, device_client, supervisor_client };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
