@@ -3096,6 +3096,247 @@ pub mod supervisor {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Capability {
+	Log = 0,
+	Storage = 1,
+	Network = 2,
+}
+
+impl Capability {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Capability> {
+		Capability::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<Capability> {
+		match r.u8()? {
+			0 => Some(Capability::Log),
+			1 => Some(Capability::Storage),
+			2 => Some(Capability::Network),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Manifest {
+	pub component: String,
+	pub grants: Vec<Capability>,
+}
+
+impl Manifest {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Manifest> {
+		Manifest::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.component.as_bytes())?;
+		if self.grants.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.grants.len() as u16)?;
+		for v110 in self.grants.iter() {
+			v110.write(w)?;
+		}
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<Manifest> {
+		let component = r.string_lp()?;
+		let grants = {
+			let v111 = r.u16()? as usize;
+			let mut v112 = Vec::new();
+			for _ in 0..v111 {
+				v112.push(Capability::read(r)?);
+			}
+			v112
+		};
+		Some(Manifest { component, grants })
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditEntry {
+	pub component: String,
+	pub capability: Capability,
+	pub granted: bool,
+}
+
+impl AuditEntry {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<AuditEntry> {
+		AuditEntry::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.component.as_bytes())?;
+		self.capability.write(w)?;
+		w.boolean(self.granted)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<AuditEntry> {
+		let component = r.string_lp()?;
+		let capability = Capability::read(r)?;
+		let granted = r.boolean()?;
+		Some(AuditEntry { component, capability, granted })
+	}
+}
+
+// interface `permission` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod permission {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_LOOKUP: u16 = 1;
+	pub const OP_AUDIT: u16 = 2;
+
+	pub trait Service {
+		fn lookup(&mut self, component: String) -> Result<Manifest, Error>;
+		fn audit(&mut self) -> Result<Vec<AuditEntry>, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = Reader::with_handle(request, request_handle);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		match op {
+			OP_LOOKUP => {
+				let component = r.string_lp()?;
+				let result = service.lookup(component);
+				match &result {
+					Ok(v113) => {
+						w.u8(1)?;
+						v113.write(w)?;
+					}
+					Err(v114) => {
+						w.u8(0)?;
+						v114.write(w)?;
+					}
+				}
+			}
+			OP_AUDIT => {
+				let result = service.audit();
+				match &result {
+					Ok(v115) => {
+						w.u8(1)?;
+						if v115.len() > u16::MAX as usize {
+							return None;
+						}
+						w.u16(v115.len() as u16)?;
+						for v117 in v115.iter() {
+							v117.write(w)?;
+						}
+					}
+					Err(v116) => {
+						w.u8(0)?;
+						v116.write(w)?;
+					}
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn lookup(&mut self, component: &str) -> Option<Result<Manifest, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LOOKUP)?;
+			w.u32(corr)?;
+			w.bytes_lp(component.as_bytes())?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(Manifest::read(r)?) } else { Err(Error::read(r)?) })
+		}
+		pub fn audit(&mut self) -> Option<Result<Vec<AuditEntry>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_AUDIT)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 {
+				Ok({
+					let v118 = r.u16()? as usize;
+					let mut v119 = Vec::new();
+					for _ in 0..v118 {
+						v119.push(AuditEntry::read(r)?);
+					}
+					v119
+				})
+			} else {
+				Err(Error::read(r)?)
+			})
+		}
+	}
+}
+
 impl Error {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -3261,13 +3502,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v111 = true;
-		for v110 in self.fields.iter() {
-			if !v111 {
+		let mut v121 = true;
+		for v120 in self.fields.iter() {
+			if !v121 {
 				out.push(',');
 			}
-			v111 = false;
-			v110.to_json_into(out);
+			v121 = false;
+			v120.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -3285,13 +3526,13 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v113 = true;
-		for v112 in self.fields.iter() {
-			if !v113 {
+		let mut v123 = true;
+		for v122 in self.fields.iter() {
+			if !v123 {
 				out.push_str(", ");
 			}
-			v113 = false;
-			v112.to_text_into(out);
+			v123 = false;
+			v122.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -3306,8 +3547,8 @@ impl Entry {
 		crate::codec::cbor::text(out, &self.source);
 		crate::codec::cbor::text(out, "fields");
 		crate::codec::cbor::array(out, self.fields.len());
-		for v114 in self.fields.iter() {
-			v114.to_cbor_into(out);
+		for v124 in self.fields.iter() {
+			v124.to_cbor_into(out);
 		}
 	}
 }
@@ -3332,8 +3573,8 @@ impl Query {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v115) => {
-				let _ = write!(out, "{}", v115);
+			Some(v125) => {
+				let _ = write!(out, "{}", v125);
 			}
 			None => {
 				out.push_str("null");
@@ -3342,8 +3583,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v116) => {
-				v116.to_json_into(out);
+			Some(v126) => {
+				v126.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -3352,8 +3593,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v117) => {
-				crate::codec::json_escape(v117, out);
+			Some(v127) => {
+				crate::codec::json_escape(v127, out);
 			}
 			None => {
 				out.push_str("null");
@@ -3368,8 +3609,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v118) => {
-				let _ = write!(out, "{}", v118);
+			Some(v128) => {
+				let _ = write!(out, "{}", v128);
 			}
 			None => {
 				out.push('-');
@@ -3378,8 +3619,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v119) => {
-				v119.to_text_into(out);
+			Some(v129) => {
+				v129.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -3388,8 +3629,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v120) => {
-				out.push_str(v120);
+			Some(v130) => {
+				out.push_str(v130);
 			}
 			None => {
 				out.push('-');
@@ -3404,8 +3645,8 @@ impl Query {
 		crate::codec::cbor::map(out, 4);
 		crate::codec::cbor::text(out, "since");
 		match &self.since {
-			Some(v121) => {
-				crate::codec::cbor::uint(out, *v121 as u64);
+			Some(v131) => {
+				crate::codec::cbor::uint(out, *v131 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3413,8 +3654,8 @@ impl Query {
 		}
 		crate::codec::cbor::text(out, "min-severity");
 		match &self.min_severity {
-			Some(v122) => {
-				v122.to_cbor_into(out);
+			Some(v132) => {
+				v132.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3422,8 +3663,8 @@ impl Query {
 		}
 		crate::codec::cbor::text(out, "source");
 		match &self.source {
-			Some(v123) => {
-				crate::codec::cbor::text(out, v123);
+			Some(v133) => {
+				crate::codec::cbor::text(out, v133);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3942,13 +4183,13 @@ impl Neighbor {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v125 = true;
-		for v124 in self.mac.iter() {
-			if !v125 {
+		let mut v135 = true;
+		for v134 in self.mac.iter() {
+			if !v135 {
 				out.push(',');
 			}
-			v125 = false;
-			let _ = write!(out, "{}", v124);
+			v135 = false;
+			let _ = write!(out, "{}", v134);
 		}
 		out.push(']');
 		out.push('}');
@@ -3960,13 +4201,13 @@ impl Neighbor {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v127 = true;
-		for v126 in self.mac.iter() {
-			if !v127 {
+		let mut v137 = true;
+		for v136 in self.mac.iter() {
+			if !v137 {
 				out.push_str(", ");
 			}
-			v127 = false;
-			let _ = write!(out, "{}", v126);
+			v137 = false;
+			let _ = write!(out, "{}", v136);
 		}
 		out.push(']');
 		out.push('}');
@@ -3977,8 +4218,8 @@ impl Neighbor {
 		self.addr.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mac");
 		crate::codec::cbor::array(out, self.mac.len());
-		for v128 in self.mac.iter() {
-			crate::codec::cbor::uint(out, *v128 as u64);
+		for v138 in self.mac.iter() {
+			crate::codec::cbor::uint(out, *v138 as u64);
 		}
 	}
 }
@@ -4006,13 +4247,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v130 = true;
-		for v129 in self.mac.iter() {
-			if !v130 {
+		let mut v140 = true;
+		for v139 in self.mac.iter() {
+			if !v140 {
 				out.push(',');
 			}
-			v130 = false;
-			let _ = write!(out, "{}", v129);
+			v140 = false;
+			let _ = write!(out, "{}", v139);
 		}
 		out.push(']');
 		out.push(',');
@@ -4021,13 +4262,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"neighbors\":");
 		out.push('[');
-		let mut v132 = true;
-		for v131 in self.neighbors.iter() {
-			if !v132 {
+		let mut v142 = true;
+		for v141 in self.neighbors.iter() {
+			if !v142 {
 				out.push(',');
 			}
-			v132 = false;
-			v131.to_json_into(out);
+			v142 = false;
+			v141.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -4039,13 +4280,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v134 = true;
-		for v133 in self.mac.iter() {
-			if !v134 {
+		let mut v144 = true;
+		for v143 in self.mac.iter() {
+			if !v144 {
 				out.push_str(", ");
 			}
-			v134 = false;
-			let _ = write!(out, "{}", v133);
+			v144 = false;
+			let _ = write!(out, "{}", v143);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -4054,13 +4295,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("neighbors=");
 		out.push('[');
-		let mut v136 = true;
-		for v135 in self.neighbors.iter() {
-			if !v136 {
+		let mut v146 = true;
+		for v145 in self.neighbors.iter() {
+			if !v146 {
 				out.push_str(", ");
 			}
-			v136 = false;
-			v135.to_text_into(out);
+			v146 = false;
+			v145.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -4071,15 +4312,15 @@ impl NetInfo {
 		self.addr.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mac");
 		crate::codec::cbor::array(out, self.mac.len());
-		for v137 in self.mac.iter() {
-			crate::codec::cbor::uint(out, *v137 as u64);
+		for v147 in self.mac.iter() {
+			crate::codec::cbor::uint(out, *v147 as u64);
 		}
 		crate::codec::cbor::text(out, "gateway");
 		self.gateway.to_cbor_into(out);
 		crate::codec::cbor::text(out, "neighbors");
 		crate::codec::cbor::array(out, self.neighbors.len());
-		for v138 in self.neighbors.iter() {
-			v138.to_cbor_into(out);
+		for v148 in self.neighbors.iter() {
+			v148.to_cbor_into(out);
 		}
 	}
 }
@@ -4197,13 +4438,13 @@ impl TcpRequest {
 		out.push(',');
 		out.push_str("\"request\":");
 		out.push('[');
-		let mut v140 = true;
-		for v139 in self.request.iter() {
-			if !v140 {
+		let mut v150 = true;
+		for v149 in self.request.iter() {
+			if !v150 {
 				out.push(',');
 			}
-			v140 = false;
-			let _ = write!(out, "{}", v139);
+			v150 = false;
+			let _ = write!(out, "{}", v149);
 		}
 		out.push(']');
 		out.push('}');
@@ -4215,13 +4456,13 @@ impl TcpRequest {
 		out.push_str(", ");
 		out.push_str("request=");
 		out.push('[');
-		let mut v142 = true;
-		for v141 in self.request.iter() {
-			if !v142 {
+		let mut v152 = true;
+		for v151 in self.request.iter() {
+			if !v152 {
 				out.push_str(", ");
 			}
-			v142 = false;
-			let _ = write!(out, "{}", v141);
+			v152 = false;
+			let _ = write!(out, "{}", v151);
 		}
 		out.push(']');
 		out.push('}');
@@ -4232,8 +4473,8 @@ impl TcpRequest {
 		self.ep.to_cbor_into(out);
 		crate::codec::cbor::text(out, "request");
 		crate::codec::cbor::array(out, self.request.len());
-		for v143 in self.request.iter() {
-			crate::codec::cbor::uint(out, *v143 as u64);
+		for v153 in self.request.iter() {
+			crate::codec::cbor::uint(out, *v153 as u64);
 		}
 	}
 }
@@ -4357,13 +4598,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("\"data\":");
 		out.push('[');
-		let mut v145 = true;
-		for v144 in self.data.iter() {
-			if !v145 {
+		let mut v155 = true;
+		for v154 in self.data.iter() {
+			if !v155 {
 				out.push(',');
 			}
-			v145 = false;
-			let _ = write!(out, "{}", v144);
+			v155 = false;
+			let _ = write!(out, "{}", v154);
 		}
 		out.push(']');
 		out.push('}');
@@ -4372,13 +4613,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("data=");
 		out.push('[');
-		let mut v147 = true;
-		for v146 in self.data.iter() {
-			if !v147 {
+		let mut v157 = true;
+		for v156 in self.data.iter() {
+			if !v157 {
 				out.push_str(", ");
 			}
-			v147 = false;
-			let _ = write!(out, "{}", v146);
+			v157 = false;
+			let _ = write!(out, "{}", v156);
 		}
 		out.push(']');
 		out.push('}');
@@ -4387,8 +4628,8 @@ impl Chunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "data");
 		crate::codec::cbor::array(out, self.data.len());
-		for v148 in self.data.iter() {
-			crate::codec::cbor::uint(out, *v148 as u64);
+		for v158 in self.data.iter() {
+			crate::codec::cbor::uint(out, *v158 as u64);
 		}
 	}
 }
@@ -4675,13 +4916,13 @@ impl Component {
 		out.push(',');
 		out.push_str("\"deps\":");
 		out.push('[');
-		let mut v150 = true;
-		for v149 in self.deps.iter() {
-			if !v150 {
+		let mut v160 = true;
+		for v159 in self.deps.iter() {
+			if !v160 {
 				out.push(',');
 			}
-			v150 = false;
-			crate::codec::json_escape(v149, out);
+			v160 = false;
+			crate::codec::json_escape(v159, out);
 		}
 		out.push(']');
 		out.push(',');
@@ -4702,13 +4943,13 @@ impl Component {
 		out.push_str(", ");
 		out.push_str("deps=");
 		out.push('[');
-		let mut v152 = true;
-		for v151 in self.deps.iter() {
-			if !v152 {
+		let mut v162 = true;
+		for v161 in self.deps.iter() {
+			if !v162 {
 				out.push_str(", ");
 			}
-			v152 = false;
-			out.push_str(v151);
+			v162 = false;
+			out.push_str(v161);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -4726,8 +4967,8 @@ impl Component {
 		self.state.to_cbor_into(out);
 		crate::codec::cbor::text(out, "deps");
 		crate::codec::cbor::array(out, self.deps.len());
-		for v153 in self.deps.iter() {
-			crate::codec::cbor::text(out, v153);
+		for v163 in self.deps.iter() {
+			crate::codec::cbor::text(out, v163);
 		}
 		crate::codec::cbor::text(out, "counters");
 		self.counters.to_cbor_into(out);
@@ -4797,25 +5038,25 @@ impl Graph {
 		out.push('{');
 		out.push_str("\"components\":");
 		out.push('[');
-		let mut v155 = true;
-		for v154 in self.components.iter() {
-			if !v155 {
+		let mut v165 = true;
+		for v164 in self.components.iter() {
+			if !v165 {
 				out.push(',');
 			}
-			v155 = false;
-			v154.to_json_into(out);
+			v165 = false;
+			v164.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"spans\":");
 		out.push('[');
-		let mut v157 = true;
-		for v156 in self.spans.iter() {
-			if !v157 {
+		let mut v167 = true;
+		for v166 in self.spans.iter() {
+			if !v167 {
 				out.push(',');
 			}
-			v157 = false;
-			v156.to_json_into(out);
+			v167 = false;
+			v166.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -4824,25 +5065,25 @@ impl Graph {
 		out.push('{');
 		out.push_str("components=");
 		out.push('[');
-		let mut v159 = true;
-		for v158 in self.components.iter() {
-			if !v159 {
+		let mut v169 = true;
+		for v168 in self.components.iter() {
+			if !v169 {
 				out.push_str(", ");
 			}
-			v159 = false;
-			v158.to_text_into(out);
+			v169 = false;
+			v168.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("spans=");
 		out.push('[');
-		let mut v161 = true;
-		for v160 in self.spans.iter() {
-			if !v161 {
+		let mut v171 = true;
+		for v170 in self.spans.iter() {
+			if !v171 {
 				out.push_str(", ");
 			}
-			v161 = false;
-			v160.to_text_into(out);
+			v171 = false;
+			v170.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -4851,13 +5092,13 @@ impl Graph {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "components");
 		crate::codec::cbor::array(out, self.components.len());
-		for v162 in self.components.iter() {
-			v162.to_cbor_into(out);
+		for v172 in self.components.iter() {
+			v172.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "spans");
 		crate::codec::cbor::array(out, self.spans.len());
-		for v163 in self.spans.iter() {
-			v163.to_cbor_into(out);
+		for v173 in self.spans.iter() {
+			v173.to_cbor_into(out);
 		}
 	}
 }
@@ -4918,6 +5159,168 @@ impl SupervisorStat {
 		crate::codec::cbor::uint(out, self.watchdog_trips as u64);
 		crate::codec::cbor::text(out, "last-failure");
 		crate::codec::cbor::text(out, &self.last_failure);
+	}
+}
+
+impl Capability {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			Capability::Log => out.push_str("\"log\""),
+			Capability::Storage => out.push_str("\"storage\""),
+			Capability::Network => out.push_str("\"network\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			Capability::Log => out.push_str("log"),
+			Capability::Storage => out.push_str("storage"),
+			Capability::Network => out.push_str("network"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			Capability::Log => crate::codec::cbor::text(out, "log"),
+			Capability::Storage => crate::codec::cbor::text(out, "storage"),
+			Capability::Network => crate::codec::cbor::text(out, "network"),
+		}
+	}
+}
+
+impl Manifest {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"component\":");
+		crate::codec::json_escape(&self.component, out);
+		out.push(',');
+		out.push_str("\"grants\":");
+		out.push('[');
+		let mut v175 = true;
+		for v174 in self.grants.iter() {
+			if !v175 {
+				out.push(',');
+			}
+			v175 = false;
+			v174.to_json_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("component=");
+		out.push_str(&self.component);
+		out.push_str(", ");
+		out.push_str("grants=");
+		out.push('[');
+		let mut v177 = true;
+		for v176 in self.grants.iter() {
+			if !v177 {
+				out.push_str(", ");
+			}
+			v177 = false;
+			v176.to_text_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "component");
+		crate::codec::cbor::text(out, &self.component);
+		crate::codec::cbor::text(out, "grants");
+		crate::codec::cbor::array(out, self.grants.len());
+		for v178 in self.grants.iter() {
+			v178.to_cbor_into(out);
+		}
+	}
+}
+
+impl AuditEntry {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"component\":");
+		crate::codec::json_escape(&self.component, out);
+		out.push(',');
+		out.push_str("\"capability\":");
+		self.capability.to_json_into(out);
+		out.push(',');
+		out.push_str("\"granted\":");
+		if self.granted {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("component=");
+		out.push_str(&self.component);
+		out.push_str(", ");
+		out.push_str("capability=");
+		self.capability.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("granted=");
+		if self.granted {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "component");
+		crate::codec::cbor::text(out, &self.component);
+		crate::codec::cbor::text(out, "capability");
+		self.capability.to_cbor_into(out);
+		crate::codec::cbor::text(out, "granted");
+		crate::codec::cbor::boolean(out, self.granted);
 	}
 }
 
@@ -5165,5 +5568,29 @@ mod compat {
 		let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120];
 		assert_eq!(bytes, golden);
 		assert_eq!(SupervisorStat::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn capability_wire_is_stable() {
+		let sample = Capability::Log;
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[0];
+		assert_eq!(bytes, golden);
+		assert_eq!(Capability::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn manifest_wire_is_stable() {
+		let sample = Manifest { component: String::from("x"), grants: alloc::vec![Capability::Log] };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[1, 0, 120, 1, 0, 0];
+		assert_eq!(bytes, golden);
+		assert_eq!(Manifest::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn audit_entry_wire_is_stable() {
+		let sample = AuditEntry { component: String::from("x"), capability: Capability::Log, granted: true };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[1, 0, 120, 0, 1];
+		assert_eq!(bytes, golden);
+		assert_eq!(AuditEntry::decode(&bytes).unwrap(), sample);
 	}
 }

@@ -273,6 +273,29 @@ An opaque kernel object, transferred as `handle<file>`.
 | `watchdog-trips` | `u32` |
 | `last-failure` | `string` |
 
+### enum `capability`
+
+| case | ordinal |
+| --- | --- |
+| `log` | 0 |
+| `storage` | 1 |
+| `network` | 2 |
+
+### record `manifest`
+
+| field | type |
+| --- | --- |
+| `component` | `string` |
+| `grants` | `list<capability>` |
+
+### record `audit-entry`
+
+| field | type |
+| --- | --- |
+| `component` | `string` |
+| `capability` | `capability` |
+| `granted` | `bool` |
+
 ## Interfaces
 
 ### interface `log`
@@ -403,4 +426,13 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `status` | `status() -> result<list<supervisor-stat>, error>` |
+
+### interface `permission`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `lookup` | `lookup(component: string) -> result<manifest, error>` |
+| 2 | `audit` | `audit() -> result<list<audit-entry>, error>` |
 

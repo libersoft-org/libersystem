@@ -57,8 +57,16 @@ name = "system_graph_service"
 path = "src/system_graph_service.rs"
 
 [[bin]]
+name = "permission_manager"
+path = "src/permission_manager.rs"
+
+[[bin]]
 name = "watchdog_probe"
 path = "src/watchdog_probe.rs"
+
+[[bin]]
+name = "sandbox_probe"
+path = "src/sandbox_probe.rs"
 
 [[bin]]
 name = "wasi_host"

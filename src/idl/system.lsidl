@@ -420,4 +420,45 @@ interface supervisor {
 	@op(1) status: func() -> result<list<supervisor-stat>, error>;
 }
 
+// The kinds of capability a component may be declared to receive: a connection to one
+// of the system services. The typed vocabulary a permission manifest is written in - a
+// grant names a service the component may reach, never an ambient right. A component
+// holds exactly the capabilities its manifest lists and can reach nothing else.
+enum capability {
+	log,      // a LogService client (emit / query the journal)
+	storage,  // a StorageService client (open files on a volume)
+	network,  // a NetworkService client (resolve / connect / ...)
+}
+
+// A component's permission manifest: its name and the exact set of capabilities it is
+// declared to receive. This typed object is the source of truth for what a component
+// may be granted - never a parsed text / JSON file. A launched component starts with
+// these capabilities and nothing else (the sandbox); the textual form a tool might
+// render is only ever a view of this object.
+record manifest {
+	component: string,
+	grants:    list<capability>,
+}
+
+// One decision in the PermissionManager audit trail: the component a grant decision was
+// made for, the capability in question, and whether it was granted (it was in the
+// component's manifest) or denied (it was not). The policy layer's record of every
+// authority decision, queryable over the typed API the same way the journal is.
+record audit-entry {
+	component:  string,
+	capability: capability,
+	granted:    bool,
+}
+
+// The PermissionManager contract: the policy over the kernel's capability mechanism.
+// `lookup` returns a component's declared permission manifest (the typed source of
+// truth); `audit` returns the trail of every grant / deny decision the manager has
+// made. Launching a component under its manifest - granting it exactly its declared
+// capabilities and nothing else - is a capability mechanism (the granted clients are
+// transferred to the component out-of-band), not an op on this interface.
+interface permission {
+	@op(1) lookup: func(component: string) -> result<manifest, error>;
+	@op(2) audit:  func() -> result<list<audit-entry>, error>;
+}
+
 

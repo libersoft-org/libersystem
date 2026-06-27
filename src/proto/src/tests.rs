@@ -151,11 +151,7 @@ struct VolStub;
 
 impl volume::Service for VolStub {
 	fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error> {
-		if o.path.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(OpenResult { file: 0xCAFE, size: 42 })
-		}
+		if o.path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
 	}
 
 	fn list(&mut self) -> Result<Vec<FileInfo>, Error> {

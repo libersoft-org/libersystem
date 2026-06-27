@@ -492,6 +492,21 @@ fn send_ramdisk(channel: &object::channel::Channel, volume: &[u8]) -> Result<(),
 	send_cap(channel, &msg, ramdisk, Rights::READ | Rights::MAP)
 }
 
+// Create a MemoryObject from `archive`, fill it, and hand it to a process's bootstrap
+// channel as "PACKAGE" + the archive's byte length, with a read+map+transfer cap - the
+// rt recv_package handshake. A launcher (e.g. PermissionManager) maps it and spawns the
+// programs it governs from it.
+#[cfg(test)]
+fn send_package(channel: &object::channel::Channel, archive: &[u8]) -> Result<(), &'static str> {
+	use object::rights::Rights;
+	let object = object::memory_object::MemoryObject::create(archive.len()).ok_or("no memory for the package")?;
+	copy_into_object(&object, archive);
+	let mut msg = alloc::vec::Vec::with_capacity(7 + 8);
+	msg.extend_from_slice(b"PACKAGE");
+	msg.extend_from_slice(&(archive.len() as u64).to_le_bytes());
+	send_cap(channel, &msg, object, Rights::READ | Rights::MAP | Rights::TRANSFER)
+}
+
 // Build the M16 storage topology and run it to completion. A MemoryObject holds
 // the ramdisk volume; the StorageService process maps it and serves files over a
 // service channel; a client process opens vol://system/hello.txt through the
@@ -616,6 +631,70 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 	sched::run_until_idle();
 	let result = host_boot_kernel.recv().map_err(|_| "the host reported no result")?;
 	Ok((expected, result.bytes))
+}
+
+// Build the M38 permission topology and run it to completion. A StorageService serves
+// the ramdisk volume; the permission_manager (PermissionManager) is given the clients it
+// may grant onward - a duplicable StorageService client and a duplicable (but dead-peer)
+// LogService client - plus a NetworkService client it holds but is NOT to grant, the init
+// package, and the channel its clients reach it on. PermissionManager launches its one
+// governed component, sandbox_probe, under a typed permission manifest that grants storage
+// and log but not network: it transfers exactly those two clients to the probe and
+// withholds the network one, recording every decision. The sandboxed probe reaches only
+// its granted capabilities - it reads its one granted file vol://system/hello.txt through
+// the storage grant and reports the bytes back. The kernel only brokers the initial
+// capabilities. Returns (expected, read_back, summary): the file straight from the volume,
+// the bytes the sandboxed probe read through its grant, and the manager's decisions summary
+// (which capabilities the component was and was not given).
+#[cfg(test)]
+fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
+	use object::channel::Channel;
+	use object::rights::Rights;
+
+	let (volume, package) = scenario_packages()?;
+	let init = init_package_bytes().ok_or("init package module not found")?;
+	let expected = volume_file(volume, b"hello.txt")?;
+	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
+	let pm_elf = package.lookup(b"permission_manager").ok_or("permission_manager missing from the init package")?;
+
+	let (storage_boot_kernel, storage_boot_user) = Channel::create();
+	let (pm_boot_kernel, pm_boot_user) = Channel::create();
+	let (storage_server, storage_client) = Channel::create();
+	let (perm_server, _perm_client) = Channel::create();
+	// The manager's log grant: a real, duplicable client whose service peer is dropped, so
+	// the sandboxed probe's best-effort log emit fails fast instead of blocking (no
+	// LogService runs in this scenario). The capability is still granted and audited.
+	let (log_server, log_client) = Channel::create();
+	core::mem::drop(log_server);
+	// The manager's network capability: held, but never granted to the probe.
+	let (_net_server, net_client) = Channel::create();
+
+	let domain = sched::root_domain();
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
+	loader::spawn_elf_process(domain, pm_elf, pm_boot_user, Rights::ALL, 0).map_err(|_| "failed to load PermissionManager")?;
+
+	// StorageService: the ramdisk volume and its service channel.
+	send_ramdisk(&storage_boot_kernel, volume)?;
+	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL)?;
+
+	// PermissionManager: the grantable clients (storage + log, both duplicable), a network
+	// client it withholds, the init package (to launch the probe from), and the channel its
+	// clients reach it on. The order matches PermissionManager's receive order.
+	send_cap(&pm_boot_kernel, b"STORAGE", storage_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"LOG", log_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"NETWORK", net_client, Rights::ALL)?;
+	send_package(&pm_boot_kernel, init)?;
+	send_cap(&pm_boot_kernel, b"SERVE", perm_server, Rights::ALL)?;
+
+	sched::run_until_idle();
+
+	// PermissionManager reports its "online" line, then the sandbox proof: the bytes the
+	// sandboxed probe read through its one granted storage capability, then the decisions
+	// summary of exactly which capabilities the component was and was not given.
+	let _online = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported nothing")?;
+	let read_back = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no sandbox read-back")?;
+	let summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no decisions summary")?;
+	Ok((expected, read_back.bytes, summary.bytes))
 }
 
 // Read a file from a vol:// volume by driving the StorageService as the kernel's
@@ -2115,8 +2194,10 @@ fn init_package_starts_system_manager() {
 	// first, then DeviceService, ProcessService, and ConfigService (they depend only
 	// on LogService, so they come up right after), then DeviceManager, StorageService
 	// (handed the disk block channel DeviceManager routes up), NetworkService (handed
-	// the net driver's frame channel the same way), and finally - after every
-	// component it observes - SystemGraphService, then the shell (which proves the
+	// the net driver's frame channel the same way), then PermissionManager (which needs
+	// storage and network to grant onward, so it comes up once they are running, and in
+	// turn launches its sandboxed component before reporting in), and finally - after
+	// every component it observes - SystemGraphService, then the shell (which proves the
 	// StorageService round-trip by reading a file with `cat` before it reports in).
 	// Every report is relayed up, so the kernel observes the services come up in
 	// dependency order, then DeviceManager stopped (ServiceManager exercises the stop
@@ -2125,7 +2206,7 @@ fn init_package_starts_system_manager() {
 	// the restart policy and watchdog), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 19] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"DeviceManager: online", b"StorageService: online", b"NetworkService: online", b"TimeService: online", b"AudioService: online", b"InputService: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"WatchdogProbe: online", b"WatchdogProbe: restarted", b"WatchdogProbe: recovered", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 20] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"DeviceManager: online", b"StorageService: online", b"NetworkService: online", b"TimeService: online", b"AudioService: online", b"InputService: online", b"PermissionManager: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"WatchdogProbe: online", b"WatchdogProbe: restarted", b"WatchdogProbe: recovered", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");
@@ -2311,6 +2392,157 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 	let (expected, actual) = run_powerbox_scenario().expect("the powerbox scenario should run");
 	assert!(!expected.is_empty(), "the picked file should not be empty");
 	assert_eq!(actual, expected, "the component read the user-picked file through the picker");
+}
+
+#[cfg(test)]
+#[test_case]
+fn permission_manager_sandboxes_a_component() {
+	// The PermissionManager launches sandbox_probe under a typed permission manifest that
+	// grants storage and log but not network. The launched component starts with only its
+	// manifest's capabilities: the manager transfers exactly the storage and log clients to
+	// the probe and withholds the network one it holds, recording every decision. The
+	// sandboxed probe reaches only what it was granted - it reads its one granted file
+	// through the storage capability and reports the bytes back. Those bytes must equal the
+	// file straight from the volume (the storage grant is live and reaches exactly that
+	// file), and the decisions summary must show storage and log granted, network denied -
+	// the component was given exactly its manifest and nothing more.
+	let (expected, read_back, summary) = run_permission_scenario().expect("the permission scenario should run");
+	assert!(!expected.is_empty(), "the granted file should not be empty");
+	assert_eq!(read_back, expected, "the sandboxed component read its one granted file through the storage grant");
+	assert_eq!(summary.as_slice(), b"storage=grant log=grant network=deny", "the component was granted exactly its manifest - storage and log - and denied network");
+}
+
+#[cfg(test)]
+#[test_case]
+fn capability_grants_no_operation_beyond_rights() {
+	// Property: a handle grants no operation beyond the rights it carries. Across many random
+	// granted-rights sets and random probe rights, a rights-checked lookup succeeds exactly
+	// when the probe is a subset of the granted set - never a superset. (Fixed-seed xorshift,
+	// so the run is deterministic.)
+	use object::handle::HandleTable;
+	use object::rights::Rights;
+	let mut seed: u64 = 0x5eed_1238_d38a_77c1;
+	let mut next = || -> u64 {
+		seed ^= seed << 13;
+		seed ^= seed >> 7;
+		seed ^= seed << 17;
+		seed
+	};
+	let mut table = HandleTable::new();
+	for _ in 0..512 {
+		let granted = Rights::from_bits(next() as u32);
+		let probe = Rights::from_bits(next() as u32);
+		let h = table.insert_object(TestObject::new(1), granted, 0);
+		assert_eq!(table.lookup(h, probe).is_ok(), granted.contains(probe), "a lookup must succeed iff the probe rights are a subset of the granted rights");
+		table.close(h).expect("close");
+	}
+}
+
+#[cfg(test)]
+#[test_case]
+fn capability_attenuation_only_narrows() {
+	// Property: duplicating a capability can only narrow it, never widen it. Across many
+	// random grants (carrying the DUPLICATE right) and random requests, duplication succeeds
+	// exactly when the request is a subset of the grant, and the derived handle carries
+	// exactly the requested rights - no right the original lacked, and none outside the
+	// request. There is no path by which a derived capability gains authority.
+	use object::handle::HandleTable;
+	use object::rights::Rights;
+	let mut seed: u64 = 0xabcd_0042_1357_9bdf;
+	let mut next = || -> u64 {
+		seed ^= seed << 13;
+		seed ^= seed >> 7;
+		seed ^= seed << 17;
+		seed
+	};
+	let mut table = HandleTable::new();
+	for _ in 0..512 {
+		let granted = Rights::from_bits(next() as u32) | Rights::DUPLICATE;
+		let requested = Rights::from_bits(next() as u32);
+		let h = table.insert_object(TestObject::new(2), granted, 0);
+		match table.duplicate(h, requested) {
+			Ok(dup) => {
+				// Duplication is allowed only when the request is within the grant...
+				assert!(granted.contains(requested), "duplication widened the rights beyond the original");
+				// ...and the derived handle carries exactly the requested rights, never more.
+				let probe = Rights::from_bits(next() as u32);
+				assert_eq!(table.lookup(dup, probe).is_ok(), requested.contains(probe), "the derived capability carries exactly the requested rights");
+				table.close(dup).expect("close dup");
+			}
+			Err(_) => {
+				// The grant carries DUPLICATE, so the only reason to refuse is that the request
+				// asked for a right outside the grant - widening, which is forbidden.
+				assert!(!granted.contains(requested), "duplication refused a request that was within the grant");
+			}
+		}
+		table.close(h).expect("close");
+	}
+}
+
+#[cfg(test)]
+#[test_case]
+fn no_ambient_authority_fresh_table_empty() {
+	// A newly created handle table holds nothing: a process begins with no ambient authority
+	// and can reach only capabilities explicitly handed to it. The table is empty, and every
+	// lookup into it - across a wide range of handle values - is rejected as a bad handle.
+	use object::handle::{Handle, HandleError, HandleTable};
+	use object::rights::Rights;
+	let table = HandleTable::new();
+	assert_eq!(table.len(), 0, "a fresh handle table must be empty");
+	let mut seed: u64 = 0x0f0f_1234_dead_c0de;
+	let mut next = || -> u64 {
+		seed ^= seed << 13;
+		seed ^= seed >> 7;
+		seed ^= seed << 17;
+		seed
+	};
+	for _ in 0..256 {
+		let handle = Handle::from_raw(next());
+		assert!(matches!(table.lookup(handle, Rights::NONE), Err(HandleError::BadHandle)), "an empty table must resolve no handle");
+	}
+}
+
+#[cfg(test)]
+#[test_case]
+fn syscall_fuzz_rejects_invalid_calls() {
+	// Syscall fuzzing: from a ring-0 thread (with its own, empty handle table), drive the
+	// syscall boundary with random unknown syscall numbers and random arguments, then known
+	// handle syscalls with random (bogus) handle arguments. Every call must be rejected with
+	// an error rather than crash the kernel - the boundary validates its inputs, and a caller
+	// cannot reach authority it was never handed. The thread completing at all is itself the
+	// survival check. (Fixed-seed xorshift, so the run is deterministic.)
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		let mut seed: u64 = 0x1357_2468_face_b00c;
+		let mut next = || -> u64 {
+			seed ^= seed << 13;
+			seed ^= seed >> 7;
+			seed ^= seed << 17;
+			seed
+		};
+		unsafe {
+			// Unknown syscall numbers (well above the defined range) must be rejected.
+			for _ in 0..1024 {
+				let num = 10_000 + (next() % 0x00ff_ffff);
+				let r = arch::syscall::invoke(num, next(), next(), next(), next());
+				assert!(syscall::sys_is_err(r), "an unknown syscall number must return an error");
+			}
+			// Known handle syscalls with random handle arguments. The fuzz thread's handle
+			// table is empty, so every random handle resolves to nothing and is rejected
+			// before any user buffer is touched - a bogus capability grants no authority.
+			let ops = [syscall::SYS_HANDLE_CLOSE, syscall::SYS_HANDLE_DUPLICATE, syscall::SYS_MEMORY_MAP, syscall::SYS_MEMORY_UNMAP];
+			for _ in 0..1024 {
+				let op = ops[(next() as usize) % ops.len()];
+				let r = arch::syscall::invoke(op, next(), next(), next(), next());
+				assert!(syscall::sys_is_err(r), "a syscall on a bogus handle must return an error");
+			}
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the syscall fuzz thread did not finish - the kernel did not survive");
 }
 
 #[cfg(test)]
