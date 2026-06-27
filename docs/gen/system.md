@@ -341,6 +341,8 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | --- | --- | --- |
 | 1 | `open` | `open(o: open-opts) -> result<open-result, error>` |
 | 2 | `list` | `list() -> result<list<file-info>, error>` |
+| 3 | `write` | `write(path: string, data: buffer) -> result<unit, error>` |
+| 4 | `remove` | `remove(path: string) -> result<unit, error>` |
 
 ### interface `device`
 

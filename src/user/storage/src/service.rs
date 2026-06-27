@@ -4,16 +4,19 @@
 // hands it a bootstrap channel. Over that channel it receives, in order:
 //   1. the volume backing, one of:
 //        "RAMDISK" + length, with a MemoryObject capability holding the volume's
-//          PKGARCH1 archive (the kernel's direct-client test path); or
-//        "BLOCK", with a channel capability to the virtio-blk driver's block-read
-//          service, from which the archive is read off the disk (the boot path);
-//   2. "SERVE", with a channel capability on which clients send open requests.
-// Either way the volume's PKGARCH1 archive ends up mapped in this process; the
-// service then serves the generated Storage.Volume contract (`volume.open`) until
-// the client side closes. `open` resolves a vol:// path and replies with the file's
-// length plus a MemoryObject capability to its bytes, transferred out-of-band as
-// handle<file> - the content crosses as a shared buffer handle, never copied through
-// the channel (a zero-copy read).
+//          PKGARCH1 archive - a read-only volume (the kernel's direct-client test
+//          path); or
+//        "BLOCK", with a channel capability to the virtio-blk driver's block
+//          service, on which a writable on-disk filesystem (LSFS) is mounted - the
+//          boot path. A fresh or stale disk is formatted and seeded from the factory
+//          archive laid at LBA 0, so the volume always starts with its seed files;
+//   2. "SERVE", with a channel capability on which clients send requests.
+// The service then serves the generated Storage.Volume contract: `open` resolves a
+// vol:// path and replies with the file's length plus a MemoryObject capability to
+// its bytes (handle<file>, a zero-copy read); `list` enumerates the volume; and on a
+// writable (LSFS) volume `write` creates-or-truncates a file from a zero-copy
+// `buffer` and `remove` deletes one, both persisting to the disk so they survive a
+// reboot. A read-only (archive) volume rejects writes with `denied`.
 
 #![no_std]
 #![no_main]
@@ -22,35 +25,51 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{Error, FileInfo, OpenOpts, OpenResult, volume};
+use lsfs::{BlockDevice, FsError, Lsfs};
+use proto::codec::Buffer;
+use proto::system::{volume, Error, FileInfo, OpenOpts, OpenResult};
 use rt::*;
 
 // the single volume this service serves; the URI's volume component must match
 const VOLUME_NAME: &[u8] = b"system";
 
-// block-read protocol with driver.virtio-blk: request [lba u64][count u32], reply
-// [status u32] carrying a MemoryObject of count*512 bytes. A single request reads at
-// most one DMA page (8 sectors).
+// block-service protocol with driver.virtio-blk: request [op u32][lba u64][count u32]
+// where op 0 = read, 1 = write. A read replies [status u32] carrying a MemoryObject
+// of count*512 bytes; a write transfers a MemoryObject of count*512 bytes and replies
+// [status u32]. A single request moves at most one DMA page (8 sectors).
 const SECTOR_SIZE: usize = 512;
 const MAX_SECTORS_PER_READ: usize = 8;
+const OP_READ: u32 = 0;
+const OP_WRITE: u32 = 1;
+
+// LSFS layout on the disk: the writable filesystem spans FS_BLOCKS filesystem blocks
+// (one block = SECTORS_PER_BLOCK disk sectors) starting at FS_START_SECTOR - well past
+// the small factory archive at LBA 0, which the boot runner re-lays every boot and the
+// filesystem never overwrites, so created files persist across reboots.
+const SECTORS_PER_BLOCK: u64 = (lsfs::BLOCK_SIZE / SECTOR_SIZE) as u64;
+const FS_START_SECTOR: u64 = 2048;
+const FS_BLOCKS: u32 = 64;
+
+// An upper bound on a single write, so a bogus buffer length cannot make us allocate
+// without limit; the filesystem enforces the real per-file maximum.
+const MAX_WRITE: usize = 256 * 1024;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	// 1. volume backing: either the legacy ramdisk MemoryObject (kernel test) or a
-	//    block service channel to the virtio-blk disk (real boot). Both resolve to
-	//    the volume's PKGARCH1 archive mapped at (volume_base, volume_len).
-	let (volume_base, volume_len): (u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	// 1. volume backing: the legacy ramdisk archive (read-only, kernel test) or the
+	//    virtio-blk disk mounted as a writable LSFS (real boot).
+	let mut vol: Volume = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"RAMDISK" => {
 			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
 			let base: u64 = unsafe { syscall(SYS_MEMORY_MAP, handle, 0, 0, 0) };
 			if sys_is_err(base) {
 				exit();
 			}
-			(base, length)
+			Volume::Archive { base, len: length }
 		}
-		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BLOCK" => match unsafe { load_archive_from_disk(handle) } {
-			Some(extent) => extent,
+		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BLOCK" => match unsafe { mount_or_format(handle) } {
+			Some(fs) => Volume::Disk(fs),
 			None => exit(),
 		},
 		_ => exit(),
@@ -61,29 +80,31 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 	// 3. report in over the bootstrap channel (the supervisor that started us is
-	//    listening there), then serve generated volume.open requests until the
-	//    client side closes.
+	//    listening there), then serve generated volume requests until the client side
+	//    closes.
 	unsafe {
 		send_blocking(bootstrap, b"StorageService: online", 0);
 	}
-	let mut vol: Volume = Volume { base: volume_base, len: volume_len };
-	let mut reply: [u8; 64] = [0u8; 64];
+	let mut reply: [u8; 2048] = [0u8; 2048];
 	unsafe {
 		serve_multi(service, &mut buf, &mut reply, |_chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { volume::dispatch(&mut vol, req, handle, out, reply_handle) });
 	}
 	exit();
 }
 
-// The volume's mapped PKGARCH1 archive, behind the generated Storage.Volume
-// contract. `open` resolves a vol:// path to the file's bytes as a shared buffer.
-struct Volume {
-	base: u64,
-	len: usize,
+// The volume backing, behind the generated Storage.Volume contract: either a
+// read-only PKGARCH1 archive mapped in memory (the ramdisk path) or a writable LSFS
+// on the virtio-blk disk (the boot path).
+enum Volume {
+	Archive { base: u64, len: usize },
+	Disk(Lsfs<ChannelBlockDevice>),
 }
 
 impl volume::Service for Volume {
+	// Resolve a vol:// path and hand back the file's bytes as a read-only shared
+	// buffer (out-of-band handle<file>) plus its length - a zero-copy read.
 	fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error> {
-		// the volume is read-only: refuse any write or create request.
+		// `open` is the read path; writes go through `write` / `remove`.
 		if o.write || o.create {
 			return Err(Error::Denied);
 		}
@@ -91,26 +112,86 @@ impl volume::Service for Volume {
 		if target.volume != VOLUME_NAME {
 			return Err(Error::NotFound);
 		}
-		let archive: &[u8] = unsafe { core::slice::from_raw_parts(self.base as *const u8, self.len) };
-		let file: &[u8] = Package::parse(archive).and_then(|p| p.lookup(target.path.as_bytes())).ok_or(Error::NotFound)?;
-		// fill a fresh read-only shared buffer with the file's bytes and hand it back
-		// as a capability (transferred out-of-band); the length travels in-stream.
-		let handle: u64 = unsafe { make_file_buffer(file) }.ok_or(Error::Again)?;
-		Ok(OpenResult { file: handle, size: file.len() as u64 })
-	}
-
-	// List the files in the volume's archive (each as name + byte length), for `ls`.
-	fn list(&mut self) -> Result<Vec<FileInfo>, Error> {
-		let archive: &[u8] = unsafe { core::slice::from_raw_parts(self.base as *const u8, self.len) };
-		let package = Package::parse(archive).ok_or(Error::NotFound)?;
-		let mut files: Vec<FileInfo> = Vec::new();
-		for index in 0..package.len() {
-			if let Some(name) = package.name(index) {
-				let size: u64 = package.lookup(name).map(|b| b.len()).unwrap_or(0) as u64;
-				files.push(FileInfo { name: String::from_utf8_lossy(name).into_owned(), size });
+		let name: &[u8] = target.path.as_bytes();
+		match self {
+			Volume::Archive { base, len } => {
+				let archive: &[u8] = unsafe { core::slice::from_raw_parts(*base as *const u8, *len) };
+				let file: &[u8] = Package::parse(archive).and_then(|p| p.lookup(name)).ok_or(Error::NotFound)?;
+				let handle: u64 = unsafe { make_file_buffer(file) }.ok_or(Error::Again)?;
+				Ok(OpenResult { file: handle, size: file.len() as u64 })
+			}
+			Volume::Disk(fs) => {
+				let file: Vec<u8> = fs.read_file(name).map_err(map_fs_err)?;
+				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
+				Ok(OpenResult { file: handle, size: file.len() as u64 })
 			}
 		}
-		Ok(files)
+	}
+
+	// List the files in the volume (each as name + byte length), for `ls`.
+	fn list(&mut self) -> Result<Vec<FileInfo>, Error> {
+		match self {
+			Volume::Archive { base, len } => {
+				let archive: &[u8] = unsafe { core::slice::from_raw_parts(*base as *const u8, *len) };
+				let package = Package::parse(archive).ok_or(Error::NotFound)?;
+				let mut files: Vec<FileInfo> = Vec::new();
+				for index in 0..package.len() {
+					if let Some(name) = package.name(index) {
+						let size: u64 = package.lookup(name).map(|b| b.len()).unwrap_or(0) as u64;
+						files.push(FileInfo { name: String::from_utf8_lossy(name).into_owned(), size });
+					}
+				}
+				Ok(files)
+			}
+			Volume::Disk(fs) => {
+				let entries = fs.list().map_err(map_fs_err)?;
+				Ok(entries.into_iter().map(|(name, size)| FileInfo { name: String::from_utf8_lossy(&name).into_owned(), size }).collect())
+			}
+		}
+	}
+
+	// Create or overwrite a file from the zero-copy `data` buffer. The transferred
+	// buffer handle is always consumed. A read-only volume refuses with `denied`.
+	fn write(&mut self, path: String, data: Buffer) -> Result<(), Error> {
+		// always release the transferred buffer handle, copying its bytes out first.
+		let bytes: Option<Vec<u8>> = unsafe { read_buffer(&data) };
+		let name: &[u8] = self.writable_name(&path)?;
+		let bytes: Vec<u8> = bytes.ok_or(Error::Invalid)?;
+		match self {
+			Volume::Archive { .. } => Err(Error::Denied),
+			Volume::Disk(fs) => fs.write_file(name, &bytes).map_err(map_fs_err),
+		}
+	}
+
+	// Delete a file. A read-only volume refuses with `denied`.
+	fn remove(&mut self, path: String) -> Result<(), Error> {
+		let name: &[u8] = self.writable_name(&path)?;
+		match self {
+			Volume::Archive { .. } => Err(Error::Denied),
+			Volume::Disk(fs) => fs.remove(name).map_err(map_fs_err),
+		}
+	}
+}
+
+impl Volume {
+	// Validate a vol:// path for a mutating op and return the file name within the
+	// volume. The name borrows `path`, so it outlives the call.
+	fn writable_name<'a>(&self, path: &'a str) -> Result<&'a [u8], Error> {
+		let target: VolumePath<'a> = VolumePath::parse(path.as_bytes()).ok_or(Error::NotFound)?;
+		if target.volume != VOLUME_NAME {
+			return Err(Error::NotFound);
+		}
+		Ok(target.path.as_bytes())
+	}
+}
+
+// Map an LSFS error onto the Storage.Volume `error` enum.
+fn map_fs_err(e: FsError) -> Error {
+	match e {
+		FsError::NotFound => Error::NotFound,
+		FsError::NoSpace => Error::Again,
+		FsError::TooLong | FsError::Invalid => Error::Invalid,
+		FsError::Io => Error::Again,
 	}
 }
 
@@ -141,12 +222,63 @@ unsafe fn make_file_buffer(file: &[u8]) -> Option<u64> {
 	}
 }
 
-// Read the volume's PKGARCH1 archive off the virtio-blk disk over the block-read
-// service channel `block_client`, into a freshly created+mapped MemoryObject.
-// Returns the archive's (base, len) on success. The archive stays mapped for the
-// serve loop; `block_client` is closed when done (the driver then shuts down).
-// Phase 1 assumes the archive header + entry table fit the first sector.
-unsafe fn load_archive_from_disk(block_client: u64) -> Option<(u64, usize)> {
+// The virtio-blk disk as a block device for LSFS: each LSFS block maps to
+// SECTORS_PER_BLOCK consecutive disk sectors, offset to the filesystem region at
+// FS_START_SECTOR. Reads and writes go through the driver's block service on `chan`,
+// which stays open for the life of the service.
+struct ChannelBlockDevice {
+	chan: u64,
+}
+
+impl BlockDevice for ChannelBlockDevice {
+	fn read_block(&mut self, index: u32, buf: &mut [u8]) -> bool {
+		let lba: u64 = FS_START_SECTOR + index as u64 * SECTORS_PER_BLOCK;
+		unsafe { block_read(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_mut_ptr()) }
+	}
+
+	fn write_block(&mut self, index: u32, buf: &[u8]) -> bool {
+		let lba: u64 = FS_START_SECTOR + index as u64 * SECTORS_PER_BLOCK;
+		unsafe { block_write(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_ptr()) }
+	}
+}
+
+// Mount the LSFS on the virtio-blk disk, or, on a fresh or stale disk, format a new
+// filesystem and seed it from the factory archive laid at LBA 0 so the volume always
+// starts with its seed files. The block channel stays open for the serve loop.
+unsafe fn mount_or_format(block_client: u64) -> Option<Lsfs<ChannelBlockDevice>> {
+	// an existing filesystem (files persisted from a previous boot) mounts as-is.
+	if let Some(fs) = Lsfs::mount(ChannelBlockDevice { chan: block_client }) {
+		return Some(fs);
+	}
+	// otherwise lay down a fresh filesystem and copy in the factory seed files. The
+	// device is rebuilt from the (Copy) channel handle - the failed mount consumed the
+	// previous device value but left the channel open.
+	let mut fs: Lsfs<ChannelBlockDevice> = Lsfs::format(ChannelBlockDevice { chan: block_client }, FS_BLOCKS).ok()?;
+	if let Some(archive) = unsafe { read_seed_archive(block_client) } {
+		seed_from_archive(&mut fs, &archive);
+	}
+	Some(fs)
+}
+
+// Copy every file from the factory PKGARCH1 archive into the filesystem (best effort;
+// a file that does not fit is skipped).
+fn seed_from_archive(fs: &mut Lsfs<ChannelBlockDevice>, archive: &[u8]) {
+	let Some(package) = Package::parse(archive) else {
+		return;
+	};
+	for index in 0..package.len() {
+		if let Some(name) = package.name(index) {
+			if let Some(bytes) = package.lookup(name) {
+				let _ = fs.write_file(name, bytes);
+			}
+		}
+	}
+}
+
+// Read the factory PKGARCH1 archive off the virtio-blk disk at LBA 0 into a Vec,
+// leaving `block_client` open for the filesystem. Phase 1 assumes the archive header
+// + entry table fit the first sector. Returns None if the disk holds no archive.
+unsafe fn read_seed_archive(block_client: u64) -> Option<Vec<u8>> {
 	unsafe {
 		// read sector 0 to find the archive's magic and total size.
 		let mut head: [u8; SECTOR_SIZE] = [0u8; SECTOR_SIZE];
@@ -173,43 +305,66 @@ unsafe fn load_archive_from_disk(block_client: u64) -> Option<(u64, usize)> {
 			}
 			i += 1;
 		}
-		// allocate the archive buffer and fill it from the disk in page-sized chunks.
-		let obj: u64 = syscall(SYS_MEMORY_OBJECT_CREATE, total as u64, 0, 0, 0);
-		if sys_is_err(obj) {
-			return None;
-		}
-		let base: u64 = syscall(SYS_MEMORY_MAP, obj, 0, 0, 0);
-		if sys_is_err(base) {
-			close(obj);
-			return None;
-		}
+		// read the whole archive into a sector-padded Vec, in page-sized chunks.
+		let rounded: usize = ((total + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE;
+		let mut archive: Vec<u8> = alloc::vec![0u8; rounded];
 		let mut filled: usize = 0;
 		while filled < total {
 			let lba: u64 = (filled / SECTOR_SIZE) as u64;
 			let remaining: usize = total - filled;
 			let sectors: usize = ((remaining + SECTOR_SIZE - 1) / SECTOR_SIZE).min(MAX_SECTORS_PER_READ);
-			if !block_read(block_client, lba, sectors as u32, (base as *mut u8).add(filled)) {
-				unmap_object(obj);
-				close(obj);
+			if !block_read(block_client, lba, sectors as u32, archive.as_mut_ptr().add(filled)) {
 				return None;
 			}
 			filled += sectors * SECTOR_SIZE;
 		}
-		// the disk is no longer needed; closing it lets the driver shut down.
-		close(block_client);
-		Some((base, total))
+		archive.truncate(total);
+		Some(archive)
 	}
 }
 
-// Send one block-read request [lba u64][count u32] to the driver and copy the
+// Copy the bytes behind a zero-copy `data` buffer out into a Vec and release the
+// transferred buffer handle. Always consumes the handle. Returns None on failure or
+// if the length exceeds MAX_WRITE.
+unsafe fn read_buffer(data: &Buffer) -> Option<Vec<u8>> {
+	unsafe {
+		if data.handle == 0 {
+			return None;
+		}
+		let len: usize = data.len as usize;
+		if len > MAX_WRITE {
+			close(data.handle);
+			return None;
+		}
+		if len == 0 {
+			close(data.handle);
+			return Some(Vec::new());
+		}
+		let base: u64 = match map_object(data.handle) {
+			Some(base) => base,
+			None => {
+				close(data.handle);
+				return None;
+			}
+		};
+		let mut bytes: Vec<u8> = alloc::vec![0u8; len];
+		core::ptr::copy_nonoverlapping(base as *const u8, bytes.as_mut_ptr(), len);
+		unmap_object(data.handle);
+		close(data.handle);
+		Some(bytes)
+	}
+}
+
+// Send one block-read request [op=0][lba u64][count u32] to the driver and copy the
 // returned sectors into `dst`. The reply is [status u32] carrying, on success, a
 // MemoryObject of count*512 bytes which we map, copy out, and release. Returns true
 // on success. `dst` must have room for count*512 bytes.
 unsafe fn block_read(block_client: u64, lba: u64, count: u32, dst: *mut u8) -> bool {
 	unsafe {
-		let mut req: [u8; 12] = [0u8; 12];
-		req[..8].copy_from_slice(&lba.to_le_bytes());
-		req[8..12].copy_from_slice(&count.to_le_bytes());
+		let mut req: [u8; 16] = [0u8; 16];
+		req[..4].copy_from_slice(&OP_READ.to_le_bytes());
+		req[4..12].copy_from_slice(&lba.to_le_bytes());
+		req[12..16].copy_from_slice(&count.to_le_bytes());
 		if !send_blocking(block_client, &req, 0) {
 			return false;
 		}
@@ -235,5 +390,48 @@ unsafe fn block_read(block_client: u64, lba: u64, count: u32, dst: *mut u8) -> b
 		unmap_object(handle);
 		close(handle);
 		true
+	}
+}
+
+// Send one block-write request [op=1][lba u64][count u32] to the driver, transferring
+// a freshly staged MemoryObject of count*512 bytes filled from `src`. The driver maps
+// it, writes it to the disk, and closes it; the reply is [status u32]. Returns true on
+// success. `src` must hold count*512 bytes.
+unsafe fn block_write(block_client: u64, lba: u64, count: u32, src: *const u8) -> bool {
+	unsafe {
+		let bytes: usize = count as usize * SECTOR_SIZE;
+		// stage the sectors in a fresh MemoryObject, then attenuate to a transferable
+		// read+map handle (the driver only reads it).
+		let obj: u64 = syscall(SYS_MEMORY_OBJECT_CREATE, bytes as u64, 0, 0, 0);
+		if sys_is_err(obj) {
+			return false;
+		}
+		let mapped: u64 = match map_object(obj) {
+			Some(base) => base,
+			None => {
+				close(obj);
+				return false;
+			}
+		};
+		core::ptr::copy_nonoverlapping(src, mapped as *mut u8, bytes);
+		unmap_object(obj);
+		let granted: i64 = duplicate(obj, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+		close(obj);
+		if granted < 0 {
+			return false;
+		}
+		let mut req: [u8; 16] = [0u8; 16];
+		req[..4].copy_from_slice(&OP_WRITE.to_le_bytes());
+		req[4..12].copy_from_slice(&lba.to_le_bytes());
+		req[12..16].copy_from_slice(&count.to_le_bytes());
+		// send consumes the granted handle (transferred to the driver).
+		if !send_blocking(block_client, &req, granted as u64) {
+			return false;
+		}
+		let mut rep: [u8; 16] = [0u8; 16];
+		match recv_blocking(block_client, &mut rep) {
+			Received::Message { len, .. } if len >= 4 => u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0,
+			_ => false,
+		}
 	}
 }

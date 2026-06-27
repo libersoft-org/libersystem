@@ -80,10 +80,14 @@ record file-info {
 // The Storage volume contract: resolve a path on a volume and hand back the file's
 // bytes as a shared-buffer capability. `open` returns the capability out-of-band
 // (handle<file>) alongside its length - the M26 capability-return case that
-// exercises the handle<T> wire transfer.
+// exercises the handle<T> wire transfer. `write` / `remove` make the volume writable
+// (M43): `write` creates-or-truncates a file from a zero-copy `buffer`, `remove`
+// deletes one. A read-only volume rejects both with `denied`.
 interface volume {
-	@op(1) open: func(o: open-opts) -> result<open-result, error>;
-	@op(2) list: func() -> result<list<file-info>, error>;
+	@op(1) open:   func(o: open-opts) -> result<open-result, error>;
+	@op(2) list:   func() -> result<list<file-info>, error>;
+	@op(3) write:  func(path: string, data: buffer) -> result<unit, error>;
+	@op(4) remove: func(path: string) -> result<unit, error>;
 }
 
 // The class of a discovered device, mirroring the kernel's virtio type codes.

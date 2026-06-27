@@ -20,12 +20,17 @@ const SECTOR: u32 = 512;
 
 // virtio-blk request types and the success status.
 const BLK_T_IN: u32 = 0; // read (device writes the data buffer)
+const BLK_T_OUT: u32 = 1; // write (device reads the data buffer)
 const BLK_S_OK: u8 = 0;
 
-// The most sectors served per block-read request (one DMA page).
+// The most sectors served per block request (one DMA page).
 const MAX_SECTORS: u32 = 8;
 
-// Block-read reply status codes.
+// Block-service request opcodes (the leading u32 of each request).
+const OP_READ: u32 = 0;
+const OP_WRITE: u32 = 1;
+
+// Block-service reply status codes.
 const STATUS_OK: u32 = 0;
 const STATUS_ERR: u32 = 1;
 
@@ -106,14 +111,16 @@ unsafe fn request(queue: &Queue, virt: u64, phys: u64, lba: u64, kind: u32, data
 	}
 }
 
-// Serve block-read requests on `blk_server` until the client closes its end. Each
-// request is [lba u64][count u32] (count clamped to one DMA page = 8 sectors); the
-// reply is [status u32] carrying, on success, a MemoryObject capability to a freshly
-// filled buffer of count*512 bytes - the sectors read off the disk. The data crosses
-// as a shared buffer handle, never copied through the channel.
+// Serve block requests on `blk_server` until the client closes its end. Each request
+// is [op u32][lba u64][count u32] (count clamped to one DMA page = 8 sectors). A read
+// (op 0) replies [status u32] carrying, on success, a MemoryObject capability to a
+// freshly filled buffer of count*512 bytes - the sectors read off the disk. A write
+// (op 1) carries a transferred MemoryObject of count*512 bytes the device reads onto
+// the disk, and replies [status u32] with no buffer. The data crosses as a shared
+// buffer handle, never copied through the channel.
 unsafe fn serve_blocks(queue: &Queue, blk_server: u64) -> ! {
 	unsafe {
-		// one reusable DMA buffer the device reads each sector into.
+		// one reusable DMA buffer the device reads/writes each sector through.
 		let dma: i64 = dma_buffer_create(4096);
 		if dma < 0 {
 			exit();
@@ -127,10 +134,20 @@ unsafe fn serve_blocks(queue: &Queue, blk_server: u64) -> ! {
 		let mut req: [u8; 16] = [0u8; 16];
 		loop {
 			match recv_blocking(blk_server, &mut req) {
-				Received::Message { len, .. } if len >= 12 => {
-					let lba: u64 = u64::from_le_bytes([req[0], req[1], req[2], req[3], req[4], req[5], req[6], req[7]]);
-					let count: u32 = u32::from_le_bytes([req[8], req[9], req[10], req[11]]).clamp(1, MAX_SECTORS);
-					serve_one(queue, blk_server, virt, phys, lba, count);
+				Received::Message { len, handle } if len >= 16 => {
+					let op: u32 = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
+					let lba: u64 = u64::from_le_bytes([req[4], req[5], req[6], req[7], req[8], req[9], req[10], req[11]]);
+					let count: u32 = u32::from_le_bytes([req[12], req[13], req[14], req[15]]).clamp(1, MAX_SECTORS);
+					match op {
+						OP_READ => serve_read(queue, blk_server, virt, phys, lba, count),
+						OP_WRITE => serve_write(queue, blk_server, virt, phys, lba, count, handle),
+						_ => {
+							if handle != 0 {
+								close(handle);
+							}
+							reply_block(blk_server, STATUS_ERR, 0);
+						}
+					}
 				}
 				_ => exit(),
 			}
@@ -140,7 +157,7 @@ unsafe fn serve_blocks(queue: &Queue, blk_server: u64) -> ! {
 
 // Read `count` sectors starting at `lba` into a fresh shared buffer and hand it to
 // the client, or reply with an error status and no buffer on any failure.
-unsafe fn serve_one(queue: &Queue, blk_server: u64, virt: u64, phys: u64, lba: u64, count: u32) {
+unsafe fn serve_read(queue: &Queue, blk_server: u64, virt: u64, phys: u64, lba: u64, count: u32) {
 	unsafe {
 		let bytes: u64 = count as u64 * SECTOR as u64;
 		let obj: u64 = syscall(SYS_MEMORY_OBJECT_CREATE, bytes, 0, 0, 0);
@@ -184,7 +201,42 @@ unsafe fn serve_one(queue: &Queue, blk_server: u64, virt: u64, phys: u64, lba: u
 	}
 }
 
-// Send a block-read reply: [status u32 LE] carrying the handle `xfer` (0 = none).
+// Write `count` sectors starting at `lba` from the transferred buffer `src_handle`
+// (a MemoryObject of count*512 bytes the client filled). We map it, push each sector
+// through the DMA buffer to the device, then unmap and close the handle. Replies with
+// the status and no buffer.
+unsafe fn serve_write(queue: &Queue, blk_server: u64, virt: u64, phys: u64, lba: u64, count: u32, src_handle: u64) {
+	unsafe {
+		if src_handle == 0 {
+			reply_block(blk_server, STATUS_ERR, 0);
+			return;
+		}
+		let src: u64 = match map_object(src_handle) {
+			Some(base) => base,
+			None => {
+				close(src_handle);
+				reply_block(blk_server, STATUS_ERR, 0);
+				return;
+			}
+		};
+		// copy each sector from the client buffer into the DMA buffer, then write it.
+		let mut s: u32 = 0;
+		let mut ok: bool = true;
+		while s < count {
+			core::ptr::copy_nonoverlapping((src + s as u64 * SECTOR as u64) as *const u8, (virt + DATA_OFF) as *mut u8, SECTOR as usize);
+			if !request(queue, virt, phys, lba + s as u64, BLK_T_OUT, false) {
+				ok = false;
+				break;
+			}
+			s += 1;
+		}
+		unmap_object(src_handle);
+		close(src_handle);
+		reply_block(blk_server, if ok { STATUS_OK } else { STATUS_ERR }, 0);
+	}
+}
+
+// Send a block reply: [status u32 LE] carrying the handle `xfer` (0 = none).
 unsafe fn reply_block(blk_server: u64, status: u32, xfer: u64) {
 	unsafe {
 		send_blocking(blk_server, &status.to_le_bytes(), xfer);

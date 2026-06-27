@@ -1,0 +1,8 @@
+[package]
+name = "lsfs"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "LSFS - a simple writable on-disk filesystem (block allocation, inodes, a root directory) behind one BlockDevice trait"
+
+[dependencies]

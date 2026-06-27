@@ -525,6 +525,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  echo <text>      print text\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
 			print(b"  ls [vol://vol]   list volumes, or a volume's files via StorageService\n");
+			print(b"  write <vol://...> <text>  create or overwrite a file via StorageService\n");
+			print(b"  rm <vol://...>   delete a file via StorageService\n");
 			print(b"  beep [hz] [ms]   play a tone via AudioService\n");
 			print(b"  mouse            show recent pointer events via InputService\n");
 			print(b"  script [<cmd>]   run a command in a fresh pty-hosted shell and record it\n");
@@ -724,6 +726,19 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 				print(uri);
 				print(b"\n");
 			}
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"write ") {
+			let rest = trim(rest);
+			// "write <uri> <text>": split on the first space.
+			match rest.iter().position(|&b: &u8| b == b' ') {
+				Some(sp) => write_cmd(storage, &rest[..sp], trim(&rest[sp + 1..])),
+				None => print(b"usage: write <vol://...> <text>\n"),
+			}
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"rm ") {
+			rm_cmd(storage, trim(rest));
 			return false;
 		}
 		if line == b"script" {
@@ -1477,5 +1492,85 @@ unsafe fn ls_cmd(storage: u64, arg: &[u8]) {
 			print_usize(f.size as usize);
 			print(b" bytes\n");
 		}
+	}
+}
+
+// Create or overwrite a file on the volume via the StorageService `write` op. The
+// text is staged in a fresh read-only shared buffer and handed over out-of-band as a
+// zero-copy `buffer`; the service writes it to the on-disk filesystem, so it survives
+// a reboot.
+unsafe fn write_cmd(storage: u64, uri: &[u8], text: &[u8]) {
+	unsafe {
+		let data: proto::codec::Buffer = match make_buffer(text) {
+			Some(b) => b,
+			None => {
+				print(b"write: out of memory\n");
+				return;
+			}
+		};
+		let path: String = String::from_utf8_lossy(uri).into_owned();
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		match client.write(&path, &data) {
+			Some(Ok(())) => {
+				print(b"wrote ");
+				print(uri);
+				print(b"\n");
+			}
+			_ => {
+				print(b"write: could not write ");
+				print(uri);
+				print(b"\n");
+			}
+		}
+	}
+}
+
+// Delete a file on the volume via the StorageService `remove` op.
+unsafe fn rm_cmd(storage: u64, uri: &[u8]) {
+	unsafe {
+		let path: String = String::from_utf8_lossy(uri).into_owned();
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		match client.remove(&path) {
+			Some(Ok(())) => {
+				print(b"removed ");
+				print(uri);
+				print(b"\n");
+			}
+			_ => {
+				print(b"rm: could not remove ");
+				print(uri);
+				print(b"\n");
+			}
+		}
+	}
+}
+
+// Stage `bytes` in a fresh MemoryObject and return a transferable read-only buffer
+// (read + map + transfer) over it for a zero-copy `write`. The caller passes the
+// buffer to the generated client, whose send consumes the handle. An empty write
+// still allocates a one-byte object (length 0) so the create cannot fail on a
+// zero-length request.
+unsafe fn make_buffer(bytes: &[u8]) -> Option<proto::codec::Buffer> {
+	unsafe {
+		let alloc_len: usize = bytes.len().max(1);
+		let obj: u64 = syscall(SYS_MEMORY_OBJECT_CREATE, alloc_len as u64, 0, 0, 0);
+		if sys_is_err(obj) {
+			return None;
+		}
+		let mapped: u64 = match map_object(obj) {
+			Some(base) => base,
+			None => {
+				close(obj);
+				return None;
+			}
+		};
+		core::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped as *mut u8, bytes.len());
+		unmap_object(obj);
+		let granted: i64 = duplicate(obj, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+		close(obj);
+		if granted < 0 {
+			return None;
+		}
+		Some(proto::codec::Buffer { handle: granted as u64, len: bytes.len() as u64 })
 	}
 }

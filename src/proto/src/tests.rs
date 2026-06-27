@@ -151,11 +151,33 @@ struct VolStub;
 
 impl volume::Service for VolStub {
 	fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error> {
-		if o.path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
+		if o.path.is_empty() {
+			Err(Error::NotFound)
+		} else {
+			Ok(OpenResult { file: 0xCAFE, size: 42 })
+		}
 	}
 
 	fn list(&mut self) -> Result<Vec<FileInfo>, Error> {
 		Ok(Vec::new())
+	}
+
+	fn write(&mut self, path: String, data: crate::codec::Buffer) -> Result<(), Error> {
+		// the buffer handle must have travelled out-of-band (set_handle -> request_handle
+		// -> take_handle); prove it by succeeding only when it arrives intact.
+		if path.is_empty() || data.handle != 0xBEEF || data.len != 5 {
+			Err(Error::Invalid)
+		} else {
+			Ok(())
+		}
+	}
+
+	fn remove(&mut self, path: String) -> Result<(), Error> {
+		if path.is_empty() {
+			Err(Error::NotFound)
+		} else {
+			Ok(())
+		}
 	}
 }
 
@@ -180,6 +202,23 @@ fn handle_return_crosses_out_of_band() {
 	assert_eq!(client.open(&opts), Some(Ok(OpenResult { file: 0xCAFE, size: 42 })));
 	let empty = OpenOpts { path: String::new(), write: false, create: false };
 	assert_eq!(client.open(&empty), Some(Err(Error::NotFound)));
+}
+
+#[test]
+fn write_buffer_handle_crosses_out_of_band() {
+	let mut client = volume::Client::new(VolLoopback { service: VolStub });
+	let data = crate::codec::Buffer { handle: 0xBEEF, len: 5 };
+	// the buffer handle (0xBEEF) crosses out-of-band; the length travels in-stream.
+	assert_eq!(client.write("/x", &data), Some(Ok(())));
+	// a missing path is rejected.
+	assert_eq!(client.write("", &data), Some(Err(Error::Invalid)));
+}
+
+#[test]
+fn remove_round_trips() {
+	let mut client = volume::Client::new(VolLoopback { service: VolStub });
+	assert_eq!(client.remove("/x"), Some(Ok(())));
+	assert_eq!(client.remove(""), Some(Err(Error::NotFound)));
 }
 
 #[test]
