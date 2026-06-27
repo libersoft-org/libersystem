@@ -92,3 +92,89 @@ fn raw_sink_clear_resets_the_capture() {
 	assert!(raw.is_empty());
 	assert_eq!(raw.as_bytes(), b"");
 }
+
+// The DEC private mouse-tracking modes (?1000 normal, ?1002 button-event, ?1003 any-event)
+// and the SGR encoding (?1006) toggle the queryable mode the console reads to route pointer
+// events; each turns off again with the matching `l`.
+#[test]
+fn mouse_modes_track_the_dec_private_toggles() {
+	let mut s = Screen::new(8, 4);
+	assert!(!s.mouse_tracking());
+	feed(&mut s, b"\x1b[?1000h");
+	assert!(s.mouse_tracking() && !s.mouse_report_motion());
+	feed(&mut s, b"\x1b[?1002h");
+	assert!(s.mouse_report_motion() && !s.mouse_any_motion());
+	feed(&mut s, b"\x1b[?1003h");
+	assert!(s.mouse_any_motion());
+	feed(&mut s, b"\x1b[?1003l");
+	assert!(!s.mouse_tracking());
+	assert!(!s.mouse_sgr());
+	feed(&mut s, b"\x1b[?1006h");
+	assert!(s.mouse_sgr());
+}
+
+// Bracketed paste (?2004) toggles the flag the console reads to wrap a paste.
+#[test]
+fn bracketed_paste_toggles() {
+	let mut s = Screen::new(8, 4);
+	assert!(!s.bracketed_paste());
+	feed(&mut s, b"\x1b[?2004h");
+	assert!(s.bracketed_paste());
+	feed(&mut s, b"\x1b[?2004l");
+	assert!(!s.bracketed_paste());
+}
+
+// OSC 52 sets the clipboard: the base64 payload is decoded to plain text and drained to the
+// console, which holds the clipboard.
+#[test]
+fn osc_52_sets_the_clipboard() {
+	let mut s = Screen::new(8, 4);
+	// "aGVsbG8=" is base64 for "hello".
+	feed(&mut s, b"\x1b]52;c;aGVsbG8=\x07");
+	assert_eq!(s.take_clipboard_set().as_deref(), Some(&b"hello"[..]));
+	// drained once.
+	assert_eq!(s.take_clipboard_set(), None);
+}
+
+// A click-drag selection over the live screen copies the selected glyphs, trailing spaces
+// trimmed, rows joined by a newline; the selected cells render reversed.
+#[test]
+fn selection_copies_text_and_highlights_cells() {
+	let mut s = Screen::new(8, 4);
+	feed(&mut s, b"hello");
+	s.selection_begin(0, 0);
+	s.selection_extend(4, 0);
+	assert!(s.has_selection());
+	assert_eq!(s.selection_text(), b"hello");
+	// the selected cells are reversed, an unselected one is not.
+	assert!(s.display_cell(0, 0).reverse);
+	assert!(s.display_cell(4, 0).reverse);
+	assert!(!s.display_cell(5, 0).reverse);
+	s.selection_clear();
+	assert!(!s.has_selection());
+	assert!(!s.display_cell(0, 0).reverse);
+}
+
+// A selection spanning two rows takes each row's segment to its end, joining them with a
+// newline (trailing blanks trimmed).
+#[test]
+fn selection_spans_rows() {
+	let mut s = Screen::new(8, 4);
+	feed(&mut s, b"ab\ncd");
+	s.selection_begin(0, 0);
+	s.selection_extend(1, 1);
+	assert_eq!(s.selection_text(), b"ab\ncd");
+}
+
+// Selection works over the scrollback view: scrolling up brings a scrolled-off line into
+// the viewport, and a selection there copies that history line.
+#[test]
+fn selection_reaches_into_scrollback() {
+	let mut s = Screen::new(8, 3);
+	feed(&mut s, b"L0\nL1\nL2\nL3\nL4");
+	// L0/L1 have scrolled into the history; page the view up to show them.
+	s.scroll_view_up();
+	s.selection_begin(0, 0);
+	s.selection_extend(1, 0);
+	assert_eq!(s.selection_text(), b"L0");
+}

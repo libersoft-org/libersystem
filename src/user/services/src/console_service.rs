@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 // display `Surface`. This service supplies the userspace display backends - the boot
 // framebuffer and the virtio-gpu shared backing - and drives `Term`; the kernel boot
 // console shares the same `Term`.
-use term::{CELL_H, CELL_W, Geometry, Raster, RawSink, Surface, Term};
+use term::{Geometry, Raster, RawSink, Surface, Term, CELL_H, CELL_W};
 
 // The boot framebuffer the kernel maps directly: its pixel writes are visible immediately,
 // so present is a no-op. The fallback display (and the deterministic test path).
@@ -85,8 +85,8 @@ const NVT: usize = 4;
 
 // The number of program-hosted PTYs open at once (the `script` tool, a future `ssh`). A
 // PTY occupies three wait-set slots (its slave data + control channels and the master
-// channel), so the whole wait set - keyboard + gpu + NVT display VTs + PTY_MAX PTYs - is
-// `2 + 2*NVT + 3*PTY_MAX` = 16 <= the kernel's MAX_WAIT_ANY.
+// channel), so the whole wait set - keyboard + gpu + NVT display VTs + PTY_MAX PTYs + the
+// pointer channel - is `2 + 2*NVT + 3*PTY_MAX + 1` = 17 <= the kernel's MAX_WAIT_ANY.
 const PTY_MAX: usize = 2;
 
 // Control-byte chords intercepted by the console (never forwarded to a shell): the
@@ -524,6 +524,16 @@ struct Console {
 	facs: Factories,
 	package: Package<'static>,
 	pkg_len: usize,
+	// The pointer-forward channel from InputService (0 = no pointer device this boot): raw
+	// 6-byte pointer events [x u16 LE][y u16 LE][buttons u8][wheel i8] arrive on it, which
+	// `handle_pointer` turns into SGR mouse reports (for a program that enabled tracking)
+	// or native selection / scrollback / paste (when no program is tracking the mouse).
+	pointer: u64,
+	// The console-held clipboard - the Linux primary selection. A mouse selection copies
+	// into it (select-to-copy), middle-click pastes it, and a program's OSC 52 sets it.
+	clipboard: Vec<u8>,
+	// The pointer button bits from the previous event, to detect press / release edges.
+	ptr_buttons: u8,
 }
 
 // Receive the "GPU" bootstrap message, returning the gpu driver's display channel, or 0
@@ -533,6 +543,18 @@ unsafe fn recv_gpu(bootstrap: u64, buf: &mut [u8]) -> u64 {
 	unsafe {
 		match recv_blocking(bootstrap, buf) {
 			Received::Message { len, handle } if len >= 3 && &buf[..3] == b"GPU" => handle,
+			_ => 0,
+		}
+	}
+}
+
+// Receive the "POINTER" bootstrap message, returning InputService's pointer-forward
+// channel, or 0 when there is no pointer device this boot. A 0 handle is valid here (as
+// for "GPU"), so this does not use recv_tagged.
+unsafe fn recv_pointer(bootstrap: u64, buf: &mut [u8]) -> u64 {
+	unsafe {
+		match recv_blocking(bootstrap, buf) {
+			Received::Message { len, handle } if len >= 7 && &buf[..7] == b"POINTER" => handle,
 			_ => 0,
 		}
 	}
@@ -610,6 +632,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// The gpu driver's display channel (0 = no virtio-gpu device; a 0 handle is valid
 		// here, unlike the tagged factories above, so we do not use recv_tagged).
 		let gpu: u64 = recv_gpu(bootstrap, &mut buf);
+		// InputService's pointer-forward channel (0 = no pointer device this boot).
+		let pointer: u64 = recv_pointer(bootstrap, &mut buf);
 		let (pkg_handle, archive): (u64, &'static [u8]) = recv_package(bootstrap, &mut buf).unwrap_or_else(|| exit());
 		let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
 		let pkg_len: usize = archive.len();
@@ -659,7 +683,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, pkg_handle };
-		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, package, pkg_len };
+		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, package, pkg_len, pointer, clipboard: Vec::new(), ptr_buttons: 0 };
 		run(&mut console);
 	}
 }
@@ -683,7 +707,7 @@ unsafe fn run(console: &mut Console) -> ! {
 		console.input = input;
 		let mut keys: [u8; 64] = [0u8; 64];
 		let mut out: [u8; 1024] = [0u8; 1024];
-		let mut waits: [u64; 2 + 2 * NVT + 3 * PTY_MAX] = [0u64; 2 + 2 * NVT + 3 * PTY_MAX];
+		let mut waits: [u64; 2 + 2 * NVT + 3 * PTY_MAX + 1] = [0u64; 2 + 2 * NVT + 3 * PTY_MAX + 1];
 		// present the initial banner (the foreground term was rendered in __user_main).
 		present_fg(console);
 		loop {
@@ -691,7 +715,8 @@ unsafe fn run(console: &mut Console) -> ! {
 			// and its control channel interleaved (data at 1 + 2*i, control at 2 + 2*i),
 			// then the gpu driver's display channel (when present, it sends RESIZE on a
 			// host-window change), then each program-hosted PTY's slave-data, slave-control,
-			// and master channels interleaved (data / control / master at pty_base + 3*j).
+			// and master channels interleaved (data / control / master at pty_base + 3*j),
+			// then the pointer channel (when present) in the last slot.
 			waits[0] = console.input;
 			let nv: usize = console.vts.len();
 			for i in 0..nv {
@@ -710,7 +735,14 @@ unsafe fn run(console: &mut Console) -> ! {
 				waits[pty_base + 3 * j + 1] = console.ptys[j].control;
 				waits[pty_base + 3 * j + 2] = console.ptys[j].master;
 			}
-			let total: usize = pty_base + 3 * np;
+			// The pointer channel (when present) is the last wait slot: raw pointer events
+			// from InputService drive selection, scrollback, and SGR mouse reports.
+			let ptr_idx: usize = pty_base + 3 * np;
+			let have_pointer: bool = console.pointer != 0;
+			if have_pointer {
+				waits[ptr_idx] = console.pointer;
+			}
+			let total: usize = ptr_idx + have_pointer as usize;
 			// Block (~0% CPU) until a channel is ready: a keystroke, VT output, a gpu RESIZE, or
 			// a program-hosted PTY's traffic.
 			let ready: i64 = wait_any(&waits[..total], 0);
@@ -724,6 +756,18 @@ unsafe fn run(console: &mut Console) -> ! {
 				} else if have_gpu && r == gpu_idx {
 					// the gpu driver reports a host-window resize: refit every VT.
 					handle_gpu_resize(console);
+				} else if have_pointer && r == ptr_idx {
+					// a raw pointer event from InputService: SGR report, selection, or scrollback.
+					loop {
+						match try_recv(console.pointer, &mut out) {
+							Polled::Message { len, .. } => handle_pointer(console, &out[..len]),
+							Polled::Empty => break,
+							Polled::Closed => {
+								console.pointer = 0;
+								break;
+							}
+						}
+					}
 				} else if r < gpu_idx {
 					let vi: usize = (r - 1) / 2;
 					if (r - 1) % 2 == 0 {
@@ -793,6 +837,7 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 		let input: u64 = console.input;
 		let mut raw_req: Option<bool> = None;
 		let mut echo_req: Option<bool> = None;
+		let mut clip_req: Option<Vec<u8>> = None;
 		if let Some(t) = console.vts[vi].term.as_mut() {
 			for &b in bytes {
 				t.screen.put_byte(b);
@@ -800,6 +845,8 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 			// Pick up any tty mode change the program asked for in this output.
 			raw_req = t.screen.take_tty_raw_req();
 			echo_req = t.screen.take_tty_echo_req();
+			// Pick up an OSC 52 clipboard-set the program emitted in this output.
+			clip_req = t.screen.take_clipboard_set();
 			let bell: bool = t.screen.take_bell();
 			if fg {
 				t.flush();
@@ -821,6 +868,11 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 		}
 		if let Some(echo) = echo_req {
 			console.vts[vi].ld.echo = echo;
+		}
+		// Adopt an OSC 52 clipboard-set into the console-held clipboard (the Linux way: a
+		// program sets the selection, a later middle-click pastes it).
+		if let Some(text) = clip_req {
+			console.clipboard = text;
 		}
 		if fg {
 			// Tap the raw output stream (L1) into the serial mirror, alongside the L2 model above;
@@ -1220,6 +1272,216 @@ fn snap_fg_live(console: &mut Console) {
 	if let Some(t) = console.vts[console.fg].term.as_mut() {
 		if t.screen.snap_live() {
 			t.flush();
+		}
+	}
+}
+
+// Handle one raw pointer event from InputService: [x u16 LE][y u16 LE][buttons u8][wheel i8].
+// When the foreground program enabled mouse tracking (DECSET ?1000 / ?1002 / ?1003), the
+// event is translated into SGR mouse reports and delivered to the program (best-effort: a
+// program that is not reading drops them rather than stalling the console). Otherwise the
+// console drives it natively the Linux way: the wheel pages the scrollback, click-drag
+// selects a range (copied to the clipboard on release), and middle-click pastes the
+// clipboard (bracketed when the program asked for ?2004).
+unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
+	unsafe {
+		if msg.len() < 6 {
+			return;
+		}
+		let fg: usize = console.fg;
+		let x: u32 = u16::from_le_bytes([msg[0], msg[1]]) as u32;
+		let y: u32 = u16::from_le_bytes([msg[2], msg[3]]) as u32;
+		let buttons: u8 = msg[4];
+		let wheel: i8 = msg[5] as i8;
+		let prev: u8 = console.ptr_buttons;
+		console.ptr_buttons = buttons;
+		// The foreground VT's grid geometry and its mouse / paste modes.
+		let (cols, rows, tracking, sgr, motion, anymotion, bracket): (usize, usize, bool, bool, bool, bool, bool) = match console.vts[fg].term.as_ref() {
+			Some(t) => (t.screen.cols(), t.screen.rows(), t.screen.mouse_tracking(), t.screen.mouse_sgr(), t.screen.mouse_report_motion(), t.screen.mouse_any_motion(), t.screen.bracketed_paste()),
+			None => return,
+		};
+		if cols == 0 || rows == 0 {
+			return;
+		}
+		// Map the normalized 0..0x10000 position onto the 0-based viewport cell grid.
+		let col: usize = ((x as usize * cols) / 0x1_0000).min(cols - 1);
+		let row: usize = ((y as usize * rows) / 0x1_0000).min(rows - 1);
+		if tracking {
+			pointer_report(console, fg, col, row, buttons, prev, wheel, sgr, motion, anymotion);
+			return;
+		}
+		// Native console handling: no program is tracking the mouse.
+		let left_now: bool = buttons & 1 != 0;
+		let left_was: bool = prev & 1 != 0;
+		let mid_now: bool = buttons & 4 != 0;
+		let mid_was: bool = prev & 4 != 0;
+		if wheel != 0 {
+			// Route the wheel to the scrollback view (three lines per notch, the Linux default).
+			if let Some(t) = console.vts[fg].term.as_mut() {
+				if wheel > 0 {
+					t.screen.scroll_view_up_by(3);
+				} else {
+					t.screen.scroll_view_down_by(3);
+				}
+				t.flush();
+			}
+			present_fg(console);
+			return;
+		}
+		if left_now && !left_was {
+			// Press: anchor a fresh selection at the cell under the pointer.
+			if let Some(t) = console.vts[fg].term.as_mut() {
+				t.screen.selection_begin(col, row);
+				t.flush();
+			}
+			present_fg(console);
+		} else if left_now && left_was {
+			// Drag: extend the selection to the cell under the pointer.
+			if let Some(t) = console.vts[fg].term.as_mut() {
+				t.screen.selection_extend(col, row);
+				t.flush();
+			}
+			present_fg(console);
+		} else if !left_now && left_was {
+			// Release: copy the selected text to the clipboard (select-to-copy). A bare click
+			// (no drag, so nothing selected) clears the transient highlight instead.
+			let text: Vec<u8> = match console.vts[fg].term.as_ref() {
+				Some(t) => t.screen.selection_text(),
+				None => Vec::new(),
+			};
+			if text.is_empty() {
+				if let Some(t) = console.vts[fg].term.as_mut() {
+					t.screen.selection_clear();
+					t.flush();
+				}
+				present_fg(console);
+			} else {
+				console.clipboard = text;
+			}
+		}
+		if mid_now && !mid_was {
+			// Middle-click: paste the clipboard (bracketed when the program asked for ?2004).
+			paste_clipboard(console, bracket);
+		}
+	}
+}
+
+// Translate a pointer event into SGR mouse reports for a tracking program. Only the SGR
+// encoding (?1006) is produced; without it the report is dropped (the legacy X10 byte
+// encoding is not emitted). The button press / release edges are always reported; a wheel
+// tick reports as button 64 (up) / 65 (down); a drag (button held) reports under ?1002 and
+// any bare motion under ?1003 (Cb + 32). Reports are best-effort (try_send), so a program
+// that is not draining its input drops them rather than stalling the console loop.
+unsafe fn pointer_report(console: &mut Console, fg: usize, col: usize, row: usize, buttons: u8, prev: u8, wheel: i8, sgr: bool, motion: bool, anymotion: bool) {
+	unsafe {
+		if !sgr {
+			return;
+		}
+		let client: u64 = console.vts[fg].client;
+		let cx: usize = col + 1;
+		let cy: usize = row + 1;
+		if wheel != 0 {
+			let cb: usize = if wheel > 0 { 64 } else { 65 };
+			send_sgr(client, cb, cx, cy, true);
+			return;
+		}
+		// Button edges (bit 0 left -> Cb 0, bit 1 right -> Cb 2, bit 2 middle -> Cb 1).
+		for &(bit, code) in &[(1u8, 0usize), (4u8, 1usize), (2u8, 2usize)] {
+			let now: bool = buttons & bit != 0;
+			let was: bool = prev & bit != 0;
+			if now && !was {
+				send_sgr(client, code, cx, cy, true);
+			} else if !now && was {
+				send_sgr(client, code, cx, cy, false);
+			}
+		}
+		// Motion (no button change this event): a drag under ?1002, any motion under ?1003.
+		if buttons == prev {
+			let any_button: bool = buttons & 0b111 != 0;
+			if (motion && any_button) || anymotion {
+				let base: usize = if buttons & 1 != 0 {
+					0
+				} else if buttons & 4 != 0 {
+					1
+				} else if buttons & 2 != 0 {
+					2
+				} else {
+					3
+				};
+				send_sgr(client, 32 + base, cx, cy, true);
+			}
+		}
+	}
+}
+
+// Send one SGR mouse report to a tracking program: ESC [ < Cb ; Cx ; Cy followed by M for a
+// press / motion or m for a release, with 1-based cell coordinates. Best-effort: a full or
+// closed input channel drops the report rather than blocking the console.
+unsafe fn send_sgr(client: u64, cb: usize, cx: usize, cy: usize, press: bool) {
+	unsafe {
+		let mut buf: [u8; 24] = [0u8; 24];
+		let mut n: usize = 0;
+		buf[n] = 0x1b;
+		n += 1;
+		buf[n] = b'[';
+		n += 1;
+		buf[n] = b'<';
+		n += 1;
+		n += write_dec(&mut buf[n..], cb);
+		buf[n] = b';';
+		n += 1;
+		n += write_dec(&mut buf[n..], cx);
+		buf[n] = b';';
+		n += 1;
+		n += write_dec(&mut buf[n..], cy);
+		buf[n] = if press { b'M' } else { b'm' };
+		n += 1;
+		try_send(client, &buf[..n], 0);
+	}
+}
+
+// Write `v` as ASCII decimal into `buf` and return the number of bytes written.
+fn write_dec(buf: &mut [u8], v: usize) -> usize {
+	let mut tmp: [u8; 20] = [0u8; 20];
+	let mut i: usize = 0;
+	let mut n: usize = v;
+	loop {
+		tmp[i] = b'0' + (n % 10) as u8;
+		i += 1;
+		n /= 10;
+		if n == 0 {
+			break;
+		}
+	}
+	for j in 0..i {
+		buf[j] = tmp[i - 1 - j];
+	}
+	i
+}
+
+// Paste the console-held clipboard into the foreground VT (middle-click, the Linux way).
+// When the program asked for bracketed paste (?2004) the content is wrapped in
+// ESC [ 200 ~ ... ESC [ 201 ~ and sent straight to the program, so it can tell a paste from
+// typed input; otherwise the bytes are fed through the line discipline as if typed (so a
+// paste at the prompt enters the line editor and echoes). A no-op with an empty clipboard.
+unsafe fn paste_clipboard(console: &mut Console, bracketed: bool) {
+	unsafe {
+		if console.clipboard.is_empty() {
+			return;
+		}
+		// A paste targets the live screen, so leave any scrollback view first.
+		snap_fg_live(console);
+		let fg: usize = console.fg;
+		if bracketed {
+			let client: u64 = console.vts[fg].client;
+			send_blocking(client, b"\x1b[200~", 0);
+			send_blocking(client, &console.clipboard, 0);
+			send_blocking(client, b"\x1b[201~", 0);
+		} else {
+			let clip: Vec<u8> = console.clipboard.clone();
+			for &b in &clip {
+				feed_key(console, b);
+			}
 		}
 	}
 }

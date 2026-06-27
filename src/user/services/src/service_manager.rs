@@ -41,7 +41,7 @@ const N: usize = 12;
 // start LogService first. This proves the ordering is driven by declared
 // dependencies, not by manifest position. The shell is the last component up: it
 // depends on StorageService, which it talks to over IPC.
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }];
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -93,6 +93,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut snd_client: u64 = 0;
 	let mut input_raw: u64 = 0;
 	let mut input_client: u64 = 0;
+	// The console end of the InputService -> ConsoleService pointer-forward channel,
+	// minted when InputService bootstraps and handed to ConsoleService when it bootstraps
+	// (InputService is a declared dependency of ConsoleService, so it starts first).
+	let mut pointer_console: u64 = 0;
 	let mut audio_client: u64 = 0;
 	let mut time_client: u64 = 0;
 	let mut console_client: u64 = 0;
@@ -106,7 +110,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
-				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut channels[i], &mut buf) };
+				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut channels[i], &mut buf) };
 				progress = true;
 			}
 			i += 1;
@@ -190,7 +194,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -231,10 +235,10 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"audio_service" && !bootstrap_audio_service(manager_side, *snd_client, audio_client) {
 			return State::Failed;
 		}
-		if name == b"input_service" && !bootstrap_input(manager_side, *input_raw, input_client) {
+		if name == b"input_service" && !bootstrap_input(manager_side, *input_raw, input_client, pointer_console) {
 			return State::Failed;
 		}
-		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, console_client, console_control, pkg_handle, pkg_len, buf) {
+		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, *pointer_console, console_client, console_control, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *input_client, *console_client, *console_control, pkg_handle, pkg_len, buf) {
@@ -421,13 +425,28 @@ unsafe fn bootstrap_serve(manager_side: u64, client: &mut u64) -> bool {
 // in `*input_client` for the shell) and the raw pointer-event channel routed up from
 // the virtio_input pointer driver via DeviceManager ("INPUT"; the handle is 0 when no
 // pointer device is present, e.g. under test - InputService still serves an empty
-// stream). The order matches InputService's receive order: SERVE then INPUT.
-unsafe fn bootstrap_input(manager_side: u64, input_raw: u64, input_client: &mut u64) -> bool {
+// stream), then "FORWARD" transferring the input end of a fresh pointer-forward
+// channel - InputService forwards every raw pointer event over it to ConsoleService,
+// whose end is kept in `*pointer_console` for ConsoleService's own bootstrap (it starts
+// later, since it declares input_service as a dependency). The order matches
+// InputService's receive order: SERVE, INPUT, FORWARD.
+unsafe fn bootstrap_input(manager_side: u64, input_raw: u64, input_client: &mut u64, pointer_console: &mut u64) -> bool {
 	unsafe {
 		if !bootstrap_serve(manager_side, input_client) {
 			return false;
 		}
-		send_blocking(manager_side, b"INPUT", input_raw)
+		if !send_blocking(manager_side, b"INPUT", input_raw) {
+			return false;
+		}
+		let (input_fwd, console_fwd): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"FORWARD", input_fwd) {
+			return false;
+		}
+		*pointer_console = console_fwd;
+		true
 	}
 }
 
@@ -513,7 +532,7 @@ unsafe fn bootstrap_audio_service(manager_side: u64, snd_client: u64, audio_clie
 // so minting from them never crosses the supervisor's lifecycle traffic. ConsoleService
 // maps the framebuffer itself (the kernel console then stops drawing) and attaches to
 // the kernel console input for keys.
-unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, gpu_client: u64, time_client: u64, audio_client: u64, console_client: &mut u64, console_control: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, gpu_client: u64, time_client: u64, audio_client: u64, pointer_console: u64, console_client: &mut u64, console_control: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		let (service_end, client_end): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -568,6 +587,12 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 		// The gpu driver's display channel (0 when there is no virtio-gpu device, e.g.
 		// under test - ConsoleService then falls back to the boot framebuffer).
 		if !send_blocking(manager_side, b"GPU", gpu_client) {
+			return false;
+		}
+		// The pointer-forward channel from InputService (0 when no pointer device this
+		// boot): ConsoleService reads raw pointer events off it to drive selection,
+		// scrollback, and SGR mouse reports.
+		if !send_blocking(manager_side, b"POINTER", pointer_console) {
 			return false;
 		}
 		// A read-only view of the init package so ConsoleService can spawn shells. It

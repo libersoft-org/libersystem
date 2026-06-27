@@ -105,12 +105,28 @@ pub struct Screen {
 	cursor_shape: CursorShape,
 	cursor_blink: bool,
 	bell: bool,
-	osc: [u8; 64],
+	osc: [u8; 256],
 	osc_len: usize,
 	// Pending tty mode changes requested by the program via ESC[?9001h/l (raw) and
 	// ESC[?9002h/l (echo); drained by the service into this VT's line discipline.
 	tty_raw_req: Option<bool>,
 	tty_echo_req: Option<bool>,
+	// Mouse tracking the foreground program enabled (DEC private modes): 0 off, 1 normal
+	// (?1000, button press/release), 2 button-event (?1002, + drag), 3 any-event (?1003, +
+	// motion). The console reads this to decide whether to deliver pointer events to the
+	// program as mouse reports or drive its own selection / scrollback.
+	mouse_mode: u8,
+	// Whether the program asked for SGR-encoded mouse reports (?1006: ESC[<b;x;yM/m).
+	mouse_sgr: bool,
+	// Bracketed paste (?2004): the console wraps a paste in ESC[200~ .. ESC[201~.
+	bracketed_paste: bool,
+	// A clipboard write the program requested via OSC 52 (decoded to plain text); drained
+	// by the console into the clipboard it holds.
+	clipboard_set: Option<Vec<u8>>,
+	// The current mouse selection as inclusive (anchor row, anchor col, end row, end col)
+	// in global-row coordinates (scrollback rows first, then the live screen), or None.
+	// The renderer reverses the selected cells; `selection_text` extracts their glyphs.
+	selection: Option<(usize, usize, usize, usize)>,
 	esc_state: u8,
 	csi_private: u8,
 	params: [u16; 16],
@@ -143,21 +159,28 @@ pub struct Screen {
 impl Screen {
 	pub fn new(cols: usize, rows: usize) -> Screen {
 		let blank = Cell { glyph: b' ', fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
-		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 64], osc_len: 0, tty_raw_req: None, tty_echo_req: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; SCROLLBACK_ROWS * cols], sb_wrap: alloc::vec![false; SCROLLBACK_ROWS], sb_cap: SCROLLBACK_ROWS, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new() }
+		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, tty_raw_req: None, tty_echo_req: None, mouse_mode: 0, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; SCROLLBACK_ROWS * cols], sb_wrap: alloc::vec![false; SCROLLBACK_ROWS], sb_cap: SCROLLBACK_ROWS, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new() }
 	}
 
 	// The active cell buffer: the alternate screen while it is up, else the primary.
 	fn cells(&self) -> &[Cell] {
-		if self.alt_active {
-			&self.alt
-		} else {
-			&self.primary
-		}
+		if self.alt_active { &self.alt } else { &self.primary }
 	}
 
 	// A snapshot of the live cell at (col, row): the renderer's read of the grid model.
 	pub fn cell(&self, col: usize, row: usize) -> Cell {
 		self.cells()[row * self.cols + col]
+	}
+
+	// The live cell at (col, row) with the mouse selection highlight applied (its colours
+	// reversed when it falls in the selection) - the renderer's read for the live screen
+	// (view offset 0); `view_cell` does the same for the scrollback view.
+	pub fn display_cell(&self, col: usize, row: usize) -> Cell {
+		let mut c = self.cell(col, row);
+		if self.is_selected(self.sb_len + row, col) {
+			c.reverse = !c.reverse;
+		}
+		c
 	}
 
 	// A blank cell in the current background (so erase/scroll paint the SGR bg).
@@ -248,6 +271,128 @@ impl Screen {
 		self.tty_echo_req.take()
 	}
 
+	// Whether the foreground program enabled mouse tracking (DEC ?1000/?1002/?1003), and
+	// at what granularity - the console reads these to decide whether to deliver pointer
+	// events to the program as mouse reports or drive its own selection / scrollback.
+	pub fn mouse_tracking(&self) -> bool {
+		self.mouse_mode != 0
+	}
+
+	// Whether the program asked to be told about drag motion (?1002 button-event or ?1003
+	// any-event), and whether it wants motion with no button held too (?1003).
+	pub fn mouse_report_motion(&self) -> bool {
+		self.mouse_mode >= 2
+	}
+
+	pub fn mouse_any_motion(&self) -> bool {
+		self.mouse_mode == 3
+	}
+
+	// Whether the program asked for SGR-encoded reports (?1006).
+	pub fn mouse_sgr(&self) -> bool {
+		self.mouse_sgr
+	}
+
+	// Whether bracketed paste (?2004) is on, so the console wraps a paste in ESC[200~..201~.
+	pub fn bracketed_paste(&self) -> bool {
+		self.bracketed_paste
+	}
+
+	// Drain a clipboard write the program requested via OSC 52 (decoded plain text); the
+	// console stores it in the clipboard it holds.
+	pub fn take_clipboard_set(&mut self) -> Option<Vec<u8>> {
+		self.clipboard_set.take()
+	}
+
+	// Whether a mouse selection is active (so the console copies it on release).
+	pub fn has_selection(&self) -> bool {
+		self.selection.is_some()
+	}
+
+	// Begin a mouse selection at viewport (col, row) for the current scroll offset: anchor
+	// and end both start on the global cell the viewport position maps to.
+	pub fn selection_begin(&mut self, col: usize, row: usize) {
+		let g = self.view_global_row(row);
+		let c = col.min(self.cols.saturating_sub(1));
+		self.selection = Some((g, c, g, c));
+		self.mark_all_dirty();
+	}
+
+	// Extend the active selection's end to viewport (col, row) (a drag); a no-op with no
+	// selection in progress.
+	pub fn selection_extend(&mut self, col: usize, row: usize) {
+		if let Some((ag, ac, _, _)) = self.selection {
+			let g = self.view_global_row(row);
+			let c = col.min(self.cols.saturating_sub(1));
+			self.selection = Some((ag, ac, g, c));
+			self.mark_all_dirty();
+		}
+	}
+
+	// Clear the selection highlight; a no-op (no repaint) when nothing was selected.
+	pub fn selection_clear(&mut self) {
+		if self.selection.is_some() {
+			self.selection = None;
+			self.mark_all_dirty();
+		}
+	}
+
+	// The selected text as the console copies it to the clipboard: the selected glyphs of
+	// each global row in reading order, trailing spaces trimmed per row, rows joined by a
+	// newline. Empty when nothing is selected.
+	pub fn selection_text(&self) -> Vec<u8> {
+		let (lo, hi) = match self.sel_bounds() {
+			Some(b) => b,
+			None => return Vec::new(),
+		};
+		let (lg, lc) = lo;
+		let (hg, hc) = hi;
+		let last_col = self.cols.saturating_sub(1);
+		let mut out: Vec<u8> = Vec::new();
+		let mut g = lg;
+		while g <= hg && g < self.total_logical_rows() {
+			let start_col = if g == lg { lc } else { 0 };
+			let end_col = if g == hg { hc.min(last_col) } else { last_col };
+			let mut line: Vec<u8> = Vec::new();
+			let mut c = start_col;
+			while c <= end_col {
+				line.push(self.global_glyph(c, g));
+				c += 1;
+			}
+			while line.last() == Some(&b' ') {
+				line.pop();
+			}
+			out.extend_from_slice(&line);
+			if g != hg {
+				out.push(b'\n');
+			}
+			g += 1;
+		}
+		out
+	}
+
+	// The global row (scrollback rows first, then the live screen) a viewport row maps to
+	// at the current scroll offset - mirrors `view_cell`'s mapping.
+	fn view_global_row(&self, row: usize) -> usize {
+		(self.sb_len - self.view_offset) + row
+	}
+
+	// The selection's ordered ((row, col) low, high) endpoints in reading order, or None.
+	fn sel_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+		let (ag, ac, eg, ec) = self.selection?;
+		let a = (ag, ac);
+		let e = (eg, ec);
+		Some(if a <= e { (a, e) } else { (e, a) })
+	}
+
+	// Whether the cell at column `col` of global row `g` falls within the selection.
+	fn is_selected(&self, g: usize, col: usize) -> bool {
+		match self.sel_bounds() {
+			Some((lo, hi)) => (g, col) >= lo && (g, col) <= hi,
+			None => false,
+		}
+	}
+
 	// Write a cell into the active buffer, marking it dirty only when it changes.
 	fn set_cell(&mut self, col: usize, row: usize, cell: Cell) {
 		if col >= self.cols || row >= self.rows {
@@ -323,6 +468,7 @@ impl Screen {
 		self.sb_head = 0;
 		self.sb_len = 0;
 		self.view_offset = 0;
+		self.selection = None;
 		self.cols = new_cols;
 		self.rows = new_rows;
 		self.scroll_top = 0;
@@ -354,31 +500,48 @@ impl Screen {
 
 	// The cell shown at viewport (col, row) for the current scrollback view offset: a
 	// scrollback row while the viewport reaches above the live screen, else a live cell.
+	// The mouse selection highlight is applied (reversed colours) over both.
 	pub fn view_cell(&self, col: usize, row: usize) -> Cell {
 		let g = (self.sb_len - self.view_offset) + row;
-		if g < self.sb_len {
+		let mut cell = if g < self.sb_len {
 			let ring = (self.sb_head + g) % self.sb_cap;
 			self.scrollback[ring * self.cols + col]
 		} else {
 			self.primary[(g - self.sb_len) * self.cols + col]
+		};
+		if self.is_selected(g, col) {
+			cell.reverse = !cell.reverse;
 		}
+		cell
 	}
 
 	// Page the scrollback view up (toward older lines) by one screen. A no-op on the
 	// alternate screen or with no history.
 	pub fn scroll_view_up(&mut self) {
-		if self.alt_active || self.sb_len == 0 {
-			return;
-		}
 		let page = self.rows.saturating_sub(1).max(1);
-		self.view_offset = (self.view_offset + page).min(self.sb_len);
+		self.scroll_view_up_by(page);
 	}
 
 	// Page the scrollback view down (toward the live screen) by one screen; on reaching the
 	// live screen the whole grid is marked dirty so the next flush repaints it.
 	pub fn scroll_view_down(&mut self) {
 		let page = self.rows.saturating_sub(1).max(1);
-		let new = self.view_offset.saturating_sub(page);
+		self.scroll_view_down_by(page);
+	}
+
+	// Move the scrollback view up (toward older lines) by `lines` rows - the wheel's
+	// finer-grained scroll. A no-op on the alternate screen or with no history.
+	pub fn scroll_view_up_by(&mut self, lines: usize) {
+		if self.alt_active || self.sb_len == 0 {
+			return;
+		}
+		self.view_offset = (self.view_offset + lines).min(self.sb_len);
+	}
+
+	// Move the scrollback view down (toward the live screen) by `lines` rows; on reaching
+	// the live screen the whole grid is marked dirty so the next flush repaints it.
+	pub fn scroll_view_down_by(&mut self, lines: usize) {
+		let new = self.view_offset.saturating_sub(lines);
 		if new == 0 && self.view_offset > 0 {
 			self.mark_all_dirty();
 		}
@@ -671,11 +834,7 @@ impl Screen {
 	fn param(&self, i: usize, default: usize) -> usize {
 		if i <= self.nparams {
 			let v = self.params[i] as usize;
-			if v == 0 {
-				default
-			} else {
-				v
-			}
+			if v == 0 { default } else { v }
 		} else {
 			default
 		}
@@ -898,6 +1057,11 @@ impl Screen {
 				}
 				9001 => self.tty_raw_req = Some(enable),
 				9002 => self.tty_echo_req = Some(enable),
+				1000 => self.mouse_mode = if enable { 1 } else { 0 },
+				1002 => self.mouse_mode = if enable { 2 } else { 0 },
+				1003 => self.mouse_mode = if enable { 3 } else { 0 },
+				1006 => self.mouse_sgr = enable,
+				2004 => self.bracketed_paste = enable,
 				_ => {}
 			}
 		}
@@ -942,6 +1106,10 @@ impl Screen {
 		self.view_offset = 0;
 		self.sb_head = 0;
 		self.sb_len = 0;
+		self.mouse_mode = 0;
+		self.mouse_sgr = false;
+		self.bracketed_paste = false;
+		self.selection = None;
 		self.clear();
 	}
 
@@ -1064,6 +1232,19 @@ impl Screen {
 					self.default_bg = (r, g, b);
 				}
 			}
+			Some(52) => {
+				// OSC 52 ; Pc ; Pd - set the clipboard. Pd is base64-encoded text (or "?"
+				// to query, which needs a write-back path the console owns, not this model).
+				let rest = &self.osc[rest_start..len];
+				if let Some(semi2) = rest.iter().position(|&b| b == b';') {
+					let data = &rest[semi2 + 1..];
+					if data != b"?" {
+						if let Some(text) = base64_decode(data) {
+							self.clipboard_set = Some(text);
+						}
+					}
+				}
+			}
 			_ => {}
 		}
 	}
@@ -1109,6 +1290,36 @@ fn parse_dec(s: &[u8]) -> Option<usize> {
 		v = v.checked_mul(10)?.checked_add((b - b'0') as usize)?;
 	}
 	Some(v)
+}
+
+// Decode a standard-alphabet base64 byte string (the OSC 52 clipboard payload) to its
+// bytes; `=` ends the data and any non-alphabet byte fails the decode.
+fn base64_decode(s: &[u8]) -> Option<Vec<u8>> {
+	fn sextet(b: u8) -> Option<u32> {
+		match b {
+			b'A'..=b'Z' => Some((b - b'A') as u32),
+			b'a'..=b'z' => Some((b - b'a' + 26) as u32),
+			b'0'..=b'9' => Some((b - b'0' + 52) as u32),
+			b'+' => Some(62),
+			b'/' => Some(63),
+			_ => None,
+		}
+	}
+	let mut out: Vec<u8> = Vec::new();
+	let mut acc: u32 = 0;
+	let mut bits: u32 = 0;
+	for &b in s {
+		if b == b'=' {
+			break;
+		}
+		acc = (acc << 6) | sextet(b)?;
+		bits += 6;
+		if bits >= 8 {
+			bits -= 8;
+			out.push((acc >> bits) as u8);
+		}
+	}
+	Some(out)
 }
 
 fn hex_digit(b: u8) -> Option<u8> {

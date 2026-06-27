@@ -36,6 +36,7 @@ const EV_REL: u16 = 2;
 const EV_ABS: u16 = 3;
 const AXIS_X: u16 = 0;
 const AXIS_Y: u16 = 1;
+const REL_WHEEL: u16 = 8;
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
@@ -266,9 +267,10 @@ unsafe fn pointer_loop(irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: 
 		loop {
 			wait(irq, 0);
 			let mut synced: bool = false;
+			let mut wheel: i32 = 0;
 			while let Some((id, _len)) = eventq.take_used() {
 				if id < slots {
-					if pointer_event(pool_virt + id as u64 * EVENT_SIZE, &mut state, bound_x, bound_y) {
+					if pointer_event(pool_virt + id as u64 * EVENT_SIZE, &mut state, &mut wheel, bound_x, bound_y) {
 						synced = true;
 					}
 					eventq.post_recv(id, pool_phys + id as u64 * EVENT_SIZE, EVENT_SIZE as u32);
@@ -276,13 +278,16 @@ unsafe fn pointer_loop(irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: 
 			}
 			eventq.notify();
 			interrupt_ack(irq);
-			if synced && state != sent {
+			// Send when a frame completed and either the position/buttons changed or the
+			// wheel ticked (the wheel is a momentary delta, not part of the held state).
+			if synced && (state != sent || wheel != 0) {
 				let nx: u16 = normalize(state.x, bound_x);
 				let ny: u16 = normalize(state.y, bound_y);
-				let mut msg: [u8; 5] = [0u8; 5];
+				let mut msg: [u8; 6] = [0u8; 6];
 				msg[0..2].copy_from_slice(&nx.to_le_bytes());
 				msg[2..4].copy_from_slice(&ny.to_le_bytes());
 				msg[4] = state.buttons;
+				msg[5] = wheel.clamp(-127, 127) as i8 as u8;
 				if !send_blocking(sink, &msg, 0) {
 					// InputService dropped its end: there is no consumer, so retire.
 					exit();
@@ -294,10 +299,11 @@ unsafe fn pointer_loop(irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: 
 }
 
 // Fold one virtio_input_event into the pointer state: an EV_ABS sets an axis, an
-// EV_REL nudges it (clamped to the axis range), an EV_KEY toggles a button bit.
+// EV_REL nudges it (clamped to the axis range), an EV_KEY toggles a button bit, and an
+// EV_REL wheel tick accumulates into `wheel` (a momentary delta, reset after each send).
 // Returns true on EV_SYN - the end of an event group, the point at which the
 // accumulated state is a complete frame ready to send.
-unsafe fn pointer_event(addr: u64, state: &mut Pointer, max_x: i32, max_y: i32) -> bool {
+unsafe fn pointer_event(addr: u64, state: &mut Pointer, wheel: &mut i32, max_x: i32, max_y: i32) -> bool {
 	unsafe {
 		let kind: u16 = (addr as *const u16).read_volatile();
 		let code: u16 = ((addr + 2) as *const u16).read_volatile();
@@ -316,6 +322,8 @@ unsafe fn pointer_event(addr: u64, state: &mut Pointer, max_x: i32, max_y: i32) 
 					state.x = (state.x + value).clamp(0, max_x);
 				} else if code == AXIS_Y {
 					state.y = (state.y + value).clamp(0, max_y);
+				} else if code == REL_WHEEL {
+					*wheel += value;
 				}
 			}
 			EV_KEY => {
@@ -455,7 +463,11 @@ fn layout(code: u16, mods: &Mods) -> u8 {
 	}
 	// Letters flip with Shift XOR Caps Lock; symbols only with Shift.
 	let shifted: bool = if base.is_ascii_lowercase() { mods.shift ^ mods.caps } else { mods.shift };
-	if shifted { KEYMAP_SHIFT[code as usize] } else { base }
+	if shifted {
+		KEYMAP_SHIFT[code as usize]
+	} else {
+		base
+	}
 }
 
 // The ANSI escape sequence a navigation keycode maps to, or None for an ordinary key.

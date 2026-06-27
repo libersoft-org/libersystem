@@ -1,7 +1,6 @@
 - Boot log - [ OK ] [FAIL] [INFO] [WARN]
 - What is the difference between SYS_CLOCK_GET, SYS_CLOCK_RTC and SYS_CLOCK_MONO_NS? Also clock(), clock_rtc() and clock_ns()?
-- ping ABI like version with multiple representations - classic CLI (alredy have it), JSON, etc.
-- "exit" command should not halt the machine, but just exits the shell and shows up the parent shell (shell that started this console). If there is no parent, then, then just reload the whole shell
+- "exit" command should not halt the machine, but just exits the shell and shows up the parent shell (shell that started this console). If there is no parent, just reload the whole shell
 - just run spice -> run spice - it doesnt show boot log, only >
 - Virtio drivers - MSI-X only? Remove the old IRQ?
 - List the available volumes "ls" - change to "lsvol"?

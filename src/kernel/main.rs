@@ -1910,8 +1910,9 @@ fn input_service_streams_pointer_events() {
 	use object::rights::Rights;
 
 	// Drive the real userspace InputService end to end over its generated Input
-	// bindings: spawn it from the init package, hand it a SERVE channel and an INPUT
-	// raw channel (the one the virtio_input pointer driver would feed), inject a
+	// bindings: spawn it from the init package, hand it a SERVE channel, an INPUT
+	// raw channel (the one the virtio_input pointer driver would feed), and a FORWARD
+	// channel (ConsoleService's pointer sink, which it mirrors raw events to), inject a
 	// couple of normalized [x u16][y u16][buttons u8] pointer events the way the
 	// driver does, then SUBSCRIBE and read the mapped text-cell events back off the
 	// stream. The pointer device is interactive-only, so here the test plays the
@@ -1922,9 +1923,14 @@ fn input_service_streams_pointer_events() {
 	let (boot_kernel, boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
 	let (raw_producer, raw_consumer) = Channel::create();
+	// ConsoleService's pointer sink: the test keeps the consumer end alive so the forward
+	// channel stays open (InputService mirrors each raw event to it), but does not assert
+	// on it here - the forwarding path is exercised by the live console.
+	let (_forward_drain, forward_input) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn InputService");
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 	send_cap(&boot_kernel, b"INPUT", raw_consumer, Rights::ALL).expect("input raw bootstrap");
+	send_cap(&boot_kernel, b"FORWARD", forward_input, Rights::ALL).expect("forward raw bootstrap");
 
 	// Inject two normalized pointer events as the driver would. The grid is COLS = 80
 	// x ROWS = 50 over the 0..0x10000 normalized span, so col = (x * 80) / 0x10000 and
@@ -2142,7 +2148,7 @@ fn pty_hosts_a_program() {
 
 	// ConsoleService's bootstrap channel and the channels its __user_main expects: VT 1's
 	// data (CLIENT) + control (CONTROL), a factory per service (FSTORAGE..FNET, unused here
-	// since the ptyecho slave needs no services), then GPU (none) and PACKAGE.
+	// since the ptyecho slave needs no services), then GPU (none), POINTER (none) and PACKAGE.
 	let (boot_kernel, boot_user) = Channel::create();
 	let (vt1_console_a, _vt1_console_b) = Channel::create();
 	let (ctl_console, ctl_shell) = Channel::create();
@@ -2156,6 +2162,7 @@ fn pty_hosts_a_program() {
 		send_cap(&boot_kernel, tag, dummy_a.clone(), Rights::ALL).expect("factory bootstrap");
 	}
 	boot_kernel.send(Message::new(b"GPU".to_vec(), alloc::vec::Vec::new(), 0)).expect("GPU bootstrap");
+	boot_kernel.send(Message::new(b"POINTER".to_vec(), alloc::vec::Vec::new(), 0)).expect("POINTER bootstrap");
 	let pkg_obj = object::memory_object::MemoryObject::create(init.len()).expect("memory for the package");
 	copy_into_object(&pkg_obj, init);
 	let mut pkg_msg = alloc::vec::Vec::new();

@@ -1,13 +1,15 @@
 // InputService - the userspace pointer-input service.
 //
 // ServiceManager starts this program from the init package and hands it a bootstrap
-// channel, then over it a "SERVE" channel (the one clients reach it on) and an
-// "INPUT" channel (the raw pointer-event stream the virtio_input pointer driver
-// feeds it; its handle is 0 when no pointer device is present this boot). The driver
-// sends normalized [x u16][y u16][buttons u8] events; InputService maps each to the
-// text-cell grid and keeps a bounded ring of the recent ones. Over the serve channel
-// clients speak the generated `liber:system` Input bindings: `subscribe` hands back a
-// wait-drained event stream of that snapshot (the M30 bounded-snapshot form).
+// channel, then over it a "SERVE" channel (the one clients reach it on), an "INPUT"
+// channel (the raw pointer-event stream the virtio_input pointer driver feeds it; its
+// handle is 0 when no pointer device is present this boot), and a "FORWARD" channel
+// (ConsoleService's pointer sink, which drives selection / scrollback / mouse reports).
+// The driver sends normalized [x u16][y u16][buttons u8][wheel i8] events; InputService
+// maps each to the text-cell grid and keeps a bounded ring of the recent ones for the
+// typed `subscribe` API, and forwards the raw bytes to ConsoleService verbatim. Over the
+// serve channel clients speak the generated `liber:system` Input bindings: `subscribe`
+// hands back a wait-drained event stream of that snapshot (the M30 bounded-snapshot form).
 //
 // When the supervisor that started it drops the bootstrap channel (no clients this
 // boot), the service exits.
@@ -18,8 +20,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::PointerEvent;
 use proto::system::input;
+use proto::system::PointerEvent;
 use rt::*;
 
 // The default text-cell grid the normalized pointer position maps onto: the boot
@@ -32,7 +34,9 @@ const ROWS: u32 = 50;
 const NORM_SPAN: u32 = 0x1_0000;
 // The bounded ring of recent mapped pointer events a `subscribe` snapshot returns.
 const RING_CAP: usize = 32;
-// A raw pointer event from the driver: [x u16 LE][y u16 LE][buttons u8].
+// A raw pointer event from the driver: [x u16 LE][y u16 LE][buttons u8][wheel i8]. The
+// first five bytes are the minimum to map a cell position; the wheel byte is forwarded
+// to ConsoleService but not part of the typed snapshot.
 const RAW_LEN: usize = 5;
 
 // The recent pointer events, mapped to the text-cell grid - the bounded source a
@@ -88,6 +92,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Received::Message { len, handle } if len >= 5 && &buf[..5] == b"INPUT" => handle,
 		_ => exit(),
 	};
+	// ConsoleService's pointer sink: we forward every raw event to it so it can drive
+	// selection, scrollback, and mouse reports (handle 0 = no console this boot).
+	let forward: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if len >= 7 && &buf[..7] == b"FORWARD" => handle,
+		_ => 0,
+	};
 
 	// 2. report in to the supervisor that started us.
 	unsafe {
@@ -97,7 +107,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 3. serve until the client side closes.
 	let mut state: Input = Input::new();
 	unsafe {
-		serve(service, raw, &mut state);
+		serve(service, raw, forward, &mut state);
 	}
 	exit();
 }
@@ -107,7 +117,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // one client request. Returns when the client side closes (no more clients). Once
 // the raw channel closes (the pointer driver retired), it is dropped from the wait
 // set so a peer-closed channel cannot spin the loop.
-unsafe fn serve(service: u64, raw: u64, state: &mut Input) {
+unsafe fn serve(service: u64, raw: u64, forward: u64, state: &mut Input) {
 	unsafe {
 		let mut req: [u8; 64] = [0u8; 64];
 		let mut raw_open: bool = raw != 0;
@@ -118,13 +128,17 @@ unsafe fn serve(service: u64, raw: u64, state: &mut Input) {
 			} else {
 				wait(service, 0);
 			}
-			// drain every pending raw pointer event and fold it into the ring.
+			// drain every pending raw pointer event: fold it into the ring for the typed
+			// snapshot, and forward the raw bytes to ConsoleService for selection / reports.
 			if raw_open {
 				loop {
 					match try_recv(raw, &mut req) {
 						Polled::Message { len, .. } => {
 							if let Some(event) = map_event(&req[..len]) {
 								state.record(event);
+							}
+							if forward != 0 {
+								send_blocking(forward, &req[..len], 0);
 							}
 						}
 						Polled::Empty => break,

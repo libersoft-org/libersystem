@@ -314,7 +314,7 @@ impl FramebufferRenderer {
 
 	// Paint one cell from the grid to the framebuffer.
 	fn draw_cell(&self, screen: &Screen, col: usize, row: usize) {
-		self.draw_cell_at(screen, col, row, screen.cell(col, row));
+		self.draw_cell_at(screen, col, row, screen.display_cell(col, row));
 	}
 
 	// Paint a given cell value at (col, row) - used by the live flush (reading the grid)
