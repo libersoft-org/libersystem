@@ -526,6 +526,11 @@ impl Cg {
 		self.line("\t\tself.to_text_into(&mut s);");
 		self.line("\t\ts");
 		self.line("\t}");
+		self.line("\tpub fn to_cbor(&self) -> Vec<u8> {");
+		self.line("\t\tlet mut v = Vec::new();");
+		self.line("\t\tself.to_cbor_into(&mut v);");
+		self.line("\t\tv");
+		self.line("\t}");
 	}
 
 	fn render_record(&mut self, r: &Record) -> Result<(), Error> {
@@ -556,6 +561,14 @@ impl Cg {
 		}
 		self.line("\t\tout.push('}');");
 		self.line("\t}");
+		self.line("\tpub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {");
+		self.line(&format!("\t\tcrate::codec::cbor::map(out, {});", r.fields.len()));
+		for f in &r.fields {
+			self.line(&format!("\t\tcrate::codec::cbor::text(out, \"{}\");", f.name));
+			let code = self.cbor_value(&f.ty, &format!("self.{}", field_ident(&f.name)), false).map_err(|m| Error::new(f.span, m))?;
+			self.line(&format!("\t\t{code}"));
+		}
+		self.line("\t}");
 		self.line("}");
 		self.line("");
 		Ok(())
@@ -576,6 +589,13 @@ impl Cg {
 		self.line("\t\tmatch self {");
 		for c in &e.cases {
 			self.line(&format!("\t\t\t{ty}::{} => out.push_str(\"{}\"),", camel(&c.name), c.name));
+		}
+		self.line("\t\t}");
+		self.line("\t}");
+		self.line("\tpub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {");
+		self.line("\t\tmatch self {");
+		for c in &e.cases {
+			self.line(&format!("\t\t\t{ty}::{} => crate::codec::cbor::text(out, \"{}\"),", camel(&c.name), c.name));
 		}
 		self.line("\t\t}");
 		self.line("\t}");
@@ -615,6 +635,20 @@ impl Cg {
 		}
 		self.line("\t\t}");
 		self.line("\t}");
+		self.line("\tpub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {");
+		self.line("\t\tmatch self {");
+		for c in &v.cases {
+			match &c.payload {
+				Some(p) => {
+					let b = self.fresh();
+					let body = self.cbor_value(p, &b, true).map_err(|m| Error::new(c.span, m))?;
+					self.line(&format!("\t\t\t{ty}::{}({b}) => {{ crate::codec::cbor::map(out, 1); crate::codec::cbor::text(out, \"{}\"); {body} }}", camel(&c.name), c.name));
+				}
+				None => self.line(&format!("\t\t\t{ty}::{} => crate::codec::cbor::text(out, \"{}\"),", camel(&c.name), c.name)),
+			}
+		}
+		self.line("\t\t}");
+		self.line("\t}");
 		self.line("}");
 		self.line("");
 		Ok(())
@@ -638,6 +672,16 @@ impl Cg {
 			self.line(&format!("\t\tif self.0 & Self::{} != 0 {{ if any {{ out.push('|'); }} any = true; out.push_str(\"{}\"); }}", screaming(name), name));
 		}
 		self.line("\t\tif !any { out.push('-'); }");
+		self.line("\t}");
+		self.line("\tpub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {");
+		self.line("\t\tlet mut count = 0usize;");
+		for name in &f.flags {
+			self.line(&format!("\t\tif self.0 & Self::{} != 0 {{ count += 1; }}", screaming(name)));
+		}
+		self.line("\t\tcrate::codec::cbor::array(out, count);");
+		for name in &f.flags {
+			self.line(&format!("\t\tif self.0 & Self::{} != 0 {{ crate::codec::cbor::text(out, \"{}\"); }}", screaming(name), name));
+		}
 		self.line("\t}");
 		self.line("}");
 		self.line("");
@@ -735,6 +779,53 @@ impl Cg {
 		})
 	}
 
+	// Emit a statement appending the CBOR encoding of the value at `place` (`&ty`
+	// when `is_ref`, else `ty`) to the in-scope `out: &mut Vec<u8>`. The CBOR shape
+	// mirrors the JSON one: records are maps, enum cases are text, results are
+	// single-pair maps, options collapse to `null`, lists/tuples are arrays.
+	fn cbor_value(&mut self, ty: &Type, place: &str, is_ref: bool) -> Result<String, String> {
+		let refplace = if is_ref { place.to_string() } else { format!("&{place}") };
+		let valexpr = if is_ref { format!("*{place}") } else { place.to_string() };
+		Ok(match ty {
+			Type::Bool => format!("crate::codec::cbor::boolean(out, {valexpr});"),
+			Type::U8 | Type::U16 | Type::U32 | Type::U64 => format!("crate::codec::cbor::uint(out, {valexpr} as u64);"),
+			Type::I8 | Type::I16 | Type::I32 | Type::I64 => format!("crate::codec::cbor::int(out, {valexpr} as i64);"),
+			Type::F32 => format!("crate::codec::cbor::f32(out, {valexpr});"),
+			Type::F64 => format!("crate::codec::cbor::f64(out, {valexpr});"),
+			Type::String => format!("crate::codec::cbor::text(out, {refplace});"),
+			Type::Unit => "crate::codec::cbor::null(out);".to_string(),
+			Type::Named(_) => format!("{place}.to_cbor_into(out);"),
+			Type::Option(inner) => {
+				let v = self.fresh();
+				let body = self.cbor_value(inner, &v, true)?;
+				format!("match {refplace} {{ Some({v}) => {{ {body} }} None => {{ crate::codec::cbor::null(out); }} }}")
+			}
+			Type::List(inner) => {
+				let v = self.fresh();
+				let body = self.cbor_value(inner, &v, true)?;
+				format!("crate::codec::cbor::array(out, {place}.len()); for {v} in {place}.iter() {{ {body} }}")
+			}
+			Type::Tuple(elems) => {
+				let binds: Vec<String> = (0..elems.len()).map(|_| self.fresh()).collect();
+				let mut body = String::new();
+				for (e, b) in elems.iter().zip(&binds) {
+					let _ = write!(body, "{} ", self.cbor_value(e, b, true)?);
+				}
+				format!("crate::codec::cbor::array(out, {}); let ({}) = {refplace}; {body}", elems.len(), binds.join(", "))
+			}
+			Type::Result(okty, errty) => {
+				let vo = self.fresh();
+				let ve = self.fresh();
+				let okb = self.cbor_value(okty, &vo, true)?;
+				let errb = self.cbor_value(errty, &ve, true)?;
+				format!("match {refplace} {{ Ok({vo}) => {{ crate::codec::cbor::map(out, 1); crate::codec::cbor::text(out, \"ok\"); {okb} }} Err({ve}) => {{ crate::codec::cbor::map(out, 1); crate::codec::cbor::text(out, \"err\"); {errb} }} }}")
+			}
+			Type::Handle(_) => format!("crate::codec::cbor::uint(out, {valexpr} as u64);"),
+			Type::Buffer => format!("crate::codec::cbor::uint(out, {place}.len);"),
+			Type::Stream(_) => return Err("stream is not renderable".into()),
+		})
+	}
+
 	// Emit a `#[cfg(test)] mod compat` pinning each type's wire bytes: a
 	// deterministic sample, its golden encoding, and a round-trip check. The golden
 	// bytes are computed here (host) and the test checks the generated codec agrees,
@@ -789,7 +880,11 @@ fn camel(name: &str) -> String {
 // as a raw identifier if it collides with a keyword.
 fn field_ident(name: &str) -> String {
 	let s = name.replace('-', "_");
-	if is_rust_keyword(&s) { format!("r#{s}") } else { s }
+	if is_rust_keyword(&s) {
+		format!("r#{s}")
+	} else {
+		s
+	}
 }
 
 // Map a kebab-case name to a SCREAMING_SNAKE_CASE constant identifier.

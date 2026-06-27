@@ -17,7 +17,7 @@ use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::address_space::AddressSpace;
 use super::domain::Domain;
@@ -59,6 +59,11 @@ pub struct Process {
 	// Set when a caught SIG_INT has been delivered and not yet consumed; the process
 	// polls and clears it with SYS_SIGNAL_TAKE.
 	int_pending: AtomicBool,
+	// Per-process IPC volume counters: the number of channel messages this process has
+	// sent and received. Bumped on each successful channel send / recv, so a userspace
+	// SystemGraphService can read a component's traffic over SYS_PROCESS_STATS_GET.
+	messages_sent: AtomicU64,
+	messages_received: AtomicU64,
 }
 
 impl Process {
@@ -68,7 +73,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0) });
 		// Register with the Domain so a Domain kill can reach and terminate it.
 		process.domain.register_process(&process);
 		process
@@ -163,6 +168,37 @@ impl Process {
 	// Poll and clear the pending caught SIG_INT, returning whether one was pending.
 	pub fn take_int_pending(&self) -> bool {
 		self.int_pending.swap(false, Ordering::AcqRel)
+	}
+
+	// Count a channel message this process has sent (one successful send).
+	pub fn record_send(&self) {
+		self.messages_sent.fetch_add(1, Ordering::Relaxed);
+	}
+
+	// Count a channel message this process has received (one successful recv).
+	pub fn record_recv(&self) {
+		self.messages_received.fetch_add(1, Ordering::Relaxed);
+	}
+
+	// The number of channel messages this process has sent.
+	pub fn messages_sent(&self) -> u64 {
+		self.messages_sent.load(Ordering::Relaxed)
+	}
+
+	// The number of channel messages this process has received.
+	pub fn messages_received(&self) -> u64 {
+		self.messages_received.load(Ordering::Relaxed)
+	}
+
+	// The number of bytes of user memory this process has mapped (the leaf frames
+	// backing its image and stack).
+	pub fn memory_bytes(&self) -> u64 {
+		self.user_frames.lock().len() as u64 * crate::mem::frame::PAGE_SIZE
+	}
+
+	// The number of handles this process's table currently holds.
+	pub fn handle_count(&self) -> u64 {
+		self.handles.lock().len() as u64
 	}
 
 	// Terminate this process: mark it killed and close all its handles, refunding

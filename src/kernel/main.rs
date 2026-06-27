@@ -2115,14 +2115,15 @@ fn init_package_starts_system_manager() {
 	// first, then DeviceService, ProcessService, and ConfigService (they depend only
 	// on LogService, so they come up right after), then DeviceManager, StorageService
 	// (handed the disk block channel DeviceManager routes up), NetworkService (handed
-	// the net driver's frame channel the same way), and finally the shell (which
-	// proves the StorageService round-trip by reading a file with `cat` before it
-	// reports in). Every report is relayed up, so the kernel observes the services
-	// come up in dependency order, then DeviceManager stopped (ServiceManager
-	// exercises the stop path on that service), followed by the two managers.
+	// the net driver's frame channel the same way), and finally - after every
+	// component it observes - SystemGraphService, then the shell (which proves the
+	// StorageService round-trip by reading a file with `cat` before it reports in).
+	// Every report is relayed up, so the kernel observes the services come up in
+	// dependency order, then DeviceManager stopped (ServiceManager exercises the stop
+	// path on that service), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 15] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"DeviceManager: online", b"StorageService: online", b"NetworkService: online", b"TimeService: online", b"AudioService: online", b"InputService: online", b"ConsoleService: online", b"Shell: online", b"DeviceManager: stopped", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 16] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"DeviceManager: online", b"StorageService: online", b"NetworkService: online", b"TimeService: online", b"AudioService: online", b"InputService: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");
@@ -2379,6 +2380,40 @@ fn system_graph_reflects_live_state() {
 	drop(process);
 	let after = graph::collect_from(&domain);
 	assert_eq!(after.processes.len(), 0, "the process is gone after it drops");
+}
+
+#[cfg(test)]
+#[test_case]
+fn process_counters_track_ipc_and_resources() {
+	use object::address_space::AddressSpace;
+	use object::domain::Domain;
+	use object::process::Process;
+	use object::rights::Rights;
+	// The per-process observability counters SYS_PROCESS_STATS_GET reads back: a fresh
+	// process has done no IPC and holds nothing, recording sends and receives bumps the
+	// IPC volume independently, installing handles grows the handle count, and a kill is
+	// observable as the FAILED liveness the stats syscall derives.
+	let domain = Domain::new(1 << 20, 16, 8);
+	let process = Process::new(AddressSpace::kernel(), domain.clone());
+	assert_eq!(process.messages_sent(), 0);
+	assert_eq!(process.messages_received(), 0);
+	assert_eq!(process.handle_count(), 0);
+	assert_eq!(process.memory_bytes(), 0, "a kernel process owns no user frames");
+
+	process.record_send();
+	process.record_send();
+	process.record_recv();
+	assert_eq!(process.messages_sent(), 2, "two sends counted");
+	assert_eq!(process.messages_received(), 1, "one recv counted");
+
+	process.install(object::event::Event::create(), Rights::ALL, 0);
+	process.install(object::event::Event::create(), Rights::ALL, 0);
+	assert_eq!(process.handle_count(), 2, "two installed handles");
+
+	// Liveness the stats syscall reports: not killed here, killed after terminate().
+	assert!(!process.is_killed(), "a live process is not failed");
+	process.terminate();
+	assert!(process.is_killed(), "a terminated process reports as failed");
 }
 
 #[cfg(test)]

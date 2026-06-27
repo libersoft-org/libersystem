@@ -99,6 +99,11 @@ pub const SYS_SIGNAL_CATCH: u64 = 50;
 // Poll-and-clear a pending caught signal on the calling process: returns 1 if the
 // signal (SIG_INT) was delivered since the last take (clearing it), else 0.
 pub const SYS_SIGNAL_TAKE: u64 = 51;
+// Read live per-process counters and state into the caller's buffer (a ProcessStats),
+// for a Process handle that carries RIGHT_READ. Surfaces the kernel's per-process IPC
+// volume, handle and memory usage, and liveness so a userspace SystemGraphService can
+// build the live observability graph without each component having to self-report.
+pub const SYS_PROCESS_STATS_GET: u64 = 52;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;
@@ -193,6 +198,28 @@ pub struct ObjectInfo {
 	pub rights: u32,
 	pub generation: u32,
 }
+
+// The live per-process view process_stats_get returns for a Process handle: the IPC
+// volume the process has done (channel messages sent and received), how many handles
+// its table currently holds, how many bytes of user memory it has mapped, and its
+// liveness state (PROC_STATE_RUNNING / PROC_STATE_STOPPED / PROC_STATE_FAILED). The
+// kernel derives state from the live process - threads still running, a clean exit,
+// or a fault/kill - so a SystemGraphService sees crash and stop transitions at the
+// next snapshot without the component reporting them. repr(C) so it marshals cleanly.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ProcessStats {
+	pub messages_sent: u64,
+	pub messages_received: u64,
+	pub handle_count: u64,
+	pub memory_bytes: u64,
+	pub state: u64,
+}
+
+// Liveness states reported in ProcessStats::state.
+pub const PROC_STATE_RUNNING: u64 = 0;
+pub const PROC_STATE_STOPPED: u64 = 1;
+pub const PROC_STATE_FAILED: u64 = 2;
 
 // Error codes (Linux-style: a successful call returns its value, an error returns
 // a small negative in the reserved band [-4095, -1]).

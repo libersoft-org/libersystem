@@ -53,6 +53,10 @@ name = "input_service"
 path = "src/input_service.rs"
 
 [[bin]]
+name = "system_graph_service"
+path = "src/system_graph_service.rs"
+
+[[bin]]
 name = "wasi_host"
 path = "src/wasi_host.rs"
 

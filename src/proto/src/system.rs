@@ -2624,6 +2624,341 @@ pub mod input {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ComponentKind {
+	Service = 0,
+	Driver = 1,
+	Device = 2,
+}
+
+impl ComponentKind {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ComponentKind> {
+		ComponentKind::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<ComponentKind> {
+		match r.u8()? {
+			0 => Some(ComponentKind::Service),
+			1 => Some(ComponentKind::Driver),
+			2 => Some(ComponentKind::Device),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ComponentState {
+	Running = 0,
+	Stopped = 1,
+	Failed = 2,
+	Restarting = 3,
+	Pending = 4,
+}
+
+impl ComponentState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ComponentState> {
+		ComponentState::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<ComponentState> {
+		match r.u8()? {
+			0 => Some(ComponentState::Running),
+			1 => Some(ComponentState::Stopped),
+			2 => Some(ComponentState::Failed),
+			3 => Some(ComponentState::Restarting),
+			4 => Some(ComponentState::Pending),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Counters {
+	pub messages_sent: u64,
+	pub messages_received: u64,
+	pub handles: u64,
+	pub memory_bytes: u64,
+	pub restarts: u32,
+}
+
+impl Counters {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Counters> {
+		Counters::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u64(self.messages_sent)?;
+		w.u64(self.messages_received)?;
+		w.u64(self.handles)?;
+		w.u64(self.memory_bytes)?;
+		w.u32(self.restarts)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<Counters> {
+		let messages_sent = r.u64()?;
+		let messages_received = r.u64()?;
+		let handles = r.u64()?;
+		let memory_bytes = r.u64()?;
+		let restarts = r.u32()?;
+		Some(Counters { messages_sent, messages_received, handles, memory_bytes, restarts })
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Component {
+	pub name: String,
+	pub kind: ComponentKind,
+	pub state: ComponentState,
+	pub deps: Vec<String>,
+	pub counters: Counters,
+}
+
+impl Component {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Component> {
+		Component::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.name.as_bytes())?;
+		self.kind.write(w)?;
+		self.state.write(w)?;
+		if self.deps.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.deps.len() as u16)?;
+		for v94 in self.deps.iter() {
+			w.bytes_lp(v94.as_bytes())?;
+		}
+		self.counters.write(w)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<Component> {
+		let name = r.string_lp()?;
+		let kind = ComponentKind::read(r)?;
+		let state = ComponentState::read(r)?;
+		let deps = {
+			let v95 = r.u16()? as usize;
+			let mut v96 = Vec::new();
+			for _ in 0..v95 {
+				v96.push(r.string_lp()?);
+			}
+			v96
+		};
+		let counters = Counters::read(r)?;
+		Some(Component { name, kind, state, deps, counters })
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TraceSpan {
+	pub name: String,
+	pub duration_ns: u64,
+}
+
+impl TraceSpan {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<TraceSpan> {
+		TraceSpan::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.name.as_bytes())?;
+		w.u64(self.duration_ns)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<TraceSpan> {
+		let name = r.string_lp()?;
+		let duration_ns = r.u64()?;
+		Some(TraceSpan { name, duration_ns })
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Graph {
+	pub components: Vec<Component>,
+	pub spans: Vec<TraceSpan>,
+}
+
+impl Graph {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Graph> {
+		Graph::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		if self.components.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.components.len() as u16)?;
+		for v97 in self.components.iter() {
+			v97.write(w)?;
+		}
+		if self.spans.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.spans.len() as u16)?;
+		for v98 in self.spans.iter() {
+			v98.write(w)?;
+		}
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<Graph> {
+		let components = {
+			let v99 = r.u16()? as usize;
+			let mut v100 = Vec::new();
+			for _ in 0..v99 {
+				v100.push(Component::read(r)?);
+			}
+			v100
+		};
+		let spans = {
+			let v101 = r.u16()? as usize;
+			let mut v102 = Vec::new();
+			for _ in 0..v101 {
+				v102.push(TraceSpan::read(r)?);
+			}
+			v102
+		};
+		Some(Graph { components, spans })
+	}
+}
+
+// interface `system-graph` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod system_graph {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_SNAPSHOT: u16 = 1;
+
+	pub trait Service {
+		fn snapshot(&mut self) -> Result<Graph, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = Reader::with_handle(request, request_handle);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		match op {
+			OP_SNAPSHOT => {
+				let result = service.snapshot();
+				match &result {
+					Ok(v103) => {
+						w.u8(1)?;
+						v103.write(w)?;
+					}
+					Err(v104) => {
+						w.u8(0)?;
+						v104.write(w)?;
+					}
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn snapshot(&mut self) -> Option<Result<Graph, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SNAPSHOT)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(Graph::read(r)?) } else { Err(Error::read(r)?) })
+		}
+	}
+}
+
 impl Error {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -2634,6 +2969,11 @@ impl Error {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		match self {
@@ -2653,6 +2993,15 @@ impl Error {
 			Error::Closed => out.push_str("closed"),
 		}
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			Error::Denied => crate::codec::cbor::text(out, "denied"),
+			Error::NotFound => crate::codec::cbor::text(out, "not-found"),
+			Error::Invalid => crate::codec::cbor::text(out, "invalid"),
+			Error::Again => crate::codec::cbor::text(out, "again"),
+			Error::Closed => crate::codec::cbor::text(out, "closed"),
+		}
+	}
 }
 
 impl Severity {
@@ -2665,6 +3014,11 @@ impl Severity {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		match self {
@@ -2686,6 +3040,16 @@ impl Severity {
 			Severity::Fatal => out.push_str("fatal"),
 		}
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			Severity::Trace => crate::codec::cbor::text(out, "trace"),
+			Severity::Debug => crate::codec::cbor::text(out, "debug"),
+			Severity::Info => crate::codec::cbor::text(out, "info"),
+			Severity::Warn => crate::codec::cbor::text(out, "warn"),
+			Severity::Error => crate::codec::cbor::text(out, "error"),
+			Severity::Fatal => crate::codec::cbor::text(out, "fatal"),
+		}
+	}
 }
 
 impl Field {
@@ -2698,6 +3062,11 @@ impl Field {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -2717,6 +3086,13 @@ impl Field {
 		out.push_str(&self.value);
 		out.push('}');
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "key");
+		crate::codec::cbor::text(out, &self.key);
+		crate::codec::cbor::text(out, "value");
+		crate::codec::cbor::text(out, &self.value);
+	}
 }
 
 impl Entry {
@@ -2729,6 +3105,11 @@ impl Entry {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -2743,13 +3124,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v95 = true;
-		for v94 in self.fields.iter() {
-			if !v95 {
+		let mut v106 = true;
+		for v105 in self.fields.iter() {
+			if !v106 {
 				out.push(',');
 			}
-			v95 = false;
-			v94.to_json_into(out);
+			v106 = false;
+			v105.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2767,16 +3148,30 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v97 = true;
-		for v96 in self.fields.iter() {
-			if !v97 {
+		let mut v108 = true;
+		for v107 in self.fields.iter() {
+			if !v108 {
 				out.push_str(", ");
 			}
-			v97 = false;
-			v96.to_text_into(out);
+			v108 = false;
+			v107.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "timestamp");
+		crate::codec::cbor::uint(out, self.timestamp as u64);
+		crate::codec::cbor::text(out, "severity");
+		self.severity.to_cbor_into(out);
+		crate::codec::cbor::text(out, "source");
+		crate::codec::cbor::text(out, &self.source);
+		crate::codec::cbor::text(out, "fields");
+		crate::codec::cbor::array(out, self.fields.len());
+		for v109 in self.fields.iter() {
+			v109.to_cbor_into(out);
+		}
 	}
 }
 
@@ -2791,12 +3186,17 @@ impl Query {
 		self.to_text_into(&mut s);
 		s
 	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v98) => {
-				let _ = write!(out, "{}", v98);
+			Some(v110) => {
+				let _ = write!(out, "{}", v110);
 			}
 			None => {
 				out.push_str("null");
@@ -2805,8 +3205,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v99) => {
-				v99.to_json_into(out);
+			Some(v111) => {
+				v111.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -2815,8 +3215,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v100) => {
-				crate::codec::json_escape(v100, out);
+			Some(v112) => {
+				crate::codec::json_escape(v112, out);
 			}
 			None => {
 				out.push_str("null");
@@ -2831,8 +3231,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v101) => {
-				let _ = write!(out, "{}", v101);
+			Some(v113) => {
+				let _ = write!(out, "{}", v113);
 			}
 			None => {
 				out.push('-');
@@ -2841,8 +3241,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v102) => {
-				v102.to_text_into(out);
+			Some(v114) => {
+				v114.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -2851,8 +3251,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v103) => {
-				out.push_str(v103);
+			Some(v115) => {
+				out.push_str(v115);
 			}
 			None => {
 				out.push('-');
@@ -2862,6 +3262,38 @@ impl Query {
 		out.push_str("limit=");
 		let _ = write!(out, "{}", self.limit);
 		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "since");
+		match &self.since {
+			Some(v116) => {
+				crate::codec::cbor::uint(out, *v116 as u64);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "min-severity");
+		match &self.min_severity {
+			Some(v117) => {
+				v117.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "source");
+		match &self.source {
+			Some(v118) => {
+				crate::codec::cbor::text(out, v118);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "limit");
+		crate::codec::cbor::uint(out, self.limit as u64);
 	}
 }
 
@@ -2875,6 +3307,11 @@ impl OpenOpts {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -2916,6 +3353,15 @@ impl OpenOpts {
 		}
 		out.push('}');
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "path");
+		crate::codec::cbor::text(out, &self.path);
+		crate::codec::cbor::text(out, "write");
+		crate::codec::cbor::boolean(out, self.write);
+		crate::codec::cbor::text(out, "create");
+		crate::codec::cbor::boolean(out, self.create);
+	}
 }
 
 impl OpenResult {
@@ -2928,6 +3374,11 @@ impl OpenResult {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -2947,6 +3398,13 @@ impl OpenResult {
 		let _ = write!(out, "{}", self.size);
 		out.push('}');
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "file");
+		crate::codec::cbor::uint(out, self.file as u64);
+		crate::codec::cbor::text(out, "size");
+		crate::codec::cbor::uint(out, self.size as u64);
+	}
 }
 
 impl FileInfo {
@@ -2959,6 +3417,11 @@ impl FileInfo {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -2978,6 +3441,13 @@ impl FileInfo {
 		let _ = write!(out, "{}", self.size);
 		out.push('}');
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "size");
+		crate::codec::cbor::uint(out, self.size as u64);
+	}
 }
 
 impl DeviceKind {
@@ -2990,6 +3460,11 @@ impl DeviceKind {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		match self {
@@ -3007,6 +3482,14 @@ impl DeviceKind {
 			DeviceKind::Console => out.push_str("console"),
 		}
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			DeviceKind::Unknown => crate::codec::cbor::text(out, "unknown"),
+			DeviceKind::Net => crate::codec::cbor::text(out, "net"),
+			DeviceKind::Block => crate::codec::cbor::text(out, "block"),
+			DeviceKind::Console => crate::codec::cbor::text(out, "console"),
+		}
+	}
 }
 
 impl DeviceEntry {
@@ -3019,6 +3502,11 @@ impl DeviceEntry {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -3044,6 +3532,15 @@ impl DeviceEntry {
 		let _ = write!(out, "{}", self.mmio_len);
 		out.push('}');
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "index");
+		crate::codec::cbor::uint(out, self.index as u64);
+		crate::codec::cbor::text(out, "kind");
+		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "mmio-len");
+		crate::codec::cbor::uint(out, self.mmio_len as u64);
+	}
 }
 
 impl ProcessInfo {
@@ -3056,6 +3553,11 @@ impl ProcessInfo {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -3075,6 +3577,13 @@ impl ProcessInfo {
 		out.push_str(&self.name);
 		out.push('}');
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "koid");
+		crate::codec::cbor::uint(out, self.koid as u64);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+	}
 }
 
 impl ConfigEntry {
@@ -3087,6 +3596,11 @@ impl ConfigEntry {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -3106,6 +3620,13 @@ impl ConfigEntry {
 		out.push_str(&self.value);
 		out.push('}');
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "key");
+		crate::codec::cbor::text(out, &self.key);
+		crate::codec::cbor::text(out, "value");
+		crate::codec::cbor::text(out, &self.value);
+	}
 }
 
 impl Picked {
@@ -3118,6 +3639,11 @@ impl Picked {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -3143,6 +3669,15 @@ impl Picked {
 		out.push_str(&self.name);
 		out.push('}');
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "file");
+		crate::codec::cbor::uint(out, self.file as u64);
+		crate::codec::cbor::text(out, "size");
+		crate::codec::cbor::uint(out, self.size as u64);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+	}
 }
 
 impl Ipv4Addr {
@@ -3155,6 +3690,11 @@ impl Ipv4Addr {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -3186,6 +3726,17 @@ impl Ipv4Addr {
 		let _ = write!(out, "{}", self.d);
 		out.push('}');
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "a");
+		crate::codec::cbor::uint(out, self.a as u64);
+		crate::codec::cbor::text(out, "b");
+		crate::codec::cbor::uint(out, self.b as u64);
+		crate::codec::cbor::text(out, "c");
+		crate::codec::cbor::uint(out, self.c as u64);
+		crate::codec::cbor::text(out, "d");
+		crate::codec::cbor::uint(out, self.d as u64);
+	}
 }
 
 impl Endpoint {
@@ -3198,6 +3749,11 @@ impl Endpoint {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -3217,6 +3773,13 @@ impl Endpoint {
 		let _ = write!(out, "{}", self.port);
 		out.push('}');
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "addr");
+		self.addr.to_cbor_into(out);
+		crate::codec::cbor::text(out, "port");
+		crate::codec::cbor::uint(out, self.port as u64);
+	}
 }
 
 impl Neighbor {
@@ -3230,6 +3793,11 @@ impl Neighbor {
 		self.to_text_into(&mut s);
 		s
 	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"addr\":");
@@ -3237,13 +3805,13 @@ impl Neighbor {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v105 = true;
-		for v104 in self.mac.iter() {
-			if !v105 {
+		let mut v120 = true;
+		for v119 in self.mac.iter() {
+			if !v120 {
 				out.push(',');
 			}
-			v105 = false;
-			let _ = write!(out, "{}", v104);
+			v120 = false;
+			let _ = write!(out, "{}", v119);
 		}
 		out.push(']');
 		out.push('}');
@@ -3255,16 +3823,26 @@ impl Neighbor {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v107 = true;
-		for v106 in self.mac.iter() {
-			if !v107 {
+		let mut v122 = true;
+		for v121 in self.mac.iter() {
+			if !v122 {
 				out.push_str(", ");
 			}
-			v107 = false;
-			let _ = write!(out, "{}", v106);
+			v122 = false;
+			let _ = write!(out, "{}", v121);
 		}
 		out.push(']');
 		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "addr");
+		self.addr.to_cbor_into(out);
+		crate::codec::cbor::text(out, "mac");
+		crate::codec::cbor::array(out, self.mac.len());
+		for v123 in self.mac.iter() {
+			crate::codec::cbor::uint(out, *v123 as u64);
+		}
 	}
 }
 
@@ -3279,6 +3857,11 @@ impl NetInfo {
 		self.to_text_into(&mut s);
 		s
 	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"addr\":");
@@ -3286,13 +3869,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v109 = true;
-		for v108 in self.mac.iter() {
-			if !v109 {
+		let mut v125 = true;
+		for v124 in self.mac.iter() {
+			if !v125 {
 				out.push(',');
 			}
-			v109 = false;
-			let _ = write!(out, "{}", v108);
+			v125 = false;
+			let _ = write!(out, "{}", v124);
 		}
 		out.push(']');
 		out.push(',');
@@ -3301,13 +3884,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"neighbors\":");
 		out.push('[');
-		let mut v111 = true;
-		for v110 in self.neighbors.iter() {
-			if !v111 {
+		let mut v127 = true;
+		for v126 in self.neighbors.iter() {
+			if !v127 {
 				out.push(',');
 			}
-			v111 = false;
-			v110.to_json_into(out);
+			v127 = false;
+			v126.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -3319,13 +3902,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v113 = true;
-		for v112 in self.mac.iter() {
-			if !v113 {
+		let mut v129 = true;
+		for v128 in self.mac.iter() {
+			if !v129 {
 				out.push_str(", ");
 			}
-			v113 = false;
-			let _ = write!(out, "{}", v112);
+			v129 = false;
+			let _ = write!(out, "{}", v128);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -3334,16 +3917,33 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("neighbors=");
 		out.push('[');
-		let mut v115 = true;
-		for v114 in self.neighbors.iter() {
-			if !v115 {
+		let mut v131 = true;
+		for v130 in self.neighbors.iter() {
+			if !v131 {
 				out.push_str(", ");
 			}
-			v115 = false;
-			v114.to_text_into(out);
+			v131 = false;
+			v130.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "addr");
+		self.addr.to_cbor_into(out);
+		crate::codec::cbor::text(out, "mac");
+		crate::codec::cbor::array(out, self.mac.len());
+		for v132 in self.mac.iter() {
+			crate::codec::cbor::uint(out, *v132 as u64);
+		}
+		crate::codec::cbor::text(out, "gateway");
+		self.gateway.to_cbor_into(out);
+		crate::codec::cbor::text(out, "neighbors");
+		crate::codec::cbor::array(out, self.neighbors.len());
+		for v133 in self.neighbors.iter() {
+			v133.to_cbor_into(out);
+		}
 	}
 }
 
@@ -3357,6 +3957,11 @@ impl PingStatus {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		match self {
@@ -3372,6 +3977,13 @@ impl PingStatus {
 			PingStatus::Unreachable => out.push_str("unreachable"),
 		}
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			PingStatus::Reply => crate::codec::cbor::text(out, "reply"),
+			PingStatus::Timeout => crate::codec::cbor::text(out, "timeout"),
+			PingStatus::Unreachable => crate::codec::cbor::text(out, "unreachable"),
+		}
+	}
 }
 
 impl PingReply {
@@ -3384,6 +3996,11 @@ impl PingReply {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -3409,6 +4026,15 @@ impl PingReply {
 		let _ = write!(out, "{}", self.rtt_us);
 		out.push('}');
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "status");
+		self.status.to_cbor_into(out);
+		crate::codec::cbor::text(out, "ttl");
+		crate::codec::cbor::uint(out, self.ttl as u64);
+		crate::codec::cbor::text(out, "rtt-us");
+		crate::codec::cbor::uint(out, self.rtt_us as u64);
+	}
 }
 
 impl TcpRequest {
@@ -3422,6 +4048,11 @@ impl TcpRequest {
 		self.to_text_into(&mut s);
 		s
 	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"ep\":");
@@ -3429,13 +4060,13 @@ impl TcpRequest {
 		out.push(',');
 		out.push_str("\"request\":");
 		out.push('[');
-		let mut v117 = true;
-		for v116 in self.request.iter() {
-			if !v117 {
+		let mut v135 = true;
+		for v134 in self.request.iter() {
+			if !v135 {
 				out.push(',');
 			}
-			v117 = false;
-			let _ = write!(out, "{}", v116);
+			v135 = false;
+			let _ = write!(out, "{}", v134);
 		}
 		out.push(']');
 		out.push('}');
@@ -3447,16 +4078,26 @@ impl TcpRequest {
 		out.push_str(", ");
 		out.push_str("request=");
 		out.push('[');
-		let mut v119 = true;
-		for v118 in self.request.iter() {
-			if !v119 {
+		let mut v137 = true;
+		for v136 in self.request.iter() {
+			if !v137 {
 				out.push_str(", ");
 			}
-			v119 = false;
-			let _ = write!(out, "{}", v118);
+			v137 = false;
+			let _ = write!(out, "{}", v136);
 		}
 		out.push(']');
 		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "ep");
+		self.ep.to_cbor_into(out);
+		crate::codec::cbor::text(out, "request");
+		crate::codec::cbor::array(out, self.request.len());
+		for v138 in self.request.iter() {
+			crate::codec::cbor::uint(out, *v138 as u64);
+		}
 	}
 }
 
@@ -3470,6 +4111,11 @@ impl SockState {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		match self {
@@ -3491,6 +4137,16 @@ impl SockState {
 			SockState::Listen => out.push_str("listen"),
 		}
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			SockState::Closed => crate::codec::cbor::text(out, "closed"),
+			SockState::SynSent => crate::codec::cbor::text(out, "syn-sent"),
+			SockState::SynRcvd => crate::codec::cbor::text(out, "syn-rcvd"),
+			SockState::Established => crate::codec::cbor::text(out, "established"),
+			SockState::FinWait => crate::codec::cbor::text(out, "fin-wait"),
+			SockState::Listen => crate::codec::cbor::text(out, "listen"),
+		}
+	}
 }
 
 impl SockInfo {
@@ -3503,6 +4159,11 @@ impl SockInfo {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -3528,6 +4189,15 @@ impl SockInfo {
 		self.state.to_text_into(out);
 		out.push('}');
 	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "local-port");
+		crate::codec::cbor::uint(out, self.local_port as u64);
+		crate::codec::cbor::text(out, "remote");
+		self.remote.to_cbor_into(out);
+		crate::codec::cbor::text(out, "state");
+		self.state.to_cbor_into(out);
+	}
 }
 
 impl Chunk {
@@ -3541,17 +4211,22 @@ impl Chunk {
 		self.to_text_into(&mut s);
 		s
 	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"data\":");
 		out.push('[');
-		let mut v121 = true;
-		for v120 in self.data.iter() {
-			if !v121 {
+		let mut v140 = true;
+		for v139 in self.data.iter() {
+			if !v140 {
 				out.push(',');
 			}
-			v121 = false;
-			let _ = write!(out, "{}", v120);
+			v140 = false;
+			let _ = write!(out, "{}", v139);
 		}
 		out.push(']');
 		out.push('}');
@@ -3560,16 +4235,24 @@ impl Chunk {
 		out.push('{');
 		out.push_str("data=");
 		out.push('[');
-		let mut v123 = true;
-		for v122 in self.data.iter() {
-			if !v123 {
+		let mut v142 = true;
+		for v141 in self.data.iter() {
+			if !v142 {
 				out.push_str(", ");
 			}
-			v123 = false;
-			let _ = write!(out, "{}", v122);
+			v142 = false;
+			let _ = write!(out, "{}", v141);
 		}
 		out.push(']');
 		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 1);
+		crate::codec::cbor::text(out, "data");
+		crate::codec::cbor::array(out, self.data.len());
+		for v143 in self.data.iter() {
+			crate::codec::cbor::uint(out, *v143 as u64);
+		}
 	}
 }
 
@@ -3584,6 +4267,11 @@ impl Timestamp {
 		self.to_text_into(&mut s);
 		s
 	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"unix-secs\":");
@@ -3595,6 +4283,11 @@ impl Timestamp {
 		out.push_str("unix-secs=");
 		let _ = write!(out, "{}", self.unix_secs);
 		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 1);
+		crate::codec::cbor::text(out, "unix-secs");
+		crate::codec::cbor::uint(out, self.unix_secs as u64);
 	}
 }
 
@@ -3608,6 +4301,11 @@ impl PointerEvent {
 		let mut s = String::new();
 		self.to_text_into(&mut s);
 		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
@@ -3632,6 +4330,382 @@ impl PointerEvent {
 		out.push_str("buttons=");
 		let _ = write!(out, "{}", self.buttons);
 		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "col");
+		crate::codec::cbor::uint(out, self.col as u64);
+		crate::codec::cbor::text(out, "row");
+		crate::codec::cbor::uint(out, self.row as u64);
+		crate::codec::cbor::text(out, "buttons");
+		crate::codec::cbor::uint(out, self.buttons as u64);
+	}
+}
+
+impl ComponentKind {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			ComponentKind::Service => out.push_str("\"service\""),
+			ComponentKind::Driver => out.push_str("\"driver\""),
+			ComponentKind::Device => out.push_str("\"device\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			ComponentKind::Service => out.push_str("service"),
+			ComponentKind::Driver => out.push_str("driver"),
+			ComponentKind::Device => out.push_str("device"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			ComponentKind::Service => crate::codec::cbor::text(out, "service"),
+			ComponentKind::Driver => crate::codec::cbor::text(out, "driver"),
+			ComponentKind::Device => crate::codec::cbor::text(out, "device"),
+		}
+	}
+}
+
+impl ComponentState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			ComponentState::Running => out.push_str("\"running\""),
+			ComponentState::Stopped => out.push_str("\"stopped\""),
+			ComponentState::Failed => out.push_str("\"failed\""),
+			ComponentState::Restarting => out.push_str("\"restarting\""),
+			ComponentState::Pending => out.push_str("\"pending\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			ComponentState::Running => out.push_str("running"),
+			ComponentState::Stopped => out.push_str("stopped"),
+			ComponentState::Failed => out.push_str("failed"),
+			ComponentState::Restarting => out.push_str("restarting"),
+			ComponentState::Pending => out.push_str("pending"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			ComponentState::Running => crate::codec::cbor::text(out, "running"),
+			ComponentState::Stopped => crate::codec::cbor::text(out, "stopped"),
+			ComponentState::Failed => crate::codec::cbor::text(out, "failed"),
+			ComponentState::Restarting => crate::codec::cbor::text(out, "restarting"),
+			ComponentState::Pending => crate::codec::cbor::text(out, "pending"),
+		}
+	}
+}
+
+impl Counters {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"messages-sent\":");
+		let _ = write!(out, "{}", self.messages_sent);
+		out.push(',');
+		out.push_str("\"messages-received\":");
+		let _ = write!(out, "{}", self.messages_received);
+		out.push(',');
+		out.push_str("\"handles\":");
+		let _ = write!(out, "{}", self.handles);
+		out.push(',');
+		out.push_str("\"memory-bytes\":");
+		let _ = write!(out, "{}", self.memory_bytes);
+		out.push(',');
+		out.push_str("\"restarts\":");
+		let _ = write!(out, "{}", self.restarts);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("messages-sent=");
+		let _ = write!(out, "{}", self.messages_sent);
+		out.push_str(", ");
+		out.push_str("messages-received=");
+		let _ = write!(out, "{}", self.messages_received);
+		out.push_str(", ");
+		out.push_str("handles=");
+		let _ = write!(out, "{}", self.handles);
+		out.push_str(", ");
+		out.push_str("memory-bytes=");
+		let _ = write!(out, "{}", self.memory_bytes);
+		out.push_str(", ");
+		out.push_str("restarts=");
+		let _ = write!(out, "{}", self.restarts);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::text(out, "messages-sent");
+		crate::codec::cbor::uint(out, self.messages_sent as u64);
+		crate::codec::cbor::text(out, "messages-received");
+		crate::codec::cbor::uint(out, self.messages_received as u64);
+		crate::codec::cbor::text(out, "handles");
+		crate::codec::cbor::uint(out, self.handles as u64);
+		crate::codec::cbor::text(out, "memory-bytes");
+		crate::codec::cbor::uint(out, self.memory_bytes as u64);
+		crate::codec::cbor::text(out, "restarts");
+		crate::codec::cbor::uint(out, self.restarts as u64);
+	}
+}
+
+impl Component {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push(',');
+		out.push_str("\"kind\":");
+		self.kind.to_json_into(out);
+		out.push(',');
+		out.push_str("\"state\":");
+		self.state.to_json_into(out);
+		out.push(',');
+		out.push_str("\"deps\":");
+		out.push('[');
+		let mut v145 = true;
+		for v144 in self.deps.iter() {
+			if !v145 {
+				out.push(',');
+			}
+			v145 = false;
+			crate::codec::json_escape(v144, out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"counters\":");
+		self.counters.to_json_into(out);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("name=");
+		out.push_str(&self.name);
+		out.push_str(", ");
+		out.push_str("kind=");
+		self.kind.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("state=");
+		self.state.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("deps=");
+		out.push('[');
+		let mut v147 = true;
+		for v146 in self.deps.iter() {
+			if !v147 {
+				out.push_str(", ");
+			}
+			v147 = false;
+			out.push_str(v146);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("counters=");
+		self.counters.to_text_into(out);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "kind");
+		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "state");
+		self.state.to_cbor_into(out);
+		crate::codec::cbor::text(out, "deps");
+		crate::codec::cbor::array(out, self.deps.len());
+		for v148 in self.deps.iter() {
+			crate::codec::cbor::text(out, v148);
+		}
+		crate::codec::cbor::text(out, "counters");
+		self.counters.to_cbor_into(out);
+	}
+}
+
+impl TraceSpan {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push(',');
+		out.push_str("\"duration-ns\":");
+		let _ = write!(out, "{}", self.duration_ns);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("name=");
+		out.push_str(&self.name);
+		out.push_str(", ");
+		out.push_str("duration-ns=");
+		let _ = write!(out, "{}", self.duration_ns);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "duration-ns");
+		crate::codec::cbor::uint(out, self.duration_ns as u64);
+	}
+}
+
+impl Graph {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"components\":");
+		out.push('[');
+		let mut v150 = true;
+		for v149 in self.components.iter() {
+			if !v150 {
+				out.push(',');
+			}
+			v150 = false;
+			v149.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"spans\":");
+		out.push('[');
+		let mut v152 = true;
+		for v151 in self.spans.iter() {
+			if !v152 {
+				out.push(',');
+			}
+			v152 = false;
+			v151.to_json_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("components=");
+		out.push('[');
+		let mut v154 = true;
+		for v153 in self.components.iter() {
+			if !v154 {
+				out.push_str(", ");
+			}
+			v154 = false;
+			v153.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("spans=");
+		out.push('[');
+		let mut v156 = true;
+		for v155 in self.spans.iter() {
+			if !v156 {
+				out.push_str(", ");
+			}
+			v156 = false;
+			v155.to_text_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "components");
+		crate::codec::cbor::array(out, self.components.len());
+		for v157 in self.components.iter() {
+			v157.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "spans");
+		crate::codec::cbor::array(out, self.spans.len());
+		for v158 in self.spans.iter() {
+			v158.to_cbor_into(out);
+		}
 	}
 }
 
@@ -3823,5 +4897,53 @@ mod compat {
 		let golden: &[u8] = &[7, 0, 7, 0, 7];
 		assert_eq!(bytes, golden);
 		assert_eq!(PointerEvent::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn component_kind_wire_is_stable() {
+		let sample = ComponentKind::Service;
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[0];
+		assert_eq!(bytes, golden);
+		assert_eq!(ComponentKind::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn component_state_wire_is_stable() {
+		let sample = ComponentState::Running;
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[0];
+		assert_eq!(bytes, golden);
+		assert_eq!(ComponentState::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn counters_wire_is_stable() {
+		let sample = Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7 };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0];
+		assert_eq!(bytes, golden);
+		assert_eq!(Counters::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn component_wire_is_stable() {
+		let sample = Component { name: String::from("x"), kind: ComponentKind::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7 } };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[1, 0, 120, 0, 0, 1, 0, 1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0];
+		assert_eq!(bytes, golden);
+		assert_eq!(Component::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn trace_span_wire_is_stable() {
+		let sample = TraceSpan { name: String::from("x"), duration_ns: 7 };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0];
+		assert_eq!(bytes, golden);
+		assert_eq!(TraceSpan::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn graph_wire_is_stable() {
+		let sample = Graph { components: alloc::vec![Component { name: String::from("x"), kind: ComponentKind::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7 } }], spans: alloc::vec![TraceSpan { name: String::from("x"), duration_ns: 7 }] };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[1, 0, 1, 0, 120, 0, 0, 1, 0, 1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 1, 0, 1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0];
+		assert_eq!(bytes, golden);
+		assert_eq!(Graph::decode(&bytes).unwrap(), sample);
 	}
 }

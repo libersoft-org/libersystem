@@ -153,6 +153,10 @@ impl volume::Service for VolStub {
 	fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error> {
 		if o.path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
 	}
+
+	fn list(&mut self) -> Result<Vec<FileInfo>, Error> {
+		Ok(Vec::new())
+	}
 }
 
 struct VolLoopback<S: volume::Service> {
@@ -218,3 +222,182 @@ fn query_renders_text_with_option_none() {
 	let q = Query { since: Some(5), min_severity: None, source: Some(String::from("svc")), limit: 9 };
 	assert_eq!(q.to_text(), "{since=5, min-severity=-, source=svc, limit=9}");
 }
+
+// CBOR primitive heads use the canonical shortest argument encoding (RFC 8949):
+// inline for n < 24, then 1/2/4/8 big-endian bytes.
+#[test]
+fn cbor_uint_uses_shortest_head() {
+	use crate::codec::cbor;
+	let mut v = Vec::new();
+	cbor::uint(&mut v, 23);
+	assert_eq!(v, [0x17]);
+	v.clear();
+	cbor::uint(&mut v, 24);
+	assert_eq!(v, [0x18, 24]);
+	v.clear();
+	cbor::uint(&mut v, 255);
+	assert_eq!(v, [0x18, 255]);
+	v.clear();
+	cbor::uint(&mut v, 256);
+	assert_eq!(v, [0x19, 0x01, 0x00]);
+	v.clear();
+	cbor::uint(&mut v, 65535);
+	assert_eq!(v, [0x19, 0xff, 0xff]);
+	v.clear();
+	cbor::uint(&mut v, 65536);
+	assert_eq!(v, [0x1a, 0x00, 0x01, 0x00, 0x00]);
+}
+
+// Negative integers are major type 1 over `-1 - v`.
+#[test]
+fn cbor_int_encodes_negatives() {
+	use crate::codec::cbor;
+	let mut v = Vec::new();
+	cbor::int(&mut v, -1);
+	assert_eq!(v, [0x20]);
+	v.clear();
+	cbor::int(&mut v, -24);
+	assert_eq!(v, [0x37]);
+	v.clear();
+	cbor::int(&mut v, -25);
+	assert_eq!(v, [0x38, 24]);
+	v.clear();
+	cbor::int(&mut v, 9);
+	assert_eq!(v, [0x09]);
+}
+
+// Simple values: booleans and null map to fixed major-type-7 bytes.
+#[test]
+fn cbor_simple_values() {
+	use crate::codec::cbor;
+	let mut v = Vec::new();
+	cbor::boolean(&mut v, false);
+	cbor::boolean(&mut v, true);
+	cbor::null(&mut v);
+	assert_eq!(v, [0xf4, 0xf5, 0xf6]);
+}
+
+// An enum case renders as a CBOR text string of its kebab-case name.
+#[test]
+fn severity_renders_cbor() {
+	assert_eq!(Severity::Info.to_cbor(), [0x64, b'i', b'n', b'f', b'o']);
+}
+
+#[test]
+fn error_renders_cbor_kebab() {
+	assert_eq!(Error::NotFound.to_cbor(), [0x69, b'n', b'o', b't', b'-', b'f', b'o', b'u', b'n', b'd']);
+}
+
+// A record renders as a definite-length CBOR map keyed by field name, mirroring
+// the JSON object structure.
+#[test]
+fn field_renders_cbor_map() {
+	let f = Field { key: String::from("k"), value: String::from("v") };
+	assert_eq!(f.to_cbor(), [0xa2, 0x63, b'k', b'e', b'y', 0x61, b'k', 0x65, b'v', b'a', b'l', b'u', b'e', 0x61, b'v']);
+}
+
+#[test]
+fn entry_renders_cbor_map() {
+	let e = Entry { timestamp: 42, severity: Severity::Info, source: String::from("kernel"), fields: Vec::new() };
+	let mut want = Vec::new();
+	want.push(0xa4); // map(4)
+	want.push(0x69);
+	want.extend_from_slice(b"timestamp");
+	want.extend_from_slice(&[0x18, 42]); // uint 42
+	want.push(0x68);
+	want.extend_from_slice(b"severity");
+	want.push(0x64);
+	want.extend_from_slice(b"info");
+	want.push(0x66);
+	want.extend_from_slice(b"source");
+	want.push(0x66);
+	want.extend_from_slice(b"kernel");
+	want.push(0x66);
+	want.extend_from_slice(b"fields");
+	want.push(0x80); // array(0)
+	assert_eq!(e.to_cbor(), want);
+}
+
+// Options collapse to their value or `null`, and kebab-case keys are preserved.
+#[test]
+fn query_renders_cbor_with_options() {
+	let q = Query { since: Some(5), min_severity: None, source: Some(String::from("svc")), limit: 9 };
+	let mut want = Vec::new();
+	want.push(0xa4); // map(4)
+	want.push(0x65);
+	want.extend_from_slice(b"since");
+	want.push(0x05); // uint 5
+	want.push(0x6c);
+	want.extend_from_slice(b"min-severity");
+	want.push(0xf6); // null
+	want.push(0x66);
+	want.extend_from_slice(b"source");
+	want.push(0x63);
+	want.extend_from_slice(b"svc");
+	want.push(0x65);
+	want.extend_from_slice(b"limit");
+	want.push(0x09); // uint 9
+	assert_eq!(q.to_cbor(), want);
+}
+
+// The System Graph round-trips through its binary wire form: a component carrying
+// its kind, state, dependency edges and counters, plus a trace span, survives an
+// encode/decode unchanged.
+#[test]
+fn graph_round_trips() {
+	let g = Graph {
+		components: alloc::vec![
+			Component { name: String::from("log-service"), kind: ComponentKind::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 7, messages_received: 3, handles: 5, memory_bytes: 8192, restarts: 0 } },
+			Component { name: String::from("device-manager"), kind: ComponentKind::Service, state: ComponentState::Stopped, deps: alloc::vec![String::from("log-service")], counters: Counters { messages_sent: 1, messages_received: 1, handles: 2, memory_bytes: 4096, restarts: 0 } },
+		],
+		spans: alloc::vec![TraceSpan { name: String::from("device.list"), duration_ns: 1234 }],
+	};
+	let bytes = g.encode_vec();
+	assert_eq!(Graph::decode(&bytes), Some(g));
+}
+
+// A component renders to a CBOR map with kebab-case keys, its kind and state as text
+// enums, its deps as an array, and its counters as a nested map.
+#[test]
+fn component_renders_cbor_map() {
+	let c = Component { name: String::from("net"), kind: ComponentKind::Driver, state: ComponentState::Failed, deps: alloc::vec![String::from("device-manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 1, memory_bytes: 0, restarts: 2 } };
+	let mut want = Vec::new();
+	want.push(0xa5); // map(5)
+	want.push(0x64);
+	want.extend_from_slice(b"name");
+	want.push(0x63);
+	want.extend_from_slice(b"net");
+	want.push(0x64);
+	want.extend_from_slice(b"kind");
+	want.push(0x66);
+	want.extend_from_slice(b"driver");
+	want.push(0x65);
+	want.extend_from_slice(b"state");
+	want.push(0x66);
+	want.extend_from_slice(b"failed");
+	want.push(0x64);
+	want.extend_from_slice(b"deps");
+	want.push(0x81); // array(1)
+	want.push(0x6e);
+	want.extend_from_slice(b"device-manager");
+	want.push(0x68);
+	want.extend_from_slice(b"counters");
+	want.push(0xa5); // map(5)
+	want.push(0x6d);
+	want.extend_from_slice(b"messages-sent");
+	want.push(0x00); // uint 0
+	want.push(0x71);
+	want.extend_from_slice(b"messages-received");
+	want.push(0x00); // uint 0
+	want.push(0x67);
+	want.extend_from_slice(b"handles");
+	want.push(0x01); // uint 1
+	want.push(0x6c);
+	want.extend_from_slice(b"memory-bytes");
+	want.push(0x00); // uint 0
+	want.push(0x68);
+	want.extend_from_slice(b"restarts");
+	want.push(0x02); // uint 2
+	assert_eq!(c.to_cbor(), want);
+}
+

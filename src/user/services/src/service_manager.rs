@@ -33,15 +33,17 @@ struct Service {
 
 // The number of managed services. (A fixed size keeps the state array on the
 // stack, which a no_std program with no heap needs.)
-const N: usize = 12;
+const N: usize = 13;
 
 // The core service manifest. The array order is deliberately NOT the start order:
 // DeviceManager, StorageService, and the shell are listed before LogService, but
 // all depend (directly or transitively) on it, so the dependency resolver must
 // start LogService first. This proves the ordering is driven by declared
-// dependencies, not by manifest position. The shell is the last component up: it
-// depends on StorageService, which it talks to over IPC.
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }];
+// dependencies, not by manifest position. SystemGraphService comes up after every
+// component it observes (so it holds their process handles for the live graph), and
+// the shell is the last component up: it depends on StorageService (which it talks to
+// over IPC) and on SystemGraphService (whose graph its `graph` command renders).
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"system_graph_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service"] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -85,6 +87,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    alive in `storage_client` so the service stays standing after it reports in.
 	let mut state: [State; N] = [State::Pending; N];
 	let mut channels: [u64; N] = [0u64; N];
+	// The spawned Process handle of each component, kept so SystemGraphService can be
+	// handed a read-only duplicate of every component it observes (the live data source
+	// for that component's graph node).
+	let mut procs: [u64; N] = [0u64; N];
 	let mut storage_client: u64 = 0;
 	let mut block_client: u64 = 0;
 	let mut net_frames: u64 = 0;
@@ -105,12 +111,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut device_client: u64 = 0;
 	let mut process_client: u64 = 0;
 	let mut config_client: u64 = 0;
+	let mut graph_client: u64 = 0;
 	loop {
 		let mut progress: bool = false;
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
-				state[i] = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut channels[i], &mut buf) };
+				let mut proc_handle: u64 = 0;
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
+				state[i] = started;
+				procs[i] = proc_handle;
 				progress = true;
 			}
 			i += 1;
@@ -194,7 +204,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let elf: &[u8] = match package.lookup(name) {
 			Some(e) => e,
@@ -208,6 +218,9 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if proc < 0 {
 			return State::Failed;
 		}
+		// Keep the spawned Process handle so SystemGraphService can be handed a read-only
+		// duplicate of it (the live data source for this component's graph node).
+		*proc_out = proc as u64;
 		if name == b"log_service" && !bootstrap_serve(manager_side, log_client) {
 			return State::Failed;
 		}
@@ -241,7 +254,10 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, *pointer_console, console_client, console_control, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
-		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *input_client, *console_client, *console_control, pkg_handle, pkg_len, buf) {
+		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client) {
+			return State::Failed;
+		}
+		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *input_client, *console_client, *console_control, *graph_client, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -264,6 +280,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 				// (Every other service is meant to stand for the life of the system.)
 				if name == b"shell" {
 					close(proc as u64);
+					*proc_out = 0;
 				}
 				// DeviceManager sends a follow-up "NET" message carrying the net driver's
 				// frame channel, then a "GPU" message carrying the gpu driver's display
@@ -330,7 +347,7 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 // client are transferred (the shell becomes their sole owner); the LogService
 // client is *duplicated* and the copy transferred, since the supervisor keeps
 // emitting on the original.
-unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, input_client: u64, console_client: u64, console_control: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, input_client: u64, console_client: u64, console_control: u64, graph_client: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"STORAGE", storage_client) {
 			return false;
@@ -363,6 +380,11 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 		if !send_blocking(manager_side, b"INPUT", input_client) {
 			return false;
 		}
+		// The SystemGraphService client, so the shell's `graph` command can render the live
+		// system graph. Sent right after INPUT to match the shell's receive order.
+		if !send_blocking(manager_side, b"GRAPH", graph_client) {
+			return false;
+		}
 		if !send_blocking(manager_side, b"CONSOLE", console_client) {
 			return false;
 		}
@@ -375,6 +397,59 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, log_client: u6
 		// The shell spawns foreground programs (echo, later the net tools) from the
 		// init package, so hand it a read-only view of it like the other launchers.
 		bootstrap_package(manager_side, pkg_handle, pkg_len, buf)
+	}
+}
+
+// Register every observed component with SystemGraphService and hand it the live data
+// sources for the graph: one "NODE" message per Running component (excluding the shell
+// and SystemGraphService itself), carrying the component's name and its declared
+// dependency edges as the payload and a read-only duplicate of that component's Process
+// as the transferred handle (the source of its live counters and state), then a
+// dedicated DeviceService connection ("DEVICE") for the device nodes, and finally the
+// channel its clients reach it on ("SERVE"), kept in `*graph_client` for the shell.
+// SystemGraphService comes up after every component it observes, so their handles are
+// all captured and their state is Running when its node set is built.
+unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], state: &[State; N], device_client: u64, graph_client: &mut u64) -> bool {
+	unsafe {
+		let mut i: usize = 0;
+		while i < N {
+			let name: &[u8] = MANIFEST[i].name;
+			if state[i] == State::Running && procs[i] != 0 && name != b"shell" && name != b"system_graph_service" {
+				let dup: i64 = duplicate(procs[i], RIGHT_READ | RIGHT_TRANSFER);
+				if dup < 0 {
+					return false;
+				}
+				let mut payload: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+				payload.extend_from_slice(b"NODE");
+				payload.extend_from_slice(name);
+				payload.push(b'\n');
+				let mut first: bool = true;
+				for &dep in MANIFEST[i].deps {
+					if !first {
+						payload.push(b',');
+					}
+					payload.extend_from_slice(dep);
+					first = false;
+				}
+				if !send_blocking(manager_side, &payload, dup as u64) {
+					return false;
+				}
+			}
+			i += 1;
+		}
+		// A dedicated DeviceService connection for the device nodes, minted from the
+		// supervisor's DeviceService client so it never races the shell's own connection.
+		match service_connect(device_client) {
+			Some(dev) => {
+				if !send_blocking(manager_side, b"DEVICE", dev) {
+					return false;
+				}
+			}
+			None => return false,
+		}
+		// The channel its clients (the shell) reach it on; the client end is kept in
+		// `*graph_client` for the shell's own bootstrap.
+		bootstrap_serve(manager_side, graph_client)
 	}
 }
 

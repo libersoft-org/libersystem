@@ -659,6 +659,24 @@ pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
 	}
 }
 
+// Read the live per-process counters and state behind a Process `handle` (the IPC
+// volume it has done, the handles and user memory it holds, and its liveness). The
+// handle must carry RIGHT_READ. Returns None if the handle is unknown or not a
+// process; the SystemGraphService uses this to build the live observability graph
+// from the process handles it holds for each component.
+pub unsafe fn process_stats(handle: u64) -> Option<ProcessStats> {
+	unsafe {
+		let mut stats: ProcessStats = ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: 0 };
+		let size: u64 = core::mem::size_of::<ProcessStats>() as u64;
+		let ok: i64 = syscall(SYS_PROCESS_STATS_GET, handle, &mut stats as *mut ProcessStats as u64, size, 0) as i64;
+		if ok == 1 {
+			Some(stats)
+		} else {
+			None
+		}
+	}
+}
+
 // The number of devices the kernel discovered at boot.
 pub unsafe fn device_count() -> u64 {
 	unsafe { syscall(SYS_DEVICE_COUNT, 0, 0, 0, 0) }

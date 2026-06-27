@@ -281,3 +281,88 @@ pub fn json_escape(s: &str, out: &mut String) {
 	}
 	out.push('"');
 }
+
+// CBOR (RFC 8949) encoding primitives for the generated `to_cbor` renderers. The
+// CBOR form is the binary analog of the JSON one: a record is a text-keyed map, an
+// enum case is a text string, a `result` is a single-pair map (`ok` / `err`), an
+// `option` is the value or `null`, a `list` is an array. Only definite-length
+// encodings are emitted, each with the canonical shortest head, so the output is
+// deterministic and round-trips with any conformant CBOR decoder.
+pub mod cbor {
+	use alloc::vec::Vec;
+
+	// Write a major-type head: `(major << 5) | additional`, with `n` as the
+	// argument in the shortest encoding (inline < 24, then 1/2/4/8 big-endian bytes).
+	fn head(out: &mut Vec<u8>, major: u8, n: u64) {
+		let mt = major << 5;
+		if n < 24 {
+			out.push(mt | n as u8);
+		} else if n <= u8::MAX as u64 {
+			out.push(mt | 24);
+			out.push(n as u8);
+		} else if n <= u16::MAX as u64 {
+			out.push(mt | 25);
+			out.extend_from_slice(&(n as u16).to_be_bytes());
+		} else if n <= u32::MAX as u64 {
+			out.push(mt | 26);
+			out.extend_from_slice(&(n as u32).to_be_bytes());
+		} else {
+			out.push(mt | 27);
+			out.extend_from_slice(&n.to_be_bytes());
+		}
+	}
+
+	// An unsigned integer (major type 0).
+	pub fn uint(out: &mut Vec<u8>, v: u64) {
+		head(out, 0, v);
+	}
+
+	// A signed integer: a negative `v` is major type 1 over `-1 - v`.
+	pub fn int(out: &mut Vec<u8>, v: i64) {
+		if v < 0 {
+			head(out, 1, (-1 - v) as u64);
+		} else {
+			head(out, 0, v as u64);
+		}
+	}
+
+	// A boolean (major type 7 simple value `false` / `true`).
+	pub fn boolean(out: &mut Vec<u8>, v: bool) {
+		out.push(if v { 0xf5 } else { 0xf4 });
+	}
+
+	// The `null` simple value (major type 7).
+	pub fn null(out: &mut Vec<u8>) {
+		out.push(0xf6);
+	}
+
+	// An IEEE-754 single-precision float (major type 7).
+	pub fn f32(out: &mut Vec<u8>, v: f32) {
+		out.push(0xfa);
+		out.extend_from_slice(&v.to_be_bytes());
+	}
+
+	// An IEEE-754 double-precision float (major type 7).
+	pub fn f64(out: &mut Vec<u8>, v: f64) {
+		out.push(0xfb);
+		out.extend_from_slice(&v.to_be_bytes());
+	}
+
+	// A UTF-8 text string (major type 3).
+	pub fn text(out: &mut Vec<u8>, s: &str) {
+		head(out, 3, s.len() as u64);
+		out.extend_from_slice(s.as_bytes());
+	}
+
+	// The head of a definite-length array of `len` items (major type 4); the items
+	// follow.
+	pub fn array(out: &mut Vec<u8>, len: usize) {
+		head(out, 4, len as u64);
+	}
+
+	// The head of a definite-length map of `pairs` key/value pairs (major type 5);
+	// the pairs follow.
+	pub fn map(out: &mut Vec<u8>, pairs: usize) {
+		head(out, 5, pairs as u64);
+	}
+}

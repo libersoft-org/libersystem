@@ -210,6 +210,58 @@ An opaque kernel object, transferred as `handle<file>`.
 | `row` | `u16` |
 | `buttons` | `u8` |
 
+### enum `component-kind`
+
+| case | ordinal |
+| --- | --- |
+| `service` | 0 |
+| `driver` | 1 |
+| `device` | 2 |
+
+### enum `component-state`
+
+| case | ordinal |
+| --- | --- |
+| `running` | 0 |
+| `stopped` | 1 |
+| `failed` | 2 |
+| `restarting` | 3 |
+| `pending` | 4 |
+
+### record `counters`
+
+| field | type |
+| --- | --- |
+| `messages-sent` | `u64` |
+| `messages-received` | `u64` |
+| `handles` | `u64` |
+| `memory-bytes` | `u64` |
+| `restarts` | `u32` |
+
+### record `component`
+
+| field | type |
+| --- | --- |
+| `name` | `string` |
+| `kind` | `component-kind` |
+| `state` | `component-state` |
+| `deps` | `list<string>` |
+| `counters` | `counters` |
+
+### record `trace-span`
+
+| field | type |
+| --- | --- |
+| `name` | `string` |
+| `duration-ns` | `u64` |
+
+### record `graph`
+
+| field | type |
+| --- | --- |
+| `components` | `list<component>` |
+| `spans` | `list<trace-span>` |
+
 ## Interfaces
 
 ### interface `log`
@@ -324,4 +376,12 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `subscribe` | `subscribe() -> stream<pointer-event>` |
+
+### interface `system-graph`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `snapshot` | `snapshot() -> result<graph, error>` |
 

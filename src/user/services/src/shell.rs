@@ -15,7 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{audio, config, device, input, log, network, process, time, volume, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp};
+use proto::system::{audio, config, device, input, log, network, process, system_graph, time, volume, Component, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -41,6 +41,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The InputService client: `mouse` subscribes to its pointer-event stream and prints
 	// the recent text-cell positions (the plumbing echo - no mouse-driven UI yet).
 	let inputsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"INPUT") }.unwrap_or_else(|| exit());
+	// The SystemGraphService client: `graph` queries the live system graph (components,
+	// devices, dependency edges, counters, and trace spans) and renders it as CLI / JSON
+	// / CBOR. Sent right after INPUT, matching ServiceManager's send order.
+	let graphsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"GRAPH") }.unwrap_or_else(|| exit());
 	// The console channel to ConsoleService: the shell writes its output to it (routed
 	// via stdout) and reads its keystrokes from it. The userspace terminal renders the
 	// output and forwards the input, so the shell talks to the console, not the kernel.
@@ -69,7 +73,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    become the interactive console and run the read-eval-print loop.
 	print_motd();
 	unsafe {
-		repl(console, control, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, &package, &mut buf);
+		repl(console, control, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, &package, &mut buf);
 	}
 	exit();
 }
@@ -125,7 +129,7 @@ fn print_banner(lines: &[&str]) {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, package: &Package, buf: &mut [u8]) {
+unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control);
 		loop {
@@ -141,7 +145,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u6
 			// The terminal delivers a whole submitted line (with a trailing newline);
 			// trim it, dispatch it, reap finished jobs, and print the next prompt.
 			let line: &[u8] = trim(&buf[..n]);
-			if dispatch(line, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, package, &mut jobs) {
+			if dispatch(line, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, package, &mut jobs) {
 				return;
 			}
 			reap_jobs(&mut jobs);
@@ -451,7 +455,7 @@ unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -514,6 +518,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  log [json]       show the system journal via LogService\n");
 			print(b"  log tail [json]  stream the journal via LogService (sub-channel)\n");
 			print(b"  dev [json]       list devices via DeviceService\n");
+			print(b"  graph [json|cbor]  show the live system graph and counters via SystemGraphService\n");
 			print(b"  ps               list started processes via ProcessService\n");
 			print(b"  run <name>       start a program via ProcessService\n");
 			print(b"  config [<key>]   list the config tree or read one key via ConfigService\n");
@@ -574,6 +579,18 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		}
 		if line == b"dev json" {
 			query_devices(devsvc, true);
+			return false;
+		}
+		if line == b"graph" {
+			query_graph(graphsvc, GraphFmt::Text);
+			return false;
+		}
+		if line == b"graph json" {
+			query_graph(graphsvc, GraphFmt::Json);
+			return false;
+		}
+		if line == b"graph cbor" {
+			query_graph(graphsvc, GraphFmt::Cbor);
 			return false;
 		}
 		if line == b"ps" {
@@ -1048,6 +1065,61 @@ unsafe fn query_devices(devsvc: u64, json: bool) {
 			Some(Err(_)) => print(b"dev: query error\n"),
 			None => print(b"dev: service unavailable\n"),
 		}
+	}
+}
+
+// The representation the `graph` command renders the snapshot in: human-readable text
+// (the default), a JSON document, or a CBOR document shown as hex. The JSON and CBOR
+// forms are the same bytes a remote consumer would read off the wire in a later phase.
+enum GraphFmt {
+	Text,
+	Json,
+	Cbor,
+}
+
+// Query SystemGraphService for the live system graph over the generated client and
+// render it in the requested representation: the components (each with its kind,
+// state, dependency edges, and live counters) and the trace spans, each via the
+// generated to_text / to_json / to_cbor on the client side - the one typed API, many
+// representations rule. A 0 handle means the service is not wired (e.g. a non-primary
+// VT this milestone), reported as unavailable rather than blocking.
+unsafe fn query_graph(graphsvc: u64, fmt: GraphFmt) {
+	unsafe {
+		if graphsvc == 0 {
+			print(b"graph: service unavailable\n");
+			return;
+		}
+		let mut client = system_graph::Client::new(ChannelTransport { chan: graphsvc });
+		match client.snapshot() {
+			Some(Ok(graph)) => match fmt {
+				GraphFmt::Text => {
+					print_text_lines(&graph.components, |c: &Component| -> String { c.to_text() });
+					print_text_lines(&graph.spans, |s: &TraceSpan| -> String { s.to_text() });
+				}
+				GraphFmt::Json => {
+					print(graph.to_json().as_bytes());
+					print(b"\n");
+				}
+				GraphFmt::Cbor => print_hex(&graph.to_cbor()),
+			},
+			Some(Err(_)) => print(b"graph: query error\n"),
+			None => print(b"graph: service unavailable\n"),
+		}
+	}
+}
+
+// Print bytes as a lowercase hex string on its own line - used to show a binary CBOR
+// document on the text console (the same bytes a remote consumer reads off the wire).
+unsafe fn print_hex(bytes: &[u8]) {
+	unsafe {
+		const HEX: &[u8; 16] = b"0123456789abcdef";
+		let mut line: Vec<u8> = Vec::with_capacity(bytes.len() * 2 + 1);
+		for &b in bytes {
+			line.push(HEX[(b >> 4) as usize]);
+			line.push(HEX[(b & 0x0f) as usize]);
+		}
+		line.push(b'\n');
+		print(&line);
 	}
 }
 

@@ -20,7 +20,7 @@ use crate::sync::SpinLock;
 
 // Heap virtual window: well clear of both the HHDM and the kernel image.
 const HEAP_START: u64 = 0xffff_e000_0000_0000;
-const HEAP_SIZE: u64 = 1024 * 1024; // 1 MiB
+const HEAP_SIZE: u64 = 2 * 1024 * 1024; // 2 MiB
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
