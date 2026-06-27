@@ -4,10 +4,16 @@
 // program, and transfers that channel to it alongside the target (a hostname or a
 // dotted-decimal address) as its argument. ping resolves the target (parsing it as an
 // address, else asking NetworkService to resolve it via DNS), then sends one echo per
-// second over its OWN client channel - printing a Linux-style line per reply - until
-// it reaches the `-c` count or the user presses Ctrl+C, at which point it prints a
-// statistics summary and exits. Ctrl+C is caught (rt::catch_interrupt) so the summary
-// survives the interrupt instead of the tool being killed.
+// second over its OWN client channel until it reaches the `-c` count or the user
+// presses Ctrl+C. Ctrl+C is caught (rt::catch_interrupt) so the output survives the
+// interrupt instead of the tool being killed.
+//
+// The same probe results render in one of two representations - the "one model, many
+// codecs" idea applied to a tool's output: by default a Linux-style line per reply
+// plus a statistics summary, or, with `--json`/`-j`, a single JSON document
+// {target, address, replies, statistics} that reuses the generated PingReply codec
+// for each reply body. Because an unbounded run never produces its final JSON
+// document, JSON mode defaults to four probes when no `-c` count is given.
 
 #![no_std]
 #![no_main]
@@ -15,10 +21,20 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt::Write;
 
-use proto::system::{Ipv4Addr, PingStatus, network};
+use proto::codec::json_escape;
+use proto::system::{network, Ipv4Addr, PingReply, PingStatus};
 use rt::*;
+
+// The representation ping renders its results in. Extend with further codecs (e.g.
+// CBOR) as needed - the probe loop is representation-agnostic.
+#[derive(Clone, Copy, PartialEq)]
+enum OutputFormat {
+	Cli,
+	Json,
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -73,17 +89,23 @@ impl Stats {
 // count is reached or Ctrl+C is pressed - then print the statistics summary.
 unsafe fn ping(netsvc: u64, args: &[u8]) {
 	unsafe {
-		let (count, target): (Option<u32>, &[u8]) = match parse_args(args) {
+		let (count, format, target): (Option<u32>, OutputFormat, &[u8]) = match parse_args(args) {
 			Some(parsed) => parsed,
 			None => {
-				print(b"ping: usage: ping [-c count] <host>\n");
+				print(b"ping: usage: ping [-c count] [--json] <host>\n");
 				return;
 			}
 		};
 		if target.is_empty() {
-			print(b"ping: usage: ping [-c count] <host>\n");
+			print(b"ping: usage: ping [-c count] [--json] <host>\n");
 			return;
 		}
+		// An unbounded ping never produces its final JSON document, so default to four
+		// probes in JSON mode when no count was given; CLI keeps its infinite default.
+		let count: Option<u32> = match (format, count) {
+			(OutputFormat::Json, None) => Some(4),
+			_ => count,
+		};
 		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
 		// Resolve the target: a dotted-decimal address parses directly, otherwise ask
 		// NetworkService to resolve the name over DNS.
@@ -104,20 +126,24 @@ unsafe fn ping(netsvc: u64, args: &[u8]) {
 		let mut ip_buf: [u8; 16] = [0u8; 16];
 		let ip_len: usize = addr.render(&mut ip_buf);
 		let ip: &[u8] = &ip_buf[..ip_len];
-		// PING <target> (<ip>) 56(84) bytes of data.
-		let mut header: String = String::new();
-		header.push_str("PING ");
-		append_bytes(&mut header, target);
-		header.push_str(" (");
-		append_bytes(&mut header, ip);
-		header.push_str(") 56(84) bytes of data.\n");
-		print(header.as_bytes());
+		// PING <target> (<ip>) 56(84) bytes of data. (CLI representation only - the JSON
+		// document carries the same target/address in its header fields instead.)
+		if format == OutputFormat::Cli {
+			let mut header: String = String::new();
+			header.push_str("PING ");
+			append_bytes(&mut header, target);
+			header.push_str(" (");
+			append_bytes(&mut header, ip);
+			header.push_str(") 56(84) bytes of data.\n");
+			print(header.as_bytes());
+		}
 
-		// Arm Ctrl+C so we stop cleanly and print a summary instead of being killed.
+		// Arm Ctrl+C so we stop cleanly and still emit our output instead of being killed.
 		catch_interrupt();
 
 		let start_ns: u64 = clock_ns();
 		let mut stats: Stats = Stats::new();
+		let mut attempts: Vec<(u32, PingReply)> = Vec::new();
 		let mut seq: u32 = 0;
 		let mut was_interrupted: bool = false;
 		loop {
@@ -125,31 +151,45 @@ unsafe fn ping(netsvc: u64, args: &[u8]) {
 			stats.transmitted += 1;
 			let send_ns: u64 = clock_ns();
 			match client.ping(&addr) {
-				Some(Ok(reply)) => match reply.status {
-					PingStatus::Reply => {
+				Some(Ok(reply)) => {
+					if reply.status == PingStatus::Reply {
 						stats.add_reply(reply.rtt_us);
-						let mut line: String = String::new();
-						line.push_str("64 bytes from ");
-						append_bytes(&mut line, ip);
-						let _ = write!(line, ": icmp_seq={} ttl={} time=", seq, reply.ttl);
-						append_ms2(&mut line, reply.rtt_us);
-						line.push_str(" ms\n");
-						print(line.as_bytes());
 					}
-					PingStatus::Unreachable => {
-						let mut line: String = String::new();
-						line.push_str("From ");
-						append_bytes(&mut line, ip);
-						let _ = write!(line, " icmp_seq={} Destination Host Unreachable\n", seq);
-						print(line.as_bytes());
+					match format {
+						// CLI: one Linux-style line per reply (timeouts are silent losses).
+						OutputFormat::Cli => match reply.status {
+							PingStatus::Reply => {
+								let mut line: String = String::new();
+								line.push_str("64 bytes from ");
+								append_bytes(&mut line, ip);
+								let _ = write!(line, ": icmp_seq={} ttl={} time=", seq, reply.ttl);
+								append_ms2(&mut line, reply.rtt_us);
+								line.push_str(" ms\n");
+								print(line.as_bytes());
+							}
+							PingStatus::Unreachable => {
+								let mut line: String = String::new();
+								line.push_str("From ");
+								append_bytes(&mut line, ip);
+								let _ = write!(line, " icmp_seq={} Destination Host Unreachable\n", seq);
+								print(line.as_bytes());
+							}
+							PingStatus::Timeout => {}
+						},
+						// JSON: collect the wire record for the final document.
+						OutputFormat::Json => attempts.push((seq, reply)),
 					}
-					// A timeout is a silent loss, counted but not printed (as Linux does).
-					PingStatus::Timeout => {}
-				},
-				// A service-side error counts as a loss, like a timeout.
-				Some(Err(_)) => {}
+				}
+				// A service-side error counts as a loss; record it as a timeout in JSON.
+				Some(Err(_)) => {
+					if format == OutputFormat::Json {
+						attempts.push((seq, PingReply { status: PingStatus::Timeout, ttl: 0, rtt_us: 0 }));
+					}
+				}
 				None => {
-					print(b"ping: network service unavailable\n");
+					if format == OutputFormat::Cli {
+						print(b"ping: network service unavailable\n");
+					}
 					break;
 				}
 			}
@@ -176,7 +216,11 @@ unsafe fn ping(netsvc: u64, args: &[u8]) {
 				break;
 			}
 		}
-		print_summary(target, &stats, start_ns, was_interrupted);
+		// Render the collected results in the chosen representation.
+		match format {
+			OutputFormat::Cli => print_summary(target, &stats, start_ns, was_interrupted),
+			OutputFormat::Json => print_json(target, ip, &attempts, &stats, start_ns),
+		}
 	}
 }
 
@@ -215,10 +259,53 @@ unsafe fn print_summary(target: &[u8], stats: &Stats, start_ns: u64, was_interru
 	}
 }
 
-// Parse `[-c count] <host>` (in any order), returning the optional count and the
-// target. None on a malformed count or an unknown flag.
-fn parse_args(args: &[u8]) -> Option<(Option<u32>, &[u8])> {
+// Render the probe results as one JSON document - the machine-readable representation
+// selected by `--json`. Each reply body reuses the generated PingReply codec (prefixed
+// with the client-side icmp-seq), so the wire model stays the single source of truth;
+// it is framed with the target, resolved address, and the same statistics the CLI
+// summary reports. Timeouts and lost probes appear as "timeout" replies.
+unsafe fn print_json(target: &[u8], ip: &[u8], attempts: &[(u32, PingReply)], stats: &Stats, start_ns: u64) {
+	unsafe {
+		let elapsed_ms: u64 = clock_ns().saturating_sub(start_ns) / 1_000_000;
+		let lost: u32 = stats.transmitted - stats.received;
+		let loss_pct: u64 = if stats.transmitted > 0 { lost as u64 * 100 / stats.transmitted as u64 } else { 0 };
+		let mut out: String = String::new();
+		out.push_str("{\"target\":");
+		json_escape(core::str::from_utf8(target).unwrap_or(""), &mut out);
+		out.push_str(",\"address\":");
+		json_escape(core::str::from_utf8(ip).unwrap_or(""), &mut out);
+		out.push_str(",\"replies\":[");
+		let mut first: bool = true;
+		for (seq, reply) in attempts {
+			if !first {
+				out.push(',');
+			}
+			first = false;
+			// Reuse the wire record's JSON, prepending the client-side sequence number.
+			let _ = write!(out, "{{\"icmp-seq\":{},", seq);
+			out.push_str(&reply.to_json()[1..]);
+		}
+		out.push_str("],\"statistics\":{");
+		let _ = write!(out, "\"transmitted\":{},\"received\":{},\"packet-loss-pct\":{},\"time-ms\":{},\"rtt\":", stats.transmitted, stats.received, loss_pct, elapsed_ms);
+		if stats.received > 0 {
+			let n: u128 = stats.received as u128;
+			let mean: u128 = stats.sum_us as u128 / n;
+			let variance: u128 = (stats.sum_sq / n).saturating_sub(mean * mean);
+			let mdev_us: u64 = isqrt(variance) as u64;
+			let _ = write!(out, "{{\"min-us\":{},\"avg-us\":{},\"max-us\":{},\"mdev-us\":{}}}", stats.min_us, mean as u64, stats.max_us, mdev_us);
+		} else {
+			out.push_str("null");
+		}
+		out.push_str("}}\n");
+		print(out.as_bytes());
+	}
+}
+
+// Parse `[-c count] [--json] <host>` (in any order), returning the optional count, the
+// chosen output format, and the target. None on a malformed count or an unknown flag.
+fn parse_args(args: &[u8]) -> Option<(Option<u32>, OutputFormat, &[u8])> {
 	let mut count: Option<u32> = None;
+	let mut format: OutputFormat = OutputFormat::Cli;
 	let mut target: &[u8] = b"";
 	let mut rest: &[u8] = args;
 	loop {
@@ -231,6 +318,9 @@ fn parse_args(args: &[u8]) -> Option<(Option<u32>, &[u8])> {
 			let (num, after_num): (&[u8], &[u8]) = next_token(skip_spaces(after));
 			count = Some(parse_u32(num)?);
 			rest = after_num;
+		} else if tok == b"--json" || tok == b"-j" {
+			format = OutputFormat::Json;
+			rest = after;
 		} else if tok.first() == Some(&b'-') {
 			return None;
 		} else {
@@ -238,7 +328,7 @@ fn parse_args(args: &[u8]) -> Option<(Option<u32>, &[u8])> {
 			rest = after;
 		}
 	}
-	Some((count, target))
+	Some((count, format, target))
 }
 
 // Drop leading spaces.
