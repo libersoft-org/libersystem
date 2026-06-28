@@ -14,7 +14,7 @@ proto_dir := "proto"
 wasm_dir := "wasm"
 sdk_dir := "sdk"
 term_dir := "term"
-lsfs_dir := "lsfs"
+liberfs_dir := "liberfs"
 target := "x86_64-unknown-none"
 kernel_elf := kernel_dir / "target" / target / "debug" / "kernel"
 
@@ -91,7 +91,7 @@ fmt:
 	cd {{wasm_dir}} && cargo fmt
 	cd {{sdk_dir}} && cargo fmt
 	cd {{term_dir}} && cargo fmt
-	cd {{lsfs_dir}} && cargo fmt
+	cd {{liberfs_dir}} && cargo fmt
 	shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # check formatting without writing changes (CI-friendly)
@@ -109,7 +109,7 @@ fmt-check:
 	cd {{wasm_dir}} && cargo fmt --check
 	cd {{sdk_dir}} && cargo fmt --check
 	cd {{term_dir}} && cargo fmt --check
-	cd {{lsfs_dir}} && cargo fmt --check
+	cd {{liberfs_dir}} && cargo fmt --check
 	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # clean build artifacts
@@ -127,6 +127,6 @@ clean:
 	cd {{wasm_dir}} && cargo clean
 	cd {{sdk_dir}} && cargo clean
 	cd {{term_dir}} && cargo clean
-	cd {{lsfs_dir}} && cargo clean
+	cd {{liberfs_dir}} && cargo clean
 	rm -f volume/app.wasm
 	rm -rf boot/.build

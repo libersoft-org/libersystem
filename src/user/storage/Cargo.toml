@@ -25,9 +25,9 @@ rt = { path = "../rt" }
 # the demo client speaks it, both via the proto codec + dispatch/client.
 proto = { path = "../../proto" }
 
-# The writable on-disk filesystem (LSFS) StorageService mounts on the virtio-blk
+# The writable on-disk filesystem (LiberFS) StorageService mounts on the virtio-blk
 # disk for the M43 persistent volume.
-lsfs = { path = "../../lsfs" }
+liberfs = { path = "../../liberfs" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

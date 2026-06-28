@@ -1,4 +1,4 @@
-//! LSFS - a small writable, copy-on-write on-disk filesystem for LiberSystem.
+//! LiberFS - a small writable, copy-on-write on-disk filesystem for LiberSystem.
 //!
 //! The on-disk layout is a deliberately small Unix-flavoured filesystem turned
 //! copy-on-write: two superblock slots at blocks 0 and 1, then one flat pool of
@@ -35,8 +35,8 @@
 //!
 //! Because the previous generation's blocks are not freed at commit (they stay
 //! reserved by the free-map walk), the superblock slot it still occupies remains a
-//! consistent, read-only snapshot of the filesystem one commit ago. [`Lsfs::mount`]
-//! opens the newest generation; [`Lsfs::mount_snapshot`] opens that previous one
+//! consistent, read-only snapshot of the filesystem one commit ago. [`LiberFs::mount`]
+//! opens the newest generation; [`LiberFs::mount_snapshot`] opens that previous one
 //! read-only. This is the structural groundwork for snapshots; the full snapshot UX
 //! is a later milestone. The generation before last is reclaimed by the next commit.
 //!
@@ -45,7 +45,7 @@
 //! Each block is checksummed with a CRC32C stored beside the pointer to it (in the
 //! inode for direct blocks, in the indirect block for the rest). The checksum is
 //! computed on write and rechecked on every read, so a flipped bit on disk surfaces
-//! as [`FsError::Corrupt`] instead of silently corrupt data; [`Lsfs::fsck`] walks
+//! as [`FsError::Corrupt`] instead of silently corrupt data; [`LiberFs::fsck`] walks
 //! every live data block and reports how many fail their checksum. With copy-on-write
 //! a crash can no longer leak blocks or orphan an inode, so `fsck` no longer needs to
 //! reclaim them.
@@ -68,7 +68,7 @@ pub const BLOCK_SIZE: usize = 4096;
 // timestamps; version 3 pairs every block pointer with a CRC32C of the block it points
 // at; version 4 turns the layout copy-on-write: two superblock slots, a flat block
 // pool with no on-disk bitmap, and an inode table reached through an index block.
-const MAGIC: [u8; 8] = *b"LSFS0001";
+const MAGIC: [u8; 8] = *b"LIBERFS1";
 const VERSION: u32 = 4;
 
 // The two superblock slots (blocks 0 and 1): a commit writes the new superblock to the
@@ -155,7 +155,7 @@ pub enum FsError {
 	Io,
 }
 
-// Metadata about one path, returned by [`Lsfs::stat`]: its byte length, whether it is
+// Metadata about one path, returned by [`LiberFs::stat`]: its byte length, whether it is
 // a directory, and its created / modified logical timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stat {
@@ -165,7 +165,7 @@ pub struct Stat {
 	pub mtime: u64,
 }
 
-// What an [`Lsfs::fsck`] pass reclaimed: blocks that the bitmap marked allocated but
+// What an [`LiberFs::fsck`] pass reclaimed: blocks that the bitmap marked allocated but
 // no live inode referenced, and inodes that were allocated but named by no directory
 // (orphans left by a crash mid-write); plus how many live data blocks failed their
 // checksum (on-disk corruption found while walking the tree).
@@ -263,7 +263,7 @@ impl Inode {
 	}
 }
 
-// A mounted LSFS over a block device. Copy-on-write: the inode table is reached
+// A mounted LiberFS over a block device. Copy-on-write: the inode table is reached
 // through an in-memory `itable` (the (block, CRC32C) of each inode-table block, kept
 // in sync with the index block) rather than a fixed region, and `free` is rebuilt at
 // mount from the blocks the live and previous generations reference - there is no
@@ -274,7 +274,7 @@ impl Inode {
 // fresh blocks (tracked in `fresh`) and copies metadata up, and `commit` writes a new
 // superblock to the inactive slot - or `abort` rolls back. The previous generation's
 // `itable` and index stay reserved so it remains a read-only snapshot.
-pub struct Lsfs<D: BlockDevice> {
+pub struct LiberFs<D: BlockDevice> {
 	dev: D,
 	num_blocks: u32,
 	num_inodes: u32,
@@ -302,13 +302,13 @@ pub struct Lsfs<D: BlockDevice> {
 	clock: u64,
 }
 
-impl<D: BlockDevice> Lsfs<D> {
-	// Format `dev` as a fresh, empty LSFS spanning `num_blocks` blocks (an empty root
+impl<D: BlockDevice> LiberFs<D> {
+	// Format `dev` as a fresh, empty LiberFS spanning `num_blocks` blocks (an empty root
 	// directory, no files), then return it mounted. Generation 0 lays out the two
 	// superblock slots, the inode-table blocks, and the index block; everything else is
 	// the free pool. The inode table scales with the volume but is capped so its index
 	// fits one block.
-	pub fn format(mut dev: D, num_blocks: u32) -> Result<Lsfs<D>, FsError> {
+	pub fn format(mut dev: D, num_blocks: u32) -> Result<LiberFs<D>, FsError> {
 		// scale the inode count with the volume, rounded up to whole inode blocks, and
 		// capped so the whole inode-table index fits one block.
 		let want_inodes = (num_blocks / BLOCKS_PER_INODE).max(MIN_INODES);
@@ -361,14 +361,14 @@ impl<D: BlockDevice> Lsfs<D> {
 			return Err(FsError::Io);
 		}
 
-		let mut fs = Lsfs { dev, num_blocks, num_inodes, inode_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, itable, itable_index: index_block, prev_itable: None, prev_index: 0, free: vec![0u8; (num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn_itable: None, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks, num_inodes, inode_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, itable, itable_index: index_block, prev_itable: None, prev_index: 0, free: vec![0u8; (num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn_itable: None, clock: 0 };
 		fs.derive_free()?;
 		Ok(fs)
 	}
 
-	// Mount an existing LSFS on `dev` at its newest committed generation. Returns None
-	// if neither superblock slot is a valid LSFS (an unformatted or foreign disk).
-	pub fn mount(dev: D) -> Option<Lsfs<D>> {
+	// Mount an existing LiberFS on `dev` at its newest committed generation. Returns None
+	// if neither superblock slot is a valid LiberFS (an unformatted or foreign disk).
+	pub fn mount(dev: D) -> Option<LiberFs<D>> {
 		Self::mount_at(dev, true)
 	}
 
@@ -376,11 +376,11 @@ impl<D: BlockDevice> Lsfs<D> {
 	// filesystem one commit ago. Returns None unless both superblock slots are valid (a
 	// freshly formatted or single-generation volume has no older snapshot). The handle
 	// is meant for reading; writing to it would interleave generations.
-	pub fn mount_snapshot(dev: D) -> Option<Lsfs<D>> {
+	pub fn mount_snapshot(dev: D) -> Option<LiberFs<D>> {
 		Self::mount_at(dev, false)
 	}
 
-	fn mount_at(mut dev: D, newest: bool) -> Option<Lsfs<D>> {
+	fn mount_at(mut dev: D, newest: bool) -> Option<LiberFs<D>> {
 		// read and validate both superblock slots.
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		let mut slots: [Option<Superblock>; SUPER_SLOTS as usize] = [None, None];
@@ -415,7 +415,7 @@ impl<D: BlockDevice> Lsfs<D> {
 			None => (None, 0),
 		};
 
-		let mut fs = Lsfs { dev, num_blocks: sb.num_blocks, num_inodes: sb.num_inodes, inode_blocks: sb.inode_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, itable, itable_index: sb.itable_index, prev_itable, prev_index, free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn_itable: None, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, num_inodes: sb.num_inodes, inode_blocks: sb.inode_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, itable, itable_index: sb.itable_index, prev_itable, prev_index, free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn_itable: None, clock: 0 };
 		fs.derive_free().ok()?;
 		Some(fs)
 	}
@@ -1464,7 +1464,7 @@ fn serialize_superblock(sb: &Superblock) -> Vec<u8> {
 	block
 }
 
-// Parse and validate a superblock block: it must carry the LSFS magic and version,
+// Parse and validate a superblock block: it must carry the LiberFS magic and version,
 // match this build's block size, and pass its own CRC32C. Returns None otherwise (an
 // unformatted slot, a foreign disk, or a torn commit).
 fn parse_superblock(block: &[u8]) -> Option<Superblock> {

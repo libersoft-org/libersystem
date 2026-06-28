@@ -7,7 +7,7 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
-name = "lsfs"
+name = "liberfs"
 version = "0.0.0"
 
 [[package]]
@@ -26,7 +26,7 @@ dependencies = [
 name = "storage"
 version = "0.0.0"
 dependencies = [
- "lsfs",
+ "liberfs",
  "proto",
  "rt",
 ]

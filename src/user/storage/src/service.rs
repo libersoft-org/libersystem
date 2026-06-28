@@ -7,14 +7,14 @@
 //          PKGARCH1 archive - a read-only volume (the kernel's direct-client test
 //          path); or
 //        "BLOCK", with a channel capability to the virtio-blk driver's block
-//          service, on which a writable on-disk filesystem (LSFS) is mounted - the
+//          service, on which a writable on-disk filesystem (LiberFS) is mounted - the
 //          boot path. A fresh or stale disk is formatted and seeded from the factory
 //          archive laid at LBA 0, so the volume always starts with its seed files;
 //   2. "SERVE", with a channel capability on which clients send requests.
 // The service then serves the generated Storage.Volume contract: `open` resolves a
 // vol:// path and replies with the file's length plus a MemoryObject capability to
 // its bytes (handle<file>, a zero-copy read); `list` enumerates the volume; and on a
-// writable (LSFS) volume `write` creates-or-truncates a file from a zero-copy
+// writable (LiberFS) volume `write` creates-or-truncates a file from a zero-copy
 // `buffer` and `remove` deletes one, both persisting to the disk so they survive a
 // reboot. A read-only (archive) volume rejects writes with `denied`.
 
@@ -25,7 +25,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use lsfs::{BlockDevice, FsError, Lsfs};
+use liberfs::{BlockDevice, FsError, LiberFs};
 use proto::codec::Buffer;
 use proto::system::{volume, Error, FileInfo, OpenOpts, OpenResult};
 use rt::*;
@@ -42,11 +42,11 @@ const MAX_SECTORS_PER_READ: usize = 8;
 const OP_READ: u32 = 0;
 const OP_WRITE: u32 = 1;
 
-// LSFS layout on the disk: the writable filesystem spans FS_BLOCKS filesystem blocks
+// LiberFS layout on the disk: the writable filesystem spans FS_BLOCKS filesystem blocks
 // (one block = SECTORS_PER_BLOCK disk sectors) starting at FS_START_SECTOR - well past
 // the small factory archive at LBA 0, which the boot runner re-lays every boot and the
 // filesystem never overwrites, so created files persist across reboots.
-const SECTORS_PER_BLOCK: u64 = (lsfs::BLOCK_SIZE / SECTOR_SIZE) as u64;
+const SECTORS_PER_BLOCK: u64 = (liberfs::BLOCK_SIZE / SECTOR_SIZE) as u64;
 const FS_START_SECTOR: u64 = 2048;
 const FS_BLOCKS: u32 = 64;
 
@@ -58,7 +58,7 @@ const MAX_WRITE: usize = 256 * 1024;
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	// 1. volume backing: the legacy ramdisk archive (read-only, kernel test) or the
-	//    virtio-blk disk mounted as a writable LSFS (real boot).
+	//    virtio-blk disk mounted as a writable LiberFS (real boot).
 	let mut vol: Volume = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"RAMDISK" => {
 			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
@@ -93,11 +93,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 }
 
 // The volume backing, behind the generated Storage.Volume contract: either a
-// read-only PKGARCH1 archive mapped in memory (the ramdisk path) or a writable LSFS
+// read-only PKGARCH1 archive mapped in memory (the ramdisk path) or a writable LiberFS
 // on the virtio-blk disk (the boot path).
 enum Volume {
 	Archive { base: u64, len: usize },
-	Disk(Lsfs<ChannelBlockDevice>),
+	Disk(LiberFs<ChannelBlockDevice>),
 }
 
 impl volume::Service for Volume {
@@ -185,7 +185,7 @@ impl Volume {
 	}
 }
 
-// Map an LSFS error onto the Storage.Volume `error` enum.
+// Map an LiberFS error onto the Storage.Volume `error` enum.
 fn map_fs_err(e: FsError) -> Error {
 	match e {
 		FsError::NotFound => Error::NotFound,
@@ -224,7 +224,7 @@ unsafe fn make_file_buffer(file: &[u8]) -> Option<u64> {
 	}
 }
 
-// The virtio-blk disk as a block device for LSFS: each LSFS block maps to
+// The virtio-blk disk as a block device for LiberFS: each LiberFS block maps to
 // SECTORS_PER_BLOCK consecutive disk sectors, offset to the filesystem region at
 // FS_START_SECTOR. Reads and writes go through the driver's block service on `chan`,
 // which stays open for the life of the service.
@@ -244,18 +244,18 @@ impl BlockDevice for ChannelBlockDevice {
 	}
 }
 
-// Mount the LSFS on the virtio-blk disk, or, on a fresh or stale disk, format a new
+// Mount the LiberFS on the virtio-blk disk, or, on a fresh or stale disk, format a new
 // filesystem and seed it from the factory archive laid at LBA 0 so the volume always
 // starts with its seed files. The block channel stays open for the serve loop.
-unsafe fn mount_or_format(block_client: u64) -> Option<Lsfs<ChannelBlockDevice>> {
+unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>> {
 	// an existing filesystem (files persisted from a previous boot) mounts as-is.
-	if let Some(fs) = Lsfs::mount(ChannelBlockDevice { chan: block_client }) {
+	if let Some(fs) = LiberFs::mount(ChannelBlockDevice { chan: block_client }) {
 		return Some(fs);
 	}
 	// otherwise lay down a fresh filesystem and copy in the factory seed files. The
 	// device is rebuilt from the (Copy) channel handle - the failed mount consumed the
 	// previous device value but left the channel open.
-	let mut fs: Lsfs<ChannelBlockDevice> = Lsfs::format(ChannelBlockDevice { chan: block_client }, FS_BLOCKS).ok()?;
+	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format(ChannelBlockDevice { chan: block_client }, FS_BLOCKS).ok()?;
 	if let Some(archive) = unsafe { read_seed_archive(block_client) } {
 		seed_from_archive(&mut fs, &archive);
 	}
@@ -264,7 +264,7 @@ unsafe fn mount_or_format(block_client: u64) -> Option<Lsfs<ChannelBlockDevice>>
 
 // Copy every file from the factory PKGARCH1 archive into the filesystem (best effort;
 // a file that does not fit is skipped).
-fn seed_from_archive(fs: &mut Lsfs<ChannelBlockDevice>, archive: &[u8]) {
+fn seed_from_archive(fs: &mut LiberFs<ChannelBlockDevice>, archive: &[u8]) {
 	let Some(package) = Package::parse(archive) else {
 		return;
 	};
