@@ -697,6 +697,62 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	Ok((expected, read_back.bytes, summary.bytes))
 }
 
+// Build the M41 component topology and run it to completion. A StorageService serves
+// the ramdisk volume and a LogService holds the journal; the component_host is given
+// exactly two capabilities - a StorageService client and a LogService client - and
+// nothing else. It loads a real Wasm component (built by the Rust SDK, served from
+// storage as vol://system/app.wasm rather than embedded in the kernel image) and runs
+// it: the component's three imports are wired by name to the two services - `read` /
+// `write` to StorageService, `log` to LogService - with no ambient authority. The
+// component reads its one granted file, upper-cases it, logs the result through
+// LogService, writes it back, and returns the count; the host also calls the
+// component's float `score` export. The kernel only brokers the initial capabilities.
+// Returns (expected, content, logged, score): the upper-cased granted file, the bytes
+// the component produced, whether the log grant was reached, and the float result.
+#[cfg(test)]
+fn run_component_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, bool, i32), &'static str> {
+	use object::channel::Channel;
+	use object::rights::Rights;
+
+	let (volume, package) = scenario_packages()?;
+	let raw = volume_file(volume, b"hello.txt")?;
+	let expected: alloc::vec::Vec<u8> = raw.iter().map(|b: &u8| b.to_ascii_uppercase()).collect();
+	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
+	let log_elf = package.lookup(b"log_service").ok_or("log_service missing from the init package")?;
+	let host_elf = package.lookup(b"component_host").ok_or("component_host missing from the init package")?;
+
+	let (storage_boot_kernel, storage_boot_user) = Channel::create();
+	let (log_boot_kernel, log_boot_user) = Channel::create();
+	let (host_boot_kernel, host_boot_user) = Channel::create();
+	let (storage_server, storage_client) = Channel::create();
+	let (log_server, log_client) = Channel::create();
+
+	let domain = sched::root_domain();
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
+	loader::spawn_elf_process(domain.clone(), log_elf, log_boot_user, Rights::ALL, 0).map_err(|_| "failed to load LogService")?;
+	loader::spawn_elf_process(domain, host_elf, host_boot_user, Rights::ALL, 0).map_err(|_| "failed to load component_host")?;
+
+	// StorageService: the ramdisk volume and its service channel. LogService: its
+	// service channel. component_host: the StorageService client, then the LogService
+	// client - exactly the two capabilities its world is wired to, and nothing else.
+	send_ramdisk(&storage_boot_kernel, volume)?;
+	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL)?;
+	send_cap(&log_boot_kernel, b"SERVE", log_server, Rights::ALL)?;
+	send_cap(&host_boot_kernel, b"STORAGE", storage_client, Rights::ALL)?;
+	send_cap(&host_boot_kernel, b"LOG", log_client, Rights::ALL)?;
+
+	sched::run_until_idle();
+	let result = host_boot_kernel.recv().map_err(|_| "the host reported no result")?;
+	let bytes: alloc::vec::Vec<u8> = result.bytes;
+	if bytes.len() < 5 {
+		return Err("the host report was too short");
+	}
+	let logged: bool = bytes[0] != 0;
+	let score: i32 = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+	let content: alloc::vec::Vec<u8> = bytes[5..].to_vec();
+	Ok((expected, content, logged, score))
+}
+
 // Build the M39 resource topology and run it to completion. The resource_manager
 // (ResourceManager) is given the init package (to launch the component it governs from) and
 // the channel its clients reach it on - nothing more, since it governs through the kernel's
@@ -2454,6 +2510,27 @@ fn permission_manager_sandboxes_a_component() {
 	assert!(!expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(read_back, expected, "the sandboxed component read its one granted file through the storage grant");
 	assert_eq!(summary.as_slice(), b"storage=grant log=grant network=deny", "the component was granted exactly its manifest - storage and log - and denied network");
+}
+
+#[cfg(test)]
+#[test_case]
+fn component_host_runs_an_sdk_component() {
+	// component_host (a ring-3 process) loads a real Wasm component - built by the Rust
+	// SDK and served from storage as vol://system/app.wasm, not embedded in the kernel
+	// image - and runs it. Its three imports are resolved by name and wired to two
+	// typed services with no ambient authority: `read` / `write` to StorageService,
+	// `log` to LogService. The component reads its one granted file, upper-cases it,
+	// logs the result through LogService, writes it back, and returns the count; the
+	// host also calls the component's float `score` export. The bytes the component
+	// produced must equal the upper-cased granted file (a real SDK component performed a
+	// capability-gated filesystem read and transformed it on the interpreter), the log
+	// grant must have been reached (the second typed service was wired - no ambient
+	// authority), and score(10) must be 17 (the float path on genuine toolchain output).
+	let (expected, content, logged, score) = run_component_scenario().expect("the component scenario should run");
+	assert!(!expected.is_empty(), "the granted file should not be empty");
+	assert_eq!(content, expected, "the component read, transformed, and returned its granted file's bytes through the host imports");
+	assert!(logged, "the component reached its LogService grant - the second typed service was wired with no ambient authority");
+	assert_eq!(score, 17, "the component's float `score` export computed floor(10 * 1.5 + 2.0) on real toolchain output");
 }
 
 #[cfg(test)]

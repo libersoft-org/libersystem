@@ -37,3 +37,5 @@ target/
 .DS_Store
 Thumbs.db
 desktop.ini
+# Component SDK build artifact staged into the ramdisk volume (built by `just sdk`)
+src/volume/app.wasm

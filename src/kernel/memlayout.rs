@@ -26,9 +26,11 @@ pub(crate) const USER_STACK_VA: u64 = 0x0000_0000_4001_0000;
 // the program's load address and clear of the kernel's higher half) and grows
 // down from USER_STACK_TOP over USER_STACK_PAGES pages. USER_STACK_TOP is part of
 // the spawn ABI (a userspace spawner passes it to thread_create), so its value is
-// sourced from the abi crate.
+// sourced from the abi crate. The stack is 64 KiB: a debug-built service can run a
+// deep call chain (e.g. the Wasm interpreter dispatching an import that fans out
+// through a generated service client and the codec), which overruns a smaller one.
 pub(crate) const USER_STACK_TOP: u64 = abi::USER_STACK_TOP;
-pub(crate) const USER_STACK_PAGES: u64 = 4;
+pub(crate) const USER_STACK_PAGES: u64 = 16;
 
 // Ring-3 syscall-mapped MemoryObjects bump up from here. The base sits far above
 // the program and stack the loader places below the 2 GiB line, yet within the

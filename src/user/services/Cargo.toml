@@ -81,6 +81,10 @@ name = "wasi_host"
 path = "src/wasi_host.rs"
 
 [[bin]]
+name = "component_host"
+path = "src/component_host.rs"
+
+[[bin]]
 name = "file_picker"
 path = "src/file_picker.rs"
 

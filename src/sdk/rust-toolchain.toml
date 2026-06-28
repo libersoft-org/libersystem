@@ -1,0 +1,6 @@
+[toolchain]
+# The component SDK builds for wasm32-unknown-unknown, whose rust-std ships on the
+# stable channel. Pinning it here (with the target) keeps the guest build
+# reproducible regardless of the workspace's default toolchain.
+channel = "stable"
+targets = ["wasm32-unknown-unknown"]

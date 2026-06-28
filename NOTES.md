@@ -1,3 +1,5 @@
+- add "cd" command
+- GPU driver keeps failing probably (screen sometimes blinking after few minutes - probably restartind driver or something)
 - Boot log - [ OK ] [FAIL] [INFO] [WARN]
 - What is the difference between SYS_CLOCK_GET, SYS_CLOCK_RTC and SYS_CLOCK_MONO_NS? Also clock(), clock_rtc() and clock_ns()?
 - "exit" command should not halt the machine, but just exits the shell and shows up the parent shell (shell that started this console). If there is no parent, just reload the whole shell

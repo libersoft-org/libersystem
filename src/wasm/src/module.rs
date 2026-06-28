@@ -5,12 +5,14 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-// A value type. The runtime handles the 32/64-bit integers; floats and reference
+// A value type. The runtime handles the 32/64-bit integers and floats; reference
 // types are out of scope for the minimal host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValType {
 	I32,
 	I64,
+	F32,
+	F64,
 }
 
 // A function signature: the parameter and result value types.
@@ -55,6 +57,25 @@ pub struct Export {
 	pub index: u32,
 }
 
+// A defined global: its value type, whether it is mutable, and its constant
+// initial value (held as a 64-bit pattern; an i32 global uses the low 32 bits, and
+// a float global stores its IEEE-754 bits). The minimal runtime supports only
+// constant init expressions (`i32.const` / `i64.const` / `f32.const` / `f64.const`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Global {
+	pub val_type: ValType,
+	pub mutable: bool,
+	pub init: i64,
+}
+
+// An active data segment: raw bytes copied into linear memory at `offset` when the
+// module is instantiated. Passive segments are out of scope for the minimal runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataSegment {
+	pub offset: u32,
+	pub bytes: Vec<u8>,
+}
+
 // A parsed module. `memory_min_pages` is the declared minimum of the single memory
 // (0 if the module declares none); one page is 64 KiB.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -64,6 +85,8 @@ pub struct Module {
 	pub funcs: Vec<Func>,
 	pub exports: Vec<Export>,
 	pub memory_min_pages: u32,
+	pub globals: Vec<Global>,
+	pub data: Vec<DataSegment>,
 }
 
 impl Module {

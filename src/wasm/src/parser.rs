@@ -4,7 +4,7 @@
 // are skipped by their declared size, so a module may carry them as long as the
 // runtime does not need them.
 
-use crate::module::{Export, ExportKind, Func, FuncType, Import, Module, ValType};
+use crate::module::{DataSegment, Export, ExportKind, Func, FuncType, Global, Import, Module, ValType};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -59,6 +59,26 @@ impl<'a> Reader<'a> {
 		}
 	}
 
+	// Signed LEB128, sign-extended into 64 bits.
+	fn i64(&mut self) -> Result<i64, ParseError> {
+		let mut result: i64 = 0;
+		let mut shift: u32 = 0;
+		loop {
+			let b: u8 = self.byte()?;
+			result |= ((b & 0x7f) as i64) << shift;
+			shift += 7;
+			if b & 0x80 == 0 {
+				if shift < 64 && (b & 0x40) != 0 {
+					result |= -1i64 << shift;
+				}
+				return Ok(result);
+			}
+			if shift >= 64 {
+				return Err(ParseError("LEB128 overflow"));
+			}
+		}
+	}
+
 	// A length-prefixed UTF-8 name.
 	fn name(&mut self) -> Result<String, ParseError> {
 		let n: usize = self.u32()? as usize;
@@ -71,6 +91,8 @@ fn val_type(b: u8) -> Result<ValType, ParseError> {
 	match b {
 		0x7f => Ok(ValType::I32),
 		0x7e => Ok(ValType::I64),
+		0x7d => Ok(ValType::F32),
+		0x7c => Ok(ValType::F64),
 		_ => Err(ParseError("unsupported value type")),
 	}
 }
@@ -97,8 +119,10 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
 			2 => parse_imports(&mut r, &mut m)?,
 			3 => parse_functions(&mut r, &mut m)?,
 			5 => parse_memory(&mut r, &mut m)?,
+			6 => parse_globals(&mut r, &mut m)?,
 			7 => parse_exports(&mut r, &mut m)?,
 			10 => parse_code(&mut r, &mut m)?,
+			11 => parse_data(&mut r, &mut m)?,
 			_ => r.pos = end, // skip a section the runtime does not need
 		}
 		if r.pos != end {
@@ -167,6 +191,75 @@ fn parse_memory(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 			let _max: u32 = r.u32()?; // a maximum is allowed but unused
 		}
 		m.memory_min_pages = min;
+	}
+	Ok(())
+}
+
+// Read a constant init expression - a single `i32.const` / `i64.const` /
+// `f32.const` / `f64.const` followed by `end` - returning its value as a 64-bit
+// pattern (floats are stored as their IEEE-754 bits). Other (non-constant) init
+// expressions are rejected; the minimal runtime only supports constant globals /
+// data offsets.
+fn const_expr(r: &mut Reader) -> Result<i64, ParseError> {
+	let op: u8 = r.byte()?;
+	let v: i64 = match op {
+		0x41 => r.i64()? as i32 as i64, // i32.const (sign-extended via i32)
+		0x42 => r.i64()?,               // i64.const
+		0x43 => {
+			let b: &[u8] = r.bytes(4)?; // f32.const: raw IEEE-754 bits, little-endian
+			u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64
+		}
+		0x44 => {
+			let b: &[u8] = r.bytes(8)?; // f64.const: raw IEEE-754 bits, little-endian
+			u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as i64
+		}
+		_ => return Err(ParseError("unsupported constant expression")),
+	};
+	if r.byte()? != 0x0b {
+		return Err(ParseError("constant expression must end in `end`"));
+	}
+	Ok(v)
+}
+
+fn parse_globals(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
+	let count: u32 = r.u32()?;
+	for _ in 0..count {
+		let val_type: ValType = val_type(r.byte()?)?;
+		let mutable: bool = match r.byte()? {
+			0x00 => false,
+			0x01 => true,
+			_ => return Err(ParseError("invalid global mutability")),
+		};
+		let init: i64 = const_expr(r)?;
+		m.globals.push(Global { val_type, mutable, init });
+	}
+	Ok(())
+}
+
+fn parse_data(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
+	let count: u32 = r.u32()?;
+	for _ in 0..count {
+		let flags: u32 = r.u32()?;
+		match flags {
+			0 => {
+				// active segment, memory 0, with an offset expression
+				let offset: u32 = const_expr(r)? as u32;
+				let n: usize = r.u32()? as usize;
+				let bytes: Vec<u8> = r.bytes(n)?.to_vec();
+				m.data.push(DataSegment { offset, bytes });
+			}
+			2 => {
+				// active segment with an explicit memory index (must be 0)
+				if r.u32()? != 0 {
+					return Err(ParseError("only memory 0 is supported"));
+				}
+				let offset: u32 = const_expr(r)? as u32;
+				let n: usize = r.u32()? as usize;
+				let bytes: Vec<u8> = r.bytes(n)?.to_vec();
+				m.data.push(DataSegment { offset, bytes });
+			}
+			_ => return Err(ParseError("passive data segments are not supported")),
+		}
 	}
 	Ok(())
 }

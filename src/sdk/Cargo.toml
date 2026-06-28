@@ -1,0 +1,22 @@
+[package]
+name = "liber_component"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted. This crate is the LiberSystem component SDK
+# example: a guest built for wasm32-unknown-unknown against the `liber` world and
+# run on the kernel's WASI host (see src/user/services/src/component_host.rs).
+edition = "2024"
+description = "LiberSystem component SDK: a Rust guest built against the liber world"
+
+[lib]
+# A cdylib so the toolchain emits a WebAssembly module (imports + exports), not a
+# host archive. The build recipe (`just sdk`) compiles it for wasm32-unknown-unknown
+# and copies the artifact into src/volume so StorageService serves it over vol://.
+crate-type = ["cdylib"]
+
+[profile.release]
+# wasm32-unknown-unknown is not abort-by-default, so the component opts into abort
+# (no unwinder in a wasm guest) and is size-optimized into one small module.
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true

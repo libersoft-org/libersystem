@@ -1,0 +1,6 @@
+# The default wasm32 stack is 1 MiB, which forces the module's initial linear
+# memory to 17 pages (~1.1 MB) - more than the host process's heap can hold for a
+# component's whole linear memory. A component needs only a small stack, so cap it
+# at 64 KiB; the module's initial memory then fits comfortably in the host heap.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=65536"]

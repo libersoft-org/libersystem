@@ -12,6 +12,7 @@ abi_dir := "abi"
 tools_dir := "tools/lsidl-gen"
 proto_dir := "proto"
 wasm_dir := "wasm"
+sdk_dir := "sdk"
 term_dir := "term"
 lsfs_dir := "lsfs"
 target := "x86_64-unknown-none"
@@ -28,8 +29,15 @@ user:
 	cd {{drivers_dir}} && cargo build
 	cd {{usertools_dir}} && cargo build
 
+# build the WebAssembly component SDK example (the `liber` world guest) for
+# wasm32-unknown-unknown and stage it into the ramdisk volume as app.wasm, where
+# StorageService serves it over vol:// for the component_host to load and run
+sdk:
+	cd {{sdk_dir}} && cargo build --release --target wasm32-unknown-unknown
+	cp {{sdk_dir}}/target/wasm32-unknown-unknown/release/liber_component.wasm volume/app.wasm
+
 # build the kernel (its build.rs assembles the init package from the userspace build)
-build: user
+build: sdk user
 	cd {{kernel_dir}} && cargo build
 
 # generate the proto crate's bindings from the LSIDL interface definitions
@@ -40,11 +48,11 @@ gen:
 
 # build + boot in QEMU (serial on stdout). Add live displays as arguments
 # (combinable): `just run`, `just run vnc`, `just run spice`, `just run vnc spice`
-run *displays: user
+run *displays: sdk user
 	cd {{kernel_dir}} && DISPLAYS="{{displays}}" cargo run
 
 # build + boot, QEMU waits for GDB (port :1234)
-debug: user
+debug: sdk user
 	cd {{kernel_dir}} && DEBUG=1 NOKVM=1 cargo run
 
 # attach GDB to a running QEMU (run in a second panel after 'just debug')
@@ -52,7 +60,7 @@ gdb:
 	gdb -x boot/gdb-init {{kernel_elf}}
 
 # run tests in QEMU (isa-debug-exit)
-test: user
+test: sdk user
 	cd {{kernel_dir}} && TEST=1 cargo test
 
 # screenshot the framebuffer to a file (format by extension: png/jpg/webp/...);
@@ -81,6 +89,7 @@ fmt:
 	cd {{tools_dir}} && cargo fmt
 	cd {{proto_dir}} && cargo fmt
 	cd {{wasm_dir}} && cargo fmt
+	cd {{sdk_dir}} && cargo fmt
 	cd {{term_dir}} && cargo fmt
 	cd {{lsfs_dir}} && cargo fmt
 	shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
@@ -98,6 +107,7 @@ fmt-check:
 	cd {{tools_dir}} && cargo fmt --check
 	cd {{proto_dir}} && cargo fmt --check
 	cd {{wasm_dir}} && cargo fmt --check
+	cd {{sdk_dir}} && cargo fmt --check
 	cd {{term_dir}} && cargo fmt --check
 	cd {{lsfs_dir}} && cargo fmt --check
 	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
@@ -114,6 +124,9 @@ clean:
 	cd {{usertools_dir}} && cargo clean
 	cd {{tools_dir}} && cargo clean
 	cd {{proto_dir}} && cargo clean
+	cd {{wasm_dir}} && cargo clean
+	cd {{sdk_dir}} && cargo clean
 	cd {{term_dir}} && cargo clean
 	cd {{lsfs_dir}} && cargo clean
+	rm -f volume/app.wasm
 	rm -rf boot/.build
