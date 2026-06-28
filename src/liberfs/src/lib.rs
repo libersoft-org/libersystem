@@ -1339,11 +1339,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// allocated (overwrite in place), else copy up to a fresh metadata block so the
 	// committed generation keeps the original.
 	fn node_dest(&mut self, ptr: u64) -> Result<u64, FsError> {
-		if ptr != 0 && self.fresh.contains(&ptr) {
-			Ok(ptr)
-		} else {
-			self.alloc_meta()
-		}
+		if ptr != 0 && self.fresh.contains(&ptr) { Ok(ptr) } else { self.alloc_meta() }
 	}
 
 	// Write `buf` to block `ptr` and return its CRC32C (to store in the parent link).
@@ -2594,11 +2590,7 @@ fn find_extent(extents: &[Extent], lb: u64) -> Option<usize> {
 	if pos == 0 {
 		return None;
 	}
-	if extents[pos - 1].covers(lb) {
-		Some(pos - 1)
-	} else {
-		None
-	}
+	if extents[pos - 1].covers(lb) { Some(pos - 1) } else { None }
 }
 
 // Hash the 3-byte prefix at `w` into an LZ_HASH_BITS-wide match-finder bucket.

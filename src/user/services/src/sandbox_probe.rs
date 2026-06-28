@@ -21,7 +21,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{log, volume, Entry, Field, OpenOpts, Severity};
+use proto::system::{Entry, Field, OpenOpts, Severity, log, volume};
 use rt::*;
 
 // The one file the probe's storage grant lets it read (proving the grant is live).

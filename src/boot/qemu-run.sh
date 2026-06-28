@@ -41,6 +41,17 @@ mkdir -p "$HERE/.build"
 if [[ -f "$VOLUME_PKG" ]]; then
 	dd if="$VOLUME_PKG" of="$VIRTIO_DISK" bs=512 conv=notrunc status=none
 fi
+# A second virtio-blk disk holding a real FAT volume (M48): the media StorageService
+# instance mounts it read-only as `vol://media`. Built once with mtools (mformat +
+# mcopy) so it is a genuine FAT image, not a fixture; skipped if mtools is absent (the
+# media volume then simply does not mount). Files come from the volume/ seed dir.
+FAT_DISK="$HERE/.build/fat-media.img"
+if [[ ! -f "$FAT_DISK" ]] && command -v mformat >/dev/null && command -v mcopy >/dev/null; then
+	truncate -s 16M "$FAT_DISK"
+	mformat -i "$FAT_DISK" -F ::
+	mcopy -i "$FAT_DISK" "$HERE/../volume/hello.txt" ::hello.txt
+	mcopy -i "$FAT_DISK" "$HERE/../volume/motd.txt" ::motd.txt
+fi
 # Forward host 127.0.0.1:5555 to the guest's port 80, so a host HTTP client can reach
 # the guest's httpd (passive open / inbound) - SLIRP gives no inbound route otherwise.
 # Interactive runs only: the test path keeps a fixed device set and binds no host port.
@@ -57,6 +68,14 @@ QEMU_ARGS+=(
 	-device virtconsole,chardev=vcon
 	-chardev "file,id=vcon,path=$HERE/.build/virtio-console.out"
 )
+# The second virtio-blk disk (FAT vol://media), discovered after the system disk; only
+# attached when the FAT image was built (mtools present).
+if [[ -f "$FAT_DISK" ]]; then
+	QEMU_ARGS+=(
+		-drive "file=$FAT_DISK,if=none,id=vmedia,format=raw"
+		-device virtio-blk-pci,drive=vmedia,disable-legacy=on
+	)
+fi
 
 # display backends: the DISPLAYS env is a space-separated list, any of `vnc` and
 # `spice` (both may be given at once; empty = headless, serial only). The

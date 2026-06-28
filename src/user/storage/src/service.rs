@@ -9,7 +9,11 @@
 //        "BLOCK", with a channel capability to the virtio-blk driver's block
 //          service, on which a writable on-disk filesystem (LiberFS) is mounted - the
 //          boot path. A fresh or stale disk is formatted and seeded from the factory
-//          archive laid at LBA 0, so the volume always starts with its seed files;
+//          archive laid at LBA 0, so the volume always starts with its seed files; or
+//        "FATBLOCK", with a channel capability to a second virtio-blk driver's block
+//          service, on which a read-only FAT12/16/32 or exFAT volume is mounted as
+//          vol://media - reading a flash-drive / SD-card image through the same Volume
+//          contract;
 //   2. "SERVE", with a channel capability on which clients send requests.
 // The service then serves the generated Storage.Volume contract: `open` resolves a
 // vol:// path and replies with the file's length plus a MemoryObject capability to
@@ -25,13 +29,17 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use fat::FatFs;
 use liberfs::{BlockDevice, FsError, LiberFs};
 use proto::codec::Buffer;
-use proto::system::{volume, Error, FileInfo, OpenOpts, OpenResult, SnapshotInfo};
+use proto::system::{Error, FileInfo, OpenOpts, OpenResult, SnapshotInfo, volume};
 use rt::*;
 
-// the single volume this service serves; the URI's volume component must match
-const VOLUME_NAME: &[u8] = b"system";
+// the volume names this service answers to; the URI's volume component must match
+// one of these. "system" is the writable LiberFS disk; "media" is a read-only FAT
+// disk mounted off a second virtio-blk device.
+const SYSTEM_VOLUME: &[u8] = b"system";
+const MEDIA_VOLUME: &[u8] = b"media";
 
 // block-service protocol with driver.virtio-blk: request [op u32][lba u64][count u32]
 // where op 0 = read, 1 = write. A read replies [status u32] carrying a MemoryObject
@@ -72,6 +80,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(fs) => Volume::Disk(fs),
 			None => exit(),
 		},
+		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => match FatFs::mount(FatBlockDevice { chan: handle }) {
+			Some(fs) => Volume::Fat(fs),
+			None => exit(),
+		},
 		_ => exit(),
 	};
 	// 2. service endpoint: clients reach the service here.
@@ -93,11 +105,24 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 }
 
 // The volume backing, behind the generated Storage.Volume contract: either a
-// read-only PKGARCH1 archive mapped in memory (the ramdisk path) or a writable LiberFS
-// on the virtio-blk disk (the boot path).
+// read-only PKGARCH1 archive mapped in memory (the ramdisk path), a writable LiberFS
+// on the virtio-blk disk (the boot path), or a read-only FAT12/16/32/exFAT volume on
+// a second virtio-blk disk (foreign media).
 enum Volume {
 	Archive { base: u64, len: usize },
 	Disk(LiberFs<ChannelBlockDevice>),
+	Fat(FatFs<FatBlockDevice>),
+}
+
+impl Volume {
+	// The vol:// name this backing answers to: writable LiberFS (and the test archive)
+	// is "system"; the read-only FAT media is "media".
+	fn name(&self) -> &'static [u8] {
+		match self {
+			Volume::Fat(_) => MEDIA_VOLUME,
+			_ => SYSTEM_VOLUME,
+		}
+	}
 }
 
 impl volume::Service for Volume {
@@ -109,7 +134,7 @@ impl volume::Service for Volume {
 			return Err(Error::Denied);
 		}
 		let target: VolumePath = VolumePath::parse(o.path.as_bytes()).ok_or(Error::NotFound)?;
-		if target.volume != VOLUME_NAME {
+		if target.volume != self.name() {
 			return Err(Error::NotFound);
 		}
 		let name: &[u8] = target.path.as_bytes();
@@ -122,6 +147,11 @@ impl volume::Service for Volume {
 			}
 			Volume::Disk(fs) => {
 				let file: Vec<u8> = fs.read_file(name).map_err(map_fs_err)?;
+				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
+				Ok(OpenResult { file: handle, size: file.len() as u64 })
+			}
+			Volume::Fat(fs) => {
+				let file: Vec<u8> = fs.read_file(name).map_err(map_fat_err)?;
 				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
 				Ok(OpenResult { file: handle, size: file.len() as u64 })
 			}
@@ -147,6 +177,10 @@ impl volume::Service for Volume {
 				let entries = fs.list().map_err(map_fs_err)?;
 				Ok(entries.into_iter().map(|(name, size)| FileInfo { name: String::from_utf8_lossy(&name).into_owned(), size }).collect())
 			}
+			Volume::Fat(fs) => {
+				let entries = fs.list().map_err(map_fat_err)?;
+				Ok(entries.into_iter().map(|e| FileInfo { name: e.name, size: e.size }).collect())
+			}
 		}
 	}
 
@@ -160,6 +194,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.write_file(name, &bytes).map_err(map_fs_err),
+			Volume::Fat(_) => Err(Error::Denied),
 		}
 	}
 
@@ -169,6 +204,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.remove(name).map_err(map_fs_err),
+			Volume::Fat(_) => Err(Error::Denied),
 		}
 	}
 
@@ -178,6 +214,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.create_snapshot(name.as_bytes()).map_err(map_fs_err),
+			Volume::Fat(_) => Err(Error::Denied),
 		}
 	}
 
@@ -190,6 +227,7 @@ impl volume::Service for Volume {
 				let snaps = fs.list_snapshots().map_err(map_fs_err)?;
 				Ok(snaps.into_iter().map(|(name, generation)| SnapshotInfo { name: String::from_utf8_lossy(&name).into_owned(), generation }).collect())
 			}
+			Volume::Fat(_) => Ok(Vec::new()),
 		}
 	}
 
@@ -199,6 +237,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.delete_snapshot(name.as_bytes()).map_err(map_fs_err),
+			Volume::Fat(_) => Err(Error::Denied),
 		}
 	}
 
@@ -218,6 +257,7 @@ impl volume::Service for Volume {
 				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
 				Ok(OpenResult { file: handle, size: file.len() as u64 })
 			}
+			Volume::Fat(_) => Err(Error::Denied),
 		}
 	}
 }
@@ -227,7 +267,7 @@ impl Volume {
 	// volume. The name borrows `path`, so it outlives the call.
 	fn writable_name<'a>(&self, path: &'a str) -> Result<&'a [u8], Error> {
 		let target: VolumePath<'a> = VolumePath::parse(path.as_bytes()).ok_or(Error::NotFound)?;
-		if target.volume != VOLUME_NAME {
+		if target.volume != self.name() {
 			return Err(Error::NotFound);
 		}
 		Ok(target.path.as_bytes())
@@ -243,6 +283,15 @@ fn map_fs_err(e: FsError) -> Error {
 		// on-disk corruption caught by a block checksum: the data cannot be trusted.
 		FsError::Corrupt => Error::Invalid,
 		FsError::Io => Error::Again,
+	}
+}
+
+// Map a FAT error onto the Storage.Volume `error` enum.
+fn map_fat_err(e: fat::FsError) -> Error {
+	match e {
+		fat::FsError::NotFound => Error::NotFound,
+		fat::FsError::TooLong | fat::FsError::Invalid => Error::Invalid,
+		fat::FsError::Io => Error::Again,
 	}
 }
 
@@ -290,6 +339,20 @@ impl BlockDevice for ChannelBlockDevice {
 	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
 		let lba: u64 = FS_START_SECTOR + index * SECTORS_PER_BLOCK;
 		unsafe { block_write(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_ptr()) }
+	}
+}
+
+// A second virtio-blk disk as a read-only block device for the FAT backend: foreign
+// media is addressed by absolute 512-byte LBA, so each FAT sector maps straight to one
+// disk sector with no filesystem-region offset. Reads go through the driver's block
+// service on `chan`, which stays open for the life of the service.
+struct FatBlockDevice {
+	chan: u64,
+}
+
+impl fat::BlockDevice for FatBlockDevice {
+	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		unsafe { block_read(self.chan, lba, 1, buf.as_mut_ptr()) }
 	}
 }
 

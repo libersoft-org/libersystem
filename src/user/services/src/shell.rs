@@ -15,7 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{audio, config, device, input, log, network, permission, process, resources, system_graph, time, volume, AuditEntry, Budget, Component, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan};
+use proto::system::{AuditEntry, Budget, Component, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan, audio, config, device, input, log, network, permission, process, resources, system_graph, time, volume};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -31,6 +31,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    then a read-only view of the init package. Each is a tagged capability over the
 	//    bootstrap channel.
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or_else(|| exit());
+	// The media StorageService client: the read-only FAT vol://media volume off a second
+	// virtio-blk disk. Sent right after STORAGE; `cat`/`ls` route vol://media to it.
+	let media: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"MEDIA") }.unwrap_or_else(|| exit());
 	let logsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or_else(|| exit());
 	let devsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DEVICE") }.unwrap_or_else(|| exit());
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
@@ -86,7 +89,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    become the interactive console and run the read-eval-print loop.
 	print_motd();
 	unsafe {
-		repl(console, control, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, &package, &mut buf);
+		repl(console, control, storage, media, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, &package, &mut buf);
 	}
 	exit();
 }
@@ -142,7 +145,7 @@ fn print_banner(lines: &[&str]) {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, buf: &mut [u8]) {
+unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control);
 		loop {
@@ -158,7 +161,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, logsvc: u64, devsvc: u6
 			// The terminal delivers a whole submitted line (with a trailing newline);
 			// trim it, dispatch it, reap finished jobs, and print the next prompt.
 			let line: &[u8] = trim(&buf[..n]);
-			if dispatch(line, storage, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, package, &mut jobs) {
+			if dispatch(line, storage, media, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, package, &mut jobs) {
 				return;
 			}
 			reap_jobs(&mut jobs);
@@ -468,7 +471,7 @@ unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, media: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -716,16 +719,16 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			return false;
 		}
 		if line == b"ls" {
-			ls_cmd(storage, b"");
+			ls_cmd(storage, media, b"");
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"ls ") {
-			ls_cmd(storage, trim(rest));
+			ls_cmd(storage, media, trim(rest));
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"cat ") {
 			let uri = trim(rest);
-			if !cat(storage, uri) {
+			if !cat(storage_for(uri, storage, media), uri) {
 				print(b"cat: could not read ");
 				print(uri);
 				print(b"\n");
@@ -736,13 +739,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			let rest = trim(rest);
 			// "write <uri> <text>": split on the first space.
 			match rest.iter().position(|&b: &u8| b == b' ') {
-				Some(sp) => write_cmd(storage, &rest[..sp], trim(&rest[sp + 1..])),
+				Some(sp) => write_cmd(storage_for(&rest[..sp], storage, media), &rest[..sp], trim(&rest[sp + 1..])),
 				None => print(b"usage: write <vol://...> <text>\n"),
 			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"rm ") {
-			rm_cmd(storage, trim(rest));
+			let uri = trim(rest);
+			rm_cmd(storage_for(uri, storage, media), uri);
 			return false;
 		}
 		if line == b"snap" || line == b"snap list" {
@@ -851,11 +855,7 @@ unsafe fn send_stdout(parent: u64) {
 		let so: u64 = stdout();
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, RIGHT_SEND | RIGHT_TRANSFER);
-			if d > 0 {
-				d as u64
-			} else {
-				0
-			}
+			if d > 0 { d as u64 } else { 0 }
 		} else {
 			0
 		};
@@ -1490,11 +1490,32 @@ unsafe fn cat(storage: u64, uri: &[u8]) -> bool {
 }
 
 // List the volume set via the StorageService `list` op. With no argument print the
-// volume set; with `vol://<volume>` print that volume's files (name + size). The single
-// phase-1 volume is `system`.
-unsafe fn ls_cmd(storage: u64, arg: &[u8]) {
+// volume set; with `vol://<volume>` print that volume's files (name + size). The
+// volumes are `system` (writable LiberFS) and `media` (read-only FAT off a second
+// disk).
+unsafe fn ls_cmd(storage: u64, media: u64, arg: &[u8]) {
 	unsafe {
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		if arg.is_empty() {
+			let sys: usize = volume_count(storage);
+			let med: usize = volume_count(media);
+			print(b"volumes (2):\n  vol://system (");
+			print_usize(sys);
+			print(b" files)\n  vol://media (");
+			print_usize(med);
+			print(b" files)\n");
+			return;
+		}
+		let name: &[u8] = arg.strip_prefix(b"vol://").unwrap_or(arg);
+		let name: &[u8] = name.strip_suffix(b"/").unwrap_or(name);
+		let chan: u64 = match name {
+			b"system" => storage,
+			b"media" => media,
+			_ => {
+				print(b"ls: unknown volume\n");
+				return;
+			}
+		};
+		let mut client = volume::Client::new(ChannelTransport { chan });
 		let files = match client.list() {
 			Some(Ok(f)) => f,
 			_ => {
@@ -1502,19 +1523,9 @@ unsafe fn ls_cmd(storage: u64, arg: &[u8]) {
 				return;
 			}
 		};
-		if arg.is_empty() {
-			print(b"volumes (1):\n  vol://system (");
-			print_usize(files.len());
-			print(b" files)\n");
-			return;
-		}
-		let vol: &[u8] = arg.strip_prefix(b"vol://").unwrap_or(arg);
-		let vol: &[u8] = vol.strip_suffix(b"/").unwrap_or(vol);
-		if vol != b"system" {
-			print(b"ls: unknown volume\n");
-			return;
-		}
-		print(b"vol://system (");
+		print(b"vol://");
+		print(name);
+		print(b" (");
 		print_usize(files.len());
 		print(b" files):\n");
 		for f in &files {
@@ -1525,6 +1536,21 @@ unsafe fn ls_cmd(storage: u64, arg: &[u8]) {
 			print(b" bytes\n");
 		}
 	}
+}
+
+// Count the files on a volume, for the `ls` overview; 0 if the service is unavailable.
+unsafe fn volume_count(storage: u64) -> usize {
+	let mut client = volume::Client::new(ChannelTransport { chan: storage });
+	match client.list() {
+		Some(Ok(f)) => f.len(),
+		_ => 0,
+	}
+}
+
+// Pick the StorageService client for a vol:// URI: vol://media reads the read-only FAT
+// disk, everything else the writable system volume.
+fn storage_for(uri: &[u8], storage: u64, media: u64) -> u64 {
+	if uri.strip_prefix(b"vol://").map(|r: &[u8]| r.starts_with(b"media/") || r == b"media").unwrap_or(false) { media } else { storage }
 }
 
 // Create or overwrite a file on the volume via the StorageService `write` op. The

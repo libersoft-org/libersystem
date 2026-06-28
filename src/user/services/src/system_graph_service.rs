@@ -28,7 +28,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{device, supervisor, system_graph, Component, ComponentKind, ComponentState, Counters, DeviceEntry, DeviceKind, Error, Graph, TraceSpan};
+use proto::system::{Component, ComponentKind, ComponentState, Counters, DeviceEntry, DeviceKind, Error, Graph, TraceSpan, device, supervisor, system_graph};
 use rt::*;
 
 // One component node the supervisor registered: its name and dependency edges (the

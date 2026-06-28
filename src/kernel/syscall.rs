@@ -1220,18 +1220,7 @@ fn sys_domain_stats_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	let account = domain.account();
-	let out = DomainStats {
-		memory_used: account.memory().used(),
-		memory_limit: account.memory().limit(),
-		handles_used: account.handles().used(),
-		handles_limit: account.handles().limit(),
-		threads_used: account.threads().used(),
-		threads_limit: account.threads().limit(),
-		ipc_used: account.ipc_queue().used(),
-		ipc_limit: account.ipc_queue().limit(),
-		dma_used: account.dma().used(),
-		dma_limit: account.dma().limit(),
-	};
+	let out = DomainStats { memory_used: account.memory().used(), memory_limit: account.memory().limit(), handles_used: account.handles().used(), handles_limit: account.handles().limit(), threads_used: account.threads().used(), threads_limit: account.threads().limit(), ipc_used: account.ipc_queue().used(), ipc_limit: account.ipc_queue().limit(), dma_used: account.dma().used(), dma_limit: account.dma().limit() };
 	unsafe {
 		(buf_ptr as *mut DomainStats).write_unaligned(out);
 	}

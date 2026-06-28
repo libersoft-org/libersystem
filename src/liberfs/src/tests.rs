@@ -534,11 +534,7 @@ fn newest_super_slot(dev: &MemDevice) -> u32 {
 		let off = slot as usize * BLOCK_SIZE + 28;
 		u64::from_le_bytes(dev.blocks[off..off + 8].try_into().unwrap())
 	};
-	if generation(1) > generation(0) {
-		1
-	} else {
-		0
-	}
+	if generation(1) > generation(0) { 1 } else { 0 }
 }
 
 #[test]
@@ -959,4 +955,3 @@ fn the_codec_round_trips_varied_inputs() {
 		assert_eq!(lz_decompress(&lz_compress(&input)), input);
 	}
 }
-

@@ -29,5 +29,9 @@ proto = { path = "../../proto" }
 # disk for the M43 persistent volume.
 liberfs = { path = "../../liberfs" }
 
+# The read-only FAT12/16/32 and exFAT backend StorageService mounts on a second
+# virtio-blk disk for the M48 foreign-media volume.
+fat = { path = "../../fat" }
+
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).
