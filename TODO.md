@@ -833,7 +833,93 @@ LiberFS overwrites data in place, so a crash mid-write can leave a file half-old
 - [x] Atomic commit: a single atomic pointer swap (a versioned superblock / root) makes a write all-or-nothing across a crash, replacing the ordered-writes-plus-fsck model for the common path.
 - [x] Groundwork for snapshots: keeping an old root reachable instead of freeing it is a read-only snapshot - lay the structure (do not build the full snapshot UX, which stays phase 3).
 - Done when: a simulated crash mid-write always leaves either the complete old file or the complete new file (never a torn mix), and an old root can still be mounted read-only, tests green - LiberFS becomes a crash-atomic CoW base for the modern FS.
-- Concept: Native filesystem (copy-on-write + atomic writes + rollback; the working-name modern FS), M50 (replaces its ordered-writes / fsck crash story for the common path), M51 (checksums + CoW together give detection and atomicity). Full snapshots / compression / encryption stay phase 3.
+- Concept: Native filesystem (copy-on-write + atomic writes + rollback; the working-name modern FS), M50 (replaces its ordered-writes / fsck crash story for the common path), M51 (checksums + CoW together give detection and atomicity). Full snapshots and transparent compression are the LiberFS modernization track below (M56 / M57); encryption stays out of the FS (a lower block/volume layer) and deduplication is not planned.
+
+## LiberFS modernization track (M53-M57)
+
+M43-M52 grew LiberFS into a crash-atomic copy-on-write filesystem with per-block
+checksums, but on a deliberately small layout: u32 block addresses (a ~16 TiB
+volume cap), double-indirect files (a ~1 GiB file cap), 28-byte names, a fixed
+inode table sized at format time (a static file-count cap), and linear directory
+scans (O(n), capped near 33 M entries). For real data arrays - a 184 TB partition,
+100+ GB media files, millions of files - it needs the structure modern filesystems
+use: 64-bit addressing, extents (and sparse files), B+tree directories, and
+dynamic inode allocation, while keeping CoW + checksums. Authorization stays out of
+the FS (the capability layer + StorageService, not POSIX permissions / ACLs);
+deduplication and encryption are out by decision (dedup is too memory-costly for
+the gain, encryption belongs to a lower block/volume layer); compression comes
+last. The layout changes are pre-release, so disks reformat and the on-disk version
+field stays 1 until a real system release.
+
+## M53 - LiberFS: 64-bit addressing, large files/volumes, and long names
+
+LiberFS uses u32 block pointers (a ~16 TiB volume ceiling) and double-indirect
+files (a ~1 GiB ceiling), and caps names at 28 bytes - all far too small for real
+storage (a 184 TB partition, 100+ GB media). This widens addressing and names and
+bakes in portable-name rules so a LiberFS name is always valid on other systems.
+
+- [ ] Widen block pointers and file sizes to u64, lifting the u32 block-address ceiling so volumes scale from ~16 TiB into exabytes.
+- [ ] Large files: lift the ~1 GiB cap (an interim triple-indirect level, or folded straight into the M54 extent map) so a single file reaches terabytes and beyond.
+- [ ] Long names: raise NAME_MAX from 28 to 255 bytes, decoupling the directory entry from the fixed 32-byte slot.
+- [ ] Portable-name policy at the FS boundary: reject the cross-platform-unsafe set (`\ : * ? < > | "` and control bytes) on top of `/` and NUL, so files move cleanly to FAT / NTFS media.
+- [ ] Reserve opaque per-inode room for a future owner / ACL tag (stored, never enforced - authorization stays in StorageService and the capability layer, not the FS).
+- Done when: LiberFS addresses exabyte volumes and terabyte+ files with 255-byte portable names, a volume well past 16 TiB and a multi-GB file round-trip across reboot, and non-portable names are rejected, tests green.
+- Concept: Native filesystem (scaling the FS for real data arrays), Storage model (typed RelativePath; authorization is the capability layer, not FS permissions), M43 / M49 (the layout this widens).
+
+## M54 - LiberFS: extents and sparse files
+
+LiberFS maps a file as a pointer-per-block array (a 1 GiB file is ~256 K pointers),
+which is heavy metadata and forces every block to physically exist. An extent
+stores a contiguous run as one (start, length) record, shrinking metadata for large
+files and - via missing extents - giving sparse files for free.
+
+- [ ] Extent-based block mapping: replace the direct / indirect pointer arrays with an extent map (start block + run length), so a large contiguous file needs a handful of records instead of hundreds of thousands of pointers.
+- [ ] Sparse files: an unwritten region is a gap in the extent map (read back as zeros), so a logically huge but mostly-empty file (a VM image, a preallocated DB) costs only its written extents.
+- [ ] Carry the per-block CRC32C integrity (M51) over the extent layout.
+- [ ] fsck over extents: validate extent runs and the free map derived from them.
+- Done when: files are mapped by extents (a large contiguous file uses minimal metadata), a sparse file reports its full logical size while occupying only written blocks, checksums and fsck work over the extent layout, tests green.
+- Concept: Native filesystem (extents + sparse, the modern-FS mapping), M51 (checksums carried over extents), M52 (the CoW write path the extents allocate through).
+
+## M55 - LiberFS: B+tree directories and dynamic inode allocation
+
+Directory lookup is a linear scan of 32-byte entries (O(n), capped near 33 M), and
+the inode table is a fixed array sized at format time (so file count is capped and
+the table wastes space on a sparsely-used volume). A B+tree fixes both: O(log n)
+directory lookups with effectively unbounded entries, and inodes allocated on
+demand (bounded only by free space) - the XFS / btrfs / ZFS model.
+
+- [ ] B+tree directories: index entries by name so lookup / insert / remove is O(log n) and a directory scales to millions of entries without linear scans.
+- [ ] Dynamic inode allocation: replace the fixed inode table with a B+tree of inodes allocated on demand, so a volume never runs out of inodes while it has free space (and an empty volume wastes none).
+- [ ] Keep CoW + checksums over the tree nodes (a tree node is just another copy-on-write, checksummed block).
+- [ ] fsck walks the trees: verify the directory and inode B+trees and the free map.
+- Done when: directory operations are O(log n) and a directory holds millions of entries without slowdown, inodes are allocated dynamically (no fixed cap, none wasted), the trees are CoW + checksummed, and fsck validates them, tests green.
+- Concept: Native filesystem (B+tree organization, the btrfs / ZFS structure), M52 (the CoW the trees ride on), M49 (the directory tree / inode table this replaces).
+
+## M56 - LiberFS: snapshots
+
+M52 left the CoW snapshot groundwork - the previous root stays reachable and
+`mount_snapshot` opens it read-only. This finishes it into a usable feature: named
+snapshots, several retained, managed over the typed Storage API.
+
+- [ ] Named snapshots: create a named read-only snapshot of a volume, pinning that generation's root so its blocks are not reclaimed.
+- [ ] Retain several snapshots (not just the previous generation), list them, and delete one (releasing its pinned blocks).
+- [ ] Surface snapshots through Storage.Volume (create / list / delete / mount read-only) so the shell can manage them.
+- [ ] fsck and the free-map derivation account for every pinned snapshot generation.
+- Done when: a user creates several named read-only snapshots of a volume, lists and deletes them, and mounts one to read an earlier state, with the free map honoring all pinned generations, tests green.
+- Concept: Native filesystem (snapshots on the CoW base), M52 (the snapshot groundwork this completes).
+
+## M57 - LiberFS: transparent compression (optional, last)
+
+The final modern-FS feature, deliberately last (after extents, B+trees, and
+snapshots are solid). Per-extent transparent compression shrinks data on disk and
+can cut I/O; it pairs naturally with the M54 extent map (compress per extent, store
+the compressed length).
+
+- [ ] Per-extent transparent compression: compress a data extent on write and decompress on read, storing the algorithm + compressed length beside the extent; an incompressible extent is stored raw.
+- [ ] A simple, dependency-free codec (the no_std, zero-dependency rule holds - an LZ-family coder vendored in, not an external crate).
+- [ ] Keep checksums over the stored (compressed) bytes and the extent integrity.
+- Done when: file data is transparently compressed per extent and reads back identically, incompressible data falls back to raw, checksums cover the stored bytes, tests green - the last modern-FS feature.
+- Concept: Native filesystem (compression, explicitly the last FS feature; deduplication and encryption are out by decision - dedup too costly, encryption a lower block/volume layer), the no_std + zero-dependency rule.
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
@@ -846,7 +932,7 @@ CLI/JSON/CBOR); security hardening (typed permission manifests + a PermissionMan
 + a strict sandbox + a threat model); the ResourceManager policy layer; a
 ServiceManager with a restart policy + watchdog; the full Component Model + WASI
 preview 2 + an SDK running components loaded from storage; a package/app format with
-installation + AOT; and a simple writable persistent filesystem - all in a VM over
+installation + AOT; and a writable persistent native filesystem (LiberFS) - all in a VM over
 virtio on QEMU/KVM, testable under `cargo test` / QEMU.
 
 ## Out of scope for phase 2 (= phase 3, the server platform)
@@ -854,8 +940,9 @@ A POSIX-like / relibc compatibility layer for foreign software (phase 4, with re
 hardware); user accounts / identities, multi-user remote access, and the network-exposed (authenticated) remote-admin endpoint over the System Graph / logs / counters (phase-2 observability is local + network-friendly representations only); localization
 (locale, language, time zone, formatting); a wider network stack and server-class
 workloads; immutable signed system + A/B updates + rollback + verified boot;
-encrypted user volumes; a modern native filesystem with CoW / checksums / snapshots
-/ compression (phase 2 ships only a simple writable FS); first-party server apps (a
+encrypted user volumes; LiberFS work beyond the M53-M57 modernization (online
+defrag, multi-device / RAID; deduplication and encryption stay out by decision);
+first-party server apps (a
 static-file web server and the like); and a CLI package manager over the phase-2
 package format. The desktop concerns (GUI / compositor, a full input stack, the
 end-user app store) are phases 4-5. Phases 3-6 (server / real hardware / desktop /
