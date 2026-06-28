@@ -77,6 +77,13 @@ An opaque kernel object, transferred as `handle<file>`.
 | `name` | `string` |
 | `size` | `u64` |
 
+### record `snapshot-info`
+
+| field | type |
+| --- | --- |
+| `name` | `string` |
+| `generation` | `u64` |
+
 ### enum `device-kind`
 
 | case | ordinal |
@@ -343,6 +350,10 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 2 | `list` | `list() -> result<list<file-info>, error>` |
 | 3 | `write` | `write(path: string, data: buffer) -> result<unit, error>` |
 | 4 | `remove` | `remove(path: string) -> result<unit, error>` |
+| 5 | `snap-create` | `snap-create(name: string) -> result<unit, error>` |
+| 6 | `snap-list` | `snap-list() -> result<list<snapshot-info>, error>` |
+| 7 | `snap-delete` | `snap-delete(name: string) -> result<unit, error>` |
+| 8 | `snap-open` | `snap-open(snapshot: string, path: string) -> result<open-result, error>` |
 
 ### interface `device`
 

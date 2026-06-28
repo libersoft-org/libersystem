@@ -901,10 +901,10 @@ M52 left the CoW snapshot groundwork - the previous root stays reachable and
 `mount_snapshot` opens it read-only. This finishes it into a usable feature: named
 snapshots, several retained, managed over the typed Storage API.
 
-- [ ] Named snapshots: create a named read-only snapshot of a volume, pinning that generation's root so its blocks are not reclaimed.
-- [ ] Retain several snapshots (not just the previous generation), list them, and delete one (releasing its pinned blocks).
-- [ ] Surface snapshots through Storage.Volume (create / list / delete / mount read-only) so the shell can manage them.
-- [ ] fsck and the free-map derivation account for every pinned snapshot generation.
+- [x] Named snapshots: create a named read-only snapshot of a volume, pinning that generation's root so its blocks are not reclaimed.
+- [x] Retain several snapshots (not just the previous generation), list them, and delete one (releasing its pinned blocks).
+- [x] Surface snapshots through Storage.Volume (create / list / delete / mount read-only) so the shell can manage them.
+- [x] fsck and the free-map derivation account for every pinned snapshot generation.
 - Done when: a user creates several named read-only snapshots of a volume, lists and deletes them, and mounts one to read an earlier state, with the free map honoring all pinned generations, tests green.
 - Concept: Native filesystem (snapshots on the CoW base), M52 (the snapshot groundwork this completes).
 

@@ -527,6 +527,10 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 			print(b"  ls [vol://vol]   list volumes, or a volume's files via StorageService\n");
 			print(b"  write <vol://...> <text>  create or overwrite a file via StorageService\n");
 			print(b"  rm <vol://...>   delete a file via StorageService\n");
+			print(b"  snap [list]      list the volume's named snapshots via StorageService\n");
+			print(b"  snap create <name>  pin a named read-only snapshot of the volume\n");
+			print(b"  snap delete <name>  delete a named snapshot, releasing its blocks\n");
+			print(b"  snap cat <name> <vol://...>  read a file from a snapshot (an earlier state)\n");
 			print(b"  beep [hz] [ms]   play a tone via AudioService\n");
 			print(b"  mouse            show recent pointer events via InputService\n");
 			print(b"  script [<cmd>]   run a command in a fresh pty-hosted shell and record it\n");
@@ -739,6 +743,34 @@ unsafe fn dispatch(line: &[u8], storage: u64, logsvc: u64, devsvc: u64, procsvc:
 		}
 		if let Some(rest) = line.strip_prefix(b"rm ") {
 			rm_cmd(storage, trim(rest));
+			return false;
+		}
+		if line == b"snap" || line == b"snap list" {
+			snap_list_cmd(storage);
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"snap create ") {
+			snap_create_cmd(storage, trim(rest));
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"snap delete ") {
+			snap_delete_cmd(storage, trim(rest));
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"snap cat ") {
+			let rest = trim(rest);
+			// "snap cat <name> <vol://...>": split on the first space.
+			match rest.iter().position(|&b: &u8| b == b' ') {
+				Some(sp) => {
+					let uri = trim(&rest[sp + 1..]);
+					if !snap_cat(storage, &rest[..sp], uri) {
+						print(b"snap cat: could not read ");
+						print(uri);
+						print(b"\n");
+					}
+				}
+				None => print(b"usage: snap cat <name> <vol://...>\n"),
+			}
 			return false;
 		}
 		if line == b"script" {
@@ -1542,6 +1574,102 @@ unsafe fn rm_cmd(storage: u64, uri: &[u8]) {
 				print(b"\n");
 			}
 		}
+	}
+}
+
+// List the volume's named snapshots via the StorageService `snap-list` op (each as
+// name + pinned generation), oldest first.
+unsafe fn snap_list_cmd(storage: u64) {
+	unsafe {
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let snaps = match client.snap_list() {
+			Some(Ok(s)) => s,
+			_ => {
+				print(b"snap: StorageService unavailable\n");
+				return;
+			}
+		};
+		print(b"snapshots (");
+		print_usize(snaps.len());
+		print(b"):\n");
+		for s in &snaps {
+			print(b"  ");
+			print(s.name.as_bytes());
+			print(b" (generation ");
+			print_usize(s.generation as usize);
+			print(b")\n");
+		}
+	}
+}
+
+// Create a named read-only snapshot of the volume via the `snap-create` op, pinning
+// the current state so a later `snap cat` can read it.
+unsafe fn snap_create_cmd(storage: u64, name: &[u8]) {
+	unsafe {
+		let snapshot: String = String::from_utf8_lossy(name).into_owned();
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		match client.snap_create(&snapshot) {
+			Some(Ok(())) => {
+				print(b"created snapshot ");
+				print(name);
+				print(b"\n");
+			}
+			_ => {
+				print(b"snap create: could not create ");
+				print(name);
+				print(b"\n");
+			}
+		}
+	}
+}
+
+// Delete a named snapshot via the `snap-delete` op, releasing the blocks it pinned.
+unsafe fn snap_delete_cmd(storage: u64, name: &[u8]) {
+	unsafe {
+		let snapshot: String = String::from_utf8_lossy(name).into_owned();
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		match client.snap_delete(&snapshot) {
+			Some(Ok(())) => {
+				print(b"deleted snapshot ");
+				print(name);
+				print(b"\n");
+			}
+			_ => {
+				print(b"snap delete: could not delete ");
+				print(name);
+				print(b"\n");
+			}
+		}
+	}
+}
+
+// Read a file from inside a named snapshot via the `snap-open` op, printing an earlier
+// state of the volume - the snapshot counterpart of `cat`.
+unsafe fn snap_cat(storage: u64, name: &[u8], uri: &[u8]) -> bool {
+	unsafe {
+		let snapshot: String = String::from_utf8_lossy(name).into_owned();
+		let path: String = String::from_utf8_lossy(uri).into_owned();
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let result = match client.snap_open(&snapshot, &path) {
+			Some(Ok(r)) => r,
+			_ => return false,
+		};
+		if result.file == 0 || result.size == 0 {
+			return false;
+		}
+		// map the shared buffer, print the file, then release it.
+		let mapped: u64 = match map_object(result.file) {
+			Some(base) => base,
+			None => return false,
+		};
+		let contents: &[u8] = core::slice::from_raw_parts(mapped as *const u8, result.size as usize);
+		print(contents);
+		if contents.last() != Some(&b'\n') {
+			print(b"\n");
+		}
+		unmap_object(result.file);
+		close(result.file);
+		true
 	}
 }
 

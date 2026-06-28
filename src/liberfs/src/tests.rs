@@ -723,3 +723,152 @@ fn inodes_are_allocated_dynamically_without_a_fixed_cap() {
 	assert_eq!(fs.list().unwrap().len() as u32, made);
 	assert_eq!(fs.read_file(b"f0").unwrap(), b"x");
 }
+
+// M56: named, pinned snapshots.
+
+#[test]
+fn a_named_snapshot_reads_an_earlier_state() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"f", b"version one").unwrap();
+	fs.create_snapshot(b"before").unwrap();
+	fs.write_file(b"f", b"version two").unwrap();
+	let dev = fs.into_device();
+
+	// the live volume sees the newest write.
+	let mut live = LiberFs::mount(dev.clone()).unwrap();
+	assert_eq!(live.read_file(b"f").unwrap(), b"version two");
+
+	// the named snapshot reads the state captured when it was created.
+	let mut snap = LiberFs::mount_named_snapshot(dev, b"before").unwrap();
+	assert_eq!(snap.read_file(b"f").unwrap(), b"version one");
+}
+
+#[test]
+fn snapshots_are_listed_and_survive_a_remount() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"f", b"v1").unwrap();
+	fs.create_snapshot(b"first").unwrap();
+	fs.write_file(b"f", b"v2").unwrap();
+	fs.create_snapshot(b"second").unwrap();
+
+	let listed = fs.list_snapshots().unwrap();
+	assert_eq!(listed.len(), 2);
+	assert_eq!(listed[0].0, b"first");
+	assert_eq!(listed[1].0, b"second");
+	// each pins a later generation than the one before it.
+	assert!(listed[1].1 > listed[0].1);
+
+	// the table is carried in the superblock, so it survives a remount.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	let listed = fs.list_snapshots().unwrap();
+	assert_eq!(listed.len(), 2);
+	assert_eq!(listed[0].0, b"first");
+	assert_eq!(listed[1].0, b"second");
+}
+
+#[test]
+fn a_snapshot_keeps_a_file_the_live_tree_deleted() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"keep.txt", b"original").unwrap();
+	fs.create_snapshot(b"backup").unwrap();
+	fs.remove(b"keep.txt").unwrap();
+	let dev = fs.into_device();
+
+	// the live tree no longer has the file.
+	let mut live = LiberFs::mount(dev.clone()).unwrap();
+	assert_eq!(live.read_file(b"keep.txt"), Err(FsError::NotFound));
+
+	// the snapshot still holds it, blocks pinned against reclamation.
+	let mut snap = LiberFs::mount_named_snapshot(dev, b"backup").unwrap();
+	assert_eq!(snap.read_file(b"keep.txt").unwrap(), b"original");
+}
+
+#[test]
+fn the_free_map_honors_every_pinned_generation() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	// three named snapshots, each pinning a different version of the same file.
+	fs.write_file(b"f", b"one").unwrap();
+	fs.create_snapshot(b"s1").unwrap();
+	fs.write_file(b"f", b"two").unwrap();
+	fs.create_snapshot(b"s2").unwrap();
+	fs.write_file(b"f", b"three").unwrap();
+	fs.create_snapshot(b"s3").unwrap();
+	// churn the live file well past all three snapshots; the rolling previous-generation
+	// retention moves on, but the named pins must keep each earlier root reachable.
+	for v in 0..8 {
+		let payload = format!("live-{v}");
+		fs.write_file(b"f", payload.as_bytes()).unwrap();
+	}
+	let dev = fs.into_device();
+
+	// every pinned generation still reads its captured content after a remount.
+	assert_eq!(LiberFs::mount_named_snapshot(dev.clone(), b"s1").unwrap().read_file(b"f").unwrap(), b"one");
+	assert_eq!(LiberFs::mount_named_snapshot(dev.clone(), b"s2").unwrap().read_file(b"f").unwrap(), b"two");
+	assert_eq!(LiberFs::mount_named_snapshot(dev.clone(), b"s3").unwrap().read_file(b"f").unwrap(), b"three");
+
+	// the live volume reads the newest content and verifies clean: fsck accounts for
+	// every pinned snapshot generation as well as the live tree.
+	let mut live = LiberFs::mount(dev).unwrap();
+	assert_eq!(live.read_file(b"f").unwrap(), b"live-7");
+	assert_eq!(live.fsck().unwrap().checksum_failures, 0);
+}
+
+#[test]
+fn deleting_a_snapshot_releases_its_pinned_blocks() {
+	// how many single-block files a volume still accepts: a capacity probe.
+	fn fill(fs: &mut LiberFs<MemDevice>) -> u32 {
+		let mut n = 0u32;
+		loop {
+			let name = format!("fill{n}");
+			match fs.write_file(name.as_bytes(), b"x") {
+				Ok(()) => n += 1,
+				Err(FsError::NoSpace) => return n,
+				Err(e) => panic!("unexpected error: {e:?}"),
+			}
+		}
+	}
+	let nblocks: u64 = 48;
+	let big: Vec<u8> = vec![0xCDu8; BLOCK_SIZE * 6];
+
+	// pin a multi-block file in a snapshot, delete it from the live tree, then roll the
+	// previous-generation retention forward so ONLY the named snapshot pins its blocks.
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	fs.write_file(b"big", &big).unwrap();
+	fs.create_snapshot(b"snap").unwrap();
+	fs.remove(b"big").unwrap();
+	fs.write_file(b"tmp", b"y").unwrap();
+	fs.remove(b"tmp").unwrap();
+	let with_snapshot = fill(&mut fs);
+
+	// the same sequence, but delete the snapshot first: big's blocks are reclaimed, so
+	// the volume now accepts strictly more fill files.
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	fs.write_file(b"big", &big).unwrap();
+	fs.create_snapshot(b"snap").unwrap();
+	fs.remove(b"big").unwrap();
+	fs.write_file(b"tmp", b"y").unwrap();
+	fs.remove(b"tmp").unwrap();
+	fs.delete_snapshot(b"snap").unwrap();
+	let without_snapshot = fill(&mut fs);
+
+	assert!(without_snapshot > with_snapshot, "deleting the snapshot freed no blocks: {without_snapshot} !> {with_snapshot}");
+}
+
+#[test]
+fn snapshot_name_rules_are_enforced() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"f", b"x").unwrap();
+	// an empty name is rejected.
+	assert_eq!(fs.create_snapshot(b""), Err(FsError::Invalid));
+	// a name longer than the field is rejected.
+	let long = vec![b'a'; SNAP_NAME_MAX + 1];
+	assert_eq!(fs.create_snapshot(&long), Err(FsError::TooLong));
+	// a duplicate name is rejected.
+	fs.create_snapshot(b"dup").unwrap();
+	assert_eq!(fs.create_snapshot(b"dup"), Err(FsError::Invalid));
+	// deleting an unknown snapshot is NotFound; deleting the real one succeeds.
+	assert_eq!(fs.delete_snapshot(b"missing"), Err(FsError::NotFound));
+	fs.delete_snapshot(b"dup").unwrap();
+	assert!(fs.list_snapshots().unwrap().is_empty());
+}

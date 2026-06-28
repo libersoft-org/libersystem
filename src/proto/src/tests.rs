@@ -151,11 +151,7 @@ struct VolStub;
 
 impl volume::Service for VolStub {
 	fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error> {
-		if o.path.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(OpenResult { file: 0xCAFE, size: 42 })
-		}
+		if o.path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
 	}
 
 	fn list(&mut self) -> Result<Vec<FileInfo>, Error> {
@@ -165,19 +161,28 @@ impl volume::Service for VolStub {
 	fn write(&mut self, path: String, data: crate::codec::Buffer) -> Result<(), Error> {
 		// the buffer handle must have travelled out-of-band (set_handle -> request_handle
 		// -> take_handle); prove it by succeeding only when it arrives intact.
-		if path.is_empty() || data.handle != 0xBEEF || data.len != 5 {
-			Err(Error::Invalid)
-		} else {
-			Ok(())
-		}
+		if path.is_empty() || data.handle != 0xBEEF || data.len != 5 { Err(Error::Invalid) } else { Ok(()) }
 	}
 
 	fn remove(&mut self, path: String) -> Result<(), Error> {
-		if path.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(())
-		}
+		if path.is_empty() { Err(Error::NotFound) } else { Ok(()) }
+	}
+
+	fn snap_create(&mut self, name: String) -> Result<(), Error> {
+		if name.is_empty() { Err(Error::Invalid) } else { Ok(()) }
+	}
+
+	fn snap_list(&mut self) -> Result<Vec<SnapshotInfo>, Error> {
+		Ok(alloc::vec![SnapshotInfo { name: String::from("backup"), generation: 7 }])
+	}
+
+	fn snap_delete(&mut self, name: String) -> Result<(), Error> {
+		if name.is_empty() { Err(Error::NotFound) } else { Ok(()) }
+	}
+
+	fn snap_open(&mut self, snapshot: String, path: String) -> Result<OpenResult, Error> {
+		// the file handle must travel out-of-band, exactly like `open`.
+		if snapshot.is_empty() || path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
 	}
 }
 
@@ -219,6 +224,21 @@ fn remove_round_trips() {
 	let mut client = volume::Client::new(VolLoopback { service: VolStub });
 	assert_eq!(client.remove("/x"), Some(Ok(())));
 	assert_eq!(client.remove(""), Some(Err(Error::NotFound)));
+}
+
+#[test]
+fn snapshot_ops_round_trip() {
+	let mut client = volume::Client::new(VolLoopback { service: VolStub });
+	// create / delete return unit results.
+	assert_eq!(client.snap_create("backup"), Some(Ok(())));
+	assert_eq!(client.snap_create(""), Some(Err(Error::Invalid)));
+	assert_eq!(client.snap_delete("backup"), Some(Ok(())));
+	assert_eq!(client.snap_delete(""), Some(Err(Error::NotFound)));
+	// list carries the snapshot records in-stream.
+	assert_eq!(client.snap_list(), Some(Ok(alloc::vec![SnapshotInfo { name: String::from("backup"), generation: 7 }])));
+	// snap-open returns the file handle out-of-band, just like open.
+	assert_eq!(client.snap_open("backup", "/x"), Some(Ok(OpenResult { file: 0xCAFE, size: 42 })));
+	assert_eq!(client.snap_open("backup", ""), Some(Err(Error::NotFound)));
 }
 
 #[test]

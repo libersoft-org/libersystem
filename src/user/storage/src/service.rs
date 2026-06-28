@@ -27,7 +27,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use liberfs::{BlockDevice, FsError, LiberFs};
 use proto::codec::Buffer;
-use proto::system::{volume, Error, FileInfo, OpenOpts, OpenResult};
+use proto::system::{volume, Error, FileInfo, OpenOpts, OpenResult, SnapshotInfo};
 use rt::*;
 
 // the single volume this service serves; the URI's volume component must match
@@ -169,6 +169,55 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.remove(name).map_err(map_fs_err),
+		}
+	}
+
+	// Create a named read-only snapshot of the volume, pinning the current generation
+	// so its blocks survive later writes. A read-only volume refuses with `denied`.
+	fn snap_create(&mut self, name: String) -> Result<(), Error> {
+		match self {
+			Volume::Archive { .. } => Err(Error::Denied),
+			Volume::Disk(fs) => fs.create_snapshot(name.as_bytes()).map_err(map_fs_err),
+		}
+	}
+
+	// List the volume's named snapshots (name + pinned generation), oldest first. A
+	// read-only archive volume has none.
+	fn snap_list(&mut self) -> Result<Vec<SnapshotInfo>, Error> {
+		match self {
+			Volume::Archive { .. } => Ok(Vec::new()),
+			Volume::Disk(fs) => {
+				let snaps = fs.list_snapshots().map_err(map_fs_err)?;
+				Ok(snaps.into_iter().map(|(name, generation)| SnapshotInfo { name: String::from_utf8_lossy(&name).into_owned(), generation }).collect())
+			}
+		}
+	}
+
+	// Delete a named snapshot, releasing the blocks only it pinned. A read-only volume
+	// refuses with `denied`.
+	fn snap_delete(&mut self, name: String) -> Result<(), Error> {
+		match self {
+			Volume::Archive { .. } => Err(Error::Denied),
+			Volume::Disk(fs) => fs.delete_snapshot(name.as_bytes()).map_err(map_fs_err),
+		}
+	}
+
+	// Resolve a vol:// path inside a named snapshot and hand back the file's bytes as a
+	// read-only shared buffer (out-of-band handle<file>) plus its length - reading an
+	// earlier state. A read-only archive volume has no snapshots.
+	fn snap_open(&mut self, snapshot: String, path: String) -> Result<OpenResult, Error> {
+		let name: &[u8] = self.writable_name(&path)?;
+		match self {
+			Volume::Archive { .. } => Err(Error::Denied),
+			Volume::Disk(fs) => {
+				// open a second, read-only view re-rooted at the snapshot over the same
+				// block backing (the channel handle is shared, not consumed).
+				let chan: u64 = fs.device().chan;
+				let mut snap: LiberFs<ChannelBlockDevice> = LiberFs::mount_named_snapshot(ChannelBlockDevice { chan }, snapshot.as_bytes()).ok_or(Error::NotFound)?;
+				let file: Vec<u8> = snap.read_file(name).map_err(map_fs_err)?;
+				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
+				Ok(OpenResult { file: handle, size: file.len() as u64 })
+			}
 		}
 	}
 }

@@ -48,8 +48,16 @@
 //! reserved by the free-map walk), the superblock slot it still occupies remains a
 //! consistent, read-only snapshot of the filesystem one commit ago. [`LiberFs::mount`]
 //! opens the newest generation; [`LiberFs::mount_snapshot`] opens that previous one
-//! read-only. This is the structural groundwork for snapshots; the full snapshot UX
-//! is a later milestone. The generation before last is reclaimed by the next commit.
+//! read-only.
+//!
+//! A NAMED snapshot keeps any earlier generation reachable for as long as wanted:
+//! [`LiberFs::create_snapshot`] records the live generation's inode-tree root in a
+//! snapshot table the superblock points at, [`LiberFs::list_snapshots`] enumerates
+//! them, and [`LiberFs::delete_snapshot`] drops one. The free-map walk reserves every
+//! pinned generation, so their blocks are never reused until the snapshot is deleted;
+//! [`LiberFs::mount_named_snapshot`] re-roots a read-only mount at a snapshot to read
+//! that earlier state. The generation before last (if unnamed) is reclaimed by the
+//! next commit.
 //!
 //! ## Integrity (block checksums)
 //!
@@ -256,11 +264,25 @@ struct Superblock {
 	// holds only live inodes and a volume never runs out of inode numbers in practice.
 	next_inode: u32,
 	root_inode: u32,
+	// The snapshot table: the block holding the named snapshots (0 = none) and that
+	// block's CRC32C. Carried in the superblock so the pinned snapshots commit atomically
+	// with the generation and survive a remount.
+	snap_root: u64,
+	snap_root_crc: u32,
 }
 
 // Byte offset of the superblock's own CRC32C within its block; the checksum covers the
 // whole block with these four bytes zeroed, so a half-written superblock fails it.
 const SB_CRC_OFFSET: usize = 56;
+
+// A named snapshot pins an earlier generation's inode-tree root so its blocks are not
+// reclaimed. The snapshot table is the one block `snap_root` points at: a u32 count and
+// a u32 pad, then fixed records of a NUL-padded name, the pinned inode-tree root and its
+// CRC32C, and the generation. (4096 - 8) / 84 = 48 snapshots fit one block.
+const SNAP_NAME_MAX: usize = 64;
+const SNAP_HDR: usize = 8;
+const SNAP_REC: usize = SNAP_NAME_MAX + 20;
+const SNAP_MAX: usize = (BLOCK_SIZE - SNAP_HDR) / SNAP_REC;
 
 // One extent: a contiguous run of `length` blocks mapped from logical block `logical`
 // to physical block `physical`, paired with a checksum block (`csum`) holding the
@@ -403,6 +425,30 @@ enum Del {
 	Empty,
 }
 
+// One named, pinned snapshot in memory: the inode-tree root (and its CRC32C) of the
+// generation it captured, kept reserved by the free-map walk so a later commit never
+// reuses its blocks. Loaded from the snapshot table at mount.
+#[derive(Clone)]
+struct Snapshot {
+	name: Vec<u8>,
+	inode_root: u64,
+	inode_root_crc: u32,
+	generation: u64,
+}
+
+// The filesystem state captured at `begin`: the inode-tree root and next-inode counter,
+// plus the snapshot table. `abort` restores it and `commit` reserves the generation it
+// supersedes from it, so a rolled-back or committed snapshot create / delete leaves the
+// in-memory state consistent with the disk.
+struct Txn {
+	inode_root: u64,
+	inode_root_crc: u32,
+	next_inode: u32,
+	snap_root: u64,
+	snap_root_crc: u32,
+	snapshots: Vec<Snapshot>,
+}
+
 // A mounted LiberFS over a block device. Copy-on-write: the inodes are reached through
 // the in-memory root of the inode B+tree (`inode_root` and its CRC32C) rather than a
 // fixed region, and `free` is rebuilt at mount from the blocks the live and previous
@@ -432,15 +478,21 @@ pub struct LiberFs<D: BlockDevice> {
 	prev_inode_root: u64,
 	prev_inode_root_crc: u32,
 	prev_valid: bool,
+	// The snapshot table: the block the superblock points at (`snap_root` and its CRC32C)
+	// and the named snapshots loaded from it, each pinning an earlier generation's root
+	// so the free-map walk keeps its blocks reserved.
+	snap_root: u64,
+	snap_root_crc: u32,
+	snapshots: Vec<Snapshot>,
 	// In-memory free map, one bit per block, derived at mount and after each commit -
 	// never written to disk.
 	free: Vec<u8>,
 	// Blocks allocated by the in-flight transaction: safe to overwrite in place (no
 	// committed generation references them yet).
 	fresh: BTreeSet<u64>,
-	// The (inode_root, inode_root_crc, next_inode) snapshot taken at `begin`, restored by
-	// `abort` and used by `commit` to reserve the generation it supersedes.
-	txn: Option<(u64, u32, u32)>,
+	// The state captured at `begin`, restored by `abort` and used by `commit` to reserve
+	// the generation it supersedes.
+	txn: Option<Txn>,
 	clock: u64,
 }
 
@@ -471,7 +523,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// generation 0 in slot 0; slot 1 left invalid (zeroed) until the first commit
 		// ping-pongs onto it.
 		let zero = vec![0u8; BLOCK_SIZE];
-		let sb = Superblock { num_blocks, generation: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, root_inode: ROOT_INODE };
+		let sb = Superblock { num_blocks, generation: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, root_inode: ROOT_INODE, snap_root: 0, snap_root_crc: 0 };
 		if !dev.write_block(0, &serialize_superblock(&sb)) {
 			return Err(FsError::Io);
 		}
@@ -479,7 +531,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Io);
 		}
 
-		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, free: vec![0u8; (num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, clock: 0 };
 		fs.derive_free()?;
 		Ok(fs)
 	}
@@ -496,6 +548,19 @@ impl<D: BlockDevice> LiberFs<D> {
 	// is meant for reading; writing to it would interleave generations.
 	pub fn mount_snapshot(dev: D) -> Option<LiberFs<D>> {
 		Self::mount_at(dev, false)
+	}
+
+	// Mount a named snapshot read-only: the consistent, pinned state captured when the
+	// snapshot was created. Returns None if the volume has no such snapshot. Like
+	// `mount_snapshot`, the handle is meant for reading; the live free map (which already
+	// reserves the snapshot's blocks) is reused unchanged.
+	pub fn mount_named_snapshot(dev: D, name: &[u8]) -> Option<LiberFs<D>> {
+		let mut fs = Self::mount(dev)?;
+		let snap = fs.snapshots.iter().find(|s| s.name == name)?.clone();
+		fs.inode_root = snap.inode_root;
+		fs.inode_root_crc = snap.inode_root_crc;
+		fs.generation = snap.generation;
+		Some(fs)
 	}
 
 	fn mount_at(mut dev: D, newest: bool) -> Option<LiberFs<D>> {
@@ -532,7 +597,8 @@ impl<D: BlockDevice> LiberFs<D> {
 			None => (0, 0, false),
 		};
 
-		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, clock: 0 };
+		fs.load_snapshot_table().ok()?;
 		fs.derive_free().ok()?;
 		Some(fs)
 	}
@@ -681,9 +747,120 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(())
 	}
 
+	// snapshots
+
+	// Create a named, read-only snapshot pinning the current generation's inode-tree
+	// root, so its blocks survive later commits until the snapshot is deleted. The name
+	// must be non-empty, at most SNAP_NAME_MAX bytes, and unique among existing
+	// snapshots; a volume holds at most SNAP_MAX snapshots.
+	pub fn create_snapshot(&mut self, name: &[u8]) -> Result<(), FsError> {
+		if name.is_empty() {
+			return Err(FsError::Invalid);
+		}
+		if name.len() > SNAP_NAME_MAX {
+			return Err(FsError::TooLong);
+		}
+		if self.snapshots.iter().any(|s| s.name == name) {
+			return Err(FsError::Invalid);
+		}
+		if self.snapshots.len() >= SNAP_MAX {
+			return Err(FsError::NoSpace);
+		}
+		self.begin();
+		let r = self.create_snapshot_inner(name);
+		self.finish(r)
+	}
+
+	fn create_snapshot_inner(&mut self, name: &[u8]) -> Result<(), FsError> {
+		// pin the current live generation: the snapshot-table write is the only change,
+		// so the committed generation keeps this exact inode-tree root.
+		self.snapshots.push(Snapshot { name: name.to_vec(), inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, generation: self.generation });
+		self.write_snapshot_table()
+	}
+
+	// List the named snapshots as (name, generation) pairs, oldest first.
+	pub fn list_snapshots(&mut self) -> Result<Vec<(Vec<u8>, u64)>, FsError> {
+		Ok(self.snapshots.iter().map(|s| (s.name.clone(), s.generation)).collect())
+	}
+
+	// Delete the named snapshot, releasing the blocks only it pinned (reclaimed by the
+	// rederived free map). An unknown name is NotFound.
+	pub fn delete_snapshot(&mut self, name: &[u8]) -> Result<(), FsError> {
+		if !self.snapshots.iter().any(|s| s.name == name) {
+			return Err(FsError::NotFound);
+		}
+		self.begin();
+		let r = self.delete_snapshot_inner(name);
+		self.finish(r)
+	}
+
+	fn delete_snapshot_inner(&mut self, name: &[u8]) -> Result<(), FsError> {
+		self.snapshots.retain(|s| s.name != name);
+		self.write_snapshot_table()
+	}
+
+	// Serialize the in-memory snapshot table to a fresh metadata block (copy-on-write),
+	// updating snap_root and its CRC32C; an empty table clears the pointer. The fresh
+	// block is published by the commit's superblock write.
+	fn write_snapshot_table(&mut self) -> Result<(), FsError> {
+		if self.snapshots.is_empty() {
+			self.snap_root = 0;
+			self.snap_root_crc = 0;
+			return Ok(());
+		}
+		let mut block = vec![0u8; BLOCK_SIZE];
+		block[0..4].copy_from_slice(&(self.snapshots.len() as u32).to_le_bytes());
+		for (i, s) in self.snapshots.iter().enumerate() {
+			let off = SNAP_HDR + i * SNAP_REC;
+			block[off..off + s.name.len()].copy_from_slice(&s.name);
+			block[off + SNAP_NAME_MAX..off + SNAP_NAME_MAX + 8].copy_from_slice(&s.inode_root.to_le_bytes());
+			block[off + SNAP_NAME_MAX + 8..off + SNAP_NAME_MAX + 12].copy_from_slice(&s.inode_root_crc.to_le_bytes());
+			block[off + SNAP_NAME_MAX + 12..off + SNAP_NAME_MAX + 20].copy_from_slice(&s.generation.to_le_bytes());
+		}
+		let ptr = self.snap_root;
+		let dest = self.node_dest(ptr)?;
+		let crc = self.write_node_to(dest, &block)?;
+		self.snap_root = dest;
+		self.snap_root_crc = crc;
+		Ok(())
+	}
+
+	// Load the snapshot table the superblock points at into memory. The block is checked
+	// against snap_root_crc; a corrupt or empty table yields no snapshots, so a damaged
+	// table never pins (or walks) garbage.
+	fn load_snapshot_table(&mut self) -> Result<(), FsError> {
+		self.snapshots = Vec::new();
+		if self.snap_root == 0 {
+			return Ok(());
+		}
+		let mut block = vec![0u8; BLOCK_SIZE];
+		if !self.dev.read_block(self.snap_root, &mut block) {
+			return Err(FsError::Io);
+		}
+		if crc32c(&block) != self.snap_root_crc {
+			return Ok(());
+		}
+		let count = (u32::from_le_bytes(block[0..4].try_into().unwrap()) as usize).min(SNAP_MAX);
+		for i in 0..count {
+			let off = SNAP_HDR + i * SNAP_REC;
+			let name = name_in(&block[off..off + SNAP_NAME_MAX]).to_vec();
+			let inode_root = u64::from_le_bytes(block[off + SNAP_NAME_MAX..off + SNAP_NAME_MAX + 8].try_into().unwrap());
+			let inode_root_crc = u32::from_le_bytes(block[off + SNAP_NAME_MAX + 8..off + SNAP_NAME_MAX + 12].try_into().unwrap());
+			let generation = u64::from_le_bytes(block[off + SNAP_NAME_MAX + 12..off + SNAP_NAME_MAX + 20].try_into().unwrap());
+			self.snapshots.push(Snapshot { name, inode_root, inode_root_crc, generation });
+		}
+		Ok(())
+	}
+
 	// Recover the device, consuming the filesystem.
 	pub fn into_device(self) -> D {
 		self.dev
+	}
+
+	// Borrow the backing block device without consuming the filesystem, so a caller can
+	// open a second read-only view (a snapshot) over the same backing.
+	pub fn device(&self) -> &D {
+		&self.dev
 	}
 
 	// metadata and timestamps
@@ -910,7 +1087,13 @@ impl<D: BlockDevice> LiberFs<D> {
 	// which is a no-op on a consistent volume.
 	pub fn fsck(&mut self) -> Result<FsckReport, FsError> {
 		self.derive_free()?;
-		let checksum_failures = self.check_inode_tree(self.inode_root, self.inode_root_crc)?;
+		let mut checksum_failures = self.check_inode_tree(self.inode_root, self.inode_root_crc)?;
+		// every pinned snapshot generation is part of the live volume: verify its blocks
+		// too, so corruption in a snapshot is reported and the walk accounts for it.
+		for i in 0..self.snapshots.len() {
+			let (root, crc) = (self.snapshots[i].inode_root, self.snapshots[i].inode_root_crc);
+			checksum_failures += self.check_inode_tree(root, crc)?;
+		}
 		Ok(FsckReport { reclaimed_blocks: 0, reclaimed_inodes: 0, checksum_failures })
 	}
 
@@ -943,21 +1126,21 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// transactions
 
-	// Begin a mutation: snapshot the inode-tree root and next-inode counter so they can
-	// be restored on failure and reserved as the previous generation on commit, and
-	// clear the fresh-block set.
+	// Begin a mutation: snapshot the inode-tree root, next-inode counter and snapshot
+	// table so they can be restored on failure and the inode root reserved as the
+	// previous generation on commit, and clear the fresh-block set.
 	fn begin(&mut self) {
-		self.txn = Some((self.inode_root, self.inode_root_crc, self.next_inode));
+		self.txn = Some(Txn { inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, snap_root: self.snap_root, snap_root_crc: self.snap_root_crc, snapshots: self.snapshots.clone() });
 		self.fresh.clear();
 	}
 
 	// Commit the in-flight mutation: write a new superblock (incremented generation,
-	// carrying the new inode-tree root and next-inode counter) to the inactive slot -
-	// the single atomic write that publishes the whole transaction. The superseded
-	// generation becomes the read-only snapshot; the one before it is reclaimed by
-	// rederiving the free map.
+	// carrying the new inode-tree root, next-inode counter and snapshot table) to the
+	// inactive slot - the single atomic write that publishes the whole transaction. The
+	// superseded generation becomes the read-only snapshot; the one before it is
+	// reclaimed by rederiving the free map.
 	fn commit(&mut self) -> Result<(), FsError> {
-		let sb = Superblock { num_blocks: self.num_blocks, generation: self.generation + 1, inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, root_inode: self.root_inode };
+		let sb = Superblock { num_blocks: self.num_blocks, generation: self.generation + 1, inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, root_inode: self.root_inode, snap_root: self.snap_root, snap_root_crc: self.snap_root_crc };
 		let new_slot = (self.slot + 1) % SUPER_SLOTS;
 		// the commit point: a single superblock write swaps the live root atomically.
 		if !self.dev.write_block(new_slot as u64, &serialize_superblock(&sb)) {
@@ -966,9 +1149,9 @@ impl<D: BlockDevice> LiberFs<D> {
 
 		// the generation this commit superseded becomes the snapshot; its blocks stay
 		// reserved by the rederived free map.
-		if let Some((proot, pcrc, _)) = self.txn.take() {
-			self.prev_inode_root = proot;
-			self.prev_inode_root_crc = pcrc;
+		if let Some(t) = self.txn.take() {
+			self.prev_inode_root = t.inode_root;
+			self.prev_inode_root_crc = t.inode_root_crc;
 			self.prev_valid = true;
 		}
 		self.generation += 1;
@@ -976,14 +1159,17 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.derive_free()
 	}
 
-	// Roll back a failed mutation: restore the inode-tree root and next-inode counter and
-	// rederive the free map, so the half-written fresh blocks are forgotten and on-disk
-	// state is untouched.
+	// Roll back a failed mutation: restore the inode-tree root, next-inode counter and
+	// snapshot table and rederive the free map, so the half-written fresh blocks are
+	// forgotten and on-disk state is untouched.
 	fn abort(&mut self) {
-		if let Some((root, crc, next)) = self.txn.take() {
-			self.inode_root = root;
-			self.inode_root_crc = crc;
-			self.next_inode = next;
+		if let Some(t) = self.txn.take() {
+			self.inode_root = t.inode_root;
+			self.inode_root_crc = t.inode_root_crc;
+			self.next_inode = t.next_inode;
+			self.snap_root = t.snap_root;
+			self.snap_root_crc = t.snap_root_crc;
+			self.snapshots = t.snapshots;
 		}
 		self.fresh.clear();
 		let _ = self.derive_free();
@@ -1001,8 +1187,9 @@ impl<D: BlockDevice> LiberFs<D> {
 	}
 
 	// Rebuild the in-memory free map from scratch: blocks 0 and 1 (the superblock
-	// slots) plus every block the live and previous generations reference. Called at
-	// mount and after each commit; nothing else persists allocation state.
+	// slots) plus every block the live and previous generations reference, the snapshot
+	// table block, and every pinned snapshot generation. Called at mount and after each
+	// commit; nothing else persists allocation state.
 	fn derive_free(&mut self) -> Result<(), FsError> {
 		let mut map = vec![0u8; self.free.len()];
 		set_bit(&mut map, 0);
@@ -1010,6 +1197,15 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.mark_inode_tree(self.inode_root, &mut map)?;
 		if self.prev_valid {
 			self.mark_inode_tree(self.prev_inode_root, &mut map)?;
+		}
+		// the snapshot table block and every pinned snapshot generation stay reserved, so
+		// a later commit never reuses an earlier root's blocks.
+		if self.snap_root != 0 {
+			set_bit(&mut map, self.snap_root);
+		}
+		for i in 0..self.snapshots.len() {
+			let root = self.snapshots[i].inode_root;
+			self.mark_inode_tree(root, &mut map)?;
 		}
 		self.free = map;
 		Ok(())
@@ -2023,6 +2219,10 @@ fn serialize_superblock(sb: &Superblock) -> Vec<u8> {
 	block[36..44].copy_from_slice(&sb.inode_root.to_le_bytes());
 	block[44..48].copy_from_slice(&sb.inode_root_crc.to_le_bytes());
 	block[52..56].copy_from_slice(&sb.root_inode.to_le_bytes());
+	// the snapshot-table pointer and its CRC32C sit past the self-CRC field, so they are
+	// covered by the whole-block checksum below.
+	block[60..68].copy_from_slice(&sb.snap_root.to_le_bytes());
+	block[68..72].copy_from_slice(&sb.snap_root_crc.to_le_bytes());
 	// the CRC bytes are already zero; checksum the block and store it over them.
 	let crc = crc32c(&block);
 	block[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
@@ -2052,7 +2252,7 @@ fn parse_superblock(block: &[u8]) -> Option<Superblock> {
 	if crc32c(&probe) != stored {
 		return None;
 	}
-	Some(Superblock { num_blocks: u64::from_le_bytes(block[16..24].try_into().ok()?), generation: u64::from_le_bytes(block[28..36].try_into().ok()?), inode_root: u64::from_le_bytes(block[36..44].try_into().ok()?), inode_root_crc: u32::from_le_bytes(block[44..48].try_into().ok()?), next_inode: u32::from_le_bytes(block[24..28].try_into().ok()?), root_inode: u32::from_le_bytes(block[52..56].try_into().ok()?) })
+	Some(Superblock { num_blocks: u64::from_le_bytes(block[16..24].try_into().ok()?), generation: u64::from_le_bytes(block[28..36].try_into().ok()?), inode_root: u64::from_le_bytes(block[36..44].try_into().ok()?), inode_root_crc: u32::from_le_bytes(block[44..48].try_into().ok()?), next_inode: u32::from_le_bytes(block[24..28].try_into().ok()?), root_inode: u32::from_le_bytes(block[52..56].try_into().ok()?), snap_root: u64::from_le_bytes(block[60..68].try_into().ok()?), snap_root_crc: u32::from_le_bytes(block[68..72].try_into().ok()?) })
 }
 
 // The name held in a directory record's NUL-padded name field: up to the first NUL.
