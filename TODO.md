@@ -915,9 +915,9 @@ snapshots are solid). Per-extent transparent compression shrinks data on disk an
 can cut I/O; it pairs naturally with the M54 extent map (compress per extent, store
 the compressed length).
 
-- [ ] Per-extent transparent compression: compress a data extent on write and decompress on read, storing the algorithm + compressed length beside the extent; an incompressible extent is stored raw.
-- [ ] A simple, dependency-free codec (the no_std, zero-dependency rule holds - an LZ-family coder vendored in, not an external crate).
-- [ ] Keep checksums over the stored (compressed) bytes and the extent integrity.
+- [x] Per-extent transparent compression: compress a data extent on write and decompress on read, storing the algorithm + compressed length beside the extent; an incompressible extent is stored raw.
+- [x] A simple, dependency-free codec (the no_std, zero-dependency rule holds - an LZ-family coder vendored in, not an external crate).
+- [x] Keep checksums over the stored (compressed) bytes and the extent integrity.
 - Done when: file data is transparently compressed per extent and reads back identically, incompressible data falls back to raw, checksums cover the stored bytes, tests green - the last modern-FS feature.
 - Concept: Native filesystem (compression, explicitly the last FS feature; deduplication and encryption are out by decision - dedup too costly, encryption a lower block/volume layer), the no_std + zero-dependency rule.
 

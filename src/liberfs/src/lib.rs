@@ -13,9 +13,11 @@
 //! each a contiguous run of blocks paired with one checksum block - held inline in the
 //! inode and spilling to an overflow chain when there are many, so a file grows from a
 //! few blocks to hundreds of gigabytes and an unwritten range simply has no extent (a
-//! sparse hole that reads back as zeros). Every data block is paired with a CRC32C,
-//! kept in its extent's checksum block, and every tree node with its own CRC32C kept in
-//! the parent link, so on-disk corruption is caught when the block is read. Each inode
+//! sparse hole that reads back as zeros). A run whose bytes shrink is transparently
+//! compressed, stored across fewer blocks, and falls back to raw when they do not. Every
+//! stored block is paired with a CRC32C, kept in its extent's checksum block, and every
+//! tree node with its own CRC32C kept in the parent link, so on-disk corruption is caught
+//! when the block is read. Each inode
 //! also reserves an opaque owner tag (stored, never interpreted: authorization lives in
 //! the capability layer and StorageService, not in the filesystem). There is no on-disk
 //! allocation bitmap: the free map is reconstructed in memory at mount from the blocks
@@ -68,6 +70,19 @@
 //! every live data block and reports how many fail their checksum. With copy-on-write
 //! a crash can no longer leak blocks or orphan an inode, so `fsck` no longer needs to
 //! reclaim them.
+//!
+//! ## Compression (transparent, per extent)
+//!
+//! A whole-file write compresses each of its runs with a small, dependency-free LZSS
+//! coder ([`lz_compress`]): a run whose bytes shrink to fewer blocks is stored as a
+//! compressed extent - the compressed stream packed into a contiguous run of stored
+//! blocks, the original block span kept as the extent's logical `length` - while an
+//! incompressible run is left raw. Reads decode the extent transparently, so a file
+//! reads back identically whether or not it compressed. The per-block CRC32C covers the
+//! stored (compressed) bytes, so integrity and `fsck` work unchanged. Editing a
+//! compressed file thaws the touched run back to raw blocks (a later whole-file write
+//! recompresses it), keeping partial writes simple. Compression is a space optimization
+//! only: it never changes a file's contents or the `Storage.Volume` API.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -133,23 +148,44 @@ const OWNER_TAG_LEN: usize = 16;
 const OWNER_TAG_OFF: usize = 56;
 
 // A file is mapped by EXTENTS: each is a contiguous run of blocks (a logical start, a
-// physical start, a length) with one checksum block holding a CRC32C per block in the
-// run. One extent record is 32 bytes on disk: logical (u64), physical (u64), length
-// (u32), the checksum block's own CRC32C (u32), then the checksum block pointer (u64).
-const EXTENT_SIZE: usize = 32;
+// physical start, a length) with one checksum block holding a CRC32C per stored block in
+// the run. One extent record is 40 bytes on disk: logical (u64), physical (u64), length
+// (u32), the checksum block's own CRC32C (u32), the checksum block pointer (u64), then
+// the stored-block count (u32) and the compressed byte length (u32). A raw run stores
+// `length` blocks (its stored count equals `length` and its compressed length is 0); a
+// transparently compressed run stores fewer blocks holding the compressed bytes of the
+// whole `length`-block span (see [`LiberFs::compress_inode`]).
+const EXTENT_SIZE: usize = 40;
 // Byte offset of the first inline extent: past the fixed header (kind, size, two
 // timestamps, the extent-overflow pointer and count) and the owner tag.
 const EXTENT_OFF: usize = OWNER_TAG_OFF + OWNER_TAG_LEN;
-// (256 - 72) / 32 = 5 extents live inline in the inode; a file of up to five runs needs
+// (256 - 72) / 40 = 4 extents live inline in the inode; a file of up to four runs needs
 // no overflow block at all. Beyond that, extents spill to a chain of extent blocks.
 const EXTENTS_INLINE: usize = (INODE_SIZE - EXTENT_OFF) / EXTENT_SIZE;
-// A checksum block holds one CRC32C (4 bytes) per block of its extent, so an extent
-// spans at most this many blocks (1024 = 4 MiB). A longer file is several extents.
+// A checksum block holds one CRC32C (4 bytes) per stored block of its extent, so an
+// extent stores at most this many blocks (1024 = 4 MiB) and spans at most that many
+// logical blocks. A longer file is several extents.
 const CRCS_PER_BLOCK: usize = BLOCK_SIZE / 4;
 // An extent-overflow block: an 8-byte next-block pointer, its 4-byte CRC32C, a 4-byte
-// count, then the extent records. (4096 - 16) / 32 = 127 extents per overflow block.
+// count, then the extent records. (4096 - 16) / 40 = 102 extents per overflow block.
 const EXTENT_HDR: usize = 16;
 const EXTENTS_PER_BLOCK: usize = (BLOCK_SIZE - EXTENT_HDR) / EXTENT_SIZE;
+
+// Transparent per-extent compression uses a small, dependency-free LZ77 / LZSS coder (no
+// external crate, no_std). A control byte's eight bits flag the next eight items as a
+// literal byte or a back-reference; a back-reference is a 12-bit distance (1..=4096, the
+// sliding window) and a 4-bit length (LZ_MIN_MATCH..=LZ_MAX_MATCH). The compressed stream
+// begins with the uncompressed length (u32, little-endian) so it decodes without external
+// size metadata. A compressed extent stores this stream across whole blocks, each with
+// its own CRC32C, so the integrity checks cover the stored (compressed) bytes.
+const LZ_WINDOW: usize = 4096;
+const LZ_MIN_MATCH: usize = 3;
+const LZ_MAX_MATCH: usize = LZ_MIN_MATCH + 15;
+const LZ_HASH_BITS: usize = 13;
+const LZ_HASH_SIZE: usize = 1 << LZ_HASH_BITS;
+// How many earlier positions sharing a 3-byte prefix to test for the longest match: a
+// bounded chain keeps compression roughly linear while still finding most matches.
+const LZ_MAX_CHAIN: usize = 32;
 
 // Inode kinds. A live inode record is always a file or a directory; a freed inode is
 // deleted from the tree rather than tombstoned, so there is no "free" kind.
@@ -284,11 +320,14 @@ const SNAP_HDR: usize = 8;
 const SNAP_REC: usize = SNAP_NAME_MAX + 20;
 const SNAP_MAX: usize = (BLOCK_SIZE - SNAP_HDR) / SNAP_REC;
 
-// One extent: a contiguous run of `length` blocks mapped from logical block `logical`
-// to physical block `physical`, paired with a checksum block (`csum`) holding the
-// CRC32C of every block in the run, plus `csum_crc`, that checksum block's own CRC32C.
-// A file's extents are kept sorted by `logical`; a logical block no extent covers is a
-// hole that reads back as zeros (so a sparse file costs only its written runs).
+// One extent: a contiguous run of `length` logical blocks mapped from logical block
+// `logical` to physical block `physical`, paired with a checksum block (`csum`) holding
+// the CRC32C of every stored block in the run, plus `csum_crc`, that checksum block's own
+// CRC32C. A run is either raw (`clen` == 0, `store_len` == `length`, one physical block
+// per logical block) or transparently compressed (`clen` > 0, `store_len` < `length`, the
+// `store_len` physical blocks holding the `clen`-byte compressed stream of the whole
+// span). A file's extents are kept sorted by `logical`; a logical block no extent covers
+// is a hole that reads back as zeros (so a sparse file costs only its written runs).
 #[derive(Clone, Copy)]
 struct Extent {
 	logical: u64,
@@ -296,11 +335,17 @@ struct Extent {
 	length: u32,
 	csum: u64,
 	csum_crc: u32,
+	// Stored (physical) blocks of the run: equals `length` for a raw run, fewer for a
+	// compressed one. The checksum block holds one CRC32C per stored block.
+	store_len: u32,
+	// Compressed byte length: 0 for a raw run, else the length of the compressed stream
+	// held across the `store_len` stored blocks.
+	clen: u32,
 }
 
 impl Extent {
 	fn parse(buf: &[u8]) -> Extent {
-		Extent { logical: u64::from_le_bytes(buf[0..8].try_into().unwrap()), physical: u64::from_le_bytes(buf[8..16].try_into().unwrap()), length: u32::from_le_bytes(buf[16..20].try_into().unwrap()), csum_crc: u32::from_le_bytes(buf[20..24].try_into().unwrap()), csum: u64::from_le_bytes(buf[24..32].try_into().unwrap()) }
+		Extent { logical: u64::from_le_bytes(buf[0..8].try_into().unwrap()), physical: u64::from_le_bytes(buf[8..16].try_into().unwrap()), length: u32::from_le_bytes(buf[16..20].try_into().unwrap()), csum_crc: u32::from_le_bytes(buf[20..24].try_into().unwrap()), csum: u64::from_le_bytes(buf[24..32].try_into().unwrap()), store_len: u32::from_le_bytes(buf[32..36].try_into().unwrap()), clen: u32::from_le_bytes(buf[36..40].try_into().unwrap()) }
 	}
 
 	fn write(&self, buf: &mut [u8]) {
@@ -309,6 +354,8 @@ impl Extent {
 		buf[16..20].copy_from_slice(&self.length.to_le_bytes());
 		buf[20..24].copy_from_slice(&self.csum_crc.to_le_bytes());
 		buf[24..32].copy_from_slice(&self.csum.to_le_bytes());
+		buf[32..36].copy_from_slice(&self.store_len.to_le_bytes());
+		buf[36..40].copy_from_slice(&self.clen.to_le_bytes());
 	}
 
 	// The first logical block past the run.
@@ -493,6 +540,9 @@ pub struct LiberFs<D: BlockDevice> {
 	// The state captured at `begin`, restored by `abort` and used by `commit` to reserve
 	// the generation it supersedes.
 	txn: Option<Txn>,
+	// A one-extent cache of the most recently decompressed run, keyed by its first stored
+	// block, so a sequential read of a compressed extent decodes it only once.
+	decomp: Option<(u64, Vec<u8>)>,
 	clock: u64,
 }
 
@@ -531,7 +581,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Io);
 		}
 
-		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, decomp: None, clock: 0 };
 		fs.derive_free()?;
 		Ok(fs)
 	}
@@ -597,7 +647,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			None => (0, 0, false),
 		};
 
-		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, decomp: None, clock: 0 };
 		fs.load_snapshot_table().ok()?;
 		fs.derive_free().ok()?;
 		Some(fs)
@@ -712,6 +762,10 @@ impl<D: BlockDevice> LiberFs<D> {
 			block[..end - start].copy_from_slice(&data[start..end]);
 			self.write_logical(&mut inode, i, &block)?;
 		}
+
+		// transparently compress the freshly written runs: a run that shrinks is replaced
+		// by a compressed record, an incompressible one stays raw.
+		self.compress_inode(&mut inode)?;
 
 		// point the inode at the new blocks, then name it (new files only). The old
 		// inode and blocks are not freed here - the commit's previous generation keeps
@@ -1132,6 +1186,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	fn begin(&mut self) {
 		self.txn = Some(Txn { inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, snap_root: self.snap_root, snap_root_crc: self.snap_root_crc, snapshots: self.snapshots.clone() });
 		self.fresh.clear();
+		self.decomp = None;
 	}
 
 	// Commit the in-flight mutation: write a new superblock (incremented generation,
@@ -1845,6 +1900,25 @@ impl<D: BlockDevice> LiberFs<D> {
 			Some(i) => inode.extents[i],
 			None => return Ok(false),
 		};
+		if ext.clen != 0 {
+			// a compressed run: serve the block from the whole extent's decompressed
+			// image, decoding once and caching it for the rest of a sequential read.
+			let cached = matches!(&self.decomp, Some((key, _)) if *key == ext.physical);
+			if !cached {
+				let decoded = self.decompress_extent(&ext)?;
+				self.decomp = Some((ext.physical, decoded));
+			}
+			let data = &self.decomp.as_ref().unwrap().1;
+			let start = (lb - ext.logical) as usize * BLOCK_SIZE;
+			for b in buf.iter_mut() {
+				*b = 0;
+			}
+			if start < data.len() {
+				let end = (start + BLOCK_SIZE).min(data.len());
+				buf[..end - start].copy_from_slice(&data[start..end]);
+			}
+			return Ok(true);
+		}
 		let off = (lb - ext.logical) as usize;
 		if !self.dev.read_block(ext.physical + off as u64, buf) {
 			return Err(FsError::Io);
@@ -1863,6 +1937,13 @@ impl<D: BlockDevice> LiberFs<D> {
 	// persists the inode, which flushes the map to disk.
 	fn write_logical(&mut self, inode: &mut Inode, logical: usize, buf: &[u8]) -> Result<(), FsError> {
 		let lb = logical as u64;
+		// a compressed run cannot be edited in place: thaw it back to raw blocks first, so
+		// this overwrite (and any later block of the run) proceeds on a raw extent.
+		if let Some(i) = find_extent(&inode.extents, lb) {
+			if inode.extents[i].clen != 0 {
+				self.thaw_extent(inode, i)?;
+			}
+		}
 		let crc = crc32c(buf);
 		if let Some(i) = find_extent(&inode.extents, lb) {
 			let ext = inode.extents[i];
@@ -1888,11 +1969,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		let pos = inode.extents.partition_point(|e| e.logical <= lb);
 		if pos > 0 {
 			let prev = inode.extents[pos - 1];
-			if prev.end() == lb && prev.physical + prev.length as u64 == phys && (prev.length as usize) < CRCS_PER_BLOCK {
+			if prev.clen == 0 && prev.end() == lb && prev.physical + prev.length as u64 == phys && (prev.length as usize) < CRCS_PER_BLOCK {
 				let csum = self.cow_meta(prev.csum)?;
 				let csum_crc = self.set_csum_slot(csum, prev.length as usize, crc)?;
 				let e = &mut inode.extents[pos - 1];
 				e.length += 1;
+				e.store_len += 1;
 				e.csum = csum;
 				e.csum_crc = csum_crc;
 				return Ok(());
@@ -1904,7 +1986,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if !self.dev.write_block(csum, &cbuf) {
 			return Err(FsError::Io);
 		}
-		inode.extents.insert(pos, Extent { logical: lb, physical: phys, length: 1, csum, csum_crc: crc32c(&cbuf) });
+		inode.extents.insert(pos, Extent { logical: lb, physical: phys, length: 1, csum, csum_crc: crc32c(&cbuf), store_len: 1, clen: 0 });
 		Ok(())
 	}
 
@@ -1934,7 +2016,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if off > 0 {
 			// the prefix is unchanged: reuse the original checksum block (its leading
 			// slots still match the kept blocks).
-			pieces.push(Extent { logical: ext.logical, physical: ext.physical, length: off as u32, csum: ext.csum, csum_crc: ext.csum_crc });
+			pieces.push(Extent { logical: ext.logical, physical: ext.physical, length: off as u32, csum: ext.csum, csum_crc: ext.csum_crc, store_len: off as u32, clen: 0 });
 		}
 		// the rewritten block gets a fresh single-entry checksum block.
 		let mid_csum = self.alloc_meta()?;
@@ -1943,7 +2025,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if !self.dev.write_block(mid_csum, &cbuf) {
 			return Err(FsError::Io);
 		}
-		pieces.push(Extent { logical: ext.logical + off as u64, physical: new_phys, length: 1, csum: mid_csum, csum_crc: crc32c(&cbuf) });
+		pieces.push(Extent { logical: ext.logical + off as u64, physical: new_phys, length: 1, csum: mid_csum, csum_crc: crc32c(&cbuf), store_len: 1, clen: 0 });
 		if off + 1 < ext.length as usize {
 			let slen = ext.length as usize - off - 1;
 			let suf_csum = self.alloc_meta()?;
@@ -1953,15 +2035,138 @@ impl<D: BlockDevice> LiberFs<D> {
 			if !self.dev.write_block(suf_csum, &sbuf) {
 				return Err(FsError::Io);
 			}
-			pieces.push(Extent { logical: ext.logical + off as u64 + 1, physical: ext.physical + off as u64 + 1, length: slen as u32, csum: suf_csum, csum_crc: crc32c(&sbuf) });
+			pieces.push(Extent { logical: ext.logical + off as u64 + 1, physical: ext.physical + off as u64 + 1, length: slen as u32, csum: suf_csum, csum_crc: crc32c(&sbuf), store_len: slen as u32, clen: 0 });
 		}
 		inode.extents.splice(i..i + 1, pieces);
 		Ok(())
 	}
 
+	// Decompress a compressed extent's stored blocks and rewrite its span as a raw 1:1
+	// run (each logical block its own fresh data block with a per-block checksum),
+	// dropping the compressed record. Editing a compressed file falls back to raw; a
+	// later whole-file write recompresses it. The old stored and checksum blocks become
+	// unreferenced and are reclaimed when the free map is rederived at commit.
+	fn thaw_extent(&mut self, inode: &mut Inode, i: usize) -> Result<(), FsError> {
+		let ext = inode.extents[i];
+		let decoded = self.decompress_extent(&ext)?;
+		inode.extents.remove(i);
+		let mut blk = vec![0u8; BLOCK_SIZE];
+		for lo in 0..ext.length as usize {
+			for b in blk.iter_mut() {
+				*b = 0;
+			}
+			let start = lo * BLOCK_SIZE;
+			if start < decoded.len() {
+				let end = (start + BLOCK_SIZE).min(decoded.len());
+				blk[..end - start].copy_from_slice(&decoded[start..end]);
+			}
+			let crc = crc32c(&blk);
+			let phys = self.alloc_data()?;
+			if !self.dev.write_block(phys, &blk) {
+				return Err(FsError::Io);
+			}
+			self.place_block(inode, ext.logical + lo as u64, phys, crc)?;
+		}
+		Ok(())
+	}
+
+	// Read and verify the stored (compressed) blocks of a compressed extent, then decode
+	// them into the run's uncompressed image. Each stored block is checked against its
+	// CRC32C in the checksum block, so corruption of the compressed bytes surfaces as
+	// `FsError::Corrupt` rather than bad data.
+	fn decompress_extent(&mut self, ext: &Extent) -> Result<Vec<u8>, FsError> {
+		let mut cbuf = vec![0u8; BLOCK_SIZE];
+		if !self.dev.read_block(ext.csum, &mut cbuf) {
+			return Err(FsError::Io);
+		}
+		if crc32c(&cbuf) != ext.csum_crc {
+			return Err(FsError::Corrupt);
+		}
+		let mut comp = vec![0u8; ext.store_len as usize * BLOCK_SIZE];
+		for s in 0..ext.store_len as usize {
+			let dst = &mut comp[s * BLOCK_SIZE..(s + 1) * BLOCK_SIZE];
+			if !self.dev.read_block(ext.physical + s as u64, dst) {
+				return Err(FsError::Io);
+			}
+			let stored = u32::from_le_bytes(cbuf[s * 4..s * 4 + 4].try_into().unwrap());
+			if crc32c(dst) != stored {
+				return Err(FsError::Corrupt);
+			}
+		}
+		Ok(lz_decompress(&comp[..ext.clen as usize]))
+	}
+
+	// Try to transparently compress each of a freshly written file's raw extents in
+	// place: a run that shrinks to fewer blocks becomes a compressed record, an
+	// incompressible one is left raw. Run as the last step of a whole-file write, so the
+	// block-by-block writer stays simple and partial updates keep working on raw runs.
+	fn compress_inode(&mut self, inode: &mut Inode) -> Result<(), FsError> {
+		for i in 0..inode.extents.len() {
+			self.compress_extent(inode, i)?;
+		}
+		Ok(())
+	}
+
+	// Compress raw extent `i` if its bytes shrink to fewer blocks. The compressed stream
+	// is written across a contiguous run of fresh data blocks with one checksum block
+	// (one CRC32C per stored block), and the extent rewritten to point at it; the old raw
+	// blocks become unreferenced and are reclaimed at commit. The run stays raw if it is
+	// a single block, does not shrink, or a contiguous stored run is unavailable.
+	fn compress_extent(&mut self, inode: &mut Inode, i: usize) -> Result<(), FsError> {
+		let ext = inode.extents[i];
+		if ext.clen != 0 || ext.length < 2 {
+			return Ok(());
+		}
+		let mut ubuf = vec![0u8; ext.length as usize * BLOCK_SIZE];
+		for off in 0..ext.length as usize {
+			let dst = &mut ubuf[off * BLOCK_SIZE..(off + 1) * BLOCK_SIZE];
+			if !self.dev.read_block(ext.physical + off as u64, dst) {
+				return Err(FsError::Io);
+			}
+		}
+		let comp = lz_compress(&ubuf);
+		let store_len = comp.len().div_ceil(BLOCK_SIZE);
+		if store_len >= ext.length as usize {
+			return Ok(());
+		}
+		// claim a contiguous run of stored blocks (data is taken low-to-high, so fresh
+		// data allocations run contiguously); leave the run raw if a gap appears.
+		let first = self.alloc_data()?;
+		let mut last = first;
+		for _ in 1..store_len {
+			let b = self.alloc_data()?;
+			if b != last + 1 {
+				return Ok(());
+			}
+			last = b;
+		}
+		let mut blk = vec![0u8; BLOCK_SIZE];
+		let mut cbuf = vec![0u8; BLOCK_SIZE];
+		for s in 0..store_len {
+			for b in blk.iter_mut() {
+				*b = 0;
+			}
+			let start = s * BLOCK_SIZE;
+			let end = (start + BLOCK_SIZE).min(comp.len());
+			blk[..end - start].copy_from_slice(&comp[start..end]);
+			if !self.dev.write_block(first + s as u64, &blk) {
+				return Err(FsError::Io);
+			}
+			let crc = crc32c(&blk);
+			cbuf[s * 4..s * 4 + 4].copy_from_slice(&crc.to_le_bytes());
+		}
+		let csum = self.alloc_meta()?;
+		if !self.dev.write_block(csum, &cbuf) {
+			return Err(FsError::Io);
+		}
+		inode.extents[i] = Extent { logical: ext.logical, physical: first, length: ext.length, csum, csum_crc: crc32c(&cbuf), store_len: store_len as u32, clen: comp.len() as u32 };
+		Ok(())
+	}
+
 	// Count the live data blocks of `inode` whose on-disk bytes no longer match the
 	// CRC32C stored for them in their run's checksum block. A run whose checksum block
-	// is itself corrupt counts as wholly bad.
+	// is itself corrupt counts as wholly bad. A compressed run is checked over its stored
+	// (compressed) blocks, since those are the bytes the checksum covers.
 	fn count_corrupt(&mut self, inode: &Inode) -> Result<u32, FsError> {
 		let mut bad = 0;
 		let mut buf = vec![0u8; BLOCK_SIZE];
@@ -1971,10 +2176,10 @@ impl<D: BlockDevice> LiberFs<D> {
 				return Err(FsError::Io);
 			}
 			if crc32c(&cbuf) != ext.csum_crc {
-				bad += ext.length;
+				bad += ext.store_len;
 				continue;
 			}
-			for off in 0..ext.length as usize {
+			for off in 0..ext.store_len as usize {
 				if !self.dev.read_block(ext.physical + off as u64, &mut buf) {
 					return Err(FsError::Io);
 				}
@@ -2181,11 +2386,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(())
 	}
 
-	// Set the bitmap bit for every block an inode references: each run's data blocks and
-	// its checksum block, plus the blocks of the extent overflow chain.
+	// Set the bitmap bit for every block an inode references: each run's stored (data or
+	// compressed) blocks and its checksum block, plus the blocks of the extent overflow
+	// chain.
 	fn collect_inode_blocks(&mut self, inode: &Inode, bitmap: &mut [u8]) -> Result<(), FsError> {
 		for ext in inode.extents.iter() {
-			for off in 0..ext.length as u64 {
+			for off in 0..ext.store_len as u64 {
 				set_bit(bitmap, ext.physical + off);
 			}
 			if ext.csum != 0 {
@@ -2393,6 +2599,135 @@ fn find_extent(extents: &[Extent], lb: u64) -> Option<usize> {
 	} else {
 		None
 	}
+}
+
+// Hash the 3-byte prefix at `w` into an LZ_HASH_BITS-wide match-finder bucket.
+fn lz_hash(w: &[u8]) -> usize {
+	let v = (w[0] as u32) << 16 | (w[1] as u32) << 8 | w[2] as u32;
+	(v.wrapping_mul(0x9E37_79B1) >> (32 - LZ_HASH_BITS)) as usize
+}
+
+// Record position `i` in the hash chain (most-recent-first) so later positions can find
+// it as a match candidate. `prev` is windowed (LZ_WINDOW entries): within the active
+// window the low bits of a position are unique, and the match walk stops once a candidate
+// is more than a window back, so the wrap never yields a wrong match.
+fn lz_insert(src: &[u8], i: usize, head: &mut [i32], prev: &mut [i32]) {
+	if i + LZ_MIN_MATCH <= src.len() {
+		let h = lz_hash(&src[i..]);
+		prev[i & (LZ_WINDOW - 1)] = head[h];
+		head[h] = i as i32;
+	}
+}
+
+// Compress `src` with the small LZSS coder described at the LZ_* constants: a control
+// byte per eight items, each a literal byte or a (distance, length) back-reference into
+// the 4096-byte sliding window. The stream begins with the uncompressed length, so
+// `lz_decompress` needs no external size. Dependency-free and no_std; the ratio is modest
+// but the format is simple and the decoder trivial, which is what an on-disk filesystem
+// wants. Every candidate match is verified by comparing bytes, so the windowed hash chain
+// only affects the ratio, never correctness.
+fn lz_compress(src: &[u8]) -> Vec<u8> {
+	let n = src.len();
+	let mut out = Vec::with_capacity(n / 2 + 8);
+	out.extend_from_slice(&(n as u32).to_le_bytes());
+	let mut head = vec![-1i32; LZ_HASH_SIZE];
+	let mut prev = vec![-1i32; LZ_WINDOW];
+	let mut i = 0usize;
+	while i < n {
+		let ctrl = out.len();
+		out.push(0u8);
+		let mut flags = 0u8;
+		let mut bit = 0;
+		while bit < 8 && i < n {
+			let (mut best_len, mut best_dist) = (0usize, 0usize);
+			if i + LZ_MIN_MATCH <= n {
+				let mut cand = head[lz_hash(&src[i..])];
+				let mut probes = 0;
+				while cand >= 0 && probes < LZ_MAX_CHAIN {
+					let c = cand as usize;
+					let dist = i - c;
+					if dist > LZ_WINDOW {
+						break;
+					}
+					let max = (n - i).min(LZ_MAX_MATCH);
+					let mut l = 0;
+					while l < max && src[c + l] == src[i + l] {
+						l += 1;
+					}
+					if l > best_len {
+						best_len = l;
+						best_dist = dist;
+						if l == LZ_MAX_MATCH {
+							break;
+						}
+					}
+					cand = prev[c & (LZ_WINDOW - 1)];
+					probes += 1;
+				}
+			}
+			if best_len >= LZ_MIN_MATCH {
+				let dist_code = (best_dist - 1) as u16;
+				out.push((dist_code & 0xFF) as u8);
+				out.push((((dist_code >> 8) as u8) << 4) | (best_len - LZ_MIN_MATCH) as u8);
+				let end = i + best_len;
+				while i < end {
+					lz_insert(src, i, &mut head, &mut prev);
+					i += 1;
+				}
+			} else {
+				flags |= 1 << bit;
+				out.push(src[i]);
+				lz_insert(src, i, &mut head, &mut prev);
+				i += 1;
+			}
+			bit += 1;
+		}
+		out[ctrl] = flags;
+	}
+	out
+}
+
+// Decode a stream produced by `lz_compress` back into its original bytes. Bounds-checked
+// throughout, so a malformed stream yields whatever decoded cleanly rather than panicking
+// (a compressed extent's stored blocks are checksum-verified before this is called).
+fn lz_decompress(src: &[u8]) -> Vec<u8> {
+	if src.len() < 4 {
+		return Vec::new();
+	}
+	let n = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
+	let mut out = Vec::with_capacity(n);
+	let mut p = 4;
+	while out.len() < n && p < src.len() {
+		let flags = src[p];
+		p += 1;
+		let mut bit = 0;
+		while bit < 8 && out.len() < n {
+			if flags & (1 << bit) != 0 {
+				if p >= src.len() {
+					return out;
+				}
+				out.push(src[p]);
+				p += 1;
+			} else {
+				if p + 1 >= src.len() {
+					return out;
+				}
+				let dist = (((src[p + 1] >> 4) as usize) << 8 | src[p] as usize) + 1;
+				let len = (src[p + 1] & 0x0F) as usize + LZ_MIN_MATCH;
+				p += 2;
+				if dist > out.len() {
+					return out;
+				}
+				let start = out.len() - dist;
+				for k in 0..len {
+					let byte = out[start + k];
+					out.push(byte);
+				}
+			}
+			bit += 1;
+		}
+	}
+	out
 }
 
 // Split a path into its validated segments. Each segment must be non-empty, no longer

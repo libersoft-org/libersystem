@@ -457,6 +457,18 @@ fn corrupt_bytes(dev: &mut MemDevice, needle: &[u8]) {
 	dev.blocks[pos] ^= 0xFF;
 }
 
+// Pseudo-random, incompressible bytes (a small LCG), so a file stays raw on disk and its
+// content lands verbatim rather than being squashed by transparent compression.
+fn noise(n: usize) -> Vec<u8> {
+	let mut s: u32 = 0x1234_5678;
+	(0..n)
+		.map(|_| {
+			s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+			(s >> 24) as u8
+		})
+		.collect()
+}
+
 #[test]
 fn a_flipped_byte_is_caught_on_read() {
 	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
@@ -476,7 +488,9 @@ fn a_flipped_byte_in_an_extent_file_is_caught() {
 	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
 	let size = BLOCK_SIZE * 6;
 	let marker = b"a needle near the end";
-	let mut big: Vec<u8> = vec![b'.'; size];
+	// incompressible payload so the run stays raw: a compressed extent would not hold the
+	// marker verbatim on disk for corrupt_bytes to find.
+	let mut big: Vec<u8> = noise(size);
 	let at = size - 64;
 	big[at..at + marker.len()].copy_from_slice(marker);
 	fs.write_file(b"big", &big).unwrap();
@@ -829,7 +843,9 @@ fn deleting_a_snapshot_releases_its_pinned_blocks() {
 		}
 	}
 	let nblocks: u64 = 48;
-	let big: Vec<u8> = vec![0xCDu8; BLOCK_SIZE * 6];
+	// incompressible, so the file really pins six data blocks (a compressed run would
+	// shrink to one, weakening the capacity margin the assertion checks).
+	let big: Vec<u8> = noise(BLOCK_SIZE * 6);
 
 	// pin a multi-block file in a snapshot, delete it from the live tree, then roll the
 	// previous-generation retention forward so ONLY the named snapshot pins its blocks.
@@ -872,3 +888,75 @@ fn snapshot_name_rules_are_enforced() {
 	fs.delete_snapshot(b"dup").unwrap();
 	assert!(fs.list_snapshots().unwrap().is_empty());
 }
+
+// M57: transparent per-extent compression.
+
+#[test]
+fn a_compressible_file_shrinks_and_round_trips() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	// four blocks of repeating text: highly compressible, so the run shrinks.
+	let big: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
+	fs.write_file(b"big", &big).unwrap();
+	assert_eq!(fs.read_file(b"big").unwrap(), big);
+	let num = fs.lookup(b"big").unwrap();
+	let ext = fs.read_inode(num).unwrap().extents[0];
+	assert!(ext.clen != 0, "expected a compressed extent");
+	assert!((ext.store_len as usize) < ext.length as usize, "compressed run should use fewer blocks");
+	// it reads back identically across a remount and verifies clean.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(b"big").unwrap(), big);
+	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
+}
+
+#[test]
+fn an_incompressible_file_stays_raw() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let big = noise(BLOCK_SIZE * 4);
+	fs.write_file(b"rnd", &big).unwrap();
+	assert_eq!(fs.read_file(b"rnd").unwrap(), big);
+	// random bytes do not shrink, so the run is stored raw: store_len == length, clen 0.
+	let num = fs.lookup(b"rnd").unwrap();
+	let ext = fs.read_inode(num).unwrap().extents[0];
+	assert_eq!(ext.clen, 0);
+	assert_eq!(ext.store_len, ext.length);
+}
+
+#[test]
+fn editing_a_compressed_file_thaws_it() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut big: Vec<u8> = b"compress me well, ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
+	fs.write_file(b"big", &big).unwrap();
+	let num = fs.lookup(b"big").unwrap();
+	assert!(fs.read_inode(num).unwrap().extents[0].clen != 0);
+	// overwriting a block thaws the run back to raw and keeps the data correct.
+	fs.write_at(b"big", BLOCK_SIZE as u64, b"PATCH").unwrap();
+	big[BLOCK_SIZE..BLOCK_SIZE + 5].copy_from_slice(b"PATCH");
+	assert_eq!(fs.read_file(b"big").unwrap(), big);
+	for ext in fs.read_inode(num).unwrap().extents.iter() {
+		assert_eq!(ext.clen, 0, "edited file should be raw");
+	}
+}
+
+#[test]
+fn compression_checksums_catch_corruption() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let big: Vec<u8> = b"checksum the stored bytes. ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
+	fs.write_file(b"big", &big).unwrap();
+	let num = fs.lookup(b"big").unwrap();
+	let ext = fs.read_inode(num).unwrap().extents[0];
+	let mut dev = fs.into_device();
+	// flip a byte in a stored (compressed) block: the per-block CRC32C catches it.
+	dev.blocks[ext.physical as usize * BLOCK_SIZE] ^= 0xFF;
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(b"big"), Err(FsError::Corrupt));
+	assert_eq!(fs.fsck().unwrap().checksum_failures, 1);
+}
+
+#[test]
+fn the_codec_round_trips_varied_inputs() {
+	for input in [Vec::new(), vec![0u8; 9000], b"hello hello hello hello world".to_vec(), noise(8000)] {
+		assert_eq!(lz_decompress(&lz_compress(&input)), input);
+	}
+}
+
