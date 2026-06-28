@@ -782,6 +782,59 @@ wrap flag. Each sub-step must build and keep the test harness green (66 [ok]).
   codecs" parallel, M35c (the cell-buffer terminal this refactors), M44 (the virtio-gpu
   surface), and the "don't clear the boot log" / "find duplicate code" NOTES items.
 
+## M48 - FAT / exFAT filesystem backend (read foreign removable media)
+
+LSFS (M43) is our own system filesystem. For interop the Volume API also needs to read foreign media - USB flash drives, SD cards, install images - which in practice are formatted with the ubiquitous FAT family. Per the layering principle a FAT backend sits behind the same `Storage.Volume` API as just another FS backend (a `driver.fs.fat` service), read-first; this is the concept's compatible-FS direction (ext4 / NTFS / exFAT / FAT32 / ISO9660 / UDF as backends behind one Volume API).
+
+- [ ] A FAT backend behind `Storage.Volume`: parse the boot sector / BPB and auto-detect FAT12 / FAT16 / FAT32 and exFAT, walk the FAT cluster chain, and read the root and subdirectories (including VFAT long file names).
+- [ ] Mount a FAT-formatted block device as a `vol://` volume and read it: `ls` a directory and `cat` a file off a real flash-drive / SD-card image through the existing typed Storage interface, no new app-facing API.
+- [ ] Host-testable like `lsfs`: a FAT backend driven through the same `BlockDevice` trait against image fixtures (one per FAT12 / 16 / 32 / exFAT), plus a live read of a FAT-formatted virtio-blk image in QEMU.
+- [ ] Write support (at least FAT32 / exFAT: create / write / delete + cluster allocation) - optional, after the read path is solid; the first goal is reading foreign media.
+- Done when: a FAT12 / 16 / 32 and exFAT volume mounts behind the Volume API and the shell lists and reads files off it (e.g. a USB image), tests green - foreign removable media is readable through the same typed `Storage.Volume` as LSFS.
+- Concept: Native filesystem (the supported-compatible-FS backends - ext4 / NTFS / exFAT / FAT32 / ISO9660 / UDF - behind the unified Volume API), the layering principle (multiple FS backends behind one Volume API; a `driver.fs.*` service), Storage model, M43 (LSFS and the `BlockDevice` trait this reuses).
+
+## M49 - LSFS: directories and capacity scaling
+
+LSFS (M43) is a flat, fixed-capacity filesystem: a single root directory, 32 inodes, 28 direct block pointers per file (a 112 KiB max), and a one-block allocation bitmap (a ~128 MiB max volume). Before it can hold real data and installed apps it needs nested directories and to scale past those fixed limits. The on-disk format stays the same small Unix-flavoured layout; this grows its dimensions and adds a directory tree.
+
+- [ ] Nested directories: directory inodes that hold child entries, a `mkdir`, and path resolution that walks `/`-separated segments from the root (replacing the flat single-root lookup) - the typed `RelativePath` model (a list of validated segments, no `..` / `/` injection) at the FS boundary.
+- [ ] Inode table scaling: grow the inode table from one fixed block (32 inodes) to multiple blocks, so a volume can hold far more files and directories.
+- [ ] Large files via indirect blocks: add single (and double) indirect block pointers so a file is no longer capped at 28 direct blocks (112 KiB).
+- [ ] Large volumes: a multi-block allocation bitmap so volume size is not capped at one bitmap block (~128 MiB).
+- Done when: LSFS has a directory tree (mkdir + nested paths resolved as validated segment lists), a multi-block inode table and bitmap, and indirect-block large files, all persisted across reboot, tests green - the structural capacity an appliance and installed apps need.
+- Concept: Native filesystem (growing the phase-2 FS toward real use; the modern CoW FS stays phase 3), Storage model (a path is a typed `RelativePath` of validated segments), M43 (the LSFS layout this extends).
+
+## M50 - LSFS: write semantics, metadata, and integrity
+
+LSFS today writes only whole files (create-or-truncate), keeps no timestamps, cannot rename, and leaks orphaned blocks / inodes on a crash (its ordered-writes design assumes an fsck that does not yet exist). Real apps, logs, and tools need partial writes, basic metadata, rename, and a consistency pass.
+
+- [ ] Offset / partial writes: seek + write-at-offset, append, and truncate-to-length (today `write_file` only replaces the whole file) - so logs and apps can update a file in place.
+- [ ] Timestamps and basic metadata per inode: created / modified times plus room for typed metadata (the concept's typed-metadata direction), surfaced through `Storage.Volume` `Stat`.
+- [ ] Rename / move within a volume: an atomic directory-entry rename (the in-volume half of the concept's `Transfer`).
+- [ ] fsck / orphan reclamation: a consistency pass that reclaims blocks / inodes leaked by a crash mid-write, making the ordered-writes guarantee complete.
+- Done when: LSFS supports offset / append / truncate writes, per-file timestamps via `Stat`, atomic in-volume rename, and an fsck that reclaims orphans after a simulated crash, tests green - the write semantics and integrity real workloads need.
+- Concept: Native filesystem, Storage model (`Stat`; `Transfer` = atomic rename within a volume, copy + verify + delete across volumes), M43 (the ordered writes whose fsck this completes), the M26 `Stat` / `Watch` deferral.
+
+## M51 - LSFS: block checksums (integrity)
+
+LSFS trusts the block device: a flipped bit on disk (bit rot, a flaky controller, a bad cable) is read back as silent corruption. The modern-FS direction in the concept lists checksums as a core property. This adds a per-block checksum so the FS detects corruption on read instead of handing back bad data. It does not need copy-on-write and can land independently of M52.
+
+- [ ] Per-block checksum: a CRC32C (or similar) computed on write and stored in the block's parent metadata (inode for data blocks, superblock / inode-table headers for metadata blocks), not inside the block itself.
+- [ ] Verify on read: recompute and compare on every `read_block` path; surface a mismatch as a distinct `FsError` (checksum failure) rather than returning corrupt bytes.
+- [ ] fsck integration: extend the M50 fsck pass to walk all blocks and report / quarantine checksum failures.
+- Done when: a deliberately flipped on-disk byte is caught on read (a checksum-failure error instead of corrupt data) and reported by fsck, tests green - silent corruption becomes a detected error.
+- Concept: Native filesystem (checksums as a core modern-FS property; detection now, self-healing needs redundancy later), M43 (the LSFS layout these checksums annotate), M50 (the fsck pass this extends).
+
+## M52 - LSFS: copy-on-write (toward the modern FS)
+
+LSFS overwrites data in place, so a crash mid-write can leave a file half-old / half-new. Copy-on-write writes changed blocks to fresh locations and swaps the pointer atomically, so a write either fully lands or not at all - and it is the structural foundation the concept's modern FS needs for snapshots and rollback. This is a large change to the allocator and the whole write path, so it comes after the M49 / M50 capacity and write-semantics work and turns LSFS into the modern-FS base.
+
+- [ ] Copy-on-write write path: changed data and the metadata above it (inode, then the table / superblock) are written to newly allocated blocks; the old blocks are freed only after the new root is committed.
+- [ ] Atomic commit: a single atomic pointer swap (a versioned superblock / root) makes a write all-or-nothing across a crash, replacing the ordered-writes-plus-fsck model for the common path.
+- [ ] Groundwork for snapshots: keeping an old root reachable instead of freeing it is a read-only snapshot - lay the structure (do not build the full snapshot UX, which stays phase 3).
+- Done when: a simulated crash mid-write always leaves either the complete old file or the complete new file (never a torn mix), and an old root can still be mounted read-only, tests green - LSFS becomes a crash-atomic CoW base for the modern FS.
+- Concept: Native filesystem (copy-on-write + atomic writes + rollback; the working-name modern FS), M50 (replaces its ordered-writes / fsck crash story for the common path), M51 (checksums + CoW together give detection and atomicity). Full snapshots / compression / encryption stay phase 3.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
