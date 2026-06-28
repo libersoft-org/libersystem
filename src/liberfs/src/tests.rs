@@ -15,13 +15,13 @@ struct MemDevice {
 }
 
 impl MemDevice {
-	fn new(num_blocks: u32) -> MemDevice {
+	fn new(num_blocks: u64) -> MemDevice {
 		MemDevice { blocks: vec![0u8; num_blocks as usize * BLOCK_SIZE] }
 	}
 }
 
 impl BlockDevice for MemDevice {
-	fn read_block(&mut self, index: u32, buf: &mut [u8]) -> bool {
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
 		let start = index as usize * BLOCK_SIZE;
 		let Some(src) = self.blocks.get(start..start + BLOCK_SIZE) else {
 			return false;
@@ -30,7 +30,7 @@ impl BlockDevice for MemDevice {
 		true
 	}
 
-	fn write_block(&mut self, index: u32, buf: &[u8]) -> bool {
+	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
 		let start = index as usize * BLOCK_SIZE;
 		let Some(dst) = self.blocks.get_mut(start..start + BLOCK_SIZE) else {
 			return false;
@@ -40,7 +40,7 @@ impl BlockDevice for MemDevice {
 	}
 }
 
-const NBLOCKS: u32 = 64;
+const NBLOCKS: u64 = 64;
 
 #[test]
 fn format_then_mount_is_empty() {
@@ -137,7 +137,7 @@ fn rejects_too_long_a_name() {
 #[test]
 fn reports_out_of_space() {
 	// a tiny filesystem: too few data blocks for an oversized file.
-	let small: u32 = 6;
+	let small: u64 = 6;
 	let mut fs = LiberFs::format(MemDevice::new(small), small).unwrap();
 	let payload = vec![b'z'; BLOCK_SIZE * 5];
 	assert_eq!(fs.write_file(b"toobig", &payload), Err(FsError::NoSpace));
@@ -162,18 +162,18 @@ fn many_small_files_fill_the_directory() {
 // A sparse RAM device backed by a map: only written blocks cost memory, so a huge
 // volume can be formatted in a test without allocating it whole.
 struct SparseDevice {
-	blocks: std::collections::HashMap<u32, Vec<u8>>,
-	num_blocks: u32,
+	blocks: std::collections::HashMap<u64, Vec<u8>>,
+	num_blocks: u64,
 }
 
 impl SparseDevice {
-	fn new(num_blocks: u32) -> SparseDevice {
+	fn new(num_blocks: u64) -> SparseDevice {
 		SparseDevice { blocks: std::collections::HashMap::new(), num_blocks }
 	}
 }
 
 impl BlockDevice for SparseDevice {
-	fn read_block(&mut self, index: u32, buf: &mut [u8]) -> bool {
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
 		if index >= self.num_blocks {
 			return false;
 		}
@@ -184,7 +184,7 @@ impl BlockDevice for SparseDevice {
 		true
 	}
 
-	fn write_block(&mut self, index: u32, buf: &[u8]) -> bool {
+	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
 		if index >= self.num_blocks {
 			return false;
 		}
@@ -255,7 +255,7 @@ fn rejects_dot_and_dot_dot_segments() {
 #[test]
 fn single_indirect_large_file() {
 	// a file past the direct pointers exercises the single indirect block.
-	let nblocks: u32 = 128;
+	let nblocks: u64 = 128;
 	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
 	let size = BLOCK_SIZE * (DIRECT + 5) + 123;
 	let big: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
@@ -273,7 +273,7 @@ fn single_indirect_large_file() {
 #[test]
 fn double_indirect_large_file() {
 	// a file past the direct + single-indirect range reaches the double indirect.
-	let nblocks: u32 = (DIRECT + PTRS_PER_BLOCK + 160) as u32;
+	let nblocks: u64 = (DIRECT + PTRS_PER_BLOCK + 160) as u64;
 	let mut fs = LiberFs::format(SparseDevice::new(nblocks), nblocks).unwrap();
 	let blocks = DIRECT + PTRS_PER_BLOCK + 3;
 	let size = BLOCK_SIZE * blocks;
@@ -285,7 +285,7 @@ fn double_indirect_large_file() {
 #[test]
 fn many_files_across_multiple_inode_blocks() {
 	// a volume large enough for far more than one inode block's worth of files.
-	let nblocks: u32 = 400;
+	let nblocks: u64 = 400;
 	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
 	let count = 100u32;
 	for i in 0..count {
@@ -303,7 +303,7 @@ fn many_files_across_multiple_inode_blocks() {
 fn a_large_volume_formats_and_round_trips() {
 	// the free map is derived, so it scales to a large volume for free; a sparse device
 	// lets us format such a volume without allocating it whole.
-	let nblocks: u32 = 40_000;
+	let nblocks: u64 = 40_000;
 	let mut fs = LiberFs::format(SparseDevice::new(nblocks), nblocks).unwrap();
 	fs.write_file(b"f", b"on a big volume").unwrap();
 	assert_eq!(fs.read_file(b"f").unwrap(), b"on a big volume");
@@ -500,7 +500,7 @@ fn a_flipped_byte_is_caught_on_read() {
 #[test]
 fn a_flipped_byte_in_an_indirect_file_is_caught() {
 	// a file that reaches the single indirect block: its data CRCs live in that block.
-	let nblocks: u32 = 128;
+	let nblocks: u64 = 128;
 	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
 	let size = BLOCK_SIZE * (DIRECT + 3);
 	let marker = b"a needle near the end";
@@ -600,4 +600,62 @@ fn a_freshly_formatted_volume_has_no_snapshot() {
 	let dev = fs.into_device();
 	// only generation 0 has ever been written: there is no older root to mount.
 	assert!(LiberFs::mount_snapshot(dev).is_none());
+}
+
+// M53: 64-bit addressing, large files and long names.
+
+#[test]
+fn triple_indirect_large_file() {
+	// a sparse write far past the double-indirect range reaches the triple indirect.
+	// only the touched blocks are allocated, so a small device holds the huge offset.
+	let nblocks: u64 = 256;
+	let mut fs = LiberFs::format(SparseDevice::new(nblocks), nblocks).unwrap();
+	let triple = (DIRECT + PTRS_PER_BLOCK + PTRS_PER_BLOCK * PTRS_PER_BLOCK) as u64;
+	let off = triple * BLOCK_SIZE as u64 + 100;
+	fs.write_at(b"deep", off, b"triple").unwrap();
+	assert_eq!(fs.read_at(b"deep", off, 6).unwrap(), b"triple");
+	// remount to prove the triple-indirect chain persisted.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_at(b"deep", off, 6).unwrap(), b"triple");
+}
+
+#[test]
+fn a_long_name_round_trips() {
+	// a 255-byte name fills the whole dentry name field with no terminator.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let name = vec![b'n'; NAME_MAX];
+	fs.write_file(&name, b"long").unwrap();
+	assert_eq!(fs.read_file(&name).unwrap(), b"long");
+	// the full name lists back exactly and survives a remount.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(&name).unwrap(), b"long");
+	assert_eq!(fs.list().unwrap()[0].0, name);
+}
+
+#[test]
+fn rejects_unportable_name_characters() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	// the portable-name policy rejects the Windows-reserved punctuation and control
+	// bytes, on top of the path separator and NUL the parser already forbids.
+	let bad: [&[u8]; 10] = [
+		b"a\\b",
+		b"a:b",
+		b"a*b",
+		b"a?b",
+		b"a<b",
+		b"a>b",
+		b"a|b",
+		b"a\"b",
+		b"a\x01b",
+		b"a\x7fb",
+	];
+	for name in bad {
+		assert_eq!(fs.write_file(name, b"x"), Err(FsError::Invalid));
+	}
+	// allowed punctuation, spaces and non-ASCII bytes still work.
+	let ok = "resume v2 (final).txt".as_bytes();
+	fs.write_file(ok, b"ok").unwrap();
+	assert_eq!(fs.read_file(ok).unwrap(), b"ok");
 }

@@ -405,7 +405,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		let mut slots: [Option<Superblock>; SUPER_SLOTS as usize] = [None, None];
 		for s in 0..SUPER_SLOTS {
-			if dev.read_block(s, &mut buf) {
+			if dev.read_block(s as u64, &mut buf) {
 				slots[s as usize] = parse_superblock(&buf);
 			}
 		}
@@ -871,7 +871,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let sb = Superblock { num_blocks: self.num_blocks, num_inodes: self.num_inodes, inode_blocks: self.inode_blocks, generation: self.generation + 1, itable_index: new_index, itable_index_crc: crc32c(&index), root_inode: self.root_inode };
 		let new_slot = (self.slot + 1) % SUPER_SLOTS;
 		// the commit point: a single superblock write swaps the live root atomically.
-		if !self.dev.write_block(new_slot, &serialize_superblock(&sb)) {
+		if !self.dev.write_block(new_slot as u64, &serialize_superblock(&sb)) {
 			return Err(FsError::Io);
 		}
 

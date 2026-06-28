@@ -48,7 +48,7 @@ const OP_WRITE: u32 = 1;
 // filesystem never overwrites, so created files persist across reboots.
 const SECTORS_PER_BLOCK: u64 = (liberfs::BLOCK_SIZE / SECTOR_SIZE) as u64;
 const FS_START_SECTOR: u64 = 2048;
-const FS_BLOCKS: u32 = 64;
+const FS_BLOCKS: u64 = 64;
 
 // An upper bound on a single write, so a bogus buffer length cannot make us allocate
 // without limit; the filesystem enforces the real per-file maximum.
@@ -233,13 +233,13 @@ struct ChannelBlockDevice {
 }
 
 impl BlockDevice for ChannelBlockDevice {
-	fn read_block(&mut self, index: u32, buf: &mut [u8]) -> bool {
-		let lba: u64 = FS_START_SECTOR + index as u64 * SECTORS_PER_BLOCK;
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+		let lba: u64 = FS_START_SECTOR + index * SECTORS_PER_BLOCK;
 		unsafe { block_read(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_mut_ptr()) }
 	}
 
-	fn write_block(&mut self, index: u32, buf: &[u8]) -> bool {
-		let lba: u64 = FS_START_SECTOR + index as u64 * SECTORS_PER_BLOCK;
+	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+		let lba: u64 = FS_START_SECTOR + index * SECTORS_PER_BLOCK;
 		unsafe { block_write(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_ptr()) }
 	}
 }

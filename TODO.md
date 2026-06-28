@@ -858,11 +858,11 @@ files (a ~1 GiB ceiling), and caps names at 28 bytes - all far too small for rea
 storage (a 184 TB partition, 100+ GB media). This widens addressing and names and
 bakes in portable-name rules so a LiberFS name is always valid on other systems.
 
-- [ ] Widen block pointers and file sizes to u64, lifting the u32 block-address ceiling so volumes scale from ~16 TiB into exabytes.
-- [ ] Large files: lift the ~1 GiB cap (an interim triple-indirect level, or folded straight into the M54 extent map) so a single file reaches terabytes and beyond.
-- [ ] Long names: raise NAME_MAX from 28 to 255 bytes, decoupling the directory entry from the fixed 32-byte slot.
-- [ ] Portable-name policy at the FS boundary: reject the cross-platform-unsafe set (`\ : * ? < > | "` and control bytes) on top of `/` and NUL, so files move cleanly to FAT / NTFS media.
-- [ ] Reserve opaque per-inode room for a future owner / ACL tag (stored, never enforced - authorization stays in StorageService and the capability layer, not the FS).
+- [x] Widen block pointers and file sizes to u64, lifting the u32 block-address ceiling so volumes scale from ~16 TiB into exabytes.
+- [x] Large files: lift the ~1 GiB cap (an interim triple-indirect level, or folded straight into the M54 extent map) so a single file reaches terabytes and beyond.
+- [x] Long names: raise NAME_MAX from 28 to 255 bytes, decoupling the directory entry from the fixed 32-byte slot.
+- [x] Portable-name policy at the FS boundary: reject the cross-platform-unsafe set (`\ : * ? < > | "` and control bytes) on top of `/` and NUL, so files move cleanly to FAT / NTFS media.
+- [x] Reserve opaque per-inode room for a future owner / ACL tag (stored, never enforced - authorization stays in StorageService and the capability layer, not the FS).
 - Done when: LiberFS addresses exabyte volumes and terabyte+ files with 255-byte portable names, a volume well past 16 TiB and a multi-GB file round-trip across reboot, and non-portable names are rejected, tests green.
 - Concept: Native filesystem (scaling the FS for real data arrays), Storage model (typed RelativePath; authorization is the capability layer, not FS permissions), M43 / M49 (the layout this widens).
 
