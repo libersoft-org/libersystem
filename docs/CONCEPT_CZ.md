@@ -1203,7 +1203,6 @@ Byly dohodnuty tyto logické namespaces:
 
 ```text
 system://
-apps://
 user://
 appdata://
 cache://
@@ -1217,7 +1216,6 @@ Význam:
 | Namespace | Význam |
 |---|---|
 | `system://` | systémové soubory / základ OS |
-| `apps://` | instalované aplikace |
 | `user://` | uživatelská data |
 | `appdata://` | per-app persistentní data |
 | `cache://` | mazatelná cache |

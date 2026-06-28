@@ -642,7 +642,7 @@ M28 ran a first minimal Wasm component over an integer-subset interpreter with a
 
 - [x] Grow the Wasm runtime to a usable subset - control flow, floats, the wider instruction set and validation - or adopt a mature engine (e.g. Wasmtime) behind the same `Host` seam (the *layering principle*: the engine is a replaceable implementation).
 - [x] WASI preview 2 worlds mapped onto our services: `wasi:filesystem` -> StorageService, `wasi:sockets` -> NetworkService (M33), `wasi:cli` -> the console - each import wired to a typed service, no ambient authority.
-- [x] Load components from storage (a `vol://` / `apps://` package) and launch them as ordinary capability-scoped components, rather than embedding them in the kernel image.
+- [x] Load components from storage (a `vol://` package) and launch them as ordinary capability-scoped components, rather than embedding them in the kernel image.
 - [x] An SDK for Rust/C/Go: build a component against our WIT worlds and run it on the host.
 - Done when: the WASI host runs real components (control flow / floats / WASI preview 2 worlds) loaded from storage, their imports wired to our services with no ambient authority, and an SDK builds a component in at least one language, tests green - the application runtime the platform's apps target.
 - Concept: Application model (WASI is one host over the stable native ABI; the layering principle - the engine is replaceable; a WASI world = the capabilities granted), IDL language (the WIT relationship), the M28 deferrals.
@@ -653,12 +653,12 @@ M28 ran a first minimal Wasm component over an integer-subset interpreter with a
 
 With a real component runtime (M41), the platform needs a way to ship, install, and accelerate components: a typed package/app format, an install path that places a component and its manifest into the system, and AOT compilation at install time for speed - the foundation the phase-3 CLI package manager and the phase-5 app store later build on.
 
-- [ ] A typed package/app format: a component plus its permission manifest (M38) and metadata, as a typed object (not an ad-hoc archive treated as the source of truth).
-- [ ] An install path: place a package into the system (a `vol://apps` / `apps://` namespace), register it with ServiceManager / PermissionManager, and list / remove it.
+- [ ] A typed package/app format: a component plus its permission manifest (M38 - the capabilities it requests and is thus granted) and metadata, as a typed object (not an ad-hoc archive treated as the source of truth).
+- [ ] An install path: place an app on disk as an ordinary `vol://` object (no special namespace - the app and its manifest are plainly visible on a volume), register it with ServiceManager / PermissionManager, and list / remove it.
 - [ ] AOT compilation at install time: compile the component to native for speed (the M28/M41 "interpret or AOT-compile at install" option), cached on the volume.
 - [ ] A CLI to install / list / remove a first-party package.
 - Done when: a component ships as a typed package with its manifest, installs into the system (registered, listed, removable), is AOT-compiled at install for speed, and launches from storage, tests green - the packaging / installation foundation for the platform's apps.
-- Concept: Application model (AOT-compile at install; the package/app format), Security model (the manifest is a typed object), Storage model (the `apps://` namespace).
+- Concept: Application model (AOT-compile at install; the package/app format), Security model (the manifest is a typed object - the rights an app requests and is granted), Storage model (an app is an ordinary on-disk object on a volume, not a special namespace).
 
 ## M43 - A simple persistent native filesystem
 

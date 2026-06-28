@@ -1203,7 +1203,6 @@ The following logical namespaces have been agreed:
 
 ```text
 system://
-apps://
 user://
 appdata://
 cache://
@@ -1217,7 +1216,6 @@ Meaning:
 | Namespace | Meaning |
 |---|---|
 | `system://` | system files / the OS base |
-| `apps://` | installed applications |
 | `user://` | user data |
 | `appdata://` | per-app persistent data |
 | `cache://` | deletable cache |
