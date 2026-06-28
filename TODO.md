@@ -789,7 +789,7 @@ LiberFS (M43) is our own system filesystem. For interop the Volume API also need
 - [x] A FAT backend behind `Storage.Volume`: parse the boot sector / BPB and auto-detect FAT12 / FAT16 / FAT32 and exFAT, walk the FAT cluster chain, and read the root and subdirectories (including VFAT long file names).
 - [x] Mount a FAT-formatted block device as a `vol://` volume and read it: `ls` a directory and `cat` a file off a real flash-drive / SD-card image through the existing typed Storage interface, no new app-facing API.
 - [x] Host-testable like `liberfs`: a FAT backend driven through the same `BlockDevice` trait against image fixtures (one per FAT12 / 16 / 32 / exFAT), plus a live read of a FAT-formatted virtio-blk image in QEMU.
-- [ ] Write support (at least FAT32 / exFAT: create / write / delete + cluster allocation) - optional, after the read path is solid; the first goal is reading foreign media.
+- [x] Write support (create / write / delete + cluster allocation) for FAT12 / 16 / 32 (allocate and free cluster chains, write every FAT copy, create and clear directory entries including VFAT long names); exFAT stays read-only. The shell `write`/`rm` route through `vol://media`.
 - Done when: a FAT12 / 16 / 32 and exFAT volume mounts behind the Volume API and the shell lists and reads files off it (e.g. a USB image), tests green - foreign removable media is readable through the same typed `Storage.Volume` as LiberFS.
 - Concept: Native filesystem (the supported-compatible-FS backends - ext4 / NTFS / exFAT / FAT32 / ISO9660 / UDF - behind the unified Volume API), the layering principle (multiple FS backends behind one Volume API; a `driver.fs.*` service), Storage model, M43 (LiberFS and the `BlockDevice` trait this reuses).
 

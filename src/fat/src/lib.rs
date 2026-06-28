@@ -4,12 +4,14 @@
 //! layering principle, several filesystems mount behind one volume API, and FAT is the
 //! ubiquitous interchange format so reading it makes those media readable.
 //!
-//! Read-first by design. The boot sector is parsed and the family auto-detected: a small
-//! cluster count is FAT12, a medium one FAT16, a large one FAT32, and an `EXFAT ` magic
-//! is exFAT. A file is found by walking `/`-separated path segments from the root, each
-//! lookup scanning a directory's 32-byte entries (assembling VFAT long file names from
-//! their UTF-16 fragments, or the exFAT file-name entry set) and following the cluster
-//! chain through the allocation table. Nothing is written; foreign media is only read.
+//! Read-first by design, with a classic-FAT write path. The boot sector is parsed and the
+//! family auto-detected: a small cluster count is FAT12, a medium one FAT16, a large one
+//! FAT32, and an `EXFAT ` magic is exFAT. A file is found by walking `/`-separated path
+//! segments from the root, each lookup scanning a directory's 32-byte entries (assembling
+//! VFAT long file names from their UTF-16 fragments, or the exFAT file-name entry set) and
+//! following the cluster chain through the allocation table. FAT12/16/32 volumes also
+//! create, overwrite, and delete files (allocating and freeing cluster chains and writing
+//! every FAT copy); exFAT stays read-only.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -27,21 +29,24 @@ mod tests;
 // read as a run of them.
 pub const SECTOR_SIZE: usize = 512;
 
-// A read-only block device: foreign media is read one 512-byte sector at a time, by
-// absolute LBA. Implementors map that onto their backing (disk sectors, a Vec). FAT is
-// mounted read-first, so there is no write half.
+// A block device: foreign media is read and written one 512-byte sector at a time, by
+// absolute LBA. Implementors map that onto their backing (disk sectors, a Vec). The read
+// path mounts and lists; the write path creates, overwrites, and deletes files.
 pub trait BlockDevice {
 	// Read sector `lba` into `buf` (exactly SECTOR_SIZE bytes). False on I/O failure.
 	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool;
+	// Write `buf` (exactly SECTOR_SIZE bytes) to sector `lba`. False on I/O failure.
+	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool;
 }
 
 // A FAT error. The variants map onto the `Storage.Volume` `error` enum at the service
-// boundary (NotFound -> not-found, the rest -> invalid).
+// boundary (NotFound -> not-found, the rest -> invalid / again).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsError {
 	NotFound,
 	Invalid,
 	TooLong,
+	NoSpace,
 	Io,
 }
 
@@ -117,6 +122,49 @@ impl<D: BlockDevice> FatFs<D> {
 			return Err(FsError::NotFound);
 		}
 		self.read_chain(entry.first_cluster, entry.size as usize)
+	}
+
+	// Create or overwrite a file named by a `/`-separated path with `data`, allocating a
+	// cluster chain and writing a directory entry. FAT12/16/32 only; exFAT stays read-only.
+	pub fn write_file(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
+		if self.geo.kind == Kind::ExFat {
+			return Err(FsError::Invalid);
+		}
+		let (parent, name) = split_parent(path)?;
+		if name.is_empty() || name.len() > 255 {
+			return Err(FsError::TooLong);
+		}
+		let dir = self.resolve_dir(parent)?;
+		self.unlink_in(dir, name, false)?;
+		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
+		let need = data.len().div_ceil(cluster_bytes);
+		let chain = self.alloc_chain(need)?;
+		for (i, c) in chain.iter().enumerate() {
+			let mut buf = vec![0u8; cluster_bytes];
+			let off = i * cluster_bytes;
+			let end = (off + cluster_bytes).min(data.len());
+			if off < data.len() {
+				buf[..end - off].copy_from_slice(&data[off..end]);
+			}
+			let fs = self.geo.first_data_sector as u64 + (*c as u64 - 2) * self.geo.sectors_per_cluster as u64;
+			self.write_fs_sectors(fs, self.geo.sectors_per_cluster, &buf)?;
+		}
+		let first = chain.first().copied().unwrap_or(0);
+		self.add_entry(dir, name, first, data.len() as u32, 0x20)
+	}
+
+	// Delete a file named by a `/`-separated path: free its cluster chain and clear its
+	// directory entry. FAT12/16/32 only; exFAT stays read-only.
+	pub fn remove(&mut self, path: &[u8]) -> Result<(), FsError> {
+		if self.geo.kind == Kind::ExFat {
+			return Err(FsError::Invalid);
+		}
+		let (parent, name) = split_parent(path)?;
+		let dir = self.resolve_dir(parent)?;
+		if !self.unlink_in(dir, name, true)? {
+			return Err(FsError::NotFound);
+		}
+		Ok(())
 	}
 
 	// The cluster the root directory starts at. FAT32 and exFAT keep the root in the
@@ -253,6 +301,206 @@ impl<D: BlockDevice> FatFs<D> {
 			Kind::Fat12 => cluster >= 0x0FF8,
 			Kind::Fat16 => cluster >= 0xFFF8,
 			Kind::Fat32 | Kind::ExFat => cluster >= 0x0FFF_FFF8,
+		}
+	}
+
+	// Write `count` logical sectors of `buf` starting at fs sector `sec`, expanding each
+	// logical sector to its 512-byte device sectors. The write mirror of read_fs_sectors.
+	fn write_fs_sectors(&mut self, sec: u64, count: u32, buf: &[u8]) -> Result<(), FsError> {
+		let ratio = (self.geo.bytes_per_sector / SECTOR_SIZE as u32) as u64;
+		let total = count as u64 * ratio;
+		for i in 0..total {
+			let off = i as usize * SECTOR_SIZE;
+			if !self.dev.write_sector(sec * ratio + i, &buf[off..off + SECTOR_SIZE]) {
+				return Err(FsError::Io);
+			}
+		}
+		Ok(())
+	}
+
+	// The last usable cluster index, derived from the FAT size and entry width: a chain
+	// is allocated by scanning [2, max_cluster] for free entries.
+	fn max_cluster(&self) -> u32 {
+		let bytes = self.geo.fat_size as u64 * self.geo.bytes_per_sector as u64;
+		let entries = match self.geo.kind {
+			Kind::Fat12 => bytes * 2 / 3,
+			Kind::Fat16 => bytes / 2,
+			Kind::Fat32 | Kind::ExFat => bytes / 4,
+		};
+		entries.saturating_sub(1) as u32
+	}
+
+	// Write `val` into `cluster`'s FAT slot, in every FAT copy. FAT12 packs two entries
+	// into three bytes, so a slot is read-modified-written; FAT16/32 align to the width.
+	fn set_fat_entry(&mut self, cluster: u32, val: u32) -> Result<(), FsError> {
+		let bps = self.geo.bytes_per_sector;
+		let byte_off = match self.geo.kind {
+			Kind::Fat12 => cluster as u64 + (cluster as u64 / 2),
+			Kind::Fat16 => cluster as u64 * 2,
+			Kind::Fat32 | Kind::ExFat => cluster as u64 * 4,
+		};
+		for fat in 0..self.geo.num_fats {
+			let fat_base = self.geo.reserved_sectors + fat * self.geo.fat_size;
+			let sec = fat_base as u64 + byte_off / bps as u64;
+			let within = (byte_off % bps as u64) as usize;
+			let mut buf = vec![0u8; (bps * 2) as usize];
+			self.read_fs_sectors(sec, 2, &mut buf)?;
+			match self.geo.kind {
+				Kind::Fat12 => {
+					let cur = u16::from_le_bytes([buf[within], buf[within + 1]]);
+					let next = if cluster & 1 == 1 { (cur & 0x000F) | ((val as u16) << 4) } else { (cur & 0xF000) | (val as u16 & 0x0FFF) };
+					buf[within..within + 2].copy_from_slice(&next.to_le_bytes());
+				}
+				Kind::Fat16 => buf[within..within + 2].copy_from_slice(&(val as u16).to_le_bytes()),
+				Kind::Fat32 | Kind::ExFat => buf[within..within + 4].copy_from_slice(&(val & 0x0FFF_FFFF).to_le_bytes()),
+			}
+			self.write_fs_sectors(sec, 2, &buf)?;
+		}
+		Ok(())
+	}
+
+	// Allocate `n` free clusters into an end-terminated chain, returning them in order.
+	// Zero clusters is an empty file. NoSpace if the table runs out of free entries.
+	fn alloc_chain(&mut self, n: usize) -> Result<Vec<u32>, FsError> {
+		let mut chain: Vec<u32> = Vec::with_capacity(n);
+		let mut c = 2u32;
+		let max = self.max_cluster();
+		while chain.len() < n {
+			if c > max {
+				return Err(FsError::NoSpace);
+			}
+			if self.next_cluster(c)? == 0 && !chain.contains(&c) {
+				chain.push(c);
+			}
+			c += 1;
+		}
+		let eoc = 0x0FFF_FFFF;
+		for i in 0..chain.len() {
+			let val = if i + 1 < chain.len() { chain[i + 1] } else { eoc };
+			self.set_fat_entry(chain[i], val)?;
+		}
+		Ok(chain)
+	}
+
+	// Free a cluster chain, marking each slot free. Cluster 0 means no chain.
+	fn free_chain(&mut self, first: u32) -> Result<(), FsError> {
+		let mut cluster = first;
+		let mut guard = 0u32;
+		while cluster >= 2 && !self.is_end(cluster) {
+			let next = self.next_cluster(cluster)?;
+			self.set_fat_entry(cluster, 0)?;
+			cluster = next;
+			guard += 1;
+			if guard > self.max_cluster() {
+				break;
+			}
+		}
+		Ok(())
+	}
+
+	// Read a directory's raw bytes: the fixed root region for FAT12/16, else its chain.
+	fn read_dir_bytes(&mut self, cluster: u32) -> Result<Vec<u8>, FsError> {
+		if cluster == 0 { self.read_root_region() } else { self.read_chain(cluster, usize::MAX) }
+	}
+
+	// Write a directory's raw bytes back, to the fixed root region or its cluster chain.
+	fn write_dir_bytes(&mut self, cluster: u32, bytes: &[u8]) -> Result<(), FsError> {
+		if cluster == 0 {
+			let start = self.geo.reserved_sectors + self.geo.num_fats * self.geo.fat_size;
+			let sectors = (self.geo.root_entries * 32).div_ceil(self.geo.bytes_per_sector);
+			self.write_fs_sectors(start as u64, sectors, bytes)?;
+			return Ok(());
+		}
+		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
+		let mut c = cluster;
+		let mut off = 0usize;
+		while off < bytes.len() && c >= 2 && !self.is_end(c) {
+			let fs = self.geo.first_data_sector as u64 + (c as u64 - 2) * self.geo.sectors_per_cluster as u64;
+			self.write_fs_sectors(fs, self.geo.sectors_per_cluster, &bytes[off..off + cluster_bytes])?;
+			off += cluster_bytes;
+			c = self.next_cluster(c)?;
+		}
+		Ok(())
+	}
+
+	// Remove the entry named `name` from directory `cluster`: clear its 8.3 plus any long
+	// fragments and, if `free`, release its chain. Returns whether the name was present.
+	fn unlink_in(&mut self, cluster: u32, name: &[u8], free: bool) -> Result<bool, FsError> {
+		let mut bytes = self.read_dir_bytes(cluster)?;
+		let mut start = 0usize;
+		let mut i = 0usize;
+		while i + 32 <= bytes.len() {
+			let e = &bytes[i..i + 32];
+			if e[0] == 0x00 {
+				return Ok(false);
+			}
+			if e[0] == 0xE5 || e[11] == 0x0F {
+				i += 32;
+				continue;
+			}
+			if e[11] & 0x08 != 0 {
+				start = i + 32;
+				i += 32;
+				continue;
+			}
+			let nm = short_name(e).into_bytes();
+			let first = ((u16::from_le_bytes([e[20], e[21]]) as u32) << 16) | u16::from_le_bytes([e[26], e[27]]) as u32;
+			if eq_ignore_case(&nm, name) {
+				if e[11] & 0x10 != 0 {
+					return Err(FsError::Invalid);
+				}
+				for off in (start..=i).step_by(32) {
+					bytes[off] = 0xE5;
+				}
+				self.write_dir_bytes(cluster, &bytes)?;
+				if free {
+					self.free_chain(first)?;
+				}
+				return Ok(true);
+			}
+			start = i + 32;
+			i += 32;
+		}
+		Ok(false)
+	}
+
+	// Add a directory entry for `name` (8.3 plus long fragments when needed), pointing at
+	// `first` cluster with `size` bytes and `attr`. NoSpace if the directory is full.
+	fn add_entry(&mut self, cluster: u32, name: &[u8], first: u32, size: u32, attr: u8) -> Result<(), FsError> {
+		let entries = build_entries(name, first, size, attr);
+		let mut bytes = self.read_dir_bytes(cluster)?;
+		let need = entries.len() * 32;
+		let slot = free_run(&bytes, entries.len());
+		let at = match slot {
+			Some(p) => p,
+			None => {
+				if cluster == 0 {
+					return Err(FsError::NoSpace);
+				}
+				let grow = self.alloc_chain(1)?[0];
+				let last = self.last_cluster(cluster)?;
+				self.set_fat_entry(last, grow)?;
+				let p = bytes.len();
+				bytes.resize(p + (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize, 0);
+				p
+			}
+		};
+		for (k, e) in entries.iter().enumerate() {
+			bytes[at + k * 32..at + k * 32 + 32].copy_from_slice(e);
+		}
+		let _ = need;
+		self.write_dir_bytes(cluster, &bytes)
+	}
+
+	// The last cluster of a chain, for appending: walk to the end-of-chain marker.
+	fn last_cluster(&mut self, first: u32) -> Result<u32, FsError> {
+		let mut c = first;
+		loop {
+			let next = self.next_cluster(c)?;
+			if self.is_end(next) {
+				return Ok(c);
+			}
+			c = next;
 		}
 	}
 }
@@ -444,4 +692,90 @@ fn split_parent(path: &[u8]) -> Result<(&[u8], &[u8]), FsError> {
 // Compare two names ignoring ASCII case, as FAT lookups are case-insensitive.
 fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
 	a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+// Build a directory entry set: the 8.3 short entry, preceded by VFAT long-name fragments
+// when the name is not a plain uppercase 8.3 name. Fragments are emitted last-first.
+fn build_entries(name: &[u8], first: u32, size: u32, attr: u8) -> Vec<[u8; 32]> {
+	let short = gen_short(name);
+	let mut out: Vec<[u8; 32]> = Vec::new();
+	if name != short_name(&short).as_bytes() {
+		let units: Vec<u16> = String::from_utf8_lossy(name).encode_utf16().collect();
+		let sum = lfn_checksum(&short);
+		let frags = units.len().div_ceil(13).max(1);
+		for f in (0..frags).rev() {
+			let mut e = [0u8; 32];
+			e[0] = (f as u8 + 1) | if f + 1 == frags { 0x40 } else { 0 };
+			e[11] = 0x0F;
+			e[13] = sum;
+			for c in 0..13 {
+				let idx = f * 13 + c;
+				let v = if idx < units.len() {
+					units[idx]
+				} else if idx == units.len() {
+					0
+				} else {
+					0xFFFF
+				};
+				let pos = [1usize, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30][c];
+				e[pos..pos + 2].copy_from_slice(&v.to_le_bytes());
+			}
+			out.push(e);
+		}
+	}
+	let mut e = [0u8; 32];
+	e[0..11].copy_from_slice(&short);
+	e[11] = attr;
+	e[20..22].copy_from_slice(&((first >> 16) as u16).to_le_bytes());
+	e[26..28].copy_from_slice(&(first as u16).to_le_bytes());
+	e[28..32].copy_from_slice(&size.to_le_bytes());
+	out.push(e);
+	out
+}
+
+// Generate an 8.3 short name padded with spaces: base in 8 columns, extension in 3,
+// uppercased. Names that do not fit are accepted on a best-effort, space-padded basis.
+fn gen_short(name: &[u8]) -> [u8; 11] {
+	let mut s = [0x20u8; 11];
+	let dot = name.iter().rposition(|&b| b == b'.');
+	let (base, ext): (&[u8], &[u8]) = match dot {
+		Some(p) => (&name[..p], &name[p + 1..]),
+		None => (name, b""),
+	};
+	for (i, &b) in base.iter().take(8).enumerate() {
+		s[i] = b.to_ascii_uppercase();
+	}
+	for (i, &b) in ext.iter().take(3).enumerate() {
+		s[8 + i] = b.to_ascii_uppercase();
+	}
+	s
+}
+
+// The VFAT checksum of an 8.3 name: a byte-by-byte rotate-and-add, stamped on every long
+// fragment so a stale fragment cannot be paired with the wrong short entry.
+fn lfn_checksum(short: &[u8; 11]) -> u8 {
+	let mut sum: u8 = 0;
+	for &b in short {
+		sum = sum.rotate_right(1).wrapping_add(b);
+	}
+	sum
+}
+
+// Find the offset of the first run of `n` free entries (0x00 fresh or 0xE5 deleted) in a
+// directory region, or None when there is no contiguous gap that large.
+fn free_run(bytes: &[u8], n: usize) -> Option<usize> {
+	let mut run = 0usize;
+	let mut i = 0usize;
+	while i + 32 <= bytes.len() {
+		if bytes[i] == 0x00 || bytes[i] == 0xE5 {
+			run += 1;
+			if run == n {
+				return Some(i + 32 - n * 32);
+			}
+		} else {
+			run = 0;
+		}
+		i += 32;
+	}
+	None
 }

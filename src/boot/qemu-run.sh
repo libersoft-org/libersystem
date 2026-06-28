@@ -42,9 +42,10 @@ if [[ -f "$VOLUME_PKG" ]]; then
 	dd if="$VOLUME_PKG" of="$VIRTIO_DISK" bs=512 conv=notrunc status=none
 fi
 # A second virtio-blk disk holding a real FAT volume (M48): the media StorageService
-# instance mounts it read-only as `vol://media`. Built once with mtools (mformat +
-# mcopy) so it is a genuine FAT image, not a fixture; skipped if mtools is absent (the
-# media volume then simply does not mount). Files come from the volume/ seed dir.
+# instance mounts it as `vol://media` (FAT12/16/32 read-write, exFAT read-only). Built
+# once with mtools (mformat + mcopy) so it is a genuine FAT image, not a fixture; skipped
+# if mtools is absent (the media volume then simply does not mount). Files come from the
+# volume/ seed dir.
 FAT_DISK="$HERE/.build/fat-media.img"
 if [[ ! -f "$FAT_DISK" ]] && command -v mformat >/dev/null && command -v mcopy >/dev/null; then
 	truncate -s 16M "$FAT_DISK"

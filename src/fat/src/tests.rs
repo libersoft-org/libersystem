@@ -1,13 +1,13 @@
 // Host tests for the FAT backend, run with `cd src/fat && cargo test`. A Vec-backed
-// read-only sector device stands in for the disk; each family's volume is synthesized in
-// memory by a small image builder, so the tests need no external mkfs tools and are
-// deterministic - mounting the image, listing it, and reading files back proves the
-// boot-sector detection, the cluster-chain walk, VFAT long names, and the exFAT entry
-// sets all work.
+// sector device stands in for the disk; each family's volume is synthesized in memory by
+// a small image builder, so the tests need no external mkfs tools and are deterministic -
+// mounting the image, listing it, and reading files back proves the boot-sector
+// detection, the cluster-chain walk, VFAT long names, and the exFAT entry sets all work,
+// and writing then re-reading proves cluster allocation and entry creation round-trip.
 
 use super::*;
 
-// A RAM-backed read-only sector device: one contiguous Vec of 512-byte sectors.
+// A RAM-backed sector device: one contiguous Vec of 512-byte sectors, read and written.
 struct MemDisk {
 	data: Vec<u8>,
 }
@@ -19,6 +19,15 @@ impl BlockDevice for MemDisk {
 			return false;
 		};
 		buf.copy_from_slice(src);
+		true
+	}
+
+	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
+		let start = lba as usize * SECTOR_SIZE;
+		let Some(dst) = self.data.get_mut(start..start + SECTOR_SIZE) else {
+			return false;
+		};
+		dst.copy_from_slice(buf);
 		true
 	}
 }
@@ -388,4 +397,59 @@ fn a_missing_file_is_not_found() {
 #[test]
 fn an_unformatted_disk_does_not_mount() {
 	assert!(FatFs::mount(MemDisk { data: vec![0u8; SECTOR_SIZE * 4] }).is_none());
+}
+
+#[test]
+fn writes_a_new_file_then_reads_it_back() {
+	for kind in [Kind::Fat12, Kind::Fat16, Kind::Fat32] {
+		let mut fs = FatFs::mount(MemDisk { data: build_fat(kind, ROOT) }).unwrap();
+		fs.write_file(b"NEW.TXT", b"fresh bytes").unwrap();
+		assert_eq!(fs.read_file(b"NEW.TXT").unwrap(), b"fresh bytes");
+		assert!(names(&fs.list().unwrap()).contains(&"NEW.TXT".to_string()));
+	}
+}
+
+#[test]
+fn writes_a_multi_cluster_file() {
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	let big: Vec<u8> = (0..1500u32).map(|i| i as u8).collect();
+	fs.write_file(b"BIG.BIN", &big).unwrap();
+	assert_eq!(fs.read_file(b"BIG.BIN").unwrap(), big);
+}
+
+#[test]
+fn overwrites_an_existing_file() {
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat32, ROOT) }).unwrap();
+	fs.write_file(b"HELLO.TXT", b"shorter").unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"shorter");
+	let n: Vec<String> = fs.list().unwrap().iter().filter(|e| e.name == "HELLO.TXT").map(|e| e.name.clone()).collect();
+	assert_eq!(n.len(), 1);
+}
+
+#[test]
+fn removes_a_file() {
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	fs.remove(b"HELLO.TXT").unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::NotFound));
+	assert!(!names(&fs.list().unwrap()).contains(&"HELLO.TXT".to_string()));
+}
+
+#[test]
+fn writes_a_long_name_file() {
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat32, ROOT) }).unwrap();
+	fs.write_file(b"a long note.txt", b"vfat").unwrap();
+	assert_eq!(fs.read_file(b"a long note.txt").unwrap(), b"vfat");
+}
+
+#[test]
+fn removing_a_missing_file_is_not_found() {
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	assert_eq!(fs.remove(b"nope.txt"), Err(FsError::NotFound));
+}
+
+#[test]
+fn exfat_is_read_only() {
+	let mut fs = FatFs::mount(MemDisk { data: build_exfat(ROOT) }).unwrap();
+	assert_eq!(fs.write_file(b"NEW.TXT", b"x"), Err(FsError::Invalid));
+	assert_eq!(fs.remove(b"HELLO.TXT"), Err(FsError::Invalid));
 }

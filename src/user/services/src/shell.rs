@@ -31,7 +31,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    then a read-only view of the init package. Each is a tagged capability over the
 	//    bootstrap channel.
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or_else(|| exit());
-	// The media StorageService client: the read-only FAT vol://media volume off a second
+	// The media StorageService client: the FAT vol://media volume off a second
 	// virtio-blk disk. Sent right after STORAGE; `cat`/`ls` route vol://media to it.
 	let media: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"MEDIA") }.unwrap_or_else(|| exit());
 	let logsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or_else(|| exit());
@@ -1491,7 +1491,7 @@ unsafe fn cat(storage: u64, uri: &[u8]) -> bool {
 
 // List the volume set via the StorageService `list` op. With no argument print the
 // volume set; with `vol://<volume>` print that volume's files (name + size). The
-// volumes are `system` (writable LiberFS) and `media` (read-only FAT off a second
+// volumes are `system` (writable LiberFS) and `media` (FAT12/16/32 off a second
 // disk).
 unsafe fn ls_cmd(storage: u64, media: u64, arg: &[u8]) {
 	unsafe {
@@ -1547,8 +1547,8 @@ unsafe fn volume_count(storage: u64) -> usize {
 	}
 }
 
-// Pick the StorageService client for a vol:// URI: vol://media reads the read-only FAT
-// disk, everything else the writable system volume.
+// Pick the StorageService client for a vol:// URI: vol://media is the FAT media
+// disk, everything else the system volume.
 fn storage_for(uri: &[u8], storage: u64, media: u64) -> u64 {
 	if uri.strip_prefix(b"vol://").map(|r: &[u8]| r.starts_with(b"media/") || r == b"media").unwrap_or(false) { media } else { storage }
 }

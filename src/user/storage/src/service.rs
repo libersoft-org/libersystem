@@ -11,16 +11,17 @@
 //          boot path. A fresh or stale disk is formatted and seeded from the factory
 //          archive laid at LBA 0, so the volume always starts with its seed files; or
 //        "FATBLOCK", with a channel capability to a second virtio-blk driver's block
-//          service, on which a read-only FAT12/16/32 or exFAT volume is mounted as
-//          vol://media - reading a flash-drive / SD-card image through the same Volume
-//          contract;
+//          service, on which a FAT12/16/32 (writable) or exFAT (read-only) volume is
+//          mounted as vol://media - a flash-drive / SD-card image through the same
+//          Volume contract;
 //   2. "SERVE", with a channel capability on which clients send requests.
 // The service then serves the generated Storage.Volume contract: `open` resolves a
 // vol:// path and replies with the file's length plus a MemoryObject capability to
 // its bytes (handle<file>, a zero-copy read); `list` enumerates the volume; and on a
-// writable (LiberFS) volume `write` creates-or-truncates a file from a zero-copy
-// `buffer` and `remove` deletes one, both persisting to the disk so they survive a
-// reboot. A read-only (archive) volume rejects writes with `denied`.
+// writable LiberFS and FAT12/16/32 volume `write` creates-or-truncates a file from a
+// zero-copy `buffer` and `remove` deletes one, both persisting to the disk so they
+// survive a reboot. A read-only archive volume rejects writes with `denied`; exFAT
+// media is read-only and rejects them with `invalid`.
 
 #![no_std]
 #![no_main]
@@ -194,7 +195,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.write_file(name, &bytes).map_err(map_fs_err),
-			Volume::Fat(_) => Err(Error::Denied),
+			Volume::Fat(fs) => fs.write_file(name, &bytes).map_err(map_fat_err),
 		}
 	}
 
@@ -204,7 +205,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.remove(name).map_err(map_fs_err),
-			Volume::Fat(_) => Err(Error::Denied),
+			Volume::Fat(fs) => fs.remove(name).map_err(map_fat_err),
 		}
 	}
 
@@ -290,6 +291,7 @@ fn map_fs_err(e: FsError) -> Error {
 fn map_fat_err(e: fat::FsError) -> Error {
 	match e {
 		fat::FsError::NotFound => Error::NotFound,
+		fat::FsError::NoSpace => Error::Again,
 		fat::FsError::TooLong | fat::FsError::Invalid => Error::Invalid,
 		fat::FsError::Io => Error::Again,
 	}
@@ -342,10 +344,10 @@ impl BlockDevice for ChannelBlockDevice {
 	}
 }
 
-// A second virtio-blk disk as a read-only block device for the FAT backend: foreign
-// media is addressed by absolute 512-byte LBA, so each FAT sector maps straight to one
-// disk sector with no filesystem-region offset. Reads go through the driver's block
-// service on `chan`, which stays open for the life of the service.
+// A second virtio-blk disk as a block device for the FAT backend: foreign media is
+// addressed by absolute 512-byte LBA, so each FAT sector maps straight to one disk
+// sector with no filesystem-region offset. Reads and writes go through the driver's
+// block service on `chan`, which stays open for the life of the service.
 struct FatBlockDevice {
 	chan: u64,
 }
@@ -353,6 +355,10 @@ struct FatBlockDevice {
 impl fat::BlockDevice for FatBlockDevice {
 	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool {
 		unsafe { block_read(self.chan, lba, 1, buf.as_mut_ptr()) }
+	}
+
+	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
+		unsafe { block_write(self.chan, lba, 1, buf.as_ptr()) }
 	}
 }
 

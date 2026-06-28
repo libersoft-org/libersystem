@@ -341,7 +341,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, media_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, admin_server: &mut u64, stats_server: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		// media_storage is a second instance of the storage_service binary, mounting the
-		// read-only FAT disk as vol://media instead of the writable system disk.
+		// FAT disk as vol://media instead of the writable system disk.
 		let elf_name: &[u8] = if name == b"media_storage" { b"storage_service" } else { name };
 		let elf: &[u8] = match package.lookup(elf_name) {
 			Some(e) => e,
@@ -822,7 +822,7 @@ unsafe fn bootstrap_storage(manager_side: u64, block_client: u64, storage_client
 }
 
 // Bootstrap the media StorageService instance: hand it the second virtio-blk disk's
-// block service ("FATBLOCK"), which it mounts read-only as the FAT vol://media volume,
+// block service ("FATBLOCK"), which it mounts as the FAT vol://media volume,
 // then mint its service channel ("SERVE"); the client end is kept in `*media_client`
 // and later handed to the shell. The block handle is 0 when no second disk is present,
 // so the instance simply fails to mount and reports failed.
