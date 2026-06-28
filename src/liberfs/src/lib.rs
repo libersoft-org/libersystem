@@ -63,13 +63,12 @@ use alloc::vec::Vec;
 pub const BLOCK_SIZE: usize = 4096;
 
 // On-disk superblock magic and format version. Mount rejects anything else (a fresh
-// or stale-format disk), so StorageService knows to reformat. Version 2 added nested
-// directories, a multi-block inode table and bitmap, indirect blocks, and per-inode
-// timestamps; version 3 pairs every block pointer with a CRC32C of the block it points
-// at; version 4 turns the layout copy-on-write: two superblock slots, a flat block
-// pool with no on-disk bitmap, and an inode table reached through an index block.
+// or stale-format disk), so StorageService knows to reformat. Version 1 is the
+// copy-on-write layout: two superblock slots, a flat block pool with no on-disk
+// bitmap, an inode table reached through an index block, nested directories, indirect
+// blocks, per-inode timestamps, and a CRC32C paired with every block pointer.
 const MAGIC: [u8; 8] = *b"LIBERFS1";
-const VERSION: u32 = 4;
+const VERSION: u32 = 1;
 
 // The two superblock slots (blocks 0 and 1): a commit writes the new superblock to the
 // inactive slot, so the active one survives a torn write. The block pool begins right
