@@ -873,10 +873,10 @@ which is heavy metadata and forces every block to physically exist. An extent
 stores a contiguous run as one (start, length) record, shrinking metadata for large
 files and - via missing extents - giving sparse files for free.
 
-- [ ] Extent-based block mapping: replace the direct / indirect pointer arrays with an extent map (start block + run length), so a large contiguous file needs a handful of records instead of hundreds of thousands of pointers.
-- [ ] Sparse files: an unwritten region is a gap in the extent map (read back as zeros), so a logically huge but mostly-empty file (a VM image, a preallocated DB) costs only its written extents.
-- [ ] Carry the per-block CRC32C integrity (M51) over the extent layout.
-- [ ] fsck over extents: validate extent runs and the free map derived from them.
+- [x] Extent-based block mapping: replace the direct / indirect pointer arrays with an extent map (start block + run length), so a large contiguous file needs a handful of records instead of hundreds of thousands of pointers.
+- [x] Sparse files: an unwritten region is a gap in the extent map (read back as zeros), so a logically huge but mostly-empty file (a VM image, a preallocated DB) costs only its written extents.
+- [x] Carry the per-block CRC32C integrity (M51) over the extent layout.
+- [x] fsck over extents: validate extent runs and the free map derived from them.
 - Done when: files are mapped by extents (a large contiguous file uses minimal metadata), a sparse file reports its full logical size while occupying only written blocks, checksums and fsck work over the extent layout, tests green.
 - Concept: Native filesystem (extents + sparse, the modern-FS mapping), M51 (checksums carried over extents), M52 (the CoW write path the extents allocate through).
 

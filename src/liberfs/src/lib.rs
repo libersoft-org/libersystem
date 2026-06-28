@@ -2,18 +2,19 @@
 //!
 //! The on-disk layout is a Unix-flavoured filesystem turned copy-on-write: two
 //! superblock slots at blocks 0 and 1, then one flat pool of blocks (block 2 onward)
-//! out of which the inode table, its index block, directory data, file data, and
-//! indirect blocks are all allocated. Block addresses are 64-bit, so a volume scales
-//! from gigabytes into exabytes. Directories form a tree from the root inode; inodes
-//! carry direct block pointers plus single, double, and triple indirect pointers, so
-//! a file grows from a few blocks to hundreds of gigabytes. Every block pointer (in
-//! the inode and in the indirect blocks) is paired with a CRC32C of the block it
-//! points at, so on-disk corruption is caught when the block is read. Each inode also
-//! reserves an opaque owner tag (stored, never interpreted: authorization lives in
-//! the capability layer and StorageService, not in the filesystem). There is no
-//! on-disk allocation bitmap: the free map is reconstructed in memory at mount from
-//! the blocks the live generations reference. It backs the `Storage.Volume` API and
-//! survives a reboot.
+//! out of which the inode table, its index block, directory data, file data, and the
+//! per-extent checksum blocks are all allocated. Block addresses are 64-bit, so a
+//! volume scales from gigabytes into exabytes. Directories form a tree from the root
+//! inode; an inode maps its data with extents - each a contiguous run of blocks paired
+//! with one checksum block - held inline in the inode and spilling to an overflow chain
+//! when there are many, so a file grows from a few blocks to hundreds of gigabytes and
+//! an unwritten range simply has no extent (a sparse hole that reads back as zeros).
+//! Every data block is paired with a CRC32C, kept in its extent's checksum block, so
+//! on-disk corruption is caught when the block is read. Each inode also reserves an
+//! opaque owner tag (stored, never interpreted: authorization lives in the capability
+//! layer and StorageService, not in the filesystem). There is no on-disk allocation
+//! bitmap: the free map is reconstructed in memory at mount from the blocks the live
+//! generations reference. It backs the `Storage.Volume` API and survives a reboot.
 //!
 //! All I/O goes through the [`BlockDevice`] trait (one fixed-size block at a time),
 //! so the same code drives a real virtio-blk disk in StorageService and a
@@ -24,9 +25,10 @@
 //! ## Crash atomicity (copy-on-write)
 //!
 //! A mutation never overwrites a block that a committed generation still references:
-//! changed data, the indirect blocks above it, the inode, and the inode-table block
-//! holding the inode are each written to a freshly allocated block (copied up once per
-//! transaction, then updated in place). The transaction commits with a single atomic
+//! changed data, the extent and checksum blocks describing it, the inode, and the
+//! inode-table block holding the inode are each written to a freshly allocated block
+//! (copied up once per transaction, then updated in place). The transaction commits
+//! with a single atomic
 //! write of a new superblock - carrying an incremented generation and a self-CRC - to
 //! the inactive of the two slots. A crash before that write leaves the old superblock
 //! active and the old tree fully intact; a torn superblock write fails its self-CRC
@@ -45,10 +47,10 @@
 //!
 //! ## Integrity (block checksums)
 //!
-//! Each block is checksummed with a CRC32C stored beside the pointer to it (in the
-//! inode for direct blocks, in the indirect block for the rest). The checksum is
-//! computed on write and rechecked on every read, so a flipped bit on disk surfaces
-//! as [`FsError::Corrupt`] instead of silently corrupt data; [`LiberFs::fsck`] walks
+//! Each data block is checksummed with a CRC32C stored in its extent's checksum block,
+//! and each metadata block beside its own pointer. The checksum is computed on write
+//! and rechecked on every read, so a flipped bit on disk surfaces as
+//! [`FsError::Corrupt`] instead of silently corrupt data; [`LiberFs::fsck`] walks
 //! every live data block and reports how many fail their checksum. With copy-on-write
 //! a crash can no longer leak blocks or orphan an inode, so `fsck` no longer needs to
 //! reclaim them.
@@ -67,10 +69,11 @@ pub const BLOCK_SIZE: usize = 4096;
 
 // On-disk superblock magic and format version. Mount rejects anything else (a fresh
 // or stale-format disk), so StorageService knows to reformat. Version 1 is the
-// copy-on-write layout: two superblock slots, a flat block pool with no on-disk
-// bitmap, 64-bit block addresses, an inode table reached through an index block,
-// nested directories, single / double / triple indirect blocks, per-inode timestamps
-// and an opaque owner tag, and a CRC32C paired with every block pointer.
+// copy-on-write, extent-mapped layout: two superblock slots, a flat block pool with no
+// on-disk bitmap, 64-bit block addresses, an inode table reached through an index
+// block, nested directories, files mapped by extents (each a contiguous run with its
+// own checksum block) and sparse holes, per-inode timestamps and an opaque owner tag,
+// and a CRC32C paired with every block pointer.
 const MAGIC: [u8; 8] = *b"LIBERFS1";
 const VERSION: u32 = 1;
 
@@ -80,29 +83,41 @@ const VERSION: u32 = 1;
 const SUPER_SLOTS: u32 = 2;
 const POOL_START: u64 = SUPER_SLOTS as u64;
 
-// One inode is a fixed 256-byte slot: a kind byte, a size, two timestamps, single /
-// double / triple indirect pointers, an opaque owner tag, then DIRECT (block pointer,
-// block CRC32C) entries. 16 inodes fit one block.
+// One inode is a fixed 256-byte slot: a kind byte, a size, two timestamps, the extent
+// map's overflow pointer and count, an opaque owner tag, then EXTENTS_INLINE inline
+// extent records. 16 inodes fit one block.
 const INODE_SIZE: usize = 256;
 const INODES_PER_BLOCK: usize = BLOCK_SIZE / INODE_SIZE;
-// A block reference is a (u64 block pointer, u32 CRC32C) pair: 12 bytes. The 64-bit
-// pointer scales the volume into exabytes; the CRC covers the referenced block, so a
-// flipped bit on disk is caught when the block is read.
+// The inode-table index pairs each inode-table block with its CRC32C as a (u64 pointer,
+// u32 CRC32C) entry: 12 bytes. The same pairing checksums the inode metadata itself.
 const ENTRY_SIZE: usize = 12;
+// (u64 pointer + u32 CRC) entries that fit one index block; also caps the inode table so
+// its whole index fits a single block.
+const PTRS_PER_BLOCK: usize = BLOCK_SIZE / ENTRY_SIZE;
 // A reserved opaque owner / ACL tag, stored in every inode but never interpreted by the
 // filesystem: authorization is the capability layer and StorageService, not POSIX
 // permissions. Room to grow into a real owner identity without another format change.
 const OWNER_TAG_LEN: usize = 16;
 const OWNER_TAG_OFF: usize = 56;
-// Byte offset of the first direct entry: past the fixed header (kind, size, two
-// timestamps, three indirect pointers) and the owner tag.
-const DIRECT_OFF: usize = OWNER_TAG_OFF + OWNER_TAG_LEN;
-// (256 - 72) / 12 = 15 direct entries; a file's first 15 blocks (60 KiB) need no
-// indirection. Beyond that the single indirect block adds PTRS_PER_BLOCK more, the
-// double indirect PTRS_PER_BLOCK^2 more, and the triple indirect PTRS_PER_BLOCK^3 more.
-const DIRECT: usize = (INODE_SIZE - DIRECT_OFF) / ENTRY_SIZE;
-// Block references (pointer + CRC) that fit one indirect block.
-const PTRS_PER_BLOCK: usize = BLOCK_SIZE / ENTRY_SIZE;
+
+// A file is mapped by EXTENTS: each is a contiguous run of blocks (a logical start, a
+// physical start, a length) with one checksum block holding a CRC32C per block in the
+// run. One extent record is 32 bytes on disk: logical (u64), physical (u64), length
+// (u32), the checksum block's own CRC32C (u32), then the checksum block pointer (u64).
+const EXTENT_SIZE: usize = 32;
+// Byte offset of the first inline extent: past the fixed header (kind, size, two
+// timestamps, the extent-overflow pointer and count) and the owner tag.
+const EXTENT_OFF: usize = OWNER_TAG_OFF + OWNER_TAG_LEN;
+// (256 - 72) / 32 = 5 extents live inline in the inode; a file of up to five runs needs
+// no overflow block at all. Beyond that, extents spill to a chain of extent blocks.
+const EXTENTS_INLINE: usize = (INODE_SIZE - EXTENT_OFF) / EXTENT_SIZE;
+// A checksum block holds one CRC32C (4 bytes) per block of its extent, so an extent
+// spans at most this many blocks (1024 = 4 MiB). A longer file is several extents.
+const CRCS_PER_BLOCK: usize = BLOCK_SIZE / 4;
+// An extent-overflow block: an 8-byte next-block pointer, its 4-byte CRC32C, a 4-byte
+// count, then the extent records. (4096 - 16) / 32 = 127 extents per overflow block.
+const EXTENT_HDR: usize = 16;
+const EXTENTS_PER_BLOCK: usize = (BLOCK_SIZE - EXTENT_HDR) / EXTENT_SIZE;
 
 // Inode kinds. 0 is also the "free" marker, so a freed inode reads back as Free.
 const KIND_FREE: u8 = 0;
@@ -224,40 +239,85 @@ struct Superblock {
 // whole block with these four bytes zeroed, so a half-written superblock fails it.
 const SB_CRC_OFFSET: usize = 56;
 
-// One inode, parsed from / rendered to its 256-byte on-disk slot.
+// One extent: a contiguous run of `length` blocks mapped from logical block `logical`
+// to physical block `physical`, paired with a checksum block (`csum`) holding the
+// CRC32C of every block in the run, plus `csum_crc`, that checksum block's own CRC32C.
+// A file's extents are kept sorted by `logical`; a logical block no extent covers is a
+// hole that reads back as zeros (so a sparse file costs only its written runs).
+#[derive(Clone, Copy)]
+struct Extent {
+	logical: u64,
+	physical: u64,
+	length: u32,
+	csum: u64,
+	csum_crc: u32,
+}
+
+impl Extent {
+	fn parse(buf: &[u8]) -> Extent {
+		Extent { logical: u64::from_le_bytes(buf[0..8].try_into().unwrap()), physical: u64::from_le_bytes(buf[8..16].try_into().unwrap()), length: u32::from_le_bytes(buf[16..20].try_into().unwrap()), csum_crc: u32::from_le_bytes(buf[20..24].try_into().unwrap()), csum: u64::from_le_bytes(buf[24..32].try_into().unwrap()) }
+	}
+
+	fn write(&self, buf: &mut [u8]) {
+		buf[0..8].copy_from_slice(&self.logical.to_le_bytes());
+		buf[8..16].copy_from_slice(&self.physical.to_le_bytes());
+		buf[16..20].copy_from_slice(&self.length.to_le_bytes());
+		buf[20..24].copy_from_slice(&self.csum_crc.to_le_bytes());
+		buf[24..32].copy_from_slice(&self.csum.to_le_bytes());
+	}
+
+	// The first logical block past the run.
+	fn end(&self) -> u64 {
+		self.logical + self.length as u64
+	}
+
+	// Does the run cover logical block `lb`?
+	fn covers(&self, lb: u64) -> bool {
+		lb >= self.logical && lb < self.end()
+	}
+}
+
+// One inode, parsed from / rendered to its 256-byte on-disk slot. `extents` is the
+// in-memory extent map: `parse` fills only the EXTENTS_INLINE runs that live in the
+// slot, and [`LiberFs::read_inode`] completes it from the overflow chain rooted at
+// `spill`. `extent_count` is the total run count (inline plus spilled) - the header
+// field that says how many extents to read.
 struct Inode {
 	kind: u8,
 	size: u64,
 	ctime: u64,
 	mtime: u64,
-	indirect: u64,
-	dindirect: u64,
-	tindirect: u64,
 	// An opaque owner / ACL tag, stored but never interpreted by the filesystem.
 	owner_tag: [u8; OWNER_TAG_LEN],
-	// Direct block pointers and, beside each, the CRC32C of the block it points at.
-	direct: [u64; DIRECT],
-	direct_crc: [u32; DIRECT],
+	extents: Vec<Extent>,
+	spill: u64,
+	spill_crc: u32,
+	extent_count: u32,
 }
 
 impl Inode {
 	fn empty(kind: u8) -> Inode {
-		Inode { kind, size: 0, ctime: 0, mtime: 0, indirect: 0, dindirect: 0, tindirect: 0, owner_tag: [0u8; OWNER_TAG_LEN], direct: [0u64; DIRECT], direct_crc: [0u32; DIRECT] }
+		Inode { kind, size: 0, ctime: 0, mtime: 0, owner_tag: [0u8; OWNER_TAG_LEN], extents: Vec::new(), spill: 0, spill_crc: 0, extent_count: 0 }
 	}
 
+	// Parse the fixed header and the inline extents; any spilled extents (when
+	// `extent_count` exceeds EXTENTS_INLINE) are appended afterwards by `read_inode`.
 	fn parse(buf: &[u8]) -> Inode {
-		let mut direct = [0u64; DIRECT];
-		let mut direct_crc = [0u32; DIRECT];
-		for i in 0..DIRECT {
-			let off = DIRECT_OFF + i * ENTRY_SIZE;
-			direct[i] = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-			direct_crc[i] = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
+		let extent_count = u32::from_le_bytes(buf[44..48].try_into().unwrap());
+		let inline = (extent_count as usize).min(EXTENTS_INLINE);
+		let mut extents = Vec::with_capacity(inline);
+		for i in 0..inline {
+			let off = EXTENT_OFF + i * EXTENT_SIZE;
+			extents.push(Extent::parse(&buf[off..off + EXTENT_SIZE]));
 		}
 		let mut owner_tag = [0u8; OWNER_TAG_LEN];
 		owner_tag.copy_from_slice(&buf[OWNER_TAG_OFF..OWNER_TAG_OFF + OWNER_TAG_LEN]);
-		Inode { kind: buf[0], size: u64::from_le_bytes(buf[8..16].try_into().unwrap()), ctime: u64::from_le_bytes(buf[16..24].try_into().unwrap()), mtime: u64::from_le_bytes(buf[24..32].try_into().unwrap()), indirect: u64::from_le_bytes(buf[32..40].try_into().unwrap()), dindirect: u64::from_le_bytes(buf[40..48].try_into().unwrap()), tindirect: u64::from_le_bytes(buf[48..56].try_into().unwrap()), owner_tag, direct, direct_crc }
+		Inode { kind: buf[0], size: u64::from_le_bytes(buf[8..16].try_into().unwrap()), ctime: u64::from_le_bytes(buf[16..24].try_into().unwrap()), mtime: u64::from_le_bytes(buf[24..32].try_into().unwrap()), owner_tag, extents, spill: u64::from_le_bytes(buf[32..40].try_into().unwrap()), spill_crc: u32::from_le_bytes(buf[40..44].try_into().unwrap()), extent_count }
 	}
 
+	// Render the header and the first EXTENTS_INLINE extents into the 256-byte slot. The
+	// `spill` / `spill_crc` / `extent_count` header fields and the overflow chain are set
+	// beforehand by [`LiberFs::flush_extents`], which `write_inode` always calls first.
 	fn write(&self, buf: &mut [u8]) {
 		for b in buf[..INODE_SIZE].iter_mut() {
 			*b = 0;
@@ -266,14 +326,13 @@ impl Inode {
 		buf[8..16].copy_from_slice(&self.size.to_le_bytes());
 		buf[16..24].copy_from_slice(&self.ctime.to_le_bytes());
 		buf[24..32].copy_from_slice(&self.mtime.to_le_bytes());
-		buf[32..40].copy_from_slice(&self.indirect.to_le_bytes());
-		buf[40..48].copy_from_slice(&self.dindirect.to_le_bytes());
-		buf[48..56].copy_from_slice(&self.tindirect.to_le_bytes());
+		buf[32..40].copy_from_slice(&self.spill.to_le_bytes());
+		buf[40..44].copy_from_slice(&self.spill_crc.to_le_bytes());
+		buf[44..48].copy_from_slice(&self.extent_count.to_le_bytes());
 		buf[OWNER_TAG_OFF..OWNER_TAG_OFF + OWNER_TAG_LEN].copy_from_slice(&self.owner_tag);
-		for i in 0..DIRECT {
-			let off = DIRECT_OFF + i * ENTRY_SIZE;
-			buf[off..off + 8].copy_from_slice(&self.direct[i].to_le_bytes());
-			buf[off + 8..off + 12].copy_from_slice(&self.direct_crc[i].to_le_bytes());
+		for (i, ext) in self.extents.iter().take(EXTENTS_INLINE).enumerate() {
+			let off = EXTENT_OFF + i * EXTENT_SIZE;
+			ext.write(&mut buf[off..off + EXTENT_SIZE]);
 		}
 	}
 
@@ -522,10 +581,10 @@ impl<D: BlockDevice> LiberFs<D> {
 	}
 
 	// Create or overwrite the file at `path` with `data` (create-or-truncate). Missing
-	// parent directories are created. Copy-on-write: the new data, indirect blocks, and
-	// inode are written to freshly allocated blocks and the transaction commits with a
-	// single superblock swap, so a crash leaves either the previous file or the new one
-	// intact - never a torn mix.
+	// parent directories are created. Copy-on-write: the new data, extent and checksum
+	// blocks, and inode are written to freshly allocated blocks and the transaction
+	// commits with a single superblock swap, so a crash leaves either the previous file
+	// or the new one intact - never a torn mix.
 	pub fn write_file(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
 		self.begin();
 		let r = self.write_file_inner(path, data);
@@ -573,7 +632,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// point the inode at the new blocks, then name it (new files only). The old
 		// inode and blocks are not freed here - the commit's previous generation keeps
 		// them as the snapshot, and the next commit reclaims them.
-		self.write_inode(inode_num, &inode)?;
+		self.write_inode(inode_num, &mut inode)?;
 		if old.is_none() {
 			self.dir_add(parent, name, inode_num)?;
 		}
@@ -600,7 +659,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// clear the directory entry and free the inode in the new generation; its old
 		// blocks remain referenced by the previous generation.
 		self.dir_clear(parent, name)?;
-		self.write_inode(inode_num, &Inode::empty(KIND_FREE))?;
+		self.write_inode(inode_num, &mut Inode::empty(KIND_FREE))?;
 		Ok(())
 	}
 
@@ -682,7 +741,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				let mut f = Inode::empty(KIND_FILE);
 				f.ctime = self.clock;
 				f.mtime = self.clock;
-				self.write_inode(num, &f)?;
+				self.write_inode(num, &mut f)?;
 				self.dir_add(parent, name, num)?;
 				num
 			}
@@ -717,7 +776,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 		}
 		inode.mtime = self.clock;
-		self.write_inode(inode_num, &inode)?;
+		self.write_inode(inode_num, &mut inode)?;
 		Ok(())
 	}
 
@@ -772,7 +831,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		inode.size = new_len;
 		inode.mtime = self.clock;
-		self.write_inode(inode_num, &inode)?;
+		self.write_inode(inode_num, &mut inode)?;
 		Ok(())
 	}
 
@@ -818,7 +877,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.dir_clear(pf, nf)?;
 		if let Some(inode_t) = dest {
 			if inode_t != inode_f {
-				self.write_inode(inode_t, &Inode::empty(KIND_FREE))?;
+				self.write_inode(inode_t, &mut Inode::empty(KIND_FREE))?;
 			}
 		}
 		Ok(())
@@ -858,7 +917,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// read-only snapshot; the one before it is reclaimed by rederiving the free map.
 	fn commit(&mut self) -> Result<(), FsError> {
 		// the index block holding the (pointer, CRC32C) of every inode-table block.
-		let new_index = self.alloc_one()?;
+		let new_index = self.alloc_meta()?;
 		let mut index = vec![0u8; BLOCK_SIZE];
 		for (i, &(ptr, crc)) in self.itable.iter().enumerate() {
 			let off = i * ENTRY_SIZE;
@@ -923,7 +982,8 @@ impl<D: BlockDevice> LiberFs<D> {
 	}
 
 	// Mark, in `map`, the index block and every block one generation references: each
-	// inode-table block, and the data and indirect blocks of each live inode in it.
+	// inode-table block, and the data, checksum and extent-overflow blocks of each live
+	// inode in it.
 	fn mark_generation(&mut self, index_block: u64, itable: &[(u64, u32)], map: &mut [u8]) -> Result<(), FsError> {
 		set_bit(map, index_block);
 		let mut block = vec![0u8; BLOCK_SIZE];
@@ -933,8 +993,10 @@ impl<D: BlockDevice> LiberFs<D> {
 				return Err(FsError::Io);
 			}
 			for slot in 0..INODES_PER_BLOCK {
-				let inode = Inode::parse(&block[slot * INODE_SIZE..slot * INODE_SIZE + INODE_SIZE]);
+				let mut inode = Inode::parse(&block[slot * INODE_SIZE..slot * INODE_SIZE + INODE_SIZE]);
 				if inode.kind != KIND_FREE {
+					// complete the extent map from the overflow chain before marking.
+					self.load_spill(&mut inode)?;
 					self.collect_inode_blocks(&inode, map)?;
 				}
 			}
@@ -967,18 +1029,88 @@ impl<D: BlockDevice> LiberFs<D> {
 		if crc32c(&block) != crc {
 			return Err(FsError::Corrupt);
 		}
-		Ok(Inode::parse(&block[offset..offset + INODE_SIZE]))
+		let mut inode = Inode::parse(&block[offset..offset + INODE_SIZE]);
+		// complete the extent map from the overflow chain (a no-op for a file whose
+		// runs all fit inline).
+		self.load_spill(&mut inode)?;
+		Ok(inode)
+	}
+
+	// Append the spilled extents (those past EXTENTS_INLINE) from the overflow chain to
+	// `inode.extents`, which `parse` filled only with the inline runs. Each chain block
+	// carries the (pointer, CRC32C) of the next, so a flipped bit in the chain is caught.
+	fn load_spill(&mut self, inode: &mut Inode) -> Result<(), FsError> {
+		if inode.extent_count as usize <= inode.extents.len() {
+			return Ok(());
+		}
+		let mut ptr = inode.spill;
+		let mut crc = inode.spill_crc;
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		while ptr != 0 {
+			if !self.dev.read_block(ptr, &mut buf) {
+				return Err(FsError::Io);
+			}
+			if crc32c(&buf) != crc {
+				return Err(FsError::Corrupt);
+			}
+			let count = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+			for i in 0..count {
+				let off = EXTENT_HDR + i * EXTENT_SIZE;
+				inode.extents.push(Extent::parse(&buf[off..off + EXTENT_SIZE]));
+			}
+			ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+			crc = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+		}
+		Ok(())
+	}
+
+	// Persist `inode.extents` past the inline ones into a fresh overflow chain (one
+	// block per EXTENTS_PER_BLOCK runs) and set the `spill` / `spill_crc` /
+	// `extent_count` header fields to match. The chain is built back to front so each
+	// block can hold the (pointer, CRC32C) of the one after it. Always called by
+	// `write_inode`, so the inode slot and chain stay consistent.
+	fn flush_extents(&mut self, inode: &mut Inode) -> Result<(), FsError> {
+		inode.extent_count = inode.extents.len() as u32;
+		if inode.extents.len() <= EXTENTS_INLINE {
+			inode.spill = 0;
+			inode.spill_crc = 0;
+			return Ok(());
+		}
+		let spilled: Vec<Extent> = inode.extents[EXTENTS_INLINE..].to_vec();
+		let mut next_ptr = 0u64;
+		let mut next_crc = 0u32;
+		for chunk in spilled.chunks(EXTENTS_PER_BLOCK).rev() {
+			let blk = self.alloc_meta()?;
+			let mut buf = vec![0u8; BLOCK_SIZE];
+			buf[0..8].copy_from_slice(&next_ptr.to_le_bytes());
+			buf[8..12].copy_from_slice(&next_crc.to_le_bytes());
+			buf[12..16].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+			for (i, ext) in chunk.iter().enumerate() {
+				let off = EXTENT_HDR + i * EXTENT_SIZE;
+				ext.write(&mut buf[off..off + EXTENT_SIZE]);
+			}
+			if !self.dev.write_block(blk, &buf) {
+				return Err(FsError::Io);
+			}
+			next_ptr = blk;
+			next_crc = crc32c(&buf);
+		}
+		inode.spill = next_ptr;
+		inode.spill_crc = next_crc;
+		Ok(())
 	}
 
 	// Write inode `num`, copying its inode-table block up to a fresh block (once per
-	// transaction) and updating `itable` with the new (pointer, CRC32C). The change is
+	// transaction) and updating `itable` with the new (pointer, CRC32C). The extent
+	// overflow chain is rebuilt first so the inode slot and chain agree. The change is
 	// published by `commit`.
-	fn write_inode(&mut self, num: u32, inode: &Inode) -> Result<(), FsError> {
+	fn write_inode(&mut self, num: u32, inode: &mut Inode) -> Result<(), FsError> {
 		if num >= self.num_inodes {
 			return Err(FsError::Invalid);
 		}
+		self.flush_extents(inode)?;
 		let (tbl, offset) = self.inode_location(num);
-		let ptr = self.cow(self.itable[tbl].0)?;
+		let ptr = self.cow_meta(self.itable[tbl].0)?;
 		let mut block = vec![0u8; BLOCK_SIZE];
 		if !self.dev.read_block(ptr, &mut block) {
 			return Err(FsError::Io);
@@ -996,7 +1128,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	fn alloc_inode(&mut self) -> Result<u32, FsError> {
 		for num in 1..self.num_inodes {
 			if self.read_inode(num)?.kind == KIND_FREE {
-				self.write_inode(num, &Inode::empty(KIND_FILE))?;
+				self.write_inode(num, &mut Inode::empty(KIND_FILE))?;
 				return Ok(num);
 			}
 		}
@@ -1009,29 +1141,55 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.free[(block / 8) as usize] & (1 << (block % 8)) != 0
 	}
 
-	// Claim one free block from the pool: scan the in-memory free map, mark the block
-	// used, and record it as fresh (allocated by this transaction, so safe to overwrite
-	// in place). The free map is in-memory only; nothing is flushed.
-	fn alloc_one(&mut self) -> Result<u64, FsError> {
-		for block in POOL_START..self.num_blocks {
-			if !self.is_alloc(block) {
-				self.free[(block / 8) as usize] |= 1 << (block % 8);
-				self.fresh.insert(block);
-				return Ok(block);
+	// Claim one free block, marking it used and recording it as fresh (allocated by
+	// this transaction, so safe to overwrite in place). Data blocks are taken from the
+	// low end of the pool and metadata (checksum, extent-overflow, inode-table, index)
+	// from the high end, so a run of data blocks stays physically contiguous and
+	// coalesces into one extent instead of being split by interleaved metadata.
+	fn alloc_block(&mut self, meta: bool) -> Result<u64, FsError> {
+		let claim = |free: &mut [u8], block: u64| {
+			free[(block / 8) as usize] |= 1 << (block % 8);
+		};
+		if meta {
+			let mut block = self.num_blocks;
+			while block > POOL_START {
+				block -= 1;
+				if !self.is_alloc(block) {
+					claim(&mut self.free, block);
+					self.fresh.insert(block);
+					return Ok(block);
+				}
+			}
+		} else {
+			for block in POOL_START..self.num_blocks {
+				if !self.is_alloc(block) {
+					claim(&mut self.free, block);
+					self.fresh.insert(block);
+					return Ok(block);
+				}
 			}
 		}
 		Err(FsError::NoSpace)
 	}
 
+	fn alloc_data(&mut self) -> Result<u64, FsError> {
+		self.alloc_block(false)
+	}
+
+	fn alloc_meta(&mut self) -> Result<u64, FsError> {
+		self.alloc_block(true)
+	}
+
 	// Copy-on-write a block reference. A pointer this transaction already allocated is
 	// returned as is (safe to mutate in place). A committed block (or the 0 "unmapped"
-	// sentinel) is copied up: a fresh block is allocated and the old contents copied
-	// into it (or zeroed), so the committed generation keeps the original untouched.
-	fn cow(&mut self, ptr: u64) -> Result<u64, FsError> {
+	// sentinel) is copied up to a fresh block (data low, metadata high) and the old
+	// contents copied into it (or zeroed), so the committed generation keeps the
+	// original untouched.
+	fn cow_block(&mut self, ptr: u64, meta: bool) -> Result<u64, FsError> {
 		if ptr != 0 && self.fresh.contains(&ptr) {
 			return Ok(ptr);
 		}
-		let fresh = self.alloc_one()?;
+		let fresh = self.alloc_block(meta)?;
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		if ptr != 0 && !self.dev.read_block(ptr, &mut buf) {
 			return Err(FsError::Io);
@@ -1042,182 +1200,191 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(fresh)
 	}
 
-	// block references: a (pointer, CRC32C) pair at index `idx` in an indirect block
+	fn cow_data(&mut self, ptr: u64) -> Result<u64, FsError> {
+		self.cow_block(ptr, false)
+	}
 
-	fn read_entry(&mut self, block: u64, idx: usize) -> Result<(u64, u32), FsError> {
+	fn cow_meta(&mut self, ptr: u64) -> Result<u64, FsError> {
+		self.cow_block(ptr, true)
+	}
+
+	// Read the CRC32C of an extent's block at slot `slot` from its checksum block,
+	// verifying that block's own checksum first (so a flipped bit in the checksum
+	// metadata is caught, not silently trusted).
+	fn read_csum(&mut self, csum: u64, csum_crc: u32, slot: usize) -> Result<u32, FsError> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		if !self.dev.read_block(block, &mut buf) {
+		if !self.dev.read_block(csum, &mut buf) {
 			return Err(FsError::Io);
 		}
-		let off = idx * ENTRY_SIZE;
-		let ptr = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-		let crc = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
-		Ok((ptr, crc))
+		if crc32c(&buf) != csum_crc {
+			return Err(FsError::Corrupt);
+		}
+		let off = slot * 4;
+		Ok(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()))
 	}
 
-	fn write_entry_at(&mut self, block: u64, idx: usize, ptr: u64, crc: u32) -> Result<(), FsError> {
+	// Set slot `slot` of checksum block `csum` to `crc` and return the block's new
+	// CRC32C (the extent's `csum_crc`). The block is read, edited, and written back.
+	fn set_csum_slot(&mut self, csum: u64, slot: usize, crc: u32) -> Result<u32, FsError> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		if !self.dev.read_block(block, &mut buf) {
+		if !self.dev.read_block(csum, &mut buf) {
 			return Err(FsError::Io);
 		}
-		let off = idx * ENTRY_SIZE;
-		buf[off..off + 8].copy_from_slice(&ptr.to_le_bytes());
-		buf[off + 8..off + 12].copy_from_slice(&crc.to_le_bytes());
-		if !self.dev.write_block(block, &buf) {
+		let off = slot * 4;
+		buf[off..off + 4].copy_from_slice(&crc.to_le_bytes());
+		if !self.dev.write_block(csum, &buf) {
 			return Err(FsError::Io);
 		}
-		Ok(())
+		Ok(crc32c(&buf))
 	}
 
-	// file block mapping (direct -> single -> double -> triple indirect)
+	// file block mapping (extents)
 
-	// Resolve logical block `logical` of `inode` to (physical block, stored CRC32C), or
-	// None if it is not mapped (a hole).
-	fn map_for_read(&mut self, inode: &Inode, logical: usize) -> Result<Option<(u64, u32)>, FsError> {
-		if logical < DIRECT {
-			return Ok(nonzero(inode.direct[logical]).map(|p| (p, inode.direct_crc[logical])));
-		}
-		let l = logical - DIRECT;
-		if l < PTRS_PER_BLOCK {
-			if inode.indirect == 0 {
-				return Ok(None);
-			}
-			let (ptr, crc) = self.read_entry(inode.indirect, l)?;
-			return Ok(nonzero(ptr).map(|p| (p, crc)));
-		}
-		let l = l - PTRS_PER_BLOCK;
-		if l < PTRS_PER_BLOCK * PTRS_PER_BLOCK {
-			let first = l / PTRS_PER_BLOCK;
-			let second = l % PTRS_PER_BLOCK;
-			if inode.dindirect == 0 {
-				return Ok(None);
-			}
-			let (mid, _) = self.read_entry(inode.dindirect, first)?;
-			if mid == 0 {
-				return Ok(None);
-			}
-			let (ptr, crc) = self.read_entry(mid, second)?;
-			return Ok(nonzero(ptr).map(|p| (p, crc)));
-		}
-		let l = l - PTRS_PER_BLOCK * PTRS_PER_BLOCK;
-		let first = l / (PTRS_PER_BLOCK * PTRS_PER_BLOCK);
-		let rem = l % (PTRS_PER_BLOCK * PTRS_PER_BLOCK);
-		let second = rem / PTRS_PER_BLOCK;
-		let third = rem % PTRS_PER_BLOCK;
-		if first >= PTRS_PER_BLOCK {
-			return Err(FsError::NoSpace);
-		}
-		if inode.tindirect == 0 {
-			return Ok(None);
-		}
-		let (mid, _) = self.read_entry(inode.tindirect, first)?;
-		if mid == 0 {
-			return Ok(None);
-		}
-		let (leaf, _) = self.read_entry(mid, second)?;
-		if leaf == 0 {
-			return Ok(None);
-		}
-		let (ptr, crc) = self.read_entry(leaf, third)?;
-		Ok(nonzero(ptr).map(|p| (p, crc)))
-	}
-
-	// Ensure logical block `logical` of `inode` is mapped to a writable block, copying
-	// up the data block and every indirect block on the path so no committed generation
-	// is disturbed, and record `crc` beside the data pointer. Returns the physical data
-	// block. Updates `inode`'s pointers in memory - the caller persists the inode.
-	fn map_for_write(&mut self, inode: &mut Inode, logical: usize, crc: u32) -> Result<u64, FsError> {
-		if logical < DIRECT {
-			inode.direct[logical] = self.cow(inode.direct[logical])?;
-			inode.direct_crc[logical] = crc;
-			return Ok(inode.direct[logical]);
-		}
-		let l = logical - DIRECT;
-		if l < PTRS_PER_BLOCK {
-			// copy the indirect block up (cow of 0 yields a fresh zeroed block), then
-			// the data block it points at, recording the data CRC beside the pointer.
-			inode.indirect = self.cow(inode.indirect)?;
-			let (data, _) = self.read_entry(inode.indirect, l)?;
-			let data = self.cow(data)?;
-			self.write_entry_at(inode.indirect, l, data, crc)?;
-			return Ok(data);
-		}
-		let l = l - PTRS_PER_BLOCK;
-		if l < PTRS_PER_BLOCK * PTRS_PER_BLOCK {
-			let first = l / PTRS_PER_BLOCK;
-			let second = l % PTRS_PER_BLOCK;
-			inode.dindirect = self.cow(inode.dindirect)?;
-			let (mid, _) = self.read_entry(inode.dindirect, first)?;
-			let mid = self.cow(mid)?;
-			// the double indirect points at a mid block, not data: no data CRC here.
-			self.write_entry_at(inode.dindirect, first, mid, 0)?;
-			let (data, _) = self.read_entry(mid, second)?;
-			let data = self.cow(data)?;
-			self.write_entry_at(mid, second, data, crc)?;
-			return Ok(data);
-		}
-		let l = l - PTRS_PER_BLOCK * PTRS_PER_BLOCK;
-		let first = l / (PTRS_PER_BLOCK * PTRS_PER_BLOCK);
-		let rem = l % (PTRS_PER_BLOCK * PTRS_PER_BLOCK);
-		let second = rem / PTRS_PER_BLOCK;
-		let third = rem % PTRS_PER_BLOCK;
-		if first >= PTRS_PER_BLOCK {
-			return Err(FsError::NoSpace);
-		}
-		inode.tindirect = self.cow(inode.tindirect)?;
-		let (mid, _) = self.read_entry(inode.tindirect, first)?;
-		let mid = self.cow(mid)?;
-		// the triple indirect points at mid (index) blocks, not data: no data CRC here.
-		self.write_entry_at(inode.tindirect, first, mid, 0)?;
-		let (leaf, _) = self.read_entry(mid, second)?;
-		let leaf = self.cow(leaf)?;
-		self.write_entry_at(mid, second, leaf, 0)?;
-		let (data, _) = self.read_entry(leaf, third)?;
-		let data = self.cow(data)?;
-		self.write_entry_at(leaf, third, data, crc)?;
-		Ok(data)
-	}
-
-	// Read logical block `logical` of `inode` into `buf`, verifying its stored
-	// checksum. Returns false (and leaves `buf` untouched) for a hole; a mismatch is
-	// `FsError::Corrupt`.
+	// Read logical block `logical` of `inode` into `buf` via its extent map, verifying
+	// the per-block checksum. Returns false (and leaves `buf` untouched) for a hole - a
+	// logical block no extent covers, which the caller reads back as zeros. A checksum
+	// mismatch is `FsError::Corrupt`.
 	fn read_logical(&mut self, inode: &Inode, logical: usize, buf: &mut [u8]) -> Result<bool, FsError> {
-		match self.map_for_read(inode, logical)? {
-			Some((phys, crc)) => {
-				if !self.dev.read_block(phys, buf) {
-					return Err(FsError::Io);
-				}
-				if crc32c(buf) != crc {
-					return Err(FsError::Corrupt);
-				}
-				Ok(true)
-			}
-			None => Ok(false),
+		let lb = logical as u64;
+		let ext = match find_extent(&inode.extents, lb) {
+			Some(i) => inode.extents[i],
+			None => return Ok(false),
+		};
+		let off = (lb - ext.logical) as usize;
+		if !self.dev.read_block(ext.physical + off as u64, buf) {
+			return Err(FsError::Io);
 		}
+		let crc = self.read_csum(ext.csum, ext.csum_crc, off)?;
+		if crc32c(buf) != crc {
+			return Err(FsError::Corrupt);
+		}
+		Ok(true)
 	}
 
-	// Write `buf` as logical block `logical` of `inode`, allocating the block if needed
-	// and recording its checksum. Updates `inode` in memory - the caller persists it.
+	// Write `buf` as logical block `logical` of `inode`, updating the extent map in
+	// memory and recording the block's checksum. Overwriting a mapped block copies it
+	// up (and may split its run); writing a hole appends to the run before it when the
+	// new block is physically contiguous, otherwise starts a new run. The caller
+	// persists the inode, which flushes the map to disk.
 	fn write_logical(&mut self, inode: &mut Inode, logical: usize, buf: &[u8]) -> Result<(), FsError> {
+		let lb = logical as u64;
 		let crc = crc32c(buf);
-		let phys = self.map_for_write(inode, logical, crc)?;
+		if let Some(i) = find_extent(&inode.extents, lb) {
+			let ext = inode.extents[i];
+			let off = (lb - ext.logical) as usize;
+			let new_phys = self.cow_data(ext.physical + off as u64)?;
+			if !self.dev.write_block(new_phys, buf) {
+				return Err(FsError::Io);
+			}
+			self.overwrite_block(inode, i, off, new_phys, crc)?;
+			return Ok(());
+		}
+		let phys = self.alloc_data()?;
 		if !self.dev.write_block(phys, buf) {
 			return Err(FsError::Io);
 		}
+		self.place_block(inode, lb, phys, crc)
+	}
+
+	// Record a freshly allocated data block `phys` as logical block `lb` of `inode`,
+	// extending the run that ends at `lb` when it is physically contiguous and still has
+	// room in its checksum block, or inserting a new single-block run otherwise.
+	fn place_block(&mut self, inode: &mut Inode, lb: u64, phys: u64, crc: u32) -> Result<(), FsError> {
+		let pos = inode.extents.partition_point(|e| e.logical <= lb);
+		if pos > 0 {
+			let prev = inode.extents[pos - 1];
+			if prev.end() == lb && prev.physical + prev.length as u64 == phys && (prev.length as usize) < CRCS_PER_BLOCK {
+				let csum = self.cow_meta(prev.csum)?;
+				let csum_crc = self.set_csum_slot(csum, prev.length as usize, crc)?;
+				let e = &mut inode.extents[pos - 1];
+				e.length += 1;
+				e.csum = csum;
+				e.csum_crc = csum_crc;
+				return Ok(());
+			}
+		}
+		let csum = self.alloc_meta()?;
+		let mut cbuf = vec![0u8; BLOCK_SIZE];
+		cbuf[0..4].copy_from_slice(&crc.to_le_bytes());
+		if !self.dev.write_block(csum, &cbuf) {
+			return Err(FsError::Io);
+		}
+		inode.extents.insert(pos, Extent { logical: lb, physical: phys, length: 1, csum, csum_crc: crc32c(&cbuf) });
+		Ok(())
+	}
+
+	// Apply an overwrite of the block at offset `off` in extent `i`, now living at
+	// `new_phys`. If the block did not move (it was already fresh this transaction) the
+	// run is intact and only its checksum changes; otherwise the run splits into the
+	// unchanged prefix, the single rewritten block, and the unchanged suffix, copying
+	// the checksum sub-ranges so every block keeps its CRC.
+	fn overwrite_block(&mut self, inode: &mut Inode, i: usize, off: usize, new_phys: u64, crc: u32) -> Result<(), FsError> {
+		let ext = inode.extents[i];
+		if new_phys == ext.physical + off as u64 {
+			let csum = self.cow_meta(ext.csum)?;
+			let csum_crc = self.set_csum_slot(csum, off, crc)?;
+			let e = &mut inode.extents[i];
+			e.csum = csum;
+			e.csum_crc = csum_crc;
+			return Ok(());
+		}
+		let mut old_csum = vec![0u8; BLOCK_SIZE];
+		if !self.dev.read_block(ext.csum, &mut old_csum) {
+			return Err(FsError::Io);
+		}
+		if crc32c(&old_csum) != ext.csum_crc {
+			return Err(FsError::Corrupt);
+		}
+		let mut pieces: Vec<Extent> = Vec::new();
+		if off > 0 {
+			// the prefix is unchanged: reuse the original checksum block (its leading
+			// slots still match the kept blocks).
+			pieces.push(Extent { logical: ext.logical, physical: ext.physical, length: off as u32, csum: ext.csum, csum_crc: ext.csum_crc });
+		}
+		// the rewritten block gets a fresh single-entry checksum block.
+		let mid_csum = self.alloc_meta()?;
+		let mut cbuf = vec![0u8; BLOCK_SIZE];
+		cbuf[0..4].copy_from_slice(&crc.to_le_bytes());
+		if !self.dev.write_block(mid_csum, &cbuf) {
+			return Err(FsError::Io);
+		}
+		pieces.push(Extent { logical: ext.logical + off as u64, physical: new_phys, length: 1, csum: mid_csum, csum_crc: crc32c(&cbuf) });
+		if off + 1 < ext.length as usize {
+			let slen = ext.length as usize - off - 1;
+			let suf_csum = self.alloc_meta()?;
+			let mut sbuf = vec![0u8; BLOCK_SIZE];
+			// copy the original CRCs of the suffix down to the start of the new block.
+			sbuf[0..slen * 4].copy_from_slice(&old_csum[(off + 1) * 4..(off + 1 + slen) * 4]);
+			if !self.dev.write_block(suf_csum, &sbuf) {
+				return Err(FsError::Io);
+			}
+			pieces.push(Extent { logical: ext.logical + off as u64 + 1, physical: ext.physical + off as u64 + 1, length: slen as u32, csum: suf_csum, csum_crc: crc32c(&sbuf) });
+		}
+		inode.extents.splice(i..i + 1, pieces);
 		Ok(())
 	}
 
 	// Count the live data blocks of `inode` whose on-disk bytes no longer match the
-	// checksum stored beside their pointer.
+	// CRC32C stored for them in their run's checksum block. A run whose checksum block
+	// is itself corrupt counts as wholly bad.
 	fn count_corrupt(&mut self, inode: &Inode) -> Result<u32, FsError> {
 		let mut bad = 0;
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		for lb in 0..inode.nblocks() {
-			if let Some((phys, crc)) = self.map_for_read(inode, lb)? {
-				if !self.dev.read_block(phys, &mut buf) {
+		let mut cbuf = vec![0u8; BLOCK_SIZE];
+		for ext in inode.extents.iter() {
+			if !self.dev.read_block(ext.csum, &mut cbuf) {
+				return Err(FsError::Io);
+			}
+			if crc32c(&cbuf) != ext.csum_crc {
+				bad += ext.length;
+				continue;
+			}
+			for off in 0..ext.length as usize {
+				if !self.dev.read_block(ext.physical + off as u64, &mut buf) {
 					return Err(FsError::Io);
 				}
-				if crc32c(&buf) != crc {
+				let c = u32::from_le_bytes(cbuf[off * 4..off * 4 + 4].try_into().unwrap());
+				if crc32c(&buf) != c {
 					bad += 1;
 				}
 			}
@@ -1273,7 +1440,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut dir = Inode::empty(KIND_DIR);
 		dir.ctime = self.clock;
 		dir.mtime = self.clock;
-		self.write_inode(num, &dir)?;
+		self.write_inode(num, &mut dir)?;
 		self.dir_add(parent, name, num)?;
 		Ok(num)
 	}
@@ -1351,7 +1518,7 @@ impl<D: BlockDevice> LiberFs<D> {
 					write_entry(&mut block[off..off + DENTRY_SIZE], name, child);
 					self.write_logical(&mut dir, i, &block)?;
 					dir.mtime = self.clock;
-					self.write_inode(dir_num, &dir)?;
+					self.write_inode(dir_num, &mut dir)?;
 					return Ok(());
 				}
 			}
@@ -1366,7 +1533,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.write_logical(&mut dir, logical, &block)?;
 		dir.size += BLOCK_SIZE as u64;
 		dir.mtime = self.clock;
-		self.write_inode(dir_num, &dir)?;
+		self.write_inode(dir_num, &mut dir)?;
 		Ok(())
 	}
 
@@ -1379,7 +1546,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			self.read_logical(&dir, logical, &mut block)?;
 			block[off + NAME_MAX..off + NAME_MAX + 4].copy_from_slice(&child.to_le_bytes());
 			self.write_logical(&mut dir, logical, &block)?;
-			self.write_inode(dir_num, &dir)?;
+			self.write_inode(dir_num, &mut dir)?;
 			return Ok(());
 		}
 		self.dir_add(dir_num, name, child)
@@ -1395,7 +1562,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			*b = 0;
 		}
 		self.write_logical(&mut dir, logical, &block)?;
-		self.write_inode(dir_num, &dir)?;
+		self.write_inode(dir_num, &mut dir)?;
 		Ok(())
 	}
 
@@ -1414,137 +1581,51 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(false)
 	}
 
-	// Free the file's data blocks from logical block `keep` to the end, clearing their
-	// pointers, and drop the indirect blocks that map only the freed region. Under
-	// copy-on-write nothing is marked free here: the dropped blocks simply stop being
-	// referenced by the new generation and are reclaimed when the free map is rederived
-	// at commit (until then the previous generation still pins them as a snapshot).
+	// Drop the file's blocks from logical block `keep` to the end: runs wholly past the
+	// cut are removed, a run straddling it is shortened. Under copy-on-write nothing is
+	// marked free here - the dropped data, checksum, and overflow blocks simply stop
+	// being referenced by the new generation and are reclaimed when the free map is
+	// rederived at commit (until then the previous generation still pins them as a
+	// snapshot). A shortened run keeps its checksum block; its leading slots still match
+	// the kept blocks.
 	fn free_from(&mut self, inode: &mut Inode, keep: usize) -> Result<(), FsError> {
-		let total = inode.nblocks();
-		for lb in keep..total {
-			self.clear_block_at(inode, lb)?;
+		let keep = keep as u64;
+		let mut kept: Vec<Extent> = Vec::new();
+		for ext in inode.extents.iter() {
+			if ext.logical >= keep {
+				continue;
+			}
+			if ext.end() <= keep {
+				kept.push(*ext);
+				continue;
+			}
+			let mut e = *ext;
+			e.length = (keep - ext.logical) as u32;
+			kept.push(e);
 		}
-		if keep <= DIRECT {
-			inode.indirect = 0;
-		}
-		if keep <= DIRECT + PTRS_PER_BLOCK {
-			inode.dindirect = 0;
-		}
-		if keep <= DIRECT + PTRS_PER_BLOCK + PTRS_PER_BLOCK * PTRS_PER_BLOCK {
-			inode.tindirect = 0;
-		}
+		inode.extents = kept;
 		Ok(())
 	}
 
-	// Clear the pointer slot of the data block at logical index `lb` (leaving any
-	// indirect blocks in place), copying up the indirect blocks on the path first so no
-	// committed generation is disturbed.
-	fn clear_block_at(&mut self, inode: &mut Inode, lb: usize) -> Result<(), FsError> {
-		if lb < DIRECT {
-			inode.direct[lb] = 0;
-			inode.direct_crc[lb] = 0;
-			return Ok(());
-		}
-		let l = lb - DIRECT;
-		if l < PTRS_PER_BLOCK {
-			if inode.indirect != 0 {
-				inode.indirect = self.cow(inode.indirect)?;
-				self.write_entry_at(inode.indirect, l, 0, 0)?;
-			}
-			return Ok(());
-		}
-		let l = l - PTRS_PER_BLOCK;
-		if l < PTRS_PER_BLOCK * PTRS_PER_BLOCK {
-			let first = l / PTRS_PER_BLOCK;
-			let second = l % PTRS_PER_BLOCK;
-			if inode.dindirect != 0 {
-				inode.dindirect = self.cow(inode.dindirect)?;
-				let (mid, _) = self.read_entry(inode.dindirect, first)?;
-				if mid != 0 {
-					let mid = self.cow(mid)?;
-					self.write_entry_at(inode.dindirect, first, mid, 0)?;
-					self.write_entry_at(mid, second, 0, 0)?;
-				}
-			}
-			return Ok(());
-		}
-		let l = l - PTRS_PER_BLOCK * PTRS_PER_BLOCK;
-		let first = l / (PTRS_PER_BLOCK * PTRS_PER_BLOCK);
-		let rem = l % (PTRS_PER_BLOCK * PTRS_PER_BLOCK);
-		let second = rem / PTRS_PER_BLOCK;
-		let third = rem % PTRS_PER_BLOCK;
-		if inode.tindirect != 0 {
-			inode.tindirect = self.cow(inode.tindirect)?;
-			let (mid, _) = self.read_entry(inode.tindirect, first)?;
-			if mid != 0 {
-				let mid = self.cow(mid)?;
-				self.write_entry_at(inode.tindirect, first, mid, 0)?;
-				let (leaf, _) = self.read_entry(mid, second)?;
-				if leaf != 0 {
-					let leaf = self.cow(leaf)?;
-					self.write_entry_at(mid, second, leaf, 0)?;
-					self.write_entry_at(leaf, third, 0, 0)?;
-				}
-			}
-		}
-		Ok(())
-	}
-
-	// Set the bitmap bit for every block an inode references - its data blocks and the
-	// indirect blocks that map them.
+	// Set the bitmap bit for every block an inode references: each run's data blocks and
+	// its checksum block, plus the blocks of the extent overflow chain.
 	fn collect_inode_blocks(&mut self, inode: &Inode, bitmap: &mut [u8]) -> Result<(), FsError> {
-		for i in 0..DIRECT {
-			if inode.direct[i] != 0 {
-				set_bit(bitmap, inode.direct[i]);
+		for ext in inode.extents.iter() {
+			for off in 0..ext.length as u64 {
+				set_bit(bitmap, ext.physical + off);
+			}
+			if ext.csum != 0 {
+				set_bit(bitmap, ext.csum);
 			}
 		}
-		if inode.indirect != 0 {
-			set_bit(bitmap, inode.indirect);
-			for idx in 0..PTRS_PER_BLOCK {
-				let (p, _) = self.read_entry(inode.indirect, idx)?;
-				if p != 0 {
-					set_bit(bitmap, p);
-				}
+		let mut ptr = inode.spill;
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		while ptr != 0 {
+			set_bit(bitmap, ptr);
+			if !self.dev.read_block(ptr, &mut buf) {
+				return Err(FsError::Io);
 			}
-		}
-		if inode.dindirect != 0 {
-			set_bit(bitmap, inode.dindirect);
-			for first in 0..PTRS_PER_BLOCK {
-				let (mid, _) = self.read_entry(inode.dindirect, first)?;
-				if mid == 0 {
-					continue;
-				}
-				set_bit(bitmap, mid);
-				for second in 0..PTRS_PER_BLOCK {
-					let (p, _) = self.read_entry(mid, second)?;
-					if p != 0 {
-						set_bit(bitmap, p);
-					}
-				}
-			}
-		}
-		if inode.tindirect != 0 {
-			set_bit(bitmap, inode.tindirect);
-			for first in 0..PTRS_PER_BLOCK {
-				let (mid, _) = self.read_entry(inode.tindirect, first)?;
-				if mid == 0 {
-					continue;
-				}
-				set_bit(bitmap, mid);
-				for second in 0..PTRS_PER_BLOCK {
-					let (leaf, _) = self.read_entry(mid, second)?;
-					if leaf == 0 {
-						continue;
-					}
-					set_bit(bitmap, leaf);
-					for third in 0..PTRS_PER_BLOCK {
-						let (p, _) = self.read_entry(leaf, third)?;
-						if p != 0 {
-							set_bit(bitmap, p);
-						}
-					}
-				}
-			}
+			ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
 		}
 		Ok(())
 	}
@@ -1620,13 +1701,18 @@ fn set_bit(bitmap: &mut [u8], b: u64) {
 	bitmap[(b / 8) as usize] |= 1 << (b % 8);
 }
 
-// A block pointer as an Option: 0 is the "unmapped" sentinel, anything else a real
-// block.
-fn nonzero(block: u64) -> Option<u64> {
-	if block == 0 {
-		None
+// Index of the extent covering logical block `lb`, or None if it falls in a hole. The
+// runs are sorted by `logical`, so the candidate is the last one starting at or before
+// `lb`; a binary search keeps lookups cheap on a many-extent file.
+fn find_extent(extents: &[Extent], lb: u64) -> Option<usize> {
+	let pos = extents.partition_point(|e| e.logical <= lb);
+	if pos == 0 {
+		return None;
+	}
+	if extents[pos - 1].covers(lb) {
+		Some(pos - 1)
 	} else {
-		Some(block)
+		None
 	}
 }
 

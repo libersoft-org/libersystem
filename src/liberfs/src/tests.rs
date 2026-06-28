@@ -253,36 +253,6 @@ fn rejects_dot_and_dot_dot_segments() {
 }
 
 #[test]
-fn single_indirect_large_file() {
-	// a file past the direct pointers exercises the single indirect block.
-	let nblocks: u64 = 128;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
-	let size = BLOCK_SIZE * (DIRECT + 5) + 123;
-	let big: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-	fs.write_file(b"big", &big).unwrap();
-	assert_eq!(fs.read_file(b"big").unwrap(), big);
-	// remount and re-read to prove the indirect block persisted.
-	let dev = fs.into_device();
-	let mut fs = LiberFs::mount(dev).unwrap();
-	assert_eq!(fs.read_file(b"big").unwrap(), big);
-	// overwriting with a smaller file frees the indirect chain and reuses the inode.
-	fs.write_file(b"big", b"small").unwrap();
-	assert_eq!(fs.read_file(b"big").unwrap(), b"small");
-}
-
-#[test]
-fn double_indirect_large_file() {
-	// a file past the direct + single-indirect range reaches the double indirect.
-	let nblocks: u64 = (DIRECT + PTRS_PER_BLOCK + 160) as u64;
-	let mut fs = LiberFs::format(SparseDevice::new(nblocks), nblocks).unwrap();
-	let blocks = DIRECT + PTRS_PER_BLOCK + 3;
-	let size = BLOCK_SIZE * blocks;
-	let big: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-	fs.write_file(b"huge", &big).unwrap();
-	assert_eq!(fs.read_file(b"huge").unwrap(), big);
-}
-
-#[test]
 fn many_files_across_multiple_inode_blocks() {
 	// a volume large enough for far more than one inode block's worth of files.
 	let nblocks: u64 = 400;
@@ -498,11 +468,12 @@ fn a_flipped_byte_is_caught_on_read() {
 }
 
 #[test]
-fn a_flipped_byte_in_an_indirect_file_is_caught() {
-	// a file that reaches the single indirect block: its data CRCs live in that block.
+fn a_flipped_byte_in_an_extent_file_is_caught() {
+	// a multi-block file keeps a per-block CRC32C in its extent's checksum block;
+	// flipping a data byte far into the run is still caught on read.
 	let nblocks: u64 = 128;
 	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
-	let size = BLOCK_SIZE * (DIRECT + 3);
+	let size = BLOCK_SIZE * 6;
 	let marker = b"a needle near the end";
 	let mut big: Vec<u8> = vec![b'.'; size];
 	let at = size - 64;
@@ -605,22 +576,6 @@ fn a_freshly_formatted_volume_has_no_snapshot() {
 // M53: 64-bit addressing, large files and long names.
 
 #[test]
-fn triple_indirect_large_file() {
-	// a sparse write far past the double-indirect range reaches the triple indirect.
-	// only the touched blocks are allocated, so a small device holds the huge offset.
-	let nblocks: u64 = 256;
-	let mut fs = LiberFs::format(SparseDevice::new(nblocks), nblocks).unwrap();
-	let triple = (DIRECT + PTRS_PER_BLOCK + PTRS_PER_BLOCK * PTRS_PER_BLOCK) as u64;
-	let off = triple * BLOCK_SIZE as u64 + 100;
-	fs.write_at(b"deep", off, b"triple").unwrap();
-	assert_eq!(fs.read_at(b"deep", off, 6).unwrap(), b"triple");
-	// remount to prove the triple-indirect chain persisted.
-	let dev = fs.into_device();
-	let mut fs = LiberFs::mount(dev).unwrap();
-	assert_eq!(fs.read_at(b"deep", off, 6).unwrap(), b"triple");
-}
-
-#[test]
 fn a_long_name_round_trips() {
 	// a 255-byte name fills the whole dentry name field with no terminator.
 	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
@@ -639,18 +594,7 @@ fn rejects_unportable_name_characters() {
 	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	// the portable-name policy rejects the Windows-reserved punctuation and control
 	// bytes, on top of the path separator and NUL the parser already forbids.
-	let bad: [&[u8]; 10] = [
-		b"a\\b",
-		b"a:b",
-		b"a*b",
-		b"a?b",
-		b"a<b",
-		b"a>b",
-		b"a|b",
-		b"a\"b",
-		b"a\x01b",
-		b"a\x7fb",
-	];
+	let bad: [&[u8]; 10] = [b"a\\b", b"a:b", b"a*b", b"a?b", b"a<b", b"a>b", b"a|b", b"a\"b", b"a\x01b", b"a\x7fb"];
 	for name in bad {
 		assert_eq!(fs.write_file(name, b"x"), Err(FsError::Invalid));
 	}
@@ -658,4 +602,50 @@ fn rejects_unportable_name_characters() {
 	let ok = "resume v2 (final).txt".as_bytes();
 	fs.write_file(ok, b"ok").unwrap();
 	assert_eq!(fs.read_file(ok).unwrap(), b"ok");
+}
+
+// M54: extents and sparse files.
+
+#[test]
+fn large_contiguous_file_uses_few_extents() {
+	// a big file written in one shot lands in a contiguous run of data blocks, so the
+	// whole thing collapses into a couple of extents instead of a pointer per block.
+	let nblocks: u64 = 4096;
+	let mut fs = LiberFs::format(SparseDevice::new(nblocks), nblocks).unwrap();
+	// 1501 blocks: past one extent's 1024-block (4 MiB) checksum cap, so it needs two.
+	let size = BLOCK_SIZE * 1500 + 321;
+	let big: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+	fs.write_file(b"big", &big).unwrap();
+	assert_eq!(fs.read_file(b"big").unwrap(), big);
+	// the 1501 blocks map with two extents, not 1501 pointers.
+	let num = fs.lookup(b"big").unwrap();
+	assert_eq!(fs.read_inode(num).unwrap().extents.len(), 2);
+	// the extents persist across a remount.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(b"big").unwrap(), big);
+	// overwriting with a smaller file frees the run and reuses the inode.
+	fs.write_file(b"big", b"small").unwrap();
+	assert_eq!(fs.read_file(b"big").unwrap(), b"small");
+}
+
+#[test]
+fn sparse_file_occupies_only_written_blocks() {
+	// a file can be far larger logically than the device is physically: writing two
+	// spans far apart allocates only those blocks, never the hole between them.
+	let nblocks: u64 = 4096;
+	let mut fs = LiberFs::format(SparseDevice::new(nblocks), nblocks).unwrap();
+	fs.write_at(b"sparse", 0, b"start").unwrap();
+	// half a million blocks past the start - the gap alone dwarfs the whole device.
+	let far = 500_000u64 * BLOCK_SIZE as u64;
+	fs.write_at(b"sparse", far, b"end").unwrap();
+	// the file logically spans far past the device; had the hole been allocated, a
+	// 500k-block file could never fit a 4096-block device.
+	assert_eq!(fs.stat(b"sparse").unwrap().size, far + 3);
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_at(b"sparse", 0, 5).unwrap(), b"start");
+	assert_eq!(fs.read_at(b"sparse", far, 3).unwrap(), b"end");
+	// the hole between the two spans reads back as zeros.
+	assert_eq!(fs.read_at(b"sparse", BLOCK_SIZE as u64, 4).unwrap(), vec![0u8; 4]);
 }
