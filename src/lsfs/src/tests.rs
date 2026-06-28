@@ -494,6 +494,7 @@ fn fsck_reclaims_leaked_blocks_and_orphan_inodes() {
 	let report = fs.fsck().unwrap();
 	assert_eq!(report.reclaimed_inodes, 1);
 	assert_eq!(report.reclaimed_blocks, 1);
+	assert_eq!(report.checksum_failures, 0);
 	// the live file is untouched and the reclaimed inode is free again.
 	assert_eq!(fs.read_file(b"live").unwrap(), b"keep me");
 	assert!(!fs.is_alloc(blk));
@@ -501,5 +502,66 @@ fn fsck_reclaims_leaked_blocks_and_orphan_inodes() {
 	let again = fs.fsck().unwrap();
 	assert_eq!(again.reclaimed_inodes, 0);
 	assert_eq!(again.reclaimed_blocks, 0);
+	assert_eq!(again.checksum_failures, 0);
 }
 
+// M51: block checksums (integrity).
+
+// Flip the first byte of the given needle where it sits on disk, modelling bit rot.
+fn corrupt_bytes(dev: &mut MemDevice, needle: &[u8]) {
+	let pos = dev.blocks.windows(needle.len()).position(|w| w == needle).expect("content on disk");
+	dev.blocks[pos] ^= 0xFF;
+}
+
+#[test]
+fn a_flipped_byte_is_caught_on_read() {
+	let mut fs = Lsfs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"f", b"the quick brown fox").unwrap();
+	let mut dev = fs.into_device();
+	corrupt_bytes(&mut dev, b"the quick brown fox");
+	let mut fs = Lsfs::mount(dev).unwrap();
+	// the checksum no longer matches: a distinct error, not the corrupt bytes.
+	assert_eq!(fs.read_file(b"f"), Err(FsError::Corrupt));
+}
+
+#[test]
+fn a_flipped_byte_in_an_indirect_file_is_caught() {
+	// a file that reaches the single indirect block: its data CRCs live in that block.
+	let nblocks: u32 = 128;
+	let mut fs = Lsfs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let size = BLOCK_SIZE * (DIRECT + 3);
+	let marker = b"a needle near the end";
+	let mut big: Vec<u8> = vec![b'.'; size];
+	let at = size - 64;
+	big[at..at + marker.len()].copy_from_slice(marker);
+	fs.write_file(b"big", &big).unwrap();
+	let mut dev = fs.into_device();
+	corrupt_bytes(&mut dev, marker);
+	let mut fs = Lsfs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(b"big"), Err(FsError::Corrupt));
+}
+
+#[test]
+fn fsck_reports_a_checksum_failure() {
+	let mut fs = Lsfs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"f", b"integrity matters here").unwrap();
+	let mut dev = fs.into_device();
+	corrupt_bytes(&mut dev, b"integrity matters here");
+	let mut fs = Lsfs::mount(dev).unwrap();
+	let report = fs.fsck().unwrap();
+	assert_eq!(report.checksum_failures, 1);
+	// fsck does not silently drop the still-referenced (if corrupt) block.
+	assert_eq!(report.reclaimed_blocks, 0);
+}
+
+#[test]
+fn a_clean_file_survives_a_remount_with_checksums() {
+	let mut fs = Lsfs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let payload: Vec<u8> = (0..(BLOCK_SIZE * 2 + 17)).map(|i| (i % 251) as u8).collect();
+	fs.write_file(b"data.bin", &payload).unwrap();
+	let dev = fs.into_device();
+	let mut fs = Lsfs::mount(dev).unwrap();
+	// an untouched disk verifies cleanly: every block matches its stored checksum.
+	assert_eq!(fs.read_file(b"data.bin").unwrap(), payload);
+	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
+}

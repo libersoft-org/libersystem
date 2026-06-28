@@ -4,8 +4,10 @@
 //! superblock, a multi-block allocation bitmap, a multi-block inode table, then data
 //! blocks. Directories form a tree from the root inode; inodes carry direct block
 //! pointers plus a single and a double indirect pointer, so files and directories
-//! grow well past one inode's worth of direct blocks. It backs the `Storage.Volume`
-//! API and survives a reboot.
+//! grow well past one inode's worth of direct blocks. Every block pointer (in the
+//! inode and in the indirect blocks) is paired with a CRC32C of the block it points
+//! at, so on-disk corruption is caught when the block is read. It backs the
+//! `Storage.Volume` API and survives a reboot.
 //!
 //! All I/O goes through the [`BlockDevice`] trait (one fixed-size block at a time),
 //! so the same code drives a real virtio-blk disk in StorageService and a
@@ -24,6 +26,14 @@
 //! later [`Lsfs::fsck`] pass walks the directory tree, rebuilds the allocation bitmap
 //! from the blocks live inodes actually reference, and frees any leaked blocks and
 //! orphan inodes.
+//!
+//! ## Integrity (block checksums)
+//!
+//! Each block is checksummed with a CRC32C stored beside the pointer to it (in the
+//! inode for direct blocks, in the indirect block for the rest). The checksum is
+//! computed on write and rechecked on every read, so a flipped bit on disk surfaces
+//! as [`FsError::Corrupt`] instead of silently corrupt data; `fsck` walks every live
+//! data block and reports how many fail their checksum.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -38,23 +48,27 @@ use alloc::vec::Vec;
 pub const BLOCK_SIZE: usize = 4096;
 
 // On-disk superblock magic and format version. Mount rejects anything else (a fresh
-// or stale-format disk), so StorageService knows to reformat. Version 2 adds nested
+// or stale-format disk), so StorageService knows to reformat. Version 2 added nested
 // directories, a multi-block inode table and bitmap, indirect blocks, and per-inode
-// timestamps.
+// timestamps; version 3 pairs every block pointer with a CRC32C of the block it points
+// at (in the inode and in the indirect blocks) for on-read integrity checking.
 const MAGIC: [u8; 8] = *b"LSFS0001";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 // One inode is a fixed 256-byte slot: a kind byte, a size, two timestamps, a single
-// and a double indirect pointer, then DIRECT direct block pointers. 16 inodes fit one
-// block.
+// and a double indirect pointer, then DIRECT (block pointer, block CRC32C) entries. 16
+// inodes fit one block.
 const INODE_SIZE: usize = 256;
 const INODES_PER_BLOCK: usize = BLOCK_SIZE / INODE_SIZE;
-// (256 - 40) / 4 = 54 direct pointers; a file's first 54 blocks (216 KiB) need no
+// A block reference is a (u32 block pointer, u32 CRC32C) pair: 8 bytes. The CRC covers
+// the referenced block, so a flipped bit on disk is caught when the block is read.
+const ENTRY_SIZE: usize = 8;
+// (256 - 40) / 8 = 27 direct entries; a file's first 27 blocks (108 KiB) need no
 // indirection. Beyond that the single indirect block adds PTRS_PER_BLOCK more and the
 // double indirect block PTRS_PER_BLOCK^2 more.
-const DIRECT: usize = (INODE_SIZE - 40) / 4;
-// Block pointers (u32) that fit one indirect block.
-const PTRS_PER_BLOCK: usize = BLOCK_SIZE / 4;
+const DIRECT: usize = (INODE_SIZE - 40) / ENTRY_SIZE;
+// Block references (pointer + CRC) that fit one indirect block.
+const PTRS_PER_BLOCK: usize = BLOCK_SIZE / ENTRY_SIZE;
 
 // Inode kinds. 0 is also the "free" marker, so a freed inode reads back as Free.
 const KIND_FREE: u8 = 0;
@@ -75,6 +89,36 @@ const DENTRY_SIZE: usize = 32;
 const NAME_MAX: usize = DENTRY_SIZE - 4;
 const DENTRIES_PER_BLOCK: usize = BLOCK_SIZE / DENTRY_SIZE;
 
+// CRC32C (Castagnoli) lookup table, built at compile time. Each block's checksum is a
+// CRC32C of its bytes, stored next to the pointer to it; the reflected polynomial is
+// 0x82F63B78.
+const CRC32C_TABLE: [u32; 256] = {
+	let mut table = [0u32; 256];
+	let mut i = 0;
+	while i < 256 {
+		let mut crc = i as u32;
+		let mut j = 0;
+		while j < 8 {
+			let mask = (crc & 1).wrapping_neg();
+			crc = (crc >> 1) ^ (0x82F6_3B78 & mask);
+			j += 1;
+		}
+		table[i] = crc;
+		i += 1;
+	}
+	table
+};
+
+// CRC32C of a block's bytes: computed on write, stored beside the pointer, and rechecked
+// on read so a flipped bit on disk surfaces as `FsError::Corrupt` rather than bad data.
+fn crc32c(data: &[u8]) -> u32 {
+	let mut crc = 0xFFFF_FFFFu32;
+	for &b in data {
+		crc = (crc >> 8) ^ CRC32C_TABLE[((crc ^ b as u32) & 0xFF) as usize];
+	}
+	!crc
+}
+
 // A filesystem error. The variants map onto the `Storage.Volume` `error` enum at the
 // service boundary (NotFound -> not-found, NoSpace -> again, the rest -> invalid).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +127,9 @@ pub enum FsError {
 	NoSpace,
 	TooLong,
 	Invalid,
+	// A block read back with a CRC32C that did not match the one stored beside its
+	// pointer: on-disk corruption, surfaced instead of returning the bad bytes.
+	Corrupt,
 	Io,
 }
 
@@ -98,11 +145,13 @@ pub struct Stat {
 
 // What an [`Lsfs::fsck`] pass reclaimed: blocks that the bitmap marked allocated but
 // no live inode referenced, and inodes that were allocated but named by no directory
-// (orphans left by a crash mid-write).
+// (orphans left by a crash mid-write); plus how many live data blocks failed their
+// checksum (on-disk corruption found while walking the tree).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsckReport {
 	pub reclaimed_blocks: u32,
 	pub reclaimed_inodes: u32,
+	pub checksum_failures: u32,
 }
 
 // A fixed-size block device: the whole filesystem is read and written one
@@ -139,21 +188,25 @@ struct Inode {
 	mtime: u64,
 	indirect: u32,
 	dindirect: u32,
+	// Direct block pointers and, beside each, the CRC32C of the block it points at.
 	direct: [u32; DIRECT],
+	direct_crc: [u32; DIRECT],
 }
 
 impl Inode {
 	fn empty(kind: u8) -> Inode {
-		Inode { kind, size: 0, ctime: 0, mtime: 0, indirect: 0, dindirect: 0, direct: [0u32; DIRECT] }
+		Inode { kind, size: 0, ctime: 0, mtime: 0, indirect: 0, dindirect: 0, direct: [0u32; DIRECT], direct_crc: [0u32; DIRECT] }
 	}
 
 	fn parse(buf: &[u8]) -> Inode {
 		let mut direct = [0u32; DIRECT];
-		for (i, slot) in direct.iter_mut().enumerate() {
-			let off = 40 + i * 4;
-			*slot = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+		let mut direct_crc = [0u32; DIRECT];
+		for i in 0..DIRECT {
+			let off = 40 + i * ENTRY_SIZE;
+			direct[i] = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+			direct_crc[i] = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
 		}
-		Inode { kind: buf[0], size: u64::from_le_bytes(buf[8..16].try_into().unwrap()), ctime: u64::from_le_bytes(buf[16..24].try_into().unwrap()), mtime: u64::from_le_bytes(buf[24..32].try_into().unwrap()), indirect: u32::from_le_bytes(buf[32..36].try_into().unwrap()), dindirect: u32::from_le_bytes(buf[36..40].try_into().unwrap()), direct }
+		Inode { kind: buf[0], size: u64::from_le_bytes(buf[8..16].try_into().unwrap()), ctime: u64::from_le_bytes(buf[16..24].try_into().unwrap()), mtime: u64::from_le_bytes(buf[24..32].try_into().unwrap()), indirect: u32::from_le_bytes(buf[32..36].try_into().unwrap()), dindirect: u32::from_le_bytes(buf[36..40].try_into().unwrap()), direct, direct_crc }
 	}
 
 	fn write(&self, buf: &mut [u8]) {
@@ -166,9 +219,10 @@ impl Inode {
 		buf[24..32].copy_from_slice(&self.mtime.to_le_bytes());
 		buf[32..36].copy_from_slice(&self.indirect.to_le_bytes());
 		buf[36..40].copy_from_slice(&self.dindirect.to_le_bytes());
-		for (i, &b) in self.direct.iter().enumerate() {
-			let off = 40 + i * 4;
-			buf[off..off + 4].copy_from_slice(&b.to_le_bytes());
+		for i in 0..DIRECT {
+			let off = 40 + i * ENTRY_SIZE;
+			buf[off..off + 4].copy_from_slice(&self.direct[i].to_le_bytes());
+			buf[off + 4..off + 8].copy_from_slice(&self.direct_crc[i].to_le_bytes());
 		}
 	}
 
@@ -293,17 +347,11 @@ impl<D: BlockDevice> Lsfs<D> {
 		let mut block = vec![0u8; BLOCK_SIZE];
 		let mut remaining = inode.size as usize;
 		for i in 0..inode.nblocks() {
-			match self.block_map_read(&inode, i)? {
-				Some(phys) => {
-					if !self.dev.read_block(phys, &mut block) {
-						return Err(FsError::Io);
-					}
-				}
-				None => {
-					// a hole (a sparse gap left by a write past the end): reads as zeros.
-					for b in block.iter_mut() {
-						*b = 0;
-					}
+			// a hole (a sparse gap left by a write past the end) reads back as zeros;
+			// a mapped block is verified against its stored checksum.
+			if !self.read_logical(&inode, i, &mut block)? {
+				for b in block.iter_mut() {
+					*b = 0;
 				}
 			}
 			let take = remaining.min(BLOCK_SIZE);
@@ -371,16 +419,13 @@ impl<D: BlockDevice> Lsfs<D> {
 		inode.mtime = self.clock;
 		let mut block = vec![0u8; BLOCK_SIZE];
 		for i in 0..inode.nblocks() {
-			let phys = self.block_map_alloc(&mut inode, i)?;
 			let start = i * BLOCK_SIZE;
 			let end = (start + BLOCK_SIZE).min(data.len());
 			for b in block.iter_mut() {
 				*b = 0;
 			}
 			block[..end - start].copy_from_slice(&data[start..end]);
-			if !self.dev.write_block(phys, &block) {
-				return Err(FsError::Io);
-			}
+			self.write_logical(&mut inode, i, &block)?;
 		}
 
 		// point the inode at the new blocks, then name it (new files only).
@@ -400,24 +445,14 @@ impl<D: BlockDevice> Lsfs<D> {
 	// first, so a crash leaves at worst an orphaned inode, never a dangling name.
 	pub fn remove(&mut self, path: &[u8]) -> Result<(), FsError> {
 		let (parent, name) = self.resolve_parent(path, false)?;
-		let (inode_num, dir_block, slot) = self.dir_find_in(parent, name).ok_or(FsError::NotFound)?;
+		let inode_num = self.dir_find_in(parent, name).ok_or(FsError::NotFound)?.0;
 		let inode = self.read_inode(inode_num)?;
 		if inode.kind == KIND_DIR && !self.read_dir_inode(inode_num)?.is_empty() {
 			return Err(FsError::Invalid);
 		}
 
 		// 1. clear the directory entry.
-		let mut block = vec![0u8; BLOCK_SIZE];
-		if !self.dev.read_block(dir_block, &mut block) {
-			return Err(FsError::Io);
-		}
-		for b in block[slot..slot + DENTRY_SIZE].iter_mut() {
-			*b = 0;
-		}
-		if !self.dev.write_block(dir_block, &block) {
-			return Err(FsError::Io);
-		}
-
+		self.dir_clear(parent, name)?;
 		// 2. free the inode, then 3. free its blocks.
 		self.write_inode(inode_num, &Inode::empty(KIND_FREE))?;
 		self.free_blocks(&inode)?;
@@ -465,16 +500,9 @@ impl<D: BlockDevice> Lsfs<D> {
 		let last = ((end - 1) / BLOCK_SIZE as u64) as usize;
 		for lb in first..=last {
 			let block_start = lb as u64 * BLOCK_SIZE as u64;
-			match self.block_map_read(&inode, lb)? {
-				Some(phys) => {
-					if !self.dev.read_block(phys, &mut buf) {
-						return Err(FsError::Io);
-					}
-				}
-				None => {
-					for b in buf.iter_mut() {
-						*b = 0;
-					}
+			if !self.read_logical(&inode, lb, &mut buf)? {
+				for b in buf.iter_mut() {
+					*b = 0;
 				}
 			}
 			let copy_start = offset.max(block_start);
@@ -515,15 +543,11 @@ impl<D: BlockDevice> Lsfs<D> {
 			let last = ((end - 1) / BLOCK_SIZE as u64) as usize;
 			let mut buf = vec![0u8; BLOCK_SIZE];
 			for lb in first..=last {
-				let phys = self.block_map_alloc(&mut inode, lb)?;
 				let block_start = lb as u64 * BLOCK_SIZE as u64;
 				let full = start <= block_start && end >= block_start + BLOCK_SIZE as u64;
-				if !full && block_start < inode.size {
-					// a partial write over existing data: keep what is already there.
-					if !self.dev.read_block(phys, &mut buf) {
-						return Err(FsError::Io);
-					}
-				} else {
+				// a full-block overwrite needs no read; a partial one preserves whatever
+				// is there (zeros for a hole or a block past the old end).
+				if full || !self.read_logical(&inode, lb, &mut buf)? {
 					for b in buf.iter_mut() {
 						*b = 0;
 					}
@@ -534,9 +558,7 @@ impl<D: BlockDevice> Lsfs<D> {
 				let data_off = (copy_start - start) as usize;
 				let n = (copy_end - copy_start) as usize;
 				buf[buf_off..buf_off + n].copy_from_slice(&data[data_off..data_off + n]);
-				if !self.dev.write_block(phys, &buf) {
-					return Err(FsError::Io);
-				}
+				self.write_logical(&mut inode, lb, &buf)?;
 			}
 			if end > inode.size {
 				inode.size = end;
@@ -574,17 +596,13 @@ impl<D: BlockDevice> Lsfs<D> {
 			let tail = (new_len % BLOCK_SIZE as u64) as usize;
 			if tail != 0 {
 				let lb = (new_len / BLOCK_SIZE as u64) as usize;
-				if let Some(phys) = self.block_map_read(&inode, lb)? {
-					let mut buf = vec![0u8; BLOCK_SIZE];
-					if !self.dev.read_block(phys, &mut buf) {
-						return Err(FsError::Io);
-					}
+				let mut buf = vec![0u8; BLOCK_SIZE];
+				if self.read_logical(&inode, lb, &mut buf)? {
 					for b in buf[tail..].iter_mut() {
 						*b = 0;
 					}
-					if !self.dev.write_block(phys, &buf) {
-						return Err(FsError::Io);
-					}
+					// rewriting the block refreshes its stored checksum too.
+					self.write_logical(&mut inode, lb, &buf)?;
 				}
 			}
 		}
@@ -649,14 +667,17 @@ impl<D: BlockDevice> Lsfs<D> {
 		reachable.insert(self.sb.root_inode);
 		self.gather_reachable(self.sb.root_inode, &mut reachable)?;
 
-		// 2. a fresh bitmap: the metadata blocks plus the blocks of reachable inodes.
+		// 2. a fresh bitmap: the metadata blocks plus the blocks of reachable inodes,
+		// while checking every live data block against its stored checksum.
 		let mut rebuilt = vec![0u8; self.bitmap.len()];
 		for b in 0..self.sb.data_start {
 			set_bit(&mut rebuilt, b);
 		}
+		let mut checksum_failures = 0;
 		for &num in &reachable {
 			let inode = self.read_inode(num)?;
 			self.collect_inode_blocks(&inode, &mut rebuilt)?;
+			checksum_failures += self.count_corrupt(&inode)?;
 		}
 
 		// 3. reclaim orphan inodes (allocated but named by no directory).
@@ -673,10 +694,10 @@ impl<D: BlockDevice> Lsfs<D> {
 		let after = self.count_alloc(&rebuilt);
 		self.bitmap = rebuilt;
 		self.flush_bitmap()?;
-		Ok(FsckReport { reclaimed_blocks: before - after, reclaimed_inodes })
+		Ok(FsckReport { reclaimed_blocks: before - after, reclaimed_inodes, checksum_failures })
 	}
 
-
+	// inode I/O
 
 	fn inode_location(&self, num: u32) -> (u32, usize) {
 		let block = self.sb.inode_start + num / INODES_PER_BLOCK as u32;
@@ -788,24 +809,27 @@ impl<D: BlockDevice> Lsfs<D> {
 		Ok(block)
 	}
 
-	// block pointers (one u32 slot inside an indirect block)
+	// block references: a (pointer, CRC32C) pair at index `idx` in an indirect block
 
-	fn read_ptr(&mut self, block: u32, idx: usize) -> Result<u32, FsError> {
+	fn read_entry(&mut self, block: u32, idx: usize) -> Result<(u32, u32), FsError> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		if !self.dev.read_block(block, &mut buf) {
 			return Err(FsError::Io);
 		}
-		let off = idx * 4;
-		Ok(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()))
+		let off = idx * ENTRY_SIZE;
+		let ptr = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+		let crc = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+		Ok((ptr, crc))
 	}
 
-	fn write_ptr(&mut self, block: u32, idx: usize, val: u32) -> Result<(), FsError> {
+	fn write_entry_at(&mut self, block: u32, idx: usize, ptr: u32, crc: u32) -> Result<(), FsError> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		if !self.dev.read_block(block, &mut buf) {
 			return Err(FsError::Io);
 		}
-		let off = idx * 4;
-		buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+		let off = idx * ENTRY_SIZE;
+		buf[off..off + 4].copy_from_slice(&ptr.to_le_bytes());
+		buf[off + 4..off + 8].copy_from_slice(&crc.to_le_bytes());
 		if !self.dev.write_block(block, &buf) {
 			return Err(FsError::Io);
 		}
@@ -814,18 +838,19 @@ impl<D: BlockDevice> Lsfs<D> {
 
 	// file block mapping (direct -> single indirect -> double indirect)
 
-	// Resolve logical block `logical` of `inode` to its physical block, or None if it
-	// is not mapped.
-	fn block_map_read(&mut self, inode: &Inode, logical: usize) -> Result<Option<u32>, FsError> {
+	// Resolve logical block `logical` of `inode` to (physical block, stored CRC32C), or
+	// None if it is not mapped (a hole).
+	fn map_for_read(&mut self, inode: &Inode, logical: usize) -> Result<Option<(u32, u32)>, FsError> {
 		if logical < DIRECT {
-			return Ok(nonzero(inode.direct[logical]));
+			return Ok(nonzero(inode.direct[logical]).map(|p| (p, inode.direct_crc[logical])));
 		}
 		let l = logical - DIRECT;
 		if l < PTRS_PER_BLOCK {
 			if inode.indirect == 0 {
 				return Ok(None);
 			}
-			return Ok(nonzero(self.read_ptr(inode.indirect, l)?));
+			let (ptr, crc) = self.read_entry(inode.indirect, l)?;
+			return Ok(nonzero(ptr).map(|p| (p, crc)));
 		}
 		let d = l - PTRS_PER_BLOCK;
 		let first = d / PTRS_PER_BLOCK;
@@ -836,21 +861,24 @@ impl<D: BlockDevice> Lsfs<D> {
 		if inode.dindirect == 0 {
 			return Ok(None);
 		}
-		let mid = self.read_ptr(inode.dindirect, first)?;
+		let (mid, _) = self.read_entry(inode.dindirect, first)?;
 		if mid == 0 {
 			return Ok(None);
 		}
-		Ok(nonzero(self.read_ptr(mid, second)?))
+		let (ptr, crc) = self.read_entry(mid, second)?;
+		Ok(nonzero(ptr).map(|p| (p, crc)))
 	}
 
 	// Ensure logical block `logical` of `inode` is mapped, allocating the data block
-	// (and any indirect blocks on the way) if needed; return its physical block.
-	// Updates `inode`'s pointers in memory - the caller persists the inode.
-	fn block_map_alloc(&mut self, inode: &mut Inode, logical: usize) -> Result<u32, FsError> {
+	// (and any indirect blocks on the way) if needed, and record `crc` beside its
+	// pointer. Returns the physical block. Updates `inode`'s pointers in memory - the
+	// caller persists the inode.
+	fn map_for_write(&mut self, inode: &mut Inode, logical: usize, crc: u32) -> Result<u32, FsError> {
 		if logical < DIRECT {
 			if inode.direct[logical] == 0 {
 				inode.direct[logical] = self.alloc_one()?;
 			}
+			inode.direct_crc[logical] = crc;
 			return Ok(inode.direct[logical]);
 		}
 		let l = logical - DIRECT;
@@ -858,11 +886,11 @@ impl<D: BlockDevice> Lsfs<D> {
 			if inode.indirect == 0 {
 				inode.indirect = self.alloc_zeroed()?;
 			}
-			let mut data = self.read_ptr(inode.indirect, l)?;
+			let (mut data, _) = self.read_entry(inode.indirect, l)?;
 			if data == 0 {
 				data = self.alloc_one()?;
-				self.write_ptr(inode.indirect, l, data)?;
 			}
+			self.write_entry_at(inode.indirect, l, data, crc)?;
 			return Ok(data);
 		}
 		let d = l - PTRS_PER_BLOCK;
@@ -874,17 +902,65 @@ impl<D: BlockDevice> Lsfs<D> {
 		if inode.dindirect == 0 {
 			inode.dindirect = self.alloc_zeroed()?;
 		}
-		let mut mid = self.read_ptr(inode.dindirect, first)?;
+		let (mut mid, _) = self.read_entry(inode.dindirect, first)?;
 		if mid == 0 {
 			mid = self.alloc_zeroed()?;
-			self.write_ptr(inode.dindirect, first, mid)?;
+			// the double indirect points at a mid block, not data: no data CRC here.
+			self.write_entry_at(inode.dindirect, first, mid, 0)?;
 		}
-		let mut data = self.read_ptr(mid, second)?;
+		let (mut data, _) = self.read_entry(mid, second)?;
 		if data == 0 {
 			data = self.alloc_one()?;
-			self.write_ptr(mid, second, data)?;
 		}
+		self.write_entry_at(mid, second, data, crc)?;
 		Ok(data)
+	}
+
+	// Read logical block `logical` of `inode` into `buf`, verifying its stored
+	// checksum. Returns false (and leaves `buf` untouched) for a hole; a mismatch is
+	// `FsError::Corrupt`.
+	fn read_logical(&mut self, inode: &Inode, logical: usize, buf: &mut [u8]) -> Result<bool, FsError> {
+		match self.map_for_read(inode, logical)? {
+			Some((phys, crc)) => {
+				if !self.dev.read_block(phys, buf) {
+					return Err(FsError::Io);
+				}
+				if crc32c(buf) != crc {
+					return Err(FsError::Corrupt);
+				}
+				Ok(true)
+			}
+			None => Ok(false),
+		}
+	}
+
+	// Write `buf` as logical block `logical` of `inode`, allocating the block if needed
+	// and recording its checksum. Updates `inode` in memory - the caller persists it.
+	fn write_logical(&mut self, inode: &mut Inode, logical: usize, buf: &[u8]) -> Result<(), FsError> {
+		let crc = crc32c(buf);
+		let phys = self.map_for_write(inode, logical, crc)?;
+		if !self.dev.write_block(phys, buf) {
+			return Err(FsError::Io);
+		}
+		Ok(())
+	}
+
+	// Count the live data blocks of `inode` whose on-disk bytes no longer match the
+	// checksum stored beside their pointer.
+	fn count_corrupt(&mut self, inode: &Inode) -> Result<u32, FsError> {
+		let mut bad = 0;
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		for lb in 0..inode.nblocks() {
+			if let Some((phys, crc)) = self.map_for_read(inode, lb)? {
+				if !self.dev.read_block(phys, &mut buf) {
+					return Err(FsError::Io);
+				}
+				if crc32c(&buf) != crc {
+					bad += 1;
+				}
+			}
+		}
+		Ok(bad)
 	}
 
 	// Free every block an inode references - its data blocks and the indirect blocks
@@ -897,7 +973,7 @@ impl<D: BlockDevice> Lsfs<D> {
 		}
 		if inode.indirect != 0 {
 			for idx in 0..PTRS_PER_BLOCK {
-				let p = self.read_ptr(inode.indirect, idx)?;
+				let (p, _) = self.read_entry(inode.indirect, idx)?;
 				if p != 0 {
 					self.mark(p, false);
 				}
@@ -906,12 +982,12 @@ impl<D: BlockDevice> Lsfs<D> {
 		}
 		if inode.dindirect != 0 {
 			for first in 0..PTRS_PER_BLOCK {
-				let mid = self.read_ptr(inode.dindirect, first)?;
+				let (mid, _) = self.read_entry(inode.dindirect, first)?;
 				if mid == 0 {
 					continue;
 				}
 				for second in 0..PTRS_PER_BLOCK {
-					let p = self.read_ptr(mid, second)?;
+					let (p, _) = self.read_entry(mid, second)?;
 					if p != 0 {
 						self.mark(p, false);
 					}
@@ -978,15 +1054,14 @@ impl<D: BlockDevice> Lsfs<D> {
 
 	// directory operations (on any directory inode)
 
-	// Scan directory `dir_num` for `name`, returning (child inode, the physical
+	// Scan directory `dir_num` for `name`, returning (child inode, the logical
 	// directory block holding the entry, the entry's byte offset in that block).
-	fn dir_find_in(&mut self, dir_num: u32, name: &[u8]) -> Option<(u32, u32, usize)> {
+	fn dir_find_in(&mut self, dir_num: u32, name: &[u8]) -> Option<(u32, usize, usize)> {
 		let dir = self.read_inode(dir_num).ok()?;
 		let mut block = vec![0u8; BLOCK_SIZE];
 		for i in 0..dir.nblocks() {
-			let phys = self.block_map_read(&dir, i).ok()??;
-			if !self.dev.read_block(phys, &mut block) {
-				return None;
+			if !self.read_logical(&dir, i, &mut block).ok()? {
+				continue;
 			}
 			for slot in 0..DENTRIES_PER_BLOCK {
 				let off = slot * DENTRY_SIZE;
@@ -995,7 +1070,7 @@ impl<D: BlockDevice> Lsfs<D> {
 				}
 				if entry_name(&block[off..off + DENTRY_SIZE]) == name {
 					let inode = u32::from_le_bytes(block[off + NAME_MAX..off + NAME_MAX + 4].try_into().ok()?);
-					return Some((inode, phys, off));
+					return Some((inode, i, off));
 				}
 			}
 		}
@@ -1008,9 +1083,8 @@ impl<D: BlockDevice> Lsfs<D> {
 		let mut out = Vec::new();
 		let mut block = vec![0u8; BLOCK_SIZE];
 		for i in 0..dir.nblocks() {
-			let phys = self.block_map_read(&dir, i)?.ok_or(FsError::Io)?;
-			if !self.dev.read_block(phys, &mut block) {
-				return Err(FsError::Io);
+			if !self.read_logical(&dir, i, &mut block)? {
+				continue;
 			}
 			for slot in 0..DENTRIES_PER_BLOCK {
 				let off = slot * DENTRY_SIZE;
@@ -1042,17 +1116,16 @@ impl<D: BlockDevice> Lsfs<D> {
 
 		// reuse a free slot in an existing directory block.
 		for i in 0..dir.nblocks() {
-			let phys = self.block_map_read(&dir, i)?.ok_or(FsError::Io)?;
-			if !self.dev.read_block(phys, &mut block) {
+			if !self.read_logical(&dir, i, &mut block)? {
 				return Err(FsError::Io);
 			}
 			for slot in 0..DENTRIES_PER_BLOCK {
 				let off = slot * DENTRY_SIZE;
 				if block[off] == 0 {
 					write_entry(&mut block[off..off + DENTRY_SIZE], name, child);
-					if !self.dev.write_block(phys, &block) {
-						return Err(FsError::Io);
-					}
+					self.write_logical(&mut dir, i, &block)?;
+					dir.mtime = self.clock;
+					self.write_inode(dir_num, &dir)?;
 					return Ok(());
 				}
 			}
@@ -1060,14 +1133,11 @@ impl<D: BlockDevice> Lsfs<D> {
 
 		// no room: grow the directory by one block.
 		let logical = dir.nblocks();
-		let phys = self.block_map_alloc(&mut dir, logical)?;
 		for b in block.iter_mut() {
 			*b = 0;
 		}
 		write_entry(&mut block[0..DENTRY_SIZE], name, child);
-		if !self.dev.write_block(phys, &block) {
-			return Err(FsError::Io);
-		}
+		self.write_logical(&mut dir, logical, &block)?;
 		dir.size += BLOCK_SIZE as u64;
 		dir.mtime = self.clock;
 		self.write_inode(dir_num, &dir)?;
@@ -1077,15 +1147,13 @@ impl<D: BlockDevice> Lsfs<D> {
 	// Point an existing entry `name` in directory `dir_num` at `child`, or add it if it
 	// is not there yet.
 	fn dir_set(&mut self, dir_num: u32, name: &[u8], child: u32) -> Result<(), FsError> {
-		if let Some((_, phys, off)) = self.dir_find_in(dir_num, name) {
+		if let Some((_, logical, off)) = self.dir_find_in(dir_num, name) {
+			let mut dir = self.read_inode(dir_num)?;
 			let mut block = vec![0u8; BLOCK_SIZE];
-			if !self.dev.read_block(phys, &mut block) {
-				return Err(FsError::Io);
-			}
+			self.read_logical(&dir, logical, &mut block)?;
 			block[off + NAME_MAX..off + NAME_MAX + 4].copy_from_slice(&child.to_le_bytes());
-			if !self.dev.write_block(phys, &block) {
-				return Err(FsError::Io);
-			}
+			self.write_logical(&mut dir, logical, &block)?;
+			self.write_inode(dir_num, &dir)?;
 			return Ok(());
 		}
 		self.dir_add(dir_num, name, child)
@@ -1093,17 +1161,15 @@ impl<D: BlockDevice> Lsfs<D> {
 
 	// Clear entry `name` from directory `dir_num` (leaving a free slot).
 	fn dir_clear(&mut self, dir_num: u32, name: &[u8]) -> Result<(), FsError> {
-		let (_, phys, off) = self.dir_find_in(dir_num, name).ok_or(FsError::NotFound)?;
+		let (_, logical, off) = self.dir_find_in(dir_num, name).ok_or(FsError::NotFound)?;
+		let mut dir = self.read_inode(dir_num)?;
 		let mut block = vec![0u8; BLOCK_SIZE];
-		if !self.dev.read_block(phys, &mut block) {
-			return Err(FsError::Io);
-		}
+		self.read_logical(&dir, logical, &mut block)?;
 		for b in block[off..off + DENTRY_SIZE].iter_mut() {
 			*b = 0;
 		}
-		if !self.dev.write_block(phys, &block) {
-			return Err(FsError::Io);
-		}
+		self.write_logical(&mut dir, logical, &block)?;
+		self.write_inode(dir_num, &dir)?;
 		Ok(())
 	}
 
@@ -1136,7 +1202,7 @@ impl<D: BlockDevice> Lsfs<D> {
 		}
 		if keep <= DIRECT + PTRS_PER_BLOCK && inode.dindirect != 0 {
 			for first in 0..PTRS_PER_BLOCK {
-				let mid = self.read_ptr(inode.dindirect, first)?;
+				let (mid, _) = self.read_entry(inode.dindirect, first)?;
 				if mid != 0 {
 					self.mark(mid, false);
 				}
@@ -1154,16 +1220,17 @@ impl<D: BlockDevice> Lsfs<D> {
 			if inode.direct[lb] != 0 {
 				self.mark(inode.direct[lb], false);
 				inode.direct[lb] = 0;
+				inode.direct_crc[lb] = 0;
 			}
 			return Ok(());
 		}
 		let l = lb - DIRECT;
 		if l < PTRS_PER_BLOCK {
 			if inode.indirect != 0 {
-				let p = self.read_ptr(inode.indirect, l)?;
+				let (p, _) = self.read_entry(inode.indirect, l)?;
 				if p != 0 {
 					self.mark(p, false);
-					self.write_ptr(inode.indirect, l, 0)?;
+					self.write_entry_at(inode.indirect, l, 0, 0)?;
 				}
 			}
 			return Ok(());
@@ -1172,12 +1239,12 @@ impl<D: BlockDevice> Lsfs<D> {
 		let first = d / PTRS_PER_BLOCK;
 		let second = d % PTRS_PER_BLOCK;
 		if inode.dindirect != 0 {
-			let mid = self.read_ptr(inode.dindirect, first)?;
+			let (mid, _) = self.read_entry(inode.dindirect, first)?;
 			if mid != 0 {
-				let p = self.read_ptr(mid, second)?;
+				let (p, _) = self.read_entry(mid, second)?;
 				if p != 0 {
 					self.mark(p, false);
-					self.write_ptr(mid, second, 0)?;
+					self.write_entry_at(mid, second, 0, 0)?;
 				}
 			}
 		}
@@ -1205,7 +1272,7 @@ impl<D: BlockDevice> Lsfs<D> {
 		if inode.indirect != 0 {
 			set_bit(bitmap, inode.indirect);
 			for idx in 0..PTRS_PER_BLOCK {
-				let p = self.read_ptr(inode.indirect, idx)?;
+				let (p, _) = self.read_entry(inode.indirect, idx)?;
 				if p != 0 {
 					set_bit(bitmap, p);
 				}
@@ -1214,13 +1281,13 @@ impl<D: BlockDevice> Lsfs<D> {
 		if inode.dindirect != 0 {
 			set_bit(bitmap, inode.dindirect);
 			for first in 0..PTRS_PER_BLOCK {
-				let mid = self.read_ptr(inode.dindirect, first)?;
+				let (mid, _) = self.read_entry(inode.dindirect, first)?;
 				if mid == 0 {
 					continue;
 				}
 				set_bit(bitmap, mid);
 				for second in 0..PTRS_PER_BLOCK {
-					let p = self.read_ptr(mid, second)?;
+					let (p, _) = self.read_entry(mid, second)?;
 					if p != 0 {
 						set_bit(bitmap, p);
 					}

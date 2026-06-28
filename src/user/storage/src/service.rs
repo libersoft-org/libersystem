@@ -191,6 +191,8 @@ fn map_fs_err(e: FsError) -> Error {
 		FsError::NotFound => Error::NotFound,
 		FsError::NoSpace => Error::Again,
 		FsError::TooLong | FsError::Invalid => Error::Invalid,
+		// on-disk corruption caught by a block checksum: the data cannot be trusted.
+		FsError::Corrupt => Error::Invalid,
 		FsError::Io => Error::Again,
 	}
 }
