@@ -7,7 +7,9 @@ use super::*;
 
 // A RAM-backed block device: one contiguous Vec of `num_blocks` blocks. Dropping and
 // re-mounting from the same Vec models a reboot (the bytes persist, the in-memory
-// filesystem state does not).
+// filesystem state does not). Cloning models taking the same disk image two ways - a
+// clean mount versus one of a crash-damaged copy.
+#[derive(Clone)]
 struct MemDevice {
 	blocks: Vec<u8>,
 }
@@ -298,9 +300,9 @@ fn many_files_across_multiple_inode_blocks() {
 }
 
 #[test]
-fn multi_block_bitmap_large_volume() {
-	// past 32768 blocks the bitmap needs more than one block; a sparse device lets us
-	// format such a volume without allocating it whole.
+fn a_large_volume_formats_and_round_trips() {
+	// the free map is derived, so it scales to a large volume for free; a sparse device
+	// lets us format such a volume without allocating it whole.
 	let nblocks: u32 = 40_000;
 	let mut fs = Lsfs::format(SparseDevice::new(nblocks), nblocks).unwrap();
 	fs.write_file(b"f", b"on a big volume").unwrap();
@@ -476,35 +478,6 @@ fn rename_rejects_overwriting_a_nonempty_directory() {
 	assert_eq!(fs.rename(b"src", b"dst"), Err(FsError::Invalid));
 }
 
-// M50: fsck / orphan reclamation.
-
-#[test]
-fn fsck_reclaims_leaked_blocks_and_orphan_inodes() {
-	let mut fs = Lsfs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
-	fs.write_file(b"live", b"keep me").unwrap();
-	// simulate a crash mid-write: an inode and a data block are claimed but never
-	// linked into any directory. We forge that state through the test-visible internals.
-	let orphan = fs.alloc_inode().unwrap();
-	let mut leaked = Inode::empty(KIND_FILE);
-	let blk = fs.alloc_one().unwrap();
-	leaked.direct[0] = blk;
-	leaked.size = 1;
-	fs.write_inode(orphan, &leaked).unwrap();
-
-	let report = fs.fsck().unwrap();
-	assert_eq!(report.reclaimed_inodes, 1);
-	assert_eq!(report.reclaimed_blocks, 1);
-	assert_eq!(report.checksum_failures, 0);
-	// the live file is untouched and the reclaimed inode is free again.
-	assert_eq!(fs.read_file(b"live").unwrap(), b"keep me");
-	assert!(!fs.is_alloc(blk));
-	// a clean filesystem reclaims nothing.
-	let again = fs.fsck().unwrap();
-	assert_eq!(again.reclaimed_inodes, 0);
-	assert_eq!(again.reclaimed_blocks, 0);
-	assert_eq!(again.checksum_failures, 0);
-}
-
 // M51: block checksums (integrity).
 
 // Flip the first byte of the given needle where it sits on disk, modelling bit rot.
@@ -564,4 +537,67 @@ fn a_clean_file_survives_a_remount_with_checksums() {
 	// an untouched disk verifies cleanly: every block matches its stored checksum.
 	assert_eq!(fs.read_file(b"data.bin").unwrap(), payload);
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
+}
+
+// M52: copy-on-write atomicity and snapshots.
+
+// The superblock slot (block 0 or 1) holding the newer generation - the root a clean
+// mount would pick. The generation is the little-endian u64 at byte 28 of the slot.
+fn newest_super_slot(dev: &MemDevice) -> u32 {
+	let generation = |slot: u32| -> u64 {
+		let off = slot as usize * BLOCK_SIZE + 28;
+		u64::from_le_bytes(dev.blocks[off..off + 8].try_into().unwrap())
+	};
+	if generation(1) > generation(0) {
+		1
+	} else {
+		0
+	}
+}
+
+#[test]
+fn a_torn_commit_keeps_the_previous_file_whole() {
+	let mut fs = Lsfs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"f", b"version one").unwrap();
+	fs.write_file(b"f", b"version two").unwrap();
+	let dev = fs.into_device();
+
+	// an intact disk mounts the complete new file.
+	let mut clean = Lsfs::mount(dev.clone()).unwrap();
+	assert_eq!(clean.read_file(b"f").unwrap(), b"version two");
+
+	// model a crash that lost the latest commit: tear the newest superblock slot by
+	// flipping one byte. The byte sits past the header fields, so magic and version
+	// still parse - it is the slot's self-CRC that rejects it. Mount must fall back to
+	// the previous root: the complete old file, never a torn mix of the two.
+	let mut torn = dev;
+	let slot = newest_super_slot(&torn);
+	torn.blocks[slot as usize * BLOCK_SIZE + 200] ^= 0xFF;
+	let mut fs = Lsfs::mount(torn).unwrap();
+	assert_eq!(fs.read_file(b"f").unwrap(), b"version one");
+}
+
+#[test]
+fn a_previous_root_mounts_read_only_as_a_snapshot() {
+	let mut fs = Lsfs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"f", b"version one").unwrap();
+	fs.write_file(b"f", b"version two").unwrap();
+	let dev = fs.into_device();
+
+	// the live mount sees the newest write.
+	let mut live = Lsfs::mount(dev.clone()).unwrap();
+	assert_eq!(live.read_file(b"f").unwrap(), b"version two");
+
+	// the generation one commit back is still reachable, holding the old contents - the
+	// groundwork a read-only snapshot is built on.
+	let mut snap = Lsfs::mount_snapshot(dev).unwrap();
+	assert_eq!(snap.read_file(b"f").unwrap(), b"version one");
+}
+
+#[test]
+fn a_freshly_formatted_volume_has_no_snapshot() {
+	let fs = Lsfs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let dev = fs.into_device();
+	// only generation 0 has ever been written: there is no older root to mount.
+	assert!(Lsfs::mount_snapshot(dev).is_none());
 }
