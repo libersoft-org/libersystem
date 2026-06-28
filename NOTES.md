@@ -1,3 +1,4 @@
+- LSFS - current version is already 2 - set it to 1, as we are still not making any new system release. Apply the same for any other system part - keep it version 1 (except system itself which is 0.0.1)
 - LSFS - rename to LiberFS? Good or bad idea?
 - Compare LSFS / LiberFS with other file systems (fat, ntfs, ext4, zfs, btrfs, xfs and other modern file systems) and compare their abilities
 - add "route" command
