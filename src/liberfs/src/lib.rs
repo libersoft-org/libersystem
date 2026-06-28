@@ -1,16 +1,19 @@
 //! LiberFS - a small writable, copy-on-write on-disk filesystem for LiberSystem.
 //!
-//! The on-disk layout is a deliberately small Unix-flavoured filesystem turned
-//! copy-on-write: two superblock slots at blocks 0 and 1, then one flat pool of
-//! blocks (block 2 onward) out of which the inode table, its index block, directory
-//! data, file data, and indirect blocks are all allocated. Directories form a tree
-//! from the root inode; inodes carry direct block pointers plus a single and a double
-//! indirect pointer, so files and directories grow well past one inode's worth of
-//! direct blocks. Every block pointer (in the inode and in the indirect blocks) is
-//! paired with a CRC32C of the block it points at, so on-disk corruption is caught
-//! when the block is read. There is no on-disk allocation bitmap: the free map is
-//! reconstructed in memory at mount from the blocks the live generations reference.
-//! It backs the `Storage.Volume` API and survives a reboot.
+//! The on-disk layout is a Unix-flavoured filesystem turned copy-on-write: two
+//! superblock slots at blocks 0 and 1, then one flat pool of blocks (block 2 onward)
+//! out of which the inode table, its index block, directory data, file data, and
+//! indirect blocks are all allocated. Block addresses are 64-bit, so a volume scales
+//! from gigabytes into exabytes. Directories form a tree from the root inode; inodes
+//! carry direct block pointers plus single, double, and triple indirect pointers, so
+//! a file grows from a few blocks to hundreds of gigabytes. Every block pointer (in
+//! the inode and in the indirect blocks) is paired with a CRC32C of the block it
+//! points at, so on-disk corruption is caught when the block is read. Each inode also
+//! reserves an opaque owner tag (stored, never interpreted: authorization lives in
+//! the capability layer and StorageService, not in the filesystem). There is no
+//! on-disk allocation bitmap: the free map is reconstructed in memory at mount from
+//! the blocks the live generations reference. It backs the `Storage.Volume` API and
+//! survives a reboot.
 //!
 //! All I/O goes through the [`BlockDevice`] trait (one fixed-size block at a time),
 //! so the same code drives a real virtio-blk disk in StorageService and a
@@ -65,8 +68,9 @@ pub const BLOCK_SIZE: usize = 4096;
 // On-disk superblock magic and format version. Mount rejects anything else (a fresh
 // or stale-format disk), so StorageService knows to reformat. Version 1 is the
 // copy-on-write layout: two superblock slots, a flat block pool with no on-disk
-// bitmap, an inode table reached through an index block, nested directories, indirect
-// blocks, per-inode timestamps, and a CRC32C paired with every block pointer.
+// bitmap, 64-bit block addresses, an inode table reached through an index block,
+// nested directories, single / double / triple indirect blocks, per-inode timestamps
+// and an opaque owner tag, and a CRC32C paired with every block pointer.
 const MAGIC: [u8; 8] = *b"LIBERFS1";
 const VERSION: u32 = 1;
 
@@ -74,20 +78,29 @@ const VERSION: u32 = 1;
 // inactive slot, so the active one survives a torn write. The block pool begins right
 // after them.
 const SUPER_SLOTS: u32 = 2;
-const POOL_START: u32 = SUPER_SLOTS;
+const POOL_START: u64 = SUPER_SLOTS as u64;
 
-// One inode is a fixed 256-byte slot: a kind byte, a size, two timestamps, a single
-// and a double indirect pointer, then DIRECT (block pointer, block CRC32C) entries. 16
-// inodes fit one block.
+// One inode is a fixed 256-byte slot: a kind byte, a size, two timestamps, single /
+// double / triple indirect pointers, an opaque owner tag, then DIRECT (block pointer,
+// block CRC32C) entries. 16 inodes fit one block.
 const INODE_SIZE: usize = 256;
 const INODES_PER_BLOCK: usize = BLOCK_SIZE / INODE_SIZE;
-// A block reference is a (u32 block pointer, u32 CRC32C) pair: 8 bytes. The CRC covers
-// the referenced block, so a flipped bit on disk is caught when the block is read.
-const ENTRY_SIZE: usize = 8;
-// (256 - 40) / 8 = 27 direct entries; a file's first 27 blocks (108 KiB) need no
-// indirection. Beyond that the single indirect block adds PTRS_PER_BLOCK more and the
-// double indirect block PTRS_PER_BLOCK^2 more.
-const DIRECT: usize = (INODE_SIZE - 40) / ENTRY_SIZE;
+// A block reference is a (u64 block pointer, u32 CRC32C) pair: 12 bytes. The 64-bit
+// pointer scales the volume into exabytes; the CRC covers the referenced block, so a
+// flipped bit on disk is caught when the block is read.
+const ENTRY_SIZE: usize = 12;
+// A reserved opaque owner / ACL tag, stored in every inode but never interpreted by the
+// filesystem: authorization is the capability layer and StorageService, not POSIX
+// permissions. Room to grow into a real owner identity without another format change.
+const OWNER_TAG_LEN: usize = 16;
+const OWNER_TAG_OFF: usize = 56;
+// Byte offset of the first direct entry: past the fixed header (kind, size, two
+// timestamps, three indirect pointers) and the owner tag.
+const DIRECT_OFF: usize = OWNER_TAG_OFF + OWNER_TAG_LEN;
+// (256 - 72) / 12 = 15 direct entries; a file's first 15 blocks (60 KiB) need no
+// indirection. Beyond that the single indirect block adds PTRS_PER_BLOCK more, the
+// double indirect PTRS_PER_BLOCK^2 more, and the triple indirect PTRS_PER_BLOCK^3 more.
+const DIRECT: usize = (INODE_SIZE - DIRECT_OFF) / ENTRY_SIZE;
 // Block references (pointer + CRC) that fit one indirect block.
 const PTRS_PER_BLOCK: usize = BLOCK_SIZE / ENTRY_SIZE;
 
@@ -104,10 +117,11 @@ const MIN_INODES: u32 = 16;
 // The root directory is inode 0; other inodes are allocated from 1.
 const ROOT_INODE: u32 = 0;
 
-// One directory entry is 32 bytes: a NUL-padded name then the entry's inode number. A
-// free slot has an empty name (first byte NUL); 128 entries fit one block.
-const DENTRY_SIZE: usize = 32;
-const NAME_MAX: usize = DENTRY_SIZE - 4;
+// One directory entry is a fixed slot: a NUL-padded name then the entry's inode number.
+// A free slot has an empty name (first byte NUL); a full 255-byte name uses the whole
+// name field with no terminator. 15 entries fit one block.
+const NAME_MAX: usize = 255;
+const DENTRY_SIZE: usize = 260;
 const DENTRIES_PER_BLOCK: usize = BLOCK_SIZE / DENTRY_SIZE;
 
 // CRC32C (Castagnoli) lookup table, built at compile time. Each block's checksum is a
@@ -180,9 +194,9 @@ pub struct FsckReport {
 // `0..num_blocks`. Implementors map that onto their backing (disk sectors, a Vec).
 pub trait BlockDevice {
 	// Read block `index` into `buf` (exactly BLOCK_SIZE bytes). False on I/O failure.
-	fn read_block(&mut self, index: u32, buf: &mut [u8]) -> bool;
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool;
 	// Write `buf` (exactly BLOCK_SIZE bytes) to block `index`. False on I/O failure.
-	fn write_block(&mut self, index: u32, buf: &[u8]) -> bool;
+	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool;
 }
 
 // The parsed superblock, cached in memory for the life of a mount. With copy-on-write
@@ -191,7 +205,7 @@ pub trait BlockDevice {
 // trailing self-CRC catches a torn commit.
 #[derive(Clone, Copy)]
 struct Superblock {
-	num_blocks: u32,
+	num_blocks: u64,
 	num_inodes: u32,
 	// Size of the inode table in blocks; also the number of live entries in the index
 	// block.
@@ -201,14 +215,14 @@ struct Superblock {
 	generation: u64,
 	// Pool block holding the inode-table index (the (pointer, CRC32C) of each
 	// inode-table block), and the checksum of that index block.
-	itable_index: u32,
+	itable_index: u64,
 	itable_index_crc: u32,
 	root_inode: u32,
 }
 
 // Byte offset of the superblock's own CRC32C within its block; the checksum covers the
 // whole block with these four bytes zeroed, so a half-written superblock fails it.
-const SB_CRC_OFFSET: usize = 48;
+const SB_CRC_OFFSET: usize = 56;
 
 // One inode, parsed from / rendered to its 256-byte on-disk slot.
 struct Inode {
@@ -216,27 +230,32 @@ struct Inode {
 	size: u64,
 	ctime: u64,
 	mtime: u64,
-	indirect: u32,
-	dindirect: u32,
+	indirect: u64,
+	dindirect: u64,
+	tindirect: u64,
+	// An opaque owner / ACL tag, stored but never interpreted by the filesystem.
+	owner_tag: [u8; OWNER_TAG_LEN],
 	// Direct block pointers and, beside each, the CRC32C of the block it points at.
-	direct: [u32; DIRECT],
+	direct: [u64; DIRECT],
 	direct_crc: [u32; DIRECT],
 }
 
 impl Inode {
 	fn empty(kind: u8) -> Inode {
-		Inode { kind, size: 0, ctime: 0, mtime: 0, indirect: 0, dindirect: 0, direct: [0u32; DIRECT], direct_crc: [0u32; DIRECT] }
+		Inode { kind, size: 0, ctime: 0, mtime: 0, indirect: 0, dindirect: 0, tindirect: 0, owner_tag: [0u8; OWNER_TAG_LEN], direct: [0u64; DIRECT], direct_crc: [0u32; DIRECT] }
 	}
 
 	fn parse(buf: &[u8]) -> Inode {
-		let mut direct = [0u32; DIRECT];
+		let mut direct = [0u64; DIRECT];
 		let mut direct_crc = [0u32; DIRECT];
 		for i in 0..DIRECT {
-			let off = 40 + i * ENTRY_SIZE;
-			direct[i] = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-			direct_crc[i] = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+			let off = DIRECT_OFF + i * ENTRY_SIZE;
+			direct[i] = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+			direct_crc[i] = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
 		}
-		Inode { kind: buf[0], size: u64::from_le_bytes(buf[8..16].try_into().unwrap()), ctime: u64::from_le_bytes(buf[16..24].try_into().unwrap()), mtime: u64::from_le_bytes(buf[24..32].try_into().unwrap()), indirect: u32::from_le_bytes(buf[32..36].try_into().unwrap()), dindirect: u32::from_le_bytes(buf[36..40].try_into().unwrap()), direct, direct_crc }
+		let mut owner_tag = [0u8; OWNER_TAG_LEN];
+		owner_tag.copy_from_slice(&buf[OWNER_TAG_OFF..OWNER_TAG_OFF + OWNER_TAG_LEN]);
+		Inode { kind: buf[0], size: u64::from_le_bytes(buf[8..16].try_into().unwrap()), ctime: u64::from_le_bytes(buf[16..24].try_into().unwrap()), mtime: u64::from_le_bytes(buf[24..32].try_into().unwrap()), indirect: u64::from_le_bytes(buf[32..40].try_into().unwrap()), dindirect: u64::from_le_bytes(buf[40..48].try_into().unwrap()), tindirect: u64::from_le_bytes(buf[48..56].try_into().unwrap()), owner_tag, direct, direct_crc }
 	}
 
 	fn write(&self, buf: &mut [u8]) {
@@ -247,12 +266,14 @@ impl Inode {
 		buf[8..16].copy_from_slice(&self.size.to_le_bytes());
 		buf[16..24].copy_from_slice(&self.ctime.to_le_bytes());
 		buf[24..32].copy_from_slice(&self.mtime.to_le_bytes());
-		buf[32..36].copy_from_slice(&self.indirect.to_le_bytes());
-		buf[36..40].copy_from_slice(&self.dindirect.to_le_bytes());
+		buf[32..40].copy_from_slice(&self.indirect.to_le_bytes());
+		buf[40..48].copy_from_slice(&self.dindirect.to_le_bytes());
+		buf[48..56].copy_from_slice(&self.tindirect.to_le_bytes());
+		buf[OWNER_TAG_OFF..OWNER_TAG_OFF + OWNER_TAG_LEN].copy_from_slice(&self.owner_tag);
 		for i in 0..DIRECT {
-			let off = 40 + i * ENTRY_SIZE;
-			buf[off..off + 4].copy_from_slice(&self.direct[i].to_le_bytes());
-			buf[off + 4..off + 8].copy_from_slice(&self.direct_crc[i].to_le_bytes());
+			let off = DIRECT_OFF + i * ENTRY_SIZE;
+			buf[off..off + 8].copy_from_slice(&self.direct[i].to_le_bytes());
+			buf[off + 8..off + 12].copy_from_slice(&self.direct_crc[i].to_le_bytes());
 		}
 	}
 
@@ -275,7 +296,7 @@ impl Inode {
 // `itable` and index stay reserved so it remains a read-only snapshot.
 pub struct LiberFs<D: BlockDevice> {
 	dev: D,
-	num_blocks: u32,
+	num_blocks: u64,
 	num_inodes: u32,
 	inode_blocks: u32,
 	root_inode: u32,
@@ -283,21 +304,21 @@ pub struct LiberFs<D: BlockDevice> {
 	// per-inode-table-block (pointer, CRC32C) pairs plus the index block holding them.
 	generation: u64,
 	slot: u32,
-	itable: Vec<(u32, u32)>,
-	itable_index: u32,
+	itable: Vec<(u64, u32)>,
+	itable_index: u64,
 	// The previous generation (the read-only snapshot), if any: its inode table and
 	// index, kept reserved so a commit does not reuse its blocks.
-	prev_itable: Option<Vec<(u32, u32)>>,
-	prev_index: u32,
+	prev_itable: Option<Vec<(u64, u32)>>,
+	prev_index: u64,
 	// In-memory free map, one bit per block, derived at mount and after each commit -
 	// never written to disk.
 	free: Vec<u8>,
 	// Blocks allocated by the in-flight transaction: safe to overwrite in place (no
 	// committed generation references them yet).
-	fresh: BTreeSet<u32>,
+	fresh: BTreeSet<u64>,
 	// The `itable` snapshot taken at `begin`, restored by `abort` and used by `commit`
 	// to reserve the generation it supersedes.
-	txn_itable: Option<Vec<(u32, u32)>>,
+	txn_itable: Option<Vec<(u64, u32)>>,
 	clock: u64,
 }
 
@@ -307,10 +328,10 @@ impl<D: BlockDevice> LiberFs<D> {
 	// superblock slots, the inode-table blocks, and the index block; everything else is
 	// the free pool. The inode table scales with the volume but is capped so its index
 	// fits one block.
-	pub fn format(mut dev: D, num_blocks: u32) -> Result<LiberFs<D>, FsError> {
+	pub fn format(mut dev: D, num_blocks: u64) -> Result<LiberFs<D>, FsError> {
 		// scale the inode count with the volume, rounded up to whole inode blocks, and
 		// capped so the whole inode-table index fits one block.
-		let want_inodes = (num_blocks / BLOCKS_PER_INODE).max(MIN_INODES);
+		let want_inodes = (num_blocks / BLOCKS_PER_INODE as u64).max(MIN_INODES as u64);
 		let mut inode_blocks = (want_inodes as usize * INODE_SIZE).div_ceil(BLOCK_SIZE) as u32;
 		if inode_blocks > PTRS_PER_BLOCK as u32 {
 			inode_blocks = PTRS_PER_BLOCK as u32;
@@ -319,7 +340,7 @@ impl<D: BlockDevice> LiberFs<D> {
 
 		// generation-0 layout: [slot 0][slot 1][inode-table blocks][index block], then
 		// the free pool. The root directory inode starts empty (no data blocks).
-		let index_block = POOL_START + inode_blocks;
+		let index_block: u64 = POOL_START + inode_blocks as u64;
 		if num_blocks <= index_block + 1 {
 			return Err(FsError::Invalid);
 		}
@@ -333,7 +354,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			if b == 0 {
 				Inode::empty(KIND_DIR).write(&mut block[0..INODE_SIZE]);
 			}
-			let ptr = POOL_START + b;
+			let ptr = POOL_START + b as u64;
 			if !dev.write_block(ptr, &block) {
 				return Err(FsError::Io);
 			}
@@ -342,8 +363,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut index = vec![0u8; BLOCK_SIZE];
 		for (i, &(ptr, crc)) in itable.iter().enumerate() {
 			let off = i * ENTRY_SIZE;
-			index[off..off + 4].copy_from_slice(&ptr.to_le_bytes());
-			index[off + 4..off + 8].copy_from_slice(&crc.to_le_bytes());
+			index[off..off + 8].copy_from_slice(&ptr.to_le_bytes());
+			index[off + 8..off + 12].copy_from_slice(&crc.to_le_bytes());
 		}
 		if !dev.write_block(index_block, &index) {
 			return Err(FsError::Io);
@@ -421,7 +442,7 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Read the inode-table index block named by `sb` and parse it into the per-block
 	// (pointer, CRC32C) table. Fails if the index block does not match its checksum.
-	fn load_itable(dev: &mut D, sb: &Superblock) -> Option<Vec<(u32, u32)>> {
+	fn load_itable(dev: &mut D, sb: &Superblock) -> Option<Vec<(u64, u32)>> {
 		let mut idx = vec![0u8; BLOCK_SIZE];
 		if !dev.read_block(sb.itable_index, &mut idx) {
 			return None;
@@ -432,8 +453,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut itable = Vec::with_capacity(sb.inode_blocks as usize);
 		for i in 0..sb.inode_blocks as usize {
 			let off = i * ENTRY_SIZE;
-			let ptr = u32::from_le_bytes(idx[off..off + 4].try_into().ok()?);
-			let crc = u32::from_le_bytes(idx[off + 4..off + 8].try_into().ok()?);
+			let ptr = u64::from_le_bytes(idx[off..off + 8].try_into().ok()?);
+			let crc = u32::from_le_bytes(idx[off + 8..off + 12].try_into().ok()?);
 			itable.push((ptr, crc));
 		}
 		Some(itable)
@@ -841,8 +862,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut index = vec![0u8; BLOCK_SIZE];
 		for (i, &(ptr, crc)) in self.itable.iter().enumerate() {
 			let off = i * ENTRY_SIZE;
-			index[off..off + 4].copy_from_slice(&ptr.to_le_bytes());
-			index[off + 4..off + 8].copy_from_slice(&crc.to_le_bytes());
+			index[off..off + 8].copy_from_slice(&ptr.to_le_bytes());
+			index[off + 8..off + 12].copy_from_slice(&crc.to_le_bytes());
 		}
 		if !self.dev.write_block(new_index, &index) {
 			return Err(FsError::Io);
@@ -903,7 +924,7 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Mark, in `map`, the index block and every block one generation references: each
 	// inode-table block, and the data and indirect blocks of each live inode in it.
-	fn mark_generation(&mut self, index_block: u32, itable: &[(u32, u32)], map: &mut [u8]) -> Result<(), FsError> {
+	fn mark_generation(&mut self, index_block: u64, itable: &[(u64, u32)], map: &mut [u8]) -> Result<(), FsError> {
 		set_bit(map, index_block);
 		let mut block = vec![0u8; BLOCK_SIZE];
 		for &(tbl_ptr, _) in itable {
@@ -984,14 +1005,14 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// block allocation (copy-on-write)
 
-	fn is_alloc(&self, block: u32) -> bool {
+	fn is_alloc(&self, block: u64) -> bool {
 		self.free[(block / 8) as usize] & (1 << (block % 8)) != 0
 	}
 
 	// Claim one free block from the pool: scan the in-memory free map, mark the block
 	// used, and record it as fresh (allocated by this transaction, so safe to overwrite
 	// in place). The free map is in-memory only; nothing is flushed.
-	fn alloc_one(&mut self) -> Result<u32, FsError> {
+	fn alloc_one(&mut self) -> Result<u64, FsError> {
 		for block in POOL_START..self.num_blocks {
 			if !self.is_alloc(block) {
 				self.free[(block / 8) as usize] |= 1 << (block % 8);
@@ -1006,7 +1027,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// returned as is (safe to mutate in place). A committed block (or the 0 "unmapped"
 	// sentinel) is copied up: a fresh block is allocated and the old contents copied
 	// into it (or zeroed), so the committed generation keeps the original untouched.
-	fn cow(&mut self, ptr: u32) -> Result<u32, FsError> {
+	fn cow(&mut self, ptr: u64) -> Result<u64, FsError> {
 		if ptr != 0 && self.fresh.contains(&ptr) {
 			return Ok(ptr);
 		}
@@ -1023,36 +1044,36 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// block references: a (pointer, CRC32C) pair at index `idx` in an indirect block
 
-	fn read_entry(&mut self, block: u32, idx: usize) -> Result<(u32, u32), FsError> {
+	fn read_entry(&mut self, block: u64, idx: usize) -> Result<(u64, u32), FsError> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		if !self.dev.read_block(block, &mut buf) {
 			return Err(FsError::Io);
 		}
 		let off = idx * ENTRY_SIZE;
-		let ptr = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-		let crc = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+		let ptr = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+		let crc = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
 		Ok((ptr, crc))
 	}
 
-	fn write_entry_at(&mut self, block: u32, idx: usize, ptr: u32, crc: u32) -> Result<(), FsError> {
+	fn write_entry_at(&mut self, block: u64, idx: usize, ptr: u64, crc: u32) -> Result<(), FsError> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		if !self.dev.read_block(block, &mut buf) {
 			return Err(FsError::Io);
 		}
 		let off = idx * ENTRY_SIZE;
-		buf[off..off + 4].copy_from_slice(&ptr.to_le_bytes());
-		buf[off + 4..off + 8].copy_from_slice(&crc.to_le_bytes());
+		buf[off..off + 8].copy_from_slice(&ptr.to_le_bytes());
+		buf[off + 8..off + 12].copy_from_slice(&crc.to_le_bytes());
 		if !self.dev.write_block(block, &buf) {
 			return Err(FsError::Io);
 		}
 		Ok(())
 	}
 
-	// file block mapping (direct -> single indirect -> double indirect)
+	// file block mapping (direct -> single -> double -> triple indirect)
 
 	// Resolve logical block `logical` of `inode` to (physical block, stored CRC32C), or
 	// None if it is not mapped (a hole).
-	fn map_for_read(&mut self, inode: &Inode, logical: usize) -> Result<Option<(u32, u32)>, FsError> {
+	fn map_for_read(&mut self, inode: &Inode, logical: usize) -> Result<Option<(u64, u32)>, FsError> {
 		if logical < DIRECT {
 			return Ok(nonzero(inode.direct[logical]).map(|p| (p, inode.direct_crc[logical])));
 		}
@@ -1064,20 +1085,40 @@ impl<D: BlockDevice> LiberFs<D> {
 			let (ptr, crc) = self.read_entry(inode.indirect, l)?;
 			return Ok(nonzero(ptr).map(|p| (p, crc)));
 		}
-		let d = l - PTRS_PER_BLOCK;
-		let first = d / PTRS_PER_BLOCK;
-		let second = d % PTRS_PER_BLOCK;
+		let l = l - PTRS_PER_BLOCK;
+		if l < PTRS_PER_BLOCK * PTRS_PER_BLOCK {
+			let first = l / PTRS_PER_BLOCK;
+			let second = l % PTRS_PER_BLOCK;
+			if inode.dindirect == 0 {
+				return Ok(None);
+			}
+			let (mid, _) = self.read_entry(inode.dindirect, first)?;
+			if mid == 0 {
+				return Ok(None);
+			}
+			let (ptr, crc) = self.read_entry(mid, second)?;
+			return Ok(nonzero(ptr).map(|p| (p, crc)));
+		}
+		let l = l - PTRS_PER_BLOCK * PTRS_PER_BLOCK;
+		let first = l / (PTRS_PER_BLOCK * PTRS_PER_BLOCK);
+		let rem = l % (PTRS_PER_BLOCK * PTRS_PER_BLOCK);
+		let second = rem / PTRS_PER_BLOCK;
+		let third = rem % PTRS_PER_BLOCK;
 		if first >= PTRS_PER_BLOCK {
 			return Err(FsError::NoSpace);
 		}
-		if inode.dindirect == 0 {
+		if inode.tindirect == 0 {
 			return Ok(None);
 		}
-		let (mid, _) = self.read_entry(inode.dindirect, first)?;
+		let (mid, _) = self.read_entry(inode.tindirect, first)?;
 		if mid == 0 {
 			return Ok(None);
 		}
-		let (ptr, crc) = self.read_entry(mid, second)?;
+		let (leaf, _) = self.read_entry(mid, second)?;
+		if leaf == 0 {
+			return Ok(None);
+		}
+		let (ptr, crc) = self.read_entry(leaf, third)?;
 		Ok(nonzero(ptr).map(|p| (p, crc)))
 	}
 
@@ -1085,7 +1126,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// up the data block and every indirect block on the path so no committed generation
 	// is disturbed, and record `crc` beside the data pointer. Returns the physical data
 	// block. Updates `inode`'s pointers in memory - the caller persists the inode.
-	fn map_for_write(&mut self, inode: &mut Inode, logical: usize, crc: u32) -> Result<u32, FsError> {
+	fn map_for_write(&mut self, inode: &mut Inode, logical: usize, crc: u32) -> Result<u64, FsError> {
 		if logical < DIRECT {
 			inode.direct[logical] = self.cow(inode.direct[logical])?;
 			inode.direct_crc[logical] = crc;
@@ -1101,20 +1142,39 @@ impl<D: BlockDevice> LiberFs<D> {
 			self.write_entry_at(inode.indirect, l, data, crc)?;
 			return Ok(data);
 		}
-		let d = l - PTRS_PER_BLOCK;
-		let first = d / PTRS_PER_BLOCK;
-		let second = d % PTRS_PER_BLOCK;
+		let l = l - PTRS_PER_BLOCK;
+		if l < PTRS_PER_BLOCK * PTRS_PER_BLOCK {
+			let first = l / PTRS_PER_BLOCK;
+			let second = l % PTRS_PER_BLOCK;
+			inode.dindirect = self.cow(inode.dindirect)?;
+			let (mid, _) = self.read_entry(inode.dindirect, first)?;
+			let mid = self.cow(mid)?;
+			// the double indirect points at a mid block, not data: no data CRC here.
+			self.write_entry_at(inode.dindirect, first, mid, 0)?;
+			let (data, _) = self.read_entry(mid, second)?;
+			let data = self.cow(data)?;
+			self.write_entry_at(mid, second, data, crc)?;
+			return Ok(data);
+		}
+		let l = l - PTRS_PER_BLOCK * PTRS_PER_BLOCK;
+		let first = l / (PTRS_PER_BLOCK * PTRS_PER_BLOCK);
+		let rem = l % (PTRS_PER_BLOCK * PTRS_PER_BLOCK);
+		let second = rem / PTRS_PER_BLOCK;
+		let third = rem % PTRS_PER_BLOCK;
 		if first >= PTRS_PER_BLOCK {
 			return Err(FsError::NoSpace);
 		}
-		inode.dindirect = self.cow(inode.dindirect)?;
-		let (mid, _) = self.read_entry(inode.dindirect, first)?;
+		inode.tindirect = self.cow(inode.tindirect)?;
+		let (mid, _) = self.read_entry(inode.tindirect, first)?;
 		let mid = self.cow(mid)?;
-		// the double indirect points at a mid block, not data: no data CRC here.
-		self.write_entry_at(inode.dindirect, first, mid, 0)?;
-		let (data, _) = self.read_entry(mid, second)?;
+		// the triple indirect points at mid (index) blocks, not data: no data CRC here.
+		self.write_entry_at(inode.tindirect, first, mid, 0)?;
+		let (leaf, _) = self.read_entry(mid, second)?;
+		let leaf = self.cow(leaf)?;
+		self.write_entry_at(mid, second, leaf, 0)?;
+		let (data, _) = self.read_entry(leaf, third)?;
 		let data = self.cow(data)?;
-		self.write_entry_at(mid, second, data, crc)?;
+		self.write_entry_at(leaf, third, data, crc)?;
 		Ok(data)
 	}
 
@@ -1370,6 +1430,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		if keep <= DIRECT + PTRS_PER_BLOCK {
 			inode.dindirect = 0;
 		}
+		if keep <= DIRECT + PTRS_PER_BLOCK + PTRS_PER_BLOCK * PTRS_PER_BLOCK {
+			inode.tindirect = 0;
+		}
 		Ok(())
 	}
 
@@ -1390,16 +1453,38 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			return Ok(());
 		}
-		let d = l - PTRS_PER_BLOCK;
-		let first = d / PTRS_PER_BLOCK;
-		let second = d % PTRS_PER_BLOCK;
-		if inode.dindirect != 0 {
-			inode.dindirect = self.cow(inode.dindirect)?;
-			let (mid, _) = self.read_entry(inode.dindirect, first)?;
+		let l = l - PTRS_PER_BLOCK;
+		if l < PTRS_PER_BLOCK * PTRS_PER_BLOCK {
+			let first = l / PTRS_PER_BLOCK;
+			let second = l % PTRS_PER_BLOCK;
+			if inode.dindirect != 0 {
+				inode.dindirect = self.cow(inode.dindirect)?;
+				let (mid, _) = self.read_entry(inode.dindirect, first)?;
+				if mid != 0 {
+					let mid = self.cow(mid)?;
+					self.write_entry_at(inode.dindirect, first, mid, 0)?;
+					self.write_entry_at(mid, second, 0, 0)?;
+				}
+			}
+			return Ok(());
+		}
+		let l = l - PTRS_PER_BLOCK * PTRS_PER_BLOCK;
+		let first = l / (PTRS_PER_BLOCK * PTRS_PER_BLOCK);
+		let rem = l % (PTRS_PER_BLOCK * PTRS_PER_BLOCK);
+		let second = rem / PTRS_PER_BLOCK;
+		let third = rem % PTRS_PER_BLOCK;
+		if inode.tindirect != 0 {
+			inode.tindirect = self.cow(inode.tindirect)?;
+			let (mid, _) = self.read_entry(inode.tindirect, first)?;
 			if mid != 0 {
 				let mid = self.cow(mid)?;
-				self.write_entry_at(inode.dindirect, first, mid, 0)?;
-				self.write_entry_at(mid, second, 0, 0)?;
+				self.write_entry_at(inode.tindirect, first, mid, 0)?;
+				let (leaf, _) = self.read_entry(mid, second)?;
+				if leaf != 0 {
+					let leaf = self.cow(leaf)?;
+					self.write_entry_at(mid, second, leaf, 0)?;
+					self.write_entry_at(leaf, third, 0, 0)?;
+				}
 			}
 		}
 		Ok(())
@@ -1438,6 +1523,29 @@ impl<D: BlockDevice> LiberFs<D> {
 				}
 			}
 		}
+		if inode.tindirect != 0 {
+			set_bit(bitmap, inode.tindirect);
+			for first in 0..PTRS_PER_BLOCK {
+				let (mid, _) = self.read_entry(inode.tindirect, first)?;
+				if mid == 0 {
+					continue;
+				}
+				set_bit(bitmap, mid);
+				for second in 0..PTRS_PER_BLOCK {
+					let (leaf, _) = self.read_entry(mid, second)?;
+					if leaf == 0 {
+						continue;
+					}
+					set_bit(bitmap, leaf);
+					for third in 0..PTRS_PER_BLOCK {
+						let (p, _) = self.read_entry(leaf, third)?;
+						if p != 0 {
+							set_bit(bitmap, p);
+						}
+					}
+				}
+			}
+		}
 		Ok(())
 	}
 }
@@ -1450,13 +1558,13 @@ fn serialize_superblock(sb: &Superblock) -> Vec<u8> {
 	block[0..8].copy_from_slice(&MAGIC);
 	block[8..12].copy_from_slice(&VERSION.to_le_bytes());
 	block[12..16].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
-	block[16..20].copy_from_slice(&sb.num_blocks.to_le_bytes());
-	block[20..24].copy_from_slice(&sb.num_inodes.to_le_bytes());
-	block[24..28].copy_from_slice(&sb.inode_blocks.to_le_bytes());
+	block[16..24].copy_from_slice(&sb.num_blocks.to_le_bytes());
+	block[24..28].copy_from_slice(&sb.num_inodes.to_le_bytes());
 	block[28..36].copy_from_slice(&sb.generation.to_le_bytes());
-	block[36..40].copy_from_slice(&sb.itable_index.to_le_bytes());
-	block[40..44].copy_from_slice(&sb.itable_index_crc.to_le_bytes());
-	block[44..48].copy_from_slice(&sb.root_inode.to_le_bytes());
+	block[36..44].copy_from_slice(&sb.itable_index.to_le_bytes());
+	block[44..48].copy_from_slice(&sb.itable_index_crc.to_le_bytes());
+	block[48..52].copy_from_slice(&sb.inode_blocks.to_le_bytes());
+	block[52..56].copy_from_slice(&sb.root_inode.to_le_bytes());
 	// the CRC bytes are already zero; checksum the block and store it over them.
 	let crc = crc32c(&block);
 	block[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
@@ -1486,7 +1594,7 @@ fn parse_superblock(block: &[u8]) -> Option<Superblock> {
 	if crc32c(&probe) != stored {
 		return None;
 	}
-	Some(Superblock { num_blocks: u32::from_le_bytes(block[16..20].try_into().ok()?), num_inodes: u32::from_le_bytes(block[20..24].try_into().ok()?), inode_blocks: u32::from_le_bytes(block[24..28].try_into().ok()?), generation: u64::from_le_bytes(block[28..36].try_into().ok()?), itable_index: u32::from_le_bytes(block[36..40].try_into().ok()?), itable_index_crc: u32::from_le_bytes(block[40..44].try_into().ok()?), root_inode: u32::from_le_bytes(block[44..48].try_into().ok()?) })
+	Some(Superblock { num_blocks: u64::from_le_bytes(block[16..24].try_into().ok()?), num_inodes: u32::from_le_bytes(block[24..28].try_into().ok()?), inode_blocks: u32::from_le_bytes(block[48..52].try_into().ok()?), generation: u64::from_le_bytes(block[28..36].try_into().ok()?), itable_index: u64::from_le_bytes(block[36..44].try_into().ok()?), itable_index_crc: u32::from_le_bytes(block[44..48].try_into().ok()?), root_inode: u32::from_le_bytes(block[52..56].try_into().ok()?) })
 }
 
 // The name held in a directory entry: the name field up to its first NUL.
@@ -1508,13 +1616,13 @@ fn write_entry(entry: &mut [u8], name: &[u8], inode: u32) {
 }
 
 // Set the allocation bit for block `b` in `bitmap`.
-fn set_bit(bitmap: &mut [u8], b: u32) {
+fn set_bit(bitmap: &mut [u8], b: u64) {
 	bitmap[(b / 8) as usize] |= 1 << (b % 8);
 }
 
 // A block pointer as an Option: 0 is the "unmapped" sentinel, anything else a real
 // block.
-fn nonzero(block: u32) -> Option<u32> {
+fn nonzero(block: u64) -> Option<u64> {
 	if block == 0 {
 		None
 	} else {
@@ -1524,7 +1632,10 @@ fn nonzero(block: u32) -> Option<u32> {
 
 // Split a path into its validated segments. Each segment must be non-empty, no longer
 // than NAME_MAX, neither "." nor "..", and free of NUL bytes - so a resolved path can
-// never escape the volume or name an invalid entry.
+// never escape the volume or name an invalid entry. A portable-name policy is enforced
+// at this boundary: the cross-platform-unsafe set (`\ : * ? < > | "` and control bytes)
+// is rejected on top of `/` and NUL, so a LiberFS name moves cleanly to FAT / NTFS media
+// and other systems.
 fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
 	if path.is_empty() {
 		return Err(FsError::Invalid);
@@ -1537,12 +1648,22 @@ fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
 		if seg.len() > NAME_MAX {
 			return Err(FsError::TooLong);
 		}
-		if seg.iter().any(|&c| c == 0) {
+		if seg.iter().any(|&c| !is_portable_name_byte(c)) {
 			return Err(FsError::Invalid);
 		}
 		segs.push(seg);
 	}
 	Ok(segs)
+}
+
+// Is byte `c` allowed in a portable file name? Rejects NUL and control bytes (0x00..=0x1F
+// and 0x7F) and the cross-platform-reserved set `\ : * ? < > | "`. (`/` never reaches
+// here - it is the path separator.)
+fn is_portable_name_byte(c: u8) -> bool {
+	if c < 0x20 || c == 0x7F {
+		return false;
+	}
+	!matches!(c, b'\\' | b':' | b'*' | b'?' | b'<' | b'>' | b'|' | b'"')
 }
 
 #[cfg(test)]
