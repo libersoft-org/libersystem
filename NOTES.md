@@ -1,3 +1,5 @@
+- LSFS - rename to LiberFS? Good or bad idea?
+- add "route" command
 - add "cd" command
 - GPU driver keeps failing probably (screen sometimes blinking after few minutes - probably restartind driver or something)
 - Boot log - [ OK ] [FAIL] [INFO] [WARN]
