@@ -1,6 +1,5 @@
 # Bugs / changes
 
-- LiberFS lib.rs has 2700 lines of code - is it OK or should it be divided to multiple files?
 - GPU driver keeps failing probably (screen sometimes blinking after few minutes - probably restartind driver or something)
 - "exit" command should not halt the machine, but just exits the shell and shows up the parent shell (shell that started this console). If there is no parent, just reload the whole shell
 - List the available volumes "ls" - change to "lsvol"?

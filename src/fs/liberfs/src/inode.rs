@@ -1,0 +1,127 @@
+use crate::*;
+
+impl<D: BlockDevice> LiberFs<D> {
+	// Read inode `num` from the inode B+tree. Missing (never allocated or freed) is
+	// FsError::Invalid; a tree node failing its checksum is FsError::Corrupt.
+	pub(crate) fn read_inode(&mut self, num: u32) -> Result<Inode, FsError> {
+		let key = num as u64;
+		let probe = key.to_le_bytes();
+		match self.tree_lookup(self.inode_root, self.inode_root_crc, key, &probe, INODE_REC)? {
+			Some(rec) => {
+				let mut inode = Inode::parse(&rec[8..8 + INODE_SIZE]);
+				if inode.kind == KIND_FILE {
+					// complete the extent map from the overflow chain (a no-op for a
+					// file whose runs all fit inline).
+					self.load_spill(&mut inode)?;
+				}
+				Ok(inode)
+			}
+			None => Err(FsError::Invalid),
+		}
+	}
+
+	// Append the spilled extents (those past EXTENTS_INLINE) from the overflow chain to
+	// `inode.extents`, which `parse` filled only with the inline runs. Each chain block
+	// carries the (pointer, CRC32C) of the next, so a flipped bit in the chain is caught.
+	pub(crate) fn load_spill(&mut self, inode: &mut Inode) -> Result<(), FsError> {
+		if inode.extent_count as usize <= inode.extents.len() {
+			return Ok(());
+		}
+		let mut ptr = inode.spill;
+		let mut crc = inode.spill_crc;
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		while ptr != 0 {
+			if !self.dev.read_block(ptr, &mut buf) {
+				return Err(FsError::Io);
+			}
+			if crc32c(&buf) != crc {
+				return Err(FsError::Corrupt);
+			}
+			let count = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+			for i in 0..count {
+				let off = EXTENT_HDR + i * EXTENT_SIZE;
+				inode.extents.push(Extent::parse(&buf[off..off + EXTENT_SIZE]));
+			}
+			ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+			crc = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+		}
+		Ok(())
+	}
+
+	// Persist `inode.extents` past the inline ones into a fresh overflow chain (one
+	// block per EXTENTS_PER_BLOCK runs) and set the `spill` / `spill_crc` /
+	// `extent_count` header fields to match. The chain is built back to front so each
+	// block can hold the (pointer, CRC32C) of the one after it. Always called by
+	// `write_inode`, so the inode slot and chain stay consistent.
+	pub(crate) fn flush_extents(&mut self, inode: &mut Inode) -> Result<(), FsError> {
+		inode.extent_count = inode.extents.len() as u32;
+		if inode.extents.len() <= EXTENTS_INLINE {
+			inode.spill = 0;
+			inode.spill_crc = 0;
+			return Ok(());
+		}
+		let spilled: Vec<Extent> = inode.extents[EXTENTS_INLINE..].to_vec();
+		let mut next_ptr = 0u64;
+		let mut next_crc = 0u32;
+		for chunk in spilled.chunks(EXTENTS_PER_BLOCK).rev() {
+			let blk = self.alloc_meta()?;
+			let mut buf = vec![0u8; BLOCK_SIZE];
+			buf[0..8].copy_from_slice(&next_ptr.to_le_bytes());
+			buf[8..12].copy_from_slice(&next_crc.to_le_bytes());
+			buf[12..16].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+			for (i, ext) in chunk.iter().enumerate() {
+				let off = EXTENT_HDR + i * EXTENT_SIZE;
+				ext.write(&mut buf[off..off + EXTENT_SIZE]);
+			}
+			if !self.dev.write_block(blk, &buf) {
+				return Err(FsError::Io);
+			}
+			next_ptr = blk;
+			next_crc = crc32c(&buf);
+		}
+		inode.spill = next_ptr;
+		inode.spill_crc = next_crc;
+		Ok(())
+	}
+
+	// Write inode `num` into the inode B+tree, rebuilding its extent overflow chain
+	// first (for a file) so the inode slot and chain agree. The insert copies every tree
+	// node on the path up to a fresh block and updates `inode_root`; the change is
+	// published by `commit`.
+	pub(crate) fn write_inode(&mut self, num: u32, inode: &mut Inode) -> Result<(), FsError> {
+		if inode.kind == KIND_FILE {
+			self.flush_extents(inode)?;
+		}
+		let mut rec = vec![0u8; INODE_REC];
+		rec[0..8].copy_from_slice(&(num as u64).to_le_bytes());
+		inode.write(&mut rec[8..8 + INODE_SIZE]);
+		let (root, crc) = self.tree_insert(self.inode_root, self.inode_root_crc, num as u64, &rec, INODE_REC, INODE_LEAF_MAX, INODE_KEYLEN)?;
+		self.inode_root = root;
+		self.inode_root_crc = crc;
+		Ok(())
+	}
+
+	// Hand out a fresh inode number from the monotonic counter (never reused). The
+	// caller writes the inode right after, so nothing is inserted into the tree here.
+	pub(crate) fn alloc_inode(&mut self) -> Result<u32, FsError> {
+		let num = self.next_inode;
+		if num == u32::MAX {
+			return Err(FsError::NoSpace);
+		}
+		self.next_inode += 1;
+		Ok(num)
+	}
+
+	// Remove inode `num` from the inode B+tree (its data blocks are reclaimed when the
+	// free map is rederived at commit, the previous generation pinning them until then).
+	pub(crate) fn free_inode(&mut self, num: u32) -> Result<(), FsError> {
+		let probe = (num as u64).to_le_bytes();
+		let (root, crc, _) = self.tree_delete(self.inode_root, self.inode_root_crc, num as u64, &probe, INODE_REC, INODE_KEYLEN)?;
+		self.inode_root = root;
+		self.inode_root_crc = crc;
+		Ok(())
+	}
+
+	// block allocation (copy-on-write)
+
+}
