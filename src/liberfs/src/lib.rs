@@ -2,19 +2,25 @@
 //!
 //! The on-disk layout is a Unix-flavoured filesystem turned copy-on-write: two
 //! superblock slots at blocks 0 and 1, then one flat pool of blocks (block 2 onward)
-//! out of which the inode table, its index block, directory data, file data, and the
-//! per-extent checksum blocks are all allocated. Block addresses are 64-bit, so a
-//! volume scales from gigabytes into exabytes. Directories form a tree from the root
-//! inode; an inode maps its data with extents - each a contiguous run of blocks paired
-//! with one checksum block - held inline in the inode and spilling to an overflow chain
-//! when there are many, so a file grows from a few blocks to hundreds of gigabytes and
-//! an unwritten range simply has no extent (a sparse hole that reads back as zeros).
-//! Every data block is paired with a CRC32C, kept in its extent's checksum block, so
-//! on-disk corruption is caught when the block is read. Each inode also reserves an
-//! opaque owner tag (stored, never interpreted: authorization lives in the capability
-//! layer and StorageService, not in the filesystem). There is no on-disk allocation
-//! bitmap: the free map is reconstructed in memory at mount from the blocks the live
-//! generations reference. It backs the `Storage.Volume` API and survives a reboot.
+//! out of which the inode B+tree, directory B+trees, file data, and the per-extent
+//! checksum blocks are all allocated. Block addresses are 64-bit, so a volume scales
+//! from gigabytes into exabytes. Inodes are not a fixed table: they live in a B+tree
+//! keyed by inode number (a node per block, copy-on-write and checksummed), allocated
+//! on demand, so a volume never runs out of inodes while it has free space and an
+//! empty one wastes none. Each directory is its own B+tree keyed by the hash of an
+//! entry's name, so lookup, insert and remove are O(log n) and a directory holds
+//! millions of entries without a linear scan. A file maps its data with extents -
+//! each a contiguous run of blocks paired with one checksum block - held inline in the
+//! inode and spilling to an overflow chain when there are many, so a file grows from a
+//! few blocks to hundreds of gigabytes and an unwritten range simply has no extent (a
+//! sparse hole that reads back as zeros). Every data block is paired with a CRC32C,
+//! kept in its extent's checksum block, and every tree node with its own CRC32C kept in
+//! the parent link, so on-disk corruption is caught when the block is read. Each inode
+//! also reserves an opaque owner tag (stored, never interpreted: authorization lives in
+//! the capability layer and StorageService, not in the filesystem). There is no on-disk
+//! allocation bitmap: the free map is reconstructed in memory at mount from the blocks
+//! the live generations reference. It backs the `Storage.Volume` API and survives a
+//! reboot.
 //!
 //! All I/O goes through the [`BlockDevice`] trait (one fixed-size block at a time),
 //! so the same code drives a real virtio-blk disk in StorageService and a
@@ -26,9 +32,9 @@
 //!
 //! A mutation never overwrites a block that a committed generation still references:
 //! changed data, the extent and checksum blocks describing it, the inode, and the
-//! inode-table block holding the inode are each written to a freshly allocated block
-//! (copied up once per transaction, then updated in place). The transaction commits
-//! with a single atomic
+//! inode- and directory-B+tree nodes on the path to it are each written to a freshly
+//! allocated block (copied up once per transaction, then updated in place). The
+//! transaction commits with a single atomic
 //! write of a new superblock - carrying an incremented generation and a self-CRC - to
 //! the inactive of the two slots. A crash before that write leaves the old superblock
 //! active and the old tree fully intact; a torn superblock write fails its self-CRC
@@ -62,6 +68,7 @@ extern crate alloc;
 use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 // One filesystem block. Eight 512-byte disk sectors, a page; the I/O unit of the
 // BlockDevice trait.
@@ -70,8 +77,8 @@ pub const BLOCK_SIZE: usize = 4096;
 // On-disk superblock magic and format version. Mount rejects anything else (a fresh
 // or stale-format disk), so StorageService knows to reformat. Version 1 is the
 // copy-on-write, extent-mapped layout: two superblock slots, a flat block pool with no
-// on-disk bitmap, 64-bit block addresses, an inode table reached through an index
-// block, nested directories, files mapped by extents (each a contiguous run with its
+// on-disk bitmap, 64-bit block addresses, an inode B+tree keyed by number, directories
+// that are name-keyed B+trees, files mapped by extents (each a contiguous run with its
 // own checksum block) and sparse holes, per-inode timestamps and an opaque owner tag,
 // and a CRC32C paired with every block pointer.
 const MAGIC: [u8; 8] = *b"LIBERFS1";
@@ -83,17 +90,34 @@ const VERSION: u32 = 1;
 const SUPER_SLOTS: u32 = 2;
 const POOL_START: u64 = SUPER_SLOTS as u64;
 
-// One inode is a fixed 256-byte slot: a kind byte, a size, two timestamps, the extent
-// map's overflow pointer and count, an opaque owner tag, then EXTENTS_INLINE inline
-// extent records. 16 inodes fit one block.
+// One inode is a fixed 256-byte slot: a kind byte, a size, two timestamps, then either
+// (for a file) the extent map's overflow pointer and count and EXTENTS_INLINE inline
+// extents, or (for a directory) its B+tree root pointer and that root's CRC32C. An
+// opaque owner tag sits at OWNER_TAG_OFF. Each slot is stored, keyed by inode number,
+// in a leaf of the inode B+tree.
 const INODE_SIZE: usize = 256;
-const INODES_PER_BLOCK: usize = BLOCK_SIZE / INODE_SIZE;
-// The inode-table index pairs each inode-table block with its CRC32C as a (u64 pointer,
-// u32 CRC32C) entry: 12 bytes. The same pairing checksums the inode metadata itself.
-const ENTRY_SIZE: usize = 12;
-// (u64 pointer + u32 CRC) entries that fit one index block; also caps the inode table so
-// its whole index fits a single block.
-const PTRS_PER_BLOCK: usize = BLOCK_SIZE / ENTRY_SIZE;
+
+// A B+tree node lives in one block: an 8-byte header (a type byte then a u16 entry
+// count) followed by the entries. An internal node holds `count` u64 separator keys
+// then `count + 1` child links, each a block pointer (u64) and that block's CRC32C
+// (u32); a leaf holds `count` fixed-width records, each beginning with its u64 key.
+// Nodes are copy-on-write and every child link carries the child's checksum.
+const NODE_INTERNAL: u8 = 0;
+const NODE_LEAF: u8 = 1;
+const NODE_HDR: usize = 8;
+const SEP_SIZE: usize = 8;
+const CHILD_SIZE: usize = 12;
+// Maximum children of an internal node: header + (C - 1) separators + C child links fit
+// one block. The separators occupy the (C - 1)-slot region right after the header and
+// the child links a fixed region after it, so offsets do not depend on the live count.
+const INTERNAL_MAX: usize = (BLOCK_SIZE - NODE_HDR + SEP_SIZE) / (SEP_SIZE + CHILD_SIZE);
+const INTERNAL_CHILD_BASE: usize = NODE_HDR + SEP_SIZE * (INTERNAL_MAX - 1);
+
+// An inode-tree leaf record: the inode number (u64 key) then its 256-byte slot. The key
+// is compared on its own 8 bytes, since inode numbers are unique.
+const INODE_REC: usize = 8 + INODE_SIZE;
+const INODE_LEAF_MAX: usize = (BLOCK_SIZE - NODE_HDR) / INODE_REC;
+const INODE_KEYLEN: usize = 8;
 // A reserved opaque owner / ACL tag, stored in every inode but never interpreted by the
 // filesystem: authorization is the capability layer and StorageService, not POSIX
 // permissions. Room to grow into a real owner identity without another format change.
@@ -119,25 +143,24 @@ const CRCS_PER_BLOCK: usize = BLOCK_SIZE / 4;
 const EXTENT_HDR: usize = 16;
 const EXTENTS_PER_BLOCK: usize = (BLOCK_SIZE - EXTENT_HDR) / EXTENT_SIZE;
 
-// Inode kinds. 0 is also the "free" marker, so a freed inode reads back as Free.
-const KIND_FREE: u8 = 0;
+// Inode kinds. A live inode record is always a file or a directory; a freed inode is
+// deleted from the tree rather than tombstoned, so there is no "free" kind.
 const KIND_FILE: u8 = 1;
 const KIND_DIR: u8 = 2;
 
-// How many inodes a freshly formatted volume gets: one per this many blocks, but at
-// least MIN_INODES and rounded up to whole inode blocks.
-const BLOCKS_PER_INODE: u32 = 4;
-const MIN_INODES: u32 = 16;
-
-// The root directory is inode 0; other inodes are allocated from 1.
+// The root directory is inode 0; other inodes are handed out from a monotonic counter
+// (`next_inode`) starting at 1, so a number is never reused and the inode B+tree holds
+// only live inodes.
 const ROOT_INODE: u32 = 0;
 
-// One directory entry is a fixed slot: a NUL-padded name then the entry's inode number.
-// A free slot has an empty name (first byte NUL); a full 255-byte name uses the whole
-// name field with no terminator. 15 entries fit one block.
+// A directory is a B+tree keyed by the hash of an entry's name. One leaf record is the
+// name hash (u64 key), the NUL-padded name, then the child inode number (u32); records
+// sort by (hash, name), so the key portion compared in a leaf is the hash plus the name.
+// A full 255-byte name fills the whole name field with no terminator.
 const NAME_MAX: usize = 255;
-const DENTRY_SIZE: usize = 260;
-const DENTRIES_PER_BLOCK: usize = BLOCK_SIZE / DENTRY_SIZE;
+const DIR_REC: usize = 8 + NAME_MAX + 4;
+const DIR_LEAF_MAX: usize = (BLOCK_SIZE - NODE_HDR) / DIR_REC;
+const DIR_KEYLEN: usize = 8 + NAME_MAX;
 
 // CRC32C (Castagnoli) lookup table, built at compile time. Each block's checksum is a
 // CRC32C of its bytes, stored next to the pointer to it; the reflected polynomial is
@@ -221,17 +244,17 @@ pub trait BlockDevice {
 #[derive(Clone, Copy)]
 struct Superblock {
 	num_blocks: u64,
-	num_inodes: u32,
-	// Size of the inode table in blocks; also the number of live entries in the index
-	// block.
-	inode_blocks: u32,
 	// Monotonic generation: a commit writes the new superblock with `generation + 1`,
 	// so the newest valid slot is the live one and the other is the snapshot.
 	generation: u64,
-	// Pool block holding the inode-table index (the (pointer, CRC32C) of each
-	// inode-table block), and the checksum of that index block.
-	itable_index: u64,
-	itable_index_crc: u32,
+	// Root block of the inode B+tree and that root node's CRC32C; the tree is reached
+	// from here rather than from a fixed inode region. 0 would mean an empty tree, which
+	// never happens past format (format seeds the root directory as inode 0).
+	inode_root: u64,
+	inode_root_crc: u32,
+	// The next inode number to hand out (monotonic; never reused), so the inode tree
+	// holds only live inodes and a volume never runs out of inode numbers in practice.
+	next_inode: u32,
 	root_inode: u32,
 }
 
@@ -277,11 +300,13 @@ impl Extent {
 	}
 }
 
-// One inode, parsed from / rendered to its 256-byte on-disk slot. `extents` is the
-// in-memory extent map: `parse` fills only the EXTENTS_INLINE runs that live in the
-// slot, and [`LiberFs::read_inode`] completes it from the overflow chain rooted at
-// `spill`. `extent_count` is the total run count (inline plus spilled) - the header
-// field that says how many extents to read.
+// One inode, parsed from / rendered to its 256-byte on-disk slot. A file and a directory
+// share the header (kind, size, two timestamps, owner tag) but overlay the rest: a file
+// keeps its extent map (the inline runs plus the `spill` overflow pointer and the total
+// `extent_count`), while a directory keeps its B+tree root (`dir_root` and that root's
+// `dir_root_crc`) in the same bytes and leaves the extent fields zero. `extents` is the
+// in-memory extent map of a file: `parse` fills only the EXTENTS_INLINE inline runs, and
+// [`LiberFs::read_inode`] completes it from the overflow chain rooted at `spill`.
 struct Inode {
 	kind: u8,
 	size: u64,
@@ -289,34 +314,49 @@ struct Inode {
 	mtime: u64,
 	// An opaque owner / ACL tag, stored but never interpreted by the filesystem.
 	owner_tag: [u8; OWNER_TAG_LEN],
+	// File mapping: the extent runs, the overflow chain pointer, and the total run count.
 	extents: Vec<Extent>,
 	spill: u64,
 	spill_crc: u32,
 	extent_count: u32,
+	// Directory mapping: the root block of this directory's name-keyed B+tree and that
+	// root node's CRC32C (0 / 0 for an empty directory). Overlaid on the file fields.
+	dir_root: u64,
+	dir_root_crc: u32,
 }
 
 impl Inode {
 	fn empty(kind: u8) -> Inode {
-		Inode { kind, size: 0, ctime: 0, mtime: 0, owner_tag: [0u8; OWNER_TAG_LEN], extents: Vec::new(), spill: 0, spill_crc: 0, extent_count: 0 }
+		Inode { kind, size: 0, ctime: 0, mtime: 0, owner_tag: [0u8; OWNER_TAG_LEN], extents: Vec::new(), spill: 0, spill_crc: 0, extent_count: 0, dir_root: 0, dir_root_crc: 0 }
 	}
 
-	// Parse the fixed header and the inline extents; any spilled extents (when
-	// `extent_count` exceeds EXTENTS_INLINE) are appended afterwards by `read_inode`.
+	// Parse the fixed header and, for a file, the inline extents (any spilled ones are
+	// appended afterwards by `read_inode`); for a directory, the B+tree root pointer.
 	fn parse(buf: &[u8]) -> Inode {
-		let extent_count = u32::from_le_bytes(buf[44..48].try_into().unwrap());
-		let inline = (extent_count as usize).min(EXTENTS_INLINE);
-		let mut extents = Vec::with_capacity(inline);
-		for i in 0..inline {
-			let off = EXTENT_OFF + i * EXTENT_SIZE;
-			extents.push(Extent::parse(&buf[off..off + EXTENT_SIZE]));
-		}
+		let kind = buf[0];
 		let mut owner_tag = [0u8; OWNER_TAG_LEN];
 		owner_tag.copy_from_slice(&buf[OWNER_TAG_OFF..OWNER_TAG_OFF + OWNER_TAG_LEN]);
-		Inode { kind: buf[0], size: u64::from_le_bytes(buf[8..16].try_into().unwrap()), ctime: u64::from_le_bytes(buf[16..24].try_into().unwrap()), mtime: u64::from_le_bytes(buf[24..32].try_into().unwrap()), owner_tag, extents, spill: u64::from_le_bytes(buf[32..40].try_into().unwrap()), spill_crc: u32::from_le_bytes(buf[40..44].try_into().unwrap()), extent_count }
+		let mut inode = Inode { kind, size: u64::from_le_bytes(buf[8..16].try_into().unwrap()), ctime: u64::from_le_bytes(buf[16..24].try_into().unwrap()), mtime: u64::from_le_bytes(buf[24..32].try_into().unwrap()), owner_tag, extents: Vec::new(), spill: 0, spill_crc: 0, extent_count: 0, dir_root: 0, dir_root_crc: 0 };
+		if kind == KIND_DIR {
+			inode.dir_root = u64::from_le_bytes(buf[32..40].try_into().unwrap());
+			inode.dir_root_crc = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+		} else {
+			inode.spill = u64::from_le_bytes(buf[32..40].try_into().unwrap());
+			inode.spill_crc = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+			inode.extent_count = u32::from_le_bytes(buf[44..48].try_into().unwrap());
+			let inline = (inode.extent_count as usize).min(EXTENTS_INLINE);
+			inode.extents.reserve(inline);
+			for i in 0..inline {
+				let off = EXTENT_OFF + i * EXTENT_SIZE;
+				inode.extents.push(Extent::parse(&buf[off..off + EXTENT_SIZE]));
+			}
+		}
+		inode
 	}
 
-	// Render the header and the first EXTENTS_INLINE extents into the 256-byte slot. The
-	// `spill` / `spill_crc` / `extent_count` header fields and the overflow chain are set
+	// Render the header into the 256-byte slot, then either the file's overflow fields
+	// and first EXTENTS_INLINE extents or the directory's B+tree root. For a file, the
+	// `spill` / `spill_crc` / `extent_count` fields and the overflow chain are set
 	// beforehand by [`LiberFs::flush_extents`], which `write_inode` always calls first.
 	fn write(&self, buf: &mut [u8]) {
 		for b in buf[..INODE_SIZE].iter_mut() {
@@ -326,13 +366,18 @@ impl Inode {
 		buf[8..16].copy_from_slice(&self.size.to_le_bytes());
 		buf[16..24].copy_from_slice(&self.ctime.to_le_bytes());
 		buf[24..32].copy_from_slice(&self.mtime.to_le_bytes());
-		buf[32..40].copy_from_slice(&self.spill.to_le_bytes());
-		buf[40..44].copy_from_slice(&self.spill_crc.to_le_bytes());
-		buf[44..48].copy_from_slice(&self.extent_count.to_le_bytes());
 		buf[OWNER_TAG_OFF..OWNER_TAG_OFF + OWNER_TAG_LEN].copy_from_slice(&self.owner_tag);
-		for (i, ext) in self.extents.iter().take(EXTENTS_INLINE).enumerate() {
-			let off = EXTENT_OFF + i * EXTENT_SIZE;
-			ext.write(&mut buf[off..off + EXTENT_SIZE]);
+		if self.kind == KIND_DIR {
+			buf[32..40].copy_from_slice(&self.dir_root.to_le_bytes());
+			buf[40..44].copy_from_slice(&self.dir_root_crc.to_le_bytes());
+		} else {
+			buf[32..40].copy_from_slice(&self.spill.to_le_bytes());
+			buf[40..44].copy_from_slice(&self.spill_crc.to_le_bytes());
+			buf[44..48].copy_from_slice(&self.extent_count.to_le_bytes());
+			for (i, ext) in self.extents.iter().take(EXTENTS_INLINE).enumerate() {
+				let off = EXTENT_OFF + i * EXTENT_SIZE;
+				ext.write(&mut buf[off..off + EXTENT_SIZE]);
+			}
 		}
 	}
 
@@ -342,97 +387,91 @@ impl Inode {
 	}
 }
 
-// A mounted LiberFS over a block device. Copy-on-write: the inode table is reached
-// through an in-memory `itable` (the (block, CRC32C) of each inode-table block, kept
-// in sync with the index block) rather than a fixed region, and `free` is rebuilt at
-// mount from the blocks the live and previous generations reference - there is no
-// on-disk bitmap. `clock` is a logical timestamp the caller can advance (no wall clock
-// lives in this crate); mutations stamp inode `mtime` from it.
+// The outcome of inserting into a B+tree subtree: either the node was rewritten in
+// place (its new (ptr, crc)) or it split into two, lifting a separator key to the
+// parent: left (ptr, crc), the separator, right (ptr, crc).
+enum Ins {
+	Updated(u64, u32),
+	Split(u64, u32, u64, u64, u32),
+}
+
+// The outcome of deleting from a B+tree subtree: the key was not present, the node was
+// rewritten (its new (ptr, crc)), or the node emptied and the parent should drop it.
+enum Del {
+	NotFound,
+	Updated(u64, u32),
+	Empty,
+}
+
+// A mounted LiberFS over a block device. Copy-on-write: the inodes are reached through
+// the in-memory root of the inode B+tree (`inode_root` and its CRC32C) rather than a
+// fixed region, and `free` is rebuilt at mount from the blocks the live and previous
+// generations reference - there is no on-disk bitmap. `next_inode` hands out fresh inode
+// numbers monotonically. `clock` is a logical timestamp the caller can advance (no wall
+// clock lives in this crate); mutations stamp inode `mtime` from it.
 //
-// A mutation runs as a transaction: `begin` snapshots `itable`, the body allocates
-// fresh blocks (tracked in `fresh`) and copies metadata up, and `commit` writes a new
-// superblock to the inactive slot - or `abort` rolls back. The previous generation's
-// `itable` and index stay reserved so it remains a read-only snapshot.
+// A mutation runs as a transaction: `begin` snapshots the inode-tree root and
+// `next_inode`, the body allocates fresh blocks (tracked in `fresh`) and copies metadata
+// up the trees, and `commit` writes a new superblock to the inactive slot - or `abort`
+// rolls back. The previous generation's root stays reserved so it remains a read-only
+// snapshot.
 pub struct LiberFs<D: BlockDevice> {
 	dev: D,
 	num_blocks: u64,
-	num_inodes: u32,
-	inode_blocks: u32,
 	root_inode: u32,
-	// Live generation: its number, the superblock slot (0 or 1) it occupies, and the
-	// per-inode-table-block (pointer, CRC32C) pairs plus the index block holding them.
+	// Live generation: its number and the superblock slot (0 or 1) it occupies.
 	generation: u64,
 	slot: u32,
-	itable: Vec<(u64, u32)>,
-	itable_index: u64,
-	// The previous generation (the read-only snapshot), if any: its inode table and
-	// index, kept reserved so a commit does not reuse its blocks.
-	prev_itable: Option<Vec<(u64, u32)>>,
-	prev_index: u64,
+	// The inode B+tree: the root node's block and CRC32C, plus the next inode number to
+	// hand out.
+	inode_root: u64,
+	inode_root_crc: u32,
+	next_inode: u32,
+	// The previous generation (the read-only snapshot), if any: its inode-tree root, kept
+	// reserved so a commit does not reuse its blocks.
+	prev_inode_root: u64,
+	prev_inode_root_crc: u32,
+	prev_valid: bool,
 	// In-memory free map, one bit per block, derived at mount and after each commit -
 	// never written to disk.
 	free: Vec<u8>,
 	// Blocks allocated by the in-flight transaction: safe to overwrite in place (no
 	// committed generation references them yet).
 	fresh: BTreeSet<u64>,
-	// The `itable` snapshot taken at `begin`, restored by `abort` and used by `commit`
-	// to reserve the generation it supersedes.
-	txn_itable: Option<Vec<(u64, u32)>>,
+	// The (inode_root, inode_root_crc, next_inode) snapshot taken at `begin`, restored by
+	// `abort` and used by `commit` to reserve the generation it supersedes.
+	txn: Option<(u64, u32, u32)>,
 	clock: u64,
 }
 
 impl<D: BlockDevice> LiberFs<D> {
 	// Format `dev` as a fresh, empty LiberFS spanning `num_blocks` blocks (an empty root
 	// directory, no files), then return it mounted. Generation 0 lays out the two
-	// superblock slots, the inode-table blocks, and the index block; everything else is
-	// the free pool. The inode table scales with the volume but is capped so its index
-	// fits one block.
+	// superblock slots and a single inode-tree leaf holding the root directory inode;
+	// everything else is the free pool. Inodes and directory nodes are allocated on
+	// demand thereafter, so a fresh volume reserves no fixed inode region.
 	pub fn format(mut dev: D, num_blocks: u64) -> Result<LiberFs<D>, FsError> {
-		// scale the inode count with the volume, rounded up to whole inode blocks, and
-		// capped so the whole inode-table index fits one block.
-		let want_inodes = (num_blocks / BLOCKS_PER_INODE as u64).max(MIN_INODES as u64);
-		let mut inode_blocks = (want_inodes as usize * INODE_SIZE).div_ceil(BLOCK_SIZE) as u32;
-		if inode_blocks > PTRS_PER_BLOCK as u32 {
-			inode_blocks = PTRS_PER_BLOCK as u32;
-		}
-		let num_inodes = inode_blocks * INODES_PER_BLOCK as u32;
-
-		// generation-0 layout: [slot 0][slot 1][inode-table blocks][index block], then
-		// the free pool. The root directory inode starts empty (no data blocks).
-		let index_block: u64 = POOL_START + inode_blocks as u64;
-		if num_blocks <= index_block + 1 {
+		// generation-0 layout: [slot 0][slot 1][inode-tree root leaf], then the free
+		// pool. The root directory inode starts empty (no entries, no B+tree yet).
+		if num_blocks <= POOL_START + 1 {
 			return Err(FsError::Invalid);
 		}
+		let leaf_block: u64 = POOL_START;
 
-		// write the inode-table blocks (all free but the root directory at inode 0) and
-		// record each block's (pointer, CRC32C) in the index.
-		let zero = vec![0u8; BLOCK_SIZE];
-		let mut itable = Vec::with_capacity(inode_blocks as usize);
-		for b in 0..inode_blocks {
-			let mut block = zero.clone();
-			if b == 0 {
-				Inode::empty(KIND_DIR).write(&mut block[0..INODE_SIZE]);
-			}
-			let ptr = POOL_START + b as u64;
-			if !dev.write_block(ptr, &block) {
-				return Err(FsError::Io);
-			}
-			itable.push((ptr, crc32c(&block)));
-		}
-		let mut index = vec![0u8; BLOCK_SIZE];
-		for (i, &(ptr, crc)) in itable.iter().enumerate() {
-			let off = i * ENTRY_SIZE;
-			index[off..off + 8].copy_from_slice(&ptr.to_le_bytes());
-			index[off + 8..off + 12].copy_from_slice(&crc.to_le_bytes());
-		}
-		if !dev.write_block(index_block, &index) {
+		// the inode tree's sole leaf: one record keyed by inode 0 (the root directory).
+		let mut leaf = vec![0u8; BLOCK_SIZE];
+		node_set_header(&mut leaf, NODE_LEAF, 1);
+		leaf[NODE_HDR..NODE_HDR + 8].copy_from_slice(&(ROOT_INODE as u64).to_le_bytes());
+		Inode::empty(KIND_DIR).write(&mut leaf[NODE_HDR + 8..NODE_HDR + 8 + INODE_SIZE]);
+		if !dev.write_block(leaf_block, &leaf) {
 			return Err(FsError::Io);
 		}
-		let index_crc = crc32c(&index);
+		let leaf_crc = crc32c(&leaf);
 
 		// generation 0 in slot 0; slot 1 left invalid (zeroed) until the first commit
 		// ping-pongs onto it.
-		let sb = Superblock { num_blocks, num_inodes, inode_blocks, generation: 0, itable_index: index_block, itable_index_crc: index_crc, root_inode: ROOT_INODE };
+		let zero = vec![0u8; BLOCK_SIZE];
+		let sb = Superblock { num_blocks, generation: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, root_inode: ROOT_INODE };
 		if !dev.write_block(0, &serialize_superblock(&sb)) {
 			return Err(FsError::Io);
 		}
@@ -440,7 +479,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Io);
 		}
 
-		let mut fs = LiberFs { dev, num_blocks, num_inodes, inode_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, itable, itable_index: index_block, prev_itable: None, prev_index: 0, free: vec![0u8; (num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn_itable: None, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, free: vec![0u8; (num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, clock: 0 };
 		fs.derive_free()?;
 		Ok(fs)
 	}
@@ -485,38 +524,17 @@ impl<D: BlockDevice> LiberFs<D> {
 		};
 
 		let sb = slots[cur_slot as usize]?;
-		let itable = Self::load_itable(&mut dev, &sb)?;
-		let (prev_itable, prev_index) = match prev_slot {
+		let (prev_inode_root, prev_inode_root_crc, prev_valid) = match prev_slot {
 			Some(ps) => {
 				let psb = slots[ps as usize]?;
-				(Some(Self::load_itable(&mut dev, &psb)?), psb.itable_index)
+				(psb.inode_root, psb.inode_root_crc, true)
 			}
-			None => (None, 0),
+			None => (0, 0, false),
 		};
 
-		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, num_inodes: sb.num_inodes, inode_blocks: sb.inode_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, itable, itable_index: sb.itable_index, prev_itable, prev_index, free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn_itable: None, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, clock: 0 };
 		fs.derive_free().ok()?;
 		Some(fs)
-	}
-
-	// Read the inode-table index block named by `sb` and parse it into the per-block
-	// (pointer, CRC32C) table. Fails if the index block does not match its checksum.
-	fn load_itable(dev: &mut D, sb: &Superblock) -> Option<Vec<(u64, u32)>> {
-		let mut idx = vec![0u8; BLOCK_SIZE];
-		if !dev.read_block(sb.itable_index, &mut idx) {
-			return None;
-		}
-		if crc32c(&idx) != sb.itable_index_crc {
-			return None;
-		}
-		let mut itable = Vec::with_capacity(sb.inode_blocks as usize);
-		for i in 0..sb.inode_blocks as usize {
-			let off = i * ENTRY_SIZE;
-			let ptr = u64::from_le_bytes(idx[off..off + 8].try_into().ok()?);
-			let crc = u32::from_le_bytes(idx[off + 8..off + 12].try_into().ok()?);
-			itable.push((ptr, crc));
-		}
-		Some(itable)
 	}
 
 	// Resolve a path to its inode number, or None if any segment is missing.
@@ -593,9 +611,9 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	fn write_file_inner(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
 		let (parent, name) = self.resolve_parent(path, true)?;
-		let existing = self.dir_find_in(parent, name);
+		let existing = self.dir_lookup(parent, name)?;
 		let old = match existing {
-			Some((num, _, _)) => {
+			Some(num) => {
 				let inode = self.read_inode(num)?;
 				if inode.kind != KIND_FILE {
 					return Err(FsError::Invalid);
@@ -634,7 +652,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// them as the snapshot, and the next commit reclaims them.
 		self.write_inode(inode_num, &mut inode)?;
 		if old.is_none() {
-			self.dir_add(parent, name, inode_num)?;
+			self.dir_insert(parent, name, inode_num)?;
 		}
 		Ok(())
 	}
@@ -650,16 +668,16 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	fn remove_inner(&mut self, path: &[u8]) -> Result<(), FsError> {
 		let (parent, name) = self.resolve_parent(path, false)?;
-		let inode_num = self.dir_find_in(parent, name).ok_or(FsError::NotFound)?.0;
+		let inode_num = self.dir_lookup(parent, name)?.ok_or(FsError::NotFound)?;
 		let inode = self.read_inode(inode_num)?;
-		if inode.kind == KIND_DIR && !self.read_dir_inode(inode_num)?.is_empty() {
+		if inode.kind == KIND_DIR && inode.size != 0 {
 			return Err(FsError::Invalid);
 		}
 
 		// clear the directory entry and free the inode in the new generation; its old
 		// blocks remain referenced by the previous generation.
-		self.dir_clear(parent, name)?;
-		self.write_inode(inode_num, &mut Inode::empty(KIND_FREE))?;
+		self.dir_remove(parent, name)?;
+		self.free_inode(inode_num)?;
 		Ok(())
 	}
 
@@ -729,8 +747,8 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	fn write_at_inner(&mut self, path: &[u8], offset: u64, data: &[u8]) -> Result<(), FsError> {
 		let (parent, name) = self.resolve_parent(path, true)?;
-		let inode_num = match self.dir_find_in(parent, name) {
-			Some((num, _, _)) => {
+		let inode_num = match self.dir_lookup(parent, name)? {
+			Some(num) => {
 				if self.read_inode(num)?.kind != KIND_FILE {
 					return Err(FsError::Invalid);
 				}
@@ -742,7 +760,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				f.ctime = self.clock;
 				f.mtime = self.clock;
 				self.write_inode(num, &mut f)?;
-				self.dir_add(parent, name, num)?;
+				self.dir_insert(parent, name, num)?;
 				num
 			}
 		};
@@ -850,7 +868,7 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	fn rename_inner(&mut self, from: &[u8], to: &[u8]) -> Result<(), FsError> {
 		let (pf, nf) = self.resolve_parent(from, false)?;
-		let inode_f = self.dir_find_in(pf, nf).ok_or(FsError::NotFound)?.0;
+		let inode_f = self.dir_lookup(pf, nf)?.ok_or(FsError::NotFound)?;
 		let from_inode = self.read_inode(inode_f)?;
 		let (pt, nt) = self.resolve_parent(to, true)?;
 
@@ -859,13 +877,13 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Invalid);
 		}
 
-		let dest = self.dir_find_in(pt, nt).map(|(num, _, _)| num);
+		let dest = self.dir_lookup(pt, nt)?;
 		if let Some(inode_t) = dest {
 			if inode_t == inode_f {
 				return Ok(());
 			}
 			let ti = self.read_inode(inode_t)?;
-			if ti.kind == KIND_DIR && !self.read_dir_inode(inode_t)?.is_empty() {
+			if ti.kind == KIND_DIR && ti.size != 0 {
 				return Err(FsError::Invalid);
 			}
 		}
@@ -873,11 +891,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		// point the destination name at the moved inode (add or overwrite), clear the
 		// source entry, and free the inode the destination used to hold. Its old blocks
 		// stay with the previous generation; the next commit reclaims them.
-		self.dir_set(pt, nt, inode_f)?;
-		self.dir_clear(pf, nf)?;
+		self.dir_insert(pt, nt, inode_f)?;
+		self.dir_remove(pf, nf)?;
 		if let Some(inode_t) = dest {
 			if inode_t != inode_f {
-				self.write_inode(inode_t, &mut Inode::empty(KIND_FREE))?;
+				self.free_inode(inode_t)?;
 			}
 		}
 		Ok(())
@@ -892,42 +910,54 @@ impl<D: BlockDevice> LiberFs<D> {
 	// which is a no-op on a consistent volume.
 	pub fn fsck(&mut self) -> Result<FsckReport, FsError> {
 		self.derive_free()?;
-		let mut checksum_failures = 0;
-		for num in 0..self.num_inodes {
-			let inode = self.read_inode(num)?;
-			if inode.kind != KIND_FREE {
-				checksum_failures += self.count_corrupt(&inode)?;
+		let checksum_failures = self.check_inode_tree(self.inode_root, self.inode_root_crc)?;
+		Ok(FsckReport { reclaimed_blocks: 0, reclaimed_inodes: 0, checksum_failures })
+	}
+
+	// Walk the inode B+tree, verifying every node against its stored checksum, and sum
+	// the corrupt data blocks of every live file.
+	fn check_inode_tree(&mut self, ptr: u64, crc: u32) -> Result<u32, FsError> {
+		if ptr == 0 {
+			return Ok(0);
+		}
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		self.read_node(ptr, crc, &mut buf)?;
+		let count = node_count(&buf);
+		let mut bad = 0;
+		if node_type(&buf) == NODE_LEAF {
+			for i in 0..count {
+				let off = NODE_HDR + i * INODE_REC + 8;
+				let mut inode = Inode::parse(&buf[off..off + INODE_SIZE]);
+				if inode.kind == KIND_FILE {
+					self.load_spill(&mut inode)?;
+					bad += self.count_corrupt(&inode)?;
+				}
+			}
+		} else {
+			for i in 0..=count {
+				bad += self.check_inode_tree(child_ptr(&buf, i), child_crc(&buf, i))?;
 			}
 		}
-		Ok(FsckReport { reclaimed_blocks: 0, reclaimed_inodes: 0, checksum_failures })
+		Ok(bad)
 	}
 
 	// transactions
 
-	// Begin a mutation: snapshot the inode table so it can be restored on failure and
-	// reserved as the previous generation on commit, and clear the fresh-block set.
+	// Begin a mutation: snapshot the inode-tree root and next-inode counter so they can
+	// be restored on failure and reserved as the previous generation on commit, and
+	// clear the fresh-block set.
 	fn begin(&mut self) {
-		self.txn_itable = Some(self.itable.clone());
+		self.txn = Some((self.inode_root, self.inode_root_crc, self.next_inode));
 		self.fresh.clear();
 	}
 
-	// Commit the in-flight mutation: write the new inode-table index, then a new
-	// superblock (incremented generation) to the inactive slot - the single atomic
-	// write that publishes the whole transaction. The superseded generation becomes the
-	// read-only snapshot; the one before it is reclaimed by rederiving the free map.
+	// Commit the in-flight mutation: write a new superblock (incremented generation,
+	// carrying the new inode-tree root and next-inode counter) to the inactive slot -
+	// the single atomic write that publishes the whole transaction. The superseded
+	// generation becomes the read-only snapshot; the one before it is reclaimed by
+	// rederiving the free map.
 	fn commit(&mut self) -> Result<(), FsError> {
-		// the index block holding the (pointer, CRC32C) of every inode-table block.
-		let new_index = self.alloc_meta()?;
-		let mut index = vec![0u8; BLOCK_SIZE];
-		for (i, &(ptr, crc)) in self.itable.iter().enumerate() {
-			let off = i * ENTRY_SIZE;
-			index[off..off + 8].copy_from_slice(&ptr.to_le_bytes());
-			index[off + 8..off + 12].copy_from_slice(&crc.to_le_bytes());
-		}
-		if !self.dev.write_block(new_index, &index) {
-			return Err(FsError::Io);
-		}
-		let sb = Superblock { num_blocks: self.num_blocks, num_inodes: self.num_inodes, inode_blocks: self.inode_blocks, generation: self.generation + 1, itable_index: new_index, itable_index_crc: crc32c(&index), root_inode: self.root_inode };
+		let sb = Superblock { num_blocks: self.num_blocks, generation: self.generation + 1, inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, root_inode: self.root_inode };
 		let new_slot = (self.slot + 1) % SUPER_SLOTS;
 		// the commit point: a single superblock write swaps the live root atomically.
 		if !self.dev.write_block(new_slot as u64, &serialize_superblock(&sb)) {
@@ -936,19 +966,24 @@ impl<D: BlockDevice> LiberFs<D> {
 
 		// the generation this commit superseded becomes the snapshot; its blocks stay
 		// reserved by the rederived free map.
-		self.prev_itable = self.txn_itable.take();
-		self.prev_index = self.itable_index;
+		if let Some((proot, pcrc, _)) = self.txn.take() {
+			self.prev_inode_root = proot;
+			self.prev_inode_root_crc = pcrc;
+			self.prev_valid = true;
+		}
 		self.generation += 1;
 		self.slot = new_slot;
-		self.itable_index = new_index;
 		self.derive_free()
 	}
 
-	// Roll back a failed mutation: restore the inode table and rederive the free map, so
-	// the half-written fresh blocks are forgotten and on-disk state is untouched.
+	// Roll back a failed mutation: restore the inode-tree root and next-inode counter and
+	// rederive the free map, so the half-written fresh blocks are forgotten and on-disk
+	// state is untouched.
 	fn abort(&mut self) {
-		if let Some(saved) = self.txn_itable.take() {
-			self.itable = saved;
+		if let Some((root, crc, next)) = self.txn.take() {
+			self.inode_root = root;
+			self.inode_root_crc = crc;
+			self.next_inode = next;
 		}
 		self.fresh.clear();
 		let _ = self.derive_free();
@@ -972,68 +1007,429 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut map = vec![0u8; self.free.len()];
 		set_bit(&mut map, 0);
 		set_bit(&mut map, 1);
-		let cur = self.itable.clone();
-		self.mark_generation(self.itable_index, &cur, &mut map)?;
-		if let Some(prev) = self.prev_itable.clone() {
-			self.mark_generation(self.prev_index, &prev, &mut map)?;
+		self.mark_inode_tree(self.inode_root, &mut map)?;
+		if self.prev_valid {
+			self.mark_inode_tree(self.prev_inode_root, &mut map)?;
 		}
 		self.free = map;
 		Ok(())
 	}
 
-	// Mark, in `map`, the index block and every block one generation references: each
-	// inode-table block, and the data, checksum and extent-overflow blocks of each live
-	// inode in it.
-	fn mark_generation(&mut self, index_block: u64, itable: &[(u64, u32)], map: &mut [u8]) -> Result<(), FsError> {
-		set_bit(map, index_block);
-		let mut block = vec![0u8; BLOCK_SIZE];
-		for &(tbl_ptr, _) in itable {
-			set_bit(map, tbl_ptr);
-			if !self.dev.read_block(tbl_ptr, &mut block) {
-				return Err(FsError::Io);
-			}
-			for slot in 0..INODES_PER_BLOCK {
-				let mut inode = Inode::parse(&block[slot * INODE_SIZE..slot * INODE_SIZE + INODE_SIZE]);
-				if inode.kind != KIND_FREE {
+	// Mark, in `map`, every block the inode B+tree rooted at `ptr` references: the tree
+	// nodes themselves, and for each live inode either its file data / checksum /
+	// overflow blocks or its directory's B+tree. Reads are raw (no checksum check), like
+	// the old generation walk, so a corrupt block does not abort the mount or rebuild.
+	fn mark_inode_tree(&mut self, ptr: u64, map: &mut [u8]) -> Result<(), FsError> {
+		if ptr == 0 {
+			return Ok(());
+		}
+		set_bit(map, ptr);
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		if !self.dev.read_block(ptr, &mut buf) {
+			return Err(FsError::Io);
+		}
+		let count = node_count(&buf);
+		if node_type(&buf) == NODE_LEAF {
+			for i in 0..count {
+				let off = NODE_HDR + i * INODE_REC + 8;
+				let mut inode = Inode::parse(&buf[off..off + INODE_SIZE]);
+				if inode.kind == KIND_FILE {
 					// complete the extent map from the overflow chain before marking.
 					self.load_spill(&mut inode)?;
 					self.collect_inode_blocks(&inode, map)?;
+				} else if inode.kind == KIND_DIR {
+					self.mark_dir_tree(inode.dir_root, map)?;
 				}
+			}
+		} else {
+			for i in 0..=count {
+				self.mark_inode_tree(child_ptr(&buf, i), map)?;
 			}
 		}
 		Ok(())
 	}
 
-	// inode I/O
-
-	// Locate inode `num`: the index of its inode-table block in `itable` and its byte
-	// offset within that block.
-	fn inode_location(&self, num: u32) -> (usize, usize) {
-		let block = num as usize / INODES_PER_BLOCK;
-		let offset = (num as usize % INODES_PER_BLOCK) * INODE_SIZE;
-		(block, offset)
-	}
-
-	fn read_inode(&mut self, num: u32) -> Result<Inode, FsError> {
-		if num >= self.num_inodes {
-			return Err(FsError::Invalid);
+	// Mark every node block of a directory's B+tree. The entries themselves point at
+	// inodes, which the inode-tree walk already covers, so only the nodes are marked.
+	fn mark_dir_tree(&mut self, ptr: u64, map: &mut [u8]) -> Result<(), FsError> {
+		if ptr == 0 {
+			return Ok(());
 		}
-		let (tbl, offset) = self.inode_location(num);
-		let (ptr, crc) = self.itable[tbl];
-		let mut block = vec![0u8; BLOCK_SIZE];
-		if !self.dev.read_block(ptr, &mut block) {
+		set_bit(map, ptr);
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		if !self.dev.read_block(ptr, &mut buf) {
 			return Err(FsError::Io);
 		}
-		// the inode-table block carries its own checksum (in the index), so a flipped
-		// bit in the metadata is caught too.
-		if crc32c(&block) != crc {
+		if node_type(&buf) == NODE_INTERNAL {
+			let count = node_count(&buf);
+			for i in 0..=count {
+				self.mark_dir_tree(child_ptr(&buf, i), map)?;
+			}
+		}
+		Ok(())
+	}
+
+	// B+tree node and generic tree operations
+
+	// Read a B+tree node block, verifying it against the CRC32C its parent link stored.
+	// A mismatch is FsError::Corrupt, so on-disk damage to a tree node is caught on the
+	// live path (lookup / insert / delete / enumeration / fsck).
+	fn read_node(&mut self, ptr: u64, crc: u32, buf: &mut [u8]) -> Result<(), FsError> {
+		if !self.dev.read_block(ptr, buf) {
+			return Err(FsError::Io);
+		}
+		if crc32c(buf) != crc {
 			return Err(FsError::Corrupt);
 		}
-		let mut inode = Inode::parse(&block[offset..offset + INODE_SIZE]);
-		// complete the extent map from the overflow chain (a no-op for a file whose
-		// runs all fit inline).
-		self.load_spill(&mut inode)?;
-		Ok(inode)
+		Ok(())
+	}
+
+	// The block to write an updated node to: reuse one this transaction already
+	// allocated (overwrite in place), else copy up to a fresh metadata block so the
+	// committed generation keeps the original.
+	fn node_dest(&mut self, ptr: u64) -> Result<u64, FsError> {
+		if ptr != 0 && self.fresh.contains(&ptr) {
+			Ok(ptr)
+		} else {
+			self.alloc_meta()
+		}
+	}
+
+	// Write `buf` to block `ptr` and return its CRC32C (to store in the parent link).
+	fn write_node_to(&mut self, ptr: u64, buf: &[u8]) -> Result<u32, FsError> {
+		if !self.dev.write_block(ptr, buf) {
+			return Err(FsError::Io);
+		}
+		Ok(crc32c(buf))
+	}
+
+	// Look up `key` in the B+tree rooted at (`root`, `root_crc`), returning the matching
+	// leaf record (whose leading `probe.len()` bytes equal `probe`) or None. `rec` is the
+	// record width. Internal nodes route by the numeric u64 `key`; a leaf is searched by
+	// the full probe so records sharing a u64 key are disambiguated by the bytes after it.
+	fn tree_lookup(&mut self, root: u64, root_crc: u32, key: u64, probe: &[u8], rec: usize) -> Result<Option<Vec<u8>>, FsError> {
+		if root == 0 {
+			return Ok(None);
+		}
+		let mut ptr = root;
+		let mut crc = root_crc;
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		loop {
+			self.read_node(ptr, crc, &mut buf)?;
+			let count = node_count(&buf);
+			if node_type(&buf) == NODE_LEAF {
+				let (mut lo, mut hi) = (0usize, count);
+				while lo < hi {
+					let mid = (lo + hi) / 2;
+					let off = NODE_HDR + mid * rec;
+					match key_cmp(&buf[off..off + probe.len()], probe) {
+						Ordering::Less => lo = mid + 1,
+						Ordering::Greater => hi = mid,
+						Ordering::Equal => return Ok(Some(buf[off..off + rec].to_vec())),
+					}
+				}
+				return Ok(None);
+			}
+			// internal: route to the child whose range holds `key`.
+			let mut ci = 0;
+			while ci < count && sep_key(&buf, ci) <= key {
+				ci += 1;
+			}
+			ptr = child_ptr(&buf, ci);
+			crc = child_crc(&buf, ci);
+		}
+	}
+
+	// Insert or overwrite `record` (numeric key `key`, full key width `keylen`) in the
+	// B+tree rooted at (`root`, `root_crc`); `rec` is the record width and `leaf_max` the
+	// leaf capacity. Returns the new root (ptr, crc). Copy-on-write: every node on the
+	// path is rewritten to a fresh block (or in place if already fresh this transaction).
+	fn tree_insert(&mut self, root: u64, root_crc: u32, key: u64, record: &[u8], rec: usize, leaf_max: usize, keylen: usize) -> Result<(u64, u32), FsError> {
+		if root == 0 {
+			// empty tree: a new leaf with the single record.
+			let blk = self.alloc_meta()?;
+			let mut buf = vec![0u8; BLOCK_SIZE];
+			node_set_header(&mut buf, NODE_LEAF, 1);
+			buf[NODE_HDR..NODE_HDR + rec].copy_from_slice(record);
+			let crc = self.write_node_to(blk, &buf)?;
+			return Ok((blk, crc));
+		}
+		match self.tree_insert_node(root, root_crc, key, record, rec, leaf_max, keylen)? {
+			Ins::Updated(p, c) => Ok((p, c)),
+			Ins::Split(lp, lc, sep, rp, rc) => {
+				// the root split: build a new internal root over the two halves.
+				let blk = self.alloc_meta()?;
+				let mut buf = vec![0u8; BLOCK_SIZE];
+				node_set_header(&mut buf, NODE_INTERNAL, 1);
+				set_sep(&mut buf, 0, sep);
+				set_child(&mut buf, 0, lp, lc);
+				set_child(&mut buf, 1, rp, rc);
+				let crc = self.write_node_to(blk, &buf)?;
+				Ok((blk, crc))
+			}
+		}
+	}
+
+	fn tree_insert_node(&mut self, ptr: u64, crc: u32, key: u64, record: &[u8], rec: usize, leaf_max: usize, keylen: usize) -> Result<Ins, FsError> {
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		self.read_node(ptr, crc, &mut buf)?;
+		let count = node_count(&buf);
+		if node_type(&buf) == NODE_LEAF {
+			// find the insert position, or an exact match by the full key.
+			let (mut lo, mut hi) = (0usize, count);
+			let mut exact = false;
+			while lo < hi {
+				let mid = (lo + hi) / 2;
+				let off = NODE_HDR + mid * rec;
+				match key_cmp(&buf[off..off + keylen], &record[..keylen]) {
+					Ordering::Less => lo = mid + 1,
+					Ordering::Greater => hi = mid,
+					Ordering::Equal => {
+						exact = true;
+						lo = mid;
+						break;
+					}
+				}
+			}
+			let pos = lo;
+			if exact {
+				// overwrite in place (after copying the node up).
+				let dest = self.node_dest(ptr)?;
+				let off = NODE_HDR + pos * rec;
+				buf[off..off + rec].copy_from_slice(record);
+				let ncrc = self.write_node_to(dest, &buf)?;
+				return Ok(Ins::Updated(dest, ncrc));
+			}
+			if count < leaf_max {
+				// insert, shifting the tail right by one record.
+				let dest = self.node_dest(ptr)?;
+				let start = NODE_HDR + pos * rec;
+				let end = NODE_HDR + count * rec;
+				buf.copy_within(start..end, start + rec);
+				buf[start..start + rec].copy_from_slice(record);
+				node_set_header(&mut buf, NODE_LEAF, count + 1);
+				let ncrc = self.write_node_to(dest, &buf)?;
+				return Ok(Ins::Updated(dest, ncrc));
+			}
+			// full: gather every record with the new one inserted, then split in two.
+			let mut recs: Vec<Vec<u8>> = Vec::with_capacity(count + 1);
+			for i in 0..count {
+				let off = NODE_HDR + i * rec;
+				recs.push(buf[off..off + rec].to_vec());
+			}
+			recs.insert(pos, record.to_vec());
+			let split = leaf_split_point(&recs);
+			let left_dest = self.node_dest(ptr)?;
+			let right_dest = self.alloc_meta()?;
+			let mut lbuf = vec![0u8; BLOCK_SIZE];
+			node_set_header(&mut lbuf, NODE_LEAF, split);
+			for (i, r) in recs[..split].iter().enumerate() {
+				let off = NODE_HDR + i * rec;
+				lbuf[off..off + rec].copy_from_slice(r);
+			}
+			let mut rbuf = vec![0u8; BLOCK_SIZE];
+			node_set_header(&mut rbuf, NODE_LEAF, recs.len() - split);
+			for (i, r) in recs[split..].iter().enumerate() {
+				let off = NODE_HDR + i * rec;
+				rbuf[off..off + rec].copy_from_slice(r);
+			}
+			let lcrc = self.write_node_to(left_dest, &lbuf)?;
+			let rcrc = self.write_node_to(right_dest, &rbuf)?;
+			let sep = u64::from_le_bytes(recs[split][0..8].try_into().unwrap());
+			return Ok(Ins::Split(left_dest, lcrc, sep, right_dest, rcrc));
+		}
+		// internal: route to a child and recurse.
+		let mut ci = 0;
+		while ci < count && sep_key(&buf, ci) <= key {
+			ci += 1;
+		}
+		let cp = child_ptr(&buf, ci);
+		let cc = child_crc(&buf, ci);
+		match self.tree_insert_node(cp, cc, key, record, rec, leaf_max, keylen)? {
+			Ins::Updated(np, nc) => {
+				let dest = self.node_dest(ptr)?;
+				set_child(&mut buf, ci, np, nc);
+				let ncrc = self.write_node_to(dest, &buf)?;
+				Ok(Ins::Updated(dest, ncrc))
+			}
+			Ins::Split(lp, lc, sep, rp, rc) => {
+				if count + 2 <= INTERNAL_MAX {
+					// room: replace child ci with the left half and insert the separator
+					// and the right half after it.
+					let dest = self.node_dest(ptr)?;
+					let sstart = NODE_HDR + ci * SEP_SIZE;
+					let send = NODE_HDR + count * SEP_SIZE;
+					buf.copy_within(sstart..send, sstart + SEP_SIZE);
+					set_sep(&mut buf, ci, sep);
+					let cstart = INTERNAL_CHILD_BASE + (ci + 1) * CHILD_SIZE;
+					let cend = INTERNAL_CHILD_BASE + (count + 1) * CHILD_SIZE;
+					buf.copy_within(cstart..cend, cstart + CHILD_SIZE);
+					set_child(&mut buf, ci, lp, lc);
+					set_child(&mut buf, ci + 1, rp, rc);
+					node_set_header(&mut buf, NODE_INTERNAL, count + 1);
+					let ncrc = self.write_node_to(dest, &buf)?;
+					Ok(Ins::Updated(dest, ncrc))
+				} else {
+					// full: build the combined separator and child arrays, split them,
+					// and lift the middle separator to the parent.
+					let mut seps: Vec<u64> = (0..count).map(|i| sep_key(&buf, i)).collect();
+					let mut kids: Vec<(u64, u32)> = (0..=count).map(|i| (child_ptr(&buf, i), child_crc(&buf, i))).collect();
+					seps.insert(ci, sep);
+					kids[ci] = (lp, lc);
+					kids.insert(ci + 1, (rp, rc));
+					let s = seps.len();
+					let mid = s / 2;
+					let up = seps[mid];
+					let left_dest = self.node_dest(ptr)?;
+					let right_dest = self.alloc_meta()?;
+					let mut lbuf = vec![0u8; BLOCK_SIZE];
+					node_set_header(&mut lbuf, NODE_INTERNAL, mid);
+					for i in 0..mid {
+						set_sep(&mut lbuf, i, seps[i]);
+					}
+					for i in 0..=mid {
+						set_child(&mut lbuf, i, kids[i].0, kids[i].1);
+					}
+					let rcount = s - mid - 1;
+					let mut rbuf = vec![0u8; BLOCK_SIZE];
+					node_set_header(&mut rbuf, NODE_INTERNAL, rcount);
+					for i in 0..rcount {
+						set_sep(&mut rbuf, i, seps[mid + 1 + i]);
+					}
+					for i in 0..=rcount {
+						set_child(&mut rbuf, i, kids[mid + 1 + i].0, kids[mid + 1 + i].1);
+					}
+					let lcrc = self.write_node_to(left_dest, &lbuf)?;
+					let rcrc = self.write_node_to(right_dest, &rbuf)?;
+					Ok(Ins::Split(left_dest, lcrc, up, right_dest, rcrc))
+				}
+			}
+		}
+	}
+
+	// Delete `key` from the B+tree rooted at (`root`, `root_crc`). Returns the new root
+	// (ptr, crc) and whether a record was removed. Empty leaves and single-child roots
+	// are collapsed; there is no rebalancing or merging of half-full nodes, which keeps
+	// deletion O(log n) and is sound for a copy-on-write tree (a thin node only wastes a
+	// little space, never breaks lookup).
+	fn tree_delete(&mut self, root: u64, root_crc: u32, key: u64, probe: &[u8], rec: usize, keylen: usize) -> Result<(u64, u32, bool), FsError> {
+		if root == 0 {
+			return Ok((0, 0, false));
+		}
+		match self.tree_delete_node(root, root_crc, key, probe, rec, keylen)? {
+			Del::NotFound => Ok((root, root_crc, false)),
+			Del::Empty => Ok((0, 0, true)),
+			Del::Updated(p, c) => {
+				// collapse a root that became a single-child internal node, repeatedly.
+				let mut ptr = p;
+				let mut crc = c;
+				let mut buf = vec![0u8; BLOCK_SIZE];
+				loop {
+					self.read_node(ptr, crc, &mut buf)?;
+					if node_type(&buf) == NODE_INTERNAL && node_count(&buf) == 0 {
+						let cp = child_ptr(&buf, 0);
+						let cc = child_crc(&buf, 0);
+						ptr = cp;
+						crc = cc;
+					} else {
+						break;
+					}
+				}
+				Ok((ptr, crc, true))
+			}
+		}
+	}
+
+	fn tree_delete_node(&mut self, ptr: u64, crc: u32, key: u64, probe: &[u8], rec: usize, keylen: usize) -> Result<Del, FsError> {
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		self.read_node(ptr, crc, &mut buf)?;
+		let count = node_count(&buf);
+		if node_type(&buf) == NODE_LEAF {
+			let (mut lo, mut hi) = (0usize, count);
+			let mut found = None;
+			while lo < hi {
+				let mid = (lo + hi) / 2;
+				let off = NODE_HDR + mid * rec;
+				match key_cmp(&buf[off..off + keylen], probe) {
+					Ordering::Less => lo = mid + 1,
+					Ordering::Greater => hi = mid,
+					Ordering::Equal => {
+						found = Some(mid);
+						break;
+					}
+				}
+			}
+			let pos = match found {
+				Some(p) => p,
+				None => return Ok(Del::NotFound),
+			};
+			if count == 1 {
+				return Ok(Del::Empty);
+			}
+			let dest = self.node_dest(ptr)?;
+			let start = NODE_HDR + pos * rec;
+			let end = NODE_HDR + count * rec;
+			buf.copy_within(start + rec..end, start);
+			node_set_header(&mut buf, NODE_LEAF, count - 1);
+			let ncrc = self.write_node_to(dest, &buf)?;
+			return Ok(Del::Updated(dest, ncrc));
+		}
+		// internal: route and recurse.
+		let mut ci = 0;
+		while ci < count && sep_key(&buf, ci) <= key {
+			ci += 1;
+		}
+		let cp = child_ptr(&buf, ci);
+		let cc = child_crc(&buf, ci);
+		match self.tree_delete_node(cp, cc, key, probe, rec, keylen)? {
+			Del::NotFound => Ok(Del::NotFound),
+			Del::Updated(np, nc) => {
+				let dest = self.node_dest(ptr)?;
+				set_child(&mut buf, ci, np, nc);
+				let ncrc = self.write_node_to(dest, &buf)?;
+				Ok(Del::Updated(dest, ncrc))
+			}
+			Del::Empty => {
+				if count == 0 {
+					// a single-child internal whose only child emptied empties too.
+					return Ok(Del::Empty);
+				}
+				// drop child ci and an adjacent separator (the one to its left when ci is
+				// the last child, else the one to its right).
+				let dest = self.node_dest(ptr)?;
+				let sidx = if ci == count { ci - 1 } else { ci };
+				let sstart = NODE_HDR + sidx * SEP_SIZE;
+				let send = NODE_HDR + count * SEP_SIZE;
+				buf.copy_within(sstart + SEP_SIZE..send, sstart);
+				let cstart = INTERNAL_CHILD_BASE + ci * CHILD_SIZE;
+				let cend = INTERNAL_CHILD_BASE + (count + 1) * CHILD_SIZE;
+				buf.copy_within(cstart + CHILD_SIZE..cend, cstart);
+				node_set_header(&mut buf, NODE_INTERNAL, count - 1);
+				let ncrc = self.write_node_to(dest, &buf)?;
+				Ok(Del::Updated(dest, ncrc))
+			}
+		}
+	}
+
+	// inode I/O
+
+	// Read inode `num` from the inode B+tree. Missing (never allocated or freed) is
+	// FsError::Invalid; a tree node failing its checksum is FsError::Corrupt.
+	fn read_inode(&mut self, num: u32) -> Result<Inode, FsError> {
+		let key = num as u64;
+		let probe = key.to_le_bytes();
+		match self.tree_lookup(self.inode_root, self.inode_root_crc, key, &probe, INODE_REC)? {
+			Some(rec) => {
+				let mut inode = Inode::parse(&rec[8..8 + INODE_SIZE]);
+				if inode.kind == KIND_FILE {
+					// complete the extent map from the overflow chain (a no-op for a
+					// file whose runs all fit inline).
+					self.load_spill(&mut inode)?;
+				}
+				Ok(inode)
+			}
+			None => Err(FsError::Invalid),
+		}
 	}
 
 	// Append the spilled extents (those past EXTENTS_INLINE) from the overflow chain to
@@ -1100,39 +1496,42 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(())
 	}
 
-	// Write inode `num`, copying its inode-table block up to a fresh block (once per
-	// transaction) and updating `itable` with the new (pointer, CRC32C). The extent
-	// overflow chain is rebuilt first so the inode slot and chain agree. The change is
+	// Write inode `num` into the inode B+tree, rebuilding its extent overflow chain
+	// first (for a file) so the inode slot and chain agree. The insert copies every tree
+	// node on the path up to a fresh block and updates `inode_root`; the change is
 	// published by `commit`.
 	fn write_inode(&mut self, num: u32, inode: &mut Inode) -> Result<(), FsError> {
-		if num >= self.num_inodes {
-			return Err(FsError::Invalid);
+		if inode.kind == KIND_FILE {
+			self.flush_extents(inode)?;
 		}
-		self.flush_extents(inode)?;
-		let (tbl, offset) = self.inode_location(num);
-		let ptr = self.cow_meta(self.itable[tbl].0)?;
-		let mut block = vec![0u8; BLOCK_SIZE];
-		if !self.dev.read_block(ptr, &mut block) {
-			return Err(FsError::Io);
-		}
-		inode.write(&mut block[offset..offset + INODE_SIZE]);
-		if !self.dev.write_block(ptr, &block) {
-			return Err(FsError::Io);
-		}
-		self.itable[tbl] = (ptr, crc32c(&block));
+		let mut rec = vec![0u8; INODE_REC];
+		rec[0..8].copy_from_slice(&(num as u64).to_le_bytes());
+		inode.write(&mut rec[8..8 + INODE_SIZE]);
+		let (root, crc) = self.tree_insert(self.inode_root, self.inode_root_crc, num as u64, &rec, INODE_REC, INODE_LEAF_MAX, INODE_KEYLEN)?;
+		self.inode_root = root;
+		self.inode_root_crc = crc;
 		Ok(())
 	}
 
-	// Find a free inode slot (1..num_inodes), claim it as an empty file, and return
-	// its number.
+	// Hand out a fresh inode number from the monotonic counter (never reused). The
+	// caller writes the inode right after, so nothing is inserted into the tree here.
 	fn alloc_inode(&mut self) -> Result<u32, FsError> {
-		for num in 1..self.num_inodes {
-			if self.read_inode(num)?.kind == KIND_FREE {
-				self.write_inode(num, &mut Inode::empty(KIND_FILE))?;
-				return Ok(num);
-			}
+		let num = self.next_inode;
+		if num == u32::MAX {
+			return Err(FsError::NoSpace);
 		}
-		Err(FsError::NoSpace)
+		self.next_inode += 1;
+		Ok(num)
+	}
+
+	// Remove inode `num` from the inode B+tree (its data blocks are reclaimed when the
+	// free map is rederived at commit, the previous generation pinning them until then).
+	fn free_inode(&mut self, num: u32) -> Result<(), FsError> {
+		let probe = (num as u64).to_le_bytes();
+		let (root, crc, _) = self.tree_delete(self.inode_root, self.inode_root_crc, num as u64, &probe, INODE_REC, INODE_KEYLEN)?;
+		self.inode_root = root;
+		self.inode_root_crc = crc;
+		Ok(())
 	}
 
 	// block allocation (copy-on-write)
@@ -1399,10 +1798,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let segs = split_segments(path)?;
 		let mut inode_num = self.root_inode;
 		for seg in segs {
-			if self.read_inode(inode_num)?.kind != KIND_DIR {
-				return Err(FsError::NotFound);
-			}
-			inode_num = self.dir_find_in(inode_num, seg).ok_or(FsError::NotFound)?.0;
+			inode_num = self.dir_lookup(inode_num, seg)?.ok_or(FsError::NotFound)?;
 		}
 		Ok(inode_num)
 	}
@@ -1418,7 +1814,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			parent = if create {
 				self.dir_lookup_or_create(parent, seg)?
 			} else {
-				let child = self.dir_find_in(parent, seg).ok_or(FsError::NotFound)?.0;
+				let child = self.dir_lookup(parent, seg)?.ok_or(FsError::NotFound)?;
 				if self.read_inode(child)?.kind != KIND_DIR {
 					return Err(FsError::Invalid);
 				}
@@ -1430,7 +1826,7 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Find child `name` in `parent`, or create it as a directory; return its inode.
 	fn dir_lookup_or_create(&mut self, parent: u32, name: &[u8]) -> Result<u32, FsError> {
-		if let Some((child, _, _)) = self.dir_find_in(parent, name) {
+		if let Some(child) = self.dir_lookup(parent, name)? {
 			if self.read_inode(child)?.kind != KIND_DIR {
 				return Err(FsError::Invalid);
 			}
@@ -1441,54 +1837,101 @@ impl<D: BlockDevice> LiberFs<D> {
 		dir.ctime = self.clock;
 		dir.mtime = self.clock;
 		self.write_inode(num, &mut dir)?;
-		self.dir_add(parent, name, num)?;
+		self.dir_insert(parent, name, num)?;
 		Ok(num)
 	}
 
 	// directory operations (on any directory inode)
 
-	// Scan directory `dir_num` for `name`, returning (child inode, the logical
-	// directory block holding the entry, the entry's byte offset in that block).
-	fn dir_find_in(&mut self, dir_num: u32, name: &[u8]) -> Option<(u32, usize, usize)> {
-		let dir = self.read_inode(dir_num).ok()?;
-		let mut block = vec![0u8; BLOCK_SIZE];
-		for i in 0..dir.nblocks() {
-			if !self.read_logical(&dir, i, &mut block).ok()? {
-				continue;
-			}
-			for slot in 0..DENTRIES_PER_BLOCK {
-				let off = slot * DENTRY_SIZE;
-				if block[off] == 0 {
-					continue;
-				}
-				if entry_name(&block[off..off + DENTRY_SIZE]) == name {
-					let inode = u32::from_le_bytes(block[off + NAME_MAX..off + NAME_MAX + 4].try_into().ok()?);
-					return Some((inode, i, off));
-				}
-			}
+	// Look up `name` in directory `dir_num` through its B+tree: the child inode, or None
+	// if absent. Errors if `dir_num` is not a directory.
+	fn dir_lookup(&mut self, dir_num: u32, name: &[u8]) -> Result<Option<u32>, FsError> {
+		let dir = self.read_inode(dir_num)?;
+		if dir.kind != KIND_DIR {
+			return Err(FsError::NotFound);
 		}
-		None
+		let probe = dir_probe(name);
+		match self.tree_lookup(dir.dir_root, dir.dir_root_crc, name_hash(name), &probe, DIR_REC)? {
+			Some(rec) => Ok(Some(u32::from_le_bytes(rec[8 + NAME_MAX..8 + NAME_MAX + 4].try_into().unwrap()))),
+			None => Ok(None),
+		}
 	}
 
-	// Collect every live (name, inode) entry in directory `dir_num`.
+	// Insert entry `name` -> `child` into directory `dir_num`, or repoint it if it is
+	// already there. The directory's B+tree root (and the entry count it stores in
+	// `size`) are updated and the directory inode rewritten.
+	fn dir_insert(&mut self, dir_num: u32, name: &[u8], child: u32) -> Result<(), FsError> {
+		let mut dir = self.read_inode(dir_num)?;
+		if dir.kind != KIND_DIR {
+			return Err(FsError::NotFound);
+		}
+		let key = name_hash(name);
+		let existed = {
+			let probe = dir_probe(name);
+			self.tree_lookup(dir.dir_root, dir.dir_root_crc, key, &probe, DIR_REC)?.is_some()
+		};
+		let record = dir_record(name, child);
+		let (root, crc) = self.tree_insert(dir.dir_root, dir.dir_root_crc, key, &record, DIR_REC, DIR_LEAF_MAX, DIR_KEYLEN)?;
+		dir.dir_root = root;
+		dir.dir_root_crc = crc;
+		if !existed {
+			dir.size += 1;
+		}
+		dir.mtime = self.clock;
+		self.write_inode(dir_num, &mut dir)?;
+		Ok(())
+	}
+
+	// Remove entry `name` from directory `dir_num`. NotFound if it is not there.
+	fn dir_remove(&mut self, dir_num: u32, name: &[u8]) -> Result<(), FsError> {
+		let mut dir = self.read_inode(dir_num)?;
+		if dir.kind != KIND_DIR {
+			return Err(FsError::NotFound);
+		}
+		let probe = dir_probe(name);
+		let (root, crc, removed) = self.tree_delete(dir.dir_root, dir.dir_root_crc, name_hash(name), &probe, DIR_REC, DIR_KEYLEN)?;
+		if !removed {
+			return Err(FsError::NotFound);
+		}
+		dir.dir_root = root;
+		dir.dir_root_crc = crc;
+		dir.size = dir.size.saturating_sub(1);
+		dir.mtime = self.clock;
+		self.write_inode(dir_num, &mut dir)?;
+		Ok(())
+	}
+
+	// Collect every (name, inode) entry in directory `dir_num`, in key order.
 	fn dir_entries_of(&mut self, dir_num: u32) -> Result<Vec<(Vec<u8>, u32)>, FsError> {
 		let dir = self.read_inode(dir_num)?;
 		let mut out = Vec::new();
-		let mut block = vec![0u8; BLOCK_SIZE];
-		for i in 0..dir.nblocks() {
-			if !self.read_logical(&dir, i, &mut block)? {
-				continue;
+		self.collect_dir_entries(dir.dir_root, dir.dir_root_crc, &mut out)?;
+		Ok(out)
+	}
+
+	// Walk the directory B+tree rooted at (`ptr`, `crc`), appending each leaf's entries.
+	fn collect_dir_entries(&mut self, ptr: u64, crc: u32, out: &mut Vec<(Vec<u8>, u32)>) -> Result<(), FsError> {
+		if ptr == 0 {
+			return Ok(());
+		}
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		self.read_node(ptr, crc, &mut buf)?;
+		let count = node_count(&buf);
+		if node_type(&buf) == NODE_LEAF {
+			for i in 0..count {
+				let off = NODE_HDR + i * DIR_REC;
+				let name = name_in(&buf[off + 8..off + 8 + NAME_MAX]).to_vec();
+				let inode = u32::from_le_bytes(buf[off + 8 + NAME_MAX..off + 8 + NAME_MAX + 4].try_into().unwrap());
+				out.push((name, inode));
 			}
-			for slot in 0..DENTRIES_PER_BLOCK {
-				let off = slot * DENTRY_SIZE;
-				if block[off] == 0 {
-					continue;
-				}
-				let inode = u32::from_le_bytes(block[off + NAME_MAX..off + NAME_MAX + 4].try_into().unwrap());
-				out.push((entry_name(&block[off..off + DENTRY_SIZE]).to_vec(), inode));
+		} else {
+			for i in 0..=count {
+				let cp = child_ptr(&buf, i);
+				let cc = child_crc(&buf, i);
+				self.collect_dir_entries(cp, cc, out)?;
 			}
 		}
-		Ok(out)
+		Ok(())
 	}
 
 	// List directory `dir_num` as (name, size) pairs.
@@ -1499,71 +1942,6 @@ impl<D: BlockDevice> LiberFs<D> {
 			out.push((name, size));
 		}
 		Ok(out)
-	}
-
-	// Add a (name, inode) entry to directory `dir_num`, reusing a free slot or growing
-	// the directory by one block.
-	fn dir_add(&mut self, dir_num: u32, name: &[u8], child: u32) -> Result<(), FsError> {
-		let mut dir = self.read_inode(dir_num)?;
-		let mut block = vec![0u8; BLOCK_SIZE];
-
-		// reuse a free slot in an existing directory block.
-		for i in 0..dir.nblocks() {
-			if !self.read_logical(&dir, i, &mut block)? {
-				return Err(FsError::Io);
-			}
-			for slot in 0..DENTRIES_PER_BLOCK {
-				let off = slot * DENTRY_SIZE;
-				if block[off] == 0 {
-					write_entry(&mut block[off..off + DENTRY_SIZE], name, child);
-					self.write_logical(&mut dir, i, &block)?;
-					dir.mtime = self.clock;
-					self.write_inode(dir_num, &mut dir)?;
-					return Ok(());
-				}
-			}
-		}
-
-		// no room: grow the directory by one block.
-		let logical = dir.nblocks();
-		for b in block.iter_mut() {
-			*b = 0;
-		}
-		write_entry(&mut block[0..DENTRY_SIZE], name, child);
-		self.write_logical(&mut dir, logical, &block)?;
-		dir.size += BLOCK_SIZE as u64;
-		dir.mtime = self.clock;
-		self.write_inode(dir_num, &mut dir)?;
-		Ok(())
-	}
-
-	// Point an existing entry `name` in directory `dir_num` at `child`, or add it if it
-	// is not there yet.
-	fn dir_set(&mut self, dir_num: u32, name: &[u8], child: u32) -> Result<(), FsError> {
-		if let Some((_, logical, off)) = self.dir_find_in(dir_num, name) {
-			let mut dir = self.read_inode(dir_num)?;
-			let mut block = vec![0u8; BLOCK_SIZE];
-			self.read_logical(&dir, logical, &mut block)?;
-			block[off + NAME_MAX..off + NAME_MAX + 4].copy_from_slice(&child.to_le_bytes());
-			self.write_logical(&mut dir, logical, &block)?;
-			self.write_inode(dir_num, &mut dir)?;
-			return Ok(());
-		}
-		self.dir_add(dir_num, name, child)
-	}
-
-	// Clear entry `name` from directory `dir_num` (leaving a free slot).
-	fn dir_clear(&mut self, dir_num: u32, name: &[u8]) -> Result<(), FsError> {
-		let (_, logical, off) = self.dir_find_in(dir_num, name).ok_or(FsError::NotFound)?;
-		let mut dir = self.read_inode(dir_num)?;
-		let mut block = vec![0u8; BLOCK_SIZE];
-		self.read_logical(&dir, logical, &mut block)?;
-		for b in block[off..off + DENTRY_SIZE].iter_mut() {
-			*b = 0;
-		}
-		self.write_logical(&mut dir, logical, &block)?;
-		self.write_inode(dir_num, &mut dir)?;
-		Ok(())
 	}
 
 	// Does the subtree rooted at directory `root_dir` contain inode `target` (as the
@@ -1640,11 +2018,10 @@ fn serialize_superblock(sb: &Superblock) -> Vec<u8> {
 	block[8..12].copy_from_slice(&VERSION.to_le_bytes());
 	block[12..16].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
 	block[16..24].copy_from_slice(&sb.num_blocks.to_le_bytes());
-	block[24..28].copy_from_slice(&sb.num_inodes.to_le_bytes());
+	block[24..28].copy_from_slice(&sb.next_inode.to_le_bytes());
 	block[28..36].copy_from_slice(&sb.generation.to_le_bytes());
-	block[36..44].copy_from_slice(&sb.itable_index.to_le_bytes());
-	block[44..48].copy_from_slice(&sb.itable_index_crc.to_le_bytes());
-	block[48..52].copy_from_slice(&sb.inode_blocks.to_le_bytes());
+	block[36..44].copy_from_slice(&sb.inode_root.to_le_bytes());
+	block[44..48].copy_from_slice(&sb.inode_root_crc.to_le_bytes());
 	block[52..56].copy_from_slice(&sb.root_inode.to_le_bytes());
 	// the CRC bytes are already zero; checksum the block and store it over them.
 	let crc = crc32c(&block);
@@ -1675,25 +2052,127 @@ fn parse_superblock(block: &[u8]) -> Option<Superblock> {
 	if crc32c(&probe) != stored {
 		return None;
 	}
-	Some(Superblock { num_blocks: u64::from_le_bytes(block[16..24].try_into().ok()?), num_inodes: u32::from_le_bytes(block[24..28].try_into().ok()?), inode_blocks: u32::from_le_bytes(block[48..52].try_into().ok()?), generation: u64::from_le_bytes(block[28..36].try_into().ok()?), itable_index: u64::from_le_bytes(block[36..44].try_into().ok()?), itable_index_crc: u32::from_le_bytes(block[44..48].try_into().ok()?), root_inode: u32::from_le_bytes(block[52..56].try_into().ok()?) })
+	Some(Superblock { num_blocks: u64::from_le_bytes(block[16..24].try_into().ok()?), generation: u64::from_le_bytes(block[28..36].try_into().ok()?), inode_root: u64::from_le_bytes(block[36..44].try_into().ok()?), inode_root_crc: u32::from_le_bytes(block[44..48].try_into().ok()?), next_inode: u32::from_le_bytes(block[24..28].try_into().ok()?), root_inode: u32::from_le_bytes(block[52..56].try_into().ok()?) })
 }
 
-// The name held in a directory entry: the name field up to its first NUL.
-fn entry_name(entry: &[u8]) -> &[u8] {
-	let name = &entry[..NAME_MAX];
-	match name.iter().position(|&b| b == 0) {
-		Some(end) => &name[..end],
-		None => name,
+// The name held in a directory record's NUL-padded name field: up to the first NUL.
+fn name_in(field: &[u8]) -> &[u8] {
+	match field.iter().position(|&b| b == 0) {
+		Some(end) => &field[..end],
+		None => field,
 	}
 }
 
-// Render a directory entry: the NUL-padded name then the inode number.
-fn write_entry(entry: &mut [u8], name: &[u8], inode: u32) {
-	for b in entry[..DENTRY_SIZE].iter_mut() {
+// FNV-1a 64-bit hash of an entry name: the B+tree key that orders a directory's entries.
+fn name_hash(name: &[u8]) -> u64 {
+	let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+	for &b in name {
+		h ^= b as u64;
+		h = h.wrapping_mul(0x0000_0100_0000_01b3);
+	}
+	h
+}
+
+// A directory probe key (the name hash then the NUL-padded name): the DIR_KEYLEN-byte
+// prefix a leaf record is matched against.
+fn dir_probe(name: &[u8]) -> Vec<u8> {
+	let mut probe = vec![0u8; DIR_KEYLEN];
+	probe[0..8].copy_from_slice(&name_hash(name).to_le_bytes());
+	probe[8..8 + name.len()].copy_from_slice(name);
+	probe
+}
+
+// A full directory leaf record: the (hash, NUL-padded name) key then the child inode.
+fn dir_record(name: &[u8], child: u32) -> Vec<u8> {
+	let mut rec = vec![0u8; DIR_REC];
+	rec[0..8].copy_from_slice(&name_hash(name).to_le_bytes());
+	rec[8..8 + name.len()].copy_from_slice(name);
+	rec[8 + NAME_MAX..8 + NAME_MAX + 4].copy_from_slice(&child.to_le_bytes());
+	rec
+}
+
+// B+tree node accessors. A node block begins with an 8-byte header: a type byte
+// (NODE_LEAF or NODE_INTERNAL) then a u16 entry count at bytes 2..4; the entries follow.
+fn node_type(buf: &[u8]) -> u8 {
+	buf[0]
+}
+
+fn node_count(buf: &[u8]) -> usize {
+	u16::from_le_bytes(buf[2..4].try_into().unwrap()) as usize
+}
+
+fn node_set_header(buf: &mut [u8], typ: u8, count: usize) {
+	for b in buf[..NODE_HDR].iter_mut() {
 		*b = 0;
 	}
-	entry[..name.len()].copy_from_slice(name);
-	entry[NAME_MAX..NAME_MAX + 4].copy_from_slice(&inode.to_le_bytes());
+	buf[0] = typ;
+	buf[2..4].copy_from_slice(&(count as u16).to_le_bytes());
+}
+
+// Internal-node separator key `i`: child `i` holds keys below it, child `i + 1` keys at
+// or above it. Separators sit in a fixed region right after the header.
+fn sep_key(buf: &[u8], i: usize) -> u64 {
+	let off = NODE_HDR + i * SEP_SIZE;
+	u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+fn set_sep(buf: &mut [u8], i: usize, key: u64) {
+	let off = NODE_HDR + i * SEP_SIZE;
+	buf[off..off + 8].copy_from_slice(&key.to_le_bytes());
+}
+
+// Internal-node child link `i`: its block pointer and that block's CRC32C. Child links
+// sit in a fixed region after the separators, so offsets do not shift with the count.
+fn child_ptr(buf: &[u8], i: usize) -> u64 {
+	let off = INTERNAL_CHILD_BASE + i * CHILD_SIZE;
+	u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+fn child_crc(buf: &[u8], i: usize) -> u32 {
+	let off = INTERNAL_CHILD_BASE + i * CHILD_SIZE + 8;
+	u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
+
+fn set_child(buf: &mut [u8], i: usize, ptr: u64, crc: u32) {
+	let off = INTERNAL_CHILD_BASE + i * CHILD_SIZE;
+	buf[off..off + 8].copy_from_slice(&ptr.to_le_bytes());
+	buf[off + 8..off + 12].copy_from_slice(&crc.to_le_bytes());
+}
+
+// Compare two leaf keys: the leading u64 numerically (so leaf order matches the numeric
+// routing in internal nodes), then any remaining bytes lexicographically (the name, for
+// a directory record, disambiguating a shared hash). Both slices are one key wide.
+fn key_cmp(a: &[u8], b: &[u8]) -> Ordering {
+	let ka = u64::from_le_bytes(a[0..8].try_into().unwrap());
+	let kb = u64::from_le_bytes(b[0..8].try_into().unwrap());
+	match ka.cmp(&kb) {
+		Ordering::Equal => a[8..].cmp(&b[8..]),
+		other => other,
+	}
+}
+
+// Where to split an overfull leaf's records in two: the midpoint, nudged so two records
+// sharing a u64 key never straddle the split (the parent routes by that key alone, so
+// equal keys must stay in one leaf). Records are unique in the inode tree, so this is the
+// plain midpoint there; in a directory it matters only for an astronomically rare 64-bit
+// hash collision.
+fn leaf_split_point(recs: &[Vec<u8>]) -> usize {
+	let n = recs.len();
+	let key_at = |i: usize| -> u64 { u64::from_le_bytes(recs[i][0..8].try_into().unwrap()) };
+	let mut up = n / 2;
+	while up < n && key_at(up) == key_at(up - 1) {
+		up += 1;
+	}
+	if up < n {
+		return up;
+	}
+	// no key boundary above the midpoint: look below it (only reached when most of the
+	// leaf shares one 64-bit key).
+	let mut down = n / 2;
+	while down > 1 && key_at(down) == key_at(down - 1) {
+		down -= 1;
+	}
+	down
 }
 
 // Set the allocation bit for block `b` in `bitmap`.

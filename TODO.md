@@ -888,10 +888,10 @@ the table wastes space on a sparsely-used volume). A B+tree fixes both: O(log n)
 directory lookups with effectively unbounded entries, and inodes allocated on
 demand (bounded only by free space) - the XFS / btrfs / ZFS model.
 
-- [ ] B+tree directories: index entries by name so lookup / insert / remove is O(log n) and a directory scales to millions of entries without linear scans.
-- [ ] Dynamic inode allocation: replace the fixed inode table with a B+tree of inodes allocated on demand, so a volume never runs out of inodes while it has free space (and an empty volume wastes none).
-- [ ] Keep CoW + checksums over the tree nodes (a tree node is just another copy-on-write, checksummed block).
-- [ ] fsck walks the trees: verify the directory and inode B+trees and the free map.
+- [x] B+tree directories: index entries by name so lookup / insert / remove is O(log n) and a directory scales to millions of entries without linear scans.
+- [x] Dynamic inode allocation: replace the fixed inode table with a B+tree of inodes allocated on demand, so a volume never runs out of inodes while it has free space (and an empty volume wastes none).
+- [x] Keep CoW + checksums over the tree nodes (a tree node is just another copy-on-write, checksummed block).
+- [x] fsck walks the trees: verify the directory and inode B+trees and the free map.
 - Done when: directory operations are O(log n) and a directory holds millions of entries without slowdown, inodes are allocated dynamically (no fixed cap, none wasted), the trees are CoW + checksummed, and fsck validates them, tests green.
 - Concept: Native filesystem (B+tree organization, the btrfs / ZFS structure), M52 (the CoW the trees ride on), M49 (the directory tree / inode table this replaces).
 

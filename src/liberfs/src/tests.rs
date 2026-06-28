@@ -254,7 +254,8 @@ fn rejects_dot_and_dot_dot_segments() {
 
 #[test]
 fn many_files_across_multiple_inode_blocks() {
-	// a volume large enough for far more than one inode block's worth of files.
+	// a volume holding far more files than one inode-tree leaf, so the inode B+tree grows
+	// past a single node.
 	let nblocks: u64 = 400;
 	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
 	let count = 100u32;
@@ -577,7 +578,7 @@ fn a_freshly_formatted_volume_has_no_snapshot() {
 
 #[test]
 fn a_long_name_round_trips() {
-	// a 255-byte name fills the whole dentry name field with no terminator.
+	// a 255-byte name fills the whole record name field with no terminator.
 	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let name = vec![b'n'; NAME_MAX];
 	fs.write_file(&name, b"long").unwrap();
@@ -648,4 +649,77 @@ fn sparse_file_occupies_only_written_blocks() {
 	assert_eq!(fs.read_at(b"sparse", far, 3).unwrap(), b"end");
 	// the hole between the two spans reads back as zeros.
 	assert_eq!(fs.read_at(b"sparse", BLOCK_SIZE as u64, 4).unwrap(), vec![0u8; 4]);
+}
+
+// M55: B+tree directories and dynamic inode allocation.
+
+#[test]
+fn a_directory_scales_to_thousands_of_entries() {
+	// enough entries to force internal-node splits in both the directory B+tree (keyed by
+	// name hash) and the inode B+tree (keyed by number): a leaf holds at most
+	// DIR_LEAF_MAX / INODE_LEAF_MAX records and an internal node at most INTERNAL_MAX
+	// children. The inode tree's sequential keys leave each split leaf about half full,
+	// so a couple of thousand files alone push it past two levels and exercise the
+	// internal-node split.
+	let nblocks: u64 = 12_000;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let count = 2000u32;
+	for i in 0..count {
+		let name = format!("file{i:05}");
+		fs.write_file(name.as_bytes(), name.as_bytes()).unwrap();
+	}
+	// every entry is present and reads back its own name.
+	assert_eq!(fs.list().unwrap().len() as u32, count);
+	for i in 0..count {
+		let name = format!("file{i:05}");
+		assert_eq!(fs.read_file(name.as_bytes()).unwrap(), name.as_bytes());
+	}
+
+	// remove every third entry, then confirm the rest survive and the gaps are gone.
+	let mut removed = 0u32;
+	for i in (0..count).step_by(3) {
+		let name = format!("file{i:05}");
+		fs.remove(name.as_bytes()).unwrap();
+		removed += 1;
+	}
+	assert_eq!(fs.list().unwrap().len() as u32, count - removed);
+
+	// the survivors persist across a remount; the removed ones stay gone.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.list().unwrap().len() as u32, count - removed);
+	for i in 0..count {
+		let name = format!("file{i:05}");
+		if i % 3 == 0 {
+			assert_eq!(fs.lookup(name.as_bytes()), None);
+		} else {
+			assert_eq!(fs.read_file(name.as_bytes()).unwrap(), name.as_bytes());
+		}
+	}
+}
+
+#[test]
+fn inodes_are_allocated_dynamically_without_a_fixed_cap() {
+	// a small volume creates as many files as its data blocks allow, not a preallocated
+	// inode count: inodes come from the B+tree on demand, so the only limit is space.
+	let nblocks: u64 = 256;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut made = 0u32;
+	loop {
+		let name = format!("f{made}");
+		match fs.write_file(name.as_bytes(), b"x") {
+			Ok(()) => made += 1,
+			Err(FsError::NoSpace) => break,
+			Err(e) => panic!("unexpected error: {e:?}"),
+		}
+	}
+	// far more files than any small fixed inode table would have reserved room for.
+	assert!(made > 16, "only {made} files created");
+	assert_eq!(fs.list().unwrap().len() as u32, made);
+
+	// the inodes and entries survive a remount.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.list().unwrap().len() as u32, made);
+	assert_eq!(fs.read_file(b"f0").unwrap(), b"x");
 }
