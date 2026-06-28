@@ -1,4 +1,5 @@
 - LSFS - rename to LiberFS? Good or bad idea?
+- Compare LSFS / LiberFS with other file systems (fat, ntfs, ext4, zfs, btrfs, xfs and other modern file systems) and compare their abilities
 - add "route" command
 - add "cd" command
 - GPU driver keeps failing probably (screen sometimes blinking after few minutes - probably restartind driver or something)

@@ -20,13 +20,16 @@
 //! bitmap before the inode that points at it, and the inode before the directory
 //! entry that names it; on delete the directory entry is cleared before the inode
 //! and blocks it referenced are freed. A crash between steps can only leak blocks or
-//! an inode (an orphan reclaimed by a future `fsck`), never expose a dangling
-//! reference or corrupt live data.
+//! an inode (an orphan), never expose a dangling reference or corrupt live data. A
+//! later [`Lsfs::fsck`] pass walks the directory tree, rebuilds the allocation bitmap
+//! from the blocks live inodes actually reference, and frees any leaked blocks and
+//! orphan inodes.
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
+use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -59,8 +62,8 @@ const KIND_FILE: u8 = 1;
 const KIND_DIR: u8 = 2;
 
 // How many inodes a freshly formatted volume gets: one per this many blocks, but at
-// least MIN_INODES and never so many the table cannot fit alongside one data block.
-const BLOCKS_PER_INODE: u32 = 2;
+// least MIN_INODES and rounded up to whole inode blocks.
+const BLOCKS_PER_INODE: u32 = 4;
 const MIN_INODES: u32 = 16;
 
 // The root directory is inode 0; other inodes are allocated from 1.
@@ -81,6 +84,25 @@ pub enum FsError {
 	TooLong,
 	Invalid,
 	Io,
+}
+
+// Metadata about one path, returned by [`Lsfs::stat`]: its byte length, whether it is
+// a directory, and its created / modified logical timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stat {
+	pub size: u64,
+	pub is_dir: bool,
+	pub ctime: u64,
+	pub mtime: u64,
+}
+
+// What an [`Lsfs::fsck`] pass reclaimed: blocks that the bitmap marked allocated but
+// no live inode referenced, and inodes that were allocated but named by no directory
+// (orphans left by a crash mid-write).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsckReport {
+	pub reclaimed_blocks: u32,
+	pub reclaimed_inodes: u32,
 }
 
 // A fixed-size block device: the whole filesystem is read and written one
@@ -271,9 +293,18 @@ impl<D: BlockDevice> Lsfs<D> {
 		let mut block = vec![0u8; BLOCK_SIZE];
 		let mut remaining = inode.size as usize;
 		for i in 0..inode.nblocks() {
-			let phys = self.block_map_read(&inode, i)?.ok_or(FsError::Io)?;
-			if !self.dev.read_block(phys, &mut block) {
-				return Err(FsError::Io);
+			match self.block_map_read(&inode, i)? {
+				Some(phys) => {
+					if !self.dev.read_block(phys, &mut block) {
+						return Err(FsError::Io);
+					}
+				}
+				None => {
+					// a hole (a sparse gap left by a write past the end): reads as zeros.
+					for b in block.iter_mut() {
+						*b = 0;
+					}
+				}
 			}
 			let take = remaining.min(BLOCK_SIZE);
 			out.extend_from_slice(&block[..take]);
@@ -398,7 +429,254 @@ impl<D: BlockDevice> Lsfs<D> {
 		self.dev
 	}
 
-	// inode I/O
+	// metadata and timestamps
+
+	// Advance the logical clock the filesystem stamps onto inode `mtime` (and `ctime`
+	// for new files). The caller injects a real time source; there is no wall clock in
+	// this crate.
+	pub fn set_clock(&mut self, now: u64) {
+		self.clock = now;
+	}
+
+	// Return metadata for the file or directory at `path`.
+	pub fn stat(&mut self, path: &[u8]) -> Result<Stat, FsError> {
+		let inode_num = self.resolve(path)?;
+		let inode = self.read_inode(inode_num)?;
+		Ok(Stat { size: inode.size, is_dir: inode.kind == KIND_DIR, ctime: inode.ctime, mtime: inode.mtime })
+	}
+
+	// offset / partial reads and writes
+
+	// Read up to `len` bytes of the file at `path` starting at byte `offset`. Returns
+	// fewer bytes (or none) if the range runs past the end; holes read back as zeros.
+	pub fn read_at(&mut self, path: &[u8], offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+		let inode_num = self.resolve(path)?;
+		let inode = self.read_inode(inode_num)?;
+		if inode.kind != KIND_FILE {
+			return Err(FsError::NotFound);
+		}
+		if offset >= inode.size || len == 0 {
+			return Ok(Vec::new());
+		}
+		let end = (offset + len as u64).min(inode.size);
+		let mut out = Vec::with_capacity((end - offset) as usize);
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		let first = (offset / BLOCK_SIZE as u64) as usize;
+		let last = ((end - 1) / BLOCK_SIZE as u64) as usize;
+		for lb in first..=last {
+			let block_start = lb as u64 * BLOCK_SIZE as u64;
+			match self.block_map_read(&inode, lb)? {
+				Some(phys) => {
+					if !self.dev.read_block(phys, &mut buf) {
+						return Err(FsError::Io);
+					}
+				}
+				None => {
+					for b in buf.iter_mut() {
+						*b = 0;
+					}
+				}
+			}
+			let copy_start = offset.max(block_start);
+			let copy_end = end.min(block_start + BLOCK_SIZE as u64);
+			out.extend_from_slice(&buf[(copy_start - block_start) as usize..(copy_end - block_start) as usize]);
+		}
+		Ok(out)
+	}
+
+	// Write `data` into the file at `path` starting at byte `offset`, creating the file
+	// (and any missing parents) if needed and extending it if the write runs past the
+	// end. A gap between the old end and `offset` becomes a hole that reads as zeros.
+	// Only the touched blocks are rewritten - the rest of the file is left in place.
+	pub fn write_at(&mut self, path: &[u8], offset: u64, data: &[u8]) -> Result<(), FsError> {
+		let (parent, name) = self.resolve_parent(path, true)?;
+		let inode_num = match self.dir_find_in(parent, name) {
+			Some((num, _, _)) => {
+				if self.read_inode(num)?.kind != KIND_FILE {
+					return Err(FsError::Invalid);
+				}
+				num
+			}
+			None => {
+				let num = self.alloc_inode()?;
+				let mut f = Inode::empty(KIND_FILE);
+				f.ctime = self.clock;
+				f.mtime = self.clock;
+				self.write_inode(num, &f)?;
+				self.dir_add(parent, name, num)?;
+				num
+			}
+		};
+		let mut inode = self.read_inode(inode_num)?;
+		if !data.is_empty() {
+			let start = offset;
+			let end = offset + data.len() as u64;
+			let first = (start / BLOCK_SIZE as u64) as usize;
+			let last = ((end - 1) / BLOCK_SIZE as u64) as usize;
+			let mut buf = vec![0u8; BLOCK_SIZE];
+			for lb in first..=last {
+				let phys = self.block_map_alloc(&mut inode, lb)?;
+				let block_start = lb as u64 * BLOCK_SIZE as u64;
+				let full = start <= block_start && end >= block_start + BLOCK_SIZE as u64;
+				if !full && block_start < inode.size {
+					// a partial write over existing data: keep what is already there.
+					if !self.dev.read_block(phys, &mut buf) {
+						return Err(FsError::Io);
+					}
+				} else {
+					for b in buf.iter_mut() {
+						*b = 0;
+					}
+				}
+				let copy_start = start.max(block_start);
+				let copy_end = end.min(block_start + BLOCK_SIZE as u64);
+				let buf_off = (copy_start - block_start) as usize;
+				let data_off = (copy_start - start) as usize;
+				let n = (copy_end - copy_start) as usize;
+				buf[buf_off..buf_off + n].copy_from_slice(&data[data_off..data_off + n]);
+				if !self.dev.write_block(phys, &buf) {
+					return Err(FsError::Io);
+				}
+			}
+			if end > inode.size {
+				inode.size = end;
+			}
+		}
+		inode.mtime = self.clock;
+		self.write_inode(inode_num, &inode)?;
+		Ok(())
+	}
+
+	// Append `data` to the end of the file at `path` (creating it if needed).
+	pub fn append(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
+		let size = match self.resolve(path) {
+			Ok(num) => self.read_inode(num)?.size,
+			Err(FsError::NotFound) => 0,
+			Err(e) => return Err(e),
+		};
+		self.write_at(path, size, data)
+	}
+
+	// Resize the file at `path` to `new_len`: shrinking frees the blocks past the new
+	// end, growing leaves a hole (which reads as zeros). Leaked indirect blocks from a
+	// partial shrink are reclaimed by the next `fsck`.
+	pub fn truncate(&mut self, path: &[u8], new_len: u64) -> Result<(), FsError> {
+		let inode_num = self.resolve(path)?;
+		let mut inode = self.read_inode(inode_num)?;
+		if inode.kind != KIND_FILE {
+			return Err(FsError::Invalid);
+		}
+		if new_len < inode.size {
+			let keep = (new_len as usize).div_ceil(BLOCK_SIZE);
+			self.free_from(&mut inode, keep)?;
+			// zero the slack past the new end in the last kept block, so that a later
+			// grow back over it reads zeros rather than the discarded tail.
+			let tail = (new_len % BLOCK_SIZE as u64) as usize;
+			if tail != 0 {
+				let lb = (new_len / BLOCK_SIZE as u64) as usize;
+				if let Some(phys) = self.block_map_read(&inode, lb)? {
+					let mut buf = vec![0u8; BLOCK_SIZE];
+					if !self.dev.read_block(phys, &mut buf) {
+						return Err(FsError::Io);
+					}
+					for b in buf[tail..].iter_mut() {
+						*b = 0;
+					}
+					if !self.dev.write_block(phys, &buf) {
+						return Err(FsError::Io);
+					}
+				}
+			}
+		}
+		inode.size = new_len;
+		inode.mtime = self.clock;
+		self.write_inode(inode_num, &inode)?;
+		Ok(())
+	}
+
+	// rename / move within the volume
+
+	// Move the file or directory at `from` to `to` within the same volume. Missing
+	// parent directories of `to` are created. An existing file (or empty directory) at
+	// `to` is replaced. The destination entry is written before the source entry is
+	// cleared, so a crash leaves the object reachable under at least one name - never
+	// lost. Moving a directory into its own subtree is rejected.
+	pub fn rename(&mut self, from: &[u8], to: &[u8]) -> Result<(), FsError> {
+		let (pf, nf) = self.resolve_parent(from, false)?;
+		let inode_f = self.dir_find_in(pf, nf).ok_or(FsError::NotFound)?.0;
+		let from_inode = self.read_inode(inode_f)?;
+		let (pt, nt) = self.resolve_parent(to, true)?;
+
+		// a directory may not move into itself or one of its descendants.
+		if from_inode.kind == KIND_DIR && self.subtree_contains(inode_f, pt)? {
+			return Err(FsError::Invalid);
+		}
+
+		let dest = self.dir_find_in(pt, nt).map(|(num, _, _)| num);
+		if let Some(inode_t) = dest {
+			if inode_t == inode_f {
+				return Ok(());
+			}
+			let ti = self.read_inode(inode_t)?;
+			if ti.kind == KIND_DIR && !self.read_dir_inode(inode_t)?.is_empty() {
+				return Err(FsError::Invalid);
+			}
+		}
+
+		// 1. point the destination name at the moved inode (add or overwrite).
+		self.dir_set(pt, nt, inode_f)?;
+		// 2. clear the source entry.
+		self.dir_clear(pf, nf)?;
+		// 3. free the inode the destination name used to hold, if any and distinct.
+		if let Some(inode_t) = dest {
+			if inode_t != inode_f {
+				let ti = self.read_inode(inode_t)?;
+				self.write_inode(inode_t, &Inode::empty(KIND_FREE))?;
+				self.free_blocks(&ti)?;
+			}
+		}
+		Ok(())
+	}
+
+	// consistency
+
+	// Walk the directory tree and rebuild the allocation bitmap from the blocks live
+	// inodes actually reference, reclaiming blocks leaked by a crash mid-write, and
+	// free any allocated-but-unreferenced (orphan) inodes. Returns what was reclaimed.
+	pub fn fsck(&mut self) -> Result<FsckReport, FsError> {
+		// 1. every inode reachable by name from the root.
+		let mut reachable = BTreeSet::new();
+		reachable.insert(self.sb.root_inode);
+		self.gather_reachable(self.sb.root_inode, &mut reachable)?;
+
+		// 2. a fresh bitmap: the metadata blocks plus the blocks of reachable inodes.
+		let mut rebuilt = vec![0u8; self.bitmap.len()];
+		for b in 0..self.sb.data_start {
+			set_bit(&mut rebuilt, b);
+		}
+		for &num in &reachable {
+			let inode = self.read_inode(num)?;
+			self.collect_inode_blocks(&inode, &mut rebuilt)?;
+		}
+
+		// 3. reclaim orphan inodes (allocated but named by no directory).
+		let mut reclaimed_inodes = 0;
+		for num in 1..self.sb.num_inodes {
+			if self.read_inode(num)?.kind != KIND_FREE && !reachable.contains(&num) {
+				self.write_inode(num, &Inode::empty(KIND_FREE))?;
+				reclaimed_inodes += 1;
+			}
+		}
+
+		// 4. install the rebuilt bitmap, counting the blocks it freed.
+		let before = self.count_alloc(&self.bitmap);
+		let after = self.count_alloc(&rebuilt);
+		self.bitmap = rebuilt;
+		self.flush_bitmap()?;
+		Ok(FsckReport { reclaimed_blocks: before - after, reclaimed_inodes })
+	}
+
+
 
 	fn inode_location(&self, num: u32) -> (u32, usize) {
 		let block = self.sb.inode_start + num / INODES_PER_BLOCK as u32;
@@ -795,6 +1073,173 @@ impl<D: BlockDevice> Lsfs<D> {
 		self.write_inode(dir_num, &dir)?;
 		Ok(())
 	}
+
+	// Point an existing entry `name` in directory `dir_num` at `child`, or add it if it
+	// is not there yet.
+	fn dir_set(&mut self, dir_num: u32, name: &[u8], child: u32) -> Result<(), FsError> {
+		if let Some((_, phys, off)) = self.dir_find_in(dir_num, name) {
+			let mut block = vec![0u8; BLOCK_SIZE];
+			if !self.dev.read_block(phys, &mut block) {
+				return Err(FsError::Io);
+			}
+			block[off + NAME_MAX..off + NAME_MAX + 4].copy_from_slice(&child.to_le_bytes());
+			if !self.dev.write_block(phys, &block) {
+				return Err(FsError::Io);
+			}
+			return Ok(());
+		}
+		self.dir_add(dir_num, name, child)
+	}
+
+	// Clear entry `name` from directory `dir_num` (leaving a free slot).
+	fn dir_clear(&mut self, dir_num: u32, name: &[u8]) -> Result<(), FsError> {
+		let (_, phys, off) = self.dir_find_in(dir_num, name).ok_or(FsError::NotFound)?;
+		let mut block = vec![0u8; BLOCK_SIZE];
+		if !self.dev.read_block(phys, &mut block) {
+			return Err(FsError::Io);
+		}
+		for b in block[off..off + DENTRY_SIZE].iter_mut() {
+			*b = 0;
+		}
+		if !self.dev.write_block(phys, &block) {
+			return Err(FsError::Io);
+		}
+		Ok(())
+	}
+
+	// Does the subtree rooted at directory `root_dir` contain inode `target` (as the
+	// directory itself or any descendant)? Used to reject moving a directory into
+	// itself.
+	fn subtree_contains(&mut self, root_dir: u32, target: u32) -> Result<bool, FsError> {
+		if root_dir == target {
+			return Ok(true);
+		}
+		for (_, child) in self.dir_entries_of(root_dir)? {
+			if self.read_inode(child)?.kind == KIND_DIR && self.subtree_contains(child, target)? {
+				return Ok(true);
+			}
+		}
+		Ok(false)
+	}
+
+	// Free the file's data blocks from logical block `keep` to the end, clearing their
+	// pointers, and free the indirect blocks that map only the freed region. A partial
+	// shrink may leave a half-used indirect block allocated; `fsck` reclaims it.
+	fn free_from(&mut self, inode: &mut Inode, keep: usize) -> Result<(), FsError> {
+		let total = inode.nblocks();
+		for lb in keep..total {
+			self.clear_block_at(inode, lb)?;
+		}
+		if keep <= DIRECT && inode.indirect != 0 {
+			self.mark(inode.indirect, false);
+			inode.indirect = 0;
+		}
+		if keep <= DIRECT + PTRS_PER_BLOCK && inode.dindirect != 0 {
+			for first in 0..PTRS_PER_BLOCK {
+				let mid = self.read_ptr(inode.dindirect, first)?;
+				if mid != 0 {
+					self.mark(mid, false);
+				}
+			}
+			self.mark(inode.dindirect, false);
+			inode.dindirect = 0;
+		}
+		self.flush_bitmap()
+	}
+
+	// Free the data block at logical index `lb` and clear its pointer slot (leaving any
+	// indirect blocks in place).
+	fn clear_block_at(&mut self, inode: &mut Inode, lb: usize) -> Result<(), FsError> {
+		if lb < DIRECT {
+			if inode.direct[lb] != 0 {
+				self.mark(inode.direct[lb], false);
+				inode.direct[lb] = 0;
+			}
+			return Ok(());
+		}
+		let l = lb - DIRECT;
+		if l < PTRS_PER_BLOCK {
+			if inode.indirect != 0 {
+				let p = self.read_ptr(inode.indirect, l)?;
+				if p != 0 {
+					self.mark(p, false);
+					self.write_ptr(inode.indirect, l, 0)?;
+				}
+			}
+			return Ok(());
+		}
+		let d = l - PTRS_PER_BLOCK;
+		let first = d / PTRS_PER_BLOCK;
+		let second = d % PTRS_PER_BLOCK;
+		if inode.dindirect != 0 {
+			let mid = self.read_ptr(inode.dindirect, first)?;
+			if mid != 0 {
+				let p = self.read_ptr(mid, second)?;
+				if p != 0 {
+					self.mark(p, false);
+					self.write_ptr(mid, second, 0)?;
+				}
+			}
+		}
+		Ok(())
+	}
+
+	// Add every inode named under directory `dir` (recursively) to `set`.
+	fn gather_reachable(&mut self, dir: u32, set: &mut BTreeSet<u32>) -> Result<(), FsError> {
+		for (_, child) in self.dir_entries_of(dir)? {
+			if set.insert(child) && self.read_inode(child)?.kind == KIND_DIR {
+				self.gather_reachable(child, set)?;
+			}
+		}
+		Ok(())
+	}
+
+	// Set the bitmap bit for every block an inode references - its data blocks and the
+	// indirect blocks that map them.
+	fn collect_inode_blocks(&mut self, inode: &Inode, bitmap: &mut [u8]) -> Result<(), FsError> {
+		for i in 0..DIRECT {
+			if inode.direct[i] != 0 {
+				set_bit(bitmap, inode.direct[i]);
+			}
+		}
+		if inode.indirect != 0 {
+			set_bit(bitmap, inode.indirect);
+			for idx in 0..PTRS_PER_BLOCK {
+				let p = self.read_ptr(inode.indirect, idx)?;
+				if p != 0 {
+					set_bit(bitmap, p);
+				}
+			}
+		}
+		if inode.dindirect != 0 {
+			set_bit(bitmap, inode.dindirect);
+			for first in 0..PTRS_PER_BLOCK {
+				let mid = self.read_ptr(inode.dindirect, first)?;
+				if mid == 0 {
+					continue;
+				}
+				set_bit(bitmap, mid);
+				for second in 0..PTRS_PER_BLOCK {
+					let p = self.read_ptr(mid, second)?;
+					if p != 0 {
+						set_bit(bitmap, p);
+					}
+				}
+			}
+		}
+		Ok(())
+	}
+
+	// Count the allocated blocks recorded in `bitmap`, within the volume.
+	fn count_alloc(&self, bitmap: &[u8]) -> u32 {
+		let mut n = 0;
+		for b in 0..self.sb.num_blocks {
+			if bitmap[(b / 8) as usize] & (1 << (b % 8)) != 0 {
+				n += 1;
+			}
+		}
+		n
+	}
 }
 
 // The name held in a directory entry: the name field up to its first NUL.
@@ -813,6 +1258,11 @@ fn write_entry(entry: &mut [u8], name: &[u8], inode: u32) {
 	}
 	entry[..name.len()].copy_from_slice(name);
 	entry[NAME_MAX..NAME_MAX + 4].copy_from_slice(&inode.to_le_bytes());
+}
+
+// Set the allocation bit for block `b` in `bitmap`.
+fn set_bit(bitmap: &mut [u8], b: u32) {
+	bitmap[(b / 8) as usize] |= 1 << (b % 8);
 }
 
 // A block pointer as an Option: 0 is the "unmapped" sentinel, anything else a real
