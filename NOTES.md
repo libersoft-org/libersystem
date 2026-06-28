@@ -1,6 +1,5 @@
 # Bugs / changes
 
-- Move fat and liberfs directories to a new "fs" directory where all future file systems will be placed in their own folders
 - LiberFS lib.rs has 2700 lines of code - is it OK or should it be divided to multiple files?
 - GPU driver keeps failing probably (screen sometimes blinking after few minutes - probably restartind driver or something)
 - "exit" command should not halt the machine, but just exits the shell and shows up the parent shell (shell that started this console). If there is no parent, just reload the whole shell
@@ -20,7 +19,7 @@
 - Optimize the code
 - Find the dead code
 - Find the duplicate / repetitive code
-- There are "build" / "target" folders in "src", should it be somewhere else (a folder above)?
+- There are "build" / "target" directories in "src", should it be somewhere else (a directory above)?
 - SSH server
 
 # Questions / other

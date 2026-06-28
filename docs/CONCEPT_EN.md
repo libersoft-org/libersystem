@@ -1275,13 +1275,13 @@ Snapshot/checksum/incremental sync are properties of the FS backend (see Native 
 
 - **Broad control over disks is held by the application to which the system/user granted it.** Typically a file manager or a shell - it gets broad storage capabilities (all disks, arbitrary volumes, browsing and creating structure), and through them the user has full control. A "trusted tool" here means exactly and only "it got a broad capability", not a built-in privileged status.
 - **A third-party application can get the same capabilities too.** A user's own file manager gets *exactly the same* as the built-in one - the mechanism is one and the same. And vice versa: a built-in app with a narrow capability has no more rights than anyone else.
-- **Most applications get only narrow capabilities.** They do not see a global list of disks; they get only what the user passed them (typically a single file/folder via the file picker). This is not a restriction of the user - it is protection of the user *from applications*.
+- **Most applications get only narrow capabilities.** They do not see a global list of disks; they get only what the user passed them (typically a single file/directory via the file picker). This is not a restriction of the user - it is protection of the user *from applications*.
 
 How it holds together (no "root"):
 
 - A privilege is **not a property of a process** ("I am a system application"), but **a property of the held capability**.
 - A concrete tool holds broad access because it was **explicitly granted** to it (at install time or by the user in a session) - auditably and revocably, not as ambient authority.
-- The user then *delegates narrow slices* of that broad authority onward (one file, one folder) via the picker.
+- The user then *delegates narrow slices* of that broad authority onward (one file, one directory) via the picker.
 
 **`user://` is a default convenience, not a cage.**
 
