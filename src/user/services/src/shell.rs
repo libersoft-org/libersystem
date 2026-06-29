@@ -757,13 +757,29 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"ls" {
-			// no argument lists the current working directory
-			ls_cmd(storage, media, iso, udf, cwd.as_bytes());
+			// no argument lists the current working directory; route through PermissionManager
+			// (governed ELF) for the system volume, falling back to the inline listing otherwise.
+			let chan: u64 = storage_for(cwd.as_bytes(), storage, media, iso, udf);
+			let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"ls", cwd.as_bytes());
+			if !launched {
+				ls_cmd(storage, media, iso, udf, cwd.as_bytes());
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"ls ") {
 			match resolve_path(cwd, trim(rest)) {
-				Some(uri) => ls_cmd(storage, media, iso, udf, uri.as_bytes()),
+				Some(uri) => {
+					let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
+					// For a system-volume directory, launch `ls` as its own sandboxed ELF through
+					// PermissionManager (the launcher / granter): it grants the command just a
+					// storage client and forwards it this terminal, and the command reports its own
+					// result. Other volumes (media / iso / udf), and a shell with no
+					// PermissionManager (a non-primary VT), list the directory inline instead.
+					let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"ls", uri.as_bytes());
+					if !launched {
+						ls_cmd(storage, media, iso, udf, uri.as_bytes());
+					}
+				}
 				None => print(b"ls: invalid path\n"),
 			}
 			return false;
