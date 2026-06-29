@@ -836,14 +836,36 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 		}
 		if let Some(rest) = line.strip_prefix(b"mkdir ") {
 			match resolve_path(cwd, trim(rest)) {
-				Some(uri) => mkdir_cmd(storage_for(uri.as_bytes(), storage, media, iso, udf), uri.as_bytes()),
+				Some(uri) => {
+					let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
+					// For a system-volume directory, launch `mkdir` as its own sandboxed ELF through
+					// PermissionManager (the launcher / granter): it grants the command just a
+					// storage client and forwards it this terminal, and the command reports its own
+					// result. Other volumes (media / iso / udf), and a shell with no
+					// PermissionManager (a non-primary VT), create the directory inline instead.
+					let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"mkdir", uri.as_bytes());
+					if !launched {
+						mkdir_cmd(chan, uri.as_bytes());
+					}
+				}
 				None => print(b"mkdir: invalid path\n"),
 			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"rmdir ") {
 			match resolve_path(cwd, trim(rest)) {
-				Some(uri) => rmdir_cmd(storage_for(uri.as_bytes(), storage, media, iso, udf), uri.as_bytes()),
+				Some(uri) => {
+					let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
+					// For a system-volume directory, launch `rmdir` as its own sandboxed ELF through
+					// PermissionManager (the launcher / granter): it grants the command just a
+					// storage client and forwards it this terminal, and the command reports its own
+					// result. Other volumes (media / iso / udf), and a shell with no
+					// PermissionManager (a non-primary VT), remove the directory inline instead.
+					let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"rmdir", uri.as_bytes());
+					if !launched {
+						rmdir_cmd(chan, uri.as_bytes());
+					}
+				}
 				None => print(b"rmdir: invalid path\n"),
 			}
 			return false;
