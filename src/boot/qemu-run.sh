@@ -65,6 +65,25 @@ if [[ ! -f "$ISO_DISK" ]]; then
 		genisoimage -quiet -J -R -o "$ISO_DISK" "$HERE/../volume" 2>/dev/null || true
 	fi
 fi
+# A fourth virtio-blk disk holding a real UDF image (M60): the udf StorageService
+# instance mounts it read-only as `vol://udf`. Built once with mkfs.udf (blocksize 2048,
+# DVD-style) and populated via a loopback mount; skipped if mkfs.udf or loop mount is
+# unavailable (the udf volume then simply does not mount). Files come from volume/.
+UDF_DISK="$HERE/.build/udf-media.udf"
+if [[ ! -f "$UDF_DISK" ]] && command -v mkfs.udf >/dev/null; then
+	dd if=/dev/zero of="$UDF_DISK" bs=1M count=8 status=none 2>/dev/null || true
+	if mkfs.udf --media-type=hd --blocksize=2048 "$UDF_DISK" >/dev/null 2>&1; then
+		UMNT="$HERE/.build/udf-mnt"
+		mkdir -p "$UMNT"
+		if mount -o loop,ro=0 "$UDF_DISK" "$UMNT" 2>/dev/null; then
+			cp "$HERE/../volume"/* "$UMNT"/ 2>/dev/null || true
+			umount "$UMNT" 2>/dev/null || true
+		fi
+		rmdir "$UMNT" 2>/dev/null || true
+	else
+		rm -f "$UDF_DISK"
+	fi
+fi
 # Forward host 127.0.0.1:5555 to the guest's port 80, so a host HTTP client can reach
 # the guest's httpd (passive open / inbound) - SLIRP gives no inbound route otherwise.
 # Interactive runs only: the test path keeps a fixed device set and binds no host port.
@@ -95,6 +114,14 @@ if [[ -f "$ISO_DISK" ]]; then
 	QEMU_ARGS+=(
 		-drive "file=$ISO_DISK,if=none,id=viso,format=raw"
 		-device virtio-blk-pci,drive=viso,disable-legacy=on
+	)
+fi
+# The fourth virtio-blk disk (UDF vol://udf), discovered after the iso disk; only
+# attached when the UDF image was built (mkfs.udf present and loop mount succeeded).
+if [[ -f "$UDF_DISK" ]]; then
+	QEMU_ARGS+=(
+		-drive "file=$UDF_DISK,if=none,id=vudf,format=raw"
+		-device virtio-blk-pci,drive=vudf,disable-legacy=on
 	)
 fi
 

@@ -961,9 +961,9 @@ ISO9660 - so M58 covers CDs but not DVD/BR. A read-only UDF backend behind the
 Volume API completes optical-media interop: walk the anchor / partition descriptors
 to the root directory and read files, no allocation or write path.
 
-- [ ] A UDF backend behind `Storage.Volume`: read the Anchor Volume Descriptor Pointer and the volume / partition descriptors, walk the File Set and directory ICBs, and read files (long Unicode names).
-- [ ] Mount a UDF DVD / Blu-ray / `.udf` block device as a `vol://` volume: `ls` a directory and `cat` a file through the existing typed Storage interface, no new app-facing API.
-- [ ] Host-testable like `fat`: driven through the shared `BlockDevice` trait against a UDF image fixture, plus a live read of a UDF virtio-blk image in QEMU.
+- [x] A UDF backend behind `Storage.Volume`: read the Anchor Volume Descriptor Pointer and the volume / partition descriptors, walk the File Set and directory ICBs, and read files (long Unicode names).
+- [x] Mount a UDF DVD / Blu-ray / `.udf` block device as a `vol://` volume: `ls` a directory and `cat` a file through the existing typed Storage interface, no new app-facing API.
+- [x] Host-testable like `fat`: driven through the shared `BlockDevice` trait against a UDF image fixture, plus a live read of a UDF virtio-blk image in QEMU.
 - Done when: a UDF volume mounts behind the Volume API and the shell lists and reads files off it, tests green - DVD / Blu-ray media is readable through the same typed `Storage.Volume`.
 - Concept: Native filesystem (the supported-compatible-FS backends - ISO9660 / UDF among them - behind the unified Volume API), the layering principle (a `driver.fs.*` service; multiple FS backends behind one Volume API), M48 / M58 (the FAT / ISO9660 backends and the `BlockDevice` trait this reuses).
 

@@ -40,18 +40,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut block_client: u64 = 0;
 		let mut block2_client: u64 = 0;
 		let mut block3_client: u64 = 0;
+		let mut block4_client: u64 = 0;
 		let mut net_client: u64 = 0;
 		let mut gpu_client: u64 = 0;
 		let mut snd_client: u64 = 0;
 		let mut input_client: u64 = 0;
-		launch_drivers(&package, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client);
+		launch_drivers(&package, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client);
 
 		// 3. report in once the devices are bound to drivers, transferring the block
 		//    service channel up the boot chain, then the net driver's control channel, the
 		//    gpu driver's display channel, the snd driver's control channel, the pointer
 		//    driver's event channel, and the second block disk's service channel in follow-up
 		//    messages (the report itself carries one handle; each `GPU`/`NET`/`SND`/`INPUT`/
-		//    `BLOCK2`/`BLOCK3` handle is 0 when that device is absent).
+		//    `BLOCK2`/`BLOCK3`/`BLOCK4` handle is 0 when that device is absent).
 		send_blocking(bootstrap, b"DeviceManager: online", block_client);
 		send_blocking(bootstrap, b"NET", net_client);
 		send_blocking(bootstrap, b"GPU", gpu_client);
@@ -59,6 +60,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(bootstrap, b"INPUT", input_client);
 		send_blocking(bootstrap, b"BLOCK2", block2_client);
 		send_blocking(bootstrap, b"BLOCK3", block3_client);
+		send_blocking(bootstrap, b"BLOCK4", block4_client);
 
 		// 4. stand until ServiceManager asks us to stop (which also drops the driver
 		//    channels, so the drivers shut down with us), then acknowledge and exit.
@@ -74,7 +76,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // each device's state (online once its driver reports in, failed otherwise) and
 // prints a summary. The driver's "online" report is printed; it does not flow up
 // the boot-chain report channel (which carries only the service lifecycle).
-unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64) {
+unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64) {
 	unsafe {
 		let count: u64 = device_count();
 		let mut state: [u8; MAX_DEVICES] = [STATE_UNKNOWN; MAX_DEVICES];
@@ -103,13 +105,15 @@ unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u
 				if driver_name == b"virtio_blk" {
 					// the first virtio-blk disk is the writable system volume; a second is
 					// routed up separately as the read-only FAT media volume, a third as the
-					// read-only ISO9660 volume.
+					// read-only ISO9660 volume, a fourth as the read-only UDF volume.
 					if *block_client == 0 {
 						*block_client = handle;
 					} else if *block2_client == 0 {
 						*block2_client = handle;
 					} else if *block3_client == 0 {
 						*block3_client = handle;
+					} else if *block4_client == 0 {
+						*block4_client = handle;
 					}
 				}
 				if driver_name == b"virtio_net" {

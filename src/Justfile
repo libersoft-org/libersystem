@@ -17,6 +17,7 @@ term_dir := "term"
 liberfs_dir := "fs/liberfs"
 fat_dir := "fs/fat"
 iso9660_dir := "fs/iso9660"
+udf_dir := "fs/udf"
 target := "x86_64-unknown-none"
 kernel_elf := kernel_dir / "target" / target / "debug" / "kernel"
 
@@ -96,6 +97,7 @@ fmt:
 	cd {{liberfs_dir}} && cargo fmt
 	cd {{fat_dir}} && cargo fmt
 	cd {{iso9660_dir}} && cargo fmt
+	cd {{udf_dir}} && cargo fmt
 	shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # check formatting without writing changes (CI-friendly)
@@ -116,6 +118,7 @@ fmt-check:
 	cd {{liberfs_dir}} && cargo fmt --check
 	cd {{fat_dir}} && cargo fmt --check
 	cd {{iso9660_dir}} && cargo fmt --check
+	cd {{udf_dir}} && cargo fmt --check
 	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
 
 # clean build artifacts
@@ -136,5 +139,6 @@ clean:
 	cd {{liberfs_dir}} && cargo clean
 	cd {{fat_dir}} && cargo clean
 	cd {{iso9660_dir}} && cargo clean
+	cd {{udf_dir}} && cargo clean
 	rm -f volume/app.wasm
 	rm -rf boot/.build

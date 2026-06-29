@@ -1,0 +1,8 @@
+[package]
+name = "udf"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "UDF - a read-only backend for DVD / Blu-ray and large optical (.udf) media behind one BlockDevice trait"
+
+[dependencies]

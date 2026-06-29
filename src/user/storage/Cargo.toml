@@ -37,5 +37,9 @@ fat = { path = "../../fs/fat" }
 # the M58 optical / install-media volume.
 iso9660 = { path = "../../fs/iso9660" }
 
+# The read-only UDF backend StorageService mounts on a fourth virtio-blk disk for the
+# M60 DVD / Blu-ray volume.
+udf = { path = "../../fs/udf" }
+
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

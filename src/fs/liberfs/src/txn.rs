@@ -478,7 +478,6 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 		}
 	}
-
 }
 
 // B+tree node accessors. A node block begins with an 8-byte header: a type byte
@@ -564,4 +563,3 @@ pub(crate) fn leaf_split_point(recs: &[Vec<u8>]) -> usize {
 	}
 	down
 }
-

@@ -305,4 +305,3 @@ pub(crate) fn parse_superblock(block: &[u8]) -> Option<Superblock> {
 	}
 	Some(Superblock { num_blocks: u64::from_le_bytes(block[16..24].try_into().ok()?), generation: u64::from_le_bytes(block[28..36].try_into().ok()?), inode_root: u64::from_le_bytes(block[36..44].try_into().ok()?), inode_root_crc: u32::from_le_bytes(block[44..48].try_into().ok()?), next_inode: u32::from_le_bytes(block[24..28].try_into().ok()?), root_inode: u32::from_le_bytes(block[52..56].try_into().ok()?), snap_root: u64::from_le_bytes(block[60..68].try_into().ok()?), snap_root_crc: u32::from_le_bytes(block[68..72].try_into().ok()?) })
 }
-
