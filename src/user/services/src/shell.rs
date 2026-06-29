@@ -33,17 +33,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    sends them: storage (`cat`), log (`log`), device (`dev`), process (`ps`/`run`
 	//    and the launcher the shell runs foreground programs through), config
 	//    (`config`/`set`), network (`ip`/`ping`/...), time (`date`), audio (`beep`). Each
-	//    is a tagged capability over the bootstrap channel.
+	//    is a tagged capability over the bootstrap channel. The extended capabilities the
+	//    primary VT also gets (the media / iso / udf volumes, input, graph, perm, resource)
+	//    arrive as 0 on a non-primary VT - ConsoleService cannot mint them per VT (input /
+	//    graph are single-client, the rest are simply not proxied), and the dependent
+	//    command then reports the service unavailable.
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or_else(|| exit());
 	// The media StorageService client: the FAT vol://media volume off a second
 	// virtio-blk disk. Sent right after STORAGE; `cat`/`ls` route vol://media to it.
-	let media: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"MEDIA") }.unwrap_or_else(|| exit());
+	let media: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"MEDIA") }.unwrap_or(0);
 	// The ISO StorageService client: the read-only ISO9660 vol://iso volume off a third
 	// virtio-blk disk. Sent right after MEDIA; `cat`/`ls` route vol://iso to it.
-	let iso: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"ISO") }.unwrap_or_else(|| exit());
+	let iso: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"ISO") }.unwrap_or(0);
 	// The UDF StorageService client: the read-only UDF vol://udf volume off a fourth
 	// virtio-blk disk. Sent right after ISO; `cat`/`ls` route vol://udf to it.
-	let udf: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"UDF") }.unwrap_or_else(|| exit());
+	let udf: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"UDF") }.unwrap_or(0);
 	let logsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or_else(|| exit());
 	let devsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DEVICE") }.unwrap_or_else(|| exit());
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
@@ -53,20 +57,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let audiosvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"AUDIO") }.unwrap_or_else(|| exit());
 	// The InputService client: `mouse` subscribes to its pointer-event stream and prints
 	// the recent text-cell positions (the plumbing echo - no mouse-driven UI yet).
-	let inputsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"INPUT") }.unwrap_or_else(|| exit());
+	let inputsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"INPUT") }.unwrap_or(0);
 	// The SystemGraphService client: `graph` queries the live system graph (components,
 	// devices, dependency edges, counters, and trace spans) and renders it as CLI / JSON
 	// / CBOR. Sent right after INPUT, matching ServiceManager's send order.
-	let graphsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"GRAPH") }.unwrap_or_else(|| exit());
+	let graphsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"GRAPH") }.unwrap_or(0);
 	// The PermissionManager client: `perm` queries the permission audit trail (which
 	// capabilities each launched component was and was not granted under its manifest)
 	// and renders it as CLI / JSON. Sent right after GRAPH, matching ServiceManager's
 	// send order.
-	let permsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PERM") }.unwrap_or_else(|| exit());
+	let permsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PERM") }.unwrap_or(0);
 	// The ResourceManager client: `usage` queries the live per-Domain resource budgets
 	// (memory, handles, threads, IPC queue, DMA - used and limit) and renders them as CLI
 	// / JSON. Sent right after PERM, matching ServiceManager's send order.
-	let ressvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"RESOURCE") }.unwrap_or_else(|| exit());
+	let ressvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"RESOURCE") }.unwrap_or(0);
 	// The console channel to ConsoleService: the shell writes its output to it (routed
 	// via stdout) and reads its keystrokes from it. The userspace terminal renders the
 	// output and forwards the input, so the shell talks to the console, not the kernel.

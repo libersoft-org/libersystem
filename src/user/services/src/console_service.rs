@@ -1519,15 +1519,21 @@ fn repaint(console: &mut Console) {
 	}
 }
 
-// Spawn a fully-capable shell over the given console + control channels (the shell's
+// Spawn a core-capable shell over the given console + control channels (the shell's
 // ends): mint a fresh per-session client from each service factory, spawn the shell ELF,
-// hand it the full capability set in the order it expects (STORAGE, LOG, DEVICE, PROCESS,
-// CONFIG, NET, TIME, AUDIO, CONSOLE, CONTROL), wait for its "online" report (it
-// self-checks storage over its own connection), then release its bootstrap + Process
-// handle. The terminal's liveness is tracked solely by its console channel closing on
-// exit; holding the Process handle would pin the shell's handle table (and that channel)
-// alive, so the terminal could never be reaped when the shell logs out or exits. Shared by
-// spawn_vt (a display VT) and open_pty (a program-hosted PTY).
+// hand it its capability set in the order it expects (STORAGE, MEDIA, ISO, UDF, LOG,
+// DEVICE, PROCESS, CONFIG, NET, TIME, AUDIO, INPUT, GRAPH, PERM, RESOURCE, CONSOLE,
+// CONTROL), wait for its "online" report (it self-checks storage over its own
+// connection), then release its bootstrap + Process handle. The extended capabilities
+// (the media / iso / udf volumes, input, graph, perm, resource) are sent as 0 - a
+// non-primary VT cannot mint them per session (input / graph are single-client, the rest
+// are not proxied here) - so the shell boots core-capable and the dependent command
+// reports the service unavailable. The tags are still sent (with handle 0) so the shell
+// stays in positional sync with ServiceManager's primary-VT order. The terminal's
+// liveness is tracked solely by its console channel closing on exit; holding the Process
+// handle would pin the shell's handle table (and that channel) alive, so the terminal
+// could never be reaped when the shell logs out or exits. Shared by spawn_vt (a display
+// VT) and open_pty (a program-hosted PTY).
 unsafe fn spawn_shell(facs: &Factories, package: &Package, shell_console: u64, shell_control: u64) -> bool {
 	unsafe {
 		let shell_elf: &[u8] = match package.lookup(b"shell") {
@@ -1576,6 +1582,9 @@ unsafe fn spawn_shell(facs: &Factories, package: &Package, shell_console: u64, s
 			return false;
 		}
 		send_blocking(boot_parent, b"STORAGE", storage);
+		send_blocking(boot_parent, b"MEDIA", 0);
+		send_blocking(boot_parent, b"ISO", 0);
+		send_blocking(boot_parent, b"UDF", 0);
 		send_blocking(boot_parent, b"LOG", log);
 		send_blocking(boot_parent, b"DEVICE", device);
 		send_blocking(boot_parent, b"PROCESS", process);
@@ -1583,6 +1592,10 @@ unsafe fn spawn_shell(facs: &Factories, package: &Package, shell_console: u64, s
 		send_blocking(boot_parent, b"NET", net_client);
 		send_blocking(boot_parent, b"TIME", time);
 		send_blocking(boot_parent, b"AUDIO", audio);
+		send_blocking(boot_parent, b"INPUT", 0);
+		send_blocking(boot_parent, b"GRAPH", 0);
+		send_blocking(boot_parent, b"PERM", 0);
+		send_blocking(boot_parent, b"RESOURCE", 0);
 		send_blocking(boot_parent, b"CONSOLE", shell_console);
 		send_blocking(boot_parent, b"CONTROL", shell_control);
 		// wait for the shell to self-check storage and report in, then drop its bootstrap.
