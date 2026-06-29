@@ -45,6 +45,10 @@ name = "log"
 path = "src/log.rs"
 
 [[bin]]
+name = "snap"
+path = "src/snap.rs"
+
+[[bin]]
 name = "ping"
 path = "src/ping.rs"
 

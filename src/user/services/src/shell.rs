@@ -903,30 +903,57 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"snap" || line == b"snap list" {
-			snap_list_cmd(storage);
+			// Launch `snap` as its own sandboxed ELF through PermissionManager (the launcher /
+			// granter), which grants it a storage client and forwards it this terminal and the
+			// snapshot sub-form. A shell with no PermissionManager (a non-primary VT) manages
+			// snapshots inline instead.
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"snap", b"list");
+			if !launched {
+				snap_list_cmd(storage);
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"snap create ") {
-			snap_create_cmd(storage, trim(rest));
+			let name: &[u8] = trim(rest);
+			let mut arg: Vec<u8> = Vec::with_capacity(7 + name.len());
+			arg.extend_from_slice(b"create ");
+			arg.extend_from_slice(name);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"snap", &arg);
+			if !launched {
+				snap_create_cmd(storage, name);
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"snap delete ") {
-			snap_delete_cmd(storage, trim(rest));
+			let name: &[u8] = trim(rest);
+			let mut arg: Vec<u8> = Vec::with_capacity(7 + name.len());
+			arg.extend_from_slice(b"delete ");
+			arg.extend_from_slice(name);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"snap", &arg);
+			if !launched {
+				snap_delete_cmd(storage, name);
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"snap cat ") {
 			let rest = trim(rest);
-			// "snap cat <name> <vol://...>": split on the first space.
-			match rest.iter().position(|&b: &u8| b == b' ') {
-				Some(sp) => {
-					let uri = trim(&rest[sp + 1..]);
-					if !snap_cat(storage, &rest[..sp], uri) {
-						print(b"snap cat: could not read ");
-						print(uri);
-						print(b"\n");
+			let mut arg: Vec<u8> = Vec::with_capacity(4 + rest.len());
+			arg.extend_from_slice(b"cat ");
+			arg.extend_from_slice(rest);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"snap", &arg);
+			if !launched {
+				// "snap cat <name> <vol://...>": split on the first space.
+				match rest.iter().position(|&b: &u8| b == b' ') {
+					Some(sp) => {
+						let uri = trim(&rest[sp + 1..]);
+						if !snap_cat(storage, &rest[..sp], uri) {
+							print(b"snap cat: could not read ");
+							print(uri);
+							print(b"\n");
+						}
 					}
+					None => print(b"usage: snap cat <name> <vol://...>\n"),
 				}
-				None => print(b"usage: snap cat <name> <vol://...>\n"),
 			}
 			return false;
 		}
