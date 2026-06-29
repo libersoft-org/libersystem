@@ -1,6 +1,6 @@
 # Bugs / changes
 
-- List the available volumes "ls" - change to "lsvol"?
+- Add commands for listing hw resources - lsblk, lspci etc.
 - Search for big source code files, sort them by number of lines, create a plan to atomize them
 - GPU driver keeps failing probably (screen sometimes blinking after few minutes - probably restartind driver or something)
 - "exit" command should not halt the machine, but just exits the shell and shows up the parent shell (shell that started this console). If there is no parent, just reload the whole shell

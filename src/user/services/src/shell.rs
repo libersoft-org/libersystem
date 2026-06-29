@@ -533,7 +533,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			print(b"  resize <c> <r>   resize the terminal to c cols x r rows\n");
 			print(b"  echo <text>      print text\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
-			print(b"  ls [vol://vol]   list volumes, or a volume's files via StorageService\n");
+			print(b"  lsvol            list the available volumes via StorageService\n");
+			print(b"  ls <vol://vol>   list a volume's files via StorageService\n");
 			print(b"  write <vol://...> <text>  create or overwrite a file via StorageService\n");
 			print(b"  rm <vol://...>   delete a file via StorageService\n");
 			print(b"  snap [list]      list the volume's named snapshots via StorageService\n");
@@ -724,8 +725,12 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			exec(jobs, package, b"echo", trim(rest), 0, bg);
 			return false;
 		}
+		if line == b"lsvol" {
+			lsvol_cmd(storage, media, iso, udf);
+			return false;
+		}
 		if line == b"ls" {
-			ls_cmd(storage, media, iso, udf, b"");
+			print(b"usage: ls <vol://...>\n");
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"ls ") {
@@ -1495,28 +1500,32 @@ unsafe fn cat(storage: u64, uri: &[u8]) -> bool {
 	}
 }
 
-// List the volume set via the StorageService `list` op. With no argument print the
-// volume set; with `vol://<volume>` print that volume's files (name + size). The
-// volumes are `system` (writable LiberFS), `media` (FAT12/16/32 or exFAT off a second disk),
-// `iso` (read-only ISO9660 off a third disk), and `udf` (read-only UDF off a fourth disk).
+// List the available volumes via the StorageService `list` op: print the volume set with
+// a per-volume file count. The volumes are `system` (writable LiberFS), `media`
+// (FAT12/16/32 or exFAT off a second disk), `iso` (read-only ISO9660 off a third disk),
+// and `udf` (read-only UDF off a fourth disk).
+unsafe fn lsvol_cmd(storage: u64, media: u64, iso: u64, udf: u64) {
+	unsafe {
+		let sys: usize = volume_count(storage);
+		let med: usize = volume_count(media);
+		let opt: usize = volume_count(iso);
+		let dvd: usize = volume_count(udf);
+		print(b"volumes (4):\n  vol://system (");
+		print_usize(sys);
+		print(b" files)\n  vol://media (");
+		print_usize(med);
+		print(b" files)\n  vol://iso (");
+		print_usize(opt);
+		print(b" files)\n  vol://udf (");
+		print_usize(dvd);
+		print(b" files)\n");
+	}
+}
+
+// List the files of one volume via the StorageService `list` op: `vol://<volume>` prints
+// that volume's files (name + size). `lsvol` lists the volume set itself.
 unsafe fn ls_cmd(storage: u64, media: u64, iso: u64, udf: u64, arg: &[u8]) {
 	unsafe {
-		if arg.is_empty() {
-			let sys: usize = volume_count(storage);
-			let med: usize = volume_count(media);
-			let opt: usize = volume_count(iso);
-			let dvd: usize = volume_count(udf);
-			print(b"volumes (4):\n  vol://system (");
-			print_usize(sys);
-			print(b" files)\n  vol://media (");
-			print_usize(med);
-			print(b" files)\n  vol://iso (");
-			print_usize(opt);
-			print(b" files)\n  vol://udf (");
-			print_usize(dvd);
-			print(b" files)\n");
-			return;
-		}
 		let name: &[u8] = arg.strip_prefix(b"vol://").unwrap_or(arg);
 		let name: &[u8] = name.strip_suffix(b"/").unwrap_or(name);
 		let chan: u64 = match name {
@@ -1552,7 +1561,7 @@ unsafe fn ls_cmd(storage: u64, media: u64, iso: u64, udf: u64, arg: &[u8]) {
 	}
 }
 
-// Count the files on a volume, for the `ls` overview; 0 if the service is unavailable.
+// Count the files on a volume, for the `lsvol` overview; 0 if the service is unavailable.
 unsafe fn volume_count(storage: u64) -> usize {
 	let mut client = volume::Client::new(ChannelTransport { chan: storage });
 	match client.list() {
