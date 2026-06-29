@@ -921,6 +921,52 @@ the compressed length).
 - Done when: file data is transparently compressed per extent and reads back identically, incompressible data falls back to raw, checksums cover the stored bytes, tests green - the last modern-FS feature.
 - Concept: Native filesystem (compression, explicitly the last FS feature; deduplication and encryption are out by decision - dedup too costly, encryption a lower block/volume layer), the no_std + zero-dependency rule.
 
+## Foreign-FS interop track (M58-M60)
+
+M48 reads the FAT family for removable media; the concept's compatible-FS direction
+lists ISO9660 and exFAT alongside it. These add three more read backends behind the
+same `Storage.Volume` API (a `driver.fs.*` service over the shared `BlockDevice`
+trait), so install/boot media and large removable media mount as `vol://` volumes.
+All stay no_std + zero-dependency like `fat` and `liberfs`, host-testable against
+image fixtures plus a live QEMU read.
+
+## M58 - ISO9660 filesystem backend (read-only)
+
+Optical / install media and `.iso` images are ISO9660. A small, read-only backend
+behind the Volume API lets the system mount and read them with no allocation or
+write path - the cheapest interop win and the first compatible-FS after FAT.
+
+- [ ] An ISO9660 backend behind `Storage.Volume`: parse the volume descriptors, walk the directory records, and read files (Rock Ridge / Joliet long names where present, plain 8.3 otherwise).
+- [ ] Mount an `.iso` / optical block device as a `vol://` volume: `ls` a directory and `cat` a file through the existing typed Storage interface, no new app-facing API.
+- [ ] Host-testable like `fat`: driven through the shared `BlockDevice` trait against an ISO image fixture, plus a live read of an ISO virtio-blk image in QEMU.
+- Done when: an ISO9660 volume mounts behind the Volume API and the shell lists and reads files off it, tests green - install/boot media is readable through the same typed `Storage.Volume`.
+- Concept: Native filesystem (the supported-compatible-FS backends behind the unified Volume API), the layering principle (a `driver.fs.*` service; multiple FS backends behind one Volume API), M48 (the FAT backend and the `BlockDevice` trait this reuses).
+
+## M59 - exFAT write support (large removable media)
+
+M48 detects and reads exFAT; large SD cards and USB drives (over the FAT32 4 GiB
+file cap) need to be writable too. exFAT is close to FAT - a cluster chain plus an
+allocation bitmap - so the write path shares most of the M48 FAT machinery.
+
+- [ ] exFAT write: allocate and free cluster chains via the allocation bitmap, update the FAT, and create / write / delete files and directory entries (4 GiB+ files supported).
+- [ ] The shell `write` / `rm` route through `vol://media` on an exFAT volume, matching the FAT12/16/32 write path.
+- [ ] Host-testable: write round-trips on an exFAT image fixture plus a live write to an exFAT virtio-blk image in QEMU.
+- Done when: an exFAT volume mounts read-write behind the Volume API, the shell creates / writes / deletes files (including a >4 GiB file), tests green - large removable media is fully writable through the typed `Storage.Volume`.
+- Concept: Native filesystem (compatible-FS backends behind the unified Volume API), M48 (extends its read-only exFAT and reuses the FAT write machinery).
+
+## M60 - UDF filesystem backend (read-only, DVD / Blu-ray)
+
+DVDs and Blu-ray discs (and many large optical / `.udf` images) are UDF, not
+ISO9660 - so M58 covers CDs but not DVD/BR. A read-only UDF backend behind the
+Volume API completes optical-media interop: walk the anchor / partition descriptors
+to the root directory and read files, no allocation or write path.
+
+- [ ] A UDF backend behind `Storage.Volume`: read the Anchor Volume Descriptor Pointer and the volume / partition descriptors, walk the File Set and directory ICBs, and read files (long Unicode names).
+- [ ] Mount a UDF DVD / Blu-ray / `.udf` block device as a `vol://` volume: `ls` a directory and `cat` a file through the existing typed Storage interface, no new app-facing API.
+- [ ] Host-testable like `fat`: driven through the shared `BlockDevice` trait against a UDF image fixture, plus a live read of a UDF virtio-blk image in QEMU.
+- Done when: a UDF volume mounts behind the Volume API and the shell lists and reads files off it, tests green - DVD / Blu-ray media is readable through the same typed `Storage.Volume`.
+- Concept: Native filesystem (the supported-compatible-FS backends - ISO9660 / UDF among them - behind the unified Volume API), the layering principle (a `driver.fs.*` service; multiple FS backends behind one Volume API), M48 / M58 (the FAT / ISO9660 backends and the `BlockDevice` trait this reuses).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
