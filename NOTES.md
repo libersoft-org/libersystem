@@ -7,6 +7,7 @@
 
 # New features
 
+- When phase 2 is done, check if all matches with CONCEPT_EN/CZ.md
 - THREAT_MODEL.md - check if everything in this document is correct and current, add it to README as a link
 - Look for other FS compatibility (NTFS, ext4, xfs etc.)
 - add "cd" command

@@ -639,20 +639,20 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 // onward - a duplicable StorageService client, a duplicable (but dead-peer) LogService
 // client, and a TimeService client - plus a NetworkService client it holds but is NOT to
 // grant, a ProcessService client it drives to load components, and the channel its clients
-// reach it on. PermissionManager launches three governed components through ProcessService,
-// each under a typed permission manifest: sandbox_probe (granted storage and log but not
-// network - it transfers exactly those two clients and withholds the network one), `date`
-// (granted only time - the `date` shell command run as a standalone sandboxed ELF), and
-// request_probe (granted only log, which then asks for an undeclared capability - storage -
-// at runtime), recording every decision. Each sandboxed component reaches only its granted
-// capabilities: sandbox_probe reads its one granted file vol://system/hello.txt through the
-// storage grant and reports the bytes back, `date` reads the wall clock through the time
-// grant and reports the rendered instant, and request_probe's runtime request is refused by
-// the headless policy default (least privilege - an undeclared capability is never granted)
-// and recorded as a dynamic denial. PermissionManager then exercises its `run` launcher: it
-// starts the `cat` command as its own sandboxed ELF (granted only storage) with a captured
-// stdout console and a file argument, and `cat` prints that file through its storage grant to
-// the forwarded stdout. The kernel only brokers the initial capabilities. Returns (expected,
+// reach it on. PermissionManager governs four components through ProcessService, each under
+// a typed permission manifest. Two are report-back probes: sandbox_probe (granted storage and
+// log but not network - it transfers exactly those two clients and withholds the network one)
+// and request_probe (granted only log, which then asks for an undeclared capability - storage
+// - at runtime), recording every decision. The other two it launches on demand through its
+// `run` op (the launcher / granter path), each printing to a captured stdout: `date` (granted
+// only time) renders the wall clock, and `cat` (granted only storage) prints a file. Each
+// sandboxed component reaches only its granted capabilities: sandbox_probe reads its one
+// granted file vol://system/hello.txt through the storage grant and reports the bytes back;
+// `date` reads the wall clock through the time grant and prints the rendered instant to its
+// captured stdout; request_probe's runtime request is refused by the headless policy default
+// (least privilege - an undeclared capability is never granted) and recorded as a dynamic
+// denial; and `cat` prints that file through its storage grant to the forwarded stdout. The
+// kernel only brokers the initial capabilities. Returns (expected,
 // probe_read, probe_summary, date_read, date_summary, request_read, request_summary,
 // cat_read): the file straight from the volume, then each component's proof and decisions
 // summary, then the bytes `cat` printed through the run launcher.
@@ -728,7 +728,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 
 	// PermissionManager reports its "online" line, then each governed component's proof and
 	// decisions summary: the bytes sandbox_probe read through its one granted storage
-	// capability and its summary, the instant `date` read through its one granted time
+	// capability and its summary, the instant `date` printed through its one granted time
 	// capability and its summary, then request_probe's verdict on its runtime request for an
 	// undeclared capability and its summary (which marks that refused request as dynamic) -
 	// exactly which capabilities each component was and was not given - and finally the bytes
@@ -2549,30 +2549,30 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 #[cfg(test)]
 #[test_case]
 fn permission_manager_sandboxes_a_component() {
-	// The PermissionManager launches three governed components under typed permission
-	// manifests. sandbox_probe is granted storage and log but not network: it starts with
-	// only its manifest's capabilities - the manager transfers exactly the storage and log
-	// clients to it and withholds the network one it holds, recording every decision - and
+	// The PermissionManager governs four components under typed permission manifests. Two are
+	// report-back probes. sandbox_probe is granted storage and log but not network: it starts
+	// with only its manifest's capabilities - the manager transfers exactly the storage and
+	// log clients to it and withholds the network one it holds, recording every decision - and
 	// reads its one granted file through the storage capability, reporting the bytes back.
-	// `date` (the `date` shell command run as a standalone sandboxed ELF) is granted only
-	// time: it reaches the wall clock through that one capability and reports the rendered
-	// instant. request_probe is granted only log and then asks for an undeclared capability
-	// (storage) at runtime: the headless policy default refuses it (least privilege) and the
-	// manager records that refusal as a dynamic decision. The probe's bytes must equal the
-	// file straight from the volume (the storage grant is live and reaches exactly that file)
-	// and its summary must show storage and log granted and every other capability denied;
-	// `date`'s reply must be a well-formed ISO-8601 UTC instant (the time grant is live) and
-	// its summary must show only time granted and every other capability denied;
-	// request_probe's runtime request must be denied and its summary must mark that refusal
-	// as dynamic - each component was given exactly its manifest and nothing more. Finally the
-	// manager exercises its `run` launcher: it starts the `cat` command as its own sandboxed
-	// ELF granted only storage with a captured stdout and a file to print, and `cat`'s output
-	// must equal that file.
+	// request_probe is granted only log and then asks for an undeclared capability (storage)
+	// at runtime: the headless policy default refuses it (least privilege) and the manager
+	// records that refusal as a dynamic decision. The other two are real system tools the
+	// manager launches on demand through its `run` op, each printing to a captured stdout:
+	// `date` (granted only time) reaches the wall clock through that one capability and prints
+	// the rendered instant, and `cat` (granted only storage) prints its one file argument. The
+	// probe's bytes must equal the file straight from the volume (the storage grant is live
+	// and reaches exactly that file) and its summary must show storage and log granted and
+	// every other capability denied; `date`'s output must be a well-formed ISO-8601 UTC instant
+	// (the time grant is live) and its summary must show only time granted and every other
+	// capability denied; request_probe's runtime request must be denied and its summary must
+	// mark that refusal as dynamic - each component was given exactly its manifest and nothing
+	// more. Finally `cat`'s output must equal that file (the storage grant reaches it through
+	// the on-demand launcher).
 	let (expected, probe_read, probe_summary, date_read, date_summary, request_read, request_summary, cat_read) = run_permission_scenario().expect("the permission scenario should run");
 	assert!(!expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(probe_read, expected, "the sandboxed component read its one granted file through the storage grant");
 	assert_eq!(probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
-	// `date` reached its one granted capability: the reply is a well-formed ISO-8601 UTC
+	// `date` reached its one granted capability: its output is a well-formed ISO-8601 UTC
 	// instant "YYYY-MM-DDTHH:MM:SSZ" (the exact moment varies, so check the shape, not the
 	// value - its presence proves the time grant is live).
 	assert_eq!(date_read.len(), 20, "the date command rendered a 20-byte ISO-8601 UTC instant through its time grant");

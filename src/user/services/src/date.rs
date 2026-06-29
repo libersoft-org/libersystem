@@ -1,58 +1,53 @@
-// date - the `date` shell command run as a standalone, governed program.
+// date - print the current wall-clock instant, run as its own sandboxed ELF.
 //
-// PermissionManager launches this program under its permission manifest, which grants it
-// exactly one capability: a TimeService client. The command receives that client (and
-// nothing else - no storage, no log, no network), queries the wall clock through it,
-// renders the instant as ISO-8601 UTC, and reports the rendered string back to the
-// manager over its bootstrap channel - the manager's proof that the governed command
-// reached its one granted capability. This is a slice of moving every shell command into
-// its own sandboxed ELF: `date` carries only the time capability its manifest declares.
-//
-// The command never receives any other capability (its manifest grants only time), so it
-// cannot reach storage, the log, or the network at all - there is no ambient authority to
-// fall back on, only the one capability handed to it. This is the strict-sandbox property:
-// a launched component starts with only its manifest's capabilities and can reach nothing
-// else.
+// PermissionManager launches this program under a permission manifest that grants it
+// exactly one capability - a TimeService client - and forwards it the shell's stdout console
+// and an (empty) argument string. date reads the wall clock through its time grant, renders
+// the instant as ISO-8601 UTC, prints it to the inherited stdout, and exits. A standalone
+// command, not a shell built-in: it reaches the clock only through the one capability the
+// permission store granted it (no storage, no log, no network - no ambient authority to fall
+// back on), and renders on the same terminal as the shell that launched it.
 
 #![no_std]
 #![no_main]
 
-extern crate alloc;
-
-use alloc::vec::Vec;
-use proto::system::{Timestamp, time};
+use proto::system::{time, Timestamp};
 use rt::*;
-
-// Read the wall clock through the granted TimeService client and render it as ISO-8601
-// UTC ("YYYY-MM-DDTHH:MM:SSZ"). Mirrors the shell's `date`: query now() over the time
-// client, then render the typed timestamp. Returns the rendered bytes, or None if the
-// grant could not be reached (no ambient fallback - the capability is the only way to the
-// clock).
-fn read_clock(timesvc: u64) -> Option<Vec<u8>> {
-	let mut client = time::Client::new(ChannelTransport { chan: timesvc });
-	let ts: Timestamp = match client.now() {
-		Some(Ok(t)) => t,
-		_ => return None,
-	};
-	let mut out: [u8; 24] = [0u8; 24];
-	let n: usize = ts.render(&mut out);
-	Some(out[..n].to_vec())
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 64] = [0u8; 64];
-
-	// Receive exactly the one capability the manifest grants: the TimeService client. The
-	// command never receives (and so can never reach) anything else.
-	let timesvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"TIME") }.unwrap_or_else(|| exit());
-
-	// Exercise the grant: read the wall clock and render it.
-	let rendered: Vec<u8> = read_clock(timesvc).unwrap_or_default();
-
-	// Report the rendered instant back to the manager - its proof the time grant is live.
 	unsafe {
-		send_blocking(bootstrap, &rendered, 0);
+		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
+		//    renders on the same terminal as the shell that launched us.
+		inherit_stdout(bootstrap);
+		// 2. receive the argument string (date takes none, but the launch protocol sends one).
+		let _ = recv_blocking(bootstrap, &mut buf);
+		// 3. receive the one capability the manifest grants: a TimeService client.
+		let timesvc: u64 = recv_tagged(bootstrap, &mut buf, b"TIME").unwrap_or_else(|| exit());
+		date(timesvc);
 	}
 	exit();
+}
+
+// Read the wall clock through the time grant, render it as ISO-8601 UTC
+// ("YYYY-MM-DDTHH:MM:SSZ"), and print it to stdout - reporting a concise error if the grant
+// cannot be reached (no ambient fallback, the capability is the only way to the clock). The
+// instant is printed as its own message, then the trailing newline, so a launcher capturing
+// the first message reads exactly the rendered instant.
+unsafe fn date(timesvc: u64) {
+	unsafe {
+		let mut client = time::Client::new(ChannelTransport { chan: timesvc });
+		let ts: Timestamp = match client.now() {
+			Some(Ok(t)) => t,
+			_ => {
+				print(b"date: time error\n");
+				return;
+			}
+		};
+		let mut out: [u8; 24] = [0u8; 24];
+		let n: usize = ts.render(&mut out);
+		print(&out[..n]);
+		print(b"\n");
+	}
 }

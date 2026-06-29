@@ -677,7 +677,13 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"date" {
-			show_date(timesvc);
+			// Launch `date` as its own sandboxed ELF through PermissionManager (the launcher /
+			// granter), which grants it just a time client and forwards it this terminal. A
+			// shell with no PermissionManager (a non-primary VT) reads the clock inline instead.
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"date", b"");
+			if !launched {
+				show_date(timesvc);
+			}
 			return false;
 		}
 		if line == b"beep" {
@@ -787,7 +793,23 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// "write <uri> <text>": split on the first space.
 			match rest.iter().position(|&b: &u8| b == b' ') {
 				Some(sp) => match resolve_path(cwd, trim(&rest[..sp])) {
-					Some(uri) => write_cmd(storage_for(uri.as_bytes(), storage, media, iso, udf), uri.as_bytes(), trim(&rest[sp + 1..])),
+					Some(uri) => {
+						let text: &[u8] = trim(&rest[sp + 1..]);
+						let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
+						// For a system-volume file, launch `write` as its own sandboxed ELF through
+						// PermissionManager (the launcher / granter): it grants the command just a
+						// storage client and forwards it this terminal and the "<uri> <text>" argument,
+						// and the command reports its own result. Other volumes (media / iso / udf), and
+						// a shell with no PermissionManager (a non-primary VT), write inline.
+						let mut arg: Vec<u8> = Vec::with_capacity(uri.len() + 1 + text.len());
+						arg.extend_from_slice(uri.as_bytes());
+						arg.push(b' ');
+						arg.extend_from_slice(text);
+						let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"write", &arg);
+						if !launched {
+							write_cmd(chan, uri.as_bytes(), text);
+						}
+					}
 					None => print(b"write: invalid path\n"),
 				},
 				None => print(b"usage: write <vol://...> <text>\n"),

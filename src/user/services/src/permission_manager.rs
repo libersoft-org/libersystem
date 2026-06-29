@@ -26,16 +26,15 @@
 // job control (so the shell reaches the OS tools only through the manager, never the raw
 // kernel loader).
 //
-// This milestone it launches three governed components: sandbox_probe, whose manifest grants
-// storage and log but not network; `date` (the `date` shell command run as a standalone
-// sandboxed ELF), whose manifest grants only time; and request_probe, whose manifest grants
-// only log and which then asks for an undeclared capability (storage) at runtime. Each
-// reaches exactly its granted capabilities and nothing else - sandbox_probe reads its one
-// granted file and reports the bytes back, `date` reads the wall clock and reports the
-// rendered instant, and request_probe's runtime request is refused by the headless policy
-// and recorded as a dynamic denial. It then demonstrates the `run` launcher by starting the
-// `cat` command as its own sandboxed ELF (granted only storage) with a captured stdout and a
-// file to print. The manager relays each proof and decisions summary, and the tool's printed
+// This milestone it governs four components. Two are report-back probes that prove the grant
+// paths: sandbox_probe, whose manifest grants storage and log but not network, reads its one
+// granted file and reports the bytes back; and request_probe, whose manifest grants only log,
+// asks for an undeclared capability (storage) at runtime, which the headless policy refuses
+// and records as a dynamic denial. The other two are real system tools the manager launches
+// on demand through the `run` op - the launcher / granter path - each printing to a captured
+// stdout: `date` (granted only time) renders the wall clock, and `cat` (granted only storage)
+// prints a file. Each reaches exactly its manifest's capabilities and nothing else. The
+// manager relays each component's proof and decisions summary, and each tool's printed
 // output, to the supervisor, then serves the Permission contract until the supervisor drops
 // its bootstrap channel.
 
@@ -54,15 +53,17 @@ use rt::*;
 // duplicated with before it is transferred (send + receive + wait + transfer onward - the
 // set a service client needs, never more than the manager itself holds).
 const PROBE_NAME: &[u8] = b"sandbox_probe";
-// The governed command this milestone also launches: the `date` shell command run as a
-// standalone sandboxed ELF, whose manifest grants it exactly one capability (time).
+// One of the system tools the manager launches on demand through the `run` op (the launcher
+// / granter path): the `date` command run as its own sandboxed ELF, which renders the wall
+// clock to a captured stdout; its manifest grants it exactly one capability (time).
 const DATE_NAME: &[u8] = b"date";
 // The governed component that exercises the dynamic permission-request path: its manifest
 // grants only log, and at runtime it asks for an undeclared capability (storage) to prove
 // the headless policy refuses any escalation beyond the manifest.
 const REQUEST_NAME: &[u8] = b"request_probe";
-// The first system tool launched on demand through the `run` op: the `cat` shell command
-// run as its own sandboxed ELF, whose manifest grants it exactly one capability (storage).
+// Another system tool launched on demand through the `run` op: the `cat` command run as its
+// own sandboxed ELF, which prints a file to a captured stdout; its manifest grants it exactly
+// one capability (storage).
 const CAT_NAME: &[u8] = b"cat";
 const GRANT_RIGHTS: u32 = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER;
 
@@ -94,6 +95,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"date" => Some(Manifest { component: String::from("date"), grants: alloc::vec![Capability::Time] }),
 		b"request_probe" => Some(Manifest { component: String::from("request_probe"), grants: alloc::vec![Capability::Log] }),
 		b"cat" => Some(Manifest { component: String::from("cat"), grants: alloc::vec![Capability::Storage] }),
+		b"write" => Some(Manifest { component: String::from("write"), grants: alloc::vec![Capability::Storage] }),
 		_ => None,
 	}
 }
@@ -388,26 +390,25 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
 
 	// 3. launch each governed component under its manifest, accumulating one shared audit
-	//    trail: sandbox_probe (granted storage + log, denied the rest) reads its one file,
-	//    `date` (granted only time) reads the wall clock - the `date` shell command run as a
-	//    standalone sandboxed ELF - and request_probe (granted only log) asks for an
-	//    undeclared capability at runtime to exercise the dynamic-request path. Then
-	//    demonstrate the on-demand tool launcher behind the `run` op: launch the `cat` command
-	//    as its own sandboxed ELF, granted only storage, with a captured stdout console and a
-	//    file to print.
+	//    trail: sandbox_probe (granted storage + log, denied the rest) reads its one file and
+	//    reports the bytes back; `date` (granted only time) is launched on demand through the
+	//    `run` op and renders the wall clock to a captured stdout; request_probe (granted only
+	//    log) asks for an undeclared capability at runtime to exercise the dynamic-request
+	//    path; and `cat` (granted only storage) is likewise launched through `run`, printing a
+	//    file to a captured stdout.
 	let mut audit: Vec<AuditEntry> = Vec::new();
 	let probe_read: Vec<u8> = unsafe { launch_under_manifest(procsvc, PROBE_NAME, &clients, &mut audit, &mut buf) }.unwrap_or_default();
-	let date_read: Vec<u8> = unsafe { launch_under_manifest(procsvc, DATE_NAME, &clients, &mut audit, &mut buf) }.unwrap_or_default();
+	let date_read: Vec<u8> = unsafe { demonstrate_tool(procsvc, DATE_NAME, b"", &clients, &mut audit, &mut buf) };
 	let request_read: Vec<u8> = unsafe { launch_under_manifest(procsvc, REQUEST_NAME, &clients, &mut audit, &mut buf) }.unwrap_or_default();
 	let cat_read: Vec<u8> = unsafe { demonstrate_tool(procsvc, CAT_NAME, b"vol://system/hello.txt", &clients, &mut audit, &mut buf) };
 
 	// 4. report in to the supervisor, then relay each governed component's proof and its
 	//    decisions summary (exactly which capabilities it was and was not given): the bytes
-	//    sandbox_probe read through its storage grant, the instant `date` read through its
-	//    time grant, request_probe's verdict on its runtime request for an undeclared
-	//    capability (its summary marks that refused request as a dynamic decision), then the
-	//    bytes the on-demand `cat` tool printed through its storage grant to the forwarded
-	//    stdout.
+	//    sandbox_probe read through its storage grant, the instant `date` printed through its
+	//    time grant to a captured stdout, request_probe's verdict on its runtime request for an
+	//    undeclared capability (its summary marks that refused request as a dynamic decision),
+	//    then the bytes the on-demand `cat` tool printed through its storage grant to the
+	//    forwarded stdout.
 	unsafe {
 		send_blocking(bootstrap, b"PermissionManager: online", 0);
 		send_blocking(bootstrap, &probe_read, 0);
