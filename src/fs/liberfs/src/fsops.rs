@@ -137,13 +137,13 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(out)
 	}
 
-	// List the root directory as (name, size) pairs, one per live entry.
-	pub fn list(&mut self) -> Result<Vec<(Vec<u8>, u64)>, FsError> {
+	// List the root directory as (name, size, is_dir) triples, one per live entry.
+	pub fn list(&mut self) -> Result<Vec<(Vec<u8>, u64, bool)>, FsError> {
 		self.read_dir_inode(self.root_inode)
 	}
 
-	// List the directory at `path` as (name, size) pairs.
-	pub fn read_dir(&mut self, path: &[u8]) -> Result<Vec<(Vec<u8>, u64)>, FsError> {
+	// List the directory at `path` as (name, size, is_dir) triples.
+	pub fn read_dir(&mut self, path: &[u8]) -> Result<Vec<(Vec<u8>, u64, bool)>, FsError> {
 		let inode_num = self.resolve(path)?;
 		if self.read_inode(inode_num)?.kind != KIND_DIR {
 			return Err(FsError::Invalid);
@@ -238,6 +238,22 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.begin();
 		let r = self.remove_inner(path);
 		self.finish(r)
+	}
+
+	// Remove the empty directory at `path`. Rejects a regular file (use `remove`) and a
+	// non-empty directory, so a directory is never deleted with its contents.
+	pub fn rmdir(&mut self, path: &[u8]) -> Result<(), FsError> {
+		self.begin();
+		let r = self.rmdir_inner(path);
+		self.finish(r)
+	}
+
+	pub(crate) fn rmdir_inner(&mut self, path: &[u8]) -> Result<(), FsError> {
+		let inode_num = self.resolve(path)?;
+		if self.read_inode(inode_num)?.kind != KIND_DIR {
+			return Err(FsError::Invalid);
+		}
+		self.remove_inner(path)
 	}
 
 	pub(crate) fn remove_inner(&mut self, path: &[u8]) -> Result<(), FsError> {

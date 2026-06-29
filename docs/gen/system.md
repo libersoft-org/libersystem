@@ -70,12 +70,20 @@ An opaque kernel object, transferred as `handle<file>`.
 | `file` | `handle<file>` |
 | `size` | `u64` |
 
+### enum `file-kind`
+
+| case | ordinal |
+| --- | --- |
+| `file` | 0 |
+| `dir` | 1 |
+
 ### record `file-info`
 
 | field | type |
 | --- | --- |
 | `name` | `string` |
 | `size` | `u64` |
+| `kind` | `file-kind` |
 
 ### record `snapshot-info`
 
@@ -347,13 +355,15 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `open` | `open(o: open-opts) -> result<open-result, error>` |
-| 2 | `list` | `list() -> result<list<file-info>, error>` |
+| 2 | `list` | `list(path: string) -> result<list<file-info>, error>` |
 | 3 | `write` | `write(path: string, data: buffer) -> result<unit, error>` |
 | 4 | `remove` | `remove(path: string) -> result<unit, error>` |
 | 5 | `snap-create` | `snap-create(name: string) -> result<unit, error>` |
 | 6 | `snap-list` | `snap-list() -> result<list<snapshot-info>, error>` |
 | 7 | `snap-delete` | `snap-delete(name: string) -> result<unit, error>` |
 | 8 | `snap-open` | `snap-open(snapshot: string, path: string) -> result<open-result, error>` |
+| 9 | `mkdir` | `mkdir(path: string) -> result<unit, error>` |
+| 10 | `rmdir` | `rmdir(path: string) -> result<unit, error>` |
 
 ### interface `device`
 

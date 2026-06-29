@@ -15,7 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{AuditEntry, Budget, Component, ConfigEntry, DeviceEntry, Entry, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan, audio, config, device, input, log, network, permission, process, resources, system_graph, time, volume};
+use proto::system::{audio, config, device, input, log, network, permission, process, resources, system_graph, time, volume, AuditEntry, Budget, Component, ConfigEntry, DeviceEntry, Entry, FileKind, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -534,9 +534,11 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			print(b"  echo <text>      print text\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
 			print(b"  lsvol            list the available volumes via StorageService\n");
-			print(b"  ls <vol://vol>   list a volume's files via StorageService\n");
+			print(b"  ls <vol://vol>   list a directory's entries via StorageService\n");
 			print(b"  write <vol://...> <text>  create or overwrite a file via StorageService\n");
 			print(b"  rm <vol://...>   delete a file via StorageService\n");
+			print(b"  mkdir <vol://...>  create a directory via StorageService\n");
+			print(b"  rmdir <vol://...>  remove an empty directory via StorageService\n");
 			print(b"  snap [list]      list the volume's named snapshots via StorageService\n");
 			print(b"  snap create <name>  pin a named read-only snapshot of the volume\n");
 			print(b"  snap delete <name>  delete a named snapshot, releasing its blocks\n");
@@ -760,6 +762,16 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			rm_cmd(storage_for(uri, storage, media, iso, udf), uri);
 			return false;
 		}
+		if let Some(rest) = line.strip_prefix(b"mkdir ") {
+			let uri = trim(rest);
+			mkdir_cmd(storage_for(uri, storage, media, iso, udf), uri);
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"rmdir ") {
+			let uri = trim(rest);
+			rmdir_cmd(storage_for(uri, storage, media, iso, udf), uri);
+			return false;
+		}
 		if line == b"snap" || line == b"snap list" {
 			snap_list_cmd(storage);
 			return false;
@@ -866,7 +878,11 @@ unsafe fn send_stdout(parent: u64) {
 		let so: u64 = stdout();
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, RIGHT_SEND | RIGHT_TRANSFER);
-			if d > 0 { d as u64 } else { 0 }
+			if d > 0 {
+				d as u64
+			} else {
+				0
+			}
 		} else {
 			0
 		};
@@ -1506,10 +1522,10 @@ unsafe fn cat(storage: u64, uri: &[u8]) -> bool {
 // and `udf` (read-only UDF off a fourth disk).
 unsafe fn lsvol_cmd(storage: u64, media: u64, iso: u64, udf: u64) {
 	unsafe {
-		let sys: usize = volume_count(storage);
-		let med: usize = volume_count(media);
-		let opt: usize = volume_count(iso);
-		let dvd: usize = volume_count(udf);
+		let sys: usize = volume_count(storage, "vol://system");
+		let med: usize = volume_count(media, "vol://media");
+		let opt: usize = volume_count(iso, "vol://iso");
+		let dvd: usize = volume_count(udf, "vol://udf");
 		print(b"volumes (4):\n  vol://system (");
 		print_usize(sys);
 		print(b" files)\n  vol://media (");
@@ -1522,13 +1538,25 @@ unsafe fn lsvol_cmd(storage: u64, media: u64, iso: u64, udf: u64) {
 	}
 }
 
-// List the files of one volume via the StorageService `list` op: `vol://<volume>` prints
-// that volume's files (name + size). `lsvol` lists the volume set itself.
+// List the entries of a directory via the StorageService `list` op: `vol://<volume>`
+// lists that volume's root, `vol://<volume>/<subdir>` a subdirectory (name + size, with
+// a trailing `/` marking a subdirectory). `lsvol` lists the volume set itself.
 unsafe fn ls_cmd(storage: u64, media: u64, iso: u64, udf: u64, arg: &[u8]) {
 	unsafe {
-		let name: &[u8] = arg.strip_prefix(b"vol://").unwrap_or(arg);
-		let name: &[u8] = name.strip_suffix(b"/").unwrap_or(name);
-		let chan: u64 = match name {
+		// the URI is vol://<volume>[/<subdir>]; the volume picks the channel, the whole
+		// URI names the directory to list.
+		let rest: &[u8] = match arg.strip_prefix(b"vol://") {
+			Some(r) => r,
+			None => {
+				print(b"ls: unknown volume\n");
+				return;
+			}
+		};
+		let vol: &[u8] = match rest.iter().position(|&b: &u8| b == b'/') {
+			Some(i) => &rest[..i],
+			None => rest,
+		};
+		let chan: u64 = match vol {
 			b"system" => storage,
 			b"media" => media,
 			b"iso" => iso,
@@ -1538,33 +1566,44 @@ unsafe fn ls_cmd(storage: u64, media: u64, iso: u64, udf: u64, arg: &[u8]) {
 				return;
 			}
 		};
+		let uri: &str = match core::str::from_utf8(arg) {
+			Ok(s) => s,
+			Err(_) => {
+				print(b"ls: invalid path\n");
+				return;
+			}
+		};
 		let mut client = volume::Client::new(ChannelTransport { chan });
-		let files = match client.list() {
+		let files = match client.list(uri) {
 			Some(Ok(f)) => f,
 			_ => {
 				print(b"ls: StorageService unavailable\n");
 				return;
 			}
 		};
-		print(b"vol://");
-		print(name);
+		print(arg);
 		print(b" (");
 		print_usize(files.len());
-		print(b" files):\n");
+		print(b" entries):\n");
 		for f in &files {
 			print(b"  ");
 			print(f.name.as_bytes());
-			print(b" ");
-			print_usize(f.size as usize);
-			print(b" bytes\n");
+			match f.kind {
+				FileKind::Dir => print(b"/\n"),
+				FileKind::File => {
+					print(b" ");
+					print_usize(f.size as usize);
+					print(b" bytes\n");
+				}
+			}
 		}
 	}
 }
 
 // Count the files on a volume, for the `lsvol` overview; 0 if the service is unavailable.
-unsafe fn volume_count(storage: u64) -> usize {
+unsafe fn volume_count(storage: u64, uri: &str) -> usize {
 	let mut client = volume::Client::new(ChannelTransport { chan: storage });
-	match client.list() {
+	match client.list(uri) {
 		Some(Ok(f)) => f.len(),
 		_ => 0,
 	}
@@ -1629,6 +1668,47 @@ unsafe fn rm_cmd(storage: u64, uri: &[u8]) {
 			}
 			_ => {
 				print(b"rm: could not remove ");
+				print(uri);
+				print(b"\n");
+			}
+		}
+	}
+}
+
+// Create a directory on the volume via the StorageService `mkdir` op, making any
+// missing parents (mkdir -p).
+unsafe fn mkdir_cmd(storage: u64, uri: &[u8]) {
+	unsafe {
+		let path: String = String::from_utf8_lossy(uri).into_owned();
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		match client.mkdir(&path) {
+			Some(Ok(())) => {
+				print(b"created ");
+				print(uri);
+				print(b"\n");
+			}
+			_ => {
+				print(b"mkdir: could not create ");
+				print(uri);
+				print(b"\n");
+			}
+		}
+	}
+}
+
+// Remove an empty directory on the volume via the StorageService `rmdir` op.
+unsafe fn rmdir_cmd(storage: u64, uri: &[u8]) {
+	unsafe {
+		let path: String = String::from_utf8_lossy(uri).into_owned();
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		match client.rmdir(&path) {
+			Some(Ok(())) => {
+				print(b"removed ");
+				print(uri);
+				print(b"\n");
+			}
+			_ => {
+				print(b"rmdir: could not remove ");
 				print(uri);
 				print(b"\n");
 			}

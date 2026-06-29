@@ -207,10 +207,30 @@ fn nested_directories_resolve_and_list() {
 	let entries = fs.read_dir(b"a/b/c").unwrap();
 	assert_eq!(entries.len(), 1);
 	assert_eq!(entries[0].0, b"file.txt");
+	// the file reports as a regular file, not a directory.
+	assert!(!entries[0].2);
 	// the root shows only the top-level directory.
 	let root = fs.list().unwrap();
 	assert_eq!(root.len(), 1);
 	assert_eq!(root[0].0, b"a");
+	// the entry reports as a directory.
+	assert!(root[0].2);
+}
+
+#[test]
+fn rmdir_removes_an_empty_directory_only() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.mkdir(b"empty").unwrap();
+	fs.mkdir(b"full").unwrap();
+	fs.write_file(b"full/f", b"x").unwrap();
+	fs.write_file(b"file", b"y").unwrap();
+	// a non-empty directory is refused.
+	assert_eq!(fs.rmdir(b"full"), Err(FsError::Invalid));
+	// a regular file is refused (use remove).
+	assert_eq!(fs.rmdir(b"file"), Err(FsError::Invalid));
+	// an empty directory is removed.
+	assert!(fs.rmdir(b"empty").is_ok());
+	assert!(fs.lookup(b"empty").is_none());
 }
 
 #[test]

@@ -39,7 +39,7 @@ use fat::FatFs;
 use iso9660::Iso9660;
 use liberfs::{BlockDevice, FsError, LiberFs};
 use proto::codec::Buffer;
-use proto::system::{Error, FileInfo, OpenOpts, OpenResult, SnapshotInfo, volume};
+use proto::system::{Error, FileInfo, FileKind, OpenOpts, OpenResult, SnapshotInfo, volume};
 use rt::*;
 use udf::Udf;
 
@@ -200,36 +200,42 @@ impl volume::Service for Volume {
 		}
 	}
 
-	// List the files in the volume (each as name + byte length), for `ls`.
-	fn list(&mut self) -> Result<Vec<FileInfo>, Error> {
+	// List the directory named by a vol:// path (each entry as name + byte length +
+	// kind), for `ls`. An empty subdirectory names the volume root.
+	fn list(&mut self, path: String) -> Result<Vec<FileInfo>, Error> {
+		let dir: &[u8] = self.list_dir_name(&path)?;
 		match self {
 			Volume::Archive { base, len } => {
+				// the test archive is a flat package - it has no subdirectories.
+				if !dir.is_empty() {
+					return Err(Error::NotFound);
+				}
 				let archive: &[u8] = unsafe { core::slice::from_raw_parts(*base as *const u8, *len) };
 				let package = Package::parse(archive).ok_or(Error::NotFound)?;
 				let mut files: Vec<FileInfo> = Vec::new();
 				for index in 0..package.len() {
 					if let Some(name) = package.name(index) {
 						let size: u64 = package.lookup(name).map(|b| b.len()).unwrap_or(0) as u64;
-						files.push(FileInfo { name: String::from_utf8_lossy(name).into_owned(), size });
+						files.push(file_info(name, size, false));
 					}
 				}
 				Ok(files)
 			}
 			Volume::Disk(fs) => {
-				let entries = fs.list().map_err(map_fs_err)?;
-				Ok(entries.into_iter().map(|(name, size)| FileInfo { name: String::from_utf8_lossy(&name).into_owned(), size }).collect())
+				let entries = if dir.is_empty() { fs.list() } else { fs.read_dir(dir) }.map_err(map_fs_err)?;
+				Ok(entries.into_iter().map(|(name, size, is_dir)| file_info(&name, size, is_dir)).collect())
 			}
 			Volume::Fat(fs) => {
-				let entries = fs.list().map_err(map_fat_err)?;
-				Ok(entries.into_iter().map(|e| FileInfo { name: e.name, size: e.size }).collect())
+				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_fat_err)?;
+				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir)).collect())
 			}
 			Volume::Iso(fs) => {
-				let entries = fs.list().map_err(map_iso_err)?;
-				Ok(entries.into_iter().map(|e| FileInfo { name: e.name, size: e.size }).collect())
+				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_iso_err)?;
+				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir)).collect())
 			}
 			Volume::Udf(fs) => {
-				let entries = fs.list().map_err(map_udf_err)?;
-				Ok(entries.into_iter().map(|e| FileInfo { name: e.name, size: e.size }).collect())
+				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_udf_err)?;
+				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir)).collect())
 			}
 		}
 	}
@@ -322,6 +328,34 @@ impl volume::Service for Volume {
 			Volume::Udf(_) => Err(Error::Denied),
 		}
 	}
+
+	// Create the directory at a vol:// path, plus any missing parents (mkdir -p). Only
+	// the writable LiberFS volume supports it; the read-only archive refuses with
+	// `denied`, the other backends with `invalid` (no directory writes implemented).
+	fn mkdir(&mut self, path: String) -> Result<(), Error> {
+		let name: &[u8] = self.writable_name(&path)?;
+		match self {
+			Volume::Archive { .. } => Err(Error::Denied),
+			Volume::Disk(fs) => fs.mkdir(name).map_err(map_fs_err),
+			Volume::Fat(_) => Err(Error::Invalid),
+			Volume::Iso(_) => Err(Error::Invalid),
+			Volume::Udf(_) => Err(Error::Invalid),
+		}
+	}
+
+	// Remove the empty directory at a vol:// path. Only the writable LiberFS volume
+	// supports it; the read-only archive refuses with `denied`, the other backends with
+	// `invalid`.
+	fn rmdir(&mut self, path: String) -> Result<(), Error> {
+		let name: &[u8] = self.writable_name(&path)?;
+		match self {
+			Volume::Archive { .. } => Err(Error::Denied),
+			Volume::Disk(fs) => fs.rmdir(name).map_err(map_fs_err),
+			Volume::Fat(_) => Err(Error::Invalid),
+			Volume::Iso(_) => Err(Error::Invalid),
+			Volume::Udf(_) => Err(Error::Invalid),
+		}
+	}
 }
 
 impl Volume {
@@ -334,6 +368,28 @@ impl Volume {
 		}
 		Ok(target.path.as_bytes())
 	}
+
+	// Validate a vol:// listing path and return the directory within the volume (empty
+	// names the volume root, which `VolumePath::parse` rejects). A trailing slash is
+	// tolerated so `vol://system/bin/` and `vol://system/bin` both name the same
+	// directory.
+	fn list_dir_name<'a>(&self, path: &'a str) -> Result<&'a [u8], Error> {
+		const SCHEME: &[u8] = b"vol://";
+		let rest: &[u8] = path.as_bytes().strip_prefix(SCHEME).ok_or(Error::NotFound)?;
+		let (volume, sub): (&[u8], &[u8]) = match rest.iter().position(|&b: &u8| b == b'/') {
+			Some(i) => (&rest[..i], &rest[i + 1..]),
+			None => (rest, &[]),
+		};
+		if volume != self.name() {
+			return Err(Error::NotFound);
+		}
+		Ok(sub.strip_suffix(b"/").unwrap_or(sub))
+	}
+}
+
+// Build a listing entry from a raw name, byte length, and whether it is a directory.
+fn file_info(name: &[u8], size: u64, is_dir: bool) -> FileInfo {
+	FileInfo { name: String::from_utf8_lossy(name).into_owned(), size, kind: if is_dir { FileKind::Dir } else { FileKind::File } }
 }
 
 // Map an LiberFS error onto the Storage.Volume `error` enum.

@@ -154,7 +154,7 @@ impl volume::Service for VolStub {
 		if o.path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
 	}
 
-	fn list(&mut self) -> Result<Vec<FileInfo>, Error> {
+	fn list(&mut self, _path: String) -> Result<Vec<FileInfo>, Error> {
 		Ok(Vec::new())
 	}
 
@@ -183,6 +183,14 @@ impl volume::Service for VolStub {
 	fn snap_open(&mut self, snapshot: String, path: String) -> Result<OpenResult, Error> {
 		// the file handle must travel out-of-band, exactly like `open`.
 		if snapshot.is_empty() || path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
+	}
+
+	fn mkdir(&mut self, path: String) -> Result<(), Error> {
+		if path.is_empty() { Err(Error::Invalid) } else { Ok(()) }
+	}
+
+	fn rmdir(&mut self, path: String) -> Result<(), Error> {
+		if path.is_empty() { Err(Error::NotFound) } else { Ok(()) }
 	}
 }
 
@@ -224,6 +232,15 @@ fn remove_round_trips() {
 	let mut client = volume::Client::new(VolLoopback { service: VolStub });
 	assert_eq!(client.remove("/x"), Some(Ok(())));
 	assert_eq!(client.remove(""), Some(Err(Error::NotFound)));
+}
+
+#[test]
+fn mkdir_rmdir_round_trip() {
+	let mut client = volume::Client::new(VolLoopback { service: VolStub });
+	assert_eq!(client.mkdir("/d"), Some(Ok(())));
+	assert_eq!(client.mkdir(""), Some(Err(Error::Invalid)));
+	assert_eq!(client.rmdir("/d"), Some(Ok(())));
+	assert_eq!(client.rmdir(""), Some(Err(Error::NotFound)));
 }
 
 #[test]

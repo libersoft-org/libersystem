@@ -142,12 +142,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(())
 	}
 
-	// List directory `dir_num` as (name, size) pairs.
-	pub(crate) fn read_dir_inode(&mut self, dir_num: u32) -> Result<Vec<(Vec<u8>, u64)>, FsError> {
+	// List directory `dir_num` as (name, size, is_dir) triples.
+	pub(crate) fn read_dir_inode(&mut self, dir_num: u32) -> Result<Vec<(Vec<u8>, u64, bool)>, FsError> {
 		let mut out = Vec::new();
 		for (name, inode_num) in self.dir_entries_of(dir_num)? {
-			let size = self.read_inode(inode_num)?.size;
-			out.push((name, size));
+			let inode = self.read_inode(inode_num)?;
+			out.push((name, inode.size, inode.kind == KIND_DIR));
 		}
 		Ok(out)
 	}
