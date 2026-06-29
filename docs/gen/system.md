@@ -306,6 +306,13 @@ An opaque kernel object, transferred as `handle<task>`.
 | `log` | 0 |
 | `storage` | 1 |
 | `network` | 2 |
+| `device` | 3 |
+| `config` | 4 |
+| `time` | 5 |
+| `audio` | 6 |
+| `input` | 7 |
+| `graph` | 8 |
+| `resource` | 9 |
 
 ### record `manifest`
 
@@ -321,6 +328,7 @@ An opaque kernel object, transferred as `handle<task>`.
 | `component` | `string` |
 | `capability` | `capability` |
 | `granted` | `bool` |
+| `dynamic` | `bool` |
 
 ### enum `resource-kind`
 
@@ -495,6 +503,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | --- | --- | --- |
 | 1 | `lookup` | `lookup(component: string) -> result<manifest, error>` |
 | 2 | `audit` | `audit() -> result<list<audit-entry>, error>` |
+| 3 | `run` | `run(name: string, args: string, stdout: handle<channel>) -> result<start-result, error>` |
 
 ### interface `resources`
 

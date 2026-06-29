@@ -634,21 +634,30 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 }
 
 // Build the M38 permission topology and run it to completion. A StorageService serves
-// the ramdisk volume; a ProcessService is the loading mechanism; the permission_manager
-// (PermissionManager) is given the clients it may grant onward - a duplicable StorageService
-// client and a duplicable (but dead-peer) LogService client - plus a NetworkService client
-// it holds but is NOT to grant, a ProcessService client it drives to load components, and
-// the channel its clients reach it on. PermissionManager launches its one governed
-// component, sandbox_probe, through ProcessService under a typed permission manifest that
-// grants storage and log but not network: it transfers exactly those two clients to the probe
-// and withholds the network one, recording every decision. The sandboxed probe reaches only
-// its granted capabilities - it reads its one granted file vol://system/hello.txt through
-// the storage grant and reports the bytes back. The kernel only brokers the initial
-// capabilities. Returns (expected, read_back, summary): the file straight from the volume,
-// the bytes the sandboxed probe read through its grant, and the manager's decisions summary
-// (which capabilities the component was and was not given).
+// the ramdisk volume; a ProcessService is the loading mechanism; a TimeService serves the
+// wall clock; the permission_manager (PermissionManager) is given the clients it may grant
+// onward - a duplicable StorageService client, a duplicable (but dead-peer) LogService
+// client, and a TimeService client - plus a NetworkService client it holds but is NOT to
+// grant, a ProcessService client it drives to load components, and the channel its clients
+// reach it on. PermissionManager launches three governed components through ProcessService,
+// each under a typed permission manifest: sandbox_probe (granted storage and log but not
+// network - it transfers exactly those two clients and withholds the network one), `date`
+// (granted only time - the `date` shell command run as a standalone sandboxed ELF), and
+// request_probe (granted only log, which then asks for an undeclared capability - storage -
+// at runtime), recording every decision. Each sandboxed component reaches only its granted
+// capabilities: sandbox_probe reads its one granted file vol://system/hello.txt through the
+// storage grant and reports the bytes back, `date` reads the wall clock through the time
+// grant and reports the rendered instant, and request_probe's runtime request is refused by
+// the headless policy default (least privilege - an undeclared capability is never granted)
+// and recorded as a dynamic denial. PermissionManager then exercises its `run` launcher: it
+// starts the `cat` command as its own sandboxed ELF (granted only storage) with a captured
+// stdout console and a file argument, and `cat` prints that file through its storage grant to
+// the forwarded stdout. The kernel only brokers the initial capabilities. Returns (expected,
+// probe_read, probe_summary, date_read, date_summary, request_read, request_summary,
+// cat_read): the file straight from the volume, then each component's proof and decisions
+// summary, then the bytes `cat` printed through the run launcher.
 #[cfg(test)]
-fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
+fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
 	use object::channel::Channel;
 	use object::rights::Rights;
 
@@ -657,13 +666,16 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let expected = volume_file(volume, b"hello.txt")?;
 	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
 	let process_elf = package.lookup(b"process_service").ok_or("process_service missing from the init package")?;
+	let time_elf = package.lookup(b"time_service").ok_or("time_service missing from the init package")?;
 	let pm_elf = package.lookup(b"permission_manager").ok_or("permission_manager missing from the init package")?;
 
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (process_boot_kernel, process_boot_user) = Channel::create();
+	let (time_boot_kernel, time_boot_user) = Channel::create();
 	let (pm_boot_kernel, pm_boot_user) = Channel::create();
 	let (storage_server, storage_client) = Channel::create();
 	let (process_server, process_client) = Channel::create();
+	let (time_server, time_client) = Channel::create();
 	let (perm_server, _perm_client) = Channel::create();
 	// The manager's log grant: a real, duplicable client whose service peer is dropped, so
 	// the sandboxed probe's best-effort log emit fails fast instead of blocking (no
@@ -672,10 +684,17 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	core::mem::drop(log_server);
 	// The manager's network capability: held, but never granted to the probe.
 	let (_net_server, net_client) = Channel::create();
+	// TimeService's own network client: a real, dead-peer client whose service peer is
+	// dropped, so its best-effort SNTP discipline fails fast (PeerClosed) instead of
+	// blocking on a reply that never comes (no NetworkService runs in this scenario). It
+	// still serves the RTC-seeded wall clock to the governed `date` command.
+	let (time_net_server, time_net_client) = Channel::create();
+	core::mem::drop(time_net_server);
 
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
 	loader::spawn_elf_process(domain.clone(), process_elf, process_boot_user, Rights::ALL, 0).map_err(|_| "failed to load ProcessService")?;
+	loader::spawn_elf_process(domain.clone(), time_elf, time_boot_user, Rights::ALL, 0).map_err(|_| "failed to load TimeService")?;
 	loader::spawn_elf_process(domain, pm_elf, pm_boot_user, Rights::ALL, 0).map_err(|_| "failed to load PermissionManager")?;
 
 	// StorageService: the ramdisk volume and its service channel.
@@ -688,24 +707,41 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	send_package(&process_boot_kernel, init)?;
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL)?;
 
-	// PermissionManager: the grantable clients (storage + log, both duplicable), a network
-	// client it withholds, the ProcessService client it drives to load the probe, and the
-	// channel its clients reach it on. The order matches PermissionManager's receive order.
+	// TimeService: its (dead-peer) network client and its service channel. It seeds its
+	// wall clock from the RTC and serves it; the governed `date` command reads it through
+	// the grant PermissionManager hands on.
+	send_cap(&time_boot_kernel, b"NET", time_net_client, Rights::ALL)?;
+	send_cap(&time_boot_kernel, b"SERVE", time_server, Rights::ALL)?;
+
+	// PermissionManager: the grantable clients (storage + log, both duplicable, and time), a
+	// network client it withholds, the ProcessService client it drives to load the
+	// components, and the channel its clients reach it on. The order matches
+	// PermissionManager's receive order.
 	send_cap(&pm_boot_kernel, b"STORAGE", storage_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"LOG", log_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"NETWORK", net_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"TIME", time_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"PROCESS", process_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"SERVE", perm_server, Rights::ALL)?;
 
 	sched::run_until_idle();
 
-	// PermissionManager reports its "online" line, then the sandbox proof: the bytes the
-	// sandboxed probe read through its one granted storage capability, then the decisions
-	// summary of exactly which capabilities the component was and was not given.
+	// PermissionManager reports its "online" line, then each governed component's proof and
+	// decisions summary: the bytes sandbox_probe read through its one granted storage
+	// capability and its summary, the instant `date` read through its one granted time
+	// capability and its summary, then request_probe's verdict on its runtime request for an
+	// undeclared capability and its summary (which marks that refused request as dynamic) -
+	// exactly which capabilities each component was and was not given - and finally the bytes
+	// the on-demand `cat` tool printed through its storage grant to the forwarded stdout.
 	let _online = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported nothing")?;
-	let read_back = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no sandbox read-back")?;
-	let summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no decisions summary")?;
-	Ok((expected, read_back.bytes, summary.bytes))
+	let probe_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no sandbox read-back")?;
+	let probe_summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no sandbox decisions summary")?;
+	let date_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no date read-back")?;
+	let date_summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no date decisions summary")?;
+	let request_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no dynamic-request verdict")?;
+	let request_summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no dynamic-request decisions summary")?;
+	let cat_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no cat output")?;
+	Ok((expected, probe_read.bytes, probe_summary.bytes, date_read.bytes, date_summary.bytes, request_read.bytes, request_summary.bytes, cat_read.bytes))
 }
 
 // Build the M41 component topology and run it to completion. A StorageService serves
@@ -2513,19 +2549,49 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 #[cfg(test)]
 #[test_case]
 fn permission_manager_sandboxes_a_component() {
-	// The PermissionManager launches sandbox_probe under a typed permission manifest that
-	// grants storage and log but not network. The launched component starts with only its
-	// manifest's capabilities: the manager transfers exactly the storage and log clients to
-	// the probe and withholds the network one it holds, recording every decision. The
-	// sandboxed probe reaches only what it was granted - it reads its one granted file
-	// through the storage capability and reports the bytes back. Those bytes must equal the
-	// file straight from the volume (the storage grant is live and reaches exactly that
-	// file), and the decisions summary must show storage and log granted, network denied -
-	// the component was given exactly its manifest and nothing more.
-	let (expected, read_back, summary) = run_permission_scenario().expect("the permission scenario should run");
+	// The PermissionManager launches three governed components under typed permission
+	// manifests. sandbox_probe is granted storage and log but not network: it starts with
+	// only its manifest's capabilities - the manager transfers exactly the storage and log
+	// clients to it and withholds the network one it holds, recording every decision - and
+	// reads its one granted file through the storage capability, reporting the bytes back.
+	// `date` (the `date` shell command run as a standalone sandboxed ELF) is granted only
+	// time: it reaches the wall clock through that one capability and reports the rendered
+	// instant. request_probe is granted only log and then asks for an undeclared capability
+	// (storage) at runtime: the headless policy default refuses it (least privilege) and the
+	// manager records that refusal as a dynamic decision. The probe's bytes must equal the
+	// file straight from the volume (the storage grant is live and reaches exactly that file)
+	// and its summary must show storage and log granted and every other capability denied;
+	// `date`'s reply must be a well-formed ISO-8601 UTC instant (the time grant is live) and
+	// its summary must show only time granted and every other capability denied;
+	// request_probe's runtime request must be denied and its summary must mark that refusal
+	// as dynamic - each component was given exactly its manifest and nothing more. Finally the
+	// manager exercises its `run` launcher: it starts the `cat` command as its own sandboxed
+	// ELF granted only storage with a captured stdout and a file to print, and `cat`'s output
+	// must equal that file.
+	let (expected, probe_read, probe_summary, date_read, date_summary, request_read, request_summary, cat_read) = run_permission_scenario().expect("the permission scenario should run");
 	assert!(!expected.is_empty(), "the granted file should not be empty");
-	assert_eq!(read_back, expected, "the sandboxed component read its one granted file through the storage grant");
-	assert_eq!(summary.as_slice(), b"storage=grant log=grant network=deny", "the component was granted exactly its manifest - storage and log - and denied network");
+	assert_eq!(probe_read, expected, "the sandboxed component read its one granted file through the storage grant");
+	assert_eq!(probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
+	// `date` reached its one granted capability: the reply is a well-formed ISO-8601 UTC
+	// instant "YYYY-MM-DDTHH:MM:SSZ" (the exact moment varies, so check the shape, not the
+	// value - its presence proves the time grant is live).
+	assert_eq!(date_read.len(), 20, "the date command rendered a 20-byte ISO-8601 UTC instant through its time grant");
+	assert_eq!(date_read[4], b'-', "the date instant has a date separator after the year");
+	assert_eq!(date_read[7], b'-', "the date instant has a date separator after the month");
+	assert_eq!(date_read[10], b'T', "the date instant separates date and time with 'T'");
+	assert_eq!(date_read[13], b':', "the date instant has a time separator after the hour");
+	assert_eq!(date_read[16], b':', "the date instant has a time separator after the minute");
+	assert_eq!(date_read[19], b'Z', "the date instant is UTC, terminated by 'Z'");
+	assert_eq!(date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny", "date was granted exactly its manifest - time - and denied every other capability in the vocabulary");
+	// request_probe asked for storage at runtime - a capability outside its manifest. The
+	// headless policy default refused it, so the request comes back denied and its summary
+	// carries the static grants followed by the refused runtime request marked `(dynamic)`.
+	assert_eq!(request_read.as_slice(), b"storage denied", "request_probe's runtime request for an undeclared capability was refused by the headless policy default");
+	assert_eq!(request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny storage=deny(dynamic)", "request_probe was granted exactly its manifest - log - and its runtime storage request was refused and recorded as a dynamic denial");
+	// The on-demand `cat` tool, launched through PermissionManager's `run` op under a manifest
+	// granting only storage, printed the file it was given through that grant to the stdout the
+	// manager forwarded it: the bytes it rendered must equal the file straight from the volume.
+	assert_eq!(cat_read, expected, "the cat tool printed its file argument through the storage grant the run launcher gave it, forwarded to the captured stdout");
 }
 
 #[cfg(test)]

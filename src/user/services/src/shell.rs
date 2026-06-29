@@ -765,7 +765,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 		if let Some(rest) = line.strip_prefix(b"cat ") {
 			match resolve_path(cwd, trim(rest)) {
 				Some(uri) => {
-					if !cat(storage_for(uri.as_bytes(), storage, media, iso, udf), uri.as_bytes()) {
+					let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
+					// For a system-volume file, launch `cat` as its own sandboxed ELF through
+					// PermissionManager (the launcher / granter): it grants the command just a
+					// storage client and forwards it this terminal, and the command reports its own
+					// errors. Other volumes (media / iso / udf), and a shell with no
+					// PermissionManager (a non-primary VT), read the file inline instead.
+					let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"cat", uri.as_bytes());
+					if !launched && !cat(chan, uri.as_bytes()) {
 						print(b"cat: could not read ");
 						print(uri.as_bytes());
 						print(b"\n");
@@ -961,6 +968,59 @@ unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8]
 			}
 		};
 		exec(jobs, procsvc, name, args, tool_netsvc, bg);
+	}
+}
+
+// Launch a system command as its own sandboxed ELF through PermissionManager and render
+// its output on this terminal. The shell hands PermissionManager the command name, its
+// argument string, and the write end of a fresh stdout channel; PermissionManager consults
+// the command's permission manifest, starts it, grants it exactly its declared capabilities,
+// and forwards that stdout end to it. The command prints through the one capability it was
+// granted, and the shell relays each message it sends to its own console until the command
+// exits and its stdout end closes. Returns true once the command was launched (its own
+// output, including any error it reports, has been rendered); false if PermissionManager
+// could not start it, so the caller can fall back to an inline path. This is the
+// governed-launch primitive: the shell reaches the OS commands only through PermissionManager
+// (the launcher / granter), never the raw process loader, so each command runs with exactly
+// its manifest's capabilities. Foreground only this milestone (no background / job control).
+unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8]) -> bool {
+	unsafe {
+		let name_str: &str = match core::str::from_utf8(name) {
+			Ok(s) => s,
+			Err(_) => return false,
+		};
+		let args_str: &str = match core::str::from_utf8(args) {
+			Ok(s) => s,
+			Err(_) => return false,
+		};
+		let (out_read, out_write): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		// Ask PermissionManager to launch the command, handing it the write end of our stdout
+		// channel. On the request that end is transferred away (to PermissionManager and on to
+		// the command), so we keep only the read end and never close the write end ourselves.
+		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
+		let task: u64 = match client.run(name_str, args_str, &out_write) {
+			Some(Ok(started)) => started.task,
+			_ => {
+				close(out_read);
+				return false;
+			}
+		};
+		// Relay the command's output to our console as it prints, until it exits and its stdout
+		// end closes. The buffer matches the console's own per-write size, so a single message
+		// renders the same as it would straight from the command.
+		let mut obuf: [u8; 1024] = [0u8; 1024];
+		loop {
+			match recv_blocking(out_read, &mut obuf) {
+				Received::Message { len, .. } => print(&obuf[..len]),
+				Received::Closed => break,
+			}
+		}
+		close(out_read);
+		close(task);
+		true
 	}
 }
 

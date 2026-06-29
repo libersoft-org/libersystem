@@ -473,9 +473,16 @@ interface supervisor {
 // grant names a service the component may reach, never an ambient right. A component
 // holds exactly the capabilities its manifest lists and can reach nothing else.
 enum capability {
-	log,      // a LogService client (emit / query the journal)
-	storage,  // a StorageService client (open files on a volume)
-	network,  // a NetworkService client (resolve / connect / ...)
+	log,       // a LogService client (emit / query the journal)
+	storage,   // a StorageService client (open files on a volume)
+	network,   // a NetworkService client (resolve / connect / ...)
+	device,    // a DeviceService client (enumerate discovered devices)
+	config,    // a ConfigService client (read / set product config)
+	time,      // a TimeService client (read the wall clock)
+	audio,     // an AudioService client (emit tones / play streams)
+	input,     // an InputService client (subscribe to pointer events)
+	graph,     // a SystemGraphService client (query the live system graph)
+	resource,  // a ResourceManager client (read per-Domain budgets)
 }
 
 // A component's permission manifest: its name and the exact set of capabilities it is
@@ -489,24 +496,35 @@ record manifest {
 }
 
 // One decision in the PermissionManager audit trail: the component a grant decision was
-// made for, the capability in question, and whether it was granted (it was in the
-// component's manifest) or denied (it was not). The policy layer's record of every
-// authority decision, queryable over the typed API the same way the journal is.
+// made for, the capability in question, whether it was granted, and whether the decision
+// was a runtime permission request rather than a static manifest grant. A `dynamic` entry
+// records a capability the component asked for at launch that its manifest did not declare -
+// decided by the headless policy default and recorded back into the same store - while a
+// static (`dynamic` false) entry is a decision over the component's declared manifest. The
+// policy layer's record of every authority decision, queryable over the typed API the same
+// way the journal is.
 record audit-entry {
 	component:  string,
 	capability: capability,
 	granted:    bool,
+	dynamic:    bool,
 }
 
 // The PermissionManager contract: the policy over the kernel's capability mechanism.
 // `lookup` returns a component's declared permission manifest (the typed source of
 // truth); `audit` returns the trail of every grant / deny decision the manager has
-// made. Launching a component under its manifest - granting it exactly its declared
-// capabilities and nothing else - is a capability mechanism (the granted clients are
-// transferred to the component out-of-band), not an op on this interface.
+// made; `run` is the launcher / granter primitive - it starts a named system tool (a
+// shell command run as its own ELF) under its manifest, granting it exactly its declared
+// capabilities and nothing else, forwards the caller's stdout console and argument string
+// to it, and returns the live process handle for job control. The granted clients are
+// transferred to the new process out-of-band over the bootstrap channel the manager drives
+// ProcessService to create; the manager is the launcher / granter, ProcessService the
+// mechanism. A caller (the shell) reaches the OS tools only through this op, never the raw
+// kernel loader.
 interface permission {
 	@op(1) lookup: func(component: string) -> result<manifest, error>;
 	@op(2) audit:  func() -> result<list<audit-entry>, error>;
+	@op(3) run:    func(name: string, args: string, stdout: handle<channel>) -> result<start-result, error>;
 }
 
 // The kinds of resource the kernel accounts and the ResourceManager budgets per Domain:
