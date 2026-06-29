@@ -34,6 +34,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The media StorageService client: the FAT vol://media volume off a second
 	// virtio-blk disk. Sent right after STORAGE; `cat`/`ls` route vol://media to it.
 	let media: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"MEDIA") }.unwrap_or_else(|| exit());
+	// The ISO StorageService client: the read-only ISO9660 vol://iso volume off a third
+	// virtio-blk disk. Sent right after MEDIA; `cat`/`ls` route vol://iso to it.
+	let iso: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"ISO") }.unwrap_or_else(|| exit());
 	let logsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or_else(|| exit());
 	let devsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DEVICE") }.unwrap_or_else(|| exit());
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
@@ -89,7 +92,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    become the interactive console and run the read-eval-print loop.
 	print_motd();
 	unsafe {
-		repl(console, control, storage, media, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, &package, &mut buf);
+		repl(console, control, storage, media, iso, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, &package, &mut buf);
 	}
 	exit();
 }
@@ -145,7 +148,7 @@ fn print_banner(lines: &[&str]) {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, buf: &mut [u8]) {
+unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control);
 		loop {
@@ -161,7 +164,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, logsvc: u64
 			// The terminal delivers a whole submitted line (with a trailing newline);
 			// trim it, dispatch it, reap finished jobs, and print the next prompt.
 			let line: &[u8] = trim(&buf[..n]);
-			if dispatch(line, storage, media, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, package, &mut jobs) {
+			if dispatch(line, storage, media, iso, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, package, &mut jobs) {
 				return;
 			}
 			reap_jobs(&mut jobs);
@@ -471,7 +474,7 @@ unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, media: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -719,16 +722,16 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, logsvc: u64, devsvc: u
 			return false;
 		}
 		if line == b"ls" {
-			ls_cmd(storage, media, b"");
+			ls_cmd(storage, media, iso, b"");
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"ls ") {
-			ls_cmd(storage, media, trim(rest));
+			ls_cmd(storage, media, iso, trim(rest));
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"cat ") {
 			let uri = trim(rest);
-			if !cat(storage_for(uri, storage, media), uri) {
+			if !cat(storage_for(uri, storage, media, iso), uri) {
 				print(b"cat: could not read ");
 				print(uri);
 				print(b"\n");
@@ -739,14 +742,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, logsvc: u64, devsvc: u
 			let rest = trim(rest);
 			// "write <uri> <text>": split on the first space.
 			match rest.iter().position(|&b: &u8| b == b' ') {
-				Some(sp) => write_cmd(storage_for(&rest[..sp], storage, media), &rest[..sp], trim(&rest[sp + 1..])),
+				Some(sp) => write_cmd(storage_for(&rest[..sp], storage, media, iso), &rest[..sp], trim(&rest[sp + 1..])),
 				None => print(b"usage: write <vol://...> <text>\n"),
 			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"rm ") {
 			let uri = trim(rest);
-			rm_cmd(storage_for(uri, storage, media), uri);
+			rm_cmd(storage_for(uri, storage, media, iso), uri);
 			return false;
 		}
 		if line == b"snap" || line == b"snap list" {
@@ -1491,17 +1494,20 @@ unsafe fn cat(storage: u64, uri: &[u8]) -> bool {
 
 // List the volume set via the StorageService `list` op. With no argument print the
 // volume set; with `vol://<volume>` print that volume's files (name + size). The
-// volumes are `system` (writable LiberFS) and `media` (FAT12/16/32 off a second
-// disk).
-unsafe fn ls_cmd(storage: u64, media: u64, arg: &[u8]) {
+// volumes are `system` (writable LiberFS), `media` (FAT12/16/32 off a second disk),
+// and `iso` (read-only ISO9660 off a third disk).
+unsafe fn ls_cmd(storage: u64, media: u64, iso: u64, arg: &[u8]) {
 	unsafe {
 		if arg.is_empty() {
 			let sys: usize = volume_count(storage);
 			let med: usize = volume_count(media);
-			print(b"volumes (2):\n  vol://system (");
+			let opt: usize = volume_count(iso);
+			print(b"volumes (3):\n  vol://system (");
 			print_usize(sys);
 			print(b" files)\n  vol://media (");
 			print_usize(med);
+			print(b" files)\n  vol://iso (");
+			print_usize(opt);
 			print(b" files)\n");
 			return;
 		}
@@ -1510,6 +1516,7 @@ unsafe fn ls_cmd(storage: u64, media: u64, arg: &[u8]) {
 		let chan: u64 = match name {
 			b"system" => storage,
 			b"media" => media,
+			b"iso" => iso,
 			_ => {
 				print(b"ls: unknown volume\n");
 				return;
@@ -1548,9 +1555,16 @@ unsafe fn volume_count(storage: u64) -> usize {
 }
 
 // Pick the StorageService client for a vol:// URI: vol://media is the FAT media
-// disk, everything else the system volume.
-fn storage_for(uri: &[u8], storage: u64, media: u64) -> u64 {
-	if uri.strip_prefix(b"vol://").map(|r: &[u8]| r.starts_with(b"media/") || r == b"media").unwrap_or(false) { media } else { storage }
+// disk, vol://iso the ISO9660 disk, everything else the system volume.
+fn storage_for(uri: &[u8], storage: u64, media: u64, iso: u64) -> u64 {
+	let v: Option<&[u8]> = uri.strip_prefix(b"vol://");
+	if v.map(|r: &[u8]| r.starts_with(b"media/") || r == b"media").unwrap_or(false) {
+		media
+	} else if v.map(|r: &[u8]| r.starts_with(b"iso/") || r == b"iso").unwrap_or(false) {
+		iso
+	} else {
+		storage
+	}
 }
 
 // Create or overwrite a file on the volume via the StorageService `write` op. The

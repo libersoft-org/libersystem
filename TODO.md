@@ -936,9 +936,9 @@ Optical / install media and `.iso` images are ISO9660. A small, read-only backen
 behind the Volume API lets the system mount and read them with no allocation or
 write path - the cheapest interop win and the first compatible-FS after FAT.
 
-- [ ] An ISO9660 backend behind `Storage.Volume`: parse the volume descriptors, walk the directory records, and read files (Rock Ridge / Joliet long names where present, plain 8.3 otherwise).
-- [ ] Mount an `.iso` / optical block device as a `vol://` volume: `ls` a directory and `cat` a file through the existing typed Storage interface, no new app-facing API.
-- [ ] Host-testable like `fat`: driven through the shared `BlockDevice` trait against an ISO image fixture, plus a live read of an ISO virtio-blk image in QEMU.
+- [x] An ISO9660 backend behind `Storage.Volume`: parse the volume descriptors, walk the directory records, and read files (Rock Ridge / Joliet long names where present, plain 8.3 otherwise).
+- [x] Mount an `.iso` / optical block device as a `vol://` volume: `ls` a directory and `cat` a file through the existing typed Storage interface, no new app-facing API.
+- [x] Host-testable like `fat`: driven through the shared `BlockDevice` trait against an ISO image fixture, plus a live read of an ISO virtio-blk image in QEMU.
 - Done when: an ISO9660 volume mounts behind the Volume API and the shell lists and reads files off it, tests green - install/boot media is readable through the same typed `Storage.Volume`.
 - Concept: Native filesystem (the supported-compatible-FS backends behind the unified Volume API), the layering principle (a `driver.fs.*` service; multiple FS backends behind one Volume API), M48 (the FAT backend and the `BlockDevice` trait this reuses).
 

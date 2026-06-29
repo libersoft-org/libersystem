@@ -2292,9 +2292,11 @@ fn init_package_starts_system_manager() {
 	// on LogService, so they come up right after), then ResourceManager (which also
 	// depends only on LogService, so it comes up among them, and in turn launches the
 	// component it governs and caps its Domain before reporting in), then DeviceManager,
-	// StorageService (handed the disk block channel DeviceManager routes up) and the
+	// StorageService (handed the disk block channel DeviceManager routes up), the
 	// media StorageService (handed the second disk's block channel, mounting it as the
-	// read-only FAT vol://media - so two StorageService reports arrive),
+	// read-only FAT vol://media), and the iso StorageService (handed the third disk's
+	// block channel, mounting it as the read-only ISO9660 vol://iso - so three
+	// StorageService reports arrive),
 	// NetworkService (handed the net driver's frame channel the same way), then
 	// PermissionManager (which needs storage and network to grant onward, so it comes up
 	// once they are running, and in turn launches its sandboxed component before reporting
@@ -2308,7 +2310,7 @@ fn init_package_starts_system_manager() {
 	// managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 22] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"ResourceManager: online", b"DeviceManager: online", b"StorageService: online", b"StorageService: online", b"NetworkService: online", b"TimeService: online", b"AudioService: online", b"InputService: online", b"PermissionManager: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"WatchdogProbe: online", b"WatchdogProbe: restarted", b"WatchdogProbe: recovered", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 23] = [b"LogService: online", b"DeviceService: online", b"ProcessService: online", b"ConfigService: online", b"ResourceManager: online", b"DeviceManager: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"NetworkService: online", b"TimeService: online", b"AudioService: online", b"InputService: online", b"PermissionManager: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"WatchdogProbe: online", b"WatchdogProbe: restarted", b"WatchdogProbe: recovered", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");

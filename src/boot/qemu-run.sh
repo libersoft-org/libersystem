@@ -53,6 +53,18 @@ if [[ ! -f "$FAT_DISK" ]] && command -v mformat >/dev/null && command -v mcopy >
 	mcopy -i "$FAT_DISK" "$HERE/../volume/hello.txt" ::hello.txt
 	mcopy -i "$FAT_DISK" "$HERE/../volume/motd.txt" ::motd.txt
 fi
+# A third virtio-blk disk holding a real ISO9660 image (M58): the iso StorageService
+# instance mounts it read-only as `vol://iso`. Built once with xorriso/genisoimage so it
+# is a genuine optical image, not a fixture; skipped if neither is present (the iso volume
+# then simply does not mount). Files come from the volume/ seed dir.
+ISO_DISK="$HERE/.build/iso-media.iso"
+if [[ ! -f "$ISO_DISK" ]]; then
+	if command -v xorriso >/dev/null; then
+		xorriso -as mkisofs -quiet -J -R -o "$ISO_DISK" "$HERE/../volume" 2>/dev/null || true
+	elif command -v genisoimage >/dev/null; then
+		genisoimage -quiet -J -R -o "$ISO_DISK" "$HERE/../volume" 2>/dev/null || true
+	fi
+fi
 # Forward host 127.0.0.1:5555 to the guest's port 80, so a host HTTP client can reach
 # the guest's httpd (passive open / inbound) - SLIRP gives no inbound route otherwise.
 # Interactive runs only: the test path keeps a fixed device set and binds no host port.
@@ -75,6 +87,14 @@ if [[ -f "$FAT_DISK" ]]; then
 	QEMU_ARGS+=(
 		-drive "file=$FAT_DISK,if=none,id=vmedia,format=raw"
 		-device virtio-blk-pci,drive=vmedia,disable-legacy=on
+	)
+fi
+# The third virtio-blk disk (ISO9660 vol://iso), discovered after the media disk; only
+# attached when the ISO image was built (xorriso / genisoimage present).
+if [[ -f "$ISO_DISK" ]]; then
+	QEMU_ARGS+=(
+		-drive "file=$ISO_DISK,if=none,id=viso,format=raw"
+		-device virtio-blk-pci,drive=viso,disable-legacy=on
 	)
 fi
 

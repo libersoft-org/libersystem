@@ -1,0 +1,8 @@
+[package]
+name = "iso9660"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "ISO9660 - a read-only backend for optical and install media (.iso) behind one BlockDevice trait"
+
+[dependencies]

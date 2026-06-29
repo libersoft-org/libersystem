@@ -6,6 +6,7 @@
 
 # New features
 
+- THREAT_MODEL.md - check if everything in this document is correct and current, add it to README as a link
 - Look for other FS compatibility (NTFS, ext4, xfs, CD-ROM etc.)
 - Compare LiberFS with other file systems (fat, ntfs, ext4, zfs, btrfs, xfs and other modern file systems) and compare their abilities - write the MD document about it
 - add "cd" command

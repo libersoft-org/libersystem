@@ -14,6 +14,12 @@
 //          service, on which a FAT12/16/32 (writable) or exFAT (read-only) volume is
 //          mounted as vol://media - a flash-drive / SD-card image through the same
 //          Volume contract;
+//        "ISOBLOCK", with a channel capability to a third virtio-blk driver's block
+//          service, on which a read-only ISO9660 volume is mounted as vol://iso - an
+//          optical / install image through the same Volume contract;
+//        "ISOBLOCK", with a channel capability to a third virtio-blk driver's block
+//          service, on which a read-only ISO9660 volume is mounted as vol://iso - an
+//          optical / install image through the same Volume contract;
 //   2. "SERVE", with a channel capability on which clients send requests.
 // The service then serves the generated Storage.Volume contract: `open` resolves a
 // vol:// path and replies with the file's length plus a MemoryObject capability to
@@ -31,6 +37,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use fat::FatFs;
+use iso9660::Iso9660;
 use liberfs::{BlockDevice, FsError, LiberFs};
 use proto::codec::Buffer;
 use proto::system::{Error, FileInfo, OpenOpts, OpenResult, SnapshotInfo, volume};
@@ -38,9 +45,11 @@ use rt::*;
 
 // the volume names this service answers to; the URI's volume component must match
 // one of these. "system" is the writable LiberFS disk; "media" is a read-only FAT
-// disk mounted off a second virtio-blk device.
+// disk mounted off a second virtio-blk device; "iso" is a read-only ISO9660 disk
+// mounted off a third virtio-blk device.
 const SYSTEM_VOLUME: &[u8] = b"system";
 const MEDIA_VOLUME: &[u8] = b"media";
+const ISO_VOLUME: &[u8] = b"iso";
 
 // block-service protocol with driver.virtio-blk: request [op u32][lba u64][count u32]
 // where op 0 = read, 1 = write. A read replies [status u32] carrying a MemoryObject
@@ -58,6 +67,10 @@ const OP_WRITE: u32 = 1;
 const SECTORS_PER_BLOCK: u64 = (liberfs::BLOCK_SIZE / SECTOR_SIZE) as u64;
 const FS_START_SECTOR: u64 = 2048;
 const FS_BLOCKS: u64 = 64;
+
+// An ISO9660 logical block (2048 bytes) is this many 512-byte disk sectors; one read
+// stays within a single DMA page (8 sectors).
+const ISO_SECTORS: u64 = (iso9660::SECTOR_SIZE / SECTOR_SIZE) as u64;
 
 // An upper bound on a single write, so a bogus buffer length cannot make us allocate
 // without limit; the filesystem enforces the real per-file maximum.
@@ -83,6 +96,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		},
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => match FatFs::mount(FatBlockDevice { chan: handle }) {
 			Some(fs) => Volume::Fat(fs),
+			None => exit(),
+		},
+		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"ISOBLOCK" => match Iso9660::mount(IsoBlockDevice { chan: handle }) {
+			Some(fs) => Volume::Iso(fs),
 			None => exit(),
 		},
 		_ => exit(),
@@ -113,14 +130,16 @@ enum Volume {
 	Archive { base: u64, len: usize },
 	Disk(LiberFs<ChannelBlockDevice>),
 	Fat(FatFs<FatBlockDevice>),
+	Iso(Iso9660<IsoBlockDevice>),
 }
 
 impl Volume {
 	// The vol:// name this backing answers to: writable LiberFS (and the test archive)
-	// is "system"; the read-only FAT media is "media".
+	// is "system"; the read-only FAT media is "media"; the read-only ISO9660 is "iso".
 	fn name(&self) -> &'static [u8] {
 		match self {
 			Volume::Fat(_) => MEDIA_VOLUME,
+			Volume::Iso(_) => ISO_VOLUME,
 			_ => SYSTEM_VOLUME,
 		}
 	}
@@ -156,6 +175,11 @@ impl volume::Service for Volume {
 				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
 				Ok(OpenResult { file: handle, size: file.len() as u64 })
 			}
+			Volume::Iso(fs) => {
+				let file: Vec<u8> = fs.read_file(name).map_err(map_iso_err)?;
+				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
+				Ok(OpenResult { file: handle, size: file.len() as u64 })
+			}
 		}
 	}
 
@@ -182,6 +206,10 @@ impl volume::Service for Volume {
 				let entries = fs.list().map_err(map_fat_err)?;
 				Ok(entries.into_iter().map(|e| FileInfo { name: e.name, size: e.size }).collect())
 			}
+			Volume::Iso(fs) => {
+				let entries = fs.list().map_err(map_iso_err)?;
+				Ok(entries.into_iter().map(|e| FileInfo { name: e.name, size: e.size }).collect())
+			}
 		}
 	}
 
@@ -196,6 +224,7 @@ impl volume::Service for Volume {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.write_file(name, &bytes).map_err(map_fs_err),
 			Volume::Fat(fs) => fs.write_file(name, &bytes).map_err(map_fat_err),
+			Volume::Iso(_) => Err(Error::Invalid),
 		}
 	}
 
@@ -206,6 +235,7 @@ impl volume::Service for Volume {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.remove(name).map_err(map_fs_err),
 			Volume::Fat(fs) => fs.remove(name).map_err(map_fat_err),
+			Volume::Iso(_) => Err(Error::Invalid),
 		}
 	}
 
@@ -216,6 +246,7 @@ impl volume::Service for Volume {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.create_snapshot(name.as_bytes()).map_err(map_fs_err),
 			Volume::Fat(_) => Err(Error::Denied),
+			Volume::Iso(_) => Err(Error::Denied),
 		}
 	}
 
@@ -229,6 +260,7 @@ impl volume::Service for Volume {
 				Ok(snaps.into_iter().map(|(name, generation)| SnapshotInfo { name: String::from_utf8_lossy(&name).into_owned(), generation }).collect())
 			}
 			Volume::Fat(_) => Ok(Vec::new()),
+			Volume::Iso(_) => Ok(Vec::new()),
 		}
 	}
 
@@ -239,6 +271,7 @@ impl volume::Service for Volume {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.delete_snapshot(name.as_bytes()).map_err(map_fs_err),
 			Volume::Fat(_) => Err(Error::Denied),
+			Volume::Iso(_) => Err(Error::Denied),
 		}
 	}
 
@@ -259,6 +292,7 @@ impl volume::Service for Volume {
 				Ok(OpenResult { file: handle, size: file.len() as u64 })
 			}
 			Volume::Fat(_) => Err(Error::Denied),
+			Volume::Iso(_) => Err(Error::Denied),
 		}
 	}
 }
@@ -294,6 +328,15 @@ fn map_fat_err(e: fat::FsError) -> Error {
 		fat::FsError::NoSpace => Error::Again,
 		fat::FsError::TooLong | fat::FsError::Invalid => Error::Invalid,
 		fat::FsError::Io => Error::Again,
+	}
+}
+
+// Map an ISO9660 error onto the Storage.Volume `error` enum.
+fn map_iso_err(e: iso9660::FsError) -> Error {
+	match e {
+		iso9660::FsError::NotFound => Error::NotFound,
+		iso9660::FsError::TooLong | iso9660::FsError::Invalid => Error::Invalid,
+		iso9660::FsError::Io => Error::Again,
 	}
 }
 
@@ -359,6 +402,21 @@ impl fat::BlockDevice for FatBlockDevice {
 
 	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
 		unsafe { block_write(self.chan, lba, 1, buf.as_ptr()) }
+	}
+}
+
+// A third virtio-blk disk as a block device for the ISO9660 backend: optical media is
+// addressed by absolute 2048-byte logical block, so each block maps to ISO_SECTORS
+// consecutive 512-byte disk sectors. Read-only, through the driver's block service on
+// `chan`, which stays open for the life of the service.
+struct IsoBlockDevice {
+	chan: u64,
+}
+
+impl iso9660::BlockDevice for IsoBlockDevice {
+	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		let sector: u64 = lba * ISO_SECTORS;
+		unsafe { block_read(self.chan, sector, ISO_SECTORS as u32, buf.as_mut_ptr()) }
 	}
 }
 

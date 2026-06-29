@@ -11,6 +11,10 @@ name = "fat"
 version = "0.0.0"
 
 [[package]]
+name = "iso9660"
+version = "0.0.0"
+
+[[package]]
 name = "liberfs"
 version = "0.0.0"
 
@@ -31,6 +35,7 @@ name = "storage"
 version = "0.0.0"
 dependencies = [
  "fat",
+ "iso9660",
  "liberfs",
  "proto",
  "rt",
