@@ -981,7 +981,34 @@ the same Volume API as the virtio disks, and HID feeds the existing console inpu
 - Done when: a USB keyboard types into the shell and a USB mass-storage device mounts and lists files, tests green - USB is a first-class bus behind the device/Volume APIs.
 - Concept: The layering principle (a `driver.usb.*` service; classes behind one bus), the device inventory (DeviceService gains USB nodes), M48 (the FAT backend and `BlockDevice` trait the mass-storage class reuses).
 
-## M62 - Hardware inventory commands (lsblk / lspci / lscpu / ...)
+## M62 - Thin shell: job-control / session service + commands as binaries
+
+Today most commands are shell built-ins, the shell creates processes itself via
+the raw `SYS_PROCESS_CREATE` / `SYS_PROCESS_LOAD` kernel syscalls (carrying the
+`init.pkg` ELF blobs), and job control lives inside the shell process - so logging
+out would kill the jobs and the shell reaches past its services into the kernel.
+Split it: a session / job-control service owns the job table, the foreground job,
+the tty binding and the session environment; every command except `cd` becomes its
+own ELF program; the shell stops loading programs itself, asking ProcessService to
+start them instead; and what each program may reach is decided by the system-wide
+permission store, not the shell. The shell is then a thin launcher + REPL + help
+that talks only to services over IPC, jobs survive a logout, and each tool runs
+with only the capabilities its grant allows. The program binaries (and the
+non-bootstrap drivers) move out of `init.pkg` onto the system volume so they load
+from the filesystem.
+
+- [ ] A session / job-control service: it owns the job table, foreground job, tty binding and the session environment (cwd + `PATH` + variables); shell and tools are clients, so a shell logout / restart leaves running jobs intact. It wires the foreground job's stdin / stdout / stderr to the terminal (interactive tools read input, not just print), and the environment is inherited by spawned tools so relative paths and `PATH` resolution work in the binaries.
+- [ ] Route all process creation through ProcessService (which loads the binary from `system/bin`); the shell stops calling `SYS_PROCESS_CREATE` / `SYS_PROCESS_LOAD` and stops carrying the package - it reaches the OS only through service IPC, never the raw kernel loader. The capability IPC primitives (`channel` / `send` / `recv` / `duplicate`) stay - those are the system API.
+- [ ] A single system-wide permission store (extend the M38 PermissionManager's typed `Manifest` + audit trail to the full service vocabulary): it is the one place that records each program's grants - never a manifest file beside the binary. At launch ProcessService asks PermissionManager for the program's grants and hands over exactly those; a capability the program needs but lacks triggers a permission request (a prompt) that, once allowed, is written back into the store and audited.
+- [ ] Move every service-query / utility into its own ELF (`cat`, `ls`, `rm`, `mkdir`, `write`, `snap`, `dev`, `graph`, `perm`, `usage`, `ps`, `log`, `run`, `stop`, `config`, `set`, `date`, `beep`, `mouse`, `lsvol`), each started with only the capabilities the permission store grants it - the model the net tools already use.
+- [ ] Extend the Volume API with directory operations - `list(path)`, `mkdir`, `rmdir` - and surface the directories the backends already have (LiberFS dir B+trees, FAT / exFAT / ISO9660 / UDF directories); the on-disk format already supports them, only `list()` is path-less and `mkdir` is missing today.
+- [ ] Keep only `cd` as a shell built-in (it updates the session cwd); default the working directory to `vol://system`, so the prompt sits in the persistent system volume instead of a bare `>`. `ls` / `rm` / `mkdir` are ordinary binaries that inherit the cwd from the session.
+- [ ] Stage the program binaries into `system/bin` (and the non-bootstrap drivers into `system/drivers`) on the system volume by extending the existing factory-seed pipeline: build.rs already packs `volume/` into the `volume.pkg` factory archive, which StorageService seeds into the freshly-formatted LiberFS disk - add the tool / driver ELFs to that archive under `bin/` and `drivers/` paths and let the seeder create them (LiberFS already does `mkdir -p`). No new host `mkfs.liberfs` is needed, and the system volume stays persistent on virtio-blk (not a ramdisk).
+- [ ] Pin the bootstrap set: `init.pkg` keeps only what is needed to mount the system volume - the kernel, `system_manager`, `service_manager`, `process_service`, `storage_service`, `device_manager` and the `virtio_blk` driver (a disk driver cannot load from the disk it backs). Every other service, tool and driver loads from the volume; drivers are userspace apps too, so the rest (`virtio_net` / `virtio_gpu` / `virtio_snd` / `virtio_input` / future USB) live in `system/drivers`.
+- Done when: logout leaves background jobs running, commands run as separate processes loaded by ProcessService from `system/bin` with exactly the capabilities the permission store grants, interactive tools have stdin / stdout / stderr, non-bootstrap drivers load from `system/drivers`, the shell is launcher + job control + `cd` talking only to services, tests green.
+- Concept: Least privilege and the strict app sandbox (M38 - one system-wide permission store decides every program's grants), the layering principle (job control, process loading and the permission policy as services, not shell state or raw syscalls), M50 (the services these tools talk to).
+
+## M63 - Hardware inventory commands (lsblk / lspci / lscpu / ...)
 
 The shell can show services, devices and the system graph, but there is no
 Linux-style HW inventory: a quick look at PCI, block devices, CPUs, IRQs and
@@ -991,7 +1018,7 @@ allocator and heap), surfaced as a consistent `ls*` family next to `lsvol`. Like
 every other command, each is purely a CLI rendering of data the system already
 exposes over its service ABI (DeviceService / SystemGraphService / ResourceManager)
 - no command pokes hardware or the kernel directly; where the info is missing, the
-owning service gains a typed query first.
+owning service gains a typed query first; each ships as a binary per M62.
 
 - [ ] `lspci`: enumerate the PCI bus (bus:dev.fn, vendor/device, class, the virtio-blk / net / sound / gpu functions) - the same scan the drivers bind against.
 - [ ] `lsblk`: list block devices and their mounted volumes (the four virtio-blk disks, size, and `vol://system|media|iso|udf`).
@@ -1005,8 +1032,9 @@ owning service gains a typed query first.
 - [ ] `dmesg`: the kernel ring-buffer log.
 - [ ] `uname`: architecture, kernel name and version string.
 - [ ] `uptime`: time since boot from the system clock.
+- [ ] `ps` interactive mode (e.g. `ps -i`): a live, refreshing process/resource view like Linux `htop`, over ProcessService / ResourceManager - needs a console raw / refresh (alternate-screen) mode to redraw in place.
 - Done when: each command prints a stable inventory in the shell (and where useful a `--json` form), tests green - the HW resources are inspectable from the CLI.
-- Concept: Observability (a local, human- and machine-readable view of the live system), the layering principle (read-only views over DeviceService / the kernel, no new privilege), M50 / M61 (the DeviceService, System Graph and USB stack these extend).
+- Concept: Observability (a local, human- and machine-readable view of the live system), the layering principle (read-only views over DeviceService / the kernel, no new privilege), M50 / M61 / M62 (the DeviceService, System Graph, USB stack and binary tool model these extend).
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
