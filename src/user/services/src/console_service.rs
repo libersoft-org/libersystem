@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 // display `Surface`. This service supplies the userspace display backends - the boot
 // framebuffer and the virtio-gpu shared backing - and drives `Term`; the kernel boot
 // console shares the same `Term`.
-use term::{CELL_H, CELL_W, Geometry, Raster, RawSink, Surface, Term};
+use term::{Geometry, Raster, RawSink, Surface, Term, CELL_H, CELL_W};
 
 // The boot framebuffer the kernel maps directly: its pixel writes are visible immediately,
 // so present is a no-op. The fallback display (and the deterministic test path).
@@ -66,7 +66,11 @@ impl Surface for GpuSurface {
 // channel is given (it presents on FLUSH), else the boot framebuffer (present is a no-op).
 fn make_surface(addr: u64, fb: &Framebuffer, gpu: u64) -> Box<dyn Surface> {
 	let raster = Raster::new(addr, &geometry(fb));
-	if gpu != 0 { Box::new(GpuSurface { raster, gpu }) } else { Box::new(BootSurface { raster }) }
+	if gpu != 0 {
+		Box::new(GpuSurface { raster, gpu })
+	} else {
+		Box::new(BootSurface { raster })
+	}
 }
 
 // The renderer's `Geometry` for a mapped ABI `Framebuffer`: the pixel format the display
@@ -472,9 +476,9 @@ struct Vt {
 }
 
 // The capabilities ConsoleService holds to spawn a shell for any additional VT: a
-// factory connection to each multi-client service (it mints a fresh per-VT client from
-// each with `service_connect` / `network.open`) and the init package handle (it dups a
-// read-only view per shell, and looks up the shell ELF in it).
+// factory connection to each multi-client service, from which it mints a fresh per-VT
+// client with `service_connect` / `network.open`. The init package the shell ELF is
+// looked up in is held separately on `Console`.
 struct Factories {
 	storage: u64,
 	log: u64,
@@ -484,7 +488,6 @@ struct Factories {
 	net: u64,
 	time: u64,
 	audio: u64,
-	pkg_handle: u64,
 }
 
 // The whole console session: the framebuffer it owns, the kernel keystroke channel, the
@@ -519,7 +522,6 @@ struct Console {
 	ptys: Vec<Vt>,
 	facs: Factories,
 	package: Package<'static>,
-	pkg_len: usize,
 	// The pointer-forward channel from InputService (0 = no pointer device this boot): raw
 	// 6-byte pointer events [x u16 LE][y u16 LE][buttons u8][wheel i8] arrive on it, which
 	// `handle_pointer` turns into SGR mouse reports (for a program that enabled tracking)
@@ -630,9 +632,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let gpu: u64 = recv_gpu(bootstrap, &mut buf);
 		// InputService's pointer-forward channel (0 = no pointer device this boot).
 		let pointer: u64 = recv_pointer(bootstrap, &mut buf);
-		let (pkg_handle, archive): (u64, &'static [u8]) = recv_package(bootstrap, &mut buf).unwrap_or_else(|| exit());
+		let (_pkg_handle, archive): (u64, &'static [u8]) = recv_package(bootstrap, &mut buf).unwrap_or_else(|| exit());
 		let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
-		let pkg_len: usize = archive.len();
 
 		// 2. acquire the display backends. The boot framebuffer the kernel hands over holds
 		//    the boot log; the virtio-gpu driver's resizable shared backing is the runtime
@@ -678,8 +679,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(bootstrap, b"ConsoleService: online", 0);
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
-		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, pkg_handle };
-		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, package, pkg_len, pointer, clipboard: Vec::new(), ptr_buttons: 0 };
+		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio };
+		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, package, pointer, clipboard: Vec::new(), ptr_buttons: 0 };
 		run(&mut console);
 	}
 }
@@ -1233,7 +1234,7 @@ unsafe fn create_vt(console: &mut Console) {
 		if !console.has_fb || console.vts.len() >= NVT {
 			return;
 		}
-		if let Some(vt) = spawn_vt(&console.facs, &console.package, console.pkg_len, console.addr, &console.fb, console.gpu, console.cur_w, console.cur_h) {
+		if let Some(vt) = spawn_vt(&console.facs, &console.package, console.addr, &console.fb, console.gpu, console.cur_w, console.cur_h) {
 			console.vts.push(vt);
 			console.fg = console.vts.len() - 1;
 			repaint(console);
@@ -1521,13 +1522,13 @@ fn repaint(console: &mut Console) {
 // Spawn a fully-capable shell over the given console + control channels (the shell's
 // ends): mint a fresh per-session client from each service factory, spawn the shell ELF,
 // hand it the full capability set in the order it expects (STORAGE, LOG, DEVICE, PROCESS,
-// CONFIG, NET, TIME, AUDIO, CONSOLE, CONTROL, then PACKAGE), wait for its "online" report (it
+// CONFIG, NET, TIME, AUDIO, CONSOLE, CONTROL), wait for its "online" report (it
 // self-checks storage over its own connection), then release its bootstrap + Process
 // handle. The terminal's liveness is tracked solely by its console channel closing on
 // exit; holding the Process handle would pin the shell's handle table (and that channel)
 // alive, so the terminal could never be reaped when the shell logs out or exits. Shared by
 // spawn_vt (a display VT) and open_pty (a program-hosted PTY).
-unsafe fn spawn_shell(facs: &Factories, package: &Package, pkg_len: usize, shell_console: u64, shell_control: u64) -> bool {
+unsafe fn spawn_shell(facs: &Factories, package: &Package, shell_console: u64, shell_control: u64) -> bool {
 	unsafe {
 		let shell_elf: &[u8] = match package.lookup(b"shell") {
 			Some(e) => e,
@@ -1584,16 +1585,6 @@ unsafe fn spawn_shell(facs: &Factories, package: &Package, pkg_len: usize, shell
 		send_blocking(boot_parent, b"AUDIO", audio);
 		send_blocking(boot_parent, b"CONSOLE", shell_console);
 		send_blocking(boot_parent, b"CONTROL", shell_control);
-		let pkg_dup: i64 = duplicate(facs.pkg_handle, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
-		if pkg_dup < 0 {
-			close(boot_parent);
-			close(shell_proc as u64);
-			return false;
-		}
-		let mut pbuf: [u8; 16] = [0u8; 16];
-		pbuf[..7].copy_from_slice(b"PACKAGE");
-		pbuf[7..15].copy_from_slice(&(pkg_len as u64).to_le_bytes());
-		send_blocking(boot_parent, &pbuf[..15], pkg_dup as u64);
 		// wait for the shell to self-check storage and report in, then drop its bootstrap.
 		let mut rbuf: [u8; 32] = [0u8; 32];
 		if let Received::Closed = recv_blocking(boot_parent, &mut rbuf) {
@@ -1610,11 +1601,11 @@ unsafe fn spawn_shell(facs: &Factories, package: &Package, pkg_len: usize, shell
 // Open one VT's shell: create the VT's console + control channels, spawn a fully-capable
 // shell over them, nudge it to print its first prompt, and return the VT (its cleared grid
 // + the service ends of those channels). None on any failure.
-unsafe fn spawn_vt(facs: &Factories, package: &Package, pkg_len: usize, addr: u64, fb: &Framebuffer, gpu: u64, cur_w: u32, cur_h: u32) -> Option<Vt> {
+unsafe fn spawn_vt(facs: &Factories, package: &Package, addr: u64, fb: &Framebuffer, gpu: u64, cur_w: u32, cur_h: u32) -> Option<Vt> {
 	unsafe {
 		let (vt_service, vt_client): (u64, u64) = channel()?;
 		let (control_console, control_shell): (u64, u64) = channel()?;
-		if !spawn_shell(facs, package, pkg_len, vt_client, control_shell) {
+		if !spawn_shell(facs, package, vt_client, control_shell) {
 			close(vt_service);
 			close(vt_client);
 			close(control_console);
@@ -1645,7 +1636,7 @@ unsafe fn open_pty(console: &mut Console, name: &[u8]) -> Option<u64> {
 		let (control_console, control_slave): (u64, u64) = channel()?;
 		let (master_console, master_host): (u64, u64) = channel()?;
 		let is_shell: bool = name == b"shell";
-		let ok: bool = if is_shell { spawn_shell(&console.facs, &console.package, console.pkg_len, slave_client, control_slave) } else { spawn_pty_program(&console.package, name, slave_client, control_slave) };
+		let ok: bool = if is_shell { spawn_shell(&console.facs, &console.package, slave_client, control_slave) } else { spawn_pty_program(&console.package, name, slave_client, control_slave) };
 		if !ok {
 			close(slave_service);
 			close(slave_client);

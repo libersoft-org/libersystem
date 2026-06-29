@@ -30,10 +30,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 
 	// 1. receive the per-service client channels from ServiceManager, in the order it
-	//    sends them: storage (`cat`), log (`log`), device (`dev`), process (`ps`/`run`),
-	//    config (`config`/`set`), network (`ip`/`ping`/...), time (`date`), audio (`beep`),
-	//    then a read-only view of the init package. Each is a tagged capability over the
-	//    bootstrap channel.
+	//    sends them: storage (`cat`), log (`log`), device (`dev`), process (`ps`/`run`
+	//    and the launcher the shell runs foreground programs through), config
+	//    (`config`/`set`), network (`ip`/`ping`/...), time (`date`), audio (`beep`). Each
+	//    is a tagged capability over the bootstrap channel.
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or_else(|| exit());
 	// The media StorageService client: the FAT vol://media volume off a second
 	// virtio-blk disk. Sent right after STORAGE; `cat`/`ls` route vol://media to it.
@@ -76,10 +76,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// job on it (SET_FG / CLEAR_FG) so the tty signals it on Ctrl+C / Ctrl+Z / Ctrl+\,
 	// and learns of a Ctrl+Z suspend (JOB_STOPPED) so it can background the job.
 	let control: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONTROL") }.unwrap_or_else(|| exit());
-	// The init package lets the shell spawn foreground programs (echo, later the net
-	// tools); the archive is mapped 'static and parsed once.
-	let (_pkg_handle, archive): (u64, &'static [u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| exit());
-	let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
 	// The admin channel to ServiceManager: `stop <service>` drives a reverse-dependency
 	// teardown over it. Sent last, only by the ServiceManager-spawned VT 1 shell; other
 	// shells run without it (`adminsvc` stays 0 and `stop` reports it is unavailable).
@@ -99,7 +95,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    become the interactive console and run the read-eval-print loop.
 	print_motd();
 	unsafe {
-		repl(console, control, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, &package, &mut buf);
+		repl(console, control, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, &mut buf);
 	}
 	exit();
 }
@@ -155,7 +151,7 @@ fn print_banner(lines: &[&str]) {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, buf: &mut [u8]) {
+unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, buf: &mut [u8]) {
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control);
 		let mut cwd: String = String::from(DEFAULT_CWD);
@@ -172,7 +168,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			// The terminal delivers a whole submitted line (with a trailing newline);
 			// trim it, dispatch it, reap finished jobs, and print the next prompt.
 			let line: &[u8] = trim(&buf[..n]);
-			if dispatch(line, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, package, &mut jobs, &mut cwd) {
+			if dispatch(line, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, &mut jobs, &mut cwd) {
 				return;
 			}
 			reap_jobs(&mut jobs);
@@ -485,7 +481,7 @@ unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, jobs: &mut Jobs, cwd: &mut String) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, jobs: &mut Jobs, cwd: &mut String) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -693,47 +689,47 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"ip" || line == b"net" {
-			spawn_net_tool(jobs, netsvc, package, b"ip", b"", bg);
+			spawn_net_tool(jobs, netsvc, procsvc, b"ip", b"", bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"ping ") {
-			spawn_net_tool(jobs, netsvc, package, b"ping", trim(rest), bg);
+			spawn_net_tool(jobs, netsvc, procsvc, b"ping", trim(rest), bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"nslookup ") {
-			spawn_net_tool(jobs, netsvc, package, b"nslookup", trim(rest), bg);
+			spawn_net_tool(jobs, netsvc, procsvc, b"nslookup", trim(rest), bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"host ") {
-			spawn_net_tool(jobs, netsvc, package, b"nslookup", trim(rest), bg);
+			spawn_net_tool(jobs, netsvc, procsvc, b"nslookup", trim(rest), bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"tcp ") {
-			spawn_net_tool(jobs, netsvc, package, b"tcp", trim(rest), bg);
+			spawn_net_tool(jobs, netsvc, procsvc, b"tcp", trim(rest), bg);
 			return false;
 		}
 		if line == b"arp" {
-			spawn_net_tool(jobs, netsvc, package, b"arp", b"", bg);
+			spawn_net_tool(jobs, netsvc, procsvc, b"arp", b"", bg);
 			return false;
 		}
 		if line == b"ss" || line == b"netstat" {
-			spawn_net_tool(jobs, netsvc, package, b"ss", b"", bg);
+			spawn_net_tool(jobs, netsvc, procsvc, b"ss", b"", bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"nc ") {
-			spawn_net_tool(jobs, netsvc, package, b"nc", trim(rest), bg);
+			spawn_net_tool(jobs, netsvc, procsvc, b"nc", trim(rest), bg);
 			return false;
 		}
 		if line == b"httpd" {
-			spawn_net_tool(jobs, netsvc, package, b"httpd", b"", true);
+			spawn_net_tool(jobs, netsvc, procsvc, b"httpd", b"", true);
 			return false;
 		}
 		if line == b"echo" {
-			exec(jobs, package, b"echo", b"", 0, bg);
+			exec(jobs, procsvc, b"echo", b"", 0, bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
-			exec(jobs, package, b"echo", trim(rest), 0, bg);
+			exec(jobs, procsvc, b"echo", trim(rest), 0, bg);
 			return false;
 		}
 		if line == b"lsvol" {
@@ -837,11 +833,11 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"script" {
-			run_script(jobs, package, b"");
+			run_script(jobs, procsvc, b"");
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"script ") {
-			run_script(jobs, package, trim(rest));
+			run_script(jobs, procsvc, trim(rest));
 			return false;
 		}
 		print(b"\x1b[31munknown command: ");
@@ -851,20 +847,23 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 	}
 }
 
-// Spawn a standalone program `name` from the init package as a foreground child,
-// hand it `args` over a bootstrap channel, and wait for it to finish. The child
-// runs as its own process and prints its output to the console directly (a
-// program's stdout reaches the console via SYS_DEBUG_WRITE); it sends a completion
-// message just before it exits, which we wait on - an exited process is briefly a
-// zombie whose channel has not yet closed, so we cannot rely on the channel closing
-// to detect exit. This is the foreground exec primitive the net tools build on.
-unsafe fn exec(jobs: &mut Jobs, package: &Package, name: &[u8], args: &[u8], cap: u64, bg: bool) {
+// Launch a standalone program `name` through ProcessService as a foreground child, hand
+// it `args` over a bootstrap channel, and wait for it to finish. The shell never loads an
+// ELF itself - ProcessService is the loading mechanism: it reads the program from the init
+// package, moves the child end of the bootstrap channel in as the new process's bootstrap
+// handle, and hands back the live process handle (which carries MANAGE, so the shell can
+// signal it for job control). The child runs as its own process and prints its output to
+// the console directly (a program's stdout reaches the console via SYS_DEBUG_WRITE); it
+// sends a completion message just before it exits, which we wait on - an exited process is
+// briefly a zombie whose channel has not yet closed, so we cannot rely on the channel
+// closing to detect exit. This is the foreground exec primitive the net tools build on.
+unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cap: u64, bg: bool) {
 	unsafe {
-		let elf: &[u8] = match package.lookup(name) {
-			Some(e) => e,
-			None => {
+		let name_str: &str = match core::str::from_utf8(name) {
+			Ok(s) => s,
+			Err(_) => {
 				print(name);
-				print(b": program not found\n");
+				print(b": invalid name\n");
 				return;
 			}
 		};
@@ -872,23 +871,33 @@ unsafe fn exec(jobs: &mut Jobs, package: &Package, name: &[u8], args: &[u8], cap
 			Some(pair) => pair,
 			None => return,
 		};
-		// `spawn` moves the child end into the new process as its bootstrap handle and
-		// returns the child Process handle (which carries MANAGE, so the shell can signal
-		// it for job control).
-		let proc: i64 = spawn(elf, child);
-		if proc < 0 {
-			print(name);
-			print(b": could not start\n");
-			close(parent);
-			return;
-		}
+		// LAUNCH the program via ProcessService: the child end is transferred to it as the new
+		// process's bootstrap handle, and it replies the live Process handle. On any failure the
+		// child end has already been transferred (or never created), so we drop only our parent
+		// end - the same posture the raw spawn took on a failed start.
+		let mut client = process::Client::new(ChannelTransport { chan: procsvc });
+		let proc: u64 = match client.launch(name_str, &child) {
+			Some(Ok(started)) => started.task,
+			Some(Err(_)) => {
+				print(name);
+				print(b": could not start\n");
+				close(parent);
+				return;
+			}
+			None => {
+				print(name);
+				print(b": process service unavailable\n");
+				close(parent);
+				return;
+			}
+		};
 		// Hand the child our console as its stdout (a SEND dup of our console channel), then
 		// its arguments + an optional inherited capability (e.g. a NetworkService client).
 		send_stdout(parent);
 		send_blocking(parent, args, cap);
 		let id: usize = jobs.next_id;
 		jobs.next_id += 1;
-		let job: Job = Job { id, proc: proc as u64, done: parent, name: name.to_vec(), stopped: false };
+		let job: Job = Job { id, proc, done: parent, name: name.to_vec(), stopped: false };
 		if bg {
 			// Background: track the job and return to the prompt; its completion is reaped
 			// before a later prompt.
@@ -931,7 +940,7 @@ unsafe fn send_stdout(parent: u64) {
 // the tool alongside its arguments. Each tool talks to NetworkService over its own
 // channel rather than sharing the shell's (a shared channel would race), and the
 // shell keeps its own `netsvc`.
-unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, package: &Package, name: &[u8], args: &[u8], bg: bool) {
+unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8], args: &[u8], bg: bool) {
 	unsafe {
 		if netsvc == 0 {
 			print(name);
@@ -947,7 +956,7 @@ unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, package: &Package, name: 
 				return;
 			}
 		};
-		exec(jobs, package, name, args, tool_netsvc, bg);
+		exec(jobs, procsvc, name, args, tool_netsvc, bg);
 	}
 }
 
@@ -956,7 +965,7 @@ unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, package: &Package, name: 
 // pty's shell with `cmd` and prints the captured session. This is the foreground side of
 // the PTY abstraction - a program (script) hosting a terminal it is not the hardware
 // console for (the same path a future ssh drives).
-unsafe fn run_script(jobs: &mut Jobs, package: &Package, cmd: &[u8]) {
+unsafe fn run_script(jobs: &mut Jobs, procsvc: u64, cmd: &[u8]) {
 	unsafe {
 		// `PTY_OPEN` + the program to host (a shell); the console replies `PTY` + the master.
 		let mut req: [u8; 13] = [0u8; 13];
@@ -971,7 +980,7 @@ unsafe fn run_script(jobs: &mut Jobs, package: &Package, cmd: &[u8]) {
 				return;
 			}
 		};
-		exec(jobs, package, b"script", cmd, master, false);
+		exec(jobs, procsvc, b"script", cmd, master, false);
 	}
 }
 
