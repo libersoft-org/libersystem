@@ -13,6 +13,18 @@ name = "echo"
 path = "src/echo.rs"
 
 [[bin]]
+name = "date"
+path = "src/date.rs"
+
+[[bin]]
+name = "cat"
+path = "src/cat.rs"
+
+[[bin]]
+name = "write"
+path = "src/write.rs"
+
+[[bin]]
 name = "ping"
 path = "src/ping.rs"
 
