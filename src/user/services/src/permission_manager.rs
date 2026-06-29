@@ -96,6 +96,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"request_probe" => Some(Manifest { component: String::from("request_probe"), grants: alloc::vec![Capability::Log] }),
 		b"cat" => Some(Manifest { component: String::from("cat"), grants: alloc::vec![Capability::Storage] }),
 		b"write" => Some(Manifest { component: String::from("write"), grants: alloc::vec![Capability::Storage] }),
+		b"rm" => Some(Manifest { component: String::from("rm"), grants: alloc::vec![Capability::Storage] }),
 		_ => None,
 	}
 }
