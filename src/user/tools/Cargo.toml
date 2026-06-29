@@ -41,6 +41,10 @@ name = "rmdir"
 path = "src/rmdir.rs"
 
 [[bin]]
+name = "log"
+path = "src/log.rs"
+
+[[bin]]
 name = "ping"
 path = "src/ping.rs"
 

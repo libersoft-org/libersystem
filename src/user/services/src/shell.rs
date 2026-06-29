@@ -601,19 +601,35 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"log" {
-			query_log(logsvc, timesvc, false);
+			// Launch `log` as its own sandboxed ELF through PermissionManager (the launcher /
+			// granter), which grants it a log client and a time client and forwards it this
+			// terminal and the sub-form argument. A shell with no PermissionManager (a non-primary
+			// VT) queries the journal inline instead.
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"log", b"");
+			if !launched {
+				query_log(logsvc, timesvc, false);
+			}
 			return false;
 		}
 		if line == b"log json" {
-			query_log(logsvc, timesvc, true);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"log", b"json");
+			if !launched {
+				query_log(logsvc, timesvc, true);
+			}
 			return false;
 		}
 		if line == b"log tail" {
-			tail_log(logsvc, timesvc, false);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"log", b"tail");
+			if !launched {
+				tail_log(logsvc, timesvc, false);
+			}
 			return false;
 		}
 		if line == b"log tail json" {
-			tail_log(logsvc, timesvc, true);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"log", b"tail json");
+			if !launched {
+				tail_log(logsvc, timesvc, true);
+			}
 			return false;
 		}
 		if line == b"dev" {
