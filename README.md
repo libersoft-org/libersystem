@@ -22,6 +22,7 @@ This is an early-stage project under active development. It is not yet a general
 
 - [**Concept**](./docs/CONCEPT_EN.md) - the **LiberSystem design document**: object and capability model, IPC, services, and the roadmap.
 - [**LSIDL**](./docs/LSIDL.md) - the **LiberSystem Interface Definition Language**: the language services are described in, from which the wire codec, clients, servers, and docs are generated.
+- [**LiberFS**](./docs/LIBERFS.md) - the **native filesystem**: the copy-on-write, extent-mapped, checksummed and snapshotting on-disk format, and how it compares with FAT, NTFS, ext4, XFS, Btrfs and ZFS.
 
 ## Installation
 
