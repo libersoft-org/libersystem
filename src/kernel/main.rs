@@ -2294,7 +2294,7 @@ fn init_package_starts_system_manager() {
 	// component it governs and caps its Domain before reporting in), then DeviceManager,
 	// StorageService (handed the disk block channel DeviceManager routes up), the
 	// media StorageService (handed the second disk's block channel, mounting it as the
-	// read-only FAT vol://media), the iso StorageService (handed the third disk's
+	// writable FAT / exFAT vol://media), the iso StorageService (handed the third disk's
 	// block channel, mounting it as the read-only ISO9660 vol://iso), and the udf
 	// StorageService (handed the fourth disk's block channel, mounting it as the read-only
 	// UDF vol://udf - so four StorageService reports arrive),

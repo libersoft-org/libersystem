@@ -261,8 +261,9 @@ fn write_bpb(img: &mut [u8], bps: usize, spc: usize, reserved: usize, fat_size: 
 }
 
 // Build a small exFAT image: a 24-sector reserved boot region, a 32-bit FAT, and a
-// cluster heap whose root cluster holds entry sets (0x85 / 0xC0 / 0xC1). Only files in
-// the root; spc 1; FAT chains written so the reader follows them.
+// cluster heap with an allocation bitmap (cluster 2), a root directory (cluster 3) and
+// file clusters. The bitmap and the 0x81 entry are written so the write path can find
+// free clusters; spc 1; FAT chains written so the reader follows them.
 fn build_exfat(files: &[File]) -> Vec<u8> {
 	let bps = 512;
 	let reserved = 24;
@@ -272,18 +273,26 @@ fn build_exfat(files: &[File]) -> Vec<u8> {
 	let total = heap + clusters;
 	let mut img = vec![0u8; total * bps];
 	let mut fat = vec![0u8; fat_size * bps];
-	let mut next = 3;
+	let mut bm = vec![0u8; clusters.div_ceil(8)];
+	let mut next = 4;
 	let mut root: Vec<u8> = Vec::new();
+	// the allocation bitmap lives in cluster 2; the root in cluster 3; both stay allocated.
 	set_fat(&mut fat, 4, 2, 0x0FFF_FFFF);
+	set_fat(&mut fat, 4, 3, 0x0FFF_FFFF);
+	bm[0] |= 0b11;
+	push_exfat_bitmap(&mut root, 2, clusters.div_ceil(8) as u64);
 	for f in files {
 		let cluster = next;
 		next += 1;
 		set_fat(&mut fat, 4, cluster, 0x0FFF_FFFF);
+		bm[0] |= 1 << (cluster - 2);
 		let off = (heap + cluster - 2) * bps;
 		img[off..off + f.data.len()].copy_from_slice(f.data);
 		push_exfat_entry(&mut root, f.path, f.data.len() as u64, cluster as u32);
 	}
-	let root_off = (heap) * bps;
+	let bm_off = heap * bps;
+	img[bm_off..bm_off + bm.len()].copy_from_slice(&bm);
+	let root_off = (heap + 1) * bps;
 	img[root_off..root_off + root.len()].copy_from_slice(&root);
 	img[reserved * bps..reserved * bps + fat.len()].copy_from_slice(&fat);
 	img[3..11].copy_from_slice(b"EXFAT   ");
@@ -291,13 +300,22 @@ fn build_exfat(files: &[File]) -> Vec<u8> {
 	img[84..88].copy_from_slice(&(fat_size as u32).to_le_bytes());
 	img[88..92].copy_from_slice(&(heap as u32).to_le_bytes());
 	img[92..96].copy_from_slice(&(clusters as u32).to_le_bytes());
-	img[96..100].copy_from_slice(&2u32.to_le_bytes());
+	img[96..100].copy_from_slice(&3u32.to_le_bytes());
 	img[108] = 9;
 	img[109] = 0;
 	img[110] = 1;
 	img[510] = 0x55;
 	img[511] = 0xAA;
 	img
+}
+
+// A 0x81 allocation-bitmap entry: marks the bitmap's first cluster and byte length.
+fn push_exfat_bitmap(dir: &mut Vec<u8>, cluster: u32, size: u64) {
+	let mut e = [0u8; 32];
+	e[0] = 0x81;
+	e[20..24].copy_from_slice(&cluster.to_le_bytes());
+	e[24..32].copy_from_slice(&size.to_le_bytes());
+	dir.extend_from_slice(&e);
 }
 
 fn push_exfat_entry(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32) {
@@ -448,8 +466,26 @@ fn removing_a_missing_file_is_not_found() {
 }
 
 #[test]
-fn exfat_is_read_only() {
+fn writes_an_exfat_file_then_reads_it_back() {
 	let mut fs = FatFs::mount(MemDisk { data: build_exfat(ROOT) }).unwrap();
-	assert_eq!(fs.write_file(b"NEW.TXT", b"x"), Err(FsError::Invalid));
-	assert_eq!(fs.remove(b"HELLO.TXT"), Err(FsError::Invalid));
+	fs.write_file(b"NEW.TXT", b"fresh exfat bytes").unwrap();
+	assert_eq!(fs.read_file(b"NEW.TXT").unwrap(), b"fresh exfat bytes");
+	assert!(names(&fs.list().unwrap()).contains(&"NEW.TXT".to_string()));
+}
+
+#[test]
+fn writes_a_multi_cluster_exfat_file() {
+	let mut fs = FatFs::mount(MemDisk { data: build_exfat(ROOT) }).unwrap();
+	let big: Vec<u8> = (0..1500u32).map(|i| i as u8).collect();
+	fs.write_file(b"BIG.BIN", &big).unwrap();
+	assert_eq!(fs.read_file(b"BIG.BIN").unwrap(), big);
+}
+
+#[test]
+fn overwrites_and_removes_an_exfat_file() {
+	let mut fs = FatFs::mount(MemDisk { data: build_exfat(ROOT) }).unwrap();
+	fs.write_file(b"HELLO.TXT", b"shorter").unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"shorter");
+	fs.remove(b"HELLO.TXT").unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::NotFound));
 }

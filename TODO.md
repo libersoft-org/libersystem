@@ -948,9 +948,9 @@ M48 detects and reads exFAT; large SD cards and USB drives (over the FAT32 4 GiB
 file cap) need to be writable too. exFAT is close to FAT - a cluster chain plus an
 allocation bitmap - so the write path shares most of the M48 FAT machinery.
 
-- [ ] exFAT write: allocate and free cluster chains via the allocation bitmap, update the FAT, and create / write / delete files and directory entries (4 GiB+ files supported).
-- [ ] The shell `write` / `rm` route through `vol://media` on an exFAT volume, matching the FAT12/16/32 write path.
-- [ ] Host-testable: write round-trips on an exFAT image fixture plus a live write to an exFAT virtio-blk image in QEMU.
+- [x] exFAT write: allocate and free cluster chains via the allocation bitmap, update the FAT, and create / write / delete files and directory entries (4 GiB+ files supported).
+- [x] The shell `write` / `rm` route through `vol://media` on an exFAT volume, matching the FAT12/16/32 write path.
+- [x] Host-testable: write round-trips on an exFAT image fixture plus a live write to an exFAT virtio-blk image in QEMU.
 - Done when: an exFAT volume mounts read-write behind the Volume API, the shell creates / writes / deletes files (including a >4 GiB file), tests green - large removable media is fully writable through the typed `Storage.Volume`.
 - Concept: Native filesystem (compatible-FS backends behind the unified Volume API), M48 (extends its read-only exFAT and reuses the FAT write machinery).
 

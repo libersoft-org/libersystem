@@ -4,14 +4,15 @@
 //! layering principle, several filesystems mount behind one volume API, and FAT is the
 //! ubiquitous interchange format so reading it makes those media readable.
 //!
-//! Read-first by design, with a classic-FAT write path. The boot sector is parsed and the
+//! Read-first by design, with a full write path. The boot sector is parsed and the
 //! family auto-detected: a small cluster count is FAT12, a medium one FAT16, a large one
 //! FAT32, and an `EXFAT ` magic is exFAT. A file is found by walking `/`-separated path
 //! segments from the root, each lookup scanning a directory's 32-byte entries (assembling
 //! VFAT long file names from their UTF-16 fragments, or the exFAT file-name entry set) and
-//! following the cluster chain through the allocation table. FAT12/16/32 volumes also
-//! create, overwrite, and delete files (allocating and freeing cluster chains and writing
-//! every FAT copy); exFAT stays read-only.
+//! following the cluster chain through the allocation table. All four families also
+//! create, overwrite, and delete files - FAT12/16/32 allocate from the FAT and write
+//! every copy; exFAT allocates from the allocation bitmap and writes its 0x85/0xC0/0xC1
+//! entry sets, so >4 GiB removable media is writable.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -125,16 +126,16 @@ impl<D: BlockDevice> FatFs<D> {
 	}
 
 	// Create or overwrite a file named by a `/`-separated path with `data`, allocating a
-	// cluster chain and writing a directory entry. FAT12/16/32 only; exFAT stays read-only.
+	// cluster chain and writing a directory entry, for any of the four families.
 	pub fn write_file(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
-		if self.geo.kind == Kind::ExFat {
-			return Err(FsError::Invalid);
-		}
 		let (parent, name) = split_parent(path)?;
 		if name.is_empty() || name.len() > 255 {
 			return Err(FsError::TooLong);
 		}
 		let dir = self.resolve_dir(parent)?;
+		if self.geo.kind == Kind::ExFat {
+			return self.exfat_write(dir, name, data);
+		}
 		self.unlink_in(dir, name, false)?;
 		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
 		let need = data.len().div_ceil(cluster_bytes);
@@ -154,13 +155,13 @@ impl<D: BlockDevice> FatFs<D> {
 	}
 
 	// Delete a file named by a `/`-separated path: free its cluster chain and clear its
-	// directory entry. FAT12/16/32 only; exFAT stays read-only.
+	// directory entry, for any of the four families.
 	pub fn remove(&mut self, path: &[u8]) -> Result<(), FsError> {
-		if self.geo.kind == Kind::ExFat {
-			return Err(FsError::Invalid);
-		}
 		let (parent, name) = split_parent(path)?;
 		let dir = self.resolve_dir(parent)?;
+		if self.geo.kind == Kind::ExFat {
+			return self.exfat_remove(dir, name);
+		}
 		if !self.unlink_in(dir, name, true)? {
 			return Err(FsError::NotFound);
 		}
@@ -503,6 +504,176 @@ impl<D: BlockDevice> FatFs<D> {
 			c = next;
 		}
 	}
+
+	// Create or overwrite an exFAT file: drop any existing entry set, allocate the data
+	// clusters from the allocation bitmap, write them, and add the 0x85 / 0xC0 / 0xC1 set.
+	fn exfat_write(&mut self, dir: u32, name: &[u8], data: &[u8]) -> Result<(), FsError> {
+		self.exfat_unlink(dir, name, false)?;
+		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
+		let need = data.len().div_ceil(cluster_bytes);
+		let chain = self.exfat_alloc(need)?;
+		for (i, c) in chain.iter().enumerate() {
+			let mut buf = vec![0u8; cluster_bytes];
+			let off = i * cluster_bytes;
+			let end = (off + cluster_bytes).min(data.len());
+			if off < data.len() {
+				buf[..end - off].copy_from_slice(&data[off..end]);
+			}
+			let fs = self.geo.first_data_sector as u64 + (*c as u64 - 2) * self.geo.sectors_per_cluster as u64;
+			self.write_fs_sectors(fs, self.geo.sectors_per_cluster, &buf)?;
+		}
+		let first = chain.first().copied().unwrap_or(0);
+		self.exfat_add_entry(dir, name, first, data.len() as u64)
+	}
+
+	// Delete an exFAT file: clear its entry set and free its cluster chain and bitmap bits.
+	fn exfat_remove(&mut self, dir: u32, name: &[u8]) -> Result<(), FsError> {
+		if !self.exfat_unlink(dir, name, true)? {
+			return Err(FsError::NotFound);
+		}
+		Ok(())
+	}
+
+	// Locate the allocation bitmap (the 0x81 entry in the root): its first cluster and its
+	// byte length. exFAT tracks free clusters as a bit per cluster, set when allocated.
+	fn exfat_bitmap(&mut self) -> Result<(u32, u64), FsError> {
+		let bytes = self.read_dir_bytes(self.geo.root_cluster)?;
+		let mut i = 0;
+		while i + 32 <= bytes.len() {
+			let e = &bytes[i..i + 32];
+			if e[0] == 0x00 {
+				break;
+			}
+			if e[0] == 0x81 {
+				let first = u32::from_le_bytes([e[20], e[21], e[22], e[23]]);
+				let size = u64::from_le_bytes([e[24], e[25], e[26], e[27], e[28], e[29], e[30], e[31]]);
+				return Ok((first, size));
+			}
+			i += 32;
+		}
+		Err(FsError::Invalid)
+	}
+
+	// Allocate `n` clusters from the bitmap into a FAT-linked chain, returning them in
+	// order. Sets the bitmap bit and the FAT entry of each; NoSpace if the volume is full.
+	fn exfat_alloc(&mut self, n: usize) -> Result<Vec<u32>, FsError> {
+		if n == 0 {
+			return Ok(Vec::new());
+		}
+		let (bm_first, _bm_size) = self.exfat_bitmap()?;
+		let mut bm = self.read_chain(bm_first, usize::MAX)?;
+		let max = self.max_cluster();
+		let mut chain: Vec<u32> = Vec::with_capacity(n);
+		let mut c = 2u32;
+		while chain.len() < n {
+			if c > max {
+				return Err(FsError::NoSpace);
+			}
+			let idx = (c - 2) as usize;
+			let byte = idx / 8;
+			let bit = idx % 8;
+			if byte < bm.len() && bm[byte] & (1 << bit) == 0 {
+				bm[byte] |= 1 << bit;
+				chain.push(c);
+			}
+			c += 1;
+		}
+		self.write_dir_bytes(bm_first, &bm)?;
+		let eoc = 0x0FFF_FFFF;
+		for i in 0..chain.len() {
+			let val = if i + 1 < chain.len() { chain[i + 1] } else { eoc };
+			self.set_fat_entry(chain[i], val)?;
+		}
+		Ok(chain)
+	}
+
+	// Free an exFAT chain: clear each cluster's bitmap bit and FAT slot. First 0 = none.
+	fn exfat_free(&mut self, first: u32) -> Result<(), FsError> {
+		if first < 2 {
+			return Ok(());
+		}
+		let (bm_first, _bm_size) = self.exfat_bitmap()?;
+		let mut bm = self.read_chain(bm_first, usize::MAX)?;
+		let mut cluster = first;
+		let mut guard = 0u32;
+		while cluster >= 2 && !self.is_end(cluster) {
+			let next = self.next_cluster(cluster)?;
+			let idx = (cluster - 2) as usize;
+			let byte = idx / 8;
+			if byte < bm.len() {
+				bm[byte] &= !(1 << (idx % 8));
+			}
+			self.set_fat_entry(cluster, 0)?;
+			cluster = next;
+			guard += 1;
+			if guard > self.max_cluster() {
+				break;
+			}
+		}
+		self.write_dir_bytes(bm_first, &bm)
+	}
+
+	// Add an exFAT entry set (0x85 file + 0xC0 stream + 0xC1 names) to directory `dir`,
+	// pointing at `first` cluster with `size` bytes. NoSpace if the directory is full.
+	fn exfat_add_entry(&mut self, dir: u32, name: &[u8], first: u32, size: u64) -> Result<(), FsError> {
+		let set = build_exfat_set(name, first, size);
+		let mut bytes = self.read_dir_bytes(dir)?;
+		let count = set.len() / 32;
+		let at = exfat_free_run(&bytes, count).ok_or(FsError::NoSpace)?;
+		bytes[at..at + set.len()].copy_from_slice(&set);
+		self.write_dir_bytes(dir, &bytes)
+	}
+
+	// Remove the entry named `name` from exFAT directory `dir`: clear the type bit of each
+	// entry in its set and, if `free`, release its chain. Returns whether it was present.
+	fn exfat_unlink(&mut self, dir: u32, name: &[u8], free: bool) -> Result<bool, FsError> {
+		let mut bytes = self.read_dir_bytes(dir)?;
+		let mut i = 0;
+		while i + 32 <= bytes.len() {
+			if bytes[i] == 0x00 {
+				break;
+			}
+			if bytes[i] != 0x85 {
+				i += 32;
+				continue;
+			}
+			let secondary = bytes[i + 1] as usize;
+			let mut nm: Vec<u16> = Vec::new();
+			let mut len = 0usize;
+			let mut first = 0u32;
+			for k in 1..=secondary {
+				let s = i + k * 32;
+				if s + 32 > bytes.len() {
+					break;
+				}
+				let x = &bytes[s..s + 32];
+				if x[0] == 0xC0 {
+					len = x[3] as usize;
+					first = u32::from_le_bytes([x[20], x[21], x[22], x[23]]);
+				} else if x[0] == 0xC1 {
+					for c in 0..15 {
+						nm.push(u16::from_le_bytes([x[2 + c * 2], x[3 + c * 2]]));
+					}
+				}
+			}
+			nm.truncate(len);
+			if eq_ignore_case(decode_utf16(&nm).as_bytes(), name) {
+				for k in 0..=secondary {
+					let off = i + k * 32;
+					if off < bytes.len() {
+						bytes[off] &= 0x7F;
+					}
+				}
+				self.write_dir_bytes(dir, &bytes)?;
+				if free {
+					self.exfat_free(first)?;
+				}
+				return Ok(true);
+			}
+			i += (secondary + 1) * 32;
+		}
+		Ok(false)
+	}
 }
 
 // A directory entry as parsed off disk, before it becomes a FileInfo: keeps the first
@@ -768,6 +939,81 @@ fn free_run(bytes: &[u8], n: usize) -> Option<usize> {
 	let mut i = 0usize;
 	while i + 32 <= bytes.len() {
 		if bytes[i] == 0x00 || bytes[i] == 0xE5 {
+			run += 1;
+			if run == n {
+				return Some(i + 32 - n * 32);
+			}
+		} else {
+			run = 0;
+		}
+		i += 32;
+	}
+	None
+}
+
+// Build an exFAT entry set for `name`: a 0x85 file entry, a 0xC0 stream extension (FAT
+// chain, length, first cluster), and 0xC1 name fragments, stamped with the set checksum.
+fn build_exfat_set(name: &[u8], first: u32, size: u64) -> Vec<u8> {
+	let units: Vec<u16> = String::from_utf8_lossy(name).encode_utf16().collect();
+	let frags = units.len().div_ceil(15);
+	let count = 1 + frags;
+	let mut set = vec![0u8; (count + 1) * 32];
+	set[0] = 0x85;
+	set[1] = count as u8;
+	set[4..6].copy_from_slice(&0x20u16.to_le_bytes());
+	set[32] = 0xC0;
+	set[33] = 0x01;
+	set[35] = units.len() as u8;
+	set[36..38].copy_from_slice(&exfat_name_hash(&units).to_le_bytes());
+	set[40..48].copy_from_slice(&size.to_le_bytes());
+	set[52..56].copy_from_slice(&first.to_le_bytes());
+	set[56..64].copy_from_slice(&size.to_le_bytes());
+	for f in 0..frags {
+		let base = (2 + f) * 32;
+		set[base] = 0xC1;
+		for c in 0..15 {
+			let idx = f * 15 + c;
+			let v = if idx < units.len() { units[idx] } else { 0 };
+			set[base + 2 + c * 2..base + 4 + c * 2].copy_from_slice(&v.to_le_bytes());
+		}
+	}
+	let sum = exfat_set_checksum(&set);
+	set[2..4].copy_from_slice(&sum.to_le_bytes());
+	set
+}
+
+// The exFAT entry-set checksum: a 16-bit rotate-and-add over every byte of the set,
+// skipping the two checksum bytes (2, 3) of the first entry where the value lands.
+fn exfat_set_checksum(set: &[u8]) -> u16 {
+	let mut sum: u16 = 0;
+	for (i, &b) in set.iter().enumerate() {
+		if i == 2 || i == 3 {
+			continue;
+		}
+		sum = sum.rotate_right(1).wrapping_add(b as u16);
+	}
+	sum
+}
+
+// The exFAT file-name hash, over the UTF-16LE name bytes; not verified by the reader but
+// written for correctness so a real exFAT driver accepts the file.
+fn exfat_name_hash(units: &[u16]) -> u16 {
+	let mut hash: u16 = 0;
+	for &u in units {
+		for b in u.to_le_bytes() {
+			hash = hash.rotate_right(1).wrapping_add(b as u16);
+		}
+	}
+	hash
+}
+
+// Find the first run of `n` free exFAT entries (0x00 fresh or a cleared type bit) in a
+// directory region, or None when there is no contiguous gap that large.
+fn exfat_free_run(bytes: &[u8], n: usize) -> Option<usize> {
+	let mut run = 0usize;
+	let mut i = 0usize;
+	while i + 32 <= bytes.len() {
+		if bytes[i] == 0x00 || bytes[i] & 0x80 == 0 {
 			run += 1;
 			if run == n {
 				return Some(i + 32 - n * 32);

@@ -1497,7 +1497,7 @@ unsafe fn cat(storage: u64, uri: &[u8]) -> bool {
 
 // List the volume set via the StorageService `list` op. With no argument print the
 // volume set; with `vol://<volume>` print that volume's files (name + size). The
-// volumes are `system` (writable LiberFS), `media` (FAT12/16/32 off a second disk),
+// volumes are `system` (writable LiberFS), `media` (FAT12/16/32 or exFAT off a second disk),
 // `iso` (read-only ISO9660 off a third disk), and `udf` (read-only UDF off a fourth disk).
 unsafe fn ls_cmd(storage: u64, media: u64, iso: u64, udf: u64, arg: &[u8]) {
 	unsafe {

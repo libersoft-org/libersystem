@@ -41,12 +41,26 @@ mkdir -p "$HERE/.build"
 if [[ -f "$VOLUME_PKG" ]]; then
 	dd if="$VOLUME_PKG" of="$VIRTIO_DISK" bs=512 conv=notrunc status=none
 fi
-# A second virtio-blk disk holding a real FAT volume (M48): the media StorageService
-# instance mounts it as `vol://media` (FAT12/16/32 read-write, exFAT read-only). Built
-# once with mtools (mformat + mcopy) so it is a genuine FAT image, not a fixture; skipped
-# if mtools is absent (the media volume then simply does not mount). Files come from the
-# volume/ seed dir.
+# A second virtio-blk disk holding a real exFAT volume (M48 read, M59 write): the media
+# StorageService instance mounts it read-write as `vol://media`. Built once with mkfs.exfat
+# (a genuine exFAT image, not a fixture) and seeded via a loopback mount; falls back to an
+# mtools FAT32 image when mkfs.exfat / loop mount is unavailable, and is skipped entirely
+# if neither toolchain is present. Files come from the volume/ seed dir.
 FAT_DISK="$HERE/.build/fat-media.img"
+if [[ ! -f "$FAT_DISK" ]] && command -v mkfs.exfat >/dev/null; then
+	truncate -s 16M "$FAT_DISK"
+	if mkfs.exfat "$FAT_DISK" >/dev/null 2>&1; then
+		FMNT="$HERE/.build/media-mnt"
+		mkdir -p "$FMNT"
+		if mount -o loop "$FAT_DISK" "$FMNT" 2>/dev/null; then
+			cp "$HERE/../volume/hello.txt" "$HERE/../volume/motd.txt" "$FMNT"/ 2>/dev/null || true
+			umount "$FMNT" 2>/dev/null || true
+		fi
+		rmdir "$FMNT" 2>/dev/null || true
+	else
+		rm -f "$FAT_DISK"
+	fi
+fi
 if [[ ! -f "$FAT_DISK" ]] && command -v mformat >/dev/null && command -v mcopy >/dev/null; then
 	truncate -s 16M "$FAT_DISK"
 	mformat -i "$FAT_DISK" -F ::

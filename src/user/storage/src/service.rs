@@ -11,7 +11,7 @@
 //          boot path. A fresh or stale disk is formatted and seeded from the factory
 //          archive laid at LBA 0, so the volume always starts with its seed files; or
 //        "FATBLOCK", with a channel capability to a second virtio-blk driver's block
-//          service, on which a FAT12/16/32 (writable) or exFAT (read-only) volume is
+//          service, on which a writable FAT12/16/32 or exFAT volume is
 //          mounted as vol://media - a flash-drive / SD-card image through the same
 //          Volume contract;
 //        "ISOBLOCK", with a channel capability to a third virtio-blk driver's block
@@ -24,10 +24,9 @@
 // The service then serves the generated Storage.Volume contract: `open` resolves a
 // vol:// path and replies with the file's length plus a MemoryObject capability to
 // its bytes (handle<file>, a zero-copy read); `list` enumerates the volume; and on a
-// writable LiberFS and FAT12/16/32 volume `write` creates-or-truncates a file from a
+// writable LiberFS and FAT volume `write` creates-or-truncates a file from a
 // zero-copy `buffer` and `remove` deletes one, both persisting to the disk so they
-// survive a reboot. A read-only archive volume rejects writes with `denied`; exFAT
-// media is read-only and rejects them with `invalid`.
+// survive a reboot. A read-only archive volume rejects writes with `denied`.
 
 #![no_std]
 #![no_main]
@@ -45,7 +44,7 @@ use rt::*;
 use udf::Udf;
 
 // the volume names this service answers to; the URI's volume component must match
-// one of these. "system" is the writable LiberFS disk; "media" is a read-only FAT
+// one of these. "system" is the writable LiberFS disk; "media" is a writable FAT
 // disk mounted off a second virtio-blk device; "iso" is a read-only ISO9660 disk
 // mounted off a third virtio-blk device; "udf" is a read-only UDF disk mounted off a
 // fourth virtio-blk device.
@@ -134,7 +133,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 // The volume backing, behind the generated Storage.Volume contract: either a
 // read-only PKGARCH1 archive mapped in memory (the ramdisk path), a writable LiberFS
-// on the virtio-blk disk (the boot path), or a read-only FAT12/16/32/exFAT volume on
+// on the virtio-blk disk (the boot path), or a writable FAT12/16/32/exFAT volume on
 // a second virtio-blk disk (foreign media).
 enum Volume {
 	Archive { base: u64, len: usize },
@@ -146,7 +145,7 @@ enum Volume {
 
 impl Volume {
 	// The vol:// name this backing answers to: writable LiberFS (and the test archive)
-	// is "system"; the read-only FAT media is "media"; the read-only ISO9660 is "iso";
+	// is "system"; the writable FAT media is "media"; the read-only ISO9660 is "iso";
 	// the read-only UDF is "udf".
 	fn name(&self) -> &'static [u8] {
 		match self {
