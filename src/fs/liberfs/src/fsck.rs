@@ -44,7 +44,4 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		Ok(bad)
 	}
-
-	// transactions
-
 }

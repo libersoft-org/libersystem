@@ -217,3 +217,75 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(())
 	}
 }
+
+// The name held in a directory record's NUL-padded name field: up to the first NUL.
+pub(crate) fn name_in(field: &[u8]) -> &[u8] {
+	match field.iter().position(|&b| b == 0) {
+		Some(end) => &field[..end],
+		None => field,
+	}
+}
+
+// FNV-1a 64-bit hash of an entry name: the B+tree key that orders a directory's entries.
+pub(crate) fn name_hash(name: &[u8]) -> u64 {
+	let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+	for &b in name {
+		h ^= b as u64;
+		h = h.wrapping_mul(0x0000_0100_0000_01b3);
+	}
+	h
+}
+
+// A directory probe key (the name hash then the NUL-padded name): the DIR_KEYLEN-byte
+// prefix a leaf record is matched against.
+pub(crate) fn dir_probe(name: &[u8]) -> Vec<u8> {
+	let mut probe = vec![0u8; DIR_KEYLEN];
+	probe[0..8].copy_from_slice(&name_hash(name).to_le_bytes());
+	probe[8..8 + name.len()].copy_from_slice(name);
+	probe
+}
+
+// A full directory leaf record: the (hash, NUL-padded name) key then the child inode.
+pub(crate) fn dir_record(name: &[u8], child: u32) -> Vec<u8> {
+	let mut rec = vec![0u8; DIR_REC];
+	rec[0..8].copy_from_slice(&name_hash(name).to_le_bytes());
+	rec[8..8 + name.len()].copy_from_slice(name);
+	rec[8 + NAME_MAX..8 + NAME_MAX + 4].copy_from_slice(&child.to_le_bytes());
+	rec
+}
+
+// Split a path into its validated segments. Each segment must be non-empty, no longer
+// than NAME_MAX, neither "." nor "..", and free of NUL bytes - so a resolved path can
+// never escape the volume or name an invalid entry. A portable-name policy is enforced
+// at this boundary: the cross-platform-unsafe set (`\ : * ? < > | "` and control bytes)
+// is rejected on top of `/` and NUL, so a LiberFS name moves cleanly to FAT / NTFS media
+// and other systems.
+pub(crate) fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
+	if path.is_empty() {
+		return Err(FsError::Invalid);
+	}
+	let mut segs = Vec::new();
+	for seg in path.split(|&b| b == b'/') {
+		if seg.is_empty() || seg == b"." || seg == b".." {
+			return Err(FsError::Invalid);
+		}
+		if seg.len() > NAME_MAX {
+			return Err(FsError::TooLong);
+		}
+		if seg.iter().any(|&c| !is_portable_name_byte(c)) {
+			return Err(FsError::Invalid);
+		}
+		segs.push(seg);
+	}
+	Ok(segs)
+}
+
+// Is byte `c` allowed in a portable file name? Rejects NUL and control bytes (0x00..=0x1F
+// and 0x7F) and the cross-platform-reserved set `\ : * ? < > | "`. (`/` never reaches
+// here - it is the path separator.)
+pub(crate) fn is_portable_name_byte(c: u8) -> bool {
+	if c < 0x20 || c == 0x7F {
+		return false;
+	}
+	!matches!(c, b'\\' | b':' | b'*' | b'?' | b'<' | b'>' | b'|' | b'"')
+}

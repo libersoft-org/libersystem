@@ -254,7 +254,55 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.free_inode(inode_num)?;
 		Ok(())
 	}
-
-	// snapshots
-
 }
+
+// Render a superblock to a fresh BLOCK_SIZE block. The self-CRC covers the whole
+// block with its own four bytes zeroed, so a torn write (any byte wrong) fails it on
+// mount and the slot is rejected.
+pub(crate) fn serialize_superblock(sb: &Superblock) -> Vec<u8> {
+	let mut block = vec![0u8; BLOCK_SIZE];
+	block[0..8].copy_from_slice(&MAGIC);
+	block[8..12].copy_from_slice(&VERSION.to_le_bytes());
+	block[12..16].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
+	block[16..24].copy_from_slice(&sb.num_blocks.to_le_bytes());
+	block[24..28].copy_from_slice(&sb.next_inode.to_le_bytes());
+	block[28..36].copy_from_slice(&sb.generation.to_le_bytes());
+	block[36..44].copy_from_slice(&sb.inode_root.to_le_bytes());
+	block[44..48].copy_from_slice(&sb.inode_root_crc.to_le_bytes());
+	block[52..56].copy_from_slice(&sb.root_inode.to_le_bytes());
+	// the snapshot-table pointer and its CRC32C sit past the self-CRC field, so they are
+	// covered by the whole-block checksum below.
+	block[60..68].copy_from_slice(&sb.snap_root.to_le_bytes());
+	block[68..72].copy_from_slice(&sb.snap_root_crc.to_le_bytes());
+	// the CRC bytes are already zero; checksum the block and store it over them.
+	let crc = crc32c(&block);
+	block[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+	block
+}
+
+// Parse and validate a superblock block: it must carry the LiberFS magic and version,
+// match this build's block size, and pass its own CRC32C. Returns None otherwise (an
+// unformatted slot, a foreign disk, or a torn commit).
+pub(crate) fn parse_superblock(block: &[u8]) -> Option<Superblock> {
+	if block.len() < BLOCK_SIZE {
+		return None;
+	}
+	if block[0..8] != MAGIC {
+		return None;
+	}
+	if u32::from_le_bytes(block[8..12].try_into().ok()?) != VERSION {
+		return None;
+	}
+	if u32::from_le_bytes(block[12..16].try_into().ok()?) != BLOCK_SIZE as u32 {
+		return None;
+	}
+	// verify the self-CRC by recomputing over the block with its CRC bytes zeroed.
+	let stored = u32::from_le_bytes(block[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].try_into().ok()?);
+	let mut probe = block[..BLOCK_SIZE].to_vec();
+	probe[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].fill(0);
+	if crc32c(&probe) != stored {
+		return None;
+	}
+	Some(Superblock { num_blocks: u64::from_le_bytes(block[16..24].try_into().ok()?), generation: u64::from_le_bytes(block[28..36].try_into().ok()?), inode_root: u64::from_le_bytes(block[36..44].try_into().ok()?), inode_root_crc: u32::from_le_bytes(block[44..48].try_into().ok()?), next_inode: u32::from_le_bytes(block[24..28].try_into().ok()?), root_inode: u32::from_le_bytes(block[52..56].try_into().ok()?), snap_root: u64::from_le_bytes(block[60..68].try_into().ok()?), snap_root_crc: u32::from_le_bytes(block[68..72].try_into().ok()?) })
+}
+

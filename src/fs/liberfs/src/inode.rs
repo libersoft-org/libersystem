@@ -121,7 +121,4 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.inode_root_crc = crc;
 		Ok(())
 	}
-
-	// block allocation (copy-on-write)
-
 }

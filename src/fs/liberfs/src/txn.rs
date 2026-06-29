@@ -479,6 +479,89 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 	}
 
-	// inode I/O
-
 }
+
+// B+tree node accessors. A node block begins with an 8-byte header: a type byte
+// (NODE_LEAF or NODE_INTERNAL) then a u16 entry count at bytes 2..4; the entries follow.
+pub(crate) fn node_type(buf: &[u8]) -> u8 {
+	buf[0]
+}
+
+pub(crate) fn node_count(buf: &[u8]) -> usize {
+	u16::from_le_bytes(buf[2..4].try_into().unwrap()) as usize
+}
+
+pub(crate) fn node_set_header(buf: &mut [u8], typ: u8, count: usize) {
+	for b in buf[..NODE_HDR].iter_mut() {
+		*b = 0;
+	}
+	buf[0] = typ;
+	buf[2..4].copy_from_slice(&(count as u16).to_le_bytes());
+}
+
+// Internal-node separator key `i`: child `i` holds keys below it, child `i + 1` keys at
+// or above it. Separators sit in a fixed region right after the header.
+pub(crate) fn sep_key(buf: &[u8], i: usize) -> u64 {
+	let off = NODE_HDR + i * SEP_SIZE;
+	u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+pub(crate) fn set_sep(buf: &mut [u8], i: usize, key: u64) {
+	let off = NODE_HDR + i * SEP_SIZE;
+	buf[off..off + 8].copy_from_slice(&key.to_le_bytes());
+}
+
+// Internal-node child link `i`: its block pointer and that block's CRC32C. Child links
+// sit in a fixed region after the separators, so offsets do not shift with the count.
+pub(crate) fn child_ptr(buf: &[u8], i: usize) -> u64 {
+	let off = INTERNAL_CHILD_BASE + i * CHILD_SIZE;
+	u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+pub(crate) fn child_crc(buf: &[u8], i: usize) -> u32 {
+	let off = INTERNAL_CHILD_BASE + i * CHILD_SIZE + 8;
+	u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
+
+pub(crate) fn set_child(buf: &mut [u8], i: usize, ptr: u64, crc: u32) {
+	let off = INTERNAL_CHILD_BASE + i * CHILD_SIZE;
+	buf[off..off + 8].copy_from_slice(&ptr.to_le_bytes());
+	buf[off + 8..off + 12].copy_from_slice(&crc.to_le_bytes());
+}
+
+// Compare two leaf keys: the leading u64 numerically (so leaf order matches the numeric
+// routing in internal nodes), then any remaining bytes lexicographically (the name, for
+// a directory record, disambiguating a shared hash). Both slices are one key wide.
+pub(crate) fn key_cmp(a: &[u8], b: &[u8]) -> Ordering {
+	let ka = u64::from_le_bytes(a[0..8].try_into().unwrap());
+	let kb = u64::from_le_bytes(b[0..8].try_into().unwrap());
+	match ka.cmp(&kb) {
+		Ordering::Equal => a[8..].cmp(&b[8..]),
+		other => other,
+	}
+}
+
+// Where to split an overfull leaf's records in two: the midpoint, nudged so two records
+// sharing a u64 key never straddle the split (the parent routes by that key alone, so
+// equal keys must stay in one leaf). Records are unique in the inode tree, so this is the
+// plain midpoint there; in a directory it matters only for an astronomically rare 64-bit
+// hash collision.
+pub(crate) fn leaf_split_point(recs: &[Vec<u8>]) -> usize {
+	let n = recs.len();
+	let key_at = |i: usize| -> u64 { u64::from_le_bytes(recs[i][0..8].try_into().unwrap()) };
+	let mut up = n / 2;
+	while up < n && key_at(up) == key_at(up - 1) {
+		up += 1;
+	}
+	if up < n {
+		return up;
+	}
+	// no key boundary above the midpoint: look below it (only reached when most of the
+	// leaf shares one 64-bit key).
+	let mut down = n / 2;
+	while down > 1 && key_at(down) == key_at(down - 1) {
+		down -= 1;
+	}
+	down
+}
+

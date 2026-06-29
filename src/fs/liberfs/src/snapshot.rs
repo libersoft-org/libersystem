@@ -329,7 +329,4 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		Ok(())
 	}
-
-	// consistency
-
 }

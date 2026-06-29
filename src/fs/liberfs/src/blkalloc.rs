@@ -405,7 +405,148 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		Ok(bad)
 	}
+}
 
-	// path resolution
+pub(crate) fn set_bit(bitmap: &mut [u8], b: u64) {
+	bitmap[(b / 8) as usize] |= 1 << (b % 8);
+}
 
+// Index of the extent covering logical block `lb`, or None if it falls in a hole. The
+// runs are sorted by `logical`, so the candidate is the last one starting at or before
+// `lb`; a binary search keeps lookups cheap on a many-extent file.
+pub(crate) fn find_extent(extents: &[Extent], lb: u64) -> Option<usize> {
+	let pos = extents.partition_point(|e| e.logical <= lb);
+	if pos == 0 {
+		return None;
+	}
+	if extents[pos - 1].covers(lb) { Some(pos - 1) } else { None }
+}
+
+// Hash the 3-byte prefix at `w` into an LZ_HASH_BITS-wide match-finder bucket.
+pub(crate) fn lz_hash(w: &[u8]) -> usize {
+	let v = (w[0] as u32) << 16 | (w[1] as u32) << 8 | w[2] as u32;
+	(v.wrapping_mul(0x9E37_79B1) >> (32 - LZ_HASH_BITS)) as usize
+}
+
+// Record position `i` in the hash chain (most-recent-first) so later positions can find
+// it as a match candidate. `prev` is windowed (LZ_WINDOW entries): within the active
+// window the low bits of a position are unique, and the match walk stops once a candidate
+// is more than a window back, so the wrap never yields a wrong match.
+pub(crate) fn lz_insert(src: &[u8], i: usize, head: &mut [i32], prev: &mut [i32]) {
+	if i + LZ_MIN_MATCH <= src.len() {
+		let h = lz_hash(&src[i..]);
+		prev[i & (LZ_WINDOW - 1)] = head[h];
+		head[h] = i as i32;
+	}
+}
+
+// Compress `src` with the small LZSS coder described at the LZ_* constants: a control
+// byte per eight items, each a literal byte or a (distance, length) back-reference into
+// the 4096-byte sliding window. The stream begins with the uncompressed length, so
+// `lz_decompress` needs no external size. Dependency-free and no_std; the ratio is modest
+// but the format is simple and the decoder trivial, which is what an on-disk filesystem
+// wants. Every candidate match is verified by comparing bytes, so the windowed hash chain
+// only affects the ratio, never correctness.
+pub(crate) fn lz_compress(src: &[u8]) -> Vec<u8> {
+	let n = src.len();
+	let mut out = Vec::with_capacity(n / 2 + 8);
+	out.extend_from_slice(&(n as u32).to_le_bytes());
+	let mut head = vec![-1i32; LZ_HASH_SIZE];
+	let mut prev = vec![-1i32; LZ_WINDOW];
+	let mut i = 0usize;
+	while i < n {
+		let ctrl = out.len();
+		out.push(0u8);
+		let mut flags = 0u8;
+		let mut bit = 0;
+		while bit < 8 && i < n {
+			let (mut best_len, mut best_dist) = (0usize, 0usize);
+			if i + LZ_MIN_MATCH <= n {
+				let mut cand = head[lz_hash(&src[i..])];
+				let mut probes = 0;
+				while cand >= 0 && probes < LZ_MAX_CHAIN {
+					let c = cand as usize;
+					let dist = i - c;
+					if dist > LZ_WINDOW {
+						break;
+					}
+					let max = (n - i).min(LZ_MAX_MATCH);
+					let mut l = 0;
+					while l < max && src[c + l] == src[i + l] {
+						l += 1;
+					}
+					if l > best_len {
+						best_len = l;
+						best_dist = dist;
+						if l == LZ_MAX_MATCH {
+							break;
+						}
+					}
+					cand = prev[c & (LZ_WINDOW - 1)];
+					probes += 1;
+				}
+			}
+			if best_len >= LZ_MIN_MATCH {
+				let dist_code = (best_dist - 1) as u16;
+				out.push((dist_code & 0xFF) as u8);
+				out.push((((dist_code >> 8) as u8) << 4) | (best_len - LZ_MIN_MATCH) as u8);
+				let end = i + best_len;
+				while i < end {
+					lz_insert(src, i, &mut head, &mut prev);
+					i += 1;
+				}
+			} else {
+				flags |= 1 << bit;
+				out.push(src[i]);
+				lz_insert(src, i, &mut head, &mut prev);
+				i += 1;
+			}
+			bit += 1;
+		}
+		out[ctrl] = flags;
+	}
+	out
+}
+
+// Decode a stream produced by `lz_compress` back into its original bytes. Bounds-checked
+// throughout, so a malformed stream yields whatever decoded cleanly rather than panicking
+// (a compressed extent's stored blocks are checksum-verified before this is called).
+pub(crate) fn lz_decompress(src: &[u8]) -> Vec<u8> {
+	if src.len() < 4 {
+		return Vec::new();
+	}
+	let n = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
+	let mut out = Vec::with_capacity(n);
+	let mut p = 4;
+	while out.len() < n && p < src.len() {
+		let flags = src[p];
+		p += 1;
+		let mut bit = 0;
+		while bit < 8 && out.len() < n {
+			if flags & (1 << bit) != 0 {
+				if p >= src.len() {
+					return out;
+				}
+				out.push(src[p]);
+				p += 1;
+			} else {
+				if p + 1 >= src.len() {
+					return out;
+				}
+				let dist = (((src[p + 1] >> 4) as usize) << 8 | src[p] as usize) + 1;
+				let len = (src[p + 1] & 0x0F) as usize + LZ_MIN_MATCH;
+				p += 2;
+				if dist > out.len() {
+					return out;
+				}
+				let start = out.len() - dist;
+				for k in 0..len {
+					let byte = out[start + k];
+					out.push(byte);
+				}
+			}
+			bit += 1;
+		}
+	}
+	out
 }
