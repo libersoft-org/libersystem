@@ -116,6 +116,17 @@ An opaque kernel object, transferred as `handle<file>`.
 | `koid` | `u64` |
 | `name` | `string` |
 
+### resource `task`
+
+An opaque kernel object, transferred as `handle<task>`.
+
+### record `start-result`
+
+| field | type |
+| --- | --- |
+| `task` | `handle<task>` |
+| `info` | `process-info` |
+
 ### record `config-entry`
 
 | field | type |
@@ -382,6 +393,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | --- | --- | --- |
 | 1 | `start` | `start(name: string) -> result<process-info, error>` |
 | 2 | `list` | `list() -> result<list<process-info>, error>` |
+| 3 | `launch` | `launch(name: string, bootstrap: handle<channel>) -> result<start-result, error>` |
 
 ### interface `config`
 

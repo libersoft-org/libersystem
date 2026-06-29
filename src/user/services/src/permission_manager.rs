@@ -2,13 +2,17 @@
 //
 // PermissionManager is the policy over the kernel's capability mechanism. ServiceManager
 // starts it from the init package and hands it the clients it is allowed to grant onward
-// (a StorageService, a LogService, and a NetworkService client), the init package (so it
-// can launch the components it governs), and a "SERVE" channel its clients reach it on.
+// (a StorageService, a LogService, and a NetworkService client), a ProcessService client
+// (the loading mechanism it drives to start the components it governs), and a "SERVE"
+// channel its clients reach it on. It never loads a program itself - it reaches the kernel
+// loader only through ProcessService, so mechanism (loading) and policy (granting) live in
+// separate services and no one service can both load a program and reach every capability.
 //
 // Its policy is a typed permission manifest per component - a `Manifest` of `Capability`
 // grants, the typed source of truth for what a component may be given (never a text or
-// JSON file). When it launches a component it grants that component exactly its manifest's
-// capabilities and nothing else - the strict app sandbox - and records every decision
+// JSON file). When it launches a component it asks ProcessService to start it with a fresh
+// bootstrap channel, then grants that component exactly its manifest's capabilities over
+// that channel and nothing else - the strict app sandbox - and records every decision
 // (grant or denial) in an audit trail. Over the SERVE channel callers speak the generated
 // `liber:system` Permission bindings: `lookup` returns a component's manifest, `audit`
 // returns the trail.
@@ -27,7 +31,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::system::permission::{self, Service};
-use proto::system::{AuditEntry, Capability, Error, Manifest};
+use proto::system::{process, AuditEntry, Capability, Error, Manifest};
 use rt::*;
 
 // The governed component this milestone launches, and the rights a granted client is
@@ -93,21 +97,29 @@ impl Service for Manager {
 	}
 }
 
-// Launch a component under its permission manifest: look it up in the init package, spawn
-// it with a fresh bootstrap channel, then for every capability in the vocabulary grant the
-// held client if the manifest lists it (recording the grant) or withhold it (recording the
-// denial). The component receives exactly its manifest's capabilities, in vocabulary order,
-// and can reach nothing else - the sandbox. Returns the bytes the component reported back
-// (its proof the granted storage capability is live), or None if the launch failed.
-unsafe fn launch_under_manifest(package: &Package, component: &[u8], clients: &Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Option<Vec<u8>> {
+// Launch a component under its permission manifest: ask ProcessService (the loading
+// mechanism) to start it with a fresh bootstrap channel, then for every capability in the
+// vocabulary grant the held client if the manifest lists it (recording the grant) or
+// withhold it (recording the denial). The component receives exactly its manifest's
+// capabilities, in vocabulary order, and can reach nothing else - the sandbox. Returns the
+// bytes the component reported back (its proof the granted storage capability is live), or
+// None if the launch failed.
+unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Option<Vec<u8>> {
 	unsafe {
 		let manifest: Manifest = manifest_for(component)?;
-		let elf: &[u8] = package.lookup(component)?;
 		let (manager_side, child_side): (u64, u64) = channel()?;
-		let proc: i64 = spawn(elf, child_side);
-		if proc < 0 {
-			return None;
-		}
+		// Hand the child end to ProcessService, which loads the component and starts it with
+		// that end as its bootstrap; the manager keeps `manager_side` to grant over. The
+		// returned process handle is the manager's job-control handle on the component.
+		let name: String = String::from_utf8_lossy(component).into_owned();
+		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
+		let task: u64 = match process_client.launch(&name, &child_side) {
+			Some(Ok(started)) => started.task,
+			_ => {
+				close(manager_side);
+				return None;
+			}
+		};
 		// Grant exactly the manifest's capabilities, auditing every decision. A granted
 		// client is duplicated (the manager keeps its own) with only the rights a client
 		// needs, then transferred under its tag; a withheld capability is recorded denied
@@ -118,7 +130,7 @@ unsafe fn launch_under_manifest(package: &Package, component: &[u8], clients: &C
 				let dup: i64 = duplicate(clients.for_capability(cap), GRANT_RIGHTS);
 				if dup < 0 || !send_blocking(manager_side, tag_for(cap), dup as u64) {
 					close(manager_side);
-					close(proc as u64);
+					close(task);
 					return None;
 				}
 			}
@@ -131,7 +143,7 @@ unsafe fn launch_under_manifest(package: &Package, component: &[u8], clients: &C
 			Received::Closed => None,
 		};
 		close(manager_side);
-		close(proc as u64);
+		close(task);
 		result
 	}
 }
@@ -157,22 +169,21 @@ fn summarize(audit: &[AuditEntry]) -> Vec<u8> {
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 512] = [0u8; 512];
 
-	// 1. receive the grantable clients the manager may hand onward, then the init package
-	//    it launches governed components from. A client the supervisor does not grant
-	//    arrives as 0 (the manager simply cannot grant what it does not hold).
+	// 1. receive the grantable clients the manager may hand onward, then the ProcessService
+	//    client it drives to load the components it governs. A client the supervisor does not
+	//    grant arrives as 0 (the manager simply cannot grant what it does not hold).
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or(0);
 	let log: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or(0);
 	let network: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NETWORK") }.unwrap_or(0);
 	let clients: Clients = Clients { log, storage, network };
-	let (_pkg_handle, archive): (u64, &[u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| exit());
-	let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
+	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
 
 	// 2. wait for the serve channel clients reach us on.
 	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
 
 	// 3. launch the governed component under its manifest, building the audit trail.
 	let mut audit: Vec<AuditEntry> = Vec::new();
-	let read_back: Vec<u8> = unsafe { launch_under_manifest(&package, PROBE_NAME, &clients, &mut audit, &mut buf) }.unwrap_or_default();
+	let read_back: Vec<u8> = unsafe { launch_under_manifest(procsvc, PROBE_NAME, &clients, &mut audit, &mut buf) }.unwrap_or_default();
 
 	// 4. report in to the supervisor, then relay the sandbox proof: the bytes the
 	//    sandboxed component read through its one granted storage capability, and the

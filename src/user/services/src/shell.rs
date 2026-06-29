@@ -21,6 +21,10 @@ use rt::*;
 // the file the shell reads at startup to prove the StorageService round-trip works
 const SELF_CHECK_URI: &[u8] = b"vol://system/hello.txt";
 
+// the working directory the shell starts in - the persistent system volume, so the
+// prompt sits in real storage and relative paths resolve against it
+const DEFAULT_CWD: &str = "vol://system";
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
@@ -154,6 +158,7 @@ fn print_banner(lines: &[&str]) {
 unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, buf: &mut [u8]) {
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control);
+		let mut cwd: String = String::from(DEFAULT_CWD);
 		loop {
 			let n: usize = match recv_blocking(console, buf) {
 				Received::Message { len, .. } => len,
@@ -167,11 +172,14 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			// The terminal delivers a whole submitted line (with a trailing newline);
 			// trim it, dispatch it, reap finished jobs, and print the next prompt.
 			let line: &[u8] = trim(&buf[..n]);
-			if dispatch(line, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, package, &mut jobs) {
+			if dispatch(line, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, package, &mut jobs, &mut cwd) {
 				return;
 			}
 			reap_jobs(&mut jobs);
-			print(b"\x1b[1;32m> \x1b[0m");
+			// the prompt shows the current working directory, so it sits in real storage.
+			print(b"\x1b[1;32m");
+			print(cwd.as_bytes());
+			print(b"> \x1b[0m");
 		}
 	}
 }
@@ -477,7 +485,7 @@ unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, jobs: &mut Jobs) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, package: &Package, jobs: &mut Jobs, cwd: &mut String) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -534,7 +542,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			print(b"  echo <text>      print text\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
 			print(b"  lsvol            list the available volumes via StorageService\n");
-			print(b"  ls <vol://vol>   list a directory's entries via StorageService\n");
+			print(b"  cd [<path>]      change the working directory (no argument returns home)\n");
+			print(b"  ls [<path>]      list a directory's entries (the working directory by default)\n");
 			print(b"  write <vol://...> <text>  create or overwrite a file via StorageService\n");
 			print(b"  rm <vol://...>   delete a file via StorageService\n");
 			print(b"  mkdir <vol://...>  create a directory via StorageService\n");
@@ -731,20 +740,38 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			lsvol_cmd(storage, media, iso, udf);
 			return false;
 		}
+		if line == b"cd" {
+			// no argument returns to the home volume
+			cwd.clear();
+			cwd.push_str(DEFAULT_CWD);
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"cd ") {
+			cd_cmd(cwd, trim(rest), storage, media, iso, udf);
+			return false;
+		}
 		if line == b"ls" {
-			print(b"usage: ls <vol://...>\n");
+			// no argument lists the current working directory
+			ls_cmd(storage, media, iso, udf, cwd.as_bytes());
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"ls ") {
-			ls_cmd(storage, media, iso, udf, trim(rest));
+			match resolve_path(cwd, trim(rest)) {
+				Some(uri) => ls_cmd(storage, media, iso, udf, uri.as_bytes()),
+				None => print(b"ls: invalid path\n"),
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"cat ") {
-			let uri = trim(rest);
-			if !cat(storage_for(uri, storage, media, iso, udf), uri) {
-				print(b"cat: could not read ");
-				print(uri);
-				print(b"\n");
+			match resolve_path(cwd, trim(rest)) {
+				Some(uri) => {
+					if !cat(storage_for(uri.as_bytes(), storage, media, iso, udf), uri.as_bytes()) {
+						print(b"cat: could not read ");
+						print(uri.as_bytes());
+						print(b"\n");
+					}
+				}
+				None => print(b"cat: invalid path\n"),
 			}
 			return false;
 		}
@@ -752,24 +779,33 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			let rest = trim(rest);
 			// "write <uri> <text>": split on the first space.
 			match rest.iter().position(|&b: &u8| b == b' ') {
-				Some(sp) => write_cmd(storage_for(&rest[..sp], storage, media, iso, udf), &rest[..sp], trim(&rest[sp + 1..])),
+				Some(sp) => match resolve_path(cwd, trim(&rest[..sp])) {
+					Some(uri) => write_cmd(storage_for(uri.as_bytes(), storage, media, iso, udf), uri.as_bytes(), trim(&rest[sp + 1..])),
+					None => print(b"write: invalid path\n"),
+				},
 				None => print(b"usage: write <vol://...> <text>\n"),
 			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"rm ") {
-			let uri = trim(rest);
-			rm_cmd(storage_for(uri, storage, media, iso, udf), uri);
+			match resolve_path(cwd, trim(rest)) {
+				Some(uri) => rm_cmd(storage_for(uri.as_bytes(), storage, media, iso, udf), uri.as_bytes()),
+				None => print(b"rm: invalid path\n"),
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"mkdir ") {
-			let uri = trim(rest);
-			mkdir_cmd(storage_for(uri, storage, media, iso, udf), uri);
+			match resolve_path(cwd, trim(rest)) {
+				Some(uri) => mkdir_cmd(storage_for(uri.as_bytes(), storage, media, iso, udf), uri.as_bytes()),
+				None => print(b"mkdir: invalid path\n"),
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"rmdir ") {
-			let uri = trim(rest);
-			rmdir_cmd(storage_for(uri, storage, media, iso, udf), uri);
+			match resolve_path(cwd, trim(rest)) {
+				Some(uri) => rmdir_cmd(storage_for(uri.as_bytes(), storage, media, iso, udf), uri.as_bytes()),
+				None => print(b"rmdir: invalid path\n"),
+			}
 			return false;
 		}
 		if line == b"snap" || line == b"snap list" {
@@ -1625,7 +1661,85 @@ fn storage_for(uri: &[u8], storage: u64, media: u64, iso: u64, udf: u64) -> u64 
 	}
 }
 
-// Create or overwrite a file on the volume via the StorageService `write` op. The
+// Split a "vol://<volume>[/<tail>]" URI into its volume name and the remaining path
+// (without the leading slash). Returns None if the "vol://" scheme is missing.
+fn split_vol(uri: &[u8]) -> Option<(&[u8], &[u8])> {
+	let rest: &[u8] = uri.strip_prefix(b"vol://")?;
+	match rest.iter().position(|&b: &u8| b == b'/') {
+		Some(slash) => Some((&rest[..slash], &rest[slash + 1..])),
+		None => Some((rest, b"")),
+	}
+}
+
+// Normalize a '/'-separated path onto `segs`: empty and "." segments are dropped and
+// ".." pops the last segment (a no-op at the root), so the result stays clean.
+fn push_segments<'a>(tail: &'a [u8], segs: &mut Vec<&'a [u8]>) {
+	for seg in tail.split(|&b: &u8| b == b'/') {
+		if seg.is_empty() || seg == b"." {
+			continue;
+		}
+		if seg == b".." {
+			segs.pop();
+			continue;
+		}
+		segs.push(seg);
+	}
+}
+
+// Resolve a user-supplied path against the current working directory. An argument
+// that starts with "vol://" is absolute and starts fresh at its own volume; anything
+// else is relative and extends the cwd. The result is always a clean, normalized
+// "vol://<volume>[/<seg>...]" URI; returns None if the path is malformed (missing
+// scheme or volume, or non-UTF-8) so the caller can report it.
+fn resolve_path(cwd: &str, arg: &[u8]) -> Option<String> {
+	let arg: &[u8] = trim(arg);
+	let absolute: bool = arg.starts_with(b"vol://");
+	let base: &[u8] = if absolute { arg } else { cwd.as_bytes() };
+	let (volume, base_tail) = split_vol(base)?;
+	if volume.is_empty() {
+		return None;
+	}
+	let mut segs: Vec<&[u8]> = Vec::new();
+	push_segments(base_tail, &mut segs);
+	if !absolute {
+		push_segments(arg, &mut segs);
+	}
+	let mut out: String = String::from("vol://");
+	out.push_str(core::str::from_utf8(volume).ok()?);
+	for seg in segs {
+		out.push('/');
+		out.push_str(core::str::from_utf8(seg).ok()?);
+	}
+	Some(out)
+}
+
+// Change the working directory. The target is resolved against the current cwd and
+// must be an existing directory, which we confirm by listing it through the owning
+// StorageService; only then does the prompt move there.
+unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], storage: u64, media: u64, iso: u64, udf: u64) {
+	unsafe {
+		let target: String = match resolve_path(cwd, arg) {
+			Some(t) => t,
+			None => {
+				print(b"cd: invalid path\n");
+				return;
+			}
+		};
+		let chan: u64 = storage_for(target.as_bytes(), storage, media, iso, udf);
+		let mut client = volume::Client::new(ChannelTransport { chan });
+		match client.list(&target) {
+			Some(Ok(_)) => {
+				cwd.clear();
+				cwd.push_str(&target);
+			}
+			_ => {
+				print(b"cd: not a directory: ");
+				print(target.as_bytes());
+				print(b"\n");
+			}
+		}
+	}
+}
 // text is staged in a fresh read-only shared buffer and handed over out-of-band as a
 // zero-copy `buffer`; the service writes it to the on-disk filesystem, so it survives
 // a reboot.

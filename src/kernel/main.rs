@@ -634,13 +634,14 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 }
 
 // Build the M38 permission topology and run it to completion. A StorageService serves
-// the ramdisk volume; the permission_manager (PermissionManager) is given the clients it
-// may grant onward - a duplicable StorageService client and a duplicable (but dead-peer)
-// LogService client - plus a NetworkService client it holds but is NOT to grant, the init
-// package, and the channel its clients reach it on. PermissionManager launches its one
-// governed component, sandbox_probe, under a typed permission manifest that grants storage
-// and log but not network: it transfers exactly those two clients to the probe and
-// withholds the network one, recording every decision. The sandboxed probe reaches only
+// the ramdisk volume; a ProcessService is the loading mechanism; the permission_manager
+// (PermissionManager) is given the clients it may grant onward - a duplicable StorageService
+// client and a duplicable (but dead-peer) LogService client - plus a NetworkService client
+// it holds but is NOT to grant, a ProcessService client it drives to load components, and
+// the channel its clients reach it on. PermissionManager launches its one governed
+// component, sandbox_probe, through ProcessService under a typed permission manifest that
+// grants storage and log but not network: it transfers exactly those two clients to the probe
+// and withholds the network one, recording every decision. The sandboxed probe reaches only
 // its granted capabilities - it reads its one granted file vol://system/hello.txt through
 // the storage grant and reports the bytes back. The kernel only brokers the initial
 // capabilities. Returns (expected, read_back, summary): the file straight from the volume,
@@ -655,11 +656,14 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let init = init_package_bytes().ok_or("init package module not found")?;
 	let expected = volume_file(volume, b"hello.txt")?;
 	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
+	let process_elf = package.lookup(b"process_service").ok_or("process_service missing from the init package")?;
 	let pm_elf = package.lookup(b"permission_manager").ok_or("permission_manager missing from the init package")?;
 
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
+	let (process_boot_kernel, process_boot_user) = Channel::create();
 	let (pm_boot_kernel, pm_boot_user) = Channel::create();
 	let (storage_server, storage_client) = Channel::create();
+	let (process_server, process_client) = Channel::create();
 	let (perm_server, _perm_client) = Channel::create();
 	// The manager's log grant: a real, duplicable client whose service peer is dropped, so
 	// the sandboxed probe's best-effort log emit fails fast instead of blocking (no
@@ -671,19 +675,26 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
+	loader::spawn_elf_process(domain.clone(), process_elf, process_boot_user, Rights::ALL, 0).map_err(|_| "failed to load ProcessService")?;
 	loader::spawn_elf_process(domain, pm_elf, pm_boot_user, Rights::ALL, 0).map_err(|_| "failed to load PermissionManager")?;
 
 	// StorageService: the ramdisk volume and its service channel.
 	send_ramdisk(&storage_boot_kernel, volume)?;
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL)?;
 
+	// ProcessService: the init package (to load the probe from) and its service channel.
+	// PermissionManager drives it to load the component it governs - the loading mechanism,
+	// kept separate from the granting policy.
+	send_package(&process_boot_kernel, init)?;
+	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL)?;
+
 	// PermissionManager: the grantable clients (storage + log, both duplicable), a network
-	// client it withholds, the init package (to launch the probe from), and the channel its
-	// clients reach it on. The order matches PermissionManager's receive order.
+	// client it withholds, the ProcessService client it drives to load the probe, and the
+	// channel its clients reach it on. The order matches PermissionManager's receive order.
 	send_cap(&pm_boot_kernel, b"STORAGE", storage_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"LOG", log_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"NETWORK", net_client, Rights::ALL)?;
-	send_package(&pm_boot_kernel, init)?;
+	send_cap(&pm_boot_kernel, b"PROCESS", process_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"SERVE", perm_server, Rights::ALL)?;
 
 	sched::run_until_idle();
