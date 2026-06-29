@@ -967,6 +967,47 @@ to the root directory and read files, no allocation or write path.
 - Done when: a UDF volume mounts behind the Volume API and the shell lists and reads files off it, tests green - DVD / Blu-ray media is readable through the same typed `Storage.Volume`.
 - Concept: Native filesystem (the supported-compatible-FS backends - ISO9660 / UDF among them - behind the unified Volume API), the layering principle (a `driver.fs.*` service; multiple FS backends behind one Volume API), M48 / M58 (the FAT / ISO9660 backends and the `BlockDevice` trait this reuses).
 
+## M61 - USB stack (xHCI + HID + mass storage)
+
+The platform has no USB: an xHCI host controller driver, device enumeration over
+the bus, and the two classes that matter for an appliance - HID (keyboard) and
+mass storage. Mass-storage exposes a `BlockDevice` so a USB stick mounts through
+the same Volume API as the virtio disks, and HID feeds the existing console input.
+
+- [ ] An `xhci` driver: probe the PCI xHCI function, set up command / event rings, reset and enumerate attached devices (descriptors, addressing).
+- [ ] USB HID keyboard behind the existing console input path so a USB keyboard works in the shell.
+- [ ] USB mass storage (Bulk-Only Transport / SCSI) as a `BlockDevice`, so a USB stick mounts as a `vol://` volume through M48 / the FAT backend.
+- [ ] Host-testable transfer/enumeration logic plus a live QEMU pass with a `qemu` xHCI controller and emulated keyboard / mass-storage device.
+- Done when: a USB keyboard types into the shell and a USB mass-storage device mounts and lists files, tests green - USB is a first-class bus behind the device/Volume APIs.
+- Concept: The layering principle (a `driver.usb.*` service; classes behind one bus), the device inventory (DeviceService gains USB nodes), M48 (the FAT backend and `BlockDevice` trait the mass-storage class reuses).
+
+## M62 - Hardware inventory commands (lsblk / lspci / lscpu / ...)
+
+The shell can show services, devices and the system graph, but there is no
+Linux-style HW inventory: a quick look at PCI, block devices, CPUs, IRQs and
+memory. These are thin read-only views over what the kernel and DeviceService
+already know (the PCI scan, virtio devices, SMP core set, APIC vectors, the frame
+allocator and heap), surfaced as a consistent `ls*` family next to `lsvol`. Like
+every other command, each is purely a CLI rendering of data the system already
+exposes over its service ABI (DeviceService / SystemGraphService / ResourceManager)
+- no command pokes hardware or the kernel directly; where the info is missing, the
+owning service gains a typed query first.
+
+- [ ] `lspci`: enumerate the PCI bus (bus:dev.fn, vendor/device, class, the virtio-blk / net / sound / gpu functions) - the same scan the drivers bind against.
+- [ ] `lsblk`: list block devices and their mounted volumes (the four virtio-blk disks, size, and `vol://system|media|iso|udf`).
+- [ ] `lscpu`: report the architecture, online core count (SMP) and APIC ids.
+- [ ] `free`: memory total / used / free from the frame allocator and heap, with human-readable units (`-h`) like Linux.
+- [ ] `lsmem`: the physical memory map - the Limine memmap regions (usable / reserved / ACPI), their ranges and sizes, complementing `free`.
+- [ ] `lsdev`: the device inventory (fold the existing `dev` into the `ls*` family or alias it).
+- [ ] `lssvc`: registered system services and their state (drivers are services too, so they list here; an optional filter narrows to `driver.*`) - a filtered view of the processes shown by `ps`.
+- [ ] `lsirq`: the APIC / IRQ vectors and their virtio MSI-X mappings.
+- [ ] `lsusb`: enumerate USB devices off the M61 stack (xHCI keyboard / mass storage).
+- [ ] `dmesg`: the kernel ring-buffer log.
+- [ ] `uname`: architecture, kernel name and version string.
+- [ ] `uptime`: time since boot from the system clock.
+- Done when: each command prints a stable inventory in the shell (and where useful a `--json` form), tests green - the HW resources are inspectable from the CLI.
+- Concept: Observability (a local, human- and machine-readable view of the live system), the layering principle (read-only views over DeviceService / the kernel, no new privilege), M50 / M61 (the DeviceService, System Graph and USB stack these extend).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
