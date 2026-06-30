@@ -103,6 +103,8 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"log" => Some(Manifest { component: String::from("log"), grants: alloc::vec![Capability::Log, Capability::Time] }),
 		b"snap" => Some(Manifest { component: String::from("snap"), grants: alloc::vec![Capability::Storage] }),
 		b"dev" => Some(Manifest { component: String::from("dev"), grants: alloc::vec![Capability::Device] }),
+		b"config" => Some(Manifest { component: String::from("config"), grants: alloc::vec![Capability::Config] }),
+		b"set" => Some(Manifest { component: String::from("set"), grants: alloc::vec![Capability::Config] }),
 		_ => None,
 	}
 }

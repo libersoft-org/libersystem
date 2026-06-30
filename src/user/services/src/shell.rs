@@ -691,15 +691,30 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"config" {
-			query_config(cfgsvc);
+			// Launch `config` as its own sandboxed ELF through PermissionManager (the launcher /
+			// granter), which grants it a config client and forwards it this terminal and the
+			// sub-form argument. A shell with no PermissionManager (a non-primary VT) queries the
+			// store inline instead.
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"config", b"");
+			if !launched {
+				query_config(cfgsvc);
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"config ") {
-			get_config(cfgsvc, trim(rest));
+			let key: &[u8] = trim(rest);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"config", key);
+			if !launched {
+				get_config(cfgsvc, key);
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"set ") {
-			set_config(cfgsvc, trim(rest));
+			let args: &[u8] = trim(rest);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"set", args);
+			if !launched {
+				set_config(cfgsvc, args);
+			}
 			return false;
 		}
 		if line == b"date" {

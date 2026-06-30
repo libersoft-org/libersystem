@@ -53,6 +53,14 @@ name = "dev"
 path = "src/dev.rs"
 
 [[bin]]
+name = "config"
+path = "src/config.rs"
+
+[[bin]]
+name = "set"
+path = "src/set.rs"
+
+[[bin]]
 name = "ping"
 path = "src/ping.rs"
 
