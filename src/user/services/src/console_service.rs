@@ -488,6 +488,7 @@ struct Factories {
 	net: u64,
 	time: u64,
 	audio: u64,
+	session: u64,
 }
 
 // The whole console session: the framebuffer it owns, the kernel keystroke channel, the
@@ -626,6 +627,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let config: u64 = recv_tagged(bootstrap, &mut buf, b"FCONFIG").unwrap_or_else(|| exit());
 		let time: u64 = recv_tagged(bootstrap, &mut buf, b"FTIME").unwrap_or_else(|| exit());
 		let audio: u64 = recv_tagged(bootstrap, &mut buf, b"FAUDIO").unwrap_or_else(|| exit());
+		// The SessionService factory, from which a fresh per-VT session is minted for each
+		// additional virtual terminal. Received right after FAUDIO to match the supervisor's
+		// send order.
+		let session: u64 = recv_tagged(bootstrap, &mut buf, b"FSESSION").unwrap_or_else(|| exit());
 		let net: u64 = recv_tagged(bootstrap, &mut buf, b"FNET").unwrap_or_else(|| exit());
 		// The gpu driver's display channel (0 = no virtio-gpu device; a 0 handle is valid
 		// here, unlike the tagged factories above, so we do not use recv_tagged).
@@ -679,7 +684,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(bootstrap, b"ConsoleService: online", 0);
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
-		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio };
+		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session };
 		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, package, pointer, clipboard: Vec::new(), ptr_buttons: 0 };
 		run(&mut console);
 	}
@@ -1568,6 +1573,12 @@ unsafe fn spawn_shell(facs: &Factories, package: &Package, shell_console: u64, s
 			Some(h) => h,
 			None => return false,
 		};
+		// A fresh per-VT session: this VT's shell owns it and keeps its cwd for the VT's
+		// lifetime (the VT is torn down on logout, so there is no shell restart to outlive).
+		let session: u64 = match service_connect(facs.session) {
+			Some(h) => h,
+			None => return false,
+		};
 		let mut net = network::Client::new(ChannelTransport { chan: facs.net });
 		let net_client: u64 = match net.open() {
 			Some(Ok(h)) => h,
@@ -1596,6 +1607,8 @@ unsafe fn spawn_shell(facs: &Factories, package: &Package, shell_console: u64, s
 		send_blocking(boot_parent, b"GRAPH", 0);
 		send_blocking(boot_parent, b"PERM", 0);
 		send_blocking(boot_parent, b"RESOURCE", 0);
+		// This VT's session, sent right after RESOURCE to match the shell's receive order.
+		send_blocking(boot_parent, b"SESSION", session);
 		send_blocking(boot_parent, b"CONSOLE", shell_console);
 		send_blocking(boot_parent, b"CONTROL", shell_control);
 		// wait for the shell to self-check storage and report in, then drop its bootstrap.

@@ -15,7 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{audio, config, device, input, log, network, permission, process, resources, system_graph, time, volume, AuditEntry, Budget, Component, ConfigEntry, DeviceEntry, Entry, FileKind, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan};
+use proto::system::{audio, config, device, input, log, network, permission, process, resources, session, system_graph, time, volume, AuditEntry, Budget, Component, ConfigEntry, DeviceEntry, Entry, FileKind, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -71,6 +71,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// (memory, handles, threads, IPC queue, DMA - used and limit) and renders them as CLI
 	// / JSON. Sent right after PERM, matching ServiceManager's send order.
 	let ressvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"RESOURCE") }.unwrap_or(0);
+	// The session (SessionService) the shell runs under: the long-lived owner of the
+	// working directory (and, later, the environment). `cd` round-trips to it and the
+	// prompt reads its cwd, so the cwd survives a shell restart - the supervisor keeps the
+	// session and hands each (re)started shell a fresh capability to the same one. Sent
+	// right after RESOURCE, matching both spawn paths; 0 on a minimal boot with no session.
+	let session: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SESSION") }.unwrap_or(0);
 	// The console channel to ConsoleService: the shell writes its output to it (routed
 	// via stdout) and reads its keystrokes from it. The userspace terminal renders the
 	// output and forwards the input, so the shell talks to the console, not the kernel.
@@ -99,7 +105,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    become the interactive console and run the read-eval-print loop.
 	print_motd();
 	unsafe {
-		repl(console, control, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, &mut buf);
+		repl(console, control, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, session, adminsvc, &mut buf);
 	}
 	exit();
 }
@@ -155,10 +161,21 @@ fn print_banner(lines: &[&str]) {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, buf: &mut [u8]) {
+unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, session: u64, adminsvc: u64, buf: &mut [u8]) {
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control);
-		let mut cwd: String = String::from(DEFAULT_CWD);
+		// The cwd is owned by the session (so it survives a shell restart); read it once at
+		// startup, then keep a local cache so the prompt and path resolution need no IPC
+		// round-trip each line. `cd` updates the session and refreshes this cache. With no
+		// session (a minimal boot) the cwd is local-only and starts at the default volume.
+		let mut cwd: String = if session != 0 {
+			match session::Client::new(ChannelTransport { chan: session }).cwd() {
+				Some(Ok(c)) => c,
+				_ => String::from(DEFAULT_CWD),
+			}
+		} else {
+			String::from(DEFAULT_CWD)
+		};
 		loop {
 			let n: usize = match recv_blocking(console, buf) {
 				Received::Message { len, .. } => len,
@@ -172,7 +189,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			// The terminal delivers a whole submitted line (with a trailing newline);
 			// trim it, dispatch it, reap finished jobs, and print the next prompt.
 			let line: &[u8] = trim(&buf[..n]);
-			if dispatch(line, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, adminsvc, &mut jobs, &mut cwd) {
+			if dispatch(line, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, session, adminsvc, &mut jobs, &mut cwd) {
 				return;
 			}
 			reap_jobs(&mut jobs);
@@ -485,7 +502,7 @@ unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, adminsvc: u64, jobs: &mut Jobs, cwd: &mut String) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, session: u64, adminsvc: u64, jobs: &mut Jobs, cwd: &mut String) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -851,10 +868,13 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// no argument returns to the home volume
 			cwd.clear();
 			cwd.push_str(DEFAULT_CWD);
+			if session != 0 {
+				let _ = session::Client::new(ChannelTransport { chan: session }).chdir(DEFAULT_CWD);
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"cd ") {
-			cd_cmd(cwd, trim(rest), storage, media, iso, udf);
+			cd_cmd(cwd, trim(rest), session, storage, media, iso, udf);
 			return false;
 		}
 		if line == b"ls" {
@@ -1988,7 +2008,7 @@ fn resolve_path(cwd: &str, arg: &[u8]) -> Option<String> {
 // Change the working directory. The target is resolved against the current cwd and
 // must be an existing directory, which we confirm by listing it through the owning
 // StorageService; only then does the prompt move there.
-unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], storage: u64, media: u64, iso: u64, udf: u64) {
+unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], session: u64, storage: u64, media: u64, iso: u64, udf: u64) {
 	unsafe {
 		let target: String = match resolve_path(cwd, arg) {
 			Some(t) => t,
@@ -2003,6 +2023,11 @@ unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], storage: u64, media: u64, iso: u6
 			Some(Ok(_)) => {
 				cwd.clear();
 				cwd.push_str(&target);
+				// Persist the new cwd in the session so it outlives this shell; the local
+				// cache above is what the prompt and path resolution read each line.
+				if session != 0 {
+					let _ = session::Client::new(ChannelTransport { chan: session }).chdir(&target);
+				}
 			}
 			_ => {
 				print(b"cd: not a directory: ");

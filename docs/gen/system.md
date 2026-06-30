@@ -518,3 +518,12 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 1 | `usage` | `usage() -> result<list<budget>, error>` |
 | 2 | `set-limit` | `set-limit(name: string, kind: resource-kind, limit: u64) -> result<budget, error>` |
 
+### interface `session`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `cwd` | `cwd() -> result<string, error>` |
+| 2 | `chdir` | `chdir(path: string) -> result<unit, error>` |
+

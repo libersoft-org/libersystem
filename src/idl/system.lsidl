@@ -572,4 +572,17 @@ interface resources {
 	@op(2) set-limit: func(name: string, kind: resource-kind, limit: u64) -> result<budget, error>;
 }
 
+// The SessionService contract: a login session is a long-lived object owning the
+// working directory (and, in later phases, the environment and the job table), so the
+// shell and the tools it runs are clients of the session rather than its owner. A shell
+// logout or restart leaves the session - its cwd - intact, because SessionService, not
+// the shell, holds it. Each client reaches its own session over a dedicated channel (the
+// session capability the spawner mints and hands it); `cwd` reads the working directory
+// and `chdir` moves it (the caller resolves and validates the path against the volume
+// first, so the session is pure state and reaches no filesystem).
+interface session {
+	@op(1) cwd:   func() -> result<string, error>;
+	@op(2) chdir: func(path: string) -> result<unit, error>;
+}
+
 

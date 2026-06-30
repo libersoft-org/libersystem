@@ -65,6 +65,10 @@ name = "resource_manager"
 path = "src/resource_manager.rs"
 
 [[bin]]
+name = "session_service"
+path = "src/session_service.rs"
+
+[[bin]]
 name = "watchdog_probe"
 path = "src/watchdog_probe.rs"
 

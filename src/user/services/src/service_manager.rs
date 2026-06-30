@@ -43,7 +43,7 @@ struct Service {
 
 // The number of managed services. (A fixed size keeps the state array on the
 // stack, which a no_std program with no heap needs.)
-const N: usize = 18;
+const N: usize = 19;
 
 // The core service manifest. The array order is deliberately NOT the start order:
 // DeviceManager, StorageService, and the shell are listed before LogService, but
@@ -53,7 +53,7 @@ const N: usize = 18;
 // component it observes (so it holds their process handles for the live graph), and
 // the shell is the last component up: it depends on StorageService (which it talks to
 // over IPC) and on SystemGraphService (whose graph its `graph` command renders).
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"media_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"network_service", b"time_service", b"config_service", b"device_service", b"audio_service", b"process_service", b"resource_manager"] }, Service { name: b"resource_manager", deps: &[b"log_service"] }];
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"media_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service", b"session_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service", b"session_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"network_service", b"time_service", b"config_service", b"device_service", b"audio_service", b"process_service", b"resource_manager"] }, Service { name: b"resource_manager", deps: &[b"log_service"] }, Service { name: b"session_service", deps: &[b"log_service"] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -184,6 +184,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The ResourceManager service-channel client end, kept after ResourceManager
 	// bootstraps and later handed to the shell for its `usage` command.
 	let mut res_client: u64 = 0;
+	// The SessionService service-channel client end (the session factory), kept after
+	// SessionService bootstraps and handed to ConsoleService (so it can mint a session
+	// per VT it spawns); the shell's VT 1 session is minted from it into `session1`.
+	let mut session_client: u64 = 0;
+	// VT 1's session channel, minted once from the session factory and reused across
+	// every restart of the VT 1 shell: the supervisor holds it, so the session - and thus
+	// the cwd - survives a shell crash / restart. A fresh duplicate is handed to each
+	// shell the supervisor (re)starts.
+	let mut session1: u64 = 0;
 	// The admin channel the shell drives `stop <service>` over (the supervisor keeps the
 	// server end), and the channel SystemGraphService queries the `supervisor` interface
 	// on (the supervisor serves it). Both are minted when the shell and SystemGraphService
@@ -202,7 +211,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut media_client, &mut iso_client, &mut udf_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut admin_server, &mut admin_server2, &mut stats_server, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut media_client, &mut iso_client, &mut udf_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -348,7 +357,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		// media_storage is a second instance of the storage_service binary, mounting the
 		// FAT disk as vol://media instead of the writable system disk; iso_storage is a
@@ -409,7 +418,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"input_service" && !bootstrap_input(manager_side, *input_raw, input_client, pointer_console) {
 			return State::Failed;
 		}
-		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, *pointer_console, console_client, console_control, pkg_handle, pkg_len, buf) {
+		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, *session_client, *pointer_console, console_client, console_control, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
@@ -421,7 +430,10 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
-		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *input_client, *console_client, *console_control, *graph_client, *perm_client, *res_client, admin_server) {
+		if name == b"session_service" && !bootstrap_serve(manager_side, session_client) {
+			return State::Failed;
+		}
+		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *input_client, *console_client, *console_control, *graph_client, *perm_client, *res_client, *session_client, session1, admin_server) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -543,7 +555,7 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 // emitting on the original. Finally the supervisor mints a fresh ADMIN channel and
 // transfers the client end to the shell (so its `stop <service>` command can drive
 // reverse-dependency teardown), keeping the server end in `*admin_server` to serve.
-unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, input_client: u64, console_client: u64, console_control: u64, graph_client: u64, perm_client: u64, res_client: u64, admin_server: &mut u64) -> bool {
+unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, input_client: u64, console_client: u64, console_control: u64, graph_client: u64, perm_client: u64, res_client: u64, session_client: u64, session1: &mut u64, admin_server: &mut u64) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"STORAGE", storage_client) {
 			return false;
@@ -598,6 +610,24 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: 
 		// The ResourceManager client, so the shell's `usage` command can render the live
 		// per-Domain budgets. Sent right after PERM to match the shell's receive order.
 		if !send_blocking(manager_side, b"RESOURCE", res_client) {
+			return false;
+		}
+		// VT 1's session capability. The session is minted once from the session factory
+		// and kept in `*session1` for the life of the system, so it - and thus the cwd -
+		// survives a restart of the VT 1 shell; each (re)started shell receives a fresh
+		// transferable duplicate. Sent right after RESOURCE to match the shell's receive
+		// order.
+		if *session1 == 0 {
+			*session1 = match service_connect(session_client) {
+				Some(h) => h,
+				None => return false,
+			};
+		}
+		let session_dup: i64 = duplicate(*session1, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		if session_dup < 0 {
+			return false;
+		}
+		if !send_blocking(manager_side, b"SESSION", session_dup as u64) {
 			return false;
 		}
 		if !send_blocking(manager_side, b"CONSOLE", console_client) {
@@ -1046,7 +1076,7 @@ unsafe fn bootstrap_audio_service(manager_side: u64, snd_client: u64, audio_clie
 // so minting from them never crosses the supervisor's lifecycle traffic. ConsoleService
 // maps the framebuffer itself (the kernel console then stops drawing) and attaches to
 // the kernel console input for keys.
-unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, gpu_client: u64, time_client: u64, audio_client: u64, pointer_console: u64, console_client: &mut u64, console_control: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, gpu_client: u64, time_client: u64, audio_client: u64, session_client: u64, pointer_console: u64, console_client: &mut u64, console_control: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		let (service_end, client_end): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -1087,6 +1117,12 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 			return false;
 		}
 		if !send_factory(manager_side, b"FAUDIO", audio_client) {
+			return false;
+		}
+		// The SessionService factory, so ConsoleService can mint a fresh per-VT session for
+		// each additional virtual terminal it spawns. Sent right after FAUDIO to match the
+		// console's receive order.
+		if !send_factory(manager_side, b"FSESSION", session_client) {
 			return false;
 		}
 		// NetworkService is multi-client through its own typed `open`, not serve_multi.
