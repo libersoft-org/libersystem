@@ -275,6 +275,16 @@ pub unsafe fn wait_any(handles: &[u64], deadline: u64) -> i64 {
 	unsafe { syscall(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, deadline, 0) as i64 }
 }
 
+// Non-blocking check of whether the object behind `handle` is ready right now - a
+// channel readable, a process terminated, an event signaled - without sleeping.
+// Waits against the current instant as the deadline, so the kernel runs its readiness
+// check and returns at once rather than blocking. The shell reaps finished background
+// jobs with it: a terminated child's Process handle reads ready. The handle needs the
+// WAIT right.
+pub unsafe fn poll_ready(handle: u64) -> bool {
+	unsafe { wait(handle, clock().max(1)) == 0 }
+}
+
 // The outcome of a blocking receive.
 pub enum Received {
 	// A message arrived: `len` payload bytes were written to the buffer and a

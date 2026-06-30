@@ -203,13 +203,13 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 }
 
 // Dispatch one command line. Returns true if the shell should exit.
-// A background or suspended job the shell tracks: the child Process handle (to
-// signal it), the channel the shell learns of its completion on, a display name, a
-// small id, and whether it is currently stopped (suspended by Ctrl+Z).
+// A background or suspended job the shell tracks: the child Process handle (which it
+// both signals and waits on, the handle becoming ready once the process terminates),
+// a display name, a small id, and whether it is currently stopped (suspended by
+// Ctrl+Z).
 struct Job {
 	id: usize,
 	proc: u64,
-	done: u64,
 	name: Vec<u8>,
 	stopped: bool,
 }
@@ -276,12 +276,14 @@ fn job_index(jobs: &Jobs, arg: &[u8]) -> Option<usize> {
 // Run a foreground job: hand the tty this job (SET_FG, with a MANAGE+TRANSFER dup of its
 // Process handle) so the user can interrupt it (Ctrl+C -> SIG_INT), suspend it
 // (Ctrl+Z -> SIG_STOP) or quit it (Ctrl+\ -> SIG_TERM) from the keyboard, then wait on
-// BOTH its completion channel and the control channel. ConsoleService's line discipline
+// BOTH the job's Process handle and the control channel. ConsoleService's line discipline
 // interprets the signal keys itself (the tty's ISIG behaviour, relocated there) and, on
 // a suspend, sends JOB_STOPPED back here. Returns Some(job) when it was suspended (the
-// caller backgrounds it), or None when it finished or was interrupted (its handles are
-// closed here). CLEAR_FG releases the tty's hold on the job before returning to the
-// prompt.
+// caller backgrounds it), or None when it finished or was interrupted (its handle is
+// closed here). The Process handle becomes ready once the process terminates - the
+// kernel's process-terminated signal - so the shell waits for it directly instead of a
+// separate completion channel. CLEAR_FG releases the tty's hold on the job before
+// returning to the prompt.
 unsafe fn run_foreground(control: u64, job: Job) -> Option<Job> {
 	unsafe {
 		// Discard any stale JOB_STOPPED a previous job's Ctrl+Z left queued, so the wait
@@ -293,16 +295,14 @@ unsafe fn run_foreground(control: u64, job: Job) -> Option<Job> {
 		if dup >= 0 {
 			send_blocking(control, b"SET_FG", dup as u64);
 		}
-		let waits: [u64; 2] = [job.done, control];
+		let waits: [u64; 2] = [job.proc, control];
 		let mut cbuf: [u8; 32] = [0u8; 32];
 		loop {
 			let ready: i64 = wait_any(&waits, 0);
 			if ready == 0 {
-				// The job's channel is ready: it sent its completion message or its end
-				// closed (a signal terminated it). Either way the job is done; release the
-				// tty and reap it.
+				// The Process handle is ready: the process has terminated (it exited or a
+				// signal killed it). The job is done; release the tty and reap it.
 				send_blocking(control, b"CLEAR_FG", 0);
-				close(job.done);
 				close(job.proc);
 				return None;
 			}
@@ -317,7 +317,6 @@ unsafe fn run_foreground(control: u64, job: Job) -> Option<Job> {
 				}
 				Received::Closed => {
 					// The console is gone; treat the job as finished.
-					close(job.done);
 					close(job.proc);
 					return None;
 				}
@@ -337,30 +336,27 @@ unsafe fn drain_control(control: u64) {
 	}
 }
 
-// Poll each running (not stopped) job: once its completion channel is no longer empty
-// it has finished, so announce it and drop it. Called before each prompt, the way a
-// shell reports a background job's completion.
+// Poll each running (not stopped) job: once its Process handle reads ready it has
+// terminated, so announce it and drop it. Called before each prompt, the way a shell
+// reports a background job's completion.
 unsafe fn reap_jobs(jobs: &mut Jobs) {
 	unsafe {
-		let mut buf: [u8; 16] = [0u8; 16];
 		let mut i: usize = 0;
 		while i < jobs.list.len() {
 			if jobs.list[i].stopped {
 				i += 1;
 				continue;
 			}
-			match try_recv(jobs.list[i].done, &mut buf) {
-				Polled::Empty => i += 1,
-				_ => {
-					let job = jobs.list.remove(i);
-					print(b"[");
-					print_usize(job.id);
-					print(b"] done   ");
-					print(&job.name);
-					print(b"\n");
-					close(job.done);
-					close(job.proc);
-				}
+			if poll_ready(jobs.list[i].proc) {
+				let job = jobs.list.remove(i);
+				print(b"[");
+				print_usize(job.id);
+				print(b"] done   ");
+				print(&job.name);
+				print(b"\n");
+				close(job.proc);
+			} else {
+				i += 1;
 			}
 		}
 	}
@@ -1093,12 +1089,12 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 // it `args` over a bootstrap channel, and wait for it to finish. The shell never loads an
 // ELF itself - ProcessService is the loading mechanism: it reads the program from the init
 // package, moves the child end of the bootstrap channel in as the new process's bootstrap
-// handle, and hands back the live process handle (which carries MANAGE, so the shell can
-// signal it for job control). The child runs as its own process and prints its output to
-// the console directly (a program's stdout reaches the console via SYS_DEBUG_WRITE); it
-// sends a completion message just before it exits, which we wait on - an exited process is
-// briefly a zombie whose channel has not yet closed, so we cannot rely on the channel
-// closing to detect exit. This is the foreground exec primitive the net tools build on.
+// handle, and hands back the live process handle (which carries ALL rights, so the shell
+// can both signal it for job control and wait on it). The child runs as its own process
+// and prints its output to the console directly (a program's stdout reaches the console
+// via SYS_DEBUG_WRITE); the shell waits on the Process handle, which the kernel readies
+// once the process terminates - so no completion channel or zombie-lag handling is needed.
+// This is the foreground exec primitive the net tools build on.
 unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cap: u64, bg: bool) {
 	unsafe {
 		let name_str: &str = match core::str::from_utf8(name) {
@@ -1137,9 +1133,13 @@ unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cap: u64
 		// its arguments + an optional inherited capability (e.g. a NetworkService client).
 		send_stdout(parent);
 		send_blocking(parent, args, cap);
+		// The bootstrap is delivered; the child drains it from its own end, so the shell no
+		// longer needs the parent end. Drop it - the shell now tracks the job solely by its
+		// waitable Process handle (ready once the child terminates), not a completion channel.
+		close(parent);
 		let id: usize = jobs.next_id;
 		jobs.next_id += 1;
-		let job: Job = Job { id, proc, done: parent, name: name.to_vec(), stopped: false };
+		let job: Job = Job { id, proc, name: name.to_vec(), stopped: false };
 		if bg {
 			// Background: track the job and return to the prompt; its completion is reaped
 			// before a later prompt.
