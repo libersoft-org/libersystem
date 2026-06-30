@@ -380,16 +380,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 1. receive the grantable clients the manager may hand onward, then the ProcessService
 	//    client it drives to load the components it governs. A client the supervisor does not
 	//    grant arrives as 0 (the manager simply cannot grant what it does not hold). Storage,
-	//    log, network, and time are wired this milestone (time so the governed `date` command
-	//    can read the wall clock); the remaining vocabulary capabilities (device, config,
-	//    audio, input, graph, resource) are declared in the store but not wired - held 0, so a
-	//    manifest naming one records the decision yet hands over nothing (input / graph are
+	//    log, network, time, config, device, and audio are wired (time so the governed `date`
+	//    command can read the wall clock, config/device/audio so the governed `config` / `set`,
+	//    `dev`, and `beep` commands can reach their one service); the remaining vocabulary
+	//    capabilities (input, graph, resource) are declared in the store but not wired - held 0,
+	//    so a manifest naming one records the decision yet hands over nothing (input / graph are
 	//    single-client and cannot be proxied at all).
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or(0);
 	let log: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or(0);
 	let network: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NETWORK") }.unwrap_or(0);
 	let time: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"TIME") }.unwrap_or(0);
-	let clients: Clients = Clients { log, storage, network, time, device: 0, config: 0, audio: 0, input: 0, graph: 0, resource: 0 };
+	let config: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONFIG") }.unwrap_or(0);
+	let device: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DEVICE") }.unwrap_or(0);
+	let audio: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"AUDIO") }.unwrap_or(0);
+	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource: 0 };
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
 
 	// 2. wait for the serve channel clients reach us on.
