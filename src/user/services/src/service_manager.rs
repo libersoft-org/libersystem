@@ -695,9 +695,11 @@ unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], st
 // connection (the loading mechanism it drives to start the components it governs) and the
 // channel its clients reach it on ("SERVE", the client end kept in `*perm_client` for the
 // shell's `perm` command). The order matches PermissionManager's receive order: STORAGE,
-// LOG, NETWORK, TIME, CONFIG, DEVICE, AUDIO, PROCESS, SERVE. The grantable clients carry
-// RIGHT_DUPLICATE so the manager can attenuate and hand a strictly narrower client to
-// each component it sandboxes.
+// LOG, NETWORK, TIME, CONFIG, DEVICE, AUDIO, RESOURCE, PROCESS_GRANT, PROCESS, SERVE. The
+// grantable clients carry RIGHT_DUPLICATE so the manager can attenuate and hand a strictly
+// narrower client to each component it sandboxes. (The grantable permission capability - a
+// connection to the manager's own serve channel - is not passed here: the manager mints that
+// self-connection itself.)
 unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, resource_client: u64, process_client: u64, perm_client: &mut u64) -> bool {
 	unsafe {
 		// A fresh StorageService connection for the manager (independent of the shell's),

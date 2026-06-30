@@ -468,13 +468,28 @@ pub const CONNECT_OP: u16 = 0xffff;
 // shape, plus the channel it arrived on as the first argument (for ops that stream
 // out of band on that connection). A sub-client channel closing (or sending the empty
 // quit sentinel) is dropped from the set; the loop ends when the root closes.
-pub unsafe fn serve_multi<F>(root: u64, request: &mut [u8], reply: &mut [u8], mut handle_request: F)
+pub unsafe fn serve_multi<F>(root: u64, request: &mut [u8], reply: &mut [u8], handle_request: F)
+where
+	F: FnMut(u64, &[u8], u64, &mut [u8], &mut u64) -> Option<usize>,
+{
+	unsafe {
+		serve_multi_seeded(root, &[], request, reply, handle_request);
+	}
+}
+
+// Like `serve_multi`, but pre-seeds the client set with `seed` channels - service ends the
+// server already holds connections to (a self-connection a manager mints to a copy of itself,
+// for instance), served exactly like ones minted on demand via `CONNECT_OP`. As with any
+// sub-client, a seed channel closing (or sending the empty quit sentinel) is simply dropped
+// from the set; only `root` closing ends the service.
+pub unsafe fn serve_multi_seeded<F>(root: u64, seed: &[u64], request: &mut [u8], reply: &mut [u8], mut handle_request: F)
 where
 	F: FnMut(u64, &[u8], u64, &mut [u8], &mut u64) -> Option<usize>,
 {
 	unsafe {
 		let mut chans: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
 		chans.push(root);
+		chans.extend_from_slice(seed);
 		while !chans.is_empty() {
 			let ready: i64 = wait_any(&chans, 0);
 			if ready < 0 {
@@ -606,7 +621,11 @@ pub unsafe fn memory_object_create(size: u64) -> i64 {
 pub unsafe fn map_object(handle: u64) -> Option<u64> {
 	unsafe {
 		let base: u64 = syscall(SYS_MEMORY_MAP, handle, 0, 0, 0);
-		if sys_is_err(base) { None } else { Some(base) }
+		if sys_is_err(base) {
+			None
+		} else {
+			Some(base)
+		}
 	}
 }
 
@@ -685,7 +704,11 @@ pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
 		let mut info: ObjectInfo = ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0 };
 		let size: u64 = core::mem::size_of::<ObjectInfo>() as u64;
 		let ok: i64 = syscall(SYS_OBJECT_INFO_GET, handle, &mut info as *mut ObjectInfo as u64, size, 0) as i64;
-		if ok == 1 { Some(info) } else { None }
+		if ok == 1 {
+			Some(info)
+		} else {
+			None
+		}
 	}
 }
 
@@ -699,7 +722,11 @@ pub unsafe fn process_stats(handle: u64) -> Option<ProcessStats> {
 		let mut stats: ProcessStats = ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: 0 };
 		let size: u64 = core::mem::size_of::<ProcessStats>() as u64;
 		let ok: i64 = syscall(SYS_PROCESS_STATS_GET, handle, &mut stats as *mut ProcessStats as u64, size, 0) as i64;
-		if ok == 1 { Some(stats) } else { None }
+		if ok == 1 {
+			Some(stats)
+		} else {
+			None
+		}
 	}
 }
 
@@ -883,7 +910,11 @@ pub unsafe fn domain_stats(handle: u64) -> Option<DomainStats> {
 		let mut stats: DomainStats = DomainStats::default();
 		let size: u64 = core::mem::size_of::<DomainStats>() as u64;
 		let ok: i64 = syscall(SYS_DOMAIN_STATS_GET, handle, &mut stats as *mut DomainStats as u64, size, 0) as i64;
-		if ok == 1 { Some(stats) } else { None }
+		if ok == 1 {
+			Some(stats)
+		} else {
+			None
+		}
 	}
 }
 

@@ -85,7 +85,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // client only for the ones the supervisor wired it (the rest stay 0 - declared in the
 // vocabulary, not yet grantable - so a manifest naming them records the decision but hands
 // over nothing).
-const VOCABULARY: [Capability; 11] = [Capability::Storage, Capability::Log, Capability::Network, Capability::Device, Capability::Config, Capability::Time, Capability::Audio, Capability::Input, Capability::Graph, Capability::Resource, Capability::Process];
+const VOCABULARY: [Capability; 12] = [Capability::Storage, Capability::Log, Capability::Network, Capability::Device, Capability::Config, Capability::Time, Capability::Audio, Capability::Input, Capability::Graph, Capability::Resource, Capability::Process, Capability::Permission];
 
 // The manager's policy: the permission manifest declared for each component it governs -
 // the typed source of truth for what that component may be granted.
@@ -109,6 +109,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"usage" => Some(Manifest { component: String::from("usage"), grants: alloc::vec![Capability::Resource] }),
 		b"ps" => Some(Manifest { component: String::from("ps"), grants: alloc::vec![Capability::Process] }),
 		b"run" => Some(Manifest { component: String::from("run"), grants: alloc::vec![Capability::Process] }),
+		b"perm" => Some(Manifest { component: String::from("perm"), grants: alloc::vec![Capability::Permission] }),
 		_ => None,
 	}
 }
@@ -147,6 +148,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::Graph => b"GRAPH",
 		Capability::Resource => b"RESOURCE",
 		Capability::Process => b"PROCESS",
+		Capability::Permission => b"PERMISSION",
 	}
 }
 
@@ -163,6 +165,7 @@ struct Clients {
 	graph: u64,
 	resource: u64,
 	process: u64,
+	permission: u64,
 }
 
 impl Clients {
@@ -180,6 +183,7 @@ impl Clients {
 			Capability::Graph => self.graph,
 			Capability::Resource => self.resource,
 			Capability::Process => self.process,
+			Capability::Permission => self.permission,
 		}
 	}
 }
@@ -393,11 +397,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    log, network, time, config, device, audio, resource, and process are wired (time so the
 	//    governed `date` command can read the wall clock, config/device/audio/resource so the
 	//    governed `config` / `set`, `dev`, `beep`, and `usage` commands can reach their one
-	//    service, process so the governed `ps` command can list processes - a dedicated
-	//    ProcessService connection, kept separate from the launch mechanism below); the remaining
-	//    vocabulary capabilities (input, graph) are declared in the store but not wired - held 0,
-	//    so a manifest naming one records the decision yet hands over nothing (input / graph are
-	//    single-client and cannot be proxied at all).
+	//    service, process so the governed `ps` / `run` commands can list / start processes - a
+	//    dedicated ProcessService connection, kept separate from the launch mechanism below); the
+	//    permission capability is not received but minted locally below (a self-connection to the
+	//    manager's own serve channel); the remaining vocabulary capabilities (input, graph) are
+	//    declared in the store but not wired - held 0, so a manifest naming one records the
+	//    decision yet hands over nothing (input / graph are single-client and cannot be proxied
+	//    at all).
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or(0);
 	let log: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or(0);
 	let network: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NETWORK") }.unwrap_or(0);
@@ -407,7 +413,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let audio: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"AUDIO") }.unwrap_or(0);
 	let resource: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"RESOURCE") }.unwrap_or(0);
 	let process: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS_GRANT") }.unwrap_or(0);
-	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process };
+	// Mint the manager's self-connection: a dedicated channel pair whose server end is seeded
+	// into the serve set below (so requests on it are dispatched like any other client's) and
+	// whose client end the manager holds as the grantable `permission` capability. The governed
+	// `perm` command thus reaches the very audit trail this manager serves over a connection of
+	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
+	// granted tool's queries never race the supervisor's own connection.
+	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| exit());
+	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client };
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
 
 	// 2. wait for the serve channel clients reach us on.
@@ -444,12 +457,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(bootstrap, &cat_read, 0);
 	}
 
-	// 5. serve generated lookup/audit/run requests until the supervisor drops the channel.
+	// 5. serve generated lookup/audit/run requests until the supervisor drops the channel. The
+	//    self-connection's server end is seeded into the client set alongside the root, so the
+	//    governed `perm` command - granted the matching client end - is served like any other.
 	let mut manager: Manager = Manager { audit, procsvc, clients };
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 1024] = [0u8; 1024];
 	unsafe {
-		serve_multi(service, &mut request, &mut reply, |_chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { permission::dispatch(&mut manager, req, handle, out, reply_handle) });
+		serve_multi_seeded(service, &[perm_self_server], &mut request, &mut reply, |_chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { permission::dispatch(&mut manager, req, handle, out, reply_handle) });
 	}
 	exit();
 }

@@ -484,6 +484,7 @@ enum capability {
 	graph,     // a SystemGraphService client (query the live system graph)
 	resource,  // a ResourceManager client (read per-Domain budgets)
 	process,   // a ProcessService client (list / start processes)
+	permission, // a PermissionManager client (read the audit trail)
 }
 
 // A component's permission manifest: its name and the exact set of capabilities it is

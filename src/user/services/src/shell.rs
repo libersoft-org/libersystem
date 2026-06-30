@@ -663,11 +663,21 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"perm" {
-			query_permission(permsvc, false);
+			// Launch `perm` as its own sandboxed ELF through PermissionManager (the launcher /
+			// granter), which grants it a client to its own serve channel and forwards it this
+			// terminal and the sub-form argument. A shell with no PermissionManager (a non-primary
+			// VT) reads the audit trail inline instead.
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"perm", b"");
+			if !launched {
+				query_permission(permsvc, false);
+			}
 			return false;
 		}
 		if line == b"perm json" {
-			query_permission(permsvc, true);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"perm", b"json");
+			if !launched {
+				query_permission(permsvc, true);
+			}
 			return false;
 		}
 		if line == b"usage" {

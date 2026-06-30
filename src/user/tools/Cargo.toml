@@ -77,6 +77,10 @@ name = "run"
 path = "src/run.rs"
 
 [[bin]]
+name = "perm"
+path = "src/perm.rs"
+
+[[bin]]
 name = "ping"
 path = "src/ping.rs"
 
