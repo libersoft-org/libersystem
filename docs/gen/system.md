@@ -313,6 +313,7 @@ An opaque kernel object, transferred as `handle<task>`.
 | `input` | 7 |
 | `graph` | 8 |
 | `resource` | 9 |
+| `process` | 10 |
 
 ### record `manifest`
 

@@ -85,7 +85,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // client only for the ones the supervisor wired it (the rest stay 0 - declared in the
 // vocabulary, not yet grantable - so a manifest naming them records the decision but hands
 // over nothing).
-const VOCABULARY: [Capability; 10] = [Capability::Storage, Capability::Log, Capability::Network, Capability::Device, Capability::Config, Capability::Time, Capability::Audio, Capability::Input, Capability::Graph, Capability::Resource];
+const VOCABULARY: [Capability; 11] = [Capability::Storage, Capability::Log, Capability::Network, Capability::Device, Capability::Config, Capability::Time, Capability::Audio, Capability::Input, Capability::Graph, Capability::Resource, Capability::Process];
 
 // The manager's policy: the permission manifest declared for each component it governs -
 // the typed source of truth for what that component may be granted.
@@ -107,6 +107,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"set" => Some(Manifest { component: String::from("set"), grants: alloc::vec![Capability::Config] }),
 		b"beep" => Some(Manifest { component: String::from("beep"), grants: alloc::vec![Capability::Audio] }),
 		b"usage" => Some(Manifest { component: String::from("usage"), grants: alloc::vec![Capability::Resource] }),
+		b"ps" => Some(Manifest { component: String::from("ps"), grants: alloc::vec![Capability::Process] }),
 		_ => None,
 	}
 }
@@ -144,6 +145,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::Input => b"INPUT",
 		Capability::Graph => b"GRAPH",
 		Capability::Resource => b"RESOURCE",
+		Capability::Process => b"PROCESS",
 	}
 }
 
@@ -159,6 +161,7 @@ struct Clients {
 	input: u64,
 	graph: u64,
 	resource: u64,
+	process: u64,
 }
 
 impl Clients {
@@ -175,6 +178,7 @@ impl Clients {
 			Capability::Input => self.input,
 			Capability::Graph => self.graph,
 			Capability::Resource => self.resource,
+			Capability::Process => self.process,
 		}
 	}
 }
@@ -385,12 +389,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 1. receive the grantable clients the manager may hand onward, then the ProcessService
 	//    client it drives to load the components it governs. A client the supervisor does not
 	//    grant arrives as 0 (the manager simply cannot grant what it does not hold). Storage,
-	//    log, network, time, config, device, audio, and resource are wired (time so the governed
-	//    `date` command can read the wall clock, config/device/audio/resource so the governed
-	//    `config` / `set`, `dev`, `beep`, and `usage` commands can reach their one service); the
-	//    remaining vocabulary capabilities (input, graph) are declared in the store but not wired
-	//    - held 0, so a manifest naming one records the decision yet hands over nothing (input /
-	//    graph are single-client and cannot be proxied at all).
+	//    log, network, time, config, device, audio, resource, and process are wired (time so the
+	//    governed `date` command can read the wall clock, config/device/audio/resource so the
+	//    governed `config` / `set`, `dev`, `beep`, and `usage` commands can reach their one
+	//    service, process so the governed `ps` command can list processes - a dedicated
+	//    ProcessService connection, kept separate from the launch mechanism below); the remaining
+	//    vocabulary capabilities (input, graph) are declared in the store but not wired - held 0,
+	//    so a manifest naming one records the decision yet hands over nothing (input / graph are
+	//    single-client and cannot be proxied at all).
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or(0);
 	let log: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or(0);
 	let network: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NETWORK") }.unwrap_or(0);
@@ -399,7 +405,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let device: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DEVICE") }.unwrap_or(0);
 	let audio: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"AUDIO") }.unwrap_or(0);
 	let resource: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"RESOURCE") }.unwrap_or(0);
-	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource };
+	let process: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS_GRANT") }.unwrap_or(0);
+	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process };
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
 
 	// 2. wait for the serve channel clients reach us on.

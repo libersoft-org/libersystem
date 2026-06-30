@@ -693,7 +693,13 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"ps" {
-			query_processes(procsvc);
+			// Launch `ps` as its own sandboxed ELF through PermissionManager (the launcher /
+			// granter), which grants it a process client and forwards it this terminal. A shell
+			// with no PermissionManager (a non-primary VT) lists the processes inline instead.
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"ps", b"");
+			if !launched {
+				query_processes(procsvc);
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"run ") {

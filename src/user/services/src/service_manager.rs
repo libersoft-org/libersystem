@@ -770,6 +770,16 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, l
 		if !send_blocking(manager_side, b"RESOURCE", resource_conn) {
 			return false;
 		}
+		// A fresh ProcessService connection the manager grants to the governed `ps` command
+		// (whose manifest grants process) - a dedicated connection, separate from the launch
+		// mechanism below, so a granted tool's queries never interleave with the manager's loads.
+		let process_grant: u64 = match service_connect(process_client) {
+			Some(h) => h,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"PROCESS_GRANT", process_grant) {
+			return false;
+		}
 		// A fresh ProcessService connection the manager drives to load the components it
 		// governs - the loading mechanism, kept separate from the granting policy.
 		let proc_conn: u64 = match service_connect(process_client) {

@@ -700,6 +700,11 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	core::mem::drop(audio_server);
 	let (resource_server, resource_client) = Channel::create();
 	core::mem::drop(resource_server);
+	// The manager's grantable process capability: a real, dead-peer ProcessService connection
+	// (distinct from the live ProcessService it drives as the launch mechanism below), held but
+	// never granted to the governed components here.
+	let (process_grant_server, process_grant_client) = Channel::create();
+	core::mem::drop(process_grant_server);
 
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
@@ -724,9 +729,10 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	send_cap(&time_boot_kernel, b"SERVE", time_server, Rights::ALL)?;
 
 	// PermissionManager: the grantable clients (storage + log, both duplicable, and time, plus
-	// dead-peer config / device / audio / resource it holds but does not grant here), a network
-	// client it withholds, the ProcessService client it drives to load the components, and the
-	// channel its clients reach it on. The order matches PermissionManager's receive order.
+	// dead-peer config / device / audio / resource / process-grant it holds but does not grant
+	// here), a network client it withholds, the ProcessService client it drives to load the
+	// components, and the channel its clients reach it on. The order matches PermissionManager's
+	// receive order.
 	send_cap(&pm_boot_kernel, b"STORAGE", storage_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"LOG", log_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"NETWORK", net_client, Rights::ALL)?;
@@ -735,6 +741,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	send_cap(&pm_boot_kernel, b"DEVICE", device_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"AUDIO", audio_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"RESOURCE", resource_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"PROCESS_GRANT", process_grant_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"PROCESS", process_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"SERVE", perm_server, Rights::ALL)?;
 
@@ -2585,7 +2592,7 @@ fn permission_manager_sandboxes_a_component() {
 	let (expected, probe_read, probe_summary, date_read, date_summary, request_read, request_summary, cat_read) = run_permission_scenario().expect("the permission scenario should run");
 	assert!(!expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(probe_read, expected, "the sandboxed component read its one granted file through the storage grant");
-	assert_eq!(probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
+	assert_eq!(probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
 	// `date` reached its one granted capability: its output is a well-formed ISO-8601 UTC
 	// instant "YYYY-MM-DDTHH:MM:SSZ" (the exact moment varies, so check the shape, not the
 	// value - its presence proves the time grant is live).
@@ -2596,12 +2603,12 @@ fn permission_manager_sandboxes_a_component() {
 	assert_eq!(date_read[13], b':', "the date instant has a time separator after the hour");
 	assert_eq!(date_read[16], b':', "the date instant has a time separator after the minute");
 	assert_eq!(date_read[19], b'Z', "the date instant is UTC, terminated by 'Z'");
-	assert_eq!(date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny", "date was granted exactly its manifest - time - and denied every other capability in the vocabulary");
+	assert_eq!(date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny", "date was granted exactly its manifest - time - and denied every other capability in the vocabulary");
 	// request_probe asked for storage at runtime - a capability outside its manifest. The
 	// headless policy default refused it, so the request comes back denied and its summary
 	// carries the static grants followed by the refused runtime request marked `(dynamic)`.
 	assert_eq!(request_read.as_slice(), b"storage denied", "request_probe's runtime request for an undeclared capability was refused by the headless policy default");
-	assert_eq!(request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny storage=deny(dynamic)", "request_probe was granted exactly its manifest - log - and its runtime storage request was refused and recorded as a dynamic denial");
+	assert_eq!(request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny storage=deny(dynamic)", "request_probe was granted exactly its manifest - log - and its runtime storage request was refused and recorded as a dynamic denial");
 	// The on-demand `cat` tool, launched through PermissionManager's `run` op under a manifest
 	// granting only storage, printed the file it was given through that grant to the stdout the
 	// manager forwarded it: the bytes it rendered must equal the file straight from the volume.
