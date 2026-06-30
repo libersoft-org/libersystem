@@ -633,11 +633,21 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"dev" {
-			query_devices(devsvc, false);
+			// Launch `dev` as its own sandboxed ELF through PermissionManager (the launcher /
+			// granter), which grants it a device client and forwards it this terminal and the
+			// sub-form argument. A shell with no PermissionManager (a non-primary VT) queries the
+			// devices inline instead.
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"dev", b"");
+			if !launched {
+				query_devices(devsvc, false);
+			}
 			return false;
 		}
 		if line == b"dev json" {
-			query_devices(devsvc, true);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"dev", b"json");
+			if !launched {
+				query_devices(devsvc, true);
+			}
 			return false;
 		}
 		if line == b"graph" {
