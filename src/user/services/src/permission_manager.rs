@@ -223,8 +223,8 @@ impl Service for Manager {
 	fn audit(&mut self) -> Result<Vec<AuditEntry>, Error> {
 		Ok(self.audit.clone())
 	}
-	fn run(&mut self, name: String, args: String, stdout: u64) -> Result<StartResult, Error> {
-		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), stdout, &self.clients, &mut self.audit) } {
+	fn run(&mut self, name: String, args: String, cwd: String, stdout: u64) -> Result<StartResult, Error> {
+		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), stdout, &self.clients, &mut self.audit) } {
 			Some(started) => Ok(started),
 			None => Err(Error::NotFound),
 		}
@@ -322,7 +322,7 @@ unsafe fn grant_dynamic(component: &[u8], cap: Capability, clients: &Clients, ma
 // manifest's capabilities in vocabulary order (auditing each decision). Returns the live
 // process handle (for the caller's job control) and the per-capability decisions, or None if
 // the tool has no manifest, the argument is not a known program name, or the launch fails.
-unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], stdout: u64, clients: &Clients, audit: &mut Vec<AuditEntry>) -> Option<StartResult> {
+unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], stdout: u64, clients: &Clients, audit: &mut Vec<AuditEntry>) -> Option<StartResult> {
 	unsafe {
 		let manifest: Manifest = manifest_for(name)?;
 		let name_str: &str = core::str::from_utf8(name).ok()?;
@@ -359,6 +359,12 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], stdout
 			}
 			audit.push(AuditEntry { component: String::from_utf8_lossy(name).into_owned(), capability: cap, granted, dynamic: false });
 		}
+		// Hand over the inherited working directory last, after the capability grants. It is
+		// plain data (no handle), so a tool resolves a relative path argument against it; a
+		// tool that takes no path simply never reads it, leaving it a harmless trailing
+		// message - sending it before the tagged grants would instead be mis-consumed by the
+		// tool's `recv_tagged` for its capabilities.
+		send_blocking(manager_side, cwd, 0);
 		close(manager_side);
 		Some(started)
 	}
@@ -397,7 +403,7 @@ unsafe fn demonstrate_tool(procsvc: u64, name: &[u8], args: &[u8], clients: &Cli
 			Some(pair) => pair,
 			None => return Vec::new(),
 		};
-		let started: StartResult = match run_tool_under_manifest(procsvc, name, args, console, clients, audit) {
+		let started: StartResult = match run_tool_under_manifest(procsvc, name, args, b"", console, clients, audit) {
 			Some(s) => s,
 			None => {
 				close(output);

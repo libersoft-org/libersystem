@@ -15,6 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use proto::path;
 use proto::system::{audio, config, device, input, log, network, permission, process, resources, session, system_graph, time, volume, AuditEntry, Budget, Component, ConfigEntry, DeviceEntry, Entry, FileKind, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan};
 use rt::*;
 
@@ -622,28 +623,28 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// granter), which grants it a log client and a time client and forwards it this
 			// terminal and the sub-form argument. A shell with no PermissionManager (a non-primary
 			// VT) queries the journal inline instead.
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"log", b"");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"log", b"", cwd.as_bytes());
 			if !launched {
 				query_log(logsvc, timesvc, false);
 			}
 			return false;
 		}
 		if line == b"log json" {
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"log", b"json");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"log", b"json", cwd.as_bytes());
 			if !launched {
 				query_log(logsvc, timesvc, true);
 			}
 			return false;
 		}
 		if line == b"log tail" {
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"log", b"tail");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"log", b"tail", cwd.as_bytes());
 			if !launched {
 				tail_log(logsvc, timesvc, false);
 			}
 			return false;
 		}
 		if line == b"log tail json" {
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"log", b"tail json");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"log", b"tail json", cwd.as_bytes());
 			if !launched {
 				tail_log(logsvc, timesvc, true);
 			}
@@ -654,14 +655,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// granter), which grants it a device client and forwards it this terminal and the
 			// sub-form argument. A shell with no PermissionManager (a non-primary VT) queries the
 			// devices inline instead.
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"dev", b"");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"dev", b"", cwd.as_bytes());
 			if !launched {
 				query_devices(devsvc, false);
 			}
 			return false;
 		}
 		if line == b"dev json" {
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"dev", b"json");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"dev", b"json", cwd.as_bytes());
 			if !launched {
 				query_devices(devsvc, true);
 			}
@@ -684,14 +685,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// granter), which grants it a client to its own serve channel and forwards it this
 			// terminal and the sub-form argument. A shell with no PermissionManager (a non-primary
 			// VT) reads the audit trail inline instead.
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"perm", b"");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"perm", b"", cwd.as_bytes());
 			if !launched {
 				query_permission(permsvc, false);
 			}
 			return false;
 		}
 		if line == b"perm json" {
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"perm", b"json");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"perm", b"json", cwd.as_bytes());
 			if !launched {
 				query_permission(permsvc, true);
 			}
@@ -702,14 +703,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// granter), which grants it a resource client and forwards it this terminal and the
 			// sub-form argument. A shell with no PermissionManager (a non-primary VT) reads the
 			// budgets inline instead.
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"usage", b"");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"usage", b"", cwd.as_bytes());
 			if !launched {
 				query_resource(ressvc, false);
 			}
 			return false;
 		}
 		if line == b"usage json" {
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"usage", b"json");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"usage", b"json", cwd.as_bytes());
 			if !launched {
 				query_resource(ressvc, true);
 			}
@@ -721,7 +722,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// terminal and the service name. A shell with no PermissionManager (a non-primary VT)
 			// stops the service inline instead.
 			let name: &[u8] = trim(rest);
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"stop", name);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"stop", name, cwd.as_bytes());
 			if !launched {
 				stop_service(adminsvc, name);
 			}
@@ -731,7 +732,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// Launch `ps` as its own sandboxed ELF through PermissionManager (the launcher /
 			// granter), which grants it a process client and forwards it this terminal. A shell
 			// with no PermissionManager (a non-primary VT) lists the processes inline instead.
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"ps", b"");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"ps", b"", cwd.as_bytes());
 			if !launched {
 				query_processes(procsvc);
 			}
@@ -743,7 +744,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// program name. A shell with no PermissionManager (a non-primary VT) starts the
 			// program inline instead.
 			let name: &[u8] = trim(rest);
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"run", name);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"run", name, cwd.as_bytes());
 			if !launched {
 				run_process(procsvc, name);
 			}
@@ -754,7 +755,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// granter), which grants it a config client and forwards it this terminal and the
 			// sub-form argument. A shell with no PermissionManager (a non-primary VT) queries the
 			// store inline instead.
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"config", b"");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"config", b"", cwd.as_bytes());
 			if !launched {
 				query_config(cfgsvc);
 			}
@@ -762,7 +763,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 		}
 		if let Some(rest) = line.strip_prefix(b"config ") {
 			let key: &[u8] = trim(rest);
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"config", key);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"config", key, cwd.as_bytes());
 			if !launched {
 				get_config(cfgsvc, key);
 			}
@@ -770,7 +771,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 		}
 		if let Some(rest) = line.strip_prefix(b"set ") {
 			let args: &[u8] = trim(rest);
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"set", args);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"set", args, cwd.as_bytes());
 			if !launched {
 				set_config(cfgsvc, args);
 			}
@@ -780,7 +781,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// Launch `date` as its own sandboxed ELF through PermissionManager (the launcher /
 			// granter), which grants it just a time client and forwards it this terminal. A
 			// shell with no PermissionManager (a non-primary VT) reads the clock inline instead.
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"date", b"");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"date", b"", cwd.as_bytes());
 			if !launched {
 				show_date(timesvc);
 			}
@@ -791,7 +792,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// granter), which grants it an audio client and forwards it this terminal and the
 			// argument string. A shell with no PermissionManager (a non-primary VT) plays the
 			// tone inline instead.
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"beep", b"");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"beep", b"", cwd.as_bytes());
 			if !launched {
 				beep_cmd(audiosvc, b"");
 			}
@@ -799,7 +800,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 		}
 		if let Some(rest) = line.strip_prefix(b"beep ") {
 			let args: &[u8] = trim(rest);
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"beep", args);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"beep", args, cwd.as_bytes());
 			if !launched {
 				beep_cmd(audiosvc, args);
 			}
@@ -858,7 +859,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// granter), which grants it the four volume StorageService clients (the `volumes`
 			// capability) and forwards it this terminal. A shell with no PermissionManager (a
 			// non-primary VT) lists the volumes inline instead.
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"lsvol", b"");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"lsvol", b"", cwd.as_bytes());
 			if !launched {
 				lsvol_cmd(storage, media, iso, udf);
 			}
@@ -879,131 +880,142 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 		}
 		if line == b"ls" {
 			// no argument lists the current working directory; route through PermissionManager
-			// (governed ELF) for the system volume, falling back to the inline listing otherwise.
-			let chan: u64 = storage_for(cwd.as_bytes(), storage, media, iso, udf);
-			let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"ls", cwd.as_bytes());
-			if !launched {
+			// (the governed ELF, which inherits this cwd and resolves it) for the system volume,
+			// falling back to the inline listing on other volumes or a shell with no
+			// PermissionManager.
+			if on_system_volume(cwd, b"") && permsvc != 0 {
+				run_tool(permsvc, b"ls", b"", cwd.as_bytes());
+			} else {
 				ls_cmd(storage, media, iso, udf, cwd.as_bytes());
 			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"ls ") {
-			match resolve_path(cwd, trim(rest)) {
-				Some(uri) => {
-					let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
-					// For a system-volume directory, launch `ls` as its own sandboxed ELF through
-					// PermissionManager (the launcher / granter): it grants the command just a
-					// storage client and forwards it this terminal, and the command reports its own
-					// result. Other volumes (media / iso / udf), and a shell with no
-					// PermissionManager (a non-primary VT), list the directory inline instead.
-					let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"ls", uri.as_bytes());
-					if !launched {
-						ls_cmd(storage, media, iso, udf, uri.as_bytes());
-					}
+			let arg: &[u8] = trim(rest);
+			// For a system-volume directory, launch `ls` as its own sandboxed ELF through
+			// PermissionManager (the launcher / granter): it inherits this cwd, resolves the
+			// (relative or absolute) path itself, and reports its own result. Other volumes
+			// (media / iso / udf), and a shell with no PermissionManager (a non-primary VT), list
+			// the directory inline instead - resolving the path here against the same cwd.
+			if on_system_volume(cwd, arg) && permsvc != 0 {
+				run_tool(permsvc, b"ls", arg, cwd.as_bytes());
+			} else {
+				match path::resolve(cwd, arg) {
+					Some(uri) => ls_cmd(storage, media, iso, udf, uri.as_bytes()),
+					None => print(b"ls: invalid path\n"),
 				}
-				None => print(b"ls: invalid path\n"),
 			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"cat ") {
-			match resolve_path(cwd, trim(rest)) {
-				Some(uri) => {
-					let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
-					// For a system-volume file, launch `cat` as its own sandboxed ELF through
-					// PermissionManager (the launcher / granter): it grants the command just a
-					// storage client and forwards it this terminal, and the command reports its own
-					// errors. Other volumes (media / iso / udf), and a shell with no
-					// PermissionManager (a non-primary VT), read the file inline instead.
-					let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"cat", uri.as_bytes());
-					if !launched && !cat(chan, uri.as_bytes()) {
-						print(b"cat: could not read ");
-						print(uri.as_bytes());
-						print(b"\n");
+			let arg: &[u8] = trim(rest);
+			// For a system-volume file, launch `cat` as its own sandboxed ELF through
+			// PermissionManager (the launcher / granter): it inherits this cwd, resolves the path
+			// itself, and reports its own errors. Other volumes (media / iso / udf), and a shell
+			// with no PermissionManager (a non-primary VT), read the file inline instead.
+			if on_system_volume(cwd, arg) && permsvc != 0 {
+				run_tool(permsvc, b"cat", arg, cwd.as_bytes());
+			} else {
+				match path::resolve(cwd, arg) {
+					Some(uri) => {
+						let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
+						if !cat(chan, uri.as_bytes()) {
+							print(b"cat: could not read ");
+							print(uri.as_bytes());
+							print(b"\n");
+						}
 					}
+					None => print(b"cat: invalid path\n"),
 				}
-				None => print(b"cat: invalid path\n"),
 			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"write ") {
 			let rest = trim(rest);
-			// "write <uri> <text>": split on the first space.
+			// "write <path> <text>": split on the first space.
 			match rest.iter().position(|&b: &u8| b == b' ') {
-				Some(sp) => match resolve_path(cwd, trim(&rest[..sp])) {
-					Some(uri) => {
-						let text: &[u8] = trim(&rest[sp + 1..]);
-						let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
-						// For a system-volume file, launch `write` as its own sandboxed ELF through
-						// PermissionManager (the launcher / granter): it grants the command just a
-						// storage client and forwards it this terminal and the "<uri> <text>" argument,
-						// and the command reports its own result. Other volumes (media / iso / udf), and
-						// a shell with no PermissionManager (a non-primary VT), write inline.
-						let mut arg: Vec<u8> = Vec::with_capacity(uri.len() + 1 + text.len());
-						arg.extend_from_slice(uri.as_bytes());
+				Some(sp) => {
+					let path_arg: &[u8] = trim(&rest[..sp]);
+					let text: &[u8] = trim(&rest[sp + 1..]);
+					// For a system-volume file, launch `write` as its own sandboxed ELF through
+					// PermissionManager (the launcher / granter): it inherits this cwd, resolves the
+					// path from the "<path> <text>" argument itself, and reports its own result. Other
+					// volumes (media / iso / udf), and a shell with no PermissionManager (a non-primary
+					// VT), write inline.
+					if on_system_volume(cwd, path_arg) && permsvc != 0 {
+						let mut arg: Vec<u8> = Vec::with_capacity(path_arg.len() + 1 + text.len());
+						arg.extend_from_slice(path_arg);
 						arg.push(b' ');
 						arg.extend_from_slice(text);
-						let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"write", &arg);
-						if !launched {
-							write_cmd(chan, uri.as_bytes(), text);
+						run_tool(permsvc, b"write", &arg, cwd.as_bytes());
+					} else {
+						match path::resolve(cwd, path_arg) {
+							Some(uri) => {
+								let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
+								write_cmd(chan, uri.as_bytes(), text);
+							}
+							None => print(b"write: invalid path\n"),
 						}
 					}
-					None => print(b"write: invalid path\n"),
-				},
-				None => print(b"usage: write <vol://...> <text>\n"),
+				}
+				None => print(b"usage: write <path> <text>\n"),
 			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"rm ") {
-			match resolve_path(cwd, trim(rest)) {
-				Some(uri) => {
-					let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
-					// For a system-volume file, launch `rm` as its own sandboxed ELF through
-					// PermissionManager (the launcher / granter): it grants the command just a
-					// storage client and forwards it this terminal, and the command reports its own
-					// result. Other volumes (media / iso / udf), and a shell with no
-					// PermissionManager (a non-primary VT), remove the file inline instead.
-					let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"rm", uri.as_bytes());
-					if !launched {
+			let arg: &[u8] = trim(rest);
+			// For a system-volume file, launch `rm` as its own sandboxed ELF through
+			// PermissionManager (the launcher / granter): it inherits this cwd, resolves the path
+			// itself, and reports its own result. Other volumes (media / iso / udf), and a shell
+			// with no PermissionManager (a non-primary VT), remove the file inline instead.
+			if on_system_volume(cwd, arg) && permsvc != 0 {
+				run_tool(permsvc, b"rm", arg, cwd.as_bytes());
+			} else {
+				match path::resolve(cwd, arg) {
+					Some(uri) => {
+						let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
 						rm_cmd(chan, uri.as_bytes());
 					}
+					None => print(b"rm: invalid path\n"),
 				}
-				None => print(b"rm: invalid path\n"),
 			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"mkdir ") {
-			match resolve_path(cwd, trim(rest)) {
-				Some(uri) => {
-					let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
-					// For a system-volume directory, launch `mkdir` as its own sandboxed ELF through
-					// PermissionManager (the launcher / granter): it grants the command just a
-					// storage client and forwards it this terminal, and the command reports its own
-					// result. Other volumes (media / iso / udf), and a shell with no
-					// PermissionManager (a non-primary VT), create the directory inline instead.
-					let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"mkdir", uri.as_bytes());
-					if !launched {
+			let arg: &[u8] = trim(rest);
+			// For a system-volume directory, launch `mkdir` as its own sandboxed ELF through
+			// PermissionManager (the launcher / granter): it inherits this cwd, resolves the path
+			// itself, and reports its own result. Other volumes (media / iso / udf), and a shell
+			// with no PermissionManager (a non-primary VT), create the directory inline instead.
+			if on_system_volume(cwd, arg) && permsvc != 0 {
+				run_tool(permsvc, b"mkdir", arg, cwd.as_bytes());
+			} else {
+				match path::resolve(cwd, arg) {
+					Some(uri) => {
+						let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
 						mkdir_cmd(chan, uri.as_bytes());
 					}
+					None => print(b"mkdir: invalid path\n"),
 				}
-				None => print(b"mkdir: invalid path\n"),
 			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"rmdir ") {
-			match resolve_path(cwd, trim(rest)) {
-				Some(uri) => {
-					let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
-					// For a system-volume directory, launch `rmdir` as its own sandboxed ELF through
-					// PermissionManager (the launcher / granter): it grants the command just a
-					// storage client and forwards it this terminal, and the command reports its own
-					// result. Other volumes (media / iso / udf), and a shell with no
-					// PermissionManager (a non-primary VT), remove the directory inline instead.
-					let launched: bool = chan == storage && permsvc != 0 && run_tool(permsvc, b"rmdir", uri.as_bytes());
-					if !launched {
+			let arg: &[u8] = trim(rest);
+			// For a system-volume directory, launch `rmdir` as its own sandboxed ELF through
+			// PermissionManager (the launcher / granter): it inherits this cwd, resolves the path
+			// itself, and reports its own result. Other volumes (media / iso / udf), and a shell
+			// with no PermissionManager (a non-primary VT), remove the directory inline instead.
+			if on_system_volume(cwd, arg) && permsvc != 0 {
+				run_tool(permsvc, b"rmdir", arg, cwd.as_bytes());
+			} else {
+				match path::resolve(cwd, arg) {
+					Some(uri) => {
+						let chan: u64 = storage_for(uri.as_bytes(), storage, media, iso, udf);
 						rmdir_cmd(chan, uri.as_bytes());
 					}
+					None => print(b"rmdir: invalid path\n"),
 				}
-				None => print(b"rmdir: invalid path\n"),
 			}
 			return false;
 		}
@@ -1012,7 +1024,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			// granter), which grants it a storage client and forwards it this terminal and the
 			// snapshot sub-form. A shell with no PermissionManager (a non-primary VT) manages
 			// snapshots inline instead.
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"snap", b"list");
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"snap", b"list", cwd.as_bytes());
 			if !launched {
 				snap_list_cmd(storage);
 			}
@@ -1023,7 +1035,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			let mut arg: Vec<u8> = Vec::with_capacity(7 + name.len());
 			arg.extend_from_slice(b"create ");
 			arg.extend_from_slice(name);
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"snap", &arg);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"snap", &arg, cwd.as_bytes());
 			if !launched {
 				snap_create_cmd(storage, name);
 			}
@@ -1034,7 +1046,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			let mut arg: Vec<u8> = Vec::with_capacity(7 + name.len());
 			arg.extend_from_slice(b"delete ");
 			arg.extend_from_slice(name);
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"snap", &arg);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"snap", &arg, cwd.as_bytes());
 			if !launched {
 				snap_delete_cmd(storage, name);
 			}
@@ -1045,7 +1057,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			let mut arg: Vec<u8> = Vec::with_capacity(4 + rest.len());
 			arg.extend_from_slice(b"cat ");
 			arg.extend_from_slice(rest);
-			let launched: bool = permsvc != 0 && run_tool(permsvc, b"snap", &arg);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"snap", &arg, cwd.as_bytes());
 			if !launched {
 				// "snap cat <name> <vol://...>": split on the first space.
 				match rest.iter().position(|&b: &u8| b == b' ') {
@@ -1192,23 +1204,29 @@ unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8]
 
 // Launch a system command as its own sandboxed ELF through PermissionManager and render
 // its output on this terminal. The shell hands PermissionManager the command name, its
-// argument string, and the write end of a fresh stdout channel; PermissionManager consults
-// the command's permission manifest, starts it, grants it exactly its declared capabilities,
-// and forwards that stdout end to it. The command prints through the one capability it was
-// granted, and the shell relays each message it sends to its own console until the command
-// exits and its stdout end closes. Returns true once the command was launched (its own
-// output, including any error it reports, has been rendered); false if PermissionManager
-// could not start it, so the caller can fall back to an inline path. This is the
-// governed-launch primitive: the shell reaches the OS commands only through PermissionManager
-// (the launcher / granter), never the raw process loader, so each command runs with exactly
-// its manifest's capabilities. Foreground only this milestone (no background / job control).
-unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8]) -> bool {
+// argument string, the inherited working directory, and the write end of a fresh stdout
+// channel; PermissionManager consults the command's permission manifest, starts it, grants
+// it exactly its declared capabilities, and forwards that stdout end and the cwd to it. The
+// command resolves a relative path argument against the inherited cwd, prints through the
+// one capability it was granted, and the shell relays each message it sends to its own
+// console until the command exits and its stdout end closes. Returns true once the command
+// was launched (its own output, including any error it reports, has been rendered); false if
+// PermissionManager could not start it, so the caller can fall back to an inline path. This
+// is the governed-launch primitive: the shell reaches the OS commands only through
+// PermissionManager (the launcher / granter), never the raw process loader, so each command
+// runs with exactly its manifest's capabilities. Foreground only this milestone (no
+// background / job control).
+unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8]) -> bool {
 	unsafe {
 		let name_str: &str = match core::str::from_utf8(name) {
 			Ok(s) => s,
 			Err(_) => return false,
 		};
 		let args_str: &str = match core::str::from_utf8(args) {
+			Ok(s) => s,
+			Err(_) => return false,
+		};
+		let cwd_str: &str = match core::str::from_utf8(cwd) {
 			Ok(s) => s,
 			Err(_) => return false,
 		};
@@ -1220,7 +1238,7 @@ unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8]) -> bool {
 		// channel. On the request that end is transferred away (to PermissionManager and on to
 		// the command), so we keep only the read end and never close the write end ourselves.
 		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
-		let task: u64 = match client.run(name_str, args_str, &out_write) {
+		let task: u64 = match client.run(name_str, args_str, cwd_str, &out_write) {
 			Some(Ok(started)) => started.task,
 			_ => {
 				close(out_read);
@@ -1953,56 +1971,12 @@ fn storage_for(uri: &[u8], storage: u64, media: u64, iso: u64, udf: u64) -> u64 
 	}
 }
 
-// Split a "vol://<volume>[/<tail>]" URI into its volume name and the remaining path
-// (without the leading slash). Returns None if the "vol://" scheme is missing.
-fn split_vol(uri: &[u8]) -> Option<(&[u8], &[u8])> {
-	let rest: &[u8] = uri.strip_prefix(b"vol://")?;
-	match rest.iter().position(|&b: &u8| b == b'/') {
-		Some(slash) => Some((&rest[..slash], &rest[slash + 1..])),
-		None => Some((rest, b"")),
-	}
-}
-
-// Normalize a '/'-separated path onto `segs`: empty and "." segments are dropped and
-// ".." pops the last segment (a no-op at the root), so the result stays clean.
-fn push_segments<'a>(tail: &'a [u8], segs: &mut Vec<&'a [u8]>) {
-	for seg in tail.split(|&b: &u8| b == b'/') {
-		if seg.is_empty() || seg == b"." {
-			continue;
-		}
-		if seg == b".." {
-			segs.pop();
-			continue;
-		}
-		segs.push(seg);
-	}
-}
-
-// Resolve a user-supplied path against the current working directory. An argument
-// that starts with "vol://" is absolute and starts fresh at its own volume; anything
-// else is relative and extends the cwd. The result is always a clean, normalized
-// "vol://<volume>[/<seg>...]" URI; returns None if the path is malformed (missing
-// scheme or volume, or non-UTF-8) so the caller can report it.
-fn resolve_path(cwd: &str, arg: &[u8]) -> Option<String> {
-	let arg: &[u8] = trim(arg);
-	let absolute: bool = arg.starts_with(b"vol://");
-	let base: &[u8] = if absolute { arg } else { cwd.as_bytes() };
-	let (volume, base_tail) = split_vol(base)?;
-	if volume.is_empty() {
-		return None;
-	}
-	let mut segs: Vec<&[u8]> = Vec::new();
-	push_segments(base_tail, &mut segs);
-	if !absolute {
-		push_segments(arg, &mut segs);
-	}
-	let mut out: String = String::from("vol://");
-	out.push_str(core::str::from_utf8(volume).ok()?);
-	for seg in segs {
-		out.push('/');
-		out.push_str(core::str::from_utf8(seg).ok()?);
-	}
-	Some(out)
+// True when a path argument resolves onto the system volume (a relative path inherits the
+// cwd's volume) - the one volume PermissionManager-launched tools are granted. The routing
+// test for the governed-ELF path: it parses only the volume, leaving the full resolution to
+// the tool itself.
+fn on_system_volume(cwd: &str, arg: &[u8]) -> bool {
+	matches!(path::volume(cwd, arg), Some(v) if v == b"system")
 }
 
 // Change the working directory. The target is resolved against the current cwd and
@@ -2010,7 +1984,7 @@ fn resolve_path(cwd: &str, arg: &[u8]) -> Option<String> {
 // StorageService; only then does the prompt move there.
 unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], session: u64, storage: u64, media: u64, iso: u64, udf: u64) {
 	unsafe {
-		let target: String = match resolve_path(cwd, arg) {
+		let target: String = match path::resolve(cwd, arg) {
 			Some(t) => t,
 			None => {
 				print(b"cd: invalid path\n");

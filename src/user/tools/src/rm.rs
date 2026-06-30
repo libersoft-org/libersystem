@@ -2,7 +2,8 @@
 //
 // PermissionManager launches this program under a permission manifest that grants it
 // exactly one capability - a StorageService (volume) client - and forwards it the shell's
-// stdout console and the argument string (the file URI to remove). rm deletes the file
+// stdout console, the argument string (the file path, relative or absolute), and the
+// inherited working directory. rm resolves the path against that cwd, deletes the file
 // through its storage grant, prints a one-line confirmation to the inherited stdout, and
 // exits. A standalone command, not a shell built-in: it reaches the filesystem only through
 // the one capability the permission store granted it, and renders on the same terminal as
@@ -15,6 +16,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use proto::path;
 use proto::system::volume;
 use rt::*;
 
@@ -25,14 +27,27 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the file URI to remove.
-		let uri: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
+		// 2. receive the argument string - the file path (relative to cwd or an absolute URI).
+		let arg: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, .. } => buf[..len].to_vec(),
 			Received::Closed => exit(),
 		};
 		// 3. receive the one capability the manifest grants: a StorageService client.
 		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or_else(|| exit());
-		rm(storage, &uri);
+		// 4. receive the inherited working directory (the last bootstrap message), and resolve
+		//    the path argument against it so a relative path reaches the same file the shell would.
+		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, .. } => buf[..len].to_vec(),
+			Received::Closed => Vec::new(),
+		};
+		let uri: String = match path::resolve(core::str::from_utf8(&cwd).unwrap_or(""), &arg) {
+			Some(u) => u,
+			None => {
+				print(b"rm: invalid path\n");
+				exit();
+			}
+		};
+		rm(storage, uri.as_bytes());
 	}
 	exit();
 }

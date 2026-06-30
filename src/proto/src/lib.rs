@@ -21,5 +21,8 @@ pub mod addr;
 // Hand-written ISO-8601 rendering for the generated `Timestamp` type.
 pub mod clock;
 
+// Hand-written `vol://` path resolution shared by the shell and the sandboxed tools.
+pub mod path;
+
 #[cfg(test)]
 mod tests;

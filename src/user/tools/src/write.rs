@@ -2,8 +2,9 @@
 //
 // PermissionManager launches this program under a permission manifest that grants it
 // exactly one capability - a StorageService (volume) client - and forwards it the shell's
-// stdout console and the argument string ("<uri> <text>"). write splits the URI from the
-// text, stages the text in a shared buffer, writes it through its storage grant, prints a
+// stdout console, the argument string ("<path> <text>"), and the inherited working
+// directory. write splits the path from the text, resolves the path against that cwd,
+// stages the text in a shared buffer, writes it through its storage grant, prints a
 // one-line confirmation to the inherited stdout, and exits. A standalone command, not a
 // shell built-in: it reaches the filesystem only through the one capability the permission
 // store granted it, and renders on the same terminal as the shell that launched it.
@@ -15,6 +16,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use proto::path;
 use proto::system::volume;
 use rt::*;
 
@@ -25,27 +27,41 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
-		// 2. receive the argument string - "<uri> <text>".
+		// 2. receive the argument string - "<path> <text>".
 		let args: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, .. } => buf[..len].to_vec(),
 			Received::Closed => exit(),
 		};
 		// 3. receive the one capability the manifest grants: a StorageService client.
 		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or_else(|| exit());
-		write(storage, &args);
+		// 4. receive the inherited working directory (the last bootstrap message), used to
+		//    resolve a relative path so it reaches the same file the shell would.
+		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, .. } => buf[..len].to_vec(),
+			Received::Closed => Vec::new(),
+		};
+		// Split the argument string into the path and the text (on the first space), then
+		// resolve the path against the inherited cwd.
+		let (path_arg, text): (&[u8], &[u8]) = match args.iter().position(|&b: &u8| b == b' ') {
+			Some(sp) => (&args[..sp], &args[sp + 1..]),
+			None => (&args[..], b""),
+		};
+		let uri: String = match path::resolve(core::str::from_utf8(&cwd).unwrap_or(""), path_arg) {
+			Some(u) => u,
+			None => {
+				print(b"write: invalid path\n");
+				exit();
+			}
+		};
+		write(storage, uri.as_bytes(), text);
 	}
 	exit();
 }
 
-// Split the argument string into the file URI and the text (on the first space), stage the
-// text in a shared buffer, write it through the storage grant, and print a one-line
-// confirmation - reporting a concise error if it cannot be written.
-unsafe fn write(storage: u64, args: &[u8]) {
+// Stage the text in a shared buffer, write it through the storage grant, and print a
+// one-line confirmation - reporting a concise error if it cannot be written.
+unsafe fn write(storage: u64, uri: &[u8], text: &[u8]) {
 	unsafe {
-		let (uri, text): (&[u8], &[u8]) = match args.iter().position(|&b: &u8| b == b' ') {
-			Some(sp) => (&args[..sp], &args[sp + 1..]),
-			None => (args, b""),
-		};
 		let data: proto::codec::Buffer = match make_buffer(text) {
 			Some(b) => b,
 			None => {

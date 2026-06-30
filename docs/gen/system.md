@@ -507,7 +507,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | --- | --- | --- |
 | 1 | `lookup` | `lookup(component: string) -> result<manifest, error>` |
 | 2 | `audit` | `audit() -> result<list<audit-entry>, error>` |
-| 3 | `run` | `run(name: string, args: string, stdout: handle<channel>) -> result<start-result, error>` |
+| 3 | `run` | `run(name: string, args: string, cwd: string, stdout: handle<channel>) -> result<start-result, error>` |
 
 ### interface `resources`
 

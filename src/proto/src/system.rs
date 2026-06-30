@@ -3676,7 +3676,7 @@ pub mod permission {
 	pub trait Service {
 		fn lookup(&mut self, component: String) -> Result<Manifest, Error>;
 		fn audit(&mut self) -> Result<Vec<AuditEntry>, Error>;
-		fn run(&mut self, name: String, args: String, stdout: u64) -> Result<StartResult, Error>;
+		fn run(&mut self, name: String, args: String, cwd: String, stdout: u64) -> Result<StartResult, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -3724,11 +3724,12 @@ pub mod permission {
 			OP_RUN => {
 				let name = r.string_lp()?;
 				let args = r.string_lp()?;
+				let cwd = r.string_lp()?;
 				let stdout = {
 					let _ = r.u32()?;
 					r.take_handle()
 				};
-				let result = service.run(name, args, stdout);
+				let result = service.run(name, args, cwd, stdout);
 				match &result {
 					Ok(v139) => {
 						w.u8(1)?;
@@ -3807,7 +3808,7 @@ pub mod permission {
 				Err(Error::read(r)?)
 			})
 		}
-		pub fn run(&mut self, name: &str, args: &str, stdout: &u64) -> Option<Result<StartResult, Error>> {
+		pub fn run(&mut self, name: &str, args: &str, cwd: &str, stdout: &u64) -> Option<Result<StartResult, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -3815,6 +3816,7 @@ pub mod permission {
 			w.u32(corr)?;
 			w.bytes_lp(name.as_bytes())?;
 			w.bytes_lp(args.as_bytes())?;
+			w.bytes_lp(cwd.as_bytes())?;
 			w.set_handle(*stdout);
 			w.u32(0)?;
 			let request_handle = writer.handle();

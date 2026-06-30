@@ -519,16 +519,16 @@ record audit-entry {
 // truth); `audit` returns the trail of every grant / deny decision the manager has
 // made; `run` is the launcher / granter primitive - it starts a named system tool (a
 // shell command run as its own ELF) under its manifest, granting it exactly its declared
-// capabilities and nothing else, forwards the caller's stdout console and argument string
-// to it, and returns the live process handle for job control. The granted clients are
-// transferred to the new process out-of-band over the bootstrap channel the manager drives
-// ProcessService to create; the manager is the launcher / granter, ProcessService the
-// mechanism. A caller (the shell) reaches the OS tools only through this op, never the raw
-// kernel loader.
+// capabilities and nothing else, forwards the caller's stdout console, argument string,
+// and inherited working directory to it, and returns the live process handle for job
+// control. The granted clients are transferred to the new process out-of-band over the
+// bootstrap channel the manager drives ProcessService to create; the manager is the
+// launcher / granter, ProcessService the mechanism. A caller (the shell) reaches the OS
+// tools only through this op, never the raw kernel loader.
 interface permission {
 	@op(1) lookup: func(component: string) -> result<manifest, error>;
 	@op(2) audit:  func() -> result<list<audit-entry>, error>;
-	@op(3) run:    func(name: string, args: string, stdout: handle<channel>) -> result<start-result, error>;
+	@op(3) run:    func(name: string, args: string, cwd: string, stdout: handle<channel>) -> result<start-result, error>;
 }
 
 // The kinds of resource the kernel accounts and the ResourceManager budgets per Domain:
