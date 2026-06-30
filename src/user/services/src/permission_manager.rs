@@ -85,7 +85,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // client only for the ones the supervisor wired it (the rest stay 0 - declared in the
 // vocabulary, not yet grantable - so a manifest naming them records the decision but hands
 // over nothing).
-const VOCABULARY: [Capability; 12] = [Capability::Storage, Capability::Log, Capability::Network, Capability::Device, Capability::Config, Capability::Time, Capability::Audio, Capability::Input, Capability::Graph, Capability::Resource, Capability::Process, Capability::Permission];
+const VOCABULARY: [Capability; 13] = [Capability::Storage, Capability::Log, Capability::Network, Capability::Device, Capability::Config, Capability::Time, Capability::Audio, Capability::Input, Capability::Graph, Capability::Resource, Capability::Process, Capability::Permission, Capability::Supervisor];
 
 // The manager's policy: the permission manifest declared for each component it governs -
 // the typed source of truth for what that component may be granted.
@@ -110,6 +110,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"ps" => Some(Manifest { component: String::from("ps"), grants: alloc::vec![Capability::Process] }),
 		b"run" => Some(Manifest { component: String::from("run"), grants: alloc::vec![Capability::Process] }),
 		b"perm" => Some(Manifest { component: String::from("perm"), grants: alloc::vec![Capability::Permission] }),
+		b"stop" => Some(Manifest { component: String::from("stop"), grants: alloc::vec![Capability::Supervisor] }),
 		_ => None,
 	}
 }
@@ -149,6 +150,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::Resource => b"RESOURCE",
 		Capability::Process => b"PROCESS",
 		Capability::Permission => b"PERMISSION",
+		Capability::Supervisor => b"SUPERVISOR",
 	}
 }
 
@@ -166,6 +168,7 @@ struct Clients {
 	resource: u64,
 	process: u64,
 	permission: u64,
+	supervisor: u64,
 }
 
 impl Clients {
@@ -184,6 +187,7 @@ impl Clients {
 			Capability::Resource => self.resource,
 			Capability::Process => self.process,
 			Capability::Permission => self.permission,
+			Capability::Supervisor => self.supervisor,
 		}
 	}
 }
@@ -394,16 +398,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 1. receive the grantable clients the manager may hand onward, then the ProcessService
 	//    client it drives to load the components it governs. A client the supervisor does not
 	//    grant arrives as 0 (the manager simply cannot grant what it does not hold). Storage,
-	//    log, network, time, config, device, audio, resource, and process are wired (time so the
-	//    governed `date` command can read the wall clock, config/device/audio/resource so the
-	//    governed `config` / `set`, `dev`, `beep`, and `usage` commands can reach their one
+	//    log, network, time, config, device, audio, resource, process, and supervisor are wired
+	//    (time so the governed `date` command can read the wall clock, config/device/audio/resource
+	//    so the governed `config` / `set`, `dev`, `beep`, and `usage` commands can reach their one
 	//    service, process so the governed `ps` / `run` commands can list / start processes - a
-	//    dedicated ProcessService connection, kept separate from the launch mechanism below); the
-	//    permission capability is not received but minted locally below (a self-connection to the
-	//    manager's own serve channel); the remaining vocabulary capabilities (input, graph) are
-	//    declared in the store but not wired - held 0, so a manifest naming one records the
-	//    decision yet hands over nothing (input / graph are single-client and cannot be proxied
-	//    at all).
+	//    dedicated ProcessService connection, kept separate from the launch mechanism below -, and
+	//    supervisor so the governed `stop` command can drive the supervisor's teardown path over a
+	//    dedicated ServiceManager admin channel); the permission capability is not received but
+	//    minted locally below (a self-connection to the manager's own serve channel); the remaining
+	//    vocabulary capabilities (input, graph) are declared in the store but not wired - held 0, so
+	//    a manifest naming one records the decision yet hands over nothing (input / graph are
+	//    single-client and cannot be proxied at all).
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or(0);
 	let log: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or(0);
 	let network: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NETWORK") }.unwrap_or(0);
@@ -413,6 +418,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let audio: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"AUDIO") }.unwrap_or(0);
 	let resource: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"RESOURCE") }.unwrap_or(0);
 	let process: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS_GRANT") }.unwrap_or(0);
+	// The admin channel the manager grants to the governed `stop` command (whose manifest
+	// grants supervisor): a dedicated ServiceManager admin channel, separate from the shell's,
+	// the manager holds but never drives itself - it only duplicates a narrowed copy onto the
+	// sandboxed `stop` tool, which speaks the bare request/reply teardown protocol over it.
+	let supervisor: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SUPERVISOR") }.unwrap_or(0);
 	// Mint the manager's self-connection: a dedicated channel pair whose server end is seeded
 	// into the serve set below (so requests on it are dispatched like any other client's) and
 	// whose client end the manager holds as the grantable `permission` capability. The governed
@@ -420,7 +430,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| exit());
-	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client };
+	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor };
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
 
 	// 2. wait for the serve channel clients reach us on.

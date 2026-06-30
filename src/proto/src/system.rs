@@ -3538,6 +3538,7 @@ pub enum Capability {
 	Resource = 9,
 	Process = 10,
 	Permission = 11,
+	Supervisor = 12,
 }
 
 impl Capability {
@@ -3571,6 +3572,7 @@ impl Capability {
 			9 => Some(Capability::Resource),
 			10 => Some(Capability::Process),
 			11 => Some(Capability::Permission),
+			12 => Some(Capability::Supervisor),
 			_ => None,
 		}
 	}
@@ -6060,6 +6062,7 @@ impl Capability {
 			Capability::Resource => out.push_str("\"resource\""),
 			Capability::Process => out.push_str("\"process\""),
 			Capability::Permission => out.push_str("\"permission\""),
+			Capability::Supervisor => out.push_str("\"supervisor\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -6076,6 +6079,7 @@ impl Capability {
 			Capability::Resource => out.push_str("resource"),
 			Capability::Process => out.push_str("process"),
 			Capability::Permission => out.push_str("permission"),
+			Capability::Supervisor => out.push_str("supervisor"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -6092,6 +6096,7 @@ impl Capability {
 			Capability::Resource => crate::codec::cbor::text(out, "resource"),
 			Capability::Process => crate::codec::cbor::text(out, "process"),
 			Capability::Permission => crate::codec::cbor::text(out, "permission"),
+			Capability::Supervisor => crate::codec::cbor::text(out, "supervisor"),
 		}
 	}
 }

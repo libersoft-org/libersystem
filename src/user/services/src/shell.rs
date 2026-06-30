@@ -699,7 +699,15 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"stop ") {
-			stop_service(adminsvc, trim(rest));
+			// Launch `stop` as its own sandboxed ELF through PermissionManager (the launcher /
+			// granter), which grants it a ServiceManager admin channel and forwards it this
+			// terminal and the service name. A shell with no PermissionManager (a non-primary VT)
+			// stops the service inline instead.
+			let name: &[u8] = trim(rest);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"stop", name);
+			if !launched {
+				stop_service(adminsvc, name);
+			}
 			return false;
 		}
 		if line == b"ps" {

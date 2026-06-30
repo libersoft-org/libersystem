@@ -189,6 +189,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// on (the supervisor serves it). Both are minted when the shell and SystemGraphService
 	// bootstrap, and stood on in the supervise loop.
 	let mut admin_server: u64 = 0;
+	// A second admin channel: the one PermissionManager grants to the sandboxed `stop`
+	// command (the supervisor capability), so `stop` run as its own ELF reaches the
+	// supervisor's teardown path. The supervisor keeps this server end too and stands on
+	// it alongside the shell's in the supervise loop; minted when PermissionManager
+	// bootstraps.
+	let mut admin_server2: u64 = 0;
 	let mut stats_server: u64 = 0;
 	loop {
 		let mut progress: bool = false;
@@ -196,7 +202,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut media_client, &mut iso_client, &mut udf_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut admin_server, &mut stats_server, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut media_client, &mut iso_client, &mut udf_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut admin_server, &mut admin_server2, &mut stats_server, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -289,7 +295,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    (reverse-dependency teardown), or SystemGraphService querying the supervisor state.
 	//    No timer stands here, so the loop sleeps at ~0% CPU until an event arrives.
 	unsafe {
-		supervise(&mut state, &mut channels, &mut sup, &procs, &package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, admin_server, stats_server, log_client, bootstrap, park, &mut buf);
+		supervise(&mut state, &mut channels, &mut sup, &procs, &package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, admin_server, admin_server2, stats_server, log_client, bootstrap, park, &mut buf);
 	}
 	exit();
 }
@@ -342,7 +348,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, admin_server: &mut u64, stats_server: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		// media_storage is a second instance of the storage_service binary, mounting the
 		// FAT disk as vol://media instead of the writable system disk; iso_storage is a
@@ -409,7 +415,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
 			return State::Failed;
 		}
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *res_client, *process_client, perm_client) {
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *res_client, *process_client, perm_client, admin_server2) {
 			return State::Failed;
 		}
 		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, pkg_handle, pkg_len, buf) {
@@ -700,7 +706,7 @@ unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], st
 // narrower client to each component it sandboxes. (The grantable permission capability - a
 // connection to the manager's own serve channel - is not passed here: the manager mints that
 // self-connection itself.)
-unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, resource_client: u64, process_client: u64, perm_client: &mut u64) -> bool {
+unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, resource_client: u64, process_client: u64, perm_client: &mut u64, admin_server2: &mut u64) -> bool {
 	unsafe {
 		// A fresh StorageService connection for the manager (independent of the shell's),
 		// duplicable so the manager can grant a narrowed copy to a sandboxed component.
@@ -782,6 +788,20 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, l
 		if !send_blocking(manager_side, b"PROCESS_GRANT", process_grant) {
 			return false;
 		}
+		// A fresh admin channel the manager grants to the governed `stop` command (whose
+		// manifest grants supervisor): the supervisor keeps the server end (in `*admin_server2`)
+		// and stands on it in the supervise loop, while the client end is handed to the manager,
+		// which duplicates a narrowed copy onto the sandboxed `stop` tool. A dedicated channel,
+		// separate from the shell's own admin channel, so a granted tool's teardown requests
+		// never race the shell's built-in `stop`.
+		let (admin_srv2, admin_cli2): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"SUPERVISOR", admin_cli2) {
+			return false;
+		}
+		*admin_server2 = admin_srv2;
 		// A fresh ProcessService connection the manager drives to load the components it
 		// governs - the loading mechanism, kept separate from the granting policy.
 		let proc_conn: u64 = match service_connect(process_client) {
@@ -1192,14 +1212,15 @@ unsafe fn sleep_ticks(park: u64, ticks: u64) {
 // wait set so its dead channel does not busy-loop); an admin message drives a reverse-
 // dependency stop; a stats request is answered over the `supervisor` interface. Returns
 // when nothing is left to watch.
-unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], package: &Package, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, admin_server: u64, stats_server: u64, log_client: u64, up: u64, park: u64, buf: &mut [u8]) {
+unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], package: &Package, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, admin_server: u64, admin_server2: u64, stats_server: u64, log_client: u64, up: u64, park: u64, buf: &mut [u8]) {
 	unsafe {
 		let mut admin: u64 = admin_server;
+		let mut admin2: u64 = admin_server2;
 		let mut stats: u64 = stats_server;
 		loop {
-			let mut handles: [u64; N + 3] = [0u64; N + 3];
-			let mut kinds: [u8; N + 3] = [0u8; N + 3];
-			let mut idxs: [usize; N + 3] = [0usize; N + 3];
+			let mut handles: [u64; N + 4] = [0u64; N + 4];
+			let mut kinds: [u8; N + 4] = [0u8; N + 4];
+			let mut idxs: [usize; N + 4] = [0usize; N + 4];
 			let mut count: usize = 0;
 			let mut i: usize = 0;
 			while i < N {
@@ -1224,6 +1245,11 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 			if stats != 0 {
 				handles[count] = stats;
 				kinds[count] = 3;
+				count += 1;
+			}
+			if admin2 != 0 {
+				handles[count] = admin2;
+				kinds[count] = 4;
 				count += 1;
 			}
 			if count == 0 {
@@ -1262,10 +1288,17 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 						admin = 0;
 					}
 				}
-				_ => {
+				3 => {
 					// SystemGraphService queried the supervisor state; answer one request.
 					if !serve_stats_once(stats, sup, canary_sup, buf) {
 						stats = 0;
+					}
+				}
+				_ => {
+					// The sandboxed `stop` tool (granted the supervisor capability) asked to
+					// stop a service over its own admin channel; tear down its dependents first.
+					if !handle_admin(admin2, state, channels, sup, procs, log_client, up, buf) {
+						admin2 = 0;
 					}
 				}
 			}
