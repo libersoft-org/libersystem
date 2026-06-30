@@ -85,6 +85,10 @@ name = "stop"
 path = "src/stop.rs"
 
 [[bin]]
+name = "lsvol"
+path = "src/lsvol.rs"
+
+[[bin]]
 name = "ping"
 path = "src/ping.rs"
 

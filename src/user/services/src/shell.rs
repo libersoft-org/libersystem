@@ -837,7 +837,14 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"lsvol" {
-			lsvol_cmd(storage, media, iso, udf);
+			// Launch `lsvol` as its own sandboxed ELF through PermissionManager (the launcher /
+			// granter), which grants it the four volume StorageService clients (the `volumes`
+			// capability) and forwards it this terminal. A shell with no PermissionManager (a
+			// non-primary VT) lists the volumes inline instead.
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"lsvol", b"");
+			if !launched {
+				lsvol_cmd(storage, media, iso, udf);
+			}
 			return false;
 		}
 		if line == b"cd" {

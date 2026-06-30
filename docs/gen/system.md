@@ -316,6 +316,7 @@ An opaque kernel object, transferred as `handle<task>`.
 | `process` | 10 |
 | `permission` | 11 |
 | `supervisor` | 12 |
+| `volumes` | 13 |
 
 ### record `manifest`
 
