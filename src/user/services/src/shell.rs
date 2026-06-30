@@ -703,7 +703,15 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"run ") {
-			run_process(procsvc, trim(rest));
+			// Launch `run` as its own sandboxed ELF through PermissionManager (the launcher /
+			// granter), which grants it a process client and forwards it this terminal and the
+			// program name. A shell with no PermissionManager (a non-primary VT) starts the
+			// program inline instead.
+			let name: &[u8] = trim(rest);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"run", name);
+			if !launched {
+				run_process(procsvc, name);
+			}
 			return false;
 		}
 		if line == b"config" {
