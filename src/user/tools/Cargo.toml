@@ -65,6 +65,10 @@ name = "beep"
 path = "src/beep.rs"
 
 [[bin]]
+name = "usage"
+path = "src/usage.rs"
+
+[[bin]]
 name = "ping"
 path = "src/ping.rs"
 

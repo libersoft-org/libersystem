@@ -671,11 +671,21 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"usage" {
-			query_resource(ressvc, false);
+			// Launch `usage` as its own sandboxed ELF through PermissionManager (the launcher /
+			// granter), which grants it a resource client and forwards it this terminal and the
+			// sub-form argument. A shell with no PermissionManager (a non-primary VT) reads the
+			// budgets inline instead.
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"usage", b"");
+			if !launched {
+				query_resource(ressvc, false);
+			}
 			return false;
 		}
 		if line == b"usage json" {
-			query_resource(ressvc, true);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"usage", b"json");
+			if !launched {
+				query_resource(ressvc, true);
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"stop ") {

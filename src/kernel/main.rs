@@ -690,14 +690,16 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	// still serves the RTC-seeded wall clock to the governed `date` command.
 	let (time_net_server, time_net_client) = Channel::create();
 	core::mem::drop(time_net_server);
-	// The manager's config / device / audio capabilities: real, dead-peer clients (no such
-	// services run in this scenario), held but never granted to the governed components here.
+	// The manager's config / device / audio / resource capabilities: real, dead-peer clients (no
+	// such services run in this scenario), held but never granted to the governed components here.
 	let (config_server, config_client) = Channel::create();
 	core::mem::drop(config_server);
 	let (device_server, device_client) = Channel::create();
 	core::mem::drop(device_server);
 	let (audio_server, audio_client) = Channel::create();
 	core::mem::drop(audio_server);
+	let (resource_server, resource_client) = Channel::create();
+	core::mem::drop(resource_server);
 
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
@@ -722,9 +724,9 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	send_cap(&time_boot_kernel, b"SERVE", time_server, Rights::ALL)?;
 
 	// PermissionManager: the grantable clients (storage + log, both duplicable, and time, plus
-	// dead-peer config / device / audio it holds but does not grant here), a network client it
-	// withholds, the ProcessService client it drives to load the components, and the channel
-	// its clients reach it on. The order matches PermissionManager's receive order.
+	// dead-peer config / device / audio / resource it holds but does not grant here), a network
+	// client it withholds, the ProcessService client it drives to load the components, and the
+	// channel its clients reach it on. The order matches PermissionManager's receive order.
 	send_cap(&pm_boot_kernel, b"STORAGE", storage_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"LOG", log_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"NETWORK", net_client, Rights::ALL)?;
@@ -732,6 +734,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	send_cap(&pm_boot_kernel, b"CONFIG", config_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"DEVICE", device_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"AUDIO", audio_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"RESOURCE", resource_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"PROCESS", process_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"SERVE", perm_server, Rights::ALL)?;
 

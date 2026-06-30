@@ -53,7 +53,7 @@ const N: usize = 18;
 // component it observes (so it holds their process handles for the live graph), and
 // the shell is the last component up: it depends on StorageService (which it talks to
 // over IPC) and on SystemGraphService (whose graph its `graph` command renders).
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"media_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"network_service", b"time_service", b"config_service", b"device_service", b"audio_service", b"process_service"] }, Service { name: b"resource_manager", deps: &[b"log_service"] }];
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"media_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"network_service", b"time_service", b"config_service", b"device_service", b"audio_service", b"process_service", b"resource_manager"] }, Service { name: b"resource_manager", deps: &[b"log_service"] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -409,7 +409,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
 			return State::Failed;
 		}
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *process_client, perm_client) {
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *res_client, *process_client, perm_client) {
 			return State::Failed;
 		}
 		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, pkg_handle, pkg_len, buf) {
@@ -698,7 +698,7 @@ unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], st
 // LOG, NETWORK, TIME, CONFIG, DEVICE, AUDIO, PROCESS, SERVE. The grantable clients carry
 // RIGHT_DUPLICATE so the manager can attenuate and hand a strictly narrower client to
 // each component it sandboxes.
-unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, process_client: u64, perm_client: &mut u64) -> bool {
+unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, resource_client: u64, process_client: u64, perm_client: &mut u64) -> bool {
 	unsafe {
 		// A fresh StorageService connection for the manager (independent of the shell's),
 		// duplicable so the manager can grant a narrowed copy to a sandboxed component.
@@ -759,6 +759,15 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, l
 			None => return false,
 		};
 		if !send_blocking(manager_side, b"AUDIO", audio_conn) {
+			return false;
+		}
+		// A fresh ResourceManager connection the manager grants to the governed `usage` command
+		// (whose manifest grants resource).
+		let resource_conn: u64 = match service_connect(resource_client) {
+			Some(h) => h,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"RESOURCE", resource_conn) {
 			return false;
 		}
 		// A fresh ProcessService connection the manager drives to load the components it
