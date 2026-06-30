@@ -26,6 +26,7 @@ use super::rights::Rights;
 use super::thread::Thread;
 use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::fault::FaultInfo;
+use crate::sched;
 use crate::sync::SpinLock;
 
 pub struct Process {
@@ -40,6 +41,11 @@ pub struct Process {
 	// Set when the process is killed (by a fault or a Domain kill); its threads
 	// observe this at their next scheduling point and exit.
 	killed: AtomicBool,
+	// Set when the process's last thread has exited (a clean exit, no kill). Together
+	// with `killed` this is the terminal "process gone" condition a Process handle
+	// becomes waitable on - the kernel's equivalent of a process-terminated signal,
+	// so a holder of the handle can wait for the process to finish instead of polling.
+	exited: AtomicBool,
 	// Physical frames backing this process's user image and stack. The address
 	// space frees only its page-table structure, not the leaf frames its entries
 	// point at, so the Process owns those frames and frees them on drop. Empty for
@@ -73,7 +79,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), exited: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0) });
 		// Register with the Domain so a Domain kill can reach and terminate it.
 		process.domain.register_process(&process);
 		process
@@ -122,6 +128,21 @@ impl Process {
 	// Whether this process has been killed and its threads should exit.
 	pub fn is_killed(&self) -> bool {
 		self.killed.load(Ordering::Acquire)
+	}
+
+	// Mark the process as having exited cleanly (its last thread is gone) and wake
+	// anything blocked on the process handle, so a waiter observes the termination at
+	// once. Idempotent: the scheduler calls it as the final thread retires.
+	pub fn mark_exited(&self) {
+		self.exited.store(true, Ordering::Release);
+		sched::wake_object(self.header.koid());
+	}
+
+	// Whether the process has reached a terminal state - killed by a fault / kill, or
+	// exited cleanly. This is the waitable "process terminated" condition: a Process
+	// handle becomes ready in `wait` once it holds.
+	pub fn is_terminated(&self) -> bool {
+		self.killed.load(Ordering::Acquire) || self.exited.load(Ordering::Acquire)
 	}
 
 	// Record a thread as belonging to this process (a weak forward link), so signal
@@ -208,6 +229,9 @@ impl Process {
 	pub fn terminate(&self) {
 		self.killed.store(true, Ordering::Release);
 		self.handles.lock().close_all();
+		// A kill is a terminal state, so wake anything blocked on this process handle to
+		// observe it - the same process-terminated signal a clean exit delivers.
+		sched::wake_object(self.header.koid());
 	}
 }
 

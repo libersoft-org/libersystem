@@ -217,6 +217,20 @@ pub fn current_thread() -> Option<Arc<Thread>> {
 
 // Terminate the calling thread. Never returns.
 pub fn exit() -> ! {
+	// If this is the last live thread of its process, the process has now terminated:
+	// mark it so a holder of its handle waiting on the process-terminated signal wakes.
+	// Scoped so the thread Arc is released before we retire - exit() never returns, and
+	// holding the Arc across it would pin the thread and keep its slot from being
+	// refunded.
+	{
+		if let Some(thread) = current_thread() {
+			let process = thread.process();
+			let others = process.live_threads().iter().filter(|t: &&Arc<Thread>| !Arc::ptr_eq(t, &thread)).count();
+			if others == 0 {
+				process.mark_exited();
+			}
+		}
+	}
 	reschedule(Disposition::Retire);
 	// The scheduler always switches away from a retiring thread; reaching here
 	// would mean it failed to, so halt rather than run on a corrupt stack.

@@ -1836,6 +1836,49 @@ fn wait_any_wakes_on_the_ready_handle() {
 
 #[cfg(test)]
 #[test_case]
+fn waiting_on_a_process_handle_wakes_when_it_exits() {
+	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+	static WAIT_RET: AtomicI64 = AtomicI64::new(-999);
+	static DONE: AtomicBool = AtomicBool::new(false);
+	// A subject process blocks until released, then returns - its last thread exiting
+	// terminates the process. A waiter blocks in SYS_WAIT on a handle to that process.
+	// The Process handle must stay unready while the subject runs, then become ready -
+	// waking the waiter, which returns 0 - once the subject exits. This is the
+	// process-terminated signal that lets a parent wait for a child to finish instead
+	// of polling, the primitive shell job control reaps background jobs on.
+	extern "C" fn subject(release: u64) {
+		unsafe {
+			// Block until the test sends on the release channel's peer, then fall off
+			// the end -> thread_bootstrap -> sched::exit(), terminating the process.
+			arch::syscall::invoke(syscall::SYS_WAIT, release, 0, 0, 0);
+		}
+	}
+	extern "C" fn waiter(proc_handle: u64) {
+		unsafe {
+			let ret = arch::syscall::invoke(syscall::SYS_WAIT, proc_handle, 0, 0, 0);
+			WAIT_RET.store(ret as i64, Ordering::SeqCst);
+			DONE.store(true, Ordering::SeqCst);
+		}
+	}
+	let (rel0, rel1) = object::channel::Channel::create();
+	let subject_thread = sched::spawn_with_object(subject, rel0, object::rights::Rights::ALL, 0);
+	let subject_process = subject_thread.process().clone();
+	// The waiter gets a handle to the subject's process as its argument (installed by
+	// spawn_with_object), carrying the WAIT right.
+	let _waiter = sched::spawn_with_object(waiter, subject_process.clone(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	// Both are blocked now: the subject on the release channel, the waiter on the
+	// not-yet-terminated process handle.
+	assert!(!DONE.load(Ordering::SeqCst), "the waiter blocks while the subject still runs");
+	// Release the subject so it returns and exits.
+	rel1.send(object::channel::Message::new(alloc::vec![1], alloc::vec::Vec::new(), 0)).unwrap();
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the waiter wakes once the subject exits");
+	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 0, "the process handle became ready on exit");
+}
+
+#[cfg(test)]
+#[test_case]
 fn signal_terminate_wakes_a_blocked_thread() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::thread::ThreadState;

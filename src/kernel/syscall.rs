@@ -1109,6 +1109,12 @@ fn object_ready(object: &Arc<dyn KernelObject>) -> bool {
 	if let Some(interrupt) = any.downcast_ref::<Interrupt>() {
 		return interrupt.is_pending();
 	}
+	if let Some(process) = any.downcast_ref::<Process>() {
+		// A Process handle becomes ready once the process has terminated (exited or
+		// been killed), so a holder can wait for a child to finish - the kernel's
+		// process-terminated signal.
+		return process.is_terminated();
+	}
 	false
 }
 
