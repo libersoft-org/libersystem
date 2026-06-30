@@ -5,13 +5,15 @@
 // channel its clients reach it on. Over that channel clients speak the generated
 // `liber:system` Session bindings.
 //
-// A session is a long-lived login context: it owns the working directory (and, in
-// later phases, the environment and the job table). Each session is reached over its
+// A session is a long-lived login context: it owns the working directory and the job
+// table (and, in a later phase, the environment). Each session is reached over its
 // own dedicated channel - the session capability the spawner (ServiceManager for VT 1,
 // ConsoleService for the other VTs) mints with `service_connect` and hands to the
 // shell. The spawner keeps the channel and re-hands a duplicate to each shell it
-// starts, so the session - and thus the cwd - outlives any one shell: a logout or a
-// supervisor restart leaves it intact, because SessionService, not the shell, holds it.
+// starts, so the session - and thus the cwd and the job table - outlives any one shell:
+// a logout or a supervisor restart leaves it intact, because SessionService, not the
+// shell, holds it. Background jobs in particular survive a shell restart because their
+// live Process handles live here, not in the shell that started them.
 //
 // One session per connected channel: `serve_multi` hands every request the channel it
 // arrived on, and the first request on a channel lazily creates a fresh session at the
@@ -28,7 +30,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::system::session::{self, Service};
-use proto::system::Error;
+use proto::system::{Error, JobEntry, JobInfo};
 use rt::*;
 
 // The default working directory a fresh session starts in: the root of the system
@@ -36,15 +38,30 @@ use rt::*;
 // own DEFAULT_CWD, the one place a prompt starts.
 const DEFAULT_CWD: &str = "vol://system";
 
-// One login session's state: its working directory (later phases add the environment
-// and the job table). Behind the generated Session contract.
+// One tracked background / stopped job in a session's job table: the live Process handle
+// (the shell transferred it here, held with WAIT so the session can poll it and MANAGE so
+// it can signal it), the program name, the session-assigned id, and whether it is
+// currently stopped (suspended by Ctrl+Z).
+struct Job {
+	id: u32,
+	proc: u64,
+	name: String,
+	stopped: bool,
+}
+
+// One login session's state: its working directory and its job table - the tracked jobs
+// and the next id to assign (later a phase adds the environment). Behind the generated
+// Session contract. The job ids are session-assigned, so they stay stable across a shell
+// restart.
 struct Session {
 	cwd: String,
+	jobs: Vec<Job>,
+	next_id: u32,
 }
 
 impl Session {
 	fn new() -> Session {
-		Session { cwd: String::from(DEFAULT_CWD) }
+		Session { cwd: String::from(DEFAULT_CWD), jobs: Vec::new(), next_id: 1 }
 	}
 }
 
@@ -56,6 +73,58 @@ impl Service for Session {
 	fn chdir(&mut self, path: String) -> Result<(), Error> {
 		self.cwd = path;
 		Ok(())
+	}
+
+	// Register a background or stopped job: the request transferred us its live Process
+	// handle, which we keep so the job outlives the shell that started it. We assign and
+	// return the small id the shell shows the user.
+	fn job_register(&mut self, name: String, stopped: bool, proc: u64) -> Result<u32, Error> {
+		let id: u32 = self.next_id;
+		self.next_id = self.next_id.wrapping_add(1);
+		self.jobs.push(Job { id, proc, name, stopped });
+		Ok(id)
+	}
+
+	// Take a job back out for foregrounding: remove it and transfer its Process handle to
+	// the caller (the reply carries the handle out-of-band). NotFound if no such id.
+	fn job_take(&mut self, id: u32) -> Result<JobEntry, Error> {
+		let pos: usize = self.jobs.iter().position(|j: &Job| j.id == id).ok_or(Error::NotFound)?;
+		let job: Job = self.jobs.remove(pos);
+		Ok(JobEntry { info: JobInfo { id: job.id, name: job.name, stopped: job.stopped }, proc: job.proc })
+	}
+
+	// List the tracked jobs for the shell's `jobs` command.
+	fn job_list(&mut self) -> Result<Vec<JobInfo>, Error> {
+		Ok(self.jobs.iter().map(|j: &Job| JobInfo { id: j.id, name: j.name.clone(), stopped: j.stopped }).collect())
+	}
+
+	// Reap finished jobs: poll each running (not stopped) job's Process handle - once it
+	// reads ready the process has terminated - then drop it (closing the handle) and report
+	// it, the way a shell announces a background job's completion before the next prompt.
+	fn job_reap(&mut self) -> Result<Vec<JobInfo>, Error> {
+		let mut done: Vec<JobInfo> = Vec::new();
+		let mut i: usize = 0;
+		while i < self.jobs.len() {
+			if !self.jobs[i].stopped && unsafe { poll_ready(self.jobs[i].proc) } {
+				let job: Job = self.jobs.remove(i);
+				unsafe { close(job.proc) };
+				done.push(JobInfo { id: job.id, name: job.name, stopped: job.stopped });
+			} else {
+				i += 1;
+			}
+		}
+		Ok(done)
+	}
+
+	// Resume a stopped job in the background (SIG_CONT), leaving it tracked. NotFound if no
+	// such id; a job that is already running is left as is.
+	fn job_resume(&mut self, id: u32) -> Result<JobInfo, Error> {
+		let pos: usize = self.jobs.iter().position(|j: &Job| j.id == id).ok_or(Error::NotFound)?;
+		if self.jobs[pos].stopped {
+			unsafe { signal(self.jobs[pos].proc, SIG_CONT) };
+			self.jobs[pos].stopped = false;
+		}
+		Ok(JobInfo { id: self.jobs[pos].id, name: self.jobs[pos].name.clone(), stopped: self.jobs[pos].stopped })
 	}
 }
 

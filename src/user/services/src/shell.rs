@@ -16,7 +16,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::path;
-use proto::system::{audio, config, device, input, log, network, permission, process, resources, session, system_graph, time, volume, AuditEntry, Budget, Component, ConfigEntry, DeviceEntry, Entry, FileKind, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan};
+use proto::system::{audio, config, device, input, log, network, permission, process, resources, session, system_graph, time, volume, AuditEntry, Budget, Component, ConfigEntry, DeviceEntry, Entry, FileKind, JobEntry, JobInfo, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -164,7 +164,7 @@ fn print_banner(lines: &[&str]) {
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
 unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, session: u64, adminsvc: u64, buf: &mut [u8]) {
 	unsafe {
-		let mut jobs: Jobs = Jobs::new(control);
+		let mut jobs: Jobs = Jobs::new(control, session);
 		// The cwd is owned by the session (so it survives a shell restart); read it once at
 		// startup, then keep a local cache so the prompt and path resolution need no IPC
 		// round-trip each line. `cd` updates the session and refreshes this cache. With no
@@ -193,7 +193,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			if dispatch(line, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, session, adminsvc, &mut jobs, &mut cwd) {
 				return;
 			}
-			reap_jobs(&mut jobs);
+			jobs.reap();
 			// the prompt shows the current working directory, so it sits in real storage.
 			print(b"\x1b[1;32m");
 			print(cwd.as_bytes());
@@ -203,29 +203,171 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 }
 
 // Dispatch one command line. Returns true if the shell should exit.
-// A background or suspended job the shell tracks: the child Process handle (which it
-// both signals and waits on, the handle becoming ready once the process terminates),
-// a display name, a small id, and whether it is currently stopped (suspended by
-// Ctrl+Z).
+// The in-flight foreground job: the child's live Process handle (ready once the process
+// terminates) and a display name. Background and stopped jobs live in the session's job
+// table, not here - this is only the job the shell is currently running in the foreground,
+// or one just handed back after a Ctrl+Z suspend on its way to the session.
 struct Job {
-	id: usize,
 	proc: u64,
 	name: Vec<u8>,
-	stopped: bool,
 }
 
-// The shell's job-control state: the per-VT control channel to ConsoleService (the tty
-// signals the foreground job over it and reports a Ctrl+Z suspend back), the tracked
-// jobs, and the next id to assign.
+// The shell's job-control state. The job table itself lives in SessionService - so jobs
+// (their live Process handles) survive a shell restart - and the shell is a thin client.
+// It keeps the per-VT control channel to ConsoleService (the tty signals the foreground
+// job over it and reports a Ctrl+Z suspend back) and the session channel it registers,
+// lists and reaps jobs over. With no session (a minimal boot) job control degrades: `&`
+// runs foreground and `jobs` / `fg` / `bg` report no jobs.
 struct Jobs {
 	control: u64,
-	list: Vec<Job>,
-	next_id: usize,
+	session: u64,
 }
 
 impl Jobs {
-	fn new(control: u64) -> Jobs {
-		Jobs { control, list: Vec::new(), next_id: 1 }
+	fn new(control: u64, session: u64) -> Jobs {
+		Jobs { control, session }
+	}
+
+	// Register a background or stopped job with the session, transferring it the live
+	// Process handle (so the job survives a shell restart); the session assigns and returns
+	// the small id. None when there is no session to hold it, or the register failed - the
+	// caller then disposes of the job itself.
+	fn register(&mut self, proc: u64, name: &[u8], stopped: bool) -> Option<u32> {
+		if self.session == 0 {
+			return None;
+		}
+		let name_str: &str = core::str::from_utf8(name).unwrap_or("");
+		match session::Client::new(ChannelTransport { chan: self.session }).job_register(name_str, &stopped, &proc) {
+			Some(Ok(id)) => Some(id),
+			_ => None,
+		}
+	}
+
+	// Run a job in the foreground; if Ctrl+Z suspends it, hand the stopped job to the
+	// session as a background job. With no session to hold it, resume it instead (so it is
+	// not left suspended) and stop tracking it.
+	unsafe fn run_foreground_tracked(&mut self, job: Job) {
+		unsafe {
+			if let Some(suspended) = run_foreground(self.control, job) {
+				if self.register(suspended.proc, &suspended.name, true).is_none() {
+					signal(suspended.proc, SIG_CONT);
+					close(suspended.proc);
+				}
+			}
+		}
+	}
+
+	// Reap finished background jobs: ask the session which have terminated and announce
+	// each. Called before each prompt, the way a shell reports a background job's completion.
+	unsafe fn reap(&mut self) {
+		unsafe {
+			if self.session == 0 {
+				return;
+			}
+			if let Some(Ok(finished)) = session::Client::new(ChannelTransport { chan: self.session }).job_reap() {
+				for job in &finished {
+					print(b"[");
+					print_usize(job.id as usize);
+					print(b"] done   ");
+					print(job.name.as_bytes());
+					print(b"\n");
+				}
+			}
+		}
+	}
+
+	// `jobs`: list the session's tracked background / stopped jobs.
+	unsafe fn list(&self) {
+		unsafe {
+			if self.session == 0 {
+				print(b"no jobs\n");
+				return;
+			}
+			match session::Client::new(ChannelTransport { chan: self.session }).job_list() {
+				Some(Ok(jobs)) if !jobs.is_empty() => {
+					for job in &jobs {
+						print(b"[");
+						print_usize(job.id as usize);
+						print(b"] ");
+						print(if job.stopped { b"stopped  " } else { b"running  " });
+						print(job.name.as_bytes());
+						print(b"\n");
+					}
+				}
+				_ => print(b"no jobs\n"),
+			}
+		}
+	}
+
+	// Resolve a `fg` / `bg` argument to a session job id: an explicit id, or the most
+	// recent job (the last the session lists) when no id is given. None when there is no
+	// such job or no session.
+	fn resolve_id(&self, arg: &[u8]) -> Option<u32> {
+		let arg: &[u8] = trim(arg);
+		if !arg.is_empty() {
+			return parse_usize(arg).map(|n: usize| n as u32);
+		}
+		if self.session == 0 {
+			return None;
+		}
+		match session::Client::new(ChannelTransport { chan: self.session }).job_list() {
+			Some(Ok(list)) => list.last().map(|j: &JobInfo| j.id),
+			_ => None,
+		}
+	}
+
+	// `fg [id]`: bring a job to the foreground. Take it from the session (which transfers
+	// us its Process handle back), resume it if stopped (SIG_CONT), then run it foreground
+	// so it can be interrupted / suspended once more.
+	unsafe fn fg(&mut self, arg: &[u8]) {
+		unsafe {
+			let id: u32 = match self.resolve_id(arg) {
+				Some(i) => i,
+				None => {
+					print(b"fg: no such job\n");
+					return;
+				}
+			};
+			let entry: JobEntry = match session::Client::new(ChannelTransport { chan: self.session }).job_take(&id) {
+				Some(Ok(e)) => e,
+				_ => {
+					print(b"fg: no such job\n");
+					return;
+				}
+			};
+			let stopped: bool = entry.info.stopped;
+			let job: Job = Job { proc: entry.proc, name: entry.info.name.into_bytes() };
+			if stopped {
+				signal(job.proc, SIG_CONT);
+			}
+			print(&job.name);
+			print(b"\n");
+			self.run_foreground_tracked(job);
+		}
+	}
+
+	// `bg [id]`: resume a stopped job in the background (SIG_CONT), leaving it tracked in
+	// the session.
+	unsafe fn bg(&mut self, arg: &[u8]) {
+		unsafe {
+			let id: u32 = match self.resolve_id(arg) {
+				Some(i) => i,
+				None => {
+					print(b"bg: no such job\n");
+					return;
+				}
+			};
+			match session::Client::new(ChannelTransport { chan: self.session }).job_resume(&id) {
+				Some(Ok(info)) => {
+					print(b"[");
+					print_usize(info.id as usize);
+					print(b"] ");
+					print(info.name.as_bytes());
+					print(b" &\n");
+				}
+				_ => print(b"bg: no such job\n"),
+			}
+		}
 	}
 }
 
@@ -260,17 +402,6 @@ fn parse_usize(s: &[u8]) -> Option<usize> {
 		v = v.checked_mul(10)?.checked_add((b - b'0') as usize)?;
 	}
 	Some(v)
-}
-
-// Resolve a `fg` / `bg` argument to a job-list index: an explicit id, or the most
-// recent job when no id is given.
-fn job_index(jobs: &Jobs, arg: &[u8]) -> Option<usize> {
-	let arg = trim(arg);
-	if arg.is_empty() {
-		return if jobs.list.is_empty() { None } else { Some(jobs.list.len() - 1) };
-	}
-	let id = parse_usize(arg)?;
-	jobs.list.iter().position(|j: &Job| j.id == id)
 }
 
 // Run a foreground job: hand the tty this job (SET_FG, with a MANAGE+TRANSFER dup of its
@@ -311,9 +442,7 @@ unsafe fn run_foreground(control: u64, job: Job) -> Option<Job> {
 					// The tty suspended the job (Ctrl+Z): release the tty and hand the job
 					// back to be tracked as a stopped background job.
 					send_blocking(control, b"CLEAR_FG", 0);
-					let mut stopped = job;
-					stopped.stopped = true;
-					return Some(stopped);
+					return Some(job);
 				}
 				Received::Closed => {
 					// The console is gone; treat the job as finished.
@@ -333,98 +462,6 @@ unsafe fn drain_control(control: u64) {
 	unsafe {
 		let mut cbuf: [u8; 32] = [0u8; 32];
 		while let Polled::Message { .. } = try_recv(control, &mut cbuf) {}
-	}
-}
-
-// Poll each running (not stopped) job: once its Process handle reads ready it has
-// terminated, so announce it and drop it. Called before each prompt, the way a shell
-// reports a background job's completion.
-unsafe fn reap_jobs(jobs: &mut Jobs) {
-	unsafe {
-		let mut i: usize = 0;
-		while i < jobs.list.len() {
-			if jobs.list[i].stopped {
-				i += 1;
-				continue;
-			}
-			if poll_ready(jobs.list[i].proc) {
-				let job = jobs.list.remove(i);
-				print(b"[");
-				print_usize(job.id);
-				print(b"] done   ");
-				print(&job.name);
-				print(b"\n");
-				close(job.proc);
-			} else {
-				i += 1;
-			}
-		}
-	}
-}
-
-// `jobs`: list the tracked background / stopped jobs.
-unsafe fn list_jobs(jobs: &Jobs) {
-	unsafe {
-		if jobs.list.is_empty() {
-			print(b"no jobs\n");
-			return;
-		}
-		for job in &jobs.list {
-			print(b"[");
-			print_usize(job.id);
-			print(b"] ");
-			print(if job.stopped { b"stopped  " } else { b"running  " });
-			print(&job.name);
-			print(b"\n");
-		}
-	}
-}
-
-// `fg [id]`: bring a job to the foreground - resume it if stopped (SIG_CONT), then run
-// it foreground again (so it can be interrupted / suspended once more).
-unsafe fn fg_job(jobs: &mut Jobs, arg: &[u8]) {
-	unsafe {
-		let idx: usize = match job_index(jobs, arg) {
-			Some(i) => i,
-			None => {
-				print(b"fg: no such job\n");
-				return;
-			}
-		};
-		let mut job: Job = jobs.list.remove(idx);
-		if job.stopped {
-			signal(job.proc, SIG_CONT);
-			job.stopped = false;
-		}
-		print(&job.name);
-		print(b"\n");
-		if let Some(suspended) = run_foreground(jobs.control, job) {
-			jobs.list.push(suspended);
-		}
-	}
-}
-
-// `bg [id]`: resume a stopped job in the background (SIG_CONT), leaving it tracked.
-unsafe fn bg_job(jobs: &mut Jobs, arg: &[u8]) {
-	unsafe {
-		let idx: usize = match job_index(jobs, arg) {
-			Some(i) => i,
-			None => {
-				print(b"bg: no such job\n");
-				return;
-			}
-		};
-		if !jobs.list[idx].stopped {
-			print(b"bg: job already running\n");
-			return;
-		}
-		signal(jobs.list[idx].proc, SIG_CONT);
-		jobs.list[idx].stopped = false;
-		print(b"[");
-		print_usize(jobs.list[idx].id);
-		print(b"] ");
-		print(&jobs.list[idx].name);
-		print(b" &\n");
 	}
 }
 
@@ -514,23 +551,23 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"jobs" {
-			list_jobs(jobs);
+			jobs.list();
 			return false;
 		}
 		if line == b"fg" {
-			fg_job(jobs, b"");
+			jobs.fg(b"");
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"fg ") {
-			fg_job(jobs, trim(rest));
+			jobs.fg(trim(rest));
 			return false;
 		}
 		if line == b"bg" {
-			bg_job(jobs, b"");
+			jobs.bg(b"");
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"bg ") {
-			bg_job(jobs, trim(rest));
+			jobs.bg(trim(rest));
 			return false;
 		}
 		if line == b"exit" || line == b"quit" {
@@ -1137,21 +1174,23 @@ unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cap: u64
 		// longer needs the parent end. Drop it - the shell now tracks the job solely by its
 		// waitable Process handle (ready once the child terminates), not a completion channel.
 		close(parent);
-		let id: usize = jobs.next_id;
-		jobs.next_id += 1;
-		let job: Job = Job { id, proc, name: name.to_vec(), stopped: false };
+		let job: Job = Job { proc, name: name.to_vec() };
 		if bg {
-			// Background: track the job and return to the prompt; its completion is reaped
-			// before a later prompt.
-			print(b"[");
-			print_usize(id);
-			print(b"] ");
-			print(name);
-			print(b" &\n");
-			jobs.list.push(job);
-		} else if let Some(suspended) = run_foreground(jobs.control, job) {
-			// Suspended by Ctrl+Z: keep it as a stopped background job.
-			jobs.list.push(suspended);
+			// Background: hand the job to the session (which holds the table, so it survives a
+			// shell restart) and return to the prompt; its completion is reaped before a later
+			// prompt. With no session to track it, run it in the foreground instead.
+			match jobs.register(job.proc, &job.name, false) {
+				Some(id) => {
+					print(b"[");
+					print_usize(id as usize);
+					print(b"] ");
+					print(name);
+					print(b" &\n");
+				}
+				None => jobs.run_foreground_tracked(job),
+			}
+		} else {
+			jobs.run_foreground_tracked(job);
 		}
 	}
 }

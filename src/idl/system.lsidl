@@ -572,17 +572,50 @@ interface resources {
 	@op(2) set-limit: func(name: string, kind: resource-kind, limit: u64) -> result<budget, error>;
 }
 
+// One tracked job in a session's job table: its small id (assigned by the session and
+// stable across shell restarts), the program name shown by `jobs`, and whether it is
+// currently stopped (suspended by Ctrl+Z). The live Process handle is held by the session
+// out of band, not named here - `job-take` hands it back when a shell foregrounds the job.
+record job-info {
+	id:      u32,
+	name:    string,
+	stopped: bool,
+}
+
+// A job handed back to a foregrounding shell: its info plus the live Process handle
+// (transferred out-of-band as handle<task>), removed from the session's table by the act
+// of taking it. The shell then drives the job in the foreground and re-registers it if it
+// is suspended again.
+record job-entry {
+	info: job-info,
+	proc: handle<task>,
+}
+
 // The SessionService contract: a login session is a long-lived object owning the
-// working directory (and, in later phases, the environment and the job table), so the
-// shell and the tools it runs are clients of the session rather than its owner. A shell
-// logout or restart leaves the session - its cwd - intact, because SessionService, not
-// the shell, holds it. Each client reaches its own session over a dedicated channel (the
-// session capability the spawner mints and hands it); `cwd` reads the working directory
-// and `chdir` moves it (the caller resolves and validates the path against the volume
-// first, so the session is pure state and reaches no filesystem).
+// working directory, the environment, and the job table, so the shell and the tools it
+// runs are clients of the session rather than its owner. A shell logout or restart
+// leaves the session - its cwd and its background jobs - intact, because SessionService,
+// not the shell, holds them. Each client reaches its own session over a dedicated channel
+// (the session capability the spawner mints and hands it); `cwd` reads the working
+// directory and `chdir` moves it (the caller resolves and validates the path against the
+// volume first, so the session is pure state and reaches no filesystem).
+//
+// The job table: a shell `register`s a background or suspended job, transferring it the
+// live Process handle (out-of-band as handle<task>); the session keeps it across shell
+// restarts and assigns the small id. `list` enumerates the jobs, `reap` polls the running
+// ones and returns those that have since terminated (the Process handle the session holds
+// reads ready once the process exits), `resume` continues a stopped job in the background
+// (the session signals it SIG_CONT), and `take` removes a job and hands its Process handle
+// back to a shell that is foregrounding it. The session does the waiting and signalling
+// because it, not the shell, owns the handle - so the jobs outlive any one shell.
 interface session {
-	@op(1) cwd:   func() -> result<string, error>;
-	@op(2) chdir: func(path: string) -> result<unit, error>;
+	@op(1) cwd:          func() -> result<string, error>;
+	@op(2) chdir:        func(path: string) -> result<unit, error>;
+	@op(3) job-register: func(name: string, stopped: bool, proc: handle<task>) -> result<u32, error>;
+	@op(4) job-take:     func(id: u32) -> result<job-entry, error>;
+	@op(5) job-list:     func() -> result<list<job-info>, error>;
+	@op(6) job-reap:     func() -> result<list<job-info>, error>;
+	@op(7) job-resume:   func(id: u32) -> result<job-info, error>;
 }
 
 

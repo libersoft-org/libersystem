@@ -359,6 +359,21 @@ An opaque kernel object, transferred as `handle<task>`.
 | `name` | `string` |
 | `usage` | `list<resource-usage>` |
 
+### record `job-info`
+
+| field | type |
+| --- | --- |
+| `id` | `u32` |
+| `name` | `string` |
+| `stopped` | `bool` |
+
+### record `job-entry`
+
+| field | type |
+| --- | --- |
+| `info` | `job-info` |
+| `proc` | `handle<task>` |
+
 ## Interfaces
 
 ### interface `log`
@@ -526,4 +541,9 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | --- | --- | --- |
 | 1 | `cwd` | `cwd() -> result<string, error>` |
 | 2 | `chdir` | `chdir(path: string) -> result<unit, error>` |
+| 3 | `job-register` | `job-register(name: string, stopped: bool, proc: handle<task>) -> result<u32, error>` |
+| 4 | `job-take` | `job-take(id: u32) -> result<job-entry, error>` |
+| 5 | `job-list` | `job-list() -> result<list<job-info>, error>` |
+| 6 | `job-reap` | `job-reap() -> result<list<job-info>, error>` |
+| 7 | `job-resume` | `job-resume(id: u32) -> result<job-info, error>` |
 
