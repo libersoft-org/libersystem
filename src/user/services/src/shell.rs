@@ -728,11 +728,22 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			return false;
 		}
 		if line == b"beep" {
-			beep_cmd(audiosvc, b"");
+			// Launch `beep` as its own sandboxed ELF through PermissionManager (the launcher /
+			// granter), which grants it an audio client and forwards it this terminal and the
+			// argument string. A shell with no PermissionManager (a non-primary VT) plays the
+			// tone inline instead.
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"beep", b"");
+			if !launched {
+				beep_cmd(audiosvc, b"");
+			}
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"beep ") {
-			beep_cmd(audiosvc, trim(rest));
+			let args: &[u8] = trim(rest);
+			let launched: bool = permsvc != 0 && run_tool(permsvc, b"beep", args);
+			if !launched {
+				beep_cmd(audiosvc, args);
+			}
 			return false;
 		}
 		if line == b"mouse" {

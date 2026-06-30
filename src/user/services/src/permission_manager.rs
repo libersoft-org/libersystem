@@ -105,6 +105,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"dev" => Some(Manifest { component: String::from("dev"), grants: alloc::vec![Capability::Device] }),
 		b"config" => Some(Manifest { component: String::from("config"), grants: alloc::vec![Capability::Config] }),
 		b"set" => Some(Manifest { component: String::from("set"), grants: alloc::vec![Capability::Config] }),
+		b"beep" => Some(Manifest { component: String::from("beep"), grants: alloc::vec![Capability::Audio] }),
 		_ => None,
 	}
 }
