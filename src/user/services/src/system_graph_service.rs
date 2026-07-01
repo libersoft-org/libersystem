@@ -125,6 +125,7 @@ fn device_name(d: &DeviceEntry) -> String {
 		DeviceKind::Net => "net",
 		DeviceKind::Block => "block",
 		DeviceKind::Console => "console",
+		DeviceKind::Usb => "usb",
 		DeviceKind::Unknown => "device",
 	};
 	alloc::format!("{kind}-{}", d.index)

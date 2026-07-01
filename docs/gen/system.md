@@ -100,6 +100,7 @@ An opaque kernel object, transferred as `handle<file>`.
 | `net` | 1 |
 | `block` | 2 |
 | `console` | 3 |
+| `usb` | 4 |
 
 ### record `device-entry`
 

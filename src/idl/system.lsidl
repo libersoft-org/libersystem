@@ -116,12 +116,13 @@ interface volume {
 	@op(10) rmdir:       func(path: string) -> result<unit, error>;
 }
 
-// The class of a discovered device, mirroring the kernel's virtio type codes.
+// The class of a discovered device, mirroring the kernel's device type codes.
 enum device-kind {
 	unknown = 0,
 	net     = 1,
 	block   = 2,
 	console = 3,
+	usb     = 4,
 }
 
 // One discovered device: its kernel-table index, class, and the size of the MMIO

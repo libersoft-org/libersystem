@@ -122,6 +122,11 @@ QEMU_ARGS+=(
 	-device virtio-serial-pci,disable-legacy=on
 	-device virtconsole,chardev=vcon
 	-chardev "file,id=vcon,path=$HERE/.build/virtio-console.out"
+	# xHCI USB host controller (M62): the kernel's PCI scan discovers it by class
+	# (0x0C/0x03/0x30) and records its MMIO BAR in the device table; the userspace
+	# xhci driver maps it and runs the USB stack. Attached on the test path too, so
+	# the kernel tests can assert the controller is discovered.
+	-device qemu-xhci,id=usb
 )
 # The second virtio-blk disk (FAT vol://media), discovered after the system disk; only
 # attached when the FAT image was built (mtools present).

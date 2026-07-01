@@ -87,11 +87,7 @@ pub fn volume<'a>(cwd: &'a str, arg: &'a [u8]) -> Option<&'a [u8]> {
 	let arg: &[u8] = trim(arg);
 	let base: &[u8] = if arg.starts_with(b"vol://") { arg } else { cwd.as_bytes() };
 	let (volume, _tail) = split_vol(base)?;
-	if volume.is_empty() {
-		None
-	} else {
-		Some(volume)
-	}
+	if volume.is_empty() { None } else { Some(volume) }
 }
 
 // Route a path to the StorageService client for its volume, from the four clients a tool

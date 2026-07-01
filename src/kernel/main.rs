@@ -1982,7 +1982,7 @@ fn device_table_exposes_virtio_mmio() {
 		unsafe {
 			COUNT.store(arch::syscall::invoke(syscall::SYS_DEVICE_COUNT, 0, 0, 0, 0) as i64, Ordering::SeqCst);
 			if arch::syscall::invoke(syscall::SYS_DEVICE_INFO, 0, &mut info as *mut _ as u64, size, 0) as i64 == 0 {
-				VTYPE.store(info.virtio_type as u64, Ordering::SeqCst);
+				VTYPE.store(info.device_type as u64, Ordering::SeqCst);
 				BAR_LEN.store(info.bar_len, Ordering::SeqCst);
 			}
 			let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, 0, 0, 0);
@@ -1998,6 +1998,60 @@ fn device_table_exposes_virtio_mmio() {
 	assert!(BAR_LEN.load(Ordering::SeqCst) > 0, "the MMIO BAR should have a non-zero length");
 	let mapped = MAPPED.load(Ordering::SeqCst);
 	assert!(mapped != 0 && !syscall::sys_is_err(mapped), "the device MMIO should map to a valid address");
+}
+
+#[cfg(test)]
+#[test_case]
+fn pci_scan_finds_the_xhci_controller() {
+	// QEMU is launched (see qemu-run.sh) with a qemu-xhci USB host controller. The
+	// kernel's PCI scan must find it by its class triple (0x0C/0x03/0x30) and resolve
+	// its MMIO window: a non-zero BAR 0 base and a probed BAR size (the sizing write-
+	// all-ones round-trip), plus an MSI-X capability for its interrupt vector.
+	let controllers = arch::pci::scan_xhci();
+	assert!(!controllers.is_empty(), "the PCI scan should find the QEMU xHCI controller");
+	for x in &controllers {
+		assert!(x.bar_phys != 0, "the xHCI BAR 0 should have a physical base");
+		assert!(x.bar_len >= 0x1000, "the xHCI BAR 0 should be at least a page (probed {:#x})", x.bar_len);
+		assert!(x.msix_cap != 0, "the xHCI controller should expose MSI-X");
+	}
+}
+
+#[cfg(test)]
+#[test_case]
+fn device_table_exposes_the_xhci_controller() {
+	use core::sync::atomic::{AtomicU64, Ordering};
+	// The xHCI controller joins the same device table the virtio devices live in. A
+	// driver-like thread walks the table over the device syscalls the way DeviceManager
+	// will: find the entry reporting DEVICE_TYPE_XHCI, acquire its DeviceMemory
+	// capability, and map the controller's register file.
+	static BAR_LEN: AtomicU64 = AtomicU64::new(0);
+	static MAPPED: AtomicU64 = AtomicU64::new(0);
+	extern "C" fn body(_arg: u64) {
+		let mut info = abi::DeviceInfo::default();
+		let size = core::mem::size_of::<abi::DeviceInfo>() as u64;
+		unsafe {
+			let count = arch::syscall::invoke(syscall::SYS_DEVICE_COUNT, 0, 0, 0, 0);
+			for i in 0..count {
+				if arch::syscall::invoke(syscall::SYS_DEVICE_INFO, i, &mut info as *mut _ as u64, size, 0) as i64 != 0 {
+					continue;
+				}
+				if info.device_type != abi::DEVICE_TYPE_XHCI {
+					continue;
+				}
+				BAR_LEN.store(info.bar_len, Ordering::SeqCst);
+				let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, i, 0, 0, 0);
+				if !syscall::sys_is_err(handle) {
+					MAPPED.store(arch::syscall::invoke(syscall::SYS_DEVICE_MEMORY_MAP, handle, 0, 0, 0), Ordering::SeqCst);
+				}
+				break;
+			}
+		}
+	}
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(BAR_LEN.load(Ordering::SeqCst) > 0, "the device table should hold the xHCI controller");
+	let mapped = MAPPED.load(Ordering::SeqCst);
+	assert!(mapped != 0 && !syscall::sys_is_err(mapped), "the xHCI register file should map to a valid address");
 }
 
 #[cfg(test)]

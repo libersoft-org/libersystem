@@ -988,6 +988,7 @@ pub enum DeviceKind {
 	Net = 1,
 	Block = 2,
 	Console = 3,
+	Usb = 4,
 }
 
 impl DeviceKind {
@@ -1013,6 +1014,7 @@ impl DeviceKind {
 			1 => Some(DeviceKind::Net),
 			2 => Some(DeviceKind::Block),
 			3 => Some(DeviceKind::Console),
+			4 => Some(DeviceKind::Usb),
 			_ => None,
 		}
 	}
@@ -5242,6 +5244,7 @@ impl DeviceKind {
 			DeviceKind::Net => out.push_str("\"net\""),
 			DeviceKind::Block => out.push_str("\"block\""),
 			DeviceKind::Console => out.push_str("\"console\""),
+			DeviceKind::Usb => out.push_str("\"usb\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -5250,6 +5253,7 @@ impl DeviceKind {
 			DeviceKind::Net => out.push_str("net"),
 			DeviceKind::Block => out.push_str("block"),
 			DeviceKind::Console => out.push_str("console"),
+			DeviceKind::Usb => out.push_str("usb"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -5258,6 +5262,7 @@ impl DeviceKind {
 			DeviceKind::Net => crate::codec::cbor::text(out, "net"),
 			DeviceKind::Block => crate::codec::cbor::text(out, "block"),
 			DeviceKind::Console => crate::codec::cbor::text(out, "console"),
+			DeviceKind::Usb => crate::codec::cbor::text(out, "usb"),
 		}
 	}
 }

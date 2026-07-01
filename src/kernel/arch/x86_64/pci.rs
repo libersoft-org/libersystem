@@ -1,9 +1,9 @@
 // PCI configuration-space access and bus enumeration (legacy CAM via I/O ports
-// 0xCF8/0xCFC). The kernel scans the bus once at boot to discover devices - in
-// particular the virtio devices QEMU exposes (PCI vendor 0x1AF4) - and records
-// each one's identity, BARs, and interrupt line. DeviceManager later queries this
-// table and is handed a DeviceMemory capability per device BAR, so it can map each
-// virtio device to a userspace driver.
+// 0xCF8/0xCFC). The kernel scans the bus once at boot to discover devices - the
+// virtio devices QEMU exposes (PCI vendor 0x1AF4) and any xHCI USB host controller
+// (class 0x0C/0x03/0x30) - and records each one's identity, BARs, and interrupt
+// line. DeviceManager later queries this table and is handed a DeviceMemory
+// capability per device BAR, so it can map each device to a userspace driver.
 //
 // Discovery has to live in the kernel: reading PCI config space needs the I/O-port
 // instructions, which ring 3 cannot issue. Only bus 0 is scanned for now (where
@@ -34,6 +34,12 @@ pub const VIRTIO_CONSOLE: u16 = abi::VIRTIO_TYPE_CONSOLE as u16;
 pub const VIRTIO_RNG: u16 = abi::VIRTIO_TYPE_RNG as u16;
 pub const VIRTIO_GPU: u16 = abi::VIRTIO_TYPE_GPU as u16;
 pub const VIRTIO_SOUND: u16 = abi::VIRTIO_TYPE_SOUND as u16;
+
+// The PCI class triple of an xHCI USB host controller: Serial Bus Controller /
+// USB Controller / xHCI programming interface.
+const CLASS_SERIAL_BUS: u8 = 0x0C;
+const SUBCLASS_USB: u8 = 0x03;
+const PROG_IF_XHCI: u8 = 0x30;
 
 // Build the CONFIG_ADDRESS value selecting a device's config dword. `offset` is
 // rounded down to a 4-byte boundary (the dword the field lives in).
@@ -124,6 +130,12 @@ impl PciDevice {
 		self.vendor == VIRTIO_VENDOR
 	}
 
+	// Whether this is an xHCI USB host controller (by its PCI class triple, so any
+	// vendor's controller matches - QEMU's qemu-xhci as well as real Intel/AMD parts).
+	pub fn is_xhci(&self) -> bool {
+		self.class == CLASS_SERIAL_BUS && self.subclass == SUBCLASS_USB && self.prog_if == PROG_IF_XHCI
+	}
+
 	// The modern virtio device type (`device_id - 0x1040`), or None if this is not
 	// a modern virtio-pci device.
 	pub fn virtio_type(&self) -> Option<u16> {
@@ -209,6 +221,24 @@ pub fn bar_address(d: &PciDevice, bar_idx: usize) -> Option<u64> {
 	}
 }
 
+// Measure a memory BAR's window size with the standard probe: write all-ones to the
+// register, read back the address mask, and restore the original value (the low half
+// suffices - no device here has a window over 4 GiB). Needed for devices like xHCI
+// whose window size is not described anywhere else; virtio derives its window from
+// the capability list instead. Returns None for an I/O BAR or an out-of-range index.
+pub fn bar_size(d: &PciDevice, bar_idx: usize) -> Option<u64> {
+	let bar = *d.bars.get(bar_idx)?;
+	if bar & 1 != 0 {
+		return None; // an I/O-space BAR, not memory
+	}
+	let offset: u16 = 0x10 + (bar_idx as u16) * 4;
+	config_write32(d.bus, d.dev, d.func, offset, 0xFFFF_FFFF);
+	let mask = config_read32(d.bus, d.dev, d.func, offset);
+	config_write32(d.bus, d.dev, d.func, offset, bar);
+	let size = !(mask & 0xFFFF_FFF0) as u64 + 1;
+	if size == 0 { None } else { Some(size) }
+}
+
 // One located virtio configuration structure (resolved from a virtio PCI cap):
 // which BAR it lives in, its byte offset within that BAR, and its length.
 #[derive(Clone, Copy, Default)]
@@ -242,6 +272,35 @@ pub struct VirtioDevice {
 	pub msix_table_phys: u64,
 }
 
+// Walk a device's PCI capability list and resolve its MSI-X capability: the
+// capability's config-space offset (0 = none), the table entry count, and the
+// physical address of the MSI-X table. Shared by the virtio and xHCI paths.
+fn resolve_msix(d: &PciDevice) -> (u16, u16, u64) {
+	if config_read16(d.bus, d.dev, d.func, 0x06) & STATUS_CAP_LIST == 0 {
+		return (0, 0, 0);
+	}
+	let mut ptr: u16 = (config_read8(d.bus, d.dev, d.func, 0x34) & 0xFC) as u16;
+	// Bound the walk so a malformed (cyclic) list cannot spin forever.
+	for _ in 0..48 {
+		if ptr == 0 {
+			break;
+		}
+		let cap_id = config_read8(d.bus, d.dev, d.func, ptr);
+		let next = (config_read8(d.bus, d.dev, d.func, ptr + 1) & 0xFC) as u16;
+		if cap_id == MSIX_CAP_ID {
+			let mc = config_read16(d.bus, d.dev, d.func, ptr + 2);
+			let table_off_bir = config_read32(d.bus, d.dev, d.func, ptr + 4);
+			let bir = (table_off_bir & 7) as usize;
+			let table_offset = (table_off_bir & !7) as u64;
+			if let Some(base) = bar_address(d, bir) {
+				return (ptr, (mc & 0x7ff) + 1, base + table_offset);
+			}
+		}
+		ptr = next;
+	}
+	(0, 0, 0)
+}
+
 // Walk a device's PCI capability list and resolve its virtio configuration
 // structures. Returns None if it is not a modern virtio device, has no capability
 // list, or is missing the required common/notify/ISR structures.
@@ -251,7 +310,6 @@ fn resolve_virtio(d: &PciDevice) -> Option<VirtioDevice> {
 		return None;
 	}
 	let (mut common, mut notify, mut isr, mut device) = (None, None, None, None);
-	let (mut msix_cap, mut msix_count, mut msix_table_phys): (u16, u16, u64) = (0, 0, 0);
 	let mut ptr: u16 = (config_read8(d.bus, d.dev, d.func, 0x34) & 0xFC) as u16;
 	// Bound the walk so a malformed (cyclic) list cannot spin forever.
 	for _ in 0..48 {
@@ -273,19 +331,10 @@ fn resolve_virtio(d: &PciDevice) -> Option<VirtioDevice> {
 				VIRTIO_CAP_DEVICE => device = Some(cap),
 				_ => {}
 			}
-		} else if cap_id == MSIX_CAP_ID {
-			let mc = config_read16(d.bus, d.dev, d.func, ptr + 2);
-			let table_off_bir = config_read32(d.bus, d.dev, d.func, ptr + 4);
-			let bir = (table_off_bir & 7) as usize;
-			let table_offset = (table_off_bir & !7) as u64;
-			if let Some(base) = bar_address(d, bir) {
-				msix_cap = ptr;
-				msix_count = (mc & 0x7ff) + 1;
-				msix_table_phys = base + table_offset;
-			}
 		}
 		ptr = next;
 	}
+	let (msix_cap, msix_count, msix_table_phys) = resolve_msix(d);
 	let common = common?;
 	let notify = notify?;
 	let isr = isr?;
@@ -308,4 +357,36 @@ fn resolve_virtio(d: &PciDevice) -> Option<VirtioDevice> {
 // Scan the bus and resolve every modern virtio device's MMIO layout.
 pub fn scan_virtio() -> Vec<VirtioDevice> {
 	scan().iter().filter_map(resolve_virtio).collect()
+}
+
+// An xHCI USB host controller with its MMIO window resolved: the physical base and
+// probed size of BAR 0 (the capability registers start at its base; the operational,
+// runtime, and doorbell registers follow at offsets the driver reads from them), plus
+// its MSI-X capability for a per-device interrupt vector.
+#[derive(Clone, Copy)]
+pub struct XhciDevice {
+	pub pci: PciDevice,
+	pub bar_phys: u64,
+	pub bar_len: u64,
+	pub msix_cap: u16,
+	pub msix_count: u16,
+	pub msix_table_phys: u64,
+}
+
+// Resolve an xHCI controller's MMIO window: BAR 0 holds the whole register file, so
+// its probed size is the window a driver maps. Returns None if the function is not
+// an xHCI controller or BAR 0 is not a memory BAR.
+fn resolve_xhci(d: &PciDevice) -> Option<XhciDevice> {
+	if !d.is_xhci() {
+		return None;
+	}
+	let bar_phys = bar_address(d, 0)?;
+	let bar_len = bar_size(d, 0)?;
+	let (msix_cap, msix_count, msix_table_phys) = resolve_msix(d);
+	Some(XhciDevice { pci: *d, bar_phys, bar_len, msix_cap, msix_count, msix_table_phys })
+}
+
+// Scan the bus and resolve every xHCI USB host controller's MMIO window.
+pub fn scan_xhci() -> Vec<XhciDevice> {
+	scan().iter().filter_map(resolve_xhci).collect()
 }

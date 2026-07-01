@@ -140,7 +140,7 @@ pub const PROP_THREAD_LIMIT: u64 = 3;
 pub const PROP_DMA_LIMIT: u64 = 4;
 pub const PROP_IPC_QUEUE_LIMIT: u64 = 5;
 
-// virtio device type codes, as written into `DeviceInfo::virtio_type` (the modern
+// virtio device type codes, as written into `DeviceInfo::device_type` (the modern
 // virtio-pci `device_id - 0x1040`). The single source of truth for the kernel's PCI
 // enumeration and the userspace DeviceManager/DeviceService that classify devices.
 pub const VIRTIO_TYPE_NET: u32 = 1;
@@ -151,16 +151,22 @@ pub const VIRTIO_TYPE_GPU: u32 = 16;
 pub const VIRTIO_TYPE_INPUT: u32 = 18;
 pub const VIRTIO_TYPE_SOUND: u32 = 25;
 
-// What `device_info` writes about one discovered virtio device. The kernel
-// resolves these from the device's PCI capabilities at boot; a driver maps the
-// device's MMIO BAR (via a DeviceMemory capability from `device_acquire`) and uses
-// the offsets to reach each virtio structure within the mapping. `repr(C)` so the
-// kernel and userspace agree on the layout byte-for-byte.
+// Non-virtio device type codes live above the virtio id space (modern virtio types
+// are below 0x40), so one `device_type` field classifies every discovered device.
+pub const DEVICE_TYPE_XHCI: u32 = 0x100;
+
+// What `device_info` writes about one discovered device. The kernel resolves these
+// from the device's PCI configuration at boot; a driver maps the device's MMIO BAR
+// (via a DeviceMemory capability from `device_acquire`) and, for a virtio device,
+// uses the offsets to reach each virtio structure within the mapping (a non-virtio
+// device such as the xHCI controller carries zero offsets - its register layout
+// starts at the BAR base). `repr(C)` so the kernel and userspace agree on the
+// layout byte-for-byte.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct DeviceInfo {
-	// virtio device type (net = 1, blk = 2, console = 3, ...).
-	pub virtio_type: u32,
+	// device type (virtio net = 1, blk = 2, console = 3, ...; xHCI = 0x100).
+	pub device_type: u32,
 	// length of the MMIO window the DeviceMemory capability covers.
 	pub bar_len: u64,
 	// byte offsets of the virtio structures within that window.

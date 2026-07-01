@@ -108,7 +108,7 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 				i += 1;
 				continue;
 			}
-			let driver_name: &[u8] = driver_for(info.virtio_type);
+			let driver_name: &[u8] = driver_for(info.device_type);
 			if driver_name != b"virtio_blk" {
 				i += 1;
 				continue;
@@ -157,7 +157,13 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 				i += 1;
 				continue;
 			}
-			let driver_name: &[u8] = driver_for(info.virtio_type);
+			let driver_name: &[u8] = driver_for(info.device_type);
+			if driver_name.is_empty() {
+				// a device with no userspace driver yet (e.g. the xHCI controller until
+				// its driver lands): skip it, leaving it out of the online summary.
+				i += 1;
+				continue;
+			}
 			if driver_name == b"virtio_blk" {
 				// the disks are bound in phase 1; count them as online in the summary.
 				state[idx] = STATE_ONLINE;
@@ -298,11 +304,16 @@ unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], 
 }
 
 // Print a one-line summary of how many devices are online (their driver bound and
-// reported in) out of those discovered - the device-state DeviceManager tracks.
+// reported in) out of those with a driver to bind - the device-state DeviceManager
+// tracks. Devices with no userspace driver yet stay unknown and are not counted.
 unsafe fn report_state(state: &[u8; MAX_DEVICES], count: u64) {
 	unsafe {
 		let mut online: u32 = 0;
-		for &s in state {
+		let mut tracked: u32 = 0;
+		for (i, &s) in state.iter().enumerate() {
+			if (i as u64) < count && s != STATE_UNKNOWN {
+				tracked += 1;
+			}
 			if s == STATE_ONLINE {
 				online += 1;
 			}
@@ -310,7 +321,7 @@ unsafe fn report_state(state: &[u8; MAX_DEVICES], count: u64) {
 		print(b"DeviceManager: ");
 		print_count(online);
 		print(b" of ");
-		print_count(count as u32);
+		print_count(tracked);
 		print(b" device(s) online\n");
 	}
 }
@@ -326,9 +337,10 @@ unsafe fn print_count(n: u32) {
 	}
 }
 
-// The init-package binary name of the driver for a virtio device type.
-fn driver_for(virtio_type: u32) -> &'static [u8] {
-	match virtio_type {
+// The binary name of the driver for a device type; empty when no userspace driver
+// exists for it yet.
+fn driver_for(device_type: u32) -> &'static [u8] {
+	match device_type {
 		VIRTIO_TYPE_NET => b"virtio_net",
 		VIRTIO_TYPE_BLOCK => b"virtio_blk",
 		VIRTIO_TYPE_CONSOLE => b"virtio_console",
