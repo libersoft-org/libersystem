@@ -1,13 +1,13 @@
 // cat - print a file's contents, run as its own sandboxed ELF.
 //
-// PermissionManager launches this program under a permission manifest that grants it
-// exactly one capability - a StorageService (volume) client - and forwards it the shell's
-// stdout console, the argument string (the file path, relative or absolute), and the
-// inherited working directory. cat resolves the path against that cwd, opens the file
-// through its storage grant, maps it, prints it to the inherited stdout, and exits. A
-// standalone command, not a shell built-in: it reaches the filesystem only through the one
-// capability the permission store granted it, and renders on the same terminal as the shell
-// that launched it.
+// PermissionManager launches this program under a permission manifest that grants it the
+// `volumes` capability - the four volume StorageService clients (system / media / iso /
+// udf) - and forwards it the shell's stdout console, the argument string (the file path,
+// relative or absolute), and the inherited working directory. cat resolves the path against
+// that cwd, routes it to the volume it names, opens the file through that grant, maps it,
+// prints it to the inherited stdout, and exits. A standalone command, not a shell built-in:
+// it reaches the filesystem only through the capability the permission store granted it, and
+// renders on the same terminal as the shell that launched it.
 
 #![no_std]
 #![no_main]
@@ -32,21 +32,28 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Message { len, .. } => buf[..len].to_vec(),
 			Received::Closed => exit(),
 		};
-		// 3. receive the one capability the manifest grants: a StorageService client.
-		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or_else(|| exit());
+		// 3. receive the four volume clients the `volumes` capability bundles (SYSTEM / MEDIA /
+		//    ISO / UDF, in grant order); a volume whose disk is absent arrives as 0.
+		let system: u64 = recv_tagged(bootstrap, &mut buf, b"SYSTEM").unwrap_or(0);
+		let media: u64 = recv_tagged(bootstrap, &mut buf, b"MEDIA").unwrap_or(0);
+		let iso: u64 = recv_tagged(bootstrap, &mut buf, b"ISO").unwrap_or(0);
+		let udf: u64 = recv_tagged(bootstrap, &mut buf, b"UDF").unwrap_or(0);
 		// 4. receive the inherited working directory (the last bootstrap message), and resolve
 		//    the path argument against it so a relative path reaches the same file the shell would.
 		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, .. } => buf[..len].to_vec(),
 			Received::Closed => Vec::new(),
 		};
-		let uri: String = match path::resolve(core::str::from_utf8(&cwd).unwrap_or(""), &arg) {
+		let cwd_str: &str = core::str::from_utf8(&cwd).unwrap_or("");
+		let uri: String = match path::resolve(cwd_str, &arg) {
 			Some(u) => u,
 			None => {
 				print(b"cat: invalid path\n");
 				exit();
 			}
 		};
+		// route the path to the client for the volume it names.
+		let storage: u64 = path::volume_client(cwd_str, &arg, system, media, iso, udf);
 		cat(storage, uri.as_bytes());
 	}
 	exit();

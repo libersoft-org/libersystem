@@ -54,7 +54,7 @@ const N: usize = 19;
 // component it observes (so it holds their process handles for the live graph), and
 // the shell is the last component up: it depends on StorageService (which it talks to
 // over IPC) and on SystemGraphService (whose graph its `graph` command renders).
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"media_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"shell", deps: &[b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service", b"session_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service", b"process_service"] }, Service { name: b"process_service", deps: &[b"log_service", b"storage_service"] }, Service { name: b"config_service", deps: &[b"log_service", b"process_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service", b"process_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service", b"session_service", b"process_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"network_service", b"time_service", b"config_service", b"device_service", b"audio_service", b"process_service", b"resource_manager"] }, Service { name: b"resource_manager", deps: &[b"log_service", b"process_service"] }, Service { name: b"session_service", deps: &[b"log_service", b"process_service"] }];
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"media_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"shell", deps: &[b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service", b"session_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service", b"process_service"] }, Service { name: b"process_service", deps: &[b"log_service", b"storage_service"] }, Service { name: b"config_service", deps: &[b"log_service", b"process_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service", b"process_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service", b"session_service", b"process_service", b"permission_manager"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"network_service", b"time_service", b"config_service", b"device_service", b"audio_service", b"process_service", b"resource_manager"] }, Service { name: b"resource_manager", deps: &[b"log_service", b"process_service"] }, Service { name: b"session_service", deps: &[b"log_service", b"process_service"] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -495,7 +495,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"input_service" && !bootstrap_input(manager_side, *input_raw, input_client, pointer_console) {
 			return State::Failed;
 		}
-		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, *session_client, *pointer_console, console_client, console_control) {
+		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, *session_client, *perm_client, *pointer_console, console_client, console_control) {
 			return State::Failed;
 		}
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
@@ -1141,7 +1141,7 @@ unsafe fn bootstrap_audio_service(manager_side: u64, snd_client: u64, audio_clie
 // so minting from them never crosses the supervisor's lifecycle traffic. ConsoleService
 // maps the framebuffer itself (the kernel console then stops drawing) and attaches to
 // the kernel console input for keys.
-unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, gpu_client: u64, time_client: u64, audio_client: u64, session_client: u64, pointer_console: u64, console_client: &mut u64, console_control: &mut u64) -> bool {
+unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, gpu_client: u64, time_client: u64, audio_client: u64, session_client: u64, perm_client: u64, pointer_console: u64, console_client: &mut u64, console_control: &mut u64) -> bool {
 	unsafe {
 		let (service_end, client_end): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -1188,6 +1188,12 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 		// each additional virtual terminal it spawns. Sent right after FAUDIO to match the
 		// console's receive order.
 		if !send_factory(manager_side, b"FSESSION", session_client) {
+			return false;
+		}
+		// The PermissionManager factory, so ConsoleService can mint a fresh per-VT launcher
+		// client for each shell it spawns. Sent right after FSESSION to match the console's
+		// receive order.
+		if !send_factory(manager_side, b"FPERM", perm_client) {
 			return false;
 		}
 		// NetworkService is multi-client through its own typed `open`, not serve_multi.

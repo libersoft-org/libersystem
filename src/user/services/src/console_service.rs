@@ -489,6 +489,7 @@ struct Factories {
 	time: u64,
 	audio: u64,
 	session: u64,
+	perm: u64,
 }
 
 // The whole console session: the framebuffer it owns, the kernel keystroke channel, the
@@ -631,6 +632,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// additional virtual terminal. Received right after FAUDIO to match the supervisor's
 		// send order.
 		let session: u64 = recv_tagged(bootstrap, &mut buf, b"FSESSION").unwrap_or_else(|| exit());
+		// The PermissionManager factory, from which a fresh per-VT launcher client is minted
+		// for each additional virtual terminal - so every VT's shell reaches the permission
+		// store and runs commands as governed processes, not just VT 1. Received right after
+		// FSESSION to match the supervisor's send order.
+		let perm: u64 = recv_tagged(bootstrap, &mut buf, b"FPERM").unwrap_or_else(|| exit());
 		let net: u64 = recv_tagged(bootstrap, &mut buf, b"FNET").unwrap_or_else(|| exit());
 		// The gpu driver's display channel (0 = no virtio-gpu device; a 0 handle is valid
 		// here, unlike the tagged factories above, so we do not use recv_tagged).
@@ -682,7 +688,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(bootstrap, b"ConsoleService: online", 0);
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
-		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session };
+		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
 		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, pointer, clipboard: Vec::new(), ptr_buttons: 0 };
 		run(&mut console);
 	}
@@ -1576,6 +1582,12 @@ unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) 
 			Some(h) => h,
 			None => return false,
 		};
+		// A fresh per-VT PermissionManager client: this VT's shell launches commands as
+		// governed processes and drives its `perm` command through it, just like VT 1.
+		let perm: u64 = match service_connect(facs.perm) {
+			Some(h) => h,
+			None => return false,
+		};
 		let mut net = network::Client::new(ChannelTransport { chan: facs.net });
 		let net_client: u64 = match net.open() {
 			Some(Ok(h)) => h,
@@ -1615,7 +1627,7 @@ unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) 
 		send_blocking(boot_parent, b"AUDIO", audio);
 		send_blocking(boot_parent, b"INPUT", 0);
 		send_blocking(boot_parent, b"GRAPH", 0);
-		send_blocking(boot_parent, b"PERM", 0);
+		send_blocking(boot_parent, b"PERM", perm);
 		send_blocking(boot_parent, b"RESOURCE", 0);
 		// This VT's session, sent right after RESOURCE to match the shell's receive order.
 		send_blocking(boot_parent, b"SESSION", session);

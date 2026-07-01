@@ -32,8 +32,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Message { len, .. } => buf[..len].to_vec(),
 			Received::Closed => exit(),
 		};
-		// 3. receive the one capability the manifest grants: a StorageService client.
-		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or_else(|| exit());
+		// 3. receive the four volume clients the `volumes` capability bundles (SYSTEM / MEDIA /
+		//    ISO / UDF, in grant order); a volume whose disk is absent arrives as 0.
+		let system: u64 = recv_tagged(bootstrap, &mut buf, b"SYSTEM").unwrap_or(0);
+		let media: u64 = recv_tagged(bootstrap, &mut buf, b"MEDIA").unwrap_or(0);
+		let iso: u64 = recv_tagged(bootstrap, &mut buf, b"ISO").unwrap_or(0);
+		let udf: u64 = recv_tagged(bootstrap, &mut buf, b"UDF").unwrap_or(0);
 		// 4. receive the inherited working directory (the last bootstrap message), used to
 		//    resolve a relative path so it reaches the same file the shell would.
 		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
@@ -46,13 +50,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(sp) => (&args[..sp], &args[sp + 1..]),
 			None => (&args[..], b""),
 		};
-		let uri: String = match path::resolve(core::str::from_utf8(&cwd).unwrap_or(""), path_arg) {
+		let cwd_str: &str = core::str::from_utf8(&cwd).unwrap_or("");
+		let uri: String = match path::resolve(cwd_str, path_arg) {
 			Some(u) => u,
 			None => {
 				print(b"write: invalid path\n");
 				exit();
 			}
 		};
+		// route the path to the client for the volume it names.
+		let storage: u64 = path::volume_client(cwd_str, path_arg, system, media, iso, udf);
 		write(storage, uri.as_bytes(), text);
 	}
 	exit();
