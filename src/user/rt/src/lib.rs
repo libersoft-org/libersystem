@@ -120,6 +120,25 @@ pub fn stdout() -> u64 {
 	STDOUT.load(Ordering::Relaxed)
 }
 
+// The console channel a program reads its input (stdin) from, or 0 for none. A
+// controlling terminal is full-duplex - the same channel carries the program's output
+// and its keyboard input - so a foreground launch hands the child one SEND|RECV dup of
+// the console and `inherit_stdout` points both stdout and stdin at it. A background or
+// non-interactive launch grants only SEND, so its stdin stays 0 (no input). Set by
+// `set_stdin`; inherited through the bootstrap alongside stdout.
+static STDIN: AtomicU64 = AtomicU64::new(0);
+
+// Route this program's input reads (`read_line`) to a console channel (its controlling
+// terminal). 0 restores no-input (reads return end-of-input at once).
+pub fn set_stdin(channel: u64) {
+	STDIN.store(channel, Ordering::Relaxed);
+}
+
+// This program's current stdin console channel (0 = no input).
+pub fn stdin() -> u64 {
+	STDIN.load(Ordering::Relaxed)
+}
+
 // Lightweight cross-process perf tracing for latency hunting, off by default. `perf_mark`
 // emits a `\x1ePERF <label> <tsc>` line straight to the kernel debug serial (NOT the
 // console channel), so a marker reaches the host trace tool (boot/perf-trace.py) without
@@ -246,15 +265,40 @@ pub fn perf_mark_val(label: &[u8], val: u64) {
 
 // Adopt a stdout console channel a launcher sent as the first bootstrap message
 // ("STDOUT" + the channel handle), so a spawned program's `print` output is routed to
-// the same console as its parent. A no-op if the first message is not a STDOUT one
-// (the handle 0 then restores the debug-port fallback).
+// the same console as its parent. The console is the program's controlling terminal, a
+// full-duplex channel, so the same handle becomes its stdin too: a foreground launch
+// grants it SEND|RECV and `read_line` then reads input from it; a background launch
+// grants only SEND, so reads return end-of-input. A no-op if the first message is not a
+// STDOUT one (the handle 0 then restores the debug-port fallback and leaves stdin empty).
 pub unsafe fn inherit_stdout(bootstrap: u64) {
 	unsafe {
 		let mut buf: [u8; 16] = [0u8; 16];
 		if let Received::Message { len, handle } = recv_blocking(bootstrap, &mut buf) {
 			if len >= 6 && &buf[..6] == b"STDOUT" {
 				set_stdout(handle);
+				set_stdin(handle);
 			}
+		}
+	}
+}
+
+// Read one cooked line of input from this program's stdin (its controlling terminal):
+// blocks until the terminal delivers a submitted line, copies it (with its trailing
+// newline) into `buf` and returns its length, or None at end-of-input - Ctrl+D, the
+// terminal closing, or no stdin at all (a background / non-interactive launch). Only a
+// foreground program reads here; the line discipline in ConsoleService edits and echoes
+// the input exactly as it does for the shell's own prompt.
+pub unsafe fn read_line(buf: &mut [u8]) -> Option<usize> {
+	unsafe {
+		let inp: u64 = STDIN.load(Ordering::Relaxed);
+		if inp == 0 {
+			return None;
+		}
+		match recv_blocking(inp, buf) {
+			// A zero-byte read is the tty's EOF (Ctrl+D on an empty line).
+			Received::Message { len: 0, .. } => None,
+			Received::Message { len, .. } => Some(len),
+			Received::Closed => None,
 		}
 	}
 }

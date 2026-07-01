@@ -2516,6 +2516,50 @@ fn pty_hosts_a_program() {
 
 #[cfg(test)]
 #[test_case]
+fn interactive_tool_reads_stdin() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	// A foreground tool reads its standard input, not just prints: the shell hands a
+	// foreground child a full-duplex dup of its console (the controlling terminal), so the
+	// child reads cooked input lines back from the same channel it prints to. Here we stand
+	// in for the shell and drive a `readln` child - spawn it, hand it a console channel as its
+	// STDOUT (which `rt::inherit_stdout` adopts as stdin too), deliver a cooked line the way
+	// ConsoleService's line discipline would, and observe readln echo it back prefixed.
+	let init = init_package_bytes().expect("init package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let readln_elf = package.lookup(b"readln").expect("readln in the init package");
+
+	// readln's bootstrap channel, and the console channel that is its stdout + stdin: the
+	// child holds one end (transferred as STDOUT), we keep the other and act as the terminal.
+	let (boot_kernel, boot_user) = Channel::create();
+	let (console_host, console_child) = Channel::create();
+
+	loader::spawn_elf_process(sched::root_domain(), readln_elf, boot_user, Rights::ALL, 0).expect("spawn readln");
+
+	// Hand the child the console as STDOUT (its `inherit_stdout` adopts it as stdin too),
+	// then an empty argv message - readln takes no arguments.
+	send_cap(&boot_kernel, b"STDOUT", console_child, Rights::ALL).expect("STDOUT bootstrap");
+	boot_kernel.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("argv bootstrap");
+	sched::run_until_idle();
+
+	// deliver one cooked input line (with its trailing newline, as the line discipline does),
+	// then end input (a zero-byte read is the tty's EOF) so readln echoes it and exits.
+	console_host.send(Message::new(b"hello\n".to_vec(), alloc::vec::Vec::new(), 0)).expect("write a line to the child's stdin");
+	sched::run_until_idle();
+	console_host.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("send EOF to the child");
+	sched::run_until_idle();
+
+	// readln echoes the line back on the same console, prefixed with "in> ".
+	let mut captured = alloc::vec::Vec::new();
+	while let Ok(msg) = console_host.recv() {
+		captured.extend_from_slice(&msg.bytes);
+	}
+	assert!(captured.windows(b"in> hello".len()).any(|w| w == b"in> hello"), "the foreground tool reads its stdin and echoes it back");
+}
+
+#[cfg(test)]
+#[test_case]
 fn system_manager_recovery_escalates_after_repeated_crashes() {
 	use object::KernelObject;
 	// The kernel supervises SystemManager: if it faults, the kernel starts a

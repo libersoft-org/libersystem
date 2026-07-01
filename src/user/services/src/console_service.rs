@@ -930,8 +930,9 @@ unsafe fn feed_tty(vt: &mut Vt, b: u8) {
 	unsafe {
 		let client: u64 = vt.client;
 		// A foreground job owns the tty: the signal keys become signals to it (the tty's
-		// ISIG behaviour). Other input is swallowed - foreground programs do not read stdin,
-		// so type-ahead is dropped the way a Linux tty drains its queue for a non-reader.
+		// ISIG behaviour) and are consumed here. Every other byte flows on through the line
+		// discipline below to the job's stdin, so an interactive foreground tool reads its
+		// input edited + echoed exactly as the shell reads keystrokes at its prompt.
 		if let Some(proc) = vt.fg_proc {
 			match b {
 				0x03 => {
@@ -939,6 +940,7 @@ unsafe fn feed_tty(vt: &mut Vt, b: u8) {
 					// and the shell's run_foreground returns to the prompt.
 					signal(proc, SIG_INT);
 					tty_echo(vt, b"^C\n");
+					return;
 				}
 				0x1a => {
 					// Ctrl+Z: suspend the job and tell the shell to background it. Clear
@@ -949,15 +951,16 @@ unsafe fn feed_tty(vt: &mut Vt, b: u8) {
 					if let Some(p) = vt.fg_proc.take() {
 						close(p);
 					}
+					return;
 				}
 				0x1c => {
 					// Ctrl+\: terminate.
 					signal(proc, SIG_TERM);
 					tty_echo(vt, b"^\\\n");
+					return;
 				}
-				_ => {} // swallowed: a foreground job does not read stdin here
+				_ => {} // any other byte: fall through to the line discipline (the job's stdin)
 			}
-			return;
 		}
 		if !vt.ld.cooked {
 			send_blocking(client, &[b], 0);

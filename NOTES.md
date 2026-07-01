@@ -1,8 +1,10 @@
 # Bugs / changes
 
-- After bootup it automatically presses enter after a few seconds
+- After bootup, in shell it automatically presses enter after a few seconds - why?
 - Where are system tools stored? When I enter "ls" in vol://system/, I can see just 2 .txt files
 - Remove "Hello from the OS ramdisk!" after start and add 1 empty line before userspace (before MOTD)
+- Remove "help" command, instead double tab should show the list of commands (the same as on Linux)
+- Is our shell a separated binary (like on Linux - bash, dash, fish etc.)?
 - Add commands for listing hw resources - lsblk, lspci etc.
 - Search for big source code files, sort them by number of lines, create a plan to atomize them
 - GPU driver keeps failing probably (screen sometimes blinking after few minutes - probably restartind driver or something)

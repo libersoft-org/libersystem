@@ -591,6 +591,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			print(b"  size             show the terminal size (cols x rows)\n");
 			print(b"  resize <c> <r>   resize the terminal to c cols x r rows\n");
 			print(b"  echo <text>      print text\n");
+			print(b"  readln           read stdin and echo each line (Ctrl+D to end)\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
 			print(b"  lsvol            list the available volumes via StorageService\n");
 			print(b"  cd [<path>]      change the working directory (no argument returns home)\n");
@@ -887,6 +888,12 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			exec(jobs, procsvc, b"echo", trim(rest), 0, bg);
 			return false;
 		}
+		if line == b"readln" {
+			// readln reads its stdin and echoes each line - the interactive counterpart to
+			// echo, proving a foreground tool reads keyboard input, not just prints.
+			exec(jobs, procsvc, b"readln", b"", 0, bg);
+			return false;
+		}
 		if line == b"lsvol" {
 			// Launch `lsvol` as its own sandboxed ELF through PermissionManager (the launcher /
 			// granter), which grants it the four volume StorageService clients (the `volumes`
@@ -1166,9 +1173,10 @@ unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cap: u64
 				return;
 			}
 		};
-		// Hand the child our console as its stdout (a SEND dup of our console channel), then
-		// its arguments + an optional inherited capability (e.g. a NetworkService client).
-		send_stdout(parent);
+		// Hand the child our console as its stdout - and, for a foreground job, its stdin too
+		// (a full-duplex dup of our console channel, the controlling terminal) - then its
+		// arguments + an optional inherited capability (e.g. a NetworkService client).
+		send_stdout(parent, !bg);
 		send_blocking(parent, args, cap);
 		// The bootstrap is delivered; the child drains it from its own end, so the shell no
 		// longer needs the parent end. Drop it - the shell now tracks the job solely by its
@@ -1195,15 +1203,25 @@ unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cap: u64
 	}
 }
 
-// Hand a freshly spawned child our console as its stdout: a SEND dup of our console
-// channel transferred in a "STDOUT" message (the child's `rt::inherit_stdout` adopts
-// it), so the program's `print` output renders on the same terminal. Sent before the
-// argv/capability message. A handle of 0 (no console) leaves the child on serial.
-unsafe fn send_stdout(parent: u64) {
+// Hand a freshly spawned child our console as its stdout - and, for an `interactive`
+// (foreground) launch, its stdin too. The console is a full-duplex controlling terminal:
+// a SEND dup carries the child's `print` output to the same VT; granting RECEIVE as well
+// lets the child read cooked input lines back from it (`rt::read_line`), so an interactive
+// foreground tool gets keyboard input while the shell parks in `run_foreground`. A
+// background job gets a SEND-only dup (no stdin - it must not race the shell for input).
+// Transferred in a "STDOUT" message before the argv/capability message; the child's
+// `rt::inherit_stdout` adopts it as both stdout and stdin. A handle of 0 (no console)
+// leaves the child on serial with no input.
+unsafe fn send_stdout(parent: u64, interactive: bool) {
 	unsafe {
 		let so: u64 = stdout();
+		let rights: u32 = if interactive {
+			RIGHT_SEND | RIGHT_RECEIVE | RIGHT_TRANSFER
+		} else {
+			RIGHT_SEND | RIGHT_TRANSFER
+		};
 		let dup: u64 = if so != 0 {
-			let d: i64 = duplicate(so, RIGHT_SEND | RIGHT_TRANSFER);
+			let d: i64 = duplicate(so, rights);
 			if d > 0 {
 				d as u64
 			} else {
