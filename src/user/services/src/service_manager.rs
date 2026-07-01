@@ -53,7 +53,7 @@ const N: usize = 19;
 // component it observes (so it holds their process handles for the live graph), and
 // the shell is the last component up: it depends on StorageService (which it talks to
 // over IPC) and on SystemGraphService (whose graph its `graph` command renders).
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"media_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service", b"session_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service", b"session_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"network_service", b"time_service", b"config_service", b"device_service", b"audio_service", b"process_service", b"resource_manager"] }, Service { name: b"resource_manager", deps: &[b"log_service"] }, Service { name: b"session_service", deps: &[b"log_service"] }];
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"media_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service", b"session_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service", b"storage_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service", b"session_service", b"process_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"network_service", b"time_service", b"config_service", b"device_service", b"audio_service", b"process_service", b"resource_manager"] }, Service { name: b"resource_manager", deps: &[b"log_service"] }, Service { name: b"session_service", deps: &[b"log_service"] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -400,7 +400,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"device_service" && !bootstrap_serve(manager_side, device_client) {
 			return State::Failed;
 		}
-		if name == b"process_service" && !bootstrap_process_service(manager_side, pkg_handle, pkg_len, process_client, buf) {
+		if name == b"process_service" && !bootstrap_process_service(manager_side, pkg_handle, pkg_len, *storage_client, process_client, buf) {
 			return State::Failed;
 		}
 		if name == b"config_service" && !bootstrap_serve(manager_side, config_client) {
@@ -418,7 +418,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"input_service" && !bootstrap_input(manager_side, *input_raw, input_client, pointer_console) {
 			return State::Failed;
 		}
-		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, *session_client, *pointer_console, console_client, console_control, pkg_handle, pkg_len, buf) {
+		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, *session_client, *pointer_console, console_client, console_control) {
 			return State::Failed;
 		}
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
@@ -889,10 +889,9 @@ unsafe fn bootstrap_package(manager_side: u64, pkg_handle: u64, pkg_len: usize, 
 	unsafe { bootstrap_package_rights(manager_side, pkg_handle, pkg_len, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER, buf) }
 }
 
-// The general form: hand a service the package under an explicit rights set. Most
-// launchers get read + map + transfer (enough to map it and pass it on); ConsoleService
-// additionally gets RIGHT_DUPLICATE, since it is itself a launcher and must re-grant a
-// read-only view of the package to every shell it spawns.
+// The general form: hand a service the package under an explicit rights set. The
+// launchers that still carry the package (DeviceManager, ProcessService as a bring-up
+// fallback, ResourceManager) get read + map + transfer - enough to map it and pass it on.
 unsafe fn bootstrap_package_rights(manager_side: u64, pkg_handle: u64, pkg_len: usize, rights: u32, buf: &mut [u8]) -> bool {
 	unsafe {
 		let dup: i64 = duplicate(pkg_handle, rights);
@@ -952,11 +951,13 @@ unsafe fn bootstrap_input(manager_side: u64, input_raw: u64, input_client: &mut 
 	}
 }
 
-// Hand ProcessService a read-only view of the init package (to launch programs
-// from) and the channel its clients reach it on. The service-channel client end is
-// kept in `*process_client` and later transferred to the shell for `ps`/`run`.
-unsafe fn bootstrap_process_service(manager_side: u64, pkg_handle: u64, pkg_len: usize, process_client: &mut u64, buf: &mut [u8]) -> bool {
-	unsafe { bootstrap_package(manager_side, pkg_handle, pkg_len, buf) && bootstrap_serve(manager_side, process_client) }
+// Hand ProcessService the StorageService client it loads the on-disk program binaries
+// through ("STORAGE", a fresh factory connection), a read-only view of the init package
+// (the bring-up fallback), and the channel its clients reach it on. The service-channel
+// client end is kept in `*process_client` and later transferred to the shell for
+// `ps`/`run`. The receive order matches ProcessService's: package, storage, serve.
+unsafe fn bootstrap_process_service(manager_side: u64, pkg_handle: u64, pkg_len: usize, storage_client: u64, process_client: &mut u64, buf: &mut [u8]) -> bool {
+	unsafe { bootstrap_package(manager_side, pkg_handle, pkg_len, buf) && send_factory(manager_side, b"STORAGE", storage_client) && bootstrap_serve(manager_side, process_client) }
 }
 
 // Hand StorageService its disk-backed volume and a service channel over
@@ -1076,7 +1077,7 @@ unsafe fn bootstrap_audio_service(manager_side: u64, snd_client: u64, audio_clie
 // so minting from them never crosses the supervisor's lifecycle traffic. ConsoleService
 // maps the framebuffer itself (the kernel console then stops drawing) and attaches to
 // the kernel console input for keys.
-unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, gpu_client: u64, time_client: u64, audio_client: u64, session_client: u64, pointer_console: u64, console_client: &mut u64, console_control: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, gpu_client: u64, time_client: u64, audio_client: u64, session_client: u64, pointer_console: u64, console_client: &mut u64, console_control: &mut u64) -> bool {
 	unsafe {
 		let (service_end, client_end): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -1142,12 +1143,7 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 		// The pointer-forward channel from InputService (0 when no pointer device this
 		// boot): ConsoleService reads raw pointer events off it to drive selection,
 		// scrollback, and SGR mouse reports.
-		if !send_blocking(manager_side, b"POINTER", pointer_console) {
-			return false;
-		}
-		// A read-only view of the init package so ConsoleService can spawn shells. It
-		// re-grants this to every VT's shell, so it needs RIGHT_DUPLICATE as well.
-		bootstrap_package_rights(manager_side, pkg_handle, pkg_len, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER | RIGHT_DUPLICATE, buf)
+		send_blocking(manager_side, b"POINTER", pointer_console)
 	}
 }
 

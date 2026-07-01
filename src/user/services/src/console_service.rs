@@ -17,7 +17,7 @@
 
 use rt::*;
 
-use proto::system::network;
+use proto::system::{network, process};
 
 extern crate alloc;
 use alloc::boxed::Box;
@@ -477,8 +477,8 @@ struct Vt {
 
 // The capabilities ConsoleService holds to spawn a shell for any additional VT: a
 // factory connection to each multi-client service, from which it mints a fresh per-VT
-// client with `service_connect` / `network.open`. The init package the shell ELF is
-// looked up in is held separately on `Console`.
+// client with `service_connect` / `network.open`. The shell (and any PTY program) is
+// loaded through the ProcessService `process` factory, so no init package is held.
 struct Factories {
 	storage: u64,
 	log: u64,
@@ -522,7 +522,6 @@ struct Console {
 	// (foreground, scrollback, switch, gpu-resize) untouched.
 	ptys: Vec<Vt>,
 	facs: Factories,
-	package: Package<'static>,
 	// The pointer-forward channel from InputService (0 = no pointer device this boot): raw
 	// 6-byte pointer events [x u16 LE][y u16 LE][buttons u8][wheel i8] arrive on it, which
 	// `handle_pointer` turns into SGR mouse reports (for a program that enabled tracking)
@@ -615,8 +614,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	unsafe {
 		// 1. receive VT 1's console channel (its shell, spawned by ServiceManager, holds
-		//    the other end), then a factory connection per multi-client service and a
-		//    read-only view of the init package: the capabilities to spawn additional VTs.
+		//    the other end), then a factory connection per multi-client service - among them
+		//    the ProcessService `process` factory it loads and launches each shell through:
+		//    the capabilities to spawn additional VTs.
 		let client: u64 = recv_tagged(bootstrap, &mut buf, b"CLIENT").unwrap_or_else(|| exit());
 		// VT 1's control channel (ServiceManager brokered it: the shell holds the other end).
 		let control: u64 = recv_tagged(bootstrap, &mut buf, b"CONTROL").unwrap_or_else(|| exit());
@@ -637,8 +637,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let gpu: u64 = recv_gpu(bootstrap, &mut buf);
 		// InputService's pointer-forward channel (0 = no pointer device this boot).
 		let pointer: u64 = recv_pointer(bootstrap, &mut buf);
-		let (_pkg_handle, archive): (u64, &'static [u8]) = recv_package(bootstrap, &mut buf).unwrap_or_else(|| exit());
-		let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
 
 		// 2. acquire the display backends. The boot framebuffer the kernel hands over holds
 		//    the boot log; the virtio-gpu driver's resizable shared backing is the runtime
@@ -685,7 +683,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session };
-		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, package, pointer, clipboard: Vec::new(), ptr_buttons: 0 };
+		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, pointer, clipboard: Vec::new(), ptr_buttons: 0 };
 		run(&mut console);
 	}
 }
@@ -1242,7 +1240,7 @@ unsafe fn create_vt(console: &mut Console) {
 		if !console.has_fb || console.vts.len() >= NVT {
 			return;
 		}
-		if let Some(vt) = spawn_vt(&console.facs, &console.package, console.addr, &console.fb, console.gpu, console.cur_w, console.cur_h) {
+		if let Some(vt) = spawn_vt(&console.facs, console.addr, &console.fb, console.gpu, console.cur_w, console.cur_h) {
 			console.vts.push(vt);
 			console.fg = console.vts.len() - 1;
 			repaint(console);
@@ -1542,12 +1540,8 @@ fn repaint(console: &mut Console) {
 // handle would pin the shell's handle table (and that channel) alive, so the terminal
 // could never be reaped when the shell logs out or exits. Shared by spawn_vt (a display
 // VT) and open_pty (a program-hosted PTY).
-unsafe fn spawn_shell(facs: &Factories, package: &Package, shell_console: u64, shell_control: u64) -> bool {
+unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) -> bool {
 	unsafe {
-		let shell_elf: &[u8] = match package.lookup(b"shell") {
-			Some(e) => e,
-			None => return false,
-		};
 		let storage: u64 = match service_connect(facs.storage) {
 			Some(h) => h,
 			None => return false,
@@ -1591,10 +1585,23 @@ unsafe fn spawn_shell(facs: &Factories, package: &Package, shell_console: u64, s
 			Some(pair) => pair,
 			None => return false,
 		};
-		let shell_proc: i64 = spawn(shell_elf, boot_child);
-		if shell_proc < 0 {
-			return false;
-		}
+		// Load and start the shell through ProcessService (the sole process-creation
+		// mechanism), which reads its binary from the system volume's `bin/`. The child's
+		// end of its bootstrap channel is handed over as the launch bootstrap; a dedicated
+		// launcher connection to ProcessService is minted for this one call.
+		let launcher: u64 = match service_connect(facs.process) {
+			Some(h) => h,
+			None => return false,
+		};
+		let started = match process::Client::new(ChannelTransport { chan: launcher }).launch("shell", &boot_child) {
+			Some(Ok(s)) => s,
+			_ => {
+				close(launcher);
+				return false;
+			}
+		};
+		close(launcher);
+		let shell_proc: u64 = started.task;
 		send_blocking(boot_parent, b"STORAGE", storage);
 		send_blocking(boot_parent, b"MEDIA", 0);
 		send_blocking(boot_parent, b"ISO", 0);
@@ -1618,11 +1625,11 @@ unsafe fn spawn_shell(facs: &Factories, package: &Package, shell_console: u64, s
 		let mut rbuf: [u8; 32] = [0u8; 32];
 		if let Received::Closed = recv_blocking(boot_parent, &mut rbuf) {
 			close(boot_parent);
-			close(shell_proc as u64);
+			close(shell_proc);
 			return false;
 		}
 		close(boot_parent);
-		close(shell_proc as u64);
+		close(shell_proc);
 		true
 	}
 }
@@ -1630,11 +1637,11 @@ unsafe fn spawn_shell(facs: &Factories, package: &Package, shell_console: u64, s
 // Open one VT's shell: create the VT's console + control channels, spawn a fully-capable
 // shell over them, nudge it to print its first prompt, and return the VT (its cleared grid
 // + the service ends of those channels). None on any failure.
-unsafe fn spawn_vt(facs: &Factories, package: &Package, addr: u64, fb: &Framebuffer, gpu: u64, cur_w: u32, cur_h: u32) -> Option<Vt> {
+unsafe fn spawn_vt(facs: &Factories, addr: u64, fb: &Framebuffer, gpu: u64, cur_w: u32, cur_h: u32) -> Option<Vt> {
 	unsafe {
 		let (vt_service, vt_client): (u64, u64) = channel()?;
 		let (control_console, control_shell): (u64, u64) = channel()?;
-		if !spawn_shell(facs, package, vt_client, control_shell) {
+		if !spawn_shell(facs, vt_client, control_shell) {
 			close(vt_service);
 			close(vt_client);
 			close(control_console);
@@ -1665,7 +1672,7 @@ unsafe fn open_pty(console: &mut Console, name: &[u8]) -> Option<u64> {
 		let (control_console, control_slave): (u64, u64) = channel()?;
 		let (master_console, master_host): (u64, u64) = channel()?;
 		let is_shell: bool = name == b"shell";
-		let ok: bool = if is_shell { spawn_shell(&console.facs, &console.package, slave_client, control_slave) } else { spawn_pty_program(&console.package, name, slave_client, control_slave) };
+		let ok: bool = if is_shell { spawn_shell(&console.facs, slave_client, control_slave) } else { spawn_pty_program(&console.facs, name, slave_client, control_slave) };
 		if !ok {
 			close(slave_service);
 			close(slave_client);
@@ -1687,25 +1694,33 @@ unsafe fn open_pty(console: &mut Console, name: &[u8]) -> Option<u64> {
 // Spawn a minimal (non-shell) program as a PTY slave: it gets only its console + control
 // channels (no service factories, no online handshake), the bootstrap a bare terminal
 // client needs. Used to host a simple program on a pty (the pty loopback test slave); a
-// shell uses spawn_shell.
-unsafe fn spawn_pty_program(package: &Package, name: &[u8], program_console: u64, program_control: u64) -> bool {
+// shell uses spawn_shell. Loaded through ProcessService from the system volume's `bin/`.
+unsafe fn spawn_pty_program(facs: &Factories, name: &[u8], program_console: u64, program_control: u64) -> bool {
 	unsafe {
-		let elf: &[u8] = match package.lookup(name) {
-			Some(e) => e,
-			None => return false,
+		let name_str: &str = match core::str::from_utf8(name) {
+			Ok(s) => s,
+			Err(_) => return false,
 		};
 		let (boot_parent, boot_child): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => return false,
 		};
-		let proc: i64 = spawn(elf, boot_child);
-		if proc < 0 {
-			return false;
-		}
+		let launcher: u64 = match service_connect(facs.process) {
+			Some(h) => h,
+			None => return false,
+		};
+		let started = match process::Client::new(ChannelTransport { chan: launcher }).launch(name_str, &boot_child) {
+			Some(Ok(s)) => s,
+			_ => {
+				close(launcher);
+				return false;
+			}
+		};
+		close(launcher);
 		send_blocking(boot_parent, b"CONSOLE", program_console);
 		send_blocking(boot_parent, b"CONTROL", program_control);
 		close(boot_parent);
-		close(proc as u64);
+		close(started.task);
 		true
 	}
 }

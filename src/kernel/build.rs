@@ -88,6 +88,12 @@ const NONBOOT_DRIVER_NAMES: [&str; 5] = ["virtio_net", "virtio_console", "virtio
 // Command-line tools - staged into the init package and onto the system volume under bin/.
 const TOOL_NAMES: [&str; 31] = ["date", "cat", "write", "rm", "ls", "mkdir", "rmdir", "log", "snap", "dev", "config", "set", "beep", "usage", "ps", "run", "perm", "stop", "lsvol", "echo", "ping", "ip", "nslookup", "tcp", "nc", "arp", "httpd", "ss", "script", "ptyecho", "readln"];
 
+// Services that are also staged onto the system volume under bin/, so ProcessService can
+// load and launch them from there like any other program (M61 box 2). The shell is a
+// program ConsoleService starts through ProcessService, so it lives on the volume as
+// bin/shell (it still ships in the init package too, as the bring-up fallback).
+const STAGED_SERVICE_NAMES: [(&str, &str); 1] = [("shell", "services")];
+
 // The debug-build target path of a userspace ELF: each crate builds to its own target dir.
 fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 	manifest.join(format!("../user/{crate_dir}/target/x86_64-unknown-none/debug/{name}"))
@@ -208,6 +214,16 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	// seed archive to a few megabytes. A missing or unstrippable ELF is skipped.
 	for name in TOOL_NAMES {
 		let path: PathBuf = user_elf_path(&manifest, "tools", name);
+		println!("cargo:rerun-if-changed={}", path.display());
+		match read_stripped(&path) {
+			Some(bytes) => files.push((format!("bin/{name}"), bytes)),
+			None => println!("cargo:warning={name} ELF not found at {} - omitting from system volume (run `just user` or `just build`)", path.display()),
+		}
+	}
+	// M61 box 2: stage the shell (and any other launched service) under bin/ too, so
+	// ConsoleService can start it through ProcessService loading from the volume.
+	for (name, crate_dir) in STAGED_SERVICE_NAMES {
+		let path: PathBuf = user_elf_path(&manifest, crate_dir, name);
 		println!("cargo:rerun-if-changed={}", path.display());
 		match read_stripped(&path) {
 			Some(bytes) => files.push((format!("bin/{name}"), bytes)),
