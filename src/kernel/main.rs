@@ -2056,6 +2056,47 @@ fn device_table_exposes_the_xhci_controller() {
 
 #[cfg(test)]
 #[test_case]
+fn xhci_driver_enumerates_the_usb_bus() {
+	use object::device_memory::DeviceMemory;
+	use object::rights::Rights;
+
+	// The userspace xhci driver, driven the way DeviceManager drives it: spawn its
+	// staged ELF (it lives on the system volume under drivers/, not in the init
+	// package) with a bootstrap channel, hand it "DEVICE" + the controller's
+	// DeviceInfo + a DeviceMemory capability to its register file, and wait for its
+	// report. The driver resets the controller, builds the command and event rings,
+	// enumerates the root-hub ports, addresses each connected device and reads its
+	// device descriptor - QEMU hangs one USB keyboard off the controller (see
+	// qemu-run.sh), so exactly one device must come back addressed.
+	let (volume, _package) = scenario_packages().expect("boot modules should be present");
+	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/xhci")).expect("the xhci driver should be staged on the volume under drivers/");
+
+	// find the controller in the device table and mint its MMIO capability.
+	let mut found: Option<(abi::DeviceInfo, u64, u64)> = None;
+	for i in 0..device::count() {
+		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
+		if entry.0 as u32 == abi::DEVICE_TYPE_XHCI {
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset }).unwrap();
+			found = Some((info, entry.1, entry.2));
+			break;
+		}
+	}
+	let (info, bar_phys, bar_len) = found.expect("the device table should hold the xHCI controller");
+
+	let (kernel_ep, user_ep) = object::channel::Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL, 0).expect("the xhci driver should load");
+	let mut msg = alloc::vec::Vec::with_capacity(6 + core::mem::size_of::<abi::DeviceInfo>());
+	msg.extend_from_slice(b"DEVICE");
+	msg.extend_from_slice(unsafe { core::slice::from_raw_parts(&info as *const abi::DeviceInfo as *const u8, core::mem::size_of::<abi::DeviceInfo>()) });
+	send_cap(&kernel_ep, &msg, DeviceMemory::new(bar_phys, bar_len as usize), Rights::ALL).expect("the DEVICE handoff should send");
+	sched::run_until_idle();
+
+	let report = kernel_ep.recv().expect("the xhci driver should report in");
+	assert_eq!(&report.bytes[..], b"driver.xhci: online (1 device(s))", "the driver should bring the controller up and address the QEMU USB keyboard");
+}
+
+#[cfg(test)]
+#[test_case]
 fn dma_buffer_maps_and_reports_phys() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	// A driver allocates a DMA buffer for its virtqueue, maps it, and programs its

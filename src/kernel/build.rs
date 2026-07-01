@@ -92,7 +92,7 @@ const BOOT_DRIVER_NAMES: [&str; 1] = ["virtio_blk"];
 
 // Non-bootstrap drivers - loaded from the system volume under drivers/ (M61 box 8), so
 // staged there and not kept in the init package.
-const NONBOOT_DRIVER_NAMES: [&str; 5] = ["virtio_net", "virtio_console", "virtio_input", "virtio_gpu", "virtio_snd"];
+const NONBOOT_DRIVER_NAMES: [&str; 6] = ["virtio_net", "virtio_console", "virtio_input", "virtio_gpu", "virtio_snd", "xhci"];
 
 // Command-line tools - loaded from the system volume under bin/, so staged there and not
 // kept in the init package.

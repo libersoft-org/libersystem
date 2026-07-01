@@ -347,6 +347,7 @@ fn driver_for(device_type: u32) -> &'static [u8] {
 		VIRTIO_TYPE_INPUT => b"virtio_input",
 		VIRTIO_TYPE_GPU => b"virtio_gpu",
 		VIRTIO_TYPE_SOUND => b"virtio_snd",
+		DEVICE_TYPE_XHCI => b"xhci",
 		_ => b"",
 	}
 }
