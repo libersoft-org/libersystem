@@ -3013,6 +3013,19 @@ fn kernel_reads_file_through_storage_service() {
 
 #[cfg(test)]
 #[test_case]
+fn storage_serves_staged_tool_binary() {
+	// M61 box 7: the tool ELFs are staged onto the system volume under bin/ by the
+	// factory-seed pipeline (build.rs strips them into the volume archive, the boot runner
+	// lays that archive at LBA 0, and StorageService seeds it into the freshly-formatted
+	// LiberFS). Reading one back through StorageService must return a valid ELF image -
+	// proof the whole staging path works end to end.
+	let actual = storage_read(b"vol://system/bin/cat").expect("the staged tool read should succeed");
+	assert!(actual.len() > 4, "the staged tool should not be empty");
+	assert_eq!(&actual[..4], b"\x7fELF", "the staged tool should be an ELF image");
+}
+
+#[cfg(test)]
+#[test_case]
 fn event_timer_objects() {
 	use object::event::Event;
 	use object::timer::Timer;

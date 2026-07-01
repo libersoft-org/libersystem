@@ -4,7 +4,8 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
 	select_linker_script();
@@ -67,6 +68,55 @@ fn conf_get<'a>(conf: &'a [(String, String)], key: &str) -> &'a str {
 	panic!("missing {key} in product.conf");
 }
 
+// The userspace programs staged at boot, the single source of truth for both archives.
+// Everything ships in the init package (a Limine module the kernel loads); the tools and
+// non-bootstrap drivers are additionally seeded onto the system volume under bin/ and
+// drivers/ (M61 box 7), so they can later be loaded from there.
+
+// Services and managers - the resident userspace, spawned by SystemManager from the init
+// package. (package entry name, crate directory under ../user).
+const SERVICE_SOURCES: [(&str, &str); 26] = [("system_manager", "system_manager"), ("service_manager", "services"), ("log_service", "services"), ("device_manager", "services"), ("device_service", "services"), ("process_service", "services"), ("config_service", "services"), ("network_service", "services"), ("time_service", "services"), ("console_service", "services"), ("audio_service", "services"), ("input_service", "services"), ("system_graph_service", "services"), ("permission_manager", "services"), ("resource_manager", "services"), ("session_service", "services"), ("watchdog_probe", "services"), ("sandbox_probe", "services"), ("request_probe", "services"), ("resource_probe", "services"), ("wasi_host", "services"), ("component_host", "services"), ("file_picker", "services"), ("shell", "services"), ("storage_service", "storage"), ("storage_client", "storage")];
+
+// The bootstrap block driver - it must ship in the init package because it backs the
+// system volume everything else is seeded onto, so it can never live on that volume.
+const BOOT_DRIVER_NAMES: [&str; 1] = ["virtio_blk"];
+
+// Non-bootstrap drivers - staged into the init package and onto the system volume under
+// drivers/.
+const NONBOOT_DRIVER_NAMES: [&str; 5] = ["virtio_net", "virtio_console", "virtio_input", "virtio_gpu", "virtio_snd"];
+
+// Command-line tools - staged into the init package and onto the system volume under bin/.
+const TOOL_NAMES: [&str; 31] = ["date", "cat", "write", "rm", "ls", "mkdir", "rmdir", "log", "snap", "dev", "config", "set", "beep", "usage", "ps", "run", "perm", "stop", "lsvol", "echo", "ping", "ip", "nslookup", "tcp", "nc", "arp", "httpd", "ss", "script", "ptyecho", "readln"];
+
+// The debug-build target path of a userspace ELF: each crate builds to its own target dir.
+fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
+	manifest.join(format!("../user/{crate_dir}/target/x86_64-unknown-none/debug/{name}"))
+}
+
+// Read a userspace ELF and strip its symbol and debug sections, returning the smaller
+// loadable image staged onto the system volume (the on-disk copies are executed by the
+// loader, which needs only the program image, while the init package keeps the full debug
+// ELFs). Returns None if the ELF is absent (the build still succeeds - the program is
+// simply not staged) or if no `strip` tool is available.
+fn read_stripped(path: &Path) -> Option<Vec<u8>> {
+	if !path.exists() {
+		return None;
+	}
+	let tmp: PathBuf = env::temp_dir().join(format!("liberseed-{}-{}", std::process::id(), path.file_name()?.to_str()?));
+	if fs::copy(path, &tmp).is_err() {
+		return None;
+	}
+	let stripped: Option<Vec<u8>> = match Command::new("strip").arg("-s").arg(&tmp).status() {
+		Ok(status) if status.success() => fs::read(&tmp).ok(),
+		_ => {
+			println!("cargo:warning=strip unavailable - omitting {} from the system volume", path.display());
+			None
+		}
+	};
+	let _ = fs::remove_file(&tmp);
+	stripped
+}
+
 // Assemble the init package that the kernel loads as a Limine module. The package
 // is a tiny archive (a header plus fixed-size entries plus the concatenated file
 // blobs) holding the userspace programs - SystemManager plus the StorageService
@@ -84,9 +134,22 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	let out_dir: PathBuf = manifest.join("../boot/.build");
 	let out_pkg: PathBuf = out_dir.join(conf_get(conf, "INIT_PACKAGE"));
 
-	// (package entry name, ELF path). The services and storage crates each produce
-	// several binaries.
-	let sources: [(&str, PathBuf); 63] = [("system_manager", manifest.join("../user/system_manager/target/x86_64-unknown-none/debug/system_manager")), ("service_manager", manifest.join("../user/services/target/x86_64-unknown-none/debug/service_manager")), ("log_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/log_service")), ("device_manager", manifest.join("../user/services/target/x86_64-unknown-none/debug/device_manager")), ("device_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/device_service")), ("process_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/process_service")), ("config_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/config_service")), ("network_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/network_service")), ("time_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/time_service")), ("console_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/console_service")), ("audio_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/audio_service")), ("input_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/input_service")), ("system_graph_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/system_graph_service")), ("permission_manager", manifest.join("../user/services/target/x86_64-unknown-none/debug/permission_manager")), ("resource_manager", manifest.join("../user/services/target/x86_64-unknown-none/debug/resource_manager")), ("session_service", manifest.join("../user/services/target/x86_64-unknown-none/debug/session_service")), ("watchdog_probe", manifest.join("../user/services/target/x86_64-unknown-none/debug/watchdog_probe")), ("sandbox_probe", manifest.join("../user/services/target/x86_64-unknown-none/debug/sandbox_probe")), ("date", manifest.join("../user/tools/target/x86_64-unknown-none/debug/date")), ("cat", manifest.join("../user/tools/target/x86_64-unknown-none/debug/cat")), ("write", manifest.join("../user/tools/target/x86_64-unknown-none/debug/write")), ("rm", manifest.join("../user/tools/target/x86_64-unknown-none/debug/rm")), ("ls", manifest.join("../user/tools/target/x86_64-unknown-none/debug/ls")), ("mkdir", manifest.join("../user/tools/target/x86_64-unknown-none/debug/mkdir")), ("rmdir", manifest.join("../user/tools/target/x86_64-unknown-none/debug/rmdir")), ("log", manifest.join("../user/tools/target/x86_64-unknown-none/debug/log")), ("snap", manifest.join("../user/tools/target/x86_64-unknown-none/debug/snap")), ("dev", manifest.join("../user/tools/target/x86_64-unknown-none/debug/dev")), ("config", manifest.join("../user/tools/target/x86_64-unknown-none/debug/config")), ("set", manifest.join("../user/tools/target/x86_64-unknown-none/debug/set")), ("beep", manifest.join("../user/tools/target/x86_64-unknown-none/debug/beep")), ("usage", manifest.join("../user/tools/target/x86_64-unknown-none/debug/usage")), ("ps", manifest.join("../user/tools/target/x86_64-unknown-none/debug/ps")), ("run", manifest.join("../user/tools/target/x86_64-unknown-none/debug/run")), ("perm", manifest.join("../user/tools/target/x86_64-unknown-none/debug/perm")), ("stop", manifest.join("../user/tools/target/x86_64-unknown-none/debug/stop")), ("lsvol", manifest.join("../user/tools/target/x86_64-unknown-none/debug/lsvol")), ("request_probe", manifest.join("../user/services/target/x86_64-unknown-none/debug/request_probe")), ("resource_probe", manifest.join("../user/services/target/x86_64-unknown-none/debug/resource_probe")), ("wasi_host", manifest.join("../user/services/target/x86_64-unknown-none/debug/wasi_host")), ("component_host", manifest.join("../user/services/target/x86_64-unknown-none/debug/component_host")), ("file_picker", manifest.join("../user/services/target/x86_64-unknown-none/debug/file_picker")), ("shell", manifest.join("../user/services/target/x86_64-unknown-none/debug/shell")), ("storage_service", manifest.join("../user/storage/target/x86_64-unknown-none/debug/storage_service")), ("storage_client", manifest.join("../user/storage/target/x86_64-unknown-none/debug/storage_client")), ("virtio_blk", manifest.join("../user/drivers/target/x86_64-unknown-none/debug/virtio_blk")), ("virtio_net", manifest.join("../user/drivers/target/x86_64-unknown-none/debug/virtio_net")), ("virtio_console", manifest.join("../user/drivers/target/x86_64-unknown-none/debug/virtio_console")), ("virtio_input", manifest.join("../user/drivers/target/x86_64-unknown-none/debug/virtio_input")), ("virtio_gpu", manifest.join("../user/drivers/target/x86_64-unknown-none/debug/virtio_gpu")), ("virtio_snd", manifest.join("../user/drivers/target/x86_64-unknown-none/debug/virtio_snd")), ("echo", manifest.join("../user/tools/target/x86_64-unknown-none/debug/echo")), ("ping", manifest.join("../user/tools/target/x86_64-unknown-none/debug/ping")), ("ip", manifest.join("../user/tools/target/x86_64-unknown-none/debug/ip")), ("nslookup", manifest.join("../user/tools/target/x86_64-unknown-none/debug/nslookup")), ("tcp", manifest.join("../user/tools/target/x86_64-unknown-none/debug/tcp")), ("nc", manifest.join("../user/tools/target/x86_64-unknown-none/debug/nc")), ("arp", manifest.join("../user/tools/target/x86_64-unknown-none/debug/arp")), ("httpd", manifest.join("../user/tools/target/x86_64-unknown-none/debug/httpd")), ("ss", manifest.join("../user/tools/target/x86_64-unknown-none/debug/ss")), ("script", manifest.join("../user/tools/target/x86_64-unknown-none/debug/script")), ("ptyecho", manifest.join("../user/tools/target/x86_64-unknown-none/debug/ptyecho")), ("readln", manifest.join("../user/tools/target/x86_64-unknown-none/debug/readln"))];
+	// (package entry name, ELF path), built from the shared program lists: every service
+	// and manager, all drivers (the bootstrap one plus the non-bootstrap set) and every
+	// tool. The services and storage crates each produce several binaries.
+	let mut sources: Vec<(&str, PathBuf)> = Vec::new();
+	for (name, crate_dir) in SERVICE_SOURCES {
+		sources.push((name, user_elf_path(&manifest, crate_dir, name)));
+	}
+	for name in BOOT_DRIVER_NAMES {
+		sources.push((name, user_elf_path(&manifest, "drivers", name)));
+	}
+	for name in NONBOOT_DRIVER_NAMES {
+		sources.push((name, user_elf_path(&manifest, "drivers", name)));
+	}
+	for name in TOOL_NAMES {
+		sources.push((name, user_elf_path(&manifest, "tools", name)));
+	}
 
 	fs::create_dir_all(&out_dir).unwrap_or_else(|e: std::io::Error| panic!("cannot create {}: {e}", out_dir.display()));
 
@@ -136,6 +199,28 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		}
 	} else {
 		println!("cargo:warning=volume directory not found at {} - writing an empty volume package", vol_dir.display());
+	}
+
+	// M61 box 7: also stage the tool and non-bootstrap driver ELFs onto the system volume
+	// under bin/ and drivers/, so they can later be loaded from there. They are stripped
+	// of symbol/debug sections (the on-disk copies are executed by the loader, which needs
+	// only the program image; the init package keeps the full debug ELFs), keeping the
+	// seed archive to a few megabytes. A missing or unstrippable ELF is skipped.
+	for name in TOOL_NAMES {
+		let path: PathBuf = user_elf_path(&manifest, "tools", name);
+		println!("cargo:rerun-if-changed={}", path.display());
+		match read_stripped(&path) {
+			Some(bytes) => files.push((format!("bin/{name}"), bytes)),
+			None => println!("cargo:warning={name} ELF not found at {} - omitting from system volume (run `just user` or `just build`)", path.display()),
+		}
+	}
+	for name in NONBOOT_DRIVER_NAMES {
+		let path: PathBuf = user_elf_path(&manifest, "drivers", name);
+		println!("cargo:rerun-if-changed={}", path.display());
+		match read_stripped(&path) {
+			Some(bytes) => files.push((format!("drivers/{name}"), bytes)),
+			None => println!("cargo:warning={name} ELF not found at {} - omitting from system volume (run `just user` or `just build`)", path.display()),
+		}
 	}
 	files.sort_by(|a, b| a.0.cmp(&b.0));
 

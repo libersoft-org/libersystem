@@ -39,7 +39,7 @@ use fat::FatFs;
 use iso9660::Iso9660;
 use liberfs::{BlockDevice, FsError, LiberFs};
 use proto::codec::Buffer;
-use proto::system::{Error, FileInfo, FileKind, OpenOpts, OpenResult, SnapshotInfo, volume};
+use proto::system::{volume, Error, FileInfo, FileKind, OpenOpts, OpenResult, SnapshotInfo};
 use rt::*;
 use udf::Udf;
 
@@ -63,11 +63,13 @@ const OP_WRITE: u32 = 1;
 
 // LiberFS layout on the disk: the writable filesystem spans FS_BLOCKS filesystem blocks
 // (one block = SECTORS_PER_BLOCK disk sectors) starting at FS_START_SECTOR - well past
-// the small factory archive at LBA 0, which the boot runner re-lays every boot and the
-// filesystem never overwrites, so created files persist across reboots.
+// the factory archive at LBA 0, which the boot runner re-lays every boot and the
+// filesystem never overwrites, so created files persist across reboots. The archive now
+// carries the staged program binaries (M61 box 7), so it is a few megabytes: the FS
+// starts 16 MiB in (past the archive) and the pool is 32 MiB, ample for the seeded ELFs.
 const SECTORS_PER_BLOCK: u64 = (liberfs::BLOCK_SIZE / SECTOR_SIZE) as u64;
-const FS_START_SECTOR: u64 = 2048;
-const FS_BLOCKS: u64 = 64;
+const FS_START_SECTOR: u64 = 32768;
+const FS_BLOCKS: u64 = 8192;
 
 // An ISO9660 logical block (2048 bytes) is this many 512-byte disk sectors; one read
 // stays within a single DMA page (8 sectors).
@@ -561,47 +563,55 @@ fn seed_from_archive(fs: &mut LiberFs<ChannelBlockDevice>, archive: &[u8]) {
 }
 
 // Read the factory PKGARCH1 archive off the virtio-blk disk at LBA 0 into a Vec,
-// leaving `block_client` open for the filesystem. Phase 1 assumes the archive header
-// + entry table fit the first sector. Returns None if the disk holds no archive.
+// leaving `block_client` open for the filesystem. The header + entry table may span
+// several sectors now that the program binaries are staged, so the whole archive is read
+// in page-sized (8-sector) chunks - each request moves at most one DMA page. Returns
+// None if the disk holds no archive.
 unsafe fn read_seed_archive(block_client: u64) -> Option<Vec<u8>> {
 	unsafe {
-		// read sector 0 to find the archive's magic and total size.
-		let mut head: [u8; SECTOR_SIZE] = [0u8; SECTOR_SIZE];
-		if !block_read(block_client, 0, 1, head.as_mut_ptr()) {
-			return None;
-		}
-		if &head[..PKG_MAGIC.len()] != PKG_MAGIC {
-			return None;
-		}
-		let count: usize = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
-		let table_end: usize = PKG_HEADER_LEN + PKG_ENTRY_LEN * count;
-		if table_end > SECTOR_SIZE {
-			return None; // phase 1: the header + entry table fit one sector
-		}
-		// the archive's total size is the end of its last blob.
-		let mut total: usize = table_end;
-		let mut i: usize = 0;
-		while i < count {
-			let e: usize = PKG_HEADER_LEN + PKG_ENTRY_LEN * i;
-			let off: usize = u32::from_le_bytes([head[e + PKG_NAME_LEN], head[e + PKG_NAME_LEN + 1], head[e + PKG_NAME_LEN + 2], head[e + PKG_NAME_LEN + 3]]) as usize;
-			let size: usize = u32::from_le_bytes([head[e + PKG_NAME_LEN + 4], head[e + PKG_NAME_LEN + 5], head[e + PKG_NAME_LEN + 6], head[e + PKG_NAME_LEN + 7]]) as usize;
-			if off + size > total {
-				total = off + size;
-			}
-			i += 1;
-		}
-		// read the whole archive into a sector-padded Vec, in page-sized chunks.
-		let rounded: usize = ((total + SECTOR_SIZE - 1) / SECTOR_SIZE) * SECTOR_SIZE;
-		let mut archive: Vec<u8> = alloc::vec![0u8; rounded];
+		const PAGE: usize = SECTOR_SIZE * MAX_SECTORS_PER_READ;
+		// `total` starts large enough to reach the entry count, grows to cover the whole
+		// entry table, then becomes the end of the last blob.
+		let mut archive: Vec<u8> = Vec::new();
+		let mut total: usize = PKG_HEADER_LEN;
+		let mut table_end: usize = 0;
 		let mut filled: usize = 0;
 		while filled < total {
+			let want: usize = ((total + PAGE - 1) / PAGE) * PAGE;
+			if archive.len() < want {
+				archive.resize(want, 0);
+			}
 			let lba: u64 = (filled / SECTOR_SIZE) as u64;
-			let remaining: usize = total - filled;
-			let sectors: usize = ((remaining + SECTOR_SIZE - 1) / SECTOR_SIZE).min(MAX_SECTORS_PER_READ);
-			if !block_read(block_client, lba, sectors as u32, archive.as_mut_ptr().add(filled)) {
+			if !block_read(block_client, lba, MAX_SECTORS_PER_READ as u32, archive.as_mut_ptr().add(filled)) {
 				return None;
 			}
-			filled += sectors * SECTOR_SIZE;
+			filled += PAGE;
+			if table_end == 0 {
+				// the first page carries the magic and the entry count.
+				if &archive[..PKG_MAGIC.len()] != PKG_MAGIC {
+					return None;
+				}
+				let count: usize = u32::from_le_bytes([archive[8], archive[9], archive[10], archive[11]]) as usize;
+				table_end = PKG_HEADER_LEN + PKG_ENTRY_LEN * count;
+				total = table_end;
+			}
+			if total == table_end && filled >= table_end {
+				// the whole entry table is in memory: the archive's total size is the end of
+				// its last blob.
+				let count: usize = (table_end - PKG_HEADER_LEN) / PKG_ENTRY_LEN;
+				let mut end: usize = table_end;
+				let mut i: usize = 0;
+				while i < count {
+					let e: usize = PKG_HEADER_LEN + PKG_ENTRY_LEN * i;
+					let off: usize = u32::from_le_bytes([archive[e + PKG_NAME_LEN], archive[e + PKG_NAME_LEN + 1], archive[e + PKG_NAME_LEN + 2], archive[e + PKG_NAME_LEN + 3]]) as usize;
+					let size: usize = u32::from_le_bytes([archive[e + PKG_NAME_LEN + 4], archive[e + PKG_NAME_LEN + 5], archive[e + PKG_NAME_LEN + 6], archive[e + PKG_NAME_LEN + 7]]) as usize;
+					if off + size > end {
+						end = off + size;
+					}
+					i += 1;
+				}
+				total = end;
+			}
 		}
 		archive.truncate(total);
 		Some(archive)

@@ -16,8 +16,13 @@ use core::ops::{Deref, DerefMut};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-// Per-process heap size, mapped on first use.
+// Per-process heap size, mapped on first use. The heap grows by another such region
+// whenever an allocation cannot be satisfied, so a program that never allocates maps
+// nothing and a small program stays at one region, while a large consumer (e.g.
+// StorageService seeding the system volume from a multi-megabyte factory archive) grows
+// on demand instead of every process reserving a big heap up front.
 const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
+const PAGE_SIZE: usize = 4096;
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::new();
@@ -71,6 +76,27 @@ impl Heap {
 			}
 			self.add_free_region(base as usize, HEAP_SIZE);
 		}
+	}
+
+	// Map another backing region and add it to the free list when no existing region
+	// fits a request. The new region is at least HEAP_SIZE, or large enough for this one
+	// allocation (plus a node header), page-rounded. Returns false if the map fails, in
+	// which case the allocation returns null (which the alloc machinery turns into an
+	// abort).
+	fn grow(&mut self, need: usize) -> bool {
+		let size: usize = align_up(need.saturating_add(mem::size_of::<FreeRegion>()).max(HEAP_SIZE), PAGE_SIZE);
+		unsafe {
+			let handle = syscall(SYS_MEMORY_OBJECT_CREATE, size as u64, 0, 0, 0);
+			if sys_is_err(handle) {
+				return false;
+			}
+			let base = syscall(SYS_MEMORY_MAP, handle, 0, 0, 0);
+			if sys_is_err(base) {
+				return false;
+			}
+			self.add_free_region(base as usize, size);
+		}
+		true
 	}
 
 	// SAFETY: `addr` must be valid for writes and large enough to hold a node.
@@ -171,7 +197,18 @@ unsafe impl GlobalAlloc for LockedHeap {
 			let mut heap = self.lock();
 			heap.ensure_init();
 			let (size, align) = Heap::size_align(layout);
-			match heap.find_region(size, align) {
+			let region = match heap.find_region(size, align) {
+				Some(found) => Some(found),
+				// no region fits: map another and retry once.
+				None => {
+					if heap.grow(size) {
+						heap.find_region(size, align)
+					} else {
+						None
+					}
+				}
+			};
+			match region {
 				Some((region, alloc_start)) => {
 					let alloc_end = alloc_start.checked_add(size).expect("alloc overflow");
 					let excess = region.end_addr() - alloc_end;

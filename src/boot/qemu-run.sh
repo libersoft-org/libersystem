@@ -34,7 +34,16 @@ QEMU_ARGS=(
 VIRTIO_DISK="$HERE/.build/virtio-blk.img"
 VOLUME_PKG="$HERE/.build/volume.pkg"
 mkdir -p "$HERE/.build"
-[[ -f "$VIRTIO_DISK" ]] || truncate -s 16M "$VIRTIO_DISK"
+# The system volume disk. It must hold the factory archive at LBA 0 (now a few megabytes
+# of staged program binaries, M61 box 7) followed by the LiberFS region, so it is sized
+# well past both. A raw sparse image costs only the blocks actually written. Recreate it
+# when missing or the wrong size (e.g. after a filesystem-geometry change), which forces a
+# clean reformat and reseed.
+VIRTIO_DISK_SIZE=$((128 * 1024 * 1024))
+if [[ ! -f "$VIRTIO_DISK" || "$(stat -c%s "$VIRTIO_DISK")" -ne "$VIRTIO_DISK_SIZE" ]]; then
+	rm -f "$VIRTIO_DISK"
+	truncate -s "$VIRTIO_DISK_SIZE" "$VIRTIO_DISK"
+fi
 # StorageService (M26) backs its `vol://system` volume with this block device, so
 # lay the packed volume archive down at LBA 0 on every boot (conv=notrunc keeps the
 # disk at its full size; the kernel's build.rs produces volume.pkg next to it).

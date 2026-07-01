@@ -335,6 +335,14 @@ impl Queue {
 				w16(d + 12, flags);
 				w16(d + 14, (i + 1) as u16);
 			}
+			// Sample the used-ring index before publishing the request, so a completion
+			// the device posts any time after the notify is observed as a change. Sampling
+			// it after the notify races the device: a fast completion (QEMU virtio-blk
+			// completes near-instantly) can bump the used index before it is read, so the
+			// poll waits for a second completion that never comes and times out - a stall
+			// that only surfaced under the sustained block I/O the staged-binary seed drives.
+			let used = self.virt + self.used_off;
+			let old_used = r16(used + 2);
 			// Publish the head descriptor (index 0) in the available ring, ordered
 			// before the index bump so the device never sees a half-written entry.
 			let avail = self.virt + self.avail_off;
@@ -346,8 +354,6 @@ impl Queue {
 			// Notify the device that this queue has work (the value is the queue index).
 			w16(self.notify_addr, self.index);
 			// Poll the used ring until the request completes.
-			let used = self.virt + self.used_off;
-			let old_used = r16(used + 2);
 			let mut spins: u32 = 0;
 			loop {
 				fence(Ordering::SeqCst);
