@@ -1618,6 +1618,7 @@ unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) 
 		send_blocking(boot_parent, b"MEDIA", 0);
 		send_blocking(boot_parent, b"ISO", 0);
 		send_blocking(boot_parent, b"UDF", 0);
+		send_blocking(boot_parent, b"USB", 0);
 		send_blocking(boot_parent, b"LOG", log);
 		send_blocking(boot_parent, b"DEVICE", device);
 		send_blocking(boot_parent, b"PROCESS", process);

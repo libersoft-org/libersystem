@@ -152,7 +152,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::Process => b"PROCESS",
 		Capability::Permission => b"PERMISSION",
 		Capability::Supervisor => b"SUPERVISOR",
-		// The `volumes` capability bundles four channels; the grant hands them over under their
+		// The `volumes` capability bundles five channels; the grant hands them over under their
 		// own per-volume tags (see `grant_volumes`), so this single tag is never sent - it only
 		// keeps the match total for the bundling capability.
 		Capability::Volumes => b"VOLUMES",
@@ -174,11 +174,12 @@ struct Clients {
 	process: u64,
 	permission: u64,
 	supervisor: u64,
-	// The three non-system volume StorageService clients, bundled with `storage` (the system
+	// The four non-system volume StorageService clients, bundled with `storage` (the system
 	// volume) under the `volumes` capability for the `lsvol` overview.
 	storage_media: u64,
 	storage_iso: u64,
 	storage_udf: u64,
+	storage_usb: u64,
 }
 
 impl Clients {
@@ -199,7 +200,7 @@ impl Clients {
 			Capability::Permission => self.permission,
 			Capability::Supervisor => self.supervisor,
 			// The `volumes` capability has no single representative client - it is granted as a
-			// bundle of four channels by `grant_volumes`, never through this single-channel path.
+			// bundle of five channels by `grant_volumes`, never through this single-channel path.
 			// The system volume stands in here for the (headless-denied) dynamic-request path.
 			Capability::Volumes => self.storage,
 		}
@@ -370,16 +371,17 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 	}
 }
 
-// Grant the four volume StorageService clients the `volumes` capability bundles, in a fixed
+// Grant the five volume StorageService clients the `volumes` capability bundles, in a fixed
 // order under their own per-volume tags: the system (writable LiberFS), media (FAT/exFAT),
-// iso (ISO9660), and udf (UDF) volumes. Each held client is duplicated (narrowed to a client's
-// rights, the manager keeping its own) and transferred; a volume whose disk is absent is held
-// as 0 and handed over as a tagged message with no handle, which `lsvol` reads as zero files -
-// so the grant always sends exactly four messages and the receiver's order stays aligned.
-// Returns false only if a transfer itself fails.
+// iso (ISO9660), udf (UDF) and usb (FAT off the USB stick) volumes. Each held client is
+// duplicated (narrowed to a client's rights, the manager keeping its own) and transferred;
+// a volume whose disk is absent is held as 0 and handed over as a tagged message with no
+// handle, which `lsvol` reads as zero files - so the grant always sends exactly five
+// messages and the receiver's order stays aligned. Returns false only if a transfer itself
+// fails.
 unsafe fn grant_volumes(manager_side: u64, clients: &Clients) -> bool {
 	unsafe {
-		let volumes: [(&[u8], u64); 4] = [(b"SYSTEM", clients.storage), (b"MEDIA", clients.storage_media), (b"ISO", clients.storage_iso), (b"UDF", clients.storage_udf)];
+		let volumes: [(&[u8], u64); 5] = [(b"SYSTEM", clients.storage), (b"MEDIA", clients.storage_media), (b"ISO", clients.storage_iso), (b"UDF", clients.storage_udf), (b"USB", clients.storage_usb)];
 		for &(tag, client) in volumes.iter() {
 			let dup: i64 = duplicate(client, GRANT_RIGHTS);
 			let handle: u64 = if dup >= 0 { dup as u64 } else { 0 };
@@ -481,6 +483,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let storage_media: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_MEDIA") }.unwrap_or(0);
 	let storage_iso: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_ISO") }.unwrap_or(0);
 	let storage_udf: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_UDF") }.unwrap_or(0);
+	let storage_usb: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_USB") }.unwrap_or(0);
 	// Mint the manager's self-connection: a dedicated channel pair whose server end is seeded
 	// into the serve set below (so requests on it are dispatched like any other client's) and
 	// whose client end the manager holds as the grantable `permission` capability. The governed
@@ -488,7 +491,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| exit());
-	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, storage_media, storage_iso, storage_udf };
+	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, storage_media, storage_iso, storage_udf, storage_usb };
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
 
 	// 2. wait for the serve channel clients reach us on.

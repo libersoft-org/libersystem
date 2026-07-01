@@ -20,6 +20,10 @@
 //        "UDFBLOCK", with a channel capability to a fourth virtio-blk driver's block
 //          service, on which a read-only UDF volume is mounted as vol://udf - a DVD /
 //          Blu-ray image through the same Volume contract;
+//        "USBBLOCK", with a channel capability to the xhci driver's block service
+//          (a USB mass-storage stick over the Bulk-Only Transport), on which a
+//          writable FAT volume is mounted as vol://usb - removable USB media
+//          through the same Volume contract;
 //   2. "SERVE", with a channel capability on which clients send requests.
 // The service then serves the generated Storage.Volume contract: `open` resolves a
 // vol:// path and replies with the file's length plus a MemoryObject capability to
@@ -47,11 +51,13 @@ use udf::Udf;
 // one of these. "system" is the writable LiberFS disk; "media" is a writable FAT
 // disk mounted off a second virtio-blk device; "iso" is a read-only ISO9660 disk
 // mounted off a third virtio-blk device; "udf" is a read-only UDF disk mounted off a
-// fourth virtio-blk device.
+// fourth virtio-blk device; "usb" is a writable FAT disk mounted off the xhci
+// driver's USB mass-storage block service.
 const SYSTEM_VOLUME: &[u8] = b"system";
 const MEDIA_VOLUME: &[u8] = b"media";
 const ISO_VOLUME: &[u8] = b"iso";
 const UDF_VOLUME: &[u8] = b"udf";
+const USB_VOLUME: &[u8] = b"usb";
 // block-service protocol with driver.virtio-blk: request [op u32][lba u64][count u32]
 // where op 0 = read, 1 = write. A read replies [status u32] carrying a MemoryObject
 // of count*512 bytes; a write transfers a MemoryObject of count*512 bytes and replies
@@ -102,7 +108,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		},
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => match FatFs::mount(FatBlockDevice { chan: handle }) {
-			Some(fs) => Volume::Fat(fs),
+			Some(fs) => Volume::Fat(fs, MEDIA_VOLUME),
 			None => exit(),
 		},
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"ISOBLOCK" => match Iso9660::mount(IsoBlockDevice { chan: handle }) {
@@ -111,6 +117,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		},
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"UDFBLOCK" => match Udf::mount(UdfBlockDevice { chan: handle }) {
 			Some(fs) => Volume::Udf(fs),
+			None => exit(),
+		},
+		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"USBBLOCK" => match FatFs::mount(FatBlockDevice { chan: handle }) {
+			Some(fs) => Volume::Fat(fs, USB_VOLUME),
 			None => exit(),
 		},
 		_ => exit(),
@@ -140,18 +150,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 enum Volume {
 	Archive { base: u64, len: usize },
 	Disk(LiberFs<ChannelBlockDevice>),
-	Fat(FatFs<FatBlockDevice>),
+	// The FAT backing serves two volumes - the virtio media disk and the USB stick -
+	// so it carries the vol:// name it answers to.
+	Fat(FatFs<FatBlockDevice>, &'static [u8]),
 	Iso(Iso9660<IsoBlockDevice>),
 	Udf(Udf<UdfBlockDevice>),
 }
 
 impl Volume {
 	// The vol:// name this backing answers to: writable LiberFS (and the test archive)
-	// is "system"; the writable FAT media is "media"; the read-only ISO9660 is "iso";
-	// the read-only UDF is "udf".
+	// is "system"; the writable FAT carries its name ("media" or "usb"); the read-only
+	// ISO9660 is "iso"; the read-only UDF is "udf".
 	fn name(&self) -> &'static [u8] {
 		match self {
-			Volume::Fat(_) => MEDIA_VOLUME,
+			Volume::Fat(_, name) => name,
 			Volume::Iso(_) => ISO_VOLUME,
 			Volume::Udf(_) => UDF_VOLUME,
 			_ => SYSTEM_VOLUME,
@@ -184,7 +196,7 @@ impl volume::Service for Volume {
 				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
 				Ok(OpenResult { file: handle, size: file.len() as u64 })
 			}
-			Volume::Fat(fs) => {
+			Volume::Fat(fs, _) => {
 				let file: Vec<u8> = fs.read_file(name).map_err(map_fat_err)?;
 				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
 				Ok(OpenResult { file: handle, size: file.len() as u64 })
@@ -227,7 +239,7 @@ impl volume::Service for Volume {
 				let entries = if dir.is_empty() { fs.list() } else { fs.read_dir(dir) }.map_err(map_fs_err)?;
 				Ok(entries.into_iter().map(|(name, size, is_dir)| file_info(&name, size, is_dir)).collect())
 			}
-			Volume::Fat(fs) => {
+			Volume::Fat(fs, _) => {
 				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_fat_err)?;
 				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir)).collect())
 			}
@@ -252,7 +264,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.write_file(name, &bytes).map_err(map_fs_err),
-			Volume::Fat(fs) => fs.write_file(name, &bytes).map_err(map_fat_err),
+			Volume::Fat(fs, _) => fs.write_file(name, &bytes).map_err(map_fat_err),
 			Volume::Iso(_) => Err(Error::Invalid),
 			Volume::Udf(_) => Err(Error::Invalid),
 		}
@@ -264,7 +276,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.remove(name).map_err(map_fs_err),
-			Volume::Fat(fs) => fs.remove(name).map_err(map_fat_err),
+			Volume::Fat(fs, _) => fs.remove(name).map_err(map_fat_err),
 			Volume::Iso(_) => Err(Error::Invalid),
 			Volume::Udf(_) => Err(Error::Invalid),
 		}
@@ -276,7 +288,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.create_snapshot(name.as_bytes()).map_err(map_fs_err),
-			Volume::Fat(_) => Err(Error::Denied),
+			Volume::Fat(..) => Err(Error::Denied),
 			Volume::Iso(_) => Err(Error::Denied),
 			Volume::Udf(_) => Err(Error::Denied),
 		}
@@ -291,7 +303,7 @@ impl volume::Service for Volume {
 				let snaps = fs.list_snapshots().map_err(map_fs_err)?;
 				Ok(snaps.into_iter().map(|(name, generation)| SnapshotInfo { name: String::from_utf8_lossy(&name).into_owned(), generation }).collect())
 			}
-			Volume::Fat(_) => Ok(Vec::new()),
+			Volume::Fat(..) => Ok(Vec::new()),
 			Volume::Iso(_) => Ok(Vec::new()),
 			Volume::Udf(_) => Ok(Vec::new()),
 		}
@@ -303,7 +315,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.delete_snapshot(name.as_bytes()).map_err(map_fs_err),
-			Volume::Fat(_) => Err(Error::Denied),
+			Volume::Fat(..) => Err(Error::Denied),
 			Volume::Iso(_) => Err(Error::Denied),
 			Volume::Udf(_) => Err(Error::Denied),
 		}
@@ -325,7 +337,7 @@ impl volume::Service for Volume {
 				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
 				Ok(OpenResult { file: handle, size: file.len() as u64 })
 			}
-			Volume::Fat(_) => Err(Error::Denied),
+			Volume::Fat(..) => Err(Error::Denied),
 			Volume::Iso(_) => Err(Error::Denied),
 			Volume::Udf(_) => Err(Error::Denied),
 		}
@@ -339,7 +351,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.mkdir(name).map_err(map_fs_err),
-			Volume::Fat(_) => Err(Error::Invalid),
+			Volume::Fat(..) => Err(Error::Invalid),
 			Volume::Iso(_) => Err(Error::Invalid),
 			Volume::Udf(_) => Err(Error::Invalid),
 		}
@@ -353,7 +365,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.rmdir(name).map_err(map_fs_err),
-			Volume::Fat(_) => Err(Error::Invalid),
+			Volume::Fat(..) => Err(Error::Invalid),
 			Volume::Iso(_) => Err(Error::Invalid),
 			Volume::Udf(_) => Err(Error::Invalid),
 		}

@@ -130,6 +130,27 @@ QEMU_ARGS+=(
 	-device qemu-xhci,id=usb
 	-device usb-kbd,bus=usb.0
 )
+
+# A USB mass-storage stick on the xHCI bus (M62): the xhci driver speaks SCSI over
+# the Bulk-Only Transport to it and serves the same block-channel protocol as
+# driver.virtio-blk, so a StorageService instance mounts it as vol://usb. The image
+# always exists (a bare truncate suffices - the driver's bring-up needs no
+# filesystem), so the test path's device set stays deterministic; when mtools is
+# present it is seeded as FAT with the volume/ files so vol://usb mounts with
+# content. Recreated only when missing.
+USB_DISK="$HERE/.build/usb-media.img"
+if [[ ! -f "$USB_DISK" ]]; then
+	truncate -s 16M "$USB_DISK"
+	if command -v mformat >/dev/null && command -v mcopy >/dev/null; then
+		mformat -i "$USB_DISK" -F ::
+		mcopy -i "$USB_DISK" "$HERE/../volume/hello.txt" ::hello.txt
+		mcopy -i "$USB_DISK" "$HERE/../volume/motd.txt" ::motd.txt
+	fi
+fi
+QEMU_ARGS+=(
+	-drive "file=$USB_DISK,if=none,id=vusb,format=raw"
+	-device usb-storage,bus=usb.0,drive=vusb
+)
 # The second virtio-blk disk (FAT vol://media), discovered after the system disk; only
 # attached when the FAT image was built (mtools present).
 if [[ -f "$FAT_DISK" ]]; then

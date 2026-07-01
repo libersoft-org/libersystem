@@ -54,6 +54,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut gpu_client: u64 = 0;
 		let mut snd_client: u64 = 0;
 		let mut input_client: u64 = 0;
+		let mut usb_client: u64 = 0;
 		launch_boot_drivers(&package, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client);
 
 		// 3. report in once the disks are bound, transferring the block service channel up
@@ -73,7 +74,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		loop {
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
-					launch_volume_drivers(handle, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client);
+					launch_volume_drivers(handle, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client);
 					if handle != 0 {
 						close(handle);
 					}
@@ -81,6 +82,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					send_blocking(bootstrap, b"GPU", gpu_client);
 					send_blocking(bootstrap, b"SND", snd_client);
 					send_blocking(bootstrap, b"INPUT", input_client);
+					send_blocking(bootstrap, b"USB", usb_client);
 				}
 				Received::Message { .. } => {
 					send_blocking(bootstrap, b"DeviceManager: stopped", 0);
@@ -143,9 +145,9 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 // Phase 2 (M61 box 8): now that the system volume is mounted, load each non-bootstrap
 // driver from vol://system/drivers/ through the StorageService client `storage` and spawn
 // it with its device's MMIO capability. Their control / event channels are handed back for
-// NetworkService, ConsoleService, AudioService and InputService. Tracks each device's state
-// and prints a summary.
-unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64) {
+// NetworkService, ConsoleService, AudioService, InputService and the USB StorageService
+// instance. Tracks each device's state and prints a summary.
+unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64) {
 	unsafe {
 		let count: u64 = device_count();
 		let mut state: [u8; MAX_DEVICES] = [STATE_UNKNOWN; MAX_DEVICES];
@@ -198,6 +200,11 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 				// virtio_input handle is the pointer's INPUT channel for InputService.
 				if driver_name == b"virtio_input" && handle != 0 {
 					*input_client = handle;
+				}
+				// The xhci driver hands up the USB stick's block-service channel (handle 0
+				// when no mass-storage device is attached), routed to the usb StorageService.
+				if driver_name == b"xhci" && handle != 0 {
+					*usb_client = handle;
 				}
 			}
 			unmap_object(file);

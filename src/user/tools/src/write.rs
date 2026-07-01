@@ -38,6 +38,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let media: u64 = recv_tagged(bootstrap, &mut buf, b"MEDIA").unwrap_or(0);
 		let iso: u64 = recv_tagged(bootstrap, &mut buf, b"ISO").unwrap_or(0);
 		let udf: u64 = recv_tagged(bootstrap, &mut buf, b"UDF").unwrap_or(0);
+		let usb: u64 = recv_tagged(bootstrap, &mut buf, b"USB").unwrap_or(0);
 		// 4. receive the inherited working directory (the last bootstrap message), used to
 		//    resolve a relative path so it reaches the same file the shell would.
 		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
@@ -59,7 +60,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 		};
 		// route the path to the client for the volume it names.
-		let storage: u64 = path::volume_client(cwd_str, path_arg, system, media, iso, udf);
+		let storage: u64 = path::volume_client(cwd_str, path_arg, system, media, iso, udf, usb);
 		write(storage, uri.as_bytes(), text);
 	}
 	exit();

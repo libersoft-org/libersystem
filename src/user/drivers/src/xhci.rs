@@ -133,6 +133,42 @@ const CLASS_HID: u8 = 3;
 const SUBCLASS_BOOT: u8 = 1;
 const PROTOCOL_KEYBOARD: u8 = 1;
 const EP_ATTR_INTERRUPT: u8 = 3;
+const EP_ATTR_BULK: u8 = 2;
+
+// The USB mass-storage identity within a configuration: the class with the SCSI
+// transparent command set over the Bulk-Only Transport.
+const CLASS_MASS_STORAGE: u8 = 8;
+const SUBCLASS_SCSI: u8 = 6;
+const PROTOCOL_BULK_ONLY: u8 = 0x50;
+
+// Bulk-Only Transport framing: the 31-byte Command Block Wrapper and the 13-byte
+// Command Status Wrapper, each led by its signature; a CSW status of 0 is success.
+const CBW_SIGNATURE: u32 = 0x4342_5355;
+const CSW_SIGNATURE: u32 = 0x5342_5355;
+const CBW_LEN: u32 = 31;
+const CSW_LEN: u32 = 13;
+// The CSW rides in the same scratch page as the CBW, at the next 32-byte slot.
+const CSW_OFF: u64 = 32;
+const CBW_FLAG_IN: u8 = 0x80;
+
+// SCSI command opcodes (the transparent command set a USB stick speaks).
+const SCSI_TEST_UNIT_READY: u8 = 0x00;
+const SCSI_REQUEST_SENSE: u8 = 0x03;
+const SCSI_READ_CAPACITY10: u8 = 0x25;
+const SCSI_READ10: u8 = 0x28;
+const SCSI_WRITE10: u8 = 0x2a;
+
+// One disk sector, and the block-service wire protocol this driver serves to a
+// StorageService instance - the same contract driver.virtio-blk serves: a request
+// is [op u32][lba u64][count u32] (count clamped to one DMA page = 8 sectors), a
+// read replies [status u32] + a MemoryObject of the sectors, a write carries a
+// MemoryObject in and replies [status u32].
+const SECTOR: u32 = 512;
+const MAX_SECTORS: u32 = 8;
+const OP_READ: u32 = 0;
+const OP_WRITE: u32 = 1;
+const STATUS_OK: u32 = 0;
+const STATUS_ERR: u32 = 1;
 
 unsafe fn r8(addr: u64) -> u8 {
 	unsafe { (addr as *const u8).read_volatile() }
@@ -244,10 +280,27 @@ struct UsbDevice {
 }
 
 // A configured HID boot keyboard: the interrupt IN endpoint's device context index
-// and its transfer ring, on which 8-byte boot reports are posted and reaped.
+// and its transfer ring, on which 8-byte boot reports are posted and reaped, plus
+// the report state the service loop diffs against (the previous report and the
+// tracked modifiers).
 struct Keyboard {
 	dci: u32,
 	ring: Ring,
+	prev: [u8; 8],
+	mods: Mods,
+}
+
+// A configured USB mass-storage device (Bulk-Only Transport): the bulk IN and OUT
+// endpoints' device context indices and transfer rings, a page for the sector data
+// (the CBW/CSW frames ride in the device's scratch page), and the rolling CBW tag.
+struct Storage {
+	dci_in: u32,
+	dci_out: u32,
+	ring_in: Ring,
+	ring_out: Ring,
+	data_virt: u64,
+	data_phys: u64,
+	tag: u32,
 }
 
 #[unsafe(no_mangle)]
@@ -276,9 +329,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		};
 		// enumerate the root-hub ports, address every connected device, and configure
-		// the first HID boot keyboard found among them.
+		// the first HID boot keyboard and the first mass-storage device found.
 		let mut devices: u32 = 0;
 		let mut keyboard: Option<(UsbDevice, Keyboard)> = None;
+		let mut storage: Option<(UsbDevice, Storage)> = None;
 		let mut port: u32 = 1;
 		while port <= hc.ports {
 			if let Some(mut dev) = attach_port(&mut hc, port) {
@@ -288,13 +342,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					&& let Some(kb) = configure_keyboard(&mut hc, &mut dev)
 				{
 					keyboard = Some((dev, kb));
+				} else if storage.is_none()
+					&& let Some(st) = configure_storage(&mut hc, &mut dev)
+				{
+					storage = Some((dev, st));
 				}
 			}
 			port += 1;
 		}
-		// report in, then serve the keyboard interrupt-driven for the life of the
-		// system - or, with no keyboard, stand holding the controller until
-		// DeviceManager drops the bootstrap channel.
+		// a mass-storage device is served over a block channel: the client end rides
+		// up with the report (DeviceManager routes it to a StorageService instance).
+		let (blk_server, blk_client): (u64, u64) = if storage.is_some() { channel().unwrap_or_else(|| exit()) } else { (0, 0) };
+		// report in, then serve the keyboard and the disk for the life of the system
+		// - or, with neither, stand holding the controller until DeviceManager drops
+		// the bootstrap channel.
 		let mut report: [u8; 64] = [0u8; 64];
 		let mut n: usize = 0;
 		for &b in b"driver.xhci: online (" {
@@ -312,9 +373,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				n += 1;
 			}
 		}
-		send_blocking(bootstrap, &report[..n], 0);
-		if let Some((mut dev, mut kb)) = keyboard {
-			keyboard_loop(&mut hc, &mut dev, &mut kb, irq);
+		if storage.is_some() {
+			for &b in b" (storage)" {
+				report[n] = b;
+				n += 1;
+			}
+		}
+		send_blocking(bootstrap, &report[..n], blk_client);
+		if keyboard.is_some() || storage.is_some() {
+			service_loop(&mut hc, keyboard, storage, blk_server, irq);
 		}
 		let _ = recv_blocking(bootstrap, &mut buf);
 	}
@@ -692,7 +759,7 @@ unsafe fn configure_keyboard(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Keybo
 		// select the configuration, then the boot protocol (the fixed 8-byte report).
 		control_nodata(hc, dev, 0x00, REQ_SET_CONFIGURATION, config_value, 0)?;
 		control_nodata(hc, dev, 0x21, HID_REQ_SET_PROTOCOL, 0, iface)?;
-		Some(Keyboard { dci, ring })
+		Some(Keyboard { dci, ring, prev: [0u8; 8], mods: Mods::default() })
 	}
 }
 
@@ -711,40 +778,355 @@ fn ep_interval(speed: u32, b_interval: u32) -> u32 {
 	exp
 }
 
-// Serve the keyboard for the life of the system: keep one 8-byte report TRB posted
-// on its interrupt endpoint, block on the controller's MSI-X interrupt, and feed
-// each arriving report's key changes into the console through the shared keys
-// module. The device only completes a report TRB when the key state changes, so
-// the loop sleeps between keystrokes.
-unsafe fn keyboard_loop(hc: &mut Xhci, dev: &mut UsbDevice, kb: &mut Keyboard, irq: u64) -> ! {
+// Serve the configured keyboard and mass-storage device for the life of the
+// system: the keyboard keeps one 8-byte report TRB posted (the device completes it
+// only when the key state changes) and its reports feed the console; the disk
+// serves block requests arriving on `blk_server`. The loop sleeps on the
+// controller's MSI-X interrupt and the block channel at once, and the synchronous
+// BOT waits service keyboard events inline, so typing is never lost behind disk
+// traffic.
+unsafe fn service_loop(hc: &mut Xhci, mut keyboard: Option<(UsbDevice, Keyboard)>, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, irq: u64) -> ! {
 	unsafe {
-		let mut mods: Mods = Mods::default();
-		let mut prev: [u8; 8] = [0u8; 8];
-		loop {
-			kb.ring.push(dev.data_phys, 8, TRB_NORMAL << 10 | TRB_IOC);
-			w32(hc.db + dev.slot as u64 * 4, kb.dci);
-			// wait for the report's transfer event, sleeping on the interrupt.
-			loop {
-				if let Some((_p, status, control)) = take_event(hc) {
-					let kind: u32 = control >> 10 & 0x3f;
-					let code: u32 = status >> 24;
-					if kind == TRB_EV_TRANSFER && (code == CC_SUCCESS || code == CC_SHORT_PACKET) {
-						break;
-					}
-					continue;
-				}
-				wait(irq, 0);
-				interrupt_ack(irq);
-				// clear the interrupter's pending flag so the next event edge fires.
-				w32(hc.ir0 + IR_IMAN, IMAN_IE | IMAN_IP);
-			}
-			let mut report: [u8; 8] = [0u8; 8];
-			for (i, slot) in report.iter_mut().enumerate() {
-				*slot = r8(dev.data_virt + i as u64);
-			}
-			feed_report(&prev, &report, &mut mods);
-			prev = report;
+		if let Some((dev, kb)) = keyboard.as_mut() {
+			post_report(hc, dev, kb);
 		}
+		let mut req: [u8; 16] = [0u8; 16];
+		loop {
+			let waitset: [u64; 2] = [irq, blk_server];
+			let handles: &[u64] = if blk_server != 0 { &waitset } else { &waitset[..1] };
+			wait_any(handles, 0);
+			// the interrupt: drain the event ring (keyboard reports feed the console),
+			// acknowledge, and clear the interrupter's pending flag so the next event
+			// edge fires.
+			while let Some((_p, status, control)) = take_event(hc) {
+				handle_keyboard_event(hc, &mut keyboard, status, control);
+			}
+			interrupt_ack(irq);
+			w32(hc.ir0 + IR_IMAN, IMAN_IE | IMAN_IP);
+			// the block channel: serve every queued request.
+			if let Some((dev, st)) = storage.as_mut() {
+				loop {
+					match try_recv(blk_server, &mut req) {
+						Polled::Message { len, handle } if len >= 16 => serve_block_request(hc, &mut keyboard, dev, st, blk_server, &req, handle),
+						Polled::Message { handle, .. } => {
+							if handle != 0 {
+								close(handle);
+							}
+							reply_block(blk_server, STATUS_ERR, 0);
+						}
+						Polled::Empty => break,
+						Polled::Closed => exit(),
+					}
+				}
+			}
+		}
+	}
+}
+
+// Post the keyboard's next 8-byte boot-report TRB and ring its doorbell.
+unsafe fn post_report(hc: &Xhci, dev: &UsbDevice, kb: &mut Keyboard) {
+	unsafe {
+		kb.ring.push(dev.data_phys, 8, TRB_NORMAL << 10 | TRB_IOC);
+		w32(hc.db + dev.slot as u64 * 4, kb.dci);
+	}
+}
+
+// Handle one event ring entry against the keyboard: a successful transfer event
+// for its interrupt endpoint is a fresh boot report, which is diffed into the
+// console and the next report TRB posted. Every other event is ignored.
+unsafe fn handle_keyboard_event(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, status: u32, control: u32) {
+	unsafe {
+		let Some((dev, kb)) = keyboard.as_mut() else {
+			return;
+		};
+		let kind: u32 = control >> 10 & 0x3f;
+		let code: u32 = status >> 24;
+		if kind != TRB_EV_TRANSFER || control >> 24 != dev.slot || (control >> 16 & 0x1f) != kb.dci || (code != CC_SUCCESS && code != CC_SHORT_PACKET) {
+			return;
+		}
+		let mut report: [u8; 8] = [0u8; 8];
+		for (i, slot) in report.iter_mut().enumerate() {
+			*slot = r8(dev.data_virt + i as u64);
+		}
+		let prev: [u8; 8] = kb.prev;
+		feed_report(&prev, &report, &mut kb.mods);
+		kb.prev = report;
+		post_report(hc, dev, kb);
+	}
+}
+
+// Wait for a transfer event on the given slot/endpoint, servicing keyboard events
+// that arrive in the meantime inline (a keystroke during a disk transfer). Returns
+// the completion code, or None on budget exhaustion.
+unsafe fn wait_transfer(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, slot: u32, dci: u32) -> Option<u32> {
+	unsafe {
+		let mut spins: u32 = 0;
+		loop {
+			if let Some((_p, status, control)) = take_event(hc) {
+				let kind: u32 = control >> 10 & 0x3f;
+				if kind == TRB_EV_TRANSFER && control >> 24 == slot && (control >> 16 & 0x1f) == dci {
+					return Some(status >> 24);
+				}
+				handle_keyboard_event(hc, keyboard, status, control);
+				continue;
+			}
+			spins += 1;
+			if spins > SPIN_BUDGET {
+				return None;
+			}
+			if spins % 4096 == 0 {
+				yield_now();
+			}
+		}
+	}
+}
+
+// Configure the device's mass-storage function, if it has one: find a SCSI
+// Bulk-Only interface and its bulk IN/OUT endpoint pair in the configuration
+// descriptor, bring both endpoints up, select the configuration, then spin the
+// unit up (TEST UNIT READY, clearing the power-on sense) and check its block size
+// is the 512-byte sector the block protocol serves. None when the device is not a
+// disk or any step fails.
+unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Storage> {
+	unsafe {
+		control_in(hc, dev, DESC_CONFIG, 9)?;
+		let total: u16 = (r8(dev.data_virt + 2) as u16 | (r8(dev.data_virt + 3) as u16) << 8).min(1024);
+		let config_value: u16 = r8(dev.data_virt + 5) as u16;
+		control_in(hc, dev, DESC_CONFIG, total)?;
+
+		// walk the descriptors for the Bulk-Only SCSI interface and its endpoint pair.
+		let mut offset: u64 = 0;
+		let mut in_storage: bool = false;
+		let mut ep_in: Option<(u32, u32)> = None; // (dci, mps)
+		let mut ep_out: Option<(u32, u32)> = None;
+		while offset + 2 <= total as u64 {
+			let length: u64 = r8(dev.data_virt + offset) as u64;
+			let kind: u8 = r8(dev.data_virt + offset + 1);
+			if length < 2 {
+				break;
+			}
+			if kind == DT_INTERFACE {
+				in_storage = r8(dev.data_virt + offset + 5) == CLASS_MASS_STORAGE && r8(dev.data_virt + offset + 6) == SUBCLASS_SCSI && r8(dev.data_virt + offset + 7) == PROTOCOL_BULK_ONLY;
+			}
+			if kind == DT_ENDPOINT && in_storage {
+				let ep_addr: u8 = r8(dev.data_virt + offset + 2);
+				let attrs: u8 = r8(dev.data_virt + offset + 3);
+				if attrs & 0x3 == EP_ATTR_BULK {
+					let mps: u32 = r8(dev.data_virt + offset + 4) as u32 | (r8(dev.data_virt + offset + 5) as u32) << 8;
+					let dci: u32 = (ep_addr & 0xf) as u32 * 2 + if ep_addr & 0x80 != 0 { 1 } else { 0 };
+					if ep_addr & 0x80 != 0 && ep_in.is_none() {
+						ep_in = Some((dci, mps));
+					} else if ep_addr & 0x80 == 0 && ep_out.is_none() {
+						ep_out = Some((dci, mps));
+					}
+				}
+			}
+			offset += length;
+		}
+		let (dci_in, mps_in): (u32, u32) = ep_in?;
+		let (dci_out, mps_out): (u32, u32) = ep_out?;
+
+		// bring both bulk endpoints up with one configure-endpoint command.
+		let ring_in: Ring = Ring::new()?;
+		let ring_out: Ring = Ring::new()?;
+		core::ptr::write_bytes(dev.in_virt as *mut u8, 0, 4096);
+		((dev.in_virt + 4) as *mut u32).write_volatile(1 | 1 << dci_in | 1 << dci_out);
+		let entries: u32 = dci_in.max(dci_out);
+		let slot_ctx: u64 = dev.in_virt + hc.ctx_size;
+		(slot_ctx as *mut u32).write_volatile(entries << 27 | dev.speed << 20);
+		((slot_ctx + 4) as *mut u32).write_volatile(dev.port << 16);
+		// bulk endpoint contexts: IN type 6 / OUT type 2, error count 3, no interval.
+		for &(dci, mps, ep_type, ring) in &[(dci_in, mps_in, 6u32, &ring_in), (dci_out, mps_out, 2u32, &ring_out)] {
+			let ep_ctx: u64 = dev.in_virt + (1 + dci as u64) * hc.ctx_size;
+			((ep_ctx + 4) as *mut u32).write_volatile(mps << 16 | ep_type << 3 | 3 << 1);
+			((ep_ctx + 8) as *mut u32).write_volatile((ring.phys | ring.cycle as u64) as u32);
+			((ep_ctx + 12) as *mut u32).write_volatile((ring.phys >> 32) as u32);
+			((ep_ctx + 16) as *mut u32).write_volatile(mps);
+		}
+		command_and_wait(hc, dev.in_phys, 0, TRB_CONFIGURE_ENDPOINT << 10 | dev.slot << 24)?;
+		control_nodata(hc, dev, 0x00, REQ_SET_CONFIGURATION, config_value, 0)?;
+
+		let (_sh, data_virt, data_phys): (u64, u64, u64) = dma_page()?;
+		let mut st: Storage = Storage { dci_in, dci_out, ring_in, ring_out, data_virt, data_phys, tag: 1 };
+		let mut keyboard: Option<(UsbDevice, Keyboard)> = None;
+
+		// spin the unit up: a freshly attached unit reports a power-on unit attention
+		// on its first command, cleared by reading the sense data - retry a few times.
+		let mut ready: bool = false;
+		let mut attempt: u32 = 0;
+		while attempt < 4 {
+			let turcb: [u8; 6] = [SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
+			if bot_command(hc, &mut keyboard, dev, &mut st, &turcb, 0, false) {
+				ready = true;
+				break;
+			}
+			let sense: [u8; 6] = [SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0];
+			let _ = bot_command(hc, &mut keyboard, dev, &mut st, &sense, 18, true);
+			attempt += 1;
+		}
+		if !ready {
+			return None;
+		}
+		// the block protocol serves 512-byte sectors; refuse a disk with another size.
+		let capcb: [u8; 10] = [SCSI_READ_CAPACITY10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+		if !bot_command(hc, &mut keyboard, dev, &mut st, &capcb, 8, true) {
+			return None;
+		}
+		let block_size: u32 = (r8(st.data_virt + 4) as u32) << 24 | (r8(st.data_virt + 5) as u32) << 16 | (r8(st.data_virt + 6) as u32) << 8 | r8(st.data_virt + 7) as u32;
+		if block_size != SECTOR {
+			return None;
+		}
+		Some(st)
+	}
+}
+
+// Run one SCSI command over the Bulk-Only Transport: the CBW on the bulk OUT
+// endpoint, the data stage (into or out of the storage data page), and the CSW on
+// the bulk IN endpoint, whose signature, tag echo and status decide the result.
+// Keyboard events arriving during the waits are serviced inline.
+unsafe fn bot_command(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage, cb: &[u8], data_len: u32, data_in: bool) -> bool {
+	unsafe {
+		// the CBW rides at the head of the device's scratch page, the CSW after it.
+		let cbw: u64 = dev.data_virt;
+		core::ptr::write_bytes(cbw as *mut u8, 0, (CSW_OFF + CSW_LEN as u64) as usize);
+		(cbw as *mut u32).write_volatile(CBW_SIGNATURE);
+		((cbw + 4) as *mut u32).write_volatile(st.tag);
+		((cbw + 8) as *mut u32).write_volatile(data_len);
+		((cbw + 12) as *mut u8).write_volatile(if data_in { CBW_FLAG_IN } else { 0 });
+		((cbw + 13) as *mut u8).write_volatile(0); // LUN 0
+		((cbw + 14) as *mut u8).write_volatile(cb.len() as u8);
+		for (i, &b) in cb.iter().enumerate() {
+			((cbw + 15 + i as u64) as *mut u8).write_volatile(b);
+		}
+		st.ring_out.push(dev.data_phys, CBW_LEN, TRB_NORMAL << 10 | TRB_IOC);
+		w32(hc.db + dev.slot as u64 * 4, st.dci_out);
+		if wait_transfer(hc, keyboard, dev.slot, st.dci_out) != Some(CC_SUCCESS) {
+			return false;
+		}
+		// the data stage, on the direction's endpoint, out of the storage data page.
+		if data_len > 0 {
+			let (ring, dci): (&mut Ring, u32) = if data_in { (&mut st.ring_in, st.dci_in) } else { (&mut st.ring_out, st.dci_out) };
+			ring.push(st.data_phys, data_len, TRB_NORMAL << 10 | TRB_IOC);
+			w32(hc.db + dev.slot as u64 * 4, dci);
+			let code: u32 = match wait_transfer(hc, keyboard, dev.slot, dci) {
+				Some(c) => c,
+				None => return false,
+			};
+			if code != CC_SUCCESS && code != CC_SHORT_PACKET {
+				return false;
+			}
+		}
+		// the CSW closes the transaction.
+		st.ring_in.push(dev.data_phys + CSW_OFF, CSW_LEN, TRB_NORMAL << 10 | TRB_IOC);
+		w32(hc.db + dev.slot as u64 * 4, st.dci_in);
+		let code: u32 = match wait_transfer(hc, keyboard, dev.slot, st.dci_in) {
+			Some(c) => c,
+			None => return false,
+		};
+		if code != CC_SUCCESS && code != CC_SHORT_PACKET {
+			return false;
+		}
+		let csw: u64 = dev.data_virt + CSW_OFF;
+		let ok: bool = (csw as *const u32).read_volatile() == CSW_SIGNATURE && ((csw + 4) as *const u32).read_volatile() == st.tag && ((csw + 12) as *const u8).read_volatile() == 0;
+		st.tag = st.tag.wrapping_add(1);
+		ok
+	}
+}
+
+// Serve one block request from the StorageService instance: [op u32][lba u64]
+// [count u32], count clamped to one DMA page. A read replies [status u32] + a
+// MemoryObject of the sectors; a write carries a MemoryObject in and replies
+// [status u32] - the same wire contract driver.virtio-blk serves.
+unsafe fn serve_block_request(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, req: &[u8; 16], handle: u64) {
+	unsafe {
+		let op: u32 = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
+		let lba: u64 = u64::from_le_bytes([req[4], req[5], req[6], req[7], req[8], req[9], req[10], req[11]]);
+		let count: u32 = u32::from_le_bytes([req[12], req[13], req[14], req[15]]).clamp(1, MAX_SECTORS);
+		match op {
+			OP_READ => serve_read(hc, keyboard, dev, st, blk_server, lba, count),
+			OP_WRITE => serve_write(hc, keyboard, dev, st, blk_server, lba, count, handle),
+			_ => {
+				if handle != 0 {
+					close(handle);
+				}
+				reply_block(blk_server, STATUS_ERR, 0);
+			}
+		}
+	}
+}
+
+// Read `count` sectors starting at `lba` with one SCSI READ(10) into a fresh
+// shared buffer and hand it to the client, or reply with an error status.
+unsafe fn serve_read(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, lba: u64, count: u32) {
+	unsafe {
+		let bytes: u64 = count as u64 * SECTOR as u64;
+		let cb: [u8; 10] = read10_cb(SCSI_READ10, lba, count);
+		if !bot_command(hc, keyboard, dev, st, &cb, bytes as u32, true) {
+			reply_block(blk_server, STATUS_ERR, 0);
+			return;
+		}
+		let obj: u64 = syscall(SYS_MEMORY_OBJECT_CREATE, bytes, 0, 0, 0);
+		if sys_is_err(obj) {
+			reply_block(blk_server, STATUS_ERR, 0);
+			return;
+		}
+		let dst: u64 = match map_object(obj) {
+			Some(base) => base,
+			None => {
+				close(obj);
+				reply_block(blk_server, STATUS_ERR, 0);
+				return;
+			}
+		};
+		core::ptr::copy_nonoverlapping(st.data_virt as *const u8, dst as *mut u8, bytes as usize);
+		unmap_object(obj);
+		// attenuate to read+map plus the transfer right, then hand the buffer over.
+		let granted: i64 = duplicate(obj, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+		close(obj);
+		if granted < 0 {
+			reply_block(blk_server, STATUS_ERR, 0);
+			return;
+		}
+		reply_block(blk_server, STATUS_OK, granted as u64);
+	}
+}
+
+// Write `count` sectors starting at `lba` from the transferred buffer with one
+// SCSI WRITE(10), then reply with the status and no buffer.
+unsafe fn serve_write(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, lba: u64, count: u32, src_handle: u64) {
+	unsafe {
+		if src_handle == 0 {
+			reply_block(blk_server, STATUS_ERR, 0);
+			return;
+		}
+		let src: u64 = match map_object(src_handle) {
+			Some(base) => base,
+			None => {
+				close(src_handle);
+				reply_block(blk_server, STATUS_ERR, 0);
+				return;
+			}
+		};
+		let bytes: u64 = count as u64 * SECTOR as u64;
+		core::ptr::copy_nonoverlapping(src as *const u8, st.data_virt as *mut u8, bytes as usize);
+		unmap_object(src_handle);
+		close(src_handle);
+		let cb: [u8; 10] = read10_cb(SCSI_WRITE10, lba, count);
+		let ok: bool = bot_command(hc, keyboard, dev, st, &cb, bytes as u32, false);
+		reply_block(blk_server, if ok { STATUS_OK } else { STATUS_ERR }, 0);
+	}
+}
+
+// Build a READ(10)/WRITE(10) command block: big-endian LBA and block count.
+fn read10_cb(opcode: u8, lba: u64, count: u32) -> [u8; 10] {
+	[opcode, 0, (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8, 0, (count >> 8) as u8, count as u8, 0]
+}
+
+// Send a block reply: [status u32 LE] carrying the handle `xfer` (0 = none).
+unsafe fn reply_block(blk_server: u64, status: u32, xfer: u64) {
+	unsafe {
+		let reply: [u8; 4] = status.to_le_bytes();
+		send_blocking(blk_server, &reply, xfer);
 	}
 }
 

@@ -2,8 +2,9 @@
 //
 // PermissionManager launches this program under a permission manifest that grants it exactly
 // one capability - `volumes` - and forwards it the shell's stdout console first, then the
-// argument string, then the four volume StorageService clients the capability bundles: the
-// `system` (writable LiberFS), `media` (FAT/exFAT), `iso` (ISO9660), and `udf` (UDF) volumes.
+// argument string, then the five volume StorageService clients the capability bundles: the
+// `system` (writable LiberFS), `media` (FAT/exFAT), `iso` (ISO9660), `udf` (UDF), and `usb`
+// (FAT off the USB stick) volumes.
 // lsvol lists each volume's root through its grant, prints the volume set with a per-volume
 // file count to the inherited stdout, then exits. A standalone command, not a shell built-in:
 // it reaches the volumes only through the one capability the permission store granted it, and
@@ -32,23 +33,25 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Message { .. } => {}
 			Received::Closed => exit(),
 		}
-		// 3. receive the four volume clients the `volumes` capability bundles, in grant order;
+		// 3. receive the five volume clients the `volumes` capability bundles, in grant order;
 		//    a volume whose disk is absent arrives as 0 (no handle) and shows zero files.
 		let system: u64 = recv_tagged(bootstrap, &mut buf, b"SYSTEM").unwrap_or(0);
 		let media: u64 = recv_tagged(bootstrap, &mut buf, b"MEDIA").unwrap_or(0);
 		let iso: u64 = recv_tagged(bootstrap, &mut buf, b"ISO").unwrap_or(0);
 		let udf: u64 = recv_tagged(bootstrap, &mut buf, b"UDF").unwrap_or(0);
-		list_volumes(system, media, iso, udf);
+		let usb: u64 = recv_tagged(bootstrap, &mut buf, b"USB").unwrap_or(0);
+		list_volumes(system, media, iso, udf, usb);
 	}
 	exit();
 }
 
-// List the volume set with a per-volume file count, read through the four grants: `system`
-// (writable LiberFS), `media` (FAT/exFAT), `iso` (ISO9660), and `udf` (UDF).
-unsafe fn list_volumes(system: u64, media: u64, iso: u64, udf: u64) {
+// List the volume set with a per-volume file count, read through the five grants: `system`
+// (writable LiberFS), `media` (FAT/exFAT), `iso` (ISO9660), `udf` (UDF), and `usb` (FAT off
+// the USB stick).
+unsafe fn list_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64) {
 	unsafe {
 		let mut out = String::new();
-		out.push_str("volumes (4):\n  vol://system (");
+		out.push_str("volumes (5):\n  vol://system (");
 		push_count(&mut out, volume_count(system, "vol://system"));
 		out.push_str(" files)\n  vol://media (");
 		push_count(&mut out, volume_count(media, "vol://media"));
@@ -56,6 +59,8 @@ unsafe fn list_volumes(system: u64, media: u64, iso: u64, udf: u64) {
 		push_count(&mut out, volume_count(iso, "vol://iso"));
 		out.push_str(" files)\n  vol://udf (");
 		push_count(&mut out, volume_count(udf, "vol://udf"));
+		out.push_str(" files)\n  vol://usb (");
+		push_count(&mut out, volume_count(usb, "vol://usb"));
 		out.push_str(" files)\n");
 		print(out.as_bytes());
 	}

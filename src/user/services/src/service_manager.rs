@@ -44,7 +44,7 @@ struct Service {
 
 // The number of managed services. (A fixed size keeps the state array on the
 // stack, which a no_std program with no heap needs.)
-const N: usize = 19;
+const N: usize = 20;
 
 // The core service manifest. The array order is deliberately NOT the start order:
 // DeviceManager, StorageService, and the shell are listed before LogService, but
@@ -54,7 +54,7 @@ const N: usize = 19;
 // component it observes (so it holds their process handles for the live graph), and
 // the shell is the last component up: it depends on StorageService (which it talks to
 // over IPC) and on SystemGraphService (whose graph its `graph` command renders).
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"media_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"shell", deps: &[b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service", b"session_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service", b"process_service"] }, Service { name: b"process_service", deps: &[b"log_service", b"storage_service"] }, Service { name: b"config_service", deps: &[b"log_service", b"process_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service", b"process_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service", b"session_service", b"process_service", b"permission_manager"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"network_service", b"time_service", b"config_service", b"device_service", b"audio_service", b"process_service", b"resource_manager"] }, Service { name: b"resource_manager", deps: &[b"log_service", b"process_service"] }, Service { name: b"session_service", deps: &[b"log_service", b"process_service"] }];
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"media_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"usb_storage", deps: &[b"log_service", b"storage_service"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"shell", deps: &[b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"usb_storage", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service", b"session_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service", b"process_service"] }, Service { name: b"process_service", deps: &[b"log_service", b"storage_service"] }, Service { name: b"config_service", deps: &[b"log_service", b"process_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service", b"process_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service", b"session_service", b"process_service", b"permission_manager"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"usb_storage", b"network_service", b"time_service", b"config_service", b"device_service", b"audio_service", b"process_service", b"resource_manager"] }, Service { name: b"resource_manager", deps: &[b"log_service", b"process_service"] }, Service { name: b"session_service", deps: &[b"log_service", b"process_service"] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -160,6 +160,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut iso_client: u64 = 0;
 	let mut block4_client: u64 = 0;
 	let mut udf_client: u64 = 0;
+	// The USB stick's block channel, handed up by the xhci driver in DeviceManager's
+	// phase 2 (0 when no mass-storage device is attached), and the usb StorageService
+	// instance's client end minted when that instance bootstraps.
+	let mut block5_client: u64 = 0;
+	let mut usb_client: u64 = 0;
 	let mut net_frames: u64 = 0;
 	let mut net_client: u64 = 0;
 	let mut gpu_client: u64 = 0;
@@ -212,7 +217,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut media_client, &mut iso_client, &mut udf_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -222,7 +227,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// on process_service, so come up later), so their driver channels are ready.
 				if MANIFEST[i].name == b"storage_service" && started == State::Running {
 					if let Some(dm) = index_of(b"device_manager") {
-						unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_frames, &mut gpu_client, &mut snd_client, &mut input_raw, &mut buf) };
+						unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_frames, &mut gpu_client, &mut snd_client, &mut input_raw, &mut block5_client, &mut buf) };
 					}
 				}
 			}
@@ -361,7 +366,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // be loaded from it. media / iso / udf storage reuse the pinned storage_service binary.
 // Every other service is loaded from the volume's `bin/` through ProcessService.
 fn is_pinned(name: &[u8]) -> bool {
-	matches!(name, b"log_service" | b"device_manager" | b"storage_service" | b"media_storage" | b"iso_storage" | b"udf_storage" | b"process_service")
+	matches!(name, b"log_service" | b"device_manager" | b"storage_service" | b"media_storage" | b"iso_storage" | b"udf_storage" | b"usb_storage" | b"process_service")
 }
 
 // Load a non-pinned service from the system volume's `bin/` through ProcessService,
@@ -394,9 +399,10 @@ unsafe fn launch_from_volume(process_client: u64, name: &[u8], bootstrap: u64) -
 // it a fresh StorageService connection over its control channel with a "DRIVERS" message,
 // so it loads the non-bootstrap drivers from vol://system/drivers/ and hands their channels
 // back - the net driver's frame channel, the gpu display channel, the snd control channel,
-// and the pointer event channel (each 0 when that device is absent). Kept for bootstrapping
-// NetworkService, ConsoleService, AudioService and InputService against the drivers.
-unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_raw: &mut u64, buf: &mut [u8]) {
+// the pointer event channel, and the USB stick's block channel (each 0 when that device is
+// absent). Kept for bootstrapping NetworkService, ConsoleService, AudioService,
+// InputService and the usb StorageService instance against the drivers.
+unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_raw: &mut u64, block5_client: &mut u64, buf: &mut [u8]) {
 	unsafe {
 		if dm_control == 0 {
 			return;
@@ -417,6 +423,9 @@ unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames
 		if let Received::Message { handle: input, .. } = recv_blocking(dm_control, buf) {
 			*input_raw = input;
 		}
+		if let Received::Message { handle: usb, .. } = recv_blocking(dm_control, buf) {
+			*block5_client = usb;
+		}
 	}
 }
 
@@ -431,7 +440,7 @@ unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -442,7 +451,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		// loaded from the volume's `bin/` through ProcessService (M61 box 8). media / iso /
 		// udf storage are extra instances of the pinned storage_service binary.
 		let proc: i64 = if is_pinned(name) {
-			let elf_name: &[u8] = if name == b"media_storage" || name == b"iso_storage" || name == b"udf_storage" { b"storage_service" } else { name };
+			let elf_name: &[u8] = if name == b"media_storage" || name == b"iso_storage" || name == b"udf_storage" || name == b"usb_storage" { b"storage_service" } else { name };
 			match package.lookup(elf_name) {
 				Some(elf) => spawn(elf, service_side),
 				None => return State::Failed,
@@ -474,6 +483,9 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"udf_storage" && !bootstrap_udf_storage(manager_side, *block4_client, udf_client) {
 			return State::Failed;
 		}
+		if name == b"usb_storage" && !bootstrap_usb_storage(manager_side, *block5_client, usb_client) {
+			return State::Failed;
+		}
 		if name == b"device_service" && !bootstrap_serve(manager_side, device_client) {
 			return State::Failed;
 		}
@@ -501,7 +513,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
 			return State::Failed;
 		}
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *res_client, *process_client, perm_client, admin_server2) {
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *res_client, *process_client, perm_client, admin_server2) {
 			return State::Failed;
 		}
 		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, pkg_handle, pkg_len, buf) {
@@ -510,7 +522,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"session_service" && !bootstrap_serve(manager_side, session_client) {
 			return State::Failed;
 		}
-		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *input_client, *console_client, *console_control, *graph_client, *perm_client, *res_client, *session_client, session1, admin_server) {
+		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *input_client, *console_client, *console_control, *graph_client, *perm_client, *res_client, *session_client, session1, admin_server) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -619,7 +631,7 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 // emitting on the original. Finally the supervisor mints a fresh ADMIN channel and
 // transfers the client end to the shell (so its `stop <service>` command can drive
 // reverse-dependency teardown), keeping the server end in `*admin_server` to serve.
-unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, input_client: u64, console_client: u64, console_control: u64, graph_client: u64, perm_client: u64, res_client: u64, session_client: u64, session1: &mut u64, admin_server: &mut u64) -> bool {
+unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, input_client: u64, console_client: u64, console_control: u64, graph_client: u64, perm_client: u64, res_client: u64, session_client: u64, session1: &mut u64, admin_server: &mut u64) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"STORAGE", storage_client) {
 			return false;
@@ -631,6 +643,9 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: 
 			return false;
 		}
 		if !send_blocking(manager_side, b"UDF", udf_client) {
+			return false;
+		}
+		if !send_blocking(manager_side, b"USB", usb_client) {
 			return false;
 		}
 		let log_dup: i64 = duplicate(log_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
@@ -800,7 +815,7 @@ unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], st
 // narrower client to each component it sandboxes. (The grantable permission capability - a
 // connection to the manager's own serve channel - is not passed here: the manager mints that
 // self-connection itself.)
-unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, resource_client: u64, process_client: u64, perm_client: &mut u64, admin_server2: &mut u64) -> bool {
+unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, resource_client: u64, process_client: u64, perm_client: &mut u64, admin_server2: &mut u64) -> bool {
 	unsafe {
 		// A fresh StorageService connection for the manager (independent of the shell's),
 		// duplicable so the manager can grant a narrowed copy to a sandboxed component.
@@ -896,11 +911,12 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			return false;
 		}
 		*admin_server2 = admin_srv2;
-		// Three fresh non-system volume StorageService connections the manager bundles with the
+		// Four fresh non-system volume StorageService connections the manager bundles with the
 		// system `storage` client under the `volumes` capability it grants the governed `lsvol`
-		// command: media (FAT/exFAT), iso (ISO9660), udf (UDF). Each is minted off the volume's
-		// own service factory; a volume whose disk is absent has no factory (its client is 0)
-		// and is handed over as 0, which `lsvol` shows as zero files.
+		// command: media (FAT/exFAT), iso (ISO9660), udf (UDF), usb (FAT off the USB stick).
+		// Each is minted off the volume's own service factory; a volume whose disk is absent
+		// has no factory (its client is 0) and is handed over as 0, which `lsvol` shows as
+		// zero files.
 		let media_conn: u64 = service_connect(media_client).unwrap_or(0);
 		if !send_blocking(manager_side, b"STORAGE_MEDIA", media_conn) {
 			return false;
@@ -911,6 +927,10 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 		}
 		let udf_conn: u64 = service_connect(udf_client).unwrap_or(0);
 		if !send_blocking(manager_side, b"STORAGE_UDF", udf_conn) {
+			return false;
+		}
+		let usb_conn: u64 = service_connect(usb_client).unwrap_or(0);
+		if !send_blocking(manager_side, b"STORAGE_USB", usb_conn) {
 			return false;
 		}
 		// A fresh ProcessService connection the manager drives to load the components it
@@ -1076,6 +1096,21 @@ unsafe fn bootstrap_udf_storage(manager_side: u64, block4_client: u64, udf_clien
 			return false;
 		}
 		bootstrap_serve(manager_side, udf_client)
+	}
+}
+
+// Bootstrap the USB StorageService instance: hand it the USB stick's block service
+// ("USBBLOCK", served by the xhci driver over the Bulk-Only Transport and routed up in
+// DeviceManager's phase 2), which it mounts as the writable FAT vol://usb volume, then
+// mint its service channel ("SERVE"); the client end is kept in `*usb_client` and later
+// handed to the shell. The block handle is 0 when no USB stick is attached, so the
+// instance simply fails to mount and reports failed.
+unsafe fn bootstrap_usb_storage(manager_side: u64, block5_client: u64, usb_client: &mut u64) -> bool {
+	unsafe {
+		if !send_blocking(manager_side, b"USBBLOCK", block5_client) {
+			return false;
+		}
+		bootstrap_serve(manager_side, usb_client)
 	}
 }
 

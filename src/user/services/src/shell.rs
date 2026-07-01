@@ -49,6 +49,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The UDF StorageService client: the read-only UDF vol://udf volume off a fourth
 	// virtio-blk disk. Sent right after ISO; `cat`/`ls` route vol://udf to it.
 	let udf: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"UDF") }.unwrap_or(0);
+	// The USB StorageService client: the writable FAT vol://usb volume off the USB
+	// mass-storage stick the xhci driver serves. Sent right after UDF; `cd` routes
+	// vol://usb to it.
+	let usb: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"USB") }.unwrap_or(0);
 	// The thin launcher runs log/device/config/time/audio commands as governed ELF tools,
 	// so it drops these bootstrap capabilities: it consumes each to keep the handshake
 	// ordering with the supervisor, then closes it so the shell holds no unused capability.
@@ -109,7 +113,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    become the interactive console and run the read-eval-print loop.
 	print_motd();
 	unsafe {
-		repl(console, control, storage, media, iso, udf, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, &mut buf);
+		repl(console, control, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, &mut buf);
 	}
 	exit();
 }
@@ -174,7 +178,7 @@ fn print_banner(lines: &[&str]) {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, buf: &mut [u8]) {
+unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, buf: &mut [u8]) {
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control, session);
 		// The cwd is owned by the session (so it survives a shell restart); read it once at
@@ -216,7 +220,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			// reap finished jobs, and print the next prompt.
 			let raw: &[u8] = trim(&buf[..n]);
 			let expanded: Vec<u8> = expand_vars(raw, &vars);
-			if dispatch(&expanded, storage, media, iso, udf, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, &mut jobs, &mut vars, &mut cwd) {
+			if dispatch(&expanded, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, &mut jobs, &mut vars, &mut cwd) {
 				return;
 			}
 			jobs.reap();
@@ -663,7 +667,7 @@ fn push_var_value(out: &mut Vec<u8>, name: &[u8], vars: &[(String, String)]) {
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, jobs: &mut Jobs, vars: &mut Vec<(String, String)>, cwd: &mut String) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, jobs: &mut Jobs, vars: &mut Vec<(String, String)>, cwd: &mut String) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
@@ -993,7 +997,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, pr
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"cd ") {
-			cd_cmd(cwd, trim(rest), session, storage, media, iso, udf);
+			cd_cmd(cwd, trim(rest), session, storage, media, iso, udf, usb);
 			return false;
 		}
 		if line == b"ls" {
@@ -1450,9 +1454,9 @@ unsafe fn cat(storage: u64, uri: &[u8]) -> bool {
 }
 
 // Pick the StorageService client for a vol:// URI: vol://media is the FAT media
-// disk, vol://iso the ISO9660 disk, vol://udf the UDF disk, everything else the system
-// volume.
-fn storage_for(uri: &[u8], storage: u64, media: u64, iso: u64, udf: u64) -> u64 {
+// disk, vol://iso the ISO9660 disk, vol://udf the UDF disk, vol://usb the USB stick,
+// everything else the system volume.
+fn storage_for(uri: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64) -> u64 {
 	let v: Option<&[u8]> = uri.strip_prefix(b"vol://");
 	if v.map(|r: &[u8]| r.starts_with(b"media/") || r == b"media").unwrap_or(false) {
 		media
@@ -1460,6 +1464,8 @@ fn storage_for(uri: &[u8], storage: u64, media: u64, iso: u64, udf: u64) -> u64 
 		iso
 	} else if v.map(|r: &[u8]| r.starts_with(b"udf/") || r == b"udf").unwrap_or(false) {
 		udf
+	} else if v.map(|r: &[u8]| r.starts_with(b"usb/") || r == b"usb").unwrap_or(false) {
+		usb
 	} else {
 		storage
 	}
@@ -1468,7 +1474,7 @@ fn storage_for(uri: &[u8], storage: u64, media: u64, iso: u64, udf: u64) -> u64 
 // Change the working directory. The target is resolved against the current cwd and
 // must be an existing directory, which we confirm by listing it through the owning
 // StorageService; only then does the prompt move there.
-unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], session: u64, storage: u64, media: u64, iso: u64, udf: u64) {
+unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], session: u64, storage: u64, media: u64, iso: u64, udf: u64, usb: u64) {
 	unsafe {
 		let target: String = match path::resolve(cwd, arg) {
 			Some(t) => t,
@@ -1477,7 +1483,7 @@ unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], session: u64, storage: u64, media
 				return;
 			}
 		};
-		let chan: u64 = storage_for(target.as_bytes(), storage, media, iso, udf);
+		let chan: u64 = storage_for(target.as_bytes(), storage, media, iso, udf, usb);
 		let mut client = volume::Client::new(ChannelTransport { chan });
 		match client.list(&target) {
 			Some(Ok(_)) => {

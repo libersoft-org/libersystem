@@ -725,16 +725,18 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	// which would receive a narrowed copy, is not among them).
 	let (supervisor_server, supervisor_client) = Channel::create();
 	core::mem::drop(supervisor_server);
-	// The manager's grantable volume capabilities: the three non-system volume StorageService
-	// clients (media / iso / udf) it bundles with the system storage client under the `volumes`
-	// capability. Real, dead-peer clients here (no such services run in this scenario), held but
-	// never granted to the governed components (the `lsvol` command is not among them).
+	// The manager's grantable volume capabilities: the four non-system volume StorageService
+	// clients (media / iso / udf / usb) it bundles with the system storage client under the
+	// `volumes` capability. Real, dead-peer clients here (no such services run in this scenario),
+	// held but never granted to the governed components (the `lsvol` command is not among them).
 	let (storage_media_server, storage_media_client) = Channel::create();
 	core::mem::drop(storage_media_server);
 	let (storage_iso_server, storage_iso_client) = Channel::create();
 	core::mem::drop(storage_iso_server);
 	let (storage_udf_server, storage_udf_client) = Channel::create();
 	core::mem::drop(storage_udf_server);
+	let (storage_usb_server, storage_usb_client) = Channel::create();
+	core::mem::drop(storage_usb_server);
 
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
@@ -780,6 +782,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	send_cap(&pm_boot_kernel, b"STORAGE_MEDIA", storage_media_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"STORAGE_ISO", storage_iso_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"STORAGE_UDF", storage_udf_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"STORAGE_USB", storage_usb_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"PROCESS", process_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"SERVE", perm_server, Rights::ALL)?;
 
@@ -2057,6 +2060,7 @@ fn device_table_exposes_the_xhci_controller() {
 #[cfg(test)]
 #[test_case]
 fn xhci_driver_enumerates_the_usb_bus() {
+	use object::channel::{Channel, Message};
 	use object::device_memory::DeviceMemory;
 	use object::rights::Rights;
 
@@ -2106,7 +2110,25 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	sched::run_until_idle();
 
 	let report = kernel_ep.recv().expect("the xhci driver should report in");
-	assert_eq!(&report.bytes[..], b"driver.xhci: online (1 device(s)) (keyboard)", "the driver should address the QEMU USB keyboard and configure its HID boot interface");
+	assert_eq!(&report.bytes[..], b"driver.xhci: online (2 device(s)) (keyboard) (storage)", "the driver should address the QEMU USB keyboard and stick, configure the HID boot interface, and bring the disk up");
+
+	// the report carries the disk's block channel: read sector 0 over it, the same
+	// [op u32][lba u64][count u32] contract driver.virtio-blk serves, and expect a
+	// success status plus a 512-byte shared buffer.
+	let cap = report.caps.first().expect("the block channel is transferred with the report");
+	let blk = cap.object().into_any_arc().downcast::<Channel>().expect("the block channel is a channel");
+	let mut request = alloc::vec::Vec::with_capacity(16);
+	request.extend_from_slice(&0u32.to_le_bytes()); // op = read
+	request.extend_from_slice(&0u64.to_le_bytes()); // lba 0
+	request.extend_from_slice(&1u32.to_le_bytes()); // one sector
+	blk.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("the block request should send");
+	sched::run_until_idle();
+	let reply = blk.recv().expect("the block reply should arrive");
+	assert_eq!(&reply.bytes[..4], &0u32.to_le_bytes(), "the USB read should succeed");
+	let buf_cap = reply.caps.first().expect("the read should grant a buffer");
+	let object = buf_cap.object();
+	let memory = object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
+	assert_eq!(read_from_object(memory, 512).len(), 512, "the buffer should hold the sector");
 }
 
 #[cfg(test)]
@@ -2648,7 +2670,7 @@ fn init_package_starts_system_manager() {
 	// managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 25] = [b"LogService: online", b"DeviceManager: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"ProcessService: online", b"ConfigService: online", b"AudioService: online", b"InputService: online", b"ResourceManager: online", b"SessionService: online", b"NetworkService: online", b"DeviceService: online", b"TimeService: online", b"PermissionManager: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"WatchdogProbe: online", b"WatchdogProbe: restarted", b"WatchdogProbe: recovered", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 26] = [b"LogService: online", b"DeviceManager: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"ProcessService: online", b"ConfigService: online", b"AudioService: online", b"InputService: online", b"ResourceManager: online", b"SessionService: online", b"NetworkService: online", b"DeviceService: online", b"TimeService: online", b"PermissionManager: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"WatchdogProbe: online", b"WatchdogProbe: restarted", b"WatchdogProbe: recovered", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");

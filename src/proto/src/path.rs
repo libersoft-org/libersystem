@@ -90,15 +90,16 @@ pub fn volume<'a>(cwd: &'a str, arg: &'a [u8]) -> Option<&'a [u8]> {
 	if volume.is_empty() { None } else { Some(volume) }
 }
 
-// Route a path to the StorageService client for its volume, from the four clients a tool
+// Route a path to the StorageService client for its volume, from the five clients a tool
 // holds under the `volumes` capability. The volume is that of an absolute `vol://` argument,
 // otherwise the cwd's; `system` (the writable LiberFS) is the fallback for the system volume
 // or an unrecognized / malformed path, so a tool always has a client to try.
-pub fn volume_client(cwd: &str, arg: &[u8], system: u64, media: u64, iso: u64, udf: u64) -> u64 {
+pub fn volume_client(cwd: &str, arg: &[u8], system: u64, media: u64, iso: u64, udf: u64, usb: u64) -> u64 {
 	match volume(cwd, arg) {
 		Some(b"media") => media,
 		Some(b"iso") => iso,
 		Some(b"udf") => udf,
+		Some(b"usb") => usb,
 		_ => system,
 	}
 }
