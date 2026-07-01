@@ -470,6 +470,21 @@ fn volume_file(volume: &[u8], name: &[u8]) -> Result<alloc::vec::Vec<u8>, &'stat
 	pkg::Package::parse(volume).and_then(|p| p.lookup(name).map(|b| b.to_vec())).ok_or("file missing from the volume package")
 }
 
+// Resolve a program's ELF for a test. The pinned bootstrap programs live in the init
+// package; every other service, manager and demo component is staged on the system volume
+// under `bin/` (M61 box 8), so fall back to the volume there. The returned slice borrows
+// the 'static module data, so it outlives the temporary volume Package.
+#[cfg(test)]
+fn program_elf(package: &pkg::Package<'static>, volume: &'static [u8], name: &[u8]) -> Option<&'static [u8]> {
+	if let Some(elf) = package.lookup(name) {
+		return Some(elf);
+	}
+	let mut path: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	path.extend_from_slice(b"bin/");
+	path.extend_from_slice(name);
+	pkg::Package::parse(volume).and_then(|p| p.lookup(&path))
+}
+
 // Send a tagged capability over a bootstrap channel: wrap `object` in a Capability
 // carrying `rights` and send it with `payload` as the message bytes. The shared
 // "hand a process one of its initial capabilities" step the scenarios repeat.
@@ -525,7 +540,7 @@ fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), 
 	let (volume, package) = scenario_packages()?;
 	let expected = volume_file(volume, b"hello.txt")?;
 	let service_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
-	let client_elf = package.lookup(b"storage_client").ok_or("storage_client missing from the init package")?;
+	let client_elf = program_elf(&package, volume, b"storage_client").ok_or("storage_client missing from the package or volume")?;
 
 	// channels: a bootstrap per process, plus the service<->client request channel
 	let (service_boot_kernel, service_boot_user) = Channel::create();
@@ -565,7 +580,7 @@ fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'s
 	let (volume, package) = scenario_packages()?;
 	let expected = volume_file(volume, b"hello.txt")?;
 	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
-	let host_elf = package.lookup(b"wasi_host").ok_or("wasi_host missing from the init package")?;
+	let host_elf = program_elf(&package, volume, b"wasi_host").ok_or("wasi_host missing from the package or volume")?;
 
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (host_boot_kernel, host_boot_user) = Channel::create();
@@ -605,8 +620,8 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 	let (volume, package) = scenario_packages()?;
 	let expected = volume_file(volume, b"motd.txt")?;
 	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
-	let picker_elf = package.lookup(b"file_picker").ok_or("file_picker missing from the init package")?;
-	let host_elf = package.lookup(b"wasi_host").ok_or("wasi_host missing from the init package")?;
+	let picker_elf = program_elf(&package, volume, b"file_picker").ok_or("file_picker missing from the package or volume")?;
+	let host_elf = program_elf(&package, volume, b"wasi_host").ok_or("wasi_host missing from the package or volume")?;
 
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (picker_boot_kernel, picker_boot_user) = Channel::create();
@@ -666,8 +681,8 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let expected = volume_file(volume, b"hello.txt")?;
 	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
 	let process_elf = package.lookup(b"process_service").ok_or("process_service missing from the init package")?;
-	let time_elf = package.lookup(b"time_service").ok_or("time_service missing from the init package")?;
-	let pm_elf = package.lookup(b"permission_manager").ok_or("permission_manager missing from the init package")?;
+	let time_elf = program_elf(&package, volume, b"time_service").ok_or("time_service missing from the package or volume")?;
+	let pm_elf = program_elf(&package, volume, b"permission_manager").ok_or("permission_manager missing from the package or volume")?;
 
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (process_boot_kernel, process_boot_user) = Channel::create();
@@ -731,12 +746,13 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	send_ramdisk(&storage_boot_kernel, volume)?;
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL)?;
 
-	// ProcessService: the init package (to load the probe from) and its service channel.
-	// PermissionManager drives it to load the component it governs - the loading mechanism,
-	// kept separate from the granting policy. It gets a placeholder "STORAGE" message with
-	// no client, so it loads from that package rather than a system volume.
+	// ProcessService: the init package (the bring-up fallback) and its service channel,
+	// plus a StorageService client so it loads the components PermissionManager governs
+	// from the system volume's bin/ (M61 box 8) - the loading mechanism, kept separate
+	// from the granting policy. The client is a duplicate of the manager's storage
+	// connection; the cooperative schedule serializes the reads, so sharing it is safe.
 	send_package(&process_boot_kernel, init)?;
-	process_boot_kernel.send(object::channel::Message::new(b"STORAGE".to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send the placeholder storage message")?;
+	send_cap(&process_boot_kernel, b"STORAGE", storage_client.clone(), Rights::ALL)?;
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL)?;
 
 	// TimeService: its (dead-peer) network client and its service channel. It seeds its
@@ -809,7 +825,7 @@ fn run_component_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>,
 	let expected: alloc::vec::Vec<u8> = raw.iter().map(|b: &u8| b.to_ascii_uppercase()).collect();
 	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
 	let log_elf = package.lookup(b"log_service").ok_or("log_service missing from the init package")?;
-	let host_elf = package.lookup(b"component_host").ok_or("component_host missing from the init package")?;
+	let host_elf = program_elf(&package, volume, b"component_host").ok_or("component_host missing from the package or volume")?;
 
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (log_boot_kernel, log_boot_user) = Channel::create();
@@ -859,9 +875,9 @@ fn run_resource_scenario() -> Result<alloc::vec::Vec<u8>, &'static str> {
 	use object::channel::Channel;
 	use object::rights::Rights;
 
-	let (_volume, package) = scenario_packages()?;
+	let (volume, package) = scenario_packages()?;
 	let init = init_package_bytes().ok_or("init package module not found")?;
-	let rm_elf = package.lookup(b"resource_manager").ok_or("resource_manager missing from the init package")?;
+	let rm_elf = program_elf(&package, volume, b"resource_manager").ok_or("resource_manager missing from the package or volume")?;
 
 	let (rm_boot_kernel, rm_boot_user) = Channel::create();
 	let (resource_server, _resource_client) = Channel::create();
@@ -2067,8 +2083,9 @@ fn spawn_service(name: &[u8]) -> (alloc::sync::Arc<object::channel::Channel>, al
 	use object::channel::Channel;
 	use object::rights::Rights;
 	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
 	let package = pkg::Package::parse(init).expect("init package parses");
-	let service_elf = package.lookup(name).expect("service in the init package");
+	let service_elf = program_elf(&package, volume, name).expect("service in the init package or volume");
 	let (boot_kernel, boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn service");
@@ -2085,8 +2102,9 @@ fn spawn_service_with_package(name: &[u8]) -> (alloc::sync::Arc<object::channel:
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
 	let package = pkg::Package::parse(init).expect("init package parses");
-	let service_elf = package.lookup(name).expect("service in the init package");
+	let service_elf = program_elf(&package, volume, name).expect("service in the init package or volume");
 	let (boot_kernel, boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn service");
@@ -2231,8 +2249,9 @@ fn input_service_streams_pointer_events() {
 	// stream. The pointer device is interactive-only, so here the test plays the
 	// driver itself by sending raw events on the producer end it keeps.
 	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
 	let package = pkg::Package::parse(init).expect("init package parses");
-	let service_elf = package.lookup(b"input_service").expect("input_service in the init package");
+	let service_elf = program_elf(&package, volume, b"input_service").expect("input_service in the package or volume");
 	let (boot_kernel, boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
 	let (raw_producer, raw_consumer) = Channel::create();
@@ -2303,8 +2322,10 @@ fn process_service_starts_a_program() {
 	// pre-queued so the cooperative service drains it in one pass and exits.
 	let (boot_kernel, service_client) = spawn_service_with_package(b"process_service");
 
-	// START storage_client: [op = 1 u16][corr u32][name: [len u16][utf8]].
-	let name: &[u8] = b"storage_client";
+	// START a pinned program by name (log_service is in the init package, which this
+	// ProcessService falls back to since it has no storage client): [op = 1 u16][corr
+	// u32][name: [len u16][utf8]].
+	let name: &[u8] = b"log_service";
 	let mut start = alloc::vec::Vec::new();
 	start.extend_from_slice(&1u16.to_le_bytes());
 	start.extend_from_slice(&1u32.to_le_bytes());
@@ -2518,7 +2539,7 @@ fn init_package_starts_system_manager() {
 	// managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 25] = [b"LogService: online", b"DeviceService: online", b"ConfigService: online", b"ResourceManager: online", b"SessionService: online", b"DeviceManager: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"NetworkService: online", b"ProcessService: online", b"TimeService: online", b"AudioService: online", b"InputService: online", b"PermissionManager: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"WatchdogProbe: online", b"WatchdogProbe: restarted", b"WatchdogProbe: recovered", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 25] = [b"LogService: online", b"DeviceManager: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"ProcessService: online", b"ConfigService: online", b"AudioService: online", b"InputService: online", b"ResourceManager: online", b"SessionService: online", b"NetworkService: online", b"DeviceService: online", b"TimeService: online", b"ConsoleService: online", b"PermissionManager: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"WatchdogProbe: online", b"WatchdogProbe: restarted", b"WatchdogProbe: recovered", b"ServiceManager: online", b"SystemManager: online"];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");
@@ -2538,9 +2559,10 @@ fn pty_hosts_a_program() {
 	// Here we stand in for the host (and for VT 1's idle shell) and drive a `ptyecho` slave:
 	// a line written to the master is cooked by the line discipline, delivered to the slave,
 	// echoed back prefixed with "pty:", and forwarded out the master to us.
+	let (volume, package) = scenario_packages().expect("scenario packages");
 	let init = init_package_bytes().expect("init package module not found");
-	let package = pkg::Package::parse(init).expect("init package parses");
-	let console_elf = package.lookup(b"console_service").expect("console_service in the init package");
+	let console_elf = program_elf(&package, volume, b"console_service").expect("console_service in the package or volume");
+	let storage_elf = package.lookup(b"storage_service").expect("storage_service in the init package");
 	let process_elf = package.lookup(b"process_service").expect("process_service in the init package");
 
 	// ConsoleService's bootstrap channel and the channels its __user_main expects: VT 1's
@@ -2554,14 +2576,22 @@ fn pty_hosts_a_program() {
 
 	loader::spawn_elf_process(sched::root_domain(), console_elf, boot_user, Rights::ALL, 0).expect("spawn ConsoleService");
 
+	// A StorageService over the factory volume (which stages ptyecho under bin/), so the
+	// ProcessService below can load the ptyecho slave from vol://system/bin/ptyecho.
+	let (storage_boot_kernel, storage_boot_user) = Channel::create();
+	let (storage_server, storage_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
+	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
+	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
+
 	// A live ProcessService the console loads and launches the ptyecho slave through (the
-	// sole process-creation mechanism). It gets a placeholder "STORAGE" message with no
-	// client, so it loads ptyecho from the init package rather than a system volume.
+	// sole process-creation mechanism), reading it from the system volume through the
+	// StorageService client.
 	let (proc_boot_kernel, proc_boot_user) = Channel::create();
 	let (proc_server, proc_client) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), process_elf, proc_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
 	send_package(&proc_boot_kernel, init).expect("process package bootstrap");
-	proc_boot_kernel.send(Message::new(b"STORAGE".to_vec(), alloc::vec::Vec::new(), 0)).expect("process storage bootstrap");
+	send_cap(&proc_boot_kernel, b"STORAGE", storage_client, Rights::ALL).expect("process storage bootstrap");
 	send_cap(&proc_boot_kernel, b"SERVE", proc_server, Rights::ALL).expect("process serve bootstrap");
 
 	send_cap(&boot_kernel, b"CLIENT", vt1_console_a, Rights::ALL).expect("CLIENT bootstrap");
@@ -2610,8 +2640,9 @@ fn interactive_tool_reads_stdin() {
 	// STDOUT (which `rt::inherit_stdout` adopts as stdin too), deliver a cooked line the way
 	// ConsoleService's line discipline would, and observe readln echo it back prefixed.
 	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
 	let package = pkg::Package::parse(init).expect("init package parses");
-	let readln_elf = package.lookup(b"readln").expect("readln in the init package");
+	let readln_elf = program_elf(&package, volume, b"readln").expect("readln in the package or volume");
 
 	// readln's bootstrap channel, and the console channel that is its stdout + stdin: the
 	// child holds one end (transferred as STDOUT), we keep the other and act as the terminal.

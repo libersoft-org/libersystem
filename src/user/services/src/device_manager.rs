@@ -12,7 +12,14 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use proto::system::{volume, OpenOpts};
 use rt::*;
+
+// Where the non-bootstrap driver binaries live on the system volume (M61 box 8): a
+// named driver is loaded from `<DRIVER_DIR><name>`.
+const DRIVER_DIR: &str = "vol://system/drivers/";
 
 // The state DeviceManager tracks per discovered device.
 const STATE_UNKNOWN: u8 = 0;
@@ -34,9 +41,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let (_pkg_handle, archive): (u64, &[u8]) = recv_package(bootstrap, &mut buf).unwrap_or_else(|| exit());
 		let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
 
-		// 2. launch the matching driver for each discovered device. The virtio-blk
-		//    driver hands back a block-read service channel, which we route up to
-		//    ServiceManager (it forwards it to StorageService).
+		// 2. phase 1: launch the bootstrap block driver (virtio_blk) for each disk it backs.
+		//    It hands back a block-read service channel, which we route up to ServiceManager
+		//    (it forwards it to StorageService). The non-bootstrap drivers cannot load yet -
+		//    they live on the system volume, which is only mountable once virtio_blk and
+		//    StorageService are up - so they wait for phase 2 below.
 		let mut block_client: u64 = 0;
 		let mut block2_client: u64 = 0;
 		let mut block3_client: u64 = 0;
@@ -45,51 +54,65 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut gpu_client: u64 = 0;
 		let mut snd_client: u64 = 0;
 		let mut input_client: u64 = 0;
-		launch_drivers(&package, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client);
+		launch_boot_drivers(&package, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client);
 
-		// 3. report in once the devices are bound to drivers, transferring the block
-		//    service channel up the boot chain, then the net driver's control channel, the
-		//    gpu driver's display channel, the snd driver's control channel, the pointer
-		//    driver's event channel, and the second block disk's service channel in follow-up
-		//    messages (the report itself carries one handle; each `GPU`/`NET`/`SND`/`INPUT`/
-		//    `BLOCK2`/`BLOCK3`/`BLOCK4` handle is 0 when that device is absent).
+		// 3. report in once the disks are bound, transferring the block service channel up
+		//    the boot chain, then the second/third/fourth block disks' service channels (the
+		//    report itself carries one handle; each `BLOCK2`/`BLOCK3`/`BLOCK4` handle is 0
+		//    when that disk is absent). The net / gpu / snd / input driver channels follow in
+		//    phase 2, once the volume they load from is mounted.
 		send_blocking(bootstrap, b"DeviceManager: online", block_client);
-		send_blocking(bootstrap, b"NET", net_client);
-		send_blocking(bootstrap, b"GPU", gpu_client);
-		send_blocking(bootstrap, b"SND", snd_client);
-		send_blocking(bootstrap, b"INPUT", input_client);
 		send_blocking(bootstrap, b"BLOCK2", block2_client);
 		send_blocking(bootstrap, b"BLOCK3", block3_client);
 		send_blocking(bootstrap, b"BLOCK4", block4_client);
 
-		// 4. stand until ServiceManager asks us to stop (which also drops the driver
-		//    channels, so the drivers shut down with us), then acknowledge and exit.
-		if let Received::Message { .. } = recv_blocking(bootstrap, &mut buf) {
-			send_blocking(bootstrap, b"DeviceManager: stopped", 0);
+		// 4. stand until ServiceManager drives phase 2 (a "DRIVERS" message carrying a
+		//    StorageService client, once the volume is up: we load the non-bootstrap drivers
+		//    from vol://system/drivers/ and hand their channels up) or asks us to stop (which
+		//    also drops the driver channels, so the drivers shut down with us).
+		loop {
+			match recv_blocking(bootstrap, &mut buf) {
+				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
+					launch_volume_drivers(handle, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client);
+					if handle != 0 {
+						close(handle);
+					}
+					send_blocking(bootstrap, b"NET", net_client);
+					send_blocking(bootstrap, b"GPU", gpu_client);
+					send_blocking(bootstrap, b"SND", snd_client);
+					send_blocking(bootstrap, b"INPUT", input_client);
+				}
+				Received::Message { .. } => {
+					send_blocking(bootstrap, b"DeviceManager: stopped", 0);
+					break;
+				}
+				Received::Closed => break,
+			}
 		}
 	}
 	exit();
 }
 
-// Enumerate the kernel device table and, for each device, spawn the matching driver
-// from the package, handing it only that device's MMIO capability and info. Tracks
-// each device's state (online once its driver reports in, failed otherwise) and
-// prints a summary. The driver's "online" report is printed; it does not flow up
-// the boot-chain report channel (which carries only the service lifecycle).
-unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64) {
+// Phase 1 (M61 box 8): enumerate the kernel device table and spawn the bootstrap block
+// driver (virtio_blk) for each disk it backs, from the init package, handing it only that
+// device's MMIO capability and info. Each disk's block-read service channel is routed up
+// (system / media / iso / udf, in discovery order). The non-bootstrap drivers are skipped
+// here - they load from the volume in phase 2, once it is mounted.
+unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64) {
 	unsafe {
 		let count: u64 = device_count();
-		let mut state: [u8; MAX_DEVICES] = [STATE_UNKNOWN; MAX_DEVICES];
 		let mut i: u64 = 0;
 		while i < count && i < MAX_DEVICES as u64 {
-			let idx: usize = i as usize;
-			state[idx] = STATE_FAILED;
 			let mut info: DeviceInfo = DeviceInfo::default();
 			if !device_info(i, &mut info) {
 				i += 1;
 				continue;
 			}
 			let driver_name: &[u8] = driver_for(info.virtio_type);
+			if driver_name != b"virtio_blk" {
+				i += 1;
+				continue;
+			}
 			let elf: &[u8] = match package.lookup(driver_name) {
 				Some(e) => e,
 				None => {
@@ -97,25 +120,64 @@ unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u
 					continue;
 				}
 			};
-			// launch the driver, restarting it if it crashes during bring-up. The
-			// block driver's report carries a service channel we route upward.
+			let mut handle: u64 = 0;
+			if launch_one(i, &info, elf, driver_name, buf, &mut handle) {
+				// the first virtio-blk disk is the writable system volume; a second is routed
+				// up separately as the read-only FAT media volume, a third as the read-only
+				// ISO9660 volume, a fourth as the read-only UDF volume.
+				if *block_client == 0 {
+					*block_client = handle;
+				} else if *block2_client == 0 {
+					*block2_client = handle;
+				} else if *block3_client == 0 {
+					*block3_client = handle;
+				} else if *block4_client == 0 {
+					*block4_client = handle;
+				}
+			}
+			i += 1;
+		}
+	}
+}
+
+// Phase 2 (M61 box 8): now that the system volume is mounted, load each non-bootstrap
+// driver from vol://system/drivers/ through the StorageService client `storage` and spawn
+// it with its device's MMIO capability. Their control / event channels are handed back for
+// NetworkService, ConsoleService, AudioService and InputService. Tracks each device's state
+// and prints a summary.
+unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64) {
+	unsafe {
+		let count: u64 = device_count();
+		let mut state: [u8; MAX_DEVICES] = [STATE_UNKNOWN; MAX_DEVICES];
+		let mut i: u64 = 0;
+		while i < count && i < MAX_DEVICES as u64 {
+			let idx: usize = i as usize;
+			let mut info: DeviceInfo = DeviceInfo::default();
+			if !device_info(i, &mut info) {
+				i += 1;
+				continue;
+			}
+			let driver_name: &[u8] = driver_for(info.virtio_type);
+			if driver_name == b"virtio_blk" {
+				// the disks are bound in phase 1; count them as online in the summary.
+				state[idx] = STATE_ONLINE;
+				i += 1;
+				continue;
+			}
+			state[idx] = STATE_FAILED;
+			// load the driver's ELF off the volume, keep it mapped while we spawn from it.
+			let loaded: Option<(u64, u64, usize)> = read_driver(storage, driver_name);
+			let (file, mapped, size): (u64, u64, usize) = match loaded {
+				Some(t) => t,
+				None => {
+					i += 1;
+					continue;
+				}
+			};
+			let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
 			let mut handle: u64 = 0;
 			if launch_one(i, &info, elf, driver_name, buf, &mut handle) {
 				state[idx] = STATE_ONLINE;
-				if driver_name == b"virtio_blk" {
-					// the first virtio-blk disk is the writable system volume; a second is
-					// routed up separately as the read-only FAT media volume, a third as the
-					// read-only ISO9660 volume, a fourth as the read-only UDF volume.
-					if *block_client == 0 {
-						*block_client = handle;
-					} else if *block2_client == 0 {
-						*block2_client = handle;
-					} else if *block3_client == 0 {
-						*block3_client = handle;
-					} else if *block4_client == 0 {
-						*block4_client = handle;
-					}
-				}
 				if driver_name == b"virtio_net" {
 					*net_client = handle;
 				}
@@ -132,9 +194,40 @@ unsafe fn launch_drivers(package: &Package, buf: &mut [u8], block_client: &mut u
 					*input_client = handle;
 				}
 			}
+			unmap_object(file);
+			close(file);
 			i += 1;
 		}
 		report_state(&state, count);
+	}
+}
+
+// Open vol://system/drivers/<name> through the StorageService client and map its bytes,
+// returning (file handle, mapped address, size) so the caller can spawn from the image and
+// then release the mapping. None if the driver cannot be read.
+unsafe fn read_driver(storage: u64, name: &[u8]) -> Option<(u64, u64, usize)> {
+	unsafe {
+		let mut path: alloc::string::String = alloc::string::String::from(DRIVER_DIR);
+		path.push_str(&alloc::string::String::from_utf8_lossy(name));
+		let opts: OpenOpts = OpenOpts { path, write: false, create: false };
+		let result = match volume::Client::new(ChannelTransport { chan: storage }).open(&opts) {
+			Some(Ok(r)) => r,
+			_ => return None,
+		};
+		if result.file == 0 || result.size == 0 {
+			if result.file != 0 {
+				close(result.file);
+			}
+			return None;
+		}
+		let mapped: u64 = match map_object(result.file) {
+			Some(base) => base,
+			None => {
+				close(result.file);
+				return None;
+			}
+		};
+		Some((result.file, mapped, result.size as usize))
 	}
 }
 

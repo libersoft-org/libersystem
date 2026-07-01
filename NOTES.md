@@ -1,5 +1,7 @@
 # Bugs / changes
 
+- Arrays in .rs files are written in 1 row - make it multiline, so it's better readable
+- Check what is in coreutils package (Debian)
 - After bootup, in shell it automatically presses enter after a few seconds - why?
 - Where are system tools stored? When I enter "ls" in vol://system/, I can see just 2 .txt files
 - Remove "Hello from the OS ramdisk!" after start and add 1 empty line before userspace (before MOTD)

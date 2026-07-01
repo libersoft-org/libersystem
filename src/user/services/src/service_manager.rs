@@ -30,6 +30,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use proto::system::log;
 use proto::system::network;
+use proto::system::process;
 use proto::system::supervisor;
 use proto::system::{Entry, Error, Field, Severity, SupervisorStat};
 use rt::*;
@@ -53,7 +54,7 @@ const N: usize = 19;
 // component it observes (so it holds their process handles for the live graph), and
 // the shell is the last component up: it depends on StorageService (which it talks to
 // over IPC) and on SystemGraphService (whose graph its `graph` command renders).
-const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"media_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"shell", deps: &[b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service", b"session_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service"] }, Service { name: b"process_service", deps: &[b"log_service", b"storage_service"] }, Service { name: b"config_service", deps: &[b"log_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service", b"session_service", b"process_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"network_service", b"time_service", b"config_service", b"device_service", b"audio_service", b"process_service", b"resource_manager"] }, Service { name: b"resource_manager", deps: &[b"log_service"] }, Service { name: b"session_service", deps: &[b"log_service"] }];
+const MANIFEST: [Service; N] = [Service { name: b"device_manager", deps: &[b"log_service"] }, Service { name: b"storage_service", deps: &[b"log_service", b"device_manager"] }, Service { name: b"media_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] }, Service { name: b"network_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"shell", deps: &[b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"device_service", b"process_service", b"config_service", b"network_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager", b"system_graph_service", b"session_service"] }, Service { name: b"log_service", deps: &[] }, Service { name: b"device_service", deps: &[b"log_service", b"process_service"] }, Service { name: b"process_service", deps: &[b"log_service", b"storage_service"] }, Service { name: b"config_service", deps: &[b"log_service", b"process_service"] }, Service { name: b"time_service", deps: &[b"log_service", b"network_service", b"process_service"] }, Service { name: b"console_service", deps: &[b"log_service", b"time_service", b"audio_service", b"input_service", b"session_service", b"process_service"] }, Service { name: b"audio_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"input_service", deps: &[b"log_service", b"device_manager", b"process_service"] }, Service { name: b"system_graph_service", deps: &[b"log_service", b"device_manager", b"storage_service", b"network_service", b"device_service", b"process_service", b"config_service", b"time_service", b"console_service", b"audio_service", b"input_service", b"permission_manager", b"resource_manager"] }, Service { name: b"permission_manager", deps: &[b"log_service", b"storage_service", b"media_storage", b"iso_storage", b"udf_storage", b"network_service", b"time_service", b"config_service", b"device_service", b"audio_service", b"process_service", b"resource_manager"] }, Service { name: b"resource_manager", deps: &[b"log_service", b"process_service"] }, Service { name: b"session_service", deps: &[b"log_service", b"process_service"] }];
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -215,6 +216,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
+				// M61 box 8: once the system StorageService is up, drive DeviceManager's phase
+				// 2 - it now loads the non-bootstrap drivers from the volume, which is only
+				// mountable now. This runs before the driver-consuming services (which depend
+				// on process_service, so come up later), so their driver channels are ready.
+				if MANIFEST[i].name == b"storage_service" && started == State::Running {
+					if let Some(dm) = index_of(b"device_manager") {
+						unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_frames, &mut gpu_client, &mut snd_client, &mut input_raw, &mut buf) };
+					}
+				}
 			}
 			i += 1;
 		}
@@ -346,6 +356,70 @@ fn index_of(name: &[u8]) -> Option<usize> {
 	None
 }
 
+// The pinned bootstrap set (M61 box 8): the services ServiceManager raw-spawns from the
+// init package, because they are on the path to mounting the system volume and so cannot
+// be loaded from it. media / iso / udf storage reuse the pinned storage_service binary.
+// Every other service is loaded from the volume's `bin/` through ProcessService.
+fn is_pinned(name: &[u8]) -> bool {
+	matches!(name, b"log_service" | b"device_manager" | b"storage_service" | b"media_storage" | b"iso_storage" | b"udf_storage" | b"process_service")
+}
+
+// Load a non-pinned service from the system volume's `bin/` through ProcessService,
+// handing the new process `bootstrap` as its bootstrap channel. Mints a dedicated
+// launcher connection to the `process` factory (so the client end kept for the shell
+// stays pristine). Returns the new process handle, or a negative value on failure.
+unsafe fn launch_from_volume(process_client: u64, name: &[u8], bootstrap: u64) -> i64 {
+	unsafe {
+		if process_client == 0 {
+			return -1;
+		}
+		let name_str: &str = match core::str::from_utf8(name) {
+			Ok(s) => s,
+			Err(_) => return -1,
+		};
+		let launcher: u64 = match service_connect(process_client) {
+			Some(h) => h,
+			None => return -1,
+		};
+		let started = process::Client::new(ChannelTransport { chan: launcher }).launch(name_str, &bootstrap);
+		close(launcher);
+		match started {
+			Some(Ok(s)) => s.task as i64,
+			_ => -1,
+		}
+	}
+}
+
+// Drive DeviceManager's phase 2 (M61 box 8): now that the system volume is mounted, hand
+// it a fresh StorageService connection over its control channel with a "DRIVERS" message,
+// so it loads the non-bootstrap drivers from vol://system/drivers/ and hands their channels
+// back - the net driver's frame channel, the gpu display channel, the snd control channel,
+// and the pointer event channel (each 0 when that device is absent). Kept for bootstrapping
+// NetworkService, ConsoleService, AudioService and InputService against the drivers.
+unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_raw: &mut u64, buf: &mut [u8]) {
+	unsafe {
+		if dm_control == 0 {
+			return;
+		}
+		let storage: u64 = service_connect(storage_client).unwrap_or(0);
+		if !send_blocking(dm_control, b"DRIVERS", storage) {
+			return;
+		}
+		if let Received::Message { handle: net, .. } = recv_blocking(dm_control, buf) {
+			*net_frames = net;
+		}
+		if let Received::Message { handle: gpu, .. } = recv_blocking(dm_control, buf) {
+			*gpu_client = gpu;
+		}
+		if let Received::Message { handle: snd, .. } = recv_blocking(dm_control, buf) {
+			*snd_client = snd;
+		}
+		if let Received::Message { handle: input, .. } = recv_blocking(dm_control, buf) {
+			*input_raw = input;
+		}
+	}
+}
+
 // Start one service: look it up in the package, spawn it with a fresh report
 // channel, wait for its "online" report, and relay that report up to `up`. Returns
 // the resulting state (Running on success, Failed otherwise).
@@ -359,20 +433,23 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // in, the supervisor records a structured "online" event in the journal.
 unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
-		// media_storage is a second instance of the storage_service binary, mounting the
-		// FAT disk as vol://media instead of the writable system disk; iso_storage is a
-		// third instance, mounting the ISO9660 disk as vol://iso; udf_storage is a fourth,
-		// mounting the UDF disk as vol://udf.
-		let elf_name: &[u8] = if name == b"media_storage" || name == b"iso_storage" || name == b"udf_storage" { b"storage_service" } else { name };
-		let elf: &[u8] = match package.lookup(elf_name) {
-			Some(e) => e,
-			None => return State::Failed,
-		};
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => return State::Failed,
 		};
-		let proc: i64 = spawn(elf, service_side);
+		// The pinned bootstrap set is raw-spawned from the init package (it is on the path
+		// to mounting the system volume, so it cannot load from it); every other service is
+		// loaded from the volume's `bin/` through ProcessService (M61 box 8). media / iso /
+		// udf storage are extra instances of the pinned storage_service binary.
+		let proc: i64 = if is_pinned(name) {
+			let elf_name: &[u8] = if name == b"media_storage" || name == b"iso_storage" || name == b"udf_storage" { b"storage_service" } else { name };
+			match package.lookup(elf_name) {
+				Some(elf) => spawn(elf, service_side),
+				None => return State::Failed,
+			}
+		} else {
+			launch_from_volume(*process_client, name, service_side)
+		};
 		if proc < 0 {
 			return State::Failed;
 		}
@@ -458,26 +535,13 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 					close(proc as u64);
 					*proc_out = 0;
 				}
-				// DeviceManager sends a follow-up "NET" message carrying the net driver's
-				// frame channel, then a "GPU" message carrying the gpu driver's display
-				// channel, then a "SND" message carrying the snd driver's control channel, then
-				// an "INPUT" message carrying the pointer driver's event channel; keep them to
-				// bootstrap NetworkService, ConsoleService, AudioService, and InputService
-				// against the drivers (each handle is 0 when that device is absent, e.g. under
-				// test).
+				// DeviceManager sends a follow-up "BLOCK2" message carrying the second disk's
+				// block service channel, then "BLOCK3" and "BLOCK4" for the third and fourth
+				// disks; keep them to bootstrap the media / iso / udf StorageService instances
+				// (each handle is 0 when that disk is absent). The net / gpu / snd / input
+				// driver channels arrive later, in DeviceManager's phase 2, once the volume they
+				// load from is mounted (driven right after StorageService comes up, below).
 				if name == b"device_manager" {
-					if let Received::Message { handle: net, .. } = recv_blocking(manager_side, buf) {
-						*net_frames = net;
-					}
-					if let Received::Message { handle: gpu, .. } = recv_blocking(manager_side, buf) {
-						*gpu_client = gpu;
-					}
-					if let Received::Message { handle: snd, .. } = recv_blocking(manager_side, buf) {
-						*snd_client = snd;
-					}
-					if let Received::Message { handle: input, .. } = recv_blocking(manager_side, buf) {
-						*input_raw = input;
-					}
 					if let Received::Message { handle: block2, .. } = recv_blocking(manager_side, buf) {
 						*block2_client = block2;
 					}
@@ -1163,7 +1227,9 @@ unsafe fn send_factory(manager_side: u64, tag: &[u8], root: u64) -> bool {
 // (the canary serves directly on its bootstrap channel, so the supervisor's end is both
 // the bootstrap peer and the control channel). Returns (Process, control), or (0, 0) on
 // failure. Waits for the canary's "online" report so the caller knows it is up before
-// exercising the restart and watchdog paths against it.
+// exercising the restart and watchdog paths against it. The canary is raw-spawned from
+// the package (not loaded from the volume) because the supervisor exercises it after
+// stopping DeviceManager - which drops virtio_blk, so the system volume is unavailable.
 unsafe fn spawn_canary(package: &Package, buf: &mut [u8]) -> (u64, u64) {
 	unsafe {
 		let elf: &[u8] = match package.lookup(b"watchdog_probe") {

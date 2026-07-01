@@ -69,30 +69,34 @@ fn conf_get<'a>(conf: &'a [(String, String)], key: &str) -> &'a str {
 }
 
 // The userspace programs staged at boot, the single source of truth for both archives.
-// Everything ships in the init package (a Limine module the kernel loads); the tools and
-// non-bootstrap drivers are additionally seeded onto the system volume under bin/ and
-// drivers/ (M61 box 7), so they can later be loaded from there.
+// The pinned bootstrap set (M61 box 8): the only programs kept in the init package.
+// Most are on the path to mounting the system volume - SystemManager and ServiceManager
+// (the launchers), LogService (every service depends on it), DeviceManager and the
+// StorageService (which brings the volume up), and ProcessService (which loads everything
+// else off the volume); a service on this path cannot itself be loaded from a volume that
+// is not mounted yet. The two probes are the exceptions: the supervisor raw-spawns
+// watchdog_probe during its self-test after stopping DeviceManager (which drops
+// virtio_blk, so the volume is gone), and ResourceManager spawns resource_probe into a
+// bounded sub-Domain (which ProcessService cannot do), so both ship in the package.
+// (package entry name, crate directory under ../user).
+const PINNED_SERVICES: [(&str, &str); 8] = [("system_manager", "system_manager"), ("service_manager", "services"), ("log_service", "services"), ("device_manager", "services"), ("process_service", "services"), ("storage_service", "storage"), ("watchdog_probe", "services"), ("resource_probe", "services")];
 
-// Services and managers - the resident userspace, spawned by SystemManager from the init
-// package. (package entry name, crate directory under ../user).
-const SERVICE_SOURCES: [(&str, &str); 26] = [("system_manager", "system_manager"), ("service_manager", "services"), ("log_service", "services"), ("device_manager", "services"), ("device_service", "services"), ("process_service", "services"), ("config_service", "services"), ("network_service", "services"), ("time_service", "services"), ("console_service", "services"), ("audio_service", "services"), ("input_service", "services"), ("system_graph_service", "services"), ("permission_manager", "services"), ("resource_manager", "services"), ("session_service", "services"), ("watchdog_probe", "services"), ("sandbox_probe", "services"), ("request_probe", "services"), ("resource_probe", "services"), ("wasi_host", "services"), ("component_host", "services"), ("file_picker", "services"), ("shell", "services"), ("storage_service", "storage"), ("storage_client", "storage")];
+// Every other service, manager and demo component: loaded from the system volume's `bin/`
+// via ProcessService, so they are staged onto the volume and NOT kept in the init package
+// (M61 box 8). (package entry name, crate directory under ../user).
+const VOLUME_SERVICES: [(&str, &str); 18] = [("device_service", "services"), ("config_service", "services"), ("network_service", "services"), ("time_service", "services"), ("console_service", "services"), ("audio_service", "services"), ("input_service", "services"), ("system_graph_service", "services"), ("permission_manager", "services"), ("resource_manager", "services"), ("session_service", "services"), ("sandbox_probe", "services"), ("request_probe", "services"), ("wasi_host", "services"), ("component_host", "services"), ("file_picker", "services"), ("shell", "services"), ("storage_client", "storage")];
 
 // The bootstrap block driver - it must ship in the init package because it backs the
 // system volume everything else is seeded onto, so it can never live on that volume.
 const BOOT_DRIVER_NAMES: [&str; 1] = ["virtio_blk"];
 
-// Non-bootstrap drivers - staged into the init package and onto the system volume under
-// drivers/.
+// Non-bootstrap drivers - loaded from the system volume under drivers/ (M61 box 8), so
+// staged there and not kept in the init package.
 const NONBOOT_DRIVER_NAMES: [&str; 5] = ["virtio_net", "virtio_console", "virtio_input", "virtio_gpu", "virtio_snd"];
 
-// Command-line tools - staged into the init package and onto the system volume under bin/.
+// Command-line tools - loaded from the system volume under bin/, so staged there and not
+// kept in the init package.
 const TOOL_NAMES: [&str; 31] = ["date", "cat", "write", "rm", "ls", "mkdir", "rmdir", "log", "snap", "dev", "config", "set", "beep", "usage", "ps", "run", "perm", "stop", "lsvol", "echo", "ping", "ip", "nslookup", "tcp", "nc", "arp", "httpd", "ss", "script", "ptyecho", "readln"];
-
-// Services that are also staged onto the system volume under bin/, so ProcessService can
-// load and launch them from there like any other program (M61 box 2). The shell is a
-// program ConsoleService starts through ProcessService, so it lives on the volume as
-// bin/shell (it still ships in the init package too, as the bring-up fallback).
-const STAGED_SERVICE_NAMES: [(&str, &str); 1] = [("shell", "services")];
 
 // The debug-build target path of a userspace ELF: each crate builds to its own target dir.
 fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
@@ -140,21 +144,16 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	let out_dir: PathBuf = manifest.join("../boot/.build");
 	let out_pkg: PathBuf = out_dir.join(conf_get(conf, "INIT_PACKAGE"));
 
-	// (package entry name, ELF path), built from the shared program lists: every service
-	// and manager, all drivers (the bootstrap one plus the non-bootstrap set) and every
-	// tool. The services and storage crates each produce several binaries.
+	// (package entry name, ELF path). The init package holds only the pinned bootstrap set
+	// (M61 box 8): the pinned services and the bootstrap block driver. Every other service,
+	// manager, driver and tool is loaded from the system volume, so it is staged there by
+	// assemble_volume_package instead.
 	let mut sources: Vec<(&str, PathBuf)> = Vec::new();
-	for (name, crate_dir) in SERVICE_SOURCES {
+	for (name, crate_dir) in PINNED_SERVICES {
 		sources.push((name, user_elf_path(&manifest, crate_dir, name)));
 	}
 	for name in BOOT_DRIVER_NAMES {
 		sources.push((name, user_elf_path(&manifest, "drivers", name)));
-	}
-	for name in NONBOOT_DRIVER_NAMES {
-		sources.push((name, user_elf_path(&manifest, "drivers", name)));
-	}
-	for name in TOOL_NAMES {
-		sources.push((name, user_elf_path(&manifest, "tools", name)));
 	}
 
 	fs::create_dir_all(&out_dir).unwrap_or_else(|e: std::io::Error| panic!("cannot create {}: {e}", out_dir.display()));
@@ -220,9 +219,9 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			None => println!("cargo:warning={name} ELF not found at {} - omitting from system volume (run `just user` or `just build`)", path.display()),
 		}
 	}
-	// M61 box 2: stage the shell (and any other launched service) under bin/ too, so
-	// ConsoleService can start it through ProcessService loading from the volume.
-	for (name, crate_dir) in STAGED_SERVICE_NAMES {
+	// M61 box 2 / box 8: stage the services, managers and demo components that load from
+	// the volume under bin/ too, so ProcessService can start them from there.
+	for (name, crate_dir) in VOLUME_SERVICES {
 		let path: PathBuf = user_elf_path(&manifest, crate_dir, name);
 		println!("cargo:rerun-if-changed={}", path.display());
 		match read_stripped(&path) {
