@@ -2,21 +2,27 @@
 //
 // DeviceManager launches this program with a "DEVICE" message carrying the
 // controller's DeviceInfo and a transferred DeviceMemory capability to its MMIO
-// BAR (the whole xHCI register file). The driver maps the BAR, resets the
+// BAR (the whole xHCI register file), followed by an "IRQ" message carrying the
+// controller's MSI-X Interrupt capability. The driver maps the BAR, resets the
 // controller, builds the device context base array, the command ring and the
 // event ring, starts the controller, and enumerates the root-hub ports: each
 // connected device is reset, given a device slot, addressed, and has its device
-// descriptor read over a control transfer on the default endpoint. It reports the
-// number of addressed devices and stands holding the controller; the USB class
-// drivers (HID keyboard, mass storage) grow on top of this bring-up in the next
-// steps. Synchronous and polled throughout - commands and transfers are one at a
-// time, completions are reaped by polling the event ring, matching the polled
-// virtio-blk/gpu drivers.
+// descriptor read over a control transfer on the default endpoint. A HID boot
+// keyboard found among them is configured (its interrupt IN endpoint brought up,
+// the boot protocol selected) and served interrupt-driven for the life of the
+// system: each report's key changes feed the interactive console through the
+// shared keys module, exactly like the virtio-input keyboard. Bring-up itself is
+// synchronous and polled - commands and transfers one at a time, completions
+// reaped off the event ring - matching the polled virtio-blk/gpu drivers.
 
 #![no_std]
 #![no_main]
 
+mod keys;
+
 use rt::*;
+
+use crate::keys::Mods;
 
 // Capability registers (at the mapped BAR base).
 const CAP_CAPLENGTH: u64 = 0x00; // u8: operational-register offset
@@ -37,6 +43,7 @@ const OP_PORTSC_BASE: u64 = 0x400; // + (port - 1) * 0x10
 // USBCMD bits.
 const CMD_RUN: u32 = 1 << 0;
 const CMD_HCRST: u32 = 1 << 1;
+const CMD_INTE: u32 = 1 << 2; // interrupter enable
 
 // USBSTS bits.
 const STS_HCHALTED: u32 = 1 << 0;
@@ -62,18 +69,26 @@ const SPEED_HIGH: u32 = 3;
 const SPEED_SUPER: u32 = 4;
 
 // Interrupter 0 registers (at base + RTSOFF + 0x20).
+const IR_IMAN: u64 = 0x00;
+const IR_IMOD: u64 = 0x04;
 const IR_ERSTSZ: u64 = 0x08;
 const IR_ERSTBA: u64 = 0x10;
 const IR_ERDP: u64 = 0x18;
 const ERDP_EHB: u64 = 1 << 3; // event handler busy (RW1C)
 
+// IMAN bits: interrupt pending (RW1C) and interrupt enable.
+const IMAN_IP: u32 = 1 << 0;
+const IMAN_IE: u32 = 1 << 1;
+
 // TRB types (control-word bits 15:10).
+const TRB_NORMAL: u32 = 1;
 const TRB_SETUP: u32 = 2;
 const TRB_DATA: u32 = 3;
 const TRB_STATUS: u32 = 4;
 const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_ADDRESS_DEVICE: u32 = 11;
+const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 const TRB_EVALUATE_CONTEXT: u32 = 13;
 const TRB_EV_TRANSFER: u32 = 32;
 const TRB_EV_CMD_COMPLETE: u32 = 33;
@@ -103,7 +118,21 @@ const SPIN_BUDGET: u32 = 10_000_000;
 
 // GET_DESCRIPTOR request fields.
 const REQ_GET_DESCRIPTOR: u8 = 6;
+const REQ_SET_CONFIGURATION: u8 = 9;
 const DESC_DEVICE: u16 = 1;
+const DESC_CONFIG: u16 = 2;
+
+// The HID class SET_PROTOCOL request (to the interface): wValue 0 selects the
+// fixed boot-report layout, so a keyboard's reports need no report descriptor.
+const HID_REQ_SET_PROTOCOL: u8 = 0x0b;
+
+// Descriptor types and the HID boot-keyboard identity within a configuration.
+const DT_INTERFACE: u8 = 4;
+const DT_ENDPOINT: u8 = 5;
+const CLASS_HID: u8 = 3;
+const SUBCLASS_BOOT: u8 = 1;
+const PROTOCOL_KEYBOARD: u8 = 1;
+const EP_ATTR_INTERRUPT: u8 = 3;
 
 unsafe fn r8(addr: u64) -> u8 {
 	unsafe { (addr as *const u8).read_volatile() }
@@ -134,6 +163,48 @@ unsafe fn dma_page() -> Option<(u64, u64, u64)> {
 	}
 }
 
+// One producer TRB ring (command or transfer): a zeroed DMA page of 256 TRBs whose
+// last slot is a link TRB back to the start (toggle cycle), so a ring pushed to
+// forever - the keyboard's interrupt endpoint - wraps correctly.
+struct Ring {
+	virt: u64,
+	phys: u64,
+	index: u64,
+	cycle: u32,
+}
+
+impl Ring {
+	// Allocate the ring page and plant the wrapping link TRB.
+	unsafe fn new() -> Option<Ring> {
+		unsafe {
+			let (_h, virt, phys): (u64, u64, u64) = dma_page()?;
+			let link: u64 = virt + (RING_TRBS - 1) * 16;
+			(link as *mut u64).write_volatile(phys);
+			((link + 12) as *mut u32).write_volatile(TRB_LINK << 10 | TRB_TOGGLE_CYCLE);
+			Some(Ring { virt, phys, index: 0, cycle: 1 })
+		}
+	}
+
+	// Push one TRB, following the link TRB (and toggling the cycle state) on wrap.
+	unsafe fn push(&mut self, param: u64, status: u32, control: u32) {
+		unsafe {
+			let trb: u64 = self.virt + self.index * 16;
+			(trb as *mut u64).write_volatile(param);
+			((trb + 8) as *mut u32).write_volatile(status);
+			((trb + 12) as *mut u32).write_volatile(control | self.cycle);
+			self.index += 1;
+			if self.index == RING_TRBS - 1 {
+				// consume the link TRB: give it the producer cycle and wrap.
+				let link: u64 = self.virt + self.index * 16;
+				let ctl: u32 = ((link + 12) as *const u32).read_volatile() & !TRB_CYCLE;
+				((link + 12) as *mut u32).write_volatile(ctl | self.cycle);
+				self.index = 0;
+				self.cycle ^= 1;
+			}
+		}
+	}
+}
+
 // The controller with its register windows resolved and its rings built.
 struct Xhci {
 	// Operational, runtime-interrupter-0 and doorbell-array register bases.
@@ -143,10 +214,8 @@ struct Xhci {
 	// 64-byte contexts when set (HCCPARAMS1.CSZ); 32-byte otherwise.
 	ctx_size: u64,
 	ports: u32,
-	// Command ring: virtual base, producer index and cycle state.
-	cmd_virt: u64,
-	cmd_index: u64,
-	cmd_cycle: u32,
+	// The command ring.
+	cmd: Ring,
 	// Event ring: virtual/physical base, consumer index and cycle state.
 	evt_virt: u64,
 	evt_phys: u64,
@@ -156,20 +225,29 @@ struct Xhci {
 	dcbaa_virt: u64,
 }
 
-// One addressed USB device: its slot, root-hub port, speed, and the default
-// endpoint's transfer ring (virtual/physical, producer index, cycle state).
+// One addressed USB device: its slot, root-hub port, speed, the default endpoint's
+// transfer ring, and the scratch pages enumeration reuses (the input context and
+// the control-transfer data page).
 struct UsbDevice {
 	slot: u32,
 	port: u32,
 	speed: u32,
-	ep0_virt: u64,
-	ep0_phys: u64,
-	ep0_index: u64,
-	ep0_cycle: u32,
+	ep0: Ring,
+	in_virt: u64,
+	in_phys: u64,
+	data_virt: u64,
+	data_phys: u64,
 	// The device descriptor's identity fields.
 	vendor: u16,
 	product: u16,
 	class: u8,
+}
+
+// A configured HID boot keyboard: the interrupt IN endpoint's device context index
+// and its transfer ring, on which 8-byte boot reports are posted and reaped.
+struct Keyboard {
+	dci: u32,
+	ring: Ring,
 }
 
 #[unsafe(no_mangle)]
@@ -182,6 +260,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Message { len, handle } if handle != 0 && len >= 6 + info_size && &buf[..6] == b"DEVICE" => (handle, (buf.as_ptr().add(6) as *const DeviceInfo).read_unaligned()),
 			_ => exit(),
 		};
+		// receive "IRQ" + the controller's MSI-X Interrupt capability (the keyboard
+		// service loop blocks on it; bring-up itself polls).
+		let irq: u64 = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } if handle != 0 && len >= 3 && &buf[..3] == b"IRQ" => handle,
+			_ => exit(),
+		};
 		// map the controller's register file.
 		let base: u64 = syscall(SYS_DEVICE_MEMORY_MAP, device_handle, 0, 0, 0);
 		if sys_is_err(base) {
@@ -191,18 +275,26 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(hc) => hc,
 			None => exit(),
 		};
-		// enumerate the root-hub ports and address every connected device.
+		// enumerate the root-hub ports, address every connected device, and configure
+		// the first HID boot keyboard found among them.
 		let mut devices: u32 = 0;
+		let mut keyboard: Option<(UsbDevice, Keyboard)> = None;
 		let mut port: u32 = 1;
 		while port <= hc.ports {
-			if let Some(dev) = attach_port(&mut hc, port) {
+			if let Some(mut dev) = attach_port(&mut hc, port) {
 				report_device(&dev);
 				devices += 1;
+				if keyboard.is_none()
+					&& let Some(kb) = configure_keyboard(&mut hc, &mut dev)
+				{
+					keyboard = Some((dev, kb));
+				}
 			}
 			port += 1;
 		}
-		// report in, then stand holding the controller until DeviceManager drops the
-		// bootstrap channel.
+		// report in, then serve the keyboard interrupt-driven for the life of the
+		// system - or, with no keyboard, stand holding the controller until
+		// DeviceManager drops the bootstrap channel.
 		let mut report: [u8; 64] = [0u8; 64];
 		let mut n: usize = 0;
 		for &b in b"driver.xhci: online (" {
@@ -214,7 +306,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			report[n] = b;
 			n += 1;
 		}
+		if keyboard.is_some() {
+			for &b in b" (keyboard)" {
+				report[n] = b;
+				n += 1;
+			}
+		}
 		send_blocking(bootstrap, &report[..n], 0);
+		if let Some((mut dev, mut kb)) = keyboard {
+			keyboard_loop(&mut hc, &mut dev, &mut kb, irq);
+		}
 		let _ = recv_blocking(bootstrap, &mut buf);
 	}
 	exit();
@@ -259,11 +360,8 @@ unsafe fn bring_up(base: u64) -> Option<Xhci> {
 		w64(op + OP_DCBAAP, dcbaa_phys);
 
 		// the command ring, with a link TRB in the last slot wrapping it (toggle cycle).
-		let (_ch, cmd_virt, cmd_phys): (u64, u64, u64) = dma_page()?;
-		let link: u64 = cmd_virt + (RING_TRBS - 1) * 16;
-		(link as *mut u64).write_volatile(cmd_phys);
-		((link + 12) as *mut u32).write_volatile(TRB_LINK << 10 | TRB_TOGGLE_CYCLE);
-		w64(op + OP_CRCR, cmd_phys | 1);
+		let cmd: Ring = Ring::new()?;
+		w64(op + OP_CRCR, cmd.phys | 1);
 
 		// a one-segment event ring on interrupter 0: the segment table needs one
 		// 16-byte entry, carved from the tail of the DCBAA page (64-byte aligned).
@@ -276,13 +374,18 @@ unsafe fn bring_up(base: u64) -> Option<Xhci> {
 		w32(ir0 + IR_ERSTSZ, 1);
 		w64(ir0 + IR_ERSTBA, erst_phys);
 		w64(ir0 + IR_ERDP, evt_phys);
+		// enable interrupter 0 with no moderation: each event raises the controller's
+		// MSI-X vector (the keyboard service loop blocks on it; bring-up polls, which
+		// interrupts do not disturb).
+		w32(ir0 + IR_IMOD, 0);
+		w32(ir0 + IR_IMAN, IMAN_IE | IMAN_IP);
 
-		// enable every device slot and start the controller.
+		// enable every device slot and start the controller (with interrupts on).
 		w32(op + OP_CONFIG, slots);
-		w32(op + OP_USBCMD, r32(op + OP_USBCMD) | CMD_RUN);
+		w32(op + OP_USBCMD, r32(op + OP_USBCMD) | CMD_RUN | CMD_INTE);
 		wait_clear(op + OP_USBSTS, STS_HCHALTED)?;
 
-		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd_virt, cmd_index: 0, cmd_cycle: 1, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, dcbaa_virt })
+		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, dcbaa_virt })
 	}
 }
 
@@ -330,48 +433,45 @@ unsafe fn portsc_write(hc: &Xhci, port: u32, set: u32) {
 	}
 }
 
-// Push one TRB onto the command ring (following the link TRB on wrap) and ring the
-// command doorbell.
+// Push one TRB onto the command ring and ring the command doorbell.
 unsafe fn command(hc: &mut Xhci, param: u64, status: u32, control: u32) {
 	unsafe {
-		let trb: u64 = hc.cmd_virt + hc.cmd_index * 16;
-		(trb as *mut u64).write_volatile(param);
-		((trb + 8) as *mut u32).write_volatile(status);
-		((trb + 12) as *mut u32).write_volatile(control | hc.cmd_cycle);
-		hc.cmd_index += 1;
-		if hc.cmd_index == RING_TRBS - 1 {
-			// consume the link TRB: give it the producer cycle and wrap.
-			let link: u64 = hc.cmd_virt + hc.cmd_index * 16;
-			let ctl: u32 = ((link + 12) as *const u32).read_volatile() & !TRB_CYCLE;
-			((link + 12) as *mut u32).write_volatile(ctl | hc.cmd_cycle);
-			hc.cmd_index = 0;
-			hc.cmd_cycle ^= 1;
-		}
+		hc.cmd.push(param, status, control);
 		w32(hc.db, 0);
 	}
 }
 
-// Poll the event ring until an event of `wanted` type arrives, acknowledging the
-// dequeue pointer as events are consumed. Port-status-change events are skipped
-// (enumeration reads PORTSC directly). Returns (param, status, control) of the
-// matching event, or None on budget exhaustion or an unexpected event type.
+// Take one event off the event ring if one is pending, publishing the new dequeue
+// pointer. Returns (param, status, control), or None when the ring is empty.
+unsafe fn take_event(hc: &mut Xhci) -> Option<(u64, u32, u32)> {
+	unsafe {
+		let trb: u64 = hc.evt_virt + hc.evt_index * 16;
+		let control: u32 = ((trb + 12) as *const u32).read_volatile();
+		if control & TRB_CYCLE != hc.evt_cycle {
+			return None;
+		}
+		let param: u64 = (trb as *const u64).read_volatile();
+		let status: u32 = ((trb + 8) as *const u32).read_volatile();
+		hc.evt_index += 1;
+		if hc.evt_index == RING_TRBS {
+			hc.evt_index = 0;
+			hc.evt_cycle ^= 1;
+		}
+		w64(hc.ir0 + IR_ERDP, hc.evt_phys + hc.evt_index * 16 | ERDP_EHB);
+		Some((param, status, control))
+	}
+}
+
+// Poll the event ring until an event of `wanted` type arrives. Port-status-change
+// events are skipped (enumeration reads PORTSC directly). Returns (param, status,
+// control) of the matching event, or None on budget exhaustion or an unexpected
+// event type.
 unsafe fn wait_event(hc: &mut Xhci, wanted: u32) -> Option<(u64, u32, u32)> {
 	unsafe {
 		let mut spins: u32 = 0;
 		loop {
-			let trb: u64 = hc.evt_virt + hc.evt_index * 16;
-			let control: u32 = ((trb + 12) as *const u32).read_volatile();
-			if control & TRB_CYCLE == hc.evt_cycle {
-				let param: u64 = (trb as *const u64).read_volatile();
-				let status: u32 = ((trb + 8) as *const u32).read_volatile();
+			if let Some((param, status, control)) = take_event(hc) {
 				let kind: u32 = control >> 10 & 0x3f;
-				// consume the event and publish the new dequeue pointer.
-				hc.evt_index += 1;
-				if hc.evt_index == RING_TRBS {
-					hc.evt_index = 0;
-					hc.evt_cycle ^= 1;
-				}
-				w64(hc.ir0 + IR_ERDP, hc.evt_phys + hc.evt_index * 16 | ERDP_EHB);
 				if kind == wanted {
 					return Some((param, status, control));
 				}
@@ -431,29 +531,28 @@ unsafe fn attach_port(hc: &mut Xhci, port: u32) -> Option<UsbDevice> {
 		}
 		let (_dh, _ctx_virt, ctx_phys): (u64, u64, u64) = dma_page()?;
 		((hc.dcbaa_virt + slot as u64 * 8) as *mut u64).write_volatile(ctx_phys);
-		let (_th, ep0_virt, ep0_phys): (u64, u64, u64) = dma_page()?;
 
-		let mut dev: UsbDevice = UsbDevice { slot, port, speed, ep0_virt, ep0_phys, ep0_index: 0, ep0_cycle: 1, vendor: 0, product: 0, class: 0 };
+		let (_ih, in_virt, in_phys): (u64, u64, u64) = dma_page()?;
+		let (_bh, data_virt, data_phys): (u64, u64, u64) = dma_page()?;
+		let mut dev: UsbDevice = UsbDevice { slot, port, speed, ep0: Ring::new()?, in_virt, in_phys, data_virt, data_phys, vendor: 0, product: 0, class: 0 };
 
 		// address the device: an input context whose slot context names the port and
 		// whose endpoint-0 context points at the transfer ring.
-		let (_ih, in_virt, in_phys): (u64, u64, u64) = dma_page()?;
-		write_address_contexts(hc, &dev, in_virt, initial_packet_size(speed));
+		write_address_contexts(hc, &dev, initial_packet_size(speed));
 		command_and_wait(hc, in_phys, 0, TRB_ADDRESS_DEVICE << 10 | slot << 24)?;
 
 		// read the descriptor head first: its bMaxPacketSize0 field tells the real
 		// default-endpoint packet size, which full-speed devices are allowed to vary.
-		let (_bh, data_virt, data_phys): (u64, u64, u64) = dma_page()?;
-		control_in(hc, &mut dev, DESC_DEVICE, 8, data_phys)?;
+		control_in(hc, &mut dev, DESC_DEVICE, 8)?;
 		let mps: u32 = r8(data_virt + 7) as u32;
 		if mps != initial_packet_size(speed) && mps >= 8 {
 			// fix endpoint 0 up with an evaluate-context command, then re-read.
-			write_address_contexts(hc, &dev, in_virt, mps);
+			write_address_contexts(hc, &dev, mps);
 			// evaluate-context consumes only the endpoint-0 add flag.
 			((in_virt + 4) as *mut u32).write_volatile(1 << 1);
 			command_and_wait(hc, in_phys, 0, TRB_EVALUATE_CONTEXT << 10 | slot << 24)?;
 		}
-		control_in(hc, &mut dev, DESC_DEVICE, 18, data_phys)?;
+		control_in(hc, &mut dev, DESC_DEVICE, 18)?;
 		dev.class = r8(data_virt + 4);
 		dev.vendor = r8(data_virt + 8) as u16 | (r8(data_virt + 9) as u16) << 8;
 		dev.product = r8(data_virt + 10) as u16 | (r8(data_virt + 11) as u16) << 8;
@@ -472,59 +571,213 @@ fn initial_packet_size(speed: u32) -> u32 {
 	}
 }
 
-// Fill the input context at `in_virt` for an address-device command: the input
+// Fill the device's input context for an address-device command: the input
 // control context adds the slot and endpoint-0 contexts, the slot context names
 // the root-hub port and speed, and the endpoint-0 context is a control endpoint
 // with max packet size `mps` whose transfer ring is the device's.
-unsafe fn write_address_contexts(hc: &Xhci, dev: &UsbDevice, in_virt: u64, mps: u32) {
+unsafe fn write_address_contexts(hc: &Xhci, dev: &UsbDevice, mps: u32) {
 	unsafe {
-		core::ptr::write_bytes(in_virt as *mut u8, 0, 4096);
+		core::ptr::write_bytes(dev.in_virt as *mut u8, 0, 4096);
 		// input control context: add slot (A0) + endpoint 0 (A1).
-		((in_virt + 4) as *mut u32).write_volatile(0x3);
+		((dev.in_virt + 4) as *mut u32).write_volatile(0x3);
 		// slot context: one context entry, the device's speed and root-hub port.
-		let slot_ctx: u64 = in_virt + hc.ctx_size;
+		let slot_ctx: u64 = dev.in_virt + hc.ctx_size;
 		(slot_ctx as *mut u32).write_volatile(1 << 27 | dev.speed << 20);
 		((slot_ctx + 4) as *mut u32).write_volatile(dev.port << 16);
 		// endpoint-0 context: a control endpoint (type 4), error count 3, the ring's
 		// physical base with the producer's cycle state, average TRB length 8.
-		let ep0_ctx: u64 = in_virt + 2 * hc.ctx_size;
+		let ep0_ctx: u64 = dev.in_virt + 2 * hc.ctx_size;
 		((ep0_ctx + 4) as *mut u32).write_volatile(mps << 16 | 4 << 3 | 3 << 1);
-		((ep0_ctx + 8) as *mut u32).write_volatile((dev.ep0_phys | dev.ep0_cycle as u64) as u32);
-		((ep0_ctx + 12) as *mut u32).write_volatile((dev.ep0_phys >> 32) as u32);
+		((ep0_ctx + 8) as *mut u32).write_volatile((dev.ep0.phys | dev.ep0.cycle as u64) as u32);
+		((ep0_ctx + 12) as *mut u32).write_volatile((dev.ep0.phys >> 32) as u32);
 		((ep0_ctx + 16) as *mut u32).write_volatile(8);
 	}
 }
 
-// Push one TRB onto the device's default-endpoint transfer ring. The ring is one
-// page and enumeration pushes only a handful of TRBs, so no link TRB is needed.
-unsafe fn push_ep0(dev: &mut UsbDevice, param: u64, status: u32, control: u32) {
-	unsafe {
-		let trb: u64 = dev.ep0_virt + dev.ep0_index * 16;
-		(trb as *mut u64).write_volatile(param);
-		((trb + 8) as *mut u32).write_volatile(status);
-		((trb + 12) as *mut u32).write_volatile(control | dev.ep0_cycle);
-		dev.ep0_index += 1;
-	}
-}
-
-// Read `len` bytes of descriptor `desc` from the device into the DMA page at
-// `data_phys` with a GET_DESCRIPTOR control transfer on the default endpoint:
-// setup stage (the 8-byte request rides in the TRB itself), IN data stage, OUT
-// status stage, then the doorbell and the transfer completion event.
-unsafe fn control_in(hc: &mut Xhci, dev: &mut UsbDevice, desc: u16, len: u16, data_phys: u64) -> Option<()> {
+// Read `len` bytes of descriptor `desc` from the device into its data page with a
+// GET_DESCRIPTOR control transfer on the default endpoint: setup stage (the 8-byte
+// request rides in the TRB itself), IN data stage, OUT status stage, then the
+// doorbell and the transfer completion event.
+unsafe fn control_in(hc: &mut Xhci, dev: &mut UsbDevice, desc: u16, len: u16) -> Option<()> {
 	unsafe {
 		let request: u64 = 0x80 | (REQ_GET_DESCRIPTOR as u64) << 8 | ((desc << 8) as u64) << 16 | (len as u64) << 48;
-		push_ep0(dev, request, 8, TRB_SETUP << 10 | TRB_IDT | TRB_TRT_IN);
-		push_ep0(dev, data_phys, len as u32, TRB_DATA << 10 | TRB_DIR_IN);
-		push_ep0(dev, 0, 0, TRB_STATUS << 10 | TRB_IOC);
+		dev.ep0.push(request, 8, TRB_SETUP << 10 | TRB_IDT | TRB_TRT_IN);
+		dev.ep0.push(dev.data_phys, len as u32, TRB_DATA << 10 | TRB_DIR_IN);
+		dev.ep0.push(0, 0, TRB_STATUS << 10 | TRB_IOC);
 		// ring the device slot's doorbell for the default control endpoint (DCI 1).
 		w32(hc.db + dev.slot as u64 * 4, 1);
 		let (_p, status, _c): (u64, u32, u32) = wait_event(hc, TRB_EV_TRANSFER)?;
 		let code: u32 = status >> 24;
-		if code != CC_SUCCESS && code != CC_SHORT_PACKET {
-			None
-		} else {
-			Some(())
+		if code != CC_SUCCESS && code != CC_SHORT_PACKET { None } else { Some(()) }
+	}
+}
+
+// Issue a data-less control request (SET_CONFIGURATION, the HID SET_PROTOCOL) on
+// the default endpoint: a setup stage with no data stage, then the IN-direction
+// status stage, the doorbell and the completion event.
+unsafe fn control_nodata(hc: &mut Xhci, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16) -> Option<()> {
+	unsafe {
+		let setup: u64 = request_type as u64 | (request as u64) << 8 | (value as u64) << 16 | (index as u64) << 32;
+		dev.ep0.push(setup, 8, TRB_SETUP << 10 | TRB_IDT);
+		dev.ep0.push(0, 0, TRB_STATUS << 10 | TRB_DIR_IN | TRB_IOC);
+		w32(hc.db + dev.slot as u64 * 4, 1);
+		let (_p, status, _c): (u64, u32, u32) = wait_event(hc, TRB_EV_TRANSFER)?;
+		if status >> 24 != CC_SUCCESS { None } else { Some(()) }
+	}
+}
+
+// Configure the device's HID boot keyboard, if it has one: read the configuration
+// descriptor, find a boot-keyboard interface (HID class, boot subclass, keyboard
+// protocol) and its interrupt IN endpoint, bring that endpoint up with a
+// configure-endpoint command, select the configuration on the device, and put the
+// keyboard into the fixed boot-report protocol. None when the device carries no
+// boot keyboard or any step fails.
+unsafe fn configure_keyboard(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Keyboard> {
+	unsafe {
+		// the configuration descriptor head names the total length; read it whole.
+		control_in(hc, dev, DESC_CONFIG, 9)?;
+		let total: u16 = (r8(dev.data_virt + 2) as u16 | (r8(dev.data_virt + 3) as u16) << 8).min(1024);
+		let config_value: u16 = r8(dev.data_virt + 5) as u16;
+		control_in(hc, dev, DESC_CONFIG, total)?;
+
+		// walk the descriptors for a boot-keyboard interface, then its interrupt IN
+		// endpoint (the descriptors that follow the interface until the next one).
+		let mut offset: u64 = 0;
+		let mut in_keyboard: bool = false;
+		let mut iface: u16 = 0;
+		let mut found: Option<(u32, u32, u32)> = None; // (dci, mps, interval)
+		while offset + 2 <= total as u64 {
+			let length: u64 = r8(dev.data_virt + offset) as u64;
+			let kind: u8 = r8(dev.data_virt + offset + 1);
+			if length < 2 {
+				break;
+			}
+			if kind == DT_INTERFACE {
+				in_keyboard = r8(dev.data_virt + offset + 5) == CLASS_HID && r8(dev.data_virt + offset + 6) == SUBCLASS_BOOT && r8(dev.data_virt + offset + 7) == PROTOCOL_KEYBOARD;
+				if in_keyboard {
+					iface = r8(dev.data_virt + offset + 2) as u16;
+				}
+			}
+			if kind == DT_ENDPOINT && in_keyboard && found.is_none() {
+				let ep_addr: u8 = r8(dev.data_virt + offset + 2);
+				let attrs: u8 = r8(dev.data_virt + offset + 3);
+				if ep_addr & 0x80 != 0 && attrs & 0x3 == EP_ATTR_INTERRUPT {
+					let mps: u32 = r8(dev.data_virt + offset + 4) as u32 | (r8(dev.data_virt + offset + 5) as u32) << 8;
+					let interval: u32 = ep_interval(dev.speed, r8(dev.data_virt + offset + 6) as u32);
+					found = Some(((ep_addr & 0xf) as u32 * 2 + 1, mps, interval));
+				}
+			}
+			offset += length;
+		}
+		let (dci, mps, interval): (u32, u32, u32) = found?;
+
+		// bring the endpoint up: the input context adds the slot context (its context
+		// entries grown to cover the new DCI) and the interrupt IN endpoint context.
+		let ring: Ring = Ring::new()?;
+		core::ptr::write_bytes(dev.in_virt as *mut u8, 0, 4096);
+		((dev.in_virt + 4) as *mut u32).write_volatile(1 | 1 << dci);
+		let slot_ctx: u64 = dev.in_virt + hc.ctx_size;
+		(slot_ctx as *mut u32).write_volatile(dci << 27 | dev.speed << 20);
+		((slot_ctx + 4) as *mut u32).write_volatile(dev.port << 16);
+		// endpoint context: interrupt IN (type 7), error count 3, the polling
+		// interval, the ring's base, and the report size as the average/ESIT payload.
+		let ep_ctx: u64 = dev.in_virt + (1 + dci as u64) * hc.ctx_size;
+		(ep_ctx as *mut u32).write_volatile(interval << 16);
+		((ep_ctx + 4) as *mut u32).write_volatile(mps << 16 | 7 << 3 | 3 << 1);
+		((ep_ctx + 8) as *mut u32).write_volatile((ring.phys | ring.cycle as u64) as u32);
+		((ep_ctx + 12) as *mut u32).write_volatile((ring.phys >> 32) as u32);
+		((ep_ctx + 16) as *mut u32).write_volatile(8 | mps << 16);
+		command_and_wait(hc, dev.in_phys, 0, TRB_CONFIGURE_ENDPOINT << 10 | dev.slot << 24)?;
+
+		// select the configuration, then the boot protocol (the fixed 8-byte report).
+		control_nodata(hc, dev, 0x00, REQ_SET_CONFIGURATION, config_value, 0)?;
+		control_nodata(hc, dev, 0x21, HID_REQ_SET_PROTOCOL, 0, iface)?;
+		Some(Keyboard { dci, ring })
+	}
+}
+
+// The xHCI endpoint-context interval field for an interrupt endpoint: the exponent
+// of the service interval in 125 us microframes. High/SuperSpeed descriptors carry
+// the exponent + 1 already; a full/low-speed bInterval counts 1 ms frames, so find
+// the smallest exponent whose period covers it (bInterval * 8 microframes).
+fn ep_interval(speed: u32, b_interval: u32) -> u32 {
+	if speed == SPEED_HIGH || speed == SPEED_SUPER {
+		return b_interval.clamp(1, 16) - 1;
+	}
+	let mut exp: u32 = 3;
+	while exp < 15 && 1 << (exp - 3) < b_interval {
+		exp += 1;
+	}
+	exp
+}
+
+// Serve the keyboard for the life of the system: keep one 8-byte report TRB posted
+// on its interrupt endpoint, block on the controller's MSI-X interrupt, and feed
+// each arriving report's key changes into the console through the shared keys
+// module. The device only completes a report TRB when the key state changes, so
+// the loop sleeps between keystrokes.
+unsafe fn keyboard_loop(hc: &mut Xhci, dev: &mut UsbDevice, kb: &mut Keyboard, irq: u64) -> ! {
+	unsafe {
+		let mut mods: Mods = Mods::default();
+		let mut prev: [u8; 8] = [0u8; 8];
+		loop {
+			kb.ring.push(dev.data_phys, 8, TRB_NORMAL << 10 | TRB_IOC);
+			w32(hc.db + dev.slot as u64 * 4, kb.dci);
+			// wait for the report's transfer event, sleeping on the interrupt.
+			loop {
+				if let Some((_p, status, control)) = take_event(hc) {
+					let kind: u32 = control >> 10 & 0x3f;
+					let code: u32 = status >> 24;
+					if kind == TRB_EV_TRANSFER && (code == CC_SUCCESS || code == CC_SHORT_PACKET) {
+						break;
+					}
+					continue;
+				}
+				wait(irq, 0);
+				interrupt_ack(irq);
+				// clear the interrupter's pending flag so the next event edge fires.
+				w32(hc.ir0 + IR_IMAN, IMAN_IE | IMAN_IP);
+			}
+			let mut report: [u8; 8] = [0u8; 8];
+			for (i, slot) in report.iter_mut().enumerate() {
+				*slot = r8(dev.data_virt + i as u64);
+			}
+			feed_report(&prev, &report, &mut mods);
+			prev = report;
+		}
+	}
+}
+
+// Diff one HID boot report against the previous one and feed the changes as key
+// events: byte 0 carries the modifier bitmask, bytes 2..8 the pressed keys' usage
+// ids (1..3 are the keyboard's error codes, skipped). Releases are fed first so a
+// fast key swap cannot double-modify.
+unsafe fn feed_report(prev: &[u8; 8], report: &[u8; 8], mods: &mut Mods) {
+	unsafe {
+		for bit in 0..8u8 {
+			let mask: u8 = 1 << bit;
+			if prev[0] & mask != report[0] & mask {
+				let code: u16 = keys::HID_MODIFIER_KEYCODES[bit as usize];
+				if code != 0 {
+					keys::feed_key(code, (report[0] & mask != 0) as u32, mods);
+				}
+			}
+		}
+		for &usage in &prev[2..8] {
+			if usage > 3 && !report[2..8].contains(&usage) {
+				let code: u16 = keys::hid_keycode(usage);
+				if code != 0 {
+					keys::feed_key(code, 0, mods);
+				}
+			}
+		}
+		for &usage in &report[2..8] {
+			if usage > 3 && !prev[2..8].contains(&usage) {
+				let code: u16 = keys::hid_keycode(usage);
+				if code != 0 {
+					keys::feed_key(code, 1, mods);
+				}
+			}
 		}
 	}
 }

@@ -2063,25 +2063,38 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// The userspace xhci driver, driven the way DeviceManager drives it: spawn its
 	// staged ELF (it lives on the system volume under drivers/, not in the init
 	// package) with a bootstrap channel, hand it "DEVICE" + the controller's
-	// DeviceInfo + a DeviceMemory capability to its register file, and wait for its
-	// report. The driver resets the controller, builds the command and event rings,
-	// enumerates the root-hub ports, addresses each connected device and reads its
-	// device descriptor - QEMU hangs one USB keyboard off the controller (see
-	// qemu-run.sh), so exactly one device must come back addressed.
+	// DeviceInfo + a DeviceMemory capability to its register file and "IRQ" + its
+	// MSI-X Interrupt capability, and wait for its report. The driver resets the
+	// controller, builds the command and event rings, enumerates the root-hub
+	// ports, addresses each connected device and reads its device descriptor - QEMU
+	// hangs one USB keyboard off the controller (see qemu-run.sh), so exactly one
+	// device must come back addressed (and its HID boot keyboard configured, which
+	// the report only follows).
 	let (volume, _package) = scenario_packages().expect("boot modules should be present");
 	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/xhci")).expect("the xhci driver should be staged on the volume under drivers/");
 
 	// find the controller in the device table and mint its MMIO capability.
-	let mut found: Option<(abi::DeviceInfo, u64, u64)> = None;
+	let mut found: Option<(abi::DeviceInfo, u64, u64, usize)> = None;
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_XHCI {
 			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset }).unwrap();
-			found = Some((info, entry.1, entry.2));
+			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
 	}
-	let (info, bar_phys, bar_len) = found.expect("the device table should hold the xHCI controller");
+	let (info, bar_phys, bar_len, index) = found.expect("the device table should hold the xHCI controller");
+
+	// mint the controller's MSI-X Interrupt the way sys_device_msix_acquire does:
+	// reserve a vector, program table entry 0, bind the Interrupt object to the
+	// vector, and enable MSI-X on the function.
+	let (msix_cap, table_phys, bus, dev, func) = device::with(index, |d| (d.msix_cap, d.msix_table_phys, d.bus, d.dev, d.func)).unwrap();
+	assert!(msix_cap != 0, "the xHCI controller should expose MSI-X");
+	let dest = arch::percpu::this_cpu().lapic_id() as u8;
+	let vector = arch::interrupts::acquire_msi(table_phys, dest).expect("an MSI vector should be free");
+	let interrupt = object::interrupt::Interrupt::new(vector);
+	assert!(arch::interrupts::bind_msi(vector, &interrupt), "the MSI vector should bind");
+	arch::pci::msix_enable(bus, dev, func, msix_cap);
 
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL, 0).expect("the xhci driver should load");
@@ -2089,10 +2102,11 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	msg.extend_from_slice(b"DEVICE");
 	msg.extend_from_slice(unsafe { core::slice::from_raw_parts(&info as *const abi::DeviceInfo as *const u8, core::mem::size_of::<abi::DeviceInfo>()) });
 	send_cap(&kernel_ep, &msg, DeviceMemory::new(bar_phys, bar_len as usize), Rights::ALL).expect("the DEVICE handoff should send");
+	send_cap(&kernel_ep, b"IRQ", interrupt, Rights::ALL).expect("the IRQ handoff should send");
 	sched::run_until_idle();
 
 	let report = kernel_ep.recv().expect("the xhci driver should report in");
-	assert_eq!(&report.bytes[..], b"driver.xhci: online (1 device(s))", "the driver should bring the controller up and address the QEMU USB keyboard");
+	assert_eq!(&report.bytes[..], b"driver.xhci: online (1 device(s)) (keyboard)", "the driver should address the QEMU USB keyboard and configure its HID boot interface");
 }
 
 #[cfg(test)]
