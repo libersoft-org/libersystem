@@ -591,6 +591,15 @@ record job-entry {
 	proc: handle<task>,
 }
 
+// One environment variable of a session: a name and its value. `PATH` is one such
+// variable (seeded with a default), so a search path and user-defined variables share the
+// same table. The shell expands `$name` references against it and persists edits in the
+// session, so the environment survives a shell restart the way the cwd and jobs do.
+record env-var {
+	name:  string,
+	value: string,
+}
+
 // The SessionService contract: a login session is a long-lived object owning the
 // working directory, the environment, and the job table, so the shell and the tools it
 // runs are clients of the session rather than its owner. A shell logout or restart
@@ -608,14 +617,24 @@ record job-entry {
 // (the session signals it SIG_CONT), and `take` removes a job and hands its Process handle
 // back to a shell that is foregrounding it. The session does the waiting and signalling
 // because it, not the shell, owns the handle - so the jobs outlive any one shell.
+//
+// The environment: `env-get` reads one variable, `env-set` creates or overwrites one,
+// `env-unset` removes one, and `env-list` enumerates them all. `PATH` is seeded with a
+// default. The shell manages these on the user's behalf (`name=value`, `env`, `unset`,
+// `$name` expansion) and the values persist in the session across a shell restart.
 interface session {
-	@op(1) cwd:          func() -> result<string, error>;
-	@op(2) chdir:        func(path: string) -> result<unit, error>;
-	@op(3) job-register: func(name: string, stopped: bool, proc: handle<task>) -> result<u32, error>;
-	@op(4) job-take:     func(id: u32) -> result<job-entry, error>;
-	@op(5) job-list:     func() -> result<list<job-info>, error>;
-	@op(6) job-reap:     func() -> result<list<job-info>, error>;
-	@op(7) job-resume:   func(id: u32) -> result<job-info, error>;
+	@op(1)  cwd:          func() -> result<string, error>;
+	@op(2)  chdir:        func(path: string) -> result<unit, error>;
+	@op(3)  job-register: func(name: string, stopped: bool, proc: handle<task>) -> result<u32, error>;
+	@op(4)  job-take:     func(id: u32) -> result<job-entry, error>;
+	@op(5)  job-list:     func() -> result<list<job-info>, error>;
+	@op(6)  job-reap:     func() -> result<list<job-info>, error>;
+	@op(7)  job-resume:   func(id: u32) -> result<job-info, error>;
+	@op(8)  env-get:      func(name: string) -> result<string, error>;
+	@op(9)  env-set:      func(name: string, value: string) -> result<unit, error>;
+	@op(10) env-unset:    func(name: string) -> result<unit, error>;
+	@op(11) env-list:     func() -> result<list<env-var>, error>;
 }
+
 
 

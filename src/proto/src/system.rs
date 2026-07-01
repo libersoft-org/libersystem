@@ -4152,6 +4152,38 @@ impl JobEntry {
 	}
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvVar {
+	pub name: String,
+	pub value: String,
+}
+
+impl EnvVar {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Vec<u8> {
+		let mut w = VecWriter::new();
+		let _ = self.write(&mut w);
+		w.into_inner()
+	}
+	pub fn decode(bytes: &[u8]) -> Option<EnvVar> {
+		EnvVar::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.name.as_bytes())?;
+		w.bytes_lp(self.value.as_bytes())?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<EnvVar> {
+		let name = r.string_lp()?;
+		let value = r.string_lp()?;
+		Some(EnvVar { name, value })
+	}
+}
+
 // interface `session` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod session {
 	use super::*;
@@ -4165,6 +4197,10 @@ pub mod session {
 	pub const OP_JOB_LIST: u16 = 5;
 	pub const OP_JOB_REAP: u16 = 6;
 	pub const OP_JOB_RESUME: u16 = 7;
+	pub const OP_ENV_GET: u16 = 8;
+	pub const OP_ENV_SET: u16 = 9;
+	pub const OP_ENV_UNSET: u16 = 10;
+	pub const OP_ENV_LIST: u16 = 11;
 
 	pub trait Service {
 		fn cwd(&mut self) -> Result<String, Error>;
@@ -4174,6 +4210,10 @@ pub mod session {
 		fn job_list(&mut self) -> Result<Vec<JobInfo>, Error>;
 		fn job_reap(&mut self) -> Result<Vec<JobInfo>, Error>;
 		fn job_resume(&mut self, id: u32) -> Result<JobInfo, Error>;
+		fn env_get(&mut self, name: String) -> Result<String, Error>;
+		fn env_set(&mut self, name: String, value: String) -> Result<(), Error>;
+		fn env_unset(&mut self, name: String) -> Result<(), Error>;
+		fn env_list(&mut self) -> Result<Vec<EnvVar>, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -4296,6 +4336,66 @@ pub mod session {
 					}
 				}
 			}
+			OP_ENV_GET => {
+				let name = r.string_lp()?;
+				let result = service.env_get(name);
+				match &result {
+					Ok(v169) => {
+						w.u8(1)?;
+						w.bytes_lp(v169.as_bytes())?;
+					}
+					Err(v170) => {
+						w.u8(0)?;
+						v170.write(w)?;
+					}
+				}
+			}
+			OP_ENV_SET => {
+				let name = r.string_lp()?;
+				let value = r.string_lp()?;
+				let result = service.env_set(name, value);
+				match &result {
+					Ok(v171) => {
+						w.u8(1)?;
+					}
+					Err(v172) => {
+						w.u8(0)?;
+						v172.write(w)?;
+					}
+				}
+			}
+			OP_ENV_UNSET => {
+				let name = r.string_lp()?;
+				let result = service.env_unset(name);
+				match &result {
+					Ok(v173) => {
+						w.u8(1)?;
+					}
+					Err(v174) => {
+						w.u8(0)?;
+						v174.write(w)?;
+					}
+				}
+			}
+			OP_ENV_LIST => {
+				let result = service.env_list();
+				match &result {
+					Ok(v175) => {
+						w.u8(1)?;
+						if v175.len() > u16::MAX as usize {
+							return None;
+						}
+						w.u16(v175.len() as u16)?;
+						for v177 in v175.iter() {
+							v177.write(w)?;
+						}
+					}
+					Err(v176) => {
+						w.u8(0)?;
+						v176.write(w)?;
+					}
+				}
+			}
 			_ => return None,
 		}
 		*reply_handle = writer.handle();
@@ -4405,12 +4505,12 @@ pub mod session {
 			}
 			Some(if r.u8()? != 0 {
 				Ok({
-					let v169 = r.u16()? as usize;
-					let mut v170 = Vec::new();
-					for _ in 0..v169 {
-						v170.push(JobInfo::read(r)?);
+					let v178 = r.u16()? as usize;
+					let mut v179 = Vec::new();
+					for _ in 0..v178 {
+						v179.push(JobInfo::read(r)?);
 					}
-					v170
+					v179
 				})
 			} else {
 				Err(Error::read(r)?)
@@ -4432,12 +4532,12 @@ pub mod session {
 			}
 			Some(if r.u8()? != 0 {
 				Ok({
-					let v171 = r.u16()? as usize;
-					let mut v172 = Vec::new();
-					for _ in 0..v171 {
-						v172.push(JobInfo::read(r)?);
+					let v180 = r.u16()? as usize;
+					let mut v181 = Vec::new();
+					for _ in 0..v180 {
+						v181.push(JobInfo::read(r)?);
 					}
-					v172
+					v181
 				})
 			} else {
 				Err(Error::read(r)?)
@@ -4459,6 +4559,85 @@ pub mod session {
 				return None;
 			}
 			Some(if r.u8()? != 0 { Ok(JobInfo::read(r)?) } else { Err(Error::read(r)?) })
+		}
+		pub fn env_get(&mut self, name: &str) -> Option<Result<String, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ENV_GET)?;
+			w.u32(corr)?;
+			w.bytes_lp(name.as_bytes())?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(r.string_lp()?) } else { Err(Error::read(r)?) })
+		}
+		pub fn env_set(&mut self, name: &str, value: &str) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ENV_SET)?;
+			w.u32(corr)?;
+			w.bytes_lp(name.as_bytes())?;
+			w.bytes_lp(value.as_bytes())?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+		}
+		pub fn env_unset(&mut self, name: &str) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ENV_UNSET)?;
+			w.u32(corr)?;
+			w.bytes_lp(name.as_bytes())?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+		}
+		pub fn env_list(&mut self) -> Option<Result<Vec<EnvVar>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ENV_LIST)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::with_handle(&reply, reply_handle);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			Some(if r.u8()? != 0 {
+				Ok({
+					let v182 = r.u16()? as usize;
+					let mut v183 = Vec::new();
+					for _ in 0..v182 {
+						v183.push(EnvVar::read(r)?);
+					}
+					v183
+				})
+			} else {
+				Err(Error::read(r)?)
+			})
 		}
 	}
 }
@@ -4628,13 +4807,13 @@ impl Entry {
 		out.push(',');
 		out.push_str("\"fields\":");
 		out.push('[');
-		let mut v174 = true;
-		for v173 in self.fields.iter() {
-			if !v174 {
+		let mut v185 = true;
+		for v184 in self.fields.iter() {
+			if !v185 {
 				out.push(',');
 			}
-			v174 = false;
-			v173.to_json_into(out);
+			v185 = false;
+			v184.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -4652,13 +4831,13 @@ impl Entry {
 		out.push_str(", ");
 		out.push_str("fields=");
 		out.push('[');
-		let mut v176 = true;
-		for v175 in self.fields.iter() {
-			if !v176 {
+		let mut v187 = true;
+		for v186 in self.fields.iter() {
+			if !v187 {
 				out.push_str(", ");
 			}
-			v176 = false;
-			v175.to_text_into(out);
+			v187 = false;
+			v186.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -4673,8 +4852,8 @@ impl Entry {
 		crate::codec::cbor::text(out, &self.source);
 		crate::codec::cbor::text(out, "fields");
 		crate::codec::cbor::array(out, self.fields.len());
-		for v177 in self.fields.iter() {
-			v177.to_cbor_into(out);
+		for v188 in self.fields.iter() {
+			v188.to_cbor_into(out);
 		}
 	}
 }
@@ -4699,8 +4878,8 @@ impl Query {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
-			Some(v178) => {
-				let _ = write!(out, "{}", v178);
+			Some(v189) => {
+				let _ = write!(out, "{}", v189);
 			}
 			None => {
 				out.push_str("null");
@@ -4709,8 +4888,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"min-severity\":");
 		match &self.min_severity {
-			Some(v179) => {
-				v179.to_json_into(out);
+			Some(v190) => {
+				v190.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -4719,8 +4898,8 @@ impl Query {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v180) => {
-				crate::codec::json_escape(v180, out);
+			Some(v191) => {
+				crate::codec::json_escape(v191, out);
 			}
 			None => {
 				out.push_str("null");
@@ -4735,8 +4914,8 @@ impl Query {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
-			Some(v181) => {
-				let _ = write!(out, "{}", v181);
+			Some(v192) => {
+				let _ = write!(out, "{}", v192);
 			}
 			None => {
 				out.push('-');
@@ -4745,8 +4924,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("min-severity=");
 		match &self.min_severity {
-			Some(v182) => {
-				v182.to_text_into(out);
+			Some(v193) => {
+				v193.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -4755,8 +4934,8 @@ impl Query {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v183) => {
-				out.push_str(v183);
+			Some(v194) => {
+				out.push_str(v194);
 			}
 			None => {
 				out.push('-');
@@ -4771,8 +4950,8 @@ impl Query {
 		crate::codec::cbor::map(out, 4);
 		crate::codec::cbor::text(out, "since");
 		match &self.since {
-			Some(v184) => {
-				crate::codec::cbor::uint(out, *v184 as u64);
+			Some(v195) => {
+				crate::codec::cbor::uint(out, *v195 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -4780,8 +4959,8 @@ impl Query {
 		}
 		crate::codec::cbor::text(out, "min-severity");
 		match &self.min_severity {
-			Some(v185) => {
-				v185.to_cbor_into(out);
+			Some(v196) => {
+				v196.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -4789,8 +4968,8 @@ impl Query {
 		}
 		crate::codec::cbor::text(out, "source");
 		match &self.source {
-			Some(v186) => {
-				crate::codec::cbor::text(out, v186);
+			Some(v197) => {
+				crate::codec::cbor::text(out, v197);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -5439,13 +5618,13 @@ impl Neighbor {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v188 = true;
-		for v187 in self.mac.iter() {
-			if !v188 {
+		let mut v199 = true;
+		for v198 in self.mac.iter() {
+			if !v199 {
 				out.push(',');
 			}
-			v188 = false;
-			let _ = write!(out, "{}", v187);
+			v199 = false;
+			let _ = write!(out, "{}", v198);
 		}
 		out.push(']');
 		out.push('}');
@@ -5457,13 +5636,13 @@ impl Neighbor {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v190 = true;
-		for v189 in self.mac.iter() {
-			if !v190 {
+		let mut v201 = true;
+		for v200 in self.mac.iter() {
+			if !v201 {
 				out.push_str(", ");
 			}
-			v190 = false;
-			let _ = write!(out, "{}", v189);
+			v201 = false;
+			let _ = write!(out, "{}", v200);
 		}
 		out.push(']');
 		out.push('}');
@@ -5474,8 +5653,8 @@ impl Neighbor {
 		self.addr.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mac");
 		crate::codec::cbor::array(out, self.mac.len());
-		for v191 in self.mac.iter() {
-			crate::codec::cbor::uint(out, *v191 as u64);
+		for v202 in self.mac.iter() {
+			crate::codec::cbor::uint(out, *v202 as u64);
 		}
 	}
 }
@@ -5503,13 +5682,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v193 = true;
-		for v192 in self.mac.iter() {
-			if !v193 {
+		let mut v204 = true;
+		for v203 in self.mac.iter() {
+			if !v204 {
 				out.push(',');
 			}
-			v193 = false;
-			let _ = write!(out, "{}", v192);
+			v204 = false;
+			let _ = write!(out, "{}", v203);
 		}
 		out.push(']');
 		out.push(',');
@@ -5518,13 +5697,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"neighbors\":");
 		out.push('[');
-		let mut v195 = true;
-		for v194 in self.neighbors.iter() {
-			if !v195 {
+		let mut v206 = true;
+		for v205 in self.neighbors.iter() {
+			if !v206 {
 				out.push(',');
 			}
-			v195 = false;
-			v194.to_json_into(out);
+			v206 = false;
+			v205.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -5536,13 +5715,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v197 = true;
-		for v196 in self.mac.iter() {
-			if !v197 {
+		let mut v208 = true;
+		for v207 in self.mac.iter() {
+			if !v208 {
 				out.push_str(", ");
 			}
-			v197 = false;
-			let _ = write!(out, "{}", v196);
+			v208 = false;
+			let _ = write!(out, "{}", v207);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -5551,13 +5730,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("neighbors=");
 		out.push('[');
-		let mut v199 = true;
-		for v198 in self.neighbors.iter() {
-			if !v199 {
+		let mut v210 = true;
+		for v209 in self.neighbors.iter() {
+			if !v210 {
 				out.push_str(", ");
 			}
-			v199 = false;
-			v198.to_text_into(out);
+			v210 = false;
+			v209.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -5568,15 +5747,15 @@ impl NetInfo {
 		self.addr.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mac");
 		crate::codec::cbor::array(out, self.mac.len());
-		for v200 in self.mac.iter() {
-			crate::codec::cbor::uint(out, *v200 as u64);
+		for v211 in self.mac.iter() {
+			crate::codec::cbor::uint(out, *v211 as u64);
 		}
 		crate::codec::cbor::text(out, "gateway");
 		self.gateway.to_cbor_into(out);
 		crate::codec::cbor::text(out, "neighbors");
 		crate::codec::cbor::array(out, self.neighbors.len());
-		for v201 in self.neighbors.iter() {
-			v201.to_cbor_into(out);
+		for v212 in self.neighbors.iter() {
+			v212.to_cbor_into(out);
 		}
 	}
 }
@@ -5694,13 +5873,13 @@ impl TcpRequest {
 		out.push(',');
 		out.push_str("\"request\":");
 		out.push('[');
-		let mut v203 = true;
-		for v202 in self.request.iter() {
-			if !v203 {
+		let mut v214 = true;
+		for v213 in self.request.iter() {
+			if !v214 {
 				out.push(',');
 			}
-			v203 = false;
-			let _ = write!(out, "{}", v202);
+			v214 = false;
+			let _ = write!(out, "{}", v213);
 		}
 		out.push(']');
 		out.push('}');
@@ -5712,13 +5891,13 @@ impl TcpRequest {
 		out.push_str(", ");
 		out.push_str("request=");
 		out.push('[');
-		let mut v205 = true;
-		for v204 in self.request.iter() {
-			if !v205 {
+		let mut v216 = true;
+		for v215 in self.request.iter() {
+			if !v216 {
 				out.push_str(", ");
 			}
-			v205 = false;
-			let _ = write!(out, "{}", v204);
+			v216 = false;
+			let _ = write!(out, "{}", v215);
 		}
 		out.push(']');
 		out.push('}');
@@ -5729,8 +5908,8 @@ impl TcpRequest {
 		self.ep.to_cbor_into(out);
 		crate::codec::cbor::text(out, "request");
 		crate::codec::cbor::array(out, self.request.len());
-		for v206 in self.request.iter() {
-			crate::codec::cbor::uint(out, *v206 as u64);
+		for v217 in self.request.iter() {
+			crate::codec::cbor::uint(out, *v217 as u64);
 		}
 	}
 }
@@ -5854,13 +6033,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("\"data\":");
 		out.push('[');
-		let mut v208 = true;
-		for v207 in self.data.iter() {
-			if !v208 {
+		let mut v219 = true;
+		for v218 in self.data.iter() {
+			if !v219 {
 				out.push(',');
 			}
-			v208 = false;
-			let _ = write!(out, "{}", v207);
+			v219 = false;
+			let _ = write!(out, "{}", v218);
 		}
 		out.push(']');
 		out.push('}');
@@ -5869,13 +6048,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("data=");
 		out.push('[');
-		let mut v210 = true;
-		for v209 in self.data.iter() {
-			if !v210 {
+		let mut v221 = true;
+		for v220 in self.data.iter() {
+			if !v221 {
 				out.push_str(", ");
 			}
-			v210 = false;
-			let _ = write!(out, "{}", v209);
+			v221 = false;
+			let _ = write!(out, "{}", v220);
 		}
 		out.push(']');
 		out.push('}');
@@ -5884,8 +6063,8 @@ impl Chunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "data");
 		crate::codec::cbor::array(out, self.data.len());
-		for v211 in self.data.iter() {
-			crate::codec::cbor::uint(out, *v211 as u64);
+		for v222 in self.data.iter() {
+			crate::codec::cbor::uint(out, *v222 as u64);
 		}
 	}
 }
@@ -6172,13 +6351,13 @@ impl Component {
 		out.push(',');
 		out.push_str("\"deps\":");
 		out.push('[');
-		let mut v213 = true;
-		for v212 in self.deps.iter() {
-			if !v213 {
+		let mut v224 = true;
+		for v223 in self.deps.iter() {
+			if !v224 {
 				out.push(',');
 			}
-			v213 = false;
-			crate::codec::json_escape(v212, out);
+			v224 = false;
+			crate::codec::json_escape(v223, out);
 		}
 		out.push(']');
 		out.push(',');
@@ -6199,13 +6378,13 @@ impl Component {
 		out.push_str(", ");
 		out.push_str("deps=");
 		out.push('[');
-		let mut v215 = true;
-		for v214 in self.deps.iter() {
-			if !v215 {
+		let mut v226 = true;
+		for v225 in self.deps.iter() {
+			if !v226 {
 				out.push_str(", ");
 			}
-			v215 = false;
-			out.push_str(v214);
+			v226 = false;
+			out.push_str(v225);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -6223,8 +6402,8 @@ impl Component {
 		self.state.to_cbor_into(out);
 		crate::codec::cbor::text(out, "deps");
 		crate::codec::cbor::array(out, self.deps.len());
-		for v216 in self.deps.iter() {
-			crate::codec::cbor::text(out, v216);
+		for v227 in self.deps.iter() {
+			crate::codec::cbor::text(out, v227);
 		}
 		crate::codec::cbor::text(out, "counters");
 		self.counters.to_cbor_into(out);
@@ -6294,25 +6473,25 @@ impl Graph {
 		out.push('{');
 		out.push_str("\"components\":");
 		out.push('[');
-		let mut v218 = true;
-		for v217 in self.components.iter() {
-			if !v218 {
+		let mut v229 = true;
+		for v228 in self.components.iter() {
+			if !v229 {
 				out.push(',');
 			}
-			v218 = false;
-			v217.to_json_into(out);
+			v229 = false;
+			v228.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"spans\":");
 		out.push('[');
-		let mut v220 = true;
-		for v219 in self.spans.iter() {
-			if !v220 {
+		let mut v231 = true;
+		for v230 in self.spans.iter() {
+			if !v231 {
 				out.push(',');
 			}
-			v220 = false;
-			v219.to_json_into(out);
+			v231 = false;
+			v230.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -6321,25 +6500,25 @@ impl Graph {
 		out.push('{');
 		out.push_str("components=");
 		out.push('[');
-		let mut v222 = true;
-		for v221 in self.components.iter() {
-			if !v222 {
+		let mut v233 = true;
+		for v232 in self.components.iter() {
+			if !v233 {
 				out.push_str(", ");
 			}
-			v222 = false;
-			v221.to_text_into(out);
+			v233 = false;
+			v232.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("spans=");
 		out.push('[');
-		let mut v224 = true;
-		for v223 in self.spans.iter() {
-			if !v224 {
+		let mut v235 = true;
+		for v234 in self.spans.iter() {
+			if !v235 {
 				out.push_str(", ");
 			}
-			v224 = false;
-			v223.to_text_into(out);
+			v235 = false;
+			v234.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -6348,13 +6527,13 @@ impl Graph {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "components");
 		crate::codec::cbor::array(out, self.components.len());
-		for v225 in self.components.iter() {
-			v225.to_cbor_into(out);
+		for v236 in self.components.iter() {
+			v236.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "spans");
 		crate::codec::cbor::array(out, self.spans.len());
-		for v226 in self.spans.iter() {
-			v226.to_cbor_into(out);
+		for v237 in self.spans.iter() {
+			v237.to_cbor_into(out);
 		}
 	}
 }
@@ -6513,13 +6692,13 @@ impl Manifest {
 		out.push(',');
 		out.push_str("\"grants\":");
 		out.push('[');
-		let mut v228 = true;
-		for v227 in self.grants.iter() {
-			if !v228 {
+		let mut v239 = true;
+		for v238 in self.grants.iter() {
+			if !v239 {
 				out.push(',');
 			}
-			v228 = false;
-			v227.to_json_into(out);
+			v239 = false;
+			v238.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -6531,13 +6710,13 @@ impl Manifest {
 		out.push_str(", ");
 		out.push_str("grants=");
 		out.push('[');
-		let mut v230 = true;
-		for v229 in self.grants.iter() {
-			if !v230 {
+		let mut v241 = true;
+		for v240 in self.grants.iter() {
+			if !v241 {
 				out.push_str(", ");
 			}
-			v230 = false;
-			v229.to_text_into(out);
+			v241 = false;
+			v240.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -6548,8 +6727,8 @@ impl Manifest {
 		crate::codec::cbor::text(out, &self.component);
 		crate::codec::cbor::text(out, "grants");
 		crate::codec::cbor::array(out, self.grants.len());
-		for v231 in self.grants.iter() {
-			v231.to_cbor_into(out);
+		for v242 in self.grants.iter() {
+			v242.to_cbor_into(out);
 		}
 	}
 }
@@ -6748,13 +6927,13 @@ impl Budget {
 		out.push(',');
 		out.push_str("\"usage\":");
 		out.push('[');
-		let mut v233 = true;
-		for v232 in self.usage.iter() {
-			if !v233 {
+		let mut v244 = true;
+		for v243 in self.usage.iter() {
+			if !v244 {
 				out.push(',');
 			}
-			v233 = false;
-			v232.to_json_into(out);
+			v244 = false;
+			v243.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -6766,13 +6945,13 @@ impl Budget {
 		out.push_str(", ");
 		out.push_str("usage=");
 		out.push('[');
-		let mut v235 = true;
-		for v234 in self.usage.iter() {
-			if !v235 {
+		let mut v246 = true;
+		for v245 in self.usage.iter() {
+			if !v246 {
 				out.push_str(", ");
 			}
-			v235 = false;
-			v234.to_text_into(out);
+			v246 = false;
+			v245.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -6783,8 +6962,8 @@ impl Budget {
 		crate::codec::cbor::text(out, &self.name);
 		crate::codec::cbor::text(out, "usage");
 		crate::codec::cbor::array(out, self.usage.len());
-		for v236 in self.usage.iter() {
-			v236.to_cbor_into(out);
+		for v247 in self.usage.iter() {
+			v247.to_cbor_into(out);
 		}
 	}
 }
@@ -6888,6 +7067,49 @@ impl JobEntry {
 		self.info.to_cbor_into(out);
 		crate::codec::cbor::text(out, "proc");
 		crate::codec::cbor::uint(out, self.proc as u64);
+	}
+}
+
+impl EnvVar {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push(',');
+		out.push_str("\"value\":");
+		crate::codec::json_escape(&self.value, out);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("name=");
+		out.push_str(&self.name);
+		out.push_str(", ");
+		out.push_str("value=");
+		out.push_str(&self.value);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "value");
+		crate::codec::cbor::text(out, &self.value);
 	}
 }
 
@@ -7207,5 +7429,13 @@ mod compat {
 		let golden: &[u8] = &[7, 0, 0, 0, 1, 0, 120, 1];
 		assert_eq!(bytes, golden);
 		assert_eq!(JobInfo::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn env_var_wire_is_stable() {
+		let sample = EnvVar { name: String::from("x"), value: String::from("x") };
+		let bytes = sample.encode_vec();
+		let golden: &[u8] = &[1, 0, 120, 1, 0, 120];
+		assert_eq!(bytes, golden);
+		assert_eq!(EnvVar::decode(&bytes).unwrap(), sample);
 	}
 }

@@ -5,15 +5,16 @@
 // channel its clients reach it on. Over that channel clients speak the generated
 // `liber:system` Session bindings.
 //
-// A session is a long-lived login context: it owns the working directory and the job
-// table (and, in a later phase, the environment). Each session is reached over its
+// A session is a long-lived login context: it owns the working directory, the
+// environment variables, and the job table. Each session is reached over its
 // own dedicated channel - the session capability the spawner (ServiceManager for VT 1,
 // ConsoleService for the other VTs) mints with `service_connect` and hands to the
 // shell. The spawner keeps the channel and re-hands a duplicate to each shell it
-// starts, so the session - and thus the cwd and the job table - outlives any one shell:
-// a logout or a supervisor restart leaves it intact, because SessionService, not the
-// shell, holds it. Background jobs in particular survive a shell restart because their
-// live Process handles live here, not in the shell that started them.
+// starts, so the session - and thus the cwd, the environment and the job table -
+// outlives any one shell: a logout or a supervisor restart leaves it intact, because
+// SessionService, not the shell, holds it. Background jobs in particular survive a shell
+// restart because their live Process handles live here, not in the shell that started
+// them.
 //
 // One session per connected channel: `serve_multi` hands every request the channel it
 // arrived on, and the first request on a channel lazily creates a fresh session at the
@@ -30,13 +31,19 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::system::session::{self, Service};
-use proto::system::{Error, JobEntry, JobInfo};
+use proto::system::{EnvVar, Error, JobEntry, JobInfo};
 use rt::*;
 
 // The default working directory a fresh session starts in: the root of the system
 // volume. A session keeps it until a client `chdir`s elsewhere. Matches the shell's
 // own DEFAULT_CWD, the one place a prompt starts.
 const DEFAULT_CWD: &str = "vol://system";
+
+// The default `PATH` a fresh session starts with: the directory the tool binaries live in
+// on the system volume. A client `PATH=...` overwrites it. Command lookup by search path
+// arrives with the binaries-on-volume phase; today the value is stored, expanded (`$PATH`)
+// and inherited like any other variable.
+const DEFAULT_PATH: &str = "vol://system/bin";
 
 // One tracked background / stopped job in a session's job table: the live Process handle
 // (the shell transferred it here, held with WAIT so the session can poll it and MANAGE so
@@ -49,19 +56,20 @@ struct Job {
 	stopped: bool,
 }
 
-// One login session's state: its working directory and its job table - the tracked jobs
-// and the next id to assign (later a phase adds the environment). Behind the generated
-// Session contract. The job ids are session-assigned, so they stay stable across a shell
-// restart.
+// One login session's state: its working directory, its environment variables (seeded
+// with `PATH`), and its job table - the tracked jobs and the next id to assign. Behind
+// the generated Session contract. The job ids are session-assigned, so they stay stable
+// across a shell restart, and the environment persists there too.
 struct Session {
 	cwd: String,
+	vars: Vec<(String, String)>,
 	jobs: Vec<Job>,
 	next_id: u32,
 }
 
 impl Session {
 	fn new() -> Session {
-		Session { cwd: String::from(DEFAULT_CWD), jobs: Vec::new(), next_id: 1 }
+		Session { cwd: String::from(DEFAULT_CWD), vars: alloc::vec![(String::from("PATH"), String::from(DEFAULT_PATH))], jobs: Vec::new(), next_id: 1 }
 	}
 }
 
@@ -125,6 +133,31 @@ impl Service for Session {
 			self.jobs[pos].stopped = false;
 		}
 		Ok(JobInfo { id: self.jobs[pos].id, name: self.jobs[pos].name.clone(), stopped: self.jobs[pos].stopped })
+	}
+
+	// Read one environment variable. NotFound if the session has no variable by that name.
+	fn env_get(&mut self, name: String) -> Result<String, Error> {
+		self.vars.iter().find(|(n, _): &&(String, String)| *n == name).map(|(_, v): &(String, String)| v.clone()).ok_or(Error::NotFound)
+	}
+
+	// Create or overwrite an environment variable, so the value persists in the session.
+	fn env_set(&mut self, name: String, value: String) -> Result<(), Error> {
+		match self.vars.iter_mut().find(|(n, _): &&mut (String, String)| *n == name) {
+			Some(entry) => entry.1 = value,
+			None => self.vars.push((name, value)),
+		}
+		Ok(())
+	}
+
+	// Remove an environment variable if present (idempotent - unsetting an absent one is ok).
+	fn env_unset(&mut self, name: String) -> Result<(), Error> {
+		self.vars.retain(|(n, _): &(String, String)| *n != name);
+		Ok(())
+	}
+
+	// List the environment for the shell's `env` command and its startup variable cache.
+	fn env_list(&mut self) -> Result<Vec<EnvVar>, Error> {
+		Ok(self.vars.iter().map(|(n, v): &(String, String)| EnvVar { name: n.clone(), value: v.clone() }).collect())
 	}
 }
 

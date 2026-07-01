@@ -374,6 +374,13 @@ An opaque kernel object, transferred as `handle<task>`.
 | `info` | `job-info` |
 | `proc` | `handle<task>` |
 
+### record `env-var`
+
+| field | type |
+| --- | --- |
+| `name` | `string` |
+| `value` | `string` |
+
 ## Interfaces
 
 ### interface `log`
@@ -546,4 +553,8 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 5 | `job-list` | `job-list() -> result<list<job-info>, error>` |
 | 6 | `job-reap` | `job-reap() -> result<list<job-info>, error>` |
 | 7 | `job-resume` | `job-resume(id: u32) -> result<job-info, error>` |
+| 8 | `env-get` | `env-get(name: string) -> result<string, error>` |
+| 9 | `env-set` | `env-set(name: string, value: string) -> result<unit, error>` |
+| 10 | `env-unset` | `env-unset(name: string) -> result<unit, error>` |
+| 11 | `env-list` | `env-list() -> result<list<env-var>, error>` |
 

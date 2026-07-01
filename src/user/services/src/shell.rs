@@ -16,7 +16,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::path;
-use proto::system::{audio, config, device, input, log, network, permission, process, resources, session, system_graph, time, volume, AuditEntry, Budget, Component, ConfigEntry, DeviceEntry, Entry, FileKind, JobEntry, JobInfo, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan};
+use proto::system::{audio, config, device, input, log, network, permission, process, resources, session, system_graph, time, volume, AuditEntry, Budget, Component, ConfigEntry, DeviceEntry, Entry, EnvVar, FileKind, JobEntry, JobInfo, OpenOpts, ProcessInfo, Query, Timestamp, TraceSpan};
 use rt::*;
 
 // the file the shell reads at startup to prove the StorageService round-trip works
@@ -177,6 +177,18 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 		} else {
 			String::from(DEFAULT_CWD)
 		};
+		// The environment variables are owned by the session too; read them once at startup
+		// into a local cache (name -> value) so `$`-expansion needs no IPC per line, then
+		// keep the cache in step whenever an assignment or `unset` writes through. With no
+		// session (a minimal boot) the environment is local-only and starts empty.
+		let mut vars: Vec<(String, String)> = if session != 0 {
+			match session::Client::new(ChannelTransport { chan: session }).env_list() {
+				Some(Ok(list)) => list.into_iter().map(|v: EnvVar| (v.name, v.value)).collect(),
+				_ => Vec::new(),
+			}
+		} else {
+			Vec::new()
+		};
 		loop {
 			let n: usize = match recv_blocking(console, buf) {
 				Received::Message { len, .. } => len,
@@ -187,10 +199,12 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 				print(b"\n");
 				return;
 			}
-			// The terminal delivers a whole submitted line (with a trailing newline);
-			// trim it, dispatch it, reap finished jobs, and print the next prompt.
-			let line: &[u8] = trim(&buf[..n]);
-			if dispatch(line, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, session, adminsvc, &mut jobs, &mut cwd) {
+			// The terminal delivers a whole submitted line (with a trailing newline); trim
+			// it, expand any `$NAME` / `${NAME}` against the environment, then dispatch it,
+			// reap finished jobs, and print the next prompt.
+			let raw: &[u8] = trim(&buf[..n]);
+			let expanded: Vec<u8> = expand_vars(raw, &vars);
+			if dispatch(&expanded, storage, media, iso, udf, logsvc, devsvc, procsvc, cfgsvc, netsvc, timesvc, audiosvc, inputsvc, graphsvc, permsvc, ressvc, session, adminsvc, &mut jobs, &mut vars, &mut cwd) {
 				return;
 			}
 			jobs.reap();
@@ -536,10 +550,118 @@ unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, session: u64, adminsvc: u64, jobs: &mut Jobs, cwd: &mut String) -> bool {
+// Detect a bare `NAME=VALUE` assignment. The name must be a shell identifier
+// (`[A-Za-z_][A-Za-z0-9_]*`) so a command with an `=` in an argument (a URL, a flag) is
+// not mistaken for one; the value is everything after the first `=` and may be empty.
+// Returns the name and value byte slices, the name valid UTF-8 by construction.
+fn parse_assignment(line: &[u8]) -> Option<(&str, &[u8])> {
+	let eq: usize = line.iter().position(|&b: &u8| b == b'=')?;
+	let name: &[u8] = &line[..eq];
+	if name.is_empty() {
+		return None;
+	}
+	let head: u8 = name[0];
+	if !(head.is_ascii_alphabetic() || head == b'_') {
+		return None;
+	}
+	if !name.iter().all(|&b: &u8| b.is_ascii_alphanumeric() || b == b'_') {
+		return None;
+	}
+	let value: &[u8] = &line[eq + 1..];
+	Some((core::str::from_utf8(name).ok()?, value))
+}
+
+// Set a shell variable: write it through to the session so it outlives the shell, then
+// upsert the local cache. A value that is not valid UTF-8 is stored empty (the session
+// contract carries a `string`); a shell with no session updates the cache only.
+fn set_var(vars: &mut Vec<(String, String)>, session: u64, name: &str, value: &[u8]) {
+	let value: &str = core::str::from_utf8(value).unwrap_or("");
+	if session != 0 {
+		let _ = session::Client::new(ChannelTransport { chan: session }).env_set(name, value);
+	}
+	match vars.iter_mut().find(|(n, _): &&mut (String, String)| n == name) {
+		Some(entry) => {
+			entry.1.clear();
+			entry.1.push_str(value);
+		}
+		None => vars.push((String::from(name), String::from(value))),
+	}
+}
+
+// Remove a shell variable: write the removal through to the session, then drop it from
+// the cache. Unsetting an absent variable is a no-op, the way `unset` is.
+fn unset_var(vars: &mut Vec<(String, String)>, session: u64, name: &str) {
+	if session != 0 {
+		let _ = session::Client::new(ChannelTransport { chan: session }).env_unset(name);
+	}
+	vars.retain(|(n, _): &(String, String)| n != name);
+}
+
+// Expand `$NAME` and `${NAME}` references in a command line against the environment cache,
+// where a name is `[A-Za-z_][A-Za-z0-9_]*`. An unset name expands to nothing; a `$` not
+// followed by a valid name (or an unterminated `${`) is left literal. The result is a
+// fresh line the dispatcher then parses, so variables reach every command uniformly.
+fn expand_vars(line: &[u8], vars: &[(String, String)]) -> Vec<u8> {
+	let mut out: Vec<u8> = Vec::with_capacity(line.len());
+	let mut i: usize = 0;
+	while i < line.len() {
+		if line[i] != b'$' {
+			out.push(line[i]);
+			i += 1;
+			continue;
+		}
+		// `${NAME}`: the name runs to the closing brace.
+		if i + 1 < line.len() && line[i + 1] == b'{' {
+			let start: usize = i + 2;
+			match line[start..].iter().position(|&b: &u8| b == b'}') {
+				Some(rel) => {
+					push_var_value(&mut out, &line[start..start + rel], vars);
+					i = start + rel + 1;
+				}
+				None => {
+					// Unterminated `${`: leave it literal.
+					out.push(b'$');
+					i += 1;
+				}
+			}
+			continue;
+		}
+		// `$NAME`: the name is the identifier run right after the `$`.
+		let start: usize = i + 1;
+		if start < line.len() && (line[start].is_ascii_alphabetic() || line[start] == b'_') {
+			let mut end: usize = start + 1;
+			while end < line.len() && (line[end].is_ascii_alphanumeric() || line[end] == b'_') {
+				end += 1;
+			}
+			push_var_value(&mut out, &line[start..end], vars);
+			i = end;
+		} else {
+			// A lone `$` (or one before a non-name): keep it literal.
+			out.push(b'$');
+			i += 1;
+		}
+	}
+	out
+}
+
+// Append the value of the named variable to `out`, or nothing if it is unset.
+fn push_var_value(out: &mut Vec<u8>, name: &[u8], vars: &[(String, String)]) {
+	if let Some((_, value)) = vars.iter().find(|(n, _): &&(String, String)| n.as_bytes() == name) {
+		out.extend_from_slice(value.as_bytes());
+	}
+}
+
+unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, logsvc: u64, devsvc: u64, procsvc: u64, cfgsvc: u64, netsvc: u64, timesvc: u64, audiosvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, ressvc: u64, session: u64, adminsvc: u64, jobs: &mut Jobs, vars: &mut Vec<(String, String)>, cwd: &mut String) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
+			return false;
+		}
+		// A bare `NAME=VALUE` sets a shell variable (write it through to the session so it
+		// persists, and update the cache); the value was already `$`-expanded upstream, so
+		// `FOO=$BAR` copies BAR's value. Checked before the `&` split so a value may hold one.
+		if let Some((name, value)) = parse_assignment(line) {
+			set_var(vars, session, name, value);
 			return false;
 		}
 		// A trailing `&` runs a spawnable command in the background.
@@ -548,6 +670,23 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			None => (line, false),
 		};
 		if line.is_empty() {
+			return false;
+		}
+		if line == b"env" {
+			// List the environment the way `env` does, one `NAME=VALUE` per line, from the cache.
+			for (name, value) in vars.iter() {
+				print(name.as_bytes());
+				print(b"=");
+				print(value.as_bytes());
+				print(b"\n");
+			}
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"unset ") {
+			// Remove a variable: write through to the session, then drop it from the cache.
+			if let Ok(name) = core::str::from_utf8(trim(rest)) {
+				unset_var(vars, session, name);
+			}
 			return false;
 		}
 		if line == b"jobs" {
@@ -592,6 +731,9 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, lo
 			print(b"  resize <c> <r>   resize the terminal to c cols x r rows\n");
 			print(b"  echo <text>      print text\n");
 			print(b"  readln           read stdin and echo each line (Ctrl+D to end)\n");
+			print(b"  NAME=VALUE       set a shell variable ($NAME expands it)\n");
+			print(b"  env              list the environment variables\n");
+			print(b"  unset <name>     remove a shell variable\n");
 			print(b"  cat <vol://...>  read a file via StorageService\n");
 			print(b"  lsvol            list the available volumes via StorageService\n");
 			print(b"  cd [<path>]      change the working directory (no argument returns home)\n");
@@ -1215,11 +1357,7 @@ unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cap: u64
 unsafe fn send_stdout(parent: u64, interactive: bool) {
 	unsafe {
 		let so: u64 = stdout();
-		let rights: u32 = if interactive {
-			RIGHT_SEND | RIGHT_RECEIVE | RIGHT_TRANSFER
-		} else {
-			RIGHT_SEND | RIGHT_TRANSFER
-		};
+		let rights: u32 = if interactive { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_TRANSFER } else { RIGHT_SEND | RIGHT_TRANSFER };
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, rights);
 			if d > 0 {
