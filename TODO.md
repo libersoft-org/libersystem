@@ -1044,13 +1044,17 @@ owning service gains a typed query first; each ships as a binary per M61.
 - [ ] `lscpu`: report the architecture, online core count (SMP) and APIC ids.
 - [ ] `free`: memory total / used / free from the frame allocator and heap, with human-readable units (`-h`) like Linux.
 - [ ] `lsmem`: the physical memory map - the Limine memmap regions (usable / reserved / ACPI), their ranges and sizes, complementing `free`.
-- [ ] `lsdev`: the device inventory (fold the existing `dev` into the `ls*` family or alias it).
+- [x] `lsdev`: the device inventory (fold the existing `dev` into the `ls*` family or alias it).
+  - Result: folded - the `dev` tool is renamed to `lsdev` outright (binary, permission manifest, shell dispatch and help), so the device inventory joins the `ls*` family and the old name is gone.
 - [ ] `lssvc`: registered system services and their state (drivers are services too, so they list here; an optional filter narrows to `driver.*`) - a filtered view of the processes shown by `ps`.
 - [ ] `lsirq`: the APIC / IRQ vectors and their virtio MSI-X mappings.
 - [ ] `lsusb`: enumerate USB devices off the M62 stack (xHCI keyboard / mass storage).
-- [ ] `dmesg`: the kernel ring-buffer log.
-- [ ] `uname`: architecture, kernel name and version string.
-- [ ] `uptime`: time since boot from the system clock.
+- [x] `dmesg`: the kernel ring-buffer log.
+  - Result: a zero-capability binary tool that copies the kernel boot log through SYS_CONSOLE_READLOG (the same text the boot screen shows) into a 32 KiB buffer and prints it line by line, so the console relay's per-message cap never truncates it; prints `dmesg: no kernel log` when the kernel kept none.
+- [x] `uname`: architecture, kernel name and version string.
+  - Result: prints `<product> <version> <arch>` from the compile-time product constants (`PRODUCT_NAME`/`PRODUCT_VERSION` env plus a `cfg`-selected arch string) - no capability, no service round-trip; the kernel test asserts the exact line against its own product constants.
+- [x] `uptime`: time since boot from the system clock.
+  - Result: renders `clock_ns()` (nanoseconds since boot, a free syscall) as `up [D day(s), ]H:MM:SS`. All three tools ship as binaries per M61 with empty permission manifests (the launcher grants them nothing), are staged on the volume, dispatched by the shell, and covered by the `inventory_tools_print_the_system_identity` kernel test that spawns each staged ELF and checks its output.
 - [ ] `ps` interactive mode (e.g. `ps -i`): a live, refreshing process/resource view like Linux `htop`, over ProcessService / ResourceManager - needs a console raw / refresh (alternate-screen) mode to redraw in place.
 - Done when: each command prints a stable inventory in the shell (and where useful a `--json` form), tests green - the HW resources are inspectable from the CLI.
 - Concept: Observability (a local, human- and machine-readable view of the live system), the layering principle (read-only views over DeviceService / the kernel, no new privilege), M50 / M61 / M62 (the DeviceService and System Graph, the binary tool model and the USB stack these extend).

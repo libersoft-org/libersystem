@@ -2842,6 +2842,53 @@ fn interactive_tool_reads_stdin() {
 	assert!(captured.windows(b"in> hello".len()).any(|w| w == b"in> hello"), "the foreground tool reads its stdin and echoes it back");
 }
 
+// Run one no-argument, no-capability tool from the volume the way the launcher does
+// - spawn its staged ELF, hand it a console channel as STDOUT and an empty argv -
+// and return everything it printed. The zero-capability inventory commands (uname,
+// uptime, dmesg) are driven through this.
+#[cfg(test)]
+fn run_inventory_tool(name: &[u8]) -> alloc::vec::Vec<u8> {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let elf = program_elf(&package, volume, name).expect("the tool should be staged");
+
+	let (boot_kernel, boot_user) = Channel::create();
+	let (console_host, console_child) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL, 0).expect("the tool should spawn");
+	send_cap(&boot_kernel, b"STDOUT", console_child, Rights::ALL).expect("STDOUT bootstrap");
+	boot_kernel.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("argv bootstrap");
+	sched::run_until_idle();
+
+	let mut captured = alloc::vec::Vec::new();
+	while let Ok(msg) = console_host.recv() {
+		captured.extend_from_slice(&msg.bytes);
+	}
+	captured
+}
+
+#[cfg(test)]
+#[test_case]
+fn inventory_tools_print_the_system_identity() {
+	// The zero-capability inventory commands (M63): each runs as its own sandboxed
+	// ELF and prints compile-time / free-syscall data - no service client, the
+	// emptiest manifests in the permission store. uname prints the product identity
+	// and architecture, uptime the time since boot, and dmesg the kernel boot log
+	// (the same text SYS_CONSOLE_READLOG hands ConsoleService for the boot screen).
+	let uname = run_inventory_tool(b"uname");
+	let expected = alloc::format!("{} {} x86_64\n", env!("PRODUCT_NAME"), env!("PRODUCT_VERSION"));
+	assert_eq!(uname, expected.as_bytes(), "uname should print the product name, version and architecture");
+
+	let uptime = run_inventory_tool(b"uptime");
+	assert!(uptime.starts_with(b"up ") && uptime.ends_with(b"\n"), "uptime should render the time since boot");
+
+	let dmesg = run_inventory_tool(b"dmesg");
+	assert!(!dmesg.is_empty(), "dmesg should print the kernel boot log (or report there is none)");
+}
+
 #[cfg(test)]
 #[test_case]
 fn system_manager_recovery_escalates_after_repeated_crashes() {

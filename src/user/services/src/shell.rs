@@ -767,10 +767,13 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			print(b"  script [<cmd>]   run a command in a fresh pty-hosted shell and record it\n");
 			print(b"  log [json]       show the system journal via LogService\n");
 			print(b"  log tail [json]  stream the journal via LogService (sub-channel)\n");
-			print(b"  dev [json]       list devices via DeviceService\n");
+			print(b"  lsdev [json]     list devices via DeviceService\n");
 			print(b"  graph [json|cbor]  show the live system graph and counters via SystemGraphService\n");
 			print(b"  perm [json]      show the permission audit trail via PermissionManager\n");
 			print(b"  usage [json]     show per-Domain resource budgets via ResourceManager\n");
+			print(b"  uname            print the system name, version and architecture\n");
+			print(b"  uptime           print the time since boot\n");
+			print(b"  dmesg            print the kernel boot log\n");
 			print(b"  stop <service>   stop a service and its dependents via ServiceManager\n");
 			print(b"  ps               list started processes via ProcessService\n");
 			print(b"  run <name>       start a program via ProcessService\n");
@@ -829,15 +832,15 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			run_tool(permsvc, b"log", b"tail json", cwd.as_bytes());
 			return false;
 		}
-		if line == b"dev" {
-			// Launch `dev` as its own sandboxed ELF through PermissionManager (the launcher /
+		if line == b"lsdev" {
+			// Launch `lsdev` as its own sandboxed ELF through PermissionManager (the launcher /
 			// granter), which grants it a device client and forwards this terminal and the
 			// sub-form argument.
-			run_tool(permsvc, b"dev", b"", cwd.as_bytes());
+			run_tool(permsvc, b"lsdev", b"", cwd.as_bytes());
 			return false;
 		}
-		if line == b"dev json" {
-			run_tool(permsvc, b"dev", b"json", cwd.as_bytes());
+		if line == b"lsdev json" {
+			run_tool(permsvc, b"lsdev", b"json", cwd.as_bytes());
 			return false;
 		}
 		if line == b"graph" {
@@ -913,6 +916,20 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			// Launch `date` as its own sandboxed ELF through PermissionManager (the launcher /
 			// granter), which grants it just a time client and forwards this terminal.
 			run_tool(permsvc, b"date", b"", cwd.as_bytes());
+			return false;
+		}
+		if line == b"uname" {
+			// The inventory commands run as sandboxed ELFs with an empty manifest - the
+			// system identity, the uptime and the boot log need no capability.
+			run_tool(permsvc, b"uname", b"", cwd.as_bytes());
+			return false;
+		}
+		if line == b"uptime" {
+			run_tool(permsvc, b"uptime", b"", cwd.as_bytes());
+			return false;
+		}
+		if line == b"dmesg" {
+			run_tool(permsvc, b"dmesg", b"", cwd.as_bytes());
 			return false;
 		}
 		if line == b"beep" {

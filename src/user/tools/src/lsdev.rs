@@ -1,8 +1,8 @@
-// dev - list the system's device nodes, run as its own sandboxed ELF.
+// lsdev - list the system's device nodes, run as its own sandboxed ELF.
 //
 // PermissionManager launches this program under a permission manifest that grants it exactly
 // one capability - a DeviceService client - and forwards it the shell's stdout console and
-// the argument string (the sub-form: "" for text or "json"). dev lists the device nodes
+// the argument string (the sub-form: "" for text or "json"). lsdev lists the device nodes
 // through its grant and prints each entry (as text or JSON) to the inherited stdout, then
 // exits. A standalone command, not a shell built-in: it reaches the service only through the
 // one capability the permission store granted it, and renders on the same terminal as the
@@ -61,8 +61,8 @@ unsafe fn query_devices(devsvc: u64, json: bool) {
 					}
 				}
 			}
-			Some(Err(_)) => print(b"dev: query error\n"),
-			None => print(b"dev: service unavailable\n"),
+			Some(Err(_)) => print(b"lsdev: query error\n"),
+			None => print(b"lsdev: service unavailable\n"),
 		}
 	}
 }

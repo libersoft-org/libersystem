@@ -49,8 +49,8 @@ name = "snap"
 path = "src/snap.rs"
 
 [[bin]]
-name = "dev"
-path = "src/dev.rs"
+name = "lsdev"
+path = "src/lsdev.rs"
 
 [[bin]]
 name = "config"
@@ -87,6 +87,18 @@ path = "src/stop.rs"
 [[bin]]
 name = "lsvol"
 path = "src/lsvol.rs"
+
+[[bin]]
+name = "uname"
+path = "src/uname.rs"
+
+[[bin]]
+name = "uptime"
+path = "src/uptime.rs"
+
+[[bin]]
+name = "dmesg"
+path = "src/dmesg.rs"
 
 [[bin]]
 name = "ping"

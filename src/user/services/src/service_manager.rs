@@ -806,7 +806,7 @@ unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], st
 // holds, and can be seen to withhold, a capability it possesses), a fresh TimeService
 // connection (the one capability the governed `date` command may reach), then fresh
 // ConfigService, DeviceService, and AudioService connections (the capabilities the governed
-// `config` / `set`, `dev`, and `beep` commands may reach) - then a fresh ProcessService
+// `config` / `set`, `lsdev`, and `beep` commands may reach) - then a fresh ProcessService
 // connection (the loading mechanism it drives to start the components it governs) and the
 // channel its clients reach it on ("SERVE", the client end kept in `*perm_client` for the
 // shell's `perm` command). The order matches PermissionManager's receive order: STORAGE,

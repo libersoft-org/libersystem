@@ -102,7 +102,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"rmdir" => Some(Manifest { component: String::from("rmdir"), grants: alloc::vec![Capability::Volumes] }),
 		b"log" => Some(Manifest { component: String::from("log"), grants: alloc::vec![Capability::Log, Capability::Time] }),
 		b"snap" => Some(Manifest { component: String::from("snap"), grants: alloc::vec![Capability::Storage] }),
-		b"dev" => Some(Manifest { component: String::from("dev"), grants: alloc::vec![Capability::Device] }),
+		b"lsdev" => Some(Manifest { component: String::from("lsdev"), grants: alloc::vec![Capability::Device] }),
 		b"config" => Some(Manifest { component: String::from("config"), grants: alloc::vec![Capability::Config] }),
 		b"set" => Some(Manifest { component: String::from("set"), grants: alloc::vec![Capability::Config] }),
 		b"beep" => Some(Manifest { component: String::from("beep"), grants: alloc::vec![Capability::Audio] }),
@@ -112,6 +112,12 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"perm" => Some(Manifest { component: String::from("perm"), grants: alloc::vec![Capability::Permission] }),
 		b"stop" => Some(Manifest { component: String::from("stop"), grants: alloc::vec![Capability::Supervisor] }),
 		b"lsvol" => Some(Manifest { component: String::from("lsvol"), grants: alloc::vec![Capability::Volumes] }),
+		// The inventory commands need no capability at all: the system identity and the
+		// uptime are compile-time / free-syscall data, and the boot log is read over its
+		// own syscall - the emptiest manifests in the store.
+		b"uname" => Some(Manifest { component: String::from("uname"), grants: alloc::vec![] }),
+		b"uptime" => Some(Manifest { component: String::from("uptime"), grants: alloc::vec![] }),
+		b"dmesg" => Some(Manifest { component: String::from("dmesg"), grants: alloc::vec![] }),
 		_ => None,
 	}
 }
@@ -452,7 +458,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    grant arrives as 0 (the manager simply cannot grant what it does not hold). Storage,
 	//    log, network, time, config, device, audio, resource, process, and supervisor are wired
 	//    (time so the governed `date` command can read the wall clock, config/device/audio/resource
-	//    so the governed `config` / `set`, `dev`, `beep`, and `usage` commands can reach their one
+	//    so the governed `config` / `set`, `lsdev`, `beep`, and `usage` commands can reach their one
 	//    service, process so the governed `ps` / `run` commands can list / start processes - a
 	//    dedicated ProcessService connection, kept separate from the launch mechanism below -, and
 	//    supervisor so the governed `stop` command can drive the supervisor's teardown path over a

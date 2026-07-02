@@ -96,7 +96,7 @@ const NONBOOT_DRIVER_NAMES: [&str; 6] = ["virtio_net", "virtio_console", "virtio
 
 // Command-line tools - loaded from the system volume under bin/, so staged there and not
 // kept in the init package.
-const TOOL_NAMES: [&str; 31] = ["date", "cat", "write", "rm", "ls", "mkdir", "rmdir", "log", "snap", "dev", "config", "set", "beep", "usage", "ps", "run", "perm", "stop", "lsvol", "echo", "ping", "ip", "nslookup", "tcp", "nc", "arp", "httpd", "ss", "script", "ptyecho", "readln"];
+const TOOL_NAMES: [&str; 34] = ["date", "cat", "write", "rm", "ls", "mkdir", "rmdir", "log", "snap", "lsdev", "config", "set", "beep", "usage", "ps", "run", "perm", "stop", "lsvol", "uname", "uptime", "dmesg", "echo", "ping", "ip", "nslookup", "tcp", "nc", "arp", "httpd", "ss", "script", "ptyecho", "readln"];
 
 // The debug-build target path of a userspace ELF: each crate builds to its own target dir.
 fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
