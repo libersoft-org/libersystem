@@ -1331,26 +1331,42 @@ worthwhile now (real I/O or documentation debt), P3 = hygiene when touching the
 area anyway.
 
 Bugs and correctness:
-- [ ] (P1) `fsck` can verify from RAM instead of the disk: it never clears `icache`/`dcache`/`rcsum`/`decomp`, so a cached inode skips its tree-path and spill-chain CRC verification and `count_corrupt` may serve a checksum block from the read cache - a damaged metadata block behind a cached inode escapes the report and fsck says clean. Integrity is not at risk (a real read still surfaces the corruption); the DIAGNOSIS lies. Fix: drop all four caches at the top of `fsck`.
-- [ ] (P2) The module doc in lib.rs still describes the compression as "a small, dependency-free LZSS coder" and does not mention the per-volume switch or the off-by-default policy - the crate's front page lies about the format since M75.
-- [ ] (P3) `reserve_run` silently truncates `len as u32`: a single write past 16 TiB would claim more blocks than the stored run count ever consumes or releases, leaking free-map bits until the next full rederivation. Unreachable today (the data would not fit in memory) - clamp the reservation anyway, it is one line.
-- [ ] (P3) `decompress_extent` trusts `ext.clen` off the disk in `&comp[..ext.clen as usize]`. The extent record is CRC-protected by its parent, so this cannot fire without a checksum collision - but a defensive `.min(comp.len())` costs nothing and removes the theoretical panic.
-- [ ] (P3) `fsck` verifies the pinned snapshot generations' inode trees and file data but not their DIRECTORY trees; corruption in a snapshot's directory node surfaces only when `mount_named_snapshot` walks it. Either extend the walk or document the gap at the fsck comment.
+- [x] (P1) `fsck` can verify from RAM instead of the disk: it never clears `icache`/`dcache`/`rcsum`/`decomp`, so a cached inode skips its tree-path and spill-chain CRC verification and `count_corrupt` may serve a checksum block from the read cache - a damaged metadata block behind a cached inode escapes the report and fsck says clean. Integrity is not at risk (a real read still surfaces the corruption); the DIAGNOSIS lies. Fix: drop all four caches at the top of `fsck`.
+  - Result: all four caches drop at the top of `fsck`. New test `fsck_verifies_the_disk_not_the_caches`: a device whose reads of one block corrupt ON SWITCH (a shared cell, flipped while the mount is live and the inode cache warm) - fsck must surface the damaged spill block from the device, then report clean again once the device heals.
+- [x] (P2) The module doc in lib.rs still describes the compression as "a small, dependency-free LZSS coder" and does not mention the per-volume switch or the off-by-default policy - the crate's front page lies about the format since M75.
+  - Result: the compression section now says LZ4 block format, per-volume switch in the superblock, off by default, new whole-file writes only.
+- [x] (P3) `reserve_run` silently truncates `len as u32`: a single write past 16 TiB would claim more blocks than the stored run count ever consumes or releases, leaking free-map bits until the next full rederivation. Unreachable today (the data would not fit in memory) - clamp the reservation anyway, it is one line.
+  - Result: clamped to u32::MAX blocks before the claim, so the accounting can never drift from the reservation.
+- [x] (P3) `decompress_extent` trusts `ext.clen` off the disk in `&comp[..ext.clen as usize]`. The extent record is CRC-protected by its parent, so this cannot fire without a checksum collision - but a defensive `.min(comp.len())` costs nothing and removes the theoretical panic.
+  - Result: bounded with `.min(comp.len())`, commented as defense in depth over the CRC protection.
+- [x] (P3) `fsck` verifies the pinned snapshot generations' inode trees and file data but not their DIRECTORY trees; corruption in a snapshot's directory node surfaces only when `mount_named_snapshot` walks it. Either extend the walk or document the gap at the fsck comment.
+  - Result: extended - `check_inode_tree` now walks each directory inode's tree through a new `check_dir_tree` (CRC-verified via `read_node`), so a snapshot generation's directory damage surfaces in fsck, not first at mount.
 
 Optimizations:
-- [ ] (P2) `write_logical`'s overwrite path copies the old block via `cow_data` (a read plus a write) and then immediately overwrites the copy whole - the caller always passes a full block, so the copy is pure waste. Replace with allocate-and-drop (keep the in-place fast path for fresh blocks): an overwritten block costs 1 device op instead of 3. The biggest remaining I/O win (write_at / truncate-tail workloads).
-- [ ] (P3) `place_block`'s new-extent path writes the checksum block to the device and the first extension immediately reads it back into `wcsum`. Seeding `wcsum` directly (no device write; the flush handles it) saves a write and a read per new extent.
-- [ ] (P3) The inode and dentry caches evict the SMALLEST key (`BTreeMap::keys().next()`): inode 0 and the root directory's entries - the hottest items in the volume - are always first out. Evict the last (or a rotating) key instead.
-- [ ] (P3) `write_file_inner` clones the old inode (`o.clone()`, the whole extent Vec) just to call `drop_inode_blocks` - the value is a local, not borrowed from self, so the clone is a borrow-checker relic. Pass the reference.
-- [ ] (P3) `append_inner` resolves the path twice (its own `resolve`, then `write_at_inner`'s `resolve_parent`); the dentry cache muffles it, but sharing the resolution is cleaner.
-- [ ] (P3) `icache_put` clones the whole inode (extent Vec included) on every `write_inode` - ~10 KB per write for a 256-extent file. Consider caching only bounded-size maps on the write path, or an Rc-style shared map, when a measurement asks for it.
+- [x] (P2) `write_logical`'s overwrite path copies the old block via `cow_data` (a read plus a write) and then immediately overwrites the copy whole - the caller always passes a full block, so the copy is pure waste. Replace with allocate-and-drop (keep the in-place fast path for fresh blocks): an overwritten block costs 1 device op instead of 3. The biggest remaining I/O win (write_at / truncate-tail workloads).
+  - Result: the overwrite path now allocates fresh and records the committed block dropped - no copy; a fresh block still rewrites in place. `cow_data` had no other caller and is gone (`cow_meta` stays for the checksum-block paths). Covered by the standing overwrite/split/thaw tests and the free-map equivalence test.
+- [x] (P3) `place_block`'s new-extent path writes the checksum block to the device and the first extension immediately reads it back into `wcsum`. Seeding `wcsum` directly (no device write; the flush handles it) saves a write and a read per new extent.
+  - Result: the fresh checksum block is born in `wcsum` (after flushing any pending one) and reaches the device once, on eviction or at the commit flush.
+- [x] (P3) The inode and dentry caches evict the SMALLEST key (`BTreeMap::keys().next()`): inode 0 and the root directory's entries - the hottest items in the volume - are always first out. Evict the last (or a rotating) key instead.
+  - Result: both evict `next_back()` (the largest key), so the root inode and the root directory's entries stay put.
+- [x] (P3) `write_file_inner` clones the old inode (`o.clone()`, the whole extent Vec) just to call `drop_inode_blocks` - the value is a local, not borrowed from self, so the clone is a borrow-checker relic. Pass the reference.
+  - Result: passes the reference; the clone is gone.
+- [x] (P3) `append_inner` resolves the path twice (its own `resolve`, then `write_at_inner`'s `resolve_parent`); the dentry cache muffles it, but sharing the resolution is cleaner.
+  - Result: `write_at_inner` takes `Option<u64>` (None = the file's current end), so `append` is a one-line wrapper resolving once and `append_inner` is gone.
+- [x] (P3) `icache_put` clones the whole inode (extent Vec included) on every `write_inode` - ~10 KB per write for a 256-extent file. Consider caching only bounded-size maps on the write path, or an Rc-style shared map, when a measurement asks for it.
+  - Result: assessed and left as is - the benchmark's 64 MiB file is 16 extents (a ~640-byte clone per write op, noise); the existing ICACHE_EXTENTS_MAX bound already skips pathological maps. An Rc-shared map is real complexity; it waits for a measurement that names this clone.
 
 Deduplication and cleanliness:
-- [ ] (P3) The chain-walk skeleton (read block, take next pointer, bound-check) exists six times: dropping and marking the spill chain, loading it, dropping and loading the snapshot chain, dropping the superseded chain in `flush_extents`. One `walk_chain` helper would also unify the bound checks.
-- [ ] (P3) `for b in buf.iter_mut() { *b = 0; }` survives at ten sites while other code uses `buf.fill(0)` - one style should win (fill).
-- [ ] (P3) `EXTENT_HDR` (= 16) duplicates `CHAIN_HDR` since the M76 header unification - the extent-chain code should reference `CHAIN_HDR` and the old constant should go.
-- [ ] (P3) The internal-node routing loop (`while ci < count && sep_key(&buf, ci) <= key`) is copied six times across the two trees' lookup/insert/delete - a tiny `route_child(buf, count, key)` helper ends the copies.
+- [x] (P3) The chain-walk skeleton (read block, take next pointer, bound-check) exists six times: dropping and marking the spill chain, loading it, dropping and loading the snapshot chain, dropping the superseded chain in `flush_extents`. One `walk_chain` helper would also unify the bound checks.
+  - Result: `walk_chain(start, f)` owns the raw bound-checked walk; the four drop/mark sites ride it (drop_inode_blocks, flush_extents, write_snapshot_table, collect_inode_blocks). The two LOADERS stay separate on purpose: they verify each link's CRC against its predecessor and parse records - a different contract than the raw walk, and forcing them through one helper would blur exactly the verified/raw distinction the comments lean on.
+- [x] (P3) `for b in buf.iter_mut() { *b = 0; }` survives at ten sites while other code uses `buf.fill(0)` - one style should win (fill).
+  - Result: all ten converted to `fill(0)`.
+- [x] (P3) `EXTENT_HDR` (= 16) duplicates `CHAIN_HDR` since the M76 header unification - the extent-chain code should reference `CHAIN_HDR` and the old constant should go.
+  - Result: gone; the extent-chain code references `CHAIN_HDR`.
+- [x] (P3) The internal-node routing loop (`while ci < count && sep_key(&buf, ci) <= key`) is copied six times across the two trees' lookup/insert/delete - a tiny `route_child(buf, count, key)` helper ends the copies.
+  - Result: `route_child` in txn.rs; all six sites call it.
 - Done when: fsck verifies from the disk (P1), the overwrite path writes each block once and the module doc tells the truth (P2), and whichever P3 items land leave the suite green - liberfs host tests, kernel fresh + mount, build 0 warnings.
+  - Result: every item landed (one assessed-and-declined with its reasoning recorded). liberfs 74 host tests (1 new), kernel 85 fresh + 85 mount, build 0 warnings.
 - Concept: the M73-M76 audit track this sweeps up after; the codebase-uniformity principle (the P3 hygiene items).
 
 ## Definition of done (phase 2)

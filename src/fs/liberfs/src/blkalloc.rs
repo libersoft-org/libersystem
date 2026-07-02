@@ -727,11 +727,7 @@ pub(crate) fn clear_bit(bitmap: &mut [u8], b: u64) {
 
 pub(crate) fn test_bit(bitmap: &[u8], b: u64) -> bool {
 	let i = (b / 8) as usize;
-	if i < bitmap.len() {
-		bitmap[i] & (1 << (b % 8)) != 0
-	} else {
-		true
-	}
+	if i < bitmap.len() { bitmap[i] & (1 << (b % 8)) != 0 } else { true }
 }
 
 // Index of the extent covering logical block `lb`, or None if it falls in a hole. The
@@ -742,11 +738,7 @@ pub(crate) fn find_extent(extents: &[Extent], lb: u64) -> Option<usize> {
 	if pos == 0 {
 		return None;
 	}
-	if extents[pos - 1].covers(lb) {
-		Some(pos - 1)
-	} else {
-		None
-	}
+	if extents[pos - 1].covers(lb) { Some(pos - 1) } else { None }
 }
 
 // Hash the 4-byte prefix at `w` into an LZ_HASH_BITS-wide match-finder bucket.

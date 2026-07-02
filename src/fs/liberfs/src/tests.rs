@@ -1543,3 +1543,57 @@ fn a_write_across_a_compressed_extent_boundary_thaws_both_runs() {
 	assert_eq!(fs.read_file(b"big").unwrap(), big);
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
 }
+
+// M77: fsck must verify the disk, not the caches.
+
+// A MemDevice that corrupts reads of one (externally switchable) block: the shared
+// cell lets the test flip corruption on while the filesystem stays mounted, with its
+// caches warm - exactly the case fsck must not be fooled by.
+struct SwitchableCorruptDevice {
+	inner: MemDevice,
+	target: std::rc::Rc<core::cell::Cell<u64>>,
+}
+
+impl BlockDevice for SwitchableCorruptDevice {
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+		if !self.inner.read_block(index, buf) {
+			return false;
+		}
+		if index == self.target.get() {
+			buf[20] ^= 0xFF;
+		}
+		true
+	}
+
+	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+		self.inner.write_block(index, buf)
+	}
+}
+
+#[test]
+fn fsck_verifies_the_disk_not_the_caches() {
+	let target = std::rc::Rc::new(core::cell::Cell::new(0u64));
+	let dev = SwitchableCorruptDevice { inner: MemDevice::new(512), target: target.clone() };
+	let mut fs = LiberFs::format(dev, 512).unwrap();
+	// a file with a spill chain (more extents than fit inline), then warm the inode
+	// cache by reading it back.
+	let span = |i: u64| i * 16 * BLOCK_SIZE as u64;
+	for i in 0..8u64 {
+		let payload = format!("span-{i}");
+		fs.write_at(b"sparse", span(i), payload.as_bytes()).unwrap();
+	}
+	let num = fs.lookup(b"sparse").unwrap();
+	let spill = fs.read_inode(num).unwrap().spill;
+	assert!(spill != 0, "eight extents should spill");
+	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
+
+	// corrupt the spill block's reads while the inode sits warm in the cache: fsck
+	// must reload from the device and surface the damage, not serve the cached map.
+	target.set(spill);
+	assert_eq!(fs.fsck().map(|_| ()), Err(FsError::Corrupt), "fsck served a cached inode instead of verifying the disk");
+
+	// healed device, clean report again (the caches repopulate from good reads).
+	target.set(0);
+	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
+	assert_eq!(fs.read_at(b"sparse", span(7), 6).unwrap(), b"span-7");
+}
