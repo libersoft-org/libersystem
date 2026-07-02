@@ -13,7 +13,17 @@ use std::fmt::Write as _;
 
 // Generate the Rust source of the `proto` module for one file.
 pub fn rust(file: &File, source: &str) -> Result<String, Error> {
-	let mut cg = Cg { out: String::new(), tmp: 0 };
+	// The enums that can express the dispatch overflow fallback: any error enum
+	// with an `again` case (the reply-too-big degradation needs a variant to name).
+	let mut again_enums: std::collections::HashSet<String> = std::collections::HashSet::new();
+	for item in &file.items {
+		if let Item::Enum(e) = item {
+			if e.cases.iter().any(|c| c.name == "again") {
+				again_enums.insert(e.name.clone());
+			}
+		}
+	}
+	let mut cg = Cg { out: String::new(), tmp: 0, again_enums };
 	cg.file(file, source);
 	for item in &file.items {
 		cg.item(item)?;
@@ -28,6 +38,9 @@ pub fn rust(file: &File, source: &str) -> Result<String, Error> {
 struct Cg {
 	out: String,
 	tmp: u32,
+	// Error-enum names that carry an `again` case, so a dispatch whose reply
+	// overflows the caller's buffer can degrade to a typed error.
+	again_enums: std::collections::HashSet<String>,
 }
 
 impl Cg {
@@ -262,8 +275,6 @@ impl Cg {
 			self.line("\t\tlet op = r.u16()?;");
 			self.line("\t\tlet corr = r.u32()?;");
 			self.line("\t\tlet mut writer = SliceWriter::new(out);");
-			self.line("\t\tlet w = &mut writer;");
-			self.line("\t\tw.u32(corr)?;");
 			self.line("\t\tmatch op {");
 			for m in &supported {
 				if matches!(&m.ret, Type::Stream(_)) {
@@ -279,7 +290,37 @@ impl Cg {
 				}
 				self.line(&format!("\t\t\t\tlet result = service.{}({});", field_ident(&m.name), args.join(", ")));
 				let code = self.write_place(&m.ret, "result", false).map_err(|e| Error::new(m.span, e))?;
-				self.line(&format!("\t\t\t\t{code}"));
+				// A result whose error enum carries an `again` case can degrade an
+				// oversized reply into a typed error instead of sending nothing
+				// (which would strand the client waiting forever).
+				let fallback: Option<String> = match &m.ret {
+					Type::Result(_, errty) => match errty.as_ref() {
+						Type::Named(n) if self.again_enums.contains(n) => Some(camel(n)),
+						_ => None,
+					},
+					_ => None,
+				};
+				if let Some(err_enum) = fallback {
+					self.line("\t\t\t\tlet encoded: Option<()> = (|| {");
+					self.line("\t\t\t\t\tlet w = &mut writer;");
+					self.line("\t\t\t\t\tw.u32(corr)?;");
+					self.line(&format!("\t\t\t\t\t{code}"));
+					self.line("\t\t\t\t\tSome(())");
+					self.line("\t\t\t\t})();");
+					self.line("\t\t\t\tif encoded.is_none() {");
+					self.line("\t\t\t\t\t// the reply outgrew the caller's buffer: replace it with a typed");
+					self.line("\t\t\t\t\t// error, so the client sees a failure instead of hanging.");
+					self.line("\t\t\t\t\twriter.reset();");
+					self.line("\t\t\t\t\tlet w = &mut writer;");
+					self.line("\t\t\t\t\tw.u32(corr)?;");
+					self.line("\t\t\t\t\tw.u8(0)?;");
+					self.line(&format!("\t\t\t\t\t{err_enum}::Again.write(w)?;"));
+					self.line("\t\t\t\t}");
+				} else {
+					self.line("\t\t\t\tlet w = &mut writer;");
+					self.line("\t\t\t\tw.u32(corr)?;");
+					self.line(&format!("\t\t\t\t{code}"));
+				}
 				self.line("\t\t\t}");
 			}
 			self.line("\t\t\t_ => return None,");

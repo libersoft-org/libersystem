@@ -79,10 +79,6 @@ fn geometry(fb: &Framebuffer) -> Geometry {
 	Geometry { width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size }
 }
 
-// The number of virtual terminals the console multiplexes (opened lazily by Ctrl+N,
-// so unopened VTs cost nothing).
-const NVT: usize = 63;
-
 // Control-byte chords intercepted by the console (never forwarded to a shell): the
 // virtio-input driver maps Ctrl+N to 0x0e (open a new VT) and Ctrl+] to 0x1d (cycle the
 // foreground). F-keys are not mapped by the driver and Alt+key collides with escape
@@ -102,7 +98,7 @@ const BELL_FLASH_TICKS: u64 = 10;
 
 // The tty line discipline limits (per VT).
 const LD_LINE_MAX: usize = 4096;
-const LD_HIST_MAX: usize = 32;
+const LD_HIST_MAX: usize = 512;
 
 // A small fixed buffer the line discipline accumulates echo bytes in, mirrored to the
 // serial port after a keystroke is processed (the framebuffer is echoed live).
@@ -1238,10 +1234,11 @@ unsafe fn handle_gpu_resize(console: &mut Console) {
 }
 
 // Open a new virtual terminal: spawn a fully-capable shell over its own per-VT service
-// connections, make it foreground, and repaint. A no-op when headless or at the VT cap.
+// connections, make it foreground, and repaint. A no-op when headless; the VT set grows
+// on demand (a VT's cost is its grid, paid only when opened) - never a fixed cap.
 unsafe fn create_vt(console: &mut Console) {
 	unsafe {
-		if !console.has_fb || console.vts.len() >= NVT {
+		if !console.has_fb {
 			return;
 		}
 		if let Some(vt) = spawn_vt(&console.facs, console.addr, &console.fb, console.gpu, console.cur_w, console.cur_h) {

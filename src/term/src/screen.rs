@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 // fixed ring so the user can page back through them (Shift+PageUp / PageDown). 100 rows
 // ~= two screenfuls; the ring is allocated once per VT (deterministic memory: at the
 // 4-VT cap this plus the cell grids stays within the rt 1 MiB heap).
-const SCROLLBACK_ROWS: usize = 100;
+const SCROLLBACK_ROWS: usize = 1000;
 
 // Light-grey on near-black, matching the kernel console's boot-log colours.
 const FG: (u8, u8, u8) = (0xc8, 0xc8, 0xc8);

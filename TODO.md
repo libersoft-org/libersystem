@@ -1075,12 +1075,18 @@ too small for comfortable use, where raising them is cheap and self-contained -
 plus one defensive fix in the generated dispatch so an oversized reply can never
 strand a client again. All genuinely small, one commit.
 
-- [ ] NetworkService typed buffers: `REQ_MAX` 256 -> 1024 (a DNS name alone may be 253 bytes plus framing) and `REPLY_MAX` 1024 -> 4096 (`ss` with a handful of sockets overflows it), aligning the network service with the 4096 wire ceiling every other service uses.
-- [ ] Line-editor history: `LD_HIST_MAX` 32 -> 512 entries (bash keeps 500+; the history is a Vec, the raise is free).
-- [ ] Terminal scrollback: `SCROLLBACK_ROWS` 100 -> 1000 (xterm's default; 100 rows is barely two screens). Verify the scrollback allocation stays lazy per opened VT.
-- [ ] Journal capacity: `JOURNAL_CAP` 32 -> 4096 records (32 records make the journal useless for diagnosing anything that happened more than a minute ago); persistence stays M70.
-- [ ] `NVT` uncapped: the VT set is a Vec like the PTY set; a VT's cost is its grid, paid only when opened - no reason for a ceiling at all.
-- [ ] Defensive dispatch: a generated server whose reply does not fit the caller's buffer currently returns None - no reply is sent and the client blocks forever. Teach lsidl-gen's dispatch to answer with a typed error (`again`) instead, so an oversized list degrades into a visible failure until M71 streams it.
+- [x] NetworkService typed buffers: `REQ_MAX` 256 -> 1024 (a DNS name alone may be 253 bytes plus framing) and `REPLY_MAX` 1024 -> 4096 (`ss` with a handful of sockets overflows it), aligning the network service with the 4096 wire ceiling every other service uses.
+  - Result: both raised as specified; the request buffer stays a stack array (1 KiB is fine on the 256 KiB stacks), the reply buffer was already heap-backed.
+- [x] Line-editor history: `LD_HIST_MAX` 32 -> 512 entries (bash keeps 500+; the history is a Vec, the raise is free).
+  - Result: raised; the history Vec grows to the new bound with the same oldest-drops eviction.
+- [x] Terminal scrollback: `SCROLLBACK_ROWS` 100 -> 1000 (xterm's default; 100 rows is barely two screens). Verify the scrollback allocation stays lazy per opened VT.
+  - Result: raised; verified lazy - the scrollback buffer lives in `Screen`, which exists only for opened display VTs (a PTY has no Screen at all), so unopened VTs still cost nothing.
+- [x] Journal capacity: `JOURNAL_CAP` 32 -> 4096 records (32 records make the journal useless for diagnosing anything that happened more than a minute ago); persistence stays M70.
+  - Result: raised to 4096. A limited query now returns the NEWEST matches (it used to take the oldest, which a deep journal would make useless), and the `log` command asks for the newest 32 (one typed reply's worth) - the full journal streams via `log tail`, and paging arrives with M71.
+- [x] `NVT` uncapped: the VT set is a Vec like the PTY set; a VT's cost is its grid, paid only when opened - no reason for a ceiling at all.
+  - Result: the constant and the ceiling check are gone; `create_vt` is bounded only by being headless.
+- [x] Defensive dispatch: a generated server whose reply does not fit the caller's buffer currently returns None - no reply is sent and the client blocks forever. Teach lsidl-gen's dispatch to answer with a typed error (`again`) instead, so an oversized list degrades into a visible failure until M71 streams it.
+  - Result: the generated dispatch now encodes each reply through a rewindable writer (`SliceWriter::reset`); when the encode overflows and the op's error enum carries an `again` case, the reply is rewritten in place as [corr][err][again] - which always fits - so the client gets a typed failure instead of silence. Ops without such an error enum keep the old behaviour. Covered by the new proto test `oversized_reply_degrades_to_a_typed_error` (6-byte buffer forces the fallback; a roomy buffer still gets the real reply).
 - Done when: the raised limits hold under the existing tests, an oversized reply produces a typed error (not a hang), and `just test` stays green.
 - Concept: the limits audit (no silent truncation, generous defaults where memory is cheap), M37 observability (a journal deep enough to diagnose with).
 

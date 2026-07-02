@@ -60,10 +60,11 @@ const TCP_REPLY_MAX: usize = 512;
 // The frame-buffer size: one full Ethernet frame (1514 bytes) with slack. The
 // driver forwards frames without the virtio_net_hdr, so this is the L2 frame only.
 const FRAME_MAX: usize = 2048;
-// The typed request and reply buffers for one client call (a `fetch` reply carries
-// up to TCP_REPLY_MAX response bytes plus the codec framing).
-const REQ_MAX: usize = 256;
-const REPLY_MAX: usize = 1024;
+// The typed request and reply buffers for one client call. The request buffer fits
+// any op comfortably (a DNS name alone may be 253 bytes plus framing); the reply
+// buffer matches the 4096 wire ceiling every other service uses.
+const REQ_MAX: usize = 1024;
+const REPLY_MAX: usize = 4096;
 // How many bytes a single socket `recv` returns (the client calls `recv` repeatedly
 // to drain a larger response); kept small for the 16 KiB user stack.
 const SOCK_RECV_MAX: usize = 512;

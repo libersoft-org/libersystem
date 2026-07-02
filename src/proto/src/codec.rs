@@ -105,6 +105,13 @@ impl<'a> SliceWriter<'a> {
 	pub fn handle(&self) -> u64 {
 		self.handle
 	}
+
+	// Rewind to an empty buffer, dropping anything written and any recorded handle,
+	// so a failed encode can be replaced in place - the dispatch overflow fallback.
+	pub fn reset(&mut self) {
+		self.pos = 0;
+		self.handle = 0;
+	}
 }
 
 impl<'a> Sink for SliceWriter<'a> {

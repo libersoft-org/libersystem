@@ -151,11 +151,7 @@ struct VolStub;
 
 impl volume::Service for VolStub {
 	fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error> {
-		if o.path.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(OpenResult { file: 0xCAFE, size: 42 })
-		}
+		if o.path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
 	}
 
 	fn list(&mut self, _path: String) -> Result<Vec<FileInfo>, Error> {
@@ -165,27 +161,15 @@ impl volume::Service for VolStub {
 	fn write(&mut self, path: String, data: crate::codec::Buffer) -> Result<(), Error> {
 		// the buffer handle must have travelled out-of-band (set_handle -> request_handle
 		// -> take_handle); prove it by succeeding only when it arrives intact.
-		if path.is_empty() || data.handle != 0xBEEF || data.len != 5 {
-			Err(Error::Invalid)
-		} else {
-			Ok(())
-		}
+		if path.is_empty() || data.handle != 0xBEEF || data.len != 5 { Err(Error::Invalid) } else { Ok(()) }
 	}
 
 	fn remove(&mut self, path: String) -> Result<(), Error> {
-		if path.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(())
-		}
+		if path.is_empty() { Err(Error::NotFound) } else { Ok(()) }
 	}
 
 	fn snap_create(&mut self, name: String) -> Result<(), Error> {
-		if name.is_empty() {
-			Err(Error::Invalid)
-		} else {
-			Ok(())
-		}
+		if name.is_empty() { Err(Error::Invalid) } else { Ok(()) }
 	}
 
 	fn snap_list(&mut self) -> Result<Vec<SnapshotInfo>, Error> {
@@ -193,36 +177,20 @@ impl volume::Service for VolStub {
 	}
 
 	fn snap_delete(&mut self, name: String) -> Result<(), Error> {
-		if name.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(())
-		}
+		if name.is_empty() { Err(Error::NotFound) } else { Ok(()) }
 	}
 
 	fn snap_open(&mut self, snapshot: String, path: String) -> Result<OpenResult, Error> {
 		// the file handle must travel out-of-band, exactly like `open`.
-		if snapshot.is_empty() || path.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(OpenResult { file: 0xCAFE, size: 42 })
-		}
+		if snapshot.is_empty() || path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
 	}
 
 	fn mkdir(&mut self, path: String) -> Result<(), Error> {
-		if path.is_empty() {
-			Err(Error::Invalid)
-		} else {
-			Ok(())
-		}
+		if path.is_empty() { Err(Error::Invalid) } else { Ok(()) }
 	}
 
 	fn rmdir(&mut self, path: String) -> Result<(), Error> {
-		if path.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(())
-		}
+		if path.is_empty() { Err(Error::NotFound) } else { Ok(()) }
 	}
 
 	fn capacity(&mut self) -> Result<u64, Error> {
@@ -268,6 +236,29 @@ fn remove_round_trips() {
 	let mut client = volume::Client::new(VolLoopback { service: VolStub });
 	assert_eq!(client.remove("/x"), Some(Ok(())));
 	assert_eq!(client.remove(""), Some(Err(Error::NotFound)));
+}
+
+#[test]
+fn oversized_reply_degrades_to_a_typed_error() {
+	// A reply that outgrows the caller's buffer must not vanish (the client would
+	// block forever waiting for it): the dispatch overflow fallback rewrites it as
+	// a typed `again` error, which always fits. snap_list's Ok reply (a one-entry
+	// snapshot list) needs more than the 6 bytes offered here; the fallback -
+	// [corr u32][err tag][again] - is exactly 6.
+	let mut request = Vec::new();
+	request.extend_from_slice(&volume::OP_SNAP_LIST.to_le_bytes());
+	request.extend_from_slice(&7u32.to_le_bytes()); // correlation id
+	let mut out = [0u8; 6];
+	let mut reply_handle = 0u64;
+	let n = volume::dispatch(&mut VolStub, &request, 0, &mut out, &mut reply_handle).expect("the fallback reply should be produced");
+	assert_eq!(&out[..4], &7u32.to_le_bytes(), "the fallback keeps the correlation id");
+	assert_eq!(out[4], 0, "the fallback is the error arm");
+	assert_eq!(Error::decode(&out[5..n]), Some(Error::Again), "the fallback error is `again`");
+	// with room to spare the same call succeeds normally.
+	let mut big = [0u8; 256];
+	let n = volume::dispatch(&mut VolStub, &request, 0, &mut big, &mut reply_handle).expect("the real reply fits");
+	assert_eq!(big[4], 1, "the roomy reply is the ok arm");
+	assert!(n > 6, "the ok reply carries the snapshot list");
 }
 
 #[test]

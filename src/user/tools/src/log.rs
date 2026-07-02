@@ -49,12 +49,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	exit();
 }
 
-// Query LogService for the whole journal over the granted log client and print it, rendering
-// each entry to text (prefixed with its wall-clock time) or JSON on the client side. The
-// query asks for all severities and no limit.
+// Query LogService for the newest journal records over the granted log client and print
+// them, rendering each entry to text (prefixed with its wall-clock time) or JSON on the
+// client side. The query asks for all severities, limited to the newest records that fit
+// one typed reply - the journal itself is much deeper; `log tail` streams all of it.
 unsafe fn query_log(logsvc: u64, timesvc: u64, json: bool) {
 	unsafe {
-		let q = Query { since: None, min_severity: None, source: None, limit: 0 };
+		let q = Query { since: None, min_severity: None, source: None, limit: 32 };
 		let epoch: Option<u64> = boot_epoch(timesvc);
 		let mut client = log::Client::new(ChannelTransport { chan: logsvc });
 		match client.query(&q) {

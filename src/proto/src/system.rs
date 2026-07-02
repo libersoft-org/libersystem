@@ -254,40 +254,66 @@ pub mod log {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_EMIT => {
 				let e = Entry::read(r)?;
 				let result = service.emit(e);
-				match &result {
-					Ok(v6) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v6) => {
+							w.u8(1)?;
+						}
+						Err(v7) => {
+							w.u8(0)?;
+							v7.write(w)?;
+						}
 					}
-					Err(v7) => {
-						w.u8(0)?;
-						v7.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_QUERY => {
 				let q = Query::read(r)?;
 				let result = service.query(q);
-				match &result {
-					Ok(v8) => {
-						w.u8(1)?;
-						if v8.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v8) => {
+							w.u8(1)?;
+							if v8.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v8.len() as u16)?;
+							for v10 in v8.iter() {
+								v10.write(w)?;
+							}
 						}
-						w.u16(v8.len() as u16)?;
-						for v10 in v8.iter() {
-							v10.write(w)?;
+						Err(v9) => {
+							w.u8(0)?;
+							v9.write(w)?;
 						}
 					}
-					Err(v9) => {
-						w.u8(0)?;
-						v9.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -609,41 +635,67 @@ pub mod volume {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_OPEN => {
 				let o = OpenOpts::read(r)?;
 				let result = service.open(o);
-				match &result {
-					Ok(v13) => {
-						w.u8(1)?;
-						v13.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v13) => {
+							w.u8(1)?;
+							v13.write(w)?;
+						}
+						Err(v14) => {
+							w.u8(0)?;
+							v14.write(w)?;
+						}
 					}
-					Err(v14) => {
-						w.u8(0)?;
-						v14.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_LIST => {
 				let path = r.string_lp()?;
 				let result = service.list(path);
-				match &result {
-					Ok(v15) => {
-						w.u8(1)?;
-						if v15.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v15) => {
+							w.u8(1)?;
+							if v15.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v15.len() as u16)?;
+							for v17 in v15.iter() {
+								v17.write(w)?;
+							}
 						}
-						w.u16(v15.len() as u16)?;
-						for v17 in v15.iter() {
-							v17.write(w)?;
+						Err(v16) => {
+							w.u8(0)?;
+							v16.write(w)?;
 						}
 					}
-					Err(v16) => {
-						w.u8(0)?;
-						v16.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_WRITE => {
@@ -654,126 +706,252 @@ pub mod volume {
 					crate::codec::Buffer { handle, len }
 				};
 				let result = service.write(path, data);
-				match &result {
-					Ok(v18) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v18) => {
+							w.u8(1)?;
+						}
+						Err(v19) => {
+							w.u8(0)?;
+							v19.write(w)?;
+						}
 					}
-					Err(v19) => {
-						w.u8(0)?;
-						v19.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_REMOVE => {
 				let path = r.string_lp()?;
 				let result = service.remove(path);
-				match &result {
-					Ok(v20) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v20) => {
+							w.u8(1)?;
+						}
+						Err(v21) => {
+							w.u8(0)?;
+							v21.write(w)?;
+						}
 					}
-					Err(v21) => {
-						w.u8(0)?;
-						v21.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_SNAP_CREATE => {
 				let name = r.string_lp()?;
 				let result = service.snap_create(name);
-				match &result {
-					Ok(v22) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v22) => {
+							w.u8(1)?;
+						}
+						Err(v23) => {
+							w.u8(0)?;
+							v23.write(w)?;
+						}
 					}
-					Err(v23) => {
-						w.u8(0)?;
-						v23.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_SNAP_LIST => {
 				let result = service.snap_list();
-				match &result {
-					Ok(v24) => {
-						w.u8(1)?;
-						if v24.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v24) => {
+							w.u8(1)?;
+							if v24.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v24.len() as u16)?;
+							for v26 in v24.iter() {
+								v26.write(w)?;
+							}
 						}
-						w.u16(v24.len() as u16)?;
-						for v26 in v24.iter() {
-							v26.write(w)?;
+						Err(v25) => {
+							w.u8(0)?;
+							v25.write(w)?;
 						}
 					}
-					Err(v25) => {
-						w.u8(0)?;
-						v25.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_SNAP_DELETE => {
 				let name = r.string_lp()?;
 				let result = service.snap_delete(name);
-				match &result {
-					Ok(v27) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v27) => {
+							w.u8(1)?;
+						}
+						Err(v28) => {
+							w.u8(0)?;
+							v28.write(w)?;
+						}
 					}
-					Err(v28) => {
-						w.u8(0)?;
-						v28.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_SNAP_OPEN => {
 				let snapshot = r.string_lp()?;
 				let path = r.string_lp()?;
 				let result = service.snap_open(snapshot, path);
-				match &result {
-					Ok(v29) => {
-						w.u8(1)?;
-						v29.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v29) => {
+							w.u8(1)?;
+							v29.write(w)?;
+						}
+						Err(v30) => {
+							w.u8(0)?;
+							v30.write(w)?;
+						}
 					}
-					Err(v30) => {
-						w.u8(0)?;
-						v30.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_MKDIR => {
 				let path = r.string_lp()?;
 				let result = service.mkdir(path);
-				match &result {
-					Ok(v31) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v31) => {
+							w.u8(1)?;
+						}
+						Err(v32) => {
+							w.u8(0)?;
+							v32.write(w)?;
+						}
 					}
-					Err(v32) => {
-						w.u8(0)?;
-						v32.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_RMDIR => {
 				let path = r.string_lp()?;
 				let result = service.rmdir(path);
-				match &result {
-					Ok(v33) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v33) => {
+							w.u8(1)?;
+						}
+						Err(v34) => {
+							w.u8(0)?;
+							v34.write(w)?;
+						}
 					}
-					Err(v34) => {
-						w.u8(0)?;
-						v34.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_CAPACITY => {
 				let result = service.capacity();
-				match &result {
-					Ok(v35) => {
-						w.u8(1)?;
-						w.u64(*v35)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v35) => {
+							w.u8(1)?;
+							w.u64(*v35)?;
+						}
+						Err(v36) => {
+							w.u8(0)?;
+							v36.write(w)?;
+						}
 					}
-					Err(v36) => {
-						w.u8(0)?;
-						v36.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -1106,40 +1284,66 @@ pub mod device {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_LIST => {
 				let result = service.list();
-				match &result {
-					Ok(v41) => {
-						w.u8(1)?;
-						if v41.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v41) => {
+							w.u8(1)?;
+							if v41.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v41.len() as u16)?;
+							for v43 in v41.iter() {
+								v43.write(w)?;
+							}
 						}
-						w.u16(v41.len() as u16)?;
-						for v43 in v41.iter() {
-							v43.write(w)?;
+						Err(v42) => {
+							w.u8(0)?;
+							v42.write(w)?;
 						}
 					}
-					Err(v42) => {
-						w.u8(0)?;
-						v42.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_GET => {
 				let index = r.u32()?;
 				let result = service.get(index);
-				match &result {
-					Ok(v44) => {
-						w.u8(1)?;
-						v44.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v44) => {
+							w.u8(1)?;
+							v44.write(w)?;
+						}
+						Err(v45) => {
+							w.u8(0)?;
+							v45.write(w)?;
+						}
 					}
-					Err(v45) => {
-						w.u8(0)?;
-						v45.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -1274,26 +1478,38 @@ pub mod usb {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_LIST => {
 				let result = service.list();
-				match &result {
-					Ok(v48) => {
-						w.u8(1)?;
-						if v48.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v48) => {
+							w.u8(1)?;
+							if v48.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v48.len() as u16)?;
+							for v50 in v48.iter() {
+								v50.write(w)?;
+							}
 						}
-						w.u16(v48.len() as u16)?;
-						for v50 in v48.iter() {
-							v50.write(w)?;
+						Err(v49) => {
+							w.u8(0)?;
+							v49.write(w)?;
 						}
 					}
-					Err(v49) => {
-						w.u8(0)?;
-						v49.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -1439,40 +1655,66 @@ pub mod process {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_START => {
 				let name = r.string_lp()?;
 				let result = service.start(name);
-				match &result {
-					Ok(v53) => {
-						w.u8(1)?;
-						v53.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v53) => {
+							w.u8(1)?;
+							v53.write(w)?;
+						}
+						Err(v54) => {
+							w.u8(0)?;
+							v54.write(w)?;
+						}
 					}
-					Err(v54) => {
-						w.u8(0)?;
-						v54.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_LIST => {
 				let result = service.list();
-				match &result {
-					Ok(v55) => {
-						w.u8(1)?;
-						if v55.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v55) => {
+							w.u8(1)?;
+							if v55.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v55.len() as u16)?;
+							for v57 in v55.iter() {
+								v57.write(w)?;
+							}
 						}
-						w.u16(v55.len() as u16)?;
-						for v57 in v55.iter() {
-							v57.write(w)?;
+						Err(v56) => {
+							w.u8(0)?;
+							v56.write(w)?;
 						}
 					}
-					Err(v56) => {
-						w.u8(0)?;
-						v56.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_LAUNCH => {
@@ -1482,15 +1724,29 @@ pub mod process {
 					r.take_handle()
 				};
 				let result = service.launch(name, bootstrap);
-				match &result {
-					Ok(v58) => {
-						w.u8(1)?;
-						v58.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v58) => {
+							w.u8(1)?;
+							v58.write(w)?;
+						}
+						Err(v59) => {
+							w.u8(0)?;
+							v59.write(w)?;
+						}
 					}
-					Err(v59) => {
-						w.u8(0)?;
-						v59.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -1636,53 +1892,93 @@ pub mod config {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_GET => {
 				let key = r.string_lp()?;
 				let result = service.get(key);
-				match &result {
-					Ok(v62) => {
-						w.u8(1)?;
-						w.bytes_lp(v62.as_bytes())?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v62) => {
+							w.u8(1)?;
+							w.bytes_lp(v62.as_bytes())?;
+						}
+						Err(v63) => {
+							w.u8(0)?;
+							v63.write(w)?;
+						}
 					}
-					Err(v63) => {
-						w.u8(0)?;
-						v63.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_LIST => {
 				let result = service.list();
-				match &result {
-					Ok(v64) => {
-						w.u8(1)?;
-						if v64.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v64) => {
+							w.u8(1)?;
+							if v64.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v64.len() as u16)?;
+							for v66 in v64.iter() {
+								v66.write(w)?;
+							}
 						}
-						w.u16(v64.len() as u16)?;
-						for v66 in v64.iter() {
-							v66.write(w)?;
+						Err(v65) => {
+							w.u8(0)?;
+							v65.write(w)?;
 						}
 					}
-					Err(v65) => {
-						w.u8(0)?;
-						v65.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_SET => {
 				let entry = ConfigEntry::read(r)?;
 				let result = service.set(entry);
-				match &result {
-					Ok(v67) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v67) => {
+							w.u8(1)?;
+						}
+						Err(v68) => {
+							w.u8(0)?;
+							v68.write(w)?;
+						}
 					}
-					Err(v68) => {
-						w.u8(0)?;
-						v68.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -1829,20 +2125,32 @@ pub mod picker {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_PICK => {
 				let result = service.pick();
-				match &result {
-					Ok(v71) => {
-						w.u8(1)?;
-						v71.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v71) => {
+							w.u8(1)?;
+							v71.write(w)?;
+						}
+						Err(v72) => {
+							w.u8(0)?;
+							v72.write(w)?;
+						}
 					}
-					Err(v72) => {
-						w.u8(0)?;
-						v72.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -2291,145 +2599,269 @@ pub mod network {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_INFO => {
 				let result = service.info();
-				match &result {
-					Ok(v85) => {
-						w.u8(1)?;
-						v85.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v85) => {
+							w.u8(1)?;
+							v85.write(w)?;
+						}
+						Err(v86) => {
+							w.u8(0)?;
+							v86.write(w)?;
+						}
 					}
-					Err(v86) => {
-						w.u8(0)?;
-						v86.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_RESOLVE => {
 				let name = r.string_lp()?;
 				let result = service.resolve(name);
-				match &result {
-					Ok(v87) => {
-						w.u8(1)?;
-						v87.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v87) => {
+							w.u8(1)?;
+							v87.write(w)?;
+						}
+						Err(v88) => {
+							w.u8(0)?;
+							v88.write(w)?;
+						}
 					}
-					Err(v88) => {
-						w.u8(0)?;
-						v88.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_PING => {
 				let addr = Ipv4Addr::read(r)?;
 				let result = service.ping(addr);
-				match &result {
-					Ok(v89) => {
-						w.u8(1)?;
-						v89.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v89) => {
+							w.u8(1)?;
+							v89.write(w)?;
+						}
+						Err(v90) => {
+							w.u8(0)?;
+							v90.write(w)?;
+						}
 					}
-					Err(v90) => {
-						w.u8(0)?;
-						v90.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_FETCH => {
 				let req = TcpRequest::read(r)?;
 				let result = service.fetch(req);
-				match &result {
-					Ok(v91) => {
-						w.u8(1)?;
-						if v91.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v91) => {
+							w.u8(1)?;
+							if v91.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v91.len() as u16)?;
+							for v93 in v91.iter() {
+								w.u8(*v93)?;
+							}
 						}
-						w.u16(v91.len() as u16)?;
-						for v93 in v91.iter() {
-							w.u8(*v93)?;
+						Err(v92) => {
+							w.u8(0)?;
+							v92.write(w)?;
 						}
 					}
-					Err(v92) => {
-						w.u8(0)?;
-						v92.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_CONNECT => {
 				let ep = Endpoint::read(r)?;
 				let result = service.connect(ep);
-				match &result {
-					Ok(v94) => {
-						w.u8(1)?;
-						w.set_handle(*v94);
-						w.u32(0)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v94) => {
+							w.u8(1)?;
+							w.set_handle(*v94);
+							w.u32(0)?;
+						}
+						Err(v95) => {
+							w.u8(0)?;
+							v95.write(w)?;
+						}
 					}
-					Err(v95) => {
-						w.u8(0)?;
-						v95.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_OPEN => {
 				let result = service.open();
-				match &result {
-					Ok(v96) => {
-						w.u8(1)?;
-						w.set_handle(*v96);
-						w.u32(0)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v96) => {
+							w.u8(1)?;
+							w.set_handle(*v96);
+							w.u32(0)?;
+						}
+						Err(v97) => {
+							w.u8(0)?;
+							v97.write(w)?;
+						}
 					}
-					Err(v97) => {
-						w.u8(0)?;
-						v97.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_LISTEN => {
 				let port = r.u16()?;
 				let result = service.listen(port);
-				match &result {
-					Ok(v98) => {
-						w.u8(1)?;
-						w.set_handle(*v98);
-						w.u32(0)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v98) => {
+							w.u8(1)?;
+							w.set_handle(*v98);
+							w.u32(0)?;
+						}
+						Err(v99) => {
+							w.u8(0)?;
+							v99.write(w)?;
+						}
 					}
-					Err(v99) => {
-						w.u8(0)?;
-						v99.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_SOCKETS => {
 				let result = service.sockets();
-				match &result {
-					Ok(v100) => {
-						w.u8(1)?;
-						if v100.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v100) => {
+							w.u8(1)?;
+							if v100.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v100.len() as u16)?;
+							for v102 in v100.iter() {
+								v102.write(w)?;
+							}
 						}
-						w.u16(v100.len() as u16)?;
-						for v102 in v100.iter() {
-							v102.write(w)?;
+						Err(v101) => {
+							w.u8(0)?;
+							v101.write(w)?;
 						}
 					}
-					Err(v101) => {
-						w.u8(0)?;
-						v101.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_SNTP => {
 				let server = Ipv4Addr::read(r)?;
 				let result = service.sntp(server);
-				match &result {
-					Ok(v103) => {
-						w.u8(1)?;
-						w.u64(*v103)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v103) => {
+							w.u8(1)?;
+							w.u64(*v103)?;
+						}
+						Err(v104) => {
+							w.u8(0)?;
+							v104.write(w)?;
+						}
 					}
-					Err(v104) => {
-						w.u8(0)?;
-						v104.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -2673,8 +3105,6 @@ pub mod socket {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_SEND => {
 				let data = {
@@ -2683,27 +3113,55 @@ pub mod socket {
 					crate::codec::Buffer { handle, len }
 				};
 				let result = service.send(data);
-				match &result {
-					Ok(v109) => {
-						w.u8(1)?;
-						w.u32(*v109)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v109) => {
+							w.u8(1)?;
+							w.u32(*v109)?;
+						}
+						Err(v110) => {
+							w.u8(0)?;
+							v110.write(w)?;
+						}
 					}
-					Err(v110) => {
-						w.u8(0)?;
-						v110.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_CLOSE => {
 				let result = service.close();
-				match &result {
-					Ok(v111) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v111) => {
+							w.u8(1)?;
+						}
+						Err(v112) => {
+							w.u8(0)?;
+							v112.write(w)?;
+						}
 					}
-					Err(v112) => {
-						w.u8(0)?;
-						v112.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -2863,21 +3321,33 @@ pub mod listener {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_ACCEPT => {
 				let result = service.accept();
-				match &result {
-					Ok(v116) => {
-						w.u8(1)?;
-						w.set_handle(*v116);
-						w.u32(0)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v116) => {
+							w.u8(1)?;
+							w.set_handle(*v116);
+							w.u32(0)?;
+						}
+						Err(v117) => {
+							w.u8(0)?;
+							v117.write(w)?;
+						}
 					}
-					Err(v117) => {
-						w.u8(0)?;
-						v117.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -2976,20 +3446,32 @@ pub mod time {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_NOW => {
 				let result = service.now();
-				match &result {
-					Ok(v118) => {
-						w.u8(1)?;
-						v118.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v118) => {
+							w.u8(1)?;
+							v118.write(w)?;
+						}
+						Err(v119) => {
+							w.u8(0)?;
+							v119.write(w)?;
+						}
 					}
-					Err(v119) => {
-						w.u8(0)?;
-						v119.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -3052,21 +3534,33 @@ pub mod audio {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_BEEP => {
 				let freq = r.u16()?;
 				let millis = r.u32()?;
 				let result = service.beep(freq, millis);
-				match &result {
-					Ok(v120) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v120) => {
+							w.u8(1)?;
+						}
+						Err(v121) => {
+							w.u8(0)?;
+							v121.write(w)?;
+						}
 					}
-					Err(v121) => {
-						w.u8(0)?;
-						v121.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -3504,20 +3998,32 @@ pub mod system_graph {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_SNAPSHOT => {
 				let result = service.snapshot();
-				match &result {
-					Ok(v131) => {
-						w.u8(1)?;
-						v131.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v131) => {
+							w.u8(1)?;
+							v131.write(w)?;
+						}
+						Err(v132) => {
+							w.u8(0)?;
+							v132.write(w)?;
+						}
 					}
-					Err(v132) => {
-						w.u8(0)?;
-						v132.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -3621,26 +4127,38 @@ pub mod supervisor {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_STATUS => {
 				let result = service.status();
-				match &result {
-					Ok(v133) => {
-						w.u8(1)?;
-						if v133.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v133) => {
+							w.u8(1)?;
+							if v133.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v133.len() as u16)?;
+							for v135 in v133.iter() {
+								v135.write(w)?;
+							}
 						}
-						w.u16(v133.len() as u16)?;
-						for v135 in v133.iter() {
-							v135.write(w)?;
+						Err(v134) => {
+							w.u8(0)?;
+							v134.write(w)?;
 						}
 					}
-					Err(v134) => {
-						w.u8(0)?;
-						v134.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -3862,40 +4380,66 @@ pub mod permission {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_LOOKUP => {
 				let component = r.string_lp()?;
 				let result = service.lookup(component);
-				match &result {
-					Ok(v141) => {
-						w.u8(1)?;
-						v141.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v141) => {
+							w.u8(1)?;
+							v141.write(w)?;
+						}
+						Err(v142) => {
+							w.u8(0)?;
+							v142.write(w)?;
+						}
 					}
-					Err(v142) => {
-						w.u8(0)?;
-						v142.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_AUDIT => {
 				let result = service.audit();
-				match &result {
-					Ok(v143) => {
-						w.u8(1)?;
-						if v143.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v143) => {
+							w.u8(1)?;
+							if v143.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v143.len() as u16)?;
+							for v145 in v143.iter() {
+								v145.write(w)?;
+							}
 						}
-						w.u16(v143.len() as u16)?;
-						for v145 in v143.iter() {
-							v145.write(w)?;
+						Err(v144) => {
+							w.u8(0)?;
+							v144.write(w)?;
 						}
 					}
-					Err(v144) => {
-						w.u8(0)?;
-						v144.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_RUN => {
@@ -3907,15 +4451,29 @@ pub mod permission {
 					r.take_handle()
 				};
 				let result = service.run(name, args, cwd, stdout);
-				match &result {
-					Ok(v146) => {
-						w.u8(1)?;
-						v146.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v146) => {
+							w.u8(1)?;
+							v146.write(w)?;
+						}
+						Err(v147) => {
+							w.u8(0)?;
+							v147.write(w)?;
+						}
 					}
-					Err(v147) => {
-						w.u8(0)?;
-						v147.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -4148,26 +4706,38 @@ pub mod resources {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_USAGE => {
 				let result = service.usage();
-				match &result {
-					Ok(v153) => {
-						w.u8(1)?;
-						if v153.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v153) => {
+							w.u8(1)?;
+							if v153.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v153.len() as u16)?;
+							for v155 in v153.iter() {
+								v155.write(w)?;
+							}
 						}
-						w.u16(v153.len() as u16)?;
-						for v155 in v153.iter() {
-							v155.write(w)?;
+						Err(v154) => {
+							w.u8(0)?;
+							v154.write(w)?;
 						}
 					}
-					Err(v154) => {
-						w.u8(0)?;
-						v154.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_SET_LIMIT => {
@@ -4175,15 +4745,29 @@ pub mod resources {
 				let kind = ResourceKind::read(r)?;
 				let limit = r.u64()?;
 				let result = service.set_limit(name, kind, limit);
-				match &result {
-					Ok(v156) => {
-						w.u8(1)?;
-						v156.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v156) => {
+							w.u8(1)?;
+							v156.write(w)?;
+						}
+						Err(v157) => {
+							w.u8(0)?;
+							v157.write(w)?;
+						}
 					}
-					Err(v157) => {
-						w.u8(0)?;
-						v157.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -4399,33 +4983,59 @@ pub mod session {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
-		let w = &mut writer;
-		w.u32(corr)?;
 		match op {
 			OP_CWD => {
 				let result = service.cwd();
-				match &result {
-					Ok(v160) => {
-						w.u8(1)?;
-						w.bytes_lp(v160.as_bytes())?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v160) => {
+							w.u8(1)?;
+							w.bytes_lp(v160.as_bytes())?;
+						}
+						Err(v161) => {
+							w.u8(0)?;
+							v161.write(w)?;
+						}
 					}
-					Err(v161) => {
-						w.u8(0)?;
-						v161.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_CHDIR => {
 				let path = r.string_lp()?;
 				let result = service.chdir(path);
-				match &result {
-					Ok(v162) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v162) => {
+							w.u8(1)?;
+						}
+						Err(v163) => {
+							w.u8(0)?;
+							v163.write(w)?;
+						}
 					}
-					Err(v163) => {
-						w.u8(0)?;
-						v163.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_JOB_REGISTER => {
@@ -4436,141 +5046,267 @@ pub mod session {
 					r.take_handle()
 				};
 				let result = service.job_register(name, stopped, proc);
-				match &result {
-					Ok(v164) => {
-						w.u8(1)?;
-						w.u32(*v164)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v164) => {
+							w.u8(1)?;
+							w.u32(*v164)?;
+						}
+						Err(v165) => {
+							w.u8(0)?;
+							v165.write(w)?;
+						}
 					}
-					Err(v165) => {
-						w.u8(0)?;
-						v165.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_JOB_TAKE => {
 				let id = r.u32()?;
 				let result = service.job_take(id);
-				match &result {
-					Ok(v166) => {
-						w.u8(1)?;
-						v166.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v166) => {
+							w.u8(1)?;
+							v166.write(w)?;
+						}
+						Err(v167) => {
+							w.u8(0)?;
+							v167.write(w)?;
+						}
 					}
-					Err(v167) => {
-						w.u8(0)?;
-						v167.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_JOB_LIST => {
 				let result = service.job_list();
-				match &result {
-					Ok(v168) => {
-						w.u8(1)?;
-						if v168.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v168) => {
+							w.u8(1)?;
+							if v168.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v168.len() as u16)?;
+							for v170 in v168.iter() {
+								v170.write(w)?;
+							}
 						}
-						w.u16(v168.len() as u16)?;
-						for v170 in v168.iter() {
-							v170.write(w)?;
+						Err(v169) => {
+							w.u8(0)?;
+							v169.write(w)?;
 						}
 					}
-					Err(v169) => {
-						w.u8(0)?;
-						v169.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_JOB_REAP => {
 				let result = service.job_reap();
-				match &result {
-					Ok(v171) => {
-						w.u8(1)?;
-						if v171.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v171) => {
+							w.u8(1)?;
+							if v171.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v171.len() as u16)?;
+							for v173 in v171.iter() {
+								v173.write(w)?;
+							}
 						}
-						w.u16(v171.len() as u16)?;
-						for v173 in v171.iter() {
-							v173.write(w)?;
+						Err(v172) => {
+							w.u8(0)?;
+							v172.write(w)?;
 						}
 					}
-					Err(v172) => {
-						w.u8(0)?;
-						v172.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_JOB_RESUME => {
 				let id = r.u32()?;
 				let result = service.job_resume(id);
-				match &result {
-					Ok(v174) => {
-						w.u8(1)?;
-						v174.write(w)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v174) => {
+							w.u8(1)?;
+							v174.write(w)?;
+						}
+						Err(v175) => {
+							w.u8(0)?;
+							v175.write(w)?;
+						}
 					}
-					Err(v175) => {
-						w.u8(0)?;
-						v175.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_ENV_GET => {
 				let name = r.string_lp()?;
 				let result = service.env_get(name);
-				match &result {
-					Ok(v176) => {
-						w.u8(1)?;
-						w.bytes_lp(v176.as_bytes())?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v176) => {
+							w.u8(1)?;
+							w.bytes_lp(v176.as_bytes())?;
+						}
+						Err(v177) => {
+							w.u8(0)?;
+							v177.write(w)?;
+						}
 					}
-					Err(v177) => {
-						w.u8(0)?;
-						v177.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_ENV_SET => {
 				let name = r.string_lp()?;
 				let value = r.string_lp()?;
 				let result = service.env_set(name, value);
-				match &result {
-					Ok(v178) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v178) => {
+							w.u8(1)?;
+						}
+						Err(v179) => {
+							w.u8(0)?;
+							v179.write(w)?;
+						}
 					}
-					Err(v179) => {
-						w.u8(0)?;
-						v179.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_ENV_UNSET => {
 				let name = r.string_lp()?;
 				let result = service.env_unset(name);
-				match &result {
-					Ok(v180) => {
-						w.u8(1)?;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v180) => {
+							w.u8(1)?;
+						}
+						Err(v181) => {
+							w.u8(0)?;
+							v181.write(w)?;
+						}
 					}
-					Err(v181) => {
-						w.u8(0)?;
-						v181.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			OP_ENV_LIST => {
 				let result = service.env_list();
-				match &result {
-					Ok(v182) => {
-						w.u8(1)?;
-						if v182.len() > u16::MAX as usize {
-							return None;
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v182) => {
+							w.u8(1)?;
+							if v182.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v182.len() as u16)?;
+							for v184 in v182.iter() {
+								v184.write(w)?;
+							}
 						}
-						w.u16(v182.len() as u16)?;
-						for v184 in v182.iter() {
-							v184.write(w)?;
+						Err(v183) => {
+							w.u8(0)?;
+							v183.write(w)?;
 						}
 					}
-					Err(v183) => {
-						w.u8(0)?;
-						v183.write(w)?;
-					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,

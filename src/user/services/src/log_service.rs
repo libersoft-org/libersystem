@@ -22,9 +22,10 @@ use proto::system::log::{self, Service};
 use proto::system::{Entry, Error, Query, Severity};
 use rt::*;
 
-// The bounded journal: at most this many records, newest dropping oldest. With a
-// heap available a real eviction policy / persistence is a later phase.
-const JOURNAL_CAP: usize = 32;
+// The bounded in-memory journal: at most this many records, newest dropping
+// oldest - deep enough to diagnose well past the last minute. Persistence (the
+// on-disk journal) is a later milestone; the depth becomes a config key then.
+const JOURNAL_CAP: usize = 4096;
 
 // The in-memory journal: a bounded list of canonical log entries.
 struct Journal {
@@ -37,7 +38,9 @@ impl Journal {
 	}
 
 	// Collect the entries matching `q`: at or above its minimum severity (none = all),
-	// capped by its limit (0 = no cap). Shared by `query` (one reply) and `tail`
+	// capped by its limit (0 = no cap). A limited query returns the NEWEST matches -
+	// the journal is deep now, and a bounded reply full of the oldest records would
+	// be useless for diagnosis. Shared by `query` (one reply) and `tail`
 	// (streamed frame by frame) so both filter identically.
 	fn filtered(&self, q: &Query) -> Vec<Entry> {
 		let min: u8 = q.min_severity.map(|s: Severity| s as u8).unwrap_or(0);
@@ -47,9 +50,9 @@ impl Journal {
 				continue;
 			}
 			out.push(entry.clone());
-			if q.limit != 0 && out.len() as u32 >= q.limit {
-				break;
-			}
+		}
+		if q.limit != 0 && out.len() > q.limit as usize {
+			out.drain(..out.len() - q.limit as usize);
 		}
 		out
 	}
