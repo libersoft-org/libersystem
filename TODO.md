@@ -1068,6 +1068,110 @@ owning service gains a typed query first; each ships as a binary per M61.
 - Done when: each command prints a stable inventory in the shell (and where useful a `--json` form), tests green - the HW resources are inspectable from the CLI.
 - Concept: Observability (a local, human- and machine-readable view of the live system), the layering principle (read-only views over DeviceService / the kernel, no new privilege), M50 / M61 / M62 (the DeviceService and System Graph, the binary tool model and the USB stack these extend).
 
+## M64 - Capacity quick wins (the limits-audit small fixes)
+
+The artificial-limits audit left a handful of buffers and rings that are simply
+too small for comfortable use, where raising them is cheap and self-contained -
+plus one defensive fix in the generated dispatch so an oversized reply can never
+strand a client again, and a few constants whose true bound the runtime already
+knows. Small items, one or two commits.
+
+- [ ] NetworkService typed buffers: `REQ_MAX` 256 -> 1024 (a DNS name alone may be 253 bytes plus framing) and `REPLY_MAX` 1024 -> 4096 (`ss` with a handful of sockets overflows it), aligning the network service with the 4096 wire ceiling every other service uses.
+- [ ] Line-editor history: `LD_HIST_MAX` 32 -> 512 entries (bash keeps 500+; the history is a Vec, the raise is free).
+- [ ] Terminal scrollback: `SCROLLBACK_ROWS` 100 -> 1000 (xterm's default; 100 rows is barely two screens). Verify the scrollback allocation stays lazy per opened VT.
+- [ ] Journal capacity: `JOURNAL_CAP` 32 -> 4096 records (32 records make the journal useless for diagnosing anything that happened more than a minute ago); persistence stays M68.
+- [ ] Defensive dispatch: a generated server whose reply does not fit the caller's buffer currently returns None - no reply is sent and the client blocks forever. Teach lsidl-gen's dispatch to answer with a typed error (`again`) instead, so an oversized list degrades into a visible failure until M69 streams it.
+- [ ] The bounded-by-nature values (scrollback, history, journal capacity, ARP cache, restart budgets) move from compile-time constants to ConfigService keys (`console.scrollback`, `log.capacity`, ...) - caches and rings must stay bounded (eviction), but the bound is the operator's policy, not the compiler's.
+- [ ] `volume.write`'s `MAX_WRITE` sanity bound is replaced by validating the claimed length against the transferred MemoryObject's real size (the kernel knows it) - the guard constant disappears.
+- [ ] `NVT` uncapped: the VT set is a Vec like the PTY set; a VT's cost is its grid, paid only when opened - no reason for a ceiling at all.
+- [ ] `MAX_WAIT_ANY` validated against the caller's real bound - its Domain handle budget - instead of a magic 4096.
+- [ ] `MAX_CPUS` retired: size the per-CPU tables (scheduler, percpu blocks, LAPIC ids) at boot from the Limine MP response - the heap is up before any AP wakes, so only the BSP's slot needs to be static and the constant disappears (the GDT/TSS side is already dynamic).
+- Done when: the raised limits hold under the existing tests, an oversized reply produces a typed error (not a hang), and `just test` stays green.
+- Concept: the limits audit (no silent truncation, generous defaults where memory is cheap), M37 observability (a journal deep enough to diagnose with).
+
+## M65 - LiberFS sized by the disk (drop the fixed 32 MiB pool)
+
+StorageService formats/mounts LiberFS over a hardcoded layout: `FS_START_SECTOR`
+16 MiB in, `FS_BLOCKS` = 32 MiB of pool - regardless of how big the disk really
+is. The block protocol can now report the disk's capacity (`OP_CAPACITY`, M63), so
+the layout should be derived from it.
+
+- [ ] On the BLOCK bootstrap, query the disk's capacity over the block channel and compute the pool: `fs_blocks = (capacity - FS_START) / BLOCK_SIZE`, formatting a fresh volume to span the whole disk.
+- [ ] An existing volume mounts at the size recorded in its superblock (never silently "grown" - the free map would not match); a mismatch against the disk is reported, and online resize stays future LiberFS work.
+- [ ] A kernel test formats a volume on a larger test disk and asserts the pool spans it (and that the seeded boot volume still mounts).
+- Done when: a fresh system volume uses the whole disk, an existing one mounts unchanged, tests green.
+- Concept: M63 (the capacity query this builds on), M43/M53 (LiberFS layout and large-volume scaling).
+
+## M66 - GPU framebuffer realloc on resize (no resolution ceiling)
+
+driver.virtio-gpu allocates its framebuffer once, floored at 1920x1080; a runtime
+resize beyond the allocation is clamped, so anything larger than the initial
+window - 4K, 8K, 16K, a video wall - never gets its full resolution. The fix is
+not a bigger constant (displays outgrow any constant) but reallocating for
+whatever geometry the host reports.
+
+- [ ] On a RESIZE beyond the allocated framebuffer, allocate a new DMA framebuffer for the new geometry, re-attach the scanout, and release the old buffer.
+- [ ] Drop the `MAX_W`/`MAX_H` floor entirely: allocate for the initial geometry and grow on demand - the display's own limit (virtio-gpu reports it) is the only bound.
+- Done when: an interactive window resize to any host-supported resolution renders full-resolution (and shrinking back releases nothing it still scans out), tests green.
+- Concept: M44 (the virtio-gpu driver and runtime mode-set this completes), the limits audit (no constant where the hardware can tell us the real bound).
+
+## M67 - Demand-paged user stacks
+
+User stacks are fully mapped up front (256 KiB per thread since the limits audit;
+Linux hands a thread 8 MiB precisely because it demand-pages). Deep call chains -
+the Wasm interpreter over a generated client over the codec - should not need a
+compile-time stack budget.
+
+- [ ] Map only the top pages of a new thread's stack; on a ring-3 page fault just below the mapped region, map the missing page and resume instead of terminating (the fault handler learns to tell stack growth from a genuine fault, with a hard floor so runaway recursion still dies).
+- [ ] Raise the stack ceiling (the reserved VA span) to megabytes now that only touched pages cost memory - and make the ceiling a per-Domain resource limit (ResourceManager policy, like the memory budget), not a global constant.
+- [ ] A kernel test drives a deep-recursion thread across the initially-mapped boundary and asserts it survives (and one that overruns the floor is killed).
+- Done when: a thread touches stack beyond the initial mapping and continues, memory only grows with use, tests green.
+- Concept: fault isolation (M17) - the fault handler gains its first resumable fault; the limits audit (budgets replaced by growth).
+
+## M68 - Journal persistence (LogService on the volume)
+
+The journal lives in memory and dies with the machine; the M64 raise makes it
+deep, not durable. An appliance needs logs that survive a reboot.
+
+- [ ] LogService gains a storage capability (its own StorageService client, granted by ServiceManager) and appends records to `vol://system/log/` - a size-bounded, rotating on-disk journal (structured records, not rendered text).
+- [ ] Flush policy: batched appends (never a disk write per record), flushed on a timer and on severity >= error.
+- [ ] `log` gains a `--boot <n>` selector to read a previous boot's journal off the volume.
+- [ ] Rotation: a size cap per boot and a count cap across boots, oldest deleted.
+- Done when: records written before a reboot are readable after it via `log --boot`, rotation holds the caps, tests green.
+- Concept: M37 observability (the journal as the durable system record), M43/M50 (the writable volume it persists to).
+
+## M69 - Streaming replies (retire the 4096 B wire ceiling)
+
+Every typed reply must fit one 4096 B message today; M64 makes overflow a visible
+error, this milestone makes it impossible. Unbounded lists - the permission audit
+trail, a big directory listing, socket recv - move to streams or pages, the way
+`log tail` already streams.
+
+- [ ] Pick the pattern per op: `stream<T>` sub-channels (the log-tail model) for unbounded lists (`permission.audit`, `volume.list` on big directories), explicit paging (`offset`/`limit`) where the client wants random access.
+- [ ] Regenerate and migrate the affected services and tools; the shell renders streams incrementally (a huge `ls` starts printing immediately).
+- [ ] Socket `recv` rides its existing stream sub-channel for bulk data, retiring the 512 B `SOCK_RECV_MAX`/`TCP_REPLY_MAX` chunk units.
+- [ ] `volume.write` grows a streaming form for large files (retiring the 16 MiB `MAX_WRITE` sanity bound as the practical limit).
+- [ ] The kernel's recv path learns to report a pending message's actual length (a peek), so a transport can size its buffer exactly instead of guessing a ceiling - the last wire constant goes.
+- Done when: no reply anywhere depends on fitting one message, big listings stream, tests green.
+- Concept: M26/M34 (the typed codec and its stream support), M64 (the defensive error this replaces with a real mechanism).
+
+## M70 - Contiguous DMA and full-size I/O (queues, sectors, jumbo)
+
+The throughput milestone: everything currently sized by "one 4 KiB DMA page" -
+virtqueue rings capped at 16 descriptors, block I/O moving one sector per device
+round-trip, the xHCI BOT data stage capped at 8 sectors, ethernet frames at MTU
+1500 - shares one root cause: the kernel cannot hand out physically contiguous
+multi-page DMA buffers.
+
+- [ ] Kernel: physically contiguous multi-page DMA allocation (`dma_buffer_create` for sizes > 4 KiB) - a contiguous-run allocator over the frame pool (the free-list cannot guarantee runs; scan or buddy).
+- [ ] virtio rings: negotiate the DEVICE-reported queue size (the `queue_size` register) instead of hardcoding one - Linux-scale rings (256+) fall out of it, and no constant replaces another.
+- [ ] virtio-blk: one request moves the whole span (header/data/status descriptors over a large data buffer) instead of a per-sector loop, sized by the device's own reported limits (`seg_max`/`size_max`), not a constant.
+- [ ] xHCI mass storage: a multi-page BOT data buffer so one READ(10)/WRITE(10) moves up to 128 KiB (`MAX_SECTORS` 8 -> 256).
+- [ ] virtio-net: jumbo frame support end to end - buffer size follows the configured MTU (an `ip` knob + what the host link reports), not a compile-time `FRAME_MAX`.
+- [ ] Measure: a before/after throughput number for a large `cat` and a TCP bulk transfer in the perf notes.
+- Done when: bulk disk and network I/O move in large requests, the measured throughput improves accordingly, tests green.
+- Concept: M23/M24/M62 (the drivers this accelerates), the limits audit (the last "one page" assumptions removed).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
