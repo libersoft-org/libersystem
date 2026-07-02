@@ -1209,6 +1209,85 @@ multi-page DMA buffers.
 - Done when: bulk disk and network I/O move in large requests, the measured throughput improves accordingly, tests green.
 - Concept: M23/M24/M62 (the drivers this accelerates), the limits audit (the last "one page" assumptions removed).
 
+## LiberFS audit track (M73-M76)
+
+A full read of the crate (~3900 lines: lib/txn/fsops/dir/inode/blkalloc/snapshot/
+fsck + tests) plus the service and driver wiring around it (2026-07-02). The core -
+CoW transactions, the shared B+tree, superblock ping-pong, hash-collision handling -
+checked out correct. The real problems sit at the edges: durability on real
+hardware, two silent-data-loss paths, and scaling of the allocator and free map.
+Backward compatibility is a non-goal, so format changes are on the table.
+
+Verified correct during the audit (no action): superblock ping-pong and
+generation n-2 reclaim; directory hash-collision keying (hash + name, collision-
+aware leaf splits); the `node_dest` / `fresh` CoW discipline; `overwrite_block`'s
+three-way split sharing the committed checksum block (read-only sharing is sound
+under CoW); tail-block zero padding and truncate's slack zeroing; the bounds-
+checked LZSS decoder; path validation as a security boundary.
+
+## M73 - LiberFS: correctness bugs and data-loss holes
+
+The findings that can lose or corrupt data. Each fix is small and self-contained;
+together they make the CoW guarantees actually hold end to end.
+
+- [ ] No flush/write barrier anywhere (the most serious finding). The whole CoW crash-atomicity story rests on "the superblock write is the atomic commit point" - which only holds if the transaction's data and metadata blocks reach the medium BEFORE the superblock. `BlockDevice` has no `flush()`, the virtio-blk driver never issues `VIRTIO_BLK_T_FLUSH`, and a write-back device cache may reorder freely. On real hardware a power cut can leave a superblock pointing at blocks that were never written. Fix: `flush()` on the `BlockDevice` trait, a flush op in the raw block protocol, and the command in BOTH block drivers - `VIRTIO_BLK_T_FLUSH` for virtio-blk and SCSI SYNCHRONIZE CACHE (10) for xHCI mass storage (a LiberFS volume on a USB disk gets the same guarantee) - with commit = write blocks -> flush -> write superblock -> flush. The torn-commit test covers a damaged superblock, not reordering.
+- [ ] A corrupt snapshot table silently destroys every named snapshot. `load_snapshot_table` returns Ok with an empty table on a CRC mismatch; `derive_free` then no longer pins the snapshot generations and the next commit reuses their blocks. One bad block quietly frees data whose roots are recorded nowhere else. Should be `FsError::Corrupt` (fail the mount or force read-only), never a silent unpin.
+- [ ] `compress_extent` bakes in silent corruption. It reads the raw source blocks with plain `dev.read_block` - no per-block CRC verification - compresses them, and discards the old checksums. Pre-existing corruption gets re-encoded into a compressed extent with a fresh, VALID checksum: detectability is lost forever. Verify each source block's CRC first and skip the run (leave it raw, where fsck can still find the damage) on a mismatch.
+- [ ] Snapshot mounts are not enforced read-only. `mount_snapshot` / `mount_named_snapshot` return a fully writable `LiberFs`; a write through one would interleave generations, and the named-snapshot path also rewinds `generation`, so its commit could collide with live generation numbering. Enforce with a runtime flag rejecting `begin()` or a type-state (`LiberFs<D, ReadOnly>`).
+- [ ] mtime/ctime are always 0 in production: only the tests call `set_clock`; StorageService never does. `stat` exists but returns zero times. Wire the system clock through the service (or stop exposing the fields until then).
+- [ ] Fragile `decomp` cache invalidation: the decompressed-extent cache (keyed by physical block) is cleared only in `begin()`. Safe today because every mutation starts with `begin()`, but that is an invisible invariant - after a commit the old compressed blocks are freed and reusable, so one future mutation path without `begin()` serves stale data. Clear it in `commit()` and `abort()` too.
+- [ ] `compress_extent` leaks claimed blocks on a non-contiguous allocation: when `alloc_data` returns a gap it bails with Ok, leaving the already-claimed blocks marked in the free map and in `fresh` until the commit rederivation returns them. Harmless waste inside one transaction, but uncommented and trivially fixable (clear the bits on the bail path) - and it disappears entirely with M74's run allocation.
+- Done when: a commit is bracketed by device flushes, a corrupt snapshot table fails loudly, compression never erases corruption evidence, snapshot mounts reject writes, `stat` returns real times, and the cache/leak nits are gone - tests green (plus new ones for the flush ordering and the corrupt-table path).
+- Concept: M52 (the CoW guarantees these fixes make real), M56/M57 (the snapshot and compression features they harden).
+
+## M74 - LiberFS: allocator and free-map scaling
+
+The two O(volume) costs on every write path, plus the I/O-amplification and
+lookup-churn debts. The perf milestone: nothing here changes the on-disk format
+except as noted.
+
+- [ ] `derive_free` after EVERY commit walks the whole volume: the live tree, the previous generation, and every snapshot - reading spill chains from disk and parsing every inode. Each `write_file` costs O(all live metadata). Unnoticeable at 128 MiB, prohibitive on a big disk with thousands of files. Fix: an incremental free map (the transaction knows what it allocated; frees fall out of the blocks CoW replaced - deferred one generation, since the superseded generation becomes the snapshot, and skipped while a named snapshot pins them) or a persistent space map; keep the full rederivation for mount and fsck only.
+- [ ] The allocator is O(pool) per block and O(pool^2) per large write: `alloc_block` linearly scans the bitmap from the start for every single block. At minimum a next-fit cursor and word-at-a-time scanning (u64 + trailing_zeros); better, `alloc_run(len)` - `write_file` knows `data.len()` up front yet allocates 4 KiB at a time. Run allocation also guarantees contiguity for `compress_extent` (retiring its bail path).
+- [ ] Checksum blocks cost 2-3x I/O amplification: every block read also reads and verifies its run's whole checksum block; every block write does a read-modify-write on it. Batch: hold the run's checksum block in memory across a sequential write and write it once; cache the last checksum block on the read path (the `decomp` cache already models this).
+- [ ] The extent spill chain is a linked list: a many-extent file reads the whole chain on every `read_inode` and `flush_extents` rewrites all of it on every `write_inode`. The generic B+tree in txn.rs (already shared by the inode and directory trees) is the natural replacement - an extent tree would be its third user (a format change).
+- [ ] No caching at all: every operation resolves its path from the root, re-reading each inode (and its spill chain) from the B+tree. A small inode LRU and dentry cache would cut I/O by an order of magnitude once more than one client hammers the service.
+- [ ] Recursion depth in `subtree_contains` / `mark_inode_tree` is bounded only by directory nesting; fine on 256 KiB stacks, but iterative versions would be robust against pathological trees.
+- Done when: commit cost no longer scales with the volume's total metadata, a large write allocates in runs, sequential I/O touches each checksum block once, and a before/after timing for a large write and a many-file tree sits in the perf notes - tests green.
+- Concept: M53 (large-volume scaling this milestone actually delivers), M72 (extent-sized block requests want contiguous extents).
+
+## M75 - LiberFS: format and modernity
+
+The on-disk-format debts, opened up by the no-compatibility decision. Bundling
+them lets one reformat carry the layout changes together (M74's extent tree, if
+not yet landed, rides the same bump; compatibility is a non-goal either way).
+
+- [ ] The superblock carries a magic, a version, and a self-CRC - but no UUID/label, no granular feature flags, and no algorithm IDs (checksum, compression codec). Compatibility is a non-goal, but feature flags and algorithm IDs are cheap insurance that future format changes (and the LZ4 switch below) get detected instead of silently mis-parsed.
+- [ ] No free-space API: the in-memory free map exists, `df` is a popcount away. Easy win, and `lsvol` / the shell would use it immediately.
+- [ ] Directory records are a fixed 267 bytes (NAME_MAX padding), so a 4 KiB leaf holds 15 entries regardless of name length. Variable-length records would raise density roughly 10x for typical names and flatten the tree - but note the cost: the shared B+tree machinery assumes a fixed record width throughout, so this means slotted leaf pages and reworked insert/split logic, the biggest single item in this milestone.
+- [ ] LZSS (4 KiB window, 18-byte max match) has a modest ratio. The LZ4 block format is equally trivial to decode, no_std, and both faster and stronger - a hand-written decoder is ~100 lines.
+- [ ] CRC32C is a byte-at-a-time software table; slice-by-8 or the SSE4.2 instruction is an order of magnitude faster and will show on bulk I/O.
+- [ ] Names are raw bytes with no UTF-8 validation or normalization - two Unicode forms of the same name are two different files. At minimum document the policy; ideally require valid UTF-8.
+- [ ] The snapshot table is one block (SNAP_MAX = 48). A B+tree (the shared infrastructure again) removes the cap.
+- [ ] Compression becomes a per-volume option, default OFF (today `write_file` tries to compress every extent unconditionally). A superblock flag chosen at format time and togglable later on a mounted volume (a `volume` shell verb + service op); the toggle governs new writes only - existing extents keep their current form (a raw file compresses on its next whole-file rewrite, a compressed one stays readable and thaws on partial writes as today). `fsck`/`lsvol` report the setting.
+- [ ] fsck only counts checksum failures, and true self-heal is impossible on today's format: under CoW the previous generation usually references the SAME physical block (no second copy), and where it references a different one that is an older version of the data, not a replica. What fits instead: fsck names the damaged files (not just a count), a recovery verb restores a damaged file from a snapshot / the previous generation (explicitly an older version, the operator's call), and optionally a metadata-DUP feature flag (two copies of every tree node) buys real self-heal for metadata. Also: `FsckReport.reclaimed_blocks` / `reclaimed_inodes` are dead fields forever 0 - remove them.
+- [ ] No hard links or symlinks (and no nlink field) - fine if intentional, but worth an explicit decision note in the design doc.
+- Done when: the new superblock fields and record layouts land together in one coordinated format change (recorded in feature flags; the version field stays 1 pre-release per the modernization-track policy), `df` reports free space in the shell, compression is off by default and demonstrably togglable at format time and on a live volume, compression and CRC are measurably faster, and fsck names damaged files with a working restore-from-snapshot path - tests green, LIBERFS.md updated.
+- Concept: the M53-M57 modernization track (this closes its leftovers), M63 (`lsvol` gains real usage numbers).
+
+## M76 - LiberFS: code quality
+
+The crate-internal cleanups: no behaviour change intended, just structure,
+allocation churn, error granularity, and the test-coverage gaps the audit found.
+
+- [ ] `vec![0u8; BLOCK_SIZE]` is allocated in nearly every function, including per-block hot loops (`read_logical`). A scratch buffer member (or passed `&mut [u8]`) removes the churn.
+- [ ] The `begin()` / `finish(r)` transaction discipline is hand-copied by every public mutating API (8 sites). A `fn mutate(&mut self, f: impl FnOnce(&mut Self) -> Result<..>)` wrapper enforces it and shortens them all.
+- [ ] Manual byte offsets in `Inode::parse` / `write` and the snapshot table serializer; named `const` offsets would make format edits safer.
+- [ ] `FsError::Invalid` means too many things (bad path, wrong inode kind, non-empty directory, duplicate snapshot name...). Finer variants would give the service real error messages.
+- [ ] `read_file` duplicates `read_at` (it could be `read_at(path, 0, size)`).
+- [ ] Test-coverage gaps: a directory hash collision (the `leaf_split_point` path), a file with more than 4 extents (spill-chain round-trip), and `write_at` into a compressed file across an extent boundary. (The corrupt-snapshot-table test lands with its M73 fix.)
+- Done when: the wrapper owns every transaction, the scratch buffer kills the hot-loop allocations, errors name their cause, and the three gap tests exist and pass - tests green.
+- Concept: the codebase-uniformity principle (one transaction shape, one buffer discipline), M73/M75 (whose new tests these gaps complement).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
@@ -1230,8 +1309,9 @@ hardware); user accounts / identities, multi-user remote access, and the network
 workloads; multi-queue devices and the per-CPU interrupt-vector spaces they need
 (one vector number per device suffices until then - the M72 throughput work stays
 single-queue); immutable signed system + A/B updates + rollback + verified boot;
-encrypted user volumes; LiberFS work beyond the M53-M57 modernization (online
-defrag, multi-device / RAID; deduplication and encryption stay out by decision);
+encrypted user volumes; LiberFS work beyond the M53-M57 modernization and the
+M73-M76 audit track (online
+resize, online defrag, multi-device / RAID; deduplication and encryption stay out by decision);
 first-party server apps (a
 static-file web server and the like); and a CLI package manager over the phase-2
 package format. The desktop concerns (GUI / compositor, a full input stack, the
