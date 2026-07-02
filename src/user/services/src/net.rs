@@ -86,7 +86,7 @@ const TCP_ACK: u8 = 0x10;
 
 // The receive buffer / advertised window for one TCP connection: 65535 is the most
 // a TCP header's 16-bit window field can advertise without window scaling (adding
-// the WS option is the future step beyond this, as Linux's autotuned buffers are).
+// the WS option is the future step beyond this, as autotuned buffers are).
 // The buffer lives inside the heap-pooled connection state.
 const TCP_RX_MAX: usize = 65535;
 

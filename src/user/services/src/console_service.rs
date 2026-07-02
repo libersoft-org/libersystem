@@ -871,8 +871,8 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 		if let Some(echo) = echo_req {
 			console.vts[vi].ld.echo = echo;
 		}
-		// Adopt an OSC 52 clipboard-set into the console-held clipboard (the Linux way: a
-		// program sets the selection, a later middle-click pastes it).
+		// Adopt an OSC 52 clipboard-set into the console-held clipboard (a program sets
+		// the selection, a later middle-click pastes it).
 		if let Some(text) = clip_req {
 			console.clipboard = text;
 		}
@@ -1287,9 +1287,9 @@ fn snap_fg_live(console: &mut Console) {
 // When the foreground program enabled mouse tracking (DECSET ?1000 / ?1002 / ?1003), the
 // event is translated into SGR mouse reports and delivered to the program (best-effort: a
 // program that is not reading drops them rather than stalling the console). Otherwise the
-// console drives it natively the Linux way: the wheel pages the scrollback, click-drag
-// selects a range (copied to the clipboard on release), and middle-click pastes the
-// clipboard (bracketed when the program asked for ?2004).
+// console drives it natively: the wheel pages the scrollback, click-drag selects a range
+// (copied to the clipboard on release), and middle-click pastes the clipboard (bracketed
+// when the program asked for ?2004).
 unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
 	unsafe {
 		if msg.len() < 6 {
@@ -1323,7 +1323,7 @@ unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
 		let mid_now: bool = buttons & 4 != 0;
 		let mid_was: bool = prev & 4 != 0;
 		if wheel != 0 {
-			// Route the wheel to the scrollback view (three lines per notch, the Linux default).
+			// Route the wheel to the scrollback view (three lines per notch).
 			if let Some(t) = console.vts[fg].term.as_mut() {
 				if wheel > 0 {
 					t.screen.scroll_view_up_by(3);
@@ -1466,7 +1466,7 @@ fn write_dec(buf: &mut [u8], v: usize) -> usize {
 	i
 }
 
-// Paste the console-held clipboard into the foreground VT (middle-click, the Linux way).
+// Paste the console-held clipboard into the foreground VT (middle-click).
 // When the program asked for bracketed paste (?2004) the content is wrapped in
 // ESC [ 200 ~ ... ESC [ 201 ~ and sent straight to the program, so it can tell a paste from
 // typed input; otherwise the bytes are fed through the line discipline as if typed (so a
