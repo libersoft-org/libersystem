@@ -110,9 +110,11 @@ write recompresses it.
 ## Crash atomicity (copy-on-write, no journal)
 
 A mutation never overwrites a block a committed generation still references.
-Changed data, its extent and checksum blocks, the inode, and every inode- and
-directory-tree node on the path to it are written to freshly allocated blocks
-(copied up once per transaction, then updated in place). The transaction commits
+Changed data goes to freshly allocated blocks (written outright - a data block is
+always replaced whole, so nothing is copied first); the metadata describing it -
+the extent and checksum blocks, the inode, and every inode- and directory-tree
+node on the path - is copied up to a fresh block once per transaction and then
+edited in place. The transaction commits
 with a single atomic write of a new superblock - a bumped generation plus a
 self-CRC - to the inactive slot. A crash before that write leaves the old
 superblock active and the old tree intact; a torn superblock write fails its
@@ -159,23 +161,23 @@ writes FAT (incl. exFAT) and reads ISO9660 and UDF behind that one API.
 
 ## Comparison with other filesystems
 
-Legend: yes = supported, no = not supported, layer = handled by another
+Legend: ✓ = supported, ✗ = not supported, layer = handled by another
 LiberSystem layer.
 
-| Capability            | FAT12/16/32 | exFAT | NTFS | ext4 | XFS | Btrfs | ZFS | LiberFS |
-|-----------------------|:-----------:|:-----:|:----:|:----:|:---:|:-----:|:---:|:-------:|
-| Crash atomicity       | none        | none  | journal | journal | journal | CoW | CoW | CoW |
-| Copy-on-write         | no          | no    | no   | no   | no  | yes   | yes | yes |
-| Data checksums        | no          | no    | no   | metadata | metadata | yes | yes | yes (CRC32C) |
-| Snapshots             | no          | no    | VSS  | no   | no  | yes   | yes | yes |
-| Compression           | no          | no    | yes  | no   | no  | yes   | yes | yes (LZ4, per-volume switch) |
-| Sparse files          | no          | no    | yes  | yes  | yes | yes   | yes | yes |
-| Dynamic inodes        | n/a         | n/a   | yes  | no   | yes | yes   | yes | yes (B+tree) |
-| Dir index             | linear      | linear | B+tree | hashed | B+tree | B+tree | hash | B+tree |
-| POSIX perms/ACL       | no          | no    | yes  | yes  | yes | yes   | yes | layer |
-| Dedup                 | no          | no    | no   | no   | no  | yes   | yes | no |
-| Encryption            | no          | no    | yes  | yes  | no  | yes   | yes | no |
-| Multi-device / RAID   | no          | no    | no   | no   | no  | yes   | yes | no |
+| Capability            | LiberFS | ZFS | Btrfs | XFS | ext4 | NTFS | exFAT | FAT12/16/32 |
+|-----------------------|:-------:|:---:|:-----:|:---:|:----:|:----:|:-----:|:-----------:|
+| Crash atomicity       | CoW     | CoW | CoW   | journal | journal | journal | ✗ | ✗ |
+| Copy-on-write         | ✓       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗     | ✗ |
+| Data checksums        | ✓ (CRC32C) | ✓ | ✓   | metadata | metadata | ✗ | ✗ | ✗ |
+| Snapshots             | ✓       | ✓   | ✓     | ✗   | ✗    | VSS  | ✗     | ✗ |
+| Compression           | ✓ (LZ4, per-volume switch) | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ |
+| Sparse files          | ✓       | ✓   | ✓     | ✓   | ✓    | ✓    | ✗     | ✗ |
+| Dynamic inodes        | ✓ (B+tree) | ✓ | ✓   | ✓   | ✗    | ✓    | n/a   | n/a |
+| Dir index             | B+tree  | hash | B+tree | B+tree | hashed | B+tree | linear | linear |
+| POSIX perms/ACL       | layer   | ✓   | ✓     | ✓   | ✓    | ✓    | ✗     | ✗ |
+| Dedup                 | ✗       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗     | ✗ |
+| Encryption            | ✗       | ✓   | ✓     | ✗   | ✓    | ✓    | ✗     | ✗ |
+| Multi-device / RAID   | ✗       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗     | ✗ |
 
 In design, LiberFS sits closest to Btrfs/ZFS: copy-on-write, end-to-end
 checksums, snapshots, and compression. It deliberately omits the enterprise

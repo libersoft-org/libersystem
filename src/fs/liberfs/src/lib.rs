@@ -33,9 +33,11 @@
 //! ## Crash atomicity (copy-on-write)
 //!
 //! A mutation never overwrites a block that a committed generation still references:
-//! changed data, the extent and checksum blocks describing it, the inode, and the
-//! inode- and directory-B+tree nodes on the path to it are each written to a freshly
-//! allocated block (copied up once per transaction, then updated in place). The
+//! changed data goes to freshly allocated blocks (written outright - a data block is
+//! always replaced whole, so nothing is copied first), while the metadata describing
+//! it - the extent and checksum blocks, the inode, and the inode- and directory-B+tree
+//! nodes on the path - is copied up to a fresh block once per transaction and then
+//! edited in place. The
 //! transaction commits with a single atomic
 //! write of a new superblock - carrying an incremented generation and a self-CRC - to
 //! the inactive of the two slots. A crash before that write leaves the old superblock
