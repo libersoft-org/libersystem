@@ -1105,6 +1105,7 @@ the write path), so they get their own milestone rather than riding the quick
 wins.
 
 - [ ] `MAX_CPUS` retired: size the per-CPU tables (scheduler, percpu blocks, LAPIC ids) at boot from the Limine MP response - the heap is up before any AP wakes, so only the BSP's slot needs to be static and the constant disappears (the GDT/TSS side is already dynamic). Early-boot ordering is the risk; the BSP must run on static state until the tables exist.
+- [ ] Machines with more than 255 cores carry APIC ids beyond one byte: MSI delivery (our message address encodes an 8-bit xAPIC destination) needs x2APIC addressing there. At minimum detect and report the situation honestly; full x2APIC support may land with it or stay a follow-up box.
 - [ ] `MAX_WAIT_ANY` validated against the caller's real bound - its Domain handle budget - instead of a magic 4096 (a wait set cannot name more handles than the caller may hold).
 - [ ] `volume.write`'s `MAX_WRITE` sanity bound replaced by validating the claimed length against the transferred MemoryObject's real size (the kernel knows it; expose it to the service if needed) - the guard constant disappears.
 - Done when: none of the three constants exists, the checks bind to runtime facts, tests green.
@@ -1193,6 +1194,8 @@ multi-page DMA buffers.
 - [ ] virtio-blk: one request moves the whole span (header/data/status descriptors over a large data buffer) instead of a per-sector loop, sized by the device's own reported limits (`seg_max`/`size_max`), not a constant.
 - [ ] xHCI mass storage: a multi-page BOT data buffer so one READ(10)/WRITE(10) moves the whole request (the 8-sector page unit goes; the buffer we allocate is the only unit).
 - [ ] virtio-net: jumbo frame support end to end - buffer size follows the configured MTU (an `ip` knob + what the host link reports), not a compile-time `FRAME_MAX`.
+- [ ] TCP window scaling (the WS option, RFC 7323): the 16-bit window field caps the receive window at 64 KiB without it, which caps bulk throughput at 64 KiB per round-trip - negotiate the option on connect/accept and size the receive buffer accordingly.
+- [ ] The read path exploits it: StorageService / the filesystems issue extent-sized block requests (a contiguous file extent = one large request) instead of one filesystem block at a time - without this the drivers' large requests never happen and the measurement below cannot move.
 - [ ] Measure: a before/after throughput number for a large `cat` and a TCP bulk transfer in the perf notes.
 - Done when: bulk disk and network I/O move in large requests, the measured throughput improves accordingly, tests green.
 - Concept: M23/M24/M62 (the drivers this accelerates), the limits audit (the last "one page" assumptions removed).
@@ -1215,7 +1218,9 @@ virtio on QEMU/KVM, testable under `cargo test` / QEMU.
 A POSIX-like / relibc compatibility layer for foreign software (phase 4, with real
 hardware); user accounts / identities, multi-user remote access, and the network-exposed (authenticated) remote-admin endpoint over the System Graph / logs / counters (phase-2 observability is local + network-friendly representations only); localization
 (locale, language, time zone, formatting); a wider network stack and server-class
-workloads; immutable signed system + A/B updates + rollback + verified boot;
+workloads; multi-queue devices and the per-CPU interrupt-vector spaces they need
+(one vector number per device suffices until then - the M72 throughput work stays
+single-queue); immutable signed system + A/B updates + rollback + verified boot;
 encrypted user volumes; LiberFS work beyond the M53-M57 modernization (online
 defrag, multi-device / RAID; deduplication and encryption stay out by decision);
 first-party server apps (a
