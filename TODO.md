@@ -1091,7 +1091,7 @@ StorageService formats/mounts LiberFS over a hardcoded layout: `FS_START_SECTOR`
 is. The block protocol can now report the disk's capacity (`OP_CAPACITY`, M63), so
 the layout should be derived from it.
 
-- [ ] On the BLOCK bootstrap, query the disk's capacity over the block channel and compute the pool: `fs_blocks = (capacity - FS_START) / BLOCK_SIZE`, formatting a fresh volume to span the whole disk.
+- [ ] On the BLOCK bootstrap, query the disk's capacity over the block channel and compute the pool: `fs_blocks = (capacity - FS_START) / BLOCK_SIZE`, formatting a fresh volume to span the whole disk. (`FS_START_SECTOR` itself stays a fixed boot-layout mark - the region below it belongs to the factory archive the boot runner re-lays.)
 - [ ] An existing volume mounts at the size recorded in its superblock (never silently "grown" - the free map would not match); a mismatch against the disk is reported, and online resize stays future LiberFS work.
 - [ ] A kernel test formats a volume on a larger test disk and asserts the pool spans it (and that the seeded boot volume still mounts).
 - Done when: a fresh system volume uses the whole disk, an existing one mounts unchanged, tests green.
@@ -1108,7 +1108,7 @@ wins.
 - [ ] Machines with more than 255 cores carry APIC ids beyond one byte: MSI delivery (our message address encodes an 8-bit xAPIC destination) needs x2APIC addressing there. At minimum detect and report the situation honestly; full x2APIC support may land with it or stay a follow-up box.
 - [ ] `MAX_WAIT_ANY` validated against the caller's real bound - its Domain handle budget - instead of a magic 4096 (a wait set cannot name more handles than the caller may hold).
 - [ ] `volume.write`'s `MAX_WRITE` sanity bound replaced by validating the claimed length against the transferred MemoryObject's real size (the kernel knows it; expose it to the service if needed) - the guard constant disappears.
-- Done when: none of the three constants exists, the checks bind to runtime facts, tests green.
+- Done when: none of the three constants exists, the checks bind to runtime facts, and a >255-core machine is either served (x2APIC) or loudly reported - tests green.
 - Concept: the limits audit's principle (where the runtime can tell us the real bound, no constant stands in for it).
 
 ## M67 - Runtime-tunable policies (constants become ConfigService keys)
