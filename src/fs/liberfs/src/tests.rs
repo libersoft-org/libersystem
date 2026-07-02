@@ -554,7 +554,11 @@ fn newest_super_slot(dev: &MemDevice) -> u32 {
 		let off = slot as usize * BLOCK_SIZE + 28;
 		u64::from_le_bytes(dev.blocks[off..off + 8].try_into().unwrap())
 	};
-	if generation(1) > generation(0) { 1 } else { 0 }
+	if generation(1) > generation(0) {
+		1
+	} else {
+		0
+	}
 }
 
 #[test]
@@ -623,7 +627,7 @@ fn a_long_name_round_trips() {
 #[test]
 fn rejects_unportable_name_characters() {
 	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
-	// the portable-name policy rejects the Windows-reserved punctuation and control
+	// the portable-name policy rejects the punctuation and control
 	// bytes, on top of the path separator and NUL the parser already forbids.
 	let bad: [&[u8]; 10] = [b"a\\b", b"a:b", b"a*b", b"a?b", b"a<b", b"a>b", b"a|b", b"a\"b", b"a\x01b", b"a\x7fb"];
 	for name in bad {
