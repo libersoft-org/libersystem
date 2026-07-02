@@ -12,8 +12,13 @@ use super::msr;
 
 const IA32_GS_BASE: u32 = 0xc000_0101;
 
-// Upper bound on supported cores; sizes the per-CPU and GDT/TSS arrays.
-pub const MAX_CPUS: usize = 8;
+// Upper bound on supported cores; sizes the static per-CPU, GDT/TSS and scheduler
+// arrays, which must exist before any allocator runs (the equivalent of Linux's
+// NR_CPUS). The cost is a few hundred bytes of static state per core (~300 KiB at
+// 1024), so the bound is deliberately server-scale - large boxes reach 512+ logical
+// cores today. Cores beyond it stay parked, loudly reported by smp::init; raise
+// this freely if such a machine ever appears.
+pub const MAX_CPUS: usize = 1024;
 
 // Byte offsets of the syscall-scratch fields within PerCpu, used by the ring-3
 // syscall entry stub to reach them through GS. Pinned by the asserts below.

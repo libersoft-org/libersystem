@@ -87,8 +87,9 @@ const ISO_SECTORS: u64 = (iso9660::SECTOR_SIZE / SECTOR_SIZE) as u64;
 const UDF_SECTORS: u64 = (udf::SECTOR_SIZE / SECTOR_SIZE) as u64;
 
 // An upper bound on a single write, so a bogus buffer length cannot make us allocate
-// without limit; the filesystem enforces the real per-file maximum.
-const MAX_WRITE: usize = 256 * 1024;
+// without limit; a sanity bound well above any real write, never a policy limit - the
+// filesystem enforces the real per-file maximum.
+const MAX_WRITE: usize = 16 * 1024 * 1024;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -131,7 +132,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		send_blocking(bootstrap, b"StorageService: online", 0);
 	}
-	let mut reply: [u8; 2048] = [0u8; 2048];
+	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
 		serve_multi(service, &mut buf, &mut reply, |_chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { volume::dispatch(&mut vol, req, handle, out, reply_handle) });
 	}

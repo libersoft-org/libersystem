@@ -566,7 +566,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    governed `perm` command - granted the matching client end - is served like any other.
 	let mut manager: Manager = Manager { audit, procsvc, clients };
 	let mut request: [u8; 512] = [0u8; 512];
-	let mut reply: [u8; 1024] = [0u8; 1024];
+	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
 		serve_multi_seeded(service, &[perm_self_server], &mut request, &mut reply, |_chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { permission::dispatch(&mut manager, req, handle, out, reply_handle) });
 	}

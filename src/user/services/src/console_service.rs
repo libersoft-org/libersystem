@@ -83,12 +83,6 @@ fn geometry(fb: &Framebuffer) -> Geometry {
 // shell over its own per-VT service connections; the foreground VT owns the display.
 const NVT: usize = 4;
 
-// The number of program-hosted PTYs open at once (the `script` tool, a future `ssh`). A
-// PTY occupies three wait-set slots (its slave data + control channels and the master
-// channel), so the whole wait set - keyboard + gpu + NVT display VTs + PTY_MAX PTYs + the
-// pointer channel - is `2 + 2*NVT + 3*PTY_MAX + 1` = 17 <= the kernel's MAX_WAIT_ANY.
-const PTY_MAX: usize = 2;
-
 // Control-byte chords intercepted by the console (never forwarded to a shell): the
 // virtio-input driver maps Ctrl+N to 0x0e (open a new VT) and Ctrl+] to 0x1d (cycle the
 // foreground). F-keys are not mapped by the driver and Alt+key collides with escape
@@ -107,7 +101,7 @@ const CHORD_SCROLL_DOWN: u8 = 0x1f;
 const BELL_FLASH_TICKS: u64 = 10;
 
 // The tty line discipline limits (per VT).
-const LD_LINE_MAX: usize = 128;
+const LD_LINE_MAX: usize = 1024;
 const LD_HIST_MAX: usize = 32;
 
 // A small fixed buffer the line discipline accumulates echo bytes in, mirrored to the
@@ -712,8 +706,15 @@ unsafe fn run(console: &mut Console) -> ! {
 		}
 		console.input = input;
 		let mut keys: [u8; 64] = [0u8; 64];
-		let mut out: [u8; 1024] = [0u8; 1024];
-		let mut waits: [u64; 2 + 2 * NVT + 3 * PTY_MAX + 1] = [0u64; 2 + 2 * NVT + 3 * PTY_MAX + 1];
+		// The per-message output buffer: sized to the transport ceiling (4096, the same
+		// bound every service reply and the shell's relay use), so a program's largest
+		// single print renders whole - the kernel truncates a message to the receiver's
+		// buffer silently.
+		let mut out: [u8; 4096] = [0u8; 4096];
+		// The wait set is built per iteration, sized by the live VT / PTY sets - PTYs
+		// grow on demand, so the set has no fixed bound (the kernel's wait_any sanity
+		// bound is far above any real console).
+		let mut waits: Vec<u64> = Vec::new();
 		// present the initial banner (the foreground term was rendered in __user_main).
 		present_fg(console);
 		loop {
@@ -723,35 +724,35 @@ unsafe fn run(console: &mut Console) -> ! {
 			// host-window change), then each program-hosted PTY's slave-data, slave-control,
 			// and master channels interleaved (data / control / master at pty_base + 3*j),
 			// then the pointer channel (when present) in the last slot.
-			waits[0] = console.input;
+			waits.clear();
+			waits.push(console.input);
 			let nv: usize = console.vts.len();
 			for i in 0..nv {
-				waits[1 + 2 * i] = console.vts[i].client;
-				waits[2 + 2 * i] = console.vts[i].control;
+				waits.push(console.vts[i].client);
+				waits.push(console.vts[i].control);
 			}
 			let gpu_idx: usize = 1 + 2 * nv;
 			let have_gpu: bool = console.gpu != 0;
 			if have_gpu {
-				waits[gpu_idx] = console.gpu;
+				waits.push(console.gpu);
 			}
 			let pty_base: usize = gpu_idx + have_gpu as usize;
 			let np: usize = console.ptys.len();
 			for j in 0..np {
-				waits[pty_base + 3 * j] = console.ptys[j].client;
-				waits[pty_base + 3 * j + 1] = console.ptys[j].control;
-				waits[pty_base + 3 * j + 2] = console.ptys[j].master;
+				waits.push(console.ptys[j].client);
+				waits.push(console.ptys[j].control);
+				waits.push(console.ptys[j].master);
 			}
 			// The pointer channel (when present) is the last wait slot: raw pointer events
 			// from InputService drive selection, scrollback, and SGR mouse reports.
 			let ptr_idx: usize = pty_base + 3 * np;
 			let have_pointer: bool = console.pointer != 0;
 			if have_pointer {
-				waits[ptr_idx] = console.pointer;
+				waits.push(console.pointer);
 			}
-			let total: usize = ptr_idx + have_pointer as usize;
 			// Block (~0% CPU) until a channel is ready: a keystroke, VT output, a gpu RESIZE, or
 			// a program-hosted PTY's traffic.
-			let ready: i64 = wait_any(&waits[..total], 0);
+			let ready: i64 = wait_any(&waits, 0);
 			if ready >= 0 {
 				let r: usize = ready as usize;
 				if r == 0 {
@@ -1675,12 +1676,9 @@ unsafe fn spawn_vt(facs: &Factories, addr: u64, fb: &Framebuffer, gpu: u64, cur_
 // tool, a future ssh) instead of the hardware display. Spawn the named slave program over
 // a fresh console + control channel pair - a shell gets the full capability set, any other
 // program just its console + control - and return the master channel end the host drives it
-// on. None on failure or at the PTY cap.
+// on. None on failure. The PTY set grows on demand - never a fixed cap.
 unsafe fn open_pty(console: &mut Console, name: &[u8]) -> Option<u64> {
 	unsafe {
-		if console.ptys.len() >= PTY_MAX {
-			return None;
-		}
 		let (slave_service, slave_client): (u64, u64) = channel()?;
 		let (control_console, control_slave): (u64, u64) = channel()?;
 		let (master_console, master_host): (u64, u64) = channel()?;

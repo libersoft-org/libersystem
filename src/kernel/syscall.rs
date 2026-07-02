@@ -1132,12 +1132,11 @@ fn sys_wait(handle: u64, deadline: u64) -> i64 {
 	}
 }
 
-// The most handles `wait_any` accepts at once (enough for a driver's IRQ plus a
-// service's client/listener/socket channels - NetworkService multiplexes its frame
-// channel, several clients, a listener, and a pool of sockets at once; ConsoleService
-// multiplexes its keyboard, every VT's data+control channel, the gpu channel, and a
-// pool of program-hosted PTYs).
-const MAX_WAIT_ANY: usize = 20;
+// The most handles `wait_any` accepts at once - a sanity bound on the caller's
+// array (the scratch tables live on the kernel heap, so this is not a memory
+// cap), well above any real wait set: a service multiplexing hundreds of client
+// and socket channels still fits.
+const MAX_WAIT_ANY: usize = 4096;
 
 // Block until ANY handle in the caller's array `[handles_ptr; count]` is ready,
 // returning that handle's index, or ERR_TIMED_OUT at `deadline` (absolute ticks,
@@ -1151,9 +1150,12 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	let raw = unsafe { core::slice::from_raw_parts(handles_ptr as *const u64, n) };
-	// Resolve every handle once up front, recording each object and its koid.
-	let mut objects: [Option<Arc<dyn KernelObject>>; MAX_WAIT_ANY] = core::array::from_fn(|_| None);
-	let mut koids: [u64; MAX_WAIT_ANY] = [0; MAX_WAIT_ANY];
+	// Resolve every handle once up front, recording each object and its koid. The
+	// scratch tables are heap-allocated, sized by the actual set - `wait_any` is a
+	// blocking call, so the allocation is never on a hot path.
+	let mut objects: alloc::vec::Vec<Option<Arc<dyn KernelObject>>> = alloc::vec::Vec::new();
+	objects.resize_with(n, || None);
+	let mut koids: alloc::vec::Vec<u64> = alloc::vec![0u64; n];
 	{
 		let table = thread.handles().lock();
 		for i in 0..n {

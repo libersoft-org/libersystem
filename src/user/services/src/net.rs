@@ -88,11 +88,11 @@ const TCP_ACK: u8 = 0x10;
 // it after every segment) so a pool of connection states stays modest.
 const TCP_RX_MAX: usize = 1024;
 
-// How many TCP connections the stack tracks at once: outbound `connect`s and inbound
-// accepted connections share this pool (a listener can hand out several at a time).
+// The initial TCP connection pool size: outbound `connect`s and inbound accepted
+// connections share the pool, which grows on demand - a size hint, never a cap.
 const TCP_CONN_MAX: usize = 4;
 
-// How many ports the stack listens on at once (passive open).
+// The initial listen-table size (passive open); the table grows on demand.
 const LISTEN_MAX: usize = 2;
 
 // A 48-bit Ethernet MAC address.
@@ -176,7 +176,11 @@ fn udp_checksum(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
 		sum = (sum & 0xffff) + (sum >> 16);
 	}
 	let c: u16 = !(sum as u16);
-	if c == 0 { 0xffff } else { c }
+	if c == 0 {
+		0xffff
+	} else {
+		c
+	}
 }
 
 // The TCP checksum over the IPv4 pseudo-header (src, dst, proto, length) plus the
@@ -206,7 +210,9 @@ struct Neigh {
 	valid: bool,
 }
 
-const NEIGH_MAX: usize = 8;
+// The ARP neighbor cache size - a cache with eviction (the oldest slot is replaced
+// when full), so it bounds memory, never which neighbors are reachable.
+const NEIGH_MAX: usize = 32;
 
 // The address configuration learned from a DHCP OFFER/ACK: the offered address plus
 // the mask / gateway / DNS / server-id carried in the reply options.
@@ -332,7 +338,8 @@ pub struct Stack {
 	neigh: [Neigh; NEIGH_MAX],
 	conns: Vec<TcpConn>,
 	// The ports we accept inbound connections on (passive open); 0 = unused slot.
-	listen_ports: [u16; LISTEN_MAX],
+	// Grows on demand.
+	listen_ports: Vec<u16>,
 	// The next initial send sequence to hand a passively-opened connection (bumped per
 	// accept; predictability is not a concern for this stack).
 	next_iss: u32,
@@ -345,7 +352,7 @@ impl Stack {
 		for _ in 0..TCP_CONN_MAX {
 			conns.push(TcpConn::closed());
 		}
-		Stack { mac, ip, mask, gateway, dns, neigh: [Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; NEIGH_MAX], conns, listen_ports: [0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
+		Stack { mac, ip, mask, gateway, dns, neigh: [Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; NEIGH_MAX], conns, listen_ports: alloc::vec![0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
 	}
 
 	pub fn mac(&self) -> MacAddr {
@@ -369,7 +376,11 @@ impl Stack {
 	// (on-link, reached by direct ARP), otherwise the gateway (off-link, routed). The
 	// L3 destination of the packet is still `dst`; only the L2 MAC we resolve changes.
 	pub fn next_hop(&self, dst: Ipv4Addr) -> Ipv4Addr {
-		if self.on_link(dst) { dst } else { self.gateway }
+		if self.on_link(dst) {
+			dst
+		} else {
+			self.gateway
+		}
 	}
 
 	// Whether `dst` is on our local subnet (its network part matches ours under the
@@ -743,7 +754,8 @@ impl Stack {
 	}
 
 	// Allocate a free connection slot for a new open (outbound or accepted), marking it
-	// in use and reset to a clean Closed state, or None if the pool is full.
+	// in use and reset to a clean Closed state. The pool grows on demand when every slot
+	// is in use, so an open never fails for lack of a slot.
 	pub fn tcp_alloc(&mut self) -> Option<usize> {
 		for (i, c) in self.conns.iter_mut().enumerate() {
 			if !c.in_use {
@@ -756,7 +768,10 @@ impl Stack {
 				return Some(i);
 			}
 		}
-		None
+		let mut fresh: TcpConn = TcpConn::closed();
+		fresh.in_use = true;
+		self.conns.push(fresh);
+		Some(self.conns.len() - 1)
 	}
 
 	// Release connection slot `ci` back to the pool (closed and free for reuse).
@@ -770,8 +785,8 @@ impl Stack {
 		c.rx_len = 0;
 	}
 
-	// Start accepting inbound connections on `port` (passive open). Idempotent; false
-	// only if the listen table is full.
+	// Start accepting inbound connections on `port` (passive open). Idempotent; the
+	// listen table grows on demand, so this always succeeds.
 	pub fn listen(&mut self, port: u16) -> bool {
 		for p in self.listen_ports.iter() {
 			if *p == port {
@@ -784,7 +799,8 @@ impl Stack {
 				return true;
 			}
 		}
-		false
+		self.listen_ports.push(port);
+		true
 	}
 
 	// Stop accepting inbound connections on `port`.
@@ -1050,7 +1066,7 @@ impl Stack {
 			*b = 0;
 		}
 		out[ntp_off] = 0x23; // LI 0, VN 4, Mode 3 (client)
-		// UDP header.
+					   // UDP header.
 		let udp_off: usize = ETH_HDR + IPV4_HDR;
 		put16(out, udp_off, src_port);
 		put16(out, udp_off + 2, NTP_PORT);
@@ -1111,7 +1127,7 @@ impl Stack {
 		put32(out, boot_off + 4, 0x3903_f326); // xid (fixed; SLIRP is the only DHCP source)
 		put16(out, boot_off + 10, 0x8000); // flags: ask the server to broadcast its reply
 		out[boot_off + 28..boot_off + 34].copy_from_slice(&self.mac.0); // chaddr
-		// DHCP magic cookie + options.
+																  // DHCP magic cookie + options.
 		let mut p: usize = boot_off + BOOTP_HDR;
 		put32(out, p, DHCP_MAGIC);
 		p += 4;

@@ -364,44 +364,38 @@ const KIND_STORAGE: u8 = 3;
 // The addressed devices, by root port - the state hot-plug works against and the
 // inventory `usb.list` serves. An attach enumerates a root port only when no slot
 // is recorded for it; a detach disables every slot recorded for it (a hub takes
-// its downstream devices along).
+// its downstream devices along). Grows with the bus - the controller's slot count
+// is the only bound, never an artificial cap that would silently drop devices.
 struct Slots {
-	entries: [SlotRec; 16],
-	len: usize,
+	entries: Vec<SlotRec>,
 }
 
 impl Slots {
 	const fn new() -> Slots {
-		Slots { entries: [SlotRec { port: 0, slot: 0, speed: 0, vendor: 0, product: 0, class: 0, kind: KIND_DEVICE }; 16], len: 0 }
+		Slots { entries: Vec::new() }
 	}
 
 	// Record one addressed device's inventory entry.
 	fn record(&mut self, rec: SlotRec) {
-		if self.len < self.entries.len() {
-			self.entries[self.len] = rec;
-			self.len += 1;
-		}
+		self.entries.push(rec);
 	}
 
 	// Update the recorded role of the device in `slot` once it is classified.
 	fn set_kind(&mut self, slot: u32, kind: u8) {
-		if let Some(rec) = self.entries[..self.len].iter_mut().find(|r| r.slot == slot) {
+		if let Some(rec) = self.entries.iter_mut().find(|r| r.slot == slot) {
 			rec.kind = kind;
 		}
 	}
 
 	// Whether any addressed device sits on this root port.
 	fn has_port(&self, port: u32) -> bool {
-		self.entries[..self.len].iter().any(|r| r.port == port)
+		self.entries.iter().any(|r| r.port == port)
 	}
 
 	// Remove and return one slot on this root port (call until None on a detach).
 	fn take_port(&mut self, port: u32) -> Option<u32> {
-		let i: usize = self.entries[..self.len].iter().position(|r| r.port == port)?;
-		let slot: u32 = self.entries[i].slot;
-		self.len -= 1;
-		self.entries[i] = self.entries[self.len];
-		Some(slot)
+		let i: usize = self.entries.iter().position(|r| r.port == port)?;
+		Some(self.entries.swap_remove(i).slot)
 	}
 }
 
@@ -1200,7 +1194,7 @@ unsafe fn service_loop(hc: &mut Xhci, slots: &mut Slots, mut keyboard: Option<(U
 				match try_recv(usbq, &mut qreq) {
 					Polled::Message { len, handle } => {
 						let mut api: UsbApi = UsbApi { slots };
-						let mut reply: [u8; 1024] = [0u8; 1024];
+						let mut reply: [u8; 4096] = [0u8; 4096];
 						let mut reply_handle: u64 = 0;
 						if let Some(n) = usb::dispatch(&mut api, &qreq[..len], handle, &mut reply, &mut reply_handle) {
 							send_blocking(usbq, &reply[..n], reply_handle);
@@ -1222,7 +1216,7 @@ struct UsbApi<'a> {
 impl<'a> usb::Service for UsbApi<'a> {
 	fn list(&mut self) -> Result<Vec<UsbEntry>, UsbError> {
 		let mut out: Vec<UsbEntry> = Vec::new();
-		for rec in &self.slots.entries[..self.slots.len] {
+		for rec in &self.slots.entries {
 			out.push(UsbEntry { port: rec.port, speed: String::from(speed_name(rec.speed)), vendor: rec.vendor as u32, product: rec.product as u32, class: rec.class as u32, kind: String::from(kind_name(rec.kind)) });
 		}
 		Ok(out)

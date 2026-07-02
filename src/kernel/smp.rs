@@ -57,6 +57,8 @@ pub fn init(mp: &MpResponse) {
 			continue;
 		}
 		if next_id >= arch::percpu::MAX_CPUS {
+			// Never park cores silently: say so on the boot log, loudly.
+			crate::serial_println!("smp: WARNING: machine has more cores than MAX_CPUS ({}); the rest stay parked", arch::percpu::MAX_CPUS);
 			break;
 		}
 		let cpu_id = next_id;

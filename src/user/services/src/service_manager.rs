@@ -1143,11 +1143,25 @@ unsafe fn bootstrap_udf_storage(manager_side: u64, block4_client: u64, udf_clien
 // ("USBBLOCK", served by the xhci driver over the Bulk-Only Transport and routed up in
 // DeviceManager's phase 2), which it mounts as the writable FAT vol://usb volume, then
 // mint its service channel ("SERVE"); the client end is kept in `*usb_client` and later
-// handed to the shell. The block handle is 0 when no USB stick is attached, so the
-// instance simply fails to mount and reports failed.
+// handed to the shell. The block handle is 0 when the xhci driver never came up (no
+// controller, or the driver failed) - the instance must still come up, so a dead-peer
+// stand-in channel is handed over instead: the removable FAT backing mounts lazily and
+// every probe of the dead channel fails like absent media, so vol://usb simply shows
+// as unavailable rather than failing the boot chain (the shell depends on this
+// instance).
 unsafe fn bootstrap_usb_storage(manager_side: u64, block5_client: u64, usb_client: &mut u64) -> bool {
 	unsafe {
-		if !send_blocking(manager_side, b"USBBLOCK", block5_client) {
+		let block: u64 = if block5_client != 0 {
+			block5_client
+		} else {
+			let (dead_server, dead_client): (u64, u64) = match channel() {
+				Some(pair) => pair,
+				None => return false,
+			};
+			close(dead_server);
+			dead_client
+		};
+		if !send_blocking(manager_side, b"USBBLOCK", block) {
 			return false;
 		}
 		bootstrap_serve(manager_side, usb_client)
@@ -1663,7 +1677,7 @@ unsafe fn serve_stats_once(stats: u64, state: &[State; N], sup: &[Supervised; N]
 			Received::Closed => return false,
 		};
 		let mut api = StatsApi { state, sup, canary_sup, drivers };
-		let mut reply: [u8; 2048] = [0u8; 2048];
+		let mut reply: [u8; 4096] = [0u8; 4096];
 		let mut reply_handle: u64 = 0;
 		if let Some(n) = supervisor::dispatch(&mut api, &buf[..len], handle, &mut reply, &mut reply_handle) {
 			send_blocking(stats, &reply[..n], reply_handle);

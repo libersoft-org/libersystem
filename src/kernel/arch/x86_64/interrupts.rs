@@ -29,8 +29,10 @@ pub const SPURIOUS_VECTOR: u8 = 0xff;
 
 // MSI-X vector window: per-device edge-triggered vectors delivered straight to a
 // LAPIC, with no INTx sharing. Sits just above the legacy INTx window (32..48).
+// 64 vectors leave headroom for many devices (and future multi-queue ones); the
+// window still ends well below the spurious vector at 0xff.
 pub const MSI_BASE: u8 = IRQ_BASE + IRQ_COUNT as u8; // 48
-pub const MSI_COUNT: usize = 16;
+pub const MSI_COUNT: usize = 64;
 
 pub type HandlerFn = fn(u8);
 
@@ -271,6 +273,54 @@ msi_stub!(msi12, 60);
 msi_stub!(msi13, 61);
 msi_stub!(msi14, 62);
 msi_stub!(msi15, 63);
+msi_stub!(msi16, 64);
+msi_stub!(msi17, 65);
+msi_stub!(msi18, 66);
+msi_stub!(msi19, 67);
+msi_stub!(msi20, 68);
+msi_stub!(msi21, 69);
+msi_stub!(msi22, 70);
+msi_stub!(msi23, 71);
+msi_stub!(msi24, 72);
+msi_stub!(msi25, 73);
+msi_stub!(msi26, 74);
+msi_stub!(msi27, 75);
+msi_stub!(msi28, 76);
+msi_stub!(msi29, 77);
+msi_stub!(msi30, 78);
+msi_stub!(msi31, 79);
+msi_stub!(msi32, 80);
+msi_stub!(msi33, 81);
+msi_stub!(msi34, 82);
+msi_stub!(msi35, 83);
+msi_stub!(msi36, 84);
+msi_stub!(msi37, 85);
+msi_stub!(msi38, 86);
+msi_stub!(msi39, 87);
+msi_stub!(msi40, 88);
+msi_stub!(msi41, 89);
+msi_stub!(msi42, 90);
+msi_stub!(msi43, 91);
+msi_stub!(msi44, 92);
+msi_stub!(msi45, 93);
+msi_stub!(msi46, 94);
+msi_stub!(msi47, 95);
+msi_stub!(msi48, 96);
+msi_stub!(msi49, 97);
+msi_stub!(msi50, 98);
+msi_stub!(msi51, 99);
+msi_stub!(msi52, 100);
+msi_stub!(msi53, 101);
+msi_stub!(msi54, 102);
+msi_stub!(msi55, 103);
+msi_stub!(msi56, 104);
+msi_stub!(msi57, 105);
+msi_stub!(msi58, 106);
+msi_stub!(msi59, 107);
+msi_stub!(msi60, 108);
+msi_stub!(msi61, 109);
+msi_stub!(msi62, 110);
+msi_stub!(msi63, 111);
 
 // Spurious LAPIC interrupts must not signal EOI, so they bypass the dispatcher.
 extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {}
@@ -291,7 +341,7 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
 
 const STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); IRQ_COUNT] = [irq0, irq1, irq2, irq3, irq4, irq5, irq6, irq7, irq8, irq9, irq10, irq11, irq12, irq13, irq14, irq15];
 
-const MSI_STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); MSI_COUNT] = [msi0, msi1, msi2, msi3, msi4, msi5, msi6, msi7, msi8, msi9, msi10, msi11, msi12, msi13, msi14, msi15];
+const MSI_STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); MSI_COUNT] = [msi0, msi1, msi2, msi3, msi4, msi5, msi6, msi7, msi8, msi9, msi10, msi11, msi12, msi13, msi14, msi15, msi16, msi17, msi18, msi19, msi20, msi21, msi22, msi23, msi24, msi25, msi26, msi27, msi28, msi29, msi30, msi31, msi32, msi33, msi34, msi35, msi36, msi37, msi38, msi39, msi40, msi41, msi42, msi43, msi44, msi45, msi46, msi47, msi48, msi49, msi50, msi51, msi52, msi53, msi54, msi55, msi56, msi57, msi58, msi59, msi60, msi61, msi62, msi63];
 
 // Install the IRQ stubs and the spurious handler into the IDT.
 pub fn init() {

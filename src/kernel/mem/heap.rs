@@ -12,15 +12,21 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem;
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::paging;
 use crate::mem::frame;
 use crate::mem::frame::PAGE_SIZE;
 use crate::sync::SpinLock;
 
-// Heap virtual window: well clear of both the HHDM and the kernel image.
+// Heap virtual window: well clear of both the HHDM and the kernel image. The heap
+// starts at one region and maps another whenever an allocation cannot be satisfied,
+// so it is never a fixed budget - the physical frame pool is the real bound.
 const HEAP_START: u64 = 0xffff_e000_0000_0000;
-const HEAP_SIZE: u64 = 2 * 1024 * 1024; // 2 MiB
+const HEAP_REGION: u64 = 2 * 1024 * 1024; // the initial size and the growth unit
+
+// The virtual base the next growth region maps at (bumped under the allocator lock).
+static NEXT_REGION: AtomicU64 = AtomicU64::new(0);
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -28,17 +34,37 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 // Map the heap window frame-by-frame, then hand the region to the allocator.
 pub fn init() {
 	let mut virt = HEAP_START;
-	let end = HEAP_START + HEAP_SIZE;
+	let end = HEAP_START + HEAP_REGION;
 	while virt < end {
 		let phys = frame::allocate().expect("out of frames: kernel heap");
 		paging::map_page(virt, phys, paging::WRITABLE);
 		virt += PAGE_SIZE;
 	}
-	unsafe { ALLOCATOR.lock().init(HEAP_START as usize, HEAP_SIZE as usize) };
+	NEXT_REGION.store(end, Ordering::Relaxed);
+	unsafe { ALLOCATOR.lock().init(HEAP_START as usize, HEAP_REGION as usize) };
 }
 
-// The heap's totals: (total bytes, bytes currently free), the free list summed
-// under the lock - the heap is small (2 MiB) so the walk is short.
+// Map another heap region (at least `at_least` bytes, in HEAP_REGION multiples) and
+// hand it to the free list. Called under the allocator lock when an allocation finds
+// no fitting region; false when the frame pool is exhausted (the real OOM).
+fn grow(heap: &mut Heap, at_least: usize) -> bool {
+	let bytes: u64 = (at_least as u64 + PAGE_SIZE).next_multiple_of(HEAP_REGION);
+	let base: u64 = NEXT_REGION.fetch_add(bytes, Ordering::Relaxed);
+	let mut virt = base;
+	while virt < base + bytes {
+		let phys = match frame::allocate() {
+			Some(p) => p,
+			None => return false,
+		};
+		paging::map_page(virt, phys, paging::WRITABLE);
+		virt += PAGE_SIZE;
+	}
+	unsafe { heap.add_free_region(base as usize, bytes as usize) };
+	true
+}
+
+// The heap's totals: (total bytes mapped so far, bytes currently free), the free
+// list summed under the lock - the walk stays short (regions coalesce).
 pub fn stats() -> (u64, u64) {
 	let heap = ALLOCATOR.lock();
 	let mut free: usize = 0;
@@ -47,7 +73,7 @@ pub fn stats() -> (u64, u64) {
 		free += next.size;
 		current = next;
 	}
-	(HEAP_SIZE, free as u64)
+	(NEXT_REGION.load(Ordering::Relaxed) - HEAP_START, free as u64)
 }
 
 // A node in the free list, stored in-place at the start of each free block.
@@ -195,7 +221,11 @@ unsafe impl GlobalAlloc for LockedHeap {
 		unsafe {
 			let (size, align) = Heap::size_align(layout);
 			let mut heap = self.lock();
-			match heap.find_region(size, align) {
+			let mut found = heap.find_region(size, align);
+			if found.is_none() && grow(&mut *heap, size + align) {
+				found = heap.find_region(size, align);
+			}
+			match found {
 				Some((region, alloc_start)) => {
 					let alloc_end = alloc_start.checked_add(size).expect("alloc overflow");
 					let excess = region.end_addr() - alloc_end;

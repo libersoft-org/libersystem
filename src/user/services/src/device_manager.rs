@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use proto::system::{volume, OpenOpts};
 use rt::*;
 
@@ -25,9 +26,6 @@ const DRIVER_DIR: &str = "vol://system/drivers/";
 const STATE_UNKNOWN: u8 = 0;
 const STATE_ONLINE: u8 = 1;
 const STATE_FAILED: u8 = 2;
-
-// The most devices DeviceManager tracks (QEMU exposes a handful).
-const MAX_DEVICES: usize = 8;
 
 // How many times DeviceManager restarts a driver that crashes during bring-up
 // before giving up on its device.
@@ -106,7 +104,7 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 	unsafe {
 		let count: u64 = device_count();
 		let mut i: u64 = 0;
-		while i < count && i < MAX_DEVICES as u64 {
+		while i < count {
 			let mut info: DeviceInfo = DeviceInfo::default();
 			if !device_info(i, &mut info) {
 				i += 1;
@@ -154,9 +152,11 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64) {
 	unsafe {
 		let count: u64 = device_count();
-		let mut state: [u8; MAX_DEVICES] = [STATE_UNKNOWN; MAX_DEVICES];
+		// per-device state, sized by what the kernel actually discovered - the bus is
+		// the only bound, never an artificial cap that would silently skip devices.
+		let mut state: Vec<u8> = alloc::vec![STATE_UNKNOWN; count as usize];
 		let mut i: u64 = 0;
-		while i < count && i < MAX_DEVICES as u64 {
+		while i < count {
 			let idx: usize = i as usize;
 			let mut info: DeviceInfo = DeviceInfo::default();
 			if !device_info(i, &mut info) {
@@ -224,7 +224,7 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 			close(file);
 			i += 1;
 		}
-		report_state(&state, count);
+			report_state(&state);
 	}
 }
 
@@ -327,12 +327,12 @@ unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], 
 // Print a one-line summary of how many devices are online (their driver bound and
 // reported in) out of those with a driver to bind - the device-state DeviceManager
 // tracks. Devices with no userspace driver yet stay unknown and are not counted.
-unsafe fn report_state(state: &[u8; MAX_DEVICES], count: u64) {
+unsafe fn report_state(state: &[u8]) {
 	unsafe {
 		let mut online: u32 = 0;
 		let mut tracked: u32 = 0;
-		for (i, &s) in state.iter().enumerate() {
-			if (i as u64) < count && s != STATE_UNKNOWN {
+		for &s in state {
+			if s != STATE_UNKNOWN {
 				tracked += 1;
 			}
 			if s == STATE_ONLINE {

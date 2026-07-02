@@ -23,9 +23,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use rt::*;
 
-use crate::net::{DHCP_ACK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, SockEntry, SockEntryState, Stack};
+use crate::net::{Event, Ipv4Addr, MacAddr, SockEntry, SockEntryState, Stack, DHCP_ACK, DHCP_OFFER};
 use proto::codec::Buffer;
-use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest, listener, network, socket};
+use proto::system::{listener, network, socket, Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -67,16 +67,12 @@ const REPLY_MAX: usize = 1024;
 // How many bytes a single socket `recv` returns (the client calls `recv` repeatedly
 // to drain a larger response); kept small for the 16 KiB user stack.
 const SOCK_RECV_MAX: usize = 512;
-// The most client channels we serve at once: the shell plus one per spawned net
-// tool. Bounded so the wait set (frames + clients + sockets) stays within the
-// kernel's wait_any limit (16).
+// The initial sizes of the client / socket / listener sets. Each set grows on
+// demand (a slot is reused when free, a new one pushed otherwise), so these are
+// size hints, never caps - the kernel's wait_any bound (64 handles) is the only
+// ceiling on how many channels the serve loop can stand on at once.
 const MAX_CLIENTS: usize = 4;
-// The most sockets open at once - the stack's connection pool size, so each accepted
-// or connected socket has a slot. frames(1) + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN <=
-// wait_any(16).
 const MAX_SOCKS: usize = 4;
-// The most listening sockets open at once (passive open); matches the stack's listen
-// table.
 const MAX_LISTEN: usize = 2;
 
 #[unsafe(no_mangle)]
@@ -140,16 +136,15 @@ unsafe fn pump(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> 
 	}
 }
 
-// The first empty slot in the client set, or None if it is full.
-fn first_empty(clients: &[u64; MAX_CLIENTS]) -> Option<usize> {
-	let mut i: usize = 0;
-	while i < MAX_CLIENTS {
-		if clients[i] == 0 {
-			return Some(i);
+// Place a client channel in the set: reuse a free slot (0), or grow the set.
+fn place_client(clients: &mut Vec<u64>, chan: u64) {
+	for slot in clients.iter_mut() {
+		if *slot == 0 {
+			*slot = chan;
+			return;
 		}
-		i += 1;
 	}
-	None
+	clients.push(chan);
 }
 
 // Stand on the driver's frame channel, every client's typed request channel, and
@@ -174,64 +169,65 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 		send_frame(frames, &tx[..arp]);
 		// The client channels we serve the `network` interface on: the shell's
 		// (clients[0]) plus any minted by `network.open` for a spawned net tool.
-		let mut clients: [u64; MAX_CLIENTS] = [0u64; MAX_CLIENTS];
-		clients[0] = client;
+		// Each set below reuses free slots and grows on demand - never a fixed cap.
+		let mut clients: Vec<u64> = Vec::with_capacity(MAX_CLIENTS);
+		clients.push(client);
 		// The active sockets (chan 0 = empty slot). Each is handed out by `network.connect`
 		// (later `listener.accept`): its channel, the stack connection index it drives, and
 		// its received-data stream producer (0 = none) plus that stream's frame sequence.
 		// The serve loop waits on every active socket channel at once.
-		let mut socks: [SockSlot; MAX_SOCKS] = [SockSlot { chan: 0, ci: 0, stream_prod: 0, stream_seq: 0 }; MAX_SOCKS];
+		let mut socks: Vec<SockSlot> = Vec::with_capacity(MAX_SOCKS);
 		// The active listeners (chan 0 = empty), each from `network.listen`: its channel,
 		// the port it accepts on, and a deferred `accept` (the correlation id to answer
 		// once an inbound connection completes, if accept was called with none pending).
-		let mut listeners: [Listener; MAX_LISTEN] = [Listener { chan: 0, port: 0, pending_corr: 0, pending: false }; MAX_LISTEN];
+		let mut listeners: Vec<Listener> = Vec::with_capacity(MAX_LISTEN);
 		loop {
 			// Build the wait set: the driver frame channel always (index 0), every active
 			// client channel, then every active socket channel, then every listener. `kind`
 			// tags each wait index (0 = client, 1 = socket, 2 = listener) and `slot_of` maps
 			// it back to its slot.
-			let mut waits: [u64; 1 + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN] = [0u64; 1 + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN];
-			let mut kind: [u8; 1 + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN] = [0u8; 1 + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN];
-			let mut slot_of: [usize; 1 + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN] = [usize::MAX; 1 + MAX_CLIENTS + MAX_SOCKS + MAX_LISTEN];
-			waits[0] = frames;
-			let mut n: usize = 1;
+			let capacity: usize = 1 + clients.len() + socks.len() + listeners.len();
+			let mut waits: Vec<u64> = Vec::with_capacity(capacity);
+			let mut kind: Vec<u8> = Vec::with_capacity(capacity);
+			let mut slot_of: Vec<usize> = Vec::with_capacity(capacity);
+			waits.push(frames);
+			kind.push(0);
+			slot_of.push(usize::MAX);
 			let mut i: usize = 0;
-			while i < MAX_CLIENTS {
+			while i < clients.len() {
 				if clients[i] != 0 {
-					waits[n] = clients[i];
-					kind[n] = 0;
-					slot_of[n] = i;
-					n += 1;
+					waits.push(clients[i]);
+					kind.push(0);
+					slot_of.push(i);
 				}
 				i += 1;
 			}
 			let mut i: usize = 0;
-			while i < MAX_SOCKS {
+			while i < socks.len() {
 				if socks[i].chan != 0 {
-					waits[n] = socks[i].chan;
-					kind[n] = 1;
-					slot_of[n] = i;
-					n += 1;
+					waits.push(socks[i].chan);
+					kind.push(1);
+					slot_of.push(i);
 				}
 				i += 1;
 			}
 			let mut i: usize = 0;
-			while i < MAX_LISTEN {
+			while i < listeners.len() {
 				if listeners[i].chan != 0 {
-					waits[n] = listeners[i].chan;
-					kind[n] = 2;
-					slot_of[n] = i;
-					n += 1;
+					waits.push(listeners[i].chan);
+					kind.push(2);
+					slot_of.push(i);
 				}
 				i += 1;
 			}
+			let n: usize = waits.len();
 			let ready: usize = wait_any(&waits[..n], 0) as usize;
 			if ready == 0 {
 				pump(frames, stack, &mut rx, &mut tx);
 				// Feed any newly received bytes to each active recv stream, closing the
 				// producer (end of stream) once that connection's peer closes or resets.
 				let mut si: usize = 0;
-				while si < MAX_SOCKS {
+				while si < socks.len() {
 					if socks[si].chan != 0 && socks[si].stream_prod != 0 {
 						let ci: usize = socks[si].ci;
 						let prod: u64 = stream_pump(ci, stack, &mut out, socks[si].stream_prod, &mut socks[si].stream_seq);
@@ -246,7 +242,7 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 				// Answer any deferred `accept`: a frame may have completed an inbound
 				// handshake, so a listener that was waiting for a connection gets one now.
 				let mut li: usize = 0;
-				while li < MAX_LISTEN {
+				while li < listeners.len() {
 					if listeners[li].chan != 0 && listeners[li].pending {
 						if let Some(ci) = stack.take_accepted(listeners[li].port) {
 							if accept_handoff(listeners[li].chan, listeners[li].pending_corr, ci, &mut socks, stack) {
@@ -273,9 +269,10 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 						let mut new_client: u64 = 0;
 						let mut new_listener: u64 = 0;
 						let mut new_listener_port: u16 = 0;
-						let client_room: bool = first_empty(&clients).is_some();
-						let sock_room: bool = first_empty_sock(&socks).is_some();
-						let listener_room: bool = first_empty_listener(&listeners).is_some();
+						// every set grows on demand, so there is always room.
+						let client_room: bool = true;
+						let sock_room: bool = true;
+						let listener_room: bool = true;
 						{
 							let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], new_sock: &mut new_sock, new_sock_ci: &mut new_sock_ci, new_client: &mut new_client, new_listener: &mut new_listener, new_listener_port: &mut new_listener_port, sock_room, client_room, listener_room };
 							let mut reply_handle: u64 = 0;
@@ -284,29 +281,13 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 							}
 						}
 						if new_sock != 0 {
-							match first_empty_sock(&socks) {
-								Some(si) => socks[si] = SockSlot { chan: new_sock, ci: new_sock_ci, stream_prod: 0, stream_seq: 0 },
-								None => {
-									socket_teardown(new_sock_ci, frames, stack, &mut rx, &mut tx);
-									stack.tcp_free(new_sock_ci);
-									close(new_sock);
-								}
-							}
+							place_sock(&mut socks, SockSlot { chan: new_sock, ci: new_sock_ci, stream_prod: 0, stream_seq: 0 });
 						}
 						if new_listener != 0 {
-							match first_empty_listener(&listeners) {
-								Some(li) => listeners[li] = Listener { chan: new_listener, port: new_listener_port, pending_corr: 0, pending: false },
-								None => {
-									stack.unlisten(new_listener_port);
-									close(new_listener);
-								}
-							}
+							place_listener(&mut listeners, Listener { chan: new_listener, port: new_listener_port, pending_corr: 0, pending: false });
 						}
 						if new_client != 0 {
-							match first_empty(&clients) {
-								Some(slot2) => clients[slot2] = new_client,
-								None => close(new_client),
-							}
+							place_client(&mut clients, new_client);
 						}
 					}
 					Received::Closed => {
@@ -330,16 +311,15 @@ struct SockSlot {
 	stream_seq: u32,
 }
 
-// The first free socket slot, or None when the pool is full.
-fn first_empty_sock(socks: &[SockSlot; MAX_SOCKS]) -> Option<usize> {
-	let mut i: usize = 0;
-	while i < MAX_SOCKS {
-		if socks[i].chan == 0 {
-			return Some(i);
+// Place a socket in the set: reuse a free slot (chan 0), or grow the set.
+fn place_sock(socks: &mut Vec<SockSlot>, sock: SockSlot) {
+	for slot in socks.iter_mut() {
+		if slot.chan == 0 {
+			*slot = sock;
+			return;
 		}
-		i += 1;
 	}
-	None
+	socks.push(sock);
 }
 
 // Service one ready socket slot: decode the request and dispatch it to the `socket`
@@ -421,22 +401,21 @@ struct Listener {
 	pending: bool,
 }
 
-// The first free listener slot, or None when the pool is full.
-fn first_empty_listener(listeners: &[Listener; MAX_LISTEN]) -> Option<usize> {
-	let mut i: usize = 0;
-	while i < MAX_LISTEN {
-		if listeners[i].chan == 0 {
-			return Some(i);
+// Place a listener in the set: reuse a free slot (chan 0), or grow the set.
+fn place_listener(listeners: &mut Vec<Listener>, listener: Listener) {
+	for slot in listeners.iter_mut() {
+		if slot.chan == 0 {
+			*slot = listener;
+			return;
 		}
-		i += 1;
 	}
-	None
+	listeners.push(listener);
 }
 
 // Service one ready listener: an `accept` request is answered now (an inbound
 // connection has completed its handshake) or deferred (its correlation id remembered)
 // to be answered when one does. A closed listener channel stops listening on its port.
-unsafe fn serve_listener(listener: &mut Listener, socks: &mut [SockSlot; MAX_SOCKS], stack: &mut Stack, req: &mut [u8]) {
+unsafe fn serve_listener(listener: &mut Listener, socks: &mut Vec<SockSlot>, stack: &mut Stack, req: &mut [u8]) {
 	unsafe {
 		match recv_blocking(listener.chan, req) {
 			Received::Message { len, .. } => {
@@ -465,20 +444,15 @@ unsafe fn serve_listener(listener: &mut Listener, socks: &mut [SockSlot; MAX_SOC
 }
 
 // Hand accepted connection `ci` to the listener as a socket: mint the socket channel,
-// record it in a free socket slot, and reply to the pending `accept` (correlation
-// `corr`) with the client end out of band. The reply frames a `result<handle<channel>,
-// error>` Ok: [corr u32][tag 1][u32 0] inline, the channel out of band. False (retry
-// later) if no socket slot is free, or the connection is dropped if the channel cannot
-// be minted.
-unsafe fn accept_handoff(listener_chan: u64, corr: u32, ci: usize, socks: &mut [SockSlot; MAX_SOCKS], stack: &mut Stack) -> bool {
+// place it in the socket set (which grows on demand), and reply to the pending
+// `accept` (correlation `corr`) with the client end out of band. The reply frames a
+// `result<handle<channel>, error>` Ok: [corr u32][tag 1][u32 0] inline, the channel
+// out of band. The connection is dropped if the channel cannot be minted.
+unsafe fn accept_handoff(listener_chan: u64, corr: u32, ci: usize, socks: &mut Vec<SockSlot>, stack: &mut Stack) -> bool {
 	unsafe {
-		let si: usize = match first_empty_sock(socks) {
-			Some(i) => i,
-			None => return false,
-		};
 		match channel() {
 			Some((server, peer)) => {
-				socks[si] = SockSlot { chan: server, ci, stream_prod: 0, stream_seq: 0 };
+				place_sock(socks, SockSlot { chan: server, ci, stream_prod: 0, stream_seq: 0 });
 				let mut reply: [u8; 9] = [0u8; 9];
 				reply[0..4].copy_from_slice(&corr.to_le_bytes());
 				reply[4] = 1;
@@ -498,8 +472,9 @@ unsafe fn accept_handoff(listener_chan: u64, corr: u32, ci: usize, socks: &mut [
 // scratch buffers - the stack and buffers are borrowed from the serve loop, so the
 // connection state and the 2 KiB frame buffers are not duplicated on the stack.
 // `connect` parks the server end of the socket it opens in `new_sock` (and its stack
-// connection index in `new_sock_ci`) for the serve loop to pick up; `sock_room` is
-// whether a socket slot is free.
+// connection index in `new_sock_ci`) for the serve loop to pick up. The room flags
+// are always true now that every set grows on demand; they remain so a future
+// resource policy can gate admission again.
 struct Net<'a> {
 	frames: u64,
 	seq: u16,

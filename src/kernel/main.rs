@@ -2944,7 +2944,7 @@ fn inventory_tools_report_the_hardware() {
 	assert!(contains(&lscpu, b"arch: x86_64") && contains(&lscpu, b"cpu0: lapic "), "lscpu should print the architecture and each core's LAPIC id");
 
 	let free = run_inventory_tool(b"free");
-	assert!(free.starts_with(b"Mem:  total ") && contains(&free, b"Heap: total 2097152, used "), "free should print the frame-pool and heap totals");
+	assert!(free.starts_with(b"Mem:  total ") && contains(&free, b"Heap: total "), "free should print the frame-pool and heap totals");
 
 	let lsmem = run_inventory_tool(b"lsmem");
 	assert!(contains(&lsmem, b" usable\n"), "lsmem should print the retained boot memory map with a usable region");

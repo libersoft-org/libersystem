@@ -1360,7 +1360,7 @@ unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8]) -> bool {
 		// Relay the command's output to our console as it prints, until it exits and its stdout
 		// end closes. The buffer matches the console's own per-write size, so a single message
 		// renders the same as it would straight from the command.
-		let mut obuf: [u8; 1024] = [0u8; 1024];
+		let mut obuf: [u8; 4096] = [0u8; 4096];
 		loop {
 			match recv_blocking(out_read, &mut obuf) {
 				Received::Message { len, .. } => print(&obuf[..len]),
