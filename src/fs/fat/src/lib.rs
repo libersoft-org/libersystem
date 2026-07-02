@@ -289,7 +289,11 @@ impl<D: BlockDevice> FatFs<D> {
 		Ok(match self.geo.kind {
 			Kind::Fat12 => {
 				let v = u16::from_le_bytes([buf[within], buf[within + 1]]);
-				if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
+				if cluster & 1 == 1 {
+					(v >> 4) as u32
+				} else {
+					(v & 0x0FFF) as u32
+				}
 			}
 			Kind::Fat16 => u16::from_le_bytes([buf[within], buf[within + 1]]) as u32,
 			Kind::Fat32 | Kind::ExFat => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]) & 0x0FFF_FFFF,
@@ -401,7 +405,11 @@ impl<D: BlockDevice> FatFs<D> {
 
 	// Read a directory's raw bytes: the fixed root region for FAT12/16, else its chain.
 	fn read_dir_bytes(&mut self, cluster: u32) -> Result<Vec<u8>, FsError> {
-		if cluster == 0 { self.read_root_region() } else { self.read_chain(cluster, usize::MAX) }
+		if cluster == 0 {
+			self.read_root_region()
+		} else {
+			self.read_chain(cluster, usize::MAX)
+		}
 	}
 
 	// Write a directory's raw bytes back, to the fixed root region or its cluster chain.
@@ -708,7 +716,15 @@ impl Geometry {
 		let root_sectors = (root_entries * 32).div_ceil(bytes_per_sector);
 		let first_data_sector = reserved_sectors + num_fats * fat_size + root_sectors;
 		let clusters = (total - first_data_sector) / sectors_per_cluster;
-		let kind = if clusters < 4085 {
+		// FAT32 announces itself by its BPB shape - no fixed root region and the FAT
+		// size in the 32-bit field - regardless of the cluster count: a small FAT32
+		// volume (e.g. an mtools-formatted stick) sits inside the FAT16 cluster range,
+		// so the count thresholds alone would misclassify it (and then read an empty
+		// fixed root region that does not exist). The thresholds decide FAT12 vs FAT16
+		// for the classic layouts only.
+		let kind = if root_entries == 0 && fat16 == 0 {
+			Kind::Fat32
+		} else if clusters < 4085 {
 			Kind::Fat12
 		} else if clusters < 65525 {
 			Kind::Fat16

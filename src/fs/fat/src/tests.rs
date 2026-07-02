@@ -43,15 +43,22 @@ struct File {
 // FAT; clusters are handed out per file/dir, FAT chains and directory entries written so
 // the reader walks them exactly as it would a real disk. Subdirectories get "." / "..".
 fn build_fat(kind: Kind, files: &[File]) -> Vec<u8> {
-	let bps: usize = 512;
-	let spc: usize = 1;
-	let reserved: usize = if kind == Kind::Fat32 { 32 } else { 1 };
-	let root_entries: usize = if kind == Kind::Fat32 { 0 } else { 512 };
 	let clusters: usize = match kind {
 		Kind::Fat12 => 1000,
 		Kind::Fat16 => 5000,
 		_ => 66000,
 	};
+	build_fat_sized(kind, files, clusters)
+}
+
+// The sized variant of `build_fat`: the cluster count is the caller's, so a FAT32
+// image can be built small (inside the FAT16 cluster range) the way mtools formats
+// a stick - the layout the BPB-shape detection exists for.
+fn build_fat_sized(kind: Kind, files: &[File], clusters: usize) -> Vec<u8> {
+	let bps: usize = 512;
+	let spc: usize = 1;
+	let reserved: usize = if kind == Kind::Fat32 { 32 } else { 1 };
+	let root_entries: usize = if kind == Kind::Fat32 { 0 } else { 512 };
 	let ent: usize = match kind {
 		Kind::Fat12 => return build_fat12(files, clusters),
 		Kind::Fat16 => 2,
@@ -367,6 +374,18 @@ fn mounts_and_lists_fat16() {
 fn mounts_and_lists_fat32() {
 	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat32, ROOT) }).unwrap();
 	assert_eq!(names(&fs.list().unwrap()), ["DOCS", "HELLO.TXT", "readme.md"]);
+}
+
+#[test]
+fn mounts_small_fat32_by_bpb_shape() {
+	// A FAT32 volume whose cluster count sits inside the FAT16 range - the layout
+	// mtools formats a small stick with. The cluster-count thresholds alone would
+	// misclassify it as FAT16 (and read an empty fixed root region that does not
+	// exist); the BPB shape (no root entries, the FAT size in the 32-bit field)
+	// must classify it as FAT32 and resolve its files.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat_sized(Kind::Fat32, ROOT, 20000) }).unwrap();
+	assert_eq!(names(&fs.list().unwrap()), ["DOCS", "HELLO.TXT", "readme.md"]);
+	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"Hello, FAT!");
 }
 
 #[test]

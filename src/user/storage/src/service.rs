@@ -107,10 +107,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(fs) => Volume::Disk(fs),
 			None => exit(),
 		},
-		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => match FatFs::mount(FatBlockDevice { chan: handle }) {
-			Some(fs) => Volume::Fat(fs, MEDIA_VOLUME),
-			None => exit(),
-		},
+		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => Volume::Fat(FatBacking { chan: handle, name: MEDIA_VOLUME, fs: None }),
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"ISOBLOCK" => match Iso9660::mount(IsoBlockDevice { chan: handle }) {
 			Some(fs) => Volume::Iso(fs),
 			None => exit(),
@@ -119,10 +116,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(fs) => Volume::Udf(fs),
 			None => exit(),
 		},
-		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"USBBLOCK" => match FatFs::mount(FatBlockDevice { chan: handle }) {
-			Some(fs) => Volume::Fat(fs, USB_VOLUME),
-			None => exit(),
-		},
+		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"USBBLOCK" => Volume::Fat(FatBacking { chan: handle, name: USB_VOLUME, fs: None }),
 		_ => exit(),
 	};
 	// 2. service endpoint: clients reach the service here.
@@ -147,12 +141,41 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // read-only PKGARCH1 archive mapped in memory (the ramdisk path), a writable LiberFS
 // on the virtio-blk disk (the boot path), or a writable FAT12/16/32/exFAT volume on
 // a second virtio-blk disk (foreign media).
+// A lazily mounted FAT backing over a block-service channel, serving removable
+// media (the virtio media disk and the USB stick - both unpluggable). The
+// filesystem mounts on first use and remounts after the media went away: an I/O
+// failure drops the mount, so the next request probes the media afresh - the
+// hot-plug behaviour a removable volume needs. An instance therefore reports
+// online at boot whether or not media is present.
+struct FatBacking {
+	chan: u64,
+	name: &'static [u8],
+	fs: Option<FatFs<FatBlockDevice>>,
+}
+
+impl FatBacking {
+	// Run `op` on the mounted filesystem (mounting on first use), dropping the mount
+	// on an I/O failure - the media was unplugged - so the next request remounts.
+	fn run<R>(&mut self, op: impl FnOnce(&mut FatFs<FatBlockDevice>) -> Result<R, fat::FsError>) -> Result<R, Error> {
+		if self.fs.is_none() {
+			self.fs = FatFs::mount(FatBlockDevice { chan: self.chan });
+		}
+		let fs: &mut FatFs<FatBlockDevice> = self.fs.as_mut().ok_or(Error::NotFound)?;
+		match op(fs) {
+			Ok(r) => Ok(r),
+			Err(fat::FsError::Io) => {
+				self.fs = None;
+				Err(Error::Again)
+			}
+			Err(e) => Err(map_fat_err(e)),
+		}
+	}
+}
+
 enum Volume {
 	Archive { base: u64, len: usize },
 	Disk(LiberFs<ChannelBlockDevice>),
-	// The FAT backing serves two volumes - the virtio media disk and the USB stick -
-	// so it carries the vol:// name it answers to.
-	Fat(FatFs<FatBlockDevice>, &'static [u8]),
+	Fat(FatBacking),
 	Iso(Iso9660<IsoBlockDevice>),
 	Udf(Udf<UdfBlockDevice>),
 }
@@ -163,7 +186,7 @@ impl Volume {
 	// ISO9660 is "iso"; the read-only UDF is "udf".
 	fn name(&self) -> &'static [u8] {
 		match self {
-			Volume::Fat(_, name) => name,
+			Volume::Fat(backing) => backing.name,
 			Volume::Iso(_) => ISO_VOLUME,
 			Volume::Udf(_) => UDF_VOLUME,
 			_ => SYSTEM_VOLUME,
@@ -196,8 +219,8 @@ impl volume::Service for Volume {
 				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
 				Ok(OpenResult { file: handle, size: file.len() as u64 })
 			}
-			Volume::Fat(fs, _) => {
-				let file: Vec<u8> = fs.read_file(name).map_err(map_fat_err)?;
+			Volume::Fat(backing) => {
+				let file: Vec<u8> = backing.run(|fs| fs.read_file(name))?;
 				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
 				Ok(OpenResult { file: handle, size: file.len() as u64 })
 			}
@@ -239,8 +262,8 @@ impl volume::Service for Volume {
 				let entries = if dir.is_empty() { fs.list() } else { fs.read_dir(dir) }.map_err(map_fs_err)?;
 				Ok(entries.into_iter().map(|(name, size, is_dir)| file_info(&name, size, is_dir)).collect())
 			}
-			Volume::Fat(fs, _) => {
-				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_fat_err)?;
+			Volume::Fat(backing) => {
+				let entries = backing.run(|fs| if dir.is_empty() { fs.list() } else { fs.list_dir(dir) })?;
 				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir)).collect())
 			}
 			Volume::Iso(fs) => {
@@ -264,7 +287,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.write_file(name, &bytes).map_err(map_fs_err),
-			Volume::Fat(fs, _) => fs.write_file(name, &bytes).map_err(map_fat_err),
+			Volume::Fat(backing) => backing.run(|fs| fs.write_file(name, &bytes)),
 			Volume::Iso(_) => Err(Error::Invalid),
 			Volume::Udf(_) => Err(Error::Invalid),
 		}
@@ -276,7 +299,7 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.remove(name).map_err(map_fs_err),
-			Volume::Fat(fs, _) => fs.remove(name).map_err(map_fat_err),
+			Volume::Fat(backing) => backing.run(|fs| fs.remove(name)),
 			Volume::Iso(_) => Err(Error::Invalid),
 			Volume::Udf(_) => Err(Error::Invalid),
 		}

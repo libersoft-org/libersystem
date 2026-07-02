@@ -87,6 +87,7 @@ const TRB_DATA: u32 = 3;
 const TRB_STATUS: u32 = 4;
 const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_DISABLE_SLOT: u32 = 10;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 const TRB_EVALUATE_CONTEXT: u32 = 13;
@@ -332,6 +333,42 @@ struct Keyboard {
 	mods: Mods,
 }
 
+// The addressed devices' slots, by root port - the state hot-plug works against.
+// An attach enumerates a root port only when no slot is recorded for it; a detach
+// disables every slot recorded for it (a hub takes its downstream devices along).
+struct Slots {
+	entries: [(u32, u32); 16],
+	len: usize,
+}
+
+impl Slots {
+	const fn new() -> Slots {
+		Slots { entries: [(0, 0); 16], len: 0 }
+	}
+
+	// Record one addressed device's (root port, slot).
+	fn record(&mut self, port: u32, slot: u32) {
+		if self.len < self.entries.len() {
+			self.entries[self.len] = (port, slot);
+			self.len += 1;
+		}
+	}
+
+	// Whether any addressed device sits on this root port.
+	fn has_port(&self, port: u32) -> bool {
+		self.entries[..self.len].iter().any(|&(p, _)| p == port)
+	}
+
+	// Remove and return one slot on this root port (call until None on a detach).
+	fn take_port(&mut self, port: u32) -> Option<u32> {
+		let i: usize = self.entries[..self.len].iter().position(|&(p, _)| p == port)?;
+		let slot: u32 = self.entries[i].1;
+		self.len -= 1;
+		self.entries[i] = self.entries[self.len];
+		Some(slot)
+	}
+}
+
 // A configured USB mass-storage device (Bulk-Only Transport): the bulk IN and OUT
 // endpoints' device context indices, addresses (for stall recovery) and transfer
 // rings, the interface number (for the BOT reset), a page for the sector data (the
@@ -376,23 +413,26 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		// enumerate the root-hub ports, address every connected device (expanding hubs
 		// recursively), and configure the first HID boot keyboard and the first
-		// mass-storage device found anywhere on the bus.
+		// mass-storage device found anywhere on the bus. Every addressed device's slot
+		// is recorded by root port, the state runtime attach/detach works against.
 		let mut devices: u32 = 0;
 		let mut keyboard: Option<(UsbDevice, Keyboard)> = None;
 		let mut storage: Option<(UsbDevice, Storage)> = None;
+		let mut slots: Slots = Slots::new();
 		let mut port: u32 = 1;
 		while port <= hc.ports {
 			if let Some(dev) = attach_port(&mut hc, port) {
-				register_device(&mut hc, dev, &mut devices, &mut keyboard, &mut storage);
+				register_device(&mut hc, dev, &mut slots, &mut devices, &mut keyboard, &mut storage);
 			}
 			port += 1;
 		}
-		// a mass-storage device is served over a block channel: the client end rides
+		// the block channel a mass-storage device is served over: the client end rides
 		// up with the report (DeviceManager routes it to a StorageService instance).
-		let (blk_server, blk_client): (u64, u64) = if storage.is_some() { channel().unwrap_or_else(|| exit()) } else { (0, 0) };
-		// report in, then serve the keyboard and the disk for the life of the system
-		// - or, with neither, stand holding the controller until DeviceManager drops
-		// the bootstrap channel.
+		// Always created - a stick hot-plugged later serves over the same channel, and
+		// with none attached requests are answered with an error status.
+		let (blk_server, blk_client): (u64, u64) = channel().unwrap_or_else(|| exit());
+		// report in, then serve the bus for the life of the system: keyboard reports,
+		// block requests, and runtime attach / detach.
 		let mut report: [u8; 64] = [0u8; 64];
 		let mut n: usize = 0;
 		for &b in b"driver.xhci: online (" {
@@ -417,12 +457,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 		}
 		send_blocking(bootstrap, &report[..n], blk_client);
-		if keyboard.is_some() || storage.is_some() {
-			service_loop(&mut hc, keyboard, storage, blk_server, irq);
-		}
-		let _ = recv_blocking(bootstrap, &mut buf);
+		service_loop(&mut hc, &mut slots, keyboard, storage, blk_server, irq);
 	}
-	exit();
 }
 
 // Reset the controller and build its data structures: the device context base
@@ -689,16 +725,18 @@ fn initial_packet_size(speed: u32) -> u32 {
 	}
 }
 
-// Register one addressed device: print its identity, count it, and classify it -
-// a hub is expanded (its ports enumerated, each downstream device landing back
-// here recursively), the first HID boot keyboard and the first mass-storage device
-// are configured and kept for the service loop, anything else is left addressed.
-unsafe fn register_device(hc: &mut Xhci, mut dev: UsbDevice, devices: &mut u32, keyboard: &mut Option<(UsbDevice, Keyboard)>, storage: &mut Option<(UsbDevice, Storage)>) {
+// Register one addressed device: print its identity, record its slot by root port
+// (the state a later detach tears down), count it, and classify it - a hub is
+// expanded (its ports enumerated, each downstream device landing back here
+// recursively), the first HID boot keyboard and the first mass-storage device are
+// configured and kept for the service loop, anything else is left addressed.
+unsafe fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices: &mut u32, keyboard: &mut Option<(UsbDevice, Keyboard)>, storage: &mut Option<(UsbDevice, Storage)>) {
 	unsafe {
 		report_device(&dev);
+		slots.record(dev.port, dev.slot);
 		*devices += 1;
 		if dev.class == CLASS_HUB {
-			expand_hub(hc, &mut dev, devices, keyboard, storage);
+			expand_hub(hc, &mut dev, slots, devices, keyboard, storage);
 		} else if keyboard.is_none()
 			&& let Some(kb) = configure_keyboard(hc, &mut dev)
 		{
@@ -716,7 +754,7 @@ unsafe fn register_device(hc: &mut Xhci, mut dev: UsbDevice, devices: &mut u32, 
 // up, and bring up whatever is connected. Each addressed downstream device runs
 // through `register_device`, so a hub found downstream expands recursively and a
 // keyboard or disk behind any tier of hubs is configured like a root one.
-unsafe fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, devices: &mut u32, keyboard: &mut Option<(UsbDevice, Keyboard)>, storage: &mut Option<(UsbDevice, Storage)>) {
+unsafe fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &mut u32, keyboard: &mut Option<(UsbDevice, Keyboard)>, storage: &mut Option<(UsbDevice, Storage)>) {
 	unsafe {
 		// no keyboard is serving yet, so the control waits see no keyboard events.
 		let mut pending: Option<(UsbDevice, Keyboard)> = None;
@@ -742,7 +780,7 @@ unsafe fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, devices: &mut u32, keyb
 		let mut port: u32 = 1;
 		while port <= ports.min(15) {
 			if let Some(dev) = attach_hub_port(hc, hub, port, shift) {
-				register_device(hc, dev, devices, keyboard, storage);
+				register_device(hc, dev, slots, devices, keyboard, storage);
 			}
 			port += 1;
 		}
@@ -1049,14 +1087,16 @@ fn ep_interval(speed: u32, b_interval: u32) -> u32 {
 	exp
 }
 
-// Serve the configured keyboard and mass-storage device for the life of the
-// system: the keyboard keeps one 8-byte report TRB posted (the device completes it
-// only when the key state changes) and its reports feed the console; the disk
-// serves block requests arriving on `blk_server`. The loop sleeps on the
-// controller's MSI-X interrupt and the block channel at once, and the synchronous
-// BOT waits service keyboard events inline, so typing is never lost behind disk
-// traffic.
-unsafe fn service_loop(hc: &mut Xhci, mut keyboard: Option<(UsbDevice, Keyboard)>, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, irq: u64) -> ! {
+// Serve the bus for the life of the system: the keyboard keeps one 8-byte report
+// TRB posted (the device completes it only when the key state changes) and its
+// reports feed the console; the disk serves block requests arriving on
+// `blk_server` (answered with an error status while no disk is attached); and a
+// port-status-change event triggers a root-port reconcile, so a device plugged in
+// at runtime enumerates and configures on the fly and an unplugged one is torn
+// down. The loop sleeps on the controller's MSI-X interrupt and the block channel
+// at once, and the synchronous BOT waits service keyboard events inline, so typing
+// is never lost behind disk traffic.
+unsafe fn service_loop(hc: &mut Xhci, slots: &mut Slots, mut keyboard: Option<(UsbDevice, Keyboard)>, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, irq: u64) -> ! {
 	unsafe {
 		if let Some((dev, kb)) = keyboard.as_mut() {
 			post_report(hc, dev, kb);
@@ -1064,32 +1104,93 @@ unsafe fn service_loop(hc: &mut Xhci, mut keyboard: Option<(UsbDevice, Keyboard)
 		let mut req: [u8; 16] = [0u8; 16];
 		loop {
 			let waitset: [u64; 2] = [irq, blk_server];
-			let handles: &[u64] = if blk_server != 0 { &waitset } else { &waitset[..1] };
-			wait_any(handles, 0);
-			// the interrupt: drain the event ring (keyboard reports feed the console),
-			// acknowledge, and clear the interrupter's pending flag so the next event
-			// edge fires.
+			wait_any(&waitset, 0);
+			// the interrupt: drain the event ring (keyboard reports feed the console; a
+			// port-status change marks the bus for the reconcile below), acknowledge,
+			// and clear the interrupter's pending flag so the next event edge fires.
+			let mut rescan: bool = false;
 			while let Some((_p, status, control)) = take_event(hc) {
+				if control >> 10 & 0x3f == TRB_EV_PORT_STATUS {
+					rescan = true;
+					continue;
+				}
 				handle_keyboard_event(hc, &mut keyboard, status, control);
 			}
 			interrupt_ack(irq);
 			w32(hc.ir0 + IR_IMAN, IMAN_IE | IMAN_IP);
-			// the block channel: serve every queued request.
-			if let Some((dev, st)) = storage.as_mut() {
-				loop {
-					match try_recv(blk_server, &mut req) {
-						Polled::Message { len, handle } if len >= 16 => serve_block_request(hc, &mut keyboard, dev, st, blk_server, &req, handle),
-						Polled::Message { handle, .. } => {
+			if rescan {
+				reconcile_ports(hc, slots, &mut keyboard, &mut storage);
+			}
+			// the block channel: serve every queued request (with an error status while
+			// no mass-storage device is attached, so a client never blocks).
+			loop {
+				match try_recv(blk_server, &mut req) {
+					Polled::Message { len, handle } if len >= 16 => match storage.as_mut() {
+						Some((dev, st)) => serve_block_request(hc, &mut keyboard, dev, st, blk_server, &req, handle),
+						None => {
 							if handle != 0 {
 								close(handle);
 							}
 							reply_block(blk_server, STATUS_ERR, 0);
 						}
-						Polled::Empty => break,
-						Polled::Closed => exit(),
+					},
+					Polled::Message { handle, .. } => {
+						if handle != 0 {
+							close(handle);
+						}
+						reply_block(blk_server, STATUS_ERR, 0);
 					}
+					Polled::Empty => break,
+					Polled::Closed => exit(),
 				}
 			}
+		}
+	}
+}
+
+// Reconcile the root ports with the addressed-device state after a port-status
+// change: a connected port with no addressed device is a fresh attach - enumerate
+// and classify it like at start (a new keyboard begins serving reports, a new disk
+// serves the block channel); a disconnected port with addressed devices is a
+// detach - every slot on that port is disabled (a hub takes its downstream devices
+// along) and the keyboard / storage state dropped, so vol://usb unmounts and a
+// replug enumerates cleanly.
+unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, keyboard: &mut Option<(UsbDevice, Keyboard)>, storage: &mut Option<(UsbDevice, Storage)>) {
+	unsafe {
+		let mut port: u32 = 1;
+		while port <= hc.ports {
+			let addr: u64 = hc.op + OP_PORTSC_BASE + (port - 1) as u64 * 0x10;
+			let connected: bool = r32(addr) & PORTSC_CCS != 0;
+			let known: bool = slots.has_port(port);
+			if connected && !known {
+				let had_keyboard: bool = keyboard.is_some();
+				let mut devices: u32 = 0;
+				if let Some(dev) = attach_port(hc, port) {
+					register_device(hc, dev, slots, &mut devices, keyboard, storage);
+				}
+				// a keyboard configured by this attach starts serving: post its first
+				// report TRB (the boot-time one is posted before the service loop).
+				if !had_keyboard && let Some((dev, kb)) = keyboard.as_mut() {
+					post_report(hc, dev, kb);
+				}
+			} else if !connected && known {
+				// acknowledge the disconnect and tear the port's devices down.
+				portsc_write(hc, port, PORTSC_CSC | PORTSC_PEC | PORTSC_PRC | PORTSC_WRC | PORTSC_PLC | PORTSC_CEC);
+				while let Some(slot) = slots.take_port(port) {
+					command(hc, 0, 0, TRB_DISABLE_SLOT << 10 | slot << 24);
+					let mut none: Option<(UsbDevice, Keyboard)> = None;
+					let _ = wait_command(hc, &mut none);
+					((hc.dcbaa_virt + slot as u64 * 8) as *mut u64).write_volatile(0);
+				}
+				if keyboard.as_ref().is_some_and(|(dev, _)| dev.port == port) {
+					*keyboard = None;
+				}
+				if storage.as_ref().is_some_and(|(dev, _)| dev.port == port) {
+					*storage = None;
+				}
+				print(b"driver.xhci: port detached\n");
+			}
+			port += 1;
 		}
 	}
 }

@@ -2131,6 +2131,43 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let object = buf_cap.object();
 	let memory = object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
 	assert_eq!(read_from_object(memory, 512).len(), 512, "the buffer should hold the sector");
+
+	// the vol://usb volume end to end: a StorageService instance is handed the same
+	// block channel ("USBBLOCK" - the removable FAT backing that mounts lazily, on
+	// first use) and a serve channel, and must resolve a file off the stick's FAT
+	// image - the same bytes the seed laid down from volume/. The kernel's block
+	// endpoint moves to the service whole: the service is its consumer now.
+	let (volume2, package) = scenario_packages().expect("boot modules should be present");
+	let service_elf = package.lookup(b"storage_service").expect("storage_service should be in the init package");
+	let (service_boot_kernel, service_boot_user) = object::channel::Channel::create();
+	let (service_server, service_client) = object::channel::Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), service_elf, service_boot_user, Rights::ALL, 0).expect("the StorageService should load");
+	send_cap(&service_boot_kernel, b"USBBLOCK", blk, Rights::ALL).expect("the USBBLOCK handoff should send");
+	send_cap(&service_boot_kernel, b"SERVE", service_server, Rights::ALL).expect("the SERVE handoff should send");
+	sched::run_until_idle();
+	let online = service_boot_kernel.recv().expect("the usb StorageService should report in");
+	assert_eq!(&online.bytes[..], b"StorageService: online", "the instance should come up without touching the media (the mount is lazy)");
+
+	// one generated volume.open request for a seeded file, plus the quit sentinel.
+	let uri: &[u8] = b"vol://usb/hello.txt";
+	let mut open = alloc::vec::Vec::new();
+	open.extend_from_slice(&1u16.to_le_bytes()); // OP_OPEN
+	open.extend_from_slice(&1u32.to_le_bytes()); // correlation id
+	open.extend_from_slice(&(uri.len() as u16).to_le_bytes());
+	open.extend_from_slice(uri);
+	open.push(0); // write = false
+	open.push(0); // create = false
+	service_client.send(Message::new(open, alloc::vec::Vec::new(), 0)).expect("the open request should send");
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("the quit sentinel should send");
+	sched::run_until_idle();
+	let reply = service_client.recv().expect("the open reply should arrive");
+	assert!(reply.bytes.len() >= 17 && reply.bytes[4] == 1, "the usb volume should resolve the seeded file");
+	let size = u64::from_le_bytes([reply.bytes[9], reply.bytes[10], reply.bytes[11], reply.bytes[12], reply.bytes[13], reply.bytes[14], reply.bytes[15], reply.bytes[16]]) as usize;
+	let file_cap = reply.caps.first().expect("the open should grant the file buffer");
+	let file_object = file_cap.object();
+	let file = file_object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
+	let expected = volume_file(volume2, b"hello.txt").expect("hello.txt should be in the volume package");
+	assert_eq!(read_from_object(file, size), expected, "vol://usb should serve the seeded file's bytes");
 }
 
 #[cfg(test)]
