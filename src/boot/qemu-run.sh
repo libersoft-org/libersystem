@@ -137,7 +137,8 @@ QEMU_ARGS+=(
 # always exists (a bare truncate suffices - the driver's bring-up needs no
 # filesystem), so the test path's device set stays deterministic; when mtools is
 # present it is seeded as FAT with the volume/ files so vol://usb mounts with
-# content. Recreated only when missing.
+# content. Recreated only when missing. Skipped when a real stick is passed through
+# (USB_HOST, interactive only), so that stick is the one storage device on the bus.
 USB_DISK="$HERE/.build/usb-media.img"
 if [[ ! -f "$USB_DISK" ]]; then
 	truncate -s 16M "$USB_DISK"
@@ -147,10 +148,12 @@ if [[ ! -f "$USB_DISK" ]]; then
 		mcopy -i "$USB_DISK" "$HERE/../volume/motd.txt" ::motd.txt
 	fi
 fi
-QEMU_ARGS+=(
-	-drive "file=$USB_DISK,if=none,id=vusb,format=raw"
-	-device usb-storage,bus=usb.0,drive=vusb
-)
+if [[ "${TEST:-0}" == "1" || -z "${USB_HOST:-}" ]]; then
+	QEMU_ARGS+=(
+		-drive "file=$USB_DISK,if=none,id=vusb,format=raw"
+		-device usb-storage,bus=usb.0,drive=vusb
+	)
+fi
 # The second virtio-blk disk (FAT vol://media), discovered after the system disk; only
 # attached when the FAT image was built (mtools present).
 if [[ -f "$FAT_DISK" ]]; then
@@ -231,6 +234,16 @@ fi
 # so typing in the SPICE/VNC window drives the system. Left out of the test path to
 # keep that device set deterministic (the test boot exercises only blk/net/console).
 QEMU_ARGS+=(-device virtio-keyboard-pci,disable-legacy=on)
+
+# A real USB device passed through from the host onto the guest's xHCI bus
+# (interactive runs only): USB_HOST=vendorid:productid (hex, as `lsusb` prints them,
+# e.g. USB_HOST=0951:1666). The device detaches from the host for the run and the
+# xhci driver enumerates it like the emulated ones - a real mass-storage stick
+# replaces the emulated image (skipped above) and mounts as vol://usb, testing the
+# BOT/SCSI path against genuine hardware. Needs access to the USB device node.
+if [[ -n "${USB_HOST:-}" ]]; then
+	QEMU_ARGS+=(-device "usb-host,bus=usb.0,vendorid=0x${USB_HOST%%:*},productid=0x${USB_HOST##*:}")
+fi
 
 # virtio-input tablet (M36): interactive runs only. An absolute pointer device the
 # same userspace virtio_input driver self-identifies and drives, delivering text-cell
