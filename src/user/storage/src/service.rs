@@ -67,6 +67,7 @@ const MAX_SECTORS_PER_READ: usize = 8;
 const OP_READ: u32 = 0;
 const OP_WRITE: u32 = 1;
 const OP_CAPACITY: u32 = 2;
+const OP_FLUSH: u32 = 3;
 
 // LiberFS layout on the disk: the writable filesystem starts at FS_START_SECTOR - well
 // past the factory archive at LBA 0, which the boot runner re-lays every boot and the
@@ -134,7 +135,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
-		serve_multi(service, &mut buf, &mut reply, |_chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { volume::dispatch(&mut vol, req, handle, out, reply_handle) });
+		serve_multi(service, &mut buf, &mut reply, |_chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
+			// stamp the wall clock onto the filesystem before each request, so a
+			// mutation's inode timestamps carry real time (the RTC's Unix seconds; the
+			// NTP-disciplined policy clock lives in TimeService).
+			if let Volume::Disk(fs) = &mut vol {
+				fs.set_clock(clock_rtc());
+			}
+			volume::dispatch(&mut vol, req, handle, out, reply_handle)
+		});
 	}
 	exit();
 }
@@ -454,6 +463,9 @@ fn map_fs_err(e: FsError) -> Error {
 		// on-disk corruption caught by a block checksum: the data cannot be trusted.
 		FsError::Corrupt => Error::Invalid,
 		FsError::Io => Error::Again,
+		// a read-only mount (a snapshot, or a volume degraded by a corrupt snapshot
+		// table) refuses mutations, like any other read-only volume.
+		FsError::ReadOnly => Error::Denied,
 	}
 }
 
@@ -530,6 +542,10 @@ impl BlockDevice for ChannelBlockDevice {
 		let lba: u64 = FS_START_SECTOR + index * SECTORS_PER_BLOCK;
 		unsafe { block_write(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_ptr()) }
 	}
+
+	fn flush(&mut self) -> bool {
+		unsafe { block_flush(self.chan) }
+	}
 }
 
 // A second virtio-blk disk as a block device for the FAT backend: foreign media is
@@ -596,12 +612,19 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 				print(b"storage: vol://system spans less than the disk allows (formatted earlier; online resize is future work)\n");
 			}
 		}
+		if fs.is_read_only() {
+			unsafe {
+				print(b"storage: vol://system mounted READ-ONLY (corrupt snapshot table; repair or reformat to write)\n");
+			}
+		}
 		return Some(fs);
 	}
 	// otherwise lay down a fresh filesystem and copy in the factory seed files. The
 	// device is rebuilt from the (Copy) channel handle - the failed mount consumed the
 	// previous device value but left the channel open.
 	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format(ChannelBlockDevice { chan: block_client }, pool).ok()?;
+	// stamp real time before seeding, so the factory files carry a real ctime/mtime.
+	fs.set_clock(unsafe { clock_rtc() });
 	if let Some(archive) = unsafe { read_seed_archive(block_client) } {
 		seed_from_archive(&mut fs, &archive);
 	}
@@ -737,6 +760,25 @@ unsafe fn block_capacity(block_client: u64) -> Result<u64, Error> {
 		match recv_blocking(block_client, &mut rep) {
 			Received::Message { len, handle } if len >= 12 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => Ok(u64::from_le_bytes([rep[4], rep[5], rep[6], rep[7], rep[8], rep[9], rep[10], rep[11]])),
 			_ => Err(Error::Again),
+		}
+	}
+}
+
+// Send one flush request [op=3][0 u64][0 u32] to the driver: every write issued so
+// far must reach the medium before any later one. The reply is [status u32]. LiberFS
+// brackets its superblock commit with this barrier, so crash atomicity holds on a
+// disk with a volatile write cache.
+unsafe fn block_flush(block_client: u64) -> bool {
+	unsafe {
+		let mut req: [u8; 16] = [0u8; 16];
+		req[..4].copy_from_slice(&OP_FLUSH.to_le_bytes());
+		if !send_blocking(block_client, &req, 0) {
+			return false;
+		}
+		let mut rep: [u8; 16] = [0u8; 16];
+		match recv_blocking(block_client, &mut rep) {
+			Received::Message { len, handle } if len >= 4 && handle == 0 => u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0,
+			_ => false,
 		}
 	}
 }

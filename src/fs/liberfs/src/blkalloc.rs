@@ -44,6 +44,14 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.alloc_block(true)
 	}
 
+	// Release a block this transaction claimed but ended up not referencing (a
+	// contiguity gap while assembling a compressed run): clear its free-map bit and
+	// forget it was fresh, so the pool does not carry dead claims until commit.
+	pub(crate) fn unclaim(&mut self, block: u64) {
+		self.free[(block / 8) as usize] &= !(1 << (block % 8));
+		self.fresh.remove(&block);
+	}
+
 	// Copy-on-write a block reference. A pointer this transaction already allocated is
 	// returned as is (safe to mutate in place). A committed block (or the 0 "unmapped"
 	// sentinel) is copied up to a fresh block (data low, metadata high) and the old
@@ -325,7 +333,11 @@ impl<D: BlockDevice> LiberFs<D> {
 	// is written across a contiguous run of fresh data blocks with one checksum block
 	// (one CRC32C per stored block), and the extent rewritten to point at it; the old raw
 	// blocks become unreferenced and are reclaimed at commit. The run stays raw if it is
-	// a single block, does not shrink, or a contiguous stored run is unavailable.
+	// a single block, does not shrink, or a contiguous stored run is unavailable. Every
+	// source block is verified against its stored CRC32C first: compressing discards the
+	// raw blocks' checksums, so re-encoding unverified bytes would launder a device
+	// corruption into a compressed extent with a fresh, valid checksum - a mismatch
+	// leaves the run raw, where a read or fsck still surfaces the damage.
 	pub(crate) fn compress_extent(&mut self, inode: &mut Inode, i: usize) -> Result<(), FsError> {
 		let ext = inode.extents[i];
 		if ext.clen != 0 || ext.length < 2 {
@@ -337,6 +349,11 @@ impl<D: BlockDevice> LiberFs<D> {
 			if !self.dev.read_block(ext.physical + off as u64, dst) {
 				return Err(FsError::Io);
 			}
+			match self.read_csum(ext.csum, ext.csum_crc, off) {
+				Ok(crc) if crc32c(dst) == crc => {}
+				Ok(_) | Err(FsError::Corrupt) => return Ok(()),
+				Err(e) => return Err(e),
+			}
 		}
 		let comp = lz_compress(&ubuf);
 		let store_len = comp.len().div_ceil(BLOCK_SIZE);
@@ -344,12 +361,18 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(());
 		}
 		// claim a contiguous run of stored blocks (data is taken low-to-high, so fresh
-		// data allocations run contiguously); leave the run raw if a gap appears.
+		// data allocations run contiguously); on a gap, release the claims and leave the
+		// run raw - nothing references them, so holding them would only waste the pool
+		// until the commit rederivation.
 		let first = self.alloc_data()?;
 		let mut last = first;
 		for _ in 1..store_len {
 			let b = self.alloc_data()?;
 			if b != last + 1 {
+				for claimed in first..=last {
+					self.unclaim(claimed);
+				}
+				self.unclaim(b);
 				return Ok(());
 			}
 			last = b;

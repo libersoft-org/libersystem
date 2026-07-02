@@ -248,6 +248,9 @@ pub enum FsError {
 	// pointer: on-disk corruption, surfaced instead of returning the bad bytes.
 	Corrupt,
 	Io,
+	// The mount is read-only (a snapshot mount, or a volume degraded by a corrupt
+	// snapshot table): every mutation is refused so the on-disk state stays intact.
+	ReadOnly,
 }
 
 // Metadata about one path, returned by [`LiberFs::stat`]: its byte length, whether it is
@@ -279,6 +282,14 @@ pub trait BlockDevice {
 	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool;
 	// Write `buf` (exactly BLOCK_SIZE bytes) to block `index`. False on I/O failure.
 	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool;
+	// Make every write issued so far durable (flush the device's volatile write cache)
+	// before any later write reaches the medium. The commit protocol brackets the
+	// superblock write with this barrier, so crash atomicity holds on devices that
+	// reorder cached writes. False on I/O failure. A backing with no volatile cache
+	// (memory, a write-through disk) may keep this default no-op.
+	fn flush(&mut self) -> bool {
+		true
+	}
 }
 
 // The parsed superblock, cached in memory for the life of a mount. With copy-on-write
@@ -543,6 +554,10 @@ pub struct LiberFs<D: BlockDevice> {
 	// A one-extent cache of the most recently decompressed run, keyed by its first stored
 	// block, so a sequential read of a compressed extent decodes it only once.
 	decomp: Option<(u64, Vec<u8>)>,
+	// Refuse every mutation: set for snapshot mounts (writing through one would
+	// interleave generations) and when the mount is degraded (a corrupt snapshot table
+	// no longer pins its generations, so a commit could reuse pinned blocks).
+	read_only: bool,
 	clock: u64,
 }
 

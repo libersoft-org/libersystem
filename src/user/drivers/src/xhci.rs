@@ -204,12 +204,15 @@ const SCSI_REQUEST_SENSE: u8 = 0x03;
 const SCSI_READ_CAPACITY10: u8 = 0x25;
 const SCSI_READ10: u8 = 0x28;
 const SCSI_WRITE10: u8 = 0x2a;
+const SCSI_SYNCHRONIZE_CACHE10: u8 = 0x35;
 
 // One disk sector, and the block-service wire protocol this driver serves to a
 // StorageService instance - the same contract driver.virtio-blk serves: a request
 // is [op u32][lba u64][count u32], a read replies [status u32] + a MemoryObject of
 // the sectors, a write carries a MemoryObject in and replies [status u32], and a
-// capacity query (op 2) replies [status u32][capacity bytes u64]. The per-request
+// capacity query (op 2) replies [status u32][capacity bytes u64], and a flush (op 3)
+// - the write barrier, served as SCSI SYNCHRONIZE CACHE (10) - replies [status u32].
+// The per-request
 // sector cap is this driver's own: one SCSI READ(10)/WRITE(10) moves through the
 // unit's single 4 KiB data page, so 8 sectors is the transfer unit here (a larger
 // unit needs a multi-page BOT data buffer - a future throughput step).
@@ -218,6 +221,7 @@ const MAX_SECTORS: u32 = 8;
 const OP_READ: u32 = 0;
 const OP_WRITE: u32 = 1;
 const OP_CAPACITY: u32 = 2;
+const OP_FLUSH: u32 = 3;
 const STATUS_OK: u32 = 0;
 const STATUS_ERR: u32 = 1;
 
@@ -1577,6 +1581,7 @@ unsafe fn serve_block_request(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, K
 			OP_READ => serve_read(hc, keyboard, dev, st, blk_server, lba, count),
 			OP_WRITE => serve_write(hc, keyboard, dev, st, blk_server, lba, count, handle),
 			OP_CAPACITY => reply_capacity(blk_server, st.capacity),
+			OP_FLUSH => serve_flush(hc, keyboard, dev, st, blk_server),
 			_ => {
 				if handle != 0 {
 					close(handle);
@@ -1669,6 +1674,29 @@ unsafe fn read_sense(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>
 	unsafe {
 		let sense: [u8; 6] = [SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0];
 		let _ = bot_command(hc, keyboard, dev, st, &sense, 18, true);
+	}
+}
+
+// Flush the unit's write cache with one SCSI SYNCHRONIZE CACHE (10) - LBA and count
+// zero mean the whole medium - then reply with the status. The write barrier LiberFS
+// commits rely on; a unit that rejects the command (no cache to flush, per the SBC
+// spec an optional command) is treated as write-through after the sense read, so the
+// barrier still reports success. No data stage.
+unsafe fn serve_flush(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64) {
+	unsafe {
+		let cb: [u8; 10] = [SCSI_SYNCHRONIZE_CACHE10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+		let mut ok: bool = bot_command(hc, keyboard, dev, st, &cb, 0, false);
+		if !ok {
+			read_sense(hc, keyboard, dev, st);
+			ok = bot_command(hc, keyboard, dev, st, &cb, 0, false);
+			// still failing: the unit does not implement the (optional) command, which
+			// per SBC means it has no volatile cache to flush - the barrier holds.
+			if !ok {
+				read_sense(hc, keyboard, dev, st);
+				ok = true;
+			}
+		}
+		reply_block(blk_server, if ok { STATUS_OK } else { STATUS_ERR }, 0);
 	}
 }
 

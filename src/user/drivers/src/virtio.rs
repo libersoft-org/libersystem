@@ -109,6 +109,9 @@ pub struct Virtio {
 	// driver opts into MSI-X with set_msix_vector). setup_queue programs each queue's
 	// MSI-X vector field from this.
 	msix_vector: u16,
+	// The word-0 (device-specific) feature bits the negotiation accepted: the
+	// intersection of what the device offered and what the driver wanted.
+	features_word0: u32,
 }
 
 // One set-up split virtqueue: its rings (in a DMA page) and the address/value used
@@ -189,6 +192,14 @@ impl Queue {
 // device FAILED) if the device rejects the features. The caller then sets up its
 // queues and calls `driver_ok`.
 pub unsafe fn negotiate(mmio_base: u64, info: &DeviceInfo) -> Option<Virtio> {
+	unsafe { negotiate_features(mmio_base, info, 0) }
+}
+
+// `negotiate`, additionally accepting the device-feature bits of word 0 (the
+// device-specific features) that `want_word0` names and the device offers. The
+// accepted set is kept on the returned device (`features_word0`), so the driver can
+// tell which of its wants the device granted.
+pub unsafe fn negotiate_features(mmio_base: u64, info: &DeviceInfo, want_word0: u32) -> Option<Virtio> {
 	unsafe {
 		let common: u64 = mmio_base + info.common_offset as u64;
 
@@ -205,9 +216,12 @@ pub unsafe fn negotiate(mmio_base: u64, info: &DeviceInfo) -> Option<Virtio> {
 		w8(common + CFG_DEVICE_STATUS, STATUS_ACKNOWLEDGE);
 		w8(common + CFG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
-		// negotiate features: accept only VERSION_1 (the modern transport).
+		// negotiate features: VERSION_1 (the modern transport) plus whichever of the
+		// wanted word-0 (device-specific) bits the device offers.
+		w32(common + CFG_DEVICE_FEATURE_SELECT, 0);
+		let features_word0: u32 = r32(common + CFG_DEVICE_FEATURE) & want_word0;
 		w32(common + CFG_DRIVER_FEATURE_SELECT, 0);
-		w32(common + CFG_DRIVER_FEATURE, 0);
+		w32(common + CFG_DRIVER_FEATURE, features_word0);
 		w32(common + CFG_DRIVER_FEATURE_SELECT, 1);
 		w32(common + CFG_DRIVER_FEATURE, FEATURE_VERSION_1);
 
@@ -217,11 +231,17 @@ pub unsafe fn negotiate(mmio_base: u64, info: &DeviceInfo) -> Option<Virtio> {
 			w8(common + CFG_DEVICE_STATUS, STATUS_FAILED);
 			return None;
 		}
-		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, isr: mmio_base + info.isr_offset as u64, msix_vector: VIRTIO_MSI_NO_VECTOR })
+		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, isr: mmio_base + info.isr_offset as u64, msix_vector: VIRTIO_MSI_NO_VECTOR, features_word0 })
 	}
 }
 
 impl Virtio {
+	// The word-0 (device-specific) feature bits the negotiation accepted, so a driver
+	// can tell which of its wanted features the device granted.
+	pub fn features_word0(&self) -> u32 {
+		self.features_word0
+	}
+
 	// Route this device's config-change and queue interrupts to MSI-X table entry
 	// `vector` (the index the kernel programmed via device_msix_acquire). Must be called
 	// after the kernel has enabled MSI-X on the device and before setup_queue, so each

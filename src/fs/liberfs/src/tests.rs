@@ -979,3 +979,155 @@ fn the_codec_round_trips_varied_inputs() {
 		assert_eq!(lz_decompress(&lz_compress(&input)), input);
 	}
 }
+
+// M73: correctness hardening (flush barriers, read-only mounts, corruption honesty).
+
+// What a device saw, in order: a block write or a flush barrier. The flush-ordering
+// test asserts the commit protocol from this log.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ev {
+	Write(u64),
+	Flush,
+}
+
+// A MemDevice that logs every write and flush, to prove the commit protocol brackets
+// the superblock write with barriers.
+struct FlushLogDevice {
+	inner: MemDevice,
+	log: Vec<Ev>,
+}
+
+impl BlockDevice for FlushLogDevice {
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+		self.inner.read_block(index, buf)
+	}
+
+	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+		self.log.push(Ev::Write(index));
+		self.inner.write_block(index, buf)
+	}
+
+	fn flush(&mut self) -> bool {
+		self.log.push(Ev::Flush);
+		true
+	}
+}
+
+#[test]
+fn a_commit_brackets_the_superblock_write_with_flushes() {
+	let dev = FlushLogDevice { inner: MemDevice::new(NBLOCKS), log: Vec::new() };
+	let fs = LiberFs::format(dev, NBLOCKS).unwrap();
+	// drop the format's own events, then observe one whole transaction (a mount only
+	// reads, so the log stays empty until the write).
+	let mut dev = fs.into_device();
+	dev.log.clear();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	fs.write_file(b"f", b"durable").unwrap();
+	let dev = fs.into_device();
+	let log = &dev.log;
+
+	// exactly one superblock write (the commit point), and it is the tail of the log,
+	// bracketed by the two barriers: every transaction block is on the medium before
+	// the superblock names it, and the commit itself is durable before we report Ok.
+	let sb_writes = log.iter().filter(|e| matches!(e, Ev::Write(0) | Ev::Write(1))).count();
+	assert_eq!(sb_writes, 1, "one commit writes one superblock: {log:?}");
+	let n = log.len();
+	assert!(n >= 3, "expected writes plus the commit tail: {log:?}");
+	assert_eq!(log[n - 1], Ev::Flush, "the commit must end with a barrier: {log:?}");
+	assert!(matches!(log[n - 2], Ev::Write(0) | Ev::Write(1)), "the superblock write sits between the barriers: {log:?}");
+	assert_eq!(log[n - 3], Ev::Flush, "a barrier must precede the superblock write: {log:?}");
+	// no data write hides between the barriers or after the commit.
+	for e in &log[..n - 3] {
+		assert!(matches!(e, Ev::Write(b) if *b > 1), "only transaction blocks precede the commit tail: {log:?}");
+	}
+}
+
+#[test]
+fn a_corrupt_snapshot_table_degrades_the_mount_to_read_only() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"f", b"pinned").unwrap();
+	fs.create_snapshot(b"keep").unwrap();
+	let mut dev = fs.into_device();
+
+	// flip one byte of the snapshot-table block the newest superblock points at.
+	let slot = newest_super_slot(&dev) as usize;
+	let snap_root = u64::from_le_bytes(dev.blocks[slot * BLOCK_SIZE + 60..slot * BLOCK_SIZE + 68].try_into().unwrap());
+	assert!(snap_root != 0, "the volume should carry a snapshot table");
+	dev.blocks[snap_root as usize * BLOCK_SIZE + 3] ^= 0xFF;
+
+	// the volume still mounts (the live tree is intact) but read-only: the pinned
+	// generations can no longer be reserved, so no commit may reuse their blocks.
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert!(fs.is_read_only(), "a corrupt snapshot table must force read-only");
+	assert_eq!(fs.read_file(b"f").unwrap(), b"pinned");
+	assert_eq!(fs.write_file(b"g", b"nope"), Err(FsError::ReadOnly));
+	assert_eq!(fs.remove(b"f"), Err(FsError::ReadOnly));
+}
+
+#[test]
+fn snapshot_mounts_refuse_writes() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"f", b"one").unwrap();
+	fs.create_snapshot(b"pin").unwrap();
+	fs.write_file(b"f", b"two").unwrap();
+	let dev = fs.into_device();
+
+	// both snapshot mounts read fine and refuse every mutation.
+	let mut prev = LiberFs::mount_snapshot(dev.clone()).unwrap();
+	assert!(prev.is_read_only());
+	assert_eq!(prev.write_file(b"f", b"x"), Err(FsError::ReadOnly));
+	let mut named = LiberFs::mount_named_snapshot(dev.clone(), b"pin").unwrap();
+	assert!(named.is_read_only());
+	assert_eq!(named.read_file(b"f").unwrap(), b"one");
+	assert_eq!(named.write_at(b"f", 0, b"x"), Err(FsError::ReadOnly));
+	assert_eq!(named.rename(b"f", b"g"), Err(FsError::ReadOnly));
+	assert_eq!(named.create_snapshot(b"more"), Err(FsError::ReadOnly));
+
+	// the live mount stays writable.
+	let mut live = LiberFs::mount(dev).unwrap();
+	assert!(!live.is_read_only());
+	live.write_file(b"f", b"three").unwrap();
+	assert_eq!(live.read_file(b"f").unwrap(), b"three");
+}
+
+// A MemDevice that corrupts one chosen block as it is written, modeling a device
+// that damages the bytes between the write and the compressor's read-back.
+struct BadWriteDevice {
+	inner: MemDevice,
+	corrupt_block: u64,
+}
+
+impl BlockDevice for BadWriteDevice {
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+		self.inner.read_block(index, buf)
+	}
+
+	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+		let mut bytes = buf.to_vec();
+		if index == self.corrupt_block {
+			bytes[0] ^= 0xFF;
+		}
+		self.inner.write_block(index, &bytes)
+	}
+}
+
+#[test]
+fn compression_never_launders_a_corrupt_source_block() {
+	// the first data block a fresh volume allocates: right past the two superblock
+	// slots and the format's inode-tree leaf.
+	let first_data: u64 = POOL_START + 1;
+	let dev = BadWriteDevice { inner: MemDevice::new(NBLOCKS), corrupt_block: first_data };
+	let mut fs = LiberFs::format(dev, NBLOCKS).unwrap();
+	// four compressible blocks; the device damages the first as it lands. The
+	// compressor must notice the read-back fails its just-stored CRC and leave the
+	// run raw - re-encoding it would discard the only checksum that knows.
+	let big: Vec<u8> = b"a very compressible refrain. ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
+	fs.write_file(b"big", &big).unwrap();
+	let num = fs.lookup(b"big").unwrap();
+	let ext = fs.read_inode(num).unwrap().extents[0];
+	assert_eq!(ext.physical, first_data, "the run should start at the first data block");
+	assert_eq!(ext.clen, 0, "a run with a bad source block must stay raw");
+	// the damage stays detectable: the read fails its checksum and fsck counts it.
+	assert_eq!(fs.read_file(b"big"), Err(FsError::Corrupt));
+	assert_eq!(fs.fsck().unwrap().checksum_failures, 1);
+}

@@ -19,6 +19,13 @@ use crate::virtio::{self, Virtio};
 // caller sets up its queues and calls `driver_ok`. Exits the process on any failure
 // (a driver with no working device has nothing to do).
 pub unsafe fn bringup(bootstrap: u64) -> Virtio {
+	unsafe { bringup_features(bootstrap, 0) }
+}
+
+// `bringup`, additionally asking the negotiation for the word-0 (device-specific)
+// feature bits `want_word0` names; the accepted set is readable off the returned
+// device (`features_word0`).
+pub unsafe fn bringup_features(bootstrap: u64, want_word0: u32) -> Virtio {
 	unsafe {
 		let mut buf: [u8; 96] = [0u8; 96];
 		let info_size: usize = core::mem::size_of::<DeviceInfo>();
@@ -33,7 +40,7 @@ pub unsafe fn bringup(bootstrap: u64) -> Virtio {
 			exit();
 		}
 		// reset -> negotiate -> features-ok.
-		match virtio::negotiate(base, &info) {
+		match virtio::negotiate_features(base, &info, want_word0) {
 			Some(device) => device,
 			None => exit(),
 		}

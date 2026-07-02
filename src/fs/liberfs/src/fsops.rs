@@ -40,8 +40,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		if !dev.write_block(1, &zero) {
 			return Err(FsError::Io);
 		}
+		// make the fresh layout durable before reporting the volume formatted.
+		if !dev.flush() {
+			return Err(FsError::Io);
+		}
 
-		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, decomp: None, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, decomp: None, read_only: false, clock: 0 };
 		fs.derive_free()?;
 		Ok(fs)
 	}
@@ -55,21 +59,22 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Mount the previous generation read-only: the consistent snapshot of the
 	// filesystem one commit ago. Returns None unless both superblock slots are valid (a
 	// freshly formatted or single-generation volume has no older snapshot). The handle
-	// is meant for reading; writing to it would interleave generations.
+	// is read-only: every mutation is refused, so the generations can never interleave.
 	pub fn mount_snapshot(dev: D) -> Option<LiberFs<D>> {
 		Self::mount_at(dev, false)
 	}
 
 	// Mount a named snapshot read-only: the consistent, pinned state captured when the
 	// snapshot was created. Returns None if the volume has no such snapshot. Like
-	// `mount_snapshot`, the handle is meant for reading; the live free map (which already
-	// reserves the snapshot's blocks) is reused unchanged.
+	// `mount_snapshot`, the handle refuses every mutation; the live free map (which
+	// already reserves the snapshot's blocks) is reused unchanged.
 	pub fn mount_named_snapshot(dev: D, name: &[u8]) -> Option<LiberFs<D>> {
 		let mut fs = Self::mount(dev)?;
 		let snap = fs.snapshots.iter().find(|s| s.name == name)?.clone();
 		fs.inode_root = snap.inode_root;
 		fs.inode_root_crc = snap.inode_root_crc;
 		fs.generation = snap.generation;
+		fs.read_only = true;
 		Some(fs)
 	}
 
@@ -107,10 +112,24 @@ impl<D: BlockDevice> LiberFs<D> {
 			None => (0, 0, false),
 		};
 
-		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, decomp: None, clock: 0 };
-		fs.load_snapshot_table().ok()?;
+		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, decomp: None, read_only: !newest, clock: 0 };
+		// a corrupt snapshot table degrades the mount to read-only instead of failing it:
+		// the pinned generations it named can no longer be reserved, so a commit could
+		// reuse their blocks - refusing every mutation keeps them (and the table block
+		// itself, for repair) intact. An I/O failure fails the mount as before.
+		match fs.load_snapshot_table() {
+			Ok(()) => {}
+			Err(FsError::Corrupt) => fs.read_only = true,
+			Err(_) => return None,
+		}
 		fs.derive_free().ok()?;
 		Some(fs)
+	}
+
+	// Is this mount read-only (a snapshot mount, or degraded by a corrupt snapshot
+	// table)? Every mutation on a read-only mount fails with FsError::ReadOnly.
+	pub fn is_read_only(&self) -> bool {
+		self.read_only
 	}
 
 	// Resolve a path to its inode number, or None if any segment is missing.
@@ -160,9 +179,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Create the directory at `path`, plus any missing parents (mkdir -p). Succeeds if
 	// it already exists as a directory.
 	pub fn mkdir(&mut self, path: &[u8]) -> Result<(), FsError> {
-		self.begin();
-		let r = self.mkdir_inner(path);
-		self.finish(r)
+		self.mutate(|fs| fs.mkdir_inner(path))
 	}
 
 	pub(crate) fn mkdir_inner(&mut self, path: &[u8]) -> Result<(), FsError> {
@@ -180,9 +197,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// commits with a single superblock swap, so a crash leaves either the previous file
 	// or the new one intact - never a torn mix.
 	pub fn write_file(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
-		self.begin();
-		let r = self.write_file_inner(path, data);
-		self.finish(r)
+		self.mutate(|fs| fs.write_file_inner(path, data))
 	}
 
 	pub(crate) fn write_file_inner(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
@@ -241,17 +256,13 @@ impl<D: BlockDevice> LiberFs<D> {
 	// drops the directory entry and frees the inode; a crash before the commit leaves
 	// the file fully intact.
 	pub fn remove(&mut self, path: &[u8]) -> Result<(), FsError> {
-		self.begin();
-		let r = self.remove_inner(path);
-		self.finish(r)
+		self.mutate(|fs| fs.remove_inner(path))
 	}
 
 	// Remove the empty directory at `path`. Rejects a regular file (use `remove`) and a
 	// non-empty directory, so a directory is never deleted with its contents.
 	pub fn rmdir(&mut self, path: &[u8]) -> Result<(), FsError> {
-		self.begin();
-		let r = self.rmdir_inner(path);
-		self.finish(r)
+		self.mutate(|fs| fs.rmdir_inner(path))
 	}
 
 	pub(crate) fn rmdir_inner(&mut self, path: &[u8]) -> Result<(), FsError> {

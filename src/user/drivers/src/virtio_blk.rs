@@ -21,7 +21,12 @@ const SECTOR: u32 = 512;
 // virtio-blk request types and the success status.
 const BLK_T_IN: u32 = 0; // read (device writes the data buffer)
 const BLK_T_OUT: u32 = 1; // write (device reads the data buffer)
+const BLK_T_FLUSH: u32 = 4; // flush the device's volatile write cache
 const BLK_S_OK: u8 = 0;
+
+// VIRTIO_BLK_F_FLUSH (feature bit 9): the device has a volatile write cache and
+// honours BLK_T_FLUSH. Without it the cache is write-through and a flush is a no-op.
+const FEATURE_FLUSH: u32 = 1 << 9;
 
 // The most sectors served per block request: the reply buffer is a MemoryObject
 // sized by the request and each sector streams through the one DMA page, so this
@@ -32,6 +37,7 @@ const MAX_SECTORS: u32 = 256;
 const OP_READ: u32 = 0;
 const OP_WRITE: u32 = 1;
 const OP_CAPACITY: u32 = 2;
+const OP_FLUSH: u32 = 3;
 
 // Block-service reply status codes.
 const STATUS_OK: u32 = 0;
@@ -46,7 +52,10 @@ const STATUS_OFF: u64 = 1024;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
-		let device = common::bringup(bootstrap);
+		// negotiate the flush feature: with it, OP_FLUSH turns into a real BLK_T_FLUSH
+		// barrier; without it the device's cache is write-through and a flush is a no-op.
+		let device = common::bringup_features(bootstrap, FEATURE_FLUSH);
+		let has_flush: bool = device.features_word0() & FEATURE_FLUSH != 0;
 		// virtio-blk has a single request queue (queue 0).
 		let queue = device.setup_queue(0);
 		device.driver_ok();
@@ -70,7 +79,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		for i in 0..8u64 {
 			capacity_sectors |= (device.config_read(i) as u64) << (i * 8);
 		}
-		serve_blocks(&queue, blk_server, capacity_sectors)
+		serve_blocks(&queue, blk_server, capacity_sectors, has_flush)
 	}
 }
 
@@ -120,6 +129,20 @@ unsafe fn request(queue: &Queue, virt: u64, phys: u64, lba: u64, kind: u32, data
 	}
 }
 
+// Issue one flush request: the device must write out its volatile cache before
+// completing it, so every earlier write is durable when this returns. The chain is
+// just the header and the status byte (a flush carries no data).
+unsafe fn flush_request(queue: &Queue, virt: u64, phys: u64) -> bool {
+	unsafe {
+		(virt as *mut u32).write_volatile(BLK_T_FLUSH); // type
+		((virt + 4) as *mut u32).write_volatile(0); // reserved
+		((virt + 8) as *mut u64).write_volatile(0); // sector (unused)
+		((virt + STATUS_OFF) as *mut u8).write_volatile(0xff); // status sentinel
+		let bufs: [(u64, u32, bool); 2] = [(phys + HDR_OFF, 16, false), (phys + STATUS_OFF, 1, true)];
+		queue.submit(&bufs).is_some() && ((virt + STATUS_OFF) as *const u8).read_volatile() == BLK_S_OK
+	}
+}
+
 // Serve block requests on `blk_server` until the client closes its end. Each request
 // is [op u32][lba u64][count u32] (count clamped to one DMA page = 8 sectors). A read
 // (op 0) replies [status u32] carrying, on success, a MemoryObject capability to a
@@ -127,9 +150,12 @@ unsafe fn request(queue: &Queue, virt: u64, phys: u64, lba: u64, kind: u32, data
 // (op 1) carries a transferred MemoryObject of count*512 bytes the device reads onto
 // the disk, and replies [status u32] with no buffer. A capacity query (op 2) replies
 // [status u32][capacity bytes u64] - the disk's size, asked once of the device config
-// at startup. The data crosses as a shared buffer handle, never copied through the
+// at startup. A flush (op 3) is the write barrier: it completes only once every
+// earlier write is durable, as BLK_T_FLUSH when the device negotiated the flush
+// feature and trivially (write-through cache) when it did not; the reply is
+// [status u32]. The data crosses as a shared buffer handle, never copied through the
 // channel.
-unsafe fn serve_blocks(queue: &Queue, blk_server: u64, capacity_sectors: u64) -> ! {
+unsafe fn serve_blocks(queue: &Queue, blk_server: u64, capacity_sectors: u64, has_flush: bool) -> ! {
 	unsafe {
 		// one reusable DMA buffer the device reads/writes each sector through.
 		let dma: i64 = dma_buffer_create(4096);
@@ -153,6 +179,10 @@ unsafe fn serve_blocks(queue: &Queue, blk_server: u64, capacity_sectors: u64) ->
 						OP_READ => serve_read(queue, blk_server, virt, phys, lba, count),
 						OP_WRITE => serve_write(queue, blk_server, virt, phys, lba, count, handle),
 						OP_CAPACITY => reply_capacity(blk_server, capacity_sectors * SECTOR as u64),
+						OP_FLUSH => {
+							let ok: bool = !has_flush || flush_request(queue, virt, phys);
+							reply_block(blk_server, if ok { STATUS_OK } else { STATUS_ERR }, 0);
+						}
 						_ => {
 							if handle != 0 {
 								close(handle);

@@ -18,9 +18,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if self.snapshots.len() >= SNAP_MAX {
 			return Err(FsError::NoSpace);
 		}
-		self.begin();
-		let r = self.create_snapshot_inner(name);
-		self.finish(r)
+		self.mutate(|fs| fs.create_snapshot_inner(name))
 	}
 
 	pub(crate) fn create_snapshot_inner(&mut self, name: &[u8]) -> Result<(), FsError> {
@@ -41,9 +39,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if !self.snapshots.iter().any(|s| s.name == name) {
 			return Err(FsError::NotFound);
 		}
-		self.begin();
-		let r = self.delete_snapshot_inner(name);
-		self.finish(r)
+		self.mutate(|fs| fs.delete_snapshot_inner(name))
 	}
 
 	pub(crate) fn delete_snapshot_inner(&mut self, name: &[u8]) -> Result<(), FsError> {
@@ -78,8 +74,10 @@ impl<D: BlockDevice> LiberFs<D> {
 	}
 
 	// Load the snapshot table the superblock points at into memory. The block is checked
-	// against snap_root_crc; a corrupt or empty table yields no snapshots, so a damaged
-	// table never pins (or walks) garbage.
+	// against snap_root_crc; a mismatch is FsError::Corrupt - the caller (mount) degrades
+	// the volume to read-only, because the pinned generations the table named can no
+	// longer be reserved and a commit could reuse their blocks. Silently dropping the
+	// table here would quietly destroy every named snapshot.
 	pub(crate) fn load_snapshot_table(&mut self) -> Result<(), FsError> {
 		self.snapshots = Vec::new();
 		if self.snap_root == 0 {
@@ -90,7 +88,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Io);
 		}
 		if crc32c(&block) != self.snap_root_crc {
-			return Ok(());
+			return Err(FsError::Corrupt);
 		}
 		let count = (u32::from_le_bytes(block[0..4].try_into().unwrap()) as usize).min(SNAP_MAX);
 		for i in 0..count {
@@ -169,9 +167,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Only the touched blocks are rewritten (each copied up to a fresh block), the rest
 	// of the file is left in place, and the change commits atomically.
 	pub fn write_at(&mut self, path: &[u8], offset: u64, data: &[u8]) -> Result<(), FsError> {
-		self.begin();
-		let r = self.write_at_inner(path, offset, data);
-		self.finish(r)
+		self.mutate(|fs| fs.write_at_inner(path, offset, data))
 	}
 
 	pub(crate) fn write_at_inner(&mut self, path: &[u8], offset: u64, data: &[u8]) -> Result<(), FsError> {
@@ -229,9 +225,7 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Append `data` to the end of the file at `path` (creating it if needed).
 	pub fn append(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
-		self.begin();
-		let r = self.append_inner(path, data);
-		self.finish(r)
+		self.mutate(|fs| fs.append_inner(path, data))
 	}
 
 	pub(crate) fn append_inner(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
@@ -247,9 +241,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// end, growing leaves a hole (which reads as zeros). Copy-on-write: the change goes
 	// to fresh blocks and commits atomically.
 	pub fn truncate(&mut self, path: &[u8], new_len: u64) -> Result<(), FsError> {
-		self.begin();
-		let r = self.truncate_inner(path, new_len);
-		self.finish(r)
+		self.mutate(|fs| fs.truncate_inner(path, new_len))
 	}
 
 	pub(crate) fn truncate_inner(&mut self, path: &[u8], new_len: u64) -> Result<(), FsError> {
@@ -290,9 +282,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// leaves the object reachable under exactly one name - never lost or doubled.
 	// Moving a directory into its own subtree is rejected.
 	pub fn rename(&mut self, from: &[u8], to: &[u8]) -> Result<(), FsError> {
-		self.begin();
-		let r = self.rename_inner(from, to);
-		self.finish(r)
+		self.mutate(|fs| fs.rename_inner(from, to))
 	}
 
 	pub(crate) fn rename_inner(&mut self, from: &[u8], to: &[u8]) -> Result<(), FsError> {

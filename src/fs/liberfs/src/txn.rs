@@ -1,6 +1,19 @@
 use crate::*;
 
 impl<D: BlockDevice> LiberFs<D> {
+	// Run `body` as one transaction: begin, run, commit on success, roll back on
+	// failure. The single gate every public mutation goes through - a read-only mount
+	// (a snapshot, or a volume degraded by a corrupt snapshot table) is refused here,
+	// so no mutation path can touch the disk.
+	pub(crate) fn mutate(&mut self, body: impl FnOnce(&mut Self) -> Result<(), FsError>) -> Result<(), FsError> {
+		if self.read_only {
+			return Err(FsError::ReadOnly);
+		}
+		self.begin();
+		let r = body(self);
+		self.finish(r)
+	}
+
 	// Begin a mutation: snapshot the inode-tree root, next-inode counter and snapshot
 	// table so they can be restored on failure and the inode root reserved as the
 	// previous generation on commit, and clear the fresh-block set.
@@ -13,13 +26,25 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Commit the in-flight mutation: write a new superblock (incremented generation,
 	// carrying the new inode-tree root, next-inode counter and snapshot table) to the
 	// inactive slot - the single atomic write that publishes the whole transaction. The
-	// superseded generation becomes the read-only snapshot; the one before it is
-	// reclaimed by rederiving the free map.
+	// superblock write is bracketed by device flushes: the first makes every block the
+	// transaction wrote durable before the superblock can name them, the second makes
+	// the commit itself durable - so a device with a volatile write cache cannot
+	// reorder the commit point ahead of its data. The superseded generation becomes the
+	// read-only snapshot; the one before it is reclaimed by rederiving the free map.
 	pub(crate) fn commit(&mut self) -> Result<(), FsError> {
 		let sb = Superblock { num_blocks: self.num_blocks, generation: self.generation + 1, inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, root_inode: self.root_inode, snap_root: self.snap_root, snap_root_crc: self.snap_root_crc };
 		let new_slot = (self.slot + 1) % SUPER_SLOTS;
+		// barrier: the transaction's blocks must be on the medium before the superblock
+		// that references them.
+		if !self.dev.flush() {
+			return Err(FsError::Io);
+		}
 		// the commit point: a single superblock write swaps the live root atomically.
 		if !self.dev.write_block(new_slot as u64, &serialize_superblock(&sb)) {
+			return Err(FsError::Io);
+		}
+		// barrier: the commit is not durable until the superblock itself is.
+		if !self.dev.flush() {
 			return Err(FsError::Io);
 		}
 
@@ -32,6 +57,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		self.generation += 1;
 		self.slot = new_slot;
+		// the commit reclaims old-generation blocks (they may be reused and rewritten),
+		// so a decompressed image cached against one of them must not outlive it.
+		self.decomp = None;
 		self.derive_free()
 	}
 
@@ -48,13 +76,22 @@ impl<D: BlockDevice> LiberFs<D> {
 			self.snapshots = t.snapshots;
 		}
 		self.fresh.clear();
+		self.decomp = None;
 		let _ = self.derive_free();
 	}
 
-	// Finish a mutation: commit on success, roll back on failure.
+	// Finish a mutation: commit on success, roll back on failure - including a failed
+	// commit (a flush or superblock write that did not land), so the in-memory roots
+	// never drift from the on-disk generation the mount still stands on.
 	pub(crate) fn finish(&mut self, r: Result<(), FsError>) -> Result<(), FsError> {
 		match r {
-			Ok(()) => self.commit(),
+			Ok(()) => {
+				let committed = self.commit();
+				if committed.is_err() {
+					self.abort();
+				}
+				committed
+			}
 			Err(e) => {
 				self.abort();
 				Err(e)

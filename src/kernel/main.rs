@@ -3027,6 +3027,10 @@ fn system_volume_formats_to_the_disks_capacity() {
 					reply.extend_from_slice(&CAPACITY.to_le_bytes());
 					blk_host.send(Message::new(reply, alloc::vec::Vec::new(), 0)).expect("the capacity reply should send");
 				}
+				3 => {
+					// flush: the in-memory disk is trivially durable; acknowledge the barrier.
+					blk_host.send(Message::new(0u32.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("the flush reply should send");
+				}
 				other => panic!("unexpected block op {}", other),
 			}
 		}
