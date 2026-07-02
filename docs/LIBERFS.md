@@ -9,8 +9,10 @@ written for a single-device VM appliance, so it intentionally drops RAID, dedup,
 encryption, quotas, and on-disk permissions; authorization lives in
 LiberSystem's capability layer, not in the filesystem.
 
-This document describes how LiberFS is built and what it does, then compares it
-with the common removable, Windows, and Linux/Unix filesystems.
+This document goes from the general to the specific: what LiberFS is and how it
+compares with the common removable, Windows, and Linux/Unix filesystems, then
+the design (layout, crash atomicity, snapshots, integrity), and finally the
+formal on-disk specification and the rules a foreign driver must honor.
 
 ## At a glance
 
@@ -20,7 +22,8 @@ with the common removable, Windows, and Linux/Unix filesystems.
 - Inodes in a B+tree keyed by number, allocated on demand (no fixed inode table).
 - Directories are name-keyed B+trees with variable-length records: O(log n)
   lookup/insert/remove, a couple hundred typical entries per leaf.
-- Files mapped by extents with sparse holes; up to hundreds of GiB.
+- Files mapped by extents with sparse holes; file sizes to 16 EiB, volumes to
+  64 ZiB (the limits table below).
 - CRC32C (slice-by-8) on every data block and metadata node; corruption surfaces,
   not silent - and `fsck` names the damaged files, `restore` heals them from a
   snapshot.
@@ -35,6 +38,70 @@ with the common removable, Windows, and Linux/Unix filesystems.
 - `no_std` userspace build; `std` only under `cargo test`. All I/O through one
   `BlockDevice` trait (read, write, flush), so the same code drives virtio-blk
   and a `Vec` in tests.
+
+## Comparison with other filesystems
+
+Legend: ✓ = supported, ✗ = not supported, layer = handled by another
+LiberSystem layer.
+
+| Capability            | LiberFS | ZFS | Btrfs | XFS | ext4 | NTFS | exFAT | FAT12/16/32 |
+|-----------------------|:-------:|:---:|:-----:|:---:|:----:|:----:|:-----:|:-----------:|
+| Crash atomicity       | CoW     | CoW | CoW   | journal | journal | journal | ✗ | ✗ |
+| Copy-on-write         | ✓       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗     | ✗ |
+| Data checksums        | ✓ (CRC32C) | ✓ | ✓   | metadata | metadata | ✗ | ✗ | ✗ |
+| Snapshots             | ✓       | ✓   | ✓     | ✗   | ✗    | VSS  | ✗     | ✗ |
+| Compression           | ✓ (LZ4, per-volume switch) | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ |
+| Sparse files          | ✓       | ✓   | ✓     | ✓   | ✓    | ✓    | ✗     | ✗ |
+| Dynamic inodes        | ✓ (B+tree) | ✓ | ✓   | ✓   | ✗    | ✓    | n/a   | n/a |
+| Dir index             | B+tree  | hash | B+tree | B+tree | hashed | B+tree | linear | linear |
+| POSIX perms/ACL       | layer   | ✓   | ✓     | ✓   | ✓    | ✓    | ✗     | ✗ |
+| Dedup                 | ✗       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗     | ✗ |
+| Encryption            | ✗       | ✓   | ✓     | ✗   | ✓    | ✓    | ✗     | ✗ |
+| Multi-device / RAID   | ✗       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗     | ✗ |
+
+### Limits
+
+Format limits (the on-disk structures' ceilings); common practical figures for
+the others.
+
+| Limit | LiberFS | ZFS | Btrfs | XFS | ext4 | NTFS | exFAT | FAT12/16/32 |
+|-------|:-------:|:---:|:-----:|:---:|:----:|:----:|:-----:|:-----------:|
+| Max volume size | 64 ZiB (2^64 × 4 KiB blocks) | 256 ZiB | 16 EiB | 8 EiB | 1 EiB | 8 PiB | 128 PiB | 2 TiB (FAT32; 16 TiB with 4 KiB sectors) |
+| Max file size | 16 EiB logical (u64 size; sparse); 16 PiB dense (2^32 extents × 4 MiB) | 16 EiB | 16 EiB | 8 EiB | 16 TiB | 8 PiB | 128 PiB | 4 GiB − 1 |
+| Max files | 2^32 inode numbers over the volume's lifetime (never reused) | 2^48 per directory | 2^64 | 2^64 (dynamic) | fixed at mkfs (≤ 2^32) | 2^32 − 1 | ~2.8 M per directory | ~268 M (FAT32) |
+| Max entries per directory | unbounded (B+tree) | 2^48 | 2^64 | 2^64 | ~10-12 M practical (htree) | 2^32 − 1 | ~2.8 M | 65 534 (FAT16/32 subdir) |
+| Max name length | 255 bytes (UTF-8) | 255 bytes | 255 bytes | 255 bytes | 255 bytes | 255 UTF-16 units | 255 UTF-16 units | 8.3 (255 UTF-16 with VFAT LFN) |
+| Max path length | unbounded | unbounded | unbounded | unbounded | unbounded | 32 767 UTF-16 units | 32 767 | 260 (classic Windows APIs) |
+| Snapshots per volume | unbounded (chained table) | 2^64 | unbounded | n/a | n/a | VSS-bound | n/a | n/a |
+| Volume label | 32 bytes UTF-8 | 256 | 256 | 12 | 16 | 32 UTF-16 | 11 | 11 |
+
+LiberFS's figures are format ceilings; today's implementation also keeps a
+1-bit-per-block free map in memory (32 MiB of RAM per TiB of volume), which is
+the practical ceiling until a persistent space map replaces it. The inode-number
+ceiling counts every file ever created, not just live ones - a design trade for
+O(1) revocation-free numbering; 2^32 creates outlast an appliance's life by a
+wide margin.
+
+In design, LiberFS sits closest to Btrfs/ZFS: copy-on-write, end-to-end
+checksums, snapshots, and compression. It deliberately omits the enterprise
+surface - RAID/pools, dedup, encryption, quotas, on-disk permissions - to stay
+small and to keep authorization in the capability layer. The classic FAT family
+and exFAT are interchange formats with no integrity or snapshots; NTFS, ext4, and
+XFS journal metadata but checksum no data and (mostly) lack snapshots. LiberFS
+trades the enterprise feature surface, not the limits, for a format small
+enough to read end to end.
+
+## Out of scope (by decision)
+
+- On-disk permissions/ACLs: only an opaque owner tag; enforcement is the
+  capability layer's.
+- Hard links and symlinks (no nlink field): names bind capabilities, and
+  aliasing complicates the one-name-one-file model; revisit with a concrete need.
+- Deduplication and encryption.
+- Multi-device, RAID, pooled storage; single device, single volume.
+- Quotas; online defrag/resize beyond the modernization milestones.
+- Metadata duplication (a DUP profile for true metadata self-heal) - a candidate
+  feature flag if single-device self-heal ever becomes a requirement.
 
 ## On-disk layout
 
@@ -326,43 +393,3 @@ reader deriving the free map walks exactly this closure.
 - A **corrupt snapshot chain** (a link failing its CRC) must degrade the mount
   to read-only, never silently drop the table - the pinned generations' blocks
   would be reused.
-
-## Comparison with other filesystems
-
-Legend: ✓ = supported, ✗ = not supported, layer = handled by another
-LiberSystem layer.
-
-| Capability            | LiberFS | ZFS | Btrfs | XFS | ext4 | NTFS | exFAT | FAT12/16/32 |
-|-----------------------|:-------:|:---:|:-----:|:---:|:----:|:----:|:-----:|:-----------:|
-| Crash atomicity       | CoW     | CoW | CoW   | journal | journal | journal | ✗ | ✗ |
-| Copy-on-write         | ✓       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗     | ✗ |
-| Data checksums        | ✓ (CRC32C) | ✓ | ✓   | metadata | metadata | ✗ | ✗ | ✗ |
-| Snapshots             | ✓       | ✓   | ✓     | ✗   | ✗    | VSS  | ✗     | ✗ |
-| Compression           | ✓ (LZ4, per-volume switch) | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ |
-| Sparse files          | ✓       | ✓   | ✓     | ✓   | ✓    | ✓    | ✗     | ✗ |
-| Dynamic inodes        | ✓ (B+tree) | ✓ | ✓   | ✓   | ✗    | ✓    | n/a   | n/a |
-| Dir index             | B+tree  | hash | B+tree | B+tree | hashed | B+tree | linear | linear |
-| POSIX perms/ACL       | layer   | ✓   | ✓     | ✓   | ✓    | ✓    | ✗     | ✗ |
-| Dedup                 | ✗       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗     | ✗ |
-| Encryption            | ✗       | ✓   | ✓     | ✗   | ✓    | ✓    | ✗     | ✗ |
-| Multi-device / RAID   | ✗       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗     | ✗ |
-
-In design, LiberFS sits closest to Btrfs/ZFS: copy-on-write, end-to-end
-checksums, snapshots, and compression. It deliberately omits the enterprise
-surface - RAID/pools, dedup, encryption, quotas, on-disk permissions - to stay
-small and to keep authorization in the capability layer. The classic FAT family
-and exFAT are interchange formats with no integrity or snapshots; NTFS, ext4, and
-XFS journal metadata but checksum no data and (mostly) lack snapshots. LiberFS
-trades modest file/volume limits for a format small enough to read end to end.
-
-## Out of scope (by decision)
-
-- On-disk permissions/ACLs: only an opaque owner tag; enforcement is the
-  capability layer's.
-- Hard links and symlinks (no nlink field): names bind capabilities, and
-  aliasing complicates the one-name-one-file model; revisit with a concrete need.
-- Deduplication and encryption.
-- Multi-device, RAID, pooled storage; single device, single volume.
-- Quotas; online defrag/resize beyond the modernization milestones.
-- Metadata duplication (a DUP profile for true metadata self-heal) - a candidate
-  feature flag if single-device self-heal ever becomes a requirement.
