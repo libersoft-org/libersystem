@@ -2961,7 +2961,6 @@ fn inventory_tools_report_the_hardware() {
 fn system_volume_formats_to_the_disks_capacity() {
 	use alloc::collections::BTreeMap;
 	use object::channel::{Channel, Message};
-	use object::memory_object::MemoryObject;
 	use object::rights::Rights;
 
 	// M65: a fresh system volume spans the whole disk - StorageService asks the block
@@ -2987,10 +2986,11 @@ fn system_volume_formats_to_the_disks_capacity() {
 	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
 
 	// serve the raw block protocol over the sparse disk until the service reports in.
-	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
-	let mut online = false;
-	'serve: for _ in 0..100_000 {
-		sched::run_until_idle();
+	fn pump(blk_host: &object::channel::Channel, disk: &mut alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>, capacity: u64) {
+		use object::channel::Message;
+		use object::memory_object::MemoryObject;
+		use object::rights::Rights;
+		const SECTOR: usize = 512;
 		while let Ok(req) = blk_host.recv() {
 			assert!(req.bytes.len() >= 16, "a block request is [op][lba][count]");
 			let op = u32::from_le_bytes([req.bytes[0], req.bytes[1], req.bytes[2], req.bytes[3]]);
@@ -3007,7 +3007,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 					}
 					let obj = MemoryObject::create(data.len()).expect("the sector buffer should allocate");
 					copy_into_object(&obj, &data);
-					send_cap(&blk_host, &0u32.to_le_bytes(), obj, Rights::ALL).expect("the read reply should send");
+					send_cap(blk_host, &0u32.to_le_bytes(), obj, Rights::ALL).expect("the read reply should send");
 				}
 				1 => {
 					// write: store the transferred sectors into the sparse disk.
@@ -3024,7 +3024,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 					// capacity: the sparse disk's size in bytes.
 					let mut reply = alloc::vec::Vec::with_capacity(12);
 					reply.extend_from_slice(&0u32.to_le_bytes());
-					reply.extend_from_slice(&CAPACITY.to_le_bytes());
+					reply.extend_from_slice(&capacity.to_le_bytes());
 					blk_host.send(Message::new(reply, alloc::vec::Vec::new(), 0)).expect("the capacity reply should send");
 				}
 				3 => {
@@ -3034,6 +3034,12 @@ fn system_volume_formats_to_the_disks_capacity() {
 				other => panic!("unexpected block op {}", other),
 			}
 		}
+	}
+	let mut disk: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
+	let mut online = false;
+	'serve: for _ in 0..100_000 {
+		sched::run_until_idle();
+		pump(&blk_host, &mut disk, CAPACITY);
 		if let Ok(report) = boot_kernel.recv() {
 			assert_eq!(&report.bytes[..], b"StorageService: online", "the service should come up on the fresh disk");
 			online = true;
@@ -3047,6 +3053,56 @@ fn system_volume_formats_to_the_disks_capacity() {
 	let sb = disk.get(&32768).expect("the format should write superblock slot 0");
 	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
 	assert_eq!(num_blocks, expected_pool, "the pool should span everything past the archive region, derived from the reported capacity");
+
+	// M75: the typed volume health/policy ops over the serve channel. Send a generated
+	// request ([op u16][corr u32][args]) and pump block traffic until the reply lands.
+	let mut request = |body: &[u8]| -> alloc::vec::Vec<u8> {
+		_serve_client.send(Message::new(body.to_vec(), alloc::vec::Vec::new(), 0)).expect("the typed request should send");
+		for _ in 0..100_000 {
+			sched::run_until_idle();
+			pump(&blk_host, &mut disk, CAPACITY);
+			if let Ok(reply) = _serve_client.recv() {
+				return reply.bytes;
+			}
+		}
+		panic!("no typed reply arrived");
+	};
+
+	// status (op 12): the label is "system", the pool matches the derived size,
+	// compression starts OFF, and the mount is read-write.
+	let mut st = alloc::vec::Vec::new();
+	st.extend_from_slice(&12u16.to_le_bytes());
+	st.extend_from_slice(&1u32.to_le_bytes());
+	let reply = request(&st);
+	assert_eq!(reply[4], 1, "status should succeed");
+	let label_len = u16::from_le_bytes([reply[5], reply[6]]) as usize;
+	assert_eq!(&reply[7..7 + label_len], b"system", "the volume should carry its label");
+	let total = u64::from_le_bytes(reply[7 + label_len..15 + label_len].try_into().unwrap());
+	assert_eq!(total, expected_pool * 4096, "status reports the pool in bytes");
+	let compression = reply[23 + label_len];
+	let read_only = reply[24 + label_len];
+	assert_eq!(compression, 0, "compression starts off by default");
+	assert_eq!(read_only, 0, "the fresh volume mounts read-write");
+
+	// set-compression on (op 13) flips the live volume; status reflects it.
+	let mut sc = alloc::vec::Vec::new();
+	sc.extend_from_slice(&13u16.to_le_bytes());
+	sc.extend_from_slice(&2u32.to_le_bytes());
+	sc.push(1);
+	let reply = request(&sc);
+	assert_eq!(reply[4], 1, "set-compression should succeed");
+	let reply = request(&st);
+	assert_eq!(reply[23 + label_len], 1, "compression should now be on");
+
+	// fsck (op 14): a fresh volume verifies clean, with no damaged files named.
+	let mut fs = alloc::vec::Vec::new();
+	fs.extend_from_slice(&14u16.to_le_bytes());
+	fs.extend_from_slice(&3u32.to_le_bytes());
+	let reply = request(&fs);
+	assert_eq!(reply[4], 1, "fsck should succeed");
+	let failures = u32::from_le_bytes(reply[5..9].try_into().unwrap());
+	let damaged = u16::from_le_bytes([reply[9], reply[10]]);
+	assert_eq!((failures, damaged), (0, 0), "a fresh volume is clean");
 }
 
 #[cfg(test)]

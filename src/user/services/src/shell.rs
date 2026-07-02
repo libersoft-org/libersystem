@@ -766,6 +766,10 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			print(b"  snap create <name>  pin a named read-only snapshot of the volume\n");
 			print(b"  snap delete <name>  delete a named snapshot, releasing its blocks\n");
 			print(b"  snap cat <name> <vol://...>  read a file from a snapshot (an earlier state)\n");
+			print(b"  volume [status]  the system volume's label, size, free space and mount mode\n");
+			print(b"  volume compress on|off  toggle transparent compression for new writes\n");
+			print(b"  volume fsck      verify every live block's checksum, naming damaged files\n");
+			print(b"  volume restore <vol://...> [snapshot]  restore a file from a snapshot\n");
 			print(b"  beep [hz] [ms]   play a tone via AudioService\n");
 			print(b"  mouse            show recent pointer events via InputService\n");
 			print(b"  script [<cmd>]   run a command in a fresh pty-hosted shell and record it\n");
@@ -1175,6 +1179,18 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			arg.extend_from_slice(b"cat ");
 			arg.extend_from_slice(rest);
 			run_tool(permsvc, b"snap", &arg, cwd.as_bytes());
+			return false;
+		}
+		if line == b"volume" || line == b"volume status" {
+			// Launch `volume` as its own sandboxed ELF through PermissionManager: the
+			// filesystem's identity and health (label, size, free, compression, mount mode).
+			run_tool(permsvc, b"volume", b"status", cwd.as_bytes());
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"volume ") {
+			// the other volume verbs (compress on|off, fsck, restore <uri> [snapshot])
+			// pass through whole; the tool validates the sub-form.
+			run_tool(permsvc, b"volume", trim(rest), cwd.as_bytes());
 			return false;
 		}
 		if line == b"script" {

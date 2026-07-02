@@ -102,6 +102,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"rmdir" => Some(Manifest { component: String::from("rmdir"), grants: alloc::vec![Capability::Volumes] }),
 		b"log" => Some(Manifest { component: String::from("log"), grants: alloc::vec![Capability::Log, Capability::Time] }),
 		b"snap" => Some(Manifest { component: String::from("snap"), grants: alloc::vec![Capability::Storage] }),
+		b"volume" => Some(Manifest { component: String::from("volume"), grants: alloc::vec![Capability::Storage] }),
 		b"lsdev" => Some(Manifest { component: String::from("lsdev"), grants: alloc::vec![Capability::Device] }),
 		b"config" => Some(Manifest { component: String::from("config"), grants: alloc::vec![Capability::Config] }),
 		b"set" => Some(Manifest { component: String::from("set"), grants: alloc::vec![Capability::Config] }),

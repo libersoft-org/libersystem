@@ -77,10 +77,11 @@ impl<D: BlockDevice> LiberFs<D> {
 	// (pointer, CRC32C) of the one after it. Always called by `write_inode`, so the
 	// inode slot and chain stay consistent.
 	pub(crate) fn flush_extents(&mut self, inode: &mut Inode) -> Result<(), FsError> {
-		// the rebuilt chain replaces the old one wholesale: drop the old blocks.
+		// the rebuilt chain replaces the old one wholesale: drop the old blocks (the raw
+		// walk stops at a pointer outside the pool).
 		let mut old = inode.spill;
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		while old != 0 {
+		while old != 0 && old < self.num_blocks {
 			self.drop_block(old);
 			if !self.dev.read_block(old, &mut buf) {
 				return Err(FsError::Io);

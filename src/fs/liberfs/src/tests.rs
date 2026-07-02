@@ -529,8 +529,8 @@ fn fsck_reports_a_checksum_failure() {
 	let mut fs = LiberFs::mount(dev).unwrap();
 	let report = fs.fsck().unwrap();
 	assert_eq!(report.checksum_failures, 1);
-	// fsck does not silently drop the still-referenced (if corrupt) block.
-	assert_eq!(report.reclaimed_blocks, 0);
+	// fsck names the damaged file, not just a count.
+	assert_eq!(report.damaged, vec![b"f".to_vec()]);
 }
 
 #[test]
@@ -911,9 +911,14 @@ fn snapshot_name_rules_are_enforced() {
 
 // M57: transparent per-extent compression.
 
+// Format with compression enabled: the compression tests opt in (the default is off).
+fn format_lz(dev: MemDevice, num_blocks: u64) -> LiberFs<MemDevice> {
+	LiberFs::format_opts(dev, num_blocks, FormatOpts { compress: true, ..FormatOpts::default() }).unwrap()
+}
+
 #[test]
 fn a_compressible_file_shrinks_and_round_trips() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = format_lz(MemDevice::new(NBLOCKS), NBLOCKS);
 	// four blocks of repeating text: highly compressible, so the run shrinks.
 	let big: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
 	fs.write_file(b"big", &big).unwrap();
@@ -931,7 +936,7 @@ fn a_compressible_file_shrinks_and_round_trips() {
 
 #[test]
 fn an_incompressible_file_stays_raw() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = format_lz(MemDevice::new(NBLOCKS), NBLOCKS);
 	let big = noise(BLOCK_SIZE * 4);
 	fs.write_file(b"rnd", &big).unwrap();
 	assert_eq!(fs.read_file(b"rnd").unwrap(), big);
@@ -944,7 +949,7 @@ fn an_incompressible_file_stays_raw() {
 
 #[test]
 fn editing_a_compressed_file_thaws_it() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = format_lz(MemDevice::new(NBLOCKS), NBLOCKS);
 	let mut big: Vec<u8> = b"compress me well, ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
 	fs.write_file(b"big", &big).unwrap();
 	let num = fs.lookup(b"big").unwrap();
@@ -960,7 +965,7 @@ fn editing_a_compressed_file_thaws_it() {
 
 #[test]
 fn compression_checksums_catch_corruption() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = format_lz(MemDevice::new(NBLOCKS), NBLOCKS);
 	let big: Vec<u8> = b"checksum the stored bytes. ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
 	fs.write_file(b"big", &big).unwrap();
 	let num = fs.lookup(b"big").unwrap();
@@ -978,6 +983,144 @@ fn the_codec_round_trips_varied_inputs() {
 	for input in [Vec::new(), vec![0u8; 9000], b"hello hello hello hello world".to_vec(), noise(8000)] {
 		assert_eq!(lz_decompress(&lz_compress(&input)), input);
 	}
+}
+
+#[test]
+fn compression_is_off_by_default_and_togglable() {
+	let compressible: Vec<u8> = b"toggle me on and off. ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
+
+	// the default volume never compresses: the run stays raw.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	assert!(!fs.compression());
+	fs.write_file(b"raw", &compressible).unwrap();
+	let num = fs.lookup(b"raw").unwrap();
+	assert_eq!(fs.read_inode(num).unwrap().extents[0].clen, 0);
+
+	// switched on, a new write compresses; the earlier file keeps its raw form.
+	fs.set_compression(true).unwrap();
+	assert!(fs.compression());
+	fs.write_file(b"packed", &compressible).unwrap();
+	let num = fs.lookup(b"packed").unwrap();
+	assert!(fs.read_inode(num).unwrap().extents[0].clen != 0);
+	let raw = fs.lookup(b"raw").unwrap();
+	assert_eq!(fs.read_inode(raw).unwrap().extents[0].clen, 0);
+
+	// the switch survives a remount, and switching off leaves old compressed files
+	// readable while new writes land raw.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert!(fs.compression());
+	fs.set_compression(false).unwrap();
+	fs.write_file(b"raw2", &compressible).unwrap();
+	let num = fs.lookup(b"raw2").unwrap();
+	assert_eq!(fs.read_inode(num).unwrap().extents[0].clen, 0);
+	assert_eq!(fs.read_file(b"packed").unwrap(), compressible);
+}
+
+#[test]
+fn the_volume_identity_survives_a_remount() {
+	let opts = FormatOpts { uuid: [7u8; 16], label: b"system".to_vec(), compress: false };
+	let fs = LiberFs::format_opts(MemDevice::new(NBLOCKS), NBLOCKS, opts).unwrap();
+	let dev = fs.into_device();
+	let fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.uuid(), [7u8; 16]);
+	assert_eq!(fs.label(), b"system");
+}
+
+#[test]
+fn a_volume_with_foreign_feature_flags_does_not_mount() {
+	let fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut dev = fs.into_device();
+	// flip a feature bit in slot 0 and refresh its self-CRC: the flags are alien now,
+	// so the mount must reject the volume rather than mis-parse its layout.
+	dev.blocks[72] ^= 0x02;
+	let crc_probe: Vec<u8> = {
+		let mut probe = dev.blocks[..BLOCK_SIZE].to_vec();
+		probe[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].fill(0);
+		probe
+	};
+	let crc = crc32c(&crc_probe);
+	dev.blocks[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+	assert!(LiberFs::mount(dev).is_none());
+}
+
+#[test]
+fn names_must_be_utf8() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	// a bare continuation byte is not UTF-8: rejected, so one file has one name.
+	assert_eq!(fs.write_file(b"bad\x80name", b"x"), Err(FsError::Invalid));
+	// real multi-byte UTF-8 works.
+	let name = "soubor-\u{10D}e\u{161}tina.txt".as_bytes();
+	fs.write_file(name, b"ok").unwrap();
+	assert_eq!(fs.read_file(name).unwrap(), b"ok");
+}
+
+#[test]
+fn fsck_names_a_damaged_file_in_a_subdirectory() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"docs/inner/report.txt", b"the full path should be named").unwrap();
+	fs.write_file(b"clean.txt", b"untouched").unwrap();
+	let mut dev = fs.into_device();
+	corrupt_bytes(&mut dev, b"the full path should be named");
+	let mut fs = LiberFs::mount(dev).unwrap();
+	let report = fs.fsck().unwrap();
+	assert_eq!(report.checksum_failures, 1);
+	assert_eq!(report.damaged, vec![b"docs/inner/report.txt".to_vec()]);
+}
+
+#[test]
+fn restore_from_a_snapshot_heals_a_damaged_file() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"f", b"version one - the good copy").unwrap();
+	fs.create_snapshot(b"backup").unwrap();
+	// the rewrite lands on fresh blocks, so the snapshot's copy stays independent.
+	fs.write_file(b"f", b"version two - about to break").unwrap();
+	let mut dev = fs.into_device();
+	corrupt_bytes(&mut dev, b"version two - about to break");
+	let mut fs = LiberFs::mount(dev).unwrap();
+
+	// the live file is damaged and fsck names it; the snapshot's copy is intact.
+	assert_eq!(fs.read_file(b"f"), Err(FsError::Corrupt));
+	assert_eq!(fs.fsck().unwrap().damaged, vec![b"f".to_vec()]);
+
+	// restore copies the snapshot's version into the live tree: readable again,
+	// explicitly at the snapshot's (older) content.
+	fs.restore_file(b"f", b"backup").unwrap();
+	assert_eq!(fs.read_file(b"f").unwrap(), b"version one - the good copy");
+	assert!(fs.fsck().unwrap().damaged.is_empty());
+
+	// an unknown snapshot is NotFound; the empty name restores from the previous
+	// generation - one more commit first, so the restored state IS that generation
+	// (right after the restore, "previous" is still the damaged pre-restore tree).
+	assert_eq!(fs.restore_file(b"f", b"missing"), Err(FsError::NotFound));
+	fs.write_file(b"other", b"tick").unwrap();
+	fs.restore_file(b"f", b"").unwrap();
+	assert_eq!(fs.read_file(b"f").unwrap(), b"version one - the good copy");
+}
+
+#[test]
+fn snapshots_scale_past_a_single_table_block() {
+	// more snapshots than one chain block holds (48): the chained table has no cap.
+	let nblocks: u64 = 512;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	fs.write_file(b"f", b"seed").unwrap();
+	for i in 0..60u32 {
+		let name = format!("snap{i:02}");
+		fs.write_file(b"f", name.as_bytes()).unwrap();
+		fs.create_snapshot(name.as_bytes()).unwrap();
+	}
+	assert_eq!(fs.list_snapshots().unwrap().len(), 60);
+
+	// the whole chain survives a remount; an early and a late snapshot both read
+	// their pinned content, and deletion still works.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.list_snapshots().unwrap().len(), 60);
+	fs.delete_snapshot(b"snap30").unwrap();
+	assert_eq!(fs.list_snapshots().unwrap().len(), 59);
+	let dev = fs.into_device();
+	assert_eq!(LiberFs::mount_named_snapshot(dev.clone(), b"snap00").unwrap().read_file(b"f").unwrap(), b"snap00");
+	assert_eq!(LiberFs::mount_named_snapshot(dev, b"snap59").unwrap().read_file(b"f").unwrap(), b"snap59");
 }
 
 // M73: correctness hardening (flush barriers, read-only mounts, corruption honesty).
@@ -1117,7 +1260,7 @@ fn compression_never_launders_a_corrupt_source_block() {
 	// slots and the format's inode-tree leaf.
 	let first_data: u64 = POOL_START + 1;
 	let dev = BadWriteDevice { inner: MemDevice::new(NBLOCKS), corrupt_block: first_data };
-	let mut fs = LiberFs::format(dev, NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_opts(dev, NBLOCKS, FormatOpts { compress: true, ..FormatOpts::default() }).unwrap();
 	// four compressible blocks; the device damages the first as it lands. The
 	// compressor must notice the read-back fails its just-stored CRC and leave the
 	// run raw - re-encoding it would discard the only checksum that knows.
@@ -1151,7 +1294,7 @@ fn the_incremental_free_map_matches_a_full_rederivation() {
 		}
 	}
 	let nblocks: u64 = 256;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_opts(MemDevice::new(nblocks), nblocks, FormatOpts { compress: true, ..FormatOpts::default() }).unwrap();
 	let compressible: Vec<u8> = b"squeeze me flat. ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
 
 	fs.write_file(b"a", &noise(BLOCK_SIZE * 3)).unwrap();

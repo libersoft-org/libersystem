@@ -4,7 +4,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Create a named, read-only snapshot pinning the current generation's inode-tree
 	// root, so its blocks survive later commits until the snapshot is deleted. The name
 	// must be non-empty, at most SNAP_NAME_MAX bytes, and unique among existing
-	// snapshots; a volume holds at most SNAP_MAX snapshots.
+	// snapshots; the chained table holds any number of them.
 	pub fn create_snapshot(&mut self, name: &[u8]) -> Result<(), FsError> {
 		if name.is_empty() {
 			return Err(FsError::Invalid);
@@ -14,9 +14,6 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		if self.snapshots.iter().any(|s| s.name == name) {
 			return Err(FsError::Invalid);
-		}
-		if self.snapshots.len() >= SNAP_MAX {
-			return Err(FsError::NoSpace);
 		}
 		self.mutate(|fs| fs.create_snapshot_inner(name))
 	}
@@ -52,57 +49,84 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.write_snapshot_table()
 	}
 
-	// Serialize the in-memory snapshot table to a fresh metadata block (copy-on-write),
-	// updating snap_root and its CRC32C; an empty table clears the pointer. The fresh
-	// block is published by the commit's superblock write.
+	// Serialize the in-memory snapshot table to a fresh chain of metadata blocks
+	// (copy-on-write: the old chain's blocks are dropped), updating snap_root and its
+	// CRC32C; an empty table clears the pointer. Built back to front so each block
+	// carries the (pointer, CRC32C) of the one after it; published by the commit's
+	// superblock write.
 	pub(crate) fn write_snapshot_table(&mut self) -> Result<(), FsError> {
+		// the rebuilt chain replaces the old one wholesale: drop the old blocks (the raw
+		// walk stops at a pointer outside the pool).
+		let mut old = self.snap_root;
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		while old != 0 && old < self.num_blocks {
+			self.drop_block(old);
+			if !self.dev.read_block(old, &mut buf) {
+				return Err(FsError::Io);
+			}
+			old = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+		}
 		if self.snapshots.is_empty() {
 			self.snap_root = 0;
 			self.snap_root_crc = 0;
 			return Ok(());
 		}
-		let mut block = vec![0u8; BLOCK_SIZE];
-		block[0..4].copy_from_slice(&(self.snapshots.len() as u32).to_le_bytes());
-		for (i, s) in self.snapshots.iter().enumerate() {
-			let off = SNAP_HDR + i * SNAP_REC;
-			block[off..off + s.name.len()].copy_from_slice(&s.name);
-			block[off + SNAP_NAME_MAX..off + SNAP_NAME_MAX + 8].copy_from_slice(&s.inode_root.to_le_bytes());
-			block[off + SNAP_NAME_MAX + 8..off + SNAP_NAME_MAX + 12].copy_from_slice(&s.inode_root_crc.to_le_bytes());
-			block[off + SNAP_NAME_MAX + 12..off + SNAP_NAME_MAX + 20].copy_from_slice(&s.generation.to_le_bytes());
+		let mut next_ptr = 0u64;
+		let mut next_crc = 0u32;
+		let snapshots = self.snapshots.clone();
+		for chunk in snapshots.chunks(SNAPS_PER_BLOCK).rev() {
+			let blk = self.alloc_meta()?;
+			let mut block = vec![0u8; BLOCK_SIZE];
+			block[0..8].copy_from_slice(&next_ptr.to_le_bytes());
+			block[8..12].copy_from_slice(&next_crc.to_le_bytes());
+			block[12..16].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+			for (i, s) in chunk.iter().enumerate() {
+				let off = SNAP_HDR + i * SNAP_REC;
+				block[off..off + s.name.len()].copy_from_slice(&s.name);
+				block[off + SNAP_NAME_MAX..off + SNAP_NAME_MAX + 8].copy_from_slice(&s.inode_root.to_le_bytes());
+				block[off + SNAP_NAME_MAX + 8..off + SNAP_NAME_MAX + 12].copy_from_slice(&s.inode_root_crc.to_le_bytes());
+				block[off + SNAP_NAME_MAX + 12..off + SNAP_NAME_MAX + 20].copy_from_slice(&s.generation.to_le_bytes());
+			}
+			if !self.dev.write_block(blk, &block) {
+				return Err(FsError::Io);
+			}
+			next_ptr = blk;
+			next_crc = crc32c(&block);
 		}
-		let ptr = self.snap_root;
-		let dest = self.node_dest(ptr)?;
-		let crc = self.write_node_to(dest, &block)?;
-		self.snap_root = dest;
-		self.snap_root_crc = crc;
+		self.snap_root = next_ptr;
+		self.snap_root_crc = next_crc;
 		Ok(())
 	}
 
-	// Load the snapshot table the superblock points at into memory. The block is checked
-	// against snap_root_crc; a mismatch is FsError::Corrupt - the caller (mount) degrades
-	// the volume to read-only, because the pinned generations the table named can no
-	// longer be reserved and a commit could reuse their blocks. Silently dropping the
-	// table here would quietly destroy every named snapshot.
+	// Load the snapshot chain the superblock points at into memory. Each block is
+	// checked against the CRC32C its predecessor (or the superblock) recorded; a
+	// mismatch is FsError::Corrupt - the caller (mount) degrades the volume to
+	// read-only, because the pinned generations the table named can no longer be
+	// reserved and a commit could reuse their blocks. Silently dropping the table here
+	// would quietly destroy every named snapshot.
 	pub(crate) fn load_snapshot_table(&mut self) -> Result<(), FsError> {
 		self.snapshots = Vec::new();
-		if self.snap_root == 0 {
-			return Ok(());
-		}
+		let mut ptr = self.snap_root;
+		let mut crc = self.snap_root_crc;
 		let mut block = vec![0u8; BLOCK_SIZE];
-		if !self.dev.read_block(self.snap_root, &mut block) {
-			return Err(FsError::Io);
-		}
-		if crc32c(&block) != self.snap_root_crc {
-			return Err(FsError::Corrupt);
-		}
-		let count = (u32::from_le_bytes(block[0..4].try_into().unwrap()) as usize).min(SNAP_MAX);
-		for i in 0..count {
-			let off = SNAP_HDR + i * SNAP_REC;
-			let name = name_in(&block[off..off + SNAP_NAME_MAX]).to_vec();
-			let inode_root = u64::from_le_bytes(block[off + SNAP_NAME_MAX..off + SNAP_NAME_MAX + 8].try_into().unwrap());
-			let inode_root_crc = u32::from_le_bytes(block[off + SNAP_NAME_MAX + 8..off + SNAP_NAME_MAX + 12].try_into().unwrap());
-			let generation = u64::from_le_bytes(block[off + SNAP_NAME_MAX + 12..off + SNAP_NAME_MAX + 20].try_into().unwrap());
-			self.snapshots.push(Snapshot { name, inode_root, inode_root_crc, generation });
+		while ptr != 0 {
+			if !self.dev.read_block(ptr, &mut block) {
+				return Err(FsError::Io);
+			}
+			if crc32c(&block) != crc {
+				return Err(FsError::Corrupt);
+			}
+			let count = (u32::from_le_bytes(block[12..16].try_into().unwrap()) as usize).min(SNAPS_PER_BLOCK);
+			for i in 0..count {
+				let off = SNAP_HDR + i * SNAP_REC;
+				let name = name_in(&block[off..off + SNAP_NAME_MAX]).to_vec();
+				let inode_root = u64::from_le_bytes(block[off + SNAP_NAME_MAX..off + SNAP_NAME_MAX + 8].try_into().unwrap());
+				let inode_root_crc = u32::from_le_bytes(block[off + SNAP_NAME_MAX + 8..off + SNAP_NAME_MAX + 12].try_into().unwrap());
+				let generation = u64::from_le_bytes(block[off + SNAP_NAME_MAX + 12..off + SNAP_NAME_MAX + 20].try_into().unwrap());
+				self.snapshots.push(Snapshot { name, inode_root, inode_root_crc, generation });
+			}
+			ptr = u64::from_le_bytes(block[0..8].try_into().unwrap());
+			crc = u32::from_le_bytes(block[8..12].try_into().unwrap());
 		}
 		Ok(())
 	}

@@ -92,6 +92,23 @@ An opaque kernel object, transferred as `handle<file>`.
 | `name` | `string` |
 | `generation` | `u64` |
 
+### record `volume-status`
+
+| field | type |
+| --- | --- |
+| `label` | `string` |
+| `total-bytes` | `u64` |
+| `free-bytes` | `u64` |
+| `compression` | `bool` |
+| `read-only` | `bool` |
+
+### record `fsck-report`
+
+| field | type |
+| --- | --- |
+| `checksum-failures` | `u32` |
+| `damaged` | `list<string>` |
+
 ### enum `device-kind`
 
 | case | ordinal |
@@ -425,6 +442,10 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 9 | `mkdir` | `mkdir(path: string) -> result<unit, error>` |
 | 10 | `rmdir` | `rmdir(path: string) -> result<unit, error>` |
 | 11 | `capacity` | `capacity() -> result<u64, error>` |
+| 12 | `status` | `status() -> result<volume-status, error>` |
+| 13 | `set-compression` | `set-compression(enabled: bool) -> result<unit, error>` |
+| 14 | `fsck` | `fsck() -> result<fsck-report, error>` |
+| 15 | `restore` | `restore(path: string, snapshot: string) -> result<unit, error>` |
 
 ### interface `device`
 

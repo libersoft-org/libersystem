@@ -46,7 +46,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// is a transaction block write like any other.
 		self.release_run();
 		self.flush_wcsum()?;
-		let sb = Superblock { num_blocks: self.num_blocks, generation: self.generation + 1, inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, root_inode: self.root_inode, snap_root: self.snap_root, snap_root_crc: self.snap_root_crc };
+		let sb = Superblock { num_blocks: self.num_blocks, generation: self.generation + 1, inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, root_inode: self.root_inode, snap_root: self.snap_root, snap_root_crc: self.snap_root_crc, uuid: self.uuid, label: self.label, compress: self.compress };
 		let new_slot = (self.slot + 1) % SUPER_SLOTS;
 		// barrier: the transaction's blocks must be on the medium before the superblock
 		// that references them.
@@ -160,10 +160,20 @@ impl<D: BlockDevice> LiberFs<D> {
 		set_bit(&mut live, 0);
 		set_bit(&mut live, 1);
 		self.mark_inode_tree(self.inode_root, &mut live)?;
-		// the snapshot table block and every pinned snapshot generation stay reserved, so
-		// a later commit never reuses an earlier root's blocks.
-		if self.snap_root != 0 {
-			set_bit(&mut live, self.snap_root);
+		// every block of the snapshot chain and every pinned snapshot generation stay
+		// reserved, so a later commit never reuses an earlier root's blocks. The raw walk
+		// stops at a pointer outside the pool (a corrupt chain block - the mount is
+		// already degrading to read-only in that case).
+		{
+			let mut ptr = self.snap_root;
+			let mut buf = vec![0u8; BLOCK_SIZE];
+			while ptr != 0 && ptr < self.num_blocks {
+				set_bit(&mut live, ptr);
+				if !self.dev.read_block(ptr, &mut buf) {
+					return Err(FsError::Io);
+				}
+				ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+			}
 		}
 		let mut pinned = vec![0u8; len];
 		for i in 0..self.snapshots.len() {
@@ -345,10 +355,16 @@ impl<D: BlockDevice> LiberFs<D> {
 			let crc = self.write_node_to(blk, &buf)?;
 			return Ok((blk, crc));
 		}
-		match self.tree_insert_node(root, root_crc, key, record, rec, leaf_max, keylen)? {
+		let outcome = self.tree_insert_node(root, root_crc, key, record, rec, leaf_max, keylen)?;
+		self.settle_root(outcome)
+	}
+
+	// Turn an insert outcome into the tree's new root: an updated node is the root as
+	// is; a split builds a new internal root over the two halves.
+	pub(crate) fn settle_root(&mut self, outcome: Ins) -> Result<(u64, u32), FsError> {
+		match outcome {
 			Ins::Updated(p, c) => Ok((p, c)),
 			Ins::Split(lp, lc, sep, rp, rc) => {
-				// the root split: build a new internal root over the two halves.
 				let blk = self.alloc_meta()?;
 				let mut buf = vec![0u8; BLOCK_SIZE];
 				node_set_header(&mut buf, NODE_INTERNAL, 1);
@@ -357,6 +373,75 @@ impl<D: BlockDevice> LiberFs<D> {
 				set_child(&mut buf, 1, rp, rc);
 				let crc = self.write_node_to(blk, &buf)?;
 				Ok((blk, crc))
+			}
+		}
+	}
+
+	// Absorb a child's insert outcome into internal node `buf` (at `ptr`, child index
+	// `ci`): rewire an updated child, or take in a split - inserting the lifted
+	// separator and the right half when there is room, else splitting this internal
+	// node too and lifting the middle separator further. Shared by every tree flavour
+	// (the inode tree's fixed leaves, the directories' variable-record leaves).
+	pub(crate) fn internal_absorb(&mut self, buf: &mut [u8], ptr: u64, ci: usize, outcome: Ins) -> Result<Ins, FsError> {
+		let count = node_count(buf);
+		match outcome {
+			Ins::Updated(np, nc) => {
+				let dest = self.node_dest(ptr)?;
+				set_child(buf, ci, np, nc);
+				let ncrc = self.write_node_to(dest, buf)?;
+				Ok(Ins::Updated(dest, ncrc))
+			}
+			Ins::Split(lp, lc, sep, rp, rc) => {
+				if count + 2 <= INTERNAL_MAX {
+					// room: replace child ci with the left half and insert the separator
+					// and the right half after it.
+					let dest = self.node_dest(ptr)?;
+					let sstart = NODE_HDR + ci * SEP_SIZE;
+					let send = NODE_HDR + count * SEP_SIZE;
+					buf.copy_within(sstart..send, sstart + SEP_SIZE);
+					set_sep(buf, ci, sep);
+					let cstart = INTERNAL_CHILD_BASE + (ci + 1) * CHILD_SIZE;
+					let cend = INTERNAL_CHILD_BASE + (count + 1) * CHILD_SIZE;
+					buf.copy_within(cstart..cend, cstart + CHILD_SIZE);
+					set_child(buf, ci, lp, lc);
+					set_child(buf, ci + 1, rp, rc);
+					node_set_header(buf, NODE_INTERNAL, count + 1);
+					let ncrc = self.write_node_to(dest, buf)?;
+					Ok(Ins::Updated(dest, ncrc))
+				} else {
+					// full: build the combined separator and child arrays, split them,
+					// and lift the middle separator to the parent.
+					let mut seps: Vec<u64> = (0..count).map(|i| sep_key(buf, i)).collect();
+					let mut kids: Vec<(u64, u32)> = (0..=count).map(|i| (child_ptr(buf, i), child_crc(buf, i))).collect();
+					seps.insert(ci, sep);
+					kids[ci] = (lp, lc);
+					kids.insert(ci + 1, (rp, rc));
+					let s = seps.len();
+					let mid = s / 2;
+					let up = seps[mid];
+					let left_dest = self.node_dest(ptr)?;
+					let right_dest = self.alloc_meta()?;
+					let mut lbuf = vec![0u8; BLOCK_SIZE];
+					node_set_header(&mut lbuf, NODE_INTERNAL, mid);
+					for i in 0..mid {
+						set_sep(&mut lbuf, i, seps[i]);
+					}
+					for i in 0..=mid {
+						set_child(&mut lbuf, i, kids[i].0, kids[i].1);
+					}
+					let rcount = s - mid - 1;
+					let mut rbuf = vec![0u8; BLOCK_SIZE];
+					node_set_header(&mut rbuf, NODE_INTERNAL, rcount);
+					for i in 0..rcount {
+						set_sep(&mut rbuf, i, seps[mid + 1 + i]);
+					}
+					for i in 0..=rcount {
+						set_child(&mut rbuf, i, kids[mid + 1 + i].0, kids[mid + 1 + i].1);
+					}
+					let lcrc = self.write_node_to(left_dest, &lbuf)?;
+					let rcrc = self.write_node_to(right_dest, &rbuf)?;
+					Ok(Ins::Split(left_dest, lcrc, up, right_dest, rcrc))
+				}
 			}
 		}
 	}
@@ -429,73 +514,15 @@ impl<D: BlockDevice> LiberFs<D> {
 			let sep = u64::from_le_bytes(recs[split][0..8].try_into().unwrap());
 			return Ok(Ins::Split(left_dest, lcrc, sep, right_dest, rcrc));
 		}
-		// internal: route to a child and recurse.
+		// internal: route to a child and recurse; the shared absorber takes the outcome.
 		let mut ci = 0;
 		while ci < count && sep_key(&buf, ci) <= key {
 			ci += 1;
 		}
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
-		match self.tree_insert_node(cp, cc, key, record, rec, leaf_max, keylen)? {
-			Ins::Updated(np, nc) => {
-				let dest = self.node_dest(ptr)?;
-				set_child(&mut buf, ci, np, nc);
-				let ncrc = self.write_node_to(dest, &buf)?;
-				Ok(Ins::Updated(dest, ncrc))
-			}
-			Ins::Split(lp, lc, sep, rp, rc) => {
-				if count + 2 <= INTERNAL_MAX {
-					// room: replace child ci with the left half and insert the separator
-					// and the right half after it.
-					let dest = self.node_dest(ptr)?;
-					let sstart = NODE_HDR + ci * SEP_SIZE;
-					let send = NODE_HDR + count * SEP_SIZE;
-					buf.copy_within(sstart..send, sstart + SEP_SIZE);
-					set_sep(&mut buf, ci, sep);
-					let cstart = INTERNAL_CHILD_BASE + (ci + 1) * CHILD_SIZE;
-					let cend = INTERNAL_CHILD_BASE + (count + 1) * CHILD_SIZE;
-					buf.copy_within(cstart..cend, cstart + CHILD_SIZE);
-					set_child(&mut buf, ci, lp, lc);
-					set_child(&mut buf, ci + 1, rp, rc);
-					node_set_header(&mut buf, NODE_INTERNAL, count + 1);
-					let ncrc = self.write_node_to(dest, &buf)?;
-					Ok(Ins::Updated(dest, ncrc))
-				} else {
-					// full: build the combined separator and child arrays, split them,
-					// and lift the middle separator to the parent.
-					let mut seps: Vec<u64> = (0..count).map(|i| sep_key(&buf, i)).collect();
-					let mut kids: Vec<(u64, u32)> = (0..=count).map(|i| (child_ptr(&buf, i), child_crc(&buf, i))).collect();
-					seps.insert(ci, sep);
-					kids[ci] = (lp, lc);
-					kids.insert(ci + 1, (rp, rc));
-					let s = seps.len();
-					let mid = s / 2;
-					let up = seps[mid];
-					let left_dest = self.node_dest(ptr)?;
-					let right_dest = self.alloc_meta()?;
-					let mut lbuf = vec![0u8; BLOCK_SIZE];
-					node_set_header(&mut lbuf, NODE_INTERNAL, mid);
-					for i in 0..mid {
-						set_sep(&mut lbuf, i, seps[i]);
-					}
-					for i in 0..=mid {
-						set_child(&mut lbuf, i, kids[i].0, kids[i].1);
-					}
-					let rcount = s - mid - 1;
-					let mut rbuf = vec![0u8; BLOCK_SIZE];
-					node_set_header(&mut rbuf, NODE_INTERNAL, rcount);
-					for i in 0..rcount {
-						set_sep(&mut rbuf, i, seps[mid + 1 + i]);
-					}
-					for i in 0..=rcount {
-						set_child(&mut rbuf, i, kids[mid + 1 + i].0, kids[mid + 1 + i].1);
-					}
-					let lcrc = self.write_node_to(left_dest, &lbuf)?;
-					let rcrc = self.write_node_to(right_dest, &rbuf)?;
-					Ok(Ins::Split(left_dest, lcrc, up, right_dest, rcrc))
-				}
-			}
-		}
+		let outcome = self.tree_insert_node(cp, cc, key, record, rec, leaf_max, keylen)?;
+		self.internal_absorb(&mut buf, ptr, ci, outcome)
 	}
 
 	// Delete `key` from the B+tree rooted at (`root`, `root_crc`). Returns the new root
@@ -511,24 +538,62 @@ impl<D: BlockDevice> LiberFs<D> {
 			Del::NotFound => Ok((root, root_crc, false)),
 			Del::Empty => Ok((0, 0, true)),
 			Del::Updated(p, c) => {
-				// collapse a root that became a single-child internal node, repeatedly;
-				// each collapsed node leaves the new generation.
-				let mut ptr = p;
-				let mut crc = c;
-				let mut buf = vec![0u8; BLOCK_SIZE];
-				loop {
-					self.read_node(ptr, crc, &mut buf)?;
-					if node_type(&buf) == NODE_INTERNAL && node_count(&buf) == 0 {
-						let cp = child_ptr(&buf, 0);
-						let cc = child_crc(&buf, 0);
-						self.drop_block(ptr);
-						ptr = cp;
-						crc = cc;
-					} else {
-						break;
-					}
-				}
+				let (ptr, crc) = self.collapse_root(p, c)?;
 				Ok((ptr, crc, true))
+			}
+		}
+	}
+
+	// Collapse a root that became a single-child internal node, repeatedly; each
+	// collapsed node leaves the new generation. Shared by every tree flavour.
+	pub(crate) fn collapse_root(&mut self, mut ptr: u64, mut crc: u32) -> Result<(u64, u32), FsError> {
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		loop {
+			self.read_node(ptr, crc, &mut buf)?;
+			if node_type(&buf) == NODE_INTERNAL && node_count(&buf) == 0 {
+				let cp = child_ptr(&buf, 0);
+				let cc = child_crc(&buf, 0);
+				self.drop_block(ptr);
+				ptr = cp;
+				crc = cc;
+			} else {
+				return Ok((ptr, crc));
+			}
+		}
+	}
+
+	// Absorb a child's delete outcome into internal node `buf` (at `ptr`, child index
+	// `ci`): rewire an updated child, or drop an emptied one along with an adjacent
+	// separator. Shared by every tree flavour.
+	pub(crate) fn internal_absorb_del(&mut self, buf: &mut [u8], ptr: u64, ci: usize, outcome: Del) -> Result<Del, FsError> {
+		let count = node_count(buf);
+		match outcome {
+			Del::NotFound => Ok(Del::NotFound),
+			Del::Updated(np, nc) => {
+				let dest = self.node_dest(ptr)?;
+				set_child(buf, ci, np, nc);
+				let ncrc = self.write_node_to(dest, buf)?;
+				Ok(Del::Updated(dest, ncrc))
+			}
+			Del::Empty => {
+				if count == 0 {
+					// a single-child internal whose only child emptied empties too.
+					self.drop_block(ptr);
+					return Ok(Del::Empty);
+				}
+				// drop child ci and an adjacent separator (the one to its left when ci is
+				// the last child, else the one to its right).
+				let dest = self.node_dest(ptr)?;
+				let sidx = if ci == count { ci - 1 } else { ci };
+				let sstart = NODE_HDR + sidx * SEP_SIZE;
+				let send = NODE_HDR + count * SEP_SIZE;
+				buf.copy_within(sstart + SEP_SIZE..send, sstart);
+				let cstart = INTERNAL_CHILD_BASE + ci * CHILD_SIZE;
+				let cend = INTERNAL_CHILD_BASE + (count + 1) * CHILD_SIZE;
+				buf.copy_within(cstart + CHILD_SIZE..cend, cstart);
+				node_set_header(buf, NODE_INTERNAL, count - 1);
+				let ncrc = self.write_node_to(dest, buf)?;
+				Ok(Del::Updated(dest, ncrc))
 			}
 		}
 	}
@@ -569,42 +634,15 @@ impl<D: BlockDevice> LiberFs<D> {
 			let ncrc = self.write_node_to(dest, &buf)?;
 			return Ok(Del::Updated(dest, ncrc));
 		}
-		// internal: route and recurse.
+		// internal: route and recurse; the shared absorber takes the outcome.
 		let mut ci = 0;
 		while ci < count && sep_key(&buf, ci) <= key {
 			ci += 1;
 		}
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
-		match self.tree_delete_node(cp, cc, key, probe, rec, keylen)? {
-			Del::NotFound => Ok(Del::NotFound),
-			Del::Updated(np, nc) => {
-				let dest = self.node_dest(ptr)?;
-				set_child(&mut buf, ci, np, nc);
-				let ncrc = self.write_node_to(dest, &buf)?;
-				Ok(Del::Updated(dest, ncrc))
-			}
-			Del::Empty => {
-				if count == 0 {
-					// a single-child internal whose only child emptied empties too.
-					self.drop_block(ptr);
-					return Ok(Del::Empty);
-				}
-				// drop child ci and an adjacent separator (the one to its left when ci is
-				// the last child, else the one to its right).
-				let dest = self.node_dest(ptr)?;
-				let sidx = if ci == count { ci - 1 } else { ci };
-				let sstart = NODE_HDR + sidx * SEP_SIZE;
-				let send = NODE_HDR + count * SEP_SIZE;
-				buf.copy_within(sstart + SEP_SIZE..send, sstart);
-				let cstart = INTERNAL_CHILD_BASE + ci * CHILD_SIZE;
-				let cend = INTERNAL_CHILD_BASE + (count + 1) * CHILD_SIZE;
-				buf.copy_within(cstart + CHILD_SIZE..cend, cstart);
-				node_set_header(&mut buf, NODE_INTERNAL, count - 1);
-				let ncrc = self.write_node_to(dest, &buf)?;
-				Ok(Del::Updated(dest, ncrc))
-			}
-		}
+		let outcome = self.tree_delete_node(cp, cc, key, probe, rec, keylen)?;
+		self.internal_absorb_del(&mut buf, ptr, ci, outcome)
 	}
 }
 

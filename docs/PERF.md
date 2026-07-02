@@ -4,6 +4,23 @@ Measured numbers for the milestones whose "done when" includes a before/after
 comparison. Methodology per entry; machine noise applies, so treat the times as
 orders, not precision instruments.
 
+## M75 - LiberFS format and modernity (2026-07-02)
+
+Same benchmark as M74. The CRC32C rewrite (slice-by-8, previously byte-at-a-time)
+and the LZ4 codec (previously LZSS) move the CPU side; compression now defaults
+OFF, so the incompressible-write benchmark no longer pays a futile compression
+pass at all.
+
+| scenario | after M74 | after M75 |
+| --- | --- | --- |
+| 64 MiB write | 1.72 s | 137 ms (and 19 reads - the source-verify reads belonged to the compression pass) |
+| 64 MiB sequential read | 204 ms | 67 ms |
+| 2000 small files | 503 ms | 223 ms |
+| 2000 stats | 164 ms | 46 ms |
+
+The host test-suite run also fell from ~82 s to ~0.4 s (the CRC dominated the
+unoptimized debug profile; the crate now tests with opt-level 2).
+
 ## M74 - LiberFS allocator and free-map scaling (2026-07-02)
 
 Benchmark: `cd src/fs/liberfs && cargo test --release bench_scaling -- --ignored --nocapture`

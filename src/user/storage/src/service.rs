@@ -41,9 +41,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use fat::FatFs;
 use iso9660::Iso9660;
-use liberfs::{BlockDevice, FsError, LiberFs};
+use liberfs::{BlockDevice, FormatOpts, FsError, LiberFs};
 use proto::codec::Buffer;
-use proto::system::{volume, Error, FileInfo, FileKind, OpenOpts, OpenResult, SnapshotInfo};
+use proto::system::{volume, Error, FileInfo, FileKind, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus};
 use rt::*;
 use udf::Udf;
 
@@ -418,6 +418,51 @@ impl volume::Service for Volume {
 			Volume::Udf(fs) => unsafe { block_capacity(fs.device().chan) },
 		}
 	}
+
+	// The filesystem's own identity and health numbers: label, pool and free bytes,
+	// the compression switch, and whether the mount is read-only. Only the LiberFS
+	// volume tracks these; the other backends refuse with `invalid`.
+	fn status(&mut self) -> Result<VolumeStatus, Error> {
+		match self {
+			Volume::Disk(fs) => {
+				let block: u64 = liberfs::BLOCK_SIZE as u64;
+				Ok(VolumeStatus { label: String::from_utf8_lossy(fs.label()).into_owned(), total_bytes: fs.num_blocks() * block, free_bytes: fs.free_blocks() * block, compression: fs.compression(), read_only: fs.is_read_only() })
+			}
+			_ => Err(Error::Invalid),
+		}
+	}
+
+	// Switch transparent compression on or off for new writes on the LiberFS volume.
+	fn set_compression(&mut self, enabled: bool) -> Result<(), Error> {
+		match self {
+			Volume::Archive { .. } => Err(Error::Denied),
+			Volume::Disk(fs) => fs.set_compression(enabled).map_err(map_fs_err),
+			_ => Err(Error::Invalid),
+		}
+	}
+
+	// Verify every live block of the LiberFS volume against its checksum and name the
+	// damaged files.
+	fn fsck(&mut self) -> Result<FsckReport, Error> {
+		match self {
+			Volume::Disk(fs) => {
+				let report = fs.fsck().map_err(map_fs_err)?;
+				Ok(FsckReport { checksum_failures: report.checksum_failures, damaged: report.damaged.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect() })
+			}
+			_ => Err(Error::Invalid),
+		}
+	}
+
+	// Copy a file out of a named snapshot (or, with an empty name, the previous
+	// generation) over the live file: the recovery verb for what `fsck` named.
+	fn restore(&mut self, path: String, snapshot: String) -> Result<(), Error> {
+		let name: &[u8] = self.writable_name(&path)?;
+		match self {
+			Volume::Archive { .. } => Err(Error::Denied),
+			Volume::Disk(fs) => fs.restore_file(name, snapshot.as_bytes()).map_err(map_fs_err),
+			_ => Err(Error::Invalid),
+		}
+	}
 }
 
 impl Volume {
@@ -621,14 +666,35 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 	}
 	// otherwise lay down a fresh filesystem and copy in the factory seed files. The
 	// device is rebuilt from the (Copy) channel handle - the failed mount consumed the
-	// previous device value but left the channel open.
-	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format(ChannelBlockDevice { chan: block_client }, pool).ok()?;
+	// previous device value but left the channel open. The volume gets a uuid stirred
+	// from the clocks (unique enough to tell volumes apart; no RNG exists yet) and the
+	// "system" label; compression starts off, togglable later via `set-compression`.
+	let uuid: [u8; 16] = unsafe { stir_uuid() };
+	let opts: FormatOpts = FormatOpts { uuid, label: b"system".to_vec(), compress: false };
+	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format_opts(ChannelBlockDevice { chan: block_client }, pool, opts).ok()?;
 	// stamp real time before seeding, so the factory files carry a real ctime/mtime.
 	fs.set_clock(unsafe { clock_rtc() });
 	if let Some(archive) = unsafe { read_seed_archive(block_client) } {
 		seed_from_archive(&mut fs, &archive);
 	}
 	Some(fs)
+}
+
+// Sixteen uuid bytes stirred from the wall clock, the boot-relative nanosecond clock,
+// and a fixed tag, mixed through a splitmix64 round each - distinct across formats,
+// which is all the volume id needs (no RNG syscall exists yet).
+unsafe fn stir_uuid() -> [u8; 16] {
+	fn mix(mut x: u64) -> u64 {
+		x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+		x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+		x ^ (x >> 31)
+	}
+	let a: u64 = mix(unsafe { clock_rtc() } ^ 0x4C69_6265_7246_5321);
+	let b: u64 = mix(unsafe { clock_ns() } ^ a);
+	let mut uuid = [0u8; 16];
+	uuid[..8].copy_from_slice(&a.to_le_bytes());
+	uuid[8..].copy_from_slice(&b.to_le_bytes());
+	uuid
 }
 
 // The filesystem pool the disk's real capacity allows: everything past the factory

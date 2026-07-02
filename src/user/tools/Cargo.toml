@@ -49,6 +49,10 @@ name = "snap"
 path = "src/snap.rs"
 
 [[bin]]
+name = "volume"
+path = "src/volume.rs"
+
+[[bin]]
 name = "lsdev"
 path = "src/lsdev.rs"
 

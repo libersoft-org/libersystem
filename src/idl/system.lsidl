@@ -93,6 +93,25 @@ record snapshot-info {
 	generation: u64,
 }
 
+// A volume's identity and health, for `lsvol` and the `volume` command: its label,
+// pool size and free space (the filesystem's own numbers, unlike `capacity` which asks
+// the disk), whether transparent compression is on for new writes, and whether the
+// mount is read-only (a snapshot mount, or degraded by on-disk damage).
+record volume-status {
+	label:       string,
+	total-bytes: u64,
+	free-bytes:  u64,
+	compression: bool,
+	read-only:   bool,
+}
+
+// What a volume integrity check found: how many data blocks failed their checksum,
+// and the paths of the damaged files - so the operator knows what to restore.
+record fsck-report {
+	checksum-failures: u32,
+	damaged:           list<string>,
+}
+
 // The Storage volume contract: resolve a path on a volume and hand back the file's
 // bytes as a shared-buffer capability. `open` returns the capability out-of-band
 // (handle<file>) alongside its length - the M26 capability-return case that
@@ -104,7 +123,13 @@ record snapshot-info {
 // `snap-create` / `snap-list` / `snap-delete` manage named read-only snapshots (M56),
 // and `snap-open` resolves a path inside a snapshot to read an earlier state.
 // `capacity` reports the size in bytes of the block device backing the volume (asked
-// of the disk, not the filesystem), for the `lsblk` inventory.
+// of the disk, not the filesystem), for the `lsblk` inventory. `status` reports the
+// filesystem's own identity and health numbers (label, pool and free bytes, the
+// compression switch, read-only); `set-compression` flips transparent compression for
+// new writes; `fsck` verifies every live block against its checksum and names the
+// damaged files; `restore` copies a file out of a named snapshot (or, with an empty
+// name, the previous generation) over the live file - the recovery verb for what
+// `fsck` named.
 interface volume {
 	@op(1)  open:        func(o: open-opts) -> result<open-result, error>;
 	@op(2)  list:        func(path: string) -> result<list<file-info>, error>;
@@ -117,6 +142,10 @@ interface volume {
 	@op(9)  mkdir:       func(path: string) -> result<unit, error>;
 	@op(10) rmdir:       func(path: string) -> result<unit, error>;
 	@op(11) capacity:    func() -> result<u64, error>;
+	@op(12) status:          func() -> result<volume-status, error>;
+	@op(13) set-compression: func(enabled: bool) -> result<unit, error>;
+	@op(14) fsck:            func() -> result<fsck-report, error>;
+	@op(15) restore:         func(path: string, snapshot: string) -> result<unit, error>;
 }
 
 // The class of a discovered device, mirroring the kernel's device type codes.

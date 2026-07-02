@@ -225,7 +225,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		let mut ptr = inode.spill;
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		while ptr != 0 {
+		while ptr != 0 && ptr < self.num_blocks {
 			self.drop_block(ptr);
 			if !self.dev.read_block(ptr, &mut buf) {
 				return Err(FsError::Io);
@@ -678,16 +678,26 @@ impl<D: BlockDevice> LiberFs<D> {
 	}
 }
 
+// The bit helpers tolerate an out-of-range block (a corrupt pointer read off a raw
+// chain walk): setting is skipped, testing reads as allocated - so damage never
+// panics and never frees a block it should not.
 pub(crate) fn set_bit(bitmap: &mut [u8], b: u64) {
-	bitmap[(b / 8) as usize] |= 1 << (b % 8);
+	let i = (b / 8) as usize;
+	if i < bitmap.len() {
+		bitmap[i] |= 1 << (b % 8);
+	}
 }
 
 pub(crate) fn clear_bit(bitmap: &mut [u8], b: u64) {
-	bitmap[(b / 8) as usize] &= !(1 << (b % 8));
+	let i = (b / 8) as usize;
+	if i < bitmap.len() {
+		bitmap[i] &= !(1 << (b % 8));
+	}
 }
 
 pub(crate) fn test_bit(bitmap: &[u8], b: u64) -> bool {
-	bitmap[(b / 8) as usize] & (1 << (b % 8)) != 0
+	let i = (b / 8) as usize;
+	if i < bitmap.len() { bitmap[i] & (1 << (b % 8)) != 0 } else { true }
 }
 
 // Index of the extent covering logical block `lb`, or None if it falls in a hole. The
@@ -701,90 +711,108 @@ pub(crate) fn find_extent(extents: &[Extent], lb: u64) -> Option<usize> {
 	if extents[pos - 1].covers(lb) { Some(pos - 1) } else { None }
 }
 
-// Hash the 3-byte prefix at `w` into an LZ_HASH_BITS-wide match-finder bucket.
+// Hash the 4-byte prefix at `w` into an LZ_HASH_BITS-wide match-finder bucket.
 pub(crate) fn lz_hash(w: &[u8]) -> usize {
-	let v = (w[0] as u32) << 16 | (w[1] as u32) << 8 | w[2] as u32;
+	let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
 	(v.wrapping_mul(0x9E37_79B1) >> (32 - LZ_HASH_BITS)) as usize
 }
 
-// Record position `i` in the hash chain (most-recent-first) so later positions can find
-// it as a match candidate. `prev` is windowed (LZ_WINDOW entries): within the active
-// window the low bits of a position are unique, and the match walk stops once a candidate
-// is more than a window back, so the wrap never yields a wrong match.
-pub(crate) fn lz_insert(src: &[u8], i: usize, head: &mut [i32], prev: &mut [i32]) {
-	if i + LZ_MIN_MATCH <= src.len() {
-		let h = lz_hash(&src[i..]);
-		prev[i & (LZ_WINDOW - 1)] = head[h];
-		head[h] = i as i32;
-	}
-}
-
-// Compress `src` with the small LZSS coder described at the LZ_* constants: a control
-// byte per eight items, each a literal byte or a (distance, length) back-reference into
-// the 4096-byte sliding window. The stream begins with the uncompressed length, so
-// `lz_decompress` needs no external size. Dependency-free and no_std; the ratio is modest
-// but the format is simple and the decoder trivial, which is what an on-disk filesystem
-// wants. Every candidate match is verified by comparing bytes, so the windowed hash chain
-// only affects the ratio, never correctness.
+// Compress `src` with the dependency-free LZ4 block-format coder described at the LZ_*
+// constants. The stream begins with the uncompressed length, so `lz_decompress` needs
+// no external size. A single-entry hash table finds the most recent position sharing a
+// 4-byte prefix; every candidate is verified by comparing bytes, so the table only
+// affects the ratio, never correctness. The format is the standard LZ4 block layout
+// (token, literals, offset, extended match length), chosen over the old LZSS coder for
+// a better ratio (64 KiB offsets, unbounded match lengths) at higher speed (token
+// framing instead of per-item control bits).
 pub(crate) fn lz_compress(src: &[u8]) -> Vec<u8> {
 	let n = src.len();
-	let mut out = Vec::with_capacity(n / 2 + 8);
+	let mut out = Vec::with_capacity(n / 2 + 16);
 	out.extend_from_slice(&(n as u32).to_le_bytes());
-	let mut head = vec![-1i32; LZ_HASH_SIZE];
-	let mut prev = vec![-1i32; LZ_WINDOW];
+	let mut head = vec![-1i64; LZ_HASH_SIZE];
 	let mut i = 0usize;
-	while i < n {
-		let ctrl = out.len();
-		out.push(0u8);
-		let mut flags = 0u8;
-		let mut bit = 0;
-		while bit < 8 && i < n {
-			let (mut best_len, mut best_dist) = (0usize, 0usize);
-			if i + LZ_MIN_MATCH <= n {
-				let mut cand = head[lz_hash(&src[i..])];
-				let mut probes = 0;
-				while cand >= 0 && probes < LZ_MAX_CHAIN {
-					let c = cand as usize;
-					let dist = i - c;
-					if dist > LZ_WINDOW {
-						break;
-					}
-					let max = (n - i).min(LZ_MAX_MATCH);
-					let mut l = 0;
-					while l < max && src[c + l] == src[i + l] {
-						l += 1;
-					}
-					if l > best_len {
-						best_len = l;
-						best_dist = dist;
-						if l == LZ_MAX_MATCH {
-							break;
-						}
-					}
-					cand = prev[c & (LZ_WINDOW - 1)];
-					probes += 1;
+	let mut anchor = 0usize;
+	// matches may neither start past this point nor extend into the last five bytes.
+	let match_limit = n.saturating_sub(LZ_MATCH_MARGIN);
+	let literal_end = n.saturating_sub(LZ_LAST_LITERALS);
+	while i < match_limit {
+		// find the most recent earlier position sharing our 4-byte prefix.
+		let h = lz_hash(&src[i..]);
+		let cand = head[h];
+		head[h] = i as i64;
+		let mut matched = 0usize;
+		let mut offset = 0usize;
+		if cand >= 0 {
+			let c = cand as usize;
+			let dist = i - c;
+			if dist <= 0xFFFF && src[c..c + 4] == src[i..i + 4] {
+				// verified 4-byte match: extend it as far as the margin allows.
+				let mut l = 4;
+				let max = literal_end - i;
+				while l < max && src[c + l] == src[i + l] {
+					l += 1;
 				}
+				matched = l;
+				offset = dist;
 			}
-			if best_len >= LZ_MIN_MATCH {
-				let dist_code = (best_dist - 1) as u16;
-				out.push((dist_code & 0xFF) as u8);
-				out.push((((dist_code >> 8) as u8) << 4) | (best_len - LZ_MIN_MATCH) as u8);
-				let end = i + best_len;
-				while i < end {
-					lz_insert(src, i, &mut head, &mut prev);
-					i += 1;
-				}
-			} else {
-				flags |= 1 << bit;
-				out.push(src[i]);
-				lz_insert(src, i, &mut head, &mut prev);
-				i += 1;
-			}
-			bit += 1;
 		}
-		out[ctrl] = flags;
+		if matched < LZ_MIN_MATCH {
+			i += 1;
+			continue;
+		}
+		// one sequence: the literals since the last match, then this match.
+		lz_put_sequence(&mut out, &src[anchor..i], offset, matched);
+		// index a couple of positions inside the match so long runs stay findable.
+		let end = i + matched;
+		let mut p = i + 1;
+		while p < end.min(match_limit) && p < i + 3 {
+			head[lz_hash(&src[p..])] = p as i64;
+			p += 1;
+		}
+		i = end;
+		anchor = end;
 	}
+	// the trailing literals (always at least LZ_LAST_LITERALS when anything matched).
+	lz_put_literals(&mut out, &src[anchor..]);
 	out
+}
+
+// Append one LZ4 sequence: token, extended literal length, the literals, the 2-byte
+// offset, and the extended match length (stored as `len - LZ_MIN_MATCH`).
+fn lz_put_sequence(out: &mut Vec<u8>, literals: &[u8], offset: usize, matched: usize) {
+	let ml = matched - LZ_MIN_MATCH;
+	let lit_nibble = literals.len().min(15) as u8;
+	let ml_nibble = ml.min(15) as u8;
+	out.push(lit_nibble << 4 | ml_nibble);
+	lz_put_extra(out, literals.len(), 15);
+	out.extend_from_slice(literals);
+	out.extend_from_slice(&(offset as u16).to_le_bytes());
+	lz_put_extra(out, ml, 15);
+}
+
+// Append a literals-only tail sequence (no match: token's low nibble unused, no offset).
+fn lz_put_literals(out: &mut Vec<u8>, literals: &[u8]) {
+	if literals.is_empty() {
+		return;
+	}
+	let lit_nibble = literals.len().min(15) as u8;
+	out.push(lit_nibble << 4);
+	lz_put_extra(out, literals.len(), 15);
+	out.extend_from_slice(literals);
+}
+
+// LZ4 length extension: a nibble of 15 is followed by 255-valued bytes plus a final
+// remainder byte until the full length is encoded.
+fn lz_put_extra(out: &mut Vec<u8>, len: usize, nibble_max: usize) {
+	if len < nibble_max {
+		return;
+	}
+	let mut rest = len - nibble_max;
+	while rest >= 255 {
+		out.push(255);
+		rest -= 255;
+	}
+	out.push(rest as u8);
 }
 
 // Decode a stream produced by `lz_compress` back into its original bytes. Bounds-checked
@@ -798,34 +826,56 @@ pub(crate) fn lz_decompress(src: &[u8]) -> Vec<u8> {
 	let mut out = Vec::with_capacity(n);
 	let mut p = 4;
 	while out.len() < n && p < src.len() {
-		let flags = src[p];
+		let token = src[p];
 		p += 1;
-		let mut bit = 0;
-		while bit < 8 && out.len() < n {
-			if flags & (1 << bit) != 0 {
-				if p >= src.len() {
-					return out;
-				}
-				out.push(src[p]);
-				p += 1;
-			} else {
-				if p + 1 >= src.len() {
-					return out;
-				}
-				let dist = (((src[p + 1] >> 4) as usize) << 8 | src[p] as usize) + 1;
-				let len = (src[p + 1] & 0x0F) as usize + LZ_MIN_MATCH;
-				p += 2;
-				if dist > out.len() {
-					return out;
-				}
-				let start = out.len() - dist;
-				for k in 0..len {
-					let byte = out[start + k];
-					out.push(byte);
-				}
+		// literals: high nibble, extended.
+		let mut lit = (token >> 4) as usize;
+		if lit == 15 {
+			match lz_take_extra(src, &mut p) {
+				Some(extra) => lit += extra,
+				None => return out,
 			}
-			bit += 1;
+		}
+		if p + lit > src.len() {
+			return out;
+		}
+		out.extend_from_slice(&src[p..p + lit]);
+		p += lit;
+		if out.len() >= n || p + 2 > src.len() {
+			break;
+		}
+		// the match: 2-byte offset, then the extended length.
+		let offset = u16::from_le_bytes([src[p], src[p + 1]]) as usize;
+		p += 2;
+		let mut ml = (token & 0x0F) as usize;
+		if ml == 15 {
+			match lz_take_extra(src, &mut p) {
+				Some(extra) => ml += extra,
+				None => return out,
+			}
+		}
+		ml += LZ_MIN_MATCH;
+		if offset == 0 || offset > out.len() {
+			return out;
+		}
+		let start = out.len() - offset;
+		for k in 0..ml {
+			let byte = out[start + k];
+			out.push(byte);
 		}
 	}
 	out
+}
+
+// Read an LZ4 length extension at `*p`: 255-valued bytes plus the final remainder.
+fn lz_take_extra(src: &[u8], p: &mut usize) -> Option<usize> {
+	let mut extra = 0usize;
+	loop {
+		let b = *src.get(*p)?;
+		*p += 1;
+		extra += b as usize;
+		if b != 255 {
+			return Some(extra);
+		}
+	}
 }

@@ -47,13 +47,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 // List the volume set with a per-volume file count, read through the five grants: `system`
 // (writable LiberFS), `media` (FAT/exFAT), `iso` (ISO9660), `udf` (UDF), and `usb` (FAT off
-// the USB stick).
+// the USB stick). The system volume also reports its filesystem numbers (label, size, free
+// space, compression, mount mode) via the `status` op - the `df` view.
 unsafe fn list_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64) {
 	unsafe {
 		let mut out = String::new();
 		out.push_str("volumes (5):\n  vol://system (");
 		push_count(&mut out, volume_count(system, "vol://system"));
-		out.push_str(" files)\n  vol://media (");
+		out.push_str(" files)");
+		push_status(&mut out, system);
+		out.push_str("\n  vol://media (");
 		push_count(&mut out, volume_count(media, "vol://media"));
 		out.push_str(" files)\n  vol://iso (");
 		push_count(&mut out, volume_count(iso, "vol://iso"));
@@ -63,6 +66,24 @@ unsafe fn list_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64) {
 		push_count(&mut out, volume_count(usb, "vol://usb"));
 		out.push_str(" files)\n");
 		print(out.as_bytes());
+	}
+}
+
+// Append the system volume's filesystem numbers, when its backend reports them: used/total
+// bytes, the compression switch, and a READ-ONLY marker on a degraded mount.
+unsafe fn push_status(out: &mut String, storage: u64) {
+	use core::fmt::Write as _;
+	if storage == 0 {
+		return;
+	}
+	let mut client = volume::Client::new(ChannelTransport { chan: storage });
+	let Some(Ok(st)) = client.status() else {
+		return;
+	};
+	let used: u64 = st.total_bytes - st.free_bytes;
+	let _ = write!(out, " - {} / {} MiB used, compression {}", used >> 20, st.total_bytes >> 20, if st.compression { "on" } else { "off" });
+	if st.read_only {
+		out.push_str(", READ-ONLY");
 	}
 }
 

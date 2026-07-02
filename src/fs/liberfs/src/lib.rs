@@ -104,9 +104,22 @@ pub const BLOCK_SIZE: usize = 4096;
 // on-disk bitmap, 64-bit block addresses, an inode B+tree keyed by number, directories
 // that are name-keyed B+trees, files mapped by extents (each a contiguous run with its
 // own checksum block) and sparse holes, per-inode timestamps and an opaque owner tag,
-// and a CRC32C paired with every block pointer.
+// and a CRC32C paired with every block pointer. The version stays 1 pre-release; the
+// FEATURES flags word records layout revisions instead, so a volume laid down by an
+// older build is detected (its flags differ) rather than mis-parsed.
 const MAGIC: [u8; 8] = *b"LIBERFS1";
 const VERSION: u32 = 1;
+// Feature flags the superblock must carry, bit for bit: bit 0 is the second-revision
+// layout (variable-length directory records, the chained snapshot table, the identity
+// and algorithm fields, per-volume compression). Unknown or missing bits reject the
+// mount.
+const FEATURES: u64 = 0x1;
+// Algorithm identifiers recorded in the superblock, so a mount never verifies with the
+// wrong checksum or decodes with the wrong codec.
+const CSUM_ALGO_CRC32C: u8 = 1;
+const CODEC_LZ4: u8 = 2;
+// The volume label's fixed on-disk field width (NUL padded).
+const LABEL_MAX: usize = 32;
 
 // The two superblock slots (blocks 0 and 1): a commit writes the new superblock to the
 // inactive slot, so the active one survives a torn write. The block pool begins right
@@ -172,21 +185,23 @@ const CRCS_PER_BLOCK: usize = BLOCK_SIZE / 4;
 const EXTENT_HDR: usize = 16;
 const EXTENTS_PER_BLOCK: usize = (BLOCK_SIZE - EXTENT_HDR) / EXTENT_SIZE;
 
-// Transparent per-extent compression uses a small, dependency-free LZ77 / LZSS coder (no
-// external crate, no_std). A control byte's eight bits flag the next eight items as a
-// literal byte or a back-reference; a back-reference is a 12-bit distance (1..=4096, the
-// sliding window) and a 4-bit length (LZ_MIN_MATCH..=LZ_MAX_MATCH). The compressed stream
-// begins with the uncompressed length (u32, little-endian) so it decodes without external
-// size metadata. A compressed extent stores this stream across whole blocks, each with
-// its own CRC32C, so the integrity checks cover the stored (compressed) bytes.
-const LZ_WINDOW: usize = 4096;
-const LZ_MIN_MATCH: usize = 3;
-const LZ_MAX_MATCH: usize = LZ_MIN_MATCH + 15;
-const LZ_HASH_BITS: usize = 13;
+// Transparent per-extent compression uses a dependency-free LZ4 block-format coder (no
+// external crate, no_std). LZ4 frames data as sequences: a token byte (literal count
+// high nibble, match length low nibble, each extended by 255-bytes), the literals, a
+// 2-byte little-endian match offset (1..=65535), and the match length (minimum 4).
+// The stream begins with the uncompressed length (u32, little-endian) so it decodes
+// without external size metadata. A compressed extent stores this stream across whole
+// blocks, each with its own CRC32C, so the integrity checks cover the stored
+// (compressed) bytes. The superblock records the codec ID, so a mount never decodes
+// with the wrong coder.
+const LZ_MIN_MATCH: usize = 4;
+const LZ_HASH_BITS: usize = 14;
 const LZ_HASH_SIZE: usize = 1 << LZ_HASH_BITS;
-// How many earlier positions sharing a 3-byte prefix to test for the longest match: a
-// bounded chain keeps compression roughly linear while still finding most matches.
-const LZ_MAX_CHAIN: usize = 32;
+// The last five bytes of an LZ4 stream are always literals and a match may not start
+// within twelve bytes of the end (the spec's parsing-restriction margin, kept for
+// interoperability and simple bounds).
+const LZ_LAST_LITERALS: usize = 5;
+const LZ_MATCH_MARGIN: usize = 12;
 
 // Inode kinds. A live inode record is always a file or a directory; a freed inode is
 // deleted from the tree rather than tombstoned, so there is no "free" kind.
@@ -203,15 +218,18 @@ const ROOT_INODE: u32 = 0;
 // sort by (hash, name), so the key portion compared in a leaf is the hash plus the name.
 // A full 255-byte name fills the whole name field with no terminator.
 const NAME_MAX: usize = 255;
-const DIR_REC: usize = 8 + NAME_MAX + 4;
-const DIR_LEAF_MAX: usize = (BLOCK_SIZE - NODE_HDR) / DIR_REC;
-const DIR_KEYLEN: usize = 8 + NAME_MAX;
+// A directory leaf record is variable-length: the name hash (u64), the child inode
+// (u32), a length byte, then the name's bytes - 13 bytes plus the name, so a 4 KiB
+// leaf holds a couple hundred typical entries instead of a fixed few. Records are
+// kept sorted by (hash, name) and the whole leaf is rewritten compactly on every
+// change (it is copied up by CoW anyway).
+const DIR_REC_HDR: usize = 13;
 
-// CRC32C (Castagnoli) lookup table, built at compile time. Each block's checksum is a
-// CRC32C of its bytes, stored next to the pointer to it; the reflected polynomial is
-// 0x82F63B78.
-const CRC32C_TABLE: [u32; 256] = {
-	let mut table = [0u32; 256];
+// CRC32C (Castagnoli) lookup tables, built at compile time: eight tables of 256
+// entries for slice-by-8, where table[t] advances a byte's contribution through
+// 8 - t further zero bytes. The reflected polynomial is 0x82F63B78.
+const CRC32C_TABLES: [[u32; 256]; 8] = {
+	let mut tables = [[0u32; 256]; 8];
 	let mut i = 0;
 	while i < 256 {
 		let mut crc = i as u32;
@@ -221,18 +239,36 @@ const CRC32C_TABLE: [u32; 256] = {
 			crc = (crc >> 1) ^ (0x82F6_3B78 & mask);
 			j += 1;
 		}
-		table[i] = crc;
+		tables[0][i] = crc;
 		i += 1;
 	}
-	table
+	let mut t = 1;
+	while t < 8 {
+		let mut i = 0;
+		while i < 256 {
+			let prev = tables[t - 1][i];
+			tables[t][i] = (prev >> 8) ^ tables[0][(prev & 0xFF) as usize];
+			i += 1;
+		}
+		t += 1;
+	}
+	tables
 };
 
 // CRC32C of a block's bytes: computed on write, stored beside the pointer, and rechecked
 // on read so a flipped bit on disk surfaces as `FsError::Corrupt` rather than bad data.
+// Slice-by-8: eight bytes advance per table round instead of one, which matters when
+// every stored block is checksummed on both sides of the device.
 fn crc32c(data: &[u8]) -> u32 {
 	let mut crc = 0xFFFF_FFFFu32;
-	for &b in data {
-		crc = (crc >> 8) ^ CRC32C_TABLE[((crc ^ b as u32) & 0xFF) as usize];
+	let mut chunks = data.chunks_exact(8);
+	for c in &mut chunks {
+		let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]) ^ crc;
+		let hi = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+		crc = CRC32C_TABLES[7][(lo & 0xFF) as usize] ^ CRC32C_TABLES[6][((lo >> 8) & 0xFF) as usize] ^ CRC32C_TABLES[5][((lo >> 16) & 0xFF) as usize] ^ CRC32C_TABLES[4][(lo >> 24) as usize] ^ CRC32C_TABLES[3][(hi & 0xFF) as usize] ^ CRC32C_TABLES[2][((hi >> 8) & 0xFF) as usize] ^ CRC32C_TABLES[1][((hi >> 16) & 0xFF) as usize] ^ CRC32C_TABLES[0][(hi >> 24) as usize];
+	}
+	for &b in chunks.remainder() {
+		crc = (crc >> 8) ^ CRC32C_TABLES[0][((crc ^ b as u32) & 0xFF) as usize];
 	}
 	!crc
 }
@@ -264,15 +300,15 @@ pub struct Stat {
 	pub mtime: u64,
 }
 
-// What an [`LiberFs::fsck`] pass reclaimed: blocks that the bitmap marked allocated but
-// no live inode referenced, and inodes that were allocated but named by no directory
-// (orphans left by a crash mid-write); plus how many live data blocks failed their
-// checksum (on-disk corruption found while walking the tree).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// What an [`LiberFs::fsck`] pass found: how many live data blocks failed their checksum
+// (on-disk corruption found while walking the trees), and the paths of the live files
+// holding them - so the operator knows WHAT is damaged, and [`LiberFs::restore_file`]
+// knows what to heal from a pinned generation. (Copy-on-write left fsck nothing to
+// reclaim: a crash can no longer leak blocks or orphan an inode.)
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsckReport {
-	pub reclaimed_blocks: u32,
-	pub reclaimed_inodes: u32,
 	pub checksum_failures: u32,
+	pub damaged: Vec<Vec<u8>>,
 }
 
 // A fixed-size block device: the whole filesystem is read and written one
@@ -296,7 +332,8 @@ pub trait BlockDevice {
 // The parsed superblock, cached in memory for the life of a mount. With copy-on-write
 // the inode table moves on every commit, so the superblock points at it through an
 // index block rather than a fixed region; `generation` orders the two slots and the
-// trailing self-CRC catches a torn commit.
+// trailing self-CRC catches a torn commit. The identity fields (uuid, label) and the
+// compression switch ride along, so they commit atomically with everything else.
 #[derive(Clone, Copy)]
 struct Superblock {
 	num_blocks: u64,
@@ -312,11 +349,17 @@ struct Superblock {
 	// holds only live inodes and a volume never runs out of inode numbers in practice.
 	next_inode: u32,
 	root_inode: u32,
-	// The snapshot table: the block holding the named snapshots (0 = none) and that
+	// The snapshot table: the first block of the snapshot chain (0 = none) and that
 	// block's CRC32C. Carried in the superblock so the pinned snapshots commit atomically
 	// with the generation and survive a remount.
 	snap_root: u64,
 	snap_root_crc: u32,
+	// Volume identity: a caller-supplied unique id and a human-readable label.
+	uuid: [u8; 16],
+	label: [u8; LABEL_MAX],
+	// Per-volume transparent compression: chosen at format time, togglable on a live
+	// volume; governs new whole-file writes only.
+	compress: bool,
 }
 
 // Byte offset of the superblock's own CRC32C within its block; the checksum covers the
@@ -324,13 +367,15 @@ struct Superblock {
 const SB_CRC_OFFSET: usize = 56;
 
 // A named snapshot pins an earlier generation's inode-tree root so its blocks are not
-// reclaimed. The snapshot table is the one block `snap_root` points at: a u32 count and
-// a u32 pad, then fixed records of a NUL-padded name, the pinned inode-tree root and its
-// CRC32C, and the generation. (4096 - 8) / 84 = 48 snapshots fit one block.
+// reclaimed. The snapshot table is a chain of blocks rooted at `snap_root`: each block
+// carries an 8-byte next pointer, that block's CRC32C (u32) and a record count (u32),
+// then fixed records of a NUL-padded name, the pinned inode-tree root and its CRC32C,
+// and the generation. (4096 - 16) / 84 = 48 records per block; the chain is unbounded,
+// so there is no cap on how many snapshots a volume holds.
 const SNAP_NAME_MAX: usize = 64;
-const SNAP_HDR: usize = 8;
+const SNAP_HDR: usize = 16;
 const SNAP_REC: usize = SNAP_NAME_MAX + 20;
-const SNAP_MAX: usize = (BLOCK_SIZE - SNAP_HDR) / SNAP_REC;
+const SNAPS_PER_BLOCK: usize = (BLOCK_SIZE - SNAP_HDR) / SNAP_REC;
 
 // In-memory cache bounds: how many parsed inodes and how many (directory, name) ->
 // inode entries are kept between operations, and the largest extent map worth caching
@@ -605,7 +650,21 @@ pub struct LiberFs<D: BlockDevice> {
 	// interleave generations) and when the mount is degraded (a corrupt snapshot table
 	// no longer pins its generations, so a commit could reuse pinned blocks).
 	read_only: bool,
+	// Volume identity and the per-volume compression switch, carried in the superblock.
+	uuid: [u8; 16],
+	label: [u8; LABEL_MAX],
+	compress: bool,
 	clock: u64,
+}
+
+// Options for [`LiberFs::format_opts`]: the volume's unique id, its human-readable
+// label (truncated to LABEL_MAX bytes), and whether transparent compression starts
+// enabled (off by default; togglable later with [`LiberFs::set_compression`]).
+#[derive(Clone, Default)]
+pub struct FormatOpts {
+	pub uuid: [u8; 16],
+	pub label: Vec<u8>,
+	pub compress: bool,
 }
 
 mod blkalloc;

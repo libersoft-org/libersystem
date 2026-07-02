@@ -62,10 +62,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		if dir.kind != KIND_DIR {
 			return Err(FsError::NotFound);
 		}
-		let probe = dir_probe(name);
-		match self.tree_lookup(dir.dir_root, dir.dir_root_crc, name_hash(name), &probe, DIR_REC)? {
-			Some(rec) => {
-				let child = u32::from_le_bytes(rec[8 + NAME_MAX..8 + NAME_MAX + 4].try_into().unwrap());
+		match self.dir_tree_lookup(dir.dir_root, dir.dir_root_crc, name)? {
+			Some(child) => {
 				self.dcache_put(dir_num, name, child);
 				Ok(Some(child))
 			}
@@ -92,13 +90,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		if dir.kind != KIND_DIR {
 			return Err(FsError::NotFound);
 		}
-		let key = name_hash(name);
-		let existed = {
-			let probe = dir_probe(name);
-			self.tree_lookup(dir.dir_root, dir.dir_root_crc, key, &probe, DIR_REC)?.is_some()
-		};
-		let record = dir_record(name, child);
-		let (root, crc) = self.tree_insert(dir.dir_root, dir.dir_root_crc, key, &record, DIR_REC, DIR_LEAF_MAX, DIR_KEYLEN)?;
+		let existed = self.dir_tree_lookup(dir.dir_root, dir.dir_root_crc, name)?.is_some();
+		let (root, crc) = self.dir_tree_insert(dir.dir_root, dir.dir_root_crc, name, child)?;
 		dir.dir_root = root;
 		dir.dir_root_crc = crc;
 		if !existed {
@@ -116,8 +109,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if dir.kind != KIND_DIR {
 			return Err(FsError::NotFound);
 		}
-		let probe = dir_probe(name);
-		let (root, crc, removed) = self.tree_delete(dir.dir_root, dir.dir_root_crc, name_hash(name), &probe, DIR_REC, DIR_KEYLEN)?;
+		let (root, crc, removed) = self.dir_tree_delete(dir.dir_root, dir.dir_root_crc, name)?;
 		if !removed {
 			return Err(FsError::NotFound);
 		}
@@ -145,15 +137,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
-		let count = node_count(&buf);
 		if node_type(&buf) == NODE_LEAF {
-			for i in 0..count {
-				let off = NODE_HDR + i * DIR_REC;
-				let name = name_in(&buf[off + 8..off + 8 + NAME_MAX]).to_vec();
-				let inode = u32::from_le_bytes(buf[off + 8 + NAME_MAX..off + 8 + NAME_MAX + 4].try_into().unwrap());
-				out.push((name, inode));
+			for rec in dir_leaf_parse(&buf) {
+				out.push((rec.name, rec.child));
 			}
 		} else {
+			let count = node_count(&buf);
 			for i in 0..=count {
 				let cp = child_ptr(&buf, i);
 				let cc = child_crc(&buf, i);
@@ -161,6 +150,139 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 		}
 		Ok(())
+	}
+
+	// directory B+tree operations over variable-length leaf records. Internal nodes
+	// route by the u64 name hash exactly like every other tree (the shared absorb and
+	// collapse helpers apply); leaves hold DirRec records sorted by (hash, name) and are
+	// rewritten compactly on every change.
+
+	// Find `name`'s child inode in the tree rooted at (`root`, `root_crc`).
+	pub(crate) fn dir_tree_lookup(&mut self, root: u64, root_crc: u32, name: &[u8]) -> Result<Option<u32>, FsError> {
+		if root == 0 {
+			return Ok(None);
+		}
+		let hash = name_hash(name);
+		let mut ptr = root;
+		let mut crc = root_crc;
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		loop {
+			self.read_node(ptr, crc, &mut buf)?;
+			if node_type(&buf) == NODE_LEAF {
+				let recs = dir_leaf_parse(&buf);
+				return Ok(match dir_recs_search(&recs, hash, name) {
+					Ok(pos) => Some(recs[pos].child),
+					Err(_) => None,
+				});
+			}
+			let count = node_count(&buf);
+			let mut ci = 0;
+			while ci < count && sep_key(&buf, ci) <= hash {
+				ci += 1;
+			}
+			ptr = child_ptr(&buf, ci);
+			crc = child_crc(&buf, ci);
+		}
+	}
+
+	// Insert or repoint `name` -> `child`; returns the tree's new root.
+	pub(crate) fn dir_tree_insert(&mut self, root: u64, root_crc: u32, name: &[u8], child: u32) -> Result<(u64, u32), FsError> {
+		if root == 0 {
+			let blk = self.alloc_meta()?;
+			let mut buf = vec![0u8; BLOCK_SIZE];
+			dir_leaf_write(&mut buf, &[DirRec { hash: name_hash(name), name: name.to_vec(), child }]);
+			let crc = self.write_node_to(blk, &buf)?;
+			return Ok((blk, crc));
+		}
+		let outcome = self.dir_insert_node(root, root_crc, name, child)?;
+		self.settle_root(outcome)
+	}
+
+	pub(crate) fn dir_insert_node(&mut self, ptr: u64, crc: u32, name: &[u8], child: u32) -> Result<Ins, FsError> {
+		let hash = name_hash(name);
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		self.read_node(ptr, crc, &mut buf)?;
+		if node_type(&buf) == NODE_LEAF {
+			let mut recs = dir_leaf_parse(&buf);
+			match dir_recs_search(&recs, hash, name) {
+				Ok(pos) => recs[pos].child = child,
+				Err(pos) => recs.insert(pos, DirRec { hash, name: name.to_vec(), child }),
+			}
+			if dir_leaf_size(&recs) <= BLOCK_SIZE {
+				let dest = self.node_dest(ptr)?;
+				dir_leaf_write(&mut buf, &recs);
+				let ncrc = self.write_node_to(dest, &buf)?;
+				return Ok(Ins::Updated(dest, ncrc));
+			}
+			// overfull: split at a hash boundary near the byte midpoint (records sharing
+			// a hash must stay in one leaf, since internal nodes route by hash alone).
+			let split = dir_split_point(&recs);
+			let left_dest = self.node_dest(ptr)?;
+			let right_dest = self.alloc_meta()?;
+			let mut lbuf = vec![0u8; BLOCK_SIZE];
+			dir_leaf_write(&mut lbuf, &recs[..split]);
+			let mut rbuf = vec![0u8; BLOCK_SIZE];
+			dir_leaf_write(&mut rbuf, &recs[split..]);
+			let lcrc = self.write_node_to(left_dest, &lbuf)?;
+			let rcrc = self.write_node_to(right_dest, &rbuf)?;
+			return Ok(Ins::Split(left_dest, lcrc, recs[split].hash, right_dest, rcrc));
+		}
+		let count = node_count(&buf);
+		let mut ci = 0;
+		while ci < count && sep_key(&buf, ci) <= hash {
+			ci += 1;
+		}
+		let cp = child_ptr(&buf, ci);
+		let cc = child_crc(&buf, ci);
+		let outcome = self.dir_insert_node(cp, cc, name, child)?;
+		self.internal_absorb(&mut buf, ptr, ci, outcome)
+	}
+
+	// Delete `name`; returns the tree's new root and whether a record was removed.
+	pub(crate) fn dir_tree_delete(&mut self, root: u64, root_crc: u32, name: &[u8]) -> Result<(u64, u32, bool), FsError> {
+		if root == 0 {
+			return Ok((0, 0, false));
+		}
+		match self.dir_delete_node(root, root_crc, name)? {
+			Del::NotFound => Ok((root, root_crc, false)),
+			Del::Empty => Ok((0, 0, true)),
+			Del::Updated(p, c) => {
+				let (ptr, crc) = self.collapse_root(p, c)?;
+				Ok((ptr, crc, true))
+			}
+		}
+	}
+
+	pub(crate) fn dir_delete_node(&mut self, ptr: u64, crc: u32, name: &[u8]) -> Result<Del, FsError> {
+		let hash = name_hash(name);
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		self.read_node(ptr, crc, &mut buf)?;
+		if node_type(&buf) == NODE_LEAF {
+			let mut recs = dir_leaf_parse(&buf);
+			let pos = match dir_recs_search(&recs, hash, name) {
+				Ok(pos) => pos,
+				Err(_) => return Ok(Del::NotFound),
+			};
+			if recs.len() == 1 {
+				// the leaf empties: the parent drops it.
+				self.drop_block(ptr);
+				return Ok(Del::Empty);
+			}
+			recs.remove(pos);
+			let dest = self.node_dest(ptr)?;
+			dir_leaf_write(&mut buf, &recs);
+			let ncrc = self.write_node_to(dest, &buf)?;
+			return Ok(Del::Updated(dest, ncrc));
+		}
+		let count = node_count(&buf);
+		let mut ci = 0;
+		while ci < count && sep_key(&buf, ci) <= hash {
+			ci += 1;
+		}
+		let cp = child_ptr(&buf, ci);
+		let cc = child_crc(&buf, ci);
+		let outcome = self.dir_delete_node(cp, cc, name)?;
+		self.internal_absorb_del(&mut buf, ptr, ci, outcome)
 	}
 
 	// List directory `dir_num` as (name, size, is_dir) triples.
@@ -248,7 +370,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		let mut ptr = inode.spill;
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		while ptr != 0 {
+		while ptr != 0 && ptr < self.num_blocks {
 			set_bit(bitmap, ptr);
 			if !self.dev.read_block(ptr, &mut buf) {
 				return Err(FsError::Io);
@@ -257,6 +379,94 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		Ok(())
 	}
+}
+
+// One in-memory directory entry: the name's FNV-1a hash (the routing key), the name,
+// and the child inode. Leaves hold these sorted by (hash, name).
+pub(crate) struct DirRec {
+	pub(crate) hash: u64,
+	pub(crate) name: Vec<u8>,
+	pub(crate) child: u32,
+}
+
+// Parse a directory leaf's variable-length records: count in the node header, then
+// [hash u64][child u32][len u8][name] each, back to back.
+pub(crate) fn dir_leaf_parse(buf: &[u8]) -> Vec<DirRec> {
+	let count = node_count(buf);
+	let mut recs = Vec::with_capacity(count);
+	let mut off = NODE_HDR;
+	for _ in 0..count {
+		if off + DIR_REC_HDR > buf.len() {
+			break;
+		}
+		let hash = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+		let child = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
+		let len = buf[off + 12] as usize;
+		if off + DIR_REC_HDR + len > buf.len() {
+			break;
+		}
+		let name = buf[off + DIR_REC_HDR..off + DIR_REC_HDR + len].to_vec();
+		recs.push(DirRec { hash, name, child });
+		off += DIR_REC_HDR + len;
+	}
+	recs
+}
+
+// The serialized byte size of a leaf holding `recs`.
+pub(crate) fn dir_leaf_size(recs: &[DirRec]) -> usize {
+	NODE_HDR + recs.iter().map(|r| DIR_REC_HDR + r.name.len()).sum::<usize>()
+}
+
+// Serialize `recs` (sorted) into a leaf block, zero-padding the tail.
+pub(crate) fn dir_leaf_write(buf: &mut [u8], recs: &[DirRec]) {
+	for b in buf.iter_mut() {
+		*b = 0;
+	}
+	node_set_header(buf, NODE_LEAF, recs.len());
+	let mut off = NODE_HDR;
+	for r in recs {
+		buf[off..off + 8].copy_from_slice(&r.hash.to_le_bytes());
+		buf[off + 8..off + 12].copy_from_slice(&r.child.to_le_bytes());
+		buf[off + 12] = r.name.len() as u8;
+		buf[off + DIR_REC_HDR..off + DIR_REC_HDR + r.name.len()].copy_from_slice(&r.name);
+		off += DIR_REC_HDR + r.name.len();
+	}
+}
+
+// Binary-search `recs` (sorted by (hash, name)) for the entry named `name`.
+pub(crate) fn dir_recs_search(recs: &[DirRec], hash: u64, name: &[u8]) -> Result<usize, usize> {
+	recs.binary_search_by(|r| match r.hash.cmp(&hash) {
+		Ordering::Equal => r.name.as_slice().cmp(name),
+		other => other,
+	})
+}
+
+// Where to split an overfull leaf's records: the record index nearest the byte
+// midpoint, nudged so two records sharing a hash never straddle the split (the parent
+// routes by hash alone). Mirrors the fixed-record `leaf_split_point`.
+pub(crate) fn dir_split_point(recs: &[DirRec]) -> usize {
+	let total = dir_leaf_size(recs) - NODE_HDR;
+	let mut acc = 0usize;
+	let mut mid = recs.len() / 2;
+	for (i, r) in recs.iter().enumerate() {
+		acc += DIR_REC_HDR + r.name.len();
+		if acc * 2 >= total {
+			mid = (i + 1).min(recs.len() - 1);
+			break;
+		}
+	}
+	let mut up = mid.max(1);
+	while up < recs.len() && recs[up].hash == recs[up - 1].hash {
+		up += 1;
+	}
+	if up < recs.len() {
+		return up;
+	}
+	let mut down = mid;
+	while down > 1 && recs[down].hash == recs[down - 1].hash {
+		down -= 1;
+	}
+	down
 }
 
 // The name held in a directory record's NUL-padded name field: up to the first NUL.
@@ -277,30 +487,13 @@ pub(crate) fn name_hash(name: &[u8]) -> u64 {
 	h
 }
 
-// A directory probe key (the name hash then the NUL-padded name): the DIR_KEYLEN-byte
-// prefix a leaf record is matched against.
-pub(crate) fn dir_probe(name: &[u8]) -> Vec<u8> {
-	let mut probe = vec![0u8; DIR_KEYLEN];
-	probe[0..8].copy_from_slice(&name_hash(name).to_le_bytes());
-	probe[8..8 + name.len()].copy_from_slice(name);
-	probe
-}
-
-// A full directory leaf record: the (hash, NUL-padded name) key then the child inode.
-pub(crate) fn dir_record(name: &[u8], child: u32) -> Vec<u8> {
-	let mut rec = vec![0u8; DIR_REC];
-	rec[0..8].copy_from_slice(&name_hash(name).to_le_bytes());
-	rec[8..8 + name.len()].copy_from_slice(name);
-	rec[8 + NAME_MAX..8 + NAME_MAX + 4].copy_from_slice(&child.to_le_bytes());
-	rec
-}
-
 // Split a path into its validated segments. Each segment must be non-empty, no longer
 // than NAME_MAX, neither "." nor "..", and free of NUL bytes - so a resolved path can
-// never escape the volume or name an invalid entry. A portable-name policy is enforced
-// at this boundary: the cross-platform-unsafe set (`\ : * ? < > | "` and control bytes)
-// is rejected on top of `/` and NUL, so a LiberFS name moves cleanly to FAT / NTFS media
-// and other systems.
+// never escape the volume or name an invalid entry. Names must be valid UTF-8, so one
+// file has one name (no byte-soup aliases a rendering cannot distinguish); a
+// portable-name policy is enforced on top: the cross-platform-unsafe set
+// (`\ : * ? < > | "` and control bytes) is rejected beyond `/` and NUL, so a LiberFS
+// name moves cleanly to FAT / NTFS media and other systems.
 pub(crate) fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
 	if path.is_empty() {
 		return Err(FsError::Invalid);
@@ -312,6 +505,9 @@ pub(crate) fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
 		}
 		if seg.len() > NAME_MAX {
 			return Err(FsError::TooLong);
+		}
+		if core::str::from_utf8(seg).is_err() {
+			return Err(FsError::Invalid);
 		}
 		if seg.iter().any(|&c| !is_portable_name_byte(c)) {
 			return Err(FsError::Invalid);

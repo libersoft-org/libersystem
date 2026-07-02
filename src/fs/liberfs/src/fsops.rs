@@ -8,17 +8,26 @@ impl<D: BlockDevice> LiberFs<D> {
 	}
 
 	// Format `dev` as a fresh, empty LiberFS spanning `num_blocks` blocks (an empty root
-	// directory, no files), then return it mounted. Generation 0 lays out the two
-	// superblock slots and a single inode-tree leaf holding the root directory inode;
-	// everything else is the free pool. Inodes and directory nodes are allocated on
-	// demand thereafter, so a fresh volume reserves no fixed inode region.
-	pub fn format(mut dev: D, num_blocks: u64) -> Result<LiberFs<D>, FsError> {
+	// directory, no files), then return it mounted. Default options: a zero uuid, no
+	// label, compression off. Generation 0 lays out the two superblock slots and a
+	// single inode-tree leaf holding the root directory inode; everything else is the
+	// free pool. Inodes and directory nodes are allocated on demand thereafter, so a
+	// fresh volume reserves no fixed inode region.
+	pub fn format(dev: D, num_blocks: u64) -> Result<LiberFs<D>, FsError> {
+		Self::format_opts(dev, num_blocks, FormatOpts::default())
+	}
+
+	// `format` with explicit volume identity and the compression switch.
+	pub fn format_opts(mut dev: D, num_blocks: u64, opts: FormatOpts) -> Result<LiberFs<D>, FsError> {
 		// generation-0 layout: [slot 0][slot 1][inode-tree root leaf], then the free
 		// pool. The root directory inode starts empty (no entries, no B+tree yet).
 		if num_blocks <= POOL_START + 1 {
 			return Err(FsError::Invalid);
 		}
 		let leaf_block: u64 = POOL_START;
+		let mut label = [0u8; LABEL_MAX];
+		let take = opts.label.len().min(LABEL_MAX);
+		label[..take].copy_from_slice(&opts.label[..take]);
 
 		// the inode tree's sole leaf: one record keyed by inode 0 (the root directory).
 		let mut leaf = vec![0u8; BLOCK_SIZE];
@@ -33,7 +42,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// generation 0 in slot 0; slot 1 left invalid (zeroed) until the first commit
 		// ping-pongs onto it.
 		let zero = vec![0u8; BLOCK_SIZE];
-		let sb = Superblock { num_blocks, generation: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, root_inode: ROOT_INODE, snap_root: 0, snap_root_crc: 0 };
+		let sb = Superblock { num_blocks, generation: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, root_inode: ROOT_INODE, snap_root: 0, snap_root_crc: 0, uuid: opts.uuid, label, compress: opts.compress };
 		if !dev.write_block(0, &serialize_superblock(&sb)) {
 			return Err(FsError::Io);
 		}
@@ -45,7 +54,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Io);
 		}
 
-		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, uuid: opts.uuid, label, compress: opts.compress, clock: 0 };
 		fs.derive_free()?;
 		Ok(fs)
 	}
@@ -112,7 +121,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			None => (0, 0, false),
 		};
 
-		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest, uuid: sb.uuid, label: sb.label, compress: sb.compress, clock: 0 };
 		// a corrupt snapshot table degrades the mount to read-only instead of failing it:
 		// the pinned generations it named can no longer be reserved, so a commit could
 		// reuse their blocks - refusing every mutation keeps them (and the table block
@@ -130,6 +139,45 @@ impl<D: BlockDevice> LiberFs<D> {
 	// table)? Every mutation on a read-only mount fails with FsError::ReadOnly.
 	pub fn is_read_only(&self) -> bool {
 		self.read_only
+	}
+
+	// The volume's unique id, assigned at format time.
+	pub fn uuid(&self) -> [u8; 16] {
+		self.uuid
+	}
+
+	// The volume's label (the NUL padding stripped).
+	pub fn label(&self) -> &[u8] {
+		name_in(&self.label)
+	}
+
+	// Is transparent compression enabled for new whole-file writes?
+	pub fn compression(&self) -> bool {
+		self.compress
+	}
+
+	// Switch transparent compression on or off for the volume. Governs new whole-file
+	// writes only: existing extents keep their current form (a raw file compresses on
+	// its next whole-file rewrite; a compressed one stays readable and thaws on partial
+	// writes as always). Commits atomically like any mutation.
+	pub fn set_compression(&mut self, enabled: bool) -> Result<(), FsError> {
+		if self.compress == enabled {
+			return Ok(());
+		}
+		self.mutate(|fs| {
+			fs.compress = enabled;
+			Ok(())
+		})
+	}
+
+	// How many pool blocks are free right now (a popcount over the in-memory free map),
+	// and the pool's size: the `df` numbers, in blocks.
+	pub fn free_blocks(&self) -> u64 {
+		let mut used: u64 = 0;
+		for &byte in self.free.iter() {
+			used += byte.count_ones() as u64;
+		}
+		self.num_blocks - used
 	}
 
 	// Resolve a path to its inode number, or None if any segment is missing.
@@ -246,9 +294,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		self.release_run();
 
-		// transparently compress the freshly written runs: a run that shrinks is replaced
-		// by a compressed record, an incompressible one stays raw.
-		self.compress_inode(&mut inode)?;
+		// transparently compress the freshly written runs when the volume opted in: a
+		// run that shrinks is replaced by a compressed record, an incompressible one
+		// stays raw. With compression off (the default) every run stays raw.
+		if self.compress {
+			self.compress_inode(&mut inode)?;
+		}
 
 		// point the inode at the new blocks, then name it (new files only). The old
 		// inode and blocks are not freed here - the commit's previous generation keeps
@@ -312,7 +363,8 @@ impl<D: BlockDevice> LiberFs<D> {
 
 // Render a superblock to a fresh BLOCK_SIZE block. The self-CRC covers the whole
 // block with its own four bytes zeroed, so a torn write (any byte wrong) fails it on
-// mount and the slot is rejected.
+// mount and the slot is rejected. Bytes 72 onward are the second-revision fields:
+// the feature flags, the volume identity, and the algorithm/compression bytes.
 pub(crate) fn serialize_superblock(sb: &Superblock) -> Vec<u8> {
 	let mut block = vec![0u8; BLOCK_SIZE];
 	block[0..8].copy_from_slice(&MAGIC);
@@ -324,10 +376,15 @@ pub(crate) fn serialize_superblock(sb: &Superblock) -> Vec<u8> {
 	block[36..44].copy_from_slice(&sb.inode_root.to_le_bytes());
 	block[44..48].copy_from_slice(&sb.inode_root_crc.to_le_bytes());
 	block[52..56].copy_from_slice(&sb.root_inode.to_le_bytes());
-	// the snapshot-table pointer and its CRC32C sit past the self-CRC field, so they are
-	// covered by the whole-block checksum below.
+	// the fields past the self-CRC offset are covered by the whole-block checksum below.
 	block[60..68].copy_from_slice(&sb.snap_root.to_le_bytes());
 	block[68..72].copy_from_slice(&sb.snap_root_crc.to_le_bytes());
+	block[72..80].copy_from_slice(&FEATURES.to_le_bytes());
+	block[80..96].copy_from_slice(&sb.uuid);
+	block[96..96 + LABEL_MAX].copy_from_slice(&sb.label);
+	block[128] = CSUM_ALGO_CRC32C;
+	block[129] = CODEC_LZ4;
+	block[130] = sb.compress as u8;
 	// the CRC bytes are already zero; checksum the block and store it over them.
 	let crc = crc32c(&block);
 	block[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
@@ -335,8 +392,10 @@ pub(crate) fn serialize_superblock(sb: &Superblock) -> Vec<u8> {
 }
 
 // Parse and validate a superblock block: it must carry the LiberFS magic and version,
-// match this build's block size, and pass its own CRC32C. Returns None otherwise (an
-// unformatted slot, a foreign disk, or a torn commit).
+// match this build's block size, feature flags, and algorithm ids, and pass its own
+// CRC32C. Returns None otherwise (an unformatted slot, a foreign disk, a torn commit,
+// or a volume laid down by a build with a different layout or algorithms - which the
+// flags catch instead of a silent mis-parse).
 pub(crate) fn parse_superblock(block: &[u8]) -> Option<Superblock> {
 	if block.len() < BLOCK_SIZE {
 		return None;
@@ -350,6 +409,12 @@ pub(crate) fn parse_superblock(block: &[u8]) -> Option<Superblock> {
 	if u32::from_le_bytes(block[12..16].try_into().ok()?) != BLOCK_SIZE as u32 {
 		return None;
 	}
+	if u64::from_le_bytes(block[72..80].try_into().ok()?) != FEATURES {
+		return None;
+	}
+	if block[128] != CSUM_ALGO_CRC32C || block[129] != CODEC_LZ4 {
+		return None;
+	}
 	// verify the self-CRC by recomputing over the block with its CRC bytes zeroed.
 	let stored = u32::from_le_bytes(block[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].try_into().ok()?);
 	let mut probe = block[..BLOCK_SIZE].to_vec();
@@ -357,5 +422,9 @@ pub(crate) fn parse_superblock(block: &[u8]) -> Option<Superblock> {
 	if crc32c(&probe) != stored {
 		return None;
 	}
-	Some(Superblock { num_blocks: u64::from_le_bytes(block[16..24].try_into().ok()?), generation: u64::from_le_bytes(block[28..36].try_into().ok()?), inode_root: u64::from_le_bytes(block[36..44].try_into().ok()?), inode_root_crc: u32::from_le_bytes(block[44..48].try_into().ok()?), next_inode: u32::from_le_bytes(block[24..28].try_into().ok()?), root_inode: u32::from_le_bytes(block[52..56].try_into().ok()?), snap_root: u64::from_le_bytes(block[60..68].try_into().ok()?), snap_root_crc: u32::from_le_bytes(block[68..72].try_into().ok()?) })
+	let mut uuid = [0u8; 16];
+	uuid.copy_from_slice(&block[80..96]);
+	let mut label = [0u8; LABEL_MAX];
+	label.copy_from_slice(&block[96..96 + LABEL_MAX]);
+	Some(Superblock { num_blocks: u64::from_le_bytes(block[16..24].try_into().ok()?), generation: u64::from_le_bytes(block[28..36].try_into().ok()?), inode_root: u64::from_le_bytes(block[36..44].try_into().ok()?), inode_root_crc: u32::from_le_bytes(block[44..48].try_into().ok()?), next_inode: u32::from_le_bytes(block[24..28].try_into().ok()?), root_inode: u32::from_le_bytes(block[52..56].try_into().ok()?), snap_root: u64::from_le_bytes(block[60..68].try_into().ok()?), snap_root_crc: u32::from_le_bytes(block[68..72].try_into().ok()?), uuid, label, compress: block[130] != 0 })
 }
