@@ -455,6 +455,7 @@ interface system-graph {
 // System Graph folds into each node's counters and the `graph` command renders.
 record supervisor-stat {
 	name:           string,
+	state:          string,
 	restarts:       u32,
 	watchdog-trips: u32,
 	last-failure:   string,
@@ -488,6 +489,7 @@ enum capability {
 	permission, // a PermissionManager client (read the audit trail)
 	supervisor, // a ServiceManager admin channel (stop a running service)
 	volumes,   // the four volume StorageService clients (system + media + iso + udf), for the `lsvol` overview
+	services,  // a ServiceManager status client (list the managed services and their state), for the `lssvc` overview
 }
 
 // A component's permission manifest: its name and the exact set of capabilities it is

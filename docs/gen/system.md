@@ -296,6 +296,7 @@ An opaque kernel object, transferred as `handle<task>`.
 | field | type |
 | --- | --- |
 | `name` | `string` |
+| `state` | `string` |
 | `restarts` | `u32` |
 | `watchdog-trips` | `u32` |
 | `last-failure` | `string` |
@@ -318,6 +319,7 @@ An opaque kernel object, transferred as `handle<task>`.
 | `permission` | 11 |
 | `supervisor` | 12 |
 | `volumes` | 13 |
+| `services` | 14 |
 
 ### record `manifest`
 

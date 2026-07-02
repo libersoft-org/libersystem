@@ -1039,7 +1039,8 @@ exposes over its service ABI (DeviceService / SystemGraphService / ResourceManag
 - no command pokes hardware or the kernel directly; where the info is missing, the
 owning service gains a typed query first; each ships as a binary per M61.
 
-- [ ] `lspci`: enumerate the PCI bus (bus:dev.fn, vendor/device, class, the virtio-blk / net / sound / gpu functions) - the same scan the drivers bind against.
+- [x] `lspci`: enumerate the PCI bus (bus:dev.fn, vendor/device, class, the virtio-blk / net / sound / gpu functions) - the same scan the drivers bind against.
+  - Result: the kernel now retains the full boot bus scan - every present function with vendor/device id and class triple, not just the virtio/xHCI ones drivers bind - and exposes it over the new free syscall SYS_PCI_INFO. lspci is a zero-capability binary printing bus:dev.fn, vendor:device, class code and class name per function, as text or `json`; the hardware kernel test asserts the virtio functions appear.
 - [ ] `lsblk`: list block devices and their mounted volumes (the four virtio-blk disks, size, and `vol://system|media|iso|udf`).
 - [x] `lscpu`: report the architecture, online core count (SMP) and APIC ids.
   - Result: the kernel now retains each core's LAPIC id at SMP report-in (it was print-and-forget) and exposes the set over the new free syscall SYS_CPU_INFO; lscpu is a zero-capability binary printing the architecture, core count and per-core LAPIC ids as text or `json`.
@@ -1049,7 +1050,8 @@ owning service gains a typed query first; each ships as a binary per M61.
   - Result: the kernel retains the Limine memory map past init (the response was one-shot and discarded) as ABI MemmapRegion records with a stable kind mapping, walked over the new free syscall SYS_MEMMAP_GET (index in, region out, count returned). lsmem prints range, size and kind per region as text or `json`.
 - [x] `lsdev`: the device inventory (fold the existing `dev` into the `ls*` family or alias it).
   - Result: folded - the `dev` tool is renamed to `lsdev` outright (binary, permission manifest, shell dispatch and help), so the device inventory joins the `ls*` family and the old name is gone.
-- [ ] `lssvc`: registered system services and their state (drivers are services too, so they list here; an optional filter narrows to `driver.*`) - a filtered view of the processes shown by `ps`.
+- [x] `lssvc`: registered system services and their state (drivers are services too, so they list here; an optional filter narrows to `driver.*`) - a filtered view of the processes shown by `ps`.
+  - Result: the `supervisor` interface's supervisor-stat gained a `state` field (pending/running/stopped/failed from the supervisor's live table), and the status view now also lists the drivers DeviceManager launched (driver.virtio_blk/net/gpu/snd/input, driver.xhci - running once their channel arrived, pending otherwise). ServiceManager mints a dedicated status channel PermissionManager grants under the new `services` capability; lssvc queries it and prints every entry (typed to_text/to_json), with an optional name-prefix filter (`lssvc driver.`) and `json` form.
 - [x] `lsirq`: the APIC / IRQ vectors and their virtio MSI-X mappings.
   - Result: the kernel now records which discovered device each MSI-X slot was acquired for (cleared on unbind) and reports both vector windows - fixed INTx and MSI-X - over the new free syscall SYS_IRQ_INFO. lsirq prints every vector in use, resolving an MSI-X owner to its device index and type (virtio-net, xhci, ...) via the free device-info query, as text or `json`; the kernel timer's dedicated gate is reported explicitly.
 - [ ] `lsusb`: enumerate USB devices off the M62 stack (xHCI keyboard / mass storage).

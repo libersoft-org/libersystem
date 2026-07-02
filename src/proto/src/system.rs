@@ -3397,6 +3397,7 @@ pub mod system_graph {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SupervisorStat {
 	pub name: String,
+	pub state: String,
 	pub restarts: u32,
 	pub watchdog_trips: u32,
 	pub last_failure: String,
@@ -3418,6 +3419,7 @@ impl SupervisorStat {
 	}
 	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
+		w.bytes_lp(self.state.as_bytes())?;
 		w.u32(self.restarts)?;
 		w.u32(self.watchdog_trips)?;
 		w.bytes_lp(self.last_failure.as_bytes())?;
@@ -3425,10 +3427,11 @@ impl SupervisorStat {
 	}
 	pub(crate) fn read(r: &mut Reader) -> Option<SupervisorStat> {
 		let name = r.string_lp()?;
+		let state = r.string_lp()?;
 		let restarts = r.u32()?;
 		let watchdog_trips = r.u32()?;
 		let last_failure = r.string_lp()?;
-		Some(SupervisorStat { name, restarts, watchdog_trips, last_failure })
+		Some(SupervisorStat { name, state, restarts, watchdog_trips, last_failure })
 	}
 }
 
@@ -3542,6 +3545,7 @@ pub enum Capability {
 	Permission = 11,
 	Supervisor = 12,
 	Volumes = 13,
+	Services = 14,
 }
 
 impl Capability {
@@ -3577,6 +3581,7 @@ impl Capability {
 			11 => Some(Capability::Permission),
 			12 => Some(Capability::Supervisor),
 			13 => Some(Capability::Volumes),
+			14 => Some(Capability::Services),
 			_ => None,
 		}
 	}
@@ -6564,6 +6569,9 @@ impl SupervisorStat {
 		out.push_str("\"name\":");
 		crate::codec::json_escape(&self.name, out);
 		out.push(',');
+		out.push_str("\"state\":");
+		crate::codec::json_escape(&self.state, out);
+		out.push(',');
 		out.push_str("\"restarts\":");
 		let _ = write!(out, "{}", self.restarts);
 		out.push(',');
@@ -6579,6 +6587,9 @@ impl SupervisorStat {
 		out.push_str("name=");
 		out.push_str(&self.name);
 		out.push_str(", ");
+		out.push_str("state=");
+		out.push_str(&self.state);
+		out.push_str(", ");
 		out.push_str("restarts=");
 		let _ = write!(out, "{}", self.restarts);
 		out.push_str(", ");
@@ -6590,9 +6601,11 @@ impl SupervisorStat {
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "state");
+		crate::codec::cbor::text(out, &self.state);
 		crate::codec::cbor::text(out, "restarts");
 		crate::codec::cbor::uint(out, self.restarts as u64);
 		crate::codec::cbor::text(out, "watchdog-trips");
@@ -6634,6 +6647,7 @@ impl Capability {
 			Capability::Permission => out.push_str("\"permission\""),
 			Capability::Supervisor => out.push_str("\"supervisor\""),
 			Capability::Volumes => out.push_str("\"volumes\""),
+			Capability::Services => out.push_str("\"services\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -6652,6 +6666,7 @@ impl Capability {
 			Capability::Permission => out.push_str("permission"),
 			Capability::Supervisor => out.push_str("supervisor"),
 			Capability::Volumes => out.push_str("volumes"),
+			Capability::Services => out.push_str("services"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -6670,6 +6685,7 @@ impl Capability {
 			Capability::Permission => crate::codec::cbor::text(out, "permission"),
 			Capability::Supervisor => crate::codec::cbor::text(out, "supervisor"),
 			Capability::Volumes => crate::codec::cbor::text(out, "volumes"),
+			Capability::Services => crate::codec::cbor::text(out, "services"),
 		}
 	}
 }
@@ -7373,9 +7389,9 @@ mod compat {
 	}
 	#[test]
 	fn supervisor_stat_wire_is_stable() {
-		let sample = SupervisorStat { name: String::from("x"), restarts: 7, watchdog_trips: 7, last_failure: String::from("x") };
+		let sample = SupervisorStat { name: String::from("x"), state: String::from("x"), restarts: 7, watchdog_trips: 7, last_failure: String::from("x") };
 		let bytes = sample.encode_vec();
-		let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120];
+		let golden: &[u8] = &[1, 0, 120, 1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120];
 		assert_eq!(bytes, golden);
 		assert_eq!(SupervisorStat::decode(&bytes).unwrap(), sample);
 	}

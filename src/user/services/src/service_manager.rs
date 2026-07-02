@@ -211,13 +211,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// bootstraps.
 	let mut admin_server2: u64 = 0;
 	let mut stats_server: u64 = 0;
+	// A second supervisor-status channel: the one PermissionManager grants to the sandboxed
+	// `lssvc` command (the services capability), so `lssvc` run as its own ELF queries the
+	// supervisor's typed status view. The supervisor keeps this server end and stands on it
+	// alongside SystemGraphService's in the supervise loop; minted when PermissionManager
+	// bootstraps.
+	let mut stats_server2: u64 = 0;
 	loop {
 		let mut progress: bool = false;
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -237,6 +243,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			break;
 		}
 	}
+
+	// The drivers' online facts, snapshotted after bring-up: a non-zero client channel
+	// means the driver came up and handed its channel over (DeviceManager launched it and
+	// it reported in). Folded into the supervisor's status view, so `lssvc` lists the
+	// drivers alongside the managed services - drivers are services too.
+	let driver_state: [(&'static [u8], bool); 6] = [(b"driver.virtio_blk", block_client != 0), (b"driver.virtio_net", net_frames != 0), (b"driver.virtio_gpu", gpu_client != 0), (b"driver.virtio_snd", snd_client != 0), (b"driver.virtio_input", input_raw != 0), (b"driver.xhci", block5_client != 0)];
 
 	// 3. exercise the stop path on a leaf service. DeviceManager is the safe choice:
 	//    nothing depends on it, so stopping it does not tear down the running system
@@ -319,7 +331,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    (reverse-dependency teardown), or SystemGraphService querying the supervisor state.
 	//    No timer stands here, so the loop sleeps at ~0% CPU until an event arrives.
 	unsafe {
-		supervise(&mut state, &mut channels, &mut sup, &procs, &package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, admin_server, admin_server2, stats_server, log_client, bootstrap, park, &mut buf);
+		supervise(&mut state, &mut channels, &mut sup, &procs, &package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, admin_server, admin_server2, stats_server, stats_server2, &driver_state, log_client, bootstrap, park, &mut buf);
 	}
 	exit();
 }
@@ -440,7 +452,7 @@ unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -513,7 +525,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
 			return State::Failed;
 		}
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *res_client, *process_client, perm_client, admin_server2) {
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *res_client, *process_client, perm_client, admin_server2, stats_server2) {
 			return State::Failed;
 		}
 		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, pkg_handle, pkg_len, buf) {
@@ -815,7 +827,7 @@ unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], st
 // narrower client to each component it sandboxes. (The grantable permission capability - a
 // connection to the manager's own serve channel - is not passed here: the manager mints that
 // self-connection itself.)
-unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, resource_client: u64, process_client: u64, perm_client: &mut u64, admin_server2: &mut u64) -> bool {
+unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, resource_client: u64, process_client: u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
 	unsafe {
 		// A fresh StorageService connection for the manager (independent of the shell's),
 		// duplicable so the manager can grant a narrowed copy to a sandboxed component.
@@ -933,6 +945,19 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 		if !send_blocking(manager_side, b"STORAGE_USB", usb_conn) {
 			return false;
 		}
+		// A fresh supervisor-status channel the manager grants to the governed `lssvc` command
+		// (whose manifest grants services): the supervisor keeps the server end (in
+		// `*stats_server2`) and serves the `supervisor` interface on it alongside
+		// SystemGraphService's, while the client end is handed to the manager. A dedicated
+		// channel, so a granted tool's queries never race the graph's.
+		let (status_srv, status_cli): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"SERVICES", status_cli) {
+			return false;
+		}
+		*stats_server2 = status_srv;
 		// A fresh ProcessService connection the manager drives to load the components it
 		// governs - the loading mechanism, kept separate from the granting policy.
 		let proc_conn: u64 = match service_connect(process_client) {
@@ -1368,15 +1393,16 @@ unsafe fn sleep_ticks(park: u64, ticks: u64) {
 // wait set so its dead channel does not busy-loop); an admin message drives a reverse-
 // dependency stop; a stats request is answered over the `supervisor` interface. Returns
 // when nothing is left to watch.
-unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], package: &Package, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, admin_server: u64, admin_server2: u64, stats_server: u64, log_client: u64, up: u64, park: u64, buf: &mut [u8]) {
+unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], package: &Package, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, admin_server: u64, admin_server2: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, up: u64, park: u64, buf: &mut [u8]) {
 	unsafe {
 		let mut admin: u64 = admin_server;
 		let mut admin2: u64 = admin_server2;
 		let mut stats: u64 = stats_server;
+		let mut stats2: u64 = stats_server2;
 		loop {
-			let mut handles: [u64; N + 4] = [0u64; N + 4];
-			let mut kinds: [u8; N + 4] = [0u8; N + 4];
-			let mut idxs: [usize; N + 4] = [0usize; N + 4];
+			let mut handles: [u64; N + 5] = [0u64; N + 5];
+			let mut kinds: [u8; N + 5] = [0u8; N + 5];
+			let mut idxs: [usize; N + 5] = [0usize; N + 5];
 			let mut count: usize = 0;
 			let mut i: usize = 0;
 			while i < N {
@@ -1406,6 +1432,11 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 			if admin2 != 0 {
 				handles[count] = admin2;
 				kinds[count] = 4;
+				count += 1;
+			}
+			if stats2 != 0 {
+				handles[count] = stats2;
+				kinds[count] = 5;
 				count += 1;
 			}
 			if count == 0 {
@@ -1446,15 +1477,22 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 				}
 				3 => {
 					// SystemGraphService queried the supervisor state; answer one request.
-					if !serve_stats_once(stats, sup, canary_sup, buf) {
+					if !serve_stats_once(stats, state, sup, canary_sup, drivers, buf) {
 						stats = 0;
 					}
 				}
-				_ => {
+				4 => {
 					// The sandboxed `stop` tool (granted the supervisor capability) asked to
 					// stop a service over its own admin channel; tear down its dependents first.
 					if !handle_admin(admin2, state, channels, sup, procs, log_client, up, buf) {
 						admin2 = 0;
+					}
+				}
+				_ => {
+					// The sandboxed `lssvc` tool (granted the services capability) queried the
+					// supervisor state over its own status channel; answer one request.
+					if !serve_stats_once(stats2, state, sup, canary_sup, drivers, buf) {
+						stats2 = 0;
 					}
 				}
 			}
@@ -1598,17 +1636,18 @@ fn index_of_dep(j: usize, i: usize) -> bool {
 	false
 }
 
-// Answer one request on the supervisor stats channel from SystemGraphService: decode it,
-// build the per-component status list (restarts, watchdog trips, last failure for each
-// manifest service plus the canary), and reply over the `supervisor` interface. Returns
-// false once the channel's peer is gone, so the supervisor drops it from its wait set.
-unsafe fn serve_stats_once(stats: u64, sup: &[Supervised; N], canary_sup: &Supervised, buf: &mut [u8]) -> bool {
+// Answer one request on a supervisor stats channel (SystemGraphService's, or the
+// sandboxed `lssvc` tool's): decode it, build the per-component status list (state,
+// restarts, watchdog trips, last failure for each manifest service, the canary, and
+// each driver), and reply over the `supervisor` interface. Returns false once the
+// channel's peer is gone, so the supervisor drops it from its wait set.
+unsafe fn serve_stats_once(stats: u64, state: &[State; N], sup: &[Supervised; N], canary_sup: &Supervised, drivers: &[(&'static [u8], bool)], buf: &mut [u8]) -> bool {
 	unsafe {
 		let (len, handle): (usize, u64) = match recv_blocking(stats, buf) {
 			Received::Message { len, handle } => (len, handle),
 			Received::Closed => return false,
 		};
-		let mut api = StatsApi { sup, canary_sup };
+		let mut api = StatsApi { state, sup, canary_sup, drivers };
 		let mut reply: [u8; 2048] = [0u8; 2048];
 		let mut reply_handle: u64 = 0;
 		if let Some(n) = supervisor::dispatch(&mut api, &buf[..len], handle, &mut reply, &mut reply_handle) {
@@ -1618,10 +1657,22 @@ unsafe fn serve_stats_once(stats: u64, sup: &[Supervised; N], canary_sup: &Super
 	}
 }
 
+// The name of a service's lifecycle state, as the status view reports it.
+fn state_name(state: State) -> &'static str {
+	match state {
+		State::Pending => "pending",
+		State::Running => "running",
+		State::Stopped => "stopped",
+		State::Failed => "failed",
+	}
+}
+
 // The supervisor's view of its own bookkeeping, served over the `supervisor` interface.
 struct StatsApi<'a> {
+	state: &'a [State; N],
 	sup: &'a [Supervised; N],
 	canary_sup: &'a Supervised,
+	drivers: &'a [(&'static [u8], bool)],
 }
 
 impl<'a> supervisor::Service for StatsApi<'a> {
@@ -1629,10 +1680,16 @@ impl<'a> supervisor::Service for StatsApi<'a> {
 		let mut out: Vec<SupervisorStat> = Vec::new();
 		let mut i: usize = 0;
 		while i < N {
-			out.push(SupervisorStat { name: String::from_utf8_lossy(MANIFEST[i].name).into_owned(), restarts: self.sup[i].restarts, watchdog_trips: self.sup[i].watchdog_trips, last_failure: String::from_utf8_lossy(self.sup[i].failure.as_bytes()).into_owned() });
+			out.push(SupervisorStat { name: String::from_utf8_lossy(MANIFEST[i].name).into_owned(), state: String::from(state_name(self.state[i])), restarts: self.sup[i].restarts, watchdog_trips: self.sup[i].watchdog_trips, last_failure: String::from_utf8_lossy(self.sup[i].failure.as_bytes()).into_owned() });
 			i += 1;
 		}
-		out.push(SupervisorStat { name: String::from("watchdog_probe"), restarts: self.canary_sup.restarts, watchdog_trips: self.canary_sup.watchdog_trips, last_failure: String::from_utf8_lossy(self.canary_sup.failure.as_bytes()).into_owned() });
+		out.push(SupervisorStat { name: String::from("watchdog_probe"), state: String::from("running"), restarts: self.canary_sup.restarts, watchdog_trips: self.canary_sup.watchdog_trips, last_failure: String::from_utf8_lossy(self.canary_sup.failure.as_bytes()).into_owned() });
+		// Drivers are services too: DeviceManager launches them and each hands its channel
+		// over when it reports in, so a driver whose channel arrived is running and one
+		// that never reported is pending (absent hardware, or not launched this boot).
+		for &(name, online) in self.drivers {
+			out.push(SupervisorStat { name: String::from_utf8_lossy(name).into_owned(), state: String::from(if online { "running" } else { "pending" }), restarts: 0, watchdog_trips: 0, last_failure: String::new() });
+		}
 		Ok(out)
 	}
 }

@@ -41,8 +41,19 @@ pub struct DeviceEntry {
 
 static DEVICES: SpinLock<Vec<DeviceEntry>> = SpinLock::new(Vec::new());
 
+// The full boot PCI scan - every present function, not just the virtio / xHCI ones
+// drivers bind - retained so the bus stays inspectable at runtime. SYS_PCI_INFO
+// reads it for `lspci`.
+static PCI_FUNCTIONS: SpinLock<Vec<abi::PciInfo>> = SpinLock::new(Vec::new());
+
 // Populate the table from a PCI scan. Called once at boot, after the heap is up.
 pub fn init() {
+	let mut functions = PCI_FUNCTIONS.lock();
+	functions.clear();
+	for p in crate::arch::pci::scan() {
+		functions.push(abi::PciInfo { vendor: p.vendor, device: p.device_id, class: p.class, subclass: p.subclass, prog_if: p.prog_if, bus: p.bus, dev: p.dev, func: p.func, _pad: 0 });
+	}
+	drop(functions);
 	let mut table = DEVICES.lock();
 	table.clear();
 	for v in crate::arch::pci::scan_virtio() {
@@ -65,6 +76,16 @@ pub fn init() {
 // The number of discovered devices.
 pub fn count() -> usize {
 	DEVICES.lock().len()
+}
+
+// The number of retained PCI functions.
+pub fn pci_count() -> usize {
+	PCI_FUNCTIONS.lock().len()
+}
+
+// One retained PCI function by index.
+pub fn pci_get(index: usize) -> Option<abi::PciInfo> {
+	PCI_FUNCTIONS.lock().get(index).copied()
 }
 
 // Run `f` against the device at `index`, returning None if it is out of range. The

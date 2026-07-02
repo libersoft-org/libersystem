@@ -126,6 +126,11 @@ pub const SYS_MEMMAP_GET: u64 = 56;
 // buffer, returning the vector count: the fixed INTx window first, then the MSI-X
 // window with the owning device's index. A free syscall feeding `lsirq`.
 pub const SYS_IRQ_INFO: u64 = 57;
+// Read one PCI function's identity (a PciInfo) by index into the caller's buffer,
+// returning the function count - ERR_INVALID past the end. The kernel retains the
+// full boot bus scan (every present function, not just the ones drivers bind), so
+// the bus stays inspectable. A free syscall feeding `lspci`.
+pub const SYS_PCI_INFO: u64 = 58;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;
@@ -324,6 +329,23 @@ pub const IRQ_KIND_FIXED: u32 = 0;
 pub const IRQ_KIND_MSI: u32 = 1;
 // IrqInfo::device when no device owns the vector.
 pub const IRQ_NO_DEVICE: u32 = u32::MAX;
+
+// One PCI function's identity pci_info writes into the caller's buffer: its bus
+// address, vendor and device ids, and class triple - the boot bus scan the kernel
+// retains in full. repr(C) so both sides agree byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PciInfo {
+	pub vendor: u16,
+	pub device: u16,
+	pub class: u8,
+	pub subclass: u8,
+	pub prog_if: u8,
+	pub bus: u8,
+	pub dev: u8,
+	pub func: u8,
+	pub _pad: u16,
+}
 
 // Error codes (Linux-style: a successful call returns its value, an error returns
 // a small negative in the reserved band [-4095, -1]).

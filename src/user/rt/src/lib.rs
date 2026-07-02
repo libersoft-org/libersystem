@@ -753,6 +753,12 @@ pub unsafe fn irq_info(index: u64, info: &mut IrqInfo) -> i64 {
 	unsafe { syscall(SYS_IRQ_INFO, index, info as *mut IrqInfo as u64, core::mem::size_of::<IrqInfo>() as u64, 0) as i64 }
 }
 
+// Read the retained PCI function at `index` into `info`, returning the function
+// count (negative past the end). A free syscall feeding the `lspci` command.
+pub unsafe fn pci_info(index: u64, info: &mut PciInfo) -> i64 {
+	unsafe { syscall(SYS_PCI_INFO, index, info as *mut PciInfo as u64, core::mem::size_of::<PciInfo>() as u64, 0) as i64 }
+}
+
 // Arm this process to catch Ctrl+C (SIG_INT): once armed, an interrupt sets a pending
 // flag `interrupted()` polls instead of terminating us, so a long-running tool can
 // stop cleanly and print a summary. Ctrl+\ (SIG_TERM) still force-quits.

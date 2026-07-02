@@ -117,6 +117,14 @@ name = "lsirq"
 path = "src/lsirq.rs"
 
 [[bin]]
+name = "lspci"
+path = "src/lspci.rs"
+
+[[bin]]
+name = "lssvc"
+path = "src/lssvc.rs"
+
+[[bin]]
 name = "ping"
 path = "src/ping.rs"
 

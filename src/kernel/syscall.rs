@@ -44,7 +44,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -64,9 +64,9 @@ pub use abi::ProcessStats;
 pub use abi::DomainStats;
 
 // The hardware-inventory records filled by cpu_info / memory_stats / memmap_get /
-// irq_info. Defined in `abi` (the SSOT shared with userspace) and re-exported here
-// next to their syscalls.
-pub use abi::{IrqInfo, MemmapRegion, MemoryStats};
+// irq_info / pci_info. Defined in `abi` (the SSOT shared with userspace) and
+// re-exported here next to their syscalls.
+pub use abi::{IrqInfo, MemmapRegion, MemoryStats, PciInfo};
 
 // Validate a caller-supplied buffer. Always accepts kernel self-calls; for a
 // ring-3 caller it requires the whole [ptr, ptr+len) range to lie in user space
@@ -250,6 +250,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_MEMORY_STATS => sys_memory_stats(a0, a1),
 		SYS_MEMMAP_GET => sys_memmap_get(a0, a1, a2),
 		SYS_IRQ_INFO => sys_irq_info(a0, a1, a2),
+		SYS_PCI_INFO => sys_pci_info(a0, a1, a2),
 		SYS_YIELD => {
 			sched::yield_now();
 			0
@@ -460,6 +461,25 @@ fn sys_irq_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 		(buf_ptr as *mut IrqInfo).write_unaligned(info);
 	}
 	arch::interrupts::irq_info_len() as i64
+}
+
+// Copy the retained PCI function at `index` into the caller's buffer (a PciInfo),
+// returning the function count - ERR_INVALID past the end. The kernel keeps the
+// full boot bus scan, so every present function is reported, not just the ones
+// drivers bind. A free syscall feeding the `lspci` command.
+fn sys_pci_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+	let info = match device::pci_get(index as usize) {
+		Some(p) => p,
+		None => return ERR_INVALID,
+	};
+	let size = core::mem::size_of::<PciInfo>() as u64;
+	if buf_len < size || !user_buf_ok(buf_ptr, size) {
+		return ERR_INVALID;
+	}
+	unsafe {
+		(buf_ptr as *mut PciInfo).write_unaligned(info);
+	}
+	device::pci_count() as i64
 }
 
 // Map a DeviceMemory's physical MMIO region into the caller's address space,

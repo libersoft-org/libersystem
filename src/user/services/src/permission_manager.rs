@@ -85,7 +85,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // client only for the ones the supervisor wired it (the rest stay 0 - declared in the
 // vocabulary, not yet grantable - so a manifest naming them records the decision but hands
 // over nothing).
-const VOCABULARY: [Capability; 14] = [Capability::Storage, Capability::Log, Capability::Network, Capability::Device, Capability::Config, Capability::Time, Capability::Audio, Capability::Input, Capability::Graph, Capability::Resource, Capability::Process, Capability::Permission, Capability::Supervisor, Capability::Volumes];
+const VOCABULARY: [Capability; 15] = [Capability::Storage, Capability::Log, Capability::Network, Capability::Device, Capability::Config, Capability::Time, Capability::Audio, Capability::Input, Capability::Graph, Capability::Resource, Capability::Process, Capability::Permission, Capability::Supervisor, Capability::Volumes, Capability::Services];
 
 // The manager's policy: the permission manifest declared for each component it governs -
 // the typed source of truth for what that component may be granted.
@@ -112,6 +112,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"perm" => Some(Manifest { component: String::from("perm"), grants: alloc::vec![Capability::Permission] }),
 		b"stop" => Some(Manifest { component: String::from("stop"), grants: alloc::vec![Capability::Supervisor] }),
 		b"lsvol" => Some(Manifest { component: String::from("lsvol"), grants: alloc::vec![Capability::Volumes] }),
+		b"lssvc" => Some(Manifest { component: String::from("lssvc"), grants: alloc::vec![Capability::Services] }),
 		// The inventory commands need no capability at all: the system identity and the
 		// uptime are compile-time / free-syscall data, and the boot log, CPU set, memory
 		// totals, memory map and vector table are read over their own free syscalls -
@@ -123,6 +124,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"free" => Some(Manifest { component: String::from("free"), grants: alloc::vec![] }),
 		b"lsmem" => Some(Manifest { component: String::from("lsmem"), grants: alloc::vec![] }),
 		b"lsirq" => Some(Manifest { component: String::from("lsirq"), grants: alloc::vec![] }),
+		b"lspci" => Some(Manifest { component: String::from("lspci"), grants: alloc::vec![] }),
 		_ => None,
 	}
 }
@@ -167,6 +169,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		// own per-volume tags (see `grant_volumes`), so this single tag is never sent - it only
 		// keeps the match total for the bundling capability.
 		Capability::Volumes => b"VOLUMES",
+		Capability::Services => b"SERVICES",
 	}
 }
 
@@ -185,6 +188,9 @@ struct Clients {
 	process: u64,
 	permission: u64,
 	supervisor: u64,
+	// The supervisor-status client bundled under the `services` capability for the `lssvc`
+	// overview - a dedicated ServiceManager status channel, separate from the graph's.
+	services: u64,
 	// The four non-system volume StorageService clients, bundled with `storage` (the system
 	// volume) under the `volumes` capability for the `lsvol` overview.
 	storage_media: u64,
@@ -210,6 +216,7 @@ impl Clients {
 			Capability::Process => self.process,
 			Capability::Permission => self.permission,
 			Capability::Supervisor => self.supervisor,
+			Capability::Services => self.services,
 			// The `volumes` capability has no single representative client - it is granted as a
 			// bundle of five channels by `grant_volumes`, never through this single-channel path.
 			// The system volume stands in here for the (headless-denied) dynamic-request path.
@@ -495,6 +502,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let storage_iso: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_ISO") }.unwrap_or(0);
 	let storage_udf: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_UDF") }.unwrap_or(0);
 	let storage_usb: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_USB") }.unwrap_or(0);
+	// The supervisor-status channel the manager grants to the governed `lssvc` command
+	// (whose manifest grants services): a dedicated ServiceManager status channel, separate
+	// from SystemGraphService's, the manager holds but never drives itself.
+	let services: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVICES") }.unwrap_or(0);
 	// Mint the manager's self-connection: a dedicated channel pair whose server end is seeded
 	// into the serve set below (so requests on it are dispatched like any other client's) and
 	// whose client end the manager holds as the grantable `permission` capability. The governed
@@ -502,7 +513,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| exit());
-	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, storage_media, storage_iso, storage_udf, storage_usb };
+	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, storage_media, storage_iso, storage_udf, storage_usb };
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
 
 	// 2. wait for the serve channel clients reach us on.
