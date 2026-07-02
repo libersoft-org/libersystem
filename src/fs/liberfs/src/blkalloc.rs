@@ -240,17 +240,27 @@ impl<D: BlockDevice> LiberFs<D> {
 	// sentinel) is copied up to a fresh block (data low, metadata high) and the old
 	// contents copied into it (or zeroed), so the committed generation keeps the
 	// original untouched - and the original is recorded dropped, since the new
-	// generation references the copy instead.
+	// generation references the copy instead. The copy rides the reusable scratch
+	// buffer: this runs once per overwritten block, so it must not allocate.
 	pub(crate) fn cow_block(&mut self, ptr: u64, meta: bool) -> Result<u64, FsError> {
 		if ptr != 0 && self.fresh.contains(&ptr) {
 			return Ok(ptr);
 		}
 		let fresh = self.alloc_block(meta)?;
-		let mut buf = vec![0u8; BLOCK_SIZE];
-		if ptr != 0 && !self.read_block_csum_aware(ptr, &mut buf) {
-			return Err(FsError::Io);
+		let mut buf = core::mem::take(&mut self.scratch);
+		if buf.len() != BLOCK_SIZE {
+			buf = vec![0u8; BLOCK_SIZE];
 		}
-		if !self.dev.write_block(fresh, &buf) {
+		let ok = if ptr != 0 {
+			self.read_block_csum_aware(ptr, &mut buf)
+		} else {
+			// the scratch may hold a previous copy: the unmapped sentinel means zeros.
+			buf.fill(0);
+			true
+		};
+		let ok = ok && self.dev.write_block(fresh, &buf);
+		self.scratch = buf;
+		if !ok {
 			return Err(FsError::Io);
 		}
 		self.drop_block(ptr);
@@ -697,7 +707,11 @@ pub(crate) fn clear_bit(bitmap: &mut [u8], b: u64) {
 
 pub(crate) fn test_bit(bitmap: &[u8], b: u64) -> bool {
 	let i = (b / 8) as usize;
-	if i < bitmap.len() { bitmap[i] & (1 << (b % 8)) != 0 } else { true }
+	if i < bitmap.len() {
+		bitmap[i] & (1 << (b % 8)) != 0
+	} else {
+		true
+	}
 }
 
 // Index of the extent covering logical block `lb`, or None if it falls in a hole. The
@@ -708,7 +722,11 @@ pub(crate) fn find_extent(extents: &[Extent], lb: u64) -> Option<usize> {
 	if pos == 0 {
 		return None;
 	}
-	if extents[pos - 1].covers(lb) { Some(pos - 1) } else { None }
+	if extents[pos - 1].covers(lb) {
+		Some(pos - 1)
+	} else {
+		None
+	}
 }
 
 // Hash the 4-byte prefix at `w` into an LZ_HASH_BITS-wide match-finder bucket.

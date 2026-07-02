@@ -59,13 +59,13 @@ impl<D: BlockDevice> LiberFs<D> {
 			if crc32c(&buf) != crc {
 				return Err(FsError::Corrupt);
 			}
-			let count = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+			let count = u32::from_le_bytes(buf[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].try_into().unwrap()) as usize;
 			for i in 0..count {
 				let off = EXTENT_HDR + i * EXTENT_SIZE;
 				inode.extents.push(Extent::parse(&buf[off..off + EXTENT_SIZE]));
 			}
-			ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-			crc = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+			ptr = u64::from_le_bytes(buf[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].try_into().unwrap());
+			crc = u32::from_le_bytes(buf[CHAIN_CRC_OFF..CHAIN_CRC_OFF + 4].try_into().unwrap());
 		}
 		Ok(())
 	}
@@ -100,9 +100,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		for chunk in spilled.chunks(EXTENTS_PER_BLOCK).rev() {
 			let blk = self.alloc_meta()?;
 			let mut buf = vec![0u8; BLOCK_SIZE];
-			buf[0..8].copy_from_slice(&next_ptr.to_le_bytes());
-			buf[8..12].copy_from_slice(&next_crc.to_le_bytes());
-			buf[12..16].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+			buf[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].copy_from_slice(&next_ptr.to_le_bytes());
+			buf[CHAIN_CRC_OFF..CHAIN_CRC_OFF + 4].copy_from_slice(&next_crc.to_le_bytes());
+			buf[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
 			for (i, ext) in chunk.iter().enumerate() {
 				let off = EXTENT_HDR + i * EXTENT_SIZE;
 				ext.write(&mut buf[off..off + EXTENT_SIZE]);

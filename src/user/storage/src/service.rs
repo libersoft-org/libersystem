@@ -504,7 +504,9 @@ fn map_fs_err(e: FsError) -> Error {
 	match e {
 		FsError::NotFound => Error::NotFound,
 		FsError::NoSpace => Error::Again,
-		FsError::TooLong | FsError::Invalid => Error::Invalid,
+		// the malformed-request family: bad or overlong names, wrong kinds, a non-empty
+		// directory, a duplicate snapshot name, an impossible operation.
+		FsError::TooLong | FsError::BadName | FsError::IsDir | FsError::NotDir | FsError::NotEmpty | FsError::Exists | FsError::Invalid => Error::Invalid,
 		// on-disk corruption caught by a block checksum: the data cannot be trusted.
 		FsError::Corrupt => Error::Invalid,
 		FsError::Io => Error::Again,

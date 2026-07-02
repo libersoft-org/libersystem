@@ -54,7 +54,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Io);
 		}
 
-		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, uuid: opts.uuid, label, compress: opts.compress, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, uuid: opts.uuid, label, compress: opts.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
 		fs.derive_free()?;
 		Ok(fs)
 	}
@@ -121,7 +121,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			None => (0, 0, false),
 		};
 
-		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest, uuid: sb.uuid, label: sb.label, compress: sb.compress, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest, uuid: sb.uuid, label: sb.label, compress: sb.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
 		// a corrupt snapshot table degrades the mount to read-only instead of failing it:
 		// the pinned generations it named can no longer be reserved, so a commit could
 		// reuse their blocks - refusing every mutation keeps them (and the table block
@@ -190,22 +190,34 @@ impl<D: BlockDevice> LiberFs<D> {
 		let inode_num = self.resolve(path)?;
 		let inode = self.read_inode(inode_num)?;
 		if inode.kind != KIND_FILE {
-			return Err(FsError::NotFound);
+			return Err(FsError::IsDir);
 		}
-		let mut out = Vec::with_capacity(inode.size as usize);
-		let mut block = vec![0u8; BLOCK_SIZE];
-		let mut remaining = inode.size as usize;
-		for i in 0..inode.nblocks() {
-			// a hole (a sparse gap left by a write past the end) reads back as zeros;
-			// a mapped block is verified against its stored checksum.
-			if !self.read_logical(&inode, i, &mut block)? {
-				for b in block.iter_mut() {
+		let size = inode.size as usize;
+		self.read_range(&inode, 0, size)
+	}
+
+	// Read up to `len` bytes of `inode` starting at byte `offset` - the one range
+	// reader behind both `read_file` (the whole file) and `read_at` (a slice). Returns
+	// fewer bytes (or none) if the range runs past the end; holes read back as zeros.
+	pub(crate) fn read_range(&mut self, inode: &Inode, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+		if offset >= inode.size || len == 0 {
+			return Ok(Vec::new());
+		}
+		let end = (offset + len as u64).min(inode.size);
+		let mut out = Vec::with_capacity((end - offset) as usize);
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		let first = (offset / BLOCK_SIZE as u64) as usize;
+		let last = ((end - 1) / BLOCK_SIZE as u64) as usize;
+		for lb in first..=last {
+			let block_start = lb as u64 * BLOCK_SIZE as u64;
+			if !self.read_logical(inode, lb, &mut buf)? {
+				for b in buf.iter_mut() {
 					*b = 0;
 				}
 			}
-			let take = remaining.min(BLOCK_SIZE);
-			out.extend_from_slice(&block[..take]);
-			remaining -= take;
+			let copy_start = offset.max(block_start);
+			let copy_end = end.min(block_start + BLOCK_SIZE as u64);
+			out.extend_from_slice(&buf[(copy_start - block_start) as usize..(copy_end - block_start) as usize]);
 		}
 		Ok(out)
 	}
@@ -219,7 +231,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub fn read_dir(&mut self, path: &[u8]) -> Result<Vec<(Vec<u8>, u64, bool)>, FsError> {
 		let inode_num = self.resolve(path)?;
 		if self.read_inode(inode_num)?.kind != KIND_DIR {
-			return Err(FsError::Invalid);
+			return Err(FsError::NotDir);
 		}
 		self.read_dir_inode(inode_num)
 	}
@@ -255,7 +267,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			Some(num) => {
 				let inode = self.read_inode(num)?;
 				if inode.kind != KIND_FILE {
-					return Err(FsError::Invalid);
+					return Err(FsError::IsDir);
 				}
 				Some((num, inode))
 			}
@@ -327,7 +339,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn rmdir_inner(&mut self, path: &[u8]) -> Result<(), FsError> {
 		let inode_num = self.resolve(path)?;
 		if self.read_inode(inode_num)?.kind != KIND_DIR {
-			return Err(FsError::Invalid);
+			return Err(FsError::NotDir);
 		}
 		self.remove_inner(path)
 	}
@@ -337,7 +349,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let inode_num = self.dir_lookup(parent, name)?.ok_or(FsError::NotFound)?;
 		let inode = self.read_inode(inode_num)?;
 		if inode.kind == KIND_DIR && inode.size != 0 {
-			return Err(FsError::Invalid);
+			return Err(FsError::NotEmpty);
 		}
 
 		// clear the directory entry and free the inode in the new generation; its old
@@ -367,24 +379,24 @@ impl<D: BlockDevice> LiberFs<D> {
 // the feature flags, the volume identity, and the algorithm/compression bytes.
 pub(crate) fn serialize_superblock(sb: &Superblock) -> Vec<u8> {
 	let mut block = vec![0u8; BLOCK_SIZE];
-	block[0..8].copy_from_slice(&MAGIC);
-	block[8..12].copy_from_slice(&VERSION.to_le_bytes());
-	block[12..16].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
-	block[16..24].copy_from_slice(&sb.num_blocks.to_le_bytes());
-	block[24..28].copy_from_slice(&sb.next_inode.to_le_bytes());
-	block[28..36].copy_from_slice(&sb.generation.to_le_bytes());
-	block[36..44].copy_from_slice(&sb.inode_root.to_le_bytes());
-	block[44..48].copy_from_slice(&sb.inode_root_crc.to_le_bytes());
-	block[52..56].copy_from_slice(&sb.root_inode.to_le_bytes());
+	block[SB_MAGIC_OFF..SB_MAGIC_OFF + 8].copy_from_slice(&MAGIC);
+	block[SB_VERSION_OFF..SB_VERSION_OFF + 4].copy_from_slice(&VERSION.to_le_bytes());
+	block[SB_BLOCK_SIZE_OFF..SB_BLOCK_SIZE_OFF + 4].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
+	block[SB_NUM_BLOCKS_OFF..SB_NUM_BLOCKS_OFF + 8].copy_from_slice(&sb.num_blocks.to_le_bytes());
+	block[SB_NEXT_INODE_OFF..SB_NEXT_INODE_OFF + 4].copy_from_slice(&sb.next_inode.to_le_bytes());
+	block[SB_GENERATION_OFF..SB_GENERATION_OFF + 8].copy_from_slice(&sb.generation.to_le_bytes());
+	block[SB_INODE_ROOT_OFF..SB_INODE_ROOT_OFF + 8].copy_from_slice(&sb.inode_root.to_le_bytes());
+	block[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].copy_from_slice(&sb.inode_root_crc.to_le_bytes());
+	block[SB_ROOT_INODE_OFF..SB_ROOT_INODE_OFF + 4].copy_from_slice(&sb.root_inode.to_le_bytes());
 	// the fields past the self-CRC offset are covered by the whole-block checksum below.
-	block[60..68].copy_from_slice(&sb.snap_root.to_le_bytes());
-	block[68..72].copy_from_slice(&sb.snap_root_crc.to_le_bytes());
-	block[72..80].copy_from_slice(&FEATURES.to_le_bytes());
-	block[80..96].copy_from_slice(&sb.uuid);
-	block[96..96 + LABEL_MAX].copy_from_slice(&sb.label);
-	block[128] = CSUM_ALGO_CRC32C;
-	block[129] = CODEC_LZ4;
-	block[130] = sb.compress as u8;
+	block[SB_SNAP_ROOT_OFF..SB_SNAP_ROOT_OFF + 8].copy_from_slice(&sb.snap_root.to_le_bytes());
+	block[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&sb.snap_root_crc.to_le_bytes());
+	block[SB_FEATURES_OFF..SB_FEATURES_OFF + 8].copy_from_slice(&FEATURES.to_le_bytes());
+	block[SB_UUID_OFF..SB_UUID_OFF + 16].copy_from_slice(&sb.uuid);
+	block[SB_LABEL_OFF..SB_LABEL_OFF + LABEL_MAX].copy_from_slice(&sb.label);
+	block[SB_CSUM_ALGO_OFF] = CSUM_ALGO_CRC32C;
+	block[SB_CODEC_OFF] = CODEC_LZ4;
+	block[SB_COMPRESS_OFF] = sb.compress as u8;
 	// the CRC bytes are already zero; checksum the block and store it over them.
 	let crc = crc32c(&block);
 	block[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
@@ -400,19 +412,19 @@ pub(crate) fn parse_superblock(block: &[u8]) -> Option<Superblock> {
 	if block.len() < BLOCK_SIZE {
 		return None;
 	}
-	if block[0..8] != MAGIC {
+	if block[SB_MAGIC_OFF..SB_MAGIC_OFF + 8] != MAGIC {
 		return None;
 	}
-	if u32::from_le_bytes(block[8..12].try_into().ok()?) != VERSION {
+	if u32::from_le_bytes(block[SB_VERSION_OFF..SB_VERSION_OFF + 4].try_into().ok()?) != VERSION {
 		return None;
 	}
-	if u32::from_le_bytes(block[12..16].try_into().ok()?) != BLOCK_SIZE as u32 {
+	if u32::from_le_bytes(block[SB_BLOCK_SIZE_OFF..SB_BLOCK_SIZE_OFF + 4].try_into().ok()?) != BLOCK_SIZE as u32 {
 		return None;
 	}
-	if u64::from_le_bytes(block[72..80].try_into().ok()?) != FEATURES {
+	if u64::from_le_bytes(block[SB_FEATURES_OFF..SB_FEATURES_OFF + 8].try_into().ok()?) != FEATURES {
 		return None;
 	}
-	if block[128] != CSUM_ALGO_CRC32C || block[129] != CODEC_LZ4 {
+	if block[SB_CSUM_ALGO_OFF] != CSUM_ALGO_CRC32C || block[SB_CODEC_OFF] != CODEC_LZ4 {
 		return None;
 	}
 	// verify the self-CRC by recomputing over the block with its CRC bytes zeroed.
@@ -423,8 +435,8 @@ pub(crate) fn parse_superblock(block: &[u8]) -> Option<Superblock> {
 		return None;
 	}
 	let mut uuid = [0u8; 16];
-	uuid.copy_from_slice(&block[80..96]);
+	uuid.copy_from_slice(&block[SB_UUID_OFF..SB_UUID_OFF + 16]);
 	let mut label = [0u8; LABEL_MAX];
-	label.copy_from_slice(&block[96..96 + LABEL_MAX]);
-	Some(Superblock { num_blocks: u64::from_le_bytes(block[16..24].try_into().ok()?), generation: u64::from_le_bytes(block[28..36].try_into().ok()?), inode_root: u64::from_le_bytes(block[36..44].try_into().ok()?), inode_root_crc: u32::from_le_bytes(block[44..48].try_into().ok()?), next_inode: u32::from_le_bytes(block[24..28].try_into().ok()?), root_inode: u32::from_le_bytes(block[52..56].try_into().ok()?), snap_root: u64::from_le_bytes(block[60..68].try_into().ok()?), snap_root_crc: u32::from_le_bytes(block[68..72].try_into().ok()?), uuid, label, compress: block[130] != 0 })
+	label.copy_from_slice(&block[SB_LABEL_OFF..SB_LABEL_OFF + LABEL_MAX]);
+	Some(Superblock { num_blocks: u64::from_le_bytes(block[SB_NUM_BLOCKS_OFF..SB_NUM_BLOCKS_OFF + 8].try_into().ok()?), generation: u64::from_le_bytes(block[SB_GENERATION_OFF..SB_GENERATION_OFF + 8].try_into().ok()?), inode_root: u64::from_le_bytes(block[SB_INODE_ROOT_OFF..SB_INODE_ROOT_OFF + 8].try_into().ok()?), inode_root_crc: u32::from_le_bytes(block[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].try_into().ok()?), next_inode: u32::from_le_bytes(block[SB_NEXT_INODE_OFF..SB_NEXT_INODE_OFF + 4].try_into().ok()?), root_inode: u32::from_le_bytes(block[SB_ROOT_INODE_OFF..SB_ROOT_INODE_OFF + 4].try_into().ok()?), snap_root: u64::from_le_bytes(block[SB_SNAP_ROOT_OFF..SB_SNAP_ROOT_OFF + 8].try_into().ok()?), snap_root_crc: u32::from_le_bytes(block[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].try_into().ok()?), uuid, label, compress: block[SB_COMPRESS_OFF] != 0 })
 }

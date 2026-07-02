@@ -225,9 +225,9 @@ fn rmdir_removes_an_empty_directory_only() {
 	fs.write_file(b"full/f", b"x").unwrap();
 	fs.write_file(b"file", b"y").unwrap();
 	// a non-empty directory is refused.
-	assert_eq!(fs.rmdir(b"full"), Err(FsError::Invalid));
+	assert_eq!(fs.rmdir(b"full"), Err(FsError::NotEmpty));
 	// a regular file is refused (use remove).
-	assert_eq!(fs.rmdir(b"file"), Err(FsError::Invalid));
+	assert_eq!(fs.rmdir(b"file"), Err(FsError::NotDir));
 	// an empty directory is removed.
 	assert!(fs.rmdir(b"empty").is_ok());
 	assert!(fs.lookup(b"empty").is_none());
@@ -257,7 +257,7 @@ fn nested_paths_survive_a_remount() {
 fn remove_rejects_a_nonempty_directory() {
 	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"dir/child", b"x").unwrap();
-	assert_eq!(fs.remove(b"dir"), Err(FsError::Invalid));
+	assert_eq!(fs.remove(b"dir"), Err(FsError::NotEmpty));
 	// removing the child then the now-empty directory works.
 	fs.remove(b"dir/child").unwrap();
 	fs.remove(b"dir").unwrap();
@@ -267,9 +267,9 @@ fn remove_rejects_a_nonempty_directory() {
 #[test]
 fn rejects_dot_and_dot_dot_segments() {
 	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
-	assert_eq!(fs.write_file(b"a/../b", b"x"), Err(FsError::Invalid));
-	assert_eq!(fs.read_file(b"./x"), Err(FsError::Invalid));
-	assert_eq!(fs.mkdir(b"x//y"), Err(FsError::Invalid));
+	assert_eq!(fs.write_file(b"a/../b", b"x"), Err(FsError::BadName));
+	assert_eq!(fs.read_file(b"./x"), Err(FsError::BadName));
+	assert_eq!(fs.mkdir(b"x//y"), Err(FsError::BadName));
 }
 
 #[test]
@@ -466,7 +466,7 @@ fn rename_rejects_overwriting_a_nonempty_directory() {
 	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"src", b"x").unwrap();
 	fs.write_file(b"dst/keep", b"y").unwrap();
-	assert_eq!(fs.rename(b"src", b"dst"), Err(FsError::Invalid));
+	assert_eq!(fs.rename(b"src", b"dst"), Err(FsError::NotEmpty));
 }
 
 // M51: block checksums (integrity).
@@ -554,11 +554,7 @@ fn newest_super_slot(dev: &MemDevice) -> u32 {
 		let off = slot as usize * BLOCK_SIZE + 28;
 		u64::from_le_bytes(dev.blocks[off..off + 8].try_into().unwrap())
 	};
-	if generation(1) > generation(0) {
-		1
-	} else {
-		0
-	}
+	if generation(1) > generation(0) { 1 } else { 0 }
 }
 
 #[test]
@@ -631,7 +627,7 @@ fn rejects_unportable_name_characters() {
 	// bytes, on top of the path separator and NUL the parser already forbids.
 	let bad: [&[u8]; 10] = [b"a\\b", b"a:b", b"a*b", b"a?b", b"a<b", b"a>b", b"a|b", b"a\"b", b"a\x01b", b"a\x7fb"];
 	for name in bad {
-		assert_eq!(fs.write_file(name, b"x"), Err(FsError::Invalid));
+		assert_eq!(fs.write_file(name, b"x"), Err(FsError::BadName));
 	}
 	// allowed punctuation, spaces and non-ASCII bytes still work.
 	let ok = "resume v2 (final).txt".as_bytes();
@@ -896,13 +892,13 @@ fn snapshot_name_rules_are_enforced() {
 	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"x").unwrap();
 	// an empty name is rejected.
-	assert_eq!(fs.create_snapshot(b""), Err(FsError::Invalid));
+	assert_eq!(fs.create_snapshot(b""), Err(FsError::BadName));
 	// a name longer than the field is rejected.
 	let long = vec![b'a'; SNAP_NAME_MAX + 1];
 	assert_eq!(fs.create_snapshot(&long), Err(FsError::TooLong));
 	// a duplicate name is rejected.
 	fs.create_snapshot(b"dup").unwrap();
-	assert_eq!(fs.create_snapshot(b"dup"), Err(FsError::Invalid));
+	assert_eq!(fs.create_snapshot(b"dup"), Err(FsError::Exists));
 	// deleting an unknown snapshot is NotFound; deleting the real one succeeds.
 	assert_eq!(fs.delete_snapshot(b"missing"), Err(FsError::NotFound));
 	fs.delete_snapshot(b"dup").unwrap();
@@ -1048,7 +1044,7 @@ fn a_volume_with_foreign_feature_flags_does_not_mount() {
 fn names_must_be_utf8() {
 	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	// a bare continuation byte is not UTF-8: rejected, so one file has one name.
-	assert_eq!(fs.write_file(b"bad\x80name", b"x"), Err(FsError::Invalid));
+	assert_eq!(fs.write_file(b"bad\x80name", b"x"), Err(FsError::BadName));
 	// real multi-byte UTF-8 works.
 	let name = "soubor-\u{10D}e\u{161}tina.txt".as_bytes();
 	fs.write_file(name, b"ok").unwrap();
@@ -1444,4 +1440,106 @@ fn bench_scaling() {
 		assert!(fs.stat(name.as_bytes()).unwrap().size > 0);
 	}
 	println!("bench: 2000 stats: {:?} ({} reads, {} writes)", t.elapsed(), fs.device().reads - r0, fs.device().writes - w0);
+}
+
+// M76: the audit's test-coverage gaps.
+
+// Records sharing a 64-bit name hash: the leaf machinery must disambiguate lookups by
+// the name bytes and never let a split straddle an equal-hash group (internal nodes
+// route by hash alone). A real FNV collision is impractical to find, so the pure leaf
+// helpers are exercised with synthetic colliding records.
+#[test]
+fn colliding_hashes_stay_searchable_and_never_straddle_a_split() {
+	let rec = |hash: u64, name: &[u8], child: u32| DirRec { hash, name: name.to_vec(), child };
+	// a leaf where most records share one hash, sorted by (hash, name).
+	let recs = vec![rec(5, b"aaa", 1), rec(7, b"bbb", 2), rec(7, b"ccc", 3), rec(7, b"ddd", 4), rec(7, b"eee", 5), rec(9, b"fff", 6)];
+
+	// lookup disambiguates by name within the shared hash.
+	assert_eq!(dir_recs_search(&recs, 7, b"ccc"), Ok(2));
+	assert_eq!(dir_recs_search(&recs, 7, b"ddd"), Ok(3));
+	assert!(dir_recs_search(&recs, 7, b"zzz").is_err());
+
+	// the split point lands on a hash boundary, never inside the 7-group.
+	let split = dir_split_point(&recs);
+	assert!(split == 1 || split == 5, "split {split} would straddle the equal-hash group");
+	assert!(recs[split].hash != recs[split - 1].hash);
+
+	// the round trip through the on-disk leaf form preserves the colliding records.
+	let mut buf = vec![0u8; BLOCK_SIZE];
+	dir_leaf_write(&mut buf, &recs);
+	let back = dir_leaf_parse(&buf);
+	assert_eq!(back.len(), recs.len());
+	for (a, b) in recs.iter().zip(back.iter()) {
+		assert_eq!((a.hash, &a.name, a.child), (b.hash, &b.name, b.child));
+	}
+
+	// the fixed-record split helper honors the same rule (the inode-tree flavour).
+	let fixed: Vec<Vec<u8>> = recs.iter().map(|r| r.hash.to_le_bytes().to_vec()).collect();
+	let split = leaf_split_point(&fixed);
+	let key = |i: usize| u64::from_le_bytes(fixed[i][0..8].try_into().unwrap());
+	assert!(key(split) != key(split - 1), "equal keys must stay in one leaf");
+}
+
+// A file with more extents than fit inline in the inode (4) spills to the overflow
+// chain; the chain must round-trip through writes, reads and a remount.
+#[test]
+fn a_many_extent_file_round_trips_through_the_spill_chain() {
+	let nblocks: u64 = 512;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	// eight sparse spans, far enough apart that each is its own extent: twice the
+	// inline capacity, so the map spills.
+	let span = |i: u64| i * 16 * BLOCK_SIZE as u64;
+	for i in 0..8u64 {
+		let payload = format!("span-{i}");
+		fs.write_at(b"sparse", span(i), payload.as_bytes()).unwrap();
+	}
+	let num = fs.lookup(b"sparse").unwrap();
+	let count = fs.read_inode(num).unwrap().extents.len();
+	assert!(count > EXTENTS_INLINE, "eight spans should overflow the {EXTENTS_INLINE} inline extents (got {count})");
+
+	// every span reads back, before and after a remount; fsck stays clean.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	for i in 0..8u64 {
+		let payload = format!("span-{i}");
+		assert_eq!(fs.read_at(b"sparse", span(i), payload.len()).unwrap(), payload.as_bytes());
+	}
+	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
+	// shrinking away the spilled extents collapses the chain cleanly too.
+	fs.truncate(b"sparse", span(2)).unwrap();
+	let count = fs.read_inode(num).unwrap().extents.len();
+	assert!(count <= EXTENTS_INLINE, "the truncated map should fit inline again (got {count})");
+	assert_eq!(fs.read_at(b"sparse", span(1), 6).unwrap(), b"span-1");
+}
+
+// A patch that straddles two compressed extents must thaw both and keep every byte.
+#[test]
+fn a_write_across_a_compressed_extent_boundary_thaws_both_runs() {
+	// 1200 compressible blocks: past one extent's 1024-block checksum cap, so the file
+	// maps as two extents, both compressed by the whole-file write.
+	let nblocks: u64 = 4096;
+	let mut fs = LiberFs::format_opts(SparseDevice::new(nblocks), nblocks, FormatOpts { compress: true, ..FormatOpts::default() }).unwrap();
+	let mut big: Vec<u8> = b"boundary boundary boundary. ".iter().cycle().take(BLOCK_SIZE * 1200).copied().collect();
+	fs.write_file(b"big", &big).unwrap();
+	let num = fs.lookup(b"big").unwrap();
+	let extents = fs.read_inode(num).unwrap().extents;
+	assert_eq!(extents.len(), 2, "1200 blocks should map as two extents");
+	assert!(extents.iter().all(|e| e.clen != 0), "both runs should have compressed");
+
+	// patch across the 1024-block boundary: half in the first extent, half in the
+	// second. Both runs thaw; the content is exact.
+	let boundary: u64 = 1024 * BLOCK_SIZE as u64;
+	let patch = b"#### the patch straddles the extent boundary ####";
+	let start = (boundary as usize) - patch.len() / 2;
+	fs.write_at(b"big", start as u64, patch).unwrap();
+	big[start..start + patch.len()].copy_from_slice(patch);
+	assert_eq!(fs.read_file(b"big").unwrap(), big);
+	for ext in fs.read_inode(num).unwrap().extents.iter() {
+		assert_eq!(ext.clen, 0, "a patched run must be raw");
+	}
+	// the patched file survives a remount and verifies clean.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(b"big").unwrap(), big);
+	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
 }

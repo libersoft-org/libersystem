@@ -7,13 +7,13 @@ impl<D: BlockDevice> LiberFs<D> {
 	// snapshots; the chained table holds any number of them.
 	pub fn create_snapshot(&mut self, name: &[u8]) -> Result<(), FsError> {
 		if name.is_empty() {
-			return Err(FsError::Invalid);
+			return Err(FsError::BadName);
 		}
 		if name.len() > SNAP_NAME_MAX {
 			return Err(FsError::TooLong);
 		}
 		if self.snapshots.iter().any(|s| s.name == name) {
-			return Err(FsError::Invalid);
+			return Err(FsError::Exists);
 		}
 		self.mutate(|fs| fs.create_snapshot_inner(name))
 	}
@@ -77,15 +77,15 @@ impl<D: BlockDevice> LiberFs<D> {
 		for chunk in snapshots.chunks(SNAPS_PER_BLOCK).rev() {
 			let blk = self.alloc_meta()?;
 			let mut block = vec![0u8; BLOCK_SIZE];
-			block[0..8].copy_from_slice(&next_ptr.to_le_bytes());
-			block[8..12].copy_from_slice(&next_crc.to_le_bytes());
-			block[12..16].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+			block[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].copy_from_slice(&next_ptr.to_le_bytes());
+			block[CHAIN_CRC_OFF..CHAIN_CRC_OFF + 4].copy_from_slice(&next_crc.to_le_bytes());
+			block[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
 			for (i, s) in chunk.iter().enumerate() {
 				let off = SNAP_HDR + i * SNAP_REC;
 				block[off..off + s.name.len()].copy_from_slice(&s.name);
-				block[off + SNAP_NAME_MAX..off + SNAP_NAME_MAX + 8].copy_from_slice(&s.inode_root.to_le_bytes());
-				block[off + SNAP_NAME_MAX + 8..off + SNAP_NAME_MAX + 12].copy_from_slice(&s.inode_root_crc.to_le_bytes());
-				block[off + SNAP_NAME_MAX + 12..off + SNAP_NAME_MAX + 20].copy_from_slice(&s.generation.to_le_bytes());
+				block[off + SNAP_ROOT_OFF..off + SNAP_ROOT_OFF + 8].copy_from_slice(&s.inode_root.to_le_bytes());
+				block[off + SNAP_ROOT_CRC_OFF..off + SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&s.inode_root_crc.to_le_bytes());
+				block[off + SNAP_GEN_OFF..off + SNAP_GEN_OFF + 8].copy_from_slice(&s.generation.to_le_bytes());
 			}
 			if !self.dev.write_block(blk, &block) {
 				return Err(FsError::Io);
@@ -116,17 +116,17 @@ impl<D: BlockDevice> LiberFs<D> {
 			if crc32c(&block) != crc {
 				return Err(FsError::Corrupt);
 			}
-			let count = (u32::from_le_bytes(block[12..16].try_into().unwrap()) as usize).min(SNAPS_PER_BLOCK);
+			let count = (u32::from_le_bytes(block[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].try_into().unwrap()) as usize).min(SNAPS_PER_BLOCK);
 			for i in 0..count {
 				let off = SNAP_HDR + i * SNAP_REC;
 				let name = name_in(&block[off..off + SNAP_NAME_MAX]).to_vec();
-				let inode_root = u64::from_le_bytes(block[off + SNAP_NAME_MAX..off + SNAP_NAME_MAX + 8].try_into().unwrap());
-				let inode_root_crc = u32::from_le_bytes(block[off + SNAP_NAME_MAX + 8..off + SNAP_NAME_MAX + 12].try_into().unwrap());
-				let generation = u64::from_le_bytes(block[off + SNAP_NAME_MAX + 12..off + SNAP_NAME_MAX + 20].try_into().unwrap());
+				let inode_root = u64::from_le_bytes(block[off + SNAP_ROOT_OFF..off + SNAP_ROOT_OFF + 8].try_into().unwrap());
+				let inode_root_crc = u32::from_le_bytes(block[off + SNAP_ROOT_CRC_OFF..off + SNAP_ROOT_CRC_OFF + 4].try_into().unwrap());
+				let generation = u64::from_le_bytes(block[off + SNAP_GEN_OFF..off + SNAP_GEN_OFF + 8].try_into().unwrap());
 				self.snapshots.push(Snapshot { name, inode_root, inode_root_crc, generation });
 			}
-			ptr = u64::from_le_bytes(block[0..8].try_into().unwrap());
-			crc = u32::from_le_bytes(block[8..12].try_into().unwrap());
+			ptr = u64::from_le_bytes(block[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].try_into().unwrap());
+			crc = u32::from_le_bytes(block[CHAIN_CRC_OFF..CHAIN_CRC_OFF + 4].try_into().unwrap());
 		}
 		Ok(())
 	}
@@ -166,28 +166,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		let inode_num = self.resolve(path)?;
 		let inode = self.read_inode(inode_num)?;
 		if inode.kind != KIND_FILE {
-			return Err(FsError::NotFound);
+			return Err(FsError::IsDir);
 		}
-		if offset >= inode.size || len == 0 {
-			return Ok(Vec::new());
-		}
-		let end = (offset + len as u64).min(inode.size);
-		let mut out = Vec::with_capacity((end - offset) as usize);
-		let mut buf = vec![0u8; BLOCK_SIZE];
-		let first = (offset / BLOCK_SIZE as u64) as usize;
-		let last = ((end - 1) / BLOCK_SIZE as u64) as usize;
-		for lb in first..=last {
-			let block_start = lb as u64 * BLOCK_SIZE as u64;
-			if !self.read_logical(&inode, lb, &mut buf)? {
-				for b in buf.iter_mut() {
-					*b = 0;
-				}
-			}
-			let copy_start = offset.max(block_start);
-			let copy_end = end.min(block_start + BLOCK_SIZE as u64);
-			out.extend_from_slice(&buf[(copy_start - block_start) as usize..(copy_end - block_start) as usize]);
-		}
-		Ok(out)
+		self.read_range(&inode, offset, len)
 	}
 
 	// Write `data` into the file at `path` starting at byte `offset`, creating the file
@@ -204,7 +185,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let inode_num = match self.dir_lookup(parent, name)? {
 			Some(num) => {
 				if self.read_inode(num)?.kind != KIND_FILE {
-					return Err(FsError::Invalid);
+					return Err(FsError::IsDir);
 				}
 				num
 			}
@@ -277,7 +258,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let inode_num = self.resolve(path)?;
 		let mut inode = self.read_inode(inode_num)?;
 		if inode.kind != KIND_FILE {
-			return Err(FsError::Invalid);
+			return Err(FsError::IsDir);
 		}
 		if new_len < inode.size {
 			let keep = (new_len as usize).div_ceil(BLOCK_SIZE);
@@ -332,7 +313,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			let ti = self.read_inode(inode_t)?;
 			if ti.kind == KIND_DIR && ti.size != 0 {
-				return Err(FsError::Invalid);
+				return Err(FsError::NotEmpty);
 			}
 		}
 

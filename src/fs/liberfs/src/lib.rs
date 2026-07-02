@@ -131,8 +131,18 @@ const POOL_START: u64 = SUPER_SLOTS as u64;
 // (for a file) the extent map's overflow pointer and count and EXTENTS_INLINE inline
 // extents, or (for a directory) its B+tree root pointer and that root's CRC32C. An
 // opaque owner tag sits at OWNER_TAG_OFF. Each slot is stored, keyed by inode number,
-// in a leaf of the inode B+tree.
+// in a leaf of the inode B+tree. The field offsets within the slot, by name, so the
+// parser and writer cannot drift apart:
 const INODE_SIZE: usize = 256;
+const INO_KIND_OFF: usize = 0;
+const INO_SIZE_OFF: usize = 8;
+const INO_CTIME_OFF: usize = 16;
+const INO_MTIME_OFF: usize = 24;
+// the overlay: a file's spill pointer / a directory's tree root, then its CRC32C,
+// then (files only) the total extent count.
+const INO_MAP_OFF: usize = 32;
+const INO_MAP_CRC_OFF: usize = 40;
+const INO_EXTENT_COUNT_OFF: usize = 44;
 
 // A B+tree node lives in one block: an 8-byte header (a type byte then a u16 entry
 // count) followed by the entries. An internal node holds `count` u64 separator keys
@@ -274,12 +284,28 @@ fn crc32c(data: &[u8]) -> u32 {
 }
 
 // A filesystem error. The variants map onto the `Storage.Volume` `error` enum at the
-// service boundary (NotFound -> not-found, NoSpace -> again, the rest -> invalid).
+// service boundary (NotFound -> not-found, NoSpace -> again, ReadOnly -> denied, the
+// rest -> invalid) - but they stay precise here, so a caller (and a test) can tell a
+// bad name from a wrong kind from a non-empty directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsError {
 	NotFound,
 	NoSpace,
 	TooLong,
+	// A malformed path or name: an empty segment, "." or "..", not UTF-8, or a byte
+	// outside the portable-name policy.
+	BadName,
+	// The path names a directory where a file was required (writing, truncating).
+	IsDir,
+	// The path names a file where a directory was required (a path component, rmdir).
+	NotDir,
+	// Removing or replacing a directory that still has entries.
+	NotEmpty,
+	// Creating something that already exists (a duplicate snapshot name).
+	Exists,
+	// An operation the filesystem cannot perform (moving a directory into its own
+	// subtree, formatting an impossibly small pool) or an internal inconsistency (an
+	// inode record missing from the tree).
 	Invalid,
 	// A block read back with a CRC32C that did not match the one stored beside its
 	// pointer: on-disk corruption, surfaced instead of returning the bad bytes.
@@ -363,19 +389,50 @@ struct Superblock {
 }
 
 // Byte offset of the superblock's own CRC32C within its block; the checksum covers the
-// whole block with these four bytes zeroed, so a half-written superblock fails it.
+// whole block with these four bytes zeroed, so a half-written superblock fails it. The
+// remaining superblock field offsets, by name, so the serializer and parser cannot
+// drift apart:
 const SB_CRC_OFFSET: usize = 56;
+const SB_MAGIC_OFF: usize = 0;
+const SB_VERSION_OFF: usize = 8;
+const SB_BLOCK_SIZE_OFF: usize = 12;
+const SB_NUM_BLOCKS_OFF: usize = 16;
+const SB_NEXT_INODE_OFF: usize = 24;
+const SB_GENERATION_OFF: usize = 28;
+const SB_INODE_ROOT_OFF: usize = 36;
+const SB_INODE_ROOT_CRC_OFF: usize = 44;
+const SB_ROOT_INODE_OFF: usize = 52;
+const SB_SNAP_ROOT_OFF: usize = 60;
+const SB_SNAP_ROOT_CRC_OFF: usize = 68;
+const SB_FEATURES_OFF: usize = 72;
+const SB_UUID_OFF: usize = 80;
+const SB_LABEL_OFF: usize = 96;
+const SB_CSUM_ALGO_OFF: usize = 128;
+const SB_CODEC_OFF: usize = 129;
+const SB_COMPRESS_OFF: usize = 130;
 
 // A named snapshot pins an earlier generation's inode-tree root so its blocks are not
 // reclaimed. The snapshot table is a chain of blocks rooted at `snap_root`: each block
-// carries an 8-byte next pointer, that block's CRC32C (u32) and a record count (u32),
-// then fixed records of a NUL-padded name, the pinned inode-tree root and its CRC32C,
-// and the generation. (4096 - 16) / 84 = 48 records per block; the chain is unbounded,
-// so there is no cap on how many snapshots a volume holds.
+// carries the shared chain header (below), then fixed records of a NUL-padded name,
+// the pinned inode-tree root and its CRC32C, and the generation - at the named record
+// offsets. (4096 - 16) / 84 = 48 records per block; the chain is unbounded, so there
+// is no cap on how many snapshots a volume holds.
 const SNAP_NAME_MAX: usize = 64;
-const SNAP_HDR: usize = 16;
+const SNAP_HDR: usize = CHAIN_HDR;
 const SNAP_REC: usize = SNAP_NAME_MAX + 20;
 const SNAPS_PER_BLOCK: usize = (BLOCK_SIZE - SNAP_HDR) / SNAP_REC;
+// field offsets within one snapshot record, after the name.
+const SNAP_ROOT_OFF: usize = SNAP_NAME_MAX;
+const SNAP_ROOT_CRC_OFF: usize = SNAP_NAME_MAX + 8;
+const SNAP_GEN_OFF: usize = SNAP_NAME_MAX + 12;
+
+// The shared chain-block header, used by both the extent overflow chain and the
+// snapshot chain: the next block's pointer (u64) and CRC32C (u32), then a record
+// count (u32).
+const CHAIN_NEXT_OFF: usize = 0;
+const CHAIN_CRC_OFF: usize = 8;
+const CHAIN_COUNT_OFF: usize = 12;
+const CHAIN_HDR: usize = 16;
 
 // In-memory cache bounds: how many parsed inodes and how many (directory, name) ->
 // inode entries are kept between operations, and the largest extent map worth caching
@@ -468,17 +525,19 @@ impl Inode {
 	// Parse the fixed header and, for a file, the inline extents (any spilled ones are
 	// appended afterwards by `read_inode`); for a directory, the B+tree root pointer.
 	fn parse(buf: &[u8]) -> Inode {
-		let kind = buf[0];
+		let kind = buf[INO_KIND_OFF];
 		let mut owner_tag = [0u8; OWNER_TAG_LEN];
 		owner_tag.copy_from_slice(&buf[OWNER_TAG_OFF..OWNER_TAG_OFF + OWNER_TAG_LEN]);
-		let mut inode = Inode { kind, size: u64::from_le_bytes(buf[8..16].try_into().unwrap()), ctime: u64::from_le_bytes(buf[16..24].try_into().unwrap()), mtime: u64::from_le_bytes(buf[24..32].try_into().unwrap()), owner_tag, extents: Vec::new(), spill: 0, spill_crc: 0, extent_count: 0, dir_root: 0, dir_root_crc: 0 };
+		let mut inode = Inode { kind, size: u64::from_le_bytes(buf[INO_SIZE_OFF..INO_SIZE_OFF + 8].try_into().unwrap()), ctime: u64::from_le_bytes(buf[INO_CTIME_OFF..INO_CTIME_OFF + 8].try_into().unwrap()), mtime: u64::from_le_bytes(buf[INO_MTIME_OFF..INO_MTIME_OFF + 8].try_into().unwrap()), owner_tag, extents: Vec::new(), spill: 0, spill_crc: 0, extent_count: 0, dir_root: 0, dir_root_crc: 0 };
+		let map = u64::from_le_bytes(buf[INO_MAP_OFF..INO_MAP_OFF + 8].try_into().unwrap());
+		let map_crc = u32::from_le_bytes(buf[INO_MAP_CRC_OFF..INO_MAP_CRC_OFF + 4].try_into().unwrap());
 		if kind == KIND_DIR {
-			inode.dir_root = u64::from_le_bytes(buf[32..40].try_into().unwrap());
-			inode.dir_root_crc = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+			inode.dir_root = map;
+			inode.dir_root_crc = map_crc;
 		} else {
-			inode.spill = u64::from_le_bytes(buf[32..40].try_into().unwrap());
-			inode.spill_crc = u32::from_le_bytes(buf[40..44].try_into().unwrap());
-			inode.extent_count = u32::from_le_bytes(buf[44..48].try_into().unwrap());
+			inode.spill = map;
+			inode.spill_crc = map_crc;
+			inode.extent_count = u32::from_le_bytes(buf[INO_EXTENT_COUNT_OFF..INO_EXTENT_COUNT_OFF + 4].try_into().unwrap());
 			let inline = (inode.extent_count as usize).min(EXTENTS_INLINE);
 			inode.extents.reserve(inline);
 			for i in 0..inline {
@@ -497,18 +556,18 @@ impl Inode {
 		for b in buf[..INODE_SIZE].iter_mut() {
 			*b = 0;
 		}
-		buf[0] = self.kind;
-		buf[8..16].copy_from_slice(&self.size.to_le_bytes());
-		buf[16..24].copy_from_slice(&self.ctime.to_le_bytes());
-		buf[24..32].copy_from_slice(&self.mtime.to_le_bytes());
+		buf[INO_KIND_OFF] = self.kind;
+		buf[INO_SIZE_OFF..INO_SIZE_OFF + 8].copy_from_slice(&self.size.to_le_bytes());
+		buf[INO_CTIME_OFF..INO_CTIME_OFF + 8].copy_from_slice(&self.ctime.to_le_bytes());
+		buf[INO_MTIME_OFF..INO_MTIME_OFF + 8].copy_from_slice(&self.mtime.to_le_bytes());
 		buf[OWNER_TAG_OFF..OWNER_TAG_OFF + OWNER_TAG_LEN].copy_from_slice(&self.owner_tag);
 		if self.kind == KIND_DIR {
-			buf[32..40].copy_from_slice(&self.dir_root.to_le_bytes());
-			buf[40..44].copy_from_slice(&self.dir_root_crc.to_le_bytes());
+			buf[INO_MAP_OFF..INO_MAP_OFF + 8].copy_from_slice(&self.dir_root.to_le_bytes());
+			buf[INO_MAP_CRC_OFF..INO_MAP_CRC_OFF + 4].copy_from_slice(&self.dir_root_crc.to_le_bytes());
 		} else {
-			buf[32..40].copy_from_slice(&self.spill.to_le_bytes());
-			buf[40..44].copy_from_slice(&self.spill_crc.to_le_bytes());
-			buf[44..48].copy_from_slice(&self.extent_count.to_le_bytes());
+			buf[INO_MAP_OFF..INO_MAP_OFF + 8].copy_from_slice(&self.spill.to_le_bytes());
+			buf[INO_MAP_CRC_OFF..INO_MAP_CRC_OFF + 4].copy_from_slice(&self.spill_crc.to_le_bytes());
+			buf[INO_EXTENT_COUNT_OFF..INO_EXTENT_COUNT_OFF + 4].copy_from_slice(&self.extent_count.to_le_bytes());
 			for (i, ext) in self.extents.iter().take(EXTENTS_INLINE).enumerate() {
 				let off = EXTENT_OFF + i * EXTENT_SIZE;
 				ext.write(&mut buf[off..off + EXTENT_SIZE]);
@@ -654,6 +713,9 @@ pub struct LiberFs<D: BlockDevice> {
 	uuid: [u8; 16],
 	label: [u8; LABEL_MAX],
 	compress: bool,
+	// One reusable block-sized buffer for the per-block hot paths (the copy-on-write
+	// copy loop), taken and returned with mem::take so no allocation rides every block.
+	scratch: Vec<u8>,
 	clock: u64,
 }
 

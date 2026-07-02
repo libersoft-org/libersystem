@@ -24,7 +24,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			} else {
 				let child = self.dir_lookup(parent, seg)?.ok_or(FsError::NotFound)?;
 				if self.read_inode(child)?.kind != KIND_DIR {
-					return Err(FsError::Invalid);
+					return Err(FsError::NotDir);
 				}
 				child
 			};
@@ -36,7 +36,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn dir_lookup_or_create(&mut self, parent: u32, name: &[u8]) -> Result<u32, FsError> {
 		if let Some(child) = self.dir_lookup(parent, name)? {
 			if self.read_inode(child)?.kind != KIND_DIR {
-				return Err(FsError::Invalid);
+				return Err(FsError::NotDir);
 			}
 			return Ok(child);
 		}
@@ -496,21 +496,21 @@ pub(crate) fn name_hash(name: &[u8]) -> u64 {
 // name moves cleanly to FAT / NTFS media and other systems.
 pub(crate) fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
 	if path.is_empty() {
-		return Err(FsError::Invalid);
+		return Err(FsError::BadName);
 	}
 	let mut segs = Vec::new();
 	for seg in path.split(|&b| b == b'/') {
 		if seg.is_empty() || seg == b"." || seg == b".." {
-			return Err(FsError::Invalid);
+			return Err(FsError::BadName);
 		}
 		if seg.len() > NAME_MAX {
 			return Err(FsError::TooLong);
 		}
 		if core::str::from_utf8(seg).is_err() {
-			return Err(FsError::Invalid);
+			return Err(FsError::BadName);
 		}
 		if seg.iter().any(|&c| !is_portable_name_byte(c)) {
-			return Err(FsError::Invalid);
+			return Err(FsError::BadName);
 		}
 		segs.push(seg);
 	}
