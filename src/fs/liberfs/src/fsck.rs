@@ -51,6 +51,16 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(FsckReport { checksum_failures, damaged })
 	}
 
+	// Read the whole file at `path` out of the named snapshot's pinned generation,
+	// without mounting a second filesystem: a table lookup re-roots the read through
+	// `with_root`, so the cost is the file's, not a volume walk. The one-file read
+	// behind the service's snap-open.
+	pub fn read_file_from_snapshot(&mut self, snapshot: &[u8], path: &[u8]) -> Result<Vec<u8>, FsError> {
+		let snap = self.snapshots.iter().find(|s| s.name == snapshot).ok_or(FsError::NotFound)?;
+		let (root, crc) = (snap.inode_root, snap.inode_root_crc);
+		self.with_root(root, crc, |fs| fs.read_file(path))
+	}
+
 	// Copy the file at `path` out of a pinned generation into the live tree: the
 	// recovery verb for a file fsck named. `snapshot` picks a named snapshot; an empty
 	// name picks the previous generation (the rolling one-commit-back snapshot). The

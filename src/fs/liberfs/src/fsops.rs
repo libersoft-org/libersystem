@@ -159,8 +159,12 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Switch transparent compression on or off for the volume. Governs new whole-file
 	// writes only: existing extents keep their current form (a raw file compresses on
 	// its next whole-file rewrite; a compressed one stays readable and thaws on partial
-	// writes as always). Commits atomically like any mutation.
+	// writes as always). Commits atomically like any mutation; a read-only mount
+	// refuses even a no-change request, so the policy has no side door.
 	pub fn set_compression(&mut self, enabled: bool) -> Result<(), FsError> {
+		if self.read_only {
+			return Err(FsError::ReadOnly);
+		}
 		if self.compress == enabled {
 			return Ok(());
 		}

@@ -116,15 +116,15 @@ const MAGIC: [u8; 8] = *b"LIBERFS1";
 const VERSION: u32 = 1;
 // Feature flags the superblock must carry, bit for bit: bit 0 is the second-revision
 // layout (variable-length directory records, the chained snapshot table, the identity
-// and algorithm fields, per-volume compression). Unknown or missing bits reject the
-// mount.
-const FEATURES: u64 = 0x1;
+// and algorithm fields, per-volume compression); bit 1 is the 256-byte label field
+// (the algorithm bytes moved past it). Unknown or missing bits reject the mount.
+const FEATURES: u64 = 0x3;
 // Algorithm identifiers recorded in the superblock, so a mount never verifies with the
 // wrong checksum or decodes with the wrong codec.
 const CSUM_ALGO_CRC32C: u8 = 1;
 const CODEC_LZ4: u8 = 2;
 // The volume label's fixed on-disk field width (NUL padded).
-const LABEL_MAX: usize = 32;
+const LABEL_MAX: usize = 256;
 
 // The two superblock slots (blocks 0 and 1): a commit writes the new superblock to the
 // inactive slot, so the active one survives a torn write. The block pool begins right
@@ -411,9 +411,9 @@ const SB_SNAP_ROOT_CRC_OFF: usize = 68;
 const SB_FEATURES_OFF: usize = 72;
 const SB_UUID_OFF: usize = 80;
 const SB_LABEL_OFF: usize = 96;
-const SB_CSUM_ALGO_OFF: usize = 128;
-const SB_CODEC_OFF: usize = 129;
-const SB_COMPRESS_OFF: usize = 130;
+const SB_CSUM_ALGO_OFF: usize = SB_LABEL_OFF + LABEL_MAX;
+const SB_CODEC_OFF: usize = SB_CSUM_ALGO_OFF + 1;
+const SB_COMPRESS_OFF: usize = SB_CODEC_OFF + 1;
 
 // A named snapshot pins an earlier generation's inode-tree root so its blocks are not
 // reclaimed. The snapshot table is a chain of blocks rooted at `snap_root`: each block

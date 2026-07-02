@@ -768,9 +768,16 @@ fn a_named_snapshot_reads_an_earlier_state() {
 	let mut live = LiberFs::mount(dev.clone()).unwrap();
 	assert_eq!(live.read_file(b"f").unwrap(), b"version two");
 
-	// the named snapshot reads the state captured when it was created.
-	let mut snap = LiberFs::mount_named_snapshot(dev, b"before").unwrap();
+	// the named snapshot reads the state captured when it was created - through a
+	// snapshot mount, and through the cheap in-place read the service's snap-open
+	// rides (no second mount, no volume walk).
+	let mut snap = LiberFs::mount_named_snapshot(dev.clone(), b"before").unwrap();
 	assert_eq!(snap.read_file(b"f").unwrap(), b"version one");
+	let mut live = LiberFs::mount(dev).unwrap();
+	assert_eq!(live.read_file_from_snapshot(b"before", b"f").unwrap(), b"version one");
+	assert_eq!(live.read_file_from_snapshot(b"missing", b"f"), Err(FsError::NotFound));
+	// the re-rooted read leaves the live tree exactly where it was.
+	assert_eq!(live.read_file(b"f").unwrap(), b"version two");
 }
 
 #[test]
@@ -1015,12 +1022,14 @@ fn compression_is_off_by_default_and_togglable() {
 
 #[test]
 fn the_volume_identity_survives_a_remount() {
-	let opts = FormatOpts { uuid: [7u8; 16], label: b"system".to_vec(), compress: false };
+	// a label well past the old 32-byte field proves the 256-byte width.
+	let long: Vec<u8> = b"backup-volume-".iter().cycle().take(200).copied().collect();
+	let opts = FormatOpts { uuid: [7u8; 16], label: long.clone(), compress: false };
 	let fs = LiberFs::format_opts(MemDevice::new(NBLOCKS), NBLOCKS, opts).unwrap();
 	let dev = fs.into_device();
 	let fs = LiberFs::mount(dev).unwrap();
 	assert_eq!(fs.uuid(), [7u8; 16]);
-	assert_eq!(fs.label(), b"system");
+	assert_eq!(fs.label(), &long[..]);
 }
 
 #[test]
@@ -1221,6 +1230,8 @@ fn snapshot_mounts_refuse_writes() {
 	assert_eq!(named.write_at(b"f", 0, b"x"), Err(FsError::ReadOnly));
 	assert_eq!(named.rename(b"f", b"g"), Err(FsError::ReadOnly));
 	assert_eq!(named.create_snapshot(b"more"), Err(FsError::ReadOnly));
+	// even a no-change compression request is refused: the policy has no side door.
+	assert_eq!(named.set_compression(false), Err(FsError::ReadOnly));
 
 	// the live mount stays writable.
 	let mut live = LiberFs::mount(dev).unwrap();
@@ -1634,12 +1645,12 @@ fn the_superblock_layout_matches_the_specification() {
 	assert_eq!(&block[52..56], &0u32.to_le_bytes(), "root_inode");
 	assert_eq!(&block[60..68], &0x2233_4455_6677_8899u64.to_le_bytes(), "snap_root");
 	assert_eq!(&block[68..72], &0xCAFE_BABEu32.to_le_bytes(), "snap_root_crc");
-	assert_eq!(&block[72..80], &1u64.to_le_bytes(), "feature flags");
+	assert_eq!(&block[72..80], &3u64.to_le_bytes(), "feature flags");
 	assert_eq!(&block[80..96], b"0123456789abcdef", "uuid");
 	assert_eq!(&block[96..102], b"golden", "label");
-	assert_eq!(block[128], 1, "checksum algorithm id (CRC32C)");
-	assert_eq!(block[129], 2, "codec id (LZ4)");
-	assert_eq!(block[130], 1, "compression switch");
+	assert_eq!(block[352], 1, "checksum algorithm id (CRC32C)");
+	assert_eq!(block[353], 2, "codec id (LZ4)");
+	assert_eq!(block[354], 1, "compression switch");
 	// the self-CRC at 56..60 covers the whole block with its own bytes zeroed.
 	let stored = u32::from_le_bytes(block[56..60].try_into().unwrap());
 	let mut probe = block.clone();

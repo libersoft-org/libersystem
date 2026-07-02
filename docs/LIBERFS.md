@@ -73,7 +73,7 @@ the others.
 | Max name length | 255 bytes (UTF-8) | 255 bytes | 255 bytes | 255 bytes | 255 bytes | 255 UTF-16 units | 255 UTF-16 units | 8.3 (255 UTF-16 with VFAT LFN) |
 | Max path length | unbounded | unbounded | unbounded | unbounded | unbounded | 32 767 UTF-16 units | 32 767 | 260 (classic Windows APIs) |
 | Snapshots per volume | unbounded (chained table) | 2^64 | unbounded | n/a | n/a | VSS-bound | n/a | n/a |
-| Volume label | 32 bytes UTF-8 | 256 | 256 | 12 | 16 | 32 UTF-16 | 11 | 11 |
+| Volume label | 256 bytes UTF-8 | 256 | 256 | 12 | 16 | 32 UTF-16 | 11 | 11 |
 
 LiberFS's figures are format ceilings; today's implementation also keeps a
 1-bit-per-block free map in memory (32 MiB of RAM per TiB of volume), which is
@@ -229,7 +229,7 @@ under `cargo test`. It backs `Storage.Volume`, the same typed contract every
 other backend uses, so foreign media mounts the same way: LiberSystem reads and
 writes FAT (incl. exFAT) and reads ISO9660 and UDF behind that one API.
 
-## On-disk format specification (version 1, features 0x1)
+## On-disk format specification (version 1, features 0x3)
 
 The authoritative field-level layout, sufficient for an independent
 implementation on any OS or architecture. The reference test suite pins these
@@ -273,13 +273,13 @@ feature-flag bit and update this section.
 | 56  | 4  | self-CRC: CRC32C over the whole block with these 4 bytes zeroed |
 | 60  | 8  | snap_root: first block of the snapshot chain (0 = none) |
 | 68  | 4  | snap_root_crc: CRC32C of that block |
-| 72  | 8  | feature flags, = 0x1; a reader MUST reject unknown or missing bits |
+| 72  | 8  | feature flags, = 0x3 (bit 0 the base revision, bit 1 the 256-byte label); a reader MUST reject unknown or missing bits |
 | 80  | 16 | volume uuid (opaque 16 bytes, assigned at format) |
-| 96  | 32 | volume label (UTF-8, NUL padded) |
-| 128 | 1  | checksum algorithm id, = 1 (CRC32C) |
-| 129 | 1  | compression codec id, = 2 (LZ4) |
-| 130 | 1  | compression switch: 1 = new whole-file writes compress |
-| 131 | -  | reserved to end of block |
+| 96  | 256 | volume label (UTF-8, NUL padded) |
+| 352 | 1  | checksum algorithm id, = 1 (CRC32C) |
+| 353 | 1  | compression codec id, = 2 (LZ4) |
+| 354 | 1  | compression switch: 1 = new whole-file writes compress |
+| 355 | -  | reserved to end of block |
 
 Mount: parse both slots; a slot is valid if magic, version, block size, feature
 flags, algorithm ids and the self-CRC all check. The valid slot with the higher

@@ -363,12 +363,9 @@ impl volume::Service for Volume {
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => {
-				// open a second, read-only view re-rooted at the snapshot over the same
-				// block backing (the channel handle is shared, not consumed).
-				let chan: u64 = fs.device().chan;
-				let base: u64 = fs.device().base;
-				let mut snap: LiberFs<ChannelBlockDevice> = LiberFs::mount_named_snapshot(ChannelBlockDevice { chan, base }, snapshot.as_bytes()).ok_or(Error::NotFound)?;
-				let file: Vec<u8> = snap.read_file(name).map_err(map_fs_err)?;
+				// a cheap re-rooted read on the live mount - one table lookup plus the
+				// file's own blocks, never a second mount or a volume walk.
+				let file: Vec<u8> = fs.read_file_from_snapshot(snapshot.as_bytes(), name).map_err(map_fs_err)?;
 				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
 				Ok(OpenResult { file: handle, size: file.len() as u64 })
 			}
@@ -725,10 +722,18 @@ unsafe fn disk_pool_blocks(block_client: u64) -> u64 {
 // a LiberFS volume with this GUID and the volume is found by it.
 const LIBERFS_GUID_ON_DISK: [u8; 16] = [0x53, 0x46, 0x42, 0x4C, 0x01, 0x00, 0x00, 0x40, 0x80, 0x00, 0x4C, 0x69, 0x62, 0x65, 0x72, 0x46];
 
-// Probe the disk for a GPT and return the first partition carrying the LiberFS type
-// GUID as its (first LBA, last LBA), or None (no GPT, or no LiberFS partition - the
-// fixed factory layout applies then). Reads the header at LBA 1 and walks the entry
-// array it points at, one 8-sector page at a time.
+// The smallest partition worth mounting, in 512-byte sectors: 16 filesystem blocks
+// (two superblock slots, the root leaf, and room to breathe). A GPT entry below this
+// is ignored - the disk's content must never be able to kill the storage service by
+// making the format fail.
+const MIN_PARTITION_SECTORS: u64 = 16 * SECTORS_PER_BLOCK;
+
+// Probe the disk for a GPT and return the first usable partition carrying the
+// LiberFS type GUID as its (first LBA, last LBA), or None (no GPT, or no usable
+// LiberFS partition - the fixed factory layout applies then). Reads the header at
+// LBA 1 and walks the entry array it points at, one 8-sector page at a time. A
+// malformed header (the GPT spec requires a power-of-two entry size >= 128) or a
+// degenerate entry (an impossible or too-small span) is skipped, never trusted.
 unsafe fn gpt_liberfs_partition(block_client: u64) -> Option<(u64, u64)> {
 	unsafe {
 		let mut header = [0u8; SECTOR_SIZE];
@@ -741,7 +746,7 @@ unsafe fn gpt_liberfs_partition(block_client: u64) -> Option<(u64, u64)> {
 		let entries_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
 		let num_entries = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
 		let entry_size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
-		if entry_size < 128 || entry_size > SECTOR_SIZE || num_entries == 0 {
+		if entry_size < 128 || entry_size > SECTOR_SIZE || !entry_size.is_power_of_two() || num_entries == 0 {
 			return None;
 		}
 		// walk the entry array a page (8 sectors) at a time; a standard 128-entry,
@@ -763,7 +768,9 @@ unsafe fn gpt_liberfs_partition(block_client: u64) -> Option<(u64, u64)> {
 				if e[0..16] == LIBERFS_GUID_ON_DISK {
 					let first = u64::from_le_bytes(e[32..40].try_into().unwrap());
 					let last = u64::from_le_bytes(e[40..48].try_into().unwrap());
-					if first != 0 && last > first {
+					// a degenerate span is skipped, not fatal: keep scanning, another
+					// entry may be the real volume.
+					if first != 0 && last > first && last - first + 1 >= MIN_PARTITION_SECTORS {
 						return Some((first, last));
 					}
 				}
