@@ -1209,7 +1209,7 @@ multi-page DMA buffers.
 - Done when: bulk disk and network I/O move in large requests, the measured throughput improves accordingly, tests green.
 - Concept: M23/M24/M62 (the drivers this accelerates), the limits audit (the last "one page" assumptions removed).
 
-## LiberFS audit track (M73-M76)
+## LiberFS audit track (M73-M77)
 
 A full read of the crate (~3900 lines: lib/txn/fsops/dir/inode/blkalloc/snapshot/
 fsck + tests) plus the service and driver wiring around it (2026-07-02). The core -
@@ -1320,6 +1320,39 @@ allocation churn, error granularity, and the test-coverage gaps the audit found.
   - Result: all hold - liberfs 73 host tests, kernel 85 fresh + 85 mount, build 0 warnings.
 - Concept: the codebase-uniformity principle (one transaction shape, one buffer discipline), M73/M75 (whose new tests these gaps complement).
 
+## M77 - LiberFS: post-audit sweep (the re-review's findings)
+
+A second full read of the crate after M73-M76 landed (2026-07-02, ~5500 lines).
+The core re-verified clean - transactions, dead lists, cache shadowing
+(wcsum/rcsum), ping-pong reclaim, split/collapse, the LZ4 margins. What remains
+are diagnostics-trust and I/O-efficiency leftovers plus hygiene, none of it
+data-endangering. Priorities: P1 = fix first (diagnostics correctness), P2 =
+worthwhile now (real I/O or documentation debt), P3 = hygiene when touching the
+area anyway.
+
+Bugs and correctness:
+- [ ] (P1) `fsck` can verify from RAM instead of the disk: it never clears `icache`/`dcache`/`rcsum`/`decomp`, so a cached inode skips its tree-path and spill-chain CRC verification and `count_corrupt` may serve a checksum block from the read cache - a damaged metadata block behind a cached inode escapes the report and fsck says clean. Integrity is not at risk (a real read still surfaces the corruption); the DIAGNOSIS lies. Fix: drop all four caches at the top of `fsck`.
+- [ ] (P2) The module doc in lib.rs still describes the compression as "a small, dependency-free LZSS coder" and does not mention the per-volume switch or the off-by-default policy - the crate's front page lies about the format since M75.
+- [ ] (P3) `reserve_run` silently truncates `len as u32`: a single write past 16 TiB would claim more blocks than the stored run count ever consumes or releases, leaking free-map bits until the next full rederivation. Unreachable today (the data would not fit in memory) - clamp the reservation anyway, it is one line.
+- [ ] (P3) `decompress_extent` trusts `ext.clen` off the disk in `&comp[..ext.clen as usize]`. The extent record is CRC-protected by its parent, so this cannot fire without a checksum collision - but a defensive `.min(comp.len())` costs nothing and removes the theoretical panic.
+- [ ] (P3) `fsck` verifies the pinned snapshot generations' inode trees and file data but not their DIRECTORY trees; corruption in a snapshot's directory node surfaces only when `mount_named_snapshot` walks it. Either extend the walk or document the gap at the fsck comment.
+
+Optimizations:
+- [ ] (P2) `write_logical`'s overwrite path copies the old block via `cow_data` (a read plus a write) and then immediately overwrites the copy whole - the caller always passes a full block, so the copy is pure waste. Replace with allocate-and-drop (keep the in-place fast path for fresh blocks): an overwritten block costs 1 device op instead of 3. The biggest remaining I/O win (write_at / truncate-tail workloads).
+- [ ] (P3) `place_block`'s new-extent path writes the checksum block to the device and the first extension immediately reads it back into `wcsum`. Seeding `wcsum` directly (no device write; the flush handles it) saves a write and a read per new extent.
+- [ ] (P3) The inode and dentry caches evict the SMALLEST key (`BTreeMap::keys().next()`): inode 0 and the root directory's entries - the hottest items in the volume - are always first out. Evict the last (or a rotating) key instead.
+- [ ] (P3) `write_file_inner` clones the old inode (`o.clone()`, the whole extent Vec) just to call `drop_inode_blocks` - the value is a local, not borrowed from self, so the clone is a borrow-checker relic. Pass the reference.
+- [ ] (P3) `append_inner` resolves the path twice (its own `resolve`, then `write_at_inner`'s `resolve_parent`); the dentry cache muffles it, but sharing the resolution is cleaner.
+- [ ] (P3) `icache_put` clones the whole inode (extent Vec included) on every `write_inode` - ~10 KB per write for a 256-extent file. Consider caching only bounded-size maps on the write path, or an Rc-style shared map, when a measurement asks for it.
+
+Deduplication and cleanliness:
+- [ ] (P3) The chain-walk skeleton (read block, take next pointer, bound-check) exists six times: dropping and marking the spill chain, loading it, dropping and loading the snapshot chain, dropping the superseded chain in `flush_extents`. One `walk_chain` helper would also unify the bound checks.
+- [ ] (P3) `for b in buf.iter_mut() { *b = 0; }` survives at ten sites while other code uses `buf.fill(0)` - one style should win (fill).
+- [ ] (P3) `EXTENT_HDR` (= 16) duplicates `CHAIN_HDR` since the M76 header unification - the extent-chain code should reference `CHAIN_HDR` and the old constant should go.
+- [ ] (P3) The internal-node routing loop (`while ci < count && sep_key(&buf, ci) <= key`) is copied six times across the two trees' lookup/insert/delete - a tiny `route_child(buf, count, key)` helper ends the copies.
+- Done when: fsck verifies from the disk (P1), the overwrite path writes each block once and the module doc tells the truth (P2), and whichever P3 items land leave the suite green - liberfs host tests, kernel fresh + mount, build 0 warnings.
+- Concept: the M73-M76 audit track this sweeps up after; the codebase-uniformity principle (the P3 hygiene items).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
@@ -1342,7 +1375,7 @@ workloads; multi-queue devices and the per-CPU interrupt-vector spaces they need
 (one vector number per device suffices until then - the M72 throughput work stays
 single-queue); immutable signed system + A/B updates + rollback + verified boot;
 encrypted user volumes; LiberFS work beyond the M53-M57 modernization and the
-M73-M76 audit track (online
+M73-M77 audit track (online
 resize, online defrag, multi-device / RAID; deduplication and encryption stay out by decision);
 first-party server apps (a
 static-file web server and the like); and a CLI package manager over the phase-2
