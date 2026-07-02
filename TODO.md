@@ -1209,7 +1209,7 @@ multi-page DMA buffers.
 - Done when: bulk disk and network I/O move in large requests, the measured throughput improves accordingly, tests green.
 - Concept: M23/M24/M62 (the drivers this accelerates), the limits audit (the last "one page" assumptions removed).
 
-## LiberFS audit track (M73-M78)
+## LiberFS audit track (M73-M79)
 
 A full read of the crate (~3900 lines: lib/txn/fsops/dir/inode/blkalloc/snapshot/
 fsck + tests) plus the service and driver wiring around it (2026-07-02). The core -
@@ -1393,6 +1393,27 @@ host mkfs/fsck tools.)
   - Result: all hold - liberfs 76 host tests (2 new), kernel 86 fresh + 86 mount (1 new), build 0 warnings.
 - Concept: the portability answer to "will it run under Windows/Linux/macOS drivers and on ARM/RISC-V" - the format was born agnostic, now it is specified, test-pinned and discoverable.
 
+## M79 - LiberFS: third-review fixes (GPT robustness, snap_open cost)
+
+The third full source pass (2026-07-03, after M77/M78 landed) re-verified the
+new machinery - wcsum seeding against the CoW paths, the copy-free overwrite
+against the split logic, the chain walker's ordering, the u64 arithmetic, GPT
+alignment - and found four fixables, none data-endangering: two
+disk-content-robustness holes in the new GPT probe, one O(volume) request cost,
+one policy inconsistency. (Recorded theoretical non-fixes: a full directory
+leaf sharing ONE 64-bit name hash would strand a record at the split - a
+~290-way FNV-64 collision, acknowledged at the code; the seed-archive probe on
+a GPT disk reads the protective MBR and correctly no-ops on the magic
+mismatch.)
+
+- [ ] (B1, high) A degenerate GPT partition kills StorageService: an entry carrying the LiberFS type GUID but spanning fewer sectors than the minimum pool makes `format_opts` fail, `mount_or_format` return None, and the BLOCK arm `exit()` - the DISK'S CONTENT can deny the whole storage service. Ignore partitions below a sane minimum pool (fall back to the factory layout) instead of dying.
+- [ ] (B2, medium) The GPT probe accepts a non-power-of-two `entry_size` (e.g. 384): entries then straddle the 8-sector read pages and the fixed-stride slot math parses garbage offsets. The GPT spec requires a power of two >= 128 - enforce `is_power_of_two()`.
+- [ ] (B3, medium) `snap_open` mounts a whole second filesystem per request: `mount_named_snapshot` runs the full free-map derivation - an O(volume) walk to read one file out of a snapshot. The crate already has the right mechanism (`with_root`, which `restore_file` rides): add `LiberFs::read_file_from_snapshot(snapshot, path)` (table lookup + `with_root` + `read_file`) and route the service's `snap_open` through it - O(file) per request, and the duplicated per-request mount machinery goes.
+- [ ] (B4, low) `set_compression` returns Ok for a no-change value BEFORE the read-only gate, so `volume compress off` on a degraded read-only volume reports success instead of `denied`. Check `read_only` first.
+- [ ] Grow the volume label from 32 to 256 bytes (UTF-8 stays): the superblock is reserved zeros from offset 131 on, so the label field can widen in place behind a feature-flag bump - riding this milestone so the format change ships with the GPT hardening. Update the spec tables, the golden layout test, and the limits row in LIBERFS.md.
+- Done when: a hostile or corrupt GPT cannot kill or misdirect the storage service (covered by a kernel test with a degenerate entry), `snap_open` costs O(file), the read-only policy has no side door, the label holds 256 bytes across a remount, and the suite stays green.
+- Concept: M78 (the GPT probe this hardens), M77 (`with_root`, the mechanism B3 reuses), the M73 read-only policy (B4 closes its last gap).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
@@ -1415,7 +1436,7 @@ workloads; multi-queue devices and the per-CPU interrupt-vector spaces they need
 (one vector number per device suffices until then - the M72 throughput work stays
 single-queue); immutable signed system + A/B updates + rollback + verified boot;
 encrypted user volumes; LiberFS work beyond the M53-M57 modernization and the
-M73-M78 audit track (online
+M73-M79 audit track (online
 resize, online defrag, multi-device / RAID; deduplication and encryption stay out by decision);
 first-party server apps (a
 static-file web server and the like); and a CLI package manager over the phase-2
