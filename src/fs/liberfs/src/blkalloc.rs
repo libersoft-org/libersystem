@@ -217,12 +217,15 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Walk a chain of blocks (the shared CHAIN_* header) from `start`, calling `f` with
 	// each block's pointer before following its next pointer. The walk is raw (no CRC
 	// check, matching the old-generation walks) and stops at a pointer outside the
-	// pool, so a corrupt link never panics the walker or wanders into garbage. The one
-	// skeleton behind dropping, marking, and releasing every chain.
+	// pool, so a corrupt link never panics the walker or wanders into garbage; a step
+	// counter stops a corrupt link that loops (no chain can be longer than the pool).
+	// The one skeleton behind dropping, marking, and releasing every chain.
 	pub(crate) fn walk_chain(&mut self, start: u64, mut f: impl FnMut(&mut Self, u64)) -> Result<(), FsError> {
 		let mut ptr = start;
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		while ptr != 0 && ptr < self.num_blocks {
+		let mut steps = 0u64;
+		while ptr != 0 && ptr < self.num_blocks && steps < self.num_blocks {
+			steps += 1;
 			f(self, ptr);
 			if !self.dev.read_block(ptr, &mut buf) {
 				return Err(FsError::Io);
@@ -585,9 +588,10 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 		}
 		// clen is CRC-protected with the extent record, but bound it defensively anyway:
-		// a slice past the stored bytes must never panic.
+		// a slice past the stored bytes must never panic. The decoder is bounded by the
+		// run's logical size, so a lying stream header cannot demand an absurd allocation.
 		let clen = (ext.clen as usize).min(comp.len());
-		Ok(lz_decompress(&comp[..clen]))
+		Ok(lz_decompress(&comp[..clen], ext.length as usize * BLOCK_SIZE))
 	}
 
 	// Try to transparently compress each of a freshly written file's raw extents in
@@ -843,14 +847,16 @@ fn lz_put_extra(out: &mut Vec<u8>, len: usize, nibble_max: usize) {
 	out.push(rest as u8);
 }
 
-// Decode a stream produced by `lz_compress` back into its original bytes. Bounds-checked
-// throughout, so a malformed stream yields whatever decoded cleanly rather than panicking
-// (a compressed extent's stored blocks are checksum-verified before this is called).
-pub(crate) fn lz_decompress(src: &[u8]) -> Vec<u8> {
+// Decode a stream produced by `lz_compress` back into its original bytes, capped at
+// `max` (the caller knows the run's logical size). Bounds-checked throughout, so a
+// malformed stream yields whatever decoded cleanly rather than panicking - and the
+// stream's own length header is clamped to `max`, so hostile bytes (which can carry
+// valid checksums) cannot demand an unbounded allocation.
+pub(crate) fn lz_decompress(src: &[u8], max: usize) -> Vec<u8> {
 	if src.len() < 4 {
 		return Vec::new();
 	}
-	let n = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
+	let n = (u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize).min(max);
 	let mut out = Vec::with_capacity(n);
 	let mut p = 4;
 	while out.len() < n && p < src.len() {
@@ -867,7 +873,8 @@ pub(crate) fn lz_decompress(src: &[u8]) -> Vec<u8> {
 		if p + lit > src.len() {
 			return out;
 		}
-		out.extend_from_slice(&src[p..p + lit]);
+		let take = lit.min(n - out.len());
+		out.extend_from_slice(&src[p..p + take]);
 		p += lit;
 		if out.len() >= n || p + 2 > src.len() {
 			break;
@@ -887,7 +894,7 @@ pub(crate) fn lz_decompress(src: &[u8]) -> Vec<u8> {
 			return out;
 		}
 		let start = out.len() - offset;
-		for k in 0..ml {
+		for k in 0..ml.min(n - out.len()) {
 			let byte = out[start + k];
 			out.push(byte);
 		}

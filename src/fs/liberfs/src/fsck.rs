@@ -8,7 +8,10 @@ impl<D: BlockDevice> LiberFs<D> {
 	// alone would leave the operator knowing something is wrong but not what. The
 	// pinned snapshot generations are verified too - inode trees, directory trees and
 	// file data (counted; their files are named under the snapshot's own mount, not
-	// here). The free map is also rederived, which is a no-op on a consistent volume.
+	// here). Metadata damage is REPORTED, never fatal: a corrupt tree node counts as a
+	// failure (named by path where one is known) and the walk continues, so one bad
+	// node cannot silence the report of everything else. The free map is also
+	// rederived, which is a no-op on a consistent volume.
 	pub fn fsck(&mut self) -> Result<FsckReport, FsError> {
 		// verify the DISK, not the caches: a cached inode would skip its tree-path and
 		// spill-chain verification, and a cached checksum block its re-read - damage
@@ -20,24 +23,41 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.derive_free()?;
 		let mut checksum_failures = 0u32;
 		let mut damaged: Vec<Vec<u8>> = Vec::new();
-		// walk the live namespace from the root, tracking each file's full path.
+		// walk the live namespace from the root, tracking each file's full path (the
+		// root directory itself reports as "/").
 		let mut stack: Vec<(u32, Vec<u8>)> = vec![(self.root_inode, Vec::new())];
 		while let Some((dir, prefix)) = stack.pop() {
-			for (name, child) in self.dir_entries_of(dir)? {
+			let entries = match self.dir_entries_of(dir) {
+				Ok(entries) => entries,
+				Err(FsError::Corrupt) => {
+					checksum_failures += 1;
+					damaged.push(if prefix.is_empty() { b"/".to_vec() } else { prefix });
+					continue;
+				}
+				Err(e) => return Err(e),
+			};
+			for (name, child) in entries {
 				let mut path = prefix.clone();
 				if !path.is_empty() {
 					path.push(b'/');
 				}
 				path.extend_from_slice(&name);
-				let inode = self.read_inode(child)?;
-				if inode.kind == KIND_DIR {
-					stack.push((child, path));
-				} else {
-					let bad = self.count_corrupt(&inode)?;
-					if bad > 0 {
-						checksum_failures += bad;
-						damaged.push(path);
+				let checked = self.read_inode(child).and_then(|inode| {
+					if inode.kind == KIND_DIR {
+						stack.push((child, path.clone()));
+						Ok(0)
+					} else {
+						self.count_corrupt(&inode)
 					}
+				});
+				let bad = match checked {
+					Ok(bad) => bad,
+					Err(FsError::Corrupt) => 1,
+					Err(e) => return Err(e),
+				};
+				if bad > 0 {
+					checksum_failures += bad;
+					damaged.push(path);
 				}
 			}
 		}
@@ -46,7 +66,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		// for it.
 		for i in 0..self.snapshots.len() {
 			let (root, crc) = (self.snapshots[i].inode_root, self.snapshots[i].inode_root_crc);
-			checksum_failures += self.check_inode_tree(root, crc)?;
+			checksum_failures += match self.check_inode_tree(root, crc) {
+				Ok(bad) => bad,
+				Err(FsError::Corrupt) => 1,
+				Err(e) => return Err(e),
+			};
 		}
 		Ok(FsckReport { checksum_failures, damaged })
 	}
@@ -102,48 +126,64 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Walk the inode B+tree, verifying every node against its stored checksum, and sum
 	// the corrupt data blocks of every live file. Directory inodes get their own tree
 	// walked and verified too, so a snapshot generation's directory damage is caught
-	// here and not only when the snapshot is mounted.
+	// here and not only when the snapshot is mounted. A corrupt subtree counts as a
+	// failure and the walk continues; only the root's own damage surfaces as the error
+	// (the caller counts it).
 	pub(crate) fn check_inode_tree(&mut self, ptr: u64, crc: u32) -> Result<u32, FsError> {
 		if ptr == 0 {
 			return Ok(0);
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
-		let count = node_count(&buf);
 		let mut bad = 0;
 		if node_type(&buf) == NODE_LEAF {
-			for i in 0..count {
+			for i in 0..leaf_count(&buf, INODE_REC) {
 				let off = NODE_HDR + i * INODE_REC + 8;
 				let mut inode = Inode::parse(&buf[off..off + INODE_SIZE]);
-				if inode.kind == KIND_FILE {
-					self.load_spill(&mut inode)?;
-					bad += self.count_corrupt(&inode)?;
+				let checked = if inode.kind == KIND_FILE {
+					self.load_spill(&mut inode).and_then(|()| self.count_corrupt(&inode))
 				} else if inode.kind == KIND_DIR {
-					self.check_dir_tree(inode.dir_root, inode.dir_root_crc)?;
-				}
+					self.check_dir_tree(inode.dir_root, inode.dir_root_crc)
+				} else {
+					Ok(0)
+				};
+				bad += match checked {
+					Ok(b) => b,
+					Err(FsError::Corrupt) => 1,
+					Err(e) => return Err(e),
+				};
 			}
 		} else {
-			for i in 0..=count {
-				bad += self.check_inode_tree(child_ptr(&buf, i), child_crc(&buf, i))?;
+			for i in 0..=internal_count(&buf) {
+				bad += match self.check_inode_tree(child_ptr(&buf, i), child_crc(&buf, i)) {
+					Ok(b) => b,
+					Err(FsError::Corrupt) => 1,
+					Err(e) => return Err(e),
+				};
 			}
 		}
 		Ok(bad)
 	}
 
 	// Walk a directory B+tree verifying every node against the CRC32C its parent link
-	// stored; damage surfaces as FsError::Corrupt.
-	pub(crate) fn check_dir_tree(&mut self, ptr: u64, crc: u32) -> Result<(), FsError> {
+	// stored, counting corrupt subtrees like `check_inode_tree`; only the root's own
+	// damage surfaces as the error (the caller counts it).
+	pub(crate) fn check_dir_tree(&mut self, ptr: u64, crc: u32) -> Result<u32, FsError> {
 		if ptr == 0 {
-			return Ok(());
+			return Ok(0);
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
+		let mut bad = 0;
 		if node_type(&buf) == NODE_INTERNAL {
-			let count = node_count(&buf);
-			for i in 0..=count {
-				self.check_dir_tree(child_ptr(&buf, i), child_crc(&buf, i))?;
+			for i in 0..=internal_count(&buf) {
+				bad += match self.check_dir_tree(child_ptr(&buf, i), child_crc(&buf, i)) {
+					Ok(b) => b,
+					Err(FsError::Corrupt) => 1,
+					Err(e) => return Err(e),
+				};
 			}
 		}
-		Ok(())
+		Ok(bad)
 	}
 }

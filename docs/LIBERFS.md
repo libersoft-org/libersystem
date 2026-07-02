@@ -255,6 +255,12 @@ feature-flag bit and update this section.
 - Compression is the **LZ4 block format**; a compressed stream is prefixed with
   its uncompressed length as a u32 (LE).
 - All "reserved" bytes are written as zero and ignored on read.
+- A checksum proves integrity, not sanity: a reader must **bound every count,
+  length and pointer it takes off the medium** before use - node entry counts by
+  what the node type can hold, extent lengths by one checksum block's coverage
+  (1024 blocks), the pool size by the device itself, chain walks by the pool
+  size (a corrupt link may loop) - so a hostile or corrupt volume degrades or is
+  refused, never crashes or hangs the reader.
 
 ### Superblock (blocks 0 and 1)
 

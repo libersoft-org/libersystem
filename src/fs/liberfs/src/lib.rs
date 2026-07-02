@@ -471,7 +471,12 @@ struct Extent {
 
 impl Extent {
 	fn parse(buf: &[u8]) -> Extent {
-		Extent { logical: u64::from_le_bytes(buf[0..8].try_into().unwrap()), physical: u64::from_le_bytes(buf[8..16].try_into().unwrap()), length: u32::from_le_bytes(buf[16..20].try_into().unwrap()), csum_crc: u32::from_le_bytes(buf[20..24].try_into().unwrap()), csum: u64::from_le_bytes(buf[24..32].try_into().unwrap()), store_len: u32::from_le_bytes(buf[32..36].try_into().unwrap()), clen: u32::from_le_bytes(buf[36..40].try_into().unwrap()) }
+		// clamp the lengths to what one checksum block can cover (the writer's own
+		// ceiling): the record comes off the medium, and a checksummed-but-hostile
+		// length must not drive the block loops or decode buffers past all reason.
+		let length = u32::from_le_bytes(buf[16..20].try_into().unwrap()).min(CRCS_PER_BLOCK as u32);
+		let store_len = u32::from_le_bytes(buf[32..36].try_into().unwrap()).min(CRCS_PER_BLOCK as u32);
+		Extent { logical: u64::from_le_bytes(buf[0..8].try_into().unwrap()), physical: u64::from_le_bytes(buf[8..16].try_into().unwrap()), length, csum_crc: u32::from_le_bytes(buf[20..24].try_into().unwrap()), csum: u64::from_le_bytes(buf[24..32].try_into().unwrap()), store_len, clen: u32::from_le_bytes(buf[36..40].try_into().unwrap()) }
 	}
 
 	fn write(&self, buf: &mut [u8]) {

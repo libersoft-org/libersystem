@@ -22,7 +22,9 @@ impl MemDevice {
 
 impl BlockDevice for MemDevice {
 	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
-		let start = index as usize * BLOCK_SIZE;
+		let Some(start) = (index as usize).checked_mul(BLOCK_SIZE) else {
+			return false;
+		};
 		let Some(src) = self.blocks.get(start..start + BLOCK_SIZE) else {
 			return false;
 		};
@@ -31,7 +33,9 @@ impl BlockDevice for MemDevice {
 	}
 
 	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
-		let start = index as usize * BLOCK_SIZE;
+		let Some(start) = (index as usize).checked_mul(BLOCK_SIZE) else {
+			return false;
+		};
 		let Some(dst) = self.blocks.get_mut(start..start + BLOCK_SIZE) else {
 			return false;
 		};
@@ -984,7 +988,7 @@ fn compression_checksums_catch_corruption() {
 #[test]
 fn the_codec_round_trips_varied_inputs() {
 	for input in [Vec::new(), vec![0u8; 9000], b"hello hello hello hello world".to_vec(), noise(8000)] {
-		assert_eq!(lz_decompress(&lz_compress(&input)), input);
+		assert_eq!(lz_decompress(&lz_compress(&input), input.len()), input);
 	}
 }
 
@@ -1677,7 +1681,9 @@ fn the_record_layouts_match_the_specification() {
 	assert_eq!(&rec[32..36], &0x5152_5354u32.to_le_bytes(), "store_len");
 	assert_eq!(&rec[36..40], &0x6162_6364u32.to_le_bytes(), "clen");
 	let back = Extent::parse(&rec);
-	assert_eq!((back.logical, back.physical, back.length, back.csum, back.csum_crc, back.store_len, back.clen), (ext.logical, ext.physical, ext.length, ext.csum, ext.csum_crc, ext.store_len, ext.clen));
+	// the parser clamps both lengths to one checksum block's coverage (CRCS_PER_BLOCK):
+	// the writer never exceeds it, so a larger stored value is hostile or corrupt.
+	assert_eq!((back.logical, back.physical, back.length, back.csum, back.csum_crc, back.store_len, back.clen), (ext.logical, ext.physical, CRCS_PER_BLOCK as u32, ext.csum, ext.csum_crc, CRCS_PER_BLOCK as u32, ext.clen));
 
 	// one file inode slot: 256 bytes, header fields then the file overlay.
 	let mut inode = Inode::empty(KIND_FILE);
@@ -1725,4 +1731,124 @@ fn the_record_layouts_match_the_specification() {
 	// the CRC32C test vector pins the checksum definition (Castagnoli, reflected,
 	// init and final xor 0xFFFFFFFF): the RFC 3720 example.
 	assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+}
+
+// hostile-disk robustness: a CRC32C proves integrity, not sanity - every count,
+// length and pointer off the medium is bounded before use, so an authored or
+// corrupt volume can never panic, hang or absurdly allocate the mount.
+
+// Doctor superblock slot `slot` in a raw device image: apply `f` to its bytes, then
+// recompute the self-CRC - the forgery a hostile author can always produce.
+fn forge_superblock(dev: &mut MemDevice, slot: usize, f: impl FnOnce(&mut [u8])) {
+	let sb = &mut dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE];
+	f(sb);
+	sb[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].fill(0);
+	let crc = crc32c(sb);
+	sb[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+}
+
+// The slot holding the live (higher) generation in a raw device image.
+fn active_slot(dev: &MemDevice) -> usize {
+	let slot_gen = |s: usize| parse_superblock(&dev.blocks[s * BLOCK_SIZE..(s + 1) * BLOCK_SIZE]).map(|sb| sb.generation);
+	if slot_gen(1) > slot_gen(0) { 1 } else { 0 }
+}
+
+#[test]
+fn an_insane_pool_size_in_the_superblock_is_refused() {
+	// a checksummed superblock can still lie about the pool: a claim below the fixed
+	// layout is rejected outright, one past the device fails the mount's probe of the
+	// last claimed block - either way None, never a panic or an absurd allocation.
+	let fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut dev = fs.into_device();
+	forge_superblock(&mut dev, 0, |sb| sb[SB_NUM_BLOCKS_OFF..SB_NUM_BLOCKS_OFF + 8].copy_from_slice(&0u64.to_le_bytes()));
+	assert!(LiberFs::mount(dev.clone()).is_none());
+	forge_superblock(&mut dev, 0, |sb| sb[SB_NUM_BLOCKS_OFF..SB_NUM_BLOCKS_OFF + 8].copy_from_slice(&(1u64 << 60).to_le_bytes()));
+	assert!(LiberFs::mount(dev).is_none());
+}
+
+#[test]
+fn a_corrupt_node_count_cannot_panic_the_mount() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"a.txt", b"payload").unwrap();
+	let root = fs.inode_root;
+	let mut dev = fs.into_device();
+	// stamp an impossible record count into the live tree's root (raw corruption, so
+	// the node no longer matches its CRC): the mount's raw generation walks clamp it
+	// and survive, and the verified read path reports the damage as itself.
+	let start = root as usize * BLOCK_SIZE;
+	dev.blocks[start + 2..start + 4].copy_from_slice(&u16::MAX.to_le_bytes());
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(b"a.txt"), Err(FsError::Corrupt));
+}
+
+#[test]
+fn a_checksummed_but_insane_node_count_cannot_panic_a_lookup() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"a.txt", b"payload").unwrap();
+	let root = fs.inode_root;
+	let mut dev = fs.into_device();
+	// a hostile author checksums whatever they write: stamp the impossible count AND
+	// forge the root CRC in the superblock so the node verifies. The clamp keeps every
+	// walk inside the block: the lookup completes with a sane outcome, never a panic.
+	let start = root as usize * BLOCK_SIZE;
+	dev.blocks[start + 2..start + 4].copy_from_slice(&u16::MAX.to_le_bytes());
+	let crc = crc32c(&dev.blocks[start..start + BLOCK_SIZE]);
+	let slot = active_slot(&dev);
+	forge_superblock(&mut dev, slot, |sb| sb[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes()));
+	let mut fs = LiberFs::mount(dev).unwrap();
+	let outcome = fs.read_file(b"a.txt");
+	assert!(matches!(outcome, Ok(_) | Err(FsError::NotFound) | Err(FsError::Corrupt)));
+	let _ = fs.fsck().unwrap();
+}
+
+#[test]
+fn a_looped_snapshot_chain_cannot_hang_the_mount() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"keep.txt", b"pinned").unwrap();
+	fs.create_snapshot(b"snap").unwrap();
+	let snap_root = fs.snap_root;
+	let mut dev = fs.into_device();
+	// loop the snapshot table's chain back onto itself: the mount's generation walk
+	// must terminate (marked means walked), and the CRC-checked table loader degrades
+	// the volume to read-only as with any table damage.
+	let start = snap_root as usize * BLOCK_SIZE;
+	dev.blocks[start..start + 8].copy_from_slice(&snap_root.to_le_bytes());
+	let fs = LiberFs::mount(dev).unwrap();
+	assert!(fs.is_read_only());
+}
+
+#[test]
+fn a_lying_compression_header_cannot_allocate_unbounded_memory() {
+	// the stream's own length header is attacker-controlled: the decoder clamps it to
+	// the caller's ceiling (the run's logical size) instead of allocating what it says.
+	let mut src = vec![0u8; 32];
+	src[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+	assert!(lz_decompress(&src, BLOCK_SIZE).len() <= BLOCK_SIZE);
+	// and a legitimate stream still round-trips under its real ceiling.
+	let input: Vec<u8> = b"bounded decode ".iter().cycle().take(4500).copied().collect();
+	assert_eq!(lz_decompress(&lz_compress(&input), input.len()), input);
+}
+
+#[test]
+fn a_write_past_the_addressable_end_is_refused() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	assert_eq!(fs.write_at(b"f", u64::MAX - 2, b"abc"), Err(FsError::Invalid));
+	// the failed transaction rolled back whole: not even the file was created.
+	assert_eq!(fs.lookup(b"f"), None);
+}
+
+#[test]
+fn fsck_reports_metadata_damage_instead_of_dying() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.mkdir(b"docs").unwrap();
+	fs.write_file(b"docs/a.txt", b"payload").unwrap();
+	let root = fs.inode_root;
+	let mut dev = fs.into_device();
+	// flip a byte in the inode tree's root: everything below it is unreadable, but
+	// fsck hands back a report naming the damage instead of dying on the first node.
+	dev.blocks[root as usize * BLOCK_SIZE + 100] ^= 0xFF;
+	let mut fs = LiberFs::mount(dev).unwrap();
+	let report = fs.fsck().unwrap();
+	assert!(report.checksum_failures >= 1);
+	assert_eq!(report.damaged, vec![b"/".to_vec()]);
 }

@@ -167,7 +167,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		{
 			let mut ptr = self.snap_root;
 			let mut buf = vec![0u8; BLOCK_SIZE];
-			while ptr != 0 && ptr < self.num_blocks {
+			while ptr != 0 && ptr < self.num_blocks && !test_bit(&live, ptr) {
 				set_bit(&mut live, ptr);
 				if !self.dev.read_block(ptr, &mut buf) {
 					return Err(FsError::Io);
@@ -216,13 +216,19 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		while let Some(ptr) = nodes.pop() {
+			// a pointer outside the pool is a corrupt link (skipped, not followed into
+			// whatever lies past the volume); an already-marked node is either a corrupt
+			// cycle (which must not hang the walk) or a subtree shared with an earlier
+			// root walked into the same map - marked means walked, so skip both.
+			if ptr >= self.num_blocks || test_bit(map, ptr) {
+				continue;
+			}
 			set_bit(map, ptr);
 			if !self.dev.read_block(ptr, &mut buf) {
 				return Err(FsError::Io);
 			}
-			let count = node_count(&buf);
 			if node_type(&buf) == NODE_LEAF {
-				for i in 0..count {
+				for i in 0..leaf_count(&buf, INODE_REC) {
 					let off = NODE_HDR + i * INODE_REC + 8;
 					let mut inode = Inode::parse(&buf[off..off + INODE_SIZE]);
 					if inode.kind == KIND_FILE {
@@ -236,7 +242,7 @@ impl<D: BlockDevice> LiberFs<D> {
 					}
 				}
 			} else {
-				for i in 0..=count {
+				for i in 0..=internal_count(&buf) {
 					nodes.push(child_ptr(&buf, i));
 				}
 			}
@@ -254,13 +260,16 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		while let Some(ptr) = nodes.pop() {
+			// same guards as `mark_inode_tree`: skip out-of-pool links and marked nodes.
+			if ptr >= self.num_blocks || test_bit(map, ptr) {
+				continue;
+			}
 			set_bit(map, ptr);
 			if !self.dev.read_block(ptr, &mut buf) {
 				return Err(FsError::Io);
 			}
 			if node_type(&buf) == NODE_INTERNAL {
-				let count = node_count(&buf);
-				for i in 0..=count {
+				for i in 0..=internal_count(&buf) {
 					nodes.push(child_ptr(&buf, i));
 				}
 			}
@@ -317,9 +326,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		loop {
 			self.read_node(ptr, crc, &mut buf)?;
-			let count = node_count(&buf);
 			if node_type(&buf) == NODE_LEAF {
-				let (mut lo, mut hi) = (0usize, count);
+				let (mut lo, mut hi) = (0usize, leaf_count(&buf, rec));
 				while lo < hi {
 					let mid = (lo + hi) / 2;
 					let off = NODE_HDR + mid * rec;
@@ -332,7 +340,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				return Ok(None);
 			}
 			// internal: route to the child whose range holds `key`.
-			let ci = route_child(&buf, count, key);
+			let ci = route_child(&buf, internal_count(&buf), key);
 			ptr = child_ptr(&buf, ci);
 			crc = child_crc(&buf, ci);
 		}
@@ -380,7 +388,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// node too and lifting the middle separator further. Shared by every tree flavour
 	// (the inode tree's fixed leaves, the directories' variable-record leaves).
 	pub(crate) fn internal_absorb(&mut self, buf: &mut [u8], ptr: u64, ci: usize, outcome: Ins) -> Result<Ins, FsError> {
-		let count = node_count(buf);
+		let count = internal_count(buf);
 		match outcome {
 			Ins::Updated(np, nc) => {
 				let dest = self.node_dest(ptr)?;
@@ -446,8 +454,8 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn tree_insert_node(&mut self, ptr: u64, crc: u32, key: u64, record: &[u8], rec: usize, leaf_max: usize, keylen: usize) -> Result<Ins, FsError> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
-		let count = node_count(&buf);
 		if node_type(&buf) == NODE_LEAF {
+			let count = leaf_count(&buf, rec);
 			// find the insert position, or an exact match by the full key.
 			let (mut lo, mut hi) = (0usize, count);
 			let mut exact = false;
@@ -512,7 +520,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(Ins::Split(left_dest, lcrc, sep, right_dest, rcrc));
 		}
 		// internal: route to a child and recurse; the shared absorber takes the outcome.
-		let ci = route_child(&buf, count, key);
+		let ci = route_child(&buf, internal_count(&buf), key);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
 		let outcome = self.tree_insert_node(cp, cc, key, record, rec, leaf_max, keylen)?;
@@ -560,7 +568,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// `ci`): rewire an updated child, or drop an emptied one along with an adjacent
 	// separator. Shared by every tree flavour.
 	pub(crate) fn internal_absorb_del(&mut self, buf: &mut [u8], ptr: u64, ci: usize, outcome: Del) -> Result<Del, FsError> {
-		let count = node_count(buf);
+		let count = internal_count(buf);
 		match outcome {
 			Del::NotFound => Ok(Del::NotFound),
 			Del::Updated(np, nc) => {
@@ -595,8 +603,8 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn tree_delete_node(&mut self, ptr: u64, crc: u32, key: u64, probe: &[u8], rec: usize, keylen: usize) -> Result<Del, FsError> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
-		let count = node_count(&buf);
 		if node_type(&buf) == NODE_LEAF {
+			let count = leaf_count(&buf, rec);
 			let (mut lo, mut hi) = (0usize, count);
 			let mut found = None;
 			while lo < hi {
@@ -629,7 +637,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(Del::Updated(dest, ncrc));
 		}
 		// internal: route and recurse; the shared absorber takes the outcome.
-		let ci = route_child(&buf, count, key);
+		let ci = route_child(&buf, internal_count(&buf), key);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
 		let outcome = self.tree_delete_node(cp, cc, key, probe, rec, keylen)?;
@@ -645,6 +653,19 @@ pub(crate) fn node_type(buf: &[u8]) -> u8 {
 
 pub(crate) fn node_count(buf: &[u8]) -> usize {
 	u16::from_le_bytes(buf[2..4].try_into().unwrap()) as usize
+}
+
+// Entry counts come off the medium, and a CRC32C proves integrity, not sanity: a
+// checksummed-but-hostile block (or plain corruption on the raw generation walks) can
+// claim a count no node can hold, running the entry loops past the 4096-byte block.
+// Every consumer clamps to what the node type physically fits: a leaf by its record
+// width, an internal node by its separator region.
+pub(crate) fn leaf_count(buf: &[u8], rec: usize) -> usize {
+	node_count(buf).min((BLOCK_SIZE - NODE_HDR) / rec)
+}
+
+pub(crate) fn internal_count(buf: &[u8]) -> usize {
+	node_count(buf).min(INTERNAL_MAX - 1)
 }
 
 pub(crate) fn node_set_header(buf: &mut [u8], typ: u8, count: usize) {

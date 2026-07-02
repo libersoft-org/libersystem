@@ -572,21 +572,33 @@ unsafe fn make_file_buffer(file: &[u8]) -> Option<u64> {
 // The virtio-blk disk as a block device for LiberFS: each LiberFS block maps to
 // SECTORS_PER_BLOCK consecutive disk sectors, offset to the volume's container -
 // a GPT partition carrying the LiberFS type GUID when the disk has one, else the
-// fixed filesystem region at FS_START_SECTOR. Reads and writes go through the
-// driver's block service on `chan`, which stays open for the life of the service.
+// fixed filesystem region at FS_START_SECTOR. Access is bounded to the container:
+// a block index at or past `limit` fails rather than reaching whatever lies beyond
+// (another partition, or past the disk) - a hostile superblock claiming a bigger
+// pool than the container is refused by the filesystem's own mount probe against
+// this bound. Reads and writes go through the driver's block service on `chan`,
+// which stays open for the life of the service.
 struct ChannelBlockDevice {
 	chan: u64,
 	// The container's first 512-byte LBA: filesystem block 0 begins here.
 	base: u64,
+	// The container's size in filesystem blocks: the first index out of bounds.
+	limit: u64,
 }
 
 impl BlockDevice for ChannelBlockDevice {
 	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+		if index >= self.limit {
+			return false;
+		}
 		let lba: u64 = self.base + index * SECTORS_PER_BLOCK;
 		unsafe { block_read(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_mut_ptr()) }
 	}
 
 	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+		if index >= self.limit {
+			return false;
+		}
 		let lba: u64 = self.base + index * SECTORS_PER_BLOCK;
 		unsafe { block_write(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_ptr()) }
 	}
@@ -658,7 +670,7 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 	// an existing filesystem (files persisted from a previous boot) mounts as-is, at
 	// the size recorded in its superblock - never silently grown, the free map would
 	// not match. A volume smaller than its container allows is reported.
-	if let Some(fs) = LiberFs::mount(ChannelBlockDevice { chan: block_client, base }) {
+	if let Some(fs) = LiberFs::mount(ChannelBlockDevice { chan: block_client, base, limit: pool }) {
 		if fs.num_blocks() != pool {
 			unsafe {
 				print(b"storage: vol://system spans less than the disk allows (formatted earlier; online resize is future work)\n");
@@ -678,7 +690,7 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 	// "system" label; compression starts off, togglable later via `set-compression`.
 	let uuid: [u8; 16] = unsafe { stir_uuid() };
 	let opts: FormatOpts = FormatOpts { uuid, label: b"system".to_vec(), compress: false };
-	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format_opts(ChannelBlockDevice { chan: block_client, base }, pool, opts).ok()?;
+	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format_opts(ChannelBlockDevice { chan: block_client, base, limit: pool }, pool, opts).ok()?;
 	// stamp real time before seeding, so the factory files carry a real ctime/mtime.
 	fs.set_clock(unsafe { clock_rtc() });
 	if let Some(archive) = unsafe { read_seed_archive(block_client) } {

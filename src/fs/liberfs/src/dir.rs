@@ -143,7 +143,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				out.push((rec.name, rec.child));
 			}
 		} else {
-			let count = node_count(&buf);
+			let count = internal_count(&buf);
 			for i in 0..=count {
 				let cp = child_ptr(&buf, i);
 				let cc = child_crc(&buf, i);
@@ -176,7 +176,7 @@ impl<D: BlockDevice> LiberFs<D> {
 					Err(_) => None,
 				});
 			}
-			let count = node_count(&buf);
+			let count = internal_count(&buf);
 			let ci = route_child(&buf, count, hash);
 			ptr = child_ptr(&buf, ci);
 			crc = child_crc(&buf, ci);
@@ -225,7 +225,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			let rcrc = self.write_node_to(right_dest, &rbuf)?;
 			return Ok(Ins::Split(left_dest, lcrc, recs[split].hash, right_dest, rcrc));
 		}
-		let count = node_count(&buf);
+		let count = internal_count(&buf);
 		let ci = route_child(&buf, count, hash);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
@@ -269,7 +269,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			let ncrc = self.write_node_to(dest, &buf)?;
 			return Ok(Del::Updated(dest, ncrc));
 		}
-		let count = node_count(&buf);
+		let count = internal_count(&buf);
 		let ci = route_child(&buf, count, hash);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
@@ -372,9 +372,11 @@ pub(crate) struct DirRec {
 }
 
 // Parse a directory leaf's variable-length records: count in the node header, then
-// [hash u64][child u32][len u8][name] each, back to back.
+// [hash u64][child u32][len u8][name] each, back to back. The loop is bounds-checked
+// and the count clamped to what the block can hold, so an insane header yields what
+// parsed cleanly rather than a panic or an absurd allocation.
 pub(crate) fn dir_leaf_parse(buf: &[u8]) -> Vec<DirRec> {
-	let count = node_count(buf);
+	let count = node_count(buf).min((BLOCK_SIZE - NODE_HDR) / DIR_REC_HDR);
 	let mut recs = Vec::with_capacity(count);
 	let mut off = NODE_HDR;
 	for _ in 0..count {

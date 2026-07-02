@@ -113,6 +113,13 @@ impl<D: BlockDevice> LiberFs<D> {
 		};
 
 		let sb = slots[cur_slot as usize]?;
+		// the medium must actually cover the claimed pool: a checksummed superblock can
+		// still lie about `num_blocks` (hostile authoring), and sizing the free maps or
+		// walking the generations off such a claim means an absurd allocation or reads
+		// past the volume. Probing the last claimed block bounds the claim by the device.
+		if !dev.read_block(sb.num_blocks - 1, &mut buf) {
+			return None;
+		}
 		let (prev_inode_root, prev_inode_root_crc, prev_valid) = match prev_slot {
 			Some(ps) => {
 				let psb = slots[ps as usize]?;
@@ -436,9 +443,16 @@ pub(crate) fn parse_superblock(block: &[u8]) -> Option<Superblock> {
 	if crc32c(&probe) != stored {
 		return None;
 	}
+	// a CRC proves integrity, not sanity: a pool smaller than the fixed layout can
+	// underflow the mount arithmetic, so reject it here (the format refuses to create
+	// one; the upper bound is checked at mount by probing the device itself).
+	let num_blocks = u64::from_le_bytes(block[SB_NUM_BLOCKS_OFF..SB_NUM_BLOCKS_OFF + 8].try_into().ok()?);
+	if num_blocks <= POOL_START + 1 {
+		return None;
+	}
 	let mut uuid = [0u8; 16];
 	uuid.copy_from_slice(&block[SB_UUID_OFF..SB_UUID_OFF + 16]);
 	let mut label = [0u8; LABEL_MAX];
 	label.copy_from_slice(&block[SB_LABEL_OFF..SB_LABEL_OFF + LABEL_MAX]);
-	Some(Superblock { num_blocks: u64::from_le_bytes(block[SB_NUM_BLOCKS_OFF..SB_NUM_BLOCKS_OFF + 8].try_into().ok()?), generation: u64::from_le_bytes(block[SB_GENERATION_OFF..SB_GENERATION_OFF + 8].try_into().ok()?), inode_root: u64::from_le_bytes(block[SB_INODE_ROOT_OFF..SB_INODE_ROOT_OFF + 8].try_into().ok()?), inode_root_crc: u32::from_le_bytes(block[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].try_into().ok()?), next_inode: u32::from_le_bytes(block[SB_NEXT_INODE_OFF..SB_NEXT_INODE_OFF + 4].try_into().ok()?), root_inode: u32::from_le_bytes(block[SB_ROOT_INODE_OFF..SB_ROOT_INODE_OFF + 4].try_into().ok()?), snap_root: u64::from_le_bytes(block[SB_SNAP_ROOT_OFF..SB_SNAP_ROOT_OFF + 8].try_into().ok()?), snap_root_crc: u32::from_le_bytes(block[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].try_into().ok()?), uuid, label, compress: block[SB_COMPRESS_OFF] != 0 })
+	Some(Superblock { num_blocks, generation: u64::from_le_bytes(block[SB_GENERATION_OFF..SB_GENERATION_OFF + 8].try_into().ok()?), inode_root: u64::from_le_bytes(block[SB_INODE_ROOT_OFF..SB_INODE_ROOT_OFF + 8].try_into().ok()?), inode_root_crc: u32::from_le_bytes(block[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].try_into().ok()?), next_inode: u32::from_le_bytes(block[SB_NEXT_INODE_OFF..SB_NEXT_INODE_OFF + 4].try_into().ok()?), root_inode: u32::from_le_bytes(block[SB_ROOT_INODE_OFF..SB_ROOT_INODE_OFF + 4].try_into().ok()?), snap_root: u64::from_le_bytes(block[SB_SNAP_ROOT_OFF..SB_SNAP_ROOT_OFF + 8].try_into().ok()?), snap_root_crc: u32::from_le_bytes(block[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].try_into().ok()?), uuid, label, compress: block[SB_COMPRESS_OFF] != 0 })
 }

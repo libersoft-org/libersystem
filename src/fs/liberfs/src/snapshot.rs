@@ -197,7 +197,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		let offset = offset.unwrap_or(inode.size);
 		if !data.is_empty() {
 			let start = offset;
-			let end = offset + data.len() as u64;
+			// an offset that runs the write past the addressable end is refused, not
+			// wrapped (a wrap would report a no-op as success).
+			let end = offset.checked_add(data.len() as u64).ok_or(FsError::Invalid)?;
 			let first = start / BLOCK_SIZE as u64;
 			let last = (end - 1) / BLOCK_SIZE as u64;
 			let mut buf = vec![0u8; BLOCK_SIZE];
