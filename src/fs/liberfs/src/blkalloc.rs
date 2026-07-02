@@ -110,10 +110,10 @@ impl<D: BlockDevice> LiberFs<D> {
 	// instead of trusting the cursor not to be interrupted. Claims the whole run up
 	// front (fresh, so an abort releases it). No-op when no contiguous run exists - the
 	// write falls back to per-block allocation.
-	pub(crate) fn reserve_run(&mut self, len: usize) {
+	pub(crate) fn reserve_run(&mut self, len: u64) {
 		// the run count is stored as u32: clamp an absurd reservation (a single write
 		// past 16 TiB) rather than silently truncating the claim/release accounting.
-		let len = len.min(u32::MAX as usize);
+		let len = len.min(u32::MAX as u64) as usize;
 		if len < 2 || self.run.is_some() {
 			return;
 		}
@@ -362,12 +362,11 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// file block mapping (extents)
 
-	// Read logical block `logical` of `inode` into `buf` via its extent map, verifying
+	// Read logical block `lb` of `inode` into `buf` via its extent map, verifying
 	// the per-block checksum. Returns false (and leaves `buf` untouched) for a hole - a
 	// logical block no extent covers, which the caller reads back as zeros. A checksum
 	// mismatch is `FsError::Corrupt`.
-	pub(crate) fn read_logical(&mut self, inode: &Inode, logical: usize, buf: &mut [u8]) -> Result<bool, FsError> {
-		let lb = logical as u64;
+	pub(crate) fn read_logical(&mut self, inode: &Inode, lb: u64, buf: &mut [u8]) -> Result<bool, FsError> {
 		let ext = match find_extent(&inode.extents, lb) {
 			Some(i) => inode.extents[i],
 			None => return Ok(false),
@@ -400,15 +399,14 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(true)
 	}
 
-	// Write `buf` as logical block `logical` of `inode`, updating the extent map in
+	// Write `buf` as logical block `lb` of `inode`, updating the extent map in
 	// memory and recording the block's checksum. Overwriting a mapped block replaces it
 	// with a fresh one (never copying the old contents - `buf` is always a whole block,
 	// so a copy would be overwritten immediately; a block already fresh this transaction
 	// is rewritten in place) and may split its run; writing a hole appends to the run
 	// before it when the new block is physically contiguous, otherwise starts a new run.
 	// The caller persists the inode, which flushes the map to disk.
-	pub(crate) fn write_logical(&mut self, inode: &mut Inode, logical: usize, buf: &[u8]) -> Result<(), FsError> {
-		let lb = logical as u64;
+	pub(crate) fn write_logical(&mut self, inode: &mut Inode, lb: u64, buf: &[u8]) -> Result<(), FsError> {
 		// a compressed run cannot be edited in place: thaw it back to raw blocks first, so
 		// this overwrite (and any later block of the run) proceeds on a raw extent.
 		if let Some(i) = find_extent(&inode.extents, lb) {

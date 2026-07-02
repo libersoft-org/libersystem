@@ -29,6 +29,9 @@ with the common removable, Windows, and Linux/Unix filesystems.
 - Read-only snapshots (enforced), including named snapshots pinning any
   generation - unbounded, in a chained table.
 - Volume identity in the superblock: uuid, label, feature flags, algorithm ids.
+- OS- and architecture-agnostic by construction: every field little-endian at a
+  fixed offset, position-independent block addressing, and a GPT partition type
+  GUID (`4C424653-0001-4000-8000-4C6962657246`) so any system finds the volume.
 - `no_std` userspace build; `std` only under `cargo test`. All I/O through one
   `BlockDevice` trait (read, write, flush), so the same code drives virtio-blk
   and a `Vec` in tests.
@@ -158,6 +161,171 @@ device in host tests. The crate is `no_std` for userspace and pulls in `std` onl
 under `cargo test`. It backs `Storage.Volume`, the same typed contract every
 other backend uses, so foreign media mounts the same way: LiberSystem reads and
 writes FAT (incl. exFAT) and reads ISO9660 and UDF behind that one API.
+
+## On-disk format specification (version 1, features 0x1)
+
+The authoritative field-level layout, sufficient for an independent
+implementation on any OS or architecture. The reference test suite pins these
+tables byte for byte (`the_superblock_layout_matches_the_specification`,
+`the_record_layouts_match_the_specification`); a layout change must set a new
+feature-flag bit and update this section.
+
+### General rules
+
+- Every multi-byte integer is **little-endian**, at a fixed byte offset. No
+  structure is a memory dump: there is no padding, no alignment requirement, and
+  no host-endian field, so the format is identical on every architecture.
+- The block size is **4096 bytes**. Block addresses are u64 indexes **relative
+  to the volume's first byte** (block 0 = the container's start), so the volume
+  is position-independent.
+- The **container** is either a GPT partition whose type GUID is
+  `4C424653-0001-4000-8000-4C6962657246` (the LiberFS partition type), or - on a
+  LiberSystem factory disk without a GPT - the fixed region starting at
+  512-byte sector 32768 (16 MiB in, past the boot archive).
+- The checksum everywhere is **CRC32C** (Castagnoli): polynomial 0x1EDC6F41
+  (reflected 0x82F63B78), reflected input/output, initial value and final XOR
+  0xFFFFFFFF. Test vector: `crc32c("123456789") = 0xE3069283`.
+- Compression is the **LZ4 block format**; a compressed stream is prefixed with
+  its uncompressed length as a u32 (LE).
+- All "reserved" bytes are written as zero and ignored on read.
+
+### Superblock (blocks 0 and 1)
+
+| Offset | Size | Field |
+|-------:|-----:|-------|
+| 0   | 8  | magic `LIBERFS1` (ASCII) |
+| 8   | 4  | version, = 1 |
+| 12  | 4  | block size, = 4096 |
+| 16  | 8  | num_blocks: the pool size in blocks (the volume's whole span) |
+| 24  | 4  | next_inode: the next inode number to hand out (monotonic, never reused) |
+| 28  | 8  | generation (monotonic; the higher valid slot is the live root) |
+| 36  | 8  | inode_root: block of the inode B+tree root |
+| 44  | 4  | inode_root_crc: CRC32C of that root block |
+| 48  | 4  | reserved |
+| 52  | 4  | root_inode: the root directory's inode number, = 0 |
+| 56  | 4  | self-CRC: CRC32C over the whole block with these 4 bytes zeroed |
+| 60  | 8  | snap_root: first block of the snapshot chain (0 = none) |
+| 68  | 4  | snap_root_crc: CRC32C of that block |
+| 72  | 8  | feature flags, = 0x1; a reader MUST reject unknown or missing bits |
+| 80  | 16 | volume uuid (opaque 16 bytes, assigned at format) |
+| 96  | 32 | volume label (UTF-8, NUL padded) |
+| 128 | 1  | checksum algorithm id, = 1 (CRC32C) |
+| 129 | 1  | compression codec id, = 2 (LZ4) |
+| 130 | 1  | compression switch: 1 = new whole-file writes compress |
+| 131 | -  | reserved to end of block |
+
+Mount: parse both slots; a slot is valid if magic, version, block size, feature
+flags, algorithm ids and the self-CRC all check. The valid slot with the higher
+generation is the live root; the other (if valid) is the previous generation.
+
+### B+tree nodes (one block each)
+
+Node header (8 bytes): type u8 at 0 (0 = internal, 1 = leaf), byte 1 reserved,
+entry count u16 at 2, bytes 4..8 reserved.
+
+**Internal node** (both trees): separator keys (u64) at `8 + i*8`; child links
+at `1632 + i*12`, each a block pointer (u64) plus that child block's CRC32C
+(u32). `count` separators and `count + 1` children; at most 203 separators (204
+children). Child `i` holds keys below separator `i`, child `i + 1` keys at or
+above it. Every child link's CRC verifies the child block on read.
+
+**Inode-tree leaf**: `count` fixed 264-byte records at `8 + i*264`, sorted by
+key: the inode number as u64, then the 256-byte inode slot (below). At most 15
+records per leaf.
+
+**Directory leaf**: `count` variable-length records back to back from offset 8,
+sorted by (hash, name): name hash u64, child inode u32, name length u8, then
+the name's bytes (13 bytes + name). Records sharing a hash never straddle a
+leaf split, since internal nodes route by hash alone. The hash is FNV-1a
+64-bit over the name's bytes (offset basis 0xCBF29CE484222325, prime
+0x100000001B3).
+
+### Inode slot (256 bytes, inside an inode-tree leaf record)
+
+| Offset | Size | Field |
+|-------:|-----:|-------|
+| 0  | 1  | kind: 1 = file, 2 = directory |
+| 1  | 7  | reserved |
+| 8  | 8  | size: file bytes, or a directory's live entry count |
+| 16 | 8  | ctime (u64 seconds since the Unix epoch, UTC) |
+| 24 | 8  | mtime (likewise) |
+| 32 | 8  | file: extent-overflow chain block (0 = none) / directory: dir-tree root block (0 = empty) |
+| 40 | 4  | CRC32C of that block (chain head / tree root) |
+| 44 | 4  | file only: total extent count (inline + spilled) |
+| 48 | 8  | reserved |
+| 56 | 16 | owner tag (opaque; never interpreted by the filesystem) |
+| 72 | 160 | file only: up to 4 inline extent records (40 bytes each) |
+| 232 | 24 | reserved |
+
+### Extent record (40 bytes)
+
+| Offset | Size | Field |
+|-------:|-----:|-------|
+| 0  | 8 | logical: first logical block of the run |
+| 8  | 8 | physical: first stored block |
+| 16 | 4 | length: logical blocks the run covers |
+| 20 | 4 | csum_crc: CRC32C of the checksum block |
+| 24 | 8 | csum: the run's checksum block |
+| 32 | 4 | store_len: stored (physical) blocks; = length raw, < length compressed |
+| 36 | 4 | clen: compressed byte length (0 = raw) |
+
+A file's extents are sorted by `logical`; a logical block no extent covers is a
+sparse hole reading as zeros. The **checksum block** holds one CRC32C (4 bytes)
+per stored block, slot `i` at byte `i*4` covering stored block `physical + i`;
+one extent therefore spans at most 1024 blocks (4 MiB). A **compressed extent**
+(`clen > 0`) stores the `clen`-byte stream (u32 LE uncompressed length + LZ4
+block format) across `store_len` blocks, zero-padded; the per-block CRCs cover
+the stored (compressed) bytes.
+
+### Chain blocks (extent overflow and snapshot table)
+
+A chain block starts with a 16-byte header: next block u64 at 0 (0 = end),
+next block's CRC32C u32 at 8, record count u32 at 12; records follow from 16.
+The chain is verified link by link: the superblock (or inode) holds the first
+block's CRC, each block holds the next one's.
+
+- **Extent overflow** (a file's 5th extent onward): 40-byte extent records,
+  at most 102 per block.
+- **Snapshot chain** (`snap_root`): 84-byte records, at most 48 per block:
+  name (64 bytes, UTF-8, NUL padded), pinned inode-tree root u64 at 64, its
+  CRC32C u32 at 72, pinned generation u64 at 76. The chain is unbounded.
+
+### Commit protocol and reachability
+
+A writer MUST follow copy-on-write: never overwrite any block reachable from
+either superblock slot or from any snapshot record. A transaction writes its
+new blocks, then: **flush** the device's write cache, write the new superblock
+(generation + 1) to the inactive slot, **flush** again. The single superblock
+write is the commit point.
+
+A block is **allocated** if and only if it is block 0 or 1, or reachable from
+the live root, the previous valid root, the snapshot chain's blocks, or any
+snapshot's pinned root (tree nodes, inode slots' data/checksum/overflow blocks,
+directory tree nodes). Everything else is free; there is no on-disk bitmap. A
+reader deriving the free map walks exactly this closure.
+
+## Semantics a foreign driver must honor
+
+- **Names** are byte-exact UTF-8, **case-sensitive**, with **no Unicode
+  normalization**: two byte sequences are two names. A segment is 1..=255
+  bytes, must not be `.` or `..`, and must not contain `/`, NUL, control bytes
+  (0x00-0x1F, 0x7F) or `\ : * ? < > | "`. Enforce on create; treat violations
+  in on-disk data as corruption.
+- **No hard links, no symlinks** - one name, one file. Do not synthesize them.
+- **Timestamps** are u64 seconds since the Unix epoch, UTC; only ctime and
+  mtime exist. Synthesize atime (= mtime) and finer resolutions as needed.
+- **No permissions/ACLs on disk**: authorization is LiberSystem's capability
+  layer. Present mount-wide synthesized ownership/permissions (the FAT-driver
+  convention: mount-time uid/gid/umask). The 16-byte **owner tag is opaque** -
+  preserve it, never interpret or invent it.
+- **Snapshots are read-only**: a mount re-rooted at a previous generation or a
+  named snapshot must refuse every mutation, or it interleaves generations.
+- **Writers follow the commit protocol** above (CoW + flush-superblock-flush)
+  or mount read-only. Respect the compression switch and codec id; writing raw
+  extents is always valid regardless of the switch.
+- A **corrupt snapshot chain** (a link failing its CRC) must degrade the mount
+  to read-only, never silently drop the table - the pinned generations' blocks
+  would be reused.
 
 ## Comparison with other filesystems
 

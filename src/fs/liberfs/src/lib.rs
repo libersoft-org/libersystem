@@ -577,9 +577,10 @@ impl Inode {
 		}
 	}
 
-	// Number of data blocks the file's `size` occupies.
-	fn nblocks(&self) -> usize {
-		(self.size as usize).div_ceil(BLOCK_SIZE)
+	// Number of data blocks the file's `size` occupies. u64, so a 32-bit build never
+	// truncates a large file's block count.
+	fn nblocks(&self) -> u64 {
+		self.size.div_ceil(BLOCK_SIZE as u64)
 	}
 }
 

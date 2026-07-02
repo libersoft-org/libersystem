@@ -366,7 +366,8 @@ impl volume::Service for Volume {
 				// open a second, read-only view re-rooted at the snapshot over the same
 				// block backing (the channel handle is shared, not consumed).
 				let chan: u64 = fs.device().chan;
-				let mut snap: LiberFs<ChannelBlockDevice> = LiberFs::mount_named_snapshot(ChannelBlockDevice { chan }, snapshot.as_bytes()).ok_or(Error::NotFound)?;
+				let base: u64 = fs.device().base;
+				let mut snap: LiberFs<ChannelBlockDevice> = LiberFs::mount_named_snapshot(ChannelBlockDevice { chan, base }, snapshot.as_bytes()).ok_or(Error::NotFound)?;
 				let file: Vec<u8> = snap.read_file(name).map_err(map_fs_err)?;
 				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
 				Ok(OpenResult { file: handle, size: file.len() as u64 })
@@ -572,21 +573,24 @@ unsafe fn make_file_buffer(file: &[u8]) -> Option<u64> {
 }
 
 // The virtio-blk disk as a block device for LiberFS: each LiberFS block maps to
-// SECTORS_PER_BLOCK consecutive disk sectors, offset to the filesystem region at
-// FS_START_SECTOR. Reads and writes go through the driver's block service on `chan`,
-// which stays open for the life of the service.
+// SECTORS_PER_BLOCK consecutive disk sectors, offset to the volume's container -
+// a GPT partition carrying the LiberFS type GUID when the disk has one, else the
+// fixed filesystem region at FS_START_SECTOR. Reads and writes go through the
+// driver's block service on `chan`, which stays open for the life of the service.
 struct ChannelBlockDevice {
 	chan: u64,
+	// The container's first 512-byte LBA: filesystem block 0 begins here.
+	base: u64,
 }
 
 impl BlockDevice for ChannelBlockDevice {
 	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
-		let lba: u64 = FS_START_SECTOR + index * SECTORS_PER_BLOCK;
+		let lba: u64 = self.base + index * SECTORS_PER_BLOCK;
 		unsafe { block_read(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_mut_ptr()) }
 	}
 
 	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
-		let lba: u64 = FS_START_SECTOR + index * SECTORS_PER_BLOCK;
+		let lba: u64 = self.base + index * SECTORS_PER_BLOCK;
 		unsafe { block_write(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_ptr()) }
 	}
 
@@ -645,15 +649,19 @@ impl udf::BlockDevice for UdfBlockDevice {
 
 // Mount the LiberFS on the virtio-blk disk, or, on a fresh or stale disk, format a new
 // filesystem and seed it from the factory archive laid at LBA 0 so the volume always
-// starts with its seed files. A fresh format spans the whole disk: the pool is derived
-// from the disk's reported capacity, never a fixed constant. The block channel stays
-// open for the serve loop.
+// starts with its seed files. The volume's container is a GPT partition carrying the
+// LiberFS type GUID when the disk has one (so a disk partitioned by another system
+// mounts the same volume), else the fixed region past the factory archive; a fresh
+// format spans the whole container. The block channel stays open for the serve loop.
 unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>> {
-	let pool: u64 = unsafe { disk_pool_blocks(block_client) };
+	let (base, pool): (u64, u64) = match unsafe { gpt_liberfs_partition(block_client) } {
+		Some((first, last)) => (first, (last - first + 1) / SECTORS_PER_BLOCK),
+		None => (FS_START_SECTOR, unsafe { disk_pool_blocks(block_client) }),
+	};
 	// an existing filesystem (files persisted from a previous boot) mounts as-is, at
 	// the size recorded in its superblock - never silently grown, the free map would
-	// not match. A volume smaller than its disk allows is reported.
-	if let Some(fs) = LiberFs::mount(ChannelBlockDevice { chan: block_client }) {
+	// not match. A volume smaller than its container allows is reported.
+	if let Some(fs) = LiberFs::mount(ChannelBlockDevice { chan: block_client, base }) {
 		if fs.num_blocks() != pool {
 			unsafe {
 				print(b"storage: vol://system spans less than the disk allows (formatted earlier; online resize is future work)\n");
@@ -673,7 +681,7 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 	// "system" label; compression starts off, togglable later via `set-compression`.
 	let uuid: [u8; 16] = unsafe { stir_uuid() };
 	let opts: FormatOpts = FormatOpts { uuid, label: b"system".to_vec(), compress: false };
-	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format_opts(ChannelBlockDevice { chan: block_client }, pool, opts).ok()?;
+	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format_opts(ChannelBlockDevice { chan: block_client, base }, pool, opts).ok()?;
 	// stamp real time before seeding, so the factory files carry a real ctime/mtime.
 	fs.set_clock(unsafe { clock_rtc() });
 	if let Some(archive) = unsafe { read_seed_archive(block_client) } {
@@ -708,6 +716,61 @@ unsafe fn disk_pool_blocks(block_client: u64) -> u64 {
 	match unsafe { block_capacity(block_client) } {
 		Ok(bytes) if bytes > fs_start_bytes + liberfs::BLOCK_SIZE as u64 => (bytes - fs_start_bytes) / liberfs::BLOCK_SIZE as u64,
 		_ => FS_BLOCKS,
+	}
+}
+
+// The LiberFS GPT partition type GUID, 4C424653-0001-4000-8000-4C6962657246
+// ("LBFS" / "LiberF"), in its on-disk byte order (the first three groups
+// little-endian, the rest as written). A disk partitioned by any other system marks
+// a LiberFS volume with this GUID and the volume is found by it.
+const LIBERFS_GUID_ON_DISK: [u8; 16] = [0x53, 0x46, 0x42, 0x4C, 0x01, 0x00, 0x00, 0x40, 0x80, 0x00, 0x4C, 0x69, 0x62, 0x65, 0x72, 0x46];
+
+// Probe the disk for a GPT and return the first partition carrying the LiberFS type
+// GUID as its (first LBA, last LBA), or None (no GPT, or no LiberFS partition - the
+// fixed factory layout applies then). Reads the header at LBA 1 and walks the entry
+// array it points at, one 8-sector page at a time.
+unsafe fn gpt_liberfs_partition(block_client: u64) -> Option<(u64, u64)> {
+	unsafe {
+		let mut header = [0u8; SECTOR_SIZE];
+		if !block_read(block_client, 1, 1, header.as_mut_ptr()) {
+			return None;
+		}
+		if &header[0..8] != b"EFI PART" {
+			return None;
+		}
+		let entries_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+		let num_entries = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
+		let entry_size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
+		if entry_size < 128 || entry_size > SECTOR_SIZE || num_entries == 0 {
+			return None;
+		}
+		// walk the entry array a page (8 sectors) at a time; a standard 128-entry,
+		// 128-byte-entry array is 4 pages.
+		const PAGE_SECTORS: usize = 8;
+		let per_page: usize = PAGE_SECTORS * SECTOR_SIZE / entry_size;
+		let mut page = [0u8; PAGE_SECTORS * SECTOR_SIZE];
+		let mut index: usize = 0;
+		while index < num_entries.min(512) {
+			let lba = entries_lba + (index / per_page * PAGE_SECTORS) as u64;
+			if !block_read(block_client, lba, PAGE_SECTORS as u32, page.as_mut_ptr()) {
+				return None;
+			}
+			for slot in 0..per_page {
+				if index >= num_entries {
+					break;
+				}
+				let e = &page[slot * entry_size..slot * entry_size + entry_size];
+				if e[0..16] == LIBERFS_GUID_ON_DISK {
+					let first = u64::from_le_bytes(e[32..40].try_into().unwrap());
+					let last = u64::from_le_bytes(e[40..48].try_into().unwrap());
+					if first != 0 && last > first {
+						return Some((first, last));
+					}
+				}
+				index += 1;
+			}
+		}
+		None
 	}
 }
 

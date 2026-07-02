@@ -1597,3 +1597,121 @@ fn fsck_verifies_the_disk_not_the_caches() {
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
 	assert_eq!(fs.read_at(b"sparse", span(7), 6).unwrap(), b"span-7");
 }
+
+// The on-disk format is defined little-endian at fixed offsets, independent of the
+// host. These golden assertions pin the serializers byte for byte: they pass on any
+// architecture or they catch an accidental format change (which must instead bump
+// FEATURES and update the specification in LIBERFS.md).
+
+#[test]
+fn the_superblock_layout_matches_the_specification() {
+	let sb = Superblock {
+		num_blocks: 0x1122_3344_5566_7788,
+		generation: 0x0102_0304_0506_0708,
+		inode_root: 0xAABB_CCDD_EEFF_0011,
+		inode_root_crc: 0xDEAD_BEEF,
+		next_inode: 0x0BAD_F00D,
+		root_inode: 0,
+		snap_root: 0x2233_4455_6677_8899,
+		snap_root_crc: 0xCAFE_BABE,
+		uuid: *b"0123456789abcdef",
+		label: {
+			let mut l = [0u8; LABEL_MAX];
+			l[..6].copy_from_slice(b"golden");
+			l
+		},
+		compress: true,
+	};
+	let block = serialize_superblock(&sb);
+	assert_eq!(&block[0..8], b"LIBERFS1");
+	assert_eq!(&block[8..12], &1u32.to_le_bytes(), "version");
+	assert_eq!(&block[12..16], &4096u32.to_le_bytes(), "block size");
+	assert_eq!(&block[16..24], &0x1122_3344_5566_7788u64.to_le_bytes(), "num_blocks");
+	assert_eq!(&block[24..28], &0x0BAD_F00Du32.to_le_bytes(), "next_inode");
+	assert_eq!(&block[28..36], &0x0102_0304_0506_0708u64.to_le_bytes(), "generation");
+	assert_eq!(&block[36..44], &0xAABB_CCDD_EEFF_0011u64.to_le_bytes(), "inode_root");
+	assert_eq!(&block[44..48], &0xDEAD_BEEFu32.to_le_bytes(), "inode_root_crc");
+	assert_eq!(&block[52..56], &0u32.to_le_bytes(), "root_inode");
+	assert_eq!(&block[60..68], &0x2233_4455_6677_8899u64.to_le_bytes(), "snap_root");
+	assert_eq!(&block[68..72], &0xCAFE_BABEu32.to_le_bytes(), "snap_root_crc");
+	assert_eq!(&block[72..80], &1u64.to_le_bytes(), "feature flags");
+	assert_eq!(&block[80..96], b"0123456789abcdef", "uuid");
+	assert_eq!(&block[96..102], b"golden", "label");
+	assert_eq!(block[128], 1, "checksum algorithm id (CRC32C)");
+	assert_eq!(block[129], 2, "codec id (LZ4)");
+	assert_eq!(block[130], 1, "compression switch");
+	// the self-CRC at 56..60 covers the whole block with its own bytes zeroed.
+	let stored = u32::from_le_bytes(block[56..60].try_into().unwrap());
+	let mut probe = block.clone();
+	probe[56..60].fill(0);
+	assert_eq!(stored, crc32c(&probe), "superblock self-CRC");
+	// and the parser reads the same volume back.
+	let parsed = parse_superblock(&block).expect("the golden superblock must parse");
+	assert_eq!(parsed.num_blocks, sb.num_blocks);
+	assert_eq!(parsed.uuid, sb.uuid);
+	assert!(parsed.compress);
+}
+
+#[test]
+fn the_record_layouts_match_the_specification() {
+	// one extent record: 40 bytes, all fields little-endian at fixed offsets.
+	let ext = Extent { logical: 0x0102_0304_0506_0708, physical: 0x1112_1314_1516_1718, length: 0x2122_2324, csum: 0x3132_3334_3536_3738, csum_crc: 0x4142_4344, store_len: 0x5152_5354, clen: 0x6162_6364 };
+	let mut rec = [0u8; EXTENT_SIZE];
+	ext.write(&mut rec);
+	assert_eq!(&rec[0..8], &0x0102_0304_0506_0708u64.to_le_bytes(), "logical");
+	assert_eq!(&rec[8..16], &0x1112_1314_1516_1718u64.to_le_bytes(), "physical");
+	assert_eq!(&rec[16..20], &0x2122_2324u32.to_le_bytes(), "length");
+	assert_eq!(&rec[20..24], &0x4142_4344u32.to_le_bytes(), "csum_crc");
+	assert_eq!(&rec[24..32], &0x3132_3334_3536_3738u64.to_le_bytes(), "csum");
+	assert_eq!(&rec[32..36], &0x5152_5354u32.to_le_bytes(), "store_len");
+	assert_eq!(&rec[36..40], &0x6162_6364u32.to_le_bytes(), "clen");
+	let back = Extent::parse(&rec);
+	assert_eq!((back.logical, back.physical, back.length, back.csum, back.csum_crc, back.store_len, back.clen), (ext.logical, ext.physical, ext.length, ext.csum, ext.csum_crc, ext.store_len, ext.clen));
+
+	// one file inode slot: 256 bytes, header fields then the file overlay.
+	let mut inode = Inode::empty(KIND_FILE);
+	inode.size = 0x0A0B_0C0D_0E0F_1011;
+	inode.ctime = 0x100;
+	inode.mtime = 0x200;
+	inode.owner_tag = *b"owner-tag-16byte";
+	inode.spill = 0x0708_090A_0B0C_0D0E;
+	inode.spill_crc = 0x1234_5678;
+	inode.extent_count = 5;
+	inode.extents.push(ext);
+	let mut slot = [0u8; INODE_SIZE];
+	inode.write(&mut slot);
+	assert_eq!(slot[0], KIND_FILE, "kind");
+	assert_eq!(&slot[8..16], &0x0A0B_0C0D_0E0F_1011u64.to_le_bytes(), "size");
+	assert_eq!(&slot[16..24], &0x100u64.to_le_bytes(), "ctime");
+	assert_eq!(&slot[24..32], &0x200u64.to_le_bytes(), "mtime");
+	assert_eq!(&slot[32..40], &0x0708_090A_0B0C_0D0Eu64.to_le_bytes(), "spill");
+	assert_eq!(&slot[40..44], &0x1234_5678u32.to_le_bytes(), "spill_crc");
+	assert_eq!(&slot[44..48], &5u32.to_le_bytes(), "extent_count");
+	assert_eq!(&slot[56..72], b"owner-tag-16byte", "owner tag");
+	assert_eq!(&slot[72..112], &rec, "first inline extent at byte 72");
+
+	// a directory inode overlays its tree root on the same map bytes.
+	let mut dir = Inode::empty(KIND_DIR);
+	dir.dir_root = 0x4041_4243_4445_4647;
+	dir.dir_root_crc = 0x5051_5253;
+	let mut dslot = [0u8; INODE_SIZE];
+	dir.write(&mut dslot);
+	assert_eq!(dslot[0], KIND_DIR);
+	assert_eq!(&dslot[32..40], &0x4041_4243_4445_4647u64.to_le_bytes(), "dir_root");
+	assert_eq!(&dslot[40..44], &0x5051_5253u32.to_le_bytes(), "dir_root_crc");
+
+	// one directory leaf: the node header, then variable records back to back.
+	let recs = vec![DirRec { hash: 0x0102_0304_0506_0708, name: b"a.txt".to_vec(), child: 0x0A0B_0C0D }];
+	let mut leaf = vec![0u8; BLOCK_SIZE];
+	dir_leaf_write(&mut leaf, &recs);
+	assert_eq!(leaf[0], NODE_LEAF, "node type");
+	assert_eq!(&leaf[2..4], &1u16.to_le_bytes(), "record count");
+	assert_eq!(&leaf[8..16], &0x0102_0304_0506_0708u64.to_le_bytes(), "record hash");
+	assert_eq!(&leaf[16..20], &0x0A0B_0C0Du32.to_le_bytes(), "record child");
+	assert_eq!(leaf[20], 5, "record name length");
+	assert_eq!(&leaf[21..26], b"a.txt", "record name");
+
+	// the CRC32C test vector pins the checksum definition (Castagnoli, reflected,
+	// init and final xor 0xFFFFFFFF): the RFC 3720 example.
+	assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+}

@@ -314,8 +314,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// shortened raw run keeps its checksum block (its leading slots still match the
 	// kept blocks) and drops only the cut tail's data blocks; a shortened compressed
 	// run keeps everything, since decoding needs the whole stored stream.
-	pub(crate) fn free_from(&mut self, inode: &mut Inode, keep: usize) -> Result<(), FsError> {
-		let keep = keep as u64;
+	pub(crate) fn free_from(&mut self, inode: &mut Inode, keep: u64) -> Result<(), FsError> {
 		let mut kept: Vec<Extent> = Vec::new();
 		let extents = core::mem::take(&mut inode.extents);
 		for ext in extents {

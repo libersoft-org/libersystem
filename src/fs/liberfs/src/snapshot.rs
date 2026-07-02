@@ -160,7 +160,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if inode.kind != KIND_FILE {
 			return Err(FsError::IsDir);
 		}
-		self.read_range(&inode, offset, len)
+		self.read_range(&inode, offset, len as u64)
 	}
 
 	// Write `data` into the file at `path` starting at byte `offset`, creating the file
@@ -198,11 +198,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		if !data.is_empty() {
 			let start = offset;
 			let end = offset + data.len() as u64;
-			let first = (start / BLOCK_SIZE as u64) as usize;
-			let last = ((end - 1) / BLOCK_SIZE as u64) as usize;
+			let first = start / BLOCK_SIZE as u64;
+			let last = (end - 1) / BLOCK_SIZE as u64;
 			let mut buf = vec![0u8; BLOCK_SIZE];
 			for lb in first..=last {
-				let block_start = lb as u64 * BLOCK_SIZE as u64;
+				let block_start = lb * BLOCK_SIZE as u64;
 				let full = start <= block_start && end >= block_start + BLOCK_SIZE as u64;
 				// a full-block overwrite needs no read; a partial one preserves whatever
 				// is there (zeros for a hole or a block past the old end).
@@ -245,13 +245,13 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::IsDir);
 		}
 		if new_len < inode.size {
-			let keep = (new_len as usize).div_ceil(BLOCK_SIZE);
+			let keep = new_len.div_ceil(BLOCK_SIZE as u64);
 			self.free_from(&mut inode, keep)?;
 			// zero the slack past the new end in the last kept block, so that a later
 			// grow back over it reads zeros rather than the discarded tail.
 			let tail = (new_len % BLOCK_SIZE as u64) as usize;
 			if tail != 0 {
-				let lb = (new_len / BLOCK_SIZE as u64) as usize;
+				let lb = new_len / BLOCK_SIZE as u64;
 				let mut buf = vec![0u8; BLOCK_SIZE];
 				if self.read_logical(&inode, lb, &mut buf)? {
 					buf[tail..].fill(0);

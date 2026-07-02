@@ -192,24 +192,26 @@ impl<D: BlockDevice> LiberFs<D> {
 		if inode.kind != KIND_FILE {
 			return Err(FsError::IsDir);
 		}
-		let size = inode.size as usize;
+		let size = inode.size;
 		self.read_range(&inode, 0, size)
 	}
 
 	// Read up to `len` bytes of `inode` starting at byte `offset` - the one range
 	// reader behind both `read_file` (the whole file) and `read_at` (a slice). Returns
 	// fewer bytes (or none) if the range runs past the end; holes read back as zeros.
-	pub(crate) fn read_range(&mut self, inode: &Inode, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+	// Lengths and block indexes are u64 end to end, so a 32-bit build never silently
+	// truncates a large file (an allocation it cannot hold fails as itself).
+	pub(crate) fn read_range(&mut self, inode: &Inode, offset: u64, len: u64) -> Result<Vec<u8>, FsError> {
 		if offset >= inode.size || len == 0 {
 			return Ok(Vec::new());
 		}
-		let end = (offset + len as u64).min(inode.size);
+		let end = offset.saturating_add(len).min(inode.size);
 		let mut out = Vec::with_capacity((end - offset) as usize);
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		let first = (offset / BLOCK_SIZE as u64) as usize;
-		let last = ((end - 1) / BLOCK_SIZE as u64) as usize;
+		let first = offset / BLOCK_SIZE as u64;
+		let last = (end - 1) / BLOCK_SIZE as u64;
 		for lb in first..=last {
-			let block_start = lb as u64 * BLOCK_SIZE as u64;
+			let block_start = lb * BLOCK_SIZE as u64;
 			if !self.read_logical(inode, lb, &mut buf)? {
 				buf.fill(0);
 			}
@@ -293,7 +295,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.reserve_run(inode.nblocks());
 		let mut block = vec![0u8; BLOCK_SIZE];
 		for i in 0..inode.nblocks() {
-			let start = i * BLOCK_SIZE;
+			// the data slice is memory-resident, so its offsets fit usize by definition.
+			let start = (i * BLOCK_SIZE as u64) as usize;
 			let end = (start + BLOCK_SIZE).min(data.len());
 			block.fill(0);
 			block[..end - start].copy_from_slice(&data[start..end]);

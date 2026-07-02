@@ -2986,60 +2986,11 @@ fn system_volume_formats_to_the_disks_capacity() {
 	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
 
 	// serve the raw block protocol over the sparse disk until the service reports in.
-	fn pump(blk_host: &object::channel::Channel, disk: &mut alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>, capacity: u64) {
-		use object::channel::Message;
-		use object::memory_object::MemoryObject;
-		use object::rights::Rights;
-		const SECTOR: usize = 512;
-		while let Ok(req) = blk_host.recv() {
-			assert!(req.bytes.len() >= 16, "a block request is [op][lba][count]");
-			let op = u32::from_le_bytes([req.bytes[0], req.bytes[1], req.bytes[2], req.bytes[3]]);
-			let lba = u64::from_le_bytes(req.bytes[4..12].try_into().unwrap());
-			let count = u32::from_le_bytes(req.bytes[12..16].try_into().unwrap()).max(1);
-			match op {
-				0 => {
-					// read: hand back a fresh buffer of the requested sectors.
-					let mut data = alloc::vec![0u8; count as usize * SECTOR];
-					for s in 0..count as u64 {
-						if let Some(sec) = disk.get(&(lba + s)) {
-							data[s as usize * SECTOR..(s as usize + 1) * SECTOR].copy_from_slice(sec);
-						}
-					}
-					let obj = MemoryObject::create(data.len()).expect("the sector buffer should allocate");
-					copy_into_object(&obj, &data);
-					send_cap(blk_host, &0u32.to_le_bytes(), obj, Rights::ALL).expect("the read reply should send");
-				}
-				1 => {
-					// write: store the transferred sectors into the sparse disk.
-					let cap = req.caps.first().expect("a write carries its buffer");
-					let object = cap.object();
-					let memory = object.as_any().downcast_ref::<MemoryObject>().expect("the buffer is a MemoryObject");
-					let data = read_from_object(memory, count as usize * SECTOR);
-					for s in 0..count as u64 {
-						disk.insert(lba + s, data[s as usize * SECTOR..(s as usize + 1) * SECTOR].to_vec());
-					}
-					blk_host.send(Message::new(0u32.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("the write reply should send");
-				}
-				2 => {
-					// capacity: the sparse disk's size in bytes.
-					let mut reply = alloc::vec::Vec::with_capacity(12);
-					reply.extend_from_slice(&0u32.to_le_bytes());
-					reply.extend_from_slice(&capacity.to_le_bytes());
-					blk_host.send(Message::new(reply, alloc::vec::Vec::new(), 0)).expect("the capacity reply should send");
-				}
-				3 => {
-					// flush: the in-memory disk is trivially durable; acknowledge the barrier.
-					blk_host.send(Message::new(0u32.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("the flush reply should send");
-				}
-				other => panic!("unexpected block op {}", other),
-			}
-		}
-	}
 	let mut disk: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
 	let mut online = false;
 	'serve: for _ in 0..100_000 {
 		sched::run_until_idle();
-		pump(&blk_host, &mut disk, CAPACITY);
+		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
 		if let Ok(report) = boot_kernel.recv() {
 			assert_eq!(&report.bytes[..], b"StorageService: online", "the service should come up on the fresh disk");
 			online = true;
@@ -3060,7 +3011,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 		_serve_client.send(Message::new(body.to_vec(), alloc::vec::Vec::new(), 0)).expect("the typed request should send");
 		for _ in 0..100_000 {
 			sched::run_until_idle();
-			pump(&blk_host, &mut disk, CAPACITY);
+			pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
 			if let Ok(reply) = _serve_client.recv() {
 				return reply.bytes;
 			}
@@ -3103,6 +3054,121 @@ fn system_volume_formats_to_the_disks_capacity() {
 	let failures = u32::from_le_bytes(reply[5..9].try_into().unwrap());
 	let damaged = u16::from_le_bytes([reply[9], reply[10]]);
 	assert_eq!((failures, damaged), (0, 0), "a fresh volume is clean");
+}
+
+// Serve pending raw-block-protocol requests (read/write/capacity/flush) over a sparse
+// in-memory sector map: the stand-in block driver behind the StorageService layout
+// tests.
+#[cfg(test)]
+fn pump_block_stand_in(blk_host: &object::channel::Channel, disk: &mut alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>, capacity: u64) {
+	use object::channel::Message;
+	use object::memory_object::MemoryObject;
+	use object::rights::Rights;
+	const SECTOR: usize = 512;
+	while let Ok(req) = blk_host.recv() {
+		assert!(req.bytes.len() >= 16, "a block request is [op][lba][count]");
+		let op = u32::from_le_bytes([req.bytes[0], req.bytes[1], req.bytes[2], req.bytes[3]]);
+		let lba = u64::from_le_bytes(req.bytes[4..12].try_into().unwrap());
+		let count = u32::from_le_bytes(req.bytes[12..16].try_into().unwrap()).max(1);
+		match op {
+			0 => {
+				// read: hand back a fresh buffer of the requested sectors.
+				let mut data = alloc::vec![0u8; count as usize * SECTOR];
+				for s in 0..count as u64 {
+					if let Some(sec) = disk.get(&(lba + s)) {
+						data[s as usize * SECTOR..(s as usize + 1) * SECTOR].copy_from_slice(sec);
+					}
+				}
+				let obj = MemoryObject::create(data.len()).expect("the sector buffer should allocate");
+				copy_into_object(&obj, &data);
+				send_cap(blk_host, &0u32.to_le_bytes(), obj, Rights::ALL).expect("the read reply should send");
+			}
+			1 => {
+				// write: store the transferred sectors into the sparse disk.
+				let cap = req.caps.first().expect("a write carries its buffer");
+				let object = cap.object();
+				let memory = object.as_any().downcast_ref::<MemoryObject>().expect("the buffer is a MemoryObject");
+				let data = read_from_object(memory, count as usize * SECTOR);
+				for s in 0..count as u64 {
+					disk.insert(lba + s, data[s as usize * SECTOR..(s as usize + 1) * SECTOR].to_vec());
+				}
+				blk_host.send(Message::new(0u32.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("the write reply should send");
+			}
+			2 => {
+				// capacity: the sparse disk's size in bytes.
+				let mut reply = alloc::vec::Vec::with_capacity(12);
+				reply.extend_from_slice(&0u32.to_le_bytes());
+				reply.extend_from_slice(&capacity.to_le_bytes());
+				blk_host.send(Message::new(reply, alloc::vec::Vec::new(), 0)).expect("the capacity reply should send");
+			}
+			3 => {
+				// flush: the in-memory disk is trivially durable; acknowledge the barrier.
+				blk_host.send(Message::new(0u32.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("the flush reply should send");
+			}
+			other => panic!("unexpected block op {}", other),
+		}
+	}
+}
+
+#[cfg(test)]
+#[test_case]
+fn system_volume_lands_in_a_gpt_partition() {
+	use alloc::collections::BTreeMap;
+	use object::channel::Channel;
+	use object::rights::Rights;
+
+	// A disk partitioned by another system: a GPT whose entry array names a LiberFS
+	// partition (the type GUID 4C424653-0001-4000-8000-4C6962657246) starting at LBA
+	// 40960 - NOT the fixed factory layout's sector 32768. StorageService must find
+	// the partition, format the volume INSIDE it, and size the pool to it.
+	const CAPACITY: u64 = 64 * 1024 * 1024;
+	const PART_FIRST: u64 = 40960;
+	const PART_BLOCKS: u64 = 4096; // 16 MiB
+	const PART_LAST: u64 = PART_FIRST + PART_BLOCKS * 8 - 1;
+
+	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
+	// the GPT header at LBA 1: signature, entry-array LBA, entry count and size.
+	let mut header = alloc::vec![0u8; 512];
+	header[0..8].copy_from_slice(b"EFI PART");
+	header[72..80].copy_from_slice(&2u64.to_le_bytes());
+	header[80..84].copy_from_slice(&128u32.to_le_bytes());
+	header[84..88].copy_from_slice(&128u32.to_le_bytes());
+	disk.insert(1, header);
+	// entry 0 at LBA 2: the LiberFS type GUID (on-disk byte order) and the span.
+	let mut entries = alloc::vec![0u8; 512];
+	entries[0..16].copy_from_slice(&[0x53, 0x46, 0x42, 0x4C, 0x01, 0x00, 0x00, 0x40, 0x80, 0x00, 0x4C, 0x69, 0x62, 0x65, 0x72, 0x46]);
+	entries[32..40].copy_from_slice(&PART_FIRST.to_le_bytes());
+	entries[40..48].copy_from_slice(&PART_LAST.to_le_bytes());
+	disk.insert(2, entries);
+
+	let (_volume, package) = scenario_packages().expect("boot modules should be present");
+	let elf = package.lookup(b"storage_service").expect("storage_service should be in the init package");
+	let (boot_kernel, boot_user) = Channel::create();
+	let (blk_host, blk_child) = Channel::create();
+	let (serve_server, _serve_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL, 0).expect("the StorageService should load");
+	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
+	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
+
+	let mut online = false;
+	'serve: for _ in 0..100_000 {
+		sched::run_until_idle();
+		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
+		if let Ok(report) = boot_kernel.recv() {
+			assert_eq!(&report.bytes[..], b"StorageService: online", "the service should come up on the GPT disk");
+			online = true;
+			break 'serve;
+		}
+	}
+	assert!(online, "the service should format inside the partition and report in");
+
+	// the superblock lands at the partition's first LBA, sized to the partition -
+	// and nothing was written at the fixed factory-layout offset.
+	let sb = disk.get(&PART_FIRST).expect("superblock slot 0 should sit at the partition start");
+	assert_eq!(&sb[0..8], b"LIBERFS1", "the partition should carry a LiberFS superblock");
+	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
+	assert_eq!(num_blocks, PART_BLOCKS, "the pool should span exactly the partition");
+	assert!(disk.get(&32768).is_none(), "the fixed factory offset must stay untouched on a GPT disk");
 }
 
 #[cfg(test)]

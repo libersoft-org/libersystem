@@ -1209,7 +1209,7 @@ multi-page DMA buffers.
 - Done when: bulk disk and network I/O move in large requests, the measured throughput improves accordingly, tests green.
 - Concept: M23/M24/M62 (the drivers this accelerates), the limits audit (the last "one page" assumptions removed).
 
-## LiberFS audit track (M73-M77)
+## LiberFS audit track (M73-M78)
 
 A full read of the crate (~3900 lines: lib/txn/fsops/dir/inode/blkalloc/snapshot/
 fsck + tests) plus the service and driver wiring around it (2026-07-02). The core -
@@ -1369,6 +1369,30 @@ Deduplication and cleanliness:
   - Result: every item landed (one assessed-and-declined with its reasoning recorded). liberfs 74 host tests (1 new), kernel 85 fresh + 85 mount, build 0 warnings.
 - Concept: the M73-M76 audit track this sweeps up after; the codebase-uniformity principle (the P3 hygiene items).
 
+## M78 - LiberFS: OS- and architecture-agnostic (portability hardening)
+
+The format was already endian-explicit and OS-neutral by construction; this
+milestone removes the last architecture assumption from the reference crate,
+pins the byte layout with tests, writes the formal field-level specification a
+foreign implementation needs, and gives the volume a GPT identity so other
+systems can find it. (Deliberately NOT here, per scope decision: CI targets for
+foreign architectures, a standalone crate build, FUSE/WinFsp reference drivers,
+host mkfs/fsck tools.)
+
+- [x] Retire the 32-bit `usize` traps: file sizes and logical block indexes ride u64 end to end (`nblocks`, `read_range`, `read_logical`/`write_logical`, `free_from`, the write loops), with `usize` only where a memory-resident slice is indexed - so a 32-bit build never silently truncates a > 4 GiB file.
+  - Result: signatures and loops converted; `reserve_run` takes u64 and clamps to its u32 run counter. Behaviour identical on 64-bit (full suite green unchanged).
+- [x] Pin the on-disk byte layout with golden tests, so the little-endian fixed-offset format is asserted on every architecture the tests run on.
+  - Result: `the_superblock_layout_matches_the_specification` (every superblock field at its documented offset, the self-CRC rule, a parser round-trip) and `the_record_layouts_match_the_specification` (extent record, file and directory inode slots, a directory leaf record, and the CRC32C RFC 3720 test vector pinning the checksum definition).
+- [x] Write the formal field-level format specification into LIBERFS.md (one place): general encoding rules, the container, every structure's offset table (superblock, B+tree nodes, inode slot, extent record, chain blocks, snapshot records), the checksum and codec definitions with test vector, the commit protocol, and the reachability rule behind the free map.
+  - Result: the "On-disk format specification (version 1, features 0x1)" section - sufficient for an independent implementation; the golden tests reference it and a layout change must bump a feature bit and update it.
+- [x] Declare the semantics a foreign driver must honor, also in LIBERFS.md: byte-exact case-sensitive UTF-8 names without normalization, the name policy, no links, UTC-seconds timestamps with synthesized atime, synthesized mount-wide permissions with the owner tag opaque, read-only snapshot mounts, the CoW + flush commit protocol, and the corrupt-snapshot-chain degradation rule.
+  - Result: the "Semantics a foreign driver must honor" section.
+- [x] Define the LiberFS GPT partition type GUID and support the volume living in a GPT partition, so a disk partitioned by any system carries a findable LiberFS volume.
+  - Result: type GUID `4C424653-0001-4000-8000-4C6962657246` ("LBFS"/"LiberF"), documented with its on-disk byte order. StorageService probes LBA 1 for a GPT and walks the entry array; a partition carrying the GUID becomes the volume's container (`ChannelBlockDevice` gained the base LBA; the pool spans the partition), else the fixed factory layout applies as before. Kernel test `system_volume_lands_in_a_gpt_partition` (a stand-in disk with a GPT naming a partition at LBA 40960: the superblock lands there, sized to the partition, and the factory offset stays untouched); the block stand-in pump was hoisted into a shared test helper.
+- Done when: a 32-bit build cannot truncate large files, the byte layout is test-pinned, LIBERFS.md alone suffices to implement a compatible driver, and a GPT-partitioned disk mounts by GUID - tests green.
+  - Result: all hold - liberfs 76 host tests (2 new), kernel 86 fresh + 86 mount (1 new), build 0 warnings.
+- Concept: the portability answer to "will it run under Windows/Linux/macOS drivers and on ARM/RISC-V" - the format was born agnostic, now it is specified, test-pinned and discoverable.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
@@ -1391,7 +1415,7 @@ workloads; multi-queue devices and the per-CPU interrupt-vector spaces they need
 (one vector number per device suffices until then - the M72 throughput work stays
 single-queue); immutable signed system + A/B updates + rollback + verified boot;
 encrypted user volumes; LiberFS work beyond the M53-M57 modernization and the
-M73-M77 audit track (online
+M73-M78 audit track (online
 resize, online defrag, multi-device / RAID; deduplication and encryption stay out by decision);
 first-party server apps (a
 static-file web server and the like); and a CLI package manager over the phase-2
