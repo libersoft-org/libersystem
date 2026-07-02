@@ -23,8 +23,10 @@ const BLK_T_IN: u32 = 0; // read (device writes the data buffer)
 const BLK_T_OUT: u32 = 1; // write (device reads the data buffer)
 const BLK_S_OK: u8 = 0;
 
-// The most sectors served per block request (one DMA page).
-const MAX_SECTORS: u32 = 8;
+// The most sectors served per block request: the reply buffer is a MemoryObject
+// sized by the request and each sector streams through the one DMA page, so this
+// is IPC-batching granularity (128 KiB per request), not a data cap.
+const MAX_SECTORS: u32 = 256;
 
 // Block-service request opcodes (the leading u32 of each request).
 const OP_READ: u32 = 0;

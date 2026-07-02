@@ -5,7 +5,7 @@
 // runs the matching handler. Handlers that touch per-process state (handles,
 // objects, mappings) operate on the calling thread's handle table.
 //
-// Return convention (Linux-style): a successful call returns its result value
+// Return convention: a successful call returns its result value
 // (a handle, an address, a count, ...). An error returns a small negative value
 // in the range [-4095, -1]; sys_is_err() tests for it. This lets a syscall return
 // a higher-half kernel address - whose top bit is set - without it being mistaken

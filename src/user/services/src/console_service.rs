@@ -79,9 +79,9 @@ fn geometry(fb: &Framebuffer) -> Geometry {
 	Geometry { width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size }
 }
 
-// The number of virtual terminals the console multiplexes. Each VT is an independent
-// shell over its own per-VT service connections; the foreground VT owns the display.
-const NVT: usize = 4;
+// The number of virtual terminals the console multiplexes (opened lazily by Ctrl+N,
+// so unopened VTs cost nothing).
+const NVT: usize = 63;
 
 // Control-byte chords intercepted by the console (never forwarded to a shell): the
 // virtio-input driver maps Ctrl+N to 0x0e (open a new VT) and Ctrl+] to 0x1d (cycle the
@@ -101,7 +101,7 @@ const CHORD_SCROLL_DOWN: u8 = 0x1f;
 const BELL_FLASH_TICKS: u64 = 10;
 
 // The tty line discipline limits (per VT).
-const LD_LINE_MAX: usize = 1024;
+const LD_LINE_MAX: usize = 4096;
 const LD_HIST_MAX: usize = 32;
 
 // A small fixed buffer the line discipline accumulates echo bytes in, mirrored to the
@@ -381,11 +381,9 @@ impl Ld {
 			return;
 		}
 		self.hist_pos -= 1;
-		let mut tmp = [0u8; LD_LINE_MAX];
-		let h = &self.history[self.hist_pos];
-		let n = h.len().min(LD_LINE_MAX);
-		tmp[..n].copy_from_slice(&h[..n]);
-		self.replace_line(&tmp[..n], e);
+		// clone to the heap: a line is up to LD_LINE_MAX (4 KiB), too big for the stack.
+		let h: Vec<u8> = self.history[self.hist_pos].clone();
+		self.replace_line(&h, e);
 	}
 
 	fn history_next(&mut self, e: &mut Echo) {
@@ -396,11 +394,8 @@ impl Ld {
 		if self.hist_pos == self.history.len() {
 			self.replace_line(b"", e);
 		} else {
-			let mut tmp = [0u8; LD_LINE_MAX];
-			let h = &self.history[self.hist_pos];
-			let n = h.len().min(LD_LINE_MAX);
-			tmp[..n].copy_from_slice(&h[..n]);
-			self.replace_line(&tmp[..n], e);
+			let h: Vec<u8> = self.history[self.hist_pos].clone();
+			self.replace_line(&h, e);
 		}
 	}
 
@@ -996,11 +991,13 @@ unsafe fn feed_tty(vt: &mut Vt, b: u8) {
 				send_blocking(client, &[], 0);
 			} else {
 				let n: usize = vt.ld.len;
-				let mut out: [u8; LD_LINE_MAX + 1] = [0u8; LD_LINE_MAX + 1];
-				out[..n].copy_from_slice(&vt.ld.line[..n]);
-				out[n] = b'\n';
+				// build the line + newline on the heap: up to LD_LINE_MAX + 1 (4 KiB),
+				// too big for this service's stack.
+				let mut out: Vec<u8> = Vec::with_capacity(n + 1);
+				out.extend_from_slice(&vt.ld.line[..n]);
+				out.push(b'\n');
 				vt.ld.commit();
-				send_blocking(client, &out[..n + 1], 0);
+				send_blocking(client, &out, 0);
 			}
 		}
 	}

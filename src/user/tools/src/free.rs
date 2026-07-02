@@ -3,7 +3,7 @@
 // PermissionManager launches this program under an empty permission manifest - the
 // memory totals are a free syscall, no capability needed - and forwards it the
 // shell's stdout console and the argument string (the sub-form: "" for bytes or
-// "-h" for human-readable units, like Linux). free reads the physical frame pool's
+// "-h" for human-readable units). free reads the physical frame pool's
 // total/free counts and the kernel heap's total/free bytes, prints a Mem: and a
 // Heap: row to the inherited stdout, and exits.
 

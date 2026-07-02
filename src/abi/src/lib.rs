@@ -347,7 +347,7 @@ pub struct PciInfo {
 	pub _pad: u16,
 }
 
-// Error codes (Linux-style: a successful call returns its value, an error returns
+// Error codes (a successful call returns its value, an error returns
 // a small negative in the reserved band [-4095, -1]).
 pub const ERR_BAD_SYSCALL: i64 = -1;
 pub const ERR_NO_THREAD: i64 = -2;

@@ -460,8 +460,7 @@ impl Screen {
 		self.alt = alloc::vec![blank; new_cols * new_rows];
 		self.dirty = alloc::vec![true; new_cols * new_rows];
 		self.wrap = alloc::vec![false; new_rows];
-		// Scrollback is reset on a resize (its fixed width changed) - the Linux console
-		// likewise drops scrollback on a mode change.
+		// Scrollback is reset on a resize (its fixed width changed)
 		self.scrollback = alloc::vec![blank; SCROLLBACK_ROWS * new_cols];
 		self.sb_wrap = alloc::vec![false; SCROLLBACK_ROWS];
 		self.sb_cap = SCROLLBACK_ROWS;

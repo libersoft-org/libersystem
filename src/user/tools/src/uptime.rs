@@ -3,8 +3,8 @@
 // PermissionManager launches this program under an empty permission manifest - the
 // monotonic clock is a free syscall, no capability needed - and forwards it the
 // shell's stdout console and an (empty) argument string. uptime reads the
-// nanosecond monotonic clock, renders it Linux-style ("up 2 days, 4:05:06" /
-// "up 0:05:32"), prints it to the inherited stdout, and exits.
+// nanosecond monotonic clock ("up 2 days, 4:05:06" /// "up 0:05:32"),
+// prints it to the inherited stdout, and exits.
 
 #![no_std]
 #![no_main]

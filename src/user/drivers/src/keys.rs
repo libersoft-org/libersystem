@@ -1,6 +1,6 @@
 // Shared keyboard-input logic for the userspace input drivers.
 //
-// Both keyboard drivers - virtio-input (Linux evdev keycodes) and the xHCI USB HID
+// Both keyboard drivers - virtio-input and the xHCI USB HID
 // keyboard (HID usages translated to the same keycodes) - feed the interactive
 // console through this one module: it tracks the modifier state across press /
 // release events, applies the US layout (Shift / Caps / Ctrl / Alt), turns the
@@ -12,7 +12,7 @@
 
 use rt::*;
 
-// Linux keycodes for the navigation keys (all above the 64-entry ASCII KEYMAP), which
+// Keycodes for the navigation keys (all above the 64-entry ASCII KEYMAP), which
 // the driver turns into ANSI escape sequences rather than glyphs.
 pub const KEY_HOME: u16 = 102;
 pub const KEY_UP: u16 = 103;
@@ -24,7 +24,7 @@ pub const KEY_DELETE: u16 = 111;
 pub const KEY_PAGEUP: u16 = 104;
 pub const KEY_PAGEDOWN: u16 = 109;
 
-// Linux keycodes for the modifier keys (tracked across press/release, not emitted).
+// Keycodes for the modifier keys (tracked across press/release, not emitted).
 pub const KEY_LEFTCTRL: u16 = 29;
 pub const KEY_LEFTSHIFT: u16 = 42;
 pub const KEY_RIGHTSHIFT: u16 = 54;
@@ -33,7 +33,7 @@ pub const KEY_CAPSLOCK: u16 = 58;
 pub const KEY_RIGHTCTRL: u16 = 97;
 pub const KEY_RIGHTALT: u16 = 100;
 
-// Linux input keycode -> ASCII for the unshifted main block: the letter keys
+// Input keycode -> ASCII for the unshifted main block: the letter keys
 // (lowercase), the digit row, and the few control keys a line shell needs. 0 means
 // "no character" (modifiers, function keys, unmapped). Indices are KEY_* codes, e.g.
 // KEY_A = 30 -> 'a', KEY_ENTER = 28 -> '\n', KEY_BACKSPACE = 14 -> 0x08.
@@ -71,7 +71,7 @@ pub struct Mods {
 	pub caps: bool,
 }
 
-// Feed one key event (a Linux keycode and its value: 1 = press, 2 = autorepeat,
+// Feed one key event (a keycode and its value: 1 = press, 2 = autorepeat,
 // 0 = release) into the console. Modifier keys update `mods` (tracked across press
 // and release); an ordinary key press / autorepeat is turned into a character
 // through the layout (Shift / Caps / Ctrl / Alt applied) and fed to the console,
@@ -195,7 +195,7 @@ fn nav_sequence(code: u16) -> Option<&'static [u8]> {
 	}
 }
 
-// HID keyboard-page usage -> Linux keycode, for the boot-protocol report a USB
+// HID keyboard-page usage -> keycode, for the boot-protocol report a USB
 // keyboard sends: the letters (0x04..), the digit row, the control and punctuation
 // keys, and the navigation block, all onto the same keycodes the virtio-input
 // KEYMAP above indexes. 0 = unmapped (function keys, keypad).
@@ -212,7 +212,7 @@ const HID_KEYCODES: [u16; 0x53] = [
 	105, 108, 103,                                    // 50: left, down, up
 ];
 
-// Resolve a HID keyboard-page usage id to its Linux keycode (0 = unmapped).
+// Resolve a HID keyboard-page usage id to its keycode (0 = unmapped).
 pub fn hid_keycode(usage: u8) -> u16 {
 	if (usage as usize) < HID_KEYCODES.len() {
 		HID_KEYCODES[usage as usize]
@@ -221,7 +221,7 @@ pub fn hid_keycode(usage: u8) -> u16 {
 	}
 }
 
-// The Linux keycode of each HID boot-report modifier bit (byte 0, bits 0..7):
+// The keycode of each HID boot-report modifier bit (byte 0, bits 0..7):
 // LCtrl, LShift, LAlt, LGui, RCtrl, RShift, RAlt, RGui. The GUI keys carry no
 // keycode here (0 = ignored).
 pub const HID_MODIFIER_KEYCODES: [u16; 8] = [KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, 0, KEY_RIGHTCTRL, KEY_RIGHTSHIFT, KEY_RIGHTALT, 0];

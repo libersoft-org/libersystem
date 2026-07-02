@@ -12,11 +12,15 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use rt::*;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	let mut buf: [u8; 256] = [0u8; 256];
+	// The line buffer matches the terminal's cooked line maximum (4 KiB + newline)
+	// and lives on the heap, clear of the 16 KiB user stack.
+	let mut buf: alloc::vec::Vec<u8> = alloc::vec![0u8; 4200];
 	unsafe {
 		// Adopt the console as stdout AND stdin (a foreground launch grants RECEIVE too).
 		inherit_stdout(bootstrap);

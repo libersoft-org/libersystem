@@ -207,10 +207,12 @@ const SCSI_WRITE10: u8 = 0x2a;
 
 // One disk sector, and the block-service wire protocol this driver serves to a
 // StorageService instance - the same contract driver.virtio-blk serves: a request
-// is [op u32][lba u64][count u32] (count clamped to one DMA page = 8 sectors), a
-// read replies [status u32] + a MemoryObject of the sectors, a write carries a
-// MemoryObject in and replies [status u32], and a capacity query (op 2) replies
-// [status u32][capacity bytes u64].
+// is [op u32][lba u64][count u32], a read replies [status u32] + a MemoryObject of
+// the sectors, a write carries a MemoryObject in and replies [status u32], and a
+// capacity query (op 2) replies [status u32][capacity bytes u64]. The per-request
+// sector cap is this driver's own: one SCSI READ(10)/WRITE(10) moves through the
+// unit's single 4 KiB data page, so 8 sectors is the transfer unit here (a larger
+// unit needs a multi-page BOT data buffer - a future throughput step).
 const SECTOR: u32 = 512;
 const MAX_SECTORS: u32 = 8;
 const OP_READ: u32 = 0;

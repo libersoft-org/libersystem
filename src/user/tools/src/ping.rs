@@ -9,8 +9,8 @@
 // interrupt instead of the tool being killed.
 //
 // The same probe results render in one of two representations - the "one model, many
-// codecs" idea applied to a tool's output: by default a Linux-style line per reply
-// plus a statistics summary, or, with `--json`/`-j`, a single JSON document
+// codecs" idea applied to a tool's output: by default a line per reply plus
+// a statistics summary, or, with `--json`/`-j`, a single JSON document
 // {target, address, replies, statistics} that reuses the generated PingReply codec
 // for each reply body. Because an unbounded run never produces its final JSON
 // document, JSON mode defaults to four probes when no `-c` count is given.
@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 
 use proto::codec::json_escape;
-use proto::system::{Ipv4Addr, PingReply, PingStatus, network};
+use proto::system::{network, Ipv4Addr, PingReply, PingStatus};
 use rt::*;
 
 // The representation ping renders its results in. Extend with further codecs (e.g.
@@ -156,7 +156,7 @@ unsafe fn ping(netsvc: u64, args: &[u8]) {
 						stats.add_reply(reply.rtt_us);
 					}
 					match format {
-						// CLI: one Linux-style line per reply (timeouts are silent losses).
+						// CLI: one line per reply (timeouts are silent losses).
 						OutputFormat::Cli => match reply.status {
 							PingStatus::Reply => {
 								let mut line: String = String::new();

@@ -113,7 +113,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    become the interactive console and run the read-eval-print loop.
 	print_motd();
 	unsafe {
-		repl(console, control, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, &mut buf);
+		repl(console, control, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session);
 	}
 	exit();
 }
@@ -178,7 +178,7 @@ fn print_banner(lines: &[&str]) {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, buf: &mut [u8]) {
+unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64) {
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control, session);
 		// The cwd is owned by the session (so it survives a shell restart); read it once at
@@ -206,7 +206,11 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			Vec::new()
 		};
 		loop {
-			let n: usize = match recv_blocking(console, buf) {
+			// The line buffer matches the terminal's cooked line maximum (4 KiB + the
+			// newline) and lives on the heap - the kernel truncates a message to the
+			// receiver's buffer silently, so it must never be smaller than a line.
+			let mut line_buf: alloc::vec::Vec<u8> = alloc::vec![0u8; 4200];
+			let n: usize = match recv_blocking(console, &mut line_buf) {
 				Received::Message { len, .. } => len,
 				Received::Closed => return,
 			};
@@ -218,7 +222,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			// The terminal delivers a whole submitted line (with a trailing newline); trim
 			// it, expand any `$NAME` / `${NAME}` against the environment, then dispatch it,
 			// reap finished jobs, and print the next prompt.
-			let raw: &[u8] = trim(&buf[..n]);
+			let raw: &[u8] = trim(&line_buf[..n]);
 			let expanded: Vec<u8> = expand_vars(raw, &vars);
 			if dispatch(&expanded, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, &mut jobs, &mut vars, &mut cwd) {
 				return;

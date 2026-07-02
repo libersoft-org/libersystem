@@ -84,9 +84,11 @@ const TCP_RST: u8 = 0x04;
 const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
 
-// The receive buffer / advertised window for one TCP connection. Kept small (we drain
-// it after every segment) so a pool of connection states stays modest.
-const TCP_RX_MAX: usize = 1024;
+// The receive buffer / advertised window for one TCP connection: 65535 is the most
+// a TCP header's 16-bit window field can advertise without window scaling (adding
+// the WS option is the future step beyond this, as Linux's autotuned buffers are).
+// The buffer lives inside the heap-pooled connection state.
+const TCP_RX_MAX: usize = 65535;
 
 // The initial TCP connection pool size: outbound `connect`s and inbound accepted
 // connections share the pool, which grows on demand - a size hint, never a cap.
@@ -211,8 +213,9 @@ struct Neigh {
 }
 
 // The ARP neighbor cache size - a cache with eviction (the oldest slot is replaced
-// when full), so it bounds memory, never which neighbors are reachable.
-const NEIGH_MAX: usize = 32;
+// when full), so it bounds memory, never which neighbors are reachable. Matches
+// Linux's default gc_thresh3; lives on the heap.
+const NEIGH_MAX: usize = 1024;
 
 // The address configuration learned from a DHCP OFFER/ACK: the offered address plus
 // the mask / gateway / DNS / server-id carried in the reply options.
@@ -295,14 +298,15 @@ struct TcpConn {
 	snd_nxt: u32,
 	// Receive sequence: the next in-order byte we expect.
 	rcv_nxt: u32,
-	// Received in-order data waiting to be read, and how much.
-	rx: [u8; TCP_RX_MAX],
+	// Received in-order data waiting to be read, and how much. Heap-allocated (the
+	// 64 KiB window must never sit on a 16 KiB user stack).
+	rx: Vec<u8>,
 	rx_len: usize,
 }
 
 impl TcpConn {
-	const fn closed() -> TcpConn {
-		TcpConn { in_use: false, state: TcpState::Closed, aborted: false, peer_fin: false, pending_accept: false, local_port: 0, remote_ip: Ipv4Addr([0; 4]), remote_port: 0, remote_mac: MacAddr::ZERO, snd_una: 0, snd_nxt: 0, rcv_nxt: 0, rx: [0; TCP_RX_MAX], rx_len: 0 }
+	fn closed() -> TcpConn {
+		TcpConn { in_use: false, state: TcpState::Closed, aborted: false, peer_fin: false, pending_accept: false, local_port: 0, remote_ip: Ipv4Addr([0; 4]), remote_port: 0, remote_mac: MacAddr::ZERO, snd_una: 0, snd_nxt: 0, rcv_nxt: 0, rx: alloc::vec![0; TCP_RX_MAX], rx_len: 0 }
 	}
 }
 
@@ -335,7 +339,7 @@ pub struct Stack {
 	mask: Ipv4Addr,
 	gateway: Ipv4Addr,
 	dns: Ipv4Addr,
-	neigh: [Neigh; NEIGH_MAX],
+	neigh: Vec<Neigh>,
 	conns: Vec<TcpConn>,
 	// The ports we accept inbound connections on (passive open); 0 = unused slot.
 	// Grows on demand.
@@ -352,7 +356,7 @@ impl Stack {
 		for _ in 0..TCP_CONN_MAX {
 			conns.push(TcpConn::closed());
 		}
-		Stack { mac, ip, mask, gateway, dns, neigh: [Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; NEIGH_MAX], conns, listen_ports: alloc::vec![0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
+		Stack { mac, ip, mask, gateway, dns, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; NEIGH_MAX], conns, listen_ports: alloc::vec![0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
 	}
 
 	pub fn mac(&self) -> MacAddr {
