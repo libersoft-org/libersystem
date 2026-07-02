@@ -76,6 +76,10 @@ pub struct Iso9660<D: BlockDevice> {
 }
 
 impl<D: BlockDevice> Iso9660<D> {
+	// The block device this filesystem reads through.
+	pub fn device(&self) -> &D {
+		&self.dev
+	}
 	// Mount optical media: scan the volume descriptors for a Primary (and a preferred
 	// Joliet) descriptor and take its root directory record. None if no PVD is found.
 	pub fn mount(mut dev: D) -> Option<Iso9660<D>> {

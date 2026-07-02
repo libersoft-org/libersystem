@@ -780,6 +780,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			print(b"  lsirq [json]     print the device-interrupt vectors in use\n");
 			print(b"  lspci [json]     list the PCI bus functions\n");
 			print(b"  lssvc [json] [prefix]  list system services and their state via ServiceManager\n");
+			print(b"  lsblk [json]     list block devices and their volumes via StorageService\n");
+			print(b"  lsusb [json]     list USB devices via the xHCI driver\n");
 			print(b"  stop <service>   stop a service and its dependents via ServiceManager\n");
 			print(b"  ps               list started processes via ProcessService\n");
 			print(b"  run <name>       start a program via ProcessService\n");
@@ -984,6 +986,22 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		}
 		if let Some(rest) = line.strip_prefix(b"lssvc ") {
 			run_tool(permsvc, b"lssvc", trim(rest), cwd.as_bytes());
+			return false;
+		}
+		if line == b"lsblk" {
+			run_tool(permsvc, b"lsblk", b"", cwd.as_bytes());
+			return false;
+		}
+		if line == b"lsblk json" {
+			run_tool(permsvc, b"lsblk", b"json", cwd.as_bytes());
+			return false;
+		}
+		if line == b"lsusb" {
+			run_tool(permsvc, b"lsusb", b"", cwd.as_bytes());
+			return false;
+		}
+		if line == b"lsusb json" {
+			run_tool(permsvc, b"lsusb", b"json", cwd.as_bytes());
 			return false;
 		}
 		if line == b"beep" {

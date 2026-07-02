@@ -87,6 +87,10 @@ pub struct Udf<D: BlockDevice> {
 }
 
 impl<D: BlockDevice> Udf<D> {
+	// The block device this filesystem reads through.
+	pub fn device(&self) -> &D {
+		&self.dev
+	}
 	// Mount UDF media: read the Anchor at LBA 256, scan the Main Volume Descriptor
 	// Sequence for the partition start and File Set, then the root directory ICB. None if
 	// the layout cannot be followed.

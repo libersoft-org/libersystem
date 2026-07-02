@@ -165,6 +165,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// instance's client end minted when that instance bootstraps.
 	let mut block5_client: u64 = 0;
 	let mut usb_client: u64 = 0;
+	// The xHCI driver's USB bus query channel (the typed `usb` inventory), handed up
+	// with the phase-2 driver channels and granted to the `lsusb` command through
+	// PermissionManager.
+	let mut usbq_client: u64 = 0;
 	let mut net_frames: u64 = 0;
 	let mut net_client: u64 = 0;
 	let mut gpu_client: u64 = 0;
@@ -223,7 +227,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -233,7 +237,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// on process_service, so come up later), so their driver channels are ready.
 				if MANIFEST[i].name == b"storage_service" && started == State::Running {
 					if let Some(dm) = index_of(b"device_manager") {
-						unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_frames, &mut gpu_client, &mut snd_client, &mut input_raw, &mut block5_client, &mut buf) };
+						unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_frames, &mut gpu_client, &mut snd_client, &mut input_raw, &mut block5_client, &mut usbq_client, &mut buf) };
 					}
 				}
 			}
@@ -411,10 +415,11 @@ unsafe fn launch_from_volume(process_client: u64, name: &[u8], bootstrap: u64) -
 // it a fresh StorageService connection over its control channel with a "DRIVERS" message,
 // so it loads the non-bootstrap drivers from vol://system/drivers/ and hands their channels
 // back - the net driver's frame channel, the gpu display channel, the snd control channel,
-// the pointer event channel, and the USB stick's block channel (each 0 when that device is
-// absent). Kept for bootstrapping NetworkService, ConsoleService, AudioService,
-// InputService and the usb StorageService instance against the drivers.
-unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_raw: &mut u64, block5_client: &mut u64, buf: &mut [u8]) {
+// the pointer event channel, the USB stick's block channel (each 0 when that device is
+// absent), and the xHCI driver's USB bus query channel (the `lsusb` inventory). Kept for
+// bootstrapping NetworkService, ConsoleService, AudioService, InputService, the usb
+// StorageService instance and PermissionManager's `usb` grant against the drivers.
+unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_raw: &mut u64, block5_client: &mut u64, usbq_client: &mut u64, buf: &mut [u8]) {
 	unsafe {
 		if dm_control == 0 {
 			return;
@@ -438,6 +443,9 @@ unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames
 		if let Received::Message { handle: usb, .. } = recv_blocking(dm_control, buf) {
 			*block5_client = usb;
 		}
+		if let Received::Message { handle: usbq, .. } = recv_blocking(dm_control, buf) {
+			*usbq_client = usbq;
+		}
 	}
 }
 
@@ -452,7 +460,7 @@ unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -525,7 +533,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
 			return State::Failed;
 		}
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *res_client, *process_client, perm_client, admin_server2, stats_server2) {
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *usbq_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *res_client, *process_client, perm_client, admin_server2, stats_server2) {
 			return State::Failed;
 		}
 		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, pkg_handle, pkg_len, buf) {
@@ -827,7 +835,7 @@ unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], st
 // narrower client to each component it sandboxes. (The grantable permission capability - a
 // connection to the manager's own serve channel - is not passed here: the manager mints that
 // self-connection itself.)
-unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, resource_client: u64, process_client: u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
+unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, usbq_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, resource_client: u64, process_client: u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
 	unsafe {
 		// A fresh StorageService connection for the manager (independent of the shell's),
 		// duplicable so the manager can grant a narrowed copy to a sandboxed component.
@@ -958,6 +966,13 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			return false;
 		}
 		*stats_server2 = status_srv;
+		// The xHCI driver's USB bus query channel the manager grants to the governed `lsusb`
+		// command (whose manifest grants usb): handed up by DeviceManager in phase 2, held by
+		// the supervisor until here (0 when the driver never came up - the manager simply
+		// cannot grant what it does not hold).
+		if !send_blocking(manager_side, b"USBBUS", usbq_client) {
+			return false;
+		}
 		// A fresh ProcessService connection the manager drives to load the components it
 		// governs - the loading mechanism, kept separate from the granting policy.
 		let proc_conn: u64 = match service_connect(process_client) {

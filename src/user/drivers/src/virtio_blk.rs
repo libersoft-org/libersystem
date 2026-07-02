@@ -29,6 +29,7 @@ const MAX_SECTORS: u32 = 8;
 // Block-service request opcodes (the leading u32 of each request).
 const OP_READ: u32 = 0;
 const OP_WRITE: u32 = 1;
+const OP_CAPACITY: u32 = 2;
 
 // Block-service reply status codes.
 const STATUS_OK: u32 = 0;
@@ -61,7 +62,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		let report: &[u8] = if ok { b"driver.virtio-blk: online (volume archive on disk)" } else { b"driver.virtio-blk: online" };
 		send_blocking(bootstrap, report, blk_client);
-		serve_blocks(&queue, blk_server)
+		// the disk's capacity in 512-byte sectors, from the virtio-blk device config
+		// (bytes 0..8), answered to OP_CAPACITY requests.
+		let mut capacity_sectors: u64 = 0;
+		for i in 0..8u64 {
+			capacity_sectors |= (device.config_read(i) as u64) << (i * 8);
+		}
+		serve_blocks(&queue, blk_server, capacity_sectors)
 	}
 }
 
@@ -116,9 +123,11 @@ unsafe fn request(queue: &Queue, virt: u64, phys: u64, lba: u64, kind: u32, data
 // (op 0) replies [status u32] carrying, on success, a MemoryObject capability to a
 // freshly filled buffer of count*512 bytes - the sectors read off the disk. A write
 // (op 1) carries a transferred MemoryObject of count*512 bytes the device reads onto
-// the disk, and replies [status u32] with no buffer. The data crosses as a shared
-// buffer handle, never copied through the channel.
-unsafe fn serve_blocks(queue: &Queue, blk_server: u64) -> ! {
+// the disk, and replies [status u32] with no buffer. A capacity query (op 2) replies
+// [status u32][capacity bytes u64] - the disk's size, asked once of the device config
+// at startup. The data crosses as a shared buffer handle, never copied through the
+// channel.
+unsafe fn serve_blocks(queue: &Queue, blk_server: u64, capacity_sectors: u64) -> ! {
 	unsafe {
 		// one reusable DMA buffer the device reads/writes each sector through.
 		let dma: i64 = dma_buffer_create(4096);
@@ -141,6 +150,7 @@ unsafe fn serve_blocks(queue: &Queue, blk_server: u64) -> ! {
 					match op {
 						OP_READ => serve_read(queue, blk_server, virt, phys, lba, count),
 						OP_WRITE => serve_write(queue, blk_server, virt, phys, lba, count, handle),
+						OP_CAPACITY => reply_capacity(blk_server, capacity_sectors * SECTOR as u64),
 						_ => {
 							if handle != 0 {
 								close(handle);
@@ -240,5 +250,15 @@ unsafe fn serve_write(queue: &Queue, blk_server: u64, virt: u64, phys: u64, lba:
 unsafe fn reply_block(blk_server: u64, status: u32, xfer: u64) {
 	unsafe {
 		send_blocking(blk_server, &status.to_le_bytes(), xfer);
+	}
+}
+
+// Send a capacity reply: [status u32 LE][capacity bytes u64 LE], no handle.
+unsafe fn reply_capacity(blk_server: u64, bytes: u64) {
+	unsafe {
+		let mut reply: [u8; 12] = [0u8; 12];
+		reply[..4].copy_from_slice(&STATUS_OK.to_le_bytes());
+		reply[4..].copy_from_slice(&bytes.to_le_bytes());
+		send_blocking(blk_server, &reply, 0);
 	}
 }

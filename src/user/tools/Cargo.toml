@@ -125,6 +125,14 @@ name = "lssvc"
 path = "src/lssvc.rs"
 
 [[bin]]
+name = "lsblk"
+path = "src/lsblk.rs"
+
+[[bin]]
+name = "lsusb"
+path = "src/lsusb.rs"
+
+[[bin]]
 name = "ping"
 path = "src/ping.rs"
 

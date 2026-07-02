@@ -18,8 +18,14 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod keys;
 
+use alloc::string::String;
+use alloc::vec::Vec;
+use proto::system::usb;
+use proto::system::{Error as UsbError, UsbDevice as UsbEntry};
 use rt::*;
 
 use crate::keys::Mods;
@@ -203,11 +209,13 @@ const SCSI_WRITE10: u8 = 0x2a;
 // StorageService instance - the same contract driver.virtio-blk serves: a request
 // is [op u32][lba u64][count u32] (count clamped to one DMA page = 8 sectors), a
 // read replies [status u32] + a MemoryObject of the sectors, a write carries a
-// MemoryObject in and replies [status u32].
+// MemoryObject in and replies [status u32], and a capacity query (op 2) replies
+// [status u32][capacity bytes u64].
 const SECTOR: u32 = 512;
 const MAX_SECTORS: u32 = 8;
 const OP_READ: u32 = 0;
 const OP_WRITE: u32 = 1;
+const OP_CAPACITY: u32 = 2;
 const STATUS_OK: u32 = 0;
 const STATUS_ERR: u32 = 1;
 
@@ -333,36 +341,64 @@ struct Keyboard {
 	mods: Mods,
 }
 
-// The addressed devices' slots, by root port - the state hot-plug works against.
-// An attach enumerates a root port only when no slot is recorded for it; a detach
-// disables every slot recorded for it (a hub takes its downstream devices along).
+// One addressed device's inventory record: its root port and slot (the state a
+// detach tears down), plus the identity its device descriptor reported and the
+// role the driver bound it to - the `usb.list` inventory.
+#[derive(Clone, Copy)]
+struct SlotRec {
+	port: u32,
+	slot: u32,
+	speed: u32,
+	vendor: u16,
+	product: u16,
+	class: u8,
+	kind: u8,
+}
+
+// The roles a device may be bound to, reported in the inventory.
+const KIND_DEVICE: u8 = 0;
+const KIND_HUB: u8 = 1;
+const KIND_KEYBOARD: u8 = 2;
+const KIND_STORAGE: u8 = 3;
+
+// The addressed devices, by root port - the state hot-plug works against and the
+// inventory `usb.list` serves. An attach enumerates a root port only when no slot
+// is recorded for it; a detach disables every slot recorded for it (a hub takes
+// its downstream devices along).
 struct Slots {
-	entries: [(u32, u32); 16],
+	entries: [SlotRec; 16],
 	len: usize,
 }
 
 impl Slots {
 	const fn new() -> Slots {
-		Slots { entries: [(0, 0); 16], len: 0 }
+		Slots { entries: [SlotRec { port: 0, slot: 0, speed: 0, vendor: 0, product: 0, class: 0, kind: KIND_DEVICE }; 16], len: 0 }
 	}
 
-	// Record one addressed device's (root port, slot).
-	fn record(&mut self, port: u32, slot: u32) {
+	// Record one addressed device's inventory entry.
+	fn record(&mut self, rec: SlotRec) {
 		if self.len < self.entries.len() {
-			self.entries[self.len] = (port, slot);
+			self.entries[self.len] = rec;
 			self.len += 1;
+		}
+	}
+
+	// Update the recorded role of the device in `slot` once it is classified.
+	fn set_kind(&mut self, slot: u32, kind: u8) {
+		if let Some(rec) = self.entries[..self.len].iter_mut().find(|r| r.slot == slot) {
+			rec.kind = kind;
 		}
 	}
 
 	// Whether any addressed device sits on this root port.
 	fn has_port(&self, port: u32) -> bool {
-		self.entries[..self.len].iter().any(|&(p, _)| p == port)
+		self.entries[..self.len].iter().any(|r| r.port == port)
 	}
 
 	// Remove and return one slot on this root port (call until None on a detach).
 	fn take_port(&mut self, port: u32) -> Option<u32> {
-		let i: usize = self.entries[..self.len].iter().position(|&(p, _)| p == port)?;
-		let slot: u32 = self.entries[i].1;
+		let i: usize = self.entries[..self.len].iter().position(|r| r.port == port)?;
+		let slot: u32 = self.entries[i].slot;
 		self.len -= 1;
 		self.entries[i] = self.entries[self.len];
 		Some(slot)
@@ -384,6 +420,9 @@ struct Storage {
 	data_virt: u64,
 	data_phys: u64,
 	tag: u32,
+	// The unit's size in bytes, from READ CAPACITY at configuration - answered to
+	// OP_CAPACITY queries for the `lsblk` inventory.
+	capacity: u64,
 }
 
 #[unsafe(no_mangle)]
@@ -431,6 +470,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// Always created - a stick hot-plugged later serves over the same channel, and
 		// with none attached requests are answered with an error status.
 		let (blk_server, blk_client): (u64, u64) = channel().unwrap_or_else(|| exit());
+		// the USB bus query channel: the client end follows the report under "USBBUS"
+		// (DeviceManager routes it on to PermissionManager, which grants it to the
+		// `lsusb` command); the driver serves the typed `usb` interface on the server
+		// end - the live inventory of the devices it addressed.
+		let (usbq_server, usbq_client): (u64, u64) = channel().unwrap_or_else(|| exit());
 		// report in, then serve the bus for the life of the system: keyboard reports,
 		// block requests, and runtime attach / detach.
 		let mut report: [u8; 64] = [0u8; 64];
@@ -457,7 +501,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 		}
 		send_blocking(bootstrap, &report[..n], blk_client);
-		service_loop(&mut hc, &mut slots, keyboard, storage, blk_server, irq);
+		send_blocking(bootstrap, b"USBBUS", usbq_client);
+		service_loop(&mut hc, &mut slots, keyboard, storage, blk_server, usbq_server, irq);
 	}
 }
 
@@ -733,17 +778,20 @@ fn initial_packet_size(speed: u32) -> u32 {
 unsafe fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices: &mut u32, keyboard: &mut Option<(UsbDevice, Keyboard)>, storage: &mut Option<(UsbDevice, Storage)>) {
 	unsafe {
 		report_device(&dev);
-		slots.record(dev.port, dev.slot);
+		slots.record(SlotRec { port: dev.port, slot: dev.slot, speed: dev.speed, vendor: dev.vendor, product: dev.product, class: dev.class, kind: KIND_DEVICE });
 		*devices += 1;
 		if dev.class == CLASS_HUB {
+			slots.set_kind(dev.slot, KIND_HUB);
 			expand_hub(hc, &mut dev, slots, devices, keyboard, storage);
 		} else if keyboard.is_none()
 			&& let Some(kb) = configure_keyboard(hc, &mut dev)
 		{
+			slots.set_kind(dev.slot, KIND_KEYBOARD);
 			*keyboard = Some((dev, kb));
 		} else if storage.is_none()
 			&& let Some(st) = configure_storage(hc, &mut dev)
 		{
+			slots.set_kind(dev.slot, KIND_STORAGE);
 			*storage = Some((dev, st));
 		}
 	}
@@ -1090,20 +1138,21 @@ fn ep_interval(speed: u32, b_interval: u32) -> u32 {
 // Serve the bus for the life of the system: the keyboard keeps one 8-byte report
 // TRB posted (the device completes it only when the key state changes) and its
 // reports feed the console; the disk serves block requests arriving on
-// `blk_server` (answered with an error status while no disk is attached); and a
+// `blk_server` (answered with an error status while no disk is attached); the
+// typed `usb` interface serves the live device inventory on `usbq`; and a
 // port-status-change event triggers a root-port reconcile, so a device plugged in
 // at runtime enumerates and configures on the fly and an unplugged one is torn
-// down. The loop sleeps on the controller's MSI-X interrupt and the block channel
+// down. The loop sleeps on the controller's MSI-X interrupt and both channels
 // at once, and the synchronous BOT waits service keyboard events inline, so typing
 // is never lost behind disk traffic.
-unsafe fn service_loop(hc: &mut Xhci, slots: &mut Slots, mut keyboard: Option<(UsbDevice, Keyboard)>, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, irq: u64) -> ! {
+unsafe fn service_loop(hc: &mut Xhci, slots: &mut Slots, mut keyboard: Option<(UsbDevice, Keyboard)>, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, usbq: u64, irq: u64) -> ! {
 	unsafe {
 		if let Some((dev, kb)) = keyboard.as_mut() {
 			post_report(hc, dev, kb);
 		}
 		let mut req: [u8; 16] = [0u8; 16];
 		loop {
-			let waitset: [u64; 2] = [irq, blk_server];
+			let waitset: [u64; 3] = [irq, blk_server, usbq];
 			wait_any(&waitset, 0);
 			// the interrupt: drain the event ring (keyboard reports feed the console; a
 			// port-status change marks the bus for the reconcile below), acknowledge,
@@ -1144,7 +1193,60 @@ unsafe fn service_loop(hc: &mut Xhci, slots: &mut Slots, mut keyboard: Option<(U
 					Polled::Closed => exit(),
 				}
 			}
+			// the query channel: answer every queued `usb.list` request with the live
+			// inventory of the addressed devices.
+			loop {
+				let mut qreq: [u8; 64] = [0u8; 64];
+				match try_recv(usbq, &mut qreq) {
+					Polled::Message { len, handle } => {
+						let mut api: UsbApi = UsbApi { slots };
+						let mut reply: [u8; 1024] = [0u8; 1024];
+						let mut reply_handle: u64 = 0;
+						if let Some(n) = usb::dispatch(&mut api, &qreq[..len], handle, &mut reply, &mut reply_handle) {
+							send_blocking(usbq, &reply[..n], reply_handle);
+						}
+					}
+					Polled::Empty => break,
+					Polled::Closed => exit(),
+				}
+			}
 		}
+	}
+}
+
+// The driver's live device inventory, served over the generated `usb` contract.
+struct UsbApi<'a> {
+	slots: &'a Slots,
+}
+
+impl<'a> usb::Service for UsbApi<'a> {
+	fn list(&mut self) -> Result<Vec<UsbEntry>, UsbError> {
+		let mut out: Vec<UsbEntry> = Vec::new();
+		for rec in &self.slots.entries[..self.slots.len] {
+			out.push(UsbEntry { port: rec.port, speed: String::from(speed_name(rec.speed)), vendor: rec.vendor as u32, product: rec.product as u32, class: rec.class as u32, kind: String::from(kind_name(rec.kind)) });
+		}
+		Ok(out)
+	}
+}
+
+// The name of a PORTSC speed code.
+fn speed_name(speed: u32) -> &'static str {
+	match speed {
+		1 => "full",
+		2 => "low",
+		3 => "high",
+		4 => "super",
+		_ => "unknown",
+	}
+}
+
+// The name of a device's bound role.
+fn kind_name(kind: u8) -> &'static str {
+	match kind {
+		KIND_HUB => "hub",
+		KIND_KEYBOARD => "keyboard",
+		KIND_STORAGE => "storage",
+		_ => "device",
 	}
 }
 
@@ -1341,7 +1443,7 @@ unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Storag
 		control_nodata(hc, &mut keyboard, dev, 0x00, REQ_SET_CONFIGURATION, config_value, 0)?;
 
 		let (_sh, data_virt, data_phys): (u64, u64, u64) = dma_page()?;
-		let mut st: Storage = Storage { dci_in, dci_out, ep_in_addr, ep_out_addr, iface, ring_in, ring_out, data_virt, data_phys, tag: 1 };
+		let mut st: Storage = Storage { dci_in, dci_out, ep_in_addr, ep_out_addr, iface, ring_in, ring_out, data_virt, data_phys, tag: 1, capacity: 0 };
 
 		// spin the unit up: a freshly attached unit reports a power-on unit attention
 		// on its first command, cleared by reading the sense data - retry a few times.
@@ -1368,6 +1470,10 @@ unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Storag
 		if block_size != SECTOR {
 			return None;
 		}
+		// the unit's size: READ CAPACITY reports the last LBA (big-endian), so the
+		// sector count is one more.
+		let last_lba: u32 = (r8(st.data_virt) as u32) << 24 | (r8(st.data_virt + 1) as u32) << 16 | (r8(st.data_virt + 2) as u32) << 8 | r8(st.data_virt + 3) as u32;
+		st.capacity = (last_lba as u64 + 1) * SECTOR as u64;
 		Some(st)
 	}
 }
@@ -1474,6 +1580,7 @@ unsafe fn serve_block_request(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, K
 		match op {
 			OP_READ => serve_read(hc, keyboard, dev, st, blk_server, lba, count),
 			OP_WRITE => serve_write(hc, keyboard, dev, st, blk_server, lba, count, handle),
+			OP_CAPACITY => reply_capacity(blk_server, st.capacity),
 			_ => {
 				if handle != 0 {
 					close(handle);
@@ -1579,6 +1686,17 @@ unsafe fn reply_block(blk_server: u64, status: u32, xfer: u64) {
 	unsafe {
 		let reply: [u8; 4] = status.to_le_bytes();
 		send_blocking(blk_server, &reply, xfer);
+	}
+}
+
+// Send a capacity reply: [status u32 LE][capacity bytes u64 LE], no handle - the
+// same wire contract driver.virtio-blk serves.
+unsafe fn reply_capacity(blk_server: u64, bytes: u64) {
+	unsafe {
+		let mut reply: [u8; 12] = [0u8; 12];
+		reply[..4].copy_from_slice(&STATUS_OK.to_le_bytes());
+		reply[4..].copy_from_slice(&bytes.to_le_bytes());
+		send_blocking(blk_server, &reply, 0);
 	}
 }
 

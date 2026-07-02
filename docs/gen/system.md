@@ -110,6 +110,17 @@ An opaque kernel object, transferred as `handle<file>`.
 | `kind` | `device-kind` |
 | `mmio-len` | `u64` |
 
+### record `usb-device`
+
+| field | type |
+| --- | --- |
+| `port` | `u32` |
+| `speed` | `string` |
+| `vendor` | `u32` |
+| `product` | `u32` |
+| `class` | `u32` |
+| `kind` | `string` |
+
 ### record `process-info`
 
 | field | type |
@@ -320,6 +331,7 @@ An opaque kernel object, transferred as `handle<task>`.
 | `supervisor` | 12 |
 | `volumes` | 13 |
 | `services` | 14 |
+| `usb` | 15 |
 
 ### record `manifest`
 
@@ -412,6 +424,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 8 | `snap-open` | `snap-open(snapshot: string, path: string) -> result<open-result, error>` |
 | 9 | `mkdir` | `mkdir(path: string) -> result<unit, error>` |
 | 10 | `rmdir` | `rmdir(path: string) -> result<unit, error>` |
+| 11 | `capacity` | `capacity() -> result<u64, error>` |
 
 ### interface `device`
 
@@ -421,6 +434,14 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | --- | --- | --- |
 | 1 | `list` | `list() -> result<list<device-entry>, error>` |
 | 2 | `get` | `get(index: u32) -> result<device-entry, error>` |
+
+### interface `usb`
+
+Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
+
+| op | method | signature |
+| --- | --- | --- |
+| 1 | `list` | `list() -> result<list<usb-device>, error>` |
 
 ### interface `process`
 

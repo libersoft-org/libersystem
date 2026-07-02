@@ -742,6 +742,11 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	// which would receive a narrowed copy, is not among them).
 	let (services_server, services_client) = Channel::create();
 	core::mem::drop(services_server);
+	// The manager's grantable usb capability: a real, dead-peer xHCI bus query channel,
+	// held but never granted to the governed components here (the `lsusb` command, which
+	// would receive a narrowed copy, is not among them).
+	let (usb_server, usb_client) = Channel::create();
+	core::mem::drop(usb_server);
 
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
@@ -789,6 +794,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	send_cap(&pm_boot_kernel, b"STORAGE_UDF", storage_udf_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"STORAGE_USB", storage_usb_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"SERVICES", services_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"USBBUS", usb_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"PROCESS", process_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"SERVE", perm_server, Rights::ALL)?;
 
@@ -2120,11 +2126,41 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let report = kernel_ep.recv().expect("the xhci driver should report in");
 	assert_eq!(&report.bytes[..], b"driver.xhci: online (3 device(s)) (keyboard) (storage)", "the driver should expand the hub, address the QEMU USB keyboard behind it and the stick, and configure both classes");
 
+	// the report is followed by the bus query channel ("USBBUS"): drive one raw
+	// `usb.list` request over it ([op u16][correlation u32], the generated wire
+	// header) and expect a successful reply naming all three devices' roles - the
+	// live inventory `lsusb` reads.
+	let usbq_msg = kernel_ep.recv().expect("the USBBUS message should follow the report");
+	assert_eq!(&usbq_msg.bytes[..], b"USBBUS", "the second message carries the bus query channel");
+	let usbq_cap = usbq_msg.caps.first().expect("the query channel is transferred with it");
+	let usbq = usbq_cap.object().into_any_arc().downcast::<Channel>().expect("the query channel is a channel");
+	let mut list = alloc::vec::Vec::new();
+	list.extend_from_slice(&1u16.to_le_bytes()); // OP_LIST
+	list.extend_from_slice(&1u32.to_le_bytes()); // correlation id
+	usbq.send(Message::new(list, alloc::vec::Vec::new(), 0)).expect("the usb.list request should send");
+	sched::run_until_idle();
+	let inventory = usbq.recv().expect("the usb.list reply should arrive");
+	assert!(inventory.bytes.len() >= 5 && inventory.bytes[4] == 1, "the inventory query should succeed");
+	let has = |needle: &[u8]| inventory.bytes.windows(needle.len()).any(|w| w == needle);
+	assert!(has(b"hub") && has(b"keyboard") && has(b"storage"), "the inventory should name the hub, the keyboard and the stick by role");
+
 	// the report carries the disk's block channel: read sector 0 over it, the same
 	// [op u32][lba u64][count u32] contract driver.virtio-blk serves, and expect a
 	// success status plus a 512-byte shared buffer.
 	let cap = report.caps.first().expect("the block channel is transferred with the report");
 	let blk = cap.object().into_any_arc().downcast::<Channel>().expect("the block channel is a channel");
+	// first the capacity query (op 2): the reply is [status u32][capacity bytes u64]
+	// and must report the seeded 16 MiB stick image.
+	let mut capacity = alloc::vec::Vec::with_capacity(16);
+	capacity.extend_from_slice(&2u32.to_le_bytes()); // op = capacity
+	capacity.extend_from_slice(&0u64.to_le_bytes());
+	capacity.extend_from_slice(&0u32.to_le_bytes());
+	blk.send(Message::new(capacity, alloc::vec::Vec::new(), 0)).expect("the capacity request should send");
+	sched::run_until_idle();
+	let cap_reply = blk.recv().expect("the capacity reply should arrive");
+	assert_eq!(&cap_reply.bytes[..4], &0u32.to_le_bytes(), "the capacity query should succeed");
+	let bytes = u64::from_le_bytes([cap_reply.bytes[4], cap_reply.bytes[5], cap_reply.bytes[6], cap_reply.bytes[7], cap_reply.bytes[8], cap_reply.bytes[9], cap_reply.bytes[10], cap_reply.bytes[11]]);
+	assert_eq!(bytes, 16 * 1024 * 1024, "the stick should report its seeded 16 MiB capacity");
 	let mut request = alloc::vec::Vec::with_capacity(16);
 	request.extend_from_slice(&0u32.to_le_bytes()); // op = read
 	request.extend_from_slice(&0u64.to_le_bytes()); // lba 0
@@ -3061,7 +3097,7 @@ fn permission_manager_sandboxes_a_component() {
 	let (expected, probe_read, probe_summary, date_read, date_summary, request_read, request_summary, cat_read) = run_permission_scenario().expect("the permission scenario should run");
 	assert!(!expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(probe_read, expected, "the sandboxed component read its one granted file through the storage grant");
-	assert_eq!(probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
+	assert_eq!(probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
 	// `date` reached its one granted capability: its output is a well-formed ISO-8601 UTC
 	// instant "YYYY-MM-DDTHH:MM:SSZ" (the exact moment varies, so check the shape, not the
 	// value - its presence proves the time grant is live).
@@ -3072,12 +3108,12 @@ fn permission_manager_sandboxes_a_component() {
 	assert_eq!(date_read[13], b':', "the date instant has a time separator after the hour");
 	assert_eq!(date_read[16], b':', "the date instant has a time separator after the minute");
 	assert_eq!(date_read[19], b'Z', "the date instant is UTC, terminated by 'Z'");
-	assert_eq!(date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny", "date was granted exactly its manifest - time - and denied every other capability in the vocabulary");
+	assert_eq!(date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny", "date was granted exactly its manifest - time - and denied every other capability in the vocabulary");
 	// request_probe asked for storage at runtime - a capability outside its manifest. The
 	// headless policy default refused it, so the request comes back denied and its summary
 	// carries the static grants followed by the refused runtime request marked `(dynamic)`.
 	assert_eq!(request_read.as_slice(), b"storage denied", "request_probe's runtime request for an undeclared capability was refused by the headless policy default");
-	assert_eq!(request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny storage=deny(dynamic)", "request_probe was granted exactly its manifest - log - and its runtime storage request was refused and recorded as a dynamic denial");
+	assert_eq!(request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny storage=deny(dynamic)", "request_probe was granted exactly its manifest - log - and its runtime storage request was refused and recorded as a dynamic denial");
 	// The on-demand `cat` tool, launched through PermissionManager's `run` op under a manifest
 	// granting only storage, printed the file it was given through that grant to the stdout the
 	// manager forwarded it: the bytes it rendered must equal the file straight from the volume.

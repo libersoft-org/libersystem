@@ -66,6 +66,7 @@ const SECTOR_SIZE: usize = 512;
 const MAX_SECTORS_PER_READ: usize = 8;
 const OP_READ: u32 = 0;
 const OP_WRITE: u32 = 1;
+const OP_CAPACITY: u32 = 2;
 
 // LiberFS layout on the disk: the writable filesystem spans FS_BLOCKS filesystem blocks
 // (one block = SECTORS_PER_BLOCK disk sectors) starting at FS_START_SECTOR - well past
@@ -393,6 +394,20 @@ impl volume::Service for Volume {
 			Volume::Udf(_) => Err(Error::Invalid),
 		}
 	}
+
+	// The size in bytes of the block device backing this volume - asked of the disk
+	// over the block channel (op 2), not of the filesystem, so it answers even for a
+	// lazily mounted removable volume. The memory-archive backing reports its own
+	// length. For the `lsblk` inventory.
+	fn capacity(&mut self) -> Result<u64, Error> {
+		match self {
+			Volume::Archive { len, .. } => Ok(*len as u64),
+			Volume::Disk(fs) => unsafe { block_capacity(fs.device().chan) },
+			Volume::Fat(backing) => unsafe { block_capacity(backing.chan) },
+			Volume::Iso(fs) => unsafe { block_capacity(fs.device().chan) },
+			Volume::Udf(fs) => unsafe { block_capacity(fs.device().chan) },
+		}
+	}
 }
 
 impl Volume {
@@ -682,6 +697,24 @@ unsafe fn read_buffer(data: &Buffer) -> Option<Vec<u8>> {
 		unmap_object(data.handle);
 		close(data.handle);
 		Some(bytes)
+	}
+}
+
+// Send one capacity query [op=2][0 u64][0 u32] to the driver and return the disk's
+// size in bytes. The reply is [status u32][capacity bytes u64], no buffer. `again`
+// when the driver (or its disk) cannot answer.
+unsafe fn block_capacity(block_client: u64) -> Result<u64, Error> {
+	unsafe {
+		let mut req: [u8; 16] = [0u8; 16];
+		req[..4].copy_from_slice(&OP_CAPACITY.to_le_bytes());
+		if !send_blocking(block_client, &req, 0) {
+			return Err(Error::Again);
+		}
+		let mut rep: [u8; 16] = [0u8; 16];
+		match recv_blocking(block_client, &mut rep) {
+			Received::Message { len, handle } if len >= 12 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => Ok(u64::from_le_bytes([rep[4], rep[5], rep[6], rep[7], rep[8], rep[9], rep[10], rep[11]])),
+			_ => Err(Error::Again),
+		}
 	}
 }
 
