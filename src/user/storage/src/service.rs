@@ -68,12 +68,12 @@ const OP_READ: u32 = 0;
 const OP_WRITE: u32 = 1;
 const OP_CAPACITY: u32 = 2;
 
-// LiberFS layout on the disk: the writable filesystem spans FS_BLOCKS filesystem blocks
-// (one block = SECTORS_PER_BLOCK disk sectors) starting at FS_START_SECTOR - well past
-// the factory archive at LBA 0, which the boot runner re-lays every boot and the
-// filesystem never overwrites, so created files persist across reboots. The archive now
-// carries the staged program binaries (M61 box 7), so it is a few megabytes: the FS
-// starts 16 MiB in (past the archive) and the pool is 32 MiB, ample for the seeded ELFs.
+// LiberFS layout on the disk: the writable filesystem starts at FS_START_SECTOR - well
+// past the factory archive at LBA 0, which the boot runner re-lays every boot and the
+// filesystem never overwrites, so created files persist across reboots. The archive
+// carries the staged program binaries (M61 box 7), so the FS starts 16 MiB in. The pool
+// SIZE is derived from the disk's real capacity at mount/format time (the capacity
+// query, M63); FS_BLOCKS is only the fallback pool for a disk that cannot report one.
 const SECTORS_PER_BLOCK: u64 = (liberfs::BLOCK_SIZE / SECTOR_SIZE) as u64;
 const FS_START_SECTOR: u64 = 32768;
 const FS_BLOCKS: u64 = 8192;
@@ -582,20 +582,42 @@ impl udf::BlockDevice for UdfBlockDevice {
 
 // Mount the LiberFS on the virtio-blk disk, or, on a fresh or stale disk, format a new
 // filesystem and seed it from the factory archive laid at LBA 0 so the volume always
-// starts with its seed files. The block channel stays open for the serve loop.
+// starts with its seed files. A fresh format spans the whole disk: the pool is derived
+// from the disk's reported capacity, never a fixed constant. The block channel stays
+// open for the serve loop.
 unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>> {
-	// an existing filesystem (files persisted from a previous boot) mounts as-is.
+	let pool: u64 = unsafe { disk_pool_blocks(block_client) };
+	// an existing filesystem (files persisted from a previous boot) mounts as-is, at
+	// the size recorded in its superblock - never silently grown, the free map would
+	// not match. A volume smaller than its disk allows is reported.
 	if let Some(fs) = LiberFs::mount(ChannelBlockDevice { chan: block_client }) {
+		if fs.num_blocks() != pool {
+			unsafe {
+				print(b"storage: vol://system spans less than the disk allows (formatted earlier; online resize is future work)\n");
+			}
+		}
 		return Some(fs);
 	}
 	// otherwise lay down a fresh filesystem and copy in the factory seed files. The
 	// device is rebuilt from the (Copy) channel handle - the failed mount consumed the
 	// previous device value but left the channel open.
-	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format(ChannelBlockDevice { chan: block_client }, FS_BLOCKS).ok()?;
+	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format(ChannelBlockDevice { chan: block_client }, pool).ok()?;
 	if let Some(archive) = unsafe { read_seed_archive(block_client) } {
 		seed_from_archive(&mut fs, &archive);
 	}
 	Some(fs)
+}
+
+// The filesystem pool the disk's real capacity allows: everything past the factory
+// archive region, in filesystem blocks - asked of the disk over the capacity query.
+// Falls back to the fixed FS_BLOCKS pool when the disk cannot answer (or is too
+// small for the layout), so an old driver still mounts something.
+unsafe fn disk_pool_blocks(block_client: u64) -> u64 {
+	let fs_start_bytes: u64 = FS_START_SECTOR * SECTOR_SIZE as u64;
+	match unsafe { block_capacity(block_client) } {
+		Ok(bytes) if bytes > fs_start_bytes + liberfs::BLOCK_SIZE as u64 => (bytes - fs_start_bytes) / liberfs::BLOCK_SIZE as u64,
+		_ => FS_BLOCKS,
+	}
 }
 
 // Copy every file from the factory PKGARCH1 archive into the filesystem (best effort;

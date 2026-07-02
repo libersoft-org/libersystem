@@ -1,6 +1,12 @@
 use crate::*;
 
 impl<D: BlockDevice> LiberFs<D> {
+	// The pool size this filesystem was formatted with, in filesystem blocks (recorded
+	// in the superblock; a volume never silently grows past it).
+	pub fn num_blocks(&self) -> u64 {
+		self.num_blocks
+	}
+
 	// Format `dev` as a fresh, empty LiberFS spanning `num_blocks` blocks (an empty root
 	// directory, no files), then return it mounted. Generation 0 lays out the two
 	// superblock slots and a single inode-tree leaf holding the root directory inode;

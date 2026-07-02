@@ -1097,9 +1097,12 @@ StorageService formats/mounts LiberFS over a hardcoded layout: `FS_START_SECTOR`
 is. The block protocol can now report the disk's capacity (`OP_CAPACITY`, M63), so
 the layout should be derived from it.
 
-- [ ] On the BLOCK bootstrap, query the disk's capacity over the block channel and compute the pool: `fs_blocks = (capacity - FS_START) / BLOCK_SIZE`, formatting a fresh volume to span the whole disk. (`FS_START_SECTOR` itself stays a fixed boot-layout mark - the region below it belongs to the factory archive the boot runner re-lays.)
-- [ ] An existing volume mounts at the size recorded in its superblock (never silently "grown" - the free map would not match); a mismatch against the disk is reported, and online resize stays future LiberFS work.
-- [ ] A kernel test formats a volume on a larger test disk and asserts the pool spans it (and that the seeded boot volume still mounts).
+- [x] On the BLOCK bootstrap, query the disk's capacity over the block channel and compute the pool: `fs_blocks = (capacity - FS_START) / BLOCK_SIZE`, formatting a fresh volume to span the whole disk. (`FS_START_SECTOR` itself stays a fixed boot-layout mark - the region below it belongs to the factory archive the boot runner re-lays.)
+  - Result: `mount_or_format` derives the pool via the new `disk_pool_blocks` (a capacity query on the block channel); on the standard 128 MiB test disk a fresh volume now formats 28672 blocks (112 MiB) instead of the fixed 8192. `FS_BLOCKS` remains only as the fallback for a disk that cannot report a capacity (or is smaller than the layout).
+- [x] An existing volume mounts at the size recorded in its superblock (never silently "grown" - the free map would not match); a mismatch against the disk is reported, and online resize stays future LiberFS work.
+  - Result: mount-as-recorded was already LiberFS's behaviour (num_blocks lives in the superblock); LiberFs gained a `num_blocks()` accessor and the service now prints a note when the mounted pool differs from what the disk's capacity would allow. The mount test run (a volume formatted by the previous run) exercises the unchanged-mount path.
+- [x] A kernel test formats a volume on a larger test disk and asserts the pool spans it (and that the seeded boot volume still mounts).
+  - Result: `system_volume_formats_to_the_disks_capacity` stands in for the block driver with a sparse in-memory sector map reporting 64 MiB, serves the raw read/write/capacity protocol until the service formats and reports in, then parses the superblock it laid down (num_blocks at its stable on-disk offset) and asserts the pool is the capacity-derived 12288 blocks - not the old constant. The seeded boot volume's mount is covered by the standing fresh+mount double test run (85 tests each).
 - Done when: a fresh system volume uses the whole disk, an existing one mounts unchanged, tests green.
 - Concept: M63 (the capacity query this builds on), M43/M53 (LiberFS layout and large-volume scaling).
 
