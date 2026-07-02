@@ -1209,7 +1209,7 @@ multi-page DMA buffers.
 - Done when: bulk disk and network I/O move in large requests, the measured throughput improves accordingly, tests green.
 - Concept: M23/M24/M62 (the drivers this accelerates), the limits audit (the last "one page" assumptions removed).
 
-## LiberFS audit track (M73-M79)
+## LiberFS audit track (M73-M80)
 
 A full read of the crate (~3900 lines: lib/txn/fsops/dir/inode/blkalloc/snapshot/
 fsck + tests) plus the service and driver wiring around it (2026-07-02). The core -
@@ -1420,6 +1420,27 @@ mismatch.)
   - Result: all hold - liberfs 76 host tests, kernel 87 fresh + 87 mount (1 new), build 0 warnings.
 - Concept: M78 (the GPT probe this hardens), M77 (`with_root`, the mechanism B3 reuses), the M73 read-only policy (B4 closes its last gap).
 
+## M80 - LiberFS: hostile-disk robustness (sanity bounds on all on-disk values)
+
+The fourth full source pass (2026-07-03, after M79 landed) found one systematic
+hole the earlier tracks only grazed: CRC32C protects against BIT FLIPS, not
+against insane-but-checksummed CONTENT. An adversary authoring a disk offline
+computes valid CRCs for whatever they write, and even plain corruption reaches
+the RAW (deliberately unchecksummed) walks that run automatically at every
+mount. Every count, length and pointer read from the medium needs a sanity
+bound before use - the mount path most of all, because StorageService mounts
+whatever the disk contains at boot.
+
+- [ ] (B1, high) `mount_at` trusts `sb.num_blocks` unvalidated: a checksummed superblock claiming `num_blocks = 0` underflows `meta_cursor: sb.num_blocks - 1` (panic), and a claim like 2^60 allocates a 2^57-byte free map (OOM abort) - the DISK'S CONTENT kills the service at mount. Reject `num_blocks <= POOL_START + 1` in `parse_superblock` and probe-read block `num_blocks - 1` at mount, so the device must actually cover the claimed pool.
+- [ ] (B2, high) The raw generation walks panic on a corrupt node header: `mark_inode_tree` / `mark_dir_tree` read blocks WITHOUT a CRC (by design - the previous generation may be damaged) but use `node_count` (a raw u16, up to 65535) unclamped - a leaf claiming more than 15 records or an internal node claiming more separators than fit runs the record offsets past the 4096-byte block and PANICS the mount, directly against the walks' own "a corrupt block does not abort the mount" contract. Child pointers are also pushed without a `< num_blocks` bound (on a partition-backed device an out-of-pool read succeeds and the walk wanders into garbage). Clamp the count to what the node type can hold and skip out-of-pool pointers.
+- [ ] (B3, medium) The raw walks have no cycle guard: a corrupt next pointer forming a loop (a chain block pointing at itself, or A -> B -> A) hangs the mount forever - in `walk_chain`, the snapshot-chain walk in `derive_free`, and the mark walks. Bound the chain walks by a step counter (`num_blocks` is the ceiling) and make the mark walks skip already-marked nodes (`test_bit` on the map they fill) - which also deduplicates shared snapshot subtrees, so the pinned walk stops re-walking what snapshots share.
+- [ ] (B4, medium) The CRC-VERIFIED paths trust `node_count` too: an attacker-authored volume has valid CRCs everywhere, so `route_child` / `sep_key` / the leaf-record loops after `read_node` walk a count like 60000 straight into a slice panic on the first `resolve()`. The B2 clamp must cover every `node_count` consumer, not only the raw walks.
+- [ ] (B5, medium) `lz_decompress` trusts the stream's own length header: `n` is read from the (attacker-checksummed) stream and drives `Vec::with_capacity(n)` - up to a 4 GiB allocation on a hostile compressed extent - and the match-copy loop can overshoot `n` by one match length. The caller knows the real ceiling (`ext.length * BLOCK_SIZE`, at most 4 MiB): pass it in, clamp `n` to it, and stop the copy loops at `n`.
+- [ ] (B6, low) `write_at_inner` computes `offset + data.len()` unchecked: a caller-supplied offset near `u64::MAX` panics a debug build and silently wraps (a no-op reported as success) in release. Not wire-reachable today (the service writes whole files), but it is public crate API - `checked_add` and refuse with `Invalid`. (`read_at` already saturates.)
+- [ ] (B7, low) `fsck` dies on the damage it exists to report: a single corrupt tree node - in the live namespace walk or a snapshot's inode/directory tree - makes `fsck()` return `Err(Corrupt)` and the operator gets NO report at all. Catch `Corrupt` per subtree, count it into the report (and name the path where one is known), and keep walking.
+- Done when: a fuzz-shaped hostile volume (insane superblock, oversized node counts, looped chains, lying compression headers) mounts degraded or is refused - never a panic, hang, or OOM; `fsck` on a metadata-damaged volume returns a report instead of an error; and the suite stays green with new tests covering each bound.
+- Concept: the M79 GPT hardening extended to the whole format - CRC checks catch accidents, sanity bounds catch adversaries; together they make "mount whatever is on the disk" safe, which is what an automatic boot-time mount does every day.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
@@ -1442,7 +1463,7 @@ workloads; multi-queue devices and the per-CPU interrupt-vector spaces they need
 (one vector number per device suffices until then - the M72 throughput work stays
 single-queue); immutable signed system + A/B updates + rollback + verified boot;
 encrypted user volumes; LiberFS work beyond the M53-M57 modernization and the
-M73-M79 audit track (online
+M73-M80 audit track (online
 resize, online defrag, multi-device / RAID; deduplication and encryption stay out by decision);
 first-party server apps (a
 static-file web server and the like); and a CLI package manager over the phase-2
