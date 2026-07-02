@@ -2958,6 +2958,57 @@ fn inventory_tools_report_the_hardware() {
 
 #[cfg(test)]
 #[test_case]
+fn ps_live_view_drives_the_terminal_contract() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	// `ps -i` (M63): the live process/resource view runs full-screen on its controlling
+	// terminal - it must enter the alternate screen, hide the cursor and flip the tty
+	// raw (the ESC[?1049h / ?25l / ?9001h private modes ConsoleService's terminal
+	// honours), redraw a snapshot in place, quit on a raw `q` keystroke, and restore
+	// every mode on the way out. Here we stand in for the terminal and both granted
+	// services: the service channels answer garbage (so each query degrades to its
+	// "unavailable" row - the terminal contract is what is under test), and a raw `q`
+	// is queued so the first frame's key check quits the loop.
+	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let ps_elf = program_elf(&package, volume, b"ps").expect("ps should be staged");
+
+	let (boot_kernel, boot_user) = Channel::create();
+	let (console_host, console_child) = Channel::create();
+	let (res_host, res_child) = Channel::create();
+	let (proc_host, proc_child) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), ps_elf, boot_user, Rights::ALL, 0).expect("ps should spawn");
+	send_cap(&boot_kernel, b"STDOUT", console_child, Rights::ALL).expect("STDOUT bootstrap");
+	boot_kernel.send(Message::new(b"-i".to_vec(), alloc::vec::Vec::new(), 0)).expect("argv bootstrap");
+	send_cap(&boot_kernel, b"RESOURCE", res_child, Rights::ALL).expect("RESOURCE bootstrap");
+	send_cap(&boot_kernel, b"PROCESS", proc_child, Rights::ALL).expect("PROCESS bootstrap");
+	sched::run_until_idle();
+
+	// the first frame queries the process list; answer garbage so it renders the
+	// unavailable row, queue the quitting keystroke, then answer the budgets query.
+	let _list_req = proc_host.recv().expect("the live view should query the process list");
+	proc_host.send(Message::new(b"?".to_vec(), alloc::vec::Vec::new(), 0)).expect("the garbage list reply should send");
+	console_host.send(Message::new(b"q".to_vec(), alloc::vec::Vec::new(), 0)).expect("the raw q keystroke should send");
+	sched::run_until_idle();
+	let _usage_req = res_host.recv().expect("the live view should query the budgets");
+	res_host.send(Message::new(b"?".to_vec(), alloc::vec::Vec::new(), 0)).expect("the garbage usage reply should send");
+	sched::run_until_idle();
+
+	let mut captured = alloc::vec::Vec::new();
+	while let Ok(msg) = console_host.recv() {
+		captured.extend_from_slice(&msg.bytes);
+	}
+	let contains = |needle: &[u8]| captured.windows(needle.len()).any(|w| w == needle);
+	assert!(contains(b"\x1b[?1049h\x1b[?25l\x1b[?9001h"), "the live view should enter the alternate screen, hide the cursor and flip the tty raw");
+	assert!(contains(b"live process / resource view"), "the live view should render its header");
+	assert!(contains(b"unavailable"), "the degraded queries should render their unavailable rows");
+	assert!(contains(b"\x1b[?9001l") && contains(b"\x1b[?1049l"), "quitting on q should restore the tty and leave the alternate screen");
+}
+
+#[cfg(test)]
+#[test_case]
 fn system_manager_recovery_escalates_after_repeated_crashes() {
 	use object::KernelObject;
 	// The kernel supervises SystemManager: if it faults, the kernel starts a

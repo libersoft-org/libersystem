@@ -783,7 +783,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			print(b"  lsblk [json]     list block devices and their volumes via StorageService\n");
 			print(b"  lsusb [json]     list USB devices via the xHCI driver\n");
 			print(b"  stop <service>   stop a service and its dependents via ServiceManager\n");
-			print(b"  ps               list started processes via ProcessService\n");
+			print(b"  ps [-i]          list started processes via ProcessService (-i: live view, q quits)\n");
 			print(b"  run <name>       start a program via ProcessService\n");
 			print(b"  config [<key>]   list the config tree or read one key via ConfigService\n");
 			print(b"  set <key> <val>  write a config key via ConfigService\n");
@@ -894,8 +894,17 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		}
 		if line == b"ps" {
 			// Launch `ps` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it a process client and forwards this terminal.
+			// granter), which grants it a resource and a process client and forwards this
+			// terminal.
 			run_tool(permsvc, b"ps", b"", cwd.as_bytes());
+			return false;
+		}
+		if line == b"ps -i" {
+			// The live view needs the terminal itself (raw input, in-place redraws), so it
+			// launches through the interactive path: the same governed PermissionManager
+			// launch, but handed a full-duplex dup of this console instead of a relay, and
+			// set as the tty's foreground job.
+			run_tool_interactive(jobs, permsvc, b"ps", b"-i", cwd.as_bytes());
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"run ") {
@@ -1360,6 +1369,45 @@ unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8]) -> bool {
 		}
 		close(out_read);
 		close(task);
+		true
+	}
+}
+
+// Launch a governed command interactively: the same PermissionManager launch as
+// `run_tool`, but handed a full-duplex dup of this console itself (its controlling
+// terminal) as its STDOUT/stdin instead of a relay channel, and run as the tty's
+// foreground job so signal keys reach it - the path a full-screen tool (`ps -i`)
+// needs to flip the tty raw and redraw in place. The shell parks until the command
+// exits (or hands it to the session on a Ctrl+Z suspend), exactly like an exec'd
+// foreground job. Returns false if the command could not be launched.
+unsafe fn run_tool_interactive(jobs: &mut Jobs, permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8]) -> bool {
+	unsafe {
+		let name_str: &str = match core::str::from_utf8(name) {
+			Ok(s) => s,
+			Err(_) => return false,
+		};
+		let args_str: &str = match core::str::from_utf8(args) {
+			Ok(s) => s,
+			Err(_) => return false,
+		};
+		let cwd_str: &str = match core::str::from_utf8(cwd) {
+			Ok(s) => s,
+			Err(_) => return false,
+		};
+		let so: u64 = stdout();
+		if so == 0 {
+			return false;
+		}
+		let dup: i64 = duplicate(so, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_TRANSFER);
+		if dup < 0 {
+			return false;
+		}
+		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
+		let task: u64 = match client.run(name_str, args_str, cwd_str, &(dup as u64)) {
+			Some(Ok(started)) => started.task,
+			_ => return false,
+		};
+		jobs.run_foreground_tracked(Job { proc: task, name: name.to_vec() });
 		true
 	}
 }
