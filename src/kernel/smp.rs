@@ -5,7 +5,7 @@
 // (the bootstrap processor is 0), wake each AP into `ap_entry`, and wait until
 // all of them have run their per-CPU init and reported in.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use limine::mp::Cpu;
 use limine::response::MpResponse;
@@ -19,6 +19,10 @@ static CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
 // Cores that have completed per-CPU init and reported in (BSP starts counted).
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
 
+// Each core's LAPIC id by CPU id, retained at report-in so the CPU topology stays
+// inspectable at runtime - SYS_CPU_INFO reads it for `lscpu`.
+static LAPIC_IDS: [AtomicU32; arch::percpu::MAX_CPUS] = [const { AtomicU32::new(0) }; arch::percpu::MAX_CPUS];
+
 // Serializes report-in lines so concurrent cores do not interleave their output.
 static REPORT_LOCK: SpinLock<()> = SpinLock::new(());
 
@@ -30,6 +34,14 @@ pub fn cpu_count() -> usize {
 // Number of cores currently online.
 pub fn online_count() -> usize {
 	ONLINE.load(Ordering::Acquire)
+}
+
+// The LAPIC id of the core with CPU id `cpu` (0 for a core that never reported in).
+pub fn lapic_id(cpu: usize) -> u32 {
+	if cpu >= arch::percpu::MAX_CPUS {
+		return 0;
+	}
+	LAPIC_IDS[cpu].load(Ordering::Relaxed)
 }
 
 // Wake every application processor and wait for all cores to report in. Runs on
@@ -76,6 +88,7 @@ unsafe extern "C" fn ap_entry(cpu: &Cpu) -> ! {
 }
 
 fn report(cpu_id: usize, lapic_id: u32, is_bsp: bool) {
+	LAPIC_IDS[cpu_id].store(lapic_id, Ordering::Relaxed);
 	let _guard = REPORT_LOCK.lock();
 	let role = if is_bsp { "BSP" } else { "AP" };
 	crate::serial_println!("cpu {} ({}) online, lapic_id {}", cpu_id, role, lapic_id);

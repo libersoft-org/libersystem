@@ -26,12 +26,13 @@ pub const PAGE_SIZE: u64 = 4096;
 struct FrameAllocator {
 	free_head: u64,
 	free_count: usize,
+	total_count: usize,
 	hhdm: u64,
 }
 
 impl FrameAllocator {
 	const fn new() -> Self {
-		Self { free_head: 0, free_count: 0, hhdm: 0 }
+		Self { free_head: 0, free_count: 0, total_count: 0, hhdm: 0 }
 	}
 
 	// SAFETY: `phys` must be a page-aligned physical frame that is currently
@@ -76,6 +77,15 @@ pub fn init(memory_map: &MemoryMapResponse, hhdm: u64) {
 			base += PAGE_SIZE;
 		}
 	}
+	// Everything pushed so far is the machine's usable frame pool: fix the total
+	// here so `totals` can report used = total - free for the rest of the run.
+	allocator.total_count = allocator.free_count;
+}
+
+// The frame pool's totals: (total usable frames fixed at init, frames currently free).
+pub fn totals() -> (usize, usize) {
+	let allocator = ALLOCATOR.lock();
+	(allocator.total_count, allocator.free_count)
 }
 
 // Allocate one physical frame, returning its physical address.

@@ -2097,7 +2097,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let (msix_cap, table_phys, bus, dev, func) = device::with(index, |d| (d.msix_cap, d.msix_table_phys, d.bus, d.dev, d.func)).unwrap();
 	assert!(msix_cap != 0, "the xHCI controller should expose MSI-X");
 	let dest = arch::percpu::this_cpu().lapic_id() as u8;
-	let vector = arch::interrupts::acquire_msi(table_phys, dest).expect("an MSI vector should be free");
+	let vector = arch::interrupts::acquire_msi(table_phys, dest, index as u32).expect("an MSI vector should be free");
 	let interrupt = object::interrupt::Interrupt::new(vector);
 	assert!(arch::interrupts::bind_msi(vector, &interrupt), "the MSI vector should bind");
 	arch::pci::msix_enable(bus, dev, func, msix_cap);
@@ -2845,7 +2845,7 @@ fn interactive_tool_reads_stdin() {
 // Run one no-argument, no-capability tool from the volume the way the launcher does
 // - spawn its staged ELF, hand it a console channel as STDOUT and an empty argv -
 // and return everything it printed. The zero-capability inventory commands (uname,
-// uptime, dmesg) are driven through this.
+// uptime, dmesg, lscpu, free, lsmem, lsirq) are driven through this.
 #[cfg(test)]
 fn run_inventory_tool(name: &[u8]) -> alloc::vec::Vec<u8> {
 	use object::channel::{Channel, Message};
@@ -2887,6 +2887,28 @@ fn inventory_tools_print_the_system_identity() {
 
 	let dmesg = run_inventory_tool(b"dmesg");
 	assert!(!dmesg.is_empty(), "dmesg should print the kernel boot log (or report there is none)");
+}
+
+#[cfg(test)]
+#[test_case]
+fn inventory_tools_report_the_hardware() {
+	// The hardware-inventory commands (M63): each runs as its own sandboxed ELF over
+	// a free syscall reading state the kernel now retains past boot - the CPU set
+	// (lscpu), the frame-pool and heap totals (free), the boot memory map (lsmem),
+	// and the device-interrupt vector table (lsirq).
+	let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+
+	let lscpu = run_inventory_tool(b"lscpu");
+	assert!(contains(&lscpu, b"arch: x86_64") && contains(&lscpu, b"cpu0: lapic "), "lscpu should print the architecture and each core's LAPIC id");
+
+	let free = run_inventory_tool(b"free");
+	assert!(free.starts_with(b"Mem:  total ") && contains(&free, b"Heap: total 2097152, used "), "free should print the frame-pool and heap totals");
+
+	let lsmem = run_inventory_tool(b"lsmem");
+	assert!(contains(&lsmem, b" usable\n"), "lsmem should print the retained boot memory map with a usable region");
+
+	let lsirq = run_inventory_tool(b"lsirq");
+	assert!(contains(&lsirq, b"vector 32: fixed"), "lsirq should report the kernel timer's fixed vector as in use");
 }
 
 #[cfg(test)]

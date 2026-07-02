@@ -1041,13 +1041,17 @@ owning service gains a typed query first; each ships as a binary per M61.
 
 - [ ] `lspci`: enumerate the PCI bus (bus:dev.fn, vendor/device, class, the virtio-blk / net / sound / gpu functions) - the same scan the drivers bind against.
 - [ ] `lsblk`: list block devices and their mounted volumes (the four virtio-blk disks, size, and `vol://system|media|iso|udf`).
-- [ ] `lscpu`: report the architecture, online core count (SMP) and APIC ids.
-- [ ] `free`: memory total / used / free from the frame allocator and heap, with human-readable units (`-h`) like Linux.
-- [ ] `lsmem`: the physical memory map - the Limine memmap regions (usable / reserved / ACPI), their ranges and sizes, complementing `free`.
+- [x] `lscpu`: report the architecture, online core count (SMP) and APIC ids.
+  - Result: the kernel now retains each core's LAPIC id at SMP report-in (it was print-and-forget) and exposes the set over the new free syscall SYS_CPU_INFO; lscpu is a zero-capability binary printing the architecture, core count and per-core LAPIC ids as text or `json`.
+- [x] `free`: memory total / used / free from the frame allocator and heap, with human-readable units (`-h`) like Linux.
+  - Result: the frame allocator now fixes its total usable frame count at init and the kernel heap sums its free list on demand; both feed the new free syscall SYS_MEMORY_STATS (a MemoryStats copy, like SYS_DOMAIN_STATS_GET). free prints a Mem: and a Heap: row - total/used/free in bytes, or scaled to KiB/MiB/GiB with `-h`.
+- [x] `lsmem`: the physical memory map - the Limine memmap regions (usable / reserved / ACPI), their ranges and sizes, complementing `free`.
+  - Result: the kernel retains the Limine memory map past init (the response was one-shot and discarded) as ABI MemmapRegion records with a stable kind mapping, walked over the new free syscall SYS_MEMMAP_GET (index in, region out, count returned). lsmem prints range, size and kind per region as text or `json`.
 - [x] `lsdev`: the device inventory (fold the existing `dev` into the `ls*` family or alias it).
   - Result: folded - the `dev` tool is renamed to `lsdev` outright (binary, permission manifest, shell dispatch and help), so the device inventory joins the `ls*` family and the old name is gone.
 - [ ] `lssvc`: registered system services and their state (drivers are services too, so they list here; an optional filter narrows to `driver.*`) - a filtered view of the processes shown by `ps`.
-- [ ] `lsirq`: the APIC / IRQ vectors and their virtio MSI-X mappings.
+- [x] `lsirq`: the APIC / IRQ vectors and their virtio MSI-X mappings.
+  - Result: the kernel now records which discovered device each MSI-X slot was acquired for (cleared on unbind) and reports both vector windows - fixed INTx and MSI-X - over the new free syscall SYS_IRQ_INFO. lsirq prints every vector in use, resolving an MSI-X owner to its device index and type (virtio-net, xhci, ...) via the free device-info query, as text or `json`; the kernel timer's dedicated gate is reported explicitly.
 - [ ] `lsusb`: enumerate USB devices off the M62 stack (xHCI keyboard / mass storage).
 - [x] `dmesg`: the kernel ring-buffer log.
   - Result: a zero-capability binary tool that copies the kernel boot log through SYS_CONSOLE_READLOG (the same text the boot screen shows) into a 32 KiB buffer and prints it line by line, so the console relay's per-message cap never truncates it; prints `dmesg: no kernel log` when the kernel kept none.

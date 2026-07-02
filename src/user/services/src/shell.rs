@@ -774,6 +774,10 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			print(b"  uname            print the system name, version and architecture\n");
 			print(b"  uptime           print the time since boot\n");
 			print(b"  dmesg            print the kernel boot log\n");
+			print(b"  lscpu [json]     print the CPU inventory (core count, LAPIC ids)\n");
+			print(b"  free [-h]        print the memory totals (physical frames, kernel heap)\n");
+			print(b"  lsmem [json]     print the physical memory map\n");
+			print(b"  lsirq [json]     print the device-interrupt vectors in use\n");
 			print(b"  stop <service>   stop a service and its dependents via ServiceManager\n");
 			print(b"  ps               list started processes via ProcessService\n");
 			print(b"  run <name>       start a program via ProcessService\n");
@@ -930,6 +934,38 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		}
 		if line == b"dmesg" {
 			run_tool(permsvc, b"dmesg", b"", cwd.as_bytes());
+			return false;
+		}
+		if line == b"lscpu" {
+			run_tool(permsvc, b"lscpu", b"", cwd.as_bytes());
+			return false;
+		}
+		if line == b"lscpu json" {
+			run_tool(permsvc, b"lscpu", b"json", cwd.as_bytes());
+			return false;
+		}
+		if line == b"free" {
+			run_tool(permsvc, b"free", b"", cwd.as_bytes());
+			return false;
+		}
+		if line == b"free -h" {
+			run_tool(permsvc, b"free", b"-h", cwd.as_bytes());
+			return false;
+		}
+		if line == b"lsmem" {
+			run_tool(permsvc, b"lsmem", b"", cwd.as_bytes());
+			return false;
+		}
+		if line == b"lsmem json" {
+			run_tool(permsvc, b"lsmem", b"json", cwd.as_bytes());
+			return false;
+		}
+		if line == b"lsirq" {
+			run_tool(permsvc, b"lsirq", b"", cwd.as_bytes());
+			return false;
+		}
+		if line == b"lsirq json" {
+			run_tool(permsvc, b"lsirq", b"json", cwd.as_bytes());
 			return false;
 		}
 		if line == b"beep" {

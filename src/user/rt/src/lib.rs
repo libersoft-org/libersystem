@@ -729,6 +729,30 @@ pub unsafe fn clock_ns() -> u64 {
 	unsafe { syscall(SYS_CLOCK_MONO_NS, 0, 0, 0, 0) }
 }
 
+// Read the online CPU set: fills `ids` with one LAPIC id per core (as many as fit)
+// and returns the core count. A free syscall feeding the `lscpu` inventory command.
+pub unsafe fn cpu_info(ids: &mut [u32]) -> i64 {
+	unsafe { syscall(SYS_CPU_INFO, ids.as_mut_ptr() as u64, ids.len() as u64 * 4, 0, 0) as i64 }
+}
+
+// Read the physical-memory and kernel-heap totals into `stats`. A free syscall
+// feeding the `free` inventory command.
+pub unsafe fn memory_stats(stats: &mut MemoryStats) -> i64 {
+	unsafe { syscall(SYS_MEMORY_STATS, stats as *mut MemoryStats as u64, core::mem::size_of::<MemoryStats>() as u64, 0, 0) as i64 }
+}
+
+// Read the boot memory-map region at `index` into `region`, returning the region
+// count (negative past the end). A free syscall feeding the `lsmem` command.
+pub unsafe fn memmap_get(index: u64, region: &mut MemmapRegion) -> i64 {
+	unsafe { syscall(SYS_MEMMAP_GET, index, region as *mut MemmapRegion as u64, core::mem::size_of::<MemmapRegion>() as u64, 0) as i64 }
+}
+
+// Read the device-interrupt vector state at `index` into `info`, returning the
+// vector count (negative past the end). A free syscall feeding the `lsirq` command.
+pub unsafe fn irq_info(index: u64, info: &mut IrqInfo) -> i64 {
+	unsafe { syscall(SYS_IRQ_INFO, index, info as *mut IrqInfo as u64, core::mem::size_of::<IrqInfo>() as u64, 0) as i64 }
+}
+
 // Arm this process to catch Ctrl+C (SIG_INT): once armed, an interrupt sets a pending
 // flag `interrupted()` polls instead of terminating us, so a long-running tool can
 // stop cleanly and print a summary. Ctrl+\ (SIG_TERM) still force-quits.

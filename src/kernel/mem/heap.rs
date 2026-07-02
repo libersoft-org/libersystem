@@ -37,6 +37,19 @@ pub fn init() {
 	unsafe { ALLOCATOR.lock().init(HEAP_START as usize, HEAP_SIZE as usize) };
 }
 
+// The heap's totals: (total bytes, bytes currently free), the free list summed
+// under the lock - the heap is small (2 MiB) so the walk is short.
+pub fn stats() -> (u64, u64) {
+	let heap = ALLOCATOR.lock();
+	let mut free: usize = 0;
+	let mut current = &heap.head;
+	while let Some(ref next) = current.next {
+		free += next.size;
+		current = next;
+	}
+	(HEAP_SIZE, free as u64)
+}
+
 // A node in the free list, stored in-place at the start of each free block.
 struct FreeRegion {
 	size: usize,

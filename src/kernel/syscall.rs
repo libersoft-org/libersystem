@@ -44,7 +44,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
+pub use abi::{ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -62,6 +62,11 @@ pub use abi::ProcessStats;
 // Live per-Domain resource counters filled by domain_stats_get. Defined in `abi`
 // (the SSOT shared with userspace) and re-exported here next to its syscall.
 pub use abi::DomainStats;
+
+// The hardware-inventory records filled by cpu_info / memory_stats / memmap_get /
+// irq_info. Defined in `abi` (the SSOT shared with userspace) and re-exported here
+// next to their syscalls.
+pub use abi::{IrqInfo, MemmapRegion, MemoryStats};
 
 // Validate a caller-supplied buffer. Always accepts kernel self-calls; for a
 // ring-3 caller it requires the whole [ptr, ptr+len) range to lie in user space
@@ -241,6 +246,10 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_DOMAIN_CREATE => sys_domain_create(a0, a1, a2),
 		SYS_DOMAIN_KILL => sys_domain_kill(a0),
 		SYS_DOMAIN_STATS_GET => sys_domain_stats_get(a0, a1, a2),
+		SYS_CPU_INFO => sys_cpu_info(a0, a1),
+		SYS_MEMORY_STATS => sys_memory_stats(a0, a1),
+		SYS_MEMMAP_GET => sys_memmap_get(a0, a1, a2),
+		SYS_IRQ_INFO => sys_irq_info(a0, a1, a2),
 		SYS_YIELD => {
 			sched::yield_now();
 			0
@@ -381,6 +390,78 @@ fn sys_console_readlog(buf_ptr: u64, buf_len: u64) -> i64 {
 	n as i64
 }
 
+// Copy the online CPU set's LAPIC ids (one u32 per core, as many as fit) into the
+// caller's buffer, returning the core count. The topology is retained by smp at
+// report-in; a free syscall - the CPU inventory is public identity, not a capability.
+fn sys_cpu_info(buf_ptr: u64, buf_len: u64) -> i64 {
+	let count = crate::smp::cpu_count();
+	let n = count.min((buf_len / 4) as usize);
+	if n > 0 && !user_buf_ok(buf_ptr, n as u64 * 4) {
+		return ERR_INVALID;
+	}
+	for cpu in 0..n {
+		unsafe {
+			(buf_ptr as *mut u32).add(cpu).write_unaligned(crate::smp::lapic_id(cpu));
+		}
+	}
+	count as i64
+}
+
+// Copy the physical-memory and kernel-heap totals into the caller's buffer (a
+// MemoryStats): the frame pool's total (fixed at init) and free frame counts, and
+// the heap's total and free bytes. A free syscall feeding the `free` command.
+fn sys_memory_stats(buf_ptr: u64, buf_len: u64) -> i64 {
+	let size = core::mem::size_of::<MemoryStats>() as u64;
+	if buf_len < size || !user_buf_ok(buf_ptr, size) {
+		return ERR_INVALID;
+	}
+	let (total_frames, free_frames) = crate::mem::frame::totals();
+	let (heap_total, heap_free) = crate::mem::heap::stats();
+	let out = MemoryStats { total_frames: total_frames as u64, free_frames: free_frames as u64, heap_total, heap_free };
+	unsafe {
+		(buf_ptr as *mut MemoryStats).write_unaligned(out);
+	}
+	1
+}
+
+// Copy the boot memory-map region at `index` into the caller's buffer (a
+// MemmapRegion), returning the region count - ERR_INVALID past the end, so a caller
+// walks the retained map without knowing its size up front. A free syscall feeding
+// the `lsmem` command.
+fn sys_memmap_get(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+	let region = match crate::mem::memmap_get(index as usize) {
+		Some(r) => r,
+		None => return ERR_INVALID,
+	};
+	let size = core::mem::size_of::<MemmapRegion>() as u64;
+	if buf_len < size || !user_buf_ok(buf_ptr, size) {
+		return ERR_INVALID;
+	}
+	unsafe {
+		(buf_ptr as *mut MemmapRegion).write_unaligned(region);
+	}
+	crate::mem::memmap_len() as i64
+}
+
+// Copy the device-interrupt vector state at `index` into the caller's buffer (an
+// IrqInfo), returning the vector count - the fixed INTx window first, then the MSI-X
+// window with each owned vector's device index. ERR_INVALID past the end. A free
+// syscall feeding the `lsirq` command.
+fn sys_irq_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+	let info = match arch::interrupts::irq_info(index as usize) {
+		Some(i) => i,
+		None => return ERR_INVALID,
+	};
+	let size = core::mem::size_of::<IrqInfo>() as u64;
+	if buf_len < size || !user_buf_ok(buf_ptr, size) {
+		return ERR_INVALID;
+	}
+	unsafe {
+		(buf_ptr as *mut IrqInfo).write_unaligned(info);
+	}
+	arch::interrupts::irq_info_len() as i64
+}
+
 // Map a DeviceMemory's physical MMIO region into the caller's address space,
 // uncacheable, and return its virtual base. A ring-3 caller maps into its own user
 // space (USER bit); a ring-0 caller into the shared kernel window. One mapping per
@@ -500,7 +581,7 @@ fn sys_device_msix_acquire(index: u64) -> i64 {
 		_ => return ERR_INVALID,
 	};
 	let dest = arch::percpu::this_cpu().lapic_id() as u8;
-	let vector = match arch::interrupts::acquire_msi(table_phys, dest) {
+	let vector = match arch::interrupts::acquire_msi(table_phys, dest, index as u32) {
 		Some(v) => v,
 		None => return ERR_RESOURCE_EXHAUSTED,
 	};

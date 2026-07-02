@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::sync::{Arc, Weak};
 
@@ -48,6 +48,11 @@ static MSI_BOUND: [SpinLock<Option<Weak<Interrupt>>>; MSI_COUNT] = [const { Spin
 // Reservation flag per MSI slot, set when acquire_msi hands the vector out and
 // cleared on unbind so the slot can be re-used.
 static MSI_USED: [AtomicBool; MSI_COUNT] = [const { AtomicBool::new(false) }; MSI_COUNT];
+
+// The discovered-device index each MSI slot was acquired for (u32::MAX = none),
+// retained so the vector-to-device mapping stays inspectable - SYS_IRQ_INFO reads
+// it for `lsirq`.
+static MSI_OWNER: [AtomicU32; MSI_COUNT] = [const { AtomicU32::new(u32::MAX) }; MSI_COUNT];
 
 // Kernel virtual base for mapping device MSI-X tables (uncacheable), clear of the
 // LAPIC (0xffff_f100) / IOAPIC (0xffff_f200) MMIO windows. One page per MSI slot; the
@@ -87,6 +92,7 @@ pub fn unbind(vector: u8) {
 		// (there is no source to mask). A gone driver's device simply stops being drained.
 		let index = (vector - MSI_BASE) as usize;
 		*MSI_BOUND[index].lock() = None;
+		MSI_OWNER[index].store(u32::MAX, Ordering::Release);
 		MSI_USED[index].store(false, Ordering::Release);
 		return;
 	}
@@ -100,17 +106,45 @@ pub fn unbind(vector: u8) {
 // delivers it to LAPIC `dest` (edge-triggered, fixed delivery, unmasked). `table_phys`
 // is the physical address of the device's MSI-X table. Returns the vector (None if
 // every MSI slot is taken); the caller enables MSI-X on the device and binds an
-// Interrupt to the returned vector with bind_msi.
-pub fn acquire_msi(table_phys: u64, dest: u8) -> Option<u8> {
+// Interrupt to the returned vector with bind_msi. `owner` is the discovered-device
+// index the vector is acquired for, retained for the `lsirq` inventory.
+pub fn acquire_msi(table_phys: u64, dest: u8, owner: u32) -> Option<u8> {
 	for index in 0..MSI_COUNT {
 		if MSI_USED[index].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
 			continue;
 		}
+		MSI_OWNER[index].store(owner, Ordering::Release);
 		let vector = MSI_BASE + index as u8;
 		program_msix_entry(index, table_phys, vector, dest);
 		return Some(vector);
 	}
 	None
+}
+
+// The state of the device-interrupt vector at `index` over both windows: the fixed
+// INTx window (0..IRQ_COUNT) first, then the MSI-X window. `bound` reports whether
+// the vector is in use - a registered kernel handler or a live driver binding -
+// and `device` the MSI owner's device index (IRQ_NO_DEVICE otherwise).
+pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
+	if index < IRQ_COUNT {
+		let vector = IRQ_BASE + index as u8;
+		// The timer vector has a dedicated IDT gate (not a HANDLERS entry), so it is
+		// reported in use explicitly - it is always the kernel's own.
+		let handled = vector == TIMER_VECTOR || HANDLERS[index].load(Ordering::SeqCst) != 0;
+		let bound = handled || is_bound(vector);
+		return Some(abi::IrqInfo { vector: vector as u32, kind: abi::IRQ_KIND_FIXED, bound: bound as u32, device: abi::IRQ_NO_DEVICE });
+	}
+	let slot = index - IRQ_COUNT;
+	if slot >= MSI_COUNT {
+		return None;
+	}
+	let vector = MSI_BASE + slot as u8;
+	Some(abi::IrqInfo { vector: vector as u32, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector) as u32, device: MSI_OWNER[slot].load(Ordering::Acquire) })
+}
+
+// The number of vectors irq_info reports over.
+pub fn irq_info_len() -> usize {
+	IRQ_COUNT + MSI_COUNT
 }
 
 // Map a device's MSI-X table page uncacheable and write entry 0: message address

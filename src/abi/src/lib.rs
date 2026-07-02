@@ -110,6 +110,22 @@ pub const SYS_PROCESS_STATS_GET: u64 = 52;
 // userspace ResourceManager can observe usage against the budgets it sets without the
 // governed component having to self-report.
 pub const SYS_DOMAIN_STATS_GET: u64 = 53;
+// Read the online CPU set: copies one u32 LAPIC id per core into the caller's buffer
+// (as many as fit) and returns the core count. A free syscall - the CPU topology is
+// public identity, not a capability - feeding the `lscpu` inventory command.
+pub const SYS_CPU_INFO: u64 = 54;
+// Read the physical-memory and kernel-heap totals into the caller's buffer (a
+// MemoryStats): total and free 4 KiB frames, and the heap's total and free bytes. A
+// free syscall feeding the `free` inventory command.
+pub const SYS_MEMORY_STATS: u64 = 55;
+// Read one retained boot memory-map region (a MemmapRegion) by index into the
+// caller's buffer, returning the region count - ERR_INVALID past the end, so a caller
+// can walk the map without knowing its size up front. A free syscall feeding `lsmem`.
+pub const SYS_MEMMAP_GET: u64 = 56;
+// Read one device-interrupt vector's state (an IrqInfo) by index into the caller's
+// buffer, returning the vector count: the fixed INTx window first, then the MSI-X
+// window with the owning device's index. A free syscall feeding `lsirq`.
+pub const SYS_IRQ_INFO: u64 = 57;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;
@@ -253,6 +269,61 @@ pub struct DomainStats {
 	pub dma_used: u64,
 	pub dma_limit: u64,
 }
+
+// The memory totals memory_stats writes into the caller's buffer: the physical frame
+// allocator's total and free 4 KiB frames (the total is fixed at boot from the usable
+// memory-map regions), and the kernel heap's total and free bytes. repr(C) so the
+// kernel and userspace agree on the layout byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MemoryStats {
+	pub total_frames: u64,
+	pub free_frames: u64,
+	pub heap_total: u64,
+	pub heap_free: u64,
+}
+
+// One boot memory-map region memmap_get writes into the caller's buffer: its physical
+// base, byte length, and kind (the MEMMAP_* codes below, the kernel's own stable
+// mapping of the bootloader's entry types). repr(C) so both sides agree byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MemmapRegion {
+	pub base: u64,
+	pub length: u64,
+	pub kind: u32,
+	pub _pad: u32,
+}
+
+// Region kinds reported in MemmapRegion::kind.
+pub const MEMMAP_USABLE: u32 = 0;
+pub const MEMMAP_RESERVED: u32 = 1;
+pub const MEMMAP_ACPI_RECLAIMABLE: u32 = 2;
+pub const MEMMAP_ACPI_NVS: u32 = 3;
+pub const MEMMAP_BAD: u32 = 4;
+pub const MEMMAP_BOOTLOADER: u32 = 5;
+pub const MEMMAP_KERNEL: u32 = 6;
+pub const MEMMAP_FRAMEBUFFER: u32 = 7;
+
+// One device-interrupt vector's state irq_info writes into the caller's buffer: the
+// vector number, its window (IRQ_KIND_FIXED for the legacy INTx window, IRQ_KIND_MSI
+// for the per-device MSI-X window), whether it is in use (a kernel handler or a live
+// driver binding), and for an owned MSI-X vector the discovered device's index
+// (IRQ_NO_DEVICE otherwise). repr(C) so both sides agree byte-for-byte.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct IrqInfo {
+	pub vector: u32,
+	pub kind: u32,
+	pub bound: u32,
+	pub device: u32,
+}
+
+// Vector windows reported in IrqInfo::kind.
+pub const IRQ_KIND_FIXED: u32 = 0;
+pub const IRQ_KIND_MSI: u32 = 1;
+// IrqInfo::device when no device owns the vector.
+pub const IRQ_NO_DEVICE: u32 = u32::MAX;
 
 // Error codes (Linux-style: a successful call returns its value, an error returns
 // a small negative in the reserved band [-4095, -1]).

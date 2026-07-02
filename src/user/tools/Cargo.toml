@@ -101,6 +101,22 @@ name = "dmesg"
 path = "src/dmesg.rs"
 
 [[bin]]
+name = "lscpu"
+path = "src/lscpu.rs"
+
+[[bin]]
+name = "free"
+path = "src/free.rs"
+
+[[bin]]
+name = "lsmem"
+path = "src/lsmem.rs"
+
+[[bin]]
+name = "lsirq"
+path = "src/lsirq.rs"
+
+[[bin]]
 name = "ping"
 path = "src/ping.rs"
 

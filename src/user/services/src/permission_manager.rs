@@ -113,11 +113,16 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"stop" => Some(Manifest { component: String::from("stop"), grants: alloc::vec![Capability::Supervisor] }),
 		b"lsvol" => Some(Manifest { component: String::from("lsvol"), grants: alloc::vec![Capability::Volumes] }),
 		// The inventory commands need no capability at all: the system identity and the
-		// uptime are compile-time / free-syscall data, and the boot log is read over its
-		// own syscall - the emptiest manifests in the store.
+		// uptime are compile-time / free-syscall data, and the boot log, CPU set, memory
+		// totals, memory map and vector table are read over their own free syscalls -
+		// the emptiest manifests in the store.
 		b"uname" => Some(Manifest { component: String::from("uname"), grants: alloc::vec![] }),
 		b"uptime" => Some(Manifest { component: String::from("uptime"), grants: alloc::vec![] }),
 		b"dmesg" => Some(Manifest { component: String::from("dmesg"), grants: alloc::vec![] }),
+		b"lscpu" => Some(Manifest { component: String::from("lscpu"), grants: alloc::vec![] }),
+		b"free" => Some(Manifest { component: String::from("free"), grants: alloc::vec![] }),
+		b"lsmem" => Some(Manifest { component: String::from("lsmem"), grants: alloc::vec![] }),
+		b"lsirq" => Some(Manifest { component: String::from("lsirq"), grants: alloc::vec![] }),
 		_ => None,
 	}
 }
