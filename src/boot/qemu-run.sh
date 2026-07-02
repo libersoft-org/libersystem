@@ -124,11 +124,14 @@ QEMU_ARGS+=(
 	-chardev "file,id=vcon,path=$HERE/.build/virtio-console.out"
 	# xHCI USB host controller (M62): the kernel's PCI scan discovers it by class
 	# (0x0C/0x03/0x30) and records its MMIO BAR in the device table; the userspace
-	# xhci driver maps it and runs the USB stack. A USB keyboard hangs off it so
-	# enumeration always finds a device. Attached on the test path too, so the
-	# kernel tests can assert the controller is discovered and its bus enumerated.
+	# xhci driver maps it and runs the USB stack. A hub hangs off port 1 with a USB
+	# keyboard behind it, so enumeration always exercises the hub expansion path
+	# (port power, hub-request port reset, route strings). Attached on the test path
+	# too, so the kernel tests can assert the controller is discovered and its bus -
+	# hub included - enumerated.
 	-device qemu-xhci,id=usb
-	-device usb-kbd,bus=usb.0
+	-device usb-hub,bus=usb.0,port=1
+	-device usb-kbd,bus=usb.0,port=1.1
 )
 
 # A USB mass-storage stick on the xHCI bus (M62): the xhci driver speaks SCSI over

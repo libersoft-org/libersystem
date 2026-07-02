@@ -2071,9 +2071,11 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// MSI-X Interrupt capability, and wait for its report. The driver resets the
 	// controller, builds the command and event rings, enumerates the root-hub
 	// ports, addresses each connected device and reads its device descriptor - QEMU
-	// hangs one USB keyboard off the controller (see qemu-run.sh), so exactly one
-	// device must come back addressed (and its HID boot keyboard configured, which
-	// the report only follows).
+	// hangs a hub with a USB keyboard behind it and a mass-storage stick off the
+	// controller (see qemu-run.sh), so three devices must come back addressed: the
+	// hub (expanded through its class requests and route strings), the keyboard
+	// behind it (its HID boot interface configured, which the report's keyboard
+	// marker proves), and the stick (its Bulk-Only transport brought up).
 	let (volume, _package) = scenario_packages().expect("boot modules should be present");
 	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/xhci")).expect("the xhci driver should be staged on the volume under drivers/");
 
@@ -2110,7 +2112,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	sched::run_until_idle();
 
 	let report = kernel_ep.recv().expect("the xhci driver should report in");
-	assert_eq!(&report.bytes[..], b"driver.xhci: online (2 device(s)) (keyboard) (storage)", "the driver should address the QEMU USB keyboard and stick, configure the HID boot interface, and bring the disk up");
+	assert_eq!(&report.bytes[..], b"driver.xhci: online (3 device(s)) (keyboard) (storage)", "the driver should expand the hub, address the QEMU USB keyboard behind it and the stick, and configure both classes");
 
 	// the report carries the disk's block channel: read sector 0 over it, the same
 	// [op u32][lba u64][count u32] contract driver.virtio-blk serves, and expect a

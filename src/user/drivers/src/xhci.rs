@@ -160,6 +160,27 @@ const CLASS_MASS_STORAGE: u8 = 8;
 const SUBCLASS_SCSI: u8 = 6;
 const PROTOCOL_BULK_ONLY: u8 = 0x50;
 
+// The hub device class (in the device descriptor) and its class descriptor type,
+// plus the hub class requests enumeration drives: GET_STATUS on a port (the status
+// word's connection / low-speed / high-speed bits), SET_FEATURE for port power and
+// reset, and CLEAR_FEATURE for the per-port change flags.
+const CLASS_HUB: u8 = 9;
+const DESC_HUB: u16 = 0x29;
+const REQ_GET_STATUS: u8 = 0;
+const REQ_SET_FEATURE: u8 = 3;
+const RT_CLASS_DEVICE_IN: u8 = 0xa0;
+const RT_CLASS_PORT: u8 = 0x23;
+const RT_CLASS_PORT_IN: u8 = 0xa3;
+const HUB_FEAT_PORT_RESET: u16 = 4;
+const HUB_FEAT_PORT_POWER: u16 = 8;
+const HUB_FEAT_C_CONNECTION: u16 = 16;
+const HUB_FEAT_C_RESET: u16 = 20;
+const PORT_STATUS_CCS: u16 = 1 << 0;
+const PORT_STATUS_POWER: u16 = 1 << 8;
+const PORT_STATUS_LOW_SPEED: u16 = 1 << 9;
+const PORT_STATUS_HIGH_SPEED: u16 = 1 << 10;
+const PORT_CHANGE_RESET: u16 = 1 << 4;
+
 // Bulk-Only Transport framing: the 31-byte Command Block Wrapper and the 13-byte
 // Command Status Wrapper, each led by its signature; a CSW status of 0 is success.
 const CBW_SIGNATURE: u32 = 0x4342_5355;
@@ -280,12 +301,14 @@ struct Xhci {
 	dcbaa_virt: u64,
 }
 
-// One addressed USB device: its slot, root-hub port, speed, the default endpoint's
-// transfer ring, and the scratch pages enumeration reuses (the input context and
-// the control-transfer data page).
+// One addressed USB device: its slot, root-hub port, route string (the hub-port
+// chain below that root port, one nibble per tier; 0 = directly attached), speed,
+// the default endpoint's transfer ring, and the scratch pages enumeration reuses
+// (the input context and the control-transfer data page).
 struct UsbDevice {
 	slot: u32,
 	port: u32,
+	route: u32,
 	speed: u32,
 	ep0: Ring,
 	in_virt: u64,
@@ -351,25 +374,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(hc) => hc,
 			None => exit(),
 		};
-		// enumerate the root-hub ports, address every connected device, and configure
-		// the first HID boot keyboard and the first mass-storage device found.
+		// enumerate the root-hub ports, address every connected device (expanding hubs
+		// recursively), and configure the first HID boot keyboard and the first
+		// mass-storage device found anywhere on the bus.
 		let mut devices: u32 = 0;
 		let mut keyboard: Option<(UsbDevice, Keyboard)> = None;
 		let mut storage: Option<(UsbDevice, Storage)> = None;
 		let mut port: u32 = 1;
 		while port <= hc.ports {
-			if let Some(mut dev) = attach_port(&mut hc, port) {
-				report_device(&dev);
-				devices += 1;
-				if keyboard.is_none()
-					&& let Some(kb) = configure_keyboard(&mut hc, &mut dev)
-				{
-					keyboard = Some((dev, kb));
-				} else if storage.is_none()
-					&& let Some(st) = configure_storage(&mut hc, &mut dev)
-				{
-					storage = Some((dev, st));
-				}
+			if let Some(dev) = attach_port(&mut hc, port) {
+				register_device(&mut hc, dev, &mut devices, &mut keyboard, &mut storage);
 			}
 			port += 1;
 		}
@@ -595,8 +609,8 @@ unsafe fn command_and_wait(hc: &mut Xhci, param: u64, status: u32, control: u32)
 }
 
 // Bring up the device on root-hub port `port`: reset the port if a device is
-// connected, enable a slot, address the device, and read its device descriptor.
-// Returns None when the port is empty or any step fails.
+// connected, then give it a slot, an address and an identity. Returns None when
+// the port is empty or any step fails.
 unsafe fn attach_port(hc: &mut Xhci, port: u32) -> Option<UsbDevice> {
 	unsafe {
 		let addr: u64 = hc.op + OP_PORTSC_BASE + (port - 1) as u64 * 0x10;
@@ -613,7 +627,18 @@ unsafe fn attach_port(hc: &mut Xhci, port: u32) -> Option<UsbDevice> {
 		// acknowledge the change bits the attach/reset raised.
 		portsc_write(hc, port, PORTSC_CSC | PORTSC_PEC | PORTSC_PRC | PORTSC_WRC | PORTSC_PLC | PORTSC_CEC);
 		let speed: u32 = r32(addr) >> 10 & 0xf;
+		address_device(hc, port, 0, speed)
+	}
+}
 
+// Give an attached, freshly reset device a slot and an address, and read its
+// identity: enable a slot, hang its device context off the DCBAA, address it (the
+// slot context names the root port, the route string below it, and the speed), fix
+// endpoint 0's packet size up from the descriptor head, and read the full device
+// descriptor. Shared by the root ports and the ports of a hub (whose devices carry
+// a non-zero route). Returns None when any step fails.
+unsafe fn address_device(hc: &mut Xhci, root_port: u32, route: u32, speed: u32) -> Option<UsbDevice> {
+	unsafe {
 		// a slot for the device, its device context, and the default endpoint's ring.
 		let slot: u32 = command_and_wait(hc, 0, 0, TRB_ENABLE_SLOT << 10)?;
 		if slot == 0 || slot > 255 {
@@ -624,7 +649,7 @@ unsafe fn attach_port(hc: &mut Xhci, port: u32) -> Option<UsbDevice> {
 
 		let (_ih, in_virt, in_phys): (u64, u64, u64) = dma_page()?;
 		let (_bh, data_virt, data_phys): (u64, u64, u64) = dma_page()?;
-		let mut dev: UsbDevice = UsbDevice { slot, port, speed, ep0: Ring::new()?, in_virt, in_phys, data_virt, data_phys, vendor: 0, product: 0, class: 0 };
+		let mut dev: UsbDevice = UsbDevice { slot, port: root_port, route, speed, ep0: Ring::new()?, in_virt, in_phys, data_virt, data_phys, vendor: 0, product: 0, class: 0 };
 		// no keyboard can have reports in flight during bring-up (its report TRB is
 		// only posted once the service loop starts), so the waits see no keyboard events.
 		let mut pending: Option<(UsbDevice, Keyboard)> = None;
@@ -664,6 +689,134 @@ fn initial_packet_size(speed: u32) -> u32 {
 	}
 }
 
+// Register one addressed device: print its identity, count it, and classify it -
+// a hub is expanded (its ports enumerated, each downstream device landing back
+// here recursively), the first HID boot keyboard and the first mass-storage device
+// are configured and kept for the service loop, anything else is left addressed.
+unsafe fn register_device(hc: &mut Xhci, mut dev: UsbDevice, devices: &mut u32, keyboard: &mut Option<(UsbDevice, Keyboard)>, storage: &mut Option<(UsbDevice, Storage)>) {
+	unsafe {
+		report_device(&dev);
+		*devices += 1;
+		if dev.class == CLASS_HUB {
+			expand_hub(hc, &mut dev, devices, keyboard, storage);
+		} else if keyboard.is_none()
+			&& let Some(kb) = configure_keyboard(hc, &mut dev)
+		{
+			*keyboard = Some((dev, kb));
+		} else if storage.is_none()
+			&& let Some(st) = configure_storage(hc, &mut dev)
+		{
+			*storage = Some((dev, st));
+		}
+	}
+}
+
+// Configure an addressed hub and enumerate the devices on its ports: select its
+// configuration, read the hub class descriptor for the port count, power each port
+// up, and bring up whatever is connected. Each addressed downstream device runs
+// through `register_device`, so a hub found downstream expands recursively and a
+// keyboard or disk behind any tier of hubs is configured like a root one.
+unsafe fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, devices: &mut u32, keyboard: &mut Option<(UsbDevice, Keyboard)>, storage: &mut Option<(UsbDevice, Storage)>) {
+	unsafe {
+		// no keyboard is serving yet, so the control waits see no keyboard events.
+		let mut pending: Option<(UsbDevice, Keyboard)> = None;
+		// select the hub's configuration (the head of its config descriptor names it).
+		if control_in(hc, &mut pending, hub, DESC_CONFIG, 9).is_none() {
+			return;
+		}
+		let config_value: u16 = r8(hub.data_virt + 5) as u16;
+		if control_nodata(hc, &mut pending, hub, 0x00, REQ_SET_CONFIGURATION, config_value, 0).is_none() {
+			return;
+		}
+		// the hub class descriptor: bNbrPorts rides at offset 2.
+		if control_in_req(hc, &mut pending, hub, RT_CLASS_DEVICE_IN, REQ_GET_DESCRIPTOR, DESC_HUB << 8, 0, 9).is_none() {
+			return;
+		}
+		let ports: u32 = r8(hub.data_virt + 2) as u32;
+		// the route string tier this hub's ports occupy: one nibble per tier, the
+		// first free nibble above the hub's own route.
+		let mut shift: u32 = 0;
+		while shift < 20 && hub.route >> shift & 0xf != 0 {
+			shift += 4;
+		}
+		let mut port: u32 = 1;
+		while port <= ports.min(15) {
+			if let Some(dev) = attach_hub_port(hc, hub, port, shift) {
+				register_device(hc, dev, devices, keyboard, storage);
+			}
+			port += 1;
+		}
+	}
+}
+
+// Bring up the device on one hub port: power the port, check a device is
+// connected, reset the port through the hub's SET_FEATURE(PORT_RESET) (waiting on
+// the reset-change flag), read the attached speed off the port status, and address
+// the device with the hub's route string extended by this port at `shift`. Returns
+// None when the port is empty or any step fails.
+unsafe fn attach_hub_port(hc: &mut Xhci, hub: &mut UsbDevice, port: u32, shift: u32) -> Option<UsbDevice> {
+	unsafe {
+		let mut pending: Option<(UsbDevice, Keyboard)> = None;
+		// power the port and wait for the power state to read back.
+		control_nodata(hc, &mut pending, hub, RT_CLASS_PORT, REQ_SET_FEATURE, HUB_FEAT_PORT_POWER, port as u16)?;
+		let mut spins: u32 = 0;
+		while hub_port_status(hc, &mut pending, hub, port)? & PORT_STATUS_POWER == 0 {
+			spins += 1;
+			if spins > 1000 {
+				return None;
+			}
+			yield_now();
+		}
+		// a device must be connected; acknowledge the connect-change flag.
+		if hub_port_status(hc, &mut pending, hub, port)? & PORT_STATUS_CCS == 0 {
+			return None;
+		}
+		control_nodata(hc, &mut pending, hub, RT_CLASS_PORT, REQ_CLEAR_FEATURE, HUB_FEAT_C_CONNECTION, port as u16)?;
+		// reset the port and wait for the reset-change flag (the status word's
+		// change half is its high 16 bits), then acknowledge it.
+		control_nodata(hc, &mut pending, hub, RT_CLASS_PORT, REQ_SET_FEATURE, HUB_FEAT_PORT_RESET, port as u16)?;
+		spins = 0;
+		loop {
+			let change: u16 = (hub_port_change(hc, &mut pending, hub, port)?) & PORT_CHANGE_RESET;
+			if change != 0 {
+				break;
+			}
+			spins += 1;
+			if spins > 1000 {
+				return None;
+			}
+			yield_now();
+		}
+		control_nodata(hc, &mut pending, hub, RT_CLASS_PORT, REQ_CLEAR_FEATURE, HUB_FEAT_C_RESET, port as u16)?;
+		// the attached speed, from the port status bits (default full speed).
+		let status: u16 = hub_port_status(hc, &mut pending, hub, port)?;
+		let speed: u32 = if status & PORT_STATUS_LOW_SPEED != 0 {
+			2
+		} else if status & PORT_STATUS_HIGH_SPEED != 0 {
+			SPEED_HIGH
+		} else {
+			1
+		};
+		address_device(hc, hub.port, hub.route | (port & 0xf) << shift, speed)
+	}
+}
+
+// Read one hub port's status word (the low half of the GET_STATUS reply).
+unsafe fn hub_port_status(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, hub: &mut UsbDevice, port: u32) -> Option<u16> {
+	unsafe {
+		control_in_req(hc, keyboard, hub, RT_CLASS_PORT_IN, REQ_GET_STATUS, 0, port as u16, 4)?;
+		Some(r8(hub.data_virt) as u16 | (r8(hub.data_virt + 1) as u16) << 8)
+	}
+}
+
+// Read one hub port's change word (the high half of the GET_STATUS reply).
+unsafe fn hub_port_change(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, hub: &mut UsbDevice, port: u32) -> Option<u16> {
+	unsafe {
+		control_in_req(hc, keyboard, hub, RT_CLASS_PORT_IN, REQ_GET_STATUS, 0, port as u16, 4)?;
+		Some(r8(hub.data_virt + 2) as u16 | (r8(hub.data_virt + 3) as u16) << 8)
+	}
+}
+
 // Fill the device's input context for an address-device command: the input
 // control context adds the slot and endpoint-0 contexts, the slot context names
 // the root-hub port and speed, and the endpoint-0 context is a control endpoint
@@ -673,9 +826,9 @@ unsafe fn write_address_contexts(hc: &Xhci, dev: &UsbDevice, mps: u32) {
 		core::ptr::write_bytes(dev.in_virt as *mut u8, 0, 4096);
 		// input control context: add slot (A0) + endpoint 0 (A1).
 		((dev.in_virt + 4) as *mut u32).write_volatile(0x3);
-		// slot context: one context entry, the device's speed and root-hub port.
+		// slot context: one context entry, the device's route string, speed and root port.
 		let slot_ctx: u64 = dev.in_virt + hc.ctx_size;
-		(slot_ctx as *mut u32).write_volatile(1 << 27 | dev.speed << 20);
+		(slot_ctx as *mut u32).write_volatile(1 << 27 | dev.speed << 20 | dev.route);
 		((slot_ctx + 4) as *mut u32).write_volatile(dev.port << 16);
 		// endpoint-0 context: a control endpoint (type 4), error count 3, the ring's
 		// physical base with the producer's cycle state, average TRB length 8.
@@ -688,14 +841,21 @@ unsafe fn write_address_contexts(hc: &Xhci, dev: &UsbDevice, mps: u32) {
 }
 
 // Read `len` bytes of descriptor `desc` from the device into its data page with a
-// GET_DESCRIPTOR control transfer on the default endpoint: setup stage (the 8-byte
-// request rides in the TRB itself), IN data stage, OUT status stage, then the
-// doorbell and the transfer completion event. A stall halts endpoint 0; it is
-// recovered before reporting failure, so the endpoint stays usable.
+// standard GET_DESCRIPTOR control transfer on the default endpoint.
 unsafe fn control_in(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, desc: u16, len: u16) -> Option<()> {
+	unsafe { control_in_req(hc, keyboard, dev, 0x80, REQ_GET_DESCRIPTOR, desc << 8, 0, len) }
+}
+
+// Run one IN control request on the default endpoint, the data landing in the
+// device's data page: setup stage (the 8-byte request rides in the TRB itself), IN
+// data stage, OUT status stage, then the doorbell and the transfer completion
+// event. The hub class requests (GET_STATUS on a port, the hub descriptor) ride
+// through here too. A stall halts endpoint 0; it is recovered before reporting
+// failure, so the endpoint stays usable.
+unsafe fn control_in_req(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16, len: u16) -> Option<()> {
 	unsafe {
-		let request: u64 = 0x80 | (REQ_GET_DESCRIPTOR as u64) << 8 | ((desc << 8) as u64) << 16 | (len as u64) << 48;
-		dev.ep0.push(request, 8, TRB_SETUP << 10 | TRB_IDT | TRB_TRT_IN);
+		let setup: u64 = request_type as u64 | (request as u64) << 8 | (value as u64) << 16 | (index as u64) << 32 | (len as u64) << 48;
+		dev.ep0.push(setup, 8, TRB_SETUP << 10 | TRB_IDT | TRB_TRT_IN);
 		dev.ep0.push(dev.data_phys, len as u32, TRB_DATA << 10 | TRB_DIR_IN);
 		dev.ep0.push(0, 0, TRB_STATUS << 10 | TRB_IOC);
 		// ring the device slot's doorbell for the default control endpoint (DCI 1).
@@ -855,7 +1015,7 @@ unsafe fn configure_keyboard(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Keybo
 		core::ptr::write_bytes(dev.in_virt as *mut u8, 0, 4096);
 		((dev.in_virt + 4) as *mut u32).write_volatile(1 | 1 << dci);
 		let slot_ctx: u64 = dev.in_virt + hc.ctx_size;
-		(slot_ctx as *mut u32).write_volatile(dci << 27 | dev.speed << 20);
+		(slot_ctx as *mut u32).write_volatile(dci << 27 | dev.speed << 20 | dev.route);
 		((slot_ctx + 4) as *mut u32).write_volatile(dev.port << 16);
 		// endpoint context: interrupt IN (type 7), error count 3, the polling
 		// interval, the ring's base, and the report size as the average/ESIT payload.
@@ -1066,7 +1226,7 @@ unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Storag
 		((dev.in_virt + 4) as *mut u32).write_volatile(1 | 1 << dci_in | 1 << dci_out);
 		let entries: u32 = dci_in.max(dci_out);
 		let slot_ctx: u64 = dev.in_virt + hc.ctx_size;
-		(slot_ctx as *mut u32).write_volatile(entries << 27 | dev.speed << 20);
+		(slot_ctx as *mut u32).write_volatile(entries << 27 | dev.speed << 20 | dev.route);
 		((slot_ctx + 4) as *mut u32).write_volatile(dev.port << 16);
 		// bulk endpoint contexts: IN type 6 / OUT type 2, error count 3, no interval.
 		for &(dci, mps, ep_type, ring) in &[(dci_in, mps_in, 6u32, &ring_in), (dci_out, mps_out, 2u32, &ring_out)] {
