@@ -52,17 +52,36 @@ impl<D: BlockDevice> LiberFs<D> {
 	// directory operations (on any directory inode)
 
 	// Look up `name` in directory `dir_num` through its B+tree: the child inode, or None
-	// if absent. Errors if `dir_num` is not a directory.
+	// if absent. Errors if `dir_num` is not a directory. A hit populates the bounded
+	// dentry cache, so path resolution stops re-walking the tree for hot names.
 	pub(crate) fn dir_lookup(&mut self, dir_num: u32, name: &[u8]) -> Result<Option<u32>, FsError> {
+		if let Some(child) = self.dcache.get(&(dir_num, name.to_vec())) {
+			return Ok(Some(*child));
+		}
 		let dir = self.read_inode(dir_num)?;
 		if dir.kind != KIND_DIR {
 			return Err(FsError::NotFound);
 		}
 		let probe = dir_probe(name);
 		match self.tree_lookup(dir.dir_root, dir.dir_root_crc, name_hash(name), &probe, DIR_REC)? {
-			Some(rec) => Ok(Some(u32::from_le_bytes(rec[8 + NAME_MAX..8 + NAME_MAX + 4].try_into().unwrap()))),
+			Some(rec) => {
+				let child = u32::from_le_bytes(rec[8 + NAME_MAX..8 + NAME_MAX + 4].try_into().unwrap());
+				self.dcache_put(dir_num, name, child);
+				Ok(Some(child))
+			}
 			None => Ok(None),
 		}
+	}
+
+	// Remember (directory, name) -> child, evicting an arbitrary entry once the cache
+	// is full (plain bounded eviction; the cache only skips re-reads).
+	pub(crate) fn dcache_put(&mut self, dir_num: u32, name: &[u8], child: u32) {
+		if self.dcache.len() >= DCACHE_MAX {
+			if let Some(k) = self.dcache.keys().next().cloned() {
+				self.dcache.remove(&k);
+			}
+		}
+		self.dcache.insert((dir_num, name.to_vec()), child);
 	}
 
 	// Insert entry `name` -> `child` into directory `dir_num`, or repoint it if it is
@@ -87,6 +106,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		dir.mtime = self.clock;
 		self.write_inode(dir_num, &mut dir)?;
+		self.dcache_put(dir_num, name, child);
 		Ok(())
 	}
 
@@ -101,6 +121,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if !removed {
 			return Err(FsError::NotFound);
 		}
+		self.dcache.remove(&(dir_num, name.to_vec()));
 		dir.dir_root = root;
 		dir.dir_root_crc = crc;
 		dir.size = dir.size.saturating_sub(1);
@@ -154,14 +175,18 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Does the subtree rooted at directory `root_dir` contain inode `target` (as the
 	// directory itself or any descendant)? Used to reject moving a directory into
-	// itself.
+	// itself. Iterative (a work list of directories), so nesting depth never grows the
+	// call stack.
 	pub(crate) fn subtree_contains(&mut self, root_dir: u32, target: u32) -> Result<bool, FsError> {
-		if root_dir == target {
-			return Ok(true);
-		}
-		for (_, child) in self.dir_entries_of(root_dir)? {
-			if self.read_inode(child)?.kind == KIND_DIR && self.subtree_contains(child, target)? {
+		let mut dirs: Vec<u32> = vec![root_dir];
+		while let Some(dir) = dirs.pop() {
+			if dir == target {
 				return Ok(true);
+			}
+			for (_, child) in self.dir_entries_of(dir)? {
+				if self.read_inode(child)?.kind == KIND_DIR {
+					dirs.push(child);
+				}
 			}
 		}
 		Ok(false)
@@ -169,24 +194,40 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Drop the file's blocks from logical block `keep` to the end: runs wholly past the
 	// cut are removed, a run straddling it is shortened. Under copy-on-write nothing is
-	// marked free here - the dropped data, checksum, and overflow blocks simply stop
-	// being referenced by the new generation and are reclaimed when the free map is
-	// rederived at commit (until then the previous generation still pins them as a
-	// snapshot). A shortened run keeps its checksum block; its leading slots still match
-	// the kept blocks.
+	// freed immediately - the dropped data, checksum, and overflow blocks stop being
+	// referenced by the new generation (recorded on the dead list, freed the commit
+	// after next; until then the previous generation still pins them as a snapshot). A
+	// shortened raw run keeps its checksum block (its leading slots still match the
+	// kept blocks) and drops only the cut tail's data blocks; a shortened compressed
+	// run keeps everything, since decoding needs the whole stored stream.
 	pub(crate) fn free_from(&mut self, inode: &mut Inode, keep: usize) -> Result<(), FsError> {
 		let keep = keep as u64;
 		let mut kept: Vec<Extent> = Vec::new();
-		for ext in inode.extents.iter() {
+		let extents = core::mem::take(&mut inode.extents);
+		for ext in extents {
 			if ext.logical >= keep {
+				// wholly cut: its stored blocks and checksum block leave the new
+				// generation.
+				for off in 0..ext.store_len as u64 {
+					self.drop_block(ext.physical + off);
+				}
+				self.drop_block(ext.csum);
 				continue;
 			}
 			if ext.end() <= keep {
-				kept.push(*ext);
+				kept.push(ext);
 				continue;
 			}
-			let mut e = *ext;
+			let mut e = ext;
 			e.length = (keep - ext.logical) as u32;
+			if ext.clen == 0 {
+				// a raw run drops the cut tail's data blocks; the checksum block stays
+				// (shared with the kept prefix).
+				for off in e.length as u64..ext.length as u64 {
+					self.drop_block(ext.physical + off);
+				}
+				e.store_len = e.length;
+			}
 			kept.push(e);
 		}
 		inode.extents = kept;

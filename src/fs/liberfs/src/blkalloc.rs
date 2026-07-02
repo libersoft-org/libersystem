@@ -5,38 +5,99 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.free[(block / 8) as usize] & (1 << (block % 8)) != 0
 	}
 
-	// Claim one free block, marking it used and recording it as fresh (allocated by
-	// this transaction, so safe to overwrite in place). Data blocks are taken from the
-	// low end of the pool and metadata (checksum, extent-overflow, inode-table, index)
-	// from the high end, so a run of data blocks stays physically contiguous and
-	// coalesces into one extent instead of being split by interleaved metadata.
+	// Mark `block` used and record it as fresh (allocated by this transaction, so safe
+	// to overwrite in place).
+	fn claim(&mut self, block: u64) {
+		self.free[(block / 8) as usize] |= 1 << (block % 8);
+		self.fresh.insert(block);
+	}
+
+	// Claim one free block. Data blocks are taken from the low end of the pool and
+	// metadata (checksum, extent-overflow, inode-table, index) from the high end, so a
+	// run of data blocks stays physically contiguous and coalesces into one extent
+	// instead of being split by interleaved metadata. Each side resumes at a next-fit
+	// cursor (wrapping once), scanning the bitmap a byte at a time, so an allocation
+	// is O(1) amortized instead of a fresh scan of the whole pool.
 	pub(crate) fn alloc_block(&mut self, meta: bool) -> Result<u64, FsError> {
-		let claim = |free: &mut [u8], block: u64| {
-			free[(block / 8) as usize] |= 1 << (block % 8);
-		};
 		if meta {
-			let mut block = self.num_blocks;
-			while block > POOL_START {
-				block -= 1;
-				if !self.is_alloc(block) {
-					claim(&mut self.free, block);
-					self.fresh.insert(block);
-					return Ok(block);
-				}
+			if let Some(block) = self.scan_down(self.meta_cursor).or_else(|| self.scan_down(self.num_blocks - 1)) {
+				self.meta_cursor = block;
+				self.claim(block);
+				return Ok(block);
 			}
-		} else {
-			for block in POOL_START..self.num_blocks {
-				if !self.is_alloc(block) {
-					claim(&mut self.free, block);
-					self.fresh.insert(block);
-					return Ok(block);
-				}
-			}
+		} else if let Some(block) = self.scan_up(self.data_cursor).or_else(|| self.scan_up(POOL_START)) {
+			self.data_cursor = block + 1;
+			self.claim(block);
+			return Ok(block);
 		}
 		Err(FsError::NoSpace)
 	}
 
+	// The first free block at or above `from` (data side), scanning whole bitmap bytes
+	// and finishing with trailing_zeros on the first byte with a free bit.
+	fn scan_up(&self, from: u64) -> Option<u64> {
+		let mut block = from.max(POOL_START);
+		if block >= self.num_blocks {
+			return None;
+		}
+		// finish the partial leading byte first.
+		while block < self.num_blocks && block % 8 != 0 {
+			if !self.is_alloc(block) {
+				return Some(block);
+			}
+			block += 1;
+		}
+		let mut byte = (block / 8) as usize;
+		let last = ((self.num_blocks - 1) / 8) as usize;
+		while byte <= last {
+			if self.free[byte] != 0xFF {
+				let candidate = byte as u64 * 8 + (!self.free[byte]).trailing_zeros() as u64;
+				if candidate < self.num_blocks {
+					return Some(candidate);
+				}
+				return None;
+			}
+			byte += 1;
+		}
+		None
+	}
+
+	// The first free block at or below `from` (metadata side), scanning bitmap bytes
+	// downward and finishing with leading_zeros on the first byte with a free bit.
+	fn scan_down(&self, from: u64) -> Option<u64> {
+		let mut block = from.min(self.num_blocks - 1);
+		if block <= POOL_START {
+			return None;
+		}
+		// finish the partial trailing byte first.
+		while block > POOL_START && block % 8 != 7 {
+			if !self.is_alloc(block) {
+				return Some(block);
+			}
+			block -= 1;
+		}
+		let mut byte = (block / 8) as isize;
+		let first = (POOL_START / 8) as isize;
+		while byte >= first {
+			if self.free[byte as usize] != 0xFF {
+				let candidate = byte as u64 * 8 + (7 - (!self.free[byte as usize]).leading_zeros() as u64);
+				if candidate > POOL_START {
+					return Some(candidate);
+				}
+				return None;
+			}
+			byte -= 1;
+		}
+		None
+	}
+
 	pub(crate) fn alloc_data(&mut self) -> Result<u64, FsError> {
+		// consume the reserved run first: a whole-file write claimed its span up front,
+		// so its blocks come out consecutive by construction.
+		if let Some((next, remaining)) = self.run {
+			self.run = if remaining > 1 { Some((next + 1, remaining - 1)) } else { None };
+			return Ok(next);
+		}
 		self.alloc_block(false)
 	}
 
@@ -44,31 +105,155 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.alloc_block(true)
 	}
 
+	// Reserve `len` consecutive free data blocks and hand them to `alloc_data` one at a
+	// time: a whole-file write lands contiguously (one extent per checksum-block span)
+	// instead of trusting the cursor not to be interrupted. Claims the whole run up
+	// front (fresh, so an abort releases it). No-op when no contiguous run exists - the
+	// write falls back to per-block allocation.
+	pub(crate) fn reserve_run(&mut self, len: usize) {
+		if len < 2 || self.run.is_some() {
+			return;
+		}
+		if let Some(start) = self.find_run(len) {
+			for b in start..start + len as u64 {
+				self.claim(b);
+			}
+			self.run = Some((start, len as u32));
+			self.data_cursor = start + len as u64;
+		}
+	}
+
+	// Release whatever remains of the reserved run (a write that ended early, or a
+	// transaction rollback): the unconsumed blocks return to the pool.
+	pub(crate) fn release_run(&mut self) {
+		if let Some((next, remaining)) = self.run.take() {
+			for b in next..next + remaining as u64 {
+				self.unclaim(b);
+			}
+		}
+	}
+
+	// The start of the first run of `len` consecutive free blocks at or above the data
+	// cursor (wrapping once), or None. Scans free bytes (0x00 = eight free blocks) so
+	// long runs are found a byte at a time.
+	fn find_run(&self, len: usize) -> Option<u64> {
+		let scan = |from: u64| -> Option<u64> {
+			let mut start = from.max(POOL_START);
+			let mut count = 0usize;
+			let mut block = start;
+			while block < self.num_blocks {
+				if self.is_alloc(block) {
+					count = 0;
+					// skip whole allocated bytes.
+					if block % 8 == 0 {
+						let mut byte = (block / 8) as usize;
+						let last = ((self.num_blocks - 1) / 8) as usize;
+						while byte <= last && self.free[byte] == 0xFF {
+							byte += 1;
+						}
+						block = (byte as u64 * 8).max(block + 1);
+					} else {
+						block += 1;
+					}
+					start = block;
+					continue;
+				}
+				count += 1;
+				if count == len {
+					return Some(start);
+				}
+				block += 1;
+			}
+			None
+		};
+		scan(self.data_cursor).or_else(|| scan(POOL_START))
+	}
+
 	// Release a block this transaction claimed but ended up not referencing (a
-	// contiguity gap while assembling a compressed run): clear its free-map bit and
-	// forget it was fresh, so the pool does not carry dead claims until commit.
+	// contiguity gap while assembling a compressed run, or an unconsumed reservation):
+	// clear its free-map bit and forget it was fresh, so the pool does not carry dead
+	// claims until commit. A released block may be re-allocated and rewritten at once,
+	// so any cache holding its old content must go with it.
 	pub(crate) fn unclaim(&mut self, block: u64) {
 		self.free[(block / 8) as usize] &= !(1 << (block % 8));
 		self.fresh.remove(&block);
+		self.forget_block(block);
+	}
+
+	// Drop every cache entry describing `block`: called when the block is released or
+	// stops being referenced, so no cache can outlive the bytes it describes.
+	pub(crate) fn forget_block(&mut self, block: u64) {
+		if matches!(&self.wcsum, Some((wp, _)) if *wp == block) {
+			self.wcsum = None;
+		}
+		if matches!(&self.rcsum, Some((rp, _, _)) if *rp == block) {
+			self.rcsum = None;
+		}
+		if matches!(&self.decomp, Some((dp, _)) if *dp == block) {
+			self.decomp = None;
+		}
+	}
+
+	// Record that the in-flight transaction stopped referencing `ptr`. A block the
+	// transaction itself allocated simply returns to the pool; a committed block joins
+	// the `dead` list - the superseded generation still references it as the rolling
+	// snapshot, so the commit after next frees it (unless a named snapshot pins it).
+	// This is what keeps the free map exact without rewalking the volume at commit.
+	pub(crate) fn drop_block(&mut self, ptr: u64) {
+		if ptr == 0 {
+			return;
+		}
+		if self.fresh.contains(&ptr) {
+			self.unclaim(ptr);
+		} else {
+			self.dead.insert(ptr);
+			self.forget_block(ptr);
+		}
+	}
+
+	// Drop every block a file inode references: each run's stored blocks and its
+	// checksum block, plus the extent overflow chain. The complement of
+	// `collect_inode_blocks`, for a file being deleted or wholly replaced. The extent
+	// map must be complete (`load_spill` already run).
+	pub(crate) fn drop_inode_blocks(&mut self, inode: &Inode) -> Result<(), FsError> {
+		for i in 0..inode.extents.len() {
+			let ext = inode.extents[i];
+			for off in 0..ext.store_len as u64 {
+				self.drop_block(ext.physical + off);
+			}
+			self.drop_block(ext.csum);
+		}
+		let mut ptr = inode.spill;
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		while ptr != 0 {
+			self.drop_block(ptr);
+			if !self.dev.read_block(ptr, &mut buf) {
+				return Err(FsError::Io);
+			}
+			ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+		}
+		Ok(())
 	}
 
 	// Copy-on-write a block reference. A pointer this transaction already allocated is
 	// returned as is (safe to mutate in place). A committed block (or the 0 "unmapped"
 	// sentinel) is copied up to a fresh block (data low, metadata high) and the old
 	// contents copied into it (or zeroed), so the committed generation keeps the
-	// original untouched.
+	// original untouched - and the original is recorded dropped, since the new
+	// generation references the copy instead.
 	pub(crate) fn cow_block(&mut self, ptr: u64, meta: bool) -> Result<u64, FsError> {
 		if ptr != 0 && self.fresh.contains(&ptr) {
 			return Ok(ptr);
 		}
 		let fresh = self.alloc_block(meta)?;
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		if ptr != 0 && !self.dev.read_block(ptr, &mut buf) {
+		if ptr != 0 && !self.read_block_csum_aware(ptr, &mut buf) {
 			return Err(FsError::Io);
 		}
 		if !self.dev.write_block(fresh, &buf) {
 			return Err(FsError::Io);
 		}
+		self.drop_block(ptr);
 		Ok(fresh)
 	}
 
@@ -80,10 +265,47 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.cow_block(ptr, true)
 	}
 
+	// Read block `ptr`, serving the in-flight checksum write cache first: a fresh
+	// checksum block being assembled lives in memory until eviction or commit, so a
+	// read of it must not go to the (stale) device copy.
+	pub(crate) fn read_block_csum_aware(&mut self, ptr: u64, buf: &mut [u8]) -> bool {
+		if let Some((wp, bytes)) = &self.wcsum {
+			if *wp == ptr {
+				buf[..BLOCK_SIZE].copy_from_slice(bytes);
+				return true;
+			}
+		}
+		self.dev.read_block(ptr, buf)
+	}
+
+	// Write the in-flight checksum block to the device, if one is pending. Called on
+	// eviction (a different checksum block is touched) and before the commit barrier.
+	pub(crate) fn flush_wcsum(&mut self) -> Result<(), FsError> {
+		if let Some((ptr, bytes)) = self.wcsum.take() {
+			if !self.dev.write_block(ptr, &bytes) {
+				return Err(FsError::Io);
+			}
+		}
+		Ok(())
+	}
+
 	// Read the CRC32C of an extent's block at slot `slot` from its checksum block,
 	// verifying that block's own checksum first (so a flipped bit in the checksum
-	// metadata is caught, not silently trusted).
+	// metadata is caught, not silently trusted). The in-flight write cache serves a
+	// fresh block being assembled; a committed block is verified once and then served
+	// from the read cache for the rest of a sequential run.
 	pub(crate) fn read_csum(&mut self, csum: u64, csum_crc: u32, slot: usize) -> Result<u32, FsError> {
+		let off = slot * 4;
+		if let Some((wp, bytes)) = &self.wcsum {
+			if *wp == csum {
+				return Ok(u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()));
+			}
+		}
+		if let Some((rp, rcrc, bytes)) = &self.rcsum {
+			if *rp == csum && *rcrc == csum_crc {
+				return Ok(u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()));
+			}
+		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		if !self.dev.read_block(csum, &mut buf) {
 			return Err(FsError::Io);
@@ -91,23 +313,33 @@ impl<D: BlockDevice> LiberFs<D> {
 		if crc32c(&buf) != csum_crc {
 			return Err(FsError::Corrupt);
 		}
-		let off = slot * 4;
-		Ok(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()))
+		let crc = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+		// safe to cache even a fresh block: the hit is keyed by the expected CRC32C, so
+		// a later in-place edit (which changes the extent's csum_crc) misses and re-reads
+		// - and the in-flight wcsum copy always shadows this cache anyway.
+		self.rcsum = Some((csum, csum_crc, buf));
+		Ok(crc)
 	}
 
-	// Set slot `slot` of checksum block `csum` to `crc` and return the block's new
-	// CRC32C (the extent's `csum_crc`). The block is read, edited, and written back.
+	// Set slot `slot` of checksum block `csum` (always fresh - the callers copy a
+	// committed block up first) to `crc` and return the block's new CRC32C (the
+	// extent's `csum_crc`). The edit happens in the in-flight write cache; the device
+	// sees the block once, on eviction or at commit, so a sequential run of writes
+	// costs one device write instead of a read-modify-write per block.
 	pub(crate) fn set_csum_slot(&mut self, csum: u64, slot: usize, crc: u32) -> Result<u32, FsError> {
-		let mut buf = vec![0u8; BLOCK_SIZE];
-		if !self.dev.read_block(csum, &mut buf) {
-			return Err(FsError::Io);
+		let cached = matches!(&self.wcsum, Some((wp, _)) if *wp == csum);
+		if !cached {
+			self.flush_wcsum()?;
+			let mut buf = vec![0u8; BLOCK_SIZE];
+			if !self.dev.read_block(csum, &mut buf) {
+				return Err(FsError::Io);
+			}
+			self.wcsum = Some((csum, buf));
 		}
+		let bytes = &mut self.wcsum.as_mut().unwrap().1;
 		let off = slot * 4;
-		buf[off..off + 4].copy_from_slice(&crc.to_le_bytes());
-		if !self.dev.write_block(csum, &buf) {
-			return Err(FsError::Io);
-		}
-		Ok(crc32c(&buf))
+		bytes[off..off + 4].copy_from_slice(&crc.to_le_bytes());
+		Ok(crc32c(bytes))
 	}
 
 	// file block mapping (extents)
@@ -228,7 +460,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(());
 		}
 		let mut old_csum = vec![0u8; BLOCK_SIZE];
-		if !self.dev.read_block(ext.csum, &mut old_csum) {
+		if !self.read_block_csum_aware(ext.csum, &mut old_csum) {
 			return Err(FsError::Io);
 		}
 		if crc32c(&old_csum) != ext.csum_crc {
@@ -239,6 +471,10 @@ impl<D: BlockDevice> LiberFs<D> {
 			// the prefix is unchanged: reuse the original checksum block (its leading
 			// slots still match the kept blocks).
 			pieces.push(Extent { logical: ext.logical, physical: ext.physical, length: off as u32, csum: ext.csum, csum_crc: ext.csum_crc, store_len: off as u32, clen: 0 });
+		} else {
+			// no prefix piece: nothing in the new generation references the original
+			// checksum block any more.
+			self.drop_block(ext.csum);
 		}
 		// the rewritten block gets a fresh single-entry checksum block.
 		let mid_csum = self.alloc_meta()?;
@@ -272,6 +508,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		let ext = inode.extents[i];
 		let decoded = self.decompress_extent(&ext)?;
 		inode.extents.remove(i);
+		// the compressed record's stored blocks and checksum block leave the new
+		// generation with it.
+		for s in 0..ext.store_len as u64 {
+			self.drop_block(ext.physical + s);
+		}
+		self.drop_block(ext.csum);
 		let mut blk = vec![0u8; BLOCK_SIZE];
 		for lo in 0..ext.length as usize {
 			for b in blk.iter_mut() {
@@ -298,7 +540,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// `FsError::Corrupt` rather than bad data.
 	pub(crate) fn decompress_extent(&mut self, ext: &Extent) -> Result<Vec<u8>, FsError> {
 		let mut cbuf = vec![0u8; BLOCK_SIZE];
-		if !self.dev.read_block(ext.csum, &mut cbuf) {
+		if !self.read_block_csum_aware(ext.csum, &mut cbuf) {
 			return Err(FsError::Io);
 		}
 		if crc32c(&cbuf) != ext.csum_crc {
@@ -396,6 +638,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		if !self.dev.write_block(csum, &cbuf) {
 			return Err(FsError::Io);
 		}
+		// the raw run's blocks and checksum block leave the new generation with it.
+		for off in 0..ext.length as u64 {
+			self.drop_block(ext.physical + off);
+		}
+		self.drop_block(ext.csum);
 		inode.extents[i] = Extent { logical: ext.logical, physical: first, length: ext.length, csum, csum_crc: crc32c(&cbuf), store_len: store_len as u32, clen: comp.len() as u32 };
 		Ok(())
 	}
@@ -408,8 +655,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut bad = 0;
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		let mut cbuf = vec![0u8; BLOCK_SIZE];
-		for ext in inode.extents.iter() {
-			if !self.dev.read_block(ext.csum, &mut cbuf) {
+		for i in 0..inode.extents.len() {
+			let ext = inode.extents[i];
+			if !self.read_block_csum_aware(ext.csum, &mut cbuf) {
 				return Err(FsError::Io);
 			}
 			if crc32c(&cbuf) != ext.csum_crc {
@@ -432,6 +680,14 @@ impl<D: BlockDevice> LiberFs<D> {
 
 pub(crate) fn set_bit(bitmap: &mut [u8], b: u64) {
 	bitmap[(b / 8) as usize] |= 1 << (b % 8);
+}
+
+pub(crate) fn clear_bit(bitmap: &mut [u8], b: u64) {
+	bitmap[(b / 8) as usize] &= !(1 << (b % 8));
+}
+
+pub(crate) fn test_bit(bitmap: &[u8], b: u64) -> bool {
+	bitmap[(b / 8) as usize] & (1 << (b % 8)) != 0
 }
 
 // Index of the extent covering logical block `lb`, or None if it falls in a hole. The

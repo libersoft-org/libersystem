@@ -23,8 +23,10 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	pub(crate) fn create_snapshot_inner(&mut self, name: &[u8]) -> Result<(), FsError> {
 		// pin the current live generation: the snapshot-table write is the only change,
-		// so the committed generation keeps this exact inode-tree root.
+		// so the committed generation keeps this exact inode-tree root. The pinned set
+		// changes, so this commit rebuilds the free map and pinned map by the full walk.
 		self.snapshots.push(Snapshot { name: name.to_vec(), inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, generation: self.generation });
+		self.snapshots_dirty = true;
 		self.write_snapshot_table()
 	}
 
@@ -43,7 +45,10 @@ impl<D: BlockDevice> LiberFs<D> {
 	}
 
 	pub(crate) fn delete_snapshot_inner(&mut self, name: &[u8]) -> Result<(), FsError> {
+		// the deleted snapshot's blocks unpin: this commit rebuilds the free map and
+		// pinned map by the full walk, which is what reclaims them.
 		self.snapshots.retain(|s| s.name != name);
+		self.snapshots_dirty = true;
 		self.write_snapshot_table()
 	}
 
@@ -309,11 +314,15 @@ impl<D: BlockDevice> LiberFs<D> {
 
 		// point the destination name at the moved inode (add or overwrite), clear the
 		// source entry, and free the inode the destination used to hold. Its old blocks
-		// stay with the previous generation; the next commit reclaims them.
+		// stay with the previous generation and leave the new one.
 		self.dir_insert(pt, nt, inode_f)?;
 		self.dir_remove(pf, nf)?;
 		if let Some(inode_t) = dest {
 			if inode_t != inode_f {
+				let ti = self.read_inode(inode_t)?;
+				if ti.kind == KIND_FILE {
+					self.drop_inode_blocks(&ti)?;
+				}
 				self.free_inode(inode_t)?;
 			}
 		}

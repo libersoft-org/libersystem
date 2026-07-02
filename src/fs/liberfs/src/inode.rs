@@ -2,8 +2,14 @@ use crate::*;
 
 impl<D: BlockDevice> LiberFs<D> {
 	// Read inode `num` from the inode B+tree. Missing (never allocated or freed) is
-	// FsError::Invalid; a tree node failing its checksum is FsError::Corrupt.
+	// FsError::Invalid; a tree node failing its checksum is FsError::Corrupt. A hit
+	// populates the bounded inode cache (extent map complete), so hot inodes - every
+	// path component, a stat-ed file - stop re-walking the tree and re-reading the
+	// overflow chain.
 	pub(crate) fn read_inode(&mut self, num: u32) -> Result<Inode, FsError> {
+		if let Some(inode) = self.icache.get(&num) {
+			return Ok(inode.clone());
+		}
 		let key = num as u64;
 		let probe = key.to_le_bytes();
 		match self.tree_lookup(self.inode_root, self.inode_root_crc, key, &probe, INODE_REC)? {
@@ -14,10 +20,26 @@ impl<D: BlockDevice> LiberFs<D> {
 					// file whose runs all fit inline).
 					self.load_spill(&mut inode)?;
 				}
+				self.icache_put(num, inode.clone());
 				Ok(inode)
 			}
 			None => Err(FsError::Invalid),
 		}
+	}
+
+	// Remember inode `num`, evicting an arbitrary entry once the cache is full and
+	// skipping a pathologically fragmented extent map (the cache only skips re-reads).
+	pub(crate) fn icache_put(&mut self, num: u32, inode: Inode) {
+		if inode.extents.len() > ICACHE_EXTENTS_MAX {
+			self.icache.remove(&num);
+			return;
+		}
+		if self.icache.len() >= ICACHE_MAX && !self.icache.contains_key(&num) {
+			if let Some(k) = self.icache.keys().next().cloned() {
+				self.icache.remove(&k);
+			}
+		}
+		self.icache.insert(num, inode);
 	}
 
 	// Append the spilled extents (those past EXTENTS_INLINE) from the overflow chain to
@@ -50,10 +72,21 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Persist `inode.extents` past the inline ones into a fresh overflow chain (one
 	// block per EXTENTS_PER_BLOCK runs) and set the `spill` / `spill_crc` /
-	// `extent_count` header fields to match. The chain is built back to front so each
-	// block can hold the (pointer, CRC32C) of the one after it. Always called by
-	// `write_inode`, so the inode slot and chain stay consistent.
+	// `extent_count` header fields to match. The superseded chain's blocks leave the
+	// new generation. The chain is built back to front so each block can hold the
+	// (pointer, CRC32C) of the one after it. Always called by `write_inode`, so the
+	// inode slot and chain stay consistent.
 	pub(crate) fn flush_extents(&mut self, inode: &mut Inode) -> Result<(), FsError> {
+		// the rebuilt chain replaces the old one wholesale: drop the old blocks.
+		let mut old = inode.spill;
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		while old != 0 {
+			self.drop_block(old);
+			if !self.dev.read_block(old, &mut buf) {
+				return Err(FsError::Io);
+			}
+			old = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+		}
 		inode.extent_count = inode.extents.len() as u32;
 		if inode.extents.len() <= EXTENTS_INLINE {
 			inode.spill = 0;
@@ -98,6 +131,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let (root, crc) = self.tree_insert(self.inode_root, self.inode_root_crc, num as u64, &rec, INODE_REC, INODE_LEAF_MAX, INODE_KEYLEN)?;
 		self.inode_root = root;
 		self.inode_root_crc = crc;
+		self.icache_put(num, inode.clone());
 		Ok(())
 	}
 
@@ -112,13 +146,14 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(num)
 	}
 
-	// Remove inode `num` from the inode B+tree (its data blocks are reclaimed when the
-	// free map is rederived at commit, the previous generation pinning them until then).
+	// Remove inode `num` from the inode B+tree (its data blocks are recorded dropped by
+	// the caller; the previous generation pins them until the commit after next).
 	pub(crate) fn free_inode(&mut self, num: u32) -> Result<(), FsError> {
 		let probe = (num as u64).to_le_bytes();
 		let (root, crc, _) = self.tree_delete(self.inode_root, self.inode_root_crc, num as u64, &probe, INODE_REC, INODE_KEYLEN)?;
 		self.inode_root = root;
 		self.inode_root_crc = crc;
+		self.icache.remove(&num);
 		Ok(())
 	}
 }

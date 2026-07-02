@@ -88,6 +88,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -331,6 +332,14 @@ const SNAP_HDR: usize = 8;
 const SNAP_REC: usize = SNAP_NAME_MAX + 20;
 const SNAP_MAX: usize = (BLOCK_SIZE - SNAP_HDR) / SNAP_REC;
 
+// In-memory cache bounds: how many parsed inodes and how many (directory, name) ->
+// inode entries are kept between operations, and the largest extent map worth caching
+// (a pathologically fragmented file would otherwise hold megabytes of cache). Both
+// caches only skip re-reads - every hit was verified when it was first read.
+const ICACHE_MAX: usize = 64;
+const DCACHE_MAX: usize = 256;
+const ICACHE_EXTENTS_MAX: usize = 4096;
+
 // One extent: a contiguous run of `length` logical blocks mapped from logical block
 // `logical` to physical block `physical`, paired with a checksum block (`csum`) holding
 // the CRC32C of every stored block in the run, plus `csum_crc`, that checksum block's own
@@ -387,6 +396,7 @@ impl Extent {
 // `dir_root_crc`) in the same bytes and leaves the extent fields zero. `extents` is the
 // in-memory extent map of a file: `parse` fills only the EXTENTS_INLINE inline runs, and
 // [`LiberFs::read_inode`] completes it from the overflow chain rooted at `spill`.
+#[derive(Clone)]
 struct Inode {
 	kind: u8,
 	size: u64,
@@ -542,18 +552,55 @@ pub struct LiberFs<D: BlockDevice> {
 	snap_root: u64,
 	snap_root_crc: u32,
 	snapshots: Vec<Snapshot>,
-	// In-memory free map, one bit per block, derived at mount and after each commit -
-	// never written to disk.
+	// In-memory free map, one bit per block, derived at mount and maintained
+	// incrementally at each commit - never written to disk.
 	free: Vec<u8>,
+	// Next-fit allocation cursors: where the next data scan starts (moving up from the
+	// pool's low end) and the next metadata scan (moving down from its high end), so an
+	// allocation resumes where the last one left off instead of rescanning the pool.
+	data_cursor: u64,
+	meta_cursor: u64,
+	// A reserved run of consecutive data blocks (next block, blocks remaining) that
+	// `alloc_data` consumes before falling back to the bitmap scan: a whole-file write
+	// reserves its span up front so the file lands contiguously.
+	run: Option<(u64, u32)>,
 	// Blocks allocated by the in-flight transaction: safe to overwrite in place (no
 	// committed generation references them yet).
 	fresh: BTreeSet<u64>,
+	// Committed blocks the in-flight transaction stopped referencing (`dead`), and those
+	// the previous committed transaction dropped (`dead_prev`). The superseded generation
+	// still references the latter as the rolling snapshot, so they free at the NEXT
+	// commit - each commit clears `dead_prev`'s unpinned bits and promotes `dead`,
+	// keeping the free map exact without rewalking the volume.
+	dead: BTreeSet<u64>,
+	dead_prev: BTreeSet<u64>,
+	// Every block a named snapshot pins (one bit per block, rebuilt by the full
+	// derivation whenever the snapshot set changes): a dead block that is pinned stays
+	// allocated until the snapshot holding it is deleted.
+	pinned: Vec<u8>,
+	// Did the in-flight transaction create or delete a snapshot? Its commit then runs
+	// the full free-map derivation (the pinned set changed) instead of the incremental
+	// promotion.
+	snapshots_dirty: bool,
 	// The state captured at `begin`, restored by `abort` and used by `commit` to reserve
 	// the generation it supersedes.
 	txn: Option<Txn>,
 	// A one-extent cache of the most recently decompressed run, keyed by its first stored
 	// block, so a sequential read of a compressed extent decodes it only once.
 	decomp: Option<(u64, Vec<u8>)>,
+	// The in-flight checksum block being assembled (always a fresh block): sequential
+	// writes edit it in memory and it reaches the device once, on eviction or at commit -
+	// instead of a read-modify-write per data block.
+	wcsum: Option<(u64, Vec<u8>)>,
+	// The most recently verified committed checksum block (pointer, its CRC32C, bytes):
+	// a sequential read of a long raw extent verifies its checksum block once, not once
+	// per data block.
+	rcsum: Option<(u64, u32, Vec<u8>)>,
+	// Bounded caches of parsed inodes and (directory, name) -> inode lookups, so path
+	// resolution and repeated stats stop re-reading the trees; entries are updated on
+	// write, dropped on delete, and cleared wholesale on abort.
+	icache: BTreeMap<u32, Inode>,
+	dcache: BTreeMap<(u32, Vec<u8>), u32>,
 	// Refuse every mutation: set for snapshot mounts (writing through one would
 	// interleave generations) and when the mount is degraded (a corrupt snapshot table
 	// no longer pins its generations, so a commit could reuse pinned blocks).

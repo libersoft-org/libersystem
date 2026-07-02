@@ -16,11 +16,16 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Begin a mutation: snapshot the inode-tree root, next-inode counter and snapshot
 	// table so they can be restored on failure and the inode root reserved as the
-	// previous generation on commit, and clear the fresh-block set.
+	// previous generation on commit, and clear the transaction-scoped state (the fresh
+	// and dead block sets and the caches).
 	pub(crate) fn begin(&mut self) {
 		self.txn = Some(Txn { inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, snap_root: self.snap_root, snap_root_crc: self.snap_root_crc, snapshots: self.snapshots.clone() });
 		self.fresh.clear();
+		self.dead.clear();
+		self.snapshots_dirty = false;
 		self.decomp = None;
+		self.wcsum = None;
+		self.rcsum = None;
 	}
 
 	// Commit the in-flight mutation: write a new superblock (incremented generation,
@@ -30,8 +35,17 @@ impl<D: BlockDevice> LiberFs<D> {
 	// transaction wrote durable before the superblock can name them, the second makes
 	// the commit itself durable - so a device with a volatile write cache cannot
 	// reorder the commit point ahead of its data. The superseded generation becomes the
-	// read-only snapshot; the one before it is reclaimed by rederiving the free map.
+	// read-only snapshot; the one before that is reclaimed INCREMENTALLY: the blocks
+	// the previous transaction recorded dropped (`dead_prev`) lose their free-map bits
+	// (unless a named snapshot pins them) and this transaction's `dead` set takes their
+	// place - no walk of the volume. Only a commit that changed the snapshot set runs
+	// the full derivation, because the pinned map must be rebuilt.
 	pub(crate) fn commit(&mut self) -> Result<(), FsError> {
+		// an unconsumed run reservation and the pending checksum block must settle
+		// before the barrier: the first returns claimed-but-unused blocks, the second
+		// is a transaction block write like any other.
+		self.release_run();
+		self.flush_wcsum()?;
 		let sb = Superblock { num_blocks: self.num_blocks, generation: self.generation + 1, inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, root_inode: self.root_inode, snap_root: self.snap_root, snap_root_crc: self.snap_root_crc };
 		let new_slot = (self.slot + 1) % SUPER_SLOTS;
 		// barrier: the transaction's blocks must be on the medium before the superblock
@@ -49,7 +63,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 
 		// the generation this commit superseded becomes the snapshot; its blocks stay
-		// reserved by the rederived free map.
+		// reserved by the free map.
 		if let Some(t) = self.txn.take() {
 			self.prev_inode_root = t.inode_root;
 			self.prev_inode_root_crc = t.inode_root_crc;
@@ -57,15 +71,36 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		self.generation += 1;
 		self.slot = new_slot;
+		// "fresh" is a transaction concept: after the commit the blocks are simply part
+		// of the live generation (and the caches may serve them like any other).
+		self.fresh.clear();
 		// the commit reclaims old-generation blocks (they may be reused and rewritten),
-		// so a decompressed image cached against one of them must not outlive it.
+		// so caches keyed by physical blocks must not outlive it.
 		self.decomp = None;
-		self.derive_free()
+		self.rcsum = None;
+		if self.snapshots_dirty {
+			// the pinned set changed: rebuild it (and the free map) by the full walk.
+			self.snapshots_dirty = false;
+			self.dead.clear();
+			return self.derive_free();
+		}
+		// the incremental reclaim: what the superseded transaction dropped is now
+		// referenced by no generation - free it unless a named snapshot pins it (a
+		// pinned block stays reserved until its snapshot is deleted, which rederives).
+		let dead_prev = core::mem::take(&mut self.dead_prev);
+		for b in dead_prev {
+			if !test_bit(&self.pinned, b) {
+				clear_bit(&mut self.free, b);
+			}
+		}
+		self.dead_prev = core::mem::take(&mut self.dead);
+		Ok(())
 	}
 
 	// Roll back a failed mutation: restore the inode-tree root, next-inode counter and
-	// snapshot table and rederive the free map, so the half-written fresh blocks are
-	// forgotten and on-disk state is untouched.
+	// snapshot table, release every block the transaction claimed, and forget its drops
+	// - so the half-written fresh blocks return to the pool and on-disk state is
+	// untouched. No walk: the fresh set IS the exact list of claimed blocks.
 	pub(crate) fn abort(&mut self) {
 		if let Some(t) = self.txn.take() {
 			self.inode_root = t.inode_root;
@@ -75,9 +110,22 @@ impl<D: BlockDevice> LiberFs<D> {
 			self.snap_root_crc = t.snap_root_crc;
 			self.snapshots = t.snapshots;
 		}
-		self.fresh.clear();
+		self.release_run();
+		let fresh = core::mem::take(&mut self.fresh);
+		for b in fresh {
+			clear_bit(&mut self.free, b);
+		}
+		// the rolled-back transaction dropped nothing after all; dead_prev (the LAST
+		// committed transaction's drops) stays for the next commit.
+		self.dead.clear();
+		self.snapshots_dirty = false;
 		self.decomp = None;
-		let _ = self.derive_free();
+		self.wcsum = None;
+		self.rcsum = None;
+		// the transaction may have replaced cached inodes/entries with rolled-back
+		// versions: drop both caches wholesale.
+		self.icache.clear();
+		self.dcache.clear();
 	}
 
 	// Finish a mutation: commit on success, roll back on failure - including a failed
@@ -99,28 +147,49 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 	}
 
-	// Rebuild the in-memory free map from scratch: blocks 0 and 1 (the superblock
-	// slots) plus every block the live and previous generations reference, the snapshot
-	// table block, and every pinned snapshot generation. Called at mount and after each
-	// commit; nothing else persists allocation state.
+	// Rebuild the in-memory allocation state from scratch: the free map (blocks 0 and 1
+	// plus every block the live and previous generations reference, the snapshot table
+	// block, and every pinned snapshot generation), the pinned map (the snapshot
+	// generations alone), and `dead_prev` (the blocks only the previous generation
+	// holds - exactly what the next commit may free). Called at mount, from fsck, and
+	// after a commit that changed the snapshot set; every other commit maintains the
+	// state incrementally.
 	pub(crate) fn derive_free(&mut self) -> Result<(), FsError> {
-		let mut map = vec![0u8; self.free.len()];
-		set_bit(&mut map, 0);
-		set_bit(&mut map, 1);
-		self.mark_inode_tree(self.inode_root, &mut map)?;
-		if self.prev_valid {
-			self.mark_inode_tree(self.prev_inode_root, &mut map)?;
-		}
+		let len = self.free.len();
+		let mut live = vec![0u8; len];
+		set_bit(&mut live, 0);
+		set_bit(&mut live, 1);
+		self.mark_inode_tree(self.inode_root, &mut live)?;
 		// the snapshot table block and every pinned snapshot generation stay reserved, so
 		// a later commit never reuses an earlier root's blocks.
 		if self.snap_root != 0 {
-			set_bit(&mut map, self.snap_root);
+			set_bit(&mut live, self.snap_root);
 		}
+		let mut pinned = vec![0u8; len];
 		for i in 0..self.snapshots.len() {
 			let root = self.snapshots[i].inode_root;
-			self.mark_inode_tree(root, &mut map)?;
+			self.mark_inode_tree(root, &mut pinned)?;
 		}
-		self.free = map;
+		let mut prev = vec![0u8; len];
+		if self.prev_valid {
+			self.mark_inode_tree(self.prev_inode_root, &mut prev)?;
+		}
+		// the free map is the union; dead_prev is what only the previous generation
+		// (and no snapshot) holds - the blocks the next commit is allowed to free.
+		self.dead_prev.clear();
+		for i in 0..len {
+			self.free[i] = live[i] | pinned[i] | prev[i];
+			let only_prev = prev[i] & !live[i] & !pinned[i];
+			if only_prev != 0 {
+				for bit in 0..8 {
+					if only_prev & (1 << bit) != 0 {
+						self.dead_prev.insert(i as u64 * 8 + bit);
+					}
+				}
+			}
+		}
+		self.pinned = pinned;
+		self.dead.clear();
 		Ok(())
 	}
 
@@ -128,31 +197,38 @@ impl<D: BlockDevice> LiberFs<D> {
 	// nodes themselves, and for each live inode either its file data / checksum /
 	// overflow blocks or its directory's B+tree. Reads are raw (no checksum check), like
 	// the old generation walk, so a corrupt block does not abort the mount or rebuild.
-	pub(crate) fn mark_inode_tree(&mut self, ptr: u64, map: &mut [u8]) -> Result<(), FsError> {
-		if ptr == 0 {
-			return Ok(());
+	// Iterative (an explicit work list), so the depth of the trees never grows the call
+	// stack.
+	pub(crate) fn mark_inode_tree(&mut self, root: u64, map: &mut [u8]) -> Result<(), FsError> {
+		let mut nodes: Vec<u64> = Vec::new();
+		if root != 0 {
+			nodes.push(root);
 		}
-		set_bit(map, ptr);
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		if !self.dev.read_block(ptr, &mut buf) {
-			return Err(FsError::Io);
-		}
-		let count = node_count(&buf);
-		if node_type(&buf) == NODE_LEAF {
-			for i in 0..count {
-				let off = NODE_HDR + i * INODE_REC + 8;
-				let mut inode = Inode::parse(&buf[off..off + INODE_SIZE]);
-				if inode.kind == KIND_FILE {
-					// complete the extent map from the overflow chain before marking.
-					self.load_spill(&mut inode)?;
-					self.collect_inode_blocks(&inode, map)?;
-				} else if inode.kind == KIND_DIR {
-					self.mark_dir_tree(inode.dir_root, map)?;
-				}
+		while let Some(ptr) = nodes.pop() {
+			set_bit(map, ptr);
+			if !self.dev.read_block(ptr, &mut buf) {
+				return Err(FsError::Io);
 			}
-		} else {
-			for i in 0..=count {
-				self.mark_inode_tree(child_ptr(&buf, i), map)?;
+			let count = node_count(&buf);
+			if node_type(&buf) == NODE_LEAF {
+				for i in 0..count {
+					let off = NODE_HDR + i * INODE_REC + 8;
+					let mut inode = Inode::parse(&buf[off..off + INODE_SIZE]);
+					if inode.kind == KIND_FILE {
+						// complete the extent map from the overflow chain before marking
+						// (the spill and dir walks use their own buffers, so the leaf
+						// image in `buf` stays intact).
+						self.load_spill(&mut inode)?;
+						self.collect_inode_blocks(&inode, map)?;
+					} else if inode.kind == KIND_DIR {
+						self.mark_dir_tree(inode.dir_root, map)?;
+					}
+				}
+			} else {
+				for i in 0..=count {
+					nodes.push(child_ptr(&buf, i));
+				}
 			}
 		}
 		Ok(())
@@ -160,19 +236,23 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Mark every node block of a directory's B+tree. The entries themselves point at
 	// inodes, which the inode-tree walk already covers, so only the nodes are marked.
-	pub(crate) fn mark_dir_tree(&mut self, ptr: u64, map: &mut [u8]) -> Result<(), FsError> {
-		if ptr == 0 {
-			return Ok(());
+	// Iterative like `mark_inode_tree`.
+	pub(crate) fn mark_dir_tree(&mut self, root: u64, map: &mut [u8]) -> Result<(), FsError> {
+		let mut nodes: Vec<u64> = Vec::new();
+		if root != 0 {
+			nodes.push(root);
 		}
-		set_bit(map, ptr);
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		if !self.dev.read_block(ptr, &mut buf) {
-			return Err(FsError::Io);
-		}
-		if node_type(&buf) == NODE_INTERNAL {
-			let count = node_count(&buf);
-			for i in 0..=count {
-				self.mark_dir_tree(child_ptr(&buf, i), map)?;
+		while let Some(ptr) = nodes.pop() {
+			set_bit(map, ptr);
+			if !self.dev.read_block(ptr, &mut buf) {
+				return Err(FsError::Io);
+			}
+			if node_type(&buf) == NODE_INTERNAL {
+				let count = node_count(&buf);
+				for i in 0..=count {
+					nodes.push(child_ptr(&buf, i));
+				}
 			}
 		}
 		Ok(())
@@ -194,10 +274,16 @@ impl<D: BlockDevice> LiberFs<D> {
 	}
 
 	// The block to write an updated node to: reuse one this transaction already
-	// allocated (overwrite in place), else copy up to a fresh metadata block so the
-	// committed generation keeps the original.
+	// allocated (overwrite in place), else allocate a fresh metadata block and record
+	// the committed original dropped - the new generation references the rewrite, so
+	// the original leaves with the superseded generation.
 	pub(crate) fn node_dest(&mut self, ptr: u64) -> Result<u64, FsError> {
-		if ptr != 0 && self.fresh.contains(&ptr) { Ok(ptr) } else { self.alloc_meta() }
+		if ptr != 0 && self.fresh.contains(&ptr) {
+			return Ok(ptr);
+		}
+		let fresh = self.alloc_meta()?;
+		self.drop_block(ptr);
+		Ok(fresh)
 	}
 
 	// Write `buf` to block `ptr` and return its CRC32C (to store in the parent link).
@@ -425,7 +511,8 @@ impl<D: BlockDevice> LiberFs<D> {
 			Del::NotFound => Ok((root, root_crc, false)),
 			Del::Empty => Ok((0, 0, true)),
 			Del::Updated(p, c) => {
-				// collapse a root that became a single-child internal node, repeatedly.
+				// collapse a root that became a single-child internal node, repeatedly;
+				// each collapsed node leaves the new generation.
 				let mut ptr = p;
 				let mut crc = c;
 				let mut buf = vec![0u8; BLOCK_SIZE];
@@ -434,6 +521,7 @@ impl<D: BlockDevice> LiberFs<D> {
 					if node_type(&buf) == NODE_INTERNAL && node_count(&buf) == 0 {
 						let cp = child_ptr(&buf, 0);
 						let cc = child_crc(&buf, 0);
+						self.drop_block(ptr);
 						ptr = cp;
 						crc = cc;
 					} else {
@@ -469,6 +557,8 @@ impl<D: BlockDevice> LiberFs<D> {
 				None => return Ok(Del::NotFound),
 			};
 			if count == 1 {
+				// the leaf empties: the parent drops it, so it leaves the new generation.
+				self.drop_block(ptr);
 				return Ok(Del::Empty);
 			}
 			let dest = self.node_dest(ptr)?;
@@ -497,6 +587,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			Del::Empty => {
 				if count == 0 {
 					// a single-child internal whose only child emptied empties too.
+					self.drop_block(ptr);
 					return Ok(Del::Empty);
 				}
 				// drop child ci and an adjacent separator (the one to its left when ci is

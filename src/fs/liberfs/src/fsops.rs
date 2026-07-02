@@ -45,7 +45,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Io);
 		}
 
-		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, decomp: None, read_only: false, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, clock: 0 };
 		fs.derive_free()?;
 		Ok(fs)
 	}
@@ -112,7 +112,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			None => (0, 0, false),
 		};
 
-		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], fresh: BTreeSet::new(), txn: None, decomp: None, read_only: !newest, clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest, clock: 0 };
 		// a corrupt snapshot table degrades the mount to read-only instead of failing it:
 		// the pinned generations it named can no longer be reserved, so a commit could
 		// reuse their blocks - refusing every mutation keeps them (and the table block
@@ -219,7 +219,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		};
 
 		// build the new inode from scratch: every logical block is written to a fresh
-		// block (the old file's blocks stay referenced by the previous generation).
+		// block (the old file's blocks stay referenced by the previous generation, and
+		// leave the new one - recorded via the dead list). A contiguous run is reserved
+		// up front, so the file lands in as few extents as the pool allows.
 		let mut inode = Inode::empty(KIND_FILE);
 		inode.size = data.len() as u64;
 		inode.ctime = match &old {
@@ -227,6 +229,11 @@ impl<D: BlockDevice> LiberFs<D> {
 			None => self.clock,
 		};
 		inode.mtime = self.clock;
+		if let Some((_, o)) = &old {
+			let o = o.clone();
+			self.drop_inode_blocks(&o)?;
+		}
+		self.reserve_run(inode.nblocks());
 		let mut block = vec![0u8; BLOCK_SIZE];
 		for i in 0..inode.nblocks() {
 			let start = i * BLOCK_SIZE;
@@ -237,6 +244,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			block[..end - start].copy_from_slice(&data[start..end]);
 			self.write_logical(&mut inode, i, &block)?;
 		}
+		self.release_run();
 
 		// transparently compress the freshly written runs: a run that shrinks is replaced
 		// by a compressed record, an incompressible one stays raw.
@@ -282,7 +290,20 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 
 		// clear the directory entry and free the inode in the new generation; its old
-		// blocks remain referenced by the previous generation.
+		// blocks remain referenced by the previous generation and leave the new one.
+		if inode.kind == KIND_FILE {
+			self.drop_inode_blocks(&inode)?;
+		} else if inode.dir_root != 0 {
+			// an empty directory's tree root is 0; a non-zero root here cannot hold
+			// entries, but drop its node(s) defensively.
+			let mut map = vec![0u8; self.free.len()];
+			self.mark_dir_tree(inode.dir_root, &mut map)?;
+			for b in 0..self.num_blocks {
+				if test_bit(&map, b) {
+					self.drop_block(b);
+				}
+			}
+		}
 		self.dir_remove(parent, name)?;
 		self.free_inode(inode_num)?;
 		Ok(())

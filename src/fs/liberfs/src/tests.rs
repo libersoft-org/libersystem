@@ -1131,3 +1131,174 @@ fn compression_never_launders_a_corrupt_source_block() {
 	assert_eq!(fs.read_file(b"big"), Err(FsError::Corrupt));
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 1);
 }
+
+// M74: the incremental free map and the next-fit allocator.
+
+// After every committed mutation, the incrementally maintained free map must equal
+// what the full volume walk would derive - the invariant the whole incremental
+// scheme stands on. `derive_free` recomputes free, pinned and dead_prev from the
+// trees, so calling it mid-scenario is state-preserving: any drift is a bug in the
+// drop bookkeeping (a leak if incremental holds more, a corruption risk if less).
+#[test]
+fn the_incremental_free_map_matches_a_full_rederivation() {
+	fn check(fs: &mut LiberFs<MemDevice>, what: &str) {
+		let saved = fs.free.clone();
+		fs.derive_free().unwrap();
+		for b in 0..fs.num_blocks {
+			let inc = test_bit(&saved, b);
+			let full = test_bit(&fs.free, b);
+			assert_eq!(inc, full, "free map drifted after {what}: block {b} incremental={inc} full={full}");
+		}
+	}
+	let nblocks: u64 = 256;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let compressible: Vec<u8> = b"squeeze me flat. ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
+
+	fs.write_file(b"a", &noise(BLOCK_SIZE * 3)).unwrap();
+	check(&mut fs, "a fresh write");
+	fs.write_file(b"a", &noise(BLOCK_SIZE * 5 + 100)).unwrap();
+	check(&mut fs, "a whole-file replace");
+	fs.write_file(b"c", &compressible).unwrap();
+	check(&mut fs, "a compressed write");
+	fs.write_at(b"c", BLOCK_SIZE as u64, b"patch").unwrap();
+	check(&mut fs, "a thawing patch");
+	fs.write_at(b"a", 100, b"xx").unwrap();
+	check(&mut fs, "an overwrite that splits a run");
+	fs.write_at(b"a", (BLOCK_SIZE * 8) as u64, b"far").unwrap();
+	check(&mut fs, "a sparse extension");
+	fs.truncate(b"a", BLOCK_SIZE as u64 + 5).unwrap();
+	check(&mut fs, "a shortening truncate");
+	fs.truncate(b"a", 0).unwrap();
+	check(&mut fs, "a truncate to zero");
+	fs.mkdir(b"d/e").unwrap();
+	check(&mut fs, "mkdir -p");
+	fs.write_file(b"d/e/f", b"x").unwrap();
+	check(&mut fs, "a nested write");
+	fs.rename(b"d/e/f", b"g").unwrap();
+	check(&mut fs, "a rename");
+	fs.write_file(b"h", b"y").unwrap();
+	fs.rename(b"g", b"h").unwrap();
+	check(&mut fs, "a replacing rename");
+	fs.remove(b"h").unwrap();
+	check(&mut fs, "a remove");
+	fs.rmdir(b"d/e").unwrap();
+	check(&mut fs, "an rmdir");
+
+	// snapshots: creation and deletion rebuild by the full walk; the churn between
+	// them exercises the incremental path with pinned blocks in play.
+	fs.write_file(b"pinned", &noise(BLOCK_SIZE * 2)).unwrap();
+	fs.create_snapshot(b"s").unwrap();
+	check(&mut fs, "a snapshot create");
+	fs.write_file(b"pinned", &noise(BLOCK_SIZE * 2 + 7)).unwrap();
+	check(&mut fs, "replacing a pinned file");
+	fs.remove(b"pinned").unwrap();
+	check(&mut fs, "removing a pinned file");
+	fs.delete_snapshot(b"s").unwrap();
+	check(&mut fs, "a snapshot delete");
+
+	// churn to a steady state: the freed blocks must actually come back for reuse.
+	for round in 0..20 {
+		fs.write_file(b"cycle", &noise(BLOCK_SIZE * 4)).unwrap();
+		check(&mut fs, "churn");
+		let _ = round;
+	}
+
+	// the state persists: a remount derives the same map and reads everything back.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(b"cycle").unwrap(), noise(BLOCK_SIZE * 4));
+	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
+}
+
+// A whole-file write reserves its span up front, so the file lands in one extent per
+// checksum-block span even when the pool is checkered by earlier churn.
+#[test]
+fn a_whole_file_write_lands_contiguously() {
+	let nblocks: u64 = 512;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	// checker the pool: many small files, then remove every other one.
+	for i in 0..24u32 {
+		let name = format!("frag{i}");
+		fs.write_file(name.as_bytes(), &noise(BLOCK_SIZE)).unwrap();
+	}
+	for i in (0..24u32).step_by(2) {
+		let name = format!("frag{i}");
+		fs.remove(name.as_bytes()).unwrap();
+	}
+	// two commits so the removals' blocks actually free (the deferred reclaim).
+	fs.write_file(b"tick", b"1").unwrap();
+	fs.write_file(b"tick", b"2").unwrap();
+	// a 40-block file: bigger than any single freed hole, so without the up-front
+	// reservation the per-block cursor would stitch it from fragments.
+	let big = noise(BLOCK_SIZE * 40);
+	fs.write_file(b"big", &big).unwrap();
+	let num = fs.lookup(b"big").unwrap();
+	assert_eq!(fs.read_inode(num).unwrap().extents.len(), 1, "the write should land as one contiguous extent");
+	assert_eq!(fs.read_file(b"big").unwrap(), big);
+}
+
+// M74: the scaling benchmark. Ignored in the normal run (it takes seconds); run with
+// `cargo test --release bench_scaling -- --ignored --nocapture` and record the
+// numbers in docs/PERF.md. Three costs the milestone attacks: a large write (the
+// allocator and checksum batching), a sequential re-read (the checksum read cache),
+// and a many-file tree (the per-commit free-map rederivation). Device reads/writes
+// are counted too: on a RAM-backed test device the I/O counts, not the wall time,
+// are what predict real-disk behaviour.
+#[test]
+#[ignore]
+fn bench_scaling() {
+	use std::time::Instant;
+
+	// a SparseDevice that counts its reads and writes.
+	struct CountingDevice {
+		inner: SparseDevice,
+		reads: u64,
+		writes: u64,
+	}
+	impl BlockDevice for CountingDevice {
+		fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+			self.reads += 1;
+			self.inner.read_block(index, buf)
+		}
+		fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+			self.writes += 1;
+			self.inner.write_block(index, buf)
+		}
+	}
+
+	// a 1 GiB volume, sparse so only written blocks cost test memory.
+	let nblocks: u64 = 262_144;
+	let dev = CountingDevice { inner: SparseDevice::new(nblocks), reads: 0, writes: 0 };
+	let mut fs = LiberFs::format(dev, nblocks).unwrap();
+
+	// one 64 MiB incompressible file.
+	let big = noise(64 * 1024 * 1024);
+	let (r0, w0) = (fs.device().reads, fs.device().writes);
+	let t = Instant::now();
+	fs.write_file(b"big", &big).unwrap();
+	println!("bench: 64 MiB write: {:?} ({} reads, {} writes)", t.elapsed(), fs.device().reads - r0, fs.device().writes - w0);
+
+	let (r0, w0) = (fs.device().reads, fs.device().writes);
+	let t = Instant::now();
+	assert_eq!(fs.read_file(b"big").unwrap().len(), big.len());
+	println!("bench: 64 MiB read: {:?} ({} reads, {} writes)", t.elapsed(), fs.device().reads - r0, fs.device().writes - w0);
+
+	// two thousand small files: every write commits, so this measures how commit cost
+	// grows with the volume's live metadata.
+	let (r0, w0) = (fs.device().reads, fs.device().writes);
+	let t = Instant::now();
+	for i in 0..2000u32 {
+		let name = format!("small{i:04}");
+		fs.write_file(name.as_bytes(), name.as_bytes()).unwrap();
+	}
+	println!("bench: 2000 small files: {:?} ({} reads, {} writes)", t.elapsed(), fs.device().reads - r0, fs.device().writes - w0);
+
+	// a stat per file: the lookup/read path over many files.
+	let (r0, w0) = (fs.device().reads, fs.device().writes);
+	let t = Instant::now();
+	for i in 0..2000u32 {
+		let name = format!("small{i:04}");
+		assert!(fs.stat(name.as_bytes()).unwrap().size > 0);
+	}
+	println!("bench: 2000 stats: {:?} ({} reads, {} writes)", t.elapsed(), fs.device().reads - r0, fs.device().writes - w0);
+}
