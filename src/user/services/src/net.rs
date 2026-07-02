@@ -213,8 +213,8 @@ struct Neigh {
 }
 
 // The ARP neighbor cache size - a cache with eviction (the oldest slot is replaced
-// when full), so it bounds memory, never which neighbors are reachable. Matches
-// Linux's default gc_thresh3; lives on the heap.
+// when full), so it bounds memory, never which neighbors are reachable. Lives
+// on the heap.
 const NEIGH_MAX: usize = 1024;
 
 // The address configuration learned from a DHCP OFFER/ACK: the offered address plus

@@ -1073,19 +1073,14 @@ owning service gains a typed query first; each ships as a binary per M61.
 The artificial-limits audit left a handful of buffers and rings that are simply
 too small for comfortable use, where raising them is cheap and self-contained -
 plus one defensive fix in the generated dispatch so an oversized reply can never
-strand a client again, and a few constants whose true bound the runtime already
-knows. Small items, one or two commits.
+strand a client again. All genuinely small, one commit.
 
 - [ ] NetworkService typed buffers: `REQ_MAX` 256 -> 1024 (a DNS name alone may be 253 bytes plus framing) and `REPLY_MAX` 1024 -> 4096 (`ss` with a handful of sockets overflows it), aligning the network service with the 4096 wire ceiling every other service uses.
 - [ ] Line-editor history: `LD_HIST_MAX` 32 -> 512 entries (bash keeps 500+; the history is a Vec, the raise is free).
 - [ ] Terminal scrollback: `SCROLLBACK_ROWS` 100 -> 1000 (xterm's default; 100 rows is barely two screens). Verify the scrollback allocation stays lazy per opened VT.
-- [ ] Journal capacity: `JOURNAL_CAP` 32 -> 4096 records (32 records make the journal useless for diagnosing anything that happened more than a minute ago); persistence stays M68.
-- [ ] Defensive dispatch: a generated server whose reply does not fit the caller's buffer currently returns None - no reply is sent and the client blocks forever. Teach lsidl-gen's dispatch to answer with a typed error (`again`) instead, so an oversized list degrades into a visible failure until M69 streams it.
-- [ ] The bounded-by-nature values (scrollback, history, journal capacity, ARP cache, restart budgets) move from compile-time constants to ConfigService keys (`console.scrollback`, `log.capacity`, ...) - caches and rings must stay bounded (eviction), but the bound is the operator's policy, not the compiler's.
-- [ ] `volume.write`'s `MAX_WRITE` sanity bound is replaced by validating the claimed length against the transferred MemoryObject's real size (the kernel knows it) - the guard constant disappears.
+- [ ] Journal capacity: `JOURNAL_CAP` 32 -> 4096 records (32 records make the journal useless for diagnosing anything that happened more than a minute ago); persistence stays M70.
 - [ ] `NVT` uncapped: the VT set is a Vec like the PTY set; a VT's cost is its grid, paid only when opened - no reason for a ceiling at all.
-- [ ] `MAX_WAIT_ANY` validated against the caller's real bound - its Domain handle budget - instead of a magic 4096.
-- [ ] `MAX_CPUS` retired: size the per-CPU tables (scheduler, percpu blocks, LAPIC ids) at boot from the Limine MP response - the heap is up before any AP wakes, so only the BSP's slot needs to be static and the constant disappears (the GDT/TSS side is already dynamic).
+- [ ] Defensive dispatch: a generated server whose reply does not fit the caller's buffer currently returns None - no reply is sent and the client blocks forever. Teach lsidl-gen's dispatch to answer with a typed error (`again`) instead, so an oversized list degrades into a visible failure until M71 streams it.
 - Done when: the raised limits hold under the existing tests, an oversized reply produces a typed error (not a hang), and `just test` stays green.
 - Concept: the limits audit (no silent truncation, generous defaults where memory is cheap), M37 observability (a journal deep enough to diagnose with).
 
@@ -1102,7 +1097,37 @@ the layout should be derived from it.
 - Done when: a fresh system volume uses the whole disk, an existing one mounts unchanged, tests green.
 - Concept: M63 (the capacity query this builds on), M43/M53 (LiberFS layout and large-volume scaling).
 
-## M66 - GPU framebuffer realloc on resize (no resolution ceiling)
+## M66 - Kernel bounds from the runtime (retire the last magic numbers)
+
+Three kernel-side constants whose true bound the runtime already knows. Contained
+changes, but each touches a sensitive path (early boot, the syscall validator,
+the write path), so they get their own milestone rather than riding the quick
+wins.
+
+- [ ] `MAX_CPUS` retired: size the per-CPU tables (scheduler, percpu blocks, LAPIC ids) at boot from the Limine MP response - the heap is up before any AP wakes, so only the BSP's slot needs to be static and the constant disappears (the GDT/TSS side is already dynamic). Early-boot ordering is the risk; the BSP must run on static state until the tables exist.
+- [ ] `MAX_WAIT_ANY` validated against the caller's real bound - its Domain handle budget - instead of a magic 4096 (a wait set cannot name more handles than the caller may hold).
+- [ ] `volume.write`'s `MAX_WRITE` sanity bound replaced by validating the claimed length against the transferred MemoryObject's real size (the kernel knows it; expose it to the service if needed) - the guard constant disappears.
+- Done when: none of the three constants exists, the checks bind to runtime facts, tests green.
+- Concept: the limits audit's principle (where the runtime can tell us the real bound, no constant stands in for it).
+
+## M67 - Runtime-tunable policies (constants become ConfigService keys)
+
+The bounded-by-nature values - caches and rings that must stay bounded (eviction)
+- have their bound picked by the compiler today. The bound is the operator's
+policy: it belongs in the typed config tree. The plumbing is the real work here:
+the owning services (ConsoleService, LogService, ServiceManager, NetworkService)
+do not hold ConfigService clients yet.
+
+- [ ] Grant the owning services a ConfigService client (ServiceManager wires it at bootstrap, like every other dependency).
+- [ ] `console.scrollback`, `console.history`: read at VT creation, defaults as today.
+- [ ] `log.capacity`: the in-memory journal depth.
+- [ ] `net.arp-cache`: the neighbor-cache size.
+- [ ] `service.restart-budget`, `service.watchdog-ticks`: the supervisor's policy knobs.
+- [ ] `config` in the shell shows the new keys with their live values; `set` changes take effect for new consumers (a live re-read where cheap, documented otherwise).
+- Done when: the values are read from config with today's numbers as defaults, `set` demonstrably changes behaviour, tests green.
+- Concept: M31 ConfigService (typed configuration as the policy surface), the limits audit (policy out of the compiler).
+
+## M68 - GPU framebuffer realloc on resize (no resolution ceiling)
 
 driver.virtio-gpu allocates its framebuffer once, floored at 1920x1080; a runtime
 resize beyond the allocation is clamped, so anything larger than the initial
@@ -1115,7 +1140,7 @@ whatever geometry the host reports.
 - Done when: an interactive window resize to any host-supported resolution renders full-resolution (and shrinking back releases nothing it still scans out), tests green.
 - Concept: M44 (the virtio-gpu driver and runtime mode-set this completes), the limits audit (no constant where the hardware can tell us the real bound).
 
-## M67 - Demand-paged user stacks
+## M69 - Demand-paged user stacks
 
 User stacks are fully mapped up front (256 KiB per thread since the limits audit;
 Linux hands a thread 8 MiB precisely because it demand-pages). Deep call chains -
@@ -1128,7 +1153,7 @@ compile-time stack budget.
 - Done when: a thread touches stack beyond the initial mapping and continues, memory only grows with use, tests green.
 - Concept: fault isolation (M17) - the fault handler gains its first resumable fault; the limits audit (budgets replaced by growth).
 
-## M68 - Journal persistence (LogService on the volume)
+## M70 - Journal persistence (LogService on the volume)
 
 The journal lives in memory and dies with the machine; the M64 raise makes it
 deep, not durable. An appliance needs logs that survive a reboot.
@@ -1136,11 +1161,11 @@ deep, not durable. An appliance needs logs that survive a reboot.
 - [ ] LogService gains a storage capability (its own StorageService client, granted by ServiceManager) and appends records to `vol://system/log/` - a size-bounded, rotating on-disk journal (structured records, not rendered text).
 - [ ] Flush policy: batched appends (never a disk write per record), flushed on a timer and on severity >= error.
 - [ ] `log` gains a `--boot <n>` selector to read a previous boot's journal off the volume.
-- [ ] Rotation: a size cap per boot and a count cap across boots, oldest deleted.
+- [ ] Rotation: a size cap per boot and a count cap across boots, oldest deleted (the caps as M67 config keys, derived from the volume's size by default).
 - Done when: records written before a reboot are readable after it via `log --boot`, rotation holds the caps, tests green.
-- Concept: M37 observability (the journal as the durable system record), M43/M50 (the writable volume it persists to).
+- Concept: M37 observability (the journal as the durable system record), M43/M50 (the writable volume it persists to), M65 (a pool big enough to hold logs).
 
-## M69 - Streaming replies (retire the 4096 B wire ceiling)
+## M71 - Streaming replies (retire the 4096 B wire ceiling)
 
 Every typed reply must fit one 4096 B message today; M64 makes overflow a visible
 error, this milestone makes it impossible. Unbounded lists - the permission audit
@@ -1150,12 +1175,12 @@ trail, a big directory listing, socket recv - move to streams or pages, the way
 - [ ] Pick the pattern per op: `stream<T>` sub-channels (the log-tail model) for unbounded lists (`permission.audit`, `volume.list` on big directories), explicit paging (`offset`/`limit`) where the client wants random access.
 - [ ] Regenerate and migrate the affected services and tools; the shell renders streams incrementally (a huge `ls` starts printing immediately).
 - [ ] Socket `recv` rides its existing stream sub-channel for bulk data, retiring the 512 B `SOCK_RECV_MAX`/`TCP_REPLY_MAX` chunk units.
-- [ ] `volume.write` grows a streaming form for large files (retiring the 16 MiB `MAX_WRITE` sanity bound as the practical limit).
+- [ ] `volume.write` grows a streaming form, so a file's size is bounded by the filesystem, not by any single transfer.
 - [ ] The kernel's recv path learns to report a pending message's actual length (a peek), so a transport can size its buffer exactly instead of guessing a ceiling - the last wire constant goes.
 - Done when: no reply anywhere depends on fitting one message, big listings stream, tests green.
 - Concept: M26/M34 (the typed codec and its stream support), M64 (the defensive error this replaces with a real mechanism).
 
-## M70 - Contiguous DMA and full-size I/O (queues, sectors, jumbo)
+## M72 - Contiguous DMA and full-size I/O (queues, sectors, jumbo)
 
 The throughput milestone: everything currently sized by "one 4 KiB DMA page" -
 virtqueue rings capped at 16 descriptors, block I/O moving one sector per device
@@ -1166,7 +1191,7 @@ multi-page DMA buffers.
 - [ ] Kernel: physically contiguous multi-page DMA allocation (`dma_buffer_create` for sizes > 4 KiB) - a contiguous-run allocator over the frame pool (the free-list cannot guarantee runs; scan or buddy).
 - [ ] virtio rings: negotiate the DEVICE-reported queue size (the `queue_size` register) instead of hardcoding one - Linux-scale rings (256+) fall out of it, and no constant replaces another.
 - [ ] virtio-blk: one request moves the whole span (header/data/status descriptors over a large data buffer) instead of a per-sector loop, sized by the device's own reported limits (`seg_max`/`size_max`), not a constant.
-- [ ] xHCI mass storage: a multi-page BOT data buffer so one READ(10)/WRITE(10) moves up to 128 KiB (`MAX_SECTORS` 8 -> 256).
+- [ ] xHCI mass storage: a multi-page BOT data buffer so one READ(10)/WRITE(10) moves the whole request (the 8-sector page unit goes; the buffer we allocate is the only unit).
 - [ ] virtio-net: jumbo frame support end to end - buffer size follows the configured MTU (an `ip` knob + what the host link reports), not a compile-time `FRAME_MAX`.
 - [ ] Measure: a before/after throughput number for a large `cat` and a TCP bulk transfer in the perf notes.
 - Done when: bulk disk and network I/O move in large requests, the measured throughput improves accordingly, tests green.

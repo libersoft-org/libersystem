@@ -224,9 +224,9 @@ unsafe fn ping(netsvc: u64, args: &[u8]) {
 	}
 }
 
-// Print the closing statistics block, mirroring Linux's `ping` summary. A leading
-// blank line separates it from the last reply only when we stopped on the count; on
-// Ctrl+C the console already echoed "^C" on its own line, so none is added.
+// Print the closing statistics block. A leading blank line separates it from the last reply
+// only when we stopped on the count; on Ctrl+C the console already echoed "^C" on its own line,
+// so none is added.
 unsafe fn print_summary(target: &[u8], stats: &Stats, start_ns: u64, was_interrupted: bool) {
 	unsafe {
 		let elapsed_ms: u64 = clock_ns().saturating_sub(start_ns) / 1_000_000;

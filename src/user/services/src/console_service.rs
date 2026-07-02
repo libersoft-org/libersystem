@@ -517,7 +517,7 @@ struct Console {
 	// `handle_pointer` turns into SGR mouse reports (for a program that enabled tracking)
 	// or native selection / scrollback / paste (when no program is tracking the mouse).
 	pointer: u64,
-	// The console-held clipboard - the Linux primary selection. A mouse selection copies
+	// The console-held clipboard. A mouse selection copies
 	// into it (select-to-copy), middle-click pastes it, and a program's OSC 52 sets it.
 	clipboard: Vec<u8>,
 	// The pointer button bits from the previous event, to detect press / release edges.
