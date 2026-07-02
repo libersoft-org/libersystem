@@ -55,17 +55,9 @@ impl<D: BlockDevice> LiberFs<D> {
 	// carries the (pointer, CRC32C) of the one after it; published by the commit's
 	// superblock write.
 	pub(crate) fn write_snapshot_table(&mut self) -> Result<(), FsError> {
-		// the rebuilt chain replaces the old one wholesale: drop the old blocks (the raw
-		// walk stops at a pointer outside the pool).
-		let mut old = self.snap_root;
-		let mut buf = vec![0u8; BLOCK_SIZE];
-		while old != 0 && old < self.num_blocks {
-			self.drop_block(old);
-			if !self.dev.read_block(old, &mut buf) {
-				return Err(FsError::Io);
-			}
-			old = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-		}
+		// the rebuilt chain replaces the old one wholesale: drop the old blocks.
+		let old = self.snap_root;
+		self.walk_chain(old, |fs, ptr| fs.drop_block(ptr))?;
 		if self.snapshots.is_empty() {
 			self.snap_root = 0;
 			self.snap_root_crc = 0;
@@ -177,10 +169,12 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Only the touched blocks are rewritten (each copied up to a fresh block), the rest
 	// of the file is left in place, and the change commits atomically.
 	pub fn write_at(&mut self, path: &[u8], offset: u64, data: &[u8]) -> Result<(), FsError> {
-		self.mutate(|fs| fs.write_at_inner(path, offset, data))
+		self.mutate(|fs| fs.write_at_inner(path, Some(offset), data))
 	}
 
-	pub(crate) fn write_at_inner(&mut self, path: &[u8], offset: u64, data: &[u8]) -> Result<(), FsError> {
+	// The body behind `write_at` and `append`: `offset` of None means "the current end
+	// of the file", so append resolves the path once, here, instead of twice.
+	pub(crate) fn write_at_inner(&mut self, path: &[u8], offset: Option<u64>, data: &[u8]) -> Result<(), FsError> {
 		let (parent, name) = self.resolve_parent(path, true)?;
 		let inode_num = match self.dir_lookup(parent, name)? {
 			Some(num) => {
@@ -200,6 +194,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 		};
 		let mut inode = self.read_inode(inode_num)?;
+		let offset = offset.unwrap_or(inode.size);
 		if !data.is_empty() {
 			let start = offset;
 			let end = offset + data.len() as u64;
@@ -212,9 +207,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				// a full-block overwrite needs no read; a partial one preserves whatever
 				// is there (zeros for a hole or a block past the old end).
 				if full || !self.read_logical(&inode, lb, &mut buf)? {
-					for b in buf.iter_mut() {
-						*b = 0;
-					}
+					buf.fill(0);
 				}
 				let copy_start = start.max(block_start);
 				let copy_end = end.min(block_start + BLOCK_SIZE as u64);
@@ -235,16 +228,7 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Append `data` to the end of the file at `path` (creating it if needed).
 	pub fn append(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
-		self.mutate(|fs| fs.append_inner(path, data))
-	}
-
-	pub(crate) fn append_inner(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
-		let size = match self.resolve(path) {
-			Ok(num) => self.read_inode(num)?.size,
-			Err(FsError::NotFound) => 0,
-			Err(e) => return Err(e),
-		};
-		self.write_at_inner(path, size, data)
+		self.mutate(|fs| fs.write_at_inner(path, None, data))
 	}
 
 	// Resize the file at `path` to `new_len`: shrinking drops the blocks past the new
@@ -270,9 +254,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				let lb = (new_len / BLOCK_SIZE as u64) as usize;
 				let mut buf = vec![0u8; BLOCK_SIZE];
 				if self.read_logical(&inode, lb, &mut buf)? {
-					for b in buf[tail..].iter_mut() {
-						*b = 0;
-					}
+					buf[tail..].fill(0);
 					// rewriting the block refreshes its stored checksum too.
 					self.write_logical(&mut inode, lb, &buf)?;
 				}

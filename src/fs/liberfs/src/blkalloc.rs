@@ -111,6 +111,9 @@ impl<D: BlockDevice> LiberFs<D> {
 	// front (fresh, so an abort releases it). No-op when no contiguous run exists - the
 	// write falls back to per-block allocation.
 	pub(crate) fn reserve_run(&mut self, len: usize) {
+		// the run count is stored as u32: clamp an absurd reservation (a single write
+		// past 16 TiB) rather than silently truncating the claim/release accounting.
+		let len = len.min(u32::MAX as usize);
 		if len < 2 || self.run.is_some() {
 			return;
 		}
@@ -211,6 +214,24 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 	}
 
+	// Walk a chain of blocks (the shared CHAIN_* header) from `start`, calling `f` with
+	// each block's pointer before following its next pointer. The walk is raw (no CRC
+	// check, matching the old-generation walks) and stops at a pointer outside the
+	// pool, so a corrupt link never panics the walker or wanders into garbage. The one
+	// skeleton behind dropping, marking, and releasing every chain.
+	pub(crate) fn walk_chain(&mut self, start: u64, mut f: impl FnMut(&mut Self, u64)) -> Result<(), FsError> {
+		let mut ptr = start;
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		while ptr != 0 && ptr < self.num_blocks {
+			f(self, ptr);
+			if !self.dev.read_block(ptr, &mut buf) {
+				return Err(FsError::Io);
+			}
+			ptr = u64::from_le_bytes(buf[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].try_into().unwrap());
+		}
+		Ok(())
+	}
+
 	// Drop every block a file inode references: each run's stored blocks and its
 	// checksum block, plus the extent overflow chain. The complement of
 	// `collect_inode_blocks`, for a file being deleted or wholly replaced. The extent
@@ -223,16 +244,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			self.drop_block(ext.csum);
 		}
-		let mut ptr = inode.spill;
-		let mut buf = vec![0u8; BLOCK_SIZE];
-		while ptr != 0 && ptr < self.num_blocks {
-			self.drop_block(ptr);
-			if !self.dev.read_block(ptr, &mut buf) {
-				return Err(FsError::Io);
-			}
-			ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-		}
-		Ok(())
+		self.walk_chain(inode.spill, |fs, ptr| fs.drop_block(ptr))
 	}
 
 	// Copy-on-write a block reference. A pointer this transaction already allocated is
@@ -265,10 +277,6 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		self.drop_block(ptr);
 		Ok(fresh)
-	}
-
-	pub(crate) fn cow_data(&mut self, ptr: u64) -> Result<u64, FsError> {
-		self.cow_block(ptr, false)
 	}
 
 	pub(crate) fn cow_meta(&mut self, ptr: u64) -> Result<u64, FsError> {
@@ -374,9 +382,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			let data = &self.decomp.as_ref().unwrap().1;
 			let start = (lb - ext.logical) as usize * BLOCK_SIZE;
-			for b in buf.iter_mut() {
-				*b = 0;
-			}
+			buf.fill(0);
 			if start < data.len() {
 				let end = (start + BLOCK_SIZE).min(data.len());
 				buf[..end - start].copy_from_slice(&data[start..end]);
@@ -395,10 +401,12 @@ impl<D: BlockDevice> LiberFs<D> {
 	}
 
 	// Write `buf` as logical block `logical` of `inode`, updating the extent map in
-	// memory and recording the block's checksum. Overwriting a mapped block copies it
-	// up (and may split its run); writing a hole appends to the run before it when the
-	// new block is physically contiguous, otherwise starts a new run. The caller
-	// persists the inode, which flushes the map to disk.
+	// memory and recording the block's checksum. Overwriting a mapped block replaces it
+	// with a fresh one (never copying the old contents - `buf` is always a whole block,
+	// so a copy would be overwritten immediately; a block already fresh this transaction
+	// is rewritten in place) and may split its run; writing a hole appends to the run
+	// before it when the new block is physically contiguous, otherwise starts a new run.
+	// The caller persists the inode, which flushes the map to disk.
 	pub(crate) fn write_logical(&mut self, inode: &mut Inode, logical: usize, buf: &[u8]) -> Result<(), FsError> {
 		let lb = logical as u64;
 		// a compressed run cannot be edited in place: thaw it back to raw blocks first, so
@@ -412,7 +420,17 @@ impl<D: BlockDevice> LiberFs<D> {
 		if let Some(i) = find_extent(&inode.extents, lb) {
 			let ext = inode.extents[i];
 			let off = (lb - ext.logical) as usize;
-			let new_phys = self.cow_data(ext.physical + off as u64)?;
+			let old = ext.physical + off as u64;
+			// a fresh block is rewritten in place; a committed one is replaced by a
+			// fresh allocation and recorded dropped - the whole block is about to be
+			// written, so copying the old contents up would be wasted device work.
+			let new_phys = if self.fresh.contains(&old) {
+				old
+			} else {
+				let fresh = self.alloc_data()?;
+				self.drop_block(old);
+				fresh
+			};
 			if !self.dev.write_block(new_phys, buf) {
 				return Err(FsError::Io);
 			}
@@ -447,10 +465,13 @@ impl<D: BlockDevice> LiberFs<D> {
 		let csum = self.alloc_meta()?;
 		let mut cbuf = vec![0u8; BLOCK_SIZE];
 		cbuf[0..4].copy_from_slice(&crc.to_le_bytes());
-		if !self.dev.write_block(csum, &cbuf) {
-			return Err(FsError::Io);
-		}
-		inode.extents.insert(pos, Extent { logical: lb, physical: phys, length: 1, csum, csum_crc: crc32c(&cbuf), store_len: 1, clen: 0 });
+		let csum_crc = crc32c(&cbuf);
+		// seed the in-flight write cache instead of writing the device: the run's next
+		// blocks edit this same checksum block, and the flush (eviction or commit)
+		// writes it once.
+		self.flush_wcsum()?;
+		self.wcsum = Some((csum, cbuf));
+		inode.extents.insert(pos, Extent { logical: lb, physical: phys, length: 1, csum, csum_crc, store_len: 1, clen: 0 });
 		Ok(())
 	}
 
@@ -526,9 +547,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.drop_block(ext.csum);
 		let mut blk = vec![0u8; BLOCK_SIZE];
 		for lo in 0..ext.length as usize {
-			for b in blk.iter_mut() {
-				*b = 0;
-			}
+			blk.fill(0);
 			let start = lo * BLOCK_SIZE;
 			if start < decoded.len() {
 				let end = (start + BLOCK_SIZE).min(decoded.len());
@@ -567,7 +586,10 @@ impl<D: BlockDevice> LiberFs<D> {
 				return Err(FsError::Corrupt);
 			}
 		}
-		Ok(lz_decompress(&comp[..ext.clen as usize]))
+		// clen is CRC-protected with the extent record, but bound it defensively anyway:
+		// a slice past the stored bytes must never panic.
+		let clen = (ext.clen as usize).min(comp.len());
+		Ok(lz_decompress(&comp[..clen]))
 	}
 
 	// Try to transparently compress each of a freshly written file's raw extents in
@@ -632,9 +654,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut blk = vec![0u8; BLOCK_SIZE];
 		let mut cbuf = vec![0u8; BLOCK_SIZE];
 		for s in 0..store_len {
-			for b in blk.iter_mut() {
-				*b = 0;
-			}
+			blk.fill(0);
 			let start = s * BLOCK_SIZE;
 			let end = (start + BLOCK_SIZE).min(comp.len());
 			blk[..end - start].copy_from_slice(&comp[start..end]);

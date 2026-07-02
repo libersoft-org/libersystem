@@ -6,10 +6,17 @@ impl<D: BlockDevice> LiberFs<D> {
 	// reclaim; what fsck does is walk the live namespace, check every file's data
 	// blocks against their stored checksums, and NAME the damaged files - a count
 	// alone would leave the operator knowing something is wrong but not what. The
-	// pinned snapshot generations are verified too (counted; their files are named
-	// under the snapshot's own mount, not here). The free map is also rederived,
-	// which is a no-op on a consistent volume.
+	// pinned snapshot generations are verified too - inode trees, directory trees and
+	// file data (counted; their files are named under the snapshot's own mount, not
+	// here). The free map is also rederived, which is a no-op on a consistent volume.
 	pub fn fsck(&mut self) -> Result<FsckReport, FsError> {
+		// verify the DISK, not the caches: a cached inode would skip its tree-path and
+		// spill-chain verification, and a cached checksum block its re-read - damage
+		// behind a warm cache would escape the report.
+		self.icache.clear();
+		self.dcache.clear();
+		self.rcsum = None;
+		self.decomp = None;
 		self.derive_free()?;
 		let mut checksum_failures = 0u32;
 		let mut damaged: Vec<Vec<u8>> = Vec::new();
@@ -83,7 +90,9 @@ impl<D: BlockDevice> LiberFs<D> {
 	}
 
 	// Walk the inode B+tree, verifying every node against its stored checksum, and sum
-	// the corrupt data blocks of every live file.
+	// the corrupt data blocks of every live file. Directory inodes get their own tree
+	// walked and verified too, so a snapshot generation's directory damage is caught
+	// here and not only when the snapshot is mounted.
 	pub(crate) fn check_inode_tree(&mut self, ptr: u64, crc: u32) -> Result<u32, FsError> {
 		if ptr == 0 {
 			return Ok(0);
@@ -99,6 +108,8 @@ impl<D: BlockDevice> LiberFs<D> {
 				if inode.kind == KIND_FILE {
 					self.load_spill(&mut inode)?;
 					bad += self.count_corrupt(&inode)?;
+				} else if inode.kind == KIND_DIR {
+					self.check_dir_tree(inode.dir_root, inode.dir_root_crc)?;
 				}
 			}
 		} else {
@@ -107,5 +118,22 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 		}
 		Ok(bad)
+	}
+
+	// Walk a directory B+tree verifying every node against the CRC32C its parent link
+	// stored; damage surfaces as FsError::Corrupt.
+	pub(crate) fn check_dir_tree(&mut self, ptr: u64, crc: u32) -> Result<(), FsError> {
+		if ptr == 0 {
+			return Ok(());
+		}
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		self.read_node(ptr, crc, &mut buf)?;
+		if node_type(&buf) == NODE_INTERNAL {
+			let count = node_count(&buf);
+			for i in 0..=count {
+				self.check_dir_tree(child_ptr(&buf, i), child_crc(&buf, i))?;
+			}
+		}
+		Ok(())
 	}
 }

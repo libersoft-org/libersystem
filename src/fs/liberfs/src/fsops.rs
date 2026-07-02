@@ -211,9 +211,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		for lb in first..=last {
 			let block_start = lb as u64 * BLOCK_SIZE as u64;
 			if !self.read_logical(inode, lb, &mut buf)? {
-				for b in buf.iter_mut() {
-					*b = 0;
-				}
+				buf.fill(0);
 			}
 			let copy_start = offset.max(block_start);
 			let copy_end = end.min(block_start + BLOCK_SIZE as u64);
@@ -290,17 +288,14 @@ impl<D: BlockDevice> LiberFs<D> {
 		};
 		inode.mtime = self.clock;
 		if let Some((_, o)) = &old {
-			let o = o.clone();
-			self.drop_inode_blocks(&o)?;
+			self.drop_inode_blocks(o)?;
 		}
 		self.reserve_run(inode.nblocks());
 		let mut block = vec![0u8; BLOCK_SIZE];
 		for i in 0..inode.nblocks() {
 			let start = i * BLOCK_SIZE;
 			let end = (start + BLOCK_SIZE).min(data.len());
-			for b in block.iter_mut() {
-				*b = 0;
-			}
+			block.fill(0);
 			block[..end - start].copy_from_slice(&data[start..end]);
 			self.write_logical(&mut inode, i, &block)?;
 		}

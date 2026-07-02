@@ -27,15 +27,17 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 	}
 
-	// Remember inode `num`, evicting an arbitrary entry once the cache is full and
-	// skipping a pathologically fragmented extent map (the cache only skips re-reads).
+	// Remember inode `num`, evicting the LARGEST cached number once the cache is full
+	// (inode 0 - the root directory, the hottest entry on every path resolution - and
+	// the low, old numbers stay put) and skipping a pathologically fragmented extent
+	// map (the cache only skips re-reads).
 	pub(crate) fn icache_put(&mut self, num: u32, inode: Inode) {
 		if inode.extents.len() > ICACHE_EXTENTS_MAX {
 			self.icache.remove(&num);
 			return;
 		}
 		if self.icache.len() >= ICACHE_MAX && !self.icache.contains_key(&num) {
-			if let Some(k) = self.icache.keys().next().cloned() {
+			if let Some(k) = self.icache.keys().next_back().cloned() {
 				self.icache.remove(&k);
 			}
 		}
@@ -61,7 +63,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			let count = u32::from_le_bytes(buf[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].try_into().unwrap()) as usize;
 			for i in 0..count {
-				let off = EXTENT_HDR + i * EXTENT_SIZE;
+				let off = CHAIN_HDR + i * EXTENT_SIZE;
 				inode.extents.push(Extent::parse(&buf[off..off + EXTENT_SIZE]));
 			}
 			ptr = u64::from_le_bytes(buf[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].try_into().unwrap());
@@ -77,17 +79,8 @@ impl<D: BlockDevice> LiberFs<D> {
 	// (pointer, CRC32C) of the one after it. Always called by `write_inode`, so the
 	// inode slot and chain stay consistent.
 	pub(crate) fn flush_extents(&mut self, inode: &mut Inode) -> Result<(), FsError> {
-		// the rebuilt chain replaces the old one wholesale: drop the old blocks (the raw
-		// walk stops at a pointer outside the pool).
-		let mut old = inode.spill;
-		let mut buf = vec![0u8; BLOCK_SIZE];
-		while old != 0 && old < self.num_blocks {
-			self.drop_block(old);
-			if !self.dev.read_block(old, &mut buf) {
-				return Err(FsError::Io);
-			}
-			old = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-		}
+		// the rebuilt chain replaces the old one wholesale: drop the old blocks.
+		self.walk_chain(inode.spill, |fs, ptr| fs.drop_block(ptr))?;
 		inode.extent_count = inode.extents.len() as u32;
 		if inode.extents.len() <= EXTENTS_INLINE {
 			inode.spill = 0;
@@ -104,7 +97,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			buf[CHAIN_CRC_OFF..CHAIN_CRC_OFF + 4].copy_from_slice(&next_crc.to_le_bytes());
 			buf[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
 			for (i, ext) in chunk.iter().enumerate() {
-				let off = EXTENT_HDR + i * EXTENT_SIZE;
+				let off = CHAIN_HDR + i * EXTENT_SIZE;
 				ext.write(&mut buf[off..off + EXTENT_SIZE]);
 			}
 			if !self.dev.write_block(blk, &buf) {

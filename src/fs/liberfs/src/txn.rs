@@ -332,10 +332,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				return Ok(None);
 			}
 			// internal: route to the child whose range holds `key`.
-			let mut ci = 0;
-			while ci < count && sep_key(&buf, ci) <= key {
-				ci += 1;
-			}
+			let ci = route_child(&buf, count, key);
 			ptr = child_ptr(&buf, ci);
 			crc = child_crc(&buf, ci);
 		}
@@ -515,10 +512,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(Ins::Split(left_dest, lcrc, sep, right_dest, rcrc));
 		}
 		// internal: route to a child and recurse; the shared absorber takes the outcome.
-		let mut ci = 0;
-		while ci < count && sep_key(&buf, ci) <= key {
-			ci += 1;
-		}
+		let ci = route_child(&buf, count, key);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
 		let outcome = self.tree_insert_node(cp, cc, key, record, rec, leaf_max, keylen)?;
@@ -635,10 +629,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(Del::Updated(dest, ncrc));
 		}
 		// internal: route and recurse; the shared absorber takes the outcome.
-		let mut ci = 0;
-		while ci < count && sep_key(&buf, ci) <= key {
-			ci += 1;
-		}
+		let ci = route_child(&buf, count, key);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
 		let outcome = self.tree_delete_node(cp, cc, key, probe, rec, keylen)?;
@@ -657,9 +648,7 @@ pub(crate) fn node_count(buf: &[u8]) -> usize {
 }
 
 pub(crate) fn node_set_header(buf: &mut [u8], typ: u8, count: usize) {
-	for b in buf[..NODE_HDR].iter_mut() {
-		*b = 0;
-	}
+	buf[..NODE_HDR].fill(0);
 	buf[0] = typ;
 	buf[2..4].copy_from_slice(&(count as u16).to_le_bytes());
 }
@@ -692,6 +681,17 @@ pub(crate) fn set_child(buf: &mut [u8], i: usize, ptr: u64, crc: u32) {
 	let off = INTERNAL_CHILD_BASE + i * CHILD_SIZE;
 	buf[off..off + 8].copy_from_slice(&ptr.to_le_bytes());
 	buf[off + 8..off + 12].copy_from_slice(&crc.to_le_bytes());
+}
+
+// Internal-node routing: the index of the child whose key range holds `key` (child i
+// holds keys below separator i, child i + 1 keys at or above it). One helper, so the
+// two trees' lookup/insert/delete share the rule instead of copying the loop.
+pub(crate) fn route_child(buf: &[u8], count: usize, key: u64) -> usize {
+	let mut ci = 0;
+	while ci < count && sep_key(buf, ci) <= key {
+		ci += 1;
+	}
+	ci
 }
 
 // Compare two leaf keys: the leading u64 numerically (so leaf order matches the numeric

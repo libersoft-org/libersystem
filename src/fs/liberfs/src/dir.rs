@@ -71,11 +71,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 	}
 
-	// Remember (directory, name) -> child, evicting an arbitrary entry once the cache
-	// is full (plain bounded eviction; the cache only skips re-reads).
+	// Remember (directory, name) -> child, evicting the LARGEST key once the cache is
+	// full (the root directory's entries - directory 0, the hottest - stay put; plain
+	// bounded eviction, the cache only skips re-reads).
 	pub(crate) fn dcache_put(&mut self, dir_num: u32, name: &[u8], child: u32) {
 		if self.dcache.len() >= DCACHE_MAX {
-			if let Some(k) = self.dcache.keys().next().cloned() {
+			if let Some(k) = self.dcache.keys().next_back().cloned() {
 				self.dcache.remove(&k);
 			}
 		}
@@ -176,10 +177,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				});
 			}
 			let count = node_count(&buf);
-			let mut ci = 0;
-			while ci < count && sep_key(&buf, ci) <= hash {
-				ci += 1;
-			}
+			let ci = route_child(&buf, count, hash);
 			ptr = child_ptr(&buf, ci);
 			crc = child_crc(&buf, ci);
 		}
@@ -228,10 +226,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(Ins::Split(left_dest, lcrc, recs[split].hash, right_dest, rcrc));
 		}
 		let count = node_count(&buf);
-		let mut ci = 0;
-		while ci < count && sep_key(&buf, ci) <= hash {
-			ci += 1;
-		}
+		let ci = route_child(&buf, count, hash);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
 		let outcome = self.dir_insert_node(cp, cc, name, child)?;
@@ -275,10 +270,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(Del::Updated(dest, ncrc));
 		}
 		let count = node_count(&buf);
-		let mut ci = 0;
-		while ci < count && sep_key(&buf, ci) <= hash {
-			ci += 1;
-		}
+		let ci = route_child(&buf, count, hash);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
 		let outcome = self.dir_delete_node(cp, cc, name)?;
@@ -368,16 +360,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				set_bit(bitmap, ext.csum);
 			}
 		}
-		let mut ptr = inode.spill;
-		let mut buf = vec![0u8; BLOCK_SIZE];
-		while ptr != 0 && ptr < self.num_blocks {
-			set_bit(bitmap, ptr);
-			if !self.dev.read_block(ptr, &mut buf) {
-				return Err(FsError::Io);
-			}
-			ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-		}
-		Ok(())
+		self.walk_chain(inode.spill, |_fs, ptr| set_bit(bitmap, ptr))
 	}
 }
 
@@ -419,9 +402,7 @@ pub(crate) fn dir_leaf_size(recs: &[DirRec]) -> usize {
 
 // Serialize `recs` (sorted) into a leaf block, zero-padding the tail.
 pub(crate) fn dir_leaf_write(buf: &mut [u8], recs: &[DirRec]) {
-	for b in buf.iter_mut() {
-		*b = 0;
-	}
+	buf.fill(0);
 	node_set_header(buf, NODE_LEAF, recs.len());
 	let mut off = NODE_HDR;
 	for r in recs {

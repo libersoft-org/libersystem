@@ -71,18 +71,21 @@
 //! a crash can no longer leak blocks or orphan an inode, so `fsck` no longer needs to
 //! reclaim them.
 //!
-//! ## Compression (transparent, per extent)
+//! ## Compression (transparent, per extent, per volume)
 //!
-//! A whole-file write compresses each of its runs with a small, dependency-free LZSS
-//! coder ([`lz_compress`]): a run whose bytes shrink to fewer blocks is stored as a
-//! compressed extent - the compressed stream packed into a contiguous run of stored
-//! blocks, the original block span kept as the extent's logical `length` - while an
-//! incompressible run is left raw. Reads decode the extent transparently, so a file
-//! reads back identically whether or not it compressed. The per-block CRC32C covers the
-//! stored (compressed) bytes, so integrity and `fsck` work unchanged. Editing a
-//! compressed file thaws the touched run back to raw blocks (a later whole-file write
-//! recompresses it), keeping partial writes simple. Compression is a space optimization
-//! only: it never changes a file's contents or the `Storage.Volume` API.
+//! Compression is a per-volume switch carried in the superblock: OFF by default,
+//! chosen at format time and togglable on a live volume; it governs new whole-file
+//! writes only. When it is on, a whole-file write compresses each of its runs with a
+//! dependency-free LZ4 block-format coder ([`lz_compress`]): a run whose bytes shrink
+//! to fewer blocks is stored as a compressed extent - the compressed stream packed
+//! into a contiguous run of stored blocks, the original block span kept as the
+//! extent's logical `length` - while an incompressible run is left raw. Reads decode
+//! the extent transparently, so a file reads back identically whether or not it
+//! compressed. The per-block CRC32C covers the stored (compressed) bytes, so
+//! integrity and `fsck` work unchanged. Editing a compressed file thaws the touched
+//! run back to raw blocks (a later whole-file write recompresses it), keeping partial
+//! writes simple. Compression is a space optimization only: it never changes a file's
+//! contents or the `Storage.Volume` API.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -190,10 +193,9 @@ const EXTENTS_INLINE: usize = (INODE_SIZE - EXTENT_OFF) / EXTENT_SIZE;
 // extent stores at most this many blocks (1024 = 4 MiB) and spans at most that many
 // logical blocks. A longer file is several extents.
 const CRCS_PER_BLOCK: usize = BLOCK_SIZE / 4;
-// An extent-overflow block: an 8-byte next-block pointer, its 4-byte CRC32C, a 4-byte
-// count, then the extent records. (4096 - 16) / 40 = 102 extents per overflow block.
-const EXTENT_HDR: usize = 16;
-const EXTENTS_PER_BLOCK: usize = (BLOCK_SIZE - EXTENT_HDR) / EXTENT_SIZE;
+// An extent-overflow block: the shared chain header (CHAIN_*, below), then the extent
+// records. (4096 - 16) / 40 = 102 extents per overflow block.
+const EXTENTS_PER_BLOCK: usize = (BLOCK_SIZE - CHAIN_HDR) / EXTENT_SIZE;
 
 // Transparent per-extent compression uses a dependency-free LZ4 block-format coder (no
 // external crate, no_std). LZ4 frames data as sequences: a token byte (literal count
@@ -553,9 +555,7 @@ impl Inode {
 	// `spill` / `spill_crc` / `extent_count` fields and the overflow chain are set
 	// beforehand by [`LiberFs::flush_extents`], which `write_inode` always calls first.
 	fn write(&self, buf: &mut [u8]) {
-		for b in buf[..INODE_SIZE].iter_mut() {
-			*b = 0;
-		}
+		buf[..INODE_SIZE].fill(0);
 		buf[INO_KIND_OFF] = self.kind;
 		buf[INO_SIZE_OFF..INO_SIZE_OFF + 8].copy_from_slice(&self.size.to_le_bytes());
 		buf[INO_CTIME_OFF..INO_CTIME_OFF + 8].copy_from_slice(&self.ctime.to_le_bytes());
