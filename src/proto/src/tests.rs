@@ -151,11 +151,7 @@ struct VolStub;
 
 impl volume::Service for VolStub {
 	fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error> {
-		if o.path.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(OpenResult { file: 0xCAFE, size: 42 })
-		}
+		if o.path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
 	}
 
 	fn list(&mut self, _path: String) -> Result<Vec<FileInfo>, Error> {
@@ -165,27 +161,15 @@ impl volume::Service for VolStub {
 	fn write(&mut self, path: String, data: crate::codec::Buffer) -> Result<(), Error> {
 		// the buffer handle must have travelled out-of-band (set_handle -> request_handle
 		// -> take_handle); prove it by succeeding only when it arrives intact.
-		if path.is_empty() || data.handle != 0xBEEF || data.len != 5 {
-			Err(Error::Invalid)
-		} else {
-			Ok(())
-		}
+		if path.is_empty() || data.handle != 0xBEEF || data.len != 5 { Err(Error::Invalid) } else { Ok(()) }
 	}
 
 	fn remove(&mut self, path: String) -> Result<(), Error> {
-		if path.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(())
-		}
+		if path.is_empty() { Err(Error::NotFound) } else { Ok(()) }
 	}
 
 	fn snap_create(&mut self, name: String) -> Result<(), Error> {
-		if name.is_empty() {
-			Err(Error::Invalid)
-		} else {
-			Ok(())
-		}
+		if name.is_empty() { Err(Error::Invalid) } else { Ok(()) }
 	}
 
 	fn snap_list(&mut self) -> Result<Vec<SnapshotInfo>, Error> {
@@ -193,36 +177,20 @@ impl volume::Service for VolStub {
 	}
 
 	fn snap_delete(&mut self, name: String) -> Result<(), Error> {
-		if name.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(())
-		}
+		if name.is_empty() { Err(Error::NotFound) } else { Ok(()) }
 	}
 
 	fn snap_open(&mut self, snapshot: String, path: String) -> Result<OpenResult, Error> {
 		// the file handle must travel out-of-band, exactly like `open`.
-		if snapshot.is_empty() || path.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(OpenResult { file: 0xCAFE, size: 42 })
-		}
+		if snapshot.is_empty() || path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
 	}
 
 	fn mkdir(&mut self, path: String) -> Result<(), Error> {
-		if path.is_empty() {
-			Err(Error::Invalid)
-		} else {
-			Ok(())
-		}
+		if path.is_empty() { Err(Error::Invalid) } else { Ok(()) }
 	}
 
 	fn rmdir(&mut self, path: String) -> Result<(), Error> {
-		if path.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(())
-		}
+		if path.is_empty() { Err(Error::NotFound) } else { Ok(()) }
 	}
 
 	fn capacity(&mut self) -> Result<u64, Error> {
@@ -242,11 +210,7 @@ impl volume::Service for VolStub {
 	}
 
 	fn restore(&mut self, path: String, _snapshot: String) -> Result<(), Error> {
-		if path.is_empty() {
-			Err(Error::NotFound)
-		} else {
-			Ok(())
-		}
+		if path.is_empty() { Err(Error::NotFound) } else { Ok(()) }
 	}
 }
 

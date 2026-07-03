@@ -84,6 +84,8 @@ An opaque kernel object, transferred as `handle<file>`.
 | `name` | `string` |
 | `size` | `u64` |
 | `kind` | `file-kind` |
+| `mtime` | `u64` |
+| `ctime` | `u64` |
 
 ### record `snapshot-info`
 

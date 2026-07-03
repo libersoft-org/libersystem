@@ -117,11 +117,7 @@ fn render_vector(out: &mut String, printed: u64, info: &IrqInfo, json: bool) {
 // The device-type code of the discovered device at `index` (0 = unknown).
 fn owner_type(index: u32) -> u32 {
 	let mut info = DeviceInfo::default();
-	if unsafe { device_info(index as u64, &mut info) } {
-		info.device_type
-	} else {
-		0
-	}
+	if unsafe { device_info(index as u64, &mut info) } { info.device_type } else { 0 }
 }
 
 // Append a decimal number to `out`.

@@ -264,26 +264,28 @@ impl volume::Service for Volume {
 				for index in 0..package.len() {
 					if let Some(name) = package.name(index) {
 						let size: u64 = package.lookup(name).map(|b| b.len()).unwrap_or(0) as u64;
-						files.push(file_info(name, size, false));
+						// the archive format carries no timestamps.
+						files.push(file_info(name, size, false, 0, 0));
 					}
 				}
 				Ok(files)
 			}
 			Volume::Disk(fs) => {
 				let entries = if dir.is_empty() { fs.list() } else { fs.read_dir(dir) }.map_err(map_fs_err)?;
-				Ok(entries.into_iter().map(|(name, size, is_dir)| file_info(&name, size, is_dir)).collect())
+				Ok(entries.into_iter().map(|(name, size, is_dir, mtime, ctime)| file_info(&name, size, is_dir, mtime, ctime)).collect())
 			}
 			Volume::Fat(backing) => {
+				// the foreign backends do not surface timestamps yet: 0 renders as "-".
 				let entries = backing.run(|fs| if dir.is_empty() { fs.list() } else { fs.list_dir(dir) })?;
-				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir)).collect())
+				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
 			}
 			Volume::Iso(fs) => {
 				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_iso_err)?;
-				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir)).collect())
+				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
 			}
 			Volume::Udf(fs) => {
 				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_udf_err)?;
-				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir)).collect())
+				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
 			}
 		}
 	}
@@ -493,8 +495,8 @@ impl Volume {
 }
 
 // Build a listing entry from a raw name, byte length, and whether it is a directory.
-fn file_info(name: &[u8], size: u64, is_dir: bool) -> FileInfo {
-	FileInfo { name: String::from_utf8_lossy(name).into_owned(), size, kind: if is_dir { FileKind::Dir } else { FileKind::File } }
+fn file_info(name: &[u8], size: u64, is_dir: bool, mtime: u64, ctime: u64) -> FileInfo {
+	FileInfo { name: String::from_utf8_lossy(name).into_owned(), size, kind: if is_dir { FileKind::Dir } else { FileKind::File }, mtime, ctime }
 }
 
 // Map an LiberFS error onto the Storage.Volume `error` enum.

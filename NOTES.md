@@ -1,9 +1,5 @@
 # Bugs / changes
 
-- Are snapshots optional or mandatory?
-- after "ls" command console freezes
-- "ls" command orders files and directories randomly - by default - by name, first directories, then files
-- "ls" command should show directories with other color than files and should show size in next column and timestamp of last modification in another column, -h should make size human readable, at the and down there add summary - total directories, total files, total size of files
 - Replace font8x8_latin.bin with something nicer - only one with CC license (!!!)
 - Arrays in .rs files are written in 1 row - make it multiline, so it's better readable
 - Check what is in coreutils package (Debian)

@@ -78,12 +78,16 @@ enum file-kind {
 	dir  = 1,
 }
 
-// One entry in a volume listing: its name, byte length, and whether it is a regular
-// file or a subdirectory (a directory reports a length of zero).
+// One entry in a volume listing: its name, byte length, whether it is a regular
+// file or a subdirectory (a directory reports a length of zero), and its last
+// modification and creation times (u64 seconds since the Unix epoch, UTC; 0 when
+// the backing filesystem does not carry them).
 record file-info {
-	name: string,
-	size: u64,
-	kind: file-kind,
+	name:  string,
+	size:  u64,
+	kind:  file-kind,
+	mtime: u64,
+	ctime: u64,
 }
 
 // One named snapshot of a volume: its name and the generation it pinned, so a client

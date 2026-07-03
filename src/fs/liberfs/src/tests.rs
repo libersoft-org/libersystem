@@ -558,7 +558,11 @@ fn newest_super_slot(dev: &MemDevice) -> u32 {
 		let off = slot as usize * BLOCK_SIZE + 28;
 		u64::from_le_bytes(dev.blocks[off..off + 8].try_into().unwrap())
 	};
-	if generation(1) > generation(0) { 1 } else { 0 }
+	if generation(1) > generation(0) {
+		1
+	} else {
+		0
+	}
 }
 
 #[test]
@@ -1757,7 +1761,11 @@ fn forge_superblock(dev: &mut MemDevice, slot: usize, f: impl FnOnce(&mut [u8]))
 // The slot holding the live (higher) generation in a raw device image.
 fn active_slot(dev: &MemDevice) -> usize {
 	let slot_gen = |s: usize| parse_superblock(&dev.blocks[s * BLOCK_SIZE..(s + 1) * BLOCK_SIZE]).map(|sb| sb.generation);
-	if slot_gen(1) > slot_gen(0) { 1 } else { 0 }
+	if slot_gen(1) > slot_gen(0) {
+		1
+	} else {
+		0
+	}
 }
 
 #[test]
@@ -2055,7 +2063,7 @@ fn a_dangling_entry_is_reported_listable_around_and_removable() {
 	assert!(report.checksum_failures >= 1);
 	assert!(report.damaged.contains(&b"ghost.txt".to_vec()));
 	// ...the directory still lists its healthy entries around it...
-	let names: Vec<Vec<u8>> = fs.list().unwrap().into_iter().map(|(n, _, _)| n).collect();
+	let names: Vec<Vec<u8>> = fs.list().unwrap().into_iter().map(|(n, _, _, _, _)| n).collect();
 	assert!(names.contains(&b"healthy.txt".to_vec()));
 	assert!(!names.contains(&b"ghost.txt".to_vec()));
 	// ...and `remove` clears the name: the repair verb for what fsck named.

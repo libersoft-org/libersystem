@@ -11,7 +11,7 @@
 #![no_std]
 #![no_main]
 
-use proto::system::{time, Timestamp};
+use proto::system::{Timestamp, time};
 use rt::*;
 
 #[unsafe(no_mangle)]

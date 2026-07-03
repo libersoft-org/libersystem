@@ -16,7 +16,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{log, time, Entry, Query, Timestamp};
+use proto::system::{Entry, Query, Timestamp, log, time};
 use rt::*;
 
 #[unsafe(no_mangle)]

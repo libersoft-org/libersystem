@@ -535,6 +535,8 @@ pub struct FileInfo {
 	pub name: String,
 	pub size: u64,
 	pub kind: FileKind,
+	pub mtime: u64,
+	pub ctime: u64,
 }
 
 impl FileInfo {
@@ -555,13 +557,17 @@ impl FileInfo {
 		w.bytes_lp(self.name.as_bytes())?;
 		w.u64(self.size)?;
 		self.kind.write(w)?;
+		w.u64(self.mtime)?;
+		w.u64(self.ctime)?;
 		Some(())
 	}
 	pub(crate) fn read(r: &mut Reader) -> Option<FileInfo> {
 		let name = r.string_lp()?;
 		let size = r.u64()?;
 		let kind = FileKind::read(r)?;
-		Some(FileInfo { name, size, kind })
+		let mtime = r.u64()?;
+		let ctime = r.u64()?;
+		Some(FileInfo { name, size, kind, mtime, ctime })
 	}
 }
 
@@ -6335,6 +6341,12 @@ impl FileInfo {
 		out.push(',');
 		out.push_str("\"kind\":");
 		self.kind.to_json_into(out);
+		out.push(',');
+		out.push_str("\"mtime\":");
+		let _ = write!(out, "{}", self.mtime);
+		out.push(',');
+		out.push_str("\"ctime\":");
+		let _ = write!(out, "{}", self.ctime);
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -6347,16 +6359,26 @@ impl FileInfo {
 		out.push_str(", ");
 		out.push_str("kind=");
 		self.kind.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("mtime=");
+		let _ = write!(out, "{}", self.mtime);
+		out.push_str(", ");
+		out.push_str("ctime=");
+		let _ = write!(out, "{}", self.ctime);
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
 		crate::codec::cbor::text(out, "size");
 		crate::codec::cbor::uint(out, self.size as u64);
 		crate::codec::cbor::text(out, "kind");
 		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "mtime");
+		crate::codec::cbor::uint(out, self.mtime as u64);
+		crate::codec::cbor::text(out, "ctime");
+		crate::codec::cbor::uint(out, self.ctime as u64);
 	}
 }
 
@@ -8598,9 +8620,9 @@ mod compat {
 	}
 	#[test]
 	fn file_info_wire_is_stable() {
-		let sample = FileInfo { name: String::from("x"), size: 7, kind: FileKind::File };
+		let sample = FileInfo { name: String::from("x"), size: 7, kind: FileKind::File, mtime: 7, ctime: 7 };
 		let bytes = sample.encode_vec();
-		let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 0];
+		let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0];
 		assert_eq!(bytes, golden);
 		assert_eq!(FileInfo::decode(&bytes).unwrap(), sample);
 	}

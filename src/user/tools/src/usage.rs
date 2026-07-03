@@ -14,7 +14,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{resources, Budget};
+use proto::system::{Budget, resources};
 use rt::*;
 
 #[unsafe(no_mangle)]
