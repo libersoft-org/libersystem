@@ -3229,6 +3229,55 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 
 #[cfg(test)]
 #[test_case]
+fn a_lying_seed_archive_cannot_kill_the_storage_service() {
+	use alloc::collections::BTreeMap;
+	use object::channel::Channel;
+	use object::rights::Rights;
+
+	// M83: the boot-time seeding path runs exactly on a disk WITHOUT a valid
+	// filesystem - the least trustworthy disk there is. A PKGARCH1 header whose
+	// entry count claims a ~137 GB table used to size the read buffer straight off
+	// the disk's word; the claim must be bounded by the seed region and treated as
+	// "no archive", so the service formats an empty volume and reports in.
+	const CAPACITY: u64 = 64 * 1024 * 1024;
+	let expected_pool: u64 = (CAPACITY - 32768 * 512) / 4096;
+
+	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
+	let mut header = alloc::vec![0u8; 512];
+	header[0..8].copy_from_slice(b"PKGARCH1");
+	header[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+	disk.insert(0, header);
+
+	let (_volume, package) = scenario_packages().expect("boot modules should be present");
+	let elf = package.lookup(b"storage_service").expect("storage_service should be in the init package");
+	let (boot_kernel, boot_user) = Channel::create();
+	let (blk_host, blk_child) = Channel::create();
+	let (serve_server, _serve_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL, 0).expect("the StorageService should load");
+	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
+	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
+
+	let mut online = false;
+	'serve: for _ in 0..100_000 {
+		sched::run_until_idle();
+		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
+		if let Ok(report) = boot_kernel.recv() {
+			assert_eq!(&report.bytes[..], b"StorageService: online", "the service must survive the lying archive");
+			online = true;
+			break 'serve;
+		}
+	}
+	assert!(online, "the service must treat the hostile claim as no archive and report in");
+
+	// the volume formatted normally (empty - nothing was seeded from the "archive").
+	let sb = disk.get(&32768).expect("superblock slot 0 should sit at the factory offset");
+	assert_eq!(&sb[0..8], b"LIBERFS1", "the factory layout should carry the volume");
+	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
+	assert_eq!(num_blocks, expected_pool, "the pool should span the capacity-derived factory region");
+}
+
+#[cfg(test)]
+#[test_case]
 fn ps_live_view_drives_the_terminal_contract() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;

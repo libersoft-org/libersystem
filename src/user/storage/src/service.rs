@@ -812,10 +812,15 @@ fn seed_from_archive(fs: &mut LiberFs<ChannelBlockDevice>, archive: &[u8]) {
 // leaving `block_client` open for the filesystem. The header + entry table may span
 // several sectors now that the program binaries are staged, so the whole archive is read
 // in page-sized (8-sector) chunks - each request moves at most one DMA page. Returns
-// None if the disk holds no archive.
+// None if the disk holds no archive. The header's claims (the entry count, each blob's
+// end) are DISK CONTENT sizing an in-memory buffer, and this path runs exactly on a
+// disk without a valid filesystem - the least trustworthy disk there is: every claim
+// is bounded by the seed region's fixed size (the filesystem starts right past it),
+// and a claim beyond it means "no archive", never an allocation.
 unsafe fn read_seed_archive(block_client: u64) -> Option<Vec<u8>> {
 	unsafe {
 		const PAGE: usize = SECTOR_SIZE * MAX_SECTORS_PER_READ;
+		const SEED_REGION_BYTES: usize = FS_START_SECTOR as usize * SECTOR_SIZE;
 		// `total` starts large enough to reach the entry count, grows to cover the whole
 		// entry table, then becomes the end of the last blob.
 		let mut archive: Vec<u8> = Vec::new();
@@ -838,12 +843,16 @@ unsafe fn read_seed_archive(block_client: u64) -> Option<Vec<u8>> {
 					return None;
 				}
 				let count: usize = u32::from_le_bytes([archive[8], archive[9], archive[10], archive[11]]) as usize;
-				table_end = PKG_HEADER_LEN + PKG_ENTRY_LEN * count;
+				let claimed: usize = PKG_HEADER_LEN + PKG_ENTRY_LEN * count;
+				if claimed > SEED_REGION_BYTES {
+					return None;
+				}
+				table_end = claimed;
 				total = table_end;
 			}
 			if total == table_end && filled >= table_end {
 				// the whole entry table is in memory: the archive's total size is the end of
-				// its last blob.
+				// its last blob - bounded by the seed region like every other claim.
 				let count: usize = (table_end - PKG_HEADER_LEN) / PKG_ENTRY_LEN;
 				let mut end: usize = table_end;
 				let mut i: usize = 0;
@@ -855,6 +864,9 @@ unsafe fn read_seed_archive(block_client: u64) -> Option<Vec<u8>> {
 						end = off + size;
 					}
 					i += 1;
+				}
+				if end > SEED_REGION_BYTES {
+					return None;
 				}
 				total = end;
 			}
