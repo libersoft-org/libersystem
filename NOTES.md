@@ -1,15 +1,21 @@
 # Bugs / changes
 
-- Check what is in coreutils package (Debian)
-- After bootup, in shell it automatically presses enter after a few seconds - why?
+- Console cursor is not blinking, it's static
+- lsvol, lsblk etc. (many other commands where possible) --json is not working - make it working
+- lsvol should show file system on volume
+- lsblk is showing the type of block device (virtio-blk), mountpoint (vol://...) and size, but not the name of the device in device tree... also there should be table headers (device, type, volume, size)
+- Selecting something from console by mouse is lagging a lot... the whole console lags a lot even when paging (shift + pg up/down)
+- Console does not autocomplete by tab key as on Linux - it should autocomplete commands and local files (like cat ./mot -> should complete cat ./motd.txt)
+- Where is vol://system/ physically stored? On ram disk or hard disk?
 - Where are system tools stored? When I enter "ls" in vol://system/, I can see just 2 .txt files
-- Remove "Hello from the OS ramdisk!" after start and add 1 empty line before userspace (before MOTD)
-- Remove "help" command, instead double tab should show the list of commands (the same as on Linux)
 - Is our shell a separated binary (like on Linux - bash, dash, fish etc.)?
+- commands.rs shows up the list of builtin shell commands - some of them should be separated binaries
 - Add commands for listing hw resources - lsblk, lspci etc.
 - Search for big source code files, sort them by number of lines, create a plan to atomize them
-- GPU driver keeps failing probably (screen sometimes blinking after few minutes - probably restartind driver or something)
+- GPU driver keeps failing probably (screen sometimes blinking after few minutes - probably restarting driver or something)
 - "exit" command should not halt the machine, but just exits the shell and shows up the parent shell (shell that started this console). If there is no parent, just reload the whole shell
+- "exit" command gracefully stops everything and then halts, but poweroff doesn't... do the same gracefullness for poweroff
+- Check what is in coreutils package (Debian)
 
 # New features
 

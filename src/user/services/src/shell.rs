@@ -1,8 +1,7 @@
 // shell - the userspace command shell (the last component up in the boot chain).
 //
 // ServiceManager starts this program and hands it the StorageService client
-// channel. The shell first proves the service round-trip works by reading a file
-// (`cat`), then reports in and becomes the system's interactive console: it
+// channel. The shell reports in and becomes the system's interactive console: it
 // registers a channel the kernel feeds keystrokes to (the kernel owns the serial
 // UART until a virtio-console driver exists), runs a read-eval-print loop over it,
 // and drives the services over IPC. This is the phase-0 kernel CLI moved into a
@@ -16,11 +15,13 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::path;
-use proto::system::{Component, EnvVar, JobEntry, JobInfo, OpenOpts, TraceSpan, input, network, permission, process, session, system_graph, volume};
+use proto::system::{input, network, permission, process, session, system_graph, volume, Component, EnvVar, JobEntry, JobInfo, TraceSpan};
 use rt::*;
 
-// the file the shell reads at startup to prove the StorageService round-trip works
-const SELF_CHECK_URI: &[u8] = b"vol://system/hello.txt";
+// The shell's builtins, shared with ConsoleService's line discipline: Tab completes the
+// command word over the builtins plus the live bin/ listing, and the shell prints the
+// matches on a double Tab - the way bash completes its builtins plus $PATH.
+mod commands;
 
 // the working directory the shell starts in - the persistent system volume, so the
 // prompt sits in real storage and relative paths resolve against it
@@ -99,18 +100,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// consumes it when present (keeping the handshake order) and closes it.
 	unsafe { drop_client(bootstrap, &mut buf, b"ADMIN") };
 
-	// 2. self-check: prove the StorageService round-trip works by reading a file.
-	if !unsafe { cat(storage, SELF_CHECK_URI) } {
-		exit();
-	}
-
-	// 3. report in once the service round-trip has succeeded.
+	// 2. report in.
 	unsafe {
 		send_blocking(bootstrap, b"Shell: online", 0);
 	}
 
-	// 4. greet the operator with the product banner (the message of the day), then
-	//    become the interactive console and run the read-eval-print loop.
+	// 3. greet the operator with the product banner (the message of the day) - one blank
+	//    line first, separating userspace from the kernel's boot log - then become the
+	//    interactive console and run the read-eval-print loop.
+	unsafe {
+		print(b"\n");
+	}
 	print_motd();
 	unsafe {
 		repl(console, control, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session);
@@ -218,6 +218,38 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			if n == 0 {
 				print(b"\n");
 				return;
+			}
+			// A line led by a tab is the line discipline's completion request (a cooked
+			// line can never contain one): the bytes after the marker are the partial
+			// command word. Print the matching commands - the builtins plus the live
+			// bin/ listing, the way bash lists builtins plus $PATH - and re-draw the
+			// prompt with the partial line (the discipline kept its buffer, so typing
+			// continues in place).
+			if line_buf[0] == b'\t' {
+				let partial: &[u8] = &line_buf[1..n];
+				print(b"\n");
+				let mut names: Vec<Vec<u8>> = bin_names(storage);
+				for &builtin in commands::BUILTINS {
+					names.push(builtin.as_bytes().to_vec());
+				}
+				names.sort();
+				names.dedup();
+				let mut listing: Vec<u8> = Vec::new();
+				for name in &names {
+					if name.starts_with(partial) {
+						if !listing.is_empty() {
+							listing.extend_from_slice(b"  ");
+						}
+						listing.extend_from_slice(name);
+					}
+				}
+				listing.push(b'\n');
+				print(&listing);
+				print(b"\x1b[1;32m");
+				print(cwd.as_bytes());
+				print(b"> \x1b[0m");
+				print(partial);
+				continue;
 			}
 			// The terminal delivers a whole submitted line (with a trailing newline); trim
 			// it, expand any `$NAME` / `${NAME}` against the environment, then dispatch it,
@@ -743,78 +775,6 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			print(b"poweroff: failed\n");
 			return false;
 		}
-		if line == b"help" {
-			print(b"commands:\n");
-			print(b"  help             show this help\n");
-			print(b"  clear            clear the screen\n");
-			print(b"  size             show the terminal size (cols x rows)\n");
-			print(b"  resize <c> <r>   resize the terminal to c cols x r rows\n");
-			print(b"  echo <text>      print text\n");
-			print(b"  readln           read stdin and echo each line (Ctrl+D to end)\n");
-			print(b"  NAME=VALUE       set a shell variable ($NAME expands it)\n");
-			print(b"  env              list the environment variables\n");
-			print(b"  unset <name>     remove a shell variable\n");
-			print(b"  cat <vol://...>  read a file via StorageService\n");
-			print(b"  lsvol            list the available volumes via StorageService\n");
-			print(b"  cd [<path>]      change the working directory (no argument returns home)\n");
-			print(b"  ls [<path>]      list a directory's entries (the working directory by default)\n");
-			print(b"  write <vol://...> <text>  create or overwrite a file via StorageService\n");
-			print(b"  rm <vol://...>   delete a file via StorageService\n");
-			print(b"  mkdir <vol://...>  create a directory via StorageService\n");
-			print(b"  rmdir <vol://...>  remove an empty directory via StorageService\n");
-			print(b"  snap [list]      list the volume's named snapshots via StorageService\n");
-			print(b"  snap create <name>  pin a named read-only snapshot of the volume\n");
-			print(b"  snap delete <name>  delete a named snapshot, releasing its blocks\n");
-			print(b"  snap cat <name> <vol://...>  read a file from a snapshot (an earlier state)\n");
-			print(b"  volume [status]  the system volume's label, size, free space and mount mode\n");
-			print(b"  volume compress on|off  toggle transparent compression for new writes\n");
-			print(b"  volume fsck      verify every live block's checksum, naming damaged files\n");
-			print(b"  volume restore <vol://...> [snapshot]  restore a file from a snapshot\n");
-			print(b"  beep [hz] [ms]   play a tone via AudioService\n");
-			print(b"  mouse            show recent pointer events via InputService\n");
-			print(b"  script [<cmd>]   run a command in a fresh pty-hosted shell and record it\n");
-			print(b"  log [json]       show the system journal via LogService\n");
-			print(b"  log tail [json]  stream the journal via LogService (sub-channel)\n");
-			print(b"  lsdev [json]     list devices via DeviceService\n");
-			print(b"  graph [json|cbor]  show the live system graph and counters via SystemGraphService\n");
-			print(b"  perm [json]      show the permission audit trail via PermissionManager\n");
-			print(b"  usage [json]     show per-Domain resource budgets via ResourceManager\n");
-			print(b"  uname            print the system name, version and architecture\n");
-			print(b"  uptime           print the time since boot\n");
-			print(b"  dmesg            print the kernel boot log\n");
-			print(b"  lscpu [json]     print the CPU inventory (core count, LAPIC ids)\n");
-			print(b"  free [-h]        print the memory totals (physical frames, kernel heap)\n");
-			print(b"  lsmem [json]     print the physical memory map\n");
-			print(b"  lsirq [json]     print the device-interrupt vectors in use\n");
-			print(b"  lspci [json]     list the PCI bus functions\n");
-			print(b"  lssvc [json] [prefix]  list system services and their state via ServiceManager\n");
-			print(b"  lsblk [json]     list block devices and their volumes via StorageService\n");
-			print(b"  lsusb [json]     list USB devices via the xHCI driver\n");
-			print(b"  stop <service>   stop a service and its dependents via ServiceManager\n");
-			print(b"  ps [-i]          list started processes via ProcessService (-i: live view, q quits)\n");
-			print(b"  run <name>       start a program via ProcessService\n");
-			print(b"  config [<key>]   list the config tree or read one key via ConfigService\n");
-			print(b"  set <key> <val>  write a config key via ConfigService\n");
-			print(b"  ip | net         show the network interface and ARP cache\n");
-			print(b"  ping [-c n] [--json] <host>  ICMP echo a host (name or address); --json emits a JSON document\n");
-			print(b"  nslookup <name>  resolve a name to an address via DNS\n");
-			print(b"  tcp <ip> <port>  open a TCP connection and probe it (HTTP GET)\n");
-			print(b"  nc <ip> <port>   open a raw TCP connection (optional request to send)\n");
-			print(b"  arp              show the ARP / neighbor cache\n");
-			print(b"  ss | netstat     list the live sockets\n");
-			print(b"  httpd            serve HTTP on port 80 (background)\n");
-			print(b"  <cmd> &          run a command in the background\n");
-			print(b"  jobs             list background / stopped jobs\n");
-			print(b"  fg [id]          resume a job in the foreground\n");
-			print(b"  bg [id]          resume a stopped job in the background\n");
-			print(b"  Ctrl+C / Ctrl+Z  interrupt / suspend the foreground job\n");
-			print(b"  Ctrl+\\           terminate the foreground job\n");
-			print(b"  Ctrl+D           end input (log out) at an empty prompt\n");
-			print(b"  reboot           reboot the machine\n");
-			print(b"  poweroff         power the machine off\n");
-			print(b"  exit             stop the shell and halt\n");
-			return false;
-		}
 		if line == b"clear" {
 			// ED (erase the whole display) + CUP (home the cursor) - the console's
 			// cell-buffer terminal interprets these the same as any VT100 terminal.
@@ -1203,7 +1163,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		}
 		print(b"\x1b[31munknown command: ");
 		print(line);
-		print(b" (try 'help')\x1b[0m\n");
+		print(b" (Tab Tab lists the commands)\x1b[0m\n");
 		false
 	}
 }
@@ -1297,7 +1257,11 @@ unsafe fn send_stdout(parent: u64, interactive: bool) {
 		let rights: u32 = if interactive { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_TRANSFER } else { RIGHT_SEND | RIGHT_TRANSFER };
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, rights);
-			if d > 0 { d as u64 } else { 0 }
+			if d > 0 {
+				d as u64
+			} else {
+				0
+			}
 		} else {
 			0
 		};
@@ -1576,33 +1540,13 @@ fn trim(mut s: &[u8]) -> &[u8] {
 	s
 }
 
-// Open `uri` through the StorageService channel `storage` over the generated volume
-// client, map the returned shared buffer, print its bytes to the console, and
-// release it. Returns true on success.
-unsafe fn cat(storage: u64, uri: &[u8]) -> bool {
-	unsafe {
-		let opts: OpenOpts = OpenOpts { path: alloc::string::String::from_utf8_lossy(uri).into_owned(), write: false, create: false };
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
-		let result = match client.open(&opts) {
-			Some(Ok(r)) => r,
-			_ => return false,
-		};
-		if result.file == 0 || result.size == 0 {
-			return false;
-		}
-		// map the shared buffer, print the file, then release it.
-		let mapped: u64 = match map_object(result.file) {
-			Some(base) => base,
-			None => return false,
-		};
-		let contents: &[u8] = core::slice::from_raw_parts(mapped as *const u8, result.size as usize);
-		print(contents);
-		if contents.last() != Some(&b'\n') {
-			print(b"\n");
-		}
-		unmap_object(result.file);
-		close(result.file);
-		true
+// The names in the system volume's bin/ - the pool of runnable programs Tab completion
+// offers alongside the builtins (the $PATH analogue). Empty when storage is unreachable.
+fn bin_names(storage: u64) -> Vec<Vec<u8>> {
+	let mut client = volume::Client::new(ChannelTransport { chan: storage });
+	match client.list("vol://system/bin") {
+		Some(Ok(files)) => files.into_iter().map(|f| f.name.into_bytes()).collect(),
+		_ => Vec::new(),
 	}
 }
 

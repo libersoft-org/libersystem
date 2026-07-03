@@ -19,6 +19,10 @@ use rt::*;
 
 use proto::system::{network, process};
 
+// The shell's command vocabulary, shared with the shell itself: the line discipline
+// completes the command word on Tab, and the shell prints the matches on a double Tab.
+mod commands;
+
 extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -28,7 +32,7 @@ use alloc::vec::Vec;
 // display `Surface`. This service supplies the userspace display backends - the boot
 // framebuffer and the virtio-gpu shared backing - and drives `Term`; the kernel boot
 // console shares the same `Term`.
-use term::{CELL_H, CELL_W, Geometry, Raster, RawSink, Surface, Term};
+use term::{Geometry, Raster, RawSink, Surface, Term, CELL_H, CELL_W};
 
 // The boot framebuffer the kernel maps directly: its pixel writes are visible immediately,
 // so present is a no-op. The fallback display (and the deterministic test path).
@@ -66,7 +70,11 @@ impl Surface for GpuSurface {
 // channel is given (it presents on FLUSH), else the boot framebuffer (present is a no-op).
 fn make_surface(addr: u64, fb: &Framebuffer, gpu: u64) -> Box<dyn Surface> {
 	let raster = Raster::new(addr, &geometry(fb));
-	if gpu != 0 { Box::new(GpuSurface { raster, gpu }) } else { Box::new(BootSurface { raster }) }
+	if gpu != 0 {
+		Box::new(GpuSurface { raster, gpu })
+	} else {
+		Box::new(BootSurface { raster })
+	}
 }
 
 // The renderer's `Geometry` for a mapped ABI `Framebuffer`: the pixel format the display
@@ -159,16 +167,26 @@ struct Ld {
 	// set when Ctrl+D ends input on an empty line: feed_key delivers a zero-byte read
 	// (EOF) to the program instead of a line.
 	eof: bool,
+	// whether the previous keystroke was a Tab, so a second one asks for the listing.
+	last_tab: bool,
+	// set when a double Tab found several completions: feed_key delivers the unfinished
+	// line to the program marked with a leading tab (which a cooked line can never
+	// contain), the program prints the matches and re-draws the prompt, and the buffer
+	// stays intact so typing continues in place.
+	relist: bool,
 }
 
 impl Ld {
 	fn new() -> Ld {
-		Ld { line: [0u8; LD_LINE_MAX], len: 0, cursor: 0, history: Vec::new(), hist_pos: 0, esc: 0, csi_param: 0, cooked: true, echo: true, eof: false }
+		Ld { line: [0u8; LD_LINE_MAX], len: 0, cursor: 0, history: Vec::new(), hist_pos: 0, esc: 0, csi_param: 0, cooked: true, echo: true, eof: false, last_tab: false, relist: false }
 	}
 
-	// Feed one cooked-mode keystroke. Returns true when the line was submitted (Enter, the
+	// Feed one cooked-mode keystroke (`vocab` is the Tab-completion vocabulary). Returns
+	// true when the line was submitted (Enter, the
 	// Ctrl+C cancel, or Ctrl+D); on a Ctrl+D EOF `self.eof` is set and the line is empty.
-	fn feed(&mut self, b: u8, e: &mut Echo) -> bool {
+	fn feed(&mut self, b: u8, vocab: &[Vec<u8>], e: &mut Echo) -> bool {
+		let again: bool = self.last_tab;
+		self.last_tab = false;
 		match self.esc {
 			1 => {
 				self.esc = if b == b'[' { 2 } else { 0 };
@@ -214,7 +232,56 @@ impl Ld {
 				return true;
 			}
 			0x20..=0x7e => self.insert(b, e),
+			b'\t' => {
+				self.last_tab = true;
+				return self.tab(again, vocab, e);
+			}
 			_ => {}
+		}
+		false
+	}
+
+	// Tab completion over the command word (the line's first token, cursor at its end),
+	// against `vocab` - the shell builtins plus the live bin/ listing: a unique match
+	// completes fully, several matches extend to their longest common
+	// prefix, and a second Tab with nothing left to extend asks the program to list the
+	// matches (returns true; `self.relist` marks the delivery). Elsewhere in the line the
+	// key is ignored - path and argument completion is future work.
+	fn tab(&mut self, again: bool, vocab: &[Vec<u8>], e: &mut Echo) -> bool {
+		if self.cursor != self.len || self.line[..self.len].contains(&b' ') {
+			return false;
+		}
+		let matches: Vec<&[u8]> = vocab.iter().map(|v: &Vec<u8>| v.as_slice()).filter(|c: &&[u8]| c.starts_with(&self.line[..self.len])).collect();
+		let first: Vec<u8> = match matches.first() {
+			Some(&m) => m.to_vec(),
+			None => return false,
+		};
+		if matches.len() == 1 {
+			for i in self.len..first.len() {
+				self.insert(first[i], e);
+			}
+			self.insert(b' ', e);
+			return false;
+		}
+		// several matches: extend to the longest common prefix they share.
+		let mut common: usize = first.len();
+		for m in &matches[1..] {
+			let mut i: usize = 0;
+			while i < common && i < m.len() && m[i] == first[i] {
+				i += 1;
+			}
+			common = i;
+		}
+		if common > self.len {
+			for i in self.len..common {
+				self.insert(first[i], e);
+			}
+			return false;
+		}
+		// nothing left to extend: the second Tab lists the matches.
+		if again {
+			self.relist = true;
+			return true;
 		}
 		false
 	}
@@ -514,6 +581,11 @@ struct Console {
 	clipboard: Vec<u8>,
 	// The pointer button bits from the previous event, to detect press / release edges.
 	ptr_buttons: u8,
+	// The Tab-completion vocabulary: the shell builtins plus the system volume's bin/
+	// listing (bash's builtins + $PATH), fetched lazily on the first Tab through a fresh
+	// storage connection and cached for the session (None until then; an unreachable
+	// volume caches the builtins alone).
+	vocab: Option<Vec<Vec<u8>>>,
 }
 
 // Receive the "GPU" bootstrap message, returning the gpu driver's display channel, or 0
@@ -670,7 +742,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, pointer, clipboard: Vec::new(), ptr_buttons: 0 };
+		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, pointer, clipboard: Vec::new(), ptr_buttons: 0, vocab: None };
 		run(&mut console);
 	}
 }
@@ -906,8 +978,39 @@ unsafe fn handle_keys(console: &mut Console, keys: &[u8]) {
 // the byte passes straight through.
 unsafe fn feed_key(console: &mut Console, b: u8) {
 	unsafe {
+		let vocab: Vec<Vec<u8>> = completion_vocab(console, b);
 		let fg: usize = console.fg;
-		feed_tty(&mut console.vts[fg], b);
+		feed_tty(&mut console.vts[fg], b, &vocab);
+	}
+}
+
+// The Tab-completion vocabulary, fetched lazily: on the first Tab, list the system
+// volume's bin/ over a fresh storage connection and cache the names together with the
+// shell builtins for the session (the bin/ set is seeded at format time and static per
+// boot). Any other key answers an empty list without touching the cache, so the input
+// path pays the IPC round-trip exactly once - and only if Tab is ever pressed.
+unsafe fn completion_vocab(console: &mut Console, b: u8) -> Vec<Vec<u8>> {
+	unsafe {
+		if b != b'\t' {
+			return Vec::new();
+		}
+		if console.vocab.is_none() {
+			let mut names: Vec<Vec<u8>> = Vec::new();
+			if let Some(storage) = service_connect(console.facs.storage) {
+				let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
+				if let Some(Ok(files)) = client.list("vol://system/bin") {
+					names = files.into_iter().map(|f| f.name.into_bytes()).collect();
+				}
+				close(storage);
+			}
+			for &builtin in commands::BUILTINS {
+				names.push(builtin.as_bytes().to_vec());
+			}
+			names.sort();
+			names.dedup();
+			console.vocab = Some(names);
+		}
+		console.vocab.clone().unwrap_or_default()
 	}
 }
 
@@ -918,7 +1021,7 @@ unsafe fn feed_key(console: &mut Console, b: u8) {
 // goes wherever the terminal's master is: a display VT mirrors it to the serial port (and
 // renders live into its grid), a PTY sends it back out its master channel so the host
 // (e.g. a remote terminal over ssh) sees what was typed.
-unsafe fn feed_tty(vt: &mut Vt, b: u8) {
+unsafe fn feed_tty(vt: &mut Vt, b: u8, vocab: &[Vec<u8>]) {
 	unsafe {
 		let client: u64 = vt.client;
 		// A foreground job owns the tty: the signal keys become signals to it (the tty's
@@ -962,7 +1065,7 @@ unsafe fn feed_tty(vt: &mut Vt, b: u8) {
 		let ser: EchoBuf;
 		{
 			let mut echo: Echo = Echo { term: vt.term.as_mut(), ser: EchoBuf::new() };
-			submitted = vt.ld.feed(b, &mut echo);
+			submitted = vt.ld.feed(b, vocab, &mut echo);
 			if let Some(t) = echo.term {
 				t.flush();
 			}
@@ -976,7 +1079,21 @@ unsafe fn feed_tty(vt: &mut Vt, b: u8) {
 			send_blocking(vt.master, ser.as_slice(), 0);
 		}
 		if submitted {
-			if vt.ld.eof {
+			if vt.ld.relist {
+				// A double Tab found several completions: hand the unfinished line to the
+				// program marked with a leading tab (a cooked line can never contain one),
+				// so it prints the matches and re-draws the prompt. The buffer is NOT
+				// committed - the operator keeps typing right where they were. Only the
+				// prompt owner gets the marker; a foreground job's stdin never sees it.
+				vt.ld.relist = false;
+				if vt.fg_proc.is_none() {
+					let n: usize = vt.ld.len;
+					let mut out: Vec<u8> = Vec::with_capacity(n + 1);
+					out.push(b'\t');
+					out.extend_from_slice(&vt.ld.line[..n]);
+					send_blocking(client, &out, 0);
+				}
+			} else if vt.ld.eof {
 				// Ctrl+D on an empty line: deliver a zero-byte read (EOF) so the shell
 				// logs out, the way a tty signals end-of-input.
 				vt.ld.commit();
@@ -1176,7 +1293,8 @@ unsafe fn pty_output(console: &mut Console, pj: usize, bytes: &[u8]) {
 unsafe fn pty_master_input(console: &mut Console, pj: usize, bytes: &[u8]) {
 	unsafe {
 		for &b in bytes {
-			feed_tty(&mut console.ptys[pj], b);
+			let vocab: Vec<Vec<u8>> = completion_vocab(console, b);
+			feed_tty(&mut console.ptys[pj], b, &vocab);
 		}
 	}
 }
@@ -1526,8 +1644,7 @@ fn repaint(console: &mut Console) {
 // ends): mint a fresh per-session client from each service factory, spawn the shell ELF,
 // hand it its capability set in the order it expects (STORAGE, MEDIA, ISO, UDF, LOG,
 // DEVICE, PROCESS, CONFIG, NET, TIME, AUDIO, INPUT, GRAPH, PERM, RESOURCE, CONSOLE,
-// CONTROL), wait for its "online" report (it self-checks storage over its own
-// connection), then release its bootstrap + Process handle. The extended capabilities
+// CONTROL), wait for its "online" report, then release its bootstrap + Process handle. The extended capabilities
 // (the media / iso / udf volumes, input, graph, perm, resource) are sent as 0 - a
 // non-primary VT cannot mint them per session (input / graph are single-client, the rest
 // are not proxied here) - so the shell boots core-capable and the dependent command
@@ -1625,7 +1742,7 @@ unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) 
 		send_blocking(boot_parent, b"SESSION", session);
 		send_blocking(boot_parent, b"CONSOLE", shell_console);
 		send_blocking(boot_parent, b"CONTROL", shell_control);
-		// wait for the shell to self-check storage and report in, then drop its bootstrap.
+		// wait for the shell to report in, then drop its bootstrap.
 		let mut rbuf: [u8; 32] = [0u8; 32];
 		if let Received::Closed = recv_blocking(boot_parent, &mut rbuf) {
 			close(boot_parent);

@@ -2749,8 +2749,7 @@ fn init_package_starts_system_manager() {
 	// PermissionManager (which needs storage and network to grant onward, so it comes up
 	// once they are running, and in turn launches its sandboxed component before reporting
 	// in), and finally - after every component it observes - SystemGraphService, then the
-	// shell (which proves the StorageService round-trip by reading a file with `cat`
-	// before it reports in). Every report is relayed up, so the kernel observes the
+	// shell. Every report is relayed up, so the kernel observes the
 	// services come up in dependency order, then DeviceManager stopped (ServiceManager
 	// exercises the stop path on that service), then the watchdog canary brought up,
 	// restarted after a commanded crash and recovered after a missed heartbeat
