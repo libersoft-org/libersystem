@@ -26,7 +26,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		let leaf_block: u64 = POOL_START;
 		let mut label = [0u8; LABEL_MAX];
-		let take = opts.label.len().min(LABEL_MAX);
+		// clamp the label to LABEL_MAX without cutting a UTF-8 character in half (the
+		// record is specified as UTF-8): back the cut off any continuation bytes.
+		let mut take = opts.label.len().min(LABEL_MAX);
+		while take > 0 && take < opts.label.len() && (opts.label[take] & 0xC0) == 0x80 {
+			take -= 1;
+		}
 		label[..take].copy_from_slice(&opts.label[..take]);
 
 		// the inode tree's sole leaf: one record keyed by inode 0 (the root directory).

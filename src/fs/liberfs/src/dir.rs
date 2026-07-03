@@ -52,7 +52,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// directory operations (on any directory inode)
 
 	// Look up `name` in directory `dir_num` through its B+tree: the child inode, or None
-	// if absent. Errors if `dir_num` is not a directory. A hit populates the bounded
+	// if absent. NotDir if `dir_num` is not a directory. A hit populates the bounded
 	// dentry cache, so path resolution stops re-walking the tree for hot names.
 	pub(crate) fn dir_lookup(&mut self, dir_num: u32, name: &[u8]) -> Result<Option<u32>, FsError> {
 		if let Some(child) = self.dcache.get(&(dir_num, name.to_vec())) {
@@ -60,7 +60,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		let dir = self.read_inode(dir_num)?;
 		if dir.kind != KIND_DIR {
-			return Err(FsError::NotFound);
+			return Err(FsError::NotDir);
 		}
 		match self.dir_tree_lookup(dir.dir_root, dir.dir_root_crc, name)? {
 			Some(child) => {
@@ -89,7 +89,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn dir_insert(&mut self, dir_num: u32, name: &[u8], child: u32) -> Result<(), FsError> {
 		let mut dir = self.read_inode(dir_num)?;
 		if dir.kind != KIND_DIR {
-			return Err(FsError::NotFound);
+			return Err(FsError::NotDir);
 		}
 		let existed = self.dir_tree_lookup(dir.dir_root, dir.dir_root_crc, name)?.is_some();
 		let (root, crc) = self.dir_tree_insert(dir.dir_root, dir.dir_root_crc, name, child)?;
@@ -108,7 +108,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn dir_remove(&mut self, dir_num: u32, name: &[u8]) -> Result<(), FsError> {
 		let mut dir = self.read_inode(dir_num)?;
 		if dir.kind != KIND_DIR {
-			return Err(FsError::NotFound);
+			return Err(FsError::NotDir);
 		}
 		let (root, crc, removed) = self.dir_tree_delete(dir.dir_root, dir.dir_root_crc, name)?;
 		if !removed {
