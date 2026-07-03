@@ -1209,7 +1209,7 @@ multi-page DMA buffers.
 - Done when: bulk disk and network I/O move in large requests, the measured throughput improves accordingly, tests green.
 - Concept: M23/M24/M62 (the drivers this accelerates), the limits audit (the last "one page" assumptions removed).
 
-## LiberFS audit track (M73-M82)
+## LiberFS audit track (M73-M83)
 
 A full read of the crate (~3900 lines: lib/txn/fsops/dir/inode/blkalloc/snapshot/
 fsck + tests) plus the service and driver wiring around it (2026-07-02). The core -
@@ -1488,6 +1488,19 @@ contract (fsck REPORTS damage, it never dies on it).
   - Result: all hold - liberfs 89 host tests (3 retargeted/extended), kernel 87 fresh + 87 mount, build 0 warnings.
 - Concept: M80-B7 (the report-not-death contract this restores), M81-B6 (the degrade-to-read-only policy fsck now applies too) - the audit track's rule that the failure mode stays proportionate to the damage.
 
+## M83 - LiberFS/storage: the seed-archive loop and snapshot-name encoding
+
+The seventh full source pass (2026-07-03, after M82 landed) found the crate
+paths clean and the remaining holes in the one place the hostile-disk audits
+had not reached: StorageService's boot-time seeding loop parses the archive
+format a SECOND time, before the bounds-checked parser ever sees the bytes -
+and a duplicated parser is a duplicated vulnerability.
+
+- [ ] (B1, medium-high) `read_seed_archive` trusts the archive before `Package::parse` can refuse it: the sizing loop reads `count` and each entry's `off + size` straight off the disk and RESIZES its Vec by them - a hostile non-LiberFS disk with the `PKGARCH1` magic and `count = 4G` claims a ~170 GB entry table (or ~8 GB via `off + size`) and the boot-time seeding path OOM-aborts the whole storage service. The seeding path runs exactly on a disk WITHOUT a valid LiberFS - the disk whose content is least trustworthy. Cap the claimed total by `block_capacity` (an archive cannot exceed the disk it lives on; the capacity query is already in the service) and treat a claim past it as "no archive".
+- [ ] (B2, low) `create_snapshot` accepts any non-empty bytes up to SNAP_NAME_MAX, but the LIBERFS.md specification says a snapshot record's name is UTF-8 - a crate-level caller can write a byte-soup name a spec-conforming foreign driver must reject (the wire path is safe: LSIDL strings are UTF-8 by construction). Validate UTF-8 in `create_snapshot` (BadName), consistent with file names.
+- Done when: a hostile PKGARCH1 header cannot make the seeding path allocate past the disk's own capacity (covered by a kernel test with a lying archive on a stand-in disk), snapshot names are UTF-8 at the crate boundary (host test), and the suite stays green.
+- Concept: M79-B1/M80-B1 (the disk's content must never kill the service - now applied to the last boot-time reader), the M78 spec (whose UTF-8 rule B2 enforces at the API), and the audit track's parser rule: one format, ONE parser - the sizing loop must not re-implement what `Package::parse` already validates.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
@@ -1510,7 +1523,7 @@ workloads; multi-queue devices and the per-CPU interrupt-vector spaces they need
 (one vector number per device suffices until then - the M72 throughput work stays
 single-queue); immutable signed system + A/B updates + rollback + verified boot;
 encrypted user volumes; LiberFS work beyond the M53-M57 modernization and the
-M73-M82 audit track (online
+M73-M83 audit track (online
 resize, online defrag, multi-device / RAID; deduplication and encryption stay out by decision);
 first-party server apps (a
 static-file web server and the like); and a CLI package manager over the phase-2
