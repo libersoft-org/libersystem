@@ -1,7 +1,6 @@
 # Bugs / changes
 
-- Replace font8x8_latin.bin with something nicer - only one with CC license (!!!)
-- Arrays in .rs files are written in 1 row - make it multiline, so it's better readable
+- Arrays in .rs files are written in 1 row - set autoformater to make it multiline, so it's better readable
 - Check what is in coreutils package (Debian)
 - After bootup, in shell it automatically presses enter after a few seconds - why?
 - Where are system tools stored? When I enter "ls" in vol://system/, I can see just 2 .txt files

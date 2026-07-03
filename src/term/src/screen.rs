@@ -26,14 +26,15 @@ const ANSI_PALETTE: [(u8, u8, u8); 16] = [
 	(0x55, 0x55, 0xff), (0xff, 0x55, 0xff), (0x55, 0xff, 0xff), (0xff, 0xff, 0xff),
 ];
 
-// One screen cell: a glyph plus its resolved foreground/background colours and an
+// One screen cell: a glyph (a Unicode codepoint the renderer resolves to a font bitmap)
+// plus its resolved foreground/background colours and an
 // underline flag. The screen is a grid of these (`primary`, plus `alt` for the
 // alternate screen); rendering reads the grid, so escape sequences and scrolling are
 // pure grid edits and the renderer repaints only the cells that changed (damage tracking
 // + double buffering).
 #[derive(Clone, Copy, PartialEq)]
 pub struct Cell {
-	pub glyph: u8,
+	pub glyph: u32,
 	pub fg: Color,
 	pub bg: Color,
 	pub bold: bool,
@@ -158,7 +159,7 @@ pub struct Screen {
 
 impl Screen {
 	pub fn new(cols: usize, rows: usize) -> Screen {
-		let blank = Cell { glyph: b' ', fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
+		let blank = Cell { glyph: b' ' as u32, fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
 		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, tty_raw_req: None, tty_echo_req: None, mouse_mode: 0, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; SCROLLBACK_ROWS * cols], sb_wrap: alloc::vec![false; SCROLLBACK_ROWS], sb_cap: SCROLLBACK_ROWS, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new() }
 	}
 
@@ -185,7 +186,7 @@ impl Screen {
 
 	// A blank cell in the current background (so erase/scroll paint the SGR bg).
 	pub fn blank(&self) -> Cell {
-		Cell { glyph: b' ', fg: self.fg_color, bg: self.bg_color, bold: self.bold, underline: false, reverse: self.reverse }
+		Cell { glyph: b' ' as u32, fg: self.fg_color, bg: self.bg_color, bold: self.bold, underline: false, reverse: self.reverse }
 	}
 
 	// The logical grid geometry: a renderer reads it to walk the cells.
@@ -353,16 +354,18 @@ impl Screen {
 		while g <= hg && g < self.total_logical_rows() {
 			let start_col = if g == lg { lc } else { 0 };
 			let end_col = if g == hg { hc.min(last_col) } else { last_col };
-			let mut line: Vec<u8> = Vec::new();
+			let mut line: Vec<u32> = Vec::new();
 			let mut c = start_col;
 			while c <= end_col {
 				line.push(self.global_glyph(c, g));
 				c += 1;
 			}
-			while line.last() == Some(&b' ') {
+			while line.last() == Some(&(b' ' as u32)) {
 				line.pop();
 			}
-			out.extend_from_slice(&line);
+			for &cp in &line {
+				push_utf8(&mut out, cp);
+			}
 			if g != hg {
 				out.push(b'\n');
 			}
@@ -441,7 +444,7 @@ impl Screen {
 		if new_cols == self.cols && new_rows == self.rows {
 			return false;
 		}
-		let blank = Cell { glyph: b' ', fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
+		let blank = Cell { glyph: b' ' as u32, fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
 		let mut new_primary = alloc::vec![blank; new_cols * new_rows];
 		let copy_rows = self.rows.min(new_rows);
 		let copy_cols = self.cols.min(new_cols);
@@ -656,7 +659,7 @@ impl Screen {
 		}
 	}
 
-	fn put_glyph(&mut self, glyph: u8) {
+	fn put_glyph(&mut self, glyph: u32) {
 		if self.col >= self.cols {
 			// The previous glyph filled the last column: this row soft-wraps into the next.
 			self.wrap[self.row] = true;
@@ -668,12 +671,10 @@ impl Screen {
 		self.col += 1;
 	}
 
-	// Render a decoded Unicode codepoint: the font covers U+0000-U+00FF (ASCII + the
-	// Latin-1 supplement), so a codepoint in that range maps straight to its glyph; one
-	// above it falls back to '?'.
+	// Render a decoded Unicode codepoint: the cell records the codepoint itself, and the
+	// renderer resolves it to a font glyph (one the font lacks draws as '?').
 	fn put_codepoint(&mut self, cp: u32) {
-		let glyph = if cp <= 0xff { cp as u8 } else { b'?' };
-		self.put_glyph(glyph);
+		self.put_glyph(cp);
 	}
 
 	// Begin a UTF-8 multi-byte sequence from its lead byte, recording how many
@@ -1254,9 +1255,10 @@ impl Screen {
 		self.sb_len + self.rows
 	}
 
-	// The glyph at column `col` of global row `g` (scrollback rows first, then the live
-	// primary screen) - a text consumer's read of the grid, mirroring `view_cell`.
-	pub(crate) fn global_glyph(&self, col: usize, g: usize) -> u8 {
+	// The glyph (Unicode codepoint) at column `col` of global row `g` (scrollback rows
+	// first, then the live primary screen) - a text consumer's read of the grid, mirroring
+	// `view_cell`.
+	pub(crate) fn global_glyph(&self, col: usize, g: usize) -> u32 {
 		if g < self.sb_len {
 			let ring = (self.sb_head + g) % self.sb_cap;
 			self.scrollback[ring * self.cols + col].glyph
@@ -1274,6 +1276,15 @@ impl Screen {
 			self.wrap[g - self.sb_len]
 		}
 	}
+}
+
+// Append one Unicode codepoint to `out` as UTF-8 (an invalid codepoint encodes as '?').
+// The text consumers (`TextSink`, `selection_text`) serialize grid glyphs through this,
+// so what a program printed as UTF-8 reads back as the same bytes.
+pub(crate) fn push_utf8(out: &mut Vec<u8>, cp: u32) {
+	let c = char::from_u32(cp).unwrap_or('?');
+	let mut buf = [0u8; 4];
+	out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
 }
 
 // Parse a decimal byte string to usize, or None if empty / non-numeric.

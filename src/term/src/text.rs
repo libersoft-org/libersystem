@@ -4,7 +4,7 @@
 // touches no pixels, so it proves the model is renderer-independent (the same model a
 // framebuffer renderer draws can be dumped to text, piped to ssh/telnet, or diffed in a test).
 
-use crate::screen::Screen;
+use crate::screen::{Screen, push_utf8};
 use alloc::vec::Vec;
 
 pub struct TextSink {
@@ -25,7 +25,7 @@ impl TextSink {
 		let cols = screen.cols();
 		let total = screen.total_logical_rows();
 		let mut lines: Vec<Vec<u8>> = Vec::new();
-		let mut line: Vec<u8> = Vec::new();
+		let mut line: Vec<u32> = Vec::new();
 		for g in 0..total {
 			for col in 0..cols {
 				line.push(screen.global_glyph(col, g));
@@ -33,14 +33,15 @@ impl TextSink {
 			if !screen.global_wrap(g) {
 				// Hard break (or a non-wrapped row): the logical line ends here.
 				trim_trailing_spaces(&mut line);
-				lines.push(core::mem::take(&mut line));
+				lines.push(encode_line(&line));
+				line.clear();
 			}
 			// Otherwise the row soft-wraps: keep accumulating into the same logical line.
 		}
 		// A trailing soft-wrapped partial with no closing hard break still forms a line.
 		if !line.is_empty() {
 			trim_trailing_spaces(&mut line);
-			lines.push(line);
+			lines.push(encode_line(&line));
 		}
 		// Drop trailing empty logical lines (the blank bottom of the screen).
 		while matches!(lines.last(), Some(l) if l.is_empty()) {
@@ -67,8 +68,17 @@ impl Default for TextSink {
 }
 
 // Drop trailing ASCII spaces from a logical line in place.
-fn trim_trailing_spaces(line: &mut Vec<u8>) {
-	while line.last() == Some(&b' ') {
+fn trim_trailing_spaces(line: &mut Vec<u32>) {
+	while line.last() == Some(&(b' ' as u32)) {
 		line.pop();
 	}
+}
+
+// Encode a logical line of codepoints as UTF-8 bytes.
+fn encode_line(line: &[u32]) -> Vec<u8> {
+	let mut out: Vec<u8> = Vec::new();
+	for &cp in line {
+		push_utf8(&mut out, cp);
+	}
+	out
 }

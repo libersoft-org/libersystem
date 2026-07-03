@@ -13,18 +13,52 @@ use alloc::boxed::Box;
 
 use crate::screen::{Cell, Color, CursorShape, Screen, ScrollOp};
 
-// The 8x8 bitmap font: 256 glyphs indexed by Unicode codepoint 0x00-0xFF - basic latin
-// (U+0000-007F) extended with the Latin-1 supplement (U+00A0-00FF, U+0080-009F the blank C1
-// controls), so non-ASCII Western text renders. Public domain (dhepper/font8x8).
-static FONT: &[u8; 2048] = include_bytes!("font8x8_latin.bin");
+// The 8x16 bitmap font: Unscii 2.1 (unscii-16 by Viznut, public domain), 2,997 glyphs
+// covering ASCII, Latin-1 + Latin Extended-A (full Czech and Western/Central European
+// coverage), Greek, Cyrillic, box drawing, block elements and the legacy-computing
+// graphics. The asset is a sorted codepoint table plus one 16-byte bitmap per glyph
+// (row-major, bit 7 = leftmost pixel): [count u32 LE][count x codepoint u32 LE]
+// [count x 16 glyph bytes], generated from unscii-16.hex. A codepoint the font lacks
+// renders as '?'.
+static FONT: &[u8] = include_bytes!("unscii16.bin");
 
 const FONT_W: usize = 8;
-const FONT_H: usize = 8;
-const SCALE: usize = 2;
+const FONT_H: usize = 16;
+const SCALE: usize = 1;
 // One text cell in pixels (a font glyph drawn at SCALE). Public so a consumer can size its
 // grid to a framebuffer's pixel geometry.
 pub const CELL_W: usize = FONT_W * SCALE;
 pub const CELL_H: usize = FONT_H * SCALE;
+
+// The 16-byte bitmap for a Unicode codepoint: a binary search over the asset's sorted
+// codepoint table, falling back to '?' for a codepoint the font does not cover ('?' is
+// guaranteed present). Called per changed cell, so the log2(n) probe is cheap.
+fn glyph_bitmap(cp: u32) -> &'static [u8] {
+	let count = u32::from_le_bytes([FONT[0], FONT[1], FONT[2], FONT[3]]) as usize;
+	let table = &FONT[4..4 + count * 4];
+	let glyphs_base = 4 + count * 4;
+	let mut lo: usize = 0;
+	let mut hi: usize = count;
+	while lo < hi {
+		let mid = (lo + hi) / 2;
+		let entry = u32::from_le_bytes([table[mid * 4], table[mid * 4 + 1], table[mid * 4 + 2], table[mid * 4 + 3]]);
+		if entry == cp {
+			let at = glyphs_base + mid * FONT_H;
+			return &FONT[at..at + FONT_H];
+		}
+		if entry < cp {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	if cp == b'?' as u32 {
+		// unreachable as long as the asset carries '?': a fixed blank stops the recursion.
+		static BLANK: [u8; FONT_H] = [0u8; FONT_H];
+		return &BLANK;
+	}
+	glyph_bitmap(b'?' as u32)
+}
 
 // A linear framebuffer's geometry and pixel format, handed to a `Raster`. Decouples the
 // renderer from any particular framebuffer description (the kernel's Limine response, the
@@ -325,14 +359,14 @@ impl FramebufferRenderer {
 	}
 
 	// Blit one glyph cell to the framebuffer in already-resolved colours.
-	fn blit_cell(&self, col: usize, row: usize, glyph: u8, fg: u32, bg: u32, underline: bool) {
-		let base = (glyph as usize) * FONT_H;
+	fn blit_cell(&self, col: usize, row: usize, glyph: u32, fg: u32, bg: u32, underline: bool) {
+		let bitmap = glyph_bitmap(glyph);
 		let x0 = col * CELL_W;
 		let y0 = row * CELL_H;
 		for gy in 0..FONT_H {
-			let bits = FONT[base + gy];
+			let bits = bitmap[gy];
 			for gx in 0..FONT_W {
-				let color = if bits & (1 << gx) != 0 { fg } else { bg };
+				let color = if bits & (0x80 >> gx) != 0 { fg } else { bg };
 				for sy in 0..SCALE {
 					for sx in 0..SCALE {
 						self.surface.put_pixel(x0 + gx * SCALE + sx, y0 + gy * SCALE + sy, color);

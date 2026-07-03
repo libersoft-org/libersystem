@@ -44,6 +44,16 @@ fn blank_screen_is_empty() {
 	assert_eq!(dump(&s), b"");
 }
 
+// Unicode text survives the grid round trip: the UTF-8 stream decodes to codepoints, the
+// cells record them (the renderer resolves them to unscii-16 glyphs), and the text dump
+// re-encodes the same UTF-8 bytes - Czech diacritics included.
+#[test]
+fn unicode_round_trips_through_the_grid() {
+	let mut s = Screen::new(40, 4);
+	feed(&mut s, "příliš žluťoučký kůň\n€ ○ ─".as_bytes());
+	assert_eq!(dump(&s), "příliš žluťoučký kůň\n€ ○ ─".as_bytes());
+}
+
 // A line that exactly fills the width and is then explicitly newlined is a hard break, not
 // a soft wrap (the next line stays separate).
 #[test]

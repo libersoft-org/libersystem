@@ -18,7 +18,7 @@ target/
 *.log
 
 # ...but the embedded console font is a required source asset, not a build output
-!src/term/src/font8x8_latin.bin
+!src/term/src/unscii16.bin
 
 # Image / distribution archives
 *.zip
