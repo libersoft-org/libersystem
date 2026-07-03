@@ -28,7 +28,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		match self.derive_free() {
 			Ok(()) => {}
 			Err(FsError::Corrupt) => {
-				checksum_failures += 1;
+				checksum_failures = checksum_failures.saturating_add(1);
 				self.read_only = true;
 			}
 			Err(e) => return Err(e),
@@ -47,7 +47,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				// superblock's root_inode) naming an inode that does not exist -
 				// structural damage like any other.
 				Err(FsError::Corrupt | FsError::Io | FsError::Invalid) => {
-					checksum_failures += 1;
+					checksum_failures = checksum_failures.saturating_add(1);
 					damaged.push(if prefix.is_empty() { b"/".to_vec() } else { prefix });
 					continue;
 				}
@@ -78,7 +78,9 @@ impl<D: BlockDevice> LiberFs<D> {
 					Err(e) => return Err(e),
 				};
 				if bad > 0 {
-					checksum_failures += bad;
+					// saturating: a count past u32 reads as "beyond counting", which such
+					// a volume is - never an overflow in the report's own arithmetic.
+					checksum_failures = checksum_failures.saturating_add(bad);
 					damaged.push(path);
 				}
 			}
@@ -88,11 +90,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		// for it.
 		for i in 0..self.snapshots.len() {
 			let (root, crc) = (self.snapshots[i].inode_root, self.snapshots[i].inode_root_crc);
-			checksum_failures += match self.check_inode_tree(root, crc, TREE_DEPTH_MAX) {
+			checksum_failures = checksum_failures.saturating_add(match self.check_inode_tree(root, crc, TREE_DEPTH_MAX) {
 				Ok(bad) => bad,
 				Err(FsError::Corrupt | FsError::Io) => 1,
 				Err(e) => return Err(e),
-			};
+			});
 		}
 		Ok(FsckReport { checksum_failures, damaged })
 	}
@@ -161,7 +163,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
-		let mut bad = 0;
+		let mut bad = 0u32;
 		if node_type(&buf) == NODE_LEAF {
 			for i in 0..leaf_count(&buf, INODE_REC) {
 				let off = NODE_HDR + i * INODE_REC + 8;
@@ -173,19 +175,19 @@ impl<D: BlockDevice> LiberFs<D> {
 				} else {
 					Ok(0)
 				};
-				bad += match checked {
+				bad = bad.saturating_add(match checked {
 					Ok(b) => b,
 					Err(FsError::Corrupt | FsError::Io) => 1,
 					Err(e) => return Err(e),
-				};
+				});
 			}
 		} else {
 			for i in 0..=internal_count(&buf) {
-				bad += match self.check_inode_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1) {
+				bad = bad.saturating_add(match self.check_inode_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1) {
 					Ok(b) => b,
 					Err(FsError::Corrupt | FsError::Io) => 1,
 					Err(e) => return Err(e),
-				};
+				});
 			}
 		}
 		Ok(bad)
@@ -203,14 +205,14 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
-		let mut bad = 0;
+		let mut bad = 0u32;
 		if node_type(&buf) == NODE_INTERNAL {
 			for i in 0..=internal_count(&buf) {
-				bad += match self.check_dir_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1) {
+				bad = bad.saturating_add(match self.check_dir_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1) {
 					Ok(b) => b,
 					Err(FsError::Corrupt | FsError::Io) => 1,
 					Err(e) => return Err(e),
-				};
+				});
 			}
 		}
 		Ok(bad)

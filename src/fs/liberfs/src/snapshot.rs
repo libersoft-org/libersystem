@@ -3,11 +3,12 @@ use crate::*;
 impl<D: BlockDevice> LiberFs<D> {
 	// Create a named, read-only snapshot pinning the current generation's inode-tree
 	// root, so its blocks survive later commits until the snapshot is deleted. The name
-	// must be non-empty UTF-8 (the on-disk record is specified as UTF-8, like file
-	// names), at most SNAP_NAME_MAX bytes, and unique among existing snapshots; the
-	// chained table holds any number of them.
+	// must be non-empty UTF-8 without NUL (the on-disk record is NUL-padded UTF-8, so
+	// an embedded NUL would silently truncate the name - and change its identity - at
+	// the next mount), at most SNAP_NAME_MAX bytes, and unique among existing
+	// snapshots; the chained table holds any number of them.
 	pub fn create_snapshot(&mut self, name: &[u8]) -> Result<(), FsError> {
-		if name.is_empty() || core::str::from_utf8(name).is_err() {
+		if name.is_empty() || name.contains(&0) || core::str::from_utf8(name).is_err() {
 			return Err(FsError::BadName);
 		}
 		if name.len() > SNAP_NAME_MAX {

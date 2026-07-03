@@ -684,7 +684,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// is itself corrupt counts as wholly bad. A compressed run is checked over its stored
 	// (compressed) blocks, since those are the bytes the checksum covers.
 	pub(crate) fn count_corrupt(&mut self, inode: &Inode) -> Result<u32, FsError> {
-		let mut bad = 0;
+		let mut bad = 0u32;
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		let mut cbuf = vec![0u8; BLOCK_SIZE];
 		for i in 0..inode.extents.len() {
@@ -693,7 +693,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				return Err(FsError::Io);
 			}
 			if crc32c(&cbuf) != ext.csum_crc {
-				bad += ext.store_len;
+				bad = bad.saturating_add(ext.store_len);
 				continue;
 			}
 			for off in 0..ext.store_len as usize {
@@ -702,7 +702,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				}
 				let c = u32::from_le_bytes(cbuf[off * 4..off * 4 + 4].try_into().unwrap());
 				if crc32c(&buf) != c {
-					bad += 1;
+					bad = bad.saturating_add(1);
 				}
 			}
 		}
@@ -729,7 +729,11 @@ pub(crate) fn clear_bit(bitmap: &mut [u8], b: u64) {
 
 pub(crate) fn test_bit(bitmap: &[u8], b: u64) -> bool {
 	let i = (b / 8) as usize;
-	if i < bitmap.len() { bitmap[i] & (1 << (b % 8)) != 0 } else { true }
+	if i < bitmap.len() {
+		bitmap[i] & (1 << (b % 8)) != 0
+	} else {
+		true
+	}
 }
 
 // Index of the extent covering logical block `lb`, or None if it falls in a hole. The
@@ -740,7 +744,11 @@ pub(crate) fn find_extent(extents: &[Extent], lb: u64) -> Option<usize> {
 	if pos == 0 {
 		return None;
 	}
-	if extents[pos - 1].covers(lb) { Some(pos - 1) } else { None }
+	if extents[pos - 1].covers(lb) {
+		Some(pos - 1)
+	} else {
+		None
+	}
 }
 
 // Hash the 4-byte prefix at `w` into an LZ_HASH_BITS-wide match-finder bucket.

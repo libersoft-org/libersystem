@@ -1,5 +1,6 @@
 # Bugs / changes
 
+- Are snapshots optional or mandatory?
 - after "ls" command console freezes
 - "ls" command orders files and directories randomly - by default - by name, first directories, then files
 - "ls" command should show directories with other color than files and should show size in next column and timestamp of last modification in another column, -h should make size human readable, at the and down there add summary - total directories, total files, total size of files

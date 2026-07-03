@@ -558,7 +558,11 @@ fn newest_super_slot(dev: &MemDevice) -> u32 {
 		let off = slot as usize * BLOCK_SIZE + 28;
 		u64::from_le_bytes(dev.blocks[off..off + 8].try_into().unwrap())
 	};
-	if generation(1) > generation(0) { 1 } else { 0 }
+	if generation(1) > generation(0) {
+		1
+	} else {
+		0
+	}
 }
 
 #[test]
@@ -1757,7 +1761,11 @@ fn forge_superblock(dev: &mut MemDevice, slot: usize, f: impl FnOnce(&mut [u8]))
 // The slot holding the live (higher) generation in a raw device image.
 fn active_slot(dev: &MemDevice) -> usize {
 	let slot_gen = |s: usize| parse_superblock(&dev.blocks[s * BLOCK_SIZE..(s + 1) * BLOCK_SIZE]).map(|sb| sb.generation);
-	if slot_gen(1) > slot_gen(0) { 1 } else { 0 }
+	if slot_gen(1) > slot_gen(0) {
+		1
+	} else {
+		0
+	}
 }
 
 #[test]
@@ -2027,6 +2035,9 @@ fn snapshot_names_must_be_utf8() {
 	// the on-disk snapshot record is specified as UTF-8, like file names: byte soup
 	// is refused at the crate boundary, not left for a foreign driver to choke on.
 	assert_eq!(fs.create_snapshot(b"\xFF\xFEsoup"), Err(FsError::BadName));
+	// an embedded NUL is valid UTF-8 but the record is NUL-padded: the name would
+	// silently truncate - and change identity - at the next mount. Refused too.
+	assert_eq!(fs.create_snapshot(b"a\0b"), Err(FsError::BadName));
 	// valid UTF-8 beyond ASCII is a name like any other.
 	fs.create_snapshot("z\u{00E1}loha".as_bytes()).unwrap();
 	assert_eq!(fs.list_snapshots().unwrap().len(), 1);

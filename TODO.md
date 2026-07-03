@@ -1209,7 +1209,7 @@ multi-page DMA buffers.
 - Done when: bulk disk and network I/O move in large requests, the measured throughput improves accordingly, tests green.
 - Concept: M23/M24/M62 (the drivers this accelerates), the limits audit (the last "one page" assumptions removed).
 
-## LiberFS audit track (M73-M84)
+## LiberFS audit track (M73-M85)
 
 A full read of the crate (~3900 lines: lib/txn/fsops/dir/inode/blkalloc/snapshot/
 fsck + tests) plus the service and driver wiring around it (2026-07-02). The core -
@@ -1520,6 +1520,19 @@ FsError::Invalid, which no protective catch covers.
   - Result: all hold - host test `a_dangling_entry_is_reported_listable_around_and_removable` (the dangle forged through the crate's own machinery: inode record dropped, entry left) walks the whole repair story: fsck names `ghost.txt`, the listing shows `healthy.txt` without it, `remove` clears it, and the next fsck is clean. Liberfs 91 host tests (1 new), kernel 88 fresh + 88 mount, build 0 warnings.
 - Concept: M82 (the report-not-death contract, extended to its last error variant), M76 (the error-classification this leans on: Invalid = internal inconsistency), and the track's proportionality rule - damage is named and repaired, it never bricks a directory.
 
+## M85 - LiberFS: last nits (NUL in snapshot names, failure-count overflow)
+
+The ninth full source pass (2026-07-03, after M84 landed) found the core clean
+and two nits at the edges - the audit track's remainders.
+
+- [x] (B1, low) `create_snapshot` accepts a name with an embedded NUL: NUL is valid UTF-8, so the M83 check passes it - but the on-disk record is "UTF-8, NUL padded" per the specification, so `load_snapshot_table` truncates the name at the first NUL on remount. `create_snapshot(b"a\0b")` and `create_snapshot(b"a\0c")` both pass the Exists check (full-byte compare), yet after a remount BOTH are named "a" - duplicate names Exists was built to prevent, and `delete_snapshot(b"a")` (a retain) then deletes both at once. A snapshot's identity must not change across a remount: reject NUL as BadName.
+  - Result: rejected alongside the empty and non-UTF-8 cases; `snapshot_names_must_be_utf8` extended with the embedded-NUL refusal.
+- [x] (B2, very low) `checksum_failures: u32` can overflow: fsck sums per-extent damage counts (up to 1024 per extent) over the whole pool, so a pathologically damaged hostile volume can push the sum past 2^32 - a debug-build panic in the `+=`. Use saturating adds at the accumulation sites; a saturated count reads as "beyond counting", which such a volume is.
+  - Result: every accumulation site saturates - fsck's four (the rederivation catch, both live-walk sites, the snapshot loop), both check-tree recursions, and `count_corrupt`'s per-extent sums.
+- Done when: a NUL-bearing snapshot name is refused (host test), the failure count saturates instead of wrapping, and the suite stays green.
+  - Result: all hold - liberfs 91 host tests, kernel 88 fresh + 88 mount, build 0 warnings.
+- Concept: M83-B2 (the UTF-8 rule this completes: valid encoding AND stable identity), the M78 spec's NUL-padding rule (which makes an embedded NUL an early terminator), and the track's bounding rule applied to fsck's own arithmetic.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
@@ -1542,7 +1555,7 @@ workloads; multi-queue devices and the per-CPU interrupt-vector spaces they need
 (one vector number per device suffices until then - the M72 throughput work stays
 single-queue); immutable signed system + A/B updates + rollback + verified boot;
 encrypted user volumes; LiberFS work beyond the M53-M57 modernization and the
-M73-M84 audit track (online
+M73-M85 audit track (online
 resize, online defrag, multi-device / RAID; deduplication and encryption stay out by decision);
 first-party server apps (a
 static-file web server and the like); and a CLI package manager over the phase-2
