@@ -1535,6 +1535,62 @@ and two nits at the edges - the audit track's remainders.
   - Result: `random_corruption_never_panics_or_hangs` - green on the first run (the M80-M85 bounds hold against randomness, not just against the reviewer's imagination), and from now on any regression in any bound fails the host suite. Two closing cosmetics landed alongside: resolve through a file answers NotDir (M76 classification), and the format-time label truncation backs off a split UTF-8 character.
 - Concept: M83-B2 (the UTF-8 rule this completes: valid encoding AND stable identity), the M78 spec's NUL-padding rule (which makes an embedded NUL an early terminator), and the track's bounding rule applied to fsck's own arithmetic. The fuzz guard is the track's closing move: reviews found the bugs, the test keeps them found.
 
+## FAT audit track (M86-M88)
+
+A full read of the fat crate (2026-07-03, lib.rs ~1030 lines + tests), the same
+treatment the LiberFS audit track gave the native filesystem. The read paths and
+the boot-sector family detection checked out; the problems cluster in three
+groups: two data-loss-grade correctness bugs in the write/delete paths (long-name
+unlink, exFAT NoFatChain), the hostile-media holes the LiberFS track taught us to
+close (panics and hangs on checksummed-but-insane or corrupt boot sectors and FAT
+chains - this crate mounts whatever removable media the user plugs in), and a set
+of allocation-bound and spec-conformance debts. Verified clean during the audit
+(no action): the LFN fragment assembly order, the FAT12 odd/even packing, the
+exFAT entry-set checksums, free_run's slot search, and the read-side truncation
+logic.
+
+## M86 - FAT: data-loss and correctness bugs
+
+The findings that lose data or corrupt the volume. Both majors sit in the write
+half; the read-only paths are unaffected.
+
+- [ ] (B1, high) `unlink_in` never matches a long file name: it compares only the 8.3 `short_name(e)` of each entry and skips the LFN fragments, while `remove` and `write_file` route straight through it (only `find_entry` assembles LFNs). So `remove("My Document.txt")` returns NotFound on an existing file, and an overwrite `write_file` of an LFN-named file fails to unlink the old entry - it adds a DUPLICATE directory entry and the old cluster chain leaks forever. The tests miss it because the one LFN write test writes once and never overwrites or removes. Fix: match against the assembled LFN (share the scan with `find_entry`), keeping the 8.3 match as the fallback. exFAT is unaffected (`exfat_unlink` decodes the UTF-16 name).
+- [ ] (B2, high) The exFAT NoFatChain flag is ignored: the stream extension's GeneralSecondaryFlags (bit 0x02) is never read, and `read_chain` always follows the FAT - but Windows writes contiguous files with NoFatChain=1 and no FAT chain at all, which on real media is most files. A multi-cluster NoFatChain file reads back silently TRUNCATED (the FAT there is zero, so the walk stops after the first cluster), and `exfat_remove` frees only the first cluster (a leak; with stale FAT junk, possibly the wrong ones). Fix: parse the flags in `parse_exfat_dir` / `exfat_unlink`, and read/free a NoFatChain file as `data_length.div_ceil(cluster_bytes)` contiguous clusters from `first_cluster`. (The allocation bitmap is NOT affected - the 0x81 entry has no NoFatChain flag and its chain legitimately lives in the FAT.)
+- [ ] (B3, low) `write_file` frees the old file before the new one is safe: the order is unlink (free the old chain) -> alloc -> write data -> `add_entry`, so a failure at `add_entry` (e.g. NoSpace growing the directory) loses the old data AND leaks the freshly allocated chain (FAT entries set, no directory entry). Fix: allocate and write the new chain first, then swap the directory entry, then free the old chain; free the new chain on any failure path.
+- Done when: an LFN-named file overwrites and removes correctly (no duplicate entries, no leaked chains), a Windows-written NoFatChain exFAT file reads back whole and frees fully, a failed overwrite leaves the old file intact, and new tests cover each - suite green.
+- Concept: M48/M59 (the FAT read/write support these fix), the LiberFS audit track's proportionality rule (a failed write must not cost the old data).
+
+## M87 - FAT: hostile-media robustness (no panic, no hang on any boot sector or chain)
+
+The crate's whole job is mounting foreign removable media - the least trustworthy
+bytes in the system. Every value read off the medium needs a bound before use,
+same rule the LiberFS track (M80/M81) baked into the native FS; today several
+malformed-but-plausible boot sectors panic or hang the storage service.
+
+- [ ] (B1, high) `Geometry::exfat` shift overflow: `1u32 << b[108]` / `<< b[109]` with a byte >= 32 panics a debug build ("shift left with overflow"), and in release the shift amount WRAPS - e.g. 41 becomes 9, yielding 512 bytes/sector and a garbage geometry that passes validation. Bound both exponents (bytes-per-sector 9..=12, sectors-per-cluster <= 25) before shifting.
+- [ ] (B2, high) `Geometry::bpb` unchecked arithmetic: `total - first_data_sector` underflows u32 on a forged BPB where the reserved/FAT/root regions exceed the total sector count, and `num_fats * fat_size` (both off the disk, up to 255 * 4G) overflows even earlier - each a debug-build panic at mount. Use checked arithmetic and refuse the volume (mount returns None).
+- [ ] (B3, medium) `last_cluster` has no cycle or free-entry guard - the ONE FAT walk without one (`read_chain` and `free_chain` both have guards). A cyclic chain on corrupt media hangs the directory-grow path forever; worse, a chain that hits a FREE entry walks to cluster 0, whose FAT slot is the media descriptor and reads as end-of-chain, so `add_entry` then does `set_fat_entry(0, grow)` - overwriting FAT[0]. Add the step guard and refuse cluster values < 2 as Invalid.
+- [ ] (B4, low) `add_entry`'s grow path can panic: when the directory is full it grows exactly ONE cluster and writes the entry set without rechecking - a 255-byte name is 21 entries = 672 bytes, which overruns a 512-byte cluster (`bytes[at + k * 32 ..]` slices past the resized buffer). Narrow conditions (name > 195 bytes + 512 B clusters + a full directory), but it is a panic: grow enough clusters for the whole set, or re-run the slot search after growing.
+- [ ] (B5, low) `mount` accepts garbage with plausible numbers: the boot-sector signature 0x55AA at offset 510 is never checked. Check it for the classic BPB path (exFAT is already gated on its 8-byte magic), so random sectors stop mounting as FAT.
+- Done when: a fuzz-shaped hostile boot sector or FAT (insane shift exponents, forged region sizes, cyclic or free-pointing chains, a full directory + max-length name) is refused or errors cleanly - never a panic, hang, or FAT[0] overwrite - with a test per bound, suite green.
+- Concept: M80/M81 (the hostile-disk rule extended to the foreign-media crate: bound every count, length and pointer off the medium), M48 (the mount path this hardens).
+
+## M88 - FAT: allocation bounds and spec conformance
+
+The remaining audit findings: two allocation/walk bounds that bite on large or
+nearly-full volumes, and the spec-conformance debts that make our volumes look
+wrong to other systems.
+
+- [ ] (B1, medium) `read_chain`'s loop guard is wrong for FAT12/16: `fat_size * (bps / 4 + 1)` assumes 4-byte FAT entries, but FAT16 holds 256 entries per 512 B sector and FAT12 341 - so a legitimate file whose chain exceeds ~50 % (FAT16) / ~38 % (FAT12) of the volume's clusters fails with a false Invalid. Derive the guard from the family's real entries-per-sector (or `max_cluster()`).
+- [ ] (B2, medium) `max_cluster` is derived from the FAT's byte size alone, which usually has slack past the real cluster count: `bpb` computes `clusters` and throws it away, and the exFAT ClusterCount field (offset 92) is never read. On a nearly full volume `alloc_chain` / `exfat_alloc` then hands out cluster numbers past the data region - the data write lands outside the volume (an Io error on our images, adjacent-data corruption where the device is larger) and the already-written FAT entries leak as an orphan chain. Store the real cluster count in `Geometry` and cap `max_cluster` with it.
+- [ ] (B3, medium) `gen_short` violates the 8.3 rules: no `~N` numeric-tail uniquification (two long names with a common prefix produce IDENTICAL short entries - a spec violation chkdsk flags), no sanitization of the 8.3-illegal characters (space, `+`, `,`, `;`, `=`, `[`, `]`), and a leading-dot name like `.foo` yields an empty base - a short name starting with 0x20, which the spec forbids. Generate `NAME~N` tails checked against the directory and map illegal bytes to `_`.
+- [ ] (B4, low) `set_fat_entry` zeroes the FAT32 reserved top nibble (`val & 0x0FFF_FFFF` written whole) instead of preserving it with a read-modify-write, as the specification requires.
+- [ ] (B5, low) FAT32 FSInfo (sector 1) is never updated after allocate/free, so other systems see a stale free-cluster count on media we wrote.
+- [ ] (B6, low) `..` breaks on FAT32: a dot-dot entry pointing at the root carries first_cluster 0, which `resolve_dir` maps to the FAT12/16 fixed root region - nonexistent on FAT32 (root_entries 0), so `list_dir("dir/..")` returns empty instead of the root. Map cluster 0 to `root_cluster()` when descending.
+- [ ] (B7, cosmetic) `add_entry`'s dead `let _ = need;` goes (the length check it stood in for lands with M87-B4).
+- Done when: a large FAT12/16 file reads whole, allocation never leaves the real data region, our short names are unique and spec-legal (chkdsk-clean), FAT32 reserved bits and FSInfo are honored, `..` resolves on FAT32, and the suite stays green with a test per bound.
+- Concept: M48/M59 (the write support these bounds finish), the interop purpose of the crate (volumes we write must look right to Windows/Linux), the audit track's rule that no constant or formula stands in for a value the medium states.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
