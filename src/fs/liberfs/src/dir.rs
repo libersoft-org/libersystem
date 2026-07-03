@@ -292,12 +292,18 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.internal_absorb_del(&mut buf, ptr, ci, outcome)
 	}
 
-	// List directory `dir_num` as (name, size, is_dir) triples.
+	// List directory `dir_num` as (name, size, is_dir) triples. An entry whose inode
+	// cannot be read - dangling (Invalid) or damaged (Corrupt / Io) - is skipped, so
+	// one bad entry never unlists the healthy rest; fsck names the damage and `remove`
+	// clears it.
 	pub(crate) fn read_dir_inode(&mut self, dir_num: u32) -> Result<Vec<(Vec<u8>, u64, bool)>, FsError> {
 		let mut out = Vec::new();
 		for (name, inode_num) in self.dir_entries_of(dir_num)? {
-			let inode = self.read_inode(inode_num)?;
-			out.push((name, inode.size, inode.kind == KIND_DIR));
+			match self.read_inode(inode_num) {
+				Ok(inode) => out.push((name, inode.size, inode.kind == KIND_DIR)),
+				Err(FsError::Invalid | FsError::Corrupt | FsError::Io) => {}
+				Err(e) => return Err(e),
+			}
 		}
 		Ok(out)
 	}

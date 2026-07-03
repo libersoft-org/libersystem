@@ -43,7 +43,10 @@ impl<D: BlockDevice> LiberFs<D> {
 		while let Some((dir, prefix)) = stack.pop() {
 			let entries = match self.dir_entries_of(dir) {
 				Ok(entries) => entries,
-				Err(FsError::Corrupt | FsError::Io) => {
+				// Invalid covers a dangling walk target: a directory entry (or the
+				// superblock's root_inode) naming an inode that does not exist -
+				// structural damage like any other.
+				Err(FsError::Corrupt | FsError::Io | FsError::Invalid) => {
 					checksum_failures += 1;
 					damaged.push(if prefix.is_empty() { b"/".to_vec() } else { prefix });
 					continue;
@@ -69,8 +72,9 @@ impl<D: BlockDevice> LiberFs<D> {
 				let bad = match checked {
 					Ok(bad) => bad,
 					// an unreadable block (a hostile out-of-pool pointer fails its read as
-					// Io) is damage to the operator, exactly like a checksum mismatch.
-					Err(FsError::Corrupt | FsError::Io) => 1,
+					// Io) and a dangling entry (Invalid: the inode does not exist) are
+					// damage to the operator, exactly like a checksum mismatch.
+					Err(FsError::Corrupt | FsError::Io | FsError::Invalid) => 1,
 					Err(e) => return Err(e),
 				};
 				if bad > 0 {

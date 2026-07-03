@@ -372,28 +372,40 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn remove_inner(&mut self, path: &[u8]) -> Result<(), FsError> {
 		let (parent, name) = self.resolve_parent(path, false)?;
 		let inode_num = self.dir_lookup(parent, name)?.ok_or(FsError::NotFound)?;
-		let inode = self.read_inode(inode_num)?;
-		if inode.kind == KIND_DIR && inode.size != 0 {
-			return Err(FsError::NotEmpty);
-		}
+		// a dangling entry (its inode does not exist - a hostile or corrupt volume;
+		// a legitimate writer commits entry and inode atomically) has nothing to drop
+		// or free, but its NAME must be removable - this is the operator's repair verb
+		// for what fsck names, and without it the only remedy is a reformat.
+		let inode = match self.read_inode(inode_num) {
+			Ok(inode) => Some(inode),
+			Err(FsError::Invalid) => None,
+			Err(e) => return Err(e),
+		};
+		if let Some(inode) = &inode {
+			if inode.kind == KIND_DIR && inode.size != 0 {
+				return Err(FsError::NotEmpty);
+			}
 
-		// clear the directory entry and free the inode in the new generation; its old
-		// blocks remain referenced by the previous generation and leave the new one.
-		if inode.kind == KIND_FILE {
-			self.drop_inode_blocks(&inode)?;
-		} else if inode.dir_root != 0 {
-			// an empty directory's tree root is 0; a non-zero root here cannot hold
-			// entries, but drop its node(s) defensively.
-			let mut map = vec![0u8; self.free.len()];
-			self.mark_dir_tree(inode.dir_root, &mut map)?;
-			for b in 0..self.num_blocks {
-				if test_bit(&map, b) {
-					self.drop_block(b);
+			// clear the directory entry and free the inode in the new generation; its old
+			// blocks remain referenced by the previous generation and leave the new one.
+			if inode.kind == KIND_FILE {
+				self.drop_inode_blocks(inode)?;
+			} else if inode.dir_root != 0 {
+				// an empty directory's tree root is 0; a non-zero root here cannot hold
+				// entries, but drop its node(s) defensively.
+				let mut map = vec![0u8; self.free.len()];
+				self.mark_dir_tree(inode.dir_root, &mut map)?;
+				for b in 0..self.num_blocks {
+					if test_bit(&map, b) {
+						self.drop_block(b);
+					}
 				}
 			}
 		}
 		self.dir_remove(parent, name)?;
-		self.free_inode(inode_num)?;
+		if inode.is_some() {
+			self.free_inode(inode_num)?;
+		}
 		Ok(())
 	}
 }

@@ -2031,3 +2031,33 @@ fn snapshot_names_must_be_utf8() {
 	fs.create_snapshot("z\u{00E1}loha".as_bytes()).unwrap();
 	assert_eq!(fs.list_snapshots().unwrap().len(), 1);
 }
+
+#[test]
+fn a_dangling_entry_is_reported_listable_around_and_removable() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"healthy.txt", b"ok").unwrap();
+	fs.write_file(b"ghost.txt", b"gone").unwrap();
+	let num = fs.lookup(b"ghost.txt").unwrap();
+	// forge the dangle through the crate's own machinery: drop the inode record and
+	// leave the directory entry (a legitimate writer commits both atomically, so this
+	// shape only exists on a hostile or corrupt volume).
+	fs.mutate(|fs| {
+		let inode = fs.read_inode(num)?;
+		fs.drop_inode_blocks(&inode)?;
+		fs.free_inode(num)
+	})
+	.unwrap();
+	// fsck names the dangling entry instead of dying on it...
+	let report = fs.fsck().unwrap();
+	assert!(report.checksum_failures >= 1);
+	assert!(report.damaged.contains(&b"ghost.txt".to_vec()));
+	// ...the directory still lists its healthy entries around it...
+	let names: Vec<Vec<u8>> = fs.list().unwrap().into_iter().map(|(n, _, _)| n).collect();
+	assert!(names.contains(&b"healthy.txt".to_vec()));
+	assert!(!names.contains(&b"ghost.txt".to_vec()));
+	// ...and `remove` clears the name: the repair verb for what fsck named.
+	fs.remove(b"ghost.txt").unwrap();
+	assert_eq!(fs.lookup(b"ghost.txt"), None);
+	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
+	assert_eq!(fs.read_file(b"healthy.txt").unwrap(), b"ok");
+}
