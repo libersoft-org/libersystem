@@ -2064,3 +2064,62 @@ fn a_dangling_entry_is_reported_listable_around_and_removable() {
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
 	assert_eq!(fs.read_file(b"healthy.txt").unwrap(), b"ok");
 }
+
+// The audit track's standing guard: deterministic random corruption over a volume
+// carrying every on-disk structure. Reading code proves what a reviewer thought of;
+// this probes what nobody thought of - and it must hold on every future change.
+
+// A splitmix64 PRNG: the fuzz smoke test must reproduce exactly, so failures are
+// debuggable by seed, never flaky.
+struct Rng(u64);
+
+impl Rng {
+	fn next(&mut self) -> u64 {
+		self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+		let mut z = self.0;
+		z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+		z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+		z ^ (z >> 31)
+	}
+}
+
+#[test]
+fn random_corruption_never_panics_or_hangs() {
+	// a rich volume, built once: nested directories, a compressed file, a fragmented
+	// (spilled) file, and a snapshot - every structure the mounts and walks touch.
+	let pool = 256u64;
+	let mut fs = format_lz(MemDevice::new(pool), pool);
+	fs.mkdir(b"docs/sub").unwrap();
+	fs.write_file(b"docs/a.txt", b"payload one").unwrap();
+	let compressible: Vec<u8> = b"compress me. ".iter().cycle().take(BLOCK_SIZE * 6).copied().collect();
+	fs.write_file(b"docs/sub/b.txt", &compressible).unwrap();
+	write_spilled_file(&mut fs);
+	fs.create_snapshot(b"snap").unwrap();
+	let pristine = fs.into_device();
+
+	let mut rng = Rng(0x4C69_6265_7246_5321);
+	for _ in 0..300 {
+		// flip 1..=24 random bytes anywhere in the image, superblocks included.
+		let mut dev = pristine.clone();
+		let flips = 1 + (rng.next() % 24) as usize;
+		for _ in 0..flips {
+			let at = (rng.next() % dev.blocks.len() as u64) as usize;
+			dev.blocks[at] ^= (rng.next() % 255 + 1) as u8;
+		}
+		// whatever the damage: the mount refuses, degrades, or serves - and every
+		// probe completes with a Result, never a panic, hang, or blow-up.
+		let Some(mut fs) = LiberFs::mount(dev) else {
+			continue;
+		};
+		let _ = fs.fsck();
+		let _ = fs.list();
+		let _ = fs.read_dir(b"docs");
+		let _ = fs.read_file(b"docs/a.txt");
+		let _ = fs.read_file(b"docs/sub/b.txt");
+		let _ = fs.read_file(b"frag.bin");
+		let _ = fs.list_snapshots();
+		let _ = fs.read_file_from_snapshot(b"snap", b"docs/a.txt");
+		let _ = fs.write_file(b"probe.txt", b"probe");
+		let _ = fs.remove(b"docs/a.txt");
+	}
+}

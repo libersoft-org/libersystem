@@ -1531,7 +1531,9 @@ and two nits at the edges - the audit track's remainders.
   - Result: every accumulation site saturates - fsck's four (the rederivation catch, both live-walk sites, the snapshot loop), both check-tree recursions, and `count_corrupt`'s per-extent sums.
 - Done when: a NUL-bearing snapshot name is refused (host test), the failure count saturates instead of wrapping, and the suite stays green.
   - Result: all hold - liberfs 91 host tests, kernel 88 fresh + 88 mount, build 0 warnings.
-- Concept: M83-B2 (the UTF-8 rule this completes: valid encoding AND stable identity), the M78 spec's NUL-padding rule (which makes an embedded NUL an early terminator), and the track's bounding rule applied to fsck's own arithmetic.
+- [x] (added while closing the track) A standing fuzz guard, so the hostile-disk bounds hold on every future change by test rather than by review: a deterministic (seeded splitmix64, reproducible by construction) corruption smoke test - 300 rounds of 1-24 random byte flips anywhere in a rich volume image (nested directories, a compressed file, a spilled extent chain, a snapshot; superblocks included), then mount + fsck + listings + reads (live and from the snapshot) + a write and a remove probe, all of which must complete with a Result: never a panic, hang, or blow-up.
+  - Result: `random_corruption_never_panics_or_hangs` - green on the first run (the M80-M85 bounds hold against randomness, not just against the reviewer's imagination), and from now on any regression in any bound fails the host suite. Two closing cosmetics landed alongside: resolve through a file answers NotDir (M76 classification), and the format-time label truncation backs off a split UTF-8 character.
+- Concept: M83-B2 (the UTF-8 rule this completes: valid encoding AND stable identity), the M78 spec's NUL-padding rule (which makes an embedded NUL an early terminator), and the track's bounding rule applied to fsck's own arithmetic. The fuzz guard is the track's closing move: reviews found the bugs, the test keeps them found.
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
