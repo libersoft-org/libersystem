@@ -1535,7 +1535,7 @@ and two nits at the edges - the audit track's remainders.
   - Result: `random_corruption_never_panics_or_hangs` - green on the first run (the M80-M85 bounds hold against randomness, not just against the reviewer's imagination), and from now on any regression in any bound fails the host suite. Two closing cosmetics landed alongside: resolve through a file answers NotDir (M76 classification), and the format-time label truncation backs off a split UTF-8 character.
 - Concept: M83-B2 (the UTF-8 rule this completes: valid encoding AND stable identity), the M78 spec's NUL-padding rule (which makes an embedded NUL an early terminator), and the track's bounding rule applied to fsck's own arithmetic. The fuzz guard is the track's closing move: reviews found the bugs, the test keeps them found.
 
-## FAT audit track (M86-M88)
+## FAT audit track (M86-M89)
 
 A full read of the fat crate (2026-07-03, lib.rs ~1030 lines + tests), the same
 treatment the LiberFS audit track gave the native filesystem. The read paths and
@@ -1608,6 +1608,27 @@ wrong to other systems.
 - Done when: a large FAT12/16 file reads whole, allocation never leaves the real data region, our short names are unique and spec-legal (chkdsk-clean), FAT32 reserved bits and FSInfo are honored, `..` resolves on FAT32, and the suite stays green with a test per bound.
   - Result: all hold - fat 32 host tests (12 new across M86-M88), `just build` clean, kernel 89 [ok], 0 warnings, fmt clean.
 - Concept: M48/M59 (the write support these bounds finish), the interop purpose of the crate (volumes we write must look right to Windows/Linux), the audit track's rule that no constant or formula stands in for a value the medium states.
+
+## M89 - FAT: second-pass findings (the sector-size read bug and the leftovers)
+
+The second full source pass (2026-07-04, after M86-M88 landed, lib.rs ~1360
+lines) re-verified the fixes hold - mark/swap offsets stay in bounds, hostile
+`secondary` counts cannot panic, the FSInfo pairing balances on error paths, the
+grow loop terminates - and found one serious latent bug the earlier rounds
+missed plus a set of leftovers: a read-path unit error that breaks every volume
+with logical sectors larger than 512 B, the one hostile-size gate the M87 sweep
+did not reach (the LiberFS M81-B2 class), and spec/robustness nits in the
+short-name and directory-slot machinery.
+
+- [ ] (B1, high) Double ratio scaling on the READ path: `cluster_lba` returns a DEVICE LBA (it multiplies by `bps / 512`), but `read_chain` / `read_contiguous` pass it to `read_fs_sectors`, which takes an FS sector and multiplies by the ratio AGAIN (`sec * ratio + i`) - while the write paths (`write_clusters`, `write_dir_bytes`) compute the FS sector correctly. On any volume with logical sectors > 512 B (4K-native exFAT / FAT on big drives) every data, directory and NoFatChain read lands on the wrong sectors: the volume mounts and is then all garbage, and a write never reads back. Latent since M48 - every test and QEMU image uses 512 B sectors. Fix: `cluster_lba` returns the FS sector (drop the ratio multiply); add a host test over a bps=1024 fixture so the unit error can never return.
+- [ ] (B2, medium) A hostile NoFatChain `size` off the disk is unbounded - the LiberFS M81-B2 class, missed for FAT: `count = size.div_ceil(cluster_bytes)` drives the loops in `read_contiguous`, `read_dir_bytes`' NFC arm and `exfat_free_contiguous`, so a forged size near u64::MAX hangs the free (~4.5e15 iterations), OOMs the read (the Vec grows until the heap dies; only an exactly-sized device fails over to Io first, a partition-backed one does not), and overflows the `first + i as u32` cluster arithmetic (a debug panic). Refuse `size > cluster_count * cluster_bytes` as Invalid and clamp the run to the clusters that remain between `first` and the end of the heap.
+- [ ] (B3, medium-low) A generated short name can begin with byte 0xE5: `short_char` passes bytes >= 0x80 through, and 0xE5 is the UTF-8 lead byte of a real CJK range - an entry whose 8.3 field starts with it reads back as DELETED (the parser skips it and discards its LFN fragments). Writing such a name silently loses the file: the data is on disk, the entry is invisible, the chain leaks. The specification stores a leading 0xE5 as 0x05; map it there (or to `_`).
+- [ ] (B4, low) `free_run` / `exfat_free_run` can place an entry set AFTER the 0x00 terminator: the spec says everything from the first 0x00 entry is free, but the scan demands 0x00/0xE5 bytes - on corrupt/hostile media with stale non-free garbage past the terminator, the first fitting run can sit beyond it, and the new entry is written where the parser (which stops at the terminator) never looks: a silently "lost" write plus a leaked chain. Treat everything from the first 0x00 as free.
+- [ ] (B5, low) Names made only of dots (`.`, `..`, `...`) or with trailing dots/spaces are accepted by `write_file`: `gen_short` strips the dots into an empty basis (a bare `~1` short) and the LFN carries `.` / `..`, colliding with the dot-entry semantics (`remove(".")` in a subdirectory hits the directory's own dot entry -> Invalid) - and such names are invalid on the media's home systems anyway. Reject a name that is empty after stripping dots and trailing spaces.
+- [ ] (B6, low) A BPB whose cluster count computes to 0 still mounts (the exFAT path refuses `cluster_count == 0`): the degenerate volume then fails piecemeal (`max_cluster` = 1, NoSpace, Invalid walks). Refuse it at `bpb` for consistency.
+- [ ] (B7, cosmetic) Two nits: `data.len() as u32` in the classic `write_file` silently truncates a > 4 GB size (unreachable today - the buffer is in memory - but a one-line `TooLong` guard makes the FAT32 limit visible), and `alloc_chain`'s `!chain.contains(&c)` is dead code (`c` is strictly increasing, so the filter never fires).
+- Done when: a bps=1024 fixture round-trips reads and writes (the unit error is test-pinned), a forged NoFatChain size is refused - never a hang, OOM or overflow, a CJK-leading name survives a write-read-remove cycle, an entry set never lands beyond the terminator, dot-only names are refused, a zero-cluster BPB does not mount, and the suite stays green with a test per finding.
+- Concept: M86-M88 (the audit this closes out), M81-B2 (the on-medium size gate extended to the last FAT consumer), the interop purpose of the crate (4K-native media are real media; a written file must never be invisible to the volume's home systems).
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
