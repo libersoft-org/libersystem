@@ -1209,7 +1209,7 @@ multi-page DMA buffers.
 - Done when: bulk disk and network I/O move in large requests, the measured throughput improves accordingly, tests green.
 - Concept: M23/M24/M62 (the drivers this accelerates), the limits audit (the last "one page" assumptions removed).
 
-## LiberFS audit track (M73-M83)
+## LiberFS audit track (M73-M84)
 
 A full read of the crate (~3900 lines: lib/txn/fsops/dir/inode/blkalloc/snapshot/
 fsck + tests) plus the service and driver wiring around it (2026-07-02). The core -
@@ -1504,6 +1504,19 @@ and a duplicated parser is a duplicated vulnerability.
   - Result: all hold - liberfs 90 host tests (1 new), kernel 88 fresh + 88 mount (1 new), build 0 warnings.
 - Concept: M79-B1/M80-B1 (the disk's content must never kill the service - now applied to the last boot-time reader), the M78 spec (whose UTF-8 rule B2 enforces at the API), and the audit track's parser rule: one format, ONE parser - the sizing loop must not re-implement what `Package::parse` already validates.
 
+## M84 - LiberFS: dangling directory entries (report them, list around them, remove them)
+
+The eighth full source pass (2026-07-03, after M83 landed) found one uncovered
+class: a directory entry pointing at an inode that does not exist. A legitimate
+CoW writer never dangles one (the entry and the inode commit atomically), but a
+hostile or corrupt volume can - and `read_inode` answers a missing inode with
+FsError::Invalid, which no protective catch covers.
+
+- [ ] (B1, medium) fsck dies on a dangling entry: the live walk reads each entry's inode, and the per-item catches (M82) cover `Corrupt | Io` but not `Invalid` - one dangling entry (or a hostile superblock `root_inode` naming a nonexistent root) returns the error mid-walk and the report dies. The third variant of the M82 family: a dangling entry IS structural damage - count it, name its path, keep walking.
+- [ ] (B2, medium-low) A dangling entry is unrepairable and poisons its directory: `read_dir_inode` stats every entry through `read_inode`, so ONE dangling entry fails the whole listing; `remove_inner` reads the inode before deleting, so the entry cannot be removed; `write_file` / `rename` over the name fail the same way - the operator's only remedy is a reformat. Give the volume a repair path: `read_dir_inode` skips entries whose inode cannot be read (the healthy rest lists; fsck names the damaged), and `remove_inner` tolerates a missing inode (clear the entry, skip the drop/free - there is nothing to free) - so fsck NAMES the damage and `remove` CLEARS it.
+- Done when: fsck on a volume with a dangling entry returns a report naming it, the directory still lists its healthy entries, `remove` clears the dangling name, and the suite stays green - covered by a host test forging a dangling entry.
+- Concept: M82 (the report-not-death contract, extended to its last error variant), M76 (the error-classification this leans on: Invalid = internal inconsistency), and the track's proportionality rule - damage is named and repaired, it never bricks a directory.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
@@ -1526,7 +1539,7 @@ workloads; multi-queue devices and the per-CPU interrupt-vector spaces they need
 (one vector number per device suffices until then - the M72 throughput work stays
 single-queue); immutable signed system + A/B updates + rollback + verified boot;
 encrypted user volumes; LiberFS work beyond the M53-M57 modernization and the
-M73-M83 audit track (online
+M73-M84 audit track (online
 resize, online defrag, multi-device / RAID; deduplication and encryption stay out by decision);
 first-party server apps (a
 static-file web server and the like); and a CLI package manager over the phase-2
