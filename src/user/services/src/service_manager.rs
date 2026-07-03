@@ -6,9 +6,10 @@
 // is started only once every service it depends on is up. Each service is spawned
 // with its own report channel; ServiceManager waits for its "online" report,
 // records its state, keeps that channel as the service's control channel, and
-// relays the report up to SystemManager. After the whole set is up it exercises
-// the stop path on a leaf service, exercises the restart policy and watchdog on a
-// managed canary, reports in itself, and then stands as a supervisor for the life
+// relays the report up to SystemManager. In a test boot (per the "MODE" flag the
+// kernel sends down the chain) it then exercises the stop path on a leaf service
+// and the restart policy and watchdog on a managed canary; a production boot skips
+// those drills. It reports in itself and then stands as a supervisor for the life
 // of the system.
 //
 // As a supervisor it does not exit after bring-up: it blocks on every live control
@@ -141,6 +142,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 
+	// 1c. receive the boot mode flag ("MODE" + one byte, relayed down the chain from
+	//     the kernel). The bring-up self-tests - the stop-path exercise and the canary
+	//     crash / hang drills - run only in a test boot (1); a production boot (0)
+	//     never deliberately faults a process or stops a service.
+	let selftest: bool = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, .. } if len == 5 && &buf[..4] == b"MODE" => buf[4] == 1,
+		_ => exit(),
+	};
+
 	// 2. bring the services up in dependency order. Each pass starts every pending
 	//    service whose dependencies are all Running; repeat until a pass makes no
 	//    progress (everything started, or what is left is blocked on a failed or
@@ -254,32 +264,36 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// drivers alongside the managed services - drivers are services too.
 	let driver_state: [(&'static [u8], bool); 6] = [(b"driver.virtio_blk", block_client != 0), (b"driver.virtio_net", net_frames != 0), (b"driver.virtio_gpu", gpu_client != 0), (b"driver.virtio_snd", snd_client != 0), (b"driver.virtio_input", input_raw != 0), (b"driver.xhci", block5_client != 0)];
 
-	// 3. exercise the stop path on a leaf service. DeviceManager is the safe choice:
-	//    nothing depends on it, so stopping it does not tear down the running system
-	//    (stopping log_service, storage_service, or the interactive shell would).
+	// 3. in a test boot, exercise the stop path on a leaf service. DeviceManager is the
+	//    safe choice: nothing depends on it, so stopping it does not tear down the running
+	//    system (stopping log_service, storage_service, or the interactive shell would).
 	//    This proves the supervisor can stop a service and track the transition, and
-	//    the transition is recorded in the journal like the startup events.
+	//    the transition is recorded in the journal like the startup events. A production
+	//    boot skips the exercise and leaves DeviceManager running.
 	let mut sup: [Supervised; N] = [Supervised::new(); N];
-	if let Some(dev) = index_of(b"device_manager") {
-		if state[dev] == State::Running {
-			state[dev] = unsafe { stop_service(channels[dev], bootstrap, &mut buf) };
-			sup[dev].failure = Failure::Stopped;
-			channels[dev] = 0;
-			unsafe { emit_event(log_client, b"device_manager", b"stopped") };
+	if selftest {
+		if let Some(dev) = index_of(b"device_manager") {
+			if state[dev] == State::Running {
+				state[dev] = unsafe { stop_service(channels[dev], bootstrap, &mut buf) };
+				sup[dev].failure = Failure::Stopped;
+				channels[dev] = 0;
+				unsafe { emit_event(log_client, b"device_manager", b"stopped") };
+			}
 		}
 	}
 
-	// 3b. exercise the restart policy and the watchdog on the managed canary. The
-	//     supervisor owns the canary outright (it is not in the manifest and no other
-	//     component holds a channel to it), so it can crash it, hang it, and restart it
-	//     without disturbing the running system - proving the unattended-recovery
-	//     machinery an edge node depends on. A crash is detected by the control channel
-	//     peer-closing and recovered by a policy restart with back-off; a hang is caught
-	//     by a missed heartbeat and recovered by a kill + restart. Each transition is
-	//     reported up the boot chain and journaled. (Transparent restart of a real
-	//     service other components hold channels to needs a re-resolve/broker, deferred;
-	//     the canary stands in for the policy, while crash detection below applies to
-	//     every real service.)
+	// 3b. bring up the managed canary and, in a test boot, exercise the restart policy
+	//     and the watchdog on it. The supervisor owns the canary outright (it is not in
+	//     the manifest and no other component holds a channel to it), so it can crash it,
+	//     hang it, and restart it without disturbing the running system - proving the
+	//     unattended-recovery machinery an edge node depends on. A crash is detected by
+	//     the control channel peer-closing and recovered by a policy restart with
+	//     back-off; a hang is caught by a missed heartbeat and recovered by a kill +
+	//     restart. Each transition is reported up the boot chain and journaled. A
+	//     production boot spawns and supervises the canary but never deliberately faults
+	//     it. (Transparent restart of a real service other components hold channels to
+	//     needs a re-resolve/broker, deferred; the canary stands in for the policy, while
+	//     crash detection below applies to every real service.)
 	let (park, _park_peer): (u64, u64) = match unsafe { channel() } {
 		Some(pair) => pair,
 		None => (0, 0),
@@ -294,23 +308,25 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			canary_ctrl = ctrl;
 			send_blocking(bootstrap, b"WatchdogProbe: online", 0);
 			emit_event(log_client, b"watchdog_probe", b"online");
-			// prove the heartbeat path on a healthy canary: it answers the probe in time.
-			let _alive: bool = heartbeat(canary_ctrl, clock() + WATCHDOG_TICKS);
-			// crash -> restart: command a real fault, observe the peer-close, restart per policy.
-			send_blocking(canary_ctrl, b"CRASH", 0);
-			if restart_canary(&package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, Failure::Crashed, park, &mut buf) {
-				send_blocking(bootstrap, b"WatchdogProbe: restarted", 0);
-				emit_event(log_client, b"watchdog_probe", b"restarted");
-			}
-			// hang -> watchdog -> restart: command a hang, miss the heartbeat, kill the hung
-			// process, then restart per policy.
-			send_blocking(canary_ctrl, b"HANG", 0);
-			if !heartbeat(canary_ctrl, clock() + WATCHDOG_TICKS) {
-				canary_sup.watchdog_trips += 1;
-				signal(canary_proc, SIG_KILL);
-				if restart_canary(&package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, Failure::Hung, park, &mut buf) {
-					send_blocking(bootstrap, b"WatchdogProbe: recovered", 0);
-					emit_event(log_client, b"watchdog_probe", b"recovered");
+			if selftest {
+				// prove the heartbeat path on a healthy canary: it answers the probe in time.
+				let _alive: bool = heartbeat(canary_ctrl, clock() + WATCHDOG_TICKS);
+				// crash -> restart: command a real fault, observe the peer-close, restart per policy.
+				send_blocking(canary_ctrl, b"CRASH", 0);
+				if restart_canary(&package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, Failure::Crashed, park, &mut buf) {
+					send_blocking(bootstrap, b"WatchdogProbe: restarted", 0);
+					emit_event(log_client, b"watchdog_probe", b"restarted");
+				}
+				// hang -> watchdog -> restart: command a hang, miss the heartbeat, kill the hung
+				// process, then restart per policy.
+				send_blocking(canary_ctrl, b"HANG", 0);
+				if !heartbeat(canary_ctrl, clock() + WATCHDOG_TICKS) {
+					canary_sup.watchdog_trips += 1;
+					signal(canary_proc, SIG_KILL);
+					if restart_canary(&package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, Failure::Hung, park, &mut buf) {
+						send_blocking(bootstrap, b"WatchdogProbe: recovered", 0);
+						emit_event(log_client, b"watchdog_probe", b"recovered");
+					}
 				}
 			}
 		}
@@ -627,6 +643,20 @@ unsafe fn emit_event(log_client: u64, source: &[u8], event: &[u8]) {
 	let _ = client.emit(&entry);
 }
 
+// Mirror a runtime service transition to the debug console, so an operator watching
+// the console sees a service stop, crash, or restart the moment it happens - the
+// journal carries the same event for `log`, but a state change must never be silent.
+// Bring-up reports are not mirrored here: the boot chain already prints those.
+unsafe fn console_report(source: &[u8], event: &[u8]) {
+	let mut line: Vec<u8> = Vec::new();
+	line.extend_from_slice(b"supervisor: ");
+	line.extend_from_slice(source);
+	line.push(b' ');
+	line.extend_from_slice(event);
+	line.push(b'\n');
+	unsafe { print(&line) };
+}
+
 // Stop a running service over its control channel: send the "STOP" sentinel, then
 // wait for the service's "stopped" acknowledgement and relay it up like its start
 // report. Returns Stopped on a clean shutdown (or if the service was already gone).
@@ -675,22 +705,44 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: 
 		if !send_blocking(manager_side, b"LOG", log_dup as u64) {
 			return false;
 		}
-		if !send_blocking(manager_side, b"DEVICE", device_client) {
+		// The device / config / time / audio / resource clients are the serve ROOTS of
+		// their services (`serve_multi` ends when the root closes), and the thin-launcher
+		// shell closes them on receipt (governed tools reach these services through
+		// PermissionManager's sub-connections instead). Hand the shell duplicates - like
+		// LOG above - so the supervisor keeps every root alive for the life of the system;
+		// transferring the originals let the shell's close tear the services down.
+		let device_dup: i64 = duplicate(device_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		if device_dup < 0 {
+			return false;
+		}
+		if !send_blocking(manager_side, b"DEVICE", device_dup as u64) {
 			return false;
 		}
 		if !send_blocking(manager_side, b"PROCESS", process_client) {
 			return false;
 		}
-		if !send_blocking(manager_side, b"CONFIG", config_client) {
+		let config_dup: i64 = duplicate(config_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		if config_dup < 0 {
+			return false;
+		}
+		if !send_blocking(manager_side, b"CONFIG", config_dup as u64) {
 			return false;
 		}
 		if !send_blocking(manager_side, b"NET", net_client) {
 			return false;
 		}
-		if !send_blocking(manager_side, b"TIME", time_client) {
+		let time_dup: i64 = duplicate(time_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		if time_dup < 0 {
 			return false;
 		}
-		if !send_blocking(manager_side, b"AUDIO", audio_client) {
+		if !send_blocking(manager_side, b"TIME", time_dup as u64) {
+			return false;
+		}
+		let audio_dup: i64 = duplicate(audio_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		if audio_dup < 0 {
+			return false;
+		}
+		if !send_blocking(manager_side, b"AUDIO", audio_dup as u64) {
 			return false;
 		}
 		if !send_blocking(manager_side, b"INPUT", input_client) {
@@ -707,8 +759,14 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: 
 			return false;
 		}
 		// The ResourceManager client, so the shell's `usage` command can render the live
-		// per-Domain budgets. Sent right after PERM to match the shell's receive order.
-		if !send_blocking(manager_side, b"RESOURCE", res_client) {
+		// per-Domain budgets. Sent right after PERM to match the shell's receive order - a
+		// duplicate, like the other launcher-dropped clients above, so the supervisor keeps
+		// the serve root.
+		let res_dup: i64 = duplicate(res_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		if res_dup < 0 {
+			return false;
+		}
+		if !send_blocking(manager_side, b"RESOURCE", res_dup as u64) {
 			return false;
 		}
 		// VT 1's session capability. The session is minted once from the session factory
@@ -1485,6 +1543,7 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 						sup[idx].failure = Failure::Crashed;
 						channels[idx] = 0;
 						emit_event(log_client, MANIFEST[idx].name, b"crashed");
+						console_report(MANIFEST[idx].name, b"crashed");
 					}
 				}
 				1 => {
@@ -1493,8 +1552,10 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 					if let Polled::Closed = try_recv(*canary_ctrl, buf) {
 						if restart_canary(package, canary_proc, canary_ctrl, canary_sup, Failure::Crashed, park, buf) {
 							emit_event(log_client, b"watchdog_probe", b"restarted");
+							console_report(b"watchdog_probe", b"restarted");
 						} else {
 							emit_event(log_client, b"watchdog_probe", b"escalated");
+							console_report(b"watchdog_probe", b"escalated");
 						}
 					}
 				}
@@ -1613,6 +1674,7 @@ unsafe fn stop_subtree(target: usize, state: &mut [State; N], channels: &mut [u6
 					state[i] = State::Stopped;
 					sup[i].failure = Failure::Stopped;
 					emit_event(log_client, MANIFEST[i].name, b"stopped");
+					console_report(MANIFEST[i].name, b"stopped");
 					if !stopped.is_empty() {
 						stopped.push(b'\n');
 					}

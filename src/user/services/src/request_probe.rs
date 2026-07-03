@@ -20,7 +20,7 @@
 extern crate alloc;
 
 use alloc::string::String;
-use proto::system::{log, Capability, Entry, Field, Severity};
+use proto::system::{Capability, Entry, Field, Severity, log};
 use rt::*;
 
 // The capability request rides the bootstrap channel as b"REQUEST" + the requested

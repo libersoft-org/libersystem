@@ -43,6 +43,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 
+	// 1c. receive the boot mode flag ("MODE" + one byte, 1 = test boot) to relay down
+	//     to ServiceManager, which gates its bring-up self-tests on it.
+	let mode: u8 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, .. } if len == 5 && &buf[..4] == b"MODE" => buf[4],
+		_ => exit(),
+	};
+
 	// 2. find ServiceManager in the package and spawn it, handing it one end of a
 	//    fresh control channel as its bootstrap.
 	let archive: &[u8] = unsafe { core::slice::from_raw_parts(pkg_base as *const u8, pkg_len) };
@@ -72,6 +79,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		rd_msg[..7].copy_from_slice(b"RAMDISK");
 		rd_msg[7..].copy_from_slice(&(ramdisk_len as u64).to_le_bytes());
 		send_blocking(sm_side, &rd_msg, ramdisk_handle);
+		let mode_msg: [u8; 5] = [b'M', b'O', b'D', b'E', mode];
+		send_blocking(sm_side, &mode_msg, 0);
 	}
 
 	// 4. relay every report ServiceManager sends up to the kernel. ServiceManager's

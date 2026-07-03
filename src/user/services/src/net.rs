@@ -178,11 +178,7 @@ fn udp_checksum(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
 		sum = (sum & 0xffff) + (sum >> 16);
 	}
 	let c: u16 = !(sum as u16);
-	if c == 0 {
-		0xffff
-	} else {
-		c
-	}
+	if c == 0 { 0xffff } else { c }
 }
 
 // The TCP checksum over the IPv4 pseudo-header (src, dst, proto, length) plus the
@@ -380,11 +376,7 @@ impl Stack {
 	// (on-link, reached by direct ARP), otherwise the gateway (off-link, routed). The
 	// L3 destination of the packet is still `dst`; only the L2 MAC we resolve changes.
 	pub fn next_hop(&self, dst: Ipv4Addr) -> Ipv4Addr {
-		if self.on_link(dst) {
-			dst
-		} else {
-			self.gateway
-		}
+		if self.on_link(dst) { dst } else { self.gateway }
 	}
 
 	// Whether `dst` is on our local subnet (its network part matches ours under the
@@ -1070,7 +1062,7 @@ impl Stack {
 			*b = 0;
 		}
 		out[ntp_off] = 0x23; // LI 0, VN 4, Mode 3 (client)
-					   // UDP header.
+		// UDP header.
 		let udp_off: usize = ETH_HDR + IPV4_HDR;
 		put16(out, udp_off, src_port);
 		put16(out, udp_off + 2, NTP_PORT);
@@ -1131,7 +1123,7 @@ impl Stack {
 		put32(out, boot_off + 4, 0x3903_f326); // xid (fixed; SLIRP is the only DHCP source)
 		put16(out, boot_off + 10, 0x8000); // flags: ask the server to broadcast its reply
 		out[boot_off + 28..boot_off + 34].copy_from_slice(&self.mac.0); // chaddr
-																  // DHCP magic cookie + options.
+		// DHCP magic cookie + options.
 		let mut p: usize = boot_off + BOOTP_HDR;
 		put32(out, p, DHCP_MAGIC);
 		p += 4;

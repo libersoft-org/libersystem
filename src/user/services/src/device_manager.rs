@@ -15,7 +15,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::{volume, OpenOpts};
+use proto::system::{OpenOpts, volume};
 use rt::*;
 
 // Where the non-bootstrap driver binaries live on the system volume (M61 box 8): a
@@ -224,7 +224,7 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 			close(file);
 			i += 1;
 		}
-			report_state(&state);
+		report_state(&state);
 	}
 }
 

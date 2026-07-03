@@ -352,6 +352,13 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	rdmsg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
 	let rdcap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
 	kernel_ep.send(Message::new(rdmsg, alloc::vec![rdcap], 0)).map_err(|_| "failed to hand SystemManager the ramdisk")?;
+
+	// Tell the boot chain which kind of boot this is: "MODE" + one byte, 1 in a test
+	// build and 0 in a production one. ServiceManager runs its bring-up self-tests
+	// (the stop-path exercise and the canary crash / hang drills) only in a test boot,
+	// so a production system never deliberately faults a process or stops a service.
+	let mode: u8 = if cfg!(test) { 1 } else { 0 };
+	kernel_ep.send(Message::new(alloc::vec![b'M', b'O', b'D', b'E', mode], alloc::vec::Vec::new(), 0)).map_err(|_| "failed to hand SystemManager the boot mode")?;
 	Ok((kernel_ep, sm_koid))
 }
 
