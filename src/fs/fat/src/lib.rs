@@ -108,6 +108,17 @@ impl<D: BlockDevice> FatFs<D> {
 		self.read_dir(self.root_cluster())
 	}
 
+	// The mounted family's name ("fat12" / "fat16" / "fat32" / "exfat"), for volume
+	// status reporting.
+	pub fn kind_name(&self) -> &'static str {
+		match self.geo.kind {
+			Kind::Fat12 => "fat12",
+			Kind::Fat16 => "fat16",
+			Kind::Fat32 => "fat32",
+			Kind::ExFat => "exfat",
+		}
+	}
+
 	// List a subdirectory named by a `/`-separated path. An empty path is the root.
 	pub fn list_dir(&mut self, path: &[u8]) -> Result<Vec<FileInfo>, FsError> {
 		let cluster = self.resolve_dir(path)?;

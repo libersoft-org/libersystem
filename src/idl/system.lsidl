@@ -99,14 +99,17 @@ record snapshot-info {
 
 // A volume's identity and health, for `lsvol` and the `volume` command: its label,
 // pool size and free space (the filesystem's own numbers, unlike `capacity` which asks
-// the disk), whether transparent compression is on for new writes, and whether the
-// mount is read-only (a snapshot mount, or degraded by on-disk damage).
+// the disk), whether transparent compression is on for new writes, whether the
+// mount is read-only (a snapshot mount, or degraded by on-disk damage), and the name
+// of the filesystem serving the volume ("liberfs", "fat16", "exfat", "iso9660",
+// "udf", "archive"). Foreign backends track no pool numbers and report zero bytes.
 record volume-status {
 	label:       string,
 	total-bytes: u64,
 	free-bytes:  u64,
 	compression: bool,
 	read-only:   bool,
+	filesystem:  string,
 }
 
 // What a volume integrity check found: how many data blocks failed their checksum,

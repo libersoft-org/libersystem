@@ -1,8 +1,9 @@
 # Bugs / changes
 
 - Console cursor is not blinking, it's static
-- lsvol, lsblk etc. (many other commands where possible) --json is not working - make it working
-- lsvol should show file system on volume
+- test if ls* commands have --json
+- df, du
+- all commands with --json parameter should be in human readable format (incl. colours) --json-min in current minimal format
 - lsblk is showing the type of block device (virtio-blk), mountpoint (vol://...) and size, but not the name of the device in device tree... also there should be table headers (device, type, volume, size)
 - Selecting something from console by mouse is lagging a lot... the whole console lags a lot even when paging (shift + pg up/down)
 - Console does not autocomplete by tab key as on Linux - it should autocomplete commands and local files (like cat ./mot -> should complete cat ./motd.txt)

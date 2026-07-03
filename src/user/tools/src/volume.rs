@@ -83,6 +83,7 @@ unsafe fn status(storage: u64) {
 			use core::fmt::Write as _;
 			let used: u64 = st.total_bytes - st.free_bytes;
 			let _ = writeln!(out, "vol://system \"{}\"", st.label);
+			let _ = writeln!(out, "  filesystem:  {}", st.filesystem);
 			let _ = writeln!(out, "  size:        {} ({} bytes)", human(st.total_bytes), st.total_bytes);
 			let _ = writeln!(out, "  used:        {} ({} bytes)", human(used), used);
 			let _ = writeln!(out, "  free:        {} ({} bytes)", human(st.free_bytes), st.free_bytes);

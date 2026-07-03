@@ -43,7 +43,7 @@ use fat::FatFs;
 use iso9660::Iso9660;
 use liberfs::{BlockDevice, FormatOpts, FsError, LiberFs};
 use proto::codec::Buffer;
-use proto::system::{Error, FileInfo, FileKind, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, volume};
+use proto::system::{volume, Error, FileInfo, FileKind, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus};
 use rt::*;
 use udf::Udf;
 
@@ -420,15 +420,22 @@ impl volume::Service for Volume {
 	}
 
 	// The filesystem's own identity and health numbers: label, pool and free bytes,
-	// the compression switch, and whether the mount is read-only. Only the LiberFS
-	// volume tracks these; the other backends refuse with `invalid`.
+	// the compression switch, whether the mount is read-only, and the filesystem's
+	// name. Only the LiberFS volume tracks pool numbers; the foreign backends report
+	// their filesystem name with zero bytes.
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		match self {
 			Volume::Disk(fs) => {
 				let block: u64 = liberfs::BLOCK_SIZE as u64;
-				Ok(VolumeStatus { label: String::from_utf8_lossy(fs.label()).into_owned(), total_bytes: fs.num_blocks() * block, free_bytes: fs.free_blocks() * block, compression: fs.compression(), read_only: fs.is_read_only() })
+				Ok(VolumeStatus { label: String::from_utf8_lossy(fs.label()).into_owned(), total_bytes: fs.num_blocks() * block, free_bytes: fs.free_blocks() * block, compression: fs.compression(), read_only: fs.is_read_only(), filesystem: String::from("liberfs") })
 			}
-			_ => Err(Error::Invalid),
+			Volume::Archive { .. } => Ok(VolumeStatus { label: String::new(), total_bytes: 0, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("archive") }),
+			Volume::Fat(backing) => {
+				let kind: &'static str = backing.run(|fs| Ok(fs.kind_name()))?;
+				Ok(VolumeStatus { label: String::new(), total_bytes: 0, free_bytes: 0, compression: false, read_only: false, filesystem: String::from(kind) })
+			}
+			Volume::Iso(_) => Ok(VolumeStatus { label: String::new(), total_bytes: 0, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("iso9660") }),
+			Volume::Udf(_) => Ok(VolumeStatus { label: String::new(), total_bytes: 0, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("udf") }),
 		}
 	}
 

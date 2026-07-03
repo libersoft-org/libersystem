@@ -103,6 +103,7 @@ An opaque kernel object, transferred as `handle<file>`.
 | `free-bytes` | `u64` |
 | `compression` | `bool` |
 | `read-only` | `bool` |
+| `filesystem` | `string` |
 
 ### record `fsck-report`
 

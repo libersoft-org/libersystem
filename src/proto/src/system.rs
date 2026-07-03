@@ -610,6 +610,7 @@ pub struct VolumeStatus {
 	pub free_bytes: u64,
 	pub compression: bool,
 	pub read_only: bool,
+	pub filesystem: String,
 }
 
 impl VolumeStatus {
@@ -632,6 +633,7 @@ impl VolumeStatus {
 		w.u64(self.free_bytes)?;
 		w.boolean(self.compression)?;
 		w.boolean(self.read_only)?;
+		w.bytes_lp(self.filesystem.as_bytes())?;
 		Some(())
 	}
 	pub(crate) fn read(r: &mut Reader) -> Option<VolumeStatus> {
@@ -640,7 +642,8 @@ impl VolumeStatus {
 		let free_bytes = r.u64()?;
 		let compression = r.boolean()?;
 		let read_only = r.boolean()?;
-		Some(VolumeStatus { label, total_bytes, free_bytes, compression, read_only })
+		let filesystem = r.string_lp()?;
+		Some(VolumeStatus { label, total_bytes, free_bytes, compression, read_only, filesystem })
 	}
 }
 
@@ -6465,6 +6468,9 @@ impl VolumeStatus {
 		} else {
 			out.push_str("false");
 		}
+		out.push(',');
+		out.push_str("\"filesystem\":");
+		crate::codec::json_escape(&self.filesystem, out);
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -6491,10 +6497,13 @@ impl VolumeStatus {
 		} else {
 			out.push_str("false");
 		}
+		out.push_str(", ");
+		out.push_str("filesystem=");
+		out.push_str(&self.filesystem);
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::map(out, 6);
 		crate::codec::cbor::text(out, "label");
 		crate::codec::cbor::text(out, &self.label);
 		crate::codec::cbor::text(out, "total-bytes");
@@ -6505,6 +6514,8 @@ impl VolumeStatus {
 		crate::codec::cbor::boolean(out, self.compression);
 		crate::codec::cbor::text(out, "read-only");
 		crate::codec::cbor::boolean(out, self.read_only);
+		crate::codec::cbor::text(out, "filesystem");
+		crate::codec::cbor::text(out, &self.filesystem);
 	}
 }
 
@@ -8636,9 +8647,9 @@ mod compat {
 	}
 	#[test]
 	fn volume_status_wire_is_stable() {
-		let sample = VolumeStatus { label: String::from("x"), total_bytes: 7, free_bytes: 7, compression: true, read_only: true };
+		let sample = VolumeStatus { label: String::from("x"), total_bytes: 7, free_bytes: 7, compression: true, read_only: true, filesystem: String::from("x") };
 		let bytes = sample.encode_vec();
-		let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 1, 1];
+		let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 120];
 		assert_eq!(bytes, golden);
 		assert_eq!(VolumeStatus::decode(&bytes).unwrap(), sample);
 	}

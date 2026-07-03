@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 
 use proto::codec::json_escape;
-use proto::system::{Ipv4Addr, PingReply, PingStatus, network};
+use proto::system::{network, Ipv4Addr, PingReply, PingStatus};
 use rt::*;
 
 // The representation ping renders its results in. Extend with further codecs (e.g.
@@ -318,7 +318,7 @@ fn parse_args(args: &[u8]) -> Option<(Option<u32>, OutputFormat, &[u8])> {
 			let (num, after_num): (&[u8], &[u8]) = next_token(skip_spaces(after));
 			count = Some(parse_u32(num)?);
 			rest = after_num;
-		} else if tok == b"--json" || tok == b"-j" {
+		} else if tok == b"--json" || tok == b"-j" || tok == b"json" {
 			format = OutputFormat::Json;
 			rest = after;
 		} else if tok.first() == Some(&b'-') {

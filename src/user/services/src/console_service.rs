@@ -32,7 +32,7 @@ use alloc::vec::Vec;
 // display `Surface`. This service supplies the userspace display backends - the boot
 // framebuffer and the virtio-gpu shared backing - and drives `Term`; the kernel boot
 // console shares the same `Term`.
-use term::{Geometry, Raster, RawSink, Surface, Term, CELL_H, CELL_W};
+use term::{CELL_H, CELL_W, Geometry, Raster, RawSink, Surface, Term};
 
 // The boot framebuffer the kernel maps directly: its pixel writes are visible immediately,
 // so present is a no-op. The fallback display (and the deterministic test path).
@@ -70,11 +70,7 @@ impl Surface for GpuSurface {
 // channel is given (it presents on FLUSH), else the boot framebuffer (present is a no-op).
 fn make_surface(addr: u64, fb: &Framebuffer, gpu: u64) -> Box<dyn Surface> {
 	let raster = Raster::new(addr, &geometry(fb));
-	if gpu != 0 {
-		Box::new(GpuSurface { raster, gpu })
-	} else {
-		Box::new(BootSurface { raster })
-	}
+	if gpu != 0 { Box::new(GpuSurface { raster, gpu }) } else { Box::new(BootSurface { raster }) }
 }
 
 // The renderer's `Geometry` for a mapped ABI `Framebuffer`: the pixel format the display

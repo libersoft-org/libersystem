@@ -703,12 +703,35 @@ fn push_var_value(out: &mut Vec<u8>, name: &[u8], vars: &[(String, String)]) {
 	}
 }
 
+// Rewrite the Linux-style `--json` / `--cbor` flag tokens to the bare `json` / `cbor`
+// forms the dispatch arms and the tools match on - one canonical spelling inside, both
+// accepted at the prompt.
+fn normalize_flags(line: &[u8]) -> Vec<u8> {
+	let mut out: Vec<u8> = Vec::with_capacity(line.len());
+	for (i, token) in line.split(|&b| b == b' ').enumerate() {
+		if i > 0 {
+			out.push(b' ');
+		}
+		match token {
+			b"--json" => out.extend_from_slice(b"json"),
+			b"--cbor" => out.extend_from_slice(b"cbor"),
+			_ => out.extend_from_slice(token),
+		}
+	}
+	out
+}
+
 unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, jobs: &mut Jobs, vars: &mut Vec<(String, String)>, cwd: &mut String) -> bool {
 	unsafe {
 		let line = trim(line);
 		if line.is_empty() {
 			return false;
 		}
+		// Normalize the Linux-style `--json` / `--cbor` flags to the bare tokens the
+		// dispatch arms and the tools match on, so `lsvol --json` and `lsvol json` are
+		// the same command whatever renders it.
+		let line: Vec<u8> = normalize_flags(line);
+		let line: &[u8] = &line;
 		// A bare `NAME=VALUE` sets a shell variable (write it through to the session so it
 		// persists, and update the cache); the value was already `$`-expanded upstream, so
 		// `FOO=$BAR` copies BAR's value. Checked before the `&` split so a value may hold one.
@@ -1051,6 +1074,10 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			// granter), which grants it the four volume StorageService clients (the `volumes`
 			// capability) and forwards this terminal.
 			run_tool(permsvc, b"lsvol", b"", cwd.as_bytes());
+			return false;
+		}
+		if line == b"lsvol json" {
+			run_tool(permsvc, b"lsvol", b"json", cwd.as_bytes());
 			return false;
 		}
 		if line == b"cd" {
