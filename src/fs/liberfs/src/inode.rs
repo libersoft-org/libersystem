@@ -61,7 +61,12 @@ impl<D: BlockDevice> LiberFs<D> {
 			if crc32c(&buf) != crc {
 				return Err(FsError::Corrupt);
 			}
-			let count = u32::from_le_bytes(buf[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].try_into().unwrap()) as usize;
+			// the count is read off the medium (a checksum proves integrity, not
+			// sanity): clamp it to what one chain block can hold AND to what the inode
+			// says is still missing, so a forged chain cannot graft records the extent
+			// map never had (they would break its sort order).
+			let want = (inode.extent_count as usize).saturating_sub(inode.extents.len());
+			let count = (u32::from_le_bytes(buf[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].try_into().unwrap()) as usize).min(EXTENTS_PER_BLOCK).min(want);
 			for i in 0..count {
 				let off = CHAIN_HDR + i * EXTENT_SIZE;
 				inode.extents.push(Extent::parse(&buf[off..off + EXTENT_SIZE]));

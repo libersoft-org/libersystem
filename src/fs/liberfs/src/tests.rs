@@ -558,7 +558,11 @@ fn newest_super_slot(dev: &MemDevice) -> u32 {
 		let off = slot as usize * BLOCK_SIZE + 28;
 		u64::from_le_bytes(dev.blocks[off..off + 8].try_into().unwrap())
 	};
-	if generation(1) > generation(0) { 1 } else { 0 }
+	if generation(1) > generation(0) {
+		1
+	} else {
+		0
+	}
 }
 
 #[test]
@@ -1750,7 +1754,11 @@ fn forge_superblock(dev: &mut MemDevice, slot: usize, f: impl FnOnce(&mut [u8]))
 // The slot holding the live (higher) generation in a raw device image.
 fn active_slot(dev: &MemDevice) -> usize {
 	let slot_gen = |s: usize| parse_superblock(&dev.blocks[s * BLOCK_SIZE..(s + 1) * BLOCK_SIZE]).map(|sb| sb.generation);
-	if slot_gen(1) > slot_gen(0) { 1 } else { 0 }
+	if slot_gen(1) > slot_gen(0) {
+		1
+	} else {
+		0
+	}
 }
 
 #[test]
@@ -1851,4 +1859,154 @@ fn fsck_reports_metadata_damage_instead_of_dying() {
 	let report = fs.fsck().unwrap();
 	assert!(report.checksum_failures >= 1);
 	assert_eq!(report.damaged, vec![b"/".to_vec()]);
+}
+
+// Doctor inode-tree leaf record `rec` in a raw device image (assumes the tree is a
+// single leaf): apply `f` to the record's 256-byte inode slot, then re-checksum the
+// leaf into the active superblock - the full forgery chain a hostile author performs.
+fn forge_inode_slot(dev: &mut MemDevice, f: impl FnOnce(&mut [u8])) {
+	let slot = active_slot(dev);
+	let sb = parse_superblock(&dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE]).unwrap();
+	let leaf_start = sb.inode_root as usize * BLOCK_SIZE;
+	let slot_off = leaf_start + NODE_HDR + INODE_REC + 8;
+	f(&mut dev.blocks[slot_off..slot_off + INODE_SIZE]);
+	let crc = crc32c(&dev.blocks[leaf_start..leaf_start + BLOCK_SIZE]);
+	forge_superblock(dev, slot, |sb| sb[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes()));
+}
+
+// Write a file fragmented into six extents (sparse, alternating logical blocks), so
+// its extent map spills past the four inline slots into an overflow chain block.
+fn write_spilled_file(fs: &mut LiberFs<MemDevice>) -> Vec<u8> {
+	let chunk = vec![0xA5u8; BLOCK_SIZE];
+	for i in 0..6u64 {
+		fs.write_at(b"frag.bin", i * 2 * BLOCK_SIZE as u64, &chunk).unwrap();
+	}
+	fs.read_file(b"frag.bin").unwrap()
+}
+
+#[test]
+fn a_forged_spill_count_cannot_panic_the_mount() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let expected = write_spilled_file(&mut fs);
+	let mut dev = fs.into_device();
+	// stamp an impossible record count into the spill chain block and re-checksum the
+	// whole forgery chain (chain -> inode slot -> leaf -> superblock): the clamp must
+	// keep the parse inside the block, in every walk and on the read path.
+	let mut spill = 0u64;
+	forge_inode_slot(&mut dev, |slot| {
+		spill = u64::from_le_bytes(slot[INO_MAP_OFF..INO_MAP_OFF + 8].try_into().unwrap());
+	});
+	let start = spill as usize * BLOCK_SIZE;
+	dev.blocks[start + CHAIN_COUNT_OFF..start + CHAIN_COUNT_OFF + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+	let chain_crc = crc32c(&dev.blocks[start..start + BLOCK_SIZE]);
+	forge_inode_slot(&mut dev, |slot| {
+		slot[INO_MAP_CRC_OFF..INO_MAP_CRC_OFF + 4].copy_from_slice(&chain_crc.to_le_bytes());
+	});
+	let mut fs = LiberFs::mount(dev).expect("the mount must survive the forged count");
+	assert_eq!(fs.read_file(b"frag.bin").unwrap(), expected, "the real extents still read");
+}
+
+#[test]
+fn a_sparse_size_past_the_pool_cannot_demand_the_moon() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	// a legitimate sparse file sized past the pool's byte count: a whole-file read
+	// could neither allocate nor fill the buffer, so it is refused - while an
+	// explicit-length read of the written range still works.
+	let past_pool = NBLOCKS * BLOCK_SIZE as u64 + 40_000;
+	fs.write_at(b"sparse.bin", past_pool, b"tail").unwrap();
+	assert_eq!(fs.read_file(b"sparse.bin"), Err(FsError::Corrupt));
+	assert_eq!(fs.read_at(b"sparse.bin", past_pool, 4).unwrap(), b"tail");
+}
+
+#[test]
+fn a_looped_namespace_cannot_hang_the_walks() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.mkdir(b"a/b").unwrap();
+	fs.write_file(b"a/b/f.txt", b"payload").unwrap();
+	// forge a namespace cycle through the crate's own machinery: an entry in a/b
+	// pointing back at the root directory (a legitimate tree is acyclic; a hostile
+	// volume need not be).
+	let sub = fs.lookup(b"a/b").unwrap();
+	fs.mutate(|fs| fs.dir_insert(sub, b"up", ROOT_INODE)).unwrap();
+	// fsck's namespace walk terminates (visited set) and reports no false damage...
+	let report = fs.fsck().unwrap();
+	assert_eq!(report.checksum_failures, 0);
+	// ...and the rename cycle check terminates too, still refusing the move.
+	assert_eq!(fs.rename(b"a", b"a/b/x"), Err(FsError::Invalid));
+}
+
+#[test]
+fn a_pathologically_deep_tree_is_refused_not_overflowed() {
+	let pool = 256u64;
+	let mut fs = LiberFs::format(MemDevice::new(pool), pool).unwrap();
+	fs.write_file(b"a.txt", b"payload").unwrap();
+	let (real_root, real_crc) = (fs.inode_root, fs.inode_root_crc);
+	let mut dev = fs.into_device();
+	// stack 70 checksummed one-child internal nodes above the real root: a shape no
+	// legitimate writer produces, built to blow a recursive walker's stack.
+	let (mut child, mut ccrc) = (real_root, real_crc);
+	for i in 0..70u64 {
+		let blk = 100 + i; // free pool blocks well past the format's layout
+		let mut node = vec![0u8; BLOCK_SIZE];
+		node_set_header(&mut node, NODE_INTERNAL, 0);
+		set_child(&mut node, 0, child, ccrc);
+		let start = blk as usize * BLOCK_SIZE;
+		dev.blocks[start..start + BLOCK_SIZE].copy_from_slice(&node);
+		child = blk;
+		ccrc = crc32c(&node);
+	}
+	let slot = active_slot(&dev);
+	forge_superblock(&mut dev, slot, |sb| {
+		sb[SB_INODE_ROOT_OFF..SB_INODE_ROOT_OFF + 8].copy_from_slice(&child.to_le_bytes());
+		sb[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].copy_from_slice(&ccrc.to_le_bytes());
+	});
+	// the mount's iterative walks handle the depth; the bounded descents refuse it.
+	let mut fs = LiberFs::mount(dev).expect("the mount must survive the deep tree");
+	assert_eq!(fs.read_file(b"a.txt"), Err(FsError::Corrupt));
+	let report = fs.fsck().unwrap();
+	assert!(report.checksum_failures >= 1, "fsck reports the hostile shape as damage");
+}
+
+#[test]
+fn extent_fields_near_the_address_ceiling_cannot_overflow() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"a.txt", b"payload").unwrap();
+	let mut dev = fs.into_device();
+	// forge the file's first inline extent to sit at the address ceiling: every
+	// arithmetic step (end, covers, stored-block loops) must saturate, not overflow.
+	forge_inode_slot(&mut dev, |slot| {
+		let ext = &mut slot[EXTENT_OFF..EXTENT_OFF + EXTENT_SIZE];
+		ext[0..8].copy_from_slice(&(u64::MAX - 2).to_le_bytes()); // logical
+		ext[8..16].copy_from_slice(&(u64::MAX - 2).to_le_bytes()); // physical
+		ext[16..20].copy_from_slice(&8u32.to_le_bytes()); // length
+		ext[32..36].copy_from_slice(&8u32.to_le_bytes()); // store_len
+	});
+	let mut fs = LiberFs::mount(dev).expect("the mount must survive the forged extent");
+	// the moved-away extent no longer covers block 0: the read sees a hole (zeros),
+	// bounded garbage rather than a panic.
+	assert_eq!(fs.read_file(b"a.txt").unwrap(), vec![0u8; 7]);
+}
+
+#[test]
+fn a_broken_spill_chain_degrades_the_mount_not_the_volume() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	// the fragmented file first, so it takes inode 1 - the record the forge helper
+	// targets; the healthy file follows as inode 2.
+	write_spilled_file(&mut fs);
+	fs.write_file(b"keep.txt", b"other data").unwrap();
+	let mut dev = fs.into_device();
+	// flip one raw byte in the fragmented file's spill chain block: before this
+	// milestone the failed generation walk FAILED THE MOUNT, and an unmountable
+	// volume is what the storage layer reformats - one bit would have cost every
+	// file. Now the walk flags the damage and the volume mounts read-only.
+	let mut spill = 0u64;
+	forge_inode_slot(&mut dev, |slot| {
+		spill = u64::from_le_bytes(slot[INO_MAP_OFF..INO_MAP_OFF + 8].try_into().unwrap());
+	});
+	dev.blocks[spill as usize * BLOCK_SIZE + CHAIN_HDR] ^= 0xFF;
+	let mut fs = LiberFs::mount(dev).expect("one damaged chain must not fail the mount");
+	assert!(fs.is_read_only(), "an incomplete free map means no allocation: read-only");
+	assert_eq!(fs.read_file(b"keep.txt").unwrap(), b"other data", "undamaged files still read");
+	assert_eq!(fs.read_file(b"frag.bin"), Err(FsError::Corrupt), "the damaged file reports as itself");
+	assert_eq!(fs.write_file(b"new.txt", b"x"), Err(FsError::ReadOnly));
 }

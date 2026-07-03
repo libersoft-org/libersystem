@@ -54,7 +54,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Io);
 		}
 
-		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, uuid: opts.uuid, label, compress: opts.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, walk_damage: false, uuid: opts.uuid, label, compress: opts.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
 		fs.derive_free()?;
 		Ok(fs)
 	}
@@ -128,7 +128,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			None => (0, 0, false),
 		};
 
-		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest, uuid: sb.uuid, label: sb.label, compress: sb.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: None, wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest, walk_damage: false, uuid: sb.uuid, label: sb.label, compress: sb.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
 		// a corrupt snapshot table degrades the mount to read-only instead of failing it:
 		// the pinned generations it named can no longer be reserved, so a commit could
 		// reuse their blocks - refusing every mutation keeps them (and the table block
@@ -138,7 +138,16 @@ impl<D: BlockDevice> LiberFs<D> {
 			Err(FsError::Corrupt) => fs.read_only = true,
 			Err(_) => return None,
 		}
-		fs.derive_free().ok()?;
+		// a generation walk that could not complete (an unreadable node, a broken spill
+		// chain) leaves the free map incomplete: degrade to read-only - a read-only
+		// mount never allocates, so the incomplete map is harmless, and failing the
+		// mount instead would present the volume as unformatted (and cost its data to
+		// the next format). An error other than Corrupt still fails the mount.
+		match fs.derive_free() {
+			Ok(()) => {}
+			Err(FsError::Corrupt) => fs.read_only = true,
+			Err(_) => return None,
+		}
 		Some(fs)
 	}
 
@@ -204,6 +213,13 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::IsDir);
 		}
 		let size = inode.size;
+		// a size the pool cannot hold is hostile or corrupt as a WHOLE-file read: the
+		// buffer could neither be allocated nor filled. (A sparse file legitimately
+		// sized past the pool's bytes stays readable through `read_at`, which takes an
+		// explicit length.)
+		if size > self.num_blocks.saturating_mul(BLOCK_SIZE as u64) {
+			return Err(FsError::Corrupt);
+		}
 		self.read_range(&inode, 0, size)
 	}
 

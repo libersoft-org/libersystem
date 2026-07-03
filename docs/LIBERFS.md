@@ -260,9 +260,15 @@ feature-flag bit and update this section.
 - A checksum proves integrity, not sanity: a reader must **bound every count,
   length and pointer it takes off the medium** before use - node entry counts by
   what the node type can hold, extent lengths by one checksum block's coverage
-  (1024 blocks), the pool size by the device itself, chain walks by the pool
-  size (a corrupt link may loop) - so a hostile or corrupt volume degrades or is
-  refused, never crashes or hangs the reader.
+  (1024 blocks), a whole-file read by the pool's byte count (a sparse size may
+  exceed it; range reads take an explicit length), tree descent by a depth
+  ceiling (a legitimate B+tree never exceeds 64 levels), namespace walks by a
+  visited set (a hostile volume may cycle or alias), the pool size by the device
+  itself, chain walks by the pool size (a corrupt link may loop) - so a hostile
+  or corrupt volume degrades or is refused, never crashes or hangs the reader.
+  Damage found while deriving the free map degrades the mount to read-only; it
+  must never fail the mount outright, or one flipped bit presents an intact
+  volume as unformatted.
 
 ### Superblock (blocks 0 and 1)
 

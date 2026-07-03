@@ -24,8 +24,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut checksum_failures = 0u32;
 		let mut damaged: Vec<Vec<u8>> = Vec::new();
 		// walk the live namespace from the root, tracking each file's full path (the
-		// root directory itself reports as "/").
+		// root directory itself reports as "/"). The visited set makes a hostile
+		// namespace - a cycle, or many names aliasing one subtree - terminate instead
+		// of looping or blowing up.
 		let mut stack: Vec<(u32, Vec<u8>)> = vec![(self.root_inode, Vec::new())];
+		let mut seen: BTreeSet<u32> = BTreeSet::new();
+		seen.insert(self.root_inode);
 		while let Some((dir, prefix)) = stack.pop() {
 			let entries = match self.dir_entries_of(dir) {
 				Ok(entries) => entries,
@@ -44,7 +48,9 @@ impl<D: BlockDevice> LiberFs<D> {
 				path.extend_from_slice(&name);
 				let checked = self.read_inode(child).and_then(|inode| {
 					if inode.kind == KIND_DIR {
-						stack.push((child, path.clone()));
+						if seen.insert(child) {
+							stack.push((child, path.clone()));
+						}
 						Ok(0)
 					} else {
 						self.count_corrupt(&inode)
@@ -66,7 +72,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// for it.
 		for i in 0..self.snapshots.len() {
 			let (root, crc) = (self.snapshots[i].inode_root, self.snapshots[i].inode_root_crc);
-			checksum_failures += match self.check_inode_tree(root, crc) {
+			checksum_failures += match self.check_inode_tree(root, crc, TREE_DEPTH_MAX) {
 				Ok(bad) => bad,
 				Err(FsError::Corrupt) => 1,
 				Err(e) => return Err(e),
@@ -128,10 +134,14 @@ impl<D: BlockDevice> LiberFs<D> {
 	// walked and verified too, so a snapshot generation's directory damage is caught
 	// here and not only when the snapshot is mounted. A corrupt subtree counts as a
 	// failure and the walk continues; only the root's own damage surfaces as the error
-	// (the caller counts it).
-	pub(crate) fn check_inode_tree(&mut self, ptr: u64, crc: u32) -> Result<u32, FsError> {
+	// (the caller counts it). The depth budget bounds the recursion against a hostile
+	// chain of one-child internals.
+	pub(crate) fn check_inode_tree(&mut self, ptr: u64, crc: u32, depth: usize) -> Result<u32, FsError> {
 		if ptr == 0 {
 			return Ok(0);
+		}
+		if depth == 0 {
+			return Err(FsError::Corrupt);
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
@@ -143,7 +153,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				let checked = if inode.kind == KIND_FILE {
 					self.load_spill(&mut inode).and_then(|()| self.count_corrupt(&inode))
 				} else if inode.kind == KIND_DIR {
-					self.check_dir_tree(inode.dir_root, inode.dir_root_crc)
+					self.check_dir_tree(inode.dir_root, inode.dir_root_crc, TREE_DEPTH_MAX)
 				} else {
 					Ok(0)
 				};
@@ -155,7 +165,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 		} else {
 			for i in 0..=internal_count(&buf) {
-				bad += match self.check_inode_tree(child_ptr(&buf, i), child_crc(&buf, i)) {
+				bad += match self.check_inode_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1) {
 					Ok(b) => b,
 					Err(FsError::Corrupt) => 1,
 					Err(e) => return Err(e),
@@ -168,16 +178,19 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Walk a directory B+tree verifying every node against the CRC32C its parent link
 	// stored, counting corrupt subtrees like `check_inode_tree`; only the root's own
 	// damage surfaces as the error (the caller counts it).
-	pub(crate) fn check_dir_tree(&mut self, ptr: u64, crc: u32) -> Result<u32, FsError> {
+	pub(crate) fn check_dir_tree(&mut self, ptr: u64, crc: u32, depth: usize) -> Result<u32, FsError> {
 		if ptr == 0 {
 			return Ok(0);
+		}
+		if depth == 0 {
+			return Err(FsError::Corrupt);
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
 		let mut bad = 0;
 		if node_type(&buf) == NODE_INTERNAL {
 			for i in 0..=internal_count(&buf) {
-				bad += match self.check_dir_tree(child_ptr(&buf, i), child_crc(&buf, i)) {
+				bad += match self.check_dir_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1) {
 					Ok(b) => b,
 					Err(FsError::Corrupt) => 1,
 					Err(e) => return Err(e),

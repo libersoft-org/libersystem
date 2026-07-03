@@ -243,7 +243,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		for i in 0..inode.extents.len() {
 			let ext = inode.extents[i];
 			for off in 0..ext.store_len as u64 {
-				self.drop_block(ext.physical + off);
+				self.drop_block(ext.stored(off));
 			}
 			self.drop_block(ext.csum);
 		}
@@ -392,7 +392,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(true);
 		}
 		let off = (lb - ext.logical) as usize;
-		if !self.dev.read_block(ext.physical + off as u64, buf) {
+		if !self.dev.read_block(ext.stored(off as u64), buf) {
 			return Err(FsError::Io);
 		}
 		let crc = self.read_csum(ext.csum, ext.csum_crc, off)?;
@@ -421,7 +421,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if let Some(i) = find_extent(&inode.extents, lb) {
 			let ext = inode.extents[i];
 			let off = (lb - ext.logical) as usize;
-			let old = ext.physical + off as u64;
+			let old = ext.stored(off as u64);
 			// a fresh block is rewritten in place; a committed one is replaced by a
 			// fresh allocation and recorded dropped - the whole block is about to be
 			// written, so copying the old contents up would be wasted device work.
@@ -452,7 +452,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let pos = inode.extents.partition_point(|e| e.logical <= lb);
 		if pos > 0 {
 			let prev = inode.extents[pos - 1];
-			if prev.clen == 0 && prev.end() == lb && prev.physical + prev.length as u64 == phys && (prev.length as usize) < CRCS_PER_BLOCK {
+			if prev.clen == 0 && prev.end() == lb && prev.stored(prev.length as u64) == phys && (prev.length as usize) < CRCS_PER_BLOCK {
 				let csum = self.cow_meta(prev.csum)?;
 				let csum_crc = self.set_csum_slot(csum, prev.length as usize, crc)?;
 				let e = &mut inode.extents[pos - 1];
@@ -483,7 +483,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// the checksum sub-ranges so every block keeps its CRC.
 	pub(crate) fn overwrite_block(&mut self, inode: &mut Inode, i: usize, off: usize, new_phys: u64, crc: u32) -> Result<(), FsError> {
 		let ext = inode.extents[i];
-		if new_phys == ext.physical + off as u64 {
+		if new_phys == ext.stored(off as u64) {
 			let csum = self.cow_meta(ext.csum)?;
 			let csum_crc = self.set_csum_slot(csum, off, crc)?;
 			let e = &mut inode.extents[i];
@@ -525,7 +525,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			if !self.dev.write_block(suf_csum, &sbuf) {
 				return Err(FsError::Io);
 			}
-			pieces.push(Extent { logical: ext.logical + off as u64 + 1, physical: ext.physical + off as u64 + 1, length: slen as u32, csum: suf_csum, csum_crc: crc32c(&sbuf), store_len: slen as u32, clen: 0 });
+			pieces.push(Extent { logical: ext.logical + off as u64 + 1, physical: ext.stored(off as u64 + 1), length: slen as u32, csum: suf_csum, csum_crc: crc32c(&sbuf), store_len: slen as u32, clen: 0 });
 		}
 		inode.extents.splice(i..i + 1, pieces);
 		Ok(())
@@ -543,7 +543,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// the compressed record's stored blocks and checksum block leave the new
 		// generation with it.
 		for s in 0..ext.store_len as u64 {
-			self.drop_block(ext.physical + s);
+			self.drop_block(ext.stored(s));
 		}
 		self.drop_block(ext.csum);
 		let mut blk = vec![0u8; BLOCK_SIZE];
@@ -579,7 +579,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut comp = vec![0u8; ext.store_len as usize * BLOCK_SIZE];
 		for s in 0..ext.store_len as usize {
 			let dst = &mut comp[s * BLOCK_SIZE..(s + 1) * BLOCK_SIZE];
-			if !self.dev.read_block(ext.physical + s as u64, dst) {
+			if !self.dev.read_block(ext.stored(s as u64), dst) {
 				return Err(FsError::Io);
 			}
 			let stored = u32::from_le_bytes(cbuf[s * 4..s * 4 + 4].try_into().unwrap());
@@ -622,7 +622,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut ubuf = vec![0u8; ext.length as usize * BLOCK_SIZE];
 		for off in 0..ext.length as usize {
 			let dst = &mut ubuf[off * BLOCK_SIZE..(off + 1) * BLOCK_SIZE];
-			if !self.dev.read_block(ext.physical + off as u64, dst) {
+			if !self.dev.read_block(ext.stored(off as u64), dst) {
 				return Err(FsError::Io);
 			}
 			match self.read_csum(ext.csum, ext.csum_crc, off) {
@@ -672,7 +672,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		// the raw run's blocks and checksum block leave the new generation with it.
 		for off in 0..ext.length as u64 {
-			self.drop_block(ext.physical + off);
+			self.drop_block(ext.stored(off));
 		}
 		self.drop_block(ext.csum);
 		inode.extents[i] = Extent { logical: ext.logical, physical: first, length: ext.length, csum, csum_crc: crc32c(&cbuf), store_len: store_len as u32, clen: comp.len() as u32 };
@@ -697,7 +697,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				continue;
 			}
 			for off in 0..ext.store_len as usize {
-				if !self.dev.read_block(ext.physical + off as u64, &mut buf) {
+				if !self.dev.read_block(ext.stored(off as u64), &mut buf) {
 					return Err(FsError::Io);
 				}
 				let c = u32::from_le_bytes(cbuf[off * 4..off * 4 + 4].try_into().unwrap());

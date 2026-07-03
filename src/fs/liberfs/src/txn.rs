@@ -79,10 +79,19 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.decomp = None;
 		self.rcsum = None;
 		if self.snapshots_dirty {
-			// the pinned set changed: rebuild it (and the free map) by the full walk.
+			// the pinned set changed: rebuild it (and the free map) by the full walk. The
+			// commit itself already landed (the superblock is on disk); if the walk finds
+			// damage, the allocator can no longer be trusted - degrade to read-only
+			// rather than allocate from an incomplete map.
 			self.snapshots_dirty = false;
 			self.dead.clear();
-			return self.derive_free();
+			return match self.derive_free() {
+				Ok(()) => Ok(()),
+				Err(e) => {
+					self.read_only = true;
+					Err(e)
+				}
+			};
 		}
 		// the incremental reclaim: what the superseded transaction dropped is now
 		// referenced by no generation - free it unless a named snapshot pins it (a
@@ -155,6 +164,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// after a commit that changed the snapshot set; every other commit maintains the
 	// state incrementally.
 	pub(crate) fn derive_free(&mut self) -> Result<(), FsError> {
+		self.walk_damage = false;
 		let len = self.free.len();
 		let mut live = vec![0u8; len];
 		set_bit(&mut live, 0);
@@ -162,15 +172,16 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.mark_inode_tree(self.inode_root, &mut live)?;
 		// every block of the snapshot chain and every pinned snapshot generation stay
 		// reserved, so a later commit never reuses an earlier root's blocks. The raw walk
-		// stops at a pointer outside the pool (a corrupt chain block - the mount is
-		// already degrading to read-only in that case).
+		// stops at a pointer outside the pool or a link that cannot be read (flagged as
+		// damage below) - and at a marked block, so a corrupt cycle terminates.
 		{
 			let mut ptr = self.snap_root;
 			let mut buf = vec![0u8; BLOCK_SIZE];
 			while ptr != 0 && ptr < self.num_blocks && !test_bit(&live, ptr) {
 				set_bit(&mut live, ptr);
 				if !self.dev.read_block(ptr, &mut buf) {
-					return Err(FsError::Io);
+					self.walk_damage = true;
+					break;
 				}
 				ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
 			}
@@ -200,15 +211,23 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		self.pinned = pinned;
 		self.dead.clear();
+		// a walk that could not complete (an unreadable node, a broken spill chain)
+		// leaves the free map incomplete: surface it, so the caller degrades to
+		// read-only rather than allocate blocks the map failed to reserve.
+		if core::mem::take(&mut self.walk_damage) {
+			return Err(FsError::Corrupt);
+		}
 		Ok(())
 	}
 
 	// Mark, in `map`, every block the inode B+tree rooted at `ptr` references: the tree
 	// nodes themselves, and for each live inode either its file data / checksum /
 	// overflow blocks or its directory's B+tree. Reads are raw (no checksum check), like
-	// the old generation walk, so a corrupt block does not abort the mount or rebuild.
-	// Iterative (an explicit work list), so the depth of the trees never grows the call
-	// stack.
+	// the old generation walk. Damage - an unreadable node, a spill chain that fails its
+	// CRC - is FLAGGED (`walk_damage`) and skipped, never fatal: aborting the mount here
+	// would present an intact-superblock volume as unformatted, and one flipped bit must
+	// not cost the volume. Iterative (an explicit work list), so the depth of the trees
+	// never grows the call stack.
 	pub(crate) fn mark_inode_tree(&mut self, root: u64, map: &mut [u8]) -> Result<(), FsError> {
 		let mut nodes: Vec<u64> = Vec::new();
 		if root != 0 {
@@ -225,7 +244,8 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			set_bit(map, ptr);
 			if !self.dev.read_block(ptr, &mut buf) {
-				return Err(FsError::Io);
+				self.walk_damage = true;
+				continue;
 			}
 			if node_type(&buf) == NODE_LEAF {
 				for i in 0..leaf_count(&buf, INODE_REC) {
@@ -234,9 +254,12 @@ impl<D: BlockDevice> LiberFs<D> {
 					if inode.kind == KIND_FILE {
 						// complete the extent map from the overflow chain before marking
 						// (the spill and dir walks use their own buffers, so the leaf
-						// image in `buf` stays intact).
-						self.load_spill(&mut inode)?;
-						self.collect_inode_blocks(&inode, map)?;
+						// image in `buf` stays intact). A file whose chain cannot be
+						// loaded is damage, not a mount failure.
+						let marked = self.load_spill(&mut inode).and_then(|()| self.collect_inode_blocks(&inode, map));
+						if marked.is_err() {
+							self.walk_damage = true;
+						}
 					} else if inode.kind == KIND_DIR {
 						self.mark_dir_tree(inode.dir_root, map)?;
 					}
@@ -252,7 +275,7 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Mark every node block of a directory's B+tree. The entries themselves point at
 	// inodes, which the inode-tree walk already covers, so only the nodes are marked.
-	// Iterative like `mark_inode_tree`.
+	// Iterative and damage-tolerant like `mark_inode_tree`.
 	pub(crate) fn mark_dir_tree(&mut self, root: u64, map: &mut [u8]) -> Result<(), FsError> {
 		let mut nodes: Vec<u64> = Vec::new();
 		if root != 0 {
@@ -266,7 +289,8 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			set_bit(map, ptr);
 			if !self.dev.read_block(ptr, &mut buf) {
-				return Err(FsError::Io);
+				self.walk_damage = true;
+				continue;
 			}
 			if node_type(&buf) == NODE_INTERNAL {
 				for i in 0..=internal_count(&buf) {
@@ -324,7 +348,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut ptr = root;
 		let mut crc = root_crc;
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		loop {
+		// bounded descent: no legitimate tree is deeper than TREE_DEPTH_MAX, so a
+		// longer path is a hostile chain of one-child internals - Corrupt, not a crawl.
+		for _ in 0..TREE_DEPTH_MAX {
 			self.read_node(ptr, crc, &mut buf)?;
 			if node_type(&buf) == NODE_LEAF {
 				let (mut lo, mut hi) = (0usize, leaf_count(&buf, rec));
@@ -344,6 +370,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			ptr = child_ptr(&buf, ci);
 			crc = child_crc(&buf, ci);
 		}
+		Err(FsError::Corrupt)
 	}
 
 	// Insert or overwrite `record` (numeric key `key`, full key width `keylen`) in the
@@ -360,7 +387,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			let crc = self.write_node_to(blk, &buf)?;
 			return Ok((blk, crc));
 		}
-		let outcome = self.tree_insert_node(root, root_crc, key, record, rec, leaf_max, keylen)?;
+		let outcome = self.tree_insert_node(root, root_crc, key, record, rec, leaf_max, keylen, TREE_DEPTH_MAX)?;
 		self.settle_root(outcome)
 	}
 
@@ -451,7 +478,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 	}
 
-	pub(crate) fn tree_insert_node(&mut self, ptr: u64, crc: u32, key: u64, record: &[u8], rec: usize, leaf_max: usize, keylen: usize) -> Result<Ins, FsError> {
+	pub(crate) fn tree_insert_node(&mut self, ptr: u64, crc: u32, key: u64, record: &[u8], rec: usize, leaf_max: usize, keylen: usize, depth: usize) -> Result<Ins, FsError> {
+		// the depth budget bounds the recursion (and so the stack) against a hostile
+		// chain of one-child internals; no legitimate tree comes near it.
+		if depth == 0 {
+			return Err(FsError::Corrupt);
+		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
@@ -523,7 +555,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let ci = route_child(&buf, internal_count(&buf), key);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
-		let outcome = self.tree_insert_node(cp, cc, key, record, rec, leaf_max, keylen)?;
+		let outcome = self.tree_insert_node(cp, cc, key, record, rec, leaf_max, keylen, depth - 1)?;
 		self.internal_absorb(&mut buf, ptr, ci, outcome)
 	}
 
@@ -536,7 +568,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if root == 0 {
 			return Ok((0, 0, false));
 		}
-		match self.tree_delete_node(root, root_crc, key, probe, rec, keylen)? {
+		match self.tree_delete_node(root, root_crc, key, probe, rec, keylen, TREE_DEPTH_MAX)? {
 			Del::NotFound => Ok((root, root_crc, false)),
 			Del::Empty => Ok((0, 0, true)),
 			Del::Updated(p, c) => {
@@ -550,7 +582,8 @@ impl<D: BlockDevice> LiberFs<D> {
 	// collapsed node leaves the new generation. Shared by every tree flavour.
 	pub(crate) fn collapse_root(&mut self, mut ptr: u64, mut crc: u32) -> Result<(u64, u32), FsError> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		loop {
+		// bounded like every descent: a longer single-child chain is a hostile shape.
+		for _ in 0..TREE_DEPTH_MAX {
 			self.read_node(ptr, crc, &mut buf)?;
 			if node_type(&buf) == NODE_INTERNAL && node_count(&buf) == 0 {
 				let cp = child_ptr(&buf, 0);
@@ -562,6 +595,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				return Ok((ptr, crc));
 			}
 		}
+		Err(FsError::Corrupt)
 	}
 
 	// Absorb a child's delete outcome into internal node `buf` (at `ptr`, child index
@@ -600,7 +634,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 	}
 
-	pub(crate) fn tree_delete_node(&mut self, ptr: u64, crc: u32, key: u64, probe: &[u8], rec: usize, keylen: usize) -> Result<Del, FsError> {
+	pub(crate) fn tree_delete_node(&mut self, ptr: u64, crc: u32, key: u64, probe: &[u8], rec: usize, keylen: usize, depth: usize) -> Result<Del, FsError> {
+		// bounded like the insert recursion: a deeper path is a hostile shape.
+		if depth == 0 {
+			return Err(FsError::Corrupt);
+		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
@@ -640,7 +678,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let ci = route_child(&buf, internal_count(&buf), key);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
-		let outcome = self.tree_delete_node(cp, cc, key, probe, rec, keylen)?;
+		let outcome = self.tree_delete_node(cp, cc, key, probe, rec, keylen, depth - 1)?;
 		self.internal_absorb_del(&mut buf, ptr, ci, outcome)
 	}
 }

@@ -127,14 +127,19 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn dir_entries_of(&mut self, dir_num: u32) -> Result<Vec<(Vec<u8>, u32)>, FsError> {
 		let dir = self.read_inode(dir_num)?;
 		let mut out = Vec::new();
-		self.collect_dir_entries(dir.dir_root, dir.dir_root_crc, &mut out)?;
+		self.collect_dir_entries(dir.dir_root, dir.dir_root_crc, &mut out, TREE_DEPTH_MAX)?;
 		Ok(out)
 	}
 
 	// Walk the directory B+tree rooted at (`ptr`, `crc`), appending each leaf's entries.
-	pub(crate) fn collect_dir_entries(&mut self, ptr: u64, crc: u32, out: &mut Vec<(Vec<u8>, u32)>) -> Result<(), FsError> {
+	// The depth budget bounds the recursion (and so the stack) against a hostile chain
+	// of one-child internals; no legitimate tree comes near it.
+	pub(crate) fn collect_dir_entries(&mut self, ptr: u64, crc: u32, out: &mut Vec<(Vec<u8>, u32)>, depth: usize) -> Result<(), FsError> {
 		if ptr == 0 {
 			return Ok(());
+		}
+		if depth == 0 {
+			return Err(FsError::Corrupt);
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
@@ -147,7 +152,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			for i in 0..=count {
 				let cp = child_ptr(&buf, i);
 				let cc = child_crc(&buf, i);
-				self.collect_dir_entries(cp, cc, out)?;
+				self.collect_dir_entries(cp, cc, out, depth - 1)?;
 			}
 		}
 		Ok(())
@@ -167,7 +172,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut ptr = root;
 		let mut crc = root_crc;
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		loop {
+		// bounded descent, like every tree walk: a longer path is a hostile shape.
+		for _ in 0..TREE_DEPTH_MAX {
 			self.read_node(ptr, crc, &mut buf)?;
 			if node_type(&buf) == NODE_LEAF {
 				let recs = dir_leaf_parse(&buf);
@@ -181,6 +187,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			ptr = child_ptr(&buf, ci);
 			crc = child_crc(&buf, ci);
 		}
+		Err(FsError::Corrupt)
 	}
 
 	// Insert or repoint `name` -> `child`; returns the tree's new root.
@@ -192,11 +199,15 @@ impl<D: BlockDevice> LiberFs<D> {
 			let crc = self.write_node_to(blk, &buf)?;
 			return Ok((blk, crc));
 		}
-		let outcome = self.dir_insert_node(root, root_crc, name, child)?;
+		let outcome = self.dir_insert_node(root, root_crc, name, child, TREE_DEPTH_MAX)?;
 		self.settle_root(outcome)
 	}
 
-	pub(crate) fn dir_insert_node(&mut self, ptr: u64, crc: u32, name: &[u8], child: u32) -> Result<Ins, FsError> {
+	pub(crate) fn dir_insert_node(&mut self, ptr: u64, crc: u32, name: &[u8], child: u32, depth: usize) -> Result<Ins, FsError> {
+		// bounded like the shared insert recursion: a deeper path is a hostile shape.
+		if depth == 0 {
+			return Err(FsError::Corrupt);
+		}
 		let hash = name_hash(name);
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
@@ -229,7 +240,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let ci = route_child(&buf, count, hash);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
-		let outcome = self.dir_insert_node(cp, cc, name, child)?;
+		let outcome = self.dir_insert_node(cp, cc, name, child, depth - 1)?;
 		self.internal_absorb(&mut buf, ptr, ci, outcome)
 	}
 
@@ -238,7 +249,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if root == 0 {
 			return Ok((0, 0, false));
 		}
-		match self.dir_delete_node(root, root_crc, name)? {
+		match self.dir_delete_node(root, root_crc, name, TREE_DEPTH_MAX)? {
 			Del::NotFound => Ok((root, root_crc, false)),
 			Del::Empty => Ok((0, 0, true)),
 			Del::Updated(p, c) => {
@@ -248,7 +259,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 	}
 
-	pub(crate) fn dir_delete_node(&mut self, ptr: u64, crc: u32, name: &[u8]) -> Result<Del, FsError> {
+	pub(crate) fn dir_delete_node(&mut self, ptr: u64, crc: u32, name: &[u8], depth: usize) -> Result<Del, FsError> {
+		// bounded like the shared delete recursion: a deeper path is a hostile shape.
+		if depth == 0 {
+			return Err(FsError::Corrupt);
+		}
 		let hash = name_hash(name);
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
@@ -273,7 +288,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let ci = route_child(&buf, count, hash);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
-		let outcome = self.dir_delete_node(cp, cc, name)?;
+		let outcome = self.dir_delete_node(cp, cc, name, depth - 1)?;
 		self.internal_absorb_del(&mut buf, ptr, ci, outcome)
 	}
 
@@ -290,12 +305,17 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Does the subtree rooted at directory `root_dir` contain inode `target` (as the
 	// directory itself or any descendant)? Used to reject moving a directory into
 	// itself. Iterative (a work list of directories), so nesting depth never grows the
-	// call stack.
+	// call stack; a visited set makes a hostile namespace (a cycle, or many names
+	// aliasing one subtree) terminate instead of looping or blowing up.
 	pub(crate) fn subtree_contains(&mut self, root_dir: u32, target: u32) -> Result<bool, FsError> {
 		let mut dirs: Vec<u32> = vec![root_dir];
+		let mut seen: BTreeSet<u32> = BTreeSet::new();
 		while let Some(dir) = dirs.pop() {
 			if dir == target {
 				return Ok(true);
+			}
+			if !seen.insert(dir) {
+				continue;
 			}
 			for (_, child) in self.dir_entries_of(dir)? {
 				if self.read_inode(child)?.kind == KIND_DIR {
@@ -322,7 +342,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				// wholly cut: its stored blocks and checksum block leave the new
 				// generation.
 				for off in 0..ext.store_len as u64 {
-					self.drop_block(ext.physical + off);
+					self.drop_block(ext.stored(off));
 				}
 				self.drop_block(ext.csum);
 				continue;
@@ -337,7 +357,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				// a raw run drops the cut tail's data blocks; the checksum block stays
 				// (shared with the kept prefix).
 				for off in e.length as u64..ext.length as u64 {
-					self.drop_block(ext.physical + off);
+					self.drop_block(ext.stored(off));
 				}
 				e.store_len = e.length;
 			}
@@ -353,7 +373,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn collect_inode_blocks(&mut self, inode: &Inode, bitmap: &mut [u8]) -> Result<(), FsError> {
 		for ext in inode.extents.iter() {
 			for off in 0..ext.store_len as u64 {
-				set_bit(bitmap, ext.physical + off);
+				set_bit(bitmap, ext.stored(off));
 			}
 			if ext.csum != 0 {
 				set_bit(bitmap, ext.csum);

@@ -678,7 +678,7 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 		}
 		if fs.is_read_only() {
 			unsafe {
-				print(b"storage: vol://system mounted READ-ONLY (corrupt snapshot table; repair or reformat to write)\n");
+				print(b"storage: vol://system mounted READ-ONLY (damaged metadata or snapshot table; copy data off / restore, or reformat to write)\n");
 			}
 		}
 		return Some(fs);

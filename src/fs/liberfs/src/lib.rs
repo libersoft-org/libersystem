@@ -164,6 +164,11 @@ const CHILD_SIZE: usize = 12;
 // the child links a fixed region after it, so offsets do not depend on the live count.
 const INTERNAL_MAX: usize = (BLOCK_SIZE - NODE_HDR + SEP_SIZE) / (SEP_SIZE + CHILD_SIZE);
 const INTERNAL_CHILD_BASE: usize = NODE_HDR + SEP_SIZE * (INTERNAL_MAX - 1);
+// The deepest tree any walk follows. A legitimate B+tree over a 2^64-block pool with
+// branching >= 2 never exceeds 64 levels (real trees stay in single digits); a deeper
+// path is a hostile shape - a checksummed chain of one-child internals - built to
+// overflow the recursive walkers, and fails as Corrupt instead.
+const TREE_DEPTH_MAX: usize = 64;
 
 // An inode-tree leaf record: the inode number (u64 key) then its 256-byte slot. The key
 // is compared on its own 8 bytes, since inode numbers are unique.
@@ -489,14 +494,23 @@ impl Extent {
 		buf[36..40].copy_from_slice(&self.clen.to_le_bytes());
 	}
 
-	// The first logical block past the run.
+	// The first logical block past the run. Saturating: a hostile `logical` near the
+	// address ceiling must not overflow the arithmetic (the range simply ends at the
+	// ceiling and the lookup misses).
 	fn end(&self) -> u64 {
-		self.logical + self.length as u64
+		self.logical.saturating_add(self.length as u64)
 	}
 
 	// Does the run cover logical block `lb`?
 	fn covers(&self, lb: u64) -> bool {
 		lb >= self.logical && lb < self.end()
+	}
+
+	// The stored block at index `i` of the run. Saturating like `end`: a hostile
+	// `physical` must not overflow - the read of the saturated address fails or its
+	// checksum mismatches, surfacing as the damage it is.
+	fn stored(&self, i: u64) -> u64 {
+		self.physical.saturating_add(i)
 	}
 }
 
@@ -717,6 +731,11 @@ pub struct LiberFs<D: BlockDevice> {
 	// interleave generations) and when the mount is degraded (a corrupt snapshot table
 	// no longer pins its generations, so a commit could reuse pinned blocks).
 	read_only: bool,
+	// Set by the free-map generation walks when a file's spill chain or a tree read
+	// fails mid-walk: the derived free map is then incomplete, so the walk's caller
+	// must degrade (a mount goes read-only, a commit refuses) rather than allocate
+	// from a map that may hand out live blocks.
+	walk_damage: bool,
 	// Volume identity and the per-volume compression switch, carried in the superblock.
 	uuid: [u8; 16],
 	label: [u8; LABEL_MAX],
