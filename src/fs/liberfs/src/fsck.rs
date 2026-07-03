@@ -8,10 +8,13 @@ impl<D: BlockDevice> LiberFs<D> {
 	// alone would leave the operator knowing something is wrong but not what. The
 	// pinned snapshot generations are verified too - inode trees, directory trees and
 	// file data (counted; their files are named under the snapshot's own mount, not
-	// here). Metadata damage is REPORTED, never fatal: a corrupt tree node counts as a
-	// failure (named by path where one is known) and the walk continues, so one bad
-	// node cannot silence the report of everything else. The free map is also
-	// rederived, which is a no-op on a consistent volume.
+	// here). Damage is REPORTED, never fatal - a corrupt node and an unreadable block
+	// alike count as failures (named by path where one is known) and the walk
+	// continues, so one bad block cannot silence the report of everything else. The
+	// free map is rederived too (a no-op on a consistent volume); damage found THERE
+	// additionally degrades the volume to read-only, the mount's own policy - the map
+	// is incomplete, so no later allocation may trust it (a remount after repair
+	// restores writes).
 	pub fn fsck(&mut self) -> Result<FsckReport, FsError> {
 		// verify the DISK, not the caches: a cached inode would skip its tree-path and
 		// spill-chain verification, and a cached checksum block its re-read - damage
@@ -20,9 +23,16 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.dcache.clear();
 		self.rcsum = None;
 		self.decomp = None;
-		self.derive_free()?;
 		let mut checksum_failures = 0u32;
 		let mut damaged: Vec<Vec<u8>> = Vec::new();
+		match self.derive_free() {
+			Ok(()) => {}
+			Err(FsError::Corrupt) => {
+				checksum_failures += 1;
+				self.read_only = true;
+			}
+			Err(e) => return Err(e),
+		}
 		// walk the live namespace from the root, tracking each file's full path (the
 		// root directory itself reports as "/"). The visited set makes a hostile
 		// namespace - a cycle, or many names aliasing one subtree - terminate instead
@@ -33,7 +43,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		while let Some((dir, prefix)) = stack.pop() {
 			let entries = match self.dir_entries_of(dir) {
 				Ok(entries) => entries,
-				Err(FsError::Corrupt) => {
+				Err(FsError::Corrupt | FsError::Io) => {
 					checksum_failures += 1;
 					damaged.push(if prefix.is_empty() { b"/".to_vec() } else { prefix });
 					continue;
@@ -58,7 +68,9 @@ impl<D: BlockDevice> LiberFs<D> {
 				});
 				let bad = match checked {
 					Ok(bad) => bad,
-					Err(FsError::Corrupt) => 1,
+					// an unreadable block (a hostile out-of-pool pointer fails its read as
+					// Io) is damage to the operator, exactly like a checksum mismatch.
+					Err(FsError::Corrupt | FsError::Io) => 1,
 					Err(e) => return Err(e),
 				};
 				if bad > 0 {
@@ -74,7 +86,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			let (root, crc) = (self.snapshots[i].inode_root, self.snapshots[i].inode_root_crc);
 			checksum_failures += match self.check_inode_tree(root, crc, TREE_DEPTH_MAX) {
 				Ok(bad) => bad,
-				Err(FsError::Corrupt) => 1,
+				Err(FsError::Corrupt | FsError::Io) => 1,
 				Err(e) => return Err(e),
 			};
 		}
@@ -159,7 +171,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				};
 				bad += match checked {
 					Ok(b) => b,
-					Err(FsError::Corrupt) => 1,
+					Err(FsError::Corrupt | FsError::Io) => 1,
 					Err(e) => return Err(e),
 				};
 			}
@@ -167,7 +179,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			for i in 0..=internal_count(&buf) {
 				bad += match self.check_inode_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1) {
 					Ok(b) => b,
-					Err(FsError::Corrupt) => 1,
+					Err(FsError::Corrupt | FsError::Io) => 1,
 					Err(e) => return Err(e),
 				};
 			}
@@ -192,7 +204,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			for i in 0..=internal_count(&buf) {
 				bad += match self.check_dir_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1) {
 					Ok(b) => b,
-					Err(FsError::Corrupt) => 1,
+					Err(FsError::Corrupt | FsError::Io) => 1,
 					Err(e) => return Err(e),
 				};
 			}

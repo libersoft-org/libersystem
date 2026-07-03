@@ -1607,11 +1607,18 @@ fn fsck_verifies_the_disk_not_the_caches() {
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
 
 	// corrupt the spill block's reads while the inode sits warm in the cache: fsck
-	// must reload from the device and surface the damage, not serve the cached map.
+	// must reload from the device and surface the damage, not serve the cached map -
+	// as a REPORT naming the file, never an error (the report is fsck's whole point).
+	// The free-map rederivation hit the same damage, so the volume also degrades to
+	// read-only (an incomplete map must never feed an allocation).
 	target.set(spill);
-	assert_eq!(fs.fsck().map(|_| ()), Err(FsError::Corrupt), "fsck served a cached inode instead of verifying the disk");
+	let report = fs.fsck().expect("fsck reports damage, it does not die on it");
+	assert!(report.checksum_failures >= 1);
+	assert!(report.damaged.contains(&b"sparse".to_vec()), "the damaged file is named");
+	assert!(fs.is_read_only(), "free-map damage degrades the volume to read-only");
 
-	// healed device, clean report again (the caches repopulate from good reads).
+	// healed device: a clean report again (the caches repopulate from good reads) and
+	// reads flow; the read-only degrade stays until a remount confirms the repair.
 	target.set(0);
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
 	assert_eq!(fs.read_at(b"sparse", span(7), 6).unwrap(), b"span-7");
@@ -1985,6 +1992,11 @@ fn extent_fields_near_the_address_ceiling_cannot_overflow() {
 	// the moved-away extent no longer covers block 0: the read sees a hole (zeros),
 	// bounded garbage rather than a panic.
 	assert_eq!(fs.read_file(b"a.txt").unwrap(), vec![0u8; 7]);
+	// the out-of-pool stored blocks fail their reads as Io: to the operator that is
+	// damage like any other - fsck counts it, names the file, and keeps walking.
+	let report = fs.fsck().expect("an unreadable block must not kill the report");
+	assert!(report.checksum_failures >= 1);
+	assert!(report.damaged.contains(&b"a.txt".to_vec()));
 }
 
 #[test]
@@ -2009,4 +2021,9 @@ fn a_broken_spill_chain_degrades_the_mount_not_the_volume() {
 	assert_eq!(fs.read_file(b"keep.txt").unwrap(), b"other data", "undamaged files still read");
 	assert_eq!(fs.read_file(b"frag.bin"), Err(FsError::Corrupt), "the damaged file reports as itself");
 	assert_eq!(fs.write_file(b"new.txt", b"x"), Err(FsError::ReadOnly));
+	// and fsck on the degraded volume still hands the operator a report naming the
+	// damage - the exact volume a report matters most for.
+	let report = fs.fsck().expect("fsck must survive what the mount survived");
+	assert!(report.checksum_failures >= 1);
+	assert!(report.damaged.contains(&b"frag.bin".to_vec()));
 }
