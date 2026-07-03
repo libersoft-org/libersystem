@@ -5,3 +5,7 @@ hard_tabs = true
 max_width = 10000
 use_small_heuristics = "Max"
 newline_style = "Unix"
+# Long arrays wrap to multiple lines (the one construct exempt from the
+# no-wrapping rule): an array wider than this becomes one element per line.
+array_width = 160
+short_array_element_width_threshold = 0

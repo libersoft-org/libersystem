@@ -359,17 +359,43 @@ fn loops_and_branches_to_sum() {
 	//   sum = 0; i = n; block { loop { if i == 0 break; sum += i; i -= 1; continue } }
 	//   sum) - exercises block / loop / br / br_if and the integer ALU.
 	let body: &[u8] = &[
-		0x41, 0x00, 0x21, 0x01, // i32.const 0; local.set 1 (sum = 0)
-		0x20, 0x00, 0x21, 0x02, // local.get 0; local.set 2 (i = n)
-		0x02, 0x40, // block
-		0x03, 0x40, // loop
-		0x20, 0x02, 0x45, 0x0d, 0x01, // local.get 2; i32.eqz; br_if 1 (break)
-		0x20, 0x01, 0x20, 0x02, 0x6a, 0x21, 0x01, // sum += i
-		0x20, 0x02, 0x41, 0x01, 0x6b, 0x21, 0x02, // i -= 1
-		0x0c, 0x00, // br 0 (continue)
+		0x41,
+		0x00,
+		0x21,
+		0x01, // i32.const 0; local.set 1 (sum = 0)
+		0x20,
+		0x00,
+		0x21,
+		0x02, // local.get 0; local.set 2 (i = n)
+		0x02,
+		0x40, // block
+		0x03,
+		0x40, // loop
+		0x20,
+		0x02,
+		0x45,
+		0x0d,
+		0x01, // local.get 2; i32.eqz; br_if 1 (break)
+		0x20,
+		0x01,
+		0x20,
+		0x02,
+		0x6a,
+		0x21,
+		0x01, // sum += i
+		0x20,
+		0x02,
+		0x41,
+		0x01,
+		0x6b,
+		0x21,
+		0x02, // i -= 1
+		0x0c,
+		0x00, // br 0 (continue)
 		0x0b, // end loop
 		0x0b, // end block
-		0x20, 0x01, // local.get 1 (sum)
+		0x20,
+		0x01, // local.get 1 (sum)
 		0x0b, // end
 	];
 	let wasm: Vec<u8> = build(&Spec { types: &[(&[I32], &[I32])], imports: &[], funcs: &[0], mem_pages: 0, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[(&[(2, I32)], body)] });
@@ -394,17 +420,30 @@ fn takes_each_if_branch() {
 fn dispatches_with_br_table() {
 	// (func (param i32) (result i32)) switch: 0 -> 10, 1 -> 20, default -> 30.
 	let body: &[u8] = &[
-		0x02, 0x40, // block $default
-		0x02, 0x40, // block $case1
-		0x02, 0x40, // block $case0
-		0x20, 0x00, // local.get 0
-		0x0e, 0x02, 0x00, 0x01, 0x02, // br_table [0, 1] default 2
+		0x02,
+		0x40, // block $default
+		0x02,
+		0x40, // block $case1
+		0x02,
+		0x40, // block $case0
+		0x20,
+		0x00, // local.get 0
+		0x0e,
+		0x02,
+		0x00,
+		0x01,
+		0x02, // br_table [0, 1] default 2
 		0x0b, // end $case0
-		0x41, 0x0a, 0x0f, // i32.const 10; return
+		0x41,
+		0x0a,
+		0x0f, // i32.const 10; return
 		0x0b, // end $case1
-		0x41, 0x14, 0x0f, // i32.const 20; return
+		0x41,
+		0x14,
+		0x0f, // i32.const 20; return
 		0x0b, // end $default
-		0x41, 0x1e, // i32.const 30
+		0x41,
+		0x1e, // i32.const 30
 		0x0b, // end
 	];
 	let wasm: Vec<u8> = build(&Spec { types: &[(&[I32], &[I32])], imports: &[], funcs: &[0], mem_pages: 0, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[(&[], body)] });

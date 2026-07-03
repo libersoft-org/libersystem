@@ -79,12 +79,40 @@ fn conf_get<'a>(conf: &'a [(String, String)], key: &str) -> &'a str {
 // virtio_blk, so the volume is gone), and ResourceManager spawns resource_probe into a
 // bounded sub-Domain (which ProcessService cannot do), so both ship in the package.
 // (package entry name, crate directory under ../user).
-const PINNED_SERVICES: [(&str, &str); 8] = [("system_manager", "system_manager"), ("service_manager", "services"), ("log_service", "services"), ("device_manager", "services"), ("process_service", "services"), ("storage_service", "storage"), ("watchdog_probe", "services"), ("resource_probe", "services")];
+const PINNED_SERVICES: [(&str, &str); 8] = [
+	("system_manager", "system_manager"),
+	("service_manager", "services"),
+	("log_service", "services"),
+	("device_manager", "services"),
+	("process_service", "services"),
+	("storage_service", "storage"),
+	("watchdog_probe", "services"),
+	("resource_probe", "services"),
+];
 
 // Every other service, manager and demo component: loaded from the system volume's `bin/`
 // via ProcessService, so they are staged onto the volume and NOT kept in the init package
 // (M61 box 8). (package entry name, crate directory under ../user).
-const VOLUME_SERVICES: [(&str, &str); 18] = [("device_service", "services"), ("config_service", "services"), ("network_service", "services"), ("time_service", "services"), ("console_service", "services"), ("audio_service", "services"), ("input_service", "services"), ("system_graph_service", "services"), ("permission_manager", "services"), ("resource_manager", "services"), ("session_service", "services"), ("sandbox_probe", "services"), ("request_probe", "services"), ("wasi_host", "services"), ("component_host", "services"), ("file_picker", "services"), ("shell", "services"), ("storage_client", "storage")];
+const VOLUME_SERVICES: [(&str, &str); 18] = [
+	("device_service", "services"),
+	("config_service", "services"),
+	("network_service", "services"),
+	("time_service", "services"),
+	("console_service", "services"),
+	("audio_service", "services"),
+	("input_service", "services"),
+	("system_graph_service", "services"),
+	("permission_manager", "services"),
+	("resource_manager", "services"),
+	("session_service", "services"),
+	("sandbox_probe", "services"),
+	("request_probe", "services"),
+	("wasi_host", "services"),
+	("component_host", "services"),
+	("file_picker", "services"),
+	("shell", "services"),
+	("storage_client", "storage"),
+];
 
 // The bootstrap block driver - it must ship in the init package because it backs the
 // system volume everything else is seeded onto, so it can never live on that volume.
@@ -96,7 +124,51 @@ const NONBOOT_DRIVER_NAMES: [&str; 6] = ["virtio_net", "virtio_console", "virtio
 
 // Command-line tools - loaded from the system volume under bin/, so staged there and not
 // kept in the init package.
-const TOOL_NAMES: [&str; 43] = ["date", "cat", "write", "rm", "ls", "mkdir", "rmdir", "log", "snap", "volume", "lsdev", "config", "set", "beep", "usage", "ps", "run", "perm", "stop", "lsvol", "uname", "uptime", "dmesg", "lscpu", "free", "lsmem", "lsirq", "lspci", "lssvc", "lsblk", "lsusb", "echo", "ping", "ip", "nslookup", "tcp", "nc", "arp", "httpd", "ss", "script", "ptyecho", "readln"];
+const TOOL_NAMES: [&str; 43] = [
+	"date",
+	"cat",
+	"write",
+	"rm",
+	"ls",
+	"mkdir",
+	"rmdir",
+	"log",
+	"snap",
+	"volume",
+	"lsdev",
+	"config",
+	"set",
+	"beep",
+	"usage",
+	"ps",
+	"run",
+	"perm",
+	"stop",
+	"lsvol",
+	"uname",
+	"uptime",
+	"dmesg",
+	"lscpu",
+	"free",
+	"lsmem",
+	"lsirq",
+	"lspci",
+	"lssvc",
+	"lsblk",
+	"lsusb",
+	"echo",
+	"ping",
+	"ip",
+	"nslookup",
+	"tcp",
+	"nc",
+	"arp",
+	"httpd",
+	"ss",
+	"script",
+	"ptyecho",
+	"readln",
+];
 
 // The debug-build target path of a userspace ELF: each crate builds to its own target dir.
 fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {

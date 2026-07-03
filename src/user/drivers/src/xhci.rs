@@ -990,11 +990,7 @@ unsafe fn recover_ep0(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)
 // CLEAR_FEATURE(ENDPOINT_HALT) to the endpoint's address, resetting its data toggle.
 unsafe fn recover_bulk(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage, dir_in: bool) {
 	unsafe {
-		let (dci, addr, dequeue): (u32, u8, u64) = if dir_in {
-			(st.dci_in, st.ep_in_addr, st.ring_in.phys + st.ring_in.index * 16 | st.ring_in.cycle as u64)
-		} else {
-			(st.dci_out, st.ep_out_addr, st.ring_out.phys + st.ring_out.index * 16 | st.ring_out.cycle as u64)
-		};
+		let (dci, addr, dequeue): (u32, u8, u64) = if dir_in { (st.dci_in, st.ep_in_addr, st.ring_in.phys + st.ring_in.index * 16 | st.ring_in.cycle as u64) } else { (st.dci_out, st.ep_out_addr, st.ring_out.phys + st.ring_out.index * 16 | st.ring_out.cycle as u64) };
 		reset_endpoint(hc, keyboard, dev.slot, dci, dequeue);
 		let _ = control_nodata(hc, keyboard, dev, RT_ENDPOINT, REQ_CLEAR_FEATURE, FEATURE_ENDPOINT_HALT, addr as u16);
 	}

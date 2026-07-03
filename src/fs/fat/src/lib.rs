@@ -289,11 +289,7 @@ impl<D: BlockDevice> FatFs<D> {
 		Ok(match self.geo.kind {
 			Kind::Fat12 => {
 				let v = u16::from_le_bytes([buf[within], buf[within + 1]]);
-				if cluster & 1 == 1 {
-					(v >> 4) as u32
-				} else {
-					(v & 0x0FFF) as u32
-				}
+				if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
 			}
 			Kind::Fat16 => u16::from_le_bytes([buf[within], buf[within + 1]]) as u32,
 			Kind::Fat32 | Kind::ExFat => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]) & 0x0FFF_FFFF,
@@ -405,11 +401,7 @@ impl<D: BlockDevice> FatFs<D> {
 
 	// Read a directory's raw bytes: the fixed root region for FAT12/16, else its chain.
 	fn read_dir_bytes(&mut self, cluster: u32) -> Result<Vec<u8>, FsError> {
-		if cluster == 0 {
-			self.read_root_region()
-		} else {
-			self.read_chain(cluster, usize::MAX)
-		}
+		if cluster == 0 { self.read_root_region() } else { self.read_chain(cluster, usize::MAX) }
 	}
 
 	// Write a directory's raw bytes back, to the fixed root region or its cluster chain.

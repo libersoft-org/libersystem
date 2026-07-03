@@ -85,7 +85,24 @@ const DENY_REPLY: &[u8] = b"DENY";
 // client only for the ones the supervisor wired it (the rest stay 0 - declared in the
 // vocabulary, not yet grantable - so a manifest naming them records the decision but hands
 // over nothing).
-const VOCABULARY: [Capability; 16] = [Capability::Storage, Capability::Log, Capability::Network, Capability::Device, Capability::Config, Capability::Time, Capability::Audio, Capability::Input, Capability::Graph, Capability::Resource, Capability::Process, Capability::Permission, Capability::Supervisor, Capability::Volumes, Capability::Services, Capability::Usb];
+const VOCABULARY: [Capability; 16] = [
+	Capability::Storage,
+	Capability::Log,
+	Capability::Network,
+	Capability::Device,
+	Capability::Config,
+	Capability::Time,
+	Capability::Audio,
+	Capability::Input,
+	Capability::Graph,
+	Capability::Resource,
+	Capability::Process,
+	Capability::Permission,
+	Capability::Supervisor,
+	Capability::Volumes,
+	Capability::Services,
+	Capability::Usb,
+];
 
 // The manager's policy: the permission manifest declared for each component it governs -
 // the typed source of truth for what that component may be granted.

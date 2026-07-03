@@ -65,7 +65,13 @@ fn prop_for(kind: ResourceKind) -> u64 {
 // `set-limit` returns updated.
 fn budget_of(domain: u64) -> Budget {
 	let stats: DomainStats = unsafe { domain_stats(domain) }.unwrap_or_default();
-	let usage: Vec<ResourceUsage> = alloc::vec![ResourceUsage { kind: ResourceKind::Memory, used: stats.memory_used, limit: stats.memory_limit }, ResourceUsage { kind: ResourceKind::Handles, used: stats.handles_used, limit: stats.handles_limit }, ResourceUsage { kind: ResourceKind::Threads, used: stats.threads_used, limit: stats.threads_limit }, ResourceUsage { kind: ResourceKind::IpcQueue, used: stats.ipc_used, limit: stats.ipc_limit }, ResourceUsage { kind: ResourceKind::Dma, used: stats.dma_used, limit: stats.dma_limit },];
+	let usage: Vec<ResourceUsage> = alloc::vec![
+		ResourceUsage { kind: ResourceKind::Memory, used: stats.memory_used, limit: stats.memory_limit },
+		ResourceUsage { kind: ResourceKind::Handles, used: stats.handles_used, limit: stats.handles_limit },
+		ResourceUsage { kind: ResourceKind::Threads, used: stats.threads_used, limit: stats.threads_limit },
+		ResourceUsage { kind: ResourceKind::IpcQueue, used: stats.ipc_used, limit: stats.ipc_limit },
+		ResourceUsage { kind: ResourceKind::Dma, used: stats.dma_used, limit: stats.dma_limit },
+	];
 	Budget { name: String::from(BUDGET_NAME), usage }
 }
 

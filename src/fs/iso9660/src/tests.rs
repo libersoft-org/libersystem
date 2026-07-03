@@ -73,7 +73,12 @@ fn build_iso(joliet: bool) -> Vec<u8> {
 	// hello.txt at 21, world.txt at 22 (inside SUB)
 	blk(21, b"hello iso");
 	blk(22, b"world");
-	let root = dir_block(&[record(root_lba, SECTOR_SIZE as u32, true, &[0]), record(root_lba, SECTOR_SIZE as u32, true, &[1]), record(sub_lba, SECTOR_SIZE as u32, true, &name("SUB", true, joliet)), record(21, 9, false, &name("HELLO.TXT", false, joliet))]);
+	let root = dir_block(&[
+		record(root_lba, SECTOR_SIZE as u32, true, &[0]),
+		record(root_lba, SECTOR_SIZE as u32, true, &[1]),
+		record(sub_lba, SECTOR_SIZE as u32, true, &name("SUB", true, joliet)),
+		record(21, 9, false, &name("HELLO.TXT", false, joliet)),
+	]);
 	let sub = dir_block(&[record(sub_lba, SECTOR_SIZE as u32, true, &[0]), record(root_lba, SECTOR_SIZE as u32, true, &[1]), record(22, 5, false, &name("WORLD.TXT", false, joliet))]);
 	blk(19, &root);
 	blk(20, &sub);

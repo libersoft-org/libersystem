@@ -2758,7 +2758,34 @@ fn init_package_starts_system_manager() {
 	// managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 26] = [b"LogService: online", b"DeviceManager: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"StorageService: online", b"ProcessService: online", b"ConfigService: online", b"AudioService: online", b"InputService: online", b"ResourceManager: online", b"SessionService: online", b"NetworkService: online", b"DeviceService: online", b"TimeService: online", b"PermissionManager: online", b"ConsoleService: online", b"SystemGraphService: online", b"Shell: online", b"DeviceManager: stopped", b"WatchdogProbe: online", b"WatchdogProbe: restarted", b"WatchdogProbe: recovered", b"ServiceManager: online", b"SystemManager: online"];
+	let reports: [&[u8]; 26] = [
+		b"LogService: online",
+		b"DeviceManager: online",
+		b"StorageService: online",
+		b"StorageService: online",
+		b"StorageService: online",
+		b"StorageService: online",
+		b"StorageService: online",
+		b"ProcessService: online",
+		b"ConfigService: online",
+		b"AudioService: online",
+		b"InputService: online",
+		b"ResourceManager: online",
+		b"SessionService: online",
+		b"NetworkService: online",
+		b"DeviceService: online",
+		b"TimeService: online",
+		b"PermissionManager: online",
+		b"ConsoleService: online",
+		b"SystemGraphService: online",
+		b"Shell: online",
+		b"DeviceManager: stopped",
+		b"WatchdogProbe: online",
+		b"WatchdogProbe: restarted",
+		b"WatchdogProbe: recovered",
+		b"ServiceManager: online",
+		b"SystemManager: online",
+	];
 	for expected in reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
 		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");

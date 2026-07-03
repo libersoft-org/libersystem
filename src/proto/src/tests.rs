@@ -14,11 +14,25 @@ fn entry_matches_abi_log_layout() {
 	let mut buf = [0u8; 64];
 	let n = e.encode(&mut buf).expect("encode");
 	let expected: &[u8] = &[
-		0x2a, 0, 0, 0, 0, 0, 0, 0,    // timestamp = 42
+		0x2a,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,    // timestamp = 42
 		0x02, // severity = info
-		0x06, 0x00, // source length = 6
-		b'k', b'e', b'r', b'n', b'e', b'l', // "kernel"
-		0x00, 0x00, // field count = 0
+		0x06,
+		0x00, // source length = 6
+		b'k',
+		b'e',
+		b'r',
+		b'n',
+		b'e',
+		b'l', // "kernel"
+		0x00,
+		0x00, // field count = 0
 	];
 	assert_eq!(&buf[..n], expected);
 }
@@ -464,7 +478,13 @@ fn query_renders_cbor_with_options() {
 // encode/decode unchanged.
 #[test]
 fn graph_round_trips() {
-	let g = Graph { components: alloc::vec![Component { name: String::from("log-service"), kind: ComponentKind::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 7, messages_received: 3, handles: 5, memory_bytes: 8192, restarts: 0, watchdog_trips: 0, last_failure: String::new() } }, Component { name: String::from("device-manager"), kind: ComponentKind::Service, state: ComponentState::Stopped, deps: alloc::vec![String::from("log-service")], counters: Counters { messages_sent: 1, messages_received: 1, handles: 2, memory_bytes: 4096, restarts: 1, watchdog_trips: 1, last_failure: String::from("hung") } },], spans: alloc::vec![TraceSpan { name: String::from("device.list"), duration_ns: 1234 }] };
+	let g = Graph {
+		components: alloc::vec![
+			Component { name: String::from("log-service"), kind: ComponentKind::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 7, messages_received: 3, handles: 5, memory_bytes: 8192, restarts: 0, watchdog_trips: 0, last_failure: String::new() } },
+			Component { name: String::from("device-manager"), kind: ComponentKind::Service, state: ComponentState::Stopped, deps: alloc::vec![String::from("log-service")], counters: Counters { messages_sent: 1, messages_received: 1, handles: 2, memory_bytes: 4096, restarts: 1, watchdog_trips: 1, last_failure: String::from("hung") } },
+		],
+		spans: alloc::vec![TraceSpan { name: String::from("device.list"), duration_ns: 1234 }],
+	};
 	let bytes = g.encode_vec();
 	assert_eq!(Graph::decode(&bytes), Some(g));
 }

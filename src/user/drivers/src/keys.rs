@@ -172,11 +172,7 @@ fn layout(code: u16, mods: &Mods) -> u8 {
 	}
 	// Letters flip with Shift XOR Caps Lock; symbols only with Shift.
 	let shifted: bool = if base.is_ascii_lowercase() { mods.shift ^ mods.caps } else { mods.shift };
-	if shifted {
-		KEYMAP_SHIFT[code as usize]
-	} else {
-		base
-	}
+	if shifted { KEYMAP_SHIFT[code as usize] } else { base }
 }
 
 // The ANSI escape sequence a navigation keycode maps to, or None for an ordinary key.
@@ -214,11 +210,7 @@ const HID_KEYCODES: [u16; 0x53] = [
 
 // Resolve a HID keyboard-page usage id to its keycode (0 = unmapped).
 pub fn hid_keycode(usage: u8) -> u16 {
-	if (usage as usize) < HID_KEYCODES.len() {
-		HID_KEYCODES[usage as usize]
-	} else {
-		0
-	}
+	if (usage as usize) < HID_KEYCODES.len() { HID_KEYCODES[usage as usize] } else { 0 }
 }
 
 // The keycode of each HID boot-report modifier bit (byte 0, bits 0..7):

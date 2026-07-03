@@ -29,7 +29,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::path;
-use proto::system::{volume, FileInfo, FileKind, Timestamp};
+use proto::system::{FileInfo, FileKind, Timestamp, volume};
 use rt::*;
 
 // What the listing is ordered by; directories group first under every key but None.
@@ -246,11 +246,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit) 
 					return by_key;
 				}
 				let by_name = a.name.cmp(&b.name);
-				if key == SortKey::Name && reverse {
-					by_name.reverse()
-				} else {
-					by_name
-				}
+				if key == SortKey::Name && reverse { by_name.reverse() } else { by_name }
 			});
 		}
 		print(uri);

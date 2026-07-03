@@ -46,7 +46,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // asked through the volume's typed `capacity` query.
 unsafe fn list_block_devices(system: u64, media: u64, iso: u64, udf: u64, usb: u64, json: bool) {
 	unsafe {
-		let rows: [(&str, &str, u64); 5] = [("vol://system", "virtio-blk", system), ("vol://media", "virtio-blk", media), ("vol://iso", "virtio-blk", iso), ("vol://udf", "virtio-blk", udf), ("vol://usb", "usb-storage", usb)];
+		let rows: [(&str, &str, u64); 5] = [
+			("vol://system", "virtio-blk", system),
+			("vol://media", "virtio-blk", media),
+			("vol://iso", "virtio-blk", iso),
+			("vol://udf", "virtio-blk", udf),
+			("vol://usb", "usb-storage", usb),
+		];
 		let mut out = String::new();
 		if json {
 			out.push('[');
