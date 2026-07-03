@@ -1209,7 +1209,7 @@ multi-page DMA buffers.
 - Done when: bulk disk and network I/O move in large requests, the measured throughput improves accordingly, tests green.
 - Concept: M23/M24/M62 (the drivers this accelerates), the limits audit (the last "one page" assumptions removed).
 
-## LiberFS audit track (M73-M81)
+## LiberFS audit track (M73-M82)
 
 A full read of the crate (~3900 lines: lib/txn/fsops/dir/inode/blkalloc/snapshot/
 fsck + tests) plus the service and driver wiring around it (2026-07-02). The core -
@@ -1473,6 +1473,18 @@ namespace, pathological tree depth), which no per-field bound catches.
   - Result: all hold, plus the B6 data-loss fix - liberfs 89 host tests (6 new), kernel 87 fresh + 87 mount, build 0 warnings.
 - Concept: M80's closing move - after this sweep every value AND every shape taken from the medium is bounded: counts, lengths, pointers, sizes, graph depth and graph acyclicity. And the failure mode is now proportionate: damage degrades the mount, it never costs the volume.
 
+## M82 - LiberFS: fsck must survive what M81 taught the mount to survive
+
+The sixth full source pass (2026-07-03, after M81 landed) found both remaining
+bugs in one place: fsck's error handling was written for the pre-M81 world and
+two M81 behaviors now kill the report - a direct contradiction of the M80-B7
+contract (fsck REPORTS damage, it never dies on it).
+
+- [ ] (B1, high) fsck dies on free-map damage: `fsck()` opens with `self.derive_free()?`, and since M81-B6 a broken spill chain (or any unreadable node) makes that return Corrupt - so fsck FAILS on exactly the volume the operator most needs a report for (the read-only-degraded mount that B6 creates). Worse: when the damage arises at runtime (bit rot after a clean mount), fsck finds it, errors out, and leaves the volume WRITABLE - the next snapshot-commit rederivation could then allocate from an incomplete map. Catch the damage, count it into the report, DEGRADE the volume to read-only (the same policy as the mount), and keep walking.
+- [ ] (B2, medium) fsck's per-item catches cover Corrupt but not Io: a hostile out-of-pool pointer (an extent's `physical`, a spill pointer, a `csum` block) read-FAILS after the M81-B5 saturation, and the resulting Io kills the report mid-walk (`dir_entries_of`, the `read_inode`/`count_corrupt` chain, and the snapshot loop's `check_inode_tree` all return it). To the operator an unreadable block IS damage; a genuinely dying device drowns the report in failures, which is itself informative. Fold Io into the per-item damage accounting alongside Corrupt.
+- Done when: fsck on a spill-damaged volume and on a volume with out-of-pool pointers returns a report (counting and naming what it can) instead of an error, and a writable volume whose rederivation finds damage is read-only afterwards - covered by tests, suite green.
+- Concept: M80-B7 (the report-not-death contract this restores), M81-B6 (the degrade-to-read-only policy fsck now applies too) - the audit track's rule that the failure mode stays proportionate to the damage.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
@@ -1495,7 +1507,7 @@ workloads; multi-queue devices and the per-CPU interrupt-vector spaces they need
 (one vector number per device suffices until then - the M72 throughput work stays
 single-queue); immutable signed system + A/B updates + rollback + verified boot;
 encrypted user volumes; LiberFS work beyond the M53-M57 modernization and the
-M73-M81 audit track (online
+M73-M82 audit track (online
 resize, online defrag, multi-device / RAID; deduplication and encryption stay out by decision);
 first-party server apps (a
 static-file web server and the like); and a CLI package manager over the phase-2
