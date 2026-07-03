@@ -3365,6 +3365,38 @@ fn system_manager_recovery_survives_a_clean_start() {
 
 #[cfg(test)]
 #[test_case]
+fn a_clean_exit_releases_the_process_channel_endpoints() {
+	use object::channel::Channel;
+	use object::process::Process;
+	use object::rights::Rights;
+
+	// The shell's tool relay waits for the tool's stdout channel to CLOSE - and a
+	// supervisor (the shell's job table, ps) legitimately holds the Process handle
+	// long after the exit. A clean exit must therefore close the process's handle
+	// table itself, exactly like the kill path does: the channel endpoints a dead
+	// process held must not stay open until the LAST Process reference drops, or
+	// every relay on a cleanly exiting child waits forever.
+	let domain = sched::root_domain();
+	let process = sched::process_create(domain).expect("the process should create");
+	let (ours, theirs) = Channel::create();
+	// park the peer endpoint in the child's handle table, standing in for a tool's
+	// inherited stdout.
+	process.install(theirs, Rights::ALL, 0);
+	// the child's single thread exits cleanly at once.
+	extern "C" fn clean_body(_arg: u64) {}
+	let thread = sched::thread_create(process.clone(), clean_body, 0);
+	sched::run_until_idle();
+	drop(thread);
+	// the process terminated cleanly...
+	assert!(process.is_terminated(), "the process should have exited");
+	// ...and even though we STILL HOLD a Process reference (the supervisor's view),
+	// its endpoint is gone: the peer reads as closed, not merely quiet.
+	assert!(ours.is_peer_closed(), "a clean exit must release the process's channel endpoints while a Process reference is still held");
+	let _: &Process = &process;
+}
+
+#[cfg(test)]
+#[test_case]
 fn userspace_spawn_syscalls_start_a_second_process() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	// A kernel thread drives the userspace spawn syscalls exactly as a ring-3

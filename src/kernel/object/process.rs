@@ -130,11 +130,17 @@ impl Process {
 		self.killed.load(Ordering::Acquire)
 	}
 
-	// Mark the process as having exited cleanly (its last thread is gone) and wake
-	// anything blocked on the process handle, so a waiter observes the termination at
-	// once. Idempotent: the scheduler calls it as the final thread retires.
+	// Mark the process as having exited cleanly (its last thread is gone), close its
+	// handle table, and wake anything blocked on the process handle, so a waiter
+	// observes the termination at once. Closing the handles here - exactly as the
+	// kill path's `terminate` does - is what releases the process's channel endpoints:
+	// a peer (a shell relaying a tool's stdout) learns the process is gone by its
+	// channel closing, and that must not wait for the LAST Process reference to drop -
+	// a supervisor or job table legitimately holds one long after the exit. Idempotent:
+	// the scheduler calls it as the final thread retires.
 	pub fn mark_exited(&self) {
 		self.exited.store(true, Ordering::Release);
+		self.handles.lock().close_all();
 		sched::wake_object(self.header.koid());
 	}
 
