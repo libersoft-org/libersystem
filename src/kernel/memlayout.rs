@@ -6,9 +6,9 @@
 // across every address space.
 //
 //   lower half (user, per-process page tables)
-//     0x0000_0000_4000_0000  USER_CODE_VA      ring-3 test code page (1 GiB)
+//     0x0000_0000_4000_0000  USER_CODE_VA      ring-3 test code page (1 GB)
 //     0x0000_0000_4001_0000  USER_STACK_VA     ring-3 test stack page
-//     0x0000_0000_8000_0000  USER_STACK_TOP    ELF-loaded program's ring-3 stack top (2 GiB)
+//     0x0000_0000_8000_0000  USER_STACK_TOP    ELF-loaded program's ring-3 stack top (2 GB)
 //     0x0000_4000_0000_0000  USER_MMAP_BASE    ring-3 syscall-mapped objects (bump up)
 //     0x0000_8000_0000_0000  USER_VA_END       exclusive top of the user half
 //   higher half (kernel, shared across address spaces)
@@ -22,19 +22,19 @@ pub(crate) const USER_CODE_VA: u64 = 0x0000_0000_4000_0000;
 #[cfg(test)]
 pub(crate) const USER_STACK_VA: u64 = 0x0000_0000_4001_0000;
 
-// ELF-loaded process ring-3 stack: it lives just below the 2 GiB line (well above
+// ELF-loaded process ring-3 stack: it lives just below the 2 GB line (well above
 // the program's load address and clear of the kernel's higher half) and grows
 // down from USER_STACK_TOP over USER_STACK_PAGES pages. USER_STACK_TOP is part of
 // the spawn ABI (a userspace spawner passes it to thread_create), so its value is
-// sourced from the abi crate. The stack is 256 KiB: a debug-built service can run
+// sourced from the abi crate. The stack is 256 kB: a debug-built service can run
 // a deep call chain (e.g. the Wasm interpreter dispatching an import that fans out
 // through a generated service client and the codec) with page-sized scratch
-// buffers along the way, which overruns a smaller one - Linux gives threads 8 MiB.
+// buffers along the way, which overruns a smaller one - Linux gives threads 8 MB.
 pub(crate) const USER_STACK_TOP: u64 = abi::USER_STACK_TOP;
 pub(crate) const USER_STACK_PAGES: u64 = 64;
 
 // Ring-3 syscall-mapped MemoryObjects bump up from here. The base sits far above
-// the program and stack the loader places below the 2 GiB line, yet within the
+// the program and stack the loader places below the 2 GB line, yet within the
 // user (lower) half, so user_buf_ok still accepts buffers carved from it.
 pub(crate) const USER_MMAP_BASE: u64 = 0x0000_4000_0000_0000;
 

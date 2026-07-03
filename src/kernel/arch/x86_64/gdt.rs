@@ -8,7 +8,7 @@
 // SMP: every core needs its OWN TSS, because `ltr` marks a TSS busy and loading
 // an already-busy TSS on a second core faults. Each core gets its own small GDT:
 // a single shared GDT would cap the machine at ~4093 cores
-// (16-byte TSS descriptors against the 64 KiB GDT limit), and per-core GDTs also
+// (16-byte TSS descriptors against the 64 kB GDT limit), and per-core GDTs also
 // let every core use the same TSS selector. The BSP's area (GDT + TSS + fault
 // stacks) is static - it is needed before any allocator runs - while each AP's
 // is allocated from the kernel heap when the core is brought online, so a huge
@@ -129,7 +129,7 @@ pub fn init() {
 
 // Per-core bring-up for an application processor: allocate the core's own area
 // straight on the kernel heap (alive by the time APs start) and install it. The
-// allocation is raw and zeroed on purpose - a Box::new would construct the ~41 KiB
+// allocation is raw and zeroed on purpose - a Box::new would construct the ~41 kB
 // value on the AP's small bootstrap stack first and overflow it. The area is
 // leaked deliberately: a core's GDT/TSS live for the life of the machine.
 pub fn load_ap(_cpu: usize) {

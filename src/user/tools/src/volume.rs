@@ -162,11 +162,11 @@ unsafe fn restore(storage: u64, uri: &[u8], snapshot: &[u8]) {
 	}
 }
 
-// Render a byte count in a human unit (KiB/MiB/GiB, one decimal place).
+// Render a byte count in a human unit (kB/MB/GB, one decimal place).
 fn human(bytes: u64) -> String {
 	use core::fmt::Write as _;
 	let mut out = String::new();
-	let units: [(&str, u64); 3] = [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)];
+	let units: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("kB", 1 << 10)];
 	for (name, unit) in units {
 		if bytes >= unit {
 			let whole: u64 = bytes / unit;

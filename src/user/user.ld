@@ -16,7 +16,7 @@ PHDRS
 
 SECTIONS
 {
-	/* low half, well clear of the user stack the kernel maps near the 2 GiB line */
+	/* low half, well clear of the user stack the kernel maps near the 2 GB line */
 	. = 0x200000;
 
 	.text : {

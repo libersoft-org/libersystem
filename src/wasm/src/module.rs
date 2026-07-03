@@ -77,7 +77,7 @@ pub struct DataSegment {
 }
 
 // A parsed module. `memory_min_pages` is the declared minimum of the single memory
-// (0 if the module declares none); one page is 64 KiB.
+// (0 if the module declares none); one page is 64 kB.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Module {
 	pub types: Vec<FuncType>,

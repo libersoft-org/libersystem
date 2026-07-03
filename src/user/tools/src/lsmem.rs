@@ -93,9 +93,9 @@ fn render_region(out: &mut String, index: u64, region: &MemmapRegion, json: bool
 	out.push('\n');
 }
 
-// Append a byte count scaled to the largest whole unit (KiB / MiB / GiB) to `out`.
+// Append a byte count scaled to the largest whole unit (kB / MB / GB) to `out`.
 fn push_size(out: &mut String, bytes: u64) {
-	let units: [(&str, u64); 3] = [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)];
+	let units: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("kB", 1 << 10)];
 	for &(unit, scale) in &units {
 		if bytes >= scale {
 			push_decimal(out, bytes / scale);

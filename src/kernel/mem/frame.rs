@@ -1,6 +1,6 @@
 // Physical frame allocator.
 //
-// Builds a free list of 4 KiB physical frames from the Limine memory map. The
+// Builds a free list of 4 kB physical frames from the Limine memory map. The
 // list is threaded *through the free frames themselves*: each free frame stores
 // the physical address of the next free frame in its first 8 bytes, accessed via
 // the higher-half direct map (HHDM). This is an O(1) alloc/free stack that needs

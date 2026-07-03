@@ -299,7 +299,7 @@ struct TcpConn {
 	// Receive sequence: the next in-order byte we expect.
 	rcv_nxt: u32,
 	// Received in-order data waiting to be read, and how much. Heap-allocated (the
-	// 64 KiB window must never sit on a 16 KiB user stack).
+	// 64 kB window must never sit on a 16 kB user stack).
 	rx: Vec<u8>,
 	rx_len: usize,
 }
@@ -332,7 +332,7 @@ pub enum SockEntryState {
 
 // The interface's L2/L3 state: our addresses, the neighbor cache, and the pool of TCP
 // connections (on the heap - each carries a kilobyte receive buffer, too large for the
-// 16 KiB user stack).
+// 16 kB user stack).
 pub struct Stack {
 	mac: MacAddr,
 	ip: Ipv4Addr,

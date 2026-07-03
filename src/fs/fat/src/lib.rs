@@ -12,7 +12,7 @@
 //! following the cluster chain through the allocation table. All four families also
 //! create, overwrite, and delete files - FAT12/16/32 allocate from the FAT and write
 //! every copy; exFAT allocates from the allocation bitmap and writes its 0x85/0xC0/0xC1
-//! entry sets, so >4 GiB removable media is writable.
+//! entry sets, so >4 GB removable media is writable.
 
 #![cfg_attr(not(test), no_std)]
 

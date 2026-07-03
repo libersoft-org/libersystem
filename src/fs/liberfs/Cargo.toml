@@ -7,7 +7,7 @@ description = "LiberFS - a simple writable on-disk filesystem (block allocation,
 
 [dependencies]
 
-# The host tests move tens of MiB through the checksummed write path; without
+# The host tests move tens of MB through the checksummed write path; without
 # optimization the CRC and codec inner loops dominate the test run.
 [profile.test]
 opt-level = 2

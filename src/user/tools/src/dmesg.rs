@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use rt::*;
 
 // The boot log capture buffer; the kernel copies at most this much (its own ring
-// holds less - ConsoleService replays it through a 16 KiB buffer of the same shape).
+// holds less - ConsoleService replays it through a 16 kB buffer of the same shape).
 const LOG_CAPACITY: usize = 32 * 1024;
 
 #[unsafe(no_mangle)]

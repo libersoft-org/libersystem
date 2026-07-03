@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 // nothing and a small program stays at one region, while a large consumer (e.g.
 // StorageService seeding the system volume from a multi-megabyte factory archive) grows
 // on demand instead of every process reserving a big heap up front.
-const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
+const HEAP_SIZE: usize = 1024 * 1024; // 1 MB
 const PAGE_SIZE: usize = 4096;
 
 #[global_allocator]

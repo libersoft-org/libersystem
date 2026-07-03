@@ -377,7 +377,7 @@ impl Ld {
 			return;
 		}
 		self.hist_pos -= 1;
-		// clone to the heap: a line is up to LD_LINE_MAX (4 KiB), too big for the stack.
+		// clone to the heap: a line is up to LD_LINE_MAX (4 kB), too big for the stack.
 		let h: Vec<u8> = self.history[self.hist_pos].clone();
 		self.replace_line(&h, e);
 	}
@@ -447,7 +447,7 @@ struct Vt {
 	// signals to this process instead of editing the line.
 	fg_proc: Option<u64>,
 	// Boxed: the line-discipline buffer (a 128-byte line + history) is large, and a Vt is
-	// returned by value through the deep spawn_vt call chain on a small (16 KiB) user
+	// returned by value through the deep spawn_vt call chain on a small (16 kB) user
 	// stack; keeping it inline overflowed the stack when opening a new VT.
 	ld: Box<Ld>,
 	// 0 for a display VT (its master is the hardware display + keyboard: it renders into
@@ -987,7 +987,7 @@ unsafe fn feed_tty(vt: &mut Vt, b: u8) {
 				send_blocking(client, &[], 0);
 			} else {
 				let n: usize = vt.ld.len;
-				// build the line + newline on the heap: up to LD_LINE_MAX + 1 (4 KiB),
+				// build the line + newline on the heap: up to LD_LINE_MAX + 1 (4 kB),
 				// too big for this service's stack.
 				let mut out: Vec<u8> = Vec::with_capacity(n + 1);
 				out.extend_from_slice(&vt.ld.line[..n]);

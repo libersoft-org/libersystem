@@ -21,7 +21,7 @@ use crate::virtio::{Queue, Virtio};
 // The virtio_net_hdr prepended to every frame on both queues (VERSION_1: 12 bytes).
 const NET_HDR_LEN: u64 = 12;
 // The receive buffer pool: a handful of slots, each holding one full frame (the
-// 12-byte header + an up-to-1514-byte Ethernet frame fits comfortably in 2 KiB).
+// 12-byte header + an up-to-1514-byte Ethernet frame fits comfortably in 2 kB).
 const RX_SLOTS: u16 = 8;
 const RX_SLOT: u64 = 2048;
 // The transmit scratch buffer (one frame at a time, copied in then submitted).

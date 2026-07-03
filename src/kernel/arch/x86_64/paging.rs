@@ -1,11 +1,11 @@
-// x86_64 4-level paging: map and unmap single 4 KiB pages.
+// x86_64 4-level paging: map and unmap single 4 kB pages.
 //
 // Operates on the page-table hierarchy currently active in CR3 (the one Limine
 // set up, which already maps the kernel image and the HHDM). Page tables are
 // reached physically through the HHDM, and intermediate tables are allocated
 // from the frame allocator on demand.
 //
-// Scope for M1: 4 KiB pages only, no huge pages, and unmapping does not reclaim
+// Scope for M1: 4 kB pages only, no huge pages, and unmapping does not reclaim
 // now-empty intermediate tables (a deliberate, documented simplification).
 
 #![allow(dead_code)]
@@ -176,7 +176,7 @@ pub fn free_address_space(pml4_phys: u64) {
 
 // Recursively free the intermediate page tables below `phys`. `level` is 3 for a
 // PDPT, 2 for a PD, 1 for a PT. A PT's entries point at data frames, which are
-// not freed; only the table frames themselves are reclaimed. 4 KiB pages only,
+// not freed; only the table frames themselves are reclaimed. 4 kB pages only,
 // so there are no huge-page leaves to special-case.
 //
 // SAFETY: `phys` must be the physical address of a valid page table at `level`.
@@ -207,8 +207,8 @@ unsafe fn next_table_walk(table: *mut u64, index: usize) -> Option<u64> {
 
 // Translate a virtual address to its physical address in the active address space,
 // or None if unmapped. Walks the 4-level table and handles a huge-page leaf at the
-// PDPT (1 GiB) or PD (2 MiB) level - Limine often maps the framebuffer with 2 MiB
-// pages, so a 4 KiB-only walk would misread it. The returned phys carries the
+// PDPT (1 GB) or PD (2 MB) level - Limine often maps the framebuffer with 2 MB
+// pages, so a 4 kB-only walk would misread it. The returned phys carries the
 // in-page offset.
 pub fn translate(virt: u64) -> Option<u64> {
 	const PS: u64 = 1 << 7;

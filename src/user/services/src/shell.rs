@@ -206,7 +206,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			Vec::new()
 		};
 		loop {
-			// The line buffer matches the terminal's cooked line maximum (4 KiB + the
+			// The line buffer matches the terminal's cooked line maximum (4 kB + the
 			// newline) and lives on the heap - the kernel truncates a message to the
 			// receiver's buffer silently, so it must never be smaller than a line.
 			let mut line_buf: alloc::vec::Vec<u8> = alloc::vec![0u8; 4200];

@@ -6,7 +6,7 @@
 // their immediate neighbours, so contiguous free memory is merged back into one
 // region - this keeps the heap from fragmenting under churn (without it a long
 // run of allocations/frees could leave no single block big enough for a large
-// contiguous request - e.g. a 16 KiB kernel thread stack - even with plenty of
+// contiguous request - e.g. a 16 kB kernel thread stack - even with plenty of
 // total free space).
 
 use core::alloc::{GlobalAlloc, Layout};

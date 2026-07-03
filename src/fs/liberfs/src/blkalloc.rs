@@ -112,7 +112,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// write falls back to per-block allocation.
 	pub(crate) fn reserve_run(&mut self, len: u64) {
 		// the run count is stored as u32: clamp an absurd reservation (a single write
-		// past 16 TiB) rather than silently truncating the claim/release accounting.
+		// past 16 TB) rather than silently truncating the claim/release accounting.
 		let len = len.min(u32::MAX as u64) as usize;
 		if len < 2 || self.run.is_some() {
 			return;
@@ -755,7 +755,7 @@ pub(crate) fn lz_hash(w: &[u8]) -> usize {
 // 4-byte prefix; every candidate is verified by comparing bytes, so the table only
 // affects the ratio, never correctness. The format is the standard LZ4 block layout
 // (token, literals, offset, extended match length), chosen over the old LZSS coder for
-// a better ratio (64 KiB offsets, unbounded match lengths) at higher speed (token
+// a better ratio (64 kB offsets, unbounded match lengths) at higher speed (token
 // framing instead of per-item control bits).
 pub(crate) fn lz_compress(src: &[u8]) -> Vec<u8> {
 	let n = src.len();

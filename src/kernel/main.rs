@@ -2150,7 +2150,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let cap = report.caps.first().expect("the block channel is transferred with the report");
 	let blk = cap.object().into_any_arc().downcast::<Channel>().expect("the block channel is a channel");
 	// first the capacity query (op 2): the reply is [status u32][capacity bytes u64]
-	// and must report the seeded 16 MiB stick image.
+	// and must report the seeded 16 MB stick image.
 	let mut capacity = alloc::vec::Vec::with_capacity(16);
 	capacity.extend_from_slice(&2u32.to_le_bytes()); // op = capacity
 	capacity.extend_from_slice(&0u64.to_le_bytes());
@@ -2160,7 +2160,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let cap_reply = blk.recv().expect("the capacity reply should arrive");
 	assert_eq!(&cap_reply.bytes[..4], &0u32.to_le_bytes(), "the capacity query should succeed");
 	let bytes = u64::from_le_bytes([cap_reply.bytes[4], cap_reply.bytes[5], cap_reply.bytes[6], cap_reply.bytes[7], cap_reply.bytes[8], cap_reply.bytes[9], cap_reply.bytes[10], cap_reply.bytes[11]]);
-	assert_eq!(bytes, 16 * 1024 * 1024, "the stick should report its seeded 16 MiB capacity");
+	assert_eq!(bytes, 16 * 1024 * 1024, "the stick should report its seeded 16 MB capacity");
 	let mut request = alloc::vec::Vec::with_capacity(16);
 	request.extend_from_slice(&0u32.to_le_bytes()); // op = read
 	request.extend_from_slice(&0u64.to_le_bytes()); // lba 0
@@ -2965,9 +2965,9 @@ fn system_volume_formats_to_the_disks_capacity() {
 
 	// M65: a fresh system volume spans the whole disk - StorageService asks the block
 	// device for its capacity (the block protocol's op 2) and derives the pool from
-	// it, instead of formatting a fixed 32 MiB. Here we stand in for the block driver
+	// it, instead of formatting a fixed 32 MB. Here we stand in for the block driver
 	// with a sparse in-memory disk (a sector map; unwritten sectors read back as
-	// zeros) reporting a 64 MiB capacity: the mount probe finds no superblock and the
+	// zeros) reporting a 64 MB capacity: the mount probe finds no superblock and the
 	// seed probe no archive, so the service formats fresh - and the superblock it
 	// lays down must record a pool spanning everything past the factory-archive
 	// region, not the old fixed constant.
@@ -3123,7 +3123,7 @@ fn system_volume_lands_in_a_gpt_partition() {
 	// the partition, format the volume INSIDE it, and size the pool to it.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
 	const PART_FIRST: u64 = 40960;
-	const PART_BLOCKS: u64 = 4096; // 16 MiB
+	const PART_BLOCKS: u64 = 4096; // 16 MB
 	const PART_LAST: u64 = PART_FIRST + PART_BLOCKS * 8 - 1;
 
 	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
@@ -4204,7 +4204,7 @@ fn ipc_round_trip_and_zero_copy() {
 	let reply = client.recv().unwrap();
 	assert_eq!(&reply.bytes[..], b"reply");
 
-	// Zero-copy: a 1 MiB buffer is transferred as a capability, not copied. The
+	// Zero-copy: a 1 MB buffer is transferred as a capability, not copied. The
 	// producer marks the far end of the buffer and sends only a 3-byte note plus
 	// the handle; the consumer maps the same object and reads the mark back. That
 	// the far-end mark survives while only 3 bytes crossed the channel proves the
@@ -4213,14 +4213,14 @@ fn ipc_round_trip_and_zero_copy() {
 	static MARKER: AtomicU64 = AtomicU64::new(0);
 	static NOTE_LEN: AtomicU64 = AtomicU64::new(0);
 	extern "C" fn body(_arg: u64) {
-		const BUF_LEN: u64 = 0x10_0000; // 1 MiB
+		const BUF_LEN: u64 = 0x10_0000; // 1 MB
 		const MARK: u64 = 0xa5a5_0000_5a5a_1111;
 		unsafe {
 			let mut client: u64 = 0;
 			let mut server: u64 = 0;
 			let created = arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, &mut client as *mut u64 as u64, &mut server as *mut u64 as u64, 0, 0);
 			assert!(!syscall::sys_is_err(created));
-			// produce: mark the last 8 bytes of a 1 MiB object, then unmap it
+			// produce: mark the last 8 bytes of a 1 MB object, then unmap it
 			let mo = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, BUF_LEN, 0, 0, 0);
 			assert!(!syscall::sys_is_err(mo));
 			let virt = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, mo, 0, 0, 0);
@@ -4250,7 +4250,7 @@ fn ipc_round_trip_and_zero_copy() {
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst));
 	// the far-end mark came through intact, and only the 3-byte note crossed the
-	// channel: the 1 MiB buffer was shared by capability, never copied.
+	// channel: the 1 MB buffer was shared by capability, never copied.
 	assert_eq!(MARKER.load(Ordering::SeqCst), 0xa5a5_0000_5a5a_1111);
 	assert_eq!(NOTE_LEN.load(Ordering::SeqCst), 3);
 }

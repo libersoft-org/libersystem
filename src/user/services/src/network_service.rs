@@ -66,7 +66,7 @@ const FRAME_MAX: usize = 2048;
 const REQ_MAX: usize = 1024;
 const REPLY_MAX: usize = 4096;
 // How many bytes a single socket `recv` returns (the client calls `recv` repeatedly
-// to drain a larger response); kept small for the 16 KiB user stack.
+// to drain a larger response); kept small for the 16 kB user stack.
 const SOCK_RECV_MAX: usize = 512;
 // The initial sizes of the client / socket / listener sets. Each set grows on
 // demand (a slot is reused when free, a new one pushed otherwise), so these are
@@ -94,7 +94,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP, DNS_SERVER);
 		// 3. learn our address / mask / gateway / DNS from DHCP, falling back to the
 		//    static config above if no server answers. The frame buffers are scoped so
-		//    they are freed before serve allocates its own (the 16 KiB user stack).
+		//    they are freed before serve allocates its own (the 16 kB user stack).
 		{
 			let mut drx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
 			let mut dtx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
@@ -161,7 +161,7 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 	unsafe {
 		// The frame and reply buffers live on the heap, not in this function's frame:
 		// serve holds all of them for its whole lifetime and the connect handshake
-		// nests a deep call chain on top, which would overflow the 16 KiB user stack.
+		// nests a deep call chain on top, which would overflow the 16 kB user stack.
 		let mut rx: Vec<u8> = alloc::vec![0u8; FRAME_MAX];
 		let mut tx: Vec<u8> = alloc::vec![0u8; FRAME_MAX];
 		let mut req: [u8; REQ_MAX] = [0u8; REQ_MAX];
@@ -471,7 +471,7 @@ unsafe fn accept_handoff(listener_chan: u64, corr: u32, ci: usize, socks: &mut V
 // The state the typed `network` service operates on for one client request: the
 // driver frame channel, an ICMP/DNS sequence counter, the stack, and the frame
 // scratch buffers - the stack and buffers are borrowed from the serve loop, so the
-// connection state and the 2 KiB frame buffers are not duplicated on the stack.
+// connection state and the 2 kB frame buffers are not duplicated on the stack.
 // `connect` parks the server end of the socket it opens in `new_sock` (and its stack
 // connection index in `new_sock_ci`) for the serve loop to pick up. The room flags
 // are always true now that every set grows on demand; they remain so a future

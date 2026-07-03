@@ -27,8 +27,8 @@ const COM1: u16 = 0x3F8;
 // (and FIFO) is empty, so a full FIFO load may be pushed before polling again.
 const FIFO_DEPTH: usize = 16;
 
-// Software transmit ring. 16 KiB comfortably buffers a screenful of console mirror
-// (a `help` listing is ~2 KiB), so the producer never blocks in practice; on the
+// Software transmit ring. 16 kB comfortably buffers a screenful of console mirror
+// (a `help` listing is ~2 kB), so the producer never blocks in practice; on the
 // rare overflow the writer drains synchronously to make room rather than dropping.
 const TX_RING_CAP: usize = 16384;
 

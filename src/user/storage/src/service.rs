@@ -72,7 +72,7 @@ const OP_FLUSH: u32 = 3;
 // LiberFS layout on the disk: the writable filesystem starts at FS_START_SECTOR - well
 // past the factory archive at LBA 0, which the boot runner re-lays every boot and the
 // filesystem never overwrites, so created files persist across reboots. The archive
-// carries the staged program binaries (M61 box 7), so the FS starts 16 MiB in. The pool
+// carries the staged program binaries (M61 box 7), so the FS starts 16 MB in. The pool
 // SIZE is derived from the disk's real capacity at mount/format time (the capacity
 // query, M63); FS_BLOCKS is only the fallback pool for a disk that cannot report one.
 const SECTORS_PER_BLOCK: u64 = (liberfs::BLOCK_SIZE / SECTOR_SIZE) as u64;

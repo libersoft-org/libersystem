@@ -18,12 +18,12 @@ formal on-disk specification and the rules a foreign driver must honor.
 
 - Copy-on-write, single atomic superblock swap per commit (no journal), bracketed
   by device flush barriers so the ordering holds on a volatile write cache.
-- 4 KiB blocks, 64-bit block addresses; a flat pool scaling into exabytes.
+- 4 kB blocks, 64-bit block addresses; a flat pool scaling into exabytes.
 - Inodes in a B+tree keyed by number, allocated on demand (no fixed inode table).
 - Directories are name-keyed B+trees with variable-length records: O(log n)
   lookup/insert/remove, a couple hundred typical entries per leaf.
-- Files mapped by extents with sparse holes; file sizes to 16 EiB, volumes to
-  64 ZiB (the limits table below).
+- Files mapped by extents with sparse holes; file sizes to 16 EB, volumes to
+  64 ZB (the limits table below).
 - CRC32C (slice-by-8) on every data block and metadata node; corruption surfaces,
   not silent - and `fsck` names the damaged files, `restore` heals them from a
   snapshot.
@@ -44,50 +44,52 @@ formal on-disk specification and the rules a foreign driver must honor.
 Legend: ✓ = supported, ✗ = not supported, layer = handled by another
 LiberSystem layer.
 
-| Capability            | LiberFS | ZFS | Btrfs | XFS | ext4 | NTFS | exFAT | FAT12/16/32 |
-|-----------------------|:-------:|:---:|:-----:|:---:|:----:|:----:|:-----:|:-----------:|
-| Crash atomicity       | CoW     | CoW | CoW   | journal | journal | journal | ✗ | ✗ |
-| Copy-on-write         | ✓       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗     | ✗ |
-| Data checksums        | ✓ (CRC32C) | ✓ | ✓   | metadata | metadata | ✗ | ✗ | ✗ |
-| Snapshots             | ✓       | ✓   | ✓     | ✗   | ✗    | VSS  | ✗     | ✗ |
-| Compression           | ✓ (LZ4, per-volume switch) | ✓ | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ |
-| Sparse files          | ✓       | ✓   | ✓     | ✓   | ✓    | ✓    | ✗     | ✗ |
-| Dynamic inodes        | ✓ (B+tree) | ✓ | ✓   | ✓   | ✗    | ✓    | n/a   | n/a |
-| Dir index             | B+tree  | hash | B+tree | B+tree | hashed | B+tree | linear | linear |
-| POSIX perms/ACL       | layer   | ✓   | ✓     | ✓   | ✓    | ✓    | ✗     | ✗ |
-| Dedup                 | ✗       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗     | ✗ |
-| Encryption            | ✗       | ✓   | ✓     | ✗   | ✓    | ✓    | ✗     | ✗ |
-| Multi-device / RAID   | ✗       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗     | ✗ |
+| Capability            | LiberFS | ZFS | Btrfs | XFS | ext4 | APFS | NTFS | exFAT | FAT12/16/32 |
+|-----------------------|:-------:|:---:|:-----:|:---:|:----:|:----:|:----:|:-----:|:-----------:|
+| Crash atomicity       | CoW     | CoW | CoW   | journal | journal | CoW | journal | ✗ | ✗ |
+| Copy-on-write         | ✓       | ✓   | ✓     | ✗   | ✗    | ✓    | ✗    | ✗     | ✗ |
+| Data checksums        | ✓ (CRC32C) | ✓ | ✓   | metadata | metadata | metadata | ✗ | ✗ | ✗ |
+| Snapshots             | ✓       | ✓   | ✓     | ✗   | ✗    | ✓    | VSS  | ✗     | ✗ |
+| Compression           | ✓ (LZ4, per-volume switch) | ✓ | ✓ | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ |
+| Sparse files          | ✓       | ✓   | ✓     | ✓   | ✓    | ✓    | ✓    | ✗     | ✗ |
+| Dynamic inodes        | ✓ (B+tree) | ✓ | ✓   | ✓   | ✗    | ✓    | ✓    | n/a   | n/a |
+| Dir index             | B+tree  | hash | B+tree | B+tree | hashed | B-tree | B+tree | linear | linear |
+| POSIX perms/ACL       | layer   | ✓   | ✓     | ✓   | ✓    | ✓    | ✓    | ✗     | ✗ |
+| Dedup                 | ✗       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗    | ✗     | ✗ |
+| Encryption            | ✗       | ✓   | ✓     | ✗   | ✓    | ✓    | ✓    | ✗     | ✗ |
+| Multi-device / RAID   | ✗       | ✓   | ✓     | ✗   | ✗    | ✗    | ✗    | ✗     | ✗ |
 
 ### Limits
 
 Format limits (the on-disk structures' ceilings); common practical figures for
-the others.
+the others. Units here and everywhere in this project are JEDEC: 1 kB = 1024 B,
+1 MB = 1024 kB and so on.
 
-| Limit | LiberFS | ZFS | Btrfs | XFS | ext4 | NTFS | exFAT | FAT12/16/32 |
-|-------|:-------:|:---:|:-----:|:---:|:----:|:----:|:-----:|:-----------:|
-| Max volume size | 64 ZiB (2^64 × 4 KiB blocks) | 256 ZiB | 16 EiB | 8 EiB | 1 EiB | 8 PiB | 128 PiB | 2 TiB (FAT32; 16 TiB with 4 KiB sectors) |
-| Max file size | 16 EiB logical (u64 size; sparse); 16 PiB dense (2^32 extents × 4 MiB) | 16 EiB | 16 EiB | 8 EiB | 16 TiB | 8 PiB | 128 PiB | 4 GiB − 1 |
-| Max files | 2^32 inode numbers over the volume's lifetime (never reused) | 2^48 per directory | 2^64 | 2^64 (dynamic) | fixed at mkfs (≤ 2^32) | 2^32 − 1 | ~2.8 M per directory | ~268 M (FAT32) |
-| Max entries per directory | unbounded (B+tree) | 2^48 | 2^64 | 2^64 | ~10-12 M practical (htree) | 2^32 − 1 | ~2.8 M | 65 534 (FAT16/32 subdir) |
-| Max name length | 255 bytes (UTF-8) | 255 bytes | 255 bytes | 255 bytes | 255 bytes | 255 UTF-16 units | 255 UTF-16 units | 8.3 (255 UTF-16 with VFAT LFN) |
-| Max path length | unbounded | unbounded | unbounded | unbounded | unbounded | 32 767 UTF-16 units | 32 767 | 260 (classic Windows APIs) |
-| Snapshots per volume | unbounded (chained table) | 2^64 | unbounded | n/a | n/a | VSS-bound | n/a | n/a |
-| Volume label | 256 bytes UTF-8 | 256 | 256 | 12 | 16 | 32 UTF-16 | 11 | 11 |
+| Limit | LiberFS | ZFS | Btrfs | XFS | ext4 | APFS | NTFS | exFAT | FAT12/16/32 |
+|-------|:-------:|:---:|:-----:|:---:|:----:|:----:|:----:|:-----:|:-----------:|
+| Max volume size | 64 ZB (2^64 × 4 kB blocks) | 256 ZB | 16 EB | 8 EB | 1 EB | 8 EB | 8 PB | 128 PB | 2 TB (FAT32; 16 TB with 4 kB sectors) |
+| Max file size | 16 EB logical (u64 size; sparse); 16 PB dense (2^32 extents × 4 MB) | 16 EB | 16 EB | 8 EB | 16 TB | 8 EB | 8 PB | 128 PB | 4 GB − 1 |
+| Max files | 2^32 inode numbers over the volume's lifetime (never reused) | 2^48 per directory | 2^64 | 2^64 (dynamic) | fixed at mkfs (≤ 2^32) | 2^63 | 2^32 − 1 | ~2.8 M per directory | ~268 M (FAT32) |
+| Max entries per directory | unbounded (B+tree) | 2^48 | 2^64 | 2^64 | ~10-12 M practical (htree) | 2^63 | 2^32 − 1 | ~2.8 M | 65 534 (FAT16/32 subdir) |
+| Max name length | 255 bytes (UTF-8) | 255 bytes | 255 bytes | 255 bytes | 255 bytes | 255 bytes (UTF-8) | 255 UTF-16 units | 255 UTF-16 units | 8.3 (255 UTF-16 with VFAT LFN) |
+| Max path length | unbounded | unbounded | unbounded | unbounded | unbounded | 1024 (macOS APIs) | 32 767 UTF-16 units | 32 767 | 260 (classic Windows APIs) |
+| Snapshots per volume | unbounded (chained table) | 2^64 | unbounded | n/a | n/a | unbounded | VSS-bound | n/a | n/a |
+| Volume label | 256 bytes UTF-8 | 256 | 256 | 12 | 16 | 255 | 32 UTF-16 | 11 | 11 |
 
 LiberFS's figures are format ceilings; today's implementation also keeps a
-1-bit-per-block free map in memory (32 MiB of RAM per TiB of volume), which is
+1-bit-per-block free map in memory (32 MB of RAM per TB of volume), which is
 the practical ceiling until a persistent space map replaces it. The inode-number
 ceiling counts every file ever created, not just live ones - a design trade for
 O(1) revocation-free numbering; 2^32 creates outlast an appliance's life by a
 wide margin.
 
-In design, LiberFS sits closest to Btrfs/ZFS: copy-on-write, end-to-end
+In design, LiberFS sits closest to Btrfs/ZFS/APFS: copy-on-write, end-to-end
 checksums, snapshots, and compression. It deliberately omits the enterprise
 surface - RAID/pools, dedup, encryption, quotas, on-disk permissions - to stay
 small and to keep authorization in the capability layer. The classic FAT family
 and exFAT are interchange formats with no integrity or snapshots; NTFS, ext4, and
-XFS journal metadata but checksum no data and (mostly) lack snapshots. LiberFS
+XFS journal metadata but checksum no data and (mostly) lack snapshots; APFS is
+CoW with snapshots but checksums only its metadata, never user data. LiberFS
 trades the enterprise feature surface, not the limits, for a format small
 enough to read end to end.
 
@@ -105,7 +107,7 @@ enough to read end to end.
 
 ## On-disk layout
 
-A LiberFS volume is two superblock slots followed by one flat pool of 4 KiB
+A LiberFS volume is two superblock slots followed by one flat pool of 4 kB
 blocks:
 
 ```
@@ -154,7 +156,7 @@ layer's, so the filesystem itself carries no permission logic.
 Each directory is its own B+tree keyed by the FNV-1a hash of an entry's name, so
 lookup, insert, and remove are O(log n) and one directory can hold millions of
 entries with no linear scan. Leaf records are variable-length (13 bytes plus the
-name), so a 4 KiB leaf holds a couple hundred typical entries; records sharing a
+name), so a 4 kB leaf holds a couple hundred typical entries; records sharing a
 hash stay in one leaf, disambiguated by the name bytes. Names must be valid
 UTF-8 and pass a portable-name policy, so one file has one name and it moves
 cleanly to foreign media. Every tree node is a single block, copy-on-write, with
@@ -166,7 +168,7 @@ concrete need.
 ### Files (extents, sparse holes, compression)
 
 A file maps its data with extents - each a contiguous run of blocks paired with
-one checksum block (so one extent spans at most 4 MiB). Four extents sit inline in
+one checksum block (so one extent spans at most 4 MB). Four extents sit inline in
 the inode; more spill to an overflow chain (built back to front so each block
 carries the next block's pointer and CRC). An unwritten range simply has no
 extent: a sparse hole that reads back as zeros and costs no blocks. When the
@@ -222,7 +224,7 @@ so there is nothing for fsck to reclaim.
 
 ## Interfaces
 
-All I/O goes through the `BlockDevice` trait, one fixed 4 KiB block at a time, so
+All I/O goes through the `BlockDevice` trait, one fixed 4 kB block at a time, so
 the same code drives a real virtio-blk disk in StorageService and a `Vec`-backed
 device in host tests. The crate is `no_std` for userspace and pulls in `std` only
 under `cargo test`. It backs `Storage.Volume`, the same typed contract every
@@ -248,7 +250,7 @@ feature-flag bit and update this section.
 - The **container** is either a GPT partition whose type GUID is
   `4C424653-0001-4000-8000-4C6962657246` (the LiberFS partition type), or - on a
   LiberSystem factory disk without a GPT - the fixed region starting at
-  512-byte sector 32768 (16 MiB in, past the boot archive).
+  512-byte sector 32768 (16 MB in, past the boot archive).
 - The checksum everywhere is **CRC32C** (Castagnoli): polynomial 0x1EDC6F41
   (reflected 0x82F63B78), reflected input/output, initial value and final XOR
   0xFFFFFFFF. Test vector: `crc32c("123456789") = 0xE3069283`.
@@ -345,7 +347,7 @@ leaf split, since internal nodes route by hash alone. The hash is FNV-1a
 A file's extents are sorted by `logical`; a logical block no extent covers is a
 sparse hole reading as zeros. The **checksum block** holds one CRC32C (4 bytes)
 per stored block, slot `i` at byte `i*4` covering stored block `physical + i`;
-one extent therefore spans at most 1024 blocks (4 MiB). A **compressed extent**
+one extent therefore spans at most 1024 blocks (4 MB). A **compressed extent**
 (`clen > 0`) stores the `clen`-byte stream (u32 LE uncompressed length + LZ4
 block format) across `store_len` blocks, zero-padded; the per-block CRCs cover
 the stored (compressed) bytes.

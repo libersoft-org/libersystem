@@ -30,7 +30,7 @@ const FEATURE_FLUSH: u32 = 1 << 9;
 
 // The most sectors served per block request: the reply buffer is a MemoryObject
 // sized by the request and each sector streams through the one DMA page, so this
-// is IPC-batching granularity (128 KiB per request), not a data cap.
+// is IPC-batching granularity (128 kB per request), not a data cap.
 const MAX_SECTORS: u32 = 256;
 
 // Block-service request opcodes (the leading u32 of each request).

@@ -81,7 +81,7 @@ unsafe fn push_status(out: &mut String, storage: u64) {
 		return;
 	};
 	let used: u64 = st.total_bytes - st.free_bytes;
-	let _ = write!(out, " - {} / {} MiB used, compression {}", used >> 20, st.total_bytes >> 20, if st.compression { "on" } else { "off" });
+	let _ = write!(out, " - {} / {} MB used, compression {}", used >> 20, st.total_bytes >> 20, if st.compression { "on" } else { "off" });
 	if st.read_only {
 		out.push_str(", READ-ONLY");
 	}

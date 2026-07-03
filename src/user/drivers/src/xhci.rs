@@ -214,7 +214,7 @@ const SCSI_SYNCHRONIZE_CACHE10: u8 = 0x35;
 // - the write barrier, served as SCSI SYNCHRONIZE CACHE (10) - replies [status u32].
 // The per-request
 // sector cap is this driver's own: one SCSI READ(10)/WRITE(10) moves through the
-// unit's single 4 KiB data page, so 8 sectors is the transfer unit here (a larger
+// unit's single 4 kB data page, so 8 sectors is the transfer unit here (a larger
 // unit needs a multi-page BOT data buffer - a future throughput step).
 const SECTOR: u32 = 512;
 const MAX_SECTORS: u32 = 8;

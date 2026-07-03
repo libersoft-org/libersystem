@@ -223,7 +223,7 @@ pub fn bar_address(d: &PciDevice, bar_idx: usize) -> Option<u64> {
 
 // Measure a memory BAR's window size with the standard probe: write all-ones to the
 // register, read back the address mask, and restore the original value (the low half
-// suffices - no device here has a window over 4 GiB). Needed for devices like xHCI
+// suffices - no device here has a window over 4 GB). Needed for devices like xHCI
 // whose window size is not described anywhere else; virtio derives its window from
 // the capability list instead. Returns None for an I/O BAR or an out-of-range index.
 pub fn bar_size(d: &PciDevice, bar_idx: usize) -> Option<u64> {

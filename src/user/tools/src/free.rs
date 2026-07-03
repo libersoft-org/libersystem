@@ -58,13 +58,13 @@ fn render_row(out: &mut String, name: &str, total: u64, free: u64, human: bool) 
 }
 
 // Append a byte count to `out`: raw decimal by default, or scaled to the largest
-// whole unit (KiB / MiB / GiB, one decimal place) in human-readable form.
+// whole unit (kB / MB / GB, one decimal place) in human-readable form.
 fn push_size(out: &mut String, bytes: u64, human: bool) {
 	if !human {
 		push_decimal(out, bytes);
 		return;
 	}
-	let units: [(&str, u64); 3] = [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)];
+	let units: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("kB", 1 << 10)];
 	for &(unit, scale) in &units {
 		if bytes >= scale {
 			push_decimal(out, bytes / scale);

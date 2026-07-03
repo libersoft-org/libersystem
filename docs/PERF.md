@@ -13,8 +13,8 @@ pass at all.
 
 | scenario | after M74 | after M75 |
 | --- | --- | --- |
-| 64 MiB write | 1.72 s | 137 ms (and 19 reads - the source-verify reads belonged to the compression pass) |
-| 64 MiB sequential read | 204 ms | 67 ms |
+| 64 MB write | 1.72 s | 137 ms (and 19 reads - the source-verify reads belonged to the compression pass) |
+| 64 MB sequential read | 204 ms | 67 ms |
 | 2000 small files | 503 ms | 223 ms |
 | 2000 stats | 164 ms | 46 ms |
 
@@ -24,14 +24,14 @@ unoptimized debug profile; the crate now tests with opt-level 2).
 ## M74 - LiberFS allocator and free-map scaling (2026-07-02)
 
 Benchmark: `cd src/fs/liberfs && cargo test --release bench_scaling -- --ignored --nocapture`
-(a 1 GiB sparse RAM-backed volume; a 64 MiB incompressible file; 2000 small files
+(a 1 GB sparse RAM-backed volume; a 64 MB incompressible file; 2000 small files
 each committed individually). The device is RAM, so wall times understate the win
 on a real disk - the I/O counts (added with M74) are the durable metric.
 
 | scenario | M73 baseline | after M74 | I/O after M74 |
 | --- | --- | --- | --- |
-| 64 MiB write | 2.07 s | 1.72 s | 16 418 reads, 16 421 writes (~1+1 per data block) |
-| 64 MiB sequential read | 354 ms | 204 ms | 16 400 reads (~1.001 per data block) |
+| 64 MB write | 2.07 s | 1.72 s | 16 418 reads, 16 421 writes (~1+1 per data block) |
+| 64 MB sequential read | 354 ms | 204 ms | 16 400 reads (~1.001 per data block) |
 | 2000 small files (2000 commits) | 1.45 s | 0.50 s | ~12.6 reads, ~9.6 writes per commit |
 | 2000 stats | 179 ms | 164 ms | ~8 reads per stat |
 

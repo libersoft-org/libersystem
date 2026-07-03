@@ -192,7 +192,7 @@ const EXTENT_OFF: usize = OWNER_TAG_OFF + OWNER_TAG_LEN;
 // no overflow block at all. Beyond that, extents spill to a chain of extent blocks.
 const EXTENTS_INLINE: usize = (INODE_SIZE - EXTENT_OFF) / EXTENT_SIZE;
 // A checksum block holds one CRC32C (4 bytes) per stored block of its extent, so an
-// extent stores at most this many blocks (1024 = 4 MiB) and spans at most that many
+// extent stores at most this many blocks (1024 = 4 MB) and spans at most that many
 // logical blocks. A longer file is several extents.
 const CRCS_PER_BLOCK: usize = BLOCK_SIZE / 4;
 // An extent-overflow block: the shared chain header (CHAIN_*, below), then the extent
@@ -233,7 +233,7 @@ const ROOT_INODE: u32 = 0;
 // A full 255-byte name fills the whole name field with no terminator.
 const NAME_MAX: usize = 255;
 // A directory leaf record is variable-length: the name hash (u64), the child inode
-// (u32), a length byte, then the name's bytes - 13 bytes plus the name, so a 4 KiB
+// (u32), a length byte, then the name's bytes - 13 bytes plus the name, so a 4 kB
 // leaf holds a couple hundred typical entries instead of a fixed few. Records are
 // kept sorted by (hash, name) and the whole leaf is rewritten compactly on every
 // change (it is copied up by CoW anyway).

@@ -115,7 +115,7 @@ pub const SYS_DOMAIN_STATS_GET: u64 = 53;
 // public identity, not a capability - feeding the `lscpu` inventory command.
 pub const SYS_CPU_INFO: u64 = 54;
 // Read the physical-memory and kernel-heap totals into the caller's buffer (a
-// MemoryStats): total and free 4 KiB frames, and the heap's total and free bytes. A
+// MemoryStats): total and free 4 kB frames, and the heap's total and free bytes. A
 // free syscall feeding the `free` inventory command.
 pub const SYS_MEMORY_STATS: u64 = 55;
 // Read one retained boot memory-map region (a MemmapRegion) by index into the
@@ -276,7 +276,7 @@ pub struct DomainStats {
 }
 
 // The memory totals memory_stats writes into the caller's buffer: the physical frame
-// allocator's total and free 4 KiB frames (the total is fixed at boot from the usable
+// allocator's total and free 4 kB frames (the total is fixed at boot from the usable
 // memory-map regions), and the kernel heap's total and free bytes. repr(C) so the
 // kernel and userspace agree on the layout byte-for-byte.
 #[repr(C)]

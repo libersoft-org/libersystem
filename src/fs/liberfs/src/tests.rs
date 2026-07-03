@@ -647,7 +647,7 @@ fn large_contiguous_file_uses_few_extents() {
 	// whole thing collapses into a couple of extents instead of a pointer per block.
 	let nblocks: u64 = 4096;
 	let mut fs = LiberFs::format(SparseDevice::new(nblocks), nblocks).unwrap();
-	// 1501 blocks: past one extent's 1024-block (4 MiB) checksum cap, so it needs two.
+	// 1501 blocks: past one extent's 1024-block (4 MB) checksum cap, so it needs two.
 	let size = BLOCK_SIZE * 1500 + 321;
 	let big: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
 	fs.write_file(b"big", &big).unwrap();
@@ -1420,22 +1420,22 @@ fn bench_scaling() {
 		}
 	}
 
-	// a 1 GiB volume, sparse so only written blocks cost test memory.
+	// a 1 GB volume, sparse so only written blocks cost test memory.
 	let nblocks: u64 = 262_144;
 	let dev = CountingDevice { inner: SparseDevice::new(nblocks), reads: 0, writes: 0 };
 	let mut fs = LiberFs::format(dev, nblocks).unwrap();
 
-	// one 64 MiB incompressible file.
+	// one 64 MB incompressible file.
 	let big = noise(64 * 1024 * 1024);
 	let (r0, w0) = (fs.device().reads, fs.device().writes);
 	let t = Instant::now();
 	fs.write_file(b"big", &big).unwrap();
-	println!("bench: 64 MiB write: {:?} ({} reads, {} writes)", t.elapsed(), fs.device().reads - r0, fs.device().writes - w0);
+	println!("bench: 64 MB write: {:?} ({} reads, {} writes)", t.elapsed(), fs.device().reads - r0, fs.device().writes - w0);
 
 	let (r0, w0) = (fs.device().reads, fs.device().writes);
 	let t = Instant::now();
 	assert_eq!(fs.read_file(b"big").unwrap().len(), big.len());
-	println!("bench: 64 MiB read: {:?} ({} reads, {} writes)", t.elapsed(), fs.device().reads - r0, fs.device().writes - w0);
+	println!("bench: 64 MB read: {:?} ({} reads, {} writes)", t.elapsed(), fs.device().reads - r0, fs.device().writes - w0);
 
 	// two thousand small files: every write commits, so this measures how commit cost
 	// grows with the volume's live metadata.
