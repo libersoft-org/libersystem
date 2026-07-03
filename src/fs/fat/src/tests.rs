@@ -260,6 +260,14 @@ fn write_bpb(img: &mut [u8], bps: usize, spc: usize, reserved: usize, fat_size: 
 	if root_cluster != 0 {
 		img[36..40].copy_from_slice(&(fat_size as u32).to_le_bytes());
 		img[44..48].copy_from_slice(&(root_cluster as u32).to_le_bytes());
+		// an FSInfo sector at sector 1 (inside the reserved region), seeded with a
+		// known free count so the allocate/free upkeep is observable.
+		img[48..50].copy_from_slice(&1u16.to_le_bytes());
+		let fi = bps;
+		img[fi..fi + 4].copy_from_slice(&0x4161_5252u32.to_le_bytes());
+		img[fi + 484..fi + 488].copy_from_slice(&0x6141_7272u32.to_le_bytes());
+		img[fi + 488..fi + 492].copy_from_slice(&1000u32.to_le_bytes());
+		img[fi + 508..fi + 512].copy_from_slice(&0xAA55_0000u32.to_le_bytes());
 	} else {
 		img[22..24].copy_from_slice(&(fat_size as u16).to_le_bytes());
 	}
@@ -272,6 +280,13 @@ fn write_bpb(img: &mut [u8], bps: usize, spc: usize, reserved: usize, fat_size: 
 // file clusters. The bitmap and the 0x81 entry are written so the write path can find
 // free clusters; spc 1; FAT chains written so the reader follows them.
 fn build_exfat(files: &[File]) -> Vec<u8> {
+	build_exfat_nfc(files, &[])
+}
+
+// The NoFatChain-aware variant: `nfc_files` are laid out as Windows commonly writes
+// them - contiguous clusters, the stream entry's NoFatChain flag set, and NOTHING
+// written into the FAT for them (the bitmap alone records the allocation).
+fn build_exfat_nfc(files: &[File], nfc_files: &[File]) -> Vec<u8> {
 	let bps = 512;
 	let reserved = 24;
 	let clusters = 64;
@@ -295,7 +310,19 @@ fn build_exfat(files: &[File]) -> Vec<u8> {
 		bm[0] |= 1 << (cluster - 2);
 		let off = (heap + cluster - 2) * bps;
 		img[off..off + f.data.len()].copy_from_slice(f.data);
-		push_exfat_entry(&mut root, f.path, f.data.len() as u64, cluster as u32);
+		push_exfat_entry(&mut root, f.path, f.data.len() as u64, cluster as u32, false);
+	}
+	for f in nfc_files {
+		let cluster = next;
+		let span = f.data.len().div_ceil(bps).max(1);
+		next += span;
+		for i in 0..span {
+			let idx = cluster + i - 2;
+			bm[idx / 8] |= 1 << (idx % 8);
+		}
+		let off = (heap + cluster - 2) * bps;
+		img[off..off + f.data.len()].copy_from_slice(f.data);
+		push_exfat_entry(&mut root, f.path, f.data.len() as u64, cluster as u32, true);
 	}
 	let bm_off = heap * bps;
 	img[bm_off..bm_off + bm.len()].copy_from_slice(&bm);
@@ -325,7 +352,7 @@ fn push_exfat_bitmap(dir: &mut Vec<u8>, cluster: u32, size: u64) {
 	dir.extend_from_slice(&e);
 }
 
-fn push_exfat_entry(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32) {
+fn push_exfat_entry(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32, nfc: bool) {
 	let units: Vec<u16> = name.encode_utf16().collect();
 	let name_frags = units.len().div_ceil(15);
 	let mut file = [0u8; 32];
@@ -333,6 +360,7 @@ fn push_exfat_entry(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32) {
 	file[1] = (1 + name_frags) as u8;
 	let mut stream = [0u8; 32];
 	stream[0] = 0xC0;
+	stream[1] = if nfc { 0x03 } else { 0x01 };
 	stream[3] = units.len() as u8;
 	stream[20..24].copy_from_slice(&cluster.to_le_bytes());
 	stream[24..32].copy_from_slice(&size.to_le_bytes());
@@ -507,4 +535,216 @@ fn overwrites_and_removes_an_exfat_file() {
 	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"shorter");
 	fs.remove(b"HELLO.TXT").unwrap();
 	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::NotFound));
+}
+
+// Count the allocated FAT entries, for leak assertions across write/remove cycles.
+fn allocated_clusters(fs: &mut FatFs<MemDisk>) -> usize {
+	let max = fs.max_cluster();
+	(2..=max).filter(|&c| fs.next_cluster(c).unwrap() != 0).count()
+}
+
+#[test]
+fn overwriting_and_removing_a_long_name_file_leaks_nothing() {
+	// An LFN-named file must unlink by its LONG name: an overwrite may not leave a
+	// duplicate entry, a remove must find it, and neither may leak clusters.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	let before = allocated_clusters(&mut fs);
+	fs.write_file(b"my document.txt", b"first version").unwrap();
+	fs.write_file(b"my document.txt", b"the second version").unwrap();
+	let hits: Vec<String> = fs.list().unwrap().iter().filter(|e| e.name == "my document.txt").map(|e| e.name.clone()).collect();
+	assert_eq!(hits.len(), 1, "an overwrite must not duplicate the entry");
+	assert_eq!(fs.read_file(b"my document.txt").unwrap(), b"the second version");
+	fs.remove(b"my document.txt").unwrap();
+	assert_eq!(fs.read_file(b"my document.txt"), Err(FsError::NotFound));
+	assert_eq!(allocated_clusters(&mut fs), before, "the cycle must free every cluster it allocated");
+}
+
+#[test]
+fn reads_and_frees_a_nofatchain_exfat_file() {
+	// The contiguous NoFatChain form Windows commonly writes: multi-cluster data with
+	// NOTHING in the FAT. It must read back whole (not truncated at the first cluster)
+	// and a remove must clear its bitmap bits.
+	let data: Vec<u8> = (0..1500u32).map(|i| (i * 7) as u8).collect();
+	let leaked: &'static [u8] = Box::leak(data.clone().into_boxed_slice());
+	let img = build_exfat_nfc(&[], &[File { path: "movie.mkv", data: leaked }]);
+	let heap = 25usize; // 24 reserved + 1 FAT sector
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"movie.mkv").unwrap(), data);
+	fs.remove(b"movie.mkv").unwrap();
+	assert_eq!(fs.read_file(b"movie.mkv"), Err(FsError::NotFound));
+	// clusters 4, 5, 6 (bitmap bits 2..=4) freed; the bitmap + root (bits 0, 1) stay.
+	assert_eq!(fs.dev.data[heap * 512], 0b11, "the NoFatChain run's bitmap bits must be cleared");
+}
+
+#[test]
+fn a_failed_overwrite_leaves_the_old_file_intact() {
+	// The new chain is allocated and written BEFORE the directory entry swaps and the
+	// old chain is freed - so an overwrite that cannot allocate must leave the old
+	// content readable and leak nothing.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat_sized(Kind::Fat12, ROOT, 1000) }).unwrap();
+	fs.write_file(b"KEEP.TXT", b"the original bytes").unwrap();
+	let before = allocated_clusters(&mut fs);
+	let huge = vec![0xA5u8; 1200 * 512];
+	assert_eq!(fs.write_file(b"KEEP.TXT", &huge), Err(FsError::NoSpace));
+	assert_eq!(fs.read_file(b"KEEP.TXT").unwrap(), b"the original bytes");
+	assert_eq!(allocated_clusters(&mut fs), before, "a failed overwrite must not leak clusters");
+}
+
+#[test]
+fn a_malformed_boot_sector_is_refused_not_panicked() {
+	// Forged boot sectors off hostile media: insane exFAT shift exponents, BPB region
+	// arithmetic past the sector count, and a missing boot signature - each must
+	// refuse the mount, never panic, wrap, or accept a garbage geometry.
+	let mut exfat_shift = vec![0u8; 512];
+	exfat_shift[3..11].copy_from_slice(b"EXFAT   ");
+	exfat_shift[108] = 255;
+	exfat_shift[109] = 0;
+	exfat_shift[110] = 1;
+	assert!(FatFs::mount(MemDisk { data: exfat_shift.clone() }).is_none());
+	exfat_shift[108] = 9;
+	exfat_shift[109] = 200;
+	assert!(FatFs::mount(MemDisk { data: exfat_shift }).is_none());
+	// a BPB whose reserved + FAT regions exceed the total sector count (u32 overflow
+	// bait in num_fats * fat_size and underflow bait in total - first_data).
+	let mut bpb = vec![0u8; 512];
+	bpb[11..13].copy_from_slice(&512u16.to_le_bytes());
+	bpb[13] = 1;
+	bpb[14..16].copy_from_slice(&1u16.to_le_bytes());
+	bpb[16] = 255;
+	bpb[17..19].copy_from_slice(&512u16.to_le_bytes());
+	bpb[19..21].copy_from_slice(&64u16.to_le_bytes());
+	bpb[22..24].copy_from_slice(&0xFFFFu16.to_le_bytes());
+	bpb[510] = 0x55;
+	bpb[511] = 0xAA;
+	assert!(FatFs::mount(MemDisk { data: bpb }).is_none());
+	// plausible numbers but no 0x55AA boot signature: not a FAT volume.
+	let mut unsigned = build_fat(Kind::Fat16, ROOT);
+	unsigned[510] = 0;
+	unsigned[511] = 0;
+	assert!(FatFs::mount(MemDisk { data: unsigned }).is_none());
+}
+
+#[test]
+fn a_corrupt_chain_cannot_hang_or_overwrite_the_media_descriptor() {
+	// last_cluster is the append/grow walk: a cyclic chain must error out (not hang),
+	// and a chain hitting a FREE entry must refuse (not walk to cluster 0, whose FAT
+	// slot is the media descriptor the old code would then overwrite).
+	let mut img = build_fat(Kind::Fat16, ROOT);
+	let fat_off = 512; // reserved = 1 sector
+	img[fat_off + 40 * 2..fat_off + 40 * 2 + 2].copy_from_slice(&41u16.to_le_bytes());
+	img[fat_off + 41 * 2..fat_off + 41 * 2 + 2].copy_from_slice(&40u16.to_le_bytes());
+	img[fat_off + 50 * 2..fat_off + 50 * 2 + 2].copy_from_slice(&0u16.to_le_bytes());
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert_eq!(fs.last_cluster(40), Err(FsError::Invalid));
+	assert_eq!(fs.last_cluster(50), Err(FsError::Invalid));
+}
+
+#[test]
+fn a_long_name_grows_a_full_directory_without_panicking() {
+	// A 255-byte name is a 21-record entry set (672 bytes) - larger than one 512-byte
+	// cluster, the exact shape whose one-cluster grow used to slice out of bounds.
+	// The directory must grow by as many clusters as the set needs.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	let mut long = vec![b'n'; 251];
+	long.extend_from_slice(b".txt");
+	let mut path = b"DOCS/".to_vec();
+	path.extend_from_slice(&long);
+	fs.write_file(&path, b"grown into place").unwrap();
+	assert_eq!(fs.read_file(&path).unwrap(), b"grown into place");
+	let listed = fs.list_dir(b"DOCS").unwrap();
+	assert!(listed.iter().any(|e| e.name.as_bytes() == long.as_slice()));
+}
+
+#[test]
+fn reads_a_chain_longer_than_the_old_guard() {
+	// FAT12 holds 341 entries per 512-byte FAT sector; the old loop guard assumed 128
+	// and falsely refused a legitimate long chain. A 500-cluster file must read whole.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat_sized(Kind::Fat12, ROOT, 1000) }).unwrap();
+	let big: Vec<u8> = (0..500 * 512u32).map(|i| (i * 13) as u8).collect();
+	fs.write_file(b"BIG.BIN", &big).unwrap();
+	assert_eq!(fs.read_file(b"BIG.BIN").unwrap(), big);
+}
+
+#[test]
+fn allocation_never_leaves_the_data_region() {
+	// The FAT's byte size has slack entries past the real cluster count; allocating
+	// from the slack would write outside the volume (an Io error on an exactly-sized
+	// device). Filling the volume must end in a clean NoSpace instead.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	let chunk = vec![0x5Au8; 500 * 512];
+	let mut wrote = 0usize;
+	let err = loop {
+		let name = alloc::format!("FILL{}.BIN", wrote);
+		match fs.write_file(name.as_bytes(), &chunk) {
+			Ok(()) => wrote += 1,
+			Err(e) => break e,
+		}
+	};
+	assert_eq!(err, FsError::NoSpace, "exhaustion must be NoSpace, never an out-of-volume Io");
+	assert!(wrote >= 9, "the volume should have fit ~9 such files, fit {wrote}");
+	let name = alloc::format!("FILL{}.BIN", wrote - 1);
+	assert_eq!(fs.read_file(name.as_bytes()).unwrap(), chunk);
+}
+
+#[test]
+fn generated_short_names_are_unique_and_legal() {
+	// Two long names with a common prefix must get DISTINCT numeric-tailed 8.3 forms,
+	// and 8.3-illegal bytes (and a leading dot) must never reach the short field.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	fs.write_file(b"longfilename one.txt", b"one").unwrap();
+	fs.write_file(b"longfilename two.txt", b"two").unwrap();
+	fs.write_file(b".gitignore", b"dots").unwrap();
+	fs.write_file(b"we;ird[name].txt", b"weird").unwrap();
+	assert_eq!(fs.read_file(b"longfilename one.txt").unwrap(), b"one");
+	assert_eq!(fs.read_file(b"longfilename two.txt").unwrap(), b"two");
+	assert_eq!(fs.read_file(b".gitignore").unwrap(), b"dots");
+	assert_eq!(fs.read_file(b"we;ird[name].txt").unwrap(), b"weird");
+	let bytes = fs.read_dir_bytes(&Dir::at(0)).unwrap();
+	let shorts = existing_shorts(&bytes);
+	let mut seen: Vec<[u8; 11]> = Vec::new();
+	for s in &shorts {
+		assert!(!seen.contains(s), "duplicate short entry {:?}", s);
+		seen.push(*s);
+		assert!(s[0] != 0x20, "a short name must not start with a space: {:?}", s);
+		for &b in s.iter() {
+			assert!(b == 0x20 || short_char(b).0 == b, "illegal byte {b:#x} in short entry {:?}", s);
+		}
+	}
+	let tailed = shorts.iter().filter(|s| s.contains(&b'~')).count();
+	assert!(tailed >= 4, "the lossy names must carry numeric tails, found {tailed}");
+}
+
+#[test]
+fn fat32_reserved_bits_survive_a_fat_write() {
+	// The top nibble of a FAT32 entry is reserved: a write must read-modify-write it
+	// through unchanged, per the specification.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat32, ROOT) }).unwrap();
+	let fat_off = 32 * 512; // reserved = 32 sectors
+	fs.dev.data[fat_off + 40 * 4..fat_off + 40 * 4 + 4].copy_from_slice(&0xF000_0000u32.to_le_bytes());
+	fs.set_fat_entry(40, 3).unwrap();
+	let raw = u32::from_le_bytes(fs.dev.data[fat_off + 40 * 4..fat_off + 40 * 4 + 4].try_into().unwrap());
+	assert_eq!(raw, 0xF000_0003, "the reserved top nibble must be preserved");
+}
+
+#[test]
+fn fsinfo_free_count_tracks_allocate_and_free() {
+	// FAT32's FSInfo free-cluster count must follow allocation and freeing, so other
+	// systems reading media we wrote see a truthful number.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat32, ROOT) }).unwrap();
+	let free_at = 512 + 488; // FSInfo sector 1, seeded with 1000 by the builder
+	fs.write_file(b"THREE.BIN", &[0x77u8; 3 * 512]).unwrap();
+	let after_alloc = u32::from_le_bytes(fs.dev.data[free_at..free_at + 4].try_into().unwrap());
+	assert_eq!(after_alloc, 997);
+	fs.remove(b"THREE.BIN").unwrap();
+	let after_free = u32::from_le_bytes(fs.dev.data[free_at..free_at + 4].try_into().unwrap());
+	assert_eq!(after_free, 1000);
+}
+
+#[test]
+fn dot_dot_resolves_to_the_root_on_fat32() {
+	// A `..` entry pointing at the root carries first cluster 0; on FAT32 that means
+	// the root cluster, not the FAT12/16 fixed region (which does not exist there).
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat32, ROOT) }).unwrap();
+	let up = names(&fs.list_dir(b"DOCS/..").unwrap());
+	assert_eq!(up, ["DOCS", "HELLO.TXT", "readme.md"]);
 }
