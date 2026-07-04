@@ -873,7 +873,7 @@ fn an_entry_never_lands_past_the_terminator() {
 	// where the parser (which stops there) never looks: a silently lost file.
 	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
 	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
-	// ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
+						  // ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
 	fs.dev.data[root_off + 5 * 32] = b'X';
 	fs.write_file(b"a long note.txt", b"visible").unwrap();
 	assert_eq!(fs.read_file(b"a long note.txt").unwrap(), b"visible");
@@ -1425,4 +1425,73 @@ fn a_non_ascii_name_resolves_by_its_exact_bytes() {
 	fs.write_file(name, b"accented").unwrap();
 	assert_eq!(fs.read_file(name).unwrap(), b"accented");
 	assert!(fs.list().unwrap().iter().any(|e| e.name.as_bytes() == name));
+}
+
+// Set the ValidDataLength of the exFAT entry set at `set_at` and restamp its checksum.
+fn restamp_vdl(img: &mut [u8], set_at: usize, vdl: u64) {
+	img[set_at + 32 + 8..set_at + 32 + 16].copy_from_slice(&vdl.to_le_bytes());
+	let count = img[set_at + 1] as usize + 1;
+	let sum = exfat_set_checksum(&img[set_at..set_at + count * 32]);
+	img[set_at + 2..set_at + 4].copy_from_slice(&sum.to_le_bytes());
+}
+
+#[test]
+fn a_preallocated_exfat_tail_reads_as_zeros() {
+	// The VDL..DataLength range is undefined on disk and the media's home systems
+	// serve it as zeros: a preallocated tail (SetEndOfFile, download managers) must
+	// never leak stale cluster content - it can hold someone else's deleted data.
+	let data: Vec<u8> = (0..1500u32).map(|i| (i * 3) as u8).collect();
+	let leaked: &'static [u8] = Box::leak(data.clone().into_boxed_slice());
+	let img = build_exfat_nfc(&[File { path: "HELLO.TXT", data: b"Hello, FAT!" }], &[File { path: "movie.mkv", data: leaked }]);
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	// HELLO.TXT's chained set follows the bitmap entry; movie.mkv's NoFatChain set
+	// follows it. Cut each VDL below the DataLength and restamp the checksums.
+	let root_off = (25 + 1) * 512;
+	restamp_vdl(&mut fs.dev.data, root_off + 32, 5);
+	restamp_vdl(&mut fs.dev.data, root_off + 32 + 96, 700);
+	let hello = fs.read_file(b"HELLO.TXT").unwrap();
+	assert_eq!(hello.len(), 11);
+	assert_eq!(&hello[..5], b"Hello");
+	assert!(hello[5..].iter().all(|&b| b == 0), "the chained tail must read as zeros: {hello:?}");
+	let movie = fs.read_file(b"movie.mkv").unwrap();
+	assert_eq!(movie.len(), 1500);
+	assert_eq!(&movie[..700], &data[..700]);
+	assert!(movie[700..].iter().all(|&b| b == 0), "the NoFatChain tail must read as zeros");
+}
+
+#[test]
+fn a_chained_exfat_directory_reads_by_its_recorded_length() {
+	// Windows reads a chained directory by its recorded DataLength; a chain longer
+	// than the record (inconsistent foreign media) must not surface extra entries.
+	let mut fs = FatFs::mount(MemDisk { data: build_exfat_tree(&[], &[], &["SUB"]) }).unwrap();
+	fs.write_file(b"SUB/real.txt", b"real").unwrap();
+	// forge: link one more cluster onto SUB's chain and plant a checksum-valid entry
+	// set in it, leaving the recorded DataLength at one cluster.
+	let heap = 25usize;
+	let sub = 4u32; // the builder's first directory cluster
+	let ghost = 30u32;
+	let mut set: Vec<u8> = Vec::new();
+	push_exfat_entry(&mut set, "GHOST.TXT", 0, 0, false);
+	let at = (heap + ghost as usize - 2) * 512;
+	fs.dev.data[at..at + set.len()].copy_from_slice(&set);
+	let fat = 24 * 512;
+	fs.dev.data[fat + sub as usize * 4..fat + sub as usize * 4 + 4].copy_from_slice(&ghost.to_le_bytes());
+	fs.dev.data[fat + ghost as usize * 4..fat + ghost as usize * 4 + 4].copy_from_slice(&0x0FFF_FFF8u32.to_le_bytes());
+	let listed = names(&fs.list_dir(b"SUB").unwrap());
+	assert_eq!(listed, ["real.txt"], "the ghost entry past the record must not surface");
+}
+
+#[test]
+fn a_zero_length_read_reads_no_data_cluster() {
+	// An empty file whose entry carries a nonzero first cluster (foreign media) used
+	// to read one whole cluster and discard it - the read must cost only the
+	// directory scan.
+	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
+	let mut fs = FatFs::mount(CountingDisk { inner, reads: 0 }).unwrap();
+	// HELLO.TXT is the first root entry: claim size 0, keep its first cluster.
+	let root_off = 21 * 512;
+	fs.dev.inner.data[root_off + 28..root_off + 32].copy_from_slice(&0u32.to_le_bytes());
+	fs.dev.reads = 0;
+	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"");
+	assert_eq!(fs.dev.reads, 32, "only the 32-sector root region may be read");
 }

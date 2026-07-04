@@ -1535,7 +1535,7 @@ and two nits at the edges - the audit track's remainders.
   - Result: `random_corruption_never_panics_or_hangs` - green on the first run (the M80-M85 bounds hold against randomness, not just against the reviewer's imagination), and from now on any regression in any bound fails the host suite. Two closing cosmetics landed alongside: resolve through a file answers NotDir (M76 classification), and the format-time label truncation backs off a split UTF-8 character.
 - Concept: M83-B2 (the UTF-8 rule this completes: valid encoding AND stable identity), the M78 spec's NUL-padding rule (which makes an embedded NUL an early terminator), and the track's bounding rule applied to fsck's own arithmetic. The fuzz guard is the track's closing move: reviews found the bugs, the test keeps them found.
 
-## FAT audit track (M86-M93)
+## FAT audit track (M86-M94)
 
 A full read of the fat crate (2026-07-03, lib.rs ~1030 lines + tests), the same
 treatment the LiberFS audit track gave the native filesystem. The read paths and
@@ -1739,6 +1739,27 @@ it), the directory write amplification, and mount strictness leftovers.
 - Done when: a forged-size volume refuses at mount instead of aborting the first write (test-pinned with a huge-FAT BPB on a small device), a one-entry mutation writes only the directory clusters it touched (test-pinned with a write-logging device), the spc and cluster-count gates refuse the out-of-spec layouts, the case rule is recorded or extended, and the suite stays green with a test per finding.
   - Result: all hold - fat 57 host tests (3 new, 1 extended, 1 retargeted), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: the hostile-media rule of M87/M90-B4 (the last unbounded value bounded - here the bound is the physical medium itself), M91-B4 (whose one-image scan introduced the allocation B1 caps), M92-B3 (the touch-only-what-you-must rule B2 extends from FAT slots to directories).
+
+## M94 - FAT: seventh-pass findings (the ValidDataLength read rule)
+
+The seventh full source pass (2026-07-04, after M93 landed, lib.rs ~1810 lines)
+re-verified the M93 machinery holds under scrutiny - the dirty-range diff
+bounds, its scrub interaction, the mount probe arithmetic - and the rest of
+M86-M93. One real read-side interop rule remains unimplemented, plus three
+cosmetic edges; the delete+create torn window inside one directory write is
+inherent to unjournaled FAT (reference drivers share it) and stays by design.
+
+- [x] (B1, medium-low) Reads ignore the exFAT ValidDataLength (stream extension bytes 8..16) and serve the full DataLength off the disk - but the VDL..DataLength range is UNDEFINED on disk by specification, and Windows serves it as zeros. A file Windows legitimately wrote with VDL < DataLength (SetEndOfFile preallocation, download managers) reads back with a tail of stale cluster content instead of zeros: wrong bytes for the application, and a stale-data disclosure - the tail can hold content of files deleted by another owner of the medium. Our own writes set VDL = DataLength, so only foreign media are affected. Fix: `Raw` carries `valid_len`; `read_file` (both the chained and the NoFatChain path) reads `min(VDL, size)` bytes and zero-fills up to `size`; directories are unaffected (the spec requires VDL = DataLength there).
+  - Result: `Raw.valid_len` (classic entries: equals size), `read_file` reads `min(VDL, size)` off the disk on both paths and zero-fills to size - with the tail bounded by the cluster heap's capacity, so a forged DataLength cannot inflate the read (the forged-NoFatChain test still refuses through this gate). Test `a_preallocated_exfat_tail_reads_as_zeros` (a chained and a NoFatChain file with cut VDLs and restamped checksums: real prefix, zeroed tail, full length).
+- [x] (B2, cosmetic) A chained (non-NoFatChain) exFAT directory is read by its whole FAT chain, ignoring its recorded DataLength - Windows reads by DataLength. When the two disagree on foreign media (a chain longer than the record), we see entries Windows does not. Our own grow keeps both in step. Fix: carry the recorded length for chained directories too and bound the read by the lesser of the two.
+  - Result: `Dir.rec_len` (set for chained exFAT subdirectories at resolve; None for the root and classic directories) bounds the directory read to the record rounded up to whole clusters - the chain end bounds it from the other side. Test `a_chained_exfat_directory_reads_by_its_recorded_length` (a ghost entry set planted in a forged chain extension past the record never surfaces).
+- [x] (B3, cosmetic) The exFAT PercentInUse field (boot sector byte 112) is never maintained, so the formatter's value goes stale after our writes. The spec allows 0xFF "unknown", but rewriting the boot sector means restamping the boot-region checksum (sector 11) - a boot-sector write per update is wear and a risk window. Record the trade-off in the module doc instead, or set 0xFF once with the checksum restamp.
+  - Result: recorded in the module doc (the boot region is never rewritten; keeping the advisory percent current would cost a boot-sector write plus a checksum restamp per operation).
+- [x] (B4, cosmetic) `read_chain` with `limit == 0` (an empty file whose entry carries a nonzero first cluster, on foreign media) reads one whole cluster and then discards it - `read_contiguous` has the early return, the chain arm does not. Add the same early return.
+  - Result: added. Test `a_zero_length_read_reads_no_data_cluster` (a size-0 entry pointing at a cluster costs exactly the directory scan's reads).
+- Done when: a foreign exFAT file with VDL < DataLength reads back with a zeroed tail on both the chained and the NoFatChain path (test-pinned with stale bytes planted past VDL), a chained directory read respects its recorded length, the PercentInUse trade-off is recorded or fixed, the zero-limit read costs no I/O, and the suite stays green with a test per finding.
+  - Result: all hold - fat 60 host tests (3 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
+- Concept: the interop purpose of the crate (what Windows serves - zeros past VDL - we must serve; M91-B1/M92-B1 continued on the read side), the hostile-media rule (the tail bytes are someone else's deleted data - serving them is a disclosure), M93-B2 (the touch-only-what-you-must rule, here for reads).
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace

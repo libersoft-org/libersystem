@@ -17,6 +17,9 @@
 //! frees the old chain last, so a failure part-way never costs the old file. The media
 //! is untrusted: every value off the boot sector and the chains is bounded before use,
 //! so a malformed volume is refused or errors cleanly instead of panicking or hanging.
+//! The exFAT boot region is never rewritten: its advisory PercentInUse stays as the
+//! formatter left it - keeping it current would cost a boot-sector write plus a
+//! boot-checksum restamp on every operation, for a value readers must treat as a hint.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -82,6 +85,10 @@ enum Kind {
 struct Dir {
 	cluster: u32,
 	nfc_len: Option<u64>,
+	// the DataLength recorded for a CHAINED exFAT directory (None = the root or a
+	// classic directory, which record none) - the read is bounded by the lesser of the
+	// record and the chain, the way the media's home systems read it.
+	rec_len: Option<u64>,
 	// where this directory's own entry set lives (None = the root, which has no
 	// record) - the exFAT grow path must update the DataLength recorded there.
 	parent: Option<Parent>,
@@ -100,7 +107,7 @@ struct Parent {
 
 impl Dir {
 	fn at(cluster: u32) -> Dir {
-		Dir { cluster, nfc_len: None, parent: None }
+		Dir { cluster, nfc_len: None, rec_len: None, parent: None }
 	}
 }
 
@@ -203,12 +210,27 @@ impl<D: BlockDevice> FatFs<D> {
 		if entry.is_dir {
 			return Err(FsError::NotFound);
 		}
-		if entry.no_fat_chain {
+		// the bytes past the ValidDataLength are undefined on disk and the media's home
+		// systems serve them as zeros - a preallocated tail must never leak stale
+		// cluster content (classic entries carry no VDL: theirs equals the size).
+		let disk = entry.size.min(entry.valid_len) as usize;
+		let mut out = if entry.no_fat_chain {
 			// an exFAT NoFatChain file occupies contiguous clusters and its FAT entries
 			// were never written - read it by length, not by following the FAT.
-			return self.read_contiguous(entry.first_cluster, entry.size as usize);
+			self.read_contiguous(entry.first_cluster, disk)?
+		} else {
+			self.read_chain(entry.first_cluster, disk)?
+		};
+		if out.len() == disk && (disk as u64) < entry.size {
+			// the zero tail is bounded by the volume itself, so a forged DataLength
+			// cannot inflate the read past what the cluster heap could hold.
+			let cluster_bytes = self.geo.sectors_per_cluster as u64 * self.geo.bytes_per_sector as u64;
+			if entry.size > self.geo.cluster_count as u64 * cluster_bytes {
+				return Err(FsError::Invalid);
+			}
+			out.resize(entry.size as usize, 0);
 		}
-		self.read_chain(entry.first_cluster, entry.size as usize)
+		Ok(out)
 	}
 
 	// Create or overwrite a file named by a `/`-separated path with `data`, allocating a
@@ -307,8 +329,9 @@ impl<D: BlockDevice> FatFs<D> {
 			}
 			let cluster = if e.first_cluster == 0 { self.root_cluster() } else { e.first_cluster };
 			let nfc_len = if e.no_fat_chain && e.first_cluster != 0 { Some(e.size) } else { None };
+			let rec_len = if self.geo.kind == Kind::ExFat && nfc_len.is_none() && cluster != self.root_cluster() { Some(e.size) } else { None };
 			let parent = if cluster == self.root_cluster() { None } else { Some(Parent { cluster: dir.cluster, nfc_len: dir.nfc_len, set_off: e.set_off, ent_off: e.ent_off }) };
-			dir = Dir { cluster, nfc_len, parent };
+			dir = Dir { cluster, nfc_len, rec_len, parent };
 		}
 		Ok(dir)
 	}
@@ -350,6 +373,9 @@ impl<D: BlockDevice> FatFs<D> {
 	// guard is the volume's real cluster count - no legitimate chain can be longer -
 	// and a cluster VALUE outside the heap is corruption, never a sector address.
 	fn read_chain(&mut self, first: u32, limit: usize) -> Result<Vec<u8>, FsError> {
+		if limit == 0 {
+			return Ok(Vec::new());
+		}
 		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
 		let max = self.max_cluster();
 		let mut out: Vec<u8> = Vec::new();
@@ -473,7 +499,11 @@ impl<D: BlockDevice> FatFs<D> {
 		Ok(match self.geo.kind {
 			Kind::Fat12 => {
 				let v = u16::from_le_bytes([buf[within], buf[within + 1]]);
-				if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
+				if cluster & 1 == 1 {
+					(v >> 4) as u32
+				} else {
+					(v & 0x0FFF) as u32
+				}
 			}
 			Kind::Fat16 => u16::from_le_bytes([buf[within], buf[within + 1]]) as u32,
 			Kind::Fat32 | Kind::ExFat => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]) & 0x0FFF_FFFF,
@@ -686,6 +716,14 @@ impl<D: BlockDevice> FatFs<D> {
 			let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
 			let count = self.nfc_run(dir.cluster, len)? as usize;
 			return self.read_contiguous(dir.cluster, count * cluster_bytes);
+		}
+		if let Some(len) = dir.rec_len {
+			// a chained exFAT directory is read by its recorded DataLength (rounded up
+			// to whole clusters), the way the media's home systems read it - a chain
+			// longer than the record must not surface extra entries.
+			let cluster_bytes = self.geo.sectors_per_cluster as u64 * self.geo.bytes_per_sector as u64;
+			let cap = len.div_ceil(cluster_bytes).saturating_mul(cluster_bytes).min(usize::MAX as u64) as usize;
+			return self.read_chain(dir.cluster, cap);
 		}
 		self.read_chain(dir.cluster, usize::MAX)
 	}
@@ -950,7 +988,7 @@ impl<D: BlockDevice> FatFs<D> {
 	// inside the entry set at `p`, restamp the set checksum, and write the parent
 	// directory back - the bookkeeping half of growing an exFAT directory.
 	fn exfat_grow_parent_record(&mut self, p: &Parent, delta: u64) -> Result<(), FsError> {
-		let pdir = Dir { cluster: p.cluster, nfc_len: p.nfc_len, parent: None };
+		let pdir = Dir { cluster: p.cluster, nfc_len: p.nfc_len, rec_len: None, parent: None };
 		let mut bytes = self.read_dir_bytes(&pdir)?;
 		let orig = bytes.clone();
 		let end = p.ent_off + 32;
@@ -977,7 +1015,11 @@ impl<D: BlockDevice> FatFs<D> {
 	// common contiguous form, whose FAT entries were never written) frees its contiguous
 	// run from the bitmap alone; a chained file walks and clears the FAT too.
 	fn exfat_release(&mut self, old: &Raw) -> Result<(), FsError> {
-		if old.no_fat_chain { self.exfat_free_contiguous(old.first_cluster, old.size) } else { self.exfat_free(old.first_cluster) }
+		if old.no_fat_chain {
+			self.exfat_free_contiguous(old.first_cluster, old.size)
+		} else {
+			self.exfat_free(old.first_cluster)
+		}
 	}
 
 	// Locate the allocation bitmap (the 0x81 entry in the root): its first cluster and its
@@ -1113,7 +1155,11 @@ fn fat_entry_at(fat: &[u8], kind: Kind, cluster: u32) -> u32 {
 				return 1;
 			}
 			let v = u16::from_le_bytes([fat[off], fat[off + 1]]);
-			if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
+			if cluster & 1 == 1 {
+				(v >> 4) as u32
+			} else {
+				(v & 0x0FFF) as u32
+			}
 		}
 		Kind::Fat16 => {
 			if off + 2 > fat.len() {
@@ -1138,6 +1184,9 @@ struct Raw {
 	name: String,
 	short: String,
 	size: u64,
+	// the exFAT ValidDataLength: the prefix of `size` that is real on disk - the rest
+	// is undefined there and reads as zeros (classic entries carry no VDL: equals size).
+	valid_len: u64,
 	is_dir: bool,
 	first_cluster: u32,
 	no_fat_chain: bool,
@@ -1363,7 +1412,7 @@ fn parse_fat_dir(bytes: &[u8]) -> Result<Vec<Raw>, FsError> {
 		let is_dir = e[11] & 0x10 != 0;
 		let first_cluster = ((u16::from_le_bytes([e[20], e[21]]) as u32) << 16) | u16::from_le_bytes([e[26], e[27]]) as u32;
 		let size = u32::from_le_bytes([e[28], e[29], e[30], e[31]]) as u64;
-		out.push(Raw { name, short, size, is_dir, first_cluster, no_fat_chain: false, set_off, ent_off: off });
+		out.push(Raw { name, short, size, valid_len: size, is_dir, first_cluster, no_fat_chain: false, set_off, ent_off: off });
 	}
 	Ok(out)
 }
@@ -1406,6 +1455,7 @@ fn parse_exfat_dir(bytes: &[u8]) -> Result<Vec<Raw>, FsError> {
 		let is_dir = u16::from_le_bytes([e[4], e[5]]) & 0x10 != 0;
 		let mut name: Vec<u16> = Vec::new();
 		let mut size = 0u64;
+		let mut valid_len = 0u64;
 		let mut first_cluster = 0u32;
 		let mut name_len = 0usize;
 		let mut no_fat_chain = false;
@@ -1420,6 +1470,7 @@ fn parse_exfat_dir(bytes: &[u8]) -> Result<Vec<Raw>, FsError> {
 			if x[0] == 0xC0 {
 				no_fat_chain = x[1] & 0x02 != 0;
 				name_len = x[3] as usize;
+				valid_len = u64::from_le_bytes([x[8], x[9], x[10], x[11], x[12], x[13], x[14], x[15]]);
 				first_cluster = u32::from_le_bytes([x[20], x[21], x[22], x[23]]);
 				size = u64::from_le_bytes([x[24], x[25], x[26], x[27], x[28], x[29], x[30], x[31]]);
 			} else if x[0] == 0xC1 {
@@ -1435,7 +1486,7 @@ fn parse_exfat_dir(bytes: &[u8]) -> Result<Vec<Raw>, FsError> {
 			i += (secondary + 1) * 32;
 			continue;
 		}
-		out.push(Raw { name: decode_utf16(&name), short: String::new(), size, is_dir, first_cluster, no_fat_chain, set_off: i, ent_off: last });
+		out.push(Raw { name: decode_utf16(&name), short: String::new(), size, valid_len, is_dir, first_cluster, no_fat_chain, set_off: i, ent_off: last });
 		i += (secondary + 1) * 32;
 	}
 	Ok(out)
@@ -1614,7 +1665,11 @@ fn gen_short(name: &[u8], dir_bytes: &[u8]) -> Result<[u8; 11], FsError> {
 // (uppercasing alone is not lossy - the long name records the case).
 fn short_char(b: u8) -> (u8, bool) {
 	let illegal = b < 0x20 || b == 0x7F || b" \"*+,./:;<=>?[\\]|".contains(&b);
-	if illegal { (b'_', true) } else { (b.to_ascii_uppercase(), false) }
+	if illegal {
+		(b'_', true)
+	} else {
+		(b.to_ascii_uppercase(), false)
+	}
 }
 
 // Collect the 8.3 name fields of a directory's live entries, for uniqueness checks.
