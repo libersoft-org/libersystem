@@ -172,6 +172,9 @@ impl FatBacking {
 			self.fs = FatFs::mount(FatBlockDevice { chan: self.chan });
 		}
 		let fs: &mut FatFs<FatBlockDevice> = self.fs.as_mut().ok_or(Error::NotFound)?;
+		// stamp the wall clock so entries we write carry real timestamps (the same
+		// RTC source the LiberFS volume is stamped with).
+		fs.set_clock(unsafe { clock_rtc() });
 		match op(fs) {
 			Ok(r) => Ok(r),
 			Err(fat::FsError::Io) => {

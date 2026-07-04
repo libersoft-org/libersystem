@@ -287,6 +287,13 @@ fn build_exfat(files: &[File]) -> Vec<u8> {
 // them - contiguous clusters, the stream entry's NoFatChain flag set, and NOTHING
 // written into the FAT for them (the bitmap alone records the allocation).
 fn build_exfat_nfc(files: &[File], nfc_files: &[File]) -> Vec<u8> {
+	build_exfat_tree(files, nfc_files, &[])
+}
+
+// The subdirectory-aware variant: each named directory gets one FAT-chained empty
+// cluster (exFAT directories carry no dot entries) and a directory-attributed entry
+// set in the root, for the directory-grow tests.
+fn build_exfat_tree(files: &[File], nfc_files: &[File], dirs: &[&str]) -> Vec<u8> {
 	let bps = 512;
 	let reserved = 24;
 	let clusters = 64;
@@ -324,6 +331,14 @@ fn build_exfat_nfc(files: &[File], nfc_files: &[File]) -> Vec<u8> {
 		img[off..off + f.data.len()].copy_from_slice(f.data);
 		push_exfat_entry(&mut root, f.path, f.data.len() as u64, cluster as u32, true);
 	}
+	for d in dirs {
+		let cluster = next;
+		next += 1;
+		set_fat(&mut fat, 4, cluster, 0x0FFF_FFFF);
+		let idx = cluster - 2;
+		bm[idx / 8] |= 1 << (idx % 8);
+		push_exfat_entry_ex(&mut root, d, bps as u64, cluster as u32, false, true);
+	}
 	let bm_off = heap * bps;
 	img[bm_off..bm_off + bm.len()].copy_from_slice(&bm);
 	let root_off = (heap + 1) * bps;
@@ -353,15 +368,23 @@ fn push_exfat_bitmap(dir: &mut Vec<u8>, cluster: u32, size: u64) {
 }
 
 fn push_exfat_entry(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32, nfc: bool) {
+	push_exfat_entry_ex(dir, name, size, cluster, nfc, false);
+}
+
+fn push_exfat_entry_ex(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32, nfc: bool, is_dir: bool) {
 	let units: Vec<u16> = name.encode_utf16().collect();
 	let name_frags = units.len().div_ceil(15);
 	let mut file = [0u8; 32];
 	file[0] = 0x85;
 	file[1] = (1 + name_frags) as u8;
+	if is_dir {
+		file[4] = 0x10;
+	}
 	let mut stream = [0u8; 32];
 	stream[0] = 0xC0;
 	stream[1] = if nfc { 0x03 } else { 0x01 };
 	stream[3] = units.len() as u8;
+	stream[8..16].copy_from_slice(&size.to_le_bytes());
 	stream[20..24].copy_from_slice(&cluster.to_le_bytes());
 	stream[24..32].copy_from_slice(&size.to_le_bytes());
 	dir.extend_from_slice(&file);
@@ -538,7 +561,7 @@ fn overwrites_and_removes_an_exfat_file() {
 }
 
 // Count the allocated FAT entries, for leak assertions across write/remove cycles.
-fn allocated_clusters(fs: &mut FatFs<MemDisk>) -> usize {
+fn allocated_clusters<D: BlockDevice>(fs: &mut FatFs<D>) -> usize {
 	let max = fs.max_cluster();
 	(2..=max).filter(|&c| fs.next_cluster(c).unwrap() != 0).count()
 }
@@ -834,7 +857,7 @@ fn an_entry_never_lands_past_the_terminator() {
 	// where the parser (which stops there) never looks: a silently lost file.
 	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
 	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
-						  // ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
+	// ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
 	fs.dev.data[root_off + 5 * 32] = b'X';
 	fs.write_file(b"a long note.txt", b"visible").unwrap();
 	assert_eq!(fs.read_file(b"a long note.txt").unwrap(), b"visible");
@@ -852,4 +875,219 @@ fn dot_only_and_trailing_dot_or_space_names_are_refused() {
 	}
 	let mut ex = FatFs::mount(MemDisk { data: build_exfat(ROOT) }).unwrap();
 	assert_eq!(ex.write_file(b"..", b"x"), Err(FsError::Invalid));
+}
+
+// A device that fails exactly one write (the `until_fail`-th), then recovers - the
+// fault injection the mid-allocation unwind needs.
+struct FlakyDisk {
+	inner: MemDisk,
+	until_fail: usize,
+	failed: bool,
+}
+
+impl BlockDevice for FlakyDisk {
+	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		self.inner.read_sector(lba, buf)
+	}
+
+	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
+		if !self.failed {
+			if self.until_fail == 0 {
+				self.failed = true;
+				return false;
+			}
+			self.until_fail -= 1;
+		}
+		self.inner.write_sector(lba, buf)
+	}
+}
+
+#[test]
+fn a_corrupt_chain_never_escapes_the_volume() {
+	// Cluster values off the medium used to become sector and FAT offsets unchecked: a
+	// corrupt next pointing outside the heap made read_chain read foreign device bytes
+	// into a file, and free_chain WRITE a FAT slot whose offset lands in the volume's
+	// own data (or, on a device larger than the volume, beyond the volume entirely).
+	// The reads must refuse and the free must stop - no byte outside the FAT and the
+	// root region may change.
+	let mut img = build_fat(Kind::Fat16, ROOT);
+	let volume_end = img.len();
+	img.extend(core::iter::repeat_n(0xEEu8, 100 * 512)); // foreign bytes past the volume
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	fs.write_file(b"BIG.BIN", &[0x42u8; 700]).unwrap(); // clusters 6, 7
+	let fat_off = 512; // reserved = 1 sector
+	img_set_fat16(&mut fs.dev.data, fat_off, 6, 0xF000); // out of the heap, not an end marker
+	assert_eq!(fs.read_file(b"BIG.BIN"), Err(FsError::Invalid), "a foreign cluster must never be read");
+	let before = fs.dev.data.clone();
+	fs.remove(b"BIG.BIN").unwrap(); // best-effort free: stops at the corrupt link
+	assert_eq!(fs.read_file(b"BIG.BIN"), Err(FsError::NotFound));
+	// only the FAT and the fixed root region (sectors 1..53) may differ; the boot
+	// sector, the whole data region, and the bytes past the volume must be untouched.
+	let allowed = 512..53 * 512;
+	for (i, (a, b)) in before.iter().zip(&fs.dev.data).enumerate() {
+		if !allowed.contains(&i) {
+			assert_eq!(a, b, "byte {i:#x} changed outside the FAT and root region (volume ends at {volume_end:#x})");
+		}
+	}
+}
+
+// Set a FAT16 entry directly in an image, for corrupting chains under test.
+fn img_set_fat16(img: &mut [u8], fat_off: usize, cluster: usize, val: u16) {
+	img[fat_off + cluster * 2..fat_off + cluster * 2 + 2].copy_from_slice(&val.to_le_bytes());
+}
+
+#[test]
+fn a_full_exfat_root_directory_grows() {
+	// The exFAT root is a FAT chain like any directory: once its cluster fills with
+	// entry sets, a write must grow it by a cluster (the root has no parent record to
+	// update), not refuse with NoSpace.
+	let mut fs = FatFs::mount(MemDisk { data: build_exfat(&[]) }).unwrap();
+	for i in 0..8u32 {
+		let name = alloc::format!("F{i}.TXT");
+		let body = alloc::format!("body {i}");
+		fs.write_file(name.as_bytes(), body.as_bytes()).unwrap();
+	}
+	assert_eq!(fs.list().unwrap().len(), 8);
+	for i in 0..8u32 {
+		let name = alloc::format!("F{i}.TXT");
+		let body = alloc::format!("body {i}");
+		assert_eq!(fs.read_file(name.as_bytes()).unwrap(), body.as_bytes());
+	}
+}
+
+#[test]
+fn a_full_exfat_subdirectory_grows_and_updates_its_parent_record() {
+	// Growing an exFAT subdirectory must also grow the DataLength / ValidDataLength
+	// recorded in its entry set in the PARENT, and restamp the set checksum - or other
+	// systems see a directory shorter than its chain.
+	let heap = 25usize; // 24 reserved + 1 FAT sector
+	let mut fs = FatFs::mount(MemDisk { data: build_exfat_tree(&[], &[], &["SUB"]) }).unwrap();
+	for i in 0..6u32 {
+		let name = alloc::format!("SUB/F{i}.TXT");
+		fs.write_file(name.as_bytes(), b"in the subdir").unwrap();
+	}
+	assert_eq!(fs.list_dir(b"SUB").unwrap().len(), 6);
+	for i in 0..6u32 {
+		let name = alloc::format!("SUB/F{i}.TXT");
+		assert_eq!(fs.read_file(name.as_bytes()).unwrap(), b"in the subdir");
+	}
+	// SUB's entry set sits right after the bitmap entry in the root: 0x85 at 32, the
+	// 0xC0 stream at 64. Both recorded lengths must now be two clusters, and the set
+	// checksum must match a recomputation.
+	let root_off = (heap + 1) * 512;
+	let stream = root_off + 64;
+	let valid = u64::from_le_bytes(fs.dev.data[stream + 8..stream + 16].try_into().unwrap());
+	let data = u64::from_le_bytes(fs.dev.data[stream + 24..stream + 32].try_into().unwrap());
+	assert_eq!((valid, data), (1024, 1024), "the parent record must grow with the directory");
+	let stored = u16::from_le_bytes(fs.dev.data[root_off + 34..root_off + 36].try_into().unwrap());
+	assert_eq!(stored, exfat_set_checksum(&fs.dev.data[root_off + 32..root_off + 128]), "the set checksum must be restamped");
+}
+
+#[test]
+fn illegal_long_name_characters_are_refused() {
+	// The characters illegal in a long name on the media's home systems must never
+	// reach the LFN / 0xC1 fragments - a written file must stay openable there.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	for name in [b"bad*.txt".as_slice(), b"a:b.txt", b"q?.txt", b"lt<.txt", b"gt>.txt", b"pi|pe.txt", b"qu\"ote.txt", b"back\\slash.txt", b"ctrl\x01.txt"] {
+		assert_eq!(fs.write_file(name, b"x"), Err(FsError::Invalid), "{name:?} must be refused");
+	}
+	let mut ex = FatFs::mount(MemDisk { data: build_exfat(ROOT) }).unwrap();
+	assert_eq!(ex.write_file(b"bad*.txt", b"x"), Err(FsError::Invalid));
+}
+
+#[test]
+fn degenerate_boot_pointers_do_not_mount() {
+	// A boot sector whose pointers cannot form a volume mounts as an empty or
+	// piecemeal-failing volume today's checks miss - refuse each at mount.
+	let mut fat32_root0 = build_fat(Kind::Fat32, ROOT);
+	fat32_root0[44..48].copy_from_slice(&0u32.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: fat32_root0 }).is_none(), "a FAT32 root below the heap");
+	let mut fat32_root1 = build_fat(Kind::Fat32, ROOT);
+	fat32_root1[44..48].copy_from_slice(&1u32.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: fat32_root1 }).is_none());
+	let mut ex_fat0 = build_exfat(ROOT);
+	ex_fat0[84..88].copy_from_slice(&0u32.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: ex_fat0 }).is_none(), "an exFAT with no FAT");
+	let mut ex_off0 = build_exfat(ROOT);
+	ex_off0[80..84].copy_from_slice(&0u32.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: ex_off0 }).is_none(), "an exFAT FAT in the boot region");
+	let mut ex_root1 = build_exfat(ROOT);
+	ex_root1[96..100].copy_from_slice(&1u32.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: ex_root1 }).is_none(), "an exFAT root below the heap");
+	// and a logical sector size the specification does not allow (not a power of two).
+	let mut odd_bps = build_fat(Kind::Fat16, ROOT);
+	odd_bps[11..13].copy_from_slice(&3584u16.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: odd_bps }).is_none(), "a non-power-of-two sector size");
+}
+
+#[test]
+fn a_failed_link_write_unwinds_the_allocation() {
+	// An I/O failure while linking a fresh chain used to leave the already-written FAT
+	// slots behind - orphan clusters no directory entry names. The allocation must
+	// unwind them.
+	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
+	let mut fs = FatFs::mount(FlakyDisk { inner, until_fail: usize::MAX, failed: true }).unwrap();
+	let before = allocated_clusters(&mut fs);
+	// the first writes of a write_file are the chain links (2 sectors per entry): let
+	// the first entry land and fail the second, mid-loop.
+	fs.dev.failed = false;
+	fs.dev.until_fail = 2;
+	assert_eq!(fs.write_file(b"BIG.BIN", &[0x11u8; 1500]), Err(FsError::Io));
+	assert_eq!(allocated_clusters(&mut fs), before, "a failed allocation must leak nothing");
+	assert_eq!(fs.read_file(b"BIG.BIN"), Err(FsError::NotFound));
+}
+
+#[test]
+fn written_entries_carry_the_volume_clock() {
+	// Entries used to carry create/write time 0 - an invalid DOS date (day 0, month
+	// 0). With the clock set they must carry its DOS encoding, and without it the
+	// valid epoch date 1980-01-01.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	fs.write_file(b"EPOCH.TXT", b"unset clock").unwrap();
+	fs.set_clock(946_684_800); // 2000-01-01 00:00:00 UTC
+	fs.write_file(b"STAMP.TXT", b"set clock").unwrap();
+	let date_2000 = ((2000u16 - 1980) << 9) | (1 << 5) | 1;
+	assert_eq!(root_entry_dates(&fs.dev.data, b"EPOCH   TXT"), ((1 << 5) | 1, (1 << 5) | 1), "an unset clock must still yield 1980-01-01");
+	assert_eq!(root_entry_dates(&fs.dev.data, b"STAMP   TXT"), (date_2000, date_2000));
+	// the exFAT form: the 32-bit timestamp (date high, time low), marked UTC.
+	let mut ex = FatFs::mount(MemDisk { data: build_exfat(&[]) }).unwrap();
+	ex.set_clock(946_684_800);
+	ex.write_file(b"S.TXT", b"stamped").unwrap();
+	let heap = 25usize;
+	let root_off = (heap + 1) * 512;
+	let e = &ex.dev.data[root_off + 32..root_off + 64]; // the set after the bitmap entry
+	assert_eq!(e[0], 0x85);
+	let ts = (date_2000 as u32) << 16;
+	assert_eq!(u32::from_le_bytes(e[8..12].try_into().unwrap()), ts, "the exFAT create timestamp");
+	assert_eq!(u32::from_le_bytes(e[12..16].try_into().unwrap()), ts, "the exFAT modify timestamp");
+	assert_eq!(e[22] & 0x80, 0x80, "the timestamp must be marked UTC");
+}
+
+// The (create date, write date) of the fixed-root entry whose 8.3 field is `short`.
+fn root_entry_dates(img: &[u8], short: &[u8; 11]) -> (u16, u16) {
+	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
+	let mut i = root_off;
+	while img[i] != 0x00 {
+		if &img[i..i + 11] == short {
+			return (u16::from_le_bytes([img[i + 16], img[i + 17]]), u16::from_le_bytes([img[i + 24], img[i + 25]]));
+		}
+		i += 32;
+	}
+	panic!("entry {short:?} not found");
+}
+
+#[test]
+fn a_degenerate_exfat_entry_set_is_skipped() {
+	// A bare 0x85 with no secondaries (or a forged zero name length) is noise, never a
+	// real file - it must not surface as an empty-named entry in a listing.
+	let mut img = build_exfat(ROOT);
+	let heap = 25usize;
+	let root_off = (heap + 1) * 512;
+	// the root holds the bitmap entry plus three 3-record file sets = 10 slots; plant
+	// the bare 0x85 in the free slot after them.
+	img[root_off + 10 * 32] = 0x85;
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	let list = fs.list().unwrap();
+	assert!(list.iter().all(|e| !e.name.is_empty()), "an empty-named entry surfaced: {list:?}");
+	assert!(list.iter().any(|e| e.name == "HELLO.TXT"));
 }
