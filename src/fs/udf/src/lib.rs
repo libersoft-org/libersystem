@@ -106,7 +106,7 @@ impl<D: BlockDevice> Udf<D> {
 	// the layout cannot be followed.
 	pub fn mount(mut dev: D) -> Option<Udf<D>> {
 		let mut block = [0u8; SECTOR_SIZE];
-		if !dev.read_block(AVDP_LBA, &mut block) || le16(&block[0..2]) != TAG_AVDP || !tag_ok(&block) {
+		if !dev.read_block(AVDP_LBA, &mut block) || le16(&block[0..2]) != TAG_AVDP || !tag_ok(&block) || le32(&block[12..16]) != AVDP_LBA as u32 {
 			return None;
 		}
 		let vds_len = le32(&block[16..20]);
@@ -120,7 +120,9 @@ impl<D: BlockDevice> Udf<D> {
 			if !dev.read_block(vds_loc as u64 + i, &mut block) {
 				return None;
 			}
-			if !tag_ok(&block) {
+			// a descriptor must checksum AND record its own address - a stale or copied
+			// block is skipped, never trusted.
+			if !tag_ok(&block) || le32(&block[12..16]) as u64 != vds_loc as u64 + i {
 				continue;
 			}
 			match le16(&block[0..2]) {
@@ -301,6 +303,12 @@ impl<D: BlockDevice> Udf<D> {
 		let l_ea = le32(&block[l_ea_off..l_ea_off + 4]) as usize;
 		let l_ad = le32(&block[l_ad_off..l_ad_off + 4]) as usize;
 		let alloc = le16(&block[34..36]) & 0x07;
+		// a symlink File Entry (ICB file type 12) stores its target path as data - the
+		// volume API has no symlink semantics, so it refuses rather than serves path
+		// bytes as file content.
+		if block[27] == 12 {
+			return Err(FsError::Invalid);
+		}
 		let ad_off = header + l_ea;
 		if ad_off > block.len() {
 			return Err(FsError::Invalid);
@@ -309,6 +317,12 @@ impl<D: BlockDevice> Udf<D> {
 		if alloc == 3 {
 			let end = (ad_off + info_len).min(block.len());
 			return Ok(block[ad_off..end].to_vec());
+		}
+		// only short_ad, long_ad, and embedded forms exist on real media - extended_ad
+		// (20-byte records) and the reserved values are refused rather than misparsed
+		// with the wrong step.
+		if alloc != 0 && alloc != 1 {
+			return Err(FsError::Invalid);
 		}
 		// the information length is the medium's claim - it cannot exceed what the
 		// partition could hold, so a forged length never allocates without bound.
@@ -409,7 +423,10 @@ fn split_parent(path: &[u8]) -> Result<(&[u8], &[u8]), FsError> {
 	}
 }
 
-// Case-insensitive ASCII name compare (queries may differ in case from the stored name).
+// Case-insensitive ASCII name compare, consistent with the sibling backends behind the
+// volume API. UDF itself is case-sensitive-preserving - two names differing only in
+// case are legal siblings there - so the first match wins and a case-distinct sibling
+// is shadowed, by decision.
 fn eq_ci(a: &str, b: &[u8]) -> bool {
 	a.len() == b.len() && a.bytes().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }

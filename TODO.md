@@ -1888,6 +1888,20 @@ files only - plus mount-symmetry and integrity nits.
   - Result: all hold - udf 13 host tests (4 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: M99 (whose gates kept this bounded but not correct), the FAT track's lesson that test-image builders must exercise the layouts real formatters emit (extent-based files, not just embedded).
 
+## M101 - UDF: third-pass findings (the last unrefused forms)
+
+The third full source pass (2026-07-04, after M100 landed) re-verified the
+M99/M100 machinery holds and found only low/cosmetic leftovers: two record
+forms still misparsed or misserved instead of refused, one unrecorded matching
+decision, and one integrity-check asymmetry.
+
+- [ ] (B1, low) The allocation type `extended_ad` (2) is not distinguished - the descriptor scan keeps the short_ad step of 8 over 20-byte records and parses garbage extents (bounded by the M99 gates, but a misread where the refuse-not-misread rule demands Invalid). Refuse allocation forms other than short_ad, long_ad, and embedded.
+- [ ] (B2, cosmetic) UDF is case-sensitive-preserving - two names differing only in case are legal siblings - while the reader matches case-insensitively (consistent with the sibling backends): the first match shadows a case-distinct sibling. Record the decision at `eq_ci`.
+- [ ] (B3, cosmetic) The File Entry's ICB file type (byte 27: 4 = directory, 5 = file, 12 = symlink) is not interpreted - a symlink serves its target-path bytes as file content. Refuse type 12 as Invalid (the volume API has no symlink semantics).
+- [ ] (B4, cosmetic) The M100 tag-location check covers the File Set and File Entries but not the Anchor or the VDS descriptors - a stale or copied anchor/descriptor passes. Verify the location there too.
+- Done when: an extended_ad File Entry refuses instead of misparsing, a symlink File Entry refuses instead of serving path bytes, the case-matching decision is recorded, a misplaced anchor or partition descriptor is not trusted, and the suite stays green with a test per finding.
+- Concept: M96-B4/M97-B2 (the refuse-not-misread rule on the last two forms), M100-B4 (the tag-location rule completed), the uniform Volume API contract.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a

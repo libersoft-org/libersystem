@@ -325,3 +325,41 @@ fn an_unknown_compression_id_does_not_decode() {
 	let names: Vec<_> = fs.list_dir(b"SUB").unwrap().into_iter().map(|f| f.name).collect();
 	assert_eq!(names, ["WORLD.TXT"], "{names:?}");
 }
+
+#[test]
+fn an_extended_ad_form_is_refused_not_misparsed() {
+	// extended_ad records are 20 bytes - scanning them with the short_ad step parses
+	// garbage extents; the form is refused instead.
+	let mut img = build_udf();
+	w16(&mut img[262 * SECTOR_SIZE..], 34, 2);
+	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid));
+}
+
+#[test]
+fn a_symlink_file_entry_is_refused() {
+	// a symlink stores its target path as data - the volume API has no symlink
+	// semantics, so serving the path bytes as content would only mislead.
+	let mut img = build_udf();
+	img[262 * SECTOR_SIZE + 27] = 12;
+	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid));
+}
+
+#[test]
+fn a_misplaced_anchor_or_descriptor_is_not_trusted() {
+	// tags record their own block address - an anchor or a VDS descriptor carrying
+	// another address is stale or copied and must not be trusted.
+	let mut img = build_udf();
+	{
+		let b = &mut img[256 * SECTOR_SIZE..257 * SECTOR_SIZE];
+		tag(b, TAG_AVDP, 999);
+	}
+	assert!(Udf::mount(MemDisc { data: img }).is_none(), "a misplaced anchor");
+	let mut img2 = build_udf();
+	{
+		let b = &mut img2[257 * SECTOR_SIZE..258 * SECTOR_SIZE];
+		tag(b, TAG_PARTITION, 999);
+	}
+	assert!(Udf::mount(MemDisc { data: img2 }).is_none(), "a misplaced partition descriptor");
+}
