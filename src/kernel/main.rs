@@ -2931,6 +2931,7 @@ fn pty_hosts_a_program() {
 	}
 	boot_kernel.send(Message::new(b"GPU".to_vec(), alloc::vec::Vec::new(), 0)).expect("GPU bootstrap");
 	boot_kernel.send(Message::new(b"POINTER".to_vec(), alloc::vec::Vec::new(), 0)).expect("POINTER bootstrap");
+	boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("READY bootstrap");
 
 	// stand in for the shell's PTY_OPEN request: ask the console to host a `ptyecho` slave
 	// on a new pty.

@@ -459,6 +459,68 @@ pub unsafe fn channel() -> Option<(u64, u64)> {
 	}
 }
 
+// The bootstrap handshake terminator: a parent sends its named capabilities, then
+// READY; the child collects the whole set with recv_caps and takes each capability
+// by name - no ordering contract, no placeholder sends for capabilities a child
+// does not get.
+pub const BOOTSTRAP_READY: &[u8] = b"READY";
+
+// A received bootstrap capability set: every named capability the parent sent
+// before READY, taken by name. Whatever the receiver does not take is closed when
+// the set drops, so an unused grant never lingers as an open handle.
+pub struct CapSet {
+	entries: alloc::vec::Vec<(alloc::vec::Vec<u8>, u64)>,
+}
+
+impl CapSet {
+	// Take the named capability out of the set: its handle, or 0 when the parent did
+	// not send it (or sent it with no handle).
+	pub fn take(&mut self, name: &[u8]) -> u64 {
+		match self.entries.iter().position(|(n, _)| n == name) {
+			Some(i) => self.entries.swap_remove(i).1,
+			None => 0,
+		}
+	}
+}
+
+impl Drop for CapSet {
+	fn drop(&mut self) {
+		for &(_, handle) in self.entries.iter() {
+			if handle != 0 {
+				unsafe { close(handle) };
+			}
+		}
+	}
+}
+
+// Receive a parent's whole bootstrap capability set: named capability messages up
+// to the READY terminator (or the channel closing). The counterpart of send_ready.
+pub unsafe fn recv_caps(bootstrap: u64) -> CapSet {
+	unsafe {
+		let mut entries: alloc::vec::Vec<(alloc::vec::Vec<u8>, u64)> = alloc::vec::Vec::new();
+		let mut buf: [u8; 64] = [0u8; 64];
+		loop {
+			match recv_blocking(bootstrap, &mut buf) {
+				Received::Message { len, handle } => {
+					let name: &[u8] = &buf[..len];
+					if name == BOOTSTRAP_READY {
+						break;
+					}
+					entries.push((name.to_vec(), handle));
+				}
+				Received::Closed => break,
+			}
+		}
+		CapSet { entries }
+	}
+}
+
+// End a bootstrap capability handshake: the child's recv_caps returns once this
+// terminator arrives.
+pub unsafe fn send_ready(bootstrap: u64) -> bool {
+	unsafe { send_blocking(bootstrap, BOOTSTRAP_READY, 0) }
+}
+
 // Receive one message and, if its payload begins with `tag` and it carried a
 // transferred handle, return that handle. None if the channel closed, no handle
 // accompanied the message, or the payload did not begin with `tag`. This is the

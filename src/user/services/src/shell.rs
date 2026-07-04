@@ -29,76 +29,56 @@ const DEFAULT_CWD: &str = "vol://system";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	let mut buf: [u8; 256] = [0u8; 256];
-
-	// 1. receive the per-service client channels from ServiceManager, in the order it
-	//    sends them: storage (`cat`), log (`log`), device (`dev`), process (`ps`/`run`
-	//    and the launcher the shell runs foreground programs through), config
-	//    (`config`/`set`), network (`ip`/`ping`/...), time (`date`), audio (`beep`). Each
-	//    is a tagged capability over the bootstrap channel. The extended capabilities the
-	//    primary VT also gets (the media / iso / udf volumes, input, graph, perm, resource)
-	//    arrive as 0 on a non-primary VT - ConsoleService cannot mint them per VT (input /
-	//    graph are single-client, the rest are simply not proxied), and the dependent
-	//    command then reports the service unavailable.
-	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or_else(|| exit());
-	// The media StorageService client: the FAT vol://media volume off a second
-	// virtio-blk disk. Sent right after STORAGE; `cat`/`ls` route vol://media to it.
-	let media: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"MEDIA") }.unwrap_or(0);
-	// The ISO StorageService client: the read-only ISO9660 vol://iso volume off a third
-	// virtio-blk disk. Sent right after MEDIA; `cat`/`ls` route vol://iso to it.
-	let iso: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"ISO") }.unwrap_or(0);
-	// The UDF StorageService client: the read-only UDF vol://udf volume off a fourth
-	// virtio-blk disk. Sent right after ISO; `cat`/`ls` route vol://udf to it.
-	let udf: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"UDF") }.unwrap_or(0);
-	// The USB StorageService client: the writable FAT vol://usb volume off the USB
-	// mass-storage stick the xhci driver serves. Sent right after UDF; `cd` routes
-	// vol://usb to it.
-	let usb: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"USB") }.unwrap_or(0);
-	// The thin launcher runs log/device/config/time/audio commands as governed ELF tools,
-	// so it drops these bootstrap capabilities: it consumes each to keep the handshake
-	// ordering with the supervisor, then closes it so the shell holds no unused capability.
-	unsafe { drop_client(bootstrap, &mut buf, b"LOG") };
-	unsafe { drop_client(bootstrap, &mut buf, b"DEVICE") };
-	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
-	unsafe { drop_client(bootstrap, &mut buf, b"CONFIG") };
-	let netsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NET") }.unwrap_or_else(|| exit());
-	unsafe { drop_client(bootstrap, &mut buf, b"TIME") };
-	unsafe { drop_client(bootstrap, &mut buf, b"AUDIO") };
-	// The InputService client: `mouse` subscribes to its pointer-event stream and prints
-	// the recent text-cell positions (the plumbing echo - no mouse-driven UI yet).
-	let inputsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"INPUT") }.unwrap_or(0);
-	// The SystemGraphService client: `graph` queries the live system graph (components,
-	// devices, dependency edges, counters, and trace spans) and renders it as CLI / JSON
-	// / CBOR. Sent right after INPUT, matching ServiceManager's send order.
-	let graphsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"GRAPH") }.unwrap_or(0);
-	// The PermissionManager client: `perm` queries the permission audit trail (which
-	// capabilities each launched component was and was not granted under its manifest)
-	// and renders it as CLI / JSON. Sent right after GRAPH, matching ServiceManager's
-	// send order.
-	let permsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PERM") }.unwrap_or(0);
-	// The ResourceManager client is dropped: `usage` now runs as a governed ELF tool, so
-	// the launcher only consumes the capability (keeping the handshake order after PERM)
-	// and closes it. Sent right after PERM, matching ServiceManager's send order.
-	unsafe { drop_client(bootstrap, &mut buf, b"RESOURCE") };
+	// 1. receive the whole bootstrap capability set (ended by READY) and take each
+	//    capability by name - no ordering contract with the spawner. The volumes route
+	//    `cat`/`ls`/`cd` (vol://system plus the removable media); process is the launcher
+	//    the shell runs every governed tool through; network backs the net builtins. The
+	//    extended capabilities a non-primary VT does not get (media / iso / udf / usb,
+	//    input, graph, perm, resource) simply are not sent to it and read as 0 - the
+	//    dependent command then reports the service unavailable. Grants the thin launcher
+	//    does not use (log / device / config / time / audio, the resource client, ADMIN)
+	//    are not taken and close with the set.
+	let mut caps: CapSet = unsafe { recv_caps(bootstrap) };
+	let storage: u64 = match caps.take(b"STORAGE") {
+		0 => exit(),
+		h => h,
+	};
+	let media: u64 = caps.take(b"MEDIA");
+	let iso: u64 = caps.take(b"ISO");
+	let udf: u64 = caps.take(b"UDF");
+	let usb: u64 = caps.take(b"USB");
+	let procsvc: u64 = match caps.take(b"PROCESS") {
+		0 => exit(),
+		h => h,
+	};
+	let netsvc: u64 = match caps.take(b"NET") {
+		0 => exit(),
+		h => h,
+	};
+	let inputsvc: u64 = caps.take(b"INPUT");
+	let graphsvc: u64 = caps.take(b"GRAPH");
+	let permsvc: u64 = caps.take(b"PERM");
 	// The session (SessionService) the shell runs under: the long-lived owner of the
 	// working directory (and, later, the environment). `cd` round-trips to it and the
 	// prompt reads its cwd, so the cwd survives a shell restart - the supervisor keeps the
-	// session and hands each (re)started shell a fresh capability to the same one. Sent
-	// right after RESOURCE, matching both spawn paths; 0 on a minimal boot with no session.
-	let session: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SESSION") }.unwrap_or(0);
+	// session and hands each (re)started shell a fresh capability to the same one.
+	let session: u64 = caps.take(b"SESSION");
 	// The console channel to ConsoleService: the shell writes its output to it (routed
 	// via stdout) and reads its keystrokes from it. The userspace terminal renders the
 	// output and forwards the input, so the shell talks to the console, not the kernel.
-	let console: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONSOLE") }.unwrap_or_else(|| exit());
+	let console: u64 = match caps.take(b"CONSOLE") {
+		0 => exit(),
+		h => h,
+	};
 	set_stdout(console);
 	// The per-VT control channel to ConsoleService: the shell announces its foreground
 	// job on it (SET_FG / CLEAR_FG) so the tty signals it on Ctrl+C / Ctrl+Z / Ctrl+\,
 	// and learns of a Ctrl+Z suspend (JOB_STOPPED) so it can background the job.
-	let control: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONTROL") }.unwrap_or_else(|| exit());
-	// The admin channel to ServiceManager is dropped: `stop` is gone from the thin
-	// launcher. Sent last, only by the ServiceManager-spawned VT 1 shell; the launcher
-	// consumes it when present (keeping the handshake order) and closes it.
-	unsafe { drop_client(bootstrap, &mut buf, b"ADMIN") };
+	let control: u64 = match caps.take(b"CONTROL") {
+		0 => exit(),
+		h => h,
+	};
+	drop(caps);
 
 	// 2. report in.
 	unsafe {
@@ -116,15 +96,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		repl(console, control, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session);
 	}
 	exit();
-}
-
-// Consume one bootstrap capability the thin launcher does not use and drop it: receiving
-// the tagged message keeps the handshake ordering with the supervisor, and closing the
-// handle leaves the shell holding no unused capability.
-unsafe fn drop_client(bootstrap: u64, buf: &mut [u8], tag: &[u8]) {
-	if let Some(h) = unsafe { recv_tagged(bootstrap, buf, tag) } {
-		unsafe { close(h) };
-	}
 }
 
 // Print the product banner as the message of the day, shown once when the shell

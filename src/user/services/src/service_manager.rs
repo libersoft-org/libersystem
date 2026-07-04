@@ -890,7 +890,7 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: 
 			return false;
 		}
 		*admin_server = admin_srv;
-		true
+		send_ready(manager_side)
 	}
 }
 
@@ -1443,7 +1443,10 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 		// The pointer-forward channel from InputService (0 when no pointer device this
 		// boot): ConsoleService reads raw pointer events off it to drive selection,
 		// scrollback, and SGR mouse reports.
-		send_blocking(manager_side, b"POINTER", pointer_console)
+		if !send_blocking(manager_side, b"POINTER", pointer_console) {
+			return false;
+		}
+		send_ready(manager_side)
 	}
 }
 

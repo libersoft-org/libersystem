@@ -612,30 +612,6 @@ struct Console {
 	vocab: Option<Vec<Vec<u8>>>,
 }
 
-// Receive the "GPU" bootstrap message, returning the gpu driver's display channel, or 0
-// when there is no virtio-gpu device. A 0 handle is valid here (unlike the tagged
-// service factories, which require a capability), so this does not use recv_tagged.
-unsafe fn recv_gpu(bootstrap: u64, buf: &mut [u8]) -> u64 {
-	unsafe {
-		match recv_blocking(bootstrap, buf) {
-			Received::Message { len, handle } if len >= 3 && &buf[..3] == b"GPU" => handle,
-			_ => 0,
-		}
-	}
-}
-
-// Receive the "POINTER" bootstrap message, returning InputService's pointer-forward
-// channel, or 0 when there is no pointer device this boot. A 0 handle is valid here (as
-// for "GPU"), so this does not use recv_tagged.
-unsafe fn recv_pointer(bootstrap: u64, buf: &mut [u8]) -> u64 {
-	unsafe {
-		match recv_blocking(bootstrap, buf) {
-			Received::Message { len, handle } if len >= 7 && &buf[..7] == b"POINTER" => handle,
-			_ => 0,
-		}
-	}
-}
-
 // Map the boot framebuffer the kernel hands over (`framebuffer_map`): the display the
 // kernel drew the boot log to, whose pixel writes are visible immediately. Returns (pixel
 // base, geometry), or None when headless or the display was already handed over. This is
@@ -693,35 +669,35 @@ unsafe fn present_fg(console: &mut Console) {
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	unsafe {
-		// 1. receive VT 1's console channel (its shell, spawned by ServiceManager, holds
-		//    the other end), then a factory connection per multi-client service - among them
-		//    the ProcessService `process` factory it loads and launches each shell through:
-		//    the capabilities to spawn additional VTs.
-		let client: u64 = recv_tagged(bootstrap, &mut buf, b"CLIENT").unwrap_or_else(|| exit());
-		// VT 1's control channel (ServiceManager brokered it: the shell holds the other end).
-		let control: u64 = recv_tagged(bootstrap, &mut buf, b"CONTROL").unwrap_or_else(|| exit());
-		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"FSTORAGE").unwrap_or_else(|| exit());
-		let log: u64 = recv_tagged(bootstrap, &mut buf, b"FLOG").unwrap_or_else(|| exit());
-		let device: u64 = recv_tagged(bootstrap, &mut buf, b"FDEVICE").unwrap_or_else(|| exit());
-		let process: u64 = recv_tagged(bootstrap, &mut buf, b"FPROCESS").unwrap_or_else(|| exit());
-		let config: u64 = recv_tagged(bootstrap, &mut buf, b"FCONFIG").unwrap_or_else(|| exit());
-		let time: u64 = recv_tagged(bootstrap, &mut buf, b"FTIME").unwrap_or_else(|| exit());
-		let audio: u64 = recv_tagged(bootstrap, &mut buf, b"FAUDIO").unwrap_or_else(|| exit());
-		// The SessionService factory, from which a fresh per-VT session is minted for each
-		// additional virtual terminal. Received right after FAUDIO to match the supervisor's
-		// send order.
-		let session: u64 = recv_tagged(bootstrap, &mut buf, b"FSESSION").unwrap_or_else(|| exit());
-		// The PermissionManager factory, from which a fresh per-VT launcher client is minted
-		// for each additional virtual terminal - so every VT's shell reaches the permission
-		// store and runs commands as governed processes, not just VT 1. Received right after
-		// FSESSION to match the supervisor's send order.
-		let perm: u64 = recv_tagged(bootstrap, &mut buf, b"FPERM").unwrap_or_else(|| exit());
-		let net: u64 = recv_tagged(bootstrap, &mut buf, b"FNET").unwrap_or_else(|| exit());
-		// The gpu driver's display channel (0 = no virtio-gpu device; a 0 handle is valid
-		// here, unlike the tagged factories above, so we do not use recv_tagged).
-		let gpu: u64 = recv_gpu(bootstrap, &mut buf);
-		// InputService's pointer-forward channel (0 = no pointer device this boot).
-		let pointer: u64 = recv_pointer(bootstrap, &mut buf);
+		// 1. receive the whole bootstrap capability set (ended by READY) and take each by
+		//    name: VT 1's console + control channels (its shell, spawned by ServiceManager,
+		//    holds the other ends), a factory connection per multi-client service - among
+		//    them the ProcessService `process` factory it loads and launches each shell
+		//    through - and the optional display plumbing: the gpu driver's display channel
+		//    and InputService's pointer forward (absent on a headless / pointerless boot,
+		//    read as 0).
+		let mut caps: CapSet = recv_caps(bootstrap);
+		let required = |h: u64| -> u64 {
+			if h == 0 {
+				exit();
+			}
+			h
+		};
+		let client: u64 = required(caps.take(b"CLIENT"));
+		let control: u64 = required(caps.take(b"CONTROL"));
+		let storage: u64 = required(caps.take(b"FSTORAGE"));
+		let log: u64 = required(caps.take(b"FLOG"));
+		let device: u64 = required(caps.take(b"FDEVICE"));
+		let process: u64 = required(caps.take(b"FPROCESS"));
+		let config: u64 = required(caps.take(b"FCONFIG"));
+		let time: u64 = required(caps.take(b"FTIME"));
+		let audio: u64 = required(caps.take(b"FAUDIO"));
+		let session: u64 = required(caps.take(b"FSESSION"));
+		let perm: u64 = required(caps.take(b"FPERM"));
+		let net: u64 = required(caps.take(b"FNET"));
+		let gpu: u64 = caps.take(b"GPU");
+		let pointer: u64 = caps.take(b"POINTER");
+		drop(caps);
 
 		// 2. acquire the display backends. The boot framebuffer the kernel hands over holds
 		//    the boot log; the virtio-gpu driver's resizable shared backing is the runtime
@@ -1800,11 +1776,10 @@ unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) 
 		};
 		close(launcher);
 		let shell_proc: u64 = started.task;
+		// The named capability set, ended by READY: the shell takes each by name, so the
+		// capabilities a non-primary VT does not get are simply not sent - no placeholder
+		// messages keeping an order.
 		send_blocking(boot_parent, b"STORAGE", storage);
-		send_blocking(boot_parent, b"MEDIA", 0);
-		send_blocking(boot_parent, b"ISO", 0);
-		send_blocking(boot_parent, b"UDF", 0);
-		send_blocking(boot_parent, b"USB", 0);
 		send_blocking(boot_parent, b"LOG", log);
 		send_blocking(boot_parent, b"DEVICE", device);
 		send_blocking(boot_parent, b"PROCESS", process);
@@ -1812,14 +1787,12 @@ unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) 
 		send_blocking(boot_parent, b"NET", net_client);
 		send_blocking(boot_parent, b"TIME", time);
 		send_blocking(boot_parent, b"AUDIO", audio);
-		send_blocking(boot_parent, b"INPUT", 0);
-		send_blocking(boot_parent, b"GRAPH", 0);
 		send_blocking(boot_parent, b"PERM", perm);
-		send_blocking(boot_parent, b"RESOURCE", 0);
-		// This VT's session, sent right after RESOURCE to match the shell's receive order.
+		// This VT's session.
 		send_blocking(boot_parent, b"SESSION", session);
 		send_blocking(boot_parent, b"CONSOLE", shell_console);
 		send_blocking(boot_parent, b"CONTROL", shell_control);
+		send_ready(boot_parent);
 		// wait for the shell to report in, then drop its bootstrap.
 		let mut rbuf: [u8; 32] = [0u8; 32];
 		if let Received::Closed = recv_blocking(boot_parent, &mut rbuf) {
