@@ -873,7 +873,7 @@ fn an_entry_never_lands_past_the_terminator() {
 	// where the parser (which stops there) never looks: a silently lost file.
 	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
 	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
-						  // ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
+	// ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
 	fs.dev.data[root_off + 5 * 32] = b'X';
 	fs.write_file(b"a long note.txt", b"visible").unwrap();
 	assert_eq!(fs.read_file(b"a long note.txt").unwrap(), b"visible");
@@ -1043,6 +1043,19 @@ fn degenerate_boot_pointers_do_not_mount() {
 	let mut zero_root = build_fat(Kind::Fat16, ROOT);
 	zero_root[17..19].copy_from_slice(&0u16.to_le_bytes());
 	assert!(FatFs::mount(MemDisk { data: zero_root }).is_none(), "a classic volume with no root region");
+	// a sectors-per-cluster the specification does not allow (a power of two up to
+	// 128 sectors only).
+	let mut odd_spc = build_fat(Kind::Fat16, ROOT);
+	odd_spc[13] = 3;
+	assert!(FatFs::mount(MemDisk { data: odd_spc }).is_none(), "a non-power-of-two spc");
+	odd_spc = build_fat(Kind::Fat16, ROOT);
+	odd_spc[13] = 200;
+	assert!(FatFs::mount(MemDisk { data: odd_spc }).is_none(), "a 200-sector cluster");
+	// a cluster count past the spec ceiling would make the BAD-cluster marker a
+	// "valid" cluster index the chain walks would follow as data.
+	let mut huge_count = build_exfat(ROOT);
+	huge_count[92..96].copy_from_slice(&0x0FFF_FFF4u32.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: huge_count }).is_none(), "a cluster count past the spec ceiling");
 	// and a logical sector size the specification does not allow (not a power of two).
 	let mut odd_bps = build_fat(Kind::Fat16, ROOT);
 	odd_bps[11..13].copy_from_slice(&3584u16.to_le_bytes());
@@ -1176,12 +1189,13 @@ fn a_zero_reserved_bpb_and_an_overlapping_exfat_fat_do_not_mount() {
 	assert!(FatFs::mount(MemDisk { data: overlap }).is_none(), "a FAT overlapping the cluster heap");
 }
 
-// A device that fails the first armed write to one specific LBA, then heals - for
-// pinning write-ordering guarantees.
+// A device that fails the first armed write to one specific LBA (after letting `skip`
+// earlier armed writes to it pass), then heals - for pinning write-ordering guarantees.
 struct FailAt {
 	inner: MemDisk,
 	lba: u64,
 	armed: bool,
+	skip: usize,
 }
 
 impl BlockDevice for FailAt {
@@ -1191,8 +1205,11 @@ impl BlockDevice for FailAt {
 
 	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
 		if self.armed && lba == self.lba {
-			self.armed = false;
-			return false;
+			if self.skip == 0 {
+				self.armed = false;
+				return false;
+			}
+			self.skip -= 1;
 		}
 		self.inner.write_sector(lba, buf)
 	}
@@ -1205,9 +1222,10 @@ fn a_grow_cluster_reaches_the_chain_only_zeroed() {
 	// garbage the parser reads as entries (and a remove could then free foreign
 	// clusters). Fail the directory write right after a grow and inspect the tail.
 	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
-	let mut fs = FatFs::mount(FailAt { inner, lba: 0, armed: false }).unwrap();
-	// fill DOCS to exactly one 16-entry cluster: ".", "..", a.txt plus 13 more.
-	for i in 0..13u32 {
+	let mut fs = FatFs::mount(FailAt { inner, lba: 0, armed: false, skip: 0 }).unwrap();
+	// fill DOCS to exactly one 16-entry cluster: ".", "..", the LFN + 8.3 pair of
+	// a.txt, plus 12 more.
+	for i in 0..12u32 {
 		let name = alloc::format!("DOCS/F{i}.TXT");
 		fs.write_file(name.as_bytes(), b"x").unwrap();
 	}
@@ -1218,15 +1236,17 @@ fn a_grow_cluster_reaches_the_chain_only_zeroed() {
 		let at = fs.cluster_fs_sector(c) as usize * 512;
 		fs.dev.inner.data[at..at + 512].fill(b'A');
 	}
-	// the next write grows DOCS; make the directory write fail at its first sector.
-	let docs = fs.resolve_dir(b"DOCS").unwrap();
-	fs.dev.lba = fs.cluster_fs_sector(docs.cluster);
+	// the next write grows DOCS: the data chain takes the first free cluster, the grow
+	// the second. Let the grow's zeroing write to it pass and fail the directory
+	// content write that follows - the tail stays linked with only the zeros.
+	fs.dev.lba = fs.cluster_fs_sector(free[1]);
+	fs.dev.skip = 1;
 	fs.dev.armed = true;
-	assert_eq!(fs.write_file(b"DOCS/F13.TXT", b"y"), Err(FsError::Io));
+	assert_eq!(fs.write_file(b"DOCS/F12.TXT", b"y"), Err(FsError::Io));
 	fs.dev.armed = false;
 	// the tail cluster is linked but zeroed - the listing shows only the real entries.
 	let listed = names(&fs.list_dir(b"DOCS").unwrap());
-	assert_eq!(listed.len(), 14, "garbage entries surfaced in the grown tail: {listed:?}");
+	assert_eq!(listed.len(), 13, "garbage entries surfaced in the grown tail: {listed:?}");
 	assert!(listed.iter().all(|n| n == "a.txt" || (n.starts_with('F') && n.ends_with(".TXT"))), "{listed:?}");
 }
 
@@ -1346,4 +1366,63 @@ fn a_fat12_slot_write_touches_only_its_sectors() {
 	fs.dev.writes.clear();
 	fs.set_fat_entry(341, 0x456).unwrap(); // byte offset 511: straddles into the second
 	assert_eq!(fs.dev.writes, [1, 2], "a straddling slot needs exactly the pair");
+}
+
+#[test]
+fn a_volume_claiming_more_than_the_device_does_not_mount() {
+	// The geometry is the medium's own claim: a forged BPB whose total (or FAT size)
+	// reaches past the real device used to mount - internally consistent regions - and
+	// the first write attempt then built the whole claimed FAT image in memory. The
+	// claimed volume end must exist on the device, or the mount is refused.
+	let mut big_total = build_fat(Kind::Fat16, ROOT);
+	big_total[19..21].copy_from_slice(&0u16.to_le_bytes());
+	big_total[32..36].copy_from_slice(&60000u32.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: big_total }).is_none(), "a total past the device end");
+	// a huge claimed FAT (the size whose in-memory image the allocator builds),
+	// with a total sized to keep the layout internally consistent.
+	let mut big_fat = build_fat(Kind::Fat32, ROOT);
+	big_fat[36..40].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes());
+	big_fat[32..36].copy_from_slice(&0x0110_0000u32.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: big_fat }).is_none(), "a FAT past the device end");
+	let mut big_heap = build_exfat(ROOT);
+	big_heap[92..96].copy_from_slice(&1_000_000u32.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: big_heap }).is_none(), "a heap past the device end");
+	// an honestly sized volume still mounts - the probe reads its very last sector.
+	assert!(FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).is_some());
+}
+
+#[test]
+fn a_one_entry_mutation_writes_only_the_clusters_it_touches() {
+	// A directory mutation used to rewrite the WHOLE directory - write amplification,
+	// and a power cut mid-rewrite could tear entries unrelated to the operation.
+	// Removing an entry in the first cluster of a two-cluster directory must write
+	// that cluster and never rewrite the second.
+	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
+	let mut fs = FatFs::mount(WriteLog { inner, writes: Vec::new() }).unwrap();
+	// DOCS starts with 4 slots (".", "..", a.txt's LFN pair); 14 more entries span
+	// two 16-slot clusters.
+	for i in 0..14u32 {
+		let name = alloc::format!("DOCS/F{i}.TXT");
+		fs.write_file(name.as_bytes(), b"x").unwrap();
+	}
+	let docs = fs.resolve_dir(b"DOCS").unwrap();
+	let second = fs.next_cluster(docs.cluster).unwrap();
+	assert!(second >= 2 && !fs.is_end(second), "DOCS must span two clusters");
+	let (lba1, lba2) = (fs.cluster_fs_sector(docs.cluster), fs.cluster_fs_sector(second));
+	fs.dev.writes.clear();
+	fs.remove(b"DOCS/F0.TXT").unwrap();
+	assert!(fs.dev.writes.contains(&lba1), "the touched cluster must be written: {:?}", fs.dev.writes);
+	assert!(!fs.dev.writes.contains(&lba2), "the untouched cluster must not be rewritten: {:?}", fs.dev.writes);
+}
+
+#[test]
+fn a_non_ascii_name_resolves_by_its_exact_bytes() {
+	// Case folding is deliberately ASCII-only (the media's home systems fold the full
+	// range through their upcase table); a non-ASCII name must always resolve by the
+	// exact bytes it was written with.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	let name = "Caf\u{E9}.txt".as_bytes();
+	fs.write_file(name, b"accented").unwrap();
+	assert_eq!(fs.read_file(name).unwrap(), b"accented");
+	assert!(fs.list().unwrap().iter().any(|e| e.name.as_bytes() == name));
 }
