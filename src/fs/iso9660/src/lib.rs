@@ -219,6 +219,9 @@ impl<D: BlockDevice> Iso9660<D> {
 			if let Some(e) = parse_record(&data[off..off + rec_len], self.geo.joliet)
 				&& !e.special
 				&& !e.name.is_empty()
+				// records order equal names adjacently with versions descending, so a
+				// multi-version file lists once, as its highest version.
+				&& !out.last().is_some_and(|p: &FileInfo| p.name == e.name)
 			{
 				// a directory reports a length of zero - the FileInfo contract,
 				// uniform across the backends behind the volume API.
@@ -268,10 +271,11 @@ struct Entry {
 }
 
 // Take a volume descriptor's root directory record (fixed 34 bytes at offset 156): its
-// extent LBA and data length, both stored little-endian first.
+// extent LBA and data length, both stored little-endian first. The root record can
+// carry an XAR length too - its data follows those blocks, like any record's.
 fn root_extent(desc: &[u8]) -> (u32, u32) {
 	let r = &desc[156..156 + 34];
-	(le32(&r[2..6]), le32(&r[10..14]))
+	(le32(&r[2..6]).saturating_add(r[1] as u32), le32(&r[10..14]))
 }
 
 // A type-2 descriptor is Joliet when its escape sequences select UCS-2 (%/@, %/C, %/E)
@@ -293,6 +297,12 @@ fn parse_record(rec: &[u8], joliet: bool) -> Option<Entry> {
 	let lba = le32(&rec[2..6]).saturating_add(rec[1] as u32);
 	let size = le32(&rec[10..14]);
 	let is_dir = rec[25] & 0x02 != 0;
+	// an associated file (flag 0x04) is a secondary stream recorded BEFORE its
+	// same-named main file - it must neither list (a duplicate name) nor match a
+	// lookup (it would shadow the main content).
+	if rec[25] & 0x04 != 0 {
+		return None;
+	}
 	// multi-extent (segments in further records) and interleaving (gap blocks woven
 	// into the extent) are forms the reader refuses rather than misreads.
 	let unsupported = rec[25] & 0x80 != 0 || rec[26] != 0 || rec[27] != 0;
@@ -343,8 +353,11 @@ fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool) -> String {
 
 // Find a Rock Ridge "NM" name in a record's system-use area: entries are sig(2), len,
 // version, then NM's flags byte and the name bytes. None if there is no NM entry.
-// Continuation areas (CE) are not followed and a SUSP skip offset (SP) is not applied -
-// a name kept there degrades cleanly to the shorter NM prefix or the 8.3 form.
+// Continuation areas (CE) are not followed, a SUSP skip offset (SP) is not applied, and
+// deep-directory relocation (CL / PL / RE) is not interpreted - a name kept in a
+// continuation degrades cleanly to the shorter NM prefix or the 8.3 form, and a tree
+// mastered deeper than eight levels shows its relocation artifacts where the mastering
+// tool placed them (everything stays reachable).
 fn rock_ridge_name(sys: &[u8]) -> Option<String> {
 	let mut off = 0usize;
 	let mut out = String::new();

@@ -1823,6 +1823,25 @@ cosmetic recognition gaps.
   - Result: all hold - iso9660 11 host tests (3 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: M96-B4 (the refuse-rather-than-misread rule extended to the remaining record shapes), the FAT track's interop rule (what the media's home systems serve, we serve - or refuse honestly).
 
+## M98 - ISO9660: third-pass findings (the root XAR and associated files)
+
+The third full source pass (2026-07-04, after M97 landed) re-verified the
+M96/M97 machinery holds and found only low/cosmetic leftovers: one
+incompleteness of the M97 XAR fix, one record class that shadows real
+content, and two recording/noise items.
+
+- [x] (B1, low) The M97 XAR fix is incomplete: `parse_record` advances the LBA by `rec[1]`, but the ROOT record in the volume descriptor (offset 156) carries its own XAR length in `r[1]` and `root_extent` ignores it - a root directory behind an XAR block parses the XAR as records. Apply the same saturating advance in `root_extent`.
+  - Result: applied. Test `a_root_extended_attribute_record_is_skipped` (the root's records behind one XAR block resolve their files).
+- [x] (B2, cosmetic) Associated files (flag bit 0x04 - a secondary stream recorded BEFORE its same-named main file) are not hidden: the name lists twice, and a lookup takes the fork instead of the main file (the spec orders the fork first) - wrong content served. Skip associated records in parsing, so they neither list nor match.
+  - Result: `parse_record` skips them. Test `an_associated_file_never_surfaces_or_matches` (a fork planted ahead of its main file: one listing entry, the main content served).
+- [x] (B3, cosmetic) Rock Ridge deep-directory relocation (CL / PL / RE entries) is not interpreted - a tree mastered deeper than eight levels shows its "rr_moved" artifacts where the mastering tool placed them. A safe degradation (everything stays reachable); record it as a known limit next to CE/SP.
+  - Result: recorded at `rock_ridge_name`.
+- [x] (B4, cosmetic) Multi-version records ("F.TXT;1", "F.TXT;2") decode to the same name and list twice. The spec orders equal names adjacently with versions descending, so the first is the highest version and lookups already take it - deduplicate adjacent equal names in the listing.
+  - Result: adjacent equal names deduplicate (the first, highest-version record stays). Test `duplicate_versions_list_once`.
+- Done when: a root directory behind an XAR reads correctly, an associated fork neither lists nor shadows its main file, the relocation limit is recorded, a multi-version file lists once, and the suite stays green with a test per finding.
+  - Result: all hold - iso9660 14 host tests (3 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
+- Concept: M97-B1 (the XAR rule completed at the root), M96-B5/M97 (the listing-contract and refuse-or-serve-right rules on the remaining record classes).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a

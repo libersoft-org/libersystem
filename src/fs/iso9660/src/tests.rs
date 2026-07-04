@@ -243,6 +243,49 @@ fn a_joliet_escape_later_in_the_field_is_recognized() {
 }
 
 #[test]
+fn a_root_extended_attribute_record_is_skipped() {
+	// the root record in the descriptor can carry an XAR length too - the root's
+	// records begin after those blocks, like any extent's.
+	let mut img = build_iso(false);
+	img.extend(vec![0u8; SECTOR_SIZE * 2]); // blocks 23 (garbage XAR) and 24 unused
+	both32(&mut img, 16 * SECTOR_SIZE + 80, 25);
+	let (a, b) = (19 * SECTOR_SIZE, 23 * SECTOR_SIZE);
+	img.copy_within(a..a + SECTOR_SIZE, b); // the root's real records move to 23
+	let root_rec = 16 * SECTOR_SIZE + 156;
+	img[root_rec + 1] = 1; // one XAR block ahead of the root data
+	both32(&mut img, root_rec + 2, 22); // extent at 22: the XAR, data at 23
+	let mut fs = Iso9660::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"hello iso");
+}
+
+#[test]
+fn an_associated_file_never_surfaces_or_matches() {
+	// an associated file (flag 0x04, a secondary stream) precedes its same-named main
+	// file - it must neither duplicate the listing nor shadow the main content.
+	let mut img = build_iso(false);
+	let mut fork = record(22, 5, false, &name("HELLO.TXT", false, false));
+	fork[25] |= 0x04; // the fork points at the "world" block - shadowing would show
+	let root = dir_block(&[record(19, SECTOR_SIZE as u32, true, &[0]), record(19, SECTOR_SIZE as u32, true, &[1]), fork, record(21, 9, false, &name("HELLO.TXT", false, false))]);
+	img[19 * SECTOR_SIZE..20 * SECTOR_SIZE].copy_from_slice(&root);
+	let mut fs = Iso9660::mount(MemDisc { data: img }).unwrap();
+	let hits = fs.list().unwrap().into_iter().filter(|f| f.name == "HELLO.TXT").count();
+	assert_eq!(hits, 1, "the fork must not duplicate the listing");
+	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"hello iso", "the fork must not shadow the main content");
+}
+
+#[test]
+fn duplicate_versions_list_once() {
+	// "F;1" and "F;2" decode to one name; records order equal names adjacently with
+	// versions descending, so the listing keeps the first and lookups already take it.
+	let mut img = build_iso(false);
+	let dup = record(22, 5, false, b"HELLO.TXT;2");
+	img[19 * SECTOR_SIZE + ROOT_FREE..19 * SECTOR_SIZE + ROOT_FREE + dup.len()].copy_from_slice(&dup);
+	let mut fs = Iso9660::mount(MemDisc { data: img }).unwrap();
+	let hits = fs.list().unwrap().into_iter().filter(|f| f.name == "HELLO.TXT").count();
+	assert_eq!(hits, 1);
+}
+
+#[test]
 fn listing_contract_and_dot_dot() {
 	// an empty-named record never surfaces or matches an empty lookup, a directory
 	// lists with size zero, and ".." resolves to the parent as on the other backends.
