@@ -877,7 +877,7 @@ fn an_entry_never_lands_past_the_terminator() {
 	// where the parser (which stops there) never looks: a silently lost file.
 	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
 	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
-	// ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
+						  // ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
 	fs.dev.data[root_off + 5 * 32] = b'X';
 	fs.write_file(b"a long note.txt", b"visible").unwrap();
 	assert_eq!(fs.read_file(b"a long note.txt").unwrap(), b"visible");
@@ -1536,6 +1536,20 @@ fn nt_case_flags_render_a_lowercase_short_name() {
 	// the lookup stays case-insensitive in both directions.
 	assert_eq!(fs.read_file(b"NOTES.TXT").unwrap(), b"");
 	assert_eq!(fs.read_file(b"notes.txt").unwrap(), b"");
+}
+
+#[test]
+fn an_overwrite_via_the_short_alias_keeps_the_long_name() {
+	// The 8.3 short form names the same file - an overwrite through it must not
+	// rename the file to the alias: the long name survives, as the media's home
+	// systems keep the directory entry on an in-place overwrite.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, &[]) }).unwrap();
+	fs.write_file(b"Alpha file.txt", b"one").unwrap();
+	fs.write_file(b"ALPHA_~1.TXT", b"two").unwrap();
+	assert_eq!(fs.read_file(b"Alpha file.txt").unwrap(), b"two");
+	let listed = names(&fs.list().unwrap());
+	assert!(listed.contains(&"Alpha file.txt".to_string()), "the long name must survive: {listed:?}");
+	assert_eq!(listed.len(), 1, "{listed:?}");
 }
 
 #[test]

@@ -511,7 +511,11 @@ impl<D: BlockDevice> FatFs<D> {
 		Ok(match self.geo.kind {
 			Kind::Fat12 => {
 				let v = u16::from_le_bytes([buf[within], buf[within + 1]]);
-				if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
+				if cluster & 1 == 1 {
+					(v >> 4) as u32
+				} else {
+					(v & 0x0FFF) as u32
+				}
 			}
 			Kind::Fat16 => u16::from_le_bytes([buf[within], buf[within + 1]]) as u32,
 			Kind::Fat32 | Kind::ExFat => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]) & 0x0FFF_FFFF,
@@ -850,15 +854,16 @@ impl<D: BlockDevice> FatFs<D> {
 	// (a unique 8.3 short + long fragments when needed, growing a chained directory by
 	// whole clusters until the set fits), and write the directory back once. An
 	// overwrite preserves what the media's home systems preserve: the replaced entry's
-	// original name case and its creation stamp. Returns the replaced entry's first
-	// cluster, which only then is safe to free.
+	// on-disk name (a match through the 8.3 alias must not rename the file) and its
+	// creation stamp. Returns the replaced entry's first cluster, which only then is
+	// safe to free.
 	fn swap_entry(&mut self, dir: &Dir, name: &[u8], first: u32, size: u32) -> Result<Option<u32>, FsError> {
 		let mut bytes = self.read_dir_bytes(dir)?;
 		let orig = bytes.clone();
 		scrub_after_terminator(&mut bytes);
 		let old = mark_unlinked(&mut bytes, name)?;
 		let name: &[u8] = match &old {
-			Some(o) if eq_ignore_case(o.name.as_bytes(), name) => o.name.as_bytes(),
+			Some(o) if writable_name(o.name.as_bytes()) => o.name.as_bytes(),
 			_ => name,
 		};
 		let mut entries = build_entries(name, &bytes, first, size, 0x20, self.dos_stamp())?;
@@ -972,8 +977,8 @@ impl<D: BlockDevice> FatFs<D> {
 	// Swap an exFAT entry set in ONE read-modify-write: mark any old set's in-use bits
 	// cleared (its slots become reusable), place the new set (growing a chained
 	// directory by whole clusters until the set fits), write the directory back once. An
-	// overwrite preserves the replaced set's original name case and creation stamp, as
-	// the media's home systems do. Returns the replaced entry, whose clusters only then
+	// overwrite preserves the replaced set's on-disk name and creation stamp, as the
+	// media's home systems do. Returns the replaced entry, whose clusters only then
 	// are safe to release.
 	fn exfat_swap_entry(&mut self, dir: &Dir, name: &[u8], first: u32, size: u64) -> Result<Option<Raw>, FsError> {
 		let mut bytes = self.read_dir_bytes(dir)?;
@@ -981,7 +986,7 @@ impl<D: BlockDevice> FatFs<D> {
 		scrub_after_terminator(&mut bytes);
 		let old = exfat_mark_unlinked(&mut bytes, name)?;
 		let name: &[u8] = match &old {
-			Some(o) if eq_ignore_case(o.name.as_bytes(), name) => o.name.as_bytes(),
+			Some(o) if writable_name(o.name.as_bytes()) => o.name.as_bytes(),
 			_ => name,
 		};
 		let mut set = build_exfat_set(name, first, size, self.exfat_stamp());
@@ -1063,7 +1068,11 @@ impl<D: BlockDevice> FatFs<D> {
 	// common contiguous form, whose FAT entries were never written) frees its contiguous
 	// run from the bitmap alone; a chained file walks and clears the FAT too.
 	fn exfat_release(&mut self, old: &Raw) -> Result<(), FsError> {
-		if old.no_fat_chain { self.exfat_free_contiguous(old.first_cluster, old.size) } else { self.exfat_free(old.first_cluster) }
+		if old.no_fat_chain {
+			self.exfat_free_contiguous(old.first_cluster, old.size)
+		} else {
+			self.exfat_free(old.first_cluster)
+		}
 	}
 
 	// Locate the allocation bitmap (the 0x81 entry in the root): its first cluster and its
@@ -1199,7 +1208,11 @@ fn fat_entry_at(fat: &[u8], kind: Kind, cluster: u32) -> u32 {
 				return 1;
 			}
 			let v = u16::from_le_bytes([fat[off], fat[off + 1]]);
-			if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
+			if cluster & 1 == 1 {
+				(v >> 4) as u32
+			} else {
+				(v & 0x0FFF) as u32
+			}
 		}
 		Kind::Fat16 => {
 			if off + 2 > fat.len() {
@@ -1298,7 +1311,9 @@ impl Geometry {
 		let total = if total16 != 0 { total16 } else { total32 };
 		let fat_size = if fat16 != 0 { fat16 } else { fat32 };
 		// a zero reserved count would put the FAT region at the boot sector, so the
-		// first FAT write would overwrite it - refuse the layout at mount.
+		// first FAT write would overwrite it - refuse the layout at mount. A FAT count
+		// above 2 is spec-tolerated (though no formatter emits one) and stays accepted:
+		// the region arithmetic below and the mount probe bound it like any layout.
 		if num_fats == 0 || fat_size == 0 || total == 0 || reserved_sectors == 0 {
 			return None;
 		}
@@ -1608,6 +1623,14 @@ fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
 	a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
+// Whether a name parsed off the medium may be re-emitted into a fresh entry set - the
+// write path's own gates. A foreign entry can carry a name no legal write produces (a
+// lossy decode renders an invalid unit as '?', an illegal character); an overwrite
+// must not write such a name back, it falls back to the caller's instead.
+fn writable_name(name: &[u8]) -> bool {
+	!name.is_empty() && name.len() <= 255 && !name.last().is_some_and(|&b| b == b'.' || b == b' ') && !name.iter().any(|&b| b < 0x20 || b"\"*:<>?\\|".contains(&b))
+}
+
 // Build a directory entry set: the 8.3 short entry, preceded by VFAT long-name fragments
 // when the name is not a plain uppercase 8.3 name. Fragments are emitted last-first. The
 // short form is generated against the directory's existing entries so it is unique
@@ -1728,7 +1751,11 @@ fn gen_short(name: &[u8], dir_bytes: &[u8]) -> Result<[u8; 11], FsError> {
 // (uppercasing alone is not lossy - the long name records the case).
 fn short_char(b: u8) -> (u8, bool) {
 	let illegal = b < 0x20 || b == 0x7F || b" \"*+,./:;<=>?[\\]|".contains(&b);
-	if illegal { (b'_', true) } else { (b.to_ascii_uppercase(), false) }
+	if illegal {
+		(b'_', true)
+	} else {
+		(b.to_ascii_uppercase(), false)
+	}
 }
 
 // Collect the 8.3 name fields of a directory's live entries, for uniqueness checks.
