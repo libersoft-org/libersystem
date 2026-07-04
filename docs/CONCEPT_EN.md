@@ -443,7 +443,7 @@ For the MVP, running on a single core is enough, but **the design must be multic
 | driver restart | `ServiceManager` + `DeviceManager` |
 | app sandbox policy | a higher layer / later |
 | JSON/CBOR/human CLI rendering | the API/CLI layer |
-| `system://`, `user://`, `vol://` resolver | userspace services |
+| `system://`, `vol://` resolver | userspace services |
 | `/proc`, `/sys`, `/dev` | do not do at all |
 
 ---
@@ -993,9 +993,10 @@ driver.nvme
 driver.gpu
 driver.audio
 driver.network
-driver.fs.modernfs
-driver.fs.ext4
-driver.fs.ntfs
+driver.fs.liberfs
+driver.fs.fat
+driver.fs.iso9660
+driver.fs.udf
 ```
 
 #### Driver crash
@@ -1132,7 +1133,7 @@ Example:
 vol://7a1f91c2-4d10-4a2a-a57e-f21c00112233/Documents/book.pdf
 ```
 
-`vol://<uuid>` is the **escape / scripting form** - always unambiguous, never leading to the wrong disk. For everyday work an application does not work with the UUID directly, but with **names in its per-process namespace** (`user://`, `appdata://`, …), which resolve via a capability to a concrete volume (see below).
+`vol://<uuid>` is the **escape / scripting form** - always unambiguous, never leading to the wrong disk. For everyday work an application does not work with the UUID directly, but with **the capabilities it was handed** (typically from the file picker), which resolve to a concrete volume (see below).
 
 A petname (a human label) **never appears** in a canonical path - because it need not be unique, it has no `vol://`/URI form, and nothing can be addressed through it (see *Human-friendly naming*).
 
@@ -1145,7 +1146,6 @@ A UUID is unambiguous, but as the primary UX it is unusable - nobody wants to ty
 | **UUID** | a volume's persistent identity (in metadata) | globally unique, immutable | the source of truth for resolution, the only thing in `vol://` |
 | **Petname** | a human label for a volume (`backup-ssd`) | **need not be unique**, display only | never addressed or resolved through, has no URI form |
 | **Self-label** | a name written into the volume at format time (`Samsung-T7`) | just a hint | untrusted, informational only |
-| **A name in a per-process namespace** | what the application actually sees (`user://`, `appdata://`) | unique *within* the given namespace | assigned by a capability, resolves to a concrete volume |
 
 Key rules:
 
@@ -1160,7 +1160,7 @@ For user-driven access to files there is a **file picker / powerbox**: the user 
 
 #### A path is an object, a URI is just a representation
 
-Schemes like `vol://`, `user://`, or `storage://` look like URLs, but **the canonical form of a path is not a text string - it is a typed object.** A URI is just one of its representations, exactly in the spirit of the rule from the *System API model* section ("one typed API, several representations").
+Schemes like `vol://` or `storage://` look like URLs, but **the canonical form of a path is not a text string - it is a typed object.** A URI is just one of its representations, exactly in the spirit of the rule from the *System API model* section ("one typed API, several representations").
 
 With a "path", three different things are usually merged into a single string, and they need to be distinguished:
 
@@ -1177,7 +1177,6 @@ VolumeId     = { uuid: Uuid }                              // unambiguous identi
 Segment      = a non-empty name without "/", ".", and ".."
 RelativePath = [Segment]                                   // a list of segments, not a string
 VolumePath   = { volume: VolumeId, path: RelativePath }
-NsName       = { namespace: NsKind, path: RelativePath }   // user://, appdata://, …
 DeviceRef    = variant { Disk(id) | Partition(id) | Volume(VolumeId) }  // storage://
 ```
 
@@ -1203,10 +1202,6 @@ The following logical namespaces have been agreed:
 
 ```text
 system://
-user://
-appdata://
-cache://
-runtime://
 vol://
 storage://
 ```
@@ -1216,10 +1211,6 @@ Meaning:
 | Namespace | Meaning |
 |---|---|
 | `system://` | system files / the OS base |
-| `user://` | user data |
-| `appdata://` | per-app persistent data |
-| `cache://` | deletable cache |
-| `runtime://` | temporary runtime state |
 | `vol://` | an explicit volume by UUID |
 | `storage://` | administration of disks/partitions/volumes |
 
@@ -1244,8 +1235,8 @@ StorageService.Transfer(src: FileCapability, dst: DirCapability, mode: Move | Co
 Instead of silently merging disks into one tree (the classic overlay, where it is unknown where the data physically is), we solve "one logical home" through **explicit composition at the namespace level**:
 
 ```text
-user:// is not one disk, but a typed view composed of explicitly added volumes.
-Each item in user:// knows which volume it physically resides on.
+The home view is not one disk, but a typed view composed of explicitly added volumes.
+Each item in it knows which volume it physically resides on.
 The composition of the view is owned by the user/service, not by the chance of what is attached.
 ```
 
@@ -1283,13 +1274,13 @@ How it holds together (no "root"):
 - A concrete tool holds broad access because it was **explicitly granted** to it (at install time or by the user in a session) - auditably and revocably, not as ambient authority.
 - The user then *delegates narrow slices* of that broad authority onward (one file, one directory) via the picker.
 
-**`user://` is a default convenience, not a cage.**
+**The home view is a default convenience, not a cage.**
 
-- For the **everyday ordinary flow** (and for a non-expert), `user://` Home + the file picker is a convenient default: the user does not have to deal with volumes or UUIDs, just "Documents", "Downloads".
-- **But an advanced user is not locked into `user://`** - via the file manager/shell they reach `storage://`, a concrete `vol://`, other disks, and compose their own structure. `user://` is just one (default) view, not the boundary of what the user may do.
+- For the **everyday ordinary flow** (and for a non-expert), the home view + the file picker is a convenient default: the user does not have to deal with volumes or UUIDs, just "Documents", "Downloads".
+- **But an advanced user is not locked into the home view** - via the file manager/shell they reach `storage://`, a concrete `vol://`, other disks, and compose their own structure. The home view is just one (default) view, not the boundary of what the user may do.
 - When there are multiple devices with the same petname, the UI distinguishes them by additional data (self-label, capacity, connection, a short UUID prefix).
 
-In summary: **the application is restricted, not the user.** The model stays strict toward applications (authority in the capability, identity in the UUID), but the user, through trusted tools, has full Windows-like control over their disks. Ergonomics for a non-expert come from `user://` + the picker as a default, not as a cage. The detailed design of these operations belongs to a later phase - here the direction is fixed, not the API.
+In summary: **the application is restricted, not the user.** The model stays strict toward applications (authority in the capability, identity in the UUID), but the user, through trusted tools, has full Windows-like control over their disks. Ergonomics for a non-expert come from the home view + the picker as a default, not as a cage. The detailed design of these operations belongs to a later phase - here the direction is fixed, not the API.
 
 ---
 
@@ -1297,26 +1288,16 @@ In summary: **the application is restricted, not the user.** The model stays str
 
 The storage model is decided, but the native filesystem is not yet designed in detail.
 
-#### Supported compatible FS later
+#### Supported compatible FS
 
-- ext4,
-- NTFS,
+- FAT12/16/32,
 - exFAT,
-- FAT32,
 - ISO9660,
 - UDF.
 
-These filesystems are backends behind the unified Volume API.
+These filesystems are backends behind the unified Volume API; further ones can be added behind the same API as the need arises.
 
-#### Native FS later
-
-Working names:
-
-```text
-ModernFS
-LiberFS
-NovaFS
-```
+#### Native FS - LiberFS
 
 Possible features:
 

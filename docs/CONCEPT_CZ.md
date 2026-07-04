@@ -443,7 +443,7 @@ Pro MVP stačí běh na jednom jádře, ale **návrh musí být multicore-ready 
 | restart driverů | `ServiceManager` + `DeviceManager` |
 | app sandbox policy | vyšší vrstva / později |
 | JSON/CBOR/human CLI rendering | API/CLI vrstva |
-| `system://`, `user://`, `vol://` resolver | userspace služby |
+| `system://`, `vol://` resolver | userspace služby |
 | `/proc`, `/sys`, `/dev` | vůbec nedělat |
 
 ---
@@ -993,9 +993,10 @@ driver.nvme
 driver.gpu
 driver.audio
 driver.network
-driver.fs.modernfs
-driver.fs.ext4
-driver.fs.ntfs
+driver.fs.liberfs
+driver.fs.fat
+driver.fs.iso9660
+driver.fs.udf
 ```
 
 #### Pád driveru
@@ -1132,7 +1133,7 @@ Příklad:
 vol://7a1f91c2-4d10-4a2a-a57e-f21c00112233/Documents/book.pdf
 ```
 
-`vol://<uuid>` je **úniková / skriptovací forma** - vždy jednoznačná, nikdy nevede na špatný disk. Pro každodenní práci aplikace nepracuje s UUID napřímo, ale s **jmény ve svém per-proces namespace** (`user://`, `appdata://`, …), která se přes capability resolvují na konkrétní volume (viz níže).
+`vol://<uuid>` je **úniková / skriptovací forma** - vždy jednoznačná, nikdy nevede na špatný disk. Pro každodenní práci aplikace nepracuje s UUID napřímo, ale s **capabilities, které dostala** (typicky z file pickeru), které se resolvují na konkrétní volume (viz níže).
 
 Petname (lidský štítek) se v kanonické cestě **nikdy neobjeví** - protože nemusí být unikátní, nemá žádnou `vol://`/URI formu a nedá se přes něj adresovat (viz *Lidsky přívětivé pojmenování*).
 
@@ -1145,7 +1146,6 @@ UUID je sice jednoznačné, ale jako primární UX je nepoužitelné - nikdo nec
 | **UUID** | trvalá identita volume (v metadatech) | globálně unikátní, neměnné | zdroj pravdy pro resolution, jediné, co je v `vol://` |
 | **Petname** | lidský popisek volume (`backup-ssd`) | **nemusí být unikátní**, jen pro zobrazení | nikdy se přes něj neadresuje ani neresolvuje, nemá URI formu |
 | **Self-label** | jméno zapsané ve volume při formátu (`Samsung-T7`) | jen nápověda | nedůvěryhodné, pouze informativní |
-| **Jméno v per-proces namespace** | co aplikace reálně vidí (`user://`, `appdata://`) | unikátní *uvnitř* daného namespace | přiděleno capabilitou, resolvuje na konkrétní volume |
 
 Klíčová pravidla:
 
@@ -1160,7 +1160,7 @@ Pro uživatelsky řízený přístup k souborům slouží **file picker / powerb
 
 #### Cesta je objekt, URI je jen reprezentace
 
-Schémata jako `vol://`, `user://` nebo `storage://` vypadají jako URL, ale **kanonická forma cesty není textový string - je to typovaný objekt.** URI je jen jedna z jeho reprezentací, přesně v duchu pravidla ze sekce *System API model* („jedno typované API, víc reprezentací“).
+Schémata jako `vol://` nebo `storage://` vypadají jako URL, ale **kanonická forma cesty není textový string - je to typovaný objekt.** URI je jen jedna z jeho reprezentací, přesně v duchu pravidla ze sekce *System API model* („jedno typované API, víc reprezentací“).
 
 U „cesty“ se obvykle do jednoho stringu slévají tři různé věci, které je potřeba rozlišit:
 
@@ -1177,7 +1177,6 @@ VolumeId     = { uuid: Uuid }                              // jednoznačná iden
 Segment      = neprázdný název bez „/“, „.“ a „..“
 RelativePath = [Segment]                                   // seznam segmentů, ne string
 VolumePath   = { volume: VolumeId, path: RelativePath }
-NsName       = { namespace: NsKind, path: RelativePath }   // user://, appdata://, …
 DeviceRef    = variant { Disk(id) | Partition(id) | Volume(VolumeId) }  // storage://
 ```
 
@@ -1203,10 +1202,6 @@ Byly dohodnuty tyto logické namespaces:
 
 ```text
 system://
-user://
-appdata://
-cache://
-runtime://
 vol://
 storage://
 ```
@@ -1216,10 +1211,6 @@ Význam:
 | Namespace | Význam |
 |---|---|
 | `system://` | systémové soubory / základ OS |
-| `user://` | uživatelská data |
-| `appdata://` | per-app persistentní data |
-| `cache://` | mazatelná cache |
-| `runtime://` | dočasný runtime stav |
 | `vol://` | explicitní volume podle UUID |
 | `storage://` | administrace disků/partitions/volumes |
 
@@ -1244,8 +1235,8 @@ StorageService.Transfer(src: FileCapability, dst: DirCapability, mode: Move | Co
 Místo tichého slévání disků do jednoho stromu (klasický overlay, kde není známo, kde data fyzicky jsou) řešíme „jeden logický domov" **explicitní kompozicí na úrovni namespace**:
 
 ```text
-user:// není jeden disk, ale typovaný pohled složený z explicitně přidaných volumes.
-Každá položka v user:// ví, na kterém volume fyzicky leží.
+Domovský pohled není jeden disk, ale typovaný pohled složený z explicitně přidaných volumes.
+Každá položka v něm ví, na kterém volume fyzicky leží.
 Skladbu pohledu vlastní uživatel/služba, ne náhoda připojení.
 ```
 
@@ -1283,13 +1274,13 @@ Jak to drží pohromadě (žádný „root"):
 - Široký přístup drží konkrétní nástroj proto, že mu byl **explicitně udělen** (při instalaci nebo uživatelem v session) - auditovatelně a odvolatelně, ne ambient authority.
 - Uživatel z té široké autority pak *deleguje úzké řezy* dál (jeden soubor, jedna složka) přes picker.
 
-**`user://` je výchozí pohodlí, ne klec.**
+**Domovský pohled je výchozí pohodlí, ne klec.**
 
-- Pro **každodenní běžný tok** (a pro laika) je `user://` Domov + file picker pohodlný default: uživatel nemusí řešit volumes ani UUID, prostě „Dokumenty", „Stažené".
-- **Pokročilý uživatel ale na `user://` zamčený není** - přes správce souborů/shell se dostane na `storage://`, konkrétní `vol://`, jiné disky a skladá si vlastní strukturu. `user://` je jen jeden (výchozí) pohled, ne hranice toho, co uživatel smí.
+- Pro **každodenní běžný tok** (a pro laika) je domovský pohled + file picker pohodlný default: uživatel nemusí řešit volumes ani UUID, prostě „Dokumenty", „Stažené".
+- **Pokročilý uživatel ale na domovský pohled zamčený není** - přes správce souborů/shell se dostane na `storage://`, konkrétní `vol://`, jiné disky a skladá si vlastní strukturu. Domovský pohled je jen jeden (výchozí) pohled, ne hranice toho, co uživatel smí.
 - Když je víc zařízení se stejným petname, UI je odliší doplňujícími údaji (self-label, kapacita, připojení, krátký prefix UUID).
 
-Shrnuto: **omezuje se aplikace, ne uživatel.** Model zůstává přísný vůči aplikacím (autorita v capability, identita v UUID), ale uživatel, přes důvěryhodné nástroje, má plnou Windows-like kontrolu nad svými disky. Ergonomii laikovi dodává `user://` + picker jako default, ne jako klec. Detailní návrh těchto operací patří do pozdější fáze - tady je zafixovaný směr, ne API.
+Shrnuto: **omezuje se aplikace, ne uživatel.** Model zůstává přísný vůči aplikacím (autorita v capability, identita v UUID), ale uživatel, přes důvěryhodné nástroje, má plnou Windows-like kontrolu nad svými disky. Ergonomii laikovi dodává domovský pohled + picker jako default, ne jako klec. Detailní návrh těchto operací patří do pozdější fáze - tady je zafixovaný směr, ne API.
 
 ---
 
@@ -1297,26 +1288,16 @@ Shrnuto: **omezuje se aplikace, ne uživatel.** Model zůstává přísný vůč
 
 Storage model je rozhodnutý, ale nativní filesystem ještě není detailně navržen.
 
-#### Podporované kompatibilní FS později
+#### Podporované kompatibilní FS
 
-- ext4,
-- NTFS,
+- FAT12/16/32,
 - exFAT,
-- FAT32,
 - ISO9660,
 - UDF.
 
-Tyto filesystémy jsou backendy za jednotným Volume API.
+Tyto filesystémy jsou backendy za jednotným Volume API; další lze přidávat stejnou cestou podle potřeby.
 
-#### Nativní FS později
-
-Pracovní názvy:
-
-```text
-ModernFS
-LiberFS
-NovaFS
-```
+#### Nativní FS - LiberFS
 
 Možné vlastnosti:
 

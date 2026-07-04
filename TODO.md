@@ -784,14 +784,14 @@ wrap flag. Each sub-step must build and keep the test harness green (66 [ok]).
 
 ## M48 - FAT / exFAT filesystem backend (read foreign removable media)
 
-LiberFS (M43) is our own system filesystem. For interop the Volume API also needs to read foreign media - USB flash drives, SD cards, install images - which in practice are formatted with the ubiquitous FAT family. Per the layering principle a FAT backend sits behind the same `Storage.Volume` API as just another FS backend (a `driver.fs.fat` service), read-first; this is the concept's compatible-FS direction (ext4 / NTFS / exFAT / FAT32 / ISO9660 / UDF as backends behind one Volume API).
+LiberFS (M43) is our own system filesystem. For interop the Volume API also needs to read foreign media - USB flash drives, SD cards, install images - which in practice are formatted with the ubiquitous FAT family. Per the layering principle a FAT backend sits behind the same `Storage.Volume` API as just another FS backend (a `driver.fs.fat` service), read-first; this is the concept's compatible-FS direction (FAT / exFAT / ISO9660 / UDF as backends behind one Volume API).
 
 - [x] A FAT backend behind `Storage.Volume`: parse the boot sector / BPB and auto-detect FAT12 / FAT16 / FAT32 and exFAT, walk the FAT cluster chain, and read the root and subdirectories (including VFAT long file names).
 - [x] Mount a FAT-formatted block device as a `vol://` volume and read it: `ls` a directory and `cat` a file off a real flash-drive / SD-card image through the existing typed Storage interface, no new app-facing API.
 - [x] Host-testable like `liberfs`: a FAT backend driven through the same `BlockDevice` trait against image fixtures (one per FAT12 / 16 / 32 / exFAT), plus a live read of a FAT-formatted virtio-blk image in QEMU.
 - [x] Write support (create / write / delete + cluster allocation) for FAT12 / 16 / 32 (allocate and free cluster chains, write every FAT copy, create and clear directory entries including VFAT long names); exFAT stays read-only. The shell `write`/`rm` route through `vol://media`.
 - Done when: a FAT12 / 16 / 32 and exFAT volume mounts behind the Volume API and the shell lists and reads files off it (e.g. a USB image), tests green - foreign removable media is readable through the same typed `Storage.Volume` as LiberFS.
-- Concept: Native filesystem (the supported-compatible-FS backends - ext4 / NTFS / exFAT / FAT32 / ISO9660 / UDF - behind the unified Volume API), the layering principle (multiple FS backends behind one Volume API; a `driver.fs.*` service), Storage model, M43 (LiberFS and the `BlockDevice` trait this reuses).
+- Concept: Native filesystem (the supported-compatible-FS backends - FAT / exFAT / ISO9660 / UDF - behind the unified Volume API), the layering principle (multiple FS backends behind one Volume API; a `driver.fs.*` service), Storage model, M43 (LiberFS and the `BlockDevice` trait this reuses).
 
 ## M49 - LiberFS: directories and capacity scaling
 
@@ -1946,6 +1946,31 @@ gap in M102's own out-of-pool gate plus two walk nits.
 - Done when: a forged raw extent whose length outruns its stored span reads as damage instead of foreign bytes, a fanning hostile tree cannot balloon the mount's work list (the marked set bounds it, test-pinned on the duplicate-push count or equivalent), the strict-rename decision is recorded, and the suite stays green with a test per finding.
   - Result: all hold - liberfs 99 host tests (2 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: M102-B4 (the gate this pass completes), the hostile-media rule (bound every on-medium value before use), the listing contract vs. the strict-verb trade-off.
+
+## M104 - Architecture sweep: memory protection, the display path, and the plumbing debt
+
+A full-tree review (kernel, services, drivers, tools, the shared crates) collected
+what has no milestone yet. The findings that already have one stay where they are
+and are NOT duplicated here - all still open: kernel magic bounds retired (M66),
+config-backed policies (M67), the framebuffer realloc on resize (M68), demand-paged
+stacks (M69), the on-disk journal (M70), streaming replies (M71), and contiguous
+DMA / device-sized rings / TCP window scaling (M72).
+
+- [ ] W^X: enable EFER.NXE and carry a no-execute flag through the page tables; the ELF loader maps data/stack/heap non-executable and code non-writable, the kernel higher half likewise; a kernel test proves a ring-3 jump into stack data faults (and kills only that process).
+- [ ] A first-class periodic wake: the cooperative boot driver treats any perpetually re-armed deadline as "not idle", so periodic work keeps being routed through whatever already polls (the caret blink rides the gpu driver's resize poll today). Give the kernel a periodic timer wake the boot driver tolerates (or teach `run_until_idle` to settle when only periodic waiters remain), so a service can tick without hanging the boot path or the tests.
+- [ ] driver.virtio-gpu: replace the ~200 ms `GET_DISPLAY_INFO` poll with the device's configuration-change interrupt (an MSI-X vector like the other virtio drivers); the caret blink moves onto the periodic wake above.
+- [ ] Dirty-rectangle present: the renderer already knows which cells it repainted - track the changed bounding box per flush, carry it in FLUSH, and have the gpu driver transfer + flush only that rectangle instead of the whole frame (the console-lag and mouse-selection-lag notes).
+- [ ] The serial mirror drains bounded: the foreground VT's serial tap is written through the byte-at-a-time THRE poll after each present and can stall the console loop for most of a second after a burst - cap the per-wake drain and carry the remainder over to later wakes (it is a debug mirror; late is fine, stalled input is not).
+- [ ] A typed bootstrap handshake: the ad-hoc tagged-capability protocol (`b"STORAGE"`, `b"NET"`, ... received positionally at startup) means every new service touches ServiceManager, ConsoleService, the shell, and the tests in step. Replace it with one generated record of named handle fields (or a service-directory channel), so adding a service is one manifest entry plus its own code.
+- [ ] driver.xhci parses HID report descriptors instead of assuming the boot protocol - non-boot keyboards, USB pointing devices, and the Consumer-page keys (the media/volume block `keys.rs` already reserves) become reachable.
+- [ ] DHCP lease renewal: the one-shot bind holds its address forever; honor T1/T2 (re-REQUEST before expiry, fall back to rebind/discover), so a long-running box survives its lease.
+- [ ] A real wait-for-exit: exec's foreground wait relies on the child's final "done" send because an exited process is briefly a zombie whose channels stay open - give the Process object a waitable exited state (`wait` on a Process handle) and retire the convention.
+- [ ] The mmap VA bump allocators (the kernel window and the per-process user window) never reuse released ranges, so a long-lived process that maps and unmaps forever walks off its span - track freed ranges and reuse them.
+- [ ] Source layout: kernel/main.rs (~4.4k lines) splits its boot scenarios and test suite into modules; the line discipline + Tab completion move out of console_service.rs into the term crate next to the Screen they drive; xhci.rs splits controller / HID / mass-storage concerns.
+- [ ] Manifests distinguish requested from granted: the M38 manifest records only the granted set - carry the component's requested capabilities too, PermissionManager grants the (audited) intersection, and the M42 package format then ships the requested set on disk.
+- [ ] A docs-and-dead-code sweep: stale module docs (wasm/src/lib.rs still claims floats are a later step), leftover dead code, and the fmt drift at HEAD.
+- Done when: NX is enforced and test-pinned, the display presents rectangles and resizes by interrupt, periodic work has a first-class home, the bootstrap handshake is typed, and the remaining boxes each land with a test (or a measurement where one applies) - suite green.
+- Concept: the security model (W^X belongs under "safe hardware access"), M44/M47 (the display path this completes), M38/M42 (the manifest split), M21 (the boot chain whose handshake gets typed), M66-M72 (the review findings already tracked there).
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
