@@ -13,6 +13,13 @@
 //! File Entry is read in turn. Data lives inline in the File Entry (embedded) or in short
 //! / long allocation extents. Names are OSTA compressed Unicode (8-bit Latin-1 or 16-bit
 //! UCS-2). All addresses are partition-relative, resolved against the partition start.
+//!
+//! The media is untrusted: every block address, length, and extent is bounded by the
+//! partition's own length (whose last block is verified to exist on the device at
+//! mount) before a buffer is allocated, descriptor tag checksums are verified, and an
+//! unrecorded (sparse) extent reads as zeros, never as stale disk content. The UDF
+//! 2.50+ metadata partition (Blu-ray) is not interpreted - such a volume refuses to
+//! mount rather than misread.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -71,10 +78,12 @@ pub struct FileInfo {
 	pub is_dir: bool,
 }
 
-// The partition's start LBA plus the root directory ICB block (partition-relative);
-// every read derives from these, so mounting is just locating one File Set Descriptor.
+// The partition's start LBA and length in blocks (bounding every partition-relative
+// address and extent), plus the root directory ICB block (partition-relative); every
+// read derives from these, so mounting is just locating one File Set Descriptor.
 struct Geometry {
 	part_start: u32,
+	part_len: u32,
 	root_icb: u32,
 }
 
@@ -96,32 +105,48 @@ impl<D: BlockDevice> Udf<D> {
 	// the layout cannot be followed.
 	pub fn mount(mut dev: D) -> Option<Udf<D>> {
 		let mut block = [0u8; SECTOR_SIZE];
-		if !dev.read_block(AVDP_LBA, &mut block) || le16(&block[0..2]) != TAG_AVDP {
+		if !dev.read_block(AVDP_LBA, &mut block) || le16(&block[0..2]) != TAG_AVDP || !tag_ok(&block) {
 			return None;
 		}
 		let vds_len = le32(&block[16..20]);
 		let vds_loc = le32(&block[20..24]);
-		let mut part_start: Option<u32> = None;
+		let mut part: Option<(u32, u32)> = None;
 		let mut fileset_lb: Option<u32> = None;
-		let count = (vds_len as usize / SECTOR_SIZE).max(1);
+		// the sequence length is the medium's claim - a real MVDS is a handful of
+		// descriptors, so the scan is clamped rather than driven megablocks far.
+		let count = (vds_len as usize / SECTOR_SIZE).clamp(1, 64);
 		for i in 0..count as u64 {
 			if !dev.read_block(vds_loc as u64 + i, &mut block) {
 				return None;
 			}
+			if !tag_ok(&block) {
+				continue;
+			}
 			match le16(&block[0..2]) {
-				TAG_PARTITION => part_start = Some(le32(&block[188..192])),
+				TAG_PARTITION => part = Some((le32(&block[188..192]), le32(&block[192..196]))),
 				TAG_LOGICAL_VOLUME => fileset_lb = Some(le32(&block[252..256])),
 				TAG_TERMINATING => break,
 				_ => {}
 			}
 		}
-		let part_start = part_start?;
+		let (part_start, part_len) = part?;
 		let fileset_lb = fileset_lb?;
-		if !dev.read_block(part_start as u64 + fileset_lb as u64, &mut block) || le16(&block[0..2]) != TAG_FILE_SET {
+		// the partition length bounds every partition-relative address; a zero length or
+		// a File Set outside it cannot form a volume, and the partition's last block must
+		// exist on the device - or a forged or truncated image mounts and only fails, or
+		// allocates without bound, inside a later read (the real media size then bounds
+		// every extent).
+		if part_len == 0 || fileset_lb >= part_len {
+			return None;
+		}
+		if !dev.read_block(part_start as u64 + part_len as u64 - 1, &mut block) {
+			return None;
+		}
+		if !dev.read_block(part_start as u64 + fileset_lb as u64, &mut block) || le16(&block[0..2]) != TAG_FILE_SET || !tag_ok(&block) {
 			return None;
 		}
 		let root_icb = le32(&block[404..408]);
-		Some(Udf { dev, geo: Geometry { part_start, root_icb } })
+		Some(Udf { dev, geo: Geometry { part_start, part_len, root_icb } })
 	}
 
 	// List the volume's root directory.
@@ -161,13 +186,14 @@ impl<D: BlockDevice> Udf<D> {
 	}
 
 	// Scan a directory for a File Identifier matching `name` (case-insensitively),
-	// returning its ICB block and whether it is a directory.
+	// returning its ICB block and whether it is a directory. The parent entry matches
+	// the name "..", so paths through it resolve as on the other backends.
 	fn find_entry(&mut self, dir_icb: u32, name: &[u8]) -> Result<(u32, bool), FsError> {
 		let data = self.read_icb(dir_icb)?;
 		let mut off = 0usize;
 		while off + 38 <= data.len() {
 			let fid = &data[off..];
-			if le16(&fid[0..2]) != TAG_FILE_ID {
+			if le16(&fid[0..2]) != TAG_FILE_ID || !tag_ok(fid) {
 				break;
 			}
 			let l_iu = le16(&fid[36..38]) as usize;
@@ -180,8 +206,9 @@ impl<D: BlockDevice> Udf<D> {
 			let parent = chars & 0x08 != 0;
 			let deleted = chars & 0x04 != 0;
 			let is_dir = chars & 0x02 != 0;
-			let id = &fid[38 + l_iu..38 + l_iu + l_fi];
-			if !parent && !deleted && eq_ci(&decode_name(id), name) {
+			let id = decode_name(&fid[38 + l_iu..38 + l_iu + l_fi]);
+			let hit = if parent { name == b".." } else { !deleted && !id.is_empty() && eq_ci(&id, name) };
+			if hit {
 				return Ok((le32(&fid[24..28]), is_dir));
 			}
 			off += (total + 3) & !3;
@@ -189,14 +216,16 @@ impl<D: BlockDevice> Udf<D> {
 		Err(FsError::NotFound)
 	}
 
-	// Read every File Identifier in a directory into FileInfos, skipping the parent entry.
+	// Read every File Identifier in a directory into FileInfos, skipping the parent
+	// entry, deleted records, and empty names. The size column comes from the child's
+	// File Entry HEADER - a listing never pulls file contents through the device.
 	fn read_dir(&mut self, dir_icb: u32) -> Result<Vec<FileInfo>, FsError> {
 		let data = self.read_icb(dir_icb)?;
 		let mut out = Vec::new();
 		let mut off = 0usize;
 		while off + 38 <= data.len() {
 			let fid = &data[off..];
-			if le16(&fid[0..2]) != TAG_FILE_ID {
+			if le16(&fid[0..2]) != TAG_FILE_ID || !tag_ok(fid) {
 				break;
 			}
 			let l_iu = le16(&fid[36..38]) as usize;
@@ -209,20 +238,50 @@ impl<D: BlockDevice> Udf<D> {
 			if chars & 0x08 == 0 && chars & 0x04 == 0 {
 				let is_dir = chars & 0x02 != 0;
 				let id = decode_name(&fid[38 + l_iu..38 + l_iu + l_fi]);
-				let size = if is_dir { 0 } else { self.read_icb(le32(&fid[24..28])).map(|d| d.len()).unwrap_or(0) as u64 };
-				out.push(FileInfo { name: id, size, is_dir });
+				let size = if is_dir { 0 } else { self.icb_size(le32(&fid[24..28])).unwrap_or(0) };
+				if !id.is_empty() {
+					out.push(FileInfo { name: id, size, is_dir });
+				}
 			}
 			off += (total + 3) & !3;
 		}
 		Ok(out)
 	}
 
-	// Read a File Entry's data: inline (embedded) bytes, or one short / long allocation
-	// extent followed to its end. The information length caps the read.
-	fn read_icb(&mut self, lb: u32) -> Result<Vec<u8>, FsError> {
+	// The information length recorded in a File Entry's header - the size a listing
+	// reports, read from the one header block instead of the whole content.
+	fn icb_size(&mut self, lb: u32) -> Result<u64, FsError> {
+		if lb >= self.geo.part_len {
+			return Err(FsError::Invalid);
+		}
 		let mut block = [0u8; SECTOR_SIZE];
 		if !self.dev.read_block(self.geo.part_start as u64 + lb as u64, &mut block) {
 			return Err(FsError::Io);
+		}
+		if !tag_ok(&block) {
+			return Err(FsError::Invalid);
+		}
+		match le16(&block[0..2]) {
+			TAG_FILE_ENTRY | TAG_EXT_FILE_ENTRY => Ok(le64(&block[56..64])),
+			_ => Err(FsError::Invalid),
+		}
+	}
+
+	// Read a File Entry's data: inline (embedded) bytes, or short / long allocation
+	// extents followed to the information length. Every value comes off the medium, so
+	// the ICB block, the information length, the descriptor region, and every extent
+	// are bounded by the partition before a buffer is allocated or a block read; an
+	// unrecorded (sparse) extent reads as zeros, never as stale disk content.
+	fn read_icb(&mut self, lb: u32) -> Result<Vec<u8>, FsError> {
+		if lb >= self.geo.part_len {
+			return Err(FsError::Invalid);
+		}
+		let mut block = [0u8; SECTOR_SIZE];
+		if !self.dev.read_block(self.geo.part_start as u64 + lb as u64, &mut block) {
+			return Err(FsError::Io);
+		}
+		if !tag_ok(&block) {
+			return Err(FsError::Invalid);
 		}
 		let tag = le16(&block[0..2]);
 		let (header, l_ea_off, l_ad_off) = match tag {
@@ -243,16 +302,45 @@ impl<D: BlockDevice> Udf<D> {
 			let end = (ad_off + info_len).min(block.len());
 			return Ok(block[ad_off..end].to_vec());
 		}
-		// short_ad (8 bytes) or long_ad (16 bytes) extents, read to the info length.
+		// the information length is the medium's claim - it cannot exceed what the
+		// partition could hold, so a forged length never allocates without bound.
+		if info_len as u64 > self.geo.part_len as u64 * SECTOR_SIZE as u64 {
+			return Err(FsError::Invalid);
+		}
+		// short_ad (8 bytes) or long_ad (16 bytes) extents, read to the info length; the
+		// descriptor region is clamped to the File Entry block it lives in.
 		let step = if alloc == 1 { 16 } else { 8 };
+		let ad_end = (ad_off + l_ad).min(block.len());
 		let mut out = vec![0u8; info_len];
 		let mut done = 0usize;
 		let mut ad = ad_off;
-		while done < info_len && ad + step <= ad_off + l_ad {
-			let len = (le32(&block[ad..ad + 4]) & 0x3fff_ffff) as usize;
+		while done < info_len && ad + step <= ad_end {
+			let raw = le32(&block[ad..ad + 4]);
+			let len = (raw & 0x3fff_ffff) as usize;
+			let ext_type = raw >> 30;
 			let lba = le32(&block[ad + 4..ad + 8]);
+			// a zero-length extent terminates the sequence; a type-3 entry chains to
+			// further descriptors - not followed, refused rather than read as data.
+			if len == 0 {
+				break;
+			}
+			if ext_type == 3 {
+				return Err(FsError::Invalid);
+			}
+			let take = len.min(info_len - done);
+			if ext_type != 0 {
+				// an unrecorded extent (allocated or not) has no written data - it
+				// reads as zeros, never as whatever the disk blocks hold.
+				done += take;
+				ad += step;
+				continue;
+			}
+			// the extent must lie inside the partition, or it would read foreign blocks.
+			if lba as u64 + (take as u64).div_ceil(SECTOR_SIZE as u64) > self.geo.part_len as u64 {
+				return Err(FsError::Invalid);
+			}
 			let mut cur = self.geo.part_start as u64 + lba as u64;
-			let mut left = len.min(info_len - done);
+			let mut left = take;
 			while left > 0 {
 				if !self.dev.read_block(cur, &mut block) {
 					return Err(FsError::Io);
@@ -267,6 +355,18 @@ impl<D: BlockDevice> Udf<D> {
 		}
 		Ok(out)
 	}
+}
+
+// Verify a descriptor tag: byte 4 is the checksum of the other fifteen tag bytes,
+// mandatory in the format - a garbage block must not parse as a descriptor.
+fn tag_ok(block: &[u8]) -> bool {
+	let mut sum = 0u8;
+	for (i, &b) in block[..16].iter().enumerate() {
+		if i != 4 {
+			sum = sum.wrapping_add(b);
+		}
+	}
+	sum == block[4]
 }
 
 // Decode a UDF d-string file identifier: the first byte is the compression id (8 =

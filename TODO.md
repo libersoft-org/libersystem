@@ -1842,6 +1842,29 @@ content, and two recording/noise items.
   - Result: all hold - iso9660 14 host tests (3 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: M97-B1 (the XAR rule completed at the root), M96-B5/M97 (the listing-contract and refuse-or-serve-right rules on the remaining record classes).
 
+## M99 - UDF: first-pass audit (no hostile-media bounds at all)
+
+The first full audit pass over the UDF backend (2026-07-04, lib.rs 318 lines),
+with the discipline of the FAT and ISO9660 tracks: the crate reads foreign
+DVD/Blu-ray media and carried none of the bounds the sibling backends earned -
+the same finding classes recur, plus two of its own.
+
+- [x] (B1, high) The File Entry's allocation-descriptors length (`l_ad`, u32 off the medium) is never bounded against the block: the scan condition `ad + step <= ad_off + l_ad` walks `ad` past 2048 and `block[ad..ad + 4]` panics - a forged File Entry panics the storage service on a read or listing. Clamp the region to the block end.
+  - Result: the descriptor region clamps to the File Entry block (`ad_end = (ad_off + l_ad).min(block.len())`). Test `a_forged_allocation_length_does_not_panic`.
+- [x] (B2, medium) `read_icb` allocates `vec![0u8; info_len]` where `info_len` is a u64 off the medium, before any read and with no bound at all - and extents are never bounded either: the partition LENGTH is not even parsed, nothing is probed at mount, so forged extents read foreign device blocks (the FAT M90-B1 class) and a forged length aborts the service (the M93/M96-B2 class). Fix: parse the Partition Length (Partition Descriptor offset 192), refuse a zero length or a File Set past it at mount, probe the partition's last block (the M93 pattern), and gate the ICB block, the information length (against the partition's byte capacity), and every extent before allocating or reading.
+  - Result: `Geometry.part_len` off the Partition Descriptor; mount refuses a zero length or a File Set past it and probes the partition's last block; `read_icb` gates the ICB block, the information length against the partition's byte capacity (before the allocation), and every recorded extent against the partition. Test `forged_lengths_do_not_allocate_or_read_foreign_blocks` (forged u64 length, an extent past the partition, a partition past the device).
+- [x] (B3, medium) `read_dir` reports each file's size by READING ITS WHOLE CONTENT (`read_icb(..).map(|d| d.len())`) - a directory listing pulls the sum of all file sizes through the device, gigabytes for one DVD movie folder. Read the size from the File Entry's header block (`icb_size`) instead.
+  - Result: new `icb_size` reads the one header block (bounded, checksummed) and the listing reports its information length. Test `a_listing_reads_headers_not_file_contents` (a root listing costs at most three block reads and still reports the right size).
+- [x] (B4, low-medium) The allocation-extent type (the length's top two bits) is masked away: an unrecorded extent (type 1/2 - sparse, written by real UDF drivers) serves whatever the disk holds instead of zeros - the FAT M94 stale-data-disclosure class - and a type-3 entry (a chain to further descriptors) is read as file data. Types 1/2 read as zeros, type 3 refuses, a zero-length extent terminates.
+  - Result: all three implemented in the extent walk. Test `an_unrecorded_extent_reads_as_zeros_and_a_chain_ad_refuses` (a sparse extent pointed at stale bytes reads back as zeros; a chain descriptor refuses).
+- [x] (B5, low) Descriptor tag checksums (byte 4 over the 16-byte tag, mandatory in the format) are never verified - any block starting with a plausible tag id parses as a descriptor, File Entry, or File Identifier. Verify the tag checksum everywhere one is read.
+  - Result: new `tag_ok` verified at the AVDP, every VDS descriptor, the File Set, every File Entry (both readers), and every File Identifier; the test image builder stamps checksums like a real formatter. Test `an_unchecksummed_descriptor_is_not_trusted`.
+- [x] (B6, cosmetic) Four nits: (a) the VDS scan trusts `vds_len` for up to two million blocks - clamp to a sane descriptor count; (b) an empty-named File Identifier lists and matches an empty lookup (the M91-B5 class) - skip empty names; (c) `".."` does not resolve (the parent FID is skipped) while FAT and ISO9660 resolve it - match the parent FID by that name; (d) the UDF 2.50+ metadata partition (Blu-ray) is unsupported and refuses only by accident of the tag check - record the limit in the module doc.
+  - Result: the scan clamps to 64 descriptors, empty names skip in listings and lookups, the parent FID matches "..", and the metadata-partition limit is recorded in the module doc. Test `listing_contract_and_dot_dot` (a planted empty-named FID never surfaces, "SUB/" is NotFound, "SUB/.." lists the root).
+- Done when: a forged allocation length errors cleanly instead of panicking, a forged information length or extent refuses before allocating or reading foreign blocks and an oversized partition claim refuses at mount, a listing costs header reads only, an unrecorded extent reads as zeros and a chain descriptor refuses, an unchecksummed descriptor is not trusted, the listing contract holds and "SUB/.." lists the root, and the suite stays green with a test per finding.
+  - Result: all hold - udf 9 host tests (6 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
+- Concept: the hostile-media rule (M87/M93-B1/M96-B1/B2: bound every on-medium value before use; the medium bounds itself), the FAT M94 VDL rule (unwritten ranges are zeros, never stale disk content), the uniform Volume API contract (M96-B5).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
