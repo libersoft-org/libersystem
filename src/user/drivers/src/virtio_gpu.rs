@@ -206,14 +206,16 @@ impl Gpu {
 		}
 	}
 
-	// Present the whole framebuffer: copy the guest backing to the host resource, then
-	// flush that rectangle to the display.
-	unsafe fn present(&self, w: u32, h: u32) -> bool {
+	// Present a rectangle of the framebuffer: copy those guest-backing pixels to the
+	// host resource, then flush that rectangle to the display. `stride` is the
+	// resource's pixel width (the backing was allocated at the max geometry), which
+	// fixes the byte offset of the rectangle's first pixel in the backing.
+	unsafe fn present(&self, x: u32, y: u32, w: u32, h: u32, stride: u32) -> bool {
 		unsafe {
 			// TRANSFER_TO_HOST_2D: rect, offset(u64), resource_id, padding.
 			self.hdr(CMD_TRANSFER_TO_HOST_2D);
-			self.rect(24, 0, 0, w, h);
-			wr64(self.cmd_virt + 40, 0);
+			self.rect(24, x, y, w, h);
+			wr64(self.cmd_virt + 40, (y as u64 * stride as u64 + x as u64) * 4);
 			wr32(self.cmd_virt + 48, RESOURCE_ID);
 			wr32(self.cmd_virt + 52, 0);
 			if self.submit(56, HDR_LEN as u32) != Some(RESP_OK_NODATA) {
@@ -221,7 +223,7 @@ impl Gpu {
 			}
 			// RESOURCE_FLUSH: rect, resource_id, padding.
 			self.hdr(CMD_RESOURCE_FLUSH);
-			self.rect(24, 0, 0, w, h);
+			self.rect(24, x, y, w, h);
 			wr32(self.cmd_virt + 40, RESOURCE_ID);
 			wr32(self.cmd_virt + 44, 0);
 			self.submit(48, HDR_LEN as u32) == Some(RESP_OK_NODATA)
@@ -356,7 +358,7 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u
 	unsafe {
 		let mut cur_w: u32 = init_w;
 		let mut cur_h: u32 = init_h;
-		let mut req: [u8; 16] = [0u8; 16];
+		let mut req: [u8; 32] = [0u8; 32];
 		loop {
 			// wake on a service request or on a display change. The interrupt path blocks
 			// with no deadline; the poll fallback is a housekeeping wake (WAIT_PERIODIC), so
@@ -393,11 +395,12 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u
 				continue;
 			}
 			// A message woke us: drain every queued request, coalescing FLUSHes so a backlog
-			// of deferred presents collapses into a single present of the latest backing.
-			// The console always renders the newest frame into the shared backing, so older
-			// queued FLUSHes are redundant; presenting once keeps the display from falling
-			// behind by N stale frames when a slow display client makes each present costly.
-			let mut need_present = false;
+			// of deferred presents collapses into a single present. Each FLUSH carries the
+			// rectangle the console repainted; the queued rectangles are united into one
+			// bounding box, so a backlog still moves only the changed region of the newest
+			// frame (the console always renders into the shared backing). A bare FLUSH (no
+			// rectangle) presents the whole display.
+			let mut flush_rect: Option<(u32, u32, u32, u32)> = None;
 			loop {
 				match try_recv(service, &mut req) {
 					Polled::Message { len, .. } => {
@@ -418,16 +421,42 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u
 							reply[fb_len + 4..fb_len + 8].copy_from_slice(&cur_h.to_le_bytes());
 							send_blocking(service, &reply[..fb_len + 8], dup as u64);
 						} else if m.starts_with(b"FLUSH") {
-							need_present = true;
+							let r = if m.len() >= 21 { (rd32_le(m, 5), rd32_le(m, 9), rd32_le(m, 13), rd32_le(m, 17)) } else { (0, 0, cur_w, cur_h) };
+							flush_rect = Some(match flush_rect {
+								Some(u) => union_rect(u, r),
+								None => r,
+							});
 						}
 					}
 					Polled::Empty => break,
 					Polled::Closed => exit(),
 				}
 			}
-			if need_present {
-				gpu.present(cur_w, cur_h);
+			if let Some((x, y, w, h)) = flush_rect {
+				// Clamp to the visible scanout: pixels past it need no transfer, and the
+				// transfer must stay inside the resource.
+				let x = x.min(cur_w);
+				let y = y.min(cur_h);
+				let w = w.min(cur_w - x);
+				let h = h.min(cur_h - y);
+				if w > 0 && h > 0 {
+					gpu.present(x, y, w, h, max_w);
+				}
 			}
 		}
 	}
+}
+
+// Read a little-endian u32 at `at` in `m`.
+fn rd32_le(m: &[u8], at: usize) -> u32 {
+	u32::from_le_bytes([m[at], m[at + 1], m[at + 2], m[at + 3]])
+}
+
+// The bounding box of two rectangles (x, y, w, h).
+fn union_rect(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+	let x0 = a.0.min(b.0);
+	let y0 = a.1.min(b.1);
+	let x1 = (a.0 + a.2).max(b.0 + b.2);
+	let y1 = (a.1 + a.3).max(b.1 + b.3);
+	(x0, y0, x1 - x0, y1 - y0)
 }

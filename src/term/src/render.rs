@@ -207,7 +207,10 @@ impl Raster {
 // backend only states its backing and its present.
 pub trait Surface {
 	fn raster(&self) -> &Raster;
-	fn present(&self);
+	// Make the rectangle `x, y, w, h` (pixels) of this frame visible - the renderer
+	// passes the bounding box of what it painted since the last present, so a backend
+	// that copies to a host scanout (virtio-gpu) moves only the changed pixels.
+	fn present(&self, x: u32, y: u32, w: u32, h: u32);
 
 	fn width(&self) -> usize {
 		self.raster().width
@@ -241,10 +244,12 @@ pub trait Surface {
 // `dirty_take`, `take_scrolls`), resolves their logical colours to packed pixels, blits
 // them, and replays the model's recorded scrolls as bulk pixel copies. The surface is
 // swappable (`handoff`) so the display backend can change under it. It never mutates the
-// grid and holds no terminal state.
+// grid and holds no terminal state. `dirty` accumulates the pixel bounding box of
+// everything painted since the last present, so the present moves only that rectangle.
 struct FramebufferRenderer {
 	surface: Box<dyn Surface>,
 	last_caret: Option<(usize, usize)>,
+	dirty: Option<(usize, usize, usize, usize)>,
 }
 
 // The terminal (L2 + L3): the grid model and the renderer that draws it. A thin façade that
@@ -280,15 +285,25 @@ impl Term {
 	}
 
 	// Make the rendered frame visible: a no-op on the boot framebuffer, a FLUSH to the gpu
-	// driver on the virtio-gpu backing.
-	pub fn present(&self) {
-		self.renderer.surface.present();
+	// driver on the virtio-gpu backing. Only the bounding box of what was painted since the
+	// last present is pushed; with nothing painted, nothing is sent at all.
+	pub fn present(&mut self) {
+		if let Some((x0, y0, x1, y1)) = self.renderer.dirty.take() {
+			let x1 = x1.min(self.renderer.surface.width());
+			let y1 = y1.min(self.renderer.surface.height());
+			if x0 < x1 && y0 < y1 {
+				self.renderer.surface.present(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
+			}
+		}
 	}
 
-	// Hand the display over to a new backend, preserving the on-screen pixels, then present.
+	// Hand the display over to a new backend, preserving the on-screen pixels, then present
+	// the whole frame (everything on the new backing is new to its scanout).
 	pub fn handoff(&mut self, next: Box<dyn Surface>) {
 		self.renderer.handoff(next);
-		self.renderer.surface.present();
+		self.renderer.dirty = None;
+		let (w, h) = (self.renderer.surface.width() as u32, self.renderer.surface.height() as u32);
+		self.renderer.surface.present(0, 0, w, h);
 	}
 
 	// Toggle the caret's blink phase: erase the caret when it is shown, redraw it when it
@@ -300,8 +315,10 @@ impl Term {
 	}
 
 	// Flash the screen with inverted colours (the visual bell) without touching the grid.
-	pub fn draw_inverted(&self) {
+	pub fn draw_inverted(&mut self) {
 		self.renderer.draw_inverted(&self.screen);
+		let (w, h) = (self.renderer.surface.width(), self.renderer.surface.height());
+		self.renderer.mark(0, 0, w, h);
 	}
 }
 
@@ -330,7 +347,20 @@ fn track_caret(caret: Option<(usize, usize)>, scrolls: &[ScrollOp]) -> Option<(u
 
 impl FramebufferRenderer {
 	fn new(surface: Box<dyn Surface>) -> FramebufferRenderer {
-		FramebufferRenderer { surface, last_caret: None }
+		FramebufferRenderer { surface, last_caret: None, dirty: None }
+	}
+
+	// Grow the painted bounding box by the pixel rectangle [x0, x1) x [y0, y1).
+	fn mark(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+		self.dirty = Some(match self.dirty {
+			Some((dx0, dy0, dx1, dy1)) => (dx0.min(x0), dy0.min(y0), dx1.max(x1), dy1.max(y1)),
+			None => (x0, y0, x1, y1),
+		});
+	}
+
+	// Grow the painted bounding box by one cell.
+	fn mark_cell(&mut self, col: usize, row: usize) {
+		self.mark(col * CELL_W, row * CELL_H, (col + 1) * CELL_W, (row + 1) * CELL_H);
 	}
 
 	// Swap in a new display backend, copying the existing pixels into its backing (clamped to
@@ -349,9 +379,11 @@ impl FramebufferRenderer {
 
 	// Fill the whole physical framebuffer with the model's default background - used when
 	// the grid shrinks so the area now outside it is not left with stale pixels.
-	fn clear_screen(&self, screen: &Screen) {
+	fn clear_screen(&mut self, screen: &Screen) {
 		let bg = screen.default_bg();
 		self.surface.fill(self.surface.pack(bg.0, bg.1, bg.2));
+		let (w, h) = (self.surface.width(), self.surface.height());
+		self.mark(0, 0, w, h);
 	}
 
 	// Paint one cell from the grid to the framebuffer.
@@ -436,12 +468,15 @@ impl FramebufferRenderer {
 		// Move the framebuffer pixels for each grid scroll, following the old caret cell
 		// through the same shifts so its smear lands on a cell the dirty walk repaints.
 		let ghost = track_caret(self.last_caret, &scrolls);
+		let cols = screen.cols();
 		for op in &scrolls {
 			if op.down {
 				self.surface.scroll_pixels_down(op.top, op.bot, op.n);
 			} else {
 				self.surface.scroll_pixels_up(op.top, op.bot, op.n);
 			}
+			// The whole band's pixels moved, so the present must carry all of it.
+			self.mark(0, op.top * CELL_H, cols * CELL_W, (op.bot + 1) * CELL_H);
 		}
 		if let Some((c, r)) = ghost {
 			screen.set_dirty(c, r);
@@ -450,13 +485,18 @@ impl FramebufferRenderer {
 			for col in 0..screen.cols() {
 				if screen.dirty_take(col, row) {
 					self.draw_cell(screen, col, row);
+					self.mark_cell(col, row);
 				}
 			}
 		}
 		if screen.cursor_visible() && screen.cursor_col() < screen.cols() && screen.cursor_row() < screen.rows() {
 			self.draw_caret(screen, screen.cursor_col(), screen.cursor_row());
+			self.mark_cell(screen.cursor_col(), screen.cursor_row());
 			self.last_caret = Some((screen.cursor_col(), screen.cursor_row()));
 		} else {
+			if let Some((c, r)) = self.last_caret {
+				self.mark_cell(c, r);
+			}
 			self.last_caret = None;
 		}
 	}
@@ -469,6 +509,7 @@ impl FramebufferRenderer {
 				self.draw_cell_at(screen, col, row, cell);
 			}
 		}
+		self.mark(0, 0, screen.cols() * CELL_W, screen.rows() * CELL_H);
 		self.last_caret = None;
 	}
 
@@ -481,10 +522,12 @@ impl FramebufferRenderer {
 		}
 		if let Some((c, r)) = self.last_caret.take() {
 			self.draw_cell(screen, c, r);
+			self.mark_cell(c, r);
 			return true;
 		}
 		if screen.cursor_visible() && screen.cursor_col() < screen.cols() && screen.cursor_row() < screen.rows() {
 			self.draw_caret(screen, screen.cursor_col(), screen.cursor_row());
+			self.mark_cell(screen.cursor_col(), screen.cursor_row());
 			self.last_caret = Some((screen.cursor_col(), screen.cursor_row()));
 			return true;
 		}

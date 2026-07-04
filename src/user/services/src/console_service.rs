@@ -44,7 +44,7 @@ impl Surface for BootSurface {
 	fn raster(&self) -> &Raster {
 		&self.raster
 	}
-	fn present(&self) {}
+	fn present(&self, _x: u32, _y: u32, _w: u32, _h: u32) {}
 }
 
 // The virtio-gpu driver's shared backing: pixel writes land in a DMA buffer the driver
@@ -59,9 +59,17 @@ impl Surface for GpuSurface {
 	fn raster(&self) -> &Raster {
 		&self.raster
 	}
-	fn present(&self) {
+	// Queue a FLUSH carrying the changed rectangle, so the driver transfers only those
+	// pixels to the host scanout instead of the whole frame.
+	fn present(&self, x: u32, y: u32, w: u32, h: u32) {
 		unsafe {
-			send_blocking(self.gpu, b"FLUSH", 0);
+			let mut msg: [u8; 21] = [0u8; 21];
+			msg[..5].copy_from_slice(b"FLUSH");
+			msg[5..9].copy_from_slice(&x.to_le_bytes());
+			msg[9..13].copy_from_slice(&y.to_le_bytes());
+			msg[13..17].copy_from_slice(&w.to_le_bytes());
+			msg[17..21].copy_from_slice(&h.to_le_bytes());
+			send_blocking(self.gpu, &msg, 0);
 		}
 	}
 }
@@ -660,9 +668,11 @@ unsafe fn gpu_framebuffer(gpu: u64, buf: &mut [u8]) -> Option<(u64, Framebuffer,
 
 // Present the foreground VT's freshly rendered frame to the display: a no-op on the boot
 // framebuffer (whose writes are visible immediately), a FLUSH to the gpu driver on the
-// virtio-gpu backing. Driven by the surface backend the foreground VT renders onto.
-unsafe fn present_fg(console: &Console) {
-	if let Some(t) = console.vts[console.fg].term.as_ref() {
+// virtio-gpu backing carrying just the repainted rectangle. Driven by the surface backend
+// the foreground VT renders onto.
+unsafe fn present_fg(console: &mut Console) {
+	let fg: usize = console.fg;
+	if let Some(t) = console.vts[fg].term.as_mut() {
 		t.present();
 	}
 }

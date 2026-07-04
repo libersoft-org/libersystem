@@ -51,7 +51,7 @@ impl Surface for KernelSurface {
 	fn raster(&self) -> &Raster {
 		&self.raster
 	}
-	fn present(&self) {}
+	fn present(&self, _x: u32, _y: u32, _w: u32, _h: u32) {}
 }
 
 // The boot console: the shared terminal (`term::Term` - the grid model plus the

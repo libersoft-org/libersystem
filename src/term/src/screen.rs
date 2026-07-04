@@ -313,28 +313,49 @@ impl Screen {
 	// Begin a mouse selection at viewport (col, row) for the current scroll offset: anchor
 	// and end both start on the global cell the viewport position maps to.
 	pub fn selection_begin(&mut self, col: usize, row: usize) {
+		let old = self.selection;
 		let g = self.view_global_row(row);
 		let c = col.min(self.cols.saturating_sub(1));
 		self.selection = Some((g, c, g, c));
-		self.mark_all_dirty();
+		self.dirty_selection_rows(old);
 	}
 
 	// Extend the active selection's end to viewport (col, row) (a drag); a no-op with no
 	// selection in progress.
 	pub fn selection_extend(&mut self, col: usize, row: usize) {
 		if let Some((ag, ac, _, _)) = self.selection {
+			let old = self.selection;
 			let g = self.view_global_row(row);
 			let c = col.min(self.cols.saturating_sub(1));
 			self.selection = Some((ag, ac, g, c));
-			self.mark_all_dirty();
+			self.dirty_selection_rows(old);
 		}
 	}
 
 	// Clear the selection highlight; a no-op (no repaint) when nothing was selected.
 	pub fn selection_clear(&mut self) {
 		if self.selection.is_some() {
-			self.selection = None;
-			self.mark_all_dirty();
+			let old = self.selection.take();
+			self.dirty_selection_rows(old);
+		}
+	}
+
+	// Mark dirty every viewport row the old or the current selection touches, so a
+	// drag repaints only the rows whose highlight can change - not the whole grid
+	// (a full-grid repaint per pointer event is what made selection feel laggy).
+	fn dirty_selection_rows(&mut self, old: Option<(usize, usize, usize, usize)>) {
+		let base = self.view_global_row(0);
+		for sel in [old, self.selection].into_iter().flatten() {
+			let (ag, _, eg, _) = sel;
+			let (lo, hi) = (ag.min(eg), ag.max(eg));
+			for row in 0..self.rows {
+				let g = base + row;
+				if g >= lo && g <= hi {
+					for col in 0..self.cols {
+						self.dirty[row * self.cols + col] = true;
+					}
+				}
+			}
 		}
 	}
 
