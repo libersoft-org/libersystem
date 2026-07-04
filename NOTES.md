@@ -1,6 +1,5 @@
 # Bugs / changes
 
-- Numeric keyboard doesn't work (tested on Spice using VirtViewer Remote Viewer)
 - Console cursor is not blinking, it's static
 - test if ls* commands have --json
 - df, du
