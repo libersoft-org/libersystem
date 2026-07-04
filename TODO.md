@@ -1535,7 +1535,7 @@ and two nits at the edges - the audit track's remainders.
   - Result: `random_corruption_never_panics_or_hangs` - green on the first run (the M80-M85 bounds hold against randomness, not just against the reviewer's imagination), and from now on any regression in any bound fails the host suite. Two closing cosmetics landed alongside: resolve through a file answers NotDir (M76 classification), and the format-time label truncation backs off a split UTF-8 character.
 - Concept: M83-B2 (the UTF-8 rule this completes: valid encoding AND stable identity), the M78 spec's NUL-padding rule (which makes an embedded NUL an early terminator), and the track's bounding rule applied to fsck's own arithmetic. The fuzz guard is the track's closing move: reviews found the bugs, the test keeps them found.
 
-## FAT audit track (M86-M90)
+## FAT audit track (M86-M91)
 
 A full read of the fat crate (2026-07-03, lib.rs ~1030 lines + tests), the same
 treatment the LiberFS audit track gave the native filesystem. The read paths and
@@ -1666,6 +1666,25 @@ the usual spec/robustness leftovers.
 - Done when: a hostile chain or entry can never turn a cluster value into an out-of-range sector or FAT offset (a corrupt chain on an oversized device neither reads foreign bytes nor writes anywhere - test-pinned on both the read and the free path), a full chained exFAT directory grows instead of refusing, Windows-illegal name bytes are refused, degenerate root/FAT pointers do not mount, written entries carry real timestamps, and the suite stays green with a test per finding.
   - Result: all hold - fat 45 host tests (8 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: M80-B2/M81-B5 (the on-medium pointer-range rule extended to the FAT crate's last unbounded values - and here one of the walks WRITES), M87 (whose step guards this completes with value bounds), M89 (the audit round this continues), the interop purpose of the crate.
+
+## M91 - FAT: fourth-pass findings (read-side name integrity and the last layout gates)
+
+The fourth full source pass (2026-07-04, after M90 landed, lib.rs ~1600 lines)
+re-verified the M86-M90 machinery holds - the range gates on all seven walks,
+the grow paths' parent bookkeeping and checksum restamp, the exFAT timestamp
+bit layout, the DOS date packing, the allocation unwinds - and found nothing of
+high grade anymore: the last real interop gap (the parsers trust name metadata
+other systems validate), the two layout gates M90-B4 did not reach, and
+robustness/perf leftovers.
+
+- [ ] (B1, medium) Name integrity is never verified on read: `parse_fat_dir` pairs VFAT fragments with the following 8.3 entry without checking the fragment checksum (byte 13) against `lfn_checksum` or validating the sequence numbers - so ORPHAN fragments (common on real media: a non-LFN-aware tool or DOS deletes only the 8.3 record) merge with the next file's fragments into a garbage name, making that file unfindable by its long name (the 8.3 fallback still works) and littering listings. `parse_exfat_dir` likewise never verifies the entry-set checksum (the code comment admits it), so a torn set after a power cut parses as valid. The media's home systems validate both and discard what fails. Fix: check `e[13] == lfn_checksum(short)` and the sequence continuity, dropping mismatched fragments (the 8.3 name stands); verify the exFAT set checksum and skip an invalid set.
+- [ ] (B2, medium-low) Two degenerate/overlapping layouts still mount - the M90-B4 class, completed: (a) a classic BPB with `reserved_sectors == 0` puts the FAT region at sector 0, so the first `set_fat_entry` OVERWRITES THE BOOT SECTOR (the volume bricks itself; M90-B4 caught exFAT's `fat_offset == 0` but not the classic counterpart), and (b) exFAT's `fat_offset` / `fat_size` / `cluster_heap_offset` are independent fields, so the FAT can overlap the cluster heap and a FAT-slot write clobbers file data inside the volume. Fix: `bpb` refuses `reserved_sectors == 0`; `exfat` refuses `fat_offset + num_fats * fat_size > cluster_heap_offset`.
+- [ ] (B3, low) Grow links the fresh cluster into the directory chain BEFORE its on-disk content is zeroed (both families: `grow_dir`, `exfat_grow_dir` zero only the in-memory copy, which reaches the disk in the final `write_dir_bytes`) - if that final write (or the exFAT parent-record update) fails, the directory permanently carries a linked cluster of stale garbage the parser reads as entries, and a later `remove` following a garbage `first_cluster` could free foreign clusters. Only an I/O-failure window, but the consequence is persistent directory corruption. Fix: write zeros to the grow cluster before `set_fat_entry(last, grow)`.
+- [ ] (B4, low) The classic allocator reads the FAT off the device per candidate cluster: `alloc_chain`'s scan calls `next_cluster` (a 2-sector read plus a fresh Vec) for every cluster from 2 - on a fuller FAT16 volume ~130k sector reads per allocation, seconds on a slow SD/USB medium over the BOT transport. exFAT is fine (the bitmap is read once into memory). Fix: read the FAT once into memory for the scan (FAT16 <= 128 kB, FAT12 <= 6 kB), the way exFAT treats its bitmap.
+- [ ] (B5, low-cosmetic) An empty-named classic entry (an all-spaces 8.3 field with no LFN) reaches listings and `read_file(b"")` matches it - M90-B7a fixed this for exFAT only. Skip empty-named entries in `parse_fat_dir` too.
+- [ ] (B6, cosmetic) Three nits: (a) an I/O error mid-walk in `free_chain` propagates through `?` and skips the `fsinfo_adjust` for the clusters already freed (an advisory drift); (b) `set_fat_entry` always read-modify-writes 2 logical sectors though only FAT12 can straddle - FAT16/32 needlessly rewrite the neighbor sector (benign); (c) the 0x81 bitmap entry's declared byte length is ignored - the bitmap is taken at its chain's full length.
+- Done when: a directory with orphan LFN fragments lists and resolves its healthy files by their real names (test-pinned with a forged orphan set), a torn exFAT entry set is skipped instead of trusted, a zero-reserved BPB and an overlapping exFAT FAT region do not mount, a grow cluster reaches the chain only zeroed, the classic allocation scan costs one FAT read, and the suite stays green with a test per finding.
+- Concept: the interop purpose of the crate (real-world media carry orphan fragments; what Windows validates and discards, we must not trust), M90-B4 (the mount-gate class B2 completes), M87 (the hostile-media rule), M74 (the read-once-then-scan allocator pattern B4 mirrors).
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
