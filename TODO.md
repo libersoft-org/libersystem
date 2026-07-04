@@ -1535,7 +1535,7 @@ and two nits at the edges - the audit track's remainders.
   - Result: `random_corruption_never_panics_or_hangs` - green on the first run (the M80-M85 bounds hold against randomness, not just against the reviewer's imagination), and from now on any regression in any bound fails the host suite. Two closing cosmetics landed alongside: resolve through a file answers NotDir (M76 classification), and the format-time label truncation backs off a split UTF-8 character.
 - Concept: M83-B2 (the UTF-8 rule this completes: valid encoding AND stable identity), the M78 spec's NUL-padding rule (which makes an embedded NUL an early terminator), and the track's bounding rule applied to fsck's own arithmetic. The fuzz guard is the track's closing move: reviews found the bugs, the test keeps them found.
 
-## FAT audit track (M86-M91)
+## FAT audit track (M86-M92)
 
 A full read of the fat crate (2026-07-03, lib.rs ~1030 lines + tests), the same
 treatment the LiberFS audit track gave the native filesystem. The read paths and
@@ -1692,6 +1692,23 @@ robustness/perf leftovers.
 - Done when: a directory with orphan LFN fragments lists and resolves its healthy files by their real names (test-pinned with a forged orphan set), a torn exFAT entry set is skipped instead of trusted, a zero-reserved BPB and an overlapping exFAT FAT region do not mount, a grow cluster reaches the chain only zeroed, the classic allocation scan costs one FAT read, and the suite stays green with a test per finding.
   - Result: all hold - fat 51 host tests (6 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: the interop purpose of the crate (real-world media carry orphan fragments; what Windows validates and discards, we must not trust), M90-B4 (the mount-gate class B2 completes), M87 (the hostile-media rule), M74 (the read-once-then-scan allocator pattern B4 mirrors).
+
+## M92 - FAT: fifth-pass findings (write-side interop and the last mount nits)
+
+The fifth full source pass (2026-07-04, after M91 landed, lib.rs ~1710 lines)
+re-verified the whole M86-M91 machinery holds - the LFN run validation, the
+exFAT set-checksum gate, the zero-before-link grow ordering, the one-image
+allocation scan, the range gates on every walk - and found only write-side
+interop gaps and mount symmetry nits: nothing left that corrupts or leaks,
+but two ways a file we write comes out wrong for its consumers.
+
+- [ ] (B1, medium) The exFAT NameHash is computed over the name as written, but the specification (7.6.2) defines it over the UP-CASED file name - and Windows' driver uses the stored hash as a lookup shortcut, skipping any entry set whose hash mismatches its own up-cased computation. So a file we write with any lowercase letter lists fine in Explorer but FAILS TO OPEN BY NAME on Windows - the crate's core interchange job broken for most real names. Fix: hash the up-cased UTF-16 units in `build_exfat_set` (ASCII upcasing; non-ASCII units pass through, matching a driver without an upcase table).
+- [ ] (B2, low-medium) A name that is not valid UTF-8 (e.g. a latin-1 0xE9 byte) passes `write_file`'s byte gate but `from_utf8_lossy` stores it as U+FFFD - so the lookup by the very bytes the file was created with matches NEITHER the long name (U+FFFD re-encodes differently) NOR the 8.3 form (which kept the raw byte): the write succeeds and the file is unreachable by its own name, silently. Fix: refuse a non-UTF-8 name in `write_file` (`Invalid`), keeping the read side lossy for foreign media.
+- [ ] (B3, low) The FAT12 FAT slot read-modify-write always touches two logical sectors even when the entry does not straddle (`byte_off % bps < bps - 1`) - when the slot lies in the FAT's last sector, the RMW needlessly rewrites the sector PAST the FAT (the next copy's first sector, or the root region's): identical content, but a torn-write window on a region the operation never meant to touch, and a spurious `Io` on a tightly sized device. Fix: two sectors only when the entry actually straddles.
+- [ ] (B4, low) A classic BPB with `root_entries == 0` (and the 16-bit FAT size set, so the FAT32 shape rule does not reclassify it) mounts with a zero-sector root region - listings are empty and every root write returns `NoSpace`. Harmless, but every other degenerate layout is refused at mount; refuse this one too.
+- [ ] (B5, cosmetic) Two mount symmetry nits: (a) `root_cluster`'s upper bound is never checked at mount (only `< 2` is) - a forged root above the heap fails only at the first read, cleanly, but the other geometry fields are gated at mount; (b) the FSInfo "next free cluster" hint (offset 492) is never maintained while the free count is - a stale hint is spec-tolerated advisory data, but writing the sentinel (or the scan position) keeps the sector truthful.
+- Done when: a lowercase-named file we write carries the up-cased NameHash (test-pinned against an independent up-cased-hash computation), a non-UTF-8 name is refused instead of stored unreachable, the FAT12 RMW touches only the sectors the slot occupies, the degenerate zero-root layout does not mount, and the suite stays green with a test per finding.
+- Concept: the interop purpose of the crate (what Windows computes on lookup, we must store; a write that succeeds must be readable back by the same name), M90-B4/M91-B2 (the mount-gate class B4/B5a completes), M91-B6b (whose sector-count fix B3 finishes for FAT12).
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
