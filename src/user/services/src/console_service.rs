@@ -577,6 +577,9 @@ struct Console {
 	clipboard: Vec<u8>,
 	// The pointer button bits from the previous event, to detect press / release edges.
 	ptr_buttons: u8,
+	// The caret blink divider: counts the gpu driver's ~200 ms TICKs, toggling the
+	// foreground caret's phase every second one (~400 ms per phase, the classic rate).
+	blink: u8,
 	// The Tab-completion vocabulary: the shell builtins plus the system volume's bin/
 	// listing (bash's builtins + $PATH), fetched lazily on the first Tab through a fresh
 	// storage connection and cached for the session (None until then; an unreachable
@@ -738,7 +741,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, pointer, clipboard: Vec::new(), ptr_buttons: 0, vocab: None };
+		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, pointer, clipboard: Vec::new(), ptr_buttons: 0, blink: 0, vocab: None };
 		run(&mut console);
 	}
 }
@@ -1309,7 +1312,8 @@ unsafe fn close_pty(console: &mut Console, pj: usize) {
 	}
 }
 
-// Handle a display-change event from the gpu driver: on a host-window resize it rebinds
+// Handle a display-change event from the gpu driver: a periodic TICK paces the caret
+// blink; on a host-window resize it rebinds
 // the scanout to the new pixel size and sends RESIZE + the new width/height. Refit every
 // VT's terminal to the new size (each shell is notified, the SIGWINCH equivalent); the
 // run loop re-presents the foreground afterwards. If the driver's channel has closed,
@@ -1324,6 +1328,13 @@ unsafe fn handle_gpu_resize(console: &mut Console) {
 				return;
 			}
 		};
+		if len == 4 && &buf[..4] == b"TICK" {
+			console.blink = (console.blink + 1) % 2;
+			if console.blink == 0 {
+				blink_fg(console);
+			}
+			return;
+		}
 		if len < 14 || &buf[..6] != b"RESIZE" {
 			return;
 		}
@@ -1339,6 +1350,21 @@ unsafe fn handle_gpu_resize(console: &mut Console) {
 		let n: usize = console.vts.len();
 		for vi in 0..n {
 			resize_vt(console, vi, cols, rows);
+		}
+	}
+}
+
+// Toggle the foreground VT's caret blink phase, presenting only when a pixel actually
+// changed (the terminal skips the toggle while scrolled back or with the cursor hidden).
+// Every flush repaints the caret, so the caret is solid while typing or under output and
+// blinks while the console is idle.
+unsafe fn blink_fg(console: &mut Console) {
+	unsafe {
+		let vi: usize = console.fg;
+		if let Some(t) = console.vts[vi].term.as_mut() {
+			if t.blink_caret() {
+				t.present();
+			}
 		}
 	}
 }

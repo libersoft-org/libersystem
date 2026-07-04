@@ -342,6 +342,11 @@ unsafe fn serve(gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u32, init_w: u32, 
 					msg[10..14].copy_from_slice(&cur_h.to_le_bytes());
 					send_blocking(service, &msg, 0);
 				}
+				// The same periodic wake paces the console's caret blink: a non-blocking tick
+				// (dropped harmlessly if the console's queue is full). The display driver is the
+				// natural clock here - a timer in ConsoleService itself would keep a perpetual
+				// deadline armed and stall the cooperative boot driver.
+				let _ = try_send(service, b"TICK", 0);
 				continue;
 			}
 			// A message woke us: drain every queued request, coalescing FLUSHes so a backlog

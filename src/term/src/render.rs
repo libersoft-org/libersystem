@@ -291,6 +291,14 @@ impl Term {
 		self.renderer.surface.present();
 	}
 
+	// Toggle the caret's blink phase: erase the caret when it is shown, redraw it when it
+	// is hidden. Returns true when a pixel changed, so the caller knows to present. Every
+	// `flush` repaints the caret (each output batch resets the phase to visible), so a
+	// periodic caller gets the classic solid-while-active, blinking-while-idle caret.
+	pub fn blink_caret(&mut self) -> bool {
+		self.renderer.blink_caret(&self.screen)
+	}
+
 	// Flash the screen with inverted colours (the visual bell) without touching the grid.
 	pub fn draw_inverted(&self) {
 		self.renderer.draw_inverted(&self.screen);
@@ -462,6 +470,25 @@ impl FramebufferRenderer {
 			}
 		}
 		self.last_caret = None;
+	}
+
+	// Toggle the caret's blink phase. `last_caret` doubles as the phase: Some = the caret
+	// is painted (erase it by repainting its cell), None = it is not (draw it at the
+	// cursor). Inert while scrolled back or while the cursor is hidden (?25l).
+	fn blink_caret(&mut self, screen: &Screen) -> bool {
+		if screen.view_offset() > 0 {
+			return false;
+		}
+		if let Some((c, r)) = self.last_caret.take() {
+			self.draw_cell(screen, c, r);
+			return true;
+		}
+		if screen.cursor_visible() && screen.cursor_col() < screen.cols() && screen.cursor_row() < screen.rows() {
+			self.draw_caret(screen, screen.cursor_col(), screen.cursor_row());
+			self.last_caret = Some((screen.cursor_col(), screen.cursor_row()));
+			return true;
+		}
+		false
 	}
 
 	// Resolve a cell's logical colours to packed (fg, bg) framebuffer pixels: bold brightens

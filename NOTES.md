@@ -1,6 +1,6 @@
 # Bugs / changes
 
-- Console cursor is not blinking, it's static
+- every command (even simple ones as ls or lsvol) has the delay at the beginning for no reason ... something that linux shows instantly - find out why and fix.
 - test if ls* commands have --json
 - df, du
 - all commands with --json parameter should be in human readable format (incl. colours) --json-min in current minimal format
