@@ -776,6 +776,11 @@ fn fsinfo_free_count_tracks_allocate_and_free() {
 	fs.write_file(b"THREE.BIN", &[0x77u8; 3 * 512]).unwrap();
 	let after_alloc = u32::from_le_bytes(fs.dev.data[free_at..free_at + 4].try_into().unwrap());
 	assert_eq!(after_alloc, 997);
+	// the "next free cluster" hint must track the allocation too (its last cluster,
+	// the spec's convention) instead of going stale: root 2, ROOT took 3..=6, the
+	// three fresh clusters are 7, 8, 9.
+	let hint = u32::from_le_bytes(fs.dev.data[free_at + 4..free_at + 8].try_into().unwrap());
+	assert_eq!(hint, 9, "the next-free hint must follow the allocation");
 	fs.remove(b"THREE.BIN").unwrap();
 	let after_free = u32::from_le_bytes(fs.dev.data[free_at..free_at + 4].try_into().unwrap());
 	assert_eq!(after_free, 1000);
@@ -1025,6 +1030,19 @@ fn degenerate_boot_pointers_do_not_mount() {
 	let mut ex_root1 = build_exfat(ROOT);
 	ex_root1[96..100].copy_from_slice(&1u32.to_le_bytes());
 	assert!(FatFs::mount(MemDisk { data: ex_root1 }).is_none(), "an exFAT root below the heap");
+	// roots past the heap fail only at the first read today - refuse them at mount
+	// like every other out-of-range geometry field.
+	let mut fat32_root_high = build_fat(Kind::Fat32, ROOT);
+	fat32_root_high[44..48].copy_from_slice(&70000u32.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: fat32_root_high }).is_none(), "a FAT32 root past the heap");
+	let mut ex_root_high = build_exfat(ROOT);
+	ex_root_high[96..100].copy_from_slice(&70000u32.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: ex_root_high }).is_none(), "an exFAT root past the heap");
+	// a classic volume with no root region (the 16-bit FAT size keeps it classic, so
+	// the FAT32 shape rule does not claim it) - nothing could ever live in its root.
+	let mut zero_root = build_fat(Kind::Fat16, ROOT);
+	zero_root[17..19].copy_from_slice(&0u16.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: zero_root }).is_none(), "a classic volume with no root region");
 	// and a logical sector size the specification does not allow (not a power of two).
 	let mut odd_bps = build_fat(Kind::Fat16, ROOT);
 	odd_bps[11..13].copy_from_slice(&3584u16.to_le_bytes());
@@ -1258,4 +1276,74 @@ fn an_all_spaces_classic_entry_is_skipped() {
 	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
 	assert!(names(&fs.list().unwrap()).iter().all(|n| !n.is_empty()));
 	assert_eq!(fs.read_file(b""), Err(FsError::NotFound));
+}
+
+#[test]
+fn a_lowercase_exfat_name_carries_the_upcased_hash() {
+	// The NameHash is defined over the UP-CASED name: the media's home systems
+	// recompute it on lookup and skip a mismatched set, so a hash over the name as
+	// written left every lowercase-named file listable but unopenable by name there.
+	let mut fs = FatFs::mount(MemDisk { data: build_exfat(&[]) }).unwrap();
+	fs.write_file(b"hello.txt", b"cased").unwrap();
+	let heap = 25usize; // 24 reserved + 1 FAT sector
+	let root_off = (heap + 1) * 512;
+	// the set follows the bitmap entry: 0x85 at 32, the 0xC0 stream at 64; the hash
+	// sits at stream bytes 4..6. Compare against an independent computation over the
+	// up-cased UTF-16LE name.
+	let stream = root_off + 64;
+	assert_eq!(fs.dev.data[stream], 0xC0);
+	let stored = u16::from_le_bytes(fs.dev.data[stream + 4..stream + 6].try_into().unwrap());
+	let mut expect: u16 = 0;
+	for u in "HELLO.TXT".encode_utf16() {
+		for b in u.to_le_bytes() {
+			expect = expect.rotate_right(1).wrapping_add(b as u16);
+		}
+	}
+	assert_eq!(stored, expect, "the NameHash must be over the up-cased name");
+	assert_eq!(fs.read_file(b"hello.txt").unwrap(), b"cased");
+}
+
+#[test]
+fn a_non_utf8_name_is_refused_not_stored_unreachable() {
+	// A latin-1 0xE9 passes the byte gates but is not valid UTF-8: the long-name forms
+	// store UTF-16, so the name would be stored lossily (U+FFFD) and the file never
+	// found again by the bytes it was created with - a write that succeeds must stay
+	// reachable, so the name is refused instead.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	assert_eq!(fs.write_file(b"caf\xE9.txt", b"x"), Err(FsError::Invalid));
+	let mut ex = FatFs::mount(MemDisk { data: build_exfat(ROOT) }).unwrap();
+	assert_eq!(ex.write_file(b"caf\xE9.txt", b"x"), Err(FsError::Invalid));
+}
+
+// A device that records every written LBA, for pinning which sectors an operation
+// touches.
+struct WriteLog {
+	inner: MemDisk,
+	writes: Vec<u64>,
+}
+
+impl BlockDevice for WriteLog {
+	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		self.inner.read_sector(lba, buf)
+	}
+
+	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
+		self.writes.push(lba);
+		self.inner.write_sector(lba, buf)
+	}
+}
+
+#[test]
+fn a_fat12_slot_write_touches_only_its_sectors() {
+	// The FAT12 read-modify-write used to touch two sectors even for a slot wholly
+	// inside one - when the slot sat in the FAT's last sector, the RMW rewrote the
+	// sector PAST the FAT (the root region's first): a torn-write window on a region
+	// the operation never meant to touch. One sector, unless the slot straddles.
+	let inner = MemDisk { data: build_fat_sized(Kind::Fat12, ROOT, 1000) };
+	let mut fs = FatFs::mount(WriteLog { inner, writes: Vec::new() }).unwrap();
+	fs.set_fat_entry(2, 0x123).unwrap(); // byte offset 3: wholly inside the first FAT sector
+	assert_eq!(fs.dev.writes, [1], "a non-straddling slot must touch one sector");
+	fs.dev.writes.clear();
+	fs.set_fat_entry(341, 0x456).unwrap(); // byte offset 511: straddles into the second
+	assert_eq!(fs.dev.writes, [1, 2], "a straddling slot needs exactly the pair");
 }

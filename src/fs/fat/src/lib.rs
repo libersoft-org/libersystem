@@ -219,6 +219,12 @@ impl<D: BlockDevice> FatFs<D> {
 		if name.iter().any(|&b| b < 0x20 || b"\"*:<>?\\|".contains(&b)) {
 			return Err(FsError::Invalid);
 		}
+		// the long-name forms store UTF-16: a name that is not valid UTF-8 would be
+		// stored lossily (U+FFFD) and never found again by the bytes it was created
+		// with - the write would succeed and the file be unreachable by its own name.
+		if core::str::from_utf8(name).is_err() {
+			return Err(FsError::Invalid);
+		}
 		let dir = self.resolve_dir(parent)?;
 		if self.geo.kind == Kind::ExFat {
 			return self.exfat_write(&dir, name, data);
@@ -431,8 +437,8 @@ impl<D: BlockDevice> FatFs<D> {
 	}
 
 	// The FAT entry for `cluster` - the next cluster in its chain - read from the first
-	// allocation table. FAT12 packs entries in 1.5 bytes (and can straddle a sector
-	// boundary, so it reads two sectors), FAT16 in 2, FAT32/exFAT in 4. The index comes
+	// allocation table. FAT12 packs entries in 1.5 bytes (a slot straddling a sector
+	// boundary reads the sector pair), FAT16 in 2, FAT32/exFAT in 4. The index comes
 	// off the medium, so an out-of-heap value is refused before it can become a table
 	// offset.
 	fn next_cluster(&mut self, cluster: u32) -> Result<u32, FsError> {
@@ -446,7 +452,9 @@ impl<D: BlockDevice> FatFs<D> {
 			Kind::Fat16 => cluster as u64 * 2,
 			Kind::Fat32 | Kind::ExFat => cluster as u64 * 4,
 		};
-		let sectors: u32 = if self.geo.kind == Kind::Fat12 { 2 } else { 1 };
+		// only a FAT12 slot can straddle a logical sector boundary (the wider slots
+		// align to their width) - touch the sector pair only then.
+		let sectors: u32 = if byte_off % bps as u64 == bps as u64 - 1 { 2 } else { 1 };
 		let sec = fat_base as u64 + byte_off / bps as u64;
 		let within = (byte_off % bps as u64) as usize;
 		let mut buf = vec![0u8; (bps * sectors) as usize];
@@ -504,11 +512,12 @@ impl<D: BlockDevice> FatFs<D> {
 	}
 
 	// Write `val` into `cluster`'s FAT slot, in every FAT copy. FAT12 packs two entries
-	// into three bytes (and can straddle a sector boundary, so its slot is a two-sector
-	// read-modify-write); FAT16 aligns to the width; FAT32 read-modify-writes too,
-	// preserving the entry's reserved top nibble as the specification requires. An
-	// out-of-heap index is refused before it can become a table offset - on corrupt
-	// media that offset lands in the volume's own data.
+	// into three bytes (a slot straddling a sector boundary is a two-sector
+	// read-modify-write; any other slot touches only its own sector); FAT16 aligns to
+	// the width; FAT32 read-modify-writes too, preserving the entry's reserved top
+	// nibble as the specification requires. An out-of-heap index is refused before it
+	// can become a table offset - on corrupt media that offset lands in the volume's
+	// own data.
 	fn set_fat_entry(&mut self, cluster: u32, val: u32) -> Result<(), FsError> {
 		if cluster < 2 || cluster > self.max_cluster() {
 			return Err(FsError::Invalid);
@@ -519,7 +528,7 @@ impl<D: BlockDevice> FatFs<D> {
 			Kind::Fat16 => cluster as u64 * 2,
 			Kind::Fat32 | Kind::ExFat => cluster as u64 * 4,
 		};
-		let sectors: u32 = if self.geo.kind == Kind::Fat12 { 2 } else { 1 };
+		let sectors: u32 = if byte_off % bps as u64 == bps as u64 - 1 { 2 } else { 1 };
 		for fat in 0..self.geo.num_fats {
 			let fat_base = self.geo.reserved_sectors + fat * self.geo.fat_size;
 			let sec = fat_base as u64 + byte_off / bps as u64;
@@ -577,7 +586,7 @@ impl<D: BlockDevice> FatFs<D> {
 				return Err(e);
 			}
 		}
-		self.fsinfo_adjust(-(chain.len() as i64));
+		self.fsinfo_adjust(-(chain.len() as i64), chain.last().copied());
 		Ok(chain)
 	}
 
@@ -603,7 +612,7 @@ impl<D: BlockDevice> FatFs<D> {
 	fn free_chain(&mut self, first: u32) -> Result<(), FsError> {
 		let mut freed = 0i64;
 		let r = self.free_walk(first, &mut freed);
-		self.fsinfo_adjust(freed);
+		self.fsinfo_adjust(freed, None);
 		r
 	}
 
@@ -629,10 +638,12 @@ impl<D: BlockDevice> FatFs<D> {
 
 	// Keep the FAT32 FSInfo sector's free-cluster count in step after an allocate (a
 	// negative delta) or a free, so other systems reading media we wrote see a truthful
-	// number. Best-effort advisory metadata: a missing sector, bad signatures, or the
-	// unknown sentinel (0xFFFFFFFF) leave it untouched, and an I/O failure is ignored -
-	// the count is a hint, never the allocation's source of truth.
-	fn fsinfo_adjust(&mut self, delta: i64) {
+	// number; an allocation also leaves the "next free cluster" hint at its last
+	// cluster - the spec's convention - instead of letting it go stale. Best-effort
+	// advisory metadata: a missing sector, bad signatures, or the unknown sentinel
+	// (0xFFFFFFFF) leave it untouched, and an I/O failure is ignored - the count is a
+	// hint, never the allocation's source of truth.
+	fn fsinfo_adjust(&mut self, delta: i64, hint: Option<u32>) {
 		if self.geo.fsinfo_sector == 0 || delta == 0 {
 			return;
 		}
@@ -652,6 +663,9 @@ impl<D: BlockDevice> FatFs<D> {
 		}
 		let new = (free as i64 + delta).clamp(0, self.geo.cluster_count as i64) as u32;
 		buf[488..492].copy_from_slice(&new.to_le_bytes());
+		if let Some(h) = hint {
+			buf[492..496].copy_from_slice(&h.to_le_bytes());
+		}
 		let _ = self.write_fs_sectors(self.geo.fsinfo_sector as u64, 1, &buf);
 	}
 
@@ -1167,10 +1181,15 @@ impl Geometry {
 		} else {
 			Kind::Fat32
 		};
+		// a classic volume with no root region is degenerate (nothing could ever live in
+		// its root); the FAT32 shape rule above already claimed the legitimate zero.
+		if kind != Kind::Fat32 && root_entries == 0 {
+			return None;
+		}
 		let root_cluster = if kind == Kind::Fat32 { u32::from_le_bytes([b[44], b[45], b[46], b[47]]) } else { 0 };
-		// a FAT32 root below the heap is degenerate (0 would even read the nonexistent
+		// a FAT32 root outside the heap is degenerate (0 would even read the nonexistent
 		// fixed root region) - refuse it at mount.
-		if kind == Kind::Fat32 && root_cluster < 2 {
+		if kind == Kind::Fat32 && (root_cluster < 2 || root_cluster as u64 > clusters as u64 + 1) {
 			return None;
 		}
 		let fsinfo = if kind == Kind::Fat32 { u16::from_le_bytes([b[48], b[49]]) as u32 } else { 0 };
@@ -1198,10 +1217,10 @@ impl Geometry {
 		let sectors_per_cluster = 1u32 << spc_shift;
 		let num_fats = b[110] as u32;
 		// degenerate pointers are refused at mount: a zero FAT size or offset would send
-		// the FAT walks into the boot region (bpb refuses both already), a root below
+		// the FAT walks into the boot region (bpb refuses both already), a root outside
 		// the heap cannot be a directory, and a FAT region overlapping the cluster heap
 		// would make a FAT-slot write clobber file data.
-		if num_fats == 0 || fat_offset == 0 || fat_size == 0 || cluster_heap_offset < 2 || cluster_count == 0 || root_cluster < 2 {
+		if num_fats == 0 || fat_offset == 0 || fat_size == 0 || cluster_heap_offset < 2 || cluster_count == 0 || root_cluster < 2 || root_cluster as u64 > cluster_count as u64 + 1 {
 			return None;
 		}
 		if fat_offset as u64 + num_fats as u64 * fat_size as u64 > cluster_heap_offset as u64 {
@@ -1681,12 +1700,16 @@ fn exfat_set_checksum(set: &[u8]) -> u16 {
 	sum
 }
 
-// The exFAT file-name hash, over the UTF-16LE name bytes; not verified by the reader but
-// written for correctness so a real exFAT driver accepts the file.
+// The exFAT file-name hash, over the UTF-16LE bytes of the UP-CASED name as the
+// specification defines it: the media's home systems recompute it on lookup and skip a
+// set whose stored hash mismatches, so hashing the name as written would leave a
+// lowercase-named file listable but unopenable by name there. ASCII upcasing (a driver
+// without an upcase table); other units pass through.
 fn exfat_name_hash(units: &[u16]) -> u16 {
 	let mut hash: u16 = 0;
 	for &u in units {
-		for b in u.to_le_bytes() {
+		let up = if (0x61..=0x7A).contains(&u) { u - 0x20 } else { u };
+		for b in up.to_le_bytes() {
 			hash = hash.rotate_right(1).wrapping_add(b as u16);
 		}
 	}
