@@ -1895,11 +1895,16 @@ M99/M100 machinery holds and found only low/cosmetic leftovers: two record
 forms still misparsed or misserved instead of refused, one unrecorded matching
 decision, and one integrity-check asymmetry.
 
-- [ ] (B1, low) The allocation type `extended_ad` (2) is not distinguished - the descriptor scan keeps the short_ad step of 8 over 20-byte records and parses garbage extents (bounded by the M99 gates, but a misread where the refuse-not-misread rule demands Invalid). Refuse allocation forms other than short_ad, long_ad, and embedded.
-- [ ] (B2, cosmetic) UDF is case-sensitive-preserving - two names differing only in case are legal siblings - while the reader matches case-insensitively (consistent with the sibling backends): the first match shadows a case-distinct sibling. Record the decision at `eq_ci`.
-- [ ] (B3, cosmetic) The File Entry's ICB file type (byte 27: 4 = directory, 5 = file, 12 = symlink) is not interpreted - a symlink serves its target-path bytes as file content. Refuse type 12 as Invalid (the volume API has no symlink semantics).
-- [ ] (B4, cosmetic) The M100 tag-location check covers the File Set and File Entries but not the Anchor or the VDS descriptors - a stale or copied anchor/descriptor passes. Verify the location there too.
+- [x] (B1, low) The allocation type `extended_ad` (2) is not distinguished - the descriptor scan keeps the short_ad step of 8 over 20-byte records and parses garbage extents (bounded by the M99 gates, but a misread where the refuse-not-misread rule demands Invalid). Refuse allocation forms other than short_ad, long_ad, and embedded.
+  - Result: refused. Test `an_extended_ad_form_is_refused_not_misparsed`.
+- [x] (B2, cosmetic) UDF is case-sensitive-preserving - two names differing only in case are legal siblings - while the reader matches case-insensitively (consistent with the sibling backends): the first match shadows a case-distinct sibling. Record the decision at `eq_ci`.
+  - Result: recorded.
+- [x] (B3, cosmetic) The File Entry's ICB file type (byte 27: 4 = directory, 5 = file, 12 = symlink) is not interpreted - a symlink serves its target-path bytes as file content. Refuse type 12 as Invalid (the volume API has no symlink semantics).
+  - Result: refused. Test `a_symlink_file_entry_is_refused`.
+- [x] (B4, cosmetic) The M100 tag-location check covers the File Set and File Entries but not the Anchor or the VDS descriptors - a stale or copied anchor/descriptor passes. Verify the location there too.
+  - Result: the anchor must record 256 and each VDS descriptor its own block (skipped otherwise). Test `a_misplaced_anchor_or_descriptor_is_not_trusted`.
 - Done when: an extended_ad File Entry refuses instead of misparsing, a symlink File Entry refuses instead of serving path bytes, the case-matching decision is recorded, a misplaced anchor or partition descriptor is not trusted, and the suite stays green with a test per finding.
+  - Result: all hold - udf 16 host tests (3 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: M96-B4/M97-B2 (the refuse-not-misread rule on the last two forms), M100-B4 (the tag-location rule completed), the uniform Volume API contract.
 
 ## Definition of done (phase 2)
