@@ -1907,6 +1907,30 @@ decision, and one integrity-check asymmetry.
   - Result: all hold - udf 16 host tests (3 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: M96-B4/M97-B2 (the refuse-not-misread rule on the last two forms), M100-B4 (the tag-location rule completed), the uniform Volume API contract.
 
+## M102 - LiberFS: revisit under the fs-track discipline
+
+A fresh full-source pass over LiberFS (2026-07-04) with the rule-set the
+FAT/ISO9660/UDF tracks built. The M73-M85 hardening holds up well - clamps,
+depth budgets, the mount probe, walk-damage degradation are all in place - but
+the pass found one crash-consistency hole in the commit path, two unbounded
+chain walks, and the out-of-pool read gate the sibling backends grew.
+
+- [ ] (B1, high) `commit` treats a failed post-superblock flush like any other failure: `finish` aborts, memory reverts to the old generation and the fresh blocks return to the pool - but the new-generation superblock may already be durable. A later transaction reuses those blocks; a crash before its commit point mounts the orphaned (higher) generation whose trees are overwritten. Once the superblock write is attempted the transaction must never roll back: adopt the new generation, and a failed durability flush degrades the volume to read-only instead (the device is failing; the in-memory state matches whichever superblock survives).
+  - Result:
+- [ ] (B2, medium) `load_snapshot_table` walks the chain with no step bound and appends records every pass: a CRC-consistent forged cycle (CRC32C is forgeable offline) hangs the mount and grows `snapshots` without limit. Bound the walk by the pool size like `walk_chain`.
+  - Result:
+- [ ] (B3, medium) `load_spill` has the same unbounded walk: the `want` clamp stops the extent pushes but the loop keeps following next pointers forever. Same fix, same bound.
+  - Result:
+- [ ] (B4, medium) The live read paths trust on-medium block pointers without the pool gate: `read_node` (every tree walk), the stored-run and checksum-block pointers behind `read_logical`/`read_csum`, and the chain pointers in `load_spill` and `load_snapshot_table` read whatever block the medium names - past the pool's end that is another partition's data on a shared device (and tree-node reads surface it as names). The mark walks and `walk_chain` already gate; gate the read paths the same way (out of pool reads as Corrupt).
+  - Result:
+- [ ] (B5, low) `rename_inner` replacing an empty directory frees the inode but drops blocks only for a file: a directory with `size == 0` and a non-zero `dir_root` (damaged or hostile) leaks its tree nodes forever - the incremental reclaim never revisits them. `rmdir_inner` drops that form defensively; the replace path does the same.
+  - Result:
+- [ ] (B6, cosmetic) `remove_inner`'s defensive drop of a damaged directory scans the whole block map - O(pool) per rmdir. Correct (the marked map is exact) and rare (a damaged dir only); record the trade-off at the scan.
+  - Result:
+- Done when: a commit whose post-superblock flush fails adopts the new generation read-only instead of rolling back (test-pinned against the orphan-superblock replay), a CRC-consistent snapshot-chain or spill-chain cycle terminates, an out-of-pool tree node, stored run, checksum block or chain link reads as damage instead of foreign bytes, a rename over a damaged empty directory leaks nothing, the scan trade-off is recorded, and the suite stays green with a test per finding.
+  - Result:
+- Concept: the fs-track rule-set (hostile-media bounds, FAT M90-B1 out-of-pool gate, M93-B1 probe), CoW commit-point semantics (the superblock write is the point of no return), M73-M85 (the hardening this pass re-verified).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
