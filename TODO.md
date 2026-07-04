@@ -1535,7 +1535,7 @@ and two nits at the edges - the audit track's remainders.
   - Result: `random_corruption_never_panics_or_hangs` - green on the first run (the M80-M85 bounds hold against randomness, not just against the reviewer's imagination), and from now on any regression in any bound fails the host suite. Two closing cosmetics landed alongside: resolve through a file answers NotDir (M76 classification), and the format-time label truncation backs off a split UTF-8 character.
 - Concept: M83-B2 (the UTF-8 rule this completes: valid encoding AND stable identity), the M78 spec's NUL-padding rule (which makes an embedded NUL an early terminator), and the track's bounding rule applied to fsck's own arithmetic. The fuzz guard is the track's closing move: reviews found the bugs, the test keeps them found.
 
-## FAT audit track (M86-M89)
+## FAT audit track (M86-M90)
 
 A full read of the fat crate (2026-07-03, lib.rs ~1030 lines + tests), the same
 treatment the LiberFS audit track gave the native filesystem. The read paths and
@@ -1637,6 +1637,27 @@ short-name and directory-slot machinery.
 - Done when: a bps=1024 fixture round-trips reads and writes (the unit error is test-pinned), a forged NoFatChain size is refused - never a hang, OOM or overflow, a CJK-leading name survives a write-read-remove cycle, an entry set never lands beyond the terminator, dot-only names are refused, a zero-cluster BPB does not mount, and the suite stays green with a test per finding.
   - Result: all hold - fat 37 host tests (5 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: M86-M88 (the audit this closes out), M81-B2 (the on-medium size gate extended to the last FAT consumer), the interop purpose of the crate (4K-native media are real media; a written file must never be invisible to the volume's home systems).
+
+## M90 - FAT: third-pass findings (the cluster range gate and the leftovers)
+
+The third full source pass (2026-07-04, after M89 landed, lib.rs ~1400 lines)
+re-verified the M86-M89 machinery holds - the single ratio expansion, the
+nfc_run gate on all three NoFatChain consumers, the scrub-mark-place ordering,
+the 0x05 mapping both ways, the balanced FSInfo pairing - and found the one
+hole every earlier round grazed but never closed: the step guards from M87/M88
+bound how LONG a chain walk runs, but never the RANGE of the cluster values it
+walks through, and one of those walks writes. Plus an exFAT feature gap and
+the usual spec/robustness leftovers.
+
+- [ ] (B1, high) Cluster values off the medium are never range-checked: `first_cluster` from a directory entry and `next` values from the FAT flow into `cluster_fs_sector` (sector addresses) and `set_fat_entry` (`byte_off = cluster * width`) with no bound against `max_cluster()` - the M87/M88 guards cap the STEP COUNT, not the VALUES. On the write side, `free_chain` on a hostile/corrupt chain calls `set_fat_entry(0xF000, 0)` whose offset lands in the volume's own root region or data (FAT16 offsets stay in-volume even on an exactly-sized device) - silent self-corruption - and on a device larger than the volume (the common removable-media case: a 1 GB FAT volume on a 64 GB stick) the FAT32 offsets write outside the volume entirely. On the read side, `read_chain` / `write_dir_bytes`' chain walk reads foreign sectors past the volume's end into file content (data disclosure). The LiberFS M80-B2/M81-B5 class, missed for FAT. Fix: a central range gate - `next_cluster` and `set_fat_entry` refuse a cluster outside `2..=cluster_count + 1` as Invalid, and the chain walks treat an out-of-range next as corruption, never as an address.
+- [ ] (B2, medium) An exFAT directory cannot grow: `exfat_swap_entry` has no grow path (`exfat_free_run(...).ok_or(NoSpace)`), while classic FAT has grown by whole clusters since M87-B4 - a chained exFAT directory can extend, so a write into a full directory fails NoSpace with space free on the volume. Note the real cost: growing an exFAT directory also updates its DataLength / ValidDataLength in the PARENT's stream entry, which `Dir` does not carry today; a NoFatChain directory stays refused (it cannot extend without relocation).
+- [ ] (B3, medium-low) Windows-illegal characters pass into long names: `write_file` accepts `* ? < > | " : \` and control bytes < 0x20 - the 8.3 form maps them to `_`, but the VFAT LFN and the exFAT 0xC1 fragments carry the original, so the file is invalid or unopenable on the media's home systems (the M89-B5 class, extended from dots to the whole illegal set). Reject them in `write_file`, one gate for both families.
+- [ ] (B4, low) Degenerate boot-sector pointers still mount: FAT32 `root_cluster < 2` (0 even reads the nonexistent fixed root region), exFAT `root_cluster < 2`, exFAT `fat_size == 0` (`bpb` refuses it, `exfat` does not - `max_cluster` becomes 0 and everything fails piecemeal), and exFAT `fat_offset == 0` (FAT reads land in the boot region). The M89-B6 class: validate at mount - `root_cluster >= 2`, `fat_size != 0`, `fat_offset >= 1`.
+- [ ] (B5, low) A mid-allocation I/O failure leaks clusters: `alloc_chain` leaves a partially written chain when `set_fat_entry` fails mid-loop (and skips the FSInfo adjust), `exfat_alloc` writes the bitmap BEFORE the FAT so a FAT-write failure strands set bitmap bits, and `grow_dir` loses its grow cluster when the link write fails. Leaks only, no corruption, and only on media already failing mid-write - unwind the error paths (clear the written slots/bits), or record the trade-off where it stands.
+- [ ] (B6, low) Zeroed timestamps: both write paths emit create/modify time 0 - an invalid DOS date (day 0, month 0, rendering as 1979/1980) on classic FAT and a zero exFAT timestamp. Give `FatFs` a `set_clock(unix_secs)` like LiberFS got in M73 (StorageService already stamps the LiberFS volume) and encode the DOS/exFAT forms.
+- [ ] (B7, cosmetic) Three nits: (a) `parse_exfat_dir` accepts a `secondary == 0` entry set, yielding an empty-named entry (listing noise; skip empty-named sets); (b) `write_dir_bytes`' chain branch would slice-panic on a buffer that is not a whole-cluster multiple - unreachable through current callers but fragile (the NFC branch guards it, the chain branch should match); (c) `bpb` accepts a non-power-of-two bytes-per-sector (e.g. 3584) where the spec allows only 512/1024/2048/4096.
+- Done when: a hostile chain or entry can never turn a cluster value into an out-of-range sector or FAT offset (a corrupt chain on an oversized device neither reads foreign bytes nor writes anywhere - test-pinned on both the read and the free path), a full chained exFAT directory grows instead of refusing, Windows-illegal name bytes are refused, degenerate root/FAT pointers do not mount, written entries carry real timestamps, and the suite stays green with a test per finding.
+- Concept: M80-B2/M81-B5 (the on-medium pointer-range rule extended to the FAT crate's last unbounded values - and here one of the walks WRITES), M87 (whose step guards this completes with value bounds), M89 (the audit round this continues), the interop purpose of the crate.
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
