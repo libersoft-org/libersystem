@@ -29,6 +29,7 @@ const ELF_HEADER_LEN: usize = 64;
 const PHDR_LEN: usize = 56;
 const PT_LOAD: u32 = 1;
 const PF_W: u32 = 0x2;
+const PF_X: u32 = 0x1;
 
 // Little-endian fixed-width readers over a byte slice at a static offset. The
 // callers slice the ELF header and program headers at offsets that always fit the
@@ -95,11 +96,16 @@ pub fn load_into(elf: &[u8], addr_space: &AddressSpace, frames: &mut Vec<u64>) -
 // Map one PT_LOAD segment page by page: allocate a zeroed frame for each page,
 // copy the file-backed bytes that fall in it, and map it at the segment's virtual
 // address. Bytes past p_filesz (the .bss tail) stay zero. Assumes page-aligned,
-// non-overlapping segments (the userspace linker script enforces this).
+// non-overlapping segments (the userspace linker script enforces this). W^X: a
+// segment is writable or executable per its flags, never both implicitly - only
+// PF_X segments are fetchable, everything else maps no-execute.
 fn map_segment(elf: &[u8], addr_space: &AddressSpace, frames: &mut Vec<u64>, p_flags: u32, p_offset: usize, p_vaddr: u64, p_filesz: usize, p_memsz: u64) -> Result<(), ElfError> {
 	let mut flags = arch::paging::PRESENT | arch::paging::USER;
 	if p_flags & PF_W != 0 {
 		flags |= arch::paging::WRITABLE;
+	}
+	if p_flags & PF_X == 0 {
+		flags |= arch::paging::NO_EXECUTE;
 	}
 	let hhdm = hhdm_offset();
 	let pages = p_memsz.div_ceil(PAGE_SIZE);

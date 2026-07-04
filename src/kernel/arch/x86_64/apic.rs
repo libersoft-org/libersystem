@@ -105,7 +105,7 @@ pub fn init() {
 	let base_msr = msr::read(IA32_APIC_BASE_MSR);
 	let phys = base_msr & APIC_BASE_ADDR_MASK;
 	msr::write(IA32_APIC_BASE_MSR, base_msr | APIC_BASE_ENABLE);
-	paging::map_page(LAPIC_VIRT, phys, paging::WRITABLE | paging::NO_CACHE);
+	paging::map_page(LAPIC_VIRT, phys, paging::WRITABLE | paging::NO_CACHE | paging::NO_EXECUTE);
 	LAPIC_BASE.store(LAPIC_VIRT as usize, Ordering::Relaxed);
 
 	// Software-enable the APIC and set the spurious-interrupt vector.

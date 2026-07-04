@@ -128,9 +128,10 @@ pub fn create_user_thread(process: &Arc<Process>, entry: u64, stack_top: u64, bo
 	}
 }
 
-// Map the ring-3 stack (zeroed, writable) just below USER_STACK_TOP.
+// Map the ring-3 stack (zeroed, writable, never executable) just below
+// USER_STACK_TOP.
 fn map_stack(address_space: &AddressSpace, frames: &mut Vec<u64>) -> Result<(), LoadError> {
-	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER | arch::paging::NO_EXECUTE;
 	let hhdm = hhdm_offset();
 	let base = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
 	for page in 0..USER_STACK_PAGES {

@@ -158,7 +158,7 @@ pub fn irq_info_len() -> usize {
 // never write its own MSI-X table; only the kernel programs it here.
 fn program_msix_entry(slot: usize, table_phys: u64, vector: u8, dest: u8) {
 	let virt = MSIX_VIRT_BASE + slot as u64 * 0x1000;
-	super::paging::map_page(virt, table_phys & !0xfff, super::paging::WRITABLE | super::paging::NO_CACHE);
+	super::paging::map_page(virt, table_phys & !0xfff, super::paging::WRITABLE | super::paging::NO_CACHE | super::paging::NO_EXECUTE);
 	let entry = (virt + (table_phys & 0xfff)) as *mut u32;
 	let msg_addr: u32 = 0xFEE0_0000 | ((dest as u32) << 12);
 	unsafe {
@@ -313,7 +313,7 @@ pub fn init() {
 	// Materialise the MSI-X table mapping region's page tables now, while the kernel
 	// PML4 is active and before any process address space is created, so later per-device
 	// mappings under it land in the shared kernel half and are visible everywhere.
-	super::paging::map_page(MSIX_VIRT_BASE, 0, super::paging::WRITABLE);
+	super::paging::map_page(MSIX_VIRT_BASE, 0, super::paging::WRITABLE | super::paging::NO_EXECUTE);
 	super::paging::unmap_page(MSIX_VIRT_BASE);
 	// The timer vector preempts, so it gets a dedicated stub instead of the generic
 	// count-and-dispatch path.

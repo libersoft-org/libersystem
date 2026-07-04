@@ -37,7 +37,7 @@ pub fn init() {
 	let end = HEAP_START + HEAP_REGION;
 	while virt < end {
 		let phys = frame::allocate().expect("out of frames: kernel heap");
-		paging::map_page(virt, phys, paging::WRITABLE);
+		paging::map_page(virt, phys, paging::WRITABLE | paging::NO_EXECUTE);
 		virt += PAGE_SIZE;
 	}
 	NEXT_REGION.store(end, Ordering::Relaxed);
@@ -56,7 +56,7 @@ fn grow(heap: &mut Heap, at_least: usize) -> bool {
 			Some(p) => p,
 			None => return false,
 		};
-		paging::map_page(virt, phys, paging::WRITABLE);
+		paging::map_page(virt, phys, paging::WRITABLE | paging::NO_EXECUTE);
 		virt += PAGE_SIZE;
 	}
 	unsafe { heap.add_free_region(base as usize, bytes as usize) };

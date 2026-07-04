@@ -53,7 +53,7 @@ fn write(index: u32, value: u32) {
 // Map the I/O APIC MMIO page and mask every redirection entry, so no device can
 // raise an interrupt until a driver routes and unmasks its GSI.
 pub fn init() {
-	paging::map_page(IOAPIC_VIRT, IOAPIC_PHYS, paging::WRITABLE | paging::NO_CACHE);
+	paging::map_page(IOAPIC_VIRT, IOAPIC_PHYS, paging::WRITABLE | paging::NO_CACHE | paging::NO_EXECUTE);
 	BASE.store(IOAPIC_VIRT as usize, Ordering::Relaxed);
 	let count = ((read(REG_VERSION) >> 16) & 0xff) + 1;
 	for gsi in 0..count {

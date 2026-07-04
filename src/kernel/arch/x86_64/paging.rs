@@ -19,10 +19,37 @@ pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;
 pub const USER: u64 = 1 << 2;
 pub const NO_CACHE: u64 = 1 << 4; // PCD: disable caching (for MMIO)
+pub const NO_EXECUTE: u64 = 1 << 63; // NX: data pages are never fetched from (needs EFER.NXE)
 
 // Physical address bits within a page-table entry (bits 12..=51).
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const ENTRY_COUNT: usize = 512;
+
+// Whether the CPU supports the NX bit and EFER.NXE has been enabled. When it has
+// not (an old CPU), map_page_in strips NO_EXECUTE so the bit is never a reserved-
+// bit violation - the mapping is then executable, matching the hardware's best.
+static NX_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// Enable no-execute enforcement on the current core: check the NX capability
+// (CPUID 0x8000_0001, EDX bit 20) and set EFER.NXE. Must run on every core (EFER
+// is per-core) BEFORE any page carrying NO_EXECUTE is touched - the BSP calls it
+// with the descriptor tables, each AP first thing in its bring-up.
+pub fn enable_nx() {
+	let nx_capable = core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 20) != 0;
+	if !nx_capable {
+		return;
+	}
+	const IA32_EFER: u32 = 0xc000_0080;
+	const EFER_NXE: u64 = 1 << 11;
+	let efer = super::msr::read(IA32_EFER);
+	super::msr::write(IA32_EFER, efer | EFER_NXE);
+	NX_ENABLED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+// Whether NX is enforced (tests assert the W^X behaviour only where it can hold).
+pub fn nx_enabled() -> bool {
+	NX_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
 
 fn hhdm() -> u64 {
 	crate::mem::hhdm_offset()
@@ -84,7 +111,10 @@ pub fn map_page(virt: u64, phys: u64, flags: u64) {
 // becomes visible when CR3 is loaded with it (which flushes the TLB anyway), so
 // the invlpg here is harmless for a non-active space.
 pub fn map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
-	// Permission bits the whole walk must grant for the leaf to be reachable.
+	// Without EFER.NXE the NX bit is a reserved bit; strip it so old CPUs still map.
+	let flags = if nx_enabled() { flags } else { flags & !NO_EXECUTE };
+	// Permission bits the whole walk must grant for the leaf to be reachable. NX
+	// stays leaf-only: an intermediate NX would blanket the whole subtree.
 	let parent_flags = flags & USER;
 	unsafe {
 		let pml4 = table_ptr(pml4_phys);

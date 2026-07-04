@@ -22,10 +22,12 @@ use core::arch::asm;
 // Shared programmed-I/O port helpers (the reset and power-off paths use them).
 use self::port::{inb, outb, outw};
 
-// install the CPU descriptor tables (GDT + TSS, then IDT)
+// install the CPU descriptor tables (GDT + TSS, then IDT), and turn on no-execute
+// enforcement before any NX-flagged mapping exists (the heap window is the first)
 pub fn init() {
 	gdt::init();
 	idt::init();
+	paging::enable_nx();
 }
 
 // Bring up interrupt delivery and the periodic timer. Requires the memory
@@ -53,9 +55,11 @@ pub fn init_bsp_percpu(lapic_id: u32) {
 	percpu::init(0, lapic_id);
 }
 
-// Full per-core bring-up for an application processor, run on that core: load
+// Full per-core bring-up for an application processor, run on that core: enable
+// no-execute first (the shared page tables already carry NX-flagged leaves), load
 // the shared descriptor tables, set up per-CPU data, and enable its LAPIC.
 pub fn init_ap(cpu_id: usize, lapic_id: u32) {
+	paging::enable_nx();
 	gdt::load_ap(cpu_id);
 	idt::load();
 	percpu::init(cpu_id, lapic_id);

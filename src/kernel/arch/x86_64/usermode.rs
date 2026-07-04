@@ -43,6 +43,8 @@ unsafe extern "C" {
 	fn user_yield_program_end();
 	fn user_fault_program_start();
 	fn user_fault_program_end();
+	fn user_nx_program_start();
+	fn user_nx_program_end();
 }
 
 // Drop the calling thread into ring 3 at `entry` with `user_stack` and `arg` (the
@@ -107,6 +109,15 @@ pub fn program_fault_bytes() -> &'static [u8] {
 pub fn program_yield_bytes() -> &'static [u8] {
 	let start = user_yield_program_start as *const () as usize;
 	let end = user_yield_program_end as *const () as usize;
+	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
+}
+
+// The bytes of the embedded ring-3 no-execute probe (position-independent machine
+// code, copied into a USER page before entering). It jumps into its own stack
+// page; with W^X enforced the instruction fetch page-faults before anything runs.
+pub fn program_nx_bytes() -> &'static [u8] {
+	let start = user_nx_program_start as *const () as usize;
+	let end = user_nx_program_end as *const () as usize;
 	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
 }
 
@@ -261,3 +272,9 @@ global_asm!(
 	"user_fault_program_end:",
 	addr = const FAULT_PROBE_ADDR,
 );
+
+// Embedded ring-3 no-execute probe. Position-independent: it jumps to an address
+// inside its own (writable, no-execute) stack page. The instruction fetch there
+// page-faults with W^X enforced; the kernel records the fault and terminates the
+// process, so control never returns into this code.
+global_asm!(".text", ".global user_nx_program_start", "user_nx_program_start:", "lea rax, [rsp - 64]", "jmp rax", "2:", "jmp 2b", ".global user_nx_program_end", "user_nx_program_end:",);

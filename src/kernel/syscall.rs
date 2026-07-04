@@ -303,7 +303,7 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 	}
 	let user = arch::percpu::in_user_syscall();
 	let base = if user { alloc_user_vrange(dma.size() as u64) } else { alloc_kernel_vrange(dma.size() as u64) };
-	let flags = if user { arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER } else { arch::paging::PRESENT | arch::paging::WRITABLE };
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE | if user { arch::paging::USER } else { 0 };
 	for (i, &phys) in dma.frames().iter().enumerate() {
 		arch::paging::map_page(base + i as u64 * PAGE_SIZE, phys, flags);
 	}
@@ -355,7 +355,7 @@ fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64) -> i64 {
 	let pages = total.div_ceil(PAGE_SIZE);
 	let user = arch::percpu::in_user_syscall();
 	let base = if user { alloc_user_vrange(total) } else { alloc_kernel_vrange(total) };
-	let mut flags = arch::paging::PRESENT | arch::paging::WRITABLE;
+	let mut flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE;
 	if user {
 		flags |= arch::paging::USER;
 	}
@@ -498,7 +498,7 @@ fn sys_device_memory_map(handle: u64) -> i64 {
 	let pages = device.pages();
 	let len = pages as u64 * PAGE_SIZE;
 	let base = if user { alloc_user_vrange(len) } else { alloc_kernel_vrange(len) };
-	let mut flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_CACHE;
+	let mut flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_CACHE | arch::paging::NO_EXECUTE;
 	if user {
 		flags |= arch::paging::USER;
 	}
@@ -903,7 +903,7 @@ fn sys_memory_map(handle: u64) -> i64 {
 	// plain map_page lands in the right address space.
 	let user = arch::percpu::in_user_syscall();
 	let base = if user { alloc_user_vrange(memory.size() as u64) } else { alloc_kernel_vrange(memory.size() as u64) };
-	let flags = if user { arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER } else { arch::paging::PRESENT | arch::paging::WRITABLE };
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE | if user { arch::paging::USER } else { 0 };
 	for (i, &phys) in memory.frames().iter().enumerate() {
 		arch::paging::map_page(base + i as u64 * PAGE_SIZE, phys, flags);
 	}

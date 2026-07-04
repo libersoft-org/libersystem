@@ -266,7 +266,7 @@ extern "C" fn user_thread_body(handle: u64) {
 	let stack = frame::allocate().expect("user stack frame");
 	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
 	arch::paging::map_page(USER_CODE_VA, code, flags);
-	arch::paging::map_page(USER_STACK_VA, stack, flags);
+	arch::paging::map_page(USER_STACK_VA, stack, flags | arch::paging::NO_EXECUTE);
 	let program = arch::usermode::program_bytes();
 	unsafe {
 		core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
@@ -1039,7 +1039,7 @@ extern "C" fn user_fault_thread_body(_arg: u64) {
 	let stack = frame::allocate().expect("user stack frame");
 	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
 	arch::paging::map_page(USER_CODE_VA, code, flags);
-	arch::paging::map_page(USER_STACK_VA, stack, flags);
+	arch::paging::map_page(USER_STACK_VA, stack, flags | arch::paging::NO_EXECUTE);
 	let program = arch::usermode::program_fault_bytes();
 	unsafe {
 		core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
@@ -1065,6 +1065,45 @@ extern "C" fn user_fault_thread_body(_arg: u64) {
 #[cfg(test)]
 const DRIVER_IRQ_VECTOR: u64 = 0x2d;
 
+// Where the no-execute probe's recorded fault lands (mirrors the FAULT_* statics).
+#[cfg(test)]
+static NX_GOT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+#[cfg(test)]
+static NX_KIND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static NX_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static NX_CODE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Kernel-thread body that drops to ring 3 running the no-execute probe: the
+// program jumps into its writable, no-execute stack page, so the instruction
+// fetch itself must page-fault (W^X). Mirrors user_fault_thread_body.
+#[cfg(test)]
+extern "C" fn user_nx_thread_body(_arg: u64) {
+	use core::sync::atomic::Ordering;
+	use mem::frame::{self, PAGE_SIZE};
+	let code = frame::allocate().expect("user code frame");
+	let stack = frame::allocate().expect("user stack frame");
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
+	arch::paging::map_page(USER_CODE_VA, code, flags);
+	arch::paging::map_page(USER_STACK_VA, stack, flags | arch::paging::NO_EXECUTE);
+	let program = arch::usermode::program_nx_bytes();
+	unsafe {
+		core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
+		arch::usermode::enter(USER_CODE_VA, USER_STACK_VA + PAGE_SIZE, 0);
+	}
+	let mut info = fault::FaultInfo { kind: 0, error_code: 0, address: 0, instruction_pointer: 0 };
+	let got = unsafe { arch::syscall::invoke(syscall::SYS_FAULT_INFO_GET, &mut info as *mut fault::FaultInfo as u64, core::mem::size_of::<fault::FaultInfo>() as u64, 0, 0) };
+	NX_GOT.store(got as i64, Ordering::SeqCst);
+	NX_KIND.store(info.kind, Ordering::SeqCst);
+	NX_ADDR.store(info.address, Ordering::SeqCst);
+	NX_CODE.store(info.error_code, Ordering::SeqCst);
+	arch::paging::unmap_page(USER_CODE_VA);
+	arch::paging::unmap_page(USER_STACK_VA);
+	frame::deallocate(code);
+	frame::deallocate(stack);
+}
+
 // Kernel-thread body for the driver-crash test: it acquires real driver resources
 // - a bound IRQ and a DMA buffer - then drops to ring 3 and faults, leaving both
 // open so the kernel's crash cleanup is what detaches the IRQ and refunds the DMA.
@@ -1082,7 +1121,7 @@ extern "C" fn driver_crash_thread_body(_arg: u64) {
 	let stack = frame::allocate().expect("user stack frame");
 	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
 	arch::paging::map_page(USER_CODE_VA, code, flags);
-	arch::paging::map_page(USER_STACK_VA, stack, flags);
+	arch::paging::map_page(USER_STACK_VA, stack, flags | arch::paging::NO_EXECUTE);
 	let program = arch::usermode::program_fault_bytes();
 	unsafe {
 		core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
@@ -3950,7 +3989,7 @@ extern "C" fn user_yield_thread_body(handle: u64) {
 	let stack = frame::allocate().expect("user stack frame");
 	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
 	arch::paging::map_page(code_va, code, flags);
-	arch::paging::map_page(stack_va, stack, flags);
+	arch::paging::map_page(stack_va, stack, flags | arch::paging::NO_EXECUTE);
 	let program = arch::usermode::program_yield_bytes();
 	unsafe {
 		core::ptr::copy_nonoverlapping(program.as_ptr(), code_va as *mut u8, program.len());
@@ -4001,6 +4040,27 @@ fn fault_isolation_kills_only_process() {
 	// Teardown refunded the open MemoryObject (memory + handle) and the thread slot.
 	assert_eq!(domain.account().memory().used(), 0, "memory refunded");
 	assert_eq!(domain.account().handles().used(), 0, "handles refunded");
+	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
+}
+
+#[cfg(test)]
+#[test_case]
+fn writable_pages_are_not_executable() {
+	use core::sync::atomic::Ordering;
+	use object::domain::Domain;
+	// W^X: a ring-3 thread jumps into its own writable stack page. With EFER.NXE on
+	// and the stack mapped NO_EXECUTE, the instruction FETCH page-faults (error code
+	// bit 4) before a single stack byte executes, the kernel kills only that
+	// process, and the recorded fault names the stack address it tried to run.
+	assert!(arch::paging::nx_enabled(), "the test hardware supports NX");
+	let domain = Domain::new(1 << 20, 8, 4);
+	sched::spawn_in(domain.clone(), user_nx_thread_body, 0).expect("spawn nx probe thread");
+	sched::run_until_idle();
+	assert_eq!(NX_GOT.load(Ordering::SeqCst), 1, "fault info should be recorded");
+	assert_eq!(NX_KIND.load(Ordering::SeqCst), fault::FAULT_PAGE);
+	let addr = NX_ADDR.load(Ordering::SeqCst);
+	assert!((USER_STACK_VA..USER_STACK_VA + mem::frame::PAGE_SIZE).contains(&addr), "the fault is inside the stack page");
+	assert!(NX_CODE.load(Ordering::SeqCst) & 0x10 != 0, "the fault is an instruction fetch");
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
