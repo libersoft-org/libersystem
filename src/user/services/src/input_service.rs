@@ -2,10 +2,11 @@
 //
 // ServiceManager starts this program from the init package and hands it a bootstrap
 // channel, then over it a "SERVE" channel (the one clients reach it on), an "INPUT"
-// channel (the raw pointer-event stream the virtio_input pointer driver feeds it; its
-// handle is 0 when no pointer device is present this boot), and a "FORWARD" channel
+// and an "INPUT2" channel (the raw pointer-event streams the virtio_input pointer
+// driver and the xhci driver feed it; a handle is 0 when that pointer source is
+// absent this boot), and a "FORWARD" channel
 // (ConsoleService's pointer sink, which drives selection / scrollback / mouse reports).
-// The driver sends normalized [x u16][y u16][buttons u8][wheel i8] events; InputService
+// The drivers send normalized [x u16][y u16][buttons u8][wheel i8] events; InputService
 // maps each to the text-cell grid and keeps a bounded ring of the recent ones for the
 // typed `subscribe` API, and forwards the raw bytes to ConsoleService verbatim. Over the
 // serve channel clients speak the generated `liber:system` Input bindings: `subscribe`
@@ -20,8 +21,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::PointerEvent;
 use proto::system::input;
+use proto::system::PointerEvent;
 use rt::*;
 
 // The default text-cell grid the normalized pointer position maps onto: the boot
@@ -85,11 +86,16 @@ fn map_event(raw: &[u8]) -> Option<PointerEvent> {
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 64] = [0u8; 64];
 
-	// 1. the serve channel clients reach us on, and the raw pointer-event channel the
-	//    pointer driver feeds us ("INPUT" + handle; handle 0 = no pointer device).
+	// 1. the serve channel clients reach us on, and the raw pointer-event channels the
+	//    pointer drivers feed us ("INPUT" = the virtio pointer, "INPUT2" = the xhci
+	//    driver's USB pointer; a handle is 0 when that source is absent).
 	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
 	let raw: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if len >= 5 && &buf[..5] == b"INPUT" => handle,
+		_ => exit(),
+	};
+	let raw2: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if len >= 6 && &buf[..6] == b"INPUT2" => handle,
 		_ => exit(),
 	};
 	// ConsoleService's pointer sink: we forward every raw event to it so it can drive
@@ -107,30 +113,37 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 3. serve until the client side closes.
 	let mut state: Input = Input::new();
 	unsafe {
-		serve(service, raw, forward, &mut state);
+		serve(service, [raw, raw2], forward, &mut state);
 	}
 	exit();
 }
 
-// Serve loop: wait on the serve channel and the raw pointer-event channel at once.
+// Serve loop: wait on the serve channel and the raw pointer-event channels at once.
 // On each wake, drain every queued raw event into the cell-mapped ring, then handle
 // one client request. Returns when the client side closes (no more clients). Once
-// the raw channel closes (the pointer driver retired), it is dropped from the wait
+// a raw channel closes (its pointer driver retired), it is dropped from the wait
 // set so a peer-closed channel cannot spin the loop.
-unsafe fn serve(service: u64, raw: u64, forward: u64, state: &mut Input) {
+unsafe fn serve(service: u64, raws: [u64; 2], forward: u64, state: &mut Input) {
 	unsafe {
 		let mut req: [u8; 64] = [0u8; 64];
-		let mut raw_open: bool = raw != 0;
+		let mut open: [bool; 2] = [raws[0] != 0, raws[1] != 0];
 		loop {
-			// block until the serve channel (or, while open, the raw channel) is ready.
-			if raw_open {
-				wait_any(&[service, raw], 0);
-			} else {
-				wait(service, 0);
+			// block until the serve channel (or, while open, a raw channel) is ready.
+			let mut waitset: [u64; 3] = [service, 0, 0];
+			let mut n: usize = 1;
+			for (i, &raw) in raws.iter().enumerate() {
+				if open[i] {
+					waitset[n] = raw;
+					n += 1;
+				}
 			}
+			wait_any(&waitset[..n], 0);
 			// drain every pending raw pointer event: fold it into the ring for the typed
 			// snapshot, and forward the raw bytes to ConsoleService for selection / reports.
-			if raw_open {
+			for (i, &raw) in raws.iter().enumerate() {
+				if !open[i] {
+					continue;
+				}
 				loop {
 					match try_recv(raw, &mut req) {
 						Polled::Message { len, .. } => {
@@ -143,7 +156,7 @@ unsafe fn serve(service: u64, raw: u64, forward: u64, state: &mut Input) {
 						}
 						Polled::Empty => break,
 						Polled::Closed => {
-							raw_open = false;
+							open[i] = false;
 							break;
 						}
 					}

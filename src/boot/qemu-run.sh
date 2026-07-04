@@ -125,13 +125,15 @@ QEMU_ARGS+=(
 	# xHCI USB host controller (M62): the kernel's PCI scan discovers it by class
 	# (0x0C/0x03/0x30) and records its MMIO BAR in the device table; the userspace
 	# xhci driver maps it and runs the USB stack. A hub hangs off port 1 with a USB
-	# keyboard behind it, so enumeration always exercises the hub expansion path
-	# (port power, hub-request port reset, route strings). Attached on the test path
-	# too, so the kernel tests can assert the controller is discovered and its bus -
-	# hub included - enumerated.
+	# keyboard and a USB tablet behind it, so enumeration always exercises the hub
+	# expansion path (port power, hub-request port reset, route strings) and the HID
+	# report-descriptor path for both a keyboard and a pointing device. Attached on
+	# the test path too, so the kernel tests can assert the controller is discovered
+	# and its bus - hub included - enumerated.
 	-device qemu-xhci,id=usb
 	-device usb-hub,bus=usb.0,port=1
 	-device usb-kbd,bus=usb.0,port=1.1
+	-device usb-tablet,bus=usb.0,port=1.2
 )
 
 # A USB mass-storage stick on the xHCI bus (M62): the xhci driver speaks SCSI over
@@ -283,5 +285,6 @@ MON_SOCK="$HERE/.build/qemu-monitor.sock"
 mkdir -p "$HERE/.build"
 rm -f "$MON_SOCK"
 QEMU_ARGS+=(-monitor "unix:$MON_SOCK,server,nowait")
+QEMU_ARGS+=(-qmp "unix:$HERE/.build/qemu-qmp.sock,server,nowait")
 
 exec qemu-system-x86_64 "${QEMU_ARGS[@]}"

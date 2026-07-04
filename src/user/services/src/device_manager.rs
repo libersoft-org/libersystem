@@ -54,6 +54,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut input_client: u64 = 0;
 		let mut usb_client: u64 = 0;
 		let mut usbq_client: u64 = 0;
+		let mut usb_pointer: u64 = 0;
 		launch_boot_drivers(&package, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client);
 
 		// 3. report in once the disks are bound, transferring the block service channel up
@@ -73,7 +74,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		loop {
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
-					launch_volume_drivers(handle, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client);
+					launch_volume_drivers(handle, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer);
 					if handle != 0 {
 						close(handle);
 					}
@@ -83,6 +84,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					send_blocking(bootstrap, b"INPUT", input_client);
 					send_blocking(bootstrap, b"USB", usb_client);
 					send_blocking(bootstrap, b"USBBUS", usbq_client);
+					// the xhci driver's pointer-event channel (a USB pointing device;
+					// InputService folds it alongside the virtio pointer's).
+					send_blocking(bootstrap, b"INPUT2", usb_pointer);
 				}
 				Received::Message { .. } => {
 					send_blocking(bootstrap, b"DeviceManager: stopped", 0);
@@ -147,9 +151,10 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 // driver from vol://system/drivers/ through the StorageService client `storage` and spawn
 // it with its device's MMIO capability. Their control / event channels are handed back for
 // NetworkService, ConsoleService, AudioService, InputService and the USB StorageService
-// instance, plus the xHCI driver's USB bus query channel (for the `lsusb` inventory).
+// instance, plus the xHCI driver's USB bus query channel (for the `lsusb` inventory) and
+// its pointer-event channel (a USB pointing device, folded by InputService).
 // Tracks each device's state and prints a summary.
-unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64) {
+unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64) {
 	unsafe {
 		let count: u64 = device_count();
 		// per-device state, sized by what the kernel actually discovered - the bus is
@@ -208,7 +213,8 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 				}
 				// The xhci driver hands up the USB stick's block-service channel (handle 0
 				// when no mass-storage device is attached), routed to the usb StorageService,
-				// then its USB bus query channel under "USBBUS" (the `lsusb` inventory).
+				// then its USB bus query channel under "USBBUS" (the `lsusb` inventory) and
+				// its pointer-event channel under "POINTER" (a USB pointing device).
 				if driver_name == b"xhci" {
 					if handle != 0 {
 						*usb_client = handle;
@@ -217,6 +223,11 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 						&& len >= 6 && &buf[..6] == b"USBBUS"
 					{
 						*usbq_client = usbq;
+					}
+					if let Received::Message { len, handle: ptr } = recv_blocking(dm_chan, buf)
+						&& len >= 7 && &buf[..7] == b"POINTER"
+					{
+						*usb_pointer = ptr;
 					}
 				}
 			}

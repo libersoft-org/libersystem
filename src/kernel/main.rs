@@ -2174,11 +2174,12 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// MSI-X Interrupt capability, and wait for its report. The driver resets the
 	// controller, builds the command and event rings, enumerates the root-hub
 	// ports, addresses each connected device and reads its device descriptor - QEMU
-	// hangs a hub with a USB keyboard behind it and a mass-storage stick off the
-	// controller (see qemu-run.sh), so three devices must come back addressed: the
-	// hub (expanded through its class requests and route strings), the keyboard
-	// behind it (its HID boot interface configured, which the report's keyboard
-	// marker proves), and the stick (its Bulk-Only transport brought up).
+	// hangs a hub with a USB keyboard and a USB tablet behind it and a mass-storage
+	// stick off the controller (see qemu-run.sh), so four devices must come back
+	// addressed: the hub (expanded through its class requests and route strings),
+	// the keyboard and the tablet behind it (their HID interfaces configured and
+	// their report descriptors parsed, which the report's keyboard and pointer
+	// markers prove), and the stick (its Bulk-Only transport brought up).
 	let (volume, _package) = scenario_packages().expect("boot modules should be present");
 	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/xhci")).expect("the xhci driver should be staged on the volume under drivers/");
 
@@ -2215,16 +2216,21 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	sched::run_until_idle();
 
 	let report = kernel_ep.recv().expect("the xhci driver should report in");
-	assert_eq!(&report.bytes[..], b"driver.xhci: online (3 device(s)) (keyboard) (storage)", "the driver should expand the hub, address the QEMU USB keyboard behind it and the stick, and configure both classes");
+	assert_eq!(&report.bytes[..], b"driver.xhci: online (4 device(s)) (keyboard) (pointer) (storage)", "the driver should expand the hub, address the QEMU USB keyboard and tablet behind it and the stick, and configure all three classes");
 
 	// the report is followed by the bus query channel ("USBBUS"): drive one raw
 	// `usb.list` request over it ([op u16][correlation u32], the generated wire
-	// header) and expect a successful reply naming all three devices' roles - the
+	// header) and expect a successful reply naming all four devices' roles - the
 	// live inventory `lsusb` reads.
 	let usbq_msg = kernel_ep.recv().expect("the USBBUS message should follow the report");
 	assert_eq!(&usbq_msg.bytes[..], b"USBBUS", "the second message carries the bus query channel");
 	let usbq_cap = usbq_msg.caps.first().expect("the query channel is transferred with it");
 	let usbq = usbq_cap.object().into_any_arc().downcast::<Channel>().expect("the query channel is a channel");
+	// the pointer-event channel follows ("POINTER"): the raw stream a USB pointing
+	// device's reports feed, routed to InputService live.
+	let ptr_msg = kernel_ep.recv().expect("the POINTER message should follow USBBUS");
+	assert_eq!(&ptr_msg.bytes[..], b"POINTER", "the third message carries the pointer-event channel");
+	assert!(ptr_msg.caps.first().is_some(), "the pointer channel is transferred with it");
 	let mut list = alloc::vec::Vec::new();
 	list.extend_from_slice(&1u16.to_le_bytes()); // OP_LIST
 	list.extend_from_slice(&1u32.to_le_bytes()); // correlation id
@@ -2233,7 +2239,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let inventory = usbq.recv().expect("the usb.list reply should arrive");
 	assert!(inventory.bytes.len() >= 5 && inventory.bytes[4] == 1, "the inventory query should succeed");
 	let has = |needle: &[u8]| inventory.bytes.windows(needle.len()).any(|w| w == needle);
-	assert!(has(b"hub") && has(b"keyboard") && has(b"storage"), "the inventory should name the hub, the keyboard and the stick by role");
+	assert!(has(b"hub") && has(b"keyboard") && has(b"pointer") && has(b"storage"), "the inventory should name the hub, the keyboard, the tablet and the stick by role");
 
 	// the report carries the disk's block channel: read sector 0 over it, the same
 	// [op u32][lba u64][count u32] contract driver.virtio-blk serves, and expect a
@@ -2565,6 +2571,8 @@ fn input_service_streams_pointer_events() {
 	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn InputService");
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 	send_cap(&boot_kernel, b"INPUT", raw_consumer, Rights::ALL).expect("input raw bootstrap");
+	// no USB pointer in this scenario: the second raw channel is absent (handle 0).
+	boot_kernel.send(Message::new(b"INPUT2".to_vec(), alloc::vec::Vec::new(), 0)).expect("input2 raw bootstrap");
 	send_cap(&boot_kernel, b"FORWARD", forward_input, Rights::ALL).expect("forward raw bootstrap");
 
 	// Inject two normalized pointer events as the driver would. The grid is COLS = 80

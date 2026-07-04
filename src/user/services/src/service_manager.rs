@@ -261,6 +261,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut snd_client: u64 = 0;
 	let mut input_raw: u64 = 0;
 	let mut input_client: u64 = 0;
+	// The xhci driver's pointer-event channel (a USB pointing device), folded by
+	// InputService alongside the virtio pointer's raw channel.
+	let mut usb_pointer: u64 = 0;
 	// The console end of the InputService -> ConsoleService pointer-forward channel,
 	// minted when InputService bootstraps and handed to ConsoleService when it bootstraps
 	// (InputService is a declared dependency of ConsoleService, so it starts first).
@@ -313,7 +316,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -323,7 +326,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// on process_service, so come up later), so their driver channels are ready.
 				if MANIFEST[i].name == b"storage_service" && started == State::Running {
 					if let Some(dm) = index_of(b"device_manager") {
-						unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_frames, &mut gpu_client, &mut snd_client, &mut input_raw, &mut block5_client, &mut usbq_client, &mut buf) };
+						unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_frames, &mut gpu_client, &mut snd_client, &mut input_raw, &mut block5_client, &mut usbq_client, &mut usb_pointer, &mut buf) };
 					}
 				}
 			}
@@ -515,10 +518,11 @@ unsafe fn launch_from_volume(process_client: u64, name: &[u8], bootstrap: u64) -
 // so it loads the non-bootstrap drivers from vol://system/drivers/ and hands their channels
 // back - the net driver's frame channel, the gpu display channel, the snd control channel,
 // the pointer event channel, the USB stick's block channel (each 0 when that device is
-// absent), and the xHCI driver's USB bus query channel (the `lsusb` inventory). Kept for
-// bootstrapping NetworkService, ConsoleService, AudioService, InputService, the usb
-// StorageService instance and PermissionManager's `usb` grant against the drivers.
-unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_raw: &mut u64, block5_client: &mut u64, usbq_client: &mut u64, buf: &mut [u8]) {
+// absent), the xHCI driver's USB bus query channel (the `lsusb` inventory) and its
+// pointer-event channel (a USB pointing device). Kept for bootstrapping NetworkService,
+// ConsoleService, AudioService, InputService, the usb StorageService instance and
+// PermissionManager's `usb` grant against the drivers.
+unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_raw: &mut u64, block5_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, buf: &mut [u8]) {
 	unsafe {
 		if dm_control == 0 {
 			return;
@@ -545,6 +549,9 @@ unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames
 		if let Received::Message { handle: usbq, .. } = recv_blocking(dm_control, buf) {
 			*usbq_client = usbq;
 		}
+		if let Received::Message { handle: ptr, .. } = recv_blocking(dm_control, buf) {
+			*usb_pointer = ptr;
+		}
 	}
 }
 
@@ -559,7 +566,7 @@ unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -623,7 +630,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"audio_service" && !bootstrap_audio_service(manager_side, *snd_client, audio_client) {
 			return State::Failed;
 		}
-		if name == b"input_service" && !bootstrap_input(manager_side, *input_raw, input_client, pointer_console) {
+		if name == b"input_service" && !bootstrap_input(manager_side, *input_raw, *usb_pointer, input_client, pointer_console) {
 			return State::Failed;
 		}
 		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, *session_client, *perm_client, *pointer_console, console_client, console_control) {
@@ -1188,20 +1195,24 @@ unsafe fn bootstrap_serve(manager_side: u64, client: &mut u64) -> bool {
 }
 
 // Hand InputService the channel its clients reach it on ("SERVE", the client end kept
-// in `*input_client` for the shell) and the raw pointer-event channel routed up from
-// the virtio_input pointer driver via DeviceManager ("INPUT"; the handle is 0 when no
-// pointer device is present, e.g. under test - InputService still serves an empty
-// stream), then "FORWARD" transferring the input end of a fresh pointer-forward
-// channel - InputService forwards every raw pointer event over it to ConsoleService,
-// whose end is kept in `*pointer_console` for ConsoleService's own bootstrap (it starts
-// later, since it declares input_service as a dependency). The order matches
-// InputService's receive order: SERVE, INPUT, FORWARD.
-unsafe fn bootstrap_input(manager_side: u64, input_raw: u64, input_client: &mut u64, pointer_console: &mut u64) -> bool {
+// in `*input_client` for the shell) and the raw pointer-event channels routed up from
+// the virtio_input pointer driver and the xhci driver via DeviceManager ("INPUT" and
+// "INPUT2"; a handle is 0 when that pointer source is absent, e.g. under test -
+// InputService still serves an empty stream), then "FORWARD" transferring the input
+// end of a fresh pointer-forward channel - InputService forwards every raw pointer
+// event over it to ConsoleService, whose end is kept in `*pointer_console` for
+// ConsoleService's own bootstrap (it starts later, since it declares input_service as
+// a dependency). The order matches InputService's receive order: SERVE, INPUT,
+// INPUT2, FORWARD.
+unsafe fn bootstrap_input(manager_side: u64, input_raw: u64, usb_pointer: u64, input_client: &mut u64, pointer_console: &mut u64) -> bool {
 	unsafe {
 		if !bootstrap_serve(manager_side, input_client) {
 			return false;
 		}
 		if !send_blocking(manager_side, b"INPUT", input_raw) {
+			return false;
+		}
+		if !send_blocking(manager_side, b"INPUT2", usb_pointer) {
 			return false;
 		}
 		let (input_fwd, console_fwd): (u64, u64) = match channel() {

@@ -386,7 +386,11 @@ fn layout(code: u16, mods: &Mods) -> u8 {
 	}
 	// Letters flip with Shift XOR Caps Lock; symbols only with Shift.
 	let shifted: bool = if base.is_ascii_lowercase() { mods.shift ^ mods.caps } else { mods.shift };
-	if shifted { KEYMAP_SHIFT[code as usize] } else { base }
+	if shifted {
+		KEYMAP_SHIFT[code as usize]
+	} else {
+		base
+	}
 }
 
 // The ANSI escape sequence a navigation, edit or function keycode maps to, or None
@@ -502,7 +506,43 @@ const HID_KEYCODES: [u16; 0x95] = [
 
 // Resolve a HID keyboard-page usage id to its keycode (0 = unmapped).
 pub fn hid_keycode(usage: u8) -> u16 {
-	if (usage as usize) < HID_KEYCODES.len() { HID_KEYCODES[usage as usize] } else { 0 }
+	if (usage as usize) < HID_KEYCODES.len() {
+		HID_KEYCODES[usage as usize]
+	} else {
+		0
+	}
+}
+
+// Resolve a HID Consumer-page usage to its keycode (0 = unmapped): the media
+// transport, audio, launcher / browser, brightness and power controls a
+// multimedia keyboard reports outside the boot protocol. They resolve to the
+// same reserved keycodes as their dedicated-key twins, so a Consumer-page volume
+// key and a KEY_VOLUMEUP key are one and the same event here.
+pub fn consumer_keycode(usage: u16) -> u16 {
+	match usage {
+		0x30 => KEY_POWER,
+		0x32 => KEY_SLEEP,
+		0x6f => KEY_BRIGHTNESSUP,
+		0x70 => KEY_BRIGHTNESSDOWN,
+		0xb5 => KEY_NEXTSONG,
+		0xb6 => KEY_PREVIOUSSONG,
+		0xb7 => KEY_STOPCD,
+		0xb8 => KEY_EJECTCD,
+		0xcd => KEY_PLAYPAUSE,
+		0xe2 => KEY_MUTE,
+		0xe9 => KEY_VOLUMEUP,
+		0xea => KEY_VOLUMEDOWN,
+		0x18a => KEY_MAIL,
+		0x192 => KEY_CALC,
+		0x194 => KEY_COMPUTER,
+		0x221 => KEY_SEARCH,
+		0x223 => KEY_HOMEPAGE,
+		0x224 => KEY_BACK,
+		0x225 => KEY_FORWARD,
+		0x226 => KEY_STOP,
+		0x227 => KEY_REFRESH,
+		_ => 0,
+	}
 }
 
 // The keycode of each HID boot-report modifier bit (byte 0, bits 0..7):

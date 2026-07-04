@@ -7,11 +7,13 @@
 // controller, builds the device context base array, the command ring and the
 // event ring, starts the controller, and enumerates the root-hub ports: each
 // connected device is reset, given a device slot, addressed, and has its device
-// descriptor read over a control transfer on the default endpoint. A HID boot
-// keyboard found among them is configured (its interrupt IN endpoint brought up,
-// the boot protocol selected) and served interrupt-driven for the life of the
-// system: each report's key changes feed the interactive console through the
-// shared keys module, exactly like the virtio-input keyboard. Bring-up itself is
+// descriptor read over a control transfer on the default endpoint. Every HID
+// device found among them is configured (its interrupt IN endpoint brought up,
+// its report descriptor read and parsed) and served interrupt-driven for the
+// life of the system: keyboard and Consumer-page changes feed the interactive
+// console through the shared keys module, exactly like the virtio-input
+// keyboard, and a pointing device's reports feed InputService as normalized
+// pointer events, exactly like the virtio-input pointer. Bring-up itself is
 // synchronous and polled - commands and transfers one at a time, completions
 // reaped off the event ring - matching the polled virtio-blk/gpu drivers.
 
@@ -20,10 +22,12 @@
 
 extern crate alloc;
 
+mod hid;
 mod keys;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use proto::system::usb;
 use proto::system::{Error as UsbError, UsbDevice as UsbEntry};
 use rt::*;
@@ -149,12 +153,19 @@ const BOT_REQ_RESET: u8 = 0xff;
 const RT_CLASS_INTERFACE: u8 = 0x21;
 
 // The HID class SET_PROTOCOL request (to the interface): wValue 0 selects the
-// fixed boot-report layout, so a keyboard's reports need no report descriptor.
+// fixed boot-report layout - the fallback for a boot-subclass keyboard whose
+// report descriptor cannot be read.
 const HID_REQ_SET_PROTOCOL: u8 = 0x0b;
 
-// Descriptor types and the HID boot-keyboard identity within a configuration.
+// Descriptor types and the HID identity within a configuration: the HID class
+// descriptor (embedded after the interface descriptor) names the report
+// descriptor's length, and the report descriptor itself is read with an
+// interface-targeted GET_DESCRIPTOR.
 const DT_INTERFACE: u8 = 4;
 const DT_ENDPOINT: u8 = 5;
+const DT_HID: u8 = 0x21;
+const DESC_REPORT: u16 = 0x22;
+const RT_INTERFACE_IN: u8 = 0x81;
 const CLASS_HID: u8 = 3;
 const SUBCLASS_BOOT: u8 = 1;
 const PROTOCOL_KEYBOARD: u8 = 1;
@@ -336,16 +347,52 @@ struct UsbDevice {
 	class: u8,
 }
 
-// A configured HID boot keyboard: the interrupt IN endpoint's device context index
-// and its transfer ring, on which 8-byte boot reports are posted and reaped, plus
-// the report state the service loop diffs against (the previous report and the
-// tracked modifiers).
-struct Keyboard {
+// A configured HID input device: the interrupt IN endpoint's device context index
+// and its transfer ring, on which input reports of the descriptor's size are
+// posted and reaped; the parsed report layout the reports decode against; the
+// previous report body per report id (the state the key diffs run against); the
+// tracked modifiers; and the running pointer state (normalized position and
+// buttons) a pointing device's reports fold into.
+struct Hid {
 	dci: u32,
 	ring: Ring,
-	prev: [u8; 8],
+	layout: hid::Layout,
+	posted: bool,
+	prevs: Vec<(u8, [u8; 64])>,
 	mods: Mods,
+	x: i32,
+	y: i32,
+	buttons: u8,
 }
+
+// The bound HID devices the service loop reaps reports for. The synchronous
+// control / transport waits service their events inline, so typing is never lost
+// behind disk traffic; bring-up paths pass an empty set (no report TRB is in
+// flight before the service loop posts the first one).
+struct Hids {
+	entries: Vec<(UsbDevice, Hid)>,
+}
+
+impl Hids {
+	const fn new() -> Hids {
+		Hids { entries: Vec::new() }
+	}
+
+	// Whether any bound device reports keyboard-page keys.
+	fn any_keyboard(&self) -> bool {
+		self.entries.iter().any(|(_, h)| h.layout.has_keyboard())
+	}
+
+	// Whether any bound device reports a pointer.
+	fn any_pointer(&self) -> bool {
+		self.entries.iter().any(|(_, h)| h.layout.has_pointer())
+	}
+}
+
+// The pointer-event sink: the server end of the channel InputService reads,
+// set once at startup. Pointer reports send through it from wherever they are
+// reaped - the service loop or a wait deep inside a disk transfer.
+static PTR_SINK: AtomicU64 = AtomicU64::new(0);
 
 // One addressed device's inventory record: its root port and slot (the state a
 // detach tears down), plus the identity its device descriptor reported and the
@@ -366,6 +413,7 @@ const KIND_DEVICE: u8 = 0;
 const KIND_HUB: u8 = 1;
 const KIND_KEYBOARD: u8 = 2;
 const KIND_STORAGE: u8 = 3;
+const KIND_POINTER: u8 = 4;
 
 // The addressed devices, by root port - the state hot-plug works against and the
 // inventory `usb.list` serves. An attach enumerates a root port only when no slot
@@ -451,17 +499,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		};
 		// enumerate the root-hub ports, address every connected device (expanding hubs
-		// recursively), and configure the first HID boot keyboard and the first
-		// mass-storage device found anywhere on the bus. Every addressed device's slot
-		// is recorded by root port, the state runtime attach/detach works against.
+		// recursively), and configure every HID device and the first mass-storage
+		// device found anywhere on the bus. Every addressed device's slot is recorded
+		// by root port, the state runtime attach/detach works against.
 		let mut devices: u32 = 0;
-		let mut keyboard: Option<(UsbDevice, Keyboard)> = None;
+		let mut hids: Hids = Hids::new();
 		let mut storage: Option<(UsbDevice, Storage)> = None;
 		let mut slots: Slots = Slots::new();
 		let mut port: u32 = 1;
 		while port <= hc.ports {
 			if let Some(dev) = attach_port(&mut hc, port) {
-				register_device(&mut hc, dev, &mut slots, &mut devices, &mut keyboard, &mut storage);
+				register_device(&mut hc, dev, &mut slots, &mut devices, &mut hids, &mut storage);
 			}
 			port += 1;
 		}
@@ -475,7 +523,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// `lsusb` command); the driver serves the typed `usb` interface on the server
 		// end - the live inventory of the devices it addressed.
 		let (usbq_server, usbq_client): (u64, u64) = channel().unwrap_or_else(|| exit());
-		// report in, then serve the bus for the life of the system: keyboard reports,
+		// the pointer-event channel: the client end follows under "POINTER"
+		// (DeviceManager routes it to InputService), and a pointing device's reports
+		// send normalized events over the server end - the same wire format the
+		// virtio-input pointer speaks. Always created, so a pointer hot-plugged later
+		// serves over the same channel.
+		let (ptr_server, ptr_client): (u64, u64) = channel().unwrap_or_else(|| exit());
+		PTR_SINK.store(ptr_server, Ordering::Relaxed);
+		// report in, then serve the bus for the life of the system: HID reports,
 		// block requests, and runtime attach / detach.
 		let mut report: [u8; 64] = [0u8; 64];
 		let mut n: usize = 0;
@@ -488,8 +543,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			report[n] = b;
 			n += 1;
 		}
-		if keyboard.is_some() {
+		if hids.any_keyboard() {
 			for &b in b" (keyboard)" {
+				report[n] = b;
+				n += 1;
+			}
+		}
+		if hids.any_pointer() {
+			for &b in b" (pointer)" {
 				report[n] = b;
 				n += 1;
 			}
@@ -502,7 +563,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		send_blocking(bootstrap, &report[..n], blk_client);
 		send_blocking(bootstrap, b"USBBUS", usbq_client);
-		service_loop(&mut hc, &mut slots, keyboard, storage, blk_server, usbq_server, irq);
+		send_blocking(bootstrap, b"POINTER", ptr_client);
+		service_loop(&mut hc, &mut slots, hids, storage, blk_server, usbq_server, irq);
 	}
 }
 
@@ -731,9 +793,9 @@ unsafe fn address_device(hc: &mut Xhci, root_port: u32, route: u32, speed: u32) 
 		let (_ih, in_virt, in_phys): (u64, u64, u64) = dma_page()?;
 		let (_bh, data_virt, data_phys): (u64, u64, u64) = dma_page()?;
 		let mut dev: UsbDevice = UsbDevice { slot, port: root_port, route, speed, ep0: Ring::new()?, in_virt, in_phys, data_virt, data_phys, vendor: 0, product: 0, class: 0 };
-		// no keyboard can have reports in flight during bring-up (its report TRB is
-		// only posted once the service loop starts), so the waits see no keyboard events.
-		let mut pending: Option<(UsbDevice, Keyboard)> = None;
+		// no HID device can have reports in flight during bring-up (report TRBs are
+		// only posted once the service loop starts), so the waits see no HID events.
+		let mut pending: Hids = Hids::new();
 
 		// address the device: an input context whose slot context names the port and
 		// whose endpoint-0 context points at the transfer ring.
@@ -773,21 +835,19 @@ fn initial_packet_size(speed: u32) -> u32 {
 // Register one addressed device: print its identity, record its slot by root port
 // (the state a later detach tears down), count it, and classify it - a hub is
 // expanded (its ports enumerated, each downstream device landing back here
-// recursively), the first HID boot keyboard and the first mass-storage device are
+// recursively), every HID device and the first mass-storage device are
 // configured and kept for the service loop, anything else is left addressed.
-unsafe fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices: &mut u32, keyboard: &mut Option<(UsbDevice, Keyboard)>, storage: &mut Option<(UsbDevice, Storage)>) {
+unsafe fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>) {
 	unsafe {
 		report_device(&dev);
 		slots.record(SlotRec { port: dev.port, slot: dev.slot, speed: dev.speed, vendor: dev.vendor, product: dev.product, class: dev.class, kind: KIND_DEVICE });
 		*devices += 1;
 		if dev.class == CLASS_HUB {
 			slots.set_kind(dev.slot, KIND_HUB);
-			expand_hub(hc, &mut dev, slots, devices, keyboard, storage);
-		} else if keyboard.is_none()
-			&& let Some(kb) = configure_keyboard(hc, &mut dev)
-		{
-			slots.set_kind(dev.slot, KIND_KEYBOARD);
-			*keyboard = Some((dev, kb));
+			expand_hub(hc, &mut dev, slots, devices, hids, storage);
+		} else if let Some(h) = configure_hid(hc, &mut dev) {
+			slots.set_kind(dev.slot, if h.layout.has_keyboard() { KIND_KEYBOARD } else { KIND_POINTER });
+			hids.entries.push((dev, h));
 		} else if storage.is_none()
 			&& let Some(st) = configure_storage(hc, &mut dev)
 		{
@@ -802,10 +862,10 @@ unsafe fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, 
 // up, and bring up whatever is connected. Each addressed downstream device runs
 // through `register_device`, so a hub found downstream expands recursively and a
 // keyboard or disk behind any tier of hubs is configured like a root one.
-unsafe fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &mut u32, keyboard: &mut Option<(UsbDevice, Keyboard)>, storage: &mut Option<(UsbDevice, Storage)>) {
+unsafe fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>) {
 	unsafe {
-		// no keyboard is serving yet, so the control waits see no keyboard events.
-		let mut pending: Option<(UsbDevice, Keyboard)> = None;
+		// no HID device is serving yet, so the control waits see no HID events.
+		let mut pending: Hids = Hids::new();
 		// select the hub's configuration (the head of its config descriptor names it).
 		if control_in(hc, &mut pending, hub, DESC_CONFIG, 9).is_none() {
 			return;
@@ -828,7 +888,7 @@ unsafe fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devi
 		let mut port: u32 = 1;
 		while port <= ports.min(15) {
 			if let Some(dev) = attach_hub_port(hc, hub, port, shift) {
-				register_device(hc, dev, slots, devices, keyboard, storage);
+				register_device(hc, dev, slots, devices, hids, storage);
 			}
 			port += 1;
 		}
@@ -842,7 +902,7 @@ unsafe fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devi
 // None when the port is empty or any step fails.
 unsafe fn attach_hub_port(hc: &mut Xhci, hub: &mut UsbDevice, port: u32, shift: u32) -> Option<UsbDevice> {
 	unsafe {
-		let mut pending: Option<(UsbDevice, Keyboard)> = None;
+		let mut pending: Hids = Hids::new();
 		// power the port and wait for the power state to read back.
 		control_nodata(hc, &mut pending, hub, RT_CLASS_PORT, REQ_SET_FEATURE, HUB_FEAT_PORT_POWER, port as u16)?;
 		let mut spins: u32 = 0;
@@ -888,17 +948,17 @@ unsafe fn attach_hub_port(hc: &mut Xhci, hub: &mut UsbDevice, port: u32, shift: 
 }
 
 // Read one hub port's status word (the low half of the GET_STATUS reply).
-unsafe fn hub_port_status(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, hub: &mut UsbDevice, port: u32) -> Option<u16> {
+unsafe fn hub_port_status(hc: &mut Xhci, hids: &mut Hids, hub: &mut UsbDevice, port: u32) -> Option<u16> {
 	unsafe {
-		control_in_req(hc, keyboard, hub, RT_CLASS_PORT_IN, REQ_GET_STATUS, 0, port as u16, 4)?;
+		control_in_req(hc, hids, hub, RT_CLASS_PORT_IN, REQ_GET_STATUS, 0, port as u16, 4)?;
 		Some(r8(hub.data_virt) as u16 | (r8(hub.data_virt + 1) as u16) << 8)
 	}
 }
 
 // Read one hub port's change word (the high half of the GET_STATUS reply).
-unsafe fn hub_port_change(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, hub: &mut UsbDevice, port: u32) -> Option<u16> {
+unsafe fn hub_port_change(hc: &mut Xhci, hids: &mut Hids, hub: &mut UsbDevice, port: u32) -> Option<u16> {
 	unsafe {
-		control_in_req(hc, keyboard, hub, RT_CLASS_PORT_IN, REQ_GET_STATUS, 0, port as u16, 4)?;
+		control_in_req(hc, hids, hub, RT_CLASS_PORT_IN, REQ_GET_STATUS, 0, port as u16, 4)?;
 		Some(r8(hub.data_virt + 2) as u16 | (r8(hub.data_virt + 3) as u16) << 8)
 	}
 }
@@ -928,8 +988,8 @@ unsafe fn write_address_contexts(hc: &Xhci, dev: &UsbDevice, mps: u32) {
 
 // Read `len` bytes of descriptor `desc` from the device into its data page with a
 // standard GET_DESCRIPTOR control transfer on the default endpoint.
-unsafe fn control_in(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, desc: u16, len: u16) -> Option<()> {
-	unsafe { control_in_req(hc, keyboard, dev, 0x80, REQ_GET_DESCRIPTOR, desc << 8, 0, len) }
+unsafe fn control_in(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, desc: u16, len: u16) -> Option<()> {
+	unsafe { control_in_req(hc, hids, dev, 0x80, REQ_GET_DESCRIPTOR, desc << 8, 0, len) }
 }
 
 // Run one IN control request on the default endpoint, the data landing in the
@@ -938,7 +998,7 @@ unsafe fn control_in(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>
 // event. The hub class requests (GET_STATUS on a port, the hub descriptor) ride
 // through here too. A stall halts endpoint 0; it is recovered before reporting
 // failure, so the endpoint stays usable.
-unsafe fn control_in_req(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16, len: u16) -> Option<()> {
+unsafe fn control_in_req(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16, len: u16) -> Option<()> {
 	unsafe {
 		let setup: u64 = request_type as u64 | (request as u64) << 8 | (value as u64) << 16 | (index as u64) << 32 | (len as u64) << 48;
 		dev.ep0.push(setup, 8, TRB_SETUP << 10 | TRB_IDT | TRB_TRT_IN);
@@ -946,9 +1006,9 @@ unsafe fn control_in_req(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboa
 		dev.ep0.push(0, 0, TRB_STATUS << 10 | TRB_IOC);
 		// ring the device slot's doorbell for the default control endpoint (DCI 1).
 		w32(hc.db + dev.slot as u64 * 4, 1);
-		let code: u32 = wait_transfer(hc, keyboard, dev.slot, 1)?;
+		let code: u32 = wait_transfer(hc, hids, dev.slot, 1)?;
 		if code == CC_STALL {
-			recover_ep0(hc, keyboard, dev);
+			recover_ep0(hc, hids, dev);
 			return None;
 		}
 		if code != CC_SUCCESS && code != CC_SHORT_PACKET { None } else { Some(()) }
@@ -960,15 +1020,15 @@ unsafe fn control_in_req(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboa
 // stage with no data stage, then the IN-direction status stage, the doorbell and
 // the completion event. A stall halts endpoint 0; it is recovered before reporting
 // failure, so a request the device rejects leaves the endpoint usable.
-unsafe fn control_nodata(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16) -> Option<()> {
+unsafe fn control_nodata(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16) -> Option<()> {
 	unsafe {
 		let setup: u64 = request_type as u64 | (request as u64) << 8 | (value as u64) << 16 | (index as u64) << 32;
 		dev.ep0.push(setup, 8, TRB_SETUP << 10 | TRB_IDT);
 		dev.ep0.push(0, 0, TRB_STATUS << 10 | TRB_DIR_IN | TRB_IOC);
 		w32(hc.db + dev.slot as u64 * 4, 1);
-		let code: u32 = wait_transfer(hc, keyboard, dev.slot, 1)?;
+		let code: u32 = wait_transfer(hc, hids, dev.slot, 1)?;
 		if code == CC_STALL {
-			recover_ep0(hc, keyboard, dev);
+			recover_ep0(hc, hids, dev);
 			return None;
 		}
 		if code != CC_SUCCESS { None } else { Some(()) }
@@ -979,39 +1039,39 @@ unsafe fn control_nodata(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboa
 // clears the controller-side halt, and a Set TR Dequeue Pointer repositions the
 // transfer ring past the abandoned control transfer (at the producer's current
 // position). Endpoint 0 has no device-side halt feature, so no CLEAR_FEATURE.
-unsafe fn recover_ep0(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice) {
+unsafe fn recover_ep0(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice) {
 	unsafe {
-		reset_endpoint(hc, keyboard, dev.slot, 1, dev.ep0.phys + dev.ep0.index * 16 | dev.ep0.cycle as u64);
+		reset_endpoint(hc, hids, dev.slot, 1, dev.ep0.phys + dev.ep0.index * 16 | dev.ep0.cycle as u64);
 	}
 }
 
 // Recover one halted bulk endpoint of the storage device after a stall: the
 // controller-side Reset Endpoint + Set TR Dequeue Pointer pair, then the device-side
 // CLEAR_FEATURE(ENDPOINT_HALT) to the endpoint's address, resetting its data toggle.
-unsafe fn recover_bulk(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage, dir_in: bool) {
+unsafe fn recover_bulk(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, dir_in: bool) {
 	unsafe {
 		let (dci, addr, dequeue): (u32, u8, u64) = if dir_in { (st.dci_in, st.ep_in_addr, st.ring_in.phys + st.ring_in.index * 16 | st.ring_in.cycle as u64) } else { (st.dci_out, st.ep_out_addr, st.ring_out.phys + st.ring_out.index * 16 | st.ring_out.cycle as u64) };
-		reset_endpoint(hc, keyboard, dev.slot, dci, dequeue);
-		let _ = control_nodata(hc, keyboard, dev, RT_ENDPOINT, REQ_CLEAR_FEATURE, FEATURE_ENDPOINT_HALT, addr as u16);
+		reset_endpoint(hc, hids, dev.slot, dci, dequeue);
+		let _ = control_nodata(hc, hids, dev, RT_ENDPOINT, REQ_CLEAR_FEATURE, FEATURE_ENDPOINT_HALT, addr as u16);
 	}
 }
 
 // The controller half of stall recovery: Reset Endpoint clears the endpoint's
 // halted state, Set TR Dequeue Pointer repositions its transfer ring to `dequeue`
 // (the producer's current position with the cycle state in bit 0), abandoning the
-// stalled TD. Keyboard events arriving during the command waits are serviced.
-unsafe fn reset_endpoint(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, slot: u32, dci: u32, dequeue: u64) {
+// stalled TD. HID events arriving during the command waits are serviced.
+unsafe fn reset_endpoint(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32, dequeue: u64) {
 	unsafe {
 		command(hc, 0, 0, TRB_RESET_ENDPOINT << 10 | dci << 16 | slot << 24);
-		let _ = wait_command(hc, keyboard);
+		let _ = wait_command(hc, hids);
 		command(hc, dequeue, 0, TRB_SET_TR_DEQUEUE << 10 | dci << 16 | slot << 24);
-		let _ = wait_command(hc, keyboard);
+		let _ = wait_command(hc, hids);
 	}
 }
 
-// Wait for a command completion event, servicing keyboard events that arrive in the
+// Wait for a command completion event, servicing HID events that arrive in the
 // meantime inline. Returns the completion code, or None on budget exhaustion.
-unsafe fn wait_command(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>) -> Option<u32> {
+unsafe fn wait_command(hc: &mut Xhci, hids: &mut Hids) -> Option<u32> {
 	unsafe {
 		let mut spins: u32 = 0;
 		loop {
@@ -1019,7 +1079,7 @@ unsafe fn wait_command(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard
 				if control >> 10 & 0x3f == TRB_EV_CMD_COMPLETE {
 					return Some(status >> 24);
 				}
-				handle_keyboard_event(hc, keyboard, status, control);
+				handle_hid_event(hc, hids, status, control);
 				continue;
 			}
 			spins += 1;
@@ -1036,35 +1096,41 @@ unsafe fn wait_command(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard
 // The last-resort transport recovery (the Bulk-Only spec's reset sequence): the
 // Mass Storage Reset class request returns the device's BOT state machine to idle,
 // then both bulk endpoints are unhalted, so the next CBW starts a clean transaction.
-unsafe fn bot_reset(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage) {
+unsafe fn bot_reset(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage) {
 	unsafe {
-		let _ = control_nodata(hc, keyboard, dev, RT_CLASS_INTERFACE, BOT_REQ_RESET, 0, st.iface);
-		recover_bulk(hc, keyboard, dev, st, true);
-		recover_bulk(hc, keyboard, dev, st, false);
+		let _ = control_nodata(hc, hids, dev, RT_CLASS_INTERFACE, BOT_REQ_RESET, 0, st.iface);
+		recover_bulk(hc, hids, dev, st, true);
+		recover_bulk(hc, hids, dev, st, false);
 	}
 }
 
-// Configure the device's HID boot keyboard, if it has one: read the configuration
-// descriptor, find a boot-keyboard interface (HID class, boot subclass, keyboard
-// protocol) and its interrupt IN endpoint, bring that endpoint up with a
-// configure-endpoint command, select the configuration on the device, and put the
-// keyboard into the fixed boot-report protocol. None when the device carries no
-// boot keyboard or any step fails.
-unsafe fn configure_keyboard(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Keyboard> {
+// Configure the device's HID function, if it has one: read the configuration
+// descriptor, find a HID interface (any subclass - keyboards, pointing devices
+// and multimedia controls alike), its interrupt IN endpoint and its report
+// descriptor's length, bring the endpoint up with a configure-endpoint command,
+// select the configuration, then read and parse the report descriptor - the
+// layout the device's input reports decode against. A boot-subclass keyboard
+// whose report descriptor cannot be read falls back to the fixed boot protocol.
+// None when the device carries no HID function whose reports the system consumes,
+// or any step fails.
+unsafe fn configure_hid(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Hid> {
 	unsafe {
-		// no keyboard is serving yet, so the control waits see no keyboard events.
-		let mut pending: Option<(UsbDevice, Keyboard)> = None;
+		// no HID device is serving yet, so the control waits see no HID events.
+		let mut pending: Hids = Hids::new();
 		// the configuration descriptor head names the total length; read it whole.
 		control_in(hc, &mut pending, dev, DESC_CONFIG, 9)?;
 		let total: u16 = (r8(dev.data_virt + 2) as u16 | (r8(dev.data_virt + 3) as u16) << 8).min(1024);
 		let config_value: u16 = r8(dev.data_virt + 5) as u16;
 		control_in(hc, &mut pending, dev, DESC_CONFIG, total)?;
 
-		// walk the descriptors for a boot-keyboard interface, then its interrupt IN
-		// endpoint (the descriptors that follow the interface until the next one).
+		// walk the descriptors for a HID interface, its report descriptor's length
+		// (the HID class descriptor rides between the interface and its endpoints)
+		// and its interrupt IN endpoint.
 		let mut offset: u64 = 0;
-		let mut in_keyboard: bool = false;
+		let mut in_hid: bool = false;
+		let mut boot_keyboard: bool = false;
 		let mut iface: u16 = 0;
+		let mut desc_len: u16 = 0;
 		let mut found: Option<(u32, u32, u32)> = None; // (dci, mps, interval)
 		while offset + 2 <= total as u64 {
 			let length: u64 = r8(dev.data_virt + offset) as u64;
@@ -1072,13 +1138,18 @@ unsafe fn configure_keyboard(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Keybo
 			if length < 2 {
 				break;
 			}
-			if kind == DT_INTERFACE {
-				in_keyboard = r8(dev.data_virt + offset + 5) == CLASS_HID && r8(dev.data_virt + offset + 6) == SUBCLASS_BOOT && r8(dev.data_virt + offset + 7) == PROTOCOL_KEYBOARD;
-				if in_keyboard {
+			if kind == DT_INTERFACE && found.is_none() {
+				in_hid = r8(dev.data_virt + offset + 5) == CLASS_HID;
+				if in_hid {
 					iface = r8(dev.data_virt + offset + 2) as u16;
+					boot_keyboard = r8(dev.data_virt + offset + 6) == SUBCLASS_BOOT && r8(dev.data_virt + offset + 7) == PROTOCOL_KEYBOARD;
 				}
 			}
-			if kind == DT_ENDPOINT && in_keyboard && found.is_none() {
+			if kind == DT_HID && in_hid && found.is_none() && length >= 9 {
+				// wDescriptorLength of the (first) class descriptor, the report one.
+				desc_len = r8(dev.data_virt + offset + 7) as u16 | (r8(dev.data_virt + offset + 8) as u16) << 8;
+			}
+			if kind == DT_ENDPOINT && in_hid && found.is_none() {
 				let ep_addr: u8 = r8(dev.data_virt + offset + 2);
 				let attrs: u8 = r8(dev.data_virt + offset + 3);
 				if ep_addr & 0x80 != 0 && attrs & 0x3 == EP_ATTR_INTERRUPT {
@@ -1109,10 +1180,28 @@ unsafe fn configure_keyboard(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Keybo
 		((ep_ctx + 16) as *mut u32).write_volatile(8 | mps << 16);
 		command_and_wait(hc, dev.in_phys, 0, TRB_CONFIGURE_ENDPOINT << 10 | dev.slot << 24)?;
 
-		// select the configuration, then the boot protocol (the fixed 8-byte report).
+		// select the configuration, then read and parse the report descriptor. The
+		// device stays in its default report protocol - the layout tells the driver
+		// what each report carries, no boot arrangement needed. A boot-subclass
+		// keyboard whose descriptor cannot be read is put into the boot protocol
+		// instead and decoded with the fixed boot layout.
 		control_nodata(hc, &mut pending, dev, 0x00, REQ_SET_CONFIGURATION, config_value, 0)?;
-		control_nodata(hc, &mut pending, dev, 0x21, HID_REQ_SET_PROTOCOL, 0, iface)?;
-		Some(Keyboard { dci, ring, prev: [0u8; 8], mods: Mods::default() })
+		let layout: hid::Layout = match desc_len {
+			0 => hid::Layout::empty(),
+			_ => match control_in_req(hc, &mut pending, dev, RT_INTERFACE_IN, REQ_GET_DESCRIPTOR, DESC_REPORT << 8, iface, desc_len.min(1024)) {
+				Some(()) => hid::parse(core::slice::from_raw_parts(dev.data_virt as *const u8, desc_len.min(1024) as usize)),
+				None => hid::Layout::empty(),
+			},
+		};
+		let layout: hid::Layout = if layout.is_useful() {
+			layout
+		} else if boot_keyboard {
+			control_nodata(hc, &mut pending, dev, 0x21, HID_REQ_SET_PROTOCOL, 0, iface)?;
+			hid::boot_keyboard()
+		} else {
+			return None;
+		};
+		Some(Hid { dci, ring, layout, posted: false, prevs: Vec::new(), mods: Mods::default(), x: 0, y: 0, buttons: 0 })
 	}
 }
 
@@ -1131,47 +1220,46 @@ fn ep_interval(speed: u32, b_interval: u32) -> u32 {
 	exp
 }
 
-// Serve the bus for the life of the system: the keyboard keeps one 8-byte report
-// TRB posted (the device completes it only when the key state changes) and its
-// reports feed the console; the disk serves block requests arriving on
-// `blk_server` (answered with an error status while no disk is attached); the
-// typed `usb` interface serves the live device inventory on `usbq`; and a
-// port-status-change event triggers a root-port reconcile, so a device plugged in
-// at runtime enumerates and configures on the fly and an unplugged one is torn
-// down. The loop sleeps on the controller's MSI-X interrupt and both channels
-// at once, and the synchronous BOT waits service keyboard events inline, so typing
-// is never lost behind disk traffic.
-unsafe fn service_loop(hc: &mut Xhci, slots: &mut Slots, mut keyboard: Option<(UsbDevice, Keyboard)>, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, usbq: u64, irq: u64) -> ! {
+// Serve the bus for the life of the system: every HID device keeps one input
+// report TRB posted (the device completes it only when its state changes) and
+// its reports feed the console and the pointer sink; the disk serves block
+// requests arriving on `blk_server` (answered with an error status while no disk
+// is attached); the typed `usb` interface serves the live device inventory on
+// `usbq`; and a port-status-change event triggers a root-port reconcile, so a
+// device plugged in at runtime enumerates and configures on the fly and an
+// unplugged one is torn down. The loop sleeps on the controller's MSI-X
+// interrupt and both channels at once, and the synchronous BOT waits service HID
+// events inline, so typing is never lost behind disk traffic.
+unsafe fn service_loop(hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, usbq: u64, irq: u64) -> ! {
 	unsafe {
-		if let Some((dev, kb)) = keyboard.as_mut() {
-			post_report(hc, dev, kb);
-		}
+		post_reports(hc, &mut hids);
 		let mut req: [u8; 16] = [0u8; 16];
 		loop {
 			let waitset: [u64; 3] = [irq, blk_server, usbq];
 			wait_any(&waitset, 0);
-			// the interrupt: drain the event ring (keyboard reports feed the console; a
-			// port-status change marks the bus for the reconcile below), acknowledge,
-			// and clear the interrupter's pending flag so the next event edge fires.
+			// the interrupt: drain the event ring (HID reports feed the console and
+			// the pointer sink; a port-status change marks the bus for the reconcile
+			// below), acknowledge, and clear the interrupter's pending flag so the
+			// next event edge fires.
 			let mut rescan: bool = false;
 			while let Some((_p, status, control)) = take_event(hc) {
 				if control >> 10 & 0x3f == TRB_EV_PORT_STATUS {
 					rescan = true;
 					continue;
 				}
-				handle_keyboard_event(hc, &mut keyboard, status, control);
+				handle_hid_event(hc, &mut hids, status, control);
 			}
 			interrupt_ack(irq);
 			w32(hc.ir0 + IR_IMAN, IMAN_IE | IMAN_IP);
 			if rescan {
-				reconcile_ports(hc, slots, &mut keyboard, &mut storage);
+				reconcile_ports(hc, slots, &mut hids, &mut storage);
 			}
 			// the block channel: serve every queued request (with an error status while
 			// no mass-storage device is attached, so a client never blocks).
 			loop {
 				match try_recv(blk_server, &mut req) {
 					Polled::Message { len, handle } if len >= 16 => match storage.as_mut() {
-						Some((dev, st)) => serve_block_request(hc, &mut keyboard, dev, st, blk_server, &req, handle),
+						Some((dev, st)) => serve_block_request(hc, &mut hids, dev, st, blk_server, &req, handle),
 						None => {
 							if handle != 0 {
 								close(handle);
@@ -1242,18 +1330,19 @@ fn kind_name(kind: u8) -> &'static str {
 		KIND_HUB => "hub",
 		KIND_KEYBOARD => "keyboard",
 		KIND_STORAGE => "storage",
+		KIND_POINTER => "pointer",
 		_ => "device",
 	}
 }
 
 // Reconcile the root ports with the addressed-device state after a port-status
 // change: a connected port with no addressed device is a fresh attach - enumerate
-// and classify it like at start (a new keyboard begins serving reports, a new disk
-// serves the block channel); a disconnected port with addressed devices is a
+// and classify it like at start (a new HID device begins serving reports, a new
+// disk serves the block channel); a disconnected port with addressed devices is a
 // detach - every slot on that port is disabled (a hub takes its downstream devices
-// along) and the keyboard / storage state dropped, so vol://usb unmounts and a
+// along) and the HID / storage state dropped, so vol://usb unmounts and a
 // replug enumerates cleanly.
-unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, keyboard: &mut Option<(UsbDevice, Keyboard)>, storage: &mut Option<(UsbDevice, Storage)>) {
+unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>) {
 	unsafe {
 		let mut port: u32 = 1;
 		while port <= hc.ports {
@@ -1261,28 +1350,23 @@ unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, keyboard: &mut Optio
 			let connected: bool = r32(addr) & PORTSC_CCS != 0;
 			let known: bool = slots.has_port(port);
 			if connected && !known {
-				let had_keyboard: bool = keyboard.is_some();
 				let mut devices: u32 = 0;
 				if let Some(dev) = attach_port(hc, port) {
-					register_device(hc, dev, slots, &mut devices, keyboard, storage);
+					register_device(hc, dev, slots, &mut devices, hids, storage);
 				}
-				// a keyboard configured by this attach starts serving: post its first
-				// report TRB (the boot-time one is posted before the service loop).
-				if !had_keyboard && let Some((dev, kb)) = keyboard.as_mut() {
-					post_report(hc, dev, kb);
-				}
+				// a HID device configured by this attach starts serving: post its first
+				// report TRB (the boot-time ones are posted before the service loop).
+				post_reports(hc, hids);
 			} else if !connected && known {
 				// acknowledge the disconnect and tear the port's devices down.
 				portsc_write(hc, port, PORTSC_CSC | PORTSC_PEC | PORTSC_PRC | PORTSC_WRC | PORTSC_PLC | PORTSC_CEC);
 				while let Some(slot) = slots.take_port(port) {
 					command(hc, 0, 0, TRB_DISABLE_SLOT << 10 | slot << 24);
-					let mut none: Option<(UsbDevice, Keyboard)> = None;
+					let mut none: Hids = Hids::new();
 					let _ = wait_command(hc, &mut none);
 					((hc.dcbaa_virt + slot as u64 * 8) as *mut u64).write_volatile(0);
 				}
-				if keyboard.as_ref().is_some_and(|(dev, _)| dev.port == port) {
-					*keyboard = None;
-				}
+				hids.entries.retain(|(dev, _)| dev.port != port);
 				if storage.as_ref().is_some_and(|(dev, _)| dev.port == port) {
 					*storage = None;
 				}
@@ -1293,57 +1377,135 @@ unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, keyboard: &mut Optio
 	}
 }
 
-// Post the keyboard's next 8-byte boot-report TRB and ring its doorbell.
-unsafe fn post_report(hc: &Xhci, dev: &UsbDevice, kb: &mut Keyboard) {
+// Post a HID device's next input-report TRB (sized by its layout) and ring its
+// doorbell.
+unsafe fn post_report(hc: &Xhci, dev: &UsbDevice, h: &mut Hid) {
 	unsafe {
-		kb.ring.push(dev.data_phys, 8, TRB_NORMAL << 10 | TRB_IOC);
-		w32(hc.db + dev.slot as u64 * 4, kb.dci);
+		h.ring.push(dev.data_phys, h.layout.report_bytes(), TRB_NORMAL << 10 | TRB_IOC);
+		w32(hc.db + dev.slot as u64 * 4, h.dci);
+		h.posted = true;
 	}
 }
 
-// Handle one event ring entry against the keyboard: a successful transfer event
-// for its interrupt endpoint is a fresh boot report, which is diffed into the
-// console and the next report TRB posted. A stalled report is recovered (the
-// endpoint unhalted, its ring repositioned, the device-side halt cleared) and
-// reposted. Every other event is ignored.
-unsafe fn handle_keyboard_event(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, status: u32, control: u32) {
+// Post the first report TRB of every HID device that is not serving yet (at the
+// service loop's start, and after a runtime attach).
+unsafe fn post_reports(hc: &Xhci, hids: &mut Hids) {
 	unsafe {
-		let Some((dev, kb)) = keyboard.as_mut() else {
-			return;
-		};
+		for (dev, h) in hids.entries.iter_mut() {
+			if !h.posted {
+				post_report(hc, dev, h);
+			}
+		}
+	}
+}
+
+// Handle one event ring entry against the bound HID devices: a successful
+// transfer event for a device's interrupt endpoint is a fresh input report,
+// which is decoded through its layout and the next report TRB posted. A stalled
+// report is recovered (the endpoint unhalted, its ring repositioned, the
+// device-side halt cleared) and reposted. Every other event is ignored.
+unsafe fn handle_hid_event(hc: &mut Xhci, hids: &mut Hids, status: u32, control: u32) {
+	unsafe {
 		let kind: u32 = control >> 10 & 0x3f;
 		let code: u32 = status >> 24;
-		if kind != TRB_EV_TRANSFER || control >> 24 != dev.slot || (control >> 16 & 0x1f) != kb.dci {
+		if kind != TRB_EV_TRANSFER {
 			return;
 		}
+		let Some(i) = hids.entries.iter().position(|(dev, h)| control >> 24 == dev.slot && (control >> 16 & 0x1f) == h.dci) else {
+			return;
+		};
+		let (dev, h) = &mut hids.entries[i];
 		if code == CC_STALL {
-			// the keyboard endpoint is halted (no reports can be in flight), so the
-			// recovery's own waits run against an empty keyboard.
-			let mut none: Option<(UsbDevice, Keyboard)> = None;
-			reset_endpoint(hc, &mut none, dev.slot, kb.dci, kb.ring.phys + kb.ring.index * 16 | kb.ring.cycle as u64);
-			let addr: u16 = 0x80 | (kb.dci >> 1) as u16;
-			let _ = control_nodata(hc, &mut none, dev, RT_ENDPOINT, REQ_CLEAR_FEATURE, FEATURE_ENDPOINT_HALT, addr);
-			post_report(hc, dev, kb);
+			// the endpoint is halted (no reports can be in flight on it), so the
+			// recovery's own waits run against the other devices only.
+			let dequeue: u64 = h.ring.phys + h.ring.index * 16 | h.ring.cycle as u64;
+			let (slot, dci): (u32, u32) = (dev.slot, h.dci);
+			let addr: u16 = 0x80 | (dci >> 1) as u16;
+			let mut rest: Hids = Hids { entries: core::mem::take(&mut hids.entries) };
+			let mut moved: (UsbDevice, Hid) = rest.entries.swap_remove(i);
+			reset_endpoint(hc, &mut rest, slot, dci, dequeue);
+			let _ = control_nodata(hc, &mut rest, &mut moved.0, RT_ENDPOINT, REQ_CLEAR_FEATURE, FEATURE_ENDPOINT_HALT, addr);
+			post_report(hc, &moved.0, &mut moved.1);
+			rest.entries.push(moved);
+			hids.entries = rest.entries;
 			return;
 		}
 		if code != CC_SUCCESS && code != CC_SHORT_PACKET {
 			return;
 		}
-		let mut report: [u8; 8] = [0u8; 8];
-		for (i, slot) in report.iter_mut().enumerate() {
+		let len: usize = (h.layout.report_bytes() as usize).saturating_sub((status & 0xff_ffff) as usize).min(64);
+		let mut report: [u8; 64] = [0u8; 64];
+		for (i, slot) in report.iter_mut().enumerate().take(len) {
 			*slot = r8(dev.data_virt + i as u64);
 		}
-		let prev: [u8; 8] = kb.prev;
-		feed_report(&prev, &report, &mut kb.mods);
-		kb.prev = report;
-		post_report(hc, dev, kb);
+		feed_hid_report(h, &report[..len]);
+		post_report(hc, dev, h);
 	}
 }
 
-// Wait for a transfer event on the given slot/endpoint, servicing keyboard events
+// Decode one input report through the device's layout and feed the results on:
+// keyboard- and Consumer-page changes (diffed against the previous report of the
+// same report id) go to the shared keys module, and pointer fields fold into the
+// running pointer state, sent to InputService when it changed - the same
+// [x u16 LE][y u16 LE][buttons u8][wheel i8] frame the virtio pointer sends.
+unsafe fn feed_hid_report(h: &mut Hid, report: &[u8]) {
+	unsafe {
+		if report.is_empty() {
+			return;
+		}
+		let (id, body): (u8, &[u8]) = if h.layout.uses_ids() { (report[0], &report[1..]) } else { (0, report) };
+		let prev_i: usize = match h.prevs.iter().position(|&(pid, _)| pid == id) {
+			Some(i) => i,
+			None => {
+				h.prevs.push((id, [0u8; 64]));
+				h.prevs.len() - 1
+			}
+		};
+		let (layout, prevs, mods): (&hid::Layout, &mut Vec<(u8, [u8; 64])>, &mut Mods) = (&h.layout, &mut h.prevs, &mut h.mods);
+		layout.keys_diff(id, &prevs[prev_i].1, body, &mut |usage, down| {
+			let code: u16 = usage_keycode(usage);
+			if code != 0 {
+				keys::feed_key(code, down as u32, mods);
+			}
+		});
+		let (mut x, mut y, mut buttons, mut wheel): (i32, i32, u8, i32) = (h.x, h.y, h.buttons, 0);
+		if layout.pointer_fold(id, body, &mut x, &mut y, &mut buttons, &mut wheel) && (x != h.x || y != h.y || buttons != h.buttons || wheel != 0) {
+			let mut msg: [u8; 6] = [0u8; 6];
+			msg[0..2].copy_from_slice(&(x as u16).to_le_bytes());
+			msg[2..4].copy_from_slice(&(y as u16).to_le_bytes());
+			msg[4] = buttons;
+			msg[5] = wheel.clamp(-127, 127) as i8 as u8;
+			let sink: u64 = PTR_SINK.load(Ordering::Relaxed);
+			if sink != 0 {
+				// non-blocking: with no consumer routed, pointer events just drop.
+				let _ = try_send(sink, &msg, 0);
+			}
+			h.x = x;
+			h.y = y;
+			h.buttons = buttons;
+		}
+		let body_len: usize = body.len().min(64);
+		prevs[prev_i].1[..body_len].copy_from_slice(&body[..body_len]);
+	}
+}
+
+// Resolve a page-extended HID usage to its keycode: the keyboard page through
+// the boot-usage table (its modifier range through the modifier map), the
+// Consumer page through the multimedia map. 0 = unmapped.
+fn usage_keycode(usage: u32) -> u16 {
+	let (page, u): (u16, u32) = ((usage >> 16) as u16, usage & 0xffff);
+	match page {
+		0x07 if (0xe0..=0xe7).contains(&u) => keys::HID_MODIFIER_KEYCODES[(u - 0xe0) as usize],
+		0x07 if u <= 0xff => keys::hid_keycode(u as u8),
+		0x0c => keys::consumer_keycode(u as u16),
+		_ => 0,
+	}
+}
+
+// Wait for a transfer event on the given slot/endpoint, servicing HID events
 // that arrive in the meantime inline (a keystroke during a disk transfer). Returns
 // the completion code, or None on budget exhaustion.
-unsafe fn wait_transfer(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, slot: u32, dci: u32) -> Option<u32> {
+unsafe fn wait_transfer(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32) -> Option<u32> {
 	unsafe {
 		let mut spins: u32 = 0;
 		loop {
@@ -1352,7 +1514,7 @@ unsafe fn wait_transfer(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboar
 				if kind == TRB_EV_TRANSFER && control >> 24 == slot && (control >> 16 & 0x1f) == dci {
 					return Some(status >> 24);
 				}
-				handle_keyboard_event(hc, keyboard, status, control);
+				handle_hid_event(hc, hids, status, control);
 				continue;
 			}
 			spins += 1;
@@ -1374,13 +1536,13 @@ unsafe fn wait_transfer(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboar
 // disk or any step fails.
 unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Storage> {
 	unsafe {
-		// no keyboard is serving yet, so the control / transport waits see no keyboard
-		// events (its report TRB is only posted once the service loop starts).
-		let mut keyboard: Option<(UsbDevice, Keyboard)> = None;
-		control_in(hc, &mut keyboard, dev, DESC_CONFIG, 9)?;
+		// no HID device is serving yet, so the control / transport waits see no HID
+		// events (report TRBs are only posted once the service loop starts).
+		let mut hids: Hids = Hids::new();
+		control_in(hc, &mut hids, dev, DESC_CONFIG, 9)?;
 		let total: u16 = (r8(dev.data_virt + 2) as u16 | (r8(dev.data_virt + 3) as u16) << 8).min(1024);
 		let config_value: u16 = r8(dev.data_virt + 5) as u16;
-		control_in(hc, &mut keyboard, dev, DESC_CONFIG, total)?;
+		control_in(hc, &mut hids, dev, DESC_CONFIG, total)?;
 
 		// walk the descriptors for the Bulk-Only SCSI interface and its endpoint pair.
 		let mut offset: u64 = 0;
@@ -1436,7 +1598,7 @@ unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Storag
 			((ep_ctx + 16) as *mut u32).write_volatile(mps);
 		}
 		command_and_wait(hc, dev.in_phys, 0, TRB_CONFIGURE_ENDPOINT << 10 | dev.slot << 24)?;
-		control_nodata(hc, &mut keyboard, dev, 0x00, REQ_SET_CONFIGURATION, config_value, 0)?;
+		control_nodata(hc, &mut hids, dev, 0x00, REQ_SET_CONFIGURATION, config_value, 0)?;
 
 		let (_sh, data_virt, data_phys): (u64, u64, u64) = dma_page()?;
 		let mut st: Storage = Storage { dci_in, dci_out, ep_in_addr, ep_out_addr, iface, ring_in, ring_out, data_virt, data_phys, tag: 1, capacity: 0 };
@@ -1447,11 +1609,11 @@ unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Storag
 		let mut attempt: u32 = 0;
 		while attempt < 4 {
 			let turcb: [u8; 6] = [SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
-			if bot_command(hc, &mut keyboard, dev, &mut st, &turcb, 0, false) {
+			if bot_command(hc, &mut hids, dev, &mut st, &turcb, 0, false) {
 				ready = true;
 				break;
 			}
-			read_sense(hc, &mut keyboard, dev, &mut st);
+			read_sense(hc, &mut hids, dev, &mut st);
 			attempt += 1;
 		}
 		if !ready {
@@ -1459,7 +1621,7 @@ unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Storag
 		}
 		// the block protocol serves 512-byte sectors; refuse a disk with another size.
 		let capcb: [u8; 10] = [SCSI_READ_CAPACITY10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-		if !bot_command(hc, &mut keyboard, dev, &mut st, &capcb, 8, true) {
+		if !bot_command(hc, &mut hids, dev, &mut st, &capcb, 8, true) {
 			return None;
 		}
 		let block_size: u32 = (r8(st.data_virt + 4) as u32) << 24 | (r8(st.data_virt + 5) as u32) << 16 | (r8(st.data_virt + 6) as u32) << 8 | r8(st.data_virt + 7) as u32;
@@ -1477,8 +1639,8 @@ unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Storag
 // Run one SCSI command over the Bulk-Only Transport: the CBW on the bulk OUT
 // endpoint, the data stage (into or out of the storage data page), and the CSW on
 // the bulk IN endpoint, whose signature, tag echo and status decide the result.
-// Keyboard events arriving during the waits are serviced inline.
-unsafe fn bot_command(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage, cb: &[u8], data_len: u32, data_in: bool) -> bool {
+// HID events arriving during the waits are serviced inline.
+unsafe fn bot_command(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, cb: &[u8], data_len: u32, data_in: bool) -> bool {
 	unsafe {
 		// the CBW rides at the head of the device's scratch page, the CSW after it.
 		let cbw: u64 = dev.data_virt;
@@ -1495,15 +1657,15 @@ unsafe fn bot_command(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)
 		st.ring_out.push(dev.data_phys, CBW_LEN, TRB_NORMAL << 10 | TRB_IOC);
 		w32(hc.db + dev.slot as u64 * 4, st.dci_out);
 		let mut ok: bool = true;
-		match wait_transfer(hc, keyboard, dev.slot, st.dci_out) {
+		match wait_transfer(hc, hids, dev.slot, st.dci_out) {
 			Some(CC_SUCCESS) => {}
 			Some(CC_STALL) => {
 				// the device rejected the CBW: unhalt the OUT endpoint and fail the command.
-				recover_bulk(hc, keyboard, dev, st, false);
+				recover_bulk(hc, hids, dev, st, false);
 				ok = false;
 			}
 			_ => {
-				bot_reset(hc, keyboard, dev, st);
+				bot_reset(hc, hids, dev, st);
 				ok = false;
 			}
 		}
@@ -1514,11 +1676,11 @@ unsafe fn bot_command(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)
 			let (ring, dci): (&mut Ring, u32) = if data_in { (&mut st.ring_in, st.dci_in) } else { (&mut st.ring_out, st.dci_out) };
 			ring.push(st.data_phys, data_len, TRB_NORMAL << 10 | TRB_IOC);
 			w32(hc.db + dev.slot as u64 * 4, dci);
-			match wait_transfer(hc, keyboard, dev.slot, dci) {
+			match wait_transfer(hc, hids, dev.slot, dci) {
 				Some(CC_SUCCESS) | Some(CC_SHORT_PACKET) => {}
-				Some(CC_STALL) => recover_bulk(hc, keyboard, dev, st, data_in),
+				Some(CC_STALL) => recover_bulk(hc, hids, dev, st, data_in),
 				_ => {
-					bot_reset(hc, keyboard, dev, st);
+					bot_reset(hc, hids, dev, st);
 					ok = false;
 				}
 			}
@@ -1532,13 +1694,13 @@ unsafe fn bot_command(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)
 			while attempt < 2 {
 				st.ring_in.push(dev.data_phys + CSW_OFF, CSW_LEN, TRB_NORMAL << 10 | TRB_IOC);
 				w32(hc.db + dev.slot as u64 * 4, st.dci_in);
-				match wait_transfer(hc, keyboard, dev.slot, st.dci_in) {
+				match wait_transfer(hc, hids, dev.slot, st.dci_in) {
 					Some(CC_SUCCESS) | Some(CC_SHORT_PACKET) => {
 						ok = true;
 						break;
 					}
 					Some(CC_STALL) => {
-						recover_bulk(hc, keyboard, dev, st, true);
+						recover_bulk(hc, hids, dev, st, true);
 						attempt += 1;
 					}
 					_ => break,
@@ -1550,13 +1712,13 @@ unsafe fn bot_command(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)
 				let csw: u64 = dev.data_virt + CSW_OFF;
 				let framed: bool = (csw as *const u32).read_volatile() == CSW_SIGNATURE && ((csw + 4) as *const u32).read_volatile() == st.tag;
 				if !framed {
-					bot_reset(hc, keyboard, dev, st);
+					bot_reset(hc, hids, dev, st);
 					ok = false;
 				} else {
 					ok = ((csw + 12) as *const u8).read_volatile() == 0;
 				}
 			} else {
-				bot_reset(hc, keyboard, dev, st);
+				bot_reset(hc, hids, dev, st);
 			}
 		}
 		st.tag = st.tag.wrapping_add(1);
@@ -1568,16 +1730,16 @@ unsafe fn bot_command(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)
 // [count u32], count clamped to one DMA page. A read replies [status u32] + a
 // MemoryObject of the sectors; a write carries a MemoryObject in and replies
 // [status u32] - the same wire contract driver.virtio-blk serves.
-unsafe fn serve_block_request(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, req: &[u8; 16], handle: u64) {
+unsafe fn serve_block_request(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, req: &[u8; 16], handle: u64) {
 	unsafe {
 		let op: u32 = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
 		let lba: u64 = u64::from_le_bytes([req[4], req[5], req[6], req[7], req[8], req[9], req[10], req[11]]);
 		let count: u32 = u32::from_le_bytes([req[12], req[13], req[14], req[15]]).clamp(1, MAX_SECTORS);
 		match op {
-			OP_READ => serve_read(hc, keyboard, dev, st, blk_server, lba, count),
-			OP_WRITE => serve_write(hc, keyboard, dev, st, blk_server, lba, count, handle),
+			OP_READ => serve_read(hc, hids, dev, st, blk_server, lba, count),
+			OP_WRITE => serve_write(hc, hids, dev, st, blk_server, lba, count, handle),
 			OP_CAPACITY => reply_capacity(blk_server, st.capacity),
-			OP_FLUSH => serve_flush(hc, keyboard, dev, st, blk_server),
+			OP_FLUSH => serve_flush(hc, hids, dev, st, blk_server),
 			_ => {
 				if handle != 0 {
 					close(handle);
@@ -1592,14 +1754,14 @@ unsafe fn serve_block_request(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, K
 // shared buffer and hand it to the client, or reply with an error status. A failed
 // command is retried once with the sense data read (and discarded) in between - a
 // transient unit attention fails the first command and succeeds the retry.
-unsafe fn serve_read(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, lba: u64, count: u32) {
+unsafe fn serve_read(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, lba: u64, count: u32) {
 	unsafe {
 		let bytes: u64 = count as u64 * SECTOR as u64;
 		let cb: [u8; 10] = read10_cb(SCSI_READ10, lba, count);
-		let mut ok: bool = bot_command(hc, keyboard, dev, st, &cb, bytes as u32, true);
+		let mut ok: bool = bot_command(hc, hids, dev, st, &cb, bytes as u32, true);
 		if !ok {
-			read_sense(hc, keyboard, dev, st);
-			ok = bot_command(hc, keyboard, dev, st, &cb, bytes as u32, true);
+			read_sense(hc, hids, dev, st);
+			ok = bot_command(hc, hids, dev, st, &cb, bytes as u32, true);
 		}
 		if !ok {
 			reply_block(blk_server, STATUS_ERR, 0);
@@ -1635,7 +1797,7 @@ unsafe fn serve_read(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>
 // SCSI WRITE(10), then reply with the status and no buffer. A failed command is
 // retried once with the sense data read in between; the sense read reuses the data
 // page, so the sectors are copied in again before the retry.
-unsafe fn serve_write(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, lba: u64, count: u32, src_handle: u64) {
+unsafe fn serve_write(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, lba: u64, count: u32, src_handle: u64) {
 	unsafe {
 		if src_handle == 0 {
 			reply_block(blk_server, STATUS_ERR, 0);
@@ -1652,11 +1814,11 @@ unsafe fn serve_write(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)
 		let bytes: u64 = count as u64 * SECTOR as u64;
 		let cb: [u8; 10] = read10_cb(SCSI_WRITE10, lba, count);
 		core::ptr::copy_nonoverlapping(src as *const u8, st.data_virt as *mut u8, bytes as usize);
-		let mut ok: bool = bot_command(hc, keyboard, dev, st, &cb, bytes as u32, false);
+		let mut ok: bool = bot_command(hc, hids, dev, st, &cb, bytes as u32, false);
 		if !ok {
-			read_sense(hc, keyboard, dev, st);
+			read_sense(hc, hids, dev, st);
 			core::ptr::copy_nonoverlapping(src as *const u8, st.data_virt as *mut u8, bytes as usize);
-			ok = bot_command(hc, keyboard, dev, st, &cb, bytes as u32, false);
+			ok = bot_command(hc, hids, dev, st, &cb, bytes as u32, false);
 		}
 		unmap_object(src_handle);
 		close(src_handle);
@@ -1666,10 +1828,10 @@ unsafe fn serve_write(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)
 
 // Read (and discard) the unit's sense data, clearing the pending condition a failed
 // command left behind so the next command starts clean.
-unsafe fn read_sense(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage) {
+unsafe fn read_sense(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage) {
 	unsafe {
 		let sense: [u8; 6] = [SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0];
-		let _ = bot_command(hc, keyboard, dev, st, &sense, 18, true);
+		let _ = bot_command(hc, hids, dev, st, &sense, 18, true);
 	}
 }
 
@@ -1678,17 +1840,17 @@ unsafe fn read_sense(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>
 // commits rely on; a unit that rejects the command (no cache to flush, per the SBC
 // spec an optional command) is treated as write-through after the sense read, so the
 // barrier still reports success. No data stage.
-unsafe fn serve_flush(hc: &mut Xhci, keyboard: &mut Option<(UsbDevice, Keyboard)>, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64) {
+unsafe fn serve_flush(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64) {
 	unsafe {
 		let cb: [u8; 10] = [SCSI_SYNCHRONIZE_CACHE10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-		let mut ok: bool = bot_command(hc, keyboard, dev, st, &cb, 0, false);
+		let mut ok: bool = bot_command(hc, hids, dev, st, &cb, 0, false);
 		if !ok {
-			read_sense(hc, keyboard, dev, st);
-			ok = bot_command(hc, keyboard, dev, st, &cb, 0, false);
+			read_sense(hc, hids, dev, st);
+			ok = bot_command(hc, hids, dev, st, &cb, 0, false);
 			// still failing: the unit does not implement the (optional) command, which
 			// per SBC means it has no volatile cache to flush - the barrier holds.
 			if !ok {
-				read_sense(hc, keyboard, dev, st);
+				read_sense(hc, hids, dev, st);
 				ok = true;
 			}
 		}
@@ -1717,40 +1879,6 @@ unsafe fn reply_capacity(blk_server: u64, bytes: u64) {
 		reply[..4].copy_from_slice(&STATUS_OK.to_le_bytes());
 		reply[4..].copy_from_slice(&bytes.to_le_bytes());
 		send_blocking(blk_server, &reply, 0);
-	}
-}
-
-// Diff one HID boot report against the previous one and feed the changes as key
-// events: byte 0 carries the modifier bitmask, bytes 2..8 the pressed keys' usage
-// ids (1..3 are the keyboard's error codes, skipped). Releases are fed first so a
-// fast key swap cannot double-modify.
-unsafe fn feed_report(prev: &[u8; 8], report: &[u8; 8], mods: &mut Mods) {
-	unsafe {
-		for bit in 0..8u8 {
-			let mask: u8 = 1 << bit;
-			if prev[0] & mask != report[0] & mask {
-				let code: u16 = keys::HID_MODIFIER_KEYCODES[bit as usize];
-				if code != 0 {
-					keys::feed_key(code, (report[0] & mask != 0) as u32, mods);
-				}
-			}
-		}
-		for &usage in &prev[2..8] {
-			if usage > 3 && !report[2..8].contains(&usage) {
-				let code: u16 = keys::hid_keycode(usage);
-				if code != 0 {
-					keys::feed_key(code, 0, mods);
-				}
-			}
-		}
-		for &usage in &report[2..8] {
-			if usage > 3 && !prev[2..8].contains(&usage) {
-				let code: u16 = keys::hid_keycode(usage);
-				if code != 0 {
-					keys::feed_key(code, 1, mods);
-				}
-			}
-		}
 	}
 }
 
