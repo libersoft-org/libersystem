@@ -12,6 +12,11 @@
 //! following the extent of the next directory or file. Names come from the directory
 //! record, decoded as Joliet UCS-2, a Rock Ridge `NM` system-use entry, or plain 8.3 with
 //! the `;1` version suffix stripped.
+//!
+//! The media is untrusted: every extent is bounded by the volume's own block count
+//! (whose last block is verified to exist on the device at mount) before a buffer is
+//! allocated, and a malformed record parses cleanly instead of panicking - a corrupt
+//! or hostile disc errors, never crashes or exhausts the mounting service.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -59,11 +64,13 @@ pub struct FileInfo {
 	pub is_dir: bool,
 }
 
-// The root directory's extent (LBA and byte length) plus whether names are Joliet UCS-2;
-// every read derives from these, so mounting is just locating one volume descriptor.
+// The root directory's extent (LBA and byte length), the volume's own block count
+// (bounding every extent), and whether names are Joliet UCS-2; every read derives from
+// these, so mounting is just locating one volume descriptor.
 struct Geometry {
 	root_lba: u32,
 	root_len: u32,
+	blocks: u32,
 	joliet: bool,
 }
 
@@ -83,8 +90,8 @@ impl<D: BlockDevice> Iso9660<D> {
 	// Mount optical media: scan the volume descriptors for a Primary (and a preferred
 	// Joliet) descriptor and take its root directory record. None if no PVD is found.
 	pub fn mount(mut dev: D) -> Option<Iso9660<D>> {
-		let mut pvd_root: Option<(u32, u32)> = None;
-		let mut joliet_root: Option<(u32, u32)> = None;
+		let mut pvd_root: Option<((u32, u32), u32, u32)> = None;
+		let mut joliet_root: Option<((u32, u32), u32, u32)> = None;
 		let mut block = [0u8; SECTOR_SIZE];
 		for i in 0..32 {
 			if !dev.read_block(FIRST_DESCRIPTOR_LBA + i, &mut block) {
@@ -93,19 +100,33 @@ impl<D: BlockDevice> Iso9660<D> {
 			if &block[1..6] != b"CD001" {
 				return None;
 			}
+			let found = (root_extent(&block), le32(&block[80..84]), u16::from_le_bytes([block[128], block[129]]) as u32);
 			match block[0] {
-				1 => pvd_root = Some(root_extent(&block)),
-				2 if is_joliet(&block) => joliet_root = Some(root_extent(&block)),
+				1 => pvd_root = Some(found),
+				2 if is_joliet(&block) => joliet_root = Some(found),
 				255 => break,
 				_ => {}
 			}
 		}
-		let (joliet, root) = match (joliet_root, pvd_root) {
+		let (joliet, ((root_lba, root_len), blocks, block_size)) = match (joliet_root, pvd_root) {
 			(Some(r), _) => (true, r),
 			(None, Some(r)) => (false, r),
 			(None, None) => return None,
 		};
-		Some(Iso9660 { dev, geo: Geometry { root_lba: root.0, root_len: root.1, joliet } })
+		// the logical block size is 2048 on real media and the unit this backend reads
+		// in - any other legal size would be read at wrong positions, so it refuses -
+		// and the root extent must fit the volume's own block count.
+		if block_size != SECTOR_SIZE as u32 || blocks == 0 || root_lba as u64 + (root_len as u64).div_ceil(SECTOR_SIZE as u64) > blocks as u64 {
+			return None;
+		}
+		// the block count is the medium's own claim: its last block must exist on the
+		// device, or a forged or truncated image mounts and only fails - or allocates
+		// without bound - inside a later read. The real media size then bounds every
+		// extent read.
+		if !dev.read_block(blocks as u64 - 1, &mut block) {
+			return None;
+		}
+		Some(Iso9660 { dev, geo: Geometry { root_lba, root_len, blocks, joliet } })
 	}
 
 	// List the volume's root directory.
@@ -127,6 +148,11 @@ impl<D: BlockDevice> Iso9660<D> {
 		if entry.is_dir {
 			return Err(FsError::NotFound);
 		}
+		// a multi-extent file (one file stored as several records) is not assembled
+		// here - refuse it rather than serve the first segment as the whole.
+		if entry.multi {
+			return Err(FsError::Invalid);
+		}
 		self.read_extent(entry.lba, entry.size)
 	}
 
@@ -147,6 +173,8 @@ impl<D: BlockDevice> Iso9660<D> {
 	}
 
 	// Scan a directory extent for an entry whose name matches `name` (case-insensitively).
+	// The "." / ".." self/parent records match by those names, so paths through them
+	// resolve the way the other backends behind the volume API resolve them.
 	fn find_entry(&mut self, lba: u32, len: u32, name: &[u8]) -> Result<Entry, FsError> {
 		let data = self.read_extent(lba, len)?;
 		let mut off = 0usize;
@@ -162,7 +190,7 @@ impl<D: BlockDevice> Iso9660<D> {
 			}
 			let rec = &data[off..off + rec_len];
 			if let Some(e) = parse_record(rec, self.geo.joliet)
-				&& !e.special
+				&& !e.name.is_empty()
 				&& eq_ci(&e.name, name)
 			{
 				return Ok(e);
@@ -189,16 +217,25 @@ impl<D: BlockDevice> Iso9660<D> {
 			}
 			if let Some(e) = parse_record(&data[off..off + rec_len], self.geo.joliet)
 				&& !e.special
+				&& !e.name.is_empty()
 			{
-				out.push(FileInfo { name: e.name, size: e.size as u64, is_dir: e.is_dir });
+				// a directory reports a length of zero - the FileInfo contract,
+				// uniform across the backends behind the volume API.
+				out.push(FileInfo { name: e.name, size: if e.is_dir { 0 } else { e.size as u64 }, is_dir: e.is_dir });
 			}
 			off += rec_len;
 		}
 		Ok(out)
 	}
 
-	// Read `size` bytes starting at logical block `lba`, one block at a time.
+	// Read `size` bytes starting at logical block `lba`, one block at a time. The extent
+	// is the medium's own claim: one that would leave the volume is refused BEFORE the
+	// buffer is allocated - a forged length can neither allocate without bound nor read
+	// past the volume.
 	fn read_extent(&mut self, lba: u32, size: u32) -> Result<Vec<u8>, FsError> {
+		if lba as u64 + (size as u64).div_ceil(SECTOR_SIZE as u64) > self.geo.blocks as u64 {
+			return Err(FsError::Invalid);
+		}
 		let mut out = vec![0u8; size as usize];
 		let mut block = [0u8; SECTOR_SIZE];
 		let mut done = 0usize;
@@ -216,13 +253,15 @@ impl<D: BlockDevice> Iso9660<D> {
 	}
 }
 
-// One parsed directory record: its extent, byte length, kind, decoded name, and whether
-// it is a "." / ".." self/parent entry to skip.
+// One parsed directory record: its extent, byte length, kind, decoded name, whether it
+// is a "." / ".." self/parent entry (named so, matched by lookups, skipped in listings),
+// and whether the file continues in further records (multi-extent).
 struct Entry {
 	lba: u32,
 	size: u32,
 	is_dir: bool,
 	special: bool,
+	multi: bool,
 	name: String,
 }
 
@@ -248,14 +287,15 @@ fn parse_record(rec: &[u8], joliet: bool) -> Option<Entry> {
 	let lba = le32(&rec[2..6]);
 	let size = le32(&rec[10..14]);
 	let is_dir = rec[25] & 0x02 != 0;
+	let multi = rec[25] & 0x80 != 0;
 	let id_len = rec[32] as usize;
 	if 33 + id_len > rec.len() {
 		return None;
 	}
 	let id = &rec[33..33 + id_len];
 	let special = id_len == 1 && (id[0] == 0 || id[0] == 1);
-	let name = decode_name(id, rec, id_len, joliet);
-	Some(Entry { lba, size, is_dir, special, name })
+	let name = if special { String::from(if id[0] == 0 { "." } else { ".." }) } else { decode_name(id, rec, id_len, joliet) };
+	Some(Entry { lba, size, is_dir, special, multi, name })
 }
 
 // Decode an entry name. Joliet is big-endian UCS-2; otherwise a Rock Ridge NM entry in
@@ -273,7 +313,11 @@ fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool) -> String {
 		return s;
 	}
 	let sys_off = 33 + id_len + (id_len % 2 == 0) as usize;
-	if let Some(n) = rock_ridge_name(&rec[sys_off..]) {
+	// a malformed record can end exactly after its identifier (the pad byte missing) -
+	// there is no system-use area to read then, never a slice past the record.
+	if let Some(sys) = rec.get(sys_off..)
+		&& let Some(n) = rock_ridge_name(sys)
+	{
 		return n;
 	}
 	let mut s = String::new();
@@ -299,7 +343,9 @@ fn rock_ridge_name(sys: &[u8]) -> Option<String> {
 		if len < 4 || off + len > sys.len() {
 			break;
 		}
-		if &sys[off..off + 2] == b"NM" {
+		// an NM payload begins after sig, len, version, and flags - a shorter entry
+		// carries no name and must not build an inverted range.
+		if &sys[off..off + 2] == b"NM" && len >= 5 {
 			out.push_str(core::str::from_utf8(&sys[off + 5..off + len]).unwrap_or(""));
 		}
 		off += len;

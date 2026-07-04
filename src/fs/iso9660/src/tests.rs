@@ -57,7 +57,11 @@ fn dir_block(records: &[Vec<u8>]) -> Vec<u8> {
 // Encode a name: ASCII 8.3 + ";1" for the PVD, big-endian UCS-2 for Joliet.
 fn name(s: &str, dir: bool, joliet: bool) -> Vec<u8> {
 	let s = if dir { s.into() } else { format!("{s};1") };
-	if joliet { s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect() } else { s.into_bytes() }
+	if joliet {
+		s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()
+	} else {
+		s.into_bytes()
+	}
 }
 
 // Build a one-level ISO: PVD (+ optional Joliet SVD), terminator, root, one subdir, and
@@ -87,6 +91,9 @@ fn build_iso(joliet: bool) -> Vec<u8> {
 	pvd[0] = 1;
 	pvd[1..6].copy_from_slice(b"CD001");
 	pvd[6] = 1;
+	both32(&mut pvd, 80, 23); // volume space size: the whole 23-block image
+	pvd[128..130].copy_from_slice(&2048u16.to_le_bytes());
+	pvd[130..132].copy_from_slice(&2048u16.to_be_bytes());
 	pvd[156..156 + record(root_lba, SECTOR_SIZE as u32, true, &[0]).len()].copy_from_slice(&record(root_lba, SECTOR_SIZE as u32, true, &[0]));
 	blk(16, &pvd);
 	if joliet {
@@ -127,4 +134,95 @@ fn joliet_names() {
 fn missing_is_not_found() {
 	let mut fs = Iso9660::mount(MemDisc { data: build_iso(false) }).unwrap();
 	assert_eq!(fs.read_file(b"NOPE.TXT"), Err(FsError::NotFound));
+}
+
+// The root block's records: "." (34) + ".." (34) + SUB (36) + HELLO.TXT;1 (44) = 148
+// bytes, so 148 is the first free record slot and 104 is HELLO.TXT's offset.
+const ROOT_FREE: usize = 148;
+const HELLO_REC: usize = 104;
+
+#[test]
+fn malformed_records_do_not_panic() {
+	// (a) an even-id-length record ending exactly after its identifier (the pad byte
+	// missing) used to slice past the record for the system-use area; (b) a Rock Ridge
+	// NM entry with length 4 used to build an inverted range. Both must parse cleanly.
+	let mut img = build_iso(false);
+	let root_off = 19 * SECTOR_SIZE;
+	let mut a = vec![0u8; 35];
+	a[0] = 35;
+	both32(&mut a, 2, 21);
+	both32(&mut a, 10, 0);
+	a[32] = 2;
+	a[33..35].copy_from_slice(b"AB");
+	let mut b = vec![0u8; 42];
+	b[0] = 42;
+	both32(&mut b, 2, 21);
+	both32(&mut b, 10, 0);
+	b[32] = 1;
+	b[33] = b'C';
+	b[34..36].copy_from_slice(b"NM");
+	b[36] = 4; // sig + len + version only: no flags, no name
+	b[37] = 1;
+	img[root_off + ROOT_FREE..root_off + ROOT_FREE + 35].copy_from_slice(&a);
+	img[root_off + ROOT_FREE + 35..root_off + ROOT_FREE + 77].copy_from_slice(&b);
+	let mut fs = Iso9660::mount(MemDisc { data: img }).unwrap();
+	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
+	assert!(names.contains(&"AB".to_string()) && names.contains(&"C".to_string()), "{names:?}");
+}
+
+#[test]
+fn forged_extents_do_not_allocate_or_mount() {
+	// the extents are the medium's own claims: a root length past the volume refuses
+	// at mount, a volume claiming more blocks than the device refuses at mount, and a
+	// forged file size errors cleanly instead of allocating gigabytes up front.
+	let mut big_root = build_iso(false);
+	big_root[16 * SECTOR_SIZE + 156 + 10..16 * SECTOR_SIZE + 156 + 14].copy_from_slice(&u32::MAX.to_le_bytes());
+	assert!(Iso9660::mount(MemDisc { data: big_root }).is_none(), "a root extent past the volume");
+	let mut big_vol = build_iso(false);
+	big_vol[16 * SECTOR_SIZE + 80..16 * SECTOR_SIZE + 84].copy_from_slice(&1000u32.to_le_bytes());
+	assert!(Iso9660::mount(MemDisc { data: big_vol }).is_none(), "a block count past the device");
+	let mut big_file = build_iso(false);
+	let hello = 19 * SECTOR_SIZE + HELLO_REC;
+	big_file[hello + 10..hello + 14].copy_from_slice(&u32::MAX.to_le_bytes());
+	let mut fs = Iso9660::mount(MemDisc { data: big_file }).unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid));
+}
+
+#[test]
+fn a_non_2048_block_size_does_not_mount() {
+	// the backend reads in 2048-byte units; a volume with another legal logical block
+	// size would be read at wrong positions - it must refuse, not misread.
+	let mut img = build_iso(false);
+	img[16 * SECTOR_SIZE + 128..16 * SECTOR_SIZE + 130].copy_from_slice(&512u16.to_le_bytes());
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none());
+}
+
+#[test]
+fn a_multi_extent_file_is_refused_not_truncated() {
+	// flag bit 0x80 marks a file continuing in further records; serving only the first
+	// extent would be a silent truncation.
+	let mut img = build_iso(false);
+	img[19 * SECTOR_SIZE + HELLO_REC + 25] |= 0x80;
+	let mut fs = Iso9660::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid));
+}
+
+#[test]
+fn listing_contract_and_dot_dot() {
+	// an empty-named record never surfaces or matches an empty lookup, a directory
+	// lists with size zero, and ".." resolves to the parent as on the other backends.
+	let mut img = build_iso(false);
+	let root_off = 19 * SECTOR_SIZE;
+	let mut e = vec![0u8; 34];
+	e[0] = 34; // id_len 0: an empty name
+	img[root_off + ROOT_FREE..root_off + ROOT_FREE + 34].copy_from_slice(&e);
+	let mut fs = Iso9660::mount(MemDisc { data: img }).unwrap();
+	let list = fs.list().unwrap();
+	assert!(list.iter().all(|f| !f.name.is_empty()), "{list:?}");
+	assert_eq!(fs.read_file(b""), Err(FsError::NotFound));
+	let sub = list.iter().find(|f| f.name == "SUB").unwrap();
+	assert_eq!((sub.is_dir, sub.size), (true, 0), "a directory must list with size zero");
+	let mut up: Vec<_> = fs.list_dir(b"SUB/..").unwrap().into_iter().map(|f| f.name).collect();
+	up.sort();
+	assert_eq!(up, ["HELLO.TXT", "SUB"]);
 }

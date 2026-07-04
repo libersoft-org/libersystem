@@ -1781,6 +1781,27 @@ NT case flags, best-effort final frees) re-verified clean.
   - Result: all hold - fat 65 host tests (2 new, 1 extended), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: the interop purpose of the crate (the flags other drivers act on, we must act on; what an overwrite preserves there, we preserve), M92-B1 (the lookup-side contract extended to the FAT-selection contract), the M86-M94 hostile-media rule (a stale FAT copy is one more untrusted input).
 
+## M96 - ISO9660: first-pass audit (hostile-media panics and unbounded reads)
+
+The first full audit pass over the ISO9660 backend (2026-07-04, lib.rs 327
+lines), with the hostile-media discipline the FAT track built: the crate reads
+foreign install/optical media, so a malformed disc must error cleanly - never
+panic the storage service or allocate without bound.
+
+- [x] (B1, high) Two slice panics on a malformed directory record: (a) `decode_name` computes `sys_off = 33 + id_len + pad` and slices `&rec[sys_off..]` - a record with an even `id_len` ending exactly after its identifier (the pad byte missing) puts `sys_off` one past the record and the range panics; (b) `rock_ridge_name` slices `sys[off + 5..off + len]` after gating only `len < 4` - an "NM" entry with `len == 4` builds an inverted range and panics. A corrupt or hostile disc panics the storage service on a mere listing. Fix: (a) take the system-use area with `rec.get(sys_off..)`, (b) an NM entry needs `len >= 5`.
+  - Result: both fixed as planned. Test `malformed_records_do_not_panic` (both shapes planted in the root: the listing parses them cleanly and shows their 8.3 names).
+- [x] (B2, medium) `read_extent` allocates `vec![0u8; size]` BEFORE any device read, and `size` is the medium's own u32 claim (root length, directory lengths, file sizes) with no bound - a forged root length of 0xFFFFFFFF mounts and the first listing allocates 4 GB and aborts the service (the FAT M93-B1 class). Fix: read the Volume Space Size off the descriptor (offset 80), refuse a zero count or a root extent past it at mount, probe that the claimed last block exists on the device (the FAT M93 pattern), and gate every extent `(lba, size)` against the block count before allocating.
+  - Result: `Geometry.blocks` off descriptor offset 80; mount refuses a zero count, a root extent past it, and probes the last claimed block; `read_extent` refuses an out-of-volume extent before allocating. Test `forged_extents_do_not_allocate_or_mount` (forged root length, forged block count, forged file size - all refuse cleanly).
+- [x] (B3, low-medium) The logical block size (descriptor offset 128) is never read - 2048 is assumed. A volume with 512- or 1024-byte logical blocks (legal, rare) mounts and reads garbage from wrong positions. Refuse a block size other than 2048 at mount - the recorded assumption becomes a gate.
+  - Result: refused at mount. Test `a_non_2048_block_size_does_not_mount`.
+- [x] (B4, low) Multi-extent files (record flag bit 0x80: one file stored as several records) are not detected - such a file reads back silently truncated to its first extent. Refuse it as Invalid rather than serve a truncated read.
+  - Result: `Entry.multi` off flag bit 0x80; `read_file` refuses it. Test `a_multi_extent_file_is_refused_not_truncated`.
+- [x] (B5, cosmetic) Three nits: (a) a record with `id_len == 0` yields an empty-named entry that surfaces in listings and matches `read_file(b"")` (the FAT M91-B5 class) - skip empty names; (b) `FileInfo.size` for a directory reports the extent length where the contract says zero (the FAT eighth-pass class) - report zero; (c) `".."` does not resolve (the parent record is skipped as special) while the FAT backend resolves it - name the special records "." and ".." so paths through them work uniformly across backends.
+  - Result: empty names skipped in listings and lookups, directories list with size zero, and the special records carry the names "." / ".." - matched by lookups, still dropped from listings. Test `listing_contract_and_dot_dot` (a planted empty-named record never surfaces, `read_file(b"")` is NotFound, SUB lists at size 0, and "SUB/.." lists the root).
+- Done when: the two malformed-record shapes parse cleanly (test-pinned), a forged root or file length refuses instead of allocating and a volume claiming more blocks than the device refuses at mount, a non-2048 block size refuses, a multi-extent file refuses instead of truncating, the listing contract holds (no empty names, zero directory sizes) and "SUB/.." lists the root, and the suite stays green with a test per finding.
+  - Result: all hold - iso9660 8 host tests (5 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean (the image builder now writes the volume space size and block size like a real mastering tool).
+- Concept: the hostile-media rule of the FAT track (M87/M90-B4/M93-B1: bound every on-medium value before use, and the medium itself is the bound), M91-B5/round-8 (the listing-contract classes recurring here), one Volume API behaving uniformly across backends.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
