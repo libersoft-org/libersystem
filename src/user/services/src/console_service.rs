@@ -100,6 +100,10 @@ const CHORD_SCROLL_DOWN: u8 = 0x1f;
 // ~100 ms) before restoring it.
 const BELL_FLASH_TICKS: u64 = 10;
 
+// The caret blink phase (in 100 Hz ticks): the run loop's periodic wake toggles the
+// foreground caret every ~400 ms while the console idles - the classic terminal rate.
+const BLINK_PHASE_TICKS: u64 = 40;
+
 // The tty line discipline limits (per VT).
 const LD_LINE_MAX: usize = 4096;
 const LD_HIST_MAX: usize = 512;
@@ -581,9 +585,6 @@ struct Console {
 	clipboard: Vec<u8>,
 	// The pointer button bits from the previous event, to detect press / release edges.
 	ptr_buttons: u8,
-	// The caret blink divider: counts the gpu driver's ~200 ms TICKs, toggling the
-	// foreground caret's phase every second one (~400 ms per phase, the classic rate).
-	blink: u8,
 	// The Tab-completion vocabulary: the shell builtins plus the system volume's bin/
 	// listing (bash's builtins + $PATH), fetched lazily on the first Tab through a fresh
 	// storage connection and cached for the session (None until then; an unreachable
@@ -745,7 +746,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, pointer, clipboard: Vec::new(), ptr_buttons: 0, blink: 0, vocab: None };
+		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, pointer, clipboard: Vec::new(), ptr_buttons: 0, vocab: None };
 		run(&mut console);
 	}
 }
@@ -812,9 +813,20 @@ unsafe fn run(console: &mut Console) -> ! {
 			if have_pointer {
 				waits.push(console.pointer);
 			}
-			// Block (~0% CPU) until a channel is ready: a keystroke, VT output, a gpu RESIZE, or
-			// a program-hosted PTY's traffic.
-			let ready: i64 = wait_any(&waits, 0);
+			// Block (~0% CPU) until a channel is ready - a keystroke, VT output, a gpu
+			// RESIZE, or a program-hosted PTY's traffic - or until the caret's blink phase
+			// elapses. The blink deadline is a housekeeping wake (WAIT_PERIODIC): it recurs
+			// forever, so it must never count as pending progress for the scheduler's boot
+			// driver (or the kernel tests). Headless (no framebuffer) there is no caret to
+			// blink, so the wait has no deadline at all.
+			let ready: i64 = if console.has_fb { wait_any_periodic(&waits, clock() + BLINK_PHASE_TICKS) } else { wait_any(&waits, 0) };
+			if ready == ERR_TIMED_OUT {
+				// the idle blink tick: toggle the foreground caret's phase. Every flush
+				// repaints the caret, so activity keeps it solid and the phase restarts
+				// with each event (the deadline above is re-armed per iteration).
+				blink_fg(console);
+				continue;
+			}
 			if ready >= 0 {
 				let r: usize = ready as usize;
 				if r == 0 {
@@ -1316,8 +1328,7 @@ unsafe fn close_pty(console: &mut Console, pj: usize) {
 	}
 }
 
-// Handle a display-change event from the gpu driver: a periodic TICK paces the caret
-// blink; on a host-window resize it rebinds
+// Handle a display-change event from the gpu driver: on a host-window resize it rebinds
 // the scanout to the new pixel size and sends RESIZE + the new width/height. Refit every
 // VT's terminal to the new size (each shell is notified, the SIGWINCH equivalent); the
 // run loop re-presents the foreground afterwards. If the driver's channel has closed,
@@ -1332,13 +1343,6 @@ unsafe fn handle_gpu_resize(console: &mut Console) {
 				return;
 			}
 		};
-		if len == 4 && &buf[..4] == b"TICK" {
-			console.blink = (console.blink + 1) % 2;
-			if console.blink == 0 {
-				blink_fg(console);
-			}
-			return;
-		}
 		if len < 14 || &buf[..6] != b"RESIZE" {
 			return;
 		}

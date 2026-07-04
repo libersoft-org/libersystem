@@ -10,12 +10,12 @@
 // (FLUSH) each frame. Only the control queue (queue 0) is used; the cursor queue
 // and 3D are not.
 //
-// Host-window resizes are detected by polling: the device's configuration-change
-// interrupt shares a PCI INTx line with virtio-input here, and the kernel does not
-// fan a shared line out to multiple drivers, so acquiring it would hijack input's
-// routing and storm. Instead the serve loop wakes periodically (a timeout on its
-// service channel), re-reads GET_DISPLAY_INFO, and on a change rebinds the scanout
-// and tells ConsoleService (RESIZE) to reflow.
+// Host-window resizes are detected by the device's configuration-change interrupt:
+// DeviceManager hands us the device's MSI-X Interrupt capability (a per-device
+// edge-triggered vector, M46 - no INTx sharing to hijack), the config vector is
+// routed to it, and a resize wakes the serve loop, which re-reads GET_DISPLAY_INFO,
+// rebinds the scanout, and tells ConsoleService (RESIZE) to reflow. Should the
+// interrupt be unavailable, the loop falls back to the old periodic size poll.
 
 #![no_std]
 #![no_main]
@@ -63,9 +63,16 @@ const MAX_W: u32 = 1920;
 const MAX_H: u32 = 1080;
 
 // How often (in 100 Hz monotonic ticks) the serve loop wakes to poll the host display
-// size for a resize while idle: ~200 ms, snappy enough for window drags yet a trivial
-// one-command-per-tick load.
+// size while idle - the FALLBACK when no config-change interrupt was granted: ~200 ms,
+// snappy enough for window drags yet a trivial one-command-per-tick load.
 const POLL_TICKS: u64 = 20;
+
+// The virtio-gpu device config: events_read (le32 at 0) accumulates event bits the
+// driver acknowledges by writing them to events_clear (le32 at 4).
+// VIRTIO_GPU_EVENT_DISPLAY (bit 0) signals a display change.
+const CONFIG_EVENTS_READ: u64 = 0;
+const CONFIG_EVENTS_CLEAR: u64 = 4;
+const EVENT_DISPLAY: u8 = 1;
 
 unsafe fn wr32(addr: u64, v: u32) {
 	unsafe { (addr as *mut u32).write_unaligned(v) }
@@ -248,13 +255,22 @@ unsafe fn dma(size: u64) -> Option<Dma> {
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
-		// 1. bring the device up (recv "DEVICE" + MMIO cap, map, negotiate to FEATURES_OK).
-		let device: Virtio = common::bringup(bootstrap);
-		// 2. set up the control queue (queue 0) and go live.
+		// 1. bring the device up (recv "DEVICE" + MMIO cap, map, negotiate to FEATURES_OK),
+		//    then receive the config-change Interrupt capability ("IRQ") DeviceManager
+		//    acquired for us.
+		let mut device: Virtio = common::bringup(bootstrap);
+		let irq: u64 = recv_irq(bootstrap);
+		// 2. set up the control queue (queue 0) and go live. The queue stays polled
+		//    (NO_VECTOR - set_msix_vector runs after setup_queue on purpose); only the
+		//    device's CONFIG vector is routed to our interrupt, so it fires exactly for
+		//    display changes.
 		let q: Queue = match device.setup_queue(0) {
 			Some(q) => q,
 			None => exit(),
 		};
+		if irq != 0 {
+			device.set_msix_vector(0);
+		}
 		device.driver_ok();
 		// command + response buffers reused for every control request.
 		let cmd = match dma(PAGE) {
@@ -310,31 +326,56 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		};
 		send_blocking(bootstrap, b"driver.virtio-gpu: online", far);
-		serve(&gpu, fb_handle, max_w, max_h, init_w, init_h, service)
+		serve(&device, &gpu, fb_handle, max_w, max_h, init_w, init_h, service, irq)
 	}
 }
 
-// Serve ConsoleService while polling for host-window resizes. The serve loop waits on
-// the service channel with a timeout: a message wakes it at once (FB / FLUSH); a timeout
-// (~POLL_TICKS) wakes it to re-read the display size, and on a change it rebinds the
-// scanout to the new sub-rectangle of the resource and tells ConsoleService (RESIZE) so
-// it reflows its terminal. "FB" hands back the framebuffer (max geometry + current size +
-// a MAP|TRANSFER dup of the backing); "FLUSH" presents the current rectangle (backing ->
-// host resource -> display).
+// Receive the "IRQ" message carrying the device's Interrupt capability (the
+// config-change vector), which DeviceManager acquired and transferred to us.
+// Returns 0 when it does not arrive - the serve loop then falls back to polling.
+unsafe fn recv_irq(bootstrap: u64) -> u64 {
+	unsafe {
+		let mut buf: [u8; 16] = [0u8; 16];
+		match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } if len >= 3 && &buf[..3] == b"IRQ" => handle,
+			_ => 0,
+		}
+	}
+}
+
+// Serve ConsoleService while watching for host-window resizes. The serve loop waits
+// on the service channel and the config-change interrupt: a message wakes it at once
+// (FB / FLUSH); the interrupt (or, with no interrupt granted, a periodic poll
+// timeout) wakes it to re-read the display size, and on a change it rebinds the
+// scanout to the new sub-rectangle of the resource and tells ConsoleService (RESIZE)
+// so it reflows its terminal. "FB" hands back the framebuffer (max geometry + current
+// size + a MAP|TRANSFER dup of the backing); "FLUSH" presents the current rectangle
+// (backing -> host resource -> display).
 #[allow(clippy::too_many_arguments)]
-unsafe fn serve(gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u32, init_w: u32, init_h: u32, service: u64) -> ! {
+unsafe fn serve(device: &Virtio, gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u32, init_w: u32, init_h: u32, service: u64, irq: u64) -> ! {
 	unsafe {
 		let mut cur_w: u32 = init_w;
 		let mut cur_h: u32 = init_h;
 		let mut req: [u8; 16] = [0u8; 16];
 		loop {
-			// wake on a service request, or periodically to poll the host display size. The
-			// poll is a housekeeping wake (WAIT_PERIODIC): it recurs forever, so it must
-			// never count as pending progress or the scheduler's boot driver (and the kernel
-			// tests) would wait on it forever.
-			let ready: i64 = wait_any_periodic(&[service], clock() + POLL_TICKS);
+			// wake on a service request or on a display change. The interrupt path blocks
+			// with no deadline; the poll fallback is a housekeeping wake (WAIT_PERIODIC), so
+			// it never counts as pending progress for the scheduler's boot driver (or the
+			// kernel tests).
+			let ready: i64 = if irq != 0 { wait_any(&[service, irq], 0) } else { wait_any_periodic(&[service], clock() + POLL_TICKS) };
 			if ready != 0 {
-				// timed out: a display resize shows up as a new GET_DISPLAY_INFO size.
+				if irq != 0 {
+					// acknowledge the display event (write the read bits back to events_clear)
+					// and re-arm the interrupt BEFORE reading the new size, so a change racing
+					// the read fires again rather than being lost.
+					let events: u8 = device.config_read(CONFIG_EVENTS_READ);
+					if events & EVENT_DISPLAY != 0 {
+						device.config_write(CONFIG_EVENTS_CLEAR, EVENT_DISPLAY);
+					}
+					interrupt_ack(irq);
+				}
+				// a display change (or poll timeout): a resize shows up as a new
+				// GET_DISPLAY_INFO size.
 				let (nw, nh) = gpu.display_size();
 				let (nw, nh) = (nw.min(max_w), nh.min(max_h));
 				if nw > 0 && nh > 0 && (nw, nh) != (cur_w, cur_h) {
@@ -349,11 +390,6 @@ unsafe fn serve(gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u32, init_w: u32, 
 					msg[10..14].copy_from_slice(&cur_h.to_le_bytes());
 					send_blocking(service, &msg, 0);
 				}
-				// The same periodic wake paces the console's caret blink: a non-blocking tick
-				// (dropped harmlessly if the console's queue is full). The display driver is the
-				// natural clock here - a timer in ConsoleService itself would keep a perpetual
-				// deadline armed and stall the cooperative boot driver.
-				let _ = try_send(service, b"TICK", 0);
 				continue;
 			}
 			// A message woke us: drain every queued request, coalescing FLUSHes so a backlog

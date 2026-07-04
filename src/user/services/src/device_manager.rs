@@ -284,13 +284,13 @@ unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], 
 			if !send_blocking(dm_side, &buf[..6 + info_size], cap as u64) {
 				return false;
 			}
-			// the interrupt-driven drivers (virtio-input, virtio-net, virtio-snd, xhci)
-			// also need their device's Interrupt capability, transferred as a second
-			// "IRQ" message. Each takes its own per-device MSI-X vector (edge-triggered,
-			// with no INTx sharing). The polling drivers (blk/console/gpu) get none, so
-			// their device IRQs stay silent. The gpu takes no interrupt at all - it polls
-			// the display size for resizes rather than acquiring one; see driver.virtio-gpu.
-			let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci";
+			// the interrupt-driven drivers (virtio-input, virtio-net, virtio-snd, xhci,
+			// virtio-gpu) also need their device's Interrupt capability, transferred as a
+			// second "IRQ" message. Each takes its own per-device MSI-X vector
+			// (edge-triggered, with no INTx sharing). The gpu routes only its CONFIG vector
+			// to it (display changes); its control queue stays polled. The remaining
+			// polling drivers (blk/console) get none, so their device IRQs stay silent.
+			let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu";
 			if use_msix {
 				let irq: i64 = device_msix_acquire(i);
 				if irq < 0 {
