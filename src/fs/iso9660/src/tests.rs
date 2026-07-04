@@ -57,11 +57,7 @@ fn dir_block(records: &[Vec<u8>]) -> Vec<u8> {
 // Encode a name: ASCII 8.3 + ";1" for the PVD, big-endian UCS-2 for Joliet.
 fn name(s: &str, dir: bool, joliet: bool) -> Vec<u8> {
 	let s = if dir { s.into() } else { format!("{s};1") };
-	if joliet {
-		s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()
-	} else {
-		s.into_bytes()
-	}
+	if joliet { s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect() } else { s.into_bytes() }
 }
 
 // Build a one-level ISO: PVD (+ optional Joliet SVD), terminator, root, one subdir, and
@@ -205,6 +201,45 @@ fn a_multi_extent_file_is_refused_not_truncated() {
 	img[19 * SECTOR_SIZE + HELLO_REC + 25] |= 0x80;
 	let mut fs = Iso9660::mount(MemDisc { data: img }).unwrap();
 	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid));
+}
+
+#[test]
+fn an_extended_attribute_record_is_skipped_not_served() {
+	// rec[1] counts XAR blocks at the extent's start - the data begins after them,
+	// and serving the XAR as content would be a silent misread.
+	let mut img = build_iso(false);
+	img.extend(vec![0u8; SECTOR_SIZE]); // block 23 for the shifted content
+	both32(&mut img, 16 * SECTOR_SIZE + 80, 24);
+	let world = 20 * SECTOR_SIZE + 68; // WORLD.TXT's record after SUB's "." and ".."
+	img[world + 1] = 1; // one XAR block ahead of the data
+	let (old, new) = (22 * SECTOR_SIZE, 23 * SECTOR_SIZE);
+	img.copy_within(old..old + 5, new);
+	img[old..old + 5].copy_from_slice(b"XARBL");
+	let mut fs = Iso9660::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"SUB/WORLD.TXT").unwrap(), b"world");
+}
+
+#[test]
+fn an_interleaved_file_is_refused_not_misread() {
+	// a nonzero file-unit/gap pair stores the file with gap blocks woven in - reading
+	// it contiguously would serve the gaps as content.
+	let mut img = build_iso(false);
+	img[19 * SECTOR_SIZE + HELLO_REC + 26] = 1;
+	img[19 * SECTOR_SIZE + HELLO_REC + 27] = 1;
+	let mut fs = Iso9660::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid));
+}
+
+#[test]
+fn a_joliet_escape_later_in_the_field_is_recognized() {
+	// a descriptor may list several escape sequences with UCS-2 not first - it is
+	// still Joliet, or the long names silently fall back to 8.3 forms.
+	let mut img = build_iso(true);
+	let svd = 17 * SECTOR_SIZE;
+	img[svd + 88..svd + 91].copy_from_slice(&[0, 0, 0]);
+	img[svd + 92..svd + 95].copy_from_slice(b"%/E");
+	let mut fs = Iso9660::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"SUB/WORLD.TXT").unwrap(), b"world");
 }
 
 #[test]

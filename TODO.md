@@ -1802,6 +1802,27 @@ panic the storage service or allocate without bound.
   - Result: all hold - iso9660 8 host tests (5 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean (the image builder now writes the volume space size and block size like a real mastering tool).
 - Concept: the hostile-media rule of the FAT track (M87/M90-B4/M93-B1: bound every on-medium value before use, and the medium itself is the bound), M91-B5/round-8 (the listing-contract classes recurring here), one Volume API behaving uniformly across backends.
 
+## M97 - ISO9660: second-pass findings (the rare-legal shapes that misread)
+
+The second full source pass (2026-07-04, after M96 landed) re-verified the
+first-pass machinery holds - the get-guards, the extent gate before every
+allocation, the mount probe, the listing contract - and found no high or
+medium grade issues anymore: what remains are the rare-but-legal record
+shapes the reader serves WRONG instead of refusing or handling, plus two
+cosmetic recognition gaps.
+
+- [x] (B1, low) The Extended Attribute Record length (`rec[1]`) is ignored: a nonzero value means the extent begins with that many XAR blocks and the data follows them - a file with an XAR serves the XAR block as content prefix, a directory with one parses it as records (cleanly, but nonsense). Fix: the parsed entry's LBA advances by the XAR length (saturating; the extent gate bounds the sum).
+  - Result: `parse_record` advances the LBA by `rec[1]` (saturating). Test `an_extended_attribute_record_is_skipped_not_served` (a file behind one XAR block reads its real content, not the XAR).
+- [x] (B2, low) Interleaving (`rec[26]` file-unit size / `rec[27]` gap size) is ignored: an interleaved file read contiguously serves its gap blocks as content - the M96-B4 silent-misread class through another flag pair. Fix: refuse a nonzero pair as Invalid, like multi-extent.
+  - Result: `Entry.multi` generalized to `Entry.unsupported` (multi-extent OR interleaved); `read_file` refuses both. Test `an_interleaved_file_is_refused_not_misread`.
+- [x] (B3, cosmetic) `is_joliet` tests the escape sequences only at the start of the 32-byte field - a descriptor listing several sequences with UCS-2 not first is missed and names fall back to 8.3 forms. Search the whole field.
+  - Result: the whole field is searched. Test `a_joliet_escape_later_in_the_field_is_recognized` (the sequence planted at offset 4 still selects Joliet and the UCS-2 names resolve).
+- [x] (B4, cosmetic) Two unrecorded known limits in the Rock Ridge reader: continuation areas (CE) are not followed and a SUSP skip offset (SP) is not applied - a name kept there degrades cleanly to the shorter NM prefix or the 8.3 form, without a word in the doc. Record the trade-off where the NM scan is defined.
+  - Result: recorded at `rock_ridge_name`.
+- Done when: a file behind an XAR reads back with its real content, an interleaved file refuses instead of misreading, a UCS-2 escape sequence anywhere in the field selects Joliet, the RR degradation is recorded, and the suite stays green with a test per finding.
+  - Result: all hold - iso9660 11 host tests (3 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
+- Concept: M96-B4 (the refuse-rather-than-misread rule extended to the remaining record shapes), the FAT track's interop rule (what the media's home systems serve, we serve - or refuse honestly).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a

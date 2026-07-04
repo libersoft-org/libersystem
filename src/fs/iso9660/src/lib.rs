@@ -148,9 +148,10 @@ impl<D: BlockDevice> Iso9660<D> {
 		if entry.is_dir {
 			return Err(FsError::NotFound);
 		}
-		// a multi-extent file (one file stored as several records) is not assembled
-		// here - refuse it rather than serve the first segment as the whole.
-		if entry.multi {
+		// a multi-extent or interleaved file (segments in further records, or gap blocks
+		// woven into the extent) is not assembled here - refuse it rather than serve a
+		// truncated or gap-riddled read as the whole.
+		if entry.unsupported {
 			return Err(FsError::Invalid);
 		}
 		self.read_extent(entry.lba, entry.size)
@@ -255,13 +256,14 @@ impl<D: BlockDevice> Iso9660<D> {
 
 // One parsed directory record: its extent, byte length, kind, decoded name, whether it
 // is a "." / ".." self/parent entry (named so, matched by lookups, skipped in listings),
-// and whether the file continues in further records (multi-extent).
+// and whether it takes a form this backend refuses rather than misreads (multi-extent
+// or interleaved).
 struct Entry {
 	lba: u32,
 	size: u32,
 	is_dir: bool,
 	special: bool,
-	multi: bool,
+	unsupported: bool,
 	name: String,
 }
 
@@ -272,10 +274,11 @@ fn root_extent(desc: &[u8]) -> (u32, u32) {
 	(le32(&r[2..6]), le32(&r[10..14]))
 }
 
-// A type-2 descriptor is Joliet when its escape sequence selects UCS-2 (%/@, %/C, %/E).
+// A type-2 descriptor is Joliet when its escape sequences select UCS-2 (%/@, %/C, %/E)
+// anywhere in the field - a descriptor may list several and UCS-2 need not be first.
 fn is_joliet(desc: &[u8]) -> bool {
 	let esc = &desc[88..120];
-	esc.starts_with(b"%/@") || esc.starts_with(b"%/C") || esc.starts_with(b"%/E")
+	[b"%/@".as_slice(), b"%/C", b"%/E"].iter().any(|s| esc.windows(3).any(|w| w == *s))
 }
 
 // Parse a directory record: extent, length, dir flag, and the name (Joliet UCS-2, a Rock
@@ -284,10 +287,15 @@ fn parse_record(rec: &[u8], joliet: bool) -> Option<Entry> {
 	if rec.len() < 33 {
 		return None;
 	}
-	let lba = le32(&rec[2..6]);
+	// an Extended Attribute Record occupies rec[1] blocks at the extent's START - the
+	// data follows it, and serving the XAR as content would be a silent misread (the
+	// extent gate bounds the advanced LBA like any other).
+	let lba = le32(&rec[2..6]).saturating_add(rec[1] as u32);
 	let size = le32(&rec[10..14]);
 	let is_dir = rec[25] & 0x02 != 0;
-	let multi = rec[25] & 0x80 != 0;
+	// multi-extent (segments in further records) and interleaving (gap blocks woven
+	// into the extent) are forms the reader refuses rather than misreads.
+	let unsupported = rec[25] & 0x80 != 0 || rec[26] != 0 || rec[27] != 0;
 	let id_len = rec[32] as usize;
 	if 33 + id_len > rec.len() {
 		return None;
@@ -295,7 +303,7 @@ fn parse_record(rec: &[u8], joliet: bool) -> Option<Entry> {
 	let id = &rec[33..33 + id_len];
 	let special = id_len == 1 && (id[0] == 0 || id[0] == 1);
 	let name = if special { String::from(if id[0] == 0 { "." } else { ".." }) } else { decode_name(id, rec, id_len, joliet) };
-	Some(Entry { lba, size, is_dir, special, multi, name })
+	Some(Entry { lba, size, is_dir, special, unsupported, name })
 }
 
 // Decode an entry name. Joliet is big-endian UCS-2; otherwise a Rock Ridge NM entry in
@@ -335,6 +343,8 @@ fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool) -> String {
 
 // Find a Rock Ridge "NM" name in a record's system-use area: entries are sig(2), len,
 // version, then NM's flags byte and the name bytes. None if there is no NM entry.
+// Continuation areas (CE) are not followed and a SUSP skip offset (SP) is not applied -
+// a name kept there degrades cleanly to the shorter NM prefix or the 8.3 form.
 fn rock_ridge_name(sys: &[u8]) -> Option<String> {
 	let mut off = 0usize;
 	let mut out = String::new();
