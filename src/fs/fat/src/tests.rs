@@ -374,6 +374,7 @@ fn push_exfat_entry(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32, nfc:
 fn push_exfat_entry_ex(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32, nfc: bool, is_dir: bool) {
 	let units: Vec<u16> = name.encode_utf16().collect();
 	let name_frags = units.len().div_ceil(15);
+	let mut set: Vec<u8> = Vec::new();
 	let mut file = [0u8; 32];
 	file[0] = 0x85;
 	file[1] = (1 + name_frags) as u8;
@@ -387,8 +388,8 @@ fn push_exfat_entry_ex(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32, n
 	stream[8..16].copy_from_slice(&size.to_le_bytes());
 	stream[20..24].copy_from_slice(&cluster.to_le_bytes());
 	stream[24..32].copy_from_slice(&size.to_le_bytes());
-	dir.extend_from_slice(&file);
-	dir.extend_from_slice(&stream);
+	set.extend_from_slice(&file);
+	set.extend_from_slice(&stream);
 	for f in 0..name_frags {
 		let mut e = [0u8; 32];
 		e[0] = 0xC1;
@@ -397,8 +398,12 @@ fn push_exfat_entry_ex(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32, n
 			let v = if idx < units.len() { units[idx] } else { 0 };
 			e[2 + c * 2..4 + c * 2].copy_from_slice(&v.to_le_bytes());
 		}
-		dir.extend_from_slice(&e);
+		set.extend_from_slice(&e);
 	}
+	// stamp the set checksum, as a real formatter would - the parser verifies it.
+	let sum = exfat_set_checksum(&set);
+	set[2..4].copy_from_slice(&sum.to_le_bytes());
+	dir.extend_from_slice(&set);
 }
 
 fn names(list: &[FileInfo]) -> Vec<String> {
@@ -821,14 +826,20 @@ fn a_1024_byte_sector_volume_reads_and_writes() {
 fn a_forged_nofatchain_size_is_refused() {
 	// The NoFatChain length is the medium's own claim: a forged huge size used to hang
 	// the free walk for ~4.5e15 iterations, grow the read allocation without bound,
-	// and overflow the cluster arithmetic. Both paths must refuse it as Invalid.
+	// and overflow the cluster arithmetic. An adversary authoring the volume offline
+	// computes a VALID set checksum, so the size gate must hold behind the checksum
+	// gate. Both paths must refuse it as Invalid.
 	let img = build_exfat_nfc(&[], &[File { path: "movie.mkv", data: b"real bytes" }]);
 	let heap = 25usize; // 24 reserved + 1 FAT sector
 	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
 	// the root: the 0x81 bitmap entry, then the 0x85 file and its 0xC0 stream entry,
-	// whose data length lives at byte 24.
-	let stream = (heap + 1) * 512 + 64;
+	// whose data length lives at byte 24; restamp the set checksum after the forgery.
+	let set_at = (heap + 1) * 512 + 32;
+	let stream = set_at + 32;
 	fs.dev.data[stream + 24..stream + 32].copy_from_slice(&u64::MAX.to_le_bytes());
+	let count = fs.dev.data[set_at + 1] as usize + 1;
+	let sum = exfat_set_checksum(&fs.dev.data[set_at..set_at + count * 32]);
+	fs.dev.data[set_at + 2..set_at + 4].copy_from_slice(&sum.to_le_bytes());
 	assert_eq!(fs.read_file(b"movie.mkv"), Err(FsError::Invalid));
 	assert_eq!(fs.remove(b"movie.mkv"), Err(FsError::Invalid));
 }
@@ -857,7 +868,7 @@ fn an_entry_never_lands_past_the_terminator() {
 	// where the parser (which stops there) never looks: a silently lost file.
 	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
 	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
-	// ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
+						  // ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
 	fs.dev.data[root_off + 5 * 32] = b'X';
 	fs.write_file(b"a long note.txt", b"visible").unwrap();
 	assert_eq!(fs.read_file(b"a long note.txt").unwrap(), b"visible");
@@ -1090,4 +1101,161 @@ fn a_degenerate_exfat_entry_set_is_skipped() {
 	let list = fs.list().unwrap();
 	assert!(list.iter().all(|e| !e.name.is_empty()), "an empty-named entry surfaced: {list:?}");
 	assert!(list.iter().any(|e| e.name == "HELLO.TXT"));
+}
+
+#[test]
+fn orphan_lfn_fragments_never_corrupt_a_neighbors_name() {
+	// A non-LFN-aware tool deletes only the 8.3 record and leaves the fragments
+	// behind: unchecked, the orphans merged with the NEXT file's fragments into one
+	// garbage name. Orphans must be discarded and the neighbor keeps its real name.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, &[]) }).unwrap();
+	fs.write_file(b"Alpha file.txt", b"alpha").unwrap();
+	// plant an orphan fragment (a mid-set sequence with a bogus checksum) in the free
+	// slot right after Alpha's set, then write Beta - its set lands after the orphan.
+	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
+	let slot = root_off + 3 * 32; // Alpha's set is 2 fragments + the 8.3 entry
+	fs.dev.data[slot] = 0x03;
+	fs.dev.data[slot + 11] = 0x0F;
+	fs.dev.data[slot + 13] = 0xAB;
+	fs.write_file(b"Beta file.txt", b"beta").unwrap();
+	assert_eq!(fs.read_file(b"Beta file.txt").unwrap(), b"beta");
+	assert_eq!(fs.read_file(b"Alpha file.txt").unwrap(), b"alpha");
+	assert_eq!(names(&fs.list().unwrap()), ["Alpha file.txt", "Beta file.txt"]);
+	// and a real set whose fragment checksum is tampered falls back to its 8.3 name,
+	// which still resolves - the file is never lost, only its long form.
+	fs.dev.data[root_off + 13] ^= 0x55;
+	let after = names(&fs.list().unwrap());
+	assert!(after.contains(&"ALPHA_~1.TXT".to_string()), "{after:?}");
+	assert!(!after.contains(&"Alpha file.txt".to_string()), "{after:?}");
+	assert_eq!(fs.read_file(b"ALPHA_~1.TXT").unwrap(), b"alpha");
+}
+
+#[test]
+fn a_torn_exfat_entry_set_is_skipped_not_trusted() {
+	// A power cut can tear an entry set half old / half new: the stored checksum no
+	// longer matches, and trusting the set would serve garbage metadata. It must be
+	// skipped, the healthy neighbors unaffected.
+	let mut fs = FatFs::mount(MemDisk { data: build_exfat(ROOT) }).unwrap();
+	let root_off = (25 + 1) * 512;
+	// HELLO.TXT's set follows the bitmap entry; corrupt one byte of its stream record
+	// without restamping the set checksum.
+	fs.dev.data[root_off + 64 + 24] ^= 0x01;
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::NotFound));
+	assert_eq!(fs.read_file(b"readme.md").unwrap(), b"long name file");
+	assert!(!names(&fs.list().unwrap()).contains(&"HELLO.TXT".to_string()));
+}
+
+#[test]
+fn a_zero_reserved_bpb_and_an_overlapping_exfat_fat_do_not_mount() {
+	// A zero reserved count puts the FAT region at the boot sector (the first FAT
+	// write would overwrite it), and an exFAT FAT running into the cluster heap makes
+	// a FAT-slot write clobber file data - both layouts are refused at mount.
+	let mut zero_res = build_fat(Kind::Fat16, ROOT);
+	zero_res[14..16].copy_from_slice(&0u16.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: zero_res }).is_none(), "a FAT region at the boot sector");
+	let mut overlap = build_exfat(ROOT);
+	overlap[84..88].copy_from_slice(&100u32.to_le_bytes()); // the FAT runs into the heap at 25
+	assert!(FatFs::mount(MemDisk { data: overlap }).is_none(), "a FAT overlapping the cluster heap");
+}
+
+// A device that fails the first armed write to one specific LBA, then heals - for
+// pinning write-ordering guarantees.
+struct FailAt {
+	inner: MemDisk,
+	lba: u64,
+	armed: bool,
+}
+
+impl BlockDevice for FailAt {
+	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		self.inner.read_sector(lba, buf)
+	}
+
+	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
+		if self.armed && lba == self.lba {
+			self.armed = false;
+			return false;
+		}
+		self.inner.write_sector(lba, buf)
+	}
+}
+
+#[test]
+fn a_grow_cluster_reaches_the_chain_only_zeroed() {
+	// grow links a fresh cluster into the directory chain; its stale on-device bytes
+	// must be zeroed BEFORE the link, or a failure of the later directory write leaves
+	// garbage the parser reads as entries (and a remove could then free foreign
+	// clusters). Fail the directory write right after a grow and inspect the tail.
+	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
+	let mut fs = FatFs::mount(FailAt { inner, lba: 0, armed: false }).unwrap();
+	// fill DOCS to exactly one 16-entry cluster: ".", "..", a.txt plus 13 more.
+	for i in 0..13u32 {
+		let name = alloc::format!("DOCS/F{i}.TXT");
+		fs.write_file(name.as_bytes(), b"x").unwrap();
+	}
+	// plant entry-like garbage in the free clusters the next write will allocate from.
+	let max = fs.max_cluster();
+	let free: Vec<u32> = (2..=max).filter(|&c| fs.next_cluster(c).unwrap() == 0).take(4).collect();
+	for &c in &free {
+		let at = fs.cluster_fs_sector(c) as usize * 512;
+		fs.dev.inner.data[at..at + 512].fill(b'A');
+	}
+	// the next write grows DOCS; make the directory write fail at its first sector.
+	let docs = fs.resolve_dir(b"DOCS").unwrap();
+	fs.dev.lba = fs.cluster_fs_sector(docs.cluster);
+	fs.dev.armed = true;
+	assert_eq!(fs.write_file(b"DOCS/F13.TXT", b"y"), Err(FsError::Io));
+	fs.dev.armed = false;
+	// the tail cluster is linked but zeroed - the listing shows only the real entries.
+	let listed = names(&fs.list_dir(b"DOCS").unwrap());
+	assert_eq!(listed.len(), 14, "garbage entries surfaced in the grown tail: {listed:?}");
+	assert!(listed.iter().all(|n| n == "a.txt" || (n.starts_with('F') && n.ends_with(".TXT"))), "{listed:?}");
+}
+
+// A device that counts its sector reads, for pinning I/O-cost bounds.
+struct CountingDisk {
+	inner: MemDisk,
+	reads: usize,
+}
+
+impl BlockDevice for CountingDisk {
+	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		self.reads += 1;
+		self.inner.read_sector(lba, buf)
+	}
+
+	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
+		self.inner.write_sector(lba, buf)
+	}
+}
+
+#[test]
+fn a_write_on_a_full_volume_reads_the_fat_once_not_per_cluster() {
+	// The allocation scan used to read the FAT off the device per candidate cluster -
+	// two sectors for each of the thousands of allocated clusters it skips on a
+	// fuller volume. A small write must cost on the order of one FAT image read.
+	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
+	let mut fs = FatFs::mount(CountingDisk { inner, reads: 0 }).unwrap();
+	let chunk = vec![0x5Au8; 500 * 512];
+	for i in 0..8u32 {
+		let name = alloc::format!("FILL{i}.BIN");
+		fs.write_file(name.as_bytes(), &chunk).unwrap();
+	}
+	fs.dev.reads = 0;
+	fs.write_file(b"SMALL.TXT", b"tiny").unwrap();
+	assert!(fs.dev.reads < 1000, "a small write cost {} sector reads", fs.dev.reads);
+}
+
+#[test]
+fn an_all_spaces_classic_entry_is_skipped() {
+	// An 8.3 field of nothing but padding decodes to an empty name - noise on hostile
+	// media, and `read_file(b"")` used to match it.
+	let mut img = build_fat(Kind::Fat16, ROOT);
+	let root_off = 21 * 512;
+	let slot = root_off + 4 * 32; // the first free slot past ROOT's four records
+	img[slot..slot + 11].fill(0x20);
+	img[slot + 11] = 0x20; // attributes: an ordinary file
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert!(names(&fs.list().unwrap()).iter().all(|n| !n.is_empty()));
+	assert_eq!(fs.read_file(b""), Err(FsError::NotFound));
 }
