@@ -65,10 +65,13 @@ static SCHED: [CpuSched; MAX_CPUS] = [const { CpuSched::new() }; MAX_CPUS];
 // it waits on becomes ready or its deadline passes. The Arc keeps the thread
 // alive while blocked. `deadline` is an absolute LAPIC tick value; u64::MAX means
 // no timeout. `koid` is the object whose readiness wakes the thread (0 = none).
+// `periodic` marks a housekeeping deadline (WAIT_PERIODIC): still woken when due,
+// but invisible to min_deadline, so run_until_idle settles across it.
 struct Waiter {
 	thread: Arc<Thread>,
 	koid: u64,
 	deadline: u64,
+	periodic: bool,
 }
 
 // The global wait registry. One lock for all blocked threads is enough at this
@@ -248,12 +251,18 @@ pub fn exit() -> ! {
 // and the fault longjmp, reschedule(Block) RETURNS when the thread is woken, so
 // the Arc's destructor still runs normally.
 pub fn block_on(koid: u64, deadline: u64) {
+	block_on_flagged(koid, deadline, false);
+}
+
+// block_on with the periodic marker: a housekeeping deadline that never counts as
+// pending progress (see Waiter::periodic).
+pub fn block_on_flagged(koid: u64, deadline: u64, periodic: bool) {
 	let thread = match current_thread() {
 		Some(t) => t,
 		None => return,
 	};
 	thread.set_state(ThreadState::Blocked);
-	WAITERS.lock().push(Waiter { thread, koid, deadline });
+	WAITERS.lock().push(Waiter { thread, koid, deadline, periodic });
 	reschedule(Disposition::Block);
 }
 
@@ -261,7 +270,7 @@ pub fn block_on(koid: u64, deadline: u64) {
 // passes): register it once per koid, so a wake on any of them returns it. The
 // caller re-checks which object is actually ready after each wake (the wait_any
 // condition loop), so an early or spurious wake just re-blocks.
-pub fn block_on_any(koids: &[u64], deadline: u64) {
+pub fn block_on_any(koids: &[u64], deadline: u64, periodic: bool) {
 	let thread = match current_thread() {
 		Some(t) => t,
 		None => return,
@@ -270,7 +279,7 @@ pub fn block_on_any(koids: &[u64], deadline: u64) {
 	{
 		let mut waiters = WAITERS.lock();
 		for &koid in koids {
-			waiters.push(Waiter { thread: thread.clone(), koid, deadline });
+			waiters.push(Waiter { thread: thread.clone(), koid, deadline, periodic });
 		}
 	}
 	reschedule(Disposition::Block);
@@ -335,9 +344,12 @@ pub fn check_deadlines() {
 	}
 }
 
-// The earliest finite deadline among blocked threads, if any.
+// The earliest finite deadline that represents pending PROGRESS - periodic
+// housekeeping wakes (WAIT_PERIODIC) are excluded, so a service that ticks forever
+// never keeps run_until_idle from settling. Expired periodic waits are still woken
+// by check_deadlines wherever the scheduler runs it.
 fn min_deadline() -> Option<u64> {
-	WAITERS.lock().iter().map(|w: &Waiter| w.deadline).filter(|d: &u64| *d != NO_DEADLINE).min()
+	WAITERS.lock().iter().filter(|w: &&Waiter| !w.periodic).map(|w: &Waiter| w.deadline).filter(|d: &u64| *d != NO_DEADLINE).min()
 }
 
 // Make a woken thread runnable again on the current core.
@@ -347,11 +359,9 @@ fn enqueue(thread: Arc<Thread>) {
 }
 
 // An optional hook the BSP runs while idle-spinning for the next timed wakeup. It
-// keeps a polled input source (the serial console) responsive even when a driver
-// keeps re-arming a short timer: virtio-gpu polls its display size every ~200ms, so
-// the run queue never stays empty long enough for run_until_idle to return, and
-// without this the BSP would spin here forever and never poll the UART. Set once at
-// boot (a bare fn pointer stored as an integer).
+// keeps a polled input source (the serial console) responsive while the scheduler
+// waits out a progress deadline. Set once at boot (a bare fn pointer stored as an
+// integer).
 static IDLE_HOOK: AtomicU64 = AtomicU64::new(0);
 
 // Register the idle hook the BSP runs while spinning for the next deadline.
@@ -371,14 +381,22 @@ fn run_idle_hook() {
 // Run ready threads on the current core until the run queue drains, then return.
 // Used by the bootstrap context to drive cooperative kernel threads to completion.
 // If the queue drains while threads are blocked with a deadline, spin until the
-// nearest deadline and wake them, so a timed wait completes; threads blocked with
-// no deadline (waiting on an object nothing will signal here) are left parked and
-// this returns.
+// nearest PROGRESS deadline and wake them, so a timed wait completes; threads
+// blocked with no deadline (waiting on an object nothing will signal here) or with
+// only a PERIODIC deadline (a housekeeping tick, WAIT_PERIODIC) are left parked
+// and this returns - the caller's standing loop re-enters, and each entry's
+// check_deadlines wakes whatever housekeeping came due.
 pub fn run_until_idle() {
 	let cpu = current_cpu_id();
 	loop {
 		while !SCHED[cpu].inner.lock().run_queue.is_empty() {
 			reschedule(Disposition::Requeue);
+		}
+		// Wake anything already past its deadline - a periodic wait does not count as
+		// progress below, but it must still run when due.
+		check_deadlines();
+		if !SCHED[cpu].inner.lock().run_queue.is_empty() {
+			continue;
 		}
 		match min_deadline() {
 			Some(deadline) => {
@@ -390,12 +408,14 @@ pub fn run_until_idle() {
 				// yields the vCPU; the 100 Hz LAPIC timer (and any device IRQ) wakes us within
 				// one tick to re-check the run queue, so an IRQ-woken driver (e.g. a virtio RX
 				// completion) still runs promptly. The run-queue check drops its lock each pass
-				// so the ISR that enqueues the woken thread can run between checks, and the idle
+				// so the ISR that enqueues the woken thread can run between checks, the idle
 				// hook runs each wake so the BSP keeps draining serial TX and polling serial
-				// input even while a driver re-arms a short timer (virtio-gpu's resize poll).
+				// input, and check_deadlines runs each wake so a periodic wait due inside this
+				// window still wakes on time.
 				while arch::apic::ticks() < deadline && SCHED[cpu].inner.lock().run_queue.is_empty() {
 					run_idle_hook();
 					arch::serial::drain_tx();
+					check_deadlines();
 					arch::idle_halt();
 				}
 				check_deadlines();

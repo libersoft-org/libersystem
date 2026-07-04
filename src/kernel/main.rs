@@ -245,7 +245,13 @@ fn console_shell_loop() {
 			}
 		}
 		sched::run_until_idle();
-		core::hint::spin_loop();
+		// The system is settled: only no-deadline and periodic waits remain. HALT until
+		// the next timer tick or device interrupt instead of spinning - a spinning BSP
+		// floods KVM with the serial poll's port-I/O VM-exits (see run_until_idle) - and
+		// re-enter, which wakes whatever housekeeping (a display poll, a blink tick)
+		// came due in the meantime.
+		arch::serial::drain_tx();
+		arch::idle_halt();
 	}
 }
 
@@ -1865,6 +1871,42 @@ fn blocking_wait_times_out_on_deadline() {
 	sched::spawn(waiter, 0);
 	sched::run_until_idle();
 	assert_eq!(WAIT_RET.load(Ordering::SeqCst), syscall::ERR_TIMED_OUT);
+}
+
+#[cfg(test)]
+#[test_case]
+fn a_periodic_wait_ticks_but_never_holds_the_scheduler() {
+	use core::sync::atomic::{AtomicU64, Ordering};
+	static TICKS: AtomicU64 = AtomicU64::new(0);
+	// A service thread waits with WAIT_PERIODIC on an event nothing signals,
+	// re-arming a short deadline forever - the virtio-gpu poll pattern. Without the
+	// flag this loop would keep run_until_idle from ever returning (the M35c blink
+	// hang); with it, the scheduler settles while the wait is parked, and each later
+	// run_until_idle entry wakes the tick that came due - the wait still TICKS.
+	extern "C" fn service(_arg: u64) {
+		unsafe {
+			let ev = arch::syscall::invoke(syscall::SYS_EVENT_CREATE, 0, 0, 0, 0);
+			loop {
+				let now = arch::syscall::invoke(syscall::SYS_CLOCK_GET, 0, 0, 0, 0);
+				let ret = arch::syscall::invoke(syscall::SYS_WAIT, ev, now + 2, abi::WAIT_PERIODIC, 0);
+				assert_eq!(ret as i64, syscall::ERR_TIMED_OUT, "the periodic wake fires as a timeout");
+				TICKS.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+	}
+	sched::spawn(service, 0);
+	// The first run must RETURN despite the perpetually re-armed deadline - this is
+	// the settling property the flag exists for (an ordinary wait here would hang).
+	sched::run_until_idle();
+	let settled = TICKS.load(Ordering::SeqCst);
+	// Later entries (the standing loop's re-entry, here explicit) wake the due tick.
+	let target = settled + 2;
+	let give_up = arch::apic::ticks() + 100;
+	while TICKS.load(Ordering::SeqCst) < target && arch::apic::ticks() < give_up {
+		sched::run_until_idle();
+		arch::idle_halt();
+	}
+	assert!(TICKS.load(Ordering::SeqCst) >= target, "the periodic wait keeps ticking across settles");
 }
 
 #[cfg(test)]

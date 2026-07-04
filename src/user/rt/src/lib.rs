@@ -311,12 +311,25 @@ pub unsafe fn wait(handle: u64, deadline: u64) -> i64 {
 	unsafe { syscall(SYS_WAIT, handle, deadline, 0, 0) as i64 }
 }
 
+// `wait` whose deadline is a recurring housekeeping wake (WAIT_PERIODIC): the
+// kernel still wakes the caller when it is due, but the wait never counts as
+// pending progress - the scheduler's boot driver settles across it, so a service
+// may tick forever (a display poll, a blink) without stalling boot or the tests.
+pub unsafe fn wait_periodic(handle: u64, deadline: u64) -> i64 {
+	unsafe { syscall(SYS_WAIT, handle, deadline, WAIT_PERIODIC, 0) as i64 }
+}
+
 // Block until any handle in `handles` is ready, returning the index of the ready
 // handle, or a negative error (ERR_TIMED_OUT at `deadline`; absolute ticks, 0 = no
 // timeout). Lets a driver wait on its device interrupt and a control channel at
 // once, waking on whichever fires first.
 pub unsafe fn wait_any(handles: &[u64], deadline: u64) -> i64 {
 	unsafe { syscall(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, deadline, 0) as i64 }
+}
+
+// `wait_any` whose deadline is a recurring housekeeping wake (see wait_periodic).
+pub unsafe fn wait_any_periodic(handles: &[u64], deadline: u64) -> i64 {
+	unsafe { syscall(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, deadline, WAIT_PERIODIC) as i64 }
 }
 
 // Non-blocking check of whether the object behind `handle` is ready right now - a
@@ -675,7 +688,11 @@ pub unsafe fn memory_object_create(size: u64) -> i64 {
 pub unsafe fn map_object(handle: u64) -> Option<u64> {
 	unsafe {
 		let base: u64 = syscall(SYS_MEMORY_MAP, handle, 0, 0, 0);
-		if sys_is_err(base) { None } else { Some(base) }
+		if sys_is_err(base) {
+			None
+		} else {
+			Some(base)
+		}
 	}
 }
 
@@ -784,7 +801,11 @@ pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
 		let mut info: ObjectInfo = ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0 };
 		let size: u64 = core::mem::size_of::<ObjectInfo>() as u64;
 		let ok: i64 = syscall(SYS_OBJECT_INFO_GET, handle, &mut info as *mut ObjectInfo as u64, size, 0) as i64;
-		if ok == 1 { Some(info) } else { None }
+		if ok == 1 {
+			Some(info)
+		} else {
+			None
+		}
 	}
 }
 
@@ -798,7 +819,11 @@ pub unsafe fn process_stats(handle: u64) -> Option<ProcessStats> {
 		let mut stats: ProcessStats = ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: 0 };
 		let size: u64 = core::mem::size_of::<ProcessStats>() as u64;
 		let ok: i64 = syscall(SYS_PROCESS_STATS_GET, handle, &mut stats as *mut ProcessStats as u64, size, 0) as i64;
-		if ok == 1 { Some(stats) } else { None }
+		if ok == 1 {
+			Some(stats)
+		} else {
+			None
+		}
 	}
 }
 
@@ -982,7 +1007,11 @@ pub unsafe fn domain_stats(handle: u64) -> Option<DomainStats> {
 		let mut stats: DomainStats = DomainStats::default();
 		let size: u64 = core::mem::size_of::<DomainStats>() as u64;
 		let ok: i64 = syscall(SYS_DOMAIN_STATS_GET, handle, &mut stats as *mut DomainStats as u64, size, 0) as i64;
-		if ok == 1 { Some(stats) } else { None }
+		if ok == 1 {
+			Some(stats)
+		} else {
+			None
+		}
 	}
 }
 

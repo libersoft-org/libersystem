@@ -257,8 +257,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		}
 		SYS_OBJECT_INFO_GET => sys_object_info_get(a0, a1, a2),
 		SYS_PROCESS_STATS_GET => sys_process_stats_get(a0, a1, a2),
-		SYS_WAIT => sys_wait(a0, a1),
-		SYS_WAIT_ANY => sys_wait_any(a0, a1, a2),
+		SYS_WAIT => sys_wait(a0, a1, a2),
+		SYS_WAIT_ANY => sys_wait_any(a0, a1, a2, a3),
 		_ => ERR_BAD_SYSCALL,
 	};
 	result as u64
@@ -1097,8 +1097,11 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 // absolute LAPIC tick value; 0 = no timeout) passes. Returns 0 when the object
 // became ready, ERR_TIMED_OUT on timeout. This is the kernel's one blocking
 // primitive; the non-blocking send/recv/poll calls layer the synchronous-looking
-// `call()` on top of it. The handle must carry the WAIT right.
-fn sys_wait(handle: u64, deadline: u64) -> i64 {
+// `call()` on top of it. The handle must carry the WAIT right. `flags` may carry
+// WAIT_PERIODIC: the deadline is a recurring housekeeping wake, still honored but
+// never holding the scheduler's settling point open.
+fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
+	let periodic = flags & abi::WAIT_PERIODIC != 0;
 	let thread = current_thread!();
 	let object = {
 		let table = thread.handles().lock();
@@ -1128,7 +1131,7 @@ fn sys_wait(handle: u64, deadline: u64) -> i64 {
 		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
 			return ERR_TIMED_OUT;
 		}
-		sched::block_on(koid, block_deadline);
+		sched::block_on_flagged(koid, block_deadline, periodic);
 	}
 }
 
@@ -1142,8 +1145,9 @@ const MAX_WAIT_ANY: usize = 4096;
 // returning that handle's index, or ERR_TIMED_OUT at `deadline` (absolute ticks,
 // 0 = none). Like `wait` but over a set: a driver waits on its device interrupt and
 // a control channel at once, waking on whichever is ready first. Each handle needs
-// the WAIT right.
-fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64) -> i64 {
+// the WAIT right. `flags` may carry WAIT_PERIODIC (see sys_wait).
+fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 {
+	let periodic = flags & abi::WAIT_PERIODIC != 0;
 	let thread = current_thread!();
 	let n = count as usize;
 	if n == 0 || n > MAX_WAIT_ANY || !user_buf_ok(handles_ptr, count * 8) {
@@ -1192,7 +1196,7 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64) -> i64 {
 		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
 			return ERR_TIMED_OUT;
 		}
-		sched::block_on_any(&koids[..n], block_deadline);
+		sched::block_on_any(&koids[..n], block_deadline, periodic);
 	}
 }
 

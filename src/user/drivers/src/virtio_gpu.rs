@@ -123,7 +123,11 @@ impl Gpu {
 			// pmodes[0].r.width @ hdr + 8, .height @ hdr + 12.
 			let w = rd32(self.resp_virt + HDR_LEN + 8);
 			let h = rd32(self.resp_virt + HDR_LEN + 12);
-			if w == 0 || h == 0 { (FALLBACK_W, FALLBACK_H) } else { (w, h) }
+			if w == 0 || h == 0 {
+				(FALLBACK_W, FALLBACK_H)
+			} else {
+				(w, h)
+			}
 		}
 	}
 
@@ -324,8 +328,11 @@ unsafe fn serve(gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u32, init_w: u32, 
 		let mut cur_h: u32 = init_h;
 		let mut req: [u8; 16] = [0u8; 16];
 		loop {
-			// wake on a service request, or periodically to poll the host display size.
-			let ready: i64 = wait_any(&[service], clock() + POLL_TICKS);
+			// wake on a service request, or periodically to poll the host display size. The
+			// poll is a housekeeping wake (WAIT_PERIODIC): it recurs forever, so it must
+			// never count as pending progress or the scheduler's boot driver (and the kernel
+			// tests) would wait on it forever.
+			let ready: i64 = wait_any_periodic(&[service], clock() + POLL_TICKS);
 			if ready != 0 {
 				// timed out: a display resize shows up as a new GET_DISPLAY_INFO size.
 				let (nw, nh) = gpu.display_size();

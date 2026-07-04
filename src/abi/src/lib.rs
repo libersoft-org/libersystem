@@ -135,6 +135,13 @@ pub const SYS_PCI_INFO: u64 = 58;
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;
 
+// Flag for SYS_WAIT (arg 2) / SYS_WAIT_ANY (arg 3): the deadline is a PERIODIC
+// housekeeping wake (a display poll, a blink tick), not pending progress. The
+// kernel still wakes the caller when it is due, but the scheduler's boot driver
+// may consider the system idle while only periodic waits remain - so a service
+// can tick forever without holding the boot path (or the tests) hostage.
+pub const WAIT_PERIODIC: u64 = 1;
+
 // Signal numbers for SYS_PROCESS_SIGNAL (POSIX-like values, but our own typed set).
 // The kernel applies the default disposition: INT / TERM / KILL terminate the target,
 // STOP suspends it, CONT resumes a suspended one. User-installed handlers are not
