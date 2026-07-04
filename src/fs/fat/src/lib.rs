@@ -247,25 +247,7 @@ impl<D: BlockDevice> FatFs<D> {
 	// freed only after the swap - so a failure part-way never costs the old file.
 	pub fn write_file(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
 		let (parent, name) = split_parent(path)?;
-		if name.is_empty() || name.len() > 255 {
-			return Err(FsError::TooLong);
-		}
-		// a name ending in a dot or a space (which covers "." and "..") collides with
-		// the dot-entry semantics and is invalid on the media's home systems.
-		if name.last().is_some_and(|&b| b == b'.' || b == b' ') {
-			return Err(FsError::Invalid);
-		}
-		// the characters illegal in a long name on the media's home systems: control
-		// bytes and `" * : < > ? \ |` (the `/` never reaches here - it is the separator).
-		if name.iter().any(|&b| b < 0x20 || b"\"*:<>?\\|".contains(&b)) {
-			return Err(FsError::Invalid);
-		}
-		// the long-name forms store UTF-16: a name that is not valid UTF-8 would be
-		// stored lossily (U+FFFD) and never found again by the bytes it was created
-		// with - the write would succeed and the file be unreachable by its own name.
-		if core::str::from_utf8(name).is_err() {
-			return Err(FsError::Invalid);
-		}
+		check_name(name)?;
 		let dir = self.resolve_dir(parent)?;
 		if self.geo.kind == Kind::ExFat {
 			return self.exfat_write(&dir, name, data);
@@ -1623,12 +1605,41 @@ fn eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
 	a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
-// Whether a name parsed off the medium may be re-emitted into a fresh entry set - the
-// write path's own gates. A foreign entry can carry a name no legal write produces (a
-// lossy decode renders an invalid unit as '?', an illegal character); an overwrite
-// must not write such a name back, it falls back to the caller's instead.
+// Validate a name for the write path - the gates of the media's home systems, owned by
+// ONE function so the write entry point and the overwrite's name-reuse guard cannot
+// drift apart. The length ceiling is 255 UTF-16 UNITS (the LFN and exFAT NameLength
+// limit), not UTF-8 bytes - a long non-ASCII name within it is legal there.
+fn check_name(name: &[u8]) -> Result<(), FsError> {
+	if name.is_empty() {
+		return Err(FsError::TooLong);
+	}
+	// a name ending in a dot or a space (which covers "." and "..") collides with the
+	// dot-entry semantics and is invalid on the media's home systems.
+	if name.last().is_some_and(|&b| b == b'.' || b == b' ') {
+		return Err(FsError::Invalid);
+	}
+	// the characters illegal in a long name there: control bytes and `" * : < > ? \ |`
+	// (the `/` never reaches here - it is the separator).
+	if name.iter().any(|&b| b < 0x20 || b"\"*:<>?\\|".contains(&b)) {
+		return Err(FsError::Invalid);
+	}
+	// the long-name forms store UTF-16: a name that is not valid UTF-8 would be stored
+	// lossily (U+FFFD) and never found again by the bytes it was created with.
+	let Ok(s) = core::str::from_utf8(name) else {
+		return Err(FsError::Invalid);
+	};
+	if s.encode_utf16().count() > 255 {
+		return Err(FsError::TooLong);
+	}
+	Ok(())
+}
+
+// Whether a name parsed off the medium may be re-emitted into a fresh entry set. A
+// foreign entry can carry a name no legal write produces (a lossy decode renders an
+// invalid unit as '?', an illegal character); an overwrite must not write such a name
+// back, it falls back to the caller's instead.
 fn writable_name(name: &[u8]) -> bool {
-	!name.is_empty() && name.len() <= 255 && !name.last().is_some_and(|&b| b == b'.' || b == b' ') && !name.iter().any(|&b| b < 0x20 || b"\"*:<>?\\|".contains(&b))
+	check_name(name).is_ok()
 }
 
 // Build a directory entry set: the 8.3 short entry, preceded by VFAT long-name fragments

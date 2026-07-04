@@ -1553,6 +1553,24 @@ fn an_overwrite_via_the_short_alias_keeps_the_long_name() {
 }
 
 #[test]
+fn a_long_non_ascii_name_within_255_units_is_accepted() {
+	// The length ceiling is 255 UTF-16 units, not UTF-8 bytes: a 204-unit name of
+	// two-byte characters (408 bytes) is legal on the media's home systems and must
+	// round-trip on both families; 256 units must refuse.
+	let path = ("\u{10D}".repeat(200) + ".txt").into_bytes();
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	fs.write_file(&path, b"diacritics").unwrap();
+	assert_eq!(fs.read_file(&path).unwrap(), b"diacritics");
+	assert!(fs.list().unwrap().iter().any(|e| e.name.as_bytes() == path.as_slice()));
+	let mut ex = FatFs::mount(MemDisk { data: build_exfat(&[]) }).unwrap();
+	ex.write_file(&path, b"diacritics").unwrap();
+	assert_eq!(ex.read_file(&path).unwrap(), b"diacritics");
+	let too_long = ("\u{10D}".repeat(252) + ".txt").into_bytes();
+	assert_eq!(fs.write_file(&too_long, b"x"), Err(FsError::TooLong));
+	assert_eq!(ex.write_file(&too_long, b"x"), Err(FsError::TooLong));
+}
+
+#[test]
 fn a_failed_free_of_the_old_chain_does_not_fail_a_durable_write() {
 	// Once the new content and its entry are on disk (or the entry is cleared, for a
 	// remove), the operation is durable - a device failing during the OLD chain's
