@@ -1060,6 +1060,14 @@ fn degenerate_boot_pointers_do_not_mount() {
 	let mut huge_count = build_exfat(ROOT);
 	huge_count[92..96].copy_from_slice(&0x0FFF_FFF4u32.to_le_bytes());
 	assert!(FatFs::mount(MemDisk { data: huge_count }).is_none(), "a cluster count past the spec ceiling");
+	// a TexFAT volume whose second FAT is active - we would read the wrong table.
+	let mut ex_active = build_exfat(ROOT);
+	ex_active[106] |= 0x01;
+	assert!(FatFs::mount(MemDisk { data: ex_active }).is_none(), "a TexFAT second-active-FAT volume");
+	// a FAT32 whose ExtFlags name an active copy past the copy count.
+	let mut bad_active = build_fat(Kind::Fat32, ROOT);
+	bad_active[40..42].copy_from_slice(&0x0081u16.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: bad_active }).is_none(), "an active FAT past the copy count");
 	// and a logical sector size the specification does not allow (not a power of two).
 	let mut odd_bps = build_fat(Kind::Fat16, ROOT);
 	odd_bps[11..13].copy_from_slice(&3584u16.to_le_bytes());
@@ -1552,4 +1560,81 @@ fn a_failed_free_of_the_old_chain_does_not_fail_a_durable_write() {
 	fs.remove(b"GONE.BIN").unwrap();
 	assert!(fs.dev.failed, "the injected failure must have fired");
 	assert_eq!(fs.read_file(b"GONE.BIN"), Err(FsError::NotFound));
+}
+
+#[test]
+fn a_non_mirrored_fat32_volume_uses_its_active_copy() {
+	// ExtFlags bit 7 disables FAT mirroring and bits 0-3 name the only current copy -
+	// the others are stale by specification. Reads must follow the active copy (the
+	// stale one truncates chains and calls allocated clusters free, cross-linking real
+	// data), and writes must leave the stale copy alone.
+	let bps = 512usize;
+	let (reserved, clusters) = (3usize, 100usize);
+	let heap = reserved + 2; // two one-sector FAT copies
+	let total = heap + clusters;
+	let mut img = vec![0u8; total * bps];
+	img[11..13].copy_from_slice(&512u16.to_le_bytes());
+	img[13] = 1;
+	img[14..16].copy_from_slice(&(reserved as u16).to_le_bytes());
+	img[16] = 2;
+	img[32..36].copy_from_slice(&(total as u32).to_le_bytes());
+	img[36..40].copy_from_slice(&1u32.to_le_bytes());
+	img[40..42].copy_from_slice(&0x0081u16.to_le_bytes()); // mirroring off, copy 1 active
+	img[44..48].copy_from_slice(&2u32.to_le_bytes());
+	img[510] = 0x55;
+	img[511] = 0xAA;
+	// the ACTIVE copy 1: root = cluster 2, HELLO.TXT = clusters 3 -> 4.
+	let f1 = 4 * bps;
+	for (c, v) in [(2usize, 0x0FFF_FFFFu32), (3, 4), (4, 0x0FFF_FFFF)] {
+		img[f1 + c * 4..f1 + c * 4 + 4].copy_from_slice(&v.to_le_bytes());
+	}
+	// the STALE copy 0 calls clusters 3 and 4 free - reading it would truncate the
+	// file and hand its clusters out again.
+	let f0 = 3 * bps;
+	img[f0 + 2 * 4..f0 + 2 * 4 + 4].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+	let mut root: Vec<u8> = Vec::new();
+	push_entry(&mut root, "HELLO.TXT", false, 700, 3);
+	img[heap * bps..heap * bps + root.len()].copy_from_slice(&root);
+	let data: Vec<u8> = (0..700u32).map(|i| (i * 7) as u8).collect();
+	let d = (heap + 1) * bps; // cluster 3, contiguously into cluster 4
+	img[d..d + 700].copy_from_slice(&data);
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert_eq!(fs.kind_name(), "fat32");
+	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), data, "the chain must follow the ACTIVE copy");
+	let stale_before = fs.dev.data[f0..f0 + bps].to_vec();
+	fs.write_file(b"NEW.TXT", b"fresh").unwrap();
+	assert_eq!(fs.read_file(b"NEW.TXT").unwrap(), b"fresh");
+	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), data, "the allocation must not cross-link the file");
+	assert_eq!(fs.dev.data[f0..f0 + bps], stale_before[..], "the stale copy must stay untouched");
+}
+
+#[test]
+fn an_overwrite_preserves_the_creation_stamp_and_name_case() {
+	// The media's home systems preserve the original name case and the creation time
+	// on an in-place overwrite - a rewritten file must not "get younger" or change
+	// its displayed case.
+	let (d1, _) = dos_datetime(946_684_800); // 2000-01-01
+	let (d2, _) = dos_datetime(1_075_680_000);
+	assert_ne!(d1, d2);
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	fs.set_clock(946_684_800);
+	fs.write_file(b"Mixed.txt", b"one").unwrap();
+	fs.set_clock(1_075_680_000);
+	fs.write_file(b"MIXED.TXT", b"two").unwrap();
+	assert_eq!(fs.read_file(b"Mixed.txt").unwrap(), b"two");
+	let listed = names(&fs.list().unwrap());
+	assert!(listed.contains(&"Mixed.txt".to_string()), "the original case must survive: {listed:?}");
+	assert_eq!(root_entry_dates(&fs.dev.data, b"MIXED   TXT"), (d1, d2), "created then, written now");
+	// the exFAT form: the create timestamp carries over, the modify stamp is fresh.
+	let mut ex = FatFs::mount(MemDisk { data: build_exfat(&[]) }).unwrap();
+	ex.set_clock(946_684_800);
+	ex.write_file(b"Case.txt", b"one").unwrap();
+	ex.set_clock(1_075_680_000);
+	ex.write_file(b"CASE.TXT", b"two").unwrap();
+	assert!(names(&ex.list().unwrap()).contains(&"Case.txt".to_string()));
+	let e = &ex.dev.data[(25 + 1) * 512 + 32..(25 + 1) * 512 + 128]; // the set after the bitmap entry
+	assert_eq!(e[0], 0x85);
+	assert_eq!(u32::from_le_bytes(e[8..12].try_into().unwrap()), (d1 as u32) << 16, "the exFAT create timestamp must carry over");
+	assert_eq!(u32::from_le_bytes(e[12..16].try_into().unwrap()), (d2 as u32) << 16, "the exFAT modify timestamp must be fresh");
+	assert_eq!(u16::from_le_bytes(e[2..4].try_into().unwrap()), exfat_set_checksum(&e[..96]), "the set checksum must cover the carried stamp");
 }

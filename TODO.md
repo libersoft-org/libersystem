@@ -1535,7 +1535,7 @@ and two nits at the edges - the audit track's remainders.
   - Result: `random_corruption_never_panics_or_hangs` - green on the first run (the M80-M85 bounds hold against randomness, not just against the reviewer's imagination), and from now on any regression in any bound fails the host suite. Two closing cosmetics landed alongside: resolve through a file answers NotDir (M76 classification), and the format-time label truncation backs off a split UTF-8 character.
 - Concept: M83-B2 (the UTF-8 rule this completes: valid encoding AND stable identity), the M78 spec's NUL-padding rule (which makes an embedded NUL an early terminator), and the track's bounding rule applied to fsck's own arithmetic. The fuzz guard is the track's closing move: reviews found the bugs, the test keeps them found.
 
-## FAT audit track (M86-M94)
+## FAT audit track (M86-M95)
 
 A full read of the fat crate (2026-07-03, lib.rs ~1030 lines + tests), the same
 treatment the LiberFS audit track gave the native filesystem. The read paths and
@@ -1760,6 +1760,26 @@ inherent to unjournaled FAT (reference drivers share it) and stays by design.
 - Done when: a foreign exFAT file with VDL < DataLength reads back with a zeroed tail on both the chained and the NoFatChain path (test-pinned with stale bytes planted past VDL), a chained directory read respects its recorded length, the PercentInUse trade-off is recorded or fixed, the zero-limit read costs no I/O, and the suite stays green with a test per finding.
   - Result: all hold - fat 60 host tests (3 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: the interop purpose of the crate (what Windows serves - zeros past VDL - we must serve; M91-B1/M92-B1 continued on the read side), the hostile-media rule (the tail bytes are someone else's deleted data - serving them is a disclosure), M93-B2 (the touch-only-what-you-must rule, here for reads).
+
+## M95 - FAT: ninth-pass findings (FAT mirroring flags and overwrite fidelity)
+
+The ninth full source pass (2026-07-04, after the eighth-pass fixes landed,
+lib.rs ~1856 lines) went after the spec corners no earlier round had read:
+the FAT mirroring flags, the volume-dirty hygiene, and what an in-place
+overwrite preserves on the media's home systems. One finding with corruption
+potential on a rare-but-settable configuration, one factually wrong doc
+claim, one metadata-fidelity gap. The eighth-pass fixes (directory sizes,
+NT case flags, best-effort final frees) re-verified clean.
+
+- [x] (B1, medium-low) The FAT32 BPB_ExtFlags word (offset 40) is ignored: bit 7 set means FAT mirroring is DISABLED and only the copy named by bits 0-3 is current - the other copies are stale by specification. Every read (`next_cluster`, `alloc_chain`'s FAT image) uses copy 0 unconditionally, so on a non-mirrored volume with an active copy other than 0 we read wrong chains (wrong file content) and the allocator hands out clusters the active FAT holds allocated - CROSS-LINKING real data. Writes land on all copies (including, correctly, the active one), which limits but does not remove the damage. The exFAT analog: VolumeFlags (offset 106) bit 0 = ActiveFat selects the second FAT (TexFAT). Fix: parse ExtFlags into the geometry; reads use `reserved + active * fat_size`; with mirroring disabled write ONLY the active copy (the others are rightfully stale); refuse an exFAT volume with ActiveFat = 1 at mount (TexFAT is out of scope).
+  - Result: `Geometry.active_fat` + `mirror` off ExtFlags (an active copy past the copy count refuses at mount); `next_cluster` and `alloc_chain`'s image read the active copy, `set_fat_entry` writes every copy only when mirroring is on; exFAT ActiveFat = 1 refuses at mount. Test `a_non_mirrored_fat32_volume_uses_its_active_copy` (divergent copies: the chain follows the active one, an allocation does not cross-link the file, the stale copy stays byte-identical); the mount gates pinned in `degenerate_boot_pointers_do_not_mount`.
+- [x] (B2, cosmetic) Two related nits: (a) the module doc's M94 claim that maintaining PercentInUse would cost a boot-checksum restamp is WRONG - the exFAT specification excludes VolumeFlags (bytes 106-107) and PercentInUse (byte 112) from the boot checksum precisely so a driver can update them in place; correct the doc. (b) Neither VolumeDirty (exFAT VolumeFlags bit 1) nor the classic clean-shutdown bits (FAT16 FAT[1] bit 15, FAT32 FAT[1] bit 27) are touched around writes, so another system's repair tooling never learns a power cut hit mid-write. Setting dirty before the first mutating write and clearing it after each completed operation costs two sector writes per op and needs no checksum work - record the trade-off or implement it.
+  - Result: the module doc now states the checksum exclusion correctly and records the dirty-flag trade-off (both stay untouched; maintaining them costs only extra sector writes, the write path stays minimal, readers treat both as advisory).
+- [x] (B3, cosmetic) An overwrite is delete+create: the replacement entry carries a fresh creation timestamp and the newly given name case. The media's home systems preserve BOTH on an in-place overwrite - a file overwritten here "gets younger" and may change its displayed case. Fix: when the swap replaces an existing entry, carry the old creation time into the new set (classic bytes 13-17; the exFAT CreateTimestamp with its UTC marker) and keep the old name when it matches case-insensitively.
+  - Result: both swap paths reuse the replaced entry's name when it matches case-insensitively and carry its creation stamp into the replacement (classic bytes 13..18; exFAT CreateTimestamp + 10ms increment + UTC marker, with the set checksum restamped over the final bytes) - the modify stamp stays fresh. Test `an_overwrite_preserves_the_creation_stamp_and_name_case` (both families: the original case lists, create = the first clock, write/modify = the second, the exFAT checksum covers the carried stamp).
+- Done when: a non-mirrored FAT32 volume with active copy 1 reads its chains from copy 1 and writes only copy 1 (test-pinned with divergent copies), an exFAT ActiveFat = 1 volume refuses to mount, the module doc states the checksum exclusion correctly and the dirty-flag trade-off is recorded or implemented, an overwrite preserves the creation stamp and the original name case (test-pinned on both families), and the suite stays green with a test per finding.
+  - Result: all hold - fat 65 host tests (2 new, 1 extended), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
+- Concept: the interop purpose of the crate (the flags other drivers act on, we must act on; what an overwrite preserves there, we preserve), M92-B1 (the lookup-side contract extended to the FAT-selection contract), the M86-M94 hostile-media rule (a stale FAT copy is one more untrusted input).
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace

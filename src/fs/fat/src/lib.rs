@@ -17,9 +17,11 @@
 //! frees the old chain last, so a failure part-way never costs the old file. The media
 //! is untrusted: every value off the boot sector and the chains is bounded before use,
 //! so a malformed volume is refused or errors cleanly instead of panicking or hanging.
-//! The exFAT boot region is never rewritten: its advisory PercentInUse stays as the
-//! formatter left it - keeping it current would cost a boot-sector write plus a
-//! boot-checksum restamp on every operation, for a value readers must treat as a hint.
+//! The exFAT boot region is never rewritten: PercentInUse stays as the formatter left
+//! it and the volume-dirty flags (exFAT VolumeFlags, the classic FAT[1] clean-shutdown
+//! bits) stay untouched - the exFAT boot checksum excludes VolumeFlags and
+//! PercentInUse, so maintaining them would cost only extra sector writes per
+//! operation; the write path stays minimal and readers treat both as advisory.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -130,6 +132,12 @@ struct Geometry {
 	// The FAT32 FSInfo sector (0 = none / not FAT32), so allocate and free can keep its
 	// free-cluster count in step for other systems.
 	fsinfo_sector: u32,
+	// Which FAT copy is current, and whether writes mirror into every copy. FAT32's
+	// ExtFlags can disable runtime mirroring, naming one active copy - the others are
+	// then stale by specification, so reads must use the active one and writes must
+	// leave the stale ones alone.
+	active_fat: u32,
+	mirror: bool,
 }
 
 // A mounted FAT volume: the device plus its geometry. Reads are on demand, so nothing is
@@ -487,7 +495,7 @@ impl<D: BlockDevice> FatFs<D> {
 			return Err(FsError::Invalid);
 		}
 		let bps = self.geo.bytes_per_sector;
-		let fat_base = self.geo.reserved_sectors;
+		let fat_base = self.geo.reserved_sectors + self.geo.active_fat * self.geo.fat_size;
 		let byte_off = match self.geo.kind {
 			Kind::Fat12 => cluster as u64 + (cluster as u64 / 2),
 			Kind::Fat16 => cluster as u64 * 2,
@@ -566,7 +574,10 @@ impl<D: BlockDevice> FatFs<D> {
 			Kind::Fat32 | Kind::ExFat => cluster as u64 * 4,
 		};
 		let sectors: u32 = if byte_off % bps as u64 == bps as u64 - 1 { 2 } else { 1 };
-		for fat in 0..self.geo.num_fats {
+		// with mirroring disabled only the active copy is current - the others are
+		// stale by specification and stay untouched.
+		let copies = if self.geo.mirror { 0..self.geo.num_fats } else { self.geo.active_fat..self.geo.active_fat + 1 };
+		for fat in copies {
 			let fat_base = self.geo.reserved_sectors + fat * self.geo.fat_size;
 			let sec = fat_base as u64 + byte_off / bps as u64;
 			let within = (byte_off % bps as u64) as usize;
@@ -592,7 +603,7 @@ impl<D: BlockDevice> FatFs<D> {
 
 	// Allocate `n` free clusters into an end-terminated chain, returning them in order.
 	// Zero clusters is an empty file. NoSpace if the table runs out of free entries. The
-	// scan runs over ONE in-memory image of the first FAT copy (a per-candidate device
+	// scan runs over ONE in-memory image of the ACTIVE FAT copy (a per-candidate device
 	// read made allocation O(volume) round-trips on slow media); a failure writing a
 	// link unwinds the slots already written, so nothing leaks.
 	fn alloc_chain(&mut self, n: usize) -> Result<Vec<u32>, FsError> {
@@ -600,7 +611,8 @@ impl<D: BlockDevice> FatFs<D> {
 			return Ok(Vec::new());
 		}
 		let mut fat = vec![0u8; (self.geo.fat_size as u64 * self.geo.bytes_per_sector as u64) as usize];
-		self.read_fs_sectors(self.geo.reserved_sectors as u64, self.geo.fat_size, &mut fat)?;
+		let fat_base = self.geo.reserved_sectors + self.geo.active_fat * self.geo.fat_size;
+		self.read_fs_sectors(fat_base as u64, self.geo.fat_size, &mut fat)?;
 		let mut chain: Vec<u32> = Vec::with_capacity(n);
 		let mut c = 2u32;
 		let max = self.max_cluster();
@@ -822,12 +834,12 @@ impl<D: BlockDevice> FatFs<D> {
 		let orig = bytes.clone();
 		match mark_unlinked(&mut bytes, name)? {
 			None => Ok(false),
-			Some(first) => {
+			Some(e) => {
 				self.write_dir_dirty(dir, &bytes, &orig)?;
 				// the unlink is durable once the directory write lands - the free is
 				// best-effort (a failing device costs lost clusters, never a false
 				// failure of a finished remove).
-				let _ = self.free_chain(first);
+				let _ = self.free_chain(e.first_cluster);
 				Ok(true)
 			}
 		}
@@ -836,14 +848,27 @@ impl<D: BlockDevice> FatFs<D> {
 	// Swap the directory entry for `name` in ONE read-modify-write: mark any old entry
 	// deleted in the in-memory copy (its slots become reusable), place the new entry set
 	// (a unique 8.3 short + long fragments when needed, growing a chained directory by
-	// whole clusters until the set fits), and write the directory back once. Returns the
-	// replaced entry's first cluster, which only then is safe to free.
+	// whole clusters until the set fits), and write the directory back once. An
+	// overwrite preserves what the media's home systems preserve: the replaced entry's
+	// original name case and its creation stamp. Returns the replaced entry's first
+	// cluster, which only then is safe to free.
 	fn swap_entry(&mut self, dir: &Dir, name: &[u8], first: u32, size: u32) -> Result<Option<u32>, FsError> {
 		let mut bytes = self.read_dir_bytes(dir)?;
 		let orig = bytes.clone();
 		scrub_after_terminator(&mut bytes);
 		let old = mark_unlinked(&mut bytes, name)?;
-		let entries = build_entries(name, &bytes, first, size, 0x20, self.dos_stamp())?;
+		let name: &[u8] = match &old {
+			Some(o) if eq_ignore_case(o.name.as_bytes(), name) => o.name.as_bytes(),
+			_ => name,
+		};
+		let mut entries = build_entries(name, &bytes, first, size, 0x20, self.dos_stamp())?;
+		if let Some(o) = &old {
+			// the creation stamp (tenths + time + date) carries over from the replaced
+			// entry - only the byte 0 of its records was marked, the fields are intact.
+			let last = entries.len() - 1;
+			let stamp: [u8; 5] = bytes[o.ent_off + 13..o.ent_off + 18].try_into().unwrap();
+			entries[last][13..18].copy_from_slice(&stamp);
+		}
 		let at = loop {
 			if let Some(p) = free_run(&bytes, entries.len()) {
 				break p;
@@ -859,7 +884,7 @@ impl<D: BlockDevice> FatFs<D> {
 			bytes[at + k * 32..at + k * 32 + 32].copy_from_slice(e);
 		}
 		self.write_dir_dirty(dir, &bytes, &orig)?;
-		Ok(old)
+		Ok(old.map(|o| o.first_cluster))
 	}
 
 	// Grow a chained directory by one zeroed cluster: allocate it, zero it on the device
@@ -946,14 +971,30 @@ impl<D: BlockDevice> FatFs<D> {
 
 	// Swap an exFAT entry set in ONE read-modify-write: mark any old set's in-use bits
 	// cleared (its slots become reusable), place the new set (growing a chained
-	// directory by whole clusters until the set fits), write the directory back once.
-	// Returns the replaced entry, whose clusters only then are safe to release.
+	// directory by whole clusters until the set fits), write the directory back once. An
+	// overwrite preserves the replaced set's original name case and creation stamp, as
+	// the media's home systems do. Returns the replaced entry, whose clusters only then
+	// are safe to release.
 	fn exfat_swap_entry(&mut self, dir: &Dir, name: &[u8], first: u32, size: u64) -> Result<Option<Raw>, FsError> {
 		let mut bytes = self.read_dir_bytes(dir)?;
 		let orig = bytes.clone();
 		scrub_after_terminator(&mut bytes);
 		let old = exfat_mark_unlinked(&mut bytes, name)?;
-		let set = build_exfat_set(name, first, size, self.exfat_stamp());
+		let name: &[u8] = match &old {
+			Some(o) if eq_ignore_case(o.name.as_bytes(), name) => o.name.as_bytes(),
+			_ => name,
+		};
+		let mut set = build_exfat_set(name, first, size, self.exfat_stamp());
+		if let Some(o) = &old {
+			// the creation stamp (timestamp + 10ms increment + UTC marker) carries over
+			// from the replaced set; the checksum is restamped over the final bytes.
+			let stamp: [u8; 4] = bytes[o.set_off + 8..o.set_off + 12].try_into().unwrap();
+			set[8..12].copy_from_slice(&stamp);
+			set[20] = bytes[o.set_off + 20];
+			set[22] = bytes[o.set_off + 22];
+			let sum = exfat_set_checksum(&set);
+			set[2..4].copy_from_slice(&sum.to_le_bytes());
+		}
 		let at = loop {
 			if let Some(p) = exfat_free_run(&bytes, set.len() / 32) {
 				break p;
@@ -1201,10 +1242,10 @@ impl Raw {
 }
 
 // Mark the classic entry named `name` deleted in a directory's in-memory bytes - the 8.3
-// record plus its long fragments - returning its first cluster, or None if absent. The
+// record plus its long fragments - returning the parsed entry, or None if absent. The
 // caller writes the bytes back and frees the chain once the write is safe; a directory
 // cannot be unlinked this way.
-fn mark_unlinked(bytes: &mut [u8], name: &[u8]) -> Result<Option<u32>, FsError> {
+fn mark_unlinked(bytes: &mut [u8], name: &[u8]) -> Result<Option<Raw>, FsError> {
 	let entries = parse_fat_dir(bytes)?;
 	let Some(e) = entries.into_iter().find(|e| e.matches(name)) else {
 		return Ok(None);
@@ -1215,7 +1256,7 @@ fn mark_unlinked(bytes: &mut [u8], name: &[u8]) -> Result<Option<u32>, FsError> 
 	for off in (e.set_off..=e.ent_off).step_by(32) {
 		bytes[off] = 0xE5;
 	}
-	Ok(Some(e.first_cluster))
+	Ok(Some(e))
 }
 
 // The exFAT counterpart: clear the in-use bit of every record in the named entry set,
@@ -1300,9 +1341,17 @@ impl Geometry {
 		if kind == Kind::Fat32 && (root_cluster < 2 || root_cluster as u64 > clusters as u64 + 1) {
 			return None;
 		}
+		// FAT32's ExtFlags: bit 7 disables runtime mirroring and bits 0-3 then name the
+		// only current FAT copy - the others are stale by specification, so reading copy
+		// 0 there would follow wrong chains and cross-link real data on allocation.
+		let ext_flags = if kind == Kind::Fat32 { u16::from_le_bytes([b[40], b[41]]) as u32 } else { 0 };
+		let (mirror, active_fat) = if ext_flags & 0x80 != 0 { (false, ext_flags & 0x0F) } else { (true, 0) };
+		if active_fat >= num_fats {
+			return None;
+		}
 		let fsinfo = if kind == Kind::Fat32 { u16::from_le_bytes([b[48], b[49]]) as u32 } else { 0 };
 		let fsinfo_sector = if fsinfo != 0 && fsinfo < reserved_sectors { fsinfo } else { 0 };
-		Some(Geometry { kind, bytes_per_sector, sectors_per_cluster, reserved_sectors, num_fats, fat_size, root_entries, root_cluster, first_data_sector, cluster_count: clusters, fsinfo_sector })
+		Some(Geometry { kind, bytes_per_sector, sectors_per_cluster, reserved_sectors, num_fats, fat_size, root_entries, root_cluster, first_data_sector, cluster_count: clusters, fsinfo_sector, active_fat, mirror })
 	}
 
 	// Parse an exFAT boot sector. exFAT keeps everything in the cluster heap, so the root
@@ -1335,7 +1384,12 @@ impl Geometry {
 		if fat_offset as u64 + num_fats as u64 * fat_size as u64 > cluster_heap_offset as u64 {
 			return None;
 		}
-		Some(Geometry { kind: Kind::ExFat, bytes_per_sector, sectors_per_cluster, reserved_sectors: fat_offset, num_fats: 1, fat_size, root_entries: 0, root_cluster, first_data_sector: cluster_heap_offset, cluster_count, fsinfo_sector: 0 })
+		// TexFAT's second-FAT selection (VolumeFlags bit 0 = the second FAT is active)
+		// is out of scope - refuse rather than read the wrong table.
+		if u16::from_le_bytes([b[106], b[107]]) & 0x01 != 0 {
+			return None;
+		}
+		Some(Geometry { kind: Kind::ExFat, bytes_per_sector, sectors_per_cluster, reserved_sectors: fat_offset, num_fats: 1, fat_size, root_entries: 0, root_cluster, first_data_sector: cluster_heap_offset, cluster_count, fsinfo_sector: 0, active_fat: 0, mirror: true })
 	}
 }
 
