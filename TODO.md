@@ -1931,6 +1931,22 @@ chain walks, and the out-of-pool read gate the sibling backends grew.
   - Result: all hold - liberfs 97 host tests (5 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: the fs-track rule-set (hostile-media bounds, FAT M90-B1 out-of-pool gate, M93-B1 probe), CoW commit-point semantics (the superblock write is the point of no return), M73-M85 (the hardening this pass re-verified).
 
+## M103 - LiberFS: second-pass findings (the raw-length gate gap)
+
+The second full source pass (2026-07-04, after M102 landed) went deep on the
+B+tree core, the allocator and the LZ4 codec - all clean - and found one real
+gap in M102's own out-of-pool gate plus two walk nits.
+
+- [x] (B1, medium) `check_extent` gates the stored span (`store_len`) but the raw read path serves logical offsets up to `length`: a forged raw extent (`clen` 0, `store_len` 1, `length` 1024) with its physical start near the pool's end passes the gate yet reads blocks past the pool - and a forged checksum block vouches for the foreign bytes, so they surface as file content. Gate the span by `length.max(store_len)`, closing the disclosure class M102-B4 aimed at.
+  - Result: a raw run gates `length.max(store_len)`; a compressed run keeps the `store_len` gate (its `length` is a logical span, not addresses). Test `a_forged_raw_length_does_not_read_past_the_pool` (every address field in pool, every CRC matching - only the length lies).
+- [x] (B2, low) The mark walks (`mark_inode_tree`, `mark_dir_tree`) push children before marking them - the marked test runs at pop. A hostile node fanning ~341 links at one unmarked block pushes ~341 duplicates, so the work list can transiently reach O(links x pool) at mount - gigabytes on a large hostile volume. Test-and-set at push, so a block enters the list once.
+  - Result: both walks mark at push (out-of-pool and marked links never enter the list), so the list holds each block at most once. Test `a_self_fanning_internal_node_cannot_stall_the_mark_walk` (a maximal fan of self-links walks once and the mount completes intact).
+- [x] (B3, cosmetic) `subtree_contains` propagates a damaged child's read error, so a directory holding one damaged entry cannot be renamed - stricter than the skip-the-bad-child listing contract. The strictness is the safe side (a move into an unverifiable subtree is refused, never allowed); record the decision at the walk.
+  - Result: recorded at the walk (an unverifiable child could be the very directory being moved into; fsck + remove unblock the rename).
+- Done when: a forged raw extent whose length outruns its stored span reads as damage instead of foreign bytes, a fanning hostile tree cannot balloon the mount's work list (the marked set bounds it, test-pinned on the duplicate-push count or equivalent), the strict-rename decision is recorded, and the suite stays green with a test per finding.
+  - Result: all hold - liberfs 99 host tests (2 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
+- Concept: M102-B4 (the gate this pass completes), the hostile-media rule (bound every on-medium value before use), the listing contract vs. the strict-verb trade-off.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a

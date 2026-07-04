@@ -2359,3 +2359,68 @@ fn a_rename_over_a_damaged_empty_directory_leaks_nothing() {
 	fs.write_file(b"tick.txt", b"1").unwrap();
 	assert!(!test_bit(&fs.free, dir_root), "the replaced directory's tree node is reclaimed, not leaked");
 }
+
+// M103: the second-pass findings.
+
+#[test]
+fn a_forged_raw_length_does_not_read_past_the_pool() {
+	// a 64-block pool on a 128-block device, like the M102 gate test - but this
+	// forgery keeps every ADDRESS FIELD inside the pool and lies with the LENGTH:
+	// a raw extent claiming 2 logical blocks over a 1-block stored span, its
+	// physical start at the pool's last block, walks its second read past the pool.
+	let mut fs = LiberFs::format(MemDevice::new(128), NBLOCKS).unwrap();
+	fs.write_file(b"f.bin", &noise(BLOCK_SIZE)).unwrap();
+	let mut dev = fs.into_device();
+
+	// the foreign bytes past the pool, and an in-pool checksum block vouching for
+	// both blocks of the claimed span - every CRC matches, only the gate can refuse.
+	let foreign = vec![0xA7u8; BLOCK_SIZE];
+	dev.blocks[64 * BLOCK_SIZE..65 * BLOCK_SIZE].copy_from_slice(&foreign);
+	let zeros = vec![0u8; BLOCK_SIZE];
+	let mut cbuf = vec![0u8; BLOCK_SIZE];
+	cbuf[0..4].copy_from_slice(&crc32c(&zeros).to_le_bytes());
+	cbuf[4..8].copy_from_slice(&crc32c(&foreign).to_le_bytes());
+	let cbuf_crc = crc32c(&cbuf);
+	dev.blocks[50 * BLOCK_SIZE..51 * BLOCK_SIZE].copy_from_slice(&cbuf);
+
+	forge_inode_slot(&mut dev, |slot| {
+		slot[INO_SIZE_OFF..INO_SIZE_OFF + 8].copy_from_slice(&(2 * BLOCK_SIZE as u64).to_le_bytes());
+		slot[INO_EXTENT_COUNT_OFF..INO_EXTENT_COUNT_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
+		let ext = Extent { logical: 0, physical: 63, length: 2, csum: 50, csum_crc: cbuf_crc, store_len: 1, clen: 0 };
+		ext.write(&mut slot[EXTENT_OFF..EXTENT_OFF + EXTENT_SIZE]);
+	});
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(b"f.bin"), Err(FsError::Corrupt), "a length past the stored span is damage, not another partition's data");
+}
+
+#[test]
+fn a_self_fanning_internal_node_cannot_stall_the_mark_walk() {
+	// a hostile directory tree: one internal node whose maximal fan of child links
+	// all point back at the node itself. The mark walks read it raw (no CRC), so the
+	// shape reaches them; marking at push queues the block once - the walk visits it,
+	// requeues nothing, and the mount completes with the rest of the volume intact.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.mkdir(b"d").unwrap();
+	fs.write_file(b"keep.txt", b"payload").unwrap();
+	let mut dev = fs.into_device();
+
+	let node = 40u64;
+	let start = node as usize * BLOCK_SIZE;
+	{
+		let block = &mut dev.blocks[start..start + BLOCK_SIZE];
+		block[0] = NODE_INTERNAL;
+		block[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+		for i in 0..INTERNAL_MAX {
+			let off = INTERNAL_CHILD_BASE + i * CHILD_SIZE;
+			block[off..off + 8].copy_from_slice(&node.to_le_bytes());
+		}
+	}
+	// point the directory's tree root at the fanning node (raw walks follow it; the
+	// checksummed live paths refuse it as the damage it is).
+	forge_inode_slot(&mut dev, |slot| {
+		slot[INO_MAP_OFF..INO_MAP_OFF + 8].copy_from_slice(&node.to_le_bytes());
+	});
+	let mut fs = LiberFs::mount(dev).expect("the mark walk must terminate");
+	assert_eq!(fs.read_file(b"keep.txt").unwrap(), b"payload");
+	assert!(test_bit(&fs.free, node), "the walked node is reserved like any referenced block");
+}

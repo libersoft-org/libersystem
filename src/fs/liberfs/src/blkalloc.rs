@@ -369,9 +369,14 @@ impl<D: BlockDevice> LiberFs<D> {
 	// through them: past the pool's end lies another partition's data on a shared
 	// device, and a checksum proves integrity, not sanity - a forged record with a
 	// matching CRC must not surface foreign bytes as file contents. Out of pool is
-	// the damage it is: Corrupt.
+	// the damage it is: Corrupt. A raw run's gated span covers `length` as well as
+	// `store_len` - the raw read path serves logical offsets up to `length`, so a
+	// forged raw extent whose `length` outruns its stored span must not slip a
+	// physical address past the pool through the gap. A compressed run reads only
+	// its `store_len` stored blocks (its `length` is a logical span, not addresses).
 	pub(crate) fn check_extent(&self, ext: &Extent) -> Result<(), FsError> {
-		if ext.csum >= self.num_blocks || ext.stored(ext.store_len.saturating_sub(1) as u64) >= self.num_blocks {
+		let span = if ext.clen == 0 { ext.length.max(ext.store_len) } else { ext.store_len };
+		if ext.csum >= self.num_blocks || ext.stored(span.saturating_sub(1) as u64) >= self.num_blocks {
 			return Err(FsError::Corrupt);
 		}
 		Ok(())
@@ -751,11 +756,7 @@ pub(crate) fn clear_bit(bitmap: &mut [u8], b: u64) {
 
 pub(crate) fn test_bit(bitmap: &[u8], b: u64) -> bool {
 	let i = (b / 8) as usize;
-	if i < bitmap.len() {
-		bitmap[i] & (1 << (b % 8)) != 0
-	} else {
-		true
-	}
+	if i < bitmap.len() { bitmap[i] & (1 << (b % 8)) != 0 } else { true }
 }
 
 // Index of the extent covering logical block `lb`, or None if it falls in a hole. The
@@ -766,11 +767,7 @@ pub(crate) fn find_extent(extents: &[Extent], lb: u64) -> Option<usize> {
 	if pos == 0 {
 		return None;
 	}
-	if extents[pos - 1].covers(lb) {
-		Some(pos - 1)
-	} else {
-		None
-	}
+	if extents[pos - 1].covers(lb) { Some(pos - 1) } else { None }
 }
 
 // Hash the 4-byte prefix at `w` into an LZ_HASH_BITS-wide match-finder bucket.

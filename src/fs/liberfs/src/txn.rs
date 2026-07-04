@@ -238,19 +238,19 @@ impl<D: BlockDevice> LiberFs<D> {
 	// never grows the call stack.
 	pub(crate) fn mark_inode_tree(&mut self, root: u64, map: &mut [u8]) -> Result<(), FsError> {
 		let mut nodes: Vec<u64> = Vec::new();
-		if root != 0 {
+		// a pointer outside the pool is a corrupt link (skipped, not followed into
+		// whatever lies past the volume); an already-marked node is either a corrupt
+		// cycle (which must not hang the walk) or a subtree shared with an earlier
+		// root walked into the same map - marked means walked (or queued), so skip
+		// both. Marking happens at PUSH, so a hostile node fanning hundreds of links
+		// at one block queues it once, not once per link - the work list stays
+		// bounded by the pool.
+		if root != 0 && root < self.num_blocks && !test_bit(map, root) {
+			set_bit(map, root);
 			nodes.push(root);
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		while let Some(ptr) = nodes.pop() {
-			// a pointer outside the pool is a corrupt link (skipped, not followed into
-			// whatever lies past the volume); an already-marked node is either a corrupt
-			// cycle (which must not hang the walk) or a subtree shared with an earlier
-			// root walked into the same map - marked means walked, so skip both.
-			if ptr >= self.num_blocks || test_bit(map, ptr) {
-				continue;
-			}
-			set_bit(map, ptr);
 			if !self.dev.read_block(ptr, &mut buf) {
 				self.walk_damage = true;
 				continue;
@@ -274,7 +274,11 @@ impl<D: BlockDevice> LiberFs<D> {
 				}
 			} else {
 				for i in 0..=internal_count(&buf) {
-					nodes.push(child_ptr(&buf, i));
+					let child = child_ptr(&buf, i);
+					if child < self.num_blocks && !test_bit(map, child) {
+						set_bit(map, child);
+						nodes.push(child);
+					}
 				}
 			}
 		}
@@ -286,23 +290,25 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Iterative and damage-tolerant like `mark_inode_tree`.
 	pub(crate) fn mark_dir_tree(&mut self, root: u64, map: &mut [u8]) -> Result<(), FsError> {
 		let mut nodes: Vec<u64> = Vec::new();
-		if root != 0 {
+		// same guards as `mark_inode_tree`: skip out-of-pool links and marked blocks,
+		// marking at push so the work list stays bounded by the pool.
+		if root != 0 && root < self.num_blocks && !test_bit(map, root) {
+			set_bit(map, root);
 			nodes.push(root);
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		while let Some(ptr) = nodes.pop() {
-			// same guards as `mark_inode_tree`: skip out-of-pool links and marked nodes.
-			if ptr >= self.num_blocks || test_bit(map, ptr) {
-				continue;
-			}
-			set_bit(map, ptr);
 			if !self.dev.read_block(ptr, &mut buf) {
 				self.walk_damage = true;
 				continue;
 			}
 			if node_type(&buf) == NODE_INTERNAL {
 				for i in 0..=internal_count(&buf) {
-					nodes.push(child_ptr(&buf, i));
+					let child = child_ptr(&buf, i);
+					if child < self.num_blocks && !test_bit(map, child) {
+						set_bit(map, child);
+						nodes.push(child);
+					}
 				}
 			}
 		}

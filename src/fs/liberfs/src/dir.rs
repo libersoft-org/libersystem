@@ -312,7 +312,12 @@ impl<D: BlockDevice> LiberFs<D> {
 	// directory itself or any descendant)? Used to reject moving a directory into
 	// itself. Iterative (a work list of directories), so nesting depth never grows the
 	// call stack; a visited set makes a hostile namespace (a cycle, or many names
-	// aliasing one subtree) terminate instead of looping or blowing up.
+	// aliasing one subtree) terminate instead of looping or blowing up. A child whose
+	// inode cannot be read propagates its error - stricter than the skip-the-bad-child
+	// listing contract, by DECISION: this walk guards rename against creating a
+	// namespace cycle, and an unverifiable child could be the very directory being
+	// moved into - refusing the move is the safe side, and the operator's repair verbs
+	// (fsck names the damage, remove clears it) unblock the rename.
 	pub(crate) fn subtree_contains(&mut self, root_dir: u32, target: u32) -> Result<bool, FsError> {
 		let mut dirs: Vec<u32> = vec![root_dir];
 		let mut seen: BTreeSet<u32> = BTreeSet::new();
