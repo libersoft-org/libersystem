@@ -51,14 +51,21 @@ const DHCP_DISCOVER: u8 = 1;
 pub const DHCP_OFFER: u8 = 2;
 const DHCP_REQUEST: u8 = 3;
 pub const DHCP_ACK: u8 = 5;
+pub const DHCP_NAK: u8 = 6;
 const DHCP_OPT_MASK: u8 = 1;
 const DHCP_OPT_ROUTER: u8 = 3;
 const DHCP_OPT_DNS: u8 = 6;
 const DHCP_OPT_REQUESTED_IP: u8 = 50;
+const DHCP_OPT_LEASE_TIME: u8 = 51;
 const DHCP_OPT_MSG_TYPE: u8 = 53;
 const DHCP_OPT_SERVER_ID: u8 = 54;
 const DHCP_OPT_PARAM_LIST: u8 = 55;
+const DHCP_OPT_T1: u8 = 58;
+const DHCP_OPT_T2: u8 = 59;
 const DHCP_OPT_END: u8 = 255;
+
+// A lease-time value of all ones means the lease never expires (no renewal clock).
+const DHCP_LEASE_INFINITE: u32 = 0xffff_ffff;
 
 // The limited-broadcast IPv4 address (255.255.255.255): the DHCP server addresses
 // its OFFER/ACK here when it broadcasts the reply (we have no address yet).
@@ -178,7 +185,11 @@ fn udp_checksum(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
 		sum = (sum & 0xffff) + (sum >> 16);
 	}
 	let c: u16 = !(sum as u16);
-	if c == 0 { 0xffff } else { c }
+	if c == 0 {
+		0xffff
+	} else {
+		c
+	}
 }
 
 // The TCP checksum over the IPv4 pseudo-header (src, dst, proto, length) plus the
@@ -214,7 +225,9 @@ struct Neigh {
 const NEIGH_MAX: usize = 1024;
 
 // The address configuration learned from a DHCP OFFER/ACK: the offered address plus
-// the mask / gateway / DNS / server-id carried in the reply options.
+// the mask / gateway / DNS / server-id carried in the reply options, and the lease
+// clock (the lease duration with its T1 renewal / T2 rebinding thresholds, seconds;
+// 0 = the server sent none).
 #[derive(Clone, Copy)]
 struct DhcpLease {
 	yiaddr: Ipv4Addr,
@@ -222,11 +235,14 @@ struct DhcpLease {
 	gateway: Ipv4Addr,
 	dns: Ipv4Addr,
 	server: Ipv4Addr,
+	lease_secs: u32,
+	t1_secs: u32,
+	t2_secs: u32,
 }
 
 impl DhcpLease {
 	const fn empty() -> DhcpLease {
-		DhcpLease { yiaddr: Ipv4Addr([0; 4]), mask: Ipv4Addr([0; 4]), gateway: Ipv4Addr([0; 4]), dns: Ipv4Addr([0; 4]), server: Ipv4Addr([0; 4]) }
+		DhcpLease { yiaddr: Ipv4Addr([0; 4]), mask: Ipv4Addr([0; 4]), gateway: Ipv4Addr([0; 4]), dns: Ipv4Addr([0; 4]), server: Ipv4Addr([0; 4]), lease_secs: 0, t1_secs: 0, t2_secs: 0 }
 	}
 }
 
@@ -376,7 +392,11 @@ impl Stack {
 	// (on-link, reached by direct ARP), otherwise the gateway (off-link, routed). The
 	// L3 destination of the packet is still `dst`; only the L2 MAC we resolve changes.
 	pub fn next_hop(&self, dst: Ipv4Addr) -> Ipv4Addr {
-		if self.on_link(dst) { dst } else { self.gateway }
+		if self.on_link(dst) {
+			dst
+		} else {
+			self.gateway
+		}
 	}
 
 	// Whether `dst` is on our local subnet (its network part matches ours under the
@@ -1062,7 +1082,7 @@ impl Stack {
 			*b = 0;
 		}
 		out[ntp_off] = 0x23; // LI 0, VN 4, Mode 3 (client)
-		// UDP header.
+					   // UDP header.
 		let udp_off: usize = ETH_HDR + IPV4_HDR;
 		put16(out, udp_off, src_port);
 		put16(out, udp_off + 2, NTP_PORT);
@@ -1095,20 +1115,31 @@ impl Stack {
 	// Build a DHCP DISCOVER (broadcast, no address yet) into `out`, returning its
 	// length.
 	pub fn build_dhcp_discover(&self, out: &mut [u8]) -> usize {
-		self.build_dhcp(DHCP_DISCOVER, out)
+		self.build_dhcp(DHCP_DISCOVER, false, None, out)
 	}
 
 	// Build a DHCP REQUEST for the offered address into `out` (it carries the offered
 	// address and the server id from the last parsed OFFER), returning its length.
 	pub fn build_dhcp_request(&self, out: &mut [u8]) -> usize {
-		self.build_dhcp(DHCP_REQUEST, out)
+		self.build_dhcp(DHCP_REQUEST, false, None, out)
 	}
 
-	// Build a DHCP client message of `msg_type` into `out` (a broadcast Ethernet +
-	// IPv4 0.0.0.0 -> 255.255.255.255 + UDP 68 -> 67 + BOOTP request + options),
-	// returning its length (0 if it does not fit). A REQUEST additionally carries the
-	// requested-address and server-id options from the last OFFER.
-	fn build_dhcp(&self, msg_type: u8, out: &mut [u8]) -> usize {
+	// Build the lease-extension REQUEST into `out`, returning its length: ciaddr
+	// carries our bound address and the requested-address / server-id options are
+	// omitted (the RFC 2131 RENEWING / REBINDING form). With `unicast` (the server's
+	// resolved MAC) it goes straight to the server - the T1 renewal; without, it
+	// broadcasts - the T2 rebinding, any server may extend the lease.
+	pub fn build_dhcp_renew(&self, unicast: Option<MacAddr>, out: &mut [u8]) -> usize {
+		self.build_dhcp(DHCP_REQUEST, true, unicast, out)
+	}
+
+	// Build a DHCP client message of `msg_type` into `out`, returning its length (0
+	// if it does not fit). The initial exchange (DISCOVER, the selecting REQUEST)
+	// broadcasts from 0.0.0.0 with the broadcast-reply flag, and the REQUEST carries
+	// the requested-address and server-id options from the last OFFER. The `renew`
+	// form instead fills ciaddr with the bound address and sends from it - unicast
+	// to the server when its MAC is known, else broadcast.
+	fn build_dhcp(&self, msg_type: u8, renew: bool, unicast: Option<MacAddr>, out: &mut [u8]) -> usize {
 		let boot_off: usize = ETH_HDR + IPV4_HDR + UDP_HDR;
 		if boot_off + BOOTP_HDR + 32 > out.len() {
 			return 0;
@@ -1121,7 +1152,13 @@ impl Stack {
 		out[boot_off + 1] = 1; // htype: Ethernet
 		out[boot_off + 2] = 6; // hlen
 		put32(out, boot_off + 4, 0x3903_f326); // xid (fixed; SLIRP is the only DHCP source)
-		put16(out, boot_off + 10, 0x8000); // flags: ask the server to broadcast its reply
+		if renew {
+			// ciaddr: the address whose lease this REQUEST extends (we can receive
+			// unicast on it, so the broadcast-reply flag stays clear).
+			out[boot_off + 12..boot_off + 16].copy_from_slice(&self.ip.0);
+		} else {
+			put16(out, boot_off + 10, 0x8000); // flags: ask the server to broadcast its reply
+		}
 		out[boot_off + 28..boot_off + 34].copy_from_slice(&self.mac.0); // chaddr
 		// DHCP magic cookie + options.
 		let mut p: usize = boot_off + BOOTP_HDR;
@@ -1131,7 +1168,7 @@ impl Stack {
 		out[p + 1] = 1;
 		out[p + 2] = msg_type;
 		p += 3;
-		if msg_type == DHCP_REQUEST {
+		if msg_type == DHCP_REQUEST && !renew {
 			out[p] = DHCP_OPT_REQUESTED_IP;
 			out[p + 1] = 4;
 			out[p + 2..p + 6].copy_from_slice(&self.dhcp.yiaddr.0);
@@ -1150,9 +1187,10 @@ impl Stack {
 		out[p] = DHCP_OPT_END;
 		p += 1;
 		let dhcp_len: usize = p - boot_off;
-		// UDP header: 0.0.0.0:68 -> 255.255.255.255:67.
-		let src: Ipv4Addr = Ipv4Addr([0; 4]);
-		let dst: Ipv4Addr = Ipv4Addr([255; 4]);
+		// UDP header: 0.0.0.0:68 -> 255.255.255.255:67 for the initial exchange, our
+		// bound address to the server (or broadcast when rebinding) for a renewal.
+		let src: Ipv4Addr = if renew { self.ip } else { Ipv4Addr([0; 4]) };
+		let dst: Ipv4Addr = if renew && unicast.is_some() { self.dhcp.server } else { Ipv4Addr([255; 4]) };
 		let udp_off: usize = ETH_HDR + IPV4_HDR;
 		put16(out, udp_off, DHCP_CLIENT_PORT);
 		put16(out, udp_off + 2, DHCP_SERVER_PORT);
@@ -1175,8 +1213,9 @@ impl Stack {
 		ip[16..20].copy_from_slice(&dst.0);
 		let csum: u16 = checksum(&ip[..IPV4_HDR]);
 		put16(ip, 10, csum);
-		// Ethernet header (broadcast).
-		out[0..6].copy_from_slice(&MacAddr::BROADCAST.0);
+		// Ethernet header: broadcast, or straight to the server for a unicast renewal.
+		let dst_mac: MacAddr = unicast.unwrap_or(MacAddr::BROADCAST);
+		out[0..6].copy_from_slice(&dst_mac.0);
 		out[6..12].copy_from_slice(&self.mac.0);
 		put16(out, 12, ETHERTYPE_IPV4);
 		ETH_HDR + total
@@ -1217,6 +1256,9 @@ impl Stack {
 				DHCP_OPT_ROUTER if len >= 4 => lease.gateway = Ipv4Addr([val[0], val[1], val[2], val[3]]),
 				DHCP_OPT_DNS if len >= 4 => lease.dns = Ipv4Addr([val[0], val[1], val[2], val[3]]),
 				DHCP_OPT_SERVER_ID if len >= 4 => lease.server = Ipv4Addr([val[0], val[1], val[2], val[3]]),
+				DHCP_OPT_LEASE_TIME if len >= 4 => lease.lease_secs = be32(val, 0),
+				DHCP_OPT_T1 if len >= 4 => lease.t1_secs = be32(val, 0),
+				DHCP_OPT_T2 if len >= 4 => lease.t2_secs = be32(val, 0),
 				_ => {}
 			}
 			p += 2 + len;
@@ -1241,6 +1283,26 @@ impl Stack {
 		if self.dhcp.dns.0 != [0; 4] {
 			self.dns = self.dhcp.dns;
 		}
+	}
+
+	// The lease clock in seconds - (T1 renewal, T2 rebinding, expiry) - with the
+	// RFC 2132 defaults applied where the server sent no thresholds (T1 = half the
+	// lease, T2 = seven eighths). None when the lease carries no duration or never
+	// expires - nothing to renew.
+	pub fn dhcp_times(&self) -> Option<(u32, u32, u32)> {
+		let lease: u32 = self.dhcp.lease_secs;
+		if lease == 0 || lease == DHCP_LEASE_INFINITE || self.dhcp.yiaddr.0 == [0; 4] {
+			return None;
+		}
+		let t1: u32 = if self.dhcp.t1_secs != 0 { self.dhcp.t1_secs } else { lease / 2 };
+		let t2: u32 = if self.dhcp.t2_secs != 0 { self.dhcp.t2_secs } else { (lease as u64 * 7 / 8) as u32 };
+		Some((t1.min(lease), t2.min(lease), lease))
+	}
+
+	// The DHCP server the held lease came from (the renewal REQUEST's unicast
+	// destination), 0.0.0.0 when no lease is held.
+	pub fn dhcp_server(&self) -> Ipv4Addr {
+		self.dhcp.server
 	}
 }
 

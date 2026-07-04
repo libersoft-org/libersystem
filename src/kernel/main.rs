@@ -2622,6 +2622,172 @@ fn input_service_streams_pointer_events() {
 
 #[cfg(test)]
 #[test_case]
+fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	// Drive the real userspace NetworkService end to end as its DHCP server AND its
+	// frame-mover driver: spawn it with FRAMES + SERVE channels, lead with its MAC,
+	// answer the DISCOVER -> REQUEST handshake with a lease whose clock is short
+	// (T1 = 1 s, T2 = 2 s, lease 3 s), answer the gratuitous ARP so the service
+	// learns the server's MAC, and then let the scheduler tick: at T1 the service
+	// must send the lease-extension REQUEST on its own - the RFC 2131 RENEWING form
+	// (ciaddr filled, unicast to the server, no server-id option) - and an ACK must
+	// restart its clock, proven by the NEXT renewal arriving a full T1 later rather
+	// than at the unanswered-retransmit pace.
+	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = program_elf(&package, volume, b"network_service").expect("network_service in the package or volume");
+	let our_mac: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+	let srv_mac: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+	let leased: [u8; 4] = [10, 0, 2, 99];
+	let server: [u8; 4] = [10, 0, 2, 2];
+
+	// Build a DHCP server reply frame (Ethernet + IPv4 + UDP 67 -> 68 + BOOTP reply
+	// with the lease-clock options; the stack verifies no checksums).
+	let reply = |msg_type: u8, dst_ip: [u8; 4], dst_mac: [u8; 6]| -> Message {
+		let mut bootp = alloc::vec![0u8; 236];
+		bootp[0] = 2; // BOOTREPLY
+		bootp[16..20].copy_from_slice(&leased); // yiaddr
+		bootp.extend_from_slice(&0x6382_5363u32.to_be_bytes());
+		bootp.extend_from_slice(&[53, 1, msg_type]);
+		bootp.extend_from_slice(&[54, 4, server[0], server[1], server[2], server[3]]);
+		bootp.extend_from_slice(&[1, 4, 255, 255, 255, 0]);
+		bootp.extend_from_slice(&[3, 4, server[0], server[1], server[2], server[3]]);
+		bootp.extend_from_slice(&[6, 4, 10, 0, 2, 3]);
+		bootp.extend_from_slice(&[51, 4, 0, 0, 0, 3]); // lease 3 s
+		bootp.extend_from_slice(&[58, 4, 0, 0, 0, 1]); // T1 1 s
+		bootp.extend_from_slice(&[59, 4, 0, 0, 0, 2]); // T2 2 s
+		bootp.push(255);
+		let mut f = alloc::vec::Vec::new();
+		f.extend_from_slice(&dst_mac);
+		f.extend_from_slice(&srv_mac);
+		f.extend_from_slice(&0x0800u16.to_be_bytes());
+		let total: u16 = (20 + 8 + bootp.len()) as u16;
+		let mut ip = [0u8; 20];
+		ip[0] = 0x45;
+		ip[2..4].copy_from_slice(&total.to_be_bytes());
+		ip[8] = 64;
+		ip[9] = 17; // UDP
+		ip[12..16].copy_from_slice(&server);
+		ip[16..20].copy_from_slice(&dst_ip);
+		f.extend_from_slice(&ip);
+		f.extend_from_slice(&67u16.to_be_bytes());
+		f.extend_from_slice(&68u16.to_be_bytes());
+		f.extend_from_slice(&((8 + bootp.len()) as u16).to_be_bytes());
+		f.extend_from_slice(&[0, 0]); // checksum: unverified
+		f.extend_from_slice(&bootp);
+		Message::new(f, alloc::vec::Vec::new(), 0)
+	};
+	// Decode a frame from the service: a DHCP client message's (type, ciaddr,
+	// unicast Ethernet destination, server-id option present), or None.
+	let decode = |f: &[u8]| -> Option<(u8, [u8; 4], bool, bool)> {
+		if f.len() < 14 + 20 + 8 + 240 || f[12..14] != [0x08, 0x00] || f[14 + 9] != 17 {
+			return None;
+		}
+		if f[14 + 20..14 + 22] != [0, 68] || f[14 + 22..14 + 24] != [0, 67] {
+			return None;
+		}
+		let bootp = &f[14 + 20 + 8..];
+		let ciaddr: [u8; 4] = [bootp[12], bootp[13], bootp[14], bootp[15]];
+		let mut msg_type: u8 = 0;
+		let mut server_id: bool = false;
+		let mut p: usize = 240;
+		while p + 2 <= bootp.len() && bootp[p] != 255 {
+			match bootp[p] {
+				0 => p += 1,
+				53 => {
+					msg_type = bootp[p + 2];
+					p += 2 + bootp[p + 1] as usize;
+				}
+				54 => {
+					server_id = true;
+					p += 2 + bootp[p + 1] as usize;
+				}
+				_ => p += 2 + bootp[p + 1] as usize,
+			}
+		}
+		Some((msg_type, ciaddr, f[0..6] == srv_mac, server_id))
+	};
+
+	let (boot_kernel, boot_user) = Channel::create();
+	let (frames_kernel, frames_user) = Channel::create();
+	let (_serve_kernel, serve_user) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn NetworkService");
+	send_cap(&boot_kernel, b"FRAMES", frames_user, Rights::ALL).expect("frames bootstrap");
+	send_cap(&boot_kernel, b"SERVE", serve_user, Rights::ALL).expect("serve bootstrap");
+	// Pre-queue the whole bind conversation (the kernel test thread cannot answer
+	// mid-wait): the MAC lead-in, the OFFER and the clock-carrying ACK the handshake
+	// will consume in order, and the ARP reply that teaches the service the server's
+	// MAC (its own gratuitous ARP pumps it in), so the T1 renewal can go unicast.
+	let mut mac_msg = alloc::vec::Vec::new();
+	mac_msg.extend_from_slice(b"MAC");
+	mac_msg.extend_from_slice(&our_mac);
+	frames_kernel.send(Message::new(mac_msg, alloc::vec::Vec::new(), 0)).expect("MAC handoff");
+	frames_kernel.send(reply(2, [255; 4], [0xff; 6])).expect("the OFFER should queue");
+	frames_kernel.send(reply(5, [255; 4], [0xff; 6])).expect("the ACK should queue");
+	let mut arp_reply = alloc::vec::Vec::new();
+	arp_reply.extend_from_slice(&our_mac);
+	arp_reply.extend_from_slice(&srv_mac);
+	arp_reply.extend_from_slice(&[0x08, 0x06]);
+	arp_reply.extend_from_slice(&[0, 1, 0x08, 0, 6, 4, 0, 2]);
+	arp_reply.extend_from_slice(&srv_mac);
+	arp_reply.extend_from_slice(&server);
+	arp_reply.extend_from_slice(&our_mac);
+	arp_reply.extend_from_slice(&leased);
+	frames_kernel.send(Message::new(arp_reply, alloc::vec::Vec::new(), 0)).expect("the ARP reply should queue");
+	sched::run_until_idle();
+
+	// The service binds and reports in; its side of the conversation arrives in
+	// order: the DISCOVER, the selecting REQUEST (ciaddr empty, server-id present),
+	// and the gratuitous ARP announcement.
+	let online = boot_kernel.recv().expect("NetworkService online report");
+	assert_eq!(&online.bytes[..], b"NetworkService: online", "the service binds and reports in");
+	let discover = frames_kernel.recv().expect("the DISCOVER should broadcast");
+	assert_eq!(decode(&discover.bytes).map(|(t, _, _, _)| t), Some(1), "the first frame is the DISCOVER");
+	let request = frames_kernel.recv().expect("the REQUEST should follow the OFFER");
+	let (rtype, rciaddr, _, rsid) = decode(&request.bytes).expect("the second frame decodes");
+	assert!(rtype == 3 && rciaddr == [0; 4] && rsid, "the selecting REQUEST names the server, ciaddr empty");
+	let arp = frames_kernel.recv().expect("the gratuitous ARP should send");
+	assert_eq!(&arp.bytes[12..14], &[0x08, 0x06], "the announcement is an ARP request");
+
+	// Let the clock tick to T1: the service must wake itself (the lease deadline is
+	// a periodic housekeeping wake) and send the RENEWING-form REQUEST.
+	let mut renewal: Option<Message> = None;
+	let give_up = arch::apic::ticks() + 500;
+	while renewal.is_none() && arch::apic::ticks() < give_up {
+		sched::run_until_idle();
+		arch::idle_halt();
+		renewal = frames_kernel.recv().ok();
+	}
+	let renewal = renewal.expect("the T1 renewal REQUEST should arrive unprompted");
+	let (t, ciaddr, unicast, sid) = decode(&renewal.bytes).expect("the renewal decodes");
+	assert_eq!(t, 3, "the renewal is a REQUEST");
+	assert_eq!(ciaddr, leased, "the renewal carries the bound address in ciaddr");
+	assert!(unicast, "the renewal goes unicast to the server it learned by ARP");
+	assert!(!sid, "the RENEWING form omits the server-id option");
+
+	// ACK the renewal (unicast to the bound address) and prove the clock RESTARTED:
+	// the next renewal must arrive a full T1 (~100 ticks) later - an unanswered
+	// REQUEST would have retransmitted at half the time to T2 (~50 ticks) instead.
+	let acked_at = arch::apic::ticks();
+	frames_kernel.send(reply(5, leased, our_mac)).expect("the renewal ACK should send");
+	let mut second: Option<Message> = None;
+	let give_up = acked_at + 500;
+	while second.is_none() && arch::apic::ticks() < give_up {
+		sched::run_until_idle();
+		arch::idle_halt();
+		second = frames_kernel.recv().ok();
+	}
+	let second = second.expect("the next T1 renewal should arrive");
+	let (t2, ciaddr2, _, _) = decode(&second.bytes).expect("the second renewal decodes");
+	assert!(t2 == 3 && ciaddr2 == leased, "the clock re-arms another renewal");
+	assert!(arch::apic::ticks() - acked_at >= 75, "the renewal came at the restarted T1, not the retransmit pace");
+}
+
+#[cfg(test)]
+#[test_case]
 fn process_service_starts_a_program() {
 	use object::channel::Message;
 

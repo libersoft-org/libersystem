@@ -1,6 +1,6 @@
 # Bugs / changes
 
-- Create some debug tools that makes debugging easier?
+- Create some debug tools that makes debugging easier? As some debug tests took ridiculously long time
 - How does the format of our binary files look like? describe it somewhere
 - Every command (even simple ones as ls or lsvol) has the delay at the beginning for no reason ... something that linux shows instantly - find out why and fix.
 - Test if ls* commands have --json

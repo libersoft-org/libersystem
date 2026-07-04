@@ -23,9 +23,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use rt::*;
 
-use crate::net::{DHCP_ACK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, SockEntry, SockEntryState, Stack};
+use crate::net::{Event, Ipv4Addr, MacAddr, SockEntry, SockEntryState, Stack, DHCP_ACK, DHCP_NAK, DHCP_OFFER};
 use proto::codec::Buffer;
-use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest, listener, network, socket};
+use proto::system::{listener, network, socket, Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -47,6 +47,14 @@ const NTP_TIMEOUT_TICKS: u64 = 300;
 // How long DHCP waits for each of the OFFER and the ACK before falling back to the
 // static configuration (100 Hz ticks).
 const DHCP_TIMEOUT_TICKS: u64 = 200;
+// The scheduler tick rate the lease clock converts the DHCP seconds with.
+const TICKS_PER_SEC: u64 = 100;
+// How often an unanswered lease-extension REQUEST (or a failed re-acquisition
+// after expiry) is retried, at most - the clamp on the halved-remaining-time pace.
+const DHCP_RETRY_MAX_TICKS: u64 = 60 * TICKS_PER_SEC;
+// The floor on the retry pace (RFC 2131 names one minute; a short test lease
+// still retries within it, so the floor is what keeps retries bounded, not dead).
+const DHCP_RETRY_MIN_TICKS: u64 = TICKS_PER_SEC / 2;
 // TCP: total time to establish, the SYN/segment retransmit interval, and how long to
 // read a response (100 Hz ticks).
 const TCP_SYN_TIMEOUT_TICKS: u64 = 300;
@@ -95,11 +103,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 3. learn our address / mask / gateway / DNS from DHCP, falling back to the
 		//    static config above if no server answers. The frame buffers are scoped so
 		//    they are freed before serve allocates its own (the 16 kB user stack).
+		let mut lease: LeaseClock = LeaseClock::none();
 		{
 			let mut drx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
 			let mut dtx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
 			if do_dhcp(frames, &mut stack, &mut drx, &mut dtx) {
 				print(b"network: configured via DHCP\n");
+				lease = LeaseClock::bound(&stack);
 			} else {
 				print(b"network: DHCP unanswered, using static config\n");
 			}
@@ -107,7 +117,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 4. report in, then serve the network and the client at once (serve announces
 		//    us on the link with a gratuitous ARP first).
 		send_blocking(bootstrap, b"NetworkService: online", 0);
-		serve(frames, client, &mut stack);
+		serve(frames, client, &mut stack, lease);
 	}
 }
 
@@ -123,7 +133,10 @@ unsafe fn send_frame(frames: u64, frame: &[u8]) {
 
 // Receive one frame from the driver, run it through the stack, send any reply frame
 // back to the driver, and return the stack event it produced (an echo / DNS reply
-// an in-flight `ping` / `nslookup` is waiting for, or `None`).
+// an in-flight `ping` / `nslookup` is waiting for, or `None`). The frame channel
+// closing means the driver is gone - there is no network left to serve, and a wait
+// on the closed channel would be forever-ready, so the service exits instead of
+// spinning on it.
 unsafe fn pump(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Event {
 	unsafe {
 		match recv_blocking(frames, rx) {
@@ -132,7 +145,7 @@ unsafe fn pump(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> 
 				send_frame(frames, &tx[..outcome.reply_len]);
 				outcome.event
 			}
-			Received::Closed => Event::None,
+			Received::Closed => exit(),
 		}
 	}
 }
@@ -156,8 +169,10 @@ fn place_client(clients: &mut Vec<u64>, chan: u64) {
 // connection `network.connect` opened. `network.open` mints a fresh client channel
 // (one per spawned net tool) added to the client set; a client channel closing
 // drops it from the set, the socket channel closing tears the connection down. The
-// gratuitous ARP that announces us on the link goes out first.
-unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
+// gratuitous ARP that announces us on the link goes out first. While a DHCP lease
+// is held, its clock arms the wait's deadline (a periodic housekeeping wake) and
+// `lease_due` extends the lease when a threshold comes due.
+unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClock) -> ! {
 	unsafe {
 		// The frame and reply buffers live on the heap, not in this function's frame:
 		// serve holds all of them for its whole lifetime and the connect handshake
@@ -222,9 +237,21 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack) -> ! {
 				i += 1;
 			}
 			let n: usize = waits.len();
-			let ready: usize = wait_any(&waits[..n], 0) as usize;
+			// While a lease clock runs, its next threshold bounds the wait as a periodic
+			// housekeeping wake; without one the wait has no deadline at all.
+			let ready_raw: i64 = match lease.next_due() {
+				Some(deadline) => wait_any_periodic(&waits[..n], deadline),
+				None => wait_any(&waits[..n], 0),
+			};
+			if ready_raw == ERR_TIMED_OUT {
+				lease_due(frames, stack, &mut lease, &mut rx, &mut tx);
+				continue;
+			}
+			let ready: usize = ready_raw as usize;
 			if ready == 0 {
-				pump(frames, stack, &mut rx, &mut tx);
+				if let Event::DhcpReply(msg_type) = pump(frames, stack, &mut rx, &mut tx) {
+					lease.on_reply(msg_type, stack);
+				}
 				// Feed any newly received bytes to each active recv stream, closing the
 				// producer (end of stream) once that connection's peer closes or resets.
 				let mut si: usize = 0;
@@ -787,6 +814,142 @@ unsafe fn do_ping(ip: Ipv4Addr, frames: u64, stack: &mut Stack, seq: &mut u16, r
 			}
 		}
 		(0, 0, 0)
+	}
+}
+
+// The held DHCP lease's renewal clock, ticked by the serve loop: at T1 the lease is
+// extended with a REQUEST unicast to its server, from T2 by broadcast (any server),
+// and at expiry the address is re-acquired from scratch. An unanswered REQUEST is
+// retried at half the time remaining to the next threshold (clamped to a sane
+// range), the RFC 2131 retransmission pace.
+struct LeaseClock {
+	phase: LeasePhase,
+	// Tick deadlines (the T1 / T2 / expiry thresholds), and the next transmission.
+	t1: u64,
+	t2: u64,
+	expiry: u64,
+	retry: u64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LeasePhase {
+	// No lease clock runs (static config, or a lease with no / infinite duration).
+	None,
+	// A lease is held; nothing to do until T1.
+	Bound,
+	// Past T1: extending with the holding server (unicast REQUEST, retried).
+	Renewing,
+	// Past T2: extending with any server (broadcast REQUEST, retried).
+	Rebinding,
+	// The lease ran out: re-acquiring from scratch (DISCOVER, retried).
+	Expired,
+}
+
+impl LeaseClock {
+	const fn none() -> LeaseClock {
+		LeaseClock { phase: LeasePhase::None, t1: 0, t2: 0, expiry: 0, retry: 0 }
+	}
+
+	// The clock for the lease just learned by the stack: thresholds from its T1 /
+	// T2 / duration, or an idle clock when there is nothing to renew.
+	unsafe fn bound(stack: &Stack) -> LeaseClock {
+		unsafe {
+			match stack.dhcp_times() {
+				Some((t1, t2, lease)) => {
+					let now: u64 = clock();
+					LeaseClock { phase: LeasePhase::Bound, t1: now + t1 as u64 * TICKS_PER_SEC, t2: now + t2 as u64 * TICKS_PER_SEC, expiry: now + lease as u64 * TICKS_PER_SEC, retry: 0 }
+				}
+				None => LeaseClock::none(),
+			}
+		}
+	}
+
+	// The next tick the serve loop must wake at, or None when the clock is idle.
+	fn next_due(&self) -> Option<u64> {
+		match self.phase {
+			LeasePhase::None => None,
+			LeasePhase::Bound => Some(self.t1),
+			LeasePhase::Renewing => Some(self.retry.min(self.t2)),
+			LeasePhase::Rebinding => Some(self.retry.min(self.expiry)),
+			LeasePhase::Expired => Some(self.retry),
+		}
+	}
+
+	// The retransmission pace from `now` toward `threshold`: half the remaining
+	// time, clamped between the floor and the one-minute cap.
+	fn pace(now: u64, threshold: u64) -> u64 {
+		(threshold.saturating_sub(now) / 2).clamp(DHCP_RETRY_MIN_TICKS, DHCP_RETRY_MAX_TICKS)
+	}
+
+	// A DHCP reply arrived on the standing loop's pump path: an ACK while extending
+	// is the server's lease extension - re-apply the configuration and restart the
+	// clock; a NAK is a refusal - the address is forfeit, re-acquire from scratch
+	// at once. Replies in any other phase belong to no exchange of ours.
+	unsafe fn on_reply(&mut self, msg_type: u8, stack: &mut Stack) {
+		unsafe {
+			if self.phase != LeasePhase::Renewing && self.phase != LeasePhase::Rebinding {
+				return;
+			}
+			if msg_type == DHCP_ACK {
+				stack.apply_dhcp();
+				*self = LeaseClock::bound(stack);
+				print(b"network: DHCP lease renewed\n");
+			} else if msg_type == DHCP_NAK {
+				self.phase = LeasePhase::Expired;
+				self.retry = clock();
+			}
+		}
+	}
+}
+
+// A lease threshold came due (the serve loop's periodic wake fired): send what the
+// phase calls for and advance the clock. Renewal REQUESTs go out here and their
+// ACK arrives through the standing loop's pump (`LeaseClock::on_reply`); only a
+// full re-acquisition after expiry runs the blocking handshake, since there is no
+// held address left to serve with in the meantime.
+unsafe fn lease_due(frames: u64, stack: &mut Stack, lease: &mut LeaseClock, rx: &mut [u8], tx: &mut [u8]) {
+	unsafe {
+		let now: u64 = clock();
+		// Cross into the later phase first, so its transmission form is used at once.
+		if lease.phase == LeasePhase::Bound && now >= lease.t1 {
+			lease.phase = LeasePhase::Renewing;
+		}
+		if lease.phase == LeasePhase::Renewing && now >= lease.t2 {
+			lease.phase = LeasePhase::Rebinding;
+		}
+		if lease.phase == LeasePhase::Rebinding && now >= lease.expiry {
+			lease.phase = LeasePhase::Expired;
+			lease.retry = now;
+			print(b"network: DHCP lease expired\n");
+		}
+		match lease.phase {
+			LeasePhase::Renewing => {
+				// Unicast to the holding server when its MAC is known (the usual case -
+				// the gateway answered ARP long ago); a cache miss falls back to the
+				// broadcast form rather than blocking the serve loop on an ARP exchange.
+				let server: Ipv4Addr = stack.dhcp_server();
+				let unicast: Option<MacAddr> = stack.lookup(stack.next_hop(server));
+				let renew: usize = stack.build_dhcp_renew(unicast, tx);
+				send_frame(frames, &tx[..renew]);
+				lease.retry = now + LeaseClock::pace(now, lease.t2);
+			}
+			LeasePhase::Rebinding => {
+				let renew: usize = stack.build_dhcp_renew(None, tx);
+				send_frame(frames, &tx[..renew]);
+				lease.retry = now + LeaseClock::pace(now, lease.expiry);
+			}
+			LeasePhase::Expired => {
+				// Re-acquire from scratch. The stale address stays applied while this
+				// retries - there is no better configuration to fall back to.
+				if do_dhcp(frames, stack, rx, tx) {
+					*lease = LeaseClock::bound(stack);
+					print(b"network: DHCP lease reacquired\n");
+				} else {
+					lease.retry = now + DHCP_RETRY_MAX_TICKS;
+				}
+			}
+			_ => {}
+		}
 	}
 }
 
