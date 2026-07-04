@@ -617,6 +617,19 @@ fn a_malformed_boot_sector_is_refused_not_panicked() {
 	bpb[510] = 0x55;
 	bpb[511] = 0xAA;
 	assert!(FatFs::mount(MemDisk { data: bpb }).is_none());
+	// a BPB whose data region rounds to zero clusters is degenerate - refused, like
+	// exFAT's cluster_count == 0, instead of mounting and failing piecemeal.
+	let mut zeroc = vec![0u8; 512];
+	zeroc[11..13].copy_from_slice(&512u16.to_le_bytes());
+	zeroc[13] = 4;
+	zeroc[14..16].copy_from_slice(&1u16.to_le_bytes());
+	zeroc[16] = 1;
+	zeroc[17..19].copy_from_slice(&16u16.to_le_bytes());
+	zeroc[19..21].copy_from_slice(&5u16.to_le_bytes());
+	zeroc[22..24].copy_from_slice(&1u16.to_le_bytes());
+	zeroc[510] = 0x55;
+	zeroc[511] = 0xAA;
+	assert!(FatFs::mount(MemDisk { data: zeroc }).is_none());
 	// plausible numbers but no 0x55AA boot signature: not a FAT volume.
 	let mut unsigned = build_fat(Kind::Fat16, ROOT);
 	unsigned[510] = 0;
@@ -747,4 +760,96 @@ fn dot_dot_resolves_to_the_root_on_fat32() {
 	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat32, ROOT) }).unwrap();
 	let up = names(&fs.list_dir(b"DOCS/..").unwrap());
 	assert_eq!(up, ["DOCS", "HELLO.TXT", "readme.md"]);
+}
+
+#[test]
+fn a_1024_byte_sector_volume_reads_and_writes() {
+	// FAT logical sectors are not always 512 bytes. On a bps=1024 volume the data
+	// reads used to scale the sector address by the ratio TWICE (once in the cluster
+	// address, once in the device expansion), landing every cluster read on the wrong
+	// device sectors - the volume mounted and then read as garbage, while the
+	// once-scaled writes went elsewhere. Reads and writes must agree.
+	let bps = 1024usize;
+	let clusters = 5000usize;
+	let fat_size = (clusters * 2).div_ceil(bps);
+	let root_sectors = (512 * 32) / bps;
+	let first_data = 1 + fat_size + root_sectors;
+	let total = first_data + clusters;
+	let mut img = vec![0u8; total * bps];
+	// one file at cluster 2: an end-of-chain FAT entry and an 8.3 root record.
+	img[bps + 4..bps + 6].copy_from_slice(&0xFFF8u16.to_le_bytes());
+	let data_off = first_data * bps;
+	img[data_off..data_off + 11].copy_from_slice(b"Hello, FAT!");
+	let mut root: Vec<u8> = Vec::new();
+	push_entry(&mut root, "HELLO.TXT", false, 11, 2);
+	let root_off = (1 + fat_size) * bps;
+	img[root_off..root_off + root.len()].copy_from_slice(&root);
+	write_bpb(&mut img, bps, 1, 1, fat_size, 512, total, 0);
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert_eq!(fs.kind_name(), "fat16");
+	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"Hello, FAT!");
+	let big: Vec<u8> = (0..3000u32).map(|i| (i * 11) as u8).collect();
+	fs.write_file(b"BIG.BIN", &big).unwrap();
+	assert_eq!(fs.read_file(b"BIG.BIN").unwrap(), big);
+	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"Hello, FAT!");
+}
+
+#[test]
+fn a_forged_nofatchain_size_is_refused() {
+	// The NoFatChain length is the medium's own claim: a forged huge size used to hang
+	// the free walk for ~4.5e15 iterations, grow the read allocation without bound,
+	// and overflow the cluster arithmetic. Both paths must refuse it as Invalid.
+	let img = build_exfat_nfc(&[], &[File { path: "movie.mkv", data: b"real bytes" }]);
+	let heap = 25usize; // 24 reserved + 1 FAT sector
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	// the root: the 0x81 bitmap entry, then the 0x85 file and its 0xC0 stream entry,
+	// whose data length lives at byte 24.
+	let stream = (heap + 1) * 512 + 64;
+	fs.dev.data[stream + 24..stream + 32].copy_from_slice(&u64::MAX.to_le_bytes());
+	assert_eq!(fs.read_file(b"movie.mkv"), Err(FsError::Invalid));
+	assert_eq!(fs.remove(b"movie.mkv"), Err(FsError::Invalid));
+}
+
+#[test]
+fn a_name_leading_with_byte_0xe5_survives_a_write_cycle() {
+	// U+5BB6 encodes as 0xE5 0xAE 0xB6: an 8.3 field starting with the raw 0xE5 reads
+	// back as DELETED (the parser skips it and the file silently vanishes). The spec
+	// stores a leading 0xE5 as 0x05; the whole cycle must work and leak nothing.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	let before = allocated_clusters(&mut fs);
+	let name = "\u{5BB6}.txt".as_bytes();
+	assert_eq!(name[0], 0xE5);
+	fs.write_file(name, b"kanji-led bytes").unwrap();
+	assert_eq!(fs.read_file(name).unwrap(), b"kanji-led bytes");
+	assert!(fs.list().unwrap().iter().any(|e| e.name.as_bytes() == name));
+	fs.remove(name).unwrap();
+	assert_eq!(fs.read_file(name), Err(FsError::NotFound));
+	assert_eq!(allocated_clusters(&mut fs), before);
+}
+
+#[test]
+fn an_entry_never_lands_past_the_terminator() {
+	// Everything from the first 0x00 entry is free space by spec, but stale non-free
+	// garbage past it used to push a new entry set beyond the terminator - written
+	// where the parser (which stops there) never looks: a silently lost file.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
+						  // ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
+	fs.dev.data[root_off + 5 * 32] = b'X';
+	fs.write_file(b"a long note.txt", b"visible").unwrap();
+	assert_eq!(fs.read_file(b"a long note.txt").unwrap(), b"visible");
+	assert!(names(&fs.list().unwrap()).contains(&"a long note.txt".to_string()));
+}
+
+#[test]
+fn dot_only_and_trailing_dot_or_space_names_are_refused() {
+	// A name of dots alone would collide with the dot-entry semantics (its short basis
+	// strips to nothing), and trailing dots or spaces are invalid on the media's home
+	// systems. All must refuse cleanly, on exFAT through the same gate.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	for name in [b".".as_slice(), b"..", b"...", b"note.", b"note ", b"DOCS/."] {
+		assert_eq!(fs.write_file(name, b"x"), Err(FsError::Invalid), "{name:?} must be refused");
+	}
+	let mut ex = FatFs::mount(MemDisk { data: build_exfat(ROOT) }).unwrap();
+	assert_eq!(ex.write_file(b"..", b"x"), Err(FsError::Invalid));
 }
