@@ -547,6 +547,12 @@ impl Inode {
 
 	// Parse the fixed header and, for a file, the inline extents (any spilled ones are
 	// appended afterwards by `read_inode`); for a directory, the B+tree root pointer.
+	// A kind byte that is neither KIND_FILE nor KIND_DIR (hostile authoring - the
+	// writer never emits one) parses file-shaped, by DECISION, and lands harmless
+	// end to end: reads and writes refuse it (their KIND_FILE gates fail), a listing
+	// shows it inert, the mark walks reserve nothing for it (neither kind branch),
+	// and `remove` can always clear it - the operator's repair verb works. A change
+	// to any `kind` branching must keep that story consistent.
 	fn parse(buf: &[u8]) -> Inode {
 		let kind = buf[INO_KIND_OFF];
 		let mut owner_tag = [0u8; OWNER_TAG_LEN];

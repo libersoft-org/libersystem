@@ -73,14 +73,16 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Remember (directory, name) -> child, evicting the LARGEST key once the cache is
 	// full (the root directory's entries - directory 0, the hottest - stay put; plain
-	// bounded eviction, the cache only skips re-reads).
+	// bounded eviction, the cache only skips re-reads). Overwriting a cached key
+	// evicts nothing, like `icache_put`.
 	pub(crate) fn dcache_put(&mut self, dir_num: u32, name: &[u8], child: u32) {
-		if self.dcache.len() >= DCACHE_MAX {
+		let key = (dir_num, name.to_vec());
+		if self.dcache.len() >= DCACHE_MAX && !self.dcache.contains_key(&key) {
 			if let Some(k) = self.dcache.keys().next_back().cloned() {
 				self.dcache.remove(&k);
 			}
 		}
-		self.dcache.insert((dir_num, name.to_vec()), child);
+		self.dcache.insert(key, child);
 	}
 
 	// Insert entry `name` -> `child` into directory `dir_num`, or repoint it if it is

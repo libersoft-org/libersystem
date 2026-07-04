@@ -2424,3 +2424,39 @@ fn a_self_fanning_internal_node_cannot_stall_the_mark_walk() {
 	assert_eq!(fs.read_file(b"keep.txt").unwrap(), b"payload");
 	assert!(test_bit(&fs.free, node), "the walked node is reserved like any referenced block");
 }
+
+// M103 follow-up: the third-pass nits.
+
+#[test]
+fn an_unknown_inode_kind_is_inert_and_removable() {
+	// a kind byte the writer never emits (hostile authoring): the record must land
+	// harmless - refused by reads and writes, shown inert by listings, and clearable
+	// by the operator's repair verb.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"odd", b"payload").unwrap();
+	let mut dev = fs.into_device();
+	forge_inode_slot(&mut dev, |slot| {
+		slot[INO_KIND_OFF] = 7;
+	});
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(b"odd"), Err(FsError::IsDir), "a read refuses the unknown kind");
+	assert_eq!(fs.write_file(b"odd", b"x"), Err(FsError::IsDir), "an overwrite refuses it too");
+	assert_eq!(fs.list().unwrap().len(), 1, "the record lists inert");
+	fs.remove(b"odd").unwrap();
+	assert_eq!(fs.list().unwrap().len(), 0, "the repair verb clears it");
+}
+
+#[test]
+fn overwriting_a_cached_entry_evicts_nothing() {
+	// a full dentry cache: re-putting a key it already holds must not evict a
+	// different entry (the insert replaces in place, like the inode cache).
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	for i in 0..DCACHE_MAX as u32 {
+		fs.dcache_put(0, format!("name{i:04}").as_bytes(), i);
+	}
+	assert_eq!(fs.dcache.len(), DCACHE_MAX);
+	fs.dcache_put(0, b"name0000", 999);
+	assert_eq!(fs.dcache.len(), DCACHE_MAX, "the overwrite evicted nothing");
+	assert_eq!(fs.dcache.get(&(0, b"name0000".to_vec())), Some(&999), "the overwrite landed");
+	assert!(fs.dcache.contains_key(&(0, format!("name{:04}", DCACHE_MAX - 1).as_bytes().to_vec())), "the largest key survived the overwrite");
+}
