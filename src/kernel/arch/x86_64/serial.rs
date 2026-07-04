@@ -166,7 +166,12 @@ fn write_byte(byte: u8) {
 // baud-paced UART - is never throttled, and the framebuffer it renders is never stalled
 // behind the debug mirror. The mirror is best-effort debug output; the framebuffer is
 // the product. The kernel's own logs keep the lossless write_byte path.
-pub fn write_bytes(bytes: &[u8]) {
+// Queue a byte slice for the serial port, returning how many of the SOURCE bytes
+// were fully accepted: once the TX ring cannot hold a byte (or the \r half of a
+// newline's \r\n pair), the rest is left to the caller - which may retry later
+// with the remainder instead of losing it. Early boot (before the ring is
+// serviced) writes to the wire directly and accepts everything.
+pub fn write_bytes(bytes: &[u8]) -> usize {
 	if !ASYNC.load(Ordering::Acquire) {
 		// Early boot (ring not yet serviced): keep it lossless via the wire-direct path.
 		for &byte in bytes {
@@ -175,21 +180,20 @@ pub fn write_bytes(bytes: &[u8]) {
 			}
 			write_byte(byte);
 		}
-		return;
+		return bytes.len();
 	}
 	let mut ring = TX.lock();
-	for &byte in bytes {
-		if byte == b'\n' {
-			if ring.len == TX_RING_CAP {
-				break;
-			}
-			ring.push(b'\r');
+	for (i, &byte) in bytes.iter().enumerate() {
+		let need: usize = if byte == b'\n' { 2 } else { 1 };
+		if TX_RING_CAP - ring.len < need {
+			return i;
 		}
-		if ring.len == TX_RING_CAP {
-			break;
+		if byte == b'\n' {
+			ring.push(b'\r');
 		}
 		ring.push(byte);
 	}
+	bytes.len()
 }
 
 // True if the UART has a received byte waiting (Line Status Register, DR bit).

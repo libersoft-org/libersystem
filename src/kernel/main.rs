@@ -103,10 +103,13 @@ pub fn _print(args: core::fmt::Arguments<'_>) {
 // console (if one is initialized), without the per-char format_args _print does. Backs
 // the bulk SYS_DEBUG_WRITE path so the console service flushes a screenful of
 // serial-mirror output in one syscall instead of one (formatted) syscall per byte.
+// Returns how many bytes the serial transmit ring accepted, so a caller carrying a
+// backlog knows where to resume instead of losing the tail.
 #[doc(hidden)]
-pub fn _print_bytes(bytes: &[u8]) {
-	arch::serial::write_bytes(bytes);
-	console::write_bytes(bytes);
+pub fn _print_bytes(bytes: &[u8]) -> usize {
+	let n = arch::serial::write_bytes(bytes);
+	console::write_bytes(&bytes[..n]);
+	n
 }
 
 // Single-byte twin of _print_bytes, for the legacy single-byte SYS_DEBUG_WRITE form.

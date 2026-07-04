@@ -94,8 +94,27 @@ pub unsafe fn print(bytes: &[u8]) {
 			return;
 		}
 		for chunk in bytes.chunks(DEBUG_WRITE_CHUNK) {
-			syscall(SYS_DEBUG_WRITE, chunk.as_ptr() as u64, chunk.len() as u64, 0, 0);
+			// The kernel reports how much its transmit ring accepted; once a chunk does
+			// not fit whole, sending more would only punch out-of-order holes, so the
+			// remainder is dropped (print is fire-and-forget; a caller that must not
+			// lose bytes paces itself with debug_write).
+			let accepted: i64 = syscall(SYS_DEBUG_WRITE, chunk.as_ptr() as u64, chunk.len() as u64, 0, 0) as i64;
+			if accepted < chunk.len() as i64 {
+				return;
+			}
 		}
+	}
+}
+
+// Write bytes to the kernel debug/serial port, returning how many the kernel's
+// transmit ring accepted (one syscall, no chunk loop). A caller draining a backlog -
+// the console's serial mirror - consumes exactly that many and retries the rest on a
+// later wake, so a burst is paced instead of truncated.
+pub unsafe fn debug_write(bytes: &[u8]) -> usize {
+	unsafe {
+		let n = bytes.len().min(DEBUG_WRITE_CHUNK);
+		let accepted: i64 = syscall(SYS_DEBUG_WRITE, bytes.as_ptr() as u64, n as u64, 0, 0) as i64;
+		if accepted < 0 { 0 } else { accepted as usize }
 	}
 }
 

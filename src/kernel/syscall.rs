@@ -127,8 +127,9 @@ fn sys_debug_write(arg: u64, len: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	let bytes = unsafe { core::slice::from_raw_parts(arg as *const u8, len as usize) };
-	crate::_print_bytes(bytes);
-	0
+	// Report how many bytes the transmit ring accepted: a caller pacing a mirror
+	// backlog resumes from there on its next pass instead of losing the tail.
+	crate::_print_bytes(bytes) as i64
 }
 
 // Kernel virtual-address window for syscall-mapped MemoryObjects. A bump pointer

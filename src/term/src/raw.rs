@@ -26,6 +26,13 @@ impl RawSink {
 		&self.out
 	}
 
+	// Drop the oldest `n` captured bytes - a downstream consumer draining the stream
+	// in bounded slices (e.g. as much as a transmit ring accepted) removes what it
+	// took and leaves the rest for a later pass.
+	pub fn consume(&mut self, n: usize) {
+		self.out.drain(..n.min(self.out.len()));
+	}
+
 	// True until anything has been fed (or since the last `clear`).
 	pub fn is_empty(&self) -> bool {
 		self.out.is_empty()

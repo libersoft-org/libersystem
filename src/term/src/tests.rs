@@ -103,6 +103,20 @@ fn raw_sink_clear_resets_the_capture() {
 	assert_eq!(raw.as_bytes(), b"");
 }
 
+// A bounded consumer drains the stream in slices: consume drops exactly the oldest
+// bytes it took, keeps the rest in order, and an over-long consume just empties.
+#[test]
+fn raw_sink_consume_drops_only_the_oldest_bytes() {
+	let mut raw = RawSink::new();
+	raw.feed(b"hello world");
+	raw.consume(6);
+	assert_eq!(raw.as_bytes(), b"world");
+	raw.feed(b"!");
+	assert_eq!(raw.as_bytes(), b"world!");
+	raw.consume(100);
+	assert!(raw.is_empty());
+}
+
 // The DEC private mouse-tracking modes (?1000 normal, ?1002 button-event, ?1003 any-event)
 // and the SGR encoding (?1006) toggle the queryable mode the console reads to route pointer
 // events; each turns off again with the matching `l`.

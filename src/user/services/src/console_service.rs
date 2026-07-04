@@ -112,6 +112,15 @@ const BELL_FLASH_TICKS: u64 = 10;
 // foreground caret every ~400 ms while the console idles - the classic terminal rate.
 const BLINK_PHASE_TICKS: u64 = 40;
 
+// The most serial-mirror backlog the console keeps queued (the kernel's transmit ring
+// accepts what it can per wake; the rest waits here). A burst beyond this is hopelessly
+// ahead of the baud-paced wire: the oldest pending output is dropped and the gap is
+// marked in the mirror.
+const SERIAL_PENDING_MAX: usize = 32768;
+
+// What the serial mirror prints in place of output it had to drop (see above).
+const SERIAL_GAP_MARKER: &[u8] = b"\n[serial mirror: behind - older output dropped]\n";
+
 // The tty line discipline limits (per VT).
 const LD_LINE_MAX: usize = 4096;
 const LD_HIST_MAX: usize = 512;
@@ -593,6 +602,9 @@ struct Console {
 	clipboard: Vec<u8>,
 	// The pointer button bits from the previous event, to detect press / release edges.
 	ptr_buttons: u8,
+	// Set when the serial mirror had to drop old backlog (SERIAL_PENDING_MAX): the next
+	// drain writes the gap marker where the dropped output would have been.
+	serial_gap: bool,
 	// The Tab-completion vocabulary: the shell builtins plus the system volume's bin/
 	// listing (bash's builtins + $PATH), fetched lazily on the first Tab through a fresh
 	// storage connection and cached for the session (None until then; an unreachable
@@ -756,7 +768,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, pointer, clipboard: Vec::new(), ptr_buttons: 0, vocab: None };
+		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
 		run(&mut console);
 	}
 }
@@ -910,10 +922,7 @@ unsafe fn run(console: &mut Console) -> ! {
 				// this thread on the baud-paced UART), so it never stalls the framebuffer the
 				// SPICE/VNC user sees.
 				present_fg(console);
-				if !console.serial.is_empty() {
-					print(console.serial.as_bytes());
-					console.serial.clear();
-				}
+				drain_serial(console);
 			}
 		}
 	}
@@ -967,9 +976,40 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 		}
 		if fg {
 			// Tap the raw output stream (L1) into the serial mirror, alongside the L2 model above;
-			// the session loop drains it after the present so the baud-throttled serial port never
-			// delays the display (see `run`).
+			// the session loop drains it after the present, bounded by what the kernel's transmit
+			// ring accepts, so the baud-throttled serial port never delays the display (see `run`).
+			// A backlog past the cap drops its oldest bytes - the newest output is the valuable
+			// part of a debug mirror - and the gap is marked on the next drain.
 			console.serial.feed(bytes);
+			let pending: usize = console.serial.as_bytes().len();
+			if pending > SERIAL_PENDING_MAX {
+				console.serial.consume(pending - SERIAL_PENDING_MAX);
+				console.serial_gap = true;
+			}
+		}
+	}
+}
+
+// Drain the serial mirror's backlog into the kernel's transmit ring, consuming exactly
+// what the ring accepted and leaving the rest for a later wake (every event drains, and
+// the caret-blink tick bounds the wait between drains) - so a burst is paced to the
+// wire instead of truncated, and this thread never blocks on the baud-paced UART. A
+// marked gap (dropped backlog) is announced ahead of the remaining stream, best-effort.
+unsafe fn drain_serial(console: &mut Console) {
+	unsafe {
+		if console.serial.is_empty() {
+			return;
+		}
+		if console.serial_gap {
+			debug_write(SERIAL_GAP_MARKER);
+			console.serial_gap = false;
+		}
+		loop {
+			let accepted: usize = debug_write(console.serial.as_bytes());
+			console.serial.consume(accepted);
+			if accepted == 0 || console.serial.is_empty() {
+				break;
+			}
 		}
 	}
 }
