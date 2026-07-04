@@ -16,10 +16,11 @@
 //!
 //! The media is untrusted: every block address, length, and extent is bounded by the
 //! partition's own length (whose last block is verified to exist on the device at
-//! mount) before a buffer is allocated, descriptor tag checksums are verified, and an
-//! unrecorded (sparse) extent reads as zeros, never as stale disk content. The UDF
-//! 2.50+ metadata partition (Blu-ray) is not interpreted - such a volume refuses to
-//! mount rather than misread.
+//! mount) before a buffer is allocated, descriptor tag checksums and locations are
+//! verified, and an unrecorded (sparse) extent reads as zeros, never as stale disk
+//! content. One physical partition is assumed (the long_ad partition references are
+//! not interpreted) and the UDF 2.50+ metadata partition (Blu-ray) is not - such
+//! volumes refuse to mount rather than misread.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -142,10 +143,13 @@ impl<D: BlockDevice> Udf<D> {
 		if !dev.read_block(part_start as u64 + part_len as u64 - 1, &mut block) {
 			return None;
 		}
-		if !dev.read_block(part_start as u64 + fileset_lb as u64, &mut block) || le16(&block[0..2]) != TAG_FILE_SET || !tag_ok(&block) {
+		if !dev.read_block(part_start as u64 + fileset_lb as u64, &mut block) || le16(&block[0..2]) != TAG_FILE_SET || !tag_ok(&block) || le32(&block[12..16]) != fileset_lb {
 			return None;
 		}
 		let root_icb = le32(&block[404..408]);
+		if root_icb >= part_len {
+			return None;
+		}
 		Some(Udf { dev, geo: Geometry { part_start, part_len, root_icb } })
 	}
 
@@ -238,6 +242,8 @@ impl<D: BlockDevice> Udf<D> {
 			if chars & 0x08 == 0 && chars & 0x04 == 0 {
 				let is_dir = chars & 0x02 != 0;
 				let id = decode_name(&fid[38 + l_iu..38 + l_iu + l_fi]);
+				// an unreadable child header lists as size 0 by decision - the listing
+				// stays best-effort, the file's own read reports the error honestly.
 				let size = if is_dir { 0 } else { self.icb_size(le32(&fid[24..28])).unwrap_or(0) };
 				if !id.is_empty() {
 					out.push(FileInfo { name: id, size, is_dir });
@@ -258,7 +264,7 @@ impl<D: BlockDevice> Udf<D> {
 		if !self.dev.read_block(self.geo.part_start as u64 + lb as u64, &mut block) {
 			return Err(FsError::Io);
 		}
-		if !tag_ok(&block) {
+		if !tag_ok(&block) || le32(&block[12..16]) != lb {
 			return Err(FsError::Invalid);
 		}
 		match le16(&block[0..2]) {
@@ -280,7 +286,9 @@ impl<D: BlockDevice> Udf<D> {
 		if !self.dev.read_block(self.geo.part_start as u64 + lb as u64, &mut block) {
 			return Err(FsError::Io);
 		}
-		if !tag_ok(&block) {
+		// the tag checksum gates garbage; the tag location gates a descriptor copied to
+		// the wrong block (its recorded address must be its own).
+		if !tag_ok(&block) || le32(&block[12..16]) != lb {
 			return Err(FsError::Invalid);
 		}
 		let tag = le16(&block[0..2]);
@@ -341,12 +349,15 @@ impl<D: BlockDevice> Udf<D> {
 			}
 			let mut cur = self.geo.part_start as u64 + lba as u64;
 			let mut left = take;
+			// the data lands in its own buffer - `block` still holds the File Entry,
+			// whose remaining descriptors the scan parses after this extent.
+			let mut data = [0u8; SECTOR_SIZE];
 			while left > 0 {
-				if !self.dev.read_block(cur, &mut block) {
+				if !self.dev.read_block(cur, &mut data) {
 					return Err(FsError::Io);
 				}
 				let n = left.min(SECTOR_SIZE);
-				out[done..done + n].copy_from_slice(&block[..n]);
+				out[done..done + n].copy_from_slice(&data[..n]);
 				done += n;
 				left -= n;
 				cur += 1;
@@ -370,7 +381,8 @@ fn tag_ok(block: &[u8]) -> bool {
 }
 
 // Decode a UDF d-string file identifier: the first byte is the compression id (8 =
-// 8-bit Latin-1, 16 = 16-bit UCS-2 big-endian); the rest are the characters.
+// 8-bit Latin-1, 16 = 16-bit UCS-2 big-endian); the rest are the characters. An unknown
+// id yields an empty name (the record is then skipped), never noise decoded as text.
 fn decode_name(id: &[u8]) -> String {
 	if id.is_empty() {
 		return String::new();
@@ -380,7 +392,7 @@ fn decode_name(id: &[u8]) -> String {
 		for c in id[1..].chunks_exact(2) {
 			s.push(char::from_u32(u16::from_be_bytes([c[0], c[1]]) as u32).unwrap_or('?'));
 		}
-	} else {
+	} else if id[0] == 8 {
 		for &b in &id[1..] {
 			s.push(b as char);
 		}

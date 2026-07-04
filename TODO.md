@@ -1865,6 +1865,29 @@ the same finding classes recur, plus two of its own.
   - Result: all hold - udf 9 host tests (6 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
 - Concept: the hostile-media rule (M87/M93-B1/M96-B1/B2: bound every on-medium value before use; the medium bounds itself), the FAT M94 VDL rule (unwritten ranges are zeros, never stale disk content), the uniform Volume API contract (M96-B5).
 
+## M100 - UDF: second-pass findings (the shared-buffer corruption)
+
+The second full source pass (2026-07-04, after M99 landed) found the most
+serious defect of the whole fs series - a silent read corruption on
+LEGITIMATE media the first pass missed because the test images use embedded
+files only - plus mount-symmetry and integrity nits.
+
+- [x] (B1, high) `read_icb` uses ONE buffer for the File Entry and for the extent data reads: the inner loop overwrites `block` with the first extent's content, and the next iteration of the descriptor scan parses `block[ad..]` - FILE DATA, not the File Entry. Any file with two or more extents (fragmented media, files near the 30-bit extent-length ceiling) reads a silently corrupt tail steered by its own first extent's bytes. The M99 gates keep it bounded; the content is simply wrong. Fix: the data reads land in their own buffer, the File Entry block stays intact for the whole scan.
+  - Result: the extent data lands in its own buffer; the File Entry stays intact for the whole descriptor scan. Test `a_multi_extent_file_reads_every_extent` (a two-extent file: the 2048-byte first extent plus a 5-byte tail both come from the disc).
+- [x] (B2, cosmetic) `root_icb` is not gated against the partition length at mount (the first read gates it) - asymmetric with the `fileset_lb` gate. Gate it at mount.
+  - Result: gated. Test `a_forged_root_icb_does_not_mount`.
+- [x] (B3, cosmetic) Multi-partition volumes: the LAST Partition Descriptor wins and the partition-reference halves of the long_ad fields are ignored - on a multi-partition medium the addresses resolve against the wrong partition. Record the single-partition assumption in the module doc next to the metadata-partition limit.
+  - Result: recorded in the module doc.
+- [x] (B4, cosmetic) The descriptor tag's location field (bytes 12..16, by specification the descriptor's own block address) is never cross-checked - a descriptor copied to the wrong block passes the checksum. Verify it for the File Set and every File Entry read (File Identifiers keep their directory-relative addressing and stay unchecked).
+  - Result: verified at the File Set and both File Entry readers; the test builder stamps locations like a real formatter. Test `a_misplaced_file_entry_is_refused` (a File Entry copied to another block and pointed at refuses).
+- [x] (B5, cosmetic) `decode_name` treats every compression id other than 16 as 8-bit text - an unknown id (254/255, or garbage) decodes noise into listings. An unknown id yields an empty name, and the empty-name path already skips the record.
+  - Result: only ids 8 and 16 decode; anything else yields the empty name and the record skips. Test `an_unknown_compression_id_does_not_decode`.
+- [x] (B6, cosmetic) `read_dir`'s `icb_size(..).unwrap_or(0)` masks an unreadable child header as size 0, indistinguishable from an empty file. Keep the best-effort listing by DECISION and record it - the file's own read reports the error honestly.
+  - Result: recorded at the call site.
+- Done when: a two-extent file reads both extents from the disc (test-pinned with a tail the old code corrupted), a forged root ICB refuses at mount, a File Entry copied to a wrong block refuses, an unknown compression id never decodes into a listing, the single-partition and best-effort-size decisions are recorded, and the suite stays green with a test per finding.
+  - Result: all hold - udf 13 host tests (4 new), `just build` clean, kernel 89 [ok] twice, 0 warnings, fmt clean.
+- Concept: M99 (whose gates kept this bounded but not correct), the FAT track's lesson that test-image builders must exercise the layouts real formatters emit (extent-based files, not just embedded).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
