@@ -286,9 +286,11 @@ impl<D: BlockDevice> FatFs<D> {
 				return Err(e);
 			}
 		};
-		// 3. only now is the old chain unreachable - free it.
+		// 3. only now is the old chain unreachable - free it, best-effort: the write is
+		//    durable at this point, so a failing device may cost lost clusters (the class
+		//    the free walks already accept), never a false failure of a finished write.
 		if let Some(old) = old_first {
-			self.free_chain(old)?;
+			let _ = self.free_chain(old);
 		}
 		Ok(())
 	}
@@ -344,9 +346,11 @@ impl<D: BlockDevice> FatFs<D> {
 	}
 
 	// The listing of a directory: name + size + is_dir, dropping the "." / ".." links.
+	// A directory reports a length of zero whatever its entry records (exFAT records
+	// the directory's DataLength there) - the FileInfo contract, uniform across families.
 	fn read_dir(&mut self, dir: &Dir) -> Result<Vec<FileInfo>, FsError> {
 		let raw = self.scan_dir(dir)?;
-		Ok(raw.into_iter().filter(|e| e.name != "." && e.name != "..").map(|e| FileInfo { name: e.name, size: e.size, is_dir: e.is_dir }).collect())
+		Ok(raw.into_iter().filter(|e| e.name != "." && e.name != "..").map(|e| FileInfo { name: e.name, size: if e.is_dir { 0 } else { e.size }, is_dir: e.is_dir }).collect())
 	}
 
 	// Read a directory's bytes (the fixed root region, a contiguous NoFatChain run, or a
@@ -499,11 +503,7 @@ impl<D: BlockDevice> FatFs<D> {
 		Ok(match self.geo.kind {
 			Kind::Fat12 => {
 				let v = u16::from_le_bytes([buf[within], buf[within + 1]]);
-				if cluster & 1 == 1 {
-					(v >> 4) as u32
-				} else {
-					(v & 0x0FFF) as u32
-				}
+				if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
 			}
 			Kind::Fat16 => u16::from_le_bytes([buf[within], buf[within + 1]]) as u32,
 			Kind::Fat32 | Kind::ExFat => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]) & 0x0FFF_FFFF,
@@ -824,7 +824,10 @@ impl<D: BlockDevice> FatFs<D> {
 			None => Ok(false),
 			Some(first) => {
 				self.write_dir_dirty(dir, &bytes, &orig)?;
-				self.free_chain(first)?;
+				// the unlink is durable once the directory write lands - the free is
+				// best-effort (a failing device costs lost clusters, never a false
+				// failure of a finished remove).
+				let _ = self.free_chain(first);
 				Ok(true)
 			}
 		}
@@ -920,8 +923,10 @@ impl<D: BlockDevice> FatFs<D> {
 				return Err(e);
 			}
 		};
+		// the write is durable once the entry set lands - the release of the replaced
+		// clusters is best-effort, like the classic path's.
 		if let Some(old) = old {
-			self.exfat_release(&old)?;
+			let _ = self.exfat_release(&old);
 		}
 		Ok(())
 	}
@@ -934,7 +939,9 @@ impl<D: BlockDevice> FatFs<D> {
 			return Err(FsError::NotFound);
 		};
 		self.write_dir_dirty(dir, &bytes, &orig)?;
-		self.exfat_release(&old)
+		// durable once the directory write lands - the release is best-effort.
+		let _ = self.exfat_release(&old);
+		Ok(())
 	}
 
 	// Swap an exFAT entry set in ONE read-modify-write: mark any old set's in-use bits
@@ -1015,11 +1022,7 @@ impl<D: BlockDevice> FatFs<D> {
 	// common contiguous form, whose FAT entries were never written) frees its contiguous
 	// run from the bitmap alone; a chained file walks and clears the FAT too.
 	fn exfat_release(&mut self, old: &Raw) -> Result<(), FsError> {
-		if old.no_fat_chain {
-			self.exfat_free_contiguous(old.first_cluster, old.size)
-		} else {
-			self.exfat_free(old.first_cluster)
-		}
+		if old.no_fat_chain { self.exfat_free_contiguous(old.first_cluster, old.size) } else { self.exfat_free(old.first_cluster) }
 	}
 
 	// Locate the allocation bitmap (the 0x81 entry in the root): its first cluster and its
@@ -1155,11 +1158,7 @@ fn fat_entry_at(fat: &[u8], kind: Kind, cluster: u32) -> u32 {
 				return 1;
 			}
 			let v = u16::from_le_bytes([fat[off], fat[off + 1]]);
-			if cluster & 1 == 1 {
-				(v >> 4) as u32
-			} else {
-				(v & 0x0FFF) as u32
-			}
+			if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
 		}
 		Kind::Fat16 => {
 			if off + 2 > fat.len() {
@@ -1501,13 +1500,23 @@ fn decode_utf16(units: &[u16]) -> String {
 	s
 }
 
-// The 8.3 short name of a classic entry: name, optional dot, extension, trimmed.
+// The 8.3 short name of a classic entry: name, optional dot, extension, trimmed. The
+// NT case flags (byte 12: 0x08 = lowercase base, 0x10 = lowercase extension) are
+// honored - the media's home systems store a short-only lowercase name this way
+// instead of a long-name set, and the listing must render what they display.
 fn short_name(e: &[u8]) -> String {
 	let mut raw = [0u8; 11];
 	raw.copy_from_slice(&e[0..11]);
 	// the 0x05 lead byte is the spec's escape for a real 0xE5, which would read as deleted.
 	if raw[0] == 0x05 {
 		raw[0] = 0xE5;
+	}
+	let flags = e.get(12).copied().unwrap_or(0);
+	if flags & 0x08 != 0 {
+		raw[0..8].make_ascii_lowercase();
+	}
+	if flags & 0x10 != 0 {
+		raw[8..11].make_ascii_lowercase();
 	}
 	let base = trim_spaces(&raw[0..8]);
 	let ext = trim_spaces(&raw[8..11]);
@@ -1665,11 +1674,7 @@ fn gen_short(name: &[u8], dir_bytes: &[u8]) -> Result<[u8; 11], FsError> {
 // (uppercasing alone is not lossy - the long name records the case).
 fn short_char(b: u8) -> (u8, bool) {
 	let illegal = b < 0x20 || b == 0x7F || b" \"*+,./:;<=>?[\\]|".contains(&b);
-	if illegal {
-		(b'_', true)
-	} else {
-		(b.to_ascii_uppercase(), false)
-	}
+	if illegal { (b'_', true) } else { (b.to_ascii_uppercase(), false) }
 }
 
 // Collect the 8.3 name fields of a directory's live entries, for uniqueness checks.

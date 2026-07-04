@@ -594,12 +594,12 @@ fn reads_and_frees_a_nofatchain_exfat_file() {
 	// and a remove must clear its bitmap bits.
 	let data: Vec<u8> = (0..1500u32).map(|i| (i * 7) as u8).collect();
 	let leaked: &'static [u8] = Box::leak(data.clone().into_boxed_slice());
-	let img = build_exfat_nfc(&[], &[File { path: "movie.mkv", data: leaked }]);
+	let img = build_exfat_nfc(&[], &[File { path: "backup.img", data: leaked }]);
 	let heap = 25usize; // 24 reserved + 1 FAT sector
 	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
-	assert_eq!(fs.read_file(b"movie.mkv").unwrap(), data);
-	fs.remove(b"movie.mkv").unwrap();
-	assert_eq!(fs.read_file(b"movie.mkv"), Err(FsError::NotFound));
+	assert_eq!(fs.read_file(b"backup.img").unwrap(), data);
+	fs.remove(b"backup.img").unwrap();
+	assert_eq!(fs.read_file(b"backup.img"), Err(FsError::NotFound));
 	// clusters 4, 5, 6 (bitmap bits 2..=4) freed; the bitmap + root (bits 0, 1) stay.
 	assert_eq!(fs.dev.data[heap * 512], 0b11, "the NoFatChain run's bitmap bits must be cleared");
 }
@@ -834,7 +834,7 @@ fn a_forged_nofatchain_size_is_refused() {
 	// and overflow the cluster arithmetic. An adversary authoring the volume offline
 	// computes a VALID set checksum, so the size gate must hold behind the checksum
 	// gate. Both paths must refuse it as Invalid.
-	let img = build_exfat_nfc(&[], &[File { path: "movie.mkv", data: b"real bytes" }]);
+	let img = build_exfat_nfc(&[], &[File { path: "backup.img", data: b"real bytes" }]);
 	let heap = 25usize; // 24 reserved + 1 FAT sector
 	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
 	// the root: the 0x81 bitmap entry, then the 0x85 file and its 0xC0 stream entry,
@@ -845,8 +845,12 @@ fn a_forged_nofatchain_size_is_refused() {
 	let count = fs.dev.data[set_at + 1] as usize + 1;
 	let sum = exfat_set_checksum(&fs.dev.data[set_at..set_at + count * 32]);
 	fs.dev.data[set_at + 2..set_at + 4].copy_from_slice(&sum.to_le_bytes());
-	assert_eq!(fs.read_file(b"movie.mkv"), Err(FsError::Invalid));
-	assert_eq!(fs.remove(b"movie.mkv"), Err(FsError::Invalid));
+	assert_eq!(fs.read_file(b"backup.img"), Err(FsError::Invalid));
+	// the remove is durable (the entry clears) but its release refuses the forged
+	// run: the clusters stay marked - a bounded leak, never a foreign free.
+	fs.remove(b"backup.img").unwrap();
+	assert_eq!(fs.read_file(b"backup.img"), Err(FsError::NotFound));
+	assert_eq!(fs.dev.data[heap * 512], 0b111, "no bitmap bit may change under a refused release");
 }
 
 #[test]
@@ -873,7 +877,7 @@ fn an_entry_never_lands_past_the_terminator() {
 	// where the parser (which stops there) never looks: a silently lost file.
 	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
 	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
-						  // ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
+	// ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
 	fs.dev.data[root_off + 5 * 32] = b'X';
 	fs.write_file(b"a long note.txt", b"visible").unwrap();
 	assert_eq!(fs.read_file(b"a long note.txt").unwrap(), b"visible");
@@ -1442,9 +1446,9 @@ fn a_preallocated_exfat_tail_reads_as_zeros() {
 	// never leak stale cluster content - it can hold someone else's deleted data.
 	let data: Vec<u8> = (0..1500u32).map(|i| (i * 3) as u8).collect();
 	let leaked: &'static [u8] = Box::leak(data.clone().into_boxed_slice());
-	let img = build_exfat_nfc(&[File { path: "HELLO.TXT", data: b"Hello, FAT!" }], &[File { path: "movie.mkv", data: leaked }]);
+	let img = build_exfat_nfc(&[File { path: "HELLO.TXT", data: b"Hello, FAT!" }], &[File { path: "backup.img", data: leaked }]);
 	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
-	// HELLO.TXT's chained set follows the bitmap entry; movie.mkv's NoFatChain set
+	// HELLO.TXT's chained set follows the bitmap entry; backup.img's NoFatChain set
 	// follows it. Cut each VDL below the DataLength and restamp the checksums.
 	let root_off = (25 + 1) * 512;
 	restamp_vdl(&mut fs.dev.data, root_off + 32, 5);
@@ -1453,10 +1457,10 @@ fn a_preallocated_exfat_tail_reads_as_zeros() {
 	assert_eq!(hello.len(), 11);
 	assert_eq!(&hello[..5], b"Hello");
 	assert!(hello[5..].iter().all(|&b| b == 0), "the chained tail must read as zeros: {hello:?}");
-	let movie = fs.read_file(b"movie.mkv").unwrap();
-	assert_eq!(movie.len(), 1500);
-	assert_eq!(&movie[..700], &data[..700]);
-	assert!(movie[700..].iter().all(|&b| b == 0), "the NoFatChain tail must read as zeros");
+	let backup = fs.read_file(b"backup.img").unwrap();
+	assert_eq!(backup.len(), 1500);
+	assert_eq!(&backup[..700], &data[..700]);
+	assert!(backup[700..].iter().all(|&b| b == 0), "the NoFatChain tail must read as zeros");
 }
 
 #[test]
@@ -1494,4 +1498,58 @@ fn a_zero_length_read_reads_no_data_cluster() {
 	fs.dev.reads = 0;
 	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"");
 	assert_eq!(fs.dev.reads, 32, "only the 32-sector root region may be read");
+}
+
+#[test]
+fn a_directory_lists_with_size_zero() {
+	// The FileInfo contract: a directory reports a length of zero. The exFAT entry
+	// records the directory's DataLength there - it must not leak into the listing.
+	let mut fs = FatFs::mount(MemDisk { data: build_exfat_tree(&[], &[], &["SUB"]) }).unwrap();
+	let list = fs.list().unwrap();
+	let sub = list.iter().find(|e| e.name == "SUB").unwrap();
+	assert!(sub.is_dir);
+	assert_eq!(sub.size, 0, "a directory must list with size zero");
+}
+
+#[test]
+fn nt_case_flags_render_a_lowercase_short_name() {
+	// A short-only lowercase name is stored by the media's home systems as an
+	// uppercase 8.3 field plus the NT case flags (byte 12), not as a long-name set -
+	// the listing must render what they display.
+	let mut img = build_fat(Kind::Fat16, ROOT);
+	let root_off = 21 * 512;
+	let slot = root_off + 4 * 32; // the first free slot past ROOT's four records
+	img[slot..slot + 11].copy_from_slice(b"NOTES   TXT");
+	img[slot + 11] = 0x20;
+	img[slot + 12] = 0x18; // NT flags: lowercase base + lowercase extension
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	let listed = names(&fs.list().unwrap());
+	assert!(listed.contains(&"notes.txt".to_string()), "{listed:?}");
+	// the lookup stays case-insensitive in both directions.
+	assert_eq!(fs.read_file(b"NOTES.TXT").unwrap(), b"");
+	assert_eq!(fs.read_file(b"notes.txt").unwrap(), b"");
+}
+
+#[test]
+fn a_failed_free_of_the_old_chain_does_not_fail_a_durable_write() {
+	// Once the new content and its entry are on disk (or the entry is cleared, for a
+	// remove), the operation is durable - a device failing during the OLD chain's
+	// free must cost at most lost clusters, never a false failure.
+	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
+	let mut fs = FatFs::mount(FlakyDisk { inner, until_fail: usize::MAX, failed: true }).unwrap();
+	fs.write_file(b"OLD.BIN", &[0x22u8; 3 * 512]).unwrap();
+	// the overwrite writes the new FAT link, the data cluster, and the directory
+	// sector, then frees the old chain - fail that free's first FAT write.
+	fs.dev.failed = false;
+	fs.dev.until_fail = 3;
+	fs.write_file(b"OLD.BIN", b"new content").unwrap();
+	assert!(fs.dev.failed, "the injected failure must have fired");
+	assert_eq!(fs.read_file(b"OLD.BIN").unwrap(), b"new content");
+	// and a remove whose free fails is still a durable remove.
+	fs.write_file(b"GONE.BIN", &[0x33u8; 3 * 512]).unwrap();
+	fs.dev.failed = false;
+	fs.dev.until_fail = 1; // the directory write passes, the free's first write fails
+	fs.remove(b"GONE.BIN").unwrap();
+	assert!(fs.dev.failed, "the injected failure must have fired");
+	assert_eq!(fs.read_file(b"GONE.BIN"), Err(FsError::NotFound));
 }
