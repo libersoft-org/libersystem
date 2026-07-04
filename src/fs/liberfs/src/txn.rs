@@ -45,22 +45,27 @@ impl<D: BlockDevice> LiberFs<D> {
 		// before the barrier: the first returns claimed-but-unused blocks, the second
 		// is a transaction block write like any other.
 		self.release_run();
-		self.flush_wcsum()?;
+		if let Err(e) = self.flush_wcsum() {
+			self.abort();
+			return Err(e);
+		}
 		let sb = Superblock { num_blocks: self.num_blocks, generation: self.generation + 1, inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, root_inode: self.root_inode, snap_root: self.snap_root, snap_root_crc: self.snap_root_crc, uuid: self.uuid, label: self.label, compress: self.compress };
 		let new_slot = (self.slot + 1) % SUPER_SLOTS;
 		// barrier: the transaction's blocks must be on the medium before the superblock
-		// that references them.
+		// that references them. A failure here is still safely rolled back - the
+		// superblock has not been touched, so the medium stands on the old generation.
 		if !self.dev.flush() {
+			self.abort();
 			return Err(FsError::Io);
 		}
-		// the commit point: a single superblock write swaps the live root atomically.
-		if !self.dev.write_block(new_slot as u64, &serialize_superblock(&sb)) {
-			return Err(FsError::Io);
-		}
-		// barrier: the commit is not durable until the superblock itself is.
-		if !self.dev.flush() {
-			return Err(FsError::Io);
-		}
+		// the point of no return: once the superblock write is ATTEMPTED, the new
+		// generation may be durable no matter what the device reports (a reported
+		// failure can still have landed; a torn write is caught by the slot's
+		// self-CRC on the next mount). Rolling back here would return the fresh
+		// blocks to the pool while the medium may name them - a later transaction
+		// would overwrite a mountable generation's trees. So the in-memory state
+		// adopts the new generation either way; what a failure costs is writability.
+		let landed = self.dev.write_block(new_slot as u64, &serialize_superblock(&sb)) && self.dev.flush();
 
 		// the generation this commit superseded becomes the snapshot; its blocks stay
 		// reserved by the free map.
@@ -78,6 +83,15 @@ impl<D: BlockDevice> LiberFs<D> {
 		// so caches keyed by physical blocks must not outlive it.
 		self.decomp = None;
 		self.rcsum = None;
+		if !landed {
+			// the commit's durability is unknown (the write or the barrier after it
+			// failed): the device is failing, so degrade to read-only. The free map is
+			// never consulted for another allocation, which makes the skipped reclaim
+			// below moot - and the in-memory state matches whichever superblock a
+			// remount finds, since both name only blocks the first barrier made durable.
+			self.read_only = true;
+			return Err(FsError::Io);
+		}
 		if self.snapshots_dirty {
 			// the pinned set changed: rebuild it (and the free map) by the full walk. The
 			// commit itself already landed (the superblock is on disk); if the walk finds
@@ -137,18 +151,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.dcache.clear();
 	}
 
-	// Finish a mutation: commit on success, roll back on failure - including a failed
-	// commit (a flush or superblock write that did not land), so the in-memory roots
-	// never drift from the on-disk generation the mount still stands on.
+	// Finish a mutation: commit on success, roll back on failure. A failed commit
+	// cleans up after itself (a rollback before the superblock write, read-only
+	// adoption after it), so it is not rolled back again here.
 	pub(crate) fn finish(&mut self, r: Result<(), FsError>) -> Result<(), FsError> {
 		match r {
-			Ok(()) => {
-				let committed = self.commit();
-				if committed.is_err() {
-					self.abort();
-				}
-				committed
-			}
+			Ok(()) => self.commit(),
 			Err(e) => {
 				self.abort();
 				Err(e)
@@ -305,8 +313,14 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Read a B+tree node block, verifying it against the CRC32C its parent link stored.
 	// A mismatch is FsError::Corrupt, so on-disk damage to a tree node is caught on the
-	// live path (lookup / insert / delete / enumeration / fsck).
+	// live path (lookup / insert / delete / enumeration / fsck). A pointer outside the
+	// pool is the same damage: past the pool's end lies another partition's data on a
+	// shared device, and a checksum proves integrity, not sanity - a forged link with a
+	// matching CRC must not surface foreign bytes as tree contents.
 	pub(crate) fn read_node(&mut self, ptr: u64, crc: u32, buf: &mut [u8]) -> Result<(), FsError> {
+		if ptr >= self.num_blocks {
+			return Err(FsError::Corrupt);
+		}
 		if !self.dev.read_block(ptr, buf) {
 			return Err(FsError::Io);
 		}

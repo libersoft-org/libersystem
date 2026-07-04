@@ -558,7 +558,11 @@ fn newest_super_slot(dev: &MemDevice) -> u32 {
 		let off = slot as usize * BLOCK_SIZE + 28;
 		u64::from_le_bytes(dev.blocks[off..off + 8].try_into().unwrap())
 	};
-	if generation(1) > generation(0) { 1 } else { 0 }
+	if generation(1) > generation(0) {
+		1
+	} else {
+		0
+	}
 }
 
 #[test]
@@ -1757,7 +1761,11 @@ fn forge_superblock(dev: &mut MemDevice, slot: usize, f: impl FnOnce(&mut [u8]))
 // The slot holding the live (higher) generation in a raw device image.
 fn active_slot(dev: &MemDevice) -> usize {
 	let slot_gen = |s: usize| parse_superblock(&dev.blocks[s * BLOCK_SIZE..(s + 1) * BLOCK_SIZE]).map(|sb| sb.generation);
-	if slot_gen(1) > slot_gen(0) { 1 } else { 0 }
+	if slot_gen(1) > slot_gen(0) {
+		1
+	} else {
+		0
+	}
 }
 
 #[test]
@@ -2122,4 +2130,232 @@ fn random_corruption_never_panics_or_hangs() {
 		let _ = fs.write_file(b"probe.txt", b"probe");
 		let _ = fs.remove(b"docs/a.txt");
 	}
+}
+
+// M102: the revisit under the fs-track discipline.
+
+// A MemDevice whose flush fails once a superblock has been written: the commit's data
+// barrier passes, the commit point lands, and the durability barrier after it reports
+// failure - the device-degrading moment the commit must survive without rolling back.
+struct FailFlushDevice {
+	inner: MemDevice,
+	sb_written: bool,
+}
+
+impl BlockDevice for FailFlushDevice {
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+		self.inner.read_block(index, buf)
+	}
+
+	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+		if index < POOL_START {
+			self.sb_written = true;
+		}
+		self.inner.write_block(index, buf)
+	}
+
+	fn flush(&mut self) -> bool {
+		!self.sb_written
+	}
+}
+
+#[test]
+fn a_failed_durability_flush_adopts_the_commit_read_only() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"old.txt", b"committed").unwrap();
+	let dev = FailFlushDevice { inner: fs.into_device(), sb_written: false };
+	let mut fs = LiberFs::mount(dev).unwrap();
+
+	// the transaction's blocks and the superblock land; only the flush after the
+	// superblock reports failure. The superblock may be durable regardless of the
+	// report, so the commit must NOT roll back - a rollback would return the fresh
+	// blocks to the pool while the medium may name them, and a later transaction
+	// would overwrite a mountable generation's trees. The filesystem adopts the new
+	// generation and the failure costs writability instead.
+	assert_eq!(fs.write_file(b"new.txt", b"landed"), Err(FsError::Io));
+	assert!(fs.is_read_only(), "an uncertain commit degrades the volume to read-only");
+	assert_eq!(fs.read_file(b"new.txt").unwrap(), b"landed", "the in-memory state matches the attempted commit");
+	assert_eq!(fs.write_file(b"more.txt", b"nope"), Err(FsError::ReadOnly));
+
+	// on this device the superblock did land: a remount stands on the new
+	// generation, whole - exactly the state the mount adopted.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev.inner).unwrap();
+	assert_eq!(fs.read_file(b"new.txt").unwrap(), b"landed");
+	assert_eq!(fs.read_file(b"old.txt").unwrap(), b"committed");
+}
+
+// Solve for the four bytes at `off` of `block` such that the block's CRC32C equals
+// those bytes read back as a u32 - the fixpoint a hostile author computes offline to
+// build a chain block whose stored CRC vouches for itself. CRC32C is affine over
+// GF(2), so the fixpoint is a 32-unknown linear system, solved here by an XOR basis;
+// the map is not always invertible, so the block's last four (parser-ignored) bytes
+// are tweaked until a solvable system comes up.
+fn crc_fixpoint(block: &mut [u8], off: usize) {
+	let mut f = |x: u32, block: &mut [u8]| -> u32 {
+		block[off..off + 4].copy_from_slice(&x.to_le_bytes());
+		crc32c(block)
+	};
+	let tweak_off = block.len() - 4;
+	for t in 0u32.. {
+		block[tweak_off..tweak_off + 4].copy_from_slice(&t.to_le_bytes());
+		// want crc(block(x)) == x, i.e. (L xor I)(x) == f(0) with L the linear part.
+		let c = f(0, block);
+		let mut basis = [(0u32, 0u32); 32];
+		for i in 0..32 {
+			let mut v = f(1u32 << i, block) ^ c ^ (1u32 << i);
+			let mut m = 1u32 << i;
+			while v != 0 {
+				let lead = (31 - v.leading_zeros()) as usize;
+				if basis[lead].0 == 0 {
+					basis[lead] = (v, m);
+					break;
+				}
+				v ^= basis[lead].0;
+				m ^= basis[lead].1;
+			}
+		}
+		let mut r = c;
+		let mut x = 0u32;
+		let mut stuck = false;
+		while r != 0 {
+			let lead = (31 - r.leading_zeros()) as usize;
+			if basis[lead].0 == 0 {
+				stuck = true;
+				break;
+			}
+			r ^= basis[lead].0;
+			x ^= basis[lead].1;
+		}
+		if stuck {
+			continue;
+		}
+		f(x, block);
+		assert_eq!(crc32c(block), u32::from_le_bytes(block[off..off + 4].try_into().unwrap()));
+		return;
+	}
+	unreachable!("some tweak yields a solvable fixpoint system");
+}
+
+#[test]
+fn a_crc_consistent_snapshot_chain_cycle_terminates() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"keep.txt", b"pinned").unwrap();
+	fs.create_snapshot(b"snap").unwrap();
+	let snap_root = fs.snap_root;
+	let mut dev = fs.into_device();
+
+	// craft a self-referential chain block: next points at the block itself and the
+	// CRC field holds the block's own CRC32C (the offline fixpoint), so every step of
+	// an unbounded walk would pass its integrity check - a checksum proves integrity,
+	// not sanity. The walk must terminate by the pool bound, not hang or grow the
+	// table without limit.
+	let start = snap_root as usize * BLOCK_SIZE;
+	let block = &mut dev.blocks[start..start + BLOCK_SIZE];
+	block[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].copy_from_slice(&snap_root.to_le_bytes());
+	crc_fixpoint(block, CHAIN_CRC_OFF);
+	let crc = crc32c(&dev.blocks[start..start + BLOCK_SIZE]);
+	let slot = newest_super_slot(&dev) as usize;
+	forge_superblock(&mut dev, slot, |sb| sb[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes()));
+
+	// the mount terminates and degrades to read-only, like any snapshot-table damage.
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert!(fs.is_read_only());
+	assert_eq!(fs.read_file(b"keep.txt").unwrap(), b"pinned");
+}
+
+#[test]
+fn a_crc_consistent_spill_chain_cycle_terminates() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	write_spilled_file(&mut fs);
+	let mut dev = fs.into_device();
+
+	// the same self-vouching cycle in a file's extent overflow chain: the extent
+	// pushes stop once the inode's count is satisfied, but an unbounded walk would
+	// follow the next pointers forever on every read of the inode.
+	let mut spill = 0u64;
+	forge_inode_slot(&mut dev, |slot| {
+		spill = u64::from_le_bytes(slot[INO_MAP_OFF..INO_MAP_OFF + 8].try_into().unwrap());
+	});
+	let start = spill as usize * BLOCK_SIZE;
+	{
+		let block = &mut dev.blocks[start..start + BLOCK_SIZE];
+		block[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].copy_from_slice(&spill.to_le_bytes());
+		crc_fixpoint(block, CHAIN_CRC_OFF);
+	}
+	let chain_crc = crc32c(&dev.blocks[start..start + BLOCK_SIZE]);
+	forge_inode_slot(&mut dev, |slot| {
+		slot[INO_MAP_CRC_OFF..INO_MAP_CRC_OFF + 4].copy_from_slice(&chain_crc.to_le_bytes());
+	});
+
+	// the mount's own walk hits the cycle too (it loads every file's spill chain), so
+	// it degrades to read-only - and the read surfaces the damage instead of hanging.
+	let mut fs = LiberFs::mount(dev).expect("the mount must terminate");
+	assert_eq!(fs.read_file(b"frag.bin"), Err(FsError::Corrupt));
+}
+
+#[test]
+fn an_out_of_pool_pointer_reads_as_damage_not_foreign_bytes() {
+	// a 64-block pool on a 128-block device: the blocks past the pool stand in for
+	// another partition on a shared disk.
+	let mut fs = LiberFs::format(MemDevice::new(128), NBLOCKS).unwrap();
+	fs.write_file(b"f.bin", &noise(BLOCK_SIZE)).unwrap();
+	let mut dev = fs.into_device();
+
+	// plant "foreign partition" bytes past the pool, beside a checksum block whose
+	// first slot vouches for them - the full forgery chain, every CRC matching. The
+	// gate, not the checksums, must keep the foreign bytes from surfacing.
+	let foreign = vec![0x5Au8; BLOCK_SIZE];
+	dev.blocks[100 * BLOCK_SIZE..101 * BLOCK_SIZE].copy_from_slice(&foreign);
+	let mut cbuf = vec![0u8; BLOCK_SIZE];
+	cbuf[0..4].copy_from_slice(&crc32c(&foreign).to_le_bytes());
+	let cbuf_crc = crc32c(&cbuf);
+	dev.blocks[101 * BLOCK_SIZE..102 * BLOCK_SIZE].copy_from_slice(&cbuf);
+
+	// re-point the file's first extent at the foreign blocks.
+	forge_inode_slot(&mut dev, |slot| {
+		let ext = Extent { logical: 0, physical: 100, length: 1, csum: 101, csum_crc: cbuf_crc, store_len: 1, clen: 0 };
+		ext.write(&mut slot[EXTENT_OFF..EXTENT_OFF + EXTENT_SIZE]);
+	});
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(b"f.bin"), Err(FsError::Corrupt), "an out-of-pool run is damage, not another partition's data");
+
+	// the same gate on tree nodes: an inode root past the pool, its CRC matching the
+	// foreign bytes, must refuse as damage - a tree parse would surface them as names.
+	let mut dev = fs.into_device();
+	let slot = newest_super_slot(&dev) as usize;
+	forge_superblock(&mut dev, slot, |sb| {
+		sb[SB_INODE_ROOT_OFF..SB_INODE_ROOT_OFF + 8].copy_from_slice(&100u64.to_le_bytes());
+		sb[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].copy_from_slice(&crc32c(&foreign).to_le_bytes());
+	});
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(b"f.bin"), Err(FsError::Corrupt));
+}
+
+#[test]
+fn a_rename_over_a_damaged_empty_directory_leaks_nothing() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.mkdir(b"victim").unwrap();
+	fs.write_file(b"victim/f.txt", b"entry").unwrap();
+	fs.write_file(b"src.txt", b"mover").unwrap();
+
+	// forge the damaged-but-empty form through the crate's own machinery: size 0
+	// with a live directory tree - the shape rmdir drops defensively, and the
+	// rename replace path must drop the same way instead of leaking the nodes.
+	let victim = fs.resolve(b"victim").unwrap();
+	let dir_root = fs.read_inode(victim).unwrap().dir_root;
+	assert!(dir_root != 0, "the directory must hold a tree to leak");
+	fs.mutate(|fs| {
+		let mut inode = fs.read_inode(victim)?;
+		inode.size = 0;
+		fs.write_inode(victim, &mut inode)
+	})
+	.unwrap();
+	assert!(test_bit(&fs.free, dir_root), "the tree node is a live block before the replace");
+
+	fs.rename(b"src.txt", b"victim").unwrap();
+	assert_eq!(fs.read_file(b"victim").unwrap(), b"mover");
+	// one more commit ages the dropped blocks out (dead -> dead_prev -> reclaimed).
+	fs.write_file(b"tick.txt", b"1").unwrap();
+	assert!(!test_bit(&fs.free, dir_root), "the replaced directory's tree node is reclaimed, not leaked");
 }

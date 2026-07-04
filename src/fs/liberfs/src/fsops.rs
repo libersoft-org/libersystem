@@ -394,23 +394,34 @@ impl<D: BlockDevice> LiberFs<D> {
 
 			// clear the directory entry and free the inode in the new generation; its old
 			// blocks remain referenced by the previous generation and leave the new one.
-			if inode.kind == KIND_FILE {
-				self.drop_inode_blocks(inode)?;
-			} else if inode.dir_root != 0 {
-				// an empty directory's tree root is 0; a non-zero root here cannot hold
-				// entries, but drop its node(s) defensively.
-				let mut map = vec![0u8; self.free.len()];
-				self.mark_dir_tree(inode.dir_root, &mut map)?;
-				for b in 0..self.num_blocks {
-					if test_bit(&map, b) {
-						self.drop_block(b);
-					}
-				}
-			}
+			self.drop_deleted_inode(inode)?;
 		}
 		self.dir_remove(parent, name)?;
 		if inode.is_some() {
 			self.free_inode(inode_num)?;
+		}
+		Ok(())
+	}
+
+	// Record every block a deleted inode references as dropped: a file's data blocks
+	// and extent chain, or - defensively - the tree nodes of a directory whose root is
+	// non-zero despite the empty size the caller verified (damaged or hostile; a
+	// legitimate empty directory's root is 0). Shared by the delete and the
+	// rename-replace paths, so neither can leak what the other drops.
+	pub(crate) fn drop_deleted_inode(&mut self, inode: &Inode) -> Result<(), FsError> {
+		if inode.kind == KIND_FILE {
+			self.drop_inode_blocks(inode)?;
+		} else if inode.dir_root != 0 {
+			// mark-then-scan is O(pool) per call - accepted: this path runs only for a
+			// damaged directory (never on a healthy volume), and the marked map is the
+			// one exact answer to "which blocks does this tree hold".
+			let mut map = vec![0u8; self.free.len()];
+			self.mark_dir_tree(inode.dir_root, &mut map)?;
+			for b in 0..self.num_blocks {
+				if test_bit(&map, b) {
+					self.drop_block(b);
+				}
+			}
 		}
 		Ok(())
 	}

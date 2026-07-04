@@ -103,7 +103,16 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut ptr = self.snap_root;
 		let mut crc = self.snap_root_crc;
 		let mut block = vec![0u8; BLOCK_SIZE];
+		let mut steps = 0u64;
 		while ptr != 0 {
+			// bound the walk like `walk_chain`: a pointer outside the pool is damage,
+			// and no chain can be longer than the pool - a CRC-consistent forged cycle
+			// (checksums prove integrity, not sanity) must not hang the mount or grow
+			// the table without limit.
+			if ptr >= self.num_blocks || steps >= self.num_blocks {
+				return Err(FsError::Corrupt);
+			}
+			steps += 1;
 			if !self.dev.read_block(ptr, &mut block) {
 				return Err(FsError::Io);
 			}
@@ -311,9 +320,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if let Some(inode_t) = dest {
 			if inode_t != inode_f {
 				let ti = self.read_inode(inode_t)?;
-				if ti.kind == KIND_FILE {
-					self.drop_inode_blocks(&ti)?;
-				}
+				self.drop_deleted_inode(&ti)?;
 				self.free_inode(inode_t)?;
 			}
 		}

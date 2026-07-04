@@ -54,7 +54,16 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut ptr = inode.spill;
 		let mut crc = inode.spill_crc;
 		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut steps = 0u64;
 		while ptr != 0 {
+			// bound the walk like `walk_chain`: a pointer outside the pool is damage,
+			// and no chain can be longer than the pool - a CRC-consistent forged cycle
+			// (checksums prove integrity, not sanity) must not hang every read of the
+			// inode.
+			if ptr >= self.num_blocks || steps >= self.num_blocks {
+				return Err(FsError::Corrupt);
+			}
+			steps += 1;
 			if !self.dev.read_block(ptr, &mut buf) {
 				return Err(FsError::Io);
 			}

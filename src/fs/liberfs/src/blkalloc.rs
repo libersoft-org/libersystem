@@ -365,6 +365,18 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// file block mapping (extents)
 
+	// Gate an extent's on-medium block pointers against the pool before any read
+	// through them: past the pool's end lies another partition's data on a shared
+	// device, and a checksum proves integrity, not sanity - a forged record with a
+	// matching CRC must not surface foreign bytes as file contents. Out of pool is
+	// the damage it is: Corrupt.
+	pub(crate) fn check_extent(&self, ext: &Extent) -> Result<(), FsError> {
+		if ext.csum >= self.num_blocks || ext.stored(ext.store_len.saturating_sub(1) as u64) >= self.num_blocks {
+			return Err(FsError::Corrupt);
+		}
+		Ok(())
+	}
+
 	// Read logical block `lb` of `inode` into `buf` via its extent map, verifying
 	// the per-block checksum. Returns false (and leaves `buf` untouched) for a hole - a
 	// logical block no extent covers, which the caller reads back as zeros. A checksum
@@ -374,6 +386,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			Some(i) => inode.extents[i],
 			None => return Ok(false),
 		};
+		self.check_extent(&ext)?;
 		if ext.clen != 0 {
 			// a compressed run: serve the block from the whole extent's decompressed
 			// image, decoding once and caching it for the rest of a sequential read.
@@ -420,6 +433,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		let crc = crc32c(buf);
 		if let Some(i) = find_extent(&inode.extents, lb) {
 			let ext = inode.extents[i];
+			// the overwrite reads the run's committed checksum block: gate its pointers
+			// like every read path.
+			self.check_extent(&ext)?;
 			let off = (lb - ext.logical) as usize;
 			let old = ext.stored(off as u64);
 			// a fresh block is rewritten in place; a committed one is replaced by a
@@ -569,6 +585,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// CRC32C in the checksum block, so corruption of the compressed bytes surfaces as
 	// `FsError::Corrupt` rather than bad data.
 	pub(crate) fn decompress_extent(&mut self, ext: &Extent) -> Result<Vec<u8>, FsError> {
+		self.check_extent(ext)?;
 		let mut cbuf = vec![0u8; BLOCK_SIZE];
 		if !self.read_block_csum_aware(ext.csum, &mut cbuf) {
 			return Err(FsError::Io);
@@ -689,6 +706,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut cbuf = vec![0u8; BLOCK_SIZE];
 		for i in 0..inode.extents.len() {
 			let ext = inode.extents[i];
+			// an out-of-pool run is damage over its whole stored span.
+			if self.check_extent(&ext).is_err() {
+				bad = bad.saturating_add(ext.store_len.max(1));
+				continue;
+			}
 			if !self.read_block_csum_aware(ext.csum, &mut cbuf) {
 				return Err(FsError::Io);
 			}
@@ -729,7 +751,11 @@ pub(crate) fn clear_bit(bitmap: &mut [u8], b: u64) {
 
 pub(crate) fn test_bit(bitmap: &[u8], b: u64) -> bool {
 	let i = (b / 8) as usize;
-	if i < bitmap.len() { bitmap[i] & (1 << (b % 8)) != 0 } else { true }
+	if i < bitmap.len() {
+		bitmap[i] & (1 << (b % 8)) != 0
+	} else {
+		true
+	}
 }
 
 // Index of the extent covering logical block `lb`, or None if it falls in a hole. The
@@ -740,7 +766,11 @@ pub(crate) fn find_extent(extents: &[Extent], lb: u64) -> Option<usize> {
 	if pos == 0 {
 		return None;
 	}
-	if extents[pos - 1].covers(lb) { Some(pos - 1) } else { None }
+	if extents[pos - 1].covers(lb) {
+		Some(pos - 1)
+	} else {
+		None
+	}
 }
 
 // Hash the 4-byte prefix at `w` into an LZ_HASH_BITS-wide match-finder bucket.
