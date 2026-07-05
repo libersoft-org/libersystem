@@ -51,14 +51,15 @@ const SCSI_SYNCHRONIZE_CACHE10: u8 = 0x35;
 // StorageService instance - the same contract driver.virtio-blk serves: a request
 // is [op u32][lba u64][count u32], a read replies [status u32] + a MemoryObject of
 // the sectors, a write carries a MemoryObject in and replies [status u32], and a
-// capacity query (op 2) replies [status u32][capacity bytes u64], and a flush (op 3)
+// capacity query (op 2) replies [status u32][capacity bytes u64][max sectors u32],
+// and a flush (op 3)
 // - the write barrier, served as SCSI SYNCHRONIZE CACHE (10) - replies [status u32].
-// The per-request
-// sector cap is this driver's own: one SCSI READ(10)/WRITE(10) moves through the
-// unit's single 4 kB data page, so 8 sectors is the transfer unit here (a larger
-// unit needs a multi-page BOT data buffer - a future throughput step).
+// The data stage rides a contiguous DMA buffer grown to the request, so one
+// READ(10)/WRITE(10) moves the whole span; the only per-request bound is the
+// xHCI Normal TRB's 17-bit transfer-length field (the protocol's own limit, 64 kB
+// here as one aligned TRB), not a page unit.
 const SECTOR: u32 = 512;
-const MAX_SECTORS: u32 = 8;
+const TRB_DATA_MAX: u32 = 64 * 1024;
 const OP_READ: u32 = 0;
 const OP_WRITE: u32 = 1;
 const OP_CAPACITY: u32 = 2;
@@ -68,8 +69,9 @@ pub const STATUS_ERR: u32 = 1;
 
 // A configured USB mass-storage device (Bulk-Only Transport): the bulk IN and OUT
 // endpoints' device context indices, addresses (for stall recovery) and transfer
-// rings, the interface number (for the BOT reset), a page for the sector data (the
-// CBW/CSW frames ride in the device's scratch page), and the rolling CBW tag.
+// rings, the interface number (for the BOT reset), a growable contiguous DMA buffer
+// for the sector data (the CBW/CSW frames ride in the device's scratch page), and
+// the rolling CBW tag.
 pub struct Storage {
 	dci_in: u32,
 	dci_out: u32,
@@ -80,10 +82,38 @@ pub struct Storage {
 	ring_out: Ring,
 	data_virt: u64,
 	data_phys: u64,
+	// The data buffer's handle and size: a contiguous DMA span grown to the
+	// largest request seen (the old buffer is released when replaced).
+	data_handle: u64,
+	data_bytes: u64,
 	tag: u32,
 	// The unit's size in bytes, from READ CAPACITY at configuration - answered to
 	// OP_CAPACITY queries for the `lsblk` inventory.
 	capacity: u64,
+}
+
+impl Storage {
+	// Ensure the data buffer holds `bytes`, reallocating a larger contiguous span
+	// when a request outgrows it. False when the allocation fails.
+	unsafe fn fit_data(&mut self, bytes: u64) -> bool {
+		unsafe {
+			if bytes <= self.data_bytes {
+				return true;
+			}
+			let (handle, virt, phys): (u64, u64, u64) = match dma_buffer(bytes) {
+				Some(t) => t,
+				None => return false,
+			};
+			if self.data_handle != 0 {
+				close(self.data_handle);
+			}
+			self.data_handle = handle;
+			self.data_virt = virt;
+			self.data_phys = phys;
+			self.data_bytes = bytes;
+			true
+		}
+	}
 }
 
 // Configure the device's mass-storage function, if it has one: find a SCSI
@@ -158,8 +188,8 @@ pub unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<St
 		command_and_wait(hc, dev.in_phys, 0, TRB_CONFIGURE_ENDPOINT << 10 | dev.slot << 24)?;
 		control_nodata(hc, &mut hids, dev, 0x00, REQ_SET_CONFIGURATION, config_value, 0)?;
 
-		let (_sh, data_virt, data_phys): (u64, u64, u64) = dma_page()?;
-		let mut st: Storage = Storage { dci_in, dci_out, ep_in_addr, ep_out_addr, iface, ring_in, ring_out, data_virt, data_phys, tag: 1, capacity: 0 };
+		let (data_handle, data_virt, data_phys): (u64, u64, u64) = dma_page()?;
+		let mut st: Storage = Storage { dci_in, dci_out, ep_in_addr, ep_out_addr, iface, ring_in, ring_out, data_virt, data_phys, data_handle, data_bytes: 4096, tag: 1, capacity: 0 };
 
 		// spin the unit up: a freshly attached unit reports a power-on unit attention
 		// on its first command, cleared by reading the sense data - retry a few times.
@@ -195,7 +225,7 @@ pub unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<St
 }
 
 // Run one SCSI command over the Bulk-Only Transport: the CBW on the bulk OUT
-// endpoint, the data stage (into or out of the storage data page), and the CSW on
+// endpoint, the data stage (into or out of the storage data buffer), and the CSW on
 // the bulk IN endpoint, whose signature, tag echo and status decide the result.
 // HID events arriving during the waits are serviced inline.
 unsafe fn bot_command(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, cb: &[u8], data_len: u32, data_in: bool) -> bool {
@@ -227,7 +257,7 @@ unsafe fn bot_command(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &
 				ok = false;
 			}
 		}
-		// the data stage, on the direction's endpoint, out of the storage data page. A
+		// the data stage, on the direction's endpoint, out of the storage data buffer. A
 		// stall here is routine (the device returned less than asked): unhalt the
 		// endpoint and continue to the CSW, which still reports the command's status.
 		if ok && data_len > 0 {
@@ -285,18 +315,18 @@ unsafe fn bot_command(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &
 }
 
 // Serve one block request from the StorageService instance: [op u32][lba u64]
-// [count u32], count clamped to one DMA page. A read replies [status u32] + a
+// [count u32], count clamped to one TRB's data stage. A read replies [status u32] + a
 // MemoryObject of the sectors; a write carries a MemoryObject in and replies
 // [status u32] - the same wire contract driver.virtio-blk serves.
 pub unsafe fn serve_block_request(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, req: &[u8; 16], handle: u64) {
 	unsafe {
 		let op: u32 = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
 		let lba: u64 = u64::from_le_bytes([req[4], req[5], req[6], req[7], req[8], req[9], req[10], req[11]]);
-		let count: u32 = u32::from_le_bytes([req[12], req[13], req[14], req[15]]).clamp(1, MAX_SECTORS);
+		let count: u32 = u32::from_le_bytes([req[12], req[13], req[14], req[15]]).clamp(1, TRB_DATA_MAX / SECTOR);
 		match op {
 			OP_READ => serve_read(hc, hids, dev, st, blk_server, lba, count),
 			OP_WRITE => serve_write(hc, hids, dev, st, blk_server, lba, count, handle),
-			OP_CAPACITY => reply_capacity(blk_server, st.capacity),
+			OP_CAPACITY => reply_capacity(blk_server, st.capacity, (TRB_DATA_MAX / SECTOR) as u64),
 			OP_FLUSH => serve_flush(hc, hids, dev, st, blk_server),
 			_ => {
 				if handle != 0 {
@@ -315,6 +345,10 @@ pub unsafe fn serve_block_request(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbD
 unsafe fn serve_read(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, lba: u64, count: u32) {
 	unsafe {
 		let bytes: u64 = count as u64 * SECTOR as u64;
+		if !st.fit_data(bytes) {
+			reply_block(blk_server, STATUS_ERR, 0);
+			return;
+		}
 		let cb: [u8; 10] = read10_cb(SCSI_READ10, lba, count);
 		let mut ok: bool = bot_command(hc, hids, dev, st, &cb, bytes as u32, true);
 		if !ok {
@@ -354,7 +388,7 @@ unsafe fn serve_read(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &m
 // Write `count` sectors starting at `lba` from the transferred buffer with one
 // SCSI WRITE(10), then reply with the status and no buffer. A failed command is
 // retried once with the sense data read in between; the sense read reuses the data
-// page, so the sectors are copied in again before the retry.
+// buffer, so the sectors are copied in again before the retry.
 unsafe fn serve_write(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, lba: u64, count: u32, src_handle: u64) {
 	unsafe {
 		if src_handle == 0 {
@@ -370,6 +404,12 @@ unsafe fn serve_write(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &
 			}
 		};
 		let bytes: u64 = count as u64 * SECTOR as u64;
+		if !st.fit_data(bytes) {
+			unmap_object(src_handle);
+			close(src_handle);
+			reply_block(blk_server, STATUS_ERR, 0);
+			return;
+		}
 		let cb: [u8; 10] = read10_cb(SCSI_WRITE10, lba, count);
 		core::ptr::copy_nonoverlapping(src as *const u8, st.data_virt as *mut u8, bytes as usize);
 		let mut ok: bool = bot_command(hc, hids, dev, st, &cb, bytes as u32, false);
@@ -429,13 +469,15 @@ pub unsafe fn reply_block(blk_server: u64, status: u32, xfer: u64) {
 	}
 }
 
-// Send a capacity reply: [status u32 LE][capacity bytes u64 LE], no handle - the
-// same wire contract driver.virtio-blk serves.
-unsafe fn reply_capacity(blk_server: u64, bytes: u64) {
+// Send a capacity reply: [status u32 LE][capacity bytes u64 LE][max sectors u32 LE],
+// no handle - the same wire contract driver.virtio-blk serves; the cap here is the
+// TRB data-stage bound.
+unsafe fn reply_capacity(blk_server: u64, bytes: u64, max_sectors: u64) {
 	unsafe {
-		let mut reply: [u8; 12] = [0u8; 12];
+		let mut reply: [u8; 16] = [0u8; 16];
 		reply[..4].copy_from_slice(&STATUS_OK.to_le_bytes());
-		reply[4..].copy_from_slice(&bytes.to_le_bytes());
+		reply[4..12].copy_from_slice(&bytes.to_le_bytes());
+		reply[12..16].copy_from_slice(&(max_sectors.min(u32::MAX as u64) as u32).to_le_bytes());
 		send_blocking(blk_server, &reply, 0);
 	}
 }

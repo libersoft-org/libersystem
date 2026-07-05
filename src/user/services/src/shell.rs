@@ -718,6 +718,17 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		if line.is_empty() {
 			return false;
 		}
+		// `time <command>` dispatches the command and prints its wall time from the
+		// monotonic clock - the measuring instrument for throughput work (a foreground
+		// tool runs to completion inside the dispatch, so the time covers it whole).
+		if let Some(rest) = line.strip_prefix(b"time ") {
+			let t0: u64 = clock_ns();
+			let quit: bool = dispatch(trim(rest), storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, jobs, vars, cwd);
+			let us: u64 = (clock_ns() - t0) / 1_000;
+			let line: String = alloc::format!("time: {}.{:03} s\n", us / 1_000_000, us % 1_000_000 / 1_000);
+			print(line.as_bytes());
+			return quit;
+		}
 		if line == b"env" {
 			// List the environment the way `env` does, one `NAME=VALUE` per line, from the cache.
 			for (name, value) in vars.iter() {

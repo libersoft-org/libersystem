@@ -2633,6 +2633,7 @@ impl Neighbor {
 pub struct NetInfo {
 	pub addr: Ipv4Addr,
 	pub mac: Vec<u8>,
+	pub mtu: u16,
 	pub gateway: Ipv4Addr,
 	pub neighbors: Vec<Neighbor>,
 }
@@ -2660,6 +2661,7 @@ impl NetInfo {
 		for v85 in self.mac.iter() {
 			w.u8(*v85)?;
 		}
+		w.u16(self.mtu)?;
 		self.gateway.write(w)?;
 		if self.neighbors.len() > u16::MAX as usize {
 			return None;
@@ -2680,6 +2682,7 @@ impl NetInfo {
 			}
 			v88
 		};
+		let mtu = r.u16()?;
 		let gateway = Ipv4Addr::read(r)?;
 		let neighbors = {
 			let v89 = r.u16()? as usize;
@@ -2689,7 +2692,7 @@ impl NetInfo {
 			}
 			v90
 		};
-		Some(NetInfo { addr, mac, gateway, neighbors })
+		Some(NetInfo { addr, mac, mtu, gateway, neighbors })
 	}
 }
 
@@ -7197,6 +7200,9 @@ impl NetInfo {
 		}
 		out.push(']');
 		out.push(',');
+		out.push_str("\"mtu\":");
+		let _ = write!(out, "{}", self.mtu);
+		out.push(',');
 		out.push_str("\"gateway\":");
 		self.gateway.to_json_into(out);
 		out.push(',');
@@ -7230,6 +7236,9 @@ impl NetInfo {
 		}
 		out.push(']');
 		out.push_str(", ");
+		out.push_str("mtu=");
+		let _ = write!(out, "{}", self.mtu);
+		out.push_str(", ");
 		out.push_str("gateway=");
 		self.gateway.to_text_into(out);
 		out.push_str(", ");
@@ -7247,7 +7256,7 @@ impl NetInfo {
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "addr");
 		self.addr.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mac");
@@ -7255,6 +7264,8 @@ impl NetInfo {
 		for v233 in self.mac.iter() {
 			crate::codec::cbor::uint(out, *v233 as u64);
 		}
+		crate::codec::cbor::text(out, "mtu");
+		crate::codec::cbor::uint(out, self.mtu as u64);
 		crate::codec::cbor::text(out, "gateway");
 		self.gateway.to_cbor_into(out);
 		crate::codec::cbor::text(out, "neighbors");
@@ -8823,9 +8834,9 @@ mod compat {
 	}
 	#[test]
 	fn net_info_wire_is_stable() {
-		let sample = NetInfo { addr: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, mac: alloc::vec![7], gateway: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, neighbors: alloc::vec![Neighbor { addr: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, mac: alloc::vec![7] }] };
+		let sample = NetInfo { addr: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, mac: alloc::vec![7], mtu: 7, gateway: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, neighbors: alloc::vec![Neighbor { addr: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, mac: alloc::vec![7] }] };
 		let bytes = sample.encode_vec();
-		let golden: &[u8] = &[7, 7, 7, 7, 1, 0, 7, 7, 7, 7, 7, 1, 0, 7, 7, 7, 7, 1, 0, 7];
+		let golden: &[u8] = &[7, 7, 7, 7, 1, 0, 7, 7, 0, 7, 7, 7, 7, 1, 0, 7, 7, 7, 7, 1, 0, 7];
 		assert_eq!(bytes, golden);
 		assert_eq!(NetInfo::decode(&bytes).unwrap(), sample);
 	}

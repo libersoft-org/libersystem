@@ -31,7 +31,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	exit();
 }
 
-// Query and render the interface state: our address, MAC, gateway, and neighbors.
+// Query and render the interface state: our address, MAC, MTU, gateway, and
+// neighbors.
 unsafe fn show(netsvc: u64) {
 	unsafe {
 		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
@@ -43,6 +44,9 @@ unsafe fn show(netsvc: u64) {
 				print(&tmp[..n]);
 				print(b"  mac ");
 				let n: usize = write_mac(&info.mac, &mut tmp);
+				print(&tmp[..n]);
+				print(b"  mtu ");
+				let n: usize = write_dec(info.mtu as u64, &mut tmp);
 				print(&tmp[..n]);
 				print(b"  gateway ");
 				let n: usize = info.gateway.render(&mut tmp);
@@ -65,4 +69,22 @@ unsafe fn show(netsvc: u64) {
 			None => print(b"ip: service unavailable\n"),
 		}
 	}
+}
+
+// Render a decimal number into `out`, returning the rendered length.
+fn write_dec(mut v: u64, out: &mut [u8]) -> usize {
+	let mut digits: [u8; 20] = [0u8; 20];
+	let mut n: usize = 0;
+	loop {
+		digits[n] = b'0' + (v % 10) as u8;
+		v /= 10;
+		n += 1;
+		if v == 0 {
+			break;
+		}
+	}
+	for i in 0..n {
+		out[i] = digits[n - 1 - i];
+	}
+	n
 }

@@ -54,7 +54,7 @@ fn region_kind(entry_type: EntryType) -> u32 {
 
 pub fn init(memory_map: &MemoryMapResponse, hhdm: u64) {
 	HHDM_OFFSET.store(hhdm, Ordering::Relaxed);
-	frame::init(memory_map, hhdm);
+	frame::init(memory_map);
 	heap::init();
 	// The heap is up now, so the map can be retained (Vec) for runtime inspection.
 	let mut retained = MEMMAP.lock();

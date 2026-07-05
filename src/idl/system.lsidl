@@ -296,11 +296,13 @@ record neighbor {
 	mac:  list<u8>,
 }
 
-// The interface's L3 state: our address, our MAC (6 bytes), the gateway, and the
-// neighbor cache - the typed form of what the `ip` / `net` command renders.
+// The interface's L3 state: our address, our MAC (6 bytes), the interface MTU,
+// the gateway, and the neighbor cache - the typed form of what the `ip` / `net`
+// command renders.
 record net-info {
-	addr:      ipv4-addr,
-	mac:       list<u8>,
+    addr:      ipv4-addr,
+    mac:       list<u8>,
+    mtu:       u16,
 	gateway:   ipv4-addr,
 	neighbors: list<neighbor>,
 }

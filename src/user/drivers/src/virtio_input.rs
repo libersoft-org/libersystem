@@ -84,11 +84,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		// this queue is interrupt-driven (the device pushes events to us).
 		eventq.enable_interrupts();
-		let (_pool, pool_virt, pool_phys): (u64, u64, u64) = match dma_buffer(4096) {
+		// one event buffer per ring slot, so the pool is sized by the negotiated
+		// ring - the device fills any slot it likes.
+		let slots: u16 = eventq.size();
+		let (_pool, pool_virt, pool_phys): (u64, u64, u64) = match dma_buffer(slots as u64 * EVENT_SIZE) {
 			Some(t) => t,
 			None => exit(),
 		};
-		let slots: u16 = eventq.size();
 		let mut id: u16 = 0;
 		while id < slots {
 			eventq.post_recv(id, pool_phys + id as u64 * EVENT_SIZE, EVENT_SIZE as u32);

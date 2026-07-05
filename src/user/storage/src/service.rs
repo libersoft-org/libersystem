@@ -61,9 +61,12 @@ const USB_VOLUME: &[u8] = b"usb";
 // block-service protocol with driver.virtio-blk: request [op u32][lba u64][count u32]
 // where op 0 = read, 1 = write. A read replies [status u32] carrying a MemoryObject
 // of count*512 bytes; a write transfers a MemoryObject of count*512 bytes and replies
-// [status u32]. A single request moves at most one DMA page (8 sectors).
+// [status u32]. The capacity reply carries the most sectors the driver moves per
+// request, so this service sizes its requests to the driver it talks to -
+// MAX_SECTORS_FALLBACK (one DMA page) stands in for an old driver whose capacity
+// reply lacks the field.
 const SECTOR_SIZE: usize = 512;
-const MAX_SECTORS_PER_READ: usize = 8;
+const MAX_SECTORS_FALLBACK: u32 = 8;
 const OP_READ: u32 = 0;
 const OP_WRITE: u32 = 1;
 const OP_CAPACITY: u32 = 2;
@@ -79,12 +82,12 @@ const SECTORS_PER_BLOCK: u64 = (liberfs::BLOCK_SIZE / SECTOR_SIZE) as u64;
 const FS_START_SECTOR: u64 = 32768;
 const FS_BLOCKS: u64 = 8192;
 
-// An ISO9660 logical block (2048 bytes) is this many 512-byte disk sectors; one read
-// stays within a single DMA page (8 sectors).
+// An ISO9660 logical block (2048 bytes) is this many 512-byte disk sectors; one
+// logical block is one read.
 const ISO_SECTORS: u64 = (iso9660::SECTOR_SIZE / SECTOR_SIZE) as u64;
 
-// A UDF logical block (2048 bytes) is this many 512-byte disk sectors; one read stays
-// within a single DMA page (8 sectors).
+// A UDF logical block (2048 bytes) is this many 512-byte disk sectors; one logical
+// block is one read.
 const UDF_SECTORS: u64 = (udf::SECTOR_SIZE / SECTOR_SIZE) as u64;
 
 #[unsafe(no_mangle)]
@@ -682,6 +685,9 @@ struct ChannelBlockDevice {
 	base: u64,
 	// The container's size in filesystem blocks: the first index out of bounds.
 	limit: u64,
+	// The most sectors the driver moves per request (from its capacity reply);
+	// `read_blocks` chunks a longer span by it.
+	max_sectors: u32,
 }
 
 impl BlockDevice for ChannelBlockDevice {
@@ -691,6 +697,25 @@ impl BlockDevice for ChannelBlockDevice {
 		}
 		let lba: u64 = self.base + index * SECTORS_PER_BLOCK;
 		unsafe { block_read(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_mut_ptr()) }
+	}
+
+	fn read_blocks(&mut self, index: u64, count: u64, buf: &mut [u8]) -> bool {
+		if index + count > self.limit {
+			return false;
+		}
+		// a contiguous extent run in as few requests as the driver's cap allows.
+		let per: u64 = (self.max_sectors as u64 / SECTORS_PER_BLOCK).max(1);
+		let mut done: u64 = 0;
+		while done < count {
+			let n: u64 = (count - done).min(per);
+			let lba: u64 = self.base + (index + done) * SECTORS_PER_BLOCK;
+			let dst: &mut [u8] = &mut buf[done as usize * liberfs::BLOCK_SIZE..];
+			if !unsafe { block_read(self.chan, lba, (n * SECTORS_PER_BLOCK) as u32, dst.as_mut_ptr()) } {
+				return false;
+			}
+			done += n;
+		}
+		true
 	}
 
 	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
@@ -765,10 +790,11 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 		Some((first, last)) => (first, (last - first + 1) / SECTORS_PER_BLOCK),
 		None => (FS_START_SECTOR, unsafe { disk_pool_blocks(block_client) }),
 	};
+	let max_sectors: u32 = unsafe { block_request_sectors(block_client) };
 	// an existing filesystem (files persisted from a previous boot) mounts as-is, at
 	// the size recorded in its superblock - never silently grown, the free map would
 	// not match. A volume smaller than its container allows is reported.
-	if let Some(fs) = LiberFs::mount(ChannelBlockDevice { chan: block_client, base, limit: pool }) {
+	if let Some(fs) = LiberFs::mount(ChannelBlockDevice { chan: block_client, base, limit: pool, max_sectors }) {
 		if fs.num_blocks() != pool {
 			unsafe {
 				print(b"storage: vol://system spans less than the disk allows (formatted earlier; online resize is future work)\n");
@@ -788,10 +814,10 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 	// "system" label; compression starts off, togglable later via `set-compression`.
 	let uuid: [u8; 16] = unsafe { stir_uuid() };
 	let opts: FormatOpts = FormatOpts { uuid, label: b"system".to_vec(), compress: false };
-	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format_opts(ChannelBlockDevice { chan: block_client, base, limit: pool }, pool, opts).ok()?;
+	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format_opts(ChannelBlockDevice { chan: block_client, base, limit: pool, max_sectors }, pool, opts).ok()?;
 	// stamp real time before seeding, so the factory files carry a real ctime/mtime.
 	fs.set_clock(unsafe { clock_rtc() });
-	if let Some(archive) = unsafe { read_seed_archive(block_client) } {
+	if let Some(archive) = unsafe { read_seed_archive(block_client, max_sectors) } {
 		seed_from_archive(&mut fs, &archive);
 	}
 	Some(fs)
@@ -908,16 +934,18 @@ fn seed_from_archive(fs: &mut LiberFs<ChannelBlockDevice>, archive: &[u8]) {
 
 // Read the factory PKGARCH1 archive off the virtio-blk disk at LBA 0 into a Vec,
 // leaving `block_client` open for the filesystem. The header + entry table may span
-// several sectors now that the program binaries are staged, so the whole archive is read
-// in page-sized (8-sector) chunks - each request moves at most one DMA page. Returns
+// several sectors now that the program binaries are staged, so the whole archive is
+// read in chunks of the driver's own per-request cap (`max_sectors`). Returns
 // None if the disk holds no archive. The header's claims (the entry count, each blob's
 // end) are DISK CONTENT sizing an in-memory buffer, and this path runs exactly on a
 // disk without a valid filesystem - the least trustworthy disk there is: every claim
 // is bounded by the seed region's fixed size (the filesystem starts right past it),
 // and a claim beyond it means "no archive", never an allocation.
-unsafe fn read_seed_archive(block_client: u64) -> Option<Vec<u8>> {
+unsafe fn read_seed_archive(block_client: u64, max_sectors: u32) -> Option<Vec<u8>> {
 	unsafe {
-		const PAGE: usize = SECTOR_SIZE * MAX_SECTORS_PER_READ;
+		// the driver's per-request cap bounds each chunk, and 1 MB bounds the chunk
+		// (a driver reporting no practical limit must not size this buffer).
+		let chunk: usize = SECTOR_SIZE * max_sectors.min(2048) as usize;
 		const SEED_REGION_BYTES: usize = FS_START_SECTOR as usize * SECTOR_SIZE;
 		// `total` starts large enough to reach the entry count, grows to cover the whole
 		// entry table, then becomes the end of the last blob.
@@ -926,17 +954,17 @@ unsafe fn read_seed_archive(block_client: u64) -> Option<Vec<u8>> {
 		let mut table_end: usize = 0;
 		let mut filled: usize = 0;
 		while filled < total {
-			let want: usize = ((total + PAGE - 1) / PAGE) * PAGE;
+			let want: usize = ((total + chunk - 1) / chunk) * chunk;
 			if archive.len() < want {
 				archive.resize(want, 0);
 			}
 			let lba: u64 = (filled / SECTOR_SIZE) as u64;
-			if !block_read(block_client, lba, MAX_SECTORS_PER_READ as u32, archive.as_mut_ptr().add(filled)) {
+			if !block_read(block_client, lba, (chunk / SECTOR_SIZE) as u32, archive.as_mut_ptr().add(filled)) {
 				return None;
 			}
-			filled += PAGE;
+			filled += chunk;
 			if table_end == 0 {
-				// the first page carries the magic and the entry count.
+				// the first chunk carries the magic and the entry count.
 				if &archive[..PKG_MAGIC.len()] != PKG_MAGIC {
 					return None;
 				}
@@ -1014,7 +1042,8 @@ unsafe fn read_buffer(data: &Buffer) -> Option<Vec<u8>> {
 }
 
 // Send one capacity query [op=2][0 u64][0 u32] to the driver and return the disk's
-// size in bytes. The reply is [status u32][capacity bytes u64], no buffer. `again`
+// size in bytes. The reply is [status u32][capacity bytes u64][max sectors u32] (the
+// trailing per-request cap is read by `block_request_sectors`). `again`
 // when the driver (or its disk) cannot answer.
 unsafe fn block_capacity(block_client: u64) -> Result<u64, Error> {
 	unsafe {
@@ -1027,6 +1056,27 @@ unsafe fn block_capacity(block_client: u64) -> Result<u64, Error> {
 		match recv_blocking(block_client, &mut rep) {
 			Received::Message { len, handle } if len >= 12 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => Ok(u64::from_le_bytes([rep[4], rep[5], rep[6], rep[7], rep[8], rep[9], rep[10], rep[11]])),
 			_ => Err(Error::Again),
+		}
+	}
+}
+
+// Ask the driver how many sectors one request may move: the capacity reply's
+// trailing [max sectors u32] field. MAX_SECTORS_FALLBACK (one DMA page) for a
+// driver whose reply lacks the field, so an old driver still serves.
+unsafe fn block_request_sectors(block_client: u64) -> u32 {
+	unsafe {
+		let mut req: [u8; 16] = [0u8; 16];
+		req[..4].copy_from_slice(&OP_CAPACITY.to_le_bytes());
+		if !send_blocking(block_client, &req, 0) {
+			return MAX_SECTORS_FALLBACK;
+		}
+		let mut rep: [u8; 16] = [0u8; 16];
+		match recv_blocking(block_client, &mut rep) {
+			Received::Message { len, handle } if len >= 16 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => {
+				let max: u32 = u32::from_le_bytes([rep[12], rep[13], rep[14], rep[15]]);
+				if max == 0 { MAX_SECTORS_FALLBACK } else { max }
+			}
+			_ => MAX_SECTORS_FALLBACK,
 		}
 	}
 }

@@ -78,6 +78,9 @@ const IPV4_HDR: usize = 20;
 const ICMP_HDR: usize = 8;
 const UDP_HDR: usize = 8;
 const TCP_HDR: usize = 20;
+// What the Ethernet + IPv4 + TCP headers take out of a frame - what remains of the
+// frame buffer is the largest single TCP segment payload.
+pub const TCP_SEGMENT_OVERHEAD: usize = ETH_HDR + IPV4_HDR + TCP_HDR;
 
 // ICMP echo payload size (bytes). 56 matches the ping default, so the on-wire
 // packet is 84 bytes (20 IP + 8 ICMP + 56) and a reply reports the familiar 64
@@ -91,11 +94,15 @@ const TCP_RST: u8 = 0x04;
 const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
 
-// The receive buffer / advertised window for one TCP connection: 65535 is the most
-// a TCP header's 16-bit window field can advertise without window scaling (adding
-// the WS option is the future step beyond this, as autotuned buffers are).
-// The buffer lives inside the heap-pooled connection state.
-const TCP_RX_MAX: usize = 65535;
+// The receive buffer / advertised window for one TCP connection. Without window
+// scaling the header's 16-bit window field caps the advertisement at 65535 bytes
+// per round-trip; the WS option (RFC 7323), negotiated on connect and accept,
+// lifts it - a connection whose peer offered the option grows its buffer to the
+// scaled size and advertises the free space shifted right by our scale. The
+// buffer lives inside the heap-pooled connection state.
+const TCP_RX_BASE: usize = 65535;
+const TCP_WS_SHIFT: u8 = 2;
+const TCP_RX_SCALED: usize = TCP_RX_BASE << TCP_WS_SHIFT;
 
 // The initial TCP connection pool size: outbound `connect`s and inbound accepted
 // connections share the pool, which grows on demand - a size hint, never a cap.
@@ -207,6 +214,32 @@ fn tcp_checksum(src: Ipv4Addr, dst: Ipv4Addr, seg: &[u8]) -> u16 {
 	!(sum as u16)
 }
 
+// Whether the TCP options of the segment (a SYN or SYN-ACK) carry the window-scale
+// option (kind 3, RFC 7323). We ignore the peer's shift value itself - the stack
+// tracks no send window - so the option's presence is all that matters: it licenses
+// scaling our own advertised window.
+fn peer_offers_ws(tcp: &[u8]) -> bool {
+	let data_off: usize = ((tcp[12] >> 4) as usize) * 4;
+	if data_off < TCP_HDR || data_off > tcp.len() {
+		return false;
+	}
+	let mut i: usize = TCP_HDR;
+	while i < data_off {
+		match tcp[i] {
+			0 => return false,
+			1 => i += 1,
+			3 => return true,
+			_ => {
+				if i + 1 >= data_off || tcp[i + 1] < 2 {
+					return false;
+				}
+				i += tcp[i + 1] as usize;
+			}
+		}
+	}
+	false
+}
+
 // One entry of the small ARP neighbor cache (IPv4 -> MAC).
 #[derive(Clone, Copy)]
 struct Neigh {
@@ -308,15 +341,19 @@ struct TcpConn {
 	snd_nxt: u32,
 	// Receive sequence: the next in-order byte we expect.
 	rcv_nxt: u32,
+	// Our window scale (RFC 7323): TCP_WS_SHIFT when the peer offered the WS option
+	// in its SYN, 0 otherwise (scaling only applies when both sides sent it).
+	rcv_wscale: u8,
 	// Received in-order data waiting to be read, and how much. Heap-allocated (the
-	// 64 kB window must never sit on a 16 kB user stack).
+	// window must never sit on a 16 kB user stack); grown to the scaled size when
+	// window scaling is negotiated, shrunk back when the slot is freed.
 	rx: Vec<u8>,
 	rx_len: usize,
 }
 
 impl TcpConn {
 	fn closed() -> TcpConn {
-		TcpConn { in_use: false, state: TcpState::Closed, aborted: false, peer_fin: false, pending_accept: false, local_port: 0, remote_ip: Ipv4Addr([0; 4]), remote_port: 0, remote_mac: MacAddr::ZERO, snd_una: 0, snd_nxt: 0, rcv_nxt: 0, rx: alloc::vec![0; TCP_RX_MAX], rx_len: 0 }
+		TcpConn { in_use: false, state: TcpState::Closed, aborted: false, peer_fin: false, pending_accept: false, local_port: 0, remote_ip: Ipv4Addr([0; 4]), remote_port: 0, remote_mac: MacAddr::ZERO, snd_una: 0, snd_nxt: 0, rcv_nxt: 0, rcv_wscale: 0, rx: alloc::vec![0; TCP_RX_BASE], rx_len: 0 }
 	}
 }
 
@@ -349,6 +386,9 @@ pub struct Stack {
 	mask: Ipv4Addr,
 	gateway: Ipv4Addr,
 	dns: Ipv4Addr,
+	// The interface MTU the frame buffers were sized by (the smaller of the link's
+	// report and the `net.mtu` knob) - rendered by `ip`, bounds a TCP segment.
+	mtu: u16,
 	neigh: Vec<Neigh>,
 	conns: Vec<TcpConn>,
 	// The ports we accept inbound connections on (passive open); 0 = unused slot.
@@ -361,16 +401,21 @@ pub struct Stack {
 }
 
 impl Stack {
-	pub fn new(mac: MacAddr, ip: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr, dns: Ipv4Addr, neigh_cap: usize) -> Stack {
+	pub fn new(mac: MacAddr, ip: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr, dns: Ipv4Addr, neigh_cap: usize, mtu: u16) -> Stack {
 		let mut conns: Vec<TcpConn> = Vec::with_capacity(TCP_CONN_MAX);
 		for _ in 0..TCP_CONN_MAX {
 			conns.push(TcpConn::closed());
 		}
-		Stack { mac, ip, mask, gateway, dns, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listen_ports: alloc::vec![0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
+		Stack { mac, ip, mask, gateway, dns, mtu, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listen_ports: alloc::vec![0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
 	}
 
 	pub fn mac(&self) -> MacAddr {
 		self.mac
+	}
+
+	// The interface MTU the stack was built with.
+	pub fn mtu(&self) -> u16 {
+		self.mtu
 	}
 
 	pub fn ip(&self) -> Ipv4Addr {
@@ -525,6 +570,9 @@ impl Stack {
 	}
 
 	// Handle an IPv4 packet addressed to us; ICMP, UDP (DNS), and TCP are processed.
+	// The frame is trimmed to the IP header's total length first: a short IP packet
+	// rides a minimum-size (60-byte) Ethernet frame whose padding would otherwise
+	// read as protocol payload - a bare ACK's padding once advanced a TCP window.
 	fn on_ipv4(&mut self, frame: &[u8], out: &mut [u8]) -> Outcome {
 		let ip: &[u8] = &frame[ETH_HDR..];
 		if ip.len() < IPV4_HDR || ip[0] >> 4 != 4 {
@@ -534,6 +582,12 @@ impl Stack {
 		if ihl < IPV4_HDR || ip.len() < ihl {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
+		let total: usize = be16(ip, 2) as usize;
+		if total < ihl || ip.len() < total {
+			return Outcome { reply_len: 0, event: Event::None };
+		}
+		let frame: &[u8] = &frame[..ETH_HDR + total];
+		let ip: &[u8] = &frame[ETH_HDR..];
 		let dst_ip: Ipv4Addr = Ipv4Addr([ip[16], ip[17], ip[18], ip[19]]);
 		let proto: u8 = ip[9];
 		// Accept packets addressed to us, plus limited-broadcast UDP - so the DHCP
@@ -592,7 +646,8 @@ impl Stack {
 				let flags: u8 = tcp[13];
 				if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 && self.is_listening(dst_port) {
 					let seg_seq: u32 = be32(tcp, 4);
-					return self.passive_open(frame, src_ip, src_port, dst_port, seg_seq, out);
+					let peer_ws: bool = peer_offers_ws(tcp);
+					return self.passive_open(frame, src_ip, src_port, dst_port, seg_seq, peer_ws, out);
 				}
 				return Outcome { reply_len: 0, event: Event::None };
 			}
@@ -611,12 +666,18 @@ impl Stack {
 			self.conns[ci].aborted = true;
 			return Outcome { reply_len: 0, event: Event::None };
 		}
-		// Complete the handshake: a SYN-ACK acknowledging our SYN.
+		// Complete the handshake: a SYN-ACK acknowledging our SYN. The peer echoing
+		// the WS option arms window scaling: the receive buffer grows to the scaled
+		// size and later segments advertise the shifted window.
 		if self.conns[ci].state == TcpState::SynSent {
 			if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 && seg_ack == self.conns[ci].snd_nxt {
 				self.conns[ci].rcv_nxt = seg_seq.wrapping_add(1);
 				self.conns[ci].snd_una = seg_ack;
 				self.conns[ci].state = TcpState::Established;
+				if peer_offers_ws(tcp) {
+					self.conns[ci].rcv_wscale = TCP_WS_SHIFT;
+					self.conns[ci].rx.resize(TCP_RX_SCALED, 0);
+				}
 				let len: usize = self.build_tcp(ci, TCP_ACK, self.conns[ci].snd_nxt, self.conns[ci].rcv_nxt, &[], out);
 				return Outcome { reply_len: len, event: Event::None };
 			}
@@ -638,11 +699,14 @@ impl Stack {
 		if flags & TCP_ACK != 0 && seq_gt(seg_ack, self.conns[ci].snd_una) && seq_le(seg_ack, self.conns[ci].snd_nxt) {
 			self.conns[ci].snd_una = seg_ack;
 		}
-		// Accept in-order data into the receive buffer (bounded by the window).
+		// Accept in-order data into the receive buffer (bounded by the window). Data
+		// at the expected sequence is acknowledged even when the buffer is full and
+		// nothing was consumed - the ACK re-advertises the current window, which is
+		// also what answers a peer's zero-window probe.
 		let mut progressed: bool = false;
 		if !payload.is_empty() && seg_seq == self.conns[ci].rcv_nxt {
 			let rx_len: usize = self.conns[ci].rx_len;
-			let n: usize = payload.len().min(TCP_RX_MAX - rx_len);
+			let n: usize = payload.len().min(self.conns[ci].rx.len() - rx_len);
 			self.conns[ci].rx[rx_len..rx_len + n].copy_from_slice(&payload[..n]);
 			self.conns[ci].rx_len += n;
 			self.conns[ci].rcv_nxt = self.conns[ci].rcv_nxt.wrapping_add(n as u32);
@@ -675,8 +739,10 @@ impl Stack {
 
 	// Open an inbound connection from a SYN to a listening port: allocate a pool slot,
 	// record the peer (its address and source MAC), enter SynRcvd, and build the SYN-ACK
-	// into `out`. No reply if the pool is full.
-	fn passive_open(&mut self, frame: &[u8], src_ip: Ipv4Addr, src_port: u16, dst_port: u16, seg_seq: u32, out: &mut [u8]) -> Outcome {
+	// (carrying our MSS and, when the peer offered it, the WS option) into `out`. No
+	// reply if the pool is full.
+	#[allow(clippy::too_many_arguments)]
+	fn passive_open(&mut self, frame: &[u8], src_ip: Ipv4Addr, src_port: u16, dst_port: u16, seg_seq: u32, peer_ws: bool, out: &mut [u8]) -> Outcome {
 		let ci: usize = match self.tcp_alloc() {
 			Some(i) => i,
 			None => return Outcome { reply_len: 0, event: Event::None },
@@ -694,36 +760,63 @@ impl Stack {
 		c.snd_una = iss;
 		c.snd_nxt = iss.wrapping_add(1);
 		c.rx_len = 0;
+		if peer_ws {
+			c.rcv_wscale = TCP_WS_SHIFT;
+			c.rx.resize(TCP_RX_SCALED, 0);
+		}
 		let snd: u32 = self.conns[ci].snd_una;
 		let rcv: u32 = self.conns[ci].rcv_nxt;
-		let len: usize = self.build_tcp(ci, TCP_SYN | TCP_ACK, snd, rcv, &[], out);
+		let opts: [u8; 8] = self.syn_options();
+		let len: usize = self.build_tcp_opts(ci, TCP_SYN | TCP_ACK, snd, rcv, if peer_ws { &opts } else { &opts[..4] }, &[], out);
 		Outcome { reply_len: len, event: Event::None }
+	}
+
+	// The TCP options our SYN and SYN-ACK carry: MSS (what a segment to us may carry,
+	// the MTU minus the IP and TCP headers) and the WS option with our shift, NOP-padded
+	// to a 4-byte boundary. A SYN-ACK answering a peer without WS truncates to the MSS
+	// half (scaling only applies when both sides sent the option).
+	fn syn_options(&self) -> [u8; 8] {
+		let mss: u16 = self.mtu.saturating_sub((IPV4_HDR + TCP_HDR) as u16);
+		[2, 4, (mss >> 8) as u8, mss as u8, 3, 3, TCP_WS_SHIFT, 1]
 	}
 
 	// Build an Ethernet + IPv4 + TCP segment to connection `ci`'s peer with `flags`,
 	// sequence `seq`, acknowledgement `ack`, and `payload`, into `out`, returning its
 	// length (0 if it does not fit). No TCP options are emitted (a 20-byte header).
 	fn build_tcp(&self, ci: usize, flags: u8, seq: u32, ack: u32, payload: &[u8], out: &mut [u8]) -> usize {
-		let total: usize = IPV4_HDR + TCP_HDR + payload.len();
+		self.build_tcp_opts(ci, flags, seq, ack, &[], payload, out)
+	}
+
+	// `build_tcp` with TCP options: `opts` follows the fixed header (its length must
+	// be a multiple of 4, NOP-padded by the caller) and widens the data offset. The
+	// advertised window is the receive buffer's free space shifted right by the
+	// connection's window scale - except on a SYN, where the field is never scaled.
+	#[allow(clippy::too_many_arguments)]
+	fn build_tcp_opts(&self, ci: usize, flags: u8, seq: u32, ack: u32, opts: &[u8], payload: &[u8], out: &mut [u8]) -> usize {
+		let hdr: usize = TCP_HDR + opts.len();
+		let total: usize = IPV4_HDR + hdr + payload.len();
 		if ETH_HDR + total > out.len() {
 			return 0;
 		}
-		out[0..6].copy_from_slice(&self.conns[ci].remote_mac.0);
+		let c: &TcpConn = &self.conns[ci];
+		let window: usize = if flags & TCP_SYN != 0 { c.rx.len() } else { (c.rx.len() - c.rx_len) >> c.rcv_wscale };
+		out[0..6].copy_from_slice(&c.remote_mac.0);
 		out[6..12].copy_from_slice(&self.mac.0);
 		put16(out, 12, ETHERTYPE_IPV4);
-		// TCP header + payload.
+		// TCP header + options + payload.
 		let t: usize = ETH_HDR + IPV4_HDR;
-		put16(out, t, self.conns[ci].local_port);
-		put16(out, t + 2, self.conns[ci].remote_port);
+		put16(out, t, c.local_port);
+		put16(out, t + 2, c.remote_port);
 		put32(out, t + 4, seq);
 		put32(out, t + 8, ack);
-		out[t + 12] = (TCP_HDR as u8 / 4) << 4;
+		out[t + 12] = (hdr as u8 / 4) << 4;
 		out[t + 13] = flags;
-		put16(out, t + 14, TCP_RX_MAX as u16);
+		put16(out, t + 14, window.min(65535) as u16);
 		put16(out, t + 16, 0);
 		put16(out, t + 18, 0);
-		out[t + TCP_HDR..t + TCP_HDR + payload.len()].copy_from_slice(payload);
-		let tcp_csum: u16 = tcp_checksum(self.ip, self.conns[ci].remote_ip, &out[t..t + TCP_HDR + payload.len()]);
+		out[t + TCP_HDR..t + hdr].copy_from_slice(opts);
+		out[t + hdr..t + hdr + payload.len()].copy_from_slice(payload);
+		let tcp_csum: u16 = tcp_checksum(self.ip, c.remote_ip, &out[t..t + hdr + payload.len()]);
 		put16(out, t + 16, tcp_csum);
 		// IPv4 header.
 		let ip: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + IPV4_HDR];
@@ -772,6 +865,11 @@ impl Stack {
 		c.peer_fin = false;
 		c.pending_accept = false;
 		c.rx_len = 0;
+		c.rcv_wscale = 0;
+		// a scaled buffer shrinks back to the base size so idle slots stay small.
+		if c.rx.len() > TCP_RX_BASE {
+			c.rx = alloc::vec![0; TCP_RX_BASE];
+		}
 	}
 
 	// Start accepting inbound connections on `port` (passive open). Idempotent; the
@@ -840,7 +938,8 @@ impl Stack {
 
 	// Build connection `ci`'s SYN (seq = the initial send sequence) into `out`.
 	pub fn tcp_build_syn(&self, ci: usize, out: &mut [u8]) -> usize {
-		self.build_tcp(ci, TCP_SYN, self.conns[ci].snd_una, 0, &[], out)
+		let opts: [u8; 8] = self.syn_options();
+		self.build_tcp_opts(ci, TCP_SYN, self.conns[ci].snd_una, 0, &opts, &[], out)
 	}
 
 	// Build a data segment carrying `data` (PSH|ACK) on connection `ci` into `out` and
@@ -901,6 +1000,19 @@ impl Stack {
 		let taken: Vec<u8> = self.conns[ci].rx[..rx_len].to_vec();
 		self.conns[ci].rx_len = 0;
 		taken
+	}
+
+	// Build a bare ACK re-advertising the connection's current receive window into
+	// `out` - sent after a drain empties the buffer, so a peer that filled the
+	// advertised window learns it reopened instead of stalling on zero-window
+	// probes. Empty (0) when the connection is not established.
+	pub fn tcp_build_window_update(&mut self, ci: usize, out: &mut [u8]) -> usize {
+		if !self.conns[ci].in_use || self.conns[ci].state != TcpState::Established {
+			return 0;
+		}
+		let seq: u32 = self.conns[ci].snd_nxt;
+		let ack: u32 = self.conns[ci].rcv_nxt;
+		self.build_tcp(ci, TCP_ACK, seq, ack, &[], out)
 	}
 
 	// Handle an ICMP message: reply to an echo request, report an echo reply.

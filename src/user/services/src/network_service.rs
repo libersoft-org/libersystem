@@ -23,7 +23,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use rt::*;
 
-use crate::net::{DHCP_ACK, DHCP_NAK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, NEIGH_MAX, SockEntry, SockEntryState, Stack};
+use crate::net::{DHCP_ACK, DHCP_NAK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, NEIGH_MAX, SockEntry, SockEntryState, Stack, TCP_SEGMENT_OVERHEAD};
 use proto::codec::Buffer;
 use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest, config, listener, network, socket};
 
@@ -63,9 +63,11 @@ const TCP_RECV_TIMEOUT_TICKS: u64 = 300;
 // The base ephemeral local port for outgoing connections.
 const TCP_LOCAL_PORT_BASE: u16 = 0xc000;
 
-// The frame-buffer size: one full Ethernet frame (1514 bytes) with slack. The
-// driver forwards frames without the virtio_net_hdr, so this is the L2 frame only.
-const FRAME_MAX: usize = 2048;
+// The default MTU: standard Ethernet, when neither the driver nor the config tree
+// says otherwise. The effective MTU - the smaller of the link's report and the
+// `net.mtu` config knob - sizes every frame buffer at start; there is no
+// compile-time frame cap.
+const DEFAULT_MTU: usize = 1500;
 // The typed request and reply buffers for one client call. The request buffer fits
 // any op comfortably (a DNS name alone may be 253 bytes plus framing); replies
 // that can grow without bound (`fetch`, socket recv chunks) are built in Vecs and
@@ -80,22 +82,26 @@ const MAX_CLIENTS: usize = 4;
 const MAX_SOCKS: usize = 4;
 const MAX_LISTEN: usize = 2;
 
-// The neighbor-cache size from the config tree (the `net.arp-cache` key), read once
-// at start over the supervisor-minted ConfigService client and the client closed -
-// the cache is allocated with the stack, so a later `set` applies at the next boot.
-// NEIGH_MAX stands in when no config tree serves this boot (handle 0, a test
-// scenario) or the key does not parse.
-fn arp_cache_size(config: u64) -> usize {
+// The neighbor-cache size and the MTU knob from the config tree (the
+// `net.arp-cache` and `net.mtu` keys), read once at start over the supervisor-minted
+// ConfigService client and the client closed - both feed allocations made with the
+// stack, so a later `set` applies at the next boot. The defaults stand in when no
+// config tree serves this boot (handle 0, a test scenario) or a key does not parse.
+fn net_policy(config: u64) -> (usize, usize) {
 	if config == 0 {
-		return NEIGH_MAX;
+		return (NEIGH_MAX, DEFAULT_MTU);
 	}
 	let mut client = config::Client::new(ChannelTransport { chan: config });
-	let size: usize = match client.get("net.arp-cache") {
+	let neigh: usize = match client.get("net.arp-cache") {
 		Some(Ok(value)) => value.parse::<usize>().ok().filter(|&n| n > 0).unwrap_or(NEIGH_MAX),
 		_ => NEIGH_MAX,
 	};
+	let mtu: usize = match client.get("net.mtu") {
+		Some(Ok(value)) => value.parse::<usize>().ok().filter(|&n| n >= 576).unwrap_or(DEFAULT_MTU),
+		_ => DEFAULT_MTU,
+	};
 	unsafe { close(config) };
-	size
+	(neigh, mtu)
 }
 
 #[unsafe(no_mangle)]
@@ -113,22 +119,29 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			_ => exit(),
 		};
 		let client: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| exit());
-		// 2. the frame-mover driver leads with our NIC's MAC over the frame channel
-		//    (it owns the device; we own the protocol), so we can build the stack -
-		//    its neighbor-cache sized by the config tree's `net.arp-cache` policy.
-		let mac: MacAddr = match recv_blocking(frames, &mut buf) {
-			Received::Message { len, .. } if len >= 9 && &buf[..3] == b"MAC" => MacAddr([buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]]),
+		// 2. the frame-mover driver leads with our NIC's MAC and the link's MTU over
+		//    the frame channel (it owns the device; we own the protocol), so we can
+		//    build the stack - its neighbor-cache sized by the config tree's
+		//    `net.arp-cache` policy, its MTU the smaller of the link's report and the
+		//    `net.mtu` knob.
+		let (mac, link_mtu): (MacAddr, usize) = match recv_blocking(frames, &mut buf) {
+			Received::Message { len, .. } if len >= 9 && &buf[..3] == b"MAC" => {
+				let link: usize = if len >= 11 { u16::from_le_bytes([buf[9], buf[10]]) as usize } else { DEFAULT_MTU };
+				(MacAddr([buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]]), if link == 0 { DEFAULT_MTU } else { link })
+			}
 			_ => exit(),
 		};
-		let neigh_cap: usize = arp_cache_size(config);
-		let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP, DNS_SERVER, neigh_cap);
+		let (neigh_cap, mtu_knob): (usize, usize) = net_policy(config);
+		let mtu: usize = mtu_knob.min(link_mtu);
+		let frame_max: usize = mtu + 14;
+		let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP, DNS_SERVER, neigh_cap, mtu as u16);
 		// 3. learn our address / mask / gateway / DNS from DHCP, falling back to the
-		//    static config above if no server answers. The frame buffers are scoped so
-		//    they are freed before serve allocates its own (the 16 kB user stack).
+		//    static config above if no server answers. The frame buffers are heap Vecs
+		//    scoped so they are freed before serve allocates its own.
 		let mut lease: LeaseClock = LeaseClock::none();
 		{
-			let mut drx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
-			let mut dtx: [u8; FRAME_MAX] = [0u8; FRAME_MAX];
+			let mut drx: Vec<u8> = alloc::vec![0u8; frame_max];
+			let mut dtx: Vec<u8> = alloc::vec![0u8; frame_max];
 			if do_dhcp(frames, &mut stack, &mut drx, &mut dtx) {
 				print(b"network: configured via DHCP\n");
 				lease = LeaseClock::bound(&stack);
@@ -139,7 +152,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 4. report in, then serve the network and the client at once (serve announces
 		//    us on the link with a gratuitous ARP first).
 		send_blocking(bootstrap, b"NetworkService: online", 0);
-		serve(frames, client, &mut stack, lease);
+		serve(frames, client, &mut stack, lease, frame_max);
 	}
 }
 
@@ -194,13 +207,13 @@ fn place_client(clients: &mut Vec<u64>, chan: u64) {
 // gratuitous ARP that announces us on the link goes out first. While a DHCP lease
 // is held, its clock arms the wait's deadline (a periodic housekeeping wake) and
 // `lease_due` extends the lease when a threshold comes due.
-unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClock) -> ! {
+unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClock, frame_max: usize) -> ! {
 	unsafe {
 		// The frame and reply buffers live on the heap, not in this function's frame:
 		// serve holds all of them for its whole lifetime and the connect handshake
 		// nests a deep call chain on top, which would overflow the 16 kB user stack.
-		let mut rx: Vec<u8> = alloc::vec![0u8; FRAME_MAX];
-		let mut tx: Vec<u8> = alloc::vec![0u8; FRAME_MAX];
+		let mut rx: Vec<u8> = alloc::vec![0u8; frame_max];
+		let mut tx: Vec<u8> = alloc::vec![0u8; frame_max];
 		let mut req: [u8; REQ_MAX] = [0u8; REQ_MAX];
 		let mut out: Vec<u8> = alloc::vec![0u8; REPLY_MAX];
 		let arp: usize = stack.build_arp_request(GATEWAY_IP, &mut tx);
@@ -280,7 +293,7 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClo
 				while si < socks.len() {
 					if socks[si].chan != 0 && socks[si].stream_prod != 0 {
 						let ci: usize = socks[si].ci;
-						let prod: u64 = stream_pump(ci, stack, socks[si].stream_prod, &mut socks[si].stream_seq);
+						let prod: u64 = stream_pump(ci, frames, stack, &mut tx, socks[si].stream_prod, &mut socks[si].stream_seq);
 						socks[si].stream_prod = prod;
 						if prod != 0 && (stack.tcp_peer_fin(ci) || stack.tcp_aborted(ci)) {
 							close(prod);
@@ -567,7 +580,7 @@ fn to_sock_info(s: SockEntry) -> SockInfo {
 }
 
 impl network::Service for Net<'_> {
-	// The interface state: our address, MAC, gateway, and the neighbor cache.
+	// The interface state: our address, MAC, MTU, gateway, and the neighbor cache.
 	fn info(&mut self) -> Result<NetInfo, Error> {
 		let mut neighbors: Vec<Neighbor> = Vec::new();
 		let mut i: usize = 0;
@@ -575,7 +588,7 @@ impl network::Service for Net<'_> {
 			neighbors.push(Neighbor { addr: to_wire(nip), mac: nmac.0.to_vec() });
 			i += 1;
 		}
-		Ok(NetInfo { addr: to_wire(self.stack.ip()), mac: self.stack.mac().0.to_vec(), gateway: to_wire(self.stack.gateway()), neighbors })
+		Ok(NetInfo { addr: to_wire(self.stack.ip()), mac: self.stack.mac().0.to_vec(), mtu: self.stack.mtu(), gateway: to_wire(self.stack.gateway()), neighbors })
 	}
 
 	// Resolve a name to an address via the DNS client.
@@ -759,9 +772,10 @@ impl socket::Service for Sock<'_> {
 					return Err(Error::Invalid);
 				}
 			};
-			// Bound the view to a single segment - the memory object is at least one
+			// Bound the view to a single segment - what fits the transmit frame buffer
+			// behind the Ethernet/IP/TCP headers; the memory object is at least one
 			// page, so this slice never runs past the mapping even for a bogus length.
-			let n: usize = (data.len as usize).min(FRAME_MAX);
+			let n: usize = (data.len as usize).min(self.tx.len() - TCP_SEGMENT_OVERHEAD);
 			let bytes: &[u8] = core::slice::from_raw_parts(base as *const u8, n);
 			socket_send(self.ci, bytes, self.frames, self.stack, self.tx);
 			unmap_object(data.handle);
@@ -772,11 +786,16 @@ impl socket::Service for Sock<'_> {
 
 	// The snapshot of bytes already buffered when the recv stream opens; the serve
 	// loop streams everything that arrives afterwards. One chunk - as large as the
-	// connection's receive buffer holds - or empty.
+	// connection's receive buffer holds - or empty; a non-empty drain is followed
+	// by a window-update ACK (the buffer just reopened).
 	fn recv(&mut self) -> Vec<Chunk> {
 		let mut chunks: Vec<Chunk> = Vec::new();
 		let data: Vec<u8> = self.stack.tcp_take_rx_all(self.ci);
 		if !data.is_empty() {
+			unsafe {
+				let w: usize = self.stack.tcp_build_window_update(self.ci, self.tx);
+				send_frame(self.frames, &self.tx[..w]);
+			}
 			chunks.push(Chunk { data });
 		}
 		chunks
@@ -1105,7 +1124,13 @@ unsafe fn do_tcp(ci: usize, ip: Ipv4Addr, port: u16, request: &[u8], frames: u64
 				break;
 			}
 			pump(frames, stack, rx, tx);
-			reply.extend_from_slice(&stack.tcp_take_rx_all(ci));
+			let data: Vec<u8> = stack.tcp_take_rx_all(ci);
+			if !data.is_empty() {
+				// the drain reopened the receive window; tell the peer.
+				let w: usize = stack.tcp_build_window_update(ci, tx);
+				send_frame(frames, &tx[..w]);
+			}
+			reply.extend_from_slice(&data);
 		}
 		reply.extend_from_slice(&stack.tcp_take_rx_all(ci));
 		// Close our half and briefly pump to acknowledge the peer's FIN.
@@ -1172,15 +1197,18 @@ unsafe fn socket_send(ci: usize, data: &[u8], frames: u64, stack: &mut Stack, tx
 
 // Drain newly received bytes from the connection and frame each chunk onto the recv
 // stream `producer` - one chunk per drain, as large as the connection's receive
-// buffer held. Returns the producer handle, or 0 if the consumer was dropped
-// (in which case the producer is closed here).
-unsafe fn stream_pump(ci: usize, stack: &mut Stack, producer: u64, seq: &mut u32) -> u64 {
+// buffer held; each drained chunk is followed by a window-update ACK to the peer
+// (the drain reopened the receive window). Returns the producer handle, or 0 if
+// the consumer was dropped (in which case the producer is closed here).
+unsafe fn stream_pump(ci: usize, frames: u64, stack: &mut Stack, tx: &mut [u8], producer: u64, seq: &mut u32) -> u64 {
 	unsafe {
 		loop {
 			let data: Vec<u8> = stack.tcp_take_rx_all(ci);
 			if data.is_empty() {
 				return producer;
 			}
+			let w: usize = stack.tcp_build_window_update(ci, tx);
+			send_frame(frames, &tx[..w]);
 			let chunk: Chunk = Chunk { data };
 			// the frame grows with the chunk: encoded exactly, sent as one message
 			// (the consumer receives it exactly-sized via the peek).

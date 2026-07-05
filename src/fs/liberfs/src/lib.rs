@@ -352,6 +352,19 @@ pub struct FsckReport {
 pub trait BlockDevice {
 	// Read block `index` into `buf` (exactly BLOCK_SIZE bytes). False on I/O failure.
 	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool;
+	// Read `count` consecutive blocks starting at `index` into `buf` (exactly
+	// count * BLOCK_SIZE bytes). The default loops `read_block`; a backing that can
+	// move a span in one device request (the disk's block service) overrides it, so
+	// a contiguous file extent costs one round-trip instead of one per block.
+	fn read_blocks(&mut self, index: u64, count: u64, buf: &mut [u8]) -> bool {
+		for i in 0..count {
+			let dst = &mut buf[i as usize * BLOCK_SIZE..(i as usize + 1) * BLOCK_SIZE];
+			if !self.read_block(index + i, dst) {
+				return false;
+			}
+		}
+		true
+	}
 	// Write `buf` (exactly BLOCK_SIZE bytes) to block `index`. False on I/O failure.
 	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool;
 	// Make every write issued so far durable (flush the device's volatile write cache)

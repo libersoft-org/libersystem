@@ -37,9 +37,11 @@ pub struct DmaBuffer {
 }
 
 impl DmaBuffer {
-	// Allocate `size` bytes (rounded up to whole pages, at least one) of pinned DMA
-	// memory charged to `domain`'s DMA quota. The quota is charged before any frame
-	// is taken, so an over-cap request fails cleanly (QuotaExceeded) with nothing
+	// Allocate `size` bytes (rounded up to whole pages, at least one) of pinned,
+	// physically CONTIGUOUS DMA memory charged to `domain`'s DMA quota - one run,
+	// so a device sees a single span (a virtqueue ring, a block data stage, a
+	// jumbo frame all ride it whole). The quota is charged before any frame is
+	// taken, so an over-cap request fails cleanly (QuotaExceeded) with nothing
 	// allocated or charged, and an out-of-memory rolls the charge back.
 	pub fn create_in(domain: &Arc<Domain>, size: usize) -> Result<Arc<Self>, MemoryError> {
 		let pages = frame::pages_for(size);
@@ -47,13 +49,14 @@ impl DmaBuffer {
 		if !domain.try_charge_dma(bytes) {
 			return Err(MemoryError::QuotaExceeded);
 		}
-		let frames = match frame::allocate_pages(pages) {
-			Some(f) => f,
+		let base = match frame::allocate_contiguous(pages) {
+			Some(b) => b,
 			None => {
 				domain.uncharge_dma(bytes);
 				return Err(MemoryError::OutOfMemory);
 			}
 		};
+		let frames: Vec<u64> = (0..pages as u64).map(|i| base + i * PAGE_SIZE).collect();
 		Ok(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mapped_at: AtomicU64::new(0), domain: domain.clone() }))
 	}
 

@@ -51,6 +51,7 @@ impl Config {
 		entries.push(ConfigEntry { key: String::from("log.disk-cap"), value: String::from("0") });
 		entries.push(ConfigEntry { key: String::from("log.boots"), value: String::from("8") });
 		entries.push(ConfigEntry { key: String::from("net.arp-cache"), value: String::from("1024") });
+		entries.push(ConfigEntry { key: String::from("net.mtu"), value: String::from("1500") });
 		entries.push(ConfigEntry { key: String::from("service.restart-budget"), value: String::from("3") });
 		entries.push(ConfigEntry { key: String::from("service.watchdog-ticks"), value: String::from("100") });
 		Config { entries }

@@ -42,11 +42,6 @@ const STATUS_FAILED: u8 = 128;
 // modern virtio device offers it and a modern driver must accept it.
 const FEATURE_VERSION_1: u32 = 1 << 0;
 
-// The queue size we request. Small enough that the split-virtqueue rings
-// (descriptor table + available ring + used ring) fit in one DMA page, which is
-// therefore physically contiguous as the rings require.
-const QUEUE_SIZE: u16 = 16;
-
 // Descriptor flags.
 const DESC_NEXT: u16 = 1; // the buffer continues in the `next` descriptor
 const DESC_WRITE: u16 = 2; // the device writes this buffer (it is device-writable)
@@ -254,32 +249,35 @@ impl Virtio {
 		}
 	}
 
-	// Select queue `index`, allocate its split-virtqueue rings in a DMA page, program
-	// the ring physical addresses, and enable the queue. One DMA page holds all three
-	// rings (contiguous, as the rings require).
+	// Select queue `index`, allocate its split-virtqueue rings in one physically
+	// contiguous DMA span sized by the ring, program the ring physical addresses,
+	// and enable the queue. The queue size is the DEVICE's reported maximum (the
+	// queue_size register) - no driver constant caps it, so Linux-scale rings
+	// (256+) fall out of whatever the device offers.
 	pub unsafe fn setup_queue(&self, index: u16) -> Option<Queue> {
 		unsafe {
 			w16(self.common + CFG_QUEUE_SELECT, index);
-			let max_size: u16 = r16(self.common + CFG_QUEUE_SIZE);
-			if max_size == 0 {
+			let size: u16 = r16(self.common + CFG_QUEUE_SIZE);
+			if size == 0 {
 				return None;
 			}
-			let size: u16 = if max_size < QUEUE_SIZE { max_size } else { QUEUE_SIZE };
 			w16(self.common + CFG_QUEUE_SIZE, size);
 			// Route this queue's interrupts to the device's MSI-X vector (NO_VECTOR for INTx /
 			// polling drivers, which is also the reset value, so this is a no-op for them).
 			w16(self.common + CFG_QUEUE_MSIX_VECTOR, self.msix_vector);
 
-			let (handle, virt, phys): (u64, u64, u64) = match dma_buffer(4096) {
+			// layout: descriptor table (16 bytes each), then the available ring
+			// (2-byte aligned), then the used ring (4-byte aligned) - contiguous, as
+			// the rings require; the whole span is one contiguous DMA allocation.
+			let avail_off: u64 = 16 * size as u64;
+			let used_off: u64 = align_up(avail_off + 6 + 2 * size as u64, 4);
+			let ring_bytes: u64 = used_off + 6 + 8 * size as u64;
+			let (handle, virt, phys): (u64, u64, u64) = match dma_buffer(ring_bytes) {
 				Some(t) => t,
 				None => return None,
 			};
-			core::ptr::write_bytes(virt as *mut u8, 0, 4096);
+			core::ptr::write_bytes(virt as *mut u8, 0, ring_bytes as usize);
 
-			// layout within the page: descriptor table (16 bytes each), then the
-			// available ring (2-byte aligned), then the used ring (4-byte aligned).
-			let avail_off: u64 = 16 * size as u64;
-			let used_off: u64 = align_up(avail_off + 6 + 2 * size as u64, 4);
 			// suppress device interrupts by default: a polling driver wants none, and an
 			// interrupt-driven one re-enables them on its queue with `enable_interrupts`.
 			w16(virt + avail_off, VIRTQ_AVAIL_F_NO_INTERRUPT);

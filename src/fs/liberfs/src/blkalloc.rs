@@ -420,6 +420,36 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(true)
 	}
 
+	// Read up to `max` logical blocks of `inode` starting at `lb` into `buf` (at
+	// least max * BLOCK_SIZE bytes), returning how many blocks were served (>= 1)
+	// and whether they were mapped. A run of blocks inside one raw extent moves as a
+	// single device request (each block still verified against its checksum); a
+	// hole or a compressed extent serves one block through `read_logical`, keeping
+	// its zero-fill / decompression-cache semantics.
+	pub(crate) fn read_logical_run(&mut self, inode: &Inode, lb: u64, max: u64, buf: &mut [u8]) -> Result<(u64, bool), FsError> {
+		let ext = match find_extent(&inode.extents, lb) {
+			Some(i) => inode.extents[i],
+			None => return Ok((1, false)),
+		};
+		if ext.clen != 0 {
+			let mapped = self.read_logical(inode, lb, &mut buf[..BLOCK_SIZE])?;
+			return Ok((1, mapped));
+		}
+		self.check_extent(&ext)?;
+		let off = lb - ext.logical;
+		let n = max.min(ext.length as u64 - off);
+		if !self.dev.read_blocks(ext.stored(off), n, &mut buf[..n as usize * BLOCK_SIZE]) {
+			return Err(FsError::Io);
+		}
+		for k in 0..n as usize {
+			let crc = self.read_csum(ext.csum, ext.csum_crc, off as usize + k)?;
+			if crc32c(&buf[k * BLOCK_SIZE..(k + 1) * BLOCK_SIZE]) != crc {
+				return Err(FsError::Corrupt);
+			}
+		}
+		Ok((n, true))
+	}
+
 	// Write `buf` as logical block `lb` of `inode`, updating the extent map in
 	// memory and recording the block's checksum. Overwriting a mapped block replaces it
 	// with a fresh one (never copying the old contents - `buf` is always a whole block,

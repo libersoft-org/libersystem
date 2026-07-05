@@ -4,6 +4,31 @@ Measured numbers for the milestones whose "done when" includes a before/after
 comparison. Methodology per entry; machine noise applies, so treat the times as
 orders, not precision instruments.
 
+## M72 - Contiguous DMA and full-size I/O (2026-07-05)
+
+Measured live in QEMU/KVM with the shell's `time` over serial: a whole-file read
+of a 5.2 MB file from the LiberFS system volume (`time cat /bin/console_service`,
+virtio-blk), and a 4 MB HTTP fetch from a host-side server printed to the console
+(`time tcp 10.0.2.2 8888`, virtio-net + the TCP stack). Before = the tree at
+HEAD (per-page DMA, 16-descriptor rings, one-sector block requests, MSS-less
+TCP); after = this milestone.
+
+| scenario | before | after |
+| --- | --- | --- |
+| 5.2 MB file read (virtio-blk, LiberFS) | 115 ms | 54 ms |
+| 4 MB TCP bulk fetch | stalls (never completes) | 1.46 s (~2.9 MB/s incl. console rendering) |
+
+The disk read halves: extent-sized block requests (a contiguous extent = one
+request) ride the driver's whole-span virtio-blk chains over contiguous DMA
+buffers, so a large `cat` is a handful of device round-trips instead of one per
+sector. The TCP "before" is honest: bulk receive at HEAD hit a latent stack bug
+(the padding of a minimum-size Ethernet frame counted as TCP payload, advancing
+`rcv_nxt` past data the peer had not sent, so the transfer wedged on the first
+bare ACK) - it went unnoticed while our optionless SYN kept the peer's segments
+small and ACKs piggybacked. This milestone's MSS option surfaced it; the fix
+(trim the frame to the IP total length) plus window scaling gives the working
+number above.
+
 ## M75 - LiberFS format and modernity (2026-07-02)
 
 Same benchmark as M74. The CRC32C rewrite (slice-by-8, previously byte-at-a-time)

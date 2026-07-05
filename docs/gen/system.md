@@ -204,6 +204,7 @@ An opaque kernel object, transferred as `handle<task>`.
 | --- | --- |
 | `addr` | `ipv4-addr` |
 | `mac` | `list<u8>` |
+| `mtu` | `u16` |
 | `gateway` | `ipv4-addr` |
 | `neighbors` | `list<neighbor>` |
 

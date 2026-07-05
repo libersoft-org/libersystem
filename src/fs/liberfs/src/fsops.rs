@@ -233,23 +233,31 @@ impl<D: BlockDevice> LiberFs<D> {
 	// fewer bytes (or none) if the range runs past the end; holes read back as zeros.
 	// Lengths and block indexes are u64 end to end, so a 32-bit build never silently
 	// truncates a large file (an allocation it cannot hold fails as itself).
+	// Contiguous raw-extent runs move as one large device request (up to the run
+	// buffer) instead of one block at a time.
 	pub(crate) fn read_range(&mut self, inode: &Inode, offset: u64, len: u64) -> Result<Vec<u8>, FsError> {
+		// the most blocks one device request carries (1 MB); the run buffer's size.
+		const RUN_BLOCKS: u64 = 256;
 		if offset >= inode.size || len == 0 {
 			return Ok(Vec::new());
 		}
 		let end = offset.saturating_add(len).min(inode.size);
 		let mut out = Vec::with_capacity((end - offset) as usize);
-		let mut buf = vec![0u8; BLOCK_SIZE];
 		let first = offset / BLOCK_SIZE as u64;
 		let last = (end - 1) / BLOCK_SIZE as u64;
-		for lb in first..=last {
-			let block_start = lb * BLOCK_SIZE as u64;
-			if !self.read_logical(inode, lb, &mut buf)? {
-				buf.fill(0);
+		let mut buf = vec![0u8; (last - first + 1).min(RUN_BLOCKS) as usize * BLOCK_SIZE];
+		let mut lb = first;
+		while lb <= last {
+			let want = (last - lb + 1).min(RUN_BLOCKS);
+			let (n, mapped) = self.read_logical_run(inode, lb, want, &mut buf)?;
+			if !mapped {
+				buf[..n as usize * BLOCK_SIZE].fill(0);
 			}
-			let copy_start = offset.max(block_start);
-			let copy_end = end.min(block_start + BLOCK_SIZE as u64);
-			out.extend_from_slice(&buf[(copy_start - block_start) as usize..(copy_end - block_start) as usize]);
+			let run_start = lb * BLOCK_SIZE as u64;
+			let copy_start = offset.max(run_start);
+			let copy_end = end.min(run_start + n * BLOCK_SIZE as u64);
+			out.extend_from_slice(&buf[(copy_start - run_start) as usize..(copy_end - run_start) as usize]);
+			lb += n;
 		}
 		Ok(out)
 	}
