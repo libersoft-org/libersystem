@@ -64,9 +64,10 @@ static TIMER_INITIAL: AtomicU32 = AtomicU32::new(0);
 static CYCLES_PER_TICK: AtomicU64 = AtomicU64::new(0);
 
 // The TSC value at which the monotonic tick counter was last advanced. Whichever
-// core's timer fires once a full period past this point claims the next tick (via a
-// CAS) and bumps TICKS, so the clock keeps advancing at TIMER_HZ even if one core
-// stalls and stops taking its own timer interrupt.
+// core's timer fires a full period past this point claims every period elapsed
+// since it (via a CAS) and bumps TICKS by that many, so the clock keeps advancing
+// at TIMER_HZ even if one core stalls - and a stall of the whole guest is caught
+// up in one jump, not replayed tick by tick.
 static LAST_TICK_TSC: AtomicU64 = AtomicU64::new(0);
 
 fn read(reg: u32) -> u32 {
@@ -160,13 +161,24 @@ fn advance_ticks() {
 	}
 	let now = super::tsc::now();
 	let last = LAST_TICK_TSC.load(Ordering::Relaxed);
-	if now.wrapping_sub(last) < cpt {
+	// Signed distance: a racing core may re-anchor past our `now` reading (or a
+	// core's TSC may sit slightly behind its peers), making the unsigned difference
+	// wrap to an enormous value - read that as "the anchor is ahead, nothing due"
+	// instead of claiming an astronomic backlog.
+	let elapsed = now.wrapping_sub(last) as i64;
+	if elapsed < cpt as i64 {
 		return;
 	}
-	// Claim this tick window: exactly one core wins the CAS and advances the clock,
-	// moving the anchor forward by one period so concurrent timers do not double-count.
-	if LAST_TICK_TSC.compare_exchange(last, last.wrapping_add(cpt), Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-		TICKS.fetch_add(1, Ordering::Relaxed);
+	// Claim every full period since the anchor in ONE step: exactly one core wins
+	// the CAS and advances the clock by the whole backlog. Catching up one tick per
+	// interrupt instead would replay a stall's backlog at the ISR rate times the
+	// core count - time would run fast in bursts whenever the host starves the
+	// vCPUs, and every relative deadline (the caret blink, timeouts) would fire in
+	// rapid succession. A single jump keeps the long-term rate exact and delivers
+	// at most one expiry per deadline.
+	let periods = elapsed as u64 / cpt;
+	if LAST_TICK_TSC.compare_exchange(last, last.wrapping_add(periods * cpt), Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+		TICKS.fetch_add(periods, Ordering::Relaxed);
 	}
 }
 
