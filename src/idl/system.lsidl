@@ -37,11 +37,13 @@ record entry {
 	fields:    list<field>,
 }
 
-// A query over the journal.
+// A query over the journal. `boot` selects a previous boot's on-disk journal
+// (1 = the oldest kept); absent means the live in-memory journal of this boot.
 record query {
 	since:        option<u64>,
 	min-severity: option<severity>,
 	source:       option<string>,
+	boot:         option<u32>,
 	limit:        u32,
 }
 

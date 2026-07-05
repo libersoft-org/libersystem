@@ -790,16 +790,10 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			run_tool(permsvc, b"log", b"", cwd.as_bytes());
 			return false;
 		}
-		if line == b"log json" {
-			run_tool(permsvc, b"log", b"json", cwd.as_bytes());
-			return false;
-		}
-		if line == b"log tail" {
-			run_tool(permsvc, b"log", b"tail", cwd.as_bytes());
-			return false;
-		}
-		if line == b"log tail json" {
-			run_tool(permsvc, b"log", b"tail json", cwd.as_bytes());
+		if let Some(rest) = line.strip_prefix(b"log ") {
+			// the sub-forms ride through verbatim: "json", "tail", "tail json",
+			// "--boot <n>", "--boot <n> json".
+			run_tool(permsvc, b"log", trim(rest), cwd.as_bytes());
 			return false;
 		}
 		if line == b"lsdev" {

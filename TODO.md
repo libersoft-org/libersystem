@@ -1180,12 +1180,15 @@ compile-time stack budget.
 The journal lives in memory and dies with the machine; the M64 raise makes it
 deep, not durable. An appliance needs logs that survive a reboot.
 
-- [ ] LogService gains a storage capability (its own StorageService client, granted by ServiceManager) and appends records to `vol://system/log/` - a size-bounded, rotating on-disk journal (structured records, not rendered text).
-- [ ] Flush policy: batched appends (never a disk write per record), flushed on a timer and on severity >= error.
-- [ ] `log` gains a `--boot <n>` selector to read a previous boot's journal off the volume.
-- [ ] Rotation: a size cap per boot and a count cap across boots, oldest deleted (the caps as M67 config keys, derived from the volume's size by default).
+- [x] LogService gains a storage capability (its own StorageService client, granted by ServiceManager) and appends records to `vol://system/log/` - a size-bounded, rotating on-disk journal (structured records, not rendered text).
+- [x] Flush policy: batched appends (never a disk write per record), flushed on a timer and on severity >= error.
+- [x] `log` gains a `--boot <n>` selector to read a previous boot's journal off the volume.
+- [x] Rotation: a size cap per boot and a count cap across boots, oldest deleted (the caps as M67 config keys, derived from the volume's size by default).
 - Done when: records written before a reboot are readable after it via `log --boot`, rotation holds the caps, tests green.
 - Concept: M37 observability (the journal as the durable system record), M43/M50 (the writable volume it persists to), M65 (a pool big enough to hold logs).
+- Result (durable journal): LogService gained a `Disk` side - a volume client ServiceManager delivers late ("STORAGE" on the control channel the moment StorageService mounts, the same late-delivery path as its M67 config client), this boot's records encoded (`Entry::encode_vec`, the wire form - structured records, never rendered text) into length-framed batches, and `vol://system/log/boot-<n>` as the boot file (n = one past the newest journal on the volume). The whole capped sequence is rewritten per flush (the volume's write op is create-or-overwrite; the per-boot cap keeps it small), so a torn write can lose at most the tail batch, never the file's framing.
+- Result (flush policy): records are never written per emit. `rt` gained `serve_multi_ticked` (serve_multi_seeded now delegates to it) - with a period it wakes the serve loop every FLUSH_TICKS (~5 s) as a WAIT_PERIODIC housekeeping tick, on which LogService flushes its dirty batch; a severity >= error record flushes immediately (the record that says why the machine died must not wait). Flush failure (the kernel test environment's read-only archive volume) is silent and re-tried with the next batch.
+- Result (--boot + rotation): the `query`/`tail` records gained `boot: option<u32>` (IDL + proto + docs regenerated; the log tool's `--boot <n> [json]` sub-form rides through the shell's new prefix dispatch for `log`), answered by decoding the kept boot file back into entries and filtering as usual. Rotation prunes at attach - the oldest `boot-*` files are deleted until the kept count fits this boot - and re-prunes if config later lowers the count; the per-boot byte cap evicts the oldest frames as records arrive. Both caps are M67 config keys (`log.boots` = 8, `log.disk-cap` = 0 meaning derived: capacity/1024 clamped to [64 kB, 1 MB]). Validation: suite 95 [ok] RC=0 (a hand-built query wire in the log-bindings test grew by the option byte), proto 76 (render expectations extended), 0 warnings, fmt clean - and the real thing live: boot 1 writes `log/boot-1`, a clean reboot lists `boot-1` + `boot-2`, and `log --boot 1` from boot 2 prints boot 1's lifecycle records off the disk.
 
 ## M71 - Streaming replies (retire the 4096 B wire ceiling)
 

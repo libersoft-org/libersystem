@@ -630,7 +630,21 @@ where
 // for instance), served exactly like ones minted on demand via `CONNECT_OP`. As with any
 // sub-client, a seed channel closing (or sending the empty quit sentinel) is simply dropped
 // from the set; only `root` closing ends the service.
-pub unsafe fn serve_multi_seeded<F>(root: u64, seed: &[u64], request: &mut [u8], reply: &mut [u8], mut handle_request: F)
+pub unsafe fn serve_multi_seeded<F>(root: u64, seed: &[u64], request: &mut [u8], reply: &mut [u8], handle_request: F)
+where
+	F: FnMut(u64, &[u8], u64, &mut [u8], &mut u64) -> Option<usize>,
+{
+	unsafe {
+		serve_multi_ticked(root, seed, 0, request, reply, handle_request);
+	}
+}
+
+// Like `serve_multi_seeded`, but with `period` non-zero the loop also wakes every
+// `period` ticks even when no request arrives, calling the handler with chan = 0
+// and an empty request - a housekeeping tick a service flushes batched state on
+// (LogService's on-disk journal). The wake is a WAIT_PERIODIC deadline, so it
+// never counts as pending progress for the scheduler's boot driver.
+pub unsafe fn serve_multi_ticked<F>(root: u64, seed: &[u64], period: u64, request: &mut [u8], reply: &mut [u8], mut handle_request: F)
 where
 	F: FnMut(u64, &[u8], u64, &mut [u8], &mut u64) -> Option<usize>,
 {
@@ -639,8 +653,13 @@ where
 		chans.push(root);
 		chans.extend_from_slice(seed);
 		while !chans.is_empty() {
-			let ready: i64 = wait_any(&chans, 0);
+			let ready: i64 = if period != 0 { wait_any_periodic(&chans, clock() + period) } else { wait_any(&chans, 0) };
 			if ready < 0 {
+				if ready == ERR_TIMED_OUT && period != 0 {
+					// the housekeeping tick: no channel is ready, let the handler flush.
+					let mut reply_handle: u64 = 0;
+					let _ = handle_request(0, &[], 0, reply, &mut reply_handle);
+				}
 				continue;
 			}
 			let idx: usize = ready as usize;

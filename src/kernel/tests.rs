@@ -2051,11 +2051,11 @@ fn log_service_speaks_generated_bindings() {
 
 	// QUERY all severities: [op = 2 (query) u16][corr u32][query bytes]. The query
 	// record is since:option<u64> min-severity:option<severity> source:option<string>
-	// limit:u32; all-absent with limit 0 is seven zero bytes.
+	// boot:option<u32> limit:u32; all-absent with limit 0 is eight zero bytes.
 	let mut q = alloc::vec::Vec::new();
 	q.extend_from_slice(&2u16.to_le_bytes());
 	q.extend_from_slice(&7u32.to_le_bytes());
-	q.extend_from_slice(&[0u8; 7]);
+	q.extend_from_slice(&[0u8; 8]);
 	service_client.send(Message::new(q, alloc::vec::Vec::new(), 0)).expect("query");
 	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
 

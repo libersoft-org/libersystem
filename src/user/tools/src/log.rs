@@ -4,7 +4,8 @@
 // capabilities - a LogService client (to query the journal) and a TimeService client (to
 // resolve the boot epoch, so each record's monotonic tick renders as wall-clock time) - and
 // forwards it the shell's stdout console and the argument string (the sub-form: "", "json",
-// "tail", or "tail json"). log queries or streams the journal through its grants and prints
+// "tail", "tail json", or "--boot <n>" / "--boot <n> json" to read a previous boot's
+// on-disk journal). log queries or streams the journal through its grants and prints
 // each entry to the inherited stdout, then exits. A standalone command, not a shell built-in:
 // it reaches the services only through the capabilities the permission store granted it, and
 // renders on the same terminal as the shell that launched it.
@@ -34,7 +35,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 3. receive the two capabilities the manifest grants, in vocabulary order: log then time.
 		let logsvc: u64 = recv_tagged(bootstrap, &mut buf, b"LOG").unwrap_or_else(|| exit());
 		let timesvc: u64 = recv_tagged(bootstrap, &mut buf, b"TIME").unwrap_or_else(|| exit());
-		let (tail, json): (bool, bool) = match &args[..] {
+		// "--boot <n>" selects a previous boot's on-disk journal; the remainder
+		// keeps the usual sub-forms.
+		let (boot, rest): (Option<u32>, &[u8]) = match args.strip_prefix(b"--boot ") {
+			Some(r) => {
+				let end: usize = r.iter().position(|&b| b == b' ').unwrap_or(r.len());
+				match core::str::from_utf8(&r[..end]).ok().and_then(|n| n.parse::<u32>().ok()) {
+					Some(n) => (Some(n), r.get(end + 1..).unwrap_or(b"")),
+					None => {
+						print(b"log: usage: log --boot <n> [json]\n");
+						exit();
+					}
+				}
+			}
+			None => (None, &args[..]),
+		};
+		let (tail, json): (bool, bool) = match rest {
 			b"json" => (false, true),
 			b"tail" => (true, false),
 			b"tail json" => (true, true),
@@ -43,7 +59,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if tail {
 			tail_log(logsvc, timesvc, json);
 		} else {
-			query_log(logsvc, timesvc, json);
+			query_log(logsvc, timesvc, boot, json);
 		}
 	}
 	exit();
@@ -52,11 +68,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // Query LogService for the newest journal records over the granted log client and print
 // them, rendering each entry to text (prefixed with its wall-clock time) or JSON on the
 // client side. The query asks for all severities, limited to the newest records that fit
-// one typed reply - the journal itself is much deeper; `log tail` streams all of it.
-unsafe fn query_log(logsvc: u64, timesvc: u64, json: bool) {
+// one typed reply - the journal itself is much deeper; `log tail` streams all of it. A
+// boot selector reads a previous boot's on-disk journal instead of the live one (its
+// ticks belong to that boot, so they render raw rather than against this boot's epoch).
+unsafe fn query_log(logsvc: u64, timesvc: u64, boot: Option<u32>, json: bool) {
 	unsafe {
-		let q = Query { since: None, min_severity: None, source: None, limit: 32 };
-		let epoch: Option<u64> = boot_epoch(timesvc);
+		let q = Query { since: None, min_severity: None, source: None, boot, limit: 32 };
+		let epoch: Option<u64> = if boot.is_none() { boot_epoch(timesvc) } else { None };
 		let mut client = log::Client::new(ChannelTransport { chan: logsvc });
 		match client.query(&q) {
 			Some(Ok(entries)) => {
@@ -89,7 +107,7 @@ unsafe fn query_log(logsvc: u64, timesvc: u64, json: bool) {
 // the frames and render each entry on the client side, one streamed record at a time.
 unsafe fn tail_log(logsvc: u64, timesvc: u64, json: bool) {
 	unsafe {
-		let q = Query { since: None, min_severity: None, source: None, limit: 0 };
+		let q = Query { since: None, min_severity: None, source: None, boot: None, limit: 0 };
 		let epoch: Option<u64> = boot_epoch(timesvc);
 		let mut client = log::Client::new(ChannelTransport { chan: logsvc });
 		let consumer: u64 = match client.tail(&q) {

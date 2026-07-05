@@ -58,7 +58,7 @@ fn manifest_round_trips_with_requested_and_grants() {
 
 #[test]
 fn query_options_round_trip() {
-	let q = Query { since: Some(100), min_severity: Some(Severity::Error), source: None, limit: 50 };
+	let q = Query { since: Some(100), min_severity: Some(Severity::Error), source: None, boot: None, limit: 50 };
 	let mut buf = [0u8; 128];
 	let n = q.encode(&mut buf).unwrap();
 	assert_eq!(Query::decode(&buf[..n]).unwrap(), q);
@@ -135,7 +135,7 @@ fn client_server_round_trip() {
 	let mut client = log::Client::new(Loopback { service: MemLog::default() });
 	let e = Entry { timestamp: 9, severity: Severity::Error, source: String::from("svc"), fields: Vec::new() };
 	assert_eq!(client.emit(&e), Some(Ok(())));
-	let q = Query { since: None, min_severity: None, source: None, limit: 0 };
+	let q = Query { since: None, min_severity: None, source: None, boot: None, limit: 0 };
 	assert_eq!(client.query(&q), Some(Ok(alloc::vec![e])));
 }
 
@@ -150,7 +150,7 @@ fn tail_stream_round_trip() {
 	service.entries = alloc::vec![e0.clone(), e1.clone()];
 
 	// Encode a tail request the way the client does (op + corr + query).
-	let q = Query { since: None, min_severity: None, source: None, limit: 0 };
+	let q = Query { since: None, min_severity: None, source: None, boot: None, limit: 0 };
 	let mut writer = VecWriter::new();
 	let w = &mut writer;
 	w.u16(log::OP_TAIL).unwrap();
@@ -340,8 +340,8 @@ fn entry_renders_json_with_fields() {
 
 #[test]
 fn query_renders_json_with_options_and_kebab_keys() {
-	let q = Query { since: Some(5), min_severity: None, source: Some(String::from("svc")), limit: 9 };
-	assert_eq!(q.to_json(), "{\"since\":5,\"min-severity\":null,\"source\":\"svc\",\"limit\":9}");
+	let q = Query { since: Some(5), min_severity: None, source: Some(String::from("svc")), boot: None, limit: 9 };
+	assert_eq!(q.to_json(), "{\"since\":5,\"min-severity\":null,\"source\":\"svc\",\"boot\":null,\"limit\":9}");
 }
 
 #[test]
@@ -363,8 +363,8 @@ fn entry_renders_text_with_fields() {
 
 #[test]
 fn query_renders_text_with_option_none() {
-	let q = Query { since: Some(5), min_severity: None, source: Some(String::from("svc")), limit: 9 };
-	assert_eq!(q.to_text(), "{since=5, min-severity=-, source=svc, limit=9}");
+	let q = Query { since: Some(5), min_severity: None, source: Some(String::from("svc")), boot: None, limit: 9 };
+	assert_eq!(q.to_text(), "{since=5, min-severity=-, source=svc, boot=-, limit=9}");
 }
 
 // CBOR primitive heads use the canonical shortest argument encoding (RFC 8949):
@@ -465,9 +465,9 @@ fn entry_renders_cbor_map() {
 // Options collapse to their value or `null`, and kebab-case keys are preserved.
 #[test]
 fn query_renders_cbor_with_options() {
-	let q = Query { since: Some(5), min_severity: None, source: Some(String::from("svc")), limit: 9 };
+	let q = Query { since: Some(5), min_severity: None, source: Some(String::from("svc")), boot: None, limit: 9 };
 	let mut want = Vec::new();
-	want.push(0xa4); // map(4)
+	want.push(0xa5); // map(5)
 	want.push(0x65);
 	want.extend_from_slice(b"since");
 	want.push(0x05); // uint 5
@@ -478,6 +478,9 @@ fn query_renders_cbor_with_options() {
 	want.extend_from_slice(b"source");
 	want.push(0x63);
 	want.extend_from_slice(b"svc");
+	want.push(0x64);
+	want.extend_from_slice(b"boot");
+	want.push(0xf6); // null
 	want.push(0x65);
 	want.extend_from_slice(b"limit");
 	want.push(0x09); // uint 9

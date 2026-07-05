@@ -365,6 +365,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					if let Some(dm) = index_of(b"device_manager") {
 						unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_frames, &mut gpu_client, &mut snd_client, &mut input_raw, &mut block5_client, &mut usbq_client, &mut usb_pointer, &mut buf) };
 					}
+					// LogService starts before StorageService, so its volume client (the
+					// on-disk journal) is delivered late, like its config client: minted
+					// from the freshly mounted system volume and sent on LogService's
+					// control channel.
+					if let Some(lg) = index_of(b"log_service") {
+						if let Some(vol) = unsafe { service_connect(storage_client) } {
+							unsafe { send_blocking(channels[lg], b"STORAGE", vol) };
+						}
+					}
 				}
 			}
 			i += 1;

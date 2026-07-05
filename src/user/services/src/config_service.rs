@@ -46,6 +46,10 @@ impl Config {
 		entries.push(ConfigEntry { key: String::from("console.scrollback"), value: String::from("1000") });
 		entries.push(ConfigEntry { key: String::from("console.history"), value: String::from("512") });
 		entries.push(ConfigEntry { key: String::from("log.capacity"), value: String::from("4096") });
+		// On-disk journal rotation: bytes per boot file (0 = derive from the volume's
+		// size) and how many boots to keep.
+		entries.push(ConfigEntry { key: String::from("log.disk-cap"), value: String::from("0") });
+		entries.push(ConfigEntry { key: String::from("log.boots"), value: String::from("8") });
 		entries.push(ConfigEntry { key: String::from("net.arp-cache"), value: String::from("1024") });
 		entries.push(ConfigEntry { key: String::from("service.restart-budget"), value: String::from("3") });
 		entries.push(ConfigEntry { key: String::from("service.watchdog-ticks"), value: String::from("100") });

@@ -49,6 +49,7 @@ Generated reference for the `liber:system` package (`system.lsidl`). See [the LS
 | `since` | `option<u64>` |
 | `min-severity` | `option<severity>` |
 | `source` | `option<string>` |
+| `boot` | `option<u32>` |
 | `limit` | `u32` |
 
 ### resource `file`
