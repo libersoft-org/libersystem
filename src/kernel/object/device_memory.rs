@@ -65,13 +65,14 @@ impl_kernel_object!(DeviceMemory, DeviceMemory);
 impl Drop for DeviceMemory {
 	fn drop(&mut self) {
 		// Tear down the mapping so the VA window is not left pointing at the device
-		// after the capability is gone. The physical range is hardware, not owned
-		// RAM, so nothing is freed.
+		// after the capability is gone, and return its address range to the window's
+		// pool. The physical range is hardware, not owned RAM, so nothing is freed.
 		let base = self.mapped_at.load(Ordering::Acquire);
 		if base != 0 {
 			for i in 0..self.pages() {
 				paging::unmap_page(base + i as u64 * PAGE_SIZE);
 			}
+			crate::syscall::free_vrange(base, self.pages() as u64 * PAGE_SIZE);
 		}
 	}
 }

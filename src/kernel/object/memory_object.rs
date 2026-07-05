@@ -105,10 +105,12 @@ impl_kernel_object!(MemoryObject, MemoryObject);
 
 impl Drop for MemoryObject {
 	fn drop(&mut self) {
-		// Tear down any leftover mapping so freed frames are never left mapped.
+		// Tear down any leftover mapping so freed frames are never left mapped, and
+		// return its address range to the window's pool.
 		let base = self.mapped_at.load(Ordering::Acquire);
 		if base != 0 {
 			paging::unmap_pages(base, self.frames.len());
+			crate::syscall::free_vrange(base, self.frames.len() as u64 * PAGE_SIZE);
 		}
 		frame::free_pages(&self.frames);
 		// Refund the physical memory to the owning Domain, if any.

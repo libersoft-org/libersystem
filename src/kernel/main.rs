@@ -1629,6 +1629,53 @@ fn syscall_object_and_handle_ops() {
 
 #[cfg(test)]
 #[test_case]
+fn an_unmapped_va_range_is_reused_not_leaked() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	// The mmap window reclaims released ranges: an unmap returns its range to the
+	// window's pool and the next map of the same size gets it back (first-fit),
+	// so a map/unmap loop no longer walks off the window. Freeing two adjacent
+	// ranges coalesces them, so a larger mapping fits the merged hole - churn
+	// cannot shatter the window into unusable slivers.
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let page: u64 = mem::frame::PAGE_SIZE;
+			// reuse: map, unmap, map again - the same range comes back.
+			let a = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, page, 0, 0, 0);
+			assert!(!syscall::sys_is_err(a));
+			let first = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, a, 0, 0, 0);
+			assert!(!syscall::sys_is_err(first));
+			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, a, 0, 0, 0) as i64, 0);
+			let second = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, a, 0, 0, 0);
+			assert_eq!(second, first, "the released range should be handed out again");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, a, 0, 0, 0) as i64, 0);
+			// coalescing: two adjacent single-page ranges released in either order
+			// merge, so a two-page mapping fits where they were.
+			let b = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, page, 0, 0, 0);
+			let c = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, page, 0, 0, 0);
+			let base_b = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, b, 0, 0, 0);
+			let base_c = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, c, 0, 0, 0);
+			assert_eq!(base_b, first, "the first-fit hole is the one just released");
+			assert_eq!(base_c, base_b + page, "adjacent allocations pack the window");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, b, 0, 0, 0) as i64, 0);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, c, 0, 0, 0) as i64, 0);
+			let d = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 2 * page, 0, 0, 0);
+			let base_d = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, d, 0, 0, 0);
+			assert_eq!(base_d, base_b, "the merged hole should fit the larger mapping");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, d, 0, 0, 0) as i64, 0);
+			for handle in [a, b, c, d] {
+				assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle, 0, 0, 0) as i64, 0);
+			}
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+}
+
+#[cfg(test)]
+#[test_case]
 fn device_memory_maps_mmio_region() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::device_memory::DeviceMemory;
