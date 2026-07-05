@@ -12,9 +12,9 @@
 use rt::*;
 
 use crate::usb_hid::Hids;
-use crate::{command_and_wait, control_in, control_nodata, dma_page, r8, reset_endpoint, w32, wait_transfer};
-use crate::{Ring, UsbDevice, Xhci};
 use crate::{CC_SHORT_PACKET, CC_STALL, CC_SUCCESS, DESC_CONFIG, DT_ENDPOINT, DT_INTERFACE, FEATURE_ENDPOINT_HALT, REQ_CLEAR_FEATURE, REQ_SET_CONFIGURATION, RT_ENDPOINT, TRB_CONFIGURE_ENDPOINT, TRB_IOC, TRB_NORMAL};
+use crate::{Ring, UsbDevice, Xhci};
+use crate::{command_and_wait, control_in, control_nodata, dma_page, r8, reset_endpoint, w32, wait_transfer};
 
 // The USB mass-storage identity within a configuration: the class with the SCSI
 // transparent command set over the Bulk-Only Transport.

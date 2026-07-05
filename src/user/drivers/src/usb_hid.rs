@@ -14,9 +14,9 @@ use rt::*;
 
 use crate::hid;
 use crate::keys::{self, Mods};
-use crate::{command_and_wait, control_in, control_in_req, control_nodata, r8, reset_endpoint, w32};
-use crate::{Ring, UsbDevice, Xhci};
 use crate::{CC_SHORT_PACKET, CC_STALL, CC_SUCCESS, DESC_CONFIG, DT_ENDPOINT, DT_INTERFACE, FEATURE_ENDPOINT_HALT, REQ_CLEAR_FEATURE, REQ_GET_DESCRIPTOR, REQ_SET_CONFIGURATION, RT_ENDPOINT, SPEED_HIGH, SPEED_SUPER, TRB_CONFIGURE_ENDPOINT, TRB_EV_TRANSFER, TRB_IOC, TRB_NORMAL};
+use crate::{Ring, UsbDevice, Xhci};
+use crate::{command_and_wait, control_in, control_in_req, control_nodata, r8, reset_endpoint, w32};
 
 // The HID class SET_PROTOCOL request (to the interface): wValue 0 selects the
 // fixed boot-report layout - the fallback for a boot-subclass keyboard whose

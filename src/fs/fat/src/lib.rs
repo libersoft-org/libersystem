@@ -493,11 +493,7 @@ impl<D: BlockDevice> FatFs<D> {
 		Ok(match self.geo.kind {
 			Kind::Fat12 => {
 				let v = u16::from_le_bytes([buf[within], buf[within + 1]]);
-				if cluster & 1 == 1 {
-					(v >> 4) as u32
-				} else {
-					(v & 0x0FFF) as u32
-				}
+				if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
 			}
 			Kind::Fat16 => u16::from_le_bytes([buf[within], buf[within + 1]]) as u32,
 			Kind::Fat32 | Kind::ExFat => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]) & 0x0FFF_FFFF,
@@ -1050,11 +1046,7 @@ impl<D: BlockDevice> FatFs<D> {
 	// common contiguous form, whose FAT entries were never written) frees its contiguous
 	// run from the bitmap alone; a chained file walks and clears the FAT too.
 	fn exfat_release(&mut self, old: &Raw) -> Result<(), FsError> {
-		if old.no_fat_chain {
-			self.exfat_free_contiguous(old.first_cluster, old.size)
-		} else {
-			self.exfat_free(old.first_cluster)
-		}
+		if old.no_fat_chain { self.exfat_free_contiguous(old.first_cluster, old.size) } else { self.exfat_free(old.first_cluster) }
 	}
 
 	// Locate the allocation bitmap (the 0x81 entry in the root): its first cluster and its
@@ -1190,11 +1182,7 @@ fn fat_entry_at(fat: &[u8], kind: Kind, cluster: u32) -> u32 {
 				return 1;
 			}
 			let v = u16::from_le_bytes([fat[off], fat[off + 1]]);
-			if cluster & 1 == 1 {
-				(v >> 4) as u32
-			} else {
-				(v & 0x0FFF) as u32
-			}
+			if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
 		}
 		Kind::Fat16 => {
 			if off + 2 > fat.len() {
@@ -1762,11 +1750,7 @@ fn gen_short(name: &[u8], dir_bytes: &[u8]) -> Result<[u8; 11], FsError> {
 // (uppercasing alone is not lossy - the long name records the case).
 fn short_char(b: u8) -> (u8, bool) {
 	let illegal = b < 0x20 || b == 0x7F || b" \"*+,./:;<=>?[\\]|".contains(&b);
-	if illegal {
-		(b'_', true)
-	} else {
-		(b.to_ascii_uppercase(), false)
-	}
+	if illegal { (b'_', true) } else { (b.to_ascii_uppercase(), false) }
 }
 
 // Collect the 8.3 name fields of a directory's live entries, for uniqueness checks.

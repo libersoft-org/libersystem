@@ -185,11 +185,7 @@ fn udp_checksum(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
 		sum = (sum & 0xffff) + (sum >> 16);
 	}
 	let c: u16 = !(sum as u16);
-	if c == 0 {
-		0xffff
-	} else {
-		c
-	}
+	if c == 0 { 0xffff } else { c }
 }
 
 // The TCP checksum over the IPv4 pseudo-header (src, dst, proto, length) plus the
@@ -392,11 +388,7 @@ impl Stack {
 	// (on-link, reached by direct ARP), otherwise the gateway (off-link, routed). The
 	// L3 destination of the packet is still `dst`; only the L2 MAC we resolve changes.
 	pub fn next_hop(&self, dst: Ipv4Addr) -> Ipv4Addr {
-		if self.on_link(dst) {
-			dst
-		} else {
-			self.gateway
-		}
+		if self.on_link(dst) { dst } else { self.gateway }
 	}
 
 	// Whether `dst` is on our local subnet (its network part matches ours under the
@@ -469,27 +461,6 @@ impl Stack {
 			out.push(SockEntry { local_port: c.local_port, remote_ip: c.remote_ip, remote_port: c.remote_port, state });
 		}
 		out
-	}
-
-	// Serialize the interface state for the `ip` / `net` command into `out`, returning
-	// its length: our address (4), MAC (6), gateway (4), the neighbor count (1), then
-	// that many (ip 4, mac 6) cache entries. The shell parses and renders it.
-	pub fn write_state(&self, out: &mut [u8]) -> usize {
-		out[0..4].copy_from_slice(&self.ip.0);
-		out[4..10].copy_from_slice(&self.mac.0);
-		out[10..14].copy_from_slice(&self.gateway.0);
-		let mut count: u8 = 0;
-		let mut off: usize = 15;
-		for n in self.neigh.iter() {
-			if n.valid && off + 10 <= out.len() {
-				out[off..off + 4].copy_from_slice(&n.ip.0);
-				out[off + 4..off + 10].copy_from_slice(&n.mac.0);
-				off += 10;
-				count += 1;
-			}
-		}
-		out[14] = count;
-		off
 	}
 
 	// Parse one received Ethernet frame, update the neighbor cache, and write an
@@ -1082,7 +1053,7 @@ impl Stack {
 			*b = 0;
 		}
 		out[ntp_off] = 0x23; // LI 0, VN 4, Mode 3 (client)
-					   // UDP header.
+		// UDP header.
 		let udp_off: usize = ETH_HDR + IPV4_HDR;
 		put16(out, udp_off, src_port);
 		put16(out, udp_off + 2, NTP_PORT);

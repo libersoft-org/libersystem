@@ -877,7 +877,7 @@ fn an_entry_never_lands_past_the_terminator() {
 	// where the parser (which stops there) never looks: a silently lost file.
 	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
 	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
-						  // ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
+	// ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
 	fs.dev.data[root_off + 5 * 32] = b'X';
 	fs.write_file(b"a long note.txt", b"visible").unwrap();
 	assert_eq!(fs.read_file(b"a long note.txt").unwrap(), b"visible");

@@ -8,10 +8,10 @@
 //! host wires up. It is `no_std` for the kernel and userspace builds, and pulls in
 //! `std` only under `cargo test` so the runtime can be exercised on the host.
 //!
-//! It supports the integer instruction set, structured control flow (block / loop /
-//! if / else / br / br_if / br_table / return), globals, data segments, and a single
-//! linear memory. Floating point, the full Component Model, and the complete WASI
-//! preview-2 world are later steps.
+//! It supports the integer and floating-point instruction sets, structured control
+//! flow (block / loop / if / else / br / br_if / br_table / return), globals, data
+//! segments, and a single linear memory. The full Component Model and the complete
+//! WASI preview-2 world are later steps.
 
 #![cfg_attr(not(test), no_std)]
 

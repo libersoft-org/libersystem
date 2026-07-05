@@ -43,7 +43,7 @@ use fat::FatFs;
 use iso9660::Iso9660;
 use liberfs::{BlockDevice, FormatOpts, FsError, LiberFs};
 use proto::codec::Buffer;
-use proto::system::{volume, Error, FileInfo, FileKind, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus};
+use proto::system::{Error, FileInfo, FileKind, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, volume};
 use rt::*;
 use udf::Udf;
 

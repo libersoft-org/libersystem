@@ -15,7 +15,7 @@
 extern crate alloc;
 
 use proto::codec::Buffer;
-use proto::system::{network, socket, Endpoint, Error, Ipv4Addr};
+use proto::system::{Endpoint, Error, Ipv4Addr, network, socket};
 use rt::*;
 
 #[unsafe(no_mangle)]

@@ -386,11 +386,7 @@ fn layout(code: u16, mods: &Mods) -> u8 {
 	}
 	// Letters flip with Shift XOR Caps Lock; symbols only with Shift.
 	let shifted: bool = if base.is_ascii_lowercase() { mods.shift ^ mods.caps } else { mods.shift };
-	if shifted {
-		KEYMAP_SHIFT[code as usize]
-	} else {
-		base
-	}
+	if shifted { KEYMAP_SHIFT[code as usize] } else { base }
 }
 
 // The ANSI escape sequence a navigation, edit or function keycode maps to, or None
@@ -477,14 +473,14 @@ fn keypad_sequence(code: u16) -> Option<&'static [u8]> {
 	}
 }
 
-// HID keyboard-page usage -> keycode, for the boot-protocol report a USB
-// keyboard sends: the whole keyboard page - the letters (0x04..), the digit row,
+// HID keyboard-page usage -> keycode, for the keyboard-page fields of a USB
+// keyboard's input report: the whole keyboard page - the letters (0x04..), the digit row,
 // the control and punctuation keys, the function keys F1..F24, the navigation
 // block, the keypad including its extras, the system / edit-action / audio keys,
 // and the international and language keys - onto the same keycodes the
 // virtio-input KEYMAP above indexes. 0 = unmapped (the Locking Caps / Num /
 // Scroll usages of legacy terminals; the multimedia keys live on the Consumer
-// page, which the boot protocol does not carry).
+// page, mapped by `consumer_keycode` below).
 #[rustfmt::skip]
 const HID_KEYCODES: [u16; 0x95] = [
 	0,   0,   0,   0,   30,  48,  46,  32,  18,  33,  // 00: -, -, -, -, a, b, c, d, e, f
@@ -506,11 +502,7 @@ const HID_KEYCODES: [u16; 0x95] = [
 
 // Resolve a HID keyboard-page usage id to its keycode (0 = unmapped).
 pub fn hid_keycode(usage: u8) -> u16 {
-	if (usage as usize) < HID_KEYCODES.len() {
-		HID_KEYCODES[usage as usize]
-	} else {
-		0
-	}
+	if (usage as usize) < HID_KEYCODES.len() { HID_KEYCODES[usage as usize] } else { 0 }
 }
 
 // Resolve a HID Consumer-page usage to its keycode (0 = unmapped): the media

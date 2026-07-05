@@ -9,10 +9,10 @@
 //     0x0000_0000_4000_0000  USER_CODE_VA      ring-3 test code page (1 GB)
 //     0x0000_0000_4001_0000  USER_STACK_VA     ring-3 test stack page
 //     0x0000_0000_8000_0000  USER_STACK_TOP    ELF-loaded program's ring-3 stack top (2 GB)
-//     0x0000_4000_0000_0000  USER_MMAP_BASE    ring-3 syscall-mapped objects (bump up)
+//     0x0000_4000_0000_0000  USER_MMAP_BASE    ring-3 syscall-mapped objects (pooled)
 //     0x0000_8000_0000_0000  USER_VA_END       exclusive top of the user half
 //   higher half (kernel, shared across address spaces)
-//     0xffff_e800_0000_0000  KERNEL_MMAP_BASE  kernel syscall-mapped objects (bump up)
+//     0xffff_e800_0000_0000  KERNEL_MMAP_BASE  kernel syscall-mapped objects (pooled)
 
 // In-kernel ring-3 test: one page for the program, one for its stack, mapped into
 // the low half of the shared address space (per-process CR3 isolation is a later
@@ -33,7 +33,8 @@ pub(crate) const USER_STACK_VA: u64 = 0x0000_0000_4001_0000;
 pub(crate) const USER_STACK_TOP: u64 = abi::USER_STACK_TOP;
 pub(crate) const USER_STACK_PAGES: u64 = 64;
 
-// Ring-3 syscall-mapped MemoryObjects bump up from here. The base sits far above
+// Ring-3 syscall-mapped MemoryObjects are allocated from here (the user window's
+// pool: reused released ranges first, then the bump). The base sits far above
 // the program and stack the loader places below the 2 GB line, yet within the
 // user (lower) half, so user_buf_ok still accepts buffers carved from it.
 pub(crate) const USER_MMAP_BASE: u64 = 0x0000_4000_0000_0000;
@@ -43,5 +44,6 @@ pub(crate) const USER_MMAP_BASE: u64 = 0x0000_4000_0000_0000;
 pub(crate) const USER_VA_END: u64 = 0x0000_8000_0000_0000;
 
 // Kernel virtual-address window for syscall-mapped MemoryObjects (the kernel-side
-// counterpart of USER_MMAP_BASE). A bump pointer hands out non-overlapping ranges.
+// counterpart of USER_MMAP_BASE). Its pool hands out non-overlapping ranges and
+// reclaims released ones.
 pub(crate) const KERNEL_MMAP_BASE: u64 = 0xffff_e800_0000_0000;

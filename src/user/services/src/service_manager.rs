@@ -839,17 +839,17 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: 
 			return false;
 		}
 		// The SystemGraphService client, so the shell's `graph` command can render the live
-		// system graph. Sent right after INPUT to match the shell's receive order.
+		// system graph.
 		if !send_blocking(manager_side, b"GRAPH", graph_client) {
 			return false;
 		}
 		// The PermissionManager client, so the shell's `perm` command can render the
-		// permission audit trail. Sent right after GRAPH to match the shell's receive order.
+		// permission audit trail.
 		if !send_blocking(manager_side, b"PERM", perm_client) {
 			return false;
 		}
 		// The ResourceManager client, so the shell's `usage` command can render the live
-		// per-Domain budgets. Sent right after PERM to match the shell's receive order - a
+		// per-Domain budgets - a
 		// duplicate, like the other launcher-dropped clients above, so the supervisor keeps
 		// the serve root.
 		let res_dup: i64 = duplicate(res_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
@@ -882,7 +882,7 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: 
 		}
 		// VT 1's control channel to ConsoleService (the shell end; the console holds the
 		// other end). Carries SET_FG / CLEAR_FG out and JOB_STOPPED back for job-control
-		// signals, sent right after CONSOLE to match the shell's receive order.
+		// signals.
 		if !send_blocking(manager_side, b"CONTROL", console_control) {
 			return false;
 		}
@@ -1392,9 +1392,8 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 			return false;
 		}
 		*console_client = client_end;
-		// VT 1's control channel: the console end goes to ConsoleService now (right after
-		// CLIENT, the order its __user_main expects), the shell end is kept for the shell's
-		// own bootstrap (it starts later in the boot order).
+		// VT 1's control channel: the console end goes to ConsoleService now, the shell end
+		// is kept for the shell's own bootstrap (it starts later in the boot order).
 		let (control_console, control_shell): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => return false,
@@ -1426,14 +1425,12 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 			return false;
 		}
 		// The SessionService factory, so ConsoleService can mint a fresh per-VT session for
-		// each additional virtual terminal it spawns. Sent right after FAUDIO to match the
-		// console's receive order.
+		// each additional virtual terminal it spawns.
 		if !send_factory(manager_side, b"FSESSION", session_client) {
 			return false;
 		}
 		// The PermissionManager factory, so ConsoleService can mint a fresh per-VT launcher
-		// client for each shell it spawns. Sent right after FSESSION to match the console's
-		// receive order.
+		// client for each shell it spawns.
 		if !send_factory(manager_side, b"FPERM", perm_client) {
 			return false;
 		}
