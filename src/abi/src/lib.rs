@@ -160,13 +160,16 @@ pub const USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
 
 // object_property_set property selectors. PROP_NAME sets an object's label (arg2 =
 // name pointer, arg3 = length); the PROP_*_LIMIT selectors set a Domain resource
-// counter's limit (arg2 = the new limit).
+// counter's limit (arg2 = the new limit). PROP_STACK_LIMIT is the per-thread stack
+// ceiling: the VA span (bytes, below USER_STACK_TOP) the kernel's fault handler
+// demand-pages a thread's stack into.
 pub const PROP_NAME: u64 = 0;
 pub const PROP_MEMORY_LIMIT: u64 = 1;
 pub const PROP_HANDLE_LIMIT: u64 = 2;
 pub const PROP_THREAD_LIMIT: u64 = 3;
 pub const PROP_DMA_LIMIT: u64 = 4;
 pub const PROP_IPC_QUEUE_LIMIT: u64 = 5;
+pub const PROP_STACK_LIMIT: u64 = 6;
 
 // virtio device type codes, as written into `DeviceInfo::device_type` (the modern
 // virtio-pci `device_id - 0x1040`). The single source of truth for the kernel's PCI
@@ -284,6 +287,11 @@ pub struct DomainStats {
 	pub ipc_limit: u64,
 	pub dma_used: u64,
 	pub dma_limit: u64,
+	// Stack: used = the stack bytes currently mapped across the Domain's processes
+	// (initial pages plus demand-paged growth); limit = the per-thread ceiling (the
+	// VA span a stack may grow into), not a cap on the sum.
+	pub stack_used: u64,
+	pub stack_limit: u64,
 }
 
 // The memory totals memory_stats writes into the caller's buffer: the physical frame

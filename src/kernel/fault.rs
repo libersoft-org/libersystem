@@ -14,6 +14,8 @@
 // running. A ring-0 fault is a real kernel bug and is left to halt loudly.
 
 use crate::arch;
+use crate::mem::frame::{self, PAGE_SIZE};
+use crate::memlayout::USER_STACK_TOP;
 use crate::object::KernelObject;
 use crate::object::channel::{Channel, Message};
 use crate::sched;
@@ -25,6 +27,55 @@ use alloc::vec::Vec;
 // than an enum) so a FaultInfo marshals cleanly across the syscall boundary.
 pub const FAULT_PAGE: u64 = 1;
 pub const FAULT_GENERAL_PROTECTION: u64 = 2;
+
+// Page-fault error-code bit 0: set when the fault is a protection violation on a
+// PRESENT page (never stack growth), clear when the page was simply not mapped.
+const PF_PRESENT: u64 = 1;
+
+// The hard floor of the stack span, in pages: the lowest page below the ceiling
+// is never demand-mapped, so runaway recursion dies there instead of eating the
+// machine page by page.
+const STACK_GUARD_PAGES: u64 = 1;
+
+// Try to satisfy a ring-3 page fault as stack growth: a not-present fault inside
+// the faulting process's stack span - below USER_STACK_TOP, above the hard floor
+// its Domain's per-thread stack ceiling (PROP_STACK_LIMIT) fixes - means the
+// stack grew into the demand-paged region. Map a zeroed page there and return
+// true: the exception handler then just returns and the faulting instruction
+// retries. Anything else (a protection fault, an address outside the span, no
+// memory left) returns false and the caller terminates the process as before.
+// The faulting thread was in ring 3, so it holds no kernel locks - taking the
+// frame-allocator and page-table locks here cannot deadlock against it.
+pub fn grow_user_stack(address: u64, error_code: u64) -> bool {
+	if error_code & PF_PRESENT != 0 {
+		return false;
+	}
+	let Some(thread) = sched::current_thread() else {
+		return false;
+	};
+	let process = thread.process();
+	// The span the Domain policy grants: [top - ceiling, top), with the lowest
+	// STACK_GUARD_PAGES never mapped. A ceiling larger than the address space
+	// below the top is clamped so the floor cannot underflow.
+	let ceiling = process.domain().account().stack().limit().min(USER_STACK_TOP);
+	let floor = USER_STACK_TOP - ceiling + STACK_GUARD_PAGES * PAGE_SIZE;
+	if address < floor || address >= USER_STACK_TOP {
+		return false;
+	}
+	let Some(new_frame) = frame::allocate() else {
+		return false;
+	};
+	let hhdm = crate::mem::hhdm_offset();
+	unsafe {
+		core::ptr::write_bytes((hhdm + new_frame) as *mut u8, 0, PAGE_SIZE as usize);
+	}
+	let page = address & !(PAGE_SIZE - 1);
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER | arch::paging::NO_EXECUTE;
+	process.address_space().map(page, new_frame, flags);
+	process.adopt_frames(alloc::vec![new_frame]);
+	process.charge_stack(PAGE_SIZE);
+	true
+}
 
 // A snapshot of the fault that terminated a process, readable back through
 // SYS_FAULT_INFO_GET. `#[repr(C)]` and all-u64 so userspace can overlay it on a

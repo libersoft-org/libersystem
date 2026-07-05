@@ -379,6 +379,7 @@ An opaque kernel object, transferred as `handle<task>`.
 | `threads` | 2 |
 | `ipc-queue` | 3 |
 | `dma` | 4 |
+| `stack` | 5 |
 
 ### record `resource-usage`
 

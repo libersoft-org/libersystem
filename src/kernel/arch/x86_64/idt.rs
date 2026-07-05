@@ -158,10 +158,16 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
 	unsafe {
 		asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
 	}
-	// A page fault taken in ring 3 is a userspace bug (a bad dereference, a write
-	// to a read-only page, and so on): terminate that process and return to the
-	// kernel. The low two bits of the saved code selector are the CPL.
 	if frame.code_segment & 3 == 3 {
+		// A ring-3 not-present fault just below the mapped stack is growth, not a
+		// bug: map the missing page and return, and the CPU retries the instruction.
+		if crate::fault::grow_user_stack(cr2, error_code) {
+			return;
+		}
+		// Anything else taken in ring 3 is a userspace bug (a bad dereference, a
+		// write to a read-only page, recursion past the stack floor): terminate that
+		// process and return to the kernel. The low two bits of the saved code
+		// selector are the CPL.
 		crate::serial_println!("fault: ring-3 page fault (code {:#x}) at {:#x}, CR2 = {:#x} - terminating process", error_code, frame.instruction_pointer, cr2);
 		crate::fault::terminate_user(crate::fault::FaultInfo { kind: crate::fault::FAULT_PAGE, error_code, address: cr2, instruction_pointer: frame.instruction_pointer });
 	}

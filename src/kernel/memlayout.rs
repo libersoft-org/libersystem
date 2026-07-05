@@ -24,14 +24,14 @@ pub(crate) const USER_STACK_VA: u64 = 0x0000_0000_4001_0000;
 
 // ELF-loaded process ring-3 stack: it lives just below the 2 GB line (well above
 // the program's load address and clear of the kernel's higher half) and grows
-// down from USER_STACK_TOP over USER_STACK_PAGES pages. USER_STACK_TOP is part of
-// the spawn ABI (a userspace spawner passes it to thread_create), so its value is
-// sourced from the abi crate. The stack is 256 kB: a debug-built service can run
-// a deep call chain (e.g. the Wasm interpreter dispatching an import that fans out
-// through a generated service client and the codec) with page-sized scratch
-// buffers along the way, which overruns a smaller one - Linux gives threads 8 MB.
+// down from USER_STACK_TOP. USER_STACK_TOP is part of the spawn ABI (a userspace
+// spawner passes it to thread_create), so its value is sourced from the abi
+// crate. Only the top USER_STACK_PAGES are mapped eagerly; the rest of the span -
+// up to the owning Domain's per-thread stack ceiling (PROP_STACK_LIMIT, 8 MB by
+// default) - is demand-paged by the fault handler as the stack grows into it, so
+// a deep call chain costs only the pages it actually touches.
 pub(crate) const USER_STACK_TOP: u64 = abi::USER_STACK_TOP;
-pub(crate) const USER_STACK_PAGES: u64 = 64;
+pub(crate) const USER_STACK_PAGES: u64 = 8;
 
 // Ring-3 syscall-mapped MemoryObjects are allocated from here (the user window's
 // pool: reused released ranges first, then the bump). The base sits far above

@@ -626,6 +626,50 @@ static NX_KIND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 static NX_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static NX_CODE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// Where the stack-growth probe's outcome lands: whether a fault was recorded (0 =
+// clean exit), its kind/address/code, and the Domain's mapped stack bytes observed
+// while the process was still alive.
+static STACK_GOT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+static STACK_KIND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static STACK_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static STACK_CODE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static STACK_USED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Kernel-thread body that drops to ring 3 running the stack-growth probe with
+// `pages` touches. Only the code page is mapped up front - the stack region below
+// USER_STACK_TOP starts entirely unmapped, so even the probe's first store
+// demand-pages. After the excursion the touched span is unmapped from the shared
+// test address space (the frames themselves belong to the process, which frees
+// them when it is dropped).
+extern "C" fn user_stack_probe_thread_body(pages: u64) {
+	use core::sync::atomic::Ordering;
+	use mem::frame::{self, PAGE_SIZE};
+	let code = frame::allocate().expect("user code frame");
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
+	arch::paging::map_page(USER_CODE_VA, code, flags);
+	let program = arch::usermode::program_stack_probe_bytes();
+	unsafe {
+		core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
+		arch::usermode::enter(USER_CODE_VA, memlayout::USER_STACK_TOP, pages);
+	}
+	let mut info = fault::FaultInfo { kind: 0, error_code: 0, address: 0, instruction_pointer: 0 };
+	let got = unsafe { arch::syscall::invoke(syscall::SYS_FAULT_INFO_GET, &mut info as *mut fault::FaultInfo as u64, core::mem::size_of::<fault::FaultInfo>() as u64, 0, 0) };
+	STACK_GOT.store(got as i64, Ordering::SeqCst);
+	STACK_KIND.store(info.kind, Ordering::SeqCst);
+	STACK_ADDR.store(info.address, Ordering::SeqCst);
+	STACK_CODE.store(info.error_code, Ordering::SeqCst);
+	if let Some(thread) = sched::current_thread() {
+		STACK_USED.store(thread.process().domain().account().stack().used(), Ordering::SeqCst);
+	}
+	arch::paging::unmap_page(USER_CODE_VA);
+	frame::deallocate(code);
+	// Unmap whatever the probe grew (up to the whole requested span; pages past
+	// the kill point were never mapped and unmap is a no-op there).
+	for i in 1..=pages {
+		arch::paging::unmap_page(memlayout::USER_STACK_TOP - i * PAGE_SIZE);
+	}
+}
+
 // Kernel-thread body that drops to ring 3 running the no-execute probe: the
 // program jumps into its writable, no-execute stack page, so the instruction
 // fetch itself must page-fault (W^X). Mirrors user_fault_thread_body.
@@ -3774,6 +3818,47 @@ fn writable_pages_are_not_executable() {
 	let addr = NX_ADDR.load(Ordering::SeqCst);
 	assert!((USER_STACK_VA..USER_STACK_VA + mem::frame::PAGE_SIZE).contains(&addr), "the fault is inside the stack page");
 	assert!(NX_CODE.load(Ordering::SeqCst) & 0x10 != 0, "the fault is an instruction fetch");
+	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
+}
+
+#[test_case]
+fn a_user_stack_grows_on_demand_past_its_initial_pages() {
+	use core::sync::atomic::Ordering;
+	use object::domain::Domain;
+	// Demand-paged stacks: nothing below USER_STACK_TOP is mapped up front for this
+	// probe, and the Domain's default ceiling is megabytes. The probe touches 100
+	// pages (400 kB - past the old eagerly-mapped 256 kB, let alone the 8-page
+	// initial mapping) walking down; every touch page-faults, the handler maps the
+	// missing page and the instruction resumes, and the probe reaches its clean
+	// exit. The Domain's stack account holds exactly the grown bytes while the
+	// process lives and refunds them when it is reaped.
+	let domain = Domain::new(1 << 22, 8, 4);
+	sched::spawn_in(domain.clone(), user_stack_probe_thread_body, 100).expect("spawn stack probe");
+	sched::run_until_idle();
+	assert_eq!(STACK_GOT.load(Ordering::SeqCst), 0, "a grown stack records no fault");
+	assert_eq!(STACK_USED.load(Ordering::SeqCst), 100 * mem::frame::PAGE_SIZE, "the stack account holds the grown pages");
+	assert_eq!(domain.account().stack().used(), 0, "the stack bytes are refunded at teardown");
+	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
+}
+
+#[test_case]
+fn recursion_past_the_stack_floor_is_killed() {
+	use core::sync::atomic::Ordering;
+	use mem::frame::PAGE_SIZE;
+	use object::domain::Domain;
+	// The hard floor: the Domain's stack ceiling is squeezed to 16 pages, so the
+	// probe's 15 touches above the one-page guard grow, and the 16th - the guard
+	// page itself - is a genuine fault that kills the process (runaway recursion
+	// dies instead of eating the machine).
+	let domain = Domain::new(1 << 22, 8, 4);
+	domain.account().stack().set_limit(16 * PAGE_SIZE);
+	sched::spawn_in(domain.clone(), user_stack_probe_thread_body, 32).expect("spawn stack probe");
+	sched::run_until_idle();
+	assert_eq!(STACK_GOT.load(Ordering::SeqCst), 1, "overrunning the floor records a fault");
+	assert_eq!(STACK_KIND.load(Ordering::SeqCst), fault::FAULT_PAGE);
+	assert_eq!(STACK_ADDR.load(Ordering::SeqCst), memlayout::USER_STACK_TOP - 16 * PAGE_SIZE, "the kill lands on the guard page at the floor");
+	assert_eq!(STACK_USED.load(Ordering::SeqCst), 15 * PAGE_SIZE, "only the pages above the guard grew");
+	assert_eq!(domain.account().stack().used(), 0, "the stack bytes are refunded at teardown");
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 

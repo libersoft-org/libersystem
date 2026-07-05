@@ -4870,6 +4870,7 @@ pub enum ResourceKind {
 	Threads = 2,
 	IpcQueue = 3,
 	Dma = 4,
+	Stack = 5,
 }
 
 impl ResourceKind {
@@ -4896,6 +4897,7 @@ impl ResourceKind {
 			2 => Some(ResourceKind::Threads),
 			3 => Some(ResourceKind::IpcQueue),
 			4 => Some(ResourceKind::Dma),
+			5 => Some(ResourceKind::Stack),
 			_ => None,
 		}
 	}
@@ -8331,6 +8333,7 @@ impl ResourceKind {
 			ResourceKind::Threads => out.push_str("\"threads\""),
 			ResourceKind::IpcQueue => out.push_str("\"ipc-queue\""),
 			ResourceKind::Dma => out.push_str("\"dma\""),
+			ResourceKind::Stack => out.push_str("\"stack\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -8340,6 +8343,7 @@ impl ResourceKind {
 			ResourceKind::Threads => out.push_str("threads"),
 			ResourceKind::IpcQueue => out.push_str("ipc-queue"),
 			ResourceKind::Dma => out.push_str("dma"),
+			ResourceKind::Stack => out.push_str("stack"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -8349,6 +8353,7 @@ impl ResourceKind {
 			ResourceKind::Threads => crate::codec::cbor::text(out, "threads"),
 			ResourceKind::IpcQueue => crate::codec::cbor::text(out, "ipc-queue"),
 			ResourceKind::Dma => crate::codec::cbor::text(out, "dma"),
+			ResourceKind::Stack => crate::codec::cbor::text(out, "stack"),
 		}
 	}
 }

@@ -599,15 +599,17 @@ interface permission {
 }
 
 // The kinds of resource the kernel accounts and the ResourceManager budgets per Domain:
-// physical memory held, live handles, live threads, in-transit IPC message bytes, and
-// pinned DMA memory. The typed vocabulary a budget is written in - each names a counter
-// the kernel already charges and enforces; the policy only sets the cap.
+// physical memory held, live handles, live threads, in-transit IPC message bytes,
+// pinned DMA memory, and user stack (whose limit is the per-thread ceiling). The typed
+// vocabulary a budget is written in - each names a counter the kernel already charges
+// and enforces; the policy only sets the cap.
 enum resource-kind {
 	memory,     // physical memory held (bytes)
 	handles,    // live handles (count)
 	threads,    // live threads (count)
 	ipc-queue,  // in-transit IPC message bytes
 	dma,        // pinned DMA memory (bytes)
+	stack,      // user stack (bytes; the limit is the per-thread ceiling a stack may demand-page into)
 }
 
 // One line of a Domain's budget: a resource kind, how much of it is currently used, and

@@ -57,6 +57,7 @@ fn prop_for(kind: ResourceKind) -> u64 {
 		ResourceKind::Threads => PROP_THREAD_LIMIT,
 		ResourceKind::IpcQueue => PROP_IPC_QUEUE_LIMIT,
 		ResourceKind::Dma => PROP_DMA_LIMIT,
+		ResourceKind::Stack => PROP_STACK_LIMIT,
 	}
 }
 
@@ -71,6 +72,7 @@ fn budget_of(domain: u64) -> Budget {
 		ResourceUsage { kind: ResourceKind::Threads, used: stats.threads_used, limit: stats.threads_limit },
 		ResourceUsage { kind: ResourceKind::IpcQueue, used: stats.ipc_used, limit: stats.ipc_limit },
 		ResourceUsage { kind: ResourceKind::Dma, used: stats.dma_used, limit: stats.dma_limit },
+		ResourceUsage { kind: ResourceKind::Stack, used: stats.stack_used, limit: stats.stack_limit },
 	];
 	Budget { name: String::from(BUDGET_NAME), usage }
 }

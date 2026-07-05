@@ -80,6 +80,7 @@ pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<d
 	// From here on the Process owns the frames and frees them when it is dropped.
 	let process = Process::new(address_space, domain);
 	process.adopt_frames(frames);
+	process.charge_stack(USER_STACK_PAGES * PAGE_SIZE);
 	let handle = process.install(bootstrap, rights, badge);
 
 	let ctx = Box::new(UserEntry { entry, stack_top: USER_STACK_TOP, bootstrap: handle });
@@ -108,6 +109,7 @@ pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadE
 	}
 	// From here on the Process owns the frames and frees them when it is dropped.
 	process.adopt_frames(frames);
+	process.charge_stack(USER_STACK_PAGES * PAGE_SIZE);
 	Ok(entry)
 }
 

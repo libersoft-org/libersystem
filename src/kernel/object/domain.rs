@@ -26,6 +26,11 @@ use crate::sync::SpinLock;
 // Sentinel limit meaning "no cap" for a resource counter.
 pub const UNLIMITED: u64 = u64::MAX;
 
+// The default per-thread stack ceiling: the VA span below USER_STACK_TOP a
+// thread's stack may demand-page into. Megabytes are affordable because only
+// touched pages cost memory; a Domain policy (PROP_STACK_LIMIT) overrides it.
+pub const DEFAULT_STACK_CEILING: u64 = 8 * 1024 * 1024;
+
 // A single counted, capped resource. `used` and `limit` are in bytes or counts
 // depending on the resource. All operations are atomic so accounting stays
 // correct when several cores charge the same Domain concurrently.
@@ -104,11 +109,17 @@ pub struct ResourceAccount {
 	// the receiver takes each message. Uncapped by default; a cap bounds how much a
 	// sender can queue (anti-DoS backpressure).
 	ipc_queue: ResourceCounter,
+	// User stack bytes. `used` counts the stack pages currently mapped across the
+	// Domain's processes (the initial top pages plus every demand-paged growth
+	// page); `limit` is the PER-THREAD stack ceiling - the VA span below
+	// USER_STACK_TOP the fault handler may grow a stack into - not a cap on the
+	// sum, so charges are recorded unconditionally (observability, like handles).
+	stack: ResourceCounter,
 }
 
 impl ResourceAccount {
 	const fn new(memory_limit: u64, handle_limit: u64, thread_limit: u64) -> Self {
-		Self { memory: ResourceCounter::new(memory_limit), handles: ResourceCounter::new(handle_limit), threads: ResourceCounter::new(thread_limit), dma: ResourceCounter::new(UNLIMITED), ipc_queue: ResourceCounter::new(UNLIMITED) }
+		Self { memory: ResourceCounter::new(memory_limit), handles: ResourceCounter::new(handle_limit), threads: ResourceCounter::new(thread_limit), dma: ResourceCounter::new(UNLIMITED), ipc_queue: ResourceCounter::new(UNLIMITED), stack: ResourceCounter::new(DEFAULT_STACK_CEILING) }
 	}
 
 	pub fn memory(&self) -> &ResourceCounter {
@@ -129,6 +140,10 @@ impl ResourceAccount {
 
 	pub fn threads(&self) -> &ResourceCounter {
 		&self.threads
+	}
+
+	pub fn stack(&self) -> &ResourceCounter {
+		&self.stack
 	}
 }
 
@@ -318,6 +333,16 @@ impl Domain {
 
 	pub fn uncharge_thread(&self) {
 		self.uncharge_hier(1, &|a: &ResourceAccount| a.threads());
+	}
+
+	// Stack bytes are recorded unconditionally (the limit is the per-thread VA
+	// ceiling, not a cap on the sum - see ResourceAccount::stack).
+	pub fn charge_stack(&self, bytes: u64) {
+		self.charge_hier(bytes, &|a: &ResourceAccount| a.stack());
+	}
+
+	pub fn uncharge_stack(&self, bytes: u64) {
+		self.uncharge_hier(bytes, &|a: &ResourceAccount| a.stack());
 	}
 }
 

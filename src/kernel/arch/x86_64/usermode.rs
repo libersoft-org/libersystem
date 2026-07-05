@@ -45,6 +45,8 @@ unsafe extern "C" {
 	fn user_fault_program_end();
 	fn user_nx_program_start();
 	fn user_nx_program_end();
+	fn user_stack_probe_program_start();
+	fn user_stack_probe_program_end();
 }
 
 // Drop the calling thread into ring 3 at `entry` with `user_stack` and `arg` (the
@@ -118,6 +120,15 @@ pub fn program_yield_bytes() -> &'static [u8] {
 pub fn program_nx_bytes() -> &'static [u8] {
 	let start = user_nx_program_start as *const () as usize;
 	let end = user_nx_program_end as *const () as usize;
+	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
+}
+
+// The bytes of the embedded ring-3 stack-growth probe (position-independent
+// machine code, copied into a USER page before entering). It touches one page per
+// count walking down from its entry stack pointer, then exits cleanly.
+pub fn program_stack_probe_bytes() -> &'static [u8] {
+	let start = user_stack_probe_program_start as *const () as usize;
+	let end = user_stack_probe_program_end as *const () as usize;
 	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
 }
 
@@ -278,3 +289,28 @@ global_asm!(
 // page-faults with W^X enforced; the kernel records the fault and terminates the
 // process, so control never returns into this code.
 global_asm!(".text", ".global user_nx_program_start", "user_nx_program_start:", "lea rax, [rsp - 64]", "jmp rax", "2:", "jmp 2b", ".global user_nx_program_end", "user_nx_program_end:",);
+
+// Embedded ring-3 stack-growth probe. Position-independent: on entry rdi holds a
+// page count; it stores one qword per page walking DOWN from the entry stack
+// pointer, marching through the demand-paged stack region one page at a time.
+// Under the ceiling every touch grows the stack and the probe reaches its clean
+// SYS_USER_EXIT; a touch past the Domain's stack floor page-faults for real and
+// the process dies right there.
+global_asm!(
+	".text",
+	".global user_stack_probe_program_start",
+	"user_stack_probe_program_start:",
+	"mov rax, rsp",
+	"2:",
+	"sub rax, 4096",
+	"mov qword ptr [rax], rax",
+	"dec rdi",
+	"jnz 2b",
+	"mov eax, {exit}",
+	"syscall",
+	"3:",
+	"jmp 3b",
+	".global user_stack_probe_program_end",
+	"user_stack_probe_program_end:",
+	exit = const crate::syscall::SYS_USER_EXIT,
+);

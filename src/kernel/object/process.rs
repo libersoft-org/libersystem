@@ -70,6 +70,9 @@ pub struct Process {
 	// SystemGraphService can read a component's traffic over SYS_PROCESS_STATS_GET.
 	messages_sent: AtomicU64,
 	messages_received: AtomicU64,
+	// Stack bytes charged to the Domain's stack account for this process (the eager
+	// top pages plus every demand-paged growth page), refunded once at teardown.
+	stack_bytes: AtomicU64,
 }
 
 impl Process {
@@ -79,7 +82,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), exited: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), exited: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0) });
 		// Register with the Domain so a Domain kill can reach and terminate it.
 		process.domain.register_process(&process);
 		process
@@ -109,6 +112,13 @@ impl Process {
 	// stack, so they are freed when the process is dropped.
 	pub fn adopt_frames(&self, frames: Vec<u64>) {
 		self.user_frames.lock().extend(frames);
+	}
+
+	// Record `bytes` of mapped stack against the Domain's stack account (and this
+	// process, for the one-shot refund at teardown).
+	pub fn charge_stack(&self, bytes: u64) {
+		self.stack_bytes.fetch_add(bytes, Ordering::AcqRel);
+		self.domain.charge_stack(bytes);
 	}
 
 	// Record the fault that is terminating this process. The first fault wins:
@@ -243,6 +253,11 @@ impl Process {
 
 impl Drop for Process {
 	fn drop(&mut self) {
+		// Refund the Domain's stack account for every page this process's stack held.
+		let stack = self.stack_bytes.swap(0, Ordering::AcqRel);
+		if stack != 0 {
+			self.domain.uncharge_stack(stack);
+		}
 		// Release the leaf data frames backing the user image and stack. The address
 		// space, dropped alongside, reclaims only the page-table structure.
 		let frames = core::mem::take(&mut *self.user_frames.lock());
