@@ -120,6 +120,12 @@ pub fn allocate_pages(pages: usize) -> Option<Vec<u64>> {
 			}
 		}
 	}
+	// Ascending physical order: consumers map the frames in slice order, so any
+	// physically adjacent frames end up virtually adjacent too, and a device fed
+	// the layout (virtio-gpu's ATTACH_BACKING mem-entries) can coalesce them into
+	// runs. The free list is LIFO, so without this a just-freed buffer comes back
+	// in reverse order and every page becomes its own run.
+	frames.sort_unstable();
 	Some(frames)
 }
 

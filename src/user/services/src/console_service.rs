@@ -238,6 +238,10 @@ fn term_policy(config: u64) -> (usize, usize) {
 struct Console {
 	addr: u64,
 	fb: Framebuffer,
+	// The gpu backing's DmaBuffer handle (0 on the boot framebuffer): kept so a FBNEW
+	// reallocation can release the old buffer (close unmaps and frees it) after the
+	// VTs swap onto the replacement.
+	fb_handle: u64,
 	has_fb: bool,
 	// The virtio-gpu driver's display channel, or 0 for the boot framebuffer (which is
 	// visible directly, no present step). `present` FLUSHes the foreground over it.
@@ -307,7 +311,7 @@ unsafe fn map_boot_framebuffer() -> Option<(u64, Framebuffer)> {
 // the shared backing it renders into, and map it. Returns (pixel base, max geometry,
 // current width, current height), or None on any failure (the caller then uses the boot
 // framebuffer). The terminal is sized to the current display but may grow to the max.
-unsafe fn gpu_framebuffer(gpu: u64, buf: &mut [u8]) -> Option<(u64, Framebuffer, u32, u32)> {
+unsafe fn gpu_framebuffer(gpu: u64, buf: &mut [u8]) -> Option<(u64, u64, Framebuffer, u32, u32)> {
 	unsafe {
 		send_blocking(gpu, b"FB", 0);
 		let (handle, len): (u64, usize) = match recv_blocking(gpu, buf) {
@@ -325,7 +329,7 @@ unsafe fn gpu_framebuffer(gpu: u64, buf: &mut [u8]) -> Option<(u64, Framebuffer,
 		if sys_is_err(addr as u64) {
 			return None;
 		}
-		Some((addr as u64, fb, cur_w, cur_h))
+		Some((handle, addr as u64, fb, cur_w, cur_h))
 	}
 }
 
@@ -379,16 +383,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    display when present (it presents on FLUSH and resizes on a host-window change).
 		//    New VTs render on the gpu backing when present, else the boot framebuffer; a
 		//    headless boot has neither and we still serve input. The framebuffer is the
-		//    maximum (resource) geometry; the terminal is sized to the current display, which
-		//    the gpu driver grows toward the max on a resize.
+		//    allocated (resource) geometry; the terminal is sized to the current display,
+		//    and the gpu driver reallocates the backing when the display outgrows it
+		//    (arriving here as FBNEW).
 		let boot: Option<(u64, Framebuffer)> = map_boot_framebuffer();
-		let gpu_disp: Option<(u64, Framebuffer, u32, u32)> = if gpu != 0 { gpu_framebuffer(gpu, &mut buf) } else { None };
+		let gpu_disp: Option<(u64, u64, Framebuffer, u32, u32)> = if gpu != 0 { gpu_framebuffer(gpu, &mut buf) } else { None };
 		// 0 = no present (the boot framebuffer, or a gpu whose connect failed).
 		let gpu: u64 = if gpu_disp.is_some() { gpu } else { 0 };
-		let (addr, fb, cur_w, cur_h): (u64, Framebuffer, u32, u32) = match (gpu_disp, boot) {
-			(Some((ga, gf, gw, gh)), _) => (ga, gf, gw, gh),
-			(None, Some((ba, bf))) => (ba, bf, bf.width, bf.height),
-			(None, None) => (0, Framebuffer::default(), 0, 0),
+		let (fb_handle, addr, fb, cur_w, cur_h): (u64, u64, Framebuffer, u32, u32) = match (gpu_disp, boot) {
+			(Some((gh, ga, gf, gw, ghh)), _) => (gh, ga, gf, gw, ghh),
+			(None, Some((ba, bf))) => (0, ba, bf, bf.width, bf.height),
+			(None, None) => (0, 0, Framebuffer::default(), 0, 0),
 		};
 		let has_fb: bool = gpu_disp.is_some() || boot.is_some();
 		// The console's own ConfigService client (minted under the bounded wait) and
@@ -424,7 +429,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0 }], fg: 0, ptys: Vec::new(), facs, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
+		let mut console: Console = Console { addr, fb, fb_handle, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0 }], fg: 0, ptys: Vec::new(), facs, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
 		run(&mut console);
 	}
 }
@@ -1041,14 +1046,20 @@ unsafe fn close_pty(console: &mut Console, pj: usize) {
 // stop polling it (the display freezes on the last frame - the driver is gone).
 unsafe fn handle_gpu_resize(console: &mut Console) {
 	unsafe {
-		let mut buf: [u8; 32] = [0u8; 32];
-		let len: usize = match recv_blocking(console.gpu, &mut buf) {
-			Received::Message { len, .. } => len,
+		let mut buf: [u8; 64] = [0u8; 64];
+		let (len, handle): (usize, u64) = match recv_blocking(console.gpu, &mut buf) {
+			Received::Message { len, handle } => (len, handle),
 			Received::Closed => {
 				console.gpu = 0;
 				return;
 			}
 		};
+		// FBNEW: the driver reallocated the backing for a display that outgrew it -
+		// swap every display VT onto the new buffer, then release the old one.
+		if len >= 5 && &buf[..5] == b"FBNEW" && handle != 0 {
+			handle_gpu_realloc(console, &buf[..len], handle);
+			return;
+		}
 		if len < 14 || &buf[..6] != b"RESIZE" {
 			return;
 		}
@@ -1064,6 +1075,50 @@ unsafe fn handle_gpu_resize(console: &mut Console) {
 		let n: usize = console.vts.len();
 		for vi in 0..n {
 			resize_vt(console, vi, cols, rows);
+		}
+	}
+}
+
+// Adopt the driver's reallocated backing (FBNEW: the new allocated geometry, the
+// display size, and the new buffer's handle): map it, swap every display VT's
+// renderer onto it (the grid models survive; each repaints in full on its next
+// flush), reflow to the new display, and release the old mapping by closing our old
+// handle (the driver already dropped its own, so the close frees the buffer).
+unsafe fn handle_gpu_realloc(console: &mut Console, msg: &[u8], handle: u64) {
+	unsafe {
+		let fb_len: usize = core::mem::size_of::<Framebuffer>();
+		if msg.len() < 5 + fb_len + 8 {
+			close(handle);
+			return;
+		}
+		let fb: Framebuffer = (msg[5..].as_ptr() as *const Framebuffer).read_unaligned();
+		let new_w: u32 = u32::from_le_bytes([msg[5 + fb_len], msg[5 + fb_len + 1], msg[5 + fb_len + 2], msg[5 + fb_len + 3]]);
+		let new_h: u32 = u32::from_le_bytes([msg[5 + fb_len + 4], msg[5 + fb_len + 5], msg[5 + fb_len + 6], msg[5 + fb_len + 7]]);
+		let addr: i64 = dma_buffer_map(handle);
+		if sys_is_err(addr as u64) {
+			close(handle);
+			return;
+		}
+		let old_handle: u64 = console.fb_handle;
+		console.addr = addr as u64;
+		console.fb = fb;
+		console.fb_handle = handle;
+		console.cur_w = new_w;
+		console.cur_h = new_h;
+		let cols: usize = new_w as usize / CELL_W;
+		let rows: usize = new_h as usize / CELL_H;
+		let n: usize = console.vts.len();
+		for vi in 0..n {
+			if let Some(t) = console.vts[vi].term.as_mut() {
+				t.set_surface(make_surface(console.addr, &console.fb, console.gpu));
+			}
+			resize_vt(console, vi, cols, rows);
+		}
+		// the run loop presents the foreground right after this handler, pushing the
+		// full repaint (the whole grid went dirty with the surface swap) onto the new
+		// backing - the old buffer is only closed once nothing renders into it.
+		if old_handle != 0 {
+			close(old_handle);
 		}
 	}
 }

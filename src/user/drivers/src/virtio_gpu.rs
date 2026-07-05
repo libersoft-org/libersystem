@@ -30,10 +30,12 @@ use crate::virtio::{Queue, Virtio};
 // virtio-gpu control commands (the 2D subset) and the two responses we check.
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
+const CMD_RESOURCE_UNREF: u32 = 0x0102;
 const CMD_SET_SCANOUT: u32 = 0x0103;
 const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
+const CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 
@@ -46,21 +48,14 @@ const FORMAT_B8G8R8X8: u32 = 2;
 const HDR_LEN: u64 = 24;
 const PAGE: u64 = 4096;
 
-// The single resource + scanout this driver drives.
-const RESOURCE_ID: u32 = 1;
+// The first host resource id; each reallocation binds the next id, so the old
+// resource and its replacement never alias while both exist.
+const FIRST_RESOURCE_ID: u32 = 1;
 const SCANOUT_ID: u32 = 0;
 
 // A sane fallback if the device reports no display size yet.
 const FALLBACK_W: u32 = 1024;
 const FALLBACK_H: u32 = 768;
-
-// The resource (and its backing framebuffer) is allocated at this maximum size so the
-// host window can grow up to it without reallocating the backing (a DmaBuffer maps
-// once, so re-handing a new one to ConsoleService is avoided): on a resize the scanout
-// is just rebound to the new sub-rectangle. A larger initial display raises the cap to
-// fit it. A window grown past the cap is clamped (the console stops growing).
-const MAX_W: u32 = 1920;
-const MAX_H: u32 = 1080;
 
 // How often (in 100 Hz monotonic ticks) the serve loop wakes to poll the host display
 // size while idle - the FALLBACK when no config-change interrupt was granted: ~200 ms,
@@ -134,11 +129,11 @@ impl Gpu {
 		}
 	}
 
-	// RESOURCE_CREATE_2D: create the host-side B8G8R8X8 resource of the given size.
-	unsafe fn create_2d(&self, w: u32, h: u32) -> bool {
+	// RESOURCE_CREATE_2D: create the host-side B8G8R8X8 resource `id` of the given size.
+	unsafe fn create_2d(&self, id: u32, w: u32, h: u32) -> bool {
 		unsafe {
 			self.hdr(CMD_RESOURCE_CREATE_2D);
-			wr32(self.cmd_virt + 24, RESOURCE_ID);
+			wr32(self.cmd_virt + 24, id);
 			wr32(self.cmd_virt + 28, FORMAT_B8G8R8X8);
 			wr32(self.cmd_virt + 32, w);
 			wr32(self.cmd_virt + 36, h);
@@ -146,27 +141,70 @@ impl Gpu {
 		}
 	}
 
+	// RESOURCE_DETACH_BACKING: release resource `id`'s guest backing store.
+	unsafe fn detach_backing(&self, id: u32) -> bool {
+		unsafe {
+			self.hdr(CMD_RESOURCE_DETACH_BACKING);
+			wr32(self.cmd_virt + 24, id);
+			wr32(self.cmd_virt + 28, 0);
+			self.submit(32, HDR_LEN as u32) == Some(RESP_OK_NODATA)
+		}
+	}
+
+	// RESOURCE_UNREF: destroy the host-side resource `id`.
+	unsafe fn unref(&self, id: u32) -> bool {
+		unsafe {
+			self.hdr(CMD_RESOURCE_UNREF);
+			wr32(self.cmd_virt + 24, id);
+			wr32(self.cmd_virt + 28, 0);
+			self.submit(32, HDR_LEN as u32) == Some(RESP_OK_NODATA)
+		}
+	}
+
 	// RESOURCE_ATTACH_BACKING: hand the device the guest framebuffer pages as the
 	// resource's backing store. The framebuffer DMA buffer is mapped contiguously but
-	// its physical frames are scattered, so one mem-entry per page (its true physical
-	// address). The entry list lives in `entries` (its own DMA buffer); the request is
-	// submitted as a descriptor chain - the 32-byte fixed head, then the entry pages,
-	// then the response - so a multi-page entry list need not be physically contiguous.
-	unsafe fn attach_backing(&self, fb_handle: u64, entries: &Dma, pages: u64) -> bool {
+	// its physical frames are scattered, so the entry list is built by coalescing
+	// physically contiguous runs - one mem-entry per run, not per page - which keeps
+	// even a large (4K+) framebuffer's request inside the control queue's descriptor
+	// budget (M72's contiguous DMA would collapse it to one entry). The entry list
+	// lives in `entries` (its own DMA buffer); the request is submitted as a
+	// descriptor chain - the 32-byte fixed head, then the entry pages, then the
+	// response - so a multi-page entry list need not be physically contiguous.
+	unsafe fn attach_backing(&self, id: u32, fb_handle: u64, entries: &Dma, pages: u64) -> bool {
 		unsafe {
-			// fill the entry list: addr(u64), length(u32 = one page), padding(u32).
+			// fill the entry list with coalesced runs: addr(u64), length(u32), padding.
+			let mut nr: u64 = 0;
+			let mut run_base: u64 = 0;
+			let mut run_len: u64 = 0;
 			for i in 0..pages {
-				let e = entries.virt + i * 16;
-				wr64(e, dma_buffer_phys_at(fb_handle, i * PAGE));
-				wr32(e + 8, PAGE as u32);
+				let phys = dma_buffer_phys_at(fb_handle, i * PAGE);
+				if run_len != 0 && phys == run_base + run_len {
+					run_len += PAGE;
+					continue;
+				}
+				if run_len != 0 {
+					let e = entries.virt + nr * 16;
+					wr64(e, run_base);
+					wr32(e + 8, run_len as u32);
+					wr32(e + 12, 0);
+					nr += 1;
+				}
+				run_base = phys;
+				run_len = PAGE;
+			}
+			if run_len != 0 {
+				let e = entries.virt + nr * 16;
+				wr64(e, run_base);
+				wr32(e + 8, run_len as u32);
 				wr32(e + 12, 0);
+				nr += 1;
 			}
 			// fixed head: hdr + resource_id + nr_entries.
 			self.hdr(CMD_RESOURCE_ATTACH_BACKING);
-			wr32(self.cmd_virt + 24, RESOURCE_ID);
-			wr32(self.cmd_virt + 28, pages as u32);
+			wr32(self.cmd_virt + 24, id);
+			wr32(self.cmd_virt + 28, nr as u32);
 			// descriptor chain: [head 32B][entry page 0..N][response].
-			let entry_bytes = pages * 16;
+			let entry_bytes = nr * 16;
 			let entry_pages = align_up(entry_bytes, PAGE) / PAGE;
 			let mut descs: [(u64, u32, bool); 16] = [(0, 0, false); 16];
 			let mut n = 0;
@@ -191,28 +229,28 @@ impl Gpu {
 		}
 	}
 
-	// SET_SCANOUT: bind the resource to scanout 0 covering the whole display.
-	unsafe fn set_scanout(&self, w: u32, h: u32) -> bool {
+	// SET_SCANOUT: bind resource `id` to scanout 0 covering the whole display.
+	unsafe fn set_scanout(&self, id: u32, w: u32, h: u32) -> bool {
 		unsafe {
 			self.hdr(CMD_SET_SCANOUT);
 			self.rect(24, 0, 0, w, h);
 			wr32(self.cmd_virt + 40, SCANOUT_ID);
-			wr32(self.cmd_virt + 44, RESOURCE_ID);
+			wr32(self.cmd_virt + 44, id);
 			self.submit(48, HDR_LEN as u32) == Some(RESP_OK_NODATA)
 		}
 	}
 
 	// Present a rectangle of the framebuffer: copy those guest-backing pixels to the
-	// host resource, then flush that rectangle to the display. `stride` is the
-	// resource's pixel width (the backing was allocated at the max geometry), which
-	// fixes the byte offset of the rectangle's first pixel in the backing.
-	unsafe fn present(&self, x: u32, y: u32, w: u32, h: u32, stride: u32) -> bool {
+	// host resource `id`, then flush that rectangle to the display. `stride` is the
+	// resource's pixel width (the backing's allocated geometry), which fixes the byte
+	// offset of the rectangle's first pixel in the backing.
+	unsafe fn present(&self, id: u32, x: u32, y: u32, w: u32, h: u32, stride: u32) -> bool {
 		unsafe {
 			// TRANSFER_TO_HOST_2D: rect, offset(u64), resource_id, padding.
 			self.hdr(CMD_TRANSFER_TO_HOST_2D);
 			self.rect(24, x, y, w, h);
 			wr64(self.cmd_virt + 40, (y as u64 * stride as u64 + x as u64) * 4);
-			wr32(self.cmd_virt + 48, RESOURCE_ID);
+			wr32(self.cmd_virt + 48, id);
 			wr32(self.cmd_virt + 52, 0);
 			if self.submit(56, HDR_LEN as u32) != Some(RESP_OK_NODATA) {
 				return false;
@@ -220,7 +258,7 @@ impl Gpu {
 			// RESOURCE_FLUSH: rect, resource_id, padding.
 			self.hdr(CMD_RESOURCE_FLUSH);
 			self.rect(24, x, y, w, h);
-			wr32(self.cmd_virt + 40, RESOURCE_ID);
+			wr32(self.cmd_virt + 40, id);
 			wr32(self.cmd_virt + 44, 0);
 			self.submit(48, HDR_LEN as u32) == Some(RESP_OK_NODATA)
 		}
@@ -247,6 +285,61 @@ unsafe fn dma(size: u64) -> Option<Dma> {
 	unsafe {
 		let (handle, virt, _phys) = dma_buffer(size)?;
 		Some(Dma { handle, virt })
+	}
+}
+
+// The guest framebuffer and its host resource: the DmaBuffer backing (unmapped here -
+// ConsoleService is the one that renders into it, and a DmaBuffer maps only once),
+// the mem-entry list, the resource id bound to the backing, and the allocated
+// geometry (the pitch every consumer renders against). Reallocated whenever the host
+// display outgrows it - displays outgrow any constant, so no fixed ceiling stands
+// here; the display's own reported size is the only bound.
+struct Backing {
+	handle: u64,
+	entries: Dma,
+	id: u32,
+	w: u32,
+	h: u32,
+}
+
+// Allocate a framebuffer + host resource for `w x h` under resource id `id`: the
+// DmaBuffer backing, its mem-entry list, RESOURCE_CREATE_2D and ATTACH_BACKING.
+// None on any failure, with everything allocated so far released (the caller keeps
+// its old backing).
+unsafe fn create_backing(gpu: &Gpu, id: u32, w: u32, h: u32) -> Option<Backing> {
+	unsafe {
+		let fb_size = align_up(w as u64 * h as u64 * 4, PAGE);
+		let pages = fb_size / PAGE;
+		let handle: i64 = dma_buffer_create(fb_size);
+		if handle < 0 {
+			return None;
+		}
+		let handle = handle as u64;
+		let entries = match dma(align_up(pages * 16, PAGE)) {
+			Some(d) => d,
+			None => {
+				close(handle);
+				return None;
+			}
+		};
+		if !gpu.create_2d(id, w, h) || !gpu.attach_backing(id, handle, &entries, pages) {
+			close(entries.handle);
+			close(handle);
+			return None;
+		}
+		Some(Backing { handle, entries, id, w, h })
+	}
+}
+
+// Release a replaced backing: unbind and destroy its host resource, then close our
+// guest handles (ConsoleService's dup keeps the old buffer alive until it swaps to
+// the replacement, so its mapping never dangles).
+unsafe fn release_backing(gpu: &Gpu, old: Backing) {
+	unsafe {
+		gpu.detach_backing(old.id);
+		gpu.unref(old.id);
+		close(old.entries.handle);
+		close(old.handle);
 	}
 }
 
@@ -283,30 +376,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let resp_phys = dma_buffer_phys(resp.handle);
 		let gpu = Gpu { q, cmd_virt: cmd.virt, cmd_phys, resp_virt: resp.virt, resp_phys };
 
-		// 3. query the current display size, then create the resource + framebuffer at the
-		//    maximum size (so the window can grow without reallocating the backing). The
-		//    framebuffer is created but NOT mapped here: a DmaBuffer may be mapped only
-		//    once, and ConsoleService is the one that renders into it, so it maps it. We
-		//    only need the backing's physical frames (dma_buffer_phys_at works unmapped).
+		// 3. query the current display size, then create the resource + framebuffer at
+		//    exactly that geometry - the backing grows on demand when the host display
+		//    outgrows it (see serve), so no ceiling constant stands here. The framebuffer
+		//    is created but NOT mapped here: a DmaBuffer may be mapped only once, and
+		//    ConsoleService is the one that renders into it, so it maps it. We only need
+		//    the backing's physical frames (dma_buffer_phys_at works unmapped).
 		let (init_w, init_h) = gpu.display_size();
-		let max_w = init_w.max(MAX_W);
-		let max_h = init_h.max(MAX_H);
-		let fb_size = align_up(max_w as u64 * max_h as u64 * 4, PAGE);
-		let pages = fb_size / PAGE;
-		let fb_handle: u64 = {
-			let h: i64 = dma_buffer_create(fb_size);
-			if h < 0 {
-				exit();
-			}
-			h as u64
-		};
-		let entries = match dma(align_up(pages * 16, PAGE)) {
-			Some(d) => d,
+		let backing: Backing = match create_backing(&gpu, FIRST_RESOURCE_ID, init_w, init_h) {
+			Some(b) => b,
 			None => exit(),
 		};
-		// create the resource at the max size, attach the backing, then bind scanout 0 to
-		// the current display sub-rectangle of it.
-		if !gpu.create_2d(max_w, max_h) || !gpu.attach_backing(fb_handle, &entries, pages) || !gpu.set_scanout(init_w, init_h) {
+		// bind scanout 0 to the whole allocation (the current display).
+		if !gpu.set_scanout(backing.id, init_w, init_h) {
 			exit();
 		}
 
@@ -324,7 +406,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		};
 		send_blocking(bootstrap, b"driver.virtio-gpu: online", far);
-		serve(&device, &gpu, fb_handle, max_w, max_h, init_w, init_h, service, irq)
+		serve(&device, &gpu, backing, service, irq)
 	}
 }
 
@@ -344,16 +426,18 @@ unsafe fn recv_irq(bootstrap: u64) -> u64 {
 // Serve ConsoleService while watching for host-window resizes. The serve loop waits
 // on the service channel and the config-change interrupt: a message wakes it at once
 // (FB / FLUSH); the interrupt (or, with no interrupt granted, a periodic poll
-// timeout) wakes it to re-read the display size, and on a change it rebinds the
-// scanout to the new sub-rectangle of the resource and tells ConsoleService (RESIZE)
-// so it reflows its terminal. "FB" hands back the framebuffer (max geometry + current
-// size + a MAP|TRANSFER dup of the backing); "FLUSH" presents the current rectangle
-// (backing -> host resource -> display).
-#[allow(clippy::too_many_arguments)]
-unsafe fn serve(device: &Virtio, gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u32, init_w: u32, init_h: u32, service: u64, irq: u64) -> ! {
+// timeout) wakes it to re-read the display size. A resize within the allocation
+// rebinds the scanout to the new sub-rectangle and tells ConsoleService (RESIZE) so
+// it reflows its terminal; a resize BEYOND the allocation reallocates - a new DMA
+// framebuffer and host resource at the new geometry, the scanout re-attached, the
+// old backing released - and hands the new backing over (FBNEW), so any
+// host-supported resolution renders in full. "FB" hands back the framebuffer
+// (allocated geometry + current size + a MAP|TRANSFER dup of the backing); "FLUSH"
+// presents the current rectangle (backing -> host resource -> display).
+unsafe fn serve(device: &Virtio, gpu: &Gpu, mut backing: Backing, service: u64, irq: u64) -> ! {
 	unsafe {
-		let mut cur_w: u32 = init_w;
-		let mut cur_h: u32 = init_h;
+		let mut cur_w: u32 = backing.w;
+		let mut cur_h: u32 = backing.h;
 		let mut req: [u8; 32] = [0u8; 32];
 		loop {
 			// wake on a service request or on a display change. The interrupt path blocks
@@ -374,12 +458,55 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u
 				}
 				// a display change (or poll timeout): a resize shows up as a new
 				// GET_DISPLAY_INFO size.
-				let (nw, nh) = gpu.display_size();
-				let (nw, nh) = (nw.min(max_w), nh.min(max_h));
+				let (mut nw, mut nh) = gpu.display_size();
 				if nw > 0 && nh > 0 && (nw, nh) != (cur_w, cur_h) {
+					if nw > backing.w || nh > backing.h {
+						// the display outgrew the allocation: reallocate at the new geometry
+						// (each axis at least what the old backing held, so a wider-but-
+						// shorter window never shrinks an axis mid-swap), rebind the scanout,
+						// release the old resource, and hand the new backing to ConsoleService.
+						match create_backing(gpu, backing.id + 1, nw.max(backing.w), nh.max(backing.h)) {
+							Some(replacement) => {
+								if !gpu.set_scanout(replacement.id, nw, nh) {
+									release_backing(gpu, replacement);
+									continue;
+								}
+								let old: Backing = core::mem::replace(&mut backing, replacement);
+								release_backing(gpu, old);
+								cur_w = nw;
+								cur_h = nh;
+								// FBNEW: the new backing's geometry, the display size, and a
+								// mappable dup - ConsoleService remaps, swaps its surfaces, and
+								// closes its old handle (which frees the old buffer).
+								let dup: i64 = duplicate(backing.handle, RIGHT_MAP | RIGHT_TRANSFER);
+								if dup < 0 {
+									exit();
+								}
+								let mut msg: [u8; 45] = [0u8; 45];
+								msg[..5].copy_from_slice(b"FBNEW");
+								let info = framebuffer_info(backing.w, backing.h);
+								let fb_len: usize = core::mem::size_of::<Framebuffer>();
+								core::ptr::copy_nonoverlapping(&info as *const Framebuffer as *const u8, msg[5..].as_mut_ptr(), fb_len);
+								msg[5 + fb_len..5 + fb_len + 4].copy_from_slice(&cur_w.to_le_bytes());
+								msg[5 + fb_len + 4..5 + fb_len + 8].copy_from_slice(&cur_h.to_le_bytes());
+								send_blocking(service, &msg[..5 + fb_len + 8], dup as u64);
+								continue;
+							}
+							None => {
+								// the reallocation failed (memory pressure): clamp to the standing
+								// allocation rather than blanking the screen, and fall through to
+								// the in-allocation rebind below.
+								nw = nw.min(backing.w);
+								nh = nh.min(backing.h);
+								if (nw, nh) == (cur_w, cur_h) {
+									continue;
+								}
+							}
+						}
+					}
 					cur_w = nw;
 					cur_h = nh;
-					gpu.set_scanout(cur_w, cur_h);
+					gpu.set_scanout(backing.id, cur_w, cur_h);
 					// ask ConsoleService to reflow to the new display (it then renders and
 					// FLUSHes, which presents the new frame).
 					let mut msg: [u8; 14] = [0u8; 14];
@@ -402,14 +529,14 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u
 					Polled::Message { len, .. } => {
 						let m: &[u8] = &req[..len];
 						if m.starts_with(b"FB") {
-							// hand back the max framebuffer geometry (pitch and extent), the
-							// current display size, and a mappable, transferable dup of the
+							// hand back the allocated framebuffer geometry (pitch and extent),
+							// the current display size, and a mappable, transferable dup of the
 							// backing handle (we keep our own handle to stay pinned).
-							let dup: i64 = duplicate(fb_handle, RIGHT_MAP | RIGHT_TRANSFER);
+							let dup: i64 = duplicate(backing.handle, RIGHT_MAP | RIGHT_TRANSFER);
 							if dup < 0 {
 								exit();
 							}
-							let info = Framebuffer { width: max_w, height: max_h, pitch: max_w * 4, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] };
+							let info = framebuffer_info(backing.w, backing.h);
 							let fb_len: usize = core::mem::size_of::<Framebuffer>();
 							let mut reply: [u8; 32] = [0u8; 32];
 							core::ptr::copy_nonoverlapping(&info as *const Framebuffer as *const u8, reply.as_mut_ptr(), fb_len);
@@ -436,7 +563,7 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u
 				let w = w.min(cur_w - x);
 				let h = h.min(cur_h - y);
 				if w > 0 && h > 0 {
-					gpu.present(x, y, w, h, max_w);
+					gpu.present(backing.id, x, y, w, h, backing.w);
 				}
 			}
 		}
@@ -446,6 +573,12 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, fb_handle: u64, max_w: u32, max_h: u
 // Read a little-endian u32 at `at` in `m`.
 fn rd32_le(m: &[u8], at: usize) -> u32 {
 	u32::from_le_bytes([m[at], m[at + 1], m[at + 2], m[at + 3]])
+}
+
+// The ABI Framebuffer describing a backing of the given allocated geometry (the
+// B8G8R8X8 pixel layout every consumer renders with).
+fn framebuffer_info(w: u32, h: u32) -> Framebuffer {
+	Framebuffer { width: w, height: h, pitch: w * 4, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] }
 }
 
 // The bounding box of two rectangles (x, y, w, h).

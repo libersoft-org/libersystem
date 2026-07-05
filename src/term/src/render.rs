@@ -278,6 +278,17 @@ impl Term {
 		}
 	}
 
+	// Swap the renderer onto a new surface (the gpu driver reallocated its backing for
+	// a larger display): the grid model is untouched, the caret bookkeeping is reset
+	// (the old pixels went with the old backing), and the whole grid is marked dirty so
+	// the next flush repaints in full onto the new pixels.
+	pub fn set_surface(&mut self, surface: Box<dyn Surface>) {
+		self.renderer.surface = surface;
+		self.renderer.last_caret = None;
+		self.renderer.dirty = None;
+		self.screen.mark_all_dirty();
+	}
+
 	// Paint the model's pending output to the framebuffer (the model's scroll + dirty diff;
 	// see FramebufferRenderer::flush).
 	pub fn flush(&mut self) {

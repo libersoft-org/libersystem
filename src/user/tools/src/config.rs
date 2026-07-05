@@ -17,8 +17,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::config;
 use proto::system::ConfigEntry;
+use proto::system::config;
 use rt::*;
 
 #[unsafe(no_mangle)]
