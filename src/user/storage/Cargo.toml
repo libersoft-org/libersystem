@@ -43,3 +43,20 @@ udf = { path = "../../fs/udf" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).
+
+# The dev build keeps this service debuggable but optimizes the filesystem crates
+# it links: LiberFS verifies a CRC32C per block it reads, and the unoptimized
+# checksum dominates every file open (a ~30 ms fixed cost on loading even a small
+# binary - the M75 lesson, applied to the service build; opt-level 2 makes an
+# open I/O-bound again).
+[profile.dev.package.liberfs]
+opt-level = 2
+
+[profile.dev.package.fat]
+opt-level = 2
+
+[profile.dev.package.iso9660]
+opt-level = 2
+
+[profile.dev.package.udf]
+opt-level = 2

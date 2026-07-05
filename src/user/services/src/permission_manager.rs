@@ -46,7 +46,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::system::permission::{self, Service};
-use proto::system::{AuditEntry, Capability, Error, Manifest, StartResult, process};
+use proto::system::{process, AuditEntry, Capability, Error, Manifest, StartResult};
 use rt::*;
 
 // The governed component this milestone launches, and the rights a granted client is

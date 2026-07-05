@@ -43,7 +43,7 @@ use fat::FatFs;
 use iso9660::Iso9660;
 use liberfs::{BlockDevice, FormatOpts, FsError, LiberFs};
 use proto::codec::Buffer;
-use proto::system::{Error, FileInfo, FileKind, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, volume};
+use proto::system::{volume, Error, FileInfo, FileKind, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus};
 use rt::*;
 use udf::Udf;
 
@@ -1074,7 +1074,11 @@ unsafe fn block_request_sectors(block_client: u64) -> u32 {
 		match recv_blocking(block_client, &mut rep) {
 			Received::Message { len, handle } if len >= 16 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => {
 				let max: u32 = u32::from_le_bytes([rep[12], rep[13], rep[14], rep[15]]);
-				if max == 0 { MAX_SECTORS_FALLBACK } else { max }
+				if max == 0 {
+					MAX_SECTORS_FALLBACK
+				} else {
+					max
+				}
 			}
 			_ => MAX_SECTORS_FALLBACK,
 		}
