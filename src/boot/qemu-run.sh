@@ -211,10 +211,13 @@ if [[ "$want_spice" == "1" ]]; then
 	QEMU_ARGS+=(-spice "port=${SPICE_PORT:-5930},addr=0.0.0.0,disable-ticketing=on")
 fi
 
+# Match the guest's core count to the host's (overridable with SMP=<n>), so SMP
+# runs exercise everything the machine has instead of a fixed number.
+SMP="${SMP:-$(nproc)}"
 if [[ "${NOKVM:-0}" != "1" && -e /dev/kvm ]]; then
-	QEMU_ARGS+=(-enable-kvm -cpu host -smp 8)
+	QEMU_ARGS+=(-enable-kvm -cpu host -smp "$SMP")
 else
-	QEMU_ARGS+=(-cpu qemu64,+rdrand -smp 8)
+	QEMU_ARGS+=(-cpu qemu64,+rdrand -smp "$SMP")
 fi
 
 if [[ "${DEBUG:-0}" == "1" ]]; then

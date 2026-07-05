@@ -1,6 +1,5 @@
 # Bugs / changes
 
-- demo showing graphics and sound capabilities
 - lsvol - show table with used / total size
 - Some commands are missing --help parameter
 - Create some debug tools that makes debugging easier? As some debug tests took ridiculously long time
@@ -49,3 +48,4 @@
 - How does ramdisk work? Does it have some file system?
 - What is the difference between SYS_CLOCK_GET, SYS_CLOCK_RTC and SYS_CLOCK_MONO_NS? Also clock(), clock_rtc() and clock_ns()?
 - Virtio drivers - MSI-X only? Remove the old IRQ?
+- Demo showing graphics and sound capabilities
