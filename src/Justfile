@@ -71,6 +71,12 @@ test: sdk user
 screenshot path: build
 	boot/screenshot.sh {{path}}
 
+# drive a live instance for debugging: boot it, run shell commands in it and get
+# their output back, tail the serial log, capture packets, type on the keyboard.
+# e.g. `just lab boot --fresh`, `just lab sh time ls`, `just lab help`
+lab *args:
+	boot/lab.py {{args}}
+
 # build a bootable hybrid ISO (BIOS + UEFI) -> boot/.build/<product>.iso; STRIP=debug|all
 iso strip="debug": build
 	STRIP={{strip}} boot/mkimage.sh iso {{kernel_elf}}
