@@ -227,9 +227,12 @@ pub struct Framebuffer {
 
 // The introspection view object_info_get returns for a handle: the identity (koid)
 // of the object behind it, its stable type code (ObjectType::code - Domain = 0,
-// Process = 1, Thread = 2, ...), the rights the handle confers, and the object's
-// generation. repr(C) with fixed-width fields so it marshals cleanly across the
-// syscall boundary; the kernel writes it, userspace reads it.
+// Process = 1, Thread = 2, ...), the rights the handle confers, the object's
+// generation, and - for memory-backed objects (MemoryObject, DmaBuffer) - its byte
+// size (0 for other types), so a service can validate a claimed transfer length
+// against the real object instead of a guessed cap. repr(C) with fixed-width
+// fields so it marshals cleanly across the syscall boundary; the kernel writes
+// it, userspace reads it.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ObjectInfo {
@@ -237,6 +240,7 @@ pub struct ObjectInfo {
 	pub object_type: u64,
 	pub rights: u32,
 	pub generation: u32,
+	pub size: u64,
 }
 
 // The live per-process view process_stats_get returns for a Process handle: the IPC

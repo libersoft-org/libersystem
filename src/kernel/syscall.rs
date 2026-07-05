@@ -695,7 +695,19 @@ fn sys_device_msix_acquire(index: u64) -> i64 {
 		Some((cap, table_phys, bus, dev, func)) if cap != 0 => (cap, table_phys, bus, dev, func),
 		_ => return ERR_INVALID,
 	};
-	let dest = arch::percpu::this_cpu().lapic_id() as u8;
+	// Our MSI message address encodes an 8-bit xAPIC destination. If the running
+	// core's LAPIC id does not fit (a >255-core machine), steer the vector to the
+	// first core with an addressable id instead of truncating silently; x2APIC
+	// delivery, which would lift the limit, is not implemented yet.
+	let lapic = arch::percpu::this_cpu().lapic_id();
+	let dest = if lapic <= u8::MAX as u32 {
+		lapic as u8
+	} else {
+		match (0..crate::smp::cpu_count()).map(crate::smp::lapic_id).find(|&id| id <= u8::MAX as u32) {
+			Some(id) => id as u8,
+			None => return ERR_RESOURCE_EXHAUSTED,
+		}
+	};
 	let vector = match arch::interrupts::acquire_msi(table_phys, dest, index as u32) {
 		Some(v) => v,
 		None => return ERR_RESOURCE_EXHAUSTED,
@@ -1234,12 +1246,6 @@ fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
 	}
 }
 
-// The most handles `wait_any` accepts at once - a sanity bound on the caller's
-// array (the scratch tables live on the kernel heap, so this is not a memory
-// cap), well above any real wait set: a service multiplexing hundreds of client
-// and socket channels still fits.
-const MAX_WAIT_ANY: usize = 4096;
-
 // Block until ANY handle in the caller's array `[handles_ptr; count]` is ready,
 // returning that handle's index, or ERR_TIMED_OUT at `deadline` (absolute ticks,
 // 0 = none). Like `wait` but over a set: a driver waits on its device interrupt and
@@ -1249,7 +1255,12 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 	let periodic = flags & abi::WAIT_PERIODIC != 0;
 	let thread = current_thread!();
 	let n = count as usize;
-	if n == 0 || n > MAX_WAIT_ANY || !user_buf_ok(handles_ptr, count * 8) {
+	// A wait set cannot name more handles than the caller's domain actually holds:
+	// every entry must resolve in the handle table below, and the domain's live
+	// handle count bounds the table. This is the real bound on the caller's array
+	// (the scratch tables live on the kernel heap, so it is not a memory cap).
+	let held = thread.process().domain().account().handles().used();
+	if n == 0 || n as u64 > held || !user_buf_ok(handles_ptr, count * 8) {
 		return ERR_INVALID;
 	}
 	let raw = unsafe { core::slice::from_raw_parts(handles_ptr as *const u64, n) };
@@ -1357,20 +1368,35 @@ fn sys_fault_info_get(buf_ptr: u64, buf_len: u64) -> i64 {
 }
 
 // Introspect a handle in the caller's table: write an ObjectInfo describing the
-// object behind it (koid, type, rights, generation) into the caller's buffer.
-// Returns 1 on success, ERR_BAD_HANDLE for an unknown/stale handle, or
-// ERR_INVALID if the buffer is too small or out of range.
+// object behind it (koid, type, rights, generation, byte size for memory-backed
+// objects) into the caller's buffer. Returns 1 on success, ERR_BAD_HANDLE for an
+// unknown/stale handle, or ERR_INVALID if the buffer is too small or out of range.
 fn sys_object_info_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	let thread = current_thread!();
-	let info = match thread.handles().lock().info(Handle::from_raw(handle)) {
-		Some(i) => i,
-		None => return ERR_BAD_HANDLE,
+	let (info, object) = {
+		let table = thread.handles().lock();
+		let info = match table.info(Handle::from_raw(handle)) {
+			Some(i) => i,
+			None => return ERR_BAD_HANDLE,
+		};
+		let object = match table.lookup(Handle::from_raw(handle), Rights::NONE) {
+			Ok(o) => o,
+			Err(_) => return ERR_BAD_HANDLE,
+		};
+		(info, object)
 	};
 	let size = core::mem::size_of::<ObjectInfo>() as u64;
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	let out = ObjectInfo { koid: info.koid, object_type: info.object_type.code(), rights: info.rights.bits(), generation: info.generation };
+	// The real byte size of memory-backed objects, so a service can validate a
+	// claimed transfer length against the object itself; 0 for other types.
+	let obj_size = match info.object_type {
+		ObjectType::MemoryObject => object.as_any().downcast_ref::<MemoryObject>().map_or(0, |m| m.size() as u64),
+		ObjectType::DmaBuffer => object.as_any().downcast_ref::<DmaBuffer>().map_or(0, |d| d.size() as u64),
+		_ => 0,
+	};
+	let out = ObjectInfo { koid: info.koid, object_type: info.object_type.code(), rights: info.rights.bits(), generation: info.generation, size: obj_size };
 	unsafe {
 		(buf_ptr as *mut ObjectInfo).write_unaligned(out);
 	}

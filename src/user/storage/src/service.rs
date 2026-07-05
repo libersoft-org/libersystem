@@ -87,11 +87,6 @@ const ISO_SECTORS: u64 = (iso9660::SECTOR_SIZE / SECTOR_SIZE) as u64;
 // within a single DMA page (8 sectors).
 const UDF_SECTORS: u64 = (udf::SECTOR_SIZE / SECTOR_SIZE) as u64;
 
-// An upper bound on a single write, so a bogus buffer length cannot make us allocate
-// without limit; a sanity bound well above any real write, never a policy limit - the
-// filesystem enforces the real per-file maximum.
-const MAX_WRITE: usize = 16 * 1024 * 1024;
-
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
@@ -890,14 +885,21 @@ unsafe fn read_seed_archive(block_client: u64) -> Option<Vec<u8>> {
 
 // Copy the bytes behind a zero-copy `data` buffer out into a Vec and release the
 // transferred buffer handle. Always consumes the handle. Returns None on failure or
-// if the length exceeds MAX_WRITE.
+// if the claimed length exceeds the transferred object's real size.
 unsafe fn read_buffer(data: &Buffer) -> Option<Vec<u8>> {
 	unsafe {
 		if data.handle == 0 {
 			return None;
 		}
 		let len: usize = data.len as usize;
-		if len > MAX_WRITE {
+		// Bind the claimed length to the object the client actually transferred: the
+		// kernel reports the memory object's real byte size, so a bogus length can
+		// never make us allocate or copy beyond what the client backed with memory.
+		let real: usize = match object_info(data.handle) {
+			Some(info) => info.size as usize,
+			None => 0,
+		};
+		if len > real {
 			close(data.handle);
 			return None;
 		}

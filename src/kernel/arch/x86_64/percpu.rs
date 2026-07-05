@@ -2,22 +2,21 @@
 //
 // Each core keeps a pointer to its own PerCpu block in the IA32_GS_BASE MSR, so
 // `this_cpu()` resolves to the running core's data with no locking. The blocks
-// live in a fixed static array indexed by our contiguous CPU id (the BSP is 0).
+// are allocated once at SMP bring-up, sized by the machine's real core count
+// from the Limine MP response (the heap is up long before any core - the BSP
+// included - initializes its slot), and indexed by our contiguous CPU id (the
+// BSP is 0).
 
 #![allow(dead_code)]
 
-use core::ptr::addr_of_mut;
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+use alloc::vec::Vec;
 
 use super::msr;
 
 const IA32_GS_BASE: u32 = 0xc000_0101;
-
-// Upper bound on supported cores - the CPU id space. It sizes only the cheap static
-// per-CPU tables (~60 B per possible core); everything expensive - a core's GDT,
-// TSS and fault stacks - is allocated from the heap when the core actually comes
-// online, so absent cores cost nothing. Cores beyond the bound stay parked,
-// loudly reported by smp::init.
-pub const MAX_CPUS: usize = 8192;
 
 // Byte offsets of the syscall-scratch fields within PerCpu, used by the ring-3
 // syscall entry stub to reach them through GS. Pinned by the asserts below.
@@ -64,13 +63,25 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, user_rip) == USER_RIP_OFFSET
 const _: () = assert!(core::mem::offset_of!(PerCpu, user_rflags) == USER_RFLAGS_OFFSET);
 const _: () = assert!(core::mem::offset_of!(PerCpu, from_user) == FROM_USER_OFFSET);
 
-static mut PER_CPU: [PerCpu; MAX_CPUS] = [const { PerCpu::empty() }; MAX_CPUS];
+static PER_CPU: AtomicPtr<PerCpu> = AtomicPtr::new(ptr::null_mut());
+
+// Allocate the per-CPU blocks for `count` cores, sized by the MP response. Called
+// once by smp::init before any core - the BSP included - runs its per-CPU init.
+pub fn allocate(count: usize) {
+	let mut blocks: Vec<PerCpu> = Vec::with_capacity(count);
+	blocks.resize_with(count, PerCpu::empty);
+	let leaked: &'static mut [PerCpu] = Vec::leak(blocks);
+	let prev = PER_CPU.swap(leaked.as_mut_ptr(), Ordering::Release);
+	assert!(prev.is_null(), "per-CPU blocks allocated twice");
+}
 
 // Initialize the running core's per-CPU block and point GS base at it. Each core
 // touches only its own slot, so concurrent calls on different cores do not race.
 pub fn init(cpu_id: usize, lapic_id: u32) {
+	let base = PER_CPU.load(Ordering::Acquire);
+	assert!(!base.is_null(), "per-CPU blocks not allocated");
 	unsafe {
-		let slot = addr_of_mut!(PER_CPU).cast::<PerCpu>().add(cpu_id);
+		let slot = base.add(cpu_id);
 		(*slot).cpu_id = cpu_id as u32;
 		(*slot).lapic_id = lapic_id;
 		msr::write(IA32_GS_BASE, slot as u64);

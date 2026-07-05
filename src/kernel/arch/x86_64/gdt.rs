@@ -11,8 +11,8 @@
 // (16-byte TSS descriptors against the 64 kB GDT limit), and per-core GDTs also
 // let every core use the same TSS selector. The BSP's area (GDT + TSS + fault
 // stacks) is static - it is needed before any allocator runs - while each AP's
-// is allocated from the kernel heap when the core is brought online, so a huge
-// MAX_CPUS costs nothing for cores that do not exist.
+// is allocated from the kernel heap when the core is brought online, so absent
+// cores cost nothing.
 
 use core::arch::asm;
 use core::mem::size_of;

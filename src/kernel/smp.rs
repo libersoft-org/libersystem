@@ -1,12 +1,15 @@
 // Symmetric multiprocessing: bring application processors online.
 //
 // Limine starts each application processor (AP) for us and parks it until we
-// write its per-CPU `goto_address`. We assign every core a contiguous CPU id
-// (the bootstrap processor is 0), wake each AP into `ap_entry`, and wait until
-// all of them have run their per-CPU init and reported in.
+// write its per-CPU `goto_address`. We size every per-CPU table from the MP
+// response first - the heap is up long before any core initializes its slot -
+// then assign every core a contiguous CPU id (the bootstrap processor is 0),
+// wake each AP into `ap_entry`, and wait until all of them have run their
+// per-CPU init and reported in.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
+use alloc::vec::Vec;
 use limine::mp::Cpu;
 use limine::response::MpResponse;
 
@@ -20,8 +23,9 @@ static CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
 
 // Each core's LAPIC id by CPU id, retained at report-in so the CPU topology stays
-// inspectable at runtime - SYS_CPU_INFO reads it for `lscpu`.
-static LAPIC_IDS: [AtomicU32; arch::percpu::MAX_CPUS] = [const { AtomicU32::new(0) }; arch::percpu::MAX_CPUS];
+// inspectable at runtime - SYS_CPU_INFO reads it for `lscpu`. Allocated by init,
+// sized by the machine's real core count.
+static LAPIC_IDS: AtomicPtr<AtomicU32> = AtomicPtr::new(core::ptr::null_mut());
 
 // Serializes report-in lines so concurrent cores do not interleave their output.
 static REPORT_LOCK: SpinLock<()> = SpinLock::new(());
@@ -38,16 +42,40 @@ pub fn online_count() -> usize {
 
 // The LAPIC id of the core with CPU id `cpu` (0 for a core that never reported in).
 pub fn lapic_id(cpu: usize) -> u32 {
-	if cpu >= arch::percpu::MAX_CPUS {
+	if cpu >= cpu_count() {
 		return 0;
 	}
-	LAPIC_IDS[cpu].load(Ordering::Relaxed)
+	let base = LAPIC_IDS.load(Ordering::Acquire);
+	if base.is_null() {
+		return 0;
+	}
+	unsafe { (*base.add(cpu)).load(Ordering::Relaxed) }
 }
 
 // Wake every application processor and wait for all cores to report in. Runs on
 // the BSP after memory and interrupts are up.
 pub fn init(mp: &MpResponse) {
 	let bsp_lapic_id = mp.bsp_lapic_id();
+
+	// Size every per-CPU table from the machine's real core count before any
+	// core - the BSP included - initializes its slot. Counted the same way the
+	// wake loop below assigns ids, so the tables and the id space always agree.
+	let total = 1 + mp.cpus().iter().filter(|cpu| cpu.lapic_id != bsp_lapic_id).count();
+	let mut ids: Vec<AtomicU32> = Vec::with_capacity(total);
+	ids.resize_with(total, || AtomicU32::new(0));
+	LAPIC_IDS.store(Vec::leak(ids).as_mut_ptr(), Ordering::Release);
+	arch::percpu::allocate(total);
+	crate::sched::allocate(total);
+	CPU_COUNT.store(total, Ordering::Relaxed);
+
+	// x2APIC honesty: our MSI message address encodes an 8-bit xAPIC destination,
+	// so a core whose LAPIC id does not fit one byte (a >255-core machine) cannot
+	// be targeted by device interrupts until x2APIC addressing lands. Say so
+	// loudly rather than truncating ids silently.
+	if mp.cpus().iter().any(|cpu| cpu.lapic_id > u8::MAX as u32) {
+		crate::serial_println!("smp: WARNING: LAPIC ids beyond 255 present; MSI delivery (8-bit xAPIC destination) cannot target those cores - x2APIC addressing is not implemented yet");
+	}
+
 	arch::init_bsp_percpu(bsp_lapic_id);
 	report(0, bsp_lapic_id, true);
 
@@ -55,11 +83,6 @@ pub fn init(mp: &MpResponse) {
 	for cpu in mp.cpus() {
 		if cpu.lapic_id == bsp_lapic_id {
 			continue;
-		}
-		if next_id >= arch::percpu::MAX_CPUS {
-			// Never park cores silently: say so on the boot log, loudly.
-			crate::serial_println!("smp: WARNING: machine has more cores than MAX_CPUS ({}); the rest stay parked", arch::percpu::MAX_CPUS);
-			break;
 		}
 		let cpu_id = next_id;
 		next_id += 1;
@@ -90,7 +113,8 @@ unsafe extern "C" fn ap_entry(cpu: &Cpu) -> ! {
 }
 
 fn report(cpu_id: usize, lapic_id: u32, is_bsp: bool) {
-	LAPIC_IDS[cpu_id].store(lapic_id, Ordering::Relaxed);
+	let base = LAPIC_IDS.load(Ordering::Acquire);
+	unsafe { (*base.add(cpu_id)).store(lapic_id, Ordering::Relaxed) };
 	let _guard = REPORT_LOCK.lock();
 	let role = if is_bsp { "BSP" } else { "AP" };
 	crate::serial_println!("cpu {} ({}) online, lapic_id {}", cpu_id, role, lapic_id);

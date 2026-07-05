@@ -3492,14 +3492,15 @@ fn object_info_get_reports_object() {
 	static DONE: AtomicBool = AtomicBool::new(false);
 	// object_info_get introspects a handle in the caller's table, so it runs inside
 	// a spawned kernel thread (which has one). It reports the object's identity,
-	// type, and the rights the handle confers, and rejects an unknown handle.
+	// type, the rights the handle confers, and the object's byte size, and rejects
+	// an unknown handle.
 	extern "C" fn body(_arg: u64) {
 		use object::ObjectType;
 		use object::rights::Rights;
 		unsafe {
 			let handle = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0);
 			assert!(!syscall::sys_is_err(handle));
-			let mut info = syscall::ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0 };
+			let mut info = syscall::ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0, size: 0 };
 			let info_ptr = &mut info as *mut syscall::ObjectInfo as u64;
 			let size = core::mem::size_of::<syscall::ObjectInfo>() as u64;
 			let got = arch::syscall::invoke(syscall::SYS_OBJECT_INFO_GET, handle, info_ptr, size, 0);
@@ -3508,6 +3509,7 @@ fn object_info_get_reports_object() {
 			assert_eq!(info.object_type, ObjectType::MemoryObject.code());
 			assert_eq!(info.rights, Rights::ALL.bits());
 			assert!(info.generation >= 1);
+			assert_eq!(info.size, 4096, "a MemoryObject reports its real byte size");
 			// an unknown handle is rejected with the bad-handle error
 			let bad = arch::syscall::invoke(syscall::SYS_OBJECT_INFO_GET, 0xdead_beef, info_ptr, size, 0);
 			assert_eq!(bad as i64, syscall::ERR_BAD_HANDLE);

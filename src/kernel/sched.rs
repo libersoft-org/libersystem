@@ -16,10 +16,9 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use crate::arch;
-use crate::arch::percpu::MAX_CPUS;
 use crate::object::KernelObject;
 use crate::object::address_space::AddressSpace;
 use crate::object::domain::Domain;
@@ -59,7 +58,26 @@ impl CpuSched {
 	}
 }
 
-static SCHED: [CpuSched; MAX_CPUS] = [const { CpuSched::new() }; MAX_CPUS];
+static SCHED: AtomicPtr<CpuSched> = AtomicPtr::new(core::ptr::null_mut());
+
+// Allocate the per-core scheduler slots for `count` cores, sized by the MP
+// response. Called once by smp::init before any core parks in its idle loop.
+pub fn allocate(count: usize) {
+	let mut slots: Vec<CpuSched> = Vec::with_capacity(count);
+	slots.resize_with(count, CpuSched::new);
+	let leaked: &'static mut [CpuSched] = Vec::leak(slots);
+	let prev = SCHED.swap(leaked.as_mut_ptr(), Ordering::Release);
+	assert!(prev.is_null(), "scheduler slots allocated twice");
+}
+
+// The scheduler slot of core `cpu`. The table exists from SMP bring-up on; the
+// scheduler is never entered before it (preemption is gated on init()).
+fn cpu_sched(cpu: usize) -> &'static CpuSched {
+	let base = SCHED.load(Ordering::Acquire);
+	assert!(!base.is_null(), "scheduler slots not allocated");
+	assert!(cpu < crate::smp::cpu_count(), "cpu id out of range");
+	unsafe { &*base.add(cpu) }
+}
 
 // A thread blocked in `wait`, parked here (off every run queue) until the object
 // it waits on becomes ready or its deadline passes. The Arc keeps the thread
@@ -138,7 +156,7 @@ pub fn spawn(entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 	let process = Process::new(kernel_as(), root_domain());
 	let thread = Thread::new(entry, arg, process);
-	SCHED[cpu].inner.lock().run_queue.push_back(thread.clone());
+	cpu_sched(cpu).inner.lock().run_queue.push_back(thread.clone());
 	thread
 }
 
@@ -148,7 +166,7 @@ pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject
 	let process = Process::new(kernel_as(), root_domain());
 	let arg = process.install(object, rights, badge);
 	let thread = Thread::new(entry, arg, process);
-	SCHED[current_cpu_id()].inner.lock().run_queue.push_back(thread.clone());
+	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread.clone());
 	thread
 }
 
@@ -158,7 +176,7 @@ pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject
 pub fn spawn_in(domain: Arc<Domain>, entry: extern "C" fn(u64), arg: u64) -> Option<Arc<Thread>> {
 	let process = Process::new(kernel_as(), domain);
 	let thread = Thread::new_in(entry, arg, process)?;
-	SCHED[current_cpu_id()].inner.lock().run_queue.push_back(thread.clone());
+	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread.clone());
 	Some(thread)
 }
 
@@ -173,7 +191,7 @@ pub fn process_create(domain: Arc<Domain>) -> Option<Arc<Process>> {
 // thread shares the process's address space and handle table with its siblings.
 pub fn thread_create(process: Arc<Process>, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 	let thread = Thread::new(entry, arg, process);
-	SCHED[current_cpu_id()].inner.lock().run_queue.push_back(thread.clone());
+	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread.clone());
 	thread
 }
 
@@ -195,7 +213,7 @@ pub fn thread_start(thread: Arc<Thread>) -> bool {
 		return false;
 	}
 	thread.set_state(ThreadState::Ready);
-	SCHED[current_cpu_id()].inner.lock().run_queue.push_back(thread);
+	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread);
 	true
 }
 
@@ -215,7 +233,7 @@ pub fn yield_now() {
 
 // The thread currently running on this core, if any (None in the idle context).
 pub fn current_thread() -> Option<Arc<Thread>> {
-	SCHED[current_cpu_id()].inner.lock().current.clone()
+	cpu_sched(current_cpu_id()).inner.lock().current.clone()
 }
 
 // Terminate the calling thread. Never returns.
@@ -355,7 +373,7 @@ fn min_deadline() -> Option<u64> {
 // Make a woken thread runnable again on the current core.
 fn enqueue(thread: Arc<Thread>) {
 	thread.set_state(ThreadState::Ready);
-	SCHED[current_cpu_id()].inner.lock().run_queue.push_back(thread);
+	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread);
 }
 
 // An optional hook the BSP runs while idle-spinning for the next timed wakeup. It
@@ -389,13 +407,13 @@ fn run_idle_hook() {
 pub fn run_until_idle() {
 	let cpu = current_cpu_id();
 	loop {
-		while !SCHED[cpu].inner.lock().run_queue.is_empty() {
+		while !cpu_sched(cpu).inner.lock().run_queue.is_empty() {
 			reschedule(Disposition::Requeue);
 		}
 		// Wake anything already past its deadline - a periodic wait does not count as
 		// progress below, but it must still run when due.
 		check_deadlines();
-		if !SCHED[cpu].inner.lock().run_queue.is_empty() {
+		if !cpu_sched(cpu).inner.lock().run_queue.is_empty() {
 			continue;
 		}
 		match min_deadline() {
@@ -412,7 +430,7 @@ pub fn run_until_idle() {
 				// hook runs each wake so the BSP keeps draining serial TX and polling serial
 				// input, and check_deadlines runs each wake so a periodic wait due inside this
 				// window still wakes on time.
-				while arch::apic::ticks() < deadline && SCHED[cpu].inner.lock().run_queue.is_empty() {
+				while arch::apic::ticks() < deadline && cpu_sched(cpu).inner.lock().run_queue.is_empty() {
 					run_idle_hook();
 					arch::serial::drain_tx();
 					check_deadlines();
@@ -423,7 +441,7 @@ pub fn run_until_idle() {
 			None => break,
 		}
 	}
-	reap(&SCHED[cpu]);
+	reap(cpu_sched(cpu));
 }
 
 // Idle loop for application processors: run any ready thread, otherwise HALT until
@@ -465,7 +483,7 @@ pub fn on_timer_preempt() {
 	if !PREEMPTION_ENABLED.load(Ordering::Relaxed) {
 		return;
 	}
-	let sched = &SCHED[current_cpu_id()];
+	let sched = cpu_sched(current_cpu_id());
 	{
 		let inner = sched.inner.lock();
 		if inner.current.is_none() || inner.run_queue.is_empty() {
@@ -497,7 +515,7 @@ fn reschedule(disp: Disposition) {
 	let resume_if = arch::interrupts_enabled();
 	arch::disable_interrupts();
 
-	let sched = &SCHED[current_cpu_id()];
+	let sched = cpu_sched(current_cpu_id());
 	reap(sched);
 
 	let mut guard = sched.inner.lock();
