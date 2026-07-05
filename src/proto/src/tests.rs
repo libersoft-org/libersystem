@@ -179,8 +179,14 @@ impl volume::Service for VolStub {
 		if o.path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
 	}
 
-	fn list(&mut self, _path: String) -> Result<Vec<FileInfo>, Error> {
-		Ok(Vec::new())
+	fn list(&mut self, _path: String) -> Vec<FileInfo> {
+		Vec::new()
+	}
+
+	fn write_stream(&mut self, path: String, data: u64) -> Result<(), Error> {
+		// the data channel handle must have travelled out-of-band, like `write`'s
+		// buffer handle.
+		if path.is_empty() || data != 0xBEEF { Err(Error::Invalid) } else { Ok(()) }
 	}
 
 	fn write(&mut self, path: String, data: crate::codec::Buffer) -> Result<(), Error> {

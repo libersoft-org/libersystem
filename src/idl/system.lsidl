@@ -141,7 +141,7 @@ record fsck-report {
 // `fsck` named.
 interface volume {
 	@op(1)  open:        func(o: open-opts) -> result<open-result, error>;
-	@op(2)  list:        func(path: string) -> result<list<file-info>, error>;
+	@op(2)  list:        func(path: string) -> stream<file-info>;
 	@op(3)  write:       func(path: string, data: buffer) -> result<unit, error>;
 	@op(4)  remove:      func(path: string) -> result<unit, error>;
 	@op(5)  snap-create: func(name: string) -> result<unit, error>;
@@ -155,6 +155,10 @@ interface volume {
 	@op(13) set-compression: func(enabled: bool) -> result<unit, error>;
 	@op(14) fsck:            func() -> result<fsck-report, error>;
 	@op(15) restore:         func(path: string, snapshot: string) -> result<unit, error>;
+	// The streaming write form (a file's size is bounded by the filesystem, never by
+	// one transfer): the caller sends the file's bytes as plain messages on `data`
+	// and closes it to mark the end; the reply comes once the whole file is written.
+	@op(16) write-stream:    func(path: string, data: handle<channel>) -> result<unit, error>;
 }
 
 // The class of a discovered device, mirroring the kernel's device type codes.
@@ -596,7 +600,7 @@ record audit-entry {
 // tools only through this op, never the raw kernel loader.
 interface permission {
 	@op(1) lookup: func(component: string) -> result<manifest, error>;
-	@op(2) audit:  func() -> result<list<audit-entry>, error>;
+	@op(2) audit:  func() -> stream<audit-entry>;
 	@op(3) run:    func(name: string, args: string, cwd: string, stdout: handle<channel>) -> result<start-result, error>;
 }
 

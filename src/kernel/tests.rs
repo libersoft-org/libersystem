@@ -1646,6 +1646,31 @@ fn channel_endpoint_semantics() {
 }
 
 #[test_case]
+fn channel_peek_reports_the_pending_length() {
+	use object::channel::{Channel, ChannelError, Message};
+	// The peek that retires the wire ceiling: a receiver learns the next pending
+	// message's exact byte length without dequeuing it, sizes its buffer, and the
+	// recv that follows loses nothing - demonstrated well past the old 4096 B
+	// reply convention.
+	let (a, b) = Channel::create();
+	assert!(matches!(b.peek_len(), Err(ChannelError::Empty)));
+	let big: alloc::vec::Vec<u8> = (0..20_000u32).map(|i| i as u8).collect();
+	a.send(Message::new(big.clone(), alloc::vec::Vec::new(), 0)).unwrap();
+	a.send(Message::new(alloc::vec![7u8; 3], alloc::vec::Vec::new(), 0)).unwrap();
+	// the peek names the FRONT message and does not consume it
+	assert_eq!(b.peek_len().unwrap(), 20_000);
+	assert_eq!(b.peek_len().unwrap(), 20_000, "peek does not dequeue");
+	let first = b.recv().unwrap();
+	assert_eq!(first.bytes, big, "the exactly-sized recv loses nothing");
+	assert_eq!(b.peek_len().unwrap(), 3, "the next message's length follows");
+	let _ = b.recv().unwrap();
+	// empty again while the peer is open, peer-closed once it is gone
+	assert!(matches!(b.peek_len(), Err(ChannelError::Empty)));
+	drop(a);
+	assert!(matches!(b.peek_len(), Err(ChannelError::PeerClosed)));
+}
+
+#[test_case]
 fn pci_scan_finds_virtio_devices() {
 	// QEMU is launched (see qemu-run.sh) with virtio-blk, virtio-net, and a virtio
 	// serial device on the PCI bus. The kernel's PCI scan must find them: at least

@@ -724,8 +724,8 @@ unsafe fn completion_vocab(console: &mut Console, b: u8) -> Vec<Vec<u8>> {
 			let mut names: Vec<Vec<u8>> = Vec::new();
 			if let Some(storage) = service_connect(console.facs.storage) {
 				let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
-				if let Some(Ok(files)) = client.list("vol://system/bin") {
-					names = files.into_iter().map(|f| f.name.into_bytes()).collect();
+				if let Some(consumer) = client.list("vol://system/bin") {
+					names = drain_stream(consumer, proto::system::volume::list_read).into_iter().map(|f| f.name.into_bytes()).collect();
 				}
 				close(storage);
 			}

@@ -131,6 +131,11 @@ pub const SYS_IRQ_INFO: u64 = 57;
 // full boot bus scan (every present function, not just the ones drivers bind), so
 // the bus stays inspectable. A free syscall feeding `lspci`.
 pub const SYS_PCI_INFO: u64 = 58;
+// Report the byte length of the next pending message on a channel WITHOUT
+// dequeuing it (ERR_WOULD_BLOCK when nothing is queued, ERR_PEER_CLOSED once the
+// queue is empty and the peer is gone), so a receiver can size its buffer exactly
+// instead of guessing a ceiling.
+pub const SYS_CHANNEL_PEEK: u64 = 59;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;

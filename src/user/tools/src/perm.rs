@@ -39,32 +39,44 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 // Read the audit trail through the grant and render each typed decision: as JSON (the
 // generated wire form, one document per entry) or as text - one line per entry, each showing
-// the component, the capability, and whether it was granted.
+// the component, the capability, and whether it was granted. The trail arrives as a
+// stream of entries, rendered as they arrive - it never has to fit one reply.
 unsafe fn query_permission(permsvc: u64, json: bool) {
 	unsafe {
 		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
-		match client.audit() {
-			Some(Ok(entries)) => {
-				if json {
-					print(b"[");
-					let mut first: bool = true;
-					for e in entries.iter() {
-						if !first {
-							print(b",");
+		let consumer: u64 = match client.audit() {
+			Some(c) => c,
+			None => {
+				print(b"perm: service unavailable\n");
+				return;
+			}
+		};
+		if json {
+			print(b"[");
+		}
+		let mut first: bool = true;
+		loop {
+			match recv_vec_blocking(consumer) {
+				ReceivedVec::Message { bytes, .. } => {
+					if let Some(e) = permission::audit_read(&bytes) {
+						if json {
+							if !first {
+								print(b",");
+							}
+							first = false;
+							print(e.to_json().as_bytes());
+						} else {
+							print(e.to_text().as_bytes());
+							print(b"\n");
 						}
-						first = false;
-						print(e.to_json().as_bytes());
-					}
-					print(b"]\n");
-				} else {
-					for e in entries.iter() {
-						print(e.to_text().as_bytes());
-						print(b"\n");
 					}
 				}
+				ReceivedVec::Closed => break,
 			}
-			Some(Err(_)) => print(b"perm: query error\n"),
-			None => print(b"perm: service unavailable\n"),
+		}
+		close(consumer);
+		if json {
+			print(b"]\n");
 		}
 	}
 }

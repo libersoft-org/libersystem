@@ -156,6 +156,15 @@ impl Channel {
 		}
 		if self.is_peer_closed() { Err(ChannelError::PeerClosed) } else { Err(ChannelError::Empty) }
 	}
+
+	// The byte length of the next pending message without dequeuing it, so a
+	// receiver can size its buffer exactly before the recv.
+	pub fn peek_len(&self) -> Result<usize, ChannelError> {
+		if let Some(msg) = self.inbox.lock().front() {
+			return Ok(msg.bytes.len());
+		}
+		if self.is_peer_closed() { Err(ChannelError::PeerClosed) } else { Err(ChannelError::Empty) }
+	}
 }
 
 impl_kernel_object!(Channel, Channel);

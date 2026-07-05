@@ -115,8 +115,8 @@ impl Disk {
 	// this boot fits under the count) and again when config lowers the count.
 	fn prune(&mut self, client: &mut volume::Client<ChannelTransport>, keep: u32) -> u32 {
 		let mut boots: Vec<u32> = match client.list("vol://system/log") {
-			Some(Ok(entries)) => entries.iter().filter_map(|e| e.name.strip_prefix("boot-").and_then(|n| n.parse::<u32>().ok())).collect(),
-			_ => return 0,
+			Some(consumer) => unsafe { drain_stream(consumer, volume::list_read) }.iter().filter_map(|e| e.name.strip_prefix("boot-").and_then(|n| n.parse::<u32>().ok())).collect(),
+			None => return 0,
 		};
 		boots.sort_unstable();
 		while boots.len() > keep as usize {

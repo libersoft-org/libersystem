@@ -393,6 +393,71 @@ pub unsafe fn recv_blocking(channel: u64, buf: &mut [u8]) -> Received {
 	}
 }
 
+// A blocking receive whose result owns its exactly-sized payload: a message with
+// its bytes and any transferred handle, or Closed once the peer is gone.
+pub enum ReceivedVec {
+	Message { bytes: alloc::vec::Vec<u8>, handle: u64 },
+	Closed,
+}
+
+// The byte length of the next pending message without dequeuing it: >= 0, or
+// ERR_WOULD_BLOCK / ERR_PEER_CLOSED (negative) - the raw peek.
+pub unsafe fn channel_peek(channel: u64) -> i64 {
+	unsafe { syscall(SYS_CHANNEL_PEEK, channel, 0, 0, 0) as i64 }
+}
+
+// Receive one message sized exactly, blocking while the channel is empty: peek the
+// pending message's length, allocate precisely, and receive into it. No ceiling
+// stands anywhere in this path - a reply is as large as the sender made it.
+pub unsafe fn recv_vec_blocking(channel: u64) -> ReceivedVec {
+	unsafe {
+		loop {
+			let pending: i64 = channel_peek(channel);
+			if pending == ERR_WOULD_BLOCK {
+				wait(channel, 0);
+				continue;
+			}
+			if pending < 0 {
+				return ReceivedVec::Closed;
+			}
+			let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; pending as usize];
+			let mut handle: u64 = 0;
+			let got: i64 = syscall(SYS_CHANNEL_RECV, channel, bytes.as_mut_ptr() as u64, bytes.len() as u64, &mut handle as *mut u64 as u64) as i64;
+			if got == ERR_WOULD_BLOCK {
+				// another receiver raced the peeked message away; go around.
+				continue;
+			}
+			if got < 0 {
+				return ReceivedVec::Closed;
+			}
+			bytes.truncate(got as usize);
+			return ReceivedVec::Message { bytes, handle };
+		}
+	}
+}
+
+// Drain a stream's consumer channel to completion: decode each frame with `read`
+// and collect the items (the producer closing the channel marks end-of-stream).
+// The consumer handle is closed. A consumer that renders incrementally loops over
+// `recv_vec_blocking` by hand instead.
+pub unsafe fn drain_stream<T, F: Fn(&[u8]) -> Option<T>>(consumer: u64, read: F) -> alloc::vec::Vec<T> {
+	unsafe {
+		let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();
+		loop {
+			match recv_vec_blocking(consumer) {
+				ReceivedVec::Message { bytes, .. } => {
+					if let Some(item) = read(&bytes) {
+						items.push(item);
+					}
+				}
+				ReceivedVec::Closed => break,
+			}
+		}
+		close(consumer);
+		items
+	}
+}
+
 // A non-blocking receive result: a message, an empty-but-open channel, or a closed
 // one. Lets a poller (e.g. the shell reaping finished background jobs) tell an empty
 // channel from a closed one without blocking.
@@ -758,10 +823,11 @@ impl proto::codec::Transport for ChannelTransport {
 			if !send_blocking(self.chan, request, request_handle) {
 				return None;
 			}
-			let mut reply: [u8; 4096] = [0u8; 4096];
-			match recv_blocking(self.chan, &mut reply) {
-				Received::Message { len, handle } => Some((reply[..len].to_vec(), handle)),
-				Received::Closed => None,
+			// The reply is received sized exactly (peek + recv), so a typed reply is
+			// as large as the service made it - no wire ceiling stands here.
+			match recv_vec_blocking(self.chan) {
+				ReceivedVec::Message { bytes, handle } => Some((bytes, handle)),
+				ReceivedVec::Closed => None,
 			}
 		}
 	}

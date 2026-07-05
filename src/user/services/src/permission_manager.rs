@@ -283,8 +283,11 @@ impl Service for Manager {
 	fn lookup(&mut self, component: String) -> Result<Manifest, Error> {
 		manifest_for(component.as_bytes()).ok_or(Error::NotFound)
 	}
-	fn audit(&mut self) -> Result<Vec<AuditEntry>, Error> {
-		Ok(self.audit.clone())
+	// The audit trail, streamed entry by entry (the serve loop frames the vector
+	// onto a sub-channel): the trail grows with every launch and never has to fit
+	// one reply.
+	fn audit(&mut self) -> Vec<AuditEntry> {
+		self.audit.clone()
 	}
 	fn run(&mut self, name: String, args: String, cwd: String, stdout: u64) -> Result<StartResult, Error> {
 		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), stdout, &self.clients, &mut self.audit) } {
@@ -601,11 +604,49 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 5. serve generated lookup/audit/run requests until the supervisor drops the channel. The
 	//    self-connection's server end is seeded into the client set alongside the root, so the
 	//    governed `perm` command - granted the matching client end - is served like any other.
+	//    OP_AUDIT opens a stream (the log-tail model): the trail is framed entry by entry onto
+	//    a fresh sub-channel, so it never has to fit one reply.
 	let mut manager: Manager = Manager { audit, procsvc, clients };
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
-		serve_multi_seeded(service, &[perm_self_server], &mut request, &mut reply, |_chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { permission::dispatch(&mut manager, req, handle, out, reply_handle) });
+		serve_multi_seeded(service, &[perm_self_server], &mut request, &mut reply, |chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
+			let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
+			if op == permission::OP_AUDIT {
+				stream_audit(&mut manager, chan, req);
+				return None;
+			}
+			permission::dispatch(&mut manager, req, handle, out, reply_handle)
+		});
 	}
 	exit();
+}
+
+// Serve one OP_AUDIT request: gather the trail snapshot, then stream the entries to
+// the client over a fresh sub-channel (the reply carries the correlation id and the
+// consumer endpoint out-of-band; closing the producer marks end-of-stream).
+fn stream_audit(manager: &mut Manager, service: u64, request: &[u8]) {
+	let (corr, items): (u32, Vec<AuditEntry>) = match permission::audit_open(manager, request) {
+		Some(v) => v,
+		None => return,
+	};
+	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
+		Some(pair) => pair,
+		None => return,
+	};
+	let corr_bytes: [u8; 4] = corr.to_le_bytes();
+	unsafe {
+		send_blocking(service, &corr_bytes, consumer);
+	}
+	let mut frame: [u8; 1024] = [0u8; 1024];
+	for (seq, item) in items.iter().enumerate() {
+		if let Some(n) = permission::audit_frame(seq as u32, item, &mut frame) {
+			unsafe {
+				send_blocking(producer, &frame[..n], 0);
+			}
+		}
+	}
+	unsafe {
+		close(producer);
+	}
 }

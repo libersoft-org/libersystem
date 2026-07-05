@@ -136,7 +136,7 @@ unsafe fn volume_count(storage: u64, uri: &str) -> usize {
 	}
 	let mut client = volume::Client::new(ChannelTransport { chan: storage });
 	match client.list(uri) {
-		Some(Ok(files)) => files.len(),
-		_ => 0,
+		Some(consumer) => unsafe { drain_stream(consumer, volume::list_read) }.len(),
+		None => 0,
 	}
 }

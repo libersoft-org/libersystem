@@ -130,17 +130,68 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
-		serve_multi(service, &mut buf, &mut reply, |_chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
+		serve_multi(service, &mut buf, &mut reply, |chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
 			// stamp the wall clock onto the filesystem before each request, so a
 			// mutation's inode timestamps carry real time (the RTC's Unix seconds; the
 			// NTP-disciplined policy clock lives in TimeService).
 			if let Volume::Disk(fs) = &mut vol {
 				fs.set_clock(clock_rtc());
 			}
+			// OP_LIST opens a stream (the log-tail model): the entries are framed one
+			// by one onto a fresh sub-channel, so a big directory never has to fit one
+			// reply. Everything else dispatches to a single reply.
+			let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
+			if op == volume::OP_LIST {
+				stream_list(&mut vol, chan, req);
+				return None;
+			}
 			volume::dispatch(&mut vol, req, handle, out, reply_handle)
 		});
 	}
 	exit();
+}
+
+// Serve one OP_LIST request: decode it, gather the listing, then stream the entries
+// to the client over a fresh sub-channel (the reply carries the correlation id and
+// the consumer endpoint out-of-band; closing the producer marks end-of-stream). A
+// bad path replies the correlation id with NO consumer handle - the generated
+// client reads that as "no stream" - so an error stays distinguishable from an
+// empty directory (`cd` validates paths this way).
+fn stream_list(vol: &mut Volume, service: u64, request: &[u8]) {
+	let mut reader = proto::codec::Reader::new(request);
+	let r = &mut reader;
+	let (corr, path): (u32, String) = match (|| Some((r.u16()?, r.u32()?, r.string_lp()?)))() {
+		Some((_op, corr, path)) => (corr, path),
+		None => return,
+	};
+	let corr_bytes: [u8; 4] = corr.to_le_bytes();
+	let items: Vec<FileInfo> = match vol.list_entries(&path) {
+		Ok(items) => items,
+		Err(_) => {
+			unsafe {
+				send_blocking(service, &corr_bytes, 0);
+			}
+			return;
+		}
+	};
+	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
+		Some(pair) => pair,
+		None => return,
+	};
+	unsafe {
+		send_blocking(service, &corr_bytes, consumer);
+	}
+	let mut frame: [u8; 1024] = [0u8; 1024];
+	for (seq, item) in items.iter().enumerate() {
+		if let Some(n) = volume::list_frame(seq as u32, item, &mut frame) {
+			unsafe {
+				send_blocking(producer, &frame[..n], 0);
+			}
+		}
+	}
+	unsafe {
+		close(producer);
+	}
 }
 
 // The volume backing, behind the generated Storage.Volume contract: either a
@@ -247,45 +298,11 @@ impl volume::Service for Volume {
 	}
 
 	// List the directory named by a vol:// path (each entry as name + byte length +
-	// kind), for `ls`. An empty subdirectory names the volume root.
-	fn list(&mut self, path: String) -> Result<Vec<FileInfo>, Error> {
-		let dir: &[u8] = self.list_dir_name(&path)?;
-		match self {
-			Volume::Archive { base, len } => {
-				// the test archive is a flat package - it has no subdirectories.
-				if !dir.is_empty() {
-					return Err(Error::NotFound);
-				}
-				let archive: &[u8] = unsafe { core::slice::from_raw_parts(*base as *const u8, *len) };
-				let package = Package::parse(archive).ok_or(Error::NotFound)?;
-				let mut files: Vec<FileInfo> = Vec::new();
-				for index in 0..package.len() {
-					if let Some(name) = package.name(index) {
-						let size: u64 = package.lookup(name).map(|b| b.len()).unwrap_or(0) as u64;
-						// the archive format carries no timestamps.
-						files.push(file_info(name, size, false, 0, 0));
-					}
-				}
-				Ok(files)
-			}
-			Volume::Disk(fs) => {
-				let entries = if dir.is_empty() { fs.list() } else { fs.read_dir(dir) }.map_err(map_fs_err)?;
-				Ok(entries.into_iter().map(|(name, size, is_dir, mtime, ctime)| file_info(&name, size, is_dir, mtime, ctime)).collect())
-			}
-			Volume::Fat(backing) => {
-				// the foreign backends do not surface timestamps yet: 0 renders as "-".
-				let entries = backing.run(|fs| if dir.is_empty() { fs.list() } else { fs.list_dir(dir) })?;
-				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
-			}
-			Volume::Iso(fs) => {
-				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_iso_err)?;
-				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
-			}
-			Volume::Udf(fs) => {
-				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_udf_err)?;
-				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
-			}
-		}
+	// kind), for `ls`. An empty subdirectory names the volume root. Streamed entry by
+	// entry (the serve loop frames the vector onto a sub-channel), so a big directory
+	// never has to fit one reply; a bad path is an empty stream.
+	fn list(&mut self, path: String) -> Vec<FileInfo> {
+		self.list_entries(&path).unwrap_or_default()
 	}
 
 	// Create or overwrite a file from the zero-copy `data` buffer. The transferred
@@ -295,6 +312,38 @@ impl volume::Service for Volume {
 		let bytes: Option<Vec<u8>> = unsafe { read_buffer(&data) };
 		let name: &[u8] = self.writable_name(&path)?;
 		let bytes: Vec<u8> = bytes.ok_or(Error::Invalid)?;
+		match self {
+			Volume::Archive { .. } => Err(Error::Denied),
+			Volume::Disk(fs) => fs.write_file(name, &bytes).map_err(map_fs_err),
+			Volume::Fat(backing) => backing.run(|fs| fs.write_file(name, &bytes)),
+			Volume::Iso(_) => Err(Error::Invalid),
+			Volume::Udf(_) => Err(Error::Invalid),
+		}
+	}
+
+	// The streaming write form: the file's bytes arrive as plain messages on the
+	// transferred `data` channel (an empty message or the peer closing marks the
+	// end), so a file's size is bounded by the filesystem, never by one transfer.
+	// The channel handle is always consumed; the reply goes out once the whole
+	// file is written.
+	fn write_stream(&mut self, path: String, data: u64) -> Result<(), Error> {
+		if data == 0 {
+			return Err(Error::Invalid);
+		}
+		let mut bytes: Vec<u8> = Vec::new();
+		loop {
+			match unsafe { recv_vec_blocking(data) } {
+				ReceivedVec::Message { bytes: chunk, .. } => {
+					if chunk.is_empty() {
+						break;
+					}
+					bytes.extend_from_slice(&chunk);
+				}
+				ReceivedVec::Closed => break,
+			}
+		}
+		unsafe { close(data) };
+		let name: &[u8] = self.writable_name(&path)?;
 		match self {
 			Volume::Archive { .. } => Err(Error::Denied),
 			Volume::Disk(fs) => fs.write_file(name, &bytes).map_err(map_fs_err),
@@ -471,6 +520,48 @@ impl volume::Service for Volume {
 }
 
 impl Volume {
+	// The directory listing behind the `list` stream: each entry as name + byte
+	// length + kind + timestamps. An empty subdirectory names the volume root.
+	fn list_entries(&mut self, path: &str) -> Result<Vec<FileInfo>, Error> {
+		let dir: &[u8] = self.list_dir_name(path)?;
+		match self {
+			Volume::Archive { base, len } => {
+				// the test archive is a flat package - it has no subdirectories.
+				if !dir.is_empty() {
+					return Err(Error::NotFound);
+				}
+				let archive: &[u8] = unsafe { core::slice::from_raw_parts(*base as *const u8, *len) };
+				let package = Package::parse(archive).ok_or(Error::NotFound)?;
+				let mut files: Vec<FileInfo> = Vec::new();
+				for index in 0..package.len() {
+					if let Some(name) = package.name(index) {
+						let size: u64 = package.lookup(name).map(|b| b.len()).unwrap_or(0) as u64;
+						// the archive format carries no timestamps.
+						files.push(file_info(name, size, false, 0, 0));
+					}
+				}
+				Ok(files)
+			}
+			Volume::Disk(fs) => {
+				let entries = if dir.is_empty() { fs.list() } else { fs.read_dir(dir) }.map_err(map_fs_err)?;
+				Ok(entries.into_iter().map(|(name, size, is_dir, mtime, ctime)| file_info(&name, size, is_dir, mtime, ctime)).collect())
+			}
+			Volume::Fat(backing) => {
+				// the foreign backends do not surface timestamps yet: 0 renders as "-".
+				let entries = backing.run(|fs| if dir.is_empty() { fs.list() } else { fs.list_dir(dir) })?;
+				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
+			}
+			Volume::Iso(fs) => {
+				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_iso_err)?;
+				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
+			}
+			Volume::Udf(fs) => {
+				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_udf_err)?;
+				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
+			}
+		}
+	}
+
 	// Validate a vol:// path for a mutating op and return the file name within the
 	// volume. The name borrows `path`, so it outlives the call.
 	fn writable_name<'a>(&self, path: &'a str) -> Result<&'a [u8], Error> {

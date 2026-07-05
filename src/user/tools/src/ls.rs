@@ -218,37 +218,62 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit) 
 			}
 		};
 		let mut client = volume::Client::new(ChannelTransport { chan: storage });
-		let mut files = match client.list(path) {
-			Some(Ok(f)) => f,
-			_ => {
+		// the listing arrives as a stream of entries (one frame each), so a big
+		// directory never has to fit one reply.
+		let consumer: u64 = match client.list(path) {
+			Some(c) => c,
+			None => {
 				print(b"ls: StorageService unavailable\n");
 				return;
 			}
 		};
+		if key == SortKey::None {
+			// unsorted: render each entry as its frame arrives, so a huge listing
+			// starts printing immediately (per-row widths - global column alignment
+			// would need the whole set first).
+			print(uri);
+			print(b":\n");
+			let mut dirs: usize = 0;
+			let mut plain: usize = 0;
+			let mut total: u64 = 0;
+			loop {
+				match recv_vec_blocking(consumer) {
+					ReceivedVec::Message { bytes, .. } => {
+						if let Some(f) = volume::list_read(&bytes) {
+							let shown: usize = f.name.len() + if f.kind == FileKind::Dir { 1 } else { 0 };
+							row(&f, shown, size_text(&f, unit).len(), unit, &mut dirs, &mut plain, &mut total);
+						}
+					}
+					ReceivedVec::Closed => break,
+				}
+			}
+			close(consumer);
+			summary(dirs, plain, total, unit);
+			return;
+		}
+		let mut files: Vec<FileInfo> = drain_stream(consumer, volume::list_read);
 		// directories first under every key but `u`, then the chosen key (ascending unless
 		// the `d` suffix asked otherwise), ties broken by name so equal keys stay in a
 		// stable, readable order.
-		if key != SortKey::None {
-			files.sort_by(|a: &FileInfo, b: &FileInfo| {
-				let dir_first = (b.kind == FileKind::Dir).cmp(&(a.kind == FileKind::Dir));
-				if dir_first != core::cmp::Ordering::Equal {
-					return dir_first;
-				}
-				let by_key = match key {
-					SortKey::Ext => extension(&a.name).cmp(extension(&b.name)),
-					SortKey::Size => a.size.cmp(&b.size),
-					SortKey::Mtime => a.mtime.cmp(&b.mtime),
-					SortKey::Ctime => a.ctime.cmp(&b.ctime),
-					_ => core::cmp::Ordering::Equal,
-				};
-				let by_key = if reverse { by_key.reverse() } else { by_key };
-				if by_key != core::cmp::Ordering::Equal {
-					return by_key;
-				}
-				let by_name = a.name.cmp(&b.name);
-				if key == SortKey::Name && reverse { by_name.reverse() } else { by_name }
-			});
-		}
+		files.sort_by(|a: &FileInfo, b: &FileInfo| {
+			let dir_first = (b.kind == FileKind::Dir).cmp(&(a.kind == FileKind::Dir));
+			if dir_first != core::cmp::Ordering::Equal {
+				return dir_first;
+			}
+			let by_key = match key {
+				SortKey::Ext => extension(&a.name).cmp(extension(&b.name)),
+				SortKey::Size => a.size.cmp(&b.size),
+				SortKey::Mtime => a.mtime.cmp(&b.mtime),
+				SortKey::Ctime => a.ctime.cmp(&b.ctime),
+				_ => core::cmp::Ordering::Equal,
+			};
+			let by_key = if reverse { by_key.reverse() } else { by_key };
+			if by_key != core::cmp::Ordering::Equal {
+				return by_key;
+			}
+			let by_name = a.name.cmp(&b.name);
+			if key == SortKey::Name && reverse { by_name.reverse() } else { by_name }
+		});
 		print(uri);
 		print(b":\n");
 		// column widths: the display name (a directory carries a trailing '/') and the
@@ -269,28 +294,42 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit) 
 		let mut plain: usize = 0;
 		let mut total: u64 = 0;
 		for f in &files {
-			let is_dir: bool = f.kind == FileKind::Dir;
-			let shown: usize = f.name.len() + if is_dir { 1 } else { 0 };
-			print(b"  ");
-			if is_dir {
-				dirs += 1;
-				print(b"\x1b[1;34m");
-				print(f.name.as_bytes());
-				print(b"/\x1b[0m");
-			} else {
-				plain += 1;
-				total += f.size;
-				print(f.name.as_bytes());
-			}
-			pad(name_w - shown);
-			let size: String = size_text(f, unit);
-			pad(1 + size_w - size.len());
-			print(size.as_bytes());
-			print(b"  ");
-			print_mtime(f.mtime);
-			print(b"\n");
+			row(f, name_w, size_w, unit, &mut dirs, &mut plain, &mut total);
 		}
-		// the summary: how much lives here, at a glance.
+		summary(dirs, plain, total, unit);
+	}
+}
+
+// Print one listing row (padded to the given column widths), counting it into the
+// summary tallies.
+unsafe fn row(f: &FileInfo, name_w: usize, size_w: usize, unit: Unit, dirs: &mut usize, plain: &mut usize, total: &mut u64) {
+	unsafe {
+		let is_dir: bool = f.kind == FileKind::Dir;
+		let shown: usize = f.name.len() + if is_dir { 1 } else { 0 };
+		print(b"  ");
+		if is_dir {
+			*dirs += 1;
+			print(b"\x1b[1;34m");
+			print(f.name.as_bytes());
+			print(b"/\x1b[0m");
+		} else {
+			*plain += 1;
+			*total += f.size;
+			print(f.name.as_bytes());
+		}
+		pad(name_w - shown);
+		let size: String = size_text(f, unit);
+		pad(1 + size_w - size.len());
+		print(size.as_bytes());
+		print(b"  ");
+		print_mtime(f.mtime);
+		print(b"\n");
+	}
+}
+
+// The closing summary: how much lives here, at a glance.
+unsafe fn summary(dirs: usize, plain: usize, total: u64, unit: Unit) {
+	unsafe {
 		print_usize(dirs);
 		print(if dirs == 1 { b" directory, " } else { b" directories, " });
 		print_usize(plain);

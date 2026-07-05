@@ -892,6 +892,17 @@ impl Stack {
 		n
 	}
 
+	// Drain EVERYTHING buffered on connection `ci` in one move: the chunk is as
+	// large as the connection's own receive buffer holds (its runtime occupancy,
+	// bounded by the ring's capacity) - no wire constant stands between the buffer
+	// and the consumer. Empty when nothing is buffered.
+	pub fn tcp_take_rx_all(&mut self, ci: usize) -> Vec<u8> {
+		let rx_len: usize = self.conns[ci].rx_len;
+		let taken: Vec<u8> = self.conns[ci].rx[..rx_len].to_vec();
+		self.conns[ci].rx_len = 0;
+		taken
+	}
+
 	// Handle an ICMP message: reply to an echo request, report an echo reply.
 	fn on_icmp(&mut self, frame: &[u8], ihl: usize, src_ip: Ipv4Addr, out: &mut [u8]) -> Outcome {
 		let icmp: &[u8] = &frame[ETH_HDR + ihl..];

@@ -1533,8 +1533,8 @@ fn trim(mut s: &[u8]) -> &[u8] {
 fn bin_names(storage: u64) -> Vec<Vec<u8>> {
 	let mut client = volume::Client::new(ChannelTransport { chan: storage });
 	match client.list("vol://system/bin") {
-		Some(Ok(files)) => files.into_iter().map(|f| f.name.into_bytes()).collect(),
-		_ => Vec::new(),
+		Some(consumer) => unsafe { drain_stream(consumer, volume::list_read) }.into_iter().map(|f| f.name.into_bytes()).collect(),
+		None => Vec::new(),
 	}
 }
 
@@ -1571,7 +1571,9 @@ unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], session: u64, storage: u64, media
 		let chan: u64 = storage_for(target.as_bytes(), storage, media, iso, udf, usb);
 		let mut client = volume::Client::new(ChannelTransport { chan });
 		match client.list(&target) {
-			Some(Ok(_)) => {
+			Some(consumer) => {
+				// a valid directory is enough - drain the entry stream unused.
+				let _ = drain_stream(consumer, volume::list_read);
 				cwd.clear();
 				cwd.push_str(&target);
 				// Persist the new cwd in the session so it outlives this shell; the local
@@ -1580,7 +1582,7 @@ unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], session: u64, storage: u64, media
 					let _ = session::Client::new(ChannelTransport { chan: session }).chdir(&target);
 				}
 			}
-			_ => {
+			None => {
 				print(b"cd: not a directory: ");
 				print(target.as_bytes());
 				print(b"\n");

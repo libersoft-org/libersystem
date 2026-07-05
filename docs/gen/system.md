@@ -438,7 +438,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `open` | `open(o: open-opts) -> result<open-result, error>` |
-| 2 | `list` | `list(path: string) -> result<list<file-info>, error>` |
+| 2 | `list` | `list(path: string) -> stream<file-info>` |
 | 3 | `write` | `write(path: string, data: buffer) -> result<unit, error>` |
 | 4 | `remove` | `remove(path: string) -> result<unit, error>` |
 | 5 | `snap-create` | `snap-create(name: string) -> result<unit, error>` |
@@ -452,6 +452,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 13 | `set-compression` | `set-compression(enabled: bool) -> result<unit, error>` |
 | 14 | `fsck` | `fsck() -> result<fsck-report, error>` |
 | 15 | `restore` | `restore(path: string, snapshot: string) -> result<unit, error>` |
+| 16 | `write-stream` | `write-stream(path: string, data: handle<channel>) -> result<unit, error>` |
 
 ### interface `device`
 
@@ -579,7 +580,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `lookup` | `lookup(component: string) -> result<manifest, error>` |
-| 2 | `audit` | `audit() -> result<list<audit-entry>, error>` |
+| 2 | `audit` | `audit() -> stream<audit-entry>` |
 | 3 | `run` | `run(name: string, args: string, cwd: string, stdout: handle<channel>) -> result<start-result, error>` |
 
 ### interface `resources`

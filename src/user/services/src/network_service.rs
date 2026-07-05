@@ -60,22 +60,18 @@ const DHCP_RETRY_MIN_TICKS: u64 = TICKS_PER_SEC / 2;
 const TCP_SYN_TIMEOUT_TICKS: u64 = 300;
 const TCP_RETX_TICKS: u64 = 50;
 const TCP_RECV_TIMEOUT_TICKS: u64 = 300;
-// The base ephemeral local port for outgoing connections, and the cap on response
-// bytes returned to the client.
+// The base ephemeral local port for outgoing connections.
 const TCP_LOCAL_PORT_BASE: u16 = 0xc000;
-const TCP_REPLY_MAX: usize = 512;
 
 // The frame-buffer size: one full Ethernet frame (1514 bytes) with slack. The
 // driver forwards frames without the virtio_net_hdr, so this is the L2 frame only.
 const FRAME_MAX: usize = 2048;
 // The typed request and reply buffers for one client call. The request buffer fits
-// any op comfortably (a DNS name alone may be 253 bytes plus framing); the reply
-// buffer matches the 4096 wire ceiling every other service uses.
+// any op comfortably (a DNS name alone may be 253 bytes plus framing); replies
+// that can grow without bound (`fetch`, socket recv chunks) are built in Vecs and
+// received exactly-sized on the client, so this bounds only the fixed-shape ops.
 const REQ_MAX: usize = 1024;
 const REPLY_MAX: usize = 4096;
-// How many bytes a single socket `recv` returns (the client calls `recv` repeatedly
-// to drain a larger response); kept small for the 16 kB user stack.
-const SOCK_RECV_MAX: usize = 512;
 // The initial sizes of the client / socket / listener sets. Each set grows on
 // demand (a slot is reused when free, a new one pushed otherwise), so these are
 // size hints, never caps - the kernel's wait_any bound (64 handles) is the only
@@ -284,7 +280,7 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClo
 				while si < socks.len() {
 					if socks[si].chan != 0 && socks[si].stream_prod != 0 {
 						let ci: usize = socks[si].ci;
-						let prod: u64 = stream_pump(ci, stack, &mut out, socks[si].stream_prod, &mut socks[si].stream_seq);
+						let prod: u64 = stream_pump(ci, stack, socks[si].stream_prod, &mut socks[si].stream_seq);
 						socks[si].stream_prod = prod;
 						if prod != 0 && (stack.tcp_peer_fin(ci) || stack.tcp_aborted(ci)) {
 							close(prod);
@@ -607,18 +603,20 @@ impl network::Service for Net<'_> {
 	}
 
 	// A one-shot TCP exchange: connect, send the request, read the response, close.
-	// Maps the connect failure modes onto the error enum.
+	// Maps the connect failure modes onto the error enum. The response accumulates
+	// in a Vec and rides an exactly-sized reply - its size is bounded by the peer
+	// closing, never by a wire constant.
 	fn fetch(&mut self, req: TcpRequest) -> Result<Vec<u8>, Error> {
 		unsafe {
 			let ci: usize = match self.stack.tcp_alloc() {
 				Some(i) => i,
 				None => return Err(Error::Again),
 			};
-			let mut data: [u8; 1 + TCP_REPLY_MAX] = [0u8; 1 + TCP_REPLY_MAX];
-			let n: usize = do_tcp(ci, from_wire(&req.ep.addr), req.ep.port, &req.request, self.frames, self.stack, self.rx, self.tx, &mut data);
+			let mut data: Vec<u8> = Vec::new();
+			let status: u8 = do_tcp(ci, from_wire(&req.ep.addr), req.ep.port, &req.request, self.frames, self.stack, self.rx, self.tx, &mut data);
 			self.stack.tcp_free(ci);
-			match data[0] {
-				1 => Ok(data[1..n].to_vec()),
+			match status {
+				1 => Ok(data),
 				2 => Err(Error::NotFound),
 				3 => Err(Error::Denied),
 				_ => Err(Error::Again),
@@ -773,13 +771,13 @@ impl socket::Service for Sock<'_> {
 	}
 
 	// The snapshot of bytes already buffered when the recv stream opens; the serve
-	// loop streams everything that arrives afterwards. One chunk, or empty.
+	// loop streams everything that arrives afterwards. One chunk - as large as the
+	// connection's receive buffer holds - or empty.
 	fn recv(&mut self) -> Vec<Chunk> {
 		let mut chunks: Vec<Chunk> = Vec::new();
-		let mut buf: [u8; SOCK_RECV_MAX] = [0u8; SOCK_RECV_MAX];
-		let n: usize = self.stack.tcp_take_rx(self.ci, &mut buf);
-		if n > 0 {
-			chunks.push(Chunk { data: buf[..n].to_vec() });
+		let data: Vec<u8> = self.stack.tcp_take_rx_all(self.ci);
+		if !data.is_empty() {
+			chunks.push(Chunk { data });
 		}
 		chunks
 	}
@@ -1083,34 +1081,33 @@ unsafe fn do_sntp(server: Ipv4Addr, frames: u64, stack: &mut Stack, rx: &mut [u8
 // received bytes into `reply` (status 1 = connected with data, 0 = no SYN-ACK in
 // time, 2 = unreachable / no ARP, 3 = refused / reset) and returns the total length.
 #[allow(clippy::too_many_arguments)]
-unsafe fn do_tcp(ci: usize, ip: Ipv4Addr, port: u16, request: &[u8], frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], reply: &mut [u8]) -> usize {
+// One-shot TCP exchange driver for `fetch`: establish, send the request, then
+// accumulate the response into `reply` until the peer closes or it falls quiet.
+// Returns the establish status (1 = ok, 2 = unreachable, 3 = refused, 0 = timeout).
+#[allow(clippy::too_many_arguments)]
+unsafe fn do_tcp(ci: usize, ip: Ipv4Addr, port: u16, request: &[u8], frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], reply: &mut Vec<u8>) -> u8 {
 	unsafe {
-		// Establish the connection; on failure write the status byte and stop (the
-		// establish status bytes 2 / 3 / 0 map straight onto the reply status).
+		// Establish the connection; on failure report the status and stop (the
+		// establish status bytes 2 / 3 / 0 map straight onto the fetch errors).
 		match tcp_establish(ci, ip, port, frames, stack, rx, tx) {
 			1 => {}
-			other => {
-				reply[0] = other;
-				return 1;
-			}
+			other => return other,
 		}
-		// Send the request, then read the response until the peer closes, the buffer
-		// fills, or it falls quiet.
+		// Send the request, then read the response until the peer closes or it
+		// falls quiet - the response grows in the Vec, never against a cap.
 		if !request.is_empty() {
 			let d: usize = stack.tcp_build_data(ci, request, tx);
 			send_frame(frames, &tx[..d]);
 		}
-		let cap: usize = reply.len() - 1;
-		let mut got: usize = 0;
 		let recv_deadline: u64 = clock() + TCP_RECV_TIMEOUT_TICKS;
-		while clock() < recv_deadline && !stack.tcp_peer_fin(ci) && !stack.tcp_aborted(ci) && got < cap {
+		while clock() < recv_deadline && !stack.tcp_peer_fin(ci) && !stack.tcp_aborted(ci) {
 			if wait(frames, recv_deadline) != 0 {
 				break;
 			}
 			pump(frames, stack, rx, tx);
-			got += stack.tcp_take_rx(ci, &mut reply[1 + got..]);
+			reply.extend_from_slice(&stack.tcp_take_rx_all(ci));
 		}
-		got += stack.tcp_take_rx(ci, &mut reply[1 + got..]);
+		reply.extend_from_slice(&stack.tcp_take_rx_all(ci));
 		// Close our half and briefly pump to acknowledge the peer's FIN.
 		let fin: usize = stack.tcp_build_fin(ci, tx);
 		send_frame(frames, &tx[..fin]);
@@ -1121,8 +1118,7 @@ unsafe fn do_tcp(ci: usize, ip: Ipv4Addr, port: u16, request: &[u8], frames: u64
 			}
 			pump(frames, stack, rx, tx);
 		}
-		reply[0] = 1;
-		1 + got
+		1
 	}
 }
 
@@ -1175,20 +1171,23 @@ unsafe fn socket_send(ci: usize, data: &[u8], frames: u64, stack: &mut Stack, tx
 }
 
 // Drain newly received bytes from the connection and frame each chunk onto the recv
-// stream `producer`. Returns the producer handle, or 0 if the consumer was dropped
+// stream `producer` - one chunk per drain, as large as the connection's receive
+// buffer held. Returns the producer handle, or 0 if the consumer was dropped
 // (in which case the producer is closed here).
-unsafe fn stream_pump(ci: usize, stack: &mut Stack, out: &mut [u8], producer: u64, seq: &mut u32) -> u64 {
+unsafe fn stream_pump(ci: usize, stack: &mut Stack, producer: u64, seq: &mut u32) -> u64 {
 	unsafe {
-		let mut buf: [u8; SOCK_RECV_MAX] = [0u8; SOCK_RECV_MAX];
 		loop {
-			let n: usize = stack.tcp_take_rx(ci, &mut buf);
-			if n == 0 {
+			let data: Vec<u8> = stack.tcp_take_rx_all(ci);
+			if data.is_empty() {
 				return producer;
 			}
-			let chunk: Chunk = Chunk { data: buf[..n].to_vec() };
-			match socket::recv_frame(*seq, &chunk, out) {
+			let chunk: Chunk = Chunk { data };
+			// the frame grows with the chunk: encoded exactly, sent as one message
+			// (the consumer receives it exactly-sized via the peek).
+			let mut frame: Vec<u8> = alloc::vec![0u8; 8 + chunk.data.len() + 16];
+			match socket::recv_frame(*seq, &chunk, &mut frame) {
 				Some(fl) => {
-					if !send_blocking(producer, &out[..fl], 0) {
+					if !send_blocking(producer, &frame[..fl], 0) {
 						close(producer);
 						return 0;
 					}

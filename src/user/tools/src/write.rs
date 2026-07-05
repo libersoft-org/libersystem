@@ -66,58 +66,70 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	exit();
 }
 
-// Stage the text in a shared buffer, write it through the storage grant, and print a
-// one-line confirmation - reporting a concise error if it cannot be written.
+// One streaming-write chunk: bounded so the sender never outruns the service's
+// drain by more than the channel queue absorbs (backpressure yields, the service
+// keeps draining), never a bound on the file.
+const WRITE_CHUNK: usize = 32 * 1024;
+
+// Send the text through the storage grant's streaming write form - the file's bytes
+// travel as plain messages on a fresh channel (closed = end of data), so a file's
+// size is bounded by the filesystem, never by one transfer. The request wire is
+// built by hand: the generated blocking client would await the reply before the
+// data is sent, and the reply only comes once the data channel is drained.
 unsafe fn write(storage: u64, uri: &[u8], text: &[u8]) {
 	unsafe {
-		let data: proto::codec::Buffer = match make_buffer(text) {
-			Some(b) => b,
+		use proto::codec::{Sink, VecWriter};
+		let (producer, consumer): (u64, u64) = match channel() {
+			Some(pair) => pair,
 			None => {
 				print(b"write: out of memory\n");
 				return;
 			}
 		};
-		let path: String = String::from_utf8_lossy(uri).into_owned();
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
-		match client.write(&path, &data) {
-			Some(Ok(())) => {
-				print(b"wrote ");
-				print(uri);
-				print(b"\n");
+		// the OP_WRITE_STREAM request: [op u16][corr u32][path][handle marker u32],
+		// the data channel's consumer end riding out-of-band (the same wire the
+		// generated client builds).
+		let request: Vec<u8> = {
+			let mut w = VecWriter::new();
+			let build = |w: &mut VecWriter| -> Option<()> {
+				w.u16(volume::OP_WRITE_STREAM)?;
+				w.u32(1)?;
+				w.bytes_lp(uri)?;
+				w.set_handle(consumer);
+				w.u32(0)?;
+				Some(())
+			};
+			if build(&mut w).is_none() {
+				print(b"write: out of memory\n");
+				return;
 			}
-			_ => {
-				print(b"write: could not write ");
-				print(uri);
-				print(b"\n");
-			}
-		}
-	}
-}
-
-// Stage `bytes` in a fresh shared memory object and return a Buffer capability (a
-// transferable read-only handle plus length) to hand to StorageService zero-copy.
-unsafe fn make_buffer(bytes: &[u8]) -> Option<proto::codec::Buffer> {
-	unsafe {
-		let alloc_len: usize = bytes.len().max(1);
-		let obj: i64 = memory_object_create(alloc_len as u64);
-		if obj < 0 {
-			return None;
-		}
-		let obj: u64 = obj as u64;
-		let mapped: u64 = match map_object(obj) {
-			Some(base) => base,
-			None => {
-				close(obj);
-				return None;
-			}
+			w.into_inner()
 		};
-		core::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped as *mut u8, bytes.len());
-		unmap_object(obj);
-		let granted: i64 = duplicate(obj, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
-		close(obj);
-		if granted < 0 {
-			return None;
+		if !send_blocking(storage, &request, consumer) {
+			print(b"write: could not write ");
+			print(uri);
+			print(b"\n");
+			return;
 		}
-		Some(proto::codec::Buffer { handle: granted as u64, len: bytes.len() as u64 })
+		for chunk in text.chunks(WRITE_CHUNK) {
+			if !send_blocking(producer, chunk, 0) {
+				break;
+			}
+		}
+		close(producer);
+		// the reply arrives once the whole file is written: [corr u32][ok u8].
+		let ok: bool = match recv_vec_blocking(storage) {
+			ReceivedVec::Message { bytes, .. } => bytes.len() >= 5 && bytes[4] == 1,
+			ReceivedVec::Closed => false,
+		};
+		if ok {
+			print(b"wrote ");
+			print(uri);
+			print(b"\n");
+		} else {
+			print(b"write: could not write ");
+			print(uri);
+			print(b"\n");
+		}
 	}
 }
