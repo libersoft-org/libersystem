@@ -16,15 +16,24 @@ LiberSystem is built with free, open-source tools. The toolchain currently targe
 
 The kernel is a Rust `no_std` project. It is compiled with a nightly toolchain and `build-std`, booted with the [Limine](https://github.com/limine-bootloader/limine) bootloader, and run and tested under QEMU. All commands below are run through [`just`](https://github.com/casey/just) from the `src` directory.
 
-### Automated setup (recommended)
+Download the latest version of this software and install required tools.
+
+**On Linux (Debian / Ubuntu):**
+
+Log in as **root** and then run in terminal:
 
 The included setup script installs the entire toolchain. It is idempotent - safe to run repeatedly:
 
 ```sh
+apt update
+apt -y upgrade
+apt -y install git
+git clone https://github.com/libersoft-org/libersystem.git
 ./setup.sh
+cd src
 ```
 
-It installs:
+This will install:
 
 - system packages: `build-essential`, `git`, `curl`, `xorriso`, `gdisk`, `mtools`, `netpbm`, `imagemagick`, `socat`, `qemu-system-x86`, `qemu-utils`, `gdb`, `lld`, `llvm`, `clang`
 - `rustup` with the **nightly** toolchain plus the `rust-src` and `llvm-tools-preview` components (required for `build-std` and the kernel build)
@@ -32,19 +41,6 @@ It installs:
 - the Limine bootloader (binary branch) into `~/.local/share/limine`
 
 The project pins the nightly toolchain via `rust-toolchain.toml`, so no global toolchain switch is needed.
-
-### Manual setup
-
-If you prefer to install the tools yourself:
-
-```sh
-sudo apt install build-essential git curl xorriso gdisk mtools netpbm imagemagick socat qemu-system-x86 qemu-utils gdb lld llvm clang
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
-rustup toolchain install nightly --profile minimal --component rust-src --component llvm-tools-preview
-cargo install just
-```
-
-Then clone the Limine `v11.x-binary` branch into `~/.local/share/limine` and run `make` in it (see `setup.sh` for the exact steps).
 
 ## Build
 
@@ -54,7 +50,7 @@ The kernel is built for the `x86_64-unknown-none` target. From the `src` directo
 just build
 ```
 
-This compiles the kernel ELF into `kernel/target/x86_64-unknown-none/debug/kernel`. A plain build does not produce a disk image - the run step assembles a bootable ISO on demand, and you can build standalone images with [`just iso`](#create-bootable-images) and [`just img`](#create-bootable-images).
+This first builds the userspace programs (the services, drivers and command-line tools that make up the init package) and the SDK component, then compiles the kernel ELF - which embeds the init package - into `kernel/target/x86_64-unknown-none/debug/kernel`. A plain build does not produce a disk image - the run step assembles a bootable ISO on demand, and you can build standalone images with [`just iso`](#create-bootable-images) and [`just img`](#create-bootable-images).
 
 ## Run
 
@@ -62,14 +58,24 @@ This compiles the kernel ELF into `kernel/target/x86_64-unknown-none/debug/kerne
 just run
 ```
 
-This builds a bootable Limine ISO from the kernel ELF and launches QEMU headless, with the kernel's serial console wired to your terminal. The boot log ends in `boot OK` and the kernel drops into an interactive serial shell at a `>` prompt. Type `help` to list commands (`ls` to list volumes, `ls <vol://volume>` to list a volume's files, `cat <vol://vol/path>`, `graph`); type `exit` to stop the shell, after which the kernel idle-spins. To quit QEMU at any time, press <kbd>Ctrl</kbd>+<kbd>A</kbd> then <kbd>X</kbd>.
+This builds a bootable ISO from the kernel ELF and launches QEMU headless, with the system's serial console wired to your terminal. The boot log reports each service coming online and ends at an interactive shell prompt:
 
-By default QEMU uses KVM (with `-cpu host`) when `/dev/kvm` is available, and four cores (`-smp 4`).
+```
+vol://system>
+```
 
 To capture the serial output to a file instead of the terminal (useful over SSH or in scripts):
 
 ```sh
 SERIAL=file:boot.log just run
+```
+
+### Networking
+
+Interactive runs attach a `virtio-net` NIC on QEMU's user-mode (SLIRP) network: the guest configures itself over DHCP (address `10.0.2.15`, gateway `10.0.2.2`), so `ping`, `nslookup`, `tcp` and the other net tools reach the outside world through the host with no setup. The host itself is reachable from the guest as `10.0.2.2`. In the other direction, the host's `127.0.0.1:5555` is forwarded to the guest's port 80, so a server started in the guest (`httpd &`) is reachable from the host:
+
+```sh
+curl http://127.0.0.1:5555/
 ```
 
 ### Graphical display (VNC / SPICE)
@@ -185,7 +191,7 @@ Run `just --list` to see every available command. The most useful ones:
 
 | Command | Description |
 | --- | --- |
-| `just build` | Build the kernel. |
+| `just build` | Build everything: the userspace programs, the SDK component, and the kernel (whose build embeds the init package). |
 | `just run [vnc] [spice]` | Build and boot in QEMU (headless by default; add `vnc` and/or `spice` for a live VNC `:5900` / SPICE `:5930` display). |
 | `just screenshot <path>` | Save a framebuffer image to `<path>` (format by extension: png/jpg/webp/...); snaps a live `just run` if one is up, else boots a throwaway. |
 | `just iso [strip]` | Build a hybrid BIOS+UEFI ISO into `boot/.build/` (`strip` = `debug` or `all`). |
@@ -193,6 +199,9 @@ Run `just --list` to see every available command. The most useful ones:
 | `just test` | Run the in-kernel test harness in QEMU. |
 | `just debug` | Boot in QEMU and wait for GDB on `:1234`. |
 | `just gdb` | Attach GDB to a waiting QEMU instance. |
+| `just user` | Build only the userspace programs (services, drivers, tools). |
+| `just sdk` | Build the SDK's Wasm component and stage it into the system volume. |
+| `just gen` | Regenerate the typed service bindings and docs from the LSIDL definitions (`idl/*.lsidl`). |
 | `just fmt` | Format all code (Rust via `rustfmt`, shell via `shfmt`). |
 | `just fmt-check` | Check formatting without writing changes (CI-friendly). |
 | `just clean` | Remove build artifacts. |
