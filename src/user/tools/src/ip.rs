@@ -27,7 +27,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		show(netsvc);
 		close(netsvc);
-		send_blocking(bootstrap, b"done", 0);
 	}
 	exit();
 }

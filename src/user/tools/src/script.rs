@@ -26,7 +26,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			record(master, &buf[..len]);
 			close(master);
 		}
-		send_blocking(bootstrap, b"done", 0);
 	}
 	exit();
 }

@@ -15,7 +15,7 @@
 extern crate alloc;
 
 use proto::codec::Buffer;
-use proto::system::{Endpoint, Error, Ipv4Addr, network, socket};
+use proto::system::{network, socket, Endpoint, Error, Ipv4Addr};
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -30,7 +30,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		connect(netsvc, &buf[..len]);
 		close(netsvc);
-		send_blocking(bootstrap, b"done", 0);
 	}
 	exit();
 }

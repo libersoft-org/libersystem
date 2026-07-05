@@ -48,10 +48,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Closed => exit(),
 		};
 		ping(netsvc, &buf[..len]);
-		// Drop our client channel (NetworkService reclaims the slot), then signal
-		// completion so the shell's foreground wait returns, and exit.
+		// Drop our client channel (NetworkService reclaims the slot) and exit; the
+		// kernel closes the bootstrap with the process, which is what a waiting
+		// parent observes.
 		close(netsvc);
-		send_blocking(bootstrap, b"done", 0);
 	}
 	exit();
 }

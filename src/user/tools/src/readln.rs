@@ -33,8 +33,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// The line already carries its trailing newline from the line discipline.
 			print(&buf[..n]);
 		}
-		// Signal completion so the parent's foreground wait returns, then exit.
-		send_blocking(bootstrap, b"done", 0);
 	}
 	exit();
 }

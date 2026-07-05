@@ -24,10 +24,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			print(&buf[..len]);
 			print(b"\n");
 		}
-		// Signal completion so the parent's foreground wait returns, then exit. (An
-		// exited process is briefly a zombie whose channel has not yet closed, so the
-		// parent waits on this explicit message rather than the channel closing.)
-		send_blocking(bootstrap, b"done", 0);
 	}
 	exit();
 }

@@ -30,7 +30,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		connect(netsvc, &buf[..len]);
 		close(netsvc);
-		send_blocking(bootstrap, b"done", 0);
 	}
 	exit();
 }
