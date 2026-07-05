@@ -29,6 +29,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use proto::system::config;
 use proto::system::log;
 use proto::system::network;
 use proto::system::process;
@@ -62,7 +63,7 @@ const MANIFEST: [Service; N] = [
 	Service { name: b"iso_storage", deps: &[b"log_service", b"device_manager"] },
 	Service { name: b"udf_storage", deps: &[b"log_service", b"device_manager"] },
 	Service { name: b"usb_storage", deps: &[b"log_service", b"storage_service"] },
-	Service { name: b"network_service", deps: &[b"log_service", b"device_manager", b"process_service"] },
+	Service { name: b"network_service", deps: &[b"log_service", b"device_manager", b"process_service", b"config_service"] },
 	Service {
 		name: b"shell",
 		deps: &[
@@ -148,17 +149,53 @@ enum State {
 
 // The watchdog's heartbeat deadline: a healthy service answers a probe in one
 // synchronous round-trip, far inside this window; a service that misses it is hung.
-// (~1s at the 100-ticks-per-second monotonic clock.)
+// (~1s at the 100-ticks-per-second monotonic clock.) The live window is the
+// operator's policy (the `service.watchdog-ticks` config key); this is the default
+// when the config tree does not answer.
 const WATCHDOG_TICKS: u64 = 100;
 
 // The restart budget the supervisor spends on a managed service before it escalates
-// (gives up and leaves it failed) rather than restarting it again.
+// (gives up and leaves it failed) rather than restarting it again. The live budget
+// is the `service.restart-budget` config key; this is the default when the config
+// tree does not answer.
 const MAX_RESTARTS: u32 = 3;
 
 // The base back-off between restart attempts, scaled by the attempt count so repeated
 // failures wait progressively longer. A bounded one-shot sleep, idle-friendly under the
 // test scheduler (which advances finite deadlines).
 const RESTART_BACKOFF_TICKS: u64 = 10;
+
+// The supervision knobs read from the config tree once ConfigService serves, with
+// the compiled-in constants as defaults. Read once per boot: the supervisor holds
+// them for its whole standing life, so a later `set` applies at the next boot.
+struct Policy {
+	watchdog_ticks: u64,
+	restart_budget: u32,
+}
+
+// Read the supervision policy (`service.watchdog-ticks`, `service.restart-budget`)
+// over the supervisor's ConfigService client; defaults stand when the tree is not
+// up (config_client 0) or a key does not parse.
+unsafe fn read_policy(config_client: u64) -> Policy {
+	let mut policy: Policy = Policy { watchdog_ticks: WATCHDOG_TICKS, restart_budget: MAX_RESTARTS };
+	if config_client == 0 {
+		return policy;
+	}
+	let mut client = config::Client::new(ChannelTransport { chan: config_client });
+	if let Some(Ok(value)) = client.get("service.watchdog-ticks") {
+		if let Ok(ticks) = value.parse::<u64>() {
+			if ticks > 0 {
+				policy.watchdog_ticks = ticks;
+			}
+		}
+	}
+	if let Some(Ok(value)) = client.get("service.restart-budget") {
+		if let Ok(budget) = value.parse::<u32>() {
+			policy.restart_budget = budget;
+		}
+	}
+	policy
+}
 
 // What last took a managed component down, surfaced to observability as a string the
 // component itself could not report (a crashed component reports nothing).
@@ -384,6 +421,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Some(pair) => pair,
 		None => (0, 0),
 	};
+	// The supervision knobs, read from the freshly-serving config tree (the canary
+	// below and the standing supervisor both run under them).
+	let policy: Policy = unsafe { read_policy(config_client) };
 	let mut canary_proc: u64 = 0;
 	let mut canary_ctrl: u64 = 0;
 	let mut canary_sup: Supervised = Supervised::new();
@@ -396,20 +436,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			emit_event(log_client, b"watchdog_probe", b"online");
 			if selftest {
 				// prove the heartbeat path on a healthy canary: it answers the probe in time.
-				let _alive: bool = heartbeat(canary_ctrl, clock() + WATCHDOG_TICKS);
+				let _alive: bool = heartbeat(canary_ctrl, clock() + policy.watchdog_ticks);
 				// crash -> restart: command a real fault, observe the peer-close, restart per policy.
 				send_blocking(canary_ctrl, b"CRASH", 0);
-				if restart_canary(&package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, Failure::Crashed, park, &mut buf) {
+				if restart_canary(&package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, Failure::Crashed, policy.restart_budget, park, &mut buf) {
 					send_blocking(bootstrap, b"WatchdogProbe: restarted", 0);
 					emit_event(log_client, b"watchdog_probe", b"restarted");
 				}
 				// hang -> watchdog -> restart: command a hang, miss the heartbeat, kill the hung
 				// process, then restart per policy.
 				send_blocking(canary_ctrl, b"HANG", 0);
-				if !heartbeat(canary_ctrl, clock() + WATCHDOG_TICKS) {
+				if !heartbeat(canary_ctrl, clock() + policy.watchdog_ticks) {
 					canary_sup.watchdog_trips += 1;
 					signal(canary_proc, SIG_KILL);
-					if restart_canary(&package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, Failure::Hung, park, &mut buf) {
+					if restart_canary(&package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, Failure::Hung, policy.restart_budget, park, &mut buf) {
 						send_blocking(bootstrap, b"WatchdogProbe: recovered", 0);
 						emit_event(log_client, b"watchdog_probe", b"recovered");
 					}
@@ -437,7 +477,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    (reverse-dependency teardown), or SystemGraphService querying the supervisor state.
 	//    No timer stands here, so the loop sleeps at ~0% CPU until an event arrives.
 	unsafe {
-		supervise(&mut state, &mut channels, &mut sup, &procs, &package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, admin_server, admin_server2, stats_server, stats_server2, &driver_state, log_client, bootstrap, park, &mut buf);
+		supervise(&mut state, &mut channels, &mut sup, &procs, &package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, stats_server, stats_server2, &driver_state, log_client, bootstrap, park, &mut buf);
 	}
 	exit();
 }
@@ -621,7 +661,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"config_service" && !bootstrap_serve(manager_side, config_client) {
 			return State::Failed;
 		}
-		if name == b"network_service" && !bootstrap_network_service(manager_side, *net_frames, net_client) {
+		if name == b"network_service" && !bootstrap_network_service(manager_side, *net_frames, *config_client, net_client) {
 			return State::Failed;
 		}
 		if name == b"time_service" && !bootstrap_time_service(manager_side, *net_client, time_client) {
@@ -1325,9 +1365,19 @@ unsafe fn bootstrap_usb_storage(manager_side: u64, block5_client: u64, usb_clien
 // its clients reach it on ("SERVE"). The service-channel client end is kept in
 // `*net_client` and later transferred to the shell for the `ip`/`ping`/`nslookup`
 // commands.
-unsafe fn bootstrap_network_service(manager_side: u64, net_frames: u64, net_client: &mut u64) -> bool {
+unsafe fn bootstrap_network_service(manager_side: u64, net_frames: u64, config_client: u64, net_client: &mut u64) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"FRAMES", net_frames) {
+			return false;
+		}
+		// The config tree's client (the `net.arp-cache` policy), minted fresh - the
+		// service depends on config_service, so the tree serves by now. Handle 0
+		// tells the service to fall back to its compiled-in default.
+		let cfg: u64 = match service_connect(config_client) {
+			Some(c) => c,
+			None => 0,
+		};
+		if !send_blocking(manager_side, b"CONFIG", cfg) {
 			return false;
 		}
 		bootstrap_serve(manager_side, net_client)
@@ -1506,7 +1556,7 @@ unsafe fn spawn_canary(package: &Package, buf: &mut [u8]) -> (u64, u64) {
 // (longer after repeated failures) and respawn, charging one restart. Returns true if a
 // replacement is running, false if the budget is exhausted (the caller escalates). The
 // canary stands in for the policy a real service restart would follow.
-unsafe fn restart_canary(package: &Package, proc: &mut u64, ctrl: &mut u64, sup: &mut Supervised, failure: Failure, park: u64, buf: &mut [u8]) -> bool {
+unsafe fn restart_canary(package: &Package, proc: &mut u64, ctrl: &mut u64, sup: &mut Supervised, failure: Failure, budget: u32, park: u64, buf: &mut [u8]) -> bool {
 	unsafe {
 		sup.failure = failure;
 		// Reap the old endpoints so the dead process is fully gone before its replacement.
@@ -1520,7 +1570,7 @@ unsafe fn restart_canary(package: &Package, proc: &mut u64, ctrl: &mut u64, sup:
 			*proc = 0;
 		}
 		// Spend from the restart budget; once exhausted, escalate rather than restart again.
-		if sup.restarts >= MAX_RESTARTS {
+		if sup.restarts >= budget {
 			return false;
 		}
 		// Back off before the respawn, scaled by the attempt count. A bounded one-shot
@@ -1574,7 +1624,7 @@ unsafe fn sleep_ticks(park: u64, ticks: u64) {
 // wait set so its dead channel does not busy-loop); an admin message drives a reverse-
 // dependency stop; a stats request is answered over the `supervisor` interface. Returns
 // when nothing is left to watch.
-unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], package: &Package, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, admin_server: u64, admin_server2: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, up: u64, park: u64, buf: &mut [u8]) {
+unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], package: &Package, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, up: u64, park: u64, buf: &mut [u8]) {
 	unsafe {
 		let mut admin: u64 = admin_server;
 		let mut admin2: u64 = admin_server2;
@@ -1644,7 +1694,7 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 					// The canary's control channel fired; a peer-close means it crashed, so
 					// restart it per policy (escalating once the budget is spent).
 					if let Polled::Closed = try_recv(*canary_ctrl, buf) {
-						if restart_canary(package, canary_proc, canary_ctrl, canary_sup, Failure::Crashed, park, buf) {
+						if restart_canary(package, canary_proc, canary_ctrl, canary_sup, Failure::Crashed, policy.restart_budget, park, buf) {
 							emit_event(log_client, b"watchdog_probe", b"restarted");
 							console_report(b"watchdog_probe", b"restarted");
 						} else {

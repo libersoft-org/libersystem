@@ -1132,14 +1132,18 @@ policy: it belongs in the typed config tree. The plumbing is the real work here:
 the owning services (ConsoleService, LogService, ServiceManager, NetworkService)
 do not hold ConfigService clients yet.
 
-- [ ] Grant the owning services a ConfigService client (ServiceManager wires it at bootstrap, like every other dependency).
-- [ ] `console.scrollback`, `console.history`: read at VT creation, defaults as today.
-- [ ] `log.capacity`: the in-memory journal depth.
-- [ ] `net.arp-cache`: the neighbor-cache size.
-- [ ] `service.restart-budget`, `service.watchdog-ticks`: the supervisor's policy knobs.
-- [ ] `config` in the shell shows the new keys with their live values; `set` changes take effect for new consumers (a live re-read where cheap, documented otherwise).
+- [x] Grant the owning services a ConfigService client (ServiceManager wires it at bootstrap, like every other dependency).
+- [x] `console.scrollback`, `console.history`: read at VT creation, defaults as today.
+- [x] `log.capacity`: the in-memory journal depth.
+- [x] `net.arp-cache`: the neighbor-cache size.
+- [x] `service.restart-budget`, `service.watchdog-ticks`: the supervisor's policy knobs.
+- [x] `config` in the shell shows the new keys with their live values; `set` changes take effect for new consumers (a live re-read where cheap, documented otherwise).
 - Done when: the values are read from config with today's numbers as defaults, `set` demonstrably changes behaviour, tests green.
 - Concept: M31 ConfigService (typed configuration as the policy surface), the limits audit (policy out of the compiler).
+- Result (plumbing): ConfigService's seeded tree gained the six policy keys with today's constants as their values (`console.scrollback` 1000, `console.history` 512, `log.capacity` 4096 - the stale demo seed of 32 corrected to the journal's real depth - `net.arp-cache` 1024, `service.restart-budget` 3, `service.watchdog-ticks` 100). Each owning service now holds a ConfigService client: NetworkService receives a supervisor-minted client as a new "CONFIG" bootstrap message (network_service gained the explicit config_service dependency; a 0 handle - a test scenario - means defaults); LogService starts before ConfigService, so its client is delivered late - ServiceManager mints and sends it on LogService's control channel the moment ConfigService reports in, and LogService's serve loop now stands on its bootstrap channel too (serve_multi_seeded) to catch it; ConsoleService mints its own client from the FCONFIG factory it already held; ServiceManager reads its knobs over its own root client.
+- Result (console keys): the term crate's `Screen::new`/`Term::new` take the scrollback depth and `Ld::new` the history depth as parameters (the old constants stay as exported defaults; `Screen::resize` reallocates at the live `sb_cap`). ConsoleService reads `console.scrollback` + `console.history` at every VT creation - VT 1, each Ctrl+N VT, and a PTY's line editor - so a `set` applies to the next VT with no console restart. The reads ride a bounded-wait transport (`DeadlineTransport`, 1 s): a live ConfigService answers in one round-trip, but a supervisor that wired the factory to a mute endpoint (the kernel pty scenario does) must never hang VT creation - a missed deadline reads as the default.
+- Result (log/net/service keys): LogService's journal capacity is a field read from `log.capacity` when the config client arrives (the journal trims immediately if it already outgrew the new cap; a later set applies at the next boot, documented at the key's read point); `Stack::new` takes the neighbor-cache size and NetworkService reads `net.arp-cache` once at start; ServiceManager reads `service.watchdog-ticks` + `service.restart-budget` into a `Policy` right after bring-up and both the canary selftest and the standing supervisor (restart_canary's budget, the heartbeat windows) run under it.
+- Result (shell surface): the `config` tool gained the `set <key> <value>` sub-form (typed `config.set` through its existing grant, printing the stored node back); `config` lists all nine keys live. Validation: build 0 warnings, fmt clean, term 15/15, kernel suite 93 [ok] RC=0, and a live boot demonstrated the loop end to end - `config` lists the keys, `config set console.history 7` + read-back shows 7, and after `config set console.history 2` a fresh Ctrl+N VT's line editor holds exactly two history entries (the third Up stays on the second-oldest line).
 
 ## M68 - GPU framebuffer realloc on resize (no resolution ceiling)
 

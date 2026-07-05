@@ -4,6 +4,7 @@
 //! the expected logical text - the model is exercised with no renderer, proving it is
 //! graphics-independent.
 
+use crate::screen::SCROLLBACK_ROWS;
 use crate::{RawSink, Screen, TextSink};
 use alloc::vec::Vec;
 
@@ -23,7 +24,7 @@ fn feed(screen: &mut Screen, bytes: &[u8]) {
 // one logical line and breaks only on the explicit newline.
 #[test]
 fn joins_soft_wraps_and_breaks_on_hard_newlines() {
-	let mut s = Screen::new(8, 4);
+	let mut s = Screen::new(8, 4, SCROLLBACK_ROWS);
 	feed(&mut s, b"hello world\nbye");
 	assert_eq!(dump(&s), b"hello world\nbye");
 }
@@ -32,7 +33,7 @@ fn joins_soft_wraps_and_breaks_on_hard_newlines() {
 // newlines.
 #[test]
 fn trims_trailing_spaces_and_blank_rows() {
-	let mut s = Screen::new(10, 5);
+	let mut s = Screen::new(10, 5, SCROLLBACK_ROWS);
 	feed(&mut s, b"abc   \ndef");
 	assert_eq!(dump(&s), b"abc\ndef");
 }
@@ -40,7 +41,7 @@ fn trims_trailing_spaces_and_blank_rows() {
 // A blank screen serializes to nothing.
 #[test]
 fn blank_screen_is_empty() {
-	let s = Screen::new(8, 4);
+	let s = Screen::new(8, 4, SCROLLBACK_ROWS);
 	assert_eq!(dump(&s), b"");
 }
 
@@ -49,7 +50,7 @@ fn blank_screen_is_empty() {
 // re-encodes the same UTF-8 bytes - Czech diacritics included.
 #[test]
 fn unicode_round_trips_through_the_grid() {
-	let mut s = Screen::new(40, 4);
+	let mut s = Screen::new(40, 4, SCROLLBACK_ROWS);
 	feed(&mut s, "příliš žluťoučký kůň\n€ ○ ─".as_bytes());
 	assert_eq!(dump(&s), "příliš žluťoučký kůň\n€ ○ ─".as_bytes());
 }
@@ -58,7 +59,7 @@ fn unicode_round_trips_through_the_grid() {
 // a soft wrap (the next line stays separate).
 #[test]
 fn exact_width_then_newline_is_hard_break() {
-	let mut s = Screen::new(4, 4);
+	let mut s = Screen::new(4, 4, SCROLLBACK_ROWS);
 	feed(&mut s, b"abcd\nef");
 	assert_eq!(dump(&s), b"abcd\nef");
 }
@@ -67,7 +68,7 @@ fn exact_width_then_newline_is_hard_break() {
 // with it so the dump still joins the wrapped line after the scroll.
 #[test]
 fn scrollback_preserves_soft_wrap() {
-	let mut s = Screen::new(6, 3);
+	let mut s = Screen::new(6, 3, SCROLLBACK_ROWS);
 	// "abcdefghij" (10 chars) wraps across two rows; the following newlines scroll the
 	// wrapped pair up into the scrollback before the dump is taken.
 	feed(&mut s, b"abcdefghij\n1\n2\n3\n4");
@@ -80,7 +81,7 @@ fn scrollback_preserves_soft_wrap() {
 #[test]
 fn raw_sink_records_the_exact_stream() {
 	let stream: &[u8] = b"\x1b[31mhi\x1b[0m\nbye";
-	let mut s = Screen::new(8, 4);
+	let mut s = Screen::new(8, 4, SCROLLBACK_ROWS);
 	let mut raw = RawSink::new();
 	raw.feed(stream);
 	feed(&mut s, stream);
@@ -122,7 +123,7 @@ fn raw_sink_consume_drops_only_the_oldest_bytes() {
 // events; each turns off again with the matching `l`.
 #[test]
 fn mouse_modes_track_the_dec_private_toggles() {
-	let mut s = Screen::new(8, 4);
+	let mut s = Screen::new(8, 4, SCROLLBACK_ROWS);
 	assert!(!s.mouse_tracking());
 	feed(&mut s, b"\x1b[?1000h");
 	assert!(s.mouse_tracking() && !s.mouse_report_motion());
@@ -140,7 +141,7 @@ fn mouse_modes_track_the_dec_private_toggles() {
 // Bracketed paste (?2004) toggles the flag the console reads to wrap a paste.
 #[test]
 fn bracketed_paste_toggles() {
-	let mut s = Screen::new(8, 4);
+	let mut s = Screen::new(8, 4, SCROLLBACK_ROWS);
 	assert!(!s.bracketed_paste());
 	feed(&mut s, b"\x1b[?2004h");
 	assert!(s.bracketed_paste());
@@ -152,7 +153,7 @@ fn bracketed_paste_toggles() {
 // console, which holds the clipboard.
 #[test]
 fn osc_52_sets_the_clipboard() {
-	let mut s = Screen::new(8, 4);
+	let mut s = Screen::new(8, 4, SCROLLBACK_ROWS);
 	// "aGVsbG8=" is base64 for "hello".
 	feed(&mut s, b"\x1b]52;c;aGVsbG8=\x07");
 	assert_eq!(s.take_clipboard_set().as_deref(), Some(&b"hello"[..]));
@@ -164,7 +165,7 @@ fn osc_52_sets_the_clipboard() {
 // trimmed, rows joined by a newline; the selected cells render reversed.
 #[test]
 fn selection_copies_text_and_highlights_cells() {
-	let mut s = Screen::new(8, 4);
+	let mut s = Screen::new(8, 4, SCROLLBACK_ROWS);
 	feed(&mut s, b"hello");
 	s.selection_begin(0, 0);
 	s.selection_extend(4, 0);
@@ -183,7 +184,7 @@ fn selection_copies_text_and_highlights_cells() {
 // newline (trailing blanks trimmed).
 #[test]
 fn selection_spans_rows() {
-	let mut s = Screen::new(8, 4);
+	let mut s = Screen::new(8, 4, SCROLLBACK_ROWS);
 	feed(&mut s, b"ab\ncd");
 	s.selection_begin(0, 0);
 	s.selection_extend(1, 1);
@@ -194,7 +195,7 @@ fn selection_spans_rows() {
 // the viewport, and a selection there copies that history line.
 #[test]
 fn selection_reaches_into_scrollback() {
-	let mut s = Screen::new(8, 3);
+	let mut s = Screen::new(8, 3, SCROLLBACK_ROWS);
 	feed(&mut s, b"L0\nL1\nL2\nL3\nL4");
 	// L0/L1 have scrolled into the history; page the view up to show them.
 	s.scroll_view_up();

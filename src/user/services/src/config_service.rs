@@ -31,13 +31,24 @@ struct Config {
 }
 
 impl Config {
-	// The default tree: a few real system facts the other services also know.
+	// The default tree: a few real system facts the other services also know, and
+	// the bounded-by-nature policy knobs their owning services read from here (each
+	// seeded with the value that used to be that service's compiled-in constant).
 	fn seeded() -> Config {
 		let mut entries: Vec<ConfigEntry> = Vec::new();
 		entries.push(ConfigEntry { key: String::from("system.name"), value: String::from("LiberSystem") });
 		entries.push(ConfigEntry { key: String::from("system.volume"), value: String::from("system") });
-		entries.push(ConfigEntry { key: String::from("log.capacity"), value: String::from("32") });
 		entries.push(ConfigEntry { key: String::from("shell.prompt"), value: String::from("> ") });
+		// ConsoleService reads these at every VT creation, so a set applies to the
+		// next VT; LogService reads its journal depth when the supervisor delivers
+		// its config client; NetworkService reads the neighbor-cache size at start;
+		// ServiceManager reads its supervision knobs once ConfigService is up.
+		entries.push(ConfigEntry { key: String::from("console.scrollback"), value: String::from("1000") });
+		entries.push(ConfigEntry { key: String::from("console.history"), value: String::from("512") });
+		entries.push(ConfigEntry { key: String::from("log.capacity"), value: String::from("4096") });
+		entries.push(ConfigEntry { key: String::from("net.arp-cache"), value: String::from("1024") });
+		entries.push(ConfigEntry { key: String::from("service.restart-budget"), value: String::from("3") });
+		entries.push(ConfigEntry { key: String::from("service.watchdog-ticks"), value: String::from("100") });
 		Config { entries }
 	}
 }

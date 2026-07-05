@@ -217,8 +217,10 @@ struct Neigh {
 
 // The ARP neighbor cache size - a cache with eviction (the oldest slot is replaced
 // when full), so it bounds memory, never which neighbors are reachable. Lives
-// on the heap.
-const NEIGH_MAX: usize = 1024;
+// on the heap. The live size is the operator's policy (the `net.arp-cache` config
+// key, read by NetworkService at start); this is the default when no configuration
+// answers.
+pub const NEIGH_MAX: usize = 1024;
 
 // The address configuration learned from a DHCP OFFER/ACK: the offered address plus
 // the mask / gateway / DNS / server-id carried in the reply options, and the lease
@@ -359,12 +361,12 @@ pub struct Stack {
 }
 
 impl Stack {
-	pub fn new(mac: MacAddr, ip: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr, dns: Ipv4Addr) -> Stack {
+	pub fn new(mac: MacAddr, ip: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr, dns: Ipv4Addr, neigh_cap: usize) -> Stack {
 		let mut conns: Vec<TcpConn> = Vec::with_capacity(TCP_CONN_MAX);
 		for _ in 0..TCP_CONN_MAX {
 			conns.push(TcpConn::closed());
 		}
-		Stack { mac, ip, mask, gateway, dns, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; NEIGH_MAX], conns, listen_ports: alloc::vec![0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
+		Stack { mac, ip, mask, gateway, dns, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listen_ports: alloc::vec![0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
 	}
 
 	pub fn mac(&self) -> MacAddr {

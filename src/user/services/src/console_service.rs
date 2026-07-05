@@ -17,7 +17,7 @@
 
 use rt::*;
 
-use proto::system::{network, process};
+use proto::system::{config, network, process};
 
 // The shell's command vocabulary, shared with the shell itself: the line discipline
 // completes the command word on Tab, and the shell prints the matches on a double Tab.
@@ -32,7 +32,7 @@ use alloc::vec::Vec;
 // display `Surface`. This service supplies the userspace display backends - the boot
 // framebuffer and the virtio-gpu shared backing - and drives `Term`; the kernel boot
 // console shares the same `Term`.
-use term::{CELL_H, CELL_W, Echo, EchoBuf, Geometry, Ld, Raster, RawSink, Surface, Term};
+use term::{CELL_H, CELL_W, Echo, EchoBuf, Geometry, LD_HIST_MAX, Ld, Raster, RawSink, SCROLLBACK_ROWS, Surface, Term};
 
 // The boot framebuffer the kernel maps directly: its pixel writes are visible immediately,
 // so present is a no-op. The fallback display (and the deterministic test path).
@@ -162,6 +162,77 @@ struct Factories {
 	perm: u64,
 }
 
+// How long a config read may wait for its reply. A live ConfigService answers in
+// one synchronous round-trip, far inside this; the bound exists so VT creation
+// never hangs when the supervisor wired the config factory to a mute endpoint (a
+// test scenario) - a missed deadline reads as "no answer, use the default".
+const CONFIG_WAIT_TICKS: u64 = 100;
+
+// A proto transport with a bounded reply wait (see CONFIG_WAIT_TICKS): send the
+// request, wait for the reply until the deadline, and treat a miss as no answer
+// instead of blocking forever.
+struct DeadlineTransport {
+	chan: u64,
+	ticks: u64,
+}
+
+impl proto::codec::Transport for DeadlineTransport {
+	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)> {
+		unsafe {
+			if !send_blocking(self.chan, request, request_handle) {
+				return None;
+			}
+			if wait(self.chan, clock() + self.ticks) != 0 {
+				return None;
+			}
+			let mut reply: [u8; 4096] = [0u8; 4096];
+			match try_recv(self.chan, &mut reply) {
+				Polled::Message { len, handle } => Some((reply[..len].to_vec(), handle)),
+				_ => None,
+			}
+		}
+	}
+}
+
+// Mint a client connection from a serve_multi `factory` under the same bounded
+// wait; 0 when the factory does not answer in time.
+unsafe fn connect_deadline(factory: u64, ticks: u64) -> u64 {
+	unsafe {
+		let req: [u8; 2] = CONNECT_OP.to_le_bytes();
+		if !send_blocking(factory, &req, 0) {
+			return 0;
+		}
+		if wait(factory, clock() + ticks) != 0 {
+			return 0;
+		}
+		let mut buf: [u8; 16] = [0u8; 16];
+		match try_recv(factory, &mut buf) {
+			Polled::Message { handle, .. } if handle != 0 => handle,
+			_ => 0,
+		}
+	}
+}
+
+// The per-VT terminal policy from the config tree - the scrollback depth and the
+// line-editor history depth (`console.scrollback`, `console.history`) - read at
+// every VT creation, so a `set` applies to the next VT. The term crate's defaults
+// stand when no config client is held or a key does not answer / parse.
+fn term_policy(config: u64) -> (usize, usize) {
+	if config == 0 {
+		return (SCROLLBACK_ROWS, LD_HIST_MAX);
+	}
+	let mut client = config::Client::new(DeadlineTransport { chan: config, ticks: CONFIG_WAIT_TICKS });
+	let mut read = |key: &str, default: usize| -> usize {
+		match client.get(key) {
+			Some(Ok(value)) => value.parse::<usize>().ok().filter(|&n| n > 0).unwrap_or(default),
+			_ => default,
+		}
+	};
+	let scrollback: usize = read("console.scrollback", SCROLLBACK_ROWS);
+	let history: usize = read("console.history", LD_HIST_MAX);
+	(scrollback, history)
+}
+
 // The whole console session: the framebuffer it owns, the kernel keystroke channel, the
 // live VTs (vts[fg] is foreground and owns the display), and the spawn capabilities.
 struct Console {
@@ -193,6 +264,9 @@ struct Console {
 	// (foreground, scrollback, switch, gpu-resize) untouched.
 	ptys: Vec<Vt>,
 	facs: Factories,
+	// The console's own ConfigService client (0 when the factory never answered),
+	// consulted at every VT creation for the terminal policy (`term_policy`).
+	config_client: u64,
 	// The pointer-forward channel from InputService (0 = no pointer device this boot): raw
 	// 6-byte pointer events [x u16 LE][y u16 LE][buttons u8][wheel i8] arrive on it, which
 	// `handle_pointer` turns into SGR mouse reports (for a program that enabled tracking)
@@ -317,6 +391,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			(None, None) => (0, Framebuffer::default(), 0, 0),
 		};
 		let has_fb: bool = gpu_disp.is_some() || boot.is_some();
+		// The console's own ConfigService client (minted under the bounded wait) and
+		// VT 1's terminal policy: the scrollback and history depths are the config
+		// tree's, re-read at every later VT creation.
+		let config_client: u64 = connect_deadline(config, CONFIG_WAIT_TICKS);
+		let (vt_scrollback, vt_history): (usize, usize) = term_policy(config_client);
 		// Build VT 1's terminal directly on the runtime display surface (the gpu backing when
 		// present, else the boot framebuffer), then seed its grid model with the kernel boot
 		// log. The kernel and this service share the same `term` stack, so the kernel hands
@@ -324,7 +403,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// the boot log stays on screen - and in the scrollback - after the gpu and this
 		// renderer take over, with no second renderer and no pixel-level handoff.
 		let term: Option<Term> = if has_fb {
-			let mut t = Term::new(make_surface(addr, &fb, gpu));
+			let mut t = Term::new(make_surface(addr, &fb, gpu), vt_scrollback);
 			t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 			let mut log: Vec<u8> = alloc::vec![0u8; 16384];
 			let n: i64 = console_readlog(&mut log);
@@ -345,7 +424,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new()), master: 0 }], fg: 0, ptys: Vec::new(), facs, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
+		let mut console: Console = Console { addr, fb, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0 }], fg: 0, ptys: Vec::new(), facs, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
 		run(&mut console);
 	}
 }
@@ -1010,7 +1089,7 @@ unsafe fn create_vt(console: &mut Console) {
 		if !console.has_fb {
 			return;
 		}
-		if let Some(vt) = spawn_vt(&console.facs, console.addr, &console.fb, console.gpu, console.cur_w, console.cur_h) {
+		if let Some(vt) = spawn_vt(&console.facs, console.config_client, console.addr, &console.fb, console.gpu, console.cur_w, console.cur_h) {
 			console.vts.push(vt);
 			console.fg = console.vts.len() - 1;
 			repaint(console);
@@ -1410,7 +1489,7 @@ unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) 
 // Open one VT's shell: create the VT's console + control channels, spawn a fully-capable
 // shell over them, nudge it to print its first prompt, and return the VT (its cleared grid
 // + the service ends of those channels). None on any failure.
-unsafe fn spawn_vt(facs: &Factories, addr: u64, fb: &Framebuffer, gpu: u64, cur_w: u32, cur_h: u32) -> Option<Vt> {
+unsafe fn spawn_vt(facs: &Factories, config_client: u64, addr: u64, fb: &Framebuffer, gpu: u64, cur_w: u32, cur_h: u32) -> Option<Vt> {
 	unsafe {
 		let (vt_service, vt_client): (u64, u64) = channel()?;
 		let (control_console, control_shell): (u64, u64) = channel()?;
@@ -1424,10 +1503,13 @@ unsafe fn spawn_vt(facs: &Factories, addr: u64, fb: &Framebuffer, gpu: u64, cur_
 		// nudge the new shell to print its first prompt: an empty line dispatches to a
 		// silent reprompt, the same first prompt VT 1 shows at boot.
 		send_blocking(vt_service, b"\n", 0);
-		let mut term: Term = Term::new(make_surface(addr, fb, gpu));
+		// the new VT's terminal policy, re-read from the config tree so a `set`
+		// applies here (the next VT) without restarting the console.
+		let (vt_scrollback, vt_history): (usize, usize) = term_policy(config_client);
+		let mut term: Term = Term::new(make_surface(addr, fb, gpu), vt_scrollback);
 		term.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 		term.screen.clear();
-		Some(Vt { term: Some(term), client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new()), master: 0 })
+		Some(Vt { term: Some(term), client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0 })
 	}
 }
 
@@ -1456,7 +1538,10 @@ unsafe fn open_pty(console: &mut Console, name: &[u8]) -> Option<u64> {
 		if is_shell {
 			send_blocking(slave_service, b"\n", 0);
 		}
-		console.ptys.push(Vt { term: None, client: slave_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new()), master: master_console });
+		// the slave's line-editor history depth follows the same config policy as a
+		// display VT (a pty has no grid, so only the history applies).
+		let (_, pty_history): (usize, usize) = term_policy(console.config_client);
+		console.ptys.push(Vt { term: None, client: slave_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(pty_history)), master: master_console });
 		Some(master_host)
 	}
 }

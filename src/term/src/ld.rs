@@ -13,9 +13,10 @@ use alloc::vec::Vec;
 
 use crate::Term;
 
-// The tty line discipline limits (per VT).
+// The tty line discipline limits (per VT). LD_HIST_MAX is the history default when
+// no configuration answers (the live depth is the `console.history` config key).
 const LD_LINE_MAX: usize = 4096;
-const LD_HIST_MAX: usize = 512;
+pub const LD_HIST_MAX: usize = 512;
 
 // A small fixed buffer the line discipline accumulates echo bytes in, mirrored to the
 // serial port after a keystroke is processed (the framebuffer is echoed live).
@@ -69,6 +70,9 @@ pub struct Ld {
 	pub len: usize,
 	cursor: usize,
 	history: Vec<Vec<u8>>,
+	// The history depth: the operator's policy (the `console.history` config key,
+	// read at VT creation), LD_HIST_MAX when no configuration answers.
+	hist_max: usize,
 	hist_pos: usize,
 	esc: u8,
 	csi_param: u8,
@@ -90,8 +94,8 @@ pub struct Ld {
 }
 
 impl Ld {
-	pub fn new() -> Ld {
-		Ld { line: [0u8; LD_LINE_MAX], len: 0, cursor: 0, history: Vec::new(), hist_pos: 0, esc: 0, csi_param: 0, cooked: true, echo: true, eof: false, last_tab: false, relist: false }
+	pub fn new(history_max: usize) -> Ld {
+		Ld { line: [0u8; LD_LINE_MAX], len: 0, cursor: 0, history: Vec::new(), hist_max: history_max, hist_pos: 0, esc: 0, csi_param: 0, cooked: true, echo: true, eof: false, last_tab: false, relist: false }
 	}
 
 	// Feed one cooked-mode keystroke (`vocab` is the Tab-completion vocabulary). Returns
@@ -375,7 +379,7 @@ impl Ld {
 	pub fn commit(&mut self) {
 		let trimmed = ld_trim(&self.line[..self.len]);
 		if !trimmed.is_empty() && self.history.last().map(|h: &Vec<u8>| h.as_slice()) != Some(trimmed) {
-			if self.history.len() >= LD_HIST_MAX {
+			if self.history.len() >= self.hist_max {
 				self.history.remove(0);
 			}
 			self.history.push(trimmed.to_vec());

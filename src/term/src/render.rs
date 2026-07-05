@@ -260,10 +260,10 @@ pub struct Term {
 }
 
 impl Term {
-	pub fn new(surface: Box<dyn Surface>) -> Term {
+	pub fn new(surface: Box<dyn Surface>, scrollback: usize) -> Term {
 		let cols = surface.width() / CELL_W;
 		let rows = surface.height() / CELL_H;
-		Term { screen: Screen::new(cols, rows), renderer: FramebufferRenderer::new(surface) }
+		Term { screen: Screen::new(cols, rows, scrollback), renderer: FramebufferRenderer::new(surface) }
 	}
 
 	// Reflow the model to fit new_cols x new_rows, clamped to what the physical framebuffer

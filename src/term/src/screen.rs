@@ -8,10 +8,12 @@
 use alloc::vec::Vec;
 
 // Per-VT scrollback: rows that scroll off the top of the primary screen are kept in a
-// fixed ring so the user can page back through them (Shift+PageUp / PageDown). 100 rows
-// ~= two screenfuls; the ring is allocated once per VT (deterministic memory: at the
-// 4-VT cap this plus the cell grids stays within the rt 1 MB heap).
-const SCROLLBACK_ROWS: usize = 1000;
+// fixed ring so the user can page back through them (Shift+PageUp / PageDown). The
+// depth is the operator's policy (the `console.scrollback` config key, read at VT
+// creation); this is the default when no configuration answers. The ring is allocated
+// once per VT (deterministic memory: at the 4-VT cap this plus the cell grids stays
+// within the rt 1 MB heap).
+pub const SCROLLBACK_ROWS: usize = 1000;
 
 // Light-grey on near-black, matching the kernel console's boot-log colours.
 const FG: (u8, u8, u8) = (0xc8, 0xc8, 0xc8);
@@ -158,9 +160,9 @@ pub struct Screen {
 }
 
 impl Screen {
-	pub fn new(cols: usize, rows: usize) -> Screen {
+	pub fn new(cols: usize, rows: usize, scrollback: usize) -> Screen {
 		let blank = Cell { glyph: b' ' as u32, fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
-		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, tty_raw_req: None, tty_echo_req: None, mouse_mode: 0, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; SCROLLBACK_ROWS * cols], sb_wrap: alloc::vec![false; SCROLLBACK_ROWS], sb_cap: SCROLLBACK_ROWS, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new() }
+		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, tty_raw_req: None, tty_echo_req: None, mouse_mode: 0, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; scrollback * cols], sb_wrap: alloc::vec![false; scrollback], sb_cap: scrollback, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new() }
 	}
 
 	// The active cell buffer: the alternate screen while it is up, else the primary.
@@ -485,9 +487,8 @@ impl Screen {
 		self.dirty = alloc::vec![true; new_cols * new_rows];
 		self.wrap = alloc::vec![false; new_rows];
 		// Scrollback is reset on a resize (its fixed width changed)
-		self.scrollback = alloc::vec![blank; SCROLLBACK_ROWS * new_cols];
-		self.sb_wrap = alloc::vec![false; SCROLLBACK_ROWS];
-		self.sb_cap = SCROLLBACK_ROWS;
+		self.scrollback = alloc::vec![blank; self.sb_cap * new_cols];
+		self.sb_wrap = alloc::vec![false; self.sb_cap];
 		self.sb_head = 0;
 		self.sb_len = 0;
 		self.view_offset = 0;

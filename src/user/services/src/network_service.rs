@@ -23,9 +23,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use rt::*;
 
-use crate::net::{DHCP_ACK, DHCP_NAK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, SockEntry, SockEntryState, Stack};
+use crate::net::{DHCP_ACK, DHCP_NAK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, NEIGH_MAX, SockEntry, SockEntryState, Stack};
 use proto::codec::Buffer;
-use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest, listener, network, socket};
+use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest, config, listener, network, socket};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -84,22 +84,48 @@ const MAX_CLIENTS: usize = 4;
 const MAX_SOCKS: usize = 4;
 const MAX_LISTEN: usize = 2;
 
+// The neighbor-cache size from the config tree (the `net.arp-cache` key), read once
+// at start over the supervisor-minted ConfigService client and the client closed -
+// the cache is allocated with the stack, so a later `set` applies at the next boot.
+// NEIGH_MAX stands in when no config tree serves this boot (handle 0, a test
+// scenario) or the key does not parse.
+fn arp_cache_size(config: u64) -> usize {
+	if config == 0 {
+		return NEIGH_MAX;
+	}
+	let mut client = config::Client::new(ChannelTransport { chan: config });
+	let size: usize = match client.get("net.arp-cache") {
+		Some(Ok(value)) => value.parse::<usize>().ok().filter(|&n| n > 0).unwrap_or(NEIGH_MAX),
+		_ => NEIGH_MAX,
+	};
+	unsafe { close(config) };
+	size
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 64] = [0u8; 64];
 	unsafe {
-		// 1. receive the driver's frame channel (we move frames over it) and the
-		//    client channel the shell reaches us on (the `ip` / `ping` / `nslookup`
-		//    control protocol).
+		// 1. receive the driver's frame channel (we move frames over it), the
+		//    ConfigService client the supervisor minted for us (handle 0 when no
+		//    config tree serves this boot - a test scenario), and the client channel
+		//    the shell reaches us on (the `ip` / `ping` / `nslookup` control
+		//    protocol).
 		let frames: u64 = recv_tagged(bootstrap, &mut buf, b"FRAMES").unwrap_or_else(|| exit());
+		let config: u64 = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } if len >= 6 && &buf[..6] == b"CONFIG" => handle,
+			_ => exit(),
+		};
 		let client: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| exit());
 		// 2. the frame-mover driver leads with our NIC's MAC over the frame channel
-		//    (it owns the device; we own the protocol), so we can build the stack.
+		//    (it owns the device; we own the protocol), so we can build the stack -
+		//    its neighbor-cache sized by the config tree's `net.arp-cache` policy.
 		let mac: MacAddr = match recv_blocking(frames, &mut buf) {
 			Received::Message { len, .. } if len >= 9 && &buf[..3] == b"MAC" => MacAddr([buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]]),
 			_ => exit(),
 		};
-		let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP, DNS_SERVER);
+		let neigh_cap: usize = arp_cache_size(config);
+		let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP, DNS_SERVER, neigh_cap);
 		// 3. learn our address / mask / gateway / DNS from DHCP, falling back to the
 		//    static config above if no server answers. The frame buffers are scoped so
 		//    they are freed before serve allocates its own (the 16 kB user stack).

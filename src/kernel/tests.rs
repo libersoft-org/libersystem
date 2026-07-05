@@ -2245,6 +2245,9 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	let (_serve_kernel, serve_user) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn NetworkService");
 	send_cap(&boot_kernel, b"FRAMES", frames_user, Rights::ALL).expect("frames bootstrap");
+	// no config tree serves this scenario: CONFIG with no handle tells the service
+	// to fall back to its compiled-in defaults (the neighbor-cache size).
+	boot_kernel.send(Message::new(b"CONFIG".to_vec(), alloc::vec::Vec::new(), 0)).expect("config bootstrap");
 	send_cap(&boot_kernel, b"SERVE", serve_user, Rights::ALL).expect("serve bootstrap");
 	// Pre-queue the whole bind conversation (the kernel test thread cannot answer
 	// mid-wait): the MAC lead-in, the OFFER and the clock-carrying ACK the handshake

@@ -19,10 +19,10 @@ mod render;
 mod screen;
 mod text;
 
-pub use ld::{Echo, EchoBuf, Ld};
+pub use ld::{Echo, EchoBuf, LD_HIST_MAX, Ld};
 pub use raw::RawSink;
 pub use render::{CELL_H, CELL_W, Geometry, Raster, Surface, Term};
-pub use screen::{Cell, Color, CursorShape, Screen, ScrollOp};
+pub use screen::{Cell, Color, CursorShape, SCROLLBACK_ROWS, Screen, ScrollOp};
 pub use text::TextSink;
 
 #[cfg(test)]

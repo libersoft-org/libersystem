@@ -19,22 +19,27 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use proto::system::log::{self, Service};
-use proto::system::{Entry, Error, Query, Severity};
+use proto::system::{Entry, Error, Query, Severity, config};
 use rt::*;
 
 // The bounded in-memory journal: at most this many records, newest dropping
-// oldest - deep enough to diagnose well past the last minute. Persistence (the
-// on-disk journal) is a later milestone; the depth becomes a config key then.
+// oldest - deep enough to diagnose well past the last minute. The depth is the
+// operator's policy (the `log.capacity` config key); this is the default until the
+// supervisor delivers a ConfigService client (LogService starts before ConfigService,
+// so the client arrives on the control channel once the config tree is up). A later
+// `set` applies at the next boot. Persistence (the on-disk journal) is a later
+// milestone.
 const JOURNAL_CAP: usize = 4096;
 
 // The in-memory journal: a bounded list of canonical log entries.
 struct Journal {
 	entries: Vec<Entry>,
+	cap: usize,
 }
 
 impl Journal {
 	fn new() -> Journal {
-		Journal { entries: Vec::new() }
+		Journal { entries: Vec::new(), cap: JOURNAL_CAP }
 	}
 
 	// Collect the entries matching `q`: at or above its minimum severity (none = all),
@@ -63,7 +68,7 @@ impl Journal {
 impl Service for Journal {
 	fn emit(&mut self, entry: Entry) -> Result<(), Error> {
 		self.entries.push(entry);
-		if self.entries.len() > JOURNAL_CAP {
+		if self.entries.len() > self.cap {
 			self.entries.remove(0);
 		}
 		Ok(())
@@ -79,6 +84,26 @@ impl Service for Journal {
 	// we return the snapshot and the serve loop streams it frame by frame.
 	fn tail(&mut self, q: Query) -> Vec<Entry> {
 		self.filtered(&q)
+	}
+}
+
+impl Journal {
+	// Adopt the config tree's journal depth (the `log.capacity` key) over the
+	// delivered ConfigService client: read it once, trim if the journal already
+	// outgrew it, and close the client. A later `set` applies at the next boot.
+	fn adopt_capacity(&mut self, config: u64) {
+		let mut client = config::Client::new(ChannelTransport { chan: config });
+		if let Some(Ok(value)) = client.get("log.capacity") {
+			if let Ok(cap) = value.parse::<usize>() {
+				if cap > 0 {
+					self.cap = cap;
+					if self.entries.len() > self.cap {
+						self.entries.drain(..self.entries.len() - self.cap);
+					}
+				}
+			}
+		}
+		unsafe { close(config) };
 	}
 }
 
@@ -101,11 +126,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    OP_TAIL is special: it opens a stream. We mint a fresh sub-channel, hand
 	//    the consumer end back out-of-band alongside the correlation id, then frame
 	//    each entry onto the producer end and close it to mark end-of-stream.
+	//    The bootstrap channel stays in the waitset for the supervisor's late
+	//    "CONFIG" delivery: LogService starts before ConfigService, so its config
+	//    client can only arrive once the config tree is up.
 	let mut journal: Journal = Journal::new();
 	let mut request: [u8; 1024] = [0u8; 1024];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
-		serve_multi(service, &mut request, &mut reply, |chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
+		serve_multi_seeded(service, &[bootstrap], &mut request, &mut reply, |chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
+			if chan == bootstrap {
+				if req == b"CONFIG" && handle != 0 {
+					journal.adopt_capacity(handle);
+				}
+				return None;
+			}
 			// OP_TAIL opens a stream served out of band (no byte reply); everything else
 			// dispatches to a single reply. The stream is minted on the channel the
 			// request arrived on, so each client gets its own tail.
