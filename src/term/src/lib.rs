@@ -13,11 +13,13 @@
 
 extern crate alloc;
 
+mod ld;
 mod raw;
 mod render;
 mod screen;
 mod text;
 
+pub use ld::{Echo, EchoBuf, Ld};
 pub use raw::RawSink;
 pub use render::{CELL_H, CELL_W, Geometry, Raster, Surface, Term};
 pub use screen::{Cell, Color, CursorShape, Screen, ScrollOp};
