@@ -204,6 +204,67 @@ impl<D: BlockDevice> FatFs<D> {
 		}
 	}
 
+	// The data area's size in bytes - the cluster heap the boot sector declares.
+	pub fn total_bytes(&self) -> u64 {
+		self.geo.cluster_count as u64 * self.geo.sectors_per_cluster as u64 * self.geo.bytes_per_sector as u64
+	}
+
+	// The unallocated share of the data area in bytes: FAT12/16/32 count the zero
+	// entries of the active allocation table (read once, decoded per family width),
+	// exFAT the clear bits of its allocation bitmap. A fresh count per call - this
+	// crate caches no allocation state, and the volumes it serves are small.
+	pub fn free_bytes(&mut self) -> Result<u64, FsError> {
+		let cluster_bytes: u64 = self.geo.sectors_per_cluster as u64 * self.geo.bytes_per_sector as u64;
+		let max = self.max_cluster();
+		let mut free: u64 = 0;
+		if self.geo.kind == Kind::ExFat {
+			let (bm_first, bm_size) = self.exfat_bitmap()?;
+			let bm = self.read_chain(bm_first, usize::MAX)?;
+			let bm_used = bm.len().min(bm_size as usize);
+			for c in 2..=max {
+				let idx = (c - 2) as usize;
+				if idx / 8 < bm_used && bm[idx / 8] & (1 << (idx % 8)) == 0 {
+					free += 1;
+				}
+			}
+			return Ok(free * cluster_bytes);
+		}
+		let bps = self.geo.bytes_per_sector;
+		let mut table = vec![0u8; (self.geo.fat_size * bps) as usize];
+		let fat_base = self.geo.reserved_sectors + self.geo.active_fat * self.geo.fat_size;
+		self.read_fs_sectors(fat_base as u64, self.geo.fat_size, &mut table)?;
+		for c in 2..=max {
+			let entry: u32 = match self.geo.kind {
+				Kind::Fat12 => {
+					let off = c as usize + c as usize / 2;
+					if off + 1 >= table.len() {
+						break;
+					}
+					let v = u16::from_le_bytes([table[off], table[off + 1]]);
+					if c & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
+				}
+				Kind::Fat16 => {
+					let off = c as usize * 2;
+					if off + 1 >= table.len() {
+						break;
+					}
+					u16::from_le_bytes([table[off], table[off + 1]]) as u32
+				}
+				Kind::Fat32 | Kind::ExFat => {
+					let off = c as usize * 4;
+					if off + 3 >= table.len() {
+						break;
+					}
+					u32::from_le_bytes([table[off], table[off + 1], table[off + 2], table[off + 3]]) & 0x0FFF_FFFF
+				}
+			};
+			if entry == 0 {
+				free += 1;
+			}
+		}
+		Ok(free * cluster_bytes)
+	}
+
 	// List a subdirectory named by a `/`-separated path. An empty path is the root.
 	pub fn list_dir(&mut self, path: &[u8]) -> Result<Vec<FileInfo>, FsError> {
 		let dir = self.resolve_dir(path)?;

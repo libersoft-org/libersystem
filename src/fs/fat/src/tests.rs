@@ -503,6 +503,23 @@ fn writes_a_new_file_then_reads_it_back() {
 }
 
 #[test]
+fn reports_total_and_free_bytes_across_writes() {
+	// every family reports a plausible pool: free fits inside total, and writing a
+	// multi-cluster file shrinks free by at least the file's size while total holds.
+	for build in [build_fat(Kind::Fat12, ROOT), build_fat(Kind::Fat16, ROOT), build_fat(Kind::Fat32, ROOT), build_exfat(ROOT)] {
+		let mut fs = FatFs::mount(MemDisk { data: build }).unwrap();
+		let total = fs.total_bytes();
+		let before = fs.free_bytes().unwrap();
+		assert!(total > 0 && before > 0 && before <= total);
+		let big: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+		fs.write_file(b"POOL.BIN", &big).unwrap();
+		let after = fs.free_bytes().unwrap();
+		assert!(after < before && before - after >= big.len() as u64);
+		assert_eq!(fs.total_bytes(), total);
+	}
+}
+
+#[test]
 fn writes_a_multi_cluster_file() {
 	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
 	let big: Vec<u8> = (0..1500u32).map(|i| i as u8).collect();

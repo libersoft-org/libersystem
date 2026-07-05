@@ -479,13 +479,13 @@ impl volume::Service for Volume {
 				let block: u64 = liberfs::BLOCK_SIZE as u64;
 				Ok(VolumeStatus { label: String::from_utf8_lossy(fs.label()).into_owned(), total_bytes: fs.num_blocks() * block, free_bytes: fs.free_blocks() * block, compression: fs.compression(), read_only: fs.is_read_only(), filesystem: String::from("liberfs") })
 			}
-			Volume::Archive { .. } => Ok(VolumeStatus { label: String::new(), total_bytes: 0, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("archive") }),
+			Volume::Archive { len, .. } => Ok(VolumeStatus { label: String::new(), total_bytes: *len as u64, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("archive") }),
 			Volume::Fat(backing) => {
-				let kind: &'static str = backing.run(|fs| Ok(fs.kind_name()))?;
-				Ok(VolumeStatus { label: String::new(), total_bytes: 0, free_bytes: 0, compression: false, read_only: false, filesystem: String::from(kind) })
+				let (kind, total, free): (&'static str, u64, u64) = backing.run(|fs| Ok((fs.kind_name(), fs.total_bytes(), fs.free_bytes()?)))?;
+				Ok(VolumeStatus { label: String::new(), total_bytes: total, free_bytes: free, compression: false, read_only: false, filesystem: String::from(kind) })
 			}
-			Volume::Iso(_) => Ok(VolumeStatus { label: String::new(), total_bytes: 0, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("iso9660") }),
-			Volume::Udf(_) => Ok(VolumeStatus { label: String::new(), total_bytes: 0, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("udf") }),
+			Volume::Iso(fs) => Ok(VolumeStatus { label: String::new(), total_bytes: fs.total_bytes(), free_bytes: 0, compression: false, read_only: true, filesystem: String::from("iso9660") }),
+			Volume::Udf(fs) => Ok(VolumeStatus { label: String::new(), total_bytes: fs.total_bytes(), free_bytes: 0, compression: false, read_only: true, filesystem: String::from("udf") }),
 		}
 	}
 

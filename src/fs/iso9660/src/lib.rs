@@ -129,6 +129,12 @@ impl<D: BlockDevice> Iso9660<D> {
 		Some(Iso9660 { dev, geo: Geometry { root_lba, root_len, blocks, joliet } })
 	}
 
+	// The volume's size in bytes - the space size the Primary Volume Descriptor
+	// declares, for volume status reporting. Read-only media, so it is all in use.
+	pub fn total_bytes(&self) -> u64 {
+		self.geo.blocks as u64 * SECTOR_SIZE as u64
+	}
+
 	// List the volume's root directory.
 	pub fn list(&mut self) -> Result<Vec<FileInfo>, FsError> {
 		self.read_dir(self.geo.root_lba, self.geo.root_len)

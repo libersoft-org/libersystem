@@ -45,10 +45,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	exit();
 }
 
-// List the volume set, read through the five grants: each volume's filesystem (as its
-// service reports it in the `status` op) and file count, plus the system volume's pool
-// numbers (label, size, free space, compression, mount mode) - the `df` view. `json`
-// selects a JSON array over the text lines.
+// List the volume set, read through the five grants: an aligned table of each
+// volume's filesystem (as its service reports it in the `status` op), file count,
+// and the size / used / free numbers the filesystem declares, with a notes column
+// for the read-only and compression flags - the `df` view. `json` selects a JSON
+// array over the table.
 unsafe fn list_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64, json: bool) {
 	unsafe {
 		let rows: [(&str, u64); 5] = [("vol://system", system), ("vol://media", media), ("vol://iso", iso), ("vol://udf", udf), ("vol://usb", usb)];
@@ -56,7 +57,7 @@ unsafe fn list_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64, js
 		if json {
 			out.push('[');
 		} else {
-			out.push_str("volumes (5):\n");
+			out.push_str("\x1b[1mvolume        filesystem  files       size       used       free\x1b[0m\n");
 		}
 		for (i, &(uri, chan)) in rows.iter().enumerate() {
 			let status: Option<VolumeStatus> = volume_status(chan);
@@ -71,10 +72,11 @@ unsafe fn list_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64, js
 	}
 }
 
-// Append one volume row to `out`, as a text line or a JSON object: the filesystem the
-// volume's service reports, the file count, and - when the filesystem tracks a pool
-// (the LiberFS system volume) - the used/total numbers, the compression switch and a
-// READ-ONLY marker on a degraded mount.
+// Append one volume row to `out`, as a table line or a JSON object: the filesystem
+// the volume's service reports, the file count, and the size / used / free columns
+// (used = total - free; a read-only volume is all in use), plus a notes column with
+// the READ-ONLY marker of a degraded or inherently read-only mount and the LiberFS
+// compression switch.
 fn render_row(out: &mut String, index: usize, uri: &str, present: bool, status: Option<&VolumeStatus>, files: usize, json: bool) {
 	use core::fmt::Write as _;
 	if json {
@@ -94,25 +96,70 @@ fn render_row(out: &mut String, index: usize, uri: &str, present: bool, status: 
 		out.push('}');
 		return;
 	}
-	let _ = write!(out, "  {uri} (");
+	push_left(out, uri, 14);
 	match status {
 		Some(st) => {
-			let _ = write!(out, "{}, {files} files)", st.filesystem);
+			push_left(out, &st.filesystem, 12);
+			let mut cell = String::new();
+			let _ = write!(cell, "{files}");
+			push_right(out, &cell, 5);
 			if st.total_bytes > 0 {
-				let used: u64 = st.total_bytes - st.free_bytes;
-				let _ = write!(out, " - {} / {} MB used, compression {}", used >> 20, st.total_bytes >> 20, if st.compression { "on" } else { "off" });
-				if st.read_only {
-					out.push_str(", READ-ONLY");
-				}
+				push_right(out, &size_cell(st.total_bytes), 11);
+				push_right(out, &size_cell(st.total_bytes - st.free_bytes), 11);
+				let free: String = if st.read_only { String::from("-") } else { size_cell(st.free_bytes) };
+				push_right(out, &free, 11);
+			} else {
+				push_right(out, "-", 11);
+				push_right(out, "-", 11);
+				push_right(out, "-", 11);
+			}
+			if st.read_only {
+				out.push_str("  read-only");
+			}
+			if st.compression {
+				out.push_str("  compression");
 			}
 		}
 		None => {
-			out.push_str(if present { "unavailable)" } else { "absent)" });
+			push_left(out, if present { "unavailable" } else { "absent" }, 12);
 		}
 	}
 	if index < 4 {
 		out.push('\n');
 	}
+}
+
+// Append `text` padded with spaces on the right to `width` (a left-aligned column,
+// two spaces of gutter included in the widths above).
+fn push_left(out: &mut String, text: &str, width: usize) {
+	out.push_str(text);
+	for _ in text.len()..width {
+		out.push(' ');
+	}
+}
+
+// Append `text` padded with spaces on the left to `width` (a right-aligned column).
+fn push_right(out: &mut String, text: &str, width: usize) {
+	for _ in text.len()..width {
+		out.push(' ');
+	}
+	out.push_str(text);
+}
+
+// A byte count scaled to the largest whole unit (kB / MB / GB), one decimal - the
+// same rendering lsblk uses for capacities.
+fn size_cell(bytes: u64) -> String {
+	use core::fmt::Write as _;
+	let mut cell = String::new();
+	let units: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("kB", 1 << 10)];
+	for &(unit, scale) in &units {
+		if bytes >= scale {
+			let _ = write!(cell, "{}.{} {}", bytes / scale, bytes % scale * 10 / scale, unit);
+			return cell;
+		}
+	}
+	let _ = write!(cell, "{bytes} B");
+	cell
 }
 
 // The volume's status (its filesystem name and, for LiberFS, the pool numbers), or None

@@ -155,6 +155,12 @@ impl<D: BlockDevice> Udf<D> {
 		Some(Udf { dev, geo: Geometry { part_start, part_len, root_icb } })
 	}
 
+	// The partition's size in bytes - the length the Main Volume Descriptor Sequence
+	// declares, for volume status reporting. Read-only media, so it is all in use.
+	pub fn total_bytes(&self) -> u64 {
+		self.geo.part_len as u64 * SECTOR_SIZE as u64
+	}
+
 	// List the volume's root directory.
 	pub fn list(&mut self) -> Result<Vec<FileInfo>, FsError> {
 		self.read_dir(self.geo.root_icb)

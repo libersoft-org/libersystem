@@ -1,6 +1,5 @@
 # Bugs / changes
 
-- lsvol - show table with used / total size
 - Some commands are missing --help parameter
 - Create some debug tools that makes debugging easier? As some debug tests took ridiculously long time
 - How does the format of our binary files look like? describe it somewhere
