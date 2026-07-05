@@ -104,47 +104,66 @@ const VOCABULARY: [Capability; 16] = [
 	Capability::Usb,
 ];
 
+// A store row where the policy allows everything the component requests - the
+// common case for the curated first-party tools, whose requests were written
+// against exactly what they need.
+fn granted(component: &str, caps: Vec<Capability>) -> Manifest {
+	Manifest { component: String::from(component), requested: caps.clone(), grants: caps }
+}
+
+// A store row where the component requests more than the policy allows: the
+// grants are the audited intersection, and the withheld remainder surfaces as a
+// denial in the launch audit. This is the requested-vs-granted split the packaged
+// (M42) form ships: the package declares `requested`, the manager decides.
+fn intersected(component: &str, requested: Vec<Capability>, allowed: &[Capability]) -> Manifest {
+	let grants: Vec<Capability> = requested.iter().copied().filter(|cap: &Capability| allowed.contains(cap)).collect();
+	Manifest { component: String::from(component), requested, grants }
+}
+
 // The manager's policy: the permission manifest declared for each component it governs -
 // the typed source of truth for what that component may be granted.
 fn manifest_for(component: &[u8]) -> Option<Manifest> {
 	match component {
-		b"sandbox_probe" => Some(Manifest { component: String::from("sandbox_probe"), grants: alloc::vec![Capability::Storage, Capability::Log] }),
-		b"date" => Some(Manifest { component: String::from("date"), grants: alloc::vec![Capability::Time] }),
-		b"request_probe" => Some(Manifest { component: String::from("request_probe"), grants: alloc::vec![Capability::Log] }),
-		b"cat" => Some(Manifest { component: String::from("cat"), grants: alloc::vec![Capability::Volumes] }),
-		b"write" => Some(Manifest { component: String::from("write"), grants: alloc::vec![Capability::Volumes] }),
-		b"rm" => Some(Manifest { component: String::from("rm"), grants: alloc::vec![Capability::Volumes] }),
-		b"ls" => Some(Manifest { component: String::from("ls"), grants: alloc::vec![Capability::Volumes] }),
-		b"mkdir" => Some(Manifest { component: String::from("mkdir"), grants: alloc::vec![Capability::Volumes] }),
-		b"rmdir" => Some(Manifest { component: String::from("rmdir"), grants: alloc::vec![Capability::Volumes] }),
-		b"log" => Some(Manifest { component: String::from("log"), grants: alloc::vec![Capability::Log, Capability::Time] }),
-		b"snap" => Some(Manifest { component: String::from("snap"), grants: alloc::vec![Capability::Storage] }),
-		b"volume" => Some(Manifest { component: String::from("volume"), grants: alloc::vec![Capability::Storage] }),
-		b"lsdev" => Some(Manifest { component: String::from("lsdev"), grants: alloc::vec![Capability::Device] }),
-		b"config" => Some(Manifest { component: String::from("config"), grants: alloc::vec![Capability::Config] }),
-		b"set" => Some(Manifest { component: String::from("set"), grants: alloc::vec![Capability::Config] }),
-		b"beep" => Some(Manifest { component: String::from("beep"), grants: alloc::vec![Capability::Audio] }),
-		b"usage" => Some(Manifest { component: String::from("usage"), grants: alloc::vec![Capability::Resource] }),
-		b"ps" => Some(Manifest { component: String::from("ps"), grants: alloc::vec![Capability::Resource, Capability::Process] }),
-		b"run" => Some(Manifest { component: String::from("run"), grants: alloc::vec![Capability::Process] }),
-		b"perm" => Some(Manifest { component: String::from("perm"), grants: alloc::vec![Capability::Permission] }),
-		b"stop" => Some(Manifest { component: String::from("stop"), grants: alloc::vec![Capability::Supervisor] }),
-		b"lsvol" => Some(Manifest { component: String::from("lsvol"), grants: alloc::vec![Capability::Volumes] }),
-		b"lssvc" => Some(Manifest { component: String::from("lssvc"), grants: alloc::vec![Capability::Services] }),
-		b"lsblk" => Some(Manifest { component: String::from("lsblk"), grants: alloc::vec![Capability::Volumes] }),
-		b"lsusb" => Some(Manifest { component: String::from("lsusb"), grants: alloc::vec![Capability::Usb] }),
+		// sandbox_probe requests network on top of storage + log, and the policy
+		// withholds it: the granted set is the intersection, the audit records the
+		// denial, and the probe proves the sandbox holds exactly the grants.
+		b"sandbox_probe" => Some(intersected("sandbox_probe", alloc::vec![Capability::Storage, Capability::Log, Capability::Network], &[Capability::Storage, Capability::Log])),
+		b"date" => Some(granted("date", alloc::vec![Capability::Time])),
+		b"request_probe" => Some(granted("request_probe", alloc::vec![Capability::Log])),
+		b"cat" => Some(granted("cat", alloc::vec![Capability::Volumes])),
+		b"write" => Some(granted("write", alloc::vec![Capability::Volumes])),
+		b"rm" => Some(granted("rm", alloc::vec![Capability::Volumes])),
+		b"ls" => Some(granted("ls", alloc::vec![Capability::Volumes])),
+		b"mkdir" => Some(granted("mkdir", alloc::vec![Capability::Volumes])),
+		b"rmdir" => Some(granted("rmdir", alloc::vec![Capability::Volumes])),
+		b"log" => Some(granted("log", alloc::vec![Capability::Log, Capability::Time])),
+		b"snap" => Some(granted("snap", alloc::vec![Capability::Storage])),
+		b"volume" => Some(granted("volume", alloc::vec![Capability::Storage])),
+		b"lsdev" => Some(granted("lsdev", alloc::vec![Capability::Device])),
+		b"config" => Some(granted("config", alloc::vec![Capability::Config])),
+		b"set" => Some(granted("set", alloc::vec![Capability::Config])),
+		b"beep" => Some(granted("beep", alloc::vec![Capability::Audio])),
+		b"usage" => Some(granted("usage", alloc::vec![Capability::Resource])),
+		b"ps" => Some(granted("ps", alloc::vec![Capability::Resource, Capability::Process])),
+		b"run" => Some(granted("run", alloc::vec![Capability::Process])),
+		b"perm" => Some(granted("perm", alloc::vec![Capability::Permission])),
+		b"stop" => Some(granted("stop", alloc::vec![Capability::Supervisor])),
+		b"lsvol" => Some(granted("lsvol", alloc::vec![Capability::Volumes])),
+		b"lssvc" => Some(granted("lssvc", alloc::vec![Capability::Services])),
+		b"lsblk" => Some(granted("lsblk", alloc::vec![Capability::Volumes])),
+		b"lsusb" => Some(granted("lsusb", alloc::vec![Capability::Usb])),
 		// The inventory commands need no capability at all: the system identity and the
 		// uptime are compile-time / free-syscall data, and the boot log, CPU set, memory
 		// totals, memory map and vector table are read over their own free syscalls -
 		// the emptiest manifests in the store.
-		b"uname" => Some(Manifest { component: String::from("uname"), grants: alloc::vec![] }),
-		b"uptime" => Some(Manifest { component: String::from("uptime"), grants: alloc::vec![] }),
-		b"dmesg" => Some(Manifest { component: String::from("dmesg"), grants: alloc::vec![] }),
-		b"lscpu" => Some(Manifest { component: String::from("lscpu"), grants: alloc::vec![] }),
-		b"free" => Some(Manifest { component: String::from("free"), grants: alloc::vec![] }),
-		b"lsmem" => Some(Manifest { component: String::from("lsmem"), grants: alloc::vec![] }),
-		b"lsirq" => Some(Manifest { component: String::from("lsirq"), grants: alloc::vec![] }),
-		b"lspci" => Some(Manifest { component: String::from("lspci"), grants: alloc::vec![] }),
+		b"uname" => Some(granted("uname", alloc::vec![])),
+		b"uptime" => Some(granted("uptime", alloc::vec![])),
+		b"dmesg" => Some(granted("dmesg", alloc::vec![])),
+		b"lscpu" => Some(granted("lscpu", alloc::vec![])),
+		b"free" => Some(granted("free", alloc::vec![])),
+		b"lsmem" => Some(granted("lsmem", alloc::vec![])),
+		b"lsirq" => Some(granted("lsirq", alloc::vec![])),
+		b"lspci" => Some(granted("lspci", alloc::vec![])),
 		_ => None,
 	}
 }

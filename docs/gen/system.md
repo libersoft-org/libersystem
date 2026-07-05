@@ -358,6 +358,7 @@ An opaque kernel object, transferred as `handle<task>`.
 | field | type |
 | --- | --- |
 | `component` | `string` |
+| `requested` | `list<capability>` |
 | `grants` | `list<capability>` |
 
 ### record `audit-entry`

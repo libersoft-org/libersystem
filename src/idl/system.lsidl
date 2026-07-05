@@ -552,13 +552,17 @@ enum capability {
 	usb,       // a USB bus client served by the xHCI driver (enumerate the addressed devices), for the `lsusb` overview
 }
 
-// A component's permission manifest: its name and the exact set of capabilities it is
-// declared to receive. This typed object is the source of truth for what a component
-// may be granted - never a parsed text / JSON file. A launched component starts with
-// these capabilities and nothing else (the sandbox); the textual form a tool might
+// A component's permission manifest: its name, the capabilities it requests (the
+// set a packaged component will ship on disk), and the exact set it is granted -
+// the audited intersection of the request with the manager's policy. This typed
+// object is the source of truth for what a component may be granted - never a
+// parsed text / JSON file. A launched component starts with the granted
+// capabilities and nothing else (the sandbox); a requested capability the policy
+// withholds surfaces as an audited denial, and the textual form a tool might
 // render is only ever a view of this object.
 record manifest {
 	component: string,
+	requested: list<capability>,
 	grants:    list<capability>,
 }
 

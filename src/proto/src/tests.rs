@@ -46,6 +46,17 @@ fn entry_round_trips() {
 }
 
 #[test]
+fn manifest_round_trips_with_requested_and_grants() {
+	// The requested set (what the component - later its package - declares it
+	// wants) travels separately from the granted set (the manager's audited
+	// intersection), so a withheld capability stays visible in the record.
+	let m = Manifest { component: String::from("probe"), requested: alloc::vec![Capability::Storage, Capability::Log, Capability::Network], grants: alloc::vec![Capability::Storage, Capability::Log] };
+	let mut buf = [0u8; 128];
+	let n = m.encode(&mut buf).unwrap();
+	assert_eq!(Manifest::decode(&buf[..n]).unwrap(), m);
+}
+
+#[test]
 fn query_options_round_trip() {
 	let q = Query { since: Some(100), min_severity: Some(Severity::Error), source: None, limit: 50 };
 	let mut buf = [0u8; 128];
