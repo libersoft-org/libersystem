@@ -315,7 +315,7 @@ are the concept's "full System Graph" = phase 2 observability, not phase 1.
 - [x] A WASI "world" = the set of capabilities a component receives at startup (no ambient authority)
 - [x] Run the first real Wasm component end-to-end
 - Done when: a Wasm component runs under the host, performs a capability-gated operation (e.g. reads a file it was granted) via a WASI import mapped to a native service, and has no access it was not explicitly given.
-- Note: the full Component Model + WASI preview 2 + an SDK + AOT compilation is phase 2; phase 1 is the minimal host + first component.
+- Note: the full Component Model + WASI preview 2 + an SDK is phase 2 (AOT compilation is phase 3, with packaging); phase 1 is the minimal host + first component.
 - Concept: Application model ("WASI as one of several hosts on top of a stable native ABI", "How it fits into the system"), roadmap ("minimal WASI host: running the first Wasm component").
 - Result: a Wasm component now runs end-to-end and reads a file it was granted, through a host import mapped onto StorageService. The runtime is a new `no_std` crate, `wasm` (host-tested like `proto`): a binary-format parser (the type / import / function / memory / export / code sections, LEB128, unknown sections skipped) producing a `Module`, and a small stack-machine `Instance` interpreter over the integer subset (i32 const / arithmetic / locals / load+store / `call`; flat bodies, no control flow or floats yet) whose imported calls are dispatched to a `Host` trait - the seam where a component reaches native services. `wasi_host` is a ring-3 process that, given only a StorageService client at startup (its whole granted world), loads an embedded component and runs its `run` export; the component's single import `liber.read` is wired by the host to open the one granted file (`vol://system/hello.txt`) over the generated `volume` client and copy its bytes into the component's linear memory. The component has no `open` import and no other capability, so it can reach nothing it was not given - a WASI "world" is exactly the imports the host wires up (the `wasm` test `an_unwired_import_traps` pins the no-ambient-authority property; `wasi_host`'s host traps any import but read). A kernel scenario brokers the two processes (StorageService + wasi_host) and reads back what the component read; `wasi_host_runs_a_component` asserts it equals the file straight from the volume, and the boot demo prints `wasi: component read "Hello from the OS ramdisk!" from vol://system/hello.txt via a host import on StorageService`. 9 `wasm` host tests + 61 kernel tests green. Deferred: control flow / floats / the full Component Model + WASI preview-2 world + an SDK + AOT (phase 2), loading the component from storage rather than embedding it, and exposing it as a boot-chain service / shell command (it runs via a kernel scenario + boot demo, like the M16 storage scenario).
 
@@ -344,8 +344,8 @@ strict app sandbox, permission manifests, a threat model) and the PermissionMana
 policy service; the ResourceManager policy service (the kernel already enforces
 accounting from phase 0; the policy layer is later); ServiceManager with a full
 restart policy + watchdog; the full Component Model + WASI preview 2 + a Rust/C/Go
-SDK; a package/app format with installation + AOT compilation; a simple persistent
-native filesystem. Also not phase 1: the `virtio-gpu` / `virtio-input` drivers
+SDK; a simple persistent native filesystem (the package/app format with installation +
+AOT compilation has since moved to phase 3). Also not phase 1: the `virtio-gpu` / `virtio-input` drivers
 (headless phase 1 only - they belong to the desktop, phase 5) and any POSIX-like /
 relibc compatibility layer (phase 3, server). Wall-clock time (a `TimeService`
 computing `UTC = clock_get + offset`) is also deferred - it needs an RTC driver or
@@ -648,17 +648,6 @@ M28 ran a first minimal Wasm component over an integer-subset interpreter with a
 - Concept: Application model (WASI is one host over the stable native ABI; the layering principle - the engine is replaceable; a WASI world = the capabilities granted), IDL language (the WIT relationship), the M28 deferrals.
 - Result (2026-06-28): the M28 integer-subset interpreter is now an application runtime that runs a real toolchain-built component loaded from storage, its imports wired to typed services with no ambient authority. The runtime (`src/wasm`) grew to a usable subset behind the same `Host` seam (the engine stays a replaceable implementation): structured control flow (`block` / `loop` / `if`-`else`, `br` / `br_if` / `br_table`, `return`, `call`, with branch targets resolved against a control stack at decode time), the full numeric instruction set over `i32` / `i64` / `f32` / `f64` (arithmetic, comparisons, bitwise, shifts and rotates, the width conversions, and the saturating `trunc_sat` family the Rust toolchain emits for `as`-casts), globals, and a single linear memory with bounds-checked load / store and `memory.copy` / `memory.fill`; the decoder validates and traps on any unsupported opcode rather than mis-running it (24 `wasm` unit tests). A new ring-3 host, `component_host`, is the M41 evolution of `wasi_host`: instead of embedding a hand-encoded module, it loads a real component from storage (`vol://system/app.wasm`, served by StorageService off the ramdisk) - not the kernel image - parses and instantiates it, resolves every import by its `(module, field)` name into a typed operation, and traps any name it does not recognize. The `liber` world it wires is exactly two typed services and nothing else: `read` / `write` map to StorageService (the `wasi:filesystem` role) and `log` maps to LogService (the `wasi:cli` / console role); the host holds only the two service clients it was granted at bootstrap, so the component reaches precisely the capabilities the world grants and nothing more (no ambient authority - a WASI world *is* the set of imports the host wires up). The SDK (`src/sdk`) is a real Rust component built by the ordinary toolchain (`cdylib` -> `wasm32-unknown-unknown`) against those world bindings, with `just sdk` building it and staging it into the ramdisk volume as `vol://system/app.wasm`; it reads its one granted file, upper-cases it, logs and writes it back through the world imports, and exposes a float `score` export to exercise the float path. The proof is a kernel scenario (`component_host_runs_an_sdk_component`): a StorageService + LogService topology hands `component_host` exactly two capabilities; the host loads and runs the SDK component; the bytes the component produced (captured through the granted `write` path) equal the upper-cased granted file, the log grant was reached, and `score(10)` is `17` (floor of `10 * 1.5 + 2.0` - the float path on genuine LLVM output), all on the from-scratch interpreter (73 [ok] kernel tests, including the existing M28/M29 `wasi_host` and powerbox scenarios kept green). Supporting changes: the ring-3 stack grew from 16 kB to 64 kB (`USER_STACK_PAGES` 4 -> 16) so a debug-built service can run the interpreter's import-dispatch call chain (interpreter -> `call_import` -> a generated service client -> the codec) without overrunning, and the SDK caps its own wasm stack at 64 kB so the component's initial linear memory fits the host heap. Scope honestly bounded for M42 to build on: this is the usable-subset path, not a full Component-Model binding generator nor an adopted off-the-shelf engine; the world wires the filesystem and cli roles, with `wasi:sockets` -> NetworkService (M33) left for when a component needs it; and the SDK ships Rust, with C / Go the remaining languages.
 
-
-## M42 - Package/app format, installation, and AOT compilation
-
-With a real component runtime (M41), the platform needs a way to ship, install, and accelerate components: a typed package/app format, an install path that places a component and its manifest into the system, and AOT compilation at install time for speed - the foundation the phase-3 CLI package manager and the phase-5 app store later build on.
-
-- [ ] A typed package/app format: a component plus its permission manifest (M38 - the capabilities it requests and is thus granted) and metadata, as a typed object (not an ad-hoc archive treated as the source of truth).
-- [ ] An install path: place an app on disk as an ordinary `vol://` object (no special namespace - the app and its manifest are plainly visible on a volume), register it with ServiceManager / PermissionManager, and list / remove it.
-- [ ] AOT compilation at install time: compile the component to native for speed (the M28/M41 "interpret or AOT-compile at install" option), cached on the volume.
-- [ ] A CLI to install / list / remove a first-party package.
-- Done when: a component ships as a typed package with its manifest, installs into the system (registered, listed, removable), is AOT-compiled at install for speed, and launches from storage, tests green - the packaging / installation foundation for the platform's apps.
-- Concept: Application model (AOT-compile at install; the package/app format), Security model (the manifest is a typed object - the rights an app requests and is granted), Storage model (an app is an ordinary on-disk object on a volume, not a special namespace).
 
 ## M43 - A simple persistent native filesystem
 
@@ -2000,12 +1989,102 @@ DMA / device-sized rings / TCP window scaling (M72).
   - Result: both windows now allocate from a `VaPool` - the old bump cursor plus a sorted free list of released ranges: allocation is first-fit from the list (splitting a larger hole) before bumping, and a release coalesces with both neighbors (a range ending at the cursor folds back into the bump), so churn cannot shatter the window into unusable slivers. Every hand-out is page-rounded (the framebuffer map used to bump a raw `height * pitch`, leaving the cursor unaligned). All the unmap paths return their range: the explicit `SYS_MEMORY_UNMAP`, and the MemoryObject / DmaBuffer / DeviceMemory Drops that tear down a leftover mapping - so a process exiting with mappings still held reclaims its ranges as the objects go. Both windows are now explicitly bounded (the kernel window gets an end where the bump used to run open-ended), and exhaustion surfaces as ERR_NO_MEMORY from the map syscalls instead of a silent walk into unrelated address space. The user window stays one global pool on purpose: each process maps its own page tables, and globally unique ranges keep a shared object's single `mapped_at` unambiguous. Test `an_unmapped_va_range_is_reused_not_leaked`: map/unmap/map hands the same range back, and two adjacent released pages merge to fit a two-page mapping. Suite 93 [ok]; live: repeated `cat` (a map/unmap per read) keeps churning through the same ranges.
 - [x] Source layout: kernel/main.rs (~4.4k lines) splits its boot scenarios and test suite into modules; the line discipline + Tab completion move out of console_service.rs into the term crate next to the Screen they drive; xhci.rs splits controller / HID / mass-storage concerns.
   - Result: three pure moves, no behavior change, each its own commit. (1) kernel/main.rs 4697 -> 442 lines: everything test-only - the ring-3 probe programs and thread bodies, the packaged-scenario drivers, the Testable harness and all 93 test cases - moved to kernel/tests.rs as a `#[cfg(test)] mod tests` (`use super::*;`, so the suite keeps reaching the root's private items); the boot path and the helpers it shares with the suite (module locators, the SystemManager spawn, the supervise ladder) stay. (2) console_service.rs 1895 -> 1500: the tty line discipline - cooked-mode editing, history, Tab completion, the echo sink - moved to term/src/ld.rs next to the Screen it echoes into (`Ld`/`Echo`/`EchoBuf` re-exported), so every console host gets the editor from the terminal crate rather than one service's file. (3) xhci.rs 1940 -> 1194: the HID binding (configure + report decode + pointer state, 323 lines) and the mass-storage side (BOT/SCSI configure + block serving + transport recovery, 464 lines) split into usb_hid.rs / usb_storage.rs; the controller core - rings, transfers, enumeration, hubs, endpoint recovery, the service loop - keeps xhci.rs, and the submodules reach it through the crate root (only the genuinely shared surface went pub). Suites along the way: 93 [ok] after each part, term 15/15; live: Tab completion, lsusb all four roles, vol://usb read.
-- [x] Manifests distinguish requested from granted: the M38 manifest records only the granted set - carry the component's requested capabilities too, PermissionManager grants the (audited) intersection, and the M42 package format then ships the requested set on disk.
-  - Result: the `manifest` record gained `requested: list<capability>` alongside `grants` (bindings regenerated), and the store distinguishes the two: the common first-party rows declare `granted(name, caps)` (policy allows everything requested - requested == grants), while `intersected(name, requested, allowed)` computes the grants as the audited intersection. sandbox_probe demonstrates the split end to end: it now REQUESTS network on top of storage + log, the policy withholds it, the granted set is the intersection (unchanged behavior - the probe's sandbox summary and the launch audit's `network granted=false` entry were already exact), and the manifest record itself now shows the request next to the decision. A proto round-trip test pins the new field on the wire. The M42 package format ships the requested set on disk when packages land - the record and the intersection it feeds are now in place. Suites: proto 76, kernel 93 [ok]; live: `perm` shows sandbox_probe's storage/log grants and the audited network denial.
+- [x] Manifests distinguish requested from granted: the M38 manifest records only the granted set - carry the component's requested capabilities too, PermissionManager grants the (audited) intersection, and the phase-3 package format then ships the requested set on disk.
+  - Result: the `manifest` record gained `requested: list<capability>` alongside `grants` (bindings regenerated), and the store distinguishes the two: the common first-party rows declare `granted(name, caps)` (policy allows everything requested - requested == grants), while `intersected(name, requested, allowed)` computes the grants as the audited intersection. sandbox_probe demonstrates the split end to end: it now REQUESTS network on top of storage + log, the policy withholds it, the granted set is the intersection (unchanged behavior - the probe's sandbox summary and the launch audit's `network granted=false` entry were already exact), and the manifest record itself now shows the request next to the decision. A proto round-trip test pins the new field on the wire. The phase-3 package format ships the requested set on disk when packages land - the record and the intersection it feeds are now in place. Suites: proto 76, kernel 93 [ok]; live: `perm` shows sandbox_probe's storage/log grants and the audited network denial.
 - [x] A docs-and-dead-code sweep: stale module docs (wasm/src/lib.rs still claims floats are a later step), leftover dead code, and the fmt drift at HEAD.
   - Result: the stale claims are gone - wasm/src/lib.rs now names the floating-point instruction set among what the runtime supports; keys.rs no longer says the Consumer page is unreachable (the HID descriptor path carries it, `consumer_keycode` maps it); memlayout.rs describes the mmap windows as pooled-with-reclaim rather than bump-only; and the "sent right after X to match the receive order" comments on the shell's and console's bootstrap grants are retired (the named CapSet handshake made their order a non-contract - the services still on ordered protocols keep theirs). Dead code: `Stack::write_state` removed (the raw `ip`/`net` serialization the typed `network.info` replaced; the crate's remaining allow covers deliberate library surface like the `Learned` event payload). Fmt drift: `just fmt` run over the tree and `just fmt-check` is clean at HEAD again - the drift spots (collapsed one-liners, import order) are re-normalized to rustfmt's output, so the check is usable as a gate from here on. All suites after the sweep: kernel 93 [ok], liberfs 101, fat 67, proto 76, term 15; build 0 warnings.
 - Done when: NX is enforced and test-pinned, the display presents rectangles and resizes by interrupt, periodic work has a first-class home, the bootstrap handshake is typed, and the remaining boxes each land with a test (or a measurement where one applies) - suite green.
-- Concept: the security model (W^X belongs under "safe hardware access"), M44/M47 (the display path this completes), M38/M42 (the manifest split), M21 (the boot chain whose handshake gets typed), M66-M72 (the review findings already tracked there).
+- Concept: the security model (W^X belongs under "safe hardware access"), M44/M47 (the display path this completes), M38 (the manifest split), M21 (the boot chain whose handshake gets typed), M66-M72 (the review findings already tracked there).
+
+## M105 - Kernel wake path: per-object wait queues, cross-core wake IPIs, and the serial RX interrupt
+
+A second architecture review found the remaining latency and scalability debt all sits on one path: how a blocked thread gets woken. One global waiter list scanned under one lock, no way to nudge a halted core, and a serial port that is only ever polled - together they quantize every interactive event to the 10 ms tick and will contend badly as core and waiter counts grow.
+
+- [ ] Per-object wait queues: replace the single global `WAITERS: SpinLock<Vec<Waiter>>` with wait queues keyed by the object (koid), so `wake_object` wakes exactly the waiters of that object instead of scanning every blocked thread in the system under one global lock.
+- [ ] Cross-core wake IPIs: when a wake enqueues a thread for a core that is halted (or running something else), send an IPI so the target core reschedules promptly instead of discovering the work on its next 100 Hz tick - the enqueue-on-the-waker's-core convention gets an explicit delivery notification.
+- [ ] UART RX interrupt: enable the 16550 receive interrupt (IER bit 0) and route it like any other device vector, so serial input wakes the console path immediately - retiring the tick-quantized RX poll in the idle hook (the last polled input source).
+- [ ] Measure before/after: the command-latency floor (the ~50 ms echo/mirror residue the M72 notes recorded) and a wake-to-run latency probe, so the win is a number, not a feeling.
+- Done when: a wake touches only the woken object's queue, a thread woken for a halted core runs without waiting out a tick (test-pinned with a latency bound), serial input is interrupt-driven end to end, and the measured command latency drops accordingly - suite green.
+- Concept: IPC model (the only blocking point is `wait` - so the wake path IS the system's latency), SMP-aware design from phase 0 (the global waiter list is the last single-core-shaped structure).
+
+## M106 - Ring-3 preemption: per-thread kernel entry stacks
+
+The kernel preempts ring-0 threads (M19), but ring 3 is still cooperative: TSS.RSP0 - the stack the CPU loads on a ring-3 interrupt - is per-CORE, so context-switching away from an interrupted user thread would leave two threads sharing one entry stack. Until that is fixed, an infinite loop in a user program owns its core, and the timer ISR deliberately only ticks when it fires in ring 3.
+
+- [ ] Per-thread kernel entry stacks: point TSS.RSP0 at the current thread's kernel stack on every context switch (the thread already owns one for syscalls), so a ring-3 interrupt lands on a stack that travels with the thread.
+- [ ] Enable ring-3 preemption in the timer path: when the timer fires at CPL 3, save the interrupted user context on the thread's own stack and reschedule - removing the ring-0-only gate in the ISR.
+- [ ] A test proves a compute-bound ring-3 loop no longer starves its core: two user threads on one core, one spinning, the other still makes progress; and the existing suite stays green under the new switch path.
+- Done when: TSS.RSP0 follows the thread, the timer preempts ring 3 the same way it preempts ring 0, a spinning user program cannot monopolize a core, and the suite is green - closing the concept's preemption promise for userspace.
+- Concept: scheduler (preemptive from M19 - ring 3 was the recorded deferral), fault isolation (a runaway app is contained by scheduling, not just by memory).
+
+## M107 - Kernel hardening: SMAP/SMEP, frame allocator bounds, and channel backpressure
+
+W^X landed in M104; the review found the remaining low-cost hardening and robustness gaps in the kernel's memory and IPC plumbing.
+
+- [ ] SMEP + SMAP: enable CR4.SMEP and CR4.SMAP on every core (CPUID-gated like NXE), wrap the kernel's legitimate user-buffer accesses in `stac`/`clac`, and pin it with a test - a kernel bug dereferencing a user pointer outside the sanctioned copy paths faults instead of silently reading or executing user memory.
+- [ ] Frame allocator robustness: the free-runs table is fixed at 1024 entries and overflow leaks frames (loudly); freeing also never checks for overlap, so a double-free silently corrupts the pool. Grow the table dynamically (heap is up for all but the earliest allocations) and refuse an insert that overlaps an existing free run.
+- [ ] Channel backpressure gets a writable wake: a sender blocked on a full queue currently yield-spins (the M104 dmesg hang class) - give channels writable readiness (wake blocked senders when the receiver drains) and make the queue depth a channel-creation parameter instead of the hardcoded 64.
+- Done when: SMAP/SMEP are enforced and test-pinned, the frame allocator survives fragmentation and refuses a double-free, a sender on a full channel blocks in `wait` and wakes on drain (no spin), and the suite is green.
+- Concept: the security model (safe hardware access - SMAP/SMEP sit next to W^X), IPC model (backpressure means the sender waits, and waiting means `wait`, not spinning).
+
+## M108 - ABI versioning and boot image hygiene
+
+The syscall numbers and ABI structs are compile-time constants with no runtime check - fine while kernel and userspace build from one tree, but the phase-3 package path will run binaries built elsewhere/earlier, and a silent mismatch (a renumbered syscall, a grown struct) is the worst possible failure mode. Plus one boot-image nit the review caught.
+
+- [ ] An ABI version handshake: stamp the abi crate with a version, have the loader (or a first-syscall check) compare the binary's expected ABI against the kernel's, and refuse a mismatch with a typed error - new calls append, old ones never renumber, and the check makes that contract enforceable.
+- [ ] Strip the init package: the pinned service ELFs embed unstripped debug binaries into init.pkg (the volume package already strips) - apply the same stripping, shrinking the kernel image and boot memory footprint.
+- Done when: a binary built against a different ABI revision is refused with a clear error instead of misbehaving, init.pkg carries stripped ELFs, and the suite is green.
+- Concept: syscall model (a stable, versioned ABI - the version now has teeth), the phase-3 package format this prepares for.
+
+## M109 - Service lifecycle: a data-driven manifest, a typed grant sender, and honest failure reports
+
+Three review findings share one root: service bring-up is half code, half convention. The manifest is a hardcoded array (and the kernel build.rs keeps parallel name lists), the granting side of the bootstrap handshake still sends ad-hoc string tags (M104 typed only the receiver), and a service that fails during bootstrap exits silently - the supervisor sees a peer-close with no reason.
+
+- [ ] A data-driven manifest: move the service table (names, deps, restart class) out of service_manager.rs into a manifest the build stages into the init package, and derive the kernel build.rs source lists from the same data - adding a service becomes one manifest entry.
+- [ ] Type the granting side: generate the bootstrap grant sequence (which capability names a service receives) from the manifest, so a sender cannot misspell a tag the receiver's `CapSet::take` then misses - finishing what the M104 typed-handshake box started on the receive side.
+- [ ] Honest bootstrap failures: before a service exits on a failed bootstrap step, it sends a tagged failure report (step name + error) on the bootstrap channel; ServiceManager logs it and folds it into the supervisor stats - replacing the ~40 silent `unwrap_or_else(exit)` sites with one rt helper.
+- Done when: adding a service touches only the manifest (plus the service's own code), the grant sequence is generated and cannot drift from the receiver, a deliberately-broken service's failure reason shows up in the log and `graph`, and the suite is green.
+- Concept: ServiceManager (dependency management + evidence of state), the M104 typed-handshake box (this is its sender half), System Graph (failures become observable, not silent).
+
+## M110 - Runtime elasticity: NetworkService capacity and device hotplug
+
+The review's "static at boot" cluster: the network service's client/socket/listener pools are tiny compile-time constants that silently refuse when full, and device enumeration happens exactly once at boot - a device that appears later (USB most practically) is invisible.
+
+- [ ] Dynamic NetworkService pools: the client, socket, and listener arrays (4/4/2) and the TCP connection pool (4) become growable vectors bounded by the wait-set ceiling; exhaustion returns the typed error instead of silence, and `ss`/the graph report utilization.
+- [ ] USB hotplug: the xhci driver watches port-status change events (the controller already delivers them) and enumerates a newly attached device at runtime; DeviceManager learns to bind a driver/role for a device that arrives after boot, and detach tears the role down cleanly.
+- [ ] A live test: attach a USB storage device via QMP after boot - it enumerates, `lsusb`/`lsblk` show it, and its volume mounts; detach removes it without wedging the storage service.
+- Done when: network capacity grows with demand (bounded, observable, typed errors at the true ceiling), a hot-attached USB device works end to end and a detach cleans up, and the suite is green.
+- Concept: DeviceManager (device state is dynamic, not a boot-time snapshot), NetworkService (the edge box serves many clients), resource accounting (growth stays bounded and observable).
+
+## M111 - Filesystem stack unification and performance
+
+Four filesystem crates grew four slightly different `BlockDevice` traits and error enums; the storage service routes volumes through a hand-written enum; and LiberFS has two known performance cliffs the audits deferred: the free map is re-derived by a full O(n) walk on every commit, and the decompression cache holds exactly one extent.
+
+- [ ] One shared fs-core contract: a single `BlockDevice` trait (with the `read_blocks` batch default) and a single `FsError` enum in a shared crate, implemented by liberfs/fat/iso9660/udf alike - no more per-crate drift for the same concepts.
+- [ ] Storage routes through a trait: the `Volume` enum's per-backend match arms become `Box<dyn FileSystem>` objects behind one trait (open/list/write/remove/snap ops), so a new backend is one impl + one mount arm.
+- [ ] LiberFS incremental free map: track allocations/frees as a delta against the derived map instead of re-walking every generation on each commit (the full walk remains for mount and fsck) - retiring the O(n)-per-commit cost that already throttled the directory-scaling test.
+- [ ] A small decompressed-extent cache: replace the single-entry `decomp` slot with a tiny LRU (4-8 entries) so alternating reads over two compressed extents stop evicting each other; measure a compressed-file read pattern before/after.
+- Done when: all four filesystems share one device/error contract, the storage service dispatches through the trait, a LiberFS commit no longer walks the whole pool (measured), compressed reads stop thrashing the cache (measured), and every fs suite plus the kernel suite stays green.
+- Concept: Native filesystem + compatible FS backends behind one Volume API (the layering principle - one contract, many implementations).
+
+## M112 - Shell, tools, and renderer cleanup
+
+The structural code-quality items the review flagged in userspace: the shell's single giant dispatch, the parsing helpers every tool re-implements, and one small renderer inefficiency.
+
+- [ ] Shell dispatch decomposition: split `dispatch` (one prefix-match chain for ~60 commands) into a dispatch table of small per-command functions, and extract line parsing + variable expansion into a `parse_and_expand` step that is testable on its own - routing stays in one screenful.
+- [ ] A shared tools helper module: the `trim`/`parse_port`/decimal-parse/argument-split patterns duplicated across 13+ tools move into one shared module in the tools crate, along with a JSON-render helper wrapping the JsonMode boilerplate each tool repeats.
+- [ ] A glyph render cache: the per-cell binary search over the font's codepoint table gets a small direct-mapped cache for the hot ASCII/Latin-1 range; measure a full-screen repaint before/after and keep it only if it pays.
+- Done when: the shell's routing is a table of small functions with parsing testable in isolation, no tool re-implements the shared parse/render helpers, the repaint measurement is recorded (cache kept or dropped on the evidence), and the suite is green.
+- Concept: the CLI as an ordinary component (small, composable), consistency and cleanliness of the tool set.
+
+## M113 - Wasm: indirect calls and tables
+
+The interpreter traps on `call_indirect` - the one gap a real toolchain-built component hits first (any Rust trait object, function pointer, or vtable in a component compiles to it). Tables and indirect calls are the next instruction-set step the M41 runtime needs before the phase-3 packaging work leans on it.
+
+- [ ] Decode and validate the table section, element segments, and `call_indirect` (type-check the callee signature against the table entry at call time, trap on mismatch or null - the spec semantics).
+- [ ] Host tests exercise an indirect call through a table (a Rust component using a function pointer / trait object round-trips), plus the mismatch and null-entry traps.
+- Done when: a toolchain-built component using function pointers runs on the interpreter, signature mismatches trap cleanly, the wasm host tests cover the new paths, and the suite is green.
+- Concept: Application model (the engine is a replaceable implementation behind the host seam - but the subset must carry real toolchain output), the M41 runtime this extends.
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
@@ -2017,8 +2096,8 @@ observability (the live System Graph + counters + tracing in
 CLI/JSON/CBOR); security hardening (typed permission manifests + a PermissionManager
 + a strict sandbox + a threat model); the ResourceManager policy layer; a
 ServiceManager with a restart policy + watchdog; the full Component Model + WASI
-preview 2 + an SDK running components loaded from storage; a package/app format with
-installation + AOT; and a writable persistent native filesystem (LiberFS) - all in a VM over
+preview 2 + an SDK running components loaded from storage; and a writable
+persistent native filesystem (LiberFS) - all in a VM over
 virtio on QEMU/KVM, testable under `cargo test` / QEMU.
 
 ## Out of scope for phase 2 (= phase 3, the server platform)
@@ -2032,7 +2111,9 @@ encrypted user volumes; LiberFS work beyond the M53-M57 modernization and the
 M73-M85 audit track (online
 resize, online defrag, multi-device / RAID; deduplication and encryption stay out by decision);
 first-party server apps (a
-static-file web server and the like); and a CLI package manager over the phase-2
+static-file web server and the like); the package/app format with installation +
+AOT compilation (moved out of phase 2 by decision - the component runtime and the
+manifest split are ready for it); and a CLI package manager over that phase-3
 package format. The desktop concerns (GUI / compositor, a full input stack, the
 end-user app store) are phases 4-5. Phases 3-6 (server / real hardware / desktop /
 AI) remain a vision, contingent on a community forming.

@@ -1626,7 +1626,6 @@ observability: full System Graph, JSON/CBOR/CLI representations, tracing, counte
 security hardening: app sandbox, permission manifests, threat model
 ServiceManager with restart policy and watchdog
 full Component Model + WASI preview 2, an SDK for Rust/C/Go
-package/app format, installation, AOT compilation
 a simple persistent native filesystem
 ```
 
@@ -1642,7 +1641,8 @@ encrypted user volumes
 a native modern FS (CoW, checksums, snapshots, compression)
 first first-party services: a simple static-file web server and similar small services - dogfooding the network stack + storage + service model on our own / WASI layer (no POSIX needed)
 a minimal headless AudioService over virtio-sound (playback, optionally capture) - so audio works from the console too (e.g. for a headless voice assistant); the full desktop audio stack stays Phase 5
-a CLI package manager (search / install / update / remove of first-party packages, built on the Phase 2 package/app format) - the end-user app store stays Phase 5
+package/app format, installation, AOT compilation
+a CLI package manager (search / install / update / remove of first-party packages, built on the package/app format from this phase) - the end-user app store stays Phase 5
 ```
 
 #### Phase 4 - Real hardware and foreign-software compatibility
@@ -1766,4 +1766,4 @@ Phases 0 and 1 are complete (the kernel MVP and the first usable userspace - see
 5. virtio drivers (blk, net, console) isolated under DeviceManager; a minimal WASI host running the first Wasm component; a powerbox file picker handing out a single file capability.
 ```
 
-The recommended next step is therefore **Phase 2 (the appliance/edge platform)**. Its priority is a network stack over virtio-net - on the edge, networking is the core - followed by the rest of the phase (full System Graph + observability, security hardening + PermissionManager, the ResourceManager policy, ServiceManager restart/watchdog, the full Component Model + WASI preview 2 + an SDK, a package/AOT path, and a simple persistent native filesystem); see the *Roadmap*.
+The recommended next step is therefore **Phase 2 (the appliance/edge platform)**. Its priority is a network stack over virtio-net - on the edge, networking is the core - followed by the rest of the phase (full System Graph + observability, security hardening + PermissionManager, the ResourceManager policy, ServiceManager restart/watchdog, the full Component Model + WASI preview 2 + an SDK, and a simple persistent native filesystem); see the *Roadmap*.

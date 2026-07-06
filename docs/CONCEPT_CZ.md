@@ -1626,7 +1626,6 @@ observabilita: plný System Graph, JSON/CBOR/CLI reprezentace, tracing, counters
 bezpečnostní hardening: app sandbox, permission manifesty, threat model
 ServiceManager s restart policy a watchdog
 plný Component Model + WASI preview 2, SDK pro Rust/C/Go
-package/app formát, instalace, AOT kompilace
 jednoduchý perzistentní nativní filesystem
 ```
 
@@ -1642,7 +1641,8 @@ immutable signed systém, A/B updates, rollback, verified boot
 nativní moderní FS (CoW, checksums, snapshots, komprese)
 první vlastní služby: jednoduchý web server pro statické soubory a podobné malé služby - dogfooding síťového stacku + storage + service modelu na naší vlastní / WASI vrstvě (bez POSIXu)
 minimální headless AudioService nad virtio-sound (přehrávání, volitelně záznam) - aby zvuk fungoval i z konzole (např. pro headless hlasového asistenta); plný desktopový audio stack zůstává fáze 5
-CLI package manager (hledání / instalace / aktualizace / odebrání vlastních balíčků, postavený na package/app formátu z fáze 2) - end-user app store zůstává fáze 5
+package/app formát, instalace, AOT kompilace
+CLI package manager (hledání / instalace / aktualizace / odebrání vlastních balíčků, postavený na package/app formátu z této fáze) - end-user app store zůstává fáze 5
 ```
 
 #### Fáze 4 - Reálný hardware a kompatibilita cizího softwaru
@@ -1766,4 +1766,4 @@ Fáze 0 a 1 jsou hotové (kernel MVP a první použitelný userspace - viz *Road
 5. virtio drivery (blk, net, console) izolované pod DeviceManagerem; minimální WASI host spouštějící první Wasm komponentu; powerbox file picker předávající jednu file capability.
 ```
 
-Doporučený další krok je tedy **Fáze 2 (appliance/edge platforma)**. Její prioritou je síťový stack nad virtio-net - na edge je síť jádrem - následovaný zbytkem fáze (plný System Graph + observabilita, security hardening + PermissionManager, ResourceManager policy, ServiceManager restart/watchdog, plný Component Model + WASI preview 2 + SDK, package/AOT cesta a jednoduchý perzistentní nativní filesystem); viz *Roadmapa*.
+Doporučený další krok je tedy **Fáze 2 (appliance/edge platforma)**. Její prioritou je síťový stack nad virtio-net - na edge je síť jádrem - následovaný zbytkem fáze (plný System Graph + observabilita, security hardening + PermissionManager, ResourceManager policy, ServiceManager restart/watchdog, plný Component Model + WASI preview 2 + SDK a jednoduchý perzistentní nativní filesystem); viz *Roadmapa*.
