@@ -14,6 +14,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use proto::codec::JsonMode;
 use proto::system::{Budget, resources};
 use rt::*;
 
@@ -31,7 +32,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		// 3. receive the one capability the manifest grants: a ResourceManager client.
 		let ressvc: u64 = recv_tagged(bootstrap, &mut buf, b"RESOURCE").unwrap_or_else(|| exit());
-		query_resource(ressvc, &args[..] == b"json");
+		query_resource(ressvc, JsonMode::parse(&args));
 	}
 	exit();
 }
@@ -40,22 +41,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // wire form, one document per budget) or as a compact text table - one line per budget, each
 // resource shown as `kind=used/limit`, with an unlimited limit (u64::MAX, the kernel's
 // UNLIMITED sentinel) shown as `unlimited` rather than the raw number.
-unsafe fn query_resource(ressvc: u64, json: bool) {
+unsafe fn query_resource(ressvc: u64, mode: Option<JsonMode>) {
 	unsafe {
 		let mut client = resources::Client::new(ChannelTransport { chan: ressvc });
 		match client.usage() {
 			Some(Ok(budgets)) => {
-				if json {
-					print(b"[");
-					let mut first: bool = true;
-					for b in budgets.iter() {
-						if !first {
-							print(b",");
+				if let Some(mode) = mode {
+					let mut out = String::from("[");
+					for (i, b) in budgets.iter().enumerate() {
+						if i > 0 {
+							out.push(',');
 						}
-						first = false;
-						print(b.to_json().as_bytes());
+						out.push_str(&b.to_json());
 					}
-					print(b"]\n");
+					out.push(']');
+					print(mode.render(out).as_bytes());
+					print(b"\n");
 				} else {
 					for b in budgets.iter() {
 						print_budget(b);

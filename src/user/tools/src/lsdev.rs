@@ -13,7 +13,9 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
+use proto::codec::JsonMode;
 use proto::system::device;
 use rt::*;
 
@@ -24,36 +26,37 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for text, "json" for JSON).
+		// 2. receive the argument string - the sub-form ("" for text, "json" /
+		//    "json-min" for JSON).
 		let args: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, .. } => buf[..len].to_vec(),
 			Received::Closed => exit(),
 		};
 		// 3. receive the one capability the manifest grants: a DeviceService client.
 		let devsvc: u64 = recv_tagged(bootstrap, &mut buf, b"DEVICE").unwrap_or_else(|| exit());
-		query_devices(devsvc, &args[..] == b"json");
+		query_devices(devsvc, JsonMode::parse(&args));
 	}
 	exit();
 }
 
 // List the device nodes through the grant and print each entry, as text (the default) or as
 // a JSON array, rendered on the client side - reporting a concise error if the query fails.
-unsafe fn query_devices(devsvc: u64, json: bool) {
+unsafe fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
 	unsafe {
 		let mut client = device::Client::new(ChannelTransport { chan: devsvc });
 		match client.list() {
 			Some(Ok(entries)) => {
-				if json {
-					print(b"[");
-					let mut first: bool = true;
-					for e in &entries {
-						if !first {
-							print(b",");
+				if let Some(mode) = mode {
+					let mut out = String::from("[");
+					for (i, e) in entries.iter().enumerate() {
+						if i > 0 {
+							out.push(',');
 						}
-						first = false;
-						print(e.to_json().as_bytes());
+						out.push_str(&e.to_json());
 					}
-					print(b"]\n");
+					out.push(']');
+					print(mode.render(out).as_bytes());
+					print(b"\n");
 				} else {
 					for e in &entries {
 						print(e.to_text().as_bytes());

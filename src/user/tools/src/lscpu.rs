@@ -12,6 +12,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use proto::codec::JsonMode;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -21,9 +22,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 1. adopt the forwarded stdout console (the first bootstrap message), so our
 		//    output renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for text, "json" for JSON).
-		let json: bool = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => &buf[..len] == b"json",
+		// 2. receive the argument string - the sub-form ("" for text, "json" /
+		//    "json-min" for JSON).
+		let mode: Option<JsonMode> = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, .. } => JsonMode::parse(&buf[..len]),
 			Received::Closed => exit(),
 		};
 		// 3. read the online CPU set and render it.
@@ -34,7 +36,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			exit();
 		}
 		let n: usize = (count as usize).min(ids.len());
-		print(render(&ids[..n], count as u64, json).as_bytes());
+		print(render(&ids[..n], count as u64, mode).as_bytes());
 	}
 	exit();
 }
@@ -48,9 +50,9 @@ const ARCH: &str = "aarch64";
 const ARCH: &str = "riscv64";
 
 // Render the CPU set as text (the default) or as a JSON object.
-fn render(ids: &[u32], count: u64, json: bool) -> String {
+fn render(ids: &[u32], count: u64, mode: Option<JsonMode>) -> String {
 	let mut out = String::new();
-	if json {
+	if let Some(mode) = mode {
 		out.push_str("{\"arch\":\"");
 		out.push_str(ARCH);
 		out.push_str("\",\"cpus\":");
@@ -62,7 +64,9 @@ fn render(ids: &[u32], count: u64, json: bool) -> String {
 			}
 			push_decimal(&mut out, id as u64);
 		}
-		out.push_str("]}\n");
+		out.push_str("]}");
+		let mut out = mode.render(out);
+		out.push('\n');
 		return out;
 	}
 	out.push_str("arch: ");

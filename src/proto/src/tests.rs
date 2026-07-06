@@ -351,6 +351,30 @@ fn query_renders_json_with_options_and_kebab_keys() {
 }
 
 #[test]
+fn json_pretty_indents_a_minified_document() {
+	let min = "{\"name\":\"a b\",\"n\":-3,\"ok\":true,\"none\":null,\"list\":[1,2],\"empty\":{},\"sub\":{\"k\":\"v\"}}";
+	let want = "{\n  \"name\": \"a b\",\n  \"n\": -3,\n  \"ok\": true,\n  \"none\": null,\n  \"list\": [\n    1,\n    2\n  ],\n  \"empty\": {},\n  \"sub\": {\n    \"k\": \"v\"\n  }\n}";
+	assert_eq!(crate::codec::json_pretty(min, false), want);
+}
+
+#[test]
+fn json_pretty_keeps_escapes_and_embedded_brackets_intact() {
+	// brackets, commas and colons inside string literals must not indent, and an
+	// escaped quote must not end the string.
+	let min = "{\"path\":\"a{b}[c],:d\",\"quote\":\"x\\\"y\"}";
+	let want = "{\n  \"path\": \"a{b}[c],:d\",\n  \"quote\": \"x\\\"y\"\n}";
+	assert_eq!(crate::codec::json_pretty(min, false), want);
+}
+
+#[test]
+fn json_pretty_colors_keys_strings_numbers_and_literals() {
+	let out = crate::codec::json_pretty("{\"k\":\"v\",\"n\":7,\"b\":false}", true);
+	assert!(out.contains("\x1b[36m\"k\"\x1b[0m: \x1b[32m\"v\"\x1b[0m"));
+	assert!(out.contains("\x1b[33m7\x1b[0m"));
+	assert!(out.contains("\x1b[35mfalse\x1b[0m"));
+}
+
+#[test]
 fn error_renders_json_kebab() {
 	assert_eq!(Error::NotFound.to_json(), "\"not-found\"");
 }

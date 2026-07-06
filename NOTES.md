@@ -5,7 +5,6 @@
 - Every command (even simple ones as ls or lsvol) has the delay at the beginning for no reason ... something that linux shows instantly - find out why and fix.
 - Test if ls* commands have --json
 - df, du
-- All commands with --json parameter should be in human readable format (incl. colours) --json-min in current minimal format
 - lsblk is showing the type of block device (virtio-blk), mountpoint (vol://...) and size, but not the name of the device in device tree... also there should be table headers (device, type, volume, size)
 - Selecting something from console by mouse is lagging a lot... the whole console lags a lot even when paging (shift + pg up/down)
 - Console does not autocomplete by tab key as on Linux - it should autocomplete commands and local files (like cat ./mot -> should complete cat ./motd.txt)

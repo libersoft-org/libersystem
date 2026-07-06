@@ -289,6 +289,140 @@ pub fn json_escape(s: &str, out: &mut String) {
 	out.push('"');
 }
 
+// The JSON output modes a tool offers: `json` (the `--json` flag) renders the
+// document indented and colored for a human, `json-min` (`--json-min`) prints the
+// minified single-line form for a machine. Tools build the minified document
+// either way and hand it to `render` last, so the two forms cannot drift.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum JsonMode {
+	Pretty,
+	Min,
+}
+
+impl JsonMode {
+	// The mode a normalized argument token selects, if any.
+	pub fn parse(token: &[u8]) -> Option<JsonMode> {
+		match token {
+			b"json" => Some(JsonMode::Pretty),
+			b"json-min" => Some(JsonMode::Min),
+			_ => None,
+		}
+	}
+
+	// Render a minified JSON document in this mode.
+	pub fn render(self, min: String) -> String {
+		match self {
+			JsonMode::Pretty => json_pretty(&min, true),
+			JsonMode::Min => min,
+		}
+	}
+}
+
+// Reformat a minified JSON document as an indented, optionally colored one - the
+// shared renderer behind every tool's `--json` form (`--json-min` prints the
+// minified document as produced). The tools keep building the compact form as
+// their single source of truth; this walks it token by token (quote- and
+// escape-aware, so brackets inside strings do not indent) and re-emits it with
+// two-space indentation, a space after `:`, and ANSI colors when `color` is set:
+// keys cyan, strings green, numbers yellow, `true`/`false`/`null` magenta.
+// Malformed input is not diagnosed - the tokens are re-emitted as they come.
+pub fn json_pretty(min: &str, color: bool) -> String {
+	const KEY: &str = "\x1b[36m";
+	const STR: &str = "\x1b[32m";
+	const NUM: &str = "\x1b[33m";
+	const LIT: &str = "\x1b[35m";
+	const RESET: &str = "\x1b[0m";
+	let mut out = String::with_capacity(min.len() * 2);
+	let bytes = min.as_bytes();
+	let mut depth: usize = 0;
+	let mut i: usize = 0;
+	let indent = |out: &mut String, depth: usize| {
+		out.push('\n');
+		for _ in 0..depth {
+			out.push_str("  ");
+		}
+	};
+	while i < bytes.len() {
+		match bytes[i] {
+			b'{' | b'[' => {
+				let close = if bytes[i] == b'{' { b'}' } else { b']' };
+				out.push(bytes[i] as char);
+				// keep an empty container on one line ("{}", "[]").
+				if i + 1 < bytes.len() && bytes[i + 1] == close {
+					out.push(close as char);
+					i += 2;
+					continue;
+				}
+				depth += 1;
+				indent(&mut out, depth);
+				i += 1;
+			}
+			b'}' | b']' => {
+				depth = depth.saturating_sub(1);
+				indent(&mut out, depth);
+				out.push(bytes[i] as char);
+				i += 1;
+			}
+			b',' => {
+				out.push(',');
+				indent(&mut out, depth);
+				i += 1;
+			}
+			b':' => {
+				out.push_str(": ");
+				i += 1;
+			}
+			b'"' => {
+				// the whole string literal, escapes included; a string followed by `:`
+				// is a key.
+				let start = i;
+				i += 1;
+				while i < bytes.len() {
+					match bytes[i] {
+						b'\\' => i += 2,
+						b'"' => {
+							i += 1;
+							break;
+						}
+						_ => i += 1,
+					}
+				}
+				// a truncated escape at end-of-input must not slice past the buffer.
+				i = i.min(bytes.len());
+				let is_key = i < bytes.len() && bytes[i] == b':';
+				if color {
+					out.push_str(if is_key { KEY } else { STR });
+				}
+				out.push_str(&min[start..i]);
+				if color {
+					out.push_str(RESET);
+				}
+			}
+			c => {
+				// a number, true/false/null, or stray whitespace (skipped - the input
+				// is expected minified).
+				if c == b' ' {
+					i += 1;
+					continue;
+				}
+				let start = i;
+				while i < bytes.len() && !matches!(bytes[i], b',' | b'}' | b']' | b':' | b'"' | b'{' | b'[') {
+					i += 1;
+				}
+				let token = &min[start..i];
+				if color {
+					out.push_str(if token.starts_with(|ch: char| ch.is_ascii_digit() || ch == '-') { NUM } else { LIT });
+				}
+				out.push_str(token);
+				if color {
+					out.push_str(RESET);
+				}
+			}
+		}
+	}
+	out
+}
+
 // CBOR (RFC 8949) encoding primitives for the generated `to_cbor` renderers. The
 // CBOR form is the binary analog of the JSON one: a record is a text-keyed map, an
 // enum case is a text string, a `result` is a single-pair map (`ok` / `err`), an

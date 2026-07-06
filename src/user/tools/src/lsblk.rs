@@ -15,6 +15,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use proto::codec::JsonMode;
 use proto::system::volume;
 use rt::*;
 
@@ -25,9 +26,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for text, "json" for JSON).
-		let json: bool = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => &buf[..len] == b"json",
+		// 2. receive the argument string - the sub-form ("" for text, "json" /
+		//    "json-min" for JSON).
+		let mode: Option<JsonMode> = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, .. } => JsonMode::parse(&buf[..len]),
 			Received::Closed => exit(),
 		};
 		// 3. receive the five volume clients the `volumes` capability bundles, in grant
@@ -37,15 +39,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let iso: u64 = recv_tagged(bootstrap, &mut buf, b"ISO").unwrap_or(0);
 		let udf: u64 = recv_tagged(bootstrap, &mut buf, b"UDF").unwrap_or(0);
 		let usb: u64 = recv_tagged(bootstrap, &mut buf, b"USB").unwrap_or(0);
-		list_block_devices(system, media, iso, udf, usb, json);
+		list_block_devices(system, media, iso, udf, usb, mode);
 	}
 	exit();
 }
 
 // One row per volume: the vol:// name, the backing block device, and its capacity
 // asked through the volume's typed `capacity` query.
-unsafe fn list_block_devices(system: u64, media: u64, iso: u64, udf: u64, usb: u64, json: bool) {
+unsafe fn list_block_devices(system: u64, media: u64, iso: u64, udf: u64, usb: u64, mode: Option<JsonMode>) {
 	unsafe {
+		let json: bool = mode.is_some();
 		let rows: [(&str, &str, u64); 5] = [
 			("vol://system", "virtio-blk", system),
 			("vol://media", "virtio-blk", media),
@@ -61,8 +64,9 @@ unsafe fn list_block_devices(system: u64, media: u64, iso: u64, udf: u64, usb: u
 			let capacity: Option<u64> = volume_capacity(chan);
 			render_row(&mut out, i, name, device, capacity, json);
 		}
-		if json {
+		if let Some(mode) = mode {
 			out.push(']');
+			out = mode.render(out);
 		}
 		out.push('\n');
 		print(out.as_bytes());

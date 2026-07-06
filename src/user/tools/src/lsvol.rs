@@ -18,6 +18,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use proto::codec::JsonMode;
 use proto::system::{VolumeStatus, volume};
 use rt::*;
 
@@ -29,8 +30,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string - the sub-form ("" for text, "json" for JSON).
-		let json: bool = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => &buf[..len] == b"json",
+		let mode: Option<JsonMode> = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, .. } => JsonMode::parse(&buf[..len]),
 			Received::Closed => exit(),
 		};
 		// 3. receive the five volume clients the `volumes` capability bundles, in grant order;
@@ -40,7 +41,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let iso: u64 = recv_tagged(bootstrap, &mut buf, b"ISO").unwrap_or(0);
 		let udf: u64 = recv_tagged(bootstrap, &mut buf, b"UDF").unwrap_or(0);
 		let usb: u64 = recv_tagged(bootstrap, &mut buf, b"USB").unwrap_or(0);
-		list_volumes(system, media, iso, udf, usb, json);
+		list_volumes(system, media, iso, udf, usb, mode);
 	}
 	exit();
 }
@@ -48,10 +49,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // List the volume set, read through the five grants: an aligned table of each
 // volume's filesystem (as its service reports it in the `status` op), file count,
 // and the size / used / free numbers the filesystem declares, with a notes column
-// for the read-only and compression flags - the `df` view. `json` selects a JSON
+// for the read-only and compression flags - the `df` view. `mode` selects a JSON
 // array over the table.
-unsafe fn list_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64, json: bool) {
+unsafe fn list_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64, mode: Option<JsonMode>) {
 	unsafe {
+		let json: bool = mode.is_some();
 		let rows: [(&str, u64); 5] = [("vol://system", system), ("vol://media", media), ("vol://iso", iso), ("vol://udf", udf), ("vol://usb", usb)];
 		let mut out = String::new();
 		if json {
@@ -64,8 +66,9 @@ unsafe fn list_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64, js
 			let files: usize = volume_count(chan, uri);
 			render_row(&mut out, i, uri, chan != 0, status.as_ref(), files, json);
 		}
-		if json {
+		if let Some(mode) = mode {
 			out.push(']');
+			out = mode.render(out);
 		}
 		out.push('\n');
 		print(out.as_bytes());

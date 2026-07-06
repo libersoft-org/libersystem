@@ -17,7 +17,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{Entry, Query, Timestamp, log, time};
+use proto::codec::JsonMode;
+use proto::system::{log, time, Entry, Query, Timestamp};
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -50,16 +51,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			None => (None, &args[..]),
 		};
-		let (tail, json): (bool, bool) = match rest {
-			b"json" => (false, true),
-			b"tail" => (true, false),
-			b"tail json" => (true, true),
-			_ => (false, false),
+		let (tail, mode): (bool, Option<JsonMode>) = match rest {
+			b"json" => (false, Some(JsonMode::Pretty)),
+			b"json-min" => (false, Some(JsonMode::Min)),
+			b"tail" => (true, None),
+			b"tail json" => (true, Some(JsonMode::Pretty)),
+			b"tail json-min" => (true, Some(JsonMode::Min)),
+			_ => (false, None),
 		};
 		if tail {
-			tail_log(logsvc, timesvc, json);
+			tail_log(logsvc, timesvc, mode);
 		} else {
-			query_log(logsvc, timesvc, boot, json);
+			query_log(logsvc, timesvc, boot, mode);
 		}
 	}
 	exit();
@@ -71,24 +74,24 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // one typed reply - the journal itself is much deeper; `log tail` streams all of it. A
 // boot selector reads a previous boot's on-disk journal instead of the live one (its
 // ticks belong to that boot, so they render raw rather than against this boot's epoch).
-unsafe fn query_log(logsvc: u64, timesvc: u64, boot: Option<u32>, json: bool) {
+unsafe fn query_log(logsvc: u64, timesvc: u64, boot: Option<u32>, mode: Option<JsonMode>) {
 	unsafe {
 		let q = Query { since: None, min_severity: None, source: None, boot, limit: 32 };
 		let epoch: Option<u64> = if boot.is_none() { boot_epoch(timesvc) } else { None };
 		let mut client = log::Client::new(ChannelTransport { chan: logsvc });
 		match client.query(&q) {
 			Some(Ok(entries)) => {
-				if json {
-					print(b"[");
-					let mut first: bool = true;
-					for e in &entries {
-						if !first {
-							print(b",");
+				if let Some(mode) = mode {
+					let mut out = String::from("[");
+					for (i, e) in entries.iter().enumerate() {
+						if i > 0 {
+							out.push(',');
 						}
-						first = false;
-						print(e.to_json().as_bytes());
+						out.push_str(&e.to_json());
 					}
-					print(b"]\n");
+					out.push(']');
+					print(mode.render(out).as_bytes());
+					print(b"\n");
 				} else {
 					for e in &entries {
 						print(entry_text(e, epoch).as_bytes());
@@ -104,8 +107,11 @@ unsafe fn query_log(logsvc: u64, timesvc: u64, boot: Option<u32>, json: bool) {
 
 // Stream the system journal via LogService's tail op: it returns a fresh sub-channel, frames
 // each entry as its own message on it, and closes it to mark the end of the stream. We drain
-// the frames and render each entry on the client side, one streamed record at a time.
-unsafe fn tail_log(logsvc: u64, timesvc: u64, json: bool) {
+// the frames and render each entry on the client side, one streamed record at a time. A
+// live stream cannot buffer into one closing array, so the JSON forms render per record:
+// `tail json` pretty-prints each entry as its own document, `tail json-min` prints each
+// entry minified on its own line (a JSON-lines stream).
+unsafe fn tail_log(logsvc: u64, timesvc: u64, mode: Option<JsonMode>) {
 	unsafe {
 		let q = Query { since: None, min_severity: None, source: None, boot: None, limit: 0 };
 		let epoch: Option<u64> = boot_epoch(timesvc);
@@ -117,21 +123,14 @@ unsafe fn tail_log(logsvc: u64, timesvc: u64, json: bool) {
 				return;
 			}
 		};
-		if json {
-			print(b"[");
-		}
-		let mut first: bool = true;
 		let mut frame: [u8; 1024] = [0u8; 1024];
 		loop {
 			match recv_blocking(consumer, &mut frame) {
 				Received::Message { len, .. } => {
 					if let Some(entry) = log::tail_read(&frame[..len]) {
-						if json {
-							if !first {
-								print(b",");
-							}
-							first = false;
-							print(entry.to_json().as_bytes());
+						if let Some(mode) = mode {
+							print(mode.render(entry.to_json()).as_bytes());
+							print(b"\n");
 						} else {
 							print(entry_text(&entry, epoch).as_bytes());
 							print(b"\n");
@@ -140,9 +139,6 @@ unsafe fn tail_log(logsvc: u64, timesvc: u64, json: bool) {
 				}
 				Received::Closed => break,
 			}
-		}
-		if json {
-			print(b"]\n");
 		}
 		close(consumer);
 	}

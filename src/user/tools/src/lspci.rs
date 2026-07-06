@@ -13,6 +13,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use proto::codec::JsonMode;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -22,11 +23,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 1. adopt the forwarded stdout console (the first bootstrap message), so our
 		//    output renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for text, "json" for JSON).
-		let json: bool = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => &buf[..len] == b"json",
+		// 2. receive the argument string - the sub-form ("" for text, "json" /
+		//    "json-min" for JSON).
+		let mode: Option<JsonMode> = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, .. } => JsonMode::parse(&buf[..len]),
 			Received::Closed => exit(),
 		};
+		let json: bool = mode.is_some();
 		// 3. walk the retained bus scan and render one entry per function.
 		let mut out = String::new();
 		if json {
@@ -41,8 +44,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			render_function(&mut out, index, &info, json);
 			index += 1;
 		}
-		if json {
-			out.push_str("]\n");
+		if let Some(mode) = mode {
+			out.push(']');
+			out = mode.render(out);
+			out.push('\n');
 		}
 		if index == 0 {
 			print(b"lspci: query error\n");

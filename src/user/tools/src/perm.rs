@@ -14,7 +14,9 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
+use proto::codec::JsonMode;
 use proto::system::permission;
 use rt::*;
 
@@ -32,7 +34,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		// 3. receive the one capability the manifest grants: a PermissionManager client.
 		let permsvc: u64 = recv_tagged(bootstrap, &mut buf, b"PERMISSION").unwrap_or_else(|| exit());
-		query_permission(permsvc, &args[..] == b"json");
+		query_permission(permsvc, JsonMode::parse(&args));
 	}
 	exit();
 }
@@ -41,7 +43,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // generated wire form, one document per entry) or as text - one line per entry, each showing
 // the component, the capability, and whether it was granted. The trail arrives as a
 // stream of entries, rendered as they arrive - it never has to fit one reply.
-unsafe fn query_permission(permsvc: u64, json: bool) {
+unsafe fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
 	unsafe {
 		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
 		let consumer: u64 = match client.audit() {
@@ -51,20 +53,18 @@ unsafe fn query_permission(permsvc: u64, json: bool) {
 				return;
 			}
 		};
-		if json {
-			print(b"[");
-		}
+		let mut out = String::from("[");
 		let mut first: bool = true;
 		loop {
 			match recv_vec_blocking(consumer) {
 				ReceivedVec::Message { bytes, .. } => {
 					if let Some(e) = permission::audit_read(&bytes) {
-						if json {
+						if mode.is_some() {
 							if !first {
-								print(b",");
+								out.push(',');
 							}
 							first = false;
-							print(e.to_json().as_bytes());
+							out.push_str(&e.to_json());
 						} else {
 							print(e.to_text().as_bytes());
 							print(b"\n");
@@ -75,8 +75,10 @@ unsafe fn query_permission(permsvc: u64, json: bool) {
 			}
 		}
 		close(consumer);
-		if json {
-			print(b"]\n");
+		if let Some(mode) = mode {
+			out.push(']');
+			print(mode.render(out).as_bytes());
+			print(b"\n");
 		}
 	}
 }

@@ -398,10 +398,12 @@ def cmd_shot(args):
 
 
 def cmd_quit(_args):
+	# The monitor socket may be a stale file from an instance that is already gone
+	# (e.g. after `lab test` replaced it) - a clean quit falls through to the kill.
 	if os.path.exists(MON_SOCK):
 		try:
 			monitor_command('quit')
-		except SystemExit:
+		except (SystemExit, OSError):
 			pass
 	time.sleep(1)
 	subprocess.run(['pkill', '-9', '-f', 'qemu-system-x86'], check=False)

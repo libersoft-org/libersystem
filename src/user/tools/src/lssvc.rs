@@ -14,7 +14,9 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
+use proto::codec::JsonMode;
 use proto::system::supervisor;
 use rt::*;
 
@@ -25,52 +27,57 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
-		// 2. receive the argument string - "json" and/or a name-prefix filter.
+		// 2. receive the argument string - "json" / "json-min" and/or a name-prefix filter.
 		let args: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, .. } => buf[..len].to_vec(),
 			Received::Closed => exit(),
 		};
-		let (json, filter): (bool, &[u8]) = parse_args(&args);
+		let (mode, filter): (Option<JsonMode>, &[u8]) = parse_args(&args);
 		// 3. receive the one capability the manifest grants: a ServiceManager status client.
 		let statsvc: u64 = recv_tagged(bootstrap, &mut buf, b"SERVICES").unwrap_or_else(|| exit());
-		query_services(statsvc, json, filter);
+		query_services(statsvc, mode, filter);
 	}
 	exit();
 }
 
-// Split the argument string into the JSON flag and the optional name-prefix filter:
-// "" / "json" / "<prefix>" / "json <prefix>".
-fn parse_args(args: &[u8]) -> (bool, &[u8]) {
-	if args == b"json" {
-		return (true, b"");
+// Split the argument string into the JSON mode and the optional name-prefix filter:
+// "" / "json" / "json-min" / "<prefix>" / "json <prefix>" / "json-min <prefix>".
+fn parse_args(args: &[u8]) -> (Option<JsonMode>, &[u8]) {
+	if let Some(mode) = JsonMode::parse(args) {
+		return (Some(mode), b"");
+	}
+	if let Some(rest) = args.strip_prefix(b"json-min ") {
+		return (Some(JsonMode::Min), rest);
 	}
 	if let Some(rest) = args.strip_prefix(b"json ") {
-		return (true, rest);
+		return (Some(JsonMode::Pretty), rest);
 	}
-	(false, args)
+	(None, args)
 }
 
 // Query the supervisor's status view through the grant and print each entry whose name
 // starts with `filter`, as text (the default) or as a JSON array.
-unsafe fn query_services(statsvc: u64, json: bool, filter: &[u8]) {
+unsafe fn query_services(statsvc: u64, mode: Option<JsonMode>, filter: &[u8]) {
 	unsafe {
 		let mut client = supervisor::Client::new(ChannelTransport { chan: statsvc });
 		match client.status() {
 			Some(Ok(entries)) => {
-				if json {
-					print(b"[");
+				if let Some(mode) = mode {
+					let mut out = String::from("[");
 					let mut first: bool = true;
 					for e in &entries {
 						if !e.name.as_bytes().starts_with(filter) {
 							continue;
 						}
 						if !first {
-							print(b",");
+							out.push(',');
 						}
 						first = false;
-						print(e.to_json().as_bytes());
+						out.push_str(&e.to_json());
 					}
-					print(b"]\n");
+					out.push(']');
+					print(mode.render(out).as_bytes());
+					print(b"\n");
 				} else {
 					for e in &entries {
 						if !e.name.as_bytes().starts_with(filter) {

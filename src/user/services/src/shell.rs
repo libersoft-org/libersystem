@@ -14,8 +14,9 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use proto::codec::JsonMode;
 use proto::path;
-use proto::system::{Component, EnvVar, JobEntry, JobInfo, TraceSpan, input, network, permission, process, session, system_graph, volume};
+use proto::system::{input, network, permission, process, session, system_graph, volume, Component, EnvVar, JobEntry, JobInfo, TraceSpan};
 use rt::*;
 
 // The shell's builtins, shared with ConsoleService's line discipline: Tab completes the
@@ -674,9 +675,9 @@ fn push_var_value(out: &mut Vec<u8>, name: &[u8], vars: &[(String, String)]) {
 	}
 }
 
-// Rewrite the Linux-style `--json` / `--cbor` flag tokens to the bare `json` / `cbor`
-// forms the dispatch arms and the tools match on - one canonical spelling inside, both
-// accepted at the prompt.
+// Rewrite the Linux-style `--json` / `--json-min` / `--cbor` flag tokens to the bare
+// `json` / `json-min` / `cbor` forms the dispatch arms and the tools match on - one
+// canonical spelling inside, both accepted at the prompt.
 fn normalize_flags(line: &[u8]) -> Vec<u8> {
 	let mut out: Vec<u8> = Vec::with_capacity(line.len());
 	for (i, token) in line.split(|&b| b == b' ').enumerate() {
@@ -685,11 +686,24 @@ fn normalize_flags(line: &[u8]) -> Vec<u8> {
 		}
 		match token {
 			b"--json" => out.extend_from_slice(b"json"),
+			b"--json-min" => out.extend_from_slice(b"json-min"),
 			b"--cbor" => out.extend_from_slice(b"cbor"),
 			_ => out.extend_from_slice(token),
 		}
 	}
 	out
+}
+
+// The `<name> json` / `<name> json-min` sub-form of a query command's line, if it is
+// one - the argument string to forward to the tool. The tools parse the same two
+// tokens (proto's JsonMode), so the shell only routes them.
+fn json_subform<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+	let rest: &[u8] = line.strip_prefix(name)?;
+	match rest {
+		b" json" => Some(b"json"),
+		b" json-min" => Some(b"json-min"),
+		_ => None,
+	}
 }
 
 unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, jobs: &mut Jobs, vars: &mut Vec<(String, String)>, cwd: &mut String) -> bool {
@@ -814,8 +828,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			run_tool(permsvc, b"lsdev", b"", cwd.as_bytes());
 			return false;
 		}
-		if line == b"lsdev json" {
-			run_tool(permsvc, b"lsdev", b"json", cwd.as_bytes());
+		if let Some(args) = json_subform(line, b"lsdev") {
+			run_tool(permsvc, b"lsdev", args, cwd.as_bytes());
 			return false;
 		}
 		if line == b"graph" {
@@ -823,7 +837,11 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			return false;
 		}
 		if line == b"graph json" {
-			query_graph(graphsvc, GraphFmt::Json);
+			query_graph(graphsvc, GraphFmt::Json(JsonMode::Pretty));
+			return false;
+		}
+		if line == b"graph json-min" {
+			query_graph(graphsvc, GraphFmt::Json(JsonMode::Min));
 			return false;
 		}
 		if line == b"graph cbor" {
@@ -837,8 +855,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			run_tool(permsvc, b"perm", b"", cwd.as_bytes());
 			return false;
 		}
-		if line == b"perm json" {
-			run_tool(permsvc, b"perm", b"json", cwd.as_bytes());
+		if line == b"perm json" || line == b"perm json-min" {
+			run_tool(permsvc, b"perm", &line[5..], cwd.as_bytes());
 			return false;
 		}
 		if line == b"usage" {
@@ -848,8 +866,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			run_tool(permsvc, b"usage", b"", cwd.as_bytes());
 			return false;
 		}
-		if line == b"usage json" {
-			run_tool(permsvc, b"usage", b"json", cwd.as_bytes());
+		if let Some(args) = json_subform(line, b"usage") {
+			run_tool(permsvc, b"usage", args, cwd.as_bytes());
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"stop ") {
@@ -920,8 +938,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			run_tool(permsvc, b"lscpu", b"", cwd.as_bytes());
 			return false;
 		}
-		if line == b"lscpu json" {
-			run_tool(permsvc, b"lscpu", b"json", cwd.as_bytes());
+		if let Some(args) = json_subform(line, b"lscpu") {
+			run_tool(permsvc, b"lscpu", args, cwd.as_bytes());
 			return false;
 		}
 		if line == b"free" {
@@ -936,24 +954,24 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			run_tool(permsvc, b"lsmem", b"", cwd.as_bytes());
 			return false;
 		}
-		if line == b"lsmem json" {
-			run_tool(permsvc, b"lsmem", b"json", cwd.as_bytes());
+		if let Some(args) = json_subform(line, b"lsmem") {
+			run_tool(permsvc, b"lsmem", args, cwd.as_bytes());
 			return false;
 		}
 		if line == b"lsirq" {
 			run_tool(permsvc, b"lsirq", b"", cwd.as_bytes());
 			return false;
 		}
-		if line == b"lsirq json" {
-			run_tool(permsvc, b"lsirq", b"json", cwd.as_bytes());
+		if let Some(args) = json_subform(line, b"lsirq") {
+			run_tool(permsvc, b"lsirq", args, cwd.as_bytes());
 			return false;
 		}
 		if line == b"lspci" {
 			run_tool(permsvc, b"lspci", b"", cwd.as_bytes());
 			return false;
 		}
-		if line == b"lspci json" {
-			run_tool(permsvc, b"lspci", b"json", cwd.as_bytes());
+		if let Some(args) = json_subform(line, b"lspci") {
+			run_tool(permsvc, b"lspci", args, cwd.as_bytes());
 			return false;
 		}
 		if line == b"lssvc" {
@@ -968,16 +986,16 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			run_tool(permsvc, b"lsblk", b"", cwd.as_bytes());
 			return false;
 		}
-		if line == b"lsblk json" {
-			run_tool(permsvc, b"lsblk", b"json", cwd.as_bytes());
+		if let Some(args) = json_subform(line, b"lsblk") {
+			run_tool(permsvc, b"lsblk", args, cwd.as_bytes());
 			return false;
 		}
 		if line == b"lsusb" {
 			run_tool(permsvc, b"lsusb", b"", cwd.as_bytes());
 			return false;
 		}
-		if line == b"lsusb json" {
-			run_tool(permsvc, b"lsusb", b"json", cwd.as_bytes());
+		if let Some(args) = json_subform(line, b"lsusb") {
+			run_tool(permsvc, b"lsusb", args, cwd.as_bytes());
 			return false;
 		}
 		if line == b"beep" {
@@ -1052,8 +1070,8 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			run_tool(permsvc, b"lsvol", b"", cwd.as_bytes());
 			return false;
 		}
-		if line == b"lsvol json" {
-			run_tool(permsvc, b"lsvol", b"json", cwd.as_bytes());
+		if let Some(args) = json_subform(line, b"lsvol") {
+			run_tool(permsvc, b"lsvol", args, cwd.as_bytes());
 			return false;
 		}
 		if line == b"cd" {
@@ -1260,7 +1278,11 @@ unsafe fn send_stdout(parent: u64, interactive: bool) {
 		let rights: u32 = if interactive { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_TRANSFER } else { RIGHT_SEND | RIGHT_TRANSFER };
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, rights);
-			if d > 0 { d as u64 } else { 0 }
+			if d > 0 {
+				d as u64
+			} else {
+				0
+			}
 		} else {
 			0
 		};
@@ -1470,7 +1492,7 @@ unsafe fn mouse_cmd(inputsvc: u64) {
 // forms are the same bytes a remote consumer would read off the wire in a later phase.
 enum GraphFmt {
 	Text,
-	Json,
+	Json(JsonMode),
 	Cbor,
 }
 
@@ -1493,8 +1515,8 @@ unsafe fn query_graph(graphsvc: u64, fmt: GraphFmt) {
 					print_text_lines(&graph.components, |c: &Component| -> String { c.to_text() });
 					print_text_lines(&graph.spans, |s: &TraceSpan| -> String { s.to_text() });
 				}
-				GraphFmt::Json => {
-					print(graph.to_json().as_bytes());
+				GraphFmt::Json(mode) => {
+					print(mode.render(graph.to_json()).as_bytes());
 					print(b"\n");
 				}
 				GraphFmt::Cbor => print_hex(&graph.to_cbor()),

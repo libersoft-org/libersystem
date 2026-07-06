@@ -24,8 +24,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use proto::codec::json_escape;
-use proto::system::{Ipv4Addr, PingReply, PingStatus, network};
+use proto::codec::{json_escape, JsonMode};
+use proto::system::{network, Ipv4Addr, PingReply, PingStatus};
 use rt::*;
 
 // The representation ping renders its results in. Extend with further codecs (e.g.
@@ -33,7 +33,7 @@ use rt::*;
 #[derive(Clone, Copy, PartialEq)]
 enum OutputFormat {
 	Cli,
-	Json,
+	Json(JsonMode),
 }
 
 #[unsafe(no_mangle)]
@@ -103,7 +103,7 @@ unsafe fn ping(netsvc: u64, args: &[u8]) {
 		// An unbounded ping never produces its final JSON document, so default to four
 		// probes in JSON mode when no count was given; CLI keeps its infinite default.
 		let count: Option<u32> = match (format, count) {
-			(OutputFormat::Json, None) => Some(4),
+			(OutputFormat::Json(_), None) => Some(4),
 			_ => count,
 		};
 		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
@@ -177,12 +177,12 @@ unsafe fn ping(netsvc: u64, args: &[u8]) {
 							PingStatus::Timeout => {}
 						},
 						// JSON: collect the wire record for the final document.
-						OutputFormat::Json => attempts.push((seq, reply)),
+						OutputFormat::Json(_) => attempts.push((seq, reply)),
 					}
 				}
 				// A service-side error counts as a loss; record it as a timeout in JSON.
 				Some(Err(_)) => {
-					if format == OutputFormat::Json {
+					if format != OutputFormat::Cli {
 						attempts.push((seq, PingReply { status: PingStatus::Timeout, ttl: 0, rtt_us: 0 }));
 					}
 				}
@@ -219,7 +219,7 @@ unsafe fn ping(netsvc: u64, args: &[u8]) {
 		// Render the collected results in the chosen representation.
 		match format {
 			OutputFormat::Cli => print_summary(target, &stats, start_ns, was_interrupted),
-			OutputFormat::Json => print_json(target, ip, &attempts, &stats, start_ns),
+			OutputFormat::Json(mode) => print_json(target, ip, &attempts, &stats, start_ns, mode),
 		}
 	}
 }
@@ -264,7 +264,7 @@ unsafe fn print_summary(target: &[u8], stats: &Stats, start_ns: u64, was_interru
 // with the client-side icmp-seq), so the wire model stays the single source of truth;
 // it is framed with the target, resolved address, and the same statistics the CLI
 // summary reports. Timeouts and lost probes appear as "timeout" replies.
-unsafe fn print_json(target: &[u8], ip: &[u8], attempts: &[(u32, PingReply)], stats: &Stats, start_ns: u64) {
+unsafe fn print_json(target: &[u8], ip: &[u8], attempts: &[(u32, PingReply)], stats: &Stats, start_ns: u64, mode: JsonMode) {
 	unsafe {
 		let elapsed_ms: u64 = clock_ns().saturating_sub(start_ns) / 1_000_000;
 		let lost: u32 = stats.transmitted - stats.received;
@@ -296,8 +296,9 @@ unsafe fn print_json(target: &[u8], ip: &[u8], attempts: &[(u32, PingReply)], st
 		} else {
 			out.push_str("null");
 		}
-		out.push_str("}}\n");
-		print(out.as_bytes());
+		out.push_str("}}");
+		print(mode.render(out).as_bytes());
+		print(b"\n");
 	}
 }
 
@@ -319,7 +320,10 @@ fn parse_args(args: &[u8]) -> Option<(Option<u32>, OutputFormat, &[u8])> {
 			count = Some(parse_u32(num)?);
 			rest = after_num;
 		} else if tok == b"--json" || tok == b"-j" || tok == b"json" {
-			format = OutputFormat::Json;
+			format = OutputFormat::Json(JsonMode::Pretty);
+			rest = after;
+		} else if tok == b"--json-min" || tok == b"json-min" {
+			format = OutputFormat::Json(JsonMode::Min);
 			rest = after;
 		} else if tok.first() == Some(&b'-') {
 			return None;
