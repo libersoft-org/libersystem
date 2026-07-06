@@ -4,6 +4,25 @@ Measured numbers for the milestones whose "done when" includes a before/after
 comparison. Methodology per entry; machine noise applies, so treat the times as
 orders, not precision instruments.
 
+## M105 - Kernel wake path (2026-07-06)
+
+Measured live in QEMU/KVM as the end-to-end round-trip of a shell command typed
+over serial (the lab harness sends the line and waits for the prompt to return;
+wall clock on the host, five runs). Before = the tree at HEAD (serial input
+polled from the 100 Hz idle hook, one global waiter list, no cross-core kick);
+after = this milestone (UART receive interrupt, per-object wait buckets, the
+remote-spawn wake IPI). The in-guest `time uname` (~5 ms) is unchanged - the
+spawn pipeline was never the bottleneck; the win is the input-delivery path.
+
+| scenario | before | after |
+| --- | --- | --- |
+| serial command round-trip (`uname`, end to end) | 182-197 ms | 122-133 ms |
+| remote spawn onto a halted core | up to one 10 ms tick | < 4 ms bound, test-pinned (microseconds typical) |
+
+The remaining ~120 ms floor is dominated by the console output path (echo and
+present quantization), not input delivery - the serial byte now reaches the
+shell's waiter in interrupt context.
+
 ## M72 - Contiguous DMA and full-size I/O (2026-07-05)
 
 Measured live in QEMU/KVM with the shell's `time` over serial: a whole-file read

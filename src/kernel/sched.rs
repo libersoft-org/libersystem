@@ -35,7 +35,7 @@ enum Disposition {
 	// Thread has exited: move it aside to be reaped, never run it again.
 	Retire,
 	// Thread blocked in `wait`: deschedule it without requeueing. It is kept alive
-	// by the wait registry (WAITERS) and re-enqueued when woken.
+	// by the wait registry (the per-object buckets) and re-enqueued when woken.
 	Block,
 }
 
@@ -81,20 +81,39 @@ fn cpu_sched(cpu: usize) -> &'static CpuSched {
 
 // A thread blocked in `wait`, parked here (off every run queue) until the object
 // it waits on becomes ready or its deadline passes. The Arc keeps the thread
-// alive while blocked. `deadline` is an absolute LAPIC tick value; u64::MAX means
-// no timeout. `koid` is the object whose readiness wakes the thread (0 = none).
-// `periodic` marks a housekeeping deadline (WAIT_PERIODIC): still woken when due,
-// but invisible to min_deadline, so run_until_idle settles across it.
-struct Waiter {
+// alive while blocked.
+//
+// The registry is split for scale: object waits live in WAIT_BUCKETS - an array
+// of small per-bucket lists keyed by the object's koid - so waking an object
+// locks and scans only that object's bucket, not every blocked thread in the
+// system; timed waits additionally register in TIMED_WAITERS, the only list the
+// deadline scan and min_deadline touch (most service waits carry no deadline, so
+// the timed list stays short). A wake CLAIMS its thread with a Blocked -> Ready
+// compare-exchange before enqueueing it, so concurrent wakes through different
+// buckets (a wait_any waiter has one entry per object) enqueue the thread exactly
+// once; the woken thread removes its own leftover entries when it resumes.
+struct BucketWaiter {
 	thread: Arc<Thread>,
 	koid: u64,
+}
+
+// A blocked thread's deadline: an absolute LAPIC tick value. `periodic` marks a
+// housekeeping wake (WAIT_PERIODIC): still woken when due, but invisible to
+// min_deadline, so run_until_idle settles across it.
+struct TimedWaiter {
+	thread: Arc<Thread>,
 	deadline: u64,
 	periodic: bool,
 }
 
-// The global wait registry. One lock for all blocked threads is enough at this
-// scale; per-object/per-CPU wait queues are a later refinement.
-static WAITERS: SpinLock<Vec<Waiter>> = SpinLock::new(Vec::new());
+const WAIT_BUCKET_COUNT: usize = 64;
+
+static WAIT_BUCKETS: [SpinLock<Vec<BucketWaiter>>; WAIT_BUCKET_COUNT] = [const { SpinLock::new(Vec::new()) }; WAIT_BUCKET_COUNT];
+static TIMED_WAITERS: SpinLock<Vec<TimedWaiter>> = SpinLock::new(Vec::new());
+
+fn bucket_of(koid: u64) -> &'static SpinLock<Vec<BucketWaiter>> {
+	&WAIT_BUCKETS[(koid % WAIT_BUCKET_COUNT as u64) as usize]
+}
 
 // No-deadline sentinel for `wait`.
 pub const NO_DEADLINE: u64 = u64::MAX;
@@ -153,10 +172,15 @@ pub fn spawn(entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 // Create a kernel thread on a specific core's run queue. The thread gets its own
 // single-thread process in the kernel address space, accounted to the root
 // Domain - so a kernel thread's table is reclaimed when the thread is reaped.
+// A remote target core is kicked with a wake IPI, so a halted core picks the
+// thread up immediately instead of on its next timer tick.
 pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 	let process = Process::new(kernel_as(), root_domain());
 	let thread = Thread::new(entry, arg, process);
 	cpu_sched(cpu).inner.lock().run_queue.push_back(thread.clone());
+	if cpu != current_cpu_id() {
+		arch::apic::send_wake_ipi(crate::smp::lapic_id(cpu));
+	}
 	thread
 }
 
@@ -273,15 +297,37 @@ pub fn block_on(koid: u64, deadline: u64) {
 }
 
 // block_on with the periodic marker: a housekeeping deadline that never counts as
-// pending progress (see Waiter::periodic).
+// pending progress (see TimedWaiter::periodic).
 pub fn block_on_flagged(koid: u64, deadline: u64, periodic: bool) {
 	let thread = match current_thread() {
 		Some(t) => t,
 		None => return,
 	};
-	thread.set_state(ThreadState::Blocked);
-	WAITERS.lock().push(Waiter { thread, koid, deadline, periodic });
+	// Interrupts stay masked from arming to the switch: a timer preemption between
+	// the Blocked store and the park would requeue the thread as Ready and break a
+	// waker's claim. reschedule re-disables and, having captured the masked state,
+	// leaves interrupts off when the thread resumes; the original state is restored
+	// after the cleanup below.
+	let saved_if = arch::interrupts_enabled();
+	arch::disable_interrupts();
+	thread.begin_park();
+	// Register under the koid even when it is 0 (nothing will wake it by object):
+	// the bucket entry's Arc is what keeps a blocked thread alive off every run
+	// queue, deadline or not.
+	bucket_of(koid).lock().push(BucketWaiter { thread: thread.clone(), koid });
+	if deadline != NO_DEADLINE {
+		TIMED_WAITERS.lock().push(TimedWaiter { thread: thread.clone(), deadline, periodic });
+	}
 	reschedule(Disposition::Block);
+	// Woken and resumed: remove whatever entries this wait left behind (the waker
+	// removed only the one it claimed through).
+	bucket_of(koid).lock().retain(|w: &BucketWaiter| !Arc::ptr_eq(&w.thread, &thread));
+	if deadline != NO_DEADLINE {
+		TIMED_WAITERS.lock().retain(|w: &TimedWaiter| !Arc::ptr_eq(&w.thread, &thread));
+	}
+	if saved_if {
+		arch::enable_interrupts();
+	}
 }
 
 // Block the calling thread until ANY of `koids` becomes ready (or `deadline`
@@ -293,31 +339,43 @@ pub fn block_on_any(koids: &[u64], deadline: u64, periodic: bool) {
 		Some(t) => t,
 		None => return,
 	};
-	thread.set_state(ThreadState::Blocked);
-	{
-		let mut waiters = WAITERS.lock();
-		for &koid in koids {
-			waiters.push(Waiter { thread: thread.clone(), koid, deadline, periodic });
-		}
+	let saved_if = arch::interrupts_enabled();
+	arch::disable_interrupts();
+	thread.begin_park();
+	for &koid in koids {
+		bucket_of(koid).lock().push(BucketWaiter { thread: thread.clone(), koid });
+	}
+	if deadline != NO_DEADLINE {
+		TIMED_WAITERS.lock().push(TimedWaiter { thread: thread.clone(), deadline, periodic });
 	}
 	reschedule(Disposition::Block);
+	for &koid in koids {
+		bucket_of(koid).lock().retain(|w: &BucketWaiter| !Arc::ptr_eq(&w.thread, &thread));
+	}
+	if deadline != NO_DEADLINE {
+		TIMED_WAITERS.lock().retain(|w: &TimedWaiter| !Arc::ptr_eq(&w.thread, &thread));
+	}
+	if saved_if {
+		arch::enable_interrupts();
+	}
 }
 
-// Wake every thread blocked on object `koid`: remove it from the wait registry,
-// mark it Ready, and enqueue it on this core's run queue. A thread that waited on
-// several objects at once (`block_on_any`) has several registry entries; all of
-// them are removed when it wakes, so a later wake on another of its objects cannot
-// re-enqueue an already-running thread.
+// Wake every thread blocked on object `koid`: claim each matching waiter in the
+// object's bucket (the Blocked -> Ready compare-exchange - so a thread waiting on
+// several objects at once is enqueued exactly once even when they fire together),
+// remove the claimed entries, and enqueue the threads. Entries the thread left in
+// other buckets are removed by the thread itself when it resumes.
 pub fn wake_object(koid: u64) {
 	let woken = {
-		let mut waiters = WAITERS.lock();
+		let mut bucket = bucket_of(koid).lock();
 		let mut woken: Vec<Arc<Thread>> = Vec::new();
-		for w in waiters.iter() {
-			if w.koid == koid && !woken.iter().any(|t: &Arc<Thread>| Arc::ptr_eq(t, &w.thread)) {
+		bucket.retain(|w: &BucketWaiter| {
+			if w.koid == koid && w.thread.try_claim_wake() {
 				woken.push(w.thread.clone());
+				return false;
 			}
-		}
-		waiters.retain(|w: &Waiter| !woken.iter().any(|t: &Arc<Thread>| Arc::ptr_eq(t, &w.thread)));
+			true
+		});
 		woken
 	};
 	for thread in woken {
@@ -325,36 +383,33 @@ pub fn wake_object(koid: u64) {
 	}
 }
 
-// Wake one specific thread if it is currently blocked: remove all its wait-registry
-// entries and enqueue it. A no-op if the thread is not blocked (already running or
-// ready), so it cannot be double-enqueued. Signal delivery calls this for every
-// thread of the target process, so a blocked thread wakes and observes the kill /
-// stop / continue at its next scheduling point.
+// Wake one specific thread if it is currently blocked: claim and enqueue it. A
+// no-op if the thread is not blocked (already running or ready), so it cannot be
+// double-enqueued. Signal delivery calls this for every thread of the target
+// process, so a blocked thread wakes and observes the kill / stop / continue at
+// its next scheduling point. The thread's registry entries are removed by the
+// thread itself when it resumes.
 pub fn wake_thread(thread: &Arc<Thread>) {
-	let was_blocked = {
-		let mut waiters = WAITERS.lock();
-		let before = waiters.len();
-		waiters.retain(|w: &Waiter| !Arc::ptr_eq(&w.thread, thread));
-		waiters.len() != before
-	};
-	if was_blocked {
+	if thread.try_claim_wake() {
 		enqueue(thread.clone());
 	}
 }
 
 // Wake every blocked thread whose deadline has passed (timed out). Called at the
-// scheduler's idle points; with preemption (M19) the timer ISR will also call it.
+// scheduler's idle points and by the timer path. Scans only the timed list -
+// waits without a deadline (most service waits) never appear here.
 pub fn check_deadlines() {
 	let now = arch::apic::ticks();
 	let expired = {
-		let mut waiters = WAITERS.lock();
+		let mut timed = TIMED_WAITERS.lock();
 		let mut expired: Vec<Arc<Thread>> = Vec::new();
-		for w in waiters.iter() {
-			if w.deadline <= now && !expired.iter().any(|t: &Arc<Thread>| Arc::ptr_eq(t, &w.thread)) {
+		timed.retain(|w: &TimedWaiter| {
+			if w.deadline <= now && w.thread.try_claim_wake() {
 				expired.push(w.thread.clone());
+				return false;
 			}
-		}
-		waiters.retain(|w: &Waiter| !expired.iter().any(|t: &Arc<Thread>| Arc::ptr_eq(t, &w.thread)));
+			true
+		});
 		expired
 	};
 	for thread in expired {
@@ -367,11 +422,19 @@ pub fn check_deadlines() {
 // never keeps run_until_idle from settling. Expired periodic waits are still woken
 // by check_deadlines wherever the scheduler runs it.
 fn min_deadline() -> Option<u64> {
-	WAITERS.lock().iter().filter(|w: &&Waiter| !w.periodic).map(|w: &Waiter| w.deadline).filter(|d: &u64| *d != NO_DEADLINE).min()
+	TIMED_WAITERS.lock().iter().filter(|w: &&TimedWaiter| !w.periodic).map(|w: &TimedWaiter| w.deadline).min()
 }
 
 // Make a woken thread runnable again on the current core.
 fn enqueue(thread: Arc<Thread>) {
+	// A freshly claimed thread may still be completing its switch away: the block
+	// path zeroes the saved stack pointer before parking and the context switch
+	// writes the real value as its very first store. Wait for that store, so no
+	// core can ever switch into a half-parked thread. Bounded: the blocker runs
+	// its arm-to-switch sequence with interrupts masked, so it cannot stall.
+	while thread.kstack_ptr_load() == 0 {
+		core::hint::spin_loop();
+	}
 	thread.set_state(ThreadState::Ready);
 	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread);
 }

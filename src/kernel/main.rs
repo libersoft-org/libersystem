@@ -379,6 +379,18 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, mut spawn: 
 	false
 }
 
+// Serial receive interrupt: drain the UART FIFO into the console input the moment
+// bytes arrive, so typed input wakes the shell immediately instead of waiting for
+// the next 100 Hz idle-hook poll (the poll stays as a fallback and for the first-
+// prompt nudge). Runs on the BSP (the UART's legacy IRQ is routed there); the
+// channel send inside feed() wakes the shell's waiter on this same core.
+#[cfg(not(test))]
+fn serial_rx_interrupt(_vector: u8) {
+	while let Some(byte) = arch::serial::read_byte() {
+		console_input::feed(byte);
+	}
+}
+
 // Bring up the userspace system under SystemManager-crash recovery, then hand
 // control to the interactive shell. The kernel registers a crash-notify channel
 // and supervises SystemManager: if it faults before the system is up, the kernel
@@ -393,6 +405,12 @@ fn boot_userspace_with_recovery() {
 	// BSP would never reach console_shell_loop to poll the UART. The idle hook keeps
 	// serial input live regardless (the keyboard is interrupt-driven and unaffected).
 	sched::set_idle_hook(serial_console_pump);
+	// Serial input goes interrupt-driven: route the UART's legacy IRQ (COM1 = ISA
+	// IRQ 4) to the BSP and enable the receive interrupt, so a typed byte reaches
+	// the shell at once rather than on the next tick-quantized poll.
+	arch::interrupts::register(arch::interrupts::IRQ_BASE + 4, serial_rx_interrupt);
+	arch::ioapic::route(4, arch::interrupts::IRQ_BASE + 4, smp::lapic_id(0));
+	arch::serial::enable_rx_irq();
 	let (crash_tx, crash_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(crash_tx);
 	let mut kernel_ep: Option<Arc<object::channel::Channel>> = None;

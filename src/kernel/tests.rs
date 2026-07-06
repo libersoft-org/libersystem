@@ -1132,6 +1132,33 @@ fn a_cpu_bound_ring3_thread_is_preempted() {
 }
 
 #[test_case]
+fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
+	use core::sync::atomic::{AtomicU64, Ordering};
+	static RAN_AT: AtomicU64 = AtomicU64::new(0);
+	extern "C" fn stamp(_arg: u64) {
+		RAN_AT.store(arch::tsc::now().max(1), Ordering::SeqCst);
+	}
+	if smp::cpu_count() < 2 {
+		return;
+	}
+	// Without the wake IPI a halted AP only notices queued work on its next 100 Hz
+	// timer tick, so each spawn-to-run trip averages ~5 ms and the odds of five
+	// trips all finishing under the bound are below a percent. With the IPI the
+	// trip is microseconds, leaving generous headroom for host jitter.
+	const TRIP_BOUND_NS: u64 = 4_000_000;
+	for _ in 0..5 {
+		RAN_AT.store(0, Ordering::SeqCst);
+		let start = arch::tsc::now();
+		sched::spawn_on(1, stamp, 0);
+		while RAN_AT.load(Ordering::SeqCst) == 0 {
+			core::hint::spin_loop();
+		}
+		let elapsed = arch::tsc::cycles_to_ns(RAN_AT.load(Ordering::SeqCst).wrapping_sub(start));
+		assert!(elapsed < TRIP_BOUND_NS, "a remote spawn waited out the tick: the wake IPI did not reach the halted core");
+	}
+}
+
+#[test_case]
 fn scheduler_runs_across_cores() {
 	use core::sync::atomic::{AtomicU32, Ordering};
 	static CROSS: AtomicU32 = AtomicU32::new(0);

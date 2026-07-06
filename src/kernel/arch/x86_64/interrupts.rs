@@ -37,6 +37,12 @@ pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub const MSI_BASE: u8 = IRQ_BASE + IRQ_COUNT as u8; // 48
 pub const MSI_COUNT: usize = 192;
 
+// The cross-core wake IPI vector: sent by the scheduler when it enqueues work for a
+// core that may be halted in its idle loop. The interrupt itself is the message -
+// the handler only signals EOI; taking it bounces the target out of HLT, and its
+// idle loop then finds the queued thread.
+pub const WAKE_VECTOR: u8 = 0xf0;
+
 pub type HandlerFn = fn(u8);
 
 static HANDLERS: [AtomicUsize; IRQ_COUNT] = [const { AtomicUsize::new(0) }; IRQ_COUNT];
@@ -285,6 +291,13 @@ const MSI_STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); MSI_COUNT] = m
 // Spurious LAPIC interrupts must not signal EOI, so they bypass the dispatcher.
 extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {}
 
+// The cross-core wake IPI: the delivery itself is the whole message (it bounces a
+// halted core out of HLT so its idle loop re-checks the run queue), so the handler
+// only acknowledges it.
+extern "x86-interrupt" fn wake_ipi(_frame: InterruptStackFrame) {
+	apic::eoi();
+}
+
 // The LAPIC timer vector. Unlike the generic IRQ stubs it preempts: after counting
 // the tick and signalling EOI, it rotates to the next ready thread. EOI is sent
 // BEFORE the switch so the LAPIC keeps delivering ticks while this thread is
@@ -309,6 +322,8 @@ pub fn init() {
 	for (i, stub) in MSI_STUBS.iter().enumerate() {
 		idt::set_gate(MSI_BASE as usize + i, *stub);
 	}
+	// The cross-core wake IPI: delivery is the message, the handler only EOIs.
+	idt::set_gate(WAKE_VECTOR as usize, wake_ipi);
 	// Materialise the MSI-X table mapping region's page tables now, while the kernel
 	// PML4 is active and before any process address space is created, so later per-device
 	// mappings under it land in the shared kernel half and are visible everywhere.

@@ -145,6 +145,22 @@ impl Thread {
 		self.kstack_ptr.load(Ordering::Acquire)
 	}
 
+	// Prepare to block: zero the saved stack pointer (the not-yet-parked marker -
+	// the context switch writes the real value as its very first store) and mark
+	// the thread Blocked so a waker can claim it. Runs on the thread itself right
+	// before it deschedules, with interrupts masked from here to the switch.
+	pub fn begin_park(&self) {
+		self.kstack_ptr.store(0, Ordering::Release);
+		self.set_state(ThreadState::Blocked);
+	}
+
+	// Claim a blocked thread for waking: exactly one waker wins the Blocked ->
+	// Ready transition, so a thread waiting on several objects at once is enqueued
+	// exactly once no matter how many of them fire together on different cores.
+	pub fn try_claim_wake(&self) -> bool {
+		self.state.compare_exchange(ThreadState::Blocked as u32, ThreadState::Ready as u32, Ordering::AcqRel, Ordering::Acquire).is_ok()
+	}
+
 	// Address of the parked-syscall-stack slot, stored into by usermode::enter so
 	// the value follows this specific thread rather than the per-CPU block.
 	pub fn syscall_rsp_addr(&self) -> *mut u64 {

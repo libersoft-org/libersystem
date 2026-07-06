@@ -23,6 +23,8 @@ const APIC_BASE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const REG_ID: u32 = 0x20; // local APIC id (in bits 24-31)
 const REG_EOI: u32 = 0xb0;
 const REG_SVR: u32 = 0xf0; // spurious interrupt vector register
+const REG_ICR_LOW: u32 = 0x300; // interrupt command register (write low dword sends)
+const REG_ICR_HIGH: u32 = 0x310; // destination LAPIC id (in bits 24-31)
 const REG_LVT_TIMER: u32 = 0x320;
 const REG_TIMER_INITIAL: u32 = 0x380;
 const REG_TIMER_CURRENT: u32 = 0x390;
@@ -91,6 +93,20 @@ fn local_apic_id() -> u32 {
 // interrupt so further interrupts of equal or lower priority can be delivered.
 pub fn eoi() {
 	write(REG_EOI, 0);
+}
+
+// Send the wake IPI to `dest_lapic`: a fixed-delivery, edge-triggered interrupt on
+// the wake vector, whose only job is to bounce the target core out of its idle HALT
+// so it re-checks its run queue immediately instead of on its next timer tick.
+// xAPIC ICR: wait out any in-flight send (delivery-status bit 12), write the
+// destination to the high dword, then the low dword (vector + fixed delivery +
+// physical destination) - the low write sends.
+pub fn send_wake_ipi(dest_lapic: u32) {
+	while read(REG_ICR_LOW) & (1 << 12) != 0 {
+		core::hint::spin_loop();
+	}
+	write(REG_ICR_HIGH, dest_lapic << 24);
+	write(REG_ICR_LOW, super::interrupts::WAKE_VECTOR as u32);
 }
 
 // Number of timer ticks since the timer started.

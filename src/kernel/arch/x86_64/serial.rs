@@ -80,6 +80,15 @@ pub fn init() {
 	}
 }
 
+// Enable the receive-data-available interrupt (IER bit 0), so typed input raises
+// the UART's legacy IRQ instead of waiting for the next poll. Called once the
+// kernel has routed that IRQ; transmit stays poll-driven (the async ring).
+pub fn enable_rx_irq() {
+	unsafe {
+		outb(COM1 + 1, 0x01);
+	}
+}
+
 // Switch transmit to the asynchronous ring. Called once the scheduler is up, so the
 // timer tick and idle loop are draining the ring; until then writes go straight to
 // the wire (see `write_byte`).
