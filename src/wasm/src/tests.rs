@@ -517,3 +517,94 @@ fn rejects_an_out_of_range_branch() {
 	let mut inst: Instance = Instance::new(&m);
 	assert_eq!(inst.invoke("run", &[], &mut NoHost), Err(Trap("branch label out of range")));
 }
+
+// Build a module with a funcref table for the call_indirect tests. Two (i32)->i32
+// callees (add-one at slot 0, double at slot 1), an (i64)->i64 callee at slot 2 (whose
+// signature does not match the call site), and slot 3 left null (the table's declared
+// minimum is 4, but the element segment fills only slots 0..2). The exported `run(sel)`
+// calls `table[sel]` with the argument 10 through type 0 ((i32)->i32), so it round-trips
+// for a matching callee and traps for a mismatch, a null entry, or an out-of-range index.
+fn indirect_module() -> Vec<u8> {
+	let mut out: Vec<u8> = Vec::new();
+	out.extend_from_slice(b"\0asm");
+	out.extend_from_slice(&[1, 0, 0, 0]);
+	// types: 0 = (i32)->i32, 1 = (i64)->i64.
+	let mut types: Vec<u8> = leb(2);
+	types.extend_from_slice(&[0x60, 0x01, I32, 0x01, I32]);
+	types.extend_from_slice(&[0x60, 0x01, I64, 0x01, I64]);
+	out.extend_from_slice(&section(1, &types));
+	// funcs: add_one(type 0), double(type 0), wrong(type 1), run(type 0).
+	let mut funcs: Vec<u8> = leb(4);
+	funcs.extend_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+	out.extend_from_slice(&section(3, &funcs));
+	// table: one funcref table, minimum 4 (no maximum).
+	let mut table: Vec<u8> = leb(1);
+	table.extend_from_slice(&[0x70, 0x00]);
+	table.extend_from_slice(&leb(4));
+	out.extend_from_slice(&section(4, &table));
+	// export "run" = function 3.
+	let mut exports: Vec<u8> = leb(1);
+	exports.extend_from_slice(&name("run"));
+	exports.push(0x00);
+	exports.extend_from_slice(&leb(3));
+	out.extend_from_slice(&section(7, &exports));
+	// element: active, table 0, offset 0, functions [0, 1, 2] (slot 3 stays null).
+	let mut elem: Vec<u8> = leb(1);
+	elem.push(0x00); // flags: active, table 0, a vector of function indices
+	elem.push(0x41); // i32.const offset
+	elem.extend_from_slice(&sleb(0));
+	elem.push(0x0b); // end of the offset expression
+	elem.extend_from_slice(&leb(3));
+	elem.extend_from_slice(&leb(0));
+	elem.extend_from_slice(&leb(1));
+	elem.extend_from_slice(&leb(2));
+	out.extend_from_slice(&section(9, &elem));
+	// code: the four bodies (no locals beyond the parameters).
+	let bodies: [&[u8]; 4] = [
+		&[0x20, 0x00, 0x41, 0x01, 0x6a, 0x0b],             // add_one: local.get 0; i32.const 1; i32.add
+		&[0x20, 0x00, 0x20, 0x00, 0x6a, 0x0b],             // double: local.get 0; local.get 0; i32.add
+		&[0x20, 0x00, 0x0b],                               // wrong: local.get 0 (returns its i64 argument)
+		&[0x41, 0x0a, 0x20, 0x00, 0x11, 0x00, 0x00, 0x0b], // run: i32.const 10; local.get 0; call_indirect type 0 table 0
+	];
+	let mut code: Vec<u8> = leb(4);
+	for b in bodies {
+		let mut entry: Vec<u8> = leb(0);
+		entry.extend_from_slice(b);
+		code.extend_from_slice(&leb(entry.len() as u32));
+		code.extend_from_slice(&entry);
+	}
+	out.extend_from_slice(&section(10, &code));
+	out
+}
+
+#[test]
+fn call_indirect_dispatches_through_the_table() {
+	// The function-pointer / trait-object round trip: `run(sel)` invokes table[sel](10).
+	// Slot 0 is add-one, slot 1 is double - what a Rust component's indirect call compiles
+	// to and the one gap a real toolchain-built component hits first.
+	let wasm: Vec<u8> = indirect_module();
+	let m: Module = parse(&wasm).unwrap();
+	let mut inst: Instance = Instance::new(&m);
+	assert_eq!(inst.invoke("run", &[Value::I32(0)], &mut NoHost).unwrap(), alloc::vec![Value::I32(11)]);
+	assert_eq!(inst.invoke("run", &[Value::I32(1)], &mut NoHost).unwrap(), alloc::vec![Value::I32(20)]);
+}
+
+#[test]
+fn call_indirect_traps_on_a_signature_mismatch() {
+	// Slot 2 holds an (i64)->i64 callee, but the call site expects (i32)->i32: the runtime
+	// type-checks the table entry against the expected signature at call time and traps.
+	let wasm: Vec<u8> = indirect_module();
+	let m: Module = parse(&wasm).unwrap();
+	let mut inst: Instance = Instance::new(&m);
+	assert_eq!(inst.invoke("run", &[Value::I32(2)], &mut NoHost), Err(Trap("call_indirect: signature mismatch")));
+}
+
+#[test]
+fn call_indirect_traps_on_a_null_or_out_of_range_entry() {
+	// Slot 3 was never filled (a null entry), and slot 4 is past the table's end - both trap.
+	let wasm: Vec<u8> = indirect_module();
+	let m: Module = parse(&wasm).unwrap();
+	let mut inst: Instance = Instance::new(&m);
+	assert_eq!(inst.invoke("run", &[Value::I32(3)], &mut NoHost), Err(Trap("call_indirect: null table entry")));
+	assert_eq!(inst.invoke("run", &[Value::I32(4)], &mut NoHost), Err(Trap("call_indirect: table index out of bounds")));
+}

@@ -1,10 +1,10 @@
 // The WebAssembly binary parser: it reads the module preamble and the sections the
-// runtime needs (types, imports, functions, memory, exports, code) into a
-// [`Module`]. Unknown or unsupported sections (custom, tables, globals, data, ...)
-// are skipped by their declared size, so a module may carry them as long as the
-// runtime does not need them.
+// runtime needs (types, imports, functions, tables, memory, globals, exports,
+// elements, code, data) into a [`Module`]. Unknown or unsupported sections (custom,
+// start, ...) are skipped by their declared size, so a module may carry them as long
+// as the runtime does not need them.
 
-use crate::module::{DataSegment, Export, ExportKind, Func, FuncType, Global, Import, Module, ValType};
+use crate::module::{DataSegment, Element, Export, ExportKind, Func, FuncType, Global, Import, Module, Table, ValType};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -118,9 +118,11 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
 			1 => parse_types(&mut r, &mut m)?,
 			2 => parse_imports(&mut r, &mut m)?,
 			3 => parse_functions(&mut r, &mut m)?,
+			4 => parse_tables(&mut r, &mut m)?,
 			5 => parse_memory(&mut r, &mut m)?,
 			6 => parse_globals(&mut r, &mut m)?,
 			7 => parse_exports(&mut r, &mut m)?,
+			9 => parse_elements(&mut r, &mut m)?,
 			10 => parse_code(&mut r, &mut m)?,
 			11 => parse_data(&mut r, &mut m)?,
 			_ => r.pos = end, // skip a section the runtime does not need
@@ -191,6 +193,67 @@ fn parse_memory(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 			let _max: u32 = r.u32()?; // a maximum is allowed but unused
 		}
 		m.memory_min_pages = min;
+	}
+	Ok(())
+}
+
+// Parse the table section: at most one `funcref` table, its minimum and optional
+// maximum entry count. The table is the array `call_indirect` dispatches through; its
+// entries are filled by the element section.
+fn parse_tables(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
+	let count: u32 = r.u32()?;
+	if count > 1 {
+		return Err(ParseError("at most one table is supported"));
+	}
+	if count == 1 {
+		if r.byte()? != 0x70 {
+			return Err(ParseError("only funcref tables are supported"));
+		}
+		let flags: u8 = r.byte()?;
+		let min: u32 = r.u32()?;
+		let max: Option<u32> = if flags & 0x01 != 0 { Some(r.u32()?) } else { None };
+		m.table = Some(Table { min, max });
+	}
+	Ok(())
+}
+
+// Parse the element section: the active segments that fill the table with function
+// indices at instantiation. Only active segments into table 0 are supported (flags 0
+// and 2, the forms a Rust/LLVM toolchain emits); passive and declarative segments and
+// expression-initialized (`ref.func`) forms are rejected.
+fn parse_elements(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
+	let count: u32 = r.u32()?;
+	for _ in 0..count {
+		let flags: u32 = r.u32()?;
+		match flags {
+			0 => {
+				// active, table 0: an offset expression, then a vector of function indices.
+				let offset: u32 = const_expr(r)? as u32;
+				let n: usize = r.u32()? as usize;
+				let mut funcs: Vec<u32> = Vec::with_capacity(n);
+				for _ in 0..n {
+					funcs.push(r.u32()?);
+				}
+				m.elements.push(Element { offset, funcs });
+			}
+			2 => {
+				// active with an explicit table index (must be 0) and an element-kind byte.
+				if r.u32()? != 0 {
+					return Err(ParseError("only table 0 is supported"));
+				}
+				let offset: u32 = const_expr(r)? as u32;
+				if r.byte()? != 0x00 {
+					return Err(ParseError("only the funcref element kind is supported"));
+				}
+				let n: usize = r.u32()? as usize;
+				let mut funcs: Vec<u32> = Vec::with_capacity(n);
+				for _ in 0..n {
+					funcs.push(r.u32()?);
+				}
+				m.elements.push(Element { offset, funcs });
+			}
+			_ => return Err(ParseError("only active element segments into table 0 are supported")),
+		}
 	}
 	Ok(())
 }

@@ -76,6 +76,24 @@ pub struct DataSegment {
 	pub bytes: Vec<u8>,
 }
 
+// The single function table's limits. `funcref` is the only element type the runtime
+// supports; `call_indirect` reads the table, while table.get / set / grow are out of
+// scope for the minimal host.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Table {
+	pub min: u32,
+	pub max: Option<u32>,
+}
+
+// An active element segment: the function indices written into the table starting at
+// `offset` when the module is instantiated, filling the entries `call_indirect`
+// dispatches through. Passive and declarative segments are out of scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Element {
+	pub offset: u32,
+	pub funcs: Vec<u32>,
+}
+
 // A parsed module. `memory_min_pages` is the declared minimum of the single memory
 // (0 if the module declares none); one page is 64 kB.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -87,6 +105,8 @@ pub struct Module {
 	pub memory_min_pages: u32,
 	pub globals: Vec<Global>,
 	pub data: Vec<DataSegment>,
+	pub table: Option<Table>,
+	pub elements: Vec<Element>,
 }
 
 impl Module {

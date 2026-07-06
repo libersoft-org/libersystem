@@ -90,12 +90,14 @@ struct Frame {
 }
 
 // An instantiated module: the parsed module, its decoded function bodies, its
-// linear memory, and its globals.
+// linear memory, its globals, and its function table (the array call_indirect
+// dispatches through).
 pub struct Instance<'a> {
 	module: &'a Module,
 	code: Vec<Vec<Instr>>,
 	memory: Vec<u8>,
 	globals: Vec<Value>,
+	table: Vec<Option<u32>>,
 	error: Option<Trap>,
 }
 
@@ -139,7 +141,21 @@ impl<'a> Instance<'a> {
 			}
 		}
 
-		Instance { module, code, memory, globals, error }
+		// build the function table from its declared minimum and the active element
+		// segments: a Vec of function indices where None is a null entry (call_indirect
+		// traps on it). Sized to the larger of the declared minimum and the highest write.
+		let mut table_len: usize = module.table.as_ref().map(|t| t.min as usize).unwrap_or(0);
+		for e in &module.elements {
+			table_len = table_len.max(e.offset as usize + e.funcs.len());
+		}
+		let mut table: Vec<Option<u32>> = alloc::vec![None; table_len];
+		for e in &module.elements {
+			for (j, &f) in e.funcs.iter().enumerate() {
+				table[e.offset as usize + j] = Some(f);
+			}
+		}
+
+		Instance { module, code, memory, globals, table, error }
 	}
 
 	// The instance's linear memory (e.g. to read back what a component wrote).
@@ -154,14 +170,14 @@ impl<'a> Instance<'a> {
 			return Err(t);
 		}
 		let index: u32 = self.module.export_func(name).ok_or(Trap("no such exported function"))?;
-		let Instance { module, code, memory, globals, .. } = self;
-		call(module, code, memory, globals, index, args, host)
+		let Instance { module, code, memory, globals, table, .. } = self;
+		call(module, code, memory, globals, table, index, args, host)
 	}
 }
 
 // Call function `index` (in the combined imports-then-defined space). Imports go to
 // the host; defined functions run their decoded body on a fresh frame.
-fn call(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mut [Value], index: u32, args: &[Value], host: &mut dyn Host) -> Result<Vec<Value>, Trap> {
+fn call(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mut [Value], table: &[Option<u32>], index: u32, args: &[Value], host: &mut dyn Host) -> Result<Vec<Value>, Trap> {
 	if index < module.import_count() {
 		return host.call_import(index, args, memory);
 	}
@@ -184,7 +200,7 @@ fn call(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 		});
 	}
 	let mut stack: Vec<Value> = Vec::new();
-	exec(module, code, memory, globals, body, &mut locals, &mut stack, host)?;
+	exec(module, code, memory, globals, table, body, &mut locals, &mut stack, host)?;
 	let n: usize = ftype.results.len();
 	if stack.len() < n {
 		return Err(Trap("missing results at return"));
@@ -195,7 +211,7 @@ fn call(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 // Execute a decoded function body, mutating `locals`, `stack`, `memory`, and
 // `globals`. Returns when the body falls off its end, hits `return`, or branches to
 // the function-level label; the caller takes the result values off the stack.
-fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mut [Value], body: &[Instr], locals: &mut [Value], stack: &mut Vec<Value>, host: &mut dyn Host) -> Result<(), Trap> {
+fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mut [Value], table: &[Option<u32>], body: &[Instr], locals: &mut [Value], stack: &mut Vec<Value>, host: &mut dyn Host) -> Result<(), Trap> {
 	let mut ctrl: Vec<Frame> = Vec::new();
 	let mut pc: usize = 0;
 	while pc < body.len() {
@@ -255,10 +271,31 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 					return Err(Trap("stack underflow at call"));
 				}
 				let call_args: Vec<Value> = stack.split_off(stack.len() - nargs);
-				let results: Vec<Value> = call(module, code, memory, globals, *f, &call_args, host)?;
+				let results: Vec<Value> = call(module, code, memory, globals, table, *f, &call_args, host)?;
 				stack.extend(results);
 			}
-			Instr::CallIndirect(_) => return Err(Trap("call_indirect is unsupported")),
+			Instr::CallIndirect(type_idx) => {
+				// the operand is the table index; the immediate is the signature the call
+				// site expects. Trap on an out-of-bounds index, a null entry, or a callee
+				// whose actual signature does not match the expected one (the spec semantics).
+				let entry: i32 = pop(stack)?.as_i32();
+				if entry < 0 || entry as usize >= table.len() {
+					return Err(Trap("call_indirect: table index out of bounds"));
+				}
+				let target: u32 = table[entry as usize].ok_or(Trap("call_indirect: null table entry"))?;
+				let expected = module.types.get(*type_idx as usize).ok_or(Trap("call_indirect: unknown type"))?;
+				let actual = module.func_type(target).ok_or(Trap("call_indirect: unknown target function"))?;
+				if actual != expected {
+					return Err(Trap("call_indirect: signature mismatch"));
+				}
+				let nargs: usize = expected.params.len();
+				if stack.len() < nargs {
+					return Err(Trap("stack underflow at call_indirect"));
+				}
+				let call_args: Vec<Value> = stack.split_off(stack.len() - nargs);
+				let results: Vec<Value> = call(module, code, memory, globals, table, target, &call_args, host)?;
+				stack.extend(results);
+			}
 			Instr::Drop => {
 				pop(stack)?;
 			}
