@@ -19,6 +19,8 @@
 #   boot/lab.py log [-f | <pattern>] show / follow / grep the serial log
 #   boot/lab.py key <text>           type through the emulated keyboard (HID path)
 #   boot/lab.py monitor <command...> one QEMU monitor command, print the reply
+#   boot/lab.py usb-attach           hot-plug the USB mass-storage stick at runtime
+#   boot/lab.py usb-detach           hot-unplug the USB stick at runtime
 #   boot/lab.py pcap <on|off|dump>   capture guest network traffic and decode it
 #   boot/lab.py test                 run the kernel test suite, summarize
 #   boot/lab.py shot <path>          screenshot the framebuffer (screenshot.sh)
@@ -46,6 +48,8 @@ Usage (via `just lab ...` from src/, or boot/lab.py directly):
   log [-f | <pattern>]  show / follow / grep the serial log
   key <text>            type through the emulated keyboard (the HID path)
   monitor <command...>  one QEMU monitor command, print the reply
+  usb-attach            hot-plug the USB mass-storage stick at runtime
+  usb-detach            hot-unplug the USB stick at runtime
   pcap <on|off|dump>    capture guest network traffic and decode it
   test                  run the kernel test suite, summarize
   shot <path>           screenshot the framebuffer
@@ -61,6 +65,7 @@ QEMU_LOG = os.path.join(BUILD, 'lab-qemu.log')
 MON_SOCK = os.path.join(BUILD, 'qemu-monitor.sock')
 PCAP = os.path.join(BUILD, 'lab.pcap')
 VOLUME_IMG = os.path.join(BUILD, 'virtio-blk.img')
+USB_IMG = os.path.join(BUILD, 'usb-media.img')
 
 ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
 PROMPT = re.compile(rb'vol://[^\r\n]*> ?$')
@@ -309,6 +314,25 @@ def cmd_monitor(args):
 		print(output)
 
 
+def cmd_usb_attach(args):
+	# Hot-plug the USB mass-storage stick onto the xHCI bus at runtime. The xhci driver
+	# watches port-status-change events and enumerates the new device, DeviceManager binds
+	# the storage role, and a StorageService instance mounts it as vol://usb - the runtime
+	# counterpart of the boot-time enumeration. Re-add the block backend first (a detach
+	# removes it); its output is ignored so an already-present drive is harmless.
+	monitor_command(f'drive_add 0 file={USB_IMG},if=none,id=vusb,format=raw')
+	output = monitor_command('device_add usb-storage,bus=usb.0,drive=vusb,id=usbstick')
+	print(output or 'lab: usb attached')
+
+
+def cmd_usb_detach(args):
+	# Hot-unplug the USB stick: the xhci driver sees the port disconnect, disables the
+	# port's slots, drops the storage state (vol://usb unmounts) and prints "port
+	# detached" - without wedging the standing StorageService instance.
+	output = monitor_command('device_del usbstick')
+	print(output or 'lab: usb detached')
+
+
 def cmd_pcap(args):
 	action = args[0] if args else 'dump'
 	if action == 'on':
@@ -439,7 +463,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit}
 
 
 def main():

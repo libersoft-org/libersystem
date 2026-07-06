@@ -510,6 +510,13 @@ impl Stack {
 		out
 	}
 
+	// The count of live (in-use) TCP connections in the pool - what `network.capacity`
+	// reports as the connection utilization. The pool grows on demand, so this is a
+	// live count, never a fraction of a fixed cap.
+	pub fn conn_used(&self) -> usize {
+		self.conns.iter().filter(|c| c.in_use).count()
+	}
+
 	// Parse one received Ethernet frame, update the neighbor cache, and write an
 	// optional reply frame to `out`. Any malformed or unhandled frame yields no reply.
 	pub fn on_frame(&mut self, frame: &[u8], out: &mut [u8]) -> Outcome {

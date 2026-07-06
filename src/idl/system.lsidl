@@ -307,6 +307,17 @@ record net-info {
 	neighbors: list<neighbor>,
 }
 
+// The NetworkService pool utilization: how many client, socket and listener channels
+// the serve loop currently stands on, and how many live TCP connections the stack holds.
+// Every pool grows on demand (the domain's handle budget is the only ceiling), so these
+// are the live counts `ss` reports and the graph folds in - observability, not a cap.
+record net-capacity {
+	clients:     u32,
+	sockets:     u32,
+	listeners:   u32,
+	connections: u32,
+}
+
 // The outcome of a ping: a reply arrived, it timed out, or the target was
 // unreachable (no route / no ARP).
 enum ping-status {
@@ -366,6 +377,7 @@ interface network {
 	@op(7) listen:  func(port: u16) -> result<handle<channel>, error>;
 	@op(8) sockets: func() -> result<list<sock-info>, error>;
 	@op(9) sntp:    func(server: ipv4-addr) -> result<u64, error>;
+	@op(10) capacity: func() -> result<net-capacity, error>;
 }
 
 // A connected TCP socket, served on the channel `network.connect` hands back as a

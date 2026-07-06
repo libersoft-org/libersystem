@@ -25,7 +25,7 @@ use rt::*;
 
 use crate::net::{DHCP_ACK, DHCP_NAK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, NEIGH_MAX, SockEntry, SockEntryState, Stack, TCP_SEGMENT_OVERHEAD};
 use proto::codec::Buffer;
-use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest, config, listener, network, socket};
+use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetCapacity, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest, config, listener, network, socket};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -336,8 +336,12 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClo
 						let client_room: bool = true;
 						let sock_room: bool = true;
 						let listener_room: bool = true;
+						// the live pool utilization, for the `capacity` reply (observability).
+						let clients_used: u32 = clients.iter().filter(|&&c| c != 0).count() as u32;
+						let sockets_used: u32 = socks.iter().filter(|s| s.chan != 0).count() as u32;
+						let listeners_used: u32 = listeners.iter().filter(|l| l.chan != 0).count() as u32;
 						{
-							let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], new_sock: &mut new_sock, new_sock_ci: &mut new_sock_ci, new_client: &mut new_client, new_listener: &mut new_listener, new_listener_port: &mut new_listener_port, sock_room, client_room, listener_room };
+							let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], new_sock: &mut new_sock, new_sock_ci: &mut new_sock_ci, new_client: &mut new_client, new_listener: &mut new_listener, new_listener_port: &mut new_listener_port, sock_room, client_room, listener_room, clients_used, sockets_used, listeners_used };
 							let mut reply_handle: u64 = 0;
 							if let Some(n2) = network::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
 								send_blocking(chan, &out[..n2], reply_handle);
@@ -555,6 +559,12 @@ struct Net<'a> {
 	sock_room: bool,
 	client_room: bool,
 	listener_room: bool,
+	// The live pool utilization the serve loop snapshots before each request: how many
+	// client, socket and listener channels it currently stands on. Reported by
+	// `capacity` (the TCP connection count comes from the stack).
+	clients_used: u32,
+	sockets_used: u32,
+	listeners_used: u32,
 }
 
 // Convert the stack's internal address to the wire (canonical) form, and back.
@@ -589,6 +599,14 @@ impl network::Service for Net<'_> {
 			i += 1;
 		}
 		Ok(NetInfo { addr: to_wire(self.stack.ip()), mac: self.stack.mac().0.to_vec(), mtu: self.stack.mtu(), gateway: to_wire(self.stack.gateway()), neighbors })
+	}
+
+	// The live pool utilization: the client, socket and listener channels the serve loop
+	// stands on, and the stack's live TCP connections. Every pool grows on demand (the
+	// domain's handle budget is the only ceiling), so these are observability counts -
+	// what `ss` prints and the graph folds in - not a fraction of a fixed cap.
+	fn capacity(&mut self) -> Result<NetCapacity, Error> {
+		Ok(NetCapacity { clients: self.clients_used, sockets: self.sockets_used, listeners: self.listeners_used, connections: self.stack.conn_used() as u32 })
 	}
 
 	// Resolve a name to an address via the DNS client.

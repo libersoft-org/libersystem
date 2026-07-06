@@ -181,7 +181,7 @@ fi
 if [[ "${TEST:-0}" == "1" || -z "${USB_HOST:-}" ]]; then
 	QEMU_ARGS+=(
 		-drive "file=$USB_DISK,if=none,id=vusb,format=raw"
-		-device usb-storage,bus=usb.0,drive=vusb
+		-device usb-storage,bus=usb.0,drive=vusb,id=usbstick
 	)
 fi
 # The second virtio-blk disk (FAT vol://media), discovered after the system disk; only

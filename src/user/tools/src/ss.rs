@@ -40,34 +40,52 @@ unsafe fn show(netsvc: u64) {
 			Some(Ok(socks)) => {
 				if socks.is_empty() {
 					print(b"ss: no sockets\n");
-					return;
-				}
-				print(b"State     Local            Peer\n");
-				for s in &socks {
-					let mut line: [u8; 80] = [0u8; 80];
-					let mut pos: usize = 0;
-					pos = put(&mut line, pos, state_label(s.state));
-					pos = pad_col(&mut line, pos, 10);
-					line[pos] = b':';
-					pos += 1;
-					pos += write_u16(s.local_port, &mut line[pos..]);
-					pos = pad_col(&mut line, pos, 27);
-					match s.state {
-						SockState::Listen => pos = put(&mut line, pos, b"*"),
-						_ => {
-							pos += s.remote.addr.render(&mut line[pos..]);
-							line[pos] = b':';
-							pos += 1;
-							pos += write_u16(s.remote.port, &mut line[pos..]);
+				} else {
+					print(b"State     Local            Peer\n");
+					for s in &socks {
+						let mut line: [u8; 80] = [0u8; 80];
+						let mut pos: usize = 0;
+						pos = put(&mut line, pos, state_label(s.state));
+						pos = pad_col(&mut line, pos, 10);
+						line[pos] = b':';
+						pos += 1;
+						pos += write_u16(s.local_port, &mut line[pos..]);
+						pos = pad_col(&mut line, pos, 27);
+						match s.state {
+							SockState::Listen => pos = put(&mut line, pos, b"*"),
+							_ => {
+								pos += s.remote.addr.render(&mut line[pos..]);
+								line[pos] = b':';
+								pos += 1;
+								pos += write_u16(s.remote.port, &mut line[pos..]);
+							}
 						}
+						line[pos] = b'\n';
+						pos += 1;
+						print(&line[..pos]);
 					}
-					line[pos] = b'\n';
-					pos += 1;
-					print(&line[..pos]);
 				}
 			}
 			Some(Err(_)) => print(b"ss: network error\n"),
 			None => print(b"ss: service unavailable\n"),
+		}
+		// The pool utilization footer (M110): the client, socket and listener channels the
+		// service currently stands on, and its live TCP connections. Every set grows on
+		// demand, so these are live counts against the domain's handle budget, not a cap.
+		if let Some(Ok(cap)) = client.capacity() {
+			let mut line: [u8; 96] = [0u8; 96];
+			let mut pos: usize = 0;
+			pos = put(&mut line, pos, b"channels: clients ");
+			pos += write_u16(cap.clients as u16, &mut line[pos..]);
+			pos = put(&mut line, pos, b", sockets ");
+			pos += write_u16(cap.sockets as u16, &mut line[pos..]);
+			pos = put(&mut line, pos, b", listeners ");
+			pos += write_u16(cap.listeners as u16, &mut line[pos..]);
+			pos = put(&mut line, pos, b"; connections ");
+			pos += write_u16(cap.connections as u16, &mut line[pos..]);
+			line[pos] = b'\n';
+			pos += 1;
+			print(&line[..pos]);
 		}
 	}
 }

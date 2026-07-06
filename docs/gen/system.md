@@ -208,6 +208,15 @@ An opaque kernel object, transferred as `handle<task>`.
 | `gateway` | `ipv4-addr` |
 | `neighbors` | `list<neighbor>` |
 
+### record `net-capacity`
+
+| field | type |
+| --- | --- |
+| `clients` | `u32` |
+| `sockets` | `u32` |
+| `listeners` | `u32` |
+| `connections` | `u32` |
+
 ### enum `ping-status`
 
 | case | ordinal |
@@ -515,6 +524,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | 7 | `listen` | `listen(port: u16) -> result<handle<channel>, error>` |
 | 8 | `sockets` | `sockets() -> result<list<sock-info>, error>` |
 | 9 | `sntp` | `sntp(server: ipv4-addr) -> result<u64, error>` |
+| 10 | `capacity` | `capacity() -> result<net-capacity, error>` |
 
 ### interface `socket`
 
