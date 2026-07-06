@@ -24,8 +24,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use proto::codec::{json_escape, JsonMode};
-use proto::system::{network, Ipv4Addr, PingReply, PingStatus};
+use proto::codec::{JsonMode, json_escape};
+use proto::system::{Ipv4Addr, PingReply, PingStatus, network};
 use rt::*;
 
 // The representation ping renders its results in. Extend with further codecs (e.g.

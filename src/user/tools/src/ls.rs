@@ -16,6 +16,8 @@
 //                 except u; default -s aa)
 //   -u UNIT       size unit - b raw bytes, k|m|g|t|p|e|z|y one fixed unit (kB through
 //                 YB), h the largest fitting unit (default -u b)
+//   json          render the listing as a JSON array of file-info records (indented
+//                 and colored; json-min for the minified machine form)
 //
 // A standalone command, not a shell built-in: it reaches the filesystem only through the
 // one capability the permission store granted it, and renders on the same terminal as the
@@ -28,6 +30,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use proto::codec::JsonMode;
 use proto::path;
 use proto::system::{FileInfo, FileKind, Timestamp, volume};
 use rt::*;
@@ -52,12 +55,13 @@ enum Unit {
 	Fixed(u32, &'static str),
 }
 
-const USAGE: &[u8] = b"usage: ls [-s KEY[a|d]] [-u UNIT] [path]
+const USAGE: &[u8] = b"usage: ls [-s KEY[a|d]] [-u UNIT] [json | json-min] [path]
   -s  sort key: u unsorted, a alphabet, e extension, s size,
       c creation time, m modification time; append a or d for
       ascending or descending (default: -s aa)
   -u  size unit: b bytes, k m g t p e z y a fixed unit (kB..YB),
       h the largest fitting unit (default: -u b)
+  json / json-min  a JSON array of the entries (pretty / minified)
 ";
 
 #[unsafe(no_mangle)]
@@ -76,6 +80,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut key: SortKey = SortKey::Name;
 		let mut reverse: bool = false;
 		let mut unit: Unit = Unit::Bytes;
+		let mut mode: Option<JsonMode> = None;
 		let mut arg: Vec<u8> = Vec::new();
 		let mut want_unit: bool = false;
 		let mut want_sort: bool = false;
@@ -105,6 +110,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			match token {
 				b"-u" => want_unit = true,
 				b"-s" => want_sort = true,
+				b"json" | b"json-min" => mode = JsonMode::parse(token),
 				_ if token.starts_with(b"-u") && token.len() > 2 => {
 					unit = match parse_unit(&token[2..]) {
 						Some(u) => u,
@@ -161,7 +167,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		// route the path to the client for the volume it names.
 		let storage: u64 = path::volume_client(cwd_str, &arg, system, media, iso, udf, usb);
-		ls(storage, uri.as_bytes(), key, reverse, unit);
+		ls(storage, uri.as_bytes(), key, reverse, unit, mode);
 	}
 	exit();
 }
@@ -208,7 +214,7 @@ fn parse_sort(token: &[u8]) -> Option<(SortKey, bool)> {
 // by the chosen key (directories grouped first, ties broken by name), one aligned row per
 // entry (name, size, modification time) and a closing summary - reporting a concise error
 // if it cannot be listed.
-unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit) {
+unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, mode: Option<JsonMode>) {
 	unsafe {
 		let path: &str = match core::str::from_utf8(uri) {
 			Ok(s) => s,
@@ -227,6 +233,24 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit) 
 				return;
 			}
 		};
+		// JSON: an array of the entries' generated records, in the chosen order (the
+		// sort applies like in the text form; the sizes stay raw bytes - units are a
+		// text-rendering concern).
+		if let Some(mode) = mode {
+			let mut files: Vec<FileInfo> = drain_stream(consumer, volume::list_read);
+			sort_files(&mut files, key, reverse);
+			let mut out = String::from("[");
+			for (i, f) in files.iter().enumerate() {
+				if i > 0 {
+					out.push(',');
+				}
+				out.push_str(&f.to_json());
+			}
+			out.push(']');
+			print(mode.render(out).as_bytes());
+			print(b"\n");
+			return;
+		}
 		if key == SortKey::None {
 			// unsorted: render each entry as its frame arrives, so a huge listing
 			// starts printing immediately (per-row widths - global column alignment
@@ -252,28 +276,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit) 
 			return;
 		}
 		let mut files: Vec<FileInfo> = drain_stream(consumer, volume::list_read);
-		// directories first under every key but `u`, then the chosen key (ascending unless
-		// the `d` suffix asked otherwise), ties broken by name so equal keys stay in a
-		// stable, readable order.
-		files.sort_by(|a: &FileInfo, b: &FileInfo| {
-			let dir_first = (b.kind == FileKind::Dir).cmp(&(a.kind == FileKind::Dir));
-			if dir_first != core::cmp::Ordering::Equal {
-				return dir_first;
-			}
-			let by_key = match key {
-				SortKey::Ext => extension(&a.name).cmp(extension(&b.name)),
-				SortKey::Size => a.size.cmp(&b.size),
-				SortKey::Mtime => a.mtime.cmp(&b.mtime),
-				SortKey::Ctime => a.ctime.cmp(&b.ctime),
-				_ => core::cmp::Ordering::Equal,
-			};
-			let by_key = if reverse { by_key.reverse() } else { by_key };
-			if by_key != core::cmp::Ordering::Equal {
-				return by_key;
-			}
-			let by_name = a.name.cmp(&b.name);
-			if key == SortKey::Name && reverse { by_name.reverse() } else { by_name }
-		});
+		sort_files(&mut files, key, reverse);
 		print(uri);
 		print(b":\n");
 		// column widths: the display name (a directory carries a trailing '/') and the
@@ -298,6 +301,34 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit) 
 		}
 		summary(dirs, plain, total, unit);
 	}
+}
+
+// Order the entries: directories first under every key but `u`, then the chosen key
+// (ascending unless the `d` suffix asked otherwise), ties broken by name so equal
+// keys stay in a stable, readable order.
+fn sort_files(files: &mut [FileInfo], key: SortKey, reverse: bool) {
+	if key == SortKey::None {
+		return;
+	}
+	files.sort_by(|a: &FileInfo, b: &FileInfo| {
+		let dir_first = (b.kind == FileKind::Dir).cmp(&(a.kind == FileKind::Dir));
+		if dir_first != core::cmp::Ordering::Equal {
+			return dir_first;
+		}
+		let by_key = match key {
+			SortKey::Ext => extension(&a.name).cmp(extension(&b.name)),
+			SortKey::Size => a.size.cmp(&b.size),
+			SortKey::Mtime => a.mtime.cmp(&b.mtime),
+			SortKey::Ctime => a.ctime.cmp(&b.ctime),
+			_ => core::cmp::Ordering::Equal,
+		};
+		let by_key = if reverse { by_key.reverse() } else { by_key };
+		if by_key != core::cmp::Ordering::Equal {
+			return by_key;
+		}
+		let by_name = a.name.cmp(&b.name);
+		if key == SortKey::Name && reverse { by_name.reverse() } else { by_name }
+	});
 }
 
 // Print one listing row (padded to the given column widths), counting it into the
