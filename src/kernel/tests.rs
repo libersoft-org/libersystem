@@ -2253,6 +2253,32 @@ fn spawn_service_with_package(name: &[u8]) -> (alloc::sync::Arc<object::channel:
 	(boot_kernel, service_client)
 }
 
+// A managed service that cannot complete a required bootstrap step reports the failing
+// step and the reason over its bootstrap channel before exiting, so the supervisor
+// records why it went down instead of seeing an unexplained peer-close. DeviceManager
+// needs the init package before it reports in; hand it a plain message where the package
+// should be and it reports the failure honestly rather than dying silently.
+#[test_case]
+fn a_service_reports_a_bootstrap_failure() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let init = init_package_bytes().expect("init package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let device_elf = package.lookup(b"device_manager").expect("device_manager in the init package");
+	let (boot_kernel, boot_user) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), device_elf, boot_user, Rights::ALL, 0).expect("spawn device_manager");
+	// Where the "PACKAGE" grant should be, hand it a plain message with no transferred
+	// object: recv_package rejects it and the service reports the failing step.
+	boot_kernel.send(Message::new(b"NOTAPACKAGE".to_vec(), alloc::vec::Vec::new(), 0)).expect("bogus bootstrap");
+
+	sched::run_until_idle();
+
+	let report = boot_kernel.recv().expect("a bootstrap failure report");
+	assert!(report.bytes.starts_with(b"BOOTFAIL"), "reports the failing step, not a silent exit");
+	assert!(report.bytes.windows(7).any(|w| w == b"package"), "the report names the failing step");
+}
+
 // Little-endian field readers for decoding the proto reply bytes in the tests.
 fn le_u16(b: &[u8], off: usize) -> u16 {
 	u16::from_le_bytes(b[off..off + 2].try_into().unwrap())

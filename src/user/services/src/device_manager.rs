@@ -36,8 +36,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	unsafe {
 		// 1. receive the init package shared buffer (to spawn drivers from) and map it.
-		let (_pkg_handle, archive): (u64, &[u8]) = recv_package(bootstrap, &mut buf).unwrap_or_else(|| exit());
-		let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
+		let (_pkg_handle, archive): (u64, &[u8]) = recv_package(bootstrap, &mut buf).unwrap_or_else(|| fail_bootstrap(bootstrap, b"package", b"init package not delivered"));
+		let package: Package = Package::parse(archive).unwrap_or_else(|| fail_bootstrap(bootstrap, b"package", b"init package malformed"));
 
 		// 2. phase 1: launch the bootstrap block driver (virtio_blk) for each disk it backs.
 		//    It hands back a block-read service channel, which we route up to ServiceManager

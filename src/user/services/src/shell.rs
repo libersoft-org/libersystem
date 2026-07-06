@@ -41,7 +41,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    are not taken and close with the set.
 	let mut caps: CapSet = unsafe { recv_caps(bootstrap) };
 	let storage: u64 = match caps.take(CAP_STORAGE) {
-		0 => exit(),
+		0 => unsafe { fail_bootstrap(bootstrap, b"storage", b"required capability not granted") },
 		h => h,
 	};
 	let media: u64 = caps.take(CAP_MEDIA);
@@ -49,11 +49,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let udf: u64 = caps.take(CAP_UDF);
 	let usb: u64 = caps.take(CAP_USB);
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
-		0 => exit(),
+		0 => unsafe { fail_bootstrap(bootstrap, b"process", b"required capability not granted") },
 		h => h,
 	};
 	let netsvc: u64 = match caps.take(CAP_NET) {
-		0 => exit(),
+		0 => unsafe { fail_bootstrap(bootstrap, b"net", b"required capability not granted") },
 		h => h,
 	};
 	let inputsvc: u64 = caps.take(CAP_INPUT);
@@ -68,7 +68,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// via stdout) and reads its keystrokes from it. The userspace terminal renders the
 	// output and forwards the input, so the shell talks to the console, not the kernel.
 	let console: u64 = match caps.take(CAP_CONSOLE) {
-		0 => exit(),
+		0 => unsafe { fail_bootstrap(bootstrap, b"console", b"required capability not granted") },
 		h => h,
 	};
 	set_stdout(console);
@@ -76,7 +76,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// job on it (SET_FG / CLEAR_FG) so the tty signals it on Ctrl+C / Ctrl+Z / Ctrl+\,
 	// and learns of a Ctrl+Z suspend (JOB_STOPPED) so it can background the job.
 	let control: u64 = match caps.take(CAP_CONTROL) {
-		0 => exit(),
+		0 => unsafe { fail_bootstrap(bootstrap, b"control", b"required capability not granted") },
 		h => h,
 	};
 	drop(caps);

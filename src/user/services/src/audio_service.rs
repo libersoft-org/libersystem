@@ -19,8 +19,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::Error;
 use proto::system::audio::{self, Service};
+use proto::system::Error;
 use rt::*;
 
 // The PCM format the virtio-snd driver expects: 48 kHz, 2 channels, signed 16-bit,
@@ -55,9 +55,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    sound device is present) and the channel clients reach us on.
 		let snd: u64 = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, handle } if len >= 3 && &buf[..3] == b"SND" => handle,
-			_ => exit(),
+			_ => fail_bootstrap(bootstrap, b"snd", b"driver channel not delivered"),
 		};
-		let service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| exit());
+		let service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
 
 		// 2. report in (with or without a device), then serve beep() until the client
 		//    side closes.
@@ -89,7 +89,15 @@ unsafe fn play_tone(snd: u64, freq: u16, millis: u32) -> Result<(), Error> {
 			// fill one period; the final, short one is padded with silence.
 			for f in 0..PERIOD_FRAMES {
 				let g: u32 = frame + f;
-				let sample: i16 = if g < total_frames { if (g / half) % 2 == 0 { AMP } else { -AMP } } else { 0 };
+				let sample: i16 = if g < total_frames {
+					if (g / half) % 2 == 0 {
+						AMP
+					} else {
+						-AMP
+					}
+				} else {
+					0
+				};
 				let le: [u8; 2] = sample.to_le_bytes();
 				let off: usize = f as usize * 4;
 				period[off] = le[0];

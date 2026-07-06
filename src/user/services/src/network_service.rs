@@ -23,9 +23,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use rt::*;
 
-use crate::net::{DHCP_ACK, DHCP_NAK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, NEIGH_MAX, SockEntry, SockEntryState, Stack, TCP_SEGMENT_OVERHEAD};
+use crate::net::{Event, Ipv4Addr, MacAddr, SockEntry, SockEntryState, Stack, DHCP_ACK, DHCP_NAK, DHCP_OFFER, NEIGH_MAX, TCP_SEGMENT_OVERHEAD};
 use proto::codec::Buffer;
-use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest, config, listener, network, socket};
+use proto::system::{config, listener, network, socket, Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -113,12 +113,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    config tree serves this boot - a test scenario), and the client channel
 		//    the shell reaches us on (the `ip` / `ping` / `nslookup` control
 		//    protocol).
-		let frames: u64 = recv_tagged(bootstrap, &mut buf, b"FRAMES").unwrap_or_else(|| exit());
+		let frames: u64 = recv_tagged(bootstrap, &mut buf, b"FRAMES").unwrap_or_else(|| fail_bootstrap(bootstrap, b"frames", b"driver frame channel not delivered"));
 		let config: u64 = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, handle } if len >= 6 && &buf[..6] == b"CONFIG" => handle,
-			_ => exit(),
+			_ => fail_bootstrap(bootstrap, b"config", b"config client not delivered"),
 		};
-		let client: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| exit());
+		let client: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
 		// 2. the frame-mover driver leads with our NIC's MAC and the link's MTU over
 		//    the frame channel (it owns the device; we own the protocol), so we can
 		//    build the stack - its neighbor-cache sized by the config tree's
@@ -129,7 +129,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				let link: usize = if len >= 11 { u16::from_le_bytes([buf[9], buf[10]]) as usize } else { DEFAULT_MTU };
 				(MacAddr([buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]]), if link == 0 { DEFAULT_MTU } else { link })
 			}
-			_ => exit(),
+			_ => fail_bootstrap(bootstrap, b"driver", b"NIC did not report its MAC"),
 		};
 		let (neigh_cap, mtu_knob): (usize, usize) = net_policy(config);
 		let mtu: usize = mtu_knob.min(link_mtu);

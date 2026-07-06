@@ -362,7 +362,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut caps: CapSet = recv_caps(bootstrap);
 		let required = |h: u64| -> u64 {
 			if h == 0 {
-				exit();
+				fail_bootstrap(bootstrap, b"capability", b"required console capability not granted")
 			}
 			h
 		};

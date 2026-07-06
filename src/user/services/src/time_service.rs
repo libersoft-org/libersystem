@@ -21,7 +21,7 @@
 extern crate alloc;
 
 use proto::system::time::{self, Service};
-use proto::system::{Error, Timestamp, network};
+use proto::system::{network, Error, Timestamp};
 use rt::*;
 
 // The LAPIC monotonic clock runs at 100 Hz (ticks per second).
@@ -61,8 +61,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		// 1. receive our NetworkService client (for the SNTP query) and the channel
 		//    clients reach us on.
-		let netsvc: u64 = recv_tagged(bootstrap, &mut buf, b"NET").unwrap_or_else(|| exit());
-		let service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| exit());
+		let netsvc: u64 = recv_tagged(bootstrap, &mut buf, b"NET").unwrap_or_else(|| fail_bootstrap(bootstrap, b"net", b"network client not delivered"));
+		let service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
 
 		// 2. seed the offset from the hardware RTC (an immediate, network-free UTC).
 		let mut time = Time { epoch_at_tick0: 0 };

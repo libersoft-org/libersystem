@@ -555,6 +555,12 @@ pub unsafe fn channel_with_depth(depth: u64) -> Option<(u64, u64)> {
 // does not get.
 pub const BOOTSTRAP_READY: &[u8] = b"READY";
 
+// The bootstrap failure report tag: a child that cannot complete a bootstrap step
+// sends this - the failing step and the reason - on its bootstrap channel before it
+// exits, so the supervisor records why it went down instead of seeing an unexplained
+// peer-close. Read by ServiceManager in place of the service's "online" report.
+pub const BOOTSTRAP_FAILURE: &[u8] = b"BOOTFAIL";
+
 // The capability tags of the CapSet bootstrap handshakes, shared by both ends so the
 // granting side (ServiceManager's bootstrap sequence) and the receiving side (the
 // service's recv_caps / CapSet::take) name each capability through one symbol and
@@ -651,6 +657,26 @@ pub unsafe fn recv_caps(bootstrap: u64) -> CapSet {
 // terminator arrives.
 pub unsafe fn send_ready(bootstrap: u64) -> bool {
 	unsafe { send_blocking(bootstrap, BOOTSTRAP_READY, 0) }
+}
+
+// Report a failed bootstrap step and terminate: send BOOTSTRAP_FAILURE with the failing
+// step and the reason (rendered as `step: reason`) on the bootstrap channel, then exit.
+// A service calls this in place of a bare exit() when a required capability or archive is
+// missing, so the supervisor logs the reason and folds it into the service's status
+// instead of recording a silent peer-close.
+pub unsafe fn fail_bootstrap(bootstrap: u64, step: &[u8], reason: &[u8]) -> ! {
+	unsafe {
+		let mut buf: [u8; 128] = [0u8; 128];
+		let mut n: usize = 0;
+		let parts: [&[u8]; 5] = [BOOTSTRAP_FAILURE, b" ", step, b": ", reason];
+		for part in parts {
+			let copy: usize = part.len().min(buf.len() - n);
+			buf[n..n + copy].copy_from_slice(&part[..copy]);
+			n += copy;
+		}
+		send_blocking(bootstrap, &buf[..n], 0);
+	}
+	exit();
 }
 
 // Receive one message and, if its payload begins with `tag` and it carried a

@@ -175,15 +175,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 1. receive the init package (to launch the governed component from), then the serve
 	//    channel clients reach us on.
-	let (_pkg_handle, archive): (u64, &[u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| exit());
-	let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
-	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
+	let (_pkg_handle, archive): (u64, &[u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"package", b"init package not delivered") });
+	let package: Package = Package::parse(archive).unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"package", b"init package malformed") });
+	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") });
 
 	// 2. create the bounded sub-Domain that hosts the governed component. It starts
 	//    uncapped; govern() sets and adjusts its memory budget around the probe.
 	let domain: i64 = unsafe { domain_create(u64::MAX, u64::MAX, u64::MAX) };
 	if domain < 0 {
-		exit();
+		unsafe { fail_bootstrap(bootstrap, b"domain", b"could not create governed sub-domain") }
 	}
 	let domain: u64 = domain as u64;
 

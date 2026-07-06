@@ -21,8 +21,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::PointerEvent;
 use proto::system::input;
+use proto::system::PointerEvent;
 use rt::*;
 
 // The default text-cell grid the normalized pointer position maps onto: the boot
@@ -89,14 +89,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 1. the serve channel clients reach us on, and the raw pointer-event channels the
 	//    pointer drivers feed us ("INPUT" = the virtio pointer, "INPUT2" = the xhci
 	//    driver's USB pointer; a handle is 0 when that source is absent).
-	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
+	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") });
 	let raw: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if len >= 5 && &buf[..5] == b"INPUT" => handle,
-		_ => exit(),
+		_ => unsafe { fail_bootstrap(bootstrap, b"input", b"pointer channel not delivered") },
 	};
 	let raw2: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if len >= 6 && &buf[..6] == b"INPUT2" => handle,
-		_ => exit(),
+		_ => unsafe { fail_bootstrap(bootstrap, b"input2", b"usb pointer channel not delivered") },
 	};
 	// ConsoleService's pointer sink: we forward every raw event to it so it can drive
 	// selection, scrollback, and mouse reports (handle 0 = no console this boot).

@@ -46,7 +46,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::system::permission::{self, Service};
-use proto::system::{AuditEntry, Capability, Error, Manifest, StartResult, process};
+use proto::system::{process, AuditEntry, Capability, Error, Manifest, StartResult};
 use rt::*;
 
 // The governed component this milestone launches, and the rights a granted client is
@@ -563,12 +563,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// `perm` command thus reaches the very audit trail this manager serves over a connection of
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
-	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| exit());
+	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection") });
 	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb };
-	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| exit());
+	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"process", b"process client not delivered") });
 
 	// 2. wait for the serve channel clients reach us on.
-	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
+	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") });
 
 	// 3. launch each governed component under its manifest, accumulating one shared audit
 	//    trail: sandbox_probe (granted storage + log, denied the rest) reads its one file and

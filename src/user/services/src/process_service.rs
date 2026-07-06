@@ -140,8 +140,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 
 	// 1. receive the init package shared buffer (the bring-up fallback source) and map it.
-	let (_pkg_handle, archive): (u64, &[u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| exit());
-	let package: Package = Package::parse(archive).unwrap_or_else(|| exit());
+	let (_pkg_handle, archive): (u64, &[u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"package", b"init package not delivered") });
+	let package: Package = Package::parse(archive).unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"package", b"init package malformed") });
 
 	// 2. receive the StorageService client the on-disk binaries are loaded through. A 0
 	//    handle (no client wired, e.g. an isolated bring-up) leaves us loading from the
@@ -149,7 +149,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or(0);
 
 	// 3. wait for the serve channel clients reach us on.
-	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
+	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") });
 
 	// 4. report in to the supervisor that started us.
 	unsafe {

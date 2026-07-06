@@ -124,6 +124,7 @@ enum Failure {
 	Crashed,
 	Hung,
 	Stopped,
+	Bootstrap,
 }
 
 impl Failure {
@@ -133,6 +134,7 @@ impl Failure {
 			Failure::Crashed => b"crashed",
 			Failure::Hung => b"hung",
 			Failure::Stopped => b"stopped",
+			Failure::Bootstrap => b"bootstrap failed",
 		}
 	}
 }
@@ -194,6 +196,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// handed a read-only duplicate of every component it observes (the live data source
 	// for that component's graph node).
 	let mut procs: [u64; N] = [0u64; N];
+	// The reason each service that failed to bootstrap gave for going down - the failing
+	// step and error it reported over its bootstrap channel before exiting (or a note that
+	// it closed without reporting). Empty for a service that came up. Surfaced in the log
+	// and the supervisor status view, so a failure is explained rather than silent.
+	let mut failure_reason: [String; N] = core::array::from_fn(|_| String::new());
 	let mut storage_client: u64 = 0;
 	let mut block_client: u64 = 0;
 	let mut block2_client: u64 = 0;
@@ -272,7 +279,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut snd_client, &mut audio_client, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut input_client, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -322,6 +329,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    the transition is recorded in the journal like the startup events. A production
 	//    boot skips the exercise and leaves DeviceManager running.
 	let mut sup: [Supervised; N] = [Supervised::new(); N];
+	// Fold any bring-up failure into the supervisor's status: a service that reported a
+	// bootstrap failure (or closed without reporting) is Failed with its reason already in
+	// `failure_reason`, so `lssvc` and the System Graph show why rather than a bare "failed".
+	for idx in 0..N {
+		if state[idx] == State::Failed {
+			sup[idx].failure = Failure::Bootstrap;
+		}
+	}
 	if selftest {
 		if let Some(dev) = index_of(b"device_manager") {
 			if state[dev] == State::Running {
@@ -405,7 +420,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    (reverse-dependency teardown), or SystemGraphService querying the supervisor state.
 	//    No timer stands here, so the loop sleeps at ~0% CPU until an event arrives.
 	unsafe {
-		supervise(&mut state, &mut channels, &mut sup, &procs, &package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, stats_server, stats_server2, &driver_state, log_client, bootstrap, park, &mut buf);
+		supervise(&mut state, &mut channels, &mut sup, &failure_reason, &procs, &package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, stats_server, stats_server2, &driver_state, log_client, bootstrap, park, &mut buf);
 	}
 	exit();
 }
@@ -534,7 +549,7 @@ unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, buf: &mut [u8]) -> State {
+unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -621,6 +636,16 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		}
 		match recv_blocking(manager_side, buf) {
 			Received::Message { len, handle } => {
+				// A service that could not complete a bootstrap step reports the failing step
+				// and the reason (BOOTSTRAP_FAILURE) in place of its "online" report: record it
+				// so the supervisor status and the journal explain the failure, instead of the
+				// supervisor seeing an unexplained peer-close.
+				if len >= BOOTSTRAP_FAILURE.len() && &buf[..BOOTSTRAP_FAILURE.len()] == BOOTSTRAP_FAILURE {
+					let start: usize = (BOOTSTRAP_FAILURE.len() + 1).min(len);
+					*failure_out = String::from_utf8_lossy(&buf[start..len]).into_owned();
+					emit_event(*log_client, name, failure_out.as_bytes());
+					return State::Failed;
+				}
 				// DeviceManager hands its block-read service channel up with its report;
 				// keep it so StorageService can be bootstrapped against the disk.
 				if name == b"device_manager" {
@@ -681,7 +706,13 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 				}
 				State::Running
 			}
-			Received::Closed => State::Failed,
+			Received::Closed => {
+				// The service closed its bootstrap channel without reporting - it crashed during
+				// bring-up before it could send a failure report. Record that so the status view
+				// still carries a reason rather than a bare "failed".
+				*failure_out = String::from("bootstrap channel closed without a report");
+				State::Failed
+			}
 		}
 	}
 }
@@ -1552,7 +1583,7 @@ unsafe fn sleep_ticks(park: u64, ticks: u64) {
 // wait set so its dead channel does not busy-loop); an admin message drives a reverse-
 // dependency stop; a stats request is answered over the `supervisor` interface. Returns
 // when nothing is left to watch.
-unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], package: &Package, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, up: u64, park: u64, buf: &mut [u8]) {
+unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &[u64; N], package: &Package, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, up: u64, park: u64, buf: &mut [u8]) {
 	unsafe {
 		let mut admin: u64 = admin_server;
 		let mut admin2: u64 = admin_server2;
@@ -1639,7 +1670,7 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 				}
 				3 => {
 					// SystemGraphService queried the supervisor state; answer one request.
-					if !serve_stats_once(stats, state, sup, canary_sup, drivers, buf) {
+					if !serve_stats_once(stats, state, sup, reason, canary_sup, drivers, buf) {
 						stats = 0;
 					}
 				}
@@ -1653,7 +1684,7 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 				_ => {
 					// The sandboxed `lssvc` tool (granted the services capability) queried the
 					// supervisor state over its own status channel; answer one request.
-					if !serve_stats_once(stats2, state, sup, canary_sup, drivers, buf) {
+					if !serve_stats_once(stats2, state, sup, reason, canary_sup, drivers, buf) {
 						stats2 = 0;
 					}
 				}
@@ -1804,13 +1835,13 @@ fn index_of_dep(j: usize, i: usize) -> bool {
 // restarts, watchdog trips, last failure for each manifest service, the canary, and
 // each driver), and reply over the `supervisor` interface. Returns false once the
 // channel's peer is gone, so the supervisor drops it from its wait set.
-unsafe fn serve_stats_once(stats: u64, state: &[State; N], sup: &[Supervised; N], canary_sup: &Supervised, drivers: &[(&'static [u8], bool)], buf: &mut [u8]) -> bool {
+unsafe fn serve_stats_once(stats: u64, state: &[State; N], sup: &[Supervised; N], reason: &[String; N], canary_sup: &Supervised, drivers: &[(&'static [u8], bool)], buf: &mut [u8]) -> bool {
 	unsafe {
 		let (len, handle): (usize, u64) = match recv_blocking(stats, buf) {
 			Received::Message { len, handle } => (len, handle),
 			Received::Closed => return false,
 		};
-		let mut api = StatsApi { state, sup, canary_sup, drivers };
+		let mut api = StatsApi { state, sup, reason, canary_sup, drivers };
 		let mut reply: [u8; 4096] = [0u8; 4096];
 		let mut reply_handle: u64 = 0;
 		if let Some(n) = supervisor::dispatch(&mut api, &buf[..len], handle, &mut reply, &mut reply_handle) {
@@ -1834,6 +1865,7 @@ fn state_name(state: State) -> &'static str {
 struct StatsApi<'a> {
 	state: &'a [State; N],
 	sup: &'a [Supervised; N],
+	reason: &'a [String; N],
 	canary_sup: &'a Supervised,
 	drivers: &'a [(&'static [u8], bool)],
 }
@@ -1843,7 +1875,11 @@ impl<'a> supervisor::Service for StatsApi<'a> {
 		let mut out: Vec<SupervisorStat> = Vec::new();
 		let mut i: usize = 0;
 		while i < N {
-			out.push(SupervisorStat { name: String::from_utf8_lossy(MANIFEST[i].name).into_owned(), state: String::from(state_name(self.state[i])), restarts: self.sup[i].restarts, watchdog_trips: self.sup[i].watchdog_trips, last_failure: String::from_utf8_lossy(self.sup[i].failure.as_bytes()).into_owned() });
+			// A service that failed to bootstrap carries the reason it reported (the failing
+			// step and error); a still-standing service has none, so fall back to the failure
+			// class (crashed / hung / stopped) the supervisor last recorded.
+			let last_failure: String = if self.reason[i].is_empty() { String::from_utf8_lossy(self.sup[i].failure.as_bytes()).into_owned() } else { self.reason[i].clone() };
+			out.push(SupervisorStat { name: String::from_utf8_lossy(MANIFEST[i].name).into_owned(), state: String::from(state_name(self.state[i])), restarts: self.sup[i].restarts, watchdog_trips: self.sup[i].watchdog_trips, last_failure });
 			i += 1;
 		}
 		out.push(SupervisorStat { name: String::from("watchdog_probe"), state: String::from("running"), restarts: self.canary_sup.restarts, watchdog_trips: self.canary_sup.watchdog_trips, last_failure: String::from_utf8_lossy(self.canary_sup.failure.as_bytes()).into_owned() });
