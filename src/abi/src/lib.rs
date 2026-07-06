@@ -11,6 +11,16 @@
 #![no_std]
 #![allow(dead_code)]
 
+// The ABI revision this crate defines: the version the kernel and every userspace
+// binary agree on. Bump it whenever the ABI changes in a way an old binary would
+// misread - a grown or reordered struct, a changed argument meaning. New syscalls
+// only ever append (a higher SYS_ number) and old ones never renumber, so appending a
+// call does NOT require a bump; a binary carrying an older version simply never issues
+// the newer call. A starting process reports the version it was built against through
+// SYS_ABI_CHECK, and the kernel refuses a mismatch (ERR_ABI_MISMATCH) so a binary built
+// against a different revision is stopped at startup instead of misbehaving.
+pub const ABI_VERSION: u32 = 1;
+
 // The canonical structured-log record type and its representations (text, JSON,
 // CBOR), shared by emitters, LogService, and the kernel.
 pub mod log;
@@ -138,6 +148,10 @@ pub const SYS_PCI_INFO: u64 = 58;
 // queue is empty and the peer is gone), so a receiver can size its buffer exactly
 // instead of guessing a ceiling.
 pub const SYS_CHANNEL_PEEK: u64 = 59;
+// Report the ABI revision the caller was built against (a0 = its abi::ABI_VERSION); the
+// kernel returns 0 on a match and ERR_ABI_MISMATCH otherwise. The runtime issues it as
+// its first syscall, so a binary built against a different ABI is refused before it runs.
+pub const SYS_ABI_CHECK: u64 = 60;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;
@@ -393,6 +407,10 @@ pub const ERR_WOULD_BLOCK: i64 = -8;
 pub const ERR_PEER_CLOSED: i64 = -9;
 pub const ERR_RESOURCE_EXHAUSTED: i64 = -10;
 pub const ERR_TIMED_OUT: i64 = -11;
+// The caller was built against a different ABI revision than the kernel implements
+// (SYS_ABI_CHECK): the runtime refuses to run rather than issue calls against a
+// mismatched syscall table or struct layout.
+pub const ERR_ABI_MISMATCH: i64 = -12;
 
 // True if a syscall return value encodes an error (the reserved band [-4095, -1]).
 // A higher-half kernel address has its top bit set and so is never mistaken for

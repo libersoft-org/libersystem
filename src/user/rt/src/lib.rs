@@ -30,9 +30,35 @@ pub use abi::*;
 mod heap;
 
 // ELF entry: the kernel drops us into ring 3 here with the bootstrap channel
-// handle in rdi. Align the stack to the SysV ABI boundary, then call the Rust
-// entry the program defines (keeping the bootstrap handle in rdi).
-global_asm!(".text", ".global _start", "_start:", "and rsp, -16", "call __user_main", "ud2");
+// handle in rdi. Align the stack to the SysV ABI boundary, then call the runtime
+// entry (keeping the bootstrap handle in rdi).
+global_asm!(".text", ".global _start", "_start:", "and rsp, -16", "call __rt_start", "ud2");
+
+// The runtime entry the assembly stub calls: verify the kernel's ABI matches the one
+// this binary was built against, then hand control to the program's `__user_main` with
+// the bootstrap handle still in rdi.
+//
+// The ABI handshake (M108): a binary built against a different kernel ABI - a renumbered
+// syscall, a grown struct - is refused here, before it issues a single call against a
+// mismatched table, instead of running on and misbehaving. New syscalls only ever append
+// and old ones never renumber, so SYS_ABI_CHECK and this comparison stay valid across
+// revisions; a match is silent, a mismatch prints a clear line and exits.
+#[unsafe(no_mangle)]
+pub extern "C" fn __rt_start(bootstrap: u64) -> ! {
+	unsafe {
+		if sys_is_err(syscall(SYS_ABI_CHECK, ABI_VERSION as u64, 0, 0, 0)) {
+			print(b"rt: refusing to run - built against a different kernel ABI revision\n");
+			exit();
+		}
+		__user_main(bootstrap)
+	}
+}
+
+unsafe extern "C" {
+	// Each program defines this (a `#[no_mangle] pub extern "C" fn __user_main`); the
+	// runtime's `__rt_start` calls it once the ABI handshake passes.
+	fn __user_main(bootstrap: u64) -> !;
+}
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {

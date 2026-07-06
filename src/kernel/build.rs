@@ -115,10 +115,11 @@ fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 }
 
 // Read a userspace ELF and strip its symbol and debug sections, returning the smaller
-// loadable image staged onto the system volume (the on-disk copies are executed by the
-// loader, which needs only the program image, while the init package keeps the full debug
-// ELFs). Returns None if the ELF is absent (the build still succeeds - the program is
-// simply not staged) or if no `strip` tool is available.
+// loadable image (both archives execute only the program image, so the symbol and debug
+// sections are dead weight - on the volume they bloat the seed archive, in the init
+// package they bloat the kernel binary and boot memory). Returns None if the ELF is
+// absent (the build still succeeds - the program is simply not staged) or if no `strip`
+// tool is available.
 fn read_stripped(path: &Path) -> Option<Vec<u8>> {
 	if !path.exists() {
 		return None;
@@ -172,9 +173,14 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	let mut entries: Vec<(&str, Vec<u8>)> = Vec::new();
 	for (name, path) in &sources {
 		println!("cargo:rerun-if-changed={}", path.display());
-		match fs::read(path) {
-			Ok(bytes) => entries.push((name.as_str(), bytes)),
-			Err(_) => println!("cargo:warning={name} ELF not found at {} - omitting from init package (run `just user` or `just build`)", path.display()),
+		// Strip the pinned ELF to its loadable image, the same as the volume package -
+		// the loader executes only the program image, so the symbol and debug sections are
+		// dead weight in the kernel binary and boot memory. Fall back to the raw ELF when
+		// no `strip` tool is available, so the boot set is never dropped; an absent ELF is
+		// skipped with a warning (the kernel handles it gracefully at runtime).
+		match read_stripped(path).or_else(|| fs::read(path).ok()) {
+			Some(bytes) => entries.push((name.as_str(), bytes)),
+			None => println!("cargo:warning={name} ELF not found at {} - omitting from init package (run `just user` or `just build`)", path.display()),
 		}
 	}
 
@@ -220,8 +226,8 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	// M61 box 7: also stage the tool and non-bootstrap driver ELFs onto the system volume
 	// under bin/ and drivers/, so they can later be loaded from there. They are stripped
 	// of symbol/debug sections (the on-disk copies are executed by the loader, which needs
-	// only the program image; the init package keeps the full debug ELFs), keeping the
-	// seed archive to a few megabytes. A missing or unstrippable ELF is skipped.
+	// only the program image), keeping the seed archive to a few megabytes. A missing or
+	// unstrippable ELF is skipped.
 	for row in read_manifest(&manifest) {
 		let dest: String = match row.kind.as_str() {
 			"tool" => format!("bin/{}", row.name),

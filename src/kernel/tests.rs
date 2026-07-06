@@ -1305,6 +1305,22 @@ fn syscall_roundtrip_stateless() {
 }
 
 #[test_case]
+fn abi_check_accepts_the_matching_revision_and_refuses_a_mismatch() {
+	// SYS_ABI_CHECK is the runtime's first syscall: a starting binary reports the ABI
+	// revision it was built against, and the kernel refuses a mismatch so it never runs
+	// against a renumbered call or a grown struct. Stateless, so it round-trips from the
+	// idle context.
+	unsafe {
+		let ok = arch::syscall::invoke(syscall::SYS_ABI_CHECK, syscall::ABI_VERSION as u64, 0, 0, 0);
+		assert_eq!(ok, 0, "the kernel's own ABI revision is accepted");
+		assert!(!syscall::sys_is_err(ok));
+		let mismatch = arch::syscall::invoke(syscall::SYS_ABI_CHECK, syscall::ABI_VERSION as u64 + 1, 0, 0, 0);
+		assert_eq!(mismatch as i64, syscall::ERR_ABI_MISMATCH, "a different ABI revision is refused");
+		assert!(syscall::sys_is_err(mismatch));
+	}
+}
+
+#[test_case]
 fn syscall_object_and_handle_ops() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
