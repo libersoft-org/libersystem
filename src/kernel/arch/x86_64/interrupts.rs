@@ -210,6 +210,10 @@ pub fn register(vector: u8, handler: HandlerFn) {
 
 // Common interrupt path: invoke the registered handler (if any), then EOI.
 fn dispatch(vector: u8) {
+	// A gate does not clear EFLAGS.AC: drop any user-set (or interrupted-window)
+	// AC so the handler runs with SMAP enforced; iretq restores the interrupted
+	// context's own AC.
+	super::paging::clac_on_entry();
 	let index = (vector - IRQ_BASE) as usize;
 	let raw = HANDLERS[index].load(Ordering::SeqCst);
 	if raw != 0 {
@@ -226,6 +230,7 @@ fn dispatch(vector: u8) {
 // MSI dispatch: edge-triggered, so just wake the bound driver and EOI - no
 // mask/unmask dance (there is no shared level line to gate, unlike the INTx path).
 fn dispatch_msi(vector: u8) {
+	super::paging::clac_on_entry();
 	let index = (vector - MSI_BASE) as usize;
 	if let Some(intr) = MSI_BOUND[index].lock().as_ref().and_then(Weak::upgrade) {
 		intr.signal();
@@ -306,6 +311,10 @@ extern "x86-interrupt" fn wake_ipi(_frame: InterruptStackFrame) {
 // usermode::enter), so the switch travels with the thread; the CPL is passed down
 // so a killed process spinning in ring 3 can be retired at its next tick.
 extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
+	// The timer is the one entry that context-switches: without this, an AC set by
+	// the interrupted context (ring-3 code may set it freely) would leak into the
+	// next thread's kernel execution, suspending SMAP there.
+	super::paging::clac_on_entry();
 	apic::on_timer_tick();
 	apic::eoi();
 	crate::sched::on_timer_preempt(frame.code_segment & 3 == 3);

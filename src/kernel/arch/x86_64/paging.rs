@@ -30,6 +30,13 @@ const ENTRY_COUNT: usize = 512;
 // bit violation - the mapping is then executable, matching the hardware's best.
 static NX_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+// Whether CR4.SMAP / CR4.SMEP are enforced (CPUID-gated, like NX). SMAP makes a
+// plain kernel access to a USER-mapped page fault; the sanctioned copy paths open
+// an explicit window with `user_access`. SMEP makes a ring-0 instruction fetch
+// from a USER-mapped page fault unconditionally.
+static SMAP_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SMEP_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 // Enable no-execute enforcement on the current core: check the NX capability
 // (CPUID 0x8000_0001, EDX bit 20) and set EFER.NXE. Must run on every core (EFER
 // is per-core) BEFORE any page carrying NO_EXECUTE is touched - the BSP calls it
@@ -44,6 +51,87 @@ pub fn enable_nx() {
 	let efer = super::msr::read(IA32_EFER);
 	super::msr::write(IA32_EFER, efer | EFER_NXE);
 	NX_ENABLED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+// Enable supervisor-mode access/execution prevention on the current core: check
+// the capabilities (CPUID leaf 7, EBX bit 7 = SMEP, bit 20 = SMAP) and set the
+// CR4 bits. CR4 is per-core, so - like enable_nx - the BSP calls it at init and
+// every AP in its own bring-up. From here on, a kernel dereference of a user
+// pointer outside a `user_access` window page-faults instead of silently reading
+// or writing user memory, and a ring-0 jump into user memory always faults.
+pub fn enable_smap_smep() {
+	const CR4_SMEP: u64 = 1 << 20;
+	const CR4_SMAP: u64 = 1 << 21;
+	let features = core::arch::x86_64::__cpuid_count(7, 0).ebx;
+	let smep = features & (1 << 7) != 0;
+	let smap = features & (1 << 20) != 0;
+	if !smep && !smap {
+		return;
+	}
+	let mut cr4: u64;
+	unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+	if smep {
+		cr4 |= CR4_SMEP;
+	}
+	if smap {
+		cr4 |= CR4_SMAP;
+	}
+	unsafe { asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags)) };
+	if smep {
+		SMEP_ENABLED.store(true, core::sync::atomic::Ordering::Release);
+	}
+	if smap {
+		SMAP_ENABLED.store(true, core::sync::atomic::Ordering::Release);
+	}
+}
+
+// Whether SMAP / SMEP are enforced (tests assert the refusal only where it can hold).
+pub fn smap_enabled() -> bool {
+	SMAP_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+pub fn smep_enabled() -> bool {
+	SMEP_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+// Run `f` inside the sanctioned user-memory window: EFLAGS.AC set (stac) so SMAP
+// permits the access, cleared again (clac) after. Every kernel access to user
+// memory - the syscall copy-in/copy-out paths, the test scaffolds staging their
+// ring-3 programs - goes through here; anything else faults under SMAP. The
+// window must stay a leaf operation (no yields, no blocking) so AC never travels
+// into unrelated kernel execution.
+#[inline]
+pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
+	let guarded = smap_enabled();
+	if guarded {
+		unsafe { asm!("stac", options(nomem, nostack)) };
+	}
+	let result = f();
+	if guarded {
+		unsafe { asm!("clac", options(nomem, nostack)) };
+	}
+	result
+}
+
+// Clear EFLAGS.AC at an interrupt entry. A gate does not clear AC, so an interrupt
+// taken from ring 3 (where user code may set AC freely) - or one landing inside a
+// user_access window - would otherwise run kernel code with SMAP suspended; worse,
+// an entry that context-switches (the timer) would leak AC=1 into the next
+// thread's kernel execution. The resuming iretq restores the interrupted context's
+// own AC, so clearing it here is invisible to the interrupted code.
+#[inline]
+pub fn clac_on_entry() {
+	if smap_enabled() {
+		unsafe { asm!("clac", options(nomem, nostack)) };
+	}
+}
+
+// Copy bytes into a USER-mapped page from ring 0 through the sanctioned window -
+// the test scaffolds stage their embedded ring-3 programs this way.
+//
+// SAFETY: `dst` must be a mapped, writable destination for `bytes.len()` bytes.
+pub unsafe fn copy_to_user_page(dst: u64, bytes: &[u8]) {
+	user_access(|| unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len()) });
 }
 
 // Whether NX is enforced (tests assert the W^X behaviour only where it can hold).

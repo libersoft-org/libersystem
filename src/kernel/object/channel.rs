@@ -25,9 +25,13 @@ use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::sched;
 use crate::sync::SpinLock;
 
-// Bounded queue depth per endpoint. A full queue makes send report Full, the
-// backpressure signal - a message is never silently dropped.
-const CHANNEL_QUEUE_LIMIT: usize = 64;
+// Default bounded queue depth per endpoint. A full queue makes send report Full,
+// the backpressure signal - a message is never silently dropped. A creator that
+// knows its traffic picks its own depth (create_with_depth); this is the default.
+const CHANNEL_QUEUE_DEFAULT: usize = 64;
+// The deepest queue a creator may ask for: bounds the kernel memory one channel
+// can pin through queued messages.
+const CHANNEL_QUEUE_MAX: usize = 4096;
 
 // Outcome of a non-blocking channel operation that did not complete.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,16 +85,26 @@ pub struct Channel {
 	header: ObjectHeader,
 	// Messages waiting to be read at this endpoint (the peer pushes here).
 	inbox: SpinLock<VecDeque<Message>>,
+	// The bounded depth of this endpoint's inbox: a send to it reports Full at
+	// this many queued messages.
+	limit: usize,
 	// The peer endpoint, held weakly so the two ends do not form a reference
 	// cycle. Upgrading fails once the peer has been dropped (its handles closed).
 	peer: SpinLock<Option<Weak<Channel>>>,
 }
 
 impl Channel {
-	// Create a connected pair of endpoints.
+	// Create a connected pair of endpoints with the default queue depth.
 	pub fn create() -> (Arc<Channel>, Arc<Channel>) {
-		let a = Arc::new(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), peer: SpinLock::new(None) });
-		let b = Arc::new(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), peer: SpinLock::new(None) });
+		Self::create_with_depth(0)
+	}
+
+	// Create a connected pair whose endpoints queue up to `depth` messages each
+	// (0 = the default depth; anything else is clamped to the sane band).
+	pub fn create_with_depth(depth: usize) -> (Arc<Channel>, Arc<Channel>) {
+		let limit = if depth == 0 { CHANNEL_QUEUE_DEFAULT } else { depth.clamp(1, CHANNEL_QUEUE_MAX) };
+		let a = Arc::new(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, peer: SpinLock::new(None) });
+		let b = Arc::new(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, peer: SpinLock::new(None) });
 		*a.peer.lock() = Some(Arc::downgrade(&b));
 		*b.peer.lock() = Some(Arc::downgrade(&a));
 		(a, b)
@@ -111,6 +125,20 @@ impl Channel {
 		!self.inbox.lock().is_empty() || self.is_peer_closed()
 	}
 
+	// True if a send through this endpoint would not report Full: the peer's queue
+	// has room. A gone peer also counts as ready, so a sender blocked for room
+	// wakes and observes PeerClosed from the send instead of waiting forever. The
+	// readiness a WAIT_WRITABLE `wait` tests - the sender's half of backpressure.
+	pub fn is_writable(&self) -> bool {
+		match self.peer() {
+			Some(peer) => {
+				let len = peer.inbox.lock().len();
+				len < peer.limit
+			}
+			None => true,
+		}
+	}
+
 	// Deliver a message to the peer's inbox. Non-blocking: Full if the peer's
 	// queue is at its limit, PeerClosed if the peer is gone. Internal kernel IPC;
 	// the queued bytes are not charged to any Domain.
@@ -129,7 +157,7 @@ impl Channel {
 		let peer = self.peer().ok_or(ChannelError::PeerClosed)?;
 		{
 			let mut inbox = peer.inbox.lock();
-			if inbox.len() >= CHANNEL_QUEUE_LIMIT {
+			if inbox.len() >= peer.limit {
 				return Err(ChannelError::Full);
 			}
 			// Charge only once space is assured, so a refused message charges nothing.
@@ -149,9 +177,21 @@ impl Channel {
 	// nothing is queued (peer still open), PeerClosed once the peer is gone and
 	// the inbox has drained. Queued messages are always delivered first.
 	pub fn recv(&self) -> Result<Message, ChannelError> {
-		if let Some(mut msg) = self.inbox.lock().pop_front() {
+		let popped = {
+			let mut inbox = self.inbox.lock();
+			let was_full = inbox.len() >= self.limit;
+			inbox.pop_front().map(|msg| (msg, was_full))
+		};
+		if let Some((mut msg, was_full)) = popped {
 			// The message has left the queue: refund the sender's queued-bytes charge.
 			msg.take_queue_charge();
+			// The queue just left its full state: the peer endpoint is writable again,
+			// so wake any sender blocked (WAIT_WRITABLE) waiting for room.
+			if was_full {
+				if let Some(peer) = self.peer() {
+					sched::wake_object(peer.header.koid());
+				}
+			}
 			return Ok(msg);
 		}
 		if self.is_peer_closed() { Err(ChannelError::PeerClosed) } else { Err(ChannelError::Empty) }

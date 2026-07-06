@@ -23,11 +23,14 @@ use core::arch::asm;
 use self::port::{inb, outb, outw};
 
 // install the CPU descriptor tables (GDT + TSS, then IDT), and turn on no-execute
-// enforcement before any NX-flagged mapping exists (the heap window is the first)
+// enforcement before any NX-flagged mapping exists (the heap window is the first),
+// plus supervisor-mode access/execution prevention (SMAP + SMEP) before any
+// USER-flagged mapping exists
 pub fn init() {
 	gdt::init();
 	idt::init();
 	paging::enable_nx();
+	paging::enable_smap_smep();
 }
 
 // Bring up interrupt delivery and the periodic timer. Requires the memory
@@ -58,10 +61,12 @@ pub fn init_bsp_percpu(lapic_id: u32) {
 }
 
 // Full per-core bring-up for an application processor, run on that core: enable
-// no-execute first (the shared page tables already carry NX-flagged leaves), load
-// the shared descriptor tables, set up per-CPU data, and enable its LAPIC.
+// no-execute and SMAP/SMEP first (the shared page tables already carry NX-flagged
+// and USER-flagged leaves), load the shared descriptor tables, set up per-CPU
+// data, and enable its LAPIC.
 pub fn init_ap(cpu_id: usize, lapic_id: u32) {
 	paging::enable_nx();
+	paging::enable_smap_smep();
 	gdt::load_ap(cpu_id);
 	idt::load();
 	percpu::init(cpu_id, lapic_id);

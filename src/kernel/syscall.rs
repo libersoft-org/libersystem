@@ -124,10 +124,13 @@ fn sys_debug_write(arg: u64, len: u64) -> i64 {
 	if len > DEBUG_WRITE_MAX || !user_buf_ok(arg, len) {
 		return ERR_INVALID;
 	}
-	let bytes = unsafe { core::slice::from_raw_parts(arg as *const u8, len as usize) };
+	// Copy the caller's bytes into a kernel buffer through the sanctioned SMAP
+	// window, so the serial path below never touches user memory directly (it
+	// holds the TX lock while it writes, so a fault there would deadlock).
+	let bytes = read_bytes(arg, len as usize);
 	// Report how many bytes the transmit ring accepted: a caller pacing a mirror
 	// backlog resumes from there on its next pass instead of losing the tail.
-	crate::_print_bytes(bytes) as i64
+	crate::_print_bytes(&bytes) as i64
 }
 
 // A window's virtual-address pool: a bump cursor over [next, end) with a sorted,
@@ -279,6 +282,14 @@ fn current_typed<T: KernelObject>(handle: u64, ty: ObjectType, rights: Rights) -
 	Ok(current_object(handle, ty, rights)?.into_any_arc().downcast::<T>().ok().expect("type checked by lookup_typed"))
 }
 
+// Write `value` to a caller-supplied buffer through the sanctioned SMAP window
+// (arch::paging::user_access): under SMAP a plain kernel store to a user page
+// faults, so every copy-out goes through here. The caller has already validated
+// the pointer with user_buf_ok.
+fn write_user<T>(ptr: u64, value: T) {
+	arch::paging::user_access(|| unsafe { (ptr as *mut T).write_unaligned(value) });
+}
+
 // Entry point called by the architecture syscall stub. `num` selects the call;
 // the meaning of the arguments and the return value is per-syscall.
 #[unsafe(no_mangle)]
@@ -318,7 +329,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_MEMORY_UNMAP => sys_memory_unmap(a0),
 		SYS_HANDLE_DUPLICATE => sys_handle_duplicate(a0, a1),
 		SYS_HANDLE_CLOSE => sys_handle_close(a0),
-		SYS_CHANNEL_CREATE => sys_channel_create(a0, a1),
+		SYS_CHANNEL_CREATE => sys_channel_create(a0, a1, a2),
 		SYS_CHANNEL_SEND => sys_channel_send(a0, a1, a2, a3),
 		SYS_CHANNEL_RECV => sys_channel_recv(a0, a1, a2, a3),
 		SYS_EVENT_CREATE => sys_event_create(),
@@ -455,9 +466,7 @@ fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64) -> i64 {
 	for i in 0..pages {
 		arch::paging::map_page(base + i * PAGE_SIZE, base_phys + i * PAGE_SIZE, flags);
 	}
-	unsafe {
-		(buf_ptr as *mut abi::Framebuffer).write_unaligned(geom);
-	}
+	write_user(buf_ptr, geom);
 	// Hand the display to the caller: the kernel console stops drawing to it.
 	crate::console::disable();
 	base as i64
@@ -478,9 +487,9 @@ fn sys_console_readlog(buf_ptr: u64, buf_len: u64) -> i64 {
 		None => return 0,
 	};
 	let n = (text.len() as u64).min(buf_len) as usize;
-	unsafe {
+	arch::paging::user_access(|| unsafe {
 		core::ptr::copy_nonoverlapping(text.as_ptr(), buf_ptr as *mut u8, n);
-	}
+	});
 	n as i64
 }
 
@@ -494,9 +503,7 @@ fn sys_cpu_info(buf_ptr: u64, buf_len: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	for cpu in 0..n {
-		unsafe {
-			(buf_ptr as *mut u32).add(cpu).write_unaligned(crate::smp::lapic_id(cpu));
-		}
+		write_user((buf_ptr as *mut u32).wrapping_add(cpu) as u64, crate::smp::lapic_id(cpu));
 	}
 	count as i64
 }
@@ -512,9 +519,7 @@ fn sys_memory_stats(buf_ptr: u64, buf_len: u64) -> i64 {
 	let (total_frames, free_frames) = crate::mem::frame::totals();
 	let (heap_total, heap_free) = crate::mem::heap::stats();
 	let out = MemoryStats { total_frames: total_frames as u64, free_frames: free_frames as u64, heap_total, heap_free };
-	unsafe {
-		(buf_ptr as *mut MemoryStats).write_unaligned(out);
-	}
+	write_user(buf_ptr, out);
 	1
 }
 
@@ -531,9 +536,7 @@ fn sys_memmap_get(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	unsafe {
-		(buf_ptr as *mut MemmapRegion).write_unaligned(region);
-	}
+	write_user(buf_ptr, region);
 	crate::mem::memmap_len() as i64
 }
 
@@ -550,9 +553,7 @@ fn sys_irq_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	unsafe {
-		(buf_ptr as *mut IrqInfo).write_unaligned(info);
-	}
+	write_user(buf_ptr, info);
 	arch::interrupts::irq_info_len() as i64
 }
 
@@ -569,9 +570,7 @@ fn sys_pci_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	unsafe {
-		(buf_ptr as *mut PciInfo).write_unaligned(info);
-	}
+	write_user(buf_ptr, info);
 	device::pci_count() as i64
 }
 
@@ -617,9 +616,7 @@ fn sys_device_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	let info = device::with(index as usize, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset });
 	match info {
 		Some(info) => {
-			unsafe {
-				(buf_ptr as *mut abi::DeviceInfo).write_unaligned(info);
-			}
+			write_user(buf_ptr, info);
 			0
 		}
 		None => ERR_INVALID,
@@ -657,9 +654,9 @@ fn sys_random_get(buf_ptr: u64, len: u64) -> i64 {
 	while filled < len {
 		let n = ((len - filled) as usize).min(CHUNK);
 		arch::random::fill(&mut scratch[..n]);
-		unsafe {
+		arch::paging::user_access(|| unsafe {
 			core::ptr::copy_nonoverlapping(scratch.as_ptr(), (buf_ptr + filled) as *mut u8, n);
-		}
+		});
 		filled += n as u64;
 	}
 	filled as i64
@@ -778,9 +775,9 @@ fn sys_object_property_set(handle: u64, prop: u64, a2: u64, a3: u64) -> i64 {
 			}
 		};
 		let mut buf = [0u8; MAX_NAME as usize];
-		unsafe {
+		arch::paging::user_access(|| unsafe {
 			core::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len as usize);
-		}
+		});
 		let name = match core::str::from_utf8(&buf[..len as usize]) {
 			Ok(s) => s,
 			Err(_) => return ERR_INVALID,
@@ -847,9 +844,13 @@ fn sys_process_load(process_handle: u64, elf_ptr: u64, elf_len: u64) -> i64 {
 	// copies only the PT_LOAD segments into the child's fresh frames, so there is no
 	// need to buffer the whole ELF on the kernel heap. The caller's tables stay
 	// active across the load (the child is mapped through its own CR3, not switched
-	// to), so the slice remains valid.
+	// to), so the slice remains valid. The whole load runs inside the sanctioned
+	// SMAP window: the loader reads the caller's mapped image throughout (buffering
+	// a multi-megabyte ELF on the kernel heap is exactly what this path avoids), so
+	// this is the one deliberately broad window - still a leaf operation that never
+	// yields or blocks.
 	let image = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_len as usize) };
-	match loader::load_image_into(&process, image) {
+	match arch::paging::user_access(|| loader::load_image_into(&process, image)) {
 		Ok(entry) => entry as i64,
 		Err(LoadError::OutOfMemory) => ERR_NO_MEMORY,
 		Err(LoadError::BadImage) => ERR_INVALID,
@@ -1067,20 +1068,25 @@ fn sys_handle_close(handle: u64) -> i64 {
 	}
 }
 
-// Copy a byte payload out of a caller-supplied buffer. M7 runs in ring 0, so the
-// pointer is a kernel pointer used directly; userspace copy-in with validation is
-// added with ring 3.
+// Copy a byte payload out of a caller-supplied buffer through the sanctioned SMAP
+// window. Ring-0 self-calls pass kernel pointers, which the window does not
+// affect; a ring-3 caller's pointer has been validated by user_buf_ok.
 fn read_bytes(ptr: u64, len: usize) -> Vec<u8> {
 	if ptr == 0 || len == 0 {
 		return Vec::new();
 	}
-	let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-	slice.to_vec()
+	let mut bytes = alloc::vec![0u8; len];
+	arch::paging::user_access(|| unsafe {
+		core::ptr::copy_nonoverlapping(ptr as *const u8, bytes.as_mut_ptr(), len);
+	});
+	bytes
 }
 
 // Create a connected channel pair, install a handle to each endpoint in the
 // caller's table, and write the two raw handles to *out0_ptr and *out1_ptr.
-fn sys_channel_create(out0_ptr: u64, out1_ptr: u64) -> i64 {
+// `depth` bounds each endpoint's queue in messages (0 = the default), so a
+// creator that knows its traffic picks its own backpressure point.
+fn sys_channel_create(out0_ptr: u64, out1_ptr: u64, depth: u64) -> i64 {
 	let thread = current_thread!();
 	if out0_ptr == 0 || out1_ptr == 0 {
 		return ERR_INVALID;
@@ -1088,7 +1094,7 @@ fn sys_channel_create(out0_ptr: u64, out1_ptr: u64) -> i64 {
 	if !user_buf_ok(out0_ptr, 8) || !user_buf_ok(out1_ptr, 8) {
 		return ERR_INVALID;
 	}
-	let (ep0, ep1) = Channel::create();
+	let (ep0, ep1) = Channel::create_with_depth(depth as usize);
 	let (h0, h1) = {
 		let mut table = thread.handles().lock();
 		// Enforce the Domain's handle quota for both endpoints; if the second
@@ -1106,10 +1112,8 @@ fn sys_channel_create(out0_ptr: u64, out1_ptr: u64) -> i64 {
 		};
 		(h0, h1)
 	};
-	unsafe {
-		(out0_ptr as *mut u64).write(h0.raw());
-		(out1_ptr as *mut u64).write(h1.raw());
-	}
+	write_user(out0_ptr, h0.raw());
+	write_user(out1_ptr, h1.raw());
 	0
 }
 
@@ -1211,9 +1215,9 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 	thread.process().record_recv();
 	let n = core::cmp::min(message.bytes.len(), bytes_cap as usize);
 	if n > 0 && bytes_ptr != 0 {
-		unsafe {
+		arch::paging::user_access(|| unsafe {
 			core::ptr::copy_nonoverlapping(message.bytes.as_ptr(), bytes_ptr as *mut u8, n);
-		}
+		});
 	}
 	// Install the transferred capability (if any) and report its new handle.
 	if out_handle_ptr != 0 {
@@ -1221,9 +1225,7 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 			Some(cap) => thread.handles().lock().insert(cap).raw(),
 			None => 0,
 		};
-		unsafe {
-			(out_handle_ptr as *mut u64).write(handle_value);
-		}
+		write_user(out_handle_ptr, handle_value);
 	}
 	n as i64
 }
@@ -1235,9 +1237,13 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 // primitive; the non-blocking send/recv/poll calls layer the synchronous-looking
 // `call()` on top of it. The handle must carry the WAIT right. `flags` may carry
 // WAIT_PERIODIC: the deadline is a recurring housekeeping wake, still honored but
-// never holding the scheduler's settling point open.
+// never holding the scheduler's settling point open. It may also carry
+// WAIT_WRITABLE: readiness for a Channel then means the peer's queue has room (or
+// the peer is gone), so a sender that got WOULD_BLOCK blocks here until the
+// receiver drains - backpressure without spinning.
 fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
 	let periodic = flags & abi::WAIT_PERIODIC != 0;
+	let writable = flags & abi::WAIT_WRITABLE != 0;
 	let thread = current_thread!();
 	let object = {
 		let table = thread.handles().lock();
@@ -1260,7 +1266,7 @@ fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
 			sched::block_on(thread.process().header().koid(), sched::NO_DEADLINE);
 			continue;
 		}
-		if object_ready(&object) {
+		if object_ready_for(&object, writable) {
 			return 0;
 		}
 		let block_deadline = wait_block_deadline(&object, deadline);
@@ -1288,7 +1294,12 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 	if n == 0 || n as u64 > held || !user_buf_ok(handles_ptr, count * 8) {
 		return ERR_INVALID;
 	}
-	let raw = unsafe { core::slice::from_raw_parts(handles_ptr as *const u64, n) };
+	// Copy the caller's handle array into a kernel buffer through the sanctioned
+	// SMAP window before resolving it.
+	let mut raw: alloc::vec::Vec<u64> = alloc::vec![0u64; n];
+	arch::paging::user_access(|| unsafe {
+		core::ptr::copy_nonoverlapping(handles_ptr as *const u64, raw.as_mut_ptr(), n);
+	});
 	// Resolve every handle once up front, recording each object and its koid. The
 	// scratch tables are heap-allocated, sized by the actual set - `wait_any` is a
 	// blocking call, so the allocation is never on a hot path.
@@ -1338,9 +1349,16 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 // Whether the waitable object behind a handle is currently ready. A non-waitable
 // object type is never ready (the wait would block until its deadline).
 fn object_ready(object: &Arc<dyn KernelObject>) -> bool {
+	object_ready_for(object, false)
+}
+
+// object_ready with the WAIT_WRITABLE sense: for a Channel, `writable` asks
+// whether a send would find room (the sender's half of backpressure) instead of
+// whether a recv would find a message. Other object types ignore the flag.
+fn object_ready_for(object: &Arc<dyn KernelObject>, writable: bool) -> bool {
 	let any = object.as_any();
 	if let Some(channel) = any.downcast_ref::<Channel>() {
-		return channel.is_readable();
+		return if writable { channel.is_writable() } else { channel.is_readable() };
 	}
 	if let Some(event) = any.downcast_ref::<Event>() {
 		return event.is_signaled();
@@ -1386,9 +1404,7 @@ fn sys_fault_info_get(buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	unsafe {
-		(buf_ptr as *mut FaultInfo).write_unaligned(info);
-	}
+	write_user(buf_ptr, info);
 	1
 }
 
@@ -1422,9 +1438,7 @@ fn sys_object_info_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 		_ => 0,
 	};
 	let out = ObjectInfo { koid: info.koid, object_type: info.object_type.code(), rights: info.rights.bits(), generation: info.generation, size: obj_size };
-	unsafe {
-		(buf_ptr as *mut ObjectInfo).write_unaligned(out);
-	}
+	write_user(buf_ptr, out);
 	1
 }
 
@@ -1452,9 +1466,7 @@ fn sys_process_stats_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 		PROC_STATE_RUNNING
 	};
 	let out = ProcessStats { messages_sent: process.messages_sent(), messages_received: process.messages_received(), handle_count: process.handle_count(), memory_bytes: process.memory_bytes(), state };
-	unsafe {
-		(buf_ptr as *mut ProcessStats).write_unaligned(out);
-	}
+	write_user(buf_ptr, out);
 	1
 }
 
@@ -1484,9 +1496,7 @@ fn sys_domain_stats_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	}
 	let account = domain.account();
 	let out = DomainStats { memory_used: account.memory().used(), memory_limit: account.memory().limit(), handles_used: account.handles().used(), handles_limit: account.handles().limit(), threads_used: account.threads().used(), threads_limit: account.threads().limit(), ipc_used: account.ipc_queue().used(), ipc_limit: account.ipc_queue().limit(), dma_used: account.dma().used(), dma_limit: account.dma().limit(), stack_used: account.stack().used(), stack_limit: account.stack().limit() };
-	unsafe {
-		(buf_ptr as *mut DomainStats).write_unaligned(out);
-	}
+	write_user(buf_ptr, out);
 	1
 }
 

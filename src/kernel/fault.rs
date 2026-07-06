@@ -122,6 +122,47 @@ fn notify_crash(koid: u64, kind: u64) {
 	}
 }
 
+// SMAP/SMEP probe: the test suite arms a designated address, then deliberately
+// dereferences (or jumps into) user memory from ring 0. The resulting ring-0 page
+// fault is the EXPECTED refusal: the handler recognizes the armed address, records
+// the fault's error code, and retires the probing kernel thread instead of halting
+// the machine. The probe body must hold nothing that needs dropping across the
+// faulting access (the handler exits the thread, abandoning its frames).
+#[cfg(test)]
+static SMAP_PROBE_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static SMAP_PROBE_CODE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Arm the probe for one expected ring-0 fault at `addr`.
+#[cfg(test)]
+pub fn arm_smap_probe(addr: u64) {
+	SMAP_PROBE_CODE.store(0, core::sync::atomic::Ordering::SeqCst);
+	SMAP_PROBE_ADDR.store(addr, core::sync::atomic::Ordering::SeqCst);
+}
+
+// Called from the ring-0 page-fault branch: true if this fault is the armed probe
+// (recording its error code and disarming), in which case the handler retires the
+// probing thread rather than halting.
+#[cfg(test)]
+pub fn smap_probe_trip(cr2: u64, error_code: u64) -> bool {
+	use core::sync::atomic::Ordering;
+	let armed = SMAP_PROBE_ADDR.load(Ordering::SeqCst);
+	if armed == 0 || cr2 != armed {
+		return false;
+	}
+	SMAP_PROBE_ADDR.store(0, Ordering::SeqCst);
+	// Record error_code + 1 so a zero code is still distinguishable from "no hit".
+	SMAP_PROBE_CODE.store(error_code + 1, Ordering::SeqCst);
+	true
+}
+
+// The recorded probe fault: Some(error_code) once the armed access faulted.
+#[cfg(test)]
+pub fn smap_probe_hit() -> Option<u64> {
+	let code = SMAP_PROBE_CODE.load(core::sync::atomic::Ordering::SeqCst);
+	if code == 0 { None } else { Some(code - 1) }
+}
+
 // Record `info` on the current process and longjmp back to the kernel thread
 // that entered ring 3. Called from the exception handlers for a ring-3 fault;
 // never returns to its caller (the abandoned RSP0 exception frame is reclaimed

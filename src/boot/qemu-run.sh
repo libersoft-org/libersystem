@@ -238,7 +238,7 @@ SMP="${SMP:-$(nproc)}"
 if [[ "${NOKVM:-0}" != "1" && -e /dev/kvm ]]; then
 	QEMU_ARGS+=(-enable-kvm -cpu host -smp "$SMP")
 else
-	QEMU_ARGS+=(-cpu qemu64,+rdrand -smp "$SMP")
+	QEMU_ARGS+=(-cpu qemu64,+rdrand,+smep,+smap -smp "$SMP")
 fi
 
 if [[ "${DEBUG:-0}" == "1" ]]; then

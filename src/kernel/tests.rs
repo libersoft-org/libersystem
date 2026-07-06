@@ -25,7 +25,7 @@ extern "C" fn user_thread_body(handle: u64) {
 	arch::paging::map_page(USER_STACK_VA, stack, flags | arch::paging::NO_EXECUTE);
 	let program = arch::usermode::program_bytes();
 	unsafe {
-		core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
+		arch::paging::copy_to_user_page(USER_CODE_VA, program);
 		arch::usermode::enter(USER_CODE_VA, USER_STACK_VA + PAGE_SIZE, handle);
 	}
 	arch::paging::unmap_page(USER_CODE_VA);
@@ -598,7 +598,7 @@ extern "C" fn user_fault_thread_body(_arg: u64) {
 	arch::paging::map_page(USER_STACK_VA, stack, flags | arch::paging::NO_EXECUTE);
 	let program = arch::usermode::program_fault_bytes();
 	unsafe {
-		core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
+		arch::paging::copy_to_user_page(USER_CODE_VA, program);
 		// Drops to ring 3; the program faults and the kernel returns control here.
 		arch::usermode::enter(USER_CODE_VA, USER_STACK_VA + PAGE_SIZE, 0);
 	}
@@ -649,7 +649,7 @@ extern "C" fn user_stack_probe_thread_body(pages: u64) {
 	arch::paging::map_page(USER_CODE_VA, code, flags);
 	let program = arch::usermode::program_stack_probe_bytes();
 	unsafe {
-		core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
+		arch::paging::copy_to_user_page(USER_CODE_VA, program);
 		arch::usermode::enter(USER_CODE_VA, memlayout::USER_STACK_TOP, pages);
 	}
 	let mut info = fault::FaultInfo { kind: 0, error_code: 0, address: 0, instruction_pointer: 0 };
@@ -683,7 +683,7 @@ extern "C" fn user_nx_thread_body(_arg: u64) {
 	arch::paging::map_page(USER_STACK_VA, stack, flags | arch::paging::NO_EXECUTE);
 	let program = arch::usermode::program_nx_bytes();
 	unsafe {
-		core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
+		arch::paging::copy_to_user_page(USER_CODE_VA, program);
 		arch::usermode::enter(USER_CODE_VA, USER_STACK_VA + PAGE_SIZE, 0);
 	}
 	let mut info = fault::FaultInfo { kind: 0, error_code: 0, address: 0, instruction_pointer: 0 };
@@ -717,7 +717,7 @@ extern "C" fn driver_crash_thread_body(_arg: u64) {
 	arch::paging::map_page(USER_STACK_VA, stack, flags | arch::paging::NO_EXECUTE);
 	let program = arch::usermode::program_fault_bytes();
 	unsafe {
-		core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
+		arch::paging::copy_to_user_page(USER_CODE_VA, program);
 		arch::usermode::enter(USER_CODE_VA, USER_STACK_VA + PAGE_SIZE, 0);
 	}
 	// Back from the crash: drop the raw code/stack mappings. The IRQ and DMA handles
@@ -812,6 +812,37 @@ fn contiguous_frames_and_dma_spans() {
 	assert_eq!(dma.phys_base(), frames[0]);
 	drop(dma);
 	assert_eq!(domain.account().dma().used(), 0, "the DMA charge is refunded");
+}
+
+#[test_case]
+fn the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free() {
+	use mem::frame::{self, PAGE_SIZE};
+	// The run table is heap-backed after boot, so pathological fragmentation grows
+	// it instead of leaking frames past a fixed size: freeing every other page of a
+	// 4096-page span leaves 2048 disjoint single-page runs - far past the old fixed
+	// table - and none may be lost. Freeing the other half re-coalesces the span
+	// whole (the free count round-trips exactly and a big contiguous fit works).
+	let before = frame::free_count();
+	let base = frame::allocate_contiguous(4096).expect("a 16 MB span");
+	for i in (0..4096u64).step_by(2) {
+		frame::deallocate(base + i * PAGE_SIZE);
+	}
+	for i in (1..4096u64).step_by(2) {
+		frame::deallocate(base + i * PAGE_SIZE);
+	}
+	assert_eq!(frame::free_count(), before, "every fragmented page returned to the pool");
+	let again = frame::allocate_contiguous(4096).expect("the span re-coalesced whole");
+	// A double free is refused: freeing a page inside the pool's free runs must
+	// not be honored (it would let the same frame be handed out twice).
+	frame::deallocate(again);
+	let after_free = frame::free_count();
+	frame::deallocate(again);
+	assert_eq!(frame::free_count(), after_free, "a double free adds nothing to the pool");
+	// Hand the rest of the span back (page 0 is already free).
+	for i in 1..4096u64 {
+		frame::deallocate(again + i * PAGE_SIZE);
+	}
+	assert_eq!(frame::free_count(), before, "the pool round-trips exactly");
 }
 
 #[test_case]
@@ -1087,7 +1118,7 @@ fn a_cpu_bound_ring3_thread_is_preempted() {
 		arch::paging::map_page(SPIN_FLAG_VA, data, flags | arch::paging::NO_EXECUTE);
 		let program = arch::usermode::program_spin_bytes();
 		unsafe {
-			core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
+			arch::paging::copy_to_user_page(USER_CODE_VA, program);
 		}
 		SPIN_FLAG_PHYS.store(data, Ordering::SeqCst);
 		unsafe {
@@ -1198,7 +1229,9 @@ fn process_isolation_and_per_process_tables() {
 	static SEEN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 	extern "C" fn reader(which: u64) {
 		let cr3 = arch::context::read_cr3();
-		let value = unsafe { (VA as *const u64).read_volatile() };
+		// The page is USER-mapped, so this ring-0 read goes through the sanctioned
+		// SMAP window (the test reads it to prove CR3 isolation, not to dodge SMAP).
+		let value = arch::paging::user_access(|| unsafe { (VA as *const u64).read_volatile() });
 		CR3[which as usize].store(cr3, Ordering::SeqCst);
 		SEEN[which as usize].store(value, Ordering::SeqCst);
 	}
@@ -1577,6 +1610,61 @@ fn blocking_wait_wakes_on_message() {
 	sched::run_until_idle();
 	assert!(OK.load(Ordering::SeqCst));
 	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 0);
+}
+
+#[test_case]
+fn a_sender_on_a_full_channel_blocks_and_wakes_on_drain() {
+	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+	static SENDER_REFUSED: AtomicBool = AtomicBool::new(false);
+	static SENDER_DONE: AtomicBool = AtomicBool::new(false);
+	static RECEIVED: AtomicU64 = AtomicU64::new(0);
+	// Backpressure without spinning: a channel created with a queue depth of 2
+	// refuses the third send with WOULD_BLOCK (the depth is a creation parameter,
+	// not a hardwired constant), the sender then BLOCKS in SYS_WAIT with
+	// WAIT_WRITABLE, and the receiver's first recv - the queue leaving its full
+	// state - wakes it to deliver the rest. If the drain never woke the sender, it
+	// would stay blocked forever and SENDER_DONE would read false.
+	extern "C" fn sender(ch: u64) {
+		unsafe {
+			for msg in [b"m1", b"m2", b"m3"] {
+				loop {
+					let sent = arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, ch, msg.as_ptr() as u64, msg.len() as u64, 0);
+					if sent as i64 == syscall::ERR_WOULD_BLOCK {
+						SENDER_REFUSED.store(true, Ordering::SeqCst);
+						let ret = arch::syscall::invoke(syscall::SYS_WAIT, ch, 0, abi::WAIT_WRITABLE, 0);
+						assert_eq!(ret as i64, 0, "the writable wait returns ready");
+						continue;
+					}
+					assert!(!syscall::sys_is_err(sent));
+					break;
+				}
+			}
+			SENDER_DONE.store(true, Ordering::SeqCst);
+		}
+	}
+	extern "C" fn receiver(ch: u64) {
+		unsafe {
+			let mut buf = [0u8; 8];
+			let mut xfer: u64 = 0;
+			while RECEIVED.load(Ordering::SeqCst) < 3 {
+				let n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, ch, buf.as_mut_ptr() as u64, buf.len() as u64, &mut xfer as *mut u64 as u64);
+				if n as i64 == syscall::ERR_WOULD_BLOCK {
+					arch::syscall::invoke(syscall::SYS_WAIT, ch, 0, 0, 0);
+					continue;
+				}
+				assert!(!syscall::sys_is_err(n), "recv failed");
+				RECEIVED.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+	}
+	let (ep0, ep1) = object::channel::Channel::create_with_depth(2);
+	// The sender runs first: it fills the depth-2 queue, is refused, and blocks.
+	sched::spawn_with_object(sender, ep0, object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(receiver, ep1, object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(SENDER_REFUSED.load(Ordering::SeqCst), "the depth-2 queue refused the third send");
+	assert!(SENDER_DONE.load(Ordering::SeqCst), "the drain woke the blocked sender");
+	assert_eq!(RECEIVED.load(Ordering::SeqCst), 3, "every message was delivered");
 }
 
 #[test_case]
@@ -3907,7 +3995,7 @@ extern "C" fn user_yield_thread_body(handle: u64) {
 	arch::paging::map_page(stack_va, stack, flags | arch::paging::NO_EXECUTE);
 	let program = arch::usermode::program_yield_bytes();
 	unsafe {
-		core::ptr::copy_nonoverlapping(program.as_ptr(), code_va as *mut u8, program.len());
+		arch::paging::copy_to_user_page(code_va, program);
 		arch::usermode::enter(code_va, stack_va + PAGE_SIZE, handle);
 	}
 	arch::paging::unmap_page(code_va);
@@ -3974,6 +4062,58 @@ fn writable_pages_are_not_executable() {
 	assert!((USER_STACK_VA..USER_STACK_VA + mem::frame::PAGE_SIZE).contains(&addr), "the fault is inside the stack page");
 	assert!(NX_CODE.load(Ordering::SeqCst) & 0x10 != 0, "the fault is an instruction fetch");
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
+}
+
+#[test_case]
+fn kernel_access_to_user_memory_is_refused_outside_the_window() {
+	use mem::frame;
+	// SMAP/SMEP: a kernel dereference of a USER-mapped page outside the sanctioned
+	// user_access window must page-fault (SMAP), and a ring-0 jump into a
+	// USER-mapped page must page-fault as an instruction fetch (SMEP) - a kernel
+	// bug can neither silently read user memory nor execute it. Each probe runs in
+	// its own kernel thread; the armed page-fault handler recognizes the expected
+	// fault and retires the thread instead of halting the machine. The probe VA is
+	// clear of every other test's user pages.
+	const SMAP_PROBE_VA: u64 = 0x0000_0000_4100_0000;
+	assert!(arch::paging::smap_enabled(), "the test hardware supports SMAP");
+	assert!(arch::paging::smep_enabled(), "the test hardware supports SMEP");
+	let frame = frame::allocate().expect("probe frame");
+	// Stamp a marker through the HHDM so a silent (unrefused) read would be visible.
+	unsafe { ((mem::hhdm_offset() + frame) as *mut u64).write_volatile(0x5341_4645) };
+	// Map it USER (no NX: the SMEP probe below fetches from it; SMAP alone must
+	// refuse the data read regardless of NX).
+	arch::paging::map_page(SMAP_PROBE_VA, frame, arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER);
+	// Probe 1 (SMAP): a plain kernel read of the user page. Only Copy values live
+	// across the faulting access - the handler retires this thread mid-statement.
+	extern "C" fn smap_probe(_arg: u64) {
+		fault::arm_smap_probe(SMAP_PROBE_VA);
+		let value = unsafe { (SMAP_PROBE_VA as *const u64).read_volatile() };
+		// Reached only if SMAP failed to refuse the access.
+		panic!("SMAP did not refuse a kernel read of user memory (read {:#x})", value);
+	}
+	sched::spawn(smap_probe, 0);
+	sched::run_until_idle();
+	let code = fault::smap_probe_hit().expect("the kernel read of user memory faulted");
+	assert!(code & 0x1 != 0, "the SMAP refusal is a protection fault on a present page");
+	assert!(code & 0x10 == 0, "the SMAP refusal is a data access, not a fetch");
+	// The sanctioned window still reads it fine - the copy paths keep working.
+	let through_window = arch::paging::user_access(|| unsafe { (SMAP_PROBE_VA as *const u64).read_volatile() });
+	assert_eq!(through_window, 0x5341_4645, "the sanctioned user_access window reads the page");
+	// Probe 2 (SMEP): a ring-0 jump into the user page. The fetch faults before a
+	// single byte executes, so the page's content never matters.
+	extern "C" fn smep_probe(_arg: u64) {
+		fault::arm_smap_probe(SMAP_PROBE_VA);
+		let target: extern "C" fn() = unsafe { core::mem::transmute::<u64, extern "C" fn()>(SMAP_PROBE_VA) };
+		target();
+		panic!("SMEP did not refuse a kernel jump into user memory");
+	}
+	sched::spawn(smep_probe, 0);
+	sched::run_until_idle();
+	let code = fault::smap_probe_hit().expect("the kernel jump into user memory faulted");
+	assert!(code & 0x10 != 0, "the SMEP refusal is an instruction fetch");
+	// The probe threads died mid-body: clean their mapping up here.
+	arch::paging::unmap_page(SMAP_PROBE_VA);
+	frame::deallocate(frame);
 }
 
 #[test_case]

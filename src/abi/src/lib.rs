@@ -25,6 +25,8 @@ pub const SYS_MEMORY_MAP: u64 = 4;
 pub const SYS_MEMORY_UNMAP: u64 = 5;
 pub const SYS_HANDLE_DUPLICATE: u64 = 6;
 pub const SYS_HANDLE_CLOSE: u64 = 7;
+// a2 = the queue depth per endpoint in messages (0 = the default), so a channel's
+// backpressure point is a creation parameter rather than one hardwired constant.
 pub const SYS_CHANNEL_CREATE: u64 = 8;
 pub const SYS_CHANNEL_SEND: u64 = 9;
 pub const SYS_CHANNEL_RECV: u64 = 10;
@@ -146,6 +148,13 @@ pub const POWER_OFF: u64 = 1;
 // may consider the system idle while only periodic waits remain - so a service
 // can tick forever without holding the boot path (or the tests) hostage.
 pub const WAIT_PERIODIC: u64 = 1;
+
+// Flag for SYS_WAIT (arg 2): wait for a Channel to become WRITABLE (the peer's
+// queue has room, or the peer is gone - the send then reports the close) instead
+// of readable. A sender that got WOULD_BLOCK blocks here until the receiver
+// drains, which is what backpressure means: the sender waits, it never spins.
+// Ignored for non-Channel objects.
+pub const WAIT_WRITABLE: u64 = 2;
 
 // Signal numbers for SYS_PROCESS_SIGNAL (POSIX-like values, but our own typed set).
 // The kernel applies the default disposition: INT / TERM / KILL terminate the target,

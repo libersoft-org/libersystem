@@ -142,6 +142,9 @@ extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, error_code: u
 }
 
 extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, error_code: u64) {
+	// A gate does not clear EFLAGS.AC; the fault path may longjmp into a kernel
+	// thread, so drop any user-set AC before kernel execution continues there.
+	super::paging::clac_on_entry();
 	// A #GP taken in ring 3 is a userspace bug: terminate that process and return
 	// to the kernel. The low two bits of the saved code selector are the CPL.
 	if frame.code_segment & 3 == 3 {
@@ -154,6 +157,9 @@ extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, e
 }
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64) {
+	// See general_protection_fault: the terminate path longjmps into a kernel
+	// thread, so any user-set EFLAGS.AC must not travel there.
+	super::paging::clac_on_entry();
 	let cr2: u64;
 	unsafe {
 		asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
@@ -171,7 +177,13 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
 		crate::serial_println!("fault: ring-3 page fault (code {:#x}) at {:#x}, CR2 = {:#x} - terminating process", error_code, frame.instruction_pointer, cr2);
 		crate::fault::terminate_user(crate::fault::FaultInfo { kind: crate::fault::FAULT_PAGE, error_code, address: cr2, instruction_pointer: frame.instruction_pointer });
 	}
-	// In ring 0 it is a kernel bug; halt loudly.
+	// In ring 0 it is a kernel bug; halt loudly. The one exception: the test suite
+	// arms a probe address to prove SMAP/SMEP refuse a kernel access to user
+	// memory - that expected fault retires the probing thread instead.
+	#[cfg(test)]
+	if crate::fault::smap_probe_trip(cr2, error_code) {
+		crate::sched::exit();
+	}
 	crate::serial_println!("EXCEPTION: page fault (code {:#x}) at {:#x}, CR2 = {:#x}", error_code, frame.instruction_pointer, cr2);
 	super::halt_loop();
 }

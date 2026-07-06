@@ -56,7 +56,10 @@ pub fn init(memory_map: &MemoryMapResponse, hhdm: u64) {
 	HHDM_OFFSET.store(hhdm, Ordering::Relaxed);
 	frame::init(memory_map);
 	heap::init();
-	// The heap is up now, so the map can be retained (Vec) for runtime inspection.
+	// The heap is up now: the frame allocator's run table moves onto it (so
+	// fragmentation is bounded by memory, not a fixed table), and the memory map
+	// can be retained (Vec) for runtime inspection.
+	frame::upgrade_to_heap();
 	let mut retained = MEMMAP.lock();
 	for entry in memory_map.entries() {
 		retained.push(abi::MemmapRegion { base: entry.base, length: entry.length, kind: region_kind(entry.entry_type), _pad: 0 });
