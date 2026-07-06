@@ -21,6 +21,7 @@ use alloc::string::String;
 use proto::codec::JsonMode;
 use proto::system::{VolumeStatus, volume};
 use rt::*;
+use tools::recv_json_mode;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -30,10 +31,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string - the sub-form ("" for text, "json" for JSON).
-		let mode: Option<JsonMode> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => JsonMode::parse(&buf[..len]),
-			Received::Closed => exit(),
-		};
+		let mode: Option<JsonMode> = recv_json_mode(bootstrap, &mut buf);
 		// 3. receive the five volume clients the `volumes` capability bundles, in grant order;
 		//    a volume whose disk is absent arrives as 0 (no handle) and shows as absent.
 		let system: u64 = recv_tagged(bootstrap, &mut buf, b"SYSTEM").unwrap_or(0);

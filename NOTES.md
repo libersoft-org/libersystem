@@ -1,6 +1,7 @@
 # Bugs / changes
 
-- Add nvme + other generic drivers
+- Remove Limine mentioning everywhere
+- Add nvme and other generic drivers (add to CONCEPT_*.md that generic drivers will be available already in phase 2)
 - Apps in vol://storage/bin/ are huge (hundreds of kB) - find out why
 - Some commands are missing --help parameter
 - How does the format of our binary files look like? describe it somewhere

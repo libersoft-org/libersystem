@@ -15,6 +15,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use proto::system::audio;
 use rt::*;
+use tools::{parse_u64, split_args};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -42,10 +43,10 @@ unsafe fn beep(audiosvc: u64, args: &[u8]) {
 	unsafe {
 		let mut freq: u16 = 440;
 		let mut millis: u32 = 200;
-		let mut parts = args.split(|&b| b == b' ').filter(|s: &&[u8]| !s.is_empty());
+		let mut parts = split_args(args);
 		if let Some(f) = parts.next() {
-			match parse_usize(f) {
-				Some(v) => freq = v.min(u16::MAX as usize) as u16,
+			match parse_u64(f) {
+				Some(v) => freq = v.min(u16::MAX as u64) as u16,
 				None => {
 					print(b"beep: invalid frequency\n");
 					return;
@@ -53,8 +54,8 @@ unsafe fn beep(audiosvc: u64, args: &[u8]) {
 			}
 		}
 		if let Some(m) = parts.next() {
-			match parse_usize(m) {
-				Some(v) => millis = v.min(u32::MAX as usize) as u32,
+			match parse_u64(m) {
+				Some(v) => millis = v.min(u32::MAX as u64) as u32,
 				None => {
 					print(b"beep: invalid duration\n");
 					return;
@@ -70,17 +71,4 @@ unsafe fn beep(audiosvc: u64, args: &[u8]) {
 	}
 }
 
-// Parse a decimal byte string into a usize, rejecting empty or non-digit input.
-fn parse_usize(s: &[u8]) -> Option<usize> {
-	if s.is_empty() {
-		return None;
-	}
-	let mut v: usize = 0;
-	for &b in s {
-		if !b.is_ascii_digit() {
-			return None;
-		}
-		v = v.checked_mul(10)?.checked_add((b - b'0') as usize)?;
-	}
-	Some(v)
-}
+// `parse_u64` and `split_args` come from the shared tools crate.

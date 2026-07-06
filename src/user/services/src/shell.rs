@@ -16,6 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use proto::codec::JsonMode;
 use proto::path;
+use proto::shell::{parse_and_expand, parse_assignment, trim};
 use proto::system::{Component, EnvVar, JobEntry, JobInfo, TraceSpan, input, network, permission, process, session, system_graph, volume};
 use rt::*;
 
@@ -224,11 +225,10 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 				continue;
 			}
 			// The terminal delivers a whole submitted line (with a trailing newline); trim
-			// it, expand any `$NAME` / `${NAME}` against the environment, then dispatch it,
-			// reap finished jobs, and print the next prompt.
-			let raw: &[u8] = trim(&line_buf[..n]);
-			let expanded: Vec<u8> = expand_vars(raw, &vars);
-			if dispatch(&expanded, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, &mut jobs, &mut vars, &mut cwd) {
+			// it, expand any `$NAME` / `${NAME}` against the environment, normalize its flags,
+			// then dispatch it, reap finished jobs, and print the next prompt.
+			let prepared: Vec<u8> = parse_and_expand(&line_buf[..n], &vars);
+			if dispatch(&prepared, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, &mut jobs, &mut vars, &mut cwd) {
 				return;
 			}
 			jobs.reap();
@@ -574,26 +574,8 @@ unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
 	}
 }
 
-// Detect a bare `NAME=VALUE` assignment. The name must be a shell identifier
-// (`[A-Za-z_][A-Za-z0-9_]*`) so a command with an `=` in an argument (a URL, a flag) is
-// not mistaken for one; the value is everything after the first `=` and may be empty.
-// Returns the name and value byte slices, the name valid UTF-8 by construction.
-fn parse_assignment(line: &[u8]) -> Option<(&str, &[u8])> {
-	let eq: usize = line.iter().position(|&b: &u8| b == b'=')?;
-	let name: &[u8] = &line[..eq];
-	if name.is_empty() {
-		return None;
-	}
-	let head: u8 = name[0];
-	if !(head.is_ascii_alphabetic() || head == b'_') {
-		return None;
-	}
-	if !name.iter().all(|&b: &u8| b.is_ascii_alphanumeric() || b == b'_') {
-		return None;
-	}
-	let value: &[u8] = &line[eq + 1..];
-	Some((core::str::from_utf8(name).ok()?, value))
-}
+// `parse_assignment` (bare `NAME=VALUE` detection) lives in `proto::shell`, host-tested
+// alongside the rest of the shell's line language.
 
 // Set a shell variable: write it through to the session so it outlives the shell, then
 // upsert the local cache. A value that is not valid UTF-8 is stored empty (the session
@@ -621,78 +603,9 @@ fn unset_var(vars: &mut Vec<(String, String)>, session: u64, name: &str) {
 	vars.retain(|(n, _): &(String, String)| n != name);
 }
 
-// Expand `$NAME` and `${NAME}` references in a command line against the environment cache,
-// where a name is `[A-Za-z_][A-Za-z0-9_]*`. An unset name expands to nothing; a `$` not
-// followed by a valid name (or an unterminated `${`) is left literal. The result is a
-// fresh line the dispatcher then parses, so variables reach every command uniformly.
-fn expand_vars(line: &[u8], vars: &[(String, String)]) -> Vec<u8> {
-	let mut out: Vec<u8> = Vec::with_capacity(line.len());
-	let mut i: usize = 0;
-	while i < line.len() {
-		if line[i] != b'$' {
-			out.push(line[i]);
-			i += 1;
-			continue;
-		}
-		// `${NAME}`: the name runs to the closing brace.
-		if i + 1 < line.len() && line[i + 1] == b'{' {
-			let start: usize = i + 2;
-			match line[start..].iter().position(|&b: &u8| b == b'}') {
-				Some(rel) => {
-					push_var_value(&mut out, &line[start..start + rel], vars);
-					i = start + rel + 1;
-				}
-				None => {
-					// Unterminated `${`: leave it literal.
-					out.push(b'$');
-					i += 1;
-				}
-			}
-			continue;
-		}
-		// `$NAME`: the name is the identifier run right after the `$`.
-		let start: usize = i + 1;
-		if start < line.len() && (line[start].is_ascii_alphabetic() || line[start] == b'_') {
-			let mut end: usize = start + 1;
-			while end < line.len() && (line[end].is_ascii_alphanumeric() || line[end] == b'_') {
-				end += 1;
-			}
-			push_var_value(&mut out, &line[start..end], vars);
-			i = end;
-		} else {
-			// A lone `$` (or one before a non-name): keep it literal.
-			out.push(b'$');
-			i += 1;
-		}
-	}
-	out
-}
-
-// Append the value of the named variable to `out`, or nothing if it is unset.
-fn push_var_value(out: &mut Vec<u8>, name: &[u8], vars: &[(String, String)]) {
-	if let Some((_, value)) = vars.iter().find(|(n, _): &&(String, String)| n.as_bytes() == name) {
-		out.extend_from_slice(value.as_bytes());
-	}
-}
-
-// Rewrite the Linux-style `--json` / `--json-min` / `--cbor` flag tokens to the bare
-// `json` / `json-min` / `cbor` forms the dispatch arms and the tools match on - one
-// canonical spelling inside, both accepted at the prompt.
-fn normalize_flags(line: &[u8]) -> Vec<u8> {
-	let mut out: Vec<u8> = Vec::with_capacity(line.len());
-	for (i, token) in line.split(|&b| b == b' ').enumerate() {
-		if i > 0 {
-			out.push(b' ');
-		}
-		match token {
-			b"--json" => out.extend_from_slice(b"json"),
-			b"--json-min" => out.extend_from_slice(b"json-min"),
-			b"--cbor" => out.extend_from_slice(b"cbor"),
-			_ => out.extend_from_slice(token),
-		}
-	}
-	out
-}
+// `expand_vars` (the `$NAME` / `${NAME}` expansion) and `normalize_flags` (the
+// `--json` / `--cbor` rewrite) live in `proto::shell`, run for every line by
+// `parse_and_expand`, and are host-tested there.
 
 // The `<name> json` / `<name> json-min` sub-form of a query command's line, if it is
 // one - the argument string to forward to the tool. The tools parse the same two
@@ -706,17 +619,153 @@ fn json_subform<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 	}
 }
 
+// The launch shape of a governed tool the router matches from `TOOLS`: what a bare
+// command word carries, and what sub-form it also accepts.
+#[derive(Clone, Copy)]
+enum Shape {
+	// bare `name` only, no argument (e.g. `date`).
+	Bare,
+	// bare `name`, or the `name json` / `name json-min` sub-form (the query tools).
+	Json,
+	// bare `name`, or `name <rest>` (the rest passed through, trimmed).
+	Rest,
+	// `name <rest>` only, no bare form (e.g. `cat <path>`).
+	Args,
+}
+
+// The governed tools PermissionManager launches, each by command word and launch shape.
+// The router matches a line against this table (see `dispatch_tool`) instead of a
+// separate `if` arm per tool, so adding a tool is one row and the routing stays short.
+const TOOLS: &[(&[u8], Shape)] = &[
+	(b"date", Shape::Bare),
+	(b"uname", Shape::Bare),
+	(b"uptime", Shape::Bare),
+	(b"dmesg", Shape::Bare),
+	(b"ps", Shape::Bare),
+	(b"free", Shape::Bare),
+	(b"lsdev", Shape::Json),
+	(b"perm", Shape::Json),
+	(b"usage", Shape::Json),
+	(b"lscpu", Shape::Json),
+	(b"lsmem", Shape::Json),
+	(b"lsirq", Shape::Json),
+	(b"lspci", Shape::Json),
+	(b"lsblk", Shape::Json),
+	(b"lsusb", Shape::Json),
+	(b"lsvol", Shape::Json),
+	(b"log", Shape::Rest),
+	(b"config", Shape::Rest),
+	(b"lssvc", Shape::Rest),
+	(b"beep", Shape::Rest),
+	(b"ls", Shape::Rest),
+	(b"stop", Shape::Args),
+	(b"run", Shape::Args),
+	(b"set", Shape::Args),
+	(b"cat", Shape::Args),
+	(b"write", Shape::Args),
+	(b"rm", Shape::Args),
+	(b"mkdir", Shape::Args),
+	(b"rmdir", Shape::Args),
+];
+
+// The network tools, each by typed command word, the tool it launches (aliases fold in),
+// and whether it takes an argument. `httpd` is not here - it always backgrounds and is
+// routed on its own.
+const NET_TOOLS: &[(&[u8], &[u8], bool)] = &[
+	(b"ip", b"ip", false),
+	(b"net", b"ip", false),
+	(b"arp", b"arp", false),
+	(b"ss", b"ss", false),
+	(b"netstat", b"ss", false),
+	(b"ping", b"ping", true),
+	(b"nslookup", b"nslookup", true),
+	(b"host", b"nslookup", true),
+	(b"tcp", b"tcp", true),
+	(b"nc", b"nc", true),
+];
+
+// `line` after a `name ` prefix - the argument of `name <rest>` - or None if the line is
+// not that command word followed by a space.
+fn strip_word<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+	let rest: &[u8] = line.strip_prefix(name)?;
+	rest.strip_prefix(b" ")
+}
+
+// Route a line to a governed tool from `TOOLS`, returning whether it matched one.
+// PermissionManager grants each tool its manifest and forwards this terminal, the cwd,
+// and the argument the line's shape carries; a foreground launch, so a trailing `&` (the
+// caller's `bg`) does not apply.
+unsafe fn dispatch_tool(line: &[u8], permsvc: u64, cwd: &[u8]) -> bool {
+	unsafe {
+		for &(name, shape) in TOOLS {
+			match shape {
+				Shape::Bare => {
+					if line == name {
+						run_tool(permsvc, name, b"", cwd);
+						return true;
+					}
+				}
+				Shape::Json => {
+					if line == name {
+						run_tool(permsvc, name, b"", cwd);
+						return true;
+					}
+					if let Some(args) = json_subform(line, name) {
+						run_tool(permsvc, name, args, cwd);
+						return true;
+					}
+				}
+				Shape::Rest => {
+					if line == name {
+						run_tool(permsvc, name, b"", cwd);
+						return true;
+					}
+					if let Some(rest) = strip_word(line, name) {
+						run_tool(permsvc, name, trim(rest), cwd);
+						return true;
+					}
+				}
+				Shape::Args => {
+					if let Some(rest) = strip_word(line, name) {
+						run_tool(permsvc, name, trim(rest), cwd);
+						return true;
+					}
+				}
+			}
+		}
+		false
+	}
+}
+
+// Route a line to a net tool from `NET_TOOLS`, returning whether it matched one. Each is
+// spawned over a fresh NetworkService client, foreground or (with a trailing `&`, the
+// caller's `bg`) background; the arg-taking forms pass the rest of the line through.
+unsafe fn dispatch_net(line: &[u8], jobs: &mut Jobs, netsvc: u64, procsvc: u64, bg: bool) -> bool {
+	unsafe {
+		for &(word, tool, takes_args) in NET_TOOLS {
+			if takes_args {
+				if let Some(rest) = strip_word(line, word) {
+					spawn_net_tool(jobs, netsvc, procsvc, tool, trim(rest), bg);
+					return true;
+				}
+			} else if line == word {
+				spawn_net_tool(jobs, netsvc, procsvc, tool, b"", bg);
+				return true;
+			}
+		}
+		false
+	}
+}
+
 unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, jobs: &mut Jobs, vars: &mut Vec<(String, String)>, cwd: &mut String) -> bool {
 	unsafe {
+		// The line arrives already trimmed, `$`-expanded, and flag-normalized by
+		// `parse_and_expand`; trim again so the recursive `time <command>` path (which passes
+		// a slice of it) is clean too.
 		let line = trim(line);
 		if line.is_empty() {
 			return false;
 		}
-		// Normalize the Linux-style `--json` / `--cbor` flags to the bare tokens the
-		// dispatch arms and the tools match on, so `lsvol --json` and `lsvol json` are
-		// the same command whatever renders it.
-		let line: Vec<u8> = normalize_flags(line);
-		let line: &[u8] = &line;
 		// A bare `NAME=VALUE` sets a shell variable (write it through to the session so it
 		// persists, and update the cache); the value was already `$`-expanded upstream, so
 		// `FOO=$BAR` copies BAR's value. Checked before the `&` split so a value may hold one.
@@ -808,30 +857,11 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			resize_console(jobs.control, trim(rest));
 			return false;
 		}
-		if line == b"log" {
-			// Launch `log` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it a log + time client and forwards this terminal and the
-			// sub-form argument.
-			run_tool(permsvc, b"log", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"log ") {
-			// the sub-forms ride through verbatim: "json", "tail", "tail json",
-			// "--boot <n>", "--boot <n> json".
-			run_tool(permsvc, b"log", trim(rest), cwd.as_bytes());
-			return false;
-		}
-		if line == b"lsdev" {
-			// Launch `lsdev` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it a device client and forwards this terminal and the
-			// sub-form argument.
-			run_tool(permsvc, b"lsdev", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(args) = json_subform(line, b"lsdev") {
-			run_tool(permsvc, b"lsdev", args, cwd.as_bytes());
-			return false;
-		}
+		// The governed-tool routing (`date`, `ls`, `cat`, the `ls*` queries, ...) is a table
+		// at the end of `dispatch` (`dispatch_tool`); only the commands that do not fit a table
+		// shape stay as their own arms here: the graph/mouse views, the `cd` builtin, the
+		// process-launcher tools (`echo` / `readln` / `script`), the multi-verb `snap` /
+		// `volume`, the interactive `ps -i`, the flagged `free -h`, and the net tools.
 		if line == b"graph" {
 			query_graph(graphsvc, GraphFmt::Text);
 			return false;
@@ -848,42 +878,6 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			query_graph(graphsvc, GraphFmt::Cbor);
 			return false;
 		}
-		if line == b"perm" {
-			// Launch `perm` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it a client to its own serve channel and forwards this
-			// terminal and the sub-form argument.
-			run_tool(permsvc, b"perm", b"", cwd.as_bytes());
-			return false;
-		}
-		if line == b"perm json" || line == b"perm json-min" {
-			run_tool(permsvc, b"perm", &line[5..], cwd.as_bytes());
-			return false;
-		}
-		if line == b"usage" {
-			// Launch `usage` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it a resource client and forwards this terminal and the
-			// sub-form argument.
-			run_tool(permsvc, b"usage", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(args) = json_subform(line, b"usage") {
-			run_tool(permsvc, b"usage", args, cwd.as_bytes());
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"stop ") {
-			// Launch `stop` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it a ServiceManager admin channel and forwards this terminal
-			// and the service name.
-			run_tool(permsvc, b"stop", trim(rest), cwd.as_bytes());
-			return false;
-		}
-		if line == b"ps" {
-			// Launch `ps` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it a resource and a process client and forwards this
-			// terminal.
-			run_tool(permsvc, b"ps", b"", cwd.as_bytes());
-			return false;
-		}
 		if line == b"ps -i" {
 			// The live view needs the terminal itself (raw input, in-place redraws), so it
 			// launches through the interactive path: the same governed PermissionManager
@@ -892,157 +886,17 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			run_tool_interactive(jobs, permsvc, b"ps", b"-i", cwd.as_bytes());
 			return false;
 		}
-		if let Some(rest) = line.strip_prefix(b"run ") {
-			// Launch `run` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it a process client and forwards this terminal and the
-			// program name.
-			run_tool(permsvc, b"run", trim(rest), cwd.as_bytes());
-			return false;
-		}
-		if line == b"config" {
-			// Launch `config` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it a config client and forwards this terminal and the
-			// sub-form argument.
-			run_tool(permsvc, b"config", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"config ") {
-			run_tool(permsvc, b"config", trim(rest), cwd.as_bytes());
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"set ") {
-			run_tool(permsvc, b"set", trim(rest), cwd.as_bytes());
-			return false;
-		}
-		if line == b"date" {
-			// Launch `date` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it just a time client and forwards this terminal.
-			run_tool(permsvc, b"date", b"", cwd.as_bytes());
-			return false;
-		}
-		if line == b"uname" {
-			// The inventory commands run as sandboxed ELFs with an empty manifest - the
-			// system identity, the uptime and the boot log need no capability.
-			run_tool(permsvc, b"uname", b"", cwd.as_bytes());
-			return false;
-		}
-		if line == b"uptime" {
-			run_tool(permsvc, b"uptime", b"", cwd.as_bytes());
-			return false;
-		}
-		if line == b"dmesg" {
-			run_tool(permsvc, b"dmesg", b"", cwd.as_bytes());
-			return false;
-		}
-		if line == b"lscpu" {
-			run_tool(permsvc, b"lscpu", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(args) = json_subform(line, b"lscpu") {
-			run_tool(permsvc, b"lscpu", args, cwd.as_bytes());
-			return false;
-		}
-		if line == b"free" {
-			run_tool(permsvc, b"free", b"", cwd.as_bytes());
-			return false;
-		}
 		if line == b"free -h" {
 			run_tool(permsvc, b"free", b"-h", cwd.as_bytes());
-			return false;
-		}
-		if line == b"lsmem" {
-			run_tool(permsvc, b"lsmem", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(args) = json_subform(line, b"lsmem") {
-			run_tool(permsvc, b"lsmem", args, cwd.as_bytes());
-			return false;
-		}
-		if line == b"lsirq" {
-			run_tool(permsvc, b"lsirq", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(args) = json_subform(line, b"lsirq") {
-			run_tool(permsvc, b"lsirq", args, cwd.as_bytes());
-			return false;
-		}
-		if line == b"lspci" {
-			run_tool(permsvc, b"lspci", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(args) = json_subform(line, b"lspci") {
-			run_tool(permsvc, b"lspci", args, cwd.as_bytes());
-			return false;
-		}
-		if line == b"lssvc" {
-			run_tool(permsvc, b"lssvc", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"lssvc ") {
-			run_tool(permsvc, b"lssvc", trim(rest), cwd.as_bytes());
-			return false;
-		}
-		if line == b"lsblk" {
-			run_tool(permsvc, b"lsblk", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(args) = json_subform(line, b"lsblk") {
-			run_tool(permsvc, b"lsblk", args, cwd.as_bytes());
-			return false;
-		}
-		if line == b"lsusb" {
-			run_tool(permsvc, b"lsusb", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(args) = json_subform(line, b"lsusb") {
-			run_tool(permsvc, b"lsusb", args, cwd.as_bytes());
-			return false;
-		}
-		if line == b"beep" {
-			// Launch `beep` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it an audio client and forwards this terminal and the
-			// argument string.
-			run_tool(permsvc, b"beep", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"beep ") {
-			run_tool(permsvc, b"beep", trim(rest), cwd.as_bytes());
 			return false;
 		}
 		if line == b"mouse" {
 			mouse_cmd(inputsvc);
 			return false;
 		}
-		if line == b"ip" || line == b"net" {
-			spawn_net_tool(jobs, netsvc, procsvc, b"ip", b"", bg);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"ping ") {
-			spawn_net_tool(jobs, netsvc, procsvc, b"ping", trim(rest), bg);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"nslookup ") {
-			spawn_net_tool(jobs, netsvc, procsvc, b"nslookup", trim(rest), bg);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"host ") {
-			spawn_net_tool(jobs, netsvc, procsvc, b"nslookup", trim(rest), bg);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"tcp ") {
-			spawn_net_tool(jobs, netsvc, procsvc, b"tcp", trim(rest), bg);
-			return false;
-		}
-		if line == b"arp" {
-			spawn_net_tool(jobs, netsvc, procsvc, b"arp", b"", bg);
-			return false;
-		}
-		if line == b"ss" || line == b"netstat" {
-			spawn_net_tool(jobs, netsvc, procsvc, b"ss", b"", bg);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"nc ") {
-			spawn_net_tool(jobs, netsvc, procsvc, b"nc", trim(rest), bg);
+		// the network views: a table of net tools spawned over a fresh NetworkService client
+		// (`httpd` is separate - it always backgrounds).
+		if dispatch_net(line, jobs, netsvc, procsvc, bg) {
 			return false;
 		}
 		if line == b"httpd" {
@@ -1063,17 +917,6 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			exec(jobs, procsvc, b"readln", b"", 0, bg);
 			return false;
 		}
-		if line == b"lsvol" {
-			// Launch `lsvol` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it the four volume StorageService clients (the `volumes`
-			// capability) and forwards this terminal.
-			run_tool(permsvc, b"lsvol", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(args) = json_subform(line, b"lsvol") {
-			run_tool(permsvc, b"lsvol", args, cwd.as_bytes());
-			return false;
-		}
 		if line == b"cd" {
 			// no argument returns to the home volume
 			cwd.clear();
@@ -1085,50 +928,6 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		}
 		if let Some(rest) = line.strip_prefix(b"cd ") {
 			cd_cmd(cwd, trim(rest), session, storage, media, iso, udf, usb);
-			return false;
-		}
-		if line == b"ls" {
-			// no argument lists the current working directory: launch `ls` as its own sandboxed
-			// ELF through PermissionManager, which grants it the four volume clients and this
-			// terminal; it inherits the cwd and lists it.
-			run_tool(permsvc, b"ls", b"", cwd.as_bytes());
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"ls ") {
-			// Launch `ls` as its own sandboxed ELF through PermissionManager: it inherits this cwd,
-			// resolves the (relative or absolute) path, and routes to the volume it names.
-			run_tool(permsvc, b"ls", trim(rest), cwd.as_bytes());
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"cat ") {
-			// Launch `cat` as its own sandboxed ELF through PermissionManager: it inherits this
-			// cwd, resolves the path, and routes to the volume it names.
-			run_tool(permsvc, b"cat", trim(rest), cwd.as_bytes());
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"write ") {
-			// Launch `write` as its own sandboxed ELF through PermissionManager: it inherits this
-			// cwd, splits the "<path> <text>" argument, resolves the path, and routes to the volume
-			// it names.
-			run_tool(permsvc, b"write", trim(rest), cwd.as_bytes());
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"rm ") {
-			// Launch `rm` as its own sandboxed ELF through PermissionManager: it inherits this cwd,
-			// resolves the path, and routes to the volume it names.
-			run_tool(permsvc, b"rm", trim(rest), cwd.as_bytes());
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"mkdir ") {
-			// Launch `mkdir` as its own sandboxed ELF through PermissionManager: it inherits this
-			// cwd, resolves the path, and routes to the volume it names.
-			run_tool(permsvc, b"mkdir", trim(rest), cwd.as_bytes());
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"rmdir ") {
-			// Launch `rmdir` as its own sandboxed ELF through PermissionManager: it inherits this
-			// cwd, resolves the path, and routes to the volume it names.
-			run_tool(permsvc, b"rmdir", trim(rest), cwd.as_bytes());
 			return false;
 		}
 		if line == b"snap" || line == b"snap list" {
@@ -1180,6 +979,10 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		}
 		if let Some(rest) = line.strip_prefix(b"script ") {
 			run_script(jobs, procsvc, trim(rest));
+			return false;
+		}
+		// everything else is a governed tool: match it against the tool table.
+		if dispatch_tool(line, permsvc, cwd.as_bytes()) {
 			return false;
 		}
 		print(b"\x1b[31munknown command: ");
@@ -1540,23 +1343,7 @@ unsafe fn print_hex(bytes: &[u8]) {
 }
 
 // Trim leading and trailing ASCII spaces from a byte slice.
-fn trim(mut s: &[u8]) -> &[u8] {
-	while let [first, rest @ ..] = s {
-		if first.is_ascii_whitespace() {
-			s = rest;
-		} else {
-			break;
-		}
-	}
-	while let [rest @ .., last] = s {
-		if last.is_ascii_whitespace() {
-			s = rest;
-		} else {
-			break;
-		}
-	}
-	s
-}
+// `trim` (drop ASCII whitespace from both ends) lives in `proto::shell`.
 
 // The names in the system volume's bin/ - the pool of runnable programs Tab completion
 // offers alongside the builtins (the $PATH analogue). Empty when storage is unreachable.

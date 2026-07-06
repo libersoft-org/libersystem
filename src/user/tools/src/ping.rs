@@ -27,6 +27,7 @@ use core::fmt::Write;
 use proto::codec::{JsonMode, json_escape};
 use proto::system::{Ipv4Addr, PingReply, PingStatus, network};
 use rt::*;
+use tools::parse_u64;
 
 // The representation ping renders its results in. Extend with further codecs (e.g.
 // CBOR) as needed - the probe loop is representation-agnostic.
@@ -317,7 +318,7 @@ fn parse_args(args: &[u8]) -> Option<(Option<u32>, OutputFormat, &[u8])> {
 		let (tok, after): (&[u8], &[u8]) = next_token(rest);
 		if tok == b"-c" {
 			let (num, after_num): (&[u8], &[u8]) = next_token(skip_spaces(after));
-			count = Some(parse_u32(num)?);
+			count = Some(parse_u64(num).filter(|v| *v <= u32::MAX as u64)? as u32);
 			rest = after_num;
 		} else if tok == b"--json" || tok == b"-j" || tok == b"json" {
 			format = OutputFormat::Json(JsonMode::Pretty);
@@ -354,19 +355,7 @@ fn next_token(s: &[u8]) -> (&[u8], &[u8]) {
 }
 
 // Parse a decimal u32, or None if empty or non-numeric.
-fn parse_u32(s: &[u8]) -> Option<u32> {
-	if s.is_empty() {
-		return None;
-	}
-	let mut val: u32 = 0;
-	for &b in s {
-		if !b.is_ascii_digit() {
-			return None;
-		}
-		val = val.checked_mul(10)?.checked_add((b - b'0') as u32)?;
-	}
-	Some(val)
-}
+// `parse_u64` comes from the shared tools crate.
 
 // Append raw ASCII bytes (a hostname or rendered address) to the string.
 fn append_bytes(out: &mut String, bytes: &[u8]) {

@@ -17,7 +17,7 @@ extern crate alloc;
 use proto::codec::Buffer;
 use proto::system::{Endpoint, Error, Ipv4Addr, network, socket};
 use rt::*;
-
+use tools::{parse_port, trim};
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 128] = [0u8; 128];
@@ -145,33 +145,4 @@ unsafe fn make_buffer(bytes: &[u8]) -> Option<Buffer> {
 	}
 }
 
-// Parse a decimal port number (0-65535), or None if malformed or out of range.
-fn parse_port(s: &[u8]) -> Option<u16> {
-	if s.is_empty() || s.len() > 5 {
-		return None;
-	}
-	let mut v: u32 = 0;
-	for &b in s {
-		if !b.is_ascii_digit() {
-			return None;
-		}
-		v = v * 10 + (b - b'0') as u32;
-		if v > 65535 {
-			return None;
-		}
-	}
-	Some(v as u16)
-}
-
-// Trim leading and trailing ASCII whitespace.
-fn trim(s: &[u8]) -> &[u8] {
-	let mut start: usize = 0;
-	let mut end: usize = s.len();
-	while start < end && s[start].is_ascii_whitespace() {
-		start += 1;
-	}
-	while end > start && s[end - 1].is_ascii_whitespace() {
-		end -= 1;
-	}
-	&s[start..end]
-}
+// `parse_port` and `trim` come from the shared tools crate.

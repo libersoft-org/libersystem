@@ -24,5 +24,9 @@ pub mod clock;
 // Hand-written `vol://` path resolution shared by the shell and the sandboxed tools.
 pub mod path;
 
+// The shell's pure line language (trim, flag normalization, `$NAME` expansion, and
+// `NAME=VALUE` detection) - host-tested so it is exercised without booting.
+pub mod shell;
+
 #[cfg(test)]
 mod tests;

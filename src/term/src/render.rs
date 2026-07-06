@@ -20,7 +20,7 @@ use crate::screen::{Cell, Color, CursorShape, Screen, ScrollOp};
 // (row-major, bit 7 = leftmost pixel): [count u32 LE][count x codepoint u32 LE]
 // [count x 16 glyph bytes], generated from unscii-16.hex. A codepoint the font lacks
 // renders as '?'.
-static FONT: &[u8] = include_bytes!("unscii16.bin");
+const FONT: &[u8] = include_bytes!("unscii16.bin");
 
 const FONT_W: usize = 8;
 const FONT_H: usize = 16;
@@ -30,20 +30,68 @@ const SCALE: usize = 1;
 pub const CELL_W: usize = FONT_W * SCALE;
 pub const CELL_H: usize = FONT_H * SCALE;
 
-// The 16-byte bitmap for a Unicode codepoint: a binary search over the asset's sorted
-// codepoint table, falling back to '?' for a codepoint the font does not cover ('?' is
-// guaranteed present). Called per changed cell, so the log2(n) probe is cheap.
+// The number of glyphs in the font's sorted codepoint table, and where the 16-byte
+// bitmaps begin (past the 4-byte header and the codepoint table).
+const FONT_COUNT: usize = u32::from_le_bytes([FONT[0], FONT[1], FONT[2], FONT[3]]) as usize;
+const FONT_GLYPHS_BASE: usize = 4 + FONT_COUNT * 4;
+
+// A direct-mapped cache of the font-table index for every codepoint in 0x00..0x100 - the
+// hot ASCII + Latin-1 range, the bulk of every repaint - computed once at compile time
+// from the sorted table, so a cell in that range resolves with one array read instead of a
+// ~log2(3000) binary-search probe. A codepoint the font lacks holds NONE and falls through
+// to the '?' path.
+const ASCII_CACHE_LEN: usize = 256;
+const ASCII_GLYPH_NONE: u16 = u16::MAX;
+const ASCII_CACHE: [u16; ASCII_CACHE_LEN] = build_ascii_cache();
+
+const fn build_ascii_cache() -> [u16; ASCII_CACHE_LEN] {
+	let mut cache = [ASCII_GLYPH_NONE; ASCII_CACHE_LEN];
+	let mut i = 0;
+	// the table is sorted ascending, so the cached range is its prefix: walk it until the
+	// first codepoint past the range, recording each one's index.
+	while i < FONT_COUNT {
+		let cp = u32::from_le_bytes([FONT[4 + i * 4], FONT[4 + i * 4 + 1], FONT[4 + i * 4 + 2], FONT[4 + i * 4 + 3]]) as usize;
+		if cp >= ASCII_CACHE_LEN {
+			break;
+		}
+		cache[cp] = i as u16;
+		i += 1;
+	}
+	cache
+}
+
+// The number of binary-search probes taken, for the repaint measurement test only.
+#[cfg(test)]
+static GLYPH_PROBES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+// The 16-byte bitmap for a Unicode codepoint. The hot ASCII + Latin-1 range resolves
+// through the compile-time direct-mapped cache (one array read); everything above it is a
+// binary search over the sorted table. A codepoint the font lacks renders as '?' (which is
+// guaranteed present). Called per changed cell, so the fast path matters on a repaint.
 fn glyph_bitmap(cp: u32) -> &'static [u8] {
-	let count = u32::from_le_bytes([FONT[0], FONT[1], FONT[2], FONT[3]]) as usize;
-	let table = &FONT[4..4 + count * 4];
-	let glyphs_base = 4 + count * 4;
+	if (cp as usize) < ASCII_CACHE_LEN {
+		let idx = ASCII_CACHE[cp as usize];
+		if idx != ASCII_GLYPH_NONE {
+			let at = FONT_GLYPHS_BASE + idx as usize * FONT_H;
+			return &FONT[at..at + FONT_H];
+		}
+		if cp == b'?' as u32 {
+			// unreachable as long as the asset carries '?': a fixed blank stops the recursion.
+			static BLANK: [u8; FONT_H] = [0u8; FONT_H];
+			return &BLANK;
+		}
+		return glyph_bitmap(b'?' as u32);
+	}
+	let table = &FONT[4..4 + FONT_COUNT * 4];
 	let mut lo: usize = 0;
-	let mut hi: usize = count;
+	let mut hi: usize = FONT_COUNT;
 	while lo < hi {
+		#[cfg(test)]
+		GLYPH_PROBES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 		let mid = (lo + hi) / 2;
 		let entry = u32::from_le_bytes([table[mid * 4], table[mid * 4 + 1], table[mid * 4 + 2], table[mid * 4 + 3]]);
 		if entry == cp {
-			let at = glyphs_base + mid * FONT_H;
+			let at = FONT_GLYPHS_BASE + mid * FONT_H;
 			return &FONT[at..at + FONT_H];
 		}
 		if entry < cp {
@@ -51,11 +99,6 @@ fn glyph_bitmap(cp: u32) -> &'static [u8] {
 		} else {
 			hi = mid;
 		}
-	}
-	if cp == b'?' as u32 {
-		// unreachable as long as the asset carries '?': a fixed blank stops the recursion.
-		static BLANK: [u8; FONT_H] = [0u8; FONT_H];
-		return &BLANK;
 	}
 	glyph_bitmap(b'?' as u32)
 }
@@ -595,5 +638,58 @@ impl FramebufferRenderer {
 				self.blit_cell(col, row, c.glyph, bg, fg, c.underline);
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod glyph_tests {
+	use super::*;
+	use core::sync::atomic::Ordering;
+
+	// The plain binary search, no cache - what resolving a codepoint cost before the
+	// cache, kept here as the reference the fast path must match.
+	fn bsearch(cp: u32) -> &'static [u8] {
+		let table = &FONT[4..4 + FONT_COUNT * 4];
+		let mut lo: usize = 0;
+		let mut hi: usize = FONT_COUNT;
+		while lo < hi {
+			let mid = (lo + hi) / 2;
+			let entry = u32::from_le_bytes([table[mid * 4], table[mid * 4 + 1], table[mid * 4 + 2], table[mid * 4 + 3]]);
+			if entry == cp {
+				let at = FONT_GLYPHS_BASE + mid * FONT_H;
+				return &FONT[at..at + FONT_H];
+			}
+			if entry < cp {
+				lo = mid + 1;
+			} else {
+				hi = mid;
+			}
+		}
+		bsearch(b'?' as u32)
+	}
+
+	#[test]
+	fn ascii_cache_matches_the_search_and_eliminates_repaint_probes() {
+		// correctness: every codepoint in the cached range (and a spread above it) resolves
+		// to the same glyph through the cache as through the plain binary search, so the
+		// fast path is a pure optimization with no behavioral change. (One test, not two, so
+		// the shared probe counter is never raced by a parallel test.)
+		for cp in 0u32..0x120 {
+			assert_eq!(glyph_bitmap(cp), bsearch(cp), "glyph for U+{cp:04X} differs");
+		}
+		// the measurement: a full 80x25 screen of ASCII text repaints with zero
+		// binary-search probes - the whole hot range is served by the compile-time cache, so
+		// the cache pays (before it, every one of those ~2000 cells cost a log2(3000)
+		// search). A codepoint above the cache still probes, so the search path stays intact
+		// where the cache does not reach.
+		GLYPH_PROBES.store(0, Ordering::Relaxed);
+		for _ in 0..25 {
+			for cp in 0x20u32..0x70 {
+				let _ = glyph_bitmap(cp);
+			}
+		}
+		assert_eq!(GLYPH_PROBES.load(Ordering::Relaxed), 0, "an ASCII repaint must not binary-search");
+		let _ = glyph_bitmap(0x2500); // a box-drawing codepoint above the cache
+		assert!(GLYPH_PROBES.load(Ordering::Relaxed) > 0, "a codepoint above the cache still searches");
 	}
 }

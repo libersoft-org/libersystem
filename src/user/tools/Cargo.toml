@@ -8,6 +8,13 @@ edition = "2024"
 build = "../build.rs"
 description = "Standalone foreground tools the shell spawns"
 
+# The helpers the tools share (trimming, tokenizing, decimal/port parsing, decimal
+# formatting, and the receive-and-parse-a-JsonMode handshake). Each bin pulls them in
+# with `use tools::*`, so the parsing and formatting cannot drift between tools.
+[lib]
+name = "tools"
+path = "src/lib.rs"
+
 [[bin]]
 name = "echo"
 path = "src/echo.rs"

@@ -16,6 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use proto::system::{ConfigEntry, config};
 use rt::*;
+use tools::trim;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -70,21 +71,4 @@ unsafe fn set_config(cfgsvc: u64, rest: &[u8]) {
 	}
 }
 
-// Drop ASCII whitespace from both ends of a byte slice.
-fn trim(mut s: &[u8]) -> &[u8] {
-	while let [first, rest @ ..] = s {
-		if first.is_ascii_whitespace() {
-			s = rest;
-		} else {
-			break;
-		}
-	}
-	while let [rest @ .., last] = s {
-		if last.is_ascii_whitespace() {
-			s = rest;
-		} else {
-			break;
-		}
-	}
-	s
-}
+// `trim` comes from the shared tools crate.
