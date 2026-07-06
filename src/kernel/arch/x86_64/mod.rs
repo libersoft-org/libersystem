@@ -50,9 +50,11 @@ pub fn init_tsc() {
 }
 
 // Initialize per-CPU data for the bootstrap processor (CPU id 0). The BSP's
-// GDT/TSS and IDT are already loaded by init(); this only sets up its GS base.
+// GDT/TSS and IDT are already loaded by init(); this only sets up its GS base
+// and records where its TSS.RSP0 slot lives for per-thread ring-3 stacks.
 pub fn init_bsp_percpu(lapic_id: u32) {
 	percpu::init(0, lapic_id);
+	percpu::set_tss_rsp0_slot(gdt::rsp0_slot_addr());
 }
 
 // Full per-core bring-up for an application processor, run on that core: enable
@@ -63,6 +65,7 @@ pub fn init_ap(cpu_id: usize, lapic_id: u32) {
 	gdt::load_ap(cpu_id);
 	idt::load();
 	percpu::init(cpu_id, lapic_id);
+	percpu::set_tss_rsp0_slot(gdt::rsp0_slot_addr());
 	apic::init_ap();
 	syscall::init();
 }

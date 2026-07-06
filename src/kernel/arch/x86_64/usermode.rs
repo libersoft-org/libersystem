@@ -2,8 +2,11 @@
 //
 // `enter` drops the calling kernel thread into ring 3 at a user entry point with
 // a user stack. It first saves the thread's callee-saved registers and parks the
-// resulting kernel stack pointer in the per-CPU block (KERNEL_RSP), then builds an
-// `iretq` frame with the user code/data selectors and returns into user mode.
+// resulting kernel stack pointer in the per-CPU block (KERNEL_RSP), in the
+// thread's own slot, and in this core's TSS.RSP0 - so a ring-3 interrupt or
+// exception lands on the thread's own kernel stack (per-thread RSP0 is what makes
+// ring-3 preemption safe) - then builds an `iretq` frame with the user code/data
+// selectors and returns into user mode.
 //
 // The thread comes back when user code invokes SYS_USER_EXIT, whose handler calls
 // `exit_to_kernel`: a one-way longjmp that restores the parked kernel stack, pops
@@ -47,6 +50,8 @@ unsafe extern "C" {
 	fn user_nx_program_end();
 	fn user_stack_probe_program_start();
 	fn user_stack_probe_program_end();
+	fn user_spin_program_start();
+	fn user_spin_program_end();
 }
 
 // Drop the calling thread into ring 3 at `entry` with `user_stack` and `arg` (the
@@ -132,6 +137,17 @@ pub fn program_stack_probe_bytes() -> &'static [u8] {
 	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
 }
 
+// The bytes of the embedded ring-3 CPU-bound spinner (position-independent
+// machine code, copied into a USER page before entering). It never makes a
+// syscall until released: it increments a counter and polls a stop flag in a
+// shared data page, so only timer-driven ring-3 preemption can let the thread
+// that sets the flag run on the same core.
+pub fn program_spin_bytes() -> &'static [u8] {
+	let start = user_spin_program_start as *const () as usize;
+	let end = user_spin_program_end as *const () as usize;
+	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
+}
+
 global_asm!(
 	".text",
 	".global user_enter",
@@ -150,6 +166,15 @@ global_asm!(
 	"jz 1f",
 	"mov [rcx], rsp",
 	"1:",
+	// And into this core's TSS.RSP0, so an interrupt taken while this thread runs
+	// in ring 3 pushes its frame onto this thread's own kernel stack (just below
+	// the parked frame), not a shared per-core stack - the scheduler keeps RSP0
+	// tracking the current thread from here on.
+	"mov rax, gs:[{tss0}]",
+	"test rax, rax",
+	"jz 4f",
+	"mov [rax], rsp",
+	"4:",
 	// Build the iretq frame (pushed high to low: SS, RSP, RFLAGS, CS, RIP).
 	"push {uds}",
 	"push rsi",
@@ -186,6 +211,7 @@ global_asm!(
 	"pop rbp",
 	"ret",
 	krsp = const percpu::KERNEL_RSP_OFFSET,
+	tss0 = const percpu::TSS_RSP0_OFFSET,
 	fu = const percpu::FROM_USER_OFFSET,
 	uds = const USER_DS,
 	ucs = const USER_CS,
@@ -312,5 +338,29 @@ global_asm!(
 	"jmp 3b",
 	".global user_stack_probe_program_end",
 	"user_stack_probe_program_end:",
+	exit = const crate::syscall::SYS_USER_EXIT,
+);
+
+// Embedded ring-3 CPU-bound spinner. Position-independent: on entry rdi holds the
+// address of a shared data page - [rdi] is a stop flag another thread sets through
+// the frame's kernel mapping, [rdi + 8] a counter this loop increments so an
+// observer can tell the spinner is genuinely running. It makes NO syscall while
+// spinning; it exits only after the flag is raised, which can only happen if the
+// timer preempts it in ring 3 and lets the releasing thread run.
+global_asm!(
+	".text",
+	".global user_spin_program_start",
+	"user_spin_program_start:",
+	"2:",
+	"inc qword ptr [rdi + 8]",
+	"mov rax, [rdi]",
+	"test rax, rax",
+	"jz 2b",
+	"mov eax, {exit}",
+	"syscall",
+	"3:",
+	"jmp 3b",
+	".global user_spin_program_end",
+	"user_spin_program_end:",
 	exit = const crate::syscall::SYS_USER_EXIT,
 );

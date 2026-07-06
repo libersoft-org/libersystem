@@ -25,6 +25,7 @@ pub const USER_RSP_OFFSET: usize = 16;
 pub const USER_RIP_OFFSET: usize = 24;
 pub const USER_RFLAGS_OFFSET: usize = 32;
 pub const FROM_USER_OFFSET: usize = 40;
+pub const TSS_RSP0_OFFSET: usize = 48;
 
 #[repr(C)]
 pub struct PerCpu {
@@ -41,11 +42,15 @@ pub struct PerCpu {
 	// Non-zero while servicing a syscall that originated in ring 3, so handlers
 	// know to validate user-supplied pointers.
 	from_user: u64,
+	// Address of this core's TSS.RSP0 slot, so the scheduler and the ring-3 entry
+	// path can point the ring-3 interrupt stack at the current thread's own kernel
+	// stack (per-thread RSP0 is what makes ring-3 preemption safe).
+	tss_rsp0: u64,
 }
 
 impl PerCpu {
 	const fn empty() -> Self {
-		Self { cpu_id: 0, lapic_id: 0, kernel_rsp: 0, user_rsp: 0, user_rip: 0, user_rflags: 0, from_user: 0 }
+		Self { cpu_id: 0, lapic_id: 0, kernel_rsp: 0, user_rsp: 0, user_rip: 0, user_rflags: 0, from_user: 0, tss_rsp0: 0 }
 	}
 
 	pub fn cpu_id(&self) -> u32 {
@@ -62,6 +67,7 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, user_rsp) == USER_RSP_OFFSET
 const _: () = assert!(core::mem::offset_of!(PerCpu, user_rip) == USER_RIP_OFFSET);
 const _: () = assert!(core::mem::offset_of!(PerCpu, user_rflags) == USER_RFLAGS_OFFSET);
 const _: () = assert!(core::mem::offset_of!(PerCpu, from_user) == FROM_USER_OFFSET);
+const _: () = assert!(core::mem::offset_of!(PerCpu, tss_rsp0) == TSS_RSP0_OFFSET);
 
 static PER_CPU: AtomicPtr<PerCpu> = AtomicPtr::new(ptr::null_mut());
 
@@ -101,6 +107,31 @@ pub fn this_cpu() -> &'static PerCpu {
 pub fn set_kernel_rsp(value: u64) {
 	let base = msr::read(IA32_GS_BASE);
 	unsafe { (*(base as *mut PerCpu)).kernel_rsp = value };
+}
+
+// Record where this core's TSS.RSP0 slot lives (called once per core after its
+// GDT/TSS are installed), so set_rsp0 and the ring-3 entry stub can retarget it.
+pub fn set_tss_rsp0_slot(addr: u64) {
+	let base = msr::read(IA32_GS_BASE);
+	unsafe { (*(base as *mut PerCpu)).tss_rsp0 = addr };
+}
+
+// Point this core's TSS.RSP0 at `value` - the incoming thread's parked kernel
+// stack position - so a ring-3 interrupt lands on that thread's own stack. A zero
+// value (a thread that never entered ring 3) leaves the slot untouched: such a
+// thread cannot take a ring-3 interrupt, and its first usermode::enter sets the
+// slot itself.
+pub fn set_rsp0(value: u64) {
+	if value == 0 {
+		return;
+	}
+	let slot = this_cpu().tss_rsp0;
+	if slot != 0 {
+		// The TSS is #[repr(C, packed)], so the RSP0 slot sits at a 4-byte-aligned
+		// address - write unaligned (the CPU reads TSS fields byte-wise anyway, and
+		// the opaque context-switch asm that follows keeps the store ordered).
+		unsafe { (slot as *mut u64).write_unaligned(value) };
+	}
 }
 
 // True while the running core is servicing a syscall issued from ring 3.

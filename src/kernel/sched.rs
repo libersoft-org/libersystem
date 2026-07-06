@@ -477,13 +477,27 @@ fn reap(sched: &CpuSched) {
 // already sent). A no-op in the idle context (no current thread) or when no other
 // thread is ready, so a sole thread keeps running uninterrupted and the idle loop
 // is never disturbed. The quantum is one timer tick (10 ms): a fair per-core round
-// robin. Only ring-0 threads reach here (the ISR gates on the interrupted CPL), so
-// the preemptive switch runs on the thread's own kernel stack.
-pub fn on_timer_preempt() {
+// robin. Ring-0 and ring-3 threads alike reach here - a ring-3 interrupt frame
+// lands on the thread's own kernel stack (per-thread TSS.RSP0), so the preemptive
+// switch travels with the thread either way. `from_user` is true when the timer
+// interrupted ring 3: user code holds no kernel locks, so a thread whose process
+// was killed while it spun in ring 3 is retired right here - the one kill point a
+// never-syscalling loop cannot dodge.
+pub fn on_timer_preempt(from_user: bool) {
 	if !PREEMPTION_ENABLED.load(Ordering::Relaxed) {
 		return;
 	}
 	let sched = cpu_sched(current_cpu_id());
+	if from_user {
+		// No Arc is held across the never-returning Retire (the closure yields a
+		// plain bool), and the lock guard drops at the end of the statement.
+		let killed = sched.inner.lock().current.as_ref().is_some_and(|t| t.process().is_killed());
+		if killed {
+			reschedule(Disposition::Retire);
+			// Retire switched away for good; this frame is never resumed.
+			arch::halt_loop();
+		}
+	}
 	{
 		let inner = sched.inner.lock();
 		if inner.current.is_none() || inner.run_queue.is_empty() {
@@ -535,6 +549,11 @@ fn reschedule(disp: Disposition) {
 			guard.current = Some(next);
 			drop(guard);
 			arch::percpu::set_kernel_rsp(new_syscall_rsp);
+			// Point TSS.RSP0 at the same parked position, so a ring-3 interrupt taken
+			// while this thread runs lands on its own kernel stack (a zero value - a
+			// thread that never entered ring 3 - leaves the slot alone; it cannot take
+			// a ring-3 interrupt, and usermode::enter sets the slot itself).
+			arch::percpu::set_rsp0(new_syscall_rsp);
 			switch_address_space(new_cr3);
 			unsafe { arch::context::switch_context(old_sp, new_sp) };
 			// Resumed on this thread: restore the interrupt state it switched with.

@@ -37,7 +37,10 @@ pub const DOUBLE_FAULT_IST_INDEX: u8 = 1;
 
 const IST_STACK_SIZE: usize = 4096 * 5;
 // Per-core ring-0 stack the CPU switches to (via TSS.RSP0) when an interrupt or
-// exception is taken while running in ring 3.
+// exception is taken while running in ring 3. Only a fallback: once a thread
+// enters ring 3, TSS.RSP0 tracks that thread's own parked kernel stack (set by
+// usermode::enter and restored by the scheduler on every context switch), so a
+// ring-3 interrupt frame lands on a stack that travels with the thread.
 const RSP0_STACK_SIZE: usize = 4096 * 5;
 
 // null, kernel code, kernel data, three user segments, then the two entries of
@@ -153,6 +156,23 @@ unsafe fn load_tss() {
 	unsafe {
 		asm!("ltr {0:x}", in(reg) TSS_SELECTOR, options(nostack, preserves_flags));
 	}
+}
+
+// The address of the running core's TSS.RSP0 slot, derived from the live GDTR:
+// read the TSS descriptor out of this core's GDT and offset to
+// privilege_stack_table[0] (right after the leading reserved u32). The per-CPU
+// block keeps this pointer so the scheduler and the ring-3 entry path can retarget
+// RSP0 at the current thread's kernel stack without knowing the CpuArea's address.
+pub fn rsp0_slot_addr() -> u64 {
+	let mut ptr = DescriptorPointer { limit: 0, base: 0 };
+	unsafe {
+		asm!("sgdt [{}]", in(reg) &mut ptr, options(nostack, preserves_flags));
+	}
+	let gdt = ptr.base as *const u64;
+	let low = unsafe { gdt.add(6).read() };
+	let high = unsafe { gdt.add(7).read() };
+	let tss_base = ((low >> 16) & 0xFF_FFFF) | (((low >> 56) & 0xFF) << 24) | ((high & 0xFFFF_FFFF) << 32);
+	tss_base + 4
 }
 
 // Build the two 64-bit halves of a 64-bit TSS system descriptor.

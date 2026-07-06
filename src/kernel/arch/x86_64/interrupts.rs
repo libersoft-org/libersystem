@@ -286,17 +286,16 @@ const MSI_STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); MSI_COUNT] = m
 extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {}
 
 // The LAPIC timer vector. Unlike the generic IRQ stubs it preempts: after counting
-// the tick and signalling EOI, it rotates to the next ready thread when it
-// interrupted ring-0 thread code. EOI is sent BEFORE the switch so the LAPIC keeps
-// delivering ticks while this thread is descheduled. Ring-3 is not preempted yet:
-// its interrupt frame lands on the shared per-core RSP0 stack, so context-switching
-// from here would not travel with the thread (that needs a per-thread RSP0).
+// the tick and signalling EOI, it rotates to the next ready thread. EOI is sent
+// BEFORE the switch so the LAPIC keeps delivering ticks while this thread is
+// descheduled. Ring 3 is preempted too: its interrupt frame lands on the thread's
+// own kernel stack (per-thread TSS.RSP0, retargeted by the scheduler and by
+// usermode::enter), so the switch travels with the thread; the CPL is passed down
+// so a killed process spinning in ring 3 can be retired at its next tick.
 extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
 	apic::on_timer_tick();
 	apic::eoi();
-	if frame.code_segment & 3 == 0 {
-		crate::sched::on_timer_preempt();
-	}
+	crate::sched::on_timer_preempt(frame.code_segment & 3 == 3);
 }
 
 const STUBS: [extern "x86-interrupt" fn(InterruptStackFrame); IRQ_COUNT] = [irq0, irq1, irq2, irq3, irq4, irq5, irq6, irq7, irq8, irq9, irq10, irq11, irq12, irq13, irq14, irq15];

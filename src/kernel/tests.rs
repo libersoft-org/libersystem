@@ -1063,6 +1063,75 @@ fn preemption_preempts_a_cpu_bound_thread() {
 }
 
 #[test_case]
+fn a_cpu_bound_ring3_thread_is_preempted() {
+	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+	use mem::frame::{self, PAGE_SIZE};
+	// The spinner's shared data page sits at a fixed USER address clear of the test
+	// code and stack pages: [0] = stop flag, [8] = liveness counter.
+	const SPIN_FLAG_VA: u64 = 0x0000_0000_4000_2000;
+	static SPIN_FLAG_PHYS: AtomicU64 = AtomicU64::new(0);
+	static SPIN_DONE: AtomicBool = AtomicBool::new(false);
+	// Host thread for the ring-3 spinner: maps code + stack + the shared data page,
+	// publishes the data frame for the releaser, and drops to ring 3. The spinner
+	// makes NO syscall until released, so without ring-3 preemption it would own
+	// this core forever and the test would hang.
+	extern "C" fn spinner_body(_arg: u64) {
+		let code = frame::allocate().expect("user code frame");
+		let stack = frame::allocate().expect("user stack frame");
+		let data = frame::allocate().expect("user data frame");
+		// Zero the data page so the stop flag starts clear (a recycled frame is not).
+		unsafe { core::ptr::write_bytes((mem::hhdm_offset() + data) as *mut u8, 0, PAGE_SIZE as usize) };
+		let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
+		arch::paging::map_page(USER_CODE_VA, code, flags);
+		arch::paging::map_page(USER_STACK_VA, stack, flags | arch::paging::NO_EXECUTE);
+		arch::paging::map_page(SPIN_FLAG_VA, data, flags | arch::paging::NO_EXECUTE);
+		let program = arch::usermode::program_spin_bytes();
+		unsafe {
+			core::ptr::copy_nonoverlapping(program.as_ptr(), USER_CODE_VA as *mut u8, program.len());
+		}
+		SPIN_FLAG_PHYS.store(data, Ordering::SeqCst);
+		unsafe {
+			arch::usermode::enter(USER_CODE_VA, USER_STACK_VA + PAGE_SIZE, SPIN_FLAG_VA);
+		}
+		arch::paging::unmap_page(USER_CODE_VA);
+		arch::paging::unmap_page(USER_STACK_VA);
+		arch::paging::unmap_page(SPIN_FLAG_VA);
+		frame::deallocate(code);
+		frame::deallocate(stack);
+		frame::deallocate(data);
+		SPIN_DONE.store(true, Ordering::SeqCst);
+	}
+	// The releaser waits until the spinner's counter demonstrably grows - proof the
+	// ring-3 loop is running AND being preempted (this kernel thread shares the same
+	// core) - then raises the stop flag through the frame's kernel mapping.
+	extern "C" fn releaser(_arg: u64) {
+		let data = loop {
+			let phys = SPIN_FLAG_PHYS.load(Ordering::SeqCst);
+			if phys != 0 {
+				break phys;
+			}
+			core::hint::spin_loop();
+		};
+		let flag = (mem::hhdm_offset() + data) as *mut u64;
+		let counter = unsafe { flag.add(1) };
+		let start = unsafe { counter.read_volatile() };
+		while unsafe { counter.read_volatile() } < start.wrapping_add(1000) {
+			core::hint::spin_loop();
+		}
+		unsafe { flag.write_volatile(1) };
+	}
+	SPIN_FLAG_PHYS.store(0, Ordering::SeqCst);
+	SPIN_DONE.store(false, Ordering::SeqCst);
+	// Both threads land on this core: the spinner never yields in ring 3, the
+	// releaser never yields in ring 0 - only the timer can interleave them, and the
+	// spinner's half of that needs ring-3 preemption.
+	sched::spawn(spinner_body, 0);
+	sched::spawn(releaser, 0);
+	sched::run_until_idle();
+	assert!(SPIN_DONE.load(Ordering::SeqCst), "the ring-3 spinner never finished: ring 3 was not preempted");
+}
+
+#[test_case]
 fn scheduler_runs_across_cores() {
 	use core::sync::atomic::{AtomicU32, Ordering};
 	static CROSS: AtomicU32 = AtomicU32::new(0);
