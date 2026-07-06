@@ -2011,7 +2011,7 @@ A second architecture review found the remaining latency and scalability debt al
 
 The kernel preempts ring-0 threads (M19), but ring 3 is still cooperative: TSS.RSP0 - the stack the CPU loads on a ring-3 interrupt - is per-CORE, so context-switching away from an interrupted user thread would leave two threads sharing one entry stack. Until that is fixed, an infinite loop in a user program owns its core, and the timer ISR deliberately only ticks when it fires in ring 3.
 
-- [ ] Per-thread kernel entry stacks: point TSS.RSP0 at the current thread's kernel stack on every context switch (the thread already owns one for syscalls), so a ring-3 interrupt lands on a stack that travels with the thread.
+- [ ] Per-thread kernel entry stacks: point TSS.RSP0 at the current thread's parked kernel stack position on every context switch (the same value the syscall entry path reads - NOT the absolute stack top, which would overwrite the parked ring-3 entry frame), so a ring-3 interrupt lands on a stack that travels with the thread.
 - [ ] Enable ring-3 preemption in the timer path: when the timer fires at CPL 3, save the interrupted user context on the thread's own stack and reschedule - removing the ring-0-only gate in the ISR.
 - [ ] A test proves a compute-bound ring-3 loop no longer starves its core: two user threads on one core, one spinning, the other still makes progress; and the existing suite stays green under the new switch path.
 - Done when: TSS.RSP0 follows the thread, the timer preempts ring 3 the same way it preempts ring 0, a spinning user program cannot monopolize a core, and the suite is green - closing the concept's preemption promise for userspace.
@@ -2050,7 +2050,7 @@ Three review findings share one root: service bring-up is half code, half conven
 
 The review's "static at boot" cluster: the network service's client/socket/listener pools are tiny compile-time constants that silently refuse when full, and device enumeration happens exactly once at boot - a device that appears later (USB most practically) is invisible.
 
-- [ ] Dynamic NetworkService pools: the client, socket, and listener arrays (4/4/2) and the TCP connection pool (4) become growable vectors bounded by the wait-set ceiling; exhaustion returns the typed error instead of silence, and `ss`/the graph report utilization.
+- [ ] Dynamic NetworkService pools: the client, socket, and listener arrays (4/4/2) and the TCP connection pool (4) become growable vectors (the wait-set is already dynamically sized, so the practical bound is the domain's handle budget); exhaustion returns the typed error instead of silence, and `ss`/the graph report utilization.
 - [ ] USB hotplug: the xhci driver watches port-status change events (the controller already delivers them) and enumerates a newly attached device at runtime; DeviceManager learns to bind a driver/role for a device that arrives after boot, and detach tears the role down cleanly.
 - [ ] A live test: attach a USB storage device via QMP after boot - it enumerates, `lsusb`/`lsblk` show it, and its volume mounts; detach removes it without wedging the storage service.
 - Done when: network capacity grows with demand (bounded, observable, typed errors at the true ceiling), a hot-attached USB device works end to end and a detach cleans up, and the suite is green.
@@ -2060,7 +2060,7 @@ The review's "static at boot" cluster: the network service's client/socket/liste
 
 Four filesystem crates grew four slightly different `BlockDevice` traits and error enums; the storage service routes volumes through a hand-written enum; and LiberFS has two known performance cliffs the audits deferred: the free map is re-derived by a full O(n) walk on every commit, and the decompression cache holds exactly one extent.
 
-- [ ] One shared fs-core contract: a single `BlockDevice` trait (with the `read_blocks` batch default) and a single `FsError` enum in a shared crate, implemented by liberfs/fat/iso9660/udf alike - no more per-crate drift for the same concepts.
+- [ ] One shared fs-core contract: a single `BlockDevice` trait (parametrized by block size - fat reads 512-byte sectors, liberfs 4 kB blocks - with the `read_blocks` batch default) and a single `FsError` enum in a shared crate, implemented by liberfs/fat/iso9660/udf alike - no more per-crate drift for the same concepts.
 - [ ] Storage routes through a trait: the `Volume` enum's per-backend match arms become `Box<dyn FileSystem>` objects behind one trait (open/list/write/remove/snap ops), so a new backend is one impl + one mount arm.
 - [ ] LiberFS incremental free map: track allocations/frees as a delta against the derived map instead of re-walking every generation on each commit (the full walk remains for mount and fsck) - retiring the O(n)-per-commit cost that already throttled the directory-scaling test.
 - [ ] A small decompressed-extent cache: replace the single-entry `decomp` slot with a tiny LRU (4-8 entries) so alternating reads over two compressed extents stop evicting each other; measure a compressed-file read pattern before/after.
@@ -2079,7 +2079,7 @@ The structural code-quality items the review flagged in userspace: the shell's s
 
 ## M113 - Wasm: indirect calls and tables
 
-The interpreter traps on `call_indirect` - the one gap a real toolchain-built component hits first (any Rust trait object, function pointer, or vtable in a component compiles to it). Tables and indirect calls are the next instruction-set step the M41 runtime needs before the phase-3 packaging work leans on it.
+The interpreter traps on `call_indirect` - the one gap a real toolchain-built component hits first (any Rust trait object, function pointer, or vtable in a component compiles to it). Tables and indirect calls are the next instruction-set step the M41 runtime needs before the phase-3 packaging work leans on it. Engine direction (decided): the from-scratch interpreter stays plan A for this phase - it is small, auditable, host-tested, and fits the no_std ring-3 environment; the AOT/JIT question is settled in phase 3 next to packaging, gated on a measurement of a real component workload (interpreter suffices / a simple baseline compiler / a ported engine - in that order of preference), and the full Component Model binary format + literal `wasi:*` worlds wait for a concrete third-party-interop need (the `liber` world + SDK covers first-party components; WIT can be emitted as an lsidl-gen backend when needed).
 
 - [ ] Decode and validate the table section, element segments, and `call_indirect` (type-check the callee signature against the table entry at call time, trap on mismatch or null - the spec semantics).
 - [ ] Host tests exercise an indirect call through a table (a Rust component using a function pointer / trait object round-trips), plus the mismatch and null-entry traps.
@@ -2113,7 +2113,8 @@ resize, online defrag, multi-device / RAID; deduplication and encryption stay ou
 first-party server apps (a
 static-file web server and the like); the package/app format with installation +
 AOT compilation (moved out of phase 2 by decision - the component runtime and the
-manifest split are ready for it); and a CLI package manager over that phase-3
+manifest split are ready for it; the AOT/JIT engine choice there is gated on a
+measurement of a real component workload, not decided on faith); and a CLI package manager over that phase-3
 package format. The desktop concerns (GUI / compositor, a full input stack, the
 end-user app store) are phases 4-5. Phases 3-6 (server / real hardware / desktop /
 AI) remain a vision, contingent on a community forming.
