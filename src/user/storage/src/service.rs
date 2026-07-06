@@ -43,7 +43,7 @@ use fat::FatFs;
 use iso9660::Iso9660;
 use liberfs::{BlockDevice, FormatOpts, FsError, LiberFs};
 use proto::codec::Buffer;
-use proto::system::{Error, FileInfo, FileKind, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, volume};
+use proto::system::{Error, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, volume};
 use rt::*;
 use udf::Udf;
 
@@ -595,7 +595,7 @@ impl Volume {
 
 // Build a listing entry from a raw name, byte length, and whether it is a directory.
 fn file_info(name: &[u8], size: u64, is_dir: bool, mtime: u64, ctime: u64) -> FileInfo {
-	FileInfo { name: String::from_utf8_lossy(name).into_owned(), size, kind: if is_dir { FileKind::Dir } else { FileKind::File }, mtime, ctime }
+	FileInfo { name: String::from_utf8_lossy(name).into_owned(), size, r#type: if is_dir { FileType::Dir } else { FileType::File }, mtime, ctime }
 }
 
 // Map an LiberFS error onto the Storage.Volume `error` enum.

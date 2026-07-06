@@ -510,12 +510,12 @@ impl OpenResult {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum FileKind {
+pub enum FileType {
 	File = 0,
 	Dir = 1,
 }
 
-impl FileKind {
+impl FileType {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
@@ -526,16 +526,16 @@ impl FileKind {
 		let _ = self.write(&mut w);
 		w.into_inner()
 	}
-	pub fn decode(bytes: &[u8]) -> Option<FileKind> {
-		FileKind::read(&mut Reader::new(bytes))
+	pub fn decode(bytes: &[u8]) -> Option<FileType> {
+		FileType::read(&mut Reader::new(bytes))
 	}
 	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<FileKind> {
+	pub(crate) fn read(r: &mut Reader) -> Option<FileType> {
 		match r.u8()? {
-			0 => Some(FileKind::File),
-			1 => Some(FileKind::Dir),
+			0 => Some(FileType::File),
+			1 => Some(FileType::Dir),
 			_ => None,
 		}
 	}
@@ -545,7 +545,7 @@ impl FileKind {
 pub struct FileInfo {
 	pub name: String,
 	pub size: u64,
-	pub kind: FileKind,
+	pub r#type: FileType,
 	pub mtime: u64,
 	pub ctime: u64,
 }
@@ -567,7 +567,7 @@ impl FileInfo {
 	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
 		w.u64(self.size)?;
-		self.kind.write(w)?;
+		self.r#type.write(w)?;
 		w.u64(self.mtime)?;
 		w.u64(self.ctime)?;
 		Some(())
@@ -575,10 +575,10 @@ impl FileInfo {
 	pub(crate) fn read(r: &mut Reader) -> Option<FileInfo> {
 		let name = r.string_lp()?;
 		let size = r.u64()?;
-		let kind = FileKind::read(r)?;
+		let r#type = FileType::read(r)?;
 		let mtime = r.u64()?;
 		let ctime = r.u64()?;
-		Some(FileInfo { name, size, kind, mtime, ctime })
+		Some(FileInfo { name, size, r#type, mtime, ctime })
 	}
 }
 
@@ -6349,7 +6349,7 @@ impl OpenResult {
 	}
 }
 
-impl FileKind {
+impl FileType {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
 		self.to_json_into(&mut s);
@@ -6367,20 +6367,20 @@ impl FileKind {
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		match self {
-			FileKind::File => out.push_str("\"file\""),
-			FileKind::Dir => out.push_str("\"dir\""),
+			FileType::File => out.push_str("\"file\""),
+			FileType::Dir => out.push_str("\"dir\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
 		match self {
-			FileKind::File => out.push_str("file"),
-			FileKind::Dir => out.push_str("dir"),
+			FileType::File => out.push_str("file"),
+			FileType::Dir => out.push_str("dir"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			FileKind::File => crate::codec::cbor::text(out, "file"),
-			FileKind::Dir => crate::codec::cbor::text(out, "dir"),
+			FileType::File => crate::codec::cbor::text(out, "file"),
+			FileType::Dir => crate::codec::cbor::text(out, "dir"),
 		}
 	}
 }
@@ -6409,8 +6409,8 @@ impl FileInfo {
 		out.push_str("\"size\":");
 		let _ = write!(out, "{}", self.size);
 		out.push(',');
-		out.push_str("\"kind\":");
-		self.kind.to_json_into(out);
+		out.push_str("\"type\":");
+		self.r#type.to_json_into(out);
 		out.push(',');
 		out.push_str("\"mtime\":");
 		let _ = write!(out, "{}", self.mtime);
@@ -6427,8 +6427,8 @@ impl FileInfo {
 		out.push_str("size=");
 		let _ = write!(out, "{}", self.size);
 		out.push_str(", ");
-		out.push_str("kind=");
-		self.kind.to_text_into(out);
+		out.push_str("type=");
+		self.r#type.to_text_into(out);
 		out.push_str(", ");
 		out.push_str("mtime=");
 		let _ = write!(out, "{}", self.mtime);
@@ -6443,8 +6443,8 @@ impl FileInfo {
 		crate::codec::cbor::text(out, &self.name);
 		crate::codec::cbor::text(out, "size");
 		crate::codec::cbor::uint(out, self.size as u64);
-		crate::codec::cbor::text(out, "kind");
-		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "type");
+		self.r#type.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mtime");
 		crate::codec::cbor::uint(out, self.mtime as u64);
 		crate::codec::cbor::text(out, "ctime");
@@ -8729,16 +8729,16 @@ mod compat {
 		assert_eq!(OpenOpts::decode(&bytes).unwrap(), sample);
 	}
 	#[test]
-	fn file_kind_wire_is_stable() {
-		let sample = FileKind::File;
+	fn file_type_wire_is_stable() {
+		let sample = FileType::File;
 		let bytes = sample.encode_vec();
 		let golden: &[u8] = &[0];
 		assert_eq!(bytes, golden);
-		assert_eq!(FileKind::decode(&bytes).unwrap(), sample);
+		assert_eq!(FileType::decode(&bytes).unwrap(), sample);
 	}
 	#[test]
 	fn file_info_wire_is_stable() {
-		let sample = FileInfo { name: String::from("x"), size: 7, kind: FileKind::File, mtime: 7, ctime: 7 };
+		let sample = FileInfo { name: String::from("x"), size: 7, r#type: FileType::File, mtime: 7, ctime: 7 };
 		let bytes = sample.encode_vec();
 		let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0];
 		assert_eq!(bytes, golden);

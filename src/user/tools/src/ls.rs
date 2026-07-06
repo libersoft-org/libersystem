@@ -32,7 +32,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use proto::codec::JsonMode;
 use proto::path;
-use proto::system::{FileInfo, FileKind, Timestamp, volume};
+use proto::system::{FileInfo, FileType, Timestamp, volume};
 use rt::*;
 
 // What the listing is ordered by; directories group first under every key but None.
@@ -264,7 +264,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 				match recv_vec_blocking(consumer) {
 					ReceivedVec::Message { bytes, .. } => {
 						if let Some(f) = volume::list_read(&bytes) {
-							let shown: usize = f.name.len() + if f.kind == FileKind::Dir { 1 } else { 0 };
+							let shown: usize = f.name.len() + if f.r#type == FileType::Dir { 1 } else { 0 };
 							row(&f, shown, size_text(&f, unit).len(), unit, &mut dirs, &mut plain, &mut total);
 						}
 					}
@@ -284,7 +284,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 		let mut name_w: usize = 0;
 		let mut size_w: usize = 0;
 		for f in &files {
-			let nw: usize = f.name.len() + if f.kind == FileKind::Dir { 1 } else { 0 };
+			let nw: usize = f.name.len() + if f.r#type == FileType::Dir { 1 } else { 0 };
 			if nw > name_w {
 				name_w = nw;
 			}
@@ -311,7 +311,7 @@ fn sort_files(files: &mut [FileInfo], key: SortKey, reverse: bool) {
 		return;
 	}
 	files.sort_by(|a: &FileInfo, b: &FileInfo| {
-		let dir_first = (b.kind == FileKind::Dir).cmp(&(a.kind == FileKind::Dir));
+		let dir_first = (b.r#type == FileType::Dir).cmp(&(a.r#type == FileType::Dir));
 		if dir_first != core::cmp::Ordering::Equal {
 			return dir_first;
 		}
@@ -335,7 +335,7 @@ fn sort_files(files: &mut [FileInfo], key: SortKey, reverse: bool) {
 // summary tallies.
 unsafe fn row(f: &FileInfo, name_w: usize, size_w: usize, unit: Unit, dirs: &mut usize, plain: &mut usize, total: &mut u64) {
 	unsafe {
-		let is_dir: bool = f.kind == FileKind::Dir;
+		let is_dir: bool = f.r#type == FileType::Dir;
 		let shown: usize = f.name.len() + if is_dir { 1 } else { 0 };
 		print(b"  ");
 		if is_dir {
@@ -383,7 +383,7 @@ fn extension(name: &str) -> &str {
 // chosen unit (a bare number in the default byte mode - the summary carries the label).
 fn size_text(f: &FileInfo, unit: Unit) -> String {
 	use core::fmt::Write as _;
-	if f.kind == FileKind::Dir {
+	if f.r#type == FileType::Dir {
 		return String::from("-");
 	}
 	if unit == Unit::Bytes {

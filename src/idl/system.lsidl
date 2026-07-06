@@ -75,7 +75,7 @@ record open-result {
 
 // Whether a listed entry is a regular file or a subdirectory, so a listing can show
 // the two apart.
-enum file-kind {
+enum file-type {
 	file = 0,
 	dir  = 1,
 }
@@ -87,7 +87,7 @@ enum file-kind {
 record file-info {
 	name:  string,
 	size:  u64,
-	kind:  file-kind,
+	type:  file-type,
 	mtime: u64,
 	ctime: u64,
 }

@@ -71,7 +71,7 @@ An opaque kernel object, transferred as `handle<file>`.
 | `file` | `handle<file>` |
 | `size` | `u64` |
 
-### enum `file-kind`
+### enum `file-type`
 
 | case | ordinal |
 | --- | --- |
@@ -84,7 +84,7 @@ An opaque kernel object, transferred as `handle<file>`.
 | --- | --- |
 | `name` | `string` |
 | `size` | `u64` |
-| `kind` | `file-kind` |
+| `type` | `file-type` |
 | `mtime` | `u64` |
 | `ctime` | `u64` |
 
