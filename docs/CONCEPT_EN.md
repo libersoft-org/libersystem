@@ -895,12 +895,12 @@ The proposed system startup:
 
 #### Bootloader choice (decided)
 
-**We do not write our own bootloader** - it is weeks of work with no added value. For the MVP a ready-made, modern bootloader is used:
+The goal is **our own bootloader, strictly UEFI-only** - one small EFI application per architecture (x86-64, ARM64, RISC-V) over a shared core (ELF loader, boot protocol, modules, memory-map and framebuffer handoff). The BIOS path is not supported: it does not exist on ARM64/RISC-V, and boards without UEFI firmware are covered by U-Boot with its EFI loader.
 
-- **Limine** as the primary choice (clean, built directly for new/hobby OSes, supports x86-64 and ARM64, passes the memory map, framebuffer, modules).
-- **direct UEFI** as an alternative, if more control is needed.
+- **A shared core, a small per-arch part:** the ELF loader, the boot protocol, and the memory-map/framebuffer handoff are shared; only the page-table setup and waking the other cores depend on the architecture (via the PSCI/SBI firmware calls on ARM64/RISC-V).
+- **Development and QEMU run under UEFI (OVMF)**, so the UEFI environment is continuously exercised the same way it will run on real hardware.
 
-Our own boot code is limited to the necessary *boot glue* (taking over control from the bootloader, transitioning into our own environment). The bootloader choice does not affect the kernel architecture - it is a replaceable entry gate.
+The kernel-side boot code stays limited to the necessary *boot glue* (taking over control from the loader through the boot protocol, transitioning into our own environment). The bootloader choice does not affect the kernel architecture - it is a replaceable entry gate.
 
 #### The first practical goal
 
@@ -1597,7 +1597,7 @@ The roadmap is milestone-based, not time-based (deliberately without dates):
 #### Phase 0 - Bring-up (kernel MVP)
 
 ```text
-boot in QEMU (Limine), serial log, framebuffer text
+boot in QEMU, serial log, framebuffer text
 physical/virtual memory, heap, address spaces
 thread, scheduler (SMP-aware design, running on a single core for now), Channel IPC, handle table, capabilities, Domain
 start SystemManager, the first IPC message
@@ -1707,7 +1707,7 @@ The project is **open source under the Unlicense** (release into the public doma
 - **Maximum freedom:** anyone may use, modify, distribute, commercialize, and even close a derivative work, without conditions and without having to attribute authorship.
 - **No copyleft, no attribution** - deliberately the lowest possible barrier to adoption and forking.
 - **Contributions** are accepted under the Unlicense; it is advisable to add a DCO/note that the contributor agrees to it.
-- **Third parties:** our own code is Unlicense, but adopted components carry their own (permissive) licenses - e.g. Wasmtime (Apache-2.0), Limine (BSD). That is fine; they just need to be tracked.
+- **Third parties:** our own code is Unlicense, but any adopted components carry their own (permissive) licenses. That is fine; they just need to be tracked.
 
 ---
 
@@ -1718,7 +1718,7 @@ Some of the original questions are now decided (see above).
 ```text
 DECIDED:
 - sync vs async IPC ....... async core + sync-looking API (IPC section)
-- bootloader .............. Limine (or UEFI) (Boot flow section)
+- bootloader .............. our own UEFI-only (x86-64/ARM64/RISC-V) (Boot flow section)
 - application model ....... the native typed ABI is the default for applications too,
                            WASI is the first and recommended host on top of it (Application model section)
 - IPC wire format ......... default decode-cheap binary (FIDL/Cap'n Proto style),

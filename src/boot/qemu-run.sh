@@ -17,10 +17,31 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # build the bootable ISO (mkimage.sh prints its path on stdout)
 ISO="$("$HERE/mkimage.sh" iso "$KERNEL")"
 
+# UEFI firmware (OVMF): the platform boots through UEFI, not SeaBIOS - the ISO is
+# hybrid, and development deliberately exercises the UEFI path (the own UEFI-only
+# bootloader is the target; see the concept's bootloader choice). The CODE image is
+# read-only and shared; each run gets a private writable copy of the VARS store so
+# concurrent instances (a test suite next to a live run) never fight over NVRAM.
+# The script execs QEMU (no exit trap can clean up), so stale copies from earlier
+# runs are unlinked here instead - a still-running instance keeps its copy alive
+# through its open file descriptor.
+OVMF_CODE="${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
+OVMF_VARS_SRC="${OVMF_VARS_SRC:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
+[[ -f "$OVMF_CODE" && -f "$OVMF_VARS_SRC" ]] || {
+	echo "OVMF firmware not found (install the 'ovmf' package)" >&2
+	exit 1
+}
+mkdir -p "$HERE/.build"
+rm -f "$HERE/.build/ovmf-vars."*.fd
+OVMF_VARS="$(mktemp "$HERE/.build/ovmf-vars.XXXXXX.fd")"
+cp "$OVMF_VARS_SRC" "$OVMF_VARS"
+
 # build the QEMU arguments
 QEMU_ARGS=(
 	-machine q35
 	-m 4G
+	-drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE"
+	-drive if=pflash,format=raw,file="$OVMF_VARS"
 	-cdrom "$ISO"
 	-boot d
 	-serial "${SERIAL:-mon:stdio}"

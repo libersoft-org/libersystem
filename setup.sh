@@ -44,6 +44,7 @@ APT_PACKAGES=(
 	socat           # drive the QEMU monitor unix socket for screenshots
 	qemu-system-x86 # qemu-system-x86_64
 	qemu-utils      # qemu-img
+	ovmf            # UEFI firmware for QEMU (the platform boots through UEFI)
 	gdb             # debugging via GDB stub
 	lld             # LLVM linker (ld.lld)
 	llvm            # llvm-objcopy and friends

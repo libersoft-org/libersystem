@@ -14,7 +14,7 @@
 
 LiberSystem is built with free, open-source tools. The toolchain currently targets **Linux** (Debian/Ubuntu) and builds a 64-bit (`x86_64`) kernel that boots in QEMU.
 
-The kernel is a Rust `no_std` project. It is compiled with a nightly toolchain and `build-std`, booted with the [Limine](https://github.com/limine-bootloader/limine) bootloader, and run and tested under QEMU. All commands below are run through [`just`](https://github.com/casey/just) from the `src` directory.
+The kernel is a Rust `no_std` project. It is compiled with a nightly toolchain and `build-std`, booted with the [Limine](https://github.com/limine-bootloader/limine) bootloader through **UEFI** (QEMU runs with the OVMF firmware; the `ovmf` package is required), and run and tested under QEMU. All commands below are run through [`just`](https://github.com/casey/just) from the `src` directory.
 
 Download the latest version of this software and install required tools.
 
@@ -35,7 +35,7 @@ cd src
 
 This will install:
 
-- system packages: `build-essential`, `git`, `curl`, `xorriso`, `gdisk`, `mtools`, `netpbm`, `imagemagick`, `socat`, `qemu-system-x86`, `qemu-utils`, `gdb`, `lld`, `llvm`, `clang`
+- system packages: `build-essential`, `git`, `curl`, `xorriso`, `gdisk`, `mtools`, `netpbm`, `imagemagick`, `socat`, `qemu-system-x86`, `qemu-utils`, `ovmf`, `gdb`, `lld`, `llvm`, `clang`
 - `rustup` with the **nightly** toolchain plus the `rust-src` and `llvm-tools-preview` components (required for `build-std` and the kernel build)
 - `just`, the task runner
 - the Limine bootloader (binary branch) into `~/.local/share/limine`

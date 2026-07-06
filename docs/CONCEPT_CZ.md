@@ -895,12 +895,12 @@ Navržený start systému:
 
 #### Volba bootloaderu (rozhodnuto)
 
-**Vlastní bootloader se nepíše** - je to týdny práce bez přidané hodnoty. Pro MVP se použije hotový, moderní bootloader:
+Cílem je **vlastní bootloader, výhradně UEFI-only** - jedna malá EFI aplikace na architekturu (x86-64, ARM64, RISC-V) nad společným jádrem (ELF loader, boot protokol, moduly, předání paměťové mapy a framebufferu). BIOS cesta se nepodporuje: na ARM64/RISC-V neexistuje a desky bez UEFI firmwaru pokrývá U-Boot s EFI loaderem.
 
-- **Limine** jako primární volba (čistý, dělaný přímo pro nové/hobby OS, podporuje x86-64 i ARM64, předává paměťovou mapu, framebuffer, moduly).
-- **přímý UEFI** jako alternativa, pokud je potřeba větší kontrola.
+- **Společné jádro, malá per-arch část:** ELF loader, boot protokol a předání paměťové mapy/framebufferu jsou sdílené; na architektuře závisí jen sestavení stránkovacích tabulek a probuzení dalších jader (na ARM64/RISC-V přes firmware volání PSCI/SBI).
+- **Vývoj a QEMU běží pod UEFI (OVMF)**, takže UEFI prostředí je průběžně ověřované týmž způsobem, jakým poběží na reálném hardwaru.
 
-Vlastní boot kód se omezí na nutné *boot glue* (převzetí řízení od bootloaderu, přechod do vlastního prostředí). Volba bootloaderu neovlivňuje architekturu kernelu - je to vyměnitelná vstupní brána.
+Boot kód na straně kernelu zůstává omezen na nutné *boot glue* (převzetí řízení od loaderu přes boot protokol, přechod do vlastního prostředí). Volba bootloaderu neovlivňuje architekturu kernelu - je to vyměnitelná vstupní brána.
 
 #### První praktický cíl
 
@@ -1597,7 +1597,7 @@ Roadmapa je milníková, ne časová (záměrně bez termínů):
 #### Fáze 0 - Bring-up (MVP jádra)
 
 ```text
-boot v QEMU (Limine), serial log, framebuffer text
+boot v QEMU, serial log, framebuffer text
 physical/virtual memory, heap, address spaces
 thread, scheduler (SMP-aware návrh, běh zatím na jednom jádře), Channel IPC, handle table, capabilities, Domain
 start SystemManager, první IPC zpráva
@@ -1707,7 +1707,7 @@ Projekt je **open source pod licencí Unlicense** (uvolnění do public domain).
 - **Maximální volnost:** kdokoli smí kód použít, upravit, distribuovat, komercializovat i uzavřít odvozené dílo, bez podmínek a bez nutnosti uvádět autorství.
 - **Žádný copyleft, žádná atribuce** - záměrně nejnižší možná bariéra pro přijetí a forkování.
 - **Příspěvky** se přijímají pod Unlicense, vhodné je doplnit DCO/poznámku, že přispěvatel s tím souhlasí.
-- **Třetí strany:** vlastní kód je Unlicense, ale převzaté komponenty si nesou své (permisivní) licence - např. Wasmtime (Apache-2.0), Limine (BSD). To je v pořádku, jen je nutné je evidovat.
+- **Třetí strany:** vlastní kód je Unlicense, ale případné převzaté komponenty si nesou své (permisivní) licence. To je v pořádku, jen je nutné je evidovat.
 
 ---
 
@@ -1718,7 +1718,7 @@ Projekt je **open source pod licencí Unlicense** (uvolnění do public domain).
 ```text
 ROZHODNUTO:
 - sync vs async IPC ....... async jádro + sync-vypadající API (sekce IPC)
-- bootloader .............. Limine (příp. UEFI) (sekce Boot flow)
+- bootloader .............. vlastní UEFI-only (x86-64/ARM64/RISC-V) (sekce Boot flow)
 - aplikační model ......... nativní typované ABI je default i pro aplikace,
                            WASI je první a doporučený host nad ním (sekce Aplikační model)
 - IPC wire formát ......... default decode-cheap binárka (FIDL/Cap'n Proto styl),
