@@ -1,0 +1,19 @@
+[package]
+name = "loader"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "LiberSystem UEFI boot loader (x86_64 PE32+ EFI application)"
+
+[[bin]]
+name = "libersystem-loader"
+path = "src/main.rs"
+
+[dependencies]
+bootproto = { path = "../bootproto" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

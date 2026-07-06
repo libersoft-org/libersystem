@@ -1,0 +1,5 @@
+[package]
+name = "bootproto"
+edition = "2024"
+
+[lib]
