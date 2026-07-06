@@ -6,3 +6,4 @@ edition = "2024"
 description = "ISO9660 - a read-only backend for optical and install media (.iso) behind one BlockDevice trait"
 
 [dependencies]
+fscore = { path = "../core" }

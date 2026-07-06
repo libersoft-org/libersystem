@@ -21,7 +21,7 @@
 extern crate alloc;
 
 use proto::system::time::{self, Service};
-use proto::system::{network, Error, Timestamp};
+use proto::system::{Error, Timestamp, network};
 use rt::*;
 
 // The LAPIC monotonic clock runs at 100 Hz (ticks per second).

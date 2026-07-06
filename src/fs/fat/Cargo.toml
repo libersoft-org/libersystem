@@ -6,3 +6,4 @@ edition = "2024"
 description = "FAT - a read-only FAT12/16/32 and exFAT backend (foreign removable media) behind one BlockDevice trait"
 
 [dependencies]
+fscore = { path = "../core" }

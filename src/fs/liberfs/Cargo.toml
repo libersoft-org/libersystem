@@ -6,6 +6,7 @@ edition = "2024"
 description = "LiberFS - a simple writable on-disk filesystem (block allocation, inodes, a root directory) behind one BlockDevice trait"
 
 [dependencies]
+fscore = { path = "../core" }
 
 # The host tests move tens of MB through the checksummed write path; without
 # optimization the CRC and codec inner loops dominate the test run.

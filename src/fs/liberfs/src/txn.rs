@@ -23,7 +23,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.fresh.clear();
 		self.dead.clear();
 		self.snapshots_dirty = false;
-		self.decomp = None;
+		self.decomp.clear();
 		self.wcsum = None;
 		self.rcsum = None;
 	}
@@ -81,7 +81,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.fresh.clear();
 		// the commit reclaims old-generation blocks (they may be reused and rewritten),
 		// so caches keyed by physical blocks must not outlive it.
-		self.decomp = None;
+		self.decomp.clear();
 		self.rcsum = None;
 		if !landed {
 			// the commit's durability is unknown (the write or the barrier after it
@@ -142,7 +142,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// committed transaction's drops) stays for the next commit.
 		self.dead.clear();
 		self.snapshots_dirty = false;
-		self.decomp = None;
+		self.decomp.clear();
 		self.wcsum = None;
 		self.rcsum = None;
 		// the transaction may have replaced cached inodes/entries with rolled-back

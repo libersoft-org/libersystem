@@ -43,7 +43,7 @@ use fat::FatFs;
 use iso9660::Iso9660;
 use liberfs::{BlockDevice, FormatOpts, FsError, LiberFs};
 use proto::codec::Buffer;
-use proto::system::{Error, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, volume};
+use proto::system::{volume, Error, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus};
 use rt::*;
 use udf::Udf;
 
@@ -102,22 +102,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			if sys_is_err(base) {
 				exit();
 			}
-			Volume::Archive { base, len: length }
+			Volume { fs: alloc::boxed::Box::new(ArchiveFs { base, len: length }) }
 		}
 		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BLOCK" => match unsafe { mount_or_format(handle) } {
-			Some(fs) => Volume::Disk(fs),
+			Some(fs) => Volume { fs: alloc::boxed::Box::new(DiskFs { fs }) },
 			None => exit(),
 		},
-		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => Volume::Fat(FatBacking { chan: handle, name: MEDIA_VOLUME, fs: None }),
+		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => Volume { fs: alloc::boxed::Box::new(FatBacking { chan: handle, name: MEDIA_VOLUME, fs: None }) },
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"ISOBLOCK" => match Iso9660::mount(IsoBlockDevice { chan: handle }) {
-			Some(fs) => Volume::Iso(fs),
+			Some(fs) => Volume { fs: alloc::boxed::Box::new(IsoFs { fs }) },
 			None => exit(),
 		},
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"UDFBLOCK" => match Udf::mount(UdfBlockDevice { chan: handle }) {
-			Some(fs) => Volume::Udf(fs),
+			Some(fs) => Volume { fs: alloc::boxed::Box::new(UdfFs { fs }) },
 			None => exit(),
 		},
-		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"USBBLOCK" => Volume::Fat(FatBacking { chan: handle, name: USB_VOLUME, fs: None }),
+		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"USBBLOCK" => Volume { fs: alloc::boxed::Box::new(FatBacking { chan: handle, name: USB_VOLUME, fs: None }) },
 		_ => exit(),
 	};
 	// 2. service endpoint: clients reach the service here.
@@ -136,10 +136,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		serve_multi(service, &mut buf, &mut reply, |chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
 			// stamp the wall clock onto the filesystem before each request, so a
 			// mutation's inode timestamps carry real time (the RTC's Unix seconds; the
-			// NTP-disciplined policy clock lives in TimeService).
-			if let Volume::Disk(fs) = &mut vol {
-				fs.set_clock(clock_rtc());
-			}
+			// NTP-disciplined policy clock lives in TimeService). A no-op on the backends
+			// that do not track it.
+			vol.fs.set_clock(clock_rtc());
 			// OP_LIST opens a stream (the log-tail model): the entries are framed one
 			// by one onto a fresh sub-channel, so a big directory never has to fit one
 			// reply. Everything else dispatches to a single reply.
@@ -216,7 +215,7 @@ struct FatBacking {
 impl FatBacking {
 	// Run `op` on the mounted filesystem (mounting on first use), dropping the mount
 	// on an I/O failure - the media was unplugged - so the next request remounts.
-	fn run<R>(&mut self, op: impl FnOnce(&mut FatFs<FatBlockDevice>) -> Result<R, fat::FsError>) -> Result<R, Error> {
+	fn run<R>(&mut self, op: impl FnOnce(&mut FatFs<FatBlockDevice>) -> Result<R, FsError>) -> Result<R, Error> {
 		if self.fs.is_none() {
 			self.fs = FatFs::mount(FatBlockDevice { chan: self.chan });
 		}
@@ -226,34 +225,86 @@ impl FatBacking {
 		fs.set_clock(unsafe { clock_rtc() });
 		match op(fs) {
 			Ok(r) => Ok(r),
-			Err(fat::FsError::Io) => {
+			Err(FsError::Io) => {
 				self.fs = None;
 				Err(Error::Again)
 			}
-			Err(e) => Err(map_fat_err(e)),
+			Err(e) => Err(map_fs_err(e)),
 		}
 	}
 }
 
-enum Volume {
-	Archive { base: u64, len: usize },
-	Disk(LiberFs<ChannelBlockDevice>),
-	Fat(FatBacking),
-	Iso(Iso9660<IsoBlockDevice>),
-	Udf(Udf<UdfBlockDevice>),
+// One mounted filesystem behind the volume service. Every backend - LiberFS, FAT,
+// ISO9660, UDF and the boot archive - implements this, so the service dispatches each
+// request through one trait call instead of a per-operation match over the backends, and
+// adding a backend is one `impl` plus one mount arm. Read, list, capacity and status are
+// the universal operations; the mutation and snapshot operations default to the read-only
+// answer (a foreign or optical medium refuses them), so a read-only backend implements
+// only the four read operations.
+trait FileSystem {
+	// The vol:// volume name this backend answers to.
+	fn volume_name(&self) -> &'static [u8];
+	// Stamp the wall clock before a mutation, so a written inode's timestamps carry real
+	// time. Only the writable native filesystem tracks it; the default is a no-op.
+	fn set_clock(&mut self, _unix_secs: u64) {}
+	// Read a whole file by its in-volume path.
+	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error>;
+	// List a directory (an empty name is the volume root) as name + length + kind + times.
+	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error>;
+	// The byte size of the backing block device (for the `lsblk` inventory).
+	fn capacity(&mut self) -> Result<u64, Error>;
+	// The filesystem's own identity and health numbers (for `lsvol` / `status`).
+	fn status(&mut self) -> Result<VolumeStatus, Error>;
+
+	// Mutations. A read-only medium refuses with `invalid` (it has no write path); the
+	// boot archive overrides these to `denied` (a policy refusal, not a missing feature).
+	fn write_file(&mut self, _name: &[u8], _data: &[u8]) -> Result<(), Error> {
+		Err(Error::Invalid)
+	}
+	fn remove(&mut self, _name: &[u8]) -> Result<(), Error> {
+		Err(Error::Invalid)
+	}
+	fn mkdir(&mut self, _name: &[u8]) -> Result<(), Error> {
+		Err(Error::Invalid)
+	}
+	fn rmdir(&mut self, _name: &[u8]) -> Result<(), Error> {
+		Err(Error::Invalid)
+	}
+	fn set_compression(&mut self, _enabled: bool) -> Result<(), Error> {
+		Err(Error::Invalid)
+	}
+	fn fsck(&mut self) -> Result<FsckReport, Error> {
+		Err(Error::Invalid)
+	}
+	fn restore(&mut self, _name: &[u8], _snapshot: &[u8]) -> Result<(), Error> {
+		Err(Error::Invalid)
+	}
+
+	// Snapshots. Only the native filesystem pins generations; every other backend has
+	// none, so create / delete / open refuse with `denied` and the list is empty.
+	fn snap_create(&mut self, _name: &[u8]) -> Result<(), Error> {
+		Err(Error::Denied)
+	}
+	fn snap_list(&mut self) -> Result<Vec<SnapshotInfo>, Error> {
+		Ok(Vec::new())
+	}
+	fn snap_delete(&mut self, _name: &[u8]) -> Result<(), Error> {
+		Err(Error::Denied)
+	}
+	fn snap_read_file(&mut self, _snapshot: &[u8], _name: &[u8]) -> Result<Vec<u8>, Error> {
+		Err(Error::Denied)
+	}
+}
+
+// The volume the service serves: one boxed filesystem backend behind the trait above.
+struct Volume {
+	fs: alloc::boxed::Box<dyn FileSystem>,
 }
 
 impl Volume {
-	// The vol:// name this backing answers to: writable LiberFS (and the test archive)
-	// is "system"; the writable FAT carries its name ("media" or "usb"); the read-only
-	// ISO9660 is "iso"; the read-only UDF is "udf".
+	// The vol:// name this backing answers to (its backend's).
 	fn name(&self) -> &'static [u8] {
-		match self {
-			Volume::Fat(backing) => backing.name,
-			Volume::Iso(_) => ISO_VOLUME,
-			Volume::Udf(_) => UDF_VOLUME,
-			_ => SYSTEM_VOLUME,
-		}
+		self.fs.volume_name()
 	}
 }
 
@@ -269,35 +320,9 @@ impl volume::Service for Volume {
 		if target.volume != self.name() {
 			return Err(Error::NotFound);
 		}
-		let name: &[u8] = target.path.as_bytes();
-		match self {
-			Volume::Archive { base, len } => {
-				let archive: &[u8] = unsafe { core::slice::from_raw_parts(*base as *const u8, *len) };
-				let file: &[u8] = Package::parse(archive).and_then(|p| p.lookup(name)).ok_or(Error::NotFound)?;
-				let handle: u64 = unsafe { make_file_buffer(file) }.ok_or(Error::Again)?;
-				Ok(OpenResult { file: handle, size: file.len() as u64 })
-			}
-			Volume::Disk(fs) => {
-				let file: Vec<u8> = fs.read_file(name).map_err(map_fs_err)?;
-				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
-				Ok(OpenResult { file: handle, size: file.len() as u64 })
-			}
-			Volume::Fat(backing) => {
-				let file: Vec<u8> = backing.run(|fs| fs.read_file(name))?;
-				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
-				Ok(OpenResult { file: handle, size: file.len() as u64 })
-			}
-			Volume::Iso(fs) => {
-				let file: Vec<u8> = fs.read_file(name).map_err(map_iso_err)?;
-				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
-				Ok(OpenResult { file: handle, size: file.len() as u64 })
-			}
-			Volume::Udf(fs) => {
-				let file: Vec<u8> = fs.read_file(name).map_err(map_udf_err)?;
-				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
-				Ok(OpenResult { file: handle, size: file.len() as u64 })
-			}
-		}
+		let file: Vec<u8> = self.fs.read_file(target.path.as_bytes())?;
+		let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
+		Ok(OpenResult { file: handle, size: file.len() as u64 })
 	}
 
 	// List the directory named by a vol:// path (each entry as name + byte length +
@@ -315,13 +340,7 @@ impl volume::Service for Volume {
 		let bytes: Option<Vec<u8>> = unsafe { read_buffer(&data) };
 		let name: &[u8] = self.writable_name(&path)?;
 		let bytes: Vec<u8> = bytes.ok_or(Error::Invalid)?;
-		match self {
-			Volume::Archive { .. } => Err(Error::Denied),
-			Volume::Disk(fs) => fs.write_file(name, &bytes).map_err(map_fs_err),
-			Volume::Fat(backing) => backing.run(|fs| fs.write_file(name, &bytes)),
-			Volume::Iso(_) => Err(Error::Invalid),
-			Volume::Udf(_) => Err(Error::Invalid),
-		}
+		self.fs.write_file(name, &bytes)
 	}
 
 	// The streaming write form: the file's bytes arrive as plain messages on the
@@ -347,64 +366,31 @@ impl volume::Service for Volume {
 		}
 		unsafe { close(data) };
 		let name: &[u8] = self.writable_name(&path)?;
-		match self {
-			Volume::Archive { .. } => Err(Error::Denied),
-			Volume::Disk(fs) => fs.write_file(name, &bytes).map_err(map_fs_err),
-			Volume::Fat(backing) => backing.run(|fs| fs.write_file(name, &bytes)),
-			Volume::Iso(_) => Err(Error::Invalid),
-			Volume::Udf(_) => Err(Error::Invalid),
-		}
+		self.fs.write_file(name, &bytes)
 	}
 
 	// Delete a file. A read-only volume refuses with `denied`.
 	fn remove(&mut self, path: String) -> Result<(), Error> {
 		let name: &[u8] = self.writable_name(&path)?;
-		match self {
-			Volume::Archive { .. } => Err(Error::Denied),
-			Volume::Disk(fs) => fs.remove(name).map_err(map_fs_err),
-			Volume::Fat(backing) => backing.run(|fs| fs.remove(name)),
-			Volume::Iso(_) => Err(Error::Invalid),
-			Volume::Udf(_) => Err(Error::Invalid),
-		}
+		self.fs.remove(name)
 	}
 
 	// Create a named read-only snapshot of the volume, pinning the current generation
 	// so its blocks survive later writes. A read-only volume refuses with `denied`.
 	fn snap_create(&mut self, name: String) -> Result<(), Error> {
-		match self {
-			Volume::Archive { .. } => Err(Error::Denied),
-			Volume::Disk(fs) => fs.create_snapshot(name.as_bytes()).map_err(map_fs_err),
-			Volume::Fat(..) => Err(Error::Denied),
-			Volume::Iso(_) => Err(Error::Denied),
-			Volume::Udf(_) => Err(Error::Denied),
-		}
+		self.fs.snap_create(name.as_bytes())
 	}
 
 	// List the volume's named snapshots (name + pinned generation), oldest first. A
 	// read-only archive volume has none.
 	fn snap_list(&mut self) -> Result<Vec<SnapshotInfo>, Error> {
-		match self {
-			Volume::Archive { .. } => Ok(Vec::new()),
-			Volume::Disk(fs) => {
-				let snaps = fs.list_snapshots().map_err(map_fs_err)?;
-				Ok(snaps.into_iter().map(|(name, generation)| SnapshotInfo { name: String::from_utf8_lossy(&name).into_owned(), generation }).collect())
-			}
-			Volume::Fat(..) => Ok(Vec::new()),
-			Volume::Iso(_) => Ok(Vec::new()),
-			Volume::Udf(_) => Ok(Vec::new()),
-		}
+		self.fs.snap_list()
 	}
 
 	// Delete a named snapshot, releasing the blocks only it pinned. A read-only volume
 	// refuses with `denied`.
 	fn snap_delete(&mut self, name: String) -> Result<(), Error> {
-		match self {
-			Volume::Archive { .. } => Err(Error::Denied),
-			Volume::Disk(fs) => fs.delete_snapshot(name.as_bytes()).map_err(map_fs_err),
-			Volume::Fat(..) => Err(Error::Denied),
-			Volume::Iso(_) => Err(Error::Denied),
-			Volume::Udf(_) => Err(Error::Denied),
-		}
+		self.fs.snap_delete(name.as_bytes())
 	}
 
 	// Resolve a vol:// path inside a named snapshot and hand back the file's bytes as a
@@ -412,19 +398,9 @@ impl volume::Service for Volume {
 	// earlier state. A read-only archive volume has no snapshots.
 	fn snap_open(&mut self, snapshot: String, path: String) -> Result<OpenResult, Error> {
 		let name: &[u8] = self.writable_name(&path)?;
-		match self {
-			Volume::Archive { .. } => Err(Error::Denied),
-			Volume::Disk(fs) => {
-				// a cheap re-rooted read on the live mount - one table lookup plus the
-				// file's own blocks, never a second mount or a volume walk.
-				let file: Vec<u8> = fs.read_file_from_snapshot(snapshot.as_bytes(), name).map_err(map_fs_err)?;
-				let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
-				Ok(OpenResult { file: handle, size: file.len() as u64 })
-			}
-			Volume::Fat(..) => Err(Error::Denied),
-			Volume::Iso(_) => Err(Error::Denied),
-			Volume::Udf(_) => Err(Error::Denied),
-		}
+		let file: Vec<u8> = self.fs.snap_read_file(snapshot.as_bytes(), name)?;
+		let handle: u64 = unsafe { make_file_buffer(&file) }.ok_or(Error::Again)?;
+		Ok(OpenResult { file: handle, size: file.len() as u64 })
 	}
 
 	// Create the directory at a vol:// path, plus any missing parents (mkdir -p). Only
@@ -432,13 +408,7 @@ impl volume::Service for Volume {
 	// `denied`, the other backends with `invalid` (no directory writes implemented).
 	fn mkdir(&mut self, path: String) -> Result<(), Error> {
 		let name: &[u8] = self.writable_name(&path)?;
-		match self {
-			Volume::Archive { .. } => Err(Error::Denied),
-			Volume::Disk(fs) => fs.mkdir(name).map_err(map_fs_err),
-			Volume::Fat(..) => Err(Error::Invalid),
-			Volume::Iso(_) => Err(Error::Invalid),
-			Volume::Udf(_) => Err(Error::Invalid),
-		}
+		self.fs.mkdir(name)
 	}
 
 	// Remove the empty directory at a vol:// path. Only the writable LiberFS volume
@@ -446,13 +416,7 @@ impl volume::Service for Volume {
 	// `invalid`.
 	fn rmdir(&mut self, path: String) -> Result<(), Error> {
 		let name: &[u8] = self.writable_name(&path)?;
-		match self {
-			Volume::Archive { .. } => Err(Error::Denied),
-			Volume::Disk(fs) => fs.rmdir(name).map_err(map_fs_err),
-			Volume::Fat(..) => Err(Error::Invalid),
-			Volume::Iso(_) => Err(Error::Invalid),
-			Volume::Udf(_) => Err(Error::Invalid),
-		}
+		self.fs.rmdir(name)
 	}
 
 	// The size in bytes of the block device backing this volume - asked of the disk
@@ -460,13 +424,7 @@ impl volume::Service for Volume {
 	// lazily mounted removable volume. The memory-archive backing reports its own
 	// length. For the `lsblk` inventory.
 	fn capacity(&mut self) -> Result<u64, Error> {
-		match self {
-			Volume::Archive { len, .. } => Ok(*len as u64),
-			Volume::Disk(fs) => unsafe { block_capacity(fs.device().chan) },
-			Volume::Fat(backing) => unsafe { block_capacity(backing.chan) },
-			Volume::Iso(fs) => unsafe { block_capacity(fs.device().chan) },
-			Volume::Udf(fs) => unsafe { block_capacity(fs.device().chan) },
-		}
+		self.fs.capacity()
 	}
 
 	// The filesystem's own identity and health numbers: label, pool and free bytes,
@@ -474,51 +432,25 @@ impl volume::Service for Volume {
 	// name. Only the LiberFS volume tracks pool numbers; the foreign backends report
 	// their filesystem name with zero bytes.
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
-		match self {
-			Volume::Disk(fs) => {
-				let block: u64 = liberfs::BLOCK_SIZE as u64;
-				Ok(VolumeStatus { label: String::from_utf8_lossy(fs.label()).into_owned(), total_bytes: fs.num_blocks() * block, free_bytes: fs.free_blocks() * block, compression: fs.compression(), read_only: fs.is_read_only(), filesystem: String::from("liberfs") })
-			}
-			Volume::Archive { len, .. } => Ok(VolumeStatus { label: String::new(), total_bytes: *len as u64, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("archive") }),
-			Volume::Fat(backing) => {
-				let (kind, total, free): (&'static str, u64, u64) = backing.run(|fs| Ok((fs.kind_name(), fs.total_bytes(), fs.free_bytes()?)))?;
-				Ok(VolumeStatus { label: String::new(), total_bytes: total, free_bytes: free, compression: false, read_only: false, filesystem: String::from(kind) })
-			}
-			Volume::Iso(fs) => Ok(VolumeStatus { label: String::new(), total_bytes: fs.total_bytes(), free_bytes: 0, compression: false, read_only: true, filesystem: String::from("iso9660") }),
-			Volume::Udf(fs) => Ok(VolumeStatus { label: String::new(), total_bytes: fs.total_bytes(), free_bytes: 0, compression: false, read_only: true, filesystem: String::from("udf") }),
-		}
+		self.fs.status()
 	}
 
 	// Switch transparent compression on or off for new writes on the LiberFS volume.
 	fn set_compression(&mut self, enabled: bool) -> Result<(), Error> {
-		match self {
-			Volume::Archive { .. } => Err(Error::Denied),
-			Volume::Disk(fs) => fs.set_compression(enabled).map_err(map_fs_err),
-			_ => Err(Error::Invalid),
-		}
+		self.fs.set_compression(enabled)
 	}
 
 	// Verify every live block of the LiberFS volume against its checksum and name the
 	// damaged files.
 	fn fsck(&mut self) -> Result<FsckReport, Error> {
-		match self {
-			Volume::Disk(fs) => {
-				let report = fs.fsck().map_err(map_fs_err)?;
-				Ok(FsckReport { checksum_failures: report.checksum_failures, damaged: report.damaged.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect() })
-			}
-			_ => Err(Error::Invalid),
-		}
+		self.fs.fsck()
 	}
 
 	// Copy a file out of a named snapshot (or, with an empty name, the previous
 	// generation) over the live file: the recovery verb for what `fsck` named.
 	fn restore(&mut self, path: String, snapshot: String) -> Result<(), Error> {
 		let name: &[u8] = self.writable_name(&path)?;
-		match self {
-			Volume::Archive { .. } => Err(Error::Denied),
-			Volume::Disk(fs) => fs.restore_file(name, snapshot.as_bytes()).map_err(map_fs_err),
-			_ => Err(Error::Invalid),
-		}
+		self.fs.restore(name, snapshot.as_bytes())
 	}
 }
 
@@ -527,42 +459,7 @@ impl Volume {
 	// length + kind + timestamps. An empty subdirectory names the volume root.
 	fn list_entries(&mut self, path: &str) -> Result<Vec<FileInfo>, Error> {
 		let dir: &[u8] = self.list_dir_name(path)?;
-		match self {
-			Volume::Archive { base, len } => {
-				// the test archive is a flat package - it has no subdirectories.
-				if !dir.is_empty() {
-					return Err(Error::NotFound);
-				}
-				let archive: &[u8] = unsafe { core::slice::from_raw_parts(*base as *const u8, *len) };
-				let package = Package::parse(archive).ok_or(Error::NotFound)?;
-				let mut files: Vec<FileInfo> = Vec::new();
-				for index in 0..package.len() {
-					if let Some(name) = package.name(index) {
-						let size: u64 = package.lookup(name).map(|b| b.len()).unwrap_or(0) as u64;
-						// the archive format carries no timestamps.
-						files.push(file_info(name, size, false, 0, 0));
-					}
-				}
-				Ok(files)
-			}
-			Volume::Disk(fs) => {
-				let entries = if dir.is_empty() { fs.list() } else { fs.read_dir(dir) }.map_err(map_fs_err)?;
-				Ok(entries.into_iter().map(|(name, size, is_dir, mtime, ctime)| file_info(&name, size, is_dir, mtime, ctime)).collect())
-			}
-			Volume::Fat(backing) => {
-				// the foreign backends do not surface timestamps yet: 0 renders as "-".
-				let entries = backing.run(|fs| if dir.is_empty() { fs.list() } else { fs.list_dir(dir) })?;
-				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
-			}
-			Volume::Iso(fs) => {
-				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_iso_err)?;
-				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
-			}
-			Volume::Udf(fs) => {
-				let entries = if dir.is_empty() { fs.list() } else { fs.list_dir(dir) }.map_err(map_udf_err)?;
-				Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
-			}
-		}
+		self.fs.list_entries(dir)
 	}
 
 	// Validate a vol:// path for a mutating op and return the file name within the
@@ -598,7 +495,219 @@ fn file_info(name: &[u8], size: u64, is_dir: bool, mtime: u64, ctime: u64) -> Fi
 	FileInfo { name: String::from_utf8_lossy(name).into_owned(), size, r#type: if is_dir { FileType::Dir } else { FileType::File }, mtime, ctime }
 }
 
-// Map an LiberFS error onto the Storage.Volume `error` enum.
+// The native LiberFS backend: the full read-write filesystem with snapshots, compression
+// and fsck. The one backend that implements every operation.
+struct DiskFs {
+	fs: LiberFs<ChannelBlockDevice>,
+}
+
+impl FileSystem for DiskFs {
+	fn volume_name(&self) -> &'static [u8] {
+		SYSTEM_VOLUME
+	}
+	fn set_clock(&mut self, unix_secs: u64) {
+		self.fs.set_clock(unix_secs);
+	}
+	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error> {
+		self.fs.read_file(name).map_err(map_fs_err)
+	}
+	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
+		let entries = if dir.is_empty() { self.fs.list() } else { self.fs.read_dir(dir) }.map_err(map_fs_err)?;
+		Ok(entries.into_iter().map(|(name, size, is_dir, mtime, ctime)| file_info(&name, size, is_dir, mtime, ctime)).collect())
+	}
+	fn capacity(&mut self) -> Result<u64, Error> {
+		unsafe { block_capacity(self.fs.device().chan) }
+	}
+	fn status(&mut self) -> Result<VolumeStatus, Error> {
+		let block: u64 = liberfs::BLOCK_SIZE as u64;
+		Ok(VolumeStatus { label: String::from_utf8_lossy(self.fs.label()).into_owned(), total_bytes: self.fs.num_blocks() * block, free_bytes: self.fs.free_blocks() * block, compression: self.fs.compression(), read_only: self.fs.is_read_only(), filesystem: String::from("liberfs") })
+	}
+	fn write_file(&mut self, name: &[u8], data: &[u8]) -> Result<(), Error> {
+		self.fs.write_file(name, data).map_err(map_fs_err)
+	}
+	fn remove(&mut self, name: &[u8]) -> Result<(), Error> {
+		self.fs.remove(name).map_err(map_fs_err)
+	}
+	fn mkdir(&mut self, name: &[u8]) -> Result<(), Error> {
+		self.fs.mkdir(name).map_err(map_fs_err)
+	}
+	fn rmdir(&mut self, name: &[u8]) -> Result<(), Error> {
+		self.fs.rmdir(name).map_err(map_fs_err)
+	}
+	fn set_compression(&mut self, enabled: bool) -> Result<(), Error> {
+		self.fs.set_compression(enabled).map_err(map_fs_err)
+	}
+	fn fsck(&mut self) -> Result<FsckReport, Error> {
+		let report = self.fs.fsck().map_err(map_fs_err)?;
+		Ok(FsckReport { checksum_failures: report.checksum_failures, damaged: report.damaged.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect() })
+	}
+	fn restore(&mut self, name: &[u8], snapshot: &[u8]) -> Result<(), Error> {
+		self.fs.restore_file(name, snapshot).map_err(map_fs_err)
+	}
+	fn snap_create(&mut self, name: &[u8]) -> Result<(), Error> {
+		self.fs.create_snapshot(name).map_err(map_fs_err)
+	}
+	fn snap_list(&mut self) -> Result<Vec<SnapshotInfo>, Error> {
+		let snaps = self.fs.list_snapshots().map_err(map_fs_err)?;
+		Ok(snaps.into_iter().map(|(name, generation)| SnapshotInfo { name: String::from_utf8_lossy(&name).into_owned(), generation }).collect())
+	}
+	fn snap_delete(&mut self, name: &[u8]) -> Result<(), Error> {
+		self.fs.delete_snapshot(name).map_err(map_fs_err)
+	}
+	fn snap_read_file(&mut self, snapshot: &[u8], name: &[u8]) -> Result<Vec<u8>, Error> {
+		// a cheap re-rooted read on the live mount - one table lookup plus the file's own
+		// blocks, never a second mount or a volume walk.
+		self.fs.read_file_from_snapshot(snapshot, name).map_err(map_fs_err)
+	}
+}
+
+// The FAT / exFAT backend for foreign removable media: read-write (create, overwrite,
+// delete files), but no directory writes, snapshots, compression or fsck - so it uses the
+// trait defaults for those. Mounting is lazy and self-healing (see `FatBacking::run`).
+impl FileSystem for FatBacking {
+	fn volume_name(&self) -> &'static [u8] {
+		self.name
+	}
+	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error> {
+		self.run(|fs| fs.read_file(name))
+	}
+	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
+		// the foreign backends do not surface timestamps yet: 0 renders as "-".
+		let entries = self.run(|fs| if dir.is_empty() { fs.list() } else { fs.list_dir(dir) })?;
+		Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
+	}
+	fn capacity(&mut self) -> Result<u64, Error> {
+		unsafe { block_capacity(self.chan) }
+	}
+	fn status(&mut self) -> Result<VolumeStatus, Error> {
+		let (kind, total, free): (&'static str, u64, u64) = self.run(|fs| Ok((fs.kind_name(), fs.total_bytes(), fs.free_bytes()?)))?;
+		Ok(VolumeStatus { label: String::new(), total_bytes: total, free_bytes: free, compression: false, read_only: false, filesystem: String::from(kind) })
+	}
+	fn write_file(&mut self, name: &[u8], data: &[u8]) -> Result<(), Error> {
+		self.run(|fs| fs.write_file(name, data))
+	}
+	fn remove(&mut self, name: &[u8]) -> Result<(), Error> {
+		self.run(|fs| fs.remove(name))
+	}
+}
+
+// The read-only ISO9660 backend for optical and install media: read and list only, so it
+// uses the trait defaults (which refuse writes and report no snapshots) for the rest.
+struct IsoFs {
+	fs: Iso9660<IsoBlockDevice>,
+}
+
+impl FileSystem for IsoFs {
+	fn volume_name(&self) -> &'static [u8] {
+		ISO_VOLUME
+	}
+	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error> {
+		self.fs.read_file(name).map_err(map_fs_err)
+	}
+	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
+		let entries = if dir.is_empty() { self.fs.list() } else { self.fs.list_dir(dir) }.map_err(map_fs_err)?;
+		Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
+	}
+	fn capacity(&mut self) -> Result<u64, Error> {
+		unsafe { block_capacity(self.fs.device().chan) }
+	}
+	fn status(&mut self) -> Result<VolumeStatus, Error> {
+		Ok(VolumeStatus { label: String::new(), total_bytes: self.fs.total_bytes(), free_bytes: 0, compression: false, read_only: true, filesystem: String::from("iso9660") })
+	}
+}
+
+// The read-only UDF backend for optical media: read and list only, like ISO9660.
+struct UdfFs {
+	fs: Udf<UdfBlockDevice>,
+}
+
+impl FileSystem for UdfFs {
+	fn volume_name(&self) -> &'static [u8] {
+		UDF_VOLUME
+	}
+	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error> {
+		self.fs.read_file(name).map_err(map_fs_err)
+	}
+	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
+		let entries = if dir.is_empty() { self.fs.list() } else { self.fs.list_dir(dir) }.map_err(map_fs_err)?;
+		Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
+	}
+	fn capacity(&mut self) -> Result<u64, Error> {
+		unsafe { block_capacity(self.fs.device().chan) }
+	}
+	fn status(&mut self) -> Result<VolumeStatus, Error> {
+		Ok(VolumeStatus { label: String::new(), total_bytes: self.fs.total_bytes(), free_bytes: 0, compression: false, read_only: true, filesystem: String::from("udf") })
+	}
+}
+
+// The boot archive backend: a read-only PKGARCH1 archive mapped in memory (the kernel
+// test's ramdisk path), answering the "system" volume. It refuses every mutation with
+// `denied` (a policy refusal - the archive is deliberately immutable), not `invalid`.
+struct ArchiveFs {
+	base: u64,
+	len: usize,
+}
+
+impl ArchiveFs {
+	// The mapped archive bytes.
+	fn archive(&self) -> &[u8] {
+		unsafe { core::slice::from_raw_parts(self.base as *const u8, self.len) }
+	}
+}
+
+impl FileSystem for ArchiveFs {
+	fn volume_name(&self) -> &'static [u8] {
+		SYSTEM_VOLUME
+	}
+	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error> {
+		let file: &[u8] = Package::parse(self.archive()).and_then(|p| p.lookup(name)).ok_or(Error::NotFound)?;
+		Ok(file.to_vec())
+	}
+	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
+		// the test archive is a flat package - it has no subdirectories.
+		if !dir.is_empty() {
+			return Err(Error::NotFound);
+		}
+		let package = Package::parse(self.archive()).ok_or(Error::NotFound)?;
+		let mut files: Vec<FileInfo> = Vec::new();
+		for index in 0..package.len() {
+			if let Some(name) = package.name(index) {
+				let size: u64 = package.lookup(name).map(|b| b.len()).unwrap_or(0) as u64;
+				// the archive format carries no timestamps.
+				files.push(file_info(name, size, false, 0, 0));
+			}
+		}
+		Ok(files)
+	}
+	fn capacity(&mut self) -> Result<u64, Error> {
+		Ok(self.len as u64)
+	}
+	fn status(&mut self) -> Result<VolumeStatus, Error> {
+		Ok(VolumeStatus { label: String::new(), total_bytes: self.len as u64, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("archive") })
+	}
+	fn write_file(&mut self, _name: &[u8], _data: &[u8]) -> Result<(), Error> {
+		Err(Error::Denied)
+	}
+	fn remove(&mut self, _name: &[u8]) -> Result<(), Error> {
+		Err(Error::Denied)
+	}
+	fn mkdir(&mut self, _name: &[u8]) -> Result<(), Error> {
+		Err(Error::Denied)
+	}
+	fn rmdir(&mut self, _name: &[u8]) -> Result<(), Error> {
+		Err(Error::Denied)
+	}
+	fn set_compression(&mut self, _enabled: bool) -> Result<(), Error> {
+		Err(Error::Denied)
+	}
+	fn restore(&mut self, _name: &[u8], _snapshot: &[u8]) -> Result<(), Error> {
+		Err(Error::Denied)
+	}
+}
+
+// Map a filesystem error onto the Storage.Volume `error` enum. Every backend now
+// reports through the one shared fs-core `FsError`, so this single mapping covers them
+// all - LiberFS, FAT, ISO9660 and UDF alike.
 fn map_fs_err(e: FsError) -> Error {
 	match e {
 		FsError::NotFound => Error::NotFound,
@@ -612,34 +721,6 @@ fn map_fs_err(e: FsError) -> Error {
 		// a read-only mount (a snapshot, or a volume degraded by a corrupt snapshot
 		// table) refuses mutations, like any other read-only volume.
 		FsError::ReadOnly => Error::Denied,
-	}
-}
-
-// Map a FAT error onto the Storage.Volume `error` enum.
-fn map_fat_err(e: fat::FsError) -> Error {
-	match e {
-		fat::FsError::NotFound => Error::NotFound,
-		fat::FsError::NoSpace => Error::Again,
-		fat::FsError::TooLong | fat::FsError::Invalid => Error::Invalid,
-		fat::FsError::Io => Error::Again,
-	}
-}
-
-// Map an ISO9660 error onto the Storage.Volume `error` enum.
-fn map_iso_err(e: iso9660::FsError) -> Error {
-	match e {
-		iso9660::FsError::NotFound => Error::NotFound,
-		iso9660::FsError::TooLong | iso9660::FsError::Invalid => Error::Invalid,
-		iso9660::FsError::Io => Error::Again,
-	}
-}
-
-// Map a UDF error onto the Storage.Volume `error` enum.
-fn map_udf_err(e: udf::FsError) -> Error {
-	match e {
-		udf::FsError::NotFound => Error::NotFound,
-		udf::FsError::TooLong | udf::FsError::Invalid => Error::Invalid,
-		udf::FsError::Io => Error::Again,
 	}
 }
 
@@ -740,11 +821,11 @@ struct FatBlockDevice {
 }
 
 impl fat::BlockDevice for FatBlockDevice {
-	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
 		unsafe { block_read(self.chan, lba, 1, buf.as_mut_ptr()) }
 	}
 
-	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
+	fn write_block(&mut self, lba: u64, buf: &[u8]) -> bool {
 		unsafe { block_write(self.chan, lba, 1, buf.as_ptr()) }
 	}
 }
@@ -1074,7 +1155,11 @@ unsafe fn block_request_sectors(block_client: u64) -> u32 {
 		match recv_blocking(block_client, &mut rep) {
 			Received::Message { len, handle } if len >= 16 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => {
 				let max: u32 = u32::from_le_bytes([rep[12], rep[13], rep[14], rep[15]]);
-				if max == 0 { MAX_SECTORS_FALLBACK } else { max }
+				if max == 0 {
+					MAX_SECTORS_FALLBACK
+				} else {
+					max
+				}
 			}
 			_ => MAX_SECTORS_FALLBACK,
 		}

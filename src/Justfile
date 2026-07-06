@@ -20,6 +20,7 @@ liberfs_dir := "fs/liberfs"
 fat_dir := "fs/fat"
 iso9660_dir := "fs/iso9660"
 udf_dir := "fs/udf"
+fscore_dir := "fs/core"
 target := "x86_64-unknown-none"
 kernel_elf := kernel_dir / "target" / target / "debug" / "kernel"
 
@@ -106,6 +107,7 @@ fmt:
 	cd {{term_dir}} && cargo fmt
 	cd {{bootproto_dir}} && cargo fmt
 	cd {{loader_dir}} && cargo fmt
+	cd {{fscore_dir}} && cargo fmt
 	cd {{liberfs_dir}} && cargo fmt
 	cd {{fat_dir}} && cargo fmt
 	cd {{iso9660_dir}} && cargo fmt
@@ -129,6 +131,7 @@ fmt-check:
 	cd {{term_dir}} && cargo fmt --check
 	cd {{bootproto_dir}} && cargo fmt --check
 	cd {{loader_dir}} && cargo fmt --check
+	cd {{fscore_dir}} && cargo fmt --check
 	cd {{liberfs_dir}} && cargo fmt --check
 	cd {{fat_dir}} && cargo fmt --check
 	cd {{iso9660_dir}} && cargo fmt --check
@@ -152,6 +155,7 @@ clean:
 	cd {{term_dir}} && cargo clean
 	cd {{bootproto_dir}} && cargo clean
 	cd {{loader_dir}} && cargo clean
+	cd {{fscore_dir}} && cargo clean
 	cd {{liberfs_dir}} && cargo clean
 	cd {{fat_dir}} && cargo clean
 	cd {{iso9660_dir}} && cargo clean

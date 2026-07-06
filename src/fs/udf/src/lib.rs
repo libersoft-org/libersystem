@@ -53,22 +53,15 @@ const TAG_FILE_ENTRY: u16 = 261;
 const TAG_EXT_FILE_ENTRY: u16 = 266;
 
 // A block device: optical media is read one 2048-byte logical block at a time, by
-// absolute LBA. Implementors map that onto their backing (disc sectors, a Vec). The
-// backend never writes, so there is no write_block.
-pub trait BlockDevice {
-	// Read block `lba` into `buf` (exactly SECTOR_SIZE bytes). False on I/O failure.
-	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool;
-}
+// absolute LBA. The trait is the shared fs-core one (a block is exactly `buf.len()`
+// bytes); UDF is read-only, so it uses only `read_block` and keeps fs-core's
+// refuse-write and no-op-flush defaults.
+pub use fscore::BlockDevice;
 
 // A UDF error. The variants map onto the `Storage.Volume` `error` enum at the service
-// boundary (NotFound -> not-found, the rest -> invalid).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FsError {
-	NotFound,
-	Invalid,
-	TooLong,
-	Io,
-}
+// boundary (NotFound -> not-found, the rest -> invalid). The type is the shared fs-core
+// one, so every backend reports through one error enum; UDF uses only the read subset.
+pub use fscore::FsError;
 
 // One directory entry: a name, a byte length, and whether it is a subdirectory. The
 // listing the shell shows; a directory reports a length of zero.

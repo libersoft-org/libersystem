@@ -13,7 +13,7 @@ struct MemDisk {
 }
 
 impl BlockDevice for MemDisk {
-	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
 		let start = lba as usize * SECTOR_SIZE;
 		let Some(src) = self.data.get(start..start + SECTOR_SIZE) else {
 			return false;
@@ -22,7 +22,7 @@ impl BlockDevice for MemDisk {
 		true
 	}
 
-	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
+	fn write_block(&mut self, lba: u64, buf: &[u8]) -> bool {
 		let start = lba as usize * SECTOR_SIZE;
 		let Some(dst) = self.data.get_mut(start..start + SECTOR_SIZE) else {
 			return false;
@@ -923,11 +923,11 @@ struct FlakyDisk {
 }
 
 impl BlockDevice for FlakyDisk {
-	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool {
-		self.inner.read_sector(lba, buf)
+	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		self.inner.read_block(lba, buf)
 	}
 
-	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
+	fn write_block(&mut self, lba: u64, buf: &[u8]) -> bool {
 		if !self.failed {
 			if self.until_fail == 0 {
 				self.failed = true;
@@ -935,7 +935,7 @@ impl BlockDevice for FlakyDisk {
 			}
 			self.until_fail -= 1;
 		}
-		self.inner.write_sector(lba, buf)
+		self.inner.write_block(lba, buf)
 	}
 }
 
@@ -1228,11 +1228,11 @@ struct FailAt {
 }
 
 impl BlockDevice for FailAt {
-	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool {
-		self.inner.read_sector(lba, buf)
+	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		self.inner.read_block(lba, buf)
 	}
 
-	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
+	fn write_block(&mut self, lba: u64, buf: &[u8]) -> bool {
 		if self.armed && lba == self.lba {
 			if self.skip == 0 {
 				self.armed = false;
@@ -1240,7 +1240,7 @@ impl BlockDevice for FailAt {
 			}
 			self.skip -= 1;
 		}
-		self.inner.write_sector(lba, buf)
+		self.inner.write_block(lba, buf)
 	}
 }
 
@@ -1286,13 +1286,13 @@ struct CountingDisk {
 }
 
 impl BlockDevice for CountingDisk {
-	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
 		self.reads += 1;
-		self.inner.read_sector(lba, buf)
+		self.inner.read_block(lba, buf)
 	}
 
-	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
-		self.inner.write_sector(lba, buf)
+	fn write_block(&mut self, lba: u64, buf: &[u8]) -> bool {
+		self.inner.write_block(lba, buf)
 	}
 }
 
@@ -1372,13 +1372,13 @@ struct WriteLog {
 }
 
 impl BlockDevice for WriteLog {
-	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool {
-		self.inner.read_sector(lba, buf)
+	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		self.inner.read_block(lba, buf)
 	}
 
-	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool {
+	fn write_block(&mut self, lba: u64, buf: &[u8]) -> bool {
 		self.writes.push(lba);
-		self.inner.write_sector(lba, buf)
+		self.inner.write_block(lba, buf)
 	}
 }
 

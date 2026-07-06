@@ -19,8 +19,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::audio::{self, Service};
 use proto::system::Error;
+use proto::system::audio::{self, Service};
 use rt::*;
 
 // The PCM format the virtio-snd driver expects: 48 kHz, 2 channels, signed 16-bit,
@@ -89,15 +89,7 @@ unsafe fn play_tone(snd: u64, freq: u16, millis: u32) -> Result<(), Error> {
 			// fill one period; the final, short one is padded with silence.
 			for f in 0..PERIOD_FRAMES {
 				let g: u32 = frame + f;
-				let sample: i16 = if g < total_frames {
-					if (g / half) % 2 == 0 {
-						AMP
-					} else {
-						-AMP
-					}
-				} else {
-					0
-				};
+				let sample: i16 = if g < total_frames { if (g / half) % 2 == 0 { AMP } else { -AMP } } else { 0 };
 				let le: [u8; 2] = sample.to_le_bytes();
 				let off: usize = f as usize * 4;
 				period[off] = le[0];

@@ -6,3 +6,4 @@ edition = "2024"
 description = "UDF - a read-only backend for DVD / Blu-ray and large optical (.udf) media behind one BlockDevice trait"
 
 [dependencies]
+fscore = { path = "../core" }

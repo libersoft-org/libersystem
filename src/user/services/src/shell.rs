@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use proto::codec::JsonMode;
 use proto::path;
-use proto::system::{input, network, permission, process, session, system_graph, volume, Component, EnvVar, JobEntry, JobInfo, TraceSpan};
+use proto::system::{Component, EnvVar, JobEntry, JobInfo, TraceSpan, input, network, permission, process, session, system_graph, volume};
 use rt::*;
 
 // The shell's builtins, shared with ConsoleService's line discipline: Tab completes the
@@ -1279,11 +1279,7 @@ unsafe fn send_stdout(parent: u64, interactive: bool) {
 		let rights: u32 = if interactive { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER } else { RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER };
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, rights);
-			if d > 0 {
-				d as u64
-			} else {
-				0
-			}
+			if d > 0 { d as u64 } else { 0 }
 		} else {
 			0
 		};

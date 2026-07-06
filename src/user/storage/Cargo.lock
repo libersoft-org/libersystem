@@ -9,14 +9,27 @@ version = "0.0.0"
 [[package]]
 name = "fat"
 version = "0.0.0"
+dependencies = [
+ "fscore",
+]
+
+[[package]]
+name = "fscore"
+version = "0.0.0"
 
 [[package]]
 name = "iso9660"
 version = "0.0.0"
+dependencies = [
+ "fscore",
+]
 
 [[package]]
 name = "liberfs"
 version = "0.0.0"
+dependencies = [
+ "fscore",
+]
 
 [[package]]
 name = "proto"
@@ -45,3 +58,6 @@ dependencies = [
 [[package]]
 name = "udf"
 version = "0.0.0"
+dependencies = [
+ "fscore",
+]

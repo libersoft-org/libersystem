@@ -192,9 +192,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if matches!(&self.rcsum, Some((rp, _, _)) if *rp == block) {
 			self.rcsum = None;
 		}
-		if matches!(&self.decomp, Some((dp, _)) if *dp == block) {
-			self.decomp = None;
-		}
+		self.decomp.forget(block);
 	}
 
 	// Record that the in-flight transaction stopped referencing `ptr`. A block the
@@ -394,13 +392,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.check_extent(&ext)?;
 		if ext.clen != 0 {
 			// a compressed run: serve the block from the whole extent's decompressed
-			// image, decoding once and caching it for the rest of a sequential read.
-			let cached = matches!(&self.decomp, Some((key, _)) if *key == ext.physical);
-			if !cached {
+			// image, decoding once and caching it (in a small LRU) for later reads of it.
+			if self.decomp.get(ext.physical).is_none() {
 				let decoded = self.decompress_extent(&ext)?;
-				self.decomp = Some((ext.physical, decoded));
+				self.decomp.insert(ext.physical, decoded);
 			}
-			let data = &self.decomp.as_ref().unwrap().1;
+			let data = self.decomp.get(ext.physical).unwrap();
 			let start = (lb - ext.logical) as usize * BLOCK_SIZE;
 			buf.fill(0);
 			if start < data.len() {

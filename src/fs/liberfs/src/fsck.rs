@@ -22,7 +22,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.icache.clear();
 		self.dcache.clear();
 		self.rcsum = None;
-		self.decomp = None;
+		self.decomp.clear();
 		let mut checksum_failures = 0u32;
 		let mut damaged: Vec<Vec<u8>> = Vec::new();
 		match self.derive_free() {

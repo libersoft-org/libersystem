@@ -40,25 +40,18 @@ mod tests;
 pub const SECTOR_SIZE: usize = 512;
 
 // A block device: foreign media is read and written one 512-byte sector at a time, by
-// absolute LBA. Implementors map that onto their backing (disk sectors, a Vec). The read
-// path mounts and lists; the write path creates, overwrites, and deletes files.
-pub trait BlockDevice {
-	// Read sector `lba` into `buf` (exactly SECTOR_SIZE bytes). False on I/O failure.
-	fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> bool;
-	// Write `buf` (exactly SECTOR_SIZE bytes) to sector `lba`. False on I/O failure.
-	fn write_sector(&mut self, lba: u64, buf: &[u8]) -> bool;
-}
+// absolute LBA (its block index). The trait is the shared fs-core one (a block is
+// exactly `buf.len()` bytes, so FAT's 512-byte sectors, ISO/UDF's 2048-byte blocks and
+// LiberFS's 4 kB blocks all use it); FAT reads and writes, so it uses `read_block` and
+// `write_block`. The read path mounts and lists; the write path creates, overwrites,
+// and deletes files.
+pub use fscore::BlockDevice;
 
 // A FAT error. The variants map onto the `Storage.Volume` `error` enum at the service
-// boundary (NotFound -> not-found, the rest -> invalid / again).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FsError {
-	NotFound,
-	Invalid,
-	TooLong,
-	NoSpace,
-	Io,
-}
+// boundary (NotFound -> not-found, the rest -> invalid / again). The type is the shared
+// fs-core one, so LiberFS, FAT, ISO9660 and UDF all report through one error enum; FAT
+// uses the read subset plus `NoSpace`.
+pub use fscore::FsError;
 
 // One directory entry: a name, a byte length, and whether it is a subdirectory. The
 // listing the shell shows; a directory reports a length of zero.
@@ -157,7 +150,7 @@ impl<D: BlockDevice> FatFs<D> {
 	// random sector with plausible numbers does not mount.
 	pub fn mount(mut dev: D) -> Option<FatFs<D>> {
 		let mut boot = [0u8; SECTOR_SIZE];
-		if !dev.read_sector(0, &mut boot) {
+		if !dev.read_block(0, &mut boot) {
 			return None;
 		}
 		let geo = if &boot[3..11] == b"EXFAT   " {
@@ -176,7 +169,7 @@ impl<D: BlockDevice> FatFs<D> {
 		let ratio = (geo.bytes_per_sector / SECTOR_SIZE as u32) as u64;
 		let heap_end = geo.first_data_sector as u64 + geo.cluster_count as u64 * geo.sectors_per_cluster as u64;
 		let mut last = [0u8; SECTOR_SIZE];
-		if !dev.read_sector(heap_end * ratio - 1, &mut last) {
+		if !dev.read_block(heap_end * ratio - 1, &mut last) {
 			return None;
 		}
 		Some(FatFs { dev, geo, clock: 0 })
@@ -520,7 +513,7 @@ impl<D: BlockDevice> FatFs<D> {
 		for i in 0..total {
 			let off = i as usize * SECTOR_SIZE;
 			let mut s = [0u8; SECTOR_SIZE];
-			if !self.dev.read_sector(sec * ratio + i, &mut s) {
+			if !self.dev.read_block(sec * ratio + i, &mut s) {
 				return Err(FsError::Io);
 			}
 			buf[off..off + SECTOR_SIZE].copy_from_slice(&s);
@@ -577,7 +570,7 @@ impl<D: BlockDevice> FatFs<D> {
 		let total = count as u64 * ratio;
 		for i in 0..total {
 			let off = i as usize * SECTOR_SIZE;
-			if !self.dev.write_sector(sec * ratio + i, &buf[off..off + SECTOR_SIZE]) {
+			if !self.dev.write_block(sec * ratio + i, &buf[off..off + SECTOR_SIZE]) {
 				return Err(FsError::Io);
 			}
 		}

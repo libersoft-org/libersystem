@@ -941,6 +941,47 @@ fn a_compressible_file_shrinks_and_round_trips() {
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
 }
 
+// M111 box 4: the decompression cache is a small LRU, not a single slot, so a read
+// pattern that alternates between a few compressed runs decodes each once instead of
+// re-reading its stored blocks on every switch (a single slot thrashed the moment a
+// second run touched it). Measured with a device that counts its reads: after both runs
+// are primed, re-reading the first costs zero device reads because the intervening read
+// of the second did not evict it.
+#[test]
+fn the_decompression_lru_survives_an_intervening_compressed_read() {
+	struct Counting {
+		inner: MemDevice,
+		reads: u64,
+	}
+	impl BlockDevice for Counting {
+		fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+			self.reads += 1;
+			self.inner.read_block(index, buf)
+		}
+		fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+			self.inner.write_block(index, buf)
+		}
+	}
+
+	let dev = Counting { inner: MemDevice::new(NBLOCKS), reads: 0 };
+	let mut fs = LiberFs::format_opts(dev, NBLOCKS, FormatOpts { compress: true, ..FormatOpts::default() }).unwrap();
+	let a: Vec<u8> = b"alpha compresses very well. ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
+	let b: Vec<u8> = b"beta also compresses nicely. ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
+	fs.write_file(b"a", &a).unwrap();
+	fs.write_file(b"b", &b).unwrap();
+
+	// prime both runs into the cache: each first read decodes its stored blocks.
+	assert_eq!(fs.read_file(b"a").unwrap(), a);
+	assert_eq!(fs.read_file(b"b").unwrap(), b);
+
+	// read `a` again: it was decoded before `b`, so a single-slot cache would have evicted
+	// it and re-read its stored blocks. With the LRU it is still resident - no device read.
+	let before = fs.device().reads;
+	assert_eq!(fs.read_file(b"a").unwrap(), a);
+	let cost = fs.device().reads - before;
+	assert_eq!(cost, 0, "an intervening compressed read must not evict `a` from the decompression LRU (cost {cost} reads)");
+}
+
 #[test]
 fn an_incompressible_file_stays_raw() {
 	let mut fs = format_lz(MemDevice::new(NBLOCKS), NBLOCKS);

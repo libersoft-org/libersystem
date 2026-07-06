@@ -295,35 +295,9 @@ fn crc32c(data: &[u8]) -> u32 {
 // A filesystem error. The variants map onto the `Storage.Volume` `error` enum at the
 // service boundary (NotFound -> not-found, NoSpace -> again, ReadOnly -> denied, the
 // rest -> invalid) - but they stay precise here, so a caller (and a test) can tell a
-// bad name from a wrong type from a non-empty directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FsError {
-	NotFound,
-	NoSpace,
-	TooLong,
-	// A malformed path or name: an empty segment, "." or "..", not UTF-8, or a byte
-	// outside the portable-name policy.
-	BadName,
-	// The path names a directory where a file was required (writing, truncating).
-	IsDir,
-	// The path names a file where a directory was required (a path component, rmdir).
-	NotDir,
-	// Removing or replacing a directory that still has entries.
-	NotEmpty,
-	// Creating something that already exists (a duplicate snapshot name).
-	Exists,
-	// An operation the filesystem cannot perform (moving a directory into its own
-	// subtree, formatting an impossibly small pool) or an internal inconsistency (an
-	// inode record missing from the tree).
-	Invalid,
-	// A block read back with a CRC32C that did not match the one stored beside its
-	// pointer: on-disk corruption, surfaced instead of returning the bad bytes.
-	Corrupt,
-	Io,
-	// The mount is read-only (a snapshot mount, or a volume degraded by a corrupt
-	// snapshot table): every mutation is refused so the on-disk state stays intact.
-	ReadOnly,
-}
+// bad name from a wrong type from a non-empty directory. The type is the shared
+// fs-core one, so LiberFS, FAT, ISO9660 and UDF all report through one error enum.
+pub use fscore::FsError;
 
 // Metadata about one path, returned by [`LiberFs::stat`]: its byte length, whether it is
 // a directory, and its created / modified logical timestamps.
@@ -348,34 +322,11 @@ pub struct FsckReport {
 
 // A fixed-size block device: the whole filesystem is read and written one
 // BLOCK_SIZE-byte block at a time, addressed by a filesystem-relative block index in
-// `0..num_blocks`. Implementors map that onto their backing (disk sectors, a Vec).
-pub trait BlockDevice {
-	// Read block `index` into `buf` (exactly BLOCK_SIZE bytes). False on I/O failure.
-	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool;
-	// Read `count` consecutive blocks starting at `index` into `buf` (exactly
-	// count * BLOCK_SIZE bytes). The default loops `read_block`; a backing that can
-	// move a span in one device request (the disk's block service) overrides it, so
-	// a contiguous file extent costs one round-trip instead of one per block.
-	fn read_blocks(&mut self, index: u64, count: u64, buf: &mut [u8]) -> bool {
-		for i in 0..count {
-			let dst = &mut buf[i as usize * BLOCK_SIZE..(i as usize + 1) * BLOCK_SIZE];
-			if !self.read_block(index + i, dst) {
-				return false;
-			}
-		}
-		true
-	}
-	// Write `buf` (exactly BLOCK_SIZE bytes) to block `index`. False on I/O failure.
-	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool;
-	// Make every write issued so far durable (flush the device's volatile write cache)
-	// before any later write reaches the medium. The commit protocol brackets the
-	// superblock write with this barrier, so crash atomicity holds on devices that
-	// reorder cached writes. False on I/O failure. A backing with no volatile cache
-	// (memory, a write-through disk) may keep this default no-op.
-	fn flush(&mut self) -> bool {
-		true
-	}
-}
+// `0..num_blocks`. The trait is the shared fs-core one (a block is exactly `buf.len()`
+// bytes, so LiberFS's 4 kB blocks, FAT's 512-byte sectors and ISO/UDF's 2048-byte
+// blocks all use it); LiberFS's device passes 4 kB buffers and implements the batch
+// `read_blocks`, `write_block` and `flush` the write path relies on.
+pub use fscore::BlockDevice;
 
 // The parsed superblock, cached in memory for the life of a mount. With copy-on-write
 // the inode table moves on every commit, so the superblock points at it through an
@@ -674,6 +625,58 @@ struct Txn {
 // up the trees, and `commit` writes a new superblock to the inactive slot - or `abort`
 // rolls back. The previous generation's root stays reserved so it remains a read-only
 // snapshot.
+// The number of recently-decompressed compressed runs LiberFs keeps in memory. A small
+// LRU rather than a single slot, so alternating sequential reads over a handful of
+// compressed extents each decode once instead of evicting one another on every switch.
+pub(crate) const DECOMP_CACHE_ENTRIES: usize = 8;
+
+// An LRU cache of decompressed compressed runs, keyed by each run's first stored block.
+// The most-recently-used entry is last; a full cache evicts the least-recently-used one
+// (at the front). Bounded to DECOMP_CACHE_ENTRIES runs, so a pathological read pattern
+// cannot grow it without limit.
+pub(crate) struct DecompCache {
+	entries: Vec<(u64, Vec<u8>)>,
+}
+
+impl DecompCache {
+	pub(crate) fn new() -> DecompCache {
+		DecompCache { entries: Vec::new() }
+	}
+
+	// The decompressed bytes of the run keyed at `key`, promoted to most-recently-used, or
+	// None on a miss.
+	pub(crate) fn get(&mut self, key: u64) -> Option<&[u8]> {
+		let pos = self.entries.iter().position(|(k, _)| *k == key)?;
+		let entry = self.entries.remove(pos);
+		self.entries.push(entry);
+		Some(&self.entries.last().unwrap().1)
+	}
+
+	// Cache `data` for the run keyed at `key` as most-recently-used, evicting the least-
+	// recently-used run when the cache is full. A key already present is replaced.
+	pub(crate) fn insert(&mut self, key: u64, data: Vec<u8>) {
+		if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
+			self.entries.remove(pos);
+		}
+		if self.entries.len() >= DECOMP_CACHE_ENTRIES {
+			self.entries.remove(0);
+		}
+		self.entries.push((key, data));
+	}
+
+	// Drop the run keyed at `key`, if cached (its stored blocks are being rewritten).
+	pub(crate) fn forget(&mut self, key: u64) {
+		if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
+			self.entries.remove(pos);
+		}
+	}
+
+	// Drop every cached run (a transaction boundary reused blocks the cache described).
+	pub(crate) fn clear(&mut self) {
+		self.entries.clear();
+	}
+}
+
 pub struct LiberFs<D: BlockDevice> {
 	dev: D,
 	num_blocks: u64,
@@ -730,9 +733,10 @@ pub struct LiberFs<D: BlockDevice> {
 	// The state captured at `begin`, restored by `abort` and used by `commit` to reserve
 	// the generation it supersedes.
 	txn: Option<Txn>,
-	// A one-extent cache of the most recently decompressed run, keyed by its first stored
-	// block, so a sequential read of a compressed extent decodes it only once.
-	decomp: Option<(u64, Vec<u8>)>,
+	// A small LRU cache of the most recently decompressed runs, keyed by each run's first
+	// stored block, so alternating sequential reads over a few compressed extents each
+	// decode once instead of thrashing a single slot.
+	decomp: DecompCache,
 	// The in-flight checksum block being assembled (always a fresh block): sequential
 	// writes edit it in memory and it reaches the device once, on eviction or at commit -
 	// instead of a read-modify-write per data block.
