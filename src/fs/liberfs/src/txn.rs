@@ -259,7 +259,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				for i in 0..leaf_count(&buf, INODE_REC) {
 					let off = NODE_HDR + i * INODE_REC + 8;
 					let mut inode = Inode::parse(&buf[off..off + INODE_SIZE]);
-					if inode.kind == KIND_FILE {
+					if inode.r#type == TYPE_FILE {
 						// complete the extent map from the overflow chain before marking
 						// (the spill and dir walks use their own buffers, so the leaf
 						// image in `buf` stays intact). A file whose chain cannot be
@@ -268,7 +268,7 @@ impl<D: BlockDevice> LiberFs<D> {
 						if marked.is_err() {
 							self.walk_damage = true;
 						}
-					} else if inode.kind == KIND_DIR {
+					} else if inode.r#type == TYPE_DIR {
 						self.mark_dir_tree(inode.dir_root, map)?;
 					}
 				}

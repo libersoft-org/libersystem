@@ -89,14 +89,14 @@ fn render_vector(out: &mut String, printed: u64, info: &IrqInfo, json: bool) {
 		}
 		out.push_str("{\"vector\":");
 		push_decimal(out, info.vector as u64);
-		out.push_str(",\"kind\":\"");
+		out.push_str(",\"type\":\"");
 		out.push_str(kind);
 		out.push_str("\",\"bound\":");
 		out.push_str(if info.bound != 0 { "true" } else { "false" });
 		if info.device != IRQ_NO_DEVICE {
 			out.push_str(",\"device\":");
 			push_decimal(out, info.device as u64);
-			out.push_str(",\"type\":\"");
+			out.push_str(",\"device-type\":\"");
 			out.push_str(device_type_name(owner_type(info.device)));
 			out.push('"');
 		}

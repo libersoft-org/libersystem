@@ -524,8 +524,8 @@ fn query_renders_cbor_with_options() {
 fn graph_round_trips() {
 	let g = Graph {
 		components: alloc::vec![
-			Component { name: String::from("log-service"), kind: ComponentKind::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 7, messages_received: 3, handles: 5, memory_bytes: 8192, restarts: 0, watchdog_trips: 0, last_failure: String::new() } },
-			Component { name: String::from("device-manager"), kind: ComponentKind::Service, state: ComponentState::Stopped, deps: alloc::vec![String::from("log-service")], counters: Counters { messages_sent: 1, messages_received: 1, handles: 2, memory_bytes: 4096, restarts: 1, watchdog_trips: 1, last_failure: String::from("hung") } },
+			Component { name: String::from("log-service"), r#type: ComponentType::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 7, messages_received: 3, handles: 5, memory_bytes: 8192, restarts: 0, watchdog_trips: 0, last_failure: String::new() } },
+			Component { name: String::from("device-manager"), r#type: ComponentType::Service, state: ComponentState::Stopped, deps: alloc::vec![String::from("log-service")], counters: Counters { messages_sent: 1, messages_received: 1, handles: 2, memory_bytes: 4096, restarts: 1, watchdog_trips: 1, last_failure: String::from("hung") } },
 		],
 		spans: alloc::vec![TraceSpan { name: String::from("device.list"), duration_ns: 1234 }],
 	};
@@ -537,7 +537,7 @@ fn graph_round_trips() {
 // enums, its deps as an array, and its counters as a nested map.
 #[test]
 fn component_renders_cbor_map() {
-	let c = Component { name: String::from("net"), kind: ComponentKind::Driver, state: ComponentState::Failed, deps: alloc::vec![String::from("device-manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 1, memory_bytes: 0, restarts: 2, watchdog_trips: 0, last_failure: String::new() } };
+	let c = Component { name: String::from("net"), r#type: ComponentType::Driver, state: ComponentState::Failed, deps: alloc::vec![String::from("device-manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 1, memory_bytes: 0, restarts: 2, watchdog_trips: 0, last_failure: String::new() } };
 	let mut want = Vec::new();
 	want.push(0xa5); // map(5)
 	want.push(0x64);
@@ -545,7 +545,7 @@ fn component_renders_cbor_map() {
 	want.push(0x63);
 	want.extend_from_slice(b"net");
 	want.push(0x64);
-	want.extend_from_slice(b"kind");
+	want.extend_from_slice(b"type");
 	want.push(0x66);
 	want.extend_from_slice(b"driver");
 	want.push(0x65);

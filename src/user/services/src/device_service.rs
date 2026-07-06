@@ -18,7 +18,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use proto::system::device::{self, Service};
-use proto::system::{DeviceEntry, DeviceKind, Error};
+use proto::system::{DeviceEntry, DeviceType, Error};
 use rt::*;
 
 // The kernel device table, behind the generated Device contract.
@@ -51,18 +51,18 @@ unsafe fn device_entry(i: u64) -> Option<DeviceEntry> {
 		if !device_info(i, &mut info) {
 			return None;
 		}
-		Some(DeviceEntry { index: i as u32, kind: kind_of(info.device_type), mmio_len: info.bar_len })
+		Some(DeviceEntry { index: i as u32, r#type: type_of(info.device_type), mmio_len: info.bar_len })
 	}
 }
 
-// Map a kernel device-type code to the typed device kind.
-fn kind_of(device_type: u32) -> DeviceKind {
+// Map a kernel device-type code to the typed device type.
+fn type_of(device_type: u32) -> DeviceType {
 	match device_type {
-		VIRTIO_TYPE_NET => DeviceKind::Net,
-		VIRTIO_TYPE_BLOCK => DeviceKind::Block,
-		VIRTIO_TYPE_CONSOLE => DeviceKind::Console,
-		DEVICE_TYPE_XHCI => DeviceKind::Usb,
-		_ => DeviceKind::Unknown,
+		VIRTIO_TYPE_NET => DeviceType::Net,
+		VIRTIO_TYPE_BLOCK => DeviceType::Block,
+		VIRTIO_TYPE_CONSOLE => DeviceType::Console,
+		DEVICE_TYPE_XHCI => DeviceType::Usb,
+		_ => DeviceType::Unknown,
 	}
 }
 

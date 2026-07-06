@@ -78,7 +78,7 @@ unsafe fn print_budget(budget: &Budget) {
 		line.push(':');
 		for u in budget.usage.iter() {
 			line.push(' ');
-			line.push_str(&u.kind.to_text());
+			line.push_str(&u.r#type.to_text());
 			line.push('=');
 			push_amount(&mut line, u.used);
 			line.push('/');

@@ -32,7 +32,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 use proto::system::resources::{self, Service};
-use proto::system::{Budget, Error, ResourceKind, ResourceUsage};
+use proto::system::{Budget, Error, ResourceType, ResourceUsage};
 use rt::*;
 
 // The governed component this milestone launches, and the name of the budget the manager
@@ -49,15 +49,15 @@ const PAGE: u64 = 4096;
 // the cap by the same amount again at runtime.
 const GRANT_PAGES: u64 = 4;
 
-// The PROP_*_LIMIT selector that sets a Domain counter for a resource kind.
-fn prop_for(kind: ResourceKind) -> u64 {
-	match kind {
-		ResourceKind::Memory => PROP_MEMORY_LIMIT,
-		ResourceKind::Handles => PROP_HANDLE_LIMIT,
-		ResourceKind::Threads => PROP_THREAD_LIMIT,
-		ResourceKind::IpcQueue => PROP_IPC_QUEUE_LIMIT,
-		ResourceKind::Dma => PROP_DMA_LIMIT,
-		ResourceKind::Stack => PROP_STACK_LIMIT,
+// The PROP_*_LIMIT selector that sets a Domain counter for a resource type.
+fn prop_for(r#type: ResourceType) -> u64 {
+	match r#type {
+		ResourceType::Memory => PROP_MEMORY_LIMIT,
+		ResourceType::Handles => PROP_HANDLE_LIMIT,
+		ResourceType::Threads => PROP_THREAD_LIMIT,
+		ResourceType::IpcQueue => PROP_IPC_QUEUE_LIMIT,
+		ResourceType::Dma => PROP_DMA_LIMIT,
+		ResourceType::Stack => PROP_STACK_LIMIT,
 	}
 }
 
@@ -67,12 +67,12 @@ fn prop_for(kind: ResourceKind) -> u64 {
 fn budget_of(domain: u64) -> Budget {
 	let stats: DomainStats = unsafe { domain_stats(domain) }.unwrap_or_default();
 	let usage: Vec<ResourceUsage> = alloc::vec![
-		ResourceUsage { kind: ResourceKind::Memory, used: stats.memory_used, limit: stats.memory_limit },
-		ResourceUsage { kind: ResourceKind::Handles, used: stats.handles_used, limit: stats.handles_limit },
-		ResourceUsage { kind: ResourceKind::Threads, used: stats.threads_used, limit: stats.threads_limit },
-		ResourceUsage { kind: ResourceKind::IpcQueue, used: stats.ipc_used, limit: stats.ipc_limit },
-		ResourceUsage { kind: ResourceKind::Dma, used: stats.dma_used, limit: stats.dma_limit },
-		ResourceUsage { kind: ResourceKind::Stack, used: stats.stack_used, limit: stats.stack_limit },
+		ResourceUsage { r#type: ResourceType::Memory, used: stats.memory_used, limit: stats.memory_limit },
+		ResourceUsage { r#type: ResourceType::Handles, used: stats.handles_used, limit: stats.handles_limit },
+		ResourceUsage { r#type: ResourceType::Threads, used: stats.threads_used, limit: stats.threads_limit },
+		ResourceUsage { r#type: ResourceType::IpcQueue, used: stats.ipc_used, limit: stats.ipc_limit },
+		ResourceUsage { r#type: ResourceType::Dma, used: stats.dma_used, limit: stats.dma_limit },
+		ResourceUsage { r#type: ResourceType::Stack, used: stats.stack_used, limit: stats.stack_limit },
 	];
 	Budget { name: String::from(BUDGET_NAME), usage }
 }
@@ -87,11 +87,11 @@ impl Service for Manager {
 	fn usage(&mut self) -> Result<Vec<Budget>, Error> {
 		Ok(alloc::vec![budget_of(self.domain)])
 	}
-	fn set_limit(&mut self, name: String, kind: ResourceKind, limit: u64) -> Result<Budget, Error> {
+	fn set_limit(&mut self, name: String, r#type: ResourceType, limit: u64) -> Result<Budget, Error> {
 		if name.as_bytes() != BUDGET_NAME.as_bytes() {
 			return Err(Error::NotFound);
 		}
-		if unsafe { domain_set_limit(self.domain, prop_for(kind), limit) } != 0 {
+		if unsafe { domain_set_limit(self.domain, prop_for(r#type), limit) } != 0 {
 			return Err(Error::Denied);
 		}
 		Ok(budget_of(self.domain))

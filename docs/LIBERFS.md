@@ -144,7 +144,7 @@ the data it names.
 ### Inodes (a B+tree, not a table)
 
 Inodes live in a B+tree keyed by inode number, one 256-byte slot per inode: a
-kind byte, a size, two timestamps, an opaque owner tag, and then either a file's
+type byte, a size, two timestamps, an opaque owner tag, and then either a file's
 extent map (an overflow pointer/count plus inline extents) or a directory's
 B+tree root pointer and CRC. Because inodes are allocated on demand, a volume
 never runs out of inodes while it has free space, and an empty volume wastes
@@ -325,7 +325,7 @@ leaf split, since internal nodes route by hash alone. The hash is FNV-1a
 
 | Offset | Size | Field |
 |-------:|-----:|-------|
-| 0  | 1  | kind: 1 = file, 2 = directory |
+| 0  | 1  | type: 1 = file, 2 = directory |
 | 1  | 7  | reserved |
 | 8  | 8  | size: file bytes, or a directory's live entry count |
 | 16 | 8  | ctime (u64 seconds since the Unix epoch, UTC) |

@@ -2166,7 +2166,7 @@ fn device_service_lists_devices() {
 	assert_eq!(&online.bytes[..], b"DeviceService: online", "DeviceService reports in");
 
 	// The list reply is [corr u32][ok u8 = 1][count u16][device-entry...], each entry
-	// [index u32][kind u8][mmio-len u64]. QEMU exposes the virtio devices the kernel
+	// [index u32][type u8][mmio-len u64]. QEMU exposes the virtio devices the kernel
 	// found on the bus, so the count is non-zero and the first entry is index 0.
 	let reply = service_client.recv().expect("list reply");
 	let b = &reply.bytes;

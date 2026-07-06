@@ -158,7 +158,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub fn stat(&mut self, path: &[u8]) -> Result<Stat, FsError> {
 		let inode_num = self.resolve(path)?;
 		let inode = self.read_inode(inode_num)?;
-		Ok(Stat { size: inode.size, is_dir: inode.kind == KIND_DIR, ctime: inode.ctime, mtime: inode.mtime })
+		Ok(Stat { size: inode.size, is_dir: inode.r#type == TYPE_DIR, ctime: inode.ctime, mtime: inode.mtime })
 	}
 
 	// offset / partial reads and writes
@@ -168,7 +168,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub fn read_at(&mut self, path: &[u8], offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
 		let inode_num = self.resolve(path)?;
 		let inode = self.read_inode(inode_num)?;
-		if inode.kind != KIND_FILE {
+		if inode.r#type != TYPE_FILE {
 			return Err(FsError::IsDir);
 		}
 		self.read_range(&inode, offset, len as u64)
@@ -189,14 +189,14 @@ impl<D: BlockDevice> LiberFs<D> {
 		let (parent, name) = self.resolve_parent(path, true)?;
 		let inode_num = match self.dir_lookup(parent, name)? {
 			Some(num) => {
-				if self.read_inode(num)?.kind != KIND_FILE {
+				if self.read_inode(num)?.r#type != TYPE_FILE {
 					return Err(FsError::IsDir);
 				}
 				num
 			}
 			None => {
 				let num = self.alloc_inode()?;
-				let mut f = Inode::empty(KIND_FILE);
+				let mut f = Inode::empty(TYPE_FILE);
 				f.ctime = self.clock;
 				f.mtime = self.clock;
 				self.write_inode(num, &mut f)?;
@@ -254,7 +254,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn truncate_inner(&mut self, path: &[u8], new_len: u64) -> Result<(), FsError> {
 		let inode_num = self.resolve(path)?;
 		let mut inode = self.read_inode(inode_num)?;
-		if inode.kind != KIND_FILE {
+		if inode.r#type != TYPE_FILE {
 			return Err(FsError::IsDir);
 		}
 		if new_len < inode.size {
@@ -297,7 +297,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let (pt, nt) = self.resolve_parent(to, true)?;
 
 		// a directory may not move into itself or one of its descendants.
-		if from_inode.kind == KIND_DIR && self.subtree_contains(inode_f, pt)? {
+		if from_inode.r#type == TYPE_DIR && self.subtree_contains(inode_f, pt)? {
 			return Err(FsError::Invalid);
 		}
 
@@ -307,7 +307,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				return Ok(());
 			}
 			let ti = self.read_inode(inode_t)?;
-			if ti.kind == KIND_DIR && ti.size != 0 {
+			if ti.r#type == TYPE_DIR && ti.size != 0 {
 				return Err(FsError::NotEmpty);
 			}
 		}

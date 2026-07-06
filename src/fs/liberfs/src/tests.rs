@@ -401,7 +401,7 @@ fn truncate_frees_blocks_for_reuse() {
 // M50: timestamps and stat.
 
 #[test]
-fn stat_reports_kind_size_and_timestamps() {
+fn stat_reports_type_size_and_timestamps() {
 	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.set_clock(100);
 	fs.write_file(b"f", b"hello").unwrap();
@@ -1693,7 +1693,7 @@ fn the_record_layouts_match_the_specification() {
 	assert_eq!((back.logical, back.physical, back.length, back.csum, back.csum_crc, back.store_len, back.clen), (ext.logical, ext.physical, CRCS_PER_BLOCK as u32, ext.csum, ext.csum_crc, CRCS_PER_BLOCK as u32, ext.clen));
 
 	// one file inode slot: 256 bytes, header fields then the file overlay.
-	let mut inode = Inode::empty(KIND_FILE);
+	let mut inode = Inode::empty(TYPE_FILE);
 	inode.size = 0x0A0B_0C0D_0E0F_1011;
 	inode.ctime = 0x100;
 	inode.mtime = 0x200;
@@ -1704,7 +1704,7 @@ fn the_record_layouts_match_the_specification() {
 	inode.extents.push(ext);
 	let mut slot = [0u8; INODE_SIZE];
 	inode.write(&mut slot);
-	assert_eq!(slot[0], KIND_FILE, "kind");
+	assert_eq!(slot[0], TYPE_FILE, "type");
 	assert_eq!(&slot[8..16], &0x0A0B_0C0D_0E0F_1011u64.to_le_bytes(), "size");
 	assert_eq!(&slot[16..24], &0x100u64.to_le_bytes(), "ctime");
 	assert_eq!(&slot[24..32], &0x200u64.to_le_bytes(), "mtime");
@@ -1715,12 +1715,12 @@ fn the_record_layouts_match_the_specification() {
 	assert_eq!(&slot[72..112], &rec, "first inline extent at byte 72");
 
 	// a directory inode overlays its tree root on the same map bytes.
-	let mut dir = Inode::empty(KIND_DIR);
+	let mut dir = Inode::empty(TYPE_DIR);
 	dir.dir_root = 0x4041_4243_4445_4647;
 	dir.dir_root_crc = 0x5051_5253;
 	let mut dslot = [0u8; INODE_SIZE];
 	dir.write(&mut dslot);
-	assert_eq!(dslot[0], KIND_DIR);
+	assert_eq!(dslot[0], TYPE_DIR);
 	assert_eq!(&dslot[32..40], &0x4041_4243_4445_4647u64.to_le_bytes(), "dir_root");
 	assert_eq!(&dslot[40..44], &0x5051_5253u32.to_le_bytes(), "dir_root_crc");
 
@@ -2420,18 +2420,18 @@ fn a_self_fanning_internal_node_cannot_stall_the_mark_walk() {
 // M103 follow-up: the third-pass nits.
 
 #[test]
-fn an_unknown_inode_kind_is_inert_and_removable() {
-	// a kind byte the writer never emits (hostile authoring): the record must land
+fn an_unknown_inode_type_is_inert_and_removable() {
+	// a type byte the writer never emits (hostile authoring): the record must land
 	// harmless - refused by reads and writes, shown inert by listings, and clearable
 	// by the operator's repair verb.
 	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"odd", b"payload").unwrap();
 	let mut dev = fs.into_device();
 	forge_inode_slot(&mut dev, |slot| {
-		slot[INO_KIND_OFF] = 7;
+		slot[INO_TYPE_OFF] = 7;
 	});
 	let mut fs = LiberFs::mount(dev).unwrap();
-	assert_eq!(fs.read_file(b"odd"), Err(FsError::IsDir), "a read refuses the unknown kind");
+	assert_eq!(fs.read_file(b"odd"), Err(FsError::IsDir), "a read refuses the unknown type");
 	assert_eq!(fs.write_file(b"odd", b"x"), Err(FsError::IsDir), "an overwrite refuses it too");
 	assert_eq!(fs.list().unwrap().len(), 1, "the record lists inert");
 	fs.remove(b"odd").unwrap();

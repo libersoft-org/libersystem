@@ -15,7 +15,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		match self.tree_lookup(self.inode_root, self.inode_root_crc, key, &probe, INODE_REC)? {
 			Some(rec) => {
 				let mut inode = Inode::parse(&rec[8..8 + INODE_SIZE]);
-				if inode.kind == KIND_FILE {
+				if inode.r#type == TYPE_FILE {
 					// complete the extent map from the overflow chain (a no-op for a
 					// file whose runs all fit inline).
 					self.load_spill(&mut inode)?;
@@ -130,7 +130,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// node on the path up to a fresh block and updates `inode_root`; the change is
 	// published by `commit`.
 	pub(crate) fn write_inode(&mut self, num: u32, inode: &mut Inode) -> Result<(), FsError> {
-		if inode.kind == KIND_FILE {
+		if inode.r#type == TYPE_FILE {
 			self.flush_extents(inode)?;
 		}
 		let mut rec = vec![0u8; INODE_REC];

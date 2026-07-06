@@ -175,7 +175,20 @@ A successful run prints each test with `[ok]` and exits zero.
 
 ## Debugging
 
-Start QEMU so it waits for a debugger (a GDB stub on port `:1234`, with KVM disabled for reliable single-stepping):
+The lab harness drives a live instance from the host - boot it, run shell commands
+in the guest and get their output back, follow the serial log, capture network
+traffic - without typing into the console by hand:
+
+```sh
+just lab boot --fresh     # boot with a freshly created data volume
+just lab sh time ls       # run a shell command in the guest, print its output
+just lab quit             # shut the instance down
+```
+
+See [docs/DEBUG.md](./docs/DEBUG.md) for the full debugging toolbox (all `lab`
+subcommands, timing and tracing, packet capture).
+
+For kernel-level debugging, start QEMU so it waits for a debugger (a GDB stub on port `:1234`, with KVM disabled for reliable single-stepping):
 
 ```sh
 just debug
@@ -199,6 +212,7 @@ Run `just --list` to see every available command. The most useful ones:
 | `just iso [strip]` | Build a hybrid BIOS+UEFI ISO into `boot/.build/` (`strip` = `debug` or `all`). |
 | `just img [size] [strip]` | Build a raw GPT disk image (default `64M`) into `boot/.build/`. |
 | `just test` | Run the in-kernel test harness in QEMU. |
+| `just lab <cmd>` | Drive a live instance for debugging (boot, run guest shell commands, logs, packet capture - see [docs/DEBUG.md](./docs/DEBUG.md)). |
 | `just debug` | Boot in QEMU and wait for GDB on `:1234`. |
 | `just gdb` | Attach GDB to a waiting QEMU instance. |
 | `just user` | Build only the userspace programs (services, drivers, tools). |

@@ -132,14 +132,14 @@ const LABEL_MAX: usize = 256;
 const SUPER_SLOTS: u32 = 2;
 const POOL_START: u64 = SUPER_SLOTS as u64;
 
-// One inode is a fixed 256-byte slot: a kind byte, a size, two timestamps, then either
+// One inode is a fixed 256-byte slot: a type byte, a size, two timestamps, then either
 // (for a file) the extent map's overflow pointer and count and EXTENTS_INLINE inline
 // extents, or (for a directory) its B+tree root pointer and that root's CRC32C. An
 // opaque owner tag sits at OWNER_TAG_OFF. Each slot is stored, keyed by inode number,
 // in a leaf of the inode B+tree. The field offsets within the slot, by name, so the
 // parser and writer cannot drift apart:
 const INODE_SIZE: usize = 256;
-const INO_KIND_OFF: usize = 0;
+const INO_TYPE_OFF: usize = 0;
 const INO_SIZE_OFF: usize = 8;
 const INO_CTIME_OFF: usize = 16;
 const INO_MTIME_OFF: usize = 24;
@@ -190,7 +190,7 @@ const OWNER_TAG_OFF: usize = 56;
 // transparently compressed run stores fewer blocks holding the compressed bytes of the
 // whole `length`-block span (see [`LiberFs::compress_inode`]).
 const EXTENT_SIZE: usize = 40;
-// Byte offset of the first inline extent: past the fixed header (kind, size, two
+// Byte offset of the first inline extent: past the fixed header (type, size, two
 // timestamps, the extent-overflow pointer and count) and the owner tag.
 const EXTENT_OFF: usize = OWNER_TAG_OFF + OWNER_TAG_LEN;
 // (256 - 72) / 40 = 4 extents live inline in the inode; a file of up to four runs needs
@@ -222,10 +222,10 @@ const LZ_HASH_SIZE: usize = 1 << LZ_HASH_BITS;
 const LZ_LAST_LITERALS: usize = 5;
 const LZ_MATCH_MARGIN: usize = 12;
 
-// Inode kinds. A live inode record is always a file or a directory; a freed inode is
-// deleted from the tree rather than tombstoned, so there is no "free" kind.
-const KIND_FILE: u8 = 1;
-const KIND_DIR: u8 = 2;
+// Inode types. A live inode record is always a file or a directory; a freed inode is
+// deleted from the tree rather than tombstoned, so there is no "free" type.
+const TYPE_FILE: u8 = 1;
+const TYPE_DIR: u8 = 2;
 
 // The root directory is inode 0; other inodes are handed out from a monotonic counter
 // (`next_inode`) starting at 1, so a number is never reused and the inode B+tree holds
@@ -295,7 +295,7 @@ fn crc32c(data: &[u8]) -> u32 {
 // A filesystem error. The variants map onto the `Storage.Volume` `error` enum at the
 // service boundary (NotFound -> not-found, NoSpace -> again, ReadOnly -> denied, the
 // rest -> invalid) - but they stay precise here, so a caller (and a test) can tell a
-// bad name from a wrong kind from a non-empty directory.
+// bad name from a wrong type from a non-empty directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsError {
 	NotFound,
@@ -528,7 +528,7 @@ impl Extent {
 }
 
 // One inode, parsed from / rendered to its 256-byte on-disk slot. A file and a directory
-// share the header (kind, size, two timestamps, owner tag) but overlay the rest: a file
+// share the header (type, size, two timestamps, owner tag) but overlay the rest: a file
 // keeps its extent map (the inline runs plus the `spill` overflow pointer and the total
 // `extent_count`), while a directory keeps its B+tree root (`dir_root` and that root's
 // `dir_root_crc`) in the same bytes and leaves the extent fields zero. `extents` is the
@@ -536,7 +536,7 @@ impl Extent {
 // [`LiberFs::read_inode`] completes it from the overflow chain rooted at `spill`.
 #[derive(Clone)]
 struct Inode {
-	kind: u8,
+	r#type: u8,
 	size: u64,
 	ctime: u64,
 	mtime: u64,
@@ -554,26 +554,26 @@ struct Inode {
 }
 
 impl Inode {
-	fn empty(kind: u8) -> Inode {
-		Inode { kind, size: 0, ctime: 0, mtime: 0, owner_tag: [0u8; OWNER_TAG_LEN], extents: Vec::new(), spill: 0, spill_crc: 0, extent_count: 0, dir_root: 0, dir_root_crc: 0 }
+	fn empty(r#type: u8) -> Inode {
+		Inode { r#type, size: 0, ctime: 0, mtime: 0, owner_tag: [0u8; OWNER_TAG_LEN], extents: Vec::new(), spill: 0, spill_crc: 0, extent_count: 0, dir_root: 0, dir_root_crc: 0 }
 	}
 
 	// Parse the fixed header and, for a file, the inline extents (any spilled ones are
 	// appended afterwards by `read_inode`); for a directory, the B+tree root pointer.
-	// A kind byte that is neither KIND_FILE nor KIND_DIR (hostile authoring - the
+	// A type byte that is neither TYPE_FILE nor TYPE_DIR (hostile authoring - the
 	// writer never emits one) parses file-shaped, by DECISION, and lands harmless
-	// end to end: reads and writes refuse it (their KIND_FILE gates fail), a listing
-	// shows it inert, the mark walks reserve nothing for it (neither kind branch),
+	// end to end: reads and writes refuse it (their TYPE_FILE gates fail), a listing
+	// shows it inert, the mark walks reserve nothing for it (neither type branch),
 	// and `remove` can always clear it - the operator's repair verb works. A change
-	// to any `kind` branching must keep that story consistent.
+	// to any `type` branching must keep that story consistent.
 	fn parse(buf: &[u8]) -> Inode {
-		let kind = buf[INO_KIND_OFF];
+		let r#type = buf[INO_TYPE_OFF];
 		let mut owner_tag = [0u8; OWNER_TAG_LEN];
 		owner_tag.copy_from_slice(&buf[OWNER_TAG_OFF..OWNER_TAG_OFF + OWNER_TAG_LEN]);
-		let mut inode = Inode { kind, size: u64::from_le_bytes(buf[INO_SIZE_OFF..INO_SIZE_OFF + 8].try_into().unwrap()), ctime: u64::from_le_bytes(buf[INO_CTIME_OFF..INO_CTIME_OFF + 8].try_into().unwrap()), mtime: u64::from_le_bytes(buf[INO_MTIME_OFF..INO_MTIME_OFF + 8].try_into().unwrap()), owner_tag, extents: Vec::new(), spill: 0, spill_crc: 0, extent_count: 0, dir_root: 0, dir_root_crc: 0 };
+		let mut inode = Inode { r#type, size: u64::from_le_bytes(buf[INO_SIZE_OFF..INO_SIZE_OFF + 8].try_into().unwrap()), ctime: u64::from_le_bytes(buf[INO_CTIME_OFF..INO_CTIME_OFF + 8].try_into().unwrap()), mtime: u64::from_le_bytes(buf[INO_MTIME_OFF..INO_MTIME_OFF + 8].try_into().unwrap()), owner_tag, extents: Vec::new(), spill: 0, spill_crc: 0, extent_count: 0, dir_root: 0, dir_root_crc: 0 };
 		let map = u64::from_le_bytes(buf[INO_MAP_OFF..INO_MAP_OFF + 8].try_into().unwrap());
 		let map_crc = u32::from_le_bytes(buf[INO_MAP_CRC_OFF..INO_MAP_CRC_OFF + 4].try_into().unwrap());
-		if kind == KIND_DIR {
+		if r#type == TYPE_DIR {
 			inode.dir_root = map;
 			inode.dir_root_crc = map_crc;
 		} else {
@@ -596,12 +596,12 @@ impl Inode {
 	// beforehand by [`LiberFs::flush_extents`], which `write_inode` always calls first.
 	fn write(&self, buf: &mut [u8]) {
 		buf[..INODE_SIZE].fill(0);
-		buf[INO_KIND_OFF] = self.kind;
+		buf[INO_TYPE_OFF] = self.r#type;
 		buf[INO_SIZE_OFF..INO_SIZE_OFF + 8].copy_from_slice(&self.size.to_le_bytes());
 		buf[INO_CTIME_OFF..INO_CTIME_OFF + 8].copy_from_slice(&self.ctime.to_le_bytes());
 		buf[INO_MTIME_OFF..INO_MTIME_OFF + 8].copy_from_slice(&self.mtime.to_le_bytes());
 		buf[OWNER_TAG_OFF..OWNER_TAG_OFF + OWNER_TAG_LEN].copy_from_slice(&self.owner_tag);
-		if self.kind == KIND_DIR {
+		if self.r#type == TYPE_DIR {
 			buf[INO_MAP_OFF..INO_MAP_OFF + 8].copy_from_slice(&self.dir_root.to_le_bytes());
 			buf[INO_MAP_CRC_OFF..INO_MAP_CRC_OFF + 4].copy_from_slice(&self.dir_root_crc.to_le_bytes());
 		} else {

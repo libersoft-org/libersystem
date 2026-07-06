@@ -60,7 +60,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				}
 				path.extend_from_slice(&name);
 				let checked = self.read_inode(child).and_then(|inode| {
-					if inode.kind == KIND_DIR {
+					if inode.r#type == TYPE_DIR {
 						if seen.insert(child) {
 							stack.push((child, path.clone()));
 						}
@@ -168,9 +168,9 @@ impl<D: BlockDevice> LiberFs<D> {
 			for i in 0..leaf_count(&buf, INODE_REC) {
 				let off = NODE_HDR + i * INODE_REC + 8;
 				let mut inode = Inode::parse(&buf[off..off + INODE_SIZE]);
-				let checked = if inode.kind == KIND_FILE {
+				let checked = if inode.r#type == TYPE_FILE {
 					self.load_spill(&mut inode).and_then(|()| self.count_corrupt(&inode))
-				} else if inode.kind == KIND_DIR {
+				} else if inode.r#type == TYPE_DIR {
 					self.check_dir_tree(inode.dir_root, inode.dir_root_crc, TREE_DEPTH_MAX)
 				} else {
 					Ok(0)

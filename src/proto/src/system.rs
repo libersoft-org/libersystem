@@ -1511,7 +1511,7 @@ pub mod volume {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum DeviceKind {
+pub enum DeviceType {
 	Unknown = 0,
 	Net = 1,
 	Block = 2,
@@ -1519,7 +1519,7 @@ pub enum DeviceKind {
 	Usb = 4,
 }
 
-impl DeviceKind {
+impl DeviceType {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
@@ -1530,19 +1530,19 @@ impl DeviceKind {
 		let _ = self.write(&mut w);
 		w.into_inner()
 	}
-	pub fn decode(bytes: &[u8]) -> Option<DeviceKind> {
-		DeviceKind::read(&mut Reader::new(bytes))
+	pub fn decode(bytes: &[u8]) -> Option<DeviceType> {
+		DeviceType::read(&mut Reader::new(bytes))
 	}
 	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<DeviceKind> {
+	pub(crate) fn read(r: &mut Reader) -> Option<DeviceType> {
 		match r.u8()? {
-			0 => Some(DeviceKind::Unknown),
-			1 => Some(DeviceKind::Net),
-			2 => Some(DeviceKind::Block),
-			3 => Some(DeviceKind::Console),
-			4 => Some(DeviceKind::Usb),
+			0 => Some(DeviceType::Unknown),
+			1 => Some(DeviceType::Net),
+			2 => Some(DeviceType::Block),
+			3 => Some(DeviceType::Console),
+			4 => Some(DeviceType::Usb),
 			_ => None,
 		}
 	}
@@ -1551,7 +1551,7 @@ impl DeviceKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeviceEntry {
 	pub index: u32,
-	pub kind: DeviceKind,
+	pub r#type: DeviceType,
 	pub mmio_len: u64,
 }
 
@@ -1571,15 +1571,15 @@ impl DeviceEntry {
 	}
 	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u32(self.index)?;
-		self.kind.write(w)?;
+		self.r#type.write(w)?;
 		w.u64(self.mmio_len)?;
 		Some(())
 	}
 	pub(crate) fn read(r: &mut Reader) -> Option<DeviceEntry> {
 		let index = r.u32()?;
-		let kind = DeviceKind::read(r)?;
+		let r#type = DeviceType::read(r)?;
 		let mmio_len = r.u64()?;
-		Some(DeviceEntry { index, kind, mmio_len })
+		Some(DeviceEntry { index, r#type, mmio_len })
 	}
 }
 
@@ -1742,7 +1742,7 @@ pub struct UsbDevice {
 	pub vendor: u32,
 	pub product: u32,
 	pub class: u32,
-	pub kind: String,
+	pub r#type: String,
 }
 
 impl UsbDevice {
@@ -1765,7 +1765,7 @@ impl UsbDevice {
 		w.u32(self.vendor)?;
 		w.u32(self.product)?;
 		w.u32(self.class)?;
-		w.bytes_lp(self.kind.as_bytes())?;
+		w.bytes_lp(self.r#type.as_bytes())?;
 		Some(())
 	}
 	pub(crate) fn read(r: &mut Reader) -> Option<UsbDevice> {
@@ -1774,8 +1774,8 @@ impl UsbDevice {
 		let vendor = r.u32()?;
 		let product = r.u32()?;
 		let class = r.u32()?;
-		let kind = r.string_lp()?;
-		Some(UsbDevice { port, speed, vendor, product, class, kind })
+		let r#type = r.string_lp()?;
+		Some(UsbDevice { port, speed, vendor, product, class, r#type })
 	}
 }
 
@@ -4039,13 +4039,13 @@ pub mod input {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum ComponentKind {
+pub enum ComponentType {
 	Service = 0,
 	Driver = 1,
 	Device = 2,
 }
 
-impl ComponentKind {
+impl ComponentType {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
@@ -4056,17 +4056,17 @@ impl ComponentKind {
 		let _ = self.write(&mut w);
 		w.into_inner()
 	}
-	pub fn decode(bytes: &[u8]) -> Option<ComponentKind> {
-		ComponentKind::read(&mut Reader::new(bytes))
+	pub fn decode(bytes: &[u8]) -> Option<ComponentType> {
+		ComponentType::read(&mut Reader::new(bytes))
 	}
 	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<ComponentKind> {
+	pub(crate) fn read(r: &mut Reader) -> Option<ComponentType> {
 		match r.u8()? {
-			0 => Some(ComponentKind::Service),
-			1 => Some(ComponentKind::Driver),
-			2 => Some(ComponentKind::Device),
+			0 => Some(ComponentType::Service),
+			1 => Some(ComponentType::Driver),
+			2 => Some(ComponentType::Device),
 			_ => None,
 		}
 	}
@@ -4161,7 +4161,7 @@ impl Counters {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Component {
 	pub name: String,
-	pub kind: ComponentKind,
+	pub r#type: ComponentType,
 	pub state: ComponentState,
 	pub deps: Vec<String>,
 	pub counters: Counters,
@@ -4183,7 +4183,7 @@ impl Component {
 	}
 	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
-		self.kind.write(w)?;
+		self.r#type.write(w)?;
 		self.state.write(w)?;
 		if self.deps.len() > u16::MAX as usize {
 			return None;
@@ -4197,7 +4197,7 @@ impl Component {
 	}
 	pub(crate) fn read(r: &mut Reader) -> Option<Component> {
 		let name = r.string_lp()?;
-		let kind = ComponentKind::read(r)?;
+		let r#type = ComponentType::read(r)?;
 		let state = ComponentState::read(r)?;
 		let deps = {
 			let v132 = r.u16()? as usize;
@@ -4208,7 +4208,7 @@ impl Component {
 			v133
 		};
 		let counters = Counters::read(r)?;
-		Some(Component { name, kind, state, deps, counters })
+		Some(Component { name, r#type, state, deps, counters })
 	}
 }
 
@@ -4884,7 +4884,7 @@ pub mod permission {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum ResourceKind {
+pub enum ResourceType {
 	Memory = 0,
 	Handles = 1,
 	Threads = 2,
@@ -4893,7 +4893,7 @@ pub enum ResourceKind {
 	Stack = 5,
 }
 
-impl ResourceKind {
+impl ResourceType {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
@@ -4904,20 +4904,20 @@ impl ResourceKind {
 		let _ = self.write(&mut w);
 		w.into_inner()
 	}
-	pub fn decode(bytes: &[u8]) -> Option<ResourceKind> {
-		ResourceKind::read(&mut Reader::new(bytes))
+	pub fn decode(bytes: &[u8]) -> Option<ResourceType> {
+		ResourceType::read(&mut Reader::new(bytes))
 	}
 	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<ResourceKind> {
+	pub(crate) fn read(r: &mut Reader) -> Option<ResourceType> {
 		match r.u8()? {
-			0 => Some(ResourceKind::Memory),
-			1 => Some(ResourceKind::Handles),
-			2 => Some(ResourceKind::Threads),
-			3 => Some(ResourceKind::IpcQueue),
-			4 => Some(ResourceKind::Dma),
-			5 => Some(ResourceKind::Stack),
+			0 => Some(ResourceType::Memory),
+			1 => Some(ResourceType::Handles),
+			2 => Some(ResourceType::Threads),
+			3 => Some(ResourceType::IpcQueue),
+			4 => Some(ResourceType::Dma),
+			5 => Some(ResourceType::Stack),
 			_ => None,
 		}
 	}
@@ -4925,7 +4925,7 @@ impl ResourceKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResourceUsage {
-	pub kind: ResourceKind,
+	pub r#type: ResourceType,
 	pub used: u64,
 	pub limit: u64,
 }
@@ -4945,16 +4945,16 @@ impl ResourceUsage {
 		ResourceUsage::read(&mut Reader::new(bytes))
 	}
 	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
-		self.kind.write(w)?;
+		self.r#type.write(w)?;
 		w.u64(self.used)?;
 		w.u64(self.limit)?;
 		Some(())
 	}
 	pub(crate) fn read(r: &mut Reader) -> Option<ResourceUsage> {
-		let kind = ResourceKind::read(r)?;
+		let r#type = ResourceType::read(r)?;
 		let used = r.u64()?;
 		let limit = r.u64()?;
-		Some(ResourceUsage { kind, used, limit })
+		Some(ResourceUsage { r#type, used, limit })
 	}
 }
 
@@ -5014,7 +5014,7 @@ pub mod resources {
 
 	pub trait Service {
 		fn usage(&mut self) -> Result<Vec<Budget>, Error>;
-		fn set_limit(&mut self, name: String, kind: ResourceKind, limit: u64) -> Result<Budget, Error>;
+		fn set_limit(&mut self, name: String, r#type: ResourceType, limit: u64) -> Result<Budget, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -5059,9 +5059,9 @@ pub mod resources {
 			}
 			OP_SET_LIMIT => {
 				let name = r.string_lp()?;
-				let kind = ResourceKind::read(r)?;
+				let r#type = ResourceType::read(r)?;
 				let limit = r.u64()?;
-				let result = service.set_limit(name, kind, limit);
+				let result = service.set_limit(name, r#type, limit);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
@@ -5137,14 +5137,14 @@ pub mod resources {
 				Err(Error::read(r)?)
 			})
 		}
-		pub fn set_limit(&mut self, name: &str, kind: &ResourceKind, limit: &u64) -> Option<Result<Budget, Error>> {
+		pub fn set_limit(&mut self, name: &str, r#type: &ResourceType, limit: &u64) -> Option<Result<Budget, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
 			w.u16(OP_SET_LIMIT)?;
 			w.u32(corr)?;
 			w.bytes_lp(name.as_bytes())?;
-			kind.write(w)?;
+			r#type.write(w)?;
 			w.u64(*limit)?;
 			let request_handle = writer.handle();
 			let request = writer.into_inner();
@@ -6650,7 +6650,7 @@ impl FsckReport {
 	}
 }
 
-impl DeviceKind {
+impl DeviceType {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
 		self.to_json_into(&mut s);
@@ -6668,29 +6668,29 @@ impl DeviceKind {
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		match self {
-			DeviceKind::Unknown => out.push_str("\"unknown\""),
-			DeviceKind::Net => out.push_str("\"net\""),
-			DeviceKind::Block => out.push_str("\"block\""),
-			DeviceKind::Console => out.push_str("\"console\""),
-			DeviceKind::Usb => out.push_str("\"usb\""),
+			DeviceType::Unknown => out.push_str("\"unknown\""),
+			DeviceType::Net => out.push_str("\"net\""),
+			DeviceType::Block => out.push_str("\"block\""),
+			DeviceType::Console => out.push_str("\"console\""),
+			DeviceType::Usb => out.push_str("\"usb\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
 		match self {
-			DeviceKind::Unknown => out.push_str("unknown"),
-			DeviceKind::Net => out.push_str("net"),
-			DeviceKind::Block => out.push_str("block"),
-			DeviceKind::Console => out.push_str("console"),
-			DeviceKind::Usb => out.push_str("usb"),
+			DeviceType::Unknown => out.push_str("unknown"),
+			DeviceType::Net => out.push_str("net"),
+			DeviceType::Block => out.push_str("block"),
+			DeviceType::Console => out.push_str("console"),
+			DeviceType::Usb => out.push_str("usb"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			DeviceKind::Unknown => crate::codec::cbor::text(out, "unknown"),
-			DeviceKind::Net => crate::codec::cbor::text(out, "net"),
-			DeviceKind::Block => crate::codec::cbor::text(out, "block"),
-			DeviceKind::Console => crate::codec::cbor::text(out, "console"),
-			DeviceKind::Usb => crate::codec::cbor::text(out, "usb"),
+			DeviceType::Unknown => crate::codec::cbor::text(out, "unknown"),
+			DeviceType::Net => crate::codec::cbor::text(out, "net"),
+			DeviceType::Block => crate::codec::cbor::text(out, "block"),
+			DeviceType::Console => crate::codec::cbor::text(out, "console"),
+			DeviceType::Usb => crate::codec::cbor::text(out, "usb"),
 		}
 	}
 }
@@ -6716,8 +6716,8 @@ impl DeviceEntry {
 		out.push_str("\"index\":");
 		let _ = write!(out, "{}", self.index);
 		out.push(',');
-		out.push_str("\"kind\":");
-		self.kind.to_json_into(out);
+		out.push_str("\"type\":");
+		self.r#type.to_json_into(out);
 		out.push(',');
 		out.push_str("\"mmio-len\":");
 		let _ = write!(out, "{}", self.mmio_len);
@@ -6728,8 +6728,8 @@ impl DeviceEntry {
 		out.push_str("index=");
 		let _ = write!(out, "{}", self.index);
 		out.push_str(", ");
-		out.push_str("kind=");
-		self.kind.to_text_into(out);
+		out.push_str("type=");
+		self.r#type.to_text_into(out);
 		out.push_str(", ");
 		out.push_str("mmio-len=");
 		let _ = write!(out, "{}", self.mmio_len);
@@ -6739,8 +6739,8 @@ impl DeviceEntry {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "index");
 		crate::codec::cbor::uint(out, self.index as u64);
-		crate::codec::cbor::text(out, "kind");
-		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "type");
+		self.r#type.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mmio-len");
 		crate::codec::cbor::uint(out, self.mmio_len as u64);
 	}
@@ -6779,8 +6779,8 @@ impl UsbDevice {
 		out.push_str("\"class\":");
 		let _ = write!(out, "{}", self.class);
 		out.push(',');
-		out.push_str("\"kind\":");
-		crate::codec::json_escape(&self.kind, out);
+		out.push_str("\"type\":");
+		crate::codec::json_escape(&self.r#type, out);
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -6800,8 +6800,8 @@ impl UsbDevice {
 		out.push_str("class=");
 		let _ = write!(out, "{}", self.class);
 		out.push_str(", ");
-		out.push_str("kind=");
-		out.push_str(&self.kind);
+		out.push_str("type=");
+		out.push_str(&self.r#type);
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -6816,8 +6816,8 @@ impl UsbDevice {
 		crate::codec::cbor::uint(out, self.product as u64);
 		crate::codec::cbor::text(out, "class");
 		crate::codec::cbor::uint(out, self.class as u64);
-		crate::codec::cbor::text(out, "kind");
-		crate::codec::cbor::text(out, &self.kind);
+		crate::codec::cbor::text(out, "type");
+		crate::codec::cbor::text(out, &self.r#type);
 	}
 }
 
@@ -7671,7 +7671,7 @@ impl PointerEvent {
 	}
 }
 
-impl ComponentKind {
+impl ComponentType {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
 		self.to_json_into(&mut s);
@@ -7689,23 +7689,23 @@ impl ComponentKind {
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		match self {
-			ComponentKind::Service => out.push_str("\"service\""),
-			ComponentKind::Driver => out.push_str("\"driver\""),
-			ComponentKind::Device => out.push_str("\"device\""),
+			ComponentType::Service => out.push_str("\"service\""),
+			ComponentType::Driver => out.push_str("\"driver\""),
+			ComponentType::Device => out.push_str("\"device\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
 		match self {
-			ComponentKind::Service => out.push_str("service"),
-			ComponentKind::Driver => out.push_str("driver"),
-			ComponentKind::Device => out.push_str("device"),
+			ComponentType::Service => out.push_str("service"),
+			ComponentType::Driver => out.push_str("driver"),
+			ComponentType::Device => out.push_str("device"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			ComponentKind::Service => crate::codec::cbor::text(out, "service"),
-			ComponentKind::Driver => crate::codec::cbor::text(out, "driver"),
-			ComponentKind::Device => crate::codec::cbor::text(out, "device"),
+			ComponentType::Service => crate::codec::cbor::text(out, "service"),
+			ComponentType::Driver => crate::codec::cbor::text(out, "driver"),
+			ComponentType::Device => crate::codec::cbor::text(out, "device"),
 		}
 	}
 }
@@ -7859,8 +7859,8 @@ impl Component {
 		out.push_str("\"name\":");
 		crate::codec::json_escape(&self.name, out);
 		out.push(',');
-		out.push_str("\"kind\":");
-		self.kind.to_json_into(out);
+		out.push_str("\"type\":");
+		self.r#type.to_json_into(out);
 		out.push(',');
 		out.push_str("\"state\":");
 		self.state.to_json_into(out);
@@ -7886,8 +7886,8 @@ impl Component {
 		out.push_str("name=");
 		out.push_str(&self.name);
 		out.push_str(", ");
-		out.push_str("kind=");
-		self.kind.to_text_into(out);
+		out.push_str("type=");
+		self.r#type.to_text_into(out);
 		out.push_str(", ");
 		out.push_str("state=");
 		self.state.to_text_into(out);
@@ -7912,8 +7912,8 @@ impl Component {
 		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
-		crate::codec::cbor::text(out, "kind");
-		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "type");
+		self.r#type.to_cbor_into(out);
 		crate::codec::cbor::text(out, "state");
 		self.state.to_cbor_into(out);
 		crate::codec::cbor::text(out, "deps");
@@ -8367,7 +8367,7 @@ impl AuditEntry {
 	}
 }
 
-impl ResourceKind {
+impl ResourceType {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
 		self.to_json_into(&mut s);
@@ -8385,32 +8385,32 @@ impl ResourceKind {
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		match self {
-			ResourceKind::Memory => out.push_str("\"memory\""),
-			ResourceKind::Handles => out.push_str("\"handles\""),
-			ResourceKind::Threads => out.push_str("\"threads\""),
-			ResourceKind::IpcQueue => out.push_str("\"ipc-queue\""),
-			ResourceKind::Dma => out.push_str("\"dma\""),
-			ResourceKind::Stack => out.push_str("\"stack\""),
+			ResourceType::Memory => out.push_str("\"memory\""),
+			ResourceType::Handles => out.push_str("\"handles\""),
+			ResourceType::Threads => out.push_str("\"threads\""),
+			ResourceType::IpcQueue => out.push_str("\"ipc-queue\""),
+			ResourceType::Dma => out.push_str("\"dma\""),
+			ResourceType::Stack => out.push_str("\"stack\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
 		match self {
-			ResourceKind::Memory => out.push_str("memory"),
-			ResourceKind::Handles => out.push_str("handles"),
-			ResourceKind::Threads => out.push_str("threads"),
-			ResourceKind::IpcQueue => out.push_str("ipc-queue"),
-			ResourceKind::Dma => out.push_str("dma"),
-			ResourceKind::Stack => out.push_str("stack"),
+			ResourceType::Memory => out.push_str("memory"),
+			ResourceType::Handles => out.push_str("handles"),
+			ResourceType::Threads => out.push_str("threads"),
+			ResourceType::IpcQueue => out.push_str("ipc-queue"),
+			ResourceType::Dma => out.push_str("dma"),
+			ResourceType::Stack => out.push_str("stack"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			ResourceKind::Memory => crate::codec::cbor::text(out, "memory"),
-			ResourceKind::Handles => crate::codec::cbor::text(out, "handles"),
-			ResourceKind::Threads => crate::codec::cbor::text(out, "threads"),
-			ResourceKind::IpcQueue => crate::codec::cbor::text(out, "ipc-queue"),
-			ResourceKind::Dma => crate::codec::cbor::text(out, "dma"),
-			ResourceKind::Stack => crate::codec::cbor::text(out, "stack"),
+			ResourceType::Memory => crate::codec::cbor::text(out, "memory"),
+			ResourceType::Handles => crate::codec::cbor::text(out, "handles"),
+			ResourceType::Threads => crate::codec::cbor::text(out, "threads"),
+			ResourceType::IpcQueue => crate::codec::cbor::text(out, "ipc-queue"),
+			ResourceType::Dma => crate::codec::cbor::text(out, "dma"),
+			ResourceType::Stack => crate::codec::cbor::text(out, "stack"),
 		}
 	}
 }
@@ -8433,8 +8433,8 @@ impl ResourceUsage {
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
-		out.push_str("\"kind\":");
-		self.kind.to_json_into(out);
+		out.push_str("\"type\":");
+		self.r#type.to_json_into(out);
 		out.push(',');
 		out.push_str("\"used\":");
 		let _ = write!(out, "{}", self.used);
@@ -8445,8 +8445,8 @@ impl ResourceUsage {
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
 		out.push('{');
-		out.push_str("kind=");
-		self.kind.to_text_into(out);
+		out.push_str("type=");
+		self.r#type.to_text_into(out);
 		out.push_str(", ");
 		out.push_str("used=");
 		let _ = write!(out, "{}", self.used);
@@ -8457,8 +8457,8 @@ impl ResourceUsage {
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
-		crate::codec::cbor::text(out, "kind");
-		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "type");
+		self.r#type.to_cbor_into(out);
 		crate::codec::cbor::text(out, "used");
 		crate::codec::cbor::uint(out, self.used as u64);
 		crate::codec::cbor::text(out, "limit");
@@ -8769,16 +8769,16 @@ mod compat {
 		assert_eq!(FsckReport::decode(&bytes).unwrap(), sample);
 	}
 	#[test]
-	fn device_kind_wire_is_stable() {
-		let sample = DeviceKind::Unknown;
+	fn device_type_wire_is_stable() {
+		let sample = DeviceType::Unknown;
 		let bytes = sample.encode_vec();
 		let golden: &[u8] = &[0];
 		assert_eq!(bytes, golden);
-		assert_eq!(DeviceKind::decode(&bytes).unwrap(), sample);
+		assert_eq!(DeviceType::decode(&bytes).unwrap(), sample);
 	}
 	#[test]
 	fn device_entry_wire_is_stable() {
-		let sample = DeviceEntry { index: 7, kind: DeviceKind::Unknown, mmio_len: 7 };
+		let sample = DeviceEntry { index: 7, r#type: DeviceType::Unknown, mmio_len: 7 };
 		let bytes = sample.encode_vec();
 		let golden: &[u8] = &[7, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0];
 		assert_eq!(bytes, golden);
@@ -8786,7 +8786,7 @@ mod compat {
 	}
 	#[test]
 	fn usb_device_wire_is_stable() {
-		let sample = UsbDevice { port: 7, speed: String::from("x"), vendor: 7, product: 7, class: 7, kind: String::from("x") };
+		let sample = UsbDevice { port: 7, speed: String::from("x"), vendor: 7, product: 7, class: 7, r#type: String::from("x") };
 		let bytes = sample.encode_vec();
 		let golden: &[u8] = &[7, 0, 0, 0, 1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120];
 		assert_eq!(bytes, golden);
@@ -8905,12 +8905,12 @@ mod compat {
 		assert_eq!(PointerEvent::decode(&bytes).unwrap(), sample);
 	}
 	#[test]
-	fn component_kind_wire_is_stable() {
-		let sample = ComponentKind::Service;
+	fn component_type_wire_is_stable() {
+		let sample = ComponentType::Service;
 		let bytes = sample.encode_vec();
 		let golden: &[u8] = &[0];
 		assert_eq!(bytes, golden);
-		assert_eq!(ComponentKind::decode(&bytes).unwrap(), sample);
+		assert_eq!(ComponentType::decode(&bytes).unwrap(), sample);
 	}
 	#[test]
 	fn component_state_wire_is_stable() {
@@ -8930,7 +8930,7 @@ mod compat {
 	}
 	#[test]
 	fn component_wire_is_stable() {
-		let sample = Component { name: String::from("x"), kind: ComponentKind::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7, watchdog_trips: 7, last_failure: String::from("x") } };
+		let sample = Component { name: String::from("x"), r#type: ComponentType::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7, watchdog_trips: 7, last_failure: String::from("x") } };
 		let bytes = sample.encode_vec();
 		let golden: &[u8] = &[
 			1,
@@ -9000,7 +9000,7 @@ mod compat {
 	}
 	#[test]
 	fn graph_wire_is_stable() {
-		let sample = Graph { components: alloc::vec![Component { name: String::from("x"), kind: ComponentKind::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7, watchdog_trips: 7, last_failure: String::from("x") } }], spans: alloc::vec![TraceSpan { name: String::from("x"), duration_ns: 7 }] };
+		let sample = Graph { components: alloc::vec![Component { name: String::from("x"), r#type: ComponentType::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7, watchdog_trips: 7, last_failure: String::from("x") } }], spans: alloc::vec![TraceSpan { name: String::from("x"), duration_ns: 7 }] };
 		let bytes = sample.encode_vec();
 		let golden: &[u8] = &[
 			1,
@@ -9108,16 +9108,16 @@ mod compat {
 		assert_eq!(AuditEntry::decode(&bytes).unwrap(), sample);
 	}
 	#[test]
-	fn resource_kind_wire_is_stable() {
-		let sample = ResourceKind::Memory;
+	fn resource_type_wire_is_stable() {
+		let sample = ResourceType::Memory;
 		let bytes = sample.encode_vec();
 		let golden: &[u8] = &[0];
 		assert_eq!(bytes, golden);
-		assert_eq!(ResourceKind::decode(&bytes).unwrap(), sample);
+		assert_eq!(ResourceType::decode(&bytes).unwrap(), sample);
 	}
 	#[test]
 	fn resource_usage_wire_is_stable() {
-		let sample = ResourceUsage { kind: ResourceKind::Memory, used: 7, limit: 7 };
+		let sample = ResourceUsage { r#type: ResourceType::Memory, used: 7, limit: 7 };
 		let bytes = sample.encode_vec();
 		let golden: &[u8] = &[0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0];
 		assert_eq!(bytes, golden);
@@ -9125,7 +9125,7 @@ mod compat {
 	}
 	#[test]
 	fn budget_wire_is_stable() {
-		let sample = Budget { name: String::from("x"), usage: alloc::vec![ResourceUsage { kind: ResourceKind::Memory, used: 7, limit: 7 }] };
+		let sample = Budget { name: String::from("x"), usage: alloc::vec![ResourceUsage { r#type: ResourceType::Memory, used: 7, limit: 7 }] };
 		let bytes = sample.encode_vec();
 		let golden: &[u8] = &[1, 0, 120, 1, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0];
 		assert_eq!(bytes, golden);

@@ -28,7 +28,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{Component, ComponentKind, ComponentState, Counters, DeviceEntry, DeviceKind, Error, Graph, TraceSpan, device, supervisor, system_graph};
+use proto::system::{Component, ComponentState, ComponentType, Counters, DeviceEntry, DeviceType, Error, Graph, TraceSpan, device, supervisor, system_graph};
 use rt::*;
 
 // One component node the supervisor registered: its name and dependency edges (the
@@ -61,7 +61,7 @@ impl system_graph::Service for GraphService {
 				Some(s) => (map_state(s.state), Counters { messages_sent: s.messages_sent, messages_received: s.messages_received, handles: s.handle_count, memory_bytes: s.memory_bytes, restarts: 0, watchdog_trips: 0, last_failure: String::new() }),
 				None => (ComponentState::Failed, Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: 0, watchdog_trips: 0, last_failure: String::new() }),
 			};
-			components.push(Component { name: node.name.clone(), kind: ComponentKind::Service, state, deps: node.deps.clone(), counters });
+			components.push(Component { name: node.name.clone(), r#type: ComponentType::Service, state, deps: node.deps.clone(), counters });
 		}
 		spans.push(TraceSpan { name: String::from("process.stats"), duration_ns: unsafe { clock_ns() }.wrapping_sub(stats_start) });
 
@@ -76,7 +76,7 @@ impl system_graph::Service for GraphService {
 		};
 		spans.push(TraceSpan { name: String::from("device.list"), duration_ns: unsafe { clock_ns() }.wrapping_sub(list_start) });
 		for d in &devices {
-			components.push(Component { name: device_name(d), kind: ComponentKind::Device, state: ComponentState::Running, deps: alloc::vec![String::from("device_manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: 0, watchdog_trips: 0, last_failure: String::new() } });
+			components.push(Component { name: device_name(d), r#type: ComponentType::Device, state: ComponentState::Running, deps: alloc::vec![String::from("device_manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: 0, watchdog_trips: 0, last_failure: String::new() } });
 		}
 
 		// Supervisor history: query the ServiceManager supervisor and fold each managed
@@ -99,7 +99,7 @@ impl system_graph::Service for GraphService {
 						}
 					}
 					if s.name == "watchdog_probe" {
-						components.push(Component { name: s.name.clone(), kind: ComponentKind::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: s.restarts, watchdog_trips: s.watchdog_trips, last_failure: s.last_failure.clone() } });
+						components.push(Component { name: s.name.clone(), r#type: ComponentType::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: s.restarts, watchdog_trips: s.watchdog_trips, last_failure: s.last_failure.clone() } });
 					}
 				}
 			}
@@ -121,14 +121,14 @@ fn map_state(state: u64) -> ComponentState {
 
 // A device node's display name: its class plus its kernel-table index (e.g. "net-0").
 fn device_name(d: &DeviceEntry) -> String {
-	let kind: &str = match d.kind {
-		DeviceKind::Net => "net",
-		DeviceKind::Block => "block",
-		DeviceKind::Console => "console",
-		DeviceKind::Usb => "usb",
-		DeviceKind::Unknown => "device",
+	let class: &str = match d.r#type {
+		DeviceType::Net => "net",
+		DeviceType::Block => "block",
+		DeviceType::Console => "console",
+		DeviceType::Usb => "usb",
+		DeviceType::Unknown => "device",
 	};
-	alloc::format!("{kind}-{}", d.index)
+	alloc::format!("{class}-{}", d.index)
 }
 
 #[unsafe(no_mangle)]

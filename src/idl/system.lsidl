@@ -162,7 +162,7 @@ interface volume {
 }
 
 // The class of a discovered device, mirroring the kernel's device type codes.
-enum device-kind {
+enum device-type {
 	unknown = 0,
 	net     = 1,
 	block   = 2,
@@ -174,7 +174,7 @@ enum device-kind {
 // window its driver maps.
 record device-entry {
 	index:    u32,
-	kind:     device-kind,
+	type:     device-type,
 	mmio-len: u64,
 }
 
@@ -196,7 +196,7 @@ record usb-device {
 	vendor:  u32,
 	product: u32,
 	class:   u32,
-	kind:    string,
+	type:    string,
 }
 
 // The USB bus contract, served by the xHCI driver itself (the owner of the bus
@@ -442,7 +442,7 @@ interface input {
 // The class of a System Graph node: a userspace system service, a userspace device
 // driver, or a hardware device node. The label that turns the boot dependency tree
 // into a typed, classified graph.
-enum component-kind {
+enum component-type {
 	service,  // a userspace system service
 	driver,   // a userspace device driver
 	device,   // a hardware device node
@@ -477,13 +477,13 @@ record counters {
 	last-failure:      string,
 }
 
-// One node in the System Graph: a component's name, its kind, its live state, the
+// One node in the System Graph: a component's name, its type, its live state, the
 // names of the components it depends on (the graph edges), and its counters. A
 // service or driver carries live kernel counters; a device node carries the device's
 // identity with zero counters.
 record component {
 	name:     string,
-	kind:     component-kind,
+	type:     component-type,
 	state:    component-state,
 	deps:     list<string>,
 	counters: counters,
@@ -606,12 +606,12 @@ interface permission {
 	@op(3) run:    func(name: string, args: string, cwd: string, stdout: handle<channel>) -> result<start-result, error>;
 }
 
-// The kinds of resource the kernel accounts and the ResourceManager budgets per Domain:
+// The types of resource the kernel accounts and the ResourceManager budgets per Domain:
 // physical memory held, live handles, live threads, in-transit IPC message bytes,
 // pinned DMA memory, and user stack (whose limit is the per-thread ceiling). The typed
 // vocabulary a budget is written in - each names a counter the kernel already charges
 // and enforces; the policy only sets the cap.
-enum resource-kind {
+enum resource-type {
 	memory,     // physical memory held (bytes)
 	handles,    // live handles (count)
 	threads,    // live threads (count)
@@ -620,11 +620,11 @@ enum resource-kind {
 	stack,      // user stack (bytes; the limit is the per-thread ceiling a stack may demand-page into)
 }
 
-// One line of a Domain's budget: a resource kind, how much of it is currently used, and
+// One line of a Domain's budget: a resource type, how much of it is currently used, and
 // the cap (u64::MAX means uncapped). The live used/limit pair the kernel tracks for one
 // of a Domain's counters, read back over the typed API so usage is observable.
 record resource-usage {
-	kind:  resource-kind,
+	type:  resource-type,
 	used:  u64,
 	limit: u64,
 }
@@ -646,7 +646,7 @@ record budget {
 // this interface is the policy that sets and observes them.
 interface resources {
 	@op(1) usage:     func() -> result<list<budget>, error>;
-	@op(2) set-limit: func(name: string, kind: resource-kind, limit: u64) -> result<budget, error>;
+	@op(2) set-limit: func(name: string, type: resource-type, limit: u64) -> result<budget, error>;
 }
 
 // One tracked job in a session's job table: its small id (assigned by the session and

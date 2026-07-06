@@ -23,7 +23,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				self.dir_lookup_or_create(parent, seg)?
 			} else {
 				let child = self.dir_lookup(parent, seg)?.ok_or(FsError::NotFound)?;
-				if self.read_inode(child)?.kind != KIND_DIR {
+				if self.read_inode(child)?.r#type != TYPE_DIR {
 					return Err(FsError::NotDir);
 				}
 				child
@@ -35,13 +35,13 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Find child `name` in `parent`, or create it as a directory; return its inode.
 	pub(crate) fn dir_lookup_or_create(&mut self, parent: u32, name: &[u8]) -> Result<u32, FsError> {
 		if let Some(child) = self.dir_lookup(parent, name)? {
-			if self.read_inode(child)?.kind != KIND_DIR {
+			if self.read_inode(child)?.r#type != TYPE_DIR {
 				return Err(FsError::NotDir);
 			}
 			return Ok(child);
 		}
 		let num = self.alloc_inode()?;
-		let mut dir = Inode::empty(KIND_DIR);
+		let mut dir = Inode::empty(TYPE_DIR);
 		dir.ctime = self.clock;
 		dir.mtime = self.clock;
 		self.write_inode(num, &mut dir)?;
@@ -59,7 +59,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(Some(*child));
 		}
 		let dir = self.read_inode(dir_num)?;
-		if dir.kind != KIND_DIR {
+		if dir.r#type != TYPE_DIR {
 			return Err(FsError::NotDir);
 		}
 		match self.dir_tree_lookup(dir.dir_root, dir.dir_root_crc, name)? {
@@ -90,7 +90,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// `size`) are updated and the directory inode rewritten.
 	pub(crate) fn dir_insert(&mut self, dir_num: u32, name: &[u8], child: u32) -> Result<(), FsError> {
 		let mut dir = self.read_inode(dir_num)?;
-		if dir.kind != KIND_DIR {
+		if dir.r#type != TYPE_DIR {
 			return Err(FsError::NotDir);
 		}
 		let existed = self.dir_tree_lookup(dir.dir_root, dir.dir_root_crc, name)?.is_some();
@@ -109,7 +109,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Remove entry `name` from directory `dir_num`. NotFound if it is not there.
 	pub(crate) fn dir_remove(&mut self, dir_num: u32, name: &[u8]) -> Result<(), FsError> {
 		let mut dir = self.read_inode(dir_num)?;
-		if dir.kind != KIND_DIR {
+		if dir.r#type != TYPE_DIR {
 			return Err(FsError::NotDir);
 		}
 		let (root, crc, removed) = self.dir_tree_delete(dir.dir_root, dir.dir_root_crc, name)?;
@@ -302,7 +302,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut out = Vec::new();
 		for (name, inode_num) in self.dir_entries_of(dir_num)? {
 			match self.read_inode(inode_num) {
-				Ok(inode) => out.push((name, inode.size, inode.kind == KIND_DIR, inode.mtime, inode.ctime)),
+				Ok(inode) => out.push((name, inode.size, inode.r#type == TYPE_DIR, inode.mtime, inode.ctime)),
 				Err(FsError::Invalid | FsError::Corrupt | FsError::Io) => {}
 				Err(e) => return Err(e),
 			}
@@ -331,7 +331,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				continue;
 			}
 			for (_, child) in self.dir_entries_of(dir)? {
-				if self.read_inode(child)?.kind == KIND_DIR {
+				if self.read_inode(child)?.r#type == TYPE_DIR {
 					dirs.push(child);
 				}
 			}

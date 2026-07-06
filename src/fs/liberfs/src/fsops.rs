@@ -38,7 +38,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut leaf = vec![0u8; BLOCK_SIZE];
 		node_set_header(&mut leaf, NODE_LEAF, 1);
 		leaf[NODE_HDR..NODE_HDR + 8].copy_from_slice(&(ROOT_INODE as u64).to_le_bytes());
-		Inode::empty(KIND_DIR).write(&mut leaf[NODE_HDR + 8..NODE_HDR + 8 + INODE_SIZE]);
+		Inode::empty(TYPE_DIR).write(&mut leaf[NODE_HDR + 8..NODE_HDR + 8 + INODE_SIZE]);
 		if !dev.write_block(leaf_block, &leaf) {
 			return Err(FsError::Io);
 		}
@@ -214,7 +214,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub fn read_file(&mut self, path: &[u8]) -> Result<Vec<u8>, FsError> {
 		let inode_num = self.resolve(path)?;
 		let inode = self.read_inode(inode_num)?;
-		if inode.kind != KIND_FILE {
+		if inode.r#type != TYPE_FILE {
 			return Err(FsError::IsDir);
 		}
 		let size = inode.size;
@@ -271,7 +271,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// List the directory at `path` as (name, size, is_dir, mtime, ctime) tuples.
 	pub fn read_dir(&mut self, path: &[u8]) -> Result<Vec<(Vec<u8>, u64, bool, u64, u64)>, FsError> {
 		let inode_num = self.resolve(path)?;
-		if self.read_inode(inode_num)?.kind != KIND_DIR {
+		if self.read_inode(inode_num)?.r#type != TYPE_DIR {
 			return Err(FsError::NotDir);
 		}
 		self.read_dir_inode(inode_num)
@@ -307,7 +307,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let old = match existing {
 			Some(num) => {
 				let inode = self.read_inode(num)?;
-				if inode.kind != KIND_FILE {
+				if inode.r#type != TYPE_FILE {
 					return Err(FsError::IsDir);
 				}
 				Some((num, inode))
@@ -323,7 +323,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// block (the old file's blocks stay referenced by the previous generation, and
 		// leave the new one - recorded via the dead list). A contiguous run is reserved
 		// up front, so the file lands in as few extents as the pool allows.
-		let mut inode = Inode::empty(KIND_FILE);
+		let mut inode = Inode::empty(TYPE_FILE);
 		inode.size = data.len() as u64;
 		inode.ctime = match &old {
 			Some((_, o)) => o.ctime,
@@ -377,7 +377,7 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	pub(crate) fn rmdir_inner(&mut self, path: &[u8]) -> Result<(), FsError> {
 		let inode_num = self.resolve(path)?;
-		if self.read_inode(inode_num)?.kind != KIND_DIR {
+		if self.read_inode(inode_num)?.r#type != TYPE_DIR {
 			return Err(FsError::NotDir);
 		}
 		self.remove_inner(path)
@@ -396,7 +396,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			Err(e) => return Err(e),
 		};
 		if let Some(inode) = &inode {
-			if inode.kind == KIND_DIR && inode.size != 0 {
+			if inode.r#type == TYPE_DIR && inode.size != 0 {
 				return Err(FsError::NotEmpty);
 			}
 
@@ -417,7 +417,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// legitimate empty directory's root is 0). Shared by the delete and the
 	// rename-replace paths, so neither can leak what the other drops.
 	pub(crate) fn drop_deleted_inode(&mut self, inode: &Inode) -> Result<(), FsError> {
-		if inode.kind == KIND_FILE {
+		if inode.r#type == TYPE_FILE {
 			self.drop_inode_blocks(inode)?;
 		} else if inode.dir_root != 0 {
 			// mark-then-scan is O(pool) per call - accepted: this path runs only for a

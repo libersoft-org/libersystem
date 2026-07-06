@@ -113,7 +113,7 @@ An opaque kernel object, transferred as `handle<file>`.
 | `checksum-failures` | `u32` |
 | `damaged` | `list<string>` |
 
-### enum `device-kind`
+### enum `device-type`
 
 | case | ordinal |
 | --- | --- |
@@ -128,7 +128,7 @@ An opaque kernel object, transferred as `handle<file>`.
 | field | type |
 | --- | --- |
 | `index` | `u32` |
-| `kind` | `device-kind` |
+| `type` | `device-type` |
 | `mmio-len` | `u64` |
 
 ### record `usb-device`
@@ -140,7 +140,7 @@ An opaque kernel object, transferred as `handle<file>`.
 | `vendor` | `u32` |
 | `product` | `u32` |
 | `class` | `u32` |
-| `kind` | `string` |
+| `type` | `string` |
 
 ### record `process-info`
 
@@ -270,7 +270,7 @@ An opaque kernel object, transferred as `handle<task>`.
 | `row` | `u16` |
 | `buttons` | `u8` |
 
-### enum `component-kind`
+### enum `component-type`
 
 | case | ordinal |
 | --- | --- |
@@ -305,7 +305,7 @@ An opaque kernel object, transferred as `handle<task>`.
 | field | type |
 | --- | --- |
 | `name` | `string` |
-| `kind` | `component-kind` |
+| `type` | `component-type` |
 | `state` | `component-state` |
 | `deps` | `list<string>` |
 | `counters` | `counters` |
@@ -372,7 +372,7 @@ An opaque kernel object, transferred as `handle<task>`.
 | `granted` | `bool` |
 | `dynamic` | `bool` |
 
-### enum `resource-kind`
+### enum `resource-type`
 
 | case | ordinal |
 | --- | --- |
@@ -387,7 +387,7 @@ An opaque kernel object, transferred as `handle<task>`.
 
 | field | type |
 | --- | --- |
-| `kind` | `resource-kind` |
+| `type` | `resource-type` |
 | `used` | `u64` |
 | `limit` | `u64` |
 
@@ -591,7 +591,7 @@ Request `[op u16][corr u32][args]`, reply `[corr u32][result]`.
 | op | method | signature |
 | --- | --- | --- |
 | 1 | `usage` | `usage() -> result<list<budget>, error>` |
-| 2 | `set-limit` | `set-limit(name: string, kind: resource-kind, limit: u64) -> result<budget, error>` |
+| 2 | `set-limit` | `set-limit(name: string, type: resource-type, limit: u64) -> result<budget, error>` |
 
 ### interface `session`
 

@@ -1041,7 +1041,7 @@ impl<'a> usb::Service for UsbApi<'a> {
 	fn list(&mut self) -> Result<Vec<UsbEntry>, UsbError> {
 		let mut out: Vec<UsbEntry> = Vec::new();
 		for rec in &self.slots.entries {
-			out.push(UsbEntry { port: rec.port, speed: String::from(speed_name(rec.speed)), vendor: rec.vendor as u32, product: rec.product as u32, class: rec.class as u32, kind: String::from(kind_name(rec.kind)) });
+			out.push(UsbEntry { port: rec.port, speed: String::from(speed_name(rec.speed)), vendor: rec.vendor as u32, product: rec.product as u32, class: rec.class as u32, r#type: String::from(kind_name(rec.kind)) });
 		}
 		Ok(out)
 	}

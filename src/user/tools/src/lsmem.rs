@@ -83,7 +83,7 @@ fn render_region(out: &mut String, index: u64, region: &MemmapRegion, json: bool
 		push_decimal(out, region.base);
 		out.push_str(",\"length\":");
 		push_decimal(out, region.length);
-		out.push_str(",\"kind\":\"");
+		out.push_str(",\"type\":\"");
 		out.push_str(kind_name(region.kind));
 		out.push_str("\"}");
 		return;
