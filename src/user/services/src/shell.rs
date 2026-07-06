@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use proto::codec::JsonMode;
 use proto::path;
-use proto::system::{Component, EnvVar, JobEntry, JobInfo, TraceSpan, input, network, permission, process, session, system_graph, volume};
+use proto::system::{input, network, permission, process, session, system_graph, volume, Component, EnvVar, JobEntry, JobInfo, TraceSpan};
 use rt::*;
 
 // The shell's builtins, shared with ConsoleService's line discipline: Tab completes the
@@ -40,34 +40,34 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    does not use (log / device / config / time / audio, the resource client, ADMIN)
 	//    are not taken and close with the set.
 	let mut caps: CapSet = unsafe { recv_caps(bootstrap) };
-	let storage: u64 = match caps.take(b"STORAGE") {
+	let storage: u64 = match caps.take(CAP_STORAGE) {
 		0 => exit(),
 		h => h,
 	};
-	let media: u64 = caps.take(b"MEDIA");
-	let iso: u64 = caps.take(b"ISO");
-	let udf: u64 = caps.take(b"UDF");
-	let usb: u64 = caps.take(b"USB");
-	let procsvc: u64 = match caps.take(b"PROCESS") {
+	let media: u64 = caps.take(CAP_MEDIA);
+	let iso: u64 = caps.take(CAP_ISO);
+	let udf: u64 = caps.take(CAP_UDF);
+	let usb: u64 = caps.take(CAP_USB);
+	let procsvc: u64 = match caps.take(CAP_PROCESS) {
 		0 => exit(),
 		h => h,
 	};
-	let netsvc: u64 = match caps.take(b"NET") {
+	let netsvc: u64 = match caps.take(CAP_NET) {
 		0 => exit(),
 		h => h,
 	};
-	let inputsvc: u64 = caps.take(b"INPUT");
-	let graphsvc: u64 = caps.take(b"GRAPH");
-	let permsvc: u64 = caps.take(b"PERM");
+	let inputsvc: u64 = caps.take(CAP_INPUT);
+	let graphsvc: u64 = caps.take(CAP_GRAPH);
+	let permsvc: u64 = caps.take(CAP_PERM);
 	// The session (SessionService) the shell runs under: the long-lived owner of the
 	// working directory (and, later, the environment). `cd` round-trips to it and the
 	// prompt reads its cwd, so the cwd survives a shell restart - the supervisor keeps the
 	// session and hands each (re)started shell a fresh capability to the same one.
-	let session: u64 = caps.take(b"SESSION");
+	let session: u64 = caps.take(CAP_SESSION);
 	// The console channel to ConsoleService: the shell writes its output to it (routed
 	// via stdout) and reads its keystrokes from it. The userspace terminal renders the
 	// output and forwards the input, so the shell talks to the console, not the kernel.
-	let console: u64 = match caps.take(b"CONSOLE") {
+	let console: u64 = match caps.take(CAP_CONSOLE) {
 		0 => exit(),
 		h => h,
 	};
@@ -75,7 +75,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The per-VT control channel to ConsoleService: the shell announces its foreground
 	// job on it (SET_FG / CLEAR_FG) so the tty signals it on Ctrl+C / Ctrl+Z / Ctrl+\,
 	// and learns of a Ctrl+Z suspend (JOB_STOPPED) so it can background the job.
-	let control: u64 = match caps.take(b"CONTROL") {
+	let control: u64 = match caps.take(CAP_CONTROL) {
 		0 => exit(),
 		h => h,
 	};
@@ -1279,7 +1279,11 @@ unsafe fn send_stdout(parent: u64, interactive: bool) {
 		let rights: u32 = if interactive { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER } else { RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER };
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, rights);
-			if d > 0 { d as u64 } else { 0 }
+			if d > 0 {
+				d as u64
+			} else {
+				0
+			}
 		} else {
 			0
 		};

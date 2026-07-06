@@ -1,0 +1,115 @@
+# LiberSystem service and artifact manifest - the single source of truth for the boot
+# chain. ServiceManager's dependency table (each managed service's name and the services
+# that must be up before it may start) is generated from the `service` and `instance`
+# rows below; the kernel build script derives its init.pkg and system-volume staging
+# lists from every row. Adding a normal service is one row here plus the service's own
+# code - the runtime table and the staging lists can no longer drift apart.
+#
+# columns: kind  name  crate  stage  [deps...]
+#   kind : launcher | service | instance | probe | driver | tool | component
+#          - service : a managed service with its own ELF (ServiceManager supervises it)
+#          - instance: a managed service backed by another program's ELF (no own binary)
+#          - launcher: spawned from the init package, not supervised as a managed service
+#          - probe   : a self-test helper spawned by the supervisor
+#          - driver / tool / component: staged programs the managed services load
+#   crate: crate directory under src/user (or '-' for an instance with no own ELF)
+#   stage: pinned (kept in init.pkg) | volume (staged on the system volume) | none
+#   deps : the services that must be Running first (service and instance rows only)
+
+# managed services - ServiceManager brings these up in dependency order. The row order
+# is deliberately NOT the start order (DeviceManager and the shell are listed before
+# LogService, though all depend on it): the dependency resolver derives the real order,
+# proving it is driven by the declared deps, not by position.
+service   device_manager        services  pinned  log_service
+service   storage_service       storage   pinned  log_service device_manager
+instance  media_storage         -         none    log_service device_manager
+instance  iso_storage           -         none    log_service device_manager
+instance  udf_storage           -         none    log_service device_manager
+instance  usb_storage           -         none    log_service storage_service
+service   network_service       services  volume  log_service device_manager process_service config_service
+service   shell                 services  volume  storage_service media_storage iso_storage udf_storage usb_storage device_service process_service config_service network_service time_service console_service audio_service input_service permission_manager resource_manager system_graph_service session_service
+service   log_service           services  pinned
+service   device_service        services  volume  log_service process_service
+service   process_service       services  pinned  log_service storage_service
+service   config_service        services  volume  log_service process_service
+service   time_service          services  volume  log_service network_service process_service
+service   console_service       services  volume  log_service time_service audio_service input_service session_service process_service permission_manager
+service   audio_service         services  volume  log_service device_manager process_service
+service   input_service         services  volume  log_service device_manager process_service
+service   system_graph_service  services  volume  log_service device_manager storage_service network_service device_service process_service config_service time_service console_service audio_service input_service permission_manager resource_manager
+service   permission_manager    services  volume  log_service storage_service media_storage iso_storage udf_storage usb_storage network_service time_service config_service device_service audio_service process_service resource_manager
+service   resource_manager      services  volume  log_service process_service
+service   session_service       services  volume  log_service process_service
+
+# launchers - spawned from the init package, not supervised as managed services.
+launcher  system_manager        system_manager  pinned
+launcher  service_manager       services        pinned
+
+# self-test probes - the supervisor raw-spawns watchdog_probe during its stop-path drill
+# (after DeviceManager drops virtio_blk, so the volume is gone), and ResourceManager
+# spawns resource_probe into a bounded sub-Domain; both must ship in the init package.
+probe     watchdog_probe        services  pinned
+probe     resource_probe        services  pinned
+
+# demo and host components - loaded from the system volume by the managed services.
+component sandbox_probe         services  volume
+component request_probe         services  volume
+component wasi_host             services  volume
+component component_host        services  volume
+component file_picker           services  volume
+component storage_client        storage   volume
+
+# drivers - the bootstrap block driver backs the system volume, so it ships in the init
+# package; every other driver loads from the volume under drivers/.
+driver    virtio_blk            drivers   pinned
+driver    virtio_net            drivers   volume
+driver    virtio_console        drivers   volume
+driver    virtio_input          drivers   volume
+driver    virtio_gpu            drivers   volume
+driver    virtio_snd            drivers   volume
+driver    xhci                  drivers   volume
+
+# command-line tools - loaded from the system volume under bin/.
+tool      date       tools  volume
+tool      cat        tools  volume
+tool      write      tools  volume
+tool      rm         tools  volume
+tool      ls         tools  volume
+tool      mkdir      tools  volume
+tool      rmdir      tools  volume
+tool      log        tools  volume
+tool      snap       tools  volume
+tool      volume     tools  volume
+tool      lsdev      tools  volume
+tool      config     tools  volume
+tool      set        tools  volume
+tool      beep       tools  volume
+tool      usage      tools  volume
+tool      ps         tools  volume
+tool      run        tools  volume
+tool      perm       tools  volume
+tool      stop       tools  volume
+tool      lsvol      tools  volume
+tool      uname      tools  volume
+tool      uptime     tools  volume
+tool      dmesg      tools  volume
+tool      lscpu      tools  volume
+tool      free       tools  volume
+tool      lsmem      tools  volume
+tool      lsirq      tools  volume
+tool      lspci      tools  volume
+tool      lssvc      tools  volume
+tool      lsblk      tools  volume
+tool      lsusb      tools  volume
+tool      echo       tools  volume
+tool      ping       tools  volume
+tool      ip         tools  volume
+tool      nslookup   tools  volume
+tool      tcp        tools  volume
+tool      nc         tools  volume
+tool      arp        tools  volume
+tool      httpd      tools  volume
+tool      ss         tools  volume
+tool      script     tools  volume
+tool      ptyecho    tools  volume
+tool      readln     tools  volume

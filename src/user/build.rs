@@ -16,6 +16,55 @@ fn main() {
 	println!("cargo:rerun-if-changed=../user.ld");
 	println!("cargo:rerun-if-changed=../build.rs");
 	export_product_metadata();
+	generate_service_manifest();
+}
+
+// Generate ServiceManager's dependency table from the shared service manifest
+// (services/manifest.txt, the single source of truth the kernel build script also
+// reads for its staging lists). Only the services crate holds ServiceManager, so the
+// table is emitted only there; service_manager.rs includes it via env!("OUT_DIR").
+// Each `service` / `instance` row becomes one `Service { name, deps }` entry, in the
+// manifest's row order (the resolver derives the real start order from the deps).
+fn generate_service_manifest() {
+	if env::var("CARGO_PKG_NAME").as_deref() != Ok("services") {
+		return;
+	}
+	let path: PathBuf = PathBuf::from("manifest.txt");
+	let text: String = fs::read_to_string(&path).unwrap_or_else(|e: std::io::Error| panic!("cannot read {}: {e}", path.display()));
+	println!("cargo:rerun-if-changed=manifest.txt");
+
+	let mut out: String = String::new();
+	let mut count: usize = 0;
+	for line in text.lines() {
+		let trimmed: &str = line.trim();
+		if trimmed.is_empty() || trimmed.starts_with('#') {
+			continue;
+		}
+		let mut fields = trimmed.split_whitespace();
+		let kind: &str = fields.next().expect("manifest row missing kind");
+		if kind != "service" && kind != "instance" {
+			continue;
+		}
+		let name: &str = fields.next().expect("manifest row missing name");
+		let _crate: &str = fields.next().expect("manifest row missing crate");
+		let _stage: &str = fields.next().expect("manifest row missing stage");
+		let mut deps: String = String::new();
+		for dep in fields {
+			if !deps.is_empty() {
+				deps.push_str(", ");
+			}
+			deps.push_str("b\"");
+			deps.push_str(dep);
+			deps.push('"');
+		}
+		out.push_str(&format!("\tService {{ name: b\"{name}\", deps: &[{deps}] }},\n"));
+		count += 1;
+	}
+
+	let generated: String = format!("// @generated from services/manifest.txt by build.rs - do not edit.\nconst N: usize = {count};\nconst MANIFEST: [Service; N] = [\n{out}];\n");
+	let out_dir: String = env::var("OUT_DIR").expect("OUT_DIR not set");
+	let dest: PathBuf = PathBuf::from(&out_dir).join("manifest.rs");
+	fs::write(&dest, generated).unwrap_or_else(|e: std::io::Error| panic!("cannot write {}: {e}", dest.display()));
 }
 
 // Parse ../../../product.conf (shell-style KEY="value") and re-export every entry as

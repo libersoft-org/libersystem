@@ -68,107 +68,46 @@ fn conf_get<'a>(conf: &'a [(String, String)], key: &str) -> &'a str {
 	panic!("missing {key} in product.conf");
 }
 
-// The userspace programs staged at boot, the single source of truth for both archives.
-// The pinned bootstrap set (M61 box 8): the only programs kept in the init package.
-// Most are on the path to mounting the system volume - SystemManager and ServiceManager
-// (the launchers), LogService (every service depends on it), DeviceManager and the
-// StorageService (which brings the volume up), and ProcessService (which loads everything
-// else off the volume); a service on this path cannot itself be loaded from a volume that
-// is not mounted yet. The two probes are the exceptions: the supervisor raw-spawns
-// watchdog_probe during its self-test after stopping DeviceManager (which drops
-// virtio_blk, so the volume is gone), and ResourceManager spawns resource_probe into a
-// bounded sub-Domain (which ProcessService cannot do), so both ship in the package.
-// (package entry name, crate directory under ../user).
-const PINNED_SERVICES: [(&str, &str); 8] = [
-	("system_manager", "system_manager"),
-	("service_manager", "services"),
-	("log_service", "services"),
-	("device_manager", "services"),
-	("process_service", "services"),
-	("storage_service", "storage"),
-	("watchdog_probe", "services"),
-	("resource_probe", "services"),
-];
+// The userspace programs staged at boot, read from the shared service manifest
+// (../user/services/manifest.txt) - the single source of truth ServiceManager also
+// generates its dependency table from, so the runtime service set and the staged
+// programs cannot drift. Each staged program is one manifest row: `kind name crate
+// stage [deps...]`. The kind and stage columns sort a row into the init package (the
+// pinned bootstrap set on the path to mounting the system volume, plus the bootstrap
+// block driver that backs it) or onto the system volume (every other service, driver,
+// tool and demo component, loaded from there once it is mounted).
 
-// Every other service, manager and demo component: loaded from the system volume's `bin/`
-// via ProcessService, so they are staged onto the volume and NOT kept in the init package
-// (M61 box 8). (package entry name, crate directory under ../user).
-const VOLUME_SERVICES: [(&str, &str); 18] = [
-	("device_service", "services"),
-	("config_service", "services"),
-	("network_service", "services"),
-	("time_service", "services"),
-	("console_service", "services"),
-	("audio_service", "services"),
-	("input_service", "services"),
-	("system_graph_service", "services"),
-	("permission_manager", "services"),
-	("resource_manager", "services"),
-	("session_service", "services"),
-	("sandbox_probe", "services"),
-	("request_probe", "services"),
-	("wasi_host", "services"),
-	("component_host", "services"),
-	("file_picker", "services"),
-	("shell", "services"),
-	("storage_client", "storage"),
-];
+// A staged program parsed from a manifest row: its kind, its package entry name, the
+// crate directory under ../user that builds it, and where it is staged.
+struct ManifestRow {
+	kind: String,
+	name: String,
+	crate_dir: String,
+	stage: String,
+}
 
-// The bootstrap block driver - it must ship in the init package because it backs the
-// system volume everything else is seeded onto, so it can never live on that volume.
-const BOOT_DRIVER_NAMES: [&str; 1] = ["virtio_blk"];
-
-// Non-bootstrap drivers - loaded from the system volume under drivers/ (M61 box 8), so
-// staged there and not kept in the init package.
-const NONBOOT_DRIVER_NAMES: [&str; 6] = ["virtio_net", "virtio_console", "virtio_input", "virtio_gpu", "virtio_snd", "xhci"];
-
-// Command-line tools - loaded from the system volume under bin/, so staged there and not
-// kept in the init package.
-const TOOL_NAMES: [&str; 43] = [
-	"date",
-	"cat",
-	"write",
-	"rm",
-	"ls",
-	"mkdir",
-	"rmdir",
-	"log",
-	"snap",
-	"volume",
-	"lsdev",
-	"config",
-	"set",
-	"beep",
-	"usage",
-	"ps",
-	"run",
-	"perm",
-	"stop",
-	"lsvol",
-	"uname",
-	"uptime",
-	"dmesg",
-	"lscpu",
-	"free",
-	"lsmem",
-	"lsirq",
-	"lspci",
-	"lssvc",
-	"lsblk",
-	"lsusb",
-	"echo",
-	"ping",
-	"ip",
-	"nslookup",
-	"tcp",
-	"nc",
-	"arp",
-	"httpd",
-	"ss",
-	"script",
-	"ptyecho",
-	"readln",
-];
+// Read and parse the shared service manifest, keeping every row that names a staged
+// program (an `instance` row is a managed service backed by another program's ELF, so
+// it stages nothing of its own - its `crate` is `-` and its `stage` is `none`).
+fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
+	let path: PathBuf = manifest.join("../user/services/manifest.txt");
+	let text: String = fs::read_to_string(&path).unwrap_or_else(|e: std::io::Error| panic!("cannot read {}: {e}", path.display()));
+	println!("cargo:rerun-if-changed={}", path.display());
+	let mut rows: Vec<ManifestRow> = Vec::new();
+	for line in text.lines() {
+		let trimmed: &str = line.trim();
+		if trimmed.is_empty() || trimmed.starts_with('#') {
+			continue;
+		}
+		let mut fields = trimmed.split_whitespace();
+		let kind: String = fields.next().expect("manifest row missing kind").to_string();
+		let name: String = fields.next().expect("manifest row missing name").to_string();
+		let crate_dir: String = fields.next().expect("manifest row missing crate").to_string();
+		let stage: String = fields.next().expect("manifest row missing stage").to_string();
+		rows.push(ManifestRow { kind, name, crate_dir, stage });
+	}
+	rows
+}
 
 // The debug-build target path of a userspace ELF: each crate builds to its own target dir.
 fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
@@ -219,13 +158,13 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	// (package entry name, ELF path). The init package holds only the pinned bootstrap set
 	// (M61 box 8): the pinned services and the bootstrap block driver. Every other service,
 	// manager, driver and tool is loaded from the system volume, so it is staged there by
-	// assemble_volume_package instead.
-	let mut sources: Vec<(&str, PathBuf)> = Vec::new();
-	for (name, crate_dir) in PINNED_SERVICES {
-		sources.push((name, user_elf_path(&manifest, crate_dir, name)));
-	}
-	for name in BOOT_DRIVER_NAMES {
-		sources.push((name, user_elf_path(&manifest, "drivers", name)));
+	// assemble_volume_package instead. A pinned row with a real crate (not an `instance`
+	// backed by another program) contributes its ELF.
+	let mut sources: Vec<(String, PathBuf)> = Vec::new();
+	for row in read_manifest(&manifest) {
+		if row.stage == "pinned" && row.crate_dir != "-" {
+			sources.push((row.name.clone(), user_elf_path(&manifest, &row.crate_dir, &row.name)));
+		}
 	}
 
 	fs::create_dir_all(&out_dir).unwrap_or_else(|e: std::io::Error| panic!("cannot create {}: {e}", out_dir.display()));
@@ -234,7 +173,7 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	for (name, path) in &sources {
 		println!("cargo:rerun-if-changed={}", path.display());
 		match fs::read(path) {
-			Ok(bytes) => entries.push((name, bytes)),
+			Ok(bytes) => entries.push((name.as_str(), bytes)),
 			Err(_) => println!("cargo:warning={name} ELF not found at {} - omitting from init package (run `just user` or `just build`)", path.display()),
 		}
 	}
@@ -283,30 +222,18 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	// of symbol/debug sections (the on-disk copies are executed by the loader, which needs
 	// only the program image; the init package keeps the full debug ELFs), keeping the
 	// seed archive to a few megabytes. A missing or unstrippable ELF is skipped.
-	for name in TOOL_NAMES {
-		let path: PathBuf = user_elf_path(&manifest, "tools", name);
+	for row in read_manifest(&manifest) {
+		let dest: String = match row.kind.as_str() {
+			"tool" => format!("bin/{}", row.name),
+			"service" | "component" if row.stage == "volume" => format!("bin/{}", row.name),
+			"driver" if row.stage == "volume" => format!("drivers/{}", row.name),
+			_ => continue,
+		};
+		let path: PathBuf = user_elf_path(&manifest, &row.crate_dir, &row.name);
 		println!("cargo:rerun-if-changed={}", path.display());
 		match read_stripped(&path) {
-			Some(bytes) => files.push((format!("bin/{name}"), bytes)),
-			None => println!("cargo:warning={name} ELF not found at {} - omitting from system volume (run `just user` or `just build`)", path.display()),
-		}
-	}
-	// M61 box 2 / box 8: stage the services, managers and demo components that load from
-	// the volume under bin/ too, so ProcessService can start them from there.
-	for (name, crate_dir) in VOLUME_SERVICES {
-		let path: PathBuf = user_elf_path(&manifest, crate_dir, name);
-		println!("cargo:rerun-if-changed={}", path.display());
-		match read_stripped(&path) {
-			Some(bytes) => files.push((format!("bin/{name}"), bytes)),
-			None => println!("cargo:warning={name} ELF not found at {} - omitting from system volume (run `just user` or `just build`)", path.display()),
-		}
-	}
-	for name in NONBOOT_DRIVER_NAMES {
-		let path: PathBuf = user_elf_path(&manifest, "drivers", name);
-		println!("cargo:rerun-if-changed={}", path.display());
-		match read_stripped(&path) {
-			Some(bytes) => files.push((format!("drivers/{name}"), bytes)),
-			None => println!("cargo:warning={name} ELF not found at {} - omitting from system volume (run `just user` or `just build`)", path.display()),
+			Some(bytes) => files.push((dest, bytes)),
+			None => println!("cargo:warning={} ELF not found at {} - omitting from system volume (run `just user` or `just build`)", row.name, path.display()),
 		}
 	}
 	files.sort_by(|a, b| a.0.cmp(&b.0));

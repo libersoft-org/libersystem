@@ -32,7 +32,7 @@ use alloc::vec::Vec;
 // display `Surface`. This service supplies the userspace display backends - the boot
 // framebuffer and the virtio-gpu shared backing - and drives `Term`; the kernel boot
 // console shares the same `Term`.
-use term::{CELL_H, CELL_W, Echo, EchoBuf, Geometry, LD_HIST_MAX, Ld, Raster, RawSink, SCROLLBACK_ROWS, Surface, Term};
+use term::{Echo, EchoBuf, Geometry, Ld, Raster, RawSink, Surface, Term, CELL_H, CELL_W, LD_HIST_MAX, SCROLLBACK_ROWS};
 
 // The boot framebuffer the kernel maps directly: its pixel writes are visible immediately,
 // so present is a no-op. The fallback display (and the deterministic test path).
@@ -78,7 +78,11 @@ impl Surface for GpuSurface {
 // channel is given (it presents on FLUSH), else the boot framebuffer (present is a no-op).
 fn make_surface(addr: u64, fb: &Framebuffer, gpu: u64) -> Box<dyn Surface> {
 	let raster = Raster::new(addr, &geometry(fb));
-	if gpu != 0 { Box::new(GpuSurface { raster, gpu }) } else { Box::new(BootSurface { raster }) }
+	if gpu != 0 {
+		Box::new(GpuSurface { raster, gpu })
+	} else {
+		Box::new(BootSurface { raster })
+	}
 }
 
 // The renderer's `Geometry` for a mapped ABI `Framebuffer`: the pixel format the display
@@ -362,20 +366,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			h
 		};
-		let client: u64 = required(caps.take(b"CLIENT"));
-		let control: u64 = required(caps.take(b"CONTROL"));
-		let storage: u64 = required(caps.take(b"FSTORAGE"));
-		let log: u64 = required(caps.take(b"FLOG"));
-		let device: u64 = required(caps.take(b"FDEVICE"));
-		let process: u64 = required(caps.take(b"FPROCESS"));
-		let config: u64 = required(caps.take(b"FCONFIG"));
-		let time: u64 = required(caps.take(b"FTIME"));
-		let audio: u64 = required(caps.take(b"FAUDIO"));
-		let session: u64 = required(caps.take(b"FSESSION"));
-		let perm: u64 = required(caps.take(b"FPERM"));
-		let net: u64 = required(caps.take(b"FNET"));
-		let gpu: u64 = caps.take(b"GPU");
-		let pointer: u64 = caps.take(b"POINTER");
+		let client: u64 = required(caps.take(CAP_CLIENT));
+		let control: u64 = required(caps.take(CAP_CONTROL));
+		let storage: u64 = required(caps.take(CAP_FSTORAGE));
+		let log: u64 = required(caps.take(CAP_FLOG));
+		let device: u64 = required(caps.take(CAP_FDEVICE));
+		let process: u64 = required(caps.take(CAP_FPROCESS));
+		let config: u64 = required(caps.take(CAP_FCONFIG));
+		let time: u64 = required(caps.take(CAP_FTIME));
+		let audio: u64 = required(caps.take(CAP_FAUDIO));
+		let session: u64 = required(caps.take(CAP_FSESSION));
+		let perm: u64 = required(caps.take(CAP_FPERM));
+		let net: u64 = required(caps.take(CAP_FNET));
+		let gpu: u64 = caps.take(CAP_GPU);
+		let pointer: u64 = caps.take(CAP_POINTER);
 		drop(caps);
 
 		// 2. acquire the display backends. The boot framebuffer the kernel hands over holds
@@ -1514,19 +1518,19 @@ unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) 
 		// The named capability set, ended by READY: the shell takes each by name, so the
 		// capabilities a non-primary VT does not get are simply not sent - no placeholder
 		// messages keeping an order.
-		send_blocking(boot_parent, b"STORAGE", storage);
-		send_blocking(boot_parent, b"LOG", log);
-		send_blocking(boot_parent, b"DEVICE", device);
-		send_blocking(boot_parent, b"PROCESS", process);
-		send_blocking(boot_parent, b"CONFIG", config);
-		send_blocking(boot_parent, b"NET", net_client);
-		send_blocking(boot_parent, b"TIME", time);
-		send_blocking(boot_parent, b"AUDIO", audio);
-		send_blocking(boot_parent, b"PERM", perm);
+		send_blocking(boot_parent, CAP_STORAGE, storage);
+		send_blocking(boot_parent, CAP_LOG, log);
+		send_blocking(boot_parent, CAP_DEVICE, device);
+		send_blocking(boot_parent, CAP_PROCESS, process);
+		send_blocking(boot_parent, CAP_CONFIG, config);
+		send_blocking(boot_parent, CAP_NET, net_client);
+		send_blocking(boot_parent, CAP_TIME, time);
+		send_blocking(boot_parent, CAP_AUDIO, audio);
+		send_blocking(boot_parent, CAP_PERM, perm);
 		// This VT's session.
-		send_blocking(boot_parent, b"SESSION", session);
-		send_blocking(boot_parent, b"CONSOLE", shell_console);
-		send_blocking(boot_parent, b"CONTROL", shell_control);
+		send_blocking(boot_parent, CAP_SESSION, session);
+		send_blocking(boot_parent, CAP_CONSOLE, shell_console);
+		send_blocking(boot_parent, CAP_CONTROL, shell_control);
 		send_ready(boot_parent);
 		// wait for the shell to report in, then drop its bootstrap.
 		let mut rbuf: [u8; 32] = [0u8; 32];
@@ -1627,8 +1631,8 @@ unsafe fn spawn_pty_program(facs: &Factories, name: &[u8], program_console: u64,
 			}
 		};
 		close(launcher);
-		send_blocking(boot_parent, b"CONSOLE", program_console);
-		send_blocking(boot_parent, b"CONTROL", program_control);
+		send_blocking(boot_parent, CAP_CONSOLE, program_console);
+		send_blocking(boot_parent, CAP_CONTROL, program_control);
 		close(boot_parent);
 		close(started.task);
 		true

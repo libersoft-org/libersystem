@@ -1,5 +1,6 @@
 # Bugs / changes
 
+- Add nvme + other generic drivers
 - Apps in vol://storage/bin/ are huge (hundreds of kB) - find out why
 - Some commands are missing --help parameter
 - How does the format of our binary files look like? describe it somewhere

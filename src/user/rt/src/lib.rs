@@ -114,7 +114,11 @@ pub unsafe fn debug_write(bytes: &[u8]) -> usize {
 	unsafe {
 		let n = bytes.len().min(DEBUG_WRITE_CHUNK);
 		let accepted: i64 = syscall(SYS_DEBUG_WRITE, bytes.as_ptr() as u64, n as u64, 0, 0) as i64;
-		if accepted < 0 { 0 } else { accepted as usize }
+		if accepted < 0 {
+			0
+		} else {
+			accepted as usize
+		}
 	}
 }
 
@@ -551,6 +555,48 @@ pub unsafe fn channel_with_depth(depth: u64) -> Option<(u64, u64)> {
 // does not get.
 pub const BOOTSTRAP_READY: &[u8] = b"READY";
 
+// The capability tags of the CapSet bootstrap handshakes, shared by both ends so the
+// granting side (ServiceManager's bootstrap sequence) and the receiving side (the
+// service's recv_caps / CapSet::take) name each capability through one symbol and
+// cannot drift: a renamed or mistyped tag is a compile error, not a capability the
+// receiver silently misses. The shell handshake (ServiceManager -> shell):
+pub const CAP_STORAGE: &[u8] = b"STORAGE";
+pub const CAP_MEDIA: &[u8] = b"MEDIA";
+pub const CAP_ISO: &[u8] = b"ISO";
+pub const CAP_UDF: &[u8] = b"UDF";
+pub const CAP_USB: &[u8] = b"USB";
+pub const CAP_LOG: &[u8] = b"LOG";
+pub const CAP_DEVICE: &[u8] = b"DEVICE";
+pub const CAP_PROCESS: &[u8] = b"PROCESS";
+pub const CAP_CONFIG: &[u8] = b"CONFIG";
+pub const CAP_NET: &[u8] = b"NET";
+pub const CAP_TIME: &[u8] = b"TIME";
+pub const CAP_AUDIO: &[u8] = b"AUDIO";
+pub const CAP_INPUT: &[u8] = b"INPUT";
+pub const CAP_GRAPH: &[u8] = b"GRAPH";
+pub const CAP_PERM: &[u8] = b"PERM";
+pub const CAP_RESOURCE: &[u8] = b"RESOURCE";
+pub const CAP_SESSION: &[u8] = b"SESSION";
+pub const CAP_CONSOLE: &[u8] = b"CONSOLE";
+pub const CAP_CONTROL: &[u8] = b"CONTROL";
+pub const CAP_ADMIN: &[u8] = b"ADMIN";
+// The ConsoleService handshake (ServiceManager -> ConsoleService): its own client and
+// per-VT control channel, then a factory connection per serve_multi service it spawns
+// VTs against (the F-prefixed tags), then the display and pointer-forward channels.
+pub const CAP_CLIENT: &[u8] = b"CLIENT";
+pub const CAP_FSTORAGE: &[u8] = b"FSTORAGE";
+pub const CAP_FLOG: &[u8] = b"FLOG";
+pub const CAP_FDEVICE: &[u8] = b"FDEVICE";
+pub const CAP_FPROCESS: &[u8] = b"FPROCESS";
+pub const CAP_FCONFIG: &[u8] = b"FCONFIG";
+pub const CAP_FTIME: &[u8] = b"FTIME";
+pub const CAP_FAUDIO: &[u8] = b"FAUDIO";
+pub const CAP_FSESSION: &[u8] = b"FSESSION";
+pub const CAP_FPERM: &[u8] = b"FPERM";
+pub const CAP_FNET: &[u8] = b"FNET";
+pub const CAP_GPU: &[u8] = b"GPU";
+pub const CAP_POINTER: &[u8] = b"POINTER";
+
 // A received bootstrap capability set: every named capability the parent sent
 // before READY, taken by name. Whatever the receiver does not take is closed when
 // the set drops, so an unused grant never lingers as an open handle.
@@ -875,7 +921,11 @@ pub unsafe fn memory_object_create(size: u64) -> i64 {
 pub unsafe fn map_object(handle: u64) -> Option<u64> {
 	unsafe {
 		let base: u64 = syscall(SYS_MEMORY_MAP, handle, 0, 0, 0);
-		if sys_is_err(base) { None } else { Some(base) }
+		if sys_is_err(base) {
+			None
+		} else {
+			Some(base)
+		}
 	}
 }
 
@@ -984,7 +1034,11 @@ pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
 		let mut info: ObjectInfo = ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0, size: 0 };
 		let size: u64 = core::mem::size_of::<ObjectInfo>() as u64;
 		let ok: i64 = syscall(SYS_OBJECT_INFO_GET, handle, &mut info as *mut ObjectInfo as u64, size, 0) as i64;
-		if ok == 1 { Some(info) } else { None }
+		if ok == 1 {
+			Some(info)
+		} else {
+			None
+		}
 	}
 }
 
@@ -998,7 +1052,11 @@ pub unsafe fn process_stats(handle: u64) -> Option<ProcessStats> {
 		let mut stats: ProcessStats = ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: 0 };
 		let size: u64 = core::mem::size_of::<ProcessStats>() as u64;
 		let ok: i64 = syscall(SYS_PROCESS_STATS_GET, handle, &mut stats as *mut ProcessStats as u64, size, 0) as i64;
-		if ok == 1 { Some(stats) } else { None }
+		if ok == 1 {
+			Some(stats)
+		} else {
+			None
+		}
 	}
 }
 
@@ -1182,7 +1240,11 @@ pub unsafe fn domain_stats(handle: u64) -> Option<DomainStats> {
 		let mut stats: DomainStats = DomainStats::default();
 		let size: u64 = core::mem::size_of::<DomainStats>() as u64;
 		let ok: i64 = syscall(SYS_DOMAIN_STATS_GET, handle, &mut stats as *mut DomainStats as u64, size, 0) as i64;
-		if ok == 1 { Some(stats) } else { None }
+		if ok == 1 {
+			Some(stats)
+		} else {
+			None
+		}
 	}
 }
 
