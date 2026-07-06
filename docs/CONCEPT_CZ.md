@@ -1405,7 +1405,7 @@ WASI host:                runtime proces, který mapuje WASI importy
 
 - **WASI „world" = sada capabilit**, kterou komponenta dostane při startu (filesystem handle z file pickeru, socket od NetworkService, …).
 - **WASI importy implementují naše služby.** Např. `wasi:filesystem` voláme přes Channel na StorageService, `wasi:sockets` na NetworkService.
-- **Výkon:** komponenty lze interpretovat/JIT (Wasmtime/Cranelift) pro přenositelnost, nebo **AOT zkompilovat při instalaci** pro rychlost.
+- **Výkon:** komponenty lze interpretovat/JIT (Wasmtime/Cranelift) pro přenositelnost, nebo **AOT zkompilovat při instalaci** pro rychlost. Rozhodnuto (fáze 2): aktuálním enginem je vlastní minimální interpretr za Host rozhraním (malý, auditovatelný, bez závislostí); volba AOT/JIT se dělá až ve fázi 3 vedle balíčků, na základě měření reálné komponenty - interpretr stačí / jednoduchý baseline compiler / převzatý engine (Wasmtime), v tomto pořadí preference. Engine je vyměnitelná implementace za stejným kontraktem (viz *Princip vrstvení*).
 
 #### WASI jako jeden z hostů nad stabilním nativním ABI
 

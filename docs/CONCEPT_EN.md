@@ -1405,7 +1405,7 @@ WASI host:                a runtime process that maps WASI imports
 
 - **A WASI "world" = a set of capabilities** that a component gets at startup (a filesystem handle from the file picker, a socket from NetworkService, …).
 - **WASI imports are implemented by our services.** E.g. `wasi:filesystem` we call over a Channel to StorageService, `wasi:sockets` to NetworkService.
-- **Performance:** components can be interpreted/JITed (Wasmtime/Cranelift) for portability, or **AOT-compiled at install time** for speed.
+- **Performance:** components can be interpreted/JITed (Wasmtime/Cranelift) for portability, or **AOT-compiled at install time** for speed. Decided (phase 2): the current engine is our own minimal interpreter behind the Host seam (small, auditable, dependency-free); the AOT/JIT choice is made in phase 3 next to packaging, based on a measurement of a real component - the interpreter suffices / a simple baseline compiler / an adopted engine (Wasmtime), in that order of preference. The engine is a replaceable implementation behind the same contract (see the *layering principle*).
 
 #### WASI as one of several hosts on top of a stable native ABI
 
