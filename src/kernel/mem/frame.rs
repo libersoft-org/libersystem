@@ -26,8 +26,7 @@
 
 #![allow(dead_code)]
 
-use limine::memory_map::EntryType;
-use limine::response::MemoryMapResponse;
+use bootproto::MemRegion;
 
 use alloc::vec::Vec;
 
@@ -207,17 +206,17 @@ impl FrameAllocator {
 
 static ALLOCATOR: SpinLock<FrameAllocator> = SpinLock::new(FrameAllocator::new());
 
-// Populate the run table from the usable regions of the Limine memory map.
+// Populate the run table from the usable regions of the loader's memory map.
 // Physical frame 0 is never handed out (0 doubles as "no frame" in several
 // interfaces), so a region starting there is trimmed by one page.
-pub fn init(memory_map: &MemoryMapResponse) {
+pub fn init(regions: &[MemRegion]) {
 	let mut allocator = ALLOCATOR.lock();
-	for entry in memory_map.entries() {
-		if entry.entry_type != EntryType::USABLE {
+	for region in regions {
+		if region.kind != bootproto::MEM_USABLE {
 			continue;
 		}
-		let mut base = align_up(entry.base, PAGE_SIZE);
-		let end = entry.base + entry.length;
+		let mut base = align_up(region.base, PAGE_SIZE);
+		let end = region.base + region.length;
 		if base == 0 {
 			base = PAGE_SIZE;
 		}

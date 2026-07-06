@@ -1,4 +1,4 @@
-/* Linker script x86_64 (Limine, higher-half) */
+/* Linker script x86_64 (own UEFI loader, higher-half, static/non-PIE) */
 
 OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(kmain)
@@ -8,7 +8,6 @@ PHDRS
 	text    PT_LOAD;
 	rodata  PT_LOAD;
 	data    PT_LOAD;
-	dynamic PT_DYNAMIC;
 }
 
 SECTIONS
@@ -26,22 +25,11 @@ SECTIONS
 		*(.rodata .rodata.*)
 	} :rodata
 
-	/* Limine requests must be discoverable via the start/end markers */
-	.limine_requests : {
-		KEEP(*(.limine_requests_start))
-		KEEP(*(.limine_requests))
-		KEEP(*(.limine_requests_end))
-	} :rodata
-
 	. = ALIGN(CONSTANT(MAXPAGESIZE));
 
 	.data : {
 		*(.data .data.*)
 	} :data
-
-	.dynamic : {
-		*(.dynamic)
-	} :data :dynamic
 
 	.bss : {
 		*(.bss .bss.*)

@@ -89,6 +89,12 @@ fn local_apic_id() -> u32 {
 	read(REG_ID) >> 24
 }
 
+// This core's local APIC id, for SMP bring-up (identifying the BSP and, later,
+// targeting each application processor's wake sequence).
+pub fn local_id() -> u32 {
+	local_apic_id()
+}
+
 // Signal end-of-interrupt to the LAPIC. Must be called once per delivered
 // interrupt so further interrupts of equal or lower priority can be delivered.
 pub fn eoi() {
@@ -107,6 +113,35 @@ pub fn send_wake_ipi(dest_lapic: u32) {
 	}
 	write(REG_ICR_HIGH, dest_lapic << 24);
 	write(REG_ICR_LOW, super::interrupts::WAKE_VECTOR as u32);
+}
+
+// Send an INIT IPI to `dest_lapic` (physical destination, assert, edge), the first
+// step of the INIT-SIPI-SIPI application-processor bring-up sequence. Waits out any
+// in-flight send before and after (delivery-status bit 12).
+pub fn send_init(dest_lapic: u32) {
+	while read(REG_ICR_LOW) & (1 << 12) != 0 {
+		core::hint::spin_loop();
+	}
+	write(REG_ICR_HIGH, dest_lapic << 24);
+	// INIT (delivery mode 101), assert, edge, physical destination.
+	write(REG_ICR_LOW, 0x0000_4500);
+	while read(REG_ICR_LOW) & (1 << 12) != 0 {
+		core::hint::spin_loop();
+	}
+}
+
+// Send a STARTUP IPI (SIPI) to `dest_lapic` naming the real-mode trampoline page by
+// `vector` (the page's physical address >> 12), the second/third step of AP bring-up.
+pub fn send_startup(dest_lapic: u32, vector: u8) {
+	while read(REG_ICR_LOW) & (1 << 12) != 0 {
+		core::hint::spin_loop();
+	}
+	write(REG_ICR_HIGH, dest_lapic << 24);
+	// STARTUP (delivery mode 110), assert, edge, physical destination + vector.
+	write(REG_ICR_LOW, 0x0000_4600 | vector as u32);
+	while read(REG_ICR_LOW) & (1 << 12) != 0 {
+		core::hint::spin_loop();
+	}
 }
 
 // Number of timer ticks since the timer started.

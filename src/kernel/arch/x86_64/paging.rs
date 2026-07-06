@@ -194,6 +194,27 @@ pub fn map_page(virt: u64, phys: u64, flags: u64) {
 	map_page_in(active_pml4_phys(), virt, phys, flags);
 }
 
+// Drop the loader's low-half identity map from the active (kernel) page tables.
+// The loader identity-maps all physical memory so its own code keeps executing
+// across the `mov cr3` and the application-processor trampoline can run below
+// 1 MiB after loading these tables; once the APs are up the kernel no longer needs
+// it, and it MUST go before any kernel-context user mapping - a 2 MiB identity page
+// would otherwise shadow a 4 KiB user page mapped at the same low virtual address
+// (the kernel address space wraps these tables, so ring-3 test excursions map user
+// pages right here). Clears every lower-half PML4 entry (the whole user half) and
+// flushes the TLB by reloading CR3. The abandoned lower-level tables are
+// bootloader-reserved memory, never in the usable pool, so nothing leaks.
+pub fn remove_bootstrap_identity() {
+	let cr3 = active_pml4_phys();
+	unsafe {
+		let pml4 = table_ptr(cr3);
+		for i in 0..256 {
+			pml4.add(i).write_volatile(0);
+		}
+		asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+	}
+}
+
 // Map `virt` to `phys` in the address space rooted at `pml4_phys`. The mapping
 // takes effect immediately if that address space is the active one; otherwise it
 // becomes visible when CR3 is loaded with it (which flushes the TLB anyway), so

@@ -7,27 +7,16 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
-name = "bitflags"
-version = "2.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+name = "bootproto"
+version = "0.0.0"
 
 [[package]]
 name = "kernel"
 version = "0.0.0"
 dependencies = [
  "abi",
- "limine",
+ "bootproto",
  "term",
-]
-
-[[package]]
-name = "limine"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af6d2ee42712e7bd2c787365cd1dab06ef59a61becbf87bec7b32b970bd2594b"
-dependencies = [
- "bitflags",
 ]
 
 [[package]]

@@ -14,6 +14,8 @@ proto_dir := "proto"
 wasm_dir := "wasm"
 sdk_dir := "sdk"
 term_dir := "term"
+bootproto_dir := "bootproto"
+loader_dir := "loader"
 liberfs_dir := "fs/liberfs"
 fat_dir := "fs/fat"
 iso9660_dir := "fs/iso9660"
@@ -40,8 +42,10 @@ sdk:
 	cp {{sdk_dir}}/target/wasm32-unknown-unknown/release/liber_component.wasm volume/app.wasm
 
 # build the kernel (its build.rs assembles the init package from the userspace build)
+# and the own UEFI loader (staged into the boot image as BOOTX64.EFI)
 build: sdk user
 	cd {{kernel_dir}} && cargo build
+	cd {{loader_dir}} && cargo build
 
 # generate the proto crate's bindings from the LSIDL interface definitions
 # (src/idl/*.lsidl) and format the generated source
@@ -100,6 +104,8 @@ fmt:
 	cd {{wasm_dir}} && cargo fmt
 	cd {{sdk_dir}} && cargo fmt
 	cd {{term_dir}} && cargo fmt
+	cd {{bootproto_dir}} && cargo fmt
+	cd {{loader_dir}} && cargo fmt
 	cd {{liberfs_dir}} && cargo fmt
 	cd {{fat_dir}} && cargo fmt
 	cd {{iso9660_dir}} && cargo fmt
@@ -121,6 +127,8 @@ fmt-check:
 	cd {{wasm_dir}} && cargo fmt --check
 	cd {{sdk_dir}} && cargo fmt --check
 	cd {{term_dir}} && cargo fmt --check
+	cd {{bootproto_dir}} && cargo fmt --check
+	cd {{loader_dir}} && cargo fmt --check
 	cd {{liberfs_dir}} && cargo fmt --check
 	cd {{fat_dir}} && cargo fmt --check
 	cd {{iso9660_dir}} && cargo fmt --check
@@ -142,6 +150,8 @@ clean:
 	cd {{wasm_dir}} && cargo clean
 	cd {{sdk_dir}} && cargo clean
 	cd {{term_dir}} && cargo clean
+	cd {{bootproto_dir}} && cargo clean
+	cd {{loader_dir}} && cargo clean
 	cd {{liberfs_dir}} && cargo clean
 	cd {{fat_dir}} && cargo clean
 	cd {{iso9660_dir}} && cargo clean

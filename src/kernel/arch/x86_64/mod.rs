@@ -1,3 +1,4 @@
+pub mod apboot;
 pub mod apic;
 pub mod context;
 pub mod gdt;

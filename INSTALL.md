@@ -14,7 +14,7 @@
 
 LiberSystem is built with free, open-source tools. The toolchain currently targets **Linux** (Debian/Ubuntu) and builds a 64-bit (`x86_64`) kernel that boots in QEMU.
 
-The kernel is a Rust `no_std` project. It is compiled with a nightly toolchain and `build-std`, booted with the [Limine](https://github.com/limine-bootloader/limine) bootloader through **UEFI** (QEMU runs with the OVMF firmware; the `ovmf` package is required), and run and tested under QEMU. All commands below are run through [`just`](https://github.com/casey/just) from the `src` directory.
+The kernel is a Rust `no_std` project. It is compiled with a nightly toolchain and `build-std`, booted by the system's own UEFI loader through **UEFI** (QEMU runs with the OVMF firmware; the `ovmf` package is required), and run and tested under QEMU. All commands below are run through [`just`](https://github.com/casey/just) from the `src` directory.
 
 Download the latest version of this software and install required tools.
 
@@ -38,7 +38,6 @@ This will install:
 - system packages: `build-essential`, `git`, `curl`, `xorriso`, `gdisk`, `mtools`, `netpbm`, `imagemagick`, `socat`, `qemu-system-x86`, `qemu-utils`, `ovmf`, `gdb`, `lld`, `llvm`, `clang`
 - `rustup` with the **nightly** toolchain plus the `rust-src` and `llvm-tools-preview` components (required for `build-std` and the kernel build)
 - `just`, the task runner
-- the Limine bootloader (binary branch) into `~/.local/share/limine`
 
 The project pins the nightly toolchain via `rust-toolchain.toml`, so no global toolchain switch is needed.
 
@@ -124,7 +123,7 @@ If a `just run` instance is already up, it attaches to it and snaps the **curren
 
 ## Create bootable images
 
-`just run` builds and boots a throwaway image automatically. To boot LiberSystem on real hardware - or to keep an image around - you can build standalone images explicitly. Both are written to `boot/.build/` and boot the same way under legacy BIOS or UEFI firmware.
+`just run` builds and boots a throwaway image automatically. To boot LiberSystem on real hardware - or to keep an image around - you can build standalone images explicitly. Both are written to `boot/.build/` and boot on any UEFI machine.
 
 ### CD/DVD image (ISO)
 
@@ -132,7 +131,7 @@ If a `just run` instance is already up, it attaches to it and snaps the **curren
 just iso
 ```
 
-Builds a hybrid BIOS+UEFI image at `boot/.build/libersystem.iso`. Burn it to a CD/DVD, or write it straight to a USB stick (the ISO is isohybrid, so it also boots from a flash drive):
+Builds a UEFI-only bootable image at `boot/.build/libersystem.iso`. Burn it to a CD/DVD, or write it straight to a USB stick (the EFI boot image is exposed as a GPT partition, so it also boots from a flash drive):
 
 ```sh
 sudo dd if=boot/.build/libersystem.iso of=/dev/sdX bs=4M conv=fsync status=progress
@@ -145,7 +144,7 @@ just img        # default size 64M
 just img 1G     # custom size (truncate-style suffixes: M, G, ...)
 ```
 
-Builds a raw GPT disk image at `boot/.build/libersystem.img` for a USB stick, SD card or hard disk. It holds a small BIOS boot partition (carrying the Limine BIOS stage) plus an EFI System Partition with the kernel and bootloader, so it boots on both legacy BIOS and UEFI. Write it to a device with:
+Builds a raw GPT disk image at `boot/.build/libersystem.img` for a USB stick, SD card or hard disk. It holds a single EFI System Partition with the own UEFI loader, the kernel and the packages, so it boots on any UEFI machine. Write it to a device with:
 
 ```sh
 sudo dd if=boot/.build/libersystem.img of=/dev/sdX bs=4M conv=fsync status=progress

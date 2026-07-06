@@ -1,6 +1,6 @@
 // Memory subsystem: physical frames, paging helpers, and the kernel heap.
 //
-// `init` is called once early in boot with the Limine memory map and HHDM
+// `init` is called once early in boot with the loader's memory map and HHDM
 // offset. After it returns, `alloc` collections (Box, Vec, ...) are usable.
 
 pub mod frame;
@@ -10,8 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::vec::Vec;
 
-use limine::memory_map::EntryType;
-use limine::response::MemoryMapResponse;
+use bootproto::MemRegion;
 
 use crate::sync::SpinLock;
 
@@ -19,7 +18,7 @@ use crate::sync::SpinLock;
 // physical memory. Published once during init and read-only afterwards.
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
-// The boot memory map, retained past init (Limine's response is one-shot) so the
+// The boot memory map, retained past init (the loader's hand-off is one-shot) so the
 // physical layout stays inspectable at runtime - SYS_MEMMAP_GET reads it for `lsmem`.
 static MEMMAP: SpinLock<Vec<abi::MemmapRegion>> = SpinLock::new(Vec::new());
 
@@ -38,30 +37,19 @@ pub fn memmap_get(index: usize) -> Option<abi::MemmapRegion> {
 }
 
 // Map a bootloader entry type onto the ABI's stable region-kind codes.
-fn region_kind(entry_type: EntryType) -> u32 {
-	match entry_type {
-		EntryType::USABLE => abi::MEMMAP_USABLE,
-		EntryType::RESERVED => abi::MEMMAP_RESERVED,
-		EntryType::ACPI_RECLAIMABLE => abi::MEMMAP_ACPI_RECLAIMABLE,
-		EntryType::ACPI_NVS => abi::MEMMAP_ACPI_NVS,
-		EntryType::BAD_MEMORY => abi::MEMMAP_BAD,
-		EntryType::BOOTLOADER_RECLAIMABLE => abi::MEMMAP_BOOTLOADER,
-		EntryType::EXECUTABLE_AND_MODULES => abi::MEMMAP_KERNEL,
-		EntryType::FRAMEBUFFER => abi::MEMMAP_FRAMEBUFFER,
-		_ => abi::MEMMAP_RESERVED,
-	}
-}
+// The loader already hands the kernel these stable codes (bootproto MEM_* mirror
+// abi MEMMAP_*), so the memory map is retained verbatim - no translation here.
 
-pub fn init(memory_map: &MemoryMapResponse, hhdm: u64) {
+pub fn init(regions: &[MemRegion], hhdm: u64) {
 	HHDM_OFFSET.store(hhdm, Ordering::Relaxed);
-	frame::init(memory_map);
+	frame::init(regions);
 	heap::init();
 	// The heap is up now: the frame allocator's run table moves onto it (so
 	// fragmentation is bounded by memory, not a fixed table), and the memory map
 	// can be retained (Vec) for runtime inspection.
 	frame::upgrade_to_heap();
 	let mut retained = MEMMAP.lock();
-	for entry in memory_map.entries() {
-		retained.push(abi::MemmapRegion { base: entry.base, length: entry.length, kind: region_kind(entry.entry_type), _pad: 0 });
+	for region in regions {
+		retained.push(abi::MemmapRegion { base: region.base, length: region.length, kind: region.kind, _pad: 0 });
 	}
 }

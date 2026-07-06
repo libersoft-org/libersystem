@@ -7,3 +7,6 @@ build-std-features = ["compiler-builtins-mem"]
 
 [target.x86_64-unknown-none]
 runner = "../boot/qemu-run.sh"
+# The own loader applies no relocations, so the kernel is linked static (non-PIE,
+# ET_EXEC): all addresses baked at the higher-half link base the loader maps it at.
+rustflags = ["-C", "relocation-model=static"]

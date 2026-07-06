@@ -28,49 +28,22 @@ mod syscall;
 #[cfg(test)]
 mod tests;
 
-use limine::BaseRevision;
-use limine::request::{FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, MpRequest, RequestsEndMarker, RequestsStartMarker};
+use core::sync::atomic::{AtomicPtr, Ordering};
 
-// Limine boot protocol: request declarations.
-// Base revision tells the bootloader which protocol revision the kernel speaks.
-#[used]
-#[unsafe(link_section = ".limine_requests")]
-static BASE_REVISION: BaseRevision = BaseRevision::new();
+use bootproto::BootInfo;
 
-// HHDM: Limine maps all physical memory at a fixed higher-half offset.
-#[used]
-#[unsafe(link_section = ".limine_requests")]
-static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+// The boot information the loader hands the kernel: the memory map, HHDM offset,
+// framebuffer, loaded packages, and ACPI RSDP. Published once at kmain entry and
+// read-only afterwards, so the boot-time init steps reach it without threading a
+// pointer through every call.
+static BOOT_INFO: AtomicPtr<BootInfo> = AtomicPtr::new(core::ptr::null_mut());
 
-// Physical memory map: usable regions become the frame allocator's free list.
-#[used]
-#[unsafe(link_section = ".limine_requests")]
-static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
-
-// Multiprocessor: ask Limine to start the other cores (parked until we wake them).
-#[used]
-#[unsafe(link_section = ".limine_requests")]
-static MP_REQUEST: MpRequest = MpRequest::new();
-
-// Init package: a Limine module (boot/init.pkg) holding the first userspace
-// programs - SystemManager for now - which the kernel ELF-loads and runs.
-#[used]
-#[unsafe(link_section = ".limine_requests")]
-static MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
-
-// Framebuffer: a linear RGB video mode for the on-screen console (M15).
-#[used]
-#[unsafe(link_section = ".limine_requests")]
-static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
-
-// Start/end markers delimit the request block so Limine can locate it.
-#[used]
-#[unsafe(link_section = ".limine_requests_start")]
-static _REQUESTS_START: RequestsStartMarker = RequestsStartMarker::new();
-
-#[used]
-#[unsafe(link_section = ".limine_requests_end")]
-static _REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
+// The published BootInfo. Only valid after kmain has stored the loader's pointer.
+fn boot_info() -> &'static BootInfo {
+	let ptr = BOOT_INFO.load(Ordering::Acquire);
+	debug_assert!(!ptr.is_null(), "boot info read before it was published");
+	unsafe { &*ptr }
+}
 
 // print macros (architecture-independent, target arch::serial::SerialWriter)
 #[macro_export]
@@ -122,8 +95,12 @@ pub fn _print_byte(byte: u8) {
 
 // kernel entry point (ELF entry, see ENTRY(kmain) in the linker script)
 #[unsafe(no_mangle)]
-unsafe extern "C" fn kmain() -> ! {
+unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	arch::serial::init();
+	BOOT_INFO.store(boot_info_ptr as *mut BootInfo, Ordering::Release);
+	let bi = boot_info();
+	assert!(bi.magic == bootproto::MAGIC, "boot protocol magic mismatch: the loader and kernel disagree");
+	assert!(bi.version == bootproto::VERSION, "boot protocol version mismatch: rebuild the loader and kernel together");
 	serial_println!("{} kernel is starting ...", product::NAME);
 	arch::init();
 	init_memory();
@@ -133,6 +110,10 @@ unsafe extern "C" fn kmain() -> ! {
 	arch::enable_interrupts();
 	arch::init_syscalls();
 	init_smp();
+	// The application processors are up (their trampoline ran below 1 MiB on the
+	// loader's identity map); drop that identity map now, before any kernel-context
+	// user mapping, so a 2 MiB identity page cannot shadow a 4 KiB user page.
+	arch::paging::remove_bootstrap_identity();
 	sched::init();
 	device::init();
 
@@ -145,12 +126,12 @@ unsafe extern "C" fn kmain() -> ! {
 	arch::halt_loop()
 }
 
-// Bring up physical frames, paging and the kernel heap from the Limine
-// responses. Runs before the test/boot split so `alloc` is available in tests.
+// Bring up physical frames, paging and the kernel heap from the loader's boot
+// info. Runs before the test/boot split so `alloc` is available in tests.
 fn init_memory() {
-	let hhdm = HHDM_REQUEST.get_response().expect("Limine: no HHDM response");
-	let memory_map = MEMORY_MAP_REQUEST.get_response().expect("Limine: no memory map response");
-	mem::init(memory_map, hhdm.offset());
+	let bi = boot_info();
+	let regions = unsafe { core::slice::from_raw_parts(bi.memmap as *const bootproto::MemRegion, bi.memmap_len as usize) };
+	mem::init(regions, bi.hhdm_offset);
 }
 
 // Bring up the framebuffer console from the Limine framebuffer response, so the
@@ -159,37 +140,35 @@ fn init_memory() {
 // console is up for both paths; it allocates its grid model (the shared `term`
 // stack), so it must run after init_memory brings up the heap.
 fn init_framebuffer() {
-	let Some(response) = FRAMEBUFFER_REQUEST.get_response() else {
+	let bi = boot_info();
+	if bi.fb_present == 0 {
 		return;
-	};
-	let Some(fb) = response.framebuffers().next() else {
-		return;
-	};
-	console::init(console::FbInfo { addr: fb.addr(), width: fb.width() as usize, height: fb.height() as usize, pitch: fb.pitch() as usize, bytes_per_pixel: fb.bpp() as usize / 8, red_shift: fb.red_mask_shift(), red_size: fb.red_mask_size(), green_shift: fb.green_mask_shift(), green_size: fb.green_mask_size(), blue_shift: fb.blue_mask_shift(), blue_size: fb.blue_mask_size() });
+	}
+	let fb = &bi.framebuffer;
+	console::init(console::FbInfo { addr: fb.addr as *mut u8, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bpp as usize / 8, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size });
 }
 
 // The boot framebuffer's virtual base + geometry, for the framebuffer_map syscall to
-// hand the display to a userspace ConsoleService. Re-queries the Limine response
+// hand the display to a userspace ConsoleService. Reads the loader's boot info
 // (it is 'static), or None if there is no framebuffer (headless / no video mode).
 pub fn framebuffer_geometry() -> Option<(u64, abi::Framebuffer)> {
-	let fb = FRAMEBUFFER_REQUEST.get_response()?.framebuffers().next()?;
-	let geom = abi::Framebuffer { width: fb.width() as u32, height: fb.height() as u32, pitch: fb.pitch() as u32, bytes_per_pixel: (fb.bpp() / 8) as u32, red_shift: fb.red_mask_shift(), red_size: fb.red_mask_size(), green_shift: fb.green_mask_shift(), green_size: fb.green_mask_size(), blue_shift: fb.blue_mask_shift(), blue_size: fb.blue_mask_size(), _pad: [0; 2] };
-	Some((fb.addr() as u64, geom))
+	let bi = boot_info();
+	if bi.fb_present == 0 {
+		return None;
+	}
+	let fb = &bi.framebuffer;
+	let geom = abi::Framebuffer { width: fb.width, height: fb.height, pitch: fb.pitch, bytes_per_pixel: fb.bpp / 8, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] };
+	Some((fb.addr, geom))
 }
 
 // Wake the application processors and wait for every core to report in. Runs
 // before the test/boot split so SMP is up for both paths.
 fn init_smp() {
-	let mp = MP_REQUEST.get_response().expect("Limine: no MP response");
-	smp::init(mp);
+	smp::init(boot_info());
 }
 
 #[cfg(not(test))]
 fn boot_main() {
-	if !BASE_REVISION.is_supported() {
-		serial_println!("ERROR: Limine base revision not supported");
-		return;
-	}
 	serial_println!("arch: {}", arch::NAME);
 	serial_println!("smp: {} of {} cores online", smp::online_count(), smp::cpu_count());
 	serial_println!("memory: {} physical frames free", mem::frame::free_count());
@@ -260,32 +239,29 @@ fn console_shell_loop() {
 	}
 }
 
-// The init package bytes, located among the Limine modules by filename. Returns
-// None if the bootloader passed no module whose path ends in "init.pkg".
-fn init_package_bytes() -> Option<&'static [u8]> {
-	let response = MODULE_REQUEST.get_response()?;
-	for module in response.modules() {
-		if module.path().to_bytes().ends_with(product::INIT_PACKAGE.as_bytes()) {
-			// The module memory is mapped in the HHDM and is 'static for the kernel.
-			let bytes = unsafe { core::slice::from_raw_parts(module.addr(), module.size() as usize) };
-			return Some(bytes);
+// A loaded package's bytes, located among the loader's modules by name. Returns
+// None if the loader passed no module with the given name. The module memory is
+// mapped in the HHDM and is 'static for the kernel.
+fn module_bytes(name: &str) -> Option<&'static [u8]> {
+	let bi = boot_info();
+	let modules = unsafe { core::slice::from_raw_parts(bi.modules as *const bootproto::Module, bi.modules_len as usize) };
+	for m in modules {
+		let end = m.name.iter().position(|&b| b == 0).unwrap_or(m.name.len());
+		if &m.name[..end] == name.as_bytes() {
+			return Some(unsafe { core::slice::from_raw_parts(m.addr as *const u8, m.size as usize) });
 		}
 	}
 	None
 }
 
-// The ramdisk volume package bytes, located among the Limine modules by filename.
-// Returns None if the bootloader passed no module whose path ends in "volume.pkg".
+// The init package bytes (the first userspace programs the kernel ELF-loads).
+fn init_package_bytes() -> Option<&'static [u8]> {
+	module_bytes(product::INIT_PACKAGE)
+}
+
+// The ramdisk volume package bytes.
 fn volume_package_bytes() -> Option<&'static [u8]> {
-	let response = MODULE_REQUEST.get_response()?;
-	for module in response.modules() {
-		if module.path().to_bytes().ends_with(product::VOLUME_PACKAGE.as_bytes()) {
-			// The module memory is mapped in the HHDM and is 'static for the kernel.
-			let bytes = unsafe { core::slice::from_raw_parts(module.addr(), module.size() as usize) };
-			return Some(bytes);
-		}
-	}
-	None
+	module_bytes(product::VOLUME_PACKAGE)
 }
 
 // Load SystemManager from the init package into a new ring-3 process, handing it

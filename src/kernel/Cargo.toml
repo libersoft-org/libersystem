@@ -11,7 +11,9 @@ name = "kernel"
 path = "main.rs"
 
 [dependencies]
-limine = "0.5"
+# The typed boot protocol the own UEFI loader hands the kernel (memory map, HHDM
+# offset, framebuffer, loaded packages, ACPI RSDP).
+bootproto = { path = "../bootproto" }
 # Shared kernel/userspace ABI constants (syscalls, errors, rights, package format).
 abi = { path = "../abi" }
 # The shared terminal stack (grid model + framebuffer renderer): the boot console and
@@ -27,5 +29,20 @@ abi = { path = "../abi" }
 # pass `-C panic=abort` for normal builds while the (ignored) test profile omits
 # it, which builds `core` twice with different hashes and breaks `cargo test`
 # with a duplicate-lang-item error.
+
+# The `compiler-builtins-mem` intrinsics (memcpy/memcmp) move 16-byte spans in a
+# single u128 step. Their build-std debug build turns on core's language-UB
+# precondition checks, and that u128 read asserts a 16-byte alignment the allocator
+# does not promise for an 8-aligned value - so a benign move (e.g. dropping a
+# 16-byte `(Arc, u64)` charge) aborts the kernel with an "invalid opcode", on
+# x86-64 where the unaligned access is in fact fine. Build compiler_builtins
+# without those checks, as a release build would. (Cargo warns the spec "did not
+# match any packages" - a known build-std quirk; -Zbuild-std still applies it, and
+# without it the suite faults, so the override is load-bearing. The kernel's own
+# debug_assert!s stay on. It is a dependency, so this also governs `cargo test`.)
+[profile.dev.package.compiler_builtins]
+debug-assertions = false
+overflow-checks = false
+
 [profile.release]
 lto = true

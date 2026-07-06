@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# qemu-run.sh - cargo runner: builds a bootable ISO (Limine) from the kernel ELF
-# and launches QEMU.
+# qemu-run.sh - cargo runner: builds the own UEFI loader, assembles a UEFI-only
+# bootable ISO from the kernel ELF, and launches QEMU through OVMF.
 #
 # Usage: qemu-run.sh <kernel-elf>
 # Env variables:
@@ -13,6 +13,10 @@ set -euo pipefail
 
 KERNEL="${1:?path to kernel ELF is missing}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# build the own UEFI loader (its EFI binary is staged into the boot image as
+# BOOTX64.EFI); it lives in its own crate with its own UEFI target.
+(cd "$HERE/../loader" && cargo build) >&2
 
 # build the bootable ISO (mkimage.sh prints its path on stdout)
 ISO="$("$HERE/mkimage.sh" iso "$KERNEL")"

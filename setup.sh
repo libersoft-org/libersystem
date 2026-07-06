@@ -36,7 +36,7 @@ APT_PACKAGES=(
 	build-essential # gcc, make, ...
 	git
 	curl
-	xorriso         # ISO creation for Limine
+	xorriso         # ISO creation (UEFI)
 	gdisk           # sgdisk: GPT partitioning for the disk image
 	mtools          # mformat/mcopy: populate the FAT boot partition without root
 	netpbm          # pnmtopng/pnmtojpeg: convert QEMU framebuffer screendumps
@@ -79,23 +79,10 @@ else
 	info "'just' is installed."
 fi
 
-# Limine bootloader (binary branch + host tool)
-LIMINE_DIR="${LIMINE_DIR:-$HOME/.local/share/limine}"
-LIMINE_BRANCH="v11.x-binary"
-if [[ ! -x "$LIMINE_DIR/limine" ]]; then
-	info "Cloning and building Limine ($LIMINE_BRANCH) into $LIMINE_DIR ..."
-	rm -rf "$LIMINE_DIR"
-	git clone https://github.com/limine-bootloader/limine.git --branch="$LIMINE_BRANCH" --depth=1 "$LIMINE_DIR"
-	make -C "$LIMINE_DIR"
-else
-	info "Limine is already built in $LIMINE_DIR."
-fi
-
 echo
 info "${BOLD}Done.${RESET}"
 echo "  - Rust nightly + rust-src + llvm-tools-preview"
 echo "  - QEMU (x86_64), gdb, lld, xorriso, gdisk, mtools, just"
-echo "  - Limine in $LIMINE_DIR (limine binary: $LIMINE_DIR/limine)"
 echo
 echo "Next step: cd src/kernel && cargo build"
 echo "Note: the project selects nightly via rust-toolchain.toml, no global switch needed."
