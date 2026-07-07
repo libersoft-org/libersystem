@@ -104,6 +104,56 @@ __trap_return:
 "#
 );
 
+// EL0 entry / return trampolines.
+//
+// `aarch64_enter_el0(entry, user_sp, arg, spsr)` saves the kernel's callee-saved
+// registers + LR + SP into a resume block, sets SP_EL0 / ELR_EL1 / SPSR_EL1, and
+// `eret`s down to EL0 with x0 = arg. It does not return here; instead, when the
+// EL0 program makes the "exit" syscall, `aarch64_trap` calls `aarch64_exit_el0`,
+// which reloads the resume block and `ret`s - unwinding straight back to the
+// caller of `aarch64_enter_el0` as if it had returned normally.
+global_asm!(
+	r#"
+.section .bss
+.balign 8
+__el0_resume:
+	.skip 112
+
+.section .text, "ax"
+.global aarch64_enter_el0
+aarch64_enter_el0:
+	adrp    x4, __el0_resume
+	add     x4, x4, :lo12:__el0_resume
+	stp     x19, x20, [x4, #0]
+	stp     x21, x22, [x4, #16]
+	stp     x23, x24, [x4, #32]
+	stp     x25, x26, [x4, #48]
+	stp     x27, x28, [x4, #64]
+	stp     x29, x30, [x4, #80]
+	mov     x5, sp
+	str     x5, [x4, #96]
+	msr     sp_el0,   x1
+	msr     elr_el1,  x0
+	msr     spsr_el1, x3
+	mov     x0, x2
+	eret
+
+.global aarch64_exit_el0
+aarch64_exit_el0:
+	adrp    x4, __el0_resume
+	add     x4, x4, :lo12:__el0_resume
+	ldp     x19, x20, [x4, #0]
+	ldp     x21, x22, [x4, #16]
+	ldp     x23, x24, [x4, #32]
+	ldp     x25, x26, [x4, #48]
+	ldp     x27, x28, [x4, #64]
+	ldp     x29, x30, [x4, #80]
+	ldr     x5, [x4, #96]
+	mov     sp, x5
+	ret
+"#
+);
+
 unsafe extern "C" {
 	static __exception_vectors: u8;
 }
@@ -120,7 +170,7 @@ pub fn init_vectors() {
 // and a pointer to the saved register frame. An IRQ is acknowledged, dispatched,
 // and returns (the caller `eret`s); a synchronous fault is decoded and halts.
 #[unsafe(no_mangle)]
-extern "C" fn aarch64_trap(vector: u64, _frame: *mut u64) {
+extern "C" fn aarch64_trap(vector: u64, frame: *mut u64) {
 	// vector index: source = index / 4 (0 cur-EL/SP0, 1 cur-EL/SPx, 2 lower/A64,
 	// 3 lower/A32), kind = index % 4 (0 sync, 1 irq, 2 fiq, 3 serror).
 	if vector % 4 == 1 {
@@ -139,6 +189,18 @@ extern "C" fn aarch64_trap(vector: u64, _frame: *mut u64) {
 		);
 	}
 	let ec = (esr >> 26) & 0x3f; // ESR_EL1.EC - the exception class
+
+	// SVC from AArch64 (EC 0x15): a system call from EL0. Dispatch it against the
+	// saved register frame (x8 = number, x0.. = args, x0 = return); the "exit"
+	// syscall unwinds back to the kernel that entered EL0, anything else `eret`s
+	// back to the user program.
+	if ec == 0x15 {
+		if unsafe { super::syscall::dispatch(frame) } {
+			super::usermode::exit_to_kernel();
+		}
+		return;
+	}
+
 	let source = match vector / 4 {
 		0 => "cur-EL/SP0",
 		1 => "cur-EL/SPx",

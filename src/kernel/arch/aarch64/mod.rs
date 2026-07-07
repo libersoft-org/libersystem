@@ -280,20 +280,68 @@ pub mod syscall {
 	pub unsafe fn invoke(_num: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
 		todo!("aarch64 SVC (M116)")
 	}
+
+	// Dispatch an SVC from EL0 against the saved trap frame (x8 = number, x0.. =
+	// arguments, the result is written back into the x0 slot). Returns `true` for
+	// the "exit" syscall (the caller then unwinds back to the kernel), `false` to
+	// `eret` back to the user program.
+	pub unsafe fn dispatch(frame: *mut u64) -> bool {
+		let num = unsafe { *frame.add(8) }; // x8
+		let a0 = unsafe { *frame.add(0) }; // x0
+		match num {
+			0 => {
+				crate::serial_println!("aarch64: EL0 syscall exit(x0={a0:#x})");
+				return true;
+			}
+			1 => {
+				let r = a0 + 1;
+				crate::serial_println!("aarch64: EL0 syscall demo(x0={a0:#x}) -> {r:#x}");
+				unsafe { *frame.add(0) = r };
+			}
+			n => {
+				crate::serial_println!("aarch64: EL0 syscall {n} unknown");
+				unsafe { *frame.add(0) = u64::MAX };
+			}
+		}
+		false
+	}
 }
 
 // ---------------------------------------------------------------- usermode
 pub mod usermode {
 	pub const FAULT_PROBE_ADDR: u64 = 0x0dea_d000;
 
-	pub unsafe fn enter(_entry: u64, _user_stack: u64, _arg: u64) {
-		todo!("aarch64 EL0 entry (M116)")
+	unsafe extern "C" {
+		fn aarch64_enter_el0(entry: u64, user_sp: u64, arg: u64, spsr: u64);
+		fn aarch64_exit_el0() -> !;
 	}
+
+	// Drop to EL0 at `entry` with SP_EL0 = `user_stack` and x0 = `arg`. SPSR
+	// selects EL0t with DAIF masked (0x3C0) so the demo runs uninterrupted; the
+	// call "returns" here when the user program makes the exit syscall.
+	pub unsafe fn enter(entry: u64, user_stack: u64, arg: u64) {
+		unsafe { aarch64_enter_el0(entry, user_stack, arg, 0x3C0) }
+	}
+
+	// Unwind from an EL0 syscall back to the kernel that called `enter`.
 	pub fn exit_to_kernel() -> ! {
-		todo!("aarch64 EL0 return (M116)")
+		unsafe { aarch64_exit_el0() }
 	}
+
+	// A tiny EL0 program: syscall(1, 0x41) -> 0x42, syscall(1, 0x42) -> 0x43,
+	// then syscall(0) to exit. Encoded AArch64 instructions, little-endian.
 	pub fn program_bytes() -> &'static [u8] {
-		todo!("aarch64 test program bytes (M116)")
+		static PROGRAM: [u32; 8] = [
+			0xD280_0028, // mov x8, #1
+			0xD280_0820, // mov x0, #0x41
+			0xD400_0001, // svc #0
+			0xD280_0028, // mov x8, #1
+			0xD400_0001, // svc #0
+			0xD280_0008, // mov x8, #0
+			0xD400_0001, // svc #0
+			0x1400_0000, // b .
+		];
+		unsafe { core::slice::from_raw_parts(PROGRAM.as_ptr() as *const u8, core::mem::size_of_val(&PROGRAM)) }
 	}
 	pub fn program_fault_bytes() -> &'static [u8] {
 		todo!("aarch64 test program bytes (M116)")

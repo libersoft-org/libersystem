@@ -120,6 +120,26 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	let ok = via_high == pattern && via_phys == pattern;
 	crate::serial_println!("aarch64: map_page {hva:#x} -> {frame:#x} | high={via_high:#x} phys={via_phys:#x} = {}", if ok { "ok" } else { "FAIL" });
 
-	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging OK - halting");
+	// EL0 usermode: map a user code page and stack at 4 GiB+ (clear of the low
+	// 1 GB identity blocks), copy in a tiny program that makes SVC syscalls, and
+	// `eret` down to EL0. The program's "exit" syscall unwinds control back here.
+	let code = paging::alloc_frame().expect("aarch64: no frame for user code");
+	let stack = paging::alloc_frame().expect("aarch64: no frame for user stack");
+	let user_entry: u64 = 0x1_0000_0000; // 4 GiB
+	let user_stack_top: u64 = 0x1_0001_0000;
+	paging::map_page(user_entry, code, paging::PRESENT | paging::USER);
+	paging::map_page(user_stack_top - 0x1000, stack, paging::PRESENT | paging::WRITABLE | paging::USER | paging::NO_EXECUTE);
+	let prog = super::usermode::program_bytes();
+	unsafe {
+		core::ptr::copy_nonoverlapping(prog.as_ptr(), code as *mut u8, prog.len());
+		core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+	}
+	crate::serial_println!("aarch64: entering EL0 usermode at {user_entry:#x}");
+	unsafe {
+		super::usermode::enter(user_entry, user_stack_top, 0);
+	}
+	crate::serial_println!("aarch64: returned from EL0 usermode");
+
+	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + EL0 OK - halting");
 	super::halt_loop()
 }
