@@ -298,20 +298,31 @@ pub mod usermode {
 	pub const FAULT_PROBE_ADDR: u64 = 0x0dea_d000;
 
 	unsafe extern "C" {
-		fn aarch64_enter_el0(entry: u64, user_sp: u64, arg: u64, spsr: u64);
-		fn aarch64_exit_el0() -> !;
+		fn aarch64_enter_el0(entry: u64, user_sp: u64, arg: u64, spsr: u64, resume_slot: *mut u64);
+		fn aarch64_exit_el0(resume_sp: u64) -> !;
 	}
 
-	// Drop to EL0 at `entry` with SP_EL0 = `user_stack` and x0 = `arg`. SPSR
-	// selects EL0t with DAIF masked (0x3C0) so the demo runs uninterrupted; the
-	// call "returns" here when the user program makes the exit syscall.
+	// Drop to EL0 at `entry` with SP_EL0 = `user_stack` and x0 = `arg`. SPSR selects
+	// EL0t with interrupts enabled (0x0) so the user thread is preemptible; the call
+	// "returns" here when the user program makes SYS_USER_EXIT. The resume state is
+	// parked in the calling thread's syscall_rsp slot, so concurrent user threads do
+	// not clobber one another.
 	pub unsafe fn enter(entry: u64, user_stack: u64, arg: u64) {
-		unsafe { aarch64_enter_el0(entry, user_stack, arg, 0x3C0) }
+		let slot = match crate::sched::current_thread() {
+			Some(thread) => thread.syscall_rsp_addr(),
+			None => return,
+		};
+		unsafe { aarch64_enter_el0(entry, user_stack, arg, 0x0, slot) }
+		if let Some(thread) = crate::sched::current_thread() {
+			thread.set_syscall_rsp(0);
+		}
 	}
 
-	// Unwind from an EL0 syscall back to the kernel that called `enter`.
+	// Unwind from an EL0 syscall back to the kernel that called `enter`, using the
+	// current thread's parked resume pointer.
 	pub fn exit_to_kernel() -> ! {
-		unsafe { aarch64_exit_el0() }
+		let resume = crate::sched::current_thread().map_or(0, |thread| thread.syscall_rsp_load());
+		unsafe { aarch64_exit_el0(resume) }
 	}
 
 	// A tiny EL0 program: syscall(1, 0x41) -> 0x42, syscall(1, 0x42) -> 0x43,

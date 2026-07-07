@@ -251,12 +251,10 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	crate::sched::run_until_idle();
 	crate::serial_println!("aarch64: preemptive scheduler - all threads exited");
 
-	// Real userspace: a proper portable Process (its own address space) whose EL0
-	// program calls the REAL kernel syscall table - SYS_DEBUG_WRITE prints its
-	// message, then SYS_USER_EXIT unwinds. This exercises the full path: scheduler
-	// -> switch to the process address space -> eret to EL0 -> SVC -> portable
-	// syscall_dispatch -> user-pointer copy -> back to EL0 -> exit.
-	run_user_process();
+	// Real userspace: two portable Processes whose EL0 programs call the REAL
+	// kernel syscall table (SYS_DEBUG_WRITE) and interleave via SYS_YIELD. Each
+	// thread parks its EL0 resume state in its own slot, so the excursions coexist.
+	run_user_processes();
 
 	// Per-address-space isolation: two independent address spaces map the SAME
 	// virtual address to different physical frames. Switching TTBR0 (write_cr3)
@@ -364,11 +362,13 @@ struct UserCtx {
 	arg: u64,
 }
 
-// Build a portable user Process and run its EL0 program through the real syscall
-// path. The program (assembled below) calls SYS_DEBUG_WRITE to print a message,
-// then SYS_USER_EXIT. User VAs sit at 64 TiB - above the low kernel identity that
-// every address space carries, and below USER_VA_END - so they never collide.
-fn run_user_process() {
+// Build a portable user Process and enqueue its EL0 thread. The program (assembled
+// below) prints `msg` via SYS_DEBUG_WRITE, yields, prints + yields again, then
+// SYS_USER_EXIT - so two such processes interleave through the scheduler, which
+// only works because each thread parks its EL0 resume state in its own slot. Each
+// process has its own address space, so both can use the same 64 TiB user VAs
+// (above the low kernel identity, below USER_VA_END).
+fn spawn_user_process(msg: &[u8]) {
 	use crate::object::address_space::AddressSpace;
 	use crate::object::process::Process;
 
@@ -387,16 +387,27 @@ fn run_user_process() {
 	let stack_va: u64 = 0x0000_4000_0001_0000;
 	let stack_top = stack_va + 0x1000;
 
-	let msg = b"hello from an aarch64 EL0 process via SYS_DEBUG_WRITE\n";
-
-	// MOVZ Xd, #imm  |  x0 already holds the message pointer (the entry argument).
+	// x0 holds the message pointer (the entry argument); keep it in x19 across the
+	// syscalls. MOVZ Xd,#imm and MOV Xd,Xm (ORR Xd,XZR,Xm) build the program.
 	let movz = |rd: u32, imm: u16| -> u32 { 0xD280_0000 | ((imm as u32) << 5) | rd };
+	let mov_reg = |rd: u32, rm: u32| -> u32 { 0xAA00_03E0 | (rm << 16) | rd };
 	const SVC0: u32 = 0xD400_0001;
-	let prog: [u32; 6] = [
-		movz(1, msg.len() as u16),            // x1 = len
-		movz(8, abi::SYS_DEBUG_WRITE as u16), // x8 = SYS_DEBUG_WRITE
+	let len = msg.len() as u16;
+	let prog: [u32; 16] = [
+		mov_reg(19, 0),                       // mov x19, x0  (save msg ptr)
+		mov_reg(0, 19),                       // mov x0, x19
+		movz(1, len),                         // mov x1, #len
+		movz(8, abi::SYS_DEBUG_WRITE as u16), // mov x8, #SYS_DEBUG_WRITE
 		SVC0,
-		movz(8, abi::SYS_USER_EXIT as u16), // x8 = SYS_USER_EXIT
+		movz(8, abi::SYS_YIELD as u16), // mov x8, #SYS_YIELD
+		SVC0,
+		mov_reg(0, 19),
+		movz(1, len),
+		movz(8, abi::SYS_DEBUG_WRITE as u16),
+		SVC0,
+		movz(8, abi::SYS_YIELD as u16),
+		SVC0,
+		movz(8, abi::SYS_USER_EXIT as u16), // mov x8, #SYS_USER_EXIT
 		SVC0,
 		0x1400_0000, // b .
 	];
@@ -416,8 +427,14 @@ fn run_user_process() {
 	process.adopt_frames(alloc::vec![code, stack]);
 	let ctx = alloc::boxed::Box::new(UserCtx { entry: code_va, stack_top, arg: msg_va });
 	crate::sched::thread_create(process, user_trampoline, alloc::boxed::Box::into_raw(ctx) as u64);
+}
 
-	crate::serial_println!("aarch64: userspace - entering EL0 process");
+// Run two concurrent user processes: they interleave via SYS_YIELD, each making
+// real SYS_DEBUG_WRITE syscalls, proving per-thread EL0 excursions coexist.
+fn run_user_processes() {
+	spawn_user_process(b"userspace A: hello via SYS_DEBUG_WRITE\n");
+	spawn_user_process(b"userspace B: hello via SYS_DEBUG_WRITE\n");
+	crate::serial_println!("aarch64: userspace - running 2 EL0 processes");
 	crate::sched::run_until_idle();
-	crate::serial_println!("aarch64: userspace - EL0 process exited");
+	crate::serial_println!("aarch64: userspace - both EL0 processes exited");
 }
