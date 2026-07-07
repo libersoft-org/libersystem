@@ -51,6 +51,11 @@ SECTIONS
 		__boot_stack_top = .;
 	} :data
 
+	/* End of the loaded image, page-aligned: free DRAM for the frame allocator
+	 * (4 kB page-table frames, higher-half maps) starts here. */
+	. = ALIGN(4096);
+	__kernel_end = .;
+
 	/DISCARD/ : {
 		*(.eh_frame*)
 		*(.note .note.*)

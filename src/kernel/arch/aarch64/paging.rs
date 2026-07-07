@@ -7,11 +7,15 @@
 // turned on (MAIR / TCR / TTBR0 / SCTLR.M). Because the map is identity, the PC,
 // the stack, and the UART keep working across the enable.
 //
-// `translate` walks those tables. The full contract (4 kB `map_page` / `unmap` /
-// per-address-space `new_address_space` + TTBR1 higher-half + W^X) fills in as the
-// port routes through the portable memory subsystem; those stay `todo!()` for now.
+// `translate` walks those tables. On top of the boot map this module now also
+// brings up a bump frame allocator (free DRAM above the kernel image), a real
+// 4 kB `map_page` that allocates the intermediate L1/L2/L3 tables, and a TTBR1
+// higher-half root - enough to start routing kernel virtual addresses through
+// the portable memory subsystem. `unmap` / `new_address_space` / W^X fill in as
+// the port matures; those stay `todo!()` for now.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 // Portable page-table permission bits (the flag set the portable callers OR
 // together). The real per-PTE VMSAv8 encoding is applied by `map_page` when it
@@ -136,6 +140,157 @@ pub fn translate(va: u64) -> Option<u64> {
 	None
 }
 
+// ---- frame allocator (bump) -------------------------------------------------
+//
+// Free DRAM starts just above the loaded kernel image (`__kernel_end`, page
+// aligned by the linker) and runs to the top of RAM. Frames are handed out one
+// 4 kB page at a time and zeroed in place - the identity map means the physical
+// address is directly usable as a pointer while caches are off.
+
+unsafe extern "C" {
+	static __kernel_end: u8;
+}
+
+// Top of DRAM on QEMU virt with `-m 512M` (base 0x4000_0000 + 512 MiB).
+const DRAM_BASE: u64 = 0x4000_0000;
+const DRAM_TOP: u64 = DRAM_BASE + 512 * 1024 * 1024;
+
+// Next free physical frame (0 until `init_frame_allocator` runs).
+static FRAME_NEXT: AtomicU64 = AtomicU64::new(0);
+
+// Point the bump allocator at the free DRAM above the kernel image.
+pub fn init_frame_allocator() {
+	let start = ((&raw const __kernel_end as u64) + 0xFFF) & !0xFFF;
+	FRAME_NEXT.store(start, Ordering::Relaxed);
+}
+
+// Allocate one zeroed 4 kB physical frame, or `None` when DRAM is exhausted.
+pub fn alloc_frame() -> Option<u64> {
+	let pa = FRAME_NEXT.fetch_add(4096, Ordering::Relaxed);
+	if pa == 0 || pa + 4096 > DRAM_TOP {
+		return None;
+	}
+	unsafe {
+		core::ptr::write_bytes(pa as *mut u8, 0, 4096);
+	}
+	Some(pa)
+}
+
+// How many 4 kB frames the allocator still has (for bring-up reporting).
+pub fn frames_free() -> u64 {
+	let next = FRAME_NEXT.load(Ordering::Relaxed);
+	if next == 0 || next >= DRAM_TOP { 0 } else { (DRAM_TOP - next) / 4096 }
+}
+
+// ---- TTBR1 higher-half root -------------------------------------------------
+
+// Physical address of the TTBR1 L0 table (0 until `init_higher_half` runs).
+static TTBR1_ROOT: AtomicU64 = AtomicU64::new(0);
+
+// Allocate the TTBR1 top-level table and enable TTBR1 walks (4 kB granule,
+// 48-bit high half, Normal write-back inner-shareable) so higher-half kernel
+// virtual addresses (top bit set) translate through their own tree.
+pub unsafe fn init_higher_half() {
+	let root = alloc_frame().expect("aarch64: no frame for TTBR1 root");
+	TTBR1_ROOT.store(root, Ordering::Relaxed);
+
+	unsafe {
+		let mut tcr: u64;
+		asm!("mrs {}, tcr_el1", out(reg) tcr, options(nomem, nostack, preserves_flags));
+		tcr &= !(0x3f << 16); // clear T1SZ
+		tcr |= 16 << 16; //     T1SZ = 16 (48-bit high half)
+		tcr &= !(1 << 23); //   EPD1 = 0 (enable TTBR1 walks)
+		tcr &= !(3 << 24); //   IRGN1
+		tcr |= 1 << 24; //      IRGN1 = WB WA
+		tcr &= !(3 << 26); //   ORGN1
+		tcr |= 1 << 26; //      ORGN1 = WB WA
+		tcr &= !(3 << 28); //   SH1
+		tcr |= 3 << 28; //      SH1   = inner shareable
+		tcr &= !(3 << 30); //   TG1
+		tcr |= 2 << 30; //      TG1   = 0b10 = 4 kB granule
+		asm!(
+			"msr tcr_el1, {tcr}",
+			"msr ttbr1_el1, {root}",
+			"isb",
+			"tlbi vmalle1",
+			"dsb ish",
+			"isb",
+			tcr = in(reg) tcr,
+			root = in(reg) root,
+			options(nostack, preserves_flags),
+		);
+	}
+}
+
+// ---- 4 kB page mapping ------------------------------------------------------
+
+// Translate the portable permission flags to a VMSAv8-64 stage-1 L3 page leaf.
+fn leaf_bits(flags: u64) -> u64 {
+	// A valid L3 page descriptor: bits[1:0] = 0b11 (VALID | "page"), AF set.
+	let mut bits = VALID | TABLE | AF;
+	if flags & NO_CACHE != 0 {
+		bits |= ATTR_DEVICE;
+	} else {
+		bits |= ATTR_NORMAL | SH_INNER;
+	}
+	// AP[2:1]: bit6 = accessible at EL0, bit7 = read-only.
+	if flags & USER != 0 {
+		bits |= 1 << 6;
+	}
+	if flags & WRITABLE == 0 {
+		bits |= 1 << 7;
+	}
+	// Execute permissions: honour NO_EXECUTE; a user page is never privileged-
+	// executable (PXN) even when it stays user-executable (UXN clear).
+	if flags & NO_EXECUTE != 0 {
+		bits |= PXN | UXN;
+	} else if flags & USER != 0 {
+		bits |= PXN;
+	}
+	bits
+}
+
+// Map one 4 kB page `va -> pa` in the table tree rooted at `root` (a physical L0
+// table address), allocating any missing intermediate tables from the frame
+// allocator, then invalidate the TLB for that VA.
+unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) {
+	let mut table = root as *mut u64;
+	for level in 0..3u64 {
+		let shift = 39 - level * 9; // L0=39, L1=30, L2=21
+		let idx = ((va >> shift) & 0x1ff) as usize;
+		let desc = unsafe { core::ptr::read_volatile(table.add(idx)) };
+		let next = if desc & VALID == 0 {
+			let frame = alloc_frame().expect("aarch64 map_page: out of frames");
+			unsafe { core::ptr::write_volatile(table.add(idx), frame | VALID | TABLE) };
+			frame
+		} else {
+			desc & ADDR_MASK
+		};
+		table = next as *mut u64;
+	}
+	let idx = ((va >> 12) & 0x1ff) as usize;
+	unsafe {
+		core::ptr::write_volatile(table.add(idx), (pa & ADDR_MASK) | leaf_bits(flags));
+		asm!(
+			"dsb ishst",
+			"tlbi vae1, {page}",
+			"dsb ish",
+			"isb",
+			page = in(reg) va >> 12,
+			options(nostack, preserves_flags),
+		);
+	}
+}
+
+// The active TTBR0 (low-half) root physical address.
+fn current_ttbr0() -> u64 {
+	let ttbr0: u64;
+	unsafe {
+		asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags));
+	}
+	ttbr0 & ADDR_MASK
+}
+
 // ---- the rest of the paging contract (fills in as the port matures) ----
 
 pub fn enable_nx() {}
@@ -159,11 +314,18 @@ pub unsafe fn copy_to_user_page(_dst: u64, _bytes: &[u8]) {
 	todo!("aarch64 4 kB map_page (M116)")
 }
 
-pub fn map_page(_virt: u64, _phys: u64, _flags: u64) {
-	todo!("aarch64 4 kB map_page (M116)")
+pub fn map_page(virt: u64, phys: u64, flags: u64) {
+	// A top-bit-set virtual address translates through TTBR1 (higher half); a
+	// low address through the active TTBR0 tree.
+	let root = if virt >> 63 == 1 { TTBR1_ROOT.load(Ordering::Relaxed) } else { current_ttbr0() };
+	unsafe {
+		map_page_root(root, virt, phys, flags);
+	}
 }
-pub fn map_page_in(_ttbr: u64, _virt: u64, _phys: u64, _flags: u64) {
-	todo!("aarch64 4 kB map_page (M116)")
+pub fn map_page_in(ttbr: u64, virt: u64, phys: u64, flags: u64) {
+	unsafe {
+		map_page_root(ttbr & ADDR_MASK, virt, phys, flags);
+	}
 }
 pub fn unmap_page(_virt: u64) -> Option<u64> {
 	todo!("aarch64 4 kB unmap (M116)")

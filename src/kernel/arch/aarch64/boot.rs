@@ -97,6 +97,29 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	}
 	crate::serial_println!("aarch64: timer IRQs delivered - {} ticks", super::gic::ticks() - start);
 
-	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer OK - halting");
+	// Bring up the frame allocator and the TTBR1 higher-half root, then prove the
+	// real 4 kB map_page works: map a fresh frame at a high (top-bit-set) virtual
+	// address, write a pattern through it, and confirm it reads back both via the
+	// high VA (TTBR1 walk + allocated L1/L2/L3 tables) and via the frame's own
+	// identity address (TTBR0).
+	use super::paging;
+	paging::init_frame_allocator();
+	let free_mib = paging::frames_free() * 4 / 1024;
+	crate::serial_println!("aarch64: frame allocator up - {} MB free DRAM", free_mib);
+	unsafe {
+		paging::init_higher_half();
+	}
+	let frame = paging::alloc_frame().expect("aarch64: no frame for map test");
+	let hva: u64 = 0xFFFF_8000_0000_0000;
+	paging::map_page(hva, frame, paging::PRESENT | paging::WRITABLE | paging::NO_EXECUTE);
+	let pattern: u64 = 0xCAFE_BABE_D00D_F00D;
+	let (via_high, via_phys) = unsafe {
+		core::ptr::write_volatile(hva as *mut u64, pattern);
+		(core::ptr::read_volatile(hva as *const u64), core::ptr::read_volatile(frame as *const u64))
+	};
+	let ok = via_high == pattern && via_phys == pattern;
+	crate::serial_println!("aarch64: map_page {hva:#x} -> {frame:#x} | high={via_high:#x} phys={via_phys:#x} = {}", if ok { "ok" } else { "FAIL" });
+
+	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging OK - halting");
 	super::halt_loop()
 }
