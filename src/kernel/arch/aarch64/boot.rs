@@ -161,6 +161,14 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 		crate::serial_println!("aarch64:   {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}:{:02x}", d.bus, d.dev, d.func, d.vendor, d.device_id, d.class, d.subclass);
 	}
 
+	// Resolve each virtio device's modern MMIO layout (assigns its BARs, then walks
+	// its capability list for the common/notify/isr/device config structures).
+	let virtio = super::pci::scan_virtio();
+	crate::serial_println!("aarch64: virtio - {} device(s) resolved", virtio.len());
+	for v in &virtio {
+		crate::serial_println!("aarch64:   {} @ BAR{} phys={:#x} len={:#x} | common+{:#x} notify+{:#x}(x{}) isr+{:#x} device+{:#x}", super::pci::virtio_type_name(v.virtio_type), v.bar, v.bar_phys, v.region_len, v.common.offset, v.notify.offset, v.notify.notify_multiplier, v.isr.offset, v.device.offset);
+	}
+
 	// Per-CPU block for the boot core, reachable through TPIDR_EL1.
 	let mpidr: u64;
 	unsafe {
