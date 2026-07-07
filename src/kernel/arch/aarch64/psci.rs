@@ -109,6 +109,8 @@ fn cpu_on(target_mpidr: u64, entry: u64, context_id: u64) -> i64 {
 extern "C" fn aarch64_secondary_main(cpu_id: u64) -> ! {
 	// Install the shared EL1 exception vectors on this core (VBAR_EL1 resets to 0).
 	super::exceptions::init_vectors();
+	// Enable FP/SIMD on this core (CPACR_EL1 resets with FP trapped).
+	super::enable_fp();
 	let mpidr: u64;
 	unsafe {
 		core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));

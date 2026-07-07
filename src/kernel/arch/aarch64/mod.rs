@@ -57,6 +57,18 @@ pub fn enable_interrupts() {
 	}
 }
 
+// Enable Advanced SIMD / floating-point access at EL0 and EL1 (CPACR_EL1.FPEN =
+// 0b11), so FP/vector instructions - which the compiler emits for bulk memory
+// operations - do not trap (EC 0x7). Called once per core during bring-up.
+pub fn enable_fp() {
+	unsafe {
+		let mut cpacr: u64;
+		core::arch::asm!("mrs {}, cpacr_el1", out(reg) cpacr, options(nomem, nostack, preserves_flags));
+		cpacr |= 3 << 20;
+		core::arch::asm!("msr cpacr_el1, {}", "isb", in(reg) cpacr, options(nostack, preserves_flags));
+	}
+}
+
 pub fn disable_interrupts() {
 	unsafe {
 		core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));

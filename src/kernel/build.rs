@@ -132,8 +132,26 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 }
 
 // The debug-build target path of a userspace ELF: each crate builds to its own target dir.
+// The target triple follows the kernel's target arch, so an aarch64 kernel stages the
+// aarch64 userspace ELFs (and x86_64 the x86_64 ones).
 fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
-	manifest.join(format!("../user/{crate_dir}/target/x86_64-unknown-none/debug/{name}"))
+	manifest.join(format!("../user/{crate_dir}/target/{}/debug/{name}", user_target()))
+}
+
+// The userspace target triple matching the kernel's target arch.
+fn user_target() -> &'static str {
+	match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+		Ok("aarch64") => "aarch64-unknown-none",
+		_ => "x86_64-unknown-none",
+	}
+}
+
+// Where the assembled packages are written. On aarch64 there is no bootloader
+// module hand-off (the kernel is booted directly via `-kernel`), so the packages
+// go to OUT_DIR and are embedded into the kernel image; on x86_64 they go to
+// boot/.build for mkimage.sh to place as Limine modules.
+fn package_out_dir(manifest: &Path) -> PathBuf {
+	if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") { PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set")) } else { manifest.join("../boot/.build") }
 }
 
 // Read a userspace ELF and strip its symbol and debug sections, returning the smaller
@@ -175,7 +193,7 @@ fn read_stripped(path: &Path) -> Option<Vec<u8>> {
 fn assemble_init_package(conf: &[(String, String)]) {
 	let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
 	let manifest: PathBuf = PathBuf::from(&manifest_dir);
-	let out_dir: PathBuf = manifest.join("../boot/.build");
+	let out_dir: PathBuf = package_out_dir(&manifest);
 	let out_pkg: PathBuf = out_dir.join(conf_get(conf, "INIT_PACKAGE"));
 
 	// (package entry name, ELF path). The init package holds only the pinned bootstrap set
@@ -218,7 +236,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
 	let manifest: PathBuf = PathBuf::from(&manifest_dir);
 	let vol_dir: PathBuf = manifest.join("../volume");
-	let out_dir: PathBuf = manifest.join("../boot/.build");
+	let out_dir: PathBuf = package_out_dir(&manifest);
 	let out_pkg: PathBuf = out_dir.join(conf_get(conf, "VOLUME_PACKAGE"));
 
 	println!("cargo:rerun-if-changed={}", vol_dir.display());

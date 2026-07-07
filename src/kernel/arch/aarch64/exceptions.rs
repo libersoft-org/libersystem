@@ -16,18 +16,51 @@
 
 use core::arch::{asm, global_asm};
 
-// The vector table plus the trap entry/exit. Every entry saves a full register
-// frame, records its vector index, and calls `aarch64_trap`; an IRQ returns and
-// the shared `__trap_return` restores the frame and `eret`s back to the
-// interrupted code, while a fault halts inside the handler.
+// The vector table plus the trap entry/exit. Each 128-byte vector slot does the
+// minimum (reserve the frame, save a scratch pair, record its index) and branches
+// to the common trampoline, which finishes the full save - x0..x30 + ELR_EL1 +
+// SPSR_EL1 + the FP/SIMD state (V0..V31 + FPSR/FPCR) - and calls `aarch64_trap`.
+// FP is saved on every trap because the kernel itself uses FP/SIMD (bulk memory
+// ops), so an EL0 excursion or preemption must not clobber the interrupted
+// context's vector registers. An IRQ returns and `__trap_return` restores the
+// frame and `eret`s; a fault halts inside the handler. The heavy save lives in the
+// shared trampoline, not each slot, because the full save does not fit in 128 bytes.
 global_asm!(
 	r#"
 .section .text.vectors, "ax"
 
-// Save x0..x30 + ELR_EL1 + SPSR_EL1 into a 272-byte frame on the stack.
-.macro KERNEL_ENTRY
-	sub     sp, sp, #272
-	stp     x0,  x1,  [sp, #0]
+.balign 2048
+.global __exception_vectors
+__exception_vectors:
+
+.macro VEC id
+.balign 128
+	sub     sp, sp, #800
+	stp     x0, x1, [sp, #0]
+	mov     x0, #\id
+	b       __trap_common
+.endm
+
+	VEC 0   // Current EL with SP0:  Synchronous / IRQ / FIQ / SError
+	VEC 1
+	VEC 2
+	VEC 3
+	VEC 4   // Current EL with SPx  (the kernel runs here after boot)
+	VEC 5
+	VEC 6
+	VEC 7
+	VEC 8   // Lower EL, AArch64    (userspace)
+	VEC 9
+	VEC 10
+	VEC 11
+	VEC 12  // Lower EL, AArch32
+	VEC 13
+	VEC 14
+	VEC 15
+
+// Finish saving the frame (x0/x1 are already saved by the slot; x0 holds the
+// vector index), then dispatch with x0 = index and x1 = frame pointer.
+__trap_common:
 	stp     x2,  x3,  [sp, #16]
 	stp     x4,  x5,  [sp, #32]
 	stp     x6,  x7,  [sp, #48]
@@ -42,44 +75,54 @@ global_asm!(
 	stp     x24, x25, [sp, #192]
 	stp     x26, x27, [sp, #208]
 	stp     x28, x29, [sp, #224]
-	mrs     x0,  elr_el1
-	mrs     x1,  spsr_el1
-	stp     x30, x0,  [sp, #240]
-	str     x1,  [sp, #256]
-.endm
-
-.balign 2048
-.global __exception_vectors
-__exception_vectors:
-
-.macro VEC id
-.balign 128
-	KERNEL_ENTRY
-	mov     x0, #\id       // vector index
-	mov     x1, sp         // frame pointer
+	mrs     x2,  elr_el1
+	mrs     x3,  spsr_el1
+	stp     x30, x2,  [sp, #240]
+	str     x3,  [sp, #256]
+	mrs     x2,  fpsr
+	mrs     x3,  fpcr
+	stp     x2,  x3,  [sp, #272]
+	stp     q0,  q1,  [sp, #288]
+	stp     q2,  q3,  [sp, #320]
+	stp     q4,  q5,  [sp, #352]
+	stp     q6,  q7,  [sp, #384]
+	stp     q8,  q9,  [sp, #416]
+	stp     q10, q11, [sp, #448]
+	stp     q12, q13, [sp, #480]
+	stp     q14, q15, [sp, #512]
+	stp     q16, q17, [sp, #544]
+	stp     q18, q19, [sp, #576]
+	stp     q20, q21, [sp, #608]
+	stp     q22, q23, [sp, #640]
+	stp     q24, q25, [sp, #672]
+	stp     q26, q27, [sp, #704]
+	stp     q28, q29, [sp, #736]
+	stp     q30, q31, [sp, #768]
+	mov     x1, sp
 	bl      aarch64_trap
 	b       __trap_return
-.endm
-
-	VEC 0   // Current EL with SP0:  Synchronous / IRQ / FIQ / SError
-	VEC 1
-	VEC 2
-	VEC 3
-	VEC 4   // Current EL with SPx  (the kernel runs here after boot)
-	VEC 5
-	VEC 6
-	VEC 7
-	VEC 8   // Lower EL, AArch64    (userspace, once it exists)
-	VEC 9
-	VEC 10
-	VEC 11
-	VEC 12  // Lower EL, AArch32
-	VEC 13
-	VEC 14
-	VEC 15
 
 // Restore the frame and return to the interrupted context.
 __trap_return:
+	ldp     x0,  x1,  [sp, #272]
+	msr     fpsr, x0
+	msr     fpcr, x1
+	ldp     q0,  q1,  [sp, #288]
+	ldp     q2,  q3,  [sp, #320]
+	ldp     q4,  q5,  [sp, #352]
+	ldp     q6,  q7,  [sp, #384]
+	ldp     q8,  q9,  [sp, #416]
+	ldp     q10, q11, [sp, #448]
+	ldp     q12, q13, [sp, #480]
+	ldp     q14, q15, [sp, #512]
+	ldp     q16, q17, [sp, #544]
+	ldp     q18, q19, [sp, #576]
+	ldp     q20, q21, [sp, #608]
+	ldp     q22, q23, [sp, #640]
+	ldp     q24, q25, [sp, #672]
+	ldp     q26, q27, [sp, #704]
+	ldp     q28, q29, [sp, #736]
+	ldp     q30, q31, [sp, #768]
 	ldr     x1,  [sp, #256]
 	ldp     x30, x0,  [sp, #240]
 	msr     spsr_el1, x1
@@ -99,7 +142,7 @@ __trap_return:
 	ldp     x24, x25, [sp, #192]
 	ldp     x26, x27, [sp, #208]
 	ldp     x28, x29, [sp, #224]
-	add     sp, sp, #272
+	add     sp, sp, #800
 	eret
 "#
 );
@@ -208,9 +251,18 @@ extern "C" fn aarch64_trap(vector: u64, frame: *mut u64) {
 	};
 	crate::serial_println!("aarch64 EXCEPTION [{source} {kind}] EC={ec:#x} ESR={esr:#x} FAR={far:#x} ELR={elr:#x}");
 
-	// Fault split (fills in with EL0 userspace): a lower-EL fault (vector 8..11)
-	// would terminate only the faulting process; a current-EL (kernel) fault
-	// halts. No userspace yet, so everything halts.
+	// A lower-EL (userspace) fault terminates only the faulting process: the kernel
+	// records the fault, tears the process down, notifies the supervisor, and
+	// unwinds to the kernel thread that entered EL0. A current-EL (kernel) fault is
+	// a kernel bug and halts.
+	if vector / 4 == 2 {
+		let kind = match ec {
+			0x20 | 0x21 | 0x24 | 0x25 => crate::fault::FAULT_PAGE, // instruction / data abort
+			_ => crate::fault::FAULT_GENERAL_PROTECTION,
+		};
+		crate::fault::terminate_user(crate::fault::FaultInfo { kind, error_code: esr, address: far, instruction_pointer: elr });
+	}
+
 	crate::serial_println!("aarch64: unhandled exception - halting");
 	super::halt_loop()
 }

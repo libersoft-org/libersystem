@@ -116,9 +116,20 @@ _start:
 // (empty when the userspace was not built first, e.g. a bare `cargo build`).
 const ECHO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_demo.elf"));
 
+// The init and volume packages, assembled from the aarch64 userspace by build.rs
+// and embedded here (aarch64 has no bootloader module hand-off). Empty when the
+// userspace was not staged first (a bare `cargo build`).
+const INIT_PKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.pkg"));
+const VOLUME_PKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/volume.pkg"));
+
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_main(dtb: u64) -> ! {
 	super::serial::init();
+
+	// Enable Advanced SIMD / floating-point at EL0 and EL1 (CPACR_EL1.FPEN = 0b11)
+	// so the kernel and userspace may use FP/vector instructions - the compiler
+	// emits them for bulk memory operations - without trapping (EC 0x7).
+	super::enable_fp();
 
 	// Current exception level (CurrentEL bits [3:2]).
 	let current_el: u64;
@@ -356,6 +367,12 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	// expects). This exercises the whole real userspace path: the rt ABI handshake
 	// (SYS_ABI_CHECK over svc), the rt syscall wrapper, and the program's own logic.
 	run_echo_program();
+
+	// The real system: spawn SystemManager from the embedded init package (the same
+	// path the x86 kernel uses - pkg::Package + loader::spawn_elf_process) and let it
+	// bring up the userspace service tree as far as it goes, draining its boot-chain
+	// reports. A no-op when the packages were not staged.
+	run_system_manager();
 
 	// Per-address-space isolation: two independent address spaces map the SAME
 	// virtual address to different physical frames. Switching TTBR0 (write_cr3)
@@ -698,6 +715,43 @@ fn run_echo_program() {
 	crate::serial_println!("aarch64: echo - running the real echo tool (entry {entry:#x})");
 	crate::sched::run_until_idle();
 	crate::serial_println!("aarch64: echo - tool exited");
+}
+
+// Spawn the real SystemManager from the embedded init package and drive the
+// userspace boot chain as far as it runs, draining its reports. This is the same
+// mechanism the x86 kernel uses (pkg::Package + loader::spawn_elf_process + the
+// PACKAGE/RAMDISK/MODE bootstrap protocol); the kernel builds a BootInfo pointing
+// at the embedded packages so crate::spawn_system_manager finds them. A userspace
+// fault is isolated (the process is terminated), so the kernel always returns here.
+fn run_system_manager() {
+	if INIT_PKG.is_empty() || VOLUME_PKG.is_empty() {
+		return;
+	}
+
+	// A boot-info module descriptor for an embedded package (its kernel .rodata
+	// address is directly readable, so no HHDM translation is needed).
+	fn module(name: &[u8], bytes: &[u8]) -> bootproto::Module {
+		let mut nm = [0u8; 32];
+		nm[..name.len()].copy_from_slice(name);
+		bootproto::Module { addr: bytes.as_ptr() as u64, size: bytes.len() as u64, name: nm }
+	}
+	let modules: &'static mut [bootproto::Module; 2] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", INIT_PKG), module(b"volume.pkg", VOLUME_PKG)]));
+	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer: bootproto::Framebuffer { addr: 0, width: 0, height: 0, pitch: 0, bpp: 0, red_shift: 0, red_size: 0, green_shift: 0, green_size: 0, blue_shift: 0, blue_size: 0, _pad: [0; 2] }, fb_present: 0, _pad1: 0, rsdp: 0, smp_trampoline: 0 }));
+	crate::publish_boot_info(bi);
+
+	match crate::spawn_system_manager() {
+		Ok((ep, koid)) => {
+			crate::serial_println!("aarch64: system - SystemManager spawned (koid {koid}), bringing up userspace");
+			crate::sched::run_until_idle();
+			while let Ok(msg) = ep.recv() {
+				crate::serial_println!("aarch64: userspace: {}", core::str::from_utf8(&msg.bytes).unwrap_or("<bad>"));
+			}
+			crate::serial_println!("aarch64: system - userspace boot chain settled");
+		}
+		Err(reason) => {
+			crate::serial_println!("aarch64: system - SystemManager failed to start: {reason}");
+		}
+	}
 }
 
 // A single user process that exercises capability IPC entirely from EL0: it

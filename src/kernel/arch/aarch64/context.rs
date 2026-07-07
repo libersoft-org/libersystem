@@ -22,13 +22,19 @@ global_asm!(
 .text
 .global switch_context
 switch_context:
-	// Save the callee-saved registers (x19..x28, x29 fp, x30 lr) - 96 bytes.
-	stp     x19, x20, [sp, #-96]!
+	// Save the callee-saved registers: x19..x28, x29 fp, x30 lr, and the
+	// callee-saved FP registers d8..d15 (the kernel is built with FP, so these must
+	// be preserved across a switch) - 160 bytes.
+	stp     x19, x20, [sp, #-160]!
 	stp     x21, x22, [sp, #16]
 	stp     x23, x24, [sp, #32]
 	stp     x25, x26, [sp, #48]
 	stp     x27, x28, [sp, #64]
 	stp     x29, x30, [sp, #80]
+	stp     d8,  d9,  [sp, #96]
+	stp     d10, d11, [sp, #112]
+	stp     d12, d13, [sp, #128]
+	stp     d14, d15, [sp, #144]
 	mov     x2, sp
 	str     x2, [x0]        // *old_sp = sp
 	mov     sp, x1          // load the incoming stack pointer
@@ -38,7 +44,11 @@ switch_context:
 	ldp     x25, x26, [sp, #48]
 	ldp     x27, x28, [sp, #64]
 	ldp     x29, x30, [sp, #80]
-	add     sp, sp, #96
+	ldp     d8,  d9,  [sp, #96]
+	ldp     d10, d11, [sp, #112]
+	ldp     d12, d13, [sp, #128]
+	ldp     d14, d15, [sp, #144]
+	add     sp, sp, #160
 	ret                     // return into the resumed thread (x30)
 
 .global thread_trampoline
@@ -71,7 +81,7 @@ pub fn init_thread_stack(stack: &mut [u8], entry: extern "C" fn(u64), arg: u64) 
 	let base = stack.as_mut_ptr() as u64;
 	// 16-byte align the top so the trampoline runs with ABI-correct alignment.
 	let top = (base + stack.len() as u64) & !0xf;
-	let sp = top - 96;
+	let sp = top - 160;
 	let trampoline: unsafe extern "C" fn() = thread_trampoline;
 	unsafe {
 		let frame = sp as *mut u64;
@@ -87,6 +97,14 @@ pub fn init_thread_stack(stack: &mut [u8], entry: extern "C" fn(u64), arg: u64) 
 		frame.add(9).write(0); // x28
 		frame.add(10).write(0); // x29 (fp)
 		frame.add(11).write(trampoline as usize as u64); // x30 (return address)
+		frame.add(12).write(0); // d8
+		frame.add(13).write(0); // d9
+		frame.add(14).write(0); // d10
+		frame.add(15).write(0); // d11
+		frame.add(16).write(0); // d12
+		frame.add(17).write(0); // d13
+		frame.add(18).write(0); // d14
+		frame.add(19).write(0); // d15
 	}
 	sp
 }

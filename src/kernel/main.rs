@@ -45,6 +45,14 @@ fn boot_info() -> &'static BootInfo {
 	unsafe { &*ptr }
 }
 
+// Publish a kernel-constructed BootInfo. aarch64 boots directly (no bootloader
+// hand-off), so it builds its own BootInfo from its boot state and the embedded
+// packages and publishes it here before driving the userspace boot chain.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn publish_boot_info(bi: &'static BootInfo) {
+	BOOT_INFO.store(bi as *const BootInfo as *mut BootInfo, Ordering::Release);
+}
+
 // print macros (architecture-independent, target arch::serial::SerialWriter)
 #[macro_export]
 macro_rules! serial_print {
