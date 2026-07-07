@@ -112,18 +112,31 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 		}
 	};
 
-	// Bring up the frame allocator and the TTBR1 higher-half root, then prove the
-	// real 4 kB map_page works: map a fresh frame at a high (top-bit-set) virtual
-	// address, write a pattern through it, and confirm it reads back both via the
-	// high VA (TTBR1 walk + allocated L1/L2/L3 tables) and via the frame's own
-	// identity address (TTBR0).
+	// Seed the portable frame allocator from the device-tree memory map, bring up
+	// the TTBR1 higher-half root, then bring up the kernel heap in the higher half.
+	// After this, `alloc` collections (Box, Vec, ...) are usable.
 	use super::paging;
-	paging::init_frame_allocator(ram_top);
-	let free_mib = paging::frames_free() * 4 / 1024;
-	crate::serial_println!("aarch64: frame allocator up - {} MB free DRAM", free_mib);
+	let (region_base, region_len) = paging::usable_region(ram_top);
+	let regions = [bootproto::MemRegion { base: region_base, length: region_len, kind: bootproto::MEM_USABLE, _pad: 0 }];
+	crate::mem::frame::init(&regions);
+	crate::serial_println!("aarch64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
 	unsafe {
 		paging::init_higher_half();
 	}
+	crate::mem::heap::init();
+	crate::mem::frame::upgrade_to_heap();
+	{
+		let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+		for i in 0..8 {
+			v.push(i * i);
+		}
+		let (mapped, free) = crate::mem::heap::stats();
+		crate::serial_println!("aarch64: heap up - Vec sum={} | {} kB mapped, {} kB free", v.iter().sum::<u64>(), mapped / 1024, free / 1024);
+	}
+
+	// Prove the real 4 kB map_page works: map a fresh frame at a high (top-bit-set)
+	// virtual address, write a pattern through it, and confirm it reads back both
+	// via the high VA (TTBR1 walk) and via the frame's own identity address.
 	let frame = paging::alloc_frame().expect("aarch64: no frame for map test");
 	let hva: u64 = 0xFFFF_8000_0000_0000;
 	paging::map_page(hva, frame, paging::PRESENT | paging::WRITABLE | paging::NO_EXECUTE);
@@ -217,7 +230,7 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	paging::free_address_space(as2);
 	crate::serial_println!("aarch64: address spaces torn down");
 
-	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + percpu + SMP + threads + EL0 + addrspace OK - halting");
+	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + heap + percpu + SMP + threads + EL0 + addrspace OK - halting");
 	super::halt_loop()
 }
 

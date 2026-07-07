@@ -142,78 +142,48 @@ pub fn translate(va: u64) -> Option<u64> {
 
 // ---- frame allocator (bump) -------------------------------------------------
 //
-// Free DRAM starts just above the loaded kernel image (`__kernel_end`, page
-// aligned by the linker) and runs to the top of RAM. Frames are handed out one
-// 4 kB page at a time and zeroed in place - the identity map means the physical
-// address is directly usable as a pointer while caches are off.
+// Physical frames come from the portable frame allocator (`crate::mem::frame`),
+// seeded at boot from the device-tree memory map - the same allocator the x86
+// port uses. The kernel's low identity map means a physical address is directly
+// usable as a pointer (HHDM offset 0), so page tables are written through their
+// physical address and freshly allocated frames are zeroed in place.
 
 unsafe extern "C" {
 	static __kernel_end: u8;
 }
 
-// Base of DRAM on QEMU virt, and a fallback top for `-m 512M` when no device
-// tree is available. `init_frame_allocator` overrides the top from the DTB.
+// Base of DRAM on QEMU virt, and a fallback top for `-m 512M` when no device tree
+// is available.
 const DRAM_BASE: u64 = 0x4000_0000;
 const DRAM_TOP_FALLBACK: u64 = DRAM_BASE + 512 * 1024 * 1024;
 
-// Next free physical frame (0 until `init_frame_allocator` runs) and the top of
-// usable DRAM (from the device tree, or the fallback).
-static FRAME_NEXT: AtomicU64 = AtomicU64::new(0);
-static RAM_TOP: AtomicU64 = AtomicU64::new(DRAM_TOP_FALLBACK);
-// Head of the freed-frame list (0 = empty); each freed frame stores the next
-// head in its first 8 bytes.
-static FRAME_FREELIST: AtomicU64 = AtomicU64::new(0);
-
-// Point the bump allocator at the free DRAM above the kernel image, up to
-// `ram_top` (0 = use the built-in fallback).
-pub fn init_frame_allocator(ram_top: u64) {
-	if ram_top > DRAM_BASE {
-		RAM_TOP.store(ram_top, Ordering::Relaxed);
-	}
-	let start = ((&raw const __kernel_end as u64) + 0xFFF) & !0xFFF;
-	FRAME_NEXT.store(start, Ordering::Relaxed);
+// The usable physical range to seed the frame allocator with: free DRAM above the
+// loaded kernel image (`__kernel_end`, page aligned) up to `ram_top` (0 = use the
+// built-in fallback). Returns (base, length) in bytes.
+pub fn usable_region(ram_top: u64) -> (u64, u64) {
+	let base = ((&raw const __kernel_end as u64) + 0xFFF) & !0xFFF;
+	let top = if ram_top > base { ram_top } else { DRAM_TOP_FALLBACK };
+	(base, top.saturating_sub(base))
 }
 
-// Allocate one zeroed 4 kB physical frame, or `None` when DRAM is exhausted.
-// Reused frames come off the free list first, then fresh ones off the bump.
+// Allocate one zeroed 4 kB physical frame from the portable pool, or None when
+// memory is exhausted.
 pub fn alloc_frame() -> Option<u64> {
-	loop {
-		let head = FRAME_FREELIST.load(Ordering::Acquire);
-		if head == 0 {
-			break;
-		}
-		let next = unsafe { core::ptr::read_volatile(head as *const u64) };
-		if FRAME_FREELIST.compare_exchange(head, next, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-			unsafe { core::ptr::write_bytes(head as *mut u8, 0, 4096) };
-			return Some(head);
-		}
-	}
-	let pa = FRAME_NEXT.fetch_add(4096, Ordering::Relaxed);
-	if pa == 0 || pa + 4096 > RAM_TOP.load(Ordering::Relaxed) {
-		return None;
-	}
+	let pa = crate::mem::frame::allocate()?;
 	unsafe {
 		core::ptr::write_bytes(pa as *mut u8, 0, 4096);
 	}
 	Some(pa)
 }
 
-// Return a frame to the free list.
+// Return a frame to the portable pool.
 pub fn dealloc_frame(pa: u64) {
-	loop {
-		let head = FRAME_FREELIST.load(Ordering::Acquire);
-		unsafe { core::ptr::write_volatile(pa as *mut u64, head) };
-		if FRAME_FREELIST.compare_exchange(head, pa, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-			return;
-		}
-	}
+	crate::mem::frame::deallocate(pa);
 }
 
-// How many 4 kB frames the allocator still has (for bring-up reporting).
+// How many 4 kB frames the pool still has (for bring-up reporting).
 pub fn frames_free() -> u64 {
-	let next = FRAME_NEXT.load(Ordering::Relaxed);
-	let top = RAM_TOP.load(Ordering::Relaxed);
-	if next == 0 || next >= top { 0 } else { (top - next) / 4096 }
+	crate::mem::frame::free_count() as u64
 }
 
 // ---- TTBR1 higher-half root -------------------------------------------------
