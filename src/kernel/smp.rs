@@ -111,7 +111,7 @@ pub fn init(boot_info: &BootInfo) {
 		let tramp = (mem::hhdm_offset() + tramp_phys) as *mut u8;
 		let vector = (tramp_phys >> 12) as u8;
 		// The trampoline runs on the shared page tables (our CR3) and calls ap_entry.
-		unsafe { arch::apboot::install(tramp, read_cr3(), ap_entry as *const () as u64) };
+		unsafe { arch::apboot::install(tramp, arch::context::read_cr3(), ap_entry as *const () as u64) };
 
 		let mut online = 1usize; // the BSP
 		for &lapic in &lapics {
@@ -179,13 +179,6 @@ fn udelay(us: u64) {
 	while arch::tsc::now().wrapping_sub(start) < cycles {
 		core::hint::spin_loop();
 	}
-}
-
-// The current CR3 (the shared page tables the loader built), for the AP mailbox.
-fn read_cr3() -> u64 {
-	let cr3: u64;
-	unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)) };
-	cr3
 }
 
 // Allocate one application processor's kernel stack (16-aligned, leaked for the
