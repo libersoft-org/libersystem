@@ -728,6 +728,11 @@ fn run_system_manager() {
 		return;
 	}
 
+	// Populate the kernel device table from the PCI scan, so DeviceManager can
+	// enumerate the virtio devices and spawn their drivers (the same one-time boot
+	// scan the x86 kmain does before starting userspace).
+	crate::device::init();
+
 	// A boot-info module descriptor for an embedded package (its kernel .rodata
 	// address is directly readable, so no HHDM translation is needed).
 	fn module(name: &[u8], bytes: &[u8]) -> bootproto::Module {
@@ -742,9 +747,16 @@ fn run_system_manager() {
 	match crate::spawn_system_manager() {
 		Ok((ep, koid)) => {
 			crate::serial_println!("aarch64: system - SystemManager spawned (koid {koid}), bringing up userspace");
-			crate::sched::run_until_idle();
-			while let Ok(msg) = ep.recv() {
-				crate::serial_println!("aarch64: userspace: {}", core::str::from_utf8(&msg.bytes).unwrap_or("<bad>"));
+			// Drive the boot chain: run the scheduler to quiescence, drain any
+			// reports, then let the timer advance (idle_halt) so periodic / timed
+			// waiters wake and the next service starts. Bounded so the demo always
+			// returns even if the system keeps a periodic housekeeping tick going.
+			for _ in 0..200 {
+				crate::sched::run_until_idle();
+				while let Ok(msg) = ep.recv() {
+					crate::serial_println!("aarch64: userspace: {}", core::str::from_utf8(&msg.bytes).unwrap_or("<bad>"));
+				}
+				super::idle_halt();
 			}
 			crate::serial_println!("aarch64: system - userspace boot chain settled");
 		}

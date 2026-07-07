@@ -35,7 +35,7 @@ __exception_vectors:
 
 .macro VEC id
 .balign 128
-	sub     sp, sp, #800
+	sub     sp, sp, #816
 	stp     x0, x1, [sp, #0]
 	mov     x0, #\id
 	b       __trap_common
@@ -98,12 +98,16 @@ __trap_common:
 	stp     q26, q27, [sp, #704]
 	stp     q28, q29, [sp, #736]
 	stp     q30, q31, [sp, #768]
+	mrs     x2, sp_el0
+	str     x2, [sp, #800]
 	mov     x1, sp
 	bl      aarch64_trap
 	b       __trap_return
 
 // Restore the frame and return to the interrupted context.
 __trap_return:
+	ldr     x2,  [sp, #800]
+	msr     sp_el0, x2
 	ldp     x0,  x1,  [sp, #272]
 	msr     fpsr, x0
 	msr     fpcr, x1
@@ -142,7 +146,7 @@ __trap_return:
 	ldp     x24, x25, [sp, #192]
 	ldp     x26, x27, [sp, #208]
 	ldp     x28, x29, [sp, #224]
-	add     sp, sp, #800
+	add     sp, sp, #816
 	eret
 "#
 );
