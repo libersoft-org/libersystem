@@ -265,6 +265,12 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	// sends a message; the receiver waits, receives, and prints it.
 	run_cross_process_ipc();
 
+	// Capability delegation: the giver process makes a private channel, puts a
+	// secret in it, and TRANSFERS one endpoint to the taker over the control
+	// channel. The taker can only read the secret because it received the
+	// capability - proving handle transfer between isolated processes.
+	run_handle_transfer();
+
 	// Per-address-space isolation: two independent address spaces map the SAME
 	// virtual address to different physical frames. Switching TTBR0 (write_cr3)
 	// changes what that address reads - the kernel keeps running because each
@@ -539,9 +545,9 @@ fn run_ipc_process() {
 
 // Build a user Process running `prog` (its own address space, code+stack at 64 TiB
 // VAs), endowed with `endpoint` as its bootstrap handle (delivered as the entry
-// argument x0). `msg`, if non-empty, is placed at code+0x500 for the program to
-// send. The code page is writable so a receive buffer / handle slots can live in it.
-fn build_ipc_endpoint_process(prog: &[u32], msg: &[u8], endpoint: alloc::sync::Arc<dyn crate::object::KernelObject>) {
+// argument x0). Each `(offset, bytes)` in `data` is written into the (writable)
+// code page, so a program can reference constant strings and use scratch slots.
+fn build_ipc_endpoint_process(prog: &[u32], data: &[(u64, &[u8])], endpoint: alloc::sync::Arc<dyn crate::object::KernelObject>) {
 	use crate::object::address_space::AddressSpace;
 	use crate::object::process::Process;
 	use crate::object::rights::Rights;
@@ -564,8 +570,8 @@ fn build_ipc_endpoint_process(prog: &[u32], msg: &[u8], endpoint: alloc::sync::A
 		for (i, w) in prog.iter().enumerate() {
 			core::ptr::write_volatile(cp.add(i), *w);
 		}
-		if !msg.is_empty() {
-			core::ptr::copy_nonoverlapping(msg.as_ptr(), (code + 0x500) as *mut u8, msg.len());
+		for (off, bytes) in data {
+			core::ptr::copy_nonoverlapping(bytes.as_ptr(), (code + off) as *mut u8, bytes.len());
 		}
 		core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
 	}
@@ -640,8 +646,103 @@ fn run_cross_process_ipc() {
 
 	let (ep0, ep1) = Channel::create();
 	crate::serial_println!("aarch64: xIPC - spawning sender + receiver processes");
-	build_ipc_endpoint_process(&sender, msg, ep0);
+	build_ipc_endpoint_process(&sender, &[(0x500, msg)], ep0);
 	build_ipc_endpoint_process(&receiver, &[], ep1);
 	crate::sched::run_until_idle();
 	crate::serial_println!("aarch64: xIPC - done");
+}
+
+// Capability delegation via handle transfer. The GIVER process: creates a private
+// "gift" channel, sends a secret into it, then sends a notice on the control
+// channel with the gift's other endpoint as a TRANSFERRED capability. The TAKER
+// process: receives the notice + the transferred handle on the control channel,
+// then reads the secret through the received capability and prints it. The taker
+// has no other way to reach the gift channel, so printing the secret proves the
+// capability was delegated across the process boundary.
+fn run_handle_transfer() {
+	use crate::object::channel::Channel;
+
+	let movz = |rd: u32, imm: u16| -> u32 { 0xD280_0000 | ((imm as u32) << 5) | rd };
+	let movz_sh = |rd: u32, imm: u16, hw: u32| -> u32 { 0xD280_0000 | (hw << 21) | ((imm as u32) << 5) | rd };
+	let mov_reg = |rd: u32, rm: u32| -> u32 { 0xAA00_03E0 | (rm << 16) | rd };
+	let add_imm = |rd: u32, rn: u32, imm: u32| -> u32 { 0x9100_0000 | (imm << 10) | (rn << 5) | rd };
+	let ldr = |rt: u32, rn: u32, off: u32| -> u32 { 0xF940_0000 | ((off / 8) << 10) | (rn << 5) | rt };
+	const SVC0: u32 = 0xD400_0001;
+
+	let secret = b"secret via a transferred capability!\n";
+	let notice = b"gift enclosed";
+	let slen = secret.len() as u16;
+	let nlen = notice.len() as u16;
+
+	// GIVER: create gift channel (&g0@0x400,&g1@0x408); send secret on g0; send
+	// notice on the control handle (x19) transferring g1; exit.
+	let giver: [u32; 22] = [
+		mov_reg(19, 0),         // x19 = control handle
+		movz_sh(20, 0x4000, 2), // x20 = code base
+		add_imm(0, 20, 0x400),  // &g0
+		add_imm(1, 20, 0x408),  // &g1
+		movz(2, 0),             // depth
+		movz(8, abi::SYS_CHANNEL_CREATE as u16),
+		SVC0,
+		ldr(0, 20, 0x400),     // g0
+		add_imm(1, 20, 0x500), // secret
+		movz(2, slen),
+		movz(3, 0),
+		movz(8, abi::SYS_CHANNEL_SEND as u16),
+		SVC0,
+		mov_reg(0, 19),        // control handle
+		add_imm(1, 20, 0x550), // notice
+		movz(2, nlen),
+		ldr(3, 20, 0x408), // xfer = g1
+		movz(8, abi::SYS_CHANNEL_SEND as u16),
+		SVC0,
+		movz(8, abi::SYS_USER_EXIT as u16),
+		SVC0,
+		0x1400_0000,
+	];
+
+	// TAKER: wait+recv on control (out_handle@0x700 = the transferred gift); then
+	// wait+recv on the gift handle and print the secret; exit.
+	let taker: [u32; 33] = [
+		mov_reg(19, 0),         // x19 = control handle
+		movz_sh(20, 0x4000, 2), // x20 = code base
+		mov_reg(0, 19),
+		movz(1, 0),
+		movz(2, 0),
+		movz(8, abi::SYS_WAIT as u16),
+		SVC0,
+		mov_reg(0, 19),
+		add_imm(1, 20, 0x600), // notice buf
+		movz(2, 0x100),
+		add_imm(3, 20, 0x700), // &out_handle
+		movz(8, abi::SYS_CHANNEL_RECV as u16),
+		SVC0,
+		ldr(19, 20, 0x700), // x19 = transferred gift handle
+		mov_reg(0, 19),
+		movz(1, 0),
+		movz(2, 0),
+		movz(8, abi::SYS_WAIT as u16),
+		SVC0,
+		mov_reg(0, 19),
+		add_imm(1, 20, 0x680), // secret buf
+		movz(2, 0x100),
+		movz(3, 0),
+		movz(8, abi::SYS_CHANNEL_RECV as u16),
+		SVC0,
+		mov_reg(21, 0), // x21 = length
+		add_imm(0, 20, 0x680),
+		mov_reg(1, 21),
+		movz(8, abi::SYS_DEBUG_WRITE as u16),
+		SVC0,
+		movz(8, abi::SYS_USER_EXIT as u16),
+		SVC0,
+		0x1400_0000,
+	];
+
+	let (ctrl0, ctrl1) = Channel::create();
+	crate::serial_println!("aarch64: hxfer - giver transfers a capability to the taker");
+	build_ipc_endpoint_process(&giver, &[(0x500, secret), (0x550, notice)], ctrl0);
+	build_ipc_endpoint_process(&taker, &[], ctrl1);
+	crate::sched::run_until_idle();
+	crate::serial_println!("aarch64: hxfer - done");
 }
