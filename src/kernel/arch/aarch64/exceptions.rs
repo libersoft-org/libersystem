@@ -16,17 +16,49 @@
 
 use core::arch::{asm, global_asm};
 
+// The vector table plus the trap entry/exit. Every entry saves a full register
+// frame, records its vector index, and calls `aarch64_trap`; an IRQ returns and
+// the shared `__trap_return` restores the frame and `eret`s back to the
+// interrupted code, while a fault halts inside the handler.
 global_asm!(
 	r#"
 .section .text.vectors, "ax"
+
+// Save x0..x30 + ELR_EL1 + SPSR_EL1 into a 272-byte frame on the stack.
+.macro KERNEL_ENTRY
+	sub     sp, sp, #272
+	stp     x0,  x1,  [sp, #0]
+	stp     x2,  x3,  [sp, #16]
+	stp     x4,  x5,  [sp, #32]
+	stp     x6,  x7,  [sp, #48]
+	stp     x8,  x9,  [sp, #64]
+	stp     x10, x11, [sp, #80]
+	stp     x12, x13, [sp, #96]
+	stp     x14, x15, [sp, #112]
+	stp     x16, x17, [sp, #128]
+	stp     x18, x19, [sp, #144]
+	stp     x20, x21, [sp, #160]
+	stp     x22, x23, [sp, #176]
+	stp     x24, x25, [sp, #192]
+	stp     x26, x27, [sp, #208]
+	stp     x28, x29, [sp, #224]
+	mrs     x0,  elr_el1
+	mrs     x1,  spsr_el1
+	stp     x30, x0,  [sp, #240]
+	str     x1,  [sp, #256]
+.endm
+
 .balign 2048
 .global __exception_vectors
 __exception_vectors:
 
 .macro VEC id
 .balign 128
-	mov     x0, #\id
-	b       __exc_common
+	KERNEL_ENTRY
+	mov     x0, #\id       // vector index
+	mov     x1, sp         // frame pointer
+	bl      aarch64_trap
+	b       __trap_return
 .endm
 
 	VEC 0   // Current EL with SP0:  Synchronous / IRQ / FIQ / SError
@@ -46,15 +78,29 @@ __exception_vectors:
 	VEC 14
 	VEC 15
 
-__exc_common:
-	// x0 = vector index (set by the entry). Gather the syndrome and report.
-	mrs     x1, esr_el1
-	mrs     x2, far_el1
-	mrs     x3, elr_el1
-	bl      aarch64_exception
-0:
-	wfe
-	b       0b
+// Restore the frame and return to the interrupted context.
+__trap_return:
+	ldr     x1,  [sp, #256]
+	ldp     x30, x0,  [sp, #240]
+	msr     spsr_el1, x1
+	msr     elr_el1,  x0
+	ldp     x0,  x1,  [sp, #0]
+	ldp     x2,  x3,  [sp, #16]
+	ldp     x4,  x5,  [sp, #32]
+	ldp     x6,  x7,  [sp, #48]
+	ldp     x8,  x9,  [sp, #64]
+	ldp     x10, x11, [sp, #80]
+	ldp     x12, x13, [sp, #96]
+	ldp     x14, x15, [sp, #112]
+	ldp     x16, x17, [sp, #128]
+	ldp     x18, x19, [sp, #144]
+	ldp     x20, x21, [sp, #160]
+	ldp     x22, x23, [sp, #176]
+	ldp     x24, x25, [sp, #192]
+	ldp     x26, x27, [sp, #208]
+	ldp     x28, x29, [sp, #224]
+	add     sp, sp, #272
+	eret
 "#
 );
 
@@ -70,9 +116,28 @@ pub fn init_vectors() {
 	}
 }
 
-// The common exception handler (called from every vector-table entry).
+// The common trap handler, called from every vector entry with the vector index
+// and a pointer to the saved register frame. An IRQ is acknowledged, dispatched,
+// and returns (the caller `eret`s); a synchronous fault is decoded and halts.
 #[unsafe(no_mangle)]
-extern "C" fn aarch64_exception(vector: u64, esr: u64, far: u64, elr: u64) -> ! {
+extern "C" fn aarch64_trap(vector: u64, _frame: *mut u64) {
+	// vector index: source = index / 4 (0 cur-EL/SP0, 1 cur-EL/SPx, 2 lower/A64,
+	// 3 lower/A32), kind = index % 4 (0 sync, 1 irq, 2 fiq, 3 serror).
+	if vector % 4 == 1 {
+		super::gic::handle_irq();
+		return; // -> __trap_return erets back to the interrupted code
+	}
+
+	let (esr, far, elr): (u64, u64, u64);
+	unsafe {
+		asm!(
+			"mrs {0}, esr_el1",
+			"mrs {1}, far_el1",
+			"mrs {2}, elr_el1",
+			out(reg) esr, out(reg) far, out(reg) elr,
+			options(nomem, nostack, preserves_flags),
+		);
+	}
 	let ec = (esr >> 26) & 0x3f; // ESR_EL1.EC - the exception class
 	let source = match vector / 4 {
 		0 => "cur-EL/SP0",
@@ -82,7 +147,6 @@ extern "C" fn aarch64_exception(vector: u64, esr: u64, far: u64, elr: u64) -> ! 
 	};
 	let kind = match vector % 4 {
 		0 => "sync",
-		1 => "irq",
 		2 => "fiq",
 		_ => "serror",
 	};

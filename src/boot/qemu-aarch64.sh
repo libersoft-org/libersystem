@@ -13,7 +13,7 @@ SMP="${SMP:-1}"
 MEM="${MEM:-512M}"
 
 exec qemu-system-aarch64 \
-	-machine virt \
+	-machine virt,gic-version=2 \
 	-cpu cortex-a72 \
 	-smp "$SMP" \
 	-m "$MEM" \

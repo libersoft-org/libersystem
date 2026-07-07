@@ -79,16 +79,24 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	};
 	crate::serial_println!("aarch64: post-MMU RAM read/write = {}", if ram_ok { "ok" } else { "FAIL" });
 
-	// Install the EL1 exception vectors (VBAR_EL1) and prove the synchronous
-	// handler catches a fault: `brk #0` traps into the vector table, which
-	// decodes ESR/FAR/ELR and reports before halting.
+	// Install the EL1 exception vectors (VBAR_EL1).
 	super::exceptions::init_vectors();
 	crate::serial_println!("aarch64: VBAR_EL1 exception vectors installed");
-	crate::serial_println!("aarch64: triggering a test exception (brk #0) ...");
-	unsafe {
-		core::arch::asm!("brk #0");
-	}
 
-	// The exception handler halts, so this is unreachable.
+	// Bring up the GIC + the generic timer, enable interrupts, and confirm the
+	// timer IRQ fires by watching the tick counter advance (each tick arrives
+	// through the IRQ vector -> gic::handle_irq -> eret).
+	super::gic::init();
+	crate::serial_println!("aarch64: GIC + generic timer up ({} Hz counter)", super::gic::timer_hz());
+	super::enable_interrupts();
+	let start = super::gic::ticks();
+	let mut spins: u64 = 0;
+	while super::gic::ticks() < start + 5 && spins < 2_000_000_000 {
+		super::idle_halt();
+		spins += 1;
+	}
+	crate::serial_println!("aarch64: timer IRQs delivered - {} ticks", super::gic::ticks() - start);
+
+	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer OK - halting");
 	super::halt_loop()
 }

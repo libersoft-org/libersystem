@@ -10,6 +10,7 @@
 
 mod boot;
 mod exceptions;
+mod gic;
 pub mod serial;
 
 // halt the kernel forever (wait-for-event)
