@@ -112,7 +112,7 @@ fmt:
 	cd {{fat_dir}} && cargo fmt
 	cd {{iso9660_dir}} && cargo fmt
 	cd {{udf_dir}} && cargo fmt
-	shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
+	shfmt -w ../setup.sh boot/qemu-run.sh boot/qemu-aarch64.sh boot/mkimage.sh boot/screenshot.sh
 
 # check formatting without writing changes (CI-friendly)
 fmt-check:
@@ -136,7 +136,7 @@ fmt-check:
 	cd {{fat_dir}} && cargo fmt --check
 	cd {{iso9660_dir}} && cargo fmt --check
 	cd {{udf_dir}} && cargo fmt --check
-	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh
+	shfmt -d ../setup.sh boot/qemu-run.sh boot/qemu-aarch64.sh boot/mkimage.sh boot/screenshot.sh
 
 # clean build artifacts
 clean:

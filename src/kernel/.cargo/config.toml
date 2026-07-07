@@ -10,3 +10,10 @@ runner = "../boot/qemu-run.sh"
 # The own loader applies no relocations, so the kernel is linked static (non-PIE,
 # ET_EXEC): all addresses baked at the higher-half link base the loader maps it at.
 rustflags = ["-C", "relocation-model=static"]
+
+# aarch64 direct-boot bring-up (M116): QEMU `-machine virt -kernel` loads the ELF
+# by its physical addresses at 0x4008_0000 with the MMU off, so the kernel is
+# linked static (non-PIE) at that low base until the MMU + higher-half map land.
+[target.aarch64-unknown-none]
+runner = "../boot/qemu-aarch64.sh"
+rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-no-pie"]

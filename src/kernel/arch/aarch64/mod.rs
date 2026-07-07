@@ -8,6 +8,7 @@
 // wake, SVC syscall, TPIDR_EL1 per-CPU, PL011 UART, DTB parsing) land in M116.
 // Runtime entry points `todo!()`; a boot on this arch is not possible until then.
 
+mod boot;
 pub mod serial;
 
 // halt the kernel forever (wait-for-event)
