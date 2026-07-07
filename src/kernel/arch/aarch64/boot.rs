@@ -169,15 +169,27 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 		crate::serial_println!("aarch64:   {} @ BAR{} phys={:#x} len={:#x} | common+{:#x} notify+{:#x}(x{}) isr+{:#x} device+{:#x}", super::pci::virtio_type_name(v.virtio_type), v.bar, v.bar_phys, v.region_len, v.common.offset, v.notify.offset, v.notify.notify_multiplier, v.isr.offset, v.device.offset);
 	}
 
-	// If a virtio-blk device is present, read sector 0 through it (reset, feature
-	// negotiation, virtqueue, request, poll used ring).
+	// If a virtio-blk device is present, exercise it: read sector 0, then write a
+	// pattern to sector 1 and read it back to confirm the write path.
 	if let Some(blk) = virtio.iter().find(|v| v.virtio_type as u32 == abi::VIRTIO_TYPE_BLOCK) {
-		match super::virtio_blk::read_sector(blk, 0) {
-			Some((data, status)) => {
-				let head = unsafe { core::slice::from_raw_parts(data as *const u8, 16) };
-				crate::serial_println!("aarch64: virtio-blk sector 0 read - status={} first16={:02x?}", status, head);
+		if let Some(mut disk) = super::virtio_blk::BlkDevice::init(blk) {
+			let mut buf = [0u8; 512];
+			if disk.read(0, &mut buf) {
+				crate::serial_println!("aarch64: virtio-blk sector 0 read - first16={:02x?}", &buf[..16]);
+			} else {
+				crate::serial_println!("aarch64: virtio-blk sector 0 read - FAILED");
 			}
-			None => crate::serial_println!("aarch64: virtio-blk sector 0 read - FAILED"),
+
+			let mut wbuf = [0u8; 512];
+			let pattern = b"aarch64 virtio-blk write path OK";
+			wbuf[..pattern.len()].copy_from_slice(pattern);
+			let wrote = disk.write(1, &wbuf);
+			let mut rbuf = [0u8; 512];
+			let read_back = disk.read(1, &mut rbuf);
+			let ok = wrote && read_back && rbuf == wbuf;
+			crate::serial_println!("aarch64: virtio-blk sector 1 write+readback = {}", if ok { "ok" } else { "FAIL" });
+		} else {
+			crate::serial_println!("aarch64: virtio-blk init - FAILED");
 		}
 	}
 

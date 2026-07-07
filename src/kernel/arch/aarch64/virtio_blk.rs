@@ -1,12 +1,13 @@
 // aarch64 minimal virtio-blk driver (M116 bring-up).
 //
-// Enough of the modern virtio-pci block device to read one sector by polling: it
-// resets the device, negotiates VIRTIO_F_VERSION_1, sets up a small split
-// virtqueue (descriptor / available / used rings in DMA frames), submits a single
-// read request as a 3-descriptor chain, kicks the device through its notify
-// region, and polls the used ring for completion. Caches are off during bring-up,
-// so DMA memory is plain non-cacheable RAM and only ordering barriers are needed;
-// the BAR MMIO is Device memory the boot map already covers (identity, hhdm 0).
+// Enough of the modern virtio-pci block device to read and write sectors by
+// polling. `BlkDevice::init` resets the device, negotiates VIRTIO_F_VERSION_1,
+// and sets up a small split virtqueue (descriptor / available / used rings in DMA
+// frames); `read`/`write` submit a single request as a 3-descriptor chain, kick
+// the device through its notify region, and poll the used ring for completion.
+// Caches are off during bring-up, so DMA memory is plain non-cacheable RAM and
+// only ordering barriers are needed; the BAR MMIO is Device memory the boot map
+// already covers (identity, hhdm 0), so physical addresses are used directly.
 
 use core::arch::asm;
 
@@ -21,6 +22,10 @@ const S_FEATURES_OK: u8 = 8;
 // virtq descriptor flags.
 const VRING_DESC_F_NEXT: u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2;
+
+// virtio_blk request types.
+const VIRTIO_BLK_T_IN: u32 = 0; // read (device -> memory)
+const VIRTIO_BLK_T_OUT: u32 = 1; // write (memory -> device)
 
 // virtio_pci_common_cfg field offsets.
 const CFG_DEVICE_FEATURE_SELECT: u64 = 0x00;
@@ -37,7 +42,6 @@ const CFG_QUEUE_DRIVER: u64 = 0x28;
 const CFG_QUEUE_DEVICE: u64 = 0x30;
 
 const SECTOR_SIZE: usize = 512;
-
 unsafe fn r8(a: u64) -> u8 {
 	unsafe { core::ptr::read_volatile(a as *const u8) }
 }
@@ -74,88 +78,125 @@ unsafe fn put_desc(desc: u64, i: u64, addr: u64, len: u32, flags: u16, next: u16
 	}
 }
 
-// Read `sector` from `dev` into a freshly allocated frame, returning (frame_phys,
-// blk_status) on completion, or None on setup failure / timeout. blk_status 0 = OK.
-pub fn read_sector(dev: &VirtioDevice, sector: u64) -> Option<(u64, u8)> {
-	let cfg = dev.bar_phys + dev.common.offset as u64;
-	unsafe {
-		// Reset, then acknowledge and claim the device.
-		w8(cfg + CFG_DEVICE_STATUS, 0);
-		let mut spins = 0u64;
-		while r8(cfg + CFG_DEVICE_STATUS) != 0 && spins < 1_000_000 {
-			spins += 1;
+// A brought-up virtio-blk device: the common-config MMIO base, the queue-0 notify
+// address, the split-ring physical addresses, and a reusable request frame.
+pub struct BlkDevice {
+	notify: u64,
+	desc: u64,
+	avail: u64,
+	used: u64,
+	qsz: u16,
+	req: u64, // header@+0 (16), data@+512 (512), status@+1024 (1)
+	avail_idx: u16,
+	used_seen: u16,
+}
+
+impl BlkDevice {
+	// Reset, negotiate features, and set up request queue 0. Returns None on
+	// failure or if memory is exhausted.
+	pub fn init(dev: &VirtioDevice) -> Option<BlkDevice> {
+		let cfg = dev.bar_phys + dev.common.offset as u64;
+		unsafe {
+			// Reset, acknowledge, claim.
+			w8(cfg + CFG_DEVICE_STATUS, 0);
+			let mut spins = 0u64;
+			while r8(cfg + CFG_DEVICE_STATUS) != 0 && spins < 1_000_000 {
+				spins += 1;
+			}
+			w8(cfg + CFG_DEVICE_STATUS, S_ACK);
+			w8(cfg + CFG_DEVICE_STATUS, S_ACK | S_DRIVER);
+
+			// Require VIRTIO_F_VERSION_1 (feature bit 32 = bit 0 of the high dword).
+			w32(cfg + CFG_DEVICE_FEATURE_SELECT, 1);
+			let hi = r32(cfg + CFG_DEVICE_FEATURE);
+			w32(cfg + CFG_DRIVER_FEATURE_SELECT, 1);
+			w32(cfg + CFG_DRIVER_FEATURE, hi & 1);
+			w32(cfg + CFG_DRIVER_FEATURE_SELECT, 0);
+			w32(cfg + CFG_DRIVER_FEATURE, 0);
+			w8(cfg + CFG_DEVICE_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK);
+			if r8(cfg + CFG_DEVICE_STATUS) & S_FEATURES_OK == 0 {
+				return None;
+			}
+
+			// Queue 0: small ring in zeroed DMA frames plus a reusable request frame.
+			w16(cfg + CFG_QUEUE_SELECT, 0);
+			let qsz_max = r16(cfg + CFG_QUEUE_SIZE);
+			if qsz_max == 0 {
+				return None;
+			}
+			let qsz: u16 = 8.min(qsz_max);
+			w16(cfg + CFG_QUEUE_SIZE, qsz);
+			let desc = super::paging::alloc_frame()?;
+			let avail = super::paging::alloc_frame()?;
+			let used = super::paging::alloc_frame()?;
+			let req = super::paging::alloc_frame()?;
+			w64(cfg + CFG_QUEUE_DESC, desc);
+			w64(cfg + CFG_QUEUE_DRIVER, avail);
+			w64(cfg + CFG_QUEUE_DEVICE, used);
+			let notify_off = r16(cfg + CFG_QUEUE_NOTIFY_OFF);
+			w16(cfg + CFG_QUEUE_ENABLE, 1);
+			w8(cfg + CFG_DEVICE_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK | S_DRIVER_OK);
+
+			let notify = dev.bar_phys + dev.notify.offset as u64 + notify_off as u64 * dev.notify.notify_multiplier as u64;
+			Some(BlkDevice { notify, desc, avail, used, qsz, req, avail_idx: 0, used_seen: 0 })
 		}
-		w8(cfg + CFG_DEVICE_STATUS, S_ACK);
-		w8(cfg + CFG_DEVICE_STATUS, S_ACK | S_DRIVER);
+	}
 
-		// Negotiate features: require VIRTIO_F_VERSION_1 (feature bit 32 = bit 0 of
-		// the high dword).
-		w32(cfg + CFG_DEVICE_FEATURE_SELECT, 1);
-		let hi = r32(cfg + CFG_DEVICE_FEATURE);
-		w32(cfg + CFG_DRIVER_FEATURE_SELECT, 1);
-		w32(cfg + CFG_DRIVER_FEATURE, hi & 1);
-		w32(cfg + CFG_DRIVER_FEATURE_SELECT, 0);
-		w32(cfg + CFG_DRIVER_FEATURE, 0);
-		w8(cfg + CFG_DEVICE_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK);
-		if r8(cfg + CFG_DEVICE_STATUS) & S_FEATURES_OK == 0 {
-			return None;
+	// Submit one request (header + data + status chain) and poll for completion.
+	// Returns the blk status byte (0 = OK) or None on timeout. `data_write` marks
+	// the data buffer device-writable (a read); a write leaves the device reading it.
+	fn submit(&mut self, blk_type: u32, sector: u64, data_write: bool) -> Option<u8> {
+		let hdr = self.req;
+		let data = self.req + 512;
+		let status = self.req + 1024;
+		unsafe {
+			w32(hdr, blk_type);
+			w32(hdr + 4, 0);
+			w64(hdr + 8, sector);
+			w8(status, 0xff);
+
+			let data_flags = if data_write { VRING_DESC_F_NEXT | VRING_DESC_F_WRITE } else { VRING_DESC_F_NEXT };
+			put_desc(self.desc, 0, hdr, 16, VRING_DESC_F_NEXT, 1);
+			put_desc(self.desc, 1, data, SECTOR_SIZE as u32, data_flags, 2);
+			put_desc(self.desc, 2, status, 1, VRING_DESC_F_WRITE, 0);
+
+			// Publish descriptor 0 as head in the available ring.
+			w16(self.avail + 4 + (self.avail_idx % self.qsz) as u64 * 2, 0);
+			barrier();
+			self.avail_idx = self.avail_idx.wrapping_add(1);
+			w16(self.avail + 2, self.avail_idx);
+			barrier();
+
+			// Kick, then poll the used ring for a new completion.
+			w16(self.notify, 0);
+			let mut spins = 0u64;
+			while r16(self.used + 2) == self.used_seen && spins < 200_000_000 {
+				spins += 1;
+				core::hint::spin_loop();
+			}
+			barrier();
+			if r16(self.used + 2) == self.used_seen {
+				return None;
+			}
+			self.used_seen = self.used_seen.wrapping_add(1);
+			Some(r8(status))
 		}
+	}
 
-		// Set up request queue 0 with a small ring in three zeroed DMA frames.
-		w16(cfg + CFG_QUEUE_SELECT, 0);
-		let qsz_max = r16(cfg + CFG_QUEUE_SIZE);
-		if qsz_max == 0 {
-			return None;
+	// Read one 512-byte sector into `buf`.
+	pub fn read(&mut self, sector: u64, buf: &mut [u8; SECTOR_SIZE]) -> bool {
+		match self.submit(VIRTIO_BLK_T_IN, sector, true) {
+			Some(0) => {
+				unsafe { core::ptr::copy_nonoverlapping((self.req + 512) as *const u8, buf.as_mut_ptr(), SECTOR_SIZE) };
+				true
+			}
+			_ => false,
 		}
-		let qsz: u16 = 8.min(qsz_max);
-		w16(cfg + CFG_QUEUE_SIZE, qsz);
-		let desc = super::paging::alloc_frame()?;
-		let avail = super::paging::alloc_frame()?;
-		let used = super::paging::alloc_frame()?;
-		w64(cfg + CFG_QUEUE_DESC, desc);
-		w64(cfg + CFG_QUEUE_DRIVER, avail);
-		w64(cfg + CFG_QUEUE_DEVICE, used);
-		let notify_off = r16(cfg + CFG_QUEUE_NOTIFY_OFF);
-		w16(cfg + CFG_QUEUE_ENABLE, 1);
-		w8(cfg + CFG_DEVICE_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK | S_DRIVER_OK);
+	}
 
-		// Build the request: 16-byte header, 512-byte data, 1-byte status, packed
-		// into one frame. type 0 = read (VIRTIO_BLK_T_IN).
-		let req = super::paging::alloc_frame()?;
-		let hdr = req;
-		let data = req + 512;
-		let status = req + 1024;
-		w32(hdr, 0); // type = read
-		w32(hdr + 4, 0); // reserved
-		w64(hdr + 8, sector);
-		w8(status, 0xff); // sentinel the device overwrites
-
-		// 3-descriptor chain: header (device reads), data (device writes), status.
-		put_desc(desc, 0, hdr, 16, VRING_DESC_F_NEXT, 1);
-		put_desc(desc, 1, data, SECTOR_SIZE as u32, VRING_DESC_F_NEXT | VRING_DESC_F_WRITE, 2);
-		put_desc(desc, 2, status, 1, VRING_DESC_F_WRITE, 0);
-
-		// Publish descriptor 0 as head in the available ring.
-		w16(avail, 0); // flags
-		w16(avail + 4, 0); // ring[0] = head index 0
-		barrier();
-		w16(avail + 2, 1); // avail.idx = 1
-		barrier();
-
-		// Kick the device: write the queue index to its notify address.
-		let notify = dev.bar_phys + dev.notify.offset as u64 + notify_off as u64 * dev.notify.notify_multiplier as u64;
-		w16(notify, 0);
-
-		// Poll the used ring for completion (used.idx goes 0 -> 1).
-		let mut spins = 0u64;
-		while r16(used + 2) == 0 && spins < 200_000_000 {
-			spins += 1;
-			core::hint::spin_loop();
-		}
-		barrier();
-		if r16(used + 2) == 0 {
-			return None; // timed out
-		}
-		Some((data, r8(status)))
+	// Write one 512-byte sector from `buf`.
+	pub fn write(&mut self, sector: u64, buf: &[u8; SECTOR_SIZE]) -> bool {
+		unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), (self.req + 512) as *mut u8, SECTOR_SIZE) };
+		matches!(self.submit(VIRTIO_BLK_T_OUT, sector, false), Some(0))
 	}
 }
