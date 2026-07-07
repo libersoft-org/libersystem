@@ -39,6 +39,53 @@ if [[ -f "$VOLUME_PKG" ]]; then
 	DISK_ARGS=(-drive "if=none,id=vol0,format=raw,file=$VIRTIO_DISK" -device "virtio-blk-pci,drive=vol0,disable-legacy=on")
 fi
 
+# Media volumes for the storage StorageService instances - the same set the x86 runner
+# builds, so the boot chain (shell hard-depends on media/iso/udf storage) reaches the
+# shell here too. Each is a genuine filesystem image seeded from the volume/ dir; built
+# once and reused. Skipped if its mkfs toolchain is missing (that instance then fails,
+# like x86 without the tool). Files come from the shared volume/ seed directory.
+VOLDIR="$HERE/../volume"
+# exFAT media disk (vol://media), read-write.
+FAT_DISK="$HERE/.build/fat-media-aarch64.img"
+if [[ ! -f "$FAT_DISK" ]] && command -v mkfs.exfat >/dev/null; then
+	truncate -s 16M "$FAT_DISK"
+	if mkfs.exfat "$FAT_DISK" >/dev/null 2>&1; then
+		FMNT="$HERE/.build/media-mnt-a64"
+		mkdir -p "$FMNT"
+		if mount -o loop "$FAT_DISK" "$FMNT" 2>/dev/null; then
+			cp "$VOLDIR/hello.txt" "$VOLDIR/motd.txt" "$FMNT"/ 2>/dev/null || true
+			umount "$FMNT" 2>/dev/null || true
+		fi
+		rmdir "$FMNT" 2>/dev/null || true
+	else
+		rm -f "$FAT_DISK"
+	fi
+fi
+[[ -f "$FAT_DISK" ]] && DISK_ARGS+=(-drive "if=none,id=med0,format=raw,file=$FAT_DISK" -device "virtio-blk-pci,drive=med0,disable-legacy=on")
+# ISO9660 disk (vol://iso), read-only.
+ISO_DISK="$HERE/.build/iso-media-aarch64.iso"
+if [[ ! -f "$ISO_DISK" ]] && command -v xorriso >/dev/null; then
+	xorriso -as mkisofs -quiet -J -R -o "$ISO_DISK" "$VOLDIR" 2>/dev/null || true
+fi
+[[ -f "$ISO_DISK" ]] && DISK_ARGS+=(-drive "if=none,id=iso0,format=raw,file=$ISO_DISK" -device "virtio-blk-pci,drive=iso0,disable-legacy=on")
+# UDF disk (vol://udf), read-only.
+UDF_DISK="$HERE/.build/udf-media-aarch64.udf"
+if [[ ! -f "$UDF_DISK" ]] && command -v mkfs.udf >/dev/null; then
+	dd if=/dev/zero of="$UDF_DISK" bs=1M count=8 status=none 2>/dev/null || true
+	if mkfs.udf --media-type=hd --blocksize=2048 "$UDF_DISK" >/dev/null 2>&1; then
+		UMNT="$HERE/.build/udf-mnt-a64"
+		mkdir -p "$UMNT"
+		if mount -o loop "$UDF_DISK" "$UMNT" 2>/dev/null; then
+			cp "$VOLDIR"/* "$UMNT"/ 2>/dev/null || true
+			umount "$UMNT" 2>/dev/null || true
+		fi
+		rmdir "$UMNT" 2>/dev/null || true
+	else
+		rm -f "$UDF_DISK"
+	fi
+fi
+[[ -f "$UDF_DISK" ]] && DISK_ARGS+=(-drive "if=none,id=udf0,format=raw,file=$UDF_DISK" -device "virtio-blk-pci,drive=udf0,disable-legacy=on")
+
 # Dump the machine's device tree (same machine config as the boot below), then
 # boot with it loaded at DTB_ADDR.
 qemu-system-aarch64 \
