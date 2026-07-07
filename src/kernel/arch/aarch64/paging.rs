@@ -1,39 +1,39 @@
-// aarch64 paging - VMSAv8-64 translation (M116).
+// aarch64 paging - VMSAv8-64 translation (M116, higher half).
 //
-// The boot MMU: an identity map (VA == PA) of the low physical space via TTBR0 -
-// the device MMIO region (0..1 GB, covers the PL011 UART, the GIC, the low ECAM)
-// as Device memory, and up to 3 GB of DRAM (1..4 GB) as Normal cacheable RWX -
-// built from 1 GB block descriptors in a static boot table pool, then the MMU is
-// turned on (MAIR / TCR / TTBR0 / SCTLR.M). Because the map is identity, the PC,
-// the stack, and the UART keep working across the enable.
+// The low `.text.boot` stub (see boot.rs) builds the boot page tables and turns
+// on the MMU: TTBR0 holds a low identity map (for the hand-off), TTBR1 holds the
+// higher-half kernel map plus a direct map of physical memory at
+// `KERNEL_VA_OFFSET` (VA = PA | KOFF). The kernel then runs entirely from the
+// high half, so TTBR0 is free for userspace. Every physical/table access here
+// goes through `phys_to_virt` (the TTBR1 direct map), never a raw physical
+// pointer.
 //
-// `translate` walks those tables. On top of the boot map this module now also
-// brings up a bump frame allocator (free DRAM above the kernel image), a real
-// 4 kB `map_page` that allocates the intermediate L1/L2/L3 tables, and a TTBR1
-// higher-half root - enough to start routing kernel virtual addresses through
-// the portable memory subsystem. `unmap` / `new_address_space` / W^X fill in as
-// the port matures; those stay `todo!()` for now.
+// This module walks those tables (`translate`), runs the frame allocator (free
+// DRAM above the kernel image), maps 4 kB pages (`map_page`, allocating the
+// intermediate L1/L2/L3 tables), and builds/tears down per-process TTBR0 trees
+// (`new_address_space` / `free_address_space`).
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+
+// Higher-half kernel offset: kernel VA = physical | KERNEL_VA_OFFSET. The same
+// offset is the direct-map (HHDM) base, so any physical address is reachable as
+// `phys_to_virt(pa)` through TTBR1.
+pub const KERNEL_VA_OFFSET: u64 = 0xFFFF_0000_0000_0000;
+
+// Map a physical address to its kernel virtual address in the TTBR1 direct map.
+#[inline(always)]
+pub fn phys_to_virt(pa: u64) -> u64 {
+	pa | KERNEL_VA_OFFSET
+}
 
 // Portable page-table permission bits (the flag set the portable callers OR
-// together). The real per-PTE VMSAv8 encoding is applied by `map_page` when it
-// lands; these keep the contract's constant names meaningful.
+// together). The real per-PTE VMSAv8 encoding is applied by `map_page`; these
+// keep the contract's constant names meaningful.
 pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;
 pub const USER: u64 = 1 << 2;
 pub const NO_CACHE: u64 = 1 << 4;
 pub const NO_EXECUTE: u64 = 1 << 63;
-
-// A 4 kB translation table: 512 64-bit descriptors, naturally aligned.
-#[repr(C, align(4096))]
-struct Table([u64; 512]);
-
-// The boot table pool (in .bss, zeroed by _start): one L0 and one L1 table are
-// enough for the identity map (L0[0] -> L1; L1 holds 1 GB block descriptors).
-static mut BOOT_L0: Table = Table([0; 512]);
-static mut BOOT_L1: Table = Table([0; 512]);
 
 // Descriptor bits (VMSAv8-64, stage 1).
 const VALID: u64 = 1 << 0; // entry is valid
@@ -45,96 +45,22 @@ const ATTR_NORMAL: u64 = 1 << 2; // MAIR index 1 = Normal write-back
 const PXN: u64 = 1 << 53; // privileged execute-never
 const UXN: u64 = 1 << 54; // unprivileged execute-never
 
-// A 1 GB block of Device memory (execute-never), and one of Normal RWX memory.
-const BLOCK_DEVICE: u64 = VALID | ATTR_DEVICE | AF | PXN | UXN;
-const BLOCK_NORMAL: u64 = VALID | ATTR_NORMAL | AF | SH_INNER;
-
-// MAIR_EL1: index 0 = Device-nGnRnE (0x00), index 1 = Normal WB non-transient (0xFF).
-const MAIR: u64 = 0x00 | (0xFF << 8);
-
 // The physical-address mask for a table/page pointer (bits [47:12]).
 const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
-// Build the boot identity map and turn on the MMU. Called once, early, with the
-// MMU off (so every access is still physical). After it returns the MMU is on
-// and the low physical space is identity-mapped.
-pub unsafe fn init_boot_mmu() {
-	let l0 = &raw mut BOOT_L0;
-	let l1 = &raw mut BOOT_L1;
-
-	unsafe {
-		// L0[0] -> L1 (covers VA 0 .. 512 GB).
-		(*l0).0[0] = (l1 as u64) | VALID | TABLE;
-		// L1[0]: 0..1 GB device MMIO (UART, GIC, low ECAM).
-		(*l1).0[0] = 0x0000_0000 | BLOCK_DEVICE;
-		// L1[1..4]: 1..4 GB DRAM as Normal RWX (QEMU virt places RAM from 1 GB up;
-		// mapping unused entries is harmless - only touched RAM is ever accessed).
-		(*l1).0[1] = 0x4000_0000 | BLOCK_NORMAL;
-		(*l1).0[2] = 0x8000_0000 | BLOCK_NORMAL;
-		(*l1).0[3] = 0xC000_0000 | BLOCK_NORMAL;
-
-		// Physical address size the CPU supports (ID_AA64MMFR0_EL1.PARange), for TCR.IPS.
-		let mmfr0: u64;
-		asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nomem, nostack, preserves_flags));
-		let ips = mmfr0 & 0x7; // 0:32b 1:36b 2:40b 3:42b 4:44b 5:48b
-
-		// TCR_EL1: 4 kB granule, 48-bit VA on TTBR0 (T0SZ=16), Normal WB inner-shareable
-		// walks; TTBR1 walks disabled for now (EPD1=1).
-		let tcr: u64 = 16          // T0SZ = 16 (48-bit VA)
-			| (1 << 8)             // IRGN0 = WB WA
-			| (1 << 10)            // ORGN0 = WB WA
-			| (3 << 12)            // SH0   = inner shareable
-			| (0 << 14)            // TG0   = 4 kB granule
-			| (1 << 23)            // EPD1  = disable TTBR1 table walks
-			| (ips << 32); // IPS
-
-		asm!(
-			"msr mair_el1, {mair}",
-			"msr tcr_el1, {tcr}",
-			"msr ttbr0_el1, {ttbr0}",
-			"isb",
-			// Flush any stale TLB state before turning translation on.
-			"tlbi vmalle1",
-			"dsb ish",
-			"isb",
-			mair = in(reg) MAIR,
-			tcr = in(reg) tcr,
-			ttbr0 = in(reg) l0 as u64,
-			options(nostack, preserves_flags),
-		);
-
-		// Enable the MMU (SCTLR_EL1.M). Caches stay as they are (off) for this
-		// bring-up: Normal memory is then accessed non-cacheably, which is correct
-		// and avoids any early cache-coherency concern.
-		let mut sctlr: u64;
-		asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack, preserves_flags));
-		sctlr |= 1 << 0; // M = 1
-		asm!("msr sctlr_el1, {}", "isb", in(reg) sctlr, options(nostack, preserves_flags));
-	}
-}
-
-// Identity-map the 1 GB block containing `phys` as Device memory in the boot L1
-// (for MMIO windows above the initial 0..4 GB the boot map covers - e.g. the
-// PCIe ECAM at 256 GB on QEMU virt). The block sits under L0[0] (which spans
-// 0..512 GB), so `phys` must be below 512 GB.
-pub fn identity_map_device_gb(phys: u64) {
-	let idx = ((phys >> 30) & 0x1ff) as usize;
-	let block_base = (phys >> 30) << 30;
-	unsafe {
-		let l1 = &raw mut BOOT_L1;
-		core::ptr::write_volatile((*l1).0.as_mut_ptr().add(idx), block_base | BLOCK_DEVICE);
-		asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack, preserves_flags));
-	}
-}
-
-// Translate a TTBR0 virtual address to its physical address by walking the boot
-// tables (4 kB granule, 48-bit, levels L0..L3, honoring block descriptors).
+// Translate a virtual address to its physical address by walking the active
+// tables (4 kB granule, 48-bit, levels L0..L3, honoring block descriptors). A
+// top-bit-set VA walks TTBR1 (kernel/direct map), a low VA walks TTBR0.
 pub fn translate(va: u64) -> Option<u64> {
-	let ttbr0: u64;
+	let ttbr: u64;
 	unsafe {
-		asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags));
+		if va >> 63 == 1 {
+			asm!("mrs {}, ttbr1_el1", out(reg) ttbr, options(nomem, nostack, preserves_flags));
+		} else {
+			asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack, preserves_flags));
+		}
 	}
-	let mut table = (ttbr0 & ADDR_MASK) as *const u64;
+	let mut table = phys_to_virt(ttbr & ADDR_MASK) as *const u64;
 	for level in 0..4u64 {
 		let shift = 39 - level * 9; // L0=39, L1=30, L2=21, L3=12
 		let idx = ((va >> shift) & 0x1ff) as usize;
@@ -149,7 +75,7 @@ pub fn translate(va: u64) -> Option<u64> {
 			let base = desc & ADDR_MASK & !(region - 1);
 			return Some(base | (va & (region - 1)));
 		}
-		table = (desc & ADDR_MASK) as *const u64;
+		table = phys_to_virt(desc & ADDR_MASK) as *const u64;
 	}
 	None
 }
@@ -158,9 +84,8 @@ pub fn translate(va: u64) -> Option<u64> {
 //
 // Physical frames come from the portable frame allocator (`crate::mem::frame`),
 // seeded at boot from the device-tree memory map - the same allocator the x86
-// port uses. The kernel's low identity map means a physical address is directly
-// usable as a pointer (HHDM offset 0), so page tables are written through their
-// physical address and freshly allocated frames are zeroed in place.
+// port uses. Page tables and freshly allocated frames are reached through the
+// TTBR1 direct map (`phys_to_virt`), never a raw physical pointer.
 
 unsafe extern "C" {
 	static __kernel_end: u8;
@@ -172,10 +97,12 @@ const DRAM_BASE: u64 = 0x4000_0000;
 const DRAM_TOP_FALLBACK: u64 = DRAM_BASE + 512 * 1024 * 1024;
 
 // The usable physical range to seed the frame allocator with: free DRAM above the
-// loaded kernel image (`__kernel_end`, page aligned) up to `ram_top` (0 = use the
-// built-in fallback). Returns (base, length) in bytes.
+// loaded kernel image (`__kernel_end`, a higher-half VA - converted to physical -
+// page aligned) up to `ram_top` (0 = use the built-in fallback). Returns (base,
+// length) in bytes.
 pub fn usable_region(ram_top: u64) -> (u64, u64) {
-	let base = ((&raw const __kernel_end as u64) + 0xFFF) & !0xFFF;
+	let kend_phys = (&raw const __kernel_end as u64) & !KERNEL_VA_OFFSET;
+	let base = (kend_phys + 0xFFF) & !0xFFF;
 	let top = if ram_top > base { ram_top } else { DRAM_TOP_FALLBACK };
 	(base, top.saturating_sub(base))
 }
@@ -185,7 +112,7 @@ pub fn usable_region(ram_top: u64) -> (u64, u64) {
 pub fn alloc_frame() -> Option<u64> {
 	let pa = crate::mem::frame::allocate()?;
 	unsafe {
-		core::ptr::write_bytes(pa as *mut u8, 0, 4096);
+		core::ptr::write_bytes(phys_to_virt(pa) as *mut u8, 0, 4096);
 	}
 	Some(pa)
 }
@@ -202,42 +129,14 @@ pub fn frames_free() -> u64 {
 
 // ---- TTBR1 higher-half root -------------------------------------------------
 
-// Physical address of the TTBR1 L0 table (0 until `init_higher_half` runs).
-static TTBR1_ROOT: AtomicU64 = AtomicU64::new(0);
-
-// Allocate the TTBR1 top-level table and enable TTBR1 walks (4 kB granule,
-// 48-bit high half, Normal write-back inner-shareable) so higher-half kernel
-// virtual addresses (top bit set) translate through their own tree.
-pub unsafe fn init_higher_half() {
-	let root = alloc_frame().expect("aarch64: no frame for TTBR1 root");
-	TTBR1_ROOT.store(root, Ordering::Relaxed);
-
+// The active TTBR1 (higher-half / direct-map) root physical address. The boot
+// stub set it up; the kernel keeps a single TTBR1 tree for the life of the run.
+fn current_ttbr1() -> u64 {
+	let ttbr1: u64;
 	unsafe {
-		let mut tcr: u64;
-		asm!("mrs {}, tcr_el1", out(reg) tcr, options(nomem, nostack, preserves_flags));
-		tcr &= !(0x3f << 16); // clear T1SZ
-		tcr |= 16 << 16; //     T1SZ = 16 (48-bit high half)
-		tcr &= !(1 << 23); //   EPD1 = 0 (enable TTBR1 walks)
-		tcr &= !(3 << 24); //   IRGN1
-		tcr |= 1 << 24; //      IRGN1 = WB WA
-		tcr &= !(3 << 26); //   ORGN1
-		tcr |= 1 << 26; //      ORGN1 = WB WA
-		tcr &= !(3 << 28); //   SH1
-		tcr |= 3 << 28; //      SH1   = inner shareable
-		tcr &= !(3 << 30); //   TG1
-		tcr |= 2 << 30; //      TG1   = 0b10 = 4 kB granule
-		asm!(
-			"msr tcr_el1, {tcr}",
-			"msr ttbr1_el1, {root}",
-			"isb",
-			"tlbi vmalle1",
-			"dsb ish",
-			"isb",
-			tcr = in(reg) tcr,
-			root = in(reg) root,
-			options(nostack, preserves_flags),
-		);
+		asm!("mrs {}, ttbr1_el1", out(reg) ttbr1, options(nomem, nostack, preserves_flags));
 	}
+	ttbr1 & ADDR_MASK
 }
 
 // ---- 4 kB page mapping ------------------------------------------------------
@@ -272,7 +171,7 @@ fn leaf_bits(flags: u64) -> u64 {
 // table address), allocating any missing intermediate tables from the frame
 // allocator, then invalidate the TLB for that VA.
 unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) {
-	let mut table = root as *mut u64;
+	let mut table = phys_to_virt(root) as *mut u64;
 	for level in 0..3u64 {
 		let shift = 39 - level * 9; // L0=39, L1=30, L2=21
 		let idx = ((va >> shift) & 0x1ff) as usize;
@@ -284,7 +183,7 @@ unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) {
 		} else {
 			desc & ADDR_MASK
 		};
-		table = next as *mut u64;
+		table = phys_to_virt(next) as *mut u64;
 	}
 	let idx = ((va >> 12) & 0x1ff) as usize;
 	unsafe {
@@ -335,7 +234,7 @@ pub unsafe fn copy_to_user_page(_dst: u64, _bytes: &[u8]) {
 pub fn map_page(virt: u64, phys: u64, flags: u64) {
 	// A top-bit-set virtual address translates through TTBR1 (higher half); a
 	// low address through the active TTBR0 tree.
-	let root = if virt >> 63 == 1 { TTBR1_ROOT.load(Ordering::Relaxed) } else { current_ttbr0() };
+	let root = if virt >> 63 == 1 { current_ttbr1() } else { current_ttbr0() };
 	unsafe {
 		map_page_root(root, virt, phys, flags);
 	}
@@ -356,10 +255,10 @@ unsafe fn next_table(table: *const u64, idx: usize) -> Option<u64> {
 // Unmap `virt` in the tree rooted at `root`, returning the frame it pointed at (if
 // mapped). Intermediate tables are left in place; free_address_space reclaims them.
 unsafe fn unmap_page_root(root: u64, virt: u64) -> Option<u64> {
-	let l1 = unsafe { next_table(root as *const u64, ((virt >> 39) & 0x1ff) as usize)? };
-	let l2 = unsafe { next_table(l1 as *const u64, ((virt >> 30) & 0x1ff) as usize)? };
-	let l3 = unsafe { next_table(l2 as *const u64, ((virt >> 21) & 0x1ff) as usize)? };
-	let leaf = (l3 as *mut u64).wrapping_add(((virt >> 12) & 0x1ff) as usize);
+	let l1 = unsafe { next_table(phys_to_virt(root) as *const u64, ((virt >> 39) & 0x1ff) as usize)? };
+	let l2 = unsafe { next_table(phys_to_virt(l1) as *const u64, ((virt >> 30) & 0x1ff) as usize)? };
+	let l3 = unsafe { next_table(phys_to_virt(l2) as *const u64, ((virt >> 21) & 0x1ff) as usize)? };
+	let leaf = (phys_to_virt(l3) as *mut u64).wrapping_add(((virt >> 12) & 0x1ff) as usize);
 	let desc = unsafe { core::ptr::read_volatile(leaf) };
 	if desc & VALID == 0 {
 		return None;
@@ -390,48 +289,25 @@ pub fn unmap_page_in(ttbr: u64, virt: u64) -> Option<u64> {
 	unsafe { unmap_page_root(ttbr & ADDR_MASK, virt) }
 }
 
-// Create a fresh address-space root (TTBR0 tree). Because the kernel currently
-// runs identity-mapped in the low half, the new root carries the same kernel
-// identity: a fresh L0 -> a fresh L1 whose first four 1 GB block descriptors are
-// copied from the boot L1, so switching TTBR0 to it keeps the kernel (code,
-// stack, vectors, device MMIO) mapped. User pages go in the free region above
-// 4 GB (L1 entries 4..). Returns the L0 physical address, or None if out of RAM.
-// (When the kernel later moves to the high half, this becomes an empty L0.)
+// Create a fresh address-space root (TTBR0 tree). The kernel runs in the higher
+// half through TTBR1, so a per-process TTBR0 tree carries no kernel mappings: it
+// starts as an empty L0. User pages (all below 128 TB) are mapped on demand.
+// Returns the L0 physical address, or None if out of RAM.
 pub fn new_address_space() -> Option<u64> {
-	let l0 = alloc_frame()?;
-	let l1 = match alloc_frame() {
-		Some(f) => f,
-		None => {
-			dealloc_frame(l0);
-			return None;
-		}
-	};
-	unsafe {
-		core::ptr::write_volatile(l0 as *mut u64, l1 | VALID | TABLE);
-		let src = &raw const BOOT_L1 as *const u64;
-		let dst = l1 as *mut u64;
-		for i in 0..4 {
-			core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
-		}
-	}
-	Some(l0)
+	// alloc_frame returns a zeroed frame, so the L0 is already empty.
+	alloc_frame()
 }
 
-// Tear down an address space created by new_address_space: free the user-region
-// page tables (below L1 entries 4..) and the L1 + L0 frames. The kernel identity
-// blocks (L1 entries 0..4) map no tables and are not freed; leaf data frames are
-// owned by whoever mapped them and are not freed here.
+// Tear down an address space created by new_address_space: free every user-region
+// page table and the L0 frame. Leaf data frames are owned by whoever mapped them
+// and are not freed here.
 pub fn free_address_space(root: u64) {
 	unsafe {
-		let l0 = root as *const u64;
-		if let Some(l1) = next_table(l0, 0) {
-			let l1p = l1 as *const u64;
-			for i in 4..512 {
-				if let Some(l2) = next_table(l1p, i) {
-					free_table_level(l2, 2);
-				}
+		let l0 = phys_to_virt(root) as *const u64;
+		for i in 0..512 {
+			if let Some(l1) = next_table(l0, i) {
+				free_table_level(l1, 2);
 			}
-			dealloc_frame(l1);
 		}
 		dealloc_frame(root);
 	}
@@ -445,7 +321,7 @@ pub fn free_address_space(root: u64) {
 unsafe fn free_table_level(phys: u64, level: u32) {
 	unsafe {
 		if level > 1 {
-			let table = phys as *const u64;
+			let table = phys_to_virt(phys) as *const u64;
 			for i in 0..512 {
 				if let Some(next) = next_table(table, i) {
 					free_table_level(next, level - 1);

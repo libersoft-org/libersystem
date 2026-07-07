@@ -1,45 +1,114 @@
-// aarch64 direct-boot entry (M116 bring-up).
+// aarch64 higher-half boot entry (M116).
 //
-// QEMU `-machine virt -kernel <elf>` enters the ELF entry `_start` with the MMU
-// off, at EL1 (or EL2), on an undefined stack, with x0 = the DTB physical
-// address. `_start` (below, in `.text.boot` so it lands first) sets up the boot
-// stack, zeroes the BSS, then calls `aarch64_main` with the DTB pointer.
-//
-// This is the M0-equivalent for the new architecture: it brings up the PL011
-// serial console and reports in, then halts. The real port - the MMU + higher
-// half, the VBAR_EL1 vectors, the GIC + generic timer, PSCI SMP, the SVC syscall
-// path, and routing through the portable `kmain` - fills in from here in M116.
+// QEMU `-machine virt -kernel <elf>` enters the ELF entry `_start` at its physical
+// address with the MMU off, at EL1, x0 = DTB. `_start` lives in the low, identity-
+// linked `.text.boot` section: it is position-independent (no absolute references
+// to the high half until the MMU is on), builds the boot page tables in the
+// reserved `__boot_tables` region (an identity/direct-map L1 shared by a low L0
+// for TTBR0 and a high L0 for TTBR1), turns on the MMU, then loads the higher-half
+// address of `aarch64_main` (and the high boot stack) from `.data.boot` literals
+// and branches into the higher half. From there the kernel runs entirely from
+// TTBR1, leaving TTBR0 free for userspace.
 
 use core::arch::global_asm;
 
 global_asm!(
 	r#"
+.section .data.boot, "a"
+.balign 8
+.Lp_main:      .quad aarch64_main
+.Lp_stack_top: .quad __boot_stack_top
+.Lp_bss_start: .quad __bss_start
+.Lp_bss_end:   .quad __bss_end
+
 .section .text.boot, "ax"
 .global _start
 _start:
-	// x0 holds the DTB pointer QEMU passed; preserve it across BSS zeroing.
-	mov     x19, x0
-	// Set up the boot stack (grows down from the linker-reserved top).
-	adrp    x1, __boot_stack_top
-	add     x1, x1, :lo12:__boot_stack_top
-	mov     sp, x1
-	// Zero the BSS: [__bss_start, __bss_end).
-	adrp    x0, __bss_start
-	add     x0, x0, :lo12:__bss_start
-	adrp    x1, __bss_end
-	add     x1, x1, :lo12:__bss_end
+	mov     x19, x0                 // save DTB
+
+	// Boot tables: x20 = L1, x21 = L0_LOW (TTBR0), x22 = L0_HIGH (TTBR1).
+	adrp    x20, __boot_tables
+	add     x20, x20, :lo12:__boot_tables
+	add     x21, x20, #4096
+	add     x22, x20, #8192
+
+	// Zero the three tables (12 kB).
+	mov     x0, x20
+	add     x1, x20, #12288
 0:
-	cmp     x0, x1
-	b.hs    1f
 	str     xzr, [x0], #8
-	b       0b
+	cmp     x0, x1
+	b.lo    0b
+
+	// L1[0] = 1 GB Device block @ 0 (UART/GIC/low ECAM).
+	mov     x0, #0x0401
+	movk    x0, #0x0060, lsl #48
+	str     x0, [x20]
+	// L1[1..3] = 1 GB Normal blocks @ 1/2/3 GB (DRAM).
+	movz    x2, #0x4000, lsl #16    // x2 = 0x4000_0000 (1 GB)
+	mov     x0, #0x0705             // Normal block flags
+	orr     x0, x0, x2
+	str     x0, [x20, #8]
+	add     x0, x0, x2
+	str     x0, [x20, #16]
+	add     x0, x0, x2
+	str     x0, [x20, #24]
+	// L1[256] = 1 GB Device block @ 256 GB (the high-mem PCIe ECAM).
+	mov     x0, #0x0401
+	movk    x0, #0x0040, lsl #32
+	movk    x0, #0x0060, lsl #48
+	str     x0, [x20, #2048]
+	// L0_LOW[0] and L0_HIGH[0] -> L1 (table descriptor).
+	orr     x0, x20, #3
+	str     x0, [x21]
+	str     x0, [x22]
+
+	// MAIR: attr0 = Device-nGnRnE, attr1 = Normal write-back.
+	mov     x0, #0xFF00
+	msr     mair_el1, x0
+	// TCR: T0SZ=T1SZ=16 (48-bit), 4 kB granules, WB inner-shareable, IPS = PARange.
+	mrs     x0, id_aa64mmfr0_el1
+	and     x0, x0, #0x7
+	lsl     x0, x0, #32
+	movz    x1, #0x3510
+	movk    x1, #0xB510, lsl #16
+	orr     x0, x0, x1
+	msr     tcr_el1, x0
+	msr     ttbr0_el1, x21
+	msr     ttbr1_el1, x22
+	dsb     sy
+	tlbi    vmalle1
+	dsb     sy
+	isb
+	// Enable the MMU (SCTLR_EL1.M).
+	mrs     x0, sctlr_el1
+	orr     x0, x0, #1
+	msr     sctlr_el1, x0
+	isb
+
+	// Switch to the higher-half boot stack.
+	adrp    x0, .Lp_stack_top
+	ldr     x1, [x0, :lo12:.Lp_stack_top]
+	mov     sp, x1
+	// Zero the higher-half BSS.
+	adrp    x0, .Lp_bss_start
+	ldr     x2, [x0, :lo12:.Lp_bss_start]
+	adrp    x0, .Lp_bss_end
+	ldr     x3, [x0, :lo12:.Lp_bss_end]
 1:
-	// aarch64_main(dtb) - never returns.
-	mov     x0, x19
-	bl      aarch64_main
+	cmp     x2, x3
+	b.hs    2f
+	str     xzr, [x2], #8
+	b       1b
 2:
+	// Branch into the higher half: aarch64_main(dtb).
+	adrp    x0, .Lp_main
+	ldr     x4, [x0, :lo12:.Lp_main]
+	mov     x0, x19
+	br      x4
+3:
 	wfe
-	b       2b
+	b       3b
 "#
 );
 
@@ -57,12 +126,10 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	crate::serial_println!("{} kernel is starting ...", crate::product::NAME);
 	crate::serial_println!("arch: aarch64 | EL{el} | DTB {dtb:#x}");
 
-	// Turn on the MMU with a boot identity map. Serial keeps working across the
-	// enable because the UART's device page is mapped and the map is identity.
-	unsafe {
-		super::paging::init_boot_mmu();
-	}
-	crate::serial_println!("aarch64: MMU on (identity map, 4 kB granule)");
+	// The low boot stub already enabled the MMU: TTBR0 = a low identity map (for
+	// the hand-off), TTBR1 = the higher-half kernel plus a physical direct map. The
+	// kernel runs from the high half; device MMIO is reached through phys_to_virt.
+	crate::serial_println!("aarch64: MMU on (higher half, 4 kB granule)");
 
 	// Prove translation works: the UART (device) and this code (Normal RAM) walk
 	// back to their own physical addresses, and a RAM read-back survives the MMU.
@@ -104,10 +171,9 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	let (ram_top, cpu_count) = match boot_info {
 		Some(bi) => {
 			crate::serial_println!("aarch64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s)", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count);
-			// Map the PCIe ECAM window (QEMU virt puts it at 256 GB, above the boot
-			// map) and point the PCI code at it.
+			// The boot stub already maps the 256 GB device region (BOOT_L1[256]), so
+			// the PCIe ECAM is reachable through phys_to_virt; just point PCI at it.
 			if bi.pcie_ecam != 0 {
-				super::paging::identity_map_device_gb(bi.pcie_ecam);
 				super::pci::set_ecam_base(bi.pcie_ecam);
 			}
 			(bi.ram_base + bi.ram_size, bi.cpu_count)
@@ -118,17 +184,17 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 		}
 	};
 
-	// Seed the portable frame allocator from the device-tree memory map, bring up
-	// the TTBR1 higher-half root, then bring up the kernel heap in the higher half.
-	// After this, `alloc` collections (Box, Vec, ...) are usable.
+	// Seed the portable frame allocator from the device-tree memory map, then bring
+	// up the kernel heap in the higher half (the TTBR1 root is already live from the
+	// boot stub). After this, `alloc` collections (Box, Vec, ...) are usable.
 	use super::paging;
+	// Publish the direct-map offset so the portable subsystems (heap, ELF loader,
+	// ...) reach physical frames the same way this backend does (phys | KOFF).
+	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
 	let (region_base, region_len) = paging::usable_region(ram_top);
 	let regions = [bootproto::MemRegion { base: region_base, length: region_len, kind: bootproto::MEM_USABLE, _pad: 0 }];
 	crate::mem::frame::init(&regions);
 	crate::serial_println!("aarch64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
-	unsafe {
-		paging::init_higher_half();
-	}
 	crate::mem::heap::init();
 	crate::mem::frame::upgrade_to_heap();
 	{
@@ -142,14 +208,14 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 
 	// Prove the real 4 kB map_page works: map a fresh frame at a high (top-bit-set)
 	// virtual address, write a pattern through it, and confirm it reads back both
-	// via the high VA (TTBR1 walk) and via the frame's own identity address.
+	// via the high VA (TTBR1 walk) and via the frame's direct-map address.
 	let frame = paging::alloc_frame().expect("aarch64: no frame for map test");
 	let hva: u64 = 0xFFFF_8000_0000_0000;
 	paging::map_page(hva, frame, paging::PRESENT | paging::WRITABLE | paging::NO_EXECUTE);
 	let pattern: u64 = 0xCAFE_BABE_D00D_F00D;
 	let (via_high, via_phys) = unsafe {
 		core::ptr::write_volatile(hva as *mut u64, pattern);
-		(core::ptr::read_volatile(hva as *const u64), core::ptr::read_volatile(frame as *const u64))
+		(core::ptr::read_volatile(hva as *const u64), core::ptr::read_volatile(paging::phys_to_virt(frame) as *const u64))
 	};
 	let ok = via_high == pattern && via_phys == pattern;
 	crate::serial_println!("aarch64: map_page {hva:#x} -> {frame:#x} | high={via_high:#x} phys={via_phys:#x} = {}", if ok { "ok" } else { "FAIL" });
@@ -232,7 +298,10 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	// space, accounted to the root Domain) cooperatively to completion. This is the
 	// same scheduler the x86_64 kernel uses - the aarch64 arch backend (context
 	// switch, per-CPU, read/write_cr3, timer) now satisfies its whole contract.
-	crate::sched::allocate(1);
+	// The scheduler is sized for every online core so a secondary's timer tick
+	// indexes its own (empty) run queue rather than running off the end.
+	crate::smp::set_cpu_count(cpu_count as usize);
+	crate::sched::allocate(cpu_count as usize);
 	crate::sched::init();
 	for id in 1..=3u64 {
 		crate::sched::spawn(sched_task, id);
@@ -271,6 +340,12 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	// capability - proving handle transfer between isolated processes.
 	run_handle_transfer();
 
+	// Portable ELF loader: build a minimal aarch64 ELF (ET_EXEC, EM_AARCH64) with
+	// one low-VA PT_LOAD segment, load it through the SAME crate::elf loader the
+	// x86 kernel uses, and run it as a real EL0 process. This is a payoff of the
+	// higher-half relink: standard low virtual addresses are now free for user ELFs.
+	run_elf_process();
+
 	// Per-address-space isolation: two independent address spaces map the SAME
 	// virtual address to different physical frames. Switching TTBR0 (write_cr3)
 	// changes what that address reads - the kernel keeps running because each
@@ -306,7 +381,7 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	paging::free_address_space(as2);
 	crate::serial_println!("aarch64: address spaces torn down");
 
-	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + heap + pci + percpu + SMP + threads + EL0 + addrspace OK - halting");
+	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + heap + pci + percpu + SMP + threads + EL0 + ELF + addrspace OK - halting");
 	super::halt_loop()
 }
 
@@ -452,6 +527,103 @@ fn run_user_processes() {
 	crate::serial_println!("aarch64: userspace - running 2 EL0 processes");
 	crate::sched::run_until_idle();
 	crate::serial_println!("aarch64: userspace - both EL0 processes exited");
+}
+
+// Build a minimal aarch64 ELF in memory and run it through the PORTABLE ELF
+// loader (crate::elf, the same the x86 kernel uses). The image is a single
+// R+X PT_LOAD segment at a standard low virtual address (4 MiB) holding a short
+// EL0 program (print a message via SYS_DEBUG_WRITE, then SYS_USER_EXIT) followed
+// by the message bytes. This exercises the loader end to end and proves the
+// higher-half relink freed the low half for standard low-VA user ELFs.
+fn run_elf_process() {
+	use crate::object::address_space::AddressSpace;
+	use crate::object::process::Process;
+
+	// The EL0 program: x0 already holds the message VA (the entry argument).
+	let movz = |rd: u32, imm: u16| -> u32 { 0xD280_0000 | ((imm as u32) << 5) | rd };
+	const SVC0: u32 = 0xD400_0001;
+	let msg: &[u8] = b"hello from an ELF-loaded aarch64 process\n";
+	let prog: [u32; 6] = [
+		movz(1, msg.len() as u16),            // mov x1, #len
+		movz(8, abi::SYS_DEBUG_WRITE as u16), // mov x8, #SYS_DEBUG_WRITE
+		SVC0,
+		movz(8, abi::SYS_USER_EXIT as u16), // mov x8, #SYS_USER_EXIT
+		SVC0,
+		0x1400_0000, // b .
+	];
+
+	const CODE_VA: u64 = 0x0040_0000; // 4 MiB - a standard low user vaddr
+	const PH_OFF: usize = 64; // program header follows the 64-byte ELF header
+	const SEG_OFF: usize = 120; // segment payload follows the 56-byte phdr
+	let msg_off = prog.len() * 4;
+	let seg_len = msg_off + msg.len();
+
+	// Hand-build the 64-bit little-endian ELF: header + one PT_LOAD phdr + payload.
+	let mut elf = alloc::vec![0u8; SEG_OFF + seg_len];
+	elf[0..4].copy_from_slice(b"\x7fELF");
+	elf[4] = 2; // ELFCLASS64
+	elf[5] = 1; // ELFDATA2LSB
+	elf[6] = 1; // EV_CURRENT
+	elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+	elf[18..20].copy_from_slice(&0xb7u16.to_le_bytes()); // e_machine = EM_AARCH64
+	elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+	elf[24..32].copy_from_slice(&CODE_VA.to_le_bytes()); // e_entry
+	elf[32..40].copy_from_slice(&(PH_OFF as u64).to_le_bytes()); // e_phoff
+	elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+	elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+	elf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+	elf[PH_OFF..PH_OFF + 4].copy_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+	elf[PH_OFF + 4..PH_OFF + 8].copy_from_slice(&5u32.to_le_bytes()); // p_flags = R|X
+	elf[PH_OFF + 8..PH_OFF + 16].copy_from_slice(&(SEG_OFF as u64).to_le_bytes()); // p_offset
+	elf[PH_OFF + 16..PH_OFF + 24].copy_from_slice(&CODE_VA.to_le_bytes()); // p_vaddr
+	elf[PH_OFF + 24..PH_OFF + 32].copy_from_slice(&CODE_VA.to_le_bytes()); // p_paddr
+	elf[PH_OFF + 32..PH_OFF + 40].copy_from_slice(&(seg_len as u64).to_le_bytes()); // p_filesz
+	elf[PH_OFF + 40..PH_OFF + 48].copy_from_slice(&(seg_len as u64).to_le_bytes()); // p_memsz
+	elf[PH_OFF + 48..PH_OFF + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+	for (i, w) in prog.iter().enumerate() {
+		elf[SEG_OFF + i * 4..SEG_OFF + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+	}
+	elf[SEG_OFF + msg_off..SEG_OFF + msg_off + msg.len()].copy_from_slice(msg);
+
+	let addr_space = match AddressSpace::create() {
+		Some(a) => a,
+		None => {
+			crate::serial_println!("aarch64: ELF - no address space");
+			return;
+		}
+	};
+	let mut frames: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	let entry = match crate::elf::load_into(&elf, &addr_space, &mut frames) {
+		Ok(e) => e,
+		Err(_) => {
+			crate::serial_println!("aarch64: ELF - load failed");
+			for f in frames {
+				super::paging::dealloc_frame(f);
+			}
+			return;
+		}
+	};
+	// The loader wrote code through the data path; invalidate the I-cache so the
+	// freshly loaded instructions are fetched from memory.
+	unsafe {
+		core::arch::asm!("ic iallu", "dsb ish", "isb", options(nostack, preserves_flags));
+	}
+
+	// The loader maps only PT_LOAD segments; map a user stack separately.
+	let stack = super::paging::alloc_frame().expect("aarch64: no frame for ELF stack");
+	let stack_va: u64 = 0x0080_0000; // 8 MiB
+	let stack_top = stack_va + 0x1000;
+	addr_space.map(stack_va, stack, super::paging::PRESENT | super::paging::WRITABLE | super::paging::USER | super::paging::NO_EXECUTE);
+	frames.push(stack);
+
+	let msg_va = CODE_VA + msg_off as u64;
+	let process = Process::new(addr_space, crate::sched::root_domain());
+	process.adopt_frames(frames);
+	let ctx = alloc::boxed::Box::new(UserCtx { entry, stack_top, arg: msg_va });
+	crate::sched::thread_create(process, user_trampoline, alloc::boxed::Box::into_raw(ctx) as u64);
+	crate::serial_println!("aarch64: ELF - loading + running a low-VA aarch64 ELF (entry {entry:#x})");
+	crate::sched::run_until_idle();
+	crate::serial_println!("aarch64: ELF - process exited");
 }
 
 // A single user process that exercises capability IPC entirely from EL0: it

@@ -66,9 +66,13 @@ pub fn load_into(elf: &[u8], addr_space: &AddressSpace, frames: &mut Vec<u64>) -
 	if e_type != 2 && e_type != 3 {
 		return Err(ElfError::BadType);
 	}
-	// EM_X86_64.
+	// The ELF machine type for the arch this kernel is built for.
+	#[cfg(target_arch = "x86_64")]
+	const EXPECTED_MACHINE: u16 = 0x3e; // EM_X86_64
+	#[cfg(target_arch = "aarch64")]
+	const EXPECTED_MACHINE: u16 = 0xb7; // EM_AARCH64
 	let e_machine = rd_u16(elf, 18);
-	if e_machine != 0x3e {
+	if e_machine != EXPECTED_MACHINE {
 		return Err(ElfError::BadMachine);
 	}
 	let e_entry = rd_u64(elf, 24);

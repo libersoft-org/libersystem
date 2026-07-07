@@ -2,21 +2,23 @@
 //
 // This is a minimal polled driver, enough for the M116 bring-up: transmit a byte
 // (wait while the TX FIFO is full, then write UARTDR) and read one (if the RX
-// FIFO is not empty). With the MMU off every access goes straight to the device's
-// physical MMIO. Interrupt-driven RX + the async TX ring come later with the GIC.
+// FIFO is not empty). The kernel runs in the higher half, so the device's MMIO is
+// reached through the physical direct map (`phys_to_virt`). Interrupt-driven RX +
+// the async TX ring come later with the GIC.
 
+use super::paging::phys_to_virt;
 use core::fmt::{self, Write};
 
 // UART0 on QEMU virt.
-const UART_BASE: usize = 0x0900_0000;
-const UARTDR: usize = 0x00; // data register
-const UARTFR: usize = 0x18; // flag register
+const UART_BASE: u64 = 0x0900_0000;
+const UARTDR: u64 = 0x00; // data register
+const UARTFR: u64 = 0x18; // flag register
 const FR_RXFE: u32 = 1 << 4; // receive FIFO empty
 const FR_TXFF: u32 = 1 << 5; // transmit FIFO full
 
 #[inline]
-fn reg(off: usize) -> *mut u32 {
-	(UART_BASE + off) as *mut u32
+fn reg(off: u64) -> *mut u32 {
+	phys_to_virt(UART_BASE + off) as *mut u32
 }
 
 pub fn init() {

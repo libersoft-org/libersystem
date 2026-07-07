@@ -8,6 +8,7 @@
 // bring-up needs - the total RAM size and the CPU count - so the frame allocator
 // and the per-CPU pool stop hard-coding them.
 
+use super::paging::phys_to_virt;
 use core::ptr::read_volatile;
 
 // What the kernel wants out of the device tree.
@@ -36,7 +37,7 @@ const SCAN_END: u64 = 0x4800_0000;
 
 // Read a big-endian u32 from a (byte-addressed) FDT offset.
 unsafe fn be32(p: u64) -> u32 {
-	let b = |o: u64| unsafe { read_volatile((p + o) as *const u8) };
+	let b = |o: u64| unsafe { read_volatile(phys_to_virt(p + o) as *const u8) };
 	u32::from_be_bytes([b(0), b(1), b(2), b(3)])
 }
 
@@ -79,11 +80,11 @@ fn locate(hint: u64) -> Option<u64> {
 unsafe fn str_eq(p: u64, s: &str) -> bool {
 	unsafe {
 		for (i, &c) in s.as_bytes().iter().enumerate() {
-			if read_volatile((p + i as u64) as *const u8) != c {
+			if read_volatile(phys_to_virt(p + i as u64) as *const u8) != c {
 				return false;
 			}
 		}
-		read_volatile((p + s.len() as u64) as *const u8) == 0
+		read_volatile(phys_to_virt(p + s.len() as u64) as *const u8) == 0
 	}
 }
 
@@ -91,7 +92,7 @@ unsafe fn str_eq(p: u64, s: &str) -> bool {
 unsafe fn str_starts(p: u64, prefix: &str) -> bool {
 	unsafe {
 		for (i, &c) in prefix.as_bytes().iter().enumerate() {
-			if read_volatile((p + i as u64) as *const u8) != c {
+			if read_volatile(phys_to_virt(p + i as u64) as *const u8) != c {
 				return false;
 			}
 		}
@@ -102,7 +103,7 @@ unsafe fn str_starts(p: u64, prefix: &str) -> bool {
 // Length (excluding the terminator) of a null-terminated FDT string at `p`.
 unsafe fn str_len(p: u64) -> u64 {
 	let mut n = 0u64;
-	while unsafe { read_volatile((p + n) as *const u8) } != 0 {
+	while unsafe { read_volatile(phys_to_virt(p + n) as *const u8) } != 0 {
 		n += 1;
 	}
 	n

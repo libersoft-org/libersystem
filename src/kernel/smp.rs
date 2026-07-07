@@ -49,6 +49,14 @@ pub fn cpu_count() -> usize {
 	CPU_COUNT.load(Ordering::Relaxed)
 }
 
+// Register the machine's core count from the arch backend. aarch64 brings up SMP
+// through PSCI rather than the ACPI/APIC path in `init`, so it records the count
+// here before sizing the per-CPU scheduler slots.
+#[cfg(target_arch = "aarch64")]
+pub fn set_cpu_count(count: usize) {
+	CPU_COUNT.store(count, Ordering::Relaxed);
+}
+
 // Number of cores currently online.
 pub fn online_count() -> usize {
 	ONLINE.load(Ordering::Acquire)

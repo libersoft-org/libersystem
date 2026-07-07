@@ -34,11 +34,11 @@ static INTERVAL: AtomicU64 = AtomicU64::new(0); // timer down-count per tick
 
 #[inline]
 fn gicd(off: usize) -> *mut u32 {
-	(GICD_BASE + off) as *mut u32
+	super::paging::phys_to_virt((GICD_BASE + off) as u64) as *mut u32
 }
 #[inline]
 fn gicc(off: usize) -> *mut u32 {
-	(GICC_BASE + off) as *mut u32
+	super::paging::phys_to_virt((GICC_BASE + off) as u64) as *mut u32
 }
 
 // The generic-timer counter frequency (Hz), from CNTFRQ_EL0.

@@ -6,11 +6,14 @@
 // frames); `read`/`write` submit a single request as a 3-descriptor chain, kick
 // the device through its notify region, and poll the used ring for completion.
 // Caches are off during bring-up, so DMA memory is plain non-cacheable RAM and
-// only ordering barriers are needed; the BAR MMIO is Device memory the boot map
-// already covers (identity, hhdm 0), so physical addresses are used directly.
+// only ordering barriers are needed. The kernel runs in the higher half, so both
+// the BAR MMIO and the DMA rings are reached through the physical direct map
+// (`phys_to_virt`); the addresses programmed into the device (queue rings, buffer
+// pointers) stay physical, since the device sees physical memory.
 
 use core::arch::asm;
 
+use super::paging::phys_to_virt;
 use super::pci::VirtioDevice;
 
 // device_status bits.
@@ -67,9 +70,11 @@ fn barrier() {
 	unsafe { asm!("dmb ish", options(nostack, preserves_flags)) }
 }
 
-// Write one descriptor-table entry (16 bytes: addr, len, flags, next).
+// Write one descriptor-table entry (16 bytes: addr, len, flags, next). `desc` is
+// the ring's physical address; the kernel reaches it through the direct map,
+// while `addr` (the buffer pointer stored in the entry) stays physical.
 unsafe fn put_desc(desc: u64, i: u64, addr: u64, len: u32, flags: u16, next: u16) {
-	let d = desc + i * 16;
+	let d = phys_to_virt(desc) + i * 16;
 	unsafe {
 		w64(d, addr);
 		w32(d + 8, len);
@@ -95,7 +100,7 @@ impl BlkDevice {
 	// Reset, negotiate features, and set up request queue 0. Returns None on
 	// failure or if memory is exhausted.
 	pub fn init(dev: &VirtioDevice) -> Option<BlkDevice> {
-		let cfg = dev.bar_phys + dev.common.offset as u64;
+		let cfg = phys_to_virt(dev.bar_phys + dev.common.offset as u64);
 		unsafe {
 			// Reset, acknowledge, claim.
 			w8(cfg + CFG_DEVICE_STATUS, 0);
@@ -137,7 +142,7 @@ impl BlkDevice {
 			w16(cfg + CFG_QUEUE_ENABLE, 1);
 			w8(cfg + CFG_DEVICE_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK | S_DRIVER_OK);
 
-			let notify = dev.bar_phys + dev.notify.offset as u64 + notify_off as u64 * dev.notify.notify_multiplier as u64;
+			let notify = phys_to_virt(dev.bar_phys + dev.notify.offset as u64 + notify_off as u64 * dev.notify.notify_multiplier as u64);
 			Some(BlkDevice { notify, desc, avail, used, qsz, req, avail_idx: 0, used_seen: 0 })
 		}
 	}
@@ -146,14 +151,20 @@ impl BlkDevice {
 	// Returns the blk status byte (0 = OK) or None on timeout. `data_write` marks
 	// the data buffer device-writable (a read); a write leaves the device reading it.
 	fn submit(&mut self, blk_type: u32, sector: u64, data_write: bool) -> Option<u8> {
+		// Physical buffer pointers (programmed into descriptors, seen by the device)
+		// and their direct-map virtual aliases (used for kernel reads/writes).
 		let hdr = self.req;
 		let data = self.req + 512;
 		let status = self.req + 1024;
+		let hdr_v = phys_to_virt(hdr);
+		let status_v = phys_to_virt(status);
+		let avail_v = phys_to_virt(self.avail);
+		let used_v = phys_to_virt(self.used);
 		unsafe {
-			w32(hdr, blk_type);
-			w32(hdr + 4, 0);
-			w64(hdr + 8, sector);
-			w8(status, 0xff);
+			w32(hdr_v, blk_type);
+			w32(hdr_v + 4, 0);
+			w64(hdr_v + 8, sector);
+			w8(status_v, 0xff);
 
 			let data_flags = if data_write { VRING_DESC_F_NEXT | VRING_DESC_F_WRITE } else { VRING_DESC_F_NEXT };
 			put_desc(self.desc, 0, hdr, 16, VRING_DESC_F_NEXT, 1);
@@ -161,25 +172,25 @@ impl BlkDevice {
 			put_desc(self.desc, 2, status, 1, VRING_DESC_F_WRITE, 0);
 
 			// Publish descriptor 0 as head in the available ring.
-			w16(self.avail + 4 + (self.avail_idx % self.qsz) as u64 * 2, 0);
+			w16(avail_v + 4 + (self.avail_idx % self.qsz) as u64 * 2, 0);
 			barrier();
 			self.avail_idx = self.avail_idx.wrapping_add(1);
-			w16(self.avail + 2, self.avail_idx);
+			w16(avail_v + 2, self.avail_idx);
 			barrier();
 
 			// Kick, then poll the used ring for a new completion.
 			w16(self.notify, 0);
 			let mut spins = 0u64;
-			while r16(self.used + 2) == self.used_seen && spins < 200_000_000 {
+			while r16(used_v + 2) == self.used_seen && spins < 200_000_000 {
 				spins += 1;
 				core::hint::spin_loop();
 			}
 			barrier();
-			if r16(self.used + 2) == self.used_seen {
+			if r16(used_v + 2) == self.used_seen {
 				return None;
 			}
 			self.used_seen = self.used_seen.wrapping_add(1);
-			Some(r8(status))
+			Some(r8(status_v))
 		}
 	}
 
@@ -187,7 +198,7 @@ impl BlkDevice {
 	pub fn read(&mut self, sector: u64, buf: &mut [u8; SECTOR_SIZE]) -> bool {
 		match self.submit(VIRTIO_BLK_T_IN, sector, true) {
 			Some(0) => {
-				unsafe { core::ptr::copy_nonoverlapping((self.req + 512) as *const u8, buf.as_mut_ptr(), SECTOR_SIZE) };
+				unsafe { core::ptr::copy_nonoverlapping(phys_to_virt(self.req + 512) as *const u8, buf.as_mut_ptr(), SECTOR_SIZE) };
 				true
 			}
 			_ => false,
@@ -196,7 +207,7 @@ impl BlkDevice {
 
 	// Write one 512-byte sector from `buf`.
 	pub fn write(&mut self, sector: u64, buf: &[u8; SECTOR_SIZE]) -> bool {
-		unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), (self.req + 512) as *mut u8, SECTOR_SIZE) };
+		unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), phys_to_virt(self.req + 512) as *mut u8, SECTOR_SIZE) };
 		matches!(self.submit(VIRTIO_BLK_T_OUT, sector, false), Some(0))
 	}
 }

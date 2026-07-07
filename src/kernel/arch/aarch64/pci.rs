@@ -43,9 +43,11 @@ pub fn set_ecam_base(base: u64) {
 	ECAM_BASE.store(base as usize, Ordering::Relaxed);
 }
 
-// Byte address of a config-space register for a given B/D/F.
+// Virtual address of a config-space register for a given B/D/F (the ECAM MMIO is
+// reached through the physical direct map, since the kernel runs higher-half).
 fn cfg_addr(bus: u8, dev: u8, func: u8, off: usize) -> usize {
-	ECAM_BASE.load(Ordering::Relaxed) + ((bus as usize) << 20) + ((dev as usize) << 15) + ((func as usize) << 12) + off
+	let phys = ECAM_BASE.load(Ordering::Relaxed) + ((bus as usize) << 20) + ((dev as usize) << 15) + ((func as usize) << 12) + off;
+	super::paging::phys_to_virt(phys as u64) as usize
 }
 fn cfg_read32(bus: u8, dev: u8, func: u8, off: usize) -> u32 {
 	unsafe { core::ptr::read_volatile(cfg_addr(bus, dev, func, off) as *const u32) }

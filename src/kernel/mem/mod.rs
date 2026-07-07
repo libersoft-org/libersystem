@@ -26,6 +26,15 @@ pub fn hhdm_offset() -> u64 {
 	HHDM_OFFSET.load(Ordering::Relaxed)
 }
 
+// Publish the higher-half direct-map offset from the arch backend. aarch64 builds
+// its own boot page tables (a direct map at KERNEL_VA_OFFSET) rather than taking
+// an HHDM from a bootloader, so it sets the offset here before seeding the frame
+// allocator, rather than through `init`.
+#[cfg(target_arch = "aarch64")]
+pub fn set_hhdm_offset(offset: u64) {
+	HHDM_OFFSET.store(offset, Ordering::Relaxed);
+}
+
 // The number of retained boot memory-map regions.
 pub fn memmap_len() -> usize {
 	MEMMAP.lock().len()
