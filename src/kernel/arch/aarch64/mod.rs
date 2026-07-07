@@ -89,62 +89,7 @@ pub fn exit_qemu(_success: bool) -> ! {
 }
 
 // ------------------------------------------------------------------ paging
-pub mod paging {
-	// Placeholder page-table permission bits (mirrors the x86 flag set the
-	// portable callers OR together; the real VMSAv8 encoding lands in M116).
-	pub const PRESENT: u64 = 1 << 0;
-	pub const WRITABLE: u64 = 1 << 1;
-	pub const USER: u64 = 1 << 2;
-	pub const NO_CACHE: u64 = 1 << 4;
-	pub const NO_EXECUTE: u64 = 1 << 63;
-
-	pub fn enable_nx() {}
-	pub fn enable_smap_smep() {}
-	pub fn smap_enabled() -> bool {
-		false
-	}
-	pub fn smep_enabled() -> bool {
-		false
-	}
-	pub fn nx_enabled() -> bool {
-		false
-	}
-	pub fn clac_on_entry() {}
-
-	pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
-		f()
-	}
-
-	pub unsafe fn copy_to_user_page(_dst: u64, _bytes: &[u8]) {
-		todo!("aarch64 paging (M116)")
-	}
-
-	pub fn map_page(_virt: u64, _phys: u64, _flags: u64) {
-		todo!("aarch64 paging (M116)")
-	}
-	pub fn map_page_in(_ttbr: u64, _virt: u64, _phys: u64, _flags: u64) {
-		todo!("aarch64 paging (M116)")
-	}
-	pub fn unmap_page(_virt: u64) -> Option<u64> {
-		todo!("aarch64 paging (M116)")
-	}
-	pub fn unmap_pages(_base: u64, _count: usize) {
-		todo!("aarch64 paging (M116)")
-	}
-	pub fn unmap_page_in(_ttbr: u64, _virt: u64) -> Option<u64> {
-		todo!("aarch64 paging (M116)")
-	}
-	pub fn new_address_space() -> Option<u64> {
-		todo!("aarch64 paging (M116)")
-	}
-	pub fn free_address_space(_ttbr: u64) {
-		todo!("aarch64 paging (M116)")
-	}
-	pub fn translate(_virt: u64) -> Option<u64> {
-		todo!("aarch64 paging (M116)")
-	}
-	pub fn remove_bootstrap_identity() {}
-}
+pub mod paging;
 
 // ----------------------------------------------------------------- context
 pub mod context {

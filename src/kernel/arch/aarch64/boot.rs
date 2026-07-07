@@ -56,7 +56,30 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 
 	crate::serial_println!("{} kernel is starting ...", crate::product::NAME);
 	crate::serial_println!("arch: aarch64 | EL{el} | DTB {dtb:#x}");
-	crate::serial_println!("aarch64 bring-up: PL011 serial OK - halting (MMU / GIC / SMP land in M116)");
+
+	// Turn on the MMU with a boot identity map. Serial keeps working across the
+	// enable because the UART's device page is mapped and the map is identity.
+	unsafe {
+		super::paging::init_boot_mmu();
+	}
+	crate::serial_println!("aarch64: MMU on (identity map, 4 kB granule)");
+
+	// Prove translation works: the UART (device) and this code (Normal RAM) walk
+	// back to their own physical addresses, and a RAM read-back survives the MMU.
+	let uart = super::paging::translate(0x0900_0000).unwrap_or(0);
+	let code = super::paging::translate(aarch64_main as *const () as u64).unwrap_or(0);
+	crate::serial_println!("aarch64: translate(uart 0x9000000) = {uart:#x}");
+	crate::serial_println!("aarch64: translate(&aarch64_main)   = {code:#x}");
+
+	static mut PROBE: u64 = 0;
+	let ram_ok = unsafe {
+		let p = &raw mut PROBE;
+		core::ptr::write_volatile(p, 0xA5A5_1234_5678_C3C3);
+		core::ptr::read_volatile(p) == 0xA5A5_1234_5678_C3C3
+	};
+	crate::serial_println!("aarch64: post-MMU RAM read/write = {}", if ram_ok { "ok" } else { "FAIL" });
+
+	crate::serial_println!("aarch64 bring-up: serial + MMU OK - halting (GIC / SMP / syscall land next)");
 
 	super::halt_loop()
 }
