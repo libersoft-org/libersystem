@@ -94,58 +94,10 @@ pub fn exit_qemu(_success: bool) -> ! {
 pub mod paging;
 
 // ----------------------------------------------------------------- context
-pub mod context {
-	pub unsafe fn switch_context(_old_sp: *mut u64, _new_sp: u64) {
-		todo!("aarch64 context switch (M116)")
-	}
-	pub fn init_thread_stack(_stack: &mut [u8], _entry: extern "C" fn(u64), _arg: u64) -> u64 {
-		todo!("aarch64 context switch (M116)")
-	}
-	// The active address-space token (TTBR0 on aarch64; kept named `cr3` for the
-	// portable contract).
-	pub fn read_cr3() -> u64 {
-		todo!("aarch64 TTBR0 (M116)")
-	}
-	pub unsafe fn write_cr3(_ttbr: u64) {
-		todo!("aarch64 TTBR0 (M116)")
-	}
-}
+pub mod context;
 
 // ------------------------------------------------------------------ percpu
-pub mod percpu {
-	pub struct PerCpu;
-
-	impl PerCpu {
-		pub fn cpu_id(&self) -> u32 {
-			todo!("aarch64 per-CPU (M116)")
-		}
-		pub fn lapic_id(&self) -> u32 {
-			todo!("aarch64 per-CPU (M116)")
-		}
-	}
-
-	pub fn allocate(_count: usize) {
-		todo!("aarch64 per-CPU (M116)")
-	}
-	pub fn init(_cpu_id: usize, _mpidr: u32) {
-		todo!("aarch64 per-CPU (M116)")
-	}
-	pub fn this_cpu() -> &'static PerCpu {
-		todo!("aarch64 per-CPU (M116)")
-	}
-	pub fn set_kernel_rsp(_value: u64) {
-		todo!("aarch64 per-CPU (M116)")
-	}
-	pub fn set_tss_rsp0_slot(_addr: u64) {
-		todo!("aarch64 per-CPU (M116)")
-	}
-	pub fn set_rsp0(_value: u64) {
-		todo!("aarch64 per-CPU (M116)")
-	}
-	pub fn in_user_syscall() -> bool {
-		todo!("aarch64 per-CPU (M116)")
-	}
-}
+pub mod percpu;
 
 // -------------------------------------------------------------- interrupts
 pub mod interrupts {

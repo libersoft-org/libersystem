@@ -120,6 +120,29 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	let ok = via_high == pattern && via_phys == pattern;
 	crate::serial_println!("aarch64: map_page {hva:#x} -> {frame:#x} | high={via_high:#x} phys={via_phys:#x} = {}", if ok { "ok" } else { "FAIL" });
 
+	// Per-CPU block for the boot core, reachable through TPIDR_EL1.
+	let mpidr: u64;
+	unsafe {
+		core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
+	}
+	super::percpu::allocate(1);
+	super::percpu::init(0, mpidr as u32);
+	let cpu = super::percpu::this_cpu();
+	crate::serial_println!("aarch64: per-CPU up (TPIDR_EL1) cpu_id={} mpidr={:#x}", cpu.cpu_id(), cpu.lapic_id() & 0xff_ffff);
+
+	// Cooperative context switch: spin up two kernel threads that ping-pong via
+	// switch_context, then thread A returns control here.
+	let (a_sp, b_sp) = unsafe { (super::context::init_thread_stack(&mut *(&raw mut STACK_A), thread_a, 0xAA), super::context::init_thread_stack(&mut *(&raw mut STACK_B), thread_b, 0xBB)) };
+	unsafe {
+		A_SP = a_sp;
+		B_SP = b_sp;
+	}
+	crate::serial_println!("aarch64: context switch - starting kernel threads");
+	unsafe {
+		super::context::switch_context(&raw mut MAIN_SP, A_SP);
+	}
+	crate::serial_println!("aarch64: context switch - returned to boot core");
+
 	// EL0 usermode: map a user code page and stack at 4 GiB+ (clear of the low
 	// 1 GB identity blocks), copy in a tiny program that makes SVC syscalls, and
 	// `eret` down to EL0. The program's "exit" syscall unwinds control back here.
@@ -140,6 +163,36 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	}
 	crate::serial_println!("aarch64: returned from EL0 usermode");
 
-	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + EL0 OK - halting");
+	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + percpu + threads + EL0 OK - halting");
 	super::halt_loop()
+}
+
+// Cooperative context-switch demo: two kernel threads ping-pong via
+// switch_context, then thread A hands control back to the boot path.
+static mut MAIN_SP: u64 = 0;
+static mut A_SP: u64 = 0;
+static mut B_SP: u64 = 0;
+static mut STACK_A: [u8; 8192] = [0; 8192];
+static mut STACK_B: [u8; 8192] = [0; 8192];
+
+extern "C" fn thread_a(arg: u64) {
+	for i in 0..3 {
+		crate::serial_println!("aarch64: thread A step {i} (arg={arg:#x})");
+		unsafe {
+			super::context::switch_context(&raw mut A_SP, B_SP);
+		}
+	}
+	// Done - hand control back to the boot path.
+	unsafe {
+		super::context::switch_context(&raw mut A_SP, MAIN_SP);
+	}
+}
+
+extern "C" fn thread_b(arg: u64) {
+	loop {
+		crate::serial_println!("aarch64: thread B step (arg={arg:#x})");
+		unsafe {
+			super::context::switch_context(&raw mut B_SP, A_SP);
+		}
+	}
 }
