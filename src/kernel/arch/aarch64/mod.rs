@@ -228,12 +228,13 @@ pub mod ioapic {
 
 // --------------------------------------------------------------------- rtc
 // The PL031 real-time clock (QEMU virt at 0x0901_0000): its data register holds
-// the current time as seconds since the Unix epoch. In the low device MMIO region
-// the boot map already covers.
+// the current time as seconds since the Unix epoch. Reached through the physical
+// direct map (the kernel runs higher-half, so TTBR0 is the caller's user space).
 pub mod rtc {
 	pub fn read_unix() -> u64 {
-		const PL031_DR: usize = 0x0901_0000;
-		unsafe { core::ptr::read_volatile(PL031_DR as *const u32) as u64 }
+		const PL031_DR: u64 = 0x0901_0000;
+		let va = super::paging::phys_to_virt(PL031_DR);
+		unsafe { core::ptr::read_volatile(va as *const u32) as u64 }
 	}
 }
 

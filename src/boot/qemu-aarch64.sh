@@ -19,6 +19,26 @@ MACHINE="virt,gic-version=2"
 DTB_FILE="$(mktemp /tmp/qemu-virt-XXXXXX.dtb)"
 trap 'rm -f "$DTB_FILE"' EXIT
 
+# System volume disk: a virtio-blk disk holding the packed volume archive at LBA 0.
+# StorageService reads that factory archive from LBA 0, formats a LiberFS past it,
+# and seeds vol://system - so the userspace boot chain can reach the shell. The
+# kernel build.rs writes volume-aarch64.pkg into this script's .build directory.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+VOLUME_PKG="$HERE/.build/volume-aarch64.pkg"
+VIRTIO_DISK="$HERE/.build/virtio-blk-aarch64.img"
+DISK_ARGS=()
+if [[ -f "$VOLUME_PKG" ]]; then
+	VIRTIO_DISK_SIZE=$((128 * 1024 * 1024))
+	if [[ ! -f "$VIRTIO_DISK" || "$(stat -c%s "$VIRTIO_DISK")" -ne "$VIRTIO_DISK_SIZE" ]]; then
+		rm -f "$VIRTIO_DISK"
+		truncate -s "$VIRTIO_DISK_SIZE" "$VIRTIO_DISK"
+	fi
+	# Re-lay the factory archive at LBA 0 every boot (conv=notrunc keeps the disk at
+	# its full size); StorageService reformats and reseeds from it.
+	dd if="$VOLUME_PKG" of="$VIRTIO_DISK" bs=512 conv=notrunc status=none
+	DISK_ARGS=(-drive "if=none,id=vol0,format=raw,file=$VIRTIO_DISK" -device "virtio-blk-pci,drive=vol0,disable-legacy=on")
+fi
+
 # Dump the machine's device tree (same machine config as the boot below), then
 # boot with it loaded at DTB_ADDR.
 qemu-system-aarch64 \
@@ -38,4 +58,5 @@ qemu-system-aarch64 \
 	-serial "$SERIAL" \
 	-display none \
 	-no-reboot \
+	"${DISK_ARGS[@]}" \
 	${QEMU_EXTRA:-}

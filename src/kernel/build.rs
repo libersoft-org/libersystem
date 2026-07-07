@@ -48,6 +48,19 @@ fn embed_aarch64_demo() {
 		Vec::new()
 	};
 	fs::write(&dest, &bytes).unwrap_or_else(|e: std::io::Error| panic!("cannot write {}: {e}", dest.display()));
+
+	// Expose the assembled volume package at a stable path so the aarch64 QEMU
+	// runner can lay it (the factory archive) onto a virtio-blk disk at LBA 0, which
+	// StorageService reads to format and seed the vol://system volume.
+	if arch == "aarch64" {
+		let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+		let build_dir: PathBuf = PathBuf::from(&manifest_dir).join("../boot/.build");
+		let _ = fs::create_dir_all(&build_dir);
+		let vol_src: PathBuf = out_dir.join("volume.pkg");
+		if vol_src.exists() {
+			let _ = fs::copy(&vol_src, build_dir.join("volume-aarch64.pkg"));
+		}
+	}
 }
 
 // Parse ../../product.conf (shell-style KEY="value") into key/value pairs (the
@@ -168,13 +181,21 @@ fn read_stripped(path: &Path) -> Option<Vec<u8>> {
 	if fs::copy(path, &tmp).is_err() {
 		return None;
 	}
-	let stripped: Option<Vec<u8>> = match Command::new("strip").arg("-s").arg(&tmp).status() {
-		Ok(status) if status.success() => fs::read(&tmp).ok(),
-		_ => {
-			println!("cargo:warning=strip unavailable - omitting {} from the system volume", path.display());
-			None
+	// llvm-strip strips any target's ELF (the host binutils `strip` cannot handle a
+	// cross-arch ELF, e.g. aarch64 on an x86 host); fall back to the host strip.
+	let mut ok = false;
+	for (cmd, arg) in [("llvm-strip", "--strip-all"), ("strip", "-s")] {
+		if let Ok(status) = Command::new(cmd).arg(arg).arg(&tmp).status() {
+			if status.success() {
+				ok = true;
+				break;
+			}
 		}
-	};
+	}
+	if !ok {
+		println!("cargo:warning=no usable strip tool - omitting {} from the package", path.display());
+	}
+	let stripped: Option<Vec<u8>> = if ok { fs::read(&tmp).ok() } else { None };
 	let _ = fs::remove_file(&tmp);
 	stripped
 }
@@ -277,7 +298,10 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		};
 		let path: PathBuf = user_elf_path(&manifest, &row.crate_dir, &row.name);
 		println!("cargo:rerun-if-changed={}", path.display());
-		match read_stripped(&path) {
+		// Strip the ELF to its loadable image; fall back to the raw ELF when no
+		// `strip` supports the target (the host binutils cannot strip aarch64), so
+		// the program is still staged - the loader ignores the extra sections.
+		match read_stripped(&path).or_else(|| fs::read(&path).ok()) {
 			Some(bytes) => files.push((dest, bytes)),
 			None => println!("cargo:warning={} ELF not found at {} - omitting from system volume (run `just user` or `just build`)", row.name, path.display()),
 		}
