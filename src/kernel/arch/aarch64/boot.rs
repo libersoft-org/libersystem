@@ -182,7 +182,42 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	}
 	crate::serial_println!("aarch64: returned from EL0 usermode");
 
-	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + percpu + SMP + threads + EL0 OK - halting");
+	// Per-address-space isolation: two independent address spaces map the SAME
+	// virtual address to different physical frames. Switching TTBR0 (write_cr3)
+	// changes what that address reads - the kernel keeps running because each
+	// space carries the kernel identity. The user-region tables + frames are then
+	// freed back to the allocator.
+	let as1 = paging::new_address_space().expect("aarch64: no frame for AS1");
+	let as2 = paging::new_address_space().expect("aarch64: no frame for AS2");
+	let f1 = paging::alloc_frame().expect("aarch64: no frame for AS1 page");
+	let f2 = paging::alloc_frame().expect("aarch64: no frame for AS2 page");
+	let shared_va: u64 = 0x2_0000_0000; // 8 GiB - in the free per-AS region
+	paging::map_page_in(as1, shared_va, f1, paging::PRESENT | paging::WRITABLE | paging::NO_EXECUTE);
+	paging::map_page_in(as2, shared_va, f2, paging::PRESENT | paging::WRITABLE | paging::NO_EXECUTE);
+	let boot_ttbr0 = super::context::read_cr3();
+	let (r1, r2) = unsafe {
+		super::context::write_cr3(as1);
+		core::ptr::write_volatile(shared_va as *mut u64, 0x1111_1111);
+		super::context::write_cr3(as2);
+		core::ptr::write_volatile(shared_va as *mut u64, 0x2222_2222);
+		super::context::write_cr3(as1);
+		let a = core::ptr::read_volatile(shared_va as *const u64);
+		super::context::write_cr3(as2);
+		let b = core::ptr::read_volatile(shared_va as *const u64);
+		super::context::write_cr3(boot_ttbr0);
+		(a, b)
+	};
+	let iso_ok = r1 == 0x1111_1111 && r2 == 0x2222_2222;
+	crate::serial_println!("aarch64: address spaces {as1:#x}/{as2:#x} @ {shared_va:#x} -> {r1:#x}/{r2:#x} = {}", if iso_ok { "isolated" } else { "FAIL" });
+	paging::unmap_page_in(as1, shared_va);
+	paging::unmap_page_in(as2, shared_va);
+	paging::dealloc_frame(f1);
+	paging::dealloc_frame(f2);
+	paging::free_address_space(as1);
+	paging::free_address_space(as2);
+	crate::serial_println!("aarch64: address spaces torn down");
+
+	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + percpu + SMP + threads + EL0 + addrspace OK - halting");
 	super::halt_loop()
 }
 

@@ -160,6 +160,9 @@ const DRAM_TOP_FALLBACK: u64 = DRAM_BASE + 512 * 1024 * 1024;
 // usable DRAM (from the device tree, or the fallback).
 static FRAME_NEXT: AtomicU64 = AtomicU64::new(0);
 static RAM_TOP: AtomicU64 = AtomicU64::new(DRAM_TOP_FALLBACK);
+// Head of the freed-frame list (0 = empty); each freed frame stores the next
+// head in its first 8 bytes.
+static FRAME_FREELIST: AtomicU64 = AtomicU64::new(0);
 
 // Point the bump allocator at the free DRAM above the kernel image, up to
 // `ram_top` (0 = use the built-in fallback).
@@ -172,7 +175,19 @@ pub fn init_frame_allocator(ram_top: u64) {
 }
 
 // Allocate one zeroed 4 kB physical frame, or `None` when DRAM is exhausted.
+// Reused frames come off the free list first, then fresh ones off the bump.
 pub fn alloc_frame() -> Option<u64> {
+	loop {
+		let head = FRAME_FREELIST.load(Ordering::Acquire);
+		if head == 0 {
+			break;
+		}
+		let next = unsafe { core::ptr::read_volatile(head as *const u64) };
+		if FRAME_FREELIST.compare_exchange(head, next, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+			unsafe { core::ptr::write_bytes(head as *mut u8, 0, 4096) };
+			return Some(head);
+		}
+	}
 	let pa = FRAME_NEXT.fetch_add(4096, Ordering::Relaxed);
 	if pa == 0 || pa + 4096 > RAM_TOP.load(Ordering::Relaxed) {
 		return None;
@@ -181,6 +196,17 @@ pub fn alloc_frame() -> Option<u64> {
 		core::ptr::write_bytes(pa as *mut u8, 0, 4096);
 	}
 	Some(pa)
+}
+
+// Return a frame to the free list.
+pub fn dealloc_frame(pa: u64) {
+	loop {
+		let head = FRAME_FREELIST.load(Ordering::Acquire);
+		unsafe { core::ptr::write_volatile(pa as *mut u64, head) };
+		if FRAME_FREELIST.compare_exchange(head, pa, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+			return;
+		}
+	}
 }
 
 // How many 4 kB frames the allocator still has (for bring-up reporting).
@@ -335,19 +361,118 @@ pub fn map_page_in(ttbr: u64, virt: u64, phys: u64, flags: u64) {
 		map_page_root(ttbr & ADDR_MASK, virt, phys, flags);
 	}
 }
-pub fn unmap_page(_virt: u64) -> Option<u64> {
-	todo!("aarch64 4 kB unmap (M116)")
+
+// Return the next-level table's physical address, or None if the entry is absent
+// or a block (not a table descriptor).
+unsafe fn next_table(table: *const u64, idx: usize) -> Option<u64> {
+	let desc = unsafe { core::ptr::read_volatile(table.add(idx)) };
+	if desc & VALID == 0 || desc & TABLE == 0 { None } else { Some(desc & ADDR_MASK) }
 }
-pub fn unmap_pages(_base: u64, _count: usize) {
-	todo!("aarch64 4 kB unmap (M116)")
+
+// Unmap `virt` in the tree rooted at `root`, returning the frame it pointed at (if
+// mapped). Intermediate tables are left in place; free_address_space reclaims them.
+unsafe fn unmap_page_root(root: u64, virt: u64) -> Option<u64> {
+	let l1 = unsafe { next_table(root as *const u64, ((virt >> 39) & 0x1ff) as usize)? };
+	let l2 = unsafe { next_table(l1 as *const u64, ((virt >> 30) & 0x1ff) as usize)? };
+	let l3 = unsafe { next_table(l2 as *const u64, ((virt >> 21) & 0x1ff) as usize)? };
+	let leaf = (l3 as *mut u64).wrapping_add(((virt >> 12) & 0x1ff) as usize);
+	let desc = unsafe { core::ptr::read_volatile(leaf) };
+	if desc & VALID == 0 {
+		return None;
+	}
+	unsafe {
+		core::ptr::write_volatile(leaf, 0);
+		asm!(
+			"dsb ishst",
+			"tlbi vae1, {page}",
+			"dsb ish",
+			"isb",
+			page = in(reg) virt >> 12,
+			options(nostack, preserves_flags),
+		);
+	}
+	Some(desc & ADDR_MASK)
 }
-pub fn unmap_page_in(_ttbr: u64, _virt: u64) -> Option<u64> {
-	todo!("aarch64 4 kB unmap (M116)")
+
+pub fn unmap_page(virt: u64) -> Option<u64> {
+	unsafe { unmap_page_root(current_ttbr0(), virt) }
 }
+pub fn unmap_pages(base: u64, count: usize) {
+	for i in 0..count {
+		unmap_page(base + i as u64 * 4096);
+	}
+}
+pub fn unmap_page_in(ttbr: u64, virt: u64) -> Option<u64> {
+	unsafe { unmap_page_root(ttbr & ADDR_MASK, virt) }
+}
+
+// Create a fresh address-space root (TTBR0 tree). Because the kernel currently
+// runs identity-mapped in the low half, the new root carries the same kernel
+// identity: a fresh L0 -> a fresh L1 whose first four 1 GB block descriptors are
+// copied from the boot L1, so switching TTBR0 to it keeps the kernel (code,
+// stack, vectors, device MMIO) mapped. User pages go in the free region above
+// 4 GB (L1 entries 4..). Returns the L0 physical address, or None if out of RAM.
+// (When the kernel later moves to the high half, this becomes an empty L0.)
 pub fn new_address_space() -> Option<u64> {
-	todo!("aarch64 per-AS tables (M116)")
+	let l0 = alloc_frame()?;
+	let l1 = match alloc_frame() {
+		Some(f) => f,
+		None => {
+			dealloc_frame(l0);
+			return None;
+		}
+	};
+	unsafe {
+		core::ptr::write_volatile(l0 as *mut u64, l1 | VALID | TABLE);
+		let src = &raw const BOOT_L1 as *const u64;
+		let dst = l1 as *mut u64;
+		for i in 0..4 {
+			core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
+		}
+	}
+	Some(l0)
 }
-pub fn free_address_space(_ttbr: u64) {
-	todo!("aarch64 per-AS tables (M116)")
+
+// Tear down an address space created by new_address_space: free the user-region
+// page tables (below L1 entries 4..) and the L1 + L0 frames. The kernel identity
+// blocks (L1 entries 0..4) map no tables and are not freed; leaf data frames are
+// owned by whoever mapped them and are not freed here.
+pub fn free_address_space(root: u64) {
+	unsafe {
+		let l0 = root as *const u64;
+		if let Some(l1) = next_table(l0, 0) {
+			let l1p = l1 as *const u64;
+			for i in 4..512 {
+				if let Some(l2) = next_table(l1p, i) {
+					free_table_level(l2, 2);
+				}
+			}
+			dealloc_frame(l1);
+		}
+		dealloc_frame(root);
+	}
 }
+
+// Recursively free the intermediate tables below `phys`. `level` is 2 for an L2,
+// 1 for an L3. An L3's entries point at data frames, which are not freed; only the
+// table frames themselves are reclaimed.
+//
+// SAFETY: `phys` must be the physical address of a valid page table at `level`.
+unsafe fn free_table_level(phys: u64, level: u32) {
+	unsafe {
+		if level > 1 {
+			let table = phys as *const u64;
+			for i in 0..512 {
+				if let Some(next) = next_table(table, i) {
+					free_table_level(next, level - 1);
+				}
+			}
+		}
+		dealloc_frame(phys);
+	}
+}
+
+// No bootstrap identity to remove on aarch64: the boot identity map IS the kernel
+// address space (the kernel runs from the low half). This no-op keeps the portable
+// contract until the kernel moves to the high half.
 pub fn remove_bootstrap_identity() {}
