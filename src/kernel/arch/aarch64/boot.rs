@@ -251,25 +251,12 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	crate::sched::run_until_idle();
 	crate::serial_println!("aarch64: preemptive scheduler - all threads exited");
 
-	// EL0 usermode: map a user code page and stack at 4 GiB+ (clear of the low
-	// 1 GB identity blocks), copy in a tiny program that makes SVC syscalls, and
-	// `eret` down to EL0. The program's "exit" syscall unwinds control back here.
-	let code = paging::alloc_frame().expect("aarch64: no frame for user code");
-	let stack = paging::alloc_frame().expect("aarch64: no frame for user stack");
-	let user_entry: u64 = 0x1_0000_0000; // 4 GiB
-	let user_stack_top: u64 = 0x1_0001_0000;
-	paging::map_page(user_entry, code, paging::PRESENT | paging::USER);
-	paging::map_page(user_stack_top - 0x1000, stack, paging::PRESENT | paging::WRITABLE | paging::USER | paging::NO_EXECUTE);
-	let prog = super::usermode::program_bytes();
-	unsafe {
-		core::ptr::copy_nonoverlapping(prog.as_ptr(), code as *mut u8, prog.len());
-		core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
-	}
-	crate::serial_println!("aarch64: entering EL0 usermode at {user_entry:#x}");
-	unsafe {
-		super::usermode::enter(user_entry, user_stack_top, 0);
-	}
-	crate::serial_println!("aarch64: returned from EL0 usermode");
+	// Real userspace: a proper portable Process (its own address space) whose EL0
+	// program calls the REAL kernel syscall table - SYS_DEBUG_WRITE prints its
+	// message, then SYS_USER_EXIT unwinds. This exercises the full path: scheduler
+	// -> switch to the process address space -> eret to EL0 -> SVC -> portable
+	// syscall_dispatch -> user-pointer copy -> back to EL0 -> exit.
+	run_user_process();
 
 	// Per-address-space isolation: two independent address spaces map the SAME
 	// virtual address to different physical frames. Switching TTBR0 (write_cr3)
@@ -360,4 +347,77 @@ extern "C" fn preempt_task(id: u64) {
 		}
 		crate::serial_println!("aarch64: [preempt] thread {id} step {i}");
 	}
+}
+
+// The kernel-side entry of the user process's thread: drop to EL0 at the mapped
+// program. Returns when the program calls SYS_USER_EXIT (then the thread exits).
+extern "C" fn user_trampoline(ctx_raw: u64) {
+	let ctx = unsafe { alloc::boxed::Box::from_raw(ctx_raw as *mut UserCtx) };
+	unsafe {
+		super::usermode::enter(ctx.entry, ctx.stack_top, ctx.arg);
+	}
+}
+
+struct UserCtx {
+	entry: u64,
+	stack_top: u64,
+	arg: u64,
+}
+
+// Build a portable user Process and run its EL0 program through the real syscall
+// path. The program (assembled below) calls SYS_DEBUG_WRITE to print a message,
+// then SYS_USER_EXIT. User VAs sit at 64 TiB - above the low kernel identity that
+// every address space carries, and below USER_VA_END - so they never collide.
+fn run_user_process() {
+	use crate::object::address_space::AddressSpace;
+	use crate::object::process::Process;
+
+	let addr_space = match AddressSpace::create() {
+		Some(a) => a,
+		None => {
+			crate::serial_println!("aarch64: userspace - no address space");
+			return;
+		}
+	};
+	let code = super::paging::alloc_frame().expect("aarch64: no frame for user code");
+	let stack = super::paging::alloc_frame().expect("aarch64: no frame for user stack");
+
+	let code_va: u64 = 0x0000_4000_0000_0000; // 64 TiB
+	let msg_va = code_va + 0x800;
+	let stack_va: u64 = 0x0000_4000_0001_0000;
+	let stack_top = stack_va + 0x1000;
+
+	let msg = b"hello from an aarch64 EL0 process via SYS_DEBUG_WRITE\n";
+
+	// MOVZ Xd, #imm  |  x0 already holds the message pointer (the entry argument).
+	let movz = |rd: u32, imm: u16| -> u32 { 0xD280_0000 | ((imm as u32) << 5) | rd };
+	const SVC0: u32 = 0xD400_0001;
+	let prog: [u32; 6] = [
+		movz(1, msg.len() as u16),            // x1 = len
+		movz(8, abi::SYS_DEBUG_WRITE as u16), // x8 = SYS_DEBUG_WRITE
+		SVC0,
+		movz(8, abi::SYS_USER_EXIT as u16), // x8 = SYS_USER_EXIT
+		SVC0,
+		0x1400_0000, // b .
+	];
+	unsafe {
+		let cp = code as *mut u32;
+		for (i, w) in prog.iter().enumerate() {
+			core::ptr::write_volatile(cp.add(i), *w);
+		}
+		core::ptr::copy_nonoverlapping(msg.as_ptr(), (code + 0x800) as *mut u8, msg.len());
+		core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+	}
+
+	addr_space.map(code_va, code, super::paging::PRESENT | super::paging::USER);
+	addr_space.map(stack_va, stack, super::paging::PRESENT | super::paging::WRITABLE | super::paging::USER | super::paging::NO_EXECUTE);
+
+	let process = Process::new(addr_space, crate::sched::root_domain());
+	process.adopt_frames(alloc::vec![code, stack]);
+	let ctx = alloc::boxed::Box::new(UserCtx { entry: code_va, stack_top, arg: msg_va });
+	crate::sched::thread_create(process, user_trampoline, alloc::boxed::Box::into_raw(ctx) as u64);
+
+	crate::serial_println!("aarch64: userspace - entering EL0 process");
+	crate::sched::run_until_idle();
+	crate::serial_println!("aarch64: userspace - EL0 process exited");
 }

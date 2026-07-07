@@ -274,28 +274,21 @@ pub mod syscall {
 		todo!("aarch64 SVC (M116)")
 	}
 
-	// Dispatch an SVC from EL0 against the saved trap frame (x8 = number, x0.. =
-	// arguments, the result is written back into the x0 slot). Returns `true` for
-	// the "exit" syscall (the caller then unwinds back to the kernel), `false` to
-	// `eret` back to the user program.
+	// Dispatch an SVC from EL0 against the saved trap frame (x8 = syscall number,
+	// x0..x3 = arguments, the result is written back into the x0 slot). Routes to
+	// the portable kernel syscall table. Returns `true` for SYS_USER_EXIT (the
+	// caller then unwinds back to the kernel thread that entered EL0), `false` to
+	// `eret` back to the user program with the result in x0.
 	pub unsafe fn dispatch(frame: *mut u64) -> bool {
 		let num = unsafe { *frame.add(8) }; // x8
-		let a0 = unsafe { *frame.add(0) }; // x0
-		match num {
-			0 => {
-				crate::serial_println!("aarch64: EL0 syscall exit(x0={a0:#x})");
-				return true;
-			}
-			1 => {
-				let r = a0 + 1;
-				crate::serial_println!("aarch64: EL0 syscall demo(x0={a0:#x}) -> {r:#x}");
-				unsafe { *frame.add(0) = r };
-			}
-			n => {
-				crate::serial_println!("aarch64: EL0 syscall {n} unknown");
-				unsafe { *frame.add(0) = u64::MAX };
-			}
+		if num == abi::SYS_USER_EXIT {
+			return true;
 		}
+		let (a0, a1, a2, a3) = unsafe { (*frame.add(0), *frame.add(1), *frame.add(2), *frame.add(3)) };
+		super::percpu::set_from_user(true);
+		let result = crate::syscall::syscall_dispatch(num, a0, a1, a2, a3);
+		super::percpu::set_from_user(false);
+		unsafe { *frame.add(0) = result };
 		false
 	}
 }

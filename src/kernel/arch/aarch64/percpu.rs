@@ -117,3 +117,9 @@ pub fn set_rsp0(value: u64) {
 pub fn in_user_syscall() -> bool {
 	unsafe { (*this_cpu_mut()).from_user != 0 }
 }
+
+// Mark (or clear) that the running core is servicing an EL0 syscall, so the
+// syscall path validates user pointers.
+pub fn set_from_user(from_user: bool) {
+	unsafe { (*this_cpu_mut()).from_user = from_user as u64 };
+}
