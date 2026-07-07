@@ -2116,9 +2116,69 @@ A revision of the concept's original "we do not write our own bootloader" decisi
   - Result: a hand-rolled, dependency-free UEFI loader (`src/loader`, target `x86_64-unknown-uefi`) over a shared zero-dep `bootproto` crate carries the hand-off. Its own minimal UEFI FFI opens the FAT boot volume (SimpleFileSystem), reads the kernel ELF and the init/volume packages, loads the kernel's PT_LOAD segments honoring W^X, builds fresh page tables (an HHDM over all RAM, the kernel mapped per-PHDR at its higher-half link base, the GOP framebuffer uncacheable, plus a temporary low-half identity map so the loader and the AP trampoline keep executing across the CR3 switch), snapshots the UEFI memory map, exits boot services, and jumps to `kmain(&BootInfo)`. The kernel is relinked static (non-PIE `ET_EXEC`, no relocations - `relocation-model=static`, the `.limine_requests`/`.dynamic` sections dropped) so the loader applies none; every Limine request is gone (the memory map, HHDM offset, framebuffer, loaded packages and ACPI RSDP now come from `BootInfo`, and `abi` region kinds are handed over verbatim). SMP-wake split: the KERNEL wakes the application processors itself - it enumerates the local APICs from the ACPI MADT and drives INIT-SIPI-SIPI over a self-relocating real-mode trampoline it copies into a low page the loader reserved (`arch::x86_64::apboot`), then drops the identity map once the cores are up - symmetric with the PSCI/SBI wake the aarch64/riscv64 loaders will use, and no loader-side trampoline to carry per architecture.
 - [x] The system boots via the own loader on x86_64 QEMU/OVMF with the full suite green; Limine is retired from mkimage.sh and the images (and its bundled-license obligation goes with it).
   - Result: the system boots end to end on x86_64 QEMU/OVMF through the own loader - 52 of 52 cores online, every driver and userspace service up, the interactive shell live - with the full suite green (102 [ok]). `mkimage.sh` is UEFI-only: it builds a FAT El Torito boot image holding the loader at `/EFI/BOOT/BOOTX64.EFI` plus the kernel and the packages the loader reads off that same volume (OVMF exposes no ISO9660 filesystem, so everything the loader needs lives on the FAT image), with no BIOS boot entry and no Limine stages. Limine is gone from the kernel (`limine` crate dropped for `bootproto`), the images, `setup.sh` (it no longer clones/builds Limine), `qemu-run.sh`/the `Justfile` (which now build the loader crate), and the docs - its bundled-license obligation goes with it. One load-bearing build note: `compiler_builtins` is built without debug-assertions (a build-std `mem` intrinsic's 16-byte-in-one-`u128` move otherwise trips core's alignment UB-check on a benign 8-aligned span, aborting the kernel on x86-64 where the access is fine).
-- [ ] The aarch64 + riscv64 loader variants over the shared core: per-arch page-table setup, SMP wake via firmware calls (PSCI `CPU_ON` / SBI HSM `hart_start` - simpler than x86, no real-mode trampoline), DTB/ACPI passthrough. Blocked on the phase-4 kernel ports (the loader is the small fraction of a port; the ports themselves do not wait on it - they can bring up on Limine first).
-- Done when: development runs under UEFI everywhere, the own x86_64 loader boots the system with the suite green and Limine removed from the images, and the ARM64/RISC-V variants land alongside their kernel ports - the concept's revised bootloader decision realized end to end.
+- [ ] The aarch64 + riscv64 loader variants over the shared core: per-arch page-table setup, SMP wake via firmware calls (PSCI `CPU_ON` / SBI HSM `hart_start` - simpler than x86, no real-mode trampoline), DTB passthrough. Delivered with the phase-2 kernel ports (M116 aarch64, M117 riscv64) - each arch's loader variant lands alongside its port (the loader is the small fraction of a port; the ports do not wait on it - they can bring up via QEMU direct `-kernel` load first).
+- Done when: development runs under UEFI everywhere, the own x86_64 loader boots the system with the suite green and Limine removed from the images, and the ARM64/RISC-V variants land alongside their kernel ports (M116/M117) - the concept's revised bootloader decision realized end to end.
 - Concept: Boot flow / bootloader choice (revised: own UEFI-only loader, one EFI application per architecture; Limine as the working gate until then), the layering principle (the entry gate is replaceable, so the swap touches no kernel architecture).
+
+## Multi-architecture port track (M115-M117)
+
+The kernel, the drivers, and the own UEFI loader run on x86_64 today. This track
+ports them to the two other architectures the concept's bootloader already
+anticipates - ARM64 (aarch64) and RISC-V (riscv64) - and proves each under QEMU
+emulation (`qemu-system-aarch64` / `qemu-system-riscv64`, machine `virt`). The
+deployment target stays a VM: real hardware boards (bare metal, per-board
+drivers, power management) remain phase 4. The ordering principle: extract a clean
+architecture boundary first (so x86_64 keeps working untouched), bring aarch64 up
+second (the second architecture always hardens the abstraction), then riscv64
+(which proves it carries three arches), each ending with the full test suite green
+on its architecture under QEMU. The kernel already carries empty `arch/aarch64/` +
+`arch/riscv64/` skeleton dirs - the targets of the port.
+
+## M115 - Architecture abstraction layer (the HAL boundary)
+
+Today `arch/mod.rs` re-exports `x86_64` directly and the portable kernel reaches
+into x86-specific paths throughout. Before a second architecture can compile,
+every arch-specific surface the portable code touches must sit behind one explicit
+contract, with x86_64 as its first implementer and aarch64 / riscv64 as compiling
+stubs.
+
+- [ ] Inventory and name the arch surface the portable kernel depends on: the boot hand-off + `BootInfo`, page tables / MMU (map / unmap / translate, W^X, per-address-space switch), exceptions + faults (the resumable stack-growth fault + the ring-3 fault that kills only the process + the kernel fault that halts), interrupts (per-device vector acquire, EOI, the timer tick), the monotonic + fine clocks, SMP wake + per-CPU state, the syscall entry / return + user-context save, the context switch, the serial console, PCI / ECAM enumeration, and the hardware description (ACPI vs device tree).
+- [ ] Define each as a portable module / trait contract in `arch/` that the kernel calls with no `cfg(target_arch)` outside `arch/`; move the x86_64 code behind it unchanged (behaviour identical, x86_64 suite green).
+- [ ] `arch/aarch64/` and `arch/riscv64/` compile as `unimplemented!()` / `todo!()` stubs satisfying the same contract, selected by `cfg(target_arch)`, so a cross-build for either target links (even though it cannot boot yet).
+- Done when: the portable kernel names its whole arch dependency through one contract, x86_64 is one implementer with the suite green and zero behaviour change, and `cargo build` for the aarch64 / riscv64 bare targets links the stub arch - the boundary the two ports plug into.
+- Concept: the layering principle (arch is a replaceable implementation behind a stable boundary), the bootloader decision (one EFI app per architecture over a shared core - the kernel mirrors that shape).
+
+## M116 - aarch64 (ARM64) kernel + loader port
+
+Bring the kernel up on ARM64 under `qemu-system-aarch64 -machine virt`, filling in
+the M115 contract with the ARMv8-A mechanisms, plus the aarch64 UEFI loader variant
+(the M114 box).
+
+- [ ] MMU + page tables: VMSAv8-64 translation tables (4 kB granule, TTBR0 / TTBR1 split for the user / kernel halves), map / unmap / translate, the W^X + PXN / UXN execute-permission bits, and per-address-space `TTBR0` switch on context switch.
+- [ ] Exceptions + faults: the AArch64 vector table (`VBAR_EL1`), synchronous-exception decode (`ESR_EL1` / `FAR_EL1`), and the fault split the kernel expects - a resumable stack-growth fault, an EL0 (userspace) fault that kills only the process, and an EL1 (kernel) fault that halts.
+- [ ] Interrupts + timer: the GIC (v2 or v3 on QEMU virt) for distribution / EOI + per-device vector acquire (replacing the x86 APIC / IOAPIC / MSI-X path), and the ARM generic timer (`CNTP` / `CNTV`) for the periodic tick + the monotonic + fine clocks.
+- [ ] SMP + per-CPU + syscall + context switch: secondary-core wake via PSCI `CPU_ON` (firmware call, no real-mode trampoline), per-CPU state via `TPIDR_EL1`, the `SVC` syscall entry / return with the EL0 user-context save, and the AArch64 callee-saved context switch.
+- [ ] Platform: the PL011 UART console, ECAM PCI (or virtio-mmio) enumeration, and device-tree (DTB) parsing for the memory map + device inventory (replacing x86 ACPI) - so DeviceManager finds the same virtio devices.
+- [ ] The aarch64 own-UEFI-loader variant over the shared core (the M114 box): per-arch page-table setup, PSCI-based SMP hand-off, DTB passthrough into `BootInfo`; the kernel may bring up via QEMU direct `-kernel` load first so the port does not wait on the loader.
+- [ ] The full suite runs green on aarch64 under QEMU: the kernel test harness (`qemu-system-aarch64`), the boot chain up to the interactive shell, and the userspace services / drivers.
+- Done when: the kernel boots SMP on `qemu-system-aarch64 -machine virt`, brings up the full userspace chain to the shell, the own UEFI loader boots it, and the test suite is green on ARM64 - the second architecture, hardening the M115 boundary.
+- Concept: phase-2 deployment target (a VM; real ARM64 boards are phase 4), the bootloader decision (the aarch64 EFI app), the driver model (virtio over the shared transport, DeviceManager unchanged).
+
+## M117 - riscv64 (RISC-V) kernel + loader port
+
+Bring the kernel up on RISC-V under `qemu-system-riscv64 -machine virt` over
+OpenSBI, filling in the M115 contract with the RISC-V mechanisms, plus the riscv64
+UEFI loader variant.
+
+- [ ] MMU + page tables: Sv39 (optionally Sv48) translation tables via `SATP`, map / unmap / translate, the W^X execute bits, and per-address-space `SATP` switch on context switch.
+- [ ] Traps + faults: the trap vector (`STVEC`), `scause` / `stval` decode, and the fault split - a resumable stack-growth fault, a U-mode (userspace) fault that kills only the process, and an S-mode (kernel) fault that halts.
+- [ ] Interrupts + timer: the PLIC (external device interrupts) + CLINT / the SBI timer extension for the periodic tick, per-device vector acquire, and `rdtime` for the monotonic + fine clocks.
+- [ ] SMP + per-CPU + syscall + context switch: secondary-hart wake via the SBI HSM `hart_start` call, per-CPU state via the `tp` register, the `ECALL` syscall entry / return with the U-mode user-context save, and the RISC-V callee-saved context switch.
+- [ ] Platform: the 16550 (or SBI) console, ECAM PCI (or virtio-mmio) enumeration, and device-tree (DTB) parsing for the memory map + device inventory - so DeviceManager finds the same virtio devices.
+- [ ] The riscv64 own-UEFI-loader variant over the shared core (the M114 box): per-arch page-table setup, SBI HSM SMP hand-off, DTB passthrough into `BootInfo`, launched via U-Boot's EFI loader (or QEMU direct `-kernel` first).
+- [ ] The full suite runs green on riscv64 under QEMU: the kernel test harness (`qemu-system-riscv64` + OpenSBI), the boot chain up to the interactive shell, and the userspace services / drivers.
+- Done when: the kernel boots SMP on `qemu-system-riscv64 -machine virt` over OpenSBI, brings up the full userspace chain to the shell, the own UEFI loader boots it, and the test suite is green on RISC-V - the third architecture, proving the M115 boundary carries three arches.
+- Concept: phase-2 deployment target (a VM; real RISC-V boards are phase 4), the bootloader decision (the riscv64 EFI app), the driver model (virtio unchanged across arches).
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
@@ -2130,9 +2190,12 @@ observability (the live System Graph + counters + tracing in
 CLI/JSON/CBOR); security hardening (typed permission manifests + a PermissionManager
 + a strict sandbox + a threat model); the ResourceManager policy layer; a
 ServiceManager with a restart policy + watchdog; the full Component Model + WASI
-preview 2 + an SDK running components loaded from storage; and a writable
-persistent native filesystem (LiberFS) - all in a VM over
-virtio on QEMU/KVM, testable under `cargo test` / QEMU.
+preview 2 + an SDK running components loaded from storage; a writable
+persistent native filesystem (LiberFS); and the kernel plus its own UEFI loader
+ported to ARM64 (aarch64) and RISC-V (riscv64) and tested under QEMU emulation (one
+arch-abstracted kernel over three architectures; real hardware boards stay phase 4)
+- all in a VM over virtio on QEMU/KVM (x86_64, aarch64, riscv64), testable under
+`cargo test` / QEMU.
 
 ## Out of scope for phase 2 (= phase 3, the server platform)
 A POSIX-like / relibc compatibility layer for foreign software (phase 4, with real
@@ -2149,6 +2212,8 @@ static-file web server and the like); the package/app format with installation +
 AOT compilation (moved out of phase 2 by decision - the component runtime and the
 manifest split are ready for it; the AOT/JIT engine choice there is gated on a
 measurement of a real component workload, not decided on faith); and a CLI package manager over that phase-3
-package format. The desktop concerns (GUI / compositor, a full input stack, the
+package format. Real ARM64 / RISC-V hardware boards (bare metal, per-board
+drivers, power management, the transition off virtio/VM) stay phase 4 - the
+phase-2 ports (M115-M117) run under QEMU emulation only. The desktop concerns (GUI / compositor, a full input stack, the
 end-user app store) are phases 4-5. Phases 3-6 (server / real hardware / desktop /
 AI) remain a vision, contingent on a community forming.

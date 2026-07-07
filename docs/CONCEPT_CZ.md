@@ -1627,6 +1627,7 @@ bezpečnostní hardening: app sandbox, permission manifesty, threat model
 ServiceManager s restart policy a watchdog
 plný Component Model + WASI preview 2, SDK pro Rust/C/Go
 jednoduchý perzistentní nativní filesystem
+kernel a vlastní UEFI loader portované na ARM64 (aarch64) a RISC-V (riscv64), testované pod emulací v QEMU (qemu-system-aarch64 / qemu-system-riscv64) - jedno arch-abstrahované jádro nad třemi architekturami; reálné desky zůstávají fáze 4
 ```
 
 #### Fáze 3 - Serverová platforma
@@ -1652,7 +1653,7 @@ POSIX-like kompatibilní vrstva (relibc-style) - pro cizí serverový software
 driver binding model v praxi: DeviceManager páruje reálná zařízení → drivery
 výběrové ovladače reálného HW dle nasazení (NVMe, NIC, úložiště, sběrnice)
 podpora konkrétních serverů a SBC (single-board computers)
-ARM64 / RISC-V desky vedle x86-64
+ARM64 / RISC-V reálné desky vedle x86-64 (portace z fáze 2 přenesená z QEMU na bare metal)
 power management dle nasazení (ACPI, idle/suspend)
 přechod z virtio/VM na bare metal
 ```
@@ -1766,4 +1767,4 @@ Fáze 0 a 1 jsou hotové (kernel MVP a první použitelný userspace - viz *Road
 5. virtio drivery (blk, net, console) izolované pod DeviceManagerem; minimální WASI host spouštějící první Wasm komponentu; powerbox file picker předávající jednu file capability.
 ```
 
-Doporučený další krok je tedy **Fáze 2 (appliance/edge platforma)**. Její prioritou je síťový stack nad virtio-net - na edge je síť jádrem - následovaný zbytkem fáze (plný System Graph + observabilita, security hardening + PermissionManager, ResourceManager policy, ServiceManager restart/watchdog, plný Component Model + WASI preview 2 + SDK a jednoduchý perzistentní nativní filesystem); viz *Roadmapa*.
+Doporučený další krok je tedy **Fáze 2 (appliance/edge platforma)**. Její prioritou je síťový stack nad virtio-net - na edge je síť jádrem - následovaný zbytkem fáze (plný System Graph + observabilita, security hardening + PermissionManager, ResourceManager policy, ServiceManager restart/watchdog, plný Component Model + WASI preview 2 + SDK, jednoduchý perzistentní nativní filesystem a portace kernelu + vlastního UEFI loaderu na ARM64/RISC-V testovaná v QEMU); viz *Roadmapa*.

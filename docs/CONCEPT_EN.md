@@ -1627,6 +1627,7 @@ security hardening: app sandbox, permission manifests, threat model
 ServiceManager with restart policy and watchdog
 full Component Model + WASI preview 2, an SDK for Rust/C/Go
 a simple persistent native filesystem
+the kernel and the own UEFI loader ported to ARM64 (aarch64) and RISC-V (riscv64), tested under QEMU emulation (qemu-system-aarch64 / qemu-system-riscv64) - one arch-abstracted kernel over three architectures; real boards stay phase 4
 ```
 
 #### Phase 3 - Server platform
@@ -1652,7 +1653,7 @@ a POSIX-like compatibility layer (relibc-style) - for foreign server software
 the driver binding model in practice: DeviceManager pairs real devices -> drivers
 selective real-HW drivers per deployment (NVMe, NIC, storage, buses)
 support for specific servers and SBCs (single-board computers)
-ARM64 / RISC-V boards alongside x86-64
+ARM64 / RISC-V real boards alongside x86-64 (the phase-2 QEMU ports brought to bare metal)
 power management per deployment (ACPI, idle/suspend)
 the transition from virtio/VM to bare metal
 ```
@@ -1766,4 +1767,4 @@ Phases 0 and 1 are complete (the kernel MVP and the first usable userspace - see
 5. virtio drivers (blk, net, console) isolated under DeviceManager; a minimal WASI host running the first Wasm component; a powerbox file picker handing out a single file capability.
 ```
 
-The recommended next step is therefore **Phase 2 (the appliance/edge platform)**. Its priority is a network stack over virtio-net - on the edge, networking is the core - followed by the rest of the phase (full System Graph + observability, security hardening + PermissionManager, the ResourceManager policy, ServiceManager restart/watchdog, the full Component Model + WASI preview 2 + an SDK, and a simple persistent native filesystem); see the *Roadmap*.
+The recommended next step is therefore **Phase 2 (the appliance/edge platform)**. Its priority is a network stack over virtio-net - on the edge, networking is the core - followed by the rest of the phase (full System Graph + observability, security hardening + PermissionManager, the ResourceManager policy, ServiceManager restart/watchdog, the full Component Model + WASI preview 2 + an SDK, a simple persistent native filesystem, and the kernel + own UEFI loader ported to ARM64/RISC-V and tested under QEMU); see the *Roadmap*.
