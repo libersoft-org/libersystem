@@ -256,6 +256,10 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	// thread parks its EL0 resume state in its own slot, so the excursions coexist.
 	run_user_processes();
 
+	// Capability IPC from EL0: a user process creates a channel and round-trips a
+	// message through SYS_CHANNEL_CREATE / SEND / RECV, then prints what it got.
+	run_ipc_process();
+
 	// Per-address-space isolation: two independent address spaces map the SAME
 	// virtual address to different physical frames. Switching TTBR0 (write_cr3)
 	// changes what that address reads - the kernel keeps running because each
@@ -437,4 +441,93 @@ fn run_user_processes() {
 	crate::serial_println!("aarch64: userspace - running 2 EL0 processes");
 	crate::sched::run_until_idle();
 	crate::serial_println!("aarch64: userspace - both EL0 processes exited");
+}
+
+// A single user process that exercises capability IPC entirely from EL0: it
+// creates a channel (two endpoint handles), sends a message on endpoint 0,
+// receives it on endpoint 1, and prints what it received via SYS_DEBUG_WRITE - a
+// full round-trip through the real channel syscalls. Page layout (in the code
+// frame): program@0, endpoint handles@0x400/0x408, send message@0x500, receive
+// buffer@0x600. The entry argument (x0) is the code page base.
+fn run_ipc_process() {
+	use crate::object::address_space::AddressSpace;
+	use crate::object::process::Process;
+
+	let addr_space = match AddressSpace::create() {
+		Some(a) => a,
+		None => {
+			crate::serial_println!("aarch64: IPC - no address space");
+			return;
+		}
+	};
+	let code = super::paging::alloc_frame().expect("aarch64: no frame for IPC code");
+	let stack = super::paging::alloc_frame().expect("aarch64: no frame for IPC stack");
+
+	let code_va: u64 = 0x0000_4000_0000_0000;
+	let stack_va: u64 = 0x0000_4000_0001_0000;
+	let stack_top = stack_va + 0x1000;
+
+	let msg = b"capability IPC round-trip from EL0!\n";
+	let len = msg.len() as u16;
+
+	// Instruction encoders.
+	let movz = |rd: u32, imm: u16| -> u32 { 0xD280_0000 | ((imm as u32) << 5) | rd };
+	let mov_reg = |rd: u32, rm: u32| -> u32 { 0xAA00_03E0 | (rm << 16) | rd };
+	let add_imm = |rd: u32, rn: u32, imm: u32| -> u32 { 0x9100_0000 | (imm << 10) | (rn << 5) | rd };
+	let ldr = |rt: u32, rn: u32, off: u32| -> u32 { 0xF940_0000 | ((off / 8) << 10) | (rn << 5) | rt };
+	const SVC0: u32 = 0xD400_0001;
+
+	let prog: [u32; 26] = [
+		mov_reg(19, 0), // mov x19, x0   (x19 = code base)
+		// SYS_CHANNEL_CREATE(&h0=base+0x400, &h1=base+0x408, depth=0)
+		add_imm(0, 19, 0x400),
+		add_imm(1, 19, 0x408),
+		movz(2, 0),
+		movz(8, abi::SYS_CHANNEL_CREATE as u16),
+		SVC0,
+		// SYS_CHANNEL_SEND(h0, msg=base+0x500, len, xfer=0)
+		ldr(0, 19, 0x400),
+		add_imm(1, 19, 0x500),
+		movz(2, len),
+		movz(3, 0),
+		movz(8, abi::SYS_CHANNEL_SEND as u16),
+		SVC0,
+		// SYS_CHANNEL_RECV(h1, buf=base+0x600, cap=0x100, out_handle=0)
+		ldr(0, 19, 0x408),
+		add_imm(1, 19, 0x600),
+		movz(2, 0x100),
+		movz(3, 0),
+		movz(8, abi::SYS_CHANNEL_RECV as u16),
+		SVC0,
+		// SYS_DEBUG_WRITE(buf=base+0x600, n=recv result)
+		mov_reg(20, 0),
+		add_imm(0, 19, 0x600),
+		mov_reg(1, 20),
+		movz(8, abi::SYS_DEBUG_WRITE as u16),
+		SVC0,
+		// SYS_USER_EXIT
+		movz(8, abi::SYS_USER_EXIT as u16),
+		SVC0,
+		0x1400_0000, // b .
+	];
+	unsafe {
+		let cp = code as *mut u32;
+		for (i, w) in prog.iter().enumerate() {
+			core::ptr::write_volatile(cp.add(i), *w);
+		}
+		core::ptr::copy_nonoverlapping(msg.as_ptr(), (code + 0x500) as *mut u8, msg.len());
+		core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+	}
+
+	addr_space.map(code_va, code, super::paging::PRESENT | super::paging::WRITABLE | super::paging::USER);
+	addr_space.map(stack_va, stack, super::paging::PRESENT | super::paging::WRITABLE | super::paging::USER | super::paging::NO_EXECUTE);
+
+	let process = Process::new(addr_space, crate::sched::root_domain());
+	process.adopt_frames(alloc::vec![code, stack]);
+	let ctx = alloc::boxed::Box::new(UserCtx { entry: code_va, stack_top, arg: code_va });
+	crate::sched::thread_create(process, user_trampoline, alloc::boxed::Box::into_raw(ctx) as u64);
+
+	crate::serial_println!("aarch64: IPC - entering EL0 process");
+	crate::sched::run_until_idle();
+	crate::serial_println!("aarch64: IPC - EL0 process exited");
 }
