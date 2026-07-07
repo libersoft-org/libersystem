@@ -97,13 +97,28 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	}
 	crate::serial_println!("aarch64: timer IRQs delivered - {} ticks", super::gic::ticks() - start);
 
+	// Parse the device tree (QEMU leaves it in low RAM; x0 arrives as 0 for a bare
+	// ELF, so the parser scans for it) to learn the real RAM size and CPU count
+	// instead of hard-coding them.
+	let boot_info = super::dtb::parse(dtb);
+	let (ram_top, cpu_count) = match boot_info {
+		Some(bi) => {
+			crate::serial_println!("aarch64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s)", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count);
+			(bi.ram_base + bi.ram_size, bi.cpu_count)
+		}
+		None => {
+			crate::serial_println!("aarch64: no DTB found - using built-in defaults");
+			(0, 1)
+		}
+	};
+
 	// Bring up the frame allocator and the TTBR1 higher-half root, then prove the
 	// real 4 kB map_page works: map a fresh frame at a high (top-bit-set) virtual
 	// address, write a pattern through it, and confirm it reads back both via the
 	// high VA (TTBR1 walk + allocated L1/L2/L3 tables) and via the frame's own
 	// identity address (TTBR0).
 	use super::paging;
-	paging::init_frame_allocator();
+	paging::init_frame_allocator(ram_top);
 	let free_mib = paging::frames_free() * 4 / 1024;
 	crate::serial_println!("aarch64: frame allocator up - {} MB free DRAM", free_mib);
 	unsafe {
@@ -125,10 +140,10 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	unsafe {
 		core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
 	}
-	super::percpu::allocate(1);
+	super::percpu::allocate(cpu_count as usize);
 	super::percpu::init(0, mpidr as u32);
 	let cpu = super::percpu::this_cpu();
-	crate::serial_println!("aarch64: per-CPU up (TPIDR_EL1) cpu_id={} mpidr={:#x}", cpu.cpu_id(), cpu.lapic_id() & 0xff_ffff);
+	crate::serial_println!("aarch64: per-CPU up (TPIDR_EL1) cpu_id={} mpidr={:#x} of {} CPU(s)", cpu.cpu_id(), cpu.lapic_id() & 0xff_ffff, cpu_count);
 
 	// Cooperative context switch: spin up two kernel threads that ping-pong via
 	// switch_context, then thread A returns control here.

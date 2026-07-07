@@ -151,15 +151,22 @@ unsafe extern "C" {
 	static __kernel_end: u8;
 }
 
-// Top of DRAM on QEMU virt with `-m 512M` (base 0x4000_0000 + 512 MiB).
+// Base of DRAM on QEMU virt, and a fallback top for `-m 512M` when no device
+// tree is available. `init_frame_allocator` overrides the top from the DTB.
 const DRAM_BASE: u64 = 0x4000_0000;
-const DRAM_TOP: u64 = DRAM_BASE + 512 * 1024 * 1024;
+const DRAM_TOP_FALLBACK: u64 = DRAM_BASE + 512 * 1024 * 1024;
 
-// Next free physical frame (0 until `init_frame_allocator` runs).
+// Next free physical frame (0 until `init_frame_allocator` runs) and the top of
+// usable DRAM (from the device tree, or the fallback).
 static FRAME_NEXT: AtomicU64 = AtomicU64::new(0);
+static RAM_TOP: AtomicU64 = AtomicU64::new(DRAM_TOP_FALLBACK);
 
-// Point the bump allocator at the free DRAM above the kernel image.
-pub fn init_frame_allocator() {
+// Point the bump allocator at the free DRAM above the kernel image, up to
+// `ram_top` (0 = use the built-in fallback).
+pub fn init_frame_allocator(ram_top: u64) {
+	if ram_top > DRAM_BASE {
+		RAM_TOP.store(ram_top, Ordering::Relaxed);
+	}
 	let start = ((&raw const __kernel_end as u64) + 0xFFF) & !0xFFF;
 	FRAME_NEXT.store(start, Ordering::Relaxed);
 }
@@ -167,7 +174,7 @@ pub fn init_frame_allocator() {
 // Allocate one zeroed 4 kB physical frame, or `None` when DRAM is exhausted.
 pub fn alloc_frame() -> Option<u64> {
 	let pa = FRAME_NEXT.fetch_add(4096, Ordering::Relaxed);
-	if pa == 0 || pa + 4096 > DRAM_TOP {
+	if pa == 0 || pa + 4096 > RAM_TOP.load(Ordering::Relaxed) {
 		return None;
 	}
 	unsafe {
@@ -179,7 +186,8 @@ pub fn alloc_frame() -> Option<u64> {
 // How many 4 kB frames the allocator still has (for bring-up reporting).
 pub fn frames_free() -> u64 {
 	let next = FRAME_NEXT.load(Ordering::Relaxed);
-	if next == 0 || next >= DRAM_TOP { 0 } else { (DRAM_TOP - next) / 4096 }
+	let top = RAM_TOP.load(Ordering::Relaxed);
+	if next == 0 || next >= top { 0 } else { (top - next) / 4096 }
 }
 
 // ---- TTBR1 higher-half root -------------------------------------------------

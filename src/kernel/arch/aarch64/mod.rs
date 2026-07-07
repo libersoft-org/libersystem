@@ -9,6 +9,7 @@
 // Runtime entry points `todo!()`; a boot on this arch is not possible until then.
 
 mod boot;
+mod dtb;
 mod exceptions;
 mod gic;
 pub mod serial;
