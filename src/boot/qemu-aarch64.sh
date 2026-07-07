@@ -86,6 +86,12 @@ if [[ ! -f "$UDF_DISK" ]] && command -v mkfs.udf >/dev/null; then
 fi
 [[ -f "$UDF_DISK" ]] && DISK_ARGS+=(-drive "if=none,id=udf0,format=raw,file=$UDF_DISK" -device "virtio-blk-pci,drive=udf0,disable-legacy=on")
 
+# A virtio-net NIC on user networking, so DeviceManager brings up the virtio_net driver
+# (its own per-device MSI-X vector via the GICv2m frame) and NetworkService comes
+# online - the same device the x86 runner attaches. TimeService depends on it, and the
+# shell transitively on both.
+DISK_ARGS+=(-netdev "user,id=vnet0" -device "virtio-net-pci,netdev=vnet0,disable-legacy=on")
+
 # Dump the machine's device tree (same machine config as the boot below), then
 # boot with it loaded at DTB_ADDR.
 qemu-system-aarch64 \

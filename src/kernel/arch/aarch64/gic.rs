@@ -17,6 +17,9 @@ const GICC_BASE: usize = 0x0801_0000; // CPU interface
 
 const GICD_CTLR: usize = 0x000; // distributor control
 const GICD_ISENABLER: usize = 0x100; // set-enable (1 bit per INTID)
+const GICD_IPRIORITYR: usize = 0x400; // priority (1 byte per INTID)
+const GICD_ITARGETSR: usize = 0x800; // CPU targets (1 byte per INTID, SPIs only)
+const GICD_ICFGR: usize = 0xc00; // trigger config (2 bits per INTID)
 
 const GICC_CTLR: usize = 0x000; // CPU interface control
 const GICC_PMR: usize = 0x004; // priority mask
@@ -103,6 +106,9 @@ pub fn handle_irq(from_user: bool) {
 		// Re-arm for the next tick (clears the timer's level-asserted condition).
 		arm_timer(INTERVAL.load(Ordering::Relaxed));
 		TICKS.fetch_add(1, Ordering::Relaxed);
+	} else {
+		// A device MSI (GICv2m SPI): wake the bound userspace driver, if any.
+		super::interrupts::dispatch_msi(intid);
 	}
 	// End of interrupt for any real INTID (1020..1023 are special / spurious).
 	if intid < 1020 {
@@ -115,6 +121,27 @@ pub fn handle_irq(from_user: bool) {
 	// EOI is already sent above, matching the x86 timer-ISR order.
 	if intid == TIMER_INTID {
 		crate::sched::on_timer_preempt(from_user);
+	}
+}
+
+// Configure a shared peripheral interrupt (SPI) as an edge-triggered MSI routed to
+// the boot core, and enable it - the GIC-distributor side of a GICv2m MSI vector (the
+// frame and the device's MSI-X table are programmed in arch::interrupts). SPIs are
+// INTID 32.., so the byte-per-INTID target/priority registers are writable for them.
+pub fn enable_msi_spi(spi: u32) {
+	let spi = spi as usize;
+	unsafe {
+		// Route to the boot core (CPU 0) and give it a priority below the CPU-interface
+		// mask (PMR 0xf0) so it is delivered.
+		core::ptr::write_volatile(gicd(GICD_ITARGETSR + spi) as *mut u8, 0x01);
+		core::ptr::write_volatile(gicd(GICD_IPRIORITYR + spi) as *mut u8, 0xa0);
+		// Edge-triggered: ICFGR holds 2 bits per INTID; the high bit selects edge.
+		let icfgr = gicd(GICD_ICFGR + (spi / 16) * 4);
+		let shift = (spi % 16) * 2;
+		let cfg = (core::ptr::read_volatile(icfgr) & !(0b11 << shift)) | (0b10 << shift);
+		core::ptr::write_volatile(icfgr, cfg);
+		// Enable the SPI.
+		core::ptr::write_volatile(gicd(GICD_ISENABLER + (spi / 32) * 4), 1 << (spi % 32));
 	}
 }
 

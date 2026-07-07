@@ -170,6 +170,9 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	// through the IRQ vector -> gic::handle_irq -> eret).
 	super::gic::init();
 	crate::serial_println!("aarch64: GIC + generic timer up ({} Hz counter)", super::gic::timer_hz());
+	// Read the GICv2m frame's MSI SPI range so userspace drivers can acquire per-device
+	// MSI-X vectors (the delivery path for virtio-net/input/snd, xhci, virtio-gpu).
+	super::interrupts::init();
 	super::enable_interrupts();
 	let start = super::gic::ticks();
 	let mut spins: u64 = 0;

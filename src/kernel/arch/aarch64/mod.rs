@@ -115,41 +115,7 @@ pub mod context;
 pub mod percpu;
 
 // -------------------------------------------------------------- interrupts
-pub mod interrupts {
-	use crate::object::interrupt::Interrupt;
-	use alloc::sync::Arc;
-
-	pub const IRQ_BASE: u8 = 32;
-
-	pub type HandlerFn = fn(u8);
-
-	pub fn is_bindable(_vector: u8) -> bool {
-		false
-	}
-	pub fn bind(_vector: u8, _intr: &Arc<Interrupt>) -> bool {
-		false
-	}
-	pub fn unbind(_vector: u8) {}
-	pub fn acquire_msi(_table_phys: u64, _dest: u8, _owner: u32) -> Option<u8> {
-		None
-	}
-	pub fn irq_info(_index: usize) -> Option<abi::IrqInfo> {
-		None
-	}
-	pub fn irq_info_len() -> usize {
-		0
-	}
-	pub fn bind_msi(_vector: u8, _intr: &Arc<Interrupt>) -> bool {
-		false
-	}
-	pub fn is_bound(_vector: u8) -> bool {
-		false
-	}
-	pub fn register(_vector: u8, _handler: HandlerFn) {}
-	pub fn init() {
-		todo!("aarch64 GIC (M116)")
-	}
-}
+pub mod interrupts;
 
 // -------------------------------------------------------------------- apic
 // (the aarch64 interrupt controller is the GIC; the module keeps the portable

@@ -350,5 +350,33 @@ pub fn scan_virtio() -> Vec<VirtioDevice> {
 pub fn scan_xhci() -> Vec<XhciDevice> {
 	Vec::new()
 }
-pub fn set_intx_disabled(_bus: u8, _dev: u8, _func: u8, _disabled: bool) {}
-pub fn msix_enable(_bus: u8, _dev: u8, _func: u8, _cap: u16) {}
+
+// Set or clear a function's PCI command-register Interrupt Disable bit (bit 10), which
+// gates whether the device may assert its legacy INTx pin. The kernel takes every
+// device interrupt via per-device MSI-X, so the pins stay disabled - a device whose
+// driver does not service its interrupt cannot then storm a shared INTx line.
+pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
+	const INTX_DISABLE: u16 = 1 << 10;
+	let command = cfg_read16(bus, dev, func, 0x04);
+	let new_command = if disabled { command | INTX_DISABLE } else { command & !INTX_DISABLE };
+	cfg_write16(bus, dev, func, 0x04, new_command);
+}
+
+// Enable MSI-X on a device (set the MSI-X Enable bit, clear the Function Mask) and make
+// sure its memory space is decoded and it is a bus master, so the MSI-X table BAR
+// responds and the device may issue the DMA memory write that GICv2m MSI delivery is.
+// Called once the kernel has programmed the device's table entry. `cap` is the MSI-X
+// capability's config-space offset (from VirtioDevice::msix_cap).
+pub fn msix_enable(bus: u8, dev: u8, func: u8, cap: u16) {
+	const MEMORY_SPACE: u16 = 1 << 1;
+	const BUS_MASTER: u16 = 1 << 2;
+	const MSIX_ENABLE: u16 = 1 << 15;
+	const FUNCTION_MASK: u16 = 1 << 14;
+	let command = cfg_read16(bus, dev, func, 0x04);
+	cfg_write16(bus, dev, func, 0x04, command | MEMORY_SPACE | BUS_MASTER);
+	// Message Control is the upper 16 bits of the dword at `cap` (cap_id/next are the
+	// low 16): enable MSI-X, clear the function mask.
+	let dword = cfg_read32(bus, dev, func, cap as usize);
+	let mc = (((dword >> 16) as u16) | MSIX_ENABLE) & !FUNCTION_MASK;
+	cfg_write32(bus, dev, func, cap as usize, (dword & 0x0000_ffff) | ((mc as u32) << 16));
+}
