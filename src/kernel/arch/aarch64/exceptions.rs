@@ -174,7 +174,7 @@ extern "C" fn aarch64_trap(vector: u64, frame: *mut u64) {
 	// vector index: source = index / 4 (0 cur-EL/SP0, 1 cur-EL/SPx, 2 lower/A64,
 	// 3 lower/A32), kind = index % 4 (0 sync, 1 irq, 2 fiq, 3 serror).
 	if vector % 4 == 1 {
-		super::gic::handle_irq();
+		super::gic::handle_irq(vector / 4 == 2);
 		return; // -> __trap_return erets back to the interrupted code
 	}
 

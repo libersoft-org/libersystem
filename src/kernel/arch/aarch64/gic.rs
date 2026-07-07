@@ -94,7 +94,9 @@ fn init_cpu_local() {
 }
 
 // Acknowledge and dispatch a pending interrupt (called from the IRQ vector).
-pub fn handle_irq() {
+// `from_user` is true when the interrupt was taken from EL0, so a preemptive
+// switch knows the interrupted context was userspace.
+pub fn handle_irq(from_user: bool) {
 	let iar = unsafe { core::ptr::read_volatile(gicc(GICC_IAR)) };
 	let intid = iar & 0x3ff;
 	if intid == TIMER_INTID {
@@ -107,6 +109,12 @@ pub fn handle_irq() {
 		unsafe {
 			core::ptr::write_volatile(gicc(GICC_EOIR), iar);
 		}
+	}
+	// The periodic timer tick drives preemption: rotate to the next ready thread on
+	// this core (a no-op until the scheduler is up and only if another is ready).
+	// EOI is already sent above, matching the x86 timer-ISR order.
+	if intid == TIMER_INTID {
+		crate::sched::on_timer_preempt(from_user);
 	}
 }
 

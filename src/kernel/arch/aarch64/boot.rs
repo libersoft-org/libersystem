@@ -241,6 +241,16 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	crate::sched::run_until_idle();
 	crate::serial_println!("aarch64: portable scheduler - all threads exited");
 
+	// Preemptive scheduling: three threads that never yield - each busy-waits
+	// ~15 ms per step (longer than the 10 ms timer quantum), so the GIC timer IRQ
+	// rotates them via sched::on_timer_preempt. Interleaved output = preemption.
+	for id in 1..=3u64 {
+		crate::sched::spawn(preempt_task, id);
+	}
+	crate::serial_println!("aarch64: preemptive scheduler - 3 non-yielding threads");
+	crate::sched::run_until_idle();
+	crate::serial_println!("aarch64: preemptive scheduler - all threads exited");
+
 	// EL0 usermode: map a user code page and stack at 4 GiB+ (clear of the low
 	// 1 GB identity blocks), copy in a tiny program that makes SVC syscalls, and
 	// `eret` down to EL0. The program's "exit" syscall unwinds control back here.
@@ -336,5 +346,18 @@ extern "C" fn sched_task(id: u64) {
 	for i in 0..3 {
 		crate::serial_println!("aarch64: [sched] thread {id} step {i}");
 		crate::sched::yield_now();
+	}
+}
+
+// A preemption test thread: busy-wait ~15 ms per step (no yield) so the 10 ms
+// timer quantum forces a preemptive rotation; the interleaved output proves the
+// timer IRQ drives the scheduler.
+extern "C" fn preempt_task(id: u64) {
+	for i in 0..3 {
+		let target = super::tsc::now() + super::tsc::hz() * 15 / 1000;
+		while super::tsc::now() < target {
+			core::hint::spin_loop();
+		}
+		crate::serial_println!("aarch64: [preempt] thread {id} step {i}");
 	}
 }
