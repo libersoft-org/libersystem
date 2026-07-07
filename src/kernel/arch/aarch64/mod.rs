@@ -144,10 +144,15 @@ pub mod interrupts {
 // `apic` name for the contract until the ports rename it.)
 pub mod apic {
 	pub fn local_id() -> u32 {
-		todo!("aarch64 GIC/MPIDR (M116)")
+		// The running core's MPIDR affinity (Aff0 identifies the core on virt).
+		let mpidr: u64;
+		unsafe {
+			core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
+		}
+		(mpidr & 0xff_ffff) as u32
 	}
 	pub fn eoi() {
-		todo!("aarch64 GIC EOI (M116)")
+		// aarch64 signals end-of-interrupt per IRQ inside gic::handle_irq (GICC_EOIR).
 	}
 	pub fn send_wake_ipi(_dest: u32) {
 		todo!("aarch64 GIC SGI (M116)")
@@ -159,7 +164,7 @@ pub mod apic {
 		todo!("aarch64 PSCI wake (M116)")
 	}
 	pub fn ticks() -> u64 {
-		todo!("aarch64 generic timer (M116)")
+		super::gic::ticks()
 	}
 	pub fn init() {
 		todo!("aarch64 GIC + timer (M116)")
@@ -170,18 +175,29 @@ pub mod apic {
 }
 
 // --------------------------------------------------------------------- tsc
+// The ARM generic timer is the monotonic cycle clock: CNTVCT_EL0 counts at the
+// fixed CNTFRQ_EL0 rate (62.5 MHz on QEMU virt), resetting to 0 at power-on.
 pub mod tsc {
+	use core::arch::asm;
+
 	pub fn now() -> u64 {
-		todo!("aarch64 CNTVCT (M116)")
+		let v: u64;
+		unsafe {
+			asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags));
+		}
+		v
 	}
-	pub fn init() {
-		todo!("aarch64 CNTFRQ (M116)")
-	}
+	pub fn init() {}
 	pub fn hz() -> u64 {
-		todo!("aarch64 CNTFRQ (M116)")
+		let f: u64;
+		unsafe {
+			asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags));
+		}
+		f
 	}
-	pub fn cycles_to_ns(_cycles: u64) -> u64 {
-		todo!("aarch64 timer scaling (M116)")
+	pub fn cycles_to_ns(cycles: u64) -> u64 {
+		let f = hz();
+		if f == 0 { 0 } else { (cycles as u128 * 1_000_000_000 / f as u128) as u64 }
 	}
 }
 
@@ -199,16 +215,38 @@ pub mod ioapic {
 }
 
 // --------------------------------------------------------------------- rtc
+// The PL031 real-time clock (QEMU virt at 0x0901_0000): its data register holds
+// the current time as seconds since the Unix epoch. In the low device MMIO region
+// the boot map already covers.
 pub mod rtc {
 	pub fn read_unix() -> u64 {
-		todo!("aarch64 PL031 RTC (M116)")
+		const PL031_DR: usize = 0x0901_0000;
+		unsafe { core::ptr::read_volatile(PL031_DR as *const u32) as u64 }
 	}
 }
 
 // ------------------------------------------------------------------ random
+// No architectural RNG is guaranteed on the bring-up core (FEAT_RNG / RNDR is
+// optional), so this is a splitmix64 stream seeded and re-stirred from the
+// generic-timer counter. Adequate for non-cryptographic kernel needs during
+// bring-up; a real entropy source replaces it later.
 pub mod random {
-	pub fn fill(_buf: &mut [u8]) {
-		todo!("aarch64 RNDR / DTB entropy (M116)")
+	use core::sync::atomic::{AtomicU64, Ordering};
+
+	static STATE: AtomicU64 = AtomicU64::new(0);
+
+	pub fn fill(buf: &mut [u8]) {
+		let mut s = STATE.load(Ordering::Relaxed) ^ super::tsc::now() ^ 0x9E37_79B9_7F4A_7C15;
+		for chunk in buf.chunks_mut(8) {
+			s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+			let mut z = s;
+			z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+			z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+			z ^= z >> 31;
+			let bytes = z.to_le_bytes();
+			chunk.copy_from_slice(&bytes[..chunk.len()]);
+		}
+		STATE.store(s, Ordering::Relaxed);
 	}
 }
 

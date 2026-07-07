@@ -193,6 +193,13 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 		}
 	}
 
+	// Clocks + entropy: the generic timer (monotonic), the PL031 RTC (wall clock),
+	// and the seeded RNG.
+	super::tsc::init();
+	let mut rnd = [0u8; 6];
+	super::random::fill(&mut rnd);
+	crate::serial_println!("aarch64: clocks - timer {} MHz, uptime {} ms, RTC unix {} | random {:02x?}", super::tsc::hz() / 1_000_000, super::tsc::cycles_to_ns(super::tsc::now()) / 1_000_000, super::rtc::read_unix(), rnd);
+
 	// Per-CPU block for the boot core, reachable through TPIDR_EL1.
 	let mpidr: u64;
 	unsafe {
