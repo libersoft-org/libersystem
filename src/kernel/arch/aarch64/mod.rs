@@ -9,6 +9,7 @@
 // Runtime entry points `todo!()`; a boot on this arch is not possible until then.
 
 mod boot;
+mod exceptions;
 pub mod serial;
 
 // halt the kernel forever (wait-for-event)

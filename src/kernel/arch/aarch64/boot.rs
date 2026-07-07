@@ -79,7 +79,16 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	};
 	crate::serial_println!("aarch64: post-MMU RAM read/write = {}", if ram_ok { "ok" } else { "FAIL" });
 
-	crate::serial_println!("aarch64 bring-up: serial + MMU OK - halting (GIC / SMP / syscall land next)");
+	// Install the EL1 exception vectors (VBAR_EL1) and prove the synchronous
+	// handler catches a fault: `brk #0` traps into the vector table, which
+	// decodes ESR/FAR/ELR and reports before halting.
+	super::exceptions::init_vectors();
+	crate::serial_println!("aarch64: VBAR_EL1 exception vectors installed");
+	crate::serial_println!("aarch64: triggering a test exception (brk #0) ...");
+	unsafe {
+		core::arch::asm!("brk #0");
+	}
 
+	// The exception handler halts, so this is unreachable.
 	super::halt_loop()
 }
