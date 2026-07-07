@@ -169,6 +169,18 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 		crate::serial_println!("aarch64:   {} @ BAR{} phys={:#x} len={:#x} | common+{:#x} notify+{:#x}(x{}) isr+{:#x} device+{:#x}", super::pci::virtio_type_name(v.virtio_type), v.bar, v.bar_phys, v.region_len, v.common.offset, v.notify.offset, v.notify.notify_multiplier, v.isr.offset, v.device.offset);
 	}
 
+	// If a virtio-blk device is present, read sector 0 through it (reset, feature
+	// negotiation, virtqueue, request, poll used ring).
+	if let Some(blk) = virtio.iter().find(|v| v.virtio_type as u32 == abi::VIRTIO_TYPE_BLOCK) {
+		match super::virtio_blk::read_sector(blk, 0) {
+			Some((data, status)) => {
+				let head = unsafe { core::slice::from_raw_parts(data as *const u8, 16) };
+				crate::serial_println!("aarch64: virtio-blk sector 0 read - status={} first16={:02x?}", status, head);
+			}
+			None => crate::serial_println!("aarch64: virtio-blk sector 0 read - FAILED"),
+		}
+	}
+
 	// Per-CPU block for the boot core, reachable through TPIDR_EL1.
 	let mpidr: u64;
 	unsafe {

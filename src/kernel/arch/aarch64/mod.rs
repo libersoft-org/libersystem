@@ -14,6 +14,7 @@ mod exceptions;
 mod gic;
 mod psci;
 pub mod serial;
+mod virtio_blk;
 
 // halt the kernel forever (wait-for-event)
 pub fn halt_loop() -> ! {
