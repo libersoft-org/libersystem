@@ -260,6 +260,11 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	// message through SYS_CHANNEL_CREATE / SEND / RECV, then prints what it got.
 	run_ipc_process();
 
+	// Cross-process capability IPC: a sender process and a receiver process, each
+	// endowed with one endpoint of a channel as its bootstrap handle. The sender
+	// sends a message; the receiver waits, receives, and prints it.
+	run_cross_process_ipc();
+
 	// Per-address-space isolation: two independent address spaces map the SAME
 	// virtual address to different physical frames. Switching TTBR0 (write_cr3)
 	// changes what that address reads - the kernel keeps running because each
@@ -530,4 +535,113 @@ fn run_ipc_process() {
 	crate::serial_println!("aarch64: IPC - entering EL0 process");
 	crate::sched::run_until_idle();
 	crate::serial_println!("aarch64: IPC - EL0 process exited");
+}
+
+// Build a user Process running `prog` (its own address space, code+stack at 64 TiB
+// VAs), endowed with `endpoint` as its bootstrap handle (delivered as the entry
+// argument x0). `msg`, if non-empty, is placed at code+0x500 for the program to
+// send. The code page is writable so a receive buffer / handle slots can live in it.
+fn build_ipc_endpoint_process(prog: &[u32], msg: &[u8], endpoint: alloc::sync::Arc<dyn crate::object::KernelObject>) {
+	use crate::object::address_space::AddressSpace;
+	use crate::object::process::Process;
+	use crate::object::rights::Rights;
+
+	let addr_space = match AddressSpace::create() {
+		Some(a) => a,
+		None => {
+			crate::serial_println!("aarch64: xIPC - no address space");
+			return;
+		}
+	};
+	let code = super::paging::alloc_frame().expect("aarch64: no frame for xIPC code");
+	let stack = super::paging::alloc_frame().expect("aarch64: no frame for xIPC stack");
+	let code_va: u64 = 0x0000_4000_0000_0000;
+	let stack_va: u64 = 0x0000_4000_0001_0000;
+	let stack_top = stack_va + 0x1000;
+
+	unsafe {
+		let cp = code as *mut u32;
+		for (i, w) in prog.iter().enumerate() {
+			core::ptr::write_volatile(cp.add(i), *w);
+		}
+		if !msg.is_empty() {
+			core::ptr::copy_nonoverlapping(msg.as_ptr(), (code + 0x500) as *mut u8, msg.len());
+		}
+		core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+	}
+
+	addr_space.map(code_va, code, super::paging::PRESENT | super::paging::WRITABLE | super::paging::USER);
+	addr_space.map(stack_va, stack, super::paging::PRESENT | super::paging::WRITABLE | super::paging::USER | super::paging::NO_EXECUTE);
+
+	let process = Process::new(addr_space, crate::sched::root_domain());
+	process.adopt_frames(alloc::vec![code, stack]);
+	let handle = process.install(endpoint, Rights::ALL, 0);
+	let ctx = alloc::boxed::Box::new(UserCtx { entry: code_va, stack_top, arg: handle });
+	crate::sched::thread_create(process, user_trampoline, alloc::boxed::Box::into_raw(ctx) as u64);
+}
+
+// Cross-process capability IPC: create a channel, hand one endpoint to a sender
+// process and the other to a receiver process (each as its bootstrap handle). The
+// sender does SYS_CHANNEL_SEND; the receiver SYS_WAITs, SYS_CHANNEL_RECVs, and
+// prints the message. Both programs materialize their code base with a shifted
+// MOVZ (the entry argument x0 is their handle, not the base).
+fn run_cross_process_ipc() {
+	use crate::object::channel::Channel;
+
+	let movz = |rd: u32, imm: u16| -> u32 { 0xD280_0000 | ((imm as u32) << 5) | rd };
+	let movz_sh = |rd: u32, imm: u16, hw: u32| -> u32 { 0xD280_0000 | (hw << 21) | ((imm as u32) << 5) | rd };
+	let mov_reg = |rd: u32, rm: u32| -> u32 { 0xAA00_03E0 | (rm << 16) | rd };
+	let add_imm = |rd: u32, rn: u32, imm: u32| -> u32 { 0x9100_0000 | (imm << 10) | (rn << 5) | rd };
+	const SVC0: u32 = 0xD400_0001;
+
+	let msg = b"cross-process capability IPC on aarch64!\n";
+	let len = msg.len() as u16;
+
+	// Sender: SYS_CHANNEL_SEND(handle=x0, msg=base+0x500, len, xfer=0), then exit.
+	let sender: [u32; 11] = [
+		mov_reg(19, 0),         // x19 = handle
+		movz_sh(20, 0x4000, 2), // x20 = code base (64 TiB)
+		mov_reg(0, 19),         // x0 = handle
+		add_imm(1, 20, 0x500),  // x1 = &msg
+		movz(2, len),           // x2 = len
+		movz(3, 0),             // x3 = xfer (none)
+		movz(8, abi::SYS_CHANNEL_SEND as u16),
+		SVC0,
+		movz(8, abi::SYS_USER_EXIT as u16),
+		SVC0,
+		0x1400_0000,
+	];
+
+	// Receiver: SYS_WAIT(handle,0,0); SYS_CHANNEL_RECV(handle, base+0x600, cap, 0);
+	// SYS_DEBUG_WRITE(base+0x600, n); exit.
+	let receiver: [u32; 21] = [
+		mov_reg(19, 0),         // x19 = handle
+		movz_sh(20, 0x4000, 2), // x20 = code base
+		mov_reg(0, 19),
+		movz(1, 0), // deadline = 0 (no timeout)
+		movz(2, 0), // flags = 0
+		movz(8, abi::SYS_WAIT as u16),
+		SVC0,
+		mov_reg(0, 19),
+		add_imm(1, 20, 0x600), // x1 = &buf
+		movz(2, 0x100),        // cap
+		movz(3, 0),            // out_handle = none
+		movz(8, abi::SYS_CHANNEL_RECV as u16),
+		SVC0,
+		mov_reg(21, 0),        // x21 = received length
+		add_imm(0, 20, 0x600), // x0 = &buf
+		mov_reg(1, 21),        // x1 = length
+		movz(8, abi::SYS_DEBUG_WRITE as u16),
+		SVC0,
+		movz(8, abi::SYS_USER_EXIT as u16),
+		SVC0,
+		0x1400_0000,
+	];
+
+	let (ep0, ep1) = Channel::create();
+	crate::serial_println!("aarch64: xIPC - spawning sender + receiver processes");
+	build_ipc_endpoint_process(&sender, msg, ep0);
+	build_ipc_endpoint_process(&receiver, &[], ep1);
+	crate::sched::run_until_idle();
+	crate::serial_println!("aarch64: xIPC - done");
 }
