@@ -145,6 +145,10 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	let cpu = super::percpu::this_cpu();
 	crate::serial_println!("aarch64: per-CPU up (TPIDR_EL1) cpu_id={} mpidr={:#x} of {} CPU(s)", cpu.cpu_id(), cpu.lapic_id() & 0xff_ffff, cpu_count);
 
+	// Wake the secondary cores via PSCI CPU_ON (each brings up its own per-CPU
+	// block + local GIC/timer, then idles).
+	super::psci::bring_up_secondaries(cpu_count);
+
 	// Cooperative context switch: spin up two kernel threads that ping-pong via
 	// switch_context, then thread A returns control here.
 	let (a_sp, b_sp) = unsafe { (super::context::init_thread_stack(&mut *(&raw mut STACK_A), thread_a, 0xAA), super::context::init_thread_stack(&mut *(&raw mut STACK_B), thread_b, 0xBB)) };
@@ -178,7 +182,7 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	}
 	crate::serial_println!("aarch64: returned from EL0 usermode");
 
-	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + percpu + threads + EL0 OK - halting");
+	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + percpu + SMP + threads + EL0 OK - halting");
 	super::halt_loop()
 }
 

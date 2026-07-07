@@ -57,15 +57,31 @@ fn arm_timer(interval: u64) {
 	}
 }
 
-// Bring up the GIC and start the periodic timer. Interrupts stay masked (DAIF.I)
-// until the caller enables them.
+// Bring up the GIC and start the periodic timer on the boot core: enable the
+// (global) distributor, then this core's CPU interface + timer. Interrupts stay
+// masked (DAIF.I) until the caller enables them.
 pub fn init() {
 	unsafe {
-		// Distributor + CPU interface on; allow all priorities through (PMR high).
+		// Distributor on (global - the boot core does this once).
 		core::ptr::write_volatile(gicd(GICD_CTLR), 1);
+	}
+	init_cpu_local();
+}
+
+// Bring up a secondary core's GIC CPU interface + timer (the distributor is
+// already on). The GICv2 CPU interface and the SGI/PPI enable bits are banked
+// per core, so each core must run this itself.
+pub fn init_secondary() {
+	init_cpu_local();
+}
+
+// Per-core GIC + timer setup: CPU interface on, unmask the timer PPI, arm CNTP.
+fn init_cpu_local() {
+	unsafe {
+		// Allow all priorities through (PMR high) and enable the CPU interface.
 		core::ptr::write_volatile(gicc(GICC_PMR), 0xf0);
 		core::ptr::write_volatile(gicc(GICC_CTLR), 1);
-		// Unmask the timer PPI (INTID 30 -> ISENABLER0 bit 30).
+		// Unmask the timer PPI (INTID 30 -> ISENABLER0 bit 30; banked per core).
 		let reg = gicd(GICD_ISENABLER + (TIMER_INTID as usize / 32) * 4);
 		core::ptr::write_volatile(reg, 1 << (TIMER_INTID % 32));
 

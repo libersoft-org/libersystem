@@ -12,6 +12,7 @@ mod boot;
 mod dtb;
 mod exceptions;
 mod gic;
+mod psci;
 pub mod serial;
 
 // halt the kernel forever (wait-for-event)
