@@ -227,6 +227,20 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	}
 	crate::serial_println!("aarch64: context switch - returned to boot core");
 
+	// The portable scheduler: bring up crate::sched on the boot core and run three
+	// real kernel threads (each a Thread in its own Process in the kernel address
+	// space, accounted to the root Domain) cooperatively to completion. This is the
+	// same scheduler the x86_64 kernel uses - the aarch64 arch backend (context
+	// switch, per-CPU, read/write_cr3, timer) now satisfies its whole contract.
+	crate::sched::allocate(1);
+	crate::sched::init();
+	for id in 1..=3u64 {
+		crate::sched::spawn(sched_task, id);
+	}
+	crate::serial_println!("aarch64: portable scheduler - draining 3 kernel threads");
+	crate::sched::run_until_idle();
+	crate::serial_println!("aarch64: portable scheduler - all threads exited");
+
 	// EL0 usermode: map a user code page and stack at 4 GiB+ (clear of the low
 	// 1 GB identity blocks), copy in a tiny program that makes SVC syscalls, and
 	// `eret` down to EL0. The program's "exit" syscall unwinds control back here.
@@ -313,5 +327,14 @@ extern "C" fn thread_b(arg: u64) {
 		unsafe {
 			super::context::switch_context(&raw mut B_SP, A_SP);
 		}
+	}
+}
+
+// A portable-scheduler kernel thread: print a few times, yielding the core to the
+// next ready thread between steps, then return (which retires it via sched::exit).
+extern "C" fn sched_task(id: u64) {
+	for i in 0..3 {
+		crate::serial_println!("aarch64: [sched] thread {id} step {i}");
+		crate::sched::yield_now();
 	}
 }
