@@ -10,3 +10,9 @@ build-std-features = ["compiler-builtins-mem"]
 # segments at their link-time p_vaddr and applies no relocations, so the program
 # must use absolute addressing rather than a position-independent layout.
 rustflags = ["-C", "relocation-model=static"]
+
+[target.aarch64-unknown-none]
+# Same fixed-address ET_EXEC contract as x86_64: the kernel ELF loader maps
+# segments at their link-time p_vaddr with no relocations. Build for aarch64 with
+# `cargo build --target aarch64-unknown-none` (overriding the default target).
+rustflags = ["-C", "relocation-model=static"]

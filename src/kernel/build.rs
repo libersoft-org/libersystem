@@ -13,6 +13,7 @@ fn main() {
 	export_product_metadata(&conf);
 	assemble_init_package(&conf);
 	assemble_volume_package(&conf);
+	embed_aarch64_demo();
 }
 
 fn select_linker_script() {
@@ -26,6 +27,27 @@ fn select_linker_script() {
 	println!("cargo:rustc-link-arg=-T{script}");
 	println!("cargo:rerun-if-changed={script}");
 	println!("cargo:rerun-if-changed=build.rs");
+}
+
+// On aarch64, embed the pre-built `echo` userspace ELF so the kernel can load and
+// run a real rt-based program as an end-to-end bring-up demo. Written to OUT_DIR
+// (empty when the ELF is absent, e.g. a bare `cargo build` without the userspace
+// built first), so the kernel always builds and the demo simply does not run. On
+// other targets the embedded blob is empty (they route userspace via the init
+// package instead).
+fn embed_aarch64_demo() {
+	let out_dir: PathBuf = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+	let dest: PathBuf = out_dir.join("echo_demo.elf");
+	let arch: String = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+	let bytes: Vec<u8> = if arch == "aarch64" {
+		let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+		let elf: PathBuf = PathBuf::from(&manifest_dir).join("../user/tools/target/aarch64-unknown-none/debug/echo");
+		println!("cargo:rerun-if-changed={}", elf.display());
+		fs::read(&elf).unwrap_or_default()
+	} else {
+		Vec::new()
+	};
+	fs::write(&dest, &bytes).unwrap_or_else(|e: std::io::Error| panic!("cannot write {}: {e}", dest.display()));
 }
 
 // Parse ../../product.conf (shell-style KEY="value") into key/value pairs (the

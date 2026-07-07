@@ -29,10 +29,16 @@ pub use abi::*;
 // #[global_allocator]; dormant until the first allocation.
 mod heap;
 
-// ELF entry: the kernel drops us into ring 3 here with the bootstrap channel
-// handle in rdi. Align the stack to the SysV ABI boundary, then call the runtime
-// entry (keeping the bootstrap handle in rdi).
+// ELF entry: the kernel drops us into ring 3 / EL0 here with the bootstrap channel
+// handle in the first argument register. Align the stack to the ABI boundary, then
+// call the runtime entry (keeping the bootstrap handle in that register).
+#[cfg(target_arch = "x86_64")]
 global_asm!(".text", ".global _start", "_start:", "and rsp, -16", "call __rt_start", "ud2");
+
+// aarch64: the kernel enters EL0 with the bootstrap handle in x0. SP is already
+// 16-aligned; clear the frame pointer and call the runtime entry.
+#[cfg(target_arch = "aarch64")]
+global_asm!(".text", ".global _start", "_start:", "mov x29, xzr", "bl __rt_start", "brk #0");
 
 // The runtime entry the assembly stub calls: verify the kernel's ABI matches the one
 // this binary was built against, then hand control to the program's `__user_main` with
@@ -71,6 +77,7 @@ fn panic(_info: &PanicInfo) -> ! {
 // Issue a syscall: number in rax, up to four args in rdi/rsi/rdx/r10. The
 // `syscall` instruction clobbers rcx and r11; the kernel also uses r8/r9. The
 // result comes back in rax (a success value or a small negative error code).
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 	unsafe {
 		let result: u64;
@@ -85,6 +92,25 @@ pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 			lateout("r11") _,
 			lateout("r8") _,
 			lateout("r9") _,
+		);
+		result
+	}
+}
+
+// aarch64: number in x8, up to four args in x0..x3, result back in x0 (the SVC
+// trap path). SVC preserves the general registers, so nothing else is clobbered.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+	unsafe {
+		let result: u64;
+		asm!(
+			"svc #0",
+			in("x8") number,
+			inlateout("x0") a0 => result,
+			in("x1") a1,
+			in("x2") a2,
+			in("x3") a3,
+			options(nostack),
 		);
 		result
 	}
@@ -197,6 +223,7 @@ pub const PERF: bool = false;
 
 // Read the time-stamp counter for a perf marker (the same cycle clock the kernel times
 // with). The lfence keeps the read from being reordered ahead of the work it brackets.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn perf_now() -> u64 {
 	let lo: u32;
@@ -205,6 +232,18 @@ pub fn perf_now() -> u64 {
 		asm!("lfence", "rdtsc", out("eax") lo, out("edx") hi, options(nostack, preserves_flags));
 	}
 	((hi as u64) << 32) | lo as u64
+}
+
+// aarch64: the virtual count register is the same monotonic cycle clock; the isb
+// keeps the read from being reordered ahead of the bracketed work.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn perf_now() -> u64 {
+	let cnt: u64;
+	unsafe {
+		asm!("isb", "mrs {}, cntvct_el0", out(reg) cnt, options(nostack, preserves_flags));
+	}
+	cnt
 }
 
 // Emit one perf marker (`\x1ePERF <label> <tsc>\n`) to the kernel debug serial. The

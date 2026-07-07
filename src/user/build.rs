@@ -12,11 +12,24 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
-	println!("cargo:rustc-link-arg=-T../user.ld");
-	println!("cargo:rerun-if-changed=../user.ld");
-	println!("cargo:rerun-if-changed=../build.rs");
+	select_linker_script();
 	export_product_metadata();
 	generate_service_manifest();
+}
+
+// Link every userspace program at the fixed base its loader expects, using the
+// shared linker script for the target arch (the AArch64 script differs only in the
+// ELF object format). Build scripts run with the crate dir as the working
+// directory, so the `../` paths resolve into this user/ directory.
+fn select_linker_script() {
+	let arch: String = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+	let script: &str = match arch.as_str() {
+		"aarch64" => "../user-aarch64.ld",
+		_ => "../user.ld",
+	};
+	println!("cargo:rustc-link-arg=-T{script}");
+	println!("cargo:rerun-if-changed={script}");
+	println!("cargo:rerun-if-changed=../build.rs");
 }
 
 // Generate ServiceManager's dependency table from the shared service manifest

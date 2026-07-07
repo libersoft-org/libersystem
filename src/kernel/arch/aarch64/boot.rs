@@ -112,6 +112,10 @@ _start:
 "#
 );
 
+// The `echo` userspace tool, cross-compiled for aarch64 and embedded by build.rs
+// (empty when the userspace was not built first, e.g. a bare `cargo build`).
+const ECHO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_demo.elf"));
+
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_main(dtb: u64) -> ! {
 	super::serial::init();
@@ -345,6 +349,13 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	// x86 kernel uses, and run it as a real EL0 process. This is a payoff of the
 	// higher-half relink: standard low virtual addresses are now free for user ELFs.
 	run_elf_process();
+
+	// Real userspace binary: load the `echo` tool - cross-compiled from the actual
+	// userspace tree with the shared `rt` runtime - and run it as an EL0 process,
+	// acting as its launcher (a bootstrap channel + the stdout/argv messages rt
+	// expects). This exercises the whole real userspace path: the rt ABI handshake
+	// (SYS_ABI_CHECK over svc), the rt syscall wrapper, and the program's own logic.
+	run_echo_program();
 
 	// Per-address-space isolation: two independent address spaces map the SAME
 	// virtual address to different physical frames. Switching TTBR0 (write_cr3)
@@ -624,6 +635,69 @@ fn run_elf_process() {
 	crate::serial_println!("aarch64: ELF - loading + running a low-VA aarch64 ELF (entry {entry:#x})");
 	crate::sched::run_until_idle();
 	crate::serial_println!("aarch64: ELF - process exited");
+}
+
+// Load and run the real `echo` tool (built from the userspace tree with the shared
+// rt runtime, embedded by build.rs). The kernel acts as its launcher: it seeds the
+// process with a bootstrap channel and sends the two messages rt expects - a STDOUT
+// message (no console handle, so echo's output falls back to the debug port) and
+// the argument line. echo then does the rt ABI handshake, receives the line, and
+// prints it via SYS_DEBUG_WRITE. A no-op when the ELF was not embedded.
+fn run_echo_program() {
+	use crate::object::address_space::AddressSpace;
+	use crate::object::channel::{Channel, Message};
+	use crate::object::process::Process;
+	use crate::object::rights::Rights;
+
+	if ECHO_ELF.is_empty() {
+		return;
+	}
+
+	let addr_space = match AddressSpace::create() {
+		Some(a) => a,
+		None => {
+			crate::serial_println!("aarch64: echo - no address space");
+			return;
+		}
+	};
+	let mut frames: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	let entry = match crate::elf::load_into(ECHO_ELF, &addr_space, &mut frames) {
+		Ok(e) => e,
+		Err(_) => {
+			crate::serial_println!("aarch64: echo - ELF load failed");
+			for f in frames {
+				super::paging::dealloc_frame(f);
+			}
+			return;
+		}
+	};
+	unsafe {
+		core::arch::asm!("ic iallu", "dsb ish", "isb", options(nostack, preserves_flags));
+	}
+
+	// User stack (the loader maps only PT_LOAD segments).
+	let stack = super::paging::alloc_frame().expect("aarch64: no frame for echo stack");
+	let stack_va: u64 = 0x7fff_0000;
+	let stack_top = stack_va + 0x1000;
+	addr_space.map(stack_va, stack, super::paging::PRESENT | super::paging::WRITABLE | super::paging::USER | super::paging::NO_EXECUTE);
+	frames.push(stack);
+
+	// Bootstrap channel: the process holds ep1; the kernel keeps ep0 and, as the
+	// launcher, sends the stdout + argument messages the rt runtime consumes.
+	let (ep0, ep1) = Channel::create();
+	let process = Process::new(addr_space, crate::sched::root_domain());
+	process.adopt_frames(frames);
+	let bootstrap = process.install(ep1, Rights::ALL, 0);
+	// STDOUT message with no console handle -> rt keeps the debug-port fallback.
+	let _ = ep0.send(Message::new(alloc::vec::Vec::from(&b"STDOUT"[..]), alloc::vec::Vec::new(), 0));
+	// The argument line echo prints.
+	let _ = ep0.send(Message::new(alloc::vec::Vec::from(&b"echo running from a real aarch64 ELF"[..]), alloc::vec::Vec::new(), 0));
+
+	let ctx = alloc::boxed::Box::new(UserCtx { entry, stack_top, arg: bootstrap });
+	crate::sched::thread_create(process, user_trampoline, alloc::boxed::Box::into_raw(ctx) as u64);
+	crate::serial_println!("aarch64: echo - running the real echo tool (entry {entry:#x})");
+	crate::sched::run_until_idle();
+	crate::serial_println!("aarch64: echo - tool exited");
 }
 
 // A single user process that exercises capability IPC entirely from EL0: it
