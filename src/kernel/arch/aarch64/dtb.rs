@@ -16,6 +16,8 @@ pub struct BootInfo {
 	pub ram_base: u64,
 	pub ram_size: u64,
 	pub cpu_count: u32,
+	// PCIe ECAM config-space base (0 if the tree has no pcie node).
+	pub pcie_ecam: u64,
 }
 
 const FDT_MAGIC: u32 = 0xd00d_feed;
@@ -129,11 +131,13 @@ pub fn parse(hint: u64) -> Option<BootInfo> {
 		let mut depth: i32 = -1;
 		let mut d1_memory = false; // inside a depth-1 "memory" node
 		let mut d1_cpus = false; //   inside the depth-1 "cpus" node
+		let mut d1_pcie = false; //   inside a depth-1 "pcie"/"pci" node
 		let mut addr_cells: u32 = 2;
 		let mut size_cells: u32 = 2;
 		let mut ram_base: u64 = 0;
 		let mut ram_size: u64 = 0;
 		let mut cpu_count: u32 = 0;
+		let mut pcie_ecam: u64 = 0;
 
 		loop {
 			let token = be32(p);
@@ -146,6 +150,7 @@ pub fn parse(hint: u64) -> Option<BootInfo> {
 					if depth == 1 {
 						d1_memory = str_starts(name, "memory");
 						d1_cpus = str_eq(name, "cpus");
+						d1_pcie = str_starts(name, "pcie") || str_starts(name, "pci@");
 					} else if depth == 2 && d1_cpus && str_starts(name, "cpu@") {
 						cpu_count += 1;
 					}
@@ -154,6 +159,7 @@ pub fn parse(hint: u64) -> Option<BootInfo> {
 					if depth == 1 {
 						d1_memory = false;
 						d1_cpus = false;
+						d1_pcie = false;
 					}
 					depth -= 1;
 				}
@@ -182,6 +188,10 @@ pub fn parse(hint: u64) -> Option<BootInfo> {
 							}
 							ram_size += s;
 						}
+					} else if depth == 1 && d1_pcie && str_eq(pname, "reg") {
+						// The pcie node's reg is <ecam_base ecam_size> in root cells.
+						let mut q = val;
+						pcie_ecam = read_cells(&mut q, addr_cells);
 					}
 				}
 				FDT_NOP => {}
@@ -193,6 +203,6 @@ pub fn parse(hint: u64) -> Option<BootInfo> {
 		if ram_size == 0 {
 			return None;
 		}
-		Some(BootInfo { ram_base, ram_size, cpu_count: cpu_count.max(1) })
+		Some(BootInfo { ram_base, ram_size, cpu_count: cpu_count.max(1), pcie_ecam })
 	}
 }

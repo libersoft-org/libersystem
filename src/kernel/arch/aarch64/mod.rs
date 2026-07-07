@@ -316,10 +316,47 @@ pub mod usermode {
 
 // --------------------------------------------------------------------- pci
 // PCI config space is a bus standard; only the config-space ACCESS mechanism is
-// arch-specific (x86 ports vs aarch64 ECAM MMIO). The device types + scan logic
-// become portable in M116; for now the scans return empty so the tree links.
+// arch-specific (x86 I/O ports vs aarch64 ECAM MMIO). On QEMU's `virt` the PCIe
+// ECAM lives at 0x3f00_0000 (16 MiB = 16 buses), inside the low device MMIO
+// region the boot identity map already covers as Device memory, so config space
+// is reachable directly. `scan` enumerates it; the virtio/xhci capability walks
+// fill in with the drivers.
 pub mod pci {
 	use alloc::vec::Vec;
+	use core::sync::atomic::{AtomicUsize, Ordering};
+
+	// PCIe ECAM base (set from the device tree at boot) and the number of buses to
+	// probe. On QEMU virt the ECAM is the high-mem window at 0x40_1000_0000.
+	static ECAM_BASE: AtomicUsize = AtomicUsize::new(0);
+	const ECAM_BUSES: u8 = 16;
+
+	// Record the ECAM base discovered in the device tree.
+	pub fn set_ecam_base(base: u64) {
+		ECAM_BASE.store(base as usize, Ordering::Relaxed);
+	}
+
+	// Byte address of a config-space register for a given B/D/F.
+	fn cfg_addr(bus: u8, dev: u8, func: u8, off: usize) -> usize {
+		ECAM_BASE.load(Ordering::Relaxed) + ((bus as usize) << 20) + ((dev as usize) << 15) + ((func as usize) << 12) + off
+	}
+	fn cfg_read32(bus: u8, dev: u8, func: u8, off: usize) -> u32 {
+		unsafe { core::ptr::read_volatile(cfg_addr(bus, dev, func, off) as *const u32) }
+	}
+	fn cfg_read16(bus: u8, dev: u8, func: u8, off: usize) -> u16 {
+		unsafe { core::ptr::read_volatile(cfg_addr(bus, dev, func, off) as *const u16) }
+	}
+	fn cfg_read8(bus: u8, dev: u8, func: u8, off: usize) -> u8 {
+		unsafe { core::ptr::read_volatile(cfg_addr(bus, dev, func, off) as *const u8) }
+	}
+
+	// Read the fixed header fields of one present function into a PciDevice.
+	fn read_function(bus: u8, dev: u8, func: u8, vendor: u16) -> PciDevice {
+		let mut bars = [0u32; 6];
+		for (i, bar) in bars.iter_mut().enumerate() {
+			*bar = cfg_read32(bus, dev, func, 0x10 + i * 4);
+		}
+		PciDevice { bus, dev, func, vendor, device_id: cfg_read16(bus, dev, func, 0x02), class: cfg_read8(bus, dev, func, 0x0b), subclass: cfg_read8(bus, dev, func, 0x0a), prog_if: cfg_read8(bus, dev, func, 0x09), header_type: cfg_read8(bus, dev, func, 0x0e), bars }
+	}
 
 	#[derive(Clone, Copy)]
 	pub struct PciDevice {
@@ -369,8 +406,29 @@ pub mod pci {
 		pub msix_table_phys: u64,
 	}
 
+	// Enumerate every present function on the ECAM bus.
 	pub fn scan() -> Vec<PciDevice> {
-		Vec::new()
+		let mut out = Vec::new();
+		if ECAM_BASE.load(Ordering::Relaxed) == 0 {
+			return out;
+		}
+		for bus in 0..ECAM_BUSES {
+			for dev in 0..32u8 {
+				if cfg_read16(bus, dev, 0, 0x00) == 0xffff {
+					continue;
+				}
+				// Multi-function devices (header type bit 7) expose funcs 1..8.
+				let funcs = if cfg_read8(bus, dev, 0, 0x0e) & 0x80 != 0 { 8 } else { 1 };
+				for func in 0..funcs {
+					let vendor = cfg_read16(bus, dev, func, 0x00);
+					if vendor == 0xffff {
+						continue;
+					}
+					out.push(read_function(bus, dev, func, vendor));
+				}
+			}
+		}
+		out
 	}
 	pub fn scan_virtio() -> Vec<VirtioDevice> {
 		Vec::new()

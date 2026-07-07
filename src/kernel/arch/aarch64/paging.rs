@@ -113,6 +113,20 @@ pub unsafe fn init_boot_mmu() {
 	}
 }
 
+// Identity-map the 1 GB block containing `phys` as Device memory in the boot L1
+// (for MMIO windows above the initial 0..4 GB the boot map covers - e.g. the
+// PCIe ECAM at 256 GB on QEMU virt). The block sits under L0[0] (which spans
+// 0..512 GB), so `phys` must be below 512 GB.
+pub fn identity_map_device_gb(phys: u64) {
+	let idx = ((phys >> 30) & 0x1ff) as usize;
+	let block_base = (phys >> 30) << 30;
+	unsafe {
+		let l1 = &raw mut BOOT_L1;
+		core::ptr::write_volatile((*l1).0.as_mut_ptr().add(idx), block_base | BLOCK_DEVICE);
+		asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack, preserves_flags));
+	}
+}
+
 // Translate a TTBR0 virtual address to its physical address by walking the boot
 // tables (4 kB granule, 48-bit, levels L0..L3, honoring block descriptors).
 pub fn translate(va: u64) -> Option<u64> {

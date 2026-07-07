@@ -37,4 +37,5 @@ qemu-system-aarch64 \
 	-device loader,file="$DTB_FILE",addr="$DTB_ADDR" \
 	-serial "$SERIAL" \
 	-display none \
-	-no-reboot
+	-no-reboot \
+	${QEMU_EXTRA:-}

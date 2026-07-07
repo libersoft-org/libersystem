@@ -104,6 +104,12 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	let (ram_top, cpu_count) = match boot_info {
 		Some(bi) => {
 			crate::serial_println!("aarch64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s)", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count);
+			// Map the PCIe ECAM window (QEMU virt puts it at 256 GB, above the boot
+			// map) and point the PCI code at it.
+			if bi.pcie_ecam != 0 {
+				super::paging::identity_map_device_gb(bi.pcie_ecam);
+				super::pci::set_ecam_base(bi.pcie_ecam);
+			}
 			(bi.ram_base + bi.ram_size, bi.cpu_count)
 		}
 		None => {
@@ -147,6 +153,13 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	};
 	let ok = via_high == pattern && via_phys == pattern;
 	crate::serial_println!("aarch64: map_page {hva:#x} -> {frame:#x} | high={via_high:#x} phys={via_phys:#x} = {}", if ok { "ok" } else { "FAIL" });
+
+	// Enumerate the PCIe ECAM bus (heap is up, so scan can return a Vec).
+	let devices = super::pci::scan();
+	crate::serial_println!("aarch64: PCI - {} device(s) on the ECAM bus", devices.len());
+	for d in &devices {
+		crate::serial_println!("aarch64:   {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}:{:02x}", d.bus, d.dev, d.func, d.vendor, d.device_id, d.class, d.subclass);
+	}
 
 	// Per-CPU block for the boot core, reachable through TPIDR_EL1.
 	let mpidr: u64;
@@ -230,7 +243,7 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	paging::free_address_space(as2);
 	crate::serial_println!("aarch64: address spaces torn down");
 
-	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + heap + percpu + SMP + threads + EL0 + addrspace OK - halting");
+	crate::serial_println!("aarch64 bring-up: serial + MMU + vectors + GIC/timer + paging + heap + pci + percpu + SMP + threads + EL0 + addrspace OK - halting");
 	super::halt_loop()
 }
 
