@@ -16,33 +16,14 @@ use core::arch::asm;
 use super::paging::phys_to_virt;
 use super::pci::VirtioDevice;
 
-// device_status bits.
-const S_ACK: u8 = 1;
-const S_DRIVER: u8 = 2;
-const S_DRIVER_OK: u8 = 4;
-const S_FEATURES_OK: u8 = 8;
+// The virtio-pci wire format (device_status bits, descriptor flags, common-config
+// register offsets) is the shared `abi` source of truth, aliased here to this driver's
+// short names; only the block-request types below are device-specific.
+use abi::{VIRTIO_CFG_DEVICE_FEATURE as CFG_DEVICE_FEATURE, VIRTIO_CFG_DEVICE_FEATURE_SELECT as CFG_DEVICE_FEATURE_SELECT, VIRTIO_CFG_DEVICE_STATUS as CFG_DEVICE_STATUS, VIRTIO_CFG_DRIVER_FEATURE as CFG_DRIVER_FEATURE, VIRTIO_CFG_DRIVER_FEATURE_SELECT as CFG_DRIVER_FEATURE_SELECT, VIRTIO_CFG_QUEUE_DESC as CFG_QUEUE_DESC, VIRTIO_CFG_QUEUE_DEVICE as CFG_QUEUE_DEVICE, VIRTIO_CFG_QUEUE_DRIVER as CFG_QUEUE_DRIVER, VIRTIO_CFG_QUEUE_ENABLE as CFG_QUEUE_ENABLE, VIRTIO_CFG_QUEUE_NOTIFY_OFF as CFG_QUEUE_NOTIFY_OFF, VIRTIO_CFG_QUEUE_SELECT as CFG_QUEUE_SELECT, VIRTIO_CFG_QUEUE_SIZE as CFG_QUEUE_SIZE, VIRTIO_DESC_F_NEXT as VRING_DESC_F_NEXT, VIRTIO_DESC_F_WRITE as VRING_DESC_F_WRITE, VIRTIO_STATUS_ACKNOWLEDGE as S_ACK, VIRTIO_STATUS_DRIVER as S_DRIVER, VIRTIO_STATUS_DRIVER_OK as S_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK as S_FEATURES_OK};
 
-// virtq descriptor flags.
-const VRING_DESC_F_NEXT: u16 = 1;
-const VRING_DESC_F_WRITE: u16 = 2;
-
-// virtio_blk request types.
+// virtio_blk request types (device-specific).
 const VIRTIO_BLK_T_IN: u32 = 0; // read (device -> memory)
 const VIRTIO_BLK_T_OUT: u32 = 1; // write (memory -> device)
-
-// virtio_pci_common_cfg field offsets.
-const CFG_DEVICE_FEATURE_SELECT: u64 = 0x00;
-const CFG_DEVICE_FEATURE: u64 = 0x04;
-const CFG_DRIVER_FEATURE_SELECT: u64 = 0x08;
-const CFG_DRIVER_FEATURE: u64 = 0x0c;
-const CFG_DEVICE_STATUS: u64 = 0x14;
-const CFG_QUEUE_SELECT: u64 = 0x16;
-const CFG_QUEUE_SIZE: u64 = 0x18;
-const CFG_QUEUE_ENABLE: u64 = 0x1c;
-const CFG_QUEUE_NOTIFY_OFF: u64 = 0x1e;
-const CFG_QUEUE_DESC: u64 = 0x20;
-const CFG_QUEUE_DRIVER: u64 = 0x28;
-const CFG_QUEUE_DEVICE: u64 = 0x30;
 
 const SECTOR_SIZE: usize = 512;
 unsafe fn r8(a: u64) -> u8 {

@@ -210,6 +210,48 @@ pub const VIRTIO_TYPE_GPU: u32 = 16;
 pub const VIRTIO_TYPE_INPUT: u32 = 18;
 pub const VIRTIO_TYPE_SOUND: u32 = 25;
 
+// virtio-pci modern wire format, shared by the kernel's minimal boot driver and the
+// userspace drivers so the register offsets, status bits and ring flags have one
+// source of truth (each side aliases these to its own ergonomic short names).
+//
+// virtio_pci_common_cfg field offsets, relative to the common-config structure.
+pub const VIRTIO_CFG_DEVICE_FEATURE_SELECT: u64 = 0x00;
+pub const VIRTIO_CFG_DEVICE_FEATURE: u64 = 0x04;
+pub const VIRTIO_CFG_DRIVER_FEATURE_SELECT: u64 = 0x08;
+pub const VIRTIO_CFG_DRIVER_FEATURE: u64 = 0x0c;
+pub const VIRTIO_CFG_CONFIG_MSIX_VECTOR: u64 = 0x10;
+pub const VIRTIO_CFG_NUM_QUEUES: u64 = 0x12;
+pub const VIRTIO_CFG_DEVICE_STATUS: u64 = 0x14;
+pub const VIRTIO_CFG_QUEUE_SELECT: u64 = 0x16;
+pub const VIRTIO_CFG_QUEUE_SIZE: u64 = 0x18;
+pub const VIRTIO_CFG_QUEUE_MSIX_VECTOR: u64 = 0x1a;
+pub const VIRTIO_CFG_QUEUE_ENABLE: u64 = 0x1c;
+pub const VIRTIO_CFG_QUEUE_NOTIFY_OFF: u64 = 0x1e;
+pub const VIRTIO_CFG_QUEUE_DESC: u64 = 0x20;
+pub const VIRTIO_CFG_QUEUE_DRIVER: u64 = 0x28;
+pub const VIRTIO_CFG_QUEUE_DEVICE: u64 = 0x30;
+
+// device_status register bits.
+pub const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
+pub const VIRTIO_STATUS_DRIVER: u8 = 2;
+pub const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
+pub const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
+pub const VIRTIO_STATUS_FAILED: u8 = 128;
+
+// split-virtqueue descriptor flags.
+pub const VIRTIO_DESC_F_NEXT: u16 = 1; // the buffer continues in the `next` descriptor
+pub const VIRTIO_DESC_F_WRITE: u16 = 2; // the device writes this buffer (device-writable)
+
+// available-ring flag: suppress the device's used-buffer interrupt (polling drivers).
+pub const VIRTIO_AVAIL_F_NO_INTERRUPT: u16 = 1;
+
+// VIRTIO_F_VERSION_1 (feature bit 32) = bit 0 of the second feature word; every modern
+// virtio device offers it and a modern driver must accept it.
+pub const VIRTIO_F_VERSION_1: u32 = 1 << 0;
+
+// The MSI-X vector fields' reset value: no vector mapped (the device raises legacy INTx).
+pub const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
+
 // Non-virtio device type codes live above the virtio id space (modern virtio types
 // are below 0x40), so one `device_type` field classifies every discovered device.
 pub const DEVICE_TYPE_XHCI: u32 = 0x100;

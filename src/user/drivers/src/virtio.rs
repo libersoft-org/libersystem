@@ -14,47 +14,13 @@ use core::sync::atomic::{Ordering, fence};
 
 use rt::*;
 
-// virtio_pci_common_cfg field offsets, relative to the common-config structure.
-const CFG_DEVICE_FEATURE_SELECT: u64 = 0x00;
-const CFG_DEVICE_FEATURE: u64 = 0x04;
-const CFG_DRIVER_FEATURE_SELECT: u64 = 0x08;
-const CFG_DRIVER_FEATURE: u64 = 0x0c;
-const CFG_CONFIG_MSIX_VECTOR: u64 = 0x10;
-const CFG_NUM_QUEUES: u64 = 0x12;
-const CFG_DEVICE_STATUS: u64 = 0x14;
-const CFG_QUEUE_SELECT: u64 = 0x16;
-const CFG_QUEUE_SIZE: u64 = 0x18;
-const CFG_QUEUE_MSIX_VECTOR: u64 = 0x1a;
-const CFG_QUEUE_ENABLE: u64 = 0x1c;
-const CFG_QUEUE_NOTIFY_OFF: u64 = 0x1e;
-const CFG_QUEUE_DESC: u64 = 0x20;
-const CFG_QUEUE_DRIVER: u64 = 0x28;
-const CFG_QUEUE_DEVICE: u64 = 0x30;
-
-// device_status register bits.
-const STATUS_ACKNOWLEDGE: u8 = 1;
-const STATUS_DRIVER: u8 = 2;
-const STATUS_DRIVER_OK: u8 = 4;
-const STATUS_FEATURES_OK: u8 = 8;
-const STATUS_FAILED: u8 = 128;
-
-// VIRTIO_F_VERSION_1 (feature bit 32) is bit 0 of the second feature word; every
-// modern virtio device offers it and a modern driver must accept it.
-const FEATURE_VERSION_1: u32 = 1 << 0;
-
-// Descriptor flags.
-const DESC_NEXT: u16 = 1; // the buffer continues in the `next` descriptor
-const DESC_WRITE: u16 = 2; // the device writes this buffer (it is device-writable)
-
-// Available-ring flag: ask the device not to raise an interrupt when it consumes a
-// buffer. The polling drivers set this (they busy-poll the used ring and want no
-// interrupts, so their PCI INTx line - which may be shared with another device -
-// never asserts); an interrupt-driven driver clears it on its event queue.
-const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
-
-// The MSI-X vector fields' reset value: no vector mapped (the device raises legacy
-// INTx instead). A driver that has not opted into MSI-X leaves this in place.
-const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
+// The virtio-pci wire format (common-config register offsets, device_status bits,
+// descriptor + available-ring flags) is the shared `abi` source of truth (re-exported
+// through `rt::*`), aliased here to this transport's short names. VIRTIO_MSI_NO_VECTOR
+// keeps its canonical name and comes straight through the glob above. Not every field
+// is used by every path, so the unused-import lint is allowed.
+#[allow(unused_imports)]
+use rt::{VIRTIO_AVAIL_F_NO_INTERRUPT as VIRTQ_AVAIL_F_NO_INTERRUPT, VIRTIO_CFG_CONFIG_MSIX_VECTOR as CFG_CONFIG_MSIX_VECTOR, VIRTIO_CFG_DEVICE_FEATURE as CFG_DEVICE_FEATURE, VIRTIO_CFG_DEVICE_FEATURE_SELECT as CFG_DEVICE_FEATURE_SELECT, VIRTIO_CFG_DEVICE_STATUS as CFG_DEVICE_STATUS, VIRTIO_CFG_DRIVER_FEATURE as CFG_DRIVER_FEATURE, VIRTIO_CFG_DRIVER_FEATURE_SELECT as CFG_DRIVER_FEATURE_SELECT, VIRTIO_CFG_NUM_QUEUES as CFG_NUM_QUEUES, VIRTIO_CFG_QUEUE_DESC as CFG_QUEUE_DESC, VIRTIO_CFG_QUEUE_DEVICE as CFG_QUEUE_DEVICE, VIRTIO_CFG_QUEUE_DRIVER as CFG_QUEUE_DRIVER, VIRTIO_CFG_QUEUE_ENABLE as CFG_QUEUE_ENABLE, VIRTIO_CFG_QUEUE_MSIX_VECTOR as CFG_QUEUE_MSIX_VECTOR, VIRTIO_CFG_QUEUE_NOTIFY_OFF as CFG_QUEUE_NOTIFY_OFF, VIRTIO_CFG_QUEUE_SELECT as CFG_QUEUE_SELECT, VIRTIO_CFG_QUEUE_SIZE as CFG_QUEUE_SIZE, VIRTIO_DESC_F_NEXT as DESC_NEXT, VIRTIO_DESC_F_WRITE as DESC_WRITE, VIRTIO_F_VERSION_1 as FEATURE_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE as STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER as STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK as STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED as STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK as STATUS_FEATURES_OK};
 
 unsafe fn r8(addr: u64) -> u8 {
 	unsafe { (addr as *const u8).read_volatile() }
