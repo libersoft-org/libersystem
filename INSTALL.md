@@ -12,7 +12,7 @@
 
 ## Prerequisites
 
-LiberSystem is built with free, open-source tools. The toolchain currently targets **Linux** (Debian/Ubuntu). One portable kernel builds for two architectures - **`x86_64`** and **`aarch64` (ARM64)** - and boots in QEMU on either; a third architecture (`riscv64`) is in progress. On an x86_64 host the x86_64 build runs natively (with KVM) and the ARM64 build runs emulated, and vice versa on an ARM64 host.
+LiberSystem is built with free, open-source tools. The toolchain currently targets **Linux** (Debian/Ubuntu). One portable kernel builds for three architectures - **`x86_64`**, **`aarch64` (ARM64)** and **`riscv64` (RISC-V)** - and boots in QEMU on all three. On an x86_64 host the x86_64 build runs natively (with KVM) and the ARM64 and RISC-V builds run emulated, and vice versa on an ARM64 host; the RISC-V build is always emulated (there is no RISC-V host path here).
 
 The kernel is a Rust `no_std` project. It is compiled with a nightly toolchain and `build-std`, booted by the system's own UEFI loader through **UEFI** (QEMU runs with the OVMF firmware; the `ovmf` package is required), and run and tested under QEMU. All commands below are run through [`just`](https://github.com/casey/just) from the `src` directory.
 
@@ -35,7 +35,7 @@ cd src
 
 This will install:
 
-- system packages: `build-essential`, `git`, `curl`, `xorriso`, `gdisk`, `mtools`, `netpbm`, `imagemagick`, `socat`, `qemu-system-x86`, `qemu-system-arm`, `qemu-utils`, `ovmf`, `qemu-efi-aarch64`, `gdb`, `lld`, `llvm`, `clang` (`qemu-system-arm` + `qemu-efi-aarch64` are the ARM64 emulator and its UEFI firmware; omit them if you only build for x86_64)
+- system packages: `build-essential`, `git`, `curl`, `xorriso`, `gdisk`, `mtools`, `netpbm`, `imagemagick`, `socat`, `qemu-system-x86`, `qemu-system-arm`, `qemu-system-riscv`, `qemu-utils`, `ovmf`, `qemu-efi-aarch64`, `u-boot-qemu`, `gdb`, `lld`, `llvm`, `clang` (`qemu-system-arm` + `qemu-efi-aarch64` are the ARM64 emulator and its UEFI firmware, `qemu-system-riscv` + `u-boot-qemu` the RISC-V emulator and its U-Boot UEFI firmware; omit them if you only build for x86_64)
 - `rustup` with the **nightly** toolchain plus the `rust-src` and `llvm-tools-preview` components (required for `build-std` and the kernel build)
 - `just`, the task runner
 
@@ -79,9 +79,13 @@ QEMU uses KVM (with `-cpu host`) when `/dev/kvm` is available, and gives the gue
 just run-x86_64        # the x86_64 build (native with KVM on an x86_64 host)
 just run-aarch64       # the ARM64 build via QEMU's direct -kernel load (the quick path)
 just run-aarch64-uefi  # the ARM64 build booted through the system's own UEFI loader (AAVMF)
+just run-riscv64       # the RISC-V build via QEMU's direct -kernel load over OpenSBI (the quick path)
+just run-riscv64-uefi  # the RISC-V build booted through the system's own UEFI loader (U-Boot)
 ```
 
-All three reach the same interactive shell. `run-aarch64` boots the kernel the fast way (QEMU loads it directly); `run-aarch64-uefi` exercises the full firmware path - the AAVMF UEFI firmware runs the system's own `BOOTAA64.EFI` loader, which reads the kernel off a FAT boot volume and hands off exactly as it would on real hardware. The ARM64 build is emulated on an x86_64 host (no KVM), so it boots more slowly than the native run. The ARM64 runs attach the **same device set as x86_64** - `virtio-gpu` (the graphical display), `virtio-keyboard` / `virtio-tablet` input, `virtio-sound`, `virtio-net`, `virtio-serial` and the xHCI USB stack - so the `vnc` / `spice` displays below work identically. The one difference is the boot log: QEMU's `virt` machine has no VGA framebuffer, so the kernel does not draw the boot log pixel-by-pixel as on x86_64; instead the log is replayed as text onto the virtio-gpu display once ConsoleService takes over, so it still appears on screen.
+They all reach the same interactive shell. `run-aarch64` boots the kernel the fast way (QEMU loads it directly); `run-aarch64-uefi` exercises the full firmware path - the AAVMF UEFI firmware runs the system's own `BOOTAA64.EFI` loader, which reads the kernel off a FAT boot volume and hands off exactly as it would on real hardware. The ARM64 build is emulated on an x86_64 host (no KVM), so it boots more slowly than the native run. The ARM64 runs attach the **same device set as x86_64** - `virtio-gpu` (the graphical display), `virtio-keyboard` / `virtio-tablet` input, `virtio-sound`, `virtio-net`, `virtio-serial` and the xHCI USB stack - so the `vnc` / `spice` displays below work identically. The one difference is the boot log: QEMU's `virt` machine has no VGA framebuffer, so the kernel does not draw the boot log pixel-by-pixel as on x86_64; instead the log is replayed as text onto the virtio-gpu display once ConsoleService takes over, so it still appears on screen.
+
+The RISC-V build is always emulated. `run-riscv64` boots the kernel the fast way (QEMU's `-kernel` load over OpenSBI, which hands off in S-mode with the device tree); `run-riscv64-uefi` exercises the full firmware path - QEMU runs the S-mode U-Boot on OpenSBI, and U-Boot's EFI boot manager launches the system's own `BOOTRISCV64.EFI` loader off a FAT boot volume, which reads the kernel and hands off exactly as it would on real hardware. The RISC-V runs are **serial-console only** (headless, no `virtio-gpu`), so `vnc` / `spice` do not apply; they attach the storage volumes, a `virtio-net` NIC and an xHCI USB stack (keyboard / tablet / mass-storage). Override the core count with `SMP=<n>` (the recipes default to `SMP=4`).
 
 Like the native run, the ARM64 runs give the guest as many cores as the host has, but capped at **8** - the GICv2 interrupt controller QEMU's `virt` machine emulates addresses at most 8 CPU interfaces. Override the count on any run/test with `SMP=<n>` (e.g. `SMP=4 just run-aarch64`, `SMP=1 just test-aarch64`).
 
@@ -95,7 +99,7 @@ curl http://127.0.0.1:5555/
 
 ### Graphical display (VNC / SPICE)
 
-The graphical displays apply to **both** builds - the x86_64 run (`just run` on an x86_64 host, or `just run-x86_64` anywhere) and the ARM64 runs (`just run-aarch64` / `just run-aarch64-uefi`). Every run is headless by default - the framebuffer is still rendered internally, but no window is shown. To watch it live, attach a display server as an argument; the two combine freely with each other (and with any other `just run` arguments):
+The graphical displays apply to the **x86_64 and ARM64** builds - the x86_64 run (`just run` on an x86_64 host, or `just run-x86_64` anywhere) and the ARM64 runs (`just run-aarch64` / `just run-aarch64-uefi`); the RISC-V runs are serial-console only, so `vnc` / `spice` do not apply there. Every run is headless by default - the framebuffer is still rendered internally, but no window is shown. To watch it live, attach a display server as an argument; the two combine freely with each other (and with any other `just run` arguments):
 
 ```sh
 just run vnc        # VNC server on port 5900
@@ -186,11 +190,12 @@ just test
 
 A successful run prints each test with `[ok]` and exits zero.
 
-The same suite runs on the ARM64 build (emulated on an x86_64 host), where the result is reported through Arm semihosting instead of `isa-debug-exit`:
+The same suite runs on the ARM64 and RISC-V builds (emulated on an x86_64 host), where the result is reported through Arm / RISC-V semihosting instead of `isa-debug-exit`:
 
 ```sh
-just test-aarch64          # all host cores (capped at 8 - see below)
+just test-aarch64          # the ARM64 build (all host cores, capped at 8 - see below)
 SMP=1 just test-aarch64    # a single core
+just test-riscv64          # the RISC-V build (RISC-V semihosting; SMP=4 by default)
 ```
 
 ## Debugging
@@ -231,11 +236,14 @@ Run `just --list` to see every available command. The most useful ones:
 | `just run-x86_64 [vnc] [spice]` | Force the x86_64 build (native with KVM on an x86_64 host, emulated elsewhere). |
 | `just run-aarch64` | Force the ARM64 build via QEMU's direct `-kernel` load (headless serial; native on an ARM64 host, emulated on x86_64). |
 | `just run-aarch64-uefi` | Force the ARM64 build booted through the system's own UEFI loader under the AAVMF firmware. |
+| `just run-riscv64` | Force the RISC-V build via QEMU's direct `-kernel` load over OpenSBI (headless serial; always emulated). |
+| `just run-riscv64-uefi` | Force the RISC-V build booted through the system's own UEFI loader under U-Boot's EFI boot manager. |
 | `just screenshot <path>` | Save a framebuffer image to `<path>` (format by extension: png/jpg/webp/...); snaps a live `just run` if one is up, else boots a throwaway. |
 | `just iso [strip]` | Build a hybrid BIOS+UEFI ISO into `boot/.build/` (`strip` = `debug` or `all`). |
 | `just img [size] [strip]` | Build a raw GPT disk image (default `64M`) into `boot/.build/`. |
 | `just test` | Run the in-kernel test harness in QEMU. |
 | `just test-aarch64` | Run the in-kernel test harness for the ARM64 build under QEMU (Arm semihosting maps pass/fail; defaults to all host cores capped at 8 - the GICv2 limit - override with `SMP=<n>`). |
+| `just test-riscv64` | Run the in-kernel test harness for the RISC-V build under QEMU (RISC-V semihosting maps pass/fail; defaults to `SMP=4` - override with `SMP=<n>`). |
 | `just lab <cmd>` | Drive a live instance for debugging (boot, run guest shell commands, logs, packet capture - see [docs/DEBUG.md](./docs/DEBUG.md)). |
 | `just debug` | Boot in QEMU and wait for GDB on `:1234`. |
 | `just gdb` | Attach GDB to a waiting QEMU instance. |
