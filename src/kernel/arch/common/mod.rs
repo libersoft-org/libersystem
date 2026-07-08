@@ -15,8 +15,12 @@
 // shared by every interrupt-controller backend.
 // `context`: the portable thread bootstrap each backend's context-switch trampoline
 // lands in.
+// `dtb`: the flattened-device-tree (FDT) parser shared by the device-tree-booted
+// backends (aarch64 now, riscv64 next); only phys_to_virt + the fallback scan window
+// are arch-specific.
 
 pub mod context;
+pub mod dtb;
 pub mod msi;
 pub mod paging;
 pub mod pci;
