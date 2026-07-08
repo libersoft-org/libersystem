@@ -39,8 +39,10 @@ fi
 # Media volumes for the extra StorageService instances (vol://media|iso|udf|usb) - the
 # same set the aarch64/x86 runners build, so the boot chain (the shell hard-depends on
 # media/iso/udf/usb storage) reaches the shell on riscv64 too. Each is a real filesystem
-# image seeded from the shared volume/ dir, built once and reused; the virtio-blk drivers
-# poll, so these need no interrupt path. Skipped if its mkfs toolchain is missing.
+# image seeded from the shared volume/ dir, built once and reused (so only the first run
+# pays the mkfs cost); the virtio-blk drivers poll, so these need no interrupt path.
+# Skipped if its mkfs toolchain is missing. Attached in every run (including the TEST
+# topology), so the boot-chain test's five StorageService instances all come up.
 VOLDIR="$HERE/../volume"
 # exFAT media disk (vol://media), read-write.
 FAT_DISK="$HERE/.build/fat-media-riscv64.img"
@@ -86,12 +88,13 @@ fi
 # A virtio-net NIC on user networking, so DeviceManager brings up the virtio_net driver
 # and NetworkService comes online. TimeService depends on it and the shell transitively
 # on both. On QEMU virt the NIC signals via wired INTx routed to the PLIC (no MSI), so
-# this needs the per-device PLIC interrupt path.
+# this exercises the per-device PLIC interrupt path. Attached in every run (including the
+# TEST topology, which mirrors aarch64's blk/net/usb device set for the device tests).
 DISK_ARGS+=(-netdev "user,id=vnet0" -device "virtio-net-pci,netdev=vnet0")
 
 # xHCI USB host controller + a hub with a keyboard, tablet, and a FAT mass-storage stick
 # backing vol://usb (seeded from volume/ when mtools is present) - the same USB set the
-# aarch64/x86 runners attach.
+# aarch64/x86 runners attach; the device-table tests expect the xHCI controller present.
 USB_DISK="$HERE/.build/usb-media-riscv64.img"
 if [[ ! -f "$USB_DISK" ]]; then
 	truncate -s 16M "$USB_DISK"
@@ -110,6 +113,16 @@ DISK_ARGS+=(
 	-device "usb-storage,bus=usb.0,drive=vusb,id=usbstick"
 )
 
+# Test mode (TEST=1, the `cargo test` runner): enable RISC-V semihosting so the in-kernel
+# harness can terminate QEMU with a pass/fail exit code (arch::exit_qemu -> SYS_EXIT), and
+# route the serial console to stdout so the test report is captured. The kernel built with
+# `cargo test` branches to the harness after core bring-up (no shell).
+TEST_ARGS=()
+if [[ "${TEST:-0}" == "1" ]]; then
+	TEST_ARGS+=(-semihosting)
+	SERIAL="stdio"
+fi
+
 exec qemu-system-riscv64 \
 	-machine virt \
 	-cpu rv64 \
@@ -121,4 +134,5 @@ exec qemu-system-riscv64 \
 	-display none \
 	-no-reboot \
 	"${DISK_ARGS[@]}" \
+	"${TEST_ARGS[@]}" \
 	${QEMU_EXTRA:-}

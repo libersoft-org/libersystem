@@ -70,24 +70,73 @@ pub fn interrupts_enabled() -> bool {
 	sstatus & (1 << 1) != 0
 }
 
-// idle the hart until an interrupt (enable interrupts, then wait-for-interrupt)
+// Idle the hart until an interrupt is pending, then take it. WFI is executed with
+// SSTATUS.SIE = 0 so it WAKES on any enabled-and-pending interrupt (its wakeup depends
+// on sie & sip, not the global enable) but does NOT trap - control falls through to the
+// following `csrsi`, which re-enables interrupts so the pending handler runs. Clearing
+// SIE across the WFI closes the lost-wakeup race: an IPI or timer that arrives just
+// before the WFI (SSIP/STIP already set) makes WFI return immediately instead of
+// consuming the interrupt first and then sleeping (which `csrsi; wfi` would do, since
+// on riscv the enabled interrupt is taken between the two instructions - unlike x86's
+// `sti; hlt`, where the pending interrupt is deferred until after the HLT).
 pub fn idle_halt() {
 	unsafe {
-		core::arch::asm!("csrsi sstatus, 2", "wfi", options(nomem, nostack, preserves_flags));
+		core::arch::asm!("csrci sstatus, 2", "wfi", "csrsi sstatus, 2", options(nomem, nostack, preserves_flags));
 	}
 }
 
-// reboot / power off via the SBI SRST extension - stubbed to a halt.
+// reboot / power off via the SBI System Reset (SRST) extension (EID 0x53525354,
+// FID 0 = sbi_system_reset(reset_type, reset_reason)): reset_type 0 = shutdown,
+// 1 = cold reboot; reset_reason 0 = no reason. OpenSBI performs the platform action
+// (on QEMU virt: cold reboot re-enters the firmware, shutdown exits QEMU).
 pub fn reset() -> ! {
+	sbi_system_reset(1, 0);
 	halt_loop()
 }
 
 pub fn poweroff() -> ! {
+	sbi_system_reset(0, 0);
 	halt_loop()
 }
 
+fn sbi_system_reset(reset_type: u32, reset_reason: u32) {
+	unsafe {
+		core::arch::asm!(
+			"ecall",
+			in("a7") 0x5352_5354usize, // SRST extension id ("SRST")
+			in("a6") 0usize,           // FID 0 = system_reset
+			in("a0") reset_type as usize,
+			in("a1") reset_reason as usize,
+			lateout("a0") _,
+			lateout("a1") _,
+			options(nostack),
+		);
+	}
+}
+
 #[cfg(test)]
-pub fn exit_qemu(_success: bool) -> ! {
+pub fn exit_qemu(success: bool) -> ! {
+	// Terminate QEMU (run with `-semihosting`) via the RISC-V semihosting
+	// SYS_EXIT_EXTENDED call, passing a code the test runner maps to pass/fail:
+	// 0 = success, 1 = failure. The parameter block is {reason, exit_code};
+	// ADP_Stopped_ApplicationExit (0x20026) is the normal-exit reason. QEMU recognizes
+	// the fixed three-instruction magic sequence (slli x0 / ebreak / srai x0) around the
+	// `ebreak` as a semihosting trap and consumes it before any S-mode trap delivery;
+	// `.option norvc` keeps the instructions uncompressed so the pattern matches exactly.
+	let block: [u64; 2] = [0x20026, if success { 0 } else { 1 }];
+	unsafe {
+		core::arch::asm!(
+			".option push",
+			".option norvc",
+			"slli x0, x0, 0x1f",
+			"ebreak",
+			"srai x0, x0, 0x7",
+			".option pop",
+			in("a0") 0x20usize, // SYS_EXIT_EXTENDED
+			in("a1") block.as_ptr(),
+			options(nostack),
+		);
+	}
 	halt_loop()
 }
 

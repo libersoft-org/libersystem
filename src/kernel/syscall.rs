@@ -217,7 +217,13 @@ static USER_VMAP: crate::sync::SpinLock<VaPool> = crate::sync::SpinLock::new(VaP
 // How far the kernel mmap window extends (nothing else is laid out above it, but
 // an explicit bound turns a leak into a clean allocation failure, not a walk into
 // unrelated address space).
+// The kernel mmap window size. On riscv64 the Sv39 high half is only 256 GiB, so the
+// 16 TiB x86/aarch64 window does not fit; use 64 GiB (KERNEL_MMAP_BASE sits at +128 GiB
+// above the kernel base, so the window runs up to +192 GiB, within the high half).
+#[cfg(not(target_arch = "riscv64"))]
 const MMAP_WINDOW: u64 = 0x0000_1000_0000_0000;
+#[cfg(target_arch = "riscv64")]
+const MMAP_WINDOW: u64 = 0x0000_0010_0000_0000;
 
 fn alloc_kernel_vrange(len: u64) -> u64 {
 	KERNEL_VMAP.lock().alloc(len)

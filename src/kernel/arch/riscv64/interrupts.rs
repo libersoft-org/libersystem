@@ -119,19 +119,26 @@ pub fn eoi(vector: u8) {
 	super::plic::complete(super::plic::boot_hart(), vector as u32);
 }
 
-// The state of the INTx vector at `index`, for the `lsirq` inventory: the four PCIe
-// INTx PLIC sources (0x20..0x23), each shown with its bound device (if any).
+// The state of the vector at `index`, for the `lsirq` inventory. Index 0 is the
+// kernel's own timer - the S-mode timer interrupt (SCAUSE code 5, armed through the SBI
+// TIME extension), always in use and shown as a fixed vector like x86's LAPIC timer and
+// aarch64's EL1 physical-timer PPI. The four PCIe INTx PLIC sources (0x20..0x23) follow.
 pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
-	if index >= PCIE_INTX_LINES as usize {
+	const TIMER_VECTOR: u32 = 5; // supervisor timer interrupt (scause code 5)
+	if index == 0 {
+		return Some(abi::IrqInfo { vector: TIMER_VECTOR, kind: abi::IRQ_KIND_FIXED, bound: 1, device: abi::IRQ_NO_DEVICE });
+	}
+	let line = index - 1;
+	if line >= PCIE_INTX_LINES as usize {
 		return None;
 	}
-	let source = PCIE_INTX_BASE + index as u32;
+	let source = PCIE_INTX_BASE + line as u32;
 	Some(abi::IrqInfo { vector: source, kind: abi::IRQ_KIND_FIXED, bound: is_bound(source as u8) as u32, device: REGISTRY.owner(source as usize) })
 }
 
-// The number of vectors irq_info reports over (the four PCIe INTx sources).
+// The number of vectors irq_info reports over (the timer entry plus the four PCIe INTx sources).
 pub fn irq_info_len() -> usize {
-	PCIE_INTX_LINES as usize
+	1 + PCIE_INTX_LINES as usize
 }
 
 // No kernel-side INTx handler registration on riscv (device interrupts route to

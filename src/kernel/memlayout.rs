@@ -55,5 +55,11 @@ pub(crate) const USER_VA_END: u64 = 0x0000_0040_0000_0000;
 
 // Kernel virtual-address window for syscall-mapped MemoryObjects (the kernel-side
 // counterpart of USER_MMAP_BASE). Its pool hands out non-overlapping ranges and
-// reclaims released ones.
+// reclaims released ones. On riscv64 the kernel half is Sv39's 39-bit high canonical
+// range [0xFFFF_FFC0_0000_0000, ..]; the 48-bit x86/aarch64 base is non-canonical
+// there, so the window is placed at +128 GiB above the kernel base (clear of the 8 GiB
+// direct map and the 64 GiB heap line, and within the 256 GiB high half).
+#[cfg(not(target_arch = "riscv64"))]
 pub(crate) const KERNEL_MMAP_BASE: u64 = 0xffff_e800_0000_0000;
+#[cfg(target_arch = "riscv64")]
+pub(crate) const KERNEL_MMAP_BASE: u64 = 0xffff_ffe0_0000_0000;

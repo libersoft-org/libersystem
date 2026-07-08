@@ -98,6 +98,12 @@ test: sdk user
 test-aarch64: sdk user-aarch64
 	cd {{kernel_dir}} && TEST=1 cargo test --target aarch64-unknown-none
 
+# run the kernel test suite in QEMU on riscv64 over OpenSBI (RISC-V semihosting exit
+# maps pass/fail). SMP=4 exercises the multi-hart paths (SBI HSM hart_start bring-up,
+# the SBI IPI cross-hart wake).
+test-riscv64: sdk user-riscv64
+	cd {{kernel_dir}} && TEST=1 SMP=4 cargo test --target riscv64gc-unknown-none-elf
+
 # build the own UEFI loader for aarch64 (staged into the boot image as BOOTAA64.EFI)
 loader-aarch64:
 	cd {{loader_dir}} && cargo build --target aarch64-unknown-uefi

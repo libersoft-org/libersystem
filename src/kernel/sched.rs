@@ -532,7 +532,20 @@ pub fn cpu_idle_loop() -> ! {
 		reschedule(Disposition::Requeue);
 		// An idle core has nothing better to do than push the serial ring to the wire.
 		arch::serial::drain_tx();
-		arch::idle_halt();
+		// Lost-wakeup-safe idle: mask interrupts, re-check the run queue under the mask,
+		// and only wait if it is still empty. arch::idle_halt is entered with interrupts
+		// masked and re-enables them across the wait (x86 `sti; hlt`, aarch64 / riscv WFI
+		// wakes on a pending-but-masked interrupt), so a wake event - a cross-core IPI or
+		// the timer - that arrives after this check is held pending and delivered by the
+		// wait, rather than consumed (and lost) in the gap before it. Without the mask the
+		// IPI could run its handler between the check and the wait, and the wait would
+		// then sleep until the next tick despite the queued work.
+		arch::disable_interrupts();
+		if cpu_sched(current_cpu_id()).inner.lock().run_queue.is_empty() {
+			arch::idle_halt();
+		} else {
+			arch::enable_interrupts();
+		}
 	}
 }
 

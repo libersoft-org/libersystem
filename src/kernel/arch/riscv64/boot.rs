@@ -178,6 +178,9 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	crate::serial_println!("riscv64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
 	crate::mem::heap::init();
 	crate::mem::frame::upgrade_to_heap();
+	// Retain the boot memory map so the `lsmem` inventory tool can render it (heap-backed,
+	// so after heap::init).
+	crate::mem::retain_memmap(&regions);
 	{
 		let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
 		for i in 0..8 {
@@ -237,6 +240,31 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	crate::sched::allocate(cpu_count as usize);
 	crate::sched::init();
 
+	// Under `cargo test`, the core subsystems (heap, paging, per-CPU, SMP, scheduler)
+	// are up: arm the S-mode timer + enable interrupts (so the preemption tests can
+	// interleave ring-0/ring-3 threads), wire the syscall path, populate the device
+	// table + boot info, hand off to the kernel test harness, and exit QEMU
+	// (SBI/semihosting). The scheduler demos and the userspace boot chain below are the
+	// interactive (non-test) bring-up.
+	#[cfg(test)]
+	{
+		super::apic::init();
+		super::enable_interrupts();
+		super::syscall::init();
+		crate::device::init();
+		publish_embedded_boot_info();
+		crate::test_main();
+		super::exit_qemu(true);
+	}
+
+	#[cfg(not(test))]
+	riscv64_run_demos()
+}
+
+// The interactive scheduler demos and userspace boot chain that follow the core
+// bring-up. Skipped under `cargo test` (which runs the kernel test harness instead).
+#[cfg(not(test))]
+fn riscv64_run_demos() -> ! {
 	// Cooperative: three yielding kernel threads, drained to completion.
 	for id in 1..=3u64 {
 		crate::sched::spawn(sched_task, id);
@@ -283,6 +311,7 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 // modern MMIO layout through the shared PCI code. On QEMU virt the pci bus is empty
 // unless devices are added (e.g. `-device virtio-blk-pci`), so a device count of zero
 // just means none were attached.
+#[cfg(not(test))]
 fn run_pci_scan() {
 	let devices = super::pci::scan();
 	crate::serial_println!("riscv64: PCI - {} device(s) on the ECAM bus", devices.len());
@@ -323,6 +352,7 @@ extern "C" fn thread_b(arg: u64) {
 
 // A portable-scheduler kernel thread: print a few times, yielding the core between
 // steps, then return (which retires it through sched::exit).
+#[cfg(not(test))]
 extern "C" fn sched_task(id: u64) {
 	for i in 0..3 {
 		crate::serial_println!("riscv64: [sched] thread {id} step {i}");
@@ -333,6 +363,7 @@ extern "C" fn sched_task(id: u64) {
 // A preemption test thread: busy-wait ~15 ms per step (no yield) so the 10 ms timer
 // quantum forces a preemptive rotation; interleaved output proves the timer IRQ
 // drives the scheduler.
+#[cfg(not(test))]
 extern "C" fn preempt_task(id: u64) {
 	for i in 0..3 {
 		let target = super::tsc::now() + super::tsc::hz() * 15 / 1000;
@@ -434,6 +465,7 @@ fn spawn_user_process(msg: &[u8]) {
 
 // Run two concurrent user processes: they interleave via SYS_YIELD, each making real
 // SYS_DEBUG_WRITE syscalls, proving per-thread U-mode excursions coexist.
+#[cfg(not(test))]
 fn run_user_processes() {
 	spawn_user_process(b"userspace A: hello via SYS_DEBUG_WRITE\n");
 	spawn_user_process(b"userspace B: hello via SYS_DEBUG_WRITE\n");
@@ -449,6 +481,7 @@ fn run_user_processes() {
 // STDOUT message with no console handle, so echo falls back to the debug port, and the
 // argument line). echo does the rt ABI handshake, receives the line, and prints it via
 // SYS_DEBUG_WRITE. A no-op when the ELF was not embedded (userspace not built first).
+#[cfg(not(test))]
 fn run_echo_program() {
 	use super::paging;
 	use crate::object::address_space::AddressSpace;
@@ -524,6 +557,7 @@ fn publish_embedded_boot_info() {
 // boot chain as far as it runs, draining its reports, then hand off to the interactive
 // shell over the serial console. The same portable mechanism the x86/aarch64 kernels
 // use (pkg::Package + loader::spawn_elf_process + the PACKAGE/RAMDISK/MODE bootstrap).
+#[cfg(not(test))]
 fn run_system_manager() {
 	if INIT_PKG.is_empty() || VOLUME_PKG.is_empty() {
 		crate::serial_println!("riscv64: system - packages not embedded (build the riscv64 userspace first)");
