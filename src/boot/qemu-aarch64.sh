@@ -11,7 +11,10 @@ set -euo pipefail
 
 KERNEL="${1:?usage: qemu-aarch64.sh <kernel-elf>}"
 SERIAL="${SERIAL:-mon:stdio}"
-SMP="${SMP:-1}"
+# Match the guest's core count to the host's (like the x86 runner), capped at 8: the
+# GICv2 interrupt controller QEMU's `virt` machine uses addresses at most 8 CPU
+# interfaces, so more would fail to start. Override with SMP=<n>.
+SMP="${SMP:-$(nproc | awk '{print ($1 > 8) ? 8 : $1}')}"
 MEM="${MEM:-512M}"
 DTB_ADDR="${DTB_ADDR:-0x4A000000}"
 

@@ -83,6 +83,8 @@ just run-aarch64-uefi  # the ARM64 build booted through the system's own UEFI lo
 
 All three reach the same interactive shell. `run-aarch64` boots the kernel the fast way (QEMU loads it directly); `run-aarch64-uefi` exercises the full firmware path - the AAVMF UEFI firmware runs the system's own `BOOTAA64.EFI` loader, which reads the kernel off a FAT boot volume and hands off exactly as it would on real hardware. The ARM64 build is emulated on an x86_64 host (no KVM), so it boots more slowly than the native run. The ARM64 runs are **headless serial only** - the graphical `vnc` / `spice` displays below are x86_64 (its boot log is drawn onto a framebuffer); the ARM64 target is a headless server profile, so its console lives entirely on the serial line.
 
+Like the native run, the ARM64 runs give the guest as many cores as the host has, but capped at **8** - the GICv2 interrupt controller QEMU's `virt` machine emulates addresses at most 8 CPU interfaces. Override the count on any run/test with `SMP=<n>` (e.g. `SMP=4 just run-aarch64`, `SMP=1 just test-aarch64`).
+
 ### Networking
 
 Interactive runs attach a `virtio-net` NIC on QEMU's user-mode (SLIRP) network: the guest configures itself over DHCP (address `10.0.2.15`, gateway `10.0.2.2`), so `ping`, `nslookup`, `tcp` and the other net tools reach the outside world through the host with no setup. The host itself is reachable from the guest as `10.0.2.2`. In the other direction, the host's `127.0.0.1:5555` is forwarded to the guest's port 80, so a server started in the guest (`httpd &`) is reachable from the host:
@@ -187,8 +189,8 @@ A successful run prints each test with `[ok]` and exits zero.
 The same suite runs on the ARM64 build (emulated on an x86_64 host), where the result is reported through Arm semihosting instead of `isa-debug-exit`:
 
 ```sh
-just test-aarch64          # 1 CPU
-SMP=4 just test-aarch64    # 4 cores (exercises secondary bring-up + the cross-core wake IPI)
+just test-aarch64          # all host cores (capped at 8 - see below)
+SMP=1 just test-aarch64    # a single core
 ```
 
 ## Debugging
@@ -233,7 +235,7 @@ Run `just --list` to see every available command. The most useful ones:
 | `just iso [strip]` | Build a hybrid BIOS+UEFI ISO into `boot/.build/` (`strip` = `debug` or `all`). |
 | `just img [size] [strip]` | Build a raw GPT disk image (default `64M`) into `boot/.build/`. |
 | `just test` | Run the in-kernel test harness in QEMU. |
-| `just test-aarch64` | Run the in-kernel test harness for the ARM64 build under QEMU (Arm semihosting maps pass/fail; `SMP=4` exercises the multi-core paths). |
+| `just test-aarch64` | Run the in-kernel test harness for the ARM64 build under QEMU (Arm semihosting maps pass/fail; defaults to all host cores capped at 8 - the GICv2 limit - override with `SMP=<n>`). |
 | `just lab <cmd>` | Drive a live instance for debugging (boot, run guest shell commands, logs, packet capture - see [docs/DEBUG.md](./docs/DEBUG.md)). |
 | `just debug` | Boot in QEMU and wait for GDB on `:1234`. |
 | `just gdb` | Attach GDB to a waiting QEMU instance. |
