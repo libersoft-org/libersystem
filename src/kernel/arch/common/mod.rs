@@ -20,10 +20,13 @@
 // are arch-specific.
 // `time`: the shared scheduler-tick rate (TICK_HZ) + the cycles->ns conversion each
 // backend's cycle clock reports through.
+// `rng`: the SplitMix64 mixer the arch random fallbacks share (no arch guarantees a
+// hardware RNG on the bring-up core).
 
 pub mod context;
 pub mod dtb;
 pub mod msi;
 pub mod paging;
 pub mod pci;
+pub mod rng;
 pub mod time;

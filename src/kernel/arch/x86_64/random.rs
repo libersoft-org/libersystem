@@ -42,12 +42,9 @@ fn fallback_u64() -> u64 {
 	if seed == 0 {
 		seed = super::tsc::now() | 1;
 	}
-	seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+	let out = crate::arch::common::rng::splitmix64(&mut seed);
 	FALLBACK_STATE.store(seed, Ordering::Relaxed);
-	let mut z = seed;
-	z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-	z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-	z ^ (z >> 31)
+	out
 }
 
 // Draw the next 64-bit random value (RDRAND if available, else the fallback).

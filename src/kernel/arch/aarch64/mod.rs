@@ -232,11 +232,7 @@ pub mod random {
 	pub fn fill(buf: &mut [u8]) {
 		let mut s = STATE.load(Ordering::Relaxed) ^ super::tsc::now() ^ 0x9E37_79B9_7F4A_7C15;
 		for chunk in buf.chunks_mut(8) {
-			s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-			let mut z = s;
-			z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-			z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-			z ^= z >> 31;
+			let z = crate::arch::common::rng::splitmix64(&mut s);
 			let bytes = z.to_le_bytes();
 			chunk.copy_from_slice(&bytes[..chunk.len()]);
 		}
