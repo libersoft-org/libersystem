@@ -15,6 +15,14 @@ SMP="${SMP:-1}"
 MEM="${MEM:-512M}"
 DTB_ADDR="${DTB_ADDR:-0x4A000000}"
 
+# UEFI=1 boots through the own aarch64 UEFI loader under the AAVMF firmware (a PE
+# EFI app on a FAT ESP) instead of QEMU's direct `-kernel` load. The loader reads the
+# kernel off the ESP, places it at its physical link addresses, and enters the same
+# boot stub `-kernel` does - so the rest of the boot is identical.
+UEFI="${UEFI:-0}"
+AAVMF_CODE="${AAVMF_CODE:-/usr/share/AAVMF/AAVMF_CODE.fd}"
+AAVMF_VARS="${AAVMF_VARS:-/usr/share/AAVMF/AAVMF_VARS.fd}"
+
 MACHINE="virt,gic-version=2"
 DTB_FILE="$(mktemp /tmp/qemu-virt-XXXXXX.dtb)"
 trap 'rm -f "$DTB_FILE"' EXIT
@@ -118,12 +126,6 @@ DISK_ARGS+=(
 
 # Dump the machine's device tree (same machine config as the boot below), then
 # boot with it loaded at DTB_ADDR.
-qemu-system-aarch64 \
-	-machine "$MACHINE,dumpdtb=$DTB_FILE" \
-	-cpu cortex-a72 \
-	-smp "$SMP" \
-	-m "$MEM" \
-	-display none >/dev/null 2>&1
 
 # Test mode (TEST=1, the `cargo test` runner): enable Arm semihosting so the in-kernel
 # harness can terminate QEMU with a pass/fail exit code (arch::exit_qemu -> SYS_EXIT),
@@ -134,6 +136,61 @@ if [[ "${TEST:-0}" == "1" ]]; then
 	TEST_ARGS+=(-semihosting)
 	SERIAL="stdio"
 fi
+
+if [[ "$UEFI" == "1" ]]; then
+	# Boot through the own UEFI loader under AAVMF. Build a FAT EFI System Partition
+	# holding the loader as /EFI/BOOT/BOOTAA64.EFI (the aarch64 UEFI default boot path)
+	# and the kernel at /kernel (the loader reads it off the volume it booted from),
+	# then attach it as a virtio-blk disk alongside the writable firmware variables. The
+	# firmware hands the kernel the DTB, so no dumpdtb / -kernel is used here.
+	LOADER_EFI="${LOADER_EFI:-$HERE/../loader/target/aarch64-unknown-uefi/debug/libersystem-loader.efi}"
+	[[ -f "$LOADER_EFI" ]] || {
+		echo "qemu-aarch64: loader EFI not found: $LOADER_EFI (run 'just loader-aarch64')" >&2
+		exit 1
+	}
+	[[ -f "$AAVMF_CODE" && -f "$AAVMF_VARS" ]] || {
+		echo "qemu-aarch64: AAVMF firmware not found ($AAVMF_CODE / $AAVMF_VARS)" >&2
+		exit 1
+	}
+	ESP="$HERE/.build/esp-aarch64.img"
+	VARS="$HERE/.build/aavmf-vars.fd"
+	STAGED_KERNEL="$HERE/.build/kernel-aarch64.stripped"
+	llvm-strip --strip-debug -o "$STAGED_KERNEL" "$KERNEL" 2>/dev/null || cp "$KERNEL" "$STAGED_KERNEL"
+	ESP_MB=$((($(stat -c%s "$STAGED_KERNEL") + $(stat -c%s "$LOADER_EFI")) / 1048576 + 16))
+	rm -f "$ESP"
+	truncate -s "${ESP_MB}M" "$ESP"
+	mformat -i "$ESP" ::
+	mmd -i "$ESP" ::/EFI ::/EFI/BOOT
+	mcopy -i "$ESP" "$LOADER_EFI" ::/EFI/BOOT/BOOTAA64.EFI
+	mcopy -i "$ESP" "$STAGED_KERNEL" ::/kernel
+	cp "$AAVMF_VARS" "$VARS"
+	# The ESP goes LAST so the system volume (added first) enumerates ahead of it and
+	# StorageService binds the volume, not this FAT boot filesystem.
+	DISK_ARGS+=(-drive "if=none,id=esp,format=raw,file=$ESP" -device "virtio-blk-pci,drive=esp,disable-legacy=on")
+	qemu-system-aarch64 \
+		-machine "$MACHINE" \
+		-cpu cortex-a72 \
+		-smp "$SMP" \
+		-m "$MEM" \
+		-drive "if=pflash,format=raw,file=$AAVMF_CODE,readonly=on" \
+		-drive "if=pflash,format=raw,file=$VARS" \
+		-serial "$SERIAL" \
+		-display none \
+		-no-reboot \
+		"${TEST_ARGS[@]}" \
+		"${DISK_ARGS[@]}" \
+		${QEMU_EXTRA:-}
+	exit $?
+fi
+
+# Direct `-kernel` boot: dump the machine's device tree (same machine config as the
+# boot below) and load it at DTB_ADDR for the kernel to scan.
+qemu-system-aarch64 \
+	-machine "$MACHINE,dumpdtb=$DTB_FILE" \
+	-cpu cortex-a72 \
+	-smp "$SMP" \
+	-m "$MEM" \
+	-display none >/dev/null 2>&1
 
 qemu-system-aarch64 \
 	-machine "$MACHINE" \

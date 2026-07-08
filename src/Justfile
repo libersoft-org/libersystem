@@ -85,6 +85,16 @@ test: sdk user
 test-aarch64: sdk user-aarch64
 	cd {{kernel_dir}} && TEST=1 cargo test --target aarch64-unknown-none
 
+# build the own UEFI loader for aarch64 (staged into the boot image as BOOTAA64.EFI)
+loader-aarch64:
+	cd {{loader_dir}} && cargo build --target aarch64-unknown-uefi
+
+# build + boot the full aarch64 system through the own UEFI loader under the AAVMF
+# firmware (instead of QEMU's direct -kernel load), reaching the interactive shell.
+run-aarch64-uefi: sdk user-aarch64 loader-aarch64
+	cd {{kernel_dir}} && cargo build --target aarch64-unknown-none
+	UEFI=1 SERIAL=stdio bash boot/qemu-aarch64.sh {{kernel_dir}}/target/aarch64-unknown-none/debug/kernel
+
 # screenshot the framebuffer to a file (format by extension: png/jpg/webp/...);
 # snaps a live `just run` if one is up, else boots a throwaway. e.g. just screenshot shot.png
 screenshot path: build

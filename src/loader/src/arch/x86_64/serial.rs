@@ -32,7 +32,7 @@ pub fn init() {
 }
 
 // Transmit one byte, waiting for the holding register to drain.
-fn write_byte(byte: u8) {
+pub fn write_byte(byte: u8) {
 	unsafe {
 		while inb(COM1 + 5) & 0x20 == 0 {}
 		outb(COM1, byte);

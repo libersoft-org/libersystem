@@ -13,6 +13,15 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
+
+// The machine the loaded kernel must target: this loader runs on the same
+// architecture as the kernel it boots, so the expected e_machine is the build
+// architecture's.
+#[cfg(target_arch = "x86_64")]
+const EXPECTED_MACHINE: u16 = EM_X86_64;
+#[cfg(target_arch = "aarch64")]
+const EXPECTED_MACHINE: u16 = EM_AARCH64;
 
 // Program-header type: a loadable segment.
 pub const PT_LOAD: u32 = 1;
@@ -65,8 +74,8 @@ pub struct Elf<'a> {
 
 impl<'a> Elf<'a> {
 	// Validate the header and capture the entry point + program-header table
-	// location. Returns None if the bytes are not a little-endian 64-bit x86-64
-	// ET_EXEC image or are truncated.
+	// location. Returns None if the bytes are not a little-endian 64-bit ET_EXEC
+	// image for this build's architecture, or are truncated.
 	pub fn parse(bytes: &'a [u8]) -> Option<Self> {
 		if bytes.len() < core::mem::size_of::<Elf64Header>() {
 			return None;
@@ -80,7 +89,7 @@ impl<'a> Elf<'a> {
 		if header.e_ident[4] != ELFCLASS64 || header.e_ident[5] != ELFDATA2LSB {
 			return None;
 		}
-		if header.e_type != ET_EXEC || header.e_machine != EM_X86_64 {
+		if header.e_type != ET_EXEC || header.e_machine != EXPECTED_MACHINE {
 			return None;
 		}
 		Some(Self { bytes, entry: header.e_entry, phoff: header.e_phoff, phentsize: header.e_phentsize, phnum: header.e_phnum })

@@ -227,11 +227,17 @@ pub fn bar_address(d: &PciDevice, i: usize) -> Option<u64> {
 	if (bar >> 1) & 3 == 2 { Some((bar_raw(d, i + 1) as u64) << 32 | lo) } else { Some(lo) }
 }
 
-// Assign this device's unprogrammed memory BARs out of the MMIO window, then
-// enable memory-space decoding and bus-master in the command register (there is
-// no firmware to do this on QEMU virt with `-kernel`). Idempotent: an already
-// assigned BAR (nonzero base) is left as is.
+// Assign this device's memory BARs out of the low 32-bit MMIO window, then enable
+// memory-space decoding and bus-master in the command register. A BAR is (re)assigned
+// if it is unprogrammed (QEMU virt with `-kernel`, no firmware) OR the firmware placed
+// it outside the low window the kernel's boot stub maps (a UEFI boot assigns the 64-bit
+// window at 512 GB, which the direct map does not cover) - so devices land in the
+// mapped low window regardless of how the kernel was booted. Memory decode is turned
+// off while the BARs are reprogrammed.
 fn assign_bars(d: &PciDevice) {
+	// Disable memory-space decoding while the BARs move (the firmware may have enabled it).
+	let cmd0 = cfg_read16(d.bus, d.dev, d.func, 0x04);
+	cfg_write16(d.bus, d.dev, d.func, 0x04, cmd0 & !0x2);
 	let mut i = 0usize;
 	while i < 6 {
 		let off = 0x10 + i * 4;
@@ -260,7 +266,7 @@ fn assign_bars(d: &PciDevice) {
 			i += step;
 			continue;
 		}
-		if cur == 0 {
+		if cur == 0 || cur >= MMIO_WINDOW_END {
 			if let Some(base) = alloc_mmio(size) {
 				cfg_write32(d.bus, d.dev, d.func, off, (base as u32 & 0xFFFF_FFF0) | (bar & 0xF));
 				if is64 {
