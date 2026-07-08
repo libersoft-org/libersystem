@@ -81,7 +81,7 @@ just run-aarch64       # the ARM64 build via QEMU's direct -kernel load (the qui
 just run-aarch64-uefi  # the ARM64 build booted through the system's own UEFI loader (AAVMF)
 ```
 
-All three reach the same interactive shell. `run-aarch64` boots the kernel the fast way (QEMU loads it directly); `run-aarch64-uefi` exercises the full firmware path - the AAVMF UEFI firmware runs the system's own `BOOTAA64.EFI` loader, which reads the kernel off a FAT boot volume and hands off exactly as it would on real hardware. The ARM64 build is emulated on an x86_64 host (no KVM), so it boots more slowly than the native run. The ARM64 runs are **headless serial only** - the graphical `vnc` / `spice` displays below are x86_64 (its boot log is drawn onto a framebuffer); the ARM64 target is a headless server profile, so its console lives entirely on the serial line.
+All three reach the same interactive shell. `run-aarch64` boots the kernel the fast way (QEMU loads it directly); `run-aarch64-uefi` exercises the full firmware path - the AAVMF UEFI firmware runs the system's own `BOOTAA64.EFI` loader, which reads the kernel off a FAT boot volume and hands off exactly as it would on real hardware. The ARM64 build is emulated on an x86_64 host (no KVM), so it boots more slowly than the native run. The ARM64 runs attach the **same device set as x86_64** - `virtio-gpu` (the graphical display), `virtio-keyboard` / `virtio-tablet` input, `virtio-sound`, `virtio-net`, `virtio-serial` and the xHCI USB stack - so the `vnc` / `spice` displays below work identically. The one difference is the boot log: QEMU's `virt` machine has no VGA framebuffer, so the kernel does not draw the boot log pixel-by-pixel as on x86_64; instead the log is replayed as text onto the virtio-gpu display once ConsoleService takes over, so it still appears on screen.
 
 Like the native run, the ARM64 runs give the guest as many cores as the host has, but capped at **8** - the GICv2 interrupt controller QEMU's `virt` machine emulates addresses at most 8 CPU interfaces. Override the count on any run/test with `SMP=<n>` (e.g. `SMP=4 just run-aarch64`, `SMP=1 just test-aarch64`).
 
@@ -95,7 +95,7 @@ curl http://127.0.0.1:5555/
 
 ### Graphical display (VNC / SPICE)
 
-The graphical displays apply to the **x86_64** build (`just run` on an x86_64 host, or `just run-x86_64` anywhere); the ARM64 target is headless serial only. The x86_64 run is headless by default - the framebuffer is still rendered internally (the boot log is drawn onto it), but no window is shown. To watch it live, attach a display server as an argument; the two combine freely with each other (and with any other `just run` arguments):
+The graphical displays apply to **both** builds - the x86_64 run (`just run` on an x86_64 host, or `just run-x86_64` anywhere) and the ARM64 runs (`just run-aarch64` / `just run-aarch64-uefi`). Every run is headless by default - the framebuffer is still rendered internally, but no window is shown. To watch it live, attach a display server as an argument; the two combine freely with each other (and with any other `just run` arguments):
 
 ```sh
 just run vnc        # VNC server on port 5900

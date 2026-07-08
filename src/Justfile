@@ -72,7 +72,7 @@ run *displays:
 	set -euo pipefail
 	case "$(uname -m)" in
 	x86_64) just run-x86_64 {{displays}} ;;
-	aarch64 | arm64) just run-aarch64 ;;
+	aarch64 | arm64) just run-aarch64 {{displays}} ;;
 	*) echo "just run: unsupported host architecture '$(uname -m)' - use run-x86_64 / run-aarch64" >&2 && exit 1 ;;
 	esac
 
@@ -105,16 +105,17 @@ loader-aarch64:
 # build + boot the ARM64 build in QEMU (native on an aarch64 host, emulated on an x86
 # host), reaching the interactive shell over the serial console. Uses QEMU's direct
 # -kernel load - the quick path; `run-aarch64-uefi` boots the same system through the
-# own UEFI loader.
-run-aarch64: sdk user-aarch64
+# own UEFI loader. Add live displays as arguments (combinable): `just run-aarch64 vnc spice`.
+run-aarch64 *displays: sdk user-aarch64
 	cd {{kernel_dir}} && cargo build --target aarch64-unknown-none
-	SERIAL=stdio bash boot/qemu-aarch64.sh {{kernel_dir}}/target/aarch64-unknown-none/debug/kernel
+	DISPLAYS="{{displays}}" SERIAL=stdio bash boot/qemu-aarch64.sh {{kernel_dir}}/target/aarch64-unknown-none/debug/kernel
 
 # build + boot the full aarch64 system through the own UEFI loader under the AAVMF
 # firmware (instead of QEMU's direct -kernel load), reaching the interactive shell.
-run-aarch64-uefi: sdk user-aarch64 loader-aarch64
+# Add live displays as arguments (combinable): `just run-aarch64-uefi vnc spice`.
+run-aarch64-uefi *displays: sdk user-aarch64 loader-aarch64
 	cd {{kernel_dir}} && cargo build --target aarch64-unknown-none
-	UEFI=1 SERIAL=stdio bash boot/qemu-aarch64.sh {{kernel_dir}}/target/aarch64-unknown-none/debug/kernel
+	UEFI=1 DISPLAYS="{{displays}}" SERIAL=stdio bash boot/qemu-aarch64.sh {{kernel_dir}}/target/aarch64-unknown-none/debug/kernel
 
 # screenshot the framebuffer to a file (format by extension: png/jpg/webp/...);
 # snaps a live `just run` if one is up, else boots a throwaway. e.g. just screenshot shot.png

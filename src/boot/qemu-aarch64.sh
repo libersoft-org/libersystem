@@ -26,6 +26,29 @@ UEFI="${UEFI:-0}"
 AAVMF_CODE="${AAVMF_CODE:-/usr/share/AAVMF/AAVMF_CODE.fd}"
 AAVMF_VARS="${AAVMF_VARS:-/usr/share/AAVMF/AAVMF_VARS.fd}"
 
+# Graphical display backends (the same knobs the x86 runner exposes): DISPLAYS is a
+# space-separated list of `vnc` and/or `spice` (empty = headless, serial only). VNC
+# serves the virtio-gpu framebuffer on VNC_ADDR (default :0 = port 5900); SPICE serves
+# it plus the audio stream on SPICE_PORT (default 5930). The interactive device set below
+# (virtio-gpu/input/sound/serial) is attached whenever this is not a TEST run.
+want_vnc=0
+want_spice=0
+for _d in ${DISPLAYS:-}; do
+	case "$_d" in
+	vnc) want_vnc=1 ;;
+	spice) want_spice=1 ;;
+	none | "") ;;
+	*) echo "qemu-aarch64: unknown display '$_d' (expected vnc and/or spice)" >&2 && exit 1 ;;
+	esac
+done
+DISPLAY_ARGS=()
+if [[ "$want_vnc" == "1" ]]; then
+	DISPLAY_ARGS+=(-vnc "${VNC_ADDR:-0.0.0.0:0}")
+else
+	DISPLAY_ARGS+=(-display none)
+fi
+[[ "$want_spice" == "1" ]] && DISPLAY_ARGS+=(-spice "port=${SPICE_PORT:-5930},addr=0.0.0.0,disable-ticketing=on")
+
 MACHINE="virt,gic-version=2"
 DTB_FILE="$(mktemp /tmp/qemu-virt-XXXXXX.dtb)"
 trap 'rm -f "$DTB_FILE"' EXIT
@@ -127,6 +150,38 @@ DISK_ARGS+=(
 	-device "usb-storage,bus=usb.0,drive=vusb,id=usbstick"
 )
 
+# Interactive-only devices, the same graphical/input/audio set the x86 runner attaches,
+# left out of the deterministic TEST device set (which boots only blk/net/usb) so the
+# test topology stays fixed:
+#   - virtio-gpu: the userspace driver.virtio-gpu drives it as the display. ConsoleService
+#     renders the terminal onto the driver's shared backing and FLUSHes to the host
+#     scanout, so the shell is visible over VNC/SPICE. Unlike x86 (virtio-vga) QEMU's
+#     `virt` machine has no VGA framebuffer, so the kernel draws no boot-log framebuffer;
+#     the boot log is instead replayed into the terminal from the kernel log, so it still
+#     appears on the graphical display.
+#   - virtio-keyboard + virtio-tablet: virtio_input keyboard + pointer, so InputService
+#     gets keystrokes and absolute pointer events on the graphical display.
+#   - virtio-sound: the audio device the `beep` command drives; its audiodev is the SPICE
+#     playback stream when SPICE is up, else a null sink.
+#   - virtio-serial + virtconsole: mirrors a second console to a file, matching x86.
+if [[ "${TEST:-0}" != "1" ]]; then
+	VCON_OUT="$HERE/.build/virtio-console-aarch64.out"
+	DISK_ARGS+=(
+		-device "virtio-gpu-pci,disable-legacy=on"
+		-device "virtio-keyboard-pci,disable-legacy=on"
+		-device "virtio-tablet-pci,disable-legacy=on"
+		-device "virtio-serial-pci,disable-legacy=on"
+		-device "virtconsole,chardev=vcon"
+		-chardev "file,id=vcon,path=$VCON_OUT"
+	)
+	if [[ "$want_spice" == "1" ]]; then
+		DISK_ARGS+=(-audiodev "spice,id=snd0")
+	else
+		DISK_ARGS+=(-audiodev "none,id=snd0")
+	fi
+	DISK_ARGS+=(-device "virtio-sound-pci,audiodev=snd0")
+fi
+
 # Dump the machine's device tree (same machine config as the boot below), then
 # boot with it loaded at DTB_ADDR.
 
@@ -178,7 +233,7 @@ if [[ "$UEFI" == "1" ]]; then
 		-drive "if=pflash,format=raw,file=$AAVMF_CODE,readonly=on" \
 		-drive "if=pflash,format=raw,file=$VARS" \
 		-serial "$SERIAL" \
-		-display none \
+		"${DISPLAY_ARGS[@]}" \
 		-no-reboot \
 		"${TEST_ARGS[@]}" \
 		"${DISK_ARGS[@]}" \
@@ -203,7 +258,7 @@ qemu-system-aarch64 \
 	-kernel "$KERNEL" \
 	-device loader,file="$DTB_FILE",addr="$DTB_ADDR" \
 	-serial "$SERIAL" \
-	-display none \
+	"${DISPLAY_ARGS[@]}" \
 	-no-reboot \
 	"${TEST_ARGS[@]}" \
 	"${DISK_ARGS[@]}" \
