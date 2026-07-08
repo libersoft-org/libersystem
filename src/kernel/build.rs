@@ -51,13 +51,13 @@ fn embed_aarch64_demo() {
 	// Expose the assembled volume package at a stable path so the aarch64 QEMU
 	// runner can lay it (the factory archive) onto a virtio-blk disk at LBA 0, which
 	// StorageService reads to format and seed the vol://system volume.
-	if arch == "aarch64" {
+	if arch == "aarch64" || arch == "riscv64" {
 		let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
 		let build_dir: PathBuf = PathBuf::from(&manifest_dir).join("../boot/.build");
 		let _ = fs::create_dir_all(&build_dir);
 		let vol_src: PathBuf = out_dir.join("volume.pkg");
 		if vol_src.exists() {
-			let _ = fs::copy(&vol_src, build_dir.join("volume-aarch64.pkg"));
+			let _ = fs::copy(&vol_src, build_dir.join(format!("volume-{arch}.pkg")));
 		}
 	}
 }
