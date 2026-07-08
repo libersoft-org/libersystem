@@ -26,6 +26,12 @@ static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_WINDOW_BASE);
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const VIRTIO_MODERN_BASE: u16 = 0x1040;
 
+// The xHCI USB host controller PCI class triple (serial-bus / USB / xHCI programming
+// interface), by which the controller is recognised regardless of vendor.
+const CLASS_SERIAL_BUS: u8 = 0x0c;
+const SUBCLASS_USB: u8 = 0x03;
+const PROG_IF_XHCI: u8 = 0x30;
+
 // PCI status register bit 4: a capability list is present (pointer at 0x34).
 const STATUS_CAP_LIST: u16 = 1 << 4;
 // Vendor-specific capability id; virtio describes its MMIO structures with these.
@@ -101,6 +107,11 @@ impl PciDevice {
 			0x1005 => Some(abi::VIRTIO_TYPE_RNG as u16),
 			_ => None,
 		}
+	}
+
+	// Whether this function is an xHCI USB host controller (by its PCI class triple).
+	pub fn is_xhci(&self) -> bool {
+		self.class == CLASS_SERIAL_BUS && self.subclass == SUBCLASS_USB && self.prog_if == PROG_IF_XHCI
 	}
 }
 
@@ -347,8 +358,44 @@ pub fn scan_virtio() -> Vec<VirtioDevice> {
 	scan().iter().filter_map(resolve_virtio).collect()
 }
 
+// Probe a memory BAR's window size: write all-ones, read back the address mask,
+// restore. The low half suffices (no device here has a window over 4 GB). Returns
+// None for an I/O BAR or an out-of-range index. Used for xHCI, whose window size is
+// not described anywhere else (virtio derives its window from the capability list).
+fn bar_size(d: &PciDevice, bar_idx: usize) -> Option<u64> {
+	if bar_idx >= 6 {
+		return None;
+	}
+	let off = 0x10 + bar_idx * 4;
+	let bar = cfg_read32(d.bus, d.dev, d.func, off);
+	if bar & 1 != 0 {
+		return None; // an I/O-space BAR, not memory
+	}
+	cfg_write32(d.bus, d.dev, d.func, off, 0xFFFF_FFFF);
+	let mask = cfg_read32(d.bus, d.dev, d.func, off);
+	cfg_write32(d.bus, d.dev, d.func, off, bar);
+	let size = (!(mask & 0xFFFF_FFF0) as u64).wrapping_add(1);
+	if size == 0 { None } else { Some(size) }
+}
+
+// Resolve an xHCI controller's MMIO window: BAR 0 holds the whole register file, so
+// its assigned base + probed size is the window a driver maps. The BARs are assigned
+// here first (no firmware does it on QEMU virt with `-kernel`, as for virtio). Returns
+// None if the function is not an xHCI controller or BAR 0 is not a memory BAR.
+fn resolve_xhci(d: &PciDevice) -> Option<XhciDevice> {
+	if !d.is_xhci() {
+		return None;
+	}
+	assign_bars(d);
+	let bar_phys = bar_address(d, 0)?;
+	let bar_len = bar_size(d, 0)?;
+	let (msix_cap, msix_count, msix_table_phys) = resolve_msix(d);
+	Some(XhciDevice { pci: *d, bar_phys, bar_len, msix_cap, msix_count, msix_table_phys })
+}
+
+// Scan the bus and resolve every xHCI USB host controller's MMIO window.
 pub fn scan_xhci() -> Vec<XhciDevice> {
-	Vec::new()
+	scan().iter().filter_map(resolve_xhci).collect()
 }
 
 // Set or clear a function's PCI command-register Interrupt Disable bit (bit 10), which

@@ -92,6 +92,30 @@ fi
 # shell transitively on both.
 DISK_ARGS+=(-netdev "user,id=vnet0" -device "virtio-net-pci,netdev=vnet0,disable-legacy=on")
 
+# xHCI USB host controller + devices (the same set the x86 runner attaches): the kernel
+# discovers the controller by class (0x0c/0x03/0x30 -> scan_xhci), the userspace xhci
+# driver maps it and runs the USB stack over its own MSI-X vector. A hub on port 1
+# carries a USB keyboard + tablet (HID enumeration), and a USB mass-storage stick backs
+# vol://usb - seeded as FAT with the volume/ files when mtools is present, so vol://usb
+# mounts with content like x86.
+USB_DISK="$HERE/.build/usb-media-aarch64.img"
+if [[ ! -f "$USB_DISK" ]]; then
+	truncate -s 16M "$USB_DISK"
+	if command -v mformat >/dev/null && command -v mcopy >/dev/null; then
+		mformat -i "$USB_DISK" -F ::
+		mcopy -i "$USB_DISK" "$VOLDIR/hello.txt" ::hello.txt 2>/dev/null || true
+		mcopy -i "$USB_DISK" "$VOLDIR/motd.txt" ::motd.txt 2>/dev/null || true
+	fi
+fi
+DISK_ARGS+=(
+	-device "qemu-xhci,id=usb"
+	-device "usb-hub,bus=usb.0,port=1"
+	-device "usb-kbd,bus=usb.0,port=1.1"
+	-device "usb-tablet,bus=usb.0,port=1.2"
+	-drive "if=none,id=vusb,format=raw,file=$USB_DISK"
+	-device "usb-storage,bus=usb.0,drive=vusb,id=usbstick"
+)
+
 # Dump the machine's device tree (same machine config as the boot below), then
 # boot with it loaded at DTB_ADDR.
 qemu-system-aarch64 \
