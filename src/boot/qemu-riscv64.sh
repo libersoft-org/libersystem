@@ -36,6 +36,80 @@ if [[ -f "$VOLUME_PKG" ]]; then
 	DISK_ARGS=(-drive "if=none,id=vol0,format=raw,file=$VIRTIO_DISK" -device "virtio-blk-pci,drive=vol0")
 fi
 
+# Media volumes for the extra StorageService instances (vol://media|iso|udf|usb) - the
+# same set the aarch64/x86 runners build, so the boot chain (the shell hard-depends on
+# media/iso/udf/usb storage) reaches the shell on riscv64 too. Each is a real filesystem
+# image seeded from the shared volume/ dir, built once and reused; the virtio-blk drivers
+# poll, so these need no interrupt path. Skipped if its mkfs toolchain is missing.
+VOLDIR="$HERE/../volume"
+# exFAT media disk (vol://media), read-write.
+FAT_DISK="$HERE/.build/fat-media-riscv64.img"
+if [[ ! -f "$FAT_DISK" ]] && command -v mkfs.exfat >/dev/null; then
+	truncate -s 16M "$FAT_DISK"
+	if mkfs.exfat "$FAT_DISK" >/dev/null 2>&1; then
+		FMNT="$HERE/.build/media-mnt-rv64"
+		mkdir -p "$FMNT"
+		if mount -o loop "$FAT_DISK" "$FMNT" 2>/dev/null; then
+			cp "$VOLDIR/hello.txt" "$VOLDIR/motd.txt" "$FMNT"/ 2>/dev/null || true
+			umount "$FMNT" 2>/dev/null || true
+		fi
+		rmdir "$FMNT" 2>/dev/null || true
+	else
+		rm -f "$FAT_DISK"
+	fi
+fi
+[[ -f "$FAT_DISK" ]] && DISK_ARGS+=(-drive "if=none,id=med0,format=raw,file=$FAT_DISK" -device "virtio-blk-pci,drive=med0")
+# ISO9660 disk (vol://iso), read-only.
+ISO_DISK="$HERE/.build/iso-media-riscv64.iso"
+if [[ ! -f "$ISO_DISK" ]] && command -v xorriso >/dev/null; then
+	xorriso -as mkisofs -quiet -J -R -o "$ISO_DISK" "$VOLDIR" 2>/dev/null || true
+fi
+[[ -f "$ISO_DISK" ]] && DISK_ARGS+=(-drive "if=none,id=iso0,format=raw,file=$ISO_DISK" -device "virtio-blk-pci,drive=iso0")
+# UDF disk (vol://udf), read-only.
+UDF_DISK="$HERE/.build/udf-media-riscv64.udf"
+if [[ ! -f "$UDF_DISK" ]] && command -v mkfs.udf >/dev/null; then
+	dd if=/dev/zero of="$UDF_DISK" bs=1M count=8 status=none 2>/dev/null || true
+	if mkfs.udf --media-type=hd --blocksize=2048 "$UDF_DISK" >/dev/null 2>&1; then
+		UMNT="$HERE/.build/udf-mnt-rv64"
+		mkdir -p "$UMNT"
+		if mount -o loop "$UDF_DISK" "$UMNT" 2>/dev/null; then
+			cp "$VOLDIR"/* "$UMNT"/ 2>/dev/null || true
+			umount "$UMNT" 2>/dev/null || true
+		fi
+		rmdir "$UMNT" 2>/dev/null || true
+	else
+		rm -f "$UDF_DISK"
+	fi
+fi
+[[ -f "$UDF_DISK" ]] && DISK_ARGS+=(-drive "if=none,id=udf0,format=raw,file=$UDF_DISK" -device "virtio-blk-pci,drive=udf0")
+
+# A virtio-net NIC on user networking, so DeviceManager brings up the virtio_net driver
+# and NetworkService comes online. TimeService depends on it and the shell transitively
+# on both. On QEMU virt the NIC signals via wired INTx routed to the PLIC (no MSI), so
+# this needs the per-device PLIC interrupt path.
+DISK_ARGS+=(-netdev "user,id=vnet0" -device "virtio-net-pci,netdev=vnet0")
+
+# xHCI USB host controller + a hub with a keyboard, tablet, and a FAT mass-storage stick
+# backing vol://usb (seeded from volume/ when mtools is present) - the same USB set the
+# aarch64/x86 runners attach.
+USB_DISK="$HERE/.build/usb-media-riscv64.img"
+if [[ ! -f "$USB_DISK" ]]; then
+	truncate -s 16M "$USB_DISK"
+	if command -v mformat >/dev/null && command -v mcopy >/dev/null; then
+		mformat -i "$USB_DISK" -F ::
+		mcopy -i "$USB_DISK" "$VOLDIR/hello.txt" ::hello.txt 2>/dev/null || true
+		mcopy -i "$USB_DISK" "$VOLDIR/motd.txt" ::motd.txt 2>/dev/null || true
+	fi
+fi
+DISK_ARGS+=(
+	-device "qemu-xhci,id=usb"
+	-device "usb-hub,bus=usb.0,port=1"
+	-device "usb-kbd,bus=usb.0,port=1.1"
+	-device "usb-tablet,bus=usb.0,port=1.2"
+	-drive "if=none,id=vusb,format=raw,file=$USB_DISK"
+	-device "usb-storage,bus=usb.0,drive=vusb,id=usbstick"
+)
+
 exec qemu-system-riscv64 \
 	-machine virt \
 	-cpu rv64 \

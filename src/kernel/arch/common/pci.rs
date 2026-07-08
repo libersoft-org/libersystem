@@ -482,3 +482,14 @@ pub fn msix_enable<A: ConfigAccess>(bus: u8, dev: u8, func: u8, cap: u16) {
 	let mc = (((dword >> 16) as u16) | MSIX_ENABLE) & !MSIX_FUNCTION_MASK;
 	A::write32(bus, dev, func, cap, (dword & 0x0000_ffff) | ((mc as u32) << 16));
 }
+
+// Ensure a function decodes memory space and masters the bus without touching its
+// interrupt-delivery mode. The riscv INTx-over-PLIC path needs both (its driver reads
+// the device BARs and the device DMAs its virtqueues) but must NOT enable MSI-X: on
+// QEMU virt the PLIC receives only wired INTx, so a device switched to MSI-X would send
+// a message nothing receives. This keeps the device on its INTx pin.
+#[allow(dead_code)] // only the riscv INTx-over-PLIC backend keeps devices off MSI-X
+pub fn enable_mem_and_master<A: ConfigAccess>(bus: u8, dev: u8, func: u8) {
+	let command = A::read16(bus, dev, func, 0x04);
+	write_command::<A>(bus, dev, func, command | CMD_MEMORY_SPACE | CMD_BUS_MASTER);
+}

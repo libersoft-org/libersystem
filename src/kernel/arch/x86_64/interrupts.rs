@@ -164,6 +164,11 @@ pub fn bind_msi(vector: u8, intr: &Arc<Interrupt>) -> bool {
 	REGISTRY.bind((vector - MSI_BASE) as usize, intr)
 }
 
+// End-of-interrupt for a serviced vector. x86 MSI is edge-triggered and the LAPIC EOI
+// is issued from the ISR stub, so there is no source to complete here: a no-op, kept for
+// the portable SYS_INTERRUPT_ACK path (the riscv PLIC completes its level source here).
+pub fn eoi(_vector: u8) {}
+
 // Whether `vector` currently has a live driver binding. Used to confirm that a
 // crashed driver's IRQ was detached during cleanup.
 pub fn is_bound(vector: u8) -> bool {

@@ -64,6 +64,22 @@ impl<const N: usize> MsiRegistry<N> {
 		None
 	}
 
+	// Reserve one SPECIFIC slot for device `owner`, for a backend whose slot is fixed by
+	// the hardware rather than freely chosen: on riscv a device's PLIC INTx source is
+	// determined by its PCI slot + pin, so the source id IS the slot and the caller
+	// cannot pick a different free one. Returns false if the slot is already reserved.
+	#[allow(dead_code)] // only the riscv INTx-over-PLIC backend fixes its slot this way
+	pub fn acquire_at(&self, slot: usize, owner: u32) -> bool {
+		if slot >= N {
+			return false;
+		}
+		if self.used[slot].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+			return false;
+		}
+		self.owner[slot].store(owner, Ordering::Release);
+		true
+	}
+
 	// Bind `intr` to `slot` so `dispatch` wakes it when the slot's vector fires.
 	// Returns false if the slot is already bound to a live Interrupt.
 	pub fn bind(&self, slot: usize, intr: &Arc<Interrupt>) -> bool {

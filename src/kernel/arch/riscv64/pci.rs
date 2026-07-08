@@ -114,8 +114,19 @@ pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
 	common::set_intx_disabled::<Access>(bus, dev, func, disabled);
 }
 
-// Enable MSI-X on a device and ensure its memory space is decoded + bus mastering is on.
-// `cap` is the MSI-X capability's config-space offset (from VirtioDevice::msix_cap).
-pub fn msix_enable(bus: u8, dev: u8, func: u8, cap: u16) {
-	common::msix_enable::<Access>(bus, dev, func, cap);
+// The device's PCI Interrupt Pin (config byte 0x3D): 0 = none, 1..4 = INTA..INTD.
+// The riscv interrupt path swizzles it with the device's slot to pick the PLIC source
+// the wired INTx line lands on.
+pub fn interrupt_pin(bus: u8, dev: u8, func: u8) -> u8 {
+	let dword = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(cfg_phys(bus, dev, func, 0x3C)) as *const u32) };
+	((dword >> 8) & 0xff) as u8
+}
+
+// On QEMU virt the PLIC receives only wired INTx, never MSI/MSI-X, so the interrupt
+// path keeps every device on its INTx pin (see arch::interrupts). Enabling PCI MSI-X
+// here would switch the device to a message the PLIC cannot receive and silence it, so
+// this only ensures memory decode + bus mastering (which INTx delivery + virtio DMA
+// still need) and leaves the MSI-X enable bit clear. `cap` is unused on riscv.
+pub fn msix_enable(bus: u8, dev: u8, func: u8, _cap: u16) {
+	common::enable_mem_and_master::<Access>(bus, dev, func);
 }

@@ -270,6 +270,14 @@ impl Virtio {
 		unsafe { r8(self.common + CFG_DEVICE_STATUS) & STATUS_DRIVER_OK != 0 }
 	}
 
+	// Read the ISR-status register: returns the pending-interrupt reason bits and, on a
+	// level-triggered INTx line (the riscv PLIC path), deasserts the device's interrupt
+	// so the kernel can complete the source. An interrupt-driven driver reads it once per
+	// IRQ before acking. Harmless on MSI-X (edge-triggered), where it reads back zero.
+	pub unsafe fn read_isr(&self) -> u8 {
+		unsafe { r8(self.isr) }
+	}
+
 	// Read one byte of the device-specific config (e.g. a NIC's MAC bytes).
 	pub unsafe fn config_read(&self, offset: u64) -> u8 {
 		unsafe { r8(self.device + offset) }

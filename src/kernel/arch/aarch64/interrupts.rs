@@ -135,6 +135,11 @@ pub fn is_bound(vector: u8) -> bool {
 	}
 }
 
+// End-of-interrupt for a serviced vector. MSI on aarch64 is edge-triggered and
+// unshared, so there is no level source to complete: a no-op, kept for the portable
+// SYS_INTERRUPT_ACK path (the riscv PLIC completes its level source here).
+pub fn eoi(_vector: u8) {}
+
 // Deliver a fired GIC INTID to a bound MSI driver, if it is one of the frame's SPIs.
 // Returns true when the INTID was an MSI vector (handled here), so gic::handle_irq can
 // tell it apart from the timer and other INTIDs. Edge-triggered: just wake the bound

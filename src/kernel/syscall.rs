@@ -734,14 +734,17 @@ fn sys_device_msix_acquire(index: u64) -> i64 {
 }
 
 // Acknowledge a serviced interrupt: clear the Interrupt's pending flag so the driver's
-// next `wait` blocks until the device interrupts again. MSI-X is edge-triggered, so
-// there is no device source to unmask. Requires the WRITE right on the Interrupt handle.
+// next `wait` blocks until the device interrupts again, then run the arch end-of-
+// interrupt. MSI-X (x86/aarch64) is edge-triggered, so eoi is a no-op there; on riscv a
+// wired INTx routed through the PLIC is level-triggered, so eoi completes the PLIC
+// source (the driver has already deasserted its device line). Requires the WRITE right.
 fn sys_interrupt_ack(handle: u64) -> i64 {
 	let interrupt = match current_typed::<Interrupt>(handle, ObjectType::Interrupt, Rights::WRITE) {
 		Ok(i) => i,
 		Err(e) => return e,
 	};
 	interrupt.clear();
+	arch::interrupts::eoi(interrupt.vector());
 	0
 }
 

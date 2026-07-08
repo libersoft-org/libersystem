@@ -24,6 +24,11 @@ const MAX_SOURCES: usize = 96;
 // PLIC MMIO base (from the device tree). Reached through the higher-half direct map.
 static PLIC_BASE: AtomicUsize = AtomicUsize::new(0);
 
+// The boot hart id, captured at init. Device INTx sources are enabled and claimed on
+// this hart's S-mode context only, so their completion (from a driver's ack, which may
+// run on any hart) always targets the same context.
+static BOOT_HART: AtomicUsize = AtomicUsize::new(0);
+
 // Per-source kernel handlers (indexed by source id). A device driver registers one and
 // enables its source; the S-mode external-interrupt trap dispatches through here.
 static mut HANDLERS: [Option<fn()>; MAX_SOURCES] = [None; MAX_SOURCES];
@@ -54,6 +59,7 @@ pub fn ready() -> bool {
 // Bring up the PLIC on the boot hart: clear every source priority (all masked) and open
 // this hart's S-mode threshold so any enabled, non-zero-priority source can fire.
 pub fn init(hartid: u64) {
+	BOOT_HART.store(hartid as usize, Ordering::Relaxed);
 	if !ready() {
 		return;
 	}
@@ -63,6 +69,11 @@ pub fn init(hartid: u64) {
 		}
 	}
 	init_hart(hartid);
+}
+
+// The boot hart id (the S-mode PLIC context device INTx sources are routed to).
+pub fn boot_hart() -> u64 {
+	BOOT_HART.load(Ordering::Relaxed) as u64
 }
 
 // Open a hart's S-mode PLIC threshold (accept any priority > 0). Called on every hart.
@@ -101,6 +112,22 @@ pub fn enable_source(source: u32, hartid: u64) {
 	}
 }
 
+// Mask `source`: clear its priority and disable it in `hartid`'s S-mode context, so a
+// gone driver's device cannot re-assert its wired line into the PLIC.
+pub fn disable_source(source: u32, hartid: u64) {
+	if !ready() || source == 0 || source as usize >= MAX_SOURCES {
+		return;
+	}
+	let ctx = s_context(hartid);
+	unsafe {
+		let word = source as usize / 32;
+		let bit = source % 32;
+		let addr = reg(0x2000 + 0x80 * ctx + 4 * word);
+		addr.write_volatile(addr.read_volatile() & !(1 << bit));
+		reg(4 * source as usize).write_volatile(0); // priority 0
+	}
+}
+
 // Claim the highest-priority pending source for `hartid` (0 if none).
 pub fn claim(hartid: u64) -> u32 {
 	if !ready() {
@@ -126,6 +153,14 @@ pub fn handle_external(hartid: u64) {
 		let source = claim(hartid);
 		if source == 0 {
 			break;
+		}
+		// A device INTx bound to a userspace driver is LEVEL-triggered: signal the driver
+		// and leave the source claimed (the PLIC gateway masks it meanwhile) so it cannot
+		// re-fire. The driver deasserts its device line (reads the virtio ISR / clears the
+		// xHCI interrupt bit) and completes the source through SYS_INTERRUPT_ACK. Any other
+		// source runs its kernel handler and completes at once.
+		if super::interrupts::dispatch_intx(source) {
+			continue;
 		}
 		let handler = unsafe { (*(&raw const HANDLERS))[source as usize] };
 		if let Some(f) = handler {

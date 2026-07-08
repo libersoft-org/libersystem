@@ -104,7 +104,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		macmsg[3..9].copy_from_slice(&mac);
 		macmsg[9..11].copy_from_slice(&(mtu as u16).to_le_bytes());
 		send_blocking(frames, &macmsg, 0);
-		move_frames(irq, frames, &mut rx, &tx, rx_virt, &rx_phys, tx_virt, tx_phys, slot)
+		move_frames(&device, irq, frames, &mut rx, &tx, rx_virt, &rx_phys, tx_virt, tx_phys, slot)
 	}
 }
 
@@ -136,12 +136,13 @@ unsafe fn transmit_frame(tx: &Queue, tx_virt: u64, tx_phys: u64, slot: u64, fram
 
 // Move frames between the device and NetworkService, standing on the device IRQ and
 // the service's frame channel at once (wait_any). On an interrupt: drain the receive
-// ring (forwarding each frame to the service), then re-post the buffers and re-arm
-// (MSI-X is edge-triggered, so there is no ISR line to deassert). On a channel
+// ring (forwarding each frame to the service), then re-post the buffers, re-arm, read
+// the ISR-status register to deassert the device's (level-triggered INTx) line, and ack
+// (reading the ISR is a harmless zero read on MSI-X, edge-triggered). On a channel
 // message: transmit the frame the service handed back. The channel closing
 // (NetworkService gone) leaves us draining the device alone.
 #[allow(clippy::too_many_arguments)]
-unsafe fn move_frames(irq: u64, frames: u64, rx: &mut Queue, tx: &Queue, rx_virt: u64, rx_phys: &[u64], tx_virt: u64, tx_phys: u64, slot: u64) -> ! {
+unsafe fn move_frames(device: &Virtio, irq: u64, frames: u64, rx: &mut Queue, tx: &Queue, rx_virt: u64, rx_phys: &[u64], tx_virt: u64, tx_phys: u64, slot: u64) -> ! {
 	unsafe {
 		let mut frame: Vec<u8> = alloc::vec![0u8; (slot - NET_HDR_LEN) as usize];
 		let mut service_open: bool = true;
@@ -161,6 +162,7 @@ unsafe fn move_frames(irq: u64, frames: u64, rx: &mut Queue, tx: &Queue, rx_virt
 					rx.post_recv(id, rx_phys[id as usize], slot as u32);
 				}
 				rx.notify();
+				let _ = device.read_isr();
 				interrupt_ack(irq);
 			} else if ready == 1 {
 				match recv_blocking(frames, &mut frame) {

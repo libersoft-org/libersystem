@@ -21,7 +21,7 @@
 //   percpu:     PerCpu (cpu_id, lapic_id), allocate, init, this_cpu,
 //               set_kernel_rsp, set_tss_rsp0_slot, set_rsp0, in_user_syscall
 //   interrupts: IRQ_BASE, HandlerFn, register, bind, unbind, is_bound, is_bindable,
-//               acquire_msi, bind_msi, irq_info, irq_info_len, init
+//               acquire_msi, bind_msi, eoi, irq_info, irq_info_len, init
 //   apic:       local_id, eoi, send_wake_ipi, send_init, send_startup, ticks,
 //               init, init_ap  (the interrupt controller + timer; GIC on aarch64,
 //               PLIC/CLINT on riscv64 - keeps the `apic` name for now)
