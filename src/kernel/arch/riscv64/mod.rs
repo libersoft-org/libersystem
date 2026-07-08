@@ -95,58 +95,10 @@ pub fn exit_qemu(_success: bool) -> ! {
 pub mod paging;
 
 // ----------------------------------------------------------------- context
-pub mod context {
-	pub unsafe fn switch_context(_old_sp: *mut u64, _new_sp: u64) {
-		todo!("riscv64 context switch (M117)")
-	}
-	pub fn init_thread_stack(_stack: &mut [u8], _entry: extern "C" fn(u64), _arg: u64) -> u64 {
-		todo!("riscv64 context switch (M117)")
-	}
-	// The active address-space token (SATP on riscv64; kept named `cr3` for the
-	// portable contract).
-	pub fn read_cr3() -> u64 {
-		todo!("riscv64 SATP (M117)")
-	}
-	pub unsafe fn write_cr3(_satp: u64) {
-		todo!("riscv64 SATP (M117)")
-	}
-}
+pub mod context;
 
 // ------------------------------------------------------------------ percpu
-pub mod percpu {
-	pub struct PerCpu;
-
-	impl PerCpu {
-		pub fn cpu_id(&self) -> u32 {
-			todo!("riscv64 per-CPU (M117)")
-		}
-		pub fn lapic_id(&self) -> u32 {
-			todo!("riscv64 per-CPU (M117)")
-		}
-	}
-
-	pub fn allocate(_count: usize) {
-		todo!("riscv64 per-CPU (M117)")
-	}
-	pub fn init(_cpu_id: usize, _hartid: u32) {
-		todo!("riscv64 per-CPU (M117)")
-	}
-	pub fn this_cpu() -> &'static PerCpu {
-		todo!("riscv64 per-CPU (M117)")
-	}
-	pub fn set_kernel_rsp(_value: u64) {
-		todo!("riscv64 per-CPU (M117)")
-	}
-	pub fn set_tss_rsp0_slot(_addr: u64) {
-		todo!("riscv64 per-CPU (M117)")
-	}
-	pub fn set_rsp0(_value: u64) {
-		todo!("riscv64 per-CPU (M117)")
-	}
-	pub fn in_user_syscall() -> bool {
-		todo!("riscv64 per-CPU (M117)")
-	}
-}
+pub mod percpu;
 
 // -------------------------------------------------------------- interrupts
 pub mod interrupts {
@@ -187,47 +139,89 @@ pub mod interrupts {
 
 // -------------------------------------------------------------------- apic
 // (the riscv64 interrupt controller is the PLIC/CLINT; the module keeps the
-// portable `apic` name for the contract until the ports rename it.)
+// portable `apic` name for the contract until the ports rename it. The periodic
+// scheduler tick is the S-mode timer, armed through the SBI TIME extension.)
 pub mod apic {
+	use crate::arch::common::time::TICK_HZ;
+	use core::sync::atomic::{AtomicU64, Ordering};
+
+	// Monotonic scheduler-tick counter (advanced by the timer interrupt).
+	static TICKS: AtomicU64 = AtomicU64::new(0);
+	// The boot hart id, captured at init (the local "apic" id).
+	static BOOT_HART: AtomicU64 = AtomicU64::new(0);
+
+	pub fn set_boot_hart(hartid: u64) {
+		BOOT_HART.store(hartid, Ordering::Relaxed);
+	}
+
+	// Set the next S-mode timer interrupt via the legacy SBI set_timer (EID 0x00),
+	// which also clears the pending timer bit.
+	fn sbi_set_timer(when: u64) {
+		unsafe {
+			core::arch::asm!("ecall", in("a7") 0usize, in("a0") when, lateout("a0") _, options(nostack, preserves_flags));
+		}
+	}
+
+	// Arm the next periodic tick: now + timebase / TICK_HZ.
+	pub fn arm_timer() {
+		let interval = super::tsc::hz() / TICK_HZ as u64;
+		sbi_set_timer(super::tsc::now() + interval);
+	}
+
 	pub fn local_id() -> u32 {
-		todo!("riscv64 hartid (M117)")
+		BOOT_HART.load(Ordering::Relaxed) as u32
 	}
-	pub fn eoi() {
-		todo!("riscv64 PLIC claim/complete (M117)")
-	}
+
+	// The timer is re-armed inside its interrupt handler, so EOI is a no-op.
+	pub fn eoi() {}
+
 	pub fn send_wake_ipi(_dest: u32) {
-		todo!("riscv64 SBI IPI (M117)")
+		// SBI IPI for the cross-hart scheduler wake - wired with the SMP increment.
 	}
-	pub fn send_init(_dest: u32) {
-		todo!("riscv64 SBI HSM (M117)")
-	}
-	pub fn send_startup(_dest: u32, _vector: u8) {
-		todo!("riscv64 SBI HSM (M117)")
-	}
+	pub fn send_init(_dest: u32) {}
+	pub fn send_startup(_dest: u32, _vector: u8) {}
+
 	pub fn ticks() -> u64 {
-		todo!("riscv64 rdtime (M117)")
+		TICKS.load(Ordering::Relaxed)
 	}
+
+	// Advance the tick counter and re-arm the timer. Called from the S-mode timer
+	// interrupt (traps.rs).
+	pub fn on_timer_tick() {
+		TICKS.fetch_add(1, Ordering::Relaxed);
+		arm_timer();
+	}
+
+	// Enable the S-mode timer interrupt (SIE.STIE, bit 5) and arm the first tick.
 	pub fn init() {
-		todo!("riscv64 PLIC + timer (M117)")
+		unsafe {
+			core::arch::asm!("csrs sie, {}", in(reg) 1u64 << 5, options(nostack, preserves_flags));
+		}
+		arm_timer();
 	}
+
 	pub fn init_ap() {
-		todo!("riscv64 per-hart timer (M117)")
+		init();
 	}
 }
 
 // --------------------------------------------------------------------- tsc
+// The RISC-V `time` CSR is the monotonic cycle clock (read with a plain csrr); it
+// counts at the fixed CLINT timebase (10 MHz on QEMU virt).
 pub mod tsc {
 	pub fn now() -> u64 {
-		todo!("riscv64 rdtime (M117)")
+		let t: u64;
+		unsafe {
+			core::arch::asm!("csrr {}, time", out(reg) t, options(nomem, nostack, preserves_flags));
+		}
+		t
 	}
-	pub fn init() {
-		todo!("riscv64 timebase-frequency (M117)")
-	}
+	pub fn init() {}
 	pub fn hz() -> u64 {
-		todo!("riscv64 timebase-frequency (M117)")
+		10_000_000 // QEMU virt CLINT timebase (aclint-mtimer @ 10 MHz)
 	}
-	pub fn cycles_to_ns(_cycles: u64) -> u64 {
-		todo!("riscv64 timer scaling (M117)")
+	pub fn cycles_to_ns(cycles: u64) -> u64 {
+		crate::arch::common::time::cycles_to_ns(cycles, hz())
 	}
 }
 

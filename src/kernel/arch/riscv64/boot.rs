@@ -127,8 +127,9 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	// Increment 2: install the S-mode trap vector (STVEC) and exercise it.
 	super::traps::init();
 	// Permit S-mode access to U-mapped pages (SSTATUS.SUM, bit 18) so the kernel can
-	// seed user pages later; there is no SMAP-equivalent for now.
-	unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 1u64 << 18, options(nostack, preserves_flags)) };
+	// seed user pages later; and enable the FPU (SSTATUS.FS = Initial, bit 13) so the
+	// context switch's fsd/fld and any compiler-emitted FP do not trap.
+	unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) (1u64 << 18) | (1u64 << 13), options(nostack, preserves_flags)) };
 	crate::serial_println!("riscv64: STVEC trap vector installed");
 
 	// Trap round-trip: `ebreak` traps to S-mode (OpenSBI delegates it via medeleg);
@@ -149,7 +150,7 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 			(0, 1)
 		}
 	};
-	let _ = cpu_count;
+	let cpu_count = cpu_count.max(1);
 
 	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
 	let (region_base, region_len) = paging::usable_region(ram_top);
@@ -179,6 +180,101 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	paging::unmap_page(TEST_VA);
 	paging::dealloc_frame(frame);
 
-	crate::serial_println!("riscv64: M117 increment 4 (Sv39 paging + frame allocator + heap) - OK, halting");
+	// Increment 5: monotonic clock, per-CPU block, context switch, scheduler, timer.
+	super::tsc::init();
+	super::apic::set_boot_hart(hartid);
+	crate::serial_println!("riscv64: clock - timebase {} MHz, uptime {} ms", super::tsc::hz() / 1_000_000, super::tsc::cycles_to_ns(super::tsc::now()) / 1_000_000);
+
+	// Per-CPU block for the boot hart, reachable through `tp`.
+	super::percpu::allocate(cpu_count as usize);
+	super::percpu::init(0, hartid as u32);
+	{
+		let cpu = super::percpu::this_cpu();
+		crate::serial_println!("riscv64: per-CPU up (tp) - cpu_id={} hart={}", cpu.cpu_id(), cpu.lapic_id());
+	}
+
+	// Cooperative context switch: two kernel threads ping-pong through switch_context,
+	// then hand control back to the boot context.
+	unsafe {
+		A_SP = super::context::init_thread_stack(&mut *(&raw mut STACK_A), thread_a, 0xAA);
+		B_SP = super::context::init_thread_stack(&mut *(&raw mut STACK_B), thread_b, 0xBB);
+	}
+	crate::serial_println!("riscv64: context switch - starting kernel threads");
+	unsafe { super::context::switch_context(&raw mut MAIN_SP, A_SP) };
+	crate::serial_println!("riscv64: context switch - returned to boot context");
+
+	// The portable scheduler on top of the arch context/percpu contract.
+	crate::smp::set_cpu_count(cpu_count as usize);
+	crate::sched::allocate(cpu_count as usize);
+	crate::sched::init();
+
+	// Cooperative: three yielding kernel threads, drained to completion.
+	for id in 1..=3u64 {
+		crate::sched::spawn(sched_task, id);
+	}
+	crate::serial_println!("riscv64: portable scheduler - draining 3 yielding threads");
+	crate::sched::run_until_idle();
+	crate::serial_println!("riscv64: portable scheduler - all threads exited");
+
+	// Preemptive: arm the S-mode timer + enable interrupts, then three non-yielding
+	// threads that only the timer IRQ can rotate.
+	super::apic::init();
+	super::enable_interrupts();
+	for id in 1..=3u64 {
+		crate::sched::spawn(preempt_task, id);
+	}
+	crate::serial_println!("riscv64: preemptive scheduler - 3 non-yielding threads");
+	crate::sched::run_until_idle();
+	crate::serial_println!("riscv64: preemptive scheduler - all threads exited (ticks={})", super::apic::ticks());
+
+	crate::serial_println!("riscv64: M117 increment 5 (percpu + context switch + scheduler + timer) - OK, halting");
 	super::halt_loop()
+}
+
+// -------------------------------------------------------- increment-5 threads
+
+static mut MAIN_SP: u64 = 0;
+static mut A_SP: u64 = 0;
+static mut B_SP: u64 = 0;
+static mut STACK_A: [u8; 8192] = [0; 8192];
+static mut STACK_B: [u8; 8192] = [0; 8192];
+
+// Ping-pong partner A: print + switch to B three times, then return to the boot
+// context (which resumes right after the initial switch_context above).
+extern "C" fn thread_a(arg: u64) {
+	for i in 0..3 {
+		crate::serial_println!("riscv64: thread A step {i} (arg={arg:#x})");
+		unsafe { super::context::switch_context(&raw mut A_SP, B_SP) };
+	}
+	unsafe { super::context::switch_context(&raw mut A_SP, MAIN_SP) };
+}
+
+// Ping-pong partner B: print + switch back to A forever (A drives the count).
+extern "C" fn thread_b(arg: u64) {
+	loop {
+		crate::serial_println!("riscv64: thread B step (arg={arg:#x})");
+		unsafe { super::context::switch_context(&raw mut B_SP, A_SP) };
+	}
+}
+
+// A portable-scheduler kernel thread: print a few times, yielding the core between
+// steps, then return (which retires it through sched::exit).
+extern "C" fn sched_task(id: u64) {
+	for i in 0..3 {
+		crate::serial_println!("riscv64: [sched] thread {id} step {i}");
+		crate::sched::yield_now();
+	}
+}
+
+// A preemption test thread: busy-wait ~15 ms per step (no yield) so the 10 ms timer
+// quantum forces a preemptive rotation; interleaved output proves the timer IRQ
+// drives the scheduler.
+extern "C" fn preempt_task(id: u64) {
+	for i in 0..3 {
+		let target = super::tsc::now() + super::tsc::hz() * 15 / 1000;
+		while super::tsc::now() < target {
+			core::hint::spin_loop();
+		}
+		crate::serial_println!("riscv64: [preempt] thread {id} step {i}");
+	}
 }

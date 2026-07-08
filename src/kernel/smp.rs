@@ -49,10 +49,10 @@ pub fn cpu_count() -> usize {
 	CPU_COUNT.load(Ordering::Relaxed)
 }
 
-// Register the machine's core count from the arch backend. aarch64 brings up SMP
-// through PSCI rather than the ACPI/APIC path in `init`, so it records the count
-// here before sizing the per-CPU scheduler slots.
-#[cfg(target_arch = "aarch64")]
+// Register the machine's core count from the arch backend. aarch64 (PSCI) and
+// riscv64 (SBI HSM) bring up SMP outside the ACPI/APIC path in `init`, so they record
+// the count here before sizing the per-CPU scheduler slots.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn set_cpu_count(count: usize) {
 	CPU_COUNT.store(count, Ordering::Relaxed);
 	// Publish each core's interrupt-controller id for the cross-core wake-IPI path

@@ -139,8 +139,15 @@ pub fn init() {
 #[unsafe(no_mangle)]
 extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 	if scause & CAUSE_INTERRUPT != 0 {
-		// Timer / external (PLIC) interrupts are wired in a later increment; for now
-		// there are none enabled, so just return.
+		let code = scause & 0xff;
+		// S-mode timer interrupt (code 5): advance the tick + re-arm, then let the
+		// scheduler preempt the running thread. External (PLIC) interrupts are wired
+		// in a later increment.
+		if code == 5 {
+			super::apic::on_timer_tick();
+			let from_user = unsafe { *frame.add(FRAME_SSTATUS) } & SSTATUS_SPP == 0;
+			crate::sched::on_timer_preempt(from_user);
+		}
 		return;
 	}
 	let code = scause & 0xff;
