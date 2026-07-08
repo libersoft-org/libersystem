@@ -16,3 +16,10 @@ rustflags = ["-C", "relocation-model=static"]
 # segments at their link-time p_vaddr with no relocations. Build for aarch64 with
 # `cargo build --target aarch64-unknown-none` (overriding the default target).
 rustflags = ["-C", "relocation-model=static"]
+
+[target.riscv64gc-unknown-none-elf]
+# Same fixed-address ET_EXEC contract as x86_64/aarch64: the kernel ELF loader maps
+# segments at their link-time p_vaddr with no relocations. code-model=medium (RISC-V
+# "medany") keeps the absolute addressing within the low-half link base. Build with
+# `cargo build --target riscv64gc-unknown-none-elf`.
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=medium"]

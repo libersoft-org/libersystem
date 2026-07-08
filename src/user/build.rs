@@ -25,6 +25,7 @@ fn select_linker_script() {
 	let arch: String = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 	let script: &str = match arch.as_str() {
 		"aarch64" => "../user-aarch64.ld",
+		"riscv64" => "../user-riscv64.ld",
 		_ => "../user.ld",
 	};
 	println!("cargo:rustc-link-arg=-T{script}");

@@ -105,6 +105,17 @@ _start:
 "#
 );
 
+// The pre-built `echo` userspace tool (embedded by build.rs on riscv64), run through
+// the portable ELF loader as an end-to-end userspace bring-up demo. Empty if the
+// userspace was not built first, in which case the demo is skipped.
+const ECHO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_demo.elf"));
+
+// The init + volume packages assembled by build.rs from the riscv64 userspace build.
+// riscv64 boots directly (no bootloader hand-off), so the kernel embeds them and
+// publishes its own BootInfo pointing at them. Empty if the userspace was not built.
+const INIT_PKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.pkg"));
+const VOLUME_PKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/volume.pkg"));
+
 #[unsafe(no_mangle)]
 extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	super::serial::init();
@@ -130,6 +141,9 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	// seed user pages later; and enable the FPU (SSTATUS.FS = Initial, bit 13) so the
 	// context switch's fsd/fld and any compiler-emitted FP do not trap.
 	unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) (1u64 << 18) | (1u64 << 13), options(nostack, preserves_flags)) };
+	// Let U-mode read the cycle / time / instret counters (SCOUNTEREN CY|TM|IR) so the
+	// userspace runtime's rdcycle-based perf clock does not trap.
+	unsafe { core::arch::asm!("csrw scounteren, {}", in(reg) 0x7u64, options(nostack, preserves_flags)) };
 	crate::serial_println!("riscv64: STVEC trap vector installed");
 
 	// Trap round-trip: `ebreak` traps to S-mode (OpenSBI delegates it via medeleg);
@@ -249,11 +263,19 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	super::syscall::init();
 	run_user_processes();
 
+	// Increment 9: load + run the REAL `echo` userspace tool (cross-compiled from the
+	// userspace tree with the shared rt runtime) through the portable ELF loader.
+	run_echo_program();
+
 	// Increment 8: enumerate the PCIe ECAM bus (the shared arch::common::pci over the
 	// riscv64 ECAM ConfigAccess) and resolve any virtio devices' modern MMIO layout.
 	run_pci_scan();
 
-	crate::serial_println!("riscv64: M117 increment 8 (ECAM PCI + PLIC + DTB pcie fix) - OK, halting");
+	// Increment 9: the real userspace boot chain - spawn SystemManager from the
+	// embedded init package, bring up the services, and hand off to the shell.
+	run_system_manager();
+
+	crate::serial_println!("riscv64: M117 increment 9 (userspace boot chain) - OK, halting");
 	super::halt_loop()
 }
 
@@ -418,4 +440,117 @@ fn run_user_processes() {
 	crate::serial_println!("riscv64: userspace - running 2 U-mode processes");
 	crate::sched::run_until_idle();
 	crate::serial_println!("riscv64: userspace - both U-mode processes exited");
+}
+
+// Load and run the real `echo` tool - cross-compiled from the actual userspace tree
+// with the shared `rt` runtime, embedded by build.rs - as a U-mode process through the
+// PORTABLE ELF loader (the same crate::elf the x86/aarch64 kernels use). The kernel is
+// its launcher: it seeds a bootstrap channel and sends the two messages rt expects (a
+// STDOUT message with no console handle, so echo falls back to the debug port, and the
+// argument line). echo does the rt ABI handshake, receives the line, and prints it via
+// SYS_DEBUG_WRITE. A no-op when the ELF was not embedded (userspace not built first).
+fn run_echo_program() {
+	use super::paging;
+	use crate::object::address_space::AddressSpace;
+	use crate::object::channel::{Channel, Message};
+	use crate::object::process::Process;
+	use crate::object::rights::Rights;
+
+	if ECHO_ELF.is_empty() {
+		crate::serial_println!("riscv64: echo - not embedded (build the riscv64 userspace first)");
+		return;
+	}
+
+	let addr_space = match AddressSpace::create() {
+		Some(a) => a,
+		None => {
+			crate::serial_println!("riscv64: echo - no address space");
+			return;
+		}
+	};
+	let mut frames: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	let entry = match crate::elf::load_into(ECHO_ELF, &addr_space, &mut frames) {
+		Ok(e) => e,
+		Err(_) => {
+			crate::serial_println!("riscv64: echo - ELF load failed");
+			for f in frames {
+				paging::dealloc_frame(f);
+			}
+			return;
+		}
+	};
+	// The loader wrote code through the data path; fence.i so the new instructions are
+	// fetched from memory.
+	unsafe { core::arch::asm!("fence.i", options(nostack, preserves_flags)) };
+
+	// User stack (the loader maps only PT_LOAD segments).
+	let stack = paging::alloc_frame().expect("riscv64: no frame for echo stack");
+	let stack_va: u64 = 0x7fff_0000;
+	let stack_top = stack_va + 0x1000;
+	addr_space.map(stack_va, stack, paging::PRESENT | paging::WRITABLE | paging::USER | paging::NO_EXECUTE);
+	frames.push(stack);
+
+	// Bootstrap channel: the process holds ep1; the kernel keeps ep0 and, as the
+	// launcher, sends the stdout + argument messages the rt runtime consumes.
+	let (ep0, ep1) = Channel::create();
+	let process = Process::new(addr_space, crate::sched::root_domain());
+	process.adopt_frames(frames);
+	let bootstrap = process.install(ep1, Rights::ALL, 0);
+	let _ = ep0.send(Message::new(alloc::vec::Vec::from(&b"STDOUT"[..]), alloc::vec::Vec::new(), 0));
+	let _ = ep0.send(Message::new(alloc::vec::Vec::from(&b"echo running from a real riscv64 ELF"[..]), alloc::vec::Vec::new(), 0));
+
+	let ctx = alloc::boxed::Box::new(UserCtx { entry, stack_top, arg: bootstrap });
+	crate::sched::thread_create(process, user_trampoline, alloc::boxed::Box::into_raw(ctx) as u64);
+	crate::serial_println!("riscv64: echo - running the real echo tool (entry {entry:#x})");
+	crate::sched::run_until_idle();
+	crate::serial_println!("riscv64: echo - tool exited");
+}
+
+// Publish a kernel-constructed BootInfo pointing at the embedded init.pkg / volume.pkg
+// (riscv64 boots directly, with no bootloader hand-off, so the kernel builds its own).
+// Both the userspace boot chain and the test harness read the packages through it.
+fn publish_embedded_boot_info() {
+	fn module(name: &[u8], bytes: &[u8]) -> bootproto::Module {
+		let mut nm = [0u8; 32];
+		nm[..name.len()].copy_from_slice(name);
+		bootproto::Module { addr: bytes.as_ptr() as u64, size: bytes.len() as u64, name: nm }
+	}
+	let modules: &'static mut [bootproto::Module; 2] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", INIT_PKG), module(b"volume.pkg", VOLUME_PKG)]));
+	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer: bootproto::Framebuffer { addr: 0, width: 0, height: 0, pitch: 0, bpp: 0, red_shift: 0, red_size: 0, green_shift: 0, green_size: 0, blue_shift: 0, blue_size: 0, _pad: [0; 2] }, fb_present: 0, _pad1: 0, rsdp: 0, smp_trampoline: 0 }));
+	crate::publish_boot_info(bi);
+}
+
+// Spawn the real SystemManager from the embedded init package and drive the userspace
+// boot chain as far as it runs, draining its reports, then hand off to the interactive
+// shell over the serial console. The same portable mechanism the x86/aarch64 kernels
+// use (pkg::Package + loader::spawn_elf_process + the PACKAGE/RAMDISK/MODE bootstrap).
+fn run_system_manager() {
+	if INIT_PKG.is_empty() || VOLUME_PKG.is_empty() {
+		crate::serial_println!("riscv64: system - packages not embedded (build the riscv64 userspace first)");
+		return;
+	}
+
+	// Populate the kernel device table from the PCI scan so DeviceManager can enumerate
+	// the virtio devices (the same one-time boot scan the other kmains do).
+	crate::device::init();
+
+	publish_embedded_boot_info();
+
+	match crate::spawn_system_manager() {
+		Ok((ep, koid)) => {
+			crate::serial_println!("riscv64: system - SystemManager spawned (koid {koid}), bringing up userspace");
+			for _ in 0..400 {
+				crate::sched::run_until_idle();
+				while let Ok(msg) = ep.recv() {
+					crate::serial_println!("riscv64: userspace: {}", core::str::from_utf8(&msg.bytes).unwrap_or("<bad>"));
+				}
+				super::idle_halt();
+			}
+			crate::serial_println!("riscv64: system - userspace boot chain settled");
+			crate::console_shell_loop();
+		}
+		Err(reason) => {
+			crate::serial_println!("riscv64: system - SystemManager failed to start: {reason}");
+		}
+	}
 }

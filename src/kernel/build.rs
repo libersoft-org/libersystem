@@ -29,19 +29,18 @@ fn select_linker_script() {
 	println!("cargo:rerun-if-changed=build.rs");
 }
 
-// On aarch64, embed the pre-built `echo` userspace ELF so the kernel can load and
-// run a real rt-based program as an end-to-end bring-up demo. Written to OUT_DIR
+// On aarch64 / riscv64, embed the pre-built `echo` userspace ELF so the kernel can load
+// and run a real rt-based program as an end-to-end bring-up demo. Written to OUT_DIR
 // (empty when the ELF is absent, e.g. a bare `cargo build` without the userspace
 // built first), so the kernel always builds and the demo simply does not run. On
-// other targets the embedded blob is empty (they route userspace via the init
-// package instead).
+// x86_64 the embedded blob is empty (it routes userspace via the init package instead).
 fn embed_aarch64_demo() {
 	let out_dir: PathBuf = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
 	let dest: PathBuf = out_dir.join("echo_demo.elf");
 	let arch: String = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-	let bytes: Vec<u8> = if arch == "aarch64" {
+	let bytes: Vec<u8> = if arch == "aarch64" || arch == "riscv64" {
 		let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-		let elf: PathBuf = PathBuf::from(&manifest_dir).join("../user/tools/target/aarch64-unknown-none/debug/echo");
+		let elf: PathBuf = PathBuf::from(&manifest_dir).join(format!("../user/tools/target/{}/debug/echo", user_target()));
 		println!("cargo:rerun-if-changed={}", elf.display());
 		fs::read(&elf).unwrap_or_default()
 	} else {
@@ -155,16 +154,20 @@ fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 fn user_target() -> &'static str {
 	match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
 		Ok("aarch64") => "aarch64-unknown-none",
+		Ok("riscv64") => "riscv64gc-unknown-none-elf",
 		_ => "x86_64-unknown-none",
 	}
 }
 
-// Where the assembled packages are written. On aarch64 there is no bootloader
-// module hand-off (the kernel is booted directly via `-kernel`), so the packages
-// go to OUT_DIR and are embedded into the kernel image; on x86_64 they go to
+// Where the assembled packages are written. On aarch64 and riscv64 there is no
+// bootloader module hand-off (the kernel is booted directly via `-kernel`), so the
+// packages go to OUT_DIR and are embedded into the kernel image; on x86_64 they go to
 // boot/.build for mkimage.sh to place as Limine modules.
 fn package_out_dir(manifest: &Path) -> PathBuf {
-	if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") { PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set")) } else { manifest.join("../boot/.build") }
+	match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+		Ok("aarch64") | Ok("riscv64") => PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set")),
+		_ => manifest.join("../boot/.build"),
+	}
 }
 
 // Read a userspace ELF and strip its symbol and debug sections, returning the smaller
