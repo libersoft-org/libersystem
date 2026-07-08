@@ -191,11 +191,7 @@ pub unsafe fn debug_write(bytes: &[u8]) -> usize {
 	unsafe {
 		let n = bytes.len().min(DEBUG_WRITE_CHUNK);
 		let accepted: i64 = syscall(SYS_DEBUG_WRITE, bytes.as_ptr() as u64, n as u64, 0, 0) as i64;
-		if accepted < 0 {
-			0
-		} else {
-			accepted as usize
-		}
+		if accepted < 0 { 0 } else { accepted as usize }
 	}
 }
 
@@ -1050,11 +1046,7 @@ pub unsafe fn memory_object_create(size: u64) -> i64 {
 pub unsafe fn map_object(handle: u64) -> Option<u64> {
 	unsafe {
 		let base: u64 = syscall(SYS_MEMORY_MAP, handle, 0, 0, 0);
-		if sys_is_err(base) {
-			None
-		} else {
-			Some(base)
-		}
+		if sys_is_err(base) { None } else { Some(base) }
 	}
 }
 
@@ -1163,11 +1155,7 @@ pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
 		let mut info: ObjectInfo = ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0, size: 0 };
 		let size: u64 = core::mem::size_of::<ObjectInfo>() as u64;
 		let ok: i64 = syscall(SYS_OBJECT_INFO_GET, handle, &mut info as *mut ObjectInfo as u64, size, 0) as i64;
-		if ok == 1 {
-			Some(info)
-		} else {
-			None
-		}
+		if ok == 1 { Some(info) } else { None }
 	}
 }
 
@@ -1181,11 +1169,7 @@ pub unsafe fn process_stats(handle: u64) -> Option<ProcessStats> {
 		let mut stats: ProcessStats = ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: 0 };
 		let size: u64 = core::mem::size_of::<ProcessStats>() as u64;
 		let ok: i64 = syscall(SYS_PROCESS_STATS_GET, handle, &mut stats as *mut ProcessStats as u64, size, 0) as i64;
-		if ok == 1 {
-			Some(stats)
-		} else {
-			None
-		}
+		if ok == 1 { Some(stats) } else { None }
 	}
 }
 
@@ -1369,11 +1353,7 @@ pub unsafe fn domain_stats(handle: u64) -> Option<DomainStats> {
 		let mut stats: DomainStats = DomainStats::default();
 		let size: u64 = core::mem::size_of::<DomainStats>() as u64;
 		let ok: i64 = syscall(SYS_DOMAIN_STATS_GET, handle, &mut stats as *mut DomainStats as u64, size, 0) as i64;
-		if ok == 1 {
-			Some(stats)
-		} else {
-			None
-		}
+		if ok == 1 { Some(stats) } else { None }
 	}
 }
 

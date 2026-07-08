@@ -1,5 +1,6 @@
 # Bugs / changes
 
+- Is OS loading only drivers it detected or all?
 - src/boot/qemu-*.sh scripts - find duplicities and make it one script only with parameters, use it in Justfile and fix it in documentation
 - Remove Limine mentioning everywhere
 - Add nvme and other generic drivers (add to CONCEPT_*.md that generic drivers will be available already in phase 2)

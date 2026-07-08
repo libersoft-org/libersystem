@@ -260,15 +260,35 @@ pub mod ioapic {
 
 // --------------------------------------------------------------------- rtc
 pub mod rtc {
+	// QEMU virt exposes a Goldfish RTC (device tree "rtc@101000"): TIME_LOW then
+	// TIME_HIGH read the nanoseconds since the Unix epoch (reading LOW latches HIGH).
+	const RTC_BASE: u64 = 0x0010_1000;
 	pub fn read_unix() -> u64 {
-		todo!("riscv64 Goldfish RTC (M117)")
+		unsafe {
+			let lo = core::ptr::read_volatile(super::paging::phys_to_virt(RTC_BASE) as *const u32) as u64;
+			let hi = core::ptr::read_volatile(super::paging::phys_to_virt(RTC_BASE + 4) as *const u32) as u64;
+			((hi << 32) | lo) / 1_000_000_000
+		}
 	}
 }
 
 // ------------------------------------------------------------------ random
+// (RISC-V has no guaranteed userspace entropy source, so this is a splitmix64 stream
+// seeded and re-stirred from the cycle counter - the same fallback the other arches
+// use when their hardware RNG is absent.)
 pub mod random {
-	pub fn fill(_buf: &mut [u8]) {
-		todo!("riscv64 entropy source (M117)")
+	use core::sync::atomic::{AtomicU64, Ordering};
+
+	static STATE: AtomicU64 = AtomicU64::new(0);
+
+	pub fn fill(buf: &mut [u8]) {
+		let mut s = STATE.load(Ordering::Relaxed) ^ super::tsc::now() ^ 0x9E37_79B9_7F4A_7C15;
+		for chunk in buf.chunks_mut(8) {
+			let z = crate::arch::common::rng::splitmix64(&mut s);
+			let bytes = z.to_le_bytes();
+			chunk.copy_from_slice(&bytes[..chunk.len()]);
+		}
+		STATE.store(s, Ordering::Relaxed);
 	}
 }
 

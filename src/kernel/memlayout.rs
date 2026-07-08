@@ -36,12 +36,22 @@ pub(crate) const USER_STACK_PAGES: u64 = 8;
 // Ring-3 syscall-mapped MemoryObjects are allocated from here (the user window's
 // pool: reused released ranges first, then the bump). The base sits far above
 // the program and stack the loader places below the 2 GB line, yet within the
-// user (lower) half, so user_buf_ok still accepts buffers carved from it.
+// user (lower) half, so user_buf_ok still accepts buffers carved from it. On
+// riscv64 the user half is Sv39's 39-bit low canonical range [0, 0x40_0000_0000),
+// so the 48-bit x86/aarch64 base is non-canonical there and the window is moved
+// down to 128 GiB (still well clear of the sub-2-GiB program, stack and heap).
+#[cfg(not(target_arch = "riscv64"))]
 pub(crate) const USER_MMAP_BASE: u64 = 0x0000_4000_0000_0000;
+#[cfg(target_arch = "riscv64")]
+pub(crate) const USER_MMAP_BASE: u64 = 0x0000_0020_0000_0000;
 
 // Exclusive upper bound of the user (lower-half) virtual-address range: a ring-3
-// syscall may only hand the kernel pointers below this.
+// syscall may only hand the kernel pointers below this. On riscv64 it is the top of
+// the Sv39 low canonical half (256 GiB).
+#[cfg(not(target_arch = "riscv64"))]
 pub(crate) const USER_VA_END: u64 = 0x0000_8000_0000_0000;
+#[cfg(target_arch = "riscv64")]
+pub(crate) const USER_VA_END: u64 = 0x0000_0040_0000_0000;
 
 // Kernel virtual-address window for syscall-mapped MemoryObjects (the kernel-side
 // counterpart of USER_MMAP_BASE). Its pool hands out non-overlapping ranges and
