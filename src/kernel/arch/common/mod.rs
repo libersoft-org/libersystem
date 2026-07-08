@@ -13,7 +13,10 @@
 // exposes (each backend maps them onto its real hardware encoding).
 // `msi`: the per-device MSI-X slot registry (bind / acquire / dispatch bookkeeping),
 // shared by every interrupt-controller backend.
+// `context`: the portable thread bootstrap each backend's context-switch trampoline
+// lands in.
 
+pub mod context;
 pub mod msi;
 pub mod paging;
 pub mod pci;

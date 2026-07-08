@@ -46,20 +46,8 @@ global_asm!(
 	"ud2",
 );
 
-// First Rust code a freshly scheduled thread runs. Calls the thread entry with
-// its argument; when the entry returns, the thread exits and never comes back.
-#[unsafe(no_mangle)]
-extern "C" fn thread_bootstrap(entry: u64, arg: u64) -> ! {
-	// New threads start preemptible. The scheduler switches into a thread with
-	// interrupts disabled (it disables them across every context switch); a thread
-	// resumed from a yield gets its interrupt flag restored by the scheduler, but a
-	// brand-new thread returns straight into this trampoline instead, so it must
-	// enable interrupts itself to match.
-	crate::arch::enable_interrupts();
-	let entry_fn: extern "C" fn(u64) = unsafe { core::mem::transmute(entry) };
-	entry_fn(arg);
-	crate::sched::exit()
-}
+// `thread_bootstrap` (the Rust entry the trampoline above calls) is the portable
+// arch::common::context symbol - identical on every arch, so it lives there.
 
 // Build the initial kernel stack for a new thread. The frame is laid out so the
 // first switch_context into it pops entry into r15 and arg into r14, then returns
