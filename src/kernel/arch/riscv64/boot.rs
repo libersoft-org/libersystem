@@ -188,10 +188,18 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	// Per-CPU block for the boot hart, reachable through `tp`.
 	super::percpu::allocate(cpu_count as usize);
 	super::percpu::init(0, hartid as u32);
+	// Size the per-CPU id tables and record the boot hart's real id (the SBI boot hart
+	// is not necessarily hart 0), so the cross-hart wake IPI targets the right hart.
+	crate::smp::set_cpu_count(cpu_count as usize);
+	crate::smp::set_lapic_id(0, hartid as u32);
 	{
 		let cpu = super::percpu::this_cpu();
-		crate::serial_println!("riscv64: per-CPU up (tp) - cpu_id={} hart={}", cpu.cpu_id(), cpu.lapic_id());
+		crate::serial_println!("riscv64: per-CPU up (tp) - cpu_id={} hart={} of {} CPU(s)", cpu.cpu_id(), cpu.lapic_id(), cpu_count);
 	}
+
+	// Wake the secondary harts via SBI HSM hart_start (each brings up its own per-CPU
+	// block, trap vector, and local timer, then idles until the scheduler is ready).
+	super::smp::bring_up_secondaries(cpu_count, hartid);
 
 	// Cooperative context switch: two kernel threads ping-pong through switch_context,
 	// then hand control back to the boot context.
@@ -204,7 +212,6 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	crate::serial_println!("riscv64: context switch - returned to boot context");
 
 	// The portable scheduler on top of the arch context/percpu contract.
-	crate::smp::set_cpu_count(cpu_count as usize);
 	crate::sched::allocate(cpu_count as usize);
 	crate::sched::init();
 
@@ -234,7 +241,7 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	super::syscall::init();
 	run_user_processes();
 
-	crate::serial_println!("riscv64: M117 increment 6 (ECALL syscall + U-mode entry) - OK, halting");
+	crate::serial_println!("riscv64: M117 increment 7 (SMP via SBI HSM + wake IPI) - OK, halting");
 	super::halt_loop()
 }
 

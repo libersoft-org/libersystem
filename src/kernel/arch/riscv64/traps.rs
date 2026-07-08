@@ -169,6 +169,10 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 			super::apic::on_timer_tick();
 			let from_user = unsafe { *frame.add(FRAME_SSTATUS) } & SSTATUS_SPP == 0;
 			crate::sched::on_timer_preempt(from_user);
+		} else if code == 1 {
+			// S-mode software interrupt: a cross-hart wake IPI. Clear the pending bit
+			// (SIP.SSIP); the hart is now awake and will re-check the run queue.
+			unsafe { core::arch::asm!("csrci sip, 2", options(nostack, preserves_flags)) };
 		}
 		return;
 	}

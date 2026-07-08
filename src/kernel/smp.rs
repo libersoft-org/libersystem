@@ -74,9 +74,9 @@ pub fn online_count() -> usize {
 }
 
 // Count this core in the portable online tally. The x86 APs do this in ap_entry;
-// aarch64 secondaries come up through the PSCI path (arch::aarch64::psci) and call
-// this once their per-CPU state is initialized.
-#[cfg(target_arch = "aarch64")]
+// aarch64 (PSCI) and riscv64 (SBI HSM) secondaries come up through their arch bring-up
+// path and call this once their per-CPU state is initialized.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn mark_online() {
 	ONLINE.fetch_add(1, Ordering::Release);
 }
@@ -91,6 +91,18 @@ pub fn lapic_id(cpu: usize) -> u32 {
 		return 0;
 	}
 	unsafe { (*base.add(cpu)).load(Ordering::Relaxed) }
+}
+
+// Record the real interrupt-controller id (hart id) of CPU `cpu`. riscv64 uses this
+// because the SBI/OpenSBI boot hart is not necessarily hart 0, so the CPU-id -> hart-id
+// map is not the identity `set_cpu_count` assumes; each hart records its own on entry so
+// the cross-hart wake IPI targets the right hart.
+#[cfg(target_arch = "riscv64")]
+pub fn set_lapic_id(cpu: usize, id: u32) {
+	let base = LAPIC_IDS.load(Ordering::Acquire);
+	if !base.is_null() && cpu < cpu_count() {
+		unsafe { (*base.add(cpu)).store(id, Ordering::Relaxed) };
+	}
 }
 
 // Wake every application processor and wait for all cores to report in. Runs on

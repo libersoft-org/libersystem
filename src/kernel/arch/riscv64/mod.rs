@@ -100,6 +100,9 @@ pub mod context;
 // ------------------------------------------------------------------ percpu
 pub mod percpu;
 
+// --------------------------------------------------------------------- smp
+pub mod smp;
+
 // -------------------------------------------------------------- interrupts
 pub mod interrupts {
 	use crate::object::interrupt::Interrupt;
@@ -175,8 +178,20 @@ pub mod apic {
 	// The timer is re-armed inside its interrupt handler, so EOI is a no-op.
 	pub fn eoi() {}
 
-	pub fn send_wake_ipi(_dest: u32) {
-		// SBI IPI for the cross-hart scheduler wake - wired with the SMP increment.
+	pub fn send_wake_ipi(dest: u32) {
+		// SBI IPI extension (EID 0x735049 "sPI", FID 0): raise a supervisor software
+		// interrupt on the target hart so it leaves wfi and re-checks the run queue.
+		unsafe {
+			core::arch::asm!(
+				"ecall",
+				in("a7") 0x735049usize,
+				in("a6") 0usize,
+				in("a0") 1usize,          // hart_mask = 1 bit, based at `dest`
+				in("a1") dest as usize,   // hart_mask_base
+				lateout("a0") _,
+				options(nostack),
+			);
+		}
 	}
 	pub fn send_init(_dest: u32) {}
 	pub fn send_startup(_dest: u32, _vector: u8) {}
@@ -192,10 +207,11 @@ pub mod apic {
 		arm_timer();
 	}
 
-	// Enable the S-mode timer interrupt (SIE.STIE, bit 5) and arm the first tick.
+	// Enable the S-mode timer interrupt (SIE.STIE, bit 5) and the software interrupt
+	// (SIE.SSIE, bit 1, for cross-hart wake IPIs), then arm the first tick.
 	pub fn init() {
 		unsafe {
-			core::arch::asm!("csrs sie, {}", in(reg) 1u64 << 5, options(nostack, preserves_flags));
+			core::arch::asm!("csrs sie, {}", in(reg) (1u64 << 5) | (1u64 << 1), options(nostack, preserves_flags));
 		}
 		arm_timer();
 	}
