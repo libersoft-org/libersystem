@@ -1500,6 +1500,71 @@ fn interrupt_bind_delivers_to_driver() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
+// The aarch64 counterpart of the x86 interrupt tests above: x86 delivers device IRQs
+// through the IDT + legacy INTx vectors (bindable, `int 0x2c`), which aarch64 has no
+// equivalent for - every aarch64 device interrupt is MSI-X delivered through the
+// GICv2m frame (a device writes its SPI to MSI_SETSPI_NS, the GIC pends that SPI, and
+// gic::handle_irq dispatches it). These test that GICv2m MSI path directly.
+#[cfg(target_arch = "aarch64")]
+#[test_case]
+fn gicv2m_msi_binds_and_dispatch_signals_the_driver() {
+	use mem::frame;
+	use object::interrupt::Interrupt;
+	// A frame stands in for a device's MSI-X table: acquire_msi programs entry 0 into it
+	// (message address = the GICv2m frame's MSI_SETSPI_NS, message data = the SPI).
+	let table = frame::allocate().expect("a frame for the fake MSI-X table");
+	// Acquire a per-device MSI vector (a GICv2m SPI). `dest` (the x86 LAPIC target) is
+	// unused on aarch64; `owner` is a fake discovered-device index.
+	let vector = arch::interrupts::acquire_msi(table, 0, 3).expect("acquire_msi hands out a free SPI");
+	// Bind a driver Interrupt to the vector; a second live bind is refused.
+	let intr = Interrupt::new(vector);
+	assert!(arch::interrupts::bind_msi(vector, &intr), "the first bind succeeds");
+	assert!(arch::interrupts::is_bound(vector), "the vector reads as bound");
+	let intr2 = Interrupt::new(vector);
+	assert!(!arch::interrupts::bind_msi(vector, &intr2), "a second live bind is refused");
+	// Dispatching the SPI INTID - what gic::handle_irq does when the SPI fires - marks
+	// the bound Interrupt pending (its wait readiness).
+	assert!(!intr.is_pending(), "not pending before the SPI fires");
+	assert!(arch::interrupts::dispatch_msi(vector as u32), "dispatch_msi claims its own SPI");
+	assert!(intr.is_pending(), "dispatch signalled the bound Interrupt");
+	// An INTID below the frame's SPI range (the SGI / PPI space) is not an MSI vector.
+	assert!(!arch::interrupts::dispatch_msi(0), "INTID 0 is not one of the frame's MSI SPIs");
+	// Unbinding frees the slot for re-use.
+	arch::interrupts::unbind(vector);
+	assert!(!arch::interrupts::is_bound(vector), "unbind drops the binding");
+	frame::deallocate(table);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test_case]
+fn gicv2m_msi_inventory_reports_the_timer_and_msi_vectors() {
+	use mem::frame;
+	// Index 0 of the aarch64 IRQ inventory (what `lsirq` reads) is the kernel's own EL1
+	// physical-timer PPI (INTID 30), always in use and reported as a fixed vector - the
+	// aarch64 analogue of x86's fixed timer entry.
+	let timer = arch::interrupts::irq_info(0).expect("the inventory has a timer entry");
+	assert_eq!(timer.kind, abi::IRQ_KIND_FIXED, "index 0 is the fixed timer PPI");
+	assert_eq!(timer.vector, 30, "the aarch64 timer is the EL1 physical-timer PPI (INTID 30)");
+	assert_eq!(timer.bound, 1, "the timer is always the kernel's own");
+	// After the timer, each entry is a GICv2m MSI SPI. Acquiring one for a fake device
+	// makes it appear in the inventory as an MSI vector owned by that device index.
+	let table = frame::allocate().expect("a frame for the fake MSI-X table");
+	let vector = arch::interrupts::acquire_msi(table, 0, 9).expect("acquire an MSI SPI");
+	let mut seen = false;
+	for i in 1..arch::interrupts::irq_info_len() {
+		if let Some(info) = arch::interrupts::irq_info(i)
+			&& info.vector == vector as u32
+		{
+			assert_eq!(info.kind, abi::IRQ_KIND_MSI, "an acquired vector reports as MSI");
+			assert_eq!(info.device, 9, "the inventory records the owning device index");
+			seen = true;
+		}
+	}
+	assert!(seen, "the acquired MSI vector appears in the inventory");
+	arch::interrupts::unbind(vector);
+	frame::deallocate(table);
+}
+
 #[test_case]
 fn object_property_set_names_an_object() {
 	use core::sync::atomic::{AtomicBool, Ordering};
@@ -4121,6 +4186,34 @@ fn writable_pages_are_not_executable() {
 	let addr = NX_ADDR.load(Ordering::SeqCst);
 	assert!((USER_STACK_VA..USER_STACK_VA + mem::frame::PAGE_SIZE).contains(&addr), "the fault is inside the stack page");
 	assert!(NX_CODE.load(Ordering::SeqCst) & 0x10 != 0, "the fault is an instruction fetch");
+	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
+}
+
+// The aarch64 counterpart: aarch64 has no x86 page-fault error code (the NX bit + the
+// `& 0x10` fetch bit above are x86-specific). It encodes W^X with the UXN descriptor
+// bit and reports the fault in ESR_EL1, so the same NX probe is checked through the
+// aarch64 exception class instead.
+#[cfg(target_arch = "aarch64")]
+#[test_case]
+fn writable_pages_are_not_executable() {
+	use core::sync::atomic::Ordering;
+	use object::domain::Domain;
+	// W^X on aarch64 (UXN): `map_page` sets UXN on a WRITABLE page, so a ring-3 thread
+	// jumping into its own writable stack page takes an EL0 instruction abort on the
+	// FETCH (before a stack byte runs); the kernel kills only that process and records
+	// the stack address it tried to run and the faulting ESR.
+	let domain = Domain::new(1 << 20, 8, 4);
+	sched::spawn_in(domain.clone(), user_nx_thread_body, 0).expect("spawn nx probe thread");
+	sched::run_until_idle();
+	assert_eq!(NX_GOT.load(Ordering::SeqCst), 1, "fault info should be recorded");
+	assert_eq!(NX_KIND.load(Ordering::SeqCst), fault::FAULT_PAGE);
+	let addr = NX_ADDR.load(Ordering::SeqCst);
+	assert!((USER_STACK_VA..USER_STACK_VA + mem::frame::PAGE_SIZE).contains(&addr), "the fault is inside the stack page");
+	// The aarch64-specific angle: the recorded error_code is ESR_EL1, whose exception
+	// class (bits 31:26) is 0x20 - an Instruction Abort from a lower EL (EL0), i.e. the
+	// fault was an instruction fetch blocked by UXN, not a data access (which is 0x24).
+	let ec = (NX_CODE.load(Ordering::SeqCst) >> 26) & 0x3f;
+	assert_eq!(ec, 0x20, "the W^X fault is an EL0 instruction abort (UXN), not a data abort");
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
