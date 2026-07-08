@@ -14,7 +14,7 @@
 
 **LiberSystem** is a modern operating system written from scratch in Rust. It is built around a small, memory-safe microkernel and a typed object / capability model - every resource has a clear type and is reached through an explicit, unforgeable capability that carries its own rights.
 
-The kernel is a small, safe arbiter; system services and drivers run as isolated, restartable components that talk to each other over stable, typed contracts. Security is capability-based and least-privilege by construction, the system is SMP-aware from the ground up, and memory safety comes from the Rust language itself rather than from discipline.
+The kernel is a small, safe arbiter; system services and drivers run as isolated, restartable components that talk to each other over stable, typed contracts. Security is capability-based and least-privilege by construction, the system is SMP-aware from the ground up, and memory safety comes from the Rust language itself rather than from discipline. One portable kernel runs on multiple architectures - **`x86_64`**, **`aarch64` (ARM64)** and **`riscv64`** - each booting through the system's own UEFI loader.
 
 This is an early-stage project under active development. It is not yet a general-purpose OS release.
 

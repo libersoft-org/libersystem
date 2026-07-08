@@ -63,9 +63,22 @@ gen:
 	cd {{tools_dir}} && cargo run --quiet -- --rust-dir ../../{{proto_dir}}/src --docs-dir ../../../docs/gen ../../idl/*.lsidl
 	cd {{proto_dir}} && cargo fmt
 
-# build + boot in QEMU (serial on stdout). Add live displays as arguments
-# (combinable): `just run`, `just run vnc`, `just run spice`, `just run vnc spice`
-run *displays: sdk user
+# build + boot the host's NATIVE architecture in QEMU: an x86_64 host runs the x86_64
+# build (KVM when available), an aarch64 host runs the ARM64 build. To force a specific
+# architecture - emulated when it is not the host's - use the explicit recipes below
+# (`just run-x86_64`, `just run-aarch64`, `just run-aarch64-uefi`).
+run *displays:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	case "$(uname -m)" in
+	x86_64) just run-x86_64 {{displays}} ;;
+	aarch64 | arm64) just run-aarch64 ;;
+	*) echo "just run: unsupported host architecture '$(uname -m)' - use run-x86_64 / run-aarch64" >&2 && exit 1 ;;
+	esac
+
+# build + boot the x86_64 build in QEMU (native with KVM on an x86_64 host, emulated
+# elsewhere). Add live displays as arguments (combinable): `just run-x86_64 vnc spice`.
+run-x86_64 *displays: sdk user
 	cd {{kernel_dir}} && DISPLAYS="{{displays}}" cargo run
 
 # build + boot, QEMU waits for GDB (port :1234)
@@ -88,6 +101,14 @@ test-aarch64: sdk user-aarch64
 # build the own UEFI loader for aarch64 (staged into the boot image as BOOTAA64.EFI)
 loader-aarch64:
 	cd {{loader_dir}} && cargo build --target aarch64-unknown-uefi
+
+# build + boot the ARM64 build in QEMU (native on an aarch64 host, emulated on an x86
+# host), reaching the interactive shell over the serial console. Uses QEMU's direct
+# -kernel load - the quick path; `run-aarch64-uefi` boots the same system through the
+# own UEFI loader.
+run-aarch64: sdk user-aarch64
+	cd {{kernel_dir}} && cargo build --target aarch64-unknown-none
+	SERIAL=stdio bash boot/qemu-aarch64.sh {{kernel_dir}}/target/aarch64-unknown-none/debug/kernel
 
 # build + boot the full aarch64 system through the own UEFI loader under the AAVMF
 # firmware (instead of QEMU's direct -kernel load), reaching the interactive shell.
