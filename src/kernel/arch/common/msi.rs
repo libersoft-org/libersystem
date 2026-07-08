@@ -47,15 +47,6 @@ impl<const N: usize> MsiRegistry<N> {
 		Self { bound: [const { SpinLock::new(None) }; N], used: [const { AtomicBool::new(false) }; N], owner: [const { AtomicU32::new(u32::MAX) }; N] }
 	}
 
-	// The number of slots.
-	pub const fn len(&self) -> usize {
-		N
-	}
-
-	pub const fn is_empty(&self) -> bool {
-		N == 0
-	}
-
 	// Reserve a free slot for device `owner`, searching the first `limit` slots
 	// (capped at `N`), returning its index (None if every candidate slot is taken).
 	// `limit` lets a backend expose fewer live vectors than the table holds (a GICv2m

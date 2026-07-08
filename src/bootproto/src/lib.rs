@@ -14,6 +14,10 @@
 
 #![no_std]
 
+// The shared read-only ELF64 reader, used by both the loader (to load the kernel)
+// and the kernel (to load userspace programs).
+pub mod elf;
+
 // Identifies a valid `BootInfo`. The loader writes it; the kernel checks it.
 // Spells "LBSPROT2" (LiberSystem boot protocol, revision 2 - the UEFI loader).
 pub const MAGIC: u64 = 0x4c42_5350_524f_5432;
