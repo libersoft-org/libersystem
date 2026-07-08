@@ -755,6 +755,11 @@ fn run_system_manager() {
 				super::idle_halt();
 			}
 			crate::serial_println!("aarch64: system - userspace boot chain settled");
+			// Hand control to the interactive shell over the serial console: the shell
+			// registered a console channel during bring-up, and this pumps polled PL011
+			// keystrokes to it (running the cooperative schedule after each) until the
+			// user types `exit`. The same portable driver the x86 kernel hands off to.
+			crate::console_shell_loop();
 		}
 		Err(reason) => {
 			crate::serial_println!("aarch64: system - SystemManager failed to start: {reason}");

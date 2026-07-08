@@ -217,7 +217,7 @@ fn serial_console_pump() {
 // each so the shell (and any service it calls) makes progress. Returns when the
 // shell exits (the user typed `exit`) or never attached.
 #[cfg(not(test))]
-fn console_shell_loop() {
+pub(crate) fn console_shell_loop() {
 	if !console_input::shell_listening() {
 		serial_println!("shell: no interactive shell attached");
 		return;
