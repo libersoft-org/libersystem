@@ -14,12 +14,10 @@ use core::arch::asm;
 
 use crate::mem::frame;
 
-// Page-table entry flags.
-pub const PRESENT: u64 = 1 << 0;
-pub const WRITABLE: u64 = 1 << 1;
-pub const USER: u64 = 1 << 2;
-pub const NO_CACHE: u64 = 1 << 4; // PCD: disable caching (for MMIO)
-pub const NO_EXECUTE: u64 = 1 << 63; // NX: data pages are never fetched from (needs EFER.NXE)
+// Page-table entry flags: the portable permission set (the x86-64 PTE bit positions,
+// used here as hardware bits verbatim). NO_CACHE is PCD (disable caching, for MMIO);
+// NO_EXECUTE is NX (needs EFER.NXE).
+pub use crate::arch::common::paging::{NO_CACHE, NO_EXECUTE, PRESENT, USER, WRITABLE};
 
 // Physical address bits within a page-table entry (bits 12..=51).
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;

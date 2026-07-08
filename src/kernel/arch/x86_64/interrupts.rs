@@ -10,12 +10,13 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::sync::{Arc, Weak};
 
 use super::apic;
 use super::idt::{self, InterruptStackFrame};
+use crate::arch::common::msi::MsiRegistry;
 use crate::object::interrupt::Interrupt;
 use crate::sync::SpinLock;
 
@@ -52,18 +53,9 @@ static HANDLERS: [AtomicUsize; IRQ_COUNT] = [const { AtomicUsize::new(0) }; IRQ_
 // the binding and the kernel stops delivering to a gone driver.
 static BOUND: [SpinLock<Option<Weak<Interrupt>>>; IRQ_COUNT] = [const { SpinLock::new(None) }; IRQ_COUNT];
 
-// MSI-X driver bindings (the MSI sibling of BOUND): the Interrupt to wake when each
-// MSI vector fires, held weakly so a gone driver clears its own binding.
-static MSI_BOUND: [SpinLock<Option<Weak<Interrupt>>>; MSI_COUNT] = [const { SpinLock::new(None) }; MSI_COUNT];
-
-// Reservation flag per MSI slot, set when acquire_msi hands the vector out and
-// cleared on unbind so the slot can be re-used.
-static MSI_USED: [AtomicBool; MSI_COUNT] = [const { AtomicBool::new(false) }; MSI_COUNT];
-
-// The discovered-device index each MSI slot was acquired for (u32::MAX = none),
-// retained so the vector-to-device mapping stays inspectable - SYS_IRQ_INFO reads
-// it for `lsirq`.
-static MSI_OWNER: [AtomicU32; MSI_COUNT] = [const { AtomicU32::new(u32::MAX) }; MSI_COUNT];
+// MSI-X driver bindings (reserve / bind / dispatch / free bookkeeping, shared with
+// aarch64 via arch::common::msi): slot index i maps to vector MSI_BASE + i.
+static REGISTRY: MsiRegistry<MSI_COUNT> = MsiRegistry::new();
 
 // Kernel virtual base for mapping device MSI-X tables (uncacheable), clear of the
 // LAPIC (0xffff_f100) / IOAPIC (0xffff_f200) MMIO windows. One page per MSI slot; the
@@ -101,10 +93,7 @@ pub fn unbind(vector: u8) {
 	if is_msi(vector) {
 		// MSI is edge-triggered and unshared: just drop the binding and free the slot
 		// (there is no source to mask). A gone driver's device simply stops being drained.
-		let index = (vector - MSI_BASE) as usize;
-		*MSI_BOUND[index].lock() = None;
-		MSI_OWNER[index].store(u32::MAX, Ordering::Release);
-		MSI_USED[index].store(false, Ordering::Release);
+		REGISTRY.free((vector - MSI_BASE) as usize);
 		return;
 	}
 	let index = vector.wrapping_sub(IRQ_BASE) as usize;
@@ -120,16 +109,10 @@ pub fn unbind(vector: u8) {
 // Interrupt to the returned vector with bind_msi. `owner` is the discovered-device
 // index the vector is acquired for, retained for the `lsirq` inventory.
 pub fn acquire_msi(table_phys: u64, dest: u8, owner: u32) -> Option<u8> {
-	for index in 0..MSI_COUNT {
-		if MSI_USED[index].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-			continue;
-		}
-		MSI_OWNER[index].store(owner, Ordering::Release);
-		let vector = MSI_BASE + index as u8;
-		program_msix_entry(index, table_phys, vector, dest);
-		return Some(vector);
-	}
-	None
+	let slot = REGISTRY.acquire(owner, MSI_COUNT)?;
+	let vector = MSI_BASE + slot as u8;
+	program_msix_entry(slot, table_phys, vector, dest);
+	Some(vector)
 }
 
 // The state of the device-interrupt vector at `index` over both windows: the fixed
@@ -150,7 +133,7 @@ pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 		return None;
 	}
 	let vector = MSI_BASE + slot as u8;
-	Some(abi::IrqInfo { vector: vector as u32, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector) as u32, device: MSI_OWNER[slot].load(Ordering::Acquire) })
+	Some(abi::IrqInfo { vector: vector as u32, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector) as u32, device: REGISTRY.owner(slot) })
 }
 
 // The number of vectors irq_info reports over.
@@ -178,22 +161,14 @@ fn program_msix_entry(slot: usize, table_phys: u64, vector: u8, dest: u8) {
 // Bind `intr` to an MSI `vector` so dispatch wakes it when the vector fires (the MSI
 // sibling of bind()). Returns false if the vector is already bound to a live Interrupt.
 pub fn bind_msi(vector: u8, intr: &Arc<Interrupt>) -> bool {
-	let index = (vector - MSI_BASE) as usize;
-	let mut slot = MSI_BOUND[index].lock();
-	if slot.as_ref().and_then(Weak::upgrade).is_some() {
-		return false;
-	}
-	*slot = Some(Arc::downgrade(intr));
-	intr.mark_bound();
-	true
+	REGISTRY.bind((vector - MSI_BASE) as usize, intr)
 }
 
 // Whether `vector` currently has a live driver binding. Used to confirm that a
 // crashed driver's IRQ was detached during cleanup.
 pub fn is_bound(vector: u8) -> bool {
 	if is_msi(vector) {
-		let index = (vector - MSI_BASE) as usize;
-		return MSI_BOUND[index].lock().as_ref().and_then(Weak::upgrade).is_some();
+		return REGISTRY.is_bound((vector - MSI_BASE) as usize);
 	}
 	let index = vector.wrapping_sub(IRQ_BASE) as usize;
 	if index >= IRQ_COUNT {
@@ -231,10 +206,7 @@ fn dispatch(vector: u8) {
 // mask/unmask dance (there is no shared level line to gate, unlike the INTx path).
 fn dispatch_msi(vector: u8) {
 	super::paging::clac_on_entry();
-	let index = (vector - MSI_BASE) as usize;
-	if let Some(intr) = MSI_BOUND[index].lock().as_ref().and_then(Weak::upgrade) {
-		intr.signal();
-	}
+	REGISTRY.dispatch((vector - MSI_BASE) as usize);
 	apic::eoi();
 }
 

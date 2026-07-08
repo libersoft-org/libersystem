@@ -29,11 +29,7 @@ pub fn phys_to_virt(pa: u64) -> u64 {
 // Portable page-table permission bits (the flag set the portable callers OR
 // together). The real per-PTE VMSAv8 encoding is applied by `map_page`; these
 // keep the contract's constant names meaningful.
-pub const PRESENT: u64 = 1 << 0;
-pub const WRITABLE: u64 = 1 << 1;
-pub const USER: u64 = 1 << 2;
-pub const NO_CACHE: u64 = 1 << 4;
-pub const NO_EXECUTE: u64 = 1 << 63;
+pub use crate::arch::common::paging::{NO_CACHE, NO_EXECUTE, PRESENT, USER, WRITABLE};
 
 // Descriptor bits (VMSAv8-64, stage 1).
 const VALID: u64 = 1 << 0; // entry is valid

@@ -90,13 +90,9 @@ pub fn exit_qemu(_success: bool) -> ! {
 
 // ------------------------------------------------------------------ paging
 pub mod paging {
-	// Placeholder page-table permission bits (mirrors the x86 flag set the
-	// portable callers OR together; the real Sv39 PTE encoding lands in M117).
-	pub const PRESENT: u64 = 1 << 0;
-	pub const WRITABLE: u64 = 1 << 1;
-	pub const USER: u64 = 1 << 2;
-	pub const NO_CACHE: u64 = 1 << 4;
-	pub const NO_EXECUTE: u64 = 1 << 63;
+	// The portable page-table permission bits (the flag set the portable callers OR
+	// together); the real Sv39 PTE encoding lands in M117.
+	pub use crate::arch::common::paging::{NO_CACHE, NO_EXECUTE, PRESENT, USER, WRITABLE};
 
 	pub fn enable_nx() {}
 	pub fn enable_smap_smep() {}

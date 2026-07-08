@@ -9,5 +9,11 @@
 // `pci`: PCI / PCIe enumeration - only the config-space access mechanism is
 // arch-specific (x86 I/O ports vs ECAM MMIO); the device tables, capability walk,
 // BAR decoding and MSI-X resolution are shared.
+// `paging`: the portable page-table permission flags the `arch::paging` contract
+// exposes (each backend maps them onto its real hardware encoding).
+// `msi`: the per-device MSI-X slot registry (bind / acquire / dispatch bookkeeping),
+// shared by every interrupt-controller backend.
 
+pub mod msi;
+pub mod paging;
 pub mod pci;

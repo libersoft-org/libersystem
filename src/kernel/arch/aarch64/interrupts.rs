@@ -18,12 +18,12 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 
+use crate::arch::common::msi::MsiRegistry;
 use crate::object::interrupt::Interrupt;
-use crate::sync::SpinLock;
 
 // The device-IRQ vector window base (mirrors the contract; only the MSI window is
 // live on aarch64).
@@ -47,17 +47,10 @@ static MSI_LEN: AtomicUsize = AtomicUsize::new(0);
 // keep the bindings off the heap and safe to touch from the interrupt path.
 const MAX_MSI: usize = 64;
 
-// MSI-X driver bindings: the Interrupt to wake when each MSI slot's SPI fires, held
-// weakly so a gone driver clears its own binding on Drop.
-static MSI_BOUND: [SpinLock<Option<Weak<Interrupt>>>; MAX_MSI] = [const { SpinLock::new(None) }; MAX_MSI];
-
-// Reservation flag per MSI slot, set when acquire_msi hands the vector out and cleared
-// on unbind so the slot can be re-used.
-static MSI_USED: [AtomicBool; MAX_MSI] = [const { AtomicBool::new(false) }; MAX_MSI];
-
-// The discovered-device index each MSI slot was acquired for (u32::MAX = none),
-// retained so the vector-to-device mapping stays inspectable for the `lsirq` inventory.
-static MSI_OWNER: [AtomicU32; MAX_MSI] = [const { AtomicU32::new(u32::MAX) }; MAX_MSI];
+// The per-device MSI-X slot bindings (reserve / bind / dispatch / free bookkeeping,
+// shared with x86 via arch::common::msi). Slot index i maps to SPI INTID
+// BASE_SPI + i; only the first MSI_LEN slots (the frame's real SPI range) are used.
+static REGISTRY: MsiRegistry<MAX_MSI> = MsiRegistry::new();
 
 // The slot index of an SPI INTID, or None if it is outside the frame's MSI range.
 fn spi_slot(intid: u32) -> Option<usize> {
@@ -86,9 +79,7 @@ pub fn bind(_vector: u8, _intr: &Arc<Interrupt>) -> bool {
 // there is no level source to mask.
 pub fn unbind(vector: u8) {
 	if let Some(slot) = spi_slot(vector as u32) {
-		*MSI_BOUND[slot].lock() = None;
-		MSI_OWNER[slot].store(u32::MAX, Ordering::Release);
-		MSI_USED[slot].store(false, Ordering::Release);
+		REGISTRY.free(slot);
 	}
 }
 
@@ -102,19 +93,12 @@ pub fn unbind(vector: u8) {
 // GICv2m MSIs route through the distributor, which enable_msi_spi points at the boot
 // core.
 pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
-	let base = BASE_SPI.load(Ordering::Relaxed);
 	let len = MSI_LEN.load(Ordering::Relaxed);
-	for slot in 0..len {
-		if MSI_USED[slot].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-			continue;
-		}
-		MSI_OWNER[slot].store(owner, Ordering::Release);
-		let spi = base + slot as u32;
-		program_msix_entry(table_phys, spi);
-		super::gic::enable_msi_spi(spi);
-		return Some(spi as u8);
-	}
-	None
+	let slot = REGISTRY.acquire(owner, len)?;
+	let spi = BASE_SPI.load(Ordering::Relaxed) + slot as u32;
+	program_msix_entry(table_phys, spi);
+	super::gic::enable_msi_spi(spi);
+	Some(spi as u8)
 }
 
 // Write a device's MSI-X table entry 0 (reached through the physical direct map): the
@@ -136,24 +120,17 @@ fn program_msix_entry(table_phys: u64, spi: u32) {
 // Bind `intr` to an MSI `vector` (an SPI INTID) so dispatch wakes it when the SPI
 // fires. Returns false if the vector is already bound to a live Interrupt.
 pub fn bind_msi(vector: u8, intr: &Arc<Interrupt>) -> bool {
-	let slot = match spi_slot(vector as u32) {
-		Some(s) => s,
-		None => return false,
-	};
-	let mut bound = MSI_BOUND[slot].lock();
-	if bound.as_ref().and_then(Weak::upgrade).is_some() {
-		return false;
+	match spi_slot(vector as u32) {
+		Some(slot) => REGISTRY.bind(slot, intr),
+		None => false,
 	}
-	*bound = Some(Arc::downgrade(intr));
-	intr.mark_bound();
-	true
 }
 
 // Whether `vector` currently has a live driver binding. Used to confirm a crashed
 // driver's IRQ was detached during cleanup.
 pub fn is_bound(vector: u8) -> bool {
 	match spi_slot(vector as u32) {
-		Some(slot) => MSI_BOUND[slot].lock().as_ref().and_then(Weak::upgrade).is_some(),
+		Some(slot) => REGISTRY.is_bound(slot),
 		None => false,
 	}
 }
@@ -163,14 +140,13 @@ pub fn is_bound(vector: u8) -> bool {
 // tell it apart from the timer and other INTIDs. Edge-triggered: just wake the bound
 // driver - there is no level source to mask.
 pub fn dispatch_msi(intid: u32) -> bool {
-	let slot = match spi_slot(intid) {
-		Some(s) => s,
-		None => return false,
-	};
-	if let Some(intr) = MSI_BOUND[slot].lock().as_ref().and_then(Weak::upgrade) {
-		intr.signal();
+	match spi_slot(intid) {
+		Some(slot) => {
+			REGISTRY.dispatch(slot);
+			true
+		}
+		None => false,
 	}
-	true
 }
 
 // The state of the MSI vector at `index` (its slot), for the `lsirq` inventory. Index
@@ -188,7 +164,7 @@ pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 		return None;
 	}
 	let vector = BASE_SPI.load(Ordering::Relaxed) + slot as u32;
-	Some(abi::IrqInfo { vector, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector as u8) as u32, device: MSI_OWNER[slot].load(Ordering::Acquire) })
+	Some(abi::IrqInfo { vector, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector as u8) as u32, device: REGISTRY.owner(slot) })
 }
 
 // The number of vectors irq_info reports over (the timer entry plus the frame's MSI SPIs).
