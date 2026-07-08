@@ -39,6 +39,10 @@
 // x86_64 is the reference implementation; aarch64 / riscv64 are compiling stubs
 // (M115) that M116 / M117 fill in.
 
+// Architecture-independent HAL helpers shared by every backend (compiled for all
+// targets): the portable PCI enumeration each arch's `pci` shim builds on.
+pub mod common;
+
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]

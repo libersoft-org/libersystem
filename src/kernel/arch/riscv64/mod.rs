@@ -368,58 +368,15 @@ pub mod usermode {
 
 // --------------------------------------------------------------------- pci
 // PCI config space is a bus standard; only the config-space ACCESS mechanism is
-// arch-specific (x86 ports vs riscv64 ECAM MMIO). The device types + scan logic
-// become portable in M117; for now the scans return empty so the tree links.
+// arch-specific (x86 ports vs riscv64 ECAM MMIO). The device types + scan logic are
+// portable (`arch::common::pci`); M117 adds the riscv64 `ConfigAccess` backend, at
+// which point these scans call `common::scan*::<Access>()` like the other arches. For
+// now they return empty so the tree links, reusing the shared types.
 pub mod pci {
 	use alloc::vec::Vec;
 
-	#[derive(Clone, Copy)]
-	pub struct PciDevice {
-		pub bus: u8,
-		pub dev: u8,
-		pub func: u8,
-		pub vendor: u16,
-		pub device_id: u16,
-		pub class: u8,
-		pub subclass: u8,
-		pub prog_if: u8,
-		pub header_type: u8,
-		pub bars: [u32; 6],
-	}
-
-	#[derive(Clone, Copy, Default)]
-	pub struct VirtioCap {
-		pub bar: u8,
-		pub offset: u32,
-		pub length: u32,
-		pub notify_multiplier: u32,
-	}
-
-	#[derive(Clone, Copy)]
-	pub struct VirtioDevice {
-		pub pci: PciDevice,
-		pub virtio_type: u16,
-		pub bar: u8,
-		pub bar_phys: u64,
-		pub region_len: u64,
-		pub common: VirtioCap,
-		pub notify: VirtioCap,
-		pub isr: VirtioCap,
-		pub device: VirtioCap,
-		pub msix_cap: u16,
-		pub msix_count: u16,
-		pub msix_table_phys: u64,
-	}
-
-	#[derive(Clone, Copy)]
-	pub struct XhciDevice {
-		pub pci: PciDevice,
-		pub bar_phys: u64,
-		pub bar_len: u64,
-		pub msix_cap: u16,
-		pub msix_count: u16,
-		pub msix_table_phys: u64,
-	}
+	#[allow(unused_imports)]
+	pub use crate::arch::common::pci::{PciDevice, VirtioCap, VirtioDevice, XhciDevice, virtio_type_name};
 
 	pub fn scan() -> Vec<PciDevice> {
 		Vec::new()
