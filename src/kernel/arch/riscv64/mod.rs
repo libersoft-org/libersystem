@@ -103,6 +103,9 @@ pub mod percpu;
 // --------------------------------------------------------------------- smp
 pub mod smp;
 
+// -------------------------------------------------------------------- plic
+pub mod plic;
+
 // -------------------------------------------------------------- interrupts
 pub mod interrupts {
 	use crate::object::interrupt::Interrupt;
@@ -207,11 +210,12 @@ pub mod apic {
 		arm_timer();
 	}
 
-	// Enable the S-mode timer interrupt (SIE.STIE, bit 5) and the software interrupt
-	// (SIE.SSIE, bit 1, for cross-hart wake IPIs), then arm the first tick.
+	// Enable the S-mode timer interrupt (SIE.STIE, bit 5), the software interrupt
+	// (SIE.SSIE, bit 1, for cross-hart wake IPIs), and the external interrupt (SIE.SEIE,
+	// bit 9, for PLIC-routed device interrupts), then arm the first tick.
 	pub fn init() {
 		unsafe {
-			core::arch::asm!("csrs sie, {}", in(reg) (1u64 << 5) | (1u64 << 1), options(nostack, preserves_flags));
+			core::arch::asm!("csrs sie, {}", in(reg) (1u64 << 5) | (1u64 << 1) | (1u64 << 9), options(nostack, preserves_flags));
 		}
 		arm_timer();
 	}
@@ -324,24 +328,6 @@ pub mod usermode;
 // --------------------------------------------------------------------- pci
 // PCI config space is a bus standard; only the config-space ACCESS mechanism is
 // arch-specific (x86 ports vs riscv64 ECAM MMIO). The device types + scan logic are
-// portable (`arch::common::pci`); M117 adds the riscv64 `ConfigAccess` backend, at
-// which point these scans call `common::scan*::<Access>()` like the other arches. For
-// now they return empty so the tree links, reusing the shared types.
-pub mod pci {
-	use alloc::vec::Vec;
-
-	#[allow(unused_imports)]
-	pub use crate::arch::common::pci::{PciDevice, VirtioCap, VirtioDevice, XhciDevice, virtio_type_name};
-
-	pub fn scan() -> Vec<PciDevice> {
-		Vec::new()
-	}
-	pub fn scan_virtio() -> Vec<VirtioDevice> {
-		Vec::new()
-	}
-	pub fn scan_xhci() -> Vec<XhciDevice> {
-		Vec::new()
-	}
-	pub fn set_intx_disabled(_bus: u8, _dev: u8, _func: u8, _disabled: bool) {}
-	pub fn msix_enable(_bus: u8, _dev: u8, _func: u8, _cap: u16) {}
-}
+// portable (`arch::common::pci`); the riscv64 ECAM `ConfigAccess` backend lives in
+// `pci.rs`.
+pub mod pci;

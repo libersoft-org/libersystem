@@ -23,6 +23,8 @@ pub struct BootInfo {
 	pub cpu_count: u32,
 	// PCIe ECAM config-space base (0 if the tree has no pcie node).
 	pub pcie_ecam: u64,
+	// PLIC (RISC-V platform interrupt controller) base (0 if none / not RISC-V).
+	pub plic_base: u64,
 }
 
 // FDT token + header constants.
@@ -129,13 +131,17 @@ impl Fdt {
 			let mut depth: i32 = -1;
 			let mut d1_memory = false; // inside a depth-1 "memory" node
 			let mut d1_cpus = false; //   inside the depth-1 "cpus" node
-			let mut d1_pcie = false; //   inside a depth-1 "pcie"/"pci" node
+			// The pcie/pci and plic nodes sit at the root on aarch64 virt but under /soc
+			// (depth 2) on riscv64 virt, so track them by the depth at which we entered.
+			let mut in_pcie: i32 = -1;
+			let mut in_plic: i32 = -1;
 			let mut addr_cells: u32 = 2;
 			let mut size_cells: u32 = 2;
 			let mut ram_base: u64 = 0;
 			let mut ram_size: u64 = 0;
 			let mut cpu_count: u32 = 0;
 			let mut pcie_ecam: u64 = 0;
+			let mut plic_base: u64 = 0;
 
 			loop {
 				let token = self.be32(p);
@@ -148,16 +154,26 @@ impl Fdt {
 						if depth == 1 {
 							d1_memory = self.str_starts(name, "memory");
 							d1_cpus = self.str_eq(name, "cpus");
-							d1_pcie = self.str_starts(name, "pcie") || self.str_starts(name, "pci@");
 						} else if depth == 2 && d1_cpus && self.str_starts(name, "cpu@") {
 							cpu_count += 1;
+						}
+						if in_pcie < 0 && (self.str_starts(name, "pcie") || self.str_starts(name, "pci@")) {
+							in_pcie = depth;
+						}
+						if in_plic < 0 && self.str_starts(name, "plic") {
+							in_plic = depth;
 						}
 					}
 					FDT_END_NODE => {
 						if depth == 1 {
 							d1_memory = false;
 							d1_cpus = false;
-							d1_pcie = false;
+						}
+						if depth == in_pcie {
+							in_pcie = -1;
+						}
+						if depth == in_plic {
+							in_plic = -1;
 						}
 						depth -= 1;
 					}
@@ -186,10 +202,14 @@ impl Fdt {
 								}
 								ram_size += s;
 							}
-						} else if depth == 1 && d1_pcie && self.str_eq(pname, "reg") {
+						} else if in_pcie == depth && self.str_eq(pname, "reg") {
 							// The pcie node's reg is <ecam_base ecam_size> in root cells.
 							let mut q = val;
 							pcie_ecam = self.read_cells(&mut q, addr_cells);
+						} else if in_plic == depth && self.str_eq(pname, "reg") {
+							// The plic node's reg is <plic_base plic_size> in root cells.
+							let mut q = val;
+							plic_base = self.read_cells(&mut q, addr_cells);
 						}
 					}
 					FDT_NOP => {}
@@ -201,7 +221,7 @@ impl Fdt {
 			if ram_size == 0 {
 				return None;
 			}
-			Some(BootInfo { ram_base, ram_size, cpu_count: cpu_count.max(1), pcie_ecam })
+			Some(BootInfo { ram_base, ram_size, cpu_count: cpu_count.max(1), pcie_ecam, plic_base })
 		}
 	}
 }

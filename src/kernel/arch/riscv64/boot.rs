@@ -140,17 +140,22 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	// Increment 4: parse the device tree (the shared FDT parser), seed the portable
 	// frame allocator, and bring up the kernel heap in the higher half.
 	use super::paging;
-	let (ram_top, cpu_count) = match super::dtb::parse(dtb) {
+	let (ram_top, cpu_count, pcie_ecam, plic_base) = match super::dtb::parse(dtb) {
 		Some(bi) => {
-			crate::serial_println!("riscv64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s), ECAM {:#x}", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count, bi.pcie_ecam);
-			(bi.ram_base + bi.ram_size, bi.cpu_count)
+			crate::serial_println!("riscv64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s), ECAM {:#x}, PLIC {:#x}", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count, bi.pcie_ecam, bi.plic_base);
+			(bi.ram_base + bi.ram_size, bi.cpu_count, bi.pcie_ecam, bi.plic_base)
 		}
 		None => {
 			crate::serial_println!("riscv64: no DTB found - using built-in defaults");
-			(0, 1)
+			(0, 1, 0, 0)
 		}
 	};
 	let cpu_count = cpu_count.max(1);
+
+	// Record the device-tree MMIO bases for the interrupt controller and PCIe config
+	// space (both under 8 GiB, so the boot direct map already reaches them).
+	super::plic::set_base(plic_base);
+	super::pci::set_ecam_base(pcie_ecam);
 
 	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
 	let (region_base, region_len) = paging::usable_region(ram_top);
@@ -188,6 +193,9 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	// Per-CPU block for the boot hart, reachable through `tp`.
 	super::percpu::allocate(cpu_count as usize);
 	super::percpu::init(0, hartid as u32);
+	// Bring up the PLIC on the boot hart (mask all sources, open this hart's S-mode
+	// threshold) so PLIC-routed device interrupts can be enabled per source.
+	super::plic::init(hartid);
 	// Size the per-CPU id tables and record the boot hart's real id (the SBI boot hart
 	// is not necessarily hart 0), so the cross-hart wake IPI targets the right hart.
 	crate::smp::set_cpu_count(cpu_count as usize);
@@ -241,8 +249,28 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	super::syscall::init();
 	run_user_processes();
 
-	crate::serial_println!("riscv64: M117 increment 7 (SMP via SBI HSM + wake IPI) - OK, halting");
+	// Increment 8: enumerate the PCIe ECAM bus (the shared arch::common::pci over the
+	// riscv64 ECAM ConfigAccess) and resolve any virtio devices' modern MMIO layout.
+	run_pci_scan();
+
+	crate::serial_println!("riscv64: M117 increment 8 (ECAM PCI + PLIC + DTB pcie fix) - OK, halting");
 	super::halt_loop()
+}
+
+// Enumerate the PCIe ECAM bus and report what is present, resolving virtio devices'
+// modern MMIO layout through the shared PCI code. On QEMU virt the pci bus is empty
+// unless devices are added (e.g. `-device virtio-blk-pci`), so a device count of zero
+// just means none were attached.
+fn run_pci_scan() {
+	let devices = super::pci::scan();
+	crate::serial_println!("riscv64: PCI - {} device(s) on the ECAM bus", devices.len());
+	for d in &devices {
+		crate::serial_println!("riscv64:   {:02x}:{:02x}.{} vendor={:04x} device={:04x} class={:02x}", d.bus, d.dev, d.func, d.vendor, d.device_id, d.class);
+	}
+	let virtio = super::pci::scan_virtio();
+	for v in &virtio {
+		crate::serial_println!("riscv64:   virtio {} @ BAR{} phys={:#x} len={:#x} | common+{:#x} notify+{:#x} isr+{:#x} device+{:#x}", super::pci::virtio_type_name(v.virtio_type), v.bar, v.bar_phys, v.region_len, v.common.offset, v.notify.offset, v.isr.offset, v.device.offset);
+	}
 }
 
 // -------------------------------------------------------- increment-5 threads
