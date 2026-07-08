@@ -227,7 +227,14 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	crate::sched::run_until_idle();
 	crate::serial_println!("riscv64: preemptive scheduler - all threads exited (ticks={})", super::apic::ticks());
 
-	crate::serial_println!("riscv64: M117 increment 5 (percpu + context switch + scheduler + timer) - OK, halting");
+	// Increment 6: real userspace. Two portable Processes whose U-mode programs call
+	// the REAL kernel syscall table (SYS_DEBUG_WRITE) and interleave via SYS_YIELD.
+	// Each thread parks its U-mode resume state in its own slot, so the excursions
+	// coexist; each has its own address space, so both use the same low user VAs.
+	super::syscall::init();
+	run_user_processes();
+
+	crate::serial_println!("riscv64: M117 increment 6 (ECALL syscall + U-mode entry) - OK, halting");
 	super::halt_loop()
 }
 
@@ -277,4 +284,103 @@ extern "C" fn preempt_task(id: u64) {
 		}
 		crate::serial_println!("riscv64: [preempt] thread {id} step {i}");
 	}
+}
+
+// ---------------------------------------------------------- increment-6 users
+
+struct UserCtx {
+	entry: u64,
+	stack_top: u64,
+	arg: u64,
+}
+
+// The kernel-side entry of a user process's thread: drop to U-mode at the mapped
+// program. Returns when the program calls SYS_USER_EXIT (then the thread exits).
+extern "C" fn user_trampoline(ctx_raw: u64) {
+	let ctx = unsafe { alloc::boxed::Box::from_raw(ctx_raw as *mut UserCtx) };
+	unsafe {
+		super::usermode::enter(ctx.entry, ctx.stack_top, ctx.arg);
+	}
+}
+
+// Build a portable user Process and enqueue its U-mode thread. The program (assembled
+// below) prints `msg` via SYS_DEBUG_WRITE, yields, prints + yields again, then
+// SYS_USER_EXIT - so two such processes interleave through the scheduler, which only
+// works because each thread parks its U-mode resume state in its own slot. Each
+// process has its own address space, so both can use the same low user VAs.
+fn spawn_user_process(msg: &[u8]) {
+	use super::paging;
+	use crate::object::address_space::AddressSpace;
+	use crate::object::process::Process;
+
+	let addr_space = match AddressSpace::create() {
+		Some(a) => a,
+		None => {
+			crate::serial_println!("riscv64: userspace - no address space");
+			return;
+		}
+	};
+	let code = paging::alloc_frame().expect("riscv64: no frame for user code");
+	let stack = paging::alloc_frame().expect("riscv64: no frame for user stack");
+
+	let code_va: u64 = 0x4000_0000; // 1 GiB - a low user VA (below the kernel half)
+	let msg_va = code_va + 0x800;
+	let stack_va: u64 = 0x4001_0000;
+	let stack_top = stack_va + 0x1000;
+
+	// a0 holds the message pointer (the entry argument); keep it in s1 across the
+	// syscalls. Tiny RV64I encoders (a7 = number, a0..a1 = args).
+	let addi = |rd: u32, rs1: u32, imm: i32| -> u32 { (((imm as u32) & 0xfff) << 20) | (rs1 << 15) | (rd << 7) | 0x13 };
+	let li = |rd: u32, imm: i32| -> u32 { addi(rd, 0, imm) };
+	let mv = |rd: u32, rs: u32| -> u32 { addi(rd, rs, 0) };
+	const ECALL: u32 = 0x0000_0073;
+	const S1: u32 = 9;
+	const A0: u32 = 10;
+	const A1: u32 = 11;
+	const A7: u32 = 17;
+	let len = msg.len() as i32;
+	let prog: [u32; 16] = [
+		mv(S1, A0),  // s1 = msg ptr
+		mv(A0, S1),  // a0 = msg ptr
+		li(A1, len), // a1 = len
+		li(A7, abi::SYS_DEBUG_WRITE as i32),
+		ECALL,
+		li(A7, abi::SYS_YIELD as i32),
+		ECALL,
+		mv(A0, S1),
+		li(A1, len),
+		li(A7, abi::SYS_DEBUG_WRITE as i32),
+		ECALL,
+		li(A7, abi::SYS_YIELD as i32),
+		ECALL,
+		li(A7, abi::SYS_USER_EXIT as i32),
+		ECALL,
+		0x0000_006f, // j . (guard against running off the end)
+	];
+	unsafe {
+		let cp = paging::phys_to_virt(code) as *mut u32;
+		for (i, w) in prog.iter().enumerate() {
+			core::ptr::write_volatile(cp.add(i), *w);
+		}
+		core::ptr::copy_nonoverlapping(msg.as_ptr(), (paging::phys_to_virt(code) + 0x800) as *mut u8, msg.len());
+		core::arch::asm!("fence.i", options(nostack, preserves_flags));
+	}
+
+	addr_space.map(code_va, code, paging::PRESENT | paging::USER);
+	addr_space.map(stack_va, stack, paging::PRESENT | paging::WRITABLE | paging::USER | paging::NO_EXECUTE);
+
+	let process = Process::new(addr_space, crate::sched::root_domain());
+	process.adopt_frames(alloc::vec![code, stack]);
+	let ctx = alloc::boxed::Box::new(UserCtx { entry: code_va, stack_top, arg: msg_va });
+	crate::sched::thread_create(process, user_trampoline, alloc::boxed::Box::into_raw(ctx) as u64);
+}
+
+// Run two concurrent user processes: they interleave via SYS_YIELD, each making real
+// SYS_DEBUG_WRITE syscalls, proving per-thread U-mode excursions coexist.
+fn run_user_processes() {
+	spawn_user_process(b"userspace A: hello via SYS_DEBUG_WRITE\n");
+	spawn_user_process(b"userspace B: hello via SYS_DEBUG_WRITE\n");
+	crate::serial_println!("riscv64: userspace - running 2 U-mode processes");
+	crate::sched::run_until_idle();
+	crate::serial_println!("riscv64: userspace - both U-mode processes exited");
 }

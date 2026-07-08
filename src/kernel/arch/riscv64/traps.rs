@@ -22,10 +22,24 @@ global_asm!(
 .balign 4
 .global __trap_entry
 __trap_entry:
+	// Switch to the kernel trap stack. SSCRATCH holds the kernel trap sp while the
+	// hart runs in U-mode, and 0 while it runs in S-mode. Swap sp <-> sscratch: a
+	// non-zero result means the trap came from U-mode (sp is now the kernel stack);
+	// a zero result is a nested S-mode trap, so swap back to recover the kernel sp.
+	csrrw   sp, sscratch, sp
+	bnez    sp, 1f
+	csrrw   sp, sscratch, sp        // from S-mode: restore sp; sscratch stays 0
+1:
 	addi    sp, sp, -272
 	sd      x1,  1*8(sp)
-	addi    t0, sp, 272             // the pre-trap sp
+	// frame[2] = the pre-trap sp. From U-mode the original user sp is now in
+	// sscratch; from S-mode sscratch is 0, so the pre-trap sp is sp + 272.
+	csrr    t0, sscratch
+	bnez    t0, 2f
+	addi    t0, sp, 272
+2:
 	sd      t0,  2*8(sp)
+	csrw    sscratch, zero          // S-mode convention while the handler runs
 	sd      x3,  3*8(sp)
 	sd      x4,  4*8(sp)
 	sd      x5,  5*8(sp)
@@ -67,6 +81,14 @@ __trap_entry:
 	csrw    sepc, t0
 	ld      t1, 33*8(sp)
 	csrw    sstatus, t1
+	// If returning to U-mode (SSTATUS.SPP == 0), reload SSCRATCH with the kernel trap
+	// sp so the next U-mode trap lands here again; for S-mode it stays 0. Decide this
+	// while t1 still holds sstatus (before the temp registers are reloaded below).
+	andi    t0, t1, 0x100
+	bnez    t0, 3f
+	addi    t0, sp, 272
+	csrw    sscratch, t0
+3:
 	ld      x1,  1*8(sp)
 	ld      x3,  3*8(sp)
 	ld      x4,  4*8(sp)
@@ -168,13 +190,30 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 	let sstatus = unsafe { *frame.add(FRAME_SSTATUS) };
 	let from_user = sstatus & SSTATUS_SPP == 0;
 
-	// A U-mode fault terminates only the faulting process (the ecall syscall path +
-	// the resumable stack-growth fault + terminate_user land with the usermode
-	// increment). No U-mode exists yet, so this is currently unreachable.
+	// A U-mode trap is either a system call (ecall) or a fault that terminates only the
+	// faulting process (a store/load fault inside a stack span is demand-paged growth).
 	if from_user {
-		let _ = (EXC_ECALL_U, EXC_INSTR_PAGE_FAULT, EXC_STORE_PAGE_FAULT);
-		crate::serial_println!("riscv64: U-mode trap (usermode increment) scause={scause:#x} stval={stval:#x} sepc={sepc:#x}");
-		super::halt_loop()
+		// U-mode ecall = syscall: a7 = number, a0..a3 = args, a0 = result. Advance SEPC
+		// past the 4-byte ecall so we resume after it (irrelevant for SYS_USER_EXIT,
+		// which unwinds back to the kernel that entered U-mode).
+		if code == EXC_ECALL_U {
+			unsafe { *frame.add(FRAME_SEPC) = sepc + 4 };
+			if unsafe { super::syscall::dispatch(frame) } {
+				super::usermode::exit_to_kernel();
+			}
+			return;
+		}
+		// Demand-paged stack growth: a not-present store/load inside a thread's stack
+		// span maps a page and retries the faulting access.
+		if (code == EXC_STORE_PAGE_FAULT || code == EXC_LOAD_PAGE_FAULT) && crate::fault::grow_user_stack(stval, 0) {
+			return;
+		}
+		// Any other U-mode fault tears down just this process.
+		let kind = match code {
+			EXC_INSTR_PAGE_FAULT | EXC_LOAD_PAGE_FAULT | EXC_STORE_PAGE_FAULT => crate::fault::FAULT_PAGE,
+			_ => crate::fault::FAULT_GENERAL_PROTECTION,
+		};
+		crate::fault::terminate_user(crate::fault::FaultInfo { kind, error_code: scause, address: stval, instruction_pointer: sepc });
 	}
 
 	// An S-mode fault reaching here is a kernel bug: report it and halt.

@@ -270,43 +270,40 @@ pub mod apboot {
 
 // ----------------------------------------------------------------- syscall
 pub mod syscall {
-	pub fn init() {
-		todo!("riscv64 ECALL wiring (M117)")
+	// STVEC is already installed (traps::init), so a U-mode ecall lands in
+	// __trap_entry -> riscv64_trap -> dispatch. Nothing extra to program here.
+	pub fn init() {}
+
+	pub unsafe fn invoke(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+		// A ring-0 (kernel-context) system call: route straight to the portable syscall
+		// table, the way the in-kernel callers and the test harness use it. Mark this a
+		// kernel caller (from_user = false) so buffer checks accept kernel-owned buffers -
+		// U-mode calls arrive through the ecall trap and `dispatch`, which sets it itself.
+		super::percpu::set_from_user(false);
+		crate::syscall::syscall_dispatch(num, a0, a1, a2, a3)
 	}
-	pub unsafe fn invoke(_num: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
-		todo!("riscv64 ECALL (M117)")
+
+	// Dispatch a U-mode ecall against the saved trap frame (a7 = syscall number,
+	// a0..a3 = arguments, the result is written back into the a0 slot). Routes to the
+	// portable kernel syscall table. Returns `true` for SYS_USER_EXIT (the caller then
+	// unwinds back to the kernel thread that entered U-mode), `false` to `sret` back to
+	// the user program with the result in a0.
+	pub unsafe fn dispatch(frame: *mut u64) -> bool {
+		let num = unsafe { *frame.add(17) }; // a7
+		if num == abi::SYS_USER_EXIT {
+			return true;
+		}
+		let (a0, a1, a2, a3) = unsafe { (*frame.add(10), *frame.add(11), *frame.add(12), *frame.add(13)) };
+		super::percpu::set_from_user(true);
+		let result = crate::syscall::syscall_dispatch(num, a0, a1, a2, a3);
+		super::percpu::set_from_user(false);
+		unsafe { *frame.add(10) = result };
+		false
 	}
 }
 
 // ---------------------------------------------------------------- usermode
-pub mod usermode {
-	pub const FAULT_PROBE_ADDR: u64 = 0x0dea_d000;
-
-	pub unsafe fn enter(_entry: u64, _user_stack: u64, _arg: u64) {
-		todo!("riscv64 U-mode entry (M117)")
-	}
-	pub fn exit_to_kernel() -> ! {
-		todo!("riscv64 U-mode return (M117)")
-	}
-	pub fn program_bytes() -> &'static [u8] {
-		todo!("riscv64 test program bytes (M117)")
-	}
-	pub fn program_fault_bytes() -> &'static [u8] {
-		todo!("riscv64 test program bytes (M117)")
-	}
-	pub fn program_yield_bytes() -> &'static [u8] {
-		todo!("riscv64 test program bytes (M117)")
-	}
-	pub fn program_nx_bytes() -> &'static [u8] {
-		todo!("riscv64 test program bytes (M117)")
-	}
-	pub fn program_stack_probe_bytes() -> &'static [u8] {
-		todo!("riscv64 test program bytes (M117)")
-	}
-	pub fn program_spin_bytes() -> &'static [u8] {
-		todo!("riscv64 test program bytes (M117)")
-	}
-}
+pub mod usermode;
 
 // --------------------------------------------------------------------- pci
 // PCI config space is a bus standard; only the config-space ACCESS mechanism is
