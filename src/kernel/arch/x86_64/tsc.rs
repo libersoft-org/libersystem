@@ -56,10 +56,5 @@ pub fn hz() -> u64 {
 // Convert a TSC cycle count to nanoseconds using the calibrated frequency.
 // Returns 0 if the TSC has not been calibrated.
 pub fn cycles_to_ns(cycles: u64) -> u64 {
-	let hz = TSC_HZ.load(Ordering::Relaxed);
-	if hz == 0 {
-		return 0;
-	}
-	// ns = cycles * 1e9 / hz; the intermediate uses u128 to avoid overflow.
-	((cycles as u128 * 1_000_000_000) / hz as u128) as u64
+	crate::arch::common::time::cycles_to_ns(cycles, TSC_HZ.load(Ordering::Relaxed))
 }

@@ -18,9 +18,12 @@
 // `dtb`: the flattened-device-tree (FDT) parser shared by the device-tree-booted
 // backends (aarch64 now, riscv64 next); only phys_to_virt + the fallback scan window
 // are arch-specific.
+// `time`: the shared scheduler-tick rate (TICK_HZ) + the cycles->ns conversion each
+// backend's cycle clock reports through.
 
 pub mod context;
 pub mod dtb;
 pub mod msi;
 pub mod paging;
 pub mod pci;
+pub mod time;

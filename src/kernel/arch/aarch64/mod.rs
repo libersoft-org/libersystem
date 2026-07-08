@@ -190,8 +190,7 @@ pub mod tsc {
 		f
 	}
 	pub fn cycles_to_ns(cycles: u64) -> u64 {
-		let f = hz();
-		if f == 0 { 0 } else { (cycles as u128 * 1_000_000_000 / f as u128) as u64 }
+		crate::arch::common::time::cycles_to_ns(cycles, hz())
 	}
 }
 

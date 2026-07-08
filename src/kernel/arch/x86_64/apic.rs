@@ -35,8 +35,8 @@ const LVT_TIMER_PERIODIC: u32 = 1 << 17;
 const LVT_MASKED: u32 = 1 << 16;
 const TIMER_DIVIDE_16: u32 = 0x3;
 
-// Desired periodic tick rate.
-const TIMER_HZ: u32 = 100;
+// Desired periodic tick rate (the shared scheduler-tick policy).
+use crate::arch::common::time::TICK_HZ as TIMER_HZ;
 
 // Virtual address where the LAPIC MMIO page is mapped (its own dedicated page,
 // since Limine's HHDM does not cover the LAPIC MMIO region).

@@ -29,8 +29,8 @@ const GICC_EOIR: usize = 0x010; // end of interrupt
 // The EL1 physical timer interrupt on QEMU virt (PPI 14 -> INTID 30).
 const TIMER_INTID: u32 = 30;
 
-// 100 Hz tick.
-const TICK_HZ: u64 = 100;
+// 100 Hz tick (the shared scheduler-tick policy).
+use crate::arch::common::time::TICK_HZ;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static INTERVAL: AtomicU64 = AtomicU64::new(0); // timer down-count per tick
@@ -92,7 +92,7 @@ fn init_cpu_local() {
 		core::ptr::write_volatile(reg, 1 << (TIMER_INTID % 32));
 
 		// Arm CNTP for a TICK_HZ tick and enable it (ENABLE=1, IMASK=0).
-		let interval = cntfrq() / TICK_HZ;
+		let interval = cntfrq() / TICK_HZ as u64;
 		INTERVAL.store(interval, Ordering::Relaxed);
 		arm_timer(interval);
 		core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags));
