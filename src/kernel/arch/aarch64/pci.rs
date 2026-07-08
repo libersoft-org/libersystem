@@ -86,7 +86,7 @@ pub struct PciDevice {
 }
 
 impl PciDevice {
-	fn is_virtio(&self) -> bool {
+	pub fn is_virtio(&self) -> bool {
 		self.vendor == VIRTIO_VENDOR
 	}
 

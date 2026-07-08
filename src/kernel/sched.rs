@@ -136,6 +136,14 @@ static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 // init(), by which point init_smp() has set up per-CPU state on every core.
 static PREEMPTION_ENABLED: AtomicBool = AtomicBool::new(false);
 
+// Whether init() has completed: the per-CPU scheduler array is allocated, the kernel
+// address space captured, and preemption armed. A secondary core spins on this before
+// entering cpu_idle_loop, so it never indexes the scheduler before it exists (the x86
+// APs are started after init(); the aarch64 secondaries come up before it).
+pub fn is_initialized() -> bool {
+	PREEMPTION_ENABLED.load(Ordering::Acquire)
+}
+
 fn current_cpu_id() -> usize {
 	arch::percpu::this_cpu().cpu_id() as usize
 }

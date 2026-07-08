@@ -119,10 +119,17 @@ extern "C" fn aarch64_secondary_main(cpu_id: u64) -> ! {
 	super::gic::init_secondary();
 	SEC_MPIDR[cpu_id as usize].store(mpidr, Ordering::Relaxed);
 	SMP_ONLINE.fetch_add(1, Ordering::Release);
+	// Also count this core in the portable online tally the scheduler and tests read.
+	crate::smp::mark_online();
 	super::enable_interrupts();
-	loop {
+	// The BSP brings the scheduler up (allocate + init) after waking us: spin until it
+	// has, then park in the scheduler idle loop so threads can be scheduled onto this
+	// core (and the wake IPI bounces us out of the halt to pick them up). Before it is
+	// ready the timer IRQ is a no-op (on_timer_preempt is gated on the same flag).
+	while !crate::sched::is_initialized() {
 		super::idle_halt();
 	}
+	crate::sched::cpu_idle_loop()
 }
 
 // Wake every secondary core (cpu ids 1..cpu_count) via PSCI CPU_ON and wait for

@@ -125,6 +125,16 @@ qemu-system-aarch64 \
 	-m "$MEM" \
 	-display none >/dev/null 2>&1
 
+# Test mode (TEST=1, the `cargo test` runner): enable Arm semihosting so the in-kernel
+# harness can terminate QEMU with a pass/fail exit code (arch::exit_qemu -> SYS_EXIT),
+# and route the serial console to stdout so the test report is captured. The kernel
+# built with `cargo test` branches to the harness after core bring-up (no shell).
+TEST_ARGS=()
+if [[ "${TEST:-0}" == "1" ]]; then
+	TEST_ARGS+=(-semihosting)
+	SERIAL="stdio"
+fi
+
 qemu-system-aarch64 \
 	-machine "$MACHINE" \
 	-cpu cortex-a72 \
@@ -135,5 +145,6 @@ qemu-system-aarch64 \
 	-serial "$SERIAL" \
 	-display none \
 	-no-reboot \
+	"${TEST_ARGS[@]}" \
 	"${DISK_ARGS[@]}" \
 	${QEMU_EXTRA:-}

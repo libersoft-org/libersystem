@@ -84,6 +84,9 @@ fn init_cpu_local() {
 		// Allow all priorities through (PMR high) and enable the CPU interface.
 		core::ptr::write_volatile(gicc(GICC_PMR), 0xf0);
 		core::ptr::write_volatile(gicc(GICC_CTLR), 1);
+		// Enable the 16 SGIs (INTID 0..15, banked per core) so the cross-core wake IPI
+		// (SGI 0) is delivered and bounces this core out of WFI.
+		core::ptr::write_volatile(gicd(GICD_ISENABLER), 0x0000_ffff);
 		// Unmask the timer PPI (INTID 30 -> ISENABLER0 bit 30; banked per core).
 		let reg = gicd(GICD_ISENABLER + (TIMER_INTID as usize / 32) * 4);
 		core::ptr::write_volatile(reg, 1 << (TIMER_INTID % 32));
@@ -121,6 +124,17 @@ pub fn handle_irq(from_user: bool) {
 	// EOI is already sent above, matching the x86 timer-ISR order.
 	if intid == TIMER_INTID {
 		crate::sched::on_timer_preempt(from_user);
+	}
+}
+
+// Send a software-generated interrupt (SGI `id`, 0..15) to core `cpu` - the cross-core
+// wake IPI. GICD_SGIR selects the target with a per-core bit in the target list; the
+// delivery itself is the message (it bounces the target out of WFI so its idle loop
+// re-checks its run queue), and gic::handle_irq just EOIs it (SGIs are INTID 0..15).
+pub fn send_sgi(cpu: u32, id: u32) {
+	const GICD_SGIR: usize = 0xf00;
+	unsafe {
+		core::ptr::write_volatile(gicd(GICD_SGIR), (1 << (16 + (cpu & 0xff))) | (id & 0xf));
 	}
 }
 

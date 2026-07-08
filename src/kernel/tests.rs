@@ -617,7 +617,8 @@ extern "C" fn user_fault_thread_body(_arg: u64) {
 }
 
 // A bindable test IRQ vector (33..47, distinct from the interrupt_bind test's) a
-// crashing "driver" holds before it faults.
+// crashing "driver" holds before it faults. x86-only (legacy INTx; aarch64 is MSI-only).
+#[cfg(target_arch = "x86_64")]
 const DRIVER_IRQ_VECTOR: u64 = 0x2d;
 
 // Where the no-execute probe's recorded fault lands (mirrors the FAULT_* statics).
@@ -702,6 +703,8 @@ extern "C" fn user_nx_thread_body(_arg: u64) {
 // - a bound IRQ and a DMA buffer - then drops to ring 3 and faults, leaving both
 // open so the kernel's crash cleanup is what detaches the IRQ and refunds the DMA.
 // Mirrors user_fault_thread_body's ring-3 fault, plus the held driver resources.
+// x86-only: it binds a legacy INTx vector, which aarch64 (MSI-only) does not offer.
+#[cfg(target_arch = "x86_64")]
 extern "C" fn driver_crash_thread_body(_arg: u64) {
 	use mem::frame::{self, PAGE_SIZE};
 	unsafe {
@@ -765,6 +768,7 @@ fn trivial_assertion() {
 	assert_eq!(1 + 1, 2);
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test_case]
 fn breakpoint_exception_returns() {
 	// reaching the next line proves the IDT breakpoint handler returned cleanly
@@ -883,6 +887,7 @@ fn timer_ticks_advance() {
 	assert!(arch::apic::ticks() > start);
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test_case]
 fn handler_registration_dispatch() {
 	use core::sync::atomic::{AtomicBool, Ordering};
@@ -1467,6 +1472,7 @@ fn random_get_fills_distinct_bytes() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test_case]
 fn interrupt_bind_delivers_to_driver() {
 	use core::sync::atomic::{AtomicBool, Ordering};
@@ -3066,7 +3072,8 @@ fn inventory_tools_print_the_system_identity() {
 	// and architecture, uptime the time since boot, and dmesg the kernel boot log
 	// (the same text SYS_CONSOLE_READLOG hands ConsoleService for the boot screen).
 	let uname = run_inventory_tool(b"uname");
-	let expected = alloc::format!("{} {} x86_64\n", env!("PRODUCT_NAME"), env!("PRODUCT_VERSION"));
+	let arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+	let expected = alloc::format!("{} {} {}\n", env!("PRODUCT_NAME"), env!("PRODUCT_VERSION"), arch);
 	assert_eq!(uname, expected.as_bytes(), "uname should print the product name, version and architecture");
 
 	let uptime = run_inventory_tool(b"uptime");
@@ -3085,7 +3092,8 @@ fn inventory_tools_report_the_hardware() {
 	let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
 
 	let lscpu = run_inventory_tool(b"lscpu");
-	assert!(contains(&lscpu, b"arch: x86_64") && contains(&lscpu, b"cpu0: lapic "), "lscpu should print the architecture and each core's LAPIC id");
+	let arch_line: &[u8] = if cfg!(target_arch = "aarch64") { b"arch: aarch64" } else { b"arch: x86_64" };
+	assert!(contains(&lscpu, arch_line) && contains(&lscpu, b"cpu0: lapic "), "lscpu should print the architecture and each core's LAPIC id");
 
 	let free = run_inventory_tool(b"free");
 	assert!(free.starts_with(b"Mem:  total ") && contains(&free, b"Heap: total "), "free should print the frame-pool and heap totals");
@@ -3094,11 +3102,20 @@ fn inventory_tools_report_the_hardware() {
 	assert!(contains(&lsmem, b" usable\n"), "lsmem should print the retained boot memory map with a usable region");
 
 	let lsirq = run_inventory_tool(b"lsirq");
-	assert!(contains(&lsirq, b"vector 32: fixed"), "lsirq should report the kernel timer's fixed vector as in use");
+	// The kernel's own fixed vector: the LAPIC timer (vector 32) on x86, the EL1
+	// physical-timer PPI (INTID 30) on aarch64.
+	let timer_line: &[u8] = if cfg!(target_arch = "aarch64") { b"vector 30: fixed" } else { b"vector 32: fixed" };
+	assert!(contains(&lsirq, timer_line), "lsirq should report the kernel timer's fixed vector as in use");
 
 	let lspci = run_inventory_tool(b"lspci");
 	assert!(contains(&lspci, b"1af4:") && contains(&lspci, b"(network controller)"), "lspci should report the retained bus scan with the virtio functions");
 }
+
+// The sector where StorageService lays the fixed factory LiberFS layout when a disk
+// carries no GPT partition for it - it must mirror the storage service's own
+// FS_START_SECTOR (src/user/storage/src/service.rs), which sits past the largest
+// architecture's factory archive so the seed always fits ahead of the filesystem.
+const FACTORY_START_SECTOR: u64 = 65536;
 
 #[test_case]
 fn system_volume_formats_to_the_disks_capacity() {
@@ -3116,7 +3133,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 	// region, not the old fixed constant.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
 	const SECTOR: usize = 512;
-	let expected_pool: u64 = (CAPACITY - 32768 * SECTOR as u64) / 4096;
+	let expected_pool: u64 = (CAPACITY - FACTORY_START_SECTOR * SECTOR as u64) / 4096;
 
 	let (_volume, package) = scenario_packages().expect("boot modules should be present");
 	let elf = package.lookup(b"storage_service").expect("storage_service should be in the init package");
@@ -3144,7 +3161,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 	// the freshly laid superblock (filesystem block 0 = the first sector past the
 	// factory-archive region) must record the capacity-derived pool. num_blocks sits
 	// at bytes 16..24 of the superblock - its stable on-disk ABI.
-	let sb = disk.get(&32768).expect("the format should write superblock slot 0");
+	let sb = disk.get(&FACTORY_START_SECTOR).expect("the format should write superblock slot 0");
 	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
 	assert_eq!(num_blocks, expected_pool, "the pool should span everything past the archive region, derived from the reported capacity");
 
@@ -3260,10 +3277,10 @@ fn system_volume_lands_in_a_gpt_partition() {
 
 	// A disk partitioned by another system: a GPT whose entry array names a LiberFS
 	// partition (the type GUID 4C424653-0001-4000-8000-4C6962657246) starting at LBA
-	// 40960 - NOT the fixed factory layout's sector 32768. StorageService must find
-	// the partition, format the volume INSIDE it, and size the pool to it.
+	// 8192 - NOT the fixed factory layout's FACTORY_START_SECTOR. StorageService must
+	// find the partition, format the volume INSIDE it, and size the pool to it.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
-	const PART_FIRST: u64 = 40960;
+	const PART_FIRST: u64 = 8192;
 	const PART_BLOCKS: u64 = 4096; // 16 MB
 	const PART_LAST: u64 = PART_FIRST + PART_BLOCKS * 8 - 1;
 
@@ -3309,7 +3326,7 @@ fn system_volume_lands_in_a_gpt_partition() {
 	assert_eq!(&sb[0..8], b"LIBERFS1", "the partition should carry a LiberFS superblock");
 	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
 	assert_eq!(num_blocks, PART_BLOCKS, "the pool should span exactly the partition");
-	assert!(disk.get(&32768).is_none(), "the fixed factory offset must stay untouched on a GPT disk");
+	assert!(disk.get(&FACTORY_START_SECTOR).is_none(), "the fixed factory offset must stay untouched on a GPT disk");
 }
 
 #[test_case]
@@ -3323,7 +3340,7 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	// the probe must SKIP it and fall back to the fixed factory layout instead of
 	// failing the format and exiting.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
-	let expected_pool: u64 = (CAPACITY - 32768 * 512) / 4096;
+	let expected_pool: u64 = (CAPACITY - FACTORY_START_SECTOR * 512) / 4096;
 
 	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
 	let mut header = alloc::vec![0u8; 512];
@@ -3361,7 +3378,7 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	assert!(online, "the service must fall back to the factory layout and report in");
 
 	// the fallback formatted at the factory offset, sized by the disk's capacity.
-	let sb = disk.get(&32768).expect("the fallback should write superblock slot 0 at the factory offset");
+	let sb = disk.get(&FACTORY_START_SECTOR).expect("the fallback should write superblock slot 0 at the factory offset");
 	assert_eq!(&sb[0..8], b"LIBERFS1", "the factory layout should carry the volume");
 	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
 	assert_eq!(num_blocks, expected_pool, "the pool should span the capacity-derived factory region");
@@ -3379,7 +3396,7 @@ fn a_lying_seed_archive_cannot_kill_the_storage_service() {
 	// the disk's word; the claim must be bounded by the seed region and treated as
 	// "no archive", so the service formats an empty volume and reports in.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
-	let expected_pool: u64 = (CAPACITY - 32768 * 512) / 4096;
+	let expected_pool: u64 = (CAPACITY - FACTORY_START_SECTOR * 512) / 4096;
 
 	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
 	let mut header = alloc::vec![0u8; 512];
@@ -3409,7 +3426,7 @@ fn a_lying_seed_archive_cannot_kill_the_storage_service() {
 	assert!(online, "the service must treat the hostile claim as no archive and report in");
 
 	// the volume formatted normally (empty - nothing was seeded from the "archive").
-	let sb = disk.get(&32768).expect("superblock slot 0 should sit at the factory offset");
+	let sb = disk.get(&FACTORY_START_SECTOR).expect("superblock slot 0 should sit at the factory offset");
 	assert_eq!(&sb[0..8], b"LIBERFS1", "the factory layout should carry the volume");
 	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
 	assert_eq!(num_blocks, expected_pool, "the pool should span the capacity-derived factory region");
@@ -4086,6 +4103,7 @@ fn fault_isolation_kills_only_process() {
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test_case]
 fn writable_pages_are_not_executable() {
 	use core::sync::atomic::Ordering;
@@ -4106,6 +4124,7 @@ fn writable_pages_are_not_executable() {
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test_case]
 fn kernel_access_to_user_memory_is_refused_outside_the_window() {
 	use mem::frame;
@@ -4199,6 +4218,7 @@ fn recursion_past_the_stack_floor_is_killed() {
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test_case]
 fn driver_crash_is_cleaned_up_and_notified() {
 	use object::KernelObject;
@@ -4231,6 +4251,7 @@ fn driver_crash_is_cleaned_up_and_notified() {
 	fault::clear_crash_notify();
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test_case]
 fn device_manager_reacts_to_a_driver_crash() {
 	use object::KernelObject;

@@ -35,6 +35,17 @@ pub fn set_hhdm_offset(offset: u64) {
 	HHDM_OFFSET.store(offset, Ordering::Relaxed);
 }
 
+// Retain the boot memory map for runtime inspection (SYS_MEMMAP_GET / lsmem). The x86
+// path retains it inside `init`; aarch64 brings memory up in separate steps (frame /
+// heap init directly), so it retains the map here once the heap is available.
+#[cfg(target_arch = "aarch64")]
+pub fn retain_memmap(regions: &[MemRegion]) {
+	let mut retained = MEMMAP.lock();
+	for region in regions {
+		retained.push(abi::MemmapRegion { base: region.base, length: region.length, kind: region.kind, _pad: 0 });
+	}
+}
+
 // The number of retained boot memory-map regions.
 pub fn memmap_len() -> usize {
 	MEMMAP.lock().len()

@@ -227,8 +227,16 @@ pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
 	f()
 }
 
-pub unsafe fn copy_to_user_page(_dst: u64, _bytes: &[u8]) {
-	todo!("aarch64 4 kB map_page (M116)")
+pub unsafe fn copy_to_user_page(dst: u64, bytes: &[u8]) {
+	// cortex-a72 (ARMv8.0) has no PAN, so the kernel writes the USER-mapped page
+	// directly - no sanctioned window is needed (user_access is a passthrough). The
+	// page holds ring-3 code, so make the freshly written bytes coherent with the
+	// instruction fetch: complete the stores, invalidate the I-cache to the point of
+	// unification, and synchronise.
+	unsafe {
+		core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+		core::arch::asm!("dsb ish", "ic iallu", "dsb ish", "isb", options(nostack, preserves_flags));
+	}
 }
 
 pub fn map_page(virt: u64, phys: u64, flags: u64) {
@@ -278,7 +286,10 @@ unsafe fn unmap_page_root(root: u64, virt: u64) -> Option<u64> {
 }
 
 pub fn unmap_page(virt: u64) -> Option<u64> {
-	unsafe { unmap_page_root(current_ttbr0(), virt) }
+	// A top-bit-set virtual address lives in TTBR1 (higher half), a low address in the
+	// active TTBR0 tree - mirror map_page's routing so a high mapping is actually found.
+	let root = if virt >> 63 == 1 { current_ttbr1() } else { current_ttbr0() };
+	unsafe { unmap_page_root(root, virt) }
 }
 pub fn unmap_pages(base: u64, count: usize) {
 	for i in 0..count {

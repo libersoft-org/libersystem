@@ -215,6 +215,9 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	crate::serial_println!("aarch64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
 	crate::mem::heap::init();
 	crate::mem::frame::upgrade_to_heap();
+	// Retain the boot memory map now the heap is up, so SYS_MEMMAP_GET (lsmem) can
+	// report the physical layout - the x86 loader path retains it inside mem::init.
+	crate::mem::retain_memmap(&regions);
 	{
 		let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
 		for i in 0..8 {
@@ -313,7 +316,42 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	// indexes its own (empty) run queue rather than running off the end.
 	crate::smp::set_cpu_count(cpu_count as usize);
 	crate::sched::allocate(cpu_count as usize);
+
+	// Under `cargo test`, give the kernel address space a fresh, empty low (TTBR0) half
+	// before sched::init captures it as KERNEL_CR3: the boot identity map's low half is
+	// 1 GB blocks, but the ring-3 test probes map 4 kB USER pages into the shared address
+	// space (the x86 kernel's low half is 4 kB-granular and empty). The kernel runs
+	// entirely in the higher half (TTBR1), so swapping TTBR0 is safe; kernel threads and
+	// their EL0 excursions then use this table, and each probe's low-VA map_page lands in
+	// clean 4 kB entries.
+	#[cfg(test)]
+	unsafe {
+		super::context::write_cr3(super::paging::new_address_space().expect("aarch64: test address space"));
+	}
+
 	crate::sched::init();
+
+	// Under `cargo test`, the core subsystems (heap, paging, per-CPU, SMP, scheduler)
+	// are up: hand off to the kernel test harness and exit QEMU. The scheduler demos
+	// and the userspace boot chain are the interactive (non-test) bring-up in
+	// aarch64_run_demos below.
+	#[cfg(test)]
+	{
+		crate::device::init();
+		publish_embedded_boot_info();
+		crate::test_main();
+		super::exit_qemu(true)
+	}
+
+	#[cfg(not(test))]
+	aarch64_run_demos()
+}
+
+// The interactive scheduler demos and userspace boot chain that follow the core
+// bring-up. Skipped under `cargo test` (which runs the kernel test harness instead).
+#[cfg(not(test))]
+fn aarch64_run_demos() -> ! {
+	use super::paging;
 	for id in 1..=3u64 {
 		crate::sched::spawn(sched_task, id);
 	}
@@ -713,22 +751,11 @@ fn run_echo_program() {
 	crate::serial_println!("aarch64: echo - tool exited");
 }
 
-// Spawn the real SystemManager from the embedded init package and drive the
-// userspace boot chain as far as it runs, draining its reports. This is the same
-// mechanism the x86 kernel uses (pkg::Package + loader::spawn_elf_process + the
-// PACKAGE/RAMDISK/MODE bootstrap protocol); the kernel builds a BootInfo pointing
-// at the embedded packages so crate::spawn_system_manager finds them. A userspace
-// fault is isolated (the process is terminated), so the kernel always returns here.
-fn run_system_manager() {
-	if INIT_PKG.is_empty() || VOLUME_PKG.is_empty() {
-		return;
-	}
-
-	// Populate the kernel device table from the PCI scan, so DeviceManager can
-	// enumerate the virtio devices and spawn their drivers (the same one-time boot
-	// scan the x86 kmain does before starting userspace).
-	crate::device::init();
-
+// Publish a kernel-constructed BootInfo pointing at the embedded init.pkg / volume.pkg
+// (aarch64 boots directly, with no bootloader hand-off, so the kernel builds its own).
+// Both the userspace boot chain and the test harness read the packages through it
+// (module_bytes -> volume_package_bytes / init_package_bytes).
+fn publish_embedded_boot_info() {
 	// A boot-info module descriptor for an embedded package (its kernel .rodata
 	// address is directly readable, so no HHDM translation is needed).
 	fn module(name: &[u8], bytes: &[u8]) -> bootproto::Module {
@@ -739,6 +766,26 @@ fn run_system_manager() {
 	let modules: &'static mut [bootproto::Module; 2] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", INIT_PKG), module(b"volume.pkg", VOLUME_PKG)]));
 	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer: bootproto::Framebuffer { addr: 0, width: 0, height: 0, pitch: 0, bpp: 0, red_shift: 0, red_size: 0, green_shift: 0, green_size: 0, blue_shift: 0, blue_size: 0, _pad: [0; 2] }, fb_present: 0, _pad1: 0, rsdp: 0, smp_trampoline: 0 }));
 	crate::publish_boot_info(bi);
+}
+
+// Spawn the real SystemManager from the embedded init package and drive the
+// userspace boot chain as far as it runs, draining its reports. This is the same
+// mechanism the x86 kernel uses (pkg::Package + loader::spawn_elf_process + the
+// PACKAGE/RAMDISK/MODE bootstrap protocol); the kernel builds a BootInfo pointing
+// at the embedded packages so crate::spawn_system_manager finds them. A userspace
+// fault is isolated (the process is terminated), so the kernel always returns here.
+#[cfg(not(test))]
+fn run_system_manager() {
+	if INIT_PKG.is_empty() || VOLUME_PKG.is_empty() {
+		return;
+	}
+
+	// Populate the kernel device table from the PCI scan, so DeviceManager can
+	// enumerate the virtio devices and spawn their drivers (the same one-time boot
+	// scan the x86 kmain does before starting userspace).
+	crate::device::init();
+
+	publish_embedded_boot_info();
 
 	match crate::spawn_system_manager() {
 		Ok((ep, koid)) => {

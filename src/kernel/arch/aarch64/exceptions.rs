@@ -248,18 +248,25 @@ extern "C" fn aarch64_trap(vector: u64, frame: *mut u64) {
 		2 => "lower-EL/A64",
 		_ => "lower-EL/A32",
 	};
-	let kind = match vector % 4 {
+	let kind_str = match vector % 4 {
 		0 => "sync",
 		2 => "fiq",
 		_ => "serror",
 	};
-	crate::serial_println!("aarch64 EXCEPTION [{source} {kind}] EC={ec:#x} ESR={esr:#x} FAR={far:#x} ELR={elr:#x}");
 
 	// A lower-EL (userspace) fault terminates only the faulting process: the kernel
 	// records the fault, tears the process down, notifies the supervisor, and
 	// unwinds to the kernel thread that entered EL0. A current-EL (kernel) fault is
 	// a kernel bug and halts.
 	if vector / 4 == 2 {
+		// A not-present data abort inside the stack span is demand-paged growth: map a
+		// page and `eret` to retry the faulting store (the resumable fault, mirroring
+		// the x86 page-fault handler). ESR.DFSC 0b0001xx (0x04..=0x07) is a translation
+		// fault (not present); the stack grows on data writes (EC 0x24/0x25).
+		let dfsc = esr & 0x3f;
+		if (ec == 0x24 || ec == 0x25) && (0x04..=0x07).contains(&dfsc) && crate::fault::grow_user_stack(far, 0) {
+			return;
+		}
 		let kind = match ec {
 			0x20 | 0x21 | 0x24 | 0x25 => crate::fault::FAULT_PAGE, // instruction / data abort
 			_ => crate::fault::FAULT_GENERAL_PROTECTION,
@@ -267,6 +274,8 @@ extern "C" fn aarch64_trap(vector: u64, frame: *mut u64) {
 		crate::fault::terminate_user(crate::fault::FaultInfo { kind, error_code: esr, address: far, instruction_pointer: elr });
 	}
 
+	// A current-EL fault reaching here is a kernel bug: report it and halt.
+	crate::serial_println!("aarch64 EXCEPTION [{source} {kind_str}] EC={ec:#x} ESR={esr:#x} FAR={far:#x} ELR={elr:#x}");
 	crate::serial_println!("aarch64: unhandled exception - halting");
 	super::halt_loop()
 }

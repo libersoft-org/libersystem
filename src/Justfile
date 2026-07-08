@@ -35,6 +35,15 @@ user:
 	cd {{drivers_dir}} && cargo build
 	cd {{usertools_dir}} && cargo build
 
+# build the userspace programs for aarch64 (the aarch64 kernel build.rs reads them
+# from each crate's aarch64-unknown-none target dir)
+user-aarch64:
+	cd {{user_dir}} && cargo build --target aarch64-unknown-none
+	cd {{services_dir}} && cargo build --target aarch64-unknown-none
+	cd {{storage_dir}} && cargo build --target aarch64-unknown-none
+	cd {{drivers_dir}} && cargo build --target aarch64-unknown-none
+	cd {{usertools_dir}} && cargo build --target aarch64-unknown-none
+
 # build the WebAssembly component SDK example (the `liber` world guest) for
 # wasm32-unknown-unknown and stage it into the ramdisk volume as app.wasm, where
 # StorageService serves it over vol:// for the component_host to load and run
@@ -70,6 +79,11 @@ gdb:
 # run tests in QEMU (isa-debug-exit)
 test: sdk user
 	cd {{kernel_dir}} && TEST=1 cargo test
+
+# run the kernel test suite in QEMU on aarch64 (Arm semihosting exit maps pass/fail).
+# SMP=4 exercises the multi-core paths (secondary bring-up, the cross-core wake IPI).
+test-aarch64: sdk user-aarch64
+	cd {{kernel_dir}} && TEST=1 cargo test --target aarch64-unknown-none
 
 # screenshot the framebuffer to a file (format by extension: png/jpg/webp/...);
 # snaps a live `just run` if one is up, else boots a throwaway. e.g. just screenshot shot.png

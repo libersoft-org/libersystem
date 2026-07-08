@@ -173,20 +173,27 @@ pub fn dispatch_msi(intid: u32) -> bool {
 	true
 }
 
-// The state of the MSI vector at `index` (its slot), for the `lsirq` inventory: the
-// SPI number as the vector, whether it has a live binding, and the owning device index.
+// The state of the MSI vector at `index` (its slot), for the `lsirq` inventory. Index
+// 0 is the kernel's own timer - the EL1 physical-timer PPI (INTID 30 on QEMU virt),
+// always in use - so the inventory shows a fixed kernel vector like x86's; the MSI
+// window (each a device's per-device SPI) follows.
 pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
+	const TIMER_INTID: u32 = 30; // mirrors gic::TIMER_INTID (the EL1 physical-timer PPI)
+	if index == 0 {
+		return Some(abi::IrqInfo { vector: TIMER_INTID, kind: abi::IRQ_KIND_FIXED, bound: 1, device: abi::IRQ_NO_DEVICE });
+	}
+	let slot = index - 1;
 	let len = MSI_LEN.load(Ordering::Relaxed);
-	if index >= len {
+	if slot >= len {
 		return None;
 	}
-	let vector = BASE_SPI.load(Ordering::Relaxed) + index as u32;
-	Some(abi::IrqInfo { vector, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector as u8) as u32, device: MSI_OWNER[index].load(Ordering::Acquire) })
+	let vector = BASE_SPI.load(Ordering::Relaxed) + slot as u32;
+	Some(abi::IrqInfo { vector, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector as u8) as u32, device: MSI_OWNER[slot].load(Ordering::Acquire) })
 }
 
-// The number of vectors irq_info reports over (the frame's MSI SPI count).
+// The number of vectors irq_info reports over (the timer entry plus the frame's MSI SPIs).
 pub fn irq_info_len() -> usize {
-	MSI_LEN.load(Ordering::Relaxed)
+	1 + MSI_LEN.load(Ordering::Relaxed)
 }
 
 // No kernel-side INTx handlers on aarch64 (the timer is handled in gic::handle_irq).

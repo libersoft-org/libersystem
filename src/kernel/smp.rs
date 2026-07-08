@@ -55,11 +55,30 @@ pub fn cpu_count() -> usize {
 #[cfg(target_arch = "aarch64")]
 pub fn set_cpu_count(count: usize) {
 	CPU_COUNT.store(count, Ordering::Relaxed);
+	// Publish each core's interrupt-controller id for the cross-core wake-IPI path
+	// (the x86 path fills this from the MADT as APs report in). On QEMU virt
+	// (cortex-a72) the MPIDR affinity is the linear core index and the GICv2 SGI
+	// target list addresses CPU interface N for core N, so the id is the index.
+	if LAPIC_IDS.load(Ordering::Acquire).is_null() && count > 0 {
+		let mut ids: Vec<AtomicU32> = Vec::with_capacity(count);
+		for i in 0..count {
+			ids.push(AtomicU32::new(i as u32));
+		}
+		LAPIC_IDS.store(Vec::leak(ids).as_mut_ptr(), Ordering::Release);
+	}
 }
 
 // Number of cores currently online.
 pub fn online_count() -> usize {
 	ONLINE.load(Ordering::Acquire)
+}
+
+// Count this core in the portable online tally. The x86 APs do this in ap_entry;
+// aarch64 secondaries come up through the PSCI path (arch::aarch64::psci) and call
+// this once their per-CPU state is initialized.
+#[cfg(target_arch = "aarch64")]
+pub fn mark_online() {
+	ONLINE.fetch_add(1, Ordering::Release);
 }
 
 // The LAPIC id of the core with CPU id `cpu` (0 for a core that never reported in).
