@@ -124,6 +124,61 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	};
 	crate::serial_println!("riscv64: post-MMU RAM read/write = {}", if ok { "ok" } else { "FAIL" });
 
-	crate::serial_println!("riscv64: M117 bring-up increment 1 (boot + Sv39 + SBI serial) - OK, halting");
+	// Increment 2: install the S-mode trap vector (STVEC) and exercise it.
+	super::traps::init();
+	// Permit S-mode access to U-mapped pages (SSTATUS.SUM, bit 18) so the kernel can
+	// seed user pages later; there is no SMAP-equivalent for now.
+	unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 1u64 << 18, options(nostack, preserves_flags)) };
+	crate::serial_println!("riscv64: STVEC trap vector installed");
+
+	// Trap round-trip: `ebreak` traps to S-mode (OpenSBI delegates it via medeleg);
+	// the handler advances SEPC past it and returns via sret, so execution resumes.
+	unsafe { core::arch::asm!("ebreak") };
+	crate::serial_println!("riscv64: trap round-trip (ebreak) OK");
+
+	// Increment 4: parse the device tree (the shared FDT parser), seed the portable
+	// frame allocator, and bring up the kernel heap in the higher half.
+	use super::paging;
+	let (ram_top, cpu_count) = match super::dtb::parse(dtb) {
+		Some(bi) => {
+			crate::serial_println!("riscv64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s), ECAM {:#x}", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count, bi.pcie_ecam);
+			(bi.ram_base + bi.ram_size, bi.cpu_count)
+		}
+		None => {
+			crate::serial_println!("riscv64: no DTB found - using built-in defaults");
+			(0, 1)
+		}
+	};
+	let _ = cpu_count;
+
+	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
+	let (region_base, region_len) = paging::usable_region(ram_top);
+	let regions = [bootproto::MemRegion { base: region_base, length: region_len, kind: bootproto::MEM_USABLE, _pad: 0 }];
+	crate::mem::frame::init(&regions);
+	crate::serial_println!("riscv64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
+	crate::mem::heap::init();
+	crate::mem::frame::upgrade_to_heap();
+	{
+		let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+		for i in 0..8 {
+			v.push(i * i);
+		}
+		let (mapped, free) = crate::mem::heap::stats();
+		crate::serial_println!("riscv64: heap up - Vec sum={} | {} kB mapped, {} kB free", v.iter().sum::<u64>(), mapped / 1024, free / 1024);
+	}
+
+	// Prove 4 kB map_page / translate / unmap: map a fresh frame at a low test VA,
+	// write + read it back through the mapping, confirm translate, then unmap.
+	const TEST_VA: u64 = 0x1000_0000;
+	let frame = paging::alloc_frame().expect("test frame");
+	paging::map_page(TEST_VA, frame, paging::WRITABLE);
+	unsafe { core::ptr::write_volatile(TEST_VA as *mut u64, 0xCAFE_F00D_1234_5678) };
+	let readback = unsafe { core::ptr::read_volatile(paging::phys_to_virt(frame) as *const u64) };
+	let xlate = paging::translate(TEST_VA);
+	crate::serial_println!("riscv64: map_page test - readback {readback:#x}, translate {xlate:#x?} (frame {frame:#x})");
+	paging::unmap_page(TEST_VA);
+	paging::dealloc_frame(frame);
+
+	crate::serial_println!("riscv64: M117 increment 4 (Sv39 paging + frame allocator + heap) - OK, halting");
 	super::halt_loop()
 }

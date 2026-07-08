@@ -10,7 +10,9 @@
 // this arch is not possible until then.
 
 pub mod boot;
+pub mod dtb;
 pub mod serial;
+pub mod traps;
 
 // halt the kernel forever (wait-for-interrupt)
 pub fn halt_loop() -> ! {
@@ -90,58 +92,7 @@ pub fn exit_qemu(_success: bool) -> ! {
 }
 
 // ------------------------------------------------------------------ paging
-pub mod paging {
-	// The portable page-table permission bits (the flag set the portable callers OR
-	// together); the real Sv39 PTE encoding lands in M117.
-	pub use crate::arch::common::paging::{NO_CACHE, NO_EXECUTE, PRESENT, USER, WRITABLE};
-
-	pub fn enable_nx() {}
-	pub fn enable_smap_smep() {}
-	pub fn smap_enabled() -> bool {
-		false
-	}
-	pub fn smep_enabled() -> bool {
-		false
-	}
-	pub fn nx_enabled() -> bool {
-		false
-	}
-	pub fn clac_on_entry() {}
-
-	pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
-		f()
-	}
-
-	pub unsafe fn copy_to_user_page(_dst: u64, _bytes: &[u8]) {
-		todo!("riscv64 paging (M117)")
-	}
-
-	pub fn map_page(_virt: u64, _phys: u64, _flags: u64) {
-		todo!("riscv64 paging (M117)")
-	}
-	pub fn map_page_in(_satp: u64, _virt: u64, _phys: u64, _flags: u64) {
-		todo!("riscv64 paging (M117)")
-	}
-	pub fn unmap_page(_virt: u64) -> Option<u64> {
-		todo!("riscv64 paging (M117)")
-	}
-	pub fn unmap_pages(_base: u64, _count: usize) {
-		todo!("riscv64 paging (M117)")
-	}
-	pub fn unmap_page_in(_satp: u64, _virt: u64) -> Option<u64> {
-		todo!("riscv64 paging (M117)")
-	}
-	pub fn new_address_space() -> Option<u64> {
-		todo!("riscv64 paging (M117)")
-	}
-	pub fn free_address_space(_satp: u64) {
-		todo!("riscv64 paging (M117)")
-	}
-	pub fn translate(_virt: u64) -> Option<u64> {
-		todo!("riscv64 paging (M117)")
-	}
-	pub fn remove_bootstrap_identity() {}
-}
+pub mod paging;
 
 // ----------------------------------------------------------------- context
 pub mod context {

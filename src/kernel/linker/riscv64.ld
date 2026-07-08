@@ -76,8 +76,9 @@ SECTIONS
 		__boot_stack_top = .;
 	} :data
 
-	/* End of the loaded image; free DRAM (physical) for the frame allocator. */
-	__kernel_phys_end = . - KOFF;
+	/* End of the loaded image; a higher-half VA (mask off KOFF for the physical
+	   address). The frame allocator seeds from free DRAM above it. */
+	__kernel_end = .;
 
 	/DISCARD/ : {
 		*(.eh_frame)

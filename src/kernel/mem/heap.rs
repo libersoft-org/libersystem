@@ -22,7 +22,13 @@ use crate::sync::SpinLock;
 // Heap virtual window: well clear of both the HHDM and the kernel image. The heap
 // starts at one region and maps another whenever an allocation cannot be satisfied,
 // so it is never a fixed budget - the physical frame pool is the real bound.
+//
+// x86_64 / aarch64 have a 48-bit VA space; riscv64's Sv39 is 39-bit, so its heap sits
+// in the Sv39 high canonical half (past the 8 GiB direct map at KERNEL_VA_OFFSET).
+#[cfg(not(target_arch = "riscv64"))]
 const HEAP_START: u64 = 0xffff_e000_0000_0000;
+#[cfg(target_arch = "riscv64")]
+const HEAP_START: u64 = 0xffff_ffd0_0000_0000;
 const HEAP_REGION: u64 = 2 * 1024 * 1024; // the initial size and the growth unit
 
 // The virtual base the next growth region maps at (bumped under the allocator lock).

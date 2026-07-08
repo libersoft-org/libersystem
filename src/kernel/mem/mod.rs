@@ -26,11 +26,11 @@ pub fn hhdm_offset() -> u64 {
 	HHDM_OFFSET.load(Ordering::Relaxed)
 }
 
-// Publish the higher-half direct-map offset from the arch backend. aarch64 builds
-// its own boot page tables (a direct map at KERNEL_VA_OFFSET) rather than taking
-// an HHDM from a bootloader, so it sets the offset here before seeding the frame
-// allocator, rather than through `init`.
-#[cfg(target_arch = "aarch64")]
+// Publish the higher-half direct-map offset from the arch backend. aarch64 and
+// riscv64 build their own boot page tables (a direct map at KERNEL_VA_OFFSET) rather
+// than taking an HHDM from a bootloader, so they set the offset here before seeding
+// the frame allocator, rather than through `init`.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn set_hhdm_offset(offset: u64) {
 	HHDM_OFFSET.store(offset, Ordering::Relaxed);
 }
@@ -38,7 +38,7 @@ pub fn set_hhdm_offset(offset: u64) {
 // Retain the boot memory map for runtime inspection (SYS_MEMMAP_GET / lsmem). The x86
 // path retains it inside `init`; aarch64 brings memory up in separate steps (frame /
 // heap init directly), so it retains the map here once the heap is available.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn retain_memmap(regions: &[MemRegion]) {
 	let mut retained = MEMMAP.lock();
 	for region in regions {
