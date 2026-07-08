@@ -17,3 +17,11 @@ rustflags = ["-C", "relocation-model=static"]
 [target.aarch64-unknown-none]
 runner = "../boot/qemu-aarch64.sh"
 rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-no-pie"]
+
+# riscv64 direct-boot bring-up (M117): QEMU `-machine virt` boots OpenSBI, which
+# jumps to the kernel ELF entry in S-mode with the MMU off, a0=hartid, a1=DTB. The
+# kernel is linked static (non-PIE); the higher-half kernel needs the `medany` code
+# model (absolute addresses outside the low 2 GiB), and the boot stub sets up Sv39.
+[target.riscv64gc-unknown-none-elf]
+runner = "../boot/qemu-riscv64.sh"
+rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-no-pie", "-C", "code-model=medium"]

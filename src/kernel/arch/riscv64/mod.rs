@@ -9,6 +9,7 @@
 // console, DTB parsing) land in M117. Runtime entry points `todo!()`; a boot on
 // this arch is not possible until then.
 
+pub mod boot;
 pub mod serial;
 
 // halt the kernel forever (wait-for-interrupt)

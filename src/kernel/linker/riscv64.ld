@@ -1,54 +1,89 @@
-/* Linker script riscv64 (Limine, higher-half)
-   Stub prepared for a future port. Used only when building for riscv64. */
+/* Linker script riscv64 - higher-half kernel (M117).
+ *
+ * QEMU `-machine virt` boots OpenSBI (M-mode) which jumps to the kernel ELF entry
+ * (`_start`) in S-mode, MMU off, a0 = hartid, a1 = DTB pointer. QEMU `-kernel`
+ * loads the ELF by its physical addresses into DRAM (base 0x8000_0000, OpenSBI
+ * takes the first 2 MiB), so the boot stub lives in a low, identity-linked
+ * `.boot` section at physical 0x8020_0000: it is position-independent, builds the
+ * boot Sv39 table, turns on paging (SATP), then jumps into the higher half.
+ *
+ * Everything else is linked at KOFF + physical (KOFF = 0xFFFF_FFC0_0000_0000, the
+ * base of the Sv39 high canonical half), so the kernel runs from the higher half
+ * and the low half is free for userspace. Each high section's load address (AT) is
+ * its virtual address minus KOFF, so QEMU still loads it physically just above the
+ * boot stub. */
 
 OUTPUT_FORMAT(elf64-littleriscv)
-ENTRY(kmain)
+ENTRY(_start)
+
+KOFF = 0xFFFFFFC000000000;
 
 PHDRS
 {
-	text    PT_LOAD;
-	rodata  PT_LOAD;
-	data    PT_LOAD;
-	dynamic PT_DYNAMIC;
+	boot	PT_LOAD FLAGS(7); /* RWX - the low boot stub + boot table */
+	text	PT_LOAD FLAGS(5); /* RX  */
+	rodata	PT_LOAD FLAGS(4); /* R   */
+	data	PT_LOAD FLAGS(6); /* RW  */
 }
 
 SECTIONS
 {
-	. = 0xffffffff80000000;
+	/* Low, identity-linked boot section (physical == virtual). */
+	. = 0x80200000;
 
-	.text : {
+	.boot : {
+		KEEP(*(.text.boot))
+		*(.data.boot)
+		. = ALIGN(4096);
+		__boot_tables = .;
+		. += 4096; /* one Sv39 root table (512 * 8 B) */
+		. = ALIGN(4096);
+	} :boot
+	__boot_phys_end = .;
+
+	/* Higher-half kernel: virtual = KOFF + physical (load address). */
+	. = __boot_phys_end + KOFF;
+
+	.text : AT(ADDR(.text) - KOFF) {
 		*(.text .text.*)
 	} :text
 
-	. = ALIGN(CONSTANT(MAXPAGESIZE));
+	. = ALIGN(4096);
 
-	.rodata : {
+	.rodata : AT(ADDR(.rodata) - KOFF) {
 		*(.rodata .rodata.*)
+		*(.srodata .srodata.*)
 	} :rodata
 
-	.limine_requests : {
-		KEEP(*(.limine_requests_start))
-		KEEP(*(.limine_requests))
-		KEEP(*(.limine_requests_end))
-	} :rodata
+	. = ALIGN(4096);
 
-	. = ALIGN(CONSTANT(MAXPAGESIZE));
-
-	.data : {
+	.data : AT(ADDR(.data) - KOFF) {
 		*(.data .data.*)
+		*(.sdata .sdata.*)
 	} :data
 
-	.dynamic : {
-		*(.dynamic)
-	} :data :dynamic
-
-	.bss : {
+	.bss (NOLOAD) : AT(ADDR(.bss) - KOFF) {
+		__bss_start = .;
 		*(.bss .bss.*)
+		*(.sbss .sbss.*)
 		*(COMMON)
+		. = ALIGN(16);
+		__bss_end = .;
+		/* boot stack: reserved RAM (uninitialized), higher-half addresses. */
+		. = ALIGN(16);
+		__boot_stack_bottom = .;
+		. += 0x10000; /* 64 KiB */
+		__boot_stack_top = .;
 	} :data
+
+	/* End of the loaded image; free DRAM (physical) for the frame allocator. */
+	__kernel_phys_end = . - KOFF;
 
 	/DISCARD/ : {
-		*(.eh_frame*)
+		*(.eh_frame)
+		*(.eh_frame_hdr)
 		*(.note .note.*)
+		*(.comment)
+		*(.riscv.attributes)
 	}
 }
