@@ -15,6 +15,11 @@ SMP="${SMP:-1}"
 MEM="${MEM:-512M}"
 # `default` uses QEMU's bundled OpenSBI (fw_dynamic); override with BIOS=<path>.
 BIOS="${BIOS:-default}"
+# UEFI=1 boots through the own riscv64 UEFI loader under U-Boot instead of QEMU's direct
+# `-kernel` load. UBOOT is the S-mode U-Boot payload QEMU runs (via -kernel) on top of
+# OpenSBI; its EFI boot manager launches the loader off the FAT ESP.
+UEFI="${UEFI:-0}"
+UBOOT="${UBOOT:-/usr/lib/u-boot/qemu-riscv64_smode/u-boot.bin}"
 
 # System volume disk: a virtio-blk disk holding the packed volume archive at LBA 0.
 # StorageService reads that factory archive, formats a LiberFS past it, and seeds
@@ -121,6 +126,53 @@ TEST_ARGS=()
 if [[ "${TEST:-0}" == "1" ]]; then
 	TEST_ARGS+=(-semihosting)
 	SERIAL="stdio"
+fi
+
+if [[ "$UEFI" == "1" ]]; then
+	# Boot through the own UEFI loader under U-Boot. Build a FAT EFI System Partition
+	# holding the loader as /EFI/BOOT/BOOTRISCV64.EFI (the riscv64 UEFI default boot
+	# path) and the kernel at /kernel (the loader reads it off the volume it booted
+	# from), then attach it as a virtio-blk disk. QEMU runs OpenSBI (-bios default) and
+	# the S-mode U-Boot (-kernel), whose EFI boot manager scans the disk and launches
+	# the loader; the loader hands the kernel the DTB and boot hart id.
+	LOADER_EFI="${LOADER_EFI:-$HERE/../loader/target/riscv64gc-unknown-none-elf/debug/libersystem-loader.efi}"
+	[[ -f "$LOADER_EFI" ]] || {
+		echo "qemu-riscv64: loader EFI not found: $LOADER_EFI (run 'just loader-riscv64')" >&2
+		exit 1
+	}
+	[[ -f "$UBOOT" ]] || {
+		echo "qemu-riscv64: U-Boot not found: $UBOOT (install the u-boot-qemu package)" >&2
+		exit 1
+	}
+	ESP="$HERE/.build/esp-riscv64.img"
+	STAGED_KERNEL="$HERE/.build/kernel-riscv64.stripped"
+	llvm-strip --strip-debug -o "$STAGED_KERNEL" "$KERNEL" 2>/dev/null || cp "$KERNEL" "$STAGED_KERNEL"
+	ESP_MB=$((($(stat -c%s "$STAGED_KERNEL") + $(stat -c%s "$LOADER_EFI")) / 1048576 + 16))
+	rm -f "$ESP"
+	truncate -s "${ESP_MB}M" "$ESP"
+	mformat -i "$ESP" ::
+	mmd -i "$ESP" ::/EFI ::/EFI/BOOT
+	mcopy -i "$ESP" "$LOADER_EFI" ::/EFI/BOOT/BOOTRISCV64.EFI
+	mcopy -i "$ESP" "$STAGED_KERNEL" ::/kernel
+	# The ESP is an NVMe disk, not virtio-blk: U-Boot's default boot order is
+	# "nvme0 virtio0 virtio1 scsi0 dhcp", so nvme0 is tried first and reliably found
+	# regardless of how many virtio-blk volumes precede it. The kernel has no NVMe
+	# driver, so DeviceManager skips it - the virtio-blk system/media/iso/udf volumes
+	# keep their PCI enumeration order (and StorageService binds them, not the ESP).
+	DISK_ARGS+=(-drive "if=none,id=esp,format=raw,file=$ESP" -device "nvme,serial=libersystem-esp,drive=esp")
+	exec qemu-system-riscv64 \
+		-machine virt \
+		-cpu rv64 \
+		-smp "$SMP" \
+		-m "$MEM" \
+		-bios "$BIOS" \
+		-kernel "$UBOOT" \
+		-serial "$SERIAL" \
+		-display none \
+		-no-reboot \
+		"${DISK_ARGS[@]}" \
+		"${TEST_ARGS[@]}" \
+		${QEMU_EXTRA:-}
 fi
 
 exec qemu-system-riscv64 \

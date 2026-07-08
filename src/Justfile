@@ -108,6 +108,21 @@ test-riscv64: sdk user-riscv64
 loader-aarch64:
 	cd {{loader_dir}} && cargo build --target aarch64-unknown-uefi
 
+# build the own UEFI loader for riscv64 (staged into the boot image as BOOTRISCV64.EFI).
+# There is no built-in riscv64 UEFI rustc target (and rustc's object backend cannot emit
+# a riscv64 PE/COFF), so the loader is compiled as a static PIE on the ELF target and a
+# hand-written PE/COFF header (src/arch/riscv64/head.rs) is prepended via the linker
+# script (loader/riscv64-pe.ld); llvm-objcopy then flattens it into a valid EFI
+# application, padded to the image end so its section raw data is fully backed.
+loader-riscv64:
+	cd {{loader_dir}} && \
+		RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-T$PWD/riscv64-pe.ld" \
+		cargo build --target riscv64gc-unknown-none-elf && \
+		END=$(llvm-readelf -s target/riscv64gc-unknown-none-elf/debug/libersystem-loader | awk '/ _pe_image_end$/{print "0x"$2; exit}') && \
+		llvm-objcopy -O binary --pad-to "$END" \
+			target/riscv64gc-unknown-none-elf/debug/libersystem-loader \
+			target/riscv64gc-unknown-none-elf/debug/libersystem-loader.efi
+
 # build + boot the ARM64 build in QEMU (native on an aarch64 host, emulated on an x86
 # host), reaching the interactive shell over the serial console. Uses QEMU's direct
 # -kernel load - the quick path; `run-aarch64-uefi` boots the same system through the
@@ -132,6 +147,15 @@ user-riscv64:
 run-riscv64: sdk user-riscv64
 	cd {{kernel_dir}} && cargo build --target riscv64gc-unknown-none-elf
 	SERIAL=stdio SMP=4 bash boot/qemu-riscv64.sh {{kernel_dir}}/target/riscv64gc-unknown-none-elf/debug/kernel
+
+# build + boot the full riscv64 system through the own UEFI loader under U-Boot (the
+# qemu-riscv64 S-mode U-Boot on OpenSBI, instead of QEMU's direct -kernel load): U-Boot's
+# EFI boot manager launches /EFI/BOOT/BOOTRISCV64.EFI off the FAT ESP, which reads the
+# kernel off the same volume, places it at its physical link addresses and enters the
+# kernel's boot stub - the same entry state OpenSBI's -kernel boot produces.
+run-riscv64-uefi: sdk user-riscv64 loader-riscv64
+	cd {{kernel_dir}} && cargo build --target riscv64gc-unknown-none-elf
+	UEFI=1 SERIAL=stdio SMP=4 bash boot/qemu-riscv64.sh {{kernel_dir}}/target/riscv64gc-unknown-none-elf/debug/kernel
 
 # build + boot the full aarch64 system through the own UEFI loader under the AAVMF
 # firmware (instead of QEMU's direct -kernel load), reaching the interactive shell.
