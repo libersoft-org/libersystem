@@ -174,10 +174,9 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 			// (SIP.SSIP); the hart is now awake and will re-check the run queue.
 			unsafe { core::arch::asm!("csrci sip, 2", options(nostack, preserves_flags)) };
 		} else if code == 9 {
-			// S-mode external interrupt: a PLIC-routed device interrupt. Claim, dispatch
-			// the source's kernel handler, and complete it (all inside handle_external).
-			let hartid = super::percpu::this_cpu().lapic_id() as u64;
-			super::plic::handle_external(hartid);
+			// S-mode external interrupt: an IMSIC-delivered device MSI. Claim each pending
+			// EID and wake its bound driver (all inside handle_external, edge-triggered).
+			super::imsic::handle_external();
 		}
 		return;
 	}

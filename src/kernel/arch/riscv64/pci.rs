@@ -122,11 +122,12 @@ pub fn interrupt_pin(bus: u8, dev: u8, func: u8) -> u8 {
 	((dword >> 8) & 0xff) as u8
 }
 
-// On QEMU virt the PLIC receives only wired INTx, never MSI/MSI-X, so the interrupt
-// path keeps every device on its INTx pin (see arch::interrupts). Enabling PCI MSI-X
-// here would switch the device to a message the PLIC cannot receive and silence it, so
-// this only ensures memory decode + bus mastering (which INTx delivery + virtio DMA
-// still need) and leaves the MSI-X enable bit clear. `cap` is unused on riscv.
-pub fn msix_enable(bus: u8, dev: u8, func: u8, _cap: u16) {
+// With QEMU's `virt,aia=aplic-imsic` the PCIe host bridge delivers MSI-X to the AIA
+// IMSIC, so - like x86 and aarch64 - each device gets its own edge-triggered vector
+// (its IMSIC EID) with no INTx line sharing. Ensure memory decode + bus mastering (the
+// MSI-X DMA write to the IMSIC and virtio DMA both need them), then set the device's
+// MSI-X enable bit + clear its function mask.
+pub fn msix_enable(bus: u8, dev: u8, func: u8, cap: u16) {
 	common::enable_mem_and_master::<Access>(bus, dev, func);
+	common::msix_enable::<Access>(bus, dev, func, cap);
 }

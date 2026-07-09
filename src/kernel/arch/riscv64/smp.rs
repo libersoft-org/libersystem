@@ -91,7 +91,7 @@ extern "C" fn riscv64_secondary_main(cpu_id: u64, hartid: u64) -> ! {
 	super::traps::init();
 	super::percpu::init(cpu_id as usize, hartid as u32);
 	crate::smp::set_lapic_id(cpu_id as usize, hartid as u32);
-	super::plic::init_hart(hartid);
+	super::imsic::init_hart();
 	super::apic::init_ap();
 	SEC_HARTID[cpu_id as usize].store(hartid, Ordering::Relaxed);
 	SMP_ONLINE.fetch_add(1, Ordering::Release);

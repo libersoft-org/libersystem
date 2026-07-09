@@ -218,9 +218,22 @@ fn serial_console_pump() {
 // shell exits (the user typed `exit`) or never attached.
 #[cfg(not(test))]
 pub(crate) fn console_shell_loop() {
-	if !console_input::shell_listening() {
-		serial_println!("shell: no interactive shell attached");
-		return;
+	// The shell attaches asynchronously: ConsoleService registers its console channel
+	// (SYS_CONSOLE_ATTACH) a few scheduler passes after it reports in, so the instant
+	// the boot chain settles it may not be attached yet on a slower arch (riscv under
+	// TCG emulation). Pump the schedule for a bounded window waiting for it before
+	// concluding none is present; on x86/aarch64 it has already attached, so this falls
+	// straight through with no wait.
+	let mut waited = 0u32;
+	while !console_input::shell_listening() {
+		if waited >= 300 {
+			serial_println!("shell: no interactive shell attached");
+			return;
+		}
+		waited += 1;
+		sched::run_until_idle();
+		arch::serial::drain_tx();
+		arch::idle_halt();
 	}
 	// Nudge the shell to print its first prompt, then pump both input sources until
 	// it exits. Each round forwards any waiting serial byte and runs the cooperative

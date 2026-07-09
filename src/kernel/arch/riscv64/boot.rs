@@ -154,7 +154,7 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	// Increment 4: parse the device tree (the shared FDT parser), seed the portable
 	// frame allocator, and bring up the kernel heap in the higher half.
 	use super::paging;
-	let (ram_top, cpu_count, pcie_ecam, plic_base) = match super::dtb::parse(dtb) {
+	let (ram_top, cpu_count, pcie_ecam, _plic_base) = match super::dtb::parse(dtb) {
 		Some(bi) => {
 			crate::serial_println!("riscv64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s), ECAM {:#x}, PLIC {:#x}", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count, bi.pcie_ecam, bi.plic_base);
 			(bi.ram_base + bi.ram_size, bi.cpu_count, bi.pcie_ecam, bi.plic_base)
@@ -165,10 +165,10 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 		}
 	};
 	let cpu_count = cpu_count.max(1);
+	let _ = _plic_base;
 
-	// Record the device-tree MMIO bases for the interrupt controller and PCIe config
-	// space (both under 8 GiB, so the boot direct map already reaches them).
-	super::plic::set_base(plic_base);
+	// Record the device-tree PCIe ECAM base (under 8 GiB, so the boot direct map already
+	// reaches it). The AIA IMSIC uses its fixed QEMU virt S-file base (imsic.rs).
 	super::pci::set_ecam_base(pcie_ecam);
 
 	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
@@ -210,9 +210,9 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	// Per-CPU block for the boot hart, reachable through `tp`.
 	super::percpu::allocate(cpu_count as usize);
 	super::percpu::init(0, hartid as u32);
-	// Bring up the PLIC on the boot hart (mask all sources, open this hart's S-mode
-	// threshold) so PLIC-routed device interrupts can be enabled per source.
-	super::plic::init(hartid);
+	// Bring up the AIA IMSIC on the boot hart (enable MSI delivery, accept any priority)
+	// so per-device MSI EIDs can be enabled and delivered here.
+	super::imsic::init_hart();
 	// Size the per-CPU id tables and record the boot hart's real id (the SBI boot hart
 	// is not necessarily hart 0), so the cross-hart wake IPI targets the right hart.
 	crate::smp::set_cpu_count(cpu_count as usize);
@@ -573,10 +573,19 @@ fn run_system_manager() {
 	match crate::spawn_system_manager() {
 		Ok((ep, koid)) => {
 			crate::serial_println!("riscv64: system - SystemManager spawned (koid {koid}), bringing up userspace");
-			for _ in 0..400 {
+			// Drive the boot chain until the interactive shell attaches (the last
+			// component to come up), draining its reports as they arrive. riscv under TCG
+			// settles the interrupt-driven chain (NetworkService's DHCP over virtio-net,
+			// then TimeService / ConsoleService / the shell) more slowly and variably than
+			// x86/aarch64, so drive to the shell rather than a fixed small budget; the cap
+			// is generous so the loop always returns even if a component never settles.
+			for _ in 0..4000 {
 				crate::sched::run_until_idle();
 				while let Ok(msg) = ep.recv() {
 					crate::serial_println!("riscv64: userspace: {}", core::str::from_utf8(&msg.bytes).unwrap_or("<bad>"));
+				}
+				if crate::console_input::shell_listening() {
+					break;
 				}
 				super::idle_halt();
 			}

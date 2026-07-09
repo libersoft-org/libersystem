@@ -153,7 +153,7 @@ pub mod percpu;
 pub mod smp;
 
 // -------------------------------------------------------------------- plic
-pub mod plic;
+pub mod imsic;
 
 // -------------------------------------------------------------- interrupts
 pub mod interrupts;

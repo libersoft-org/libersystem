@@ -1,21 +1,18 @@
-// riscv64 device-interrupt binding via wired INTx routed to the PLIC (M117).
+// riscv64 device-interrupt binding + MSI-X delivery via the AIA IMSIC (M117).
 //
-// QEMU's `virt` PCIe host bridge has NO MSI/MSI-X delivery: a device signals with a
-// wired INTx pin, routed through the standard PCIe swizzle to one of the PLIC's four
-// PCIe sources (0x20..0x23). So, unlike the x86 LAPIC-MSI and aarch64 GICv2m backends,
-// a device's "vector" here is its PLIC source id, and delivery is LEVEL-triggered: the
-// PLIC gateway holds the source between claim and complete, and the device keeps its
-// pin asserted until the driver deasserts it (a virtio driver reads the ISR-status
-// register; xHCI clears IMAN.IP). The acquire path therefore re-enables the device's
-// INTx pin (device::init disabled it) and unmasks the PLIC source; plic::handle_external
-// signals the bound Interrupt WITHOUT completing (the gateway masks the source); and the
-// SYS_INTERRUPT_ACK eoi completes it - by then the driver has deasserted the pin, so the
-// source does not immediately re-fire.
+// With QEMU's `virt,aia=aplic-imsic`, PCIe devices deliver MSI-X instead of wired INTx:
+// a device signals by DMA-writing an interrupt identity (EID) to a hart's IMSIC S-mode
+// file (imsic.rs), which pends that EID and raises the hart's external interrupt. So a
+// device's MSI "vector" here is its EID: acquire_msi hands out a free EID, programs the
+// device's MSI-X table entry to write it to the acquiring hart's IMSIC file, enables the
+// EID there, and imsic::handle_external wakes the bound Interrupt when that EID fires.
 //
-// The portable MSI syscalls drive this unchanged: device_msix_acquire calls acquire_msi
-// (which ignores the MSI-X table there is none to program and returns the PLIC source)
-// then pci::msix_enable (a no-op on riscv: enabling PCI MSI-X would move the device off
-// its INTx pin to a message the PLIC cannot receive), and interrupt_ack calls eoi.
+// This mirrors the x86 (LAPIC-MSI) and aarch64 (GICv2m) backends: every driver that needs
+// an interrupt uses MSI-X, the polled drivers (virtio-blk) need none, so is_bindable is
+// always false and only the MSI window is live. Unlike the old PLIC INTx path, EIDs are
+// per-device and edge-triggered - no shared line, no mask/complete dance, reliable
+// delivery. The MSI-X table lives in a device BAR reached through the higher-half direct
+// map (phys_to_virt), so no separate uncacheable mapping is needed.
 
 #![allow(dead_code)]
 
@@ -24,127 +21,138 @@ use alloc::sync::Arc;
 use crate::arch::common::msi::MsiRegistry;
 use crate::object::interrupt::Interrupt;
 
-// The device-IRQ vector window base (mirrors the contract). On riscv it is the first
-// PCIe INTx PLIC source, so a vector doubles as its PLIC source id.
+// The device-IRQ vector window base (mirrors the contract; only the MSI window is live).
 pub const IRQ_BASE: u8 = 32;
 
 pub type HandlerFn = fn(u8);
 
-// The QEMU virt PCIe INTx sources on the PLIC: the four INTx lines A..D map to PLIC
-// sources 0x20..0x23, selected by the standard PCIe swizzle (pin + slot) % 4.
-const PCIE_INTX_BASE: u32 = 0x20;
-const PCIE_INTX_LINES: u32 = 4;
+// Device EIDs run 1..=MAX_MSI (EID 0 is "no interrupt"; the IMSIC EIE0 register holds
+// EIDs 0..63 on RV64, so a single register covers them). Slot i (in the registry) maps
+// to EID EID_BASE + i.
+const EID_BASE: u32 = 1;
+const MAX_MSI: usize = 62; // EIDs 1..=62, all within IMSIC EIE0
 
-// Bindings for every PLIC source (the vector IS the source id). MAX_SOURCES matches the
-// PLIC's source table; a driver's Interrupt is held weakly, so a gone driver clears its
-// own binding on Drop.
-const MAX_SOURCES: usize = 96;
-static REGISTRY: MsiRegistry<MAX_SOURCES> = MsiRegistry::new();
+// The per-device MSI slot bindings (reserve / bind / dispatch / free bookkeeping, shared
+// with x86/aarch64 via arch::common::msi). Slot i maps to EID EID_BASE + i.
+static REGISTRY: MsiRegistry<MAX_MSI> = MsiRegistry::new();
 
-// The PLIC source a device's INTx pin lands on: swizzle its PCI slot with its pin.
-fn intx_source(bus: u8, dev: u8, func: u8) -> u32 {
-	let pin = super::pci::interrupt_pin(bus, dev, func).max(1) as u32; // 1..4 (A..D)
-	PCIE_INTX_BASE + ((dev as u32 + pin - 1) % PCIE_INTX_LINES)
+// The registry slot an EID maps to, or None if it is outside the MSI window.
+fn eid_slot(eid: u32) -> Option<usize> {
+	if eid >= EID_BASE && ((eid - EID_BASE) as usize) < MAX_MSI { Some((eid - EID_BASE) as usize) } else { None }
 }
 
-// No legacy sys_interrupt_bind path on riscv: a driver takes its device interrupt
-// through device_msix_acquire (acquire_msi + bind_msi), which the DeviceManager already
-// uses on every arch. is_bindable / bind therefore always refuse, like aarch64.
+// No legacy-INTx binding on riscv: every driver that needs an interrupt uses MSI-X.
 pub fn is_bindable(_vector: u8) -> bool {
 	false
 }
 
+// The INTx bind path is unused (see is_bindable); it always refuses.
 pub fn bind(_vector: u8, _intr: &Arc<Interrupt>) -> bool {
 	false
 }
 
-// Remove a vector's binding (called from an Interrupt's Drop): mask its PLIC source so
-// the device cannot storm the now-unhandled line, then free the slot.
+// Remove any binding for `vector` (an EID; called from an Interrupt's Drop). MSI is
+// edge-triggered and unshared, so this just drops the binding and frees the slot; the
+// EID's IMSIC enable bit is cleared best-effort (a later stray MSI to a freed EID pends
+// but dispatches to no one).
 pub fn unbind(vector: u8) {
-	super::plic::disable_source(vector as u32, super::plic::boot_hart());
-	REGISTRY.free(vector as usize);
+	if let Some(slot) = eid_slot(vector as u32) {
+		super::imsic::disable_eid(vector as u32);
+		REGISTRY.free(slot);
+	}
 }
 
-// Acquire the INTx-over-PLIC "MSI" for the discovered device at `owner`: resolve the
-// PLIC source its wired pin lands on, reserve it, re-enable the device's INTx pin
-// (device::init disabled every pin), and route + unmask the source on the boot hart.
-// Returns the source as the vector; None if the source is out of range or already taken
-// (INTx sharing among two interrupt-driven devices is not supported yet - the block
-// drivers poll, so only the NIC and xHCI bind, and they land on distinct sources).
-// `table_phys` / `dest` (the MSI-table and LAPIC-target inputs) are unused: there is no
-// MSI-X table to program and the PLIC routes the source itself.
-pub fn acquire_msi(_table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
-	let (bus, dev, func) = crate::device::with(owner as usize, |d| (d.bus, d.dev, d.func))?;
-	let source = intx_source(bus, dev, func);
-	if source as usize >= MAX_SOURCES {
-		return None;
-	}
-	if !REGISTRY.acquire_at(source as usize, owner) {
-		return None;
-	}
-	super::pci::set_intx_disabled(bus, dev, func, false);
-	super::plic::enable_source(source, super::plic::boot_hart());
-	Some(source as u8)
+// Allocate a free EID and program a device's MSI-X table entry 0 so the device delivers
+// it: message address = the acquiring hart's IMSIC S-file, message data = the EID. The
+// EID is enabled on THIS hart (the one running the acquire), so the device's MSI targets
+// it. `table_phys` is the device's MSI-X table (reached through the higher-half direct
+// map). Returns the EID as the vector (None if every slot is taken); the caller enables
+// MSI-X on the device (pci::msix_enable) and binds an Interrupt with bind_msi. `owner` is
+// the discovered-device index (for the `lsirq` inventory); `dest` (the x86 LAPIC target)
+// is unused - IMSIC targets the current hart.
+pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
+	let slot = REGISTRY.acquire(owner, MAX_MSI)?;
+	let eid = EID_BASE + slot as u32;
+	let hart = super::percpu::this_cpu().lapic_id() as u64;
+	program_msix_entry(table_phys, super::imsic::msi_address(hart), eid);
+	super::imsic::enable_eid(eid);
+	Some(eid as u8)
 }
 
-// Bind `intr` to a `vector` (a PLIC source) so dispatch wakes it when the source fires.
-// Returns false if the source is already bound to a live Interrupt.
+// Write a device's MSI-X table entry 0 (reached through the physical direct map): the
+// message address is a hart's IMSIC S-file, so the device's DMA write of the message
+// data (the EID) pends that EID on that hart. Vector control = 0 (unmasked). A driver
+// must never write its own MSI-X table; only the kernel programs it here.
+fn program_msix_entry(table_phys: u64, msg_addr: u64, eid: u32) {
+	let entry = super::paging::phys_to_virt(table_phys) as *mut u32;
+	unsafe {
+		entry.add(0).write_volatile(msg_addr as u32); // message address low
+		entry.add(1).write_volatile((msg_addr >> 32) as u32); // message address high
+		entry.add(2).write_volatile(eid); // message data = the EID
+		entry.add(3).write_volatile(0); // vector control (unmasked)
+	}
+}
+
+// Bind `intr` to an MSI `vector` (an EID) so dispatch wakes it when the EID fires.
+// Returns false if the vector is already bound to a live Interrupt.
 pub fn bind_msi(vector: u8, intr: &Arc<Interrupt>) -> bool {
-	REGISTRY.bind(vector as usize, intr)
-}
-
-// Whether `vector` currently has a live driver binding.
-pub fn is_bound(vector: u8) -> bool {
-	REGISTRY.is_bound(vector as usize)
-}
-
-// Deliver a fired PLIC `source` to a bound driver. Returns true when the source was a
-// bound device INTx (signaled here), so plic::handle_external leaves it claimed for the
-// driver's ack instead of completing it (level-triggered). False for an unbound source.
-pub fn dispatch_intx(source: u32) -> bool {
-	if (source as usize) < MAX_SOURCES && REGISTRY.is_bound(source as usize) {
-		REGISTRY.dispatch(source as usize);
-		true
-	} else {
-		false
+	match eid_slot(vector as u32) {
+		Some(slot) => REGISTRY.bind(slot, intr),
+		None => false,
 	}
 }
 
-// End-of-interrupt for a serviced device INTx: complete its PLIC source so the gateway
-// forwards the next assertion. Called from SYS_INTERRUPT_ACK, which first cleared the
-// Interrupt's pending flag; the driver has already deasserted its device line, so the
-// completed source does not immediately re-fire. Completion always targets the boot
-// hart's context (where the source was enabled and claimed).
-pub fn eoi(vector: u8) {
-	super::plic::complete(super::plic::boot_hart(), vector as u32);
+// Whether `vector` (an EID) currently has a live driver binding.
+pub fn is_bound(vector: u8) -> bool {
+	match eid_slot(vector as u32) {
+		Some(slot) => REGISTRY.is_bound(slot),
+		None => false,
+	}
 }
 
-// The state of the vector at `index`, for the `lsirq` inventory. Index 0 is the
-// kernel's own timer - the S-mode timer interrupt (SCAUSE code 5, armed through the SBI
-// TIME extension), always in use and shown as a fixed vector like x86's LAPIC timer and
-// aarch64's EL1 physical-timer PPI. The four PCIe INTx PLIC sources (0x20..0x23) follow.
+// End-of-interrupt for a serviced vector. IMSIC MSI is edge-triggered and unshared, so
+// there is no level source to complete: a no-op (the stopei claim in handle_external
+// already cleared the EID's pending bit), kept for the portable SYS_INTERRUPT_ACK path.
+pub fn eoi(_vector: u8) {}
+
+// Deliver a fired EID to its bound MSI driver. Returns true when the EID was a bound MSI
+// vector (signaled here). Edge-triggered: just wake the bound driver.
+pub fn dispatch_msi(eid: u32) -> bool {
+	match eid_slot(eid) {
+		Some(slot) => {
+			REGISTRY.dispatch(slot);
+			true
+		}
+		None => false,
+	}
+}
+
+// The state of the vector at `index`, for the `lsirq` inventory. Index 0 is the kernel's
+// own timer - the S-mode timer interrupt (SCAUSE code 5) - shown as a fixed vector like
+// x86's LAPIC timer and aarch64's EL1 physical-timer PPI; the MSI window (each a device's
+// EID) follows.
 pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 	const TIMER_VECTOR: u32 = 5; // supervisor timer interrupt (scause code 5)
 	if index == 0 {
 		return Some(abi::IrqInfo { vector: TIMER_VECTOR, kind: abi::IRQ_KIND_FIXED, bound: 1, device: abi::IRQ_NO_DEVICE });
 	}
-	let line = index - 1;
-	if line >= PCIE_INTX_LINES as usize {
+	let slot = index - 1;
+	if slot >= MAX_MSI {
 		return None;
 	}
-	let source = PCIE_INTX_BASE + line as u32;
-	Some(abi::IrqInfo { vector: source, kind: abi::IRQ_KIND_FIXED, bound: is_bound(source as u8) as u32, device: REGISTRY.owner(source as usize) })
+	let eid = EID_BASE + slot as u32;
+	Some(abi::IrqInfo { vector: eid, kind: abi::IRQ_KIND_MSI, bound: is_bound(eid as u8) as u32, device: REGISTRY.owner(slot) })
 }
 
-// The number of vectors irq_info reports over (the timer entry plus the four PCIe INTx sources).
+// The number of vectors irq_info reports over (the timer entry plus the MSI window).
 pub fn irq_info_len() -> usize {
-	1 + PCIE_INTX_LINES as usize
+	1 + MAX_MSI
 }
 
-// No kernel-side INTx handler registration on riscv (device interrupts route to
-// userspace drivers via the registry; the timer is the S-mode timer, not a PLIC source).
+// No kernel-side INTx handler registration on riscv (device interrupts are MSI; the
+// timer is the S-mode timer, not an external source).
 pub fn register(_vector: u8, _handler: HandlerFn) {}
 
-// The PLIC is brought up on the boot hart in boot.rs (plic::init), before any device is
-// discovered, so there is nothing left to initialize here.
+// The IMSIC is brought up per hart in boot.rs / smp.rs (imsic::init_hart), so there is
+// nothing left to initialize here.
 pub fn init() {}
