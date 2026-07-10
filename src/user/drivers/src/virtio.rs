@@ -139,6 +139,10 @@ impl Queue {
 			if r16(used + 2) == self.last_used {
 				return None;
 			}
+			// Acquire barrier: order the observed completion before the buffer reads the
+			// caller makes next, so a weakly ordered core (RISC-V) sees the device's DMA
+			// writes rather than stale data (see `submit`).
+			fence(Ordering::SeqCst);
 			let elem = used + 4 + (self.last_used % self.size) as u64 * 8;
 			let id = r32(elem) as u16;
 			let len = r32(elem + 4);
@@ -365,6 +369,14 @@ impl Queue {
 					yield_now();
 				}
 			}
+			// Acquire barrier: observing the used-index bump means the device has posted
+			// the completion, but on a weakly ordered core (RISC-V) the loads that read the
+			// device-written buffer may be reordered before the used-index load without a
+			// barrier here - returning stale data. A full fence orders the completion
+			// observation before every subsequent buffer read (in this thread and its
+			// callers), so the sectors the device DMA'd are visible. On x86 (TSO) load-load
+			// order is implicit, so this only bites the weakly ordered arches.
+			fence(Ordering::SeqCst);
 			// Each used-ring element is { id u32, len u32 }; return the used length.
 			Some(r32(used + 4 + (old_used % self.size) as u64 * 8 + 4))
 		}

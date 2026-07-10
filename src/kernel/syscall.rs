@@ -1293,7 +1293,7 @@ fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
 		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
 			return ERR_TIMED_OUT;
 		}
-		sched::block_on_flagged(koid, block_deadline, periodic);
+		sched::block_on_flagged(koid, block_deadline, periodic, || object_ready_for(&object, writable));
 	}
 }
 
@@ -1362,7 +1362,7 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
 			return ERR_TIMED_OUT;
 		}
-		sched::block_on_any(&koids[..n], block_deadline, periodic);
+		sched::block_on_any(&koids[..n], block_deadline, periodic, || objects.iter().take(n).any(|slot| slot.as_ref().is_some_and(|o| object_ready(o))));
 	}
 }
 

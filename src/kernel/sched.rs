@@ -301,12 +301,18 @@ pub fn exit() -> ! {
 // and the fault longjmp, reschedule(Block) RETURNS when the thread is woken, so
 // the Arc's destructor still runs normally.
 pub fn block_on(koid: u64, deadline: u64) {
-	block_on_flagged(koid, deadline, false);
+	block_on_flagged(koid, deadline, false, || false);
 }
 
-// block_on with the periodic marker: a housekeeping deadline that never counts as
-// pending progress (see TimedWaiter::periodic).
-pub fn block_on_flagged(koid: u64, deadline: u64, periodic: bool) {
+// block_on with the periodic marker and a readiness re-check. `ready` is re-evaluated
+// AFTER the thread has registered in the wait buckets, closing the classic wait/wake
+// race: the caller checks readiness first (interrupts on), then calls this to block, so
+// a wake landing in the window between that check and the registration below would scan
+// the object's bucket without finding the not-yet-registered thread and be lost. By
+// re-checking once registered, a readiness change (and its wake) in that window is
+// caught here and the park is aborted. The periodic marker is a housekeeping deadline
+// that never counts as pending progress (see TimedWaiter::periodic).
+pub fn block_on_flagged<F: Fn() -> bool>(koid: u64, deadline: u64, periodic: bool, ready: F) {
 	let thread = match current_thread() {
 		Some(t) => t,
 		None => return,
@@ -326,6 +332,22 @@ pub fn block_on_flagged(koid: u64, deadline: u64, periodic: bool) {
 	if deadline != NO_DEADLINE {
 		TIMED_WAITERS.lock().push(TimedWaiter { thread: thread.clone(), deadline, periodic });
 	}
+	// Re-check now that we are registered. If the object became ready in the race
+	// window AND we can reclaim ourselves (try_claim_wake wins the Blocked -> Ready
+	// race), abort the park - the caller's condition loop re-checks and proceeds. If
+	// try_claim_wake loses, a waker already claimed us and is enqueueing us (it spins
+	// for our parked SP), so we must fall through and complete the park to release it.
+	if ready() && thread.try_claim_wake() {
+		thread.set_state(ThreadState::Running);
+		bucket_of(koid).lock().retain(|w: &BucketWaiter| !Arc::ptr_eq(&w.thread, &thread));
+		if deadline != NO_DEADLINE {
+			TIMED_WAITERS.lock().retain(|w: &TimedWaiter| !Arc::ptr_eq(&w.thread, &thread));
+		}
+		if saved_if {
+			arch::enable_interrupts();
+		}
+		return;
+	}
 	reschedule(Disposition::Block);
 	// Woken and resumed: remove whatever entries this wait left behind (the waker
 	// removed only the one it claimed through).
@@ -342,7 +364,7 @@ pub fn block_on_flagged(koid: u64, deadline: u64, periodic: bool) {
 // passes): register it once per koid, so a wake on any of them returns it. The
 // caller re-checks which object is actually ready after each wake (the wait_any
 // condition loop), so an early or spurious wake just re-blocks.
-pub fn block_on_any(koids: &[u64], deadline: u64, periodic: bool) {
+pub fn block_on_any<F: Fn() -> bool>(koids: &[u64], deadline: u64, periodic: bool, ready: F) {
 	let thread = match current_thread() {
 		Some(t) => t,
 		None => return,
@@ -355,6 +377,22 @@ pub fn block_on_any(koids: &[u64], deadline: u64, periodic: bool) {
 	}
 	if deadline != NO_DEADLINE {
 		TIMED_WAITERS.lock().push(TimedWaiter { thread: thread.clone(), deadline, periodic });
+	}
+	// Register-then-recheck, closing the wait/wake race across the whole set (see
+	// block_on_flagged): if any object became ready in the window since the caller's
+	// pre-check and we reclaim ourselves, abort the park.
+	if ready() && thread.try_claim_wake() {
+		thread.set_state(ThreadState::Running);
+		for &koid in koids {
+			bucket_of(koid).lock().retain(|w: &BucketWaiter| !Arc::ptr_eq(&w.thread, &thread));
+		}
+		if deadline != NO_DEADLINE {
+			TIMED_WAITERS.lock().retain(|w: &TimedWaiter| !Arc::ptr_eq(&w.thread, &thread));
+		}
+		if saved_if {
+			arch::enable_interrupts();
+		}
+		return;
 	}
 	reschedule(Disposition::Block);
 	for &koid in koids {

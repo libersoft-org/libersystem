@@ -573,12 +573,11 @@ fn run_system_manager() {
 	match crate::spawn_system_manager() {
 		Ok((ep, koid)) => {
 			crate::serial_println!("riscv64: system - SystemManager spawned (koid {koid}), bringing up userspace");
-			// Drive the boot chain until the interactive shell attaches (the last
-			// component to come up), draining its reports as they arrive. riscv under TCG
-			// settles the interrupt-driven chain (NetworkService's DHCP over virtio-net,
-			// then TimeService / ConsoleService / the shell) more slowly and variably than
-			// x86/aarch64, so drive to the shell rather than a fixed small budget; the cap
-			// is generous so the loop always returns even if a component never settles.
+			// Drive the boot chain until the interactive shell attaches (the last component
+			// to come up), draining its reports as they arrive. riscv under TCG settles the
+			// interrupt-driven chain more slowly and variably than x86/aarch64, so drive to
+			// the shell rather than a fixed budget; the cap is generous so the loop always
+			// returns even if a component never settles.
 			for _ in 0..4000 {
 				crate::sched::run_until_idle();
 				while let Ok(msg) = ep.recv() {
