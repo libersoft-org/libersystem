@@ -11,8 +11,18 @@
 // faulting process (the resumable stack-growth fault + terminate_user land with the
 // usermode path in a later increment); an S-mode (kernel) fault is a bug and halts.
 //
-// Frame layout (34 u64 slots, 272 bytes): [0]=x0(unused) [1]=ra [2]=sp [3]=gp
-// [4]=tp [5..31]=x5..x31 [32]=sepc [33]=sstatus.
+// Frame layout (68 u64 slots, 544 bytes): [0]=x0(unused) [1]=ra [2]=sp [3]=gp
+// [4]=tp [5..31]=x5..x31 [32]=sepc [33]=sstatus [34..66]=f0..f31 [66]=fcsr [67]=pad.
+//
+// The FP register file (f0..f31 + fcsr) is saved and restored on EVERY trap. The
+// kernel is compiled with hardware float (rv64gc) and its trap/scheduler path uses
+// FP (switch_context saves the callee-saved fs regs; the Rust handler may touch any
+// caller-saved ft/fa reg), so a trap that does not preserve the FULL FP state would
+// silently corrupt the trapped thread's caller-saved FP registers. Userspace runs
+// with hardware float too, so a timer preemption (or a blocking syscall's context
+// switch) of a thread mid-FP-computation - e.g. a vectorized memcpy in the storage
+// service's filesystem writes - would resume with clobbered FP and write wrong bytes.
+// SSTATUS.FS is enabled at boot (and on every hart), so the fsd/fld/frcsr never trap.
 
 use core::arch::global_asm;
 
@@ -30,19 +40,23 @@ __trap_entry:
 	bnez    sp, 1f
 	csrrw   sp, sscratch, sp        // from S-mode: restore sp; sscratch stays 0
 1:
-	addi    sp, sp, -272
+	addi    sp, sp, -544
 	sd      x1,  1*8(sp)
+	// Save x5 (t0) BEFORE using t0 as scratch below - otherwise the trapped
+	// context's t0 is overwritten by the sscratch/sp computation and lost, and the
+	// thread resumes with a corrupt t0 (a caller-saved temp a tight loop may hold
+	// live). This silently corrupted whatever the interrupted code kept in t0.
+	sd      x5,  5*8(sp)
 	// frame[2] = the pre-trap sp. From U-mode the original user sp is now in
-	// sscratch; from S-mode sscratch is 0, so the pre-trap sp is sp + 272.
+	// sscratch; from S-mode sscratch is 0, so the pre-trap sp is sp + 544.
 	csrr    t0, sscratch
 	bnez    t0, 2f
-	addi    t0, sp, 272
+	addi    t0, sp, 544
 2:
 	sd      t0,  2*8(sp)
 	csrw    sscratch, zero          // S-mode convention while the handler runs
 	sd      x3,  3*8(sp)
 	sd      x4,  4*8(sp)
-	sd      x5,  5*8(sp)
 	sd      x6,  6*8(sp)
 	sd      x7,  7*8(sp)
 	sd      x8,  8*8(sp)
@@ -73,10 +87,81 @@ __trap_entry:
 	sd      t0, 32*8(sp)
 	csrr    t1, sstatus
 	sd      t1, 33*8(sp)
+	// Save the full FP register file so the handler (and any thread it switches
+	// to) cannot corrupt the trapped thread's caller-saved FP registers.
+	fsd     f0,  34*8(sp)
+	fsd     f1,  35*8(sp)
+	fsd     f2,  36*8(sp)
+	fsd     f3,  37*8(sp)
+	fsd     f4,  38*8(sp)
+	fsd     f5,  39*8(sp)
+	fsd     f6,  40*8(sp)
+	fsd     f7,  41*8(sp)
+	fsd     f8,  42*8(sp)
+	fsd     f9,  43*8(sp)
+	fsd     f10, 44*8(sp)
+	fsd     f11, 45*8(sp)
+	fsd     f12, 46*8(sp)
+	fsd     f13, 47*8(sp)
+	fsd     f14, 48*8(sp)
+	fsd     f15, 49*8(sp)
+	fsd     f16, 50*8(sp)
+	fsd     f17, 51*8(sp)
+	fsd     f18, 52*8(sp)
+	fsd     f19, 53*8(sp)
+	fsd     f20, 54*8(sp)
+	fsd     f21, 55*8(sp)
+	fsd     f22, 56*8(sp)
+	fsd     f23, 57*8(sp)
+	fsd     f24, 58*8(sp)
+	fsd     f25, 59*8(sp)
+	fsd     f26, 60*8(sp)
+	fsd     f27, 61*8(sp)
+	fsd     f28, 62*8(sp)
+	fsd     f29, 63*8(sp)
+	fsd     f30, 64*8(sp)
+	fsd     f31, 65*8(sp)
+	frcsr   t0
+	sd      t0,  66*8(sp)
 	csrr    a0, scause
 	csrr    a1, stval
 	mv      a2, sp
 	call    riscv64_trap
+	// Restore the FP register file before the integer frame (fscsr uses t0).
+	ld      t0,  66*8(sp)
+	fscsr   t0
+	fld     f0,  34*8(sp)
+	fld     f1,  35*8(sp)
+	fld     f2,  36*8(sp)
+	fld     f3,  37*8(sp)
+	fld     f4,  38*8(sp)
+	fld     f5,  39*8(sp)
+	fld     f6,  40*8(sp)
+	fld     f7,  41*8(sp)
+	fld     f8,  42*8(sp)
+	fld     f9,  43*8(sp)
+	fld     f10, 44*8(sp)
+	fld     f11, 45*8(sp)
+	fld     f12, 46*8(sp)
+	fld     f13, 47*8(sp)
+	fld     f14, 48*8(sp)
+	fld     f15, 49*8(sp)
+	fld     f16, 50*8(sp)
+	fld     f17, 51*8(sp)
+	fld     f18, 52*8(sp)
+	fld     f19, 53*8(sp)
+	fld     f20, 54*8(sp)
+	fld     f21, 55*8(sp)
+	fld     f22, 56*8(sp)
+	fld     f23, 57*8(sp)
+	fld     f24, 58*8(sp)
+	fld     f25, 59*8(sp)
+	fld     f26, 60*8(sp)
+	fld     f27, 61*8(sp)
+	fld     f28, 62*8(sp)
+	fld     f29, 63*8(sp)
+	fld     f30, 64*8(sp)
+	fld     f31, 65*8(sp)
 	ld      t0, 32*8(sp)
 	csrw    sepc, t0
 	ld      t1, 33*8(sp)
@@ -86,7 +171,7 @@ __trap_entry:
 	// while t1 still holds sstatus (before the temp registers are reloaded below).
 	andi    t0, t1, 0x100
 	bnez    t0, 3f
-	addi    t0, sp, 272
+	addi    t0, sp, 544
 	csrw    sscratch, t0
 3:
 	ld      x1,  1*8(sp)

@@ -775,45 +775,6 @@ struct ChannelBlockDevice {
 	max_sectors: u32,
 }
 
-// PROBE helpers (temporary): FNV-1a over a buffer + a decimal print, to catch a
-// caller's buffer being mutated across a blocking write.
-unsafe fn probe_cksum(b: &[u8]) -> u64 {
-	let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-	for &x in b {
-		h ^= x as u64;
-		h = h.wrapping_mul(0x0000_0100_0000_01b3);
-	}
-	h
-}
-
-// PROBE (temporary): a per-LBA log of the LAST block written to each disk block,
-// keyed by absolute LBA -> FNV of the 4096-byte block. Re-read after the seed to
-// catch a physical block that changed since our last write to it with NO intervening
-// write from us = an external stray write clobbered it.
-static mut WRITE_LOG: Option<alloc::collections::BTreeMap<u64, u64>> = None;
-
-unsafe fn write_log_record(lba: u64, fnv: u64) {
-	unsafe {
-		let log = &mut *core::ptr::addr_of_mut!(WRITE_LOG);
-		log.get_or_insert_with(alloc::collections::BTreeMap::new).insert(lba, fnv);
-	}
-}
-
-unsafe fn probe_u64(v: u64) {
-	let mut buf: [u8; 20] = [0u8; 20];
-	let mut i: usize = 20;
-	let mut n: u64 = v;
-	loop {
-		i -= 1;
-		buf[i] = b'0' + (n % 10) as u8;
-		n /= 10;
-		if n == 0 {
-			break;
-		}
-	}
-	unsafe { print(&buf[i..]) };
-}
-
 impl BlockDevice for ChannelBlockDevice {
 	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
 		if index >= self.limit {
@@ -847,27 +808,7 @@ impl BlockDevice for ChannelBlockDevice {
 			return false;
 		}
 		let lba: u64 = self.base + index * SECTORS_PER_BLOCK;
-		// PROBE (temporary): checksum the caller's buffer before and after the blocking
-		// write. The write yields (recv_blocking waits for the driver reply); if the
-		// buffer's memory is corrupted by an external agent during that yield, the disk
-		// gets the correct pre-copy data but liberfs then CRCs the mutated buffer for the
-		// parent link -> a read-back CRC mismatch (FsError::Corrupt).
-		let before: u64 = unsafe { probe_cksum(buf) };
-		let ok: bool = unsafe { block_write(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_ptr()) };
-		let after: u64 = unsafe { probe_cksum(buf) };
-		if before != after {
-			unsafe {
-				print(b"WBUF-MUTATED index=");
-				probe_u64(index);
-				print(b" lba=");
-				probe_u64(lba);
-				print(b"\n");
-			}
-		}
-		if ok {
-			unsafe { write_log_record(lba, after) };
-		}
-		ok
+		unsafe { block_write(self.chan, lba, SECTORS_PER_BLOCK as u32, buf.as_ptr()) }
 	}
 
 	fn flush(&mut self) -> bool {
@@ -963,53 +904,6 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 	fs.set_clock(unsafe { clock_rtc() });
 	if let Some(archive) = unsafe { read_seed_archive(block_client, max_sectors) } {
 		seed_from_archive(&mut fs, &archive);
-		// PROBE (temporary): verify every seeded file reads back OK, right after the seed
-		// and BEFORE serving. Failures here = the fresh seed itself produced a corrupt FS
-		// (deterministic-input, single-threaded); zero here but failures later = the
-		// corruption happens during the concurrent service-load phase, not the seed.
-		if let Some(package) = Package::parse(&archive) {
-			let mut fails: u64 = 0;
-			for index in 0..package.len() {
-				if let Some(name) = package.name(index) {
-					if fs.read_file(name).is_err() {
-						fails += 1;
-					}
-				}
-			}
-			unsafe {
-				print(b"SEED-VERIFY fails=");
-				probe_u64(fails);
-				print(b"\n");
-			}
-		}
-		// PROBE (temporary): re-read every block we ever wrote and compare to our last
-		// write's checksum. A mismatch = that physical block changed since our last write
-		// with no intervening write from us = an EXTERNAL stray write clobbered it (points
-		// OUTSIDE liberfs: driver/DMA/kernel copy). Zero mismatches but SEED-VERIFY>0 =
-		// the disk holds exactly what liberfs wrote, so liberfs wrote self-inconsistent
-		// data-vs-CRC (a buffer reused between data-write and crc-compute).
-		unsafe {
-			if let Some(log) = &*core::ptr::addr_of!(WRITE_LOG) {
-				let mut clobbered: u64 = 0;
-				let mut first: u64 = u64::MAX;
-				let mut buf = alloc::vec![0u8; liberfs::BLOCK_SIZE];
-				for (&lba, &fnv) in log.iter() {
-					if block_read(block_client, lba, SECTORS_PER_BLOCK as u32, buf.as_mut_ptr()) && probe_cksum(&buf) != fnv {
-						clobbered += 1;
-						if first == u64::MAX {
-							first = lba;
-						}
-					}
-				}
-				print(b"WRITE-CLOBBER count=");
-				probe_u64(clobbered);
-				print(b" of=");
-				probe_u64(log.len() as u64);
-				print(b" first-lba=");
-				probe_u64(first);
-				print(b"\n");
-			}
-		}
 	}
 	Some(fs)
 }
@@ -1118,20 +1012,6 @@ fn seed_from_archive(fs: &mut LiberFs<ChannelBlockDevice>, archive: &[u8]) {
 		if let Some(name) = package.name(index) {
 			if let Some(bytes) = package.lookup(name) {
 				let _ = fs.write_file(name, bytes);
-				// PROBE (temporary): read the file back IMMEDIATELY (right after its own
-				// write/commit). Fails here = corrupt at WRITE time (data-vs-csum split in
-				// the write path). Passes here but fails the final SEED-VERIFY = the file's
-				// blocks were corrupted AFTER its commit, by a LATER file's write.
-				let immed_ok = matches!(fs.read_file(name), Ok(back) if back.len() == bytes.len());
-				if !immed_ok {
-					unsafe {
-						print(b"IMMED-FAIL i=");
-						probe_u64(index as u64);
-						print(b" name=");
-						print(name);
-						print(b"\n");
-					}
-				}
 			}
 		}
 	}
@@ -1203,14 +1083,6 @@ unsafe fn read_seed_archive(block_client: u64, max_sectors: u32) -> Option<Vec<u
 			}
 		}
 		archive.truncate(total);
-		// PROBE (temporary): the archive is dd'd identically each boot, so a correct read
-		// gives the same checksum every boot. A varying checksum means the LBA-0 archive
-		// read is non-deterministically corrupt (the unverified seed input).
-		print(b"ARCHIVE-CRC len=");
-		probe_u64(total as u64);
-		print(b" crc=");
-		probe_u64(probe_cksum(&archive));
-		print(b"\n");
 		Some(archive)
 	}
 }

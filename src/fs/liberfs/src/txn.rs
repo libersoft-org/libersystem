@@ -228,49 +228,6 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(())
 	}
 
-	// PROBE (temporary): walk the live + previous + snapshot generations into a fresh
-	// map (exactly what the free map must reserve) and count blocks that ARE referenced
-	// but sit marked FREE in `self.free` - the under-reservation that lets a later
-	// allocation hand out a still-live block and overwrite it. Returns (count, first
-	// such block). Does NOT mutate the allocator state (unlike derive_free).
-	pub fn debug_underreserved(&mut self) -> (u64, u64) {
-		let len = self.free.len();
-		let mut live = vec![0u8; len];
-		set_bit(&mut live, 0);
-		set_bit(&mut live, 1);
-		let _ = self.mark_inode_tree(self.inode_root, &mut live);
-		{
-			let mut ptr = self.snap_root;
-			let mut buf = vec![0u8; BLOCK_SIZE];
-			while ptr != 0 && ptr < self.num_blocks && !test_bit(&live, ptr) {
-				set_bit(&mut live, ptr);
-				if !self.dev.read_block(ptr, &mut buf) {
-					break;
-				}
-				ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-			}
-		}
-		for i in 0..self.snapshots.len() {
-			let root = self.snapshots[i].inode_root;
-			let _ = self.mark_inode_tree(root, &mut live);
-		}
-		if self.prev_valid {
-			let _ = self.mark_inode_tree(self.prev_inode_root, &mut live);
-		}
-		self.walk_damage = false;
-		let mut count = 0u64;
-		let mut first = u64::MAX;
-		for b in 0..self.num_blocks {
-			if test_bit(&live, b) && !test_bit(&self.free, b) {
-				count += 1;
-				if first == u64::MAX {
-					first = b;
-				}
-			}
-		}
-		(count, first)
-	}
-
 	// Mark, in `map`, every block the inode B+tree rooted at `ptr` references: the tree
 	// nodes themselves, and for each live inode either its file data / checksum /
 	// overflow blocks or its directory's B+tree. Reads are raw (no checksum check), like
