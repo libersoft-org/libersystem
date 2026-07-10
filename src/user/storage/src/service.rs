@@ -786,6 +786,19 @@ unsafe fn probe_cksum(b: &[u8]) -> u64 {
 	h
 }
 
+// PROBE (temporary): a per-LBA log of the LAST block written to each disk block,
+// keyed by absolute LBA -> FNV of the 4096-byte block. Re-read after the seed to
+// catch a physical block that changed since our last write to it with NO intervening
+// write from us = an external stray write clobbered it.
+static mut WRITE_LOG: Option<alloc::collections::BTreeMap<u64, u64>> = None;
+
+unsafe fn write_log_record(lba: u64, fnv: u64) {
+	unsafe {
+		let log = &mut *core::ptr::addr_of_mut!(WRITE_LOG);
+		log.get_or_insert_with(alloc::collections::BTreeMap::new).insert(lba, fnv);
+	}
+}
+
 unsafe fn probe_u64(v: u64) {
 	let mut buf: [u8; 20] = [0u8; 20];
 	let mut i: usize = 20;
@@ -850,6 +863,9 @@ impl BlockDevice for ChannelBlockDevice {
 				probe_u64(lba);
 				print(b"\n");
 			}
+		}
+		if ok {
+			unsafe { write_log_record(lba, after) };
 		}
 		ok
 	}
@@ -966,6 +982,34 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 				print(b"\n");
 			}
 		}
+		// PROBE (temporary): re-read every block we ever wrote and compare to our last
+		// write's checksum. A mismatch = that physical block changed since our last write
+		// with no intervening write from us = an EXTERNAL stray write clobbered it (points
+		// OUTSIDE liberfs: driver/DMA/kernel copy). Zero mismatches but SEED-VERIFY>0 =
+		// the disk holds exactly what liberfs wrote, so liberfs wrote self-inconsistent
+		// data-vs-CRC (a buffer reused between data-write and crc-compute).
+		unsafe {
+			if let Some(log) = &*core::ptr::addr_of!(WRITE_LOG) {
+				let mut clobbered: u64 = 0;
+				let mut first: u64 = u64::MAX;
+				let mut buf = alloc::vec![0u8; liberfs::BLOCK_SIZE];
+				for (&lba, &fnv) in log.iter() {
+					if block_read(block_client, lba, SECTORS_PER_BLOCK as u32, buf.as_mut_ptr()) && probe_cksum(&buf) != fnv {
+						clobbered += 1;
+						if first == u64::MAX {
+							first = lba;
+						}
+					}
+				}
+				print(b"WRITE-CLOBBER count=");
+				probe_u64(clobbered);
+				print(b" of=");
+				probe_u64(log.len() as u64);
+				print(b" first-lba=");
+				probe_u64(first);
+				print(b"\n");
+			}
+		}
 	}
 	Some(fs)
 }
@@ -1074,6 +1118,20 @@ fn seed_from_archive(fs: &mut LiberFs<ChannelBlockDevice>, archive: &[u8]) {
 		if let Some(name) = package.name(index) {
 			if let Some(bytes) = package.lookup(name) {
 				let _ = fs.write_file(name, bytes);
+				// PROBE (temporary): read the file back IMMEDIATELY (right after its own
+				// write/commit). Fails here = corrupt at WRITE time (data-vs-csum split in
+				// the write path). Passes here but fails the final SEED-VERIFY = the file's
+				// blocks were corrupted AFTER its commit, by a LATER file's write.
+				let immed_ok = matches!(fs.read_file(name), Ok(back) if back.len() == bytes.len());
+				if !immed_ok {
+					unsafe {
+						print(b"IMMED-FAIL i=");
+						probe_u64(index as u64);
+						print(b" name=");
+						print(name);
+						print(b"\n");
+					}
+				}
 			}
 		}
 	}
