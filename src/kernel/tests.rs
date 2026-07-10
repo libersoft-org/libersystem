@@ -775,6 +775,15 @@ fn breakpoint_exception_returns() {
 	unsafe { core::arch::asm!("int3") };
 }
 
+#[cfg(target_arch = "riscv64")]
+#[test_case]
+fn breakpoint_exception_returns() {
+	// reaching the next line proves the trap handler resumed past the ebreak: it decodes
+	// the trapped instruction width (2 bytes for a compressed c.ebreak, else 4) and
+	// advances sepc, the riscv analogue of x86's int3 breakpoint round-trip.
+	unsafe { core::arch::asm!("ebreak") };
+}
+
 #[test_case]
 fn frame_alloc_distinct() {
 	let a = mem::frame::allocate().expect("frame a");
@@ -852,7 +861,13 @@ fn the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free() {
 #[test_case]
 fn paging_map_unmap() {
 	let phys = mem::frame::allocate().expect("scratch frame");
+	// Sv39 (riscv64) only has a 39-bit canonical VA range, so the 48-bit x86/aarch64
+	// scratch address below is non-canonical there and faults; use a free canonical
+	// kernel-half VA just past the riscv mmap window (KERNEL_MMAP_BASE + 64 GiB).
+	#[cfg(not(target_arch = "riscv64"))]
 	let virt: u64 = 0xffff_f000_0000_0000;
+	#[cfg(target_arch = "riscv64")]
+	let virt: u64 = 0xffff_fff0_0000_0000;
 	arch::paging::map_page(virt, phys, arch::paging::WRITABLE);
 	let ptr = virt as *mut u64;
 	unsafe {
@@ -1575,6 +1590,70 @@ fn gicv2m_msi_inventory_reports_the_timer_and_msi_vectors() {
 	frame::deallocate(table);
 }
 
+// The riscv64 counterpart of the x86 INTx and aarch64 GICv2m interrupt tests: on riscv
+// (QEMU `virt,aia=aplic-imsic`) every device interrupt is an MSI-X-delivered EID pended in
+// a hart's IMSIC S-file (imsic.rs) - there is no bindable wired vector. These exercise the
+// AIA/IMSIC MSI path directly: acquire an EID, bind a driver Interrupt, dispatch the EID.
+#[cfg(target_arch = "riscv64")]
+#[test_case]
+fn imsic_msi_binds_and_dispatch_signals_the_driver() {
+	use mem::frame;
+	use object::interrupt::Interrupt;
+	// A frame stands in for a device's MSI-X table: acquire_msi programs entry 0 into it
+	// (message address = the acquiring hart's IMSIC S-file, message data = the EID).
+	let table = frame::allocate().expect("a frame for the fake MSI-X table");
+	// Acquire a per-device MSI vector (an IMSIC EID). `dest` (the x86 LAPIC target) is
+	// unused on riscv; `owner` is a fake discovered-device index.
+	let vector = arch::interrupts::acquire_msi(table, 0, 3).expect("acquire_msi hands out a free EID");
+	// Bind a driver Interrupt to the vector; a second live bind is refused.
+	let intr = Interrupt::new(vector);
+	assert!(arch::interrupts::bind_msi(vector, &intr), "the first bind succeeds");
+	assert!(arch::interrupts::is_bound(vector), "the vector reads as bound");
+	let intr2 = Interrupt::new(vector);
+	assert!(!arch::interrupts::bind_msi(vector, &intr2), "a second live bind is refused");
+	// Dispatching the EID - what imsic::handle_external does when the EID fires - marks the
+	// bound Interrupt pending (its wait readiness).
+	assert!(!intr.is_pending(), "not pending before the EID fires");
+	assert!(arch::interrupts::dispatch_msi(vector as u32), "dispatch_msi claims its own EID");
+	assert!(intr.is_pending(), "dispatch signalled the bound Interrupt");
+	// EID 0 is "no interrupt" - outside the MSI window - so it dispatches to no one.
+	assert!(!arch::interrupts::dispatch_msi(0), "EID 0 is not one of the device MSI EIDs");
+	// Unbinding frees the slot for re-use.
+	arch::interrupts::unbind(vector);
+	assert!(!arch::interrupts::is_bound(vector), "unbind drops the binding");
+	frame::deallocate(table);
+}
+
+#[cfg(target_arch = "riscv64")]
+#[test_case]
+fn imsic_msi_inventory_reports_the_timer_and_msi_vectors() {
+	use mem::frame;
+	// Index 0 of the riscv IRQ inventory (what `lsirq` reads) is the kernel's own S-mode
+	// timer interrupt (SCAUSE code 5), always in use and reported as a fixed vector - the
+	// riscv analogue of x86's fixed LAPIC-timer entry and aarch64's timer PPI.
+	let timer = arch::interrupts::irq_info(0).expect("the inventory has a timer entry");
+	assert_eq!(timer.kind, abi::IRQ_KIND_FIXED, "index 0 is the fixed S-mode timer");
+	assert_eq!(timer.vector, 5, "the riscv timer is the S-mode timer interrupt (scause code 5)");
+	assert_eq!(timer.bound, 1, "the timer is always the kernel's own");
+	// After the timer, each entry is an IMSIC MSI EID. Acquiring one for a fake device
+	// makes it appear in the inventory as an MSI vector owned by that device index.
+	let table = frame::allocate().expect("a frame for the fake MSI-X table");
+	let vector = arch::interrupts::acquire_msi(table, 0, 9).expect("acquire an MSI EID");
+	let mut seen = false;
+	for i in 1..arch::interrupts::irq_info_len() {
+		if let Some(info) = arch::interrupts::irq_info(i)
+			&& info.vector == vector as u32
+		{
+			assert_eq!(info.kind, abi::IRQ_KIND_MSI, "an acquired vector reports as MSI");
+			assert_eq!(info.device, 9, "the inventory records the owning device index");
+			seen = true;
+		}
+	}
+	assert!(seen, "the acquired MSI vector appears in the inventory");
+	arch::interrupts::unbind(vector);
+	frame::deallocate(table);
+}
+
 #[test_case]
 fn object_property_set_names_an_object() {
 	use core::sync::atomic::{AtomicBool, Ordering};
@@ -1755,11 +1834,16 @@ fn a_sender_on_a_full_channel_blocks_and_wakes_on_drain() {
 		}
 	}
 	let (ep0, ep1) = object::channel::Channel::create_with_depth(2);
-	// The sender runs first: it fills the depth-2 queue, is refused, and blocks.
+	// Run the sender ALONE first so it deterministically fills the depth-2 queue, is
+	// refused on the third send and blocks - without the receiver interleaving to drain a
+	// slot before that third send (a scheduling race that made this flaky on riscv-TCG,
+	// where a timer tick could switch to the receiver mid-fill).
 	sched::spawn_with_object(sender, ep0, object::rights::Rights::ALL, 0);
-	sched::spawn_with_object(receiver, ep1, object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(SENDER_REFUSED.load(Ordering::SeqCst), "the depth-2 queue refused the third send");
+	// Now the receiver drains, which must wake the blocked sender to deliver the rest.
+	sched::spawn_with_object(receiver, ep1, object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
 	assert!(SENDER_DONE.load(Ordering::SeqCst), "the drain woke the blocked sender");
 	assert_eq!(RECEIVED.load(Ordering::SeqCst), 3, "every message was delivered");
 }
@@ -2924,17 +3008,14 @@ fn config_service_serves_the_tree() {
 	assert_eq!(&b[7..7 + vlen], b"hi", "the value just set reads back");
 }
 
-// Not run on riscv64: this end-to-end test asserts the EXACT boot-chain report order,
-// which requires the interrupt-driven services (NetworkService over virtio-net, and its
-// transitive dependents TimeService/PermissionManager/ConsoleService/SystemGraphService/
-// Shell) to all settle inside the harness's single `run_until_idle()`. On riscv64 under
-// QEMU/TCG the virtio-net RX interrupt (routed as wired INTx through the PLIC) does not
-// reliably arrive within that one settle window, so those services intermittently do not
-// report in - the polled services (all five StorageService instances) always do. The full
-// chain IS functional on riscv64: the interactive boot (`just run-riscv64`, whose
-// SystemManager drives a multi-pass run_until_idle + idle_halt loop) reaches the shell
-// with NetworkService/TimeService/ConsoleService/Shell online deterministically.
-#[cfg(not(target_arch = "riscv64"))]
+// This end-to-end test asserts the EXACT boot-chain report order, which requires the
+// interrupt-driven services (NetworkService over virtio-net, and its transitive
+// dependents TimeService/PermissionManager/ConsoleService/SystemGraphService/Shell) to
+// all settle inside the harness's single `run_until_idle()`. It was previously gated off
+// riscv64 (`#[cfg(not(target_arch = "riscv64"))]`) because those services intermittently
+// failed to report in there - which turned out to be the riscv trap-frame register clobber
+// (a trap could corrupt the interrupted thread's t0/x5), not an interrupt-timing issue;
+// with that fixed the chain settles deterministically on riscv64 too.
 #[test_case]
 fn init_package_starts_system_manager() {
 	// The boot chain, end to end: SystemManager starts from the init package, spawns
@@ -4253,6 +4334,33 @@ fn writable_pages_are_not_executable() {
 	// fault was an instruction fetch blocked by UXN, not a data access (which is 0x24).
 	let ec = (NX_CODE.load(Ordering::SeqCst) >> 26) & 0x3f;
 	assert_eq!(ec, 0x20, "the W^X fault is an EL0 instruction abort (UXN), not a data abort");
+	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
+}
+
+// The riscv64 counterpart: riscv has no x86 page-fault error code nor aarch64 ESR; a W^X
+// fetch fault is just the scause exception code. On Sv39 a WRITABLE leaf leaves the X bit
+// clear (map_page only sets X for an executable mapping), so the same NX probe is checked
+// through scause instead.
+#[cfg(target_arch = "riscv64")]
+#[test_case]
+fn writable_pages_are_not_executable() {
+	use core::sync::atomic::Ordering;
+	use object::domain::Domain;
+	// W^X on riscv (Sv39): a WRITABLE leaf PTE has its X bit clear, so a U-mode thread
+	// jumping into its own writable stack page takes an instruction page fault on the
+	// FETCH (before a stack byte runs); the kernel kills only that process and records the
+	// stack address it tried to run.
+	let domain = Domain::new(1 << 20, 8, 4);
+	sched::spawn_in(domain.clone(), user_nx_thread_body, 0).expect("spawn nx probe thread");
+	sched::run_until_idle();
+	assert_eq!(NX_GOT.load(Ordering::SeqCst), 1, "fault info should be recorded");
+	assert_eq!(NX_KIND.load(Ordering::SeqCst), fault::FAULT_PAGE);
+	let addr = NX_ADDR.load(Ordering::SeqCst);
+	assert!((USER_STACK_VA..USER_STACK_VA + mem::frame::PAGE_SIZE).contains(&addr), "the fault is inside the stack page");
+	// The riscv-specific angle: the recorded error_code is scause, which is 12 - an
+	// instruction page fault (the fetch blocked by the clear X bit), not a load (13) or
+	// store (15) page fault.
+	assert_eq!(NX_CODE.load(Ordering::SeqCst), 12, "the W^X fault is an instruction page fault (scause 12)");
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
