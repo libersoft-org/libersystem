@@ -30,6 +30,8 @@ use bootproto::MemRegion;
 
 use alloc::vec::Vec;
 
+use alloc::collections::BTreeSet;
+
 use crate::sync::SpinLock;
 
 pub const PAGE_SIZE: u64 = 4096;
@@ -54,11 +56,36 @@ struct FrameAllocator {
 	heap: Option<Vec<Run>>,
 	free_count: usize,
 	total_count: usize,
+	// PROBE (temporary): the set of currently-allocated frames (post-heap only), to
+	// detect a physical frame handed out to two owners (a double-allocation).
+	check: Option<BTreeSet<u64>>,
 }
 
 impl FrameAllocator {
 	const fn new() -> Self {
-		Self { seed: [Run { base: 0, pages: 0 }; SEED_RUNS], seed_len: 0, heap: None, free_count: 0, total_count: 0 }
+		Self { seed: [Run { base: 0, pages: 0 }; SEED_RUNS], seed_len: 0, heap: None, free_count: 0, total_count: 0, check: None }
+	}
+
+	// PROBE (temporary): record `pages` frames from `base` as allocated; a frame already
+	// present is a double-allocation (two owners of one physical frame - memory corruption).
+	fn mark_alloc(&mut self, base: u64, pages: u64) {
+		if let Some(set) = self.check.as_mut() {
+			for i in 0..pages {
+				let f = base + i * PAGE_SIZE;
+				if !set.insert(f) {
+					crate::serial_println!("FRAME-DOUBLE-ALLOC {:#x}", f);
+				}
+			}
+		}
+	}
+
+	// PROBE (temporary): drop `pages` frames from `base` from the allocated set.
+	fn mark_free(&mut self, base: u64, pages: u64) {
+		if let Some(set) = self.check.as_mut() {
+			for i in 0..pages {
+				set.remove(&(base + i * PAGE_SIZE));
+			}
+		}
 	}
 
 	// The current run table, whichever backing it lives in.
@@ -122,6 +149,7 @@ impl FrameAllocator {
 		if pages == 0 {
 			return;
 		}
+		self.mark_free(base, pages);
 		let at = self.position(base);
 		let end = base + pages * PAGE_SIZE;
 		let len = self.runs().len();
@@ -178,6 +206,7 @@ impl FrameAllocator {
 			self.remove_at(0);
 		}
 		self.free_count -= 1;
+		self.mark_alloc(base, 1);
 		Some(base)
 	}
 
@@ -197,6 +226,7 @@ impl FrameAllocator {
 					self.remove_at(at);
 				}
 				self.free_count -= pages as usize;
+				self.mark_alloc(base, pages);
 				return Some(base);
 			}
 		}
@@ -243,6 +273,7 @@ pub fn upgrade_to_heap() {
 	let mut runs = Vec::with_capacity((allocator.seed_len * 2).max(64));
 	runs.extend_from_slice(&allocator.seed[..allocator.seed_len]);
 	allocator.heap = Some(runs);
+	allocator.check = Some(BTreeSet::new());
 }
 
 // The frame pool's totals: (total usable frames fixed at init, frames currently free).
