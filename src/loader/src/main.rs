@@ -168,11 +168,7 @@ pub(crate) fn to_utf16(s: &str, out: &mut [u16]) {
 pub(crate) fn alloc_pages(bs: *mut BootServices, pages: usize) -> Option<u64> {
 	let mut addr: u64 = 0;
 	let status = unsafe { ((*bs).allocate_pages)(uefi::ALLOCATE_ANY_PAGES, uefi::LOADER_DATA, pages, &mut addr) };
-	if uefi::is_error(status) {
-		None
-	} else {
-		Some(addr)
-	}
+	if uefi::is_error(status) { None } else { Some(addr) }
 }
 
 pub(crate) fn align_down(v: u64, align: u64) -> u64 {
@@ -241,11 +237,7 @@ pub(crate) fn locate_framebuffer(bs: *mut BootServices) -> GopFb {
 
 // Bit position of the lowest set bit of a channel mask.
 fn mask_shift(mask: u32) -> u8 {
-	if mask == 0 {
-		0
-	} else {
-		mask.trailing_zeros() as u8
-	}
+	if mask == 0 { 0 } else { mask.trailing_zeros() as u8 }
 }
 
 // Width in bits of a contiguous channel mask.

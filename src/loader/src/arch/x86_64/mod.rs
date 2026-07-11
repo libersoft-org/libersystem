@@ -16,7 +16,7 @@ use bootproto::{BootInfo, Framebuffer, MemRegion, Module};
 
 use crate::uefi::{self, BootServices, Handle, SystemTable};
 use crate::{align_down, alloc_pages, read_file};
-use paging::{PageTables, HHDM_OFFSET, PAGE_2MB, PAGE_SIZE};
+use paging::{HHDM_OFFSET, PAGE_2MB, PAGE_SIZE, PageTables};
 
 // The init/volume package filenames on the boot volume (the x86 loader reads them and
 // hands the kernel their bytes as boot-protocol modules; the aarch64 kernel embeds them).
@@ -237,11 +237,7 @@ fn find_rsdp(system_table: *mut SystemTable) -> u64 {
 fn alloc_low_page(bs: *mut BootServices) -> u64 {
 	let mut addr: u64 = 0x0010_0000;
 	let status = unsafe { ((*bs).allocate_pages)(uefi::ALLOCATE_MAX_ADDRESS, uefi::LOADER_DATA, 1, &mut addr) };
-	if uefi::is_error(status) {
-		0
-	} else {
-		addr
-	}
+	if uefi::is_error(status) { 0 } else { addr }
 }
 
 // The highest physical address any memory-map descriptor reaches.

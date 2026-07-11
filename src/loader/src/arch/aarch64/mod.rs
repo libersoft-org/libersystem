@@ -18,7 +18,7 @@ pub mod serial;
 use bootproto::{BootInfo, Framebuffer};
 
 use crate::uefi::{self, BootServices, Handle, SystemTable};
-use crate::{align_down, PAGE_SIZE};
+use crate::{PAGE_SIZE, align_down};
 
 // Halt the core (panic path): wait for an event forever. panic=abort, no unwind.
 pub fn halt() -> ! {

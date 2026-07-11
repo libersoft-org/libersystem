@@ -11,6 +11,14 @@ set -euo pipefail
 
 KERNEL="${1:?usage: qemu-riscv64.sh <kernel-elf>}"
 SERIAL="${SERIAL:-mon:stdio}"
+# Guest hart count = all host cores by default (full multi-core; the kernel scales to
+# every hart with no limit - verified booting to the shell with all 23 services online at
+# SMP=52, and the AIA/IMSIC interrupt controller has no per-hart cap like aarch64's GICv2).
+# riscv-on-x86 is TCG emulation (there is no RISC-V KVM on an x86 host), so each emulated
+# hart costs real host CPU: a very high count boots CORRECTLY but slowly - the whole VM is
+# emulated, and the U-Boot/UEFI firmware phase in particular is slow to reach the loader at
+# many harts. Lower it with SMP=<n> for faster local iteration; on real hardware (or KVM)
+# there is no such cost.
 SMP="${SMP:-$(nproc)}"
 MEM="${MEM:-512M}"
 # `default` uses QEMU's bundled OpenSBI (fw_dynamic); override with BIOS=<path>.
