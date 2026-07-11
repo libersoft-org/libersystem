@@ -114,4 +114,14 @@ pub struct BootInfo {
 	// A reserved page of physical memory below 1 MiB for the AP real-mode
 	// bring-up trampoline (INIT-SIPI-SIPI targets a page-aligned vector < 1 MiB).
 	pub smp_trampoline: u64,
+
+	// Physical address of the flattened device tree (0 on x86, which uses ACPI). The
+	// device-tree architectures (aarch64, riscv64) enter their kernel's boot stub with
+	// the DTB pointer where QEMU's `-kernel` load would put it (x0 / a1); when the UEFI
+	// loader hands a BootInfo there instead, it carries the DTB pointer here so the
+	// kernel still finds its RAM / CPU / device inventory. On those arches
+	// `framebuffer.addr` is the framebuffer's PHYSICAL base (the loader builds no page
+	// tables, so the kernel maps it through its own direct map), unlike x86 where
+	// `framebuffer.addr` is an HHDM virtual address the loader already mapped.
+	pub dtb: u64,
 }

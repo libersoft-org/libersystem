@@ -1,5 +1,18 @@
 # Bugs / changes
 
+- qemu - be on the same network like host
+- lsvol - add column - device
+- mountpoints as mount://
+- liberfs - access time
+- disk quotas per user (??)
+- limits for subprocesses?
+- lsblk doesn't show device id
+- lsblk size doesn't corespond with volume size - find out why
+- lscpu --json doesn't show the name and other attributes
+- lsdev, lssvc - without --json parameter it still shows json, not a CLI text output
+- lsirq - show as table with columns (same like lsvol)
+- ls* - find out what should it show
+- find out what other ls* should be added (lsof etc.)
 - Is OS loading only drivers it detected or all?
 - src/boot/qemu-*.sh scripts - find duplicities and make it one script only with parameters, use it in Justfile and fix it in documentation
 - Remove Limine mentioning everywhere

@@ -119,7 +119,7 @@ const INIT_PKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.pkg"));
 const VOLUME_PKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/volume.pkg"));
 
 #[unsafe(no_mangle)]
-extern "C" fn aarch64_main(dtb: u64) -> ! {
+extern "C" fn aarch64_main(arg: u64) -> ! {
 	super::serial::init();
 
 	// Enable Advanced SIMD / floating-point at EL0 and EL1 (CPACR_EL1.FPEN = 0b11)
@@ -133,6 +133,12 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 		core::arch::asm!("mrs {}, CurrentEL", out(reg) current_el, options(nomem, nostack, preserves_flags));
 	}
 	let el = (current_el >> 2) & 0b11;
+
+	// The entry argument is either a raw DTB pointer (QEMU `-kernel`) or a
+	// `bootproto::BootInfo` pointer (the UEFI loader). Tell them apart by the BootInfo
+	// magic at the target; the UEFI path also carries a GOP framebuffer, so the kernel
+	// draws its earliest boot log to the display instead of programming ramfb itself.
+	let (dtb, uefi_fb) = decode_boot_arg(arg);
 
 	crate::serial_println!("{} kernel is starting ...", crate::product::NAME);
 	crate::serial_println!("arch: aarch64 | EL{el} | DTB {dtb:#x}");
@@ -214,12 +220,16 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	// Retain the boot memory map now the heap is up, so SYS_MEMMAP_GET (lsmem) can
 	// report the physical layout - the x86 loader path retains it inside mem::init.
 	crate::mem::retain_memmap(&regions);
-	// Bring up the QEMU ramfb early framebuffer (from `-device ramfb`), so the kernel
-	// draws the boot log to the display pixel-by-pixel like x86 - QEMU virt has no VGA,
-	// so without ramfb the boot is serial-only. Runs after the heap + frame pool are up
-	// (it allocates the framebuffer and the console grid). A no-op if fw-cfg / ramfb is
-	// absent.
-	init_ramfb_console(fwcfg_base);
+	// Bring up the early framebuffer console so the kernel draws the boot log to the
+	// display pixel-by-pixel like x86 - QEMU virt has no VGA, so without one the boot is
+	// serial-only. The UEFI loader hands a GOP framebuffer in the BootInfo (drawn to
+	// directly); the `-kernel` path has no loader, so the kernel programs QEMU ramfb
+	// over fw-cfg itself. Runs after the heap + frame pool are up (the console grid, and
+	// ramfb's framebuffer, are heap/frame allocations). A no-op if neither is present.
+	match uefi_fb {
+		Some(fb) => install_console(fb),
+		None => init_ramfb_console(fwcfg_base),
+	}
 	{
 		let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
 		for i in 0..8 {
@@ -343,19 +353,65 @@ extern "C" fn aarch64_main(dtb: u64) -> ! {
 	}
 }
 
-// The QEMU ramfb framebuffer set up at boot (None if fw-cfg / ramfb is absent), read by
-// publish_embedded_boot_info to fill the BootInfo framebuffer for a userspace consumer.
-static BOOT_FB: crate::sync::SpinLock<Option<crate::arch::common::fwcfg::RamFb>> = crate::sync::SpinLock::new(None);
+// An early framebuffer the kernel draws its boot log to: its physical base (drawn
+// through the direct map) plus geometry and pixel format. From QEMU ramfb (the
+// `-kernel` path) or the UEFI loader's GOP (the BootInfo path).
+#[derive(Clone, Copy)]
+struct BootFb {
+	phys: u64,
+	width: u32,
+	height: u32,
+	stride: u32, // bytes per row
+	red_shift: u8,
+	red_size: u8,
+	green_shift: u8,
+	green_size: u8,
+	blue_shift: u8,
+	blue_size: u8,
+}
 
-// Program the ramfb early framebuffer over fw-cfg and bring up the kernel framebuffer
-// console on it, so the boot log is drawn to the display (XRGB8888: red at bit 16,
-// green at 8, blue at 0). Serial-only if fw-cfg / ramfb is not present.
+// The early framebuffer set up at boot (None if the boot is serial-only), read by
+// publish_embedded_boot_info to fill the BootInfo framebuffer for a userspace consumer.
+static BOOT_FB: crate::sync::SpinLock<Option<BootFb>> = crate::sync::SpinLock::new(None);
+
+// Decode the kernel entry argument: the DTB pointer, plus the GOP framebuffer when a
+// UEFI loader handed a `bootproto::BootInfo` here rather than QEMU `-kernel`'s raw DTB
+// pointer. Both are physical pointers reachable through the boot stub's direct map; a
+// BootInfo is recognised by its magic, and on this arch carries the framebuffer's
+// PHYSICAL base (the loader builds no page tables).
+fn decode_boot_arg(arg: u64) -> (u64, Option<BootFb>) {
+	if arg == 0 {
+		return (0, None);
+	}
+	let magic = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(arg) as *const u64) };
+	if magic != bootproto::MAGIC {
+		return (arg, None); // a raw DTB pointer (the QEMU `-kernel` entry state)
+	}
+	let bi = super::paging::phys_to_virt(arg) as *const bootproto::BootInfo;
+	let dtb = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*bi).dtb)) };
+	let present = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*bi).fb_present)) } != 0;
+	let fb = present.then(|| {
+		let f = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*bi).framebuffer)) };
+		BootFb { phys: f.addr, width: f.width, height: f.height, stride: f.pitch, red_shift: f.red_shift, red_size: f.red_size, green_shift: f.green_shift, green_size: f.green_size, blue_shift: f.blue_shift, blue_size: f.blue_size }
+	});
+	(dtb, fb)
+}
+
+// Bring up the kernel framebuffer console on `fb` (its physical base drawn through the
+// direct map), and record it for publish_embedded_boot_info to hand userspace.
+fn install_console(fb: BootFb) {
+	crate::console::init(crate::console::FbInfo { addr: super::paging::phys_to_virt(fb.phys) as *mut u8, width: fb.width as usize, height: fb.height as usize, pitch: fb.stride as usize, bytes_per_pixel: 4, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size });
+	*BOOT_FB.lock() = Some(fb);
+}
+
+// Program the QEMU ramfb early framebuffer over fw-cfg and bring up the console on it
+// (the `-kernel` boot path, which has no loader to query GOP). ramfb is XRGB8888 - red
+// at bit 16, green at 8, blue at 0. Serial-only if fw-cfg / ramfb is not present.
 fn init_ramfb_console(fwcfg_base: u64) {
 	let Some(fb) = crate::arch::common::fwcfg::setup_ramfb(fwcfg_base, 1280, 800, super::paging::phys_to_virt) else {
 		return;
 	};
-	crate::console::init(crate::console::FbInfo { addr: super::paging::phys_to_virt(fb.phys) as *mut u8, width: fb.width as usize, height: fb.height as usize, pitch: fb.stride as usize, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8 });
-	*BOOT_FB.lock() = Some(fb);
+	install_console(BootFb { phys: fb.phys, width: fb.width, height: fb.height, stride: fb.stride, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8 });
 	crate::serial_println!("aarch64: ramfb framebuffer {}x{} at {:#x}", fb.width, fb.height, fb.phys);
 }
 
@@ -372,12 +428,12 @@ fn publish_embedded_boot_info() {
 		bootproto::Module { addr: bytes.as_ptr() as u64, size: bytes.len() as u64, name: nm }
 	}
 	let modules: &'static mut [bootproto::Module; 2] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", INIT_PKG), module(b"volume.pkg", VOLUME_PKG)]));
-	// Hand the ramfb framebuffer (if any) to a userspace consumer of the boot info.
+	// Hand the early framebuffer (if any) to a userspace consumer of the boot info.
 	let (framebuffer, fb_present) = match *BOOT_FB.lock() {
-		Some(f) => (bootproto::Framebuffer { addr: super::paging::phys_to_virt(f.phys), width: f.width, height: f.height, pitch: f.stride, bpp: 32, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] }, 1u32),
+		Some(f) => (bootproto::Framebuffer { addr: super::paging::phys_to_virt(f.phys), width: f.width, height: f.height, pitch: f.stride, bpp: 32, red_shift: f.red_shift, red_size: f.red_size, green_shift: f.green_shift, green_size: f.green_size, blue_shift: f.blue_shift, blue_size: f.blue_size, _pad: [0; 2] }, 1u32),
 		None => (bootproto::Framebuffer { addr: 0, width: 0, height: 0, pitch: 0, bpp: 0, red_shift: 0, red_size: 0, green_shift: 0, green_size: 0, blue_shift: 0, blue_size: 0, _pad: [0; 2] }, 0u32),
 	};
-	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer, fb_present, _pad1: 0, rsdp: 0, smp_trampoline: 0 }));
+	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer, fb_present, _pad1: 0, rsdp: 0, smp_trampoline: 0, dtb: 0 }));
 	crate::publish_boot_info(bi);
 }
 

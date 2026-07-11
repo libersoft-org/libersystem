@@ -168,9 +168,87 @@ pub(crate) fn to_utf16(s: &str, out: &mut [u16]) {
 pub(crate) fn alloc_pages(bs: *mut BootServices, pages: usize) -> Option<u64> {
 	let mut addr: u64 = 0;
 	let status = unsafe { ((*bs).allocate_pages)(uefi::ALLOCATE_ANY_PAGES, uefi::LOADER_DATA, pages, &mut addr) };
-	if uefi::is_error(status) { None } else { Some(addr) }
+	if uefi::is_error(status) {
+		None
+	} else {
+		Some(addr)
+	}
 }
 
 pub(crate) fn align_down(v: u64, align: u64) -> u64 {
 	v & !(align - 1)
+}
+
+// The active linear framebuffer the firmware's Graphics Output Protocol reports: its
+// physical base + byte size and the pixel geometry/format. Architecture-neutral - each
+// backend turns it into a `bootproto::Framebuffer` (x86 stores an HHDM virtual `addr`
+// it mapped; the device-tree arches store the physical base and let the kernel map it).
+pub(crate) struct GopFb {
+	pub present: bool,
+	pub phys: u64,
+	// Read only by the x86 backend (to map the framebuffer into the HHDM); the
+	// device-tree arches pass the physical base straight through and never map it.
+	#[allow(dead_code)]
+	pub size: u64,
+	pub width: u32,
+	pub height: u32,
+	pub pitch: u32, // bytes per row
+	pub red_shift: u8,
+	pub red_size: u8,
+	pub green_shift: u8,
+	pub green_size: u8,
+	pub blue_shift: u8,
+	pub blue_size: u8,
+}
+
+impl GopFb {
+	pub(crate) const NONE: Self = Self { present: false, phys: 0, size: 0, width: 0, height: 0, pitch: 0, red_shift: 0, red_size: 0, green_shift: 0, green_size: 0, blue_shift: 0, blue_size: 0 };
+}
+
+// Query the Graphics Output Protocol for the active mode's linear framebuffer. Returns
+// `GopFb::NONE` on a headless boot (no GOP / no active mode / an unsupported format).
+pub(crate) fn locate_framebuffer(bs: *mut BootServices) -> GopFb {
+	let mut gop: *mut c_void = core::ptr::null_mut();
+	let status = unsafe { ((*bs).locate_protocol)(&uefi::GRAPHICS_OUTPUT_PROTOCOL_GUID, core::ptr::null_mut(), &mut gop) };
+	if uefi::is_error(status) || gop.is_null() {
+		return GopFb::NONE;
+	}
+	let gop = gop as *mut uefi::GraphicsOutput;
+	let mode = unsafe { (*gop).mode };
+	if mode.is_null() {
+		return GopFb::NONE;
+	}
+	let info = unsafe { (*mode).info };
+	if info.is_null() {
+		return GopFb::NONE;
+	}
+	let (width, height, pitch_px, format, mask) = unsafe { ((*info).horizontal_resolution, (*info).vertical_resolution, (*info).pixels_per_scan_line, (*info).pixel_format, &(*info).pixel_information) };
+	// Channel shifts/sizes: the common 32-bpp RGB/BGR modes are fixed layouts; a
+	// bit-mask mode is decoded from the reported channel masks.
+	let (rs, gs, bs_shift) = match format {
+		uefi::PIXEL_RGB => (0u8, 8u8, 16u8),
+		uefi::PIXEL_BGR => (16u8, 8u8, 0u8),
+		uefi::PIXEL_BIT_MASK => (mask_shift(mask.red), mask_shift(mask.green), mask_shift(mask.blue)),
+		_ => return GopFb::NONE,
+	};
+	let (rz, gz, bz) = match format {
+		uefi::PIXEL_BIT_MASK => (mask_size(mask.red), mask_size(mask.green), mask_size(mask.blue)),
+		_ => (8u8, 8u8, 8u8),
+	};
+	let bpp = 32u32;
+	GopFb { present: true, phys: unsafe { (*mode).frame_buffer_base }, size: unsafe { (*mode).frame_buffer_size as u64 }, width, height, pitch: pitch_px * (bpp / 8), red_shift: rs, red_size: rz, green_shift: gs, green_size: gz, blue_shift: bs_shift, blue_size: bz }
+}
+
+// Bit position of the lowest set bit of a channel mask.
+fn mask_shift(mask: u32) -> u8 {
+	if mask == 0 {
+		0
+	} else {
+		mask.trailing_zeros() as u8
+	}
+}
+
+// Width in bits of a contiguous channel mask.
+fn mask_size(mask: u32) -> u8 {
+	(mask >> mask_shift(mask)).trailing_ones() as u8
 }

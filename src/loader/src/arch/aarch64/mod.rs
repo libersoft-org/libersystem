@@ -15,8 +15,10 @@
 
 pub mod serial;
 
+use bootproto::{BootInfo, Framebuffer};
+
 use crate::uefi::{self, BootServices, Handle, SystemTable};
-use crate::{PAGE_SIZE, align_down};
+use crate::{align_down, PAGE_SIZE};
 
 // Halt the core (panic path): wait for an event forever. panic=abort, no unwind.
 pub fn halt() -> ! {
@@ -36,14 +38,21 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	let dtb = find_dtb(system_table);
 	serial::write_str(if dtb != 0 { "loader: device tree found\n" } else { "loader: no device-tree table (kernel will scan)\n" });
 
+	// Build a BootInfo carrying the DTB pointer and the GOP framebuffer, so the kernel
+	// draws its earliest boot log to the display pixel-by-pixel (QEMU virt has no VGA;
+	// the `-kernel` path programs ramfb itself instead). The kernel enters through its
+	// own boot stub, which forwards x0 to the kernel entry; there it tells a BootInfo
+	// from a raw DTB pointer (the `-kernel` entry state) by the BootInfo magic.
+	let boot_info = build_boot_info(bs, dtb);
+
 	// ExitBootServices is the last firmware call; after it no service may be used.
 	exit_boot_services(bs, image_handle);
 
 	// Mirror the QEMU `-kernel` entry state and enter the kernel's boot stub: turn
 	// the MMU + caches off (the stub sets translation up from scratch), synchronise,
-	// then branch to the entry with the DTB in x0. The loader ran under the firmware's
-	// identity map, so with translation off it keeps executing at the same (physical)
-	// addresses through the branch.
+	// then branch to the entry with the BootInfo pointer in x0. The loader ran under
+	// the firmware's identity map, so with translation off it keeps executing at the
+	// same (physical) addresses through the branch.
 	unsafe {
 		core::arch::asm!(
 			"dsb sy",
@@ -58,11 +67,27 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 			"dsb sy",
 			"isb",
 			"br x1",
-			in("x0") dtb,   // the kernel boot stub reads the DTB pointer from x0
-			in("x1") entry, // scratch x9 is clobbered freely (noreturn - never comes back)
+			in("x0") boot_info, // the kernel boot stub forwards x0 to the entry
+			in("x1") entry,     // scratch x9 is clobbered freely (noreturn - never comes back)
 			options(noreturn),
 		);
 	}
+}
+
+// Allocate and fill a `bootproto::BootInfo` (in retained LOADER_DATA) carrying the DTB
+// pointer and the GOP framebuffer, returning its physical address. The kernel reads it
+// through its own direct map, so `framebuffer.addr` is the PHYSICAL base (this backend
+// builds no page tables). Only the fields the device-tree kernel path reads are set;
+// the memmap / modules / rsdp / trampoline are x86-only.
+fn build_boot_info(bs: *mut BootServices, dtb: u64) -> u64 {
+	let fb = crate::locate_framebuffer(bs);
+	serial::write_str(if fb.present { "loader: GOP framebuffer found\n" } else { "loader: no GOP framebuffer (serial-only boot log)\n" });
+	let phys = crate::alloc_pages(bs, 1).expect("loader: cannot allocate BootInfo");
+	let framebuffer = if fb.present { Framebuffer { addr: fb.phys, width: fb.width, height: fb.height, pitch: fb.pitch, bpp: 32, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] } } else { unsafe { core::mem::zeroed() } };
+	unsafe {
+		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: 0, memmap_len: 0, modules: 0, modules_len: 0, framebuffer, fb_present: fb.present as u32, _pad1: 0, rsdp: 0, smp_trampoline: 0, dtb };
+	}
+	phys
 }
 
 // Load each PT_LOAD segment at its physical (link) address - the placement QEMU's

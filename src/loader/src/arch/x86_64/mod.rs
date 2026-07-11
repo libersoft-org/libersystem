@@ -11,13 +11,12 @@ pub mod paging;
 pub mod serial;
 
 use core::arch::asm;
-use core::ffi::c_void;
 
 use bootproto::{BootInfo, Framebuffer, MemRegion, Module};
 
 use crate::uefi::{self, BootServices, Handle, SystemTable};
 use crate::{align_down, alloc_pages, read_file};
-use paging::{HHDM_OFFSET, PAGE_2MB, PAGE_SIZE, PageTables};
+use paging::{PageTables, HHDM_OFFSET, PAGE_2MB, PAGE_SIZE};
 
 // The init/volume package filenames on the boot volume (the x86 loader reads them and
 // hands the kernel their bytes as boot-protocol modules; the aarch64 kernel embeds them).
@@ -120,6 +119,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 		(*boot_info)._pad1 = 0;
 		(*boot_info).rsdp = rsdp;
 		(*boot_info).smp_trampoline = trampoline;
+		(*boot_info).dtb = 0; // x86 uses ACPI, not a device tree.
 	}
 
 	// Snapshot the memory map and exit boot services. GetMemoryMap must be the
@@ -203,50 +203,16 @@ struct FbResult {
 	present: bool,
 }
 
-// Query the Graphics Output Protocol for the active mode's linear framebuffer.
+// Query the Graphics Output Protocol (the shared, architecture-neutral helper) and,
+// when a framebuffer is present, build the x86 boot-protocol Framebuffer with an HHDM
+// virtual `addr` (the loader maps the framebuffer into the HHDM below).
 fn locate_framebuffer(bs: *mut BootServices) -> FbResult {
-	let none = FbResult { info: unsafe { core::mem::zeroed() }, phys: 0, size: 0, present: false };
-	let mut gop: *mut c_void = core::ptr::null_mut();
-	let status = unsafe { ((*bs).locate_protocol)(&uefi::GRAPHICS_OUTPUT_PROTOCOL_GUID, core::ptr::null_mut(), &mut gop) };
-	if uefi::is_error(status) || gop.is_null() {
-		return none;
+	let g = crate::locate_framebuffer(bs);
+	if !g.present {
+		return FbResult { info: unsafe { core::mem::zeroed() }, phys: 0, size: 0, present: false };
 	}
-	let gop = gop as *mut uefi::GraphicsOutput;
-	let mode = unsafe { (*gop).mode };
-	if mode.is_null() {
-		return none;
-	}
-	let info = unsafe { (*mode).info };
-	if info.is_null() {
-		return none;
-	}
-	let (width, height, pitch_px, format, mask) = unsafe { ((*info).horizontal_resolution, (*info).vertical_resolution, (*info).pixels_per_scan_line, (*info).pixel_format, &(*info).pixel_information) };
-	// Channel shifts/sizes: the common 32-bpp RGB/BGR modes are fixed layouts; a
-	// bit-mask mode is decoded from the reported channel masks.
-	let (rs, gs, bs_shift) = match format {
-		uefi::PIXEL_RGB => (0u8, 8u8, 16u8),
-		uefi::PIXEL_BGR => (16u8, 8u8, 0u8),
-		uefi::PIXEL_BIT_MASK => (mask_shift(mask.red), mask_shift(mask.green), mask_shift(mask.blue)),
-		_ => return none,
-	};
-	let (rz, gz, bz) = match format {
-		uefi::PIXEL_BIT_MASK => (mask_size(mask.red), mask_size(mask.green), mask_size(mask.blue)),
-		_ => (8u8, 8u8, 8u8),
-	};
-	let bpp = 32u32;
-	let pitch = pitch_px * (bpp / 8);
-	let fb_info = Framebuffer { addr: HHDM_OFFSET + unsafe { (*mode).frame_buffer_base }, width, height, pitch, bpp, red_shift: rs, red_size: rz, green_shift: gs, green_size: gz, blue_shift: bs_shift, blue_size: bz, _pad: [0; 2] };
-	FbResult { info: fb_info, phys: unsafe { (*mode).frame_buffer_base }, size: unsafe { (*mode).frame_buffer_size as u64 }, present: true }
-}
-
-// Bit position of the lowest set bit of a channel mask.
-fn mask_shift(mask: u32) -> u8 {
-	if mask == 0 { 0 } else { mask.trailing_zeros() as u8 }
-}
-
-// Width in bits of a contiguous channel mask.
-fn mask_size(mask: u32) -> u8 {
-	(mask >> mask_shift(mask)).trailing_ones() as u8
+	let info = Framebuffer { addr: HHDM_OFFSET + g.phys, width: g.width, height: g.height, pitch: g.pitch, bpp: 32, red_shift: g.red_shift, red_size: g.red_size, green_shift: g.green_shift, green_size: g.green_size, blue_shift: g.blue_shift, blue_size: g.blue_size, _pad: [0; 2] };
+	FbResult { info, phys: g.phys, size: g.size, present: true }
 }
 
 // Scan the firmware configuration table for the ACPI 2.0 (then 1.0) RSDP,
@@ -271,7 +237,11 @@ fn find_rsdp(system_table: *mut SystemTable) -> u64 {
 fn alloc_low_page(bs: *mut BootServices) -> u64 {
 	let mut addr: u64 = 0x0010_0000;
 	let status = unsafe { ((*bs).allocate_pages)(uefi::ALLOCATE_MAX_ADDRESS, uefi::LOADER_DATA, 1, &mut addr) };
-	if uefi::is_error(status) { 0 } else { addr }
+	if uefi::is_error(status) {
+		0
+	} else {
+		addr
+	}
 }
 
 // The highest physical address any memory-map descriptor reaches.
