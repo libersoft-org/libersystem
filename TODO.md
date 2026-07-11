@@ -2195,6 +2195,27 @@ UEFI loader variant.
 - Done when: the kernel boots SMP on `qemu-system-riscv64 -machine virt` over OpenSBI, brings up the full userspace chain to the shell, the own UEFI loader boots it, and the test suite is green on RISC-V - the third architecture, proving the M115 boundary carries three arches.
 - Concept: phase-2 deployment target (a VM; real RISC-V boards are phase 4), the bootloader decision (the riscv64 EFI app), the driver model (virtio unchanged across arches).
 
+## M118 - Multi-arch track follow-ups (the M115-M117 loose ends)
+
+The M115-M117 track is functionally complete, but three loose ends were recorded
+only as inline NOTES inside the finished boxes (the page-table race in M117's clean-
+production result, the aarch64 demo tail in the same result, and the UEFI-GOP
+avenue in M116's ramfb result). They are promoted to actionable items here so they
+are tracked, not buried. Priority order: correctness first, then parity, then the
+boot-time nicety.
+
+- [ ] Close the latent unlocked page-table race on x86_64 and aarch64. When the riscv64 `userspace_yields_cooperatively` regression was root-caused (M117), the cause was concurrent mutation of the shared page table with no lock, fixed by a `PT_LOCK` in `arch/riscv64/paging.rs` serializing `map_page_root` / `unmap_page_root` / `new_address_space` / `free_address_space` (a leaf lock over the frame allocator, ordering page-table -> frame). The SAME race exists in x86_64 `next_table_create` (`arch/x86_64/paging.rs`) and aarch64 `map_page_root` (`arch/aarch64/paging.rs`): two cores mapping VAs that share an intermediate table level can both allocate a fresh next-level table, one write wins, and the loser's leaf is stranded in an orphaned table (its thread faults) with a leaked frame. It never triggers in practice (x86 under KVM / aarch64 under TCG are fast enough the ns window never collides), so the suites are green - but it is a real correctness bug. Add the same `PT_LOCK` discipline to both arches so all three page-table backends are consistently locked.
+- Done when: x86_64 and aarch64 serialize their page-table map/unmap/new/free paths the way riscv64 does, the x86_64 (104) and aarch64 (100) suites stay green, and a live boot on each is unaffected.
+- Concept: M117 (the riscv64 `PT_LOCK` fix this generalizes), fault isolation (a mapping race must not strand a leaf or leak a frame).
+
+- [ ] aarch64 clean production boot (retire `aarch64_run_demos`). riscv64 was cleaned in M117 to boot straight through the shared service-chain bring-up to the shell with an interrupt-driven idle; aarch64's `boot.rs` still runs its own `aarch64_run_demos` tail (the port's increment-by-increment demos) and reaches the shell via a polling loop rather than the clean sequence x86/riscv use. Retire the demo scaffolding so aarch64 boots the same clean production path as x86 (`main::kmain` -> `boot_main`: SystemManager + the service chain + interrupt-driven idle), mirroring the M117 riscv64 cleanup.
+- Done when: aarch64 boots the clean production sequence with no demo output, the aarch64 suite stays green, and a live boot reaches the shell with an interrupt-driven idle.
+- Concept: M117 (the riscv64 clean-production cleanup this mirrors), the boot path (x86 `main::kmain` -> `boot_main` is the reference).
+
+- [ ] (optional, boot-time nicety) Avenue A: the UEFI GOP framebuffer for the earliest boot log. M116 gave aarch64/riscv64 an early kernel-drawn framebuffer via ramfb (avenue B) on the direct `-kernel` path (default + tests). The UEFI loader path still boots serial-only for the earliest log - until ConsoleService takes over the display. Query the UEFI Graphics Output Protocol (GOP) in the aarch64/riscv64 loader and hand the linear framebuffer to the kernel (either a `simple-framebuffer` node injected into the DTB `/chosen`, which the kernel already parses, or by building a `BootInfo` like the x86 loader), so the UEFI boot path also draws the earliest log pixel-by-pixel. Smallest of the three; ramfb already covers the common `-kernel` path.
+- Done when: a UEFI-loader boot on aarch64/riscv64 draws the earliest boot log to a GOP framebuffer, both suites stay green, and the direct `-kernel` ramfb path is unaffected.
+- Concept: M116 (the ramfb avenue B this complements), M114 (the UEFI loaders that gain the GOP query).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
