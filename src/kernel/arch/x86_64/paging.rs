@@ -173,30 +173,32 @@ fn table_ptr(phys: u64) -> *mut u64 {
 }
 
 // Return the physical address of the next-level table for `index`, allocating
-// and zeroing a fresh table if the entry is not yet present. `parent_flags`
-// carries permission bits (notably USER) that every level of the walk must also
-// grant; a user leaf is only reachable if each table along the way is USER too,
-// so the bit is OR-ed into both new and pre-existing intermediate entries.
+// and zeroing a fresh table if the entry is not yet present. Returns None when no
+// frame is available for a fresh table, so the caller can degrade a userspace map
+// to ERR_NO_MEMORY instead of panicking the kernel. `parent_flags` carries
+// permission bits (notably USER) that every level of the walk must also grant; a
+// user leaf is only reachable if each table along the way is USER too, so the bit
+// is OR-ed into both new and pre-existing intermediate entries.
 //
 // SAFETY: `table` must point at a valid 512-entry page table.
-unsafe fn next_table_create(table: *mut u64, index: usize, parent_flags: u64) -> u64 {
+unsafe fn next_table_create(table: *mut u64, index: usize, parent_flags: u64) -> Option<u64> {
 	unsafe {
 		let entry = table.add(index);
 		let value = entry.read_volatile();
 		if value & PRESENT == 0 {
-			let new = frame::allocate().expect("out of frames: page table");
+			let new = frame::allocate()?;
 			let new_table = table_ptr(new);
 			for i in 0..ENTRY_COUNT {
 				new_table.add(i).write_volatile(0);
 			}
 			entry.write_volatile((new & ADDR_MASK) | PRESENT | WRITABLE | parent_flags);
-			new
+			Some(new)
 		} else {
 			// Widen an existing intermediate to also grant the requested bits.
 			if value & parent_flags != parent_flags {
 				entry.write_volatile(value | parent_flags);
 			}
-			value & ADDR_MASK
+			Some(value & ADDR_MASK)
 		}
 	}
 }
@@ -205,6 +207,13 @@ unsafe fn next_table_create(table: *mut u64, index: usize, parent_flags: u64) ->
 // currently active address space.
 pub fn map_page(virt: u64, phys: u64, flags: u64) {
 	map_page_in(active_pml4_phys(), virt, phys, flags);
+}
+
+// Fallible counterpart of `map_page` for userspace-triggered mappings: returns Err
+// when an intermediate page table cannot be allocated (out of frames), so the
+// caller can propagate ERR_NO_MEMORY and roll back rather than panicking the kernel.
+pub fn try_map_page(virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
+	try_map_page_in(active_pml4_phys(), virt, phys, flags)
 }
 
 // Drop the loader's low-half identity map from the active (kernel) page tables.
@@ -233,6 +242,15 @@ pub fn remove_bootstrap_identity() {
 // becomes visible when CR3 is loaded with it (which flushes the TLB anyway), so
 // the invlpg here is harmless for a non-active space.
 pub fn map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
+	try_map_page_in(pml4_phys, virt, phys, flags).expect("out of frames: page table");
+}
+
+// Fallible counterpart of `map_page_in`: returns Err when an intermediate table
+// cannot be allocated, so a userspace-triggered map degrades to ERR_NO_MEMORY
+// instead of panicking. Nothing is left mapped on failure - the walk stops at the
+// level that could not be extended, and the leaf is only written once every
+// intermediate exists.
+pub fn try_map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
 	let _guard = PT_LOCK.lock();
 	// Without EFER.NXE the NX bit is a reserved bit; strip it so old CPUs still map.
 	let flags = if nx_enabled() { flags } else { flags & !NO_EXECUTE };
@@ -241,13 +259,14 @@ pub fn map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
 	let parent_flags = flags & USER;
 	unsafe {
 		let pml4 = table_ptr(pml4_phys);
-		let pdpt = table_ptr(next_table_create(pml4, table_index(virt, 39), parent_flags));
-		let pd = table_ptr(next_table_create(pdpt, table_index(virt, 30), parent_flags));
-		let pt = table_ptr(next_table_create(pd, table_index(virt, 21), parent_flags));
+		let pdpt = table_ptr(next_table_create(pml4, table_index(virt, 39), parent_flags).ok_or(())?);
+		let pd = table_ptr(next_table_create(pdpt, table_index(virt, 30), parent_flags).ok_or(())?);
+		let pt = table_ptr(next_table_create(pd, table_index(virt, 21), parent_flags).ok_or(())?);
 		let entry = pt.add(table_index(virt, 12));
 		entry.write_volatile((phys & ADDR_MASK) | flags | PRESENT);
 		invlpg(virt);
 	}
+	Ok(())
 }
 
 // Unmap `virt` in the active address space, returning the frame it pointed at.

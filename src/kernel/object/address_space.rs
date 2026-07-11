@@ -48,6 +48,14 @@ impl AddressSpace {
 		arch::paging::map_page_in(self.cr3, virt, phys, flags);
 	}
 
+	// Fallible map for userspace-triggered mappings: returns Err when an
+	// intermediate page table cannot be allocated, so a program load / stack
+	// growth under memory pressure degrades to a clean error instead of panicking
+	// the kernel. Nothing is left mapped on failure.
+	pub fn try_map(&self, virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
+		arch::paging::try_map_page_in(self.cr3, virt, phys, flags)
+	}
+
 	// Unmap `virt` in this address space, returning the frame it pointed at.
 	pub fn unmap(&self, virt: u64) -> Option<u64> {
 		arch::paging::unmap_page_in(self.cr3, virt)

@@ -181,7 +181,7 @@ fn leaf_bits(flags: u64) -> u64 {
 // Map one 4 kB page `va -> pa` in the table tree rooted at `root` (a physical L0
 // table address), allocating any missing intermediate tables from the frame
 // allocator, then invalidate the TLB for that VA.
-unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) {
+unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<(), ()> {
 	let _guard = PT_LOCK.lock();
 	let mut table = phys_to_virt(root) as *mut u64;
 	for level in 0..3u64 {
@@ -189,7 +189,7 @@ unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) {
 		let idx = ((va >> shift) & 0x1ff) as usize;
 		let desc = unsafe { core::ptr::read_volatile(table.add(idx)) };
 		let next = if desc & VALID == 0 {
-			let frame = alloc_frame().expect("aarch64 map_page: out of frames");
+			let frame = alloc_frame().ok_or(())?;
 			unsafe { core::ptr::write_volatile(table.add(idx), frame | VALID | TABLE) };
 			frame
 		} else {
@@ -209,6 +209,7 @@ unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) {
 			options(nostack, preserves_flags),
 		);
 	}
+	Ok(())
 }
 
 // The active TTBR0 (low-half) root physical address.
@@ -254,15 +255,31 @@ pub unsafe fn copy_to_user_page(dst: u64, bytes: &[u8]) {
 pub fn map_page(virt: u64, phys: u64, flags: u64) {
 	// A top-bit-set virtual address translates through TTBR1 (higher half); a
 	// low address through the active TTBR0 tree.
-	let root = if virt >> 63 == 1 { current_ttbr1() } else { current_ttbr0() };
-	unsafe {
-		map_page_root(root, virt, phys, flags);
-	}
+	unsafe { map_page_root(map_root_for(virt), virt, phys, flags).expect("aarch64 map_page: out of frames") }
 }
+
+// Fallible counterpart of `map_page` for userspace-triggered mappings: returns Err
+// when an intermediate table cannot be allocated (out of frames), so the caller
+// degrades to ERR_NO_MEMORY rather than panicking the kernel.
+pub fn try_map_page(virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
+	unsafe { map_page_root(map_root_for(virt), virt, phys, flags) }
+}
+
 pub fn map_page_in(ttbr: u64, virt: u64, phys: u64, flags: u64) {
-	unsafe {
-		map_page_root(ttbr & ADDR_MASK, virt, phys, flags);
-	}
+	unsafe { map_page_root(ttbr & ADDR_MASK, virt, phys, flags).expect("aarch64 map_page: out of frames") }
+}
+
+// Fallible counterpart of `map_page_in`: returns Err when an intermediate table
+// cannot be allocated, leaving nothing mapped so a userspace map can degrade to
+// ERR_NO_MEMORY.
+pub fn try_map_page_in(ttbr: u64, virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
+	unsafe { map_page_root(ttbr & ADDR_MASK, virt, phys, flags) }
+}
+
+// The page-table root a virtual address maps through: the higher-half (top bit
+// set) goes through TTBR1, a low address through the active TTBR0 tree.
+fn map_root_for(virt: u64) -> u64 {
+	if virt >> 63 == 1 { current_ttbr1() } else { current_ttbr0() }
 }
 
 // Return the next-level table's physical address, or None if the entry is absent

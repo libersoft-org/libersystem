@@ -71,7 +71,12 @@ pub fn grow_user_stack(address: u64, error_code: u64) -> bool {
 	}
 	let page = address & !(PAGE_SIZE - 1);
 	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER | arch::paging::NO_EXECUTE;
-	process.address_space().map(page, new_frame, flags);
+	// Out of frames for an intermediate page table: hand the frame back and refuse
+	// the growth (the caller terminates the process) instead of panicking the kernel.
+	if process.address_space().try_map(page, new_frame, flags).is_err() {
+		frame::deallocate(new_frame);
+		return false;
+	}
 	process.adopt_frames(alloc::vec![new_frame]);
 	process.charge_stack(PAGE_SIZE);
 	true

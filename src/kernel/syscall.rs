@@ -244,6 +244,23 @@ pub(crate) fn free_vrange(base: u64, len: u64) {
 	}
 }
 
+// Map `count` consecutive pages into the active address space, rolling back every
+// page mapped so far if an intermediate page table cannot be allocated. `phys_of`
+// yields the physical frame for page `i`. Returns false only on out-of-frames,
+// leaving nothing mapped - so a mid-map OOM leaves the object un-mapped and the
+// caller can return ERR_NO_MEMORY and release its reserved virtual range.
+fn map_pages_or_rollback(base: u64, count: usize, flags: u64, mut phys_of: impl FnMut(usize) -> u64) -> bool {
+	for i in 0..count {
+		if arch::paging::try_map_page(base + i as u64 * PAGE_SIZE, phys_of(i), flags).is_err() {
+			for j in 0..i {
+				arch::paging::unmap_page(base + j as u64 * PAGE_SIZE);
+			}
+			return false;
+		}
+	}
+	true
+}
+
 // Fetch the current thread and look up a typed object handle on its table,
 // releasing the table lock before returning. Collapses the boilerplate shared by
 // the handlers that only need the looked-up object: a missing thread maps to
@@ -422,8 +439,10 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 		return ERR_NO_MEMORY;
 	}
 	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE | if user { arch::paging::USER } else { 0 };
-	for (i, &phys) in dma.frames().iter().enumerate() {
-		arch::paging::map_page(base + i as u64 * PAGE_SIZE, phys, flags);
+	let frames = dma.frames();
+	if !map_pages_or_rollback(base, frames.len(), flags, |i| frames[i]) {
+		free_vrange(base, dma.size() as u64);
+		return ERR_NO_MEMORY;
 	}
 	dma.set_mapped_at(base);
 	base as i64
@@ -480,8 +499,9 @@ fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64) -> i64 {
 	if user {
 		flags |= arch::paging::USER;
 	}
-	for i in 0..pages {
-		arch::paging::map_page(base + i * PAGE_SIZE, base_phys + i * PAGE_SIZE, flags);
+	if !map_pages_or_rollback(base, pages as usize, flags, |i| base_phys + i as u64 * PAGE_SIZE) {
+		free_vrange(base, total);
+		return ERR_NO_MEMORY;
 	}
 	write_user(buf_ptr, geom);
 	// Hand the display to the caller: the kernel console stops drawing to it.
@@ -614,8 +634,10 @@ fn sys_device_memory_map(handle: u64) -> i64 {
 	if user {
 		flags |= arch::paging::USER;
 	}
-	for i in 0..pages {
-		arch::paging::map_page(base + i as u64 * PAGE_SIZE, device.phys_base() + i as u64 * PAGE_SIZE, flags);
+	let phys_base = device.phys_base();
+	if !map_pages_or_rollback(base, pages, flags, |i| phys_base + i as u64 * PAGE_SIZE) {
+		free_vrange(base, len);
+		return ERR_NO_MEMORY;
 	}
 	device.set_mapped_at(base);
 	base as i64
@@ -1037,8 +1059,10 @@ fn sys_memory_map(handle: u64) -> i64 {
 		return ERR_NO_MEMORY;
 	}
 	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE | if user { arch::paging::USER } else { 0 };
-	for (i, &phys) in memory.frames().iter().enumerate() {
-		arch::paging::map_page(base + i as u64 * PAGE_SIZE, phys, flags);
+	let frames = memory.frames();
+	if !map_pages_or_rollback(base, frames.len(), flags, |i| frames[i]) {
+		free_vrange(base, memory.size() as u64);
+		return ERR_NO_MEMORY;
 	}
 	memory.set_mapped_at(base);
 	memory.set_mapped_cr3(cr3);

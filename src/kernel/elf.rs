@@ -70,7 +70,7 @@ fn map_segment(data: &[u8], addr_space: &AddressSpace, frames: &mut Vec<u64>, p_
 				core::ptr::copy_nonoverlapping(data.as_ptr().add(page_start), dst, copy);
 			}
 		}
-		addr_space.map(p_vaddr + page * PAGE_SIZE, frame, flags);
+		addr_space.try_map(p_vaddr + page * PAGE_SIZE, frame, flags).map_err(|_| ElfError::OutOfMemory)?;
 	}
 	Ok(())
 }

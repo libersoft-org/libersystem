@@ -8,7 +8,7 @@
 //! init is lazy, so a program that never allocates never maps a heap and the
 //! existing heap-free services are unaffected.
 
-use crate::{SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, sys_is_err, syscall};
+use crate::{sys_is_err, syscall, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE};
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::mem;
@@ -139,10 +139,10 @@ impl Heap {
 		Ok(alloc_start)
 	}
 
-	fn size_align(layout: Layout) -> (usize, usize) {
-		let layout = layout.align_to(mem::align_of::<FreeRegion>()).expect("alignment overflow").pad_to_align();
+	fn size_align(layout: Layout) -> Option<(usize, usize)> {
+		let layout = layout.align_to(mem::align_of::<FreeRegion>()).ok()?.pad_to_align();
 		let size = layout.size().max(mem::size_of::<FreeRegion>());
-		(size, layout.align())
+		Some((size, layout.align()))
 	}
 }
 
@@ -196,7 +196,12 @@ unsafe impl GlobalAlloc for LockedHeap {
 		unsafe {
 			let mut heap = self.lock();
 			heap.ensure_init();
-			let (size, align) = Heap::size_align(layout);
+			// A degenerate layout (align/size overflow) can never be satisfied: return
+			// null (the GlobalAlloc contract) rather than panicking the process.
+			let (size, align) = match Heap::size_align(layout) {
+				Some(sa) => sa,
+				None => return ptr::null_mut(),
+			};
 			let region = match heap.find_region(size, align) {
 				Some(found) => Some(found),
 				// no region fits: map another and retry once.
@@ -224,8 +229,11 @@ unsafe impl GlobalAlloc for LockedHeap {
 
 	unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
 		unsafe {
-			let (size, _) = Heap::size_align(layout);
-			self.lock().add_free_region(ptr as usize, size);
+			// A layout `alloc` would have rejected was never handed out, so there is
+			// nothing to reclaim.
+			if let Some((size, _)) = Heap::size_align(layout) {
+				self.lock().add_free_region(ptr as usize, size);
+			}
 		}
 	}
 }

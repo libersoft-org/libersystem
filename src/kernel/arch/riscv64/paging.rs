@@ -155,14 +155,14 @@ pub fn frames_free() -> u64 {
 
 // Map one 4 kB page `va -> pa` in the tree rooted at `root` (a physical Sv39 root),
 // allocating any missing intermediate tables, then flush the TLB.
-unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) {
+unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<(), ()> {
 	let _guard = PT_LOCK.lock();
 	let mut table = phys_to_virt(root) as *mut u64;
 	for level in (1..3).rev() {
 		let idx = ((va >> (12 + 9 * level)) & 0x1ff) as usize;
 		let desc = unsafe { read_volatile(table.add(idx)) };
 		let next = if desc & PTE_V == 0 {
-			let frame = alloc_frame().expect("riscv64 map_page: out of frames");
+			let frame = alloc_frame().ok_or(())?;
 			unsafe { write_volatile(table.add(idx), pte_ppn(frame) | PTE_V) };
 			frame
 		} else {
@@ -173,13 +173,28 @@ unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) {
 	let idx = ((va >> 12) & 0x1ff) as usize;
 	unsafe { write_volatile(table.add(idx), pte_ppn(pa) | leaf_bits(flags)) };
 	flush_tlb();
+	Ok(())
 }
 
 pub fn map_page(virt: u64, phys: u64, flags: u64) {
+	unsafe { map_page_root(current_satp_root(), virt, phys, flags).expect("riscv64 map_page: out of frames") }
+}
+
+// Fallible counterpart of `map_page` for userspace-triggered mappings: returns Err
+// when an intermediate table cannot be allocated (out of frames), so the caller
+// degrades to ERR_NO_MEMORY rather than panicking the kernel.
+pub fn try_map_page(virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
 	unsafe { map_page_root(current_satp_root(), virt, phys, flags) }
 }
 
 pub fn map_page_in(satp_root: u64, virt: u64, phys: u64, flags: u64) {
+	unsafe { map_page_root(satp_root, virt, phys, flags).expect("riscv64 map_page: out of frames") }
+}
+
+// Fallible counterpart of `map_page_in`: returns Err when an intermediate table
+// cannot be allocated, leaving nothing mapped so a userspace map can degrade to
+// ERR_NO_MEMORY.
+pub fn try_map_page_in(satp_root: u64, virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
 	unsafe { map_page_root(satp_root, virt, phys, flags) }
 }
 

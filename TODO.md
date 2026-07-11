@@ -2224,6 +2224,70 @@ boot-time nicety.
 - Concept: the fmt gate stays usable (the M104 docs-and-dead-code sweep's fmt-drift item, recurring).
 - Result: `just fmt` over the tree normalized four files of committed drift - `setup.sh` (shfmt comment-column alignment in the APT list), `src/loader/src/arch/riscv64/mod.rs` + `src/user/drivers/src/virtio_blk.rs` + `src/user/storage/src/service.rs` (rustfmt collapsing short `if/else` blocks to one line, plus reordering a `use` group so `volume`/`align_down` follow the uppercase names). Pure formatting, no semantic change. `just fmt-check` now rc=0 across every crate and the shell scripts.
 
+## M119 - Pre-phase-3 hardening (finish before the server platform)
+
+A code-level audit of the whole repo (2026-07-11) before declaring phase 2 done and
+starting phase 3 (the server platform). These are real, verified gaps - not phase-3
+scope - grouped by theme. A server runs unattended, for a long time, under memory and
+fault pressure, so robustness and persistence come first; the CLI/UX/cleanup items are
+the daily-friction backlog (most were already jotted in NOTES.md). Nothing here is
+implemented yet. NOT gaps (verified complete, listed so they are not re-audited):
+the three-arch ports (M115-M118), ring-3 preemption (M19/M106), crash+hang detection
+with the full restart/watchdog ladder (M40), W^X + SMAP/SMEP (M104/M107), the
+hostile-media/hostile-disk audits (M73-M103), and MSI-X-only interrupts (M46).
+
+### Robustness / correctness (highest priority for a server)
+
+- [x] Kernel OOM must degrade, not panic. The intermediate-page-table allocation in the map walk panicked on ALL THREE arches (x86 `next_table_create` `frame::allocate().expect("out of frames: page table")`; aarch64/riscv64 `map_page_root` `alloc_frame().expect(...)` - the earlier note that aarch64/riscv64 already degraded was wrong: the graceful `?` was only in the `alloc_frame` helper, whose callers still `.expect()`-ed it). A user-triggered mapping (map memory / DMA / device MMIO / framebuffer / stack growth / program load) under memory pressure panicked the WHOLE kernel.
+- Result: added a fallible `try_map_page` / `try_map_page_in` on each arch (the shared walk now returns `Result<(), ()>` and propagates `frame::allocate()? -> None`); the old infallible `map_page` / `map_page_in` stay as thin `.expect()` wrappers for kernel bring-up (LAPIC/IOAPIC/heap/boot), where OOM is genuinely unrecoverable. `AddressSpace::try_map` threads it up. The four userspace map syscalls (`sys_memory_map`, `sys_dma_buffer_map`, `sys_device_memory_map`, `sys_framebuffer_map`) now map through a `map_pages_or_rollback` helper that unmaps every page mapped so far on the first failure, frees the reserved vrange, and returns `ERR_NO_MEMORY`; `fault.rs` stack growth hands the frame back and refuses the growth (process terminates cleanly); `elf.rs` / `loader.rs` program load return `OutOfMemory`. New test `map_degrades_to_error_when_out_of_frames` drains the frame pool, asserts a fresh-address-space map fails cleanly (not a panic), then proves the same VA maps once frames return. Green on all three arches (x86 105 / aarch64 101 / riscv64 102). NOTE: the kernel heap grow (`mem/heap.rs:45`) and the AP GDT/TSS allocation (`arch/x86_64/gdt.rs:141`) still `.expect()` on OOM - rarer boot/heap-growth paths, left as a follow-up.
+- [x] Userspace rt allocator: OOM already degraded, one degenerate-layout panic hardened. Verified the OOM path was already graceful (the earlier "panics on OOM" note was wrong): `ensure_init` and `grow` return on a failed `memory_object_create`/`memory_map` syscall and `alloc` returns `ptr::null_mut()` (the `GlobalAlloc` contract) when no region fits - so a service out of heap gets a null, not a panic. The `unwrap()`s in `find_region` are invariant-safe (inside `while let Some`, they cannot fire) and the `checked_add(size).expect("alloc overflow")` in `alloc` is dead (already validated by `alloc_from_region`), so those were left untouched (adding handling for impossible cases is noise).
+- Result: the one genuinely reachable panic - `size_align`'s `align_to(..).expect("alignment overflow")` on a degenerate `Layout` - now returns `None`, and `alloc` maps that to a null return (contract-correct vs. aborting the process); `dealloc` skips a layout `alloc` would have rejected. Userspace rebuilds clean, x86 105 tests green, fmt-check clean.
+- [ ] Transparent restart of a live service (the M40 deferral). M40 detects every service's crash AND hang and runs the full restart/backoff/escalation ladder, but only the managed canary (`watchdog_probe`) is actually re-spawned; a REAL service that other components already hold channels to needs a re-resolve / broker so its clients reconnect to the restarted instance (`service_manager.rs:360`, `watchdog_probe.rs:6` both record this as the open piece). Auto-recovery of live services is a core server property.
+- APPROVED DESIGN (2026-07-12) - "the Resolver": promote the bootstrap channel to a persistent, grant-scoped broker channel on ServiceManager. This is the pattern every serious capability system converges on (Fuchsia lazy routing through the component manager, Genode parent-mediated sessions, Minix3 reincarnation server + data store, QNX name_open) sized to our static manifest: the client's durable reference is a NAME re-resolved through a broker that survives the crash; the live channel is disposable. Key insights: (a) the broker already exists - ServiceManager already spawns every service, holds its factory and control channels, and runs the restart ladder; a separate registry service would itself be a SPOF that SM would have to supervise (circular). (b) A naive "connect to anything by name" channel would introduce ambient authority; RESOLVE must be scoped to the requester's manifest grants - which STRENGTHENS the capability model (the grant is enforced on every connect, not just once at spawn). (c) Services hold channels to other services, so services are clients too - one uniform mechanism covers shell, tools, and service-to-service dependencies; the canary becomes just a regular supervised service. No new service, no new process, no kernel change.
+- Plan (each phase independently testable):
+- 1. rt: a `RESOLVE(name)` op on the (kept-alive) bootstrap channel + a `Svc` reconnect wrapper (holds name + current channel; on `ERR_PEER_CLOSED` re-resolves and retries; optional `on_reconnect` hook for session re-establishment).
+- 2. ServiceManager: remember which component each bootstrap channel belongs to and its manifest grant set; serve RESOLVE (deny un-granted names); mint fresh client channels via the service's existing `CONNECT_OP` factory (the way PermissionManager already does); generalize `restart_canary()` into `restart_service(idx)` (the backoff/budget/escalation code exists, it is just wired to the canary); QUEUE resolves aimed at a service in `Restarting` and answer when the new instance reports ready - a client experiences the crash as latency, not an error; after the restart budget is exhausted resolve returns a clean error.
+- 3. Manifest: a per-service restart policy `transparent | escalate` (drivers holding hardware state - DMA buffers, device memory - escalate; pretending transparency there is wrong).
+- 4. Migrate clients tier by tier. Tier 1 (stateless/persistent: Time, Log with its on-disk journal, Config once its persistence lands - the two M119 items complement each other): fully transparent. Tier 2 (session state: e.g. storage volume clients): transparent with an `on_reconnect` hook that re-opens the session. Tier 3 (hardware-owning drivers): `escalate`.
+- Honest limit (no design removes it, Fuchsia/Minix share it): the broker restores the CONNECTION, not the service's in-memory STATE - hence the tiers and the persistence synergy.
+- Done when: a test kills a real standing service (e.g. ConfigService), its client sends the next request through the `Svc` wrapper and gets a correct answer from the restarted instance without being re-spawned; a resolve during the restart window blocks and then succeeds; a resolve for an un-granted name is denied; the canary keeps proving the ladder as an ordinary supervised service.
+- [ ] Page-table locking has no concurrency test. M118 #1 added `PT_LOCK` to all three arches (serializing map/unmap/new/free over the frame allocator), but there is no stress/fuzz test that two cores mapping VAs sharing an intermediate table level cannot strand a leaf or leak a frame. Add one (SMP, many rounds).
+- Done when: an SMP stress test hammers concurrent map/unmap on shared intermediate levels and asserts no stranded leaf / no leaked frame, green on all three arches.
+
+### Persistence (a server keeps state)
+
+- [ ] ConfigService is in-memory only (`config_service.rs:12` - "The store is in memory, seeded with a few system defaults at start"). Configuration changes (`config set ...`) do NOT survive a reboot. M70 gave LogService a persisted on-disk journal; ConfigService needs the same - a persisted typed tree on `vol://system` (create/update writes through to disk, seeded from defaults on first boot). Without it an admin's settings vanish on restart.
+- Done when: `config set k v`, reboot, `config k` still returns v; the tree persists as structured data (not text) on the system volume, tests green.
+
+### CLI / observability polish (the NOTES.md inventory-tool cluster - real bugs)
+
+- [ ] `lsdev` and `lssvc` print JSON even without `--json` - they are missing the plain-text CLI default (every other `ls*` renders text by default and JSON only on `--json`).
+- [ ] `lscpu --json` omits the `name` and other CPU attributes; `lsblk` does not show the device-tree device id, its reported size does not match the volume size (find out why), and it has no table headers (device / type / volume / size).
+- [ ] `lsirq` should render as an aligned column table (like `lsvol`), not a flat list.
+- [ ] `du` is missing - recursive disk usage of a path / directory tree (`du vol://system/bin`), which no current tool does. (No `df` - not as a tool and not as an alias; `lsvol` already shows each volume's size / used / free.) Consider `lsof`. Audit what each `ls*` should show and what other `ls*` belong (the NOTES.md "find out what should it show" items).
+- [ ] Some tools miss `--help`, and some miss `--json` / `--json-min` where it would apply (not `cat`/`echo`/`beep`, which have no structured output).
+- Done when: every inventory tool renders aligned CLI text by default with a `--json`(/`--json-min`) opt-in and a `--help`, `lsblk`/`lscpu` show the missing fields with correct sizes, and `df`/`du` exist, tests/goldens green.
+
+### Shell / console UX (already in NOTES.md)
+
+- [ ] Tab autocompletion (commands + local files), like a normal shell (`cat ./mot` -> `cat ./motd.txt`).
+- [ ] Mouse selection and scrollback paging (Shift+PgUp/PgDn) lag noticeably - profile and fix the console redraw cost (relates to the M104 dirty-rectangle work).
+- [ ] `exit` should not halt the machine - it should exit the current shell and return to the parent shell (reload the shell if there is no parent); `poweroff` should stop everything gracefully the way `exit`-to-halt already does (today `exit` is graceful but `poweroff` is not).
+
+### Cleanup / docs (already in NOTES.md, low risk)
+
+- [ ] Unify the three `src/boot/qemu-*.sh` runners (x86 / aarch64 / riscv64) into one parametrized script, wire it in the Justfile, and fix the docs - they share ~80% (disk/media/USB/net/display setup) and drift apart.
+- [ ] Remove all remaining Limine mentions (retired in M114) from code comments and docs.
+- [ ] Big-file atomization + a dead-code / duplicate-code sweep (a recurring M104/M112 theme; find the largest source files and split them).
+- [ ] Document the binary / package format (the ELF + `PKGARCH1` + init/volume package layout) somewhere in docs.
+- [ ] Find out why the staged apps in `vol://system/bin` are hundreds of kB each (M61 strips them; check whether they still carry avoidable bulk).
+
+### Deferred to phase 3 / optional (tracked, not part of this milestone)
+
+- M35k (console session lock + login) needs the identity / user-account work, which is phase 3.
+- M35a / M35f (pluggable non-US keyboard layouts + dead-key / compose) are optional.
+- When phase 2 truly closes: reconcile the implementation against CONCEPT_EN.md / CONCEPT_CZ.md, and review THREAT_MODEL.md for currency + link it from the README (NOTES.md items).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a

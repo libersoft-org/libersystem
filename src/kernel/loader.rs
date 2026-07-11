@@ -142,7 +142,7 @@ fn map_stack(address_space: &AddressSpace, frames: &mut Vec<u64>) -> Result<(), 
 		unsafe {
 			core::ptr::write_bytes((hhdm + frame) as *mut u8, 0, PAGE_SIZE as usize);
 		}
-		address_space.map(base + page * PAGE_SIZE, frame, flags);
+		address_space.try_map(base + page * PAGE_SIZE, frame, flags).map_err(|_| LoadError::OutOfMemory)?;
 	}
 	Ok(())
 }
