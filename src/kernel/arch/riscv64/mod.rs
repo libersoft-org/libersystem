@@ -1,13 +1,21 @@
 // riscv64 (RISC-V) architecture backend.
 //
-// STATUS: STUB. This module satisfies the same arch contract as `arch::x86_64`
-// (the set of `arch::*` symbols the portable kernel calls - see the contract
-// listed in `arch/mod.rs`) so that a cross-build for `riscv64gc-unknown-none-elf`
-// links, but nothing here is implemented yet: the RISC-V mechanics (Sv39 page
-// tables via SATP, the STVEC trap vector, PLIC + CLINT / SBI timer, SBI HSM
-// hart_start SMP wake, ECALL syscall, the `tp` per-CPU register, the 16550 / SBI
-// console, DTB parsing) land in M117. Runtime entry points `todo!()`; a boot on
-// this arch is not possible until then.
+// STATUS: BOOTS. The RISC-V mechanics are implemented across the submodules below
+// (Sv39 page tables via SATP in `paging`, the STVEC trap vector + FP save/restore in
+// `traps`, the SBI timer + AIA IMSIC MSI controller in `apic`/`imsic`/`interrupts`,
+// SBI HSM hart_start SMP wake in `smp`, the ECALL syscall path in `syscall`, the `tp`
+// per-CPU register in `percpu`, the 16550 / SBI console in `serial`, and DTB parsing
+// in `dtb`). riscv64 boots directly on OpenSBI with no bootloader hand-off, so it does
+// not enter through the shared `main::kmain`; instead `boot::riscv64_main` is the S-mode
+// entry and drives the whole bring-up itself (memory, paging, per-CPU, SMP, scheduler,
+// then the userspace boot chain to the shell).
+//
+// Because of that self-driven entry, the portable `arch::*` init contract below
+// (`init`, `init_interrupts`, `init_syscalls`, `init_tsc`, `init_bsp_percpu`,
+// `init_ap`) - the hooks the bootloader-handoff `kmain` calls on x86_64 - is never
+// reached on this arch. Those functions remain `todo!()` on purpose: they exist only so
+// the shared crate root type-checks for `riscv64gc-unknown-none-elf`; the equivalent
+// work happens inline in `boot::riscv64_main`.
 
 pub mod boot;
 pub mod dtb;

@@ -105,11 +105,6 @@ _start:
 "#
 );
 
-// The pre-built `echo` userspace tool (embedded by build.rs on riscv64), run through
-// the portable ELF loader as an end-to-end userspace bring-up demo. Empty if the
-// userspace was not built first, in which case the demo is skipped.
-const ECHO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo_demo.elf"));
-
 // The init + volume packages assembled by build.rs from the riscv64 userspace build.
 // riscv64 boots directly (no bootloader hand-off), so the kernel embeds them and
 // publishes its own BootInfo pointing at them. Empty if the userspace was not built.
@@ -226,16 +221,6 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	// block, trap vector, and local timer, then idles until the scheduler is ready).
 	super::smp::bring_up_secondaries(cpu_count, hartid);
 
-	// Cooperative context switch: two kernel threads ping-pong through switch_context,
-	// then hand control back to the boot context.
-	unsafe {
-		A_SP = super::context::init_thread_stack(&mut *(&raw mut STACK_A), thread_a, 0xAA);
-		B_SP = super::context::init_thread_stack(&mut *(&raw mut STACK_B), thread_b, 0xBB);
-	}
-	crate::serial_println!("riscv64: context switch - starting kernel threads");
-	unsafe { super::context::switch_context(&raw mut MAIN_SP, A_SP) };
-	crate::serial_println!("riscv64: context switch - returned to boot context");
-
 	// The portable scheduler on top of the arch context/percpu contract.
 	crate::sched::allocate(cpu_count as usize);
 	crate::sched::init();
@@ -258,285 +243,19 @@ extern "C" fn riscv64_main(hartid: u64, dtb: u64) -> ! {
 	}
 
 	#[cfg(not(test))]
-	riscv64_run_demos()
-}
-
-// The interactive scheduler demos and userspace boot chain that follow the core
-// bring-up. Skipped under `cargo test` (which runs the kernel test harness instead).
-#[cfg(not(test))]
-fn riscv64_run_demos() -> ! {
-	// Cooperative: three yielding kernel threads, drained to completion.
-	for id in 1..=3u64 {
-		crate::sched::spawn(sched_task, id);
+	{
+		// Production boot (the interactive, non-test path): arm the S-mode timer, enable
+		// interrupts, wire the syscall path, then bring up the real userspace boot chain
+		// (SystemManager -> the service set -> the interactive shell) and idle on the
+		// interrupt-driven console loop. The same clean sequence the x86_64 kmain runs -
+		// no port demos.
+		super::apic::init();
+		super::enable_interrupts();
+		super::syscall::init();
+		run_system_manager();
+		crate::serial_println!("riscv64: halting");
+		super::halt_loop()
 	}
-	crate::serial_println!("riscv64: portable scheduler - draining 3 yielding threads");
-	crate::sched::run_until_idle();
-	crate::serial_println!("riscv64: portable scheduler - all threads exited");
-
-	// Preemptive: arm the S-mode timer + enable interrupts, then three non-yielding
-	// threads that only the timer IRQ can rotate.
-	super::apic::init();
-	super::enable_interrupts();
-	for id in 1..=3u64 {
-		crate::sched::spawn(preempt_task, id);
-	}
-	crate::serial_println!("riscv64: preemptive scheduler - 3 non-yielding threads");
-	crate::sched::run_until_idle();
-	crate::serial_println!("riscv64: preemptive scheduler - all threads exited (ticks={})", super::apic::ticks());
-
-	// Increment 6: real userspace. Two portable Processes whose U-mode programs call
-	// the REAL kernel syscall table (SYS_DEBUG_WRITE) and interleave via SYS_YIELD.
-	// Each thread parks its U-mode resume state in its own slot, so the excursions
-	// coexist; each has its own address space, so both use the same low user VAs.
-	super::syscall::init();
-	run_user_processes();
-
-	// Increment 9: load + run the REAL `echo` userspace tool (cross-compiled from the
-	// userspace tree with the shared rt runtime) through the portable ELF loader.
-	run_echo_program();
-
-	// Increment 8: enumerate the PCIe ECAM bus (the shared arch::common::pci over the
-	// riscv64 ECAM ConfigAccess) and resolve any virtio devices' modern MMIO layout.
-	run_pci_scan();
-
-	// Increment 9: the real userspace boot chain - spawn SystemManager from the
-	// embedded init package, bring up the services, and hand off to the shell.
-	run_system_manager();
-
-	crate::serial_println!("riscv64: M117 increment 9 (userspace boot chain) - OK, halting");
-	super::halt_loop()
-}
-
-// Enumerate the PCIe ECAM bus and report what is present, resolving virtio devices'
-// modern MMIO layout through the shared PCI code. On QEMU virt the pci bus is empty
-// unless devices are added (e.g. `-device virtio-blk-pci`), so a device count of zero
-// just means none were attached.
-#[cfg(not(test))]
-fn run_pci_scan() {
-	let devices = super::pci::scan();
-	crate::serial_println!("riscv64: PCI - {} device(s) on the ECAM bus", devices.len());
-	for d in &devices {
-		crate::serial_println!("riscv64:   {:02x}:{:02x}.{} vendor={:04x} device={:04x} class={:02x}", d.bus, d.dev, d.func, d.vendor, d.device_id, d.class);
-	}
-	let virtio = super::pci::scan_virtio();
-	for v in &virtio {
-		crate::serial_println!("riscv64:   virtio {} @ BAR{} phys={:#x} len={:#x} | common+{:#x} notify+{:#x} isr+{:#x} device+{:#x}", super::pci::virtio_type_name(v.virtio_type), v.bar, v.bar_phys, v.region_len, v.common.offset, v.notify.offset, v.isr.offset, v.device.offset);
-	}
-}
-
-// -------------------------------------------------------- increment-5 threads
-
-static mut MAIN_SP: u64 = 0;
-static mut A_SP: u64 = 0;
-static mut B_SP: u64 = 0;
-static mut STACK_A: [u8; 8192] = [0; 8192];
-static mut STACK_B: [u8; 8192] = [0; 8192];
-
-// Ping-pong partner A: print + switch to B three times, then return to the boot
-// context (which resumes right after the initial switch_context above).
-extern "C" fn thread_a(arg: u64) {
-	for i in 0..3 {
-		crate::serial_println!("riscv64: thread A step {i} (arg={arg:#x})");
-		unsafe { super::context::switch_context(&raw mut A_SP, B_SP) };
-	}
-	unsafe { super::context::switch_context(&raw mut A_SP, MAIN_SP) };
-}
-
-// Ping-pong partner B: print + switch back to A forever (A drives the count).
-extern "C" fn thread_b(arg: u64) {
-	loop {
-		crate::serial_println!("riscv64: thread B step (arg={arg:#x})");
-		unsafe { super::context::switch_context(&raw mut B_SP, A_SP) };
-	}
-}
-
-// A portable-scheduler kernel thread: print a few times, yielding the core between
-// steps, then return (which retires it through sched::exit).
-#[cfg(not(test))]
-extern "C" fn sched_task(id: u64) {
-	for i in 0..3 {
-		crate::serial_println!("riscv64: [sched] thread {id} step {i}");
-		crate::sched::yield_now();
-	}
-}
-
-// A preemption test thread: busy-wait ~15 ms per step (no yield) so the 10 ms timer
-// quantum forces a preemptive rotation; interleaved output proves the timer IRQ
-// drives the scheduler.
-#[cfg(not(test))]
-extern "C" fn preempt_task(id: u64) {
-	for i in 0..3 {
-		let target = super::tsc::now() + super::tsc::hz() * 15 / 1000;
-		while super::tsc::now() < target {
-			core::hint::spin_loop();
-		}
-		crate::serial_println!("riscv64: [preempt] thread {id} step {i}");
-	}
-}
-
-// ---------------------------------------------------------- increment-6 users
-
-struct UserCtx {
-	entry: u64,
-	stack_top: u64,
-	arg: u64,
-}
-
-// The kernel-side entry of a user process's thread: drop to U-mode at the mapped
-// program. Returns when the program calls SYS_USER_EXIT (then the thread exits).
-extern "C" fn user_trampoline(ctx_raw: u64) {
-	let ctx = unsafe { alloc::boxed::Box::from_raw(ctx_raw as *mut UserCtx) };
-	unsafe {
-		super::usermode::enter(ctx.entry, ctx.stack_top, ctx.arg);
-	}
-}
-
-// Build a portable user Process and enqueue its U-mode thread. The program (assembled
-// below) prints `msg` via SYS_DEBUG_WRITE, yields, prints + yields again, then
-// SYS_USER_EXIT - so two such processes interleave through the scheduler, which only
-// works because each thread parks its U-mode resume state in its own slot. Each
-// process has its own address space, so both can use the same low user VAs.
-fn spawn_user_process(msg: &[u8]) {
-	use super::paging;
-	use crate::object::address_space::AddressSpace;
-	use crate::object::process::Process;
-
-	let addr_space = match AddressSpace::create() {
-		Some(a) => a,
-		None => {
-			crate::serial_println!("riscv64: userspace - no address space");
-			return;
-		}
-	};
-	let code = paging::alloc_frame().expect("riscv64: no frame for user code");
-	let stack = paging::alloc_frame().expect("riscv64: no frame for user stack");
-
-	let code_va: u64 = 0x4000_0000; // 1 GiB - a low user VA (below the kernel half)
-	let msg_va = code_va + 0x800;
-	let stack_va: u64 = 0x4001_0000;
-	let stack_top = stack_va + 0x1000;
-
-	// a0 holds the message pointer (the entry argument); keep it in s1 across the
-	// syscalls. Tiny RV64I encoders (a7 = number, a0..a1 = args).
-	let addi = |rd: u32, rs1: u32, imm: i32| -> u32 { (((imm as u32) & 0xfff) << 20) | (rs1 << 15) | (rd << 7) | 0x13 };
-	let li = |rd: u32, imm: i32| -> u32 { addi(rd, 0, imm) };
-	let mv = |rd: u32, rs: u32| -> u32 { addi(rd, rs, 0) };
-	const ECALL: u32 = 0x0000_0073;
-	const S1: u32 = 9;
-	const A0: u32 = 10;
-	const A1: u32 = 11;
-	const A7: u32 = 17;
-	let len = msg.len() as i32;
-	let prog: [u32; 16] = [
-		mv(S1, A0),  // s1 = msg ptr
-		mv(A0, S1),  // a0 = msg ptr
-		li(A1, len), // a1 = len
-		li(A7, abi::SYS_DEBUG_WRITE as i32),
-		ECALL,
-		li(A7, abi::SYS_YIELD as i32),
-		ECALL,
-		mv(A0, S1),
-		li(A1, len),
-		li(A7, abi::SYS_DEBUG_WRITE as i32),
-		ECALL,
-		li(A7, abi::SYS_YIELD as i32),
-		ECALL,
-		li(A7, abi::SYS_USER_EXIT as i32),
-		ECALL,
-		0x0000_006f, // j . (guard against running off the end)
-	];
-	unsafe {
-		let cp = paging::phys_to_virt(code) as *mut u32;
-		for (i, w) in prog.iter().enumerate() {
-			core::ptr::write_volatile(cp.add(i), *w);
-		}
-		core::ptr::copy_nonoverlapping(msg.as_ptr(), (paging::phys_to_virt(code) + 0x800) as *mut u8, msg.len());
-		core::arch::asm!("fence.i", options(nostack, preserves_flags));
-	}
-
-	addr_space.map(code_va, code, paging::PRESENT | paging::USER);
-	addr_space.map(stack_va, stack, paging::PRESENT | paging::WRITABLE | paging::USER | paging::NO_EXECUTE);
-
-	let process = Process::new(addr_space, crate::sched::root_domain());
-	process.adopt_frames(alloc::vec![code, stack]);
-	let ctx = alloc::boxed::Box::new(UserCtx { entry: code_va, stack_top, arg: msg_va });
-	crate::sched::thread_create(process, user_trampoline, alloc::boxed::Box::into_raw(ctx) as u64);
-}
-
-// Run two concurrent user processes: they interleave via SYS_YIELD, each making real
-// SYS_DEBUG_WRITE syscalls, proving per-thread U-mode excursions coexist.
-#[cfg(not(test))]
-fn run_user_processes() {
-	spawn_user_process(b"userspace A: hello via SYS_DEBUG_WRITE\n");
-	spawn_user_process(b"userspace B: hello via SYS_DEBUG_WRITE\n");
-	crate::serial_println!("riscv64: userspace - running 2 U-mode processes");
-	crate::sched::run_until_idle();
-	crate::serial_println!("riscv64: userspace - both U-mode processes exited");
-}
-
-// Load and run the real `echo` tool - cross-compiled from the actual userspace tree
-// with the shared `rt` runtime, embedded by build.rs - as a U-mode process through the
-// PORTABLE ELF loader (the same crate::elf the x86/aarch64 kernels use). The kernel is
-// its launcher: it seeds a bootstrap channel and sends the two messages rt expects (a
-// STDOUT message with no console handle, so echo falls back to the debug port, and the
-// argument line). echo does the rt ABI handshake, receives the line, and prints it via
-// SYS_DEBUG_WRITE. A no-op when the ELF was not embedded (userspace not built first).
-#[cfg(not(test))]
-fn run_echo_program() {
-	use super::paging;
-	use crate::object::address_space::AddressSpace;
-	use crate::object::channel::{Channel, Message};
-	use crate::object::process::Process;
-	use crate::object::rights::Rights;
-
-	if ECHO_ELF.is_empty() {
-		crate::serial_println!("riscv64: echo - not embedded (build the riscv64 userspace first)");
-		return;
-	}
-
-	let addr_space = match AddressSpace::create() {
-		Some(a) => a,
-		None => {
-			crate::serial_println!("riscv64: echo - no address space");
-			return;
-		}
-	};
-	let mut frames: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-	let entry = match crate::elf::load_into(ECHO_ELF, &addr_space, &mut frames) {
-		Ok(e) => e,
-		Err(_) => {
-			crate::serial_println!("riscv64: echo - ELF load failed");
-			for f in frames {
-				paging::dealloc_frame(f);
-			}
-			return;
-		}
-	};
-	// The loader wrote code through the data path; fence.i so the new instructions are
-	// fetched from memory.
-	unsafe { core::arch::asm!("fence.i", options(nostack, preserves_flags)) };
-
-	// User stack (the loader maps only PT_LOAD segments).
-	let stack = paging::alloc_frame().expect("riscv64: no frame for echo stack");
-	let stack_va: u64 = 0x7fff_0000;
-	let stack_top = stack_va + 0x1000;
-	addr_space.map(stack_va, stack, paging::PRESENT | paging::WRITABLE | paging::USER | paging::NO_EXECUTE);
-	frames.push(stack);
-
-	// Bootstrap channel: the process holds ep1; the kernel keeps ep0 and, as the
-	// launcher, sends the stdout + argument messages the rt runtime consumes.
-	let (ep0, ep1) = Channel::create();
-	let process = Process::new(addr_space, crate::sched::root_domain());
-	process.adopt_frames(frames);
-	let bootstrap = process.install(ep1, Rights::ALL, 0);
-	let _ = ep0.send(Message::new(alloc::vec::Vec::from(&b"STDOUT"[..]), alloc::vec::Vec::new(), 0));
-	let _ = ep0.send(Message::new(alloc::vec::Vec::from(&b"echo running from a real riscv64 ELF"[..]), alloc::vec::Vec::new(), 0));
-
-	let ctx = alloc::boxed::Box::new(UserCtx { entry, stack_top, arg: bootstrap });
-	crate::sched::thread_create(process, user_trampoline, alloc::boxed::Box::into_raw(ctx) as u64);
-	crate::serial_println!("riscv64: echo - running the real echo tool (entry {entry:#x})");
-	crate::sched::run_until_idle();
-	crate::serial_println!("riscv64: echo - tool exited");
 }
 
 // Publish a kernel-constructed BootInfo pointing at the embedded init.pkg / volume.pkg
