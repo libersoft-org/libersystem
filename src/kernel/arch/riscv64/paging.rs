@@ -13,7 +13,20 @@
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
+use crate::sync::SpinLock;
+
 pub use crate::arch::common::paging::{NO_CACHE, NO_EXECUTE, PRESENT, USER, WRITABLE};
+
+// Serializes every structural mutation of a page table (map / unmap / address-space
+// create + teardown). The Sv39 tables are shared - a per-process root shares the
+// kernel high half, and the kernel root is live on every hart at once - so two harts
+// mapping VAs that share an intermediate level would otherwise race: both read an
+// absent intermediate entry, both allocate a fresh next-level table, and one write
+// wins - stranding the loser's leaf in an orphaned table (its thread then faults) and
+// leaking a frame. This lock closes that race. It is a leaf lock over the frame
+// allocator (map/unmap alloc/free intermediate tables under it, never the reverse),
+// so the ordering is page-table -> frame and cannot deadlock.
+static PT_LOCK: SpinLock<()> = SpinLock::new(());
 
 // Higher-half kernel offset: kernel VA = physical | KERNEL_VA_OFFSET, the base of the
 // Sv39 high canonical half. The same offset is the direct-map (HHDM) base.
@@ -143,6 +156,7 @@ pub fn frames_free() -> u64 {
 // Map one 4 kB page `va -> pa` in the tree rooted at `root` (a physical Sv39 root),
 // allocating any missing intermediate tables, then flush the TLB.
 unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) {
+	let _guard = PT_LOCK.lock();
 	let mut table = phys_to_virt(root) as *mut u64;
 	for level in (1..3).rev() {
 		let idx = ((va >> (12 + 9 * level)) & 0x1ff) as usize;
@@ -179,6 +193,7 @@ unsafe fn next_table(table: *const u64, idx: usize) -> Option<u64> {
 // Unmap `virt` in the tree rooted at `root`, returning the frame it pointed at (if
 // mapped). Intermediate tables are left in place; free_address_space reclaims them.
 unsafe fn unmap_page_root(root: u64, virt: u64) -> Option<u64> {
+	let _guard = PT_LOCK.lock();
 	let l1 = unsafe { next_table(phys_to_virt(root) as *const u64, ((virt >> 30) & 0x1ff) as usize)? };
 	let l0 = unsafe { next_table(phys_to_virt(l1) as *const u64, ((virt >> 21) & 0x1ff) as usize)? };
 	let leaf = (phys_to_virt(l0) as *mut u64).wrapping_add(((virt >> 12) & 0x1ff) as usize);
@@ -210,6 +225,7 @@ pub fn unmap_page_in(satp_root: u64, virt: u64) -> Option<u64> {
 // and starts with an empty low (user) half. Returns the root physical address.
 pub fn new_address_space() -> Option<u64> {
 	let root = alloc_frame()?; // zeroed
+	let _guard = PT_LOCK.lock();
 	let kernel = current_satp_root(); // any live root's high half is the kernel's
 	unsafe {
 		let dst = phys_to_virt(root) as *mut u64;
@@ -226,6 +242,7 @@ pub fn new_address_space() -> Option<u64> {
 // megapages (leaf PTEs, not owned tables) and leaf data frames are owned by whoever
 // mapped them - neither is freed here.
 pub fn free_address_space(root: u64) {
+	let _guard = PT_LOCK.lock();
 	unsafe {
 		let r = phys_to_virt(root) as *const u64;
 		for i in 0..256 {
