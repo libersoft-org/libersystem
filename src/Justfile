@@ -99,10 +99,11 @@ test-aarch64: sdk user-aarch64
 	cd {{kernel_dir}} && TEST=1 cargo test --target aarch64-unknown-none
 
 # run the kernel test suite in QEMU on riscv64 over OpenSBI (RISC-V semihosting exit
-# maps pass/fail). SMP=4 exercises the multi-hart paths (SBI HSM hart_start bring-up,
-# the SBI IPI cross-hart wake).
+# maps pass/fail). Defaults to `nproc` harts (like the x86 `test` recipe), exercising the
+# multi-hart paths (SBI HSM hart_start bring-up, the SBI IPI cross-hart wake); override
+# with `SMP=<n>` (a smaller count is faster under TCG on a many-core host).
 test-riscv64: sdk user-riscv64
-	cd {{kernel_dir}} && TEST=1 SMP=4 cargo test --target riscv64gc-unknown-none-elf
+	cd {{kernel_dir}} && TEST=1 cargo test --target riscv64gc-unknown-none-elf
 
 # build the own UEFI loader for aarch64 (staged into the boot image as BOOTAA64.EFI)
 loader-aarch64:
@@ -146,7 +147,7 @@ user-riscv64:
 # it), so no per-device interrupt path is needed for the core chain.
 run-riscv64 *displays: sdk user-riscv64
 	cd {{kernel_dir}} && cargo build --target riscv64gc-unknown-none-elf
-	DISPLAYS="{{displays}}" SERIAL=stdio SMP=4 bash boot/qemu-riscv64.sh {{kernel_dir}}/target/riscv64gc-unknown-none-elf/debug/kernel
+	DISPLAYS="{{displays}}" SERIAL=stdio bash boot/qemu-riscv64.sh {{kernel_dir}}/target/riscv64gc-unknown-none-elf/debug/kernel
 
 # build + boot the full riscv64 system through the own UEFI loader under U-Boot (the
 # qemu-riscv64 S-mode U-Boot on OpenSBI, instead of QEMU's direct -kernel load): U-Boot's
@@ -155,7 +156,7 @@ run-riscv64 *displays: sdk user-riscv64
 # kernel's boot stub - the same entry state OpenSBI's -kernel boot produces.
 run-riscv64-uefi *displays: sdk user-riscv64 loader-riscv64
 	cd {{kernel_dir}} && cargo build --target riscv64gc-unknown-none-elf
-	UEFI=1 DISPLAYS="{{displays}}" SERIAL=stdio SMP=4 bash boot/qemu-riscv64.sh {{kernel_dir}}/target/riscv64gc-unknown-none-elf/debug/kernel
+	UEFI=1 DISPLAYS="{{displays}}" SERIAL=stdio bash boot/qemu-riscv64.sh {{kernel_dir}}/target/riscv64gc-unknown-none-elf/debug/kernel
 
 # build + boot the full aarch64 system through the own UEFI loader under the AAVMF
 # firmware (instead of QEMU's direct -kernel load), reaching the interactive shell.

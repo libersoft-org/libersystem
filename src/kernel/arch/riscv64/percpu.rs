@@ -2,18 +2,18 @@
 //
 // Each hart keeps a pointer to its own PerCpu block in the `tp` register, so
 // `this_cpu()` resolves to the running hart's data with no locking (a kernel has no
-// thread-local storage, so `tp` is free for this). The blocks live in a small static
-// pool (no heap dependency during early bring-up) indexed by our contiguous CPU id
-// (the boot hart is 0); `allocate` records how many the machine has.
+// thread-local storage, so `tp` is free for this). The blocks are heap-allocated once
+// at SMP bring-up, sized by the machine's real hart count (the heap is up before any
+// hart initializes its slot), and indexed by our contiguous CPU id (the boot hart is
+// 0) - no compile-time hart cap.
 
 #![allow(dead_code)]
 
 use core::arch::asm;
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-// Maximum harts the static pool supports (QEMU virt bring-up is small).
-const MAX_CPUS: usize = 8;
+use alloc::vec::Vec;
 
 #[repr(C)]
 pub struct PerCpu {
@@ -43,17 +43,18 @@ impl PerCpu {
 	}
 }
 
-// The static per-CPU pool. UnsafeCell because each hart writes only its own slot.
-struct Pool([UnsafeCell<PerCpu>; MAX_CPUS]);
-unsafe impl Sync for Pool {}
-
-static POOL: Pool = Pool([const { UnsafeCell::new(PerCpu::empty()) }; MAX_CPUS]);
+// The heap-allocated per-CPU blocks (a leaked slice) and the machine's hart count.
+static PER_CPU: AtomicPtr<PerCpu> = AtomicPtr::new(ptr::null_mut());
 static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-// Record how many harts the machine has (the pool is static, so this only bounds the
-// valid slots). Called once before any hart initializes its slot.
+// Allocate the per-CPU blocks for `count` harts, sized by the machine. Called once by
+// the BSP before any hart initializes its slot (the heap is up by then).
 pub fn allocate(count: usize) {
-	assert!(count <= MAX_CPUS, "per-CPU pool too small");
+	let mut blocks: Vec<PerCpu> = Vec::with_capacity(count);
+	blocks.resize_with(count, PerCpu::empty);
+	let leaked: &'static mut [PerCpu] = Vec::leak(blocks);
+	let prev = PER_CPU.swap(leaked.as_mut_ptr(), Ordering::Release);
+	assert!(prev.is_null(), "per-CPU blocks allocated twice");
 	CPU_COUNT.store(count, Ordering::Release);
 }
 
@@ -61,8 +62,10 @@ pub fn allocate(count: usize) {
 // only its own slot, so concurrent calls on different harts do not race.
 pub fn init(cpu_id: usize, hartid: u32) {
 	assert!(cpu_id < CPU_COUNT.load(Ordering::Acquire), "per-CPU slot out of range");
-	let slot = POOL.0[cpu_id].get();
+	let base = PER_CPU.load(Ordering::Acquire);
+	assert!(!base.is_null(), "per-CPU blocks not allocated");
 	unsafe {
+		let slot = base.add(cpu_id);
 		(*slot).cpu_id = cpu_id as u32;
 		(*slot).lapic_id = hartid;
 		asm!("mv tp, {}", in(reg) slot as u64, options(nomem, nostack, preserves_flags));

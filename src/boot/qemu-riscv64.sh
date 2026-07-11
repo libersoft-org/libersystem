@@ -11,7 +11,7 @@ set -euo pipefail
 
 KERNEL="${1:?usage: qemu-riscv64.sh <kernel-elf>}"
 SERIAL="${SERIAL:-mon:stdio}"
-SMP="${SMP:-1}"
+SMP="${SMP:-$(nproc)}"
 MEM="${MEM:-512M}"
 # `default` uses QEMU's bundled OpenSBI (fw_dynamic); override with BIOS=<path>.
 BIOS="${BIOS:-default}"

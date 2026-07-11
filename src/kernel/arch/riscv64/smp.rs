@@ -9,27 +9,21 @@
 // the higher half. The secondaries idle in the scheduler until a thread is dispatched.
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
-// Matches the per-CPU pool size in `percpu`.
-const MAX_CPUS: usize = 8;
-const SEC_STACK_SIZE: u64 = 16384;
+use alloc::vec::Vec;
 
-// Per-core boot stacks for the secondaries (indexed by cpu id). No_mangle so the boot
-// stub can name it; the .quad literal resolves to its higher-half address.
-#[unsafe(no_mangle)]
-static mut SEC_STACKS: [[u8; SEC_STACK_SIZE as usize]; MAX_CPUS] = [[0; SEC_STACK_SIZE as usize]; MAX_CPUS];
+const SEC_STACK_SIZE: usize = 16384;
 
-// Count of secondaries that have come online, and their reported hart ids.
+// Count of secondaries that have come online.
 static SMP_ONLINE: AtomicU32 = AtomicU32::new(0);
-static SEC_HARTID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 global_asm!(
 	r#"
 .section .data.boot, "a"
 .balign 8
-.Ls_main:   .quad riscv64_secondary_main
-.Ls_stacks: .quad SEC_STACKS
+.Ls_main:    .quad riscv64_secondary_main
+.Ls_stacksp: .quad riscv64_sec_stacks_ptr
 
 .section .text.boot, "ax"
 .global riscv64_secondary_start
@@ -48,9 +42,12 @@ riscv64_secondary_start:            // a0 = hartid, a1 = opaque = cpu id
 	csrw    satp, t1
 	sfence.vma
 
-	// Per-core higher-half stack: SEC_STACKS[cpu_id] top.
-	la      t0, .Ls_stacks
-	ld      t0, 0(t0)               // higher-half base of SEC_STACKS
+	// Per-core higher-half stack: the heap stacks base + cpu_id*SEC_STACK_SIZE, top.
+	// The base lives in a higher-half static the BSP filled; the low boot word holds
+	// that static's address, so double-dereference (low word -> static -> base).
+	la      t0, .Ls_stacksp
+	ld      t0, 0(t0)               // higher-half address of riscv64_sec_stacks_ptr
+	ld      t0, 0(t0)               // the heap secondary-stacks base
 	li      t1, 16384               // SEC_STACK_SIZE
 	mul     t2, s1, t1
 	add     t0, t0, t2
@@ -80,6 +77,14 @@ unsafe extern "C" {
 	static riscv64_secondary_entry: u64;
 }
 
+// The higher-half base of the heap-allocated secondary stacks, published by the BSP
+// before waking any hart; the boot stub reads it (indirectly, through a low boot word
+// holding this static's address) to find its stack. It is a higher-half static so the
+// BSP's write stays in PC-relative range (a word in the low `.data.boot` could not be
+// reached from the higher-half kernel).
+#[unsafe(no_mangle)]
+static mut riscv64_sec_stacks_ptr: u64 = 0;
+
 // First Rust code a secondary hart runs (MMU on, per-core stack set). It brings up its
 // per-CPU block, trap vector, and local timer, records itself online, then idles.
 #[unsafe(no_mangle)]
@@ -93,7 +98,6 @@ extern "C" fn riscv64_secondary_main(cpu_id: u64, hartid: u64) -> ! {
 	crate::smp::set_lapic_id(cpu_id as usize, hartid as u32);
 	super::imsic::init_hart();
 	super::apic::init_ap();
-	SEC_HARTID[cpu_id as usize].store(hartid, Ordering::Relaxed);
 	SMP_ONLINE.fetch_add(1, Ordering::Release);
 	// Also count this core in the portable online tally the scheduler and tests read.
 	crate::smp::mark_online();
@@ -133,6 +137,20 @@ pub fn bring_up_secondaries(cpu_count: u32, boot_hartid: u64) {
 		return;
 	}
 
+	// Allocate the secondary stacks as a single zeroed, 16-byte-aligned heap block: u128
+	// elements give the alignment (the RISC-V ABI needs a 16-aligned sp) and let the
+	// allocator zero the block directly - building a `[u8; 16384]` on the boot stack
+	// would blow it. Index 0 (the boot hart) is left unused; the stacks scale with the
+	// hart count, no compile-time cap. Publish the higher-half base to the boot stub
+	// through the shared data word before any secondary reads it.
+	let words = cpu_count as usize * (SEC_STACK_SIZE / 16);
+	let stacks: Vec<u128> = alloc::vec![0u128; words];
+	let base = Vec::leak(stacks).as_mut_ptr() as u64;
+	unsafe {
+		*(&raw mut riscv64_sec_stacks_ptr) = base;
+		core::arch::asm!("fence", options(nostack, preserves_flags));
+	}
+
 	// The secondary entry is the low, physical `.text.boot` stub address; the SBI
 	// releases each hart there with the MMU off, and the stub adopts the boot page
 	// tables. High kernel code cannot address the low symbol directly, so its address
@@ -140,7 +158,7 @@ pub fn bring_up_secondaries(cpu_count: u32, boot_hartid: u64) {
 	let entry = unsafe { riscv64_secondary_entry };
 	let mut cpu_id = 1u64;
 	for hartid in 0..cpu_count as u64 {
-		if hartid == boot_hartid || cpu_id as usize >= MAX_CPUS {
+		if hartid == boot_hartid {
 			continue;
 		}
 		let status = sbi_hart_start(hartid, entry, cpu_id);
@@ -149,7 +167,7 @@ pub fn bring_up_secondaries(cpu_count: u32, boot_hartid: u64) {
 		}
 		cpu_id += 1;
 	}
-	let want = (cpu_count - 1).min((MAX_CPUS - 1) as u32);
+	let want = cpu_count - 1;
 
 	// Wait for the secondaries to come online.
 	let mut spins: u64 = 0;
@@ -161,6 +179,6 @@ pub fn bring_up_secondaries(cpu_count: u32, boot_hartid: u64) {
 	let online = SMP_ONLINE.load(Ordering::Acquire);
 	crate::serial_println!("riscv64: SMP - {}/{} secondary harts online", online, want);
 	for cpu in 1..=want as usize {
-		crate::serial_println!("riscv64:   cpu {} up (hart {})", cpu, SEC_HARTID[cpu].load(Ordering::Relaxed));
+		crate::serial_println!("riscv64:   cpu {} up (hart {})", cpu, crate::smp::lapic_id(cpu));
 	}
 }
