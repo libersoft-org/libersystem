@@ -15,6 +15,8 @@
 
 use core::arch::asm;
 
+use crate::sync::SpinLock;
+
 // Higher-half kernel offset: kernel VA = physical | KERNEL_VA_OFFSET. The same
 // offset is the direct-map (HHDM) base, so any physical address is reachable as
 // `phys_to_virt(pa)` through TTBR1.
@@ -43,6 +45,19 @@ const UXN: u64 = 1 << 54; // unprivileged execute-never
 
 // The physical-address mask for a table/page pointer (bits [47:12]).
 const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+// Serializes every structural mutation of a page table (map / unmap / address-space
+// teardown). A per-process TTBR0 tree is private, but map_page also targets the
+// shared TTBR1 higher-half tree that is live on every core at once, so two cores
+// mapping high VAs that share an intermediate level would otherwise race in
+// map_page_root: both read an absent entry, both allocate a fresh next-level table,
+// and one write wins - stranding the loser's leaf in an orphaned table (its thread
+// then faults) and leaking a frame. This lock closes that race. It is a leaf lock
+// over the frame allocator (map/unmap alloc/free intermediate tables under it, never
+// the reverse), so the ordering is page-table -> frame and cannot deadlock. (The
+// riscv64 backend carries the same lock for the same reason; on aarch64 the race
+// never triggers under TCG's speed but is a real correctness bug - M118.)
+static PT_LOCK: SpinLock<()> = SpinLock::new(());
 
 // Translate a virtual address to its physical address by walking the active
 // tables (4 kB granule, 48-bit, levels L0..L3, honoring block descriptors). A
@@ -167,6 +182,7 @@ fn leaf_bits(flags: u64) -> u64 {
 // table address), allocating any missing intermediate tables from the frame
 // allocator, then invalidate the TLB for that VA.
 unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) {
+	let _guard = PT_LOCK.lock();
 	let mut table = phys_to_virt(root) as *mut u64;
 	for level in 0..3u64 {
 		let shift = 39 - level * 9; // L0=39, L1=30, L2=21
@@ -259,6 +275,7 @@ unsafe fn next_table(table: *const u64, idx: usize) -> Option<u64> {
 // Unmap `virt` in the tree rooted at `root`, returning the frame it pointed at (if
 // mapped). Intermediate tables are left in place; free_address_space reclaims them.
 unsafe fn unmap_page_root(root: u64, virt: u64) -> Option<u64> {
+	let _guard = PT_LOCK.lock();
 	let l1 = unsafe { next_table(phys_to_virt(root) as *const u64, ((virt >> 39) & 0x1ff) as usize)? };
 	let l2 = unsafe { next_table(phys_to_virt(l1) as *const u64, ((virt >> 30) & 0x1ff) as usize)? };
 	let l3 = unsafe { next_table(phys_to_virt(l2) as *const u64, ((virt >> 21) & 0x1ff) as usize)? };
@@ -299,7 +316,8 @@ pub fn unmap_page_in(ttbr: u64, virt: u64) -> Option<u64> {
 // Create a fresh address-space root (TTBR0 tree). The kernel runs in the higher
 // half through TTBR1, so a per-process TTBR0 tree carries no kernel mappings: it
 // starts as an empty L0. User pages (all below 128 TB) are mapped on demand.
-// Returns the L0 physical address, or None if out of RAM.
+// Returns the L0 physical address, or None if out of RAM. No PT_LOCK needed: this
+// only allocates an empty root (a leaf frame alloc), it mutates no shared table.
 pub fn new_address_space() -> Option<u64> {
 	// alloc_frame returns a zeroed frame, so the L0 is already empty.
 	alloc_frame()
@@ -309,6 +327,7 @@ pub fn new_address_space() -> Option<u64> {
 // page table and the L0 frame. Leaf data frames are owned by whoever mapped them
 // and are not freed here.
 pub fn free_address_space(root: u64) {
+	let _guard = PT_LOCK.lock();
 	unsafe {
 		let l0 = phys_to_virt(root) as *const u64;
 		for i in 0..512 {

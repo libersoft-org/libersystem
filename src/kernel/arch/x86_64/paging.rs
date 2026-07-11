@@ -13,6 +13,7 @@
 use core::arch::asm;
 
 use crate::mem::frame;
+use crate::sync::SpinLock;
 
 // Page-table entry flags: the portable permission set (the x86-64 PTE bit positions,
 // used here as hardware bits verbatim). NO_CACHE is PCD (disable caching, for MMIO);
@@ -22,6 +23,20 @@ pub use crate::arch::common::paging::{NO_CACHE, NO_EXECUTE, PRESENT, USER, WRITA
 // Physical address bits within a page-table entry (bits 12..=51).
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const ENTRY_COUNT: usize = 512;
+
+// Serializes every structural mutation of a page table (map / unmap / address-space
+// create + teardown). The kernel half of every address space shares the SAME
+// intermediate tables (new_address_space copies the kernel PML4 entries), and the
+// kernel PML4 is live on every core at once, so two cores mapping VAs that share an
+// intermediate level would otherwise race in next_table_create: both read an absent
+// entry, both allocate a fresh next-level table, and one write wins - stranding the
+// loser's leaf in an orphaned table (its thread then faults) and leaking a frame.
+// This lock closes that race. It is a leaf lock over the frame allocator (map/unmap
+// alloc/free intermediate tables under it, never the reverse), so the ordering is
+// page-table -> frame and cannot deadlock. (The riscv64 backend carries the same
+// lock for the same reason; on x86 the race never triggers under KVM's speed but is
+// a real correctness bug - M118.)
+static PT_LOCK: SpinLock<()> = SpinLock::new(());
 
 // Whether the CPU supports the NX bit and EFER.NXE has been enabled. When it has
 // not (an old CPU), map_page_in strips NO_EXECUTE so the bit is never a reserved-
@@ -218,6 +233,7 @@ pub fn remove_bootstrap_identity() {
 // becomes visible when CR3 is loaded with it (which flushes the TLB anyway), so
 // the invlpg here is harmless for a non-active space.
 pub fn map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
+	let _guard = PT_LOCK.lock();
 	// Without EFER.NXE the NX bit is a reserved bit; strip it so old CPUs still map.
 	let flags = if nx_enabled() { flags } else { flags & !NO_EXECUTE };
 	// Permission bits the whole walk must grant for the leaf to be reachable. NX
@@ -252,6 +268,7 @@ pub fn unmap_pages(base: u64, count: usize) {
 // returning the physical frame it pointed at. Intermediate tables are left in
 // place (not reclaimed here); free_address_space reclaims them wholesale.
 pub fn unmap_page_in(pml4_phys: u64, virt: u64) -> Option<u64> {
+	let _guard = PT_LOCK.lock();
 	unsafe {
 		let pml4 = table_ptr(pml4_phys);
 		let pdpt = table_ptr(next_table_walk(pml4, table_index(virt, 39))?);
@@ -280,6 +297,7 @@ pub fn unmap_page_in(pml4_phys: u64, virt: u64) -> Option<u64> {
 // from kernel threads / the boot context), so the active PML4 is the kernel one.
 pub fn new_address_space() -> Option<u64> {
 	let pml4_phys = frame::allocate()?;
+	let _guard = PT_LOCK.lock();
 	unsafe {
 		let dst = table_ptr(pml4_phys);
 		let src = table_ptr(active_pml4_phys());
@@ -299,6 +317,7 @@ pub fn new_address_space() -> Option<u64> {
 // never freed. Leaf data frames are owned by whoever mapped them (a MemoryObject
 // or the caller) and are not freed here.
 pub fn free_address_space(pml4_phys: u64) {
+	let _guard = PT_LOCK.lock();
 	unsafe {
 		let pml4 = table_ptr(pml4_phys);
 		for i in 0..256 {
