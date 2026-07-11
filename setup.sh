@@ -36,22 +36,22 @@ APT_PACKAGES=(
 	build-essential # gcc, make, ...
 	git
 	curl
-	xorriso          # ISO creation (UEFI)
-	gdisk            # sgdisk: GPT partitioning for the disk image
-	mtools           # mformat/mcopy: populate the FAT boot partition without root
-	netpbm           # pnmtopng/pnmtojpeg: convert QEMU framebuffer screendumps
-	imagemagick      # convert: framebuffer screenshots to png/jpg/webp/...
-	socat            # drive the QEMU monitor unix socket for screenshots
-	qemu-system-x86  # qemu-system-x86_64 (the native x86_64 build)
-	qemu-system-arm  # qemu-system-aarch64 (the ARM64 build, emulated on an x86 host)
+	xorriso           # ISO creation (UEFI)
+	gdisk             # sgdisk: GPT partitioning for the disk image
+	mtools            # mformat/mcopy: populate the FAT boot partition without root
+	netpbm            # pnmtopng/pnmtojpeg: convert QEMU framebuffer screendumps
+	imagemagick       # convert: framebuffer screenshots to png/jpg/webp/...
+	socat             # drive the QEMU monitor unix socket for screenshots
+	qemu-system-x86   # qemu-system-x86_64 (the native x86_64 build)
+	qemu-system-arm   # qemu-system-aarch64 (the ARM64 build, emulated on an x86 host)
 	qemu-system-riscv # qemu-system-riscv64 (the RISC-V build, emulated on an x86 host)
-	qemu-utils       # qemu-img
-	ovmf             # UEFI firmware for QEMU x86_64 (the platform boots through UEFI)
-	qemu-efi-aarch64 # AAVMF: UEFI firmware for QEMU ARM64 (the own aarch64 UEFI loader)
-	u-boot-qemu      # U-Boot EFI firmware for QEMU RISC-V (the own riscv64 UEFI loader)
-	gdb              # debugging via GDB stub
-	lld              # LLVM linker (ld.lld)
-	llvm             # llvm-objcopy and friends
+	qemu-utils        # qemu-img
+	ovmf              # UEFI firmware for QEMU x86_64 (the platform boots through UEFI)
+	qemu-efi-aarch64  # AAVMF: UEFI firmware for QEMU ARM64 (the own aarch64 UEFI loader)
+	u-boot-qemu       # U-Boot EFI firmware for QEMU RISC-V (the own riscv64 UEFI loader)
+	gdb               # debugging via GDB stub
+	lld               # LLVM linker (ld.lld)
+	llvm              # llvm-objcopy and friends
 	clang
 )
 

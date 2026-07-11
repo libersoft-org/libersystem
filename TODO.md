@@ -2218,9 +2218,10 @@ boot-time nicety.
 - Done when: a UEFI-loader boot on aarch64/riscv64 draws the earliest boot log to a GOP framebuffer, both suites stay green, and the direct `-kernel` ramfb path is unaffected.
 - Concept: M116 (the ramfb avenue B this complements), M114 (the UEFI loaders that gain the GOP query).
 
-- [ ] (chore) Retire the pre-existing fmt drift at HEAD. `just fmt-check` is red on `user/storage/src/service.rs` (a block `if/else` rustfmt wants collapsed to a one-liner) - drift committed before the M118 work, not from it (git shows only the two paging.rs files touched by the PT_LOCK change). Run `just fmt` over the tree and re-verify `just fmt-check` is clean, so the gate is usable again. Trivial; ride it with the next commit that touches the area or do it standalone.
+- [x] (chore) Retire the pre-existing fmt drift at HEAD. `just fmt-check` is red on `user/storage/src/service.rs` (a block `if/else` rustfmt wants collapsed to a one-liner) - drift committed before the M118 work, not from it (git shows only the two paging.rs files touched by the PT_LOCK change). Run `just fmt` over the tree and re-verify `just fmt-check` is clean, so the gate is usable again. Trivial; ride it with the next commit that touches the area or do it standalone.
 - Done when: `just fmt-check` is clean at HEAD.
 - Concept: the fmt gate stays usable (the M104 docs-and-dead-code sweep's fmt-drift item, recurring).
+- Result: `just fmt` over the tree normalized four files of committed drift - `setup.sh` (shfmt comment-column alignment in the APT list), `src/loader/src/arch/riscv64/mod.rs` + `src/user/drivers/src/virtio_blk.rs` + `src/user/storage/src/service.rs` (rustfmt collapsing short `if/else` blocks to one line, plus reordering a `use` group so `volume`/`align_down` follow the uppercase names). Pure formatting, no semantic change. `just fmt-check` now rc=0 across every crate and the shell scripts.
 
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace

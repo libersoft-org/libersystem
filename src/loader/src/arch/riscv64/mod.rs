@@ -24,7 +24,7 @@ pub mod head;
 pub mod serial;
 
 use crate::uefi::{self, BootServices, Guid, Handle, SystemTable};
-use crate::{align_down, PAGE_SIZE};
+use crate::{PAGE_SIZE, align_down};
 
 // RISCV_EFI_BOOT_PROTOCOL: U-Boot (and EDK2) expose the id of the hart that entered
 // the firmware through this protocol, so the loader can hand it to the kernel in a0 -
@@ -121,11 +121,7 @@ fn boot_hartid(bs: *mut BootServices) -> u64 {
 	let proto = iface as *mut RiscvEfiBootProtocol;
 	let mut hartid: usize = 0;
 	let status = unsafe { ((*proto).get_boot_hartid)(proto, &mut hartid) };
-	if uefi::is_error(status) {
-		0
-	} else {
-		hartid as u64
-	}
+	if uefi::is_error(status) { 0 } else { hartid as u64 }
 }
 
 // Scan the firmware configuration table for the flattened device tree, returning its
