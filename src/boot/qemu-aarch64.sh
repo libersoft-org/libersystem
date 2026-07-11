@@ -153,12 +153,12 @@ DISK_ARGS+=(
 # Interactive-only devices, the same graphical/input/audio set the x86 runner attaches,
 # left out of the deterministic TEST device set (which boots only blk/net/usb) so the
 # test topology stays fixed:
-#   - virtio-gpu: the userspace driver.virtio-gpu drives it as the display. ConsoleService
-#     renders the terminal onto the driver's shared backing and FLUSHes to the host
-#     scanout, so the shell is visible over VNC/SPICE. Unlike x86 (virtio-vga) QEMU's
-#     `virt` machine has no VGA framebuffer, so the kernel draws no boot-log framebuffer;
-#     the boot log is instead replayed into the terminal from the kernel log, so it still
-#     appears on the graphical display.
+#   - ramfb: a simple framebuffer the kernel programs over fw-cfg and draws the boot log
+#     into pixel-by-pixel (fb_present=1), then ConsoleService renders the shell onto the
+#     same framebuffer (SYS_FRAMEBUFFER_MAP) - one unified display, boot-log to shell,
+#     like x86. QEMU's `virt` has no VGA, and QEMU 10's virtio-gpu carries no combined
+#     ramfb, so ramfb (not virtio-gpu) is the display here; runtime resize (a virtio-gpu
+#     feature) is traded for the kernel-drawn early framebuffer.
 #   - virtio-keyboard + virtio-tablet: virtio_input keyboard + pointer, so InputService
 #     gets keystrokes and absolute pointer events on the graphical display.
 #   - virtio-sound: the audio device the `beep` command drives; its audiodev is the SPICE
@@ -167,7 +167,7 @@ DISK_ARGS+=(
 if [[ "${TEST:-0}" != "1" ]]; then
 	VCON_OUT="$HERE/.build/virtio-console-aarch64.out"
 	DISK_ARGS+=(
-		-device "virtio-gpu-pci,disable-legacy=on"
+		-device "ramfb"
 		-device "virtio-keyboard-pci,disable-legacy=on"
 		-device "virtio-tablet-pci,disable-legacy=on"
 		-device "virtio-serial-pci,disable-legacy=on"

@@ -25,6 +25,9 @@ pub struct BootInfo {
 	pub pcie_ecam: u64,
 	// PLIC (RISC-V platform interrupt controller) base (0 if none / not RISC-V).
 	pub plic_base: u64,
+	// QEMU fw-cfg MMIO base (0 if the tree has no fw-cfg node). Drives the ramfb
+	// early framebuffer.
+	pub fwcfg_base: u64,
 }
 
 // FDT token + header constants.
@@ -135,6 +138,7 @@ impl Fdt {
 			// (depth 2) on riscv64 virt, so track them by the depth at which we entered.
 			let mut in_pcie: i32 = -1;
 			let mut in_plic: i32 = -1;
+			let mut in_fwcfg: i32 = -1;
 			let mut addr_cells: u32 = 2;
 			let mut size_cells: u32 = 2;
 			let mut ram_base: u64 = 0;
@@ -142,6 +146,7 @@ impl Fdt {
 			let mut cpu_count: u32 = 0;
 			let mut pcie_ecam: u64 = 0;
 			let mut plic_base: u64 = 0;
+			let mut fwcfg_base: u64 = 0;
 
 			loop {
 				let token = self.be32(p);
@@ -163,6 +168,9 @@ impl Fdt {
 						if in_plic < 0 && self.str_starts(name, "plic") {
 							in_plic = depth;
 						}
+						if in_fwcfg < 0 && self.str_starts(name, "fw-cfg") {
+							in_fwcfg = depth;
+						}
 					}
 					FDT_END_NODE => {
 						if depth == 1 {
@@ -174,6 +182,9 @@ impl Fdt {
 						}
 						if depth == in_plic {
 							in_plic = -1;
+						}
+						if depth == in_fwcfg {
+							in_fwcfg = -1;
 						}
 						depth -= 1;
 					}
@@ -210,6 +221,10 @@ impl Fdt {
 							// The plic node's reg is <plic_base plic_size> in root cells.
 							let mut q = val;
 							plic_base = self.read_cells(&mut q, addr_cells);
+						} else if in_fwcfg == depth && self.str_eq(pname, "reg") {
+							// The fw-cfg node's reg is <fwcfg_base size> in root cells.
+							let mut q = val;
+							fwcfg_base = self.read_cells(&mut q, addr_cells);
 						}
 					}
 					FDT_NOP => {}
@@ -221,7 +236,7 @@ impl Fdt {
 			if ram_size == 0 {
 				return None;
 			}
-			Some(BootInfo { ram_base, ram_size, cpu_count: cpu_count.max(1), pcie_ecam, plic_base })
+			Some(BootInfo { ram_base, ram_size, cpu_count: cpu_count.max(1), pcie_ecam, plic_base, fwcfg_base })
 		}
 	}
 }

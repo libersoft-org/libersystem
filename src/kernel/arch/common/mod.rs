@@ -25,6 +25,7 @@
 
 pub mod context;
 pub mod dtb;
+pub mod fwcfg;
 pub mod msi;
 pub mod paging;
 pub mod pci;
