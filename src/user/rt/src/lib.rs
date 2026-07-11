@@ -1000,6 +1000,42 @@ pub unsafe fn service_connect(factory: u64) -> Option<u64> {
 	}
 }
 
+// The reserved broker opcode a component sends over its (kept-alive) bootstrap
+// channel to (re-)resolve a named service capability: `RESOLVE_OP` + the capability
+// tag (e.g. CAP_CONFIG). ServiceManager - the broker, the one process that spawns
+// every service, holds its factory root, and runs the restart ladder - answers with
+// a fresh client channel to the CURRENT live instance, minted through the service's
+// CONNECT_OP factory. The request is answered only if the requester's manifest
+// grants that name (the capability discipline enforced on every connect, not just
+// once at spawn); an un-granted name gets b"DENIED", a service that is gone for
+// good (stopped, or its restart budget spent) gets b"DOWN". A resolve aimed at a
+// service the broker is currently restarting is simply answered late (the broker
+// is single-threaded), so a client experiences the crash as latency, not an error.
+// This is the durable-name / disposable-channel pattern (Fuchsia routing, Genode
+// sessions, Minix reincarnation): the client's lasting reference is the NAME.
+// No typed interface uses opcode 0xfffd, so it never collides with a real request.
+pub const RESOLVE_OP: u16 = 0xfffd;
+
+// Re-resolve a named service capability over the broker (bootstrap) channel:
+// send `RESOLVE_OP` + `name` and block for the broker's answer. Returns the fresh
+// client channel to the current live instance, or None when the broker denies the
+// name, the service is gone for good, or the broker itself is gone.
+pub unsafe fn resolve(broker: u64, name: &[u8]) -> Option<u64> {
+	unsafe {
+		let mut req: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(2 + name.len());
+		req.extend_from_slice(&RESOLVE_OP.to_le_bytes());
+		req.extend_from_slice(name);
+		if !send_blocking(broker, &req, 0) {
+			return None;
+		}
+		let mut buf: [u8; 32] = [0u8; 32];
+		match recv_blocking(broker, &mut buf) {
+			Received::Message { handle, .. } if handle != 0 => Some(handle),
+			_ => None,
+		}
+	}
+}
+
 // A proto Transport over an rt channel: send the request (with any out-of-band
 // handle), then block for the reply (whose own out-of-band handle is returned
 // alongside the bytes). Every userspace program that drives a generated service
@@ -1020,6 +1056,83 @@ impl proto::codec::Transport for ChannelTransport {
 			match recv_vec_blocking(self.chan) {
 				ReceivedVec::Message { bytes, handle } => Some((bytes, handle)),
 				ReceivedVec::Closed => None,
+			}
+		}
+	}
+}
+
+// A proto Transport that survives a service restart: like ChannelTransport, but the
+// durable reference is the capability NAME, re-resolved over the broker (bootstrap)
+// channel when the live channel dies. When the send itself fails (the service
+// crashed BETWEEN requests - the common case, nothing was delivered), the request
+// is transparently retried once on a freshly resolved channel: at-most-once
+// semantics hold, so the retry is always safe. When the service dies MID-request
+// (the send succeeded but the reply never came), the call returns None and only the
+// NEXT call reconnects: the request may have been half-applied, so replaying it is
+// the caller's protocol-level decision, not the transport's - the honest limit of
+// connection-level transparency.
+pub struct SvcTransport {
+	// The broker (bootstrap) channel resolves are sent over. Borrowed, never closed.
+	broker: u64,
+	// The capability tag this connection re-resolves as (e.g. CAP_CONFIG).
+	name: &'static [u8],
+	// The current live channel (0 = not connected; resolved on the next call).
+	chan: u64,
+}
+
+impl SvcTransport {
+	// Wrap a bootstrap-granted channel: `chan` serves until it peer-closes, then the
+	// name takes over. `chan` 0 is valid (the first call resolves).
+	pub const fn new(broker: u64, name: &'static [u8], chan: u64) -> SvcTransport {
+		SvcTransport { broker, name, chan }
+	}
+
+	// The current live channel, resolving through the broker when there is none.
+	// 0 when the broker cannot (or will not) provide one.
+	pub unsafe fn channel(&mut self) -> u64 {
+		if self.chan == 0 {
+			self.chan = unsafe { resolve(self.broker, self.name) }.unwrap_or(0);
+		}
+		self.chan
+	}
+
+	// Drop the dead channel and resolve a fresh connection to the current live
+	// instance. False when the broker denies or the service is gone for good.
+	pub unsafe fn reconnect(&mut self) -> bool {
+		unsafe {
+			if self.chan != 0 {
+				close(self.chan);
+				self.chan = 0;
+			}
+			self.channel() != 0
+		}
+	}
+}
+
+impl proto::codec::Transport for SvcTransport {
+	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
+		unsafe {
+			let chan: u64 = self.channel();
+			if chan == 0 {
+				return None;
+			}
+			if !send_blocking(chan, request, request_handle) {
+				// Nothing was delivered: reconnect and retry once (at-most-once holds).
+				if !self.reconnect() {
+					return None;
+				}
+				if !send_blocking(self.chan, request, request_handle) {
+					return None;
+				}
+			}
+			match recv_vec_blocking(self.chan) {
+				ReceivedVec::Message { bytes, handle } => Some((bytes, handle)),
+				ReceivedVec::Closed => {
+					// Died mid-request: reconnect for the NEXT call, report this one
+					// failed (replaying a possibly half-applied request is not ours).
+					let _ = self.reconnect();
+					None
+				}
 			}
 		}
 	}

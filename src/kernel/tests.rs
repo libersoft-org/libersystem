@@ -3070,14 +3070,20 @@ fn init_package_starts_system_manager() {
 	// once they are running, and in turn launches its sandboxed component before reporting
 	// in), and finally - after every component it observes - SystemGraphService, then the
 	// shell. Every report is relayed up, so the kernel observes the
-	// services come up in dependency order, then DeviceManager stopped (ServiceManager
-	// exercises the stop path on that service), then the watchdog canary brought up,
+	// services come up in dependency order, then the watchdog canary brought up,
 	// restarted after a commanded crash and recovered after a missed heartbeat
-	// (ServiceManager exercises the restart policy and watchdog), followed by the two
-	// managers.
+	// (ServiceManager exercises the restart policy and watchdog), then the
+	// transparent-restart drill: ConfigService - a REAL service other components hold
+	// channels to - is killed and restarted per policy, and the canary (a standing
+	// client with a CONFIG grant) re-resolves it through the broker and round-trips a
+	// typed request against the restarted instance, proving a client survives a
+	// service restart (and that an un-granted resolve is denied). Then DeviceManager
+	// stopped (ServiceManager exercises the stop path on that service - after the
+	// restart drill, whose replacement is launched from the system volume that
+	// DeviceManager's virtio-blk backs), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 26] = [
+	let reports: [&[u8]; 28] = [
 		b"LogService: online",
 		b"DeviceManager: online",
 		b"StorageService: online",
@@ -3098,10 +3104,12 @@ fn init_package_starts_system_manager() {
 		b"ConsoleService: online",
 		b"SystemGraphService: online",
 		b"Shell: online",
-		b"DeviceManager: stopped",
 		b"WatchdogProbe: online",
 		b"WatchdogProbe: restarted",
 		b"WatchdogProbe: recovered",
+		b"ConfigService: restarted",
+		b"WatchdogProbe: config client survived",
+		b"DeviceManager: stopped",
 		b"ServiceManager: online",
 		b"SystemManager: online",
 	];

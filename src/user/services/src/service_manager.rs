@@ -273,6 +273,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// alongside SystemGraphService's in the supervise loop; minted when PermissionManager
 	// bootstraps.
 	let mut stats_server2: u64 = 0;
+	// The supervisor's OWN ProcessService connection - the broker launches transparent-
+	// restart replacements through it. Minted right when ProcessService comes up, BEFORE
+	// the root is transferred to the shell at its bootstrap (a transferred handle is gone
+	// from our table, so a late mint would find nothing to mint from).
+	let mut broker_process: u64 = 0;
 	loop {
 		let mut progress: bool = false;
 		let mut i: usize = 0;
@@ -283,6 +288,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
+				if MANIFEST[i].name == b"process_service" && started == State::Running {
+					broker_process = unsafe { service_connect(process_client) }.unwrap_or(0);
+				}
 				// M61 box 8: once the system StorageService is up, drive DeviceManager's phase
 				// 2 - it now loads the non-bootstrap drivers from the volume, which is only
 				// mountable now. This runs before the driver-consuming services (which depend
@@ -337,29 +345,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			sup[idx].failure = Failure::Bootstrap;
 		}
 	}
-	if selftest {
-		if let Some(dev) = index_of(b"device_manager") {
-			if state[dev] == State::Running {
-				state[dev] = unsafe { stop_service(channels[dev], bootstrap, &mut buf) };
-				sup[dev].failure = Failure::Stopped;
-				channels[dev] = 0;
-				unsafe { emit_event(log_client, b"device_manager", b"stopped") };
-			}
-		}
-	}
 
-	// 3b. bring up the managed canary and, in a test boot, exercise the restart policy
-	//     and the watchdog on it. The supervisor owns the canary outright (it is not in
-	//     the manifest and no other component holds a channel to it), so it can crash it,
-	//     hang it, and restart it without disturbing the running system - proving the
-	//     unattended-recovery machinery an edge node depends on. A crash is detected by
-	//     the control channel peer-closing and recovered by a policy restart with
-	//     back-off; a hang is caught by a missed heartbeat and recovered by a kill +
-	//     restart. Each transition is reported up the boot chain and journaled. A
-	//     production boot spawns and supervises the canary but never deliberately faults
-	//     it. (Transparent restart of a real service other components hold channels to
-	//     needs a re-resolve/broker, deferred; the canary stands in for the policy, while
-	//     crash detection below applies to every real service.)
+	// 3. bring up the managed canary and, in a test boot, exercise the restart policy
+	//    and the watchdog on it. The supervisor owns the canary outright (it is not in
+	//    the manifest), so it can crash it, hang it, and restart it without disturbing
+	//    the running system - proving the unattended-recovery machinery an edge node
+	//    depends on. A crash is detected by the control channel peer-closing and
+	//    recovered by a policy restart with back-off; a hang is caught by a missed
+	//    heartbeat and recovered by a kill + restart. Each transition is reported up
+	//    the boot chain and journaled. A production boot spawns and supervises the
+	//    canary but never deliberately faults it.
 	let (park, _park_peer): (u64, u64) = match unsafe { channel() } {
 		Some(pair) => pair,
 		None => (0, 0),
@@ -401,6 +396,56 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 
+	// 3b. the transparent-restart drill (a test boot only): kill a REAL standing service
+	//     other components hold channels to - ConfigService - restart it per policy, and
+	//     prove a live client survives: the canary re-resolves CONFIG through the broker
+	//     (its bootstrap channel), round-trips a typed get against the restarted
+	//     instance, and proves an un-granted name is denied. This runs BEFORE the
+	//     DeviceManager stop drill below, because the replacement is launched from the
+	//     system volume, which stopping DeviceManager makes unavailable. The broker
+	//     stands for the life of the system (the supervise loop serves resolves and
+	//     restarts config on a runtime crash the same way).
+	let mut broker: Broker = Broker { config: config_client, process: broker_process };
+	if selftest && canary_ctrl != 0 {
+		if let Some(cfg) = index_of(b"config_service") {
+			if state[cfg] == State::Running && procs[cfg] != 0 {
+				unsafe {
+					// A real crash: kill the live instance out from under its clients.
+					signal(procs[cfg], SIG_KILL);
+					if restart_config(&mut broker, cfg, &mut state, &mut channels, &mut procs, &mut sup, policy.restart_budget, park, &mut buf) {
+						send_blocking(bootstrap, b"ConfigService: restarted", 0);
+						emit_event(log_client, b"config_service", b"restarted");
+						// The client-survives proof: the canary resolves and queries the
+						// restarted instance, and its STORAGE resolve is denied.
+						let vlen: usize = drive_check(canary_ctrl, &broker, &state, &mut buf);
+						if vlen > 0 && &buf[..vlen] == b"CONFIG-OK DENIED-OK" {
+							send_blocking(bootstrap, b"WatchdogProbe: config client survived", 0);
+							emit_event(log_client, b"watchdog_probe", b"config client survived");
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 3c. in a test boot, exercise the stop path on a leaf service. DeviceManager is the
+	//     safe choice: nothing depends on it at this point, so stopping it does not tear
+	//     down the running system (stopping log_service, storage_service, or the
+	//     interactive shell would). This proves the supervisor can stop a service and
+	//     track the transition, and the transition is recorded in the journal like the
+	//     startup events. A production boot skips the exercise and leaves DeviceManager
+	//     running.
+	if selftest {
+		if let Some(dev) = index_of(b"device_manager") {
+			if state[dev] == State::Running {
+				state[dev] = unsafe { stop_service(channels[dev], bootstrap, &mut buf) };
+				sup[dev].failure = Failure::Stopped;
+				channels[dev] = 0;
+				unsafe { emit_event(log_client, b"device_manager", b"stopped") };
+			}
+		}
+	}
+
 	// 4. report in once the whole set has settled - every service either Running or,
 	//    for the leaf we exercised the stop path on, Stopped, with none left Failed.
 	//    Keep `storage_client` alive in case the shell never took it (e.g. a spawn
@@ -420,7 +465,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    (reverse-dependency teardown), or SystemGraphService querying the supervisor state.
 	//    No timer stands here, so the loop sleeps at ~0% CPU until an event arrives.
 	unsafe {
-		supervise(&mut state, &mut channels, &mut sup, &failure_reason, &procs, &package, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, stats_server, stats_server2, &driver_state, log_client, bootstrap, park, &mut buf);
+		supervise(&mut state, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, stats_server, stats_server2, &driver_state, log_client, bootstrap, park, &mut buf);
 	}
 	exit();
 }
@@ -1562,6 +1607,174 @@ unsafe fn drain_closed(channel: u64, buf: &mut [u8]) {
 	}
 }
 
+// ---- the transparent-restart broker (the Resolver) ---------------------------------
+//
+// The durable reference a client holds to a service is the capability NAME, not the
+// live channel: a component (re-)resolves a name over its kept-alive bootstrap channel
+// (RESOLVE_OP + tag), and the supervisor - the one process that spawns every service,
+// holds its factory root, and runs the restart ladder - answers with a fresh client
+// channel to the CURRENT live instance, minted through the service's CONNECT_OP
+// factory. A resolve is answered only if the requester's grant set carries that name
+// (the capability discipline enforced on every connect, not just once at spawn), and
+// the supervisor is single-threaded, so a resolve aimed at a service it is currently
+// restarting is simply answered once the replacement serves - the client experiences
+// the crash as latency, not an error.
+
+// The live serve roots the broker mints resolved connections from, updated when a
+// restart replaces an instance (the old root died with it). `process` is the
+// supervisor's OWN ProcessService connection (minted at bring-up, before the root is
+// transferred to the shell), which volume-staged replacements are launched through.
+struct Broker {
+	config: u64,
+	process: u64,
+}
+
+// The grant set of each resolving component: which capability names its resolves may
+// answer. The slice-one table covers the canary (the standing client that proves the
+// broker); a component migrating to the Svc wrapper adds its row here.
+fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
+	match requester {
+		b"watchdog_probe" => &[CAP_CONFIG],
+		_ => &[],
+	}
+}
+
+// The manifest service serving a resolvable capability name.
+fn service_of_cap(name: &[u8]) -> Option<&'static [u8]> {
+	match name {
+		CAP_CONFIG => Some(b"config_service"),
+		_ => None,
+	}
+}
+
+// Answer one RESOLVE request from `requester` arriving on `chan`: check the grant,
+// check the service is alive, and mint a fresh client connection from its live root.
+// The reply is b"OK" + the minted channel, or b"DENIED" / b"DOWN" with no handle.
+unsafe fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, state: &[State; N]) {
+	unsafe {
+		let name: &[u8] = &request[2..];
+		if !cap_grants(requester).iter().any(|&g| g == name) {
+			send_blocking(chan, b"DENIED", 0);
+			return;
+		}
+		let root: u64 = match name {
+			CAP_CONFIG => broker.config,
+			_ => 0,
+		};
+		let alive: bool = match service_of_cap(name).and_then(index_of) {
+			Some(idx) => state[idx] == State::Running,
+			None => false,
+		};
+		if root == 0 || !alive {
+			send_blocking(chan, b"DOWN", 0);
+			return;
+		}
+		match service_connect(root) {
+			Some(minted) => {
+				send_blocking(chan, b"OK", minted);
+			}
+			None => {
+				send_blocking(chan, b"DOWN", 0);
+			}
+		}
+	}
+}
+
+// Whether a RESOLVE request opens `request` (the reserved broker opcode).
+fn is_resolve(request: &[u8]) -> bool {
+	request.len() > 2 && u16::from_le_bytes([request[0], request[1]]) == RESOLVE_OP
+}
+
+// Restart ConfigService per the restart policy - the first REAL service on the
+// transparent-restart ladder (self-contained bootstrap: a volume launch plus a fresh
+// serve root; its state is the seeded tree, so a replacement serves correctly from
+// scratch - the Tier-1 shape). Records the crash, reaps the dead endpoints (control,
+// Process, the broker's dead root), and - unless the restart budget is spent - backs
+// off, relaunches from the volume through the supervisor's own ProcessService
+// connection, re-runs the SERVE bootstrap, and waits for the replacement's online
+// report. On success the control channel, Process handle, broker root and state are
+// all replaced and one restart is charged; on failure the service is left Failed
+// (the caller escalates). Clients holding channels to the dead instance reconnect
+// through the broker (serve_resolve above) - that is the whole point.
+unsafe fn restart_config(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], sup: &mut [Supervised; N], budget: u32, park: u64, buf: &mut [u8]) -> bool {
+	unsafe {
+		sup[idx].failure = Failure::Crashed;
+		state[idx] = State::Failed;
+		// Reap every endpoint of the dead instance: the control channel, our Process
+		// handle, and the broker's serve root (it died with the instance).
+		drain_closed(channels[idx], buf);
+		if channels[idx] != 0 {
+			close(channels[idx]);
+			channels[idx] = 0;
+		}
+		if procs[idx] != 0 {
+			close(procs[idx]);
+			procs[idx] = 0;
+		}
+		if broker.config != 0 {
+			close(broker.config);
+			broker.config = 0;
+		}
+		// Spend from the restart budget; once exhausted, escalate rather than restart.
+		if sup[idx].restarts >= budget {
+			return false;
+		}
+		sleep_ticks(park, RESTART_BACKOFF_TICKS * (sup[idx].restarts as u64 + 1));
+		// Relaunch from the volume and re-run the SERVE bootstrap, like bring-up.
+		let (manager_side, service_side): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		let proc: i64 = launch_from_volume(broker.process, b"config_service", service_side);
+		if proc < 0 {
+			return false;
+		}
+		if !bootstrap_serve(manager_side, &mut broker.config) {
+			close(proc as u64);
+			return false;
+		}
+		match recv_blocking(manager_side, buf) {
+			Received::Message { .. } => {}
+			Received::Closed => {
+				close(proc as u64);
+				return false;
+			}
+		}
+		channels[idx] = manager_side;
+		procs[idx] = proc as u64;
+		state[idx] = State::Running;
+		sup[idx].restarts += 1;
+		sup[idx].failure = Failure::None;
+		true
+	}
+}
+
+// Drive one canary CHECK to its verdict: send the command, then serve the RESOLVE
+// requests the canary's client machinery sends back on the same channel until its
+// non-resolve reply (the verdict) arrives. Both sides are single-threaded, so the
+// interleaving is deterministic. Returns the verdict length in `buf` (0 = the canary
+// died mid-check).
+unsafe fn drive_check(canary_ctrl: u64, broker: &Broker, state: &[State; N], buf: &mut [u8]) -> usize {
+	unsafe {
+		if !send_blocking(canary_ctrl, b"CHECK", 0) {
+			return 0;
+		}
+		loop {
+			match recv_blocking(canary_ctrl, buf) {
+				Received::Message { len, .. } if is_resolve(&buf[..len]) => {
+					// Copy the request out of `buf`: serve_resolve round-trips reuse it.
+					let mut req: [u8; 64] = [0u8; 64];
+					let rlen: usize = len.min(req.len());
+					req[..rlen].copy_from_slice(&buf[..rlen]);
+					serve_resolve(canary_ctrl, b"watchdog_probe", &req[..rlen], broker, state);
+				}
+				Received::Message { len, .. } => return len,
+				Received::Closed => return 0,
+			}
+		}
+	}
+}
+
 // Sleep for `ticks` by waiting on the never-written `park` channel until the deadline
 // passes. A bounded one-shot wait that sleeps the thread at ~0% CPU; the test scheduler
 // advances the finite deadline, so the sleep is deterministic under test.
@@ -1578,12 +1791,15 @@ unsafe fn sleep_ticks(park: u64, ticks: u64) {
 // live control channel - the Running services' (kind 0), the canary's (kind 1), the
 // shell's admin channel (kind 2), and SystemGraphService's stats channel (kind 3) - and
 // blocks on all of them at once with no deadline, so the supervisor sleeps at ~0% CPU
-// until one needs attention. A service or the canary peer-closing means it crashed (the
-// canary is restarted per policy; a real service is recorded Failed and dropped from the
-// wait set so its dead channel does not busy-loop); an admin message drives a reverse-
-// dependency stop; a stats request is answered over the `supervisor` interface. Returns
-// when nothing is left to watch.
-unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &[u64; N], package: &Package, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, up: u64, park: u64, buf: &mut [u8]) {
+// until one needs attention. A control channel MESSAGE is a broker RESOLVE (a component
+// re-resolving a granted service name - answered with a fresh connection to the live
+// instance); a service or the canary peer-closing means it crashed. A crashed service
+// under the transparent restart policy (ConfigService) is restarted per the ladder and
+// its clients reconnect through the broker; any other service is recorded Failed and
+// dropped from the wait set. The canary is restarted per policy; an admin message
+// drives a reverse-dependency stop; a stats request is answered over the `supervisor`
+// interface. Returns when nothing is left to watch.
+unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, up: u64, park: u64, buf: &mut [u8]) {
 	unsafe {
 		let mut admin: u64 = admin_server;
 		let mut admin2: u64 = admin_server2;
@@ -1639,27 +1855,61 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 			let r: usize = ready as usize;
 			match kinds[r] {
 				0 => {
-					// A real service's control channel fired; a peer-close means it crashed.
+					// A real service's control channel fired: a message is a broker RESOLVE
+					// (answered with a fresh connection); a peer-close means it crashed - a
+					// service under the transparent restart policy is restarted per the
+					// ladder (its clients reconnect through the broker), any other is
+					// recorded Failed and dropped from the wait set.
 					let idx: usize = idxs[r];
-					if let Polled::Closed = try_recv(channels[idx], buf) {
-						state[idx] = State::Failed;
-						sup[idx].failure = Failure::Crashed;
-						channels[idx] = 0;
-						emit_event(log_client, MANIFEST[idx].name, b"crashed");
-						console_report(MANIFEST[idx].name, b"crashed");
+					match try_recv(channels[idx], buf) {
+						Polled::Message { len, .. } if is_resolve(&buf[..len]) => {
+							// Copy the request out of `buf`: serve_resolve reuses it.
+							let mut req: [u8; 64] = [0u8; 64];
+							let rlen: usize = len.min(req.len());
+							req[..rlen].copy_from_slice(&buf[..rlen]);
+							serve_resolve(channels[idx], MANIFEST[idx].name, &req[..rlen], broker, state);
+						}
+						Polled::Closed => {
+							emit_event(log_client, MANIFEST[idx].name, b"crashed");
+							console_report(MANIFEST[idx].name, b"crashed");
+							if MANIFEST[idx].name == b"config_service" {
+								if restart_config(broker, idx, state, channels, procs, sup, policy.restart_budget, park, buf) {
+									emit_event(log_client, MANIFEST[idx].name, b"restarted");
+									console_report(MANIFEST[idx].name, b"restarted");
+								} else {
+									emit_event(log_client, MANIFEST[idx].name, b"escalated");
+									console_report(MANIFEST[idx].name, b"escalated");
+								}
+							} else {
+								state[idx] = State::Failed;
+								sup[idx].failure = Failure::Crashed;
+								channels[idx] = 0;
+							}
+						}
+						_ => {}
 					}
 				}
 				1 => {
-					// The canary's control channel fired; a peer-close means it crashed, so
+					// The canary's control channel fired: a message is a broker RESOLVE (the
+					// canary is a standing client too); a peer-close means it crashed, so
 					// restart it per policy (escalating once the budget is spent).
-					if let Polled::Closed = try_recv(*canary_ctrl, buf) {
-						if restart_canary(package, canary_proc, canary_ctrl, canary_sup, Failure::Crashed, policy.restart_budget, park, buf) {
-							emit_event(log_client, b"watchdog_probe", b"restarted");
-							console_report(b"watchdog_probe", b"restarted");
-						} else {
-							emit_event(log_client, b"watchdog_probe", b"escalated");
-							console_report(b"watchdog_probe", b"escalated");
+					match try_recv(*canary_ctrl, buf) {
+						Polled::Message { len, .. } if is_resolve(&buf[..len]) => {
+							let mut req: [u8; 64] = [0u8; 64];
+							let rlen: usize = len.min(req.len());
+							req[..rlen].copy_from_slice(&buf[..rlen]);
+							serve_resolve(*canary_ctrl, b"watchdog_probe", &req[..rlen], broker, state);
 						}
+						Polled::Closed => {
+							if restart_canary(package, canary_proc, canary_ctrl, canary_sup, Failure::Crashed, policy.restart_budget, park, buf) {
+								emit_event(log_client, b"watchdog_probe", b"restarted");
+								console_report(b"watchdog_probe", b"restarted");
+							} else {
+								emit_event(log_client, b"watchdog_probe", b"escalated");
+								console_report(b"watchdog_probe", b"escalated");
+							}
+						}
+						_ => {}
 					}
 				}
 				2 => {

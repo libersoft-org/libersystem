@@ -8,7 +8,7 @@
 //! init is lazy, so a program that never allocates never maps a heap and the
 //! existing heap-free services are unaffected.
 
-use crate::{sys_is_err, syscall, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE};
+use crate::{SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, sys_is_err, syscall};
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::mem;
