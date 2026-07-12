@@ -291,6 +291,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// the root is transferred to the shell at its bootstrap (a transferred handle is gone
 	// from our table, so a late mint would find nothing to mint from).
 	let mut broker_process: u64 = 0;
+	// The supervisor's OWN system-volume connection - a restarted ConfigService's
+	// persistence backing is re-minted from it. Minted like the process connection
+	// above (the storage root is transferred to the shell at its bootstrap).
+	let mut broker_storage: u64 = 0;
 	// A drill-only PermissionManager connection (test boots drive the `run` op through it
 	// to prove a governed tool's grant survives a service restart), minted like the
 	// process connection above, before the root transfers to the shell.
@@ -307,6 +311,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				progress = true;
 				if MANIFEST[i].name == b"process_service" && started == State::Running {
 					broker_process = unsafe { service_connect(process_client) }.unwrap_or(0);
+				}
+				if MANIFEST[i].name == b"storage_service" && started == State::Running {
+					broker_storage = unsafe { service_connect(storage_client) }.unwrap_or(0);
 				}
 				if MANIFEST[i].name == b"permission_manager" && started == State::Running && selftest {
 					drill_perm = unsafe { service_connect(perm_client) }.unwrap_or(0);
@@ -425,7 +432,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     system volume, which stopping DeviceManager makes unavailable. The broker
 	//     stands for the life of the system (the supervise loop serves resolves and
 	//     restarts config on a runtime crash the same way).
-	let mut broker: Broker = Broker { config: config_client, device: device_client, process: broker_process };
+	let mut broker: Broker = Broker { config: config_client, device: device_client, process: broker_process, storage: broker_storage };
 	if selftest && canary_ctrl != 0 {
 		if let Some(cfg) = index_of(b"config_service") {
 			if state[cfg] == State::Running && procs[cfg] != 0 {
@@ -697,7 +704,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		if name == b"process_service" && !bootstrap_process_service(manager_side, pkg_handle, pkg_len, *storage_client, process_client, buf) {
 			return State::Failed;
 		}
-		if name == b"config_service" && !bootstrap_serve(manager_side, config_client) {
+		if name == b"config_service" && !bootstrap_config_service(manager_side, *storage_client, config_client) {
 			return State::Failed;
 		}
 		if name == b"network_service" && !bootstrap_network_service(manager_side, *net_frames, *config_client, net_client) {
@@ -1289,6 +1296,21 @@ unsafe fn bootstrap_serve(manager_side: u64, client: &mut u64) -> bool {
 	}
 }
 
+// Hand ConfigService its persistence backing - a fresh system-volume connection
+// ("STORAGE", minted from the storage root; ConfigService depends on
+// process_service and thus storage_service, so the volume is mounted by now) -
+// then the channel its clients reach it on. The tree then loads from and
+// write-through-persists to `vol://system/config.tree`, so a `config set`
+// survives a restart and a reboot.
+unsafe fn bootstrap_config_service(manager_side: u64, storage_client: u64, config_client: &mut u64) -> bool {
+	unsafe {
+		if storage_client != 0 && !send_factory(manager_side, b"STORAGE", storage_client) {
+			return false;
+		}
+		bootstrap_serve(manager_side, config_client)
+	}
+}
+
 // Hand InputService the channel its clients reach it on ("SERVE", the client end kept
 // in `*input_client` for the shell) and the raw pointer-event channels routed up from
 // the virtio_input pointer driver and the xhci driver via DeviceManager ("INPUT" and
@@ -1674,11 +1696,14 @@ unsafe fn drain_closed(channel: u64, buf: &mut [u8]) {
 // The live serve roots the broker mints resolved connections from, updated when a
 // restart replaces an instance (the old root died with it). `process` is the
 // supervisor's OWN ProcessService connection (minted at bring-up, before the root is
-// transferred to the shell), which volume-staged replacements are launched through.
+// transferred to the shell), which volume-staged replacements are launched through;
+// `storage` is the system-volume root a restarted ConfigService's persistence
+// backing is re-minted from.
 struct Broker {
 	config: u64,
 	device: u64,
 	process: u64,
+	storage: u64,
 }
 
 // The grant set of each resolving component: which capability names its resolves may
@@ -1793,6 +1818,13 @@ unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N
 		};
 		let proc: i64 = launch_from_volume(broker.process, MANIFEST[idx].name, service_side);
 		if proc < 0 {
+			return false;
+		}
+		// A restarted ConfigService gets a fresh persistence backing (the old volume
+		// connection died with the crashed instance), so the replacement reloads the
+		// persisted tree - a `config set` survives the restart.
+		if MANIFEST[idx].name == b"config_service" && broker.storage != 0 && !send_factory(manager_side, b"STORAGE", broker.storage) {
+			close(proc as u64);
 			return false;
 		}
 		if !bootstrap_serve(manager_side, root) {

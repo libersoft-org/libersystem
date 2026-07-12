@@ -1200,6 +1200,37 @@ pub unsafe fn unmap_object(handle: u64) {
 	}
 }
 
+// Stage bytes in a shared buffer for a zero-copy typed call (a volume write, a
+// framed payload): create a memory object, copy `bytes` in, and return a
+// read+map+transfer duplicate as the proto Buffer that travels with the request;
+// our own handle is closed. The shared "hand bytes to a service" path (LogService's
+// journal flush, ConfigService's persisted tree). None when the object cannot be
+// created or mapped.
+pub unsafe fn make_buffer(bytes: &[u8]) -> Option<proto::codec::Buffer> {
+	unsafe {
+		let obj: i64 = memory_object_create(bytes.len().max(1) as u64);
+		if obj < 0 {
+			return None;
+		}
+		let obj: u64 = obj as u64;
+		let mapped: u64 = match map_object(obj) {
+			Some(base) => base,
+			None => {
+				close(obj);
+				return None;
+			}
+		};
+		core::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped as *mut u8, bytes.len());
+		unmap_object(obj);
+		let granted: i64 = duplicate(obj, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+		close(obj);
+		if granted < 0 {
+			return None;
+		}
+		Some(proto::codec::Buffer { handle: granted as u64, len: bytes.len() as u64 })
+	}
+}
+
 // Read a shared buffer capability into `dst`: map the object behind `file`, copy up
 // to `dst.len()` of its `size` bytes into `dst`, then unmap and close it. Returns
 // the number of bytes copied, or None if the mapping fails (the handle is still

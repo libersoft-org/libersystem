@@ -3130,6 +3130,137 @@ fn config_service_serves_the_tree() {
 	assert_eq!(&b[7..7 + vlen], b"hi", "the value just set reads back");
 }
 
+#[test_case]
+fn config_set_survives_a_service_reboot() {
+	use alloc::collections::BTreeMap;
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	// M119 persistence: a `config set` survives the service's whole lifetime ending.
+	// ConfigService write-throughs its tree to `vol://system/config.tree`, so a NEW
+	// instance over the SAME volume loads it back - the reboot property (and what
+	// makes the transparent ConfigService restart stateless). Stand up a
+	// StorageService over a fresh writable disk (the sparse block stand-in formats
+	// an empty LiberFS), run a FIRST ConfigService wired to a minted volume
+	// connection, SET a key, end the instance, then run a SECOND instance over
+	// another minted connection: the set value AND the seeded defaults both serve.
+	const CAPACITY: u64 = 64 * 1024 * 1024;
+	let (scenario_volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service").expect("storage_service in the init package");
+	let config_elf = program_elf(&package, scenario_volume, b"config_service").expect("config_service in the package or volume");
+
+	// StorageService over the sparse in-memory disk: no superblock and no archive,
+	// so it formats a fresh writable volume.
+	let (storage_boot_kernel, storage_boot_user) = Channel::create();
+	let (blk_host, blk_child) = Channel::create();
+	let (storage_server, storage_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
+	send_cap(&storage_boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("BLOCK bootstrap");
+	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("SERVE bootstrap");
+	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
+	let mut online = false;
+	for _ in 0..100_000 {
+		sched::run_until_idle();
+		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
+		if let Ok(report) = storage_boot_kernel.recv() {
+			assert_eq!(&report.bytes[..], b"StorageService: online");
+			online = true;
+			break;
+		}
+	}
+	assert!(online, "StorageService should format the fresh disk and report in");
+
+	// Mint an independent volume connection off the storage root (the CONNECT_OP
+	// factory), pumping block traffic while the service answers.
+	fn mint_volume(storage_client: &alloc::sync::Arc<object::channel::Channel>, blk_host: &alloc::sync::Arc<object::channel::Channel>, disk: &mut alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>, capacity: u64) -> alloc::sync::Arc<object::channel::Channel> {
+		use object::channel::{Channel, Message};
+		storage_client.send(Message::new(0xffffu16.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("connect request");
+		for _ in 0..100_000 {
+			sched::run_until_idle();
+			pump_block_stand_in(blk_host, disk, capacity);
+			if let Ok(reply) = storage_client.recv() {
+				let cap = reply.caps.first().expect("the minted connection is transferred");
+				return cap.object().into_any_arc().downcast::<Channel>().expect("the connection is a channel");
+			}
+		}
+		panic!("no minted volume connection arrived");
+	}
+
+	// The first ConfigService instance: its persistence backing and serve channel.
+	let vol1 = mint_volume(&storage_client, &blk_host, &mut disk, CAPACITY);
+	let (cfg1_boot, cfg1_boot_user) = Channel::create();
+	let (cfg1_server, cfg1_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), config_elf, cfg1_boot_user, Rights::ALL, 0).expect("spawn ConfigService 1");
+	send_cap(&cfg1_boot, b"STORAGE", vol1, Rights::ALL).expect("STORAGE bootstrap 1");
+	send_cap(&cfg1_boot, b"SERVE", cfg1_server, Rights::ALL).expect("SERVE bootstrap 1");
+
+	// SET persist.key = survives ([op = 3 u16][corr u32][key + value strings]); the
+	// write-through to vol://system/config.tree completes before the reply.
+	let (k, v): (&[u8], &[u8]) = (b"persist.key", b"survives");
+	let mut set = alloc::vec::Vec::new();
+	set.extend_from_slice(&3u16.to_le_bytes());
+	set.extend_from_slice(&1u32.to_le_bytes());
+	set.extend_from_slice(&(k.len() as u16).to_le_bytes());
+	set.extend_from_slice(k);
+	set.extend_from_slice(&(v.len() as u16).to_le_bytes());
+	set.extend_from_slice(v);
+	cfg1_client.send(Message::new(set, alloc::vec::Vec::new(), 0)).expect("set request");
+	let mut set_ok = false;
+	for _ in 0..100_000 {
+		sched::run_until_idle();
+		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
+		if let Ok(reply) = cfg1_client.recv() {
+			assert_eq!(le_u32(&reply.bytes, 0), 1, "set echoes the correlation id");
+			assert_eq!(reply.bytes[4], 1, "set succeeded");
+			set_ok = true;
+			break;
+		}
+	}
+	assert!(set_ok, "the set should be answered");
+	// End the first instance: the quit sentinel breaks its serve loop and it exits.
+	cfg1_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	sched::run_until_idle();
+
+	// The second instance over the SAME volume: the persisted tree loads back.
+	let vol2 = mint_volume(&storage_client, &blk_host, &mut disk, CAPACITY);
+	let (cfg2_boot, cfg2_boot_user) = Channel::create();
+	let (cfg2_server, cfg2_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), config_elf, cfg2_boot_user, Rights::ALL, 0).expect("spawn ConfigService 2");
+	send_cap(&cfg2_boot, b"STORAGE", vol2, Rights::ALL).expect("STORAGE bootstrap 2");
+	send_cap(&cfg2_boot, b"SERVE", cfg2_server, Rights::ALL).expect("SERVE bootstrap 2");
+	let get = |corr: u32, key: &[u8]| -> alloc::vec::Vec<u8> {
+		let mut m = alloc::vec::Vec::new();
+		m.extend_from_slice(&1u16.to_le_bytes());
+		m.extend_from_slice(&corr.to_le_bytes());
+		m.extend_from_slice(&(key.len() as u16).to_le_bytes());
+		m.extend_from_slice(key);
+		m
+	};
+	cfg2_client.send(Message::new(get(1, b"persist.key"), alloc::vec::Vec::new(), 0)).expect("get persisted");
+	cfg2_client.send(Message::new(get(2, b"system.name"), alloc::vec::Vec::new(), 0)).expect("get seeded");
+	let mut replies: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+	for _ in 0..100_000 {
+		sched::run_until_idle();
+		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
+		while let Ok(reply) = cfg2_client.recv() {
+			replies.push(reply.bytes);
+		}
+		if replies.len() >= 2 {
+			break;
+		}
+	}
+	assert_eq!(replies.len(), 2, "both gets should be answered");
+	assert_eq!(le_u32(&replies[0], 0), 1);
+	assert_eq!(replies[0][4], 1, "the persisted key exists in the fresh instance");
+	let vlen = le_u16(&replies[0], 5) as usize;
+	assert_eq!(&replies[0][7..7 + vlen], b"survives", "the set value survived the service reboot");
+	assert_eq!(replies[1][4], 1, "a seeded default still serves");
+	let nlen = le_u16(&replies[1], 5) as usize;
+	assert_eq!(&replies[1][7..7 + nlen], b"LiberSystem", "the persisted tree overlays, not replaces, the defaults");
+	cfg2_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel 2");
+	sched::run_until_idle();
+}
+
 // This end-to-end test asserts the EXACT boot-chain report order, which requires the
 // interrupt-driven services (NetworkService over virtio-net, and its transitive
 // dependents TimeService/PermissionManager/ConsoleService/SystemGraphService/Shell) to

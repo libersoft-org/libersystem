@@ -191,32 +191,8 @@ impl Disk {
 	}
 }
 
-// Stage bytes in a shared buffer for a zero-copy volume write: a read+map+transfer
-// duplicate travels with the request, our own handle is closed.
-unsafe fn make_buffer(bytes: &[u8]) -> Option<proto::codec::Buffer> {
-	unsafe {
-		let obj: i64 = memory_object_create(bytes.len().max(1) as u64);
-		if obj < 0 {
-			return None;
-		}
-		let obj: u64 = obj as u64;
-		let mapped: u64 = match map_object(obj) {
-			Some(base) => base,
-			None => {
-				close(obj);
-				return None;
-			}
-		};
-		core::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped as *mut u8, bytes.len());
-		unmap_object(obj);
-		let granted: i64 = duplicate(obj, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
-		close(obj);
-		if granted < 0 {
-			return None;
-		}
-		Some(proto::codec::Buffer { handle: granted as u64, len: bytes.len() as u64 })
-	}
-}
+// (Staging bytes in a shared buffer for a zero-copy volume write is rt's shared
+// `make_buffer`, in scope through the rt glob import.)
 
 // The in-memory journal: a bounded list of canonical log entries, plus the
 // durable side (this boot's encoded records, batched for the volume).
