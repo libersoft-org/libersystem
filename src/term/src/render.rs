@@ -104,7 +104,7 @@ fn glyph_bitmap(cp: u32) -> &'static [u8] {
 }
 
 // A linear framebuffer's geometry and pixel format, handed to a `Raster`. Decouples the
-// renderer from any particular framebuffer description (the kernel's Limine response, the
+// renderer from any particular framebuffer description (the kernel's boot framebuffer, the
 // userspace ABI `Framebuffer`): each caller fills this from its own source.
 pub struct Geometry {
 	pub width: usize,

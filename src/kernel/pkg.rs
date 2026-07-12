@@ -1,5 +1,6 @@
 // Init package: a tiny read-only archive of the userspace programs the kernel
-// loads at boot. The bootloader hands it to the kernel as a Limine module; the
+// loads at boot. The bootloader hands it to the kernel as a boot module (a loaded
+// blob referenced from the BootInfo handoff); the
 // kernel parses it in place (the module memory is 'static) and looks up programs
 // by name. The on-disk format is produced by the kernel's build.rs.
 //

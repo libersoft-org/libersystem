@@ -1,9 +1,9 @@
 // Framebuffer boot console.
 //
-// Mirrors the kernel log to a linear RGB framebuffer (provided by Limine as a
+// Mirrors the kernel log to a linear RGB framebuffer (provided by the loader as a
 // boot-time video mode) using the shared `term` terminal stack: a `term::Term` (the
-// grid model plus the framebuffer renderer) drawing onto a `KernelSurface` (the
-// Limine framebuffer; its writes are visible immediately, so `present` is a no-op).
+// grid model plus the framebuffer renderer) drawing onto a `KernelSurface` (the boot
+// framebuffer; its writes are visible immediately, so `present` is a no-op).
 // It is a mirror, not a replacement: serial output is unchanged and always happens;
 // the console is best-effort - skipped entirely if no framebuffer was provided, and
 // skipped for a single print if its lock is already held (e.g. a panic that
@@ -23,7 +23,7 @@ use term::{Geometry, Raster, Surface, Term, TextSink};
 
 use crate::sync::SpinLock;
 
-// A framebuffer description handed in from the Limine response.
+// A framebuffer description handed in from the loader's BootInfo.
 pub struct FbInfo {
 	pub addr: *mut u8,
 	pub width: usize,
@@ -39,7 +39,7 @@ pub struct FbInfo {
 	pub blue_size: u8,
 }
 
-// The kernel's display backend: the Limine framebuffer the renderer draws into. Its
+// The kernel's display backend: the boot framebuffer the renderer draws into. Its
 // writes land directly in scanout memory and are visible immediately, so `present`
 // is a no-op (there is no host compositor to flush to, unlike the virtio-gpu
 // backing).
@@ -55,7 +55,7 @@ impl Surface for KernelSurface {
 }
 
 // The boot console: the shared terminal (`term::Term` - the grid model plus the
-// framebuffer renderer) drawing onto the Limine framebuffer.
+// framebuffer renderer) drawing onto the boot framebuffer.
 struct Console {
 	term: Term,
 }

@@ -172,7 +172,7 @@ sudo dd if=boot/.build/libersystem.img of=/dev/sdX bs=4M conv=fsync status=progr
 
 ### Strip level
 
-The kernel placed into an image is always stripped, because the debug info is never used at boot (Limine loads only the loadable segments, and the debugger reads symbols from the on-disk build). The amount stripped is selectable - it never affects booting, only the image size:
+The kernel placed into an image is always stripped, because the debug info is never used at boot (the loader loads only the loadable segments, and the debugger reads symbols from the on-disk build). The amount stripped is selectable - it never affects booting, only the image size:
 
 ```sh
 just iso          # STRIP=debug (default): drop DWARF, keep the symbol table

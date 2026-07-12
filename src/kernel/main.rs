@@ -142,7 +142,7 @@ fn init_memory() {
 	mem::init(regions, bi.hhdm_offset);
 }
 
-// Bring up the framebuffer console from the Limine framebuffer response, so the
+// Bring up the framebuffer console from the loader's boot framebuffer, so the
 // kernel log is mirrored to the screen alongside serial. A no-op (serial only) if
 // the bootloader provided no framebuffer. Runs before the test/boot split so the
 // console is up for both paths; it allocates its grid model (the shared `term`

@@ -4,7 +4,7 @@
 // The timer is calibrated against the legacy PIT (channel 2, polled) so one tick
 // is a real wall-clock interval rather than an arbitrary count.
 //
-// The LAPIC MMIO page is mapped explicitly as uncacheable (Limine's HHDM does
+// The LAPIC MMIO page is mapped explicitly as uncacheable (the loader's HHDM does
 // not cover it). Each core's LAPIC lives at the same physical address, so the
 // single mapping serves every core.
 
@@ -39,7 +39,7 @@ const TIMER_DIVIDE_16: u32 = 0x3;
 use crate::arch::common::time::TICK_HZ as TIMER_HZ;
 
 // Virtual address where the LAPIC MMIO page is mapped (its own dedicated page,
-// since Limine's HHDM does not cover the LAPIC MMIO region).
+// since the loader's HHDM does not cover the LAPIC MMIO region).
 const LAPIC_VIRT: u64 = 0xffff_f100_0000_0000;
 
 // Virtual (mapped) address of the LAPIC MMIO page, published once during init.

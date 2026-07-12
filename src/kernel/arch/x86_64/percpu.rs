@@ -3,7 +3,7 @@
 // Each core keeps a pointer to its own PerCpu block in the IA32_GS_BASE MSR, so
 // `this_cpu()` resolves to the running core's data with no locking. The blocks
 // are allocated once at SMP bring-up, sized by the machine's real core count
-// from the Limine MP response (the heap is up long before any core - the BSP
+// from the loader's SMP info (the heap is up long before any core - the BSP
 // included - initializes its slot), and indexed by our contiguous CPU id (the
 // BSP is 0).
 

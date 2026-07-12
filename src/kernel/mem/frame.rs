@@ -1,7 +1,7 @@
 // Physical frame allocator.
 //
 // Free physical memory is kept as a sorted table of contiguous runs (base +
-// length), seeded straight from the usable regions of the Limine memory map. A
+// length), seeded straight from the usable regions of the loader's memory map. A
 // single-frame alloc takes the head page of the first run (O(1)); a contiguous
 // alloc first-fits a whole run - DMA buffers need physically contiguous spans
 // (virtqueue rings, block data stages, jumbo frames) - and a free re-coalesces

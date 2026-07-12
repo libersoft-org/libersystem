@@ -290,10 +290,10 @@ fi
 QEMU_ARGS+=(-device virtio-tablet-pci,disable-legacy=on)
 
 # virtio-vga (M44): interactive runs only. A virtio-gpu device that also presents a
-# VGA-compatible boot framebuffer, so Limine still renders the boot log while
+# VGA-compatible boot framebuffer, so the loader still renders the boot log while
 # driver.virtio-gpu drives the display (a 2D scanout, and a resize event when the host
 # window changes). It replaces the default std VGA (-vga none) here; the test path
-# keeps std VGA (no virtio-gpu device, so ConsoleService falls back to the Limine
+# keeps std VGA (no virtio-gpu device, so ConsoleService falls back to the boot
 # framebuffer and the deterministic 4-device set is unchanged).
 QEMU_ARGS+=(-vga none -device virtio-vga)
 

@@ -30,7 +30,7 @@ const NX: u64 = 1 << 63;
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 // The HHDM base: virt = phys + HHDM_OFFSET. Matches the offset the kernel expects
-// (Limine's default higher-half direct map base), so no kernel constant changes.
+// (the conventional higher-half direct map base), so no kernel constant changes.
 pub const HHDM_OFFSET: u64 = 0xffff_8000_0000_0000;
 
 // Builds and owns the page hierarchy under construction.

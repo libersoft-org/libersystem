@@ -1,6 +1,6 @@
 // x86_64 4-level paging: map and unmap single 4 kB pages.
 //
-// Operates on the page-table hierarchy currently active in CR3 (the one Limine
+// Operates on the page-table hierarchy currently active in CR3 (the one the loader
 // set up, which already maps the kernel image and the HHDM). Page tables are
 // reached physically through the HHDM, and intermediate tables are allocated
 // from the frame allocator on demand.
@@ -382,9 +382,9 @@ unsafe fn next_table_walk(table: *mut u64, index: usize) -> Option<u64> {
 
 // Translate a virtual address to its physical address in the active address space,
 // or None if unmapped. Walks the 4-level table and handles a huge-page leaf at the
-// PDPT (1 GB) or PD (2 MB) level - Limine often maps the framebuffer with 2 MB
-// pages, so a 4 kB-only walk would misread it. The returned phys carries the
-// in-page offset.
+// PDPT (1 GB) or PD (2 MB) level - the loader (or firmware) often maps the
+// framebuffer with 2 MB pages, so a 4 kB-only walk would misread it. The returned
+// phys carries the in-page offset.
 pub fn translate(virt: u64) -> Option<u64> {
 	const PS: u64 = 1 << 7;
 	unsafe {

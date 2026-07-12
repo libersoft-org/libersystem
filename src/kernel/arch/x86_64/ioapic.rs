@@ -6,7 +6,7 @@
 // never reach a CPU - every device interrupt source is either an MSI-X vector or a
 // pin the kernel disables (arch::pci::set_intx_disabled).
 //
-// The MMIO page (Limine's HHDM does not cover it) is mapped uncacheable, like the
+// The MMIO page (the loader's HHDM does not cover it) is mapped uncacheable, like the
 // LAPIC's. A single I/O APIC at the standard PC base covers our QEMU q35 target; a
 // fuller implementation would enumerate them (and their GSI bases) from the ACPI
 // MADT.

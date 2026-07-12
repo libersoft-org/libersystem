@@ -162,7 +162,8 @@ fn user_target() -> &'static str {
 // Where the assembled packages are written. On aarch64 and riscv64 there is no
 // bootloader module hand-off (the kernel is booted directly via `-kernel`), so the
 // packages go to OUT_DIR and are embedded into the kernel image; on x86_64 they go to
-// boot/.build for mkimage.sh to place as Limine modules.
+// boot/.build for mkimage.sh to place as boot modules (the loader loads them alongside
+// the kernel and hands their addresses to it in the BootInfo).
 fn package_out_dir(manifest: &Path) -> PathBuf {
 	match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
 		Ok("aarch64") | Ok("riscv64") => PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set")),
@@ -203,7 +204,7 @@ fn read_stripped(path: &Path) -> Option<Vec<u8>> {
 	stripped
 }
 
-// Assemble the init package that the kernel loads as a Limine module. The package
+// Assemble the init package that the kernel loads as a boot module. The package
 // is a tiny archive (a header plus fixed-size entries plus the concatenated file
 // blobs) holding the userspace programs - SystemManager plus the StorageService
 // and its demo client. It is written to boot/.build/init.pkg, where mkimage.sh
@@ -254,7 +255,7 @@ fn assemble_init_package(conf: &[(String, String)]) {
 
 // Assemble the ramdisk volume package: every regular file under src/volume is
 // packed into boot/.build/volume.pkg using the same archive format as the init
-// package, keyed by its file name. The kernel loads it as a second Limine module
+// package, keyed by its file name. The kernel loads it as a second boot module
 // and serves its files through the userspace StorageService over vol://.
 fn assemble_volume_package(conf: &[(String, String)]) {
 	let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
