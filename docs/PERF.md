@@ -1,16 +1,16 @@
 # Performance notes
 
-Measured numbers for the milestones whose "done when" includes a before/after
+Measured numbers for the changes whose goal includes a before/after
 comparison. Methodology per entry; machine noise applies, so treat the times as
 orders, not precision instruments.
 
-## M105 - Kernel wake path (2026-07-06)
+## Kernel wake path (2026-07-06)
 
 Measured live in QEMU/KVM as the end-to-end round-trip of a shell command typed
 over serial (the lab harness sends the line and waits for the prompt to return;
 wall clock on the host, five runs). Before = the tree at HEAD (serial input
 polled from the 100 Hz idle hook, one global waiter list, no cross-core kick);
-after = this milestone (UART receive interrupt, per-object wait buckets, the
+after = this change (UART receive interrupt, per-object wait buckets, the
 remote-spawn wake IPI). The in-guest `time uname` (~5 ms) is unchanged - the
 spawn pipeline was never the bottleneck; the win is the input-delivery path.
 
@@ -23,14 +23,14 @@ The remaining ~120 ms floor is dominated by the console output path (echo and
 present quantization), not input delivery - the serial byte now reaches the
 shell's waiter in interrupt context.
 
-## M72 - Contiguous DMA and full-size I/O (2026-07-05)
+## Contiguous DMA and full-size I/O (2026-07-05)
 
 Measured live in QEMU/KVM with the shell's `time` over serial: a whole-file read
 of a 5.2 MB file from the LiberFS system volume (`time cat /bin/console_service`,
 virtio-blk), and a 4 MB HTTP fetch from a host-side server printed to the console
 (`time tcp 10.0.2.2 8888`, virtio-net + the TCP stack). Before = the tree at
 HEAD (per-page DMA, 16-descriptor rings, one-sector block requests, MSS-less
-TCP); after = this milestone.
+TCP); after = this change.
 
 | scenario | before | after |
 | --- | --- | --- |
@@ -44,18 +44,18 @@ sector. The TCP "before" is honest: bulk receive at HEAD hit a latent stack bug
 (the padding of a minimum-size Ethernet frame counted as TCP payload, advancing
 `rcv_nxt` past data the peer had not sent, so the transfer wedged on the first
 bare ACK) - it went unnoticed while our optionless SYN kept the peer's segments
-small and ACKs piggybacked. This milestone's MSS option surfaced it; the fix
+small and ACKs piggybacked. The MSS option added here surfaced it; the fix
 (trim the frame to the IP total length) plus window scaling gives the working
 number above.
 
-## M75 - LiberFS format and modernity (2026-07-02)
+## LiberFS format and modernity (2026-07-02)
 
-Same benchmark as M74. The CRC32C rewrite (slice-by-8, previously byte-at-a-time)
+Same benchmark as the allocator/free-map entry below. The CRC32C rewrite (slice-by-8, previously byte-at-a-time)
 and the LZ4 codec (previously LZSS) move the CPU side; compression now defaults
 OFF, so the incompressible-write benchmark no longer pays a futile compression
 pass at all.
 
-| scenario | after M74 | after M75 |
+| scenario | after allocator rework | after format rework |
 | --- | --- | --- |
 | 64 MB write | 1.72 s | 137 ms (and 19 reads - the source-verify reads belonged to the compression pass) |
 | 64 MB sequential read | 204 ms | 67 ms |
@@ -65,14 +65,14 @@ pass at all.
 The host test-suite run also fell from ~82 s to ~0.4 s (the CRC dominated the
 unoptimized debug profile; the crate now tests with opt-level 2).
 
-## M74 - LiberFS allocator and free-map scaling (2026-07-02)
+## LiberFS allocator and free-map scaling (2026-07-02)
 
 Benchmark: `cd src/fs/liberfs && cargo test --release bench_scaling -- --ignored --nocapture`
 (a 1 GB sparse RAM-backed volume; a 64 MB incompressible file; 2000 small files
 each committed individually). The device is RAM, so wall times understate the win
-on a real disk - the I/O counts (added with M74) are the durable metric.
+on a real disk - the I/O counts (added with this rework) are the durable metric.
 
-| scenario | M73 baseline | after M74 | I/O after M74 |
+| scenario | baseline | after this rework | I/O after |
 | --- | --- | --- | --- |
 | 64 MB write | 2.07 s | 1.72 s | 16 418 reads, 16 421 writes (~1+1 per data block) |
 | 64 MB sequential read | 354 ms | 204 ms | 16 400 reads (~1.001 per data block) |

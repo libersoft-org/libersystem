@@ -101,7 +101,7 @@ enough to read end to end.
   aliasing complicates the one-name-one-file model; revisit with a concrete need.
 - Deduplication and encryption.
 - Multi-device, RAID, pooled storage; single device, single volume.
-- Quotas; online defrag/resize beyond the modernization milestones.
+- Quotas; online defrag/resize beyond the current modernization work.
 - Metadata duplication (a DUP profile for true metadata self-heal) - a candidate
   feature flag if single-device self-heal ever becomes a requirement.
 

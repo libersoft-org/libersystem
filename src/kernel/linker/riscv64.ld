@@ -1,4 +1,4 @@
-/* Linker script riscv64 - higher-half kernel (M117).
+/* Linker script riscv64 - higher-half kernel.
  *
  * QEMU `-machine virt` boots OpenSBI (M-mode) which jumps to the kernel ELF entry
  * (`_start`) in S-mode, MMU off, a0 = hartid, a1 = DTB pointer. QEMU `-kernel`

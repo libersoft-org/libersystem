@@ -11,14 +11,14 @@ runner = "../boot/qemu-run.sh"
 # ET_EXEC): all addresses baked at the higher-half link base the loader maps it at.
 rustflags = ["-C", "relocation-model=static"]
 
-# aarch64 direct-boot bring-up (M116): QEMU `-machine virt -kernel` loads the ELF
+# aarch64 direct-boot bring-up: QEMU `-machine virt -kernel` loads the ELF
 # by its physical addresses at 0x4008_0000 with the MMU off, so the kernel is
 # linked static (non-PIE) at that low base until the MMU + higher-half map land.
 [target.aarch64-unknown-none]
 runner = "../boot/qemu-aarch64.sh"
 rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-no-pie"]
 
-# riscv64 direct-boot bring-up (M117): QEMU `-machine virt` boots OpenSBI, which
+# riscv64 direct-boot bring-up: QEMU `-machine virt` boots OpenSBI, which
 # jumps to the kernel ELF entry in S-mode with the MMU off, a0=hartid, a1=DTB. The
 # kernel is linked static (non-PIE); the higher-half kernel needs the `medany` code
 # model (absolute addresses outside the low 2 GiB), and the boot stub sets up Sv39.

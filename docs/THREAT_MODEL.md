@@ -12,7 +12,7 @@ A component can name a thing it cannot reach; authority lives only in a
 identity of the caller. Every boundary below is a consequence of that property,
 and every check below exists to prove the property holds.
 
-- Status: established at milestone M38 (security hardening: app sandbox,
+- Status: established during the security-hardening work (app sandbox,
   permission manifests, PermissionManager).
 - Enforced by: the kernel capability mechanism, the userspace PermissionManager
   policy, and the WASI/native component sandbox.
@@ -146,7 +146,7 @@ process, not by the cooperation of the process it constrains.
    capabilities and nothing else, withholding even capabilities it holds itself
    when the manifest does not list them, and records every decision (grant or
    denial) in an audit trail. The launched component thus starts with only its
-   manifest's capabilities and can reach nothing it was not granted - the M28
+   manifest's capabilities and can reach nothing it was not granted - the
    WASI-world property ("a component gets only the imports we pass it") extended to
    every launched component.
 
@@ -202,7 +202,7 @@ without a real capability ever being put at risk.
 
 ## 5. Non-goals (for now)
 
-The following are out of scope for this milestone and are tracked in the Concept's
+The following are out of scope here and are tracked in the Concept's
 *Security model: current decisions* and *Open questions*. They do not weaken the
 "no ambient authority" property; they extend policy and coverage on top of it.
 

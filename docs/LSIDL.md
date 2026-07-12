@@ -17,7 +17,7 @@ LSIDL borrows its type vocabulary from WIT (records, enums, variants, results,
 lists, tuples, options) and adds three first-class system types WIT lacks:
 `handle<T>`, `buffer`, and `stream<T>`.
 
-- Status: design draft for milestone M25.
+- Status: design draft.
 - File extension: `.lsidl`
 - Generator: `lsidl-gen` (host tool), driven by `just gen`
 - Generated output: the `proto` crate (`no_std`) plus `docs/gen/`

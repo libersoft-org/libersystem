@@ -5,7 +5,7 @@
 // bootstrap channel handle in rdi. Over that channel the kernel hands it the init
 // package as a read-only shared buffer. SystemManager maps the package, spawns
 // ServiceManager from it (the next link of the boot chain), relays ServiceManager's
-// report up to the kernel, reports in itself, and exits. Later milestones grow it
+// report up to the kernel, reports in itself, and exits. Later work grows it
 // into a standing process that supervises ServiceManager and performs recovery.
 
 #![no_std]

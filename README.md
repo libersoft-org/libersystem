@@ -26,7 +26,7 @@ This is an early-stage project under active development. It is not yet a general
 - [**System interfaces**](./docs/gen/system.md) - the generated reference for the **`liber:system` package**: every record, enum and service interface, as defined in the LSIDL sources.
 - [**LiberFS**](./docs/LIBERFS.md) - the **native filesystem**: the copy-on-write, extent-mapped, checksummed and snapshotting on-disk format, and how it compares with FAT, NTFS, ext4, XFS, Btrfs and ZFS.
 - [**Debugging**](./docs/DEBUG.md) - the **debugging toolbox**: the lab harness that drives a live instance, timing and tracing, GDB, packet capture, and the test suite.
-- [**Performance notes**](./docs/PERF.md) - **measured before/after numbers** for the milestones whose goal was a performance improvement.
+- [**Performance notes**](./docs/PERF.md) - **measured before/after numbers** for the changes whose goal was a performance improvement.
 
 ## Installation
 

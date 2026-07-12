@@ -1,4 +1,4 @@
-/* Linker script aarch64 - higher-half kernel (M116).
+/* Linker script aarch64 - higher-half kernel.
  *
  * QEMU `-machine virt -kernel <elf>` loads the ELF by its physical addresses into
  * DRAM (base 0x4000_0000), MMU off, and enters the ELF entry (`_start`) at that

@@ -26,19 +26,19 @@ rt = { path = "../rt" }
 proto = { path = "../../proto" }
 
 # The writable on-disk filesystem (LiberFS) StorageService mounts on the virtio-blk
-# disk for the M43 persistent volume.
+# disk for the persistent volume.
 liberfs = { path = "../../fs/liberfs" }
 
 # The read-only FAT12/16/32 and exFAT backend StorageService mounts on a second
-# virtio-blk disk for the M48 foreign-media volume.
+# virtio-blk disk for the foreign-media volume.
 fat = { path = "../../fs/fat" }
 
 # The read-only ISO9660 backend StorageService mounts on a third virtio-blk disk for
-# the M58 optical / install-media volume.
+# the optical / install-media volume.
 iso9660 = { path = "../../fs/iso9660" }
 
 # The read-only UDF backend StorageService mounts on a fourth virtio-blk disk for the
-# M60 DVD / Blu-ray volume.
+# DVD / Blu-ray volume.
 udf = { path = "../../fs/udf" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
@@ -47,7 +47,7 @@ udf = { path = "../../fs/udf" }
 # The dev build keeps this service debuggable but optimizes the filesystem crates
 # it links: LiberFS verifies a CRC32C per block it reads, and the unoptimized
 # checksum dominates every file open (a ~30 ms fixed cost on loading even a small
-# binary - the M75 lesson, applied to the service build; opt-level 2 makes an
+# binary - the same lesson as the LiberFS crate, applied to the service build; opt-level 2 makes an
 # open I/O-bound again).
 [profile.dev.package.liberfs]
 opt-level = 2
