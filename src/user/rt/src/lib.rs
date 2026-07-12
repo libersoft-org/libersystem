@@ -1036,6 +1036,27 @@ pub unsafe fn resolve(broker: u64, name: &[u8]) -> Option<u64> {
 	}
 }
 
+// Mint a fresh sub-connection from the factory `*held` (a connection to a
+// serve_multi service), re-resolving `name` over the broker when the factory is
+// dead - its service crashed and was restarted, so the broker answers with a
+// connection to the live instance, which replaces `*held`. The pattern every
+// standing holder of a restartable service's factory shares (PermissionManager's
+// grants, ConsoleService's per-VT connections). None when the mint fails and the
+// broker cannot provide a live replacement.
+pub unsafe fn connect_or_resolve(held: &mut u64, broker: u64, name: &[u8]) -> Option<u64> {
+	unsafe {
+		if let Some(minted) = service_connect(*held) {
+			return Some(minted);
+		}
+		let fresh: u64 = resolve(broker, name)?;
+		if *held != 0 {
+			close(*held);
+		}
+		*held = fresh;
+		service_connect(*held)
+	}
+}
+
 // A proto Transport over an rt channel: send the request (with any out-of-band
 // handle), then block for the reply (whose own out-of-band handle is returned
 // alongside the bytes). Every userspace program that drives a generated service
@@ -1135,6 +1156,15 @@ impl proto::codec::Transport for SvcTransport {
 				}
 			}
 		}
+	}
+}
+
+// A long-lived holder drives its generated client through a mutable borrow, so the
+// transport's reconnect state (the current channel) persists across calls:
+// `device::Client::new(&mut self.device)` each snapshot, one SvcTransport for life.
+impl proto::codec::Transport for &mut SvcTransport {
+	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
+		(**self).call(request, request_handle)
 	}
 }
 

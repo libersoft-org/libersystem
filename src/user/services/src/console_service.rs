@@ -268,6 +268,11 @@ struct Console {
 	// (foreground, scrollback, switch, gpu-resize) untouched.
 	ptys: Vec<Vt>,
 	facs: Factories,
+	// The broker (bootstrap) channel the restartable factories (config, device) are
+	// re-resolved over when their service crashed and was restarted: ServiceManager
+	// answers a RESOLVE with a connection to the live instance, so a VT opened after
+	// the restart still gets live per-VT connections.
+	broker: u64,
 	// The console's own ConfigService client (0 when the factory never answered),
 	// consulted at every VT creation for the terminal policy (`term_policy`).
 	config_client: u64,
@@ -429,7 +434,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, fb, fb_handle, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0 }], fg: 0, ptys: Vec::new(), facs, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
+		let mut console: Console = Console { addr, fb, fb_handle, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0 }], fg: 0, ptys: Vec::new(), facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
 		run(&mut console);
 	}
 }
@@ -1144,7 +1149,8 @@ unsafe fn create_vt(console: &mut Console) {
 		if !console.has_fb {
 			return;
 		}
-		if let Some(vt) = spawn_vt(&console.facs, console.config_client, console.addr, &console.fb, console.gpu, console.cur_w, console.cur_h) {
+		let broker: u64 = console.broker;
+		if let Some(vt) = spawn_vt(&mut console.facs, broker, console.config_client, console.addr, &console.fb, console.gpu, console.cur_w, console.cur_h) {
 			console.vts.push(vt);
 			console.fg = console.vts.len() - 1;
 			repaint(console);
@@ -1443,7 +1449,7 @@ fn repaint(console: &mut Console) {
 // handle would pin the shell's handle table (and that channel) alive, so the terminal
 // could never be reaped when the shell logs out or exits. Shared by spawn_vt (a display
 // VT) and open_pty (a program-hosted PTY).
-unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) -> bool {
+unsafe fn spawn_shell(facs: &mut Factories, broker: u64, shell_console: u64, shell_control: u64) -> bool {
 	unsafe {
 		let storage: u64 = match service_connect(facs.storage) {
 			Some(h) => h,
@@ -1453,7 +1459,10 @@ unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) 
 			Some(h) => h,
 			None => return false,
 		};
-		let device: u64 = match service_connect(facs.device) {
+		// The config and device factories re-resolve through the broker when dead: their
+		// services restart transparently, so a VT opened after such a restart still gets
+		// live connections (the other factories' services do not restart yet).
+		let device: u64 = match connect_or_resolve(&mut facs.device, broker, CAP_DEVICE) {
 			Some(h) => h,
 			None => return false,
 		};
@@ -1461,7 +1470,7 @@ unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) 
 			Some(h) => h,
 			None => return false,
 		};
-		let config: u64 = match service_connect(facs.config) {
+		let config: u64 = match connect_or_resolve(&mut facs.config, broker, CAP_CONFIG) {
 			Some(h) => h,
 			None => return false,
 		};
@@ -1544,11 +1553,11 @@ unsafe fn spawn_shell(facs: &Factories, shell_console: u64, shell_control: u64) 
 // Open one VT's shell: create the VT's console + control channels, spawn a fully-capable
 // shell over them, nudge it to print its first prompt, and return the VT (its cleared grid
 // + the service ends of those channels). None on any failure.
-unsafe fn spawn_vt(facs: &Factories, config_client: u64, addr: u64, fb: &Framebuffer, gpu: u64, cur_w: u32, cur_h: u32) -> Option<Vt> {
+unsafe fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: u64, fb: &Framebuffer, gpu: u64, cur_w: u32, cur_h: u32) -> Option<Vt> {
 	unsafe {
 		let (vt_service, vt_client): (u64, u64) = channel()?;
 		let (control_console, control_shell): (u64, u64) = channel()?;
-		if !spawn_shell(facs, vt_client, control_shell) {
+		if !spawn_shell(facs, broker, vt_client, control_shell) {
 			close(vt_service);
 			close(vt_client);
 			close(control_console);
@@ -1579,7 +1588,8 @@ unsafe fn open_pty(console: &mut Console, name: &[u8]) -> Option<u64> {
 		let (control_console, control_slave): (u64, u64) = channel()?;
 		let (master_console, master_host): (u64, u64) = channel()?;
 		let is_shell: bool = name == b"shell";
-		let ok: bool = if is_shell { spawn_shell(&console.facs, slave_client, control_slave) } else { spawn_pty_program(&console.facs, name, slave_client, control_slave) };
+		let broker: u64 = console.broker;
+		let ok: bool = if is_shell { spawn_shell(&mut console.facs, broker, slave_client, control_slave) } else { spawn_pty_program(&console.facs, name, slave_client, control_slave) };
 		if !ok {
 			close(slave_service);
 			close(slave_client);

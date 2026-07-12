@@ -349,16 +349,20 @@ pub fn free_address_space(root: u64) {
 		let l0 = phys_to_virt(root) as *const u64;
 		for i in 0..512 {
 			if let Some(l1) = next_table(l0, i) {
-				free_table_level(l1, 2);
+				// An L1 sits three table levels above the data pages (L1 -> L2 -> L3).
+				free_table_level(l1, 3);
 			}
 		}
 		dealloc_frame(root);
 	}
 }
 
-// Recursively free the intermediate tables below `phys`. `level` is 2 for an L2,
-// 1 for an L3. An L3's entries point at data frames, which are not freed; only the
-// table frames themselves are reclaimed.
+// Recursively free the intermediate tables below `phys`. `level` is 3 for an L1,
+// 2 for an L2, 1 for an L3. An L3's entries point at data frames, which are not
+// freed; only the table frames themselves are reclaimed. (Descending from an L1
+// with level 2 - one short - used to skip the L3s entirely, leaking every leaf
+// table of a torn-down address space; the concurrent-maps stress test counts the
+// reclaimed frames and caught it.)
 //
 // SAFETY: `phys` must be the physical address of a valid page table at `level`.
 unsafe fn free_table_level(phys: u64, level: u32) {

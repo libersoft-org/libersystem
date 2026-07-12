@@ -296,25 +296,11 @@ unsafe fn grant_handle(clients: &mut Clients, cap: Capability) -> u64 {
 				return if dup >= 0 { dup as u64 } else { 0 };
 			}
 		};
-		let minted: u64 = match service_connect(*held) {
+		// Mint a fresh sub-connection, re-resolving a dead held client through the
+		// broker (answered once the restarted instance serves).
+		let minted: u64 = match connect_or_resolve(held, clients.broker, name) {
 			Some(m) => m,
-			None => {
-				// The held client is dead (or absent): re-resolve the name through the
-				// broker - answered once the restarted instance serves - and mint from
-				// the fresh connection.
-				let fresh: u64 = match resolve(clients.broker, name) {
-					Some(f) => f,
-					None => return 0,
-				};
-				if *held != 0 {
-					close(*held);
-				}
-				*held = fresh;
-				match service_connect(*held) {
-					Some(m) => m,
-					None => return 0,
-				}
-			}
+			None => return 0,
 		};
 		// Narrow the minted connection to a client's rights, like every other grant.
 		let dup: i64 = duplicate(minted, GRANT_RIGHTS);

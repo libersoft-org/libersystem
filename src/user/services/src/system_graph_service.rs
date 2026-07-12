@@ -40,11 +40,14 @@ struct Node {
 }
 
 // The service state: the registered component nodes, a client connection to
-// DeviceService for the device nodes, and a client connection to the ServiceManager
-// supervisor for each node's restart / watchdog history.
+// DeviceService for the device nodes (held as a re-resolving transport: DeviceService
+// restarts transparently, and the broker answers a RESOLVE with a connection to the
+// live instance, so the graph's device nodes survive the restart; None when the
+// supervisor delivered no DEVICE connection), and a client connection to the
+// ServiceManager supervisor for each node's restart / watchdog history.
 struct GraphService {
 	nodes: Vec<Node>,
-	device_client: u64,
+	device: Option<SvcTransport>,
 	supervisor_client: u64,
 }
 
@@ -67,10 +70,11 @@ impl system_graph::Service for GraphService {
 
 		// Device nodes: enumerate the hardware devices over the DeviceService connection,
 		// timing the call as a "device.list" trace span. Each device is a leaf node owned
-		// by DeviceManager, carrying its identity and zero counters.
+		// by DeviceManager, carrying its identity and zero counters. The transport
+		// re-resolves through the broker when the connection died with a restarted
+		// DeviceService, so the device nodes survive the restart.
 		let list_start: u64 = unsafe { clock_ns() };
-		let mut dev: device::Client<ChannelTransport> = device::Client::new(ChannelTransport { chan: self.device_client });
-		let devices: Vec<DeviceEntry> = match dev.list() {
+		let devices: Vec<DeviceEntry> = match self.device.as_mut().and_then(|t| device::Client::new(t).list()) {
 			Some(Ok(d)) => d,
 			_ => Vec::new(),
 		};
@@ -166,7 +170,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	// 3. serve generated `snapshot` requests until the client side closes.
-	let mut graph: GraphService = GraphService { nodes, device_client, supervisor_client };
+	let mut graph: GraphService = GraphService { nodes, device: if device_client != 0 { Some(SvcTransport::new(bootstrap, CAP_DEVICE, device_client)) } else { None }, supervisor_client };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {

@@ -1684,11 +1684,15 @@ struct Broker {
 // The grant set of each resolving component: which capability names its resolves may
 // answer. The canary is the standing client that proves the broker; PermissionManager
 // re-resolves the grantable clients it mints for governed tools (`config` / `set` /
-// `lsdev`); a component migrating to the SvcTransport wrapper adds its row here.
+// `lsdev`); ConsoleService re-resolves its per-VT config/device factories;
+// SystemGraphService re-resolves its device-nodes connection. A component migrating
+// to the SvcTransport / connect_or_resolve wrappers adds its row here.
 fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 	match requester {
 		b"watchdog_probe" => &[CAP_CONFIG],
 		b"permission_manager" => &[CAP_CONFIG, CAP_DEVICE],
+		b"console_service" => &[CAP_CONFIG, CAP_DEVICE],
+		b"system_graph_service" => &[CAP_DEVICE],
 		_ => &[],
 	}
 }
