@@ -1408,13 +1408,22 @@ unsafe fn paste_clipboard(console: &mut Console, bracketed: bool) {
 // longer pinned by the supervisor; otherwise its console channel never closed.)
 unsafe fn close_vt(console: &mut Console, vi: usize) {
 	unsafe {
-		if console.vts.len() <= 1 {
-			exit();
-		}
 		close(console.vts[vi].client);
 		close(console.vts[vi].control);
 		if let Some(p) = console.vts[vi].fg_proc.take() {
 			close(p);
+		}
+		// The last VT's shell exiting must NOT halt the machine: reload a fresh shell on
+		// it (a logout returns a clean login prompt, like a real console). A secondary VT
+		// is removed instead, returning the operator to another VT (its still-live shell).
+		if console.vts.len() <= 1 {
+			if reload_vt(console, vi) {
+				repaint(console);
+				return;
+			}
+			// Reloading failed (out of channels, or the shell binary is gone): there is
+			// nothing left to serve, so the console genuinely exits.
+			exit();
 		}
 		console.vts.remove(vi);
 		if console.fg >= console.vts.len() {
@@ -1423,6 +1432,47 @@ unsafe fn close_vt(console: &mut Console, vi: usize) {
 			console.fg -= 1;
 		}
 		repaint(console);
+	}
+}
+
+// Reload a fresh shell onto an existing VT (its grid stays; the old shell's channels are
+// already closed by the caller). Mint a new console + control channel pair, spawn a
+// core-capable shell over them, swap the VT onto them, clear the grid and nudge the first
+// prompt. Returns false if the shell could not be spawned. This is what a logout on the
+// primary VT does instead of tearing the session down - the reloaded shell is
+// core-capable (ConsoleService mints per-VT service connections, minus the few
+// single-client capabilities it cannot proxy), the same set every non-primary VT gets.
+unsafe fn reload_vt(console: &mut Console, vi: usize) -> bool {
+	unsafe {
+		let (vt_service, vt_client): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		let (control_console, control_shell): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => {
+				close(vt_service);
+				close(vt_client);
+				return false;
+			}
+		};
+		let broker: u64 = console.broker;
+		if !spawn_shell(&mut console.facs, broker, vt_client, control_shell) {
+			close(vt_service);
+			close(vt_client);
+			close(control_console);
+			close(control_shell);
+			return false;
+		}
+		console.vts[vi].client = vt_service;
+		console.vts[vi].control = control_console;
+		console.vts[vi].fg_proc = None;
+		if let Some(t) = console.vts[vi].term.as_mut() {
+			t.screen.clear();
+		}
+		// nudge the fresh shell to print its first prompt (an empty line reprompts).
+		send_blocking(vt_service, b"\n", 0);
+		true
 	}
 }
 

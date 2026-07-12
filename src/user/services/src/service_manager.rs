@@ -864,6 +864,25 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 	}
 }
 
+// Grant the shell a capability by DUPLICATING the supervisor's client and transferring
+// the copy, so the supervisor keeps the original (the serve root's client end) alive for
+// the life of the system - the shell exiting then closes only its copy and the service
+// survives, so a logout reloads a fresh shell instead of tearing the system down. An
+// absent capability (client 0) is sent as a bare tag with no handle (the shell reads it
+// as "not granted"). Returns false only if duplicating a real client fails.
+unsafe fn send_shell_cap(manager_side: u64, tag: &[u8], client: u64) -> bool {
+	unsafe {
+		if client == 0 {
+			return send_blocking(manager_side, tag, 0);
+		}
+		let dup: i64 = duplicate(client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		if dup < 0 {
+			return false;
+		}
+		send_blocking(manager_side, tag, dup as u64)
+	}
+}
+
 // Hand the shell the client channels it needs: the StorageService one (so its
 // `cat` round-trips to storage over IPC), a LogService one (so its `log` command
 // can query the journal), the DeviceService one (`dev`), the ProcessService one
@@ -875,19 +894,24 @@ unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 // reverse-dependency teardown), keeping the server end in `*admin_server` to serve.
 unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, input_client: u64, console_client: u64, console_control: u64, graph_client: u64, perm_client: u64, res_client: u64, session_client: u64, session1: &mut u64, admin_server: &mut u64) -> bool {
 	unsafe {
-		if !send_blocking(manager_side, CAP_STORAGE, storage_client) {
+		// Every service client the shell is handed is a DUPLICATE (see send_shell_cap): the
+		// supervisor keeps every serve root's client end alive for the life of the system, so
+		// a shell exit / logout closes only its copies and reloads a fresh shell rather than
+		// tearing the running system down. The volume clients that are absent this boot
+		// (media / iso / udf / usb with no disk) arrive as 0 and are sent as a bare tag.
+		if !send_shell_cap(manager_side, CAP_STORAGE, storage_client) {
 			return false;
 		}
-		if !send_blocking(manager_side, CAP_MEDIA, media_client) {
+		if !send_shell_cap(manager_side, CAP_MEDIA, media_client) {
 			return false;
 		}
-		if !send_blocking(manager_side, CAP_ISO, iso_client) {
+		if !send_shell_cap(manager_side, CAP_ISO, iso_client) {
 			return false;
 		}
-		if !send_blocking(manager_side, CAP_UDF, udf_client) {
+		if !send_shell_cap(manager_side, CAP_UDF, udf_client) {
 			return false;
 		}
-		if !send_blocking(manager_side, CAP_USB, usb_client) {
+		if !send_shell_cap(manager_side, CAP_USB, usb_client) {
 			return false;
 		}
 		let log_dup: i64 = duplicate(log_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
@@ -910,7 +934,7 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: 
 		if !send_blocking(manager_side, CAP_DEVICE, device_dup as u64) {
 			return false;
 		}
-		if !send_blocking(manager_side, CAP_PROCESS, process_client) {
+		if !send_shell_cap(manager_side, CAP_PROCESS, process_client) {
 			return false;
 		}
 		let config_dup: i64 = duplicate(config_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
@@ -920,7 +944,7 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: 
 		if !send_blocking(manager_side, CAP_CONFIG, config_dup as u64) {
 			return false;
 		}
-		if !send_blocking(manager_side, CAP_NET, net_client) {
+		if !send_shell_cap(manager_side, CAP_NET, net_client) {
 			return false;
 		}
 		let time_dup: i64 = duplicate(time_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
@@ -937,17 +961,17 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: 
 		if !send_blocking(manager_side, CAP_AUDIO, audio_dup as u64) {
 			return false;
 		}
-		if !send_blocking(manager_side, CAP_INPUT, input_client) {
+		if !send_shell_cap(manager_side, CAP_INPUT, input_client) {
 			return false;
 		}
 		// The SystemGraphService client, so the shell's `graph` command can render the live
 		// system graph.
-		if !send_blocking(manager_side, CAP_GRAPH, graph_client) {
+		if !send_shell_cap(manager_side, CAP_GRAPH, graph_client) {
 			return false;
 		}
 		// The PermissionManager client, so the shell's `perm` command can render the
 		// permission audit trail.
-		if !send_blocking(manager_side, CAP_PERM, perm_client) {
+		if !send_shell_cap(manager_side, CAP_PERM, perm_client) {
 			return false;
 		}
 		// The ResourceManager client, so the shell's `usage` command can render the live
