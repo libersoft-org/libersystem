@@ -1794,6 +1794,13 @@ fn is_resolve(request: &[u8]) -> bool {
 	request.len() > 2 && u16::from_le_bytes([request[0], request[1]]) == RESOLVE_OP
 }
 
+// Whether `request` is a service's clean-exit announcement (the shell on logout). A
+// service that sends this before closing its report channel is stopping deliberately,
+// so the supervisor records a stop rather than a crash.
+fn is_goodbye(request: &[u8]) -> bool {
+	request.len() >= 2 && u16::from_le_bytes([request[0], request[1]]) == GOODBYE_OP
+}
+
 // Restart a crashed service under the Transparent policy - the ladder a real service
 // follows (the Tier-1 shape: a self-contained bootstrap, a volume launch plus a fresh
 // serve root, so a replacement serves correctly from scratch). Records the crash,
@@ -2032,6 +2039,14 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 							let rlen: usize = len.min(req.len());
 							req[..rlen].copy_from_slice(&buf[..rlen]);
 							serve_resolve(channels[idx], MANIFEST[idx].name, &req[..rlen], broker, state);
+						}
+						Polled::Message { len, .. } if is_goodbye(&buf[..len]) => {
+							// A deliberate exit (the shell on logout), not a crash: record a
+							// clean stop and drop it from the wait set. ConsoleService reloads a
+							// fresh shell on the VT, so nothing here restarts it.
+							emit_event(log_client, MANIFEST[idx].name, b"exited");
+							state[idx] = State::Stopped;
+							channels[idx] = 0;
 						}
 						Polled::Closed => {
 							emit_event(log_client, MANIFEST[idx].name, b"crashed");

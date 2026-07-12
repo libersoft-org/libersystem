@@ -1016,6 +1016,22 @@ pub unsafe fn service_connect(factory: u64) -> Option<u64> {
 // No typed interface uses opcode 0xfffd, so it never collides with a real request.
 pub const RESOLVE_OP: u16 = 0xfffd;
 
+// A managed service announces a CLEAN exit to the supervisor by sending `GOODBYE_OP`
+// on its bootstrap / report channel just before it exits, so the supervisor records a
+// deliberate stop instead of reading the channel's peer-close as a crash. Only the
+// interactive shell exits at runtime (a logout); every other service is meant to stand
+// for the life of the system, so a bare peer-close from one of them stays a crash.
+// No typed interface uses opcode 0xfffc, so it never collides with a real request.
+pub const GOODBYE_OP: u16 = 0xfffc;
+
+// Announce a clean exit on `channel` (the bootstrap / report channel the supervisor
+// watches). Call it right before `exit()` so a logout reads as a deliberate stop.
+pub unsafe fn announce_exit(channel: u64) {
+	unsafe {
+		send_blocking(channel, &GOODBYE_OP.to_le_bytes(), 0);
+	}
+}
+
 // Re-resolve a named service capability over the broker (bootstrap) channel:
 // send `RESOLVE_OP` + `name` and block for the broker's answer. Returns the fresh
 // client channel to the current live instance, or None when the broker denies the

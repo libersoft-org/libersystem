@@ -97,6 +97,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		repl(console, control, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session);
 	}
+	// The REPL returned: the operator logged out (`exit` / Ctrl+D). Tell the supervisor
+	// this is a deliberate exit before the bootstrap channel peer-closes, so a logout is
+	// recorded as a clean stop instead of a crash (ConsoleService reloads a fresh shell).
+	unsafe {
+		announce_exit(bootstrap);
+	}
 	exit();
 }
 
