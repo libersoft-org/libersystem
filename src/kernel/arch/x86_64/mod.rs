@@ -159,7 +159,7 @@ pub fn poweroff() -> ! {
 // the `lscpu` model field.
 pub fn cpu_brand(out: &mut [u8]) -> usize {
 	use core::arch::x86_64::__cpuid;
-	unsafe {
+	{
 		if __cpuid(0x8000_0000).eax >= 0x8000_0004 {
 			let mut raw: [u8; 48] = [0u8; 48];
 			for (i, &leaf) in [0x8000_0002u32, 0x8000_0003, 0x8000_0004].iter().enumerate() {

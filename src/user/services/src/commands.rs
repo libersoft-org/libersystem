@@ -33,6 +33,9 @@ pub const BUILTINS: &[&str] = &[
 // place, so a command gets `--help` without every tool ELF hand-rolling a usage string.
 // Each entry is (command word, "synopsis - what it does"). Grown in step with the
 // dispatch tables (TOOLS / NET_TOOLS in shell.rs and the builtin arms).
+// Used by the shell binary's `help`; the shared `commands` module also compiles into
+// console_service, where only BUILTINS is consumed - hence dead there, not everywhere.
+#[allow(dead_code)]
 pub const SYNOPSES: &[(&str, &str)] = &[
 	// shell builtins
 	("cd", "cd [dir] - change the working directory (no arg: the system volume)"),
@@ -102,6 +105,7 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 ];
 
 // The synopsis for `command`, if it is a known command.
+#[allow(dead_code)]
 pub fn synopsis(command: &[u8]) -> Option<&'static str> {
 	for &(name, text) in SYNOPSES {
 		if name.as_bytes() == command {
