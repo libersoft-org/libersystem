@@ -504,6 +504,24 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 
+	// 3d. verify the graceful-shutdown ordering (a test boot only). The graceful
+	//     `poweroff` / `reboot` tears the service tree down in reverse-dependency order
+	//     (dependents before their dependencies) before powering the machine off; the
+	//     actual teardown + power cannot run under the test harness (system_power would
+	//     stop QEMU mid-suite), so this exercises the ordering logic against the live
+	//     manifest instead: it computes the order the graceful power path would use and
+	//     confirms it covers every running service (no dependency cycle strands one) and
+	//     lists each dependent before its dependency. Non-destructive - nothing is torn
+	//     down or powered off.
+	if selftest {
+		let order: Vec<usize> = shutdown_order(&state);
+		if verify_shutdown_order(&order, &state) {
+			unsafe {
+				send_blocking(bootstrap, b"ServiceManager: shutdown order ok", 0);
+			}
+		}
+	}
+
 	// 4. report in once the whole set has settled - every service either Running or,
 	//    for the leaf we exercised the stop path on, Stopped, with none left Failed.
 	//    Keep `storage_client` alive in case the shell never took it (e.g. a spawn
@@ -2138,6 +2156,18 @@ unsafe fn handle_admin(admin: u64, state: &mut [State; N], channels: &mut [u64; 
 		let nlen: usize = len.min(namebuf.len()).min(buf.len());
 		namebuf[..nlen].copy_from_slice(&buf[..nlen]);
 		let name: &[u8] = &namebuf[..nlen];
+		// A power verb (the shell's graceful `poweroff` / `reboot`): the reserved names
+		// `!poweroff` / `!reboot` (a real service name can never start with `!`) mean tear
+		// the whole service tree down in reverse-dependency order - flushing LogService's
+		// last journal batch first - then power the machine off (or reboot) from here, so no
+		// service is killed while a dependent still needs it. system_power does not return;
+		// if it somehow does (an unsupported machine), the loop stays alive.
+		if name == b"!poweroff" || name == b"!reboot" {
+			let action: u64 = if name == b"!reboot" { POWER_REBOOT } else { POWER_OFF };
+			shutdown_all(state, channels, sup, procs, log_client, buf);
+			system_power(action);
+			return true;
+		}
 		match index_of(name) {
 			Some(target) if state[target] == State::Running => {
 				let stopped: Vec<u8> = stop_subtree(target, state, channels, sup, procs, log_client, up, buf);
@@ -2257,6 +2287,129 @@ fn index_of_dep(j: usize, i: usize) -> bool {
 		}
 	}
 	false
+}
+
+// The reverse-dependency teardown order for a graceful shutdown: every currently
+// Running service (the shell exempted - it is the issuing terminal and holds no
+// supervised Process here), ordered so a dependent always precedes every dependency it
+// declares. Computed by repeatedly taking the current leaves of the scoped subgraph (a
+// service nothing not-yet-dropped still depends on), the same rule stop_subtree tears
+// down by. Pure - it computes the order, it stops nothing - so the same function drives
+// the live `shutdown_all` teardown and is checked by the selftest ordering drill. A
+// dependency cycle would leave some service never becoming a leaf, so it would be
+// absent from the returned order (which the selftest verifies against).
+fn shutdown_order(state: &[State; N]) -> Vec<usize> {
+	let mut scope: [bool; N] = [false; N];
+	let mut i: usize = 0;
+	while i < N {
+		if state[i] == State::Running {
+			scope[i] = true;
+		}
+		i += 1;
+	}
+	if let Some(sh) = index_of(b"shell") {
+		scope[sh] = false;
+	}
+	let mut dropped: [bool; N] = [false; N];
+	let mut order: Vec<usize> = Vec::new();
+	loop {
+		let mut progress: bool = false;
+		let mut i: usize = 0;
+		while i < N {
+			if scope[i] && !dropped[i] && !has_scoped_undropped_dependent(i, &scope, &dropped) {
+				dropped[i] = true;
+				order.push(i);
+				progress = true;
+			}
+			i += 1;
+		}
+		if !progress {
+			break;
+		}
+	}
+	order
+}
+
+// Whether any in-scope, not-yet-dropped component still depends on component `i` - i.e.
+// `i` is not yet a leaf of the shrinking scoped subgraph, so it must not be dropped this
+// round (its dependents must go first). The `shutdown_order` counterpart of
+// `has_running_dependent`, tracking dropped-so-far instead of live state.
+fn has_scoped_undropped_dependent(i: usize, scope: &[bool; N], dropped: &[bool; N]) -> bool {
+	let mut j: usize = 0;
+	while j < N {
+		if j != i && scope[j] && !dropped[j] && index_of_dep(j, i) {
+			return true;
+		}
+		j += 1;
+	}
+	false
+}
+
+// Tear the whole service tree down for a graceful power-off, then return so the caller
+// powers the machine off. First ask LogService to flush its last journal batch (it is a
+// dependency of nearly everything, so it stops near-last; sending now gives it ample
+// scheduling before its own kill). Then stop every Running service in reverse-dependency
+// order (from `shutdown_order`, so a dependent always stops before its dependency) by
+// killing its process and draining its control channel to the peer-close - the same
+// per-service teardown as `stop_subtree`. The shell (the issuing terminal) is exempt:
+// `shutdown_order` omits it, so it is never drained (which would block) and it dies with
+// the machine at power-off.
+unsafe fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, buf: &mut [u8]) {
+	unsafe {
+		if let Some(log) = index_of(b"log_service") {
+			if state[log] == State::Running && channels[log] != 0 {
+				send_blocking(channels[log], b"FLUSH", 0);
+			}
+		}
+		let order: Vec<usize> = shutdown_order(state);
+		for &idx in &order {
+			if state[idx] != State::Running {
+				continue;
+			}
+			if procs[idx] != 0 {
+				signal(procs[idx], SIG_KILL);
+			}
+			drain_closed(channels[idx], buf);
+			if channels[idx] != 0 {
+				close(channels[idx]);
+				channels[idx] = 0;
+			}
+			state[idx] = State::Stopped;
+			sup[idx].failure = Failure::Stopped;
+			emit_event(log_client, MANIFEST[idx].name, b"stopped");
+			console_report(MANIFEST[idx].name, b"stopped");
+		}
+	}
+}
+
+// Verify a computed shutdown order (the selftest ordering drill): it must cover every
+// Running non-shell service (a dependency cycle would strand one out of the order), and
+// list each service before every dependency it declares that is also in the order (a
+// dependent must tear down before its dependency). Non-destructive.
+fn verify_shutdown_order(order: &[usize], state: &[State; N]) -> bool {
+	let shell: Option<usize> = index_of(b"shell");
+	let mut i: usize = 0;
+	while i < N {
+		if state[i] == State::Running && Some(i) != shell && !order.contains(&i) {
+			return false;
+		}
+		i += 1;
+	}
+	let mut pos: usize = 0;
+	while pos < order.len() {
+		let x: usize = order[pos];
+		for &dep in MANIFEST[x].deps {
+			if let Some(d) = index_of(dep) {
+				if let Some(dpos) = order.iter().position(|&s| s == d) {
+					if dpos < pos {
+						return false;
+					}
+				}
+			}
+		}
+		pos += 1;
+	}
+	true
 }
 
 // Answer one request on a supervisor stats channel (SystemGraphService's, or the

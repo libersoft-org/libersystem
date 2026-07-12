@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use proto::codec::JsonMode;
 use proto::path;
 use proto::shell::{parse_and_expand, parse_assignment, trim};
-use proto::system::{Component, EnvVar, JobEntry, JobInfo, TraceSpan, input, network, permission, process, session, system_graph, volume};
+use proto::system::{input, network, permission, process, session, system_graph, volume, Component, EnvVar, JobEntry, JobInfo, TraceSpan};
 use rt::*;
 
 // The shell's builtins, shared with ConsoleService's line discipline: Tab completes the
@@ -60,6 +60,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let inputsvc: u64 = caps.take(CAP_INPUT);
 	let graphsvc: u64 = caps.take(CAP_GRAPH);
 	let permsvc: u64 = caps.take(CAP_PERM);
+	// The ServiceManager admin channel (VT 1 is granted one; secondary VTs and a minimal
+	// boot are not). The shell drives a graceful `poweroff` / `reboot` over it - a full
+	// reverse-dependency teardown of the service tree, so no service is killed while a
+	// dependent still needs it, before the machine powers off. With no admin channel the
+	// power commands fall back to the direct power syscall (an immediate stop).
+	let admin: u64 = caps.take(CAP_ADMIN);
 	// The session (SessionService) the shell runs under: the long-lived owner of the
 	// working directory (and, later, the environment). `cd` round-trips to it and the
 	// prompt reads its cwd, so the cwd survives a shell restart - the supervisor keeps the
@@ -95,7 +101,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	print_motd();
 	unsafe {
-		repl(console, control, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session);
+		repl(console, control, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, admin);
 	}
 	// The REPL returned: the operator logged out (`exit` / Ctrl+D). Tell the supervisor
 	// this is a deliberate exit before the bootstrap channel peer-closes, so a logout is
@@ -157,7 +163,7 @@ fn print_banner(lines: &[&str]) {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64) {
+unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, admin: u64) {
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control, session);
 		// The cwd is owned by the session (so it survives a shell restart); read it once at
@@ -234,7 +240,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			// it, expand any `$NAME` / `${NAME}` against the environment, normalize its flags,
 			// then dispatch it, reap finished jobs, and print the next prompt.
 			let prepared: Vec<u8> = parse_and_expand(&line_buf[..n], &vars);
-			if dispatch(&prepared, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, &mut jobs, &mut vars, &mut cwd) {
+			if dispatch(&prepared, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, admin, &mut jobs, &mut vars, &mut cwd) {
 				return;
 			}
 			jobs.reap();
@@ -792,7 +798,34 @@ unsafe fn dispatch_net(line: &[u8], jobs: &mut Jobs, netsvc: u64, procsvc: u64, 
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, jobs: &mut Jobs, vars: &mut Vec<(String, String)>, cwd: &mut String) -> bool {
+// Power the machine down gracefully. With a ServiceManager admin channel (VT 1), drive
+// the supervisor's power verb over it: the supervisor tears the whole service tree down
+// in reverse-dependency order - flushing LogService's last journal batch first - so no
+// service is killed while a dependent still needs it, then powers the machine off (or
+// reboots) from there. The banner is printed before the request goes out, because the
+// teardown stops ConsoleService and the shell's output stops rendering. This blocks on
+// the admin channel while the supervisor works; it only returns if there is no admin
+// channel or the request could not be sent (a secondary VT / a minimal boot), and the
+// caller then falls back to the direct power syscall - an immediate, ungraceful stop.
+unsafe fn graceful_power(admin: u64, action: u64) {
+	unsafe {
+		if admin != 0 {
+			print(if action == POWER_REBOOT { b"rebooting...\n" } else { b"powering off...\n" });
+			let req: &[u8] = if action == POWER_REBOOT { b"!reboot" } else { b"!poweroff" };
+			if send_blocking(admin, req, 0) {
+				// The supervisor powers the machine off after the teardown, so this recv
+				// normally never returns (the machine is gone). If it does return - the
+				// channel closed because the supervisor is unexpectedly absent - fall
+				// through to the direct syscall below as a backstop.
+				let mut rbuf: [u8; 64] = [0u8; 64];
+				let _ = recv_blocking(admin, &mut rbuf);
+			}
+		}
+		system_power(action);
+	}
+}
+
+unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, admin: u64, jobs: &mut Jobs, vars: &mut Vec<(String, String)>, cwd: &mut String) -> bool {
 	unsafe {
 		// The line arrives already trimmed, `$`-expanded, and flag-normalized by
 		// `parse_and_expand`; trim again so the recursive `time <command>` path (which passes
@@ -839,7 +872,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		// tool runs to completion inside the dispatch, so the time covers it whole).
 		if let Some(rest) = line.strip_prefix(b"time ") {
 			let t0: u64 = clock_ns();
-			let quit: bool = dispatch(trim(rest), storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, jobs, vars, cwd);
+			let quit: bool = dispatch(trim(rest), storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, admin, jobs, vars, cwd);
 			let us: u64 = (clock_ns() - t0) / 1_000;
 			let line: String = alloc::format!("time: {}.{:03} s\n", us / 1_000_000, us % 1_000_000 / 1_000);
 			print(line.as_bytes());
@@ -887,12 +920,12 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			return true;
 		}
 		if line == b"reboot" {
-			system_power(POWER_REBOOT);
+			graceful_power(admin, POWER_REBOOT);
 			print(b"reboot: failed\n");
 			return false;
 		}
 		if line == b"poweroff" || line == b"shutdown" {
-			system_power(POWER_OFF);
+			graceful_power(admin, POWER_OFF);
 			print(b"poweroff: failed\n");
 			return false;
 		}
@@ -1135,7 +1168,11 @@ unsafe fn send_stdout(parent: u64, interactive: bool) {
 		let rights: u32 = if interactive { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER } else { RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER };
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, rights);
-			if d > 0 { d as u64 } else { 0 }
+			if d > 0 {
+				d as u64
+			} else {
+				0
+			}
 		} else {
 			0
 		};

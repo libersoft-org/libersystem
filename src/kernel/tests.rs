@@ -3301,10 +3301,12 @@ fn init_package_starts_system_manager() {
 	// service restart (and that an un-granted resolve is denied). Then DeviceManager
 	// stopped (ServiceManager exercises the stop path on that service - after the
 	// restart drill, whose replacement is launched from the system volume that
-	// DeviceManager's virtio-blk backs), followed by the two managers.
+	// DeviceManager's virtio-blk backs), the graceful-shutdown ordering check
+	// (ServiceManager confirms the reverse-dependency teardown order the `poweroff`
+	// path uses is valid against the live manifest), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 29] = [
+	let reports: [&[u8]; 30] = [
 		b"LogService: online",
 		b"DeviceManager: online",
 		b"StorageService: online",
@@ -3332,6 +3334,7 @@ fn init_package_starts_system_manager() {
 		b"WatchdogProbe: config client survived",
 		b"PermissionManager: config client reconnected",
 		b"DeviceManager: stopped",
+		b"ServiceManager: shutdown order ok",
 		b"ServiceManager: online",
 		b"SystemManager: online",
 	];

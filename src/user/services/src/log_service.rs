@@ -29,7 +29,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::system::log::{self, Service};
-use proto::system::{Entry, Error, OpenOpts, Query, Severity, config, volume};
+use proto::system::{config, volume, Entry, Error, OpenOpts, Query, Severity};
 use rt::*;
 
 // The bounded in-memory journal: at most this many records, newest dropping
@@ -349,6 +349,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					journal.disk.attach(handle);
 				} else if req == b"CONFIG" && handle != 0 {
 					journal.adopt_config(handle);
+				} else if req == b"FLUSH" {
+					// The supervisor asks for a flush before a graceful shutdown tears us
+					// down, so the last batch (records emitted since the previous
+					// housekeeping tick) reaches the on-disk journal rather than dying with
+					// the process. Best-effort - a hard power-cut loses it regardless.
+					journal.disk.flush();
 				}
 				return None;
 			}
