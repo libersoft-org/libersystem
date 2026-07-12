@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use proto::codec::JsonMode;
 use proto::path;
 use proto::shell::{parse_and_expand, parse_assignment, trim};
-use proto::system::{Component, EnvVar, JobEntry, JobInfo, TraceSpan, input, network, permission, process, session, system_graph, volume};
+use proto::system::{input, network, permission, process, session, system_graph, volume, Component, EnvVar, JobEntry, JobInfo, TraceSpan};
 use rt::*;
 
 // The shell's builtins, shared with ConsoleService's line discipline: Tab completes the
@@ -641,7 +641,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"uname", Shape::Bare),
 	(b"uptime", Shape::Bare),
 	(b"dmesg", Shape::Bare),
-	(b"ps", Shape::Bare),
+	(b"ps", Shape::Json),
 	(b"free", Shape::Bare),
 	(b"lsdev", Shape::Json),
 	(b"perm", Shape::Json),
@@ -696,6 +696,34 @@ fn strip_word<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 // PermissionManager grants each tool its manifest and forwards this terminal, the cwd,
 // and the argument the line's shape carries; a foreground launch, so a trailing `&` (the
 // caller's `bg`) does not apply.
+// Print command help: with `Some(cmd)`, that command's one-line synopsis (or an
+// "unknown command" note); with `None`, every command's synopsis, sorted. The synopsis
+// table lives in `commands` so it is shared with completion and stays in one place.
+unsafe fn print_help(cmd: Option<&[u8]>) {
+	unsafe {
+		if let Some(cmd) = cmd {
+			match commands::synopsis(cmd) {
+				Some(text) => {
+					print(text.as_bytes());
+					print(b"\n");
+				}
+				None => {
+					print(b"help: unknown command: ");
+					print(cmd);
+					print(b"\n");
+				}
+			}
+			return;
+		}
+		let mut rows: Vec<&'static str> = commands::SYNOPSES.iter().map(|&(_, text)| text).collect();
+		rows.sort_unstable();
+		for text in rows {
+			print(text.as_bytes());
+			print(b"\n");
+		}
+	}
+}
+
 unsafe fn dispatch_tool(line: &[u8], permsvc: u64, cwd: &[u8]) -> bool {
 	unsafe {
 		for &(name, shape) in TOOLS {
@@ -765,6 +793,24 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		// a slice of it) is clean too.
 		let line = trim(line);
 		if line.is_empty() {
+			return false;
+		}
+		// `help` lists every command's synopsis; `help <command>` shows one. And a
+		// `--help` anywhere on the line prints the leading command's synopsis instead of
+		// launching it - so every command answers `--help` from one central table, with
+		// no per-tool usage string. (`-h` is NOT intercepted: `free -h` / `du -h` mean
+		// human-readable; only the unambiguous long form is help.)
+		if line == b"help" {
+			print_help(None);
+			return false;
+		}
+		if let Some(rest) = line.strip_prefix(b"help ") {
+			print_help(Some(trim(rest)));
+			return false;
+		}
+		if line.split(|&b| b == b' ').any(|t: &[u8]| t == b"--help") {
+			let cmd: &[u8] = line.split(|&b| b == b' ').next().unwrap_or(b"");
+			print_help(Some(cmd));
 			return false;
 		}
 		// A bare `NAME=VALUE` sets a shell variable (write it through to the session so it
@@ -1083,7 +1129,11 @@ unsafe fn send_stdout(parent: u64, interactive: bool) {
 		let rights: u32 = if interactive { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER } else { RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER };
 		let dup: u64 = if so != 0 {
 			let d: i64 = duplicate(so, rights);
-			if d > 0 { d as u64 } else { 0 }
+			if d > 0 {
+				d as u64
+			} else {
+				0
+			}
 		} else {
 			0
 		};

@@ -16,6 +16,8 @@
 
 extern crate alloc;
 
+use alloc::string::String;
+use proto::codec::JsonMode;
 use proto::system::{process, resources};
 use rt::*;
 
@@ -35,11 +37,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    renders on the same terminal as the shell that launched us. For `ps -i` the
 		//    shell hands the console itself (full duplex), so the same handle is our stdin.
 		inherit_stdout(bootstrap);
-		// 2. receive the argument string: "" for the plain list, "-i" for the live view.
-		let interactive: bool = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => &buf[..len] == b"-i",
+		// 2. receive the argument string: "" for the plain list, "-i" for the live view,
+		//    "json" / "json-min" for a JSON array.
+		let arg: alloc::vec::Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, .. } => buf[..len].to_vec(),
 			Received::Closed => exit(),
 		};
+		let interactive: bool = arg == b"-i";
+		let mode: Option<JsonMode> = JsonMode::parse(&arg);
 		// 3. receive the two capabilities the manifest grants, in vocabulary order: a
 		//    ResourceManager client, then a ProcessService client.
 		let ressvc: u64 = recv_tagged(bootstrap, &mut buf, b"RESOURCE").unwrap_or_else(|| exit());
@@ -47,21 +52,35 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if interactive {
 			live_view(procsvc, ressvc);
 		} else {
-			query_processes(procsvc);
+			query_processes(procsvc, mode);
 		}
 	}
 	exit();
 }
 
-// List the processes through the grant and print each typed entry, one per line.
-unsafe fn query_processes(procsvc: u64) {
+// List the processes through the grant and print each typed entry - one per line as
+// text (the default), or as a JSON array rendered on the client.
+unsafe fn query_processes(procsvc: u64, mode: Option<JsonMode>) {
 	unsafe {
 		let mut client = process::Client::new(ChannelTransport { chan: procsvc });
 		match client.list() {
 			Some(Ok(procs)) => {
-				for p in &procs {
-					print(p.to_text().as_bytes());
+				if let Some(mode) = mode {
+					let mut out = String::from("[");
+					for (i, p) in procs.iter().enumerate() {
+						if i > 0 {
+							out.push(',');
+						}
+						out.push_str(&p.to_json());
+					}
+					out.push(']');
+					print(mode.render(out).as_bytes());
 					print(b"\n");
+				} else {
+					for p in &procs {
+						print(p.to_text().as_bytes());
+						print(b"\n");
+					}
 				}
 			}
 			Some(Err(_)) => print(b"ps: query error\n"),
@@ -80,7 +99,7 @@ unsafe fn live_view(procsvc: u64, ressvc: u64) {
 		let inp: u64 = stdin();
 		if inp == 0 {
 			// no terminal (a background / relayed launch): render one plain list instead.
-			query_processes(procsvc);
+			query_processes(procsvc, None);
 			return;
 		}
 		// Ctrl+C must not kill us mid-alternate-screen: catch it and exit cleanly below.
