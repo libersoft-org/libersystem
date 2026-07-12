@@ -2,8 +2,8 @@
 //
 // When ring-3 code faults (a bad pointer dereference, a privileged instruction,
 // and so on) the CPU enters the matching exception handler on the per-CPU RSP0
-// stack with interrupts masked and the kernel GS base still loaded (M8's
-// no-swapgs design). The handler decides, from the saved code selector, whether
+// stack with interrupts masked and the kernel GS base still loaded (a no-swapgs
+// design). The handler decides, from the saved code selector, whether
 // the fault came from ring 3. If it did, it records the fault on the running
 // process and longjmps back into the kernel thread that dropped to ring 3,
 // reusing the same one-way return path as a clean SYS_USER_EXIT.

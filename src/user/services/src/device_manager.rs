@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use proto::system::{OpenOpts, volume};
 use rt::*;
 
-// Where the non-bootstrap driver binaries live on the system volume (M61 box 8): a
+// Where the non-bootstrap driver binaries live on the system volume: a
 // named driver is loaded from `<DRIVER_DIR><name>`.
 const DRIVER_DIR: &str = "vol://system/drivers/";
 
@@ -99,7 +99,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	exit();
 }
 
-// Phase 1 (M61 box 8): enumerate the kernel device table and spawn the bootstrap block
+// Phase 1: enumerate the kernel device table and spawn the bootstrap block
 // driver (virtio_blk) for each disk it backs, from the init package, handing it only that
 // device's MMIO capability and info. Each disk's block-read service channel is routed up
 // (system / media / iso / udf, in discovery order). The non-bootstrap drivers are skipped
@@ -147,7 +147,7 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 	}
 }
 
-// Phase 2 (M61 box 8): now that the system volume is mounted, load each non-bootstrap
+// Phase 2: now that the system volume is mounted, load each non-bootstrap
 // driver from vol://system/drivers/ through the StorageService client `storage` and spawn
 // it with its device's MMIO capability. Their control / event channels are handed back for
 // NetworkService, ConsoleService, AudioService, InputService and the USB StorageService

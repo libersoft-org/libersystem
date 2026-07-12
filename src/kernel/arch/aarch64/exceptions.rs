@@ -1,5 +1,5 @@
 // aarch64 exceptions - the EL1 vector table (VBAR_EL1) and synchronous-fault
-// decode (M116).
+// decode.
 //
 // AArch64 has one 2 kB-aligned vector table of 16 entries (128 bytes each): four
 // exception kinds (Synchronous / IRQ / FIQ / SError) for each of four sources

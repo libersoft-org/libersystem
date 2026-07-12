@@ -1,4 +1,4 @@
-// aarch64 SMP bring-up via PSCI CPU_ON (M116).
+// aarch64 SMP bring-up via PSCI CPU_ON.
 //
 // QEMU's `virt` machine implements PSCI (Power State Coordination Interface) and,
 // for the default non-secure, non-virtualized configuration, expects the call via

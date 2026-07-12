@@ -104,7 +104,7 @@ pub const SYS_CONSOLE_READLOG: u64 = 48;
 // fine-grained companion to SYS_CLOCK_GET's 100 Hz ticks. Resolves latencies far
 // below a tick - an IPC round-trip, a ping RTT - that the tick counter cannot.
 pub const SYS_CLOCK_MONO_NS: u64 = 49;
-// Arm the calling process to catch a signal (SIG_INT only in this milestone): a
+// Arm the calling process to catch a signal (SIG_INT only for now): a
 // subsequent SIG_INT then sets a pending flag the process polls with SYS_SIGNAL_TAKE
 // instead of terminating it, so a long-running tool can stop cleanly on Ctrl+C.
 pub const SYS_SIGNAL_CATCH: u64 = 50;
@@ -179,7 +179,7 @@ pub const WAIT_WRITABLE: u64 = 2;
 // Signal numbers for SYS_PROCESS_SIGNAL (POSIX-like values, but our own typed set).
 // The kernel applies the default disposition: INT / TERM / KILL terminate the target,
 // STOP suspends it, CONT resumes a suspended one. User-installed handlers are not
-// modelled (no async handler delivery in this milestone).
+// modelled (no async handler delivery yet).
 pub const SIG_INT: u64 = 2;
 pub const SIG_KILL: u64 = 9;
 pub const SIG_TERM: u64 = 15;

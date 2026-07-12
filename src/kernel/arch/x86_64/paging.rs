@@ -5,7 +5,7 @@
 // reached physically through the HHDM, and intermediate tables are allocated
 // from the frame allocator on demand.
 //
-// Scope for M1: 4 kB pages only, no huge pages, and unmapping does not reclaim
+// Scope: 4 kB pages only, no huge pages, and unmapping does not reclaim
 // now-empty intermediate tables (a deliberate, documented simplification).
 
 #![allow(dead_code)]
@@ -35,7 +35,7 @@ const ENTRY_COUNT: usize = 512;
 // alloc/free intermediate tables under it, never the reverse), so the ordering is
 // page-table -> frame and cannot deadlock. (The riscv64 backend carries the same
 // lock for the same reason; on x86 the race never triggers under KVM's speed but is
-// a real correctness bug - M118.)
+// a real correctness bug.)
 static PT_LOCK: SpinLock<()> = SpinLock::new(());
 
 // Whether the CPU supports the NX bit and EFER.NXE has been enabled. When it has

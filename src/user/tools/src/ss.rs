@@ -12,7 +12,7 @@
 
 extern crate alloc;
 
-use proto::system::{SockState, network};
+use proto::system::{network, SockState};
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -69,7 +69,7 @@ unsafe fn show(netsvc: u64) {
 			Some(Err(_)) => print(b"ss: network error\n"),
 			None => print(b"ss: service unavailable\n"),
 		}
-		// The pool utilization footer (M110): the client, socket and listener channels the
+		// The pool utilization footer: the client, socket and listener channels the
 		// service currently stands on, and its live TCP connections. Every set grows on
 		// demand, so these are live counts against the domain's handle budget, not a cap.
 		if let Some(Ok(cap)) = client.capacity() {

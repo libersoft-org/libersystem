@@ -43,7 +43,7 @@ use fat::FatFs;
 use iso9660::Iso9660;
 use liberfs::{BlockDevice, FormatOpts, FsError, LiberFs};
 use proto::codec::Buffer;
-use proto::system::{Error, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, volume};
+use proto::system::{volume, Error, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus};
 use rt::*;
 use udf::Udf;
 
@@ -75,13 +75,13 @@ const OP_FLUSH: u32 = 3;
 // LiberFS layout on the disk: the writable filesystem starts at FS_START_SECTOR - well
 // past the factory archive at LBA 0, which the boot runner re-lays every boot and the
 // filesystem never overwrites, so created files persist across reboots. The archive
-// carries the staged program binaries (M61 box 7), so the FS starts well past it. This
+// carries the staged program binaries, so the FS starts well past it. This
 // must exceed the largest architecture's factory archive: aarch64 program binaries are
 // roughly 1.8x the x86_64 ones (fixed-width instructions), so a 10 MB x86 archive is
 // ~18 MB on aarch64 - the region is sized generously past both (read_seed_archive also
 // bounds the archive to this region, so it doubles as the "no archive" sanity cap). The
 // pool SIZE is derived from the disk's real capacity at mount/format time (the capacity
-// query, M63); FS_BLOCKS is only the fallback pool for a disk that cannot report one.
+// query); FS_BLOCKS is only the fallback pool for a disk that cannot report one.
 const SECTORS_PER_BLOCK: u64 = (liberfs::BLOCK_SIZE / SECTOR_SIZE) as u64;
 const FS_START_SECTOR: u64 = 65536; // 32 MiB in, past the largest arch's factory archive
 const FS_BLOCKS: u64 = 8192;
@@ -1159,7 +1159,11 @@ unsafe fn block_request_sectors(block_client: u64) -> u32 {
 		match recv_blocking(block_client, &mut rep) {
 			Received::Message { len, handle } if len >= 16 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => {
 				let max: u32 = u32::from_le_bytes([rep[12], rep[13], rep[14], rep[15]]);
-				if max == 0 { MAX_SECTORS_FALLBACK } else { max }
+				if max == 0 {
+					MAX_SECTORS_FALLBACK
+				} else {
+					max
+				}
 			}
 			_ => MAX_SECTORS_FALLBACK,
 		}

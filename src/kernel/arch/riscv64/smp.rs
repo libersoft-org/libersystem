@@ -1,4 +1,4 @@
-// riscv64 SMP bring-up via the SBI HSM extension (M117).
+// riscv64 SMP bring-up via the SBI HSM extension.
 //
 // OpenSBI starts only the boot hart; the others reset held in an SBI-parked state.
 // `sbi_hart_start(hartid, start_addr, opaque)` (HSM extension, EID 0x48534D) releases

@@ -1,4 +1,4 @@
-// sandbox_probe - the M38 sandboxed component.
+// sandbox_probe - the sandboxed component.
 //
 // PermissionManager launches this program under its permission manifest, which grants
 // it exactly two capabilities: a StorageService client and a LogService client. The
@@ -11,7 +11,7 @@
 //
 // The probe never receives a network client (its manifest does not grant one), so it
 // cannot reach the network at all: there is no ambient authority to fall back on, only
-// the capabilities handed to it. This is the strict-sandbox property of M38 - a launched
+// the capabilities handed to it. This is the strict-sandbox property - a launched
 // component starts with only its manifest's capabilities and can reach nothing else.
 
 #![no_std]
@@ -21,7 +21,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{Entry, Field, OpenOpts, Severity, log, volume};
+use proto::system::{log, volume, Entry, Field, OpenOpts, Severity};
 use rt::*;
 
 // The one file the probe's storage grant lets it read (proving the grant is live).

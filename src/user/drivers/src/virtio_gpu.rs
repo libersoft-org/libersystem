@@ -12,7 +12,7 @@
 //
 // Host-window resizes are detected by the device's configuration-change interrupt:
 // DeviceManager hands us the device's MSI-X Interrupt capability (a per-device
-// edge-triggered vector, M46 - no INTx sharing to hijack), the config vector is
+// edge-triggered vector - no INTx sharing to hijack), the config vector is
 // routed to it, and a resize wakes the serve loop, which re-reads GET_DISPLAY_INFO,
 // rebinds the scanout, and tells ConsoleService (RESIZE) to reflow. Should the
 // interrupt be unavailable, the loop falls back to the old periodic size poll.
@@ -125,7 +125,11 @@ impl Gpu {
 			// pmodes[0].r.width @ hdr + 8, .height @ hdr + 12.
 			let w = rd32(self.resp_virt + HDR_LEN + 8);
 			let h = rd32(self.resp_virt + HDR_LEN + 12);
-			if w == 0 || h == 0 { (FALLBACK_W, FALLBACK_H) } else { (w, h) }
+			if w == 0 || h == 0 {
+				(FALLBACK_W, FALLBACK_H)
+			} else {
+				(w, h)
+			}
 		}
 	}
 
@@ -166,7 +170,7 @@ impl Gpu {
 	// its physical frames are scattered, so the entry list is built by coalescing
 	// physically contiguous runs - one mem-entry per run, not per page - which keeps
 	// even a large (4K+) framebuffer's request inside the control queue's descriptor
-	// budget (M72's contiguous DMA would collapse it to one entry). The entry list
+	// budget (contiguous DMA would collapse it to one entry). The entry list
 	// lives in `entries` (its own DMA buffer); the request is submitted as a
 	// descriptor chain - the 32-byte fixed head, then the entry pages, then the
 	// response - so a multi-page entry list need not be physically contiguous.

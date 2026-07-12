@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # qemu-riscv64.sh - boot the riscv64 kernel under `qemu-system-riscv64 -machine virt`
-# over OpenSBI (M117 bring-up).
+# over OpenSBI (bring-up).
 #
 # QEMU loads OpenSBI (the -bios firmware, M-mode) and the kernel ELF (-kernel);
 # OpenSBI's fw_dynamic jumps to the kernel entry `_start` in S-mode with a0=hartid,

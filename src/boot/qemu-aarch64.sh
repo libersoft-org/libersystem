@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boot the aarch64 kernel under QEMU's `virt` machine (M116 bring-up).
+# Boot the aarch64 kernel under QEMU's `virt` machine (bring-up).
 #
 # Used as the cargo runner for the aarch64-unknown-none target and standalone.
 # The kernel is a low-linked static ELF; QEMU `-kernel` loads it into DRAM at

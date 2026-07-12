@@ -1,7 +1,7 @@
 // Timer: a one-shot deadline against the monotonic tick counter.
 //
 // The timer is armed with an absolute deadline (in LAPIC ticks) and reports
-// is_expired() once the counter reaches it. M7 exposes it as a pollable object;
+// is_expired() once the counter reaches it. It is exposed as a pollable object;
 // a blocking wait that sleeps the caller until expiry is layered on top once the
 // scheduler can block a thread, without changing this object.
 

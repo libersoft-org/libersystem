@@ -4,7 +4,7 @@
 // capabilities - a ResourceManager client and a ProcessService client - and forwards it
 // the shell's stdout console and the argument string ("" or "-i"). Plain ps lists the
 // processes through its grant and prints each entry to the inherited stdout, then exits.
-// `ps -i` is the live view (M63): the shell hands it the console itself (full duplex),
+// `ps -i` is the live view: the shell hands it the console itself (full duplex),
 // so it flips the tty raw (ESC[?9001h), enters the alternate screen, and redraws a
 // process / resource snapshot in place about once a second - querying both grants each
 // frame - until `q` (or Ctrl+C, caught as a pending signal) quits, when it restores the

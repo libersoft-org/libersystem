@@ -3,7 +3,7 @@
 // A MemoryObject owns a set of physical frames - a chunk of RAM that can be
 // mapped into an address space. The frames are allocated at creation and freed
 // when the last reference to the object is dropped, so the object's lifetime
-// (through Arc) governs the memory's lifetime. M6 supports at most one active
+// (through Arc) governs the memory's lifetime. This supports at most one active
 // mapping per object (tracked in `mapped_at`); richer sharing arrives with IPC.
 
 #![allow(dead_code)]

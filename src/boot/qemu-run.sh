@@ -51,7 +51,7 @@ QEMU_ARGS=(
 	-serial "${SERIAL:-mon:stdio}"
 )
 
-# virtio devices for the driver milestones (M23/M24): a scratch block disk, a
+# virtio devices for the userspace drivers: a scratch block disk, a
 # user-mode NIC, and a virtio serial/console. The kernel's PCI scan discovers them
 # and userspace drivers drive them. `disable-legacy=on` forces the modern virtio
 # transport (MMIO BARs + PCI capabilities, device id 0x1040 + virtio type), which
@@ -60,7 +60,7 @@ VIRTIO_DISK="$HERE/.build/virtio-blk.img"
 VOLUME_PKG="$HERE/.build/volume.pkg"
 mkdir -p "$HERE/.build"
 # The system volume disk. It must hold the factory archive at LBA 0 (now a few megabytes
-# of staged program binaries, M61 box 7) followed by the LiberFS region, so it is sized
+# of staged program binaries) followed by the LiberFS region, so it is sized
 # well past both. A raw sparse image costs only the blocks actually written. Recreate it
 # when missing, the wrong size (e.g. after a filesystem-geometry change), or OLDER than
 # the freshly staged volume archive: overlaying the archive at LBA 0 is not enough,
@@ -73,13 +73,13 @@ if [[ ! -f "$VIRTIO_DISK" || "$(stat -c%s "$VIRTIO_DISK")" -ne "$VIRTIO_DISK_SIZ
 	rm -f "$VIRTIO_DISK"
 	truncate -s "$VIRTIO_DISK_SIZE" "$VIRTIO_DISK"
 fi
-# StorageService (M26) backs its `vol://system` volume with this block device, so
+# StorageService backs its `vol://system` volume with this block device, so
 # lay the packed volume archive down at LBA 0 on every boot (conv=notrunc keeps the
 # disk at its full size; the kernel's build.rs produces volume.pkg next to it).
 if [[ -f "$VOLUME_PKG" ]]; then
 	dd if="$VOLUME_PKG" of="$VIRTIO_DISK" bs=512 conv=notrunc status=none
 fi
-# A second virtio-blk disk holding a real exFAT volume (M48 read, M59 write): the media
+# A second virtio-blk disk holding a real exFAT volume (read and write): the media
 # StorageService instance mounts it read-write as `vol://media`. Built once with mkfs.exfat
 # (a genuine exFAT image, not a fixture) and seeded via a loopback mount; falls back to an
 # mtools FAT32 image when mkfs.exfat / loop mount is unavailable, and is skipped entirely
@@ -105,7 +105,7 @@ if [[ ! -f "$FAT_DISK" ]] && command -v mformat >/dev/null && command -v mcopy >
 	mcopy -i "$FAT_DISK" "$HERE/../volume/hello.txt" ::hello.txt
 	mcopy -i "$FAT_DISK" "$HERE/../volume/motd.txt" ::motd.txt
 fi
-# A third virtio-blk disk holding a real ISO9660 image (M58): the iso StorageService
+# A third virtio-blk disk holding a real ISO9660 image: the iso StorageService
 # instance mounts it read-only as `vol://iso`. Built once with xorriso/genisoimage so it
 # is a genuine optical image, not a fixture; skipped if neither is present (the iso volume
 # then simply does not mount). Files come from the volume/ seed dir.
@@ -117,7 +117,7 @@ if [[ ! -f "$ISO_DISK" ]]; then
 		genisoimage -quiet -J -R -o "$ISO_DISK" "$HERE/../volume" 2>/dev/null || true
 	fi
 fi
-# A fourth virtio-blk disk holding a real UDF image (M60): the udf StorageService
+# A fourth virtio-blk disk holding a real UDF image: the udf StorageService
 # instance mounts it read-only as `vol://udf`. Built once with mkfs.udf (blocksize 2048,
 # DVD-style) and populated via a loopback mount; skipped if mkfs.udf or loop mount is
 # unavailable (the udf volume then simply does not mount). Files come from volume/.
@@ -151,7 +151,7 @@ QEMU_ARGS+=(
 	-device virtio-serial-pci,disable-legacy=on
 	-device virtconsole,chardev=vcon
 	-chardev "file,id=vcon,path=$HERE/.build/virtio-console.out"
-	# xHCI USB host controller (M62): the kernel's PCI scan discovers it by class
+	# xHCI USB host controller: the kernel's PCI scan discovers it by class
 	# (0x0C/0x03/0x30) and records its MMIO BAR in the device table; the userspace
 	# xhci driver maps it and runs the USB stack. A hub hangs off port 1 with a USB
 	# keyboard and a USB tablet behind it, so enumeration always exercises the hub
@@ -165,7 +165,7 @@ QEMU_ARGS+=(
 	-device usb-tablet,bus=usb.0,port=1.2
 )
 
-# A USB mass-storage stick on the xHCI bus (M62): the xhci driver speaks SCSI over
+# A USB mass-storage stick on the xHCI bus: the xhci driver speaks SCSI over
 # the Bulk-Only Transport to it and serves the same block-channel protocol as
 # driver.virtio-blk, so a StorageService instance mounts it as vol://usb. The image
 # always exists (a bare truncate suffices - the driver's bring-up needs no
@@ -266,7 +266,7 @@ if [[ "${TEST:-0}" == "1" ]]; then
 	exit "$code"
 fi
 
-# virtio-input keyboard (M31): interactive runs only. The userspace virtio_input
+# virtio-input keyboard: interactive runs only. The userspace virtio_input
 # driver takes this device's interrupt and feeds key presses to the console shell,
 # so typing in the SPICE/VNC window drives the system. Left out of the test path to
 # keep that device set deterministic (the test boot exercises only blk/net/console).
@@ -282,14 +282,14 @@ if [[ -n "${USB_HOST:-}" ]]; then
 	QEMU_ARGS+=(-device "usb-host,bus=usb.0,vendorid=0x${USB_HOST%%:*},productid=0x${USB_HOST##*:}")
 fi
 
-# virtio-input tablet (M36): interactive runs only. An absolute pointer device the
+# virtio-input tablet: interactive runs only. An absolute pointer device the
 # same userspace virtio_input driver self-identifies and drives, delivering text-cell
 # pointer/button events to InputService. A tablet (absolute coordinates) maps cleanly
 # to screen cells; left out of the test path with the keyboard to keep that set
 # deterministic (InputService's stream is proven by a kernel test instead).
 QEMU_ARGS+=(-device virtio-tablet-pci,disable-legacy=on)
 
-# virtio-vga (M44): interactive runs only. A virtio-gpu device that also presents a
+# virtio-vga: interactive runs only. A virtio-gpu device that also presents a
 # VGA-compatible boot framebuffer, so the loader still renders the boot log while
 # driver.virtio-gpu drives the display (a 2D scanout, and a resize event when the host
 # window changes). It replaces the default std VGA (-vga none) here; the test path
@@ -297,7 +297,7 @@ QEMU_ARGS+=(-device virtio-tablet-pci,disable-legacy=on)
 # framebuffer and the deterministic 4-device set is unchanged).
 QEMU_ARGS+=(-vga none -device virtio-vga)
 
-# virtio-sound (M45): interactive runs only. A virtio-sound device the userspace
+# virtio-sound: interactive runs only. A virtio-sound device the userspace
 # driver.virtio-snd drives for PCM playback (the shell `beep` command, via
 # AudioService). Its host audio backend is the SPICE server when a SPICE display is
 # requested (so a connected SPICE client hears it), else a null sink (the guest still

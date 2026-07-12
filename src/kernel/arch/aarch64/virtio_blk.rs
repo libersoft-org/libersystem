@@ -1,4 +1,4 @@
-// aarch64 minimal virtio-blk driver (M116 bring-up).
+// aarch64 minimal virtio-blk driver (bring-up).
 //
 // Enough of the modern virtio-pci block device to read and write sectors by
 // polling. `BlkDevice::init` resets the device, negotiates VIRTIO_F_VERSION_1,

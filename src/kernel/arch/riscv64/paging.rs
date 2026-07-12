@@ -1,4 +1,4 @@
-// riscv64 paging - Sv39 translation (M117, higher half).
+// riscv64 paging - Sv39 translation (higher half).
 //
 // The boot stub (boot.rs) built one Sv39 root table and turned paging on: a low
 // identity megapage for the hand-off plus a high direct map of physical memory at

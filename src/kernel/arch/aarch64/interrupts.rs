@@ -1,4 +1,4 @@
-// aarch64 device-interrupt binding + MSI-X delivery via GICv2m (M116).
+// aarch64 device-interrupt binding + MSI-X delivery via GICv2m.
 //
 // The GIC has no per-vector "IDT" like x86: a device interrupt arrives at the core
 // as a GIC INTID read from GICC_IAR in gic::handle_irq. MSI-X on a GICv2 is done with

@@ -1,4 +1,4 @@
-// aarch64 paging - VMSAv8-64 translation (M116, higher half).
+// aarch64 paging - VMSAv8-64 translation (higher half).
 //
 // The low `.text.boot` stub (see boot.rs) builds the boot page tables and turns
 // on the MMU: TTBR0 holds a low identity map (for the hand-off), TTBR1 holds the
@@ -56,7 +56,7 @@ const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 // over the frame allocator (map/unmap alloc/free intermediate tables under it, never
 // the reverse), so the ordering is page-table -> frame and cannot deadlock. (The
 // riscv64 backend carries the same lock for the same reason; on aarch64 the race
-// never triggers under TCG's speed but is a real correctness bug - M118.)
+// never triggers under TCG's speed but is a real correctness bug.)
 static PT_LOCK: SpinLock<()> = SpinLock::new(());
 
 // Translate a virtual address to its physical address by walking the active

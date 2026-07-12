@@ -4,7 +4,7 @@
 // spinlock, so the design is SMP-correct from the start. Scheduling is
 // cooperative round-robin: a running thread calls yield_now() or returns (which
 // exits it), and the scheduler context-switches to the next ready thread on the
-// same core. Threads do not migrate between cores in this milestone, so a core
+// same core. Threads do not migrate between cores in the current design, so a core
 // only ever touches its own queue; cross-core balancing is a later refinement.
 //
 // The bootstrap/idle context of each core (the stack the kernel booted on, and
@@ -561,10 +561,10 @@ pub fn run_until_idle() {
 // emulation. Work another core enqueues onto this core's run queue (rare - wakeups
 // land on the waker's core, not here) is picked up at the next wake.
 //
-// APs deliberately do NOT touch the wait registry: in this cooperative milestone
+// APs deliberately do NOT touch the wait registry: in this cooperative model
 // blocked threads and their deadlines are driven by run_until_idle on the BSP, so
 // only the BSP wakes them. A waiter blocked on the BSP must not be stolen onto an
-// AP's run queue. True per-core timed waits arrive with preemption (M19).
+// AP's run queue. True per-core timed waits arrive with preemption.
 pub fn cpu_idle_loop() -> ! {
 	loop {
 		reschedule(Disposition::Requeue);

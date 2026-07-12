@@ -1,4 +1,4 @@
-// riscv64 higher-half boot entry (M117).
+// riscv64 higher-half boot entry.
 //
 // QEMU `-machine virt` boots OpenSBI in M-mode; OpenSBI jumps to the kernel ELF
 // entry `_start` in S-mode with the MMU off, a0 = hartid, a1 = DTB pointer. `_start`

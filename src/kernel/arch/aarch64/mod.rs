@@ -5,7 +5,7 @@
 // listed in `arch/mod.rs`) so that a cross-build for `aarch64-unknown-none`
 // links, but nothing here is implemented yet: the ARMv8-A mechanics (VMSAv8
 // page tables, the VBAR_EL1 vector table, the GIC + generic timer, PSCI SMP
-// wake, SVC syscall, TPIDR_EL1 per-CPU, PL011 UART, DTB parsing) land in M116.
+// wake, SVC syscall, TPIDR_EL1 per-CPU, PL011 UART, DTB parsing) are still to come.
 // Runtime entry points `todo!()`; a boot on this arch is not possible until then.
 
 mod boot;
@@ -27,27 +27,27 @@ pub fn halt_loop() -> ! {
 
 // install the CPU exception vectors and enable memory-protection features
 pub fn init() {
-	todo!("aarch64: VBAR_EL1 + MMU protection bits (M116)")
+	todo!("aarch64: VBAR_EL1 + MMU protection bits")
 }
 
 pub fn init_interrupts() {
-	todo!("aarch64: GIC + generic timer (M116)")
+	todo!("aarch64: GIC + generic timer")
 }
 
 pub fn init_syscalls() {
-	todo!("aarch64: SVC vector wiring (M116)")
+	todo!("aarch64: SVC vector wiring")
 }
 
 pub fn init_tsc() {
-	todo!("aarch64: generic-timer frequency (M116)")
+	todo!("aarch64: generic-timer frequency")
 }
 
 pub fn init_bsp_percpu(_mpidr: u32) {
-	todo!("aarch64: TPIDR_EL1 for the boot core (M116)")
+	todo!("aarch64: TPIDR_EL1 for the boot core")
 }
 
 pub fn init_ap(_cpu_id: usize, _mpidr: u32) {
-	todo!("aarch64: secondary-core bring-up (M116)")
+	todo!("aarch64: secondary-core bring-up")
 }
 
 // enable maskable interrupts on the current core (clear DAIF.I)
@@ -177,19 +177,19 @@ pub mod apic {
 		super::gic::send_sgi(dest, 0);
 	}
 	pub fn send_init(_dest: u32) {
-		todo!("aarch64 PSCI wake (M116)")
+		todo!("aarch64 PSCI wake")
 	}
 	pub fn send_startup(_dest: u32, _vector: u8) {
-		todo!("aarch64 PSCI wake (M116)")
+		todo!("aarch64 PSCI wake")
 	}
 	pub fn ticks() -> u64 {
 		super::gic::ticks()
 	}
 	pub fn init() {
-		todo!("aarch64 GIC + timer (M116)")
+		todo!("aarch64 GIC + timer")
 	}
 	pub fn init_ap() {
-		todo!("aarch64 GIC per-core (M116)")
+		todo!("aarch64 GIC per-core")
 	}
 }
 
@@ -222,13 +222,13 @@ pub mod tsc {
 // ------------------------------------------------------------------ ioapic
 pub mod ioapic {
 	pub fn route(_gsi: u32, _vector: u8, _dest: u32) {
-		todo!("aarch64 GIC routing (M116)")
+		todo!("aarch64 GIC routing")
 	}
 	pub fn init() {
-		todo!("aarch64 GIC distributor (M116)")
+		todo!("aarch64 GIC distributor")
 	}
 	pub fn mask(_gsi: u32) {
-		todo!("aarch64 GIC mask (M116)")
+		todo!("aarch64 GIC mask")
 	}
 }
 
@@ -267,23 +267,23 @@ pub mod random {
 
 // ------------------------------------------------------------------ apboot
 // (aarch64 wakes secondaries via PSCI CPU_ON, not a real-mode trampoline; these
-// keep the portable names so smp.rs links until M116 replaces the wake path.)
+// keep the portable names so smp.rs links until the real wake path replaces them.)
 pub mod apboot {
 	pub fn trampoline_len() -> usize {
 		0
 	}
 	pub unsafe fn install(_dst: *mut u8, _ttbr: u64, _entry: u64) {
-		todo!("aarch64 PSCI wake (M116)")
+		todo!("aarch64 PSCI wake")
 	}
 	pub unsafe fn set_stack(_dst: *mut u8, _stack_top: u64) {
-		todo!("aarch64 PSCI wake (M116)")
+		todo!("aarch64 PSCI wake")
 	}
 }
 
 // ----------------------------------------------------------------- syscall
 pub mod syscall {
 	pub fn init() {
-		todo!("aarch64 SVC wiring (M116)")
+		todo!("aarch64 SVC wiring")
 	}
 	pub unsafe fn invoke(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 		// A ring-0 (kernel-context) system call: route straight to the portable syscall

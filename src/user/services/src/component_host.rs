@@ -1,6 +1,6 @@
 // component_host - the WASI component host.
 //
-// This is the M41 evolution of wasi_host: a host that runs a *real* WebAssembly
+// This is the evolution of wasi_host: a host that runs a *real* WebAssembly
 // component - one built by the Rust SDK (src/sdk) and emitted by the ordinary
 // toolchain, not hand-encoded - and wires the component's imports onto typed system
 // services with no ambient authority.
@@ -31,7 +31,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{Entry, Field, OpenOpts, Severity, log, volume};
+use proto::system::{log, volume, Entry, Field, OpenOpts, Severity};
 use rt::*;
 use wasm::{Host, Instance, Module, Trap, Value};
 

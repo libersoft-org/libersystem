@@ -26,7 +26,7 @@
 // job control (so the shell reaches the OS tools only through the manager, never the raw
 // kernel loader).
 //
-// This milestone it governs four components. Two are report-back probes that prove the grant
+// Currently it governs four components. Two are report-back probes that prove the grant
 // paths: sandbox_probe, whose manifest grants storage and log but not network, reads its one
 // granted file and reports the bytes back; and request_probe, whose manifest grants only log,
 // asks for an undeclared capability (storage) at runtime, which the headless policy refuses
@@ -49,7 +49,7 @@ use proto::system::permission::{self, Service};
 use proto::system::{AuditEntry, Capability, Error, Manifest, StartResult, process};
 use rt::*;
 
-// The governed component this milestone launches, and the rights a granted client is
+// The governed component the manager launches, and the rights a granted client is
 // duplicated with before it is transferred (send + receive + wait + transfer onward - the
 // set a service client needs, never more than the manager itself holds).
 const PROBE_NAME: &[u8] = b"sandbox_probe";
@@ -114,7 +114,7 @@ fn granted(component: &str, caps: Vec<Capability>) -> Manifest {
 // A store row where the component requests more than the policy allows: the
 // grants are the audited intersection, and the withheld remainder surfaces as a
 // denial in the launch audit. This is the requested-vs-granted split the packaged
-// (M42) form ships: the package declares `requested`, the manager decides.
+// form ships: the package declares `requested`, the manager decides.
 fn intersected(component: &str, requested: Vec<Capability>, allowed: &[Capability]) -> Manifest {
 	let grants: Vec<Capability> = requested.iter().copied().filter(|cap: &Capability| allowed.contains(cap)).collect();
 	Manifest { component: String::from(component), requested, grants }

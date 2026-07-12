@@ -2,7 +2,7 @@
 //
 // After bringing the device up it proves the block data path over the virtqueue by
 // reading sector 0 and checking it holds a `PKGARCH1` volume archive (laid down on
-// the disk at boot), then reports in. StorageService (M26) reads its `vol://system`
+// the disk at boot), then reports in. StorageService reads its `vol://system`
 // volume from this device over the block-read channel the driver serves.
 
 #![no_std]
@@ -63,7 +63,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			for i in 0..4u64 {
 				v |= (device.config_read(8 + i) as u32) << (i * 8);
 			}
-			if v == 0 { u64::MAX } else { v as u64 }
+			if v == 0 {
+				u64::MAX
+			} else {
+				v as u64
+			}
 		} else {
 			u64::MAX
 		};

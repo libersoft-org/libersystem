@@ -472,7 +472,7 @@ fn sys_dma_buffer_phys(handle: u64, offset: u64) -> i64 {
 // into the caller's buffer, returning the mapped virtual base; the kernel console
 // then stops drawing (the display belongs to the caller). Once-only: a second call
 // (after the display is handed out) returns ERR_INVALID. Intended for a single
-// userspace ConsoleService; capability-gating it is a later (M38) hardening.
+// userspace ConsoleService; capability-gating it is a later hardening.
 fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64) -> i64 {
 	let size = core::mem::size_of::<abi::Framebuffer>() as u64;
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
@@ -977,7 +977,7 @@ fn sys_thread_start(thread_handle: u64) -> i64 {
 // it) rather than waiting on whatever it was blocked on. INT is catchable: a process
 // that armed itself with SYS_SIGNAL_CATCH gets a pending flag set (and its threads
 // woken so a blocked poll loop notices) instead of being terminated, so it can stop
-// cleanly. There are no other user-installed handlers in this milestone - only the
+// cleanly. There are no other user-installed handlers yet - only the
 // default dispositions.
 fn sys_process_signal(process_handle: u64, signal: u64) -> i64 {
 	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
@@ -1012,7 +1012,7 @@ fn sys_process_signal(process_handle: u64, signal: u64) -> i64 {
 	0
 }
 
-// Arm the calling process to catch `signal` (SIG_INT only in this milestone): a
+// Arm the calling process to catch `signal` (SIG_INT only for now): a
 // later delivery of it sets a pending flag instead of terminating the process. A
 // self-service disposition - a process arms only itself - so it needs no capability.
 fn sys_signal_catch(signal: u64) -> i64 {

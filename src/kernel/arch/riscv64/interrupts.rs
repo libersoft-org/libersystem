@@ -1,4 +1,4 @@
-// riscv64 device-interrupt binding + MSI-X delivery via the AIA IMSIC (M117).
+// riscv64 device-interrupt binding + MSI-X delivery via the AIA IMSIC.
 //
 // With QEMU's `virt,aia=aplic-imsic`, PCIe devices deliver MSI-X instead of wired INTx:
 // a device signals by DMA-writing an interrupt identity (EID) to a hart's IMSIC S-mode

@@ -38,7 +38,7 @@
 //   rtc:        read_unix           random: fill
 //
 // x86_64 is the reference implementation; aarch64 / riscv64 are compiling stubs
-// (M115) that M116 / M117 fill in.
+// still to be filled in.
 
 // Architecture-independent HAL helpers shared by every backend (compiled for all
 // targets): the portable PCI enumeration each arch's `pci` shim builds on.

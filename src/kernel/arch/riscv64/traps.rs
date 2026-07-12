@@ -1,4 +1,4 @@
-// riscv64 traps - the S-mode trap vector (STVEC) and fault decode (M117).
+// riscv64 traps - the S-mode trap vector (STVEC) and fault decode.
 //
 // RISC-V has ONE trap entry (STVEC, direct mode): every exception and delegated
 // interrupt enters `__trap_entry` in S-mode with the cause in SCAUSE, the faulting

@@ -522,7 +522,7 @@ unsafe fn show_size(control: u64) {
 }
 
 // `resize <cols> <rows>`: ask ConsoleService to resize the terminal (the local stand-in
-// for a display mode-set until virtio-gpu drives it, M44), then report the new size from
+// for a display mode-set until virtio-gpu drives it), then report the new size from
 // the RESIZE event it sends back.
 unsafe fn resize_console(control: u64, args: &[u8]) {
 	unsafe {
@@ -1174,7 +1174,7 @@ unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8]
 // PermissionManager could not start it, so the caller can fall back to an inline path. This
 // is the governed-launch primitive: the shell reaches the OS commands only through
 // PermissionManager (the launcher / granter), never the raw process loader, so each command
-// runs with exactly its manifest's capabilities. Foreground only this milestone (no
+// runs with exactly its manifest's capabilities. Foreground only for now (no
 // background / job control).
 unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8]) -> bool {
 	unsafe {
@@ -1348,7 +1348,7 @@ enum GraphFmt {
 // state, dependency edges, and live counters) and the trace spans, each via the
 // generated to_text / to_json / to_cbor on the client side - the one typed API, many
 // representations rule. A 0 handle means the service is not wired (e.g. a non-primary
-// VT this milestone), reported as unavailable rather than blocking.
+// VT for now), reported as unavailable rather than blocking.
 unsafe fn query_graph(graphsvc: u64, fmt: GraphFmt) {
 	unsafe {
 		if graphsvc == 0 {

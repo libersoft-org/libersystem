@@ -1,4 +1,4 @@
-// resource_probe - the M39 governed component.
+// resource_probe - the governed component.
 //
 // ResourceManager launches this program into a bounded sub-Domain it controls, sets a
 // memory budget on that Domain, then drives the probe to demonstrate that the kernel

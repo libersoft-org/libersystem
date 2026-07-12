@@ -21,11 +21,11 @@ extern crate alloc;
 
 use alloc::string::String;
 use proto::system::picker::{self, Service};
-use proto::system::{Error, OpenOpts, Picked, volume};
+use proto::system::{volume, Error, OpenOpts, Picked};
 use rt::*;
 
 // The file the picker grants. Phase 1 stands in for the user's choice with a fixed
-// file (deliberately a different file than the wasi_host's M28 default, to show the
+// file (deliberately a different file than the wasi_host's default, to show the
 // granted file comes from the pick, not from the caller).
 const PICKED_PATH: &[u8] = b"vol://system/motd.txt";
 const PICKED_NAME: &[u8] = b"motd.txt";

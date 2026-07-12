@@ -2,7 +2,7 @@
 //! behind the same [`BlockDevice`] trait FAT, ISO9660 and LiberFS use. It sits behind
 //! `Storage.Volume` as just another FS backend: per the layering principle several
 //! filesystems mount behind one volume API, and UDF is the format DVDs and Blu-ray
-//! discs use, so M58 (ISO9660) covers CDs and this completes optical-media interop.
+//! discs use, so ISO9660 covers CDs and this completes optical-media interop.
 //!
 //! Read-only by design - no allocation or write path. Mounting reads the Anchor Volume
 //! Descriptor Pointer at LBA 256, scans the Main Volume Descriptor Sequence for the

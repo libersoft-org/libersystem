@@ -1,4 +1,4 @@
-// aarch64 higher-half boot entry (M116).
+// aarch64 higher-half boot entry.
 //
 // QEMU `-machine virt -kernel <elf>` enters the ELF entry `_start` at its physical
 // address with the MMU off, at EL1, x0 = DTB. `_start` lives in the low, identity-

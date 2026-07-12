@@ -63,7 +63,7 @@ impl Echo<'_> {
 // The tty line discipline for one VT: in cooked mode it line-edits + echoes keystrokes
 // (a movable cursor, mid-line insert/delete, command history, the editing control keys)
 // on the program's behalf and delivers a complete line on Enter; in raw mode keystrokes
-// pass straight through. This is the M35 line editor moved out of the shell into the
+// pass straight through. This is the line editor moved out of the shell into the
 // terminal, so every program reading this console gets the editor for free.
 pub struct Ld {
 	pub line: [u8; LD_LINE_MAX],

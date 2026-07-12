@@ -9,7 +9,7 @@ use super::*;
 
 // Userspace (ring 3) page layout for the test: one USER page for the program,
 // one for its stack, mapped into the low half of the shared address space
-// (per-process page tables / CR3 isolation are a later milestone).
+// (per-process page tables / CR3 isolation are a later refinement).
 use crate::memlayout::{USER_CODE_VA, USER_STACK_VA};
 
 // Kernel-thread body that runs a ring-3 program. It maps a USER code and stack
@@ -51,7 +51,7 @@ fn volume_file(volume: &[u8], name: &[u8]) -> Result<alloc::vec::Vec<u8>, &'stat
 
 // Resolve a program's ELF for a test. The pinned bootstrap programs live in the init
 // package; every other service, manager and demo component is staged on the system volume
-// under `bin/` (M61 box 8), so fall back to the volume there. The returned slice borrows
+// under `bin/`, so fall back to the volume there. The returned slice borrows
 // the 'static module data, so it outlives the temporary volume Package.
 fn program_elf(package: &pkg::Package<'static>, volume: &'static [u8], name: &[u8]) -> Option<&'static [u8]> {
 	if let Some(elf) = package.lookup(name) {
@@ -97,7 +97,7 @@ fn send_package(channel: &object::channel::Channel, archive: &[u8]) -> Result<()
 	send_cap(channel, &msg, object, Rights::READ | Rights::MAP | Rights::TRANSFER)
 }
 
-// Build the M16 storage topology and run it to completion. A MemoryObject holds
+// Build the storage topology and run it to completion. A MemoryObject holds
 // the ramdisk volume; the StorageService process maps it and serves files over a
 // service channel; a client process opens vol://system/hello.txt through the
 // service, receives a shared-buffer capability to the file's bytes, maps it, and
@@ -138,7 +138,7 @@ fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), 
 	Ok((expected, result.bytes))
 }
 
-// Build the M28 WASI topology and run it to completion. A StorageService serves the
+// Build the WASI topology and run it to completion. A StorageService serves the
 // ramdisk volume; the wasi_host process loads the embedded Wasm component and runs
 // it, and the component's only import (`liber.read`) is wired by the host to read
 // the granted file vol://system/hello.txt through StorageService into the
@@ -174,7 +174,7 @@ fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'s
 	Ok((expected, result.bytes))
 }
 
-// Build the M29 powerbox topology and run it to completion. A StorageService serves
+// Build the powerbox topology and run it to completion. A StorageService serves
 // the ramdisk volume; a file_picker holds the trusted storage client and serves the
 // Picker contract; the wasi_host is given ONLY a picker client - no filesystem
 // access of its own - and runs the same Wasm component. The component's read import
@@ -220,7 +220,7 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 	Ok((expected, result.bytes))
 }
 
-// Build the M38 permission topology and run it to completion. A StorageService serves
+// Build the permission topology and run it to completion. A StorageService serves
 // the ramdisk volume; a ProcessService is the loading mechanism; a TimeService serves the
 // wall clock; the permission_manager (PermissionManager) is given the clients it may grant
 // onward - a duplicable StorageService client, a duplicable (but dead-peer) LogService
@@ -331,7 +331,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 
 	// ProcessService: the init package (the bring-up fallback) and its service channel,
 	// plus a StorageService client so it loads the components PermissionManager governs
-	// from the system volume's bin/ (M61 box 8) - the loading mechanism, kept separate
+	// from the system volume's bin/ - the loading mechanism, kept separate
 	// from the granting policy. The client is a duplicate of the manager's storage
 	// connection; the cooperative schedule serializes the reads, so sharing it is safe.
 	send_package(&process_boot_kernel, init)?;
@@ -389,7 +389,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	Ok((expected, probe_read.bytes, probe_summary.bytes, date_read.bytes, date_summary.bytes, request_read.bytes, request_summary.bytes, cat_read.bytes))
 }
 
-// Build the M41 component topology and run it to completion. A StorageService serves
+// Build the component topology and run it to completion. A StorageService serves
 // the ramdisk volume and a LogService holds the journal; the component_host is given
 // exactly two capabilities - a StorageService client and a LogService client - and
 // nothing else. It loads a real Wasm component (built by the Rust SDK, served from
@@ -444,7 +444,7 @@ fn run_component_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>,
 	Ok((expected, content, logged, score))
 }
 
-// Build the M39 resource topology and run it to completion. The resource_manager
+// Build the resource topology and run it to completion. The resource_manager
 // (ResourceManager) is given the init package (to launch the component it governs from) and
 // the channel its clients reach it on - nothing more, since it governs through the kernel's
 // resource syscalls, not by brokering service connections. ResourceManager creates a
@@ -864,7 +864,7 @@ fn concurrent_maps_on_shared_tables_strand_nothing() {
 	use mem::frame;
 	use object::address_space::AddressSpace;
 
-	// The M118 PT_LOCK stress test: two cores hammer map/unmap on virtual addresses
+	// The PT_LOCK stress test: two cores hammer map/unmap on virtual addresses
 	// that share an intermediate page-table level, recreating the geometry of the
 	// historical riscv64 race - two CPUs both observe a missing leaf table, both
 	// allocate one, one write wins, and the loser's leaf lands in an orphaned table
@@ -1491,7 +1491,7 @@ fn syscall_object_and_handle_ops() {
 			let ptr = virt as *mut u64;
 			ptr.write_volatile(0xfeed_face);
 			assert_eq!(ptr.read_volatile(), 0xfeed_face);
-			// mapping the same object twice is rejected (one mapping in M6)
+			// mapping the same object twice is rejected (only one active mapping)
 			let again = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, handle, 0, 0, 0);
 			assert_eq!(again as i64, syscall::ERR_INVALID);
 			// handle op: duplicate with attenuated rights (READ only)
@@ -2993,7 +2993,7 @@ fn process_service_loads_a_program_from_system_bin() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 
-	// M61 box 2: ProcessService loads a named program's ELF from the system volume's
+	// ProcessService loads a named program's ELF from the system volume's
 	// `bin/` through a StorageService client, not the init package. Stand up a
 	// StorageService over the factory volume archive (which stages the tools under
 	// `bin/`) and a ProcessService wired to its client, then START a staged tool by name:
@@ -3136,7 +3136,7 @@ fn config_set_survives_a_service_reboot() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 
-	// M119 persistence: a `config set` survives the service's whole lifetime ending.
+	// Persistence: a `config set` survives the service's whole lifetime ending.
 	// ConfigService write-throughs its tree to `vol://system/config.tree`, so a NEW
 	// instance over the SAME volume loads it back - the reboot property (and what
 	// makes the transparent ConfigService restart stateless). Stand up a
@@ -3543,7 +3543,7 @@ fn run_inventory_tool(name: &[u8]) -> alloc::vec::Vec<u8> {
 
 #[test_case]
 fn inventory_tools_print_the_system_identity() {
-	// The zero-capability inventory commands (M63): each runs as its own sandboxed
+	// The zero-capability inventory commands: each runs as its own sandboxed
 	// ELF and prints compile-time / free-syscall data - no service client, the
 	// emptiest manifests in the permission store. uname prints the product identity
 	// and architecture, uptime the time since boot, and dmesg the kernel boot log
@@ -3568,7 +3568,7 @@ fn inventory_tools_print_the_system_identity() {
 
 #[test_case]
 fn inventory_tools_report_the_hardware() {
-	// The hardware-inventory commands (M63): each runs as its own sandboxed ELF over
+	// The hardware-inventory commands: each runs as its own sandboxed ELF over
 	// a free syscall reading state the kernel now retains past boot - the CPU set
 	// (lscpu), the frame-pool and heap totals (free), the boot memory map (lsmem),
 	// and the device-interrupt vector table (lsirq).
@@ -3583,7 +3583,7 @@ fn inventory_tools_report_the_hardware() {
 		b"arch: x86_64"
 	};
 	assert!(contains(&lscpu, arch_line) && contains(&lscpu, b"cpu0: lapic "), "lscpu should print the architecture and each core's LAPIC id");
-	// The CPU model line (M119): x86 reports the CPUID brand string, aarch64 the MIDR
+	// The CPU model line: x86 reports the CPUID brand string, aarch64 the MIDR
 	// decode (cortex-a72 -> "ARM Cortex-A72"), riscv64 the SBI vendor id ("riscv64").
 	assert!(contains(&lscpu, b"name: "), "lscpu should print the CPU model name");
 
@@ -3624,7 +3624,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 
-	// M65: a fresh system volume spans the whole disk - StorageService asks the block
+	// A fresh system volume spans the whole disk - StorageService asks the block
 	// device for its capacity (the block protocol's op 2) and derives the pool from
 	// it, instead of formatting a fixed 32 MB. Here we stand in for the block driver
 	// with a sparse in-memory disk (a sector map; unwritten sectors read back as
@@ -3666,7 +3666,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
 	assert_eq!(num_blocks, expected_pool, "the pool should span everything past the archive region, derived from the reported capacity");
 
-	// M75: the typed volume health/policy ops over the serve channel. Send a generated
+	// The typed volume health/policy ops over the serve channel. Send a generated
 	// request ([op u16][corr u32][args]) and pump block traffic until the reply lands.
 	let mut request = |body: &[u8]| -> alloc::vec::Vec<u8> {
 		_serve_client.send(Message::new(body.to_vec(), alloc::vec::Vec::new(), 0)).expect("the typed request should send");
@@ -3836,7 +3836,7 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	use object::channel::Channel;
 	use object::rights::Rights;
 
-	// M79: the disk's content must never deny storage. A GPT names a LiberFS
+	// The disk's content must never deny storage. A GPT names a LiberFS
 	// partition too small to format (8 sectors - below even the superblock slots):
 	// the probe must SKIP it and fall back to the fixed factory layout instead of
 	// failing the format and exiting.
@@ -3891,7 +3891,7 @@ fn a_lying_seed_archive_cannot_kill_the_storage_service() {
 	use object::channel::Channel;
 	use object::rights::Rights;
 
-	// M83: the boot-time seeding path runs exactly on a disk WITHOUT a valid
+	// The boot-time seeding path runs exactly on a disk WITHOUT a valid
 	// filesystem - the least trustworthy disk there is. A PKGARCH1 header whose
 	// entry count claims a ~137 GB table used to size the read buffer straight off
 	// the disk's word; the claim must be bounded by the seed region and treated as
@@ -3938,7 +3938,7 @@ fn ps_live_view_drives_the_terminal_contract() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 
-	// `ps -i` (M63): the live process/resource view runs full-screen on its controlling
+	// `ps -i`: the live process/resource view runs full-screen on its controlling
 	// terminal - it must enter the alternate screen, hide the cursor and flip the tty
 	// raw (the ESC[?1049h / ?25l / ?9001h private modes ConsoleService's terminal
 	// honours), redraw a snapshot in place, quit on a raw `q` keystroke, and restore
@@ -4454,7 +4454,7 @@ fn kernel_reads_file_through_storage_service() {
 
 #[test_case]
 fn storage_serves_staged_tool_binary() {
-	// M61 box 7: the tool ELFs are staged onto the system volume under bin/ by the
+	// The tool ELFs are staged onto the system volume under bin/ by the
 	// factory-seed pipeline (build.rs strips them into the volume archive, the boot runner
 	// lays that archive at LBA 0, and StorageService seeds it into the freshly-formatted
 	// LiberFS). Reading one back through StorageService must return a valid ELF image -

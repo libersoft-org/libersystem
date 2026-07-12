@@ -9,11 +9,11 @@ passes the kernel. Everything here is a fixed, versioned layout; both the writer
 storage runtime, the loader) decode it through one shared implementation
 (`abi::Package`, `bootproto`), so the format and its parser never drift apart.
 
-The platform is UEFI-only and boots through its own loader (`src/loader`); the
-older Limine bootloader was retired in M114. On x86 the loader is a native
-`x86_64-unknown-uefi` PE; on aarch64 / riscv64 it is an ELF static-PIE with a
-hand-written PE header (the Linux EFI-stub technique). All three read the same
-files off a FAT boot filesystem and hand the kernel the same `BootInfo`.
+The platform is UEFI-only and boots through its own loader (`src/loader`). On x86
+the loader is a native `x86_64-unknown-uefi` PE; on aarch64 / riscv64 it is an ELF
+static-PIE with a hand-written PE header (the Linux EFI-stub technique). All three
+read the same files off a FAT boot filesystem and hand the kernel the same
+`BootInfo`.
 
 ## 1. The program ELF contract
 
@@ -84,7 +84,7 @@ The kernel's `build.rs` assembles two `PKGARCH1` archives from the shared servic
 manifest (`src/user/services/manifest.txt`), keyed by each program's manifest
 name:
 
-- **`init.pkg`** - the pinned bootstrap set (M61): the services on the path to
+- **`init.pkg`** - the pinned bootstrap set: the services on the path to
   mounting the system volume (LogService, DeviceManager, StorageService and its
   media/iso/udf/usb instances' binary, ProcessService) plus the bootstrap
   `virtio_blk` driver, and `SystemManager` / `ServiceManager` themselves. These

@@ -1,4 +1,4 @@
-// RISC-V AIA IMSIC (Incoming MSI Controller) - per-hart MSI target (M117).
+// RISC-V AIA IMSIC (Incoming MSI Controller) - per-hart MSI target.
 //
 // With QEMU's `virt,aia=aplic-imsic`, PCIe devices deliver MSI-X messages instead of
 // wired INTx: a device signals by DMA-writing its interrupt identity (EID) to the target

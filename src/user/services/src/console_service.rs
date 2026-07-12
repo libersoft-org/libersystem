@@ -10,7 +10,7 @@
 // terminal logic - the cell grid, the escape parser, the colours, the cursor - lives
 // in userspace; the kernel keeps only the boot log and the serial mirror path.
 //
-// This is the M35c extraction of the M15/M35 kernel framebuffer console.
+// This is the extraction of the kernel framebuffer console into userspace.
 
 #![no_std]
 #![no_main]

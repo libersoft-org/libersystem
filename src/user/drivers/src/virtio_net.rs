@@ -2,8 +2,8 @@
 //
 // It brings the NIC up and drives both virtqueues: the receive queue (0) is
 // interrupt-driven (DeviceManager hands it the device's Interrupt, like the
-// virtio-input driver), and the transmit queue (1) is polled synchronously. Since
-// M33 the driver carries no network stack - it is a pure frame-mover. Over a single
+// virtio-input driver), and the transmit queue (1) is polled synchronously. The
+// driver carries no network stack - it is a pure frame-mover. Over a single
 // channel to NetworkService it forwards every frame the device receives and
 // transmits every frame the service hands back, standing on its IRQ and that
 // channel at once with `wait_any`. The L2/L3 protocol lives in NetworkService.

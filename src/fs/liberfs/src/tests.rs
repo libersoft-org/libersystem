@@ -161,7 +161,7 @@ fn many_small_files_fill_the_directory() {
 	}
 }
 
-// M49: nested directories and capacity scaling.
+// Nested directories and capacity scaling.
 
 // A sparse RAM device backed by a map: only written blocks cost memory, so a huge
 // volume can be formatted in a test without allocating it whole.
@@ -307,7 +307,7 @@ fn a_large_volume_formats_and_round_trips() {
 	assert_eq!(fs.read_file(b"f").unwrap(), b"on a big volume");
 }
 
-// M50: offset / partial reads and writes.
+// Offset / partial reads and writes.
 
 #[test]
 fn write_at_in_the_middle_keeps_the_rest() {
@@ -398,7 +398,7 @@ fn truncate_frees_blocks_for_reuse() {
 	assert_eq!(fs.stat(b"scratch").unwrap().size, 0);
 }
 
-// M50: timestamps and stat.
+// Timestamps and stat.
 
 #[test]
 fn stat_reports_type_size_and_timestamps() {
@@ -421,7 +421,7 @@ fn stat_reports_type_size_and_timestamps() {
 	assert_eq!(fs.stat(b"missing"), Err(FsError::NotFound));
 }
 
-// M50: rename / move within the volume.
+// Rename / move within the volume.
 
 #[test]
 fn rename_moves_a_file() {
@@ -473,7 +473,7 @@ fn rename_rejects_overwriting_a_nonempty_directory() {
 	assert_eq!(fs.rename(b"src", b"dst"), Err(FsError::NotEmpty));
 }
 
-// M51: block checksums (integrity).
+// Block checksums (integrity).
 
 // Flip the first byte of the given needle where it sits on disk, modelling bit rot.
 fn corrupt_bytes(dev: &mut MemDevice, needle: &[u8]) {
@@ -549,7 +549,7 @@ fn a_clean_file_survives_a_remount_with_checksums() {
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
 }
 
-// M52: copy-on-write atomicity and snapshots.
+// Copy-on-write atomicity and snapshots.
 
 // The superblock slot (block 0 or 1) holding the newer generation - the root a clean
 // mount would pick. The generation is the little-endian u64 at byte 28 of the slot.
@@ -558,7 +558,11 @@ fn newest_super_slot(dev: &MemDevice) -> u32 {
 		let off = slot as usize * BLOCK_SIZE + 28;
 		u64::from_le_bytes(dev.blocks[off..off + 8].try_into().unwrap())
 	};
-	if generation(1) > generation(0) { 1 } else { 0 }
+	if generation(1) > generation(0) {
+		1
+	} else {
+		0
+	}
 }
 
 #[test]
@@ -608,7 +612,7 @@ fn a_freshly_formatted_volume_has_no_snapshot() {
 	assert!(LiberFs::mount_snapshot(dev).is_none());
 }
 
-// M53: 64-bit addressing, large files and long names.
+// 64-bit addressing, large files and long names.
 
 #[test]
 fn a_long_name_round_trips() {
@@ -639,7 +643,7 @@ fn rejects_unportable_name_characters() {
 	assert_eq!(fs.read_file(ok).unwrap(), b"ok");
 }
 
-// M54: extents and sparse files.
+// Extents and sparse files.
 
 #[test]
 fn large_contiguous_file_uses_few_extents() {
@@ -685,7 +689,7 @@ fn sparse_file_occupies_only_written_blocks() {
 	assert_eq!(fs.read_at(b"sparse", BLOCK_SIZE as u64, 4).unwrap(), vec![0u8; 4]);
 }
 
-// M55: B+tree directories and dynamic inode allocation.
+// B+tree directories and dynamic inode allocation.
 
 #[test]
 fn a_directory_scales_to_thousands_of_entries() {
@@ -758,7 +762,7 @@ fn inodes_are_allocated_dynamically_without_a_fixed_cap() {
 	assert_eq!(fs.read_file(b"f0").unwrap(), b"x");
 }
 
-// M56: named, pinned snapshots.
+// Named, pinned snapshots.
 
 #[test]
 fn a_named_snapshot_reads_an_earlier_state() {
@@ -916,7 +920,7 @@ fn snapshot_name_rules_are_enforced() {
 	assert!(fs.list_snapshots().unwrap().is_empty());
 }
 
-// M57: transparent per-extent compression.
+// Transparent per-extent compression.
 
 // Format with compression enabled: the compression tests opt in (the default is off).
 fn format_lz(dev: MemDevice, num_blocks: u64) -> LiberFs<MemDevice> {
@@ -941,7 +945,7 @@ fn a_compressible_file_shrinks_and_round_trips() {
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
 }
 
-// M111 box 4: the decompression cache is a small LRU, not a single slot, so a read
+// The decompression cache is a small LRU, not a single slot, so a read
 // pattern that alternates between a few compressed runs decodes each once instead of
 // re-reading its stored blocks on every switch (a single slot thrashed the moment a
 // second run touched it). Measured with a device that counts its reads: after both runs
@@ -1173,7 +1177,7 @@ fn snapshots_scale_past_a_single_table_block() {
 	assert_eq!(LiberFs::mount_named_snapshot(dev, b"snap59").unwrap().read_file(b"f").unwrap(), b"snap59");
 }
 
-// M73: correctness hardening (flush barriers, read-only mounts, corruption honesty).
+// Correctness hardening (flush barriers, read-only mounts, corruption honesty).
 
 // What a device saw, in order: a block write or a flush barrier. The flush-ordering
 // test asserts the commit protocol from this log.
@@ -1327,7 +1331,7 @@ fn compression_never_launders_a_corrupt_source_block() {
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 1);
 }
 
-// M74: the incremental free map and the next-fit allocator.
+// The incremental free map and the next-fit allocator.
 
 // After every committed mutation, the incrementally maintained free map must equal
 // what the full volume walk would derive - the invariant the whole incremental
@@ -1432,9 +1436,9 @@ fn a_whole_file_write_lands_contiguously() {
 	assert_eq!(fs.read_file(b"big").unwrap(), big);
 }
 
-// M74: the scaling benchmark. Ignored in the normal run (it takes seconds); run with
+// The scaling benchmark. Ignored in the normal run (it takes seconds); run with
 // `cargo test --release bench_scaling -- --ignored --nocapture` and record the
-// numbers in docs/PERF.md. Three costs the milestone attacks: a large write (the
+// numbers in docs/PERF.md. Three costs the benchmark attacks: a large write (the
 // allocator and checksum batching), a sequential re-read (the checksum read cache),
 // and a many-file tree (the per-commit free-map rederivation). Device reads/writes
 // are counted too: on a RAM-backed test device the I/O counts, not the wall time,
@@ -1498,7 +1502,7 @@ fn bench_scaling() {
 	println!("bench: 2000 stats: {:?} ({} reads, {} writes)", t.elapsed(), fs.device().reads - r0, fs.device().writes - w0);
 }
 
-// M76: the audit's test-coverage gaps.
+// The audit's test-coverage gaps.
 
 // Records sharing a 64-bit name hash: the leaf machinery must disambiguate lookups by
 // the name bytes and never let a split straddle an equal-hash group (internal nodes
@@ -1600,7 +1604,7 @@ fn a_write_across_a_compressed_extent_boundary_thaws_both_runs() {
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 0);
 }
 
-// M77: fsck must verify the disk, not the caches.
+// fsck must verify the disk, not the caches.
 
 // A MemDevice that corrupts reads of one (externally switchable) block: the shared
 // cell lets the test flip corruption on while the filesystem stays mounted, with its
@@ -1798,7 +1802,11 @@ fn forge_superblock(dev: &mut MemDevice, slot: usize, f: impl FnOnce(&mut [u8]))
 // The slot holding the live (higher) generation in a raw device image.
 fn active_slot(dev: &MemDevice) -> usize {
 	let slot_gen = |s: usize| parse_superblock(&dev.blocks[s * BLOCK_SIZE..(s + 1) * BLOCK_SIZE]).map(|sb| sb.generation);
-	if slot_gen(1) > slot_gen(0) { 1 } else { 0 }
+	if slot_gen(1) > slot_gen(0) {
+		1
+	} else {
+		0
+	}
 }
 
 #[test]
@@ -2041,7 +2049,7 @@ fn a_broken_spill_chain_degrades_the_mount_not_the_volume() {
 	fs.write_file(b"keep.txt", b"other data").unwrap();
 	let mut dev = fs.into_device();
 	// flip one raw byte in the fragmented file's spill chain block: before this
-	// milestone the failed generation walk FAILED THE MOUNT, and an unmountable
+	// fix the failed generation walk FAILED THE MOUNT, and an unmountable
 	// volume is what the storage layer reformats - one bit would have cost every
 	// file. Now the walk flags the damage and the volume mounts read-only.
 	let mut spill = 0u64;
@@ -2165,7 +2173,7 @@ fn random_corruption_never_panics_or_hangs() {
 	}
 }
 
-// M102: the revisit under the fs-track discipline.
+// The revisit under the fs-track discipline.
 
 // A MemDevice whose flush fails once a superblock has been written: the commit's data
 // barrier passes, the commit point lands, and the durability barrier after it reports
@@ -2393,11 +2401,11 @@ fn a_rename_over_a_damaged_empty_directory_leaks_nothing() {
 	assert!(!test_bit(&fs.free, dir_root), "the replaced directory's tree node is reclaimed, not leaked");
 }
 
-// M103: the second-pass findings.
+// The second-pass findings.
 
 #[test]
 fn a_forged_raw_length_does_not_read_past_the_pool() {
-	// a 64-block pool on a 128-block device, like the M102 gate test - but this
+	// a 64-block pool on a 128-block device, like the earlier gate test - but this
 	// forgery keeps every ADDRESS FIELD inside the pool and lies with the LENGTH:
 	// a raw extent claiming 2 logical blocks over a 1-block stored span, its
 	// physical start at the pool's last block, walks its second read past the pool.
@@ -2458,7 +2466,7 @@ fn a_self_fanning_internal_node_cannot_stall_the_mark_walk() {
 	assert!(test_bit(&fs.free, node), "the walked node is reserved like any referenced block");
 }
 
-// M103 follow-up: the third-pass nits.
+// The third-pass follow-up nits.
 
 #[test]
 fn an_unknown_inode_type_is_inert_and_removable() {

@@ -1,4 +1,4 @@
-// riscv64 serial console over SBI (M117 bring-up).
+// riscv64 serial console over SBI (bring-up).
 //
 // OpenSBI (the M-mode firmware QEMU's `virt` machine boots) exposes a console the
 // kernel reaches through an `ecall` (a trap into M-mode). This uses the legacy SBI

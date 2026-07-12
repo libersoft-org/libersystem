@@ -10,7 +10,7 @@
 // maps each to the text-cell grid and keeps a bounded ring of the recent ones for the
 // typed `subscribe` API, and forwards the raw bytes to ConsoleService verbatim. Over the
 // serve channel clients speak the generated `liber:system` Input bindings: `subscribe`
-// hands back a wait-drained event stream of that snapshot (the M30 bounded-snapshot form).
+// hands back a wait-drained event stream of that snapshot (the bounded-snapshot form).
 //
 // When the supervisor that started it drops the bootstrap channel (no clients this
 // boot), the service exits.
@@ -21,8 +21,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::PointerEvent;
 use proto::system::input;
+use proto::system::PointerEvent;
 use rt::*;
 
 // The default text-cell grid the normalized pointer position maps onto: the boot

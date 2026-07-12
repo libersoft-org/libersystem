@@ -311,7 +311,7 @@ impl Term {
 
 	// Reflow the model to fit new_cols x new_rows, clamped to what the physical framebuffer
 	// can show, then clear the now-unused area (only when the grid actually changed). The
-	// local stand-in for a virtio-gpu mode-set (M44).
+	// local stand-in for a virtio-gpu mode-set.
 	pub fn resize(&mut self, new_cols: usize, new_rows: usize) {
 		let max_cols = (self.renderer.surface.width() / CELL_W).max(1);
 		let max_rows = (self.renderer.surface.height() / CELL_H).max(1);

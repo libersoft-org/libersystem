@@ -17,7 +17,7 @@
 // `set-limit` adjusts one Domain's cap for one resource at runtime and returns its updated
 // budget.
 //
-// This milestone it governs one component, resource_probe, under a memory budget: it caps
+// Currently it governs one component, resource_probe, under a memory budget: it caps
 // the Domain, drives the probe to fill the budget and be refused once (gracefully), raises
 // the budget at runtime, and drives the probe into the new headroom - then relays that
 // proof to the supervisor and serves the resources contract until the supervisor drops its
@@ -35,7 +35,7 @@ use proto::system::resources::{self, Service};
 use proto::system::{Budget, Error, ResourceType, ResourceUsage};
 use rt::*;
 
-// The governed component this milestone launches, and the name of the budget the manager
+// The governed component the manager launches, and the name of the budget the manager
 // assigns its Domain (the shared app sandbox).
 const PROBE_NAME: &[u8] = b"resource_probe";
 const BUDGET_NAME: &str = "apps";

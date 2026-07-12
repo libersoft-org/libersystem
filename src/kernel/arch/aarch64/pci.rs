@@ -1,4 +1,4 @@
-// aarch64 PCI / PCIe config-space access: the ECAM MMIO window (M116). This is the
+// aarch64 PCI / PCIe config-space access: the ECAM MMIO window. This is the
 // ONLY architecture-specific part of PCI enumeration - the device tables, capability
 // walk, BAR decoding and MSI-X resolution all live in `arch::common::pci`, generic
 // over the `ConfigAccess` primitives implemented here.

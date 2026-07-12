@@ -221,8 +221,8 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	let out_dir: PathBuf = package_out_dir(&manifest);
 	let out_pkg: PathBuf = out_dir.join(conf_get(conf, "INIT_PACKAGE"));
 
-	// (package entry name, ELF path). The init package holds only the pinned bootstrap set
-	// (M61 box 8): the pinned services and the bootstrap block driver. Every other service,
+	// (package entry name, ELF path). The init package holds only the pinned bootstrap set:
+	// the pinned services and the bootstrap block driver. Every other service,
 	// manager, driver and tool is loaded from the system volume, so it is staged there by
 	// assemble_volume_package instead. A pinned row with a real crate (not an `instance`
 	// backed by another program) contributes its ELF.
@@ -288,7 +288,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		println!("cargo:warning=volume directory not found at {} - writing an empty volume package", vol_dir.display());
 	}
 
-	// M61 box 7: also stage the tool and non-bootstrap driver ELFs onto the system volume
+	// Also stage the tool and non-bootstrap driver ELFs onto the system volume
 	// under bin/ and drivers/, so they can later be loaded from there. They are stripped
 	// of symbol/debug sections (the on-disk copies are executed by the loader, which needs
 	// only the program image), keeping the seed archive to a few megabytes. A missing or

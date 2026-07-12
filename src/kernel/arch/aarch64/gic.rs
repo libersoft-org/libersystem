@@ -1,4 +1,4 @@
-// aarch64 GICv2 interrupt controller + ARM generic timer (M116).
+// aarch64 GICv2 interrupt controller + ARM generic timer.
 //
 // QEMU's `virt` machine (with gic-version=2) maps the GIC distributor (GICD) at
 // 0x0800_0000 and the CPU interface (GICC) at 0x0801_0000. The EL1 physical timer

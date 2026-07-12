@@ -50,7 +50,7 @@ global_asm!(".text", ".global _start", "_start:", "andi sp, sp, -16", "mv s0, ze
 // this binary was built against, then hand control to the program's `__user_main` with
 // the bootstrap handle still in rdi.
 //
-// The ABI handshake (M108): a binary built against a different kernel ABI - a renumbered
+// The ABI handshake: a binary built against a different kernel ABI - a renumbered
 // syscall, a grown struct - is refused here, before it issues a single call against a
 // mismatched table, instead of running on and misbehaving. New syscalls only ever append
 // and old ones never renumber, so SYS_ABI_CHECK and this comparison stay valid across

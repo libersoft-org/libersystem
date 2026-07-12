@@ -33,27 +33,27 @@ pub fn halt_loop() -> ! {
 
 // install the trap vector and enable memory-protection features
 pub fn init() {
-	todo!("riscv64: STVEC + page-protection bits (M117)")
+	todo!("riscv64: STVEC + page-protection bits")
 }
 
 pub fn init_interrupts() {
-	todo!("riscv64: PLIC + CLINT / SBI timer (M117)")
+	todo!("riscv64: PLIC + CLINT / SBI timer")
 }
 
 pub fn init_syscalls() {
-	todo!("riscv64: ECALL vector wiring (M117)")
+	todo!("riscv64: ECALL vector wiring")
 }
 
 pub fn init_tsc() {
-	todo!("riscv64: timebase-frequency (M117)")
+	todo!("riscv64: timebase-frequency")
 }
 
 pub fn init_bsp_percpu(_hartid: u32) {
-	todo!("riscv64: tp register for the boot hart (M117)")
+	todo!("riscv64: tp register for the boot hart")
 }
 
 pub fn init_ap(_cpu_id: usize, _hartid: u32) {
-	todo!("riscv64: secondary-hart bring-up (M117)")
+	todo!("riscv64: secondary-hart bring-up")
 }
 
 // enable maskable interrupts on the current hart (set SSTATUS.SIE, bit 1)
@@ -307,13 +307,13 @@ pub mod tsc {
 // ------------------------------------------------------------------ ioapic
 pub mod ioapic {
 	pub fn route(_gsi: u32, _vector: u8, _dest: u32) {
-		todo!("riscv64 PLIC routing (M117)")
+		todo!("riscv64 PLIC routing")
 	}
 	pub fn init() {
-		todo!("riscv64 PLIC (M117)")
+		todo!("riscv64 PLIC")
 	}
 	pub fn mask(_gsi: u32) {
-		todo!("riscv64 PLIC mask (M117)")
+		todo!("riscv64 PLIC mask")
 	}
 }
 
@@ -354,16 +354,16 @@ pub mod random {
 // ------------------------------------------------------------------ apboot
 // (riscv64 wakes secondary harts via the SBI HSM `hart_start` call, not a
 // real-mode trampoline; these keep the portable names so smp.rs links until
-// M117 replaces the wake path.)
+// the real wake path replaces them.)
 pub mod apboot {
 	pub fn trampoline_len() -> usize {
 		0
 	}
 	pub unsafe fn install(_dst: *mut u8, _satp: u64, _entry: u64) {
-		todo!("riscv64 SBI HSM wake (M117)")
+		todo!("riscv64 SBI HSM wake")
 	}
 	pub unsafe fn set_stack(_dst: *mut u8, _stack_top: u64) {
-		todo!("riscv64 SBI HSM wake (M117)")
+		todo!("riscv64 SBI HSM wake")
 	}
 }
 

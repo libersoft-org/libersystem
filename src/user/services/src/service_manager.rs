@@ -318,7 +318,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				if MANIFEST[i].name == b"permission_manager" && started == State::Running && selftest {
 					drill_perm = unsafe { service_connect(perm_client) }.unwrap_or(0);
 				}
-				// M61 box 8: once the system StorageService is up, drive DeviceManager's phase
+				// Once the system StorageService is up, drive DeviceManager's phase
 				// 2 - it now loads the non-bootstrap drivers from the volume, which is only
 				// mountable now. This runs before the driver-consuming services (which depend
 				// on process_service, so come up later), so their driver channels are ready.
@@ -516,7 +516,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	let _ = storage_client;
 
-	// 5. stand as the supervisor. Unlike the earlier milestone, ServiceManager does not
+	// 5. stand as the supervisor. Unlike the earlier design, ServiceManager does not
 	//    exit after bring-up: it blocks on every live control channel at once so it can
 	//    react when something needs it - a real service crashing (its channel peer-closes),
 	//    the canary failing (restart per policy), the shell asking to `stop` a service
@@ -565,7 +565,7 @@ fn index_of(name: &[u8]) -> Option<usize> {
 	None
 }
 
-// The pinned bootstrap set (M61 box 8): the services ServiceManager raw-spawns from the
+// The pinned bootstrap set: the services ServiceManager raw-spawns from the
 // init package, because they are on the path to mounting the system volume and so cannot
 // be loaded from it. media / iso / udf storage reuse the pinned storage_service binary.
 // Every other service is loaded from the volume's `bin/` through ProcessService.
@@ -599,7 +599,7 @@ unsafe fn launch_from_volume(process_client: u64, name: &[u8], bootstrap: u64) -
 	}
 }
 
-// Drive DeviceManager's phase 2 (M61 box 8): now that the system volume is mounted, hand
+// Drive DeviceManager's phase 2: now that the system volume is mounted, hand
 // it a fresh StorageService connection over its control channel with a "DRIVERS" message,
 // so it loads the non-bootstrap drivers from vol://system/drivers/ and hands their channels
 // back - the net driver's frame channel, the gpu display channel, the snd control channel,
@@ -660,7 +660,7 @@ unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64
 		};
 		// The pinned bootstrap set is raw-spawned from the init package (it is on the path
 		// to mounting the system volume, so it cannot load from it); every other service is
-		// loaded from the volume's `bin/` through ProcessService (M61 box 8). media / iso /
+		// loaded from the volume's `bin/` through ProcessService. media / iso /
 		// udf storage are extra instances of the pinned storage_service binary.
 		let proc: i64 = if is_pinned(name) {
 			let elf_name: &[u8] = if name == b"media_storage" || name == b"iso_storage" || name == b"udf_storage" || name == b"usb_storage" { b"storage_service" } else { name };

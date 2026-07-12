@@ -1,4 +1,4 @@
-// driver.xhci - the userspace xHCI USB host controller driver (M62).
+// driver.xhci - the userspace xHCI USB host controller driver.
 //
 // DeviceManager launches this program with a "DEVICE" message carrying the
 // controller's DeviceInfo and a transferred DeviceMemory capability to its MMIO

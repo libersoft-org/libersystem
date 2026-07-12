@@ -459,7 +459,7 @@ impl Screen {
 	// framebuffer can show), reflowing the screen: the overlapping rectangle of cells is
 	// preserved (bottom-anchored so the cursor line stays on screen), the alternate screen
 	// and scrollback are reset, and the now-unused area is cleared. This is the local
-	// stand-in for a virtio-gpu mode-set (M44); the same path runs on a real resolution
+	// stand-in for a virtio-gpu mode-set; the same path runs on a real resolution
 	// change once that driver lands.
 	pub fn resize(&mut self, new_cols: usize, new_rows: usize, max_cols: usize, max_rows: usize) -> bool {
 		let new_cols = new_cols.clamp(1, max_cols);

@@ -1,6 +1,6 @@
 // PL011 UART - the console on QEMU's `virt` machine (UART0 at 0x0900_0000).
 //
-// This is a minimal polled driver, enough for the M116 bring-up: transmit a byte
+// This is a minimal polled driver, enough for the bring-up: transmit a byte
 // (wait while the TX FIFO is full, then write UARTDR) and read one (if the RX
 // FIFO is not empty). The kernel runs in the higher half, so the device's MMIO is
 // reached through the physical direct map (`phys_to_virt`). Interrupt-driven RX +
@@ -50,7 +50,7 @@ pub fn read_byte() -> Option<u8> {
 }
 
 // The interrupt / async-TX surface (used by the portable console path); these
-// become real once the GIC is up in M116. Polled transmit needs none of them.
+// become real once the GIC is up. Polled transmit needs none of them.
 pub fn enable_rx_irq() {}
 
 pub fn enable_async() {}

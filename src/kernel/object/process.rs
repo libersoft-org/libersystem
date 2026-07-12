@@ -4,7 +4,7 @@
 // and is bound to a resource Domain. Its threads share all three - a handle
 // opened by one thread is visible to its siblings, and they run in the same
 // address space. A thread reaches these through its Process, so the handle table
-// that M6 parked on the Thread as a stand-in now lives here, where it belongs.
+// that used to be parked on the Thread as a stand-in now lives here, where it belongs.
 //
 // Threads hold an Arc to their Process, so the Process (and thus its address
 // space and table) outlives them; the Process is torn down when its last thread

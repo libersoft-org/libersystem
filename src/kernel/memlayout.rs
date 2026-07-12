@@ -16,7 +16,7 @@
 
 // In-kernel ring-3 test: one page for the program, one for its stack, mapped into
 // the low half of the shared address space (per-process CR3 isolation is a later
-// milestone).
+// refinement).
 #[cfg(test)]
 pub(crate) const USER_CODE_VA: u64 = 0x0000_0000_4000_0000;
 #[cfg(test)]

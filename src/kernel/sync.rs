@@ -4,7 +4,7 @@
 // a test-and-test-and-set acquire with proper acquire/release memory ordering so
 // data published under the lock is visible to the next holder on another core.
 //
-// It is also interrupt-safe (since M19, preemption): `lock` disables interrupts on
+// It is also interrupt-safe (preemption can fire mid-section): `lock` disables interrupts on
 // the current core before acquiring and the guard restores the prior state on
 // drop. A lock holder therefore can never be preempted by the timer, so an
 // interrupt handler that needs the same lock can never deadlock against a holder

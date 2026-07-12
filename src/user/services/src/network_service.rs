@@ -1,6 +1,6 @@
-// NetworkService - the standing userspace network service (M33).
+// NetworkService - the standing userspace network service.
 //
-// M32 housed the L2/L3 stack inside driver.virtio-net; M33 extracts it here. The
+// The L2/L3 stack used to live inside driver.virtio-net; it is now extracted here. The
 // driver is now a pure frame-mover: it owns the NIC and the virtqueues and, over a
 // single channel, forwards each received Ethernet frame to this service and
 // transmits each frame this service hands back. NetworkService owns the stack
@@ -29,7 +29,7 @@ use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetCap
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
-// client (M33) later replaces this static configuration.
+// client later replaces this static configuration.
 const OUR_IP: Ipv4Addr = Ipv4Addr([10, 0, 2, 15]);
 const OUR_MASK: Ipv4Addr = Ipv4Addr([255, 255, 255, 0]);
 const GATEWAY_IP: Ipv4Addr = Ipv4Addr([10, 0, 2, 2]);

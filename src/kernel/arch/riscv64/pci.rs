@@ -1,4 +1,4 @@
-// riscv64 PCI / PCIe config-space access: the ECAM MMIO window (M117). Like the other
+// riscv64 PCI / PCIe config-space access: the ECAM MMIO window. Like the other
 // arches, the ONLY architecture-specific part is the config-space access mechanism -
 // the device tables, capability walk, BAR decoding and virtio layout resolution all
 // live in `arch::common::pci`, generic over the `ConfigAccess` primitives here.
