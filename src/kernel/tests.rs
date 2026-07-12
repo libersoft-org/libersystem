@@ -3083,7 +3083,7 @@ fn init_package_starts_system_manager() {
 	// DeviceManager's virtio-blk backs), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 28] = [
+	let reports: [&[u8]; 29] = [
 		b"LogService: online",
 		b"DeviceManager: online",
 		b"StorageService: online",
@@ -3109,6 +3109,7 @@ fn init_package_starts_system_manager() {
 		b"WatchdogProbe: recovered",
 		b"ConfigService: restarted",
 		b"WatchdogProbe: config client survived",
+		b"PermissionManager: config client reconnected",
 		b"DeviceManager: stopped",
 		b"ServiceManager: online",
 		b"SystemManager: online",

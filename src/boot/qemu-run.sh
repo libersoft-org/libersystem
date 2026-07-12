@@ -62,10 +62,14 @@ mkdir -p "$HERE/.build"
 # The system volume disk. It must hold the factory archive at LBA 0 (now a few megabytes
 # of staged program binaries, M61 box 7) followed by the LiberFS region, so it is sized
 # well past both. A raw sparse image costs only the blocks actually written. Recreate it
-# when missing or the wrong size (e.g. after a filesystem-geometry change), which forces a
-# clean reformat and reseed.
+# when missing, the wrong size (e.g. after a filesystem-geometry change), or OLDER than
+# the freshly staged volume archive: overlaying the archive at LBA 0 is not enough,
+# because a LiberFS formatted by an earlier boot leaves its backup GPT header at the END
+# of the disk - StorageService then mounts the old filesystem (with the old staged
+# binaries) instead of reseeding from the new archive. Recreating forces a clean
+# reformat and reseed, so a rebuilt volume.pkg always reaches vol://system.
 VIRTIO_DISK_SIZE=$((128 * 1024 * 1024))
-if [[ ! -f "$VIRTIO_DISK" || "$(stat -c%s "$VIRTIO_DISK")" -ne "$VIRTIO_DISK_SIZE" ]]; then
+if [[ ! -f "$VIRTIO_DISK" || "$(stat -c%s "$VIRTIO_DISK")" -ne "$VIRTIO_DISK_SIZE" || ("$VOLUME_PKG" -nt "$VIRTIO_DISK") ]]; then
 	rm -f "$VIRTIO_DISK"
 	truncate -s "$VIRTIO_DISK_SIZE" "$VIRTIO_DISK"
 fi

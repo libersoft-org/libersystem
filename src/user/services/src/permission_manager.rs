@@ -228,6 +228,12 @@ struct Clients {
 	process: u64,
 	permission: u64,
 	supervisor: u64,
+	// The broker (bootstrap) channel the re-resolvable capabilities are re-resolved
+	// over when their held client dies: config and device restart transparently
+	// (ServiceManager relaunches them and answers a RESOLVE with a connection to the
+	// live instance), so their grants must survive the crash of the instance the held
+	// client points at.
+	broker: u64,
 	// The supervisor-status client bundled under the `services` capability for the `lssvc`
 	// overview - a dedicated ServiceManager status channel, separate from the graph's.
 	services: u64,
@@ -269,6 +275,54 @@ impl Clients {
 	}
 }
 
+// Mint the handle actually granted for `cap`. The re-resolvable capabilities (config
+// and device - their services restart transparently) are granted as a FRESH
+// sub-connection minted from the held client, so every tool gets its own connection
+// (no shared reply queue between concurrent tools), and a dead held client - the
+// service crashed and was restarted out from under it - is replaced by re-resolving
+// the name through the broker before minting: the grant reaches the live instance,
+// which is what makes a service restart transparent to the governed tools. Every
+// other capability is granted as a narrowed duplicate of the held client, as before.
+// Returns 0 when no live client can be produced. (A re-resolving grant assumes the
+// broker peer answers RESOLVE - ServiceManager does; a scenario that grants config or
+// device must stand in for the broker or keep the service alive.)
+unsafe fn grant_handle(clients: &mut Clients, cap: Capability) -> u64 {
+	unsafe {
+		let (held, name): (&mut u64, &'static [u8]) = match cap {
+			Capability::Config => (&mut clients.config, CAP_CONFIG),
+			Capability::Device => (&mut clients.device, CAP_DEVICE),
+			_ => {
+				let dup: i64 = duplicate(clients.for_capability(cap), GRANT_RIGHTS);
+				return if dup >= 0 { dup as u64 } else { 0 };
+			}
+		};
+		let minted: u64 = match service_connect(*held) {
+			Some(m) => m,
+			None => {
+				// The held client is dead (or absent): re-resolve the name through the
+				// broker - answered once the restarted instance serves - and mint from
+				// the fresh connection.
+				let fresh: u64 = match resolve(clients.broker, name) {
+					Some(f) => f,
+					None => return 0,
+				};
+				if *held != 0 {
+					close(*held);
+				}
+				*held = fresh;
+				match service_connect(*held) {
+					Some(m) => m,
+					None => return 0,
+				}
+			}
+		};
+		// Narrow the minted connection to a client's rights, like every other grant.
+		let dup: i64 = duplicate(minted, GRANT_RIGHTS);
+		close(minted);
+		if dup >= 0 { dup as u64 } else { 0 }
+	}
+}
+
 // The manager's serve state. The manifest table is fixed policy (served read-only by
 // `lookup`); the audit trail is the mutable record of every grant decision made. It also
 // holds the ProcessService client it drives to load tools and the grantable clients it may
@@ -290,7 +344,7 @@ impl Service for Manager {
 		self.audit.clone()
 	}
 	fn run(&mut self, name: String, args: String, cwd: String, stdout: u64) -> Result<StartResult, Error> {
-		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), stdout, &self.clients, &mut self.audit) } {
+		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), stdout, &mut self.clients, &mut self.audit) } {
 			Some(started) => Ok(started),
 			None => Err(Error::NotFound),
 		}
@@ -306,7 +360,7 @@ impl Service for Manager {
 // is decided by the headless policy default and recorded in the same audit trail as a
 // dynamic decision. Returns the bytes the component reported back (its proof the granted
 // capabilities are live), or None if the launch failed.
-unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Option<Vec<u8>> {
+unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Option<Vec<u8>> {
 	unsafe {
 		let manifest: Manifest = manifest_for(component)?;
 		let (manager_side, child_side): (u64, u64) = channel()?;
@@ -329,8 +383,8 @@ unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &Client
 		for &cap in VOCABULARY.iter() {
 			let granted: bool = manifest.grants.contains(&cap);
 			if granted {
-				let dup: i64 = duplicate(clients.for_capability(cap), GRANT_RIGHTS);
-				if dup < 0 || !send_blocking(manager_side, tag_for(cap), dup as u64) {
+				let handle: u64 = grant_handle(clients, cap);
+				if handle == 0 || !send_blocking(manager_side, tag_for(cap), handle) {
 					close(manager_side);
 					close(task);
 					return None;
@@ -367,11 +421,11 @@ unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &Client
 // if it allows the request and the manager actually holds the capability, duplicate that
 // client (with only the rights a client needs) and transfer it under its tag; otherwise
 // reply with a bare DENY (no handle). Returns whether the capability was handed over.
-unsafe fn grant_dynamic(component: &[u8], cap: Capability, clients: &Clients, manager_side: u64) -> bool {
+unsafe fn grant_dynamic(component: &[u8], cap: Capability, clients: &mut Clients, manager_side: u64) -> bool {
 	unsafe {
 		if dynamic_policy(component, cap) {
-			let dup: i64 = duplicate(clients.for_capability(cap), GRANT_RIGHTS);
-			if dup >= 0 && send_blocking(manager_side, tag_for(cap), dup as u64) {
+			let handle: u64 = grant_handle(clients, cap);
+			if handle != 0 && send_blocking(manager_side, tag_for(cap), handle) {
 				return true;
 			}
 		}
@@ -388,7 +442,7 @@ unsafe fn grant_dynamic(component: &[u8], cap: Capability, clients: &Clients, ma
 // manifest's capabilities in vocabulary order (auditing each decision). Returns the live
 // process handle (for the caller's job control) and the per-capability decisions, or None if
 // the tool has no manifest, the argument is not a known program name, or the launch fails.
-unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], stdout: u64, clients: &Clients, audit: &mut Vec<AuditEntry>) -> Option<StartResult> {
+unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], stdout: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<StartResult> {
 	unsafe {
 		let manifest: Manifest = manifest_for(name)?;
 		let name_str: &str = core::str::from_utf8(name).ok()?;
@@ -415,8 +469,8 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 				let ok: bool = if cap == Capability::Volumes {
 					grant_volumes(manager_side, clients)
 				} else {
-					let dup: i64 = duplicate(clients.for_capability(cap), GRANT_RIGHTS);
-					dup >= 0 && send_blocking(manager_side, tag_for(cap), dup as u64)
+					let handle: u64 = grant_handle(clients, cap);
+					handle != 0 && send_blocking(manager_side, tag_for(cap), handle)
 				};
 				if !ok {
 					close(manager_side);
@@ -464,7 +518,7 @@ unsafe fn grant_volumes(manager_side: u64, clients: &Clients) -> bool {
 // its output was forwarded to the caller's terminal. The shell reaches this same path live
 // over the `run` op; here the manager plays both launcher and terminal so the path is
 // exercised end to end. Returns the bytes the tool printed, or empty if it could not start.
-unsafe fn demonstrate_tool(procsvc: u64, name: &[u8], args: &[u8], clients: &Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Vec<u8> {
+unsafe fn demonstrate_tool(procsvc: u64, name: &[u8], args: &[u8], clients: &mut Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Vec<u8> {
 	unsafe {
 		let (output, console): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -564,7 +618,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection") });
-	let clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, broker: bootstrap };
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"process", b"process client not delivered") });
 
 	// 2. wait for the serve channel clients reach us on.
@@ -578,10 +632,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    path; and `cat` (granted only storage) is likewise launched through `run`, printing a
 	//    file to a captured stdout.
 	let mut audit: Vec<AuditEntry> = Vec::new();
-	let probe_read: Vec<u8> = unsafe { launch_under_manifest(procsvc, PROBE_NAME, &clients, &mut audit, &mut buf) }.unwrap_or_default();
-	let date_read: Vec<u8> = unsafe { demonstrate_tool(procsvc, DATE_NAME, b"", &clients, &mut audit, &mut buf) };
-	let request_read: Vec<u8> = unsafe { launch_under_manifest(procsvc, REQUEST_NAME, &clients, &mut audit, &mut buf) }.unwrap_or_default();
-	let cat_read: Vec<u8> = unsafe { demonstrate_tool(procsvc, CAT_NAME, b"vol://system/hello.txt", &clients, &mut audit, &mut buf) };
+	let probe_read: Vec<u8> = unsafe { launch_under_manifest(procsvc, PROBE_NAME, &mut clients, &mut audit, &mut buf) }.unwrap_or_default();
+	let date_read: Vec<u8> = unsafe { demonstrate_tool(procsvc, DATE_NAME, b"", &mut clients, &mut audit, &mut buf) };
+	let request_read: Vec<u8> = unsafe { launch_under_manifest(procsvc, REQUEST_NAME, &mut clients, &mut audit, &mut buf) }.unwrap_or_default();
+	let cat_read: Vec<u8> = unsafe { demonstrate_tool(procsvc, CAT_NAME, b"vol://system/hello.txt", &mut clients, &mut audit, &mut buf) };
 
 	// 4. report in to the supervisor, then relay each governed component's proof and its
 	//    decisions summary (exactly which capabilities it was and was not given): the bytes

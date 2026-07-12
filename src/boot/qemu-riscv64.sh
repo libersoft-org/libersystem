@@ -64,7 +64,11 @@ VIRTIO_DISK="$HERE/.build/virtio-blk-riscv64.img"
 DISK_ARGS=()
 if [[ -f "$VOLUME_PKG" ]]; then
 	VIRTIO_DISK_SIZE=$((128 * 1024 * 1024))
-	if [[ ! -f "$VIRTIO_DISK" || "$(stat -c%s "$VIRTIO_DISK")" -ne "$VIRTIO_DISK_SIZE" ]]; then
+	# Recreate the disk when missing, the wrong size, or OLDER than the freshly staged
+	# volume archive: a LiberFS formatted by an earlier boot leaves its backup GPT
+	# header at the END of the disk, so StorageService would mount the old filesystem
+	# (with the old staged binaries) instead of reseeding from the new archive.
+	if [[ ! -f "$VIRTIO_DISK" || "$(stat -c%s "$VIRTIO_DISK")" -ne "$VIRTIO_DISK_SIZE" || ("$VOLUME_PKG" -nt "$VIRTIO_DISK") ]]; then
 		rm -f "$VIRTIO_DISK"
 		truncate -s "$VIRTIO_DISK_SIZE" "$VIRTIO_DISK"
 	fi

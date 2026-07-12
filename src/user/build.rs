@@ -37,8 +37,10 @@ fn select_linker_script() {
 // (services/manifest.txt, the single source of truth the kernel build script also
 // reads for its staging lists). Only the services crate holds ServiceManager, so the
 // table is emitted only there; service_manager.rs includes it via env!("OUT_DIR").
-// Each `service` / `instance` row becomes one `Service { name, deps }` entry, in the
-// manifest's row order (the resolver derives the real start order from the deps).
+// Each `service` / `instance` row becomes one `Service { name, restart, deps }`
+// entry, in the manifest's row order (the resolver derives the real start order from
+// the deps). The `restart` column is the supervisor's crash policy: `transparent`
+// (restart per the ladder, clients re-resolve through the broker) or `escalate`.
 fn generate_service_manifest() {
 	if env::var("CARGO_PKG_NAME").as_deref() != Ok("services") {
 		return;
@@ -62,6 +64,11 @@ fn generate_service_manifest() {
 		let name: &str = fields.next().expect("manifest row missing name");
 		let _crate: &str = fields.next().expect("manifest row missing crate");
 		let _stage: &str = fields.next().expect("manifest row missing stage");
+		let restart: &str = match fields.next().expect("manifest row missing restart policy") {
+			"transparent" => "Restart::Transparent",
+			"escalate" => "Restart::Escalate",
+			other => panic!("manifest row {name}: unknown restart policy {other:?} (transparent | escalate)"),
+		};
 		let mut deps: String = String::new();
 		for dep in fields {
 			if !deps.is_empty() {
@@ -71,7 +78,7 @@ fn generate_service_manifest() {
 			deps.push_str(dep);
 			deps.push('"');
 		}
-		out.push_str(&format!("\tService {{ name: b\"{name}\", deps: &[{deps}] }},\n"));
+		out.push_str(&format!("\tService {{ name: b\"{name}\", restart: {restart}, deps: &[{deps}] }},\n"));
 		count += 1;
 	}
 
