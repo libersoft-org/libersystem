@@ -78,6 +78,7 @@ tool      cat        tools  volume
 tool      write      tools  volume
 tool      rm         tools  volume
 tool      ls         tools  volume
+tool      du         tools  volume
 tool      mkdir      tools  volume
 tool      rmdir      tools  volume
 tool      log        tools  volume

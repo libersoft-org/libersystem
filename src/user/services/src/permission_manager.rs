@@ -134,6 +134,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"write" => Some(granted("write", alloc::vec![Capability::Volumes])),
 		b"rm" => Some(granted("rm", alloc::vec![Capability::Volumes])),
 		b"ls" => Some(granted("ls", alloc::vec![Capability::Volumes])),
+		b"du" => Some(granted("du", alloc::vec![Capability::Volumes])),
 		b"mkdir" => Some(granted("mkdir", alloc::vec![Capability::Volumes])),
 		b"rmdir" => Some(granted("rmdir", alloc::vec![Capability::Volumes])),
 		b"log" => Some(granted("log", alloc::vec![Capability::Log, Capability::Time])),

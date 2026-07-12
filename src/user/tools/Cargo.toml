@@ -40,6 +40,10 @@ name = "ls"
 path = "src/ls.rs"
 
 [[bin]]
+name = "du"
+path = "src/du.rs"
+
+[[bin]]
 name = "mkdir"
 path = "src/mkdir.rs"
 

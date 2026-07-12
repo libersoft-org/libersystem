@@ -3466,6 +3466,54 @@ fn interactive_tool_reads_stdin() {
 	assert!(captured.windows(b"in> hello".len()).any(|w| w == b"in> hello"), "the foreground tool reads its stdin and echoes it back");
 }
 
+#[test_case]
+fn du_reports_a_directory_tree_size() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	// `du` walks a directory tree through its `volumes` grant and sums every file's
+	// size - the recursive disk usage no other tool reports. Stand up a StorageService
+	// over the scenario volume, then drive `du -s vol://system` the way PermissionManager
+	// would: a console as STDOUT, the arg string, the five volume caps the `volumes`
+	// bundle carries (SYSTEM live, the rest absent = a tagged message with no handle),
+	// then the inherited cwd. `-s` prints just the total line: a nonzero byte count and
+	// the path (the volume root holds the seed files).
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service").expect("storage_service in the init package");
+	let du_elf = program_elf(&package, volume, b"du").expect("du in the package or volume");
+
+	let (storage_boot_kernel, storage_boot_user) = Channel::create();
+	let (storage_server, storage_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
+	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
+	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
+
+	let (du_boot, du_boot_user) = Channel::create();
+	let (console_host, console_child) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), du_elf, du_boot_user, Rights::ALL, 0).expect("spawn du");
+	// The launcher bootstrap: STDOUT, the arg string, the five volume tags (only SYSTEM
+	// carries a handle), then the cwd - matching du's receive order.
+	send_cap(&du_boot, b"STDOUT", console_child, Rights::ALL).expect("STDOUT bootstrap");
+	du_boot.send(Message::new(b"-s vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("argv bootstrap");
+	send_cap(&du_boot, b"SYSTEM", storage_client, Rights::ALL).expect("SYSTEM volume grant");
+	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..]] {
+		du_boot.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("absent volume tag");
+	}
+	du_boot.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("cwd bootstrap");
+	sched::run_until_idle();
+
+	let mut captured = alloc::vec::Vec::new();
+	while let Ok(msg) = console_host.recv() {
+		captured.extend_from_slice(&msg.bytes);
+	}
+	// The -s output is one line: "<bytes>\tvol://system\n". The path must be there and
+	// the byte count nonzero (the volume holds the seed files).
+	assert!(captured.windows(b"vol://system".len()).any(|w| w == b"vol://system"), "du should report the walked directory's path, got {:?}", core::str::from_utf8(&captured));
+	let tab: usize = captured.iter().position(|&b| b == b'\t').expect("du prints a size, a tab, then the path");
+	let size: u64 = core::str::from_utf8(&captured[..tab]).ok().and_then(|s| s.trim().parse::<u64>().ok()).expect("the size column is a byte count");
+	assert!(size > 0, "du should sum a nonzero total for the volume root");
+}
+
 // Run one no-argument, no-capability tool from the volume the way the launcher does
 // - spawn its staged ELF, hand it a console channel as STDOUT and an empty argv -
 // and return everything it printed. The zero-capability inventory commands (uname,

@@ -658,6 +658,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"lssvc", Shape::Rest),
 	(b"beep", Shape::Rest),
 	(b"ls", Shape::Rest),
+	(b"du", Shape::Rest),
 	(b"stop", Shape::Args),
 	(b"run", Shape::Args),
 	(b"set", Shape::Args),
