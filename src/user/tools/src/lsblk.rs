@@ -42,8 +42,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	exit();
 }
 
-// One row per volume: the vol:// name, the backing block device, and its capacity
-// asked through the volume's typed `capacity` query.
+// One row per volume: the vol:// name, the backing block device transport, the
+// filesystem the volume's service reports, and the backing device's capacity asked
+// through the volume's typed `capacity` query.
 unsafe fn list_block_devices(system: u64, media: u64, iso: u64, udf: u64, usb: u64, mode: Option<JsonMode>) {
 	unsafe {
 		let json: bool = mode.is_some();
@@ -57,10 +58,18 @@ unsafe fn list_block_devices(system: u64, media: u64, iso: u64, udf: u64, usb: u
 		let mut out = String::new();
 		if json {
 			out.push('[');
+		} else {
+			// The aligned column header (bold), like lsvol.
+			out.push_str("\x1b[1mvolume        device       type        size\x1b[0m\n");
 		}
 		for (i, &(name, device, chan)) in rows.iter().enumerate() {
+			// The size is the backing block DEVICE's capacity (what a block-device
+			// lister reports), asked through the volume's typed query - deliberately the
+			// raw disk size, not lsvol's usable filesystem pool (disk minus the factory
+			// archive region), so the two tools answer different, complementary questions.
 			let capacity: Option<u64> = volume_capacity(chan);
-			render_row(&mut out, i, name, device, capacity, json);
+			let fs: Option<String> = volume_filesystem(chan);
+			render_row(&mut out, i, name, device, fs.as_deref(), capacity, json);
 		}
 		if let Some(mode) = mode {
 			out.push(']');
@@ -68,6 +77,19 @@ unsafe fn list_block_devices(system: u64, media: u64, iso: u64, udf: u64, usb: u
 		}
 		out.push('\n');
 		print(out.as_bytes());
+	}
+}
+
+// The filesystem a volume's service reports (`liberfs` / `exfat` / `iso9660` /
+// `udf`), or None when the volume (or its disk) is absent.
+fn volume_filesystem(chan: u64) -> Option<String> {
+	if chan == 0 {
+		return None;
+	}
+	let mut client = volume::Client::new(ChannelTransport { chan });
+	match client.status() {
+		Some(Ok(st)) => Some(st.filesystem),
+		_ => None,
 	}
 }
 
@@ -84,8 +106,9 @@ fn volume_capacity(chan: u64) -> Option<u64> {
 	}
 }
 
-// Append one volume row to `out`, as a text line or a JSON object.
-fn render_row(out: &mut String, index: usize, name: &str, device: &str, capacity: Option<u64>, json: bool) {
+// Append one volume row to `out`, as an aligned table line or a JSON object: the
+// vol:// name, the device transport, the filesystem type, and the backing device size.
+fn render_row(out: &mut String, index: usize, name: &str, device: &str, fs: Option<&str>, capacity: Option<u64>, json: bool) {
 	if json {
 		if index > 0 {
 			out.push(',');
@@ -95,6 +118,11 @@ fn render_row(out: &mut String, index: usize, name: &str, device: &str, capacity
 		out.push_str("\",\"device\":\"");
 		out.push_str(device);
 		out.push('"');
+		if let Some(fs) = fs {
+			out.push_str(",\"filesystem\":\"");
+			out.push_str(fs);
+			out.push('"');
+		}
 		if let Some(bytes) = capacity {
 			out.push_str(",\"bytes\":");
 			push_decimal(out, bytes);
@@ -102,20 +130,23 @@ fn render_row(out: &mut String, index: usize, name: &str, device: &str, capacity
 		out.push('}');
 		return;
 	}
-	out.push_str(name);
-	for _ in name.len()..14 {
-		out.push(' ');
-	}
-	out.push_str(device);
-	for _ in device.len()..13 {
-		out.push(' ');
-	}
+	push_left(out, name, 14);
+	push_left(out, device, 13);
+	push_left(out, fs.unwrap_or("-"), 12);
 	match capacity {
 		Some(bytes) => push_size(out, bytes),
 		None => out.push('-'),
 	}
 	if index < 4 {
 		out.push('\n');
+	}
+}
+
+// Append `text` left-aligned (space-padded on the right) to `width`.
+fn push_left(out: &mut String, text: &str, width: usize) {
+	out.push_str(text);
+	for _ in text.len()..width {
+		out.push(' ');
 	}
 }
 

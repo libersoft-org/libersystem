@@ -152,6 +152,49 @@ pub fn poweroff() -> ! {
 	halt_loop()
 }
 
+// Write the CPU's model / brand string into `out`, returning the byte count. The
+// CPUID brand string (leaves 0x8000_0002..0x8000_0004, 48 bytes) when the CPU
+// advertises it - under KVM this is the host CPU's real model - trimmed of the
+// padding CPUID leaves; otherwise the 12-byte vendor string (CPUID leaf 0). Feeds
+// the `lscpu` model field.
+pub fn cpu_brand(out: &mut [u8]) -> usize {
+	use core::arch::x86_64::__cpuid;
+	unsafe {
+		if __cpuid(0x8000_0000).eax >= 0x8000_0004 {
+			let mut raw: [u8; 48] = [0u8; 48];
+			for (i, &leaf) in [0x8000_0002u32, 0x8000_0003, 0x8000_0004].iter().enumerate() {
+				let r = __cpuid(leaf);
+				for (j, &word) in [r.eax, r.ebx, r.ecx, r.edx].iter().enumerate() {
+					raw[i * 16 + j * 4..i * 16 + j * 4 + 4].copy_from_slice(&word.to_le_bytes());
+				}
+			}
+			let end: usize = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+			return copy_trimmed(&raw[..end], out);
+		}
+		// No brand string: the 12-byte vendor id (CPUID 0: EBX, EDX, ECX).
+		let r = __cpuid(0);
+		let mut vendor: [u8; 12] = [0u8; 12];
+		vendor[0..4].copy_from_slice(&r.ebx.to_le_bytes());
+		vendor[4..8].copy_from_slice(&r.edx.to_le_bytes());
+		vendor[8..12].copy_from_slice(&r.ecx.to_le_bytes());
+		copy_trimmed(&vendor, out)
+	}
+}
+
+// Copy `src` into `out` (up to its length) with leading and trailing ASCII spaces
+// trimmed, returning the copied length.
+fn copy_trimmed(src: &[u8], out: &mut [u8]) -> usize {
+	let start: usize = src.iter().position(|&b| b != b' ').unwrap_or(src.len());
+	let mut end: usize = src.len();
+	while end > start && src[end - 1] == b' ' {
+		end -= 1;
+	}
+	let trimmed: &[u8] = &src[start..end];
+	let n: usize = trimmed.len().min(out.len());
+	out[..n].copy_from_slice(&trimmed[..n]);
+	n
+}
+
 // exit QEMU via the isa-debug-exit device (test harness only)
 #[cfg(test)]
 pub fn exit_qemu(success: bool) -> ! {

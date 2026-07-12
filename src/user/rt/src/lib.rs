@@ -1276,6 +1276,12 @@ pub unsafe fn cpu_info(ids: &mut [u32]) -> i64 {
 	unsafe { syscall(SYS_CPU_INFO, ids.as_mut_ptr() as u64, ids.len() as u64 * 4, 0, 0) as i64 }
 }
 
+// Read the CPU model / brand string into `buf`, returning the byte length written
+// (as many bytes as fit). A free syscall feeding the `lscpu` model field.
+pub unsafe fn cpu_name(buf: &mut [u8]) -> i64 {
+	unsafe { syscall(SYS_CPU_NAME, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as i64 }
+}
+
 // Read the physical-memory and kernel-heap totals into `stats`. A free syscall
 // feeding the `free` inventory command.
 pub unsafe fn memory_stats(stats: &mut MemoryStats) -> i64 {

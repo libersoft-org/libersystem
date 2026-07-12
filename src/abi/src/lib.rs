@@ -152,6 +152,12 @@ pub const SYS_CHANNEL_PEEK: u64 = 59;
 // kernel returns 0 on a match and ERR_ABI_MISMATCH otherwise. The runtime issues it as
 // its first syscall, so a binary built against a different ABI is refused before it runs.
 pub const SYS_ABI_CHECK: u64 = 60;
+// Write the CPU's model / brand string into the caller's buffer, returning the byte
+// length written (as many bytes as fit). A free syscall - the CPU model is public
+// identity, not a capability - feeding the `lscpu` model field. x86 returns the CPUID
+// brand string (the host CPU under KVM); aarch64 decodes MIDR_EL1; riscv64 queries the
+// SBI vendor id (a generic QEMU rv64 falls back to "riscv64").
+pub const SYS_CPU_NAME: u64 = 61;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;

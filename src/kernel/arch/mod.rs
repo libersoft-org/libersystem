@@ -9,7 +9,7 @@
 // THE CONTRACT each backend must provide (the surface the portable kernel calls):
 //   top-level:  init, init_interrupts, init_syscalls, init_tsc, init_bsp_percpu,
 //               init_ap, enable_interrupts, disable_interrupts, interrupts_enabled,
-//               idle_halt, halt_loop, reset, poweroff, exit_qemu (cfg(test))
+//               idle_halt, halt_loop, reset, poweroff, cpu_brand, exit_qemu (cfg(test))
 //   paging:     PRESENT / WRITABLE / USER / NO_CACHE / NO_EXECUTE, map_page,
 //               map_page_in, try_map_page, try_map_page_in, unmap_page,
 //               unmap_pages, unmap_page_in, translate,

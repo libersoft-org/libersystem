@@ -26,15 +26,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 2. receive the argument string - the sub-form ("" for text, "json" /
 		//    "json-min" for JSON).
 		let mode: Option<JsonMode> = recv_json_mode(bootstrap, &mut buf);
-		// 3. read the online CPU set and render it.
+		// 3. read the online CPU set and the CPU model, and render them.
 		let mut ids: [u32; 64] = [0u32; 64];
 		let count: i64 = cpu_info(&mut ids);
 		if count <= 0 {
 			print(b"lscpu: query error\n");
 			exit();
 		}
+		let mut model_buf: [u8; 64] = [0u8; 64];
+		let model_len: i64 = cpu_name(&mut model_buf);
+		let model: &str = if model_len > 0 { core::str::from_utf8(&model_buf[..model_len as usize]).unwrap_or("") } else { "" };
 		let n: usize = (count as usize).min(ids.len());
-		print(render(&ids[..n], count as u64, mode).as_bytes());
+		print(render(&ids[..n], count as u64, model, mode).as_bytes());
 	}
 	exit();
 }
@@ -47,13 +50,20 @@ const ARCH: &str = "aarch64";
 #[cfg(target_arch = "riscv64")]
 const ARCH: &str = "riscv64";
 
-// Render the CPU set as text (the default) or as a JSON object.
-fn render(ids: &[u32], count: u64, mode: Option<JsonMode>) -> String {
+// Render the CPU set as text (the default) or as a JSON object. `model` is the CPU
+// brand string (empty when the platform exposes none), rendered as the `name` field.
+fn render(ids: &[u32], count: u64, model: &str, mode: Option<JsonMode>) -> String {
 	let mut out = String::new();
 	if let Some(mode) = mode {
 		out.push_str("{\"arch\":\"");
 		out.push_str(ARCH);
-		out.push_str("\",\"cpus\":");
+		out.push('"');
+		if !model.is_empty() {
+			out.push_str(",\"name\":\"");
+			out.push_str(model);
+			out.push('"');
+		}
+		out.push_str(",\"cpus\":");
 		push_decimal(&mut out, count);
 		out.push_str(",\"lapic\":[");
 		for (i, &id) in ids.iter().enumerate() {
@@ -69,7 +79,13 @@ fn render(ids: &[u32], count: u64, mode: Option<JsonMode>) -> String {
 	}
 	out.push_str("arch: ");
 	out.push_str(ARCH);
-	out.push_str("\ncpus: ");
+	out.push('\n');
+	if !model.is_empty() {
+		out.push_str("name: ");
+		out.push_str(model);
+		out.push('\n');
+	}
+	out.push_str("cpus: ");
 	push_decimal(&mut out, count);
 	out.push('\n');
 	for (i, &id) in ids.iter().enumerate() {

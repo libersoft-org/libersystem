@@ -35,6 +35,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		let mut index: u64 = 0;
 		let mut printed: u64 = 0;
+		if !json {
+			// The aligned column header (bold), like lsvol - a table, not a flat list.
+			out.push_str("\x1b[1mvector  type   bound  device  device-type\x1b[0m\n");
+		}
 		loop {
 			let mut info = IrqInfo::default();
 			if irq_info(index, &mut info) < 0 {
@@ -77,8 +81,9 @@ fn device_type_name(device_type: u32) -> &'static str {
 	}
 }
 
-// Append one in-use vector to `out`, as a text line or a JSON object. An MSI-X
-// vector's owner is resolved to its device type through the free device-info query.
+// Append one in-use vector to `out`, as an aligned table row or a JSON object. An
+// MSI-X vector's owner is resolved to its device type through the free device-info
+// query. The table columns match the header: vector, type, bound, device, device-type.
 fn render_vector(out: &mut String, printed: u64, info: &IrqInfo, json: bool) {
 	let kind: &str = if info.kind == IRQ_KIND_MSI { "msi" } else { "fixed" };
 	if json {
@@ -101,20 +106,43 @@ fn render_vector(out: &mut String, printed: u64, info: &IrqInfo, json: bool) {
 		out.push('}');
 		return;
 	}
-	out.push_str("vector ");
-	push_decimal(out, info.vector as u64);
-	out.push_str(": ");
-	out.push_str(kind);
+	// vector (right 6) + 2, type (left 5) + 2, bound (left 5) + 2, device (right 6)
+	// + 2, device-type.
+	let mut cell = String::new();
+	push_decimal(&mut cell, info.vector as u64);
+	push_right(out, &cell, 6);
+	out.push_str("  ");
+	push_left(out, kind, 5);
+	out.push_str("  ");
+	push_left(out, if info.bound != 0 { "yes" } else { "no" }, 5);
+	out.push_str("  ");
 	if info.device != IRQ_NO_DEVICE {
-		out.push_str(", device ");
-		push_decimal(out, info.device as u64);
-		out.push_str(" (");
+		let mut dev = String::new();
+		push_decimal(&mut dev, info.device as u64);
+		push_right(out, &dev, 6);
+		out.push_str("  ");
 		out.push_str(device_type_name(owner_type(info.device)));
-		out.push(')');
-	} else if info.bound != 0 {
-		out.push_str(", bound");
+	} else {
+		push_right(out, "-", 6);
+		out.push_str("  -");
 	}
 	out.push('\n');
+}
+
+// Append `text` left-aligned (space-padded on the right) to `width`.
+fn push_left(out: &mut String, text: &str, width: usize) {
+	out.push_str(text);
+	for _ in text.len()..width {
+		out.push(' ');
+	}
+}
+
+// Append `text` right-aligned (space-padded on the left) to `width`.
+fn push_right(out: &mut String, text: &str, width: usize) {
+	for _ in text.len()..width {
+		out.push(' ');
+	}
+	out.push_str(text);
 }
 
 // The device-type code of the discovered device at `index` (0 = unknown).

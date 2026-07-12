@@ -122,6 +122,42 @@ fn sbi_system_reset(reset_type: u32, reset_reason: u32) {
 	}
 }
 
+// Write the CPU's model name into `out`, returning the byte count. The mvendorid /
+// marchid / mimpid identity registers are M-mode CSRs, unreadable from S-mode, so
+// query them through the SBI Base extension (EID 0x10, FIDs 4/5/6). QEMU's generic
+// rv64 reports all-zero ids, so a known vendor decodes to a name and the rest falls
+// back to a plain "riscv64". Feeds `lscpu`.
+pub fn cpu_brand(out: &mut [u8]) -> usize {
+	let vendor: usize = sbi_base(4); // get_mvendorid
+	let name: &str = match vendor {
+		0x489 => "SiFive riscv64",
+		0x5b7 => "T-Head riscv64",
+		_ => "riscv64",
+	};
+	let b: &[u8] = name.as_bytes();
+	let n: usize = b.len().min(out.len());
+	out[..n].copy_from_slice(&b[..n]);
+	n
+}
+
+// One SBI Base extension probe (EID 0x10): returns the value in a1 (a0 is the error
+// code, 0 on the always-present Base extension), or 0 on any error.
+fn sbi_base(fid: usize) -> usize {
+	let error: isize;
+	let value: usize;
+	unsafe {
+		core::arch::asm!(
+			"ecall",
+			in("a7") 0x10usize, // Base extension id
+			in("a6") fid,
+			lateout("a0") error,
+			lateout("a1") value,
+			options(nostack, nomem),
+		);
+	}
+	if error == 0 { value } else { 0 }
+}
+
 #[cfg(test)]
 pub fn exit_qemu(success: bool) -> ! {
 	// Terminate QEMU (run with `-semihosting`) via the RISC-V semihosting

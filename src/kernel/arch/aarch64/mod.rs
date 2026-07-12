@@ -100,6 +100,31 @@ pub fn poweroff() -> ! {
 	halt_loop()
 }
 
+// Write the CPU's model name into `out`, returning the byte count. aarch64 exposes
+// no brand string; decode MIDR_EL1's implementer + part number to a name (a small
+// table of the parts we run on), falling back to the raw ids. Feeds `lscpu`.
+pub fn cpu_brand(out: &mut [u8]) -> usize {
+	let midr: u64;
+	unsafe {
+		core::arch::asm!("mrs {}, midr_el1", out(reg) midr, options(nomem, nostack, preserves_flags));
+	}
+	let implementer: u64 = (midr >> 24) & 0xff;
+	let part: u64 = (midr >> 4) & 0xfff;
+	let name: &str = match (implementer, part) {
+		(0x41, 0xd08) => "ARM Cortex-A72",
+		(0x41, 0xd0c) => "ARM Neoverse-N1",
+		(0x41, 0xd40) => "ARM Neoverse-V1",
+		(0x41, _) => "ARM",
+		(0x51, _) => "Qualcomm",
+		(0x61, _) => "Apple",
+		_ => "aarch64",
+	};
+	let b: &[u8] = name.as_bytes();
+	let n: usize = b.len().min(out.len());
+	out[..n].copy_from_slice(&b[..n]);
+	n
+}
+
 #[cfg(test)]
 pub fn exit_qemu(success: bool) -> ! {
 	// Terminate QEMU (run with `-semihosting`) via the Angel SYS_EXIT_EXTENDED call,

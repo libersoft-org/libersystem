@@ -3535,6 +3535,9 @@ fn inventory_tools_report_the_hardware() {
 		b"arch: x86_64"
 	};
 	assert!(contains(&lscpu, arch_line) && contains(&lscpu, b"cpu0: lapic "), "lscpu should print the architecture and each core's LAPIC id");
+	// The CPU model line (M119): x86 reports the CPUID brand string, aarch64 the MIDR
+	// decode (cortex-a72 -> "ARM Cortex-A72"), riscv64 the SBI vendor id ("riscv64").
+	assert!(contains(&lscpu, b"name: "), "lscpu should print the CPU model name");
 
 	let free = run_inventory_tool(b"free");
 	assert!(free.starts_with(b"Mem:  total ") && contains(&free, b"Heap: total "), "free should print the frame-pool and heap totals");
@@ -3543,16 +3546,19 @@ fn inventory_tools_report_the_hardware() {
 	assert!(contains(&lsmem, b" usable\n"), "lsmem should print the retained boot memory map with a usable region");
 
 	let lsirq = run_inventory_tool(b"lsirq");
-	// The kernel's own fixed vector: the LAPIC timer (vector 32) on x86, the EL1
-	// physical-timer PPI (INTID 30) on aarch64, the S-mode timer (scause code 5) on riscv.
-	let timer_line: &[u8] = if cfg!(target_arch = "aarch64") {
-		b"vector 30: fixed"
+	// lsirq renders an aligned column table (header + rows), like lsvol. The kernel's
+	// own fixed vector - the LAPIC timer (32) on x86, the EL1 physical-timer PPI (30)
+	// on aarch64, the S-mode timer (scause code 5) on riscv - appears as a `fixed` row
+	// (right-aligned vector in a width-6 column, two-space gutter, then the type).
+	let timer_row: &[u8] = if cfg!(target_arch = "aarch64") {
+		b"    30  fixed"
 	} else if cfg!(target_arch = "riscv64") {
-		b"vector 5: fixed"
+		b"     5  fixed"
 	} else {
-		b"vector 32: fixed"
+		b"    32  fixed"
 	};
-	assert!(contains(&lsirq, timer_line), "lsirq should report the kernel timer's fixed vector as in use");
+	assert!(contains(&lsirq, b"vector  type   bound  device  device-type"), "lsirq should print the aligned table header");
+	assert!(contains(&lsirq, timer_row), "lsirq should report the kernel timer's fixed vector as an aligned table row");
 
 	let lspci = run_inventory_tool(b"lspci");
 	assert!(contains(&lspci, b"1af4:") && contains(&lspci, b"(network controller)"), "lspci should report the retained bus scan with the virtio functions");
