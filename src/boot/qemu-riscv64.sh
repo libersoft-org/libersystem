@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# qemu-riscv64.sh - boot the riscv64 kernel under `qemu-system-riscv64 -machine virt`
-# over OpenSBI (bring-up).
+# Boot the riscv64 kernel under `qemu-system-riscv64 -machine virt` over OpenSBI.
+# Shared media/display setup lives in qemu-common.sh; U-Boot, AIA/IMSIC and final
+# launch remain here.
 #
 # QEMU loads OpenSBI (the -bios firmware, M-mode) and the kernel ELF (-kernel);
 # OpenSBI's fw_dynamic jumps to the kernel entry `_start` in S-mode with a0=hartid,
-# a1=DTB. This is the minimal direct-boot runner; disks + virtio devices are added in
-# later increments (the aarch64 runner `qemu-aarch64.sh` is the template).
+# a1=DTB. Disks and common peripheral images are prepared by qemu-common.sh.
 
 set -euo pipefail
 
 KERNEL="${1:?usage: qemu-riscv64.sh <kernel-elf>}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+QEMU_BOOT_DIR="$HERE"
+QEMU_BUILD_DIR="$HERE/.build"
+mkdir -p "$QEMU_BUILD_DIR"
+# shellcheck source=qemu-common.sh
+source "$HERE/qemu-common.sh"
 SERIAL="${SERIAL:-mon:stdio}"
 # Guest hart count = all host cores by default (full multi-core; the kernel scales to
 # every hart with no limit - verified booting to the shell with all 23 services online at
@@ -29,28 +35,7 @@ BIOS="${BIOS:-default}"
 UEFI="${UEFI:-0}"
 UBOOT="${UBOOT:-/usr/lib/u-boot/qemu-riscv64_smode/u-boot.bin}"
 
-# Graphical display backends (the same knobs the x86/aarch64 runners expose): DISPLAYS is
-# a space-separated list of `vnc` and/or `spice` (empty = headless, serial only). VNC
-# serves the virtio-gpu framebuffer on VNC_ADDR (default :0 = port 5900); SPICE serves it
-# plus the audio stream on SPICE_PORT (default 5930). The interactive device set below
-# (virtio-gpu/input/sound/serial) is attached whenever this is not a TEST run.
-want_vnc=0
-want_spice=0
-for _d in ${DISPLAYS:-}; do
-	case "$_d" in
-	vnc) want_vnc=1 ;;
-	spice) want_spice=1 ;;
-	none | "") ;;
-	*) echo "qemu-riscv64: unknown display '$_d' (expected vnc and/or spice)" >&2 && exit 1 ;;
-	esac
-done
-DISPLAY_ARGS=()
-if [[ "$want_vnc" == "1" ]]; then
-	DISPLAY_ARGS+=(-vnc "${VNC_ADDR:-0.0.0.0:0}")
-else
-	DISPLAY_ARGS+=(-display none)
-fi
-[[ "$want_spice" == "1" ]] && DISPLAY_ARGS+=(-spice "port=${SPICE_PORT:-5930},addr=0.0.0.0,disable-ticketing=on")
+qemu_parse_displays qemu-riscv64
 
 # System volume disk: a virtio-blk disk holding the packed volume archive at LBA 0.
 # StorageService reads that factory archive, formats a LiberFS past it, and seeds
@@ -58,21 +43,10 @@ fi
 # build.rs writes volume-riscv64.pkg into this script's .build directory. The userspace
 # virtio-blk driver polls the disk (no interrupt needed), so this works over the PLIC
 # without the per-device interrupt path. Attach only when the volume package exists.
-HERE="$(cd "$(dirname "$0")" && pwd)"
 VOLUME_PKG="$HERE/.build/volume-riscv64.pkg"
 VIRTIO_DISK="$HERE/.build/virtio-blk-riscv64.img"
 DISK_ARGS=()
-if [[ -f "$VOLUME_PKG" ]]; then
-	VIRTIO_DISK_SIZE=$((128 * 1024 * 1024))
-	# Recreate the disk when missing, the wrong size, or OLDER than the freshly staged
-	# volume archive: a LiberFS formatted by an earlier boot leaves its backup GPT
-	# header at the END of the disk, so StorageService would mount the old filesystem
-	# (with the old staged binaries) instead of reseeding from the new archive.
-	if [[ ! -f "$VIRTIO_DISK" || "$(stat -c%s "$VIRTIO_DISK")" -ne "$VIRTIO_DISK_SIZE" || ("$VOLUME_PKG" -nt "$VIRTIO_DISK") ]]; then
-		rm -f "$VIRTIO_DISK"
-		truncate -s "$VIRTIO_DISK_SIZE" "$VIRTIO_DISK"
-	fi
-	dd if="$VOLUME_PKG" of="$VIRTIO_DISK" bs=512 conv=notrunc status=none
+if qemu_prepare_system_disk "$VOLUME_PKG" "$VIRTIO_DISK"; then
 	DISK_ARGS=(-drive "if=none,id=vol0,format=raw,file=$VIRTIO_DISK" -device "virtio-blk-pci,drive=vol0")
 fi
 
@@ -83,46 +57,9 @@ fi
 # pays the mkfs cost); the virtio-blk drivers poll, so these need no interrupt path.
 # Skipped if its mkfs toolchain is missing. Attached in every run (including the TEST
 # topology), so the boot-chain test's five StorageService instances all come up.
-VOLDIR="$HERE/../volume"
-# exFAT media disk (vol://media), read-write.
-FAT_DISK="$HERE/.build/fat-media-riscv64.img"
-if [[ ! -f "$FAT_DISK" ]] && command -v mkfs.exfat >/dev/null; then
-	truncate -s 16M "$FAT_DISK"
-	if mkfs.exfat "$FAT_DISK" >/dev/null 2>&1; then
-		FMNT="$HERE/.build/media-mnt-rv64"
-		mkdir -p "$FMNT"
-		if mount -o loop "$FAT_DISK" "$FMNT" 2>/dev/null; then
-			cp "$VOLDIR/hello.txt" "$VOLDIR/motd.txt" "$FMNT"/ 2>/dev/null || true
-			umount "$FMNT" 2>/dev/null || true
-		fi
-		rmdir "$FMNT" 2>/dev/null || true
-	else
-		rm -f "$FAT_DISK"
-	fi
-fi
+qemu_prepare_media_images -riscv64 -rv64
 [[ -f "$FAT_DISK" ]] && DISK_ARGS+=(-drive "if=none,id=med0,format=raw,file=$FAT_DISK" -device "virtio-blk-pci,drive=med0")
-# ISO9660 disk (vol://iso), read-only.
-ISO_DISK="$HERE/.build/iso-media-riscv64.iso"
-if [[ ! -f "$ISO_DISK" ]] && command -v xorriso >/dev/null; then
-	xorriso -as mkisofs -quiet -J -R -o "$ISO_DISK" "$VOLDIR" 2>/dev/null || true
-fi
 [[ -f "$ISO_DISK" ]] && DISK_ARGS+=(-drive "if=none,id=iso0,format=raw,file=$ISO_DISK" -device "virtio-blk-pci,drive=iso0")
-# UDF disk (vol://udf), read-only.
-UDF_DISK="$HERE/.build/udf-media-riscv64.udf"
-if [[ ! -f "$UDF_DISK" ]] && command -v mkfs.udf >/dev/null; then
-	dd if=/dev/zero of="$UDF_DISK" bs=1M count=8 status=none 2>/dev/null || true
-	if mkfs.udf --media-type=hd --blocksize=2048 "$UDF_DISK" >/dev/null 2>&1; then
-		UMNT="$HERE/.build/udf-mnt-rv64"
-		mkdir -p "$UMNT"
-		if mount -o loop "$UDF_DISK" "$UMNT" 2>/dev/null; then
-			cp "$VOLDIR"/* "$UMNT"/ 2>/dev/null || true
-			umount "$UMNT" 2>/dev/null || true
-		fi
-		rmdir "$UMNT" 2>/dev/null || true
-	else
-		rm -f "$UDF_DISK"
-	fi
-fi
 [[ -f "$UDF_DISK" ]] && DISK_ARGS+=(-drive "if=none,id=udf0,format=raw,file=$UDF_DISK" -device "virtio-blk-pci,drive=udf0")
 
 # A virtio-net NIC on user networking, so DeviceManager brings up the virtio_net driver
@@ -135,15 +72,7 @@ DISK_ARGS+=(-netdev "user,id=vnet0" -device "virtio-net-pci,netdev=vnet0")
 # xHCI USB host controller + a hub with a keyboard, tablet, and a FAT mass-storage stick
 # backing vol://usb (seeded from volume/ when mtools is present) - the same USB set the
 # aarch64/x86 runners attach; the device-table tests expect the xHCI controller present.
-USB_DISK="$HERE/.build/usb-media-riscv64.img"
-if [[ ! -f "$USB_DISK" ]]; then
-	truncate -s 16M "$USB_DISK"
-	if command -v mformat >/dev/null && command -v mcopy >/dev/null; then
-		mformat -i "$USB_DISK" -F ::
-		mcopy -i "$USB_DISK" "$VOLDIR/hello.txt" ::hello.txt 2>/dev/null || true
-		mcopy -i "$USB_DISK" "$VOLDIR/motd.txt" ::motd.txt 2>/dev/null || true
-	fi
-fi
+qemu_prepare_usb_image -riscv64
 DISK_ARGS+=(
 	-device "qemu-xhci,id=usb"
 	-device "usb-hub,bus=usb.0,port=1"
@@ -162,11 +91,6 @@ DISK_ARGS+=(
 #     like x86. QEMU's `virt` has no VGA, and QEMU 10's virtio-gpu carries no combined
 #     ramfb, so ramfb (not virtio-gpu) is the display here; runtime resize (a virtio-gpu
 #     feature) is traded for the kernel-drawn early framebuffer.
-#   - virtio-keyboard + virtio-tablet: virtio_input keyboard + pointer, so InputService
-#     gets keystrokes and absolute pointer events on the graphical display.
-#   - virtio-sound: the audio device the `beep` command drives; its audiodev is the SPICE
-#     playback stream when SPICE is up, else a null sink.
-#   - virtio-serial + virtconsole: mirrors a second console to a file, matching x86/aarch64.
 #   - virtio-keyboard + virtio-tablet: virtio_input keyboard + pointer, so InputService
 #     gets keystrokes and absolute pointer events on the graphical display.
 #   - virtio-sound: the audio device the `beep` command drives; its audiodev is the SPICE

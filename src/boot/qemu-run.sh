@@ -13,6 +13,11 @@ set -euo pipefail
 
 KERNEL="${1:?path to kernel ELF is missing}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+QEMU_BOOT_DIR="$HERE"
+QEMU_BUILD_DIR="$HERE/.build"
+mkdir -p "$QEMU_BUILD_DIR"
+# shellcheck source=qemu-common.sh
+source "$HERE/qemu-common.sh"
 
 # build the own UEFI loader (its EFI binary is staged into the boot image as
 # BOOTX64.EFI); it lives in its own crate with its own UEFI target.
@@ -58,7 +63,6 @@ QEMU_ARGS=(
 # fits the userspace capability-driver model. The scratch disk is created once.
 VIRTIO_DISK="$HERE/.build/virtio-blk.img"
 VOLUME_PKG="$HERE/.build/volume.pkg"
-mkdir -p "$HERE/.build"
 # The system volume disk. It must hold the factory archive at LBA 0 (now a few megabytes
 # of staged program binaries) followed by the LiberFS region, so it is sized
 # well past both. A raw sparse image costs only the blocks actually written. Recreate it
@@ -68,74 +72,13 @@ mkdir -p "$HERE/.build"
 # of the disk - StorageService then mounts the old filesystem (with the old staged
 # binaries) instead of reseeding from the new archive. Recreating forces a clean
 # reformat and reseed, so a rebuilt volume.pkg always reaches vol://system.
-VIRTIO_DISK_SIZE=$((128 * 1024 * 1024))
-if [[ ! -f "$VIRTIO_DISK" || "$(stat -c%s "$VIRTIO_DISK")" -ne "$VIRTIO_DISK_SIZE" || ("$VOLUME_PKG" -nt "$VIRTIO_DISK") ]]; then
-	rm -f "$VIRTIO_DISK"
-	truncate -s "$VIRTIO_DISK_SIZE" "$VIRTIO_DISK"
-fi
-# StorageService backs its `vol://system` volume with this block device, so
-# lay the packed volume archive down at LBA 0 on every boot (conv=notrunc keeps the
-# disk at its full size; the kernel's build.rs produces volume.pkg next to it).
-if [[ -f "$VOLUME_PKG" ]]; then
-	dd if="$VOLUME_PKG" of="$VIRTIO_DISK" bs=512 conv=notrunc status=none
-fi
+qemu_prepare_system_disk "$VOLUME_PKG" "$VIRTIO_DISK" || true
 # A second virtio-blk disk holding a real exFAT volume (read and write): the media
 # StorageService instance mounts it read-write as `vol://media`. Built once with mkfs.exfat
 # (a genuine exFAT image, not a fixture) and seeded via a loopback mount; falls back to an
 # mtools FAT32 image when mkfs.exfat / loop mount is unavailable, and is skipped entirely
 # if neither toolchain is present. Files come from the volume/ seed dir.
-FAT_DISK="$HERE/.build/fat-media.img"
-if [[ ! -f "$FAT_DISK" ]] && command -v mkfs.exfat >/dev/null; then
-	truncate -s 16M "$FAT_DISK"
-	if mkfs.exfat "$FAT_DISK" >/dev/null 2>&1; then
-		FMNT="$HERE/.build/media-mnt"
-		mkdir -p "$FMNT"
-		if mount -o loop "$FAT_DISK" "$FMNT" 2>/dev/null; then
-			cp "$HERE/../volume/hello.txt" "$HERE/../volume/motd.txt" "$FMNT"/ 2>/dev/null || true
-			umount "$FMNT" 2>/dev/null || true
-		fi
-		rmdir "$FMNT" 2>/dev/null || true
-	else
-		rm -f "$FAT_DISK"
-	fi
-fi
-if [[ ! -f "$FAT_DISK" ]] && command -v mformat >/dev/null && command -v mcopy >/dev/null; then
-	truncate -s 16M "$FAT_DISK"
-	mformat -i "$FAT_DISK" -F ::
-	mcopy -i "$FAT_DISK" "$HERE/../volume/hello.txt" ::hello.txt
-	mcopy -i "$FAT_DISK" "$HERE/../volume/motd.txt" ::motd.txt
-fi
-# A third virtio-blk disk holding a real ISO9660 image: the iso StorageService
-# instance mounts it read-only as `vol://iso`. Built once with xorriso/genisoimage so it
-# is a genuine optical image, not a fixture; skipped if neither is present (the iso volume
-# then simply does not mount). Files come from the volume/ seed dir.
-ISO_DISK="$HERE/.build/iso-media.iso"
-if [[ ! -f "$ISO_DISK" ]]; then
-	if command -v xorriso >/dev/null; then
-		xorriso -as mkisofs -quiet -J -R -o "$ISO_DISK" "$HERE/../volume" 2>/dev/null || true
-	elif command -v genisoimage >/dev/null; then
-		genisoimage -quiet -J -R -o "$ISO_DISK" "$HERE/../volume" 2>/dev/null || true
-	fi
-fi
-# A fourth virtio-blk disk holding a real UDF image: the udf StorageService
-# instance mounts it read-only as `vol://udf`. Built once with mkfs.udf (blocksize 2048,
-# DVD-style) and populated via a loopback mount; skipped if mkfs.udf or loop mount is
-# unavailable (the udf volume then simply does not mount). Files come from volume/.
-UDF_DISK="$HERE/.build/udf-media.udf"
-if [[ ! -f "$UDF_DISK" ]] && command -v mkfs.udf >/dev/null; then
-	dd if=/dev/zero of="$UDF_DISK" bs=1M count=8 status=none 2>/dev/null || true
-	if mkfs.udf --media-type=hd --blocksize=2048 "$UDF_DISK" >/dev/null 2>&1; then
-		UMNT="$HERE/.build/udf-mnt"
-		mkdir -p "$UMNT"
-		if mount -o loop,ro=0 "$UDF_DISK" "$UMNT" 2>/dev/null; then
-			cp "$HERE/../volume"/* "$UMNT"/ 2>/dev/null || true
-			umount "$UMNT" 2>/dev/null || true
-		fi
-		rmdir "$UMNT" 2>/dev/null || true
-	else
-		rm -f "$UDF_DISK"
-	fi
-fi
+qemu_prepare_media_images "" "" loop,ro=0 1
 # Forward host 127.0.0.1:5555 to the guest's port 80, so a host HTTP client can reach
 # the guest's httpd (passive open / inbound) - SLIRP gives no inbound route otherwise.
 # Interactive runs only: the test path keeps a fixed device set and binds no host port.
@@ -173,15 +116,7 @@ QEMU_ARGS+=(
 # present it is seeded as FAT with the volume/ files so vol://usb mounts with
 # content. Recreated only when missing. Skipped when a real stick is passed through
 # (USB_HOST, interactive only), so that stick is the one storage device on the bus.
-USB_DISK="$HERE/.build/usb-media.img"
-if [[ ! -f "$USB_DISK" ]]; then
-	truncate -s 16M "$USB_DISK"
-	if command -v mformat >/dev/null && command -v mcopy >/dev/null; then
-		mformat -i "$USB_DISK" -F ::
-		mcopy -i "$USB_DISK" "$HERE/../volume/hello.txt" ::hello.txt
-		mcopy -i "$USB_DISK" "$HERE/../volume/motd.txt" ::motd.txt
-	fi
-fi
+qemu_prepare_usb_image ""
 if [[ "${TEST:-0}" == "1" || -z "${USB_HOST:-}" ]]; then
 	QEMU_ARGS+=(
 		-drive "file=$USB_DISK,if=none,id=vusb,format=raw"
@@ -218,27 +153,8 @@ fi
 # framebuffer is always rendered and can also be screenshotted via screenshot.sh.
 #   vnc    a VNC server; VNC_ADDR sets the bind/display, default 0.0.0.0:0 (port 5900)
 #   spice  a SPICE server; SPICE_PORT sets the TCP port, default 5930
-want_vnc=0
-want_spice=0
-for display in ${DISPLAYS:-}; do
-	case "$display" in
-	vnc) want_vnc=1 ;;
-	spice) want_spice=1 ;;
-	none) ;;
-	*) echo "qemu-run: unknown display '$display' (expected vnc and/or spice)" >&2 && exit 1 ;;
-	esac
-done
-
-# A VNC server doubles as the local display; otherwise suppress the default UI
-# (so spice-only and headless do not try to open a GTK/SDL window).
-if [[ "$want_vnc" == "1" ]]; then
-	QEMU_ARGS+=(-vnc "${VNC_ADDR:-0.0.0.0:0}")
-else
-	QEMU_ARGS+=(-display none)
-fi
-if [[ "$want_spice" == "1" ]]; then
-	QEMU_ARGS+=(-spice "port=${SPICE_PORT:-5930},addr=0.0.0.0,disable-ticketing=on")
-fi
+qemu_parse_displays qemu-run
+QEMU_ARGS+=("${DISPLAY_ARGS[@]}")
 
 # Match the guest's core count to the host's (overridable with SMP=<n>), so SMP
 # runs exercise everything the machine has instead of a fixed number.
