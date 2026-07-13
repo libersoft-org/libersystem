@@ -1,17 +1,92 @@
 #!/usr/bin/env bash
-# qemu-run.sh - cargo runner: builds the own UEFI loader, assembles a UEFI-only
-# bootable ISO from the kernel ELF, and launches QEMU through OVMF.
+# Unified QEMU runner for all architectures: x86_64, aarch64, riscv64.
 #
-# Usage: qemu-run.sh <kernel-elf>
-# Env variables:
+# Usage: qemu-run.sh [x86_64|aarch64|riscv64] [kernel-elf]
+# No arguments: detect native arch from uname -m and use default kernel path.
+# First arg matching an arch selects it; optional second arg overrides kernel ELF.
+# First arg not matching an arch is treated as kernel ELF (backward-compatible).
+#
+# Environment variables (preserved across all architectures):
 #   DEBUG=1   QEMU waits for GDB (-s -S) on port :1234
 #   NOKVM=1   disable KVM (more reliable single-stepping under TCG)
-#   TEST=1    test mode (isa-debug-exit, maps exit code to pass/fail)
-#   SERIAL=   QEMU serial backend (default mon:stdio; e.g. file:boot.log)
+#   TEST=1    test mode (isa-debug-exit or semihosting, maps exit code to pass/fail)
+#   SERIAL=   QEMU serial backend (default mon:stdio; e.g. file:boot.log or stdio)
+#   SMP=N     override core/hart count (default: nproc, with arch-specific caps)
+#   MEM=      override RAM (default varies by arch)
+#   DISPLAYS= space-separated list of vnc and/or spice (empty = headless)
+#   VNC_ADDR= VNC bind address (default 0.0.0.0:0)
+#   SPICE_PORT= SPICE TCP port (default 5930)
+#   QEMU_EXTRA= extra QEMU arguments
+#   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
+#   UEFI=1    boot through own UEFI loader (aarch64/riscv64 only)
+#   OVMF_*, AAVMF_*, BIOS=, UBOOT=, LOADER_EFI=, DTB_ADDR= arch-specific firmware
 
 set -euo pipefail
 
-KERNEL="${1:?path to kernel ELF is missing}"
+normalize_arch() {
+	case "$1" in
+	x86_64) echo "x86_64" ;;
+	aarch64 | arm64) echo "aarch64" ;;
+	riscv64) echo "riscv64" ;;
+	*)
+		echo "qemu-run: unknown architecture '$1'" >&2
+		return 1
+		;;
+	esac
+}
+
+detect_native_arch() {
+	local host
+	host="$(uname -m)"
+	case "$host" in
+	x86_64) echo "x86_64" ;;
+	aarch64 | arm64) echo "aarch64" ;;
+	riscv64) echo "riscv64" ;;
+	*)
+		echo "qemu-run: unsupported host architecture '$host'" >&2
+		exit 1
+		;;
+	esac
+}
+
+qemu_select_cpu() {
+	local -n args=$1
+	local target="$2"
+	local emulated_cpu="$3"
+	local host
+	case "$(uname -m)" in
+	x86_64) host=x86_64 ;;
+	aarch64 | arm64) host=aarch64 ;;
+	riscv64) host=riscv64 ;;
+	*) host=other ;;
+	esac
+	if [[ "${NOKVM:-0}" != "1" && "$target" == "$host" && -e /dev/kvm ]]; then
+		args=(-enable-kvm -cpu host)
+	else
+		args=(-cpu "$emulated_cpu")
+	fi
+}
+
+TARGET_ARCH=""
+KERNEL_ELF=""
+
+if [[ $# -eq 0 ]]; then
+	TARGET_ARCH="$(detect_native_arch)"
+elif [[ $# -eq 1 ]]; then
+	if normalize_arch "$1" >/dev/null 2>&1; then
+		TARGET_ARCH="$(normalize_arch "$1")"
+	else
+		TARGET_ARCH="$(detect_native_arch)"
+		KERNEL_ELF="$1"
+	fi
+elif [[ $# -eq 2 ]]; then
+	TARGET_ARCH="$(normalize_arch "$1")"
+	KERNEL_ELF="$2"
+else
+	echo "usage: qemu-run.sh [x86_64|aarch64|riscv64] [kernel-elf]" >&2
+	exit 1
+fi
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QEMU_BOOT_DIR="$HERE"
 QEMU_BUILD_DIR="$HERE/.build"
@@ -19,220 +94,342 @@ mkdir -p "$QEMU_BUILD_DIR"
 # shellcheck source=qemu-common.sh
 source "$HERE/qemu-common.sh"
 
-# build the own UEFI loader (its EFI binary is staged into the boot image as
-# BOOTX64.EFI); it lives in its own crate with its own UEFI target.
-(cd "$HERE/../loader" && cargo build) >&2
+if [[ -z "$KERNEL_ELF" ]]; then
+	case "$TARGET_ARCH" in
+	x86_64) KERNEL_ELF="$HERE/../kernel/target/x86_64-unknown-none/debug/kernel" ;;
+	aarch64) KERNEL_ELF="$HERE/../kernel/target/aarch64-unknown-none/debug/kernel" ;;
+	riscv64) KERNEL_ELF="$HERE/../kernel/target/riscv64gc-unknown-none-elf/debug/kernel" ;;
+	esac
+fi
 
-# build the bootable ISO (mkimage.sh prints its path on stdout)
-ISO="$("$HERE/mkimage.sh" iso "$KERNEL")"
-
-# UEFI firmware (OVMF): the platform boots through UEFI, not SeaBIOS - the ISO is
-# hybrid, and development deliberately exercises the UEFI path (the own UEFI-only
-# bootloader is the target; see the concept's bootloader choice). The CODE image is
-# read-only and shared; each run gets a private writable copy of the VARS store so
-# concurrent instances (a test suite next to a live run) never fight over NVRAM.
-# The script execs QEMU (no exit trap can clean up), so stale copies from earlier
-# runs are unlinked here instead - a still-running instance keeps its copy alive
-# through its open file descriptor.
-OVMF_CODE="${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
-OVMF_VARS_SRC="${OVMF_VARS_SRC:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
-[[ -f "$OVMF_CODE" && -f "$OVMF_VARS_SRC" ]] || {
-	echo "OVMF firmware not found (install the 'ovmf' package)" >&2
+[[ -f "$KERNEL_ELF" ]] || {
+	echo "qemu-run: kernel ELF not found: $KERNEL_ELF" >&2
 	exit 1
 }
-mkdir -p "$HERE/.build"
-rm -f "$HERE/.build/ovmf-vars."*.fd
-OVMF_VARS="$(mktemp "$HERE/.build/ovmf-vars.XXXXXX.fd")"
-cp "$OVMF_VARS_SRC" "$OVMF_VARS"
 
-# build the QEMU arguments
-QEMU_ARGS=(
-	-machine q35
-	-m 4G
-	-drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE"
-	-drive if=pflash,format=raw,file="$OVMF_VARS"
-	-cdrom "$ISO"
-	-boot d
-	-serial "${SERIAL:-mon:stdio}"
-)
+qemu_run_x86_64() {
+	local kernel="$1"
+	# Build the own UEFI loader (its EFI binary is staged into the boot image as
+	# BOOTX64.EFI); it lives in its own crate with its own UEFI target.
+	(cd "$HERE/../loader" && cargo build) >&2
 
-# virtio devices for the userspace drivers: a scratch block disk, a
-# user-mode NIC, and a virtio serial/console. The kernel's PCI scan discovers them
-# and userspace drivers drive them. `disable-legacy=on` forces the modern virtio
-# transport (MMIO BARs + PCI capabilities, device id 0x1040 + virtio type), which
-# fits the userspace capability-driver model. The scratch disk is created once.
-VIRTIO_DISK="$HERE/.build/virtio-blk.img"
-VOLUME_PKG="$HERE/.build/volume.pkg"
-# The system volume disk. It must hold the factory archive at LBA 0 (now a few megabytes
-# of staged program binaries) followed by the LiberFS region, so it is sized
-# well past both. A raw sparse image costs only the blocks actually written. Recreate it
-# when missing, the wrong size (e.g. after a filesystem-geometry change), or OLDER than
-# the freshly staged volume archive: overlaying the archive at LBA 0 is not enough,
-# because a LiberFS formatted by an earlier boot leaves its backup GPT header at the END
-# of the disk - StorageService then mounts the old filesystem (with the old staged
-# binaries) instead of reseeding from the new archive. Recreating forces a clean
-# reformat and reseed, so a rebuilt volume.pkg always reaches vol://system.
-qemu_prepare_system_disk "$VOLUME_PKG" "$VIRTIO_DISK" || true
-# A second virtio-blk disk holding a real exFAT volume (read and write): the media
-# StorageService instance mounts it read-write as `vol://media`. Built once with mkfs.exfat
-# (a genuine exFAT image, not a fixture) and seeded via a loopback mount; falls back to an
-# mtools FAT32 image when mkfs.exfat / loop mount is unavailable, and is skipped entirely
-# if neither toolchain is present. Files come from the volume/ seed dir.
-qemu_prepare_media_images "" "" loop,ro=0 1
-# Forward host 127.0.0.1:5555 to the guest's port 80, so a host HTTP client can reach
-# the guest's httpd (passive open / inbound) - SLIRP gives no inbound route otherwise.
-# Interactive runs only: the test path keeps a fixed device set and binds no host port.
-NET_USER="user,id=vnet0"
-if [[ "${TEST:-0}" != "1" ]]; then
-	NET_USER="$NET_USER,hostfwd=tcp:127.0.0.1:5555-:80"
-fi
-QEMU_ARGS+=(
-	-drive "file=$VIRTIO_DISK,if=none,id=vblk,format=raw"
-	-device virtio-blk-pci,drive=vblk,disable-legacy=on
-	-netdev "$NET_USER"
-	-device virtio-net-pci,netdev=vnet0,disable-legacy=on
-	-device virtio-serial-pci,disable-legacy=on
-	-device virtconsole,chardev=vcon
-	-chardev "file,id=vcon,path=$HERE/.build/virtio-console.out"
-	# xHCI USB host controller: the kernel's PCI scan discovers it by class
-	# (0x0C/0x03/0x30) and records its MMIO BAR in the device table; the userspace
-	# xhci driver maps it and runs the USB stack. A hub hangs off port 1 with a USB
-	# keyboard and a USB tablet behind it, so enumeration always exercises the hub
-	# expansion path (port power, hub-request port reset, route strings) and the HID
-	# report-descriptor path for both a keyboard and a pointing device. Attached on
-	# the test path too, so the kernel tests can assert the controller is discovered
-	# and its bus - hub included - enumerated.
-	-device qemu-xhci,id=usb
-	-device usb-hub,bus=usb.0,port=1
-	-device usb-kbd,bus=usb.0,port=1.1
-	-device usb-tablet,bus=usb.0,port=1.2
-)
+	# Build the bootable ISO (mkimage.sh prints its path on stdout)
+	local iso
+	iso="$("$HERE/mkimage.sh" iso "$kernel")"
 
-# A USB mass-storage stick on the xHCI bus: the xhci driver speaks SCSI over
-# the Bulk-Only Transport to it and serves the same block-channel protocol as
-# driver.virtio-blk, so a StorageService instance mounts it as vol://usb. The image
-# always exists (a bare truncate suffices - the driver's bring-up needs no
-# filesystem), so the test path's device set stays deterministic; when mtools is
-# present it is seeded as FAT with the volume/ files so vol://usb mounts with
-# content. Recreated only when missing. Skipped when a real stick is passed through
-# (USB_HOST, interactive only), so that stick is the one storage device on the bus.
-qemu_prepare_usb_image ""
-if [[ "${TEST:-0}" == "1" || -z "${USB_HOST:-}" ]]; then
-	QEMU_ARGS+=(
-		-drive "file=$USB_DISK,if=none,id=vusb,format=raw"
-		-device usb-storage,bus=usb.0,drive=vusb,id=usbstick
+	# UEFI firmware (OVMF): the platform boots through UEFI, not SeaBIOS - the ISO is
+	# hybrid, and development deliberately exercises the UEFI path (the own UEFI-only
+	# bootloader is the target; see the concept's bootloader choice). The CODE image is
+	# read-only and shared; each run gets a private writable copy of the VARS store so
+	# concurrent instances (a test suite next to a live run) never fight over NVRAM.
+	# The script execs QEMU (no exit trap can clean up), so stale copies from earlier
+	# runs are unlinked here instead - a still-running instance keeps its copy alive
+	# through its open file descriptor.
+	local ovmf_code="${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
+	local ovmf_vars_src="${OVMF_VARS_SRC:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
+	[[ -f "$ovmf_code" && -f "$ovmf_vars_src" ]] || {
+		echo "qemu-run: OVMF firmware not found (install the 'ovmf' package)" >&2
+		exit 1
+	}
+	rm -f "$QEMU_BUILD_DIR/ovmf-vars."*.fd
+	local ovmf_vars
+	ovmf_vars="$(mktemp "$QEMU_BUILD_DIR/ovmf-vars.XXXXXX.fd")"
+	cp "$ovmf_vars_src" "$ovmf_vars"
+
+	local qemu_args=(
+		-machine q35
+		-m "${MEM:-4G}"
+		-drive "if=pflash,format=raw,readonly=on,file=$ovmf_code"
+		-drive "if=pflash,format=raw,file=$ovmf_vars"
+		-cdrom "$iso"
+		-boot d
+		-serial "${SERIAL:-mon:stdio}"
 	)
-fi
-# The second virtio-blk disk (FAT vol://media), discovered after the system disk; only
-# attached when the FAT image was built (mtools present).
-if [[ -f "$FAT_DISK" ]]; then
-	QEMU_ARGS+=(
-		-drive "file=$FAT_DISK,if=none,id=vmedia,format=raw"
-		-device virtio-blk-pci,drive=vmedia,disable-legacy=on
+
+	# System volume disk: holds the factory archive at LBA 0.
+	local volume_pkg="$QEMU_BUILD_DIR/volume.pkg"
+	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk.img"
+	qemu_prepare_system_disk "$volume_pkg" "$virtio_disk" || true
+	qemu_attach_virtio_blk qemu_args "$virtio_disk" vblk "disable-legacy=on"
+
+	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
+	qemu_prepare_media_images "" "" loop,ro=0 1
+
+	# Network: user-mode NIC with optional hostfwd for interactive runs.
+	local hostfwd=""
+	[[ "${TEST:-0}" != "1" ]] && hostfwd="hostfwd=tcp:127.0.0.1:5555-:80"
+	qemu_attach_virtio_net qemu_args vnet0 "$hostfwd" "disable-legacy=on"
+
+	# virtio-serial + virtconsole: mirrors a second console to a file.
+	qemu_args+=(
+		-device virtio-serial-pci,disable-legacy=on
+		-device virtconsole,chardev=vcon
+		-chardev "file,id=vcon,path=$QEMU_BUILD_DIR/virtio-console.out"
 	)
-fi
-# The third virtio-blk disk (ISO9660 vol://iso), discovered after the media disk; only
-# attached when the ISO image was built (xorriso / genisoimage present).
-if [[ -f "$ISO_DISK" ]]; then
-	QEMU_ARGS+=(
-		-drive "file=$ISO_DISK,if=none,id=viso,format=raw"
-		-device virtio-blk-pci,drive=viso,disable-legacy=on
-	)
-fi
-# The fourth virtio-blk disk (UDF vol://udf), discovered after the iso disk; only
-# attached when the UDF image was built (mkfs.udf present and loop mount succeeded).
-if [[ -f "$UDF_DISK" ]]; then
-	QEMU_ARGS+=(
-		-drive "file=$UDF_DISK,if=none,id=vudf,format=raw"
-		-device virtio-blk-pci,drive=vudf,disable-legacy=on
-	)
-fi
 
-# display backends: the DISPLAYS env is a space-separated list, any of `vnc` and
-# `spice` (both may be given at once; empty = headless, serial only). The
-# framebuffer is always rendered and can also be screenshotted via screenshot.sh.
-#   vnc    a VNC server; VNC_ADDR sets the bind/display, default 0.0.0.0:0 (port 5900)
-#   spice  a SPICE server; SPICE_PORT sets the TCP port, default 5930
-qemu_parse_displays qemu-run
-QEMU_ARGS+=("${DISPLAY_ARGS[@]}")
+	# xHCI USB host controller + hub with keyboard, tablet, and optional storage.
+	qemu_prepare_usb_image ""
+	local usb_storage_id=""
+	if [[ "${TEST:-0}" == "1" || -z "${USB_HOST:-}" ]]; then
+		usb_storage_id="vusb"
+		qemu_args+=(-drive "file=$USB_DISK,if=none,id=vusb,format=raw")
+	fi
+	qemu_attach_xhci qemu_args "$usb_storage_id"
 
-# Match the guest's core count to the host's (overridable with SMP=<n>), so SMP
-# runs exercise everything the machine has instead of a fixed number.
-SMP="${SMP:-$(nproc)}"
-if [[ "${NOKVM:-0}" != "1" && -e /dev/kvm ]]; then
-	QEMU_ARGS+=(-enable-kvm -cpu host -smp "$SMP")
-else
-	QEMU_ARGS+=(-cpu qemu64,+rdrand,+smep,+smap -smp "$SMP")
-fi
+	# Keep media disks after USB in PCI discovery order, matching the historical
+	# runner and the volume/device inventory expected by the boot chain.
+	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" vmedia "disable-legacy=on"
+	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" viso "disable-legacy=on"
+	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "disable-legacy=on"
 
-if [[ "${DEBUG:-0}" == "1" ]]; then
-	QEMU_ARGS+=(-s -S)
-	echo "[qemu-run] waiting for GDB on :1234 (run 'just gdb' in another panel)"
-fi
+	# Display backends: parse DISPLAYS env for vnc/spice.
+	qemu_parse_displays qemu-run
+	qemu_args+=("${DISPLAY_ARGS[@]}")
 
-if [[ "${TEST:-0}" == "1" ]]; then
-	# -no-reboot: a triple fault in a test exits QEMU instead of reboot-looping
-	QEMU_ARGS+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
-	set +e
-	qemu-system-x86_64 "${QEMU_ARGS[@]}"
-	code=$?
-	set -e
-	# isa-debug-exit: success = (0x10 << 1) | 1 = 33
-	[[ "$code" -eq 33 ]] && exit 0
-	exit "$code"
-fi
+	# CPU and SMP: KVM for a matching host, otherwise the emulated x86 model.
+	local smp="${SMP:-$(nproc)}"
+	local cpu_args=()
+	qemu_select_cpu cpu_args x86_64 qemu64,+rdrand,+smep,+smap
+	qemu_args+=("${cpu_args[@]}" -smp "$smp")
 
-# virtio-input keyboard: interactive runs only. The userspace virtio_input
-# driver takes this device's interrupt and feeds key presses to the console shell,
-# so typing in the SPICE/VNC window drives the system. Left out of the test path to
-# keep that device set deterministic (the test boot exercises only blk/net/console).
-QEMU_ARGS+=(-device virtio-keyboard-pci,disable-legacy=on)
+	qemu_append_debug_args qemu_args
 
-# A real USB device passed through from the host onto the guest's xHCI bus
-# (interactive runs only): USB_HOST=vendorid:productid (hex, as `lsusb` prints them,
-# e.g. USB_HOST=0951:1666). The device detaches from the host for the run and the
-# xhci driver enumerates it like the emulated ones - a real mass-storage stick
-# replaces the emulated image (skipped above) and mounts as vol://usb, testing the
-# BOT/SCSI path against genuine hardware. Needs access to the USB device node.
-if [[ -n "${USB_HOST:-}" ]]; then
-	QEMU_ARGS+=(-device "usb-host,bus=usb.0,vendorid=0x${USB_HOST%%:*},productid=0x${USB_HOST##*:}")
-fi
+	if [[ "${TEST:-0}" == "1" ]]; then
+		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
+		set +e
+		qemu-system-x86_64 "${qemu_args[@]}"
+		local code=$?
+		set -e
+		[[ "$code" -eq 33 ]] && exit 0
+		exit "$code"
+	fi
 
-# virtio-input tablet: interactive runs only. An absolute pointer device the
-# same userspace virtio_input driver self-identifies and drives, delivering text-cell
-# pointer/button events to InputService. A tablet (absolute coordinates) maps cleanly
-# to screen cells; left out of the test path with the keyboard to keep that set
-# deterministic (InputService's stream is proven by a kernel test instead).
-QEMU_ARGS+=(-device virtio-tablet-pci,disable-legacy=on)
+	# Interactive-only devices: virtio-input keyboard/tablet, virtio-vga, virtio-sound.
+	qemu_args+=(-device virtio-keyboard-pci,disable-legacy=on)
+	qemu_args+=(-device virtio-tablet-pci,disable-legacy=on)
+	qemu_args+=(-vga none -device virtio-vga)
+	if [[ "$want_spice" == "1" ]]; then
+		qemu_args+=(-audiodev "spice,id=snd0")
+	else
+		qemu_args+=(-audiodev "none,id=snd0")
+	fi
+	qemu_args+=(-device virtio-sound-pci,audiodev=snd0)
 
-# virtio-vga: interactive runs only. A virtio-gpu device that also presents a
-# VGA-compatible boot framebuffer, so the loader still renders the boot log while
-# driver.virtio-gpu drives the display (a 2D scanout, and a resize event when the host
-# window changes). It replaces the default std VGA (-vga none) here; the test path
-# keeps std VGA (no virtio-gpu device, so ConsoleService falls back to the boot
-# framebuffer and the deterministic 4-device set is unchanged).
-QEMU_ARGS+=(-vga none -device virtio-vga)
+	# USB passthrough: real USB device (interactive only).
+	if [[ -n "${USB_HOST:-}" ]]; then
+		qemu_args+=(-device "usb-host,bus=usb.0,vendorid=0x${USB_HOST%%:*},productid=0x${USB_HOST##*:}")
+	fi
 
-# virtio-sound: interactive runs only. A virtio-sound device the userspace
-# driver.virtio-snd drives for PCM playback (the shell `beep` command, via
-# AudioService). Its host audio backend is the SPICE server when a SPICE display is
-# requested (so a connected SPICE client hears it), else a null sink (the guest still
-# plays, nothing is emitted). Left out of the test path to keep that device set
-# deterministic (the test boot exercises only blk/net/console).
-if [[ "$want_spice" == "1" ]]; then
-	QEMU_ARGS+=(-audiodev spice,id=snd0)
-else
-	QEMU_ARGS+=(-audiodev none,id=snd0)
-fi
-QEMU_ARGS+=(-device virtio-sound-pci,audiodev=snd0)
+	# Interactive control sockets used by screenshot.sh and lab.py.
+	local monitor_socket="$QEMU_BUILD_DIR/qemu-monitor.sock"
+	local qmp_socket="$QEMU_BUILD_DIR/qemu-qmp.sock"
+	rm -f "$monitor_socket" "$qmp_socket"
+	qemu_args+=(-monitor "unix:$monitor_socket,server,nowait")
+	qemu_args+=(-qmp "unix:$qmp_socket,server,nowait")
 
-# Expose a control monitor on a unix socket (alongside the stdio monitor) so
-# boot/screenshot.sh can attach to this running instance and snap the live
-# framebuffer at any time. Only for interactive runs (not the test path above).
-MON_SOCK="$HERE/.build/qemu-monitor.sock"
-mkdir -p "$HERE/.build"
-rm -f "$MON_SOCK"
-QEMU_ARGS+=(-monitor "unix:$MON_SOCK,server,nowait")
-QEMU_ARGS+=(-qmp "unix:$HERE/.build/qemu-qmp.sock,server,nowait")
+	exec qemu-system-x86_64 "${qemu_args[@]}" ${QEMU_EXTRA:-}
+}
 
-exec qemu-system-x86_64 "${QEMU_ARGS[@]}"
+qemu_run_aarch64() {
+	local kernel="$1"
+	local serial="${SERIAL:-mon:stdio}"
+	local smp="${SMP:-$(nproc | awk '{print ($1 > 8) ? 8 : $1}')}"
+	local mem="${MEM:-512M}"
+	local dtb_addr="${DTB_ADDR:-0x4A000000}"
+	local uefi="${UEFI:-0}"
+	local aavmf_code="${AAVMF_CODE:-/usr/share/AAVMF/AAVMF_CODE.fd}"
+	local aavmf_vars="${AAVMF_VARS:-/usr/share/AAVMF/AAVMF_VARS.fd}"
+
+	qemu_parse_displays qemu-run
+
+	local machine="virt,gic-version=2"
+	local qemu_args=()
+	local cpu_args=()
+	qemu_select_cpu cpu_args aarch64 cortex-a72
+
+	# System volume disk: virtio-blk holding the factory archive.
+	local volume_pkg="$QEMU_BUILD_DIR/volume-aarch64.pkg"
+	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk-aarch64.img"
+	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
+		qemu_attach_virtio_blk qemu_args "$virtio_disk" vol0 "disable-legacy=on"
+	fi
+
+	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
+	qemu_prepare_media_images -aarch64 -a64
+	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 "disable-legacy=on"
+	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 "disable-legacy=on"
+	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" udf0 "disable-legacy=on"
+
+	# Network: user-mode virtio-net.
+	qemu_attach_virtio_net qemu_args vnet0 "" "disable-legacy=on"
+
+	# xHCI USB host controller + hub with keyboard, tablet, and storage.
+	qemu_prepare_usb_image -aarch64
+	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$USB_DISK")
+	qemu_attach_xhci qemu_args vusb
+
+	# Test mode: enable Arm semihosting, route serial to stdout.
+	local test_args=()
+	if [[ "${TEST:-0}" == "1" ]]; then
+		test_args+=(-semihosting)
+		serial="stdio"
+	else
+		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
+		qemu_attach_virt_interactive qemu_args -aarch64 "disable-legacy=on"
+	fi
+	qemu_append_debug_args qemu_args
+
+	if [[ "$uefi" == "1" ]]; then
+		# Boot through the own UEFI loader under AAVMF.
+		local loader_efi="${LOADER_EFI:-$HERE/../loader/target/aarch64-unknown-uefi/debug/libersystem-loader.efi}"
+		[[ -f "$loader_efi" ]] || {
+			echo "qemu-run: loader EFI not found: $loader_efi (run 'just loader-aarch64')" >&2
+			exit 1
+		}
+		[[ -f "$aavmf_code" && -f "$aavmf_vars" ]] || {
+			echo "qemu-run: AAVMF firmware not found ($aavmf_code / $aavmf_vars)" >&2
+			exit 1
+		}
+		qemu_build_esp aarch64 "$kernel" "$loader_efi" BOOTAA64.EFI
+		local vars="$QEMU_BUILD_DIR/aavmf-vars.fd"
+		cp "$aavmf_vars" "$vars"
+		# ESP goes last so system volume enumerates ahead of it.
+		qemu_attach_virtio_blk qemu_args "$ESP" esp "disable-legacy=on"
+		exec qemu-system-aarch64 \
+			-machine "$machine" \
+			"${cpu_args[@]}" \
+			-smp "$smp" \
+			-m "$mem" \
+			-drive "if=pflash,format=raw,file=$aavmf_code,readonly=on" \
+			-drive "if=pflash,format=raw,file=$vars" \
+			-serial "$serial" \
+			"${DISPLAY_ARGS[@]}" \
+			-no-reboot \
+			"${test_args[@]}" \
+			"${qemu_args[@]}" \
+			${QEMU_EXTRA:-}
+	fi
+
+	# Direct -kernel boot: dump DTB and load it at DTB_ADDR.
+	local dtb_file
+	dtb_file="$(mktemp /tmp/qemu-virt-XXXXXX.dtb)"
+	trap 'rm -f "$dtb_file"' EXIT
+	qemu-system-aarch64 \
+		-machine "$machine,dumpdtb=$dtb_file" \
+		"${cpu_args[@]}" \
+		-smp "$smp" \
+		-m "$mem" \
+		-display none >/dev/null 2>&1
+
+	exec qemu-system-aarch64 \
+		-machine "$machine" \
+		"${cpu_args[@]}" \
+		-smp "$smp" \
+		-m "$mem" \
+		-kernel "$kernel" \
+		-device "loader,file=$dtb_file,addr=$dtb_addr" \
+		-serial "$serial" \
+		"${DISPLAY_ARGS[@]}" \
+		-no-reboot \
+		"${test_args[@]}" \
+		"${qemu_args[@]}" \
+		${QEMU_EXTRA:-}
+}
+
+qemu_run_riscv64() {
+	local kernel="$1"
+	local serial="${SERIAL:-mon:stdio}"
+	local smp="${SMP:-$(nproc)}"
+	local mem="${MEM:-512M}"
+	local bios="${BIOS:-default}"
+	local uefi="${UEFI:-0}"
+	local uboot="${UBOOT:-/usr/lib/u-boot/qemu-riscv64_smode/u-boot.bin}"
+
+	qemu_parse_displays qemu-run
+
+	local qemu_args=()
+	local cpu_args=()
+	qemu_select_cpu cpu_args riscv64 rv64
+
+	# System volume disk: virtio-blk holding the factory archive.
+	local volume_pkg="$QEMU_BUILD_DIR/volume-riscv64.pkg"
+	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk-riscv64.img"
+	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
+		qemu_attach_virtio_blk qemu_args "$virtio_disk" vol0 ""
+	fi
+
+	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
+	qemu_prepare_media_images -riscv64 -rv64
+	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 ""
+	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 ""
+	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" udf0 ""
+
+	# Network: user-mode virtio-net (no disable-legacy for riscv64).
+	qemu_attach_virtio_net qemu_args vnet0 "" ""
+
+	# xHCI USB host controller + hub with keyboard, tablet, and storage.
+	qemu_prepare_usb_image -riscv64
+	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$USB_DISK")
+	qemu_attach_xhci qemu_args vusb
+
+	# Test mode: enable RISC-V semihosting, route serial to stdout.
+	local test_args=()
+	if [[ "${TEST:-0}" == "1" ]]; then
+		test_args+=(-semihosting)
+		serial="stdio"
+	else
+		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
+		qemu_attach_virt_interactive qemu_args -riscv64 ""
+	fi
+	qemu_append_debug_args qemu_args
+
+	if [[ "$uefi" == "1" ]]; then
+		# Boot through the own UEFI loader under U-Boot.
+		local loader_efi="${LOADER_EFI:-$HERE/../loader/target/riscv64gc-unknown-none-elf/debug/libersystem-loader.efi}"
+		[[ -f "$loader_efi" ]] || {
+			echo "qemu-run: loader EFI not found: $loader_efi (run 'just loader-riscv64')" >&2
+			exit 1
+		}
+		[[ -f "$uboot" ]] || {
+			echo "qemu-run: U-Boot not found: $uboot (install the u-boot-qemu package)" >&2
+			exit 1
+		}
+		qemu_build_esp riscv64 "$kernel" "$loader_efi" BOOTRISCV64.EFI
+		# ESP is NVMe so U-Boot's default boot order tries nvme0 first.
+		qemu_args+=(-drive "if=none,id=esp,format=raw,file=$ESP" -device "nvme,serial=libersystem-esp,drive=esp")
+		exec qemu-system-riscv64 \
+			-machine "virt,aia=aplic-imsic" \
+			"${cpu_args[@]}" \
+			-smp "$smp" \
+			-m "$mem" \
+			-bios "$bios" \
+			-kernel "$uboot" \
+			-serial "$serial" \
+			"${DISPLAY_ARGS[@]}" \
+			-no-reboot \
+			"${qemu_args[@]}" \
+			"${test_args[@]}" \
+			${QEMU_EXTRA:-}
+	fi
+
+	# Direct -kernel boot: OpenSBI jumps to kernel entry.
+	exec qemu-system-riscv64 \
+		-machine "virt,aia=aplic-imsic" \
+		"${cpu_args[@]}" \
+		-smp "$smp" \
+		-m "$mem" \
+		-bios "$bios" \
+		-kernel "$kernel" \
+		-serial "$serial" \
+		"${DISPLAY_ARGS[@]}" \
+		-no-reboot \
+		"${qemu_args[@]}" \
+		"${test_args[@]}" \
+		${QEMU_EXTRA:-}
+}
+
+case "$TARGET_ARCH" in
+x86_64) qemu_run_x86_64 "$KERNEL_ELF" ;;
+aarch64) qemu_run_aarch64 "$KERNEL_ELF" ;;
+riscv64) qemu_run_riscv64 "$KERNEL_ELF" ;;
+esac

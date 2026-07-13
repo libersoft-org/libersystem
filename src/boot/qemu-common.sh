@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Shared QEMU-runner plumbing. Architecture launchers own firmware, machine/CPU,
-# boot protocol, interrupt model, test exit handling and final device arguments.
+# Shared QEMU-runner plumbing. Architecture functions in qemu-run.sh own firmware,
+# machine/CPU, boot protocol, interrupt model, test exits and final launch commands.
 
 qemu_parse_displays() {
 	local runner="$1"
@@ -27,6 +27,14 @@ qemu_parse_displays() {
 	fi
 	if [[ "$want_spice" == "1" ]]; then
 		DISPLAY_ARGS+=(-spice "port=${SPICE_PORT:-5930},addr=0.0.0.0,disable-ticketing=on")
+	fi
+}
+
+qemu_append_debug_args() {
+	local -n arr=$1
+	if [[ "${DEBUG:-0}" == "1" ]]; then
+		arr+=(-s -S)
+		echo "[qemu-run] waiting for GDB on :1234 (run 'just gdb' in another panel)"
 	fi
 }
 
@@ -121,4 +129,104 @@ qemu_prepare_usb_image() {
 		mcopy -i "$USB_DISK" "$voldir/hello.txt" ::hello.txt 2>/dev/null || true
 		mcopy -i "$USB_DISK" "$voldir/motd.txt" ::motd.txt 2>/dev/null || true
 	fi
+}
+
+# Append virtio-blk device to a nameref array. Accepts drive/device IDs and
+# optional disable-legacy flag.
+qemu_attach_virtio_blk() {
+	local -n arr=$1
+	local file="$2"
+	local drive_id="$3"
+	local legacy="${4:-}"
+	arr+=(-drive "file=$file,if=none,id=$drive_id,format=raw")
+	if [[ -n "$legacy" ]]; then
+		arr+=(-device "virtio-blk-pci,drive=$drive_id,$legacy")
+	else
+		arr+=(-device "virtio-blk-pci,drive=$drive_id")
+	fi
+}
+
+# Append virtio-net device to a nameref array with optional hostfwd and legacy flag.
+qemu_attach_virtio_net() {
+	local -n arr=$1
+	local net_id="$2"
+	local hostfwd="${3:-}"
+	local legacy="${4:-}"
+	local net_user="user,id=$net_id"
+	[[ -n "$hostfwd" ]] && net_user="$net_user,$hostfwd"
+	arr+=(-netdev "$net_user")
+	if [[ -n "$legacy" ]]; then
+		arr+=(-device "virtio-net-pci,netdev=$net_id,$legacy")
+	else
+		arr+=(-device "virtio-net-pci,netdev=$net_id")
+	fi
+}
+
+# Append xHCI USB hub/keyboard/tablet topology to a nameref array.
+# Optional USB storage drive_id attaches a mass-storage device on port 1.3.
+qemu_attach_xhci() {
+	local -n arr=$1
+	local usb_drive_id="${2:-}"
+	arr+=(
+		-device "qemu-xhci,id=usb"
+		-device "usb-hub,bus=usb.0,port=1"
+		-device "usb-kbd,bus=usb.0,port=1.1"
+		-device "usb-tablet,bus=usb.0,port=1.2"
+	)
+	if [[ -n "$usb_drive_id" ]]; then
+		arr+=(-device "usb-storage,bus=usb.0,drive=$usb_drive_id,id=usbstick")
+	fi
+}
+
+# Append interactive ramfb/virtio-input/sound/virtconsole block for virt machines.
+# Suffix is for console output filename, legacy is optional disable-legacy flag.
+qemu_attach_virt_interactive() {
+	local -n arr=$1
+	local suffix="$2"
+	local legacy="${3:-}"
+	local vcon_out="$QEMU_BUILD_DIR/virtio-console${suffix}.out"
+	arr+=(-device "ramfb")
+	if [[ -n "$legacy" ]]; then
+		arr+=(
+			-device "virtio-keyboard-pci,$legacy"
+			-device "virtio-tablet-pci,$legacy"
+			-device "virtio-serial-pci,$legacy"
+		)
+	else
+		arr+=(
+			-device "virtio-keyboard-pci"
+			-device "virtio-tablet-pci"
+			-device "virtio-serial-pci"
+		)
+	fi
+	arr+=(
+		-device "virtconsole,chardev=vcon"
+		-chardev "file,id=vcon,path=$vcon_out"
+	)
+	if [[ "$want_spice" == "1" ]]; then
+		arr+=(-audiodev "spice,id=snd0")
+	else
+		arr+=(-audiodev "none,id=snd0")
+	fi
+	arr+=(-device "virtio-sound-pci,audiodev=snd0")
+}
+
+# Build a FAT EFI System Partition for ARM/RISC-V UEFI boot: strip kernel,
+# create FAT, install loader as BOOT*.EFI and kernel at /kernel.
+# Returns ESP path in ESP, stripped kernel in STAGED_KERNEL.
+qemu_build_esp() {
+	local arch="$1"
+	local kernel="$2"
+	local loader_efi="$3"
+	local boot_name="$4"
+	ESP="$QEMU_BUILD_DIR/esp-${arch}.img"
+	STAGED_KERNEL="$QEMU_BUILD_DIR/kernel-${arch}.stripped"
+	llvm-strip --strip-debug -o "$STAGED_KERNEL" "$kernel" 2>/dev/null || cp "$kernel" "$STAGED_KERNEL"
+	local esp_mb=$((($(stat -c%s "$STAGED_KERNEL") + $(stat -c%s "$loader_efi")) / 1048576 + 16))
+	rm -f "$ESP"
+	truncate -s "${esp_mb}M" "$ESP"
+	mformat -i "$ESP" ::
+	mmd -i "$ESP" ::/EFI ::/EFI/BOOT
+	mcopy -i "$ESP" "$loader_efi" "::/EFI/BOOT/$boot_name"
+	mcopy -i "$ESP" "$STAGED_KERNEL" ::/kernel
 }

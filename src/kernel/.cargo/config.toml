@@ -6,7 +6,7 @@ build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
 
 [target.x86_64-unknown-none]
-runner = "../boot/qemu-run.sh"
+runner = "../boot/qemu-run.sh x86_64"
 # The own loader applies no relocations, so the kernel is linked static (non-PIE,
 # ET_EXEC): all addresses baked at the higher-half link base the loader maps it at.
 rustflags = ["-C", "relocation-model=static"]
@@ -15,7 +15,7 @@ rustflags = ["-C", "relocation-model=static"]
 # by its physical addresses at 0x4008_0000 with the MMU off, so the kernel is
 # linked static (non-PIE) at that low base until the MMU + higher-half map land.
 [target.aarch64-unknown-none]
-runner = "../boot/qemu-aarch64.sh"
+runner = "../boot/qemu-run.sh aarch64"
 rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-no-pie"]
 
 # riscv64 direct-boot bring-up: QEMU `-machine virt` boots OpenSBI, which
@@ -23,5 +23,5 @@ rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-no-pie"]
 # kernel is linked static (non-PIE); the higher-half kernel needs the `medany` code
 # model (absolute addresses outside the low 2 GiB), and the boot stub sets up Sv39.
 [target.riscv64gc-unknown-none-elf]
-runner = "../boot/qemu-riscv64.sh"
+runner = "../boot/qemu-run.sh riscv64"
 rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-no-pie", "-C", "code-model=medium"]

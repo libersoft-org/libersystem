@@ -19,7 +19,7 @@
 # Typical session (kill any stale QEMU first):
 #   pkill -9 qemu-system-x86
 #   SERIAL="unix:/tmp/ls-ser.sock,server,nowait" DISPLAYS=vnc VNC_ADDR=127.0.0.1:9 \
-#     boot/qemu-run.sh kernel/target/x86_64-unknown-none/debug/kernel >/tmp/qemu.log 2>&1 &
+#     boot/qemu-run.sh x86_64 kernel/target/x86_64-unknown-none/debug/kernel >/tmp/qemu.log 2>&1 &
 #   boot/perf-trace.py            # connects, waits for boot, runs `help`, prints the trace
 
 import argparse
