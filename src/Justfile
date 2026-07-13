@@ -89,21 +89,43 @@ debug: sdk user
 gdb:
 	gdb -x boot/gdb-init {{kernel_elf}}
 
-# run tests in QEMU (isa-debug-exit)
-test: sdk user
-	cd {{kernel_dir}} && TEST=1 cargo test
+# Run every x86_64 test in QEMU (isa-debug-exit). TEST_TIMEOUT overrides the
+# 15-minute full-suite watchdog.
+test: sdk user test-tags-check
+	boot/test-kernel.sh x86_64
+
+# Run the union of the requested x86_64 tags plus the smoke set.
+test-tags tags: sdk user test-tags-check
+	boot/test-kernel.sh x86_64 "{{tags}}"
 
 # run the kernel test suite in QEMU on aarch64 (Arm semihosting exit maps pass/fail).
 # SMP=4 exercises the multi-core paths (secondary bring-up, the cross-core wake IPI).
-test-aarch64: sdk user-aarch64
-	cd {{kernel_dir}} && TEST=1 cargo test --target aarch64-unknown-none
+test-aarch64: sdk user-aarch64 test-tags-check
+	boot/test-kernel.sh aarch64
+
+# Run the union of the requested aarch64 tags plus the smoke set.
+test-tags-aarch64 tags: sdk user-aarch64 test-tags-check
+	SMP="${SMP:-4}" boot/test-kernel.sh aarch64 "{{tags}}"
 
 # run the kernel test suite in QEMU on riscv64 over OpenSBI (RISC-V semihosting exit
 # maps pass/fail). Defaults to `nproc` harts (like the x86 `test` recipe), exercising the
 # multi-hart paths (SBI HSM hart_start bring-up, the SBI IPI cross-hart wake); override
 # with `SMP=<n>` (a smaller count is faster under TCG on a many-core host).
-test-riscv64: sdk user-riscv64
-	cd {{kernel_dir}} && TEST=1 cargo test --target riscv64gc-unknown-none-elf
+test-riscv64: sdk user-riscv64 test-tags-check
+	boot/test-kernel.sh riscv64
+
+# Run the union of the requested riscv64 tags plus the smoke set.
+test-tags-riscv64 tags: sdk user-riscv64 test-tags-check
+	SMP="${SMP:-4}" boot/test-kernel.sh riscv64 "{{tags}}"
+
+# Run all tests on all architectures. TCG guests are intentionally serial to avoid
+# host contention; this is the periodic/milestone check, not the per-task path.
+test-all: sdk user user-aarch64 user-riscv64 test-tags-check
+	boot/test-all.sh
+
+# A cheap source check; the Rust type system separately rejects unknown/empty tags.
+test-tags-check:
+	boot/check-test-tags.sh
 
 # build the own UEFI loader for aarch64 (staged into the boot image as BOOTAA64.EFI)
 loader-aarch64:
@@ -206,7 +228,7 @@ fmt:
 	cd {{fat_dir}} && cargo fmt
 	cd {{iso9660_dir}} && cargo fmt
 	cd {{udf_dir}} && cargo fmt
-	shfmt -w ../setup.sh boot/qemu-run.sh boot/qemu-aarch64.sh boot/qemu-riscv64.sh boot/mkimage.sh boot/screenshot.sh
+	shfmt -w ../setup.sh boot/qemu-run.sh boot/qemu-aarch64.sh boot/qemu-riscv64.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh
 
 # check formatting without writing changes (CI-friendly)
 fmt-check:
@@ -230,7 +252,7 @@ fmt-check:
 	cd {{fat_dir}} && cargo fmt --check
 	cd {{iso9660_dir}} && cargo fmt --check
 	cd {{udf_dir}} && cargo fmt --check
-	shfmt -d ../setup.sh boot/qemu-run.sh boot/qemu-aarch64.sh boot/qemu-riscv64.sh boot/mkimage.sh boot/screenshot.sh
+	shfmt -d ../setup.sh boot/qemu-run.sh boot/qemu-aarch64.sh boot/qemu-riscv64.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh
 
 # clean build artifacts
 clean:

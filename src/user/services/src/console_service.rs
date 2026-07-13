@@ -739,7 +739,7 @@ unsafe fn copy_selection(console: &mut Console) {
 			t.screen.selection_clear();
 			t.flush();
 		}
-		present_fg(console);
+		unsafe { present_fg(console) };
 	}
 }
 

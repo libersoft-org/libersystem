@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+	println!("cargo:rerun-if-env-changed=TEST_TAGS");
 	select_linker_script();
 	let conf: Vec<(String, String)> = read_product_conf();
 	export_product_metadata(&conf);

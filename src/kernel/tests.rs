@@ -6,6 +6,7 @@
 // SystemManager spawn and the supervise ladder) stay in main.rs.
 
 use super::*;
+use alloc::vec::Vec;
 
 // Userspace (ring 3) page layout for the test: one USER page for the program,
 // one for its stack, mapped into the low half of the shared address space
@@ -745,38 +746,170 @@ extern "C" fn domain_parker(_arg: u64) {
 // test harness (custom_test_frameworks, runs under `cargo test` in QEMU)
 pub(crate) trait Testable {
 	fn run(&self);
+	fn tags(&self) -> &'static [TestTag];
 }
 
-impl<T: Fn()> Testable for T {
+macro_rules! define_test_tags {
+	($($variant:ident => $name:literal),+ $(,)?) => {
+		#[derive(Clone, Copy, PartialEq, Eq)]
+		pub(crate) enum TestTag {
+			$($variant),+
+		}
+
+		impl TestTag {
+			const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+			const fn as_str(self) -> &'static str {
+				match self {
+					$(Self::$variant => $name),+
+				}
+			}
+
+			fn parse(value: &str) -> Option<Self> {
+				Self::ALL.iter().copied().find(|tag| tag.as_str() == value)
+			}
+		}
+	};
+}
+
+define_test_tags! {
+	ArchAarch64 => "arch-aarch64",
+	ArchRiscv64 => "arch-riscv64",
+	ArchX86_64 => "arch-x86_64",
+	Boot => "boot",
+	Console => "console",
+	Drivers => "drivers",
+	Filesystem => "filesystem",
+	Input => "input",
+	Ipc => "ipc",
+	Kernel => "kernel",
+	Memory => "memory",
+	Mouse => "mouse",
+	Network => "network",
+	Process => "process",
+	Scheduler => "scheduler",
+	Service => "service",
+	Shell => "shell",
+	Smoke => "smoke",
+	Slow => "slow",
+	Storage => "storage",
+	Stress => "stress",
+	Syscall => "syscall",
+	Usb => "usb",
+}
+
+pub(crate) struct TaggedTest {
+	name: &'static str,
+	tags: &'static [TestTag],
+	run: fn(),
+}
+
+impl Testable for TaggedTest {
 	fn run(&self) {
-		serial_print!("{}...\t", core::any::type_name::<T>());
-		self();
+		serial_print!("{}...\t", self.name);
+		(self.run)();
 		serial_println!("[ok]");
+	}
+
+	fn tags(&self) -> &'static [TestTag] {
+		self.tags
 	}
 }
 
+macro_rules! tagged_test {
+	($(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?]) => {
+		$(#[$attr])*
+		mod $name {
+			use super::*;
+
+			#[test_case]
+			static CASE: TaggedTest = TaggedTest {
+				name: stringify!($name),
+				tags: &[TestTag::$first_tag $(, TestTag::$tag)*],
+				run: super::$name,
+			};
+		}
+	};
+}
+
 pub(crate) fn test_runner(tests: &[&dyn Testable]) {
-	serial_println!("running {} tests", tests.len());
+	let Some(filter) = option_env!("TEST_TAGS").filter(|value| !value.trim().is_empty()) else {
+		serial_println!("running {} tests (all tags)", tests.len());
+		for test in tests {
+			test.run();
+		}
+		arch::exit_qemu(true);
+	};
+
+	let mut requested: Vec<TestTag> = Vec::new();
+	for value in filter.split(',').map(str::trim) {
+		let Some(tag) = TestTag::parse(value) else {
+			serial_println!("test filter error: unknown tag '{value}'");
+			arch::exit_qemu(false);
+		};
+		if !requested.contains(&tag) {
+			requested.push(tag);
+		}
+	}
+	serial_print!("test tags: requested={filter}, effective={filter}");
+	if !requested.contains(&TestTag::Smoke) {
+		serial_print!(",smoke");
+	}
+	serial_println!();
+
+	let allow_slow = requested.contains(&TestTag::Slow);
+	let allow_stress = requested.contains(&TestTag::Stress);
+	let mut selected = 0usize;
+	let mut selected_non_smoke = 0usize;
 	for test in tests {
-		test.run();
+		let tags = test.tags();
+		let gated = (tags.contains(&TestTag::Slow) && !allow_slow) || (tags.contains(&TestTag::Stress) && !allow_stress);
+		let requested_match = tags.iter().any(|tag| requested.contains(tag));
+		let smoke_match = tags.contains(&TestTag::Smoke);
+		if !gated && (requested_match || smoke_match) {
+			selected += 1;
+			if requested_match && tags.iter().any(|tag| *tag != TestTag::Smoke) {
+				selected_non_smoke += 1;
+			}
+		}
+	}
+	if selected_non_smoke == 0 {
+		serial_println!("test filter error: requested tags selected no non-smoke tests");
+		arch::exit_qemu(false);
+	}
+	serial_println!("running {selected} tests ({} skipped, {} total)", tests.len() - selected, tests.len());
+	for test in tests {
+		let tags = test.tags();
+		let gated = (tags.contains(&TestTag::Slow) && !allow_slow) || (tags.contains(&TestTag::Stress) && !allow_stress);
+		if !gated && (tags.contains(&TestTag::Smoke) || tags.iter().any(|tag| requested.contains(tag))) {
+			test.run();
+		}
 	}
 	arch::exit_qemu(true);
 }
 
-#[test_case]
+tagged_test!(trivial_assertion, [Kernel, Smoke]);
 fn trivial_assertion() {
 	assert_eq!(1 + 1, 2);
 }
 
+tagged_test!(
+	#[cfg(target_arch = "x86_64")]
+	breakpoint_exception_returns,
+	[Kernel, ArchX86_64]
+);
 #[cfg(target_arch = "x86_64")]
-#[test_case]
 fn breakpoint_exception_returns() {
 	// reaching the next line proves the IDT breakpoint handler returned cleanly
 	unsafe { core::arch::asm!("int3") };
 }
 
+tagged_test!(
+	#[cfg(target_arch = "riscv64")]
+	breakpoint_exception_returns,
+	[Kernel, ArchRiscv64]
+);
 #[cfg(target_arch = "riscv64")]
-#[test_case]
 fn breakpoint_exception_returns() {
 	// reaching the next line proves the trap handler resumed past the ebreak: it decodes
 	// the trapped instruction width (2 bytes for a compressed c.ebreak, else 4) and
@@ -784,7 +917,7 @@ fn breakpoint_exception_returns() {
 	unsafe { core::arch::asm!("ebreak") };
 }
 
-#[test_case]
+tagged_test!(frame_alloc_distinct, [Memory, Smoke]);
 fn frame_alloc_distinct() {
 	let a = mem::frame::allocate().expect("frame a");
 	let b = mem::frame::allocate().expect("frame b");
@@ -793,7 +926,7 @@ fn frame_alloc_distinct() {
 	mem::frame::deallocate(b);
 }
 
-#[test_case]
+tagged_test!(contiguous_frames_and_dma_spans, [Memory, Drivers]);
 fn contiguous_frames_and_dma_spans() {
 	use mem::frame::{self, PAGE_SIZE};
 	use object::domain::Domain;
@@ -827,7 +960,7 @@ fn contiguous_frames_and_dma_spans() {
 	assert_eq!(domain.account().dma().used(), 0, "the DMA charge is refunded");
 }
 
-#[test_case]
+tagged_test!(the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free, [Memory]);
 fn the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free() {
 	use mem::frame::{self, PAGE_SIZE};
 	// The run table is heap-backed after boot, so pathological fragmentation grows
@@ -858,7 +991,7 @@ fn the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free() {
 	assert_eq!(frame::free_count(), before, "the pool round-trips exactly");
 }
 
-#[test_case]
+tagged_test!(concurrent_maps_on_shared_tables_strand_nothing, [Memory, Stress]);
 fn concurrent_maps_on_shared_tables_strand_nothing() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	use mem::frame;
@@ -948,7 +1081,7 @@ fn concurrent_maps_on_shared_tables_strand_nothing() {
 	frame::deallocate(FRAMES[1].load(Ordering::SeqCst));
 }
 
-#[test_case]
+tagged_test!(map_degrades_to_error_when_out_of_frames, [Memory]);
 fn map_degrades_to_error_when_out_of_frames() {
 	use mem::frame;
 	use object::address_space::AddressSpace;
@@ -980,7 +1113,7 @@ fn map_degrades_to_error_when_out_of_frames() {
 	frame::deallocate(leaf);
 }
 
-#[test_case]
+tagged_test!(paging_map_unmap, [Memory]);
 fn paging_map_unmap() {
 	let phys = mem::frame::allocate().expect("scratch frame");
 	// Sv39 (riscv64) only has a 39-bit canonical VA range, so the 48-bit x86/aarch64
@@ -1001,7 +1134,7 @@ fn paging_map_unmap() {
 	mem::frame::deallocate(phys);
 }
 
-#[test_case]
+tagged_test!(heap_box_vec, [Memory, Smoke]);
 fn heap_box_vec() {
 	let boxed = alloc::boxed::Box::new(42u64);
 	assert_eq!(*boxed, 42);
@@ -1013,7 +1146,7 @@ fn heap_box_vec() {
 	assert_eq!(sum, 1000 * 999 / 2);
 }
 
-#[test_case]
+tagged_test!(timer_ticks_advance, [Kernel]);
 fn timer_ticks_advance() {
 	// Interrupts are enabled by kmain before the tests run, so the periodic
 	// LAPIC timer must keep incrementing the tick counter.
@@ -1024,8 +1157,12 @@ fn timer_ticks_advance() {
 	assert!(arch::apic::ticks() > start);
 }
 
+tagged_test!(
+	#[cfg(target_arch = "x86_64")]
+	handler_registration_dispatch,
+	[Kernel, ArchX86_64]
+);
 #[cfg(target_arch = "x86_64")]
-#[test_case]
 fn handler_registration_dispatch() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static FIRED: AtomicBool = AtomicBool::new(false);
@@ -1039,7 +1176,7 @@ fn handler_registration_dispatch() {
 	assert!(FIRED.load(Ordering::SeqCst));
 }
 
-#[test_case]
+tagged_test!(smp_all_cores_online, [Kernel, Smoke]);
 fn smp_all_cores_online() {
 	// init_smp ran before the tests and waited for every core to report in, so
 	// the online count must equal the managed core count (and exceed one when
@@ -1081,7 +1218,7 @@ impl object::KernelObject for TestObject {
 	}
 }
 
-#[test_case]
+tagged_test!(handle_create_lookup_close, [Kernel, Smoke]);
 fn handle_create_lookup_close() {
 	use object::handle::{HandleError, HandleTable};
 	use object::rights::Rights;
@@ -1097,7 +1234,7 @@ fn handle_create_lookup_close() {
 	assert!(matches!(table.lookup(h, Rights::READ), Err(HandleError::BadHandle)));
 }
 
-#[test_case]
+tagged_test!(handle_rights_enforced, [Kernel]);
 fn handle_rights_enforced() {
 	use object::handle::{HandleError, HandleTable};
 	use object::rights::Rights;
@@ -1108,7 +1245,7 @@ fn handle_rights_enforced() {
 	assert!(matches!(table.lookup(h, Rights::WRITE), Err(HandleError::AccessDenied)));
 }
 
-#[test_case]
+tagged_test!(handle_duplicate_attenuates, [Kernel]);
 fn handle_duplicate_attenuates() {
 	use object::handle::{HandleError, HandleTable};
 	use object::rights::Rights;
@@ -1125,7 +1262,7 @@ fn handle_duplicate_attenuates() {
 	assert!(matches!(table.duplicate(plain, Rights::READ), Err(HandleError::AccessDenied)));
 }
 
-#[test_case]
+tagged_test!(handle_revocation_invalidates, [Kernel]);
 fn handle_revocation_invalidates() {
 	use object::handle::{HandleError, HandleTable};
 	use object::rights::Rights;
@@ -1138,7 +1275,7 @@ fn handle_revocation_invalidates() {
 	assert!(matches!(table.lookup(h, Rights::READ), Err(HandleError::Revoked)));
 }
 
-#[test_case]
+tagged_test!(handle_type_sealing, [Kernel]);
 fn handle_type_sealing() {
 	use object::ObjectType;
 	use object::handle::{HandleError, HandleTable};
@@ -1150,7 +1287,7 @@ fn handle_type_sealing() {
 	assert!(matches!(table.lookup_typed(h, ObjectType::Channel, Rights::READ), Err(HandleError::WrongType)));
 }
 
-#[test_case]
+tagged_test!(handle_refcount_lifetime, [Kernel]);
 fn handle_refcount_lifetime() {
 	use alloc::sync::Arc;
 	use object::handle::HandleTable;
@@ -1169,7 +1306,7 @@ fn handle_refcount_lifetime() {
 	assert_eq!(Arc::strong_count(&obj), 1);
 }
 
-#[test_case]
+tagged_test!(thread_object_basics, [Process, Smoke]);
 fn thread_object_basics() {
 	use object::address_space::AddressSpace;
 	use object::process::Process;
@@ -1183,7 +1320,7 @@ fn thread_object_basics() {
 	assert!(thread.tid() >= 1);
 }
 
-#[test_case]
+tagged_test!(scheduler_multiplexes_threads, [Scheduler, Smoke]);
 fn scheduler_multiplexes_threads() {
 	use core::sync::atomic::{AtomicU32, Ordering};
 	static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1207,7 +1344,7 @@ fn scheduler_multiplexes_threads() {
 	assert_eq!(COUNTER.load(Ordering::SeqCst), threads * iters);
 }
 
-#[test_case]
+tagged_test!(preemption_preempts_a_cpu_bound_thread, [Scheduler]);
 fn preemption_preempts_a_cpu_bound_thread() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static STOP: AtomicBool = AtomicBool::new(false);
@@ -1235,7 +1372,7 @@ fn preemption_preempts_a_cpu_bound_thread() {
 	assert!(MATE_RAN.load(Ordering::SeqCst), "the cohabiting thread never ran: the never-yielding thread was not preempted");
 }
 
-#[test_case]
+tagged_test!(a_cpu_bound_ring3_thread_is_preempted, [Scheduler, Process]);
 fn a_cpu_bound_ring3_thread_is_preempted() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	use mem::frame::{self, PAGE_SIZE};
@@ -1304,7 +1441,7 @@ fn a_cpu_bound_ring3_thread_is_preempted() {
 	assert!(SPIN_DONE.load(Ordering::SeqCst), "the ring-3 spinner never finished: ring 3 was not preempted");
 }
 
-#[test_case]
+tagged_test!(a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick, [Scheduler]);
 fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	static RAN_AT: AtomicU64 = AtomicU64::new(0);
@@ -1341,7 +1478,7 @@ fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 	}
 }
 
-#[test_case]
+tagged_test!(scheduler_runs_across_cores, [Scheduler]);
 fn scheduler_runs_across_cores() {
 	use core::sync::atomic::{AtomicU32, Ordering};
 	static CROSS: AtomicU32 = AtomicU32::new(0);
@@ -1365,7 +1502,7 @@ fn scheduler_runs_across_cores() {
 	assert_eq!(CROSS.load(Ordering::SeqCst) as usize, others);
 }
 
-#[test_case]
+tagged_test!(process_isolation_and_per_process_tables, [Process, Memory]);
 fn process_isolation_and_per_process_tables() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	use mem::frame;
@@ -1437,7 +1574,7 @@ fn process_isolation_and_per_process_tables() {
 	frame::deallocate(f2);
 }
 
-#[test_case]
+tagged_test!(syscall_roundtrip_stateless, [Syscall, Smoke]);
 fn syscall_roundtrip_stateless() {
 	// Stateless syscalls round-trip from the test (idle) context: there is no
 	// current thread, but these calls do not need one.
@@ -1456,7 +1593,7 @@ fn syscall_roundtrip_stateless() {
 	}
 }
 
-#[test_case]
+tagged_test!(abi_check_accepts_the_matching_revision_and_refuses_a_mismatch, [Syscall]);
 fn abi_check_accepts_the_matching_revision_and_refuses_a_mismatch() {
 	// SYS_ABI_CHECK is the runtime's first syscall: a starting binary reports the ABI
 	// revision it was built against, and the kernel refuses a mismatch so it never runs
@@ -1472,7 +1609,7 @@ fn abi_check_accepts_the_matching_revision_and_refuses_a_mismatch() {
 	}
 }
 
-#[test_case]
+tagged_test!(syscall_object_and_handle_ops, [Syscall]);
 fn syscall_object_and_handle_ops() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
@@ -1514,7 +1651,7 @@ fn syscall_object_and_handle_ops() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
-#[test_case]
+tagged_test!(an_unmapped_va_range_is_reused_not_leaked, [Memory]);
 fn an_unmapped_va_range_is_reused_not_leaked() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
@@ -1560,7 +1697,7 @@ fn an_unmapped_va_range_is_reused_not_leaked() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
-#[test_case]
+tagged_test!(device_memory_maps_mmio_region, [Drivers]);
 fn device_memory_maps_mmio_region() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::device_memory::DeviceMemory;
@@ -1595,7 +1732,7 @@ fn device_memory_maps_mmio_region() {
 	mem::frame::deallocate(phys);
 }
 
-#[test_case]
+tagged_test!(random_get_fills_distinct_bytes, [Syscall]);
 fn random_get_fills_distinct_bytes() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
@@ -1619,8 +1756,12 @@ fn random_get_fills_distinct_bytes() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
+tagged_test!(
+	#[cfg(target_arch = "x86_64")]
+	interrupt_bind_delivers_to_driver,
+	[Drivers, ArchX86_64]
+);
 #[cfg(target_arch = "x86_64")]
-#[test_case]
 fn interrupt_bind_delivers_to_driver() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
@@ -1652,8 +1793,12 @@ fn interrupt_bind_delivers_to_driver() {
 // equivalent for - every aarch64 device interrupt is MSI-X delivered through the
 // GICv2m frame (a device writes its SPI to MSI_SETSPI_NS, the GIC pends that SPI, and
 // gic::handle_irq dispatches it). These test that GICv2m MSI path directly.
+tagged_test!(
+	#[cfg(target_arch = "aarch64")]
+	gicv2m_msi_binds_and_dispatch_signals_the_driver,
+	[Drivers, ArchAarch64]
+);
 #[cfg(target_arch = "aarch64")]
-#[test_case]
 fn gicv2m_msi_binds_and_dispatch_signals_the_driver() {
 	use mem::frame;
 	use object::interrupt::Interrupt;
@@ -1682,8 +1827,12 @@ fn gicv2m_msi_binds_and_dispatch_signals_the_driver() {
 	frame::deallocate(table);
 }
 
+tagged_test!(
+	#[cfg(target_arch = "aarch64")]
+	gicv2m_msi_inventory_reports_the_timer_and_msi_vectors,
+	[Drivers, ArchAarch64]
+);
 #[cfg(target_arch = "aarch64")]
-#[test_case]
 fn gicv2m_msi_inventory_reports_the_timer_and_msi_vectors() {
 	use mem::frame;
 	// Index 0 of the aarch64 IRQ inventory (what `lsirq` reads) is the kernel's own EL1
@@ -1716,8 +1865,12 @@ fn gicv2m_msi_inventory_reports_the_timer_and_msi_vectors() {
 // (QEMU `virt,aia=aplic-imsic`) every device interrupt is an MSI-X-delivered EID pended in
 // a hart's IMSIC S-file (imsic.rs) - there is no bindable wired vector. These exercise the
 // AIA/IMSIC MSI path directly: acquire an EID, bind a driver Interrupt, dispatch the EID.
+tagged_test!(
+	#[cfg(target_arch = "riscv64")]
+	imsic_msi_binds_and_dispatch_signals_the_driver,
+	[Drivers, ArchRiscv64]
+);
 #[cfg(target_arch = "riscv64")]
-#[test_case]
 fn imsic_msi_binds_and_dispatch_signals_the_driver() {
 	use mem::frame;
 	use object::interrupt::Interrupt;
@@ -1746,8 +1899,12 @@ fn imsic_msi_binds_and_dispatch_signals_the_driver() {
 	frame::deallocate(table);
 }
 
+tagged_test!(
+	#[cfg(target_arch = "riscv64")]
+	imsic_msi_inventory_reports_the_timer_and_msi_vectors,
+	[Drivers, ArchRiscv64]
+);
 #[cfg(target_arch = "riscv64")]
-#[test_case]
 fn imsic_msi_inventory_reports_the_timer_and_msi_vectors() {
 	use mem::frame;
 	// Index 0 of the riscv IRQ inventory (what `lsirq` reads) is the kernel's own S-mode
@@ -1776,7 +1933,7 @@ fn imsic_msi_inventory_reports_the_timer_and_msi_vectors() {
 	frame::deallocate(table);
 }
 
-#[test_case]
+tagged_test!(object_property_set_names_an_object, [Kernel]);
 fn object_property_set_names_an_object() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::KernelObject;
@@ -1800,7 +1957,7 @@ fn object_property_set_names_an_object() {
 	assert_eq!(event.header().name().as_deref(), Some("irq-driver"));
 }
 
-#[test_case]
+tagged_test!(object_property_set_bounds_a_domain, [Kernel]);
 fn object_property_set_bounds_a_domain() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::domain::{Domain, UNLIMITED};
@@ -1821,7 +1978,7 @@ fn object_property_set_bounds_a_domain() {
 	assert_eq!(domain.account().memory().limit(), 8192);
 }
 
-#[test_case]
+tagged_test!(channel_message_and_capability_transfer, [Ipc]);
 fn channel_message_and_capability_transfer() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	static OK: AtomicBool = AtomicBool::new(false);
@@ -1873,7 +2030,7 @@ fn channel_message_and_capability_transfer() {
 	assert_eq!(MARKER.load(Ordering::SeqCst), 0x5151_5151);
 }
 
-#[test_case]
+tagged_test!(blocking_wait_wakes_on_message, [Ipc]);
 fn blocking_wait_wakes_on_message() {
 	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 	static OK: AtomicBool = AtomicBool::new(false);
@@ -1910,7 +2067,7 @@ fn blocking_wait_wakes_on_message() {
 	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 0);
 }
 
-#[test_case]
+tagged_test!(a_sender_on_a_full_channel_blocks_and_wakes_on_drain, [Ipc]);
 fn a_sender_on_a_full_channel_blocks_and_wakes_on_drain() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	static SENDER_REFUSED: AtomicBool = AtomicBool::new(false);
@@ -1970,7 +2127,7 @@ fn a_sender_on_a_full_channel_blocks_and_wakes_on_drain() {
 	assert_eq!(RECEIVED.load(Ordering::SeqCst), 3, "every message was delivered");
 }
 
-#[test_case]
+tagged_test!(blocking_wait_times_out_on_deadline, [Scheduler]);
 fn blocking_wait_times_out_on_deadline() {
 	use core::sync::atomic::{AtomicI64, Ordering};
 	static WAIT_RET: AtomicI64 = AtomicI64::new(-999);
@@ -1991,7 +2148,7 @@ fn blocking_wait_times_out_on_deadline() {
 	assert_eq!(WAIT_RET.load(Ordering::SeqCst), syscall::ERR_TIMED_OUT);
 }
 
-#[test_case]
+tagged_test!(a_periodic_wait_ticks_but_never_holds_the_scheduler, [Scheduler]);
 fn a_periodic_wait_ticks_but_never_holds_the_scheduler() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -2026,7 +2183,7 @@ fn a_periodic_wait_ticks_but_never_holds_the_scheduler() {
 	assert!(TICKS.load(Ordering::SeqCst) >= target, "the periodic wait keeps ticking across settles");
 }
 
-#[test_case]
+tagged_test!(wait_any_wakes_on_the_ready_handle, [Ipc]);
 fn wait_any_wakes_on_the_ready_handle() {
 	use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 	static HB: AtomicU64 = AtomicU64::new(0);
@@ -2071,7 +2228,7 @@ fn wait_any_wakes_on_the_ready_handle() {
 	assert!(OK.load(Ordering::SeqCst));
 }
 
-#[test_case]
+tagged_test!(waiting_on_a_process_handle_wakes_when_it_exits, [Process]);
 fn waiting_on_a_process_handle_wakes_when_it_exits() {
 	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 	static WAIT_RET: AtomicI64 = AtomicI64::new(-999);
@@ -2113,7 +2270,7 @@ fn waiting_on_a_process_handle_wakes_when_it_exits() {
 	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 0, "the process handle became ready on exit");
 }
 
-#[test_case]
+tagged_test!(signal_terminate_wakes_a_blocked_thread, [Process]);
 fn signal_terminate_wakes_a_blocked_thread() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::thread::ThreadState;
@@ -2149,7 +2306,7 @@ fn signal_terminate_wakes_a_blocked_thread() {
 	assert_eq!(victim_thread.state(), ThreadState::Exited, "the victim thread has exited");
 }
 
-#[test_case]
+tagged_test!(channel_endpoint_semantics, [Ipc]);
 fn channel_endpoint_semantics() {
 	use object::channel::{Channel, ChannelError, Message};
 	let (a, b) = Channel::create();
@@ -2166,7 +2323,7 @@ fn channel_endpoint_semantics() {
 	assert!(matches!(b.recv(), Err(ChannelError::PeerClosed)));
 }
 
-#[test_case]
+tagged_test!(channel_peek_reports_the_pending_length, [Ipc]);
 fn channel_peek_reports_the_pending_length() {
 	use object::channel::{Channel, ChannelError, Message};
 	// The peek that retires the wire ceiling: a receiver learns the next pending
@@ -2191,7 +2348,7 @@ fn channel_peek_reports_the_pending_length() {
 	assert!(matches!(b.peek_len(), Err(ChannelError::PeerClosed)));
 }
 
-#[test_case]
+tagged_test!(pci_scan_finds_virtio_devices, [Drivers]);
 fn pci_scan_finds_virtio_devices() {
 	// QEMU is launched (see qemu-run.sh) with virtio-blk, virtio-net, and a virtio
 	// serial device on the PCI bus. The kernel's PCI scan must find them: at least
@@ -2205,7 +2362,7 @@ fn pci_scan_finds_virtio_devices() {
 	}
 }
 
-#[test_case]
+tagged_test!(device_table_exposes_virtio_mmio, [Drivers]);
 fn device_table_exposes_virtio_mmio() {
 	use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 	// device::init() populated the table at boot from the PCI scan. A driver-like
@@ -2239,7 +2396,7 @@ fn device_table_exposes_virtio_mmio() {
 	assert!(mapped != 0 && !syscall::sys_is_err(mapped), "the device MMIO should map to a valid address");
 }
 
-#[test_case]
+tagged_test!(pci_scan_finds_the_xhci_controller, [Drivers, Usb]);
 fn pci_scan_finds_the_xhci_controller() {
 	// QEMU is launched (see qemu-run.sh) with a qemu-xhci USB host controller. The
 	// kernel's PCI scan must find it by its class triple (0x0C/0x03/0x30) and resolve
@@ -2254,7 +2411,7 @@ fn pci_scan_finds_the_xhci_controller() {
 	}
 }
 
-#[test_case]
+tagged_test!(device_table_exposes_the_xhci_controller, [Drivers, Usb]);
 fn device_table_exposes_the_xhci_controller() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	// The xHCI controller joins the same device table the virtio devices live in. A
@@ -2291,7 +2448,7 @@ fn device_table_exposes_the_xhci_controller() {
 	assert!(mapped != 0 && !syscall::sys_is_err(mapped), "the xHCI register file should map to a valid address");
 }
 
-#[test_case]
+tagged_test!(xhci_driver_enumerates_the_usb_bus, [Drivers, Usb, Slow]);
 fn xhci_driver_enumerates_the_usb_bus() {
 	use object::channel::{Channel, Message};
 	use object::device_memory::DeviceMemory;
@@ -2439,7 +2596,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	assert_eq!(read_from_object(file, size), expected, "vol://usb should serve the seeded file's bytes");
 }
 
-#[test_case]
+tagged_test!(dma_buffer_maps_and_reports_phys, [Drivers, Memory]);
 fn dma_buffer_maps_and_reports_phys() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	// A driver allocates a DMA buffer for its virtqueue, maps it, and programs its
@@ -2477,7 +2634,7 @@ fn dma_buffer_maps_and_reports_phys() {
 	assert_eq!(READBACK.load(Ordering::SeqCst), MARK, "the bytes written through the mapping must be visible at the physical base");
 }
 
-#[test_case]
+tagged_test!(log_record_roundtrip_and_renders, [Service]);
 fn log_record_roundtrip_and_renders() {
 	use abi::log::{LogRecord, Severity, encode, render_cbor, render_json, render_text};
 	// A LogRecord is the canonical structured object; text/JSON/CBOR are derived
@@ -2561,7 +2718,7 @@ fn spawn_service_with_package(name: &[u8]) -> (alloc::sync::Arc<object::channel:
 // records why it went down instead of seeing an unexplained peer-close. DeviceManager
 // needs the init package before it reports in; hand it a plain message where the package
 // should be and it reports the failure honestly rather than dying silently.
-#[test_case]
+tagged_test!(a_service_reports_a_bootstrap_failure, [Service]);
 fn a_service_reports_a_bootstrap_failure() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -2593,7 +2750,7 @@ fn le_u64(b: &[u8], off: usize) -> u64 {
 	u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
 }
 
-#[test_case]
+tagged_test!(log_service_speaks_generated_bindings, [Service]);
 fn log_service_speaks_generated_bindings() {
 	use abi::log::{self, Severity};
 	use object::channel::Message;
@@ -2652,7 +2809,7 @@ fn log_service_speaks_generated_bindings() {
 	assert!(b.windows(b"device_manager".len()).any(|w: &[u8]| w == b"device_manager"), "second entry present");
 }
 
-#[test_case]
+tagged_test!(device_service_lists_devices, [Service, Drivers]);
 fn device_service_lists_devices() {
 	use object::channel::Message;
 
@@ -2690,7 +2847,7 @@ fn device_service_lists_devices() {
 	assert_eq!(le_u32(b, 7), 0, "the first device is index 0");
 }
 
-#[test_case]
+tagged_test!(input_service_streams_pointer_events, [Service, Input, Mouse, Console]);
 fn input_service_streams_pointer_events() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -2766,7 +2923,7 @@ fn input_service_streams_pointer_events() {
 	assert_eq!(events[1], (0, 0, 0), "the corner event maps to column 0, row 0, no buttons");
 }
 
-#[test_case]
+tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow]);
 fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -2934,7 +3091,7 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	assert!(arch::apic::ticks() - acked_at >= 75, "the renewal came at the restarted T1, not the retransmit pace");
 }
 
-#[test_case]
+tagged_test!(process_service_starts_a_program, [Service, Process]);
 fn process_service_starts_a_program() {
 	use object::channel::Message;
 
@@ -2988,7 +3145,7 @@ fn process_service_starts_a_program() {
 	assert_eq!(le_u16(b, 5), 1, "the started process is listed");
 }
 
-#[test_case]
+tagged_test!(process_service_loads_a_program_from_system_bin, [Service, Process, Storage]);
 fn process_service_loads_a_program_from_system_bin() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -3055,7 +3212,7 @@ fn process_service_loads_a_program_from_system_bin() {
 	assert_eq!(&b[15..15 + name_len], name, "the reply echoes the launched program name");
 }
 
-#[test_case]
+tagged_test!(config_service_serves_the_tree, [Service]);
 fn config_service_serves_the_tree() {
 	use object::channel::Message;
 
@@ -3130,7 +3287,7 @@ fn config_service_serves_the_tree() {
 	assert_eq!(&b[7..7 + vlen], b"hi", "the value just set reads back");
 }
 
-#[test_case]
+tagged_test!(config_set_survives_a_service_reboot, [Service, Storage]);
 fn config_set_survives_a_service_reboot() {
 	use alloc::collections::BTreeMap;
 	use object::channel::{Channel, Message};
@@ -3269,7 +3426,7 @@ fn config_set_survives_a_service_reboot() {
 // failed to report in there - which turned out to be the riscv trap-frame register clobber
 // (a trap could corrupt the interrupted thread's t0/x5), not an interrupt-timing issue;
 // with that fixed the chain settles deterministically on riscv64 too.
-#[test_case]
+tagged_test!(init_package_starts_system_manager, [Boot, Service]);
 fn init_package_starts_system_manager() {
 	// The boot chain, end to end: SystemManager starts from the init package, spawns
 	// ServiceManager and delegates the package and the ramdisk to it, and
@@ -3344,7 +3501,7 @@ fn init_package_starts_system_manager() {
 	}
 }
 
-#[test_case]
+tagged_test!(pty_hosts_a_program, [Service, Shell, Console]);
 fn pty_hosts_a_program() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -3425,7 +3582,7 @@ fn pty_hosts_a_program() {
 	assert!(captured.windows(b"pty:hello".len()).any(|w| w == b"pty:hello"), "the slave's reply is forwarded back out the master");
 }
 
-#[test_case]
+tagged_test!(interactive_tool_reads_stdin, [Service, Shell, Console, Input]);
 fn interactive_tool_reads_stdin() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -3469,7 +3626,7 @@ fn interactive_tool_reads_stdin() {
 	assert!(captured.windows(b"in> hello".len()).any(|w| w == b"in> hello"), "the foreground tool reads its stdin and echoes it back");
 }
 
-#[test_case]
+tagged_test!(du_reports_a_directory_tree_size, [Service, Storage, Shell]);
 fn du_reports_a_directory_tree_size() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -3544,7 +3701,7 @@ fn run_inventory_tool(name: &[u8]) -> alloc::vec::Vec<u8> {
 	captured
 }
 
-#[test_case]
+tagged_test!(inventory_tools_print_the_system_identity, [Service, Shell]);
 fn inventory_tools_print_the_system_identity() {
 	// The zero-capability inventory commands: each runs as its own sandboxed
 	// ELF and prints compile-time / free-syscall data - no service client, the
@@ -3569,7 +3726,7 @@ fn inventory_tools_print_the_system_identity() {
 	assert!(!dmesg.is_empty(), "dmesg should print the kernel boot log (or report there is none)");
 }
 
-#[test_case]
+tagged_test!(inventory_tools_report_the_hardware, [Service, Shell, Drivers]);
 fn inventory_tools_report_the_hardware() {
 	// The hardware-inventory commands: each runs as its own sandboxed ELF over
 	// a free syscall reading state the kernel now retains past boot - the CPU set
@@ -3621,7 +3778,7 @@ fn inventory_tools_report_the_hardware() {
 // architecture's factory archive so the seed always fits ahead of the filesystem.
 const FACTORY_START_SECTOR: u64 = 65536;
 
-#[test_case]
+tagged_test!(system_volume_formats_to_the_disks_capacity, [Service, Storage, Filesystem, Slow]);
 fn system_volume_formats_to_the_disks_capacity() {
 	use alloc::collections::BTreeMap;
 	use object::channel::{Channel, Message};
@@ -3773,7 +3930,7 @@ fn pump_block_stand_in(blk_host: &object::channel::Channel, disk: &mut alloc::co
 	}
 }
 
-#[test_case]
+tagged_test!(system_volume_lands_in_a_gpt_partition, [Service, Storage, Filesystem, Slow]);
 fn system_volume_lands_in_a_gpt_partition() {
 	use alloc::collections::BTreeMap;
 	use object::channel::Channel;
@@ -3833,7 +3990,7 @@ fn system_volume_lands_in_a_gpt_partition() {
 	assert!(disk.get(&FACTORY_START_SECTOR).is_none(), "the fixed factory offset must stay untouched on a GPT disk");
 }
 
-#[test_case]
+tagged_test!(a_degenerate_gpt_entry_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow]);
 fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	use alloc::collections::BTreeMap;
 	use object::channel::Channel;
@@ -3888,7 +4045,7 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	assert_eq!(num_blocks, expected_pool, "the pool should span the capacity-derived factory region");
 }
 
-#[test_case]
+tagged_test!(a_lying_seed_archive_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow]);
 fn a_lying_seed_archive_cannot_kill_the_storage_service() {
 	use alloc::collections::BTreeMap;
 	use object::channel::Channel;
@@ -3936,7 +4093,7 @@ fn a_lying_seed_archive_cannot_kill_the_storage_service() {
 	assert_eq!(num_blocks, expected_pool, "the pool should span the capacity-derived factory region");
 }
 
-#[test_case]
+tagged_test!(ps_live_view_drives_the_terminal_contract, [Service, Shell, Console]);
 fn ps_live_view_drives_the_terminal_contract() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -3986,7 +4143,7 @@ fn ps_live_view_drives_the_terminal_contract() {
 	assert!(contains(b"\x1b[?9001l") && contains(b"\x1b[?1049l"), "quitting on q should restore the tty and leave the alternate screen");
 }
 
-#[test_case]
+tagged_test!(system_manager_recovery_escalates_after_repeated_crashes, [Process]);
 fn system_manager_recovery_escalates_after_repeated_crashes() {
 	use object::KernelObject;
 	// The kernel supervises SystemManager: if it faults, the kernel starts a
@@ -4004,7 +4161,7 @@ fn system_manager_recovery_escalates_after_repeated_crashes() {
 	assert!(!up, "a SystemManager that faults on every attempt must exhaust recovery and escalate");
 }
 
-#[test_case]
+tagged_test!(system_manager_recovery_survives_a_clean_start, [Process]);
 fn system_manager_recovery_survives_a_clean_start() {
 	use object::KernelObject;
 	// A SystemManager that does not fault must survive on the first attempt, so
@@ -4020,7 +4177,7 @@ fn system_manager_recovery_survives_a_clean_start() {
 	assert!(up, "a SystemManager that does not fault should survive without recovery");
 }
 
-#[test_case]
+tagged_test!(a_clean_exit_releases_the_process_channel_endpoints, [Process]);
 fn a_clean_exit_releases_the_process_channel_endpoints() {
 	use object::channel::Channel;
 	use object::process::Process;
@@ -4051,7 +4208,7 @@ fn a_clean_exit_releases_the_process_channel_endpoints() {
 	let _: &Process = &process;
 }
 
-#[test_case]
+tagged_test!(userspace_spawn_syscalls_start_a_second_process, [Process, Syscall]);
 fn userspace_spawn_syscalls_start_a_second_process() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	// A kernel thread drives the userspace spawn syscalls exactly as a ring-3
@@ -4085,7 +4242,7 @@ fn userspace_spawn_syscalls_start_a_second_process() {
 	assert_eq!(&message.bytes[..], b"LogService: online");
 }
 
-#[test_case]
+tagged_test!(storage_serves_volume_file_to_client, [Service, Storage]);
 fn storage_serves_volume_file_to_client() {
 	// The StorageService (a ring-3 process) maps a ramdisk volume, and a client
 	// process opens vol://system/hello.txt through it, receives a shared-buffer
@@ -4098,7 +4255,7 @@ fn storage_serves_volume_file_to_client() {
 	assert_eq!(actual, expected);
 }
 
-#[test_case]
+tagged_test!(wasi_host_runs_a_component, [Service]);
 fn wasi_host_runs_a_component() {
 	// The wasi_host (a ring-3 process) loads an embedded Wasm component and runs it
 	// on the `wasm` runtime. The component's only import, `liber.read`, is wired by
@@ -4113,7 +4270,7 @@ fn wasi_host_runs_a_component() {
 	assert_eq!(actual, expected, "the component read the granted file's bytes through the host import");
 }
 
-#[test_case]
+tagged_test!(powerbox_grants_a_picked_file_to_a_component, [Service]);
 fn powerbox_grants_a_picked_file_to_a_component() {
 	// A Wasm component with NO filesystem access of its own runs under wasi_host,
 	// which holds only a FilePicker client. The component's read import goes through
@@ -4127,7 +4284,7 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 	assert_eq!(actual, expected, "the component read the user-picked file through the picker");
 }
 
-#[test_case]
+tagged_test!(permission_manager_sandboxes_a_component, [Service, Process]);
 fn permission_manager_sandboxes_a_component() {
 	// The PermissionManager governs four components under typed permission manifests. Two are
 	// report-back probes. sandbox_probe is granted storage and log but not network: it starts
@@ -4174,7 +4331,7 @@ fn permission_manager_sandboxes_a_component() {
 	assert_eq!(cat_read, expected, "the cat tool printed its file argument through the storage grant the run launcher gave it, forwarded to the captured stdout");
 }
 
-#[test_case]
+tagged_test!(component_host_runs_an_sdk_component, [Service, Slow]);
 fn component_host_runs_an_sdk_component() {
 	// component_host (a ring-3 process) loads a real Wasm component - built by the Rust
 	// SDK and served from storage as vol://system/app.wasm, not embedded in the kernel
@@ -4194,7 +4351,7 @@ fn component_host_runs_an_sdk_component() {
 	assert_eq!(score, 17, "the component's float `score` export computed floor(10 * 1.5 + 2.0) on real toolchain output");
 }
 
-#[test_case]
+tagged_test!(resource_manager_contains_a_domain, [Service]);
 fn resource_manager_contains_a_domain() {
 	// The ResourceManager creates a bounded sub-Domain, launches resource_probe into it, and
 	// caps the Domain's memory at four one-page objects above the probe's baseline. It drives
@@ -4210,7 +4367,7 @@ fn resource_manager_contains_a_domain() {
 	assert_eq!(summary.as_slice(), b"granted=4 denied=1 regranted=4", "the kernel enforced the Domain's memory budget, contained the over-budget refusal, and honored the runtime raise");
 }
 
-#[test_case]
+tagged_test!(capability_grants_no_operation_beyond_rights, [Kernel]);
 fn capability_grants_no_operation_beyond_rights() {
 	// Property: a handle grants no operation beyond the rights it carries. Across many random
 	// granted-rights sets and random probe rights, a rights-checked lookup succeeds exactly
@@ -4235,7 +4392,7 @@ fn capability_grants_no_operation_beyond_rights() {
 	}
 }
 
-#[test_case]
+tagged_test!(capability_attenuation_only_narrows, [Kernel]);
 fn capability_attenuation_only_narrows() {
 	// Property: duplicating a capability can only narrow it, never widen it. Across many
 	// random grants (carrying the DUPLICATE right) and random requests, duplication succeeds
@@ -4275,7 +4432,7 @@ fn capability_attenuation_only_narrows() {
 	}
 }
 
-#[test_case]
+tagged_test!(no_ambient_authority_fresh_table_empty, [Kernel]);
 fn no_ambient_authority_fresh_table_empty() {
 	// A newly created handle table holds nothing: a process begins with no ambient authority
 	// and can reach only capabilities explicitly handed to it. The table is empty, and every
@@ -4297,7 +4454,7 @@ fn no_ambient_authority_fresh_table_empty() {
 	}
 }
 
-#[test_case]
+tagged_test!(syscall_fuzz_rejects_invalid_calls, [Syscall]);
 fn syscall_fuzz_rejects_invalid_calls() {
 	// Syscall fuzzing: from a ring-0 thread (with its own, empty handle table), drive the
 	// syscall boundary with random unknown syscall numbers and random arguments, then known
@@ -4339,7 +4496,7 @@ fn syscall_fuzz_rejects_invalid_calls() {
 	assert!(DONE.load(Ordering::SeqCst), "the syscall fuzz thread did not finish - the kernel did not survive");
 }
 
-#[test_case]
+tagged_test!(object_info_get_reports_object, [Syscall]);
 fn object_info_get_reports_object() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
@@ -4374,7 +4531,7 @@ fn object_info_get_reports_object() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
-#[test_case]
+tagged_test!(system_graph_reflects_live_state, [Kernel]);
 fn system_graph_reflects_live_state() {
 	use object::address_space::AddressSpace;
 	use object::channel::Channel;
@@ -4410,7 +4567,7 @@ fn system_graph_reflects_live_state() {
 	assert_eq!(after.processes.len(), 0, "the process is gone after it drops");
 }
 
-#[test_case]
+tagged_test!(process_counters_track_ipc_and_resources, [Process]);
 fn process_counters_track_ipc_and_resources() {
 	use object::address_space::AddressSpace;
 	use object::domain::Domain;
@@ -4443,7 +4600,7 @@ fn process_counters_track_ipc_and_resources() {
 	assert!(process.is_killed(), "a terminated process reports as failed");
 }
 
-#[test_case]
+tagged_test!(kernel_reads_file_through_storage_service, [Service, Storage]);
 fn kernel_reads_file_through_storage_service() {
 	// The kernel drives the StorageService as its own client, sending one open request
 	// and a quit sentinel, then reads the returned shared buffer. The bytes must equal
@@ -4455,7 +4612,7 @@ fn kernel_reads_file_through_storage_service() {
 	assert_eq!(actual, expected);
 }
 
-#[test_case]
+tagged_test!(storage_serves_staged_tool_binary, [Service, Storage]);
 fn storage_serves_staged_tool_binary() {
 	// The tool ELFs are staged onto the system volume under bin/ by the
 	// factory-seed pipeline (build.rs strips them into the volume archive, the boot runner
@@ -4467,7 +4624,7 @@ fn storage_serves_staged_tool_binary() {
 	assert_eq!(&actual[..4], b"\x7fELF", "the staged tool should be an ELF image");
 }
 
-#[test_case]
+tagged_test!(event_timer_objects, [Kernel]);
 fn event_timer_objects() {
 	use object::event::Event;
 	use object::timer::Timer;
@@ -4495,7 +4652,7 @@ fn event_timer_objects() {
 	assert!(!timer.is_expired());
 }
 
-#[test_case]
+tagged_test!(event_timer_syscalls, [Kernel, Syscall]);
 fn event_timer_syscalls() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
@@ -4525,7 +4682,7 @@ fn event_timer_syscalls() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
-#[test_case]
+tagged_test!(userspace_runs_and_ipcs, [Process]);
 fn userspace_runs_and_ipcs() {
 	use object::channel::Channel;
 	// Hand a fresh kernel thread one end of a channel and let it drop to ring 3
@@ -4567,7 +4724,7 @@ extern "C" fn user_yield_thread_body(handle: u64) {
 	frame::deallocate(stack);
 }
 
-#[test_case]
+tagged_test!(userspace_yields_cooperatively, [Process, Scheduler]);
 fn userspace_yields_cooperatively() {
 	use object::channel::Channel;
 	// Two ring-3 threads share one core and each call SYS_YIELD several times
@@ -4585,7 +4742,7 @@ fn userspace_yields_cooperatively() {
 	assert_eq!(&k1.recv().expect("second ring-3 thread sent a message").bytes[..], b"OK");
 }
 
-#[test_case]
+tagged_test!(fault_isolation_kills_only_process, [Kernel, Process]);
 fn fault_isolation_kills_only_process() {
 	use core::sync::atomic::Ordering;
 	use object::domain::Domain;
@@ -4607,8 +4764,12 @@ fn fault_isolation_kills_only_process() {
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
+tagged_test!(
+	#[cfg(target_arch = "x86_64")]
+	writable_pages_are_not_executable,
+	[Kernel, ArchX86_64]
+);
 #[cfg(target_arch = "x86_64")]
-#[test_case]
 fn writable_pages_are_not_executable() {
 	use core::sync::atomic::Ordering;
 	use object::domain::Domain;
@@ -4632,8 +4793,12 @@ fn writable_pages_are_not_executable() {
 // `& 0x10` fetch bit above are x86-specific). It encodes W^X with the UXN descriptor
 // bit and reports the fault in ESR_EL1, so the same NX probe is checked through the
 // aarch64 exception class instead.
+tagged_test!(
+	#[cfg(target_arch = "aarch64")]
+	writable_pages_are_not_executable,
+	[Kernel, ArchAarch64]
+);
 #[cfg(target_arch = "aarch64")]
-#[test_case]
 fn writable_pages_are_not_executable() {
 	use core::sync::atomic::Ordering;
 	use object::domain::Domain;
@@ -4660,8 +4825,12 @@ fn writable_pages_are_not_executable() {
 // fetch fault is just the scause exception code. On Sv39 a WRITABLE leaf leaves the X bit
 // clear (map_page only sets X for an executable mapping), so the same NX probe is checked
 // through scause instead.
+tagged_test!(
+	#[cfg(target_arch = "riscv64")]
+	writable_pages_are_not_executable,
+	[Kernel, ArchRiscv64]
+);
 #[cfg(target_arch = "riscv64")]
-#[test_case]
 fn writable_pages_are_not_executable() {
 	use core::sync::atomic::Ordering;
 	use object::domain::Domain;
@@ -4683,8 +4852,12 @@ fn writable_pages_are_not_executable() {
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
+tagged_test!(
+	#[cfg(target_arch = "x86_64")]
+	kernel_access_to_user_memory_is_refused_outside_the_window,
+	[Kernel, ArchX86_64]
+);
 #[cfg(target_arch = "x86_64")]
-#[test_case]
 fn kernel_access_to_user_memory_is_refused_outside_the_window() {
 	use mem::frame;
 	// SMAP/SMEP: a kernel dereference of a USER-mapped page outside the sanctioned
@@ -4736,7 +4909,7 @@ fn kernel_access_to_user_memory_is_refused_outside_the_window() {
 	frame::deallocate(frame);
 }
 
-#[test_case]
+tagged_test!(a_user_stack_grows_on_demand_past_its_initial_pages, [Kernel, Memory]);
 fn a_user_stack_grows_on_demand_past_its_initial_pages() {
 	use core::sync::atomic::Ordering;
 	use object::domain::Domain;
@@ -4756,7 +4929,7 @@ fn a_user_stack_grows_on_demand_past_its_initial_pages() {
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
-#[test_case]
+tagged_test!(recursion_past_the_stack_floor_is_killed, [Kernel, Memory, Process]);
 fn recursion_past_the_stack_floor_is_killed() {
 	use core::sync::atomic::Ordering;
 	use mem::frame::PAGE_SIZE;
@@ -4777,8 +4950,12 @@ fn recursion_past_the_stack_floor_is_killed() {
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
+tagged_test!(
+	#[cfg(target_arch = "x86_64")]
+	driver_crash_is_cleaned_up_and_notified,
+	[Drivers, Process, ArchX86_64]
+);
 #[cfg(target_arch = "x86_64")]
-#[test_case]
 fn driver_crash_is_cleaned_up_and_notified() {
 	use object::KernelObject;
 	use object::domain::Domain;
@@ -4810,8 +4987,12 @@ fn driver_crash_is_cleaned_up_and_notified() {
 	fault::clear_crash_notify();
 }
 
+tagged_test!(
+	#[cfg(target_arch = "x86_64")]
+	device_manager_reacts_to_a_driver_crash,
+	[Drivers, Process, ArchX86_64]
+);
 #[cfg(target_arch = "x86_64")]
-#[test_case]
 fn device_manager_reacts_to_a_driver_crash() {
 	use object::KernelObject;
 	use object::domain::Domain;
@@ -4844,7 +5025,7 @@ fn device_manager_reacts_to_a_driver_crash() {
 	assert_eq!(device0, DeviceState::Offline, "DeviceManager should mark a crashed driver's device offline");
 }
 
-#[test_case]
+tagged_test!(driver_survives_crash_and_restart, [Process]);
 fn driver_survives_crash_and_restart() {
 	use object::KernelObject;
 	// The driver crash/restart cycle: a driver that faults is respawned by its
@@ -4877,7 +5058,7 @@ fn driver_survives_crash_and_restart() {
 	assert!(restarts >= 1, "the supervisor should have restarted the crashed driver");
 }
 
-#[test_case]
+tagged_test!(domain_quota_enforced_cleanly, [Kernel]);
 fn domain_quota_enforced_cleanly() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::domain::Domain;
@@ -4924,7 +5105,7 @@ fn domain_quota_enforced_cleanly() {
 	assert_eq!(domain.account().threads().used(), 0);
 }
 
-#[test_case]
+tagged_test!(dma_buffer_quota_enforced_cleanly, [Kernel]);
 fn dma_buffer_quota_enforced_cleanly() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::domain::{Domain, UNLIMITED};
@@ -4956,7 +5137,7 @@ fn dma_buffer_quota_enforced_cleanly() {
 	assert_eq!(domain.account().dma().used(), 0);
 }
 
-#[test_case]
+tagged_test!(ipc_queue_bytes_accounting_enforced, [Kernel, Ipc]);
 fn ipc_queue_bytes_accounting_enforced() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::domain::{Domain, UNLIMITED};
@@ -4992,7 +5173,7 @@ fn ipc_queue_bytes_accounting_enforced() {
 	assert_eq!(domain.account().ipc_queue().used(), 0);
 }
 
-#[test_case]
+tagged_test!(domain_hierarchy_limits_aggregate, [Kernel]);
 fn domain_hierarchy_limits_aggregate() {
 	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 	use object::domain::{Domain, UNLIMITED};
@@ -5032,7 +5213,7 @@ fn domain_hierarchy_limits_aggregate() {
 	assert_eq!(parent.account().memory().used(), 0, "parent aggregate memory refunded");
 }
 
-#[test_case]
+tagged_test!(domain_kill_frees_subtree, [Kernel, Process]);
 fn domain_kill_frees_subtree() {
 	use core::sync::atomic::{AtomicI64, Ordering};
 	use object::domain::Domain;
@@ -5069,7 +5250,7 @@ fn domain_kill_frees_subtree() {
 	assert_eq!(parent.account().threads().used(), 0, "parent aggregate threads refunded");
 }
 
-#[test_case]
+tagged_test!(ipc_round_trip_and_zero_copy, [Ipc]);
 fn ipc_round_trip_and_zero_copy() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	use object::channel::{Channel, Message};
