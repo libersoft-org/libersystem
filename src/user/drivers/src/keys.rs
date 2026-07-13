@@ -27,6 +27,15 @@ pub const KEY_DELETE: u16 = 111;
 pub const KEY_PAGEUP: u16 = 104;
 pub const KEY_PAGEDOWN: u16 = 109;
 pub const KEY_INSERT: u16 = 110;
+// The C and V main-block keycodes, for the clipboard copy / paste chords.
+pub const KEY_C: u16 = 46;
+pub const KEY_V: u16 = 47;
+
+// Private bytes for the clipboard chords the console intercepts (copy the selection /
+// paste the clipboard). 0xC0 and 0xC1 are never valid UTF-8 and the US layout never
+// produces them, so a serial paste of UTF-8 text can never be mistaken for a chord.
+const CHORD_COPY: u8 = 0xc0;
+const CHORD_PASTE: u8 = 0xc1;
 
 // Keycodes for the function keys (F11 / F12 sit apart from the F1..F10 run;
 // F13..F24 are the extended row professional and legacy UNIX keyboards carry).
@@ -304,6 +313,17 @@ pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 		}
 		// The recognized keys whose subsystem does not exist yet: consumed, no bytes.
 		if RESERVED_KEYS.contains(&code) {
+			return;
+		}
+		// Clipboard chords the console intercepts (a private byte, never a normal keystroke):
+		// Copy = Ctrl+Shift+C or Ctrl+Insert; Paste = Ctrl+Shift+V or Shift+Insert. Caught here,
+		// before the layout would turn Ctrl+C into 0x03 or Insert into an escape sequence.
+		if (mods.ctrl && mods.shift && code == KEY_C) || (mods.ctrl && code == KEY_INSERT) {
+			console_feed(CHORD_COPY);
+			return;
+		}
+		if (mods.ctrl && mods.shift && code == KEY_V) || (mods.shift && code == KEY_INSERT) {
+			console_feed(CHORD_PASTE);
 			return;
 		}
 		// PageUp / PageDown: Shift pages the console's own scrollback (a private control

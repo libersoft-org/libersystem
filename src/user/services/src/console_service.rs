@@ -101,6 +101,12 @@ const CHORD_NEXT: u8 = 0x1d;
 const CHORD_SCROLL_UP: u8 = 0x1e;
 const CHORD_SCROLL_DOWN: u8 = 0x1f;
 
+// Clipboard chords the driver collapses to a single private byte (0xC0 / 0xC1, never valid
+// UTF-8 nor produced by the layout): Copy (Ctrl+Shift+C / Ctrl+Insert) saves the current
+// selection to the clipboard; Paste (Ctrl+Shift+V / Shift+Insert) injects it into the shell.
+const CHORD_COPY: u8 = 0xc0;
+const CHORD_PASTE: u8 = 0xc1;
+
 // The visual bell holds the inverted screen for this many monotonic ticks (100 Hz, so
 // ~100 ms) before restoring it.
 const BELL_FLASH_TICKS: u64 = 10;
@@ -701,12 +707,33 @@ unsafe fn handle_keys(console: &mut Console, keys: &[u8]) {
 				scroll_fg(console, true);
 			} else if b == CHORD_SCROLL_DOWN {
 				scroll_fg(console, false);
+			} else if b == CHORD_COPY {
+				// Ctrl+Shift+C / Ctrl+Insert: copy the current selection to the clipboard.
+				copy_selection(console);
+			} else if b == CHORD_PASTE {
+				// Ctrl+Shift+V / Shift+Insert: paste the clipboard into the foreground shell.
+				let fg: usize = console.fg;
+				let bracketed: bool = console.vts[fg].term.as_ref().is_some_and(|t| t.screen.bracketed_paste());
+				paste_clipboard(console, bracketed);
 			} else {
 				// any other keystroke returns the foreground VT to its live screen first.
 				snap_fg_live(console);
 				feed_key(console, b);
 			}
 		}
+	}
+}
+
+// Copy the foreground VT's current mouse selection to the console clipboard (right-click
+// or the Ctrl+Shift+C / Ctrl+Insert chord); a no-op when nothing is selected.
+unsafe fn copy_selection(console: &mut Console) {
+	let fg: usize = console.fg;
+	let text: Vec<u8> = match console.vts[fg].term.as_ref() {
+		Some(t) => t.screen.selection_text(),
+		None => Vec::new(),
+	};
+	if !text.is_empty() {
+		console.clipboard = text;
 	}
 }
 
@@ -1311,6 +1338,8 @@ unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
 		let left_was: bool = prev & 1 != 0;
 		let mid_now: bool = buttons & 4 != 0;
 		let mid_was: bool = prev & 4 != 0;
+		let right_now: bool = buttons & 2 != 0;
+		let right_was: bool = prev & 2 != 0;
 		if let Some(t) = console.vts[fg].term.as_mut() {
 			t.screen.set_mouse(Some((col, row)));
 			if wheel != 0 {
@@ -1350,6 +1379,10 @@ unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
 		if mid_now && !mid_was {
 			// Middle-click: paste the clipboard (bracketed when the program asked for ?2004).
 			paste_clipboard(console, bracket);
+		}
+		if right_now && !right_was {
+			// Right-click: copy the current selection to the clipboard (select-then-right-click).
+			copy_selection(console);
 		}
 	}
 }
