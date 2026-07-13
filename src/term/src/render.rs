@@ -293,6 +293,10 @@ struct FramebufferRenderer {
 	surface: Box<dyn Surface>,
 	last_caret: Option<(usize, usize)>,
 	dirty: Option<(usize, usize, usize, usize)>,
+	// The scrollback view offset the last flush rendered. Comparing it to the model's current
+	// offset lets a pure paging move (Shift+PgUp/PgDn, the wheel) bulk-copy the framebuffer by
+	// the delta and repaint only the exposed rows, instead of re-blitting the whole screen.
+	view_offset: usize,
 }
 
 // The terminal (L2 + L3): the grid model and the renderer that draws it. A thin façade that
@@ -317,6 +321,7 @@ impl Term {
 		let max_rows = (self.renderer.surface.height() / CELL_H).max(1);
 		if self.screen.resize(new_cols, new_rows, max_cols, max_rows) {
 			self.renderer.last_caret = None;
+			self.renderer.view_offset = self.screen.view_offset();
 			self.renderer.clear_screen(&self.screen);
 		}
 	}
@@ -329,6 +334,7 @@ impl Term {
 		self.renderer.surface = surface;
 		self.renderer.last_caret = None;
 		self.renderer.dirty = None;
+		self.renderer.view_offset = self.screen.view_offset();
 		self.screen.mark_all_dirty();
 	}
 
@@ -356,6 +362,7 @@ impl Term {
 	pub fn handoff(&mut self, next: Box<dyn Surface>) {
 		self.renderer.handoff(next);
 		self.renderer.dirty = None;
+		self.renderer.view_offset = self.screen.view_offset();
 		let (w, h) = (self.renderer.surface.width() as u32, self.renderer.surface.height() as u32);
 		self.renderer.surface.present(0, 0, w, h);
 	}
@@ -401,7 +408,7 @@ fn track_caret(caret: Option<(usize, usize)>, scrolls: &[ScrollOp]) -> Option<(u
 
 impl FramebufferRenderer {
 	fn new(surface: Box<dyn Surface>) -> FramebufferRenderer {
-		FramebufferRenderer { surface, last_caret: None, dirty: None }
+		FramebufferRenderer { surface, last_caret: None, dirty: None, view_offset: 0 }
 	}
 
 	// Grow the painted bounding box by the pixel rectangle [x0, x1) x [y0, y1).
@@ -515,8 +522,20 @@ impl FramebufferRenderer {
 	// repaints only the vacated rows (and any cells edited this batch).
 	fn flush(&mut self, screen: &mut Screen) {
 		let scrolls = screen.take_scrolls();
-		if screen.view_offset() > 0 {
-			self.flush_view(screen);
+		let cur = screen.view_offset();
+		let prev = self.view_offset;
+		self.view_offset = cur;
+		if cur > 0 {
+			// Scrolled back into history. A pure paging move (the view offset changed by less than
+			// a screen with no grid edit this frame) bulk-copies the framebuffer by the delta and
+			// repaints only the newly exposed rows - instead of re-blitting every glyph
+			// (`flush_view`), which is the dominant paging cost in a debug build.
+			let delta = cur.abs_diff(prev);
+			if scrolls.is_empty() && delta > 0 && delta < screen.rows() {
+				self.flush_view_scroll(screen, delta, cur > prev);
+			} else {
+				self.flush_view(screen);
+			}
 			return;
 		}
 		// Move the framebuffer pixels for each grid scroll, following the old caret cell
@@ -553,6 +572,47 @@ impl FramebufferRenderer {
 			}
 			self.last_caret = None;
 		}
+	}
+
+	// Bulk-scroll fast path for scrollback paging: the view moved by `delta` rows (< a full
+	// screen) with no content change this frame, so shift the framebuffer pixels by the delta
+	// in one copy and repaint only the newly exposed rows from the scrollback view - avoiding
+	// the whole-screen glyph re-blit `flush_view` does (the dominant paging cost in a debug
+	// build). `up` = the view moved toward older lines (content shifts down, new rows at top).
+	fn flush_view_scroll(&mut self, screen: &Screen, delta: usize, up: bool) {
+		let cols = screen.cols();
+		let rows = screen.rows();
+		// If we just entered scrollback from the live screen, the live caret's pixels were
+		// carried down by the bulk copy to a cell the exposed-row repaint does not cover; erase
+		// it (a scroll into history is always upward, so it lands below the exposed top rows).
+		let ghost = self.last_caret.take();
+		if up {
+			self.surface.scroll_pixels_down(0, rows - 1, delta);
+			for row in 0..delta {
+				for col in 0..cols {
+					let cell = screen.view_cell(col, row);
+					self.draw_cell_at(screen, col, row, cell);
+				}
+			}
+			if let Some((cc, cr)) = ghost {
+				let gr = cr + delta;
+				if gr < rows {
+					let cell = screen.view_cell(cc, gr);
+					self.draw_cell_at(screen, cc, gr, cell);
+				}
+			}
+		} else {
+			self.surface.scroll_pixels_up(0, rows - 1, delta);
+			for row in (rows - delta)..rows {
+				for col in 0..cols {
+					let cell = screen.view_cell(col, row);
+					self.draw_cell_at(screen, col, row, cell);
+				}
+			}
+		}
+		// The whole screen's pixels moved, so the present must carry all of it.
+		self.mark(0, 0, cols * CELL_W, rows * CELL_H);
+		self.last_caret = None;
 	}
 
 	// Repaint the whole screen from the scrollback view (no caret while scrolled back).

@@ -1,5 +1,6 @@
 # Bugs / changes
 
+- why there is a "help" command again when it was deleted already?
 - qemu - be on the same network like host
 - lsvol - add column - device
 - mountpoints as mount://
