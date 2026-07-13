@@ -29,7 +29,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::system::log::{self, Service};
-use proto::system::{config, volume, Entry, Error, OpenOpts, Query, Severity};
+use proto::system::{Entry, Error, OpenOpts, Query, Severity, config, volume};
 use rt::*;
 
 // The bounded in-memory journal: at most this many records, newest dropping

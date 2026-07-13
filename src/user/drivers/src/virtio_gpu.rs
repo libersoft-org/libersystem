@@ -125,11 +125,7 @@ impl Gpu {
 			// pmodes[0].r.width @ hdr + 8, .height @ hdr + 12.
 			let w = rd32(self.resp_virt + HDR_LEN + 8);
 			let h = rd32(self.resp_virt + HDR_LEN + 12);
-			if w == 0 || h == 0 {
-				(FALLBACK_W, FALLBACK_H)
-			} else {
-				(w, h)
-			}
+			if w == 0 || h == 0 { (FALLBACK_W, FALLBACK_H) } else { (w, h) }
 		}
 	}
 

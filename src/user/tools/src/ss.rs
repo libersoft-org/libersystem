@@ -12,7 +12,7 @@
 
 extern crate alloc;
 
-use proto::system::{network, SockState};
+use proto::system::{SockState, network};
 use rt::*;
 
 #[unsafe(no_mangle)]

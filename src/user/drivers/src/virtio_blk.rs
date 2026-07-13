@@ -63,11 +63,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			for i in 0..4u64 {
 				v |= (device.config_read(8 + i) as u32) << (i * 8);
 			}
-			if v == 0 {
-				u64::MAX
-			} else {
-				v as u64
-			}
+			if v == 0 { u64::MAX } else { v as u64 }
 		} else {
 			u64::MAX
 		};
