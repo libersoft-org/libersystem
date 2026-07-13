@@ -19,6 +19,11 @@ bun i -g prettier
 
 git config user.name "$NAME"
 git config user.email "$EMAIL"
+
+if command -v just >/dev/null 2>&1; then
+	(cd src && just fmt) || echo "commit.sh: 'just fmt' failed - committing without a fresh format pass"
+fi
+
 git status
 git add .
 git status
@@ -56,12 +61,10 @@ if [ "$#" -eq 0 ]; then
 		echo "Usage: $0 \"[COMMIT MESSAGE]\""
 		exit 1
 	fi
-	# Clean the commit message - remove quotes and sanitize
 	COMMIT_MSG=$(echo "$COMMIT_MSG" | sed 's/"//g' | sed "s/'//g")
 	echo "\033[33mGENERATED COMMIT MESSAGE:\033[0m $COMMIT_MSG"
 	COMMIT_MESSAGE="$COMMIT_MSG"
 else
-	# Sanitize user-provided message
 	COMMIT_MESSAGE=$(echo "$1" | sed 's/"//g' | sed "s/'//g")
 fi
 

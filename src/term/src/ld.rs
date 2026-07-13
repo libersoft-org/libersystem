@@ -158,26 +158,38 @@ impl Ld {
 		false
 	}
 
-	// Tab completion over the command word (the line's first token, cursor at its end),
-	// against `vocab` - the shell builtins plus the live bin/ listing: a unique match
-	// completes fully, several matches extend to their longest common
-	// prefix, and a second Tab with nothing left to extend asks the program to list the
-	// matches (returns true; `self.relist` marks the delivery). Elsewhere in the line the
-	// key is ignored - path and argument completion is future work.
+	// Tab completion of the segment under the cursor (the cursor must sit at the end of
+	// the line) against `vocab`: a unique match completes fully, several matches extend to
+	// their longest common prefix, and a second Tab with nothing left to extend asks the
+	// program to list them (returns true; `self.relist` marks the delivery). The segment
+	// is the run of characters back to the previous space OR slash, so this drives both
+	// command-word completion (the first token, vocab = the builtins plus the live bin/
+	// listing) and path / argument completion (a later token, vocab = the target
+	// directory's entries with a trailing '/' on the sub-directories). A vocab entry that
+	// ends in '/' is a directory, so a unique match of one is NOT followed by a space -
+	// the operator keeps typing the sub-path.
 	fn tab(&mut self, again: bool, vocab: &[Vec<u8>], e: &mut Echo) -> bool {
-		if self.cursor != self.len || self.line[..self.len].contains(&b' ') {
+		if self.cursor != self.len {
 			return false;
 		}
-		let matches: Vec<&[u8]> = vocab.iter().map(|v: &Vec<u8>| v.as_slice()).filter(|c: &&[u8]| c.starts_with(&self.line[..self.len])).collect();
+		// The segment starts after the last space or slash, so the prefix we complete is
+		// just the final path component (or the whole first token for a bare command word).
+		let seg_start: usize = self.line[..self.len].iter().rposition(|&c: &u8| c == b' ' || c == b'/').map_or(0, |p: usize| p + 1);
+		let prefix: &[u8] = &self.line[seg_start..self.len];
+		let matches: Vec<&[u8]> = vocab.iter().map(|v: &Vec<u8>| v.as_slice()).filter(|c: &&[u8]| c.starts_with(prefix)).collect();
 		let first: Vec<u8> = match matches.first() {
 			Some(&m) => m.to_vec(),
 			None => return false,
 		};
 		if matches.len() == 1 {
-			for i in self.len..first.len() {
+			for i in prefix.len()..first.len() {
 				self.insert(first[i], e);
 			}
-			self.insert(b' ', e);
+			// A directory (trailing '/') keeps the line open for the sub-path; anything
+			// else is a complete word, so close it with a space.
+			if !first.ends_with(b"/") {
+				self.insert(b' ', e);
+			}
 			return false;
 		}
 		// several matches: extend to the longest common prefix they share.
@@ -189,8 +201,8 @@ impl Ld {
 			}
 			common = i;
 		}
-		if common > self.len {
-			for i in self.len..common {
+		if common > prefix.len() {
+			for i in prefix.len()..common {
 				self.insert(first[i], e);
 			}
 			return false;

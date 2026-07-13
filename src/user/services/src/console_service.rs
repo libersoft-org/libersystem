@@ -25,6 +25,7 @@ mod commands;
 
 extern crate alloc;
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 // The shared terminal stack from the `term` crate: the graphics-free grid model (L2,
@@ -143,6 +144,11 @@ struct Vt {
 	// (a future `ssh`, the `script` tool) is the same terminal with `term` None and the
 	// master a channel instead of the framebuffer.
 	master: u64,
+	// This VT's shell working directory, mirrored here from the shell over the control
+	// channel (SET_CWD, on startup and after each `cd`). The shell owns the cwd; the copy
+	// lets argument Tab completion resolve a relative path against it and list the target
+	// directory. Defaults to the system volume until the first SET_CWD arrives.
+	cwd: String,
 }
 
 // The capabilities ConsoleService holds to spawn a shell for any additional VT: a
@@ -434,7 +440,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, fb, fb_handle, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0 }], fg: 0, ptys: Vec::new(), facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
+		let mut console: Console = Console { addr, fb, fb_handle, has_fb, gpu, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
 		run(&mut console);
 	}
 }
@@ -715,16 +721,37 @@ unsafe fn feed_key(console: &mut Console, b: u8) {
 	}
 }
 
-// The Tab-completion vocabulary, fetched lazily: on the first Tab, list the system
-// volume's bin/ over a fresh storage connection and cache the names together with the
-// shell builtins for the session (the bin/ set is seeded at format time and static per
-// boot). Any other key answers an empty list without touching the cache, so the input
-// path pays the IPC round-trip exactly once - and only if Tab is ever pressed.
+// The Tab-completion vocabulary for the segment under the cursor. On the command word (the
+// first token) it is the shell builtins plus the system volume's bin/ listing (bash's
+// builtins + $PATH), fetched lazily on the first Tab and cached for the session. On a later
+// token it is the entries of the directory the partial path names, resolved against this
+// VT's cwd and listed fresh each time (a directory's contents vary), with a trailing '/' on
+// the sub-directories so the line discipline can keep a directory open for its sub-path. Any
+// key other than Tab answers an empty list without any IPC.
 unsafe fn completion_vocab(console: &mut Console, b: u8) -> Vec<Vec<u8>> {
 	unsafe {
 		if b != b'\t' {
 			return Vec::new();
 		}
+		let fg: usize = console.fg;
+		let vt: &Vt = &console.vts[fg];
+		let line: &[u8] = &vt.ld.line[..vt.ld.len];
+		// The token under the cursor is the run back to the last space; the command word
+		// (no space before it) completes over the runnable programs, a later token over a
+		// directory's entries.
+		let tok_start: usize = line.iter().rposition(|&c: &u8| c == b' ').map_or(0, |p: usize| p + 1);
+		if tok_start == 0 {
+			return command_vocab(console);
+		}
+		path_vocab(console, fg, tok_start)
+	}
+}
+
+// The command-word vocabulary: the shell builtins plus the system volume's bin/ listing,
+// cached for the session (the bin/ set is seeded at format time and static per boot), so the
+// input path pays this IPC round-trip once.
+unsafe fn command_vocab(console: &mut Console) -> Vec<Vec<u8>> {
+	unsafe {
 		if console.vocab.is_none() {
 			let mut names: Vec<Vec<u8>> = Vec::new();
 			if let Some(storage) = service_connect(console.facs.storage) {
@@ -742,6 +769,47 @@ unsafe fn completion_vocab(console: &mut Console, b: u8) -> Vec<Vec<u8>> {
 			console.vocab = Some(names);
 		}
 		console.vocab.clone().unwrap_or_default()
+	}
+}
+
+// The path-argument vocabulary for a later token: resolve the directory the partial path
+// names (everything up to its last '/', or the cwd when it has none yet) against this VT's
+// cwd, list that directory, and answer its entries - a trailing '/' on each sub-directory so
+// the line discipline keeps it open for the sub-path. The line discipline filters these by
+// the trailing path segment, exactly as it filters the command word. Only the system volume
+// is offered (ConsoleService holds only its storage client); any other volume answers empty.
+unsafe fn path_vocab(console: &mut Console, fg: usize, tok_start: usize) -> Vec<Vec<u8>> {
+	unsafe {
+		let vt: &Vt = &console.vts[fg];
+		let line_len: usize = vt.ld.len;
+		let token: Vec<u8> = vt.ld.line[tok_start..line_len].to_vec();
+		let cwd: String = vt.cwd.clone();
+		let dir_arg: &[u8] = match token.iter().rposition(|&c: &u8| c == b'/') {
+			Some(s) => &token[..s],
+			None => b"",
+		};
+		let target: String = match proto::path::resolve(&cwd, dir_arg) {
+			Some(t) => t,
+			None => return Vec::new(),
+		};
+		if target != "vol://system" && !target.starts_with("vol://system/") {
+			return Vec::new();
+		}
+		let mut names: Vec<Vec<u8>> = Vec::new();
+		if let Some(storage) = service_connect(console.facs.storage) {
+			let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
+			if let Some(consumer) = client.list(&target) {
+				for f in drain_stream(consumer, proto::system::volume::list_read) {
+					let mut name: Vec<u8> = f.name.into_bytes();
+					if f.r#type == proto::system::FileType::Dir {
+						name.push(b'/');
+					}
+					names.push(name);
+				}
+			}
+			close(storage);
+		}
+		names
 	}
 }
 
@@ -871,7 +939,7 @@ unsafe fn tty_echo(vt: &mut Vt, msg: &[u8]) {
 // channel, so here a close just tears the VT down too.
 unsafe fn handle_control(console: &mut Console, vi: usize) {
 	unsafe {
-		let mut cbuf: [u8; 64] = [0u8; 64];
+		let mut cbuf: [u8; 256] = [0u8; 256];
 		match recv_blocking(console.vts[vi].control, &mut cbuf) {
 			Received::Message { len, handle } => {
 				let msg: &[u8] = &cbuf[..len];
@@ -882,6 +950,13 @@ unsafe fn handle_control(console: &mut Console, vi: usize) {
 					let cols = u16::from_le_bytes([msg[11], msg[12]]) as usize;
 					let rows = u16::from_le_bytes([msg[13], msg[14]]) as usize;
 					resize_vt(console, vi, cols, rows);
+				} else if let Some(path) = msg.strip_prefix(b"SET_CWD") {
+					// The shell reports its working directory (on startup and after `cd`), so
+					// argument Tab completion can resolve a relative path against it.
+					if let Ok(s) = core::str::from_utf8(path) {
+						console.vts[vi].cwd.clear();
+						console.vts[vi].cwd.push_str(s);
+					}
 				} else if msg.starts_with(b"PTY_OPEN") {
 					// `PTY_OPEN` + a program name: open a pty hosting that program and reply
 					// the master channel (the host's data side) to the shell.
@@ -1623,7 +1698,7 @@ unsafe fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: 
 		let mut term: Term = Term::new(make_surface(addr, fb, gpu), vt_scrollback);
 		term.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 		term.screen.clear();
-		Some(Vt { term: Some(term), client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0 })
+		Some(Vt { term: Some(term), client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") })
 	}
 }
 
@@ -1656,7 +1731,7 @@ unsafe fn open_pty(console: &mut Console, name: &[u8]) -> Option<u64> {
 		// the slave's line-editor history depth follows the same config policy as a
 		// display VT (a pty has no grid, so only the history applies).
 		let (_, pty_history): (usize, usize) = term_policy(console.config_client);
-		console.ptys.push(Vt { term: None, client: slave_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(pty_history)), master: master_console });
+		console.ptys.push(Vt { term: None, client: slave_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(pty_history)), master: master_console, cwd: String::from("vol://system") });
 		Some(master_host)
 	}
 }

@@ -5,7 +5,7 @@
 //! graphics-independent.
 
 use crate::screen::SCROLLBACK_ROWS;
-use crate::{RawSink, Screen, TextSink};
+use crate::{Echo, EchoBuf, Ld, RawSink, Screen, TextSink};
 use alloc::vec::Vec;
 
 fn dump(screen: &Screen) -> Vec<u8> {
@@ -202,4 +202,62 @@ fn selection_reaches_into_scrollback() {
 	s.selection_begin(0, 0);
 	s.selection_extend(1, 0);
 	assert_eq!(s.selection_text(), b"L0");
+}
+
+// Drive the cooked line discipline: feed the initial bytes, then `tabs` Tab keys, all
+// against `vocab`, and return the resulting edited line. There is no grid (`term` None) -
+// only the buffer state matters here.
+fn tab_complete(initial: &[u8], vocab: &[&[u8]], tabs: usize) -> Vec<u8> {
+	let mut ld = Ld::new(8);
+	let vocab: Vec<Vec<u8>> = vocab.iter().map(|v: &&[u8]| v.to_vec()).collect();
+	let mut echo = Echo { term: None, ser: EchoBuf::new() };
+	for &b in initial {
+		ld.feed(b, &vocab, &mut echo);
+	}
+	for _ in 0..tabs {
+		ld.feed(b'\t', &vocab, &mut echo);
+	}
+	ld.line[..ld.len].to_vec()
+}
+
+// A unique command-word match completes fully and is closed with a space (bash's builtins +
+// $PATH completion), unchanged by the segment-aware rewrite.
+#[test]
+fn completes_a_unique_command_word() {
+	assert_eq!(tab_complete(b"ec", &[b"echo", b"cat"], 1), b"echo ");
+}
+
+// Several command-word matches extend to their longest common prefix and stop (no space -
+// the word is not finished yet).
+#[test]
+fn extends_a_command_word_to_the_common_prefix() {
+	assert_eq!(tab_complete(b"l", &[b"lsblk", b"lscpu", b"cat"], 1), b"ls");
+}
+
+// A path argument completes the trailing path segment (after the last '/') against the
+// directory's entries, leaving the rest of the line intact: `cat ./mot` -> `cat ./motd.txt `.
+#[test]
+fn completes_a_unique_path_argument() {
+	assert_eq!(tab_complete(b"cat ./mot", &[b"motd.txt", b"hello.txt"], 1), b"cat ./motd.txt ");
+}
+
+// A bare argument (no slash) completes against the directory entries too - the segment is the
+// whole token after the space.
+#[test]
+fn completes_a_bare_path_argument() {
+	assert_eq!(tab_complete(b"cat mot", &[b"motd.txt"], 1), b"cat motd.txt ");
+}
+
+// A directory completion carries its trailing '/' and is NOT closed with a space, so the
+// operator keeps typing the sub-path.
+#[test]
+fn a_directory_completion_stays_open() {
+	assert_eq!(tab_complete(b"cd bi", &[b"bin/", b"boot/"], 1), b"cd bin/");
+}
+
+// Several path-argument matches extend only the trailing segment to their common prefix, not
+// the whole token.
+#[test]
+fn extends_a_path_segment_to_the_common_prefix() {
+	assert_eq!(tab_complete(b"cat ./f", &[b"foo.txt", b"foobar.txt"], 1), b"cat ./foo");
 }

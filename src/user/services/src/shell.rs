@@ -190,6 +190,9 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 		} else {
 			Vec::new()
 		};
+		// Mirror our starting cwd to ConsoleService so argument Tab completion can resolve a
+		// relative path from the very first prompt; refreshed after each `cd` below.
+		send_set_cwd(control, &cwd);
 		loop {
 			// The line buffer matches the terminal's cooked line maximum (4 kB + the
 			// newline) and lives on the heap - the kernel truncates a message to the
@@ -213,15 +216,29 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			if line_buf[0] == b'\t' {
 				let partial: &[u8] = &line_buf[1..n];
 				print(b"\n");
-				let mut names: Vec<Vec<u8>> = bin_names(storage);
-				for &builtin in commands::BUILTINS {
-					names.push(builtin.as_bytes().to_vec());
-				}
-				names.sort();
-				names.dedup();
+				// The token under the cursor: the command word (no space before it) lists the
+				// runnable programs, a later token lists the target directory's entries - the
+				// same candidate sets the line discipline completes against.
+				let tok_start: usize = partial.iter().rposition(|&c: &u8| c == b' ').map_or(0, |p: usize| p + 1);
+				let token: &[u8] = &partial[tok_start..];
+				let names: Vec<Vec<u8>> = if tok_start == 0 {
+					let mut names: Vec<Vec<u8>> = bin_names(storage);
+					for &builtin in commands::BUILTINS {
+						names.push(builtin.as_bytes().to_vec());
+					}
+					names.sort();
+					names.dedup();
+					names
+				} else {
+					completion_dir_entries(&cwd, token, storage, media, iso, udf, usb)
+				};
+				// The filter prefix is the trailing path segment (after the last '/'), so a
+				// directory's entries match on their bare name, the way the line discipline does.
+				let seg_start: usize = token.iter().rposition(|&c: &u8| c == b'/').map_or(0, |p: usize| p + 1);
+				let seg: &[u8] = &token[seg_start..];
 				let mut listing: Vec<u8> = Vec::new();
 				for name in &names {
-					if name.starts_with(partial) {
+					if name.starts_with(seg) {
 						if !listing.is_empty() {
 							listing.extend_from_slice(b"  ");
 						}
@@ -240,8 +257,14 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			// it, expand any `$NAME` / `${NAME}` against the environment, normalize its flags,
 			// then dispatch it, reap finished jobs, and print the next prompt.
 			let prepared: Vec<u8> = parse_and_expand(&line_buf[..n], &vars);
+			let cwd_before: String = cwd.clone();
 			if dispatch(&prepared, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, admin, &mut jobs, &mut vars, &mut cwd) {
 				return;
+			}
+			// A `cd` moved the prompt: refresh ConsoleService's copy so argument completion
+			// resolves against the new directory.
+			if cwd != cwd_before {
+				send_set_cwd(control, &cwd);
 			}
 			jobs.reap();
 			// the prompt shows the current working directory, so it sits in real storage.
@@ -1439,6 +1462,47 @@ fn bin_names(storage: u64) -> Vec<Vec<u8>> {
 		Some(consumer) => unsafe { drain_stream(consumer, volume::list_read) }.into_iter().map(|f| f.name.into_bytes()).collect(),
 		None => Vec::new(),
 	}
+}
+
+// Mirror the working directory to ConsoleService over the control channel (SET_CWD), so its
+// line discipline can resolve a relative path argument for Tab completion. Sent at startup
+// and after every `cd`.
+unsafe fn send_set_cwd(control: u64, cwd: &str) {
+	unsafe {
+		let mut m: Vec<u8> = Vec::with_capacity(b"SET_CWD".len() + cwd.len());
+		m.extend_from_slice(b"SET_CWD");
+		m.extend_from_slice(cwd.as_bytes());
+		send_blocking(control, &m, 0);
+	}
+}
+
+// The entries of the directory a partial path argument names, for the double-Tab listing:
+// the directory is everything up to the token's last '/' (or the cwd when it has none),
+// resolved against the cwd and routed to the volume that owns it, so a listing works on any
+// mounted volume. Each sub-directory carries a trailing '/'. Empty on a malformed path or an
+// unreadable directory.
+fn completion_dir_entries(cwd: &str, token: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64) -> Vec<Vec<u8>> {
+	let dir_arg: &[u8] = match token.iter().rposition(|&c: &u8| c == b'/') {
+		Some(s) => &token[..s],
+		None => b"",
+	};
+	let target: String = match path::resolve(cwd, dir_arg) {
+		Some(t) => t,
+		None => return Vec::new(),
+	};
+	let chan: u64 = path::volume_client(cwd, dir_arg, storage, media, iso, udf, usb);
+	let mut client = volume::Client::new(ChannelTransport { chan });
+	let mut names: Vec<Vec<u8>> = Vec::new();
+	if let Some(consumer) = client.list(&target) {
+		for f in unsafe { drain_stream(consumer, volume::list_read) } {
+			let mut name: Vec<u8> = f.name.into_bytes();
+			if f.r#type == proto::system::FileType::Dir {
+				name.push(b'/');
+			}
+			names.push(name);
+		}
+	}
+	names
 }
 
 // Pick the StorageService client for a vol:// URI: vol://media is the FAT media
