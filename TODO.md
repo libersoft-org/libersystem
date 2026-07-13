@@ -2256,6 +2256,38 @@ hostile-media/hostile-disk audits (M73-M103), and MSI-X-only interrupts (M46).
 - Done when: a test kills a real standing service (e.g. ConfigService), its client sends the next request through the `Svc` wrapper and gets a correct answer from the restarted instance without being re-spawned; a resolve during the restart window blocks and then succeeds; a resolve for an un-granted name is denied; the canary keeps proving the ladder as an ordinary supervised service.
 - [x] Page-table locking has no concurrency test. M118 #1 added `PT_LOCK` to all three arches (serializing map/unmap/new/free over the frame allocator), but there is no stress/fuzz test that two cores mapping VAs sharing an intermediate table level cannot strand a leaf or leak a frame. Add one (SMP, many rounds).
 - Result: added `concurrent_maps_on_shared_tables_strand_nothing` - two workers pinned to their own cores (`spawn_on`), a shared scratch address space, 128 barrier-synchronized rounds each mapping into the SAME fresh 2 MiB group (both racing to create the same leaf table under a shared mid-level - the exact geometry of the historical riscv64 race); each unmap must return exactly the worker's frame (a stranded leaf reads back unmapped), and after the space drops the pool must reclaim at least one leaf-table frame per round (an orphaned table would stay allocated). AND THE TEST IMMEDIATELY PAID FOR ITSELF: it caught a REAL latent aarch64 kernel bug - `free_address_space` descended `free_table_level(l1, 2)` on a four-level tree (L0->L1->L2->L3), one level short, so EVERY L3 leaf table of every torn-down address space leaked ("reclaimed 3 frames, expected at least 128"); on a server this is a slow unbounded frame leak per process exit. Fixed to depth 3 (x86 and riscv64 verified correct - their trees are one level shallower below the root). Green: x86 106 / aarch64 102 / riscv64 103, fmt clean.
+- [ ] Add tags to the kernel/QEMU tests so local validation runs only the suites relevant to a change instead of the full tri-arch set after every small task. A test may have ANY NUMBER of tags (for example `mouse + console + input`); selecting several tags runs the UNION of their tests once. Keep the tag table deliberately extensible - add or split tags when a subsystem grows or the existing grouping is too broad.
+- Initial tag table (extend as needed):
+
+| Tag | Covers |
+| --- | --- |
+| `smoke` | The minimal boot, scheduler, IPC, userspace-launch and shutdown checks that accompany every targeted run. Keep this set small and fast. |
+| `boot` | Loader handoff, boot protocol, init package, service bootstrap and system-manager bring-up. |
+| `kernel` | Shared kernel mechanisms that are not owned by a narrower tag. Avoid using this as a catch-all when a specific tag applies. |
+| `scheduler` | Threads, preemption, yielding, waits, wakeups, timers and SMP scheduling. |
+| `ipc` | Channels, events, handles, capability transfer, queue limits and wait semantics. |
+| `memory` | Frames, paging, address spaces, mappings, heap, DMA buffers and memory objects. |
+| `syscall` | Syscall ABI, dispatch, validation, rights checks and userspace/kernel boundary behaviour. |
+| `process` | ELF loading, process/thread lifecycle, launcher and ProcessService behaviour. |
+| `service` | Service bootstrap, supervision, restart/resolver behaviour and cross-service contracts. |
+| `storage` | Block devices, StorageService, volumes, filesystem mounting and persisted state. |
+| `filesystem` | Filesystem implementations and filesystem-format semantics; combine with `storage` for end-to-end tests. |
+| `drivers` | Shared driver/device-manager behaviour and device discovery. |
+| `usb` | xHCI, USB enumeration, HID and USB mass storage. |
+| `network` | Network driver, Ethernet, DHCP, IPv4, UDP and network services/tools. |
+| `console` | Terminal model/rendering, VTs, line discipline, console service and shell-facing terminal behaviour. |
+| `input` | Keyboard, pointer and input-service event routing. |
+| `mouse` | Pointer tracking, text cursor, selection, clipboard mouse gestures, wheel and mouse reporting; normally combined with `console` and `input`. |
+| `shell` | Shell parsing/editing, completion, builtins, tool launch and command-visible behaviour. |
+| `arch-x86_64` | x86_64-only architecture, boot, interrupt, paging or device behaviour. |
+| `arch-aarch64` | aarch64-only architecture, boot, exception, paging or device behaviour. |
+| `arch-riscv64` | riscv64-only architecture, boot, trap, paging or device behaviour. |
+| `slow` | Tests intentionally excluded from the normal targeted loop because they are long-running. |
+| `stress` | High-SMP, repeated race/fuzz and load tests; run separately from ordinary functional validation. |
+
+- Selection rules: infer tags from the code changed and the behaviour requested, then run those tags plus `smoke`; architecture-specific changes add the corresponding `arch-*` tag. Shared low-level changes whose impact cannot be bounded (scheduler, IPC, syscall ABI, shared paging/boot contracts) select their subsystem tags on every affected architecture. A targeted run is the normal development check; a full tri-arch run is an independent periodic/milestone check, NOT a per-task or per-commit requirement.
+- Implementation requirements: tags must live next to each test (or in one compile-checked registry tied to the test symbol), every test must have at least one tag, unknown tags must fail instead of silently running nothing, and the runner must print the selected tags plus executed/skipped counts. Add `just` recipes for targeted x86/aarch64/riscv64 runs and a small host-side check that rejects untagged tests. QEMU runs need a bounded timeout so one stuck test cannot consume the rest of the work session.
+- Done when: `mouse` runs only the mouse-related tests plus `smoke`; a multi-tag request such as `mouse,console,input` de-duplicates overlapping tests; an architecture tag limits the relevant arch run; untagged tests fail the tag-table check; and the existing full suites remain available unchanged for periodic validation.
 
 ### Persistence (a server keeps state)
 

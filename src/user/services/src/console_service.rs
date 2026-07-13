@@ -725,7 +725,8 @@ unsafe fn handle_keys(console: &mut Console, keys: &[u8]) {
 }
 
 // Copy the foreground VT's current mouse selection to the console clipboard (right-click
-// or the Ctrl+Shift+C / Ctrl+Insert chord); a no-op when nothing is selected.
+// or the Ctrl+Shift+C / Ctrl+Insert chord), then clear the selection; a no-op when
+// nothing is selected.
 unsafe fn copy_selection(console: &mut Console) {
 	let fg: usize = console.fg;
 	let text: Vec<u8> = match console.vts[fg].term.as_ref() {
@@ -734,6 +735,11 @@ unsafe fn copy_selection(console: &mut Console) {
 	};
 	if !text.is_empty() {
 		console.clipboard = text;
+		if let Some(t) = console.vts[fg].term.as_mut() {
+			t.screen.selection_clear();
+			t.flush();
+		}
+		present_fg(console);
 	}
 }
 
@@ -1360,8 +1366,9 @@ unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
 		}
 		present_fg(console);
 		if !left_now && left_was {
-			// Release: copy the selected text to the clipboard (select-to-copy). A bare click
-			// (no drag, so nothing selected) clears the transient highlight instead.
+			// Release: keep the selection highlighted so it can be copied explicitly
+			// (right-click or Ctrl+Shift+C / Ctrl+Insert). Selecting alone does NOT copy.
+			// A bare click with nothing selected clears the transient highlight.
 			let text: Vec<u8> = match console.vts[fg].term.as_ref() {
 				Some(t) => t.screen.selection_text(),
 				None => Vec::new(),
@@ -1372,8 +1379,6 @@ unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
 					t.flush();
 				}
 				present_fg(console);
-			} else {
-				console.clipboard = text;
 			}
 		}
 		if mid_now && !mid_was {

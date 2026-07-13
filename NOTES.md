@@ -1,5 +1,6 @@
 # Bugs / changes
 
+- tests are taking too long after every small task - optimization needed
 - Can it run Doom?
 - text selection by mouse lags horribly
 - when I press hold enter in shell, sometimes it writes "vol://system> vol://system>" on the same row (not just "vol://system>" on next row)
