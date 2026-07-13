@@ -319,43 +319,47 @@ impl Screen {
 		let g = self.view_global_row(row);
 		let c = col.min(self.cols.saturating_sub(1));
 		self.selection = Some((g, c, g, c));
-		self.dirty_selection_rows(old);
+		// The whole previous selection is gone, so repaint all of its rows; the fresh one is a
+		// single cell.
+		if let Some((ag, _, eg, _)) = old {
+			self.dirty_global_span(ag.min(eg), ag.max(eg));
+		}
+		self.dirty_global_span(g, g);
 	}
 
 	// Extend the active selection's end to viewport (col, row) (a drag); a no-op with no
 	// selection in progress.
 	pub fn selection_extend(&mut self, col: usize, row: usize) {
-		if let Some((ag, ac, _, _)) = self.selection {
-			let old = self.selection;
+		if let Some((ag, ac, oeg, _)) = self.selection {
 			let g = self.view_global_row(row);
 			let c = col.min(self.cols.saturating_sub(1));
 			self.selection = Some((ag, ac, g, c));
-			self.dirty_selection_rows(old);
+			// Only the rows between the OLD and the NEW end change their highlight (the anchor
+			// side is unchanged), so repaint just that band - not the whole selection. Dirtying
+			// the entire span on every drag event is O(span) per event = O(span^2) over a drag,
+			// which made a large selection lag badly.
+			self.dirty_global_span(oeg.min(g), oeg.max(g));
 		}
 	}
 
 	// Clear the selection highlight; a no-op (no repaint) when nothing was selected.
 	pub fn selection_clear(&mut self) {
-		if self.selection.is_some() {
-			let old = self.selection.take();
-			self.dirty_selection_rows(old);
+		if let Some((ag, _, eg, _)) = self.selection.take() {
+			self.dirty_global_span(ag.min(eg), ag.max(eg));
 		}
 	}
 
-	// Mark dirty every viewport row the old or the current selection touches, so a
-	// drag repaints only the rows whose highlight can change - not the whole grid
-	// (a full-grid repaint per pointer event is what made selection feel laggy).
-	fn dirty_selection_rows(&mut self, old: Option<(usize, usize, usize, usize)>) {
+	// Mark dirty every viewport row overlapping the global-row band [lo_g, hi_g], so a
+	// selection change repaints only the rows whose highlight can actually differ - not the
+	// whole grid (a full-grid, or even full-selection, repaint per pointer event is what made
+	// selection feel laggy).
+	fn dirty_global_span(&mut self, lo_g: usize, hi_g: usize) {
 		let base = self.view_global_row(0);
-		for sel in [old, self.selection].into_iter().flatten() {
-			let (ag, _, eg, _) = sel;
-			let (lo, hi) = (ag.min(eg), ag.max(eg));
-			for row in 0..self.rows {
-				let g = base + row;
-				if g >= lo && g <= hi {
-					for col in 0..self.cols {
-						self.dirty[row * self.cols + col] = true;
-					}
+		for row in 0..self.rows {
+			let g = base + row;
+			if g >= lo_g && g <= hi_g {
+				for col in 0..self.cols {
+					self.dirty[row * self.cols + col] = true;
 				}
 			}
 		}
