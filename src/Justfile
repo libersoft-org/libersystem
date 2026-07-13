@@ -29,127 +29,127 @@ default: run
 
 # build the userspace programs that make up the init package
 user:
-	cd {{user_dir}} && cargo build
-	cd {{services_dir}} && cargo build
-	cd {{storage_dir}} && cargo build
-	cd {{drivers_dir}} && cargo build
-	cd {{usertools_dir}} && cargo build
+cd {{user_dir}} && cargo build
+cd {{services_dir}} && cargo build
+cd {{storage_dir}} && cargo build
+cd {{drivers_dir}} && cargo build
+cd {{usertools_dir}} && cargo build
 
 # build the userspace programs for aarch64 (the aarch64 kernel build.rs reads them
 # from each crate's aarch64-unknown-none target dir)
 user-aarch64:
-	cd {{user_dir}} && cargo build --target aarch64-unknown-none
-	cd {{services_dir}} && cargo build --target aarch64-unknown-none
-	cd {{storage_dir}} && cargo build --target aarch64-unknown-none
-	cd {{drivers_dir}} && cargo build --target aarch64-unknown-none
-	cd {{usertools_dir}} && cargo build --target aarch64-unknown-none
+cd {{user_dir}} && cargo build --target aarch64-unknown-none
+cd {{services_dir}} && cargo build --target aarch64-unknown-none
+cd {{storage_dir}} && cargo build --target aarch64-unknown-none
+cd {{drivers_dir}} && cargo build --target aarch64-unknown-none
+cd {{usertools_dir}} && cargo build --target aarch64-unknown-none
 
 # build the WebAssembly component SDK example (the `liber` world guest) for
 # wasm32-unknown-unknown and stage it into the ramdisk volume as app.wasm, where
 # StorageService serves it over vol:// for the component_host to load and run
 sdk:
-	cd {{sdk_dir}} && cargo build --release --target wasm32-unknown-unknown
-	cp {{sdk_dir}}/target/wasm32-unknown-unknown/release/liber_component.wasm volume/app.wasm
+cd {{sdk_dir}} && cargo build --release --target wasm32-unknown-unknown
+cp {{sdk_dir}}/target/wasm32-unknown-unknown/release/liber_component.wasm volume/app.wasm
 
 # build the kernel (its build.rs assembles the init package from the userspace build)
 # and the own UEFI loader (staged into the boot image as BOOTX64.EFI)
 build: sdk user
-	cd {{kernel_dir}} && cargo build
-	cd {{loader_dir}} && cargo build
+cd {{kernel_dir}} && cargo build
+cd {{loader_dir}} && cargo build
 
 # generate the proto crate's bindings from the LSIDL interface definitions
 # (src/idl/*.lsidl) and format the generated source
 gen:
-	cd {{tools_dir}} && cargo run --quiet -- --rust-dir ../../{{proto_dir}}/src --docs-dir ../../../docs/gen ../../idl/*.lsidl
-	cd {{proto_dir}} && cargo fmt
+cd {{tools_dir}} && cargo run --quiet -- --rust-dir ../../{{proto_dir}}/src --docs-dir ../../../docs/gen ../../idl/*.lsidl
+cd {{proto_dir}} && cargo fmt
 
 # Build + boot one architecture through the unified QEMU runner. With no architecture,
 # use the host architecture; an explicit first target runs natively or under emulation.
 # A display may still be the first argument: `just run vnc` remains native.
 # Examples: `just run`, `just run vnc`, `just run aarch64`, `just run riscv64 vnc`.
 run *args:
-	#!/usr/bin/env bash
-	set -euo pipefail
-	target=""
-	displays=()
-	for arg in {{args}}; do
-		if [[ -z "$target" && ${#displays[@]} -eq 0 && "$arg" =~ ^(x86_64|aarch64|riscv64)$ ]]; then
-			target="$arg"
-		else
-			displays+=("$arg")
-		fi
-	done
-	if [[ -z "$target" ]]; then
-		case "$(uname -m)" in
-		x86_64) target=x86_64 ;;
-		aarch64 | arm64) target=aarch64 ;;
-		riscv64) target=riscv64 ;;
-		*) echo "just run: unsupported host architecture '$(uname -m)'" >&2 && exit 1 ;;
-		esac
+#!/usr/bin/env bash
+set -euo pipefail
+target=""
+displays=()
+for arg in {{args}}; do
+	if [[ -z "$target" && ${#displays[@]} -eq 0 && "$arg" =~ ^(x86_64|aarch64|riscv64)$ ]]; then
+		target="$arg"
+	else
+		displays+=("$arg")
 	fi
-	case "$target" in
-	x86_64) just run-x86_64 "${displays[@]}" ;;
-	aarch64) just run-aarch64 "${displays[@]}" ;;
-	riscv64) just run-riscv64 "${displays[@]}" ;;
-	*) echo "just run: unknown architecture '$target' (expected x86_64, aarch64, or riscv64)" >&2 && exit 1 ;;
+done
+if [[ -z "$target" ]]; then
+	case "$(uname -m)" in
+	x86_64) target=x86_64 ;;
+	aarch64 | arm64) target=aarch64 ;;
+	riscv64) target=riscv64 ;;
+	*) echo "just run: unsupported host architecture '$(uname -m)'" >&2 && exit 1 ;;
 	esac
+fi
+case "$target" in
+x86_64) just run-x86_64 "${displays[@]}" ;;
+aarch64) just run-aarch64 "${displays[@]}" ;;
+riscv64) just run-riscv64 "${displays[@]}" ;;
+*) echo "just run: unknown architecture '$target' (expected x86_64, aarch64, or riscv64)" >&2 && exit 1 ;;
+esac
 
 # build + boot the x86_64 build in QEMU (native with KVM on an x86_64 host, emulated
 # elsewhere). Add live displays as arguments (combinable): `just run-x86_64 vnc spice`.
 run-x86_64 *displays: sdk user
-	cd {{kernel_dir}} && cargo build
-	DISPLAYS="{{displays}}" boot/qemu-run.sh x86_64 {{kernel_elf}}
+cd {{kernel_dir}} && cargo build
+DISPLAYS="{{displays}}" boot/qemu-run.sh x86_64 {{kernel_elf}}
 
 # build + boot, QEMU waits for GDB (port :1234)
 debug: sdk user
-	cd {{kernel_dir}} && cargo build
-	DEBUG=1 NOKVM=1 boot/qemu-run.sh x86_64 {{kernel_elf}}
+cd {{kernel_dir}} && cargo build
+DEBUG=1 NOKVM=1 boot/qemu-run.sh x86_64 {{kernel_elf}}
 
 # attach GDB to a running QEMU (run in a second panel after 'just debug')
 gdb:
-	gdb -x boot/gdb-init {{kernel_elf}}
+gdb -x boot/gdb-init {{kernel_elf}}
 
 # Run every x86_64 test in QEMU (isa-debug-exit). TEST_TIMEOUT overrides the
 # 15-minute full-suite watchdog.
 test: sdk user test-tags-check
-	boot/test-kernel.sh x86_64
+boot/test-kernel.sh x86_64
 
 # Run the union of the requested x86_64 tags plus the smoke set.
 test-tags tags: sdk user test-tags-check
-	boot/test-kernel.sh x86_64 "{{tags}}"
+boot/test-kernel.sh x86_64 "{{tags}}"
 
 # run the kernel test suite in QEMU on aarch64 (Arm semihosting exit maps pass/fail).
 # SMP=4 exercises the multi-core paths (secondary bring-up, the cross-core wake IPI).
 test-aarch64: sdk user-aarch64 test-tags-check
-	boot/test-kernel.sh aarch64
+boot/test-kernel.sh aarch64
 
 # Run the union of the requested aarch64 tags plus the smoke set.
 test-tags-aarch64 tags: sdk user-aarch64 test-tags-check
-	SMP="${SMP:-4}" boot/test-kernel.sh aarch64 "{{tags}}"
+SMP="${SMP:-4}" boot/test-kernel.sh aarch64 "{{tags}}"
 
 # run the kernel test suite in QEMU on riscv64 over OpenSBI (RISC-V semihosting exit
 # maps pass/fail). Defaults to `nproc` harts (like the x86 `test` recipe), exercising the
 # multi-hart paths (SBI HSM hart_start bring-up, the SBI IPI cross-hart wake); override
 # with `SMP=<n>` (a smaller count is faster under TCG on a many-core host).
 test-riscv64: sdk user-riscv64 test-tags-check
-	boot/test-kernel.sh riscv64
+boot/test-kernel.sh riscv64
 
 # Run the union of the requested riscv64 tags plus the smoke set.
 test-tags-riscv64 tags: sdk user-riscv64 test-tags-check
-	SMP="${SMP:-4}" boot/test-kernel.sh riscv64 "{{tags}}"
+SMP="${SMP:-4}" boot/test-kernel.sh riscv64 "{{tags}}"
 
 # Run all tests on all architectures. TCG guests are intentionally serial to avoid
 # host contention; this is the periodic/milestone check, not the per-task path.
 test-all: sdk user user-aarch64 user-riscv64 test-tags-check
-	boot/test-all.sh
+boot/test-all.sh
 
 # A cheap source check; the Rust type system separately rejects unknown/empty tags.
 test-tags-check:
-	boot/check-test-tags.sh
+boot/check-test-tags.sh
 
 # build the own UEFI loader for aarch64 (staged into the boot image as BOOTAA64.EFI)
 loader-aarch64:
-	cd {{loader_dir}} && cargo build --target aarch64-unknown-uefi
+cd {{loader_dir}} && cargo build --target aarch64-unknown-uefi
 
 # build the own UEFI loader for riscv64 (staged into the boot image as BOOTRISCV64.EFI).
 # There is no built-in riscv64 UEFI rustc target (and rustc's object backend cannot emit
@@ -158,38 +158,38 @@ loader-aarch64:
 # script (loader/riscv64-pe.ld); llvm-objcopy then flattens it into a valid EFI
 # application, padded to the image end so its section raw data is fully backed.
 loader-riscv64:
-	cd {{loader_dir}} && \
-		RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-T$PWD/riscv64-pe.ld" \
-		cargo build --target riscv64gc-unknown-none-elf && \
-		END=$(llvm-readelf -s target/riscv64gc-unknown-none-elf/debug/libersystem-loader | awk '/ _pe_image_end$/{print "0x"$2; exit}') && \
-		llvm-objcopy -O binary --pad-to "$END" \
-			target/riscv64gc-unknown-none-elf/debug/libersystem-loader \
-			target/riscv64gc-unknown-none-elf/debug/libersystem-loader.efi
+cd {{loader_dir}} &&
+	RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-T$PWD/riscv64-pe.ld" \
+		cargo build --target riscv64gc-unknown-none-elf &&
+	END=$(llvm-readelf -s target/riscv64gc-unknown-none-elf/debug/libersystem-loader | awk '/ _pe_image_end$/{print "0x"$2; exit}') &&
+	llvm-objcopy -O binary --pad-to "$END" \
+		target/riscv64gc-unknown-none-elf/debug/libersystem-loader \
+		target/riscv64gc-unknown-none-elf/debug/libersystem-loader.efi
 
 # build + boot the ARM64 build in QEMU (native on an aarch64 host, emulated on an x86
 # host), reaching the interactive shell over the serial console. Uses QEMU's direct
 # -kernel load - the quick path; `run-aarch64-uefi` boots the same system through the
 # own UEFI loader. Add live displays as arguments (combinable): `just run-aarch64 vnc spice`.
 run-aarch64 *displays: sdk user-aarch64
-	cd {{kernel_dir}} && cargo build --target aarch64-unknown-none
-	DISPLAYS="{{displays}}" SERIAL=stdio bash boot/qemu-run.sh aarch64 {{kernel_dir}}/target/aarch64-unknown-none/debug/kernel
+cd {{kernel_dir}} && cargo build --target aarch64-unknown-none
+DISPLAYS="{{displays}}" SERIAL=stdio bash boot/qemu-run.sh aarch64 {{kernel_dir}}/target/aarch64-unknown-none/debug/kernel
 
 # build the userspace programs for riscv64 (the riscv64 kernel build.rs reads them from
 # each crate's riscv64gc-unknown-none-elf target dir)
 user-riscv64:
-	cd {{user_dir}} && cargo build --target riscv64gc-unknown-none-elf
-	cd {{services_dir}} && cargo build --target riscv64gc-unknown-none-elf
-	cd {{storage_dir}} && cargo build --target riscv64gc-unknown-none-elf
-	cd {{drivers_dir}} && cargo build --target riscv64gc-unknown-none-elf
-	cd {{usertools_dir}} && cargo build --target riscv64gc-unknown-none-elf
+cd {{user_dir}} && cargo build --target riscv64gc-unknown-none-elf
+cd {{services_dir}} && cargo build --target riscv64gc-unknown-none-elf
+cd {{storage_dir}} && cargo build --target riscv64gc-unknown-none-elf
+cd {{drivers_dir}} && cargo build --target riscv64gc-unknown-none-elf
+cd {{usertools_dir}} && cargo build --target riscv64gc-unknown-none-elf
 
 # build + boot the riscv64 build in QEMU over OpenSBI (emulated on an x86 host),
 # reaching the pinned userspace service chain over the serial console. The system
 # volume is a polled virtio-blk disk (StorageService reads the factory archive from
 # it), so no per-device interrupt path is needed for the core chain.
 run-riscv64 *displays: sdk user-riscv64
-	cd {{kernel_dir}} && cargo build --target riscv64gc-unknown-none-elf
-	DISPLAYS="{{displays}}" SERIAL=stdio bash boot/qemu-run.sh riscv64 {{kernel_dir}}/target/riscv64gc-unknown-none-elf/debug/kernel
+cd {{kernel_dir}} && cargo build --target riscv64gc-unknown-none-elf
+DISPLAYS="{{displays}}" SERIAL=stdio bash boot/qemu-run.sh riscv64 {{kernel_dir}}/target/riscv64gc-unknown-none-elf/debug/kernel
 
 # build + boot the full riscv64 system through the own UEFI loader under U-Boot (the
 # qemu-riscv64 S-mode U-Boot on OpenSBI, instead of QEMU's direct -kernel load): U-Boot's
@@ -197,104 +197,104 @@ run-riscv64 *displays: sdk user-riscv64
 # kernel off the same volume, places it at its physical link addresses and enters the
 # kernel's boot stub - the same entry state OpenSBI's -kernel boot produces.
 run-riscv64-uefi *displays: sdk user-riscv64 loader-riscv64
-	cd {{kernel_dir}} && cargo build --target riscv64gc-unknown-none-elf
-	UEFI=1 DISPLAYS="{{displays}}" SERIAL=stdio bash boot/qemu-run.sh riscv64 {{kernel_dir}}/target/riscv64gc-unknown-none-elf/debug/kernel
+cd {{kernel_dir}} && cargo build --target riscv64gc-unknown-none-elf
+UEFI=1 DISPLAYS="{{displays}}" SERIAL=stdio bash boot/qemu-run.sh riscv64 {{kernel_dir}}/target/riscv64gc-unknown-none-elf/debug/kernel
 
 # build + boot the full aarch64 system through the own UEFI loader under the AAVMF
 # firmware (instead of QEMU's direct -kernel load), reaching the interactive shell.
 # Add live displays as arguments (combinable): `just run-aarch64-uefi vnc spice`.
 run-aarch64-uefi *displays: sdk user-aarch64 loader-aarch64
-	cd {{kernel_dir}} && cargo build --target aarch64-unknown-none
-	UEFI=1 DISPLAYS="{{displays}}" SERIAL=stdio bash boot/qemu-run.sh aarch64 {{kernel_dir}}/target/aarch64-unknown-none/debug/kernel
+cd {{kernel_dir}} && cargo build --target aarch64-unknown-none
+UEFI=1 DISPLAYS="{{displays}}" SERIAL=stdio bash boot/qemu-run.sh aarch64 {{kernel_dir}}/target/aarch64-unknown-none/debug/kernel
 
 # screenshot the framebuffer to a file (format by extension: png/jpg/webp/...);
 # snaps a live `just run` if one is up, else boots a throwaway. e.g. just screenshot shot.png
 screenshot path: build
-	boot/screenshot.sh {{path}}
+boot/screenshot.sh {{path}}
 
 # drive a live instance for debugging: boot it, run shell commands in it and get
 # their output back, tail the serial log, capture packets, type on the keyboard.
 # e.g. `just lab boot --fresh`, `just lab sh time ls`, `just lab help`
 lab *args:
-	boot/lab.py {{args}}
+boot/lab.py {{args}}
 
 # build a bootable hybrid ISO (BIOS + UEFI) -> boot/.build/<product>.iso; STRIP=debug|all
 iso strip="debug": build
-	STRIP={{strip}} boot/mkimage.sh iso {{kernel_elf}}
+STRIP={{strip}} boot/mkimage.sh iso {{kernel_elf}}
 
 # build a raw bootable disk image for USB / SD card / HDD (BIOS + UEFI); SIZE e.g. 128M, 1G; STRIP=debug|all
 img size="64M" strip="debug": build
-	STRIP={{strip}} boot/mkimage.sh img {{kernel_elf}} {{size}}
+STRIP={{strip}} boot/mkimage.sh img {{kernel_elf}} {{size}}
 
 # format all code (Rust via rustfmt, shell via shfmt)
 fmt:
-	cd {{abi_dir}} && cargo fmt
-	cd {{rt_dir}} && cargo fmt
-	cd {{kernel_dir}} && cargo fmt
-	cd {{user_dir}} && cargo fmt
-	cd {{services_dir}} && cargo fmt
-	cd {{storage_dir}} && cargo fmt
-	cd {{drivers_dir}} && cargo fmt
-	cd {{usertools_dir}} && cargo fmt
-	cd {{tools_dir}} && cargo fmt
-	cd {{proto_dir}} && cargo fmt
-	cd {{wasm_dir}} && cargo fmt
-	cd {{sdk_dir}} && cargo fmt
-	cd {{term_dir}} && cargo fmt
-	cd {{bootproto_dir}} && cargo fmt
-	cd {{loader_dir}} && cargo fmt
-	cd {{fscore_dir}} && cargo fmt
-	cd {{liberfs_dir}} && cargo fmt
-	cd {{fat_dir}} && cargo fmt
-	cd {{iso9660_dir}} && cargo fmt
-	cd {{udf_dir}} && cargo fmt
-	shfmt -w ../setup.sh boot/qemu-common.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh
+cd {{abi_dir}} && cargo fmt
+cd {{rt_dir}} && cargo fmt
+cd {{kernel_dir}} && cargo fmt
+cd {{user_dir}} && cargo fmt
+cd {{services_dir}} && cargo fmt
+cd {{storage_dir}} && cargo fmt
+cd {{drivers_dir}} && cargo fmt
+cd {{usertools_dir}} && cargo fmt
+cd {{tools_dir}} && cargo fmt
+cd {{proto_dir}} && cargo fmt
+cd {{wasm_dir}} && cargo fmt
+cd {{sdk_dir}} && cargo fmt
+cd {{term_dir}} && cargo fmt
+cd {{bootproto_dir}} && cargo fmt
+cd {{loader_dir}} && cargo fmt
+cd {{fscore_dir}} && cargo fmt
+cd {{liberfs_dir}} && cargo fmt
+cd {{fat_dir}} && cargo fmt
+cd {{iso9660_dir}} && cargo fmt
+cd {{udf_dir}} && cargo fmt
+shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh
 
 # check formatting without writing changes (CI-friendly)
 fmt-check:
-	cd {{abi_dir}} && cargo fmt --check
-	cd {{rt_dir}} && cargo fmt --check
-	cd {{kernel_dir}} && cargo fmt --check
-	cd {{user_dir}} && cargo fmt --check
-	cd {{services_dir}} && cargo fmt --check
-	cd {{storage_dir}} && cargo fmt --check
-	cd {{drivers_dir}} && cargo fmt --check
-	cd {{usertools_dir}} && cargo fmt --check
-	cd {{tools_dir}} && cargo fmt --check
-	cd {{proto_dir}} && cargo fmt --check
-	cd {{wasm_dir}} && cargo fmt --check
-	cd {{sdk_dir}} && cargo fmt --check
-	cd {{term_dir}} && cargo fmt --check
-	cd {{bootproto_dir}} && cargo fmt --check
-	cd {{loader_dir}} && cargo fmt --check
-	cd {{fscore_dir}} && cargo fmt --check
-	cd {{liberfs_dir}} && cargo fmt --check
-	cd {{fat_dir}} && cargo fmt --check
-	cd {{iso9660_dir}} && cargo fmt --check
-	cd {{udf_dir}} && cargo fmt --check
-	shfmt -d ../setup.sh boot/qemu-common.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh
+cd {{abi_dir}} && cargo fmt --check
+cd {{rt_dir}} && cargo fmt --check
+cd {{kernel_dir}} && cargo fmt --check
+cd {{user_dir}} && cargo fmt --check
+cd {{services_dir}} && cargo fmt --check
+cd {{storage_dir}} && cargo fmt --check
+cd {{drivers_dir}} && cargo fmt --check
+cd {{usertools_dir}} && cargo fmt --check
+cd {{tools_dir}} && cargo fmt --check
+cd {{proto_dir}} && cargo fmt --check
+cd {{wasm_dir}} && cargo fmt --check
+cd {{sdk_dir}} && cargo fmt --check
+cd {{term_dir}} && cargo fmt --check
+cd {{bootproto_dir}} && cargo fmt --check
+cd {{loader_dir}} && cargo fmt --check
+cd {{fscore_dir}} && cargo fmt --check
+cd {{liberfs_dir}} && cargo fmt --check
+cd {{fat_dir}} && cargo fmt --check
+cd {{iso9660_dir}} && cargo fmt --check
+cd {{udf_dir}} && cargo fmt --check
+shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh
 
 # clean build artifacts
 clean:
-	cd {{abi_dir}} && cargo clean
-	cd {{rt_dir}} && cargo clean
-	cd {{kernel_dir}} && cargo clean
-	cd {{user_dir}} && cargo clean
-	cd {{services_dir}} && cargo clean
-	cd {{storage_dir}} && cargo clean
-	cd {{drivers_dir}} && cargo clean
-	cd {{usertools_dir}} && cargo clean
-	cd {{tools_dir}} && cargo clean
-	cd {{proto_dir}} && cargo clean
-	cd {{wasm_dir}} && cargo clean
-	cd {{sdk_dir}} && cargo clean
-	cd {{term_dir}} && cargo clean
-	cd {{bootproto_dir}} && cargo clean
-	cd {{loader_dir}} && cargo clean
-	cd {{fscore_dir}} && cargo clean
-	cd {{liberfs_dir}} && cargo clean
-	cd {{fat_dir}} && cargo clean
-	cd {{iso9660_dir}} && cargo clean
-	cd {{udf_dir}} && cargo clean
-	rm -f volume/app.wasm
-	rm -rf boot/.build
+cd {{abi_dir}} && cargo clean
+cd {{rt_dir}} && cargo clean
+cd {{kernel_dir}} && cargo clean
+cd {{user_dir}} && cargo clean
+cd {{services_dir}} && cargo clean
+cd {{storage_dir}} && cargo clean
+cd {{drivers_dir}} && cargo clean
+cd {{usertools_dir}} && cargo clean
+cd {{tools_dir}} && cargo clean
+cd {{proto_dir}} && cargo clean
+cd {{wasm_dir}} && cargo clean
+cd {{sdk_dir}} && cargo clean
+cd {{term_dir}} && cargo clean
+cd {{bootproto_dir}} && cargo clean
+cd {{loader_dir}} && cargo clean
+cd {{fscore_dir}} && cargo clean
+cd {{liberfs_dir}} && cargo clean
+cd {{fat_dir}} && cargo clean
+cd {{iso9660_dir}} && cargo clean
+cd {{udf_dir}} && cargo clean
+rm -f volume/app.wasm
+rm -rf boot/.build
