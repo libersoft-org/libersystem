@@ -1295,42 +1295,42 @@ unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
 		let col: usize = ((x as usize * cols) / 0x1_0000).min(cols - 1);
 		let row: usize = ((y as usize * rows) / 0x1_0000).min(rows - 1);
 		if tracking {
+			// A program owns the mouse: hide the console's own text cursor while it does.
+			if let Some(t) = console.vts[fg].term.as_mut() {
+				if t.screen.set_mouse(None) {
+					t.flush();
+				}
+			}
+			present_fg(console);
 			pointer_report(console, fg, col, row, buttons, prev, wheel, sgr, motion, anymotion);
 			return;
 		}
-		// Native console handling: no program is tracking the mouse.
+		// Native console handling: no program is tracking the mouse. Track the text mouse cursor
+		// (an inverted block on the cell under the pointer) and drive the wheel / selection.
 		let left_now: bool = buttons & 1 != 0;
 		let left_was: bool = prev & 1 != 0;
 		let mid_now: bool = buttons & 4 != 0;
 		let mid_was: bool = prev & 4 != 0;
-		if wheel != 0 {
-			// Route the wheel to the scrollback view (three lines per notch).
-			if let Some(t) = console.vts[fg].term.as_mut() {
+		if let Some(t) = console.vts[fg].term.as_mut() {
+			t.screen.set_mouse(Some((col, row)));
+			if wheel != 0 {
+				// Route the wheel to the scrollback view (three lines per notch).
 				if wheel > 0 {
 					t.screen.scroll_view_up_by(3);
 				} else {
 					t.screen.scroll_view_down_by(3);
 				}
-				t.flush();
-			}
-			present_fg(console);
-			return;
-		}
-		if left_now && !left_was {
-			// Press: anchor a fresh selection at the cell under the pointer.
-			if let Some(t) = console.vts[fg].term.as_mut() {
+			} else if left_now && !left_was {
+				// Press: anchor a fresh selection at the cell under the pointer.
 				t.screen.selection_begin(col, row);
-				t.flush();
-			}
-			present_fg(console);
-		} else if left_now && left_was {
-			// Drag: extend the selection to the cell under the pointer.
-			if let Some(t) = console.vts[fg].term.as_mut() {
+			} else if left_now && left_was {
+				// Drag: extend the selection to the cell under the pointer.
 				t.screen.selection_extend(col, row);
-				t.flush();
 			}
-			present_fg(console);
-		} else if !left_now && left_was {
+			t.flush();
+		}
+		present_fg(console);
+		if !left_now && left_was {
 			// Release: copy the selected text to the clipboard (select-to-copy). A bare click
 			// (no drag, so nothing selected) clears the transient highlight instead.
 			let text: Vec<u8> = match console.vts[fg].term.as_ref() {

@@ -157,12 +157,17 @@ pub struct Screen {
 	// as bulk framebuffer pixel copies, then drains this. (L2 records geometry only - no
 	// pixels.)
 	scrolls: Vec<ScrollOp>,
+	// The viewport cell the text mouse cursor sits on (an inverted block that tracks the
+	// pointer, like the Linux console's gpm cursor), or None when hidden. A pure overlay:
+	// `display_cell` / `view_cell` reverse this cell's colours so it rides on top of whatever
+	// text or selection is there, and moving it dirties only the old and new cells.
+	mouse: Option<(usize, usize)>,
 }
 
 impl Screen {
 	pub fn new(cols: usize, rows: usize, scrollback: usize) -> Screen {
 		let blank = Cell { glyph: b' ' as u32, fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
-		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, tty_raw_req: None, tty_echo_req: None, mouse_mode: 0, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; scrollback * cols], sb_wrap: alloc::vec![false; scrollback], sb_cap: scrollback, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new() }
+		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, tty_raw_req: None, tty_echo_req: None, mouse_mode: 0, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; scrollback * cols], sb_wrap: alloc::vec![false; scrollback], sb_cap: scrollback, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new(), mouse: None }
 	}
 
 	// The active cell buffer: the alternate screen while it is up, else the primary.
@@ -181,6 +186,9 @@ impl Screen {
 	pub fn display_cell(&self, col: usize, row: usize) -> Cell {
 		let mut c = self.cell(col, row);
 		if self.is_selected(self.sb_len + row, col) {
+			c.reverse = !c.reverse;
+		}
+		if self.mouse == Some((col, row)) {
 			c.reverse = !c.reverse;
 		}
 		c
@@ -310,6 +318,29 @@ impl Screen {
 	// Whether a mouse selection is active (so the console copies it on release).
 	pub fn has_selection(&self) -> bool {
 		self.selection.is_some()
+	}
+
+	// The viewport cell the text mouse cursor sits on, if shown (the renderer follows it
+	// through a scroll so the bulk pixel copy does not leave the block smeared).
+	pub fn mouse(&self) -> Option<(usize, usize)> {
+		self.mouse
+	}
+
+	// Set the text mouse-cursor cell (the inverted block that tracks the pointer), or None to
+	// hide it. Dirties the old and new cells so the next flush repaints just those two.
+	// Returns whether the position actually changed.
+	pub fn set_mouse(&mut self, m: Option<(usize, usize)>) -> bool {
+		if self.mouse == m {
+			return false;
+		}
+		for cell in [self.mouse, m].into_iter().flatten() {
+			let (c, r) = cell;
+			if c < self.cols && r < self.rows {
+				self.dirty[r * self.cols + c] = true;
+			}
+		}
+		self.mouse = m;
+		true
 	}
 
 	// Begin a mouse selection at viewport (col, row) for the current scroll offset: anchor
@@ -497,6 +528,7 @@ impl Screen {
 		self.sb_len = 0;
 		self.view_offset = 0;
 		self.selection = None;
+		self.mouse = None;
 		self.cols = new_cols;
 		self.rows = new_rows;
 		self.scroll_top = 0;
@@ -538,6 +570,9 @@ impl Screen {
 			self.primary[(g - self.sb_len) * self.cols + col]
 		};
 		if self.is_selected(g, col) {
+			cell.reverse = !cell.reverse;
+		}
+		if self.mouse == Some((col, row)) {
 			cell.reverse = !cell.reverse;
 		}
 		cell

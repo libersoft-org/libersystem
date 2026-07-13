@@ -541,6 +541,11 @@ impl FramebufferRenderer {
 		// Move the framebuffer pixels for each grid scroll, following the old caret cell
 		// through the same shifts so its smear lands on a cell the dirty walk repaints.
 		let ghost = track_caret(self.last_caret, &scrolls);
+		// The mouse-cursor block rode the same bulk copy, so track where its pixels landed
+		// (the smear) and dirty both that cell and its unchanged viewport cell, so the dirty
+		// walk erases the smear and redraws the block in place.
+		let mouse = screen.mouse();
+		let mouse_ghost = if scrolls.is_empty() { None } else { track_caret(mouse, &scrolls) };
 		let cols = screen.cols();
 		for op in &scrolls {
 			if op.down {
@@ -553,6 +558,14 @@ impl FramebufferRenderer {
 		}
 		if let Some((c, r)) = ghost {
 			screen.set_dirty(c, r);
+		}
+		if let Some((c, r)) = mouse_ghost {
+			screen.set_dirty(c, r);
+		}
+		if !scrolls.is_empty() {
+			if let Some((c, r)) = mouse {
+				screen.set_dirty(c, r);
+			}
 		}
 		for row in 0..screen.rows() {
 			for col in 0..screen.cols() {
