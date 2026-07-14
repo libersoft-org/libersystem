@@ -524,6 +524,7 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, mut backing: Backing, service: u64, 
 			// frame (the console always renders into the shared backing). A bare FLUSH (no
 			// rectangle) presents the whole display.
 			let mut flush_rect: Option<(u32, u32, u32, u32)> = None;
+			let mut acknowledged: bool = false;
 			loop {
 				match try_recv(service, &mut req) {
 					Polled::Message { len, .. } => {
@@ -549,6 +550,13 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, mut backing: Backing, service: u64, 
 								Some(u) => union_rect(u, r),
 								None => r,
 							});
+						} else if m.starts_with(b"PRESENT") && m.len() >= 23 {
+							let r = (rd32_le(m, 7), rd32_le(m, 11), rd32_le(m, 15), rd32_le(m, 19));
+							flush_rect = Some(match flush_rect {
+								Some(u) => union_rect(u, r),
+								None => r,
+							});
+							acknowledged = true;
 						}
 					}
 					Polled::Empty => break,
@@ -562,8 +570,9 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, mut backing: Backing, service: u64, 
 				let y = y.min(cur_h);
 				let w = w.min(cur_w - x);
 				let h = h.min(cur_h - y);
-				if w > 0 && h > 0 {
-					gpu.present(backing.id, x, y, w, h, backing.w);
+				let ok: bool = w == 0 || h == 0 || gpu.present(backing.id, x, y, w, h, backing.w);
+				if acknowledged {
+					send_blocking(service, if ok { b"OK" } else { b"ERR" }, 0);
 				}
 			}
 		}

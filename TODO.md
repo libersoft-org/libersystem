@@ -2427,7 +2427,7 @@ phase 4-5 compositor these contracts grow into. The game itself is explicitly
 NOT pulled into this repository; an external port becomes possible once this
 layer exists.
 
-- [ ] A display surface contract, compositor-shaped from day one: a new
+- [x] A display surface contract, compositor-shaped from day one: a new
       `liber:display@1` package with `acquire(width, height) -> result<surface-info, error>`
       (`surface-info { pixels: buffer, width: u32, height: u32, pitch: u32, format }`),
       `present(x, y, width, height) -> result<unit, error>`, and `release()`.
@@ -2439,7 +2439,11 @@ layer exists.
   device flush completed when the reply arrives, so the client may then reuse
   those pixels. The client never learns it is fullscreen and owns nothing but
   its own buffer; a compositor is therefore a server-side upgrade, not an API
-  break. Center/scale smaller surfaces with nearest-neighbor first.
+  break. `acquire(0, 0)` selects the server's preferred/native logical size;
+  `events() -> stream<display-event { width, height }>` coalesces later
+  preferred-size changes. Fixed-size clients may ignore them and stay scaled;
+  ConsoleService reacquires and reflows. Center/scale smaller surfaces with
+  nearest-neighbor first.
 - [ ] Fullscreen handoff and guaranteed return: the foreground VT hands the
       display to the app for the surface's lifetime; `release()`, process exit,
       or a CRASH (surface channel peer-close) always restores the text console

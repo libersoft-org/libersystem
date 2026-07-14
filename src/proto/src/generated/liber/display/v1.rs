@@ -95,13 +95,50 @@ impl SurfaceInfo {
 	}
 }
 
+/// A new preferred logical size for a native-sized surface. Fixed-size clients may
+/// ignore it and remain scaled/centered; a client that acquired `(0, 0)` releases and
+/// reacquires at the new size. Events are coalesced, so only the newest size matters.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayEvent {
+	pub width: u32,
+	pub height: u32,
+}
+
+impl DisplayEvent {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_inner())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<DisplayEvent> {
+		DisplayEvent::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.width)?;
+		w.u32(self.height)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<DisplayEvent> {
+		let width = r.u32()?;
+		let height = r.u32()?;
+		Some(DisplayEvent { width, height })
+	}
+}
+
 /// One display connection owns at most one surface. `present` is synchronous: the
 /// service validates the damage rectangle, copies/scales that rectangle to its
 /// scanout and completes the device flush before replying; the client must not modify
 /// pixels inside the rectangle until the call returns. `release`, channel peer-close,
 /// or process death drops the surface and restores the console with a full repaint.
 /// The client is not told whether its surface is fullscreen; a compositor can later
-/// implement this same contract without an API break.
+/// implement this same contract without an API break. `(0, 0)` requests the server's
+/// preferred logical size; a zero on only one axis is invalid. `events` is a live,
+/// bounded-channel stream of preferred-size changes.
 // interface `display` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod display {
 	use super::*;
@@ -111,11 +148,13 @@ pub mod display {
 	pub const OP_ACQUIRE: u16 = 1;
 	pub const OP_PRESENT: u16 = 2;
 	pub const OP_RELEASE: u16 = 3;
+	pub const OP_EVENTS: u16 = 4;
 
 	pub trait Service {
 		fn acquire(&mut self, width: u32, height: u32) -> Result<SurfaceInfo, Error>;
 		fn present(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), Error>;
 		fn release(&mut self) -> Result<(), Error>;
+		fn events(&mut self) -> Vec<DisplayEvent>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -240,6 +279,47 @@ pub mod display {
 		Some(writer.pos())
 	}
 
+	pub fn events_open<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64) -> Option<(u32, Vec<DisplayEvent>)> {
+		let mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		if r.has_handle() {
+			return None;
+		}
+		*request_handle = 0;
+		let items = service.events();
+		Some((corr, items))
+	}
+	pub fn events_frame(seq: u32, item: &DisplayEvent, out: &mut [u8], frame_handle: &mut u64) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if writer.has_handle() {
+				*frame_handle = writer.handle();
+			}
+			return None;
+		}
+		*frame_handle = writer.handle();
+		Some(writer.pos())
+	}
+	pub fn events_read(msg: &[u8], frame_handle: &mut u64) -> Option<DisplayEvent> {
+		let mut reader = if *frame_handle == 0 { Reader::new(msg) } else { Reader::with_handle(msg, *frame_handle) };
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = DisplayEvent::read(r)?;
+		if reader.has_handle() {
+			return None;
+		}
+		*frame_handle = 0;
+		Some(value)
+	}
+
 	pub struct Client<T: Transport> {
 		transport: T,
 		corr: u32,
@@ -337,6 +417,25 @@ pub mod display {
 				return None;
 			}
 			decoded
+		}
+		pub fn events(&mut self) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_EVENTS)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || reply_handle == 0 {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			Some(reply_handle)
 		}
 	}
 }
@@ -441,6 +540,49 @@ impl SurfaceInfo {
 	}
 }
 
+impl DisplayEvent {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"width\":");
+		let _ = write!(out, "{}", self.width);
+		out.push(',');
+		out.push_str("\"height\":");
+		let _ = write!(out, "{}", self.height);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("width=");
+		let _ = write!(out, "{}", self.width);
+		out.push_str(", ");
+		out.push_str("height=");
+		let _ = write!(out, "{}", self.height);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "width");
+		crate::codec::cbor::uint(out, self.width as u64);
+		crate::codec::cbor::text(out, "height");
+		crate::codec::cbor::uint(out, self.height as u64);
+	}
+}
+
 #[cfg(test)]
 mod compat {
 	use super::*;
@@ -453,5 +595,13 @@ mod compat {
 		let golden: &[u8] = &[0];
 		assert_eq!(bytes, golden);
 		assert_eq!(PixelFormat::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn display_event_wire_is_stable() {
+		let sample = DisplayEvent { width: 7, height: 7 };
+		let bytes = sample.encode_vec().expect("encode");
+		let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0];
+		assert_eq!(bytes, golden);
+		assert_eq!(DisplayEvent::decode(&bytes).unwrap(), sample);
 	}
 }

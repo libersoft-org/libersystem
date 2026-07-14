@@ -20,8 +20,10 @@ use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::address_space::AddressSpace;
+use super::dma_buffer::DmaBuffer;
 use super::domain::Domain;
 use super::handle::HandleTable;
+use super::memory_object::MemoryObject;
 use super::rights::Rights;
 use super::thread::Thread;
 use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
@@ -73,6 +75,10 @@ pub struct Process {
 	// Stack bytes charged to the Domain's stack account for this process (the eager
 	// top pages plus every demand-paged growth page), refunded once at teardown.
 	stack_bytes: AtomicU64,
+	// Objects mapped into this address space. Holding an Arc keeps each object alive
+	// until termination removes its PTEs and returns the virtual range.
+	mapped_memory: SpinLock<Vec<Arc<MemoryObject>>>,
+	mapped_dma: SpinLock<Vec<Arc<DmaBuffer>>>,
 }
 
 impl Process {
@@ -82,7 +88,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), exited: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), exited: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()) });
 		// Register with the Domain so a Domain kill can reach and terminate it.
 		process.domain.register_process(&process);
 		process
@@ -238,12 +244,39 @@ impl Process {
 		self.handles.lock().len() as u64
 	}
 
+	pub fn record_memory_mapping(&self, object: Arc<MemoryObject>) {
+		self.mapped_memory.lock().push(object);
+	}
+
+	pub fn forget_memory_mapping(&self, object: &Arc<MemoryObject>) {
+		self.mapped_memory.lock().retain(|mapped| !Arc::ptr_eq(mapped, object));
+	}
+
+	pub fn record_dma_mapping(&self, object: Arc<DmaBuffer>) {
+		self.mapped_dma.lock().push(object);
+	}
+
+	pub fn forget_dma_mapping(&self, object: &Arc<DmaBuffer>) {
+		self.mapped_dma.lock().retain(|mapped| !Arc::ptr_eq(mapped, object));
+	}
+
+	fn unmap_objects(&self) {
+		let cr3 = self.address_space.cr3();
+		for object in core::mem::take(&mut *self.mapped_memory.lock()) {
+			object.remove_mapping(cr3);
+		}
+		for object in core::mem::take(&mut *self.mapped_dma.lock()) {
+			object.remove_mapping(cr3);
+		}
+	}
+
 	// Terminate this process: mark it killed and close all its handles, refunding
 	// their resources (and the memory the objects pinned) to the Domain at once.
 	// Its threads observe the kill at their next scheduling point and exit,
 	// releasing the last reference to the Process.
 	pub fn terminate(&self) {
 		self.killed.store(true, Ordering::Release);
+		self.unmap_objects();
 		self.handles.lock().close_all();
 		// A kill is a terminal state, so wake anything blocked on this process handle to
 		// observe it - the same process-terminated signal a clean exit delivers.
@@ -253,6 +286,7 @@ impl Process {
 
 impl Drop for Process {
 	fn drop(&mut self) {
+		self.unmap_objects();
 		// Refund the Domain's stack account for every page this process's stack held.
 		let stack = self.stack_bytes.swap(0, Ordering::AcqRel);
 		if stack != 0 {

@@ -36,7 +36,8 @@ service   device_service        services  volume  transparent  log_service proce
 service   process_service       services  pinned  escalate     log_service storage_service
 service   config_service        services  volume  transparent  log_service process_service
 service   time_service          services  volume  escalate     log_service network_service process_service
-service   console_service       services  volume  escalate     log_service time_service audio_service input_service session_service process_service permission_manager
+service   display_service       services  volume  escalate     log_service device_manager process_service
+service   console_service       services  volume  escalate     log_service time_service audio_service input_service display_service session_service process_service permission_manager
 service   audio_service         services  volume  escalate     log_service device_manager process_service
 service   input_service         services  volume  escalate     log_service device_manager process_service
 service   system_graph_service  services  volume  escalate     log_service device_manager storage_service network_service device_service process_service config_service time_service console_service audio_service input_service permission_manager resource_manager

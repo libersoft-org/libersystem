@@ -11,12 +11,12 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::domain::Domain;
 use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::arch::paging;
 use crate::mem::frame::{self, PAGE_SIZE};
+use crate::sync::SpinLock;
 
 // Why a MemoryObject could not be created.
 pub enum MemoryError {
@@ -32,13 +32,10 @@ pub struct MemoryObject {
 	frames: Vec<u64>,
 	// Size in bytes (rounded up to whole pages).
 	size: usize,
-	// Virtual base where this object is currently mapped (0 = unmapped), and the
-	// address space (CR3) that base belongs to. Tracking the address space lets the
-	// same object be mapped into several address spaces (shared memory, e.g. the
-	// init package shared by ServiceManager and DeviceManager) while still rejecting
-	// a duplicate map within one address space.
-	mapped_at: AtomicU64,
-	mapped_cr3: AtomicU64,
+	// One mapping per address space. Shared buffers are routinely mapped by both a
+	// service and its client, so no single global `mapped_at` value can represent
+	// their lifetime correctly.
+	mappings: SpinLock<Vec<(u64, u64)>>,
 	// Domain charged for this object's physical memory, if any. The charge is
 	// refunded when the object is dropped.
 	domain: Option<Arc<Domain>>,
@@ -51,7 +48,7 @@ impl MemoryObject {
 	pub fn create(size: usize) -> Option<Arc<Self>> {
 		let pages = frame::pages_for(size);
 		let frames = frame::allocate_pages(pages)?;
-		Some(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mapped_at: AtomicU64::new(0), mapped_cr3: AtomicU64::new(0), domain: None }))
+		Some(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: None }))
 	}
 
 	// Allocate physical frames for an object charged to `domain`. The Domain's
@@ -71,7 +68,7 @@ impl MemoryObject {
 				return Err(MemoryError::OutOfMemory);
 			}
 		};
-		Ok(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mapped_at: AtomicU64::new(0), mapped_cr3: AtomicU64::new(0), domain: Some(domain.clone()) }))
+		Ok(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: Some(domain.clone()) }))
 	}
 
 	pub fn size(&self) -> usize {
@@ -82,22 +79,25 @@ impl MemoryObject {
 		&self.frames
 	}
 
-	// Kernel virtual base this object is mapped at, or 0 if it is not mapped.
-	pub fn mapped_at(&self) -> u64 {
-		self.mapped_at.load(Ordering::Acquire)
+	pub fn is_mapped_in(&self, cr3: u64) -> bool {
+		self.mappings.lock().iter().any(|(mapped_cr3, _)| *mapped_cr3 == cr3)
 	}
 
-	pub fn set_mapped_at(&self, virt: u64) {
-		self.mapped_at.store(virt, Ordering::Release);
+	pub fn add_mapping(&self, cr3: u64, base: u64) {
+		self.mappings.lock().push((cr3, base));
 	}
 
-	// The address space (CR3) the current mapping belongs to.
-	pub fn mapped_cr3(&self) -> u64 {
-		self.mapped_cr3.load(Ordering::Acquire)
-	}
-
-	pub fn set_mapped_cr3(&self, cr3: u64) {
-		self.mapped_cr3.store(cr3, Ordering::Release);
+	pub fn remove_mapping(&self, cr3: u64) -> bool {
+		let base = {
+			let mut mappings = self.mappings.lock();
+			let Some(index) = mappings.iter().position(|(mapped_cr3, _)| *mapped_cr3 == cr3) else { return false };
+			mappings.swap_remove(index).1
+		};
+		for page in 0..self.frames.len() {
+			paging::unmap_page_in(cr3, base + page as u64 * PAGE_SIZE);
+		}
+		crate::syscall::free_vrange(base, self.size as u64);
+		true
 	}
 }
 
@@ -105,13 +105,7 @@ impl_kernel_object!(MemoryObject, MemoryObject);
 
 impl Drop for MemoryObject {
 	fn drop(&mut self) {
-		// Tear down any leftover mapping so freed frames are never left mapped, and
-		// return its address range to the window's pool.
-		let base = self.mapped_at.load(Ordering::Acquire);
-		if base != 0 {
-			paging::unmap_pages(base, self.frames.len());
-			crate::syscall::free_vrange(base, self.frames.len() as u64 * PAGE_SIZE);
-		}
+		debug_assert!(self.mappings.lock().is_empty(), "process cleanup must remove every MemoryObject mapping");
 		frame::free_pages(&self.frames);
 		// Refund the physical memory to the owning Domain, if any.
 		if let Some(domain) = &self.domain {

@@ -16,13 +16,13 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::domain::Domain;
 use super::memory_object::MemoryError;
 use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::arch::paging;
 use crate::mem::frame::{self, PAGE_SIZE};
+use crate::sync::SpinLock;
 
 pub struct DmaBuffer {
 	header: ObjectHeader,
@@ -30,8 +30,8 @@ pub struct DmaBuffer {
 	frames: Vec<u64>,
 	// Size in bytes (rounded up to whole pages).
 	size: usize,
-	// Virtual base where this buffer is currently mapped (0 = unmapped).
-	mapped_at: AtomicU64,
+	// The driver and display server map the same backing in different address spaces.
+	mappings: SpinLock<Vec<(u64, u64)>>,
 	// Domain charged for this buffer's pinned DMA memory; refunded on drop.
 	domain: Arc<Domain>,
 }
@@ -57,7 +57,7 @@ impl DmaBuffer {
 			}
 		};
 		let frames: Vec<u64> = (0..pages as u64).map(|i| base + i * PAGE_SIZE).collect();
-		Ok(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mapped_at: AtomicU64::new(0), domain: domain.clone() }))
+		Ok(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: domain.clone() }))
 	}
 
 	pub fn size(&self) -> usize {
@@ -73,12 +73,25 @@ impl DmaBuffer {
 		self.frames.first().copied().unwrap_or(0)
 	}
 
-	pub fn mapped_at(&self) -> u64 {
-		self.mapped_at.load(Ordering::Acquire)
+	pub fn is_mapped_in(&self, cr3: u64) -> bool {
+		self.mappings.lock().iter().any(|(mapped_cr3, _)| *mapped_cr3 == cr3)
 	}
 
-	pub fn set_mapped_at(&self, virt: u64) {
-		self.mapped_at.store(virt, Ordering::Release);
+	pub fn add_mapping(&self, cr3: u64, base: u64) {
+		self.mappings.lock().push((cr3, base));
+	}
+
+	pub fn remove_mapping(&self, cr3: u64) -> bool {
+		let base = {
+			let mut mappings = self.mappings.lock();
+			let Some(index) = mappings.iter().position(|(mapped_cr3, _)| *mapped_cr3 == cr3) else { return false };
+			mappings.swap_remove(index).1
+		};
+		for page in 0..self.frames.len() {
+			paging::unmap_page_in(cr3, base + page as u64 * PAGE_SIZE);
+		}
+		crate::syscall::free_vrange(base, self.size as u64);
+		true
 	}
 }
 
@@ -86,13 +99,7 @@ impl_kernel_object!(DmaBuffer, DmaBuffer);
 
 impl Drop for DmaBuffer {
 	fn drop(&mut self) {
-		// Tear down any leftover mapping so freed frames are never left mapped, and
-		// return its address range to the window's pool.
-		let base = self.mapped_at.load(Ordering::Acquire);
-		if base != 0 {
-			paging::unmap_pages(base, self.frames.len());
-			crate::syscall::free_vrange(base, self.frames.len() as u64 * PAGE_SIZE);
-		}
+		debug_assert!(self.mappings.lock().is_empty(), "process cleanup must remove every DmaBuffer mapping");
 		frame::free_pages(&self.frames);
 		// Refund the pinned DMA memory to the owning Domain.
 		self.domain.uncharge_dma(self.size as u64);

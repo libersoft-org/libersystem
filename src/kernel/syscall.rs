@@ -42,7 +42,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
+pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -326,6 +326,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_MEMORY_OBJECT_CREATE => sys_memory_object_create(a0),
 		SYS_DMA_BUFFER_CREATE => sys_dma_buffer_create(a0),
 		SYS_DMA_BUFFER_MAP => sys_dma_buffer_map(a0),
+		SYS_DMA_BUFFER_UNMAP => sys_dma_buffer_unmap(a0),
 		SYS_DMA_BUFFER_PHYS => sys_dma_buffer_phys(a0, a1),
 		SYS_DEVICE_MEMORY_MAP => sys_device_memory_map(a0),
 		SYS_RANDOM_GET => sys_random_get(a0, a1),
@@ -422,16 +423,16 @@ fn sys_dma_buffer_create(size: u64) -> i64 {
 	install_object(&thread, object, Rights::ALL, 0)
 }
 
-// Map a DmaBuffer into the caller's address space (cacheable RAM, unlike device
-// MMIO) and return its virtual base, so a driver can fill the virtqueue rings it
-// then points its device at. One mapping per buffer: a second call returns
-// ERR_INVALID.
+// Map a DmaBuffer into the caller's address space. One mapping per address space;
+// the driver and a display server may map the same backing concurrently.
 fn sys_dma_buffer_map(handle: u64) -> i64 {
+	let thread = current_thread!();
 	let dma = match current_typed::<DmaBuffer>(handle, ObjectType::DmaBuffer, Rights::MAP) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	if dma.mapped_at() != 0 {
+	let cr3 = arch::context::read_cr3();
+	if dma.is_mapped_in(cr3) {
 		return ERR_INVALID;
 	}
 	let user = arch::percpu::in_user_syscall();
@@ -445,8 +446,22 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 		free_vrange(base, dma.size() as u64);
 		return ERR_NO_MEMORY;
 	}
-	dma.set_mapped_at(base);
+	dma.add_mapping(cr3, base);
+	thread.process().record_dma_mapping(dma);
 	base as i64
+}
+
+fn sys_dma_buffer_unmap(handle: u64) -> i64 {
+	let thread = current_thread!();
+	let dma = match current_typed::<DmaBuffer>(handle, ObjectType::DmaBuffer, Rights::MAP) {
+		Ok(dma) => dma,
+		Err(error) => return error,
+	};
+	if !dma.remove_mapping(arch::context::read_cr3()) {
+		return ERR_NOT_MAPPED;
+	}
+	thread.process().forget_dma_mapping(&dma);
+	0
 }
 
 // Return the physical address backing byte `offset` of a DmaBuffer - the address a
@@ -1054,19 +1069,15 @@ fn sys_console_attach(handle: u64) -> i64 {
 // Map a MemoryObject into the kernel address space, returning its virtual base.
 fn sys_memory_map(handle: u64) -> i64 {
 	let thread = current_thread!();
-	let object = {
-		let table = thread.handles().lock();
-		match table.lookup_typed(Handle::from_raw(handle), ObjectType::MemoryObject, Rights::MAP) {
-			Ok(o) => o,
-			Err(_) => return ERR_BAD_HANDLE,
-		}
+	let memory = match current_typed::<MemoryObject>(handle, ObjectType::MemoryObject, Rights::MAP) {
+		Ok(memory) => memory,
+		Err(error) => return error,
 	};
-	let memory = object.as_any().downcast_ref::<MemoryObject>().expect("type checked by lookup_typed");
 	// Reject a duplicate map within the SAME address space; mapping into a different
 	// address space is allowed, so an object can be shared (e.g. the init package
 	// mapped by both ServiceManager and DeviceManager).
 	let cr3 = arch::context::read_cr3();
-	if memory.mapped_at() != 0 && memory.mapped_cr3() == cr3 {
+	if memory.is_mapped_in(cr3) {
 		return ERR_INVALID;
 	}
 	// A ring-3 caller maps into its own (lower-half) user space with the USER bit
@@ -1084,29 +1095,23 @@ fn sys_memory_map(handle: u64) -> i64 {
 		free_vrange(base, memory.size() as u64);
 		return ERR_NO_MEMORY;
 	}
-	memory.set_mapped_at(base);
-	memory.set_mapped_cr3(cr3);
+	memory.add_mapping(cr3, base);
+	thread.process().record_memory_mapping(memory.clone());
 	base as i64
 }
 
 // Remove a MemoryObject's mapping from the kernel address space.
 fn sys_memory_unmap(handle: u64) -> i64 {
 	let thread = current_thread!();
-	let object = {
-		let table = thread.handles().lock();
-		match table.lookup_typed(Handle::from_raw(handle), ObjectType::MemoryObject, Rights::MAP) {
-			Ok(o) => o,
-			Err(_) => return ERR_BAD_HANDLE,
-		}
+	let memory = match current_typed::<MemoryObject>(handle, ObjectType::MemoryObject, Rights::MAP) {
+		Ok(memory) => memory,
+		Err(error) => return error,
 	};
-	let memory = object.as_any().downcast_ref::<MemoryObject>().expect("type checked by lookup_typed");
-	let base = memory.mapped_at();
-	if base == 0 {
+	let cr3 = arch::context::read_cr3();
+	if !memory.remove_mapping(cr3) {
 		return ERR_NOT_MAPPED;
 	}
-	arch::paging::unmap_pages(base, memory.frames().len());
-	memory.set_mapped_at(0);
-	free_vrange(base, memory.frames().len() as u64 * PAGE_SIZE);
+	thread.process().forget_memory_mapping(&memory);
 	0
 }
 

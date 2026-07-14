@@ -24,15 +24,26 @@ record surface-info {
 	format: pixel-format,
 }
 
+/// A new preferred logical size for a native-sized surface. Fixed-size clients may
+/// ignore it and remain scaled/centered; a client that acquired `(0, 0)` releases and
+/// reacquires at the new size. Events are coalesced, so only the newest size matters.
+record display-event {
+	width:  u32,
+	height: u32,
+}
+
 /// One display connection owns at most one surface. `present` is synchronous: the
 /// service validates the damage rectangle, copies/scales that rectangle to its
 /// scanout and completes the device flush before replying; the client must not modify
 /// pixels inside the rectangle until the call returns. `release`, channel peer-close,
 /// or process death drops the surface and restores the console with a full repaint.
 /// The client is not told whether its surface is fullscreen; a compositor can later
-/// implement this same contract without an API break.
+/// implement this same contract without an API break. `(0, 0)` requests the server's
+/// preferred logical size; a zero on only one axis is invalid. `events` is a live,
+/// bounded-channel stream of preferred-size changes.
 interface display {
 	@op(1) acquire: func(width: u32, height: u32) -> result<surface-info, error>;
 	@op(2) present: func(x: u32, y: u32, width: u32, height: u32) -> result<unit, error>;
 	@op(3) release: func() -> result<unit, error>;
+	@op(4) events:  func() -> stream<display-event>;
 }

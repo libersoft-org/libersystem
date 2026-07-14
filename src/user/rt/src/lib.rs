@@ -702,6 +702,7 @@ pub const CAP_FAUDIO: &[u8] = b"FAUDIO";
 pub const CAP_FSESSION: &[u8] = b"FSESSION";
 pub const CAP_FPERM: &[u8] = b"FPERM";
 pub const CAP_FNET: &[u8] = b"FNET";
+pub const CAP_DISPLAY: &[u8] = b"DISPLAY";
 pub const CAP_GPU: &[u8] = b"GPU";
 pub const CAP_POINTER: &[u8] = b"POINTER";
 
@@ -1454,6 +1455,10 @@ pub unsafe fn dma_buffer_create(size: u64) -> i64 {
 // negative error). The driver fills the virtqueue rings through this mapping.
 pub unsafe fn dma_buffer_map(handle: u64) -> i64 {
 	unsafe { syscall(SYS_DMA_BUFFER_MAP, handle, 0, 0, 0) as i64 }
+}
+
+pub unsafe fn dma_buffer_unmap(handle: u64) -> i64 {
+	unsafe { syscall(SYS_DMA_BUFFER_UNMAP, handle, 0, 0, 0) as i64 }
 }
 
 // The physical base address of a DmaBuffer - the address a driver programs into

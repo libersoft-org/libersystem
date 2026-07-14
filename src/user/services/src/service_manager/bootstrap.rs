@@ -79,7 +79,7 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-pub(super) unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
+pub(super) unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, input_client: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -146,7 +146,10 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_
 		if name == b"input_service" && !bootstrap_input(manager_side, *input_raw, *usb_pointer, input_client, pointer_console) {
 			return State::Failed;
 		}
-		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *gpu_client, *time_client, *audio_client, *session_client, *perm_client, *pointer_console, console_client, console_control) {
+		if name == b"display_service" && !bootstrap_display_service(manager_side, *gpu_client, display_client) {
+			return State::Failed;
+		}
+		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *display_client, *time_client, *audio_client, *session_client, *perm_client, *pointer_console, console_client, console_control) {
 			return State::Failed;
 		}
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
@@ -949,6 +952,17 @@ unsafe fn bootstrap_audio_service(manager_side: u64, snd_client: u64, audio_clie
 	}
 }
 
+// Hand DisplayService the raw virtio-gpu channel and create the typed multi-client
+// display root. With no gpu, the service maps the boot framebuffer instead.
+unsafe fn bootstrap_display_service(manager_side: u64, gpu_client: u64, display_client: &mut u64) -> bool {
+	unsafe {
+		if !send_blocking(manager_side, b"GPU", gpu_client) {
+			return false;
+		}
+		bootstrap_serve(manager_side, display_client)
+	}
+}
+
 // Hand ConsoleService the client end of a fresh console channel over "CLIENT" (VT 1's
 // terminal: the shell writes its output to it and reads its keystrokes from it), then
 // a *factory* connection to every multi-client service plus a read-only view of the
@@ -960,7 +974,7 @@ unsafe fn bootstrap_audio_service(manager_side: u64, snd_client: u64, audio_clie
 // so minting from them never crosses the supervisor's lifecycle traffic. ConsoleService
 // maps the framebuffer itself (the kernel console then stops drawing) and attaches to
 // the kernel console input for keys.
-unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, gpu_client: u64, time_client: u64, audio_client: u64, session_client: u64, perm_client: u64, pointer_console: u64, console_client: &mut u64, console_control: &mut u64) -> bool {
+unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, display_client: u64, time_client: u64, audio_client: u64, session_client: u64, perm_client: u64, pointer_console: u64, console_client: &mut u64, console_control: &mut u64) -> bool {
 	unsafe {
 		let (service_end, client_end): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -1021,9 +1035,13 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 		if !send_blocking(manager_side, CAP_FNET, net_fac) {
 			return false;
 		}
-		// The gpu driver's display channel (0 when there is no virtio-gpu device, e.g.
-		// under test - ConsoleService then falls back to the boot framebuffer).
-		if !send_blocking(manager_side, CAP_GPU, gpu_client) {
+		// An independent typed DisplayService connection. The service owns either the
+		// virtio-gpu backing or the boot framebuffer; ConsoleService only sees a surface.
+		let display: u64 = match service_connect(display_client) {
+			Some(channel) => channel,
+			None => return false,
+		};
+		if !send_blocking(manager_side, CAP_DISPLAY, display) {
 			return false;
 		}
 		// The pointer-forward channel from InputService (0 when no pointer device this

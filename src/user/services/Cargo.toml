@@ -41,6 +41,10 @@ name = "console_service"
 path = "src/console_service.rs"
 
 [[bin]]
+name = "display_service"
+path = "src/display_service.rs"
+
+[[bin]]
 name = "time_service"
 path = "src/time_service.rs"
 

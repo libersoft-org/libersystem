@@ -778,6 +778,7 @@ define_test_tags! {
 	ArchX86_64 => "arch-x86_64",
 	Boot => "boot",
 	Console => "console",
+	Display => "display",
 	Drivers => "drivers",
 	Filesystem => "filesystem",
 	Input => "input",
@@ -2622,6 +2623,9 @@ fn dma_buffer_maps_and_reports_phys() {
 			}
 			(virt as *mut u64).write_volatile(MARK);
 			let via_hhdm = ((mem::hhdm_offset() + phys) as *const u64).read_volatile();
+			assert_eq!(arch::syscall::invoke(syscall::SYS_DMA_BUFFER_UNMAP, handle, 0, 0, 0) as i64, 0);
+			let remapped = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_MAP, handle, 0, 0, 0);
+			assert_eq!(remapped, virt, "the released DMA virtual range should be reused");
 			PHYS.store(phys, Ordering::SeqCst);
 			READBACK.store(via_hhdm, Ordering::SeqCst);
 			DONE.store(true, Ordering::SeqCst);
@@ -2921,6 +2925,138 @@ fn input_service_streams_pointer_events() {
 	assert_eq!(events.len(), 2, "both injected pointer events stream back");
 	assert_eq!(events[0], (40, 25, 1), "the half-span event maps to the middle cell with the left button");
 	assert_eq!(events[1], (0, 0, 0), "the corner event maps to column 0, row 0, no buttons");
+}
+
+tagged_test!(display_service_restores_the_console_surface, [Service, Console, Display, Memory]);
+fn display_service_restores_the_console_surface() {
+	use object::channel::{Channel, Message};
+	use object::dma_buffer::DmaBuffer;
+	use object::memory_object::MemoryObject;
+	use object::rights::Rights;
+
+	fn request(op: u16, corr: u32, args: &[u32]) -> Message {
+		let mut bytes = alloc::vec::Vec::new();
+		bytes.extend_from_slice(&op.to_le_bytes());
+		bytes.extend_from_slice(&corr.to_le_bytes());
+		for value in args {
+			bytes.extend_from_slice(&value.to_le_bytes());
+		}
+		Message::new(bytes, alloc::vec::Vec::new(), 0)
+	}
+
+	fn connect(root: &Channel) -> alloc::sync::Arc<Channel> {
+		root.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("connect request");
+		sched::run_until_idle();
+		let reply = root.recv().expect("connect reply");
+		let cap = reply.caps.first().expect("connected display channel");
+		cap.object().into_any_arc().downcast::<Channel>().expect("display connection is a channel")
+	}
+
+	fn acquire(client: &Channel, corr: u32, width: u32, height: u32) -> alloc::sync::Arc<MemoryObject> {
+		client.send(request(1, corr, &[width, height])).expect("acquire request");
+		sched::run_until_idle();
+		let reply = client.recv().expect("acquire reply");
+		assert_eq!(le_u32(&reply.bytes, 0), corr, "acquire echoes correlation id");
+		assert_eq!(reply.bytes[4], 1, "acquire succeeds");
+		assert_eq!(le_u32(&reply.bytes, 13), if width == 0 { 4 } else { width }, "surface width");
+		assert_eq!(le_u32(&reply.bytes, 17), if height == 0 { 4 } else { height }, "surface height");
+		let cap = reply.caps.first().expect("surface MemoryObject");
+		cap.object().into_any_arc().downcast::<MemoryObject>().expect("surface buffer is a MemoryObject")
+	}
+
+	fn fill(object: &MemoryObject, pixel: u32, pixels: usize) {
+		let base = mem::hhdm_offset() + object.frames()[0];
+		let words = unsafe { core::slice::from_raw_parts_mut(base as *mut u32, pixels) };
+		words.fill(pixel);
+	}
+
+	fn scanout_pixel(scanout: &DmaBuffer) -> u32 {
+		unsafe { ((mem::hhdm_offset() + scanout.frames()[0]) as *const u32).read_unaligned() }
+	}
+
+	fn acknowledge_present(gpu: &Channel, client: Option<(&Channel, u32)>) {
+		sched::run_until_idle();
+		let present = gpu.recv().expect("synchronous PRESENT reaches the gpu");
+		assert_eq!(&present.bytes[..7], b"PRESENT", "DisplayService uses the acknowledged present path");
+		gpu.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("present acknowledgement");
+		sched::run_until_idle();
+		if let Some((channel, corr)) = client {
+			let reply = channel.recv().expect("typed display reply");
+			assert_eq!(le_u32(&reply.bytes, 0), corr, "reply echoes correlation id");
+			assert_eq!(reply.bytes[4], 1, "display operation succeeds");
+		}
+	}
+
+	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = program_elf(&package, volume, b"display_service").expect("display_service in the package or volume");
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, console_client) = Channel::create();
+	let (gpu_kernel, gpu_user) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn DisplayService");
+	send_cap(&boot_kernel, b"GPU", gpu_user, Rights::ALL).expect("gpu bootstrap");
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+
+	// Answer the driver's FB handshake with a 4x4 B8G8R8X8 DMA scanout.
+	sched::run_until_idle();
+	let fb_request = gpu_kernel.recv().expect("framebuffer request");
+	assert_eq!(&fb_request.bytes[..], b"FB", "DisplayService requests the scanout");
+	let scanout = match DmaBuffer::create_in(&sched::root_domain(), 4 * 4 * 4) {
+		Ok(scanout) => scanout,
+		Err(_) => panic!("stand-in scanout"),
+	};
+	let fb = abi::Framebuffer { width: 4, height: 4, pitch: 16, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] };
+	let mut fb_reply = unsafe { core::slice::from_raw_parts(&fb as *const abi::Framebuffer as *const u8, core::mem::size_of::<abi::Framebuffer>()) }.to_vec();
+	fb_reply.extend_from_slice(&4u32.to_le_bytes());
+	fb_reply.extend_from_slice(&4u32.to_le_bytes());
+	send_cap(&gpu_kernel, &fb_reply, scanout.clone(), Rights::MAP | Rights::TRANSFER).expect("framebuffer response");
+	sched::run_until_idle();
+	let online = boot_kernel.recv().expect("DisplayService online report");
+	assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
+
+	// The root connection is the native-size console surface.
+	let console = acquire(&console_client, 1, 0, 0);
+	fill(&console, 0x0011_2233, 16);
+	console_client.send(request(2, 2, &[0, 0, 4, 4])).expect("console present");
+	acknowledge_present(&gpu_kernel, Some((&console_client, 2)));
+	assert_eq!(scanout_pixel(&scanout), 0x0011_2233, "console pixels reach the scanout");
+	console_client.send(request(4, 8, &[])).expect("display events request");
+	sched::run_until_idle();
+	let events_reply = console_client.recv().expect("display events reply");
+	assert_eq!(le_u32(&events_reply.bytes, 0), 8, "events reply echoes correlation id");
+	let events_cap = events_reply.caps.first().expect("display event stream");
+	let events = events_cap.object().into_any_arc().downcast::<Channel>().expect("event stream is a channel");
+	let mut resize = b"RESIZE".to_vec();
+	resize.extend_from_slice(&4u32.to_le_bytes());
+	resize.extend_from_slice(&4u32.to_le_bytes());
+	gpu_kernel.send(Message::new(resize, alloc::vec::Vec::new(), 0)).expect("gpu resize event");
+	acknowledge_present(&gpu_kernel, None);
+	let resize_event = events.recv().expect("typed display resize event");
+	assert_eq!(le_u32(&resize_event.bytes, 4), 4, "resize event width");
+	assert_eq!(le_u32(&resize_event.bytes, 8), 4, "resize event height");
+
+	// A later client becomes foreground. Explicit release restores and presents console.
+	let app = connect(&console_client);
+	let app_surface = acquire(&app, 3, 2, 2);
+	fill(&app_surface, 0x00aa_bbcc, 4);
+	app.send(request(2, 4, &[0, 0, 2, 2])).expect("app present");
+	acknowledge_present(&gpu_kernel, Some((&app, 4)));
+	assert_eq!(scanout_pixel(&scanout), 0x00aa_bbcc, "foreground app replaces the console");
+	app.send(request(3, 5, &[])).expect("app release");
+	acknowledge_present(&gpu_kernel, Some((&app, 5)));
+	assert_eq!(scanout_pixel(&scanout), 0x0011_2233, "release restores the console surface");
+
+	// A crashed client has the same restoration guarantee through channel peer-close.
+	let crashed = connect(&console_client);
+	let crashed_surface = acquire(&crashed, 6, 2, 2);
+	fill(&crashed_surface, 0x00dd_4400, 4);
+	crashed.send(request(2, 7, &[0, 0, 2, 2])).expect("crashed app present");
+	acknowledge_present(&gpu_kernel, Some((&crashed, 7)));
+	assert_eq!(scanout_pixel(&scanout), 0x00dd_4400, "second foreground app reaches scanout");
+	drop(crashed);
+	acknowledge_present(&gpu_kernel, None);
+	assert_eq!(scanout_pixel(&scanout), 0x0011_2233, "peer-close restores the console surface");
 }
 
 tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow]);
@@ -3463,7 +3599,7 @@ fn init_package_starts_system_manager() {
 	// path uses is valid against the live manifest), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 30] = [
+	let reports: [&[u8]; 31] = [
 		b"LogService: online",
 		b"DeviceManager: online",
 		b"StorageService: online",
@@ -3473,6 +3609,7 @@ fn init_package_starts_system_manager() {
 		b"StorageService: online",
 		b"ProcessService: online",
 		b"ConfigService: online",
+		b"DisplayService: online",
 		b"AudioService: online",
 		b"InputService: online",
 		b"ResourceManager: online",

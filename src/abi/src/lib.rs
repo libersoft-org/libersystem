@@ -166,6 +166,9 @@ pub const SYS_ABI_CHECK: u64 = 60;
 // brand string (the host CPU under KVM); aarch64 decodes MIDR_EL1; riscv64 queries the
 // SBI vendor id (a generic QEMU rv64 falls back to "riscv64").
 pub const SYS_CPU_NAME: u64 = 61;
+// Remove the calling process's DmaBuffer mapping. Shared DMA backings can be mapped
+// by a driver and a display server independently; each owner releases its own mapping.
+pub const SYS_DMA_BUFFER_UNMAP: u64 = 62;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;
