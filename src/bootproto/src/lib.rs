@@ -14,6 +14,9 @@
 
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
 // The shared read-only ELF64 reader, used by both the loader (to load the kernel)
 // and the kernel (to load userspace programs).
 pub mod elf;

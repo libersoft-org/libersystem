@@ -240,7 +240,7 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 // captured stdout; request_probe's runtime request is refused by the headless policy default
 // (least privilege - an undeclared capability is never granted) and recorded as a dynamic
 // denial; and `cat` prints that file through its storage grant to the forwarded stdout. The
-// scenario also launches `view` over a staged BMP and display/input stand-ins, proving its
+// scenario also launches `imgview` over a staged BMP and display/input stand-ins, proving its
 // acquire -> present -> focus -> key-quit -> release sequence. The kernel only brokers the
 // initial capabilities. Returns (expected,
 // probe_read, probe_summary, date_read, date_summary, request_read, request_summary,
@@ -446,24 +446,24 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let mut view_run = alloc::vec::Vec::new();
 	view_run.extend_from_slice(&3u16.to_le_bytes());
 	view_run.extend_from_slice(&1u32.to_le_bytes());
-	for value in [&b"view"[..], &b"vol://system/sample.bmp"[..], &b"vol://system"[..]] {
+	for value in [&b"imgview"[..], &b"vol://system/sample.bmp"[..], &b"vol://system"[..]] {
 		view_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
 		view_run.extend_from_slice(value);
 	}
 	view_run.extend_from_slice(&0u32.to_le_bytes());
 	send_cap(&perm_client, &view_run, view_stdout, Rights::ALL)?;
 	sched::run_until_idle();
-	let view_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer view run")?;
+	let view_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer imgview run")?;
 	if view_reply.bytes.len() < 5 || view_reply.bytes[4] == 0 {
-		return Err("PermissionManager refused view");
+		return Err("PermissionManager refused imgview");
 	}
-	let view_process = view_reply.caps.first().ok_or("view run returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "view run handle was not a Process")?;
+	let view_process = view_reply.caps.first().ok_or("imgview run returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "imgview run handle was not a Process")?;
 
-	let acquire = view_display_server.recv().map_err(|_| "view did not acquire a surface")?;
+	let acquire = view_display_server.recv().map_err(|_| "imgview did not acquire a surface")?;
 	if acquire.bytes.len() < 14 || le_u16(&acquire.bytes, 0) != 1 || le_u32(&acquire.bytes, 6) != 0 || le_u32(&acquire.bytes, 10) != 0 {
-		return Err("view sent an invalid acquire request");
+		return Err("imgview sent an invalid acquire request");
 	}
-	let surface = MemoryObject::create(4).ok_or("view surface allocation failed")?;
+	let surface = MemoryObject::create(4).ok_or("imgview surface allocation failed")?;
 	let acquire_corr = le_u32(&acquire.bytes, 2);
 	let mut acquire_reply = alloc::vec::Vec::new();
 	acquire_reply.extend_from_slice(&acquire_corr.to_le_bytes());
@@ -476,20 +476,20 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	send_cap(&view_display_server, &acquire_reply, surface.clone(), Rights::ALL)?;
 	sched::run_until_idle();
 
-	let present = view_display_server.recv().map_err(|_| "view did not present its decoded image")?;
+	let present = view_display_server.recv().map_err(|_| "imgview did not present its decoded image")?;
 	if present.bytes.len() < 22 || le_u16(&present.bytes, 0) != 2 || le_u32(&present.bytes, 14) != 1 || le_u32(&present.bytes, 18) != 1 {
-		return Err("view sent an invalid first present");
+		return Err("imgview sent an invalid first present");
 	}
 	if !read_from_object(&surface, 4).iter().any(|byte| *byte != 0) {
-		return Err("view presented a blank decoded image");
+		return Err("imgview presented a blank decoded image");
 	}
 	let present_corr = le_u32(&present.bytes, 2);
-	view_display_server.send(Message::new([present_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "view present reply failed")?;
+	view_display_server.send(Message::new([present_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "imgview present reply failed")?;
 	sched::run_until_idle();
 
-	let focus_request = view_display_server.recv().map_err(|_| "view did not request input focus")?;
+	let focus_request = view_display_server.recv().map_err(|_| "imgview did not request input focus")?;
 	if focus_request.bytes.len() < 6 || le_u16(&focus_request.bytes, 0) != 5 {
-		return Err("view sent an invalid input-focus request");
+		return Err("imgview sent an invalid input-focus request");
 	}
 	let focus_corr = le_u32(&focus_request.bytes, 2);
 	let (_focus_server, focus_client) = Channel::create();
@@ -500,42 +500,42 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	send_cap(&view_display_server, &focus_reply, focus_client.clone(), Rights::ALL)?;
 	sched::run_until_idle();
 
-	let subscribe = view_input_server.recv().map_err(|_| "view did not subscribe to focused keys")?;
+	let subscribe = view_input_server.recv().map_err(|_| "imgview did not subscribe to focused keys")?;
 	if subscribe.bytes.len() < 10 || le_u16(&subscribe.bytes, 0) != 2 || subscribe.caps.is_empty() {
-		return Err("view sent an invalid key subscription");
+		return Err("imgview sent an invalid key subscription");
 	}
-	let transferred_focus = subscribe.caps[0].object().into_any_arc().downcast::<Channel>().map_err(|_| "view key subscription did not transfer focus proof")?;
+	let transferred_focus = subscribe.caps[0].object().into_any_arc().downcast::<Channel>().map_err(|_| "imgview key subscription did not transfer focus proof")?;
 	if !alloc::sync::Arc::ptr_eq(&transferred_focus, &focus_client) {
-		return Err("view transferred the wrong focus proof");
+		return Err("imgview transferred the wrong focus proof");
 	}
 	let subscribe_corr = le_u32(&subscribe.bytes, 2);
 	let (key_producer, key_consumer) = Channel::create();
 	send_cap(&view_input_server, &subscribe_corr.to_le_bytes(), key_consumer, Rights::ALL)?;
 	sched::run_until_idle();
 	let pan_frame = [0, 0, 0, 0, 0x4f, 0, 1];
-	key_producer.send(Message::new(pan_frame.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send view pan key")?;
+	key_producer.send(Message::new(pan_frame.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send imgview pan key")?;
 	sched::run_until_idle();
-	let pan_present = view_display_server.recv().map_err(|_| "view did not present after arrow-key pan")?;
+	let pan_present = view_display_server.recv().map_err(|_| "imgview did not present after arrow-key pan")?;
 	if pan_present.bytes.len() < 22 || le_u16(&pan_present.bytes, 0) != 2 || le_u32(&pan_present.bytes, 14) != 1 || le_u32(&pan_present.bytes, 18) != 1 {
-		return Err("view sent an invalid pan present");
+		return Err("imgview sent an invalid pan present");
 	}
 	let pan_corr = le_u32(&pan_present.bytes, 2);
-	view_display_server.send(Message::new([pan_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "view pan-present reply failed")?;
+	view_display_server.send(Message::new([pan_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "imgview pan-present reply failed")?;
 	sched::run_until_idle();
 	let quit_frame = [1, 0, 0, 0, 0x14, 0, 1];
-	key_producer.send(Message::new(quit_frame.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send view quit key")?;
+	key_producer.send(Message::new(quit_frame.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send imgview quit key")?;
 	sched::run_until_idle();
 
-	let release = view_display_server.recv().map_err(|_| "view did not release its surface after q")?;
+	let release = view_display_server.recv().map_err(|_| "imgview did not release its surface after q")?;
 	if release.bytes.len() < 6 || le_u16(&release.bytes, 0) != 3 {
-		return Err("view sent an invalid release request");
+		return Err("imgview sent an invalid release request");
 	}
 	let release_corr = le_u32(&release.bytes, 2);
 	view_display_server.send(Message::new([release_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "view release reply failed")?;
 	core::mem::drop(view_output);
 	sched::run_until_idle();
 	if !view_process.is_terminated() {
-		return Err("view did not exit after releasing the surface");
+		return Err("imgview did not exit after releasing the surface");
 	}
 	Ok((expected, probe_read.bytes, probe_summary.bytes, date_read.bytes, date_summary.bytes, request_read.bytes, request_summary.bytes, cat_read.bytes, graphics_read.bytes, graphics_start_ns))
 }
@@ -1078,6 +1078,213 @@ fn frame_alloc_distinct() {
 	mem::frame::deallocate(b);
 }
 
+tagged_test!(elf_dyn_applies_relative_relocations_and_rejects_symbols, [Memory, Process]);
+fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
+	use crate::elf::ElfError;
+	use crate::object::address_space::AddressSpace;
+	use crate::object::process::Process;
+
+	fn put16(bytes: &mut [u8], offset: usize, value: u16) {
+		bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+	}
+
+	fn put32(bytes: &mut [u8], offset: usize, value: u32) {
+		bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+	}
+
+	fn put64(bytes: &mut [u8], offset: usize, value: u64) {
+		bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+	}
+
+	fn program_header(bytes: &mut [u8], index: usize, kind: u32, flags: u32, offset: u64, address: u64, file_size: u64, memory_size: u64) {
+		let base = 64 + index * 56;
+		put32(bytes, base, kind);
+		put32(bytes, base + 4, flags);
+		put64(bytes, base + 8, offset);
+		put64(bytes, base + 16, address);
+		put64(bytes, base + 24, 0);
+		put64(bytes, base + 32, file_size);
+		put64(bytes, base + 40, memory_size);
+		put64(bytes, base + 48, 1);
+	}
+
+	fn image(symbol: u32) -> Vec<u8> {
+		const CODE_OFFSET: usize = 0x200;
+		const DATA_OFFSET: usize = 0x300;
+		const DATA_ADDRESS: u64 = 0x2000;
+		const RELA_OFFSET: usize = 0x10;
+		const DYNAMIC_OFFSET: usize = 0x30;
+		const DATA_LEN: usize = 0x80;
+		let mut bytes = alloc::vec![0u8; DATA_OFFSET + DATA_LEN];
+		bytes[..4].copy_from_slice(b"\x7fELF");
+		bytes[4] = 2;
+		bytes[5] = 1;
+		put16(&mut bytes, 16, 3);
+		put16(&mut bytes, 18, elf_machine());
+		put32(&mut bytes, 20, 1);
+		put64(&mut bytes, 24, 0);
+		put64(&mut bytes, 32, 64);
+		put16(&mut bytes, 52, 64);
+		put16(&mut bytes, 54, 56);
+		put16(&mut bytes, 56, 3);
+		program_header(&mut bytes, 0, 1, 5, CODE_OFFSET as u64, 0, 1, 1);
+		program_header(&mut bytes, 1, 1, 6, DATA_OFFSET as u64, DATA_ADDRESS, DATA_LEN as u64, DATA_LEN as u64);
+		program_header(&mut bytes, 2, 2, 6, (DATA_OFFSET + DYNAMIC_OFFSET) as u64, DATA_ADDRESS + DYNAMIC_OFFSET as u64, 5 * 16, 5 * 16);
+		bytes[CODE_OFFSET] = 0xc3;
+		let rela = DATA_OFFSET + RELA_OFFSET;
+		put64(&mut bytes, rela, DATA_ADDRESS);
+		put64(&mut bytes, rela + 8, (symbol as u64) << 32 | relative_relocation_type() as u64);
+		put64(&mut bytes, rela + 16, 0x1234);
+		let dynamic = DATA_OFFSET + DYNAMIC_OFFSET;
+		for (index, (tag, value)) in [(7u64, DATA_ADDRESS + RELA_OFFSET as u64), (8, 24), (9, 24), (0x6fff_fff9, 1), (0, 0)].into_iter().enumerate() {
+			put64(&mut bytes, dynamic + index * 16, tag);
+			put64(&mut bytes, dynamic + index * 16 + 8, value);
+		}
+		bytes
+	}
+
+	fn symbol_image(provider: bool) -> Vec<u8> {
+		const CODE_OFFSET: usize = 0x200;
+		const DATA_OFFSET: usize = 0x300;
+		const DATA_ADDRESS: u64 = 0x2000;
+		const SYMBOL_OFFSET: usize = 0x20;
+		const HASH_OFFSET: usize = 0x50;
+		const RELA_OFFSET: usize = 0x70;
+		const DYNAMIC_OFFSET: usize = 0x90;
+		const TARGET_OFFSET: usize = 0x110;
+		const DATA_LEN: usize = 0x120;
+		let strings = b"\0shared_value\0";
+		let mut bytes = alloc::vec![0u8; DATA_OFFSET + DATA_LEN];
+		bytes[..4].copy_from_slice(b"\x7fELF");
+		bytes[4] = 2;
+		bytes[5] = 1;
+		put16(&mut bytes, 16, 3);
+		put16(&mut bytes, 18, elf_machine());
+		put32(&mut bytes, 20, 1);
+		put64(&mut bytes, 24, 0);
+		put64(&mut bytes, 32, 64);
+		put16(&mut bytes, 52, 64);
+		put16(&mut bytes, 54, 56);
+		put16(&mut bytes, 56, 3);
+		program_header(&mut bytes, 0, 1, 5, CODE_OFFSET as u64, 0, 1, 1);
+		program_header(&mut bytes, 1, 1, 6, DATA_OFFSET as u64, DATA_ADDRESS, DATA_LEN as u64, DATA_LEN as u64);
+		let dynamic_entries = if provider { 6 } else { 9 };
+		program_header(&mut bytes, 2, 2, 6, (DATA_OFFSET + DYNAMIC_OFFSET) as u64, DATA_ADDRESS + DYNAMIC_OFFSET as u64, dynamic_entries * 16, dynamic_entries * 16);
+		bytes[CODE_OFFSET] = 0xc3;
+		bytes[DATA_OFFSET..DATA_OFFSET + strings.len()].copy_from_slice(strings);
+		let symbol = DATA_OFFSET + SYMBOL_OFFSET + 24;
+		put32(&mut bytes, symbol, 1);
+		bytes[symbol + 4] = 0x12;
+		put16(&mut bytes, symbol + 6, if provider { 1 } else { 0 });
+		put64(&mut bytes, symbol + 8, 0);
+		let hash = DATA_OFFSET + HASH_OFFSET;
+		for (index, word) in [1u32, 2, 1, 0, 0].into_iter().enumerate() {
+			put32(&mut bytes, hash + index * 4, word);
+		}
+		if !provider {
+			let rela = DATA_OFFSET + RELA_OFFSET;
+			put64(&mut bytes, rela, DATA_ADDRESS + TARGET_OFFSET as u64);
+			put64(&mut bytes, rela + 8, 1u64 << 32 | import_relocation_type() as u64);
+			put64(&mut bytes, rela + 16, 5);
+		}
+		let mut tags = alloc::vec![(5u64, DATA_ADDRESS), (10, strings.len() as u64), (6, DATA_ADDRESS + SYMBOL_OFFSET as u64), (11, 24), (4, DATA_ADDRESS + HASH_OFFSET as u64),];
+		if !provider {
+			tags.extend_from_slice(&[(7, DATA_ADDRESS + RELA_OFFSET as u64), (8, 24), (9, 24)]);
+		}
+		tags.push((0, 0));
+		let dynamic = DATA_OFFSET + DYNAMIC_OFFSET;
+		for (index, (tag, value)) in tags.into_iter().enumerate() {
+			put64(&mut bytes, dynamic + index * 16, tag);
+			put64(&mut bytes, dynamic + index * 16 + 8, value);
+		}
+		bytes
+	}
+
+	let address_space = AddressSpace::create().expect("ET_DYN address space");
+	let mut frames = Vec::new();
+	let mut shared = Vec::new();
+	let entry = crate::elf::load_into(&image(0), &address_space, &mut frames, &mut shared).expect("relative-only ET_DYN loads");
+	assert_eq!(entry, 0x1000_0000);
+	assert_eq!((frames.len(), shared.len()), (1, 1));
+	let relocated = unsafe { ((mem::hhdm_offset() + frames[0]) as *const u64).read_unaligned() };
+	assert_eq!(relocated, 0x1000_1234);
+	drop(address_space);
+	for frame in frames {
+		mem::frame::deallocate(frame);
+	}
+
+	let rejected_space = AddressSpace::create().expect("rejected ET_DYN address space");
+	let mut rejected_frames = Vec::new();
+	let mut rejected_shared = Vec::new();
+	assert_eq!(crate::elf::load_into(&image(1), &rejected_space, &mut rejected_frames, &mut rejected_shared), Err(ElfError::BadImage));
+	assert!(rejected_space.unmap(0x1000_0000).is_none(), "failed ET_DYN load rolled back every PTE");
+	assert!(rejected_shared.is_empty());
+	drop(rejected_space);
+	for frame in rejected_frames {
+		mem::frame::deallocate(frame);
+	}
+
+	let mut oversized = image(0);
+	put64(&mut oversized, 64 + 56 + 40, 0x0200_0000);
+	let oversized_space = AddressSpace::create().expect("oversized module address space");
+	let mut oversized_frames = Vec::new();
+	let mut oversized_shared = Vec::new();
+	assert_eq!(crate::elf::load_module_into(&oversized, &oversized_space, &mut oversized_frames, &mut oversized_shared, 0x2000_0000, &|_| None), Err(ElfError::BadImage));
+	assert!(oversized_space.unmap(0x2000_0000).is_none(), "oversized provider cannot escape its 16 MiB slot");
+	for frame in oversized_frames {
+		mem::frame::deallocate(frame);
+	}
+
+	let process = Process::new(AddressSpace::create().expect("dynamic module process address space"), sched::root_domain());
+	let provider = symbol_image(true);
+	let consumer = symbol_image(false);
+	crate::loader::load_module_into(&process, &provider, 0x2000_0000).expect("provider module loads and registers exports");
+	assert_eq!(process.resolve_dynamic_symbol("shared_value"), Some(0x2000_0000));
+	crate::loader::load_module_into(&process, &consumer, 0x2100_0000).expect("consumer resolves provider symbol eagerly");
+	let consumer_data = process.address_space().unmap(0x2100_2000).expect("consumer data mapping");
+	let imported = unsafe { ((mem::hhdm_offset() + consumer_data + 0x110) as *const u64).read_unaligned() };
+	assert_eq!(imported, 0x2000_0005);
+	assert!(matches!(crate::loader::load_module_into(&process, &provider, 0x2200_0000), Err(crate::loader::LoadError::BadImage)), "duplicate provider is rejected");
+	assert!(process.address_space().unmap(0x2200_0000).is_none(), "duplicate provider mapping is rolled back");
+	let second = Process::new(AddressSpace::create().expect("second module process address space"), sched::root_domain());
+	crate::loader::load_module_into(&second, &provider, 0x2000_0000).expect("same provider loads in a second process");
+	let first_text = process.address_space().unmap(0x2000_0000).expect("first provider text mapping");
+	let second_text = second.address_space().unmap(0x2000_0000).expect("second provider text mapping");
+	assert_eq!(first_text, second_text, "two processes map one physical immutable provider page");
+}
+
+#[cfg(target_arch = "x86_64")]
+const TEST_ELF_MACHINE: u16 = 62;
+#[cfg(target_arch = "aarch64")]
+const TEST_ELF_MACHINE: u16 = 183;
+#[cfg(target_arch = "riscv64")]
+const TEST_ELF_MACHINE: u16 = 243;
+
+#[cfg(target_arch = "x86_64")]
+const TEST_RELATIVE_RELOCATION: u32 = 8;
+#[cfg(target_arch = "aarch64")]
+const TEST_RELATIVE_RELOCATION: u32 = 1027;
+#[cfg(target_arch = "riscv64")]
+const TEST_RELATIVE_RELOCATION: u32 = 3;
+
+#[cfg(target_arch = "x86_64")]
+const TEST_IMPORT_RELOCATION: u32 = 6;
+#[cfg(target_arch = "aarch64")]
+const TEST_IMPORT_RELOCATION: u32 = 1026;
+#[cfg(target_arch = "riscv64")]
+const TEST_IMPORT_RELOCATION: u32 = 5;
+
+const fn elf_machine() -> u16 {
+	TEST_ELF_MACHINE
+}
+
+const fn relative_relocation_type() -> u32 {
+	TEST_RELATIVE_RELOCATION
+}
+
+const fn import_relocation_type() -> u32 {
+	TEST_IMPORT_RELOCATION
+}
 tagged_test!(contiguous_frames_and_dma_spans, [Memory, Drivers]);
 fn contiguous_frames_and_dma_spans() {
 	use mem::frame::{self, PAGE_SIZE};
@@ -3869,6 +4076,7 @@ fn process_service_starts_a_program() {
 tagged_test!(process_service_loads_a_program_from_system_bin, [Service, Process, Storage]);
 fn process_service_loads_a_program_from_system_bin() {
 	use object::channel::{Channel, Message};
+	use object::process::Process;
 	use object::rights::Rights;
 
 	// ProcessService loads a named program's ELF from the system volume's
@@ -3904,7 +4112,7 @@ fn process_service_loads_a_program_from_system_bin() {
 	send_cap(&process_boot_kernel, b"STORAGE", storage_client, Rights::ALL).expect("process storage bootstrap");
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
 
-	// START a staged tool: [op = 1 u16][corr u32][name: [len u16][utf8]], then quit.
+	// START a staged static tool: [op = 1 u16][corr u32][name: [len u16][utf8]].
 	let name: &[u8] = b"ptyecho";
 	let mut start = alloc::vec::Vec::new();
 	start.extend_from_slice(&1u16.to_le_bytes());
@@ -3912,8 +4120,6 @@ fn process_service_loads_a_program_from_system_bin() {
 	start.extend_from_slice(&(name.len() as u16).to_le_bytes());
 	start.extend_from_slice(name);
 	process_client.send(Message::new(start, alloc::vec::Vec::new(), 0)).expect("start request");
-	process_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
-
 	sched::run_until_idle();
 
 	// the service reports in on its bootstrap channel before it serves.
@@ -3931,6 +4137,56 @@ fn process_service_loads_a_program_from_system_bin() {
 	assert!(koid >= 1, "the started process has a koid");
 	let name_len = le_u16(b, 13) as usize;
 	assert_eq!(&b[15..15 + name_len], name, "the reply echoes the launched program name");
+
+	// LAUNCH the ET_DYN probe with a bootstrap channel. ProcessService must resolve
+	// libpix.so -> liblsrt.so from vol://system/lib, load providers first, relocate the
+	// probe's PLT call, and only then start it. Wire: op, corr, name, handle marker.
+	let dynamic_name: &[u8] = b"dyn_probe";
+	let (dynamic_report, dynamic_bootstrap) = Channel::create();
+	let mut launch = alloc::vec::Vec::new();
+	launch.extend_from_slice(&3u16.to_le_bytes());
+	launch.extend_from_slice(&2u32.to_le_bytes());
+	launch.extend_from_slice(&(dynamic_name.len() as u16).to_le_bytes());
+	launch.extend_from_slice(dynamic_name);
+	launch.extend_from_slice(&0u32.to_le_bytes());
+	let dynamic_started = arch::tsc::now();
+	send_cap(&process_client, &launch, dynamic_bootstrap, Rights::ALL).expect("dynamic launch request");
+	sched::run_until_idle();
+
+	let reply = process_client.recv().expect("dynamic launch reply");
+	let b = &reply.bytes;
+	assert_eq!(le_u32(b, 0), 2, "dynamic launch echoes the correlation id");
+	assert_eq!(b[4], 1, "the staged dynamic executable loaded with its providers");
+	assert!(!reply.caps.is_empty(), "dynamic launch returns the Process capability");
+	let dynamic_process = reply.caps[0].object().into_any_arc().downcast::<Process>().expect("dynamic launch capability is a Process");
+	let report = dynamic_report.recv().expect("dynamic probe called its shared libpix symbol");
+	assert_eq!(&report.bytes, b"dynamic link ok");
+	let dynamic_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(dynamic_started));
+	crate::serial_println!("dynamic-start-perf: {}ns private-pages={} shared-pages={}", dynamic_ns, dynamic_process.private_image_pages(), dynamic_process.shared_image_pages());
+	assert!(dynamic_ns != 0 && dynamic_process.private_image_pages() != 0 && dynamic_process.shared_image_pages() != 0);
+
+	let (second_report, second_bootstrap) = Channel::create();
+	let mut second_launch = alloc::vec::Vec::new();
+	second_launch.extend_from_slice(&3u16.to_le_bytes());
+	second_launch.extend_from_slice(&3u32.to_le_bytes());
+	second_launch.extend_from_slice(&(dynamic_name.len() as u16).to_le_bytes());
+	second_launch.extend_from_slice(dynamic_name);
+	second_launch.extend_from_slice(&0u32.to_le_bytes());
+	let warm_started = arch::tsc::now();
+	send_cap(&process_client, &second_launch, second_bootstrap, Rights::ALL).expect("second dynamic launch request");
+	sched::run_until_idle();
+	let second_reply = process_client.recv().expect("second dynamic launch reply");
+	assert_eq!(le_u32(&second_reply.bytes, 0), 3);
+	assert_eq!(second_reply.bytes[4], 1);
+	let second_process = second_reply.caps[0].object().into_any_arc().downcast::<Process>().expect("second dynamic launch capability is a Process");
+	assert_eq!(&second_report.recv().expect("second dynamic probe report").bytes, b"dynamic link ok");
+	let warm_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(warm_started));
+	let first_provider_frame = dynamic_process.address_space().unmap(0x2000_0000).expect("first liblsrt text page");
+	let second_provider_frame = second_process.address_space().unmap(0x2000_0000).expect("second liblsrt text page");
+	assert_eq!(first_provider_frame, second_provider_frame, "concurrent dynamic processes share one physical liblsrt text page");
+	crate::serial_println!("dynamic-warm-perf: {}ns two-process-private-pages={} two-process-shared-refs={}", warm_ns, dynamic_process.private_image_pages() + second_process.private_image_pages(), dynamic_process.shared_image_pages() + second_process.shared_image_pages());
+	process_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	sched::run_until_idle();
 }
 
 tagged_test!(config_service_serves_the_tree, [Service]);

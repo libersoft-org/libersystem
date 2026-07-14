@@ -82,6 +82,71 @@ shared-library work still measures aggregate image and resident-memory sharing: 
 remain the better choice for small tools, while duplicated runtime/protocol text across
 many concurrent processes can still justify `liblsrt`/`libproto` sharing.
 
+## System-image dynamic linking (2026-07-14)
+
+M123 adds an eager ELF64 module loader and an image-internal shared build. The bare-metal
+Rust targets support neither Cargo `dylib` nor `cdylib`, so the reproducible builder emits
+full-graph PIC rlibs and links their object members with the pinned `rust-lld -shared`.
+The x86 KVM integration launches an assembly-only staged `dyn_probe` through the real
+StorageService and ProcessService. ProcessService reads its `DT_NEEDED` DAG
+(`libpix.so`, `libproto.so`, `liblsrt.so`), the kernel eagerly applies RELA/PLT symbol
+relocations, and the probe calls exports from both leaf providers before its first IPC.
+
+Cold start is measured from sending the ProcessService `launch` request to receiving
+`dynamic link ok` from userspace. The immediately repeated launch keeps the first
+Process handle alive, so immutable provider pages are already in the physical-page
+cache; ProcessService still reads and parses all provider files from StorageService.
+
+| x86 KVM scenario | latency |
+| --- | ---: |
+| static governed `graphics_probe` in the focused runs | 2.108-2.373 ms |
+| dynamic probe, cold | 95.176-209.965 ms |
+| dynamic probe, providers resident | 96.569-211.950 ms |
+
+The repeated launch shows that the present bottleneck is dependency file I/O/parsing,
+not page allocation/copy. A future image-index or ProcessService immutable-byte cache is
+required before dynamic launch latency can compete with a small static tool.
+
+The dynamic process owns 16 private pages (RW/BSS/GOT plus stack) and references 149
+immutable shared pages. With two concurrent Process handles the test observes 32 private
+pages plus 298 shared references to the same 149 physical frames. Therefore:
+
+$$
+	ext{unshared}=2(16+149)=330\text{ pages},\qquad
+	ext{shared}=2(16)+149=181\text{ pages}
+$$
+
+The measured saving at $N=2$ is 149 pages, or 610,304 bytes. The test additionally
+compares the two processes' first `liblsrt` text mappings and requires the exact same
+physical frame. RW relocation targets remain private and text relocations are rejected.
+
+The complete first shared graph is atomized as `liblsrt`, `libproto`, `libpix`,
+`libinflate`, `libbmp`, `libpng`, `libkeys`, `libpcm`, and `libsurface`. Raw x86 release
+objects plus the probe total 799,648 bytes. After package staging strips non-runtime
+symbols, their payload is 644,904 bytes plus 320 bytes of archive entries; the factory
+`volume.pkg` is 12,193,577 bytes versus a computed 11,548,353-byte image with those
+entries removed.
+
+| x86 shared artifact | raw release ELF |
+| --- | ---: |
+| `liblsrt.so` | 414,920 B |
+| `libproto.so` | 317,200 B |
+| `libpix.so` | 7,552 B |
+| `libinflate.so` | 14,008 B |
+| `libbmp.so` | 10,224 B |
+| `libpng.so` | 13,952 B |
+| `libkeys.so` | 5,264 B |
+| `libpcm.so` | 4,080 B |
+| `libsurface.so` | 9,872 B |
+| `dyn_probe` | 2,576 B |
+
+Decision: keep the loader, tri-architecture shared graph, and staged dynamic probe, but
+do not broadly convert small tools yet. The earlier six representative static release
+ELFs total only 491,832 bytes, below even the runtime/protocol/pixel pilot graph, and
+their cold start is far lower. Large applications and many concurrent consumers can
+cross the RAM break-even; conversion remains per-target and measurement-gated rather
+than ideological.
+
 ## Kernel wake path (2026-07-06)
 
 Measured live in QEMU/KVM as the end-to-end round-trip of a shell command typed

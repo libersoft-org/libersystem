@@ -1,0 +1,9 @@
+[package]
+name = "dyn_probe"
+edition = "2024"
+description = "Assembly-only dynamic linking integration probe"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]

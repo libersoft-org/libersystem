@@ -2546,7 +2546,7 @@ cross-builds green.
 Status: DONE (2026-07-14).
 
 The first real consumer of M121, runnable from the console before any game
-exists: `view vol://system/photo.png` takes the screen, shows the image, and a
+exists: `imgview vol://system/photo.png` takes the screen, shows the image, and a
 keypress returns to the shell. Deliberately small - it proves the whole platform
 loop (grant -> acquire -> decode -> present -> input -> release) end to end.
 
@@ -2556,17 +2556,17 @@ loop (grant -> acquire -> decode -> present -> input -> release) end to end.
       offset and dimension off the file is bounded before allocation or use - a
       malformed or malicious image errors cleanly, never panics or OOMs
       (host-tested with corrupt fixtures, like the filesystem crates).
-- [x] The `view` tool: a governed ELF (`view <vol://...>`) with the manifest
+- [x] The `imgview` tool: a governed ELF (`imgview <vol://...>`) with the manifest
       grants `volumes + display + input-keys`; it decodes the image, scales it
       to fit the screen (reusing the M121 scaler contract), presents it, and
       serves keys - Esc/q to quit, arrows to pan when the image is larger than
       the screen, +/- zoom as a stretch goal. Exiting (or crashing) returns the
       console per the M121 guarantee.
 - [x] Tests: host decoder suites over golden and corrupt fixtures; a kernel test
-      that launches the staged `view` against a stand-in display service and
+      that launches the staged `imgview` against a stand-in display service and
       asserts the acquire/present/release + key-quit sequence; a live QEMU pass
       showing an actual image on the virtio-gpu scanout (screenshot-verified).
-- Done when: `view` opens a BMP and a PNG from any mounted volume fullscreen,
+- Done when: `imgview` opens a BMP and a PNG from any mounted volume fullscreen,
       pans/quits by keyboard, survives hostile image files, and returns the
       console on every exit path - the first end-to-end proof a sandboxed
       graphical application can live on this platform, tests green.
@@ -2574,7 +2574,7 @@ loop (grant -> acquire -> decode -> present -> input -> release) end to end.
       model (a viewer is the natural first picker client later), the NOTES
       "demo showing graphics capabilities" item this realizes.
 
-Result: `view` is a governed console-launched ELF with exactly
+Result: `imgview` is a governed console-launched ELF with exactly
 `volumes + display + input-keys`; it content-sniffs BMP/PNG, decodes into bounded
 B8G8R8X8 storage, fits to the acquired surface, switches oversized images to a
 native crop on arrow input, and exits on Esc/q with explicit release. Atomic no_std
@@ -2592,6 +2592,8 @@ console after each run, and the VM shut down cleanly.
 
 ## M123 - Shared system libraries (dynamic linking)
 
+Status: DONE (2026-07-14).
+
 Today every governed ELF statically links the whole userspace runtime and the
 generated protocol code, and once M121/M122 land, the surface helpers and image
 decoders join that duplication - N staged binaries times the same code is the
@@ -2601,14 +2603,14 @@ disk, one read-only copy in RAM, mapped into every process that links it. It is
 explicitly gated on the M121 size/startup measurement: if a release/opt build
 profile alone recovers most of the size, parts of this can wait.
 
-- [ ] The compatibility model, decided first and written down: Rust has no
+- [x] The compatibility model, decided first and written down: Rust has no
       stable ABI, so the SYSTEM IMAGE is the unit of compatibility - every
       shared library and every app in one image is built together by the pinned
       toolchain and shipped together (the OpenBSD-base model). No cross-image
       dylib promises, no library sonames pretending otherwise; per-app bundled
       third-party libraries (which would need a stable C-ABI boundary) stay
       with the phase-3 package format.
-- [ ] Loader support: dynamically linked apps and the libraries become PIE
+- [x] Loader support: dynamically linked apps and the libraries become PIE
       (`relocation-model=pic`); the kernel loader - or a small userspace
       dynamic linker, decide which - parses `PT_DYNAMIC`, applies relative +
       symbol relocations on all three architectures, and maps library
@@ -2617,7 +2619,7 @@ profile alone recovers most of the size, parts of this can wait.
       every other parser in this repository: every offset/count/index bounded
       before use, corrupt-ELF fixtures in the test suite, a malformed library
       fails the load cleanly and never panics the kernel.
-- [ ] The library set, atomized - one library, one concern, with real
+- [x] The library set, atomized - one library, one concern, with real
       dependencies between them, so an app links exactly what it uses and new
       formats arrive as new leaves instead of growing a monolith:
       `liblsrt` (the userspace runtime every binary carries - entry, syscalls,
@@ -2646,10 +2648,11 @@ profile alone recovers most of the size, parts of this can wait.
       helpers: acquire/present, damage, scaling; depends on libproto + libpix);
       `libkeys` (key-event decoding and, later, the keycode-to-glyph layout
       tables; depends on libproto); `libpcm` (PCM chunking/mixing helpers;
-      depends on libproto). Example: `view` links liblsrt + libproto + libpix +
+      a pure sample-format leaf with no service/proto dependency). Example:
+      `imgview` links liblsrt + libproto + libpix +
       libbmp + libpng + libsurface + libkeys and nothing else. Staged into the
       system image next to the binaries.
-- [ ] Conversion + measurement: convert the existing tools and services to
+- [x] Conversion + measurement: convert the existing tools and services to
       link the libraries dynamically, and record before/after numbers
       (per-binary size, total image size, cold-start latency, resident RAM
       across N concurrent processes) in docs/PERF.md - the numbers, not the
@@ -2665,6 +2668,32 @@ profile alone recovers most of the size, parts of this can wait.
       discipline extended to the dynamic loader, the NOTES size/start-delay
       items this closes, M121/M122 (the crates that become the first shared
       libraries).
+
+Result: the system-image compatibility/build/ownership contract is fixed in
+docs/DYNAMIC_LINKING.md. Because the bare targets support neither Rust `dylib`
+nor `cdylib`, the pinned builder emits full-graph PIC rlibs and links deterministic
+ET_DYN objects with `rust-lld`; the normal image build stages them under `lib/`.
+ProcessService resolves bounded canonical `DT_NEEDED` DAGs provider-first, while
+the kernel validates program/dynamic/string/hash/symbol/RELA/PLT tables, confines
+each module to a fixed slot, applies relative + eager symbol relocations for all
+three architectures, rejects W+X/text relocations/unresolved strong symbols, and
+rolls failed loads back before a thread can start. Exact immutable pages are cached
+by content and mapped read-only into every consumer; RW/BSS/GOT remain private.
+
+The staged graph contains `liblsrt`, `libproto`, `libpix`, extracted `libinflate`,
+`libbmp`, `libpng`, `libkeys`, `libpcm` and `libsurface`, with strict real dependency
+edges, plus a 2.6 KiB ET_DYN probe. The probe is built on x86_64/aarch64/riscv64;
+on x86 it launches through real StorageService + ProcessService, loads
+liblsrt/libproto/libpix, calls both shared exports and reports from userspace. Two
+concurrent launches map the same physical liblsrt text frame: 32 private pages plus
+149 unique shared pages instead of 330 unshared pages (610,304 B saved at N=2).
+Host ELF parser tests are 6/6; focused x86 memory/process is 37/37 and
+service/process/storage is 52/52. Both TCG targets build the full test image but retain
+their known pre-harness timeout (`last test: unknown`). Measurements in docs/PERF.md
+show 95-212 ms dynamic start versus 2.1-2.4 ms for the small static probe and a
+644,904 B stripped shared payload. Therefore the loader/pilot stay, but broad conversion
+of small tools is deliberately deferred; large/concurrent apps opt in when their measured
+RAM/image break-even justifies it. Future image/audio formats arrive as new leaf libraries.
 
 ## M124 - Audio player (streaming decoders over AudioService)
 

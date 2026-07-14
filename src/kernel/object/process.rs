@@ -13,11 +13,13 @@
 
 #![allow(dead_code)]
 
+use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::sync::Weak;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::address_space::AddressSpace;
 use super::dma_buffer::DmaBuffer;
@@ -79,6 +81,12 @@ pub struct Process {
 	// until termination removes its PTEs and returns the virtual range.
 	mapped_memory: SpinLock<Vec<Arc<MemoryObject>>>,
 	mapped_dma: SpinLock<Vec<Arc<DmaBuffer>>>,
+	// Eager system-image dynamic symbols registered by successfully relocated
+	// provider modules. The registry is process-local: dependency order and symbol
+	// visibility cannot leak between security domains or launches.
+	dynamic_symbols: SpinLock<BTreeMap<String, u64>>,
+	shared_image_pages: SpinLock<Vec<Arc<crate::elf::SharedPage>>>,
+	dynamic_modules: AtomicUsize,
 }
 
 impl Process {
@@ -88,7 +96,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), exited: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), exited: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(BTreeMap::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0) });
 		// Register with the Domain so a Domain kill can reach and terminate it.
 		process.domain.register_process(&process);
 		process
@@ -118,6 +126,37 @@ impl Process {
 	// stack, so they are freed when the process is dropped.
 	pub fn adopt_frames(&self, frames: Vec<u64>) {
 		self.user_frames.lock().extend(frames);
+	}
+
+	pub fn adopt_shared_pages(&self, pages: Vec<Arc<crate::elf::SharedPage>>) {
+		self.shared_image_pages.lock().extend(pages);
+	}
+
+	pub fn resolve_dynamic_symbol(&self, name: &str) -> Option<u64> {
+		self.dynamic_symbols.lock().get(name).copied()
+	}
+
+	pub fn register_dynamic_symbols(&self, symbols: &[(String, u64)]) -> bool {
+		let mut registry = self.dynamic_symbols.lock();
+		if registry.len().checked_add(symbols.len()).is_none_or(|len| len > 65_536) || symbols.iter().any(|(name, _)| name.is_empty() || name.len() > 255 || registry.contains_key(name)) {
+			return false;
+		}
+		for (name, address) in symbols {
+			registry.insert(name.clone(), *address);
+		}
+		true
+	}
+
+	pub fn reserve_dynamic_module(&self) -> bool {
+		self.dynamic_modules.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < 64).then_some(count + 1)).is_ok()
+	}
+
+	pub fn release_dynamic_module(&self) {
+		self.dynamic_modules.fetch_sub(1, Ordering::AcqRel);
+	}
+
+	pub fn has_dynamic_modules(&self) -> bool {
+		self.dynamic_modules.load(Ordering::Acquire) != 0
 	}
 
 	// Record `bytes` of mapped stack against the Domain's stack account (and this
@@ -237,6 +276,14 @@ impl Process {
 	// backing its image and stack).
 	pub fn memory_bytes(&self) -> u64 {
 		self.user_frames.lock().len() as u64 * crate::mem::frame::PAGE_SIZE
+	}
+
+	pub fn private_image_pages(&self) -> usize {
+		self.user_frames.lock().len()
+	}
+
+	pub fn shared_image_pages(&self) -> usize {
+		self.shared_image_pages.lock().len()
 	}
 
 	// The number of handles this process's table currently holds.

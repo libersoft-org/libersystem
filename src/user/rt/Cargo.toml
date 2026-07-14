@@ -7,6 +7,11 @@ name = "rt"
 edition = "2024"
 description = "Shared ring-3 userspace runtime: entry stub, syscall wrapper, panic handler, and the syscall/IPC/volume helpers"
 
+[features]
+default = ["proto-transport"]
+proto-transport = ["dep:proto"]
+shared-image = []
+
 [dependencies]
 # Shared kernel/userspace ABI constants (the single source of truth), re-exported
 # so the programs reach syscall numbers, error codes, rights, and the archive
@@ -15,7 +20,7 @@ abi = { path = "../../abi" }
 
 # Generated LSIDL wire codec: provides the `Transport` trait that `ChannelTransport`
 # implements over an rt channel, so the IPC transport lives in one place.
-proto = { path = "../../proto" }
+proto = { path = "../../proto", optional = true }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

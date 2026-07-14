@@ -63,8 +63,9 @@ extern "C" fn user_process_trampoline(ctx: u64) {
 pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Result<Arc<Process>, LoadError> {
 	let address_space = AddressSpace::create().ok_or(LoadError::OutOfMemory)?;
 	let mut frames: Vec<u64> = Vec::new();
+	let mut shared = Vec::new();
 
-	let entry = match elf::load_into(elf_image, &address_space, &mut frames) {
+	let entry = match elf::load_into(elf_image, &address_space, &mut frames, &mut shared) {
 		Ok(entry) => entry,
 		Err(err) => {
 			free_frames(frames);
@@ -80,6 +81,7 @@ pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<d
 	// From here on the Process owns the frames and frees them when it is dropped.
 	let process = Process::new(address_space, domain);
 	process.adopt_frames(frames);
+	process.adopt_shared_pages(shared);
 	process.charge_stack(USER_STACK_PAGES * PAGE_SIZE);
 	let handle = process.install(bootstrap, rights, badge);
 
@@ -95,8 +97,12 @@ pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<d
 // starts a thread: the userspace spawn path (process_create / process_load /
 // thread_create / thread_start) drives those as separate, capability-gated steps.
 pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadError> {
+	if process.has_dynamic_modules() && bootproto::elf::Elf::parse(elf_image).is_none_or(|image| image.image_type != bootproto::elf::ET_DYN) {
+		return Err(LoadError::BadImage);
+	}
 	let mut frames: Vec<u64> = Vec::new();
-	let entry = match elf::load_into(elf_image, process.address_space(), &mut frames) {
+	let mut shared = Vec::new();
+	let entry = match elf::load_resolved_into(elf_image, process.address_space(), &mut frames, &mut shared, &|name| process.resolve_dynamic_symbol(name)) {
 		Ok(entry) => entry,
 		Err(err) => {
 			free_frames(frames);
@@ -109,8 +115,37 @@ pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadE
 	}
 	// From here on the Process owns the frames and frees them when it is dropped.
 	process.adopt_frames(frames);
+	process.adopt_shared_pages(shared);
 	process.charge_stack(USER_STACK_PAGES * PAGE_SIZE);
 	Ok(entry)
+}
+
+// Map one ET_DYN dependency at the bias chosen by ProcessService. Unlike the main
+// image load this does not map a stack or create a thread; providers are loaded in
+// dependency order and the main SYS_PROCESS_LOAD remains the transaction's final step.
+pub fn load_module_into(process: &Process, elf_image: &[u8], bias: u64) -> Result<(), LoadError> {
+	if !process.reserve_dynamic_module() {
+		return Err(LoadError::BadImage);
+	}
+	let mut frames: Vec<u64> = Vec::new();
+	let mut shared = Vec::new();
+	let exports = match elf::load_module_into(elf_image, process.address_space(), &mut frames, &mut shared, bias, &|name| process.resolve_dynamic_symbol(name)) {
+		Ok(exports) => exports,
+		Err(err) => {
+			process.release_dynamic_module();
+			free_frames(frames);
+			return Err(err.into());
+		}
+	};
+	if !process.register_dynamic_symbols(&exports) {
+		process.release_dynamic_module();
+		elf::unmap_module(elf_image, process.address_space(), bias);
+		free_frames(frames);
+		return Err(LoadError::BadImage);
+	}
+	process.adopt_frames(frames);
+	process.adopt_shared_pages(shared);
+	Ok(())
 }
 
 // Build a process's ring-3 entry thread, suspended (off every run queue). The

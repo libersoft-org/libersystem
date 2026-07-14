@@ -84,8 +84,8 @@ name = "graphics_probe"
 path = "src/graphics_probe.rs"
 
 [[bin]]
-name = "view"
-path = "src/view.rs"
+name = "imgview"
+path = "src/imgview.rs"
 
 [[bin]]
 name = "usage"

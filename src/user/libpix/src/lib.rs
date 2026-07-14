@@ -39,6 +39,13 @@ pub struct BlitResult {
 	pub direct: bool,
 }
 
+// Image-internal dynamic-link smoke symbol. The explicit unmangled ABI is generated
+// and consumed within one system image; it is not a cross-release public contract.
+#[unsafe(no_mangle)]
+pub extern "C" fn liber_pix_probe() -> u64 {
+	0x4c49_4250_4958_4f4b
+}
+
 pub fn blit(source: Image<'_>, mut target: Target<'_>, damage: Rect, first: bool) -> Option<BlitResult> {
 	validate(&source, &target, damage)?;
 	let direct = source.width == target.width && source.height == target.height && target.bytes_per_pixel == 4 && target.red_shift == 16 && target.red_size == 8 && target.green_shift == 8 && target.green_size == 8 && target.blue_shift == 0 && target.blue_size == 8;

@@ -31,6 +31,12 @@ pub struct Image {
 	pub pixels: Vec<u8>,
 }
 
+impl Image {
+	pub fn as_pix(&self) -> libpix::Image<'_> {
+		libpix::Image { data: &self.pixels, width: self.width, height: self.height, pitch: self.pitch }
+	}
+}
+
 #[derive(Clone, Copy)]
 struct Header {
 	width: u32,

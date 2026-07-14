@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "libinflate"
+name = "abi"
 version = "0.0.0"
 
 [[package]]
@@ -11,9 +11,22 @@ name = "libpix"
 version = "0.0.0"
 
 [[package]]
-name = "libpng"
+name = "libsurface"
 version = "0.0.0"
 dependencies = [
- "libinflate",
  "libpix",
+ "proto",
+ "rt",
+]
+
+[[package]]
+name = "proto"
+version = "0.0.0"
+
+[[package]]
+name = "rt"
+version = "0.0.0"
+dependencies = [
+ "abi",
+ "proto",
 ]

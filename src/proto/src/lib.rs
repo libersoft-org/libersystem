@@ -11,6 +11,13 @@
 
 extern crate alloc;
 
+// Image-internal dynamic-link smoke symbol. Like the generated Rust ABI around it,
+// this is rebuilt with the complete system image and carries no cross-image promise.
+#[unsafe(no_mangle)]
+pub extern "C" fn liber_proto_probe() -> u64 {
+	0x5052_4f54_4f4f_4b21
+}
+
 pub mod codec;
 pub mod generated;
 pub mod system;

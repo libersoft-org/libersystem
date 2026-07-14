@@ -169,6 +169,11 @@ pub const SYS_CPU_NAME: u64 = 61;
 // Remove the calling process's DmaBuffer mapping. Shared DMA backings can be mapped
 // by a driver and a display server independently; each owner releases its own mapping.
 pub const SYS_DMA_BUFFER_UNMAP: u64 = 62;
+// Map one ET_DYN provider into a created process before its main image. `a0` is a
+// MANAGE-capable Process handle, `a1/a2` the caller's ELF bytes, and `a3` the
+// explicit page-aligned load bias selected by ProcessService's dependency order.
+// The module receives no stack or thread; SYS_PROCESS_LOAD finalizes the main image.
+pub const SYS_PROCESS_LOAD_MODULE: u64 = 63;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;

@@ -3,12 +3,5 @@
 version = 4
 
 [[package]]
-name = "libbmp"
-version = "0.0.0"
-dependencies = [
- "libpix",
-]
-
-[[package]]
-name = "libpix"
+name = "dyn_probe"
 version = "0.0.0"

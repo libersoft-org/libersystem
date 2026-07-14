@@ -12,6 +12,7 @@
 
 #![no_std]
 #![allow(dead_code)]
+#![cfg_attr(feature = "shared-image", no_builtins)]
 
 extern crate alloc;
 
@@ -32,18 +33,18 @@ mod heap;
 // ELF entry: the kernel drops us into ring 3 / EL0 here with the bootstrap channel
 // handle in the first argument register. Align the stack to the ABI boundary, then
 // call the runtime entry (keeping the bootstrap handle in that register).
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "shared-image")))]
 global_asm!(".text", ".global _start", "_start:", "and rsp, -16", "call __rt_start", "ud2");
 
 // aarch64: the kernel enters EL0 with the bootstrap handle in x0. SP is already
 // 16-aligned; clear the frame pointer and call the runtime entry.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(feature = "shared-image")))]
 global_asm!(".text", ".global _start", "_start:", "mov x29, xzr", "bl __rt_start", "brk #0");
 
 // riscv64: the kernel enters U-mode with the bootstrap handle in a0 and sp at the
 // user stack top. Align sp to the 16-byte ABI boundary, clear the frame pointer (s0),
 // and call the runtime entry (a0 preserved).
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(target_arch = "riscv64", not(feature = "shared-image")))]
 global_asm!(".text", ".global _start", "_start:", "andi sp, sp, -16", "mv s0, zero", "call __rt_start", "ebreak");
 
 // The runtime entry the assembly stub calls: verify the kernel's ABI matches the one
@@ -56,6 +57,7 @@ global_asm!(".text", ".global _start", "_start:", "andi sp, sp, -16", "mv s0, ze
 // and old ones never renumber, so SYS_ABI_CHECK and this comparison stay valid across
 // revisions; a match is silent, a mismatch prints a clear line and exits.
 #[unsafe(no_mangle)]
+#[cfg(not(feature = "shared-image"))]
 pub extern "C" fn __rt_start(bootstrap: u64) -> ! {
 	unsafe {
 		if sys_is_err(syscall(SYS_ABI_CHECK, ABI_VERSION as u64, 0, 0, 0)) {
@@ -66,6 +68,7 @@ pub extern "C" fn __rt_start(bootstrap: u64) -> ! {
 	}
 }
 
+#[cfg(not(feature = "shared-image"))]
 unsafe extern "C" {
 	// Each program defines this (a `#[no_mangle] pub extern "C" fn __user_main`); the
 	// runtime's `__rt_start` calls it once the ABI handshake passes.
@@ -79,6 +82,72 @@ fn panic(_info: &PanicInfo) -> ! {
 	}
 	loop {}
 }
+
+#[cfg(feature = "shared-image")]
+#[unsafe(no_mangle)]
+pub static __rust_no_alloc_shim_is_unstable_v2: u8 = 0;
+
+#[cfg(feature = "shared-image")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __rust_alloc_error_handler(_size: usize, _align: usize) -> ! {
+	exit()
+}
+
+#[cfg(feature = "shared-image")]
+#[unsafe(export_name = "_RNvCshfEkAwg4zv6_7___rustc35___rust_no_alloc_shim_is_unstable_v2")]
+pub static RUST_NO_ALLOC_SHIM_ALIAS: u8 = 0;
+
+#[cfg(feature = "shared-image")]
+#[unsafe(export_name = "_RNvCshfEkAwg4zv6_7___rustc26___rust_alloc_error_handler")]
+pub extern "C" fn rust_alloc_error_handler_alias(size: usize, align: usize) -> ! {
+	__rust_alloc_error_handler(size, align)
+}
+
+#[cfg(feature = "shared-image")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn liber_memcpy_impl(destination: *mut u8, source: *const u8, len: usize) -> *mut u8 {
+	unsafe {
+		for index in 0..len {
+			destination.add(index).write(source.add(index).read());
+		}
+	}
+	destination
+}
+
+#[cfg(feature = "shared-image")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn liber_memset_impl(destination: *mut u8, value: i32, len: usize) -> *mut u8 {
+	unsafe {
+		for index in 0..len {
+			destination.add(index).write(value as u8);
+		}
+	}
+	destination
+}
+
+#[cfg(feature = "shared-image")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn liber_memcmp_impl(left: *const u8, right: *const u8, len: usize) -> i32 {
+	unsafe {
+		for index in 0..len {
+			let left = left.add(index).read();
+			let right = right.add(index).read();
+			if left != right {
+				return left as i32 - right as i32;
+			}
+		}
+	}
+	0
+}
+
+#[cfg(all(feature = "shared-image", target_arch = "x86_64"))]
+global_asm!(".global memcpy", ".type memcpy,@function", "memcpy:", "jmp liber_memcpy_impl", ".global memset", ".type memset,@function", "memset:", "jmp liber_memset_impl", ".global memcmp", ".type memcmp,@function", "memcmp:", "jmp liber_memcmp_impl",);
+
+#[cfg(all(feature = "shared-image", target_arch = "aarch64"))]
+global_asm!(".global memcpy", ".type memcpy,%function", "memcpy:", "b liber_memcpy_impl", ".global memset", ".type memset,%function", "memset:", "b liber_memset_impl", ".global memcmp", ".type memcmp,%function", "memcmp:", "b liber_memcmp_impl",);
+
+#[cfg(all(feature = "shared-image", target_arch = "riscv64"))]
+global_asm!(".global memcpy", ".type memcpy,@function", "memcpy:", "tail liber_memcpy_impl", ".global memset", ".type memset,@function", "memset:", "tail liber_memset_impl", ".global memcmp", ".type memcmp,@function", "memcmp:", "tail liber_memcmp_impl",);
 
 // Issue a syscall: number in rax, up to four args in rdi/rsi/rdx/r10. The
 // `syscall` instruction clobbers rcx and r11; the kernel also uses r8/r9. The
@@ -1093,10 +1162,12 @@ pub unsafe fn connect_or_resolve(held: &mut u64, broker: u64, name: &[u8]) -> Op
 // alongside the bytes). Every userspace program that drives a generated service
 // client - the shell, the supervisor, the demo clients - reaches its service
 // through this one implementation, instead of each repeating the send/recv glue.
+#[cfg(feature = "proto-transport")]
 pub struct ChannelTransport {
 	pub chan: u64,
 }
 
+#[cfg(feature = "proto-transport")]
 impl proto::codec::Transport for ChannelTransport {
 	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
 		unsafe {
@@ -1129,6 +1200,7 @@ impl proto::codec::Transport for ChannelTransport {
 // NEXT call reconnects: the request may have been half-applied, so replaying it is
 // the caller's protocol-level decision, not the transport's - the honest limit of
 // connection-level transparency.
+#[cfg(feature = "proto-transport")]
 pub struct SvcTransport {
 	// The broker (bootstrap) channel resolves are sent over. Borrowed, never closed.
 	broker: u64,
@@ -1138,6 +1210,7 @@ pub struct SvcTransport {
 	chan: u64,
 }
 
+#[cfg(feature = "proto-transport")]
 impl SvcTransport {
 	// Wrap a bootstrap-granted channel: `chan` serves until it peer-closes, then the
 	// name takes over. `chan` 0 is valid (the first call resolves).
@@ -1167,6 +1240,7 @@ impl SvcTransport {
 	}
 }
 
+#[cfg(feature = "proto-transport")]
 impl proto::codec::Transport for SvcTransport {
 	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
 		unsafe {
@@ -1205,6 +1279,7 @@ impl proto::codec::Transport for SvcTransport {
 // A long-lived holder drives its generated client through a mutable borrow, so the
 // transport's reconnect state (the current channel) persists across calls:
 // `device::Client::new(&mut self.device)` each snapshot, one SvcTransport for life.
+#[cfg(feature = "proto-transport")]
 impl proto::codec::Transport for &mut SvcTransport {
 	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
 		(**self).call(request, request_handle)
@@ -1249,6 +1324,7 @@ pub unsafe fn unmap_object(handle: u64) {
 // our own handle is closed. The shared "hand bytes to a service" path (LogService's
 // journal flush, ConfigService's persisted tree). None when the object cannot be
 // created or mapped.
+#[cfg(feature = "proto-transport")]
 pub unsafe fn make_buffer(bytes: &[u8]) -> Option<proto::codec::Buffer> {
 	unsafe {
 		let obj: i64 = memory_object_create(bytes.len().max(1) as u64);
@@ -1518,6 +1594,33 @@ pub unsafe fn spawn(elf: &[u8], bootstrap: u64) -> i64 {
 	unsafe { spawn_in(elf, bootstrap, 0) }
 }
 
+// Map one dependency into a process returned by SYS_PROCESS_CREATE. ProcessService
+// calls this in topological order before loading the main image; no thread or stack is
+// created by a module load.
+pub unsafe fn process_load_module(process: u64, elf: &[u8], bias: u64) -> i64 {
+	unsafe { syscall(SYS_PROCESS_LOAD_MODULE, process, elf.as_ptr() as u64, elf.len() as u64, bias) as i64 }
+}
+
+pub unsafe fn process_create(domain: u64) -> i64 {
+	unsafe { syscall(SYS_PROCESS_CREATE, domain, 0, 0, 0) as i64 }
+}
+
+pub unsafe fn process_load_main(process: u64, elf: &[u8]) -> i64 {
+	unsafe { syscall(SYS_PROCESS_LOAD, process, elf.as_ptr() as u64, elf.len() as u64, 0) as i64 }
+}
+
+pub unsafe fn process_start(process: u64, entry: u64, bootstrap: u64) -> i64 {
+	unsafe {
+		let thread = syscall(SYS_THREAD_CREATE, process, entry, USER_STACK_TOP, bootstrap);
+		if sys_is_err(thread) {
+			return thread as i64;
+		}
+		let started = syscall(SYS_THREAD_START, thread, 0, 0, 0);
+		close(thread);
+		if sys_is_err(started) { started as i64 } else { process as i64 }
+	}
+}
+
 // Spawn a new ring-3 process from an ELF image into a Domain and start it, like
 // `spawn` but accounting the child to `domain` (0 = the spawner's own Domain). The
 // Domain handle must carry the MANAGE right; the child's image, stack and every
@@ -1527,29 +1630,21 @@ pub unsafe fn spawn(elf: &[u8], bootstrap: u64) -> i64 {
 // Process handle, or a negative error.
 pub unsafe fn spawn_in(elf: &[u8], bootstrap: u64, domain: u64) -> i64 {
 	unsafe {
-		let process: u64 = syscall(SYS_PROCESS_CREATE, domain, 0, 0, 0);
-		if sys_is_err(process) {
-			return process as i64;
+		let process = process_create(domain);
+		if process < 0 {
+			return process;
 		}
-		let entry: u64 = syscall(SYS_PROCESS_LOAD, process, elf.as_ptr() as u64, elf.len() as u64, 0);
-		if sys_is_err(entry) {
-			return entry as i64;
+		let process = process as u64;
+		let entry = process_load_main(process, elf);
+		if entry < 0 {
+			close(process);
+			return entry;
 		}
-		let thread: u64 = syscall(SYS_THREAD_CREATE, process, entry, USER_STACK_TOP, bootstrap);
-		if sys_is_err(thread) {
-			return thread as i64;
+		let started = process_start(process, entry as u64, bootstrap);
+		if started < 0 {
+			close(process);
 		}
-		let started: u64 = syscall(SYS_THREAD_START, thread, 0, 0, 0);
-		if sys_is_err(started) {
-			return started as i64;
-		}
-		// The caller drives the child through its Process handle; the thread handle is
-		// not returned, so close it here rather than leaking it. A leaked thread handle
-		// would hold the child's thread (and thus its Process and handle table) alive
-		// even after the child exited cleanly, so a peer watching the child's channels
-		// would never observe them close. The scheduler already holds the started thread.
-		close(thread);
-		process as i64
+		started
 	}
 }
 

@@ -4,3 +4,4 @@ edition = "2024"
 description = "Dependency-free bounded BMP decoder"
 
 [dependencies]
+libpix = { path = "../libpix" }

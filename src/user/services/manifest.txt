@@ -73,6 +73,20 @@ driver    virtio_gpu            drivers   volume
 driver    virtio_snd            drivers   volume
 driver    xhci                  drivers   volume
 
+# system-image shared libraries - built as PIC rlibs and linked to ET_DYN by
+# tools/build-shared.sh, then staged under lib/. Consumers remain static until the
+# M123 module loader and symbol registry are complete.
+library   liblsrt               rt        volume
+library   libproto              proto     volume
+library   libpix                libpix    volume
+library   libinflate            libinflate volume
+library   libbmp                libbmp    volume
+library   libpng                libpng    volume
+library   libkeys               libkeys   volume
+library   libpcm                libpcm    volume
+library   libsurface            libsurface volume
+dynamic   dyn_probe             dyn_probe volume
+
 # command-line tools - loaded from the system volume under bin/.
 tool      date       tools  volume
 tool      cat        tools  volume
@@ -90,7 +104,7 @@ tool      config     tools  volume
 tool      set        tools  volume
 tool      beep       tools  volume
 tool      graphics_probe tools volume
-tool      view       tools  volume
+tool      imgview    tools  volume
 tool      usage      tools  volume
 tool      ps         tools  volume
 tool      run        tools  volume

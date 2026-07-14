@@ -150,7 +150,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"config" => Some(granted("config", alloc::vec![Capability::Config])),
 		b"set" => Some(granted("set", alloc::vec![Capability::Config])),
 		b"beep" => Some(granted("beep", alloc::vec![Capability::Audio])),
-		b"view" => Some(granted("view", alloc::vec![Capability::Volumes, Capability::Display, Capability::InputKeys])),
+		b"imgview" => Some(granted("imgview", alloc::vec![Capability::Volumes, Capability::Display, Capability::InputKeys])),
 		b"play" => Some(granted("play", alloc::vec![Capability::Volumes, Capability::AudioStream])),
 		b"graphics_probe" => Some(granted("graphics_probe", alloc::vec![Capability::Display, Capability::InputKeys, Capability::AudioStream])),
 		b"usage" => Some(granted("usage", alloc::vec![Capability::Resource])),

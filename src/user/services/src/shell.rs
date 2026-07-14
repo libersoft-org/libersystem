@@ -698,7 +698,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"run", Shape::Args),
 	(b"set", Shape::Args),
 	(b"cat", Shape::Args),
-	(b"view", Shape::Args),
+	(b"imgview", Shape::Args),
 	(b"write", Shape::Args),
 	(b"rm", Shape::Args),
 	(b"mkdir", Shape::Args),

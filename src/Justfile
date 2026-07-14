@@ -13,6 +13,7 @@ libkeys_dir := "user/libkeys"
 libpcm_dir := "user/libpcm"
 libsurface_dir := "user/libsurface"
 libbmp_dir := "user/libbmp"
+libinflate_dir := "user/libinflate"
 libpng_dir := "user/libpng"
 abi_dir := "abi"
 tools_dir := "tools/lsidl-gen"
@@ -33,8 +34,18 @@ kernel_elf := kernel_dir / "target" / target / "debug" / "kernel"
 # default: build and run in QEMU
 default: run
 
+# build the first system-image shared-object pilot
+shared-libs:
+	tools/build-shared.sh x86_64-unknown-none liblsrt=rt libproto=proto libpix=libpix libinflate=libinflate libbmp=libbmp libpng=libpng libkeys=libkeys libpcm=libpcm libsurface=libsurface
+
+shared-libs-aarch64:
+	tools/build-shared.sh aarch64-unknown-none liblsrt=rt libproto=proto libpix=libpix libinflate=libinflate libbmp=libbmp libpng=libpng libkeys=libkeys libpcm=libpcm libsurface=libsurface
+
+shared-libs-riscv64:
+	tools/build-shared.sh riscv64gc-unknown-none-elf liblsrt=rt libproto=proto libpix=libpix libinflate=libinflate libbmp=libbmp libpng=libpng libkeys=libkeys libpcm=libpcm libsurface=libsurface
+
 # build the userspace programs that make up the init package
-user:
+user: shared-libs
 	cd {{user_dir}} && cargo build
 	cd {{services_dir}} && cargo build
 	cd {{storage_dir}} && cargo build
@@ -43,7 +54,7 @@ user:
 
 # build the userspace programs for aarch64 (the aarch64 kernel build.rs reads them
 # from each crate's aarch64-unknown-none target dir)
-user-aarch64:
+user-aarch64: shared-libs-aarch64
 	cd {{user_dir}} && cargo build --target aarch64-unknown-none
 	cd {{services_dir}} && cargo build --target aarch64-unknown-none
 	cd {{storage_dir}} && cargo build --target aarch64-unknown-none
@@ -191,7 +202,7 @@ run-aarch64 *displays: sdk user-aarch64
 
 # build the userspace programs for riscv64 (the riscv64 kernel build.rs reads them from
 # each crate's riscv64gc-unknown-none-elf target dir)
-user-riscv64:
+user-riscv64: shared-libs-riscv64
 	cd {{user_dir}} && cargo build --target riscv64gc-unknown-none-elf
 	cd {{services_dir}} && cargo build --target riscv64gc-unknown-none-elf
 	cd {{storage_dir}} && cargo build --target riscv64gc-unknown-none-elf
@@ -247,6 +258,7 @@ app-libs-test:
 	cargo test --manifest-path {{libkeys_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 	cargo test --manifest-path {{libpcm_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 	cargo test --manifest-path {{libbmp_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{libinflate_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 	cargo test --manifest-path {{libpng_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 
 # format all code (Rust via rustfmt, shell via shfmt)
@@ -258,6 +270,7 @@ fmt:
 	cd {{libpcm_dir}} && cargo fmt
 	cd {{libsurface_dir}} && cargo fmt
 	cd {{libbmp_dir}} && cargo fmt
+	cd {{libinflate_dir}} && cargo fmt
 	cd {{libpng_dir}} && cargo fmt
 	cd {{kernel_dir}} && cargo fmt
 	cd {{user_dir}} && cargo fmt
@@ -288,6 +301,7 @@ fmt-check:
 	cd {{libpcm_dir}} && cargo fmt --check
 	cd {{libsurface_dir}} && cargo fmt --check
 	cd {{libbmp_dir}} && cargo fmt --check
+	cd {{libinflate_dir}} && cargo fmt --check
 	cd {{libpng_dir}} && cargo fmt --check
 	cd {{kernel_dir}} && cargo fmt --check
 	cd {{user_dir}} && cargo fmt --check

@@ -1,0 +1,6 @@
+[package]
+name = "libinflate"
+edition = "2024"
+description = "Dependency-free bounded zlib and DEFLATE decoder"
+
+[dependencies]

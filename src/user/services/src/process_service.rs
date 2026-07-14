@@ -35,6 +35,123 @@ use rt::*;
 // Where the on-disk program binaries live on the system volume (staged there by the
 // factory-seed pipeline). A named program is loaded from `<PROGRAM_DIR><name>`.
 const PROGRAM_DIR: &str = "vol://system/bin/";
+const LIBRARY_DIR: &str = "vol://system/lib/";
+const LIBRARY_BASE: u64 = 0x2000_0000;
+const LIBRARY_SLOT_SIZE: u64 = 0x0100_0000;
+// Per-process dependency-graph limits. MAX_MODULES counts unique loaded libraries
+// (not every library installed in the image); MAX_DEPENDENCY_DEPTH bounds one DFS
+// branch. Together with `visiting` cycle detection they make hostile DT_NEEDED
+// graphs consume bounded storage reads, allocations, recursion and address slots.
+const MAX_MODULES: usize = 64;
+const MAX_DEPENDENCY_DEPTH: usize = 16;
+
+struct MappedFile {
+	handle: u64,
+	address: u64,
+	len: usize,
+}
+
+impl MappedFile {
+	unsafe fn open(storage: u64, path: String) -> Option<MappedFile> {
+		unsafe {
+			let mut client = volume::Client::new(ChannelTransport { chan: storage });
+			let result = match client.open(&OpenOpts { path, write: false, create: false })? {
+				Ok(result) if result.file != 0 && result.size != 0 => result,
+				_ => return None,
+			};
+			let len = match usize::try_from(result.size) {
+				Ok(len) => len,
+				Err(_) => {
+					close(result.file);
+					return None;
+				}
+			};
+			let address = match map_object(result.file) {
+				Some(address) => address,
+				None => {
+					close(result.file);
+					return None;
+				}
+			};
+			Some(MappedFile { handle: result.file, address, len })
+		}
+	}
+
+	unsafe fn bytes(&self) -> &[u8] {
+		unsafe { core::slice::from_raw_parts(self.address as *const u8, self.len) }
+	}
+}
+
+impl Drop for MappedFile {
+	fn drop(&mut self) {
+		unsafe {
+			unmap_object(self.handle);
+			close(self.handle);
+		}
+	}
+}
+
+struct Resolver {
+	storage: u64,
+	process: u64,
+	loaded: Vec<String>,
+	visiting: Vec<String>,
+}
+
+impl Resolver {
+	unsafe fn load(&mut self, name: &str, depth: usize) -> bool {
+		unsafe {
+			if self.loaded.iter().any(|loaded| loaded == name) {
+				return true;
+			}
+			if depth >= MAX_DEPENDENCY_DEPTH || self.loaded.len() >= MAX_MODULES || self.visiting.iter().any(|visiting| visiting == name) || !valid_library_name(name) {
+				return false;
+			}
+			self.visiting.push(String::from(name));
+			let loaded = (|| {
+				let file = MappedFile::open(self.storage, alloc::format!("{LIBRARY_DIR}{name}"))?;
+				let bytes = file.bytes();
+				let elf = bootproto::elf::Elf::parse(bytes)?;
+				if elf.image_type != bootproto::elf::ET_DYN {
+					return None;
+				}
+				let dynamic = elf.dynamic_info()??;
+				let dependencies = dependencies(&elf, &dynamic)?;
+				for dependency in dependencies {
+					if !self.load(&dependency, depth + 1) {
+						return None;
+					}
+				}
+				let bias = LIBRARY_BASE.checked_add((self.loaded.len() as u64).checked_mul(LIBRARY_SLOT_SIZE)?)?;
+				if process_load_module(self.process, bytes, bias) < 0 {
+					return None;
+				}
+				Some(())
+			})()
+			.is_some();
+			self.visiting.pop();
+			if loaded {
+				self.loaded.push(String::from(name));
+			}
+			loaded
+		}
+	}
+}
+
+fn valid_library_name(name: &str) -> bool {
+	name.len() >= 7 && name.len() <= 64 && name.starts_with("lib") && name.ends_with(".so") && !name.contains("..") && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn dependencies(elf: &bootproto::elf::Elf<'_>, dynamic: &bootproto::elf::DynamicInfo) -> Option<Vec<String>> {
+	let mut dependencies = Vec::new();
+	for name in elf.needed_names(dynamic)? {
+		if !valid_library_name(name) || dependencies.iter().any(|dependency: &String| dependency == name) {
+			return None;
+		}
+		dependencies.push(String::from(name));
+	}
+	Some(dependencies)
+}
 
 // The processes started so far (in order), the StorageService client the on-disk
 // binaries are loaded through, and the init package they fall back to.
@@ -73,30 +190,37 @@ impl<'a> Processes<'a> {
 // process handle, or a negative value if the binary cannot be read or spawned.
 unsafe fn spawn_from_storage(storage: u64, name: &str, bootstrap: u64) -> i64 {
 	unsafe {
-		let opts: OpenOpts = OpenOpts { path: alloc::format!("{PROGRAM_DIR}{name}"), write: false, create: false };
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
-		let result = match client.open(&opts) {
-			Some(Ok(r)) => r,
-			_ => return -1,
-		};
-		if result.file == 0 || result.size == 0 {
-			if result.file != 0 {
-				close(result.file);
-			}
-			return -1;
+		let Some(main) = MappedFile::open(storage, alloc::format!("{PROGRAM_DIR}{name}")) else { return -1 };
+		let bytes = main.bytes();
+		let Some(elf) = bootproto::elf::Elf::parse(bytes) else { return -1 };
+		let Some(dynamic) = elf.dynamic_info() else { return -1 };
+		let Some(dynamic) = dynamic else { return spawn(bytes, bootstrap) };
+		let Some(dependencies) = dependencies(&elf, &dynamic) else { return -1 };
+		if dependencies.is_empty() {
+			return spawn(bytes, bootstrap);
 		}
-		let mapped: u64 = match map_object(result.file) {
-			Some(base) => base,
-			None => {
-				close(result.file);
+		let process = process_create(0);
+		if process < 0 {
+			return process;
+		}
+		let process = process as u64;
+		let mut resolver = Resolver { storage, process, loaded: Vec::new(), visiting: Vec::new() };
+		for dependency in dependencies {
+			if !resolver.load(&dependency, 0) {
+				close(process);
 				return -1;
 			}
-		};
-		let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, result.size as usize);
-		let handle: i64 = spawn(elf, bootstrap);
-		unmap_object(result.file);
-		close(result.file);
-		handle
+		}
+		let entry = process_load_main(process, bytes);
+		if entry < 0 {
+			close(process);
+			return entry;
+		}
+		let started = process_start(process, entry as u64, bootstrap);
+		if started < 0 {
+			close(process);
+		}
+		started
 	}
 }
 

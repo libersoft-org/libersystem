@@ -1,7 +1,17 @@
+#![no_std]
+
+extern crate alloc;
+
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::Error;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+	Truncated,
+	Invalid,
+	Unsupported,
+	TooLarge,
+}
 
 const MAX_BITS: usize = 15;
 const LENGTH_BASE: [usize; 29] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
@@ -263,6 +273,9 @@ fn adler32(data: &[u8]) -> u32 {
 	}
 	b << 16 | a
 }
+
+#[cfg(test)]
+extern crate std;
 
 #[cfg(test)]
 mod tests {

@@ -16,6 +16,7 @@ target/
 *.iso
 *.bin
 *.log
+src/user/shared/
 
 # ...but the embedded console font is a required source asset, not a build output
 !src/term/src/unscii16.bin

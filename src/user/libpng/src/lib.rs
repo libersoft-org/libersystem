@@ -2,8 +2,6 @@
 
 extern crate alloc;
 
-mod inflate;
-
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -23,12 +21,29 @@ pub enum Error {
 	TooLarge,
 }
 
+impl From<libinflate::Error> for Error {
+	fn from(error: libinflate::Error) -> Error {
+		match error {
+			libinflate::Error::Truncated => Error::Truncated,
+			libinflate::Error::Invalid => Error::Invalid,
+			libinflate::Error::Unsupported => Error::Unsupported,
+			libinflate::Error::TooLarge => Error::TooLarge,
+		}
+	}
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Image {
 	pub width: u32,
 	pub height: u32,
 	pub pitch: u32,
 	pub pixels: Vec<u8>,
+}
+
+impl Image {
+	pub fn as_pix(&self) -> libpix::Image<'_> {
+		libpix::Image { data: &self.pixels, width: self.width, height: self.height, pitch: self.pitch }
+	}
 }
 
 struct Parsed {
@@ -52,7 +67,7 @@ enum Transparency {
 pub fn decode(data: &[u8]) -> Result<Image, Error> {
 	let png = parse(data)?;
 	let expected = filtered_len(&png)?;
-	let filtered = inflate::zlib(&png.compressed, expected)?;
+	let filtered = libinflate::zlib(&png.compressed, expected)?;
 	let pitch = png.width.checked_mul(4).ok_or(Error::TooLarge)?;
 	let output_len = (pitch as usize).checked_mul(png.height as usize).ok_or(Error::TooLarge)?;
 	let mut pixels = zeroed(output_len)?;
@@ -461,7 +476,7 @@ mod tests {
 		let parsed = parse(&encoded).unwrap();
 		let filtered_size = filtered_len(&parsed).unwrap();
 		assert_eq!(filtered_size, adam7.len());
-		let filtered = inflate::zlib(&parsed.compressed, filtered_size).unwrap();
+		let filtered = libinflate::zlib(&parsed.compressed, filtered_size).unwrap();
 		let mut pass_output = vec![0; 3 * 3 * 4];
 		decode_passes(&parsed, &filtered, &mut pass_output).unwrap();
 		let interlaced = decode(&encoded).unwrap();

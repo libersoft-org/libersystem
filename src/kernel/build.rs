@@ -151,6 +151,14 @@ fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 	manifest.join(format!("../user/{crate_dir}/target/{}/debug/{name}", user_target()))
 }
 
+fn user_shared_path(manifest: &Path, name: &str) -> PathBuf {
+	manifest.join(format!("../user/shared/{}/{}.so", user_target(), name))
+}
+
+fn user_dynamic_path(manifest: &Path, name: &str) -> PathBuf {
+	manifest.join(format!("../user/shared/{}/{}", user_target(), name))
+}
+
 // The userspace target triple matching the kernel's target arch.
 fn user_target() -> &'static str {
 	match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
@@ -299,9 +307,15 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			"tool" => format!("bin/{}", row.name),
 			"service" | "component" if row.stage == "volume" => format!("bin/{}", row.name),
 			"driver" if row.stage == "volume" => format!("drivers/{}", row.name),
+			"library" if row.stage == "volume" => format!("lib/{}.so", row.name),
+			"dynamic" if row.stage == "volume" => format!("bin/{}", row.name),
 			_ => continue,
 		};
-		let path: PathBuf = user_elf_path(&manifest, &row.crate_dir, &row.name);
+		let path: PathBuf = match row.kind.as_str() {
+			"library" => user_shared_path(&manifest, &row.name),
+			"dynamic" => user_dynamic_path(&manifest, &row.name),
+			_ => user_elf_path(&manifest, &row.crate_dir, &row.name),
+		};
 		println!("cargo:rerun-if-changed={}", path.display());
 		// Strip the ELF to its loadable image; fall back to the raw ELF when no
 		// `strip` supports the target (the host binutils cannot strip aarch64), so

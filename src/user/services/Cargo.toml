@@ -112,6 +112,7 @@ rt = { path = "../rt" }
 # Generated LSIDL bindings (the proto codec, clients, and servers) - LogService
 # serves them and the shell + ServiceManager speak them over the log channel.
 proto = { path = "../../proto" }
+bootproto = { path = "../../bootproto" }
 
 # The graphics-free terminal model (L2): the cell grid, escape parser, and text
 # serialization that ConsoleService renders to the framebuffer.
