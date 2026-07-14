@@ -2484,7 +2484,7 @@ layer exists.
   a small software mixer (at least 2 simultaneous streams plus the beep path
   reimplemented on top), so two apps can sound at once without exclusive
   device ownership.
-- [ ] Presentation performance, measured: the nearest-neighbor scaler in the
+- [x] Presentation performance, measured: the nearest-neighbor scaler in the
       present path, a per-frame ms/present measurement (the game budget is ~28 ms
       per frame end to end), dirty-rectangle presents for app surfaces (the M104
       machinery generalized), and a look at the blit hot path's build profile.

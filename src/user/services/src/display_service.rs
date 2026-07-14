@@ -12,10 +12,11 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use libpix::{Image, Rect, Target};
 use proto::codec::Buffer;
 use proto::system::display::{self, Service};
 use proto::system::display_admin::{self, Service as AdminService};
-use proto::system::{DisplayEvent, Error, PixelFormat, SurfaceInfo};
+use proto::system::{DisplayEvent, Error, PixelFormat, PresentationStats, SurfaceInfo};
 use rt::*;
 
 const MAX_DIM: u32 = 8192;
@@ -35,10 +36,6 @@ impl Scanout {
 	fn available(&self) -> bool {
 		self.addr != 0 && self.width != 0 && self.height != 0
 	}
-
-	fn is_b8g8r8x8(&self) -> bool {
-		self.fb.bytes_per_pixel == 4 && self.fb.red_shift == 16 && self.fb.red_size == 8 && self.fb.green_shift == 8 && self.fb.green_size == 8 && self.fb.blue_shift == 0 && self.fb.blue_size == 8
-	}
 }
 
 struct Surface {
@@ -49,6 +46,7 @@ struct Surface {
 	height: u32,
 	pitch: u32,
 	focus_proof: u64,
+	initialized: bool,
 }
 
 struct EventStream {
@@ -62,6 +60,24 @@ struct Client {
 	task: u64,
 }
 
+#[derive(Default)]
+struct PerfStats {
+	presents: u64,
+	direct_presents: u64,
+	scaled_presents: u64,
+	source_pixels: u64,
+	output_pixels: u64,
+	blit_ns: u64,
+	flush_ns: u64,
+	max_present_ns: u64,
+}
+
+impl PerfStats {
+	fn snapshot(&self) -> PresentationStats {
+		PresentationStats { presents: self.presents, direct_presents: self.direct_presents, scaled_presents: self.scaled_presents, source_pixels: self.source_pixels, output_pixels: self.output_pixels, blit_ns: self.blit_ns, flush_ns: self.flush_ns, max_present_ns: self.max_present_ns }
+	}
+}
+
 struct DisplayState {
 	scanout: Scanout,
 	surfaces: Vec<Surface>,
@@ -70,11 +86,12 @@ struct DisplayState {
 	kill_control: u64,
 	console: u64,
 	active: u64,
+	stats: PerfStats,
 }
 
 impl DisplayState {
 	fn new(scanout: Scanout, focus_control: u64, kill_control: u64) -> DisplayState {
-		DisplayState { scanout, surfaces: Vec::new(), events: Vec::new(), focus_control, kill_control, console: 0, active: 0 }
+		DisplayState { scanout, surfaces: Vec::new(), events: Vec::new(), focus_control, kill_control, console: 0, active: 0, stats: PerfStats::default() }
 	}
 
 	fn surface_index(&self, chan: u64) -> Option<usize> {
@@ -118,7 +135,7 @@ impl DisplayState {
 			return Err(Error::Again);
 		}
 		self.remove_surface(chan, false);
-		self.surfaces.push(Surface { chan, handle, addr, width, height, pitch, focus_proof: 0 });
+		self.surfaces.push(Surface { chan, handle, addr, width, height, pitch, focus_proof: 0, initialized: false });
 		if self.console == 0 && native {
 			self.console = chan;
 		}
@@ -139,9 +156,27 @@ impl DisplayState {
 		if chan != self.active {
 			return Ok(());
 		}
-		let direct: bool = surface.width == self.scanout.width && surface.height == self.scanout.height && self.scanout.is_b8g8r8x8();
-		self.blit(index, (x, y, width, height));
-		self.flush(if direct { (x, y, width, height) } else { (0, 0, self.scanout.width, self.scanout.height) })
+		let source_pixels: u64 = width as u64 * height as u64;
+		let start_ns: u64 = unsafe { clock_ns() };
+		let blit: libpix::BlitResult = self.blit(index, Rect { x, y, width, height });
+		let blit_done_ns: u64 = unsafe { clock_ns() };
+		let result: Result<(), Error> = self.flush((blit.rect.x, blit.rect.y, blit.rect.width, blit.rect.height));
+		let done_ns: u64 = unsafe { clock_ns() };
+		let blit_ns: u64 = blit_done_ns.saturating_sub(start_ns);
+		let flush_ns: u64 = done_ns.saturating_sub(blit_done_ns);
+		let total_ns: u64 = done_ns.saturating_sub(start_ns);
+		self.stats.presents = self.stats.presents.saturating_add(1);
+		if blit.direct {
+			self.stats.direct_presents = self.stats.direct_presents.saturating_add(1);
+		} else {
+			self.stats.scaled_presents = self.stats.scaled_presents.saturating_add(1);
+		}
+		self.stats.source_pixels = self.stats.source_pixels.saturating_add(source_pixels);
+		self.stats.output_pixels = self.stats.output_pixels.saturating_add(blit.pixels);
+		self.stats.blit_ns = self.stats.blit_ns.saturating_add(blit_ns);
+		self.stats.flush_ns = self.stats.flush_ns.saturating_add(flush_ns);
+		self.stats.max_present_ns = self.stats.max_present_ns.max(total_ns);
+		result
 	}
 
 	fn release(&mut self, chan: u64) -> Result<(), Error> {
@@ -284,56 +319,19 @@ impl DisplayState {
 		let Some(index) = self.surface_index(self.active) else { return };
 		let width: u32 = self.surfaces[index].width;
 		let height: u32 = self.surfaces[index].height;
-		self.blit(index, (0, 0, width, height));
-		let _ = self.flush((0, 0, self.scanout.width, self.scanout.height));
+		let blit: libpix::BlitResult = self.blit(index, Rect { x: 0, y: 0, width, height });
+		let _ = self.flush((blit.rect.x, blit.rect.y, blit.rect.width, blit.rect.height));
 	}
 
-	fn blit(&mut self, index: usize, damage: (u32, u32, u32, u32)) {
+	fn blit(&mut self, index: usize, damage: Rect) -> libpix::BlitResult {
+		let first: bool = !self.surfaces[index].initialized;
+		self.surfaces[index].initialized = true;
 		let surface: &Surface = &self.surfaces[index];
-		if surface.width == self.scanout.width && surface.height == self.scanout.height && self.scanout.is_b8g8r8x8() {
-			let (x, y, width, height) = damage;
-			let bytes: usize = width as usize * 4;
-			for row in y..y + height {
-				let src: *const u8 = (surface.addr + row as u64 * surface.pitch as u64 + x as u64 * 4) as *const u8;
-				let dst: *mut u8 = (self.scanout.addr + row as u64 * self.scanout.fb.pitch as u64 + x as u64 * 4) as *mut u8;
-				unsafe { core::ptr::copy_nonoverlapping(src, dst, bytes) };
-			}
-			return;
-		}
-
-		self.clear_scanout();
-		let sw: u64 = surface.width as u64;
-		let sh: u64 = surface.height as u64;
-		let dw: u64 = self.scanout.width as u64;
-		let dh: u64 = self.scanout.height as u64;
-		let scale_num: u64 = dw.saturating_mul(sh).min(dh.saturating_mul(sw));
-		let (out_w, out_h): (u32, u32) = if scale_num == dw.saturating_mul(sh) { (self.scanout.width, ((sh * dw) / sw).max(1) as u32) } else { (((sw * dh) / sh).max(1) as u32, self.scanout.height) };
-		let off_x: u32 = (self.scanout.width - out_w) / 2;
-		let off_y: u32 = (self.scanout.height - out_h) / 2;
-		for dy in 0..out_h {
-			let sy: u32 = ((dy as u64 * surface.height as u64) / out_h as u64) as u32;
-			for dx in 0..out_w {
-				let sx: u32 = ((dx as u64 * surface.width as u64) / out_w as u64) as u32;
-				let pixel: u32 = unsafe { ((surface.addr + sy as u64 * surface.pitch as u64 + sx as u64 * 4) as *const u32).read_unaligned() };
-				self.write_pixel(off_x + dx, off_y + dy, pixel);
-			}
-		}
-	}
-
-	fn clear_scanout(&self) {
-		let bytes: usize = self.scanout.fb.pitch as usize * self.scanout.height as usize;
-		unsafe { core::ptr::write_bytes(self.scanout.addr as *mut u8, 0, bytes) };
-	}
-
-	fn write_pixel(&self, x: u32, y: u32, bgrx: u32) {
-		let red: u32 = (bgrx >> 16) & 0xff;
-		let green: u32 = (bgrx >> 8) & 0xff;
-		let blue: u32 = bgrx & 0xff;
-		let packed: u32 = scale_channel(red, self.scanout.fb.red_size) << self.scanout.fb.red_shift | scale_channel(green, self.scanout.fb.green_size) << self.scanout.fb.green_shift | scale_channel(blue, self.scanout.fb.blue_size) << self.scanout.fb.blue_shift;
-		let dst: *mut u8 = (self.scanout.addr + y as u64 * self.scanout.fb.pitch as u64 + x as u64 * self.scanout.fb.bytes_per_pixel as u64) as *mut u8;
-		for byte in 0..self.scanout.fb.bytes_per_pixel as usize {
-			unsafe { dst.add(byte).write((packed >> (byte * 8)) as u8) };
-		}
+		let source_len: usize = surface.pitch as usize * surface.height as usize;
+		let target_len: usize = self.scanout.fb.pitch as usize * self.scanout.height as usize;
+		let source: &[u8] = unsafe { core::slice::from_raw_parts(surface.addr as *const u8, source_len) };
+		let target: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(self.scanout.addr as *mut u8, target_len) };
+		libpix::blit(Image { data: source, width: surface.width, height: surface.height, pitch: surface.pitch }, Target { data: target, width: self.scanout.width, height: self.scanout.height, pitch: self.scanout.fb.pitch, bytes_per_pixel: self.scanout.fb.bytes_per_pixel, red_shift: self.scanout.fb.red_shift, red_size: self.scanout.fb.red_size, green_shift: self.scanout.fb.green_shift, green_size: self.scanout.fb.green_size, blue_shift: self.scanout.fb.blue_shift, blue_size: self.scanout.fb.blue_size }, damage, first).expect("DisplayService validates surface and scanout bounds before blitting")
 	}
 
 	fn flush(&mut self, rect: (u32, u32, u32, u32)) -> Result<(), Error> {
@@ -400,6 +398,9 @@ impl DisplayState {
 			self.scanout.fb = fb;
 			self.scanout.width = width;
 			self.scanout.height = height;
+			for surface in &mut self.surfaces {
+				surface.initialized = false;
+			}
 			if old != 0 {
 				unsafe {
 					dma_buffer_unmap(old);
@@ -417,6 +418,9 @@ impl DisplayState {
 			if width != 0 && height != 0 && width <= self.scanout.fb.width && height <= self.scanout.fb.height {
 				self.scanout.width = width;
 				self.scanout.height = height;
+				for surface in &mut self.surfaces {
+					surface.initialized = false;
+				}
 				return true;
 			}
 			return false;
@@ -457,6 +461,7 @@ impl Service for DisplayCall<'_> {
 
 struct AdminCall<'a> {
 	clients: &'a mut Vec<Client>,
+	stats: &'a PerfStats,
 }
 
 impl AdminService for AdminCall<'_> {
@@ -473,6 +478,10 @@ impl AdminService for AdminCall<'_> {
 		};
 		self.clients.push(Client { chan: server, task });
 		Ok(client)
+	}
+
+	fn stats(&mut self) -> PresentationStats {
+		self.stats.snapshot()
 	}
 }
 
@@ -599,7 +608,7 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 				match recv_blocking(admin, &mut request) {
 					Received::Message { len, mut handle } => {
 						let mut reply_handle: u64 = 0;
-						let mut call = AdminCall { clients: &mut clients };
+						let mut call = AdminCall { clients: &mut clients, stats: &state.stats };
 						if let Some(n) = display_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
 							if !send_blocking(admin, &reply[..n], reply_handle) && reply_handle != 0 {
 								close(reply_handle);
@@ -702,14 +711,4 @@ fn valid_scanout(fb: &Framebuffer, width: u32, height: u32) -> bool {
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 	u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
-}
-
-fn scale_channel(value: u32, bits: u8) -> u32 {
-	if bits == 0 {
-		0
-	} else if bits >= 8 {
-		value
-	} else {
-		value >> (8 - bits)
-	}
 }

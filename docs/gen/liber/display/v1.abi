@@ -2,6 +2,7 @@ package liber:display@1
 enum pixel-format(b8g8r8x8=0)
 record surface-info(pixels:buffer,width:u32,height:u32,pitch:u32,format:pixel-format)
 record display-event(width:u32,height:u32)
+record presentation-stats(presents:u64,direct-presents:u64,scaled-presents:u64,source-pixels:u64,output-pixels:u64,blit-ns:u64,flush-ns:u64,max-present-ns:u64)
 interface display
 method display.acquire op=1 (width:u32:rights=,height:u32:rights=) -> result<surface-info, liber:base@1::error>
 method display.present op=2 (x:u32:rights=,y:u32:rights=,width:u32:rights=,height:u32:rights=) -> result<unit, liber:base@1::error>
@@ -10,3 +11,4 @@ method display.events op=4 () -> stream<display-event>
 method display.input-focus op=5 () -> result<handle<channel>, liber:base@1::error>
 interface display-admin
 method display-admin.bind op=1 (task:handle<liber:process@1::task>:rights=) -> result<handle<channel>, liber:base@1::error>
+method display-admin.stats op=2 () -> presentation-stats

@@ -130,6 +130,60 @@ impl DisplayEvent {
 	}
 }
 
+/// Cumulative DisplayService presentation work. `source-pixels` is the client damage
+/// area accepted; `output-pixels` is the number of scanout pixels written by the CPU,
+/// including a first-frame clear. Times use the monotonic nanosecond clock and split
+/// CPU blit/scale work from the synchronous virtio-gpu transfer+flush acknowledgement.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PresentationStats {
+	pub presents: u64,
+	pub direct_presents: u64,
+	pub scaled_presents: u64,
+	pub source_pixels: u64,
+	pub output_pixels: u64,
+	pub blit_ns: u64,
+	pub flush_ns: u64,
+	pub max_present_ns: u64,
+}
+
+impl PresentationStats {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_inner())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PresentationStats> {
+		PresentationStats::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u64(self.presents)?;
+		w.u64(self.direct_presents)?;
+		w.u64(self.scaled_presents)?;
+		w.u64(self.source_pixels)?;
+		w.u64(self.output_pixels)?;
+		w.u64(self.blit_ns)?;
+		w.u64(self.flush_ns)?;
+		w.u64(self.max_present_ns)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<PresentationStats> {
+		let presents = r.u64()?;
+		let direct_presents = r.u64()?;
+		let scaled_presents = r.u64()?;
+		let source_pixels = r.u64()?;
+		let output_pixels = r.u64()?;
+		let blit_ns = r.u64()?;
+		let flush_ns = r.u64()?;
+		let max_present_ns = r.u64()?;
+		Some(PresentationStats { presents, direct_presents, scaled_presents, source_pixels, output_pixels, blit_ns, flush_ns, max_present_ns })
+	}
+}
+
 /// One display connection owns at most one surface. `present` is synchronous: the
 /// service validates the damage rectangle, copies/scales that rectangle to its
 /// scanout and completes the device flush before replying; the client must not modify
@@ -524,9 +578,11 @@ pub mod display_admin {
 	use alloc::vec::Vec;
 
 	pub const OP_BIND: u16 = 1;
+	pub const OP_STATS: u16 = 2;
 
 	pub trait Service {
 		fn bind(&mut self, task: u64) -> Result<u64, Error>;
+		fn stats(&mut self) -> PresentationStats;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -574,6 +630,25 @@ pub mod display_admin {
 					w.u32(corr)?;
 					w.u8(0)?;
 					Error::Again.write(w)?;
+				}
+			}
+			OP_STATS => {
+				if r.has_handle() {
+					return None;
+				}
+				*request_handle = 0;
+				let result = service.stats();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					result.write(w)?;
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						*reply_handle = writer.handle();
+					}
+					return None;
 				}
 			}
 			_ => return None,
@@ -624,6 +699,31 @@ pub mod display_admin {
 				} else {
 					Err(Error::read(r)?)
 				})
+			})();
+			if decoded.is_none() || reader.has_handle() {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			decoded
+		}
+		pub fn stats(&mut self) -> Option<PresentationStats> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_STATS)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				Some(PresentationStats::read(r)?)
 			})();
 			if decoded.is_none() || reader.has_handle() {
 				if reply_handle != 0 {
@@ -779,6 +879,97 @@ impl DisplayEvent {
 	}
 }
 
+impl PresentationStats {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"presents\":");
+		let _ = write!(out, "{}", self.presents);
+		out.push(',');
+		out.push_str("\"direct-presents\":");
+		let _ = write!(out, "{}", self.direct_presents);
+		out.push(',');
+		out.push_str("\"scaled-presents\":");
+		let _ = write!(out, "{}", self.scaled_presents);
+		out.push(',');
+		out.push_str("\"source-pixels\":");
+		let _ = write!(out, "{}", self.source_pixels);
+		out.push(',');
+		out.push_str("\"output-pixels\":");
+		let _ = write!(out, "{}", self.output_pixels);
+		out.push(',');
+		out.push_str("\"blit-ns\":");
+		let _ = write!(out, "{}", self.blit_ns);
+		out.push(',');
+		out.push_str("\"flush-ns\":");
+		let _ = write!(out, "{}", self.flush_ns);
+		out.push(',');
+		out.push_str("\"max-present-ns\":");
+		let _ = write!(out, "{}", self.max_present_ns);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("presents=");
+		let _ = write!(out, "{}", self.presents);
+		out.push_str(", ");
+		out.push_str("direct-presents=");
+		let _ = write!(out, "{}", self.direct_presents);
+		out.push_str(", ");
+		out.push_str("scaled-presents=");
+		let _ = write!(out, "{}", self.scaled_presents);
+		out.push_str(", ");
+		out.push_str("source-pixels=");
+		let _ = write!(out, "{}", self.source_pixels);
+		out.push_str(", ");
+		out.push_str("output-pixels=");
+		let _ = write!(out, "{}", self.output_pixels);
+		out.push_str(", ");
+		out.push_str("blit-ns=");
+		let _ = write!(out, "{}", self.blit_ns);
+		out.push_str(", ");
+		out.push_str("flush-ns=");
+		let _ = write!(out, "{}", self.flush_ns);
+		out.push_str(", ");
+		out.push_str("max-present-ns=");
+		let _ = write!(out, "{}", self.max_present_ns);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 8);
+		crate::codec::cbor::text(out, "presents");
+		crate::codec::cbor::uint(out, self.presents as u64);
+		crate::codec::cbor::text(out, "direct-presents");
+		crate::codec::cbor::uint(out, self.direct_presents as u64);
+		crate::codec::cbor::text(out, "scaled-presents");
+		crate::codec::cbor::uint(out, self.scaled_presents as u64);
+		crate::codec::cbor::text(out, "source-pixels");
+		crate::codec::cbor::uint(out, self.source_pixels as u64);
+		crate::codec::cbor::text(out, "output-pixels");
+		crate::codec::cbor::uint(out, self.output_pixels as u64);
+		crate::codec::cbor::text(out, "blit-ns");
+		crate::codec::cbor::uint(out, self.blit_ns as u64);
+		crate::codec::cbor::text(out, "flush-ns");
+		crate::codec::cbor::uint(out, self.flush_ns as u64);
+		crate::codec::cbor::text(out, "max-present-ns");
+		crate::codec::cbor::uint(out, self.max_present_ns as u64);
+	}
+}
+
 #[cfg(test)]
 mod compat {
 	use super::*;
@@ -799,5 +990,78 @@ mod compat {
 		let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0];
 		assert_eq!(bytes, golden);
 		assert_eq!(DisplayEvent::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn presentation_stats_wire_is_stable() {
+		let sample = PresentationStats { presents: 7, direct_presents: 7, scaled_presents: 7, source_pixels: 7, output_pixels: 7, blit_ns: 7, flush_ns: 7, max_present_ns: 7 };
+		let bytes = sample.encode_vec().expect("encode");
+		let golden: &[u8] = &[
+			7,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			7,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			7,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			7,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			7,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			7,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			7,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			7,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+			0,
+		];
+		assert_eq!(bytes, golden);
+		assert_eq!(PresentationStats::decode(&bytes).unwrap(), sample);
 	}
 }

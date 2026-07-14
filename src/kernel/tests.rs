@@ -3138,11 +3138,20 @@ fn display_service_restores_the_console_surface() {
 		words.fill(pixel);
 	}
 
-	fn scanout_pixel(scanout: &DmaBuffer) -> u32 {
-		unsafe { ((mem::hhdm_offset() + scanout.frames()[0]) as *const u32).read_unaligned() }
+	fn set_surface_pixel(object: &MemoryObject, index: usize, pixel: u32) {
+		let base = mem::hhdm_offset() + object.frames()[0];
+		unsafe { ((base as *mut u32).add(index)).write_unaligned(pixel) };
 	}
 
-	fn acknowledge_present(gpu: &Channel, client: Option<(&Channel, u32)>) {
+	fn scanout_pixel_at(scanout: &DmaBuffer, x: usize, y: usize) -> u32 {
+		unsafe { (((mem::hhdm_offset() + scanout.frames()[0]) as *const u32).add(y * 4 + x)).read_unaligned() }
+	}
+
+	fn scanout_pixel(scanout: &DmaBuffer) -> u32 {
+		scanout_pixel_at(scanout, 0, 0)
+	}
+
+	fn acknowledge_present(gpu: &Channel, client: Option<(&Channel, u32)>) -> Message {
 		sched::run_until_idle();
 		let present = gpu.recv().expect("synchronous PRESENT reaches the gpu");
 		assert_eq!(&present.bytes[..7], b"PRESENT", "DisplayService uses the acknowledged present path");
@@ -3153,6 +3162,18 @@ fn display_service_restores_the_console_surface() {
 			assert_eq!(le_u32(&reply.bytes, 0), corr, "reply echoes correlation id");
 			assert_eq!(reply.bytes[4], 1, "display operation succeeds");
 		}
+		present
+	}
+
+	fn display_stats(admin: &Channel, corr: u32) -> [u64; 8] {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&2u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		admin.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("display stats request");
+		sched::run_until_idle();
+		let reply = admin.recv().expect("display stats reply");
+		assert_eq!(le_u32(&reply.bytes, 0), corr);
+		core::array::from_fn(|index| le_u64(&reply.bytes, 4 + index * 8))
 	}
 
 	let init = init_package_bytes().expect("init package module not found");
@@ -3224,9 +3245,24 @@ fn display_service_restores_the_console_surface() {
 	let replay_reply = app.recv().expect("replayed focus proof reply");
 	assert_eq!(replay_reply.bytes[4], 0, "focus proof is one-shot");
 	fill(&app_surface, 0x00aa_bbcc, 4);
-	app.send(request(2, 4, &[0, 0, 2, 2])).expect("app present");
-	acknowledge_present(&gpu_kernel, Some((&app, 4)));
+	app.send(request(2, 4, &[0, 0, 1, 1])).expect("app first present");
+	let first_scaled = acknowledge_present(&gpu_kernel, Some((&app, 4)));
+	assert_eq!((le_u32(&first_scaled.bytes, 7), le_u32(&first_scaled.bytes, 11), le_u32(&first_scaled.bytes, 15), le_u32(&first_scaled.bytes, 19)), (0, 0, 4, 4), "first present initializes the whole scanout");
 	assert_eq!(scanout_pixel(&scanout), 0x00aa_bbcc, "foreground app replaces the console");
+	assert_eq!(scanout_pixel_at(&scanout, 3, 3), 0x00aa_bbcc, "first small damage cannot leak the previous console outside its rectangle");
+	let before_damage = display_stats(&display_admin, 60);
+	set_surface_pixel(&app_surface, 0, 0x0055_6677);
+	app.send(request(2, 61, &[0, 0, 1, 1])).expect("incremental scaled damage");
+	let scaled_damage = acknowledge_present(&gpu_kernel, Some((&app, 61)));
+	assert_eq!((le_u32(&scaled_damage.bytes, 7), le_u32(&scaled_damage.bytes, 11), le_u32(&scaled_damage.bytes, 15), le_u32(&scaled_damage.bytes, 19)), (0, 0, 2, 2), "scaled damage maps to its conservative output rectangle");
+	assert_eq!(scanout_pixel_at(&scanout, 0, 0), 0x0055_6677);
+	assert_eq!(scanout_pixel_at(&scanout, 1, 1), 0x0055_6677);
+	assert_eq!(scanout_pixel_at(&scanout, 2, 2), 0x00aa_bbcc, "scaled damage leaves unaffected output pixels unchanged");
+	let after_damage = display_stats(&display_admin, 62);
+	assert_eq!(after_damage[2] - before_damage[2], 1, "one additional scaled present");
+	assert_eq!(after_damage[3] - before_damage[3], 1, "one source damage pixel");
+	assert_eq!(after_damage[4] - before_damage[4], 4, "only four scaled output pixels written");
+	assert!(after_damage[7] != 0, "present latency is measured in nanoseconds");
 	app.send(request(3, 5, &[])).expect("app release");
 	acknowledge_focus(&focus_input, b"CONSOLE");
 	acknowledge_present(&gpu_kernel, Some((&app, 5)));
@@ -3268,6 +3304,47 @@ fn display_service_restores_the_console_surface() {
 	acknowledge_focus(&focus_input, b"CONSOLE");
 	acknowledge_present(&gpu_kernel, None);
 	assert_eq!(scanout_pixel(&scanout), 0x0011_2233, "peer-close restores the console surface");
+
+	// Game-class benchmark geometry: replace the stand-in scanout with 1024x768,
+	// present a 320x200 software surface, then update a 32x20 source rectangle. The
+	// service's own monotonic counters separate CPU scaling from driver ACK latency.
+	let large_scanout = match DmaBuffer::create_in(&sched::root_domain(), 1024 * 768 * 4) {
+		Ok(scanout) => scanout,
+		Err(_) => panic!("large stand-in scanout"),
+	};
+	let large_fb = abi::Framebuffer { width: 1024, height: 768, pitch: 4096, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] };
+	let mut replacement = b"FBNEW".to_vec();
+	replacement.extend_from_slice(unsafe { core::slice::from_raw_parts(&large_fb as *const abi::Framebuffer as *const u8, core::mem::size_of::<abi::Framebuffer>()) });
+	replacement.extend_from_slice(&1024u32.to_le_bytes());
+	replacement.extend_from_slice(&768u32.to_le_bytes());
+	send_cap(&gpu_kernel, &replacement, large_scanout, Rights::MAP | Rights::TRANSFER).expect("large framebuffer replacement");
+	acknowledge_present(&gpu_kernel, None);
+	let resized = events.recv().expect("large resize event");
+	assert_eq!((le_u32(&resized.bytes, 4), le_u32(&resized.bytes, 8)), (1024, 768));
+
+	let benchmark = connect(&console_client);
+	let benchmark_surface = acquire(&benchmark, &focus_input, b"SET", 70, 320, 200);
+	fill(&benchmark_surface, 0x0033_6699, 320 * 200);
+	let before_full = display_stats(&display_admin, 71);
+	benchmark.send(request(2, 72, &[0, 0, 320, 200])).expect("full benchmark present");
+	acknowledge_present(&gpu_kernel, Some((&benchmark, 72)));
+	let after_full = display_stats(&display_admin, 73);
+	benchmark.send(request(2, 74, &[32, 20, 32, 20])).expect("damage benchmark present");
+	acknowledge_present(&gpu_kernel, Some((&benchmark, 74)));
+	let after_damage = display_stats(&display_admin, 75);
+	let full_blit_ns = after_full[5] - before_full[5];
+	let full_flush_ns = after_full[6] - before_full[6];
+	let full_pixels = after_full[4] - before_full[4];
+	let damage_blit_ns = after_damage[5] - after_full[5];
+	let damage_flush_ns = after_damage[6] - after_full[6];
+	let damage_pixels = after_damage[4] - after_full[4];
+	crate::serial_println!("display-perf: full blit={}ns flush={}ns pixels={} damage blit={}ns flush={}ns pixels={}", full_blit_ns, full_flush_ns, full_pixels, damage_blit_ns, damage_flush_ns, damage_pixels);
+	assert_eq!(full_pixels, 1024 * 768 + 1024 * 640, "first scaled frame clears scanout and fills centered output");
+	assert_eq!(damage_pixels, 103 * 64, "32x20 source damage maps to a 103x64 conservative output rectangle");
+	assert!(damage_blit_ns < full_blit_ns, "incremental scaled damage must cost less CPU time than a full first frame");
+	benchmark.send(request(3, 76, &[])).expect("benchmark release");
+	acknowledge_focus(&focus_input, b"CONSOLE");
+	acknowledge_present(&gpu_kernel, Some((&benchmark, 76)));
 }
 
 tagged_test!(audio_service_mixes_pcm_streams_with_backpressure, [Service, Audio]);

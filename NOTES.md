@@ -2,6 +2,7 @@
 
 - audio player (different formats)
 - audio recorder (microphone)
+- audio device selector tool (both input and output, when system has multiple sound devices)
 - web camera viewer / recorder
 - tests are taking too long after every small task - optimization needed
 - Can it run Doom?

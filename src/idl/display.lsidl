@@ -33,6 +33,21 @@ record display-event {
 	height: u32,
 }
 
+/// Cumulative DisplayService presentation work. `source-pixels` is the client damage
+/// area accepted; `output-pixels` is the number of scanout pixels written by the CPU,
+/// including a first-frame clear. Times use the monotonic nanosecond clock and split
+/// CPU blit/scale work from the synchronous virtio-gpu transfer+flush acknowledgement.
+record presentation-stats {
+	presents:        u64,
+	direct-presents: u64,
+	scaled-presents: u64,
+	source-pixels:   u64,
+	output-pixels:   u64,
+	blit-ns:         u64,
+	flush-ns:        u64,
+	max-present-ns:  u64,
+}
+
 /// One display connection owns at most one surface. `present` is synchronous: the
 /// service validates the damage rectangle, copies/scales that rectangle to its
 /// scanout and completes the device flush before replying; the client must not modify
@@ -59,4 +74,5 @@ interface display {
 /// bind themselves or another task; emergency revocation signals the bound task.
 interface display-admin {
 	@op(1) bind: func(task: handle<task>) -> result<handle<channel>, error>;
+	@op(2) stats: func() -> presentation-stats;
 }

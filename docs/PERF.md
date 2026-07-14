@@ -4,6 +4,45 @@ Measured numbers for the changes whose goal includes a before/after
 comparison. Methodology per entry; machine noise applies, so treat the times as
 orders, not precision instruments.
 
+## Application surface presentation (2026-07-14)
+
+Measured by the tagged x86 KVM display test (`cd src && just test-tags display`).
+The real userspace DisplayService drives a stand-in virtio-gpu channel with the same
+synchronous `PRESENT` / `OK` protocol as the driver. Its private typed counters read
+`SYS_CLOCK_MONO_NS` around (a) the CPU blit/scale and (b) the driver transfer+flush
+acknowledgement. The benchmark scales a Doom-class 320x200 B8G8R8X8 surface into a
+1024x768 scanout (1024x640 output, centered) and then presents a 32x20 source damage
+rectangle. Two debug-profile KVM runs establish the unoptimized range; the final column
+optimizes only the small shared `libpix` dependency at opt-level 2 while retaining debug
+information and unoptimized service control flow.
+
+| scenario | debug baseline | incremental damage, debug | incremental damage + optimized `libpix` |
+| --- | --- | --- | --- |
+| CPU blit/scale | 234-252 ms | 2.37-2.40 ms | 0.085 ms |
+| synchronous driver ACK | 0.045-0.065 ms | 0.028 ms | 0.018-0.033 ms |
+| scanout pixels written | 1,441,792 | 6,592 | 6,592 |
+
+The final full first frame is 8.41 ms, below the approximately 28 ms end-to-end budget
+for 35 FPS before application rendering is counted. Incremental scaled damage maps source
+bounds conservatively with floor/ceil and is 27.9x faster than its debug equivalent;
+compared with the old full-scanout behavior it writes 218x fewer pixels. A new surface's
+first present still clears/copies the full frame, regardless of the submitted damage, so
+pixels from the previous foreground client cannot leak outside a small first rectangle.
+Scanout resize invalidates this initialized state and forces another full safe repaint.
+
+Build-profile result: optimizing the whole `services` package was rejected because its
+test boot fell back from the 4x4 stand-in GPU backing to the boot framebuffer. Isolating
+the hot loop in host-tested `libpix` preserved behavior and changed the debug
+`display_service` ELF from 4,314,224 to 4,315,888 bytes (+1,664 B). Current comparison
+sizes (debug information included) are: ConsoleService 5,641,624 B, shell 5,470,632 B,
+and the governed graphics grant probe 3,653,528 B. These numbers reinforce the later
+shared-library/image-size work; they are not stripped deployment sizes.
+
+QEMU caveat: the stand-in ACK isolates CPU work and IPC scheduling but does not model a
+real host display refresh. Even a live virtio-gpu resource-flush acknowledgement means
+the host accepted the command, not that a VNC/SPICE client visibly scanned the pixel.
+Treat the latency as a regression metric and budget gate, not a physical-GPU prediction.
+
 ## Kernel wake path (2026-07-06)
 
 Measured live in QEMU/KVM as the end-to-end round-trip of a shell command typed

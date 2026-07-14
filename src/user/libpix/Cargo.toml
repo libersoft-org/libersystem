@@ -1,0 +1,6 @@
+[package]
+name = "libpix"
+edition = "2024"
+description = "Shared pixel vocabulary and bounded direct/scaled blitters"
+
+[dependencies]
