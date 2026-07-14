@@ -2648,6 +2648,70 @@ profile alone recovers most of the size, parts of this can wait.
       items this closes, M121/M122 (the crates that become the first shared
       libraries).
 
+## M124 - Audio player (streaming decoders over AudioService)
+
+The second real application-platform consumer, runnable from the console:
+`play vol://media/music.flac` incrementally reads and decodes an audio file,
+pushes bounded signed-i16 chunks through the M121 `audio-stream` capability,
+and never needs device access or enough memory to hold the whole track. The
+decoder graph follows the same rule as image support: one library per codec or
+container, shared `libpcm` vocabulary, real dependencies between leaves, and no
+growing "libaudio" monolith.
+
+- [ ] Uncompressed and ADPCM containers: `libwav` parses RIFF/WAVE and delegates
+  PCM 8/16/24/32-bit mono/stereo conversion to `libpcm`; a separate `libadpcm`
+  leaf decodes both IMA ADPCM and Microsoft ADPCM blocks used by WAV. `libaiff`
+  parses AIFF and AIFC PCM, including big-endian samples and bounded extended
+  sample-rate metadata. Container and codec boundaries remain explicit rather
+  than accumulating unrelated decoders in `libwav`.
+- [ ] Lossless compressed leaves: `libflac` implements native FLAC metadata and
+  frame/subframe decode, fixed/LPC prediction, Rice residuals and CRC;
+  `libwavpack` implements bounded WavPack lossless stream and block decoding.
+  Both are no_std parsers over a bounded reader and emit `libpcm` source frames;
+  neither allocates the whole file or input-controlled unbounded tables.
+- [ ] Common lossy leaves: `libmp3` implements MPEG-1/2 Layer III, including
+  bounded ID3 skip/metadata handling; `libogg` handles only Ogg page/packet
+  framing and `libvorbis` depends on it for Vorbis codebook, floor, residue and
+  MDCT decode. Each unsupported profile or version fails with a typed error,
+  never a partial misdecode. Opus, AAC and other codecs are outside M124.
+- [ ] Hostile-input discipline and conformance: every chunk length, sample rate,
+  channel count, frame size, seek offset, codebook/table count and output-frame
+  multiplication is checked before allocation or indexing; host suites use
+  public conformance/golden vectors plus truncated, corrupt, oversized and
+  randomized fixtures. Decoder output is compared by sample count + hash (and
+  exact samples where the format guarantees bit-exact decode); a malformed file
+  errors cleanly, never panics, hangs or OOMs.
+- [ ] The governed `play` tool: `play <vol://...>` receives exactly
+  `volumes + audio-stream`, sniffs by content (extension is only a hint), opens
+  the appropriate decoder, streams bounded chunks with AudioService
+  backpressure, prints compact metadata/progress, and exits cleanly at EOF or
+  Ctrl+C. Space pause/resume and left/right seek are follow-ups after the basic
+  foreground console path is reliable; seeking is exposed only by codecs whose
+  container has a bounded seek/index implementation.
+- [ ] Integration and performance: stand-in StorageService + AudioService kernel
+  tests prove read -> sniff -> decode -> PCM writes -> close for WAV PCM,
+  WAV IMA/MS ADPCM, AIFF/AIFC PCM, FLAC, MP3, Ogg Vorbis and WavPack; a second
+  test plays two files concurrently and verifies the M121 mixer rather than
+  exclusive device ownership. Live QEMU/SPICE playback is manually audible and
+  records decode CPU, first-sample latency, queue depth/underruns and peak memory
+  in docs/PERF.md. Decoder throughput must stay ahead of real time in the staged
+  release/opt profile on all supported sample rates.
+- Explicit non-goals: encoding/recording (microphone capture is a separate app and
+  AudioService input contract), DRM, proprietary WMA/RealAudio, patent-licensed
+  AAC/HE-AAC/E-AC-3, video containers, network radio, playlists/library indexing,
+  DSP/equalizer and a graphical player UI. CAF, ALAC, Opus, tracker modules and
+  Speex remain optional leaves triggered by a concrete file/workload.
+- Done when: `play` streams WAV PCM, WAV IMA/MS ADPCM, AIFF/AIFC PCM, FLAC, MP3,
+  Ogg Vorbis and WavPack from any mounted volume through its scoped
+  `audio-stream` grant, bounded memory and backpressure remain observable,
+  corrupt inputs fail safely, two players mix concurrently, Ctrl+C stops without
+  leaving the device stream open, and host + targeted kernel tests are green.
+- Concept: M121 (typed PCM streams and mixer), M123 (codec leaves become candidates
+  for system-image sharing only after size/RAM measurement), the Unix small-tool
+  model (`play` is one focused console program), capability sandboxing
+  (`volumes + audio-stream`, no ambient device/network), and the NOTES audio
+  player item this realizes.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
