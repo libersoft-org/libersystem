@@ -5,6 +5,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use libpcm::{Format, OUTPUT_RATE};
 use proto::codec::Buffer;
 use proto::system::Error;
 use proto::system::audio::{self, Service as AudioService};
@@ -12,10 +13,8 @@ use proto::system::audio_admin::{self, Service as AdminService};
 use proto::system::pcm_stream::{self, Service as PcmService};
 use rt::*;
 
-const OUTPUT_RATE: u32 = 48_000;
 const PERIOD_FRAMES: usize = 512;
 const PERIOD_BYTES: usize = PERIOD_FRAMES * 4;
-const MIN_RATE: u32 = 8_000;
 const MAX_QUEUED_FRAMES: usize = 4_096;
 const MAX_STREAMS: usize = 16;
 const MAX_TONES: usize = 8;
@@ -30,8 +29,7 @@ struct PendingWrite {
 
 struct Stream {
 	chan: u64,
-	rate: u32,
-	channels: u8,
+	format: Format,
 	samples: Vec<i16>,
 	read_frame: usize,
 	phase: u32,
@@ -41,7 +39,7 @@ struct Stream {
 
 impl Stream {
 	fn queued_frames(&self) -> usize {
-		self.samples.len() / self.channels as usize - self.read_frame
+		self.samples.len() / self.format.channels() as usize - self.read_frame
 	}
 
 	fn capacity(&self) -> usize {
@@ -49,23 +47,17 @@ impl Stream {
 	}
 
 	fn next_frame(&mut self) -> Option<(i16, i16)> {
-		if self.read_frame >= self.samples.len() / self.channels as usize {
+		if self.read_frame >= self.samples.len() / self.format.channels() as usize {
 			return None;
 		}
-		let offset: usize = self.read_frame * self.channels as usize;
-		let left: i16 = self.samples[offset];
-		let right: i16 = if self.channels == 2 { self.samples[offset + 1] } else { left };
-		self.phase += self.rate;
-		while self.phase >= OUTPUT_RATE {
-			self.phase -= OUTPUT_RATE;
-			self.read_frame += 1;
-		}
-		Some((left, right))
+		let frame = self.format.stereo_frame(&self.samples, self.read_frame)?;
+		self.format.advance(&mut self.phase, &mut self.read_frame);
+		Some(frame)
 	}
 
 	fn compact(&mut self) {
-		let consumed: usize = self.read_frame * self.channels as usize;
-		if consumed != 0 && (self.read_frame >= self.samples.len() / self.channels as usize || consumed >= 2_048) {
+		let consumed: usize = self.read_frame * self.format.channels() as usize;
+		if consumed != 0 && (self.read_frame >= self.samples.len() / self.format.channels() as usize || consumed >= 2_048) {
 			self.samples.drain(..consumed);
 			self.read_frame = 0;
 		}
@@ -77,26 +69,19 @@ impl Stream {
 			if self.closing || handle == 0 {
 				return Err(Error::Invalid);
 			}
-			let frame_bytes: u64 = self.channels as u64 * 2;
-			if data.len == 0 || data.len % frame_bytes != 0 {
-				return Err(Error::Invalid);
-			}
+			let requested: usize = self.format.frames_in(data.len).ok_or(Error::Invalid)?;
 			let info: ObjectInfo = unsafe { object_info(handle) }.ok_or(Error::Invalid)?;
 			if data.len > info.size {
 				return Err(Error::Invalid);
 			}
-			let requested: usize = usize::try_from(data.len / frame_bytes).map_err(|_| Error::Invalid)?;
 			let accepted: usize = requested.min(self.capacity());
 			if accepted == 0 {
 				return Err(Error::Again);
 			}
 			let mapped: u64 = unsafe { map_object(handle) }.ok_or(Error::Invalid)?;
-			let sample_count: usize = accepted * self.channels as usize;
-			let bytes: &[u8] = unsafe { core::slice::from_raw_parts(mapped as *const u8, sample_count * 2) };
-			self.samples.reserve(sample_count);
-			for sample in bytes.chunks_exact(2) {
-				self.samples.push(i16::from_le_bytes([sample[0], sample[1]]));
-			}
+			let byte_count: usize = accepted * self.format.frame_bytes() as usize;
+			let bytes: &[u8] = unsafe { core::slice::from_raw_parts(mapped as *const u8, byte_count) };
+			self.format.append_i16_le(bytes, accepted, &mut self.samples).ok_or(Error::Invalid)?;
 			unsafe { unmap_object(handle) };
 			Ok(accepted as u32)
 		})();
@@ -347,14 +332,12 @@ impl AudioService for RootCall<'_> {
 		if self.audio.snd == 0 {
 			return Err(Error::NotFound);
 		}
-		if !(MIN_RATE..=OUTPUT_RATE).contains(&rate) || !(1..=2).contains(&channels) {
-			return Err(Error::Invalid);
-		}
+		let format: Format = Format::new(rate, channels).ok_or(Error::Invalid)?;
 		if self.audio.streams.len() >= MAX_STREAMS {
 			return Err(Error::Again);
 		}
 		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
-		self.audio.streams.push(Stream { chan: server, rate, channels, samples: Vec::new(), read_frame: 0, phase: 0, closing: false, pending: None });
+		self.audio.streams.push(Stream { chan: server, format, samples: Vec::new(), read_frame: 0, phase: 0, closing: false, pending: None });
 		Ok(client)
 	}
 }

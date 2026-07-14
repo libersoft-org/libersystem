@@ -43,6 +43,45 @@ real host display refresh. Even a live virtio-gpu resource-flush acknowledgement
 the host accepted the command, not that a VNC/SPICE client visibly scanned the pixel.
 Treat the latency as a regression metric and budget gate, not a physical-GPU prediction.
 
+## Application library factoring and startup (2026-07-14)
+
+The first application-side libraries are single-concern no_std crates with real standing
+consumers: `libpix` (pixel vocabulary and bounded blitters, used by DisplayService),
+`libsurface` (typed DisplayService client plus RAII MemoryObject mapping, used by
+ConsoleService), `libkeys` (canonical HID usages and held-key edge state, used by
+InputService), and `libpcm` (format/frame validation, little-endian sample decoding,
+mono expansion and rate phase, used by AudioService). Pure helpers run nine host tests
+through `just app-libs-test`; libsurface lifecycle is exercised by the live console and
+display tagged tests.
+
+Cold start is measured in the permission integration scenario with the guest monotonic
+clock: immediately before `permission.run("graphics_probe")` sends its request until the
+governed process receives its process-bound display, key-only input and playback-only
+audio grants and writes its first stdout message. One x86 KVM debug-profile run measured
+1.347 ms. This includes ProcessService volume loading, ELF spawn, PermissionManager admin
+mint/bind calls, bootstrap transfers, entrypoint and first IPC output; it excludes shell
+parsing and terminal presentation.
+
+Representative ELF sizes compare the ordinary debug staged profile (debug information,
+mostly opt-level 0) with Cargo release builds. This is a build-profile decision aid, not
+an on-disk package measurement; release binaries are not yet what `just user` stages.
+
+| binary | debug ELF | release ELF | reduction |
+| --- | ---: | ---: | ---: |
+| DisplayService | 4,315,904 B | 45,920 B | 98.9% |
+| ConsoleService | 5,691,848 B | 204,096 B | 96.4% |
+| InputService | 4,394,512 B | 35,904 B | 99.2% |
+| AudioService | 4,383,920 B | 39,176 B | 99.1% |
+| shell | 5,470,632 B | 146,528 B | 97.3% |
+| graphics grant probe | 3,653,528 B | 20,208 B | 99.4% |
+| **total** | **27,910,344 B** | **491,832 B** | **98.2%** |
+
+The profile win is already two orders of magnitude, so a stripped/release staged-image
+profile should be measured before paying the loader/ABI cost of dynamic linking. Later
+shared-library work still measures aggregate image and resident-memory sharing: static release binaries may
+remain the better choice for small tools, while duplicated runtime/protocol text across
+many concurrent processes can still justify `liblsrt`/`libproto` sharing.
+
 ## Kernel wake path (2026-07-06)
 
 Measured live in QEMU/KVM as the end-to-end round-trip of a shell command typed

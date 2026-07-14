@@ -1,0 +1,7 @@
+[package]
+name = "libkeys"
+edition = "2024"
+description = "Canonical HID key usages and focus-safe key state"
+
+[dependencies]
+proto = { path = "../../proto" }

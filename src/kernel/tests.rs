@@ -244,7 +244,7 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 // probe_read, probe_summary, date_read, date_summary, request_read, request_summary,
 // cat_read): the file straight from the volume, then each component's proof and decisions
 // summary, then the bytes `cat` printed through the run launcher.
-fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
+fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, u64), &'static str> {
 	use object::channel::Channel;
 	use object::rights::Rights;
 
@@ -420,6 +420,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 		run.extend_from_slice(value);
 	}
 	run.extend_from_slice(&0u32.to_le_bytes());
+	let graphics_start = arch::tsc::now();
 	send_cap(&perm_client, &run, graphics_stdout, Rights::ALL)?;
 	sched::run_until_idle();
 	let run_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer graphics_probe run")?;
@@ -427,7 +428,9 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 		return Err("PermissionManager refused graphics_probe");
 	}
 	let graphics_read = graphics_output.recv().map_err(|_| "graphics_probe received incomplete grants")?;
-	Ok((expected, probe_read.bytes, probe_summary.bytes, date_read.bytes, date_summary.bytes, request_read.bytes, request_summary.bytes, cat_read.bytes, graphics_read.bytes))
+	let graphics_start_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(graphics_start));
+	crate::serial_println!("app-start-perf: graphics_probe={}ns", graphics_start_ns);
+	Ok((expected, probe_read.bytes, probe_summary.bytes, date_read.bytes, date_summary.bytes, request_read.bytes, request_summary.bytes, cat_read.bytes, graphics_read.bytes, graphics_start_ns))
 }
 
 // Build the component topology and run it to completion. A StorageService serves
@@ -4917,7 +4920,7 @@ fn permission_manager_sandboxes_a_component() {
 	// mark that refusal as dynamic - each component was given exactly its manifest and nothing
 	// more. Finally `cat`'s output must equal that file (the storage grant reaches it through
 	// the on-demand launcher).
-	let (expected, probe_read, probe_summary, date_read, date_summary, request_read, request_summary, cat_read, graphics_read) = run_permission_scenario().expect("the permission scenario should run");
+	let (expected, probe_read, probe_summary, date_read, date_summary, request_read, request_summary, cat_read, graphics_read, graphics_start_ns) = run_permission_scenario().expect("the permission scenario should run");
 	assert!(!expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(probe_read, expected, "the sandboxed component read its one granted file through the storage grant");
 	assert_eq!(probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
@@ -4942,6 +4945,7 @@ fn permission_manager_sandboxes_a_component() {
 	// manager forwarded it: the bytes it rendered must equal the file straight from the volume.
 	assert_eq!(cat_read, expected, "the cat tool printed its file argument through the storage grant the run launcher gave it, forwarded to the captured stdout");
 	assert_eq!(graphics_read.as_slice(), b"graphics grants\n", "the governed graphics probe received process-bound display, key-only input and playback-only audio grants");
+	assert!(graphics_start_ns != 0, "the governed app cold-start path is measured");
 }
 
 tagged_test!(component_host_runs_an_sdk_component, [Service, Slow]);

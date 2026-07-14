@@ -2416,6 +2416,8 @@ Result (M120 Phase 0/A/B complete, Phase C deliberately separate): LSIDL is now 
 
 ## M121 - Application graphics, raw input, and PCM audio (the app-platform layer)
 
+Status: DONE (2026-07-14).
+
 Applications are prisoners of the text console: the framebuffer belongs to
 ConsoleService, the keyboard arrives as cooked text bytes, and AudioService can
 only `beep`. This milestone builds the GENERAL application platform layer - a
@@ -2495,7 +2497,7 @@ layer exists.
       app's manifest is exactly "display + input-keys + audio-stream + volumes"
       and nothing else - the sandbox showcase: a game that can draw, hear keys,
       play sound, read its data file, and reach nothing else.
-- [ ] Shared application library groundwork: small single-concern app-side
+- [x] Shared application library groundwork: small single-concern app-side
       crates (the M123 split: pixel/image vocabulary, surface helpers,
       key-event decoding, PCM chunking - separate crates with dependencies,
       not one "libapp") so every graphical app does not reimplement the
@@ -2523,6 +2525,21 @@ layer exists.
       display/input/audio surfaces are typed capabilities, never ambient device
       access), the phase 4-5 compositor these contracts seed, M44/M47 (the gpu
       and layered-console work this builds on), M45 (the PCM half it completes).
+
+Result: DisplayService now owns the physical scanout and serves process-bound logical
+surfaces with synchronous damage presents, safe first-frame isolation, resize events,
+measured presentation counters and console restoration on release, crash or Ctrl+Alt+Esc
+(which SIG_KILLs the bound process). InputService provides focus-proven canonical HID
+down/up streams while synchronously suppressing the background cooked console; AudioService
+provides bounded typed PCM streams, rate conversion and a saturating multi-source mixer with
+beep on the same path. PermissionManager grants narrowly scoped display/input-keys/audio-stream
+connections and a governed probe proves the full launch path. Reusable app plumbing lives in
+single-concern libpix/libsurface/libkeys/libpcm crates. The 320x200-to-1024x768 scaler is
+8.41 ms under x86 KVM (32x20 damage 0.085 ms), governed cold start is 1.347 ms, and six
+representative release ELFs total 491,832 B versus 27,910,344 B debug. Validation: x86
+display 10/10 and integrated process/service/input/audio/display 51/51, proto 94/94,
+app-library host tests 9/9, full build/gen/fmt/diff clean, aarch64/riscv64 userspace
+cross-builds green.
 
 ## M122 - Image viewer (the first graphical application)
 

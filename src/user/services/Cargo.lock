@@ -7,8 +7,28 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "libkeys"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "libpcm"
+version = "0.0.0"
+
+[[package]]
 name = "libpix"
 version = "0.0.0"
+
+[[package]]
+name = "libsurface"
+version = "0.0.0"
+dependencies = [
+ "libpix",
+ "proto",
+ "rt",
+]
 
 [[package]]
 name = "proto"
@@ -26,7 +46,10 @@ dependencies = [
 name = "services"
 version = "0.0.0"
 dependencies = [
+ "libkeys",
+ "libpcm",
  "libpix",
+ "libsurface",
  "proto",
  "rt",
  "term",

@@ -9,6 +9,9 @@ drivers_dir := "user/drivers"
 usertools_dir := "user/tools"
 rt_dir := "user/rt"
 libpix_dir := "user/libpix"
+libkeys_dir := "user/libkeys"
+libpcm_dir := "user/libpcm"
+libsurface_dir := "user/libsurface"
 abi_dir := "abi"
 tools_dir := "tools/lsidl-gen"
 proto_dir := "proto"
@@ -236,15 +239,20 @@ STRIP={{strip}} boot/mkimage.sh iso {{kernel_elf}}
 img size="64M" strip="debug": build
 STRIP={{strip}} boot/mkimage.sh img {{kernel_elf}} {{size}}
 
-# host-test the pure no_std pixel vocabulary/blitter outside userspace build-std
-libpix-test:
+# host-test pure application-side pixel, key and PCM helpers
+app-libs-test:
 cargo test --manifest-path {{libpix_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+cargo test --manifest-path {{libkeys_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+cargo test --manifest-path {{libpcm_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 
 # format all code (Rust via rustfmt, shell via shfmt)
 fmt:
 cd {{abi_dir}} && cargo fmt
 cd {{rt_dir}} && cargo fmt
 cd {{libpix_dir}} && cargo fmt
+cd {{libkeys_dir}} && cargo fmt
+cd {{libpcm_dir}} && cargo fmt
+cd {{libsurface_dir}} && cargo fmt
 cd {{kernel_dir}} && cargo fmt
 cd {{user_dir}} && cargo fmt
 cd {{services_dir}} && cargo fmt
@@ -270,6 +278,9 @@ fmt-check:
 cd {{abi_dir}} && cargo fmt --check
 cd {{rt_dir}} && cargo fmt --check
 cd {{libpix_dir}} && cargo fmt --check
+cd {{libkeys_dir}} && cargo fmt --check
+cd {{libpcm_dir}} && cargo fmt --check
+cd {{libsurface_dir}} && cargo fmt --check
 cd {{kernel_dir}} && cargo fmt --check
 cd {{user_dir}} && cargo fmt --check
 cd {{services_dir}} && cargo fmt --check

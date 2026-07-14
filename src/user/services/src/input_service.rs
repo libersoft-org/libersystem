@@ -23,6 +23,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use libkeys::KeyState;
 use proto::system::input;
 use proto::system::input_admin::{self, Service as AdminService};
 use proto::system::{Error, KeyEvent, PointerEvent};
@@ -47,7 +48,7 @@ const RAW_LEN: usize = 5;
 // `subscribe` stream snapshots.
 struct Input {
 	recent: Vec<PointerEvent>,
-	held: Vec<u16>,
+	keys: KeyState,
 	focus_peer: u64,
 	kill_control: u64,
 	key_stream: Option<KeyStream>,
@@ -85,7 +86,7 @@ impl AdminService for AdminCall<'_> {
 
 impl Input {
 	fn new(kill_control: u64) -> Input {
-		Input { recent: Vec::new(), held: Vec::new(), focus_peer: 0, kill_control, key_stream: None, proof_nonce: 0 }
+		Input { recent: Vec::new(), keys: KeyState::new(), focus_peer: 0, kill_control, key_stream: None, proof_nonce: 0 }
 	}
 
 	// Record one mapped event, dropping the oldest once the ring is full.
@@ -97,24 +98,10 @@ impl Input {
 	}
 
 	fn record_key(&mut self, raw: &[u8]) {
-		if raw.len() != 3 || raw[2] > 1 {
-			return;
-		}
-		let code: u16 = u16::from_le_bytes([raw[0], raw[1]]);
-		let pressed: bool = raw[2] != 0;
-		let held: Option<usize> = self.held.iter().position(|held| *held == code);
-		if pressed {
-			if held.is_some() {
-				return;
-			}
-			self.held.push(code);
-		} else if let Some(index) = held {
-			self.held.swap_remove(index);
-		} else {
-			return;
-		}
-		self.send_key(KeyEvent { code, pressed });
-		if pressed && code == 0x29 && self.held.iter().any(|code| *code == 0xe0 || *code == 0xe4) && self.held.iter().any(|code| *code == 0xe2 || *code == 0xe6) {
+		let Some(event) = self.keys.record_raw(raw) else { return };
+		let emergency = self.keys.emergency_chord(&event);
+		self.send_key(event);
+		if emergency {
 			if self.kill_control != 0 {
 				unsafe {
 					let _ = send_blocking(self.kill_control, b"KILL", 0);
@@ -147,8 +134,8 @@ impl Input {
 
 	fn close_key_stream(&mut self, release_held: bool) {
 		if release_held {
-			for code in self.held.clone() {
-				if !self.send_key(KeyEvent { code, pressed: false }) {
+			for event in self.keys.synthetic_releases() {
+				if !self.send_key(event) {
 					break;
 				}
 			}

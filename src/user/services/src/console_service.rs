@@ -18,7 +18,8 @@
 
 use rt::*;
 
-use proto::system::{PixelFormat, SurfaceInfo, config, display, network, process};
+use libsurface::{Client as DisplayClient, Mapping, Rect};
+use proto::system::{config, network, process};
 
 // The shell's command vocabulary, shared with the shell itself: the line discipline
 // completes the command word on Tab, and the shell prints the matches on a double Tab.
@@ -26,19 +27,15 @@ mod commands;
 
 extern crate alloc;
 use alloc::boxed::Box;
-use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
 // The shared terminal stack from the `term` crate: the graphics-free grid model (L2,
 // `Screen` inside `Term`) and the framebuffer renderer (L3, `Term`) that draws it onto a
 // display `Surface`. This service supplies the userspace display backends - the boot
 // framebuffer and the virtio-gpu shared backing - and drives `Term`; the kernel boot
 // console shares the same `Term`.
-use term::{CELL_H, CELL_W, Echo, EchoBuf, Geometry, LD_HIST_MAX, Ld, Raster, RawSink, SCROLLBACK_ROWS, Surface, Term};
-
-type DisplayClient = Rc<RefCell<display::Client<ChannelTransport>>>;
+use term::{Echo, EchoBuf, Geometry, Ld, Raster, RawSink, Surface, Term, CELL_H, CELL_W, LD_HIST_MAX, SCROLLBACK_ROWS};
 
 // A DisplayService surface: the raster writes the client-owned MemoryObject and each
 // present synchronously copies the damage rectangle to the service-owned scanout.
@@ -52,7 +49,7 @@ impl Surface for DisplaySurface {
 		&self.raster
 	}
 	fn present(&self, x: u32, y: u32, w: u32, h: u32) {
-		let _ = self.client.borrow_mut().present(&x, &y, &w, &h);
+		let _ = libsurface::present(&self.client, Rect { x, y, width: w, height: h });
 	}
 }
 
@@ -231,7 +228,7 @@ struct Console {
 	fb: Framebuffer,
 	// The mapped client-owned surface and typed DisplayService connection. The event
 	// sub-channel carries host display resizes without sharing the physical scanout.
-	surface_handle: u64,
+	surface: Option<Mapping>,
 	has_fb: bool,
 	display: DisplayClient,
 	display_events: u64,
@@ -286,26 +283,6 @@ struct Console {
 	vocab: Option<Vec<Vec<u8>>>,
 }
 
-fn map_surface(info: SurfaceInfo) -> Option<(u64, u64, Framebuffer)> {
-	let handle: u64 = info.pixels.handle;
-	let expected: u64 = (info.pitch as u64).checked_mul(info.height as u64)?;
-	if handle == 0 || info.format != PixelFormat::B8g8r8x8 || info.width == 0 || info.height == 0 || info.pitch < info.width.checked_mul(4)? || info.pixels.len < expected {
-		if handle != 0 {
-			unsafe { close(handle) };
-		}
-		return None;
-	}
-	let addr: u64 = match unsafe { map_object(handle) } {
-		Some(addr) => addr,
-		None => {
-			unsafe { close(handle) };
-			return None;
-		}
-	};
-	let fb = Framebuffer { width: info.width, height: info.height, pitch: info.pitch, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] };
-	Some((handle, addr, fb))
-}
-
 // Present the foreground VT's freshly rendered frame to the display: a no-op on the boot
 // framebuffer (whose writes are visible immediately), a FLUSH to the gpu driver on the
 // virtio-gpu backing carrying just the repainted rectangle. Driven by the surface backend
@@ -353,20 +330,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 2. Acquire one native-size logical surface for all display VTs. DisplayService
 		//    owns the boot framebuffer or virtio-gpu scanout; this process maps only its
 		//    client surface and receives host resize events on a separate sub-channel.
-		let display: DisplayClient = Rc::new(RefCell::new(display::Client::new(ChannelTransport { chan: display_chan })));
-		let mapped: Option<(u64, u64, Framebuffer)> = if display_chan == 0 {
-			None
-		} else {
-			match display.borrow_mut().acquire(&0, &0) {
-				Some(Ok(info)) => map_surface(info),
-				_ => None,
-			}
-		};
-		let display_events: u64 = if display_chan == 0 { 0 } else { display.borrow_mut().events().unwrap_or(0) };
-		let (surface_handle, addr, fb): (u64, u64, Framebuffer) = mapped.unwrap_or((0, 0, Framebuffer::default()));
+		let display: DisplayClient = libsurface::connect(display_chan);
+		let surface: Option<Mapping> = if display_chan == 0 { None } else { libsurface::acquire(&display, 0, 0).and_then(Result::ok) };
+		let display_events: u64 = if display_chan == 0 { 0 } else { libsurface::events(&display).unwrap_or(0) };
+		let (addr, fb): (u64, Framebuffer) = surface.as_ref().map_or((0, Framebuffer::default()), |surface| (surface.addr(), surface.framebuffer()));
 		let cur_w: u32 = fb.width;
 		let cur_h: u32 = fb.height;
-		let has_fb: bool = surface_handle != 0;
+		let has_fb: bool = surface.is_some();
 		// The console's own ConfigService client (minted under the bounded wait) and
 		// VT 1's terminal policy: the scrollback and history depths are the config
 		// tree's, re-read at every later VT creation.
@@ -400,7 +370,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, fb, surface_handle, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
+		let mut console: Console = Console { addr, fb, surface, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
 		run(&mut console);
 	}
 }
@@ -1135,23 +1105,20 @@ unsafe fn handle_display_resize(console: &mut Console) {
 				return;
 			}
 		};
-		if display::events_read(&frame[..len], &mut handle).is_none() {
+		if libsurface::read_event(&frame[..len], &mut handle).is_none() {
 			if handle != 0 {
 				close(handle);
 			}
 			return;
 		}
-		let mapped: Option<(u64, u64, Framebuffer)> = match console.display.borrow_mut().acquire(&0, &0) {
-			Some(Ok(info)) => map_surface(info),
-			_ => None,
-		};
-		let Some((new_handle, new_addr, new_fb)) = mapped else {
+		let Some(new_surface) = libsurface::acquire(&console.display, 0, 0).and_then(Result::ok) else {
 			return;
 		};
-		let old_handle: u64 = console.surface_handle;
+		let new_addr: u64 = new_surface.addr();
+		let new_fb: Framebuffer = new_surface.framebuffer();
+		let old_surface: Option<Mapping> = console.surface.replace(new_surface);
 		console.addr = new_addr;
 		console.fb = new_fb;
-		console.surface_handle = new_handle;
 		console.cur_w = new_fb.width;
 		console.cur_h = new_fb.height;
 		console.has_fb = true;
@@ -1165,10 +1132,7 @@ unsafe fn handle_display_resize(console: &mut Console) {
 			}
 			resize_vt(console, vi, cols, rows);
 		}
-		if old_handle != 0 {
-			unmap_object(old_handle);
-			close(old_handle);
-		}
+		drop(old_surface);
 	}
 }
 

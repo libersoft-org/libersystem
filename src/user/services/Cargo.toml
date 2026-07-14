@@ -123,6 +123,9 @@ wasm = { path = "../../wasm" }
 # Shared pixel vocabulary and direct/scaled blitters. Kept as a separate crate so
 # graphical applications and DisplayService use exactly the same geometry semantics.
 libpix = { path = "../libpix" }
+libkeys = { path = "../libkeys" }
+libpcm = { path = "../libpcm" }
+libsurface = { path = "../libsurface" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

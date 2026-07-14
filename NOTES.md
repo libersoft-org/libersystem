@@ -3,11 +3,12 @@
 - audio player (different formats)
 - audio recorder (microphone)
 - audio device selector tool (both input and output, when system has multiple sound devices)
+- create image conversion tool
 - web camera viewer / recorder
 - tests are taking too long after every small task - optimization needed
 - Can it run Doom?
 - text selection by mouse lags horribly
-- when I press hold enter in shell, sometimes it writes "vol://system> vol://system>" on the same row (not just "vol://system>" on next row)
+- when I press and hold enter in shell, sometimes it writes "vol://system> vol://system>" on the same row (not just "vol://system>" on next row)
 - why there is a "help" command again when it was deleted already?
 - qemu - be on the same network like host
 - lsvol - add column - device
