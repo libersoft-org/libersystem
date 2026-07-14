@@ -10,9 +10,9 @@
 // descriptor read over a control transfer on the default endpoint. Every HID
 // device found among them is configured (its interrupt IN endpoint brought up,
 // its report descriptor read and parsed) and served interrupt-driven for the
-// life of the system: keyboard and Consumer-page changes feed the interactive
-// console through the shared keys module, exactly like the virtio-input
-// keyboard, and a pointing device's reports feed InputService as normalized
+// life of the system: keyboard changes feed both canonical HID transitions to
+// InputService and cooked text to the console through the shared keys module,
+// Consumer-page changes feed the cooked path, and pointing reports feed normalized
 // pointer events, exactly like the virtio-input pointer. Bring-up itself is
 // synchronous and polled - commands and transfers one at a time, completions
 // reaped off the event ring - matching the polled virtio-blk/gpu drivers.

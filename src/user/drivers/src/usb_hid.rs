@@ -3,9 +3,10 @@
 // A HID interface found during enumeration is configured here (its interrupt IN
 // endpoint brought up, its report descriptor read and parsed into a `hid::Layout`),
 // held in the `Hids` set the whole driver threads through its waits, and served:
-// each completed input report diffs through the layout into key events for the
-// shared keys module and folds into the normalized pointer state sent to
-// InputService. The controller plumbing (rings, transfers, recovery) stays in
+// each completed input report diffs through the layout into cooked events for the
+// shared keys module plus canonical keyboard-page transitions for InputService,
+// and folds pointer fields into the normalized state sent there. The controller
+// plumbing (rings, transfers, recovery) stays in
 // xhci.rs; the report-descriptor parser is the `hid` module.
 
 use alloc::vec::Vec;

@@ -1,8 +1,9 @@
-// ConsoleService - the userspace terminal: it owns the framebuffer and renders text.
+// ConsoleService - the userspace terminal rendered into a DisplayService surface.
 //
 // The kernel prints the boot log to the framebuffer and then hands the display over:
-// `framebuffer_map` maps the pixel buffer into this service and stops the kernel
-// console drawing. From then on ConsoleService owns rendering. It serves one client
+// DisplayService owns the physical framebuffer and gives this service a logical surface;
+// attaching console input stops kernel drawing. ConsoleService owns text rendering. It
+// serves one client
 // (the shell) over a bidirectional console channel: the client writes output bytes
 // (which ConsoleService renders to the framebuffer, interpreting the ANSI escapes,
 // and mirrors to the serial port) and reads input bytes (the keystrokes the kernel's

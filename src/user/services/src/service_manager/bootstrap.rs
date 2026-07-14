@@ -776,8 +776,9 @@ unsafe fn bootstrap_config_service(manager_side: u64, storage_client: u64, confi
 // end of a fresh pointer-forward channel - InputService forwards every raw pointer
 // event over it to ConsoleService, whose end is kept in `*pointer_console` for
 // ConsoleService's own bootstrap (it starts later, since it declares input_service as
-// a dependency). The order matches InputService's receive order: SERVE, INPUT,
-// INPUT2, FORWARD.
+// a dependency). "KEYS" carries the merged keyboard-driver consumer, while private
+// "FOCUS" and "KILL" pairs connect InputService to DisplayService. The order matches
+// InputService's receive order: SERVE, INPUT, INPUT2, FORWARD, KEYS, FOCUS, KILL.
 unsafe fn bootstrap_input(manager_side: u64, input_raw: u64, usb_pointer: u64, raw_keys: u64, input_client: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64) -> bool {
 	unsafe {
 		if !bootstrap_serve(manager_side, input_client) {

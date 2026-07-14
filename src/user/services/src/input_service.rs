@@ -1,16 +1,18 @@
-// InputService - the userspace pointer-input service.
+// InputService - capability-scoped pointer and raw-key input.
 //
 // ServiceManager starts this program from the init package and hands it a bootstrap
 // channel, then over it a "SERVE" channel (the one clients reach it on), an "INPUT"
 // and an "INPUT2" channel (the raw pointer-event streams the virtio_input pointer
 // driver and the xhci driver feed it; a handle is 0 when that pointer source is
-// absent this boot), and a "FORWARD" channel
-// (ConsoleService's pointer sink, which drives selection / scrollback / mouse reports).
+// absent this boot), a merged raw-key "KEYS" channel, private "FOCUS" / "KILL"
+// channels to DisplayService, and a "FORWARD" channel to ConsoleService.
 // The drivers send normalized [x u16][y u16][buttons u8][wheel i8] events; InputService
 // maps each to the text-cell grid and keeps a bounded ring of the recent ones for the
-// typed `subscribe` API, and forwards the raw bytes to ConsoleService verbatim. Over the
-// serve channel clients speak the generated `liber:system` Input bindings: `subscribe`
-// hands back a wait-drained event stream of that snapshot (the bounded-snapshot form).
+// typed `subscribe` API, and forwards the raw bytes to ConsoleService. Keyboard drivers
+// send canonical HID usage transitions in parallel with the cooked console path;
+// `subscribe-keys` accepts only a one-shot proof minted for the active display surface,
+// streams transitions live without allowing client backpressure to stall input, and
+// synchronously suppresses the cooked console while the graphical surface has focus.
 //
 // When the supervisor that started it drops the bootstrap channel (no clients this
 // boot), the service exits.

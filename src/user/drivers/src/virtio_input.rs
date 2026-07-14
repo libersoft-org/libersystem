@@ -7,9 +7,9 @@
 // the event virtqueue (queue 0), posts a pool of device-writable event buffers, and
 // then blocks on the Interrupt. Each time the keyboard interrupts it reads the ISR
 // register (deasserting the level-triggered line), drains the virtio_input_event
-// records the device filled, translates key presses to characters, feeds them to
-// the kernel console (driving the interactive shell), re-posts the buffers, and
-// re-arms the interrupt.
+// records the device filled, translates key presses to characters for the cooked
+// kernel console and in parallel maps physical press/release transitions to canonical
+// USB HID usages for InputService, then re-posts the buffers and re-arms the interrupt.
 
 #![no_std]
 #![no_main]

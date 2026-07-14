@@ -154,7 +154,8 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 // it with its device's MMIO capability. Their control / event channels are handed back for
 // NetworkService, ConsoleService, AudioService, InputService and the USB StorageService
 // instance, plus the xHCI driver's USB bus query channel (for the `lsusb` inventory) and
-// its pointer-event channel (a USB pointing device, folded by InputService).
+// its pointer-event channel (a USB pointing device, folded by InputService), and the
+// merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64) {
 	unsafe {
