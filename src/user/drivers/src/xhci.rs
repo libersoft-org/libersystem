@@ -34,7 +34,7 @@ use proto::system::usb;
 use proto::system::{Error as UsbError, UsbDevice as UsbEntry};
 use rt::*;
 
-use crate::usb_hid::{Hids, PTR_SINK, configure_hid, handle_hid_event, post_reports};
+use crate::usb_hid::{Hids, KEY_SINK, PTR_SINK, configure_hid, handle_hid_event, post_reports};
 use crate::usb_storage::{STATUS_ERR, Storage, configure_storage, reply_block, serve_block_request};
 
 // Capability registers (at the mapped BAR base).
@@ -361,6 +361,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Message { len, handle } if handle != 0 && len >= 3 && &buf[..3] == b"IRQ" => handle,
 			_ => exit(),
 		};
+		let key_sink: u64 = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } if len >= 4 && &buf[..4] == b"KEYS" => handle,
+			_ => 0,
+		};
+		KEY_SINK.store(key_sink, Ordering::Relaxed);
 		// map the controller's register file.
 		let base: u64 = syscall(SYS_DEVICE_MEMORY_MAP, device_handle, 0, 0, 0);
 		if sys_is_err(base) {

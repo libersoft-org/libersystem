@@ -55,6 +55,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut usb_client: u64 = 0;
 		let mut usbq_client: u64 = 0;
 		let mut usb_pointer: u64 = 0;
+		let mut raw_keys: u64 = 0;
 		launch_boot_drivers(&package, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client);
 
 		// 3. report in once the disks are bound, transferring the block service channel up
@@ -74,7 +75,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		loop {
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
-					launch_volume_drivers(handle, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer);
+					launch_volume_drivers(handle, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys);
 					if handle != 0 {
 						close(handle);
 					}
@@ -87,6 +88,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// the xhci driver's pointer-event channel (a USB pointing device;
 					// InputService folds it alongside the virtio pointer's).
 					send_blocking(bootstrap, b"INPUT2", usb_pointer);
+					send_blocking(bootstrap, b"KEYS", raw_keys);
 				}
 				Received::Message { .. } => {
 					send_blocking(bootstrap, b"DeviceManager: stopped", 0);
@@ -128,7 +130,7 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 			};
 			let mut handle: u64 = 0;
 			let mut dm_chan: u64 = 0;
-			if launch_one(i, &info, elf, driver_name, buf, &mut handle, &mut dm_chan) {
+			if launch_one(i, &info, elf, driver_name, 0, buf, &mut handle, &mut dm_chan) {
 				// the first virtio-blk disk is the writable system volume; a second is routed
 				// up separately as the read-only FAT media volume, a third as the read-only
 				// ISO9660 volume, a fourth as the read-only UDF volume.
@@ -154,8 +156,13 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 // instance, plus the xHCI driver's USB bus query channel (for the `lsusb` inventory) and
 // its pointer-event channel (a USB pointing device, folded by InputService).
 // Tracks each device's state and prints a summary.
-unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64) {
+unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64) {
 	unsafe {
+		let (key_producer, key_consumer): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return,
+		};
+		*raw_keys = key_consumer;
 		let count: u64 = device_count();
 		// per-device state, sized by what the kernel actually discovered - the bus is
 		// the only bound, never an artificial cap that would silently skip devices.
@@ -194,7 +201,7 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 			let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
 			let mut handle: u64 = 0;
 			let mut dm_chan: u64 = 0;
-			if launch_one(i, &info, elf, driver_name, buf, &mut handle, &mut dm_chan) {
+			if launch_one(i, &info, elf, driver_name, key_producer, buf, &mut handle, &mut dm_chan) {
 				state[idx] = STATE_ONLINE;
 				if driver_name == b"virtio_net" {
 					*net_client = handle;
@@ -235,6 +242,7 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 			close(file);
 			i += 1;
 		}
+		close(key_producer);
 		report_state(&state);
 	}
 }
@@ -275,7 +283,7 @@ unsafe fn read_driver(storage: u64, name: &[u8]) -> Option<(u64, u64, usize)> {
 // then re-acquires a fresh capability and respawns it, up to a few times - the
 // driver crash/restart cycle. Drivers do not crash in normal operation, so the
 // restart path is dormant on a healthy boot.
-unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], buf: &mut [u8], service_handle: &mut u64, control_out: &mut u64) -> bool {
+unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], key_producer: u64, buf: &mut [u8], service_handle: &mut u64, control_out: &mut u64) -> bool {
 	unsafe {
 		let info_size: usize = core::mem::size_of::<DeviceInfo>();
 		let mut attempt: u32 = 0;
@@ -309,6 +317,12 @@ unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], 
 				}
 				buf[..3].copy_from_slice(b"IRQ");
 				if !send_blocking(dm_side, &buf[..3], irq as u64) {
+					return false;
+				}
+			}
+			if driver_name == b"virtio_input" || driver_name == b"xhci" {
+				let sink: i64 = duplicate(key_producer, RIGHT_SEND | RIGHT_TRANSFER);
+				if sink < 0 || !send_blocking(dm_side, b"KEYS", sink as u64) {
 					return false;
 				}
 			}

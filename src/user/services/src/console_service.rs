@@ -234,6 +234,7 @@ struct Console {
 	has_fb: bool,
 	display: DisplayClient,
 	display_events: u64,
+	display_focused: bool,
 	// The current display size in pixels (the visible sub-rectangle of the max `fb`
 	// geometry). New VTs are sized to it, and the gpu driver grows it toward the max on a
 	// host-window resize. Equals the full `fb` geometry for the boot framebuffer.
@@ -398,7 +399,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, fb, surface_handle, has_fb, display, display_events, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
+		let mut console: Console = Console { addr, fb, surface_handle, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
 		run(&mut console);
 	}
 }
@@ -484,7 +485,21 @@ unsafe fn run(console: &mut Console) -> ! {
 				if r == 0 {
 					// keystrokes from the kernel console input.
 					if let Received::Message { len, .. } = recv_blocking(console.input, &mut keys) {
-						handle_keys(console, &keys[..len]);
+						if console.pointer != 0 {
+							loop {
+								match try_recv(console.pointer, &mut out) {
+									Polled::Message { len, .. } => handle_pointer(console, &out[..len]),
+									Polled::Empty => break,
+									Polled::Closed => {
+										console.pointer = 0;
+										break;
+									}
+								}
+							}
+						}
+						if console.display_focused {
+							handle_keys(console, &keys[..len]);
+						}
 					}
 				} else if have_display_events && r == display_idx {
 					handle_display_resize(console);
@@ -649,6 +664,9 @@ unsafe fn drain_serial(console: &mut Console) {
 // straight through to the shell.
 unsafe fn handle_keys(console: &mut Console, keys: &[u8]) {
 	unsafe {
+		if !console.display_focused {
+			return;
+		}
 		for &b in keys {
 			if b == CHORD_NEW {
 				create_vt(console);
@@ -1223,6 +1241,13 @@ fn snap_fg_live(console: &mut Console) {
 // when the program asked for ?2004).
 unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
 	unsafe {
+		if msg.len() == 9 && &msg[..8] == b"KEYFOCUS" {
+			console.display_focused = msg[8] != 0;
+			return;
+		}
+		if !console.display_focused {
+			return;
+		}
 		if msg.len() < 6 {
 			return;
 		}

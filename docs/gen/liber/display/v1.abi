@@ -7,3 +7,4 @@ method display.acquire op=1 (width:u32:rights=,height:u32:rights=) -> result<sur
 method display.present op=2 (x:u32:rights=,y:u32:rights=,width:u32:rights=,height:u32:rights=) -> result<unit, liber:base@1::error>
 method display.release op=3 () -> result<unit, liber:base@1::error>
 method display.events op=4 () -> stream<display-event>
+method display.input-focus op=5 () -> result<handle<channel>, liber:base@1::error>

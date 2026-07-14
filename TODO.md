@@ -2451,19 +2451,25 @@ layer exists.
       emergency kill chord: a reserved console chord (e.g. Ctrl+Alt+Esc, chosen
       like the existing VT chords) SIG_KILLs the foreground graphical app and
       restores the console, so a frozen fullscreen app never locks the machine.
-- [ ] Raw stateful key input: extend `liber:input@1` with
+- [x] Raw stateful key input: extend `liber:input@1` with
       `record key-event { code: u16, pressed: bool }` and a
-      `subscribe-keys() -> stream<key-event>` op delivering key-DOWN and key-UP
+  `subscribe-keys(focus: handle<channel>) -> stream<key-event>` op delivering key-DOWN and key-UP
       events (both keyboard drivers already see releases internally - virtio-input
       diffs EV_KEY, xHCI HID diffs boot reports - today they only feed the cooked
       console path). The canonical code is the USB HID Keyboard/Keypad usage id;
       translate virtio EV_KEY at its driver boundary, pass xHCI usages through,
       and never synthesize repeat in the raw layer. Delivery is foreground-only:
-      focus IS the capability and keys go solely to the display owner. Before a
-      focus stream closes, synthesize key-up for every held key so state cannot
-      stick across apps. Generalize the generated LSIDL stream host from today's
-      finite `Vec<T>` snapshot producer to a long-lived bounded-channel producer;
-      keep the existing snapshot path for pointer/log callers. Pointer capture is
+      focus IS the capability and keys go solely to the display owner. DisplayService
+      mints a one-shot proof channel for the active surface (`input-focus()`),
+      registers its peer over a private DisplayService-to-InputService control
+      channel, and the app transfers the proof to `subscribe-keys(focus)`; changing
+      foreground closes the old peer, so a token cannot be forged, replayed, or used
+      in the background. Before that stream closes, synthesize key-up for every held
+      key so state cannot stick across apps. InputService hosts this subscription as
+      a long-lived bounded-channel producer; the generated finite `Vec<T>` snapshot
+      path stays unchanged for pointer/log callers. Focus changes synchronously gate
+      ConsoleService's parallel cooked keyboard/pointer path before `acquire` or
+      `release` replies, so background consoles receive nothing. Pointer capture is
       a future relative-motion stream (`dx`, `dy`, wheel delta, button state)
       scoped to the same focus capability; absolute cell events remain the console
       path.

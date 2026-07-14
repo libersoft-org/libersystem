@@ -80,6 +80,7 @@ impl Hids {
 // set once at startup. Pointer reports send through it from wherever they are
 // reaped - the service loop or a wait deep inside a disk transfer.
 pub static PTR_SINK: AtomicU64 = AtomicU64::new(0);
+pub static KEY_SINK: AtomicU64 = AtomicU64::new(0);
 
 // Configure the device's HID function, if it has one: read the configuration
 // descriptor, find a HID interface (any subclass - keyboards, pointing devices
@@ -283,6 +284,13 @@ unsafe fn feed_hid_report(h: &mut Hid, report: &[u8]) {
 		};
 		let (layout, prevs, mods): (&hid::Layout, &mut Vec<(u8, [u8; 64])>, &mut Mods) = (&h.layout, &mut h.prevs, &mut h.mods);
 		layout.keys_diff(id, &prevs[prev_i].1, body, &mut |usage, down| {
+			let page: u16 = (usage >> 16) as u16;
+			let raw: u16 = usage as u16;
+			let key_sink: u64 = KEY_SINK.load(Ordering::Relaxed);
+			if page == 0x07 && key_sink != 0 {
+				let event: [u8; 3] = [raw as u8, (raw >> 8) as u8, down as u8];
+				let _ = send_blocking(key_sink, &event, 0);
+			}
 			let code: u16 = usage_keycode(usage);
 			if code != 0 {
 				keys::feed_key(code, down as u32, mods);

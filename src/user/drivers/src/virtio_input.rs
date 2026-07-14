@@ -71,6 +71,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let is_pointer: bool = ev_supported(&device, EV_ABS as u8) || ev_supported(&device, EV_REL as u8);
 		// 3. receive our device's Interrupt capability ("IRQ" + handle).
 		let irq: u64 = recv_irq(bootstrap);
+		// DeviceManager supplies one producer endpoint shared by every keyboard driver.
+		// Pointer instances receive it too but never emit key events.
+		let mut key_buf: [u8; 8] = [0; 8];
+		let key_sink: u64 = match recv_blocking(bootstrap, &mut key_buf) {
+			Received::Message { len, handle } if len >= 4 && &key_buf[..4] == b"KEYS" => handle,
+			_ => 0,
+		};
 		// route this device's interrupts to MSI-X table entry 0: DeviceManager acquired
 		// an MSI-X Interrupt (device_msix_acquire), so the kernel has already programmed
 		// the table and enabled MSI-X - we just point the device's config and queue
@@ -114,7 +121,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			pointer_loop(irq, &mut eventq, pool_virt, pool_phys, slots, producer, max_x, max_y)
 		} else {
 			send_blocking(bootstrap, b"driver.virtio-input: online", 0);
-			event_loop(irq, &mut eventq, pool_virt, pool_phys, slots)
+			event_loop(irq, &mut eventq, pool_virt, pool_phys, slots, key_sink)
 		}
 	}
 }
@@ -166,7 +173,7 @@ unsafe fn recv_irq(bootstrap: u64) -> u64 {
 // the device filled (translating key presses to console input), re-post the drained
 // buffers, and re-arm the interrupt. MSI-X is edge-triggered, so there is no ISR line
 // to deassert and no GSI to unmask - the interrupt_ack just clears the pending flag.
-unsafe fn event_loop(irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16) -> ! {
+unsafe fn event_loop(irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, key_sink: u64) -> ! {
 	unsafe {
 		let mut mods: Mods = Mods::default();
 		loop {
@@ -175,7 +182,7 @@ unsafe fn event_loop(irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u6
 			// drain the buffers the device filled, re-posting each as we go.
 			while let Some((id, _len)) = eventq.take_used() {
 				if id < slots {
-					feed_event(pool_virt + id as u64 * EVENT_SIZE, &mut mods);
+					feed_event(pool_virt + id as u64 * EVENT_SIZE, &mut mods, key_sink);
 					eventq.post_recv(id, pool_phys + id as u64 * EVENT_SIZE, EVENT_SIZE as u32);
 				}
 			}
@@ -305,13 +312,20 @@ fn normalize(v: i32, max: i32) -> u16 {
 // Decode the virtio_input_event at `addr` and feed a key event into the shared
 // keyboard logic: modifier tracking, layout, navigation escapes and the console
 // injection all live in `keys::feed_key`.
-unsafe fn feed_event(addr: u64, mods: &mut Mods) {
+unsafe fn feed_event(addr: u64, mods: &mut Mods, key_sink: u64) {
 	unsafe {
 		let kind: u16 = (addr as *const u16).read_volatile();
 		let code: u16 = ((addr + 2) as *const u16).read_volatile();
 		let value: u32 = ((addr + 4) as *const u32).read_volatile();
 		if kind != EV_KEY {
 			return;
+		}
+		if value <= 1 && key_sink != 0 {
+			let usage: u16 = keys::keycode_hid(code);
+			if usage != 0 {
+				let event: [u8; 3] = [usage as u8, (usage >> 8) as u8, (value == 1) as u8];
+				let _ = send_blocking(key_sink, &event, 0);
+			}
 		}
 		keys::feed_key(code, value, mods);
 	}

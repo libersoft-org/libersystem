@@ -149,12 +149,17 @@ pub mod display {
 	pub const OP_PRESENT: u16 = 2;
 	pub const OP_RELEASE: u16 = 3;
 	pub const OP_EVENTS: u16 = 4;
+	pub const OP_INPUT_FOCUS: u16 = 5;
 
 	pub trait Service {
 		fn acquire(&mut self, width: u32, height: u32) -> Result<SurfaceInfo, Error>;
 		fn present(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), Error>;
 		fn release(&mut self) -> Result<(), Error>;
 		fn events(&mut self) -> Vec<DisplayEvent>;
+		/// Return the one-shot proof channel for this connection's active surface. The
+		/// client transfers it to `input.subscribe-keys`; a background or released
+		/// surface has no proof, and changing foreground revokes the previous peer.
+		fn input_focus(&mut self) -> Result<u64, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -255,6 +260,42 @@ pub mod display {
 						Err(v5) => {
 							w.u8(0)?;
 							v5.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						*reply_handle = writer.handle();
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_INPUT_FOCUS => {
+				if r.has_handle() {
+					return None;
+				}
+				*request_handle = 0;
+				let result = service.input_focus();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v6) => {
+							w.u8(1)?;
+							w.set_handle(*v6)?;
+							w.u32(0)?;
+						}
+						Err(v7) => {
+							w.u8(0)?;
+							v7.write(w)?;
 						}
 					}
 					Some(())
@@ -436,6 +477,38 @@ pub mod display {
 				return None;
 			}
 			Some(reply_handle)
+		}
+		pub fn input_focus(&mut self) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_INPUT_FOCUS)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				Some(if r.u8()? != 0 {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				})
+			})();
+			if decoded.is_none() || reader.has_handle() {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			decoded
 		}
 	}
 }

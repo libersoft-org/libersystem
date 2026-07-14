@@ -525,6 +525,16 @@ pub fn hid_keycode(usage: u8) -> u16 {
 	if (usage as usize) < HID_KEYCODES.len() { HID_KEYCODES[usage as usize] } else { 0 }
 }
 
+// Resolve a Linux/virtio EV_KEY code back to its canonical HID keyboard-page
+// usage. The table above is the single mapping source; modifiers occupy the HID
+// page's dedicated 0xe0..=0xe7 range rather than ordinary table entries.
+pub fn keycode_hid(code: u16) -> u16 {
+	if let Some(index) = HID_MODIFIER_KEYCODES.iter().position(|mapped| *mapped == code) {
+		return 0xe0 + index as u16;
+	}
+	HID_KEYCODES.iter().position(|mapped| *mapped == code && code != 0).map_or(0, |usage| usage as u16)
+}
+
 // Resolve a HID Consumer-page usage to its keycode (0 = unmapped): the media
 // transport, audio, launcher / browser, brightness and power controls a
 // multimedia keyboard reports outside the boot protocol. They resolve to the

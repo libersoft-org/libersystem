@@ -90,7 +90,9 @@ impl KeyEvent {
 /// ambient input access - the plumbing a future TUI consumes. `subscribe-keys` is a
 /// continuously live, bounded-channel stream granted only to the display owner. On
 /// focus loss the service emits key-up for every key still held before closing the
-/// stream, so a new foreground app cannot inherit stuck state.
+/// stream, so a new foreground app cannot inherit stuck state. `focus` is the
+/// one-shot proof channel minted by `display.input-focus`; InputService accepts it
+/// only while its registered peer is the active DisplayService focus.
 // interface `input` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod input {
 	use super::*;
@@ -102,7 +104,7 @@ pub mod input {
 
 	pub trait Service {
 		fn subscribe(&mut self) -> Vec<PointerEvent>;
-		fn subscribe_keys(&mut self) -> Vec<KeyEvent>;
+		fn subscribe_keys(&mut self, focus: u64) -> Vec<KeyEvent>;
 	}
 
 	pub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handle: &mut u64, _out: &mut [u8], _reply_handle: &mut u64) -> Option<usize> {
@@ -155,11 +157,15 @@ pub mod input {
 		let r = &mut reader;
 		let _op = r.u16()?;
 		let corr = r.u32()?;
+		let focus = {
+			let _ = r.u32()?;
+			r.take_handle()?
+		};
 		if r.has_handle() {
 			return None;
 		}
 		*request_handle = 0;
-		let items = service.subscribe_keys();
+		let items = service.subscribe_keys(focus);
 		Some((corr, items))
 	}
 	pub fn subscribe_keys_frame(seq: u32, item: &KeyEvent, out: &mut [u8], frame_handle: &mut u64) -> Option<usize> {
@@ -227,12 +233,14 @@ pub mod input {
 			}
 			Some(reply_handle)
 		}
-		pub fn subscribe_keys(&mut self) -> Option<u64> {
+		pub fn subscribe_keys(&mut self, focus: &u64) -> Option<u64> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
 			w.u16(OP_SUBSCRIBE_KEYS)?;
 			w.u32(corr)?;
+			w.set_handle(*focus)?;
+			w.u32(0)?;
 			let request_handle = writer.handle();
 			let request = writer.into_inner();
 			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;

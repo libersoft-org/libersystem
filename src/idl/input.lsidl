@@ -28,8 +28,10 @@ record key-event {
 /// ambient input access - the plumbing a future TUI consumes. `subscribe-keys` is a
 /// continuously live, bounded-channel stream granted only to the display owner. On
 /// focus loss the service emits key-up for every key still held before closing the
-/// stream, so a new foreground app cannot inherit stuck state.
+/// stream, so a new foreground app cannot inherit stuck state. `focus` is the
+/// one-shot proof channel minted by `display.input-focus`; InputService accepts it
+/// only while its registered peer is the active DisplayService focus.
 interface input {
 	@op(1) subscribe:      func() -> stream<pointer-event>;
-	@op(2) subscribe-keys: func() -> stream<key-event>;
+	@op(2) subscribe-keys: func(focus: handle<channel>) -> stream<key-event>;
 }

@@ -47,6 +47,7 @@ struct Surface {
 	width: u32,
 	height: u32,
 	pitch: u32,
+	focus_proof: u64,
 }
 
 struct EventStream {
@@ -59,13 +60,15 @@ struct DisplayState {
 	scanout: Scanout,
 	surfaces: Vec<Surface>,
 	events: Vec<EventStream>,
+	focus_control: u64,
+	kill_control: u64,
 	console: u64,
 	active: u64,
 }
 
 impl DisplayState {
-	fn new(scanout: Scanout) -> DisplayState {
-		DisplayState { scanout, surfaces: Vec::new(), events: Vec::new(), console: 0, active: 0 }
+	fn new(scanout: Scanout, focus_control: u64, kill_control: u64) -> DisplayState {
+		DisplayState { scanout, surfaces: Vec::new(), events: Vec::new(), focus_control, kill_control, console: 0, active: 0 }
 	}
 
 	fn surface_index(&self, chan: u64) -> Option<usize> {
@@ -109,12 +112,12 @@ impl DisplayState {
 			return Err(Error::Again);
 		}
 		self.remove_surface(chan, false);
-		self.surfaces.push(Surface { chan, handle, addr, width, height, pitch });
+		self.surfaces.push(Surface { chan, handle, addr, width, height, pitch, focus_proof: 0 });
 		if self.console == 0 && native {
 			self.console = chan;
 		}
 		if self.active == 0 || chan != self.console {
-			self.active = chan;
+			self.set_active(chan);
 		}
 		Ok(SurfaceInfo { pixels: Buffer { handle: granted as u64, len }, width, height, pitch, format: PixelFormat::B8g8r8x8 })
 	}
@@ -143,19 +146,89 @@ impl DisplayState {
 		Ok(())
 	}
 
+	fn input_focus(&mut self, chan: u64) -> Result<u64, Error> {
+		if chan != self.active {
+			return Err(Error::Denied);
+		}
+		let index: usize = self.surface_index(chan).ok_or(Error::Invalid)?;
+		let proof: u64 = core::mem::take(&mut self.surfaces[index].focus_proof);
+		if proof == 0 { Err(Error::Again) } else { Ok(proof) }
+	}
+
+	fn revoke_focus(&mut self) {
+		for surface in &mut self.surfaces {
+			if surface.focus_proof != 0 {
+				unsafe { close(surface.focus_proof) };
+				surface.focus_proof = 0;
+			}
+		}
+	}
+
+	fn focus_command(&self, command: &[u8], handle: u64) -> bool {
+		if self.focus_control == 0 || !unsafe { send_blocking(self.focus_control, command, handle) } {
+			return false;
+		}
+		let mut reply: [u8; 8] = [0; 8];
+		match unsafe { recv_blocking(self.focus_control, &mut reply) } {
+			Received::Message { len, handle } => {
+				if handle != 0 {
+					unsafe { close(handle) };
+				}
+				len >= 2 && &reply[..2] == b"OK"
+			}
+			Received::Closed => false,
+		}
+	}
+
+	fn set_active(&mut self, chan: u64) {
+		self.revoke_focus();
+		self.active = chan;
+		if self.focus_control == 0 {
+			return;
+		}
+		if chan == 0 {
+			self.focus_command(b"CLEAR", 0);
+			return;
+		}
+		if chan == self.console {
+			self.focus_command(b"CONSOLE", 0);
+			return;
+		}
+		let Some(index) = self.surface_index(chan) else { return };
+		let (proof, registered): (u64, u64) = match unsafe { channel() } {
+			Some(pair) => pair,
+			None => return,
+		};
+		if self.focus_command(b"SET", registered) {
+			self.surfaces[index].focus_proof = proof;
+		} else {
+			unsafe {
+				close(proof);
+				close(registered);
+			}
+		}
+	}
+
 	fn remove_surface(&mut self, chan: u64, restore: bool) {
 		if let Some(index) = self.surface_index(chan) {
 			let surface: Surface = self.surfaces.swap_remove(index);
 			unsafe {
+				if surface.focus_proof != 0 {
+					close(surface.focus_proof);
+				}
 				unmap_object(surface.handle);
 				close(surface.handle);
 			}
+		}
+		if !restore {
+			return;
 		}
 		if self.console == chan {
 			self.console = 0;
 		}
 		if self.active == chan {
-			self.active = if self.console != 0 && self.surface_index(self.console).is_some() { self.console } else { 0 };
+			let next: u64 = if self.console != 0 && self.surface_index(self.console).is_some() { self.console } else { 0 };
+			self.set_active(next);
 			if restore && self.active != 0 {
 				self.present_active_full();
 			}
@@ -370,6 +443,10 @@ impl Service for DisplayCall<'_> {
 	fn events(&mut self) -> Vec<DisplayEvent> {
 		Vec::new()
 	}
+
+	fn input_focus(&mut self) -> Result<u64, Error> {
+		self.state.input_focus(self.chan)
+	}
 }
 
 #[unsafe(no_mangle)]
@@ -380,13 +457,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Message { len, handle } if len >= 3 && &buf[..3] == b"GPU" => handle,
 			_ => fail_bootstrap(bootstrap, b"gpu", b"driver channel not delivered"),
 		};
+		let focus_control: u64 = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } if len >= 5 && &buf[..5] == b"FOCUS" => handle,
+			_ => fail_bootstrap(bootstrap, b"focus", b"input focus channel not delivered"),
+		};
+		let kill_control: u64 = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } if len >= 4 && &buf[..4] == b"KILL" => handle,
+			_ => fail_bootstrap(bootstrap, b"kill", b"emergency input channel not delivered"),
+		};
 		let service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
 		let scanout: Scanout = init_scanout(gpu, &mut buf);
 		if !scanout.available() {
 			fail_bootstrap(bootstrap, b"display", b"no framebuffer available");
 		}
 		send_blocking(bootstrap, b"DisplayService: online", 0);
-		serve_display(service, DisplayState::new(scanout));
+		serve_display(service, DisplayState::new(scanout, focus_control, kill_control));
 	}
 }
 
@@ -423,9 +508,12 @@ unsafe fn serve_display(root: u64, mut state: DisplayState) -> ! {
 		let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
 		let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
 		loop {
-			let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + 1);
+			let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + 2);
 			if state.scanout.gpu != 0 {
 				waits.push(state.scanout.gpu);
+			}
+			if state.kill_control != 0 {
+				waits.push(state.kill_control);
 			}
 			waits.extend_from_slice(&clients);
 			let ready: i64 = wait_any(&waits, 0);
@@ -445,7 +533,30 @@ unsafe fn serve_display(root: u64, mut state: DisplayState) -> ! {
 				}
 				continue;
 			}
-			let client_index: usize = ready as usize - gpu_first as usize;
+			let kill_index: usize = gpu_first as usize;
+			let kill_present: bool = state.kill_control != 0;
+			if kill_present && ready as usize == kill_index {
+				match recv_blocking(state.kill_control, &mut request) {
+					Received::Message { len, handle } => {
+						if handle != 0 {
+							close(handle);
+						}
+						if len >= 4
+							&& &request[..4] == b"KILL"
+							&& state.active != 0 && state.active != state.console
+							&& let Some(victim) = clients.iter().position(|client| *client == state.active)
+						{
+							let chan: u64 = clients[victim];
+							state.drop_client(chan);
+							close(chan);
+							clients.swap_remove(victim);
+						}
+					}
+					Received::Closed => state.kill_control = 0,
+				}
+				continue;
+			}
+			let client_index: usize = ready as usize - gpu_first as usize - kill_present as usize;
 			let chan: u64 = clients[client_index];
 			match recv_blocking(chan, &mut request) {
 				Received::Message { len, handle } if len == 0 => {

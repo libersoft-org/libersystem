@@ -44,11 +44,22 @@ const RAW_LEN: usize = 5;
 // `subscribe` stream snapshots.
 struct Input {
 	recent: Vec<PointerEvent>,
+	held: Vec<u16>,
+	focus_peer: u64,
+	kill_control: u64,
+	key_stream: Option<KeyStream>,
+	proof_nonce: u64,
+}
+
+struct KeyStream {
+	owner: u64,
+	producer: u64,
+	seq: u32,
 }
 
 impl Input {
-	fn new() -> Input {
-		Input { recent: Vec::new() }
+	fn new(kill_control: u64) -> Input {
+		Input { recent: Vec::new(), held: Vec::new(), focus_peer: 0, kill_control, key_stream: None, proof_nonce: 0 }
 	}
 
 	// Record one mapped event, dropping the oldest once the ring is full.
@@ -57,6 +68,100 @@ impl Input {
 		if self.recent.len() > RING_CAP {
 			self.recent.remove(0);
 		}
+	}
+
+	fn record_key(&mut self, raw: &[u8]) {
+		if raw.len() != 3 || raw[2] > 1 {
+			return;
+		}
+		let code: u16 = u16::from_le_bytes([raw[0], raw[1]]);
+		let pressed: bool = raw[2] != 0;
+		let held: Option<usize> = self.held.iter().position(|held| *held == code);
+		if pressed {
+			if held.is_some() {
+				return;
+			}
+			self.held.push(code);
+		} else if let Some(index) = held {
+			self.held.swap_remove(index);
+		} else {
+			return;
+		}
+		self.send_key(KeyEvent { code, pressed });
+		if pressed && code == 0x29 && self.held.iter().any(|code| *code == 0xe0 || *code == 0xe4) && self.held.iter().any(|code| *code == 0xe2 || *code == 0xe6) {
+			if self.kill_control != 0 {
+				unsafe {
+					let _ = send_blocking(self.kill_control, b"KILL", 0);
+				}
+			}
+			self.set_focus(0);
+		}
+	}
+
+	fn send_key(&mut self, event: KeyEvent) -> bool {
+		let Some(stream) = self.key_stream.as_mut() else { return false };
+		let mut frame: [u8; 32] = [0; 32];
+		let mut frame_handle: u64 = 0;
+		let sent: bool = match input::subscribe_keys_frame(stream.seq, &event, &mut frame, &mut frame_handle) {
+			Some(len) => unsafe { try_send(stream.producer, &frame[..len], frame_handle) },
+			None => false,
+		};
+		if sent {
+			stream.seq = stream.seq.wrapping_add(1);
+			true
+		} else {
+			if frame_handle != 0 {
+				unsafe { close(frame_handle) };
+			}
+			let dead: KeyStream = self.key_stream.take().unwrap();
+			unsafe { close(dead.producer) };
+			false
+		}
+	}
+
+	fn close_key_stream(&mut self, release_held: bool) {
+		if release_held {
+			for code in self.held.clone() {
+				if !self.send_key(KeyEvent { code, pressed: false }) {
+					break;
+				}
+			}
+		}
+		if let Some(stream) = self.key_stream.take() {
+			unsafe { close(stream.producer) };
+		}
+	}
+
+	fn set_focus(&mut self, peer: u64) {
+		self.close_key_stream(true);
+		if self.focus_peer != 0 {
+			unsafe { close(self.focus_peer) };
+		}
+		self.focus_peer = peer;
+	}
+
+	fn notify_console(&self, focused: bool, forward: u64) {
+		if forward != 0 {
+			let mut message: [u8; 9] = [0; 9];
+			message[..8].copy_from_slice(b"KEYFOCUS");
+			message[8] = focused as u8;
+			unsafe {
+				let _ = send_blocking(forward, &message, 0);
+			}
+		}
+	}
+
+	fn validate_focus(&mut self, proof: u64) -> bool {
+		if proof == 0 || self.focus_peer == 0 {
+			return false;
+		}
+		self.proof_nonce = self.proof_nonce.wrapping_add(1);
+		let challenge: [u8; 8] = self.proof_nonce.to_le_bytes();
+		if !unsafe { try_send(proof, &challenge, 0) } {
+			return false;
+		}
+		let mut received: [u8; 8] = [0; 8];
+		matches!(unsafe { try_recv(self.focus_peer, &mut received) }, Polled::Message { len: 8, handle: 0 } if received == challenge)
 	}
 }
 
@@ -67,7 +172,10 @@ impl input::Service for Input {
 		self.recent.clone()
 	}
 
-	fn subscribe_keys(&mut self) -> Vec<KeyEvent> {
+	fn subscribe_keys(&mut self, focus: u64) -> Vec<KeyEvent> {
+		if focus != 0 {
+			unsafe { close(focus) };
+		}
 		Vec::new()
 	}
 }
@@ -108,6 +216,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Received::Message { len, handle } if len >= 7 && &buf[..7] == b"FORWARD" => handle,
 		_ => 0,
 	};
+	let keys: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if len >= 4 && &buf[..4] == b"KEYS" => handle,
+		_ => 0,
+	};
+	let focus: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if len >= 5 && &buf[..5] == b"FOCUS" => handle,
+		_ => 0,
+	};
+	let kill: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if len >= 4 && &buf[..4] == b"KILL" => handle,
+		_ => 0,
+	};
 
 	// 2. report in to the supervisor that started us.
 	unsafe {
@@ -115,9 +235,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	// 3. serve until the client side closes.
-	let mut state: Input = Input::new();
+	let mut state: Input = Input::new(kill);
 	unsafe {
-		serve(service, [raw, raw2], forward, &mut state);
+		serve(service, [raw, raw2], forward, keys, focus, &mut state);
 	}
 	exit();
 }
@@ -127,25 +247,86 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // one client request. Returns when the client side closes (no more clients). Once
 // a raw channel closes (its pointer driver retired), it is dropped from the wait
 // set so a peer-closed channel cannot spin the loop.
-unsafe fn serve(service: u64, raws: [u64; 2], forward: u64, state: &mut Input) {
+unsafe fn serve(service: u64, raws: [u64; 2], forward: u64, keys: u64, focus: u64, state: &mut Input) {
 	unsafe {
 		let mut req: [u8; 64] = [0u8; 64];
 		let mut open: [bool; 2] = [raws[0] != 0, raws[1] != 0];
+		let mut clients: Vec<u64> = alloc::vec![service];
+		let mut keys_open: bool = keys != 0;
+		let mut focus_open: bool = focus != 0;
 		loop {
-			// block until the serve channel (or, while open, a raw channel) is ready.
-			let mut waitset: [u64; 3] = [service, 0, 0];
-			let mut n: usize = 1;
+			let mut waitset: Vec<u64> = Vec::with_capacity(clients.len() + 4);
+			if focus_open {
+				waitset.push(focus);
+			}
+			if keys_open {
+				waitset.push(keys);
+			}
 			for (i, &raw) in raws.iter().enumerate() {
 				if open[i] {
-					waitset[n] = raw;
-					n += 1;
+					waitset.push(raw);
 				}
 			}
-			wait_any(&waitset[..n], 0);
-			// drain every pending raw pointer event: fold it into the ring for the typed
-			// snapshot, and forward the raw bytes to ConsoleService for selection / reports.
+			waitset.extend_from_slice(&clients);
+			let ready: i64 = wait_any(&waitset, 0);
+			if ready < 0 {
+				continue;
+			}
+			let ready_handle: u64 = waitset[ready as usize];
+			if focus_open && ready_handle == focus {
+				let acknowledged: bool = match recv_blocking(focus, &mut req) {
+					Received::Message { len, handle } if len >= 3 && &req[..3] == b"SET" && handle != 0 => {
+						state.notify_console(false, forward);
+						state.set_focus(handle);
+						true
+					}
+					Received::Message { len, handle } if len >= 7 && &req[..7] == b"CONSOLE" => {
+						if handle != 0 {
+							close(handle);
+						}
+						state.set_focus(0);
+						state.notify_console(true, forward);
+						true
+					}
+					Received::Message { handle, .. } => {
+						if handle != 0 {
+							close(handle);
+						}
+						state.set_focus(0);
+						state.notify_console(false, forward);
+						true
+					}
+					Received::Closed => {
+						focus_open = false;
+						state.set_focus(0);
+						false
+					}
+				};
+				if acknowledged {
+					send_blocking(focus, b"OK", 0);
+				}
+				continue;
+			}
+			if keys_open && ready_handle == keys {
+				loop {
+					match try_recv(keys, &mut req) {
+						Polled::Message { len, handle } => {
+							if handle != 0 {
+								close(handle);
+							}
+							state.record_key(&req[..len]);
+						}
+						Polled::Empty => break,
+						Polled::Closed => {
+							keys_open = false;
+							break;
+						}
+					}
+				}
+				continue;
+			}
 			for (i, &raw) in raws.iter().enumerate() {
-				if !open[i] {
+				if !open[i] || ready_handle != raw {
 					continue;
 				}
 				loop {
@@ -165,18 +346,67 @@ unsafe fn serve(service: u64, raws: [u64; 2], forward: u64, state: &mut Input) {
 						}
 					}
 				}
+				continue;
 			}
-			// handle one client request: `subscribe` opens a stream, served out of band.
-			match try_recv(service, &mut req) {
-				Polled::Message { len, .. } => {
+			let Some(client_index) = clients.iter().position(|client| *client == ready_handle) else { continue };
+			let client: u64 = clients[client_index];
+			match recv_blocking(client, &mut req) {
+				Received::Message { len, mut handle } => {
 					let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
-					if op == input::OP_SUBSCRIBE {
-						stream_subscribe(service, &req[..len], state);
+					if op == CONNECT_OP {
+						if let Some((mine, theirs)) = channel() {
+							clients.push(mine);
+							send_blocking(client, &[], theirs);
+						}
+					} else if op == input::OP_SUBSCRIBE {
+						stream_subscribe(client, &req[..len], state);
+					} else if op == input::OP_SUBSCRIBE_KEYS {
+						stream_subscribe_keys(client, &req[..len], &mut handle, state);
+					}
+					if handle != 0 {
+						close(handle);
 					}
 				}
-				Polled::Empty => {}
-				Polled::Closed => return,
+				Received::Closed => {
+					if state.key_stream.as_ref().is_some_and(|stream| stream.owner == client) {
+						state.close_key_stream(false);
+					}
+					if client_index == 0 {
+						return;
+					}
+					close(client);
+					clients.swap_remove(client_index);
+				}
 			}
+		}
+	}
+}
+
+fn stream_subscribe_keys(service: u64, request: &[u8], request_handle: &mut u64, state: &mut Input) {
+	if request.len() != 10 || *request_handle == 0 {
+		return;
+	}
+	let corr: u32 = u32::from_le_bytes([request[2], request[3], request[4], request[5]]);
+	let proof: u64 = core::mem::take(request_handle);
+	let valid: bool = state.validate_focus(proof);
+	unsafe { close(proof) };
+	if !valid {
+		unsafe {
+			send_blocking(service, &corr.to_le_bytes(), 0);
+		}
+		return;
+	}
+	state.close_key_stream(true);
+	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
+		Some(pair) => pair,
+		None => return,
+	};
+	if unsafe { send_blocking(service, &corr.to_le_bytes(), consumer) } {
+		state.key_stream = Some(KeyStream { owner: service, producer, seq: 0 });
+	} else {
+		unsafe {
+			close(producer);
+			close(consumer);
 		}
 	}
 }

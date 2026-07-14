@@ -2871,6 +2871,8 @@ fn input_service_streams_pointer_events() {
 	let (boot_kernel, boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
 	let (raw_producer, raw_consumer) = Channel::create();
+	let (_key_producer, key_consumer) = Channel::create();
+	let (_focus_display, focus_input) = Channel::create();
 	// ConsoleService's pointer sink: the test keeps the consumer end alive so the forward
 	// channel stays open (InputService mirrors each raw event to it), but does not assert
 	// on it here - the forwarding path is exercised by the live console.
@@ -2881,6 +2883,9 @@ fn input_service_streams_pointer_events() {
 	// no USB pointer in this scenario: the second raw channel is absent (handle 0).
 	boot_kernel.send(Message::new(b"INPUT2".to_vec(), alloc::vec::Vec::new(), 0)).expect("input2 raw bootstrap");
 	send_cap(&boot_kernel, b"FORWARD", forward_input, Rights::ALL).expect("forward raw bootstrap");
+	send_cap(&boot_kernel, b"KEYS", key_consumer, Rights::ALL).expect("key raw bootstrap");
+	send_cap(&boot_kernel, b"FOCUS", focus_input, Rights::ALL).expect("focus bootstrap");
+	boot_kernel.send(Message::new(b"KILL".to_vec(), alloc::vec::Vec::new(), 0)).expect("kill bootstrap");
 
 	// Inject two normalized pointer events as the driver would. The grid is COLS = 80
 	// x ROWS = 50 over the 0..0x10000 normalized span, so col = (x * 80) / 0x10000 and
@@ -2927,6 +2932,100 @@ fn input_service_streams_pointer_events() {
 	assert_eq!(events[1], (0, 0, 0), "the corner event maps to column 0, row 0, no buttons");
 }
 
+tagged_test!(input_service_streams_keys_only_with_display_focus, [Service, Input, Display]);
+fn input_service_streams_keys_only_with_display_focus() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	fn subscribe(client: &Channel, corr: u32, proof: alloc::sync::Arc<Channel>) -> Option<alloc::sync::Arc<Channel>> {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&2u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(client, &request, proof, Rights::ALL).expect("key subscription request");
+		sched::run_until_idle();
+		let reply = client.recv().expect("key subscription reply");
+		assert_eq!(le_u32(&reply.bytes, 0), corr, "subscription echoes correlation id");
+		reply.caps.first().map(|cap| cap.object().into_any_arc().downcast::<Channel>().expect("key stream is a channel"))
+	}
+
+	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = program_elf(&package, volume, b"input_service").expect("input_service in the package or volume");
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+	let (_pointer_a, pointer_b) = Channel::create();
+	let (console_focus, forward_b) = Channel::create();
+	let (keys_driver, keys_input) = Channel::create();
+	let (focus_display, focus_input) = Channel::create();
+	let (kill_display, kill_input) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn InputService");
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	send_cap(&boot_kernel, b"INPUT", pointer_b, Rights::ALL).expect("pointer bootstrap");
+	boot_kernel.send(Message::new(b"INPUT2".to_vec(), alloc::vec::Vec::new(), 0)).expect("second pointer bootstrap");
+	send_cap(&boot_kernel, b"FORWARD", forward_b, Rights::ALL).expect("forward bootstrap");
+	send_cap(&boot_kernel, b"KEYS", keys_input, Rights::ALL).expect("keys bootstrap");
+	send_cap(&boot_kernel, b"FOCUS", focus_input, Rights::ALL).expect("focus bootstrap");
+	send_cap(&boot_kernel, b"KILL", kill_input, Rights::ALL).expect("kill bootstrap");
+	sched::run_until_idle();
+	let online = boot_kernel.recv().expect("InputService online report");
+	assert_eq!(&online.bytes[..], b"InputService: online");
+
+	// An unrelated channel is not a display-minted peer and cannot open the stream.
+	let (forged, _forged_peer) = Channel::create();
+	assert!(subscribe(&service_client, 1, forged).is_none(), "a forged focus proof must be refused");
+
+	// DisplayService registers one peer and transfers its counterpart to the client.
+	let (proof, registered) = Channel::create();
+	send_cap(&focus_display, b"SET", registered, Rights::ALL).expect("register focus peer");
+	let stream = subscribe(&service_client, 2, proof).expect("active display proof opens the key stream");
+	let focus_ack = focus_display.recv().expect("focus acknowledgement");
+	assert_eq!(&focus_ack.bytes[..], b"OK");
+	let suppressed = console_focus.recv().expect("console focus suppression");
+	assert_eq!(&suppressed.bytes[..], b"KEYFOCUS\0");
+	keys_driver.send(Message::new(alloc::vec![0x04, 0, 1], alloc::vec::Vec::new(), 0)).expect("A down");
+	keys_driver.send(Message::new(alloc::vec![0x04, 0, 1], alloc::vec::Vec::new(), 0)).expect("duplicate A down");
+	sched::run_until_idle();
+	focus_display.send(Message::new(b"CLEAR".to_vec(), alloc::vec::Vec::new(), 0)).expect("revoke focus");
+	sched::run_until_idle();
+	let clear_ack = focus_display.recv().expect("clear acknowledgement");
+	assert_eq!(&clear_ack.bytes[..], b"OK");
+	let cleared = console_focus.recv().expect("console focus clear");
+	assert_eq!(&cleared.bytes[..], b"KEYFOCUS\0");
+	let down = stream.recv().expect("A down frame");
+	let up = stream.recv().expect("synthetic A up frame");
+	assert_eq!((le_u16(&down.bytes, 4), down.bytes[6]), (0x04, 1), "canonical HID A down");
+	assert_eq!((le_u16(&up.bytes, 4), up.bytes[6]), (0x04, 0), "focus loss releases held A");
+	assert!(stream.recv().is_err(), "focus loss closes the key stream");
+	keys_driver.send(Message::new(alloc::vec![0x04, 0, 0], alloc::vec::Vec::new(), 0)).expect("physical A up");
+	sched::run_until_idle();
+	focus_display.send(Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new(), 0)).expect("restore console focus");
+	sched::run_until_idle();
+	let console_ack = focus_display.recv().expect("console focus acknowledgement");
+	assert_eq!(&console_ack.bytes[..], b"OK");
+	let restored = console_focus.recv().expect("console focus restoration");
+	assert_eq!(&restored.bytes[..], b"KEYFOCUS\x01");
+
+	// Ctrl+Alt+Esc is consumed as the emergency display-revocation chord.
+	let (proof2, registered2) = Channel::create();
+	send_cap(&focus_display, b"SET", registered2, Rights::ALL).expect("register second focus peer");
+	let stream2 = subscribe(&service_client, 3, proof2).expect("second active proof opens a stream");
+	let second_ack = focus_display.recv().expect("second focus acknowledgement");
+	assert_eq!(&second_ack.bytes[..], b"OK");
+	for event in [[0xe0, 0, 1], [0xe2, 0, 1], [0x29, 0, 1]] {
+		keys_driver.send(Message::new(event.to_vec(), alloc::vec::Vec::new(), 0)).expect("kill chord key");
+	}
+	sched::run_until_idle();
+	let kill = kill_display.recv().expect("kill chord reaches DisplayService");
+	assert_eq!(&kill.bytes[..], b"KILL");
+	let mut frames: usize = 0;
+	while stream2.recv().is_ok() {
+		frames += 1;
+	}
+	assert_eq!(frames, 6, "three key-down frames are followed by three synthetic releases");
+}
+
 tagged_test!(display_service_restores_the_console_surface, [Service, Console, Display, Memory]);
 fn display_service_restores_the_console_surface() {
 	use object::channel::{Channel, Message};
@@ -2952,8 +3051,16 @@ fn display_service_restores_the_console_surface() {
 		cap.object().into_any_arc().downcast::<Channel>().expect("display connection is a channel")
 	}
 
-	fn acquire(client: &Channel, corr: u32, width: u32, height: u32) -> alloc::sync::Arc<MemoryObject> {
+	fn acknowledge_focus(focus: &Channel, expected: &[u8]) {
+		sched::run_until_idle();
+		let command = focus.recv().expect("focus command");
+		assert_eq!(&command.bytes[..], expected, "expected focus transition");
+		focus.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("focus acknowledgement");
+	}
+
+	fn acquire(client: &Channel, focus: &Channel, expected_focus: &[u8], corr: u32, width: u32, height: u32) -> alloc::sync::Arc<MemoryObject> {
 		client.send(request(1, corr, &[width, height])).expect("acquire request");
+		acknowledge_focus(focus, expected_focus);
 		sched::run_until_idle();
 		let reply = client.recv().expect("acquire reply");
 		assert_eq!(le_u32(&reply.bytes, 0), corr, "acquire echoes correlation id");
@@ -2994,8 +3101,12 @@ fn display_service_restores_the_console_surface() {
 	let (boot_kernel, boot_user) = Channel::create();
 	let (service_server, console_client) = Channel::create();
 	let (gpu_kernel, gpu_user) = Channel::create();
+	let (focus_input, focus_display) = Channel::create();
+	let (kill_input, kill_display) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn DisplayService");
 	send_cap(&boot_kernel, b"GPU", gpu_user, Rights::ALL).expect("gpu bootstrap");
+	send_cap(&boot_kernel, b"FOCUS", focus_display, Rights::ALL).expect("focus bootstrap");
+	send_cap(&boot_kernel, b"KILL", kill_display, Rights::ALL).expect("kill bootstrap");
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 
 	// Answer the driver's FB handshake with a 4x4 B8G8R8X8 DMA scanout.
@@ -3016,7 +3127,7 @@ fn display_service_restores_the_console_surface() {
 	assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
 
 	// The root connection is the native-size console surface.
-	let console = acquire(&console_client, 1, 0, 0);
+	let console = acquire(&console_client, &focus_input, b"CONSOLE", 1, 0, 0);
 	fill(&console, 0x0011_2233, 16);
 	console_client.send(request(2, 2, &[0, 0, 4, 4])).expect("console present");
 	acknowledge_present(&gpu_kernel, Some((&console_client, 2)));
@@ -3038,23 +3149,47 @@ fn display_service_restores_the_console_surface() {
 
 	// A later client becomes foreground. Explicit release restores and presents console.
 	let app = connect(&console_client);
-	let app_surface = acquire(&app, 3, 2, 2);
+	let app_surface = acquire(&app, &focus_input, b"SET", 3, 2, 2);
+	app.send(request(5, 11, &[])).expect("input focus proof request");
+	sched::run_until_idle();
+	let proof_reply = app.recv().expect("input focus proof reply");
+	assert_eq!(le_u32(&proof_reply.bytes, 0), 11);
+	assert_eq!(proof_reply.bytes[4], 1, "active app receives its focus proof");
+	assert_eq!(proof_reply.caps.len(), 1, "focus proof is transferred out of band");
+	app.send(request(5, 12, &[])).expect("replayed input focus proof request");
+	sched::run_until_idle();
+	let replay_reply = app.recv().expect("replayed focus proof reply");
+	assert_eq!(replay_reply.bytes[4], 0, "focus proof is one-shot");
 	fill(&app_surface, 0x00aa_bbcc, 4);
 	app.send(request(2, 4, &[0, 0, 2, 2])).expect("app present");
 	acknowledge_present(&gpu_kernel, Some((&app, 4)));
 	assert_eq!(scanout_pixel(&scanout), 0x00aa_bbcc, "foreground app replaces the console");
 	app.send(request(3, 5, &[])).expect("app release");
+	acknowledge_focus(&focus_input, b"CONSOLE");
 	acknowledge_present(&gpu_kernel, Some((&app, 5)));
 	assert_eq!(scanout_pixel(&scanout), 0x0011_2233, "release restores the console surface");
 
+	// The private emergency command revokes a frozen foreground display connection.
+	let frozen = connect(&console_client);
+	let frozen_surface = acquire(&frozen, &focus_input, b"SET", 9, 2, 2);
+	fill(&frozen_surface, 0x0000_77dd, 4);
+	frozen.send(request(2, 10, &[0, 0, 2, 2])).expect("frozen app present");
+	acknowledge_present(&gpu_kernel, Some((&frozen, 10)));
+	kill_input.send(Message::new(b"KILL".to_vec(), alloc::vec::Vec::new(), 0)).expect("emergency display revoke");
+	acknowledge_focus(&focus_input, b"CONSOLE");
+	acknowledge_present(&gpu_kernel, None);
+	assert!(frozen.is_peer_closed(), "emergency revoke closes the foreground display connection");
+	assert_eq!(scanout_pixel(&scanout), 0x0011_2233, "emergency revoke restores the console surface");
+
 	// A crashed client has the same restoration guarantee through channel peer-close.
 	let crashed = connect(&console_client);
-	let crashed_surface = acquire(&crashed, 6, 2, 2);
+	let crashed_surface = acquire(&crashed, &focus_input, b"SET", 6, 2, 2);
 	fill(&crashed_surface, 0x00dd_4400, 4);
 	crashed.send(request(2, 7, &[0, 0, 2, 2])).expect("crashed app present");
 	acknowledge_present(&gpu_kernel, Some((&crashed, 7)));
 	assert_eq!(scanout_pixel(&scanout), 0x00dd_4400, "second foreground app reaches scanout");
 	drop(crashed);
+	acknowledge_focus(&focus_input, b"CONSOLE");
 	acknowledge_present(&gpu_kernel, None);
 	assert_eq!(scanout_pixel(&scanout), 0x0011_2233, "peer-close restores the console surface");
 }
@@ -3609,7 +3744,6 @@ fn init_package_starts_system_manager() {
 		b"StorageService: online",
 		b"ProcessService: online",
 		b"ConfigService: online",
-		b"DisplayService: online",
 		b"AudioService: online",
 		b"InputService: online",
 		b"ResourceManager: online",
@@ -3617,6 +3751,7 @@ fn init_package_starts_system_manager() {
 		b"NetworkService: online",
 		b"DeviceService: online",
 		b"TimeService: online",
+		b"DisplayService: online",
 		b"PermissionManager: online",
 		b"ConsoleService: online",
 		b"SystemGraphService: online",
