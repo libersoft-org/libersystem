@@ -7,7 +7,12 @@ use proto::system::KeyEvent;
 
 pub mod usage {
 	pub const A: u16 = 0x04;
+	pub const Q: u16 = 0x14;
 	pub const ESCAPE: u16 = 0x29;
+	pub const RIGHT: u16 = 0x4f;
+	pub const LEFT: u16 = 0x50;
+	pub const DOWN: u16 = 0x51;
+	pub const UP: u16 = 0x52;
 	pub const LEFT_CTRL: u16 = 0xe0;
 	pub const LEFT_SHIFT: u16 = 0xe1;
 	pub const LEFT_ALT: u16 = 0xe2;

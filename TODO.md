@@ -2543,24 +2543,26 @@ cross-builds green.
 
 ## M122 - Image viewer (the first graphical application)
 
+Status: DONE (2026-07-14).
+
 The first real consumer of M121, runnable from the console before any game
 exists: `view vol://system/photo.png` takes the screen, shows the image, and a
 keypress returns to the shell. Deliberately small - it proves the whole platform
 loop (grant -> acquire -> decode -> present -> input -> release) end to end.
 
-- [ ] Dependency-free `no_std` image decoders: BMP (uncompressed + RLE) and PNG
+- [x] Dependency-free `no_std` image decoders: BMP (uncompressed + RLE) and PNG
       (a vendored inflate, the same zero-dependency discipline as the LZ4 coder).
       Decoders follow the fs-track hostile-input rules: every count, length,
       offset and dimension off the file is bounded before allocation or use - a
       malformed or malicious image errors cleanly, never panics or OOMs
       (host-tested with corrupt fixtures, like the filesystem crates).
-- [ ] The `view` tool: a governed ELF (`view <vol://...>`) with the manifest
+- [x] The `view` tool: a governed ELF (`view <vol://...>`) with the manifest
       grants `volumes + display + input-keys`; it decodes the image, scales it
       to fit the screen (reusing the M121 scaler contract), presents it, and
       serves keys - Esc/q to quit, arrows to pan when the image is larger than
       the screen, +/- zoom as a stretch goal. Exiting (or crashing) returns the
       console per the M121 guarantee.
-- [ ] Tests: host decoder suites over golden and corrupt fixtures; a kernel test
+- [x] Tests: host decoder suites over golden and corrupt fixtures; a kernel test
       that launches the staged `view` against a stand-in display service and
       asserts the acquire/present/release + key-quit sequence; a live QEMU pass
       showing an actual image on the virtio-gpu scanout (screenshot-verified).
@@ -2571,6 +2573,22 @@ loop (grant -> acquire -> decode -> present -> input -> release) end to end.
 - Concept: M121 (the platform layer this consumes), the powerbox/file-picker
       model (a viewer is the natural first picker client later), the NOTES
       "demo showing graphics capabilities" item this realizes.
+
+Result: `view` is a governed console-launched ELF with exactly
+`volumes + display + input-keys`; it content-sniffs BMP/PNG, decodes into bounded
+B8G8R8X8 storage, fits to the acquired surface, switches oversized images to a
+native crop on arrow input, and exits on Esc/q with explicit release. Atomic no_std
+`libbmp` supports indexed/direct Windows and OS/2 rows, bitfields and RLE4/RLE8;
+`libpng` verifies chunks and zlib Adler-32, handles stored/fixed/dynamic DEFLATE,
+all standard color types/bit depths, all five filters, transparency and Adam7.
+Hostile sizes, tables, runs, chunks and output allocations are checked and capped.
+Validation: 22/22 app-library host tests (12 decoder tests including staged golden
+BMP/PNG and corrupt/bounded streams), focused x86 process/service/storage/display/input
+51/51 with acquire -> nonblank present -> arrow-pan present -> q -> release -> exit,
+fmt/gen/diff clean, and x86_64/aarch64/riscv64 userspace builds green. A fresh live
+x86 QEMU/VNC pass opened both staged formats through StorageService; screenshots showed
+the expected four 400x400 color quadrants on the virtio-gpu scanout, q restored the
+console after each run, and the VM shut down cleanly.
 
 ## M123 - Shared system libraries (dynamic linking)
 

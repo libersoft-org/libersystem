@@ -1,0 +1,6 @@
+[package]
+name = "libbmp"
+edition = "2024"
+description = "Dependency-free bounded BMP decoder"
+
+[dependencies]

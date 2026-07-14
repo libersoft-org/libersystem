@@ -240,12 +240,16 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 // captured stdout; request_probe's runtime request is refused by the headless policy default
 // (least privilege - an undeclared capability is never granted) and recorded as a dynamic
 // denial; and `cat` prints that file through its storage grant to the forwarded stdout. The
-// kernel only brokers the initial capabilities. Returns (expected,
+// scenario also launches `view` over a staged BMP and display/input stand-ins, proving its
+// acquire -> present -> focus -> key-quit -> release sequence. The kernel only brokers the
+// initial capabilities. Returns (expected,
 // probe_read, probe_summary, date_read, date_summary, request_read, request_summary,
 // cat_read): the file straight from the volume, then each component's proof and decisions
 // summary, then the bytes `cat` printed through the run launcher.
 fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, u64), &'static str> {
-	use object::channel::Channel;
+	use object::channel::{Channel, Message};
+	use object::memory_object::MemoryObject;
+	use object::process::Process;
 	use object::rights::Rights;
 
 	let (volume, package) = scenario_packages()?;
@@ -400,16 +404,16 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	// Prequeue one successful admin mint on each private connection. PermissionManager's
 	// generated clients all start at correlation id 0; DisplayService additionally receives
 	// the exact Process handle in the bind request queued at `display_admin_server`.
-	let admin_reply = |channel: &Channel, capability: alloc::sync::Arc<dyn object::KernelObject>| -> Result<(), &'static str> {
+	let admin_reply = |channel: &Channel, capability: alloc::sync::Arc<dyn object::KernelObject>, corr: u32| -> Result<(), &'static str> {
 		let mut bytes = alloc::vec::Vec::new();
-		bytes.extend_from_slice(&0u32.to_le_bytes());
+		bytes.extend_from_slice(&corr.to_le_bytes());
 		bytes.push(1);
 		bytes.extend_from_slice(&0u32.to_le_bytes());
 		send_cap(channel, &bytes, capability, Rights::ALL)
 	};
-	admin_reply(&display_admin_server, display_scope_client)?;
-	admin_reply(&input_admin_server, input_scope_client)?;
-	admin_reply(&audio_admin_server, audio_scope_client)?;
+	admin_reply(&display_admin_server, display_scope_client, 0)?;
+	admin_reply(&input_admin_server, input_scope_client, 0)?;
+	admin_reply(&audio_admin_server, audio_scope_client, 0)?;
 
 	let (graphics_output, graphics_stdout) = Channel::create();
 	let mut run = alloc::vec::Vec::new();
@@ -430,6 +434,109 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let graphics_read = graphics_output.recv().map_err(|_| "graphics_probe received incomplete grants")?;
 	let graphics_start_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(graphics_start));
 	crate::serial_println!("app-start-perf: graphics_probe={}ns", graphics_start_ns);
+
+	// Launch the real image viewer through the same governed path. Each scoped grant uses a
+	// fresh generated admin client, so its correlation id starts at zero; their server ends
+	// are the focused stand-ins below, so the test observes the exact app-side protocol.
+	let (view_display_server, view_display_client) = Channel::create();
+	let (view_input_server, view_input_client) = Channel::create();
+	admin_reply(&display_admin_server, view_display_client, 0)?;
+	admin_reply(&input_admin_server, view_input_client, 0)?;
+	let (view_output, view_stdout) = Channel::create();
+	let mut view_run = alloc::vec::Vec::new();
+	view_run.extend_from_slice(&3u16.to_le_bytes());
+	view_run.extend_from_slice(&1u32.to_le_bytes());
+	for value in [&b"view"[..], &b"vol://system/sample.bmp"[..], &b"vol://system"[..]] {
+		view_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
+		view_run.extend_from_slice(value);
+	}
+	view_run.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&perm_client, &view_run, view_stdout, Rights::ALL)?;
+	sched::run_until_idle();
+	let view_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer view run")?;
+	if view_reply.bytes.len() < 5 || view_reply.bytes[4] == 0 {
+		return Err("PermissionManager refused view");
+	}
+	let view_process = view_reply.caps.first().ok_or("view run returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "view run handle was not a Process")?;
+
+	let acquire = view_display_server.recv().map_err(|_| "view did not acquire a surface")?;
+	if acquire.bytes.len() < 14 || le_u16(&acquire.bytes, 0) != 1 || le_u32(&acquire.bytes, 6) != 0 || le_u32(&acquire.bytes, 10) != 0 {
+		return Err("view sent an invalid acquire request");
+	}
+	let surface = MemoryObject::create(4).ok_or("view surface allocation failed")?;
+	let acquire_corr = le_u32(&acquire.bytes, 2);
+	let mut acquire_reply = alloc::vec::Vec::new();
+	acquire_reply.extend_from_slice(&acquire_corr.to_le_bytes());
+	acquire_reply.push(1);
+	acquire_reply.extend_from_slice(&4u64.to_le_bytes());
+	acquire_reply.extend_from_slice(&1u32.to_le_bytes());
+	acquire_reply.extend_from_slice(&1u32.to_le_bytes());
+	acquire_reply.extend_from_slice(&4u32.to_le_bytes());
+	acquire_reply.push(0);
+	send_cap(&view_display_server, &acquire_reply, surface.clone(), Rights::ALL)?;
+	sched::run_until_idle();
+
+	let present = view_display_server.recv().map_err(|_| "view did not present its decoded image")?;
+	if present.bytes.len() < 22 || le_u16(&present.bytes, 0) != 2 || le_u32(&present.bytes, 14) != 1 || le_u32(&present.bytes, 18) != 1 {
+		return Err("view sent an invalid first present");
+	}
+	if !read_from_object(&surface, 4).iter().any(|byte| *byte != 0) {
+		return Err("view presented a blank decoded image");
+	}
+	let present_corr = le_u32(&present.bytes, 2);
+	view_display_server.send(Message::new([present_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "view present reply failed")?;
+	sched::run_until_idle();
+
+	let focus_request = view_display_server.recv().map_err(|_| "view did not request input focus")?;
+	if focus_request.bytes.len() < 6 || le_u16(&focus_request.bytes, 0) != 5 {
+		return Err("view sent an invalid input-focus request");
+	}
+	let focus_corr = le_u32(&focus_request.bytes, 2);
+	let (_focus_server, focus_client) = Channel::create();
+	let mut focus_reply = alloc::vec::Vec::new();
+	focus_reply.extend_from_slice(&focus_corr.to_le_bytes());
+	focus_reply.push(1);
+	focus_reply.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&view_display_server, &focus_reply, focus_client.clone(), Rights::ALL)?;
+	sched::run_until_idle();
+
+	let subscribe = view_input_server.recv().map_err(|_| "view did not subscribe to focused keys")?;
+	if subscribe.bytes.len() < 10 || le_u16(&subscribe.bytes, 0) != 2 || subscribe.caps.is_empty() {
+		return Err("view sent an invalid key subscription");
+	}
+	let transferred_focus = subscribe.caps[0].object().into_any_arc().downcast::<Channel>().map_err(|_| "view key subscription did not transfer focus proof")?;
+	if !alloc::sync::Arc::ptr_eq(&transferred_focus, &focus_client) {
+		return Err("view transferred the wrong focus proof");
+	}
+	let subscribe_corr = le_u32(&subscribe.bytes, 2);
+	let (key_producer, key_consumer) = Channel::create();
+	send_cap(&view_input_server, &subscribe_corr.to_le_bytes(), key_consumer, Rights::ALL)?;
+	sched::run_until_idle();
+	let pan_frame = [0, 0, 0, 0, 0x4f, 0, 1];
+	key_producer.send(Message::new(pan_frame.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send view pan key")?;
+	sched::run_until_idle();
+	let pan_present = view_display_server.recv().map_err(|_| "view did not present after arrow-key pan")?;
+	if pan_present.bytes.len() < 22 || le_u16(&pan_present.bytes, 0) != 2 || le_u32(&pan_present.bytes, 14) != 1 || le_u32(&pan_present.bytes, 18) != 1 {
+		return Err("view sent an invalid pan present");
+	}
+	let pan_corr = le_u32(&pan_present.bytes, 2);
+	view_display_server.send(Message::new([pan_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "view pan-present reply failed")?;
+	sched::run_until_idle();
+	let quit_frame = [1, 0, 0, 0, 0x14, 0, 1];
+	key_producer.send(Message::new(quit_frame.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send view quit key")?;
+	sched::run_until_idle();
+
+	let release = view_display_server.recv().map_err(|_| "view did not release its surface after q")?;
+	if release.bytes.len() < 6 || le_u16(&release.bytes, 0) != 3 {
+		return Err("view sent an invalid release request");
+	}
+	let release_corr = le_u32(&release.bytes, 2);
+	view_display_server.send(Message::new([release_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "view release reply failed")?;
+	core::mem::drop(view_output);
+	sched::run_until_idle();
+	if !view_process.is_terminated() {
+		return Err("view did not exit after releasing the surface");
+	}
 	Ok((expected, probe_read.bytes, probe_summary.bytes, date_read.bytes, date_summary.bytes, request_read.bytes, request_summary.bytes, cat_read.bytes, graphics_read.bytes, graphics_start_ns))
 }
 

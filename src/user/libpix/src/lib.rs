@@ -85,6 +85,26 @@ pub fn blit(source: Image<'_>, mut target: Target<'_>, damage: Rect, first: bool
 	Some(BlitResult { rect, pixels: written, direct: false })
 }
 
+pub fn blit_crop(source: Image<'_>, mut target: Target<'_>, source_x: u32, source_y: u32) -> Option<BlitResult> {
+	validate(&source, &target, Rect { x: 0, y: 0, width: source.width, height: source.height })?;
+	if source_x >= source.width || source_y >= source.height {
+		return None;
+	}
+	let width = (source.width - source_x).min(target.width);
+	let height = (source.height - source_y).min(target.height);
+	let offset_x = (target.width - width) / 2;
+	let offset_y = (target.height - height) / 2;
+	target.data.fill(0);
+	for y in 0..height {
+		for x in 0..width {
+			let source_offset = (source_y + y) as usize * source.pitch as usize + (source_x + x) as usize * 4;
+			let pixel = u32::from_le_bytes(source.data[source_offset..source_offset + 4].try_into().ok()?);
+			write_pixel(&mut target, offset_x + x, offset_y + y, pixel);
+		}
+	}
+	Some(BlitResult { rect: Rect { x: 0, y: 0, width: target.width, height: target.height }, pixels: target.width as u64 * target.height as u64, direct: false })
+}
+
 fn validate(source: &Image<'_>, target: &Target<'_>, damage: Rect) -> Option<()> {
 	if source.width == 0 || source.height == 0 || target.width == 0 || target.height == 0 {
 		return None;
@@ -171,5 +191,19 @@ mod tests {
 		blit(Image { data: &source, width: 2, height: 1, pitch: 8 }, target(&mut output, 4, 4), Rect { x: 0, y: 0, width: 2, height: 1 }, true).unwrap();
 		assert_eq!(&output[..16], &[0; 16]);
 		assert_eq!(&output[48..], &[0; 16]);
+	}
+
+	#[test]
+	fn native_crop_uses_the_requested_source_origin_and_clears_the_target() {
+		let source = bytes(&[1, 2, 3, 4, 5, 6]);
+		let mut output = vec![0xaau8; 16];
+		let result = blit_crop(Image { data: &source, width: 3, height: 2, pitch: 12 }, target(&mut output, 2, 2), 1, 0).unwrap();
+		assert_eq!(result.rect, Rect { x: 0, y: 0, width: 2, height: 2 });
+		assert_eq!(output, bytes(&[2, 3, 5, 6]));
+
+		let mut letterbox = vec![0xaau8; 24];
+		blit_crop(Image { data: &source, width: 3, height: 2, pitch: 12 }, target(&mut letterbox, 3, 2), 2, 0).unwrap();
+		assert_eq!(&letterbox[..4], &[0; 4]);
+		assert_eq!(u32::from_le_bytes(letterbox[4..8].try_into().unwrap()), 3);
 	}
 }

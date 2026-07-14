@@ -1,0 +1,6 @@
+[package]
+name = "libpng"
+edition = "2024"
+description = "Dependency-free bounded PNG and DEFLATE decoder"
+
+[dependencies]

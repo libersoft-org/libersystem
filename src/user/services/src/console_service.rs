@@ -35,7 +35,7 @@ use alloc::vec::Vec;
 // display `Surface`. This service supplies the userspace display backends - the boot
 // framebuffer and the virtio-gpu shared backing - and drives `Term`; the kernel boot
 // console shares the same `Term`.
-use term::{Echo, EchoBuf, Geometry, Ld, Raster, RawSink, Surface, Term, CELL_H, CELL_W, LD_HIST_MAX, SCROLLBACK_ROWS};
+use term::{CELL_H, CELL_W, Echo, EchoBuf, Geometry, LD_HIST_MAX, Ld, Raster, RawSink, SCROLLBACK_ROWS, Surface, Term};
 
 // A DisplayService surface: the raster writes the client-owned MemoryObject and each
 // present synchronously copies the damage rectangle to the service-owned scanout.

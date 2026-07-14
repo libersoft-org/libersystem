@@ -90,6 +90,7 @@ tool      config     tools  volume
 tool      set        tools  volume
 tool      beep       tools  volume
 tool      graphics_probe tools volume
+tool      view       tools  volume
 tool      usage      tools  volume
 tool      ps         tools  volume
 tool      run        tools  volume

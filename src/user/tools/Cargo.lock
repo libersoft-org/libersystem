@@ -7,6 +7,34 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "libbmp"
+version = "0.0.0"
+
+[[package]]
+name = "libkeys"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "libpix"
+version = "0.0.0"
+
+[[package]]
+name = "libpng"
+version = "0.0.0"
+
+[[package]]
+name = "libsurface"
+version = "0.0.0"
+dependencies = [
+ "libpix",
+ "proto",
+ "rt",
+]
+
+[[package]]
 name = "proto"
 version = "0.0.0"
 
@@ -22,6 +50,11 @@ dependencies = [
 name = "tools"
 version = "0.0.0"
 dependencies = [
+ "libbmp",
+ "libkeys",
+ "libpix",
+ "libpng",
+ "libsurface",
  "proto",
  "rt",
 ]

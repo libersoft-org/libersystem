@@ -84,6 +84,10 @@ name = "graphics_probe"
 path = "src/graphics_probe.rs"
 
 [[bin]]
+name = "view"
+path = "src/view.rs"
+
+[[bin]]
 name = "usage"
 path = "src/usage.rs"
 
@@ -203,6 +207,12 @@ rt = { path = "../rt" }
 # Generated LSIDL bindings: the net tools speak the NetworkService contracts
 # (`network` / `socket`) via the proto codec + generated clients.
 proto = { path = "../../proto" }
+
+libbmp = { path = "../libbmp" }
+libkeys = { path = "../libkeys" }
+libpix = { path = "../libpix" }
+libpng = { path = "../libpng" }
+libsurface = { path = "../libsurface" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so we
 # do not set `panic = "abort"` per-profile (same reasoning as the kernel).
