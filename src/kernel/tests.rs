@@ -3345,6 +3345,21 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	sched::run_until_idle();
 	let stop = snd_host.recv().expect("peer-close stop sentinel");
 	assert!(stop.bytes.is_empty(), "peer-close drops queued source frames before another period");
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("peer-close stop ACK");
+	sched::run_until_idle();
+
+	// A driver crash while a period is pending closes every live PCM stream and
+	// makes future opens fail cleanly instead of leaving clients blocked forever.
+	let doomed = open(&service_client, 13, 48_000, 2).expect("stream before driver crash");
+	send_write(&doomed, 14, &pcm(512, 2, 200));
+	sched::run_until_idle();
+	write_reply(&doomed, 14, 512);
+	let period = snd_host.recv().expect("period pending at driver crash");
+	assert_eq!(sample(&period), 200);
+	drop(snd_host);
+	sched::run_until_idle();
+	assert!(doomed.is_peer_closed(), "driver crash closes live PCM streams");
+	assert!(open(&service_client, 15, 48_000, 2).is_err(), "driver crash makes future opens fail");
 }
 
 tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow]);

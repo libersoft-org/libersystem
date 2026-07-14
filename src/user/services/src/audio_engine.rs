@@ -389,7 +389,7 @@ unsafe fn serve(root: u64, mut state: Audio) -> ! {
 			}
 			waits.extend_from_slice(&clients);
 			for stream in &state.streams {
-				if stream.chan != 0 && stream.pending.is_none() {
+				if stream.chan != 0 {
 					waits.push(stream.chan);
 				}
 			}
@@ -442,6 +442,18 @@ unsafe fn serve(root: u64, mut state: Audio) -> ! {
 				continue;
 			}
 			let Some(index) = state.streams.iter().position(|stream| stream.chan == ready_chan) else { continue };
+			if state.streams[index].pending.is_some() {
+				match recv_blocking(ready_chan, &mut request) {
+					Received::Message { handle, .. } => {
+						if handle != 0 {
+							close(handle);
+						}
+						state.remove_stream(index);
+					}
+					Received::Closed => state.remove_stream(index),
+				}
+				continue;
+			}
 			match recv_blocking(ready_chan, &mut request) {
 				Received::Message { len, handle } => {
 					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
