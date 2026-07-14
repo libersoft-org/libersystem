@@ -12,11 +12,24 @@ record pointer-event {
 	buttons: u8,
 }
 
+/// One state transition in the canonical raw-key namespace. `code` is a USB HID
+/// Keyboard/Keypad usage id (usage page 0x07); virtio EV_KEY codes are translated at
+/// the driver boundary and xHCI boot-keyboard usages pass through directly. Modifier
+/// keys are ordinary usages. Raw input never synthesizes repeat events.
+record key-event {
+	code:    u16,
+	pressed: bool,
+}
+
 /// InputService: typed pointer/button events from the virtio-input pointer device,
 /// mapped to the text-cell grid. `subscribe` hands back a wait-drained event stream of
 /// the recent pointer events (the bounded-snapshot form; a continuously live
 /// stream is a later refinement). The device is reached as a capability, never as
-/// ambient input access - the plumbing a future TUI consumes.
+/// ambient input access - the plumbing a future TUI consumes. `subscribe-keys` is a
+/// continuously live, bounded-channel stream granted only to the display owner. On
+/// focus loss the service emits key-up for every key still held before closing the
+/// stream, so a new foreground app cannot inherit stuck state.
 interface input {
-	@op(1) subscribe: func() -> stream<pointer-event>;
+	@op(1) subscribe:      func() -> stream<pointer-event>;
+	@op(2) subscribe-keys: func() -> stream<key-event>;
 }

@@ -45,6 +45,10 @@ impl Service for Audio {
 		}
 		unsafe { play_tone(self.snd, freq, millis) }
 	}
+
+	fn open_stream(&mut self, _rate: u32, _channels: u8) -> Result<u64, Error> {
+		Err(Error::Invalid)
+	}
 }
 
 #[unsafe(no_mangle)]

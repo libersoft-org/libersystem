@@ -3,6 +3,7 @@ pub mod audio;
 pub mod base;
 pub mod config;
 pub mod device;
+pub mod display;
 pub mod input;
 pub mod log;
 pub mod network;

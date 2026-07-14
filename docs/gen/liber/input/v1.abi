@@ -1,4 +1,6 @@
 package liber:input@1
 record pointer-event(col:u16,row:u16,buttons:u8)
+record key-event(code:u16,pressed:bool)
 interface input
 method input.subscribe op=1 () -> stream<pointer-event>
+method input.subscribe-keys op=2 () -> stream<key-event>

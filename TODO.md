@@ -2431,12 +2431,15 @@ layer exists.
       `liber:display@1` package with `acquire(width, height) -> result<surface-info, error>`
       (`surface-info { pixels: buffer, width: u32, height: u32, pitch: u32, format }`),
       `present(x, y, width, height) -> result<unit, error>`, and `release()`.
-      The first implementation serves only the fullscreen single-client case
-      (ConsoleService or a thin DisplayService over the existing gpu backing),
-      but the CONTRACT is written so a later compositor is a server-side upgrade,
-      not an API break: the client never learns it is fullscreen, presents damage
-      rectangles, and owns nothing but its own buffer. The service scales or
-      centers a smaller surface onto the scanout (nearest-neighbor first).
+  A dedicated DisplayService owns the gpu client, scanout arbitration and
+  physical backing; ConsoleService becomes a display client just like an app.
+  DisplayService creates each surface MemoryObject, retains a read+map
+  duplicate and transfers a write+map duplicate to the client. `present` is
+  synchronous: its validated damage rectangle has been copied/scaled and the
+  device flush completed when the reply arrives, so the client may then reuse
+  those pixels. The client never learns it is fullscreen and owns nothing but
+  its own buffer; a compositor is therefore a server-side upgrade, not an API
+  break. Center/scale smaller surfaces with nearest-neighbor first.
 - [ ] Fullscreen handoff and guaranteed return: the foreground VT hands the
       display to the app for the surface's lifetime; `release()`, process exit,
       or a CRASH (surface channel peer-close) always restores the text console
@@ -2449,17 +2452,28 @@ layer exists.
       `subscribe-keys() -> stream<key-event>` op delivering key-DOWN and key-UP
       events (both keyboard drivers already see releases internally - virtio-input
       diffs EV_KEY, xHCI HID diffs boot reports - today they only feed the cooked
-      console path). Delivery is foreground-only: focus IS the capability, keys
-      go solely to the app owning the display. Decide the pointer-capture
-      contract in the same pass (relative-motion mode for a captured pointer vs
-      the existing absolute cell events), even if capture ships later.
+      console path). The canonical code is the USB HID Keyboard/Keypad usage id;
+      translate virtio EV_KEY at its driver boundary, pass xHCI usages through,
+      and never synthesize repeat in the raw layer. Delivery is foreground-only:
+      focus IS the capability and keys go solely to the display owner. Before a
+      focus stream closes, synthesize key-up for every held key so state cannot
+      stick across apps. Generalize the generated LSIDL stream host from today's
+      finite `Vec<T>` snapshot producer to a long-lived bounded-channel producer;
+      keep the existing snapshot path for pointer/log callers. Pointer capture is
+      a future relative-motion stream (`dx`, `dy`, wheel delta, button state)
+      scoped to the same focus capability; absolute cell events remain the console
+      path.
 - [ ] PCM audio playback: extend `liber:audio@1` with
       `open-stream(rate: u32, channels: u8) -> result<handle<channel>, error>`;
-      the client pushes raw PCM chunks on the sub-channel (the `write-stream`
-      pattern: bounded-channel backpressure IS the playback clock) and closes to
-      end. AudioService gains a small software mixer (at least 2 simultaneous
-      streams plus the beep path reimplemented on top), so two apps can sound at
-      once without exclusive device ownership.
+  the returned channel serves a typed `pcm-stream` interface with
+  `write(data: buffer) -> result<u32, error>` and `close()`. Samples are signed
+  16-bit little-endian, interleaved, one or two channels; `write` accepts only
+  whole frames and replies with the accepted frame count after bounded playback
+  capacity is available, so IPC backpressure IS the playback clock. Peer-close
+  ends immediately; explicit close drains accepted samples. AudioService gains
+  a small software mixer (at least 2 simultaneous streams plus the beep path
+  reimplemented on top), so two apps can sound at once without exclusive
+  device ownership.
 - [ ] Presentation performance, measured: the nearest-neighbor scaler in the
       present path, a per-frame ms/present measurement (the game budget is ~28 ms
       per frame end to end), dirty-rectangle presents for app surfaces (the M104

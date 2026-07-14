@@ -1,0 +1,38 @@
+//! LiberSystem display package - capability-scoped application surfaces.
+
+package liber:display@1;
+
+use liber:base@1.{error};
+
+/// Pixel layouts accepted by DisplayService. The first format matches the existing
+/// virtio-gpu scanout and ConsoleService representation: in memory B, G, R, unused;
+/// as a little-endian u32, 0xXXRRGGBB.
+enum pixel-format {
+	b8g8r8x8,
+}
+
+/// A writable application surface. `pixels` is a shared MemoryObject: DisplayService
+/// retains a read+map duplicate and transfers a write+map handle to the client. Its
+/// wire length is exactly `pitch * height`; `pitch` is at least `width * 4` and all
+/// arithmetic is checked before allocation. The client owns the pixels, never the
+/// physical scanout.
+record surface-info {
+	pixels: buffer,
+	width:  u32,
+	height: u32,
+	pitch:  u32,
+	format: pixel-format,
+}
+
+/// One display connection owns at most one surface. `present` is synchronous: the
+/// service validates the damage rectangle, copies/scales that rectangle to its
+/// scanout and completes the device flush before replying; the client must not modify
+/// pixels inside the rectangle until the call returns. `release`, channel peer-close,
+/// or process death drops the surface and restores the console with a full repaint.
+/// The client is not told whether its surface is fullscreen; a compositor can later
+/// implement this same contract without an API break.
+interface display {
+	@op(1) acquire: func(width: u32, height: u32) -> result<surface-info, error>;
+	@op(2) present: func(x: u32, y: u32, width: u32, height: u32) -> result<unit, error>;
+	@op(3) release: func() -> result<unit, error>;
+}

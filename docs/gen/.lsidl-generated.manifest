@@ -6,6 +6,8 @@ liber/config/v1.abi
 liber/config/v1.md
 liber/device/v1.abi
 liber/device/v1.md
+liber/display/v1.abi
+liber/display/v1.md
 liber/input/v1.abi
 liber/input/v1.md
 liber/log/v1.abi

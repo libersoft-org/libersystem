@@ -1,5 +1,6 @@
 # Bugs / changes
 
+- audio player (different formats)
 - tests are taking too long after every small task - optimization needed
 - Can it run Doom?
 - text selection by mouse lags horribly

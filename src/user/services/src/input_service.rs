@@ -21,8 +21,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::PointerEvent;
 use proto::system::input;
+use proto::system::{KeyEvent, PointerEvent};
 use rt::*;
 
 // The default text-cell grid the normalized pointer position maps onto: the boot
@@ -65,6 +65,10 @@ impl Input {
 impl input::Service for Input {
 	fn subscribe(&mut self) -> Vec<PointerEvent> {
 		self.recent.clone()
+	}
+
+	fn subscribe_keys(&mut self) -> Vec<KeyEvent> {
+		Vec::new()
 	}
 }
 

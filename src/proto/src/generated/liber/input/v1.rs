@@ -47,11 +47,50 @@ impl PointerEvent {
 	}
 }
 
+/// One state transition in the canonical raw-key namespace. `code` is a USB HID
+/// Keyboard/Keypad usage id (usage page 0x07); virtio EV_KEY codes are translated at
+/// the driver boundary and xHCI boot-keyboard usages pass through directly. Modifier
+/// keys are ordinary usages. Raw input never synthesizes repeat events.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyEvent {
+	pub code: u16,
+	pub pressed: bool,
+}
+
+impl KeyEvent {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_inner())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<KeyEvent> {
+		KeyEvent::read(&mut Reader::new(bytes))
+	}
+	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u16(self.code)?;
+		w.boolean(self.pressed)?;
+		Some(())
+	}
+	pub(crate) fn read(r: &mut Reader) -> Option<KeyEvent> {
+		let code = r.u16()?;
+		let pressed = r.boolean()?;
+		Some(KeyEvent { code, pressed })
+	}
+}
+
 /// InputService: typed pointer/button events from the virtio-input pointer device,
 /// mapped to the text-cell grid. `subscribe` hands back a wait-drained event stream of
 /// the recent pointer events (the bounded-snapshot form; a continuously live
 /// stream is a later refinement). The device is reached as a capability, never as
-/// ambient input access - the plumbing a future TUI consumes.
+/// ambient input access - the plumbing a future TUI consumes. `subscribe-keys` is a
+/// continuously live, bounded-channel stream granted only to the display owner. On
+/// focus loss the service emits key-up for every key still held before closing the
+/// stream, so a new foreground app cannot inherit stuck state.
 // interface `input` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod input {
 	use super::*;
@@ -59,9 +98,11 @@ pub mod input {
 	use alloc::vec::Vec;
 
 	pub const OP_SUBSCRIBE: u16 = 1;
+	pub const OP_SUBSCRIBE_KEYS: u16 = 2;
 
 	pub trait Service {
 		fn subscribe(&mut self) -> Vec<PointerEvent>;
+		fn subscribe_keys(&mut self) -> Vec<KeyEvent>;
 	}
 
 	pub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handle: &mut u64, _out: &mut [u8], _reply_handle: &mut u64) -> Option<usize> {
@@ -109,6 +150,47 @@ pub mod input {
 		Some(value)
 	}
 
+	pub fn subscribe_keys_open<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64) -> Option<(u32, Vec<KeyEvent>)> {
+		let mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		if r.has_handle() {
+			return None;
+		}
+		*request_handle = 0;
+		let items = service.subscribe_keys();
+		Some((corr, items))
+	}
+	pub fn subscribe_keys_frame(seq: u32, item: &KeyEvent, out: &mut [u8], frame_handle: &mut u64) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if writer.has_handle() {
+				*frame_handle = writer.handle();
+			}
+			return None;
+		}
+		*frame_handle = writer.handle();
+		Some(writer.pos())
+	}
+	pub fn subscribe_keys_read(msg: &[u8], frame_handle: &mut u64) -> Option<KeyEvent> {
+		let mut reader = if *frame_handle == 0 { Reader::new(msg) } else { Reader::with_handle(msg, *frame_handle) };
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = KeyEvent::read(r)?;
+		if reader.has_handle() {
+			return None;
+		}
+		*frame_handle = 0;
+		Some(value)
+	}
+
 	pub struct Client<T: Transport> {
 		transport: T,
 		corr: u32,
@@ -131,6 +213,25 @@ pub mod input {
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
 			w.u16(OP_SUBSCRIBE)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || reply_handle == 0 {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			Some(reply_handle)
+		}
+		pub fn subscribe_keys(&mut self) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SUBSCRIBE_KEYS)?;
 			w.u32(corr)?;
 			let request_handle = writer.handle();
 			let request = writer.into_inner();
@@ -199,6 +300,57 @@ impl PointerEvent {
 	}
 }
 
+impl KeyEvent {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"code\":");
+		let _ = write!(out, "{}", self.code);
+		out.push(',');
+		out.push_str("\"pressed\":");
+		if self.pressed {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("code=");
+		let _ = write!(out, "{}", self.code);
+		out.push_str(", ");
+		out.push_str("pressed=");
+		if self.pressed {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "code");
+		crate::codec::cbor::uint(out, self.code as u64);
+		crate::codec::cbor::text(out, "pressed");
+		crate::codec::cbor::boolean(out, self.pressed);
+	}
+}
+
 #[cfg(test)]
 mod compat {
 	use super::*;
@@ -211,5 +363,13 @@ mod compat {
 		let golden: &[u8] = &[7, 0, 7, 0, 7];
 		assert_eq!(bytes, golden);
 		assert_eq!(PointerEvent::decode(&bytes).unwrap(), sample);
+	}
+	#[test]
+	fn key_event_wire_is_stable() {
+		let sample = KeyEvent { code: 7, pressed: true };
+		let bytes = sample.encode_vec().expect("encode");
+		let golden: &[u8] = &[7, 0, 1];
+		assert_eq!(bytes, golden);
+		assert_eq!(KeyEvent::decode(&bytes).unwrap(), sample);
 	}
 }

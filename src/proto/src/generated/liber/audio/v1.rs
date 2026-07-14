@@ -13,9 +13,8 @@ use crate::generated::liber::base::v1::Error;
 /// AudioService: headless PCM playback over the virtio-sound device. `beep` plays a
 /// tone of the given frequency (Hz) and duration (milliseconds) - the device is
 /// reached as a capability (the channel this interface is served on), never as
-/// ambient device access. The PCM is fixed-format (48 kHz, 2 channels, signed 16-bit)
-/// and synthesized by the service; arbitrary-PCM playback over a `buffer` is a later
-/// refinement.
+/// ambient device access. `open-stream` returns a sub-channel served as `pcm-stream`;
+/// the service validates the rate and channel count before creating it.
 // interface `audio` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod audio {
 	use super::*;
@@ -23,9 +22,11 @@ pub mod audio {
 	use alloc::vec::Vec;
 
 	pub const OP_BEEP: u16 = 1;
+	pub const OP_OPEN_STREAM: u16 = 2;
 
 	pub trait Service {
 		fn beep(&mut self, freq: u16, millis: u32) -> Result<(), Error>;
+		fn open_stream(&mut self, rate: u32, channels: u8) -> Result<u64, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -53,6 +54,44 @@ pub mod audio {
 						Err(v1) => {
 							w.u8(0)?;
 							v1.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						*reply_handle = writer.handle();
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_OPEN_STREAM => {
+				let rate = r.u32()?;
+				let channels = r.u8()?;
+				if r.has_handle() {
+					return None;
+				}
+				*request_handle = 0;
+				let result = service.open_stream(rate, channels);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v2) => {
+							w.u8(1)?;
+							w.set_handle(*v2)?;
+							w.u32(0)?;
+						}
+						Err(v3) => {
+							w.u8(0)?;
+							v3.write(w)?;
 						}
 					}
 					Some(())
@@ -102,6 +141,218 @@ pub mod audio {
 			w.u32(corr)?;
 			w.u16(*freq)?;
 			w.u32(*millis)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+			})();
+			if decoded.is_none() || reader.has_handle() {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			decoded
+		}
+		pub fn open_stream(&mut self, rate: &u32, channels: &u8) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OPEN_STREAM)?;
+			w.u32(corr)?;
+			w.u32(*rate)?;
+			w.u8(*channels)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				Some(if r.u8()? != 0 {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				})
+			})();
+			if decoded.is_none() || reader.has_handle() {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			decoded
+		}
+	}
+}
+
+/// A playback stream returned by `audio.open-stream`. Samples are signed 16-bit
+/// little-endian, interleaved by channel; one `write` contains whole sample frames.
+/// `write` returns the number of frames accepted only after bounded playback capacity
+/// is available, making synchronous IPC backpressure the playback clock. Closing the
+/// channel is equivalent to `close`; explicit close drains accepted samples first.
+// interface `pcm-stream` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod pcm_stream {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_WRITE: u16 = 1;
+	pub const OP_CLOSE: u16 = 2;
+
+	pub trait Service {
+		fn write(&mut self, data: crate::codec::Buffer) -> Result<u32, Error>;
+		fn close(&mut self) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		match op {
+			OP_WRITE => {
+				let data = {
+					let len = r.u64()?;
+					let handle = r.take_handle()?;
+					crate::codec::Buffer { handle, len }
+				};
+				if r.has_handle() {
+					return None;
+				}
+				*request_handle = 0;
+				let result = service.write(data);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v4) => {
+							w.u8(1)?;
+							w.u32(*v4)?;
+						}
+						Err(v5) => {
+							w.u8(0)?;
+							v5.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						*reply_handle = writer.handle();
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_CLOSE => {
+				if r.has_handle() {
+					return None;
+				}
+				*request_handle = 0;
+				let result = service.close();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v6) => {
+							w.u8(1)?;
+						}
+						Err(v7) => {
+							w.u8(0)?;
+							v7.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						*reply_handle = writer.handle();
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn write(&mut self, data: &crate::codec::Buffer) -> Option<Result<u32, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_WRITE)?;
+			w.u32(corr)?;
+			w.set_handle(data.handle)?;
+			w.u64(data.len)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				Some(if r.u8()? != 0 { Ok(r.u32()?) } else { Err(Error::read(r)?) })
+			})();
+			if decoded.is_none() || reader.has_handle() {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			decoded
+		}
+		pub fn close(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_CLOSE)?;
+			w.u32(corr)?;
 			let request_handle = writer.handle();
 			let request = writer.into_inner();
 			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
