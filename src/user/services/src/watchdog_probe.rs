@@ -36,7 +36,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// transparent-restart broker from the client side.
 		let mut request: [u8; 64] = [0u8; 64];
 		let mut reply: [u8; 32] = [0u8; 32];
-		serve(bootstrap, &mut request, &mut reply, |req: &[u8], _handle: u64, out: &mut [u8], _reply_handle: &mut u64| -> Option<usize> {
+		serve(bootstrap, &mut request, &mut reply, |req: &[u8], _handle: &mut u64, out: &mut [u8], _reply_handle: &mut u64| -> Option<usize> {
 			if req == b"CRASH" {
 				// a deliberate fault: write to the unmapped null page. The kernel records
 				// the fault, tears us down, and our channel peer-closes - the crash the

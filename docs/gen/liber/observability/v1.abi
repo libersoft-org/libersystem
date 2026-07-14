@@ -1,0 +1,12 @@
+package liber:observability@1
+enum component-type(service=0,driver=1,device=2)
+enum component-state(running=0,stopped=1,failed=2,restarting=3,pending=4)
+record counters(messages-sent:u64,messages-received:u64,handles:u64,memory-bytes:u64,restarts:u32,watchdog-trips:u32,last-failure:string)
+record component(name:string,type:component-type,state:component-state,deps:list<string>,counters:counters)
+record trace-span(name:string,duration-ns:u64)
+record graph(components:list<component>,spans:list<trace-span>)
+interface system-graph
+method system-graph.snapshot op=1 () -> result<graph, liber:base@1::error>
+record supervisor-stat(name:string,state:string,restarts:u32,watchdog-trips:u32,last-failure:string)
+interface supervisor
+method supervisor.status op=1 () -> result<list<supervisor-stat>, liber:base@1::error>

@@ -63,6 +63,15 @@ gen:
 	cd {{tools_dir}} && cargo run --quiet -- --rust-dir ../../{{proto_dir}}/src --docs-dir ../../../docs/gen ../../idl/*.lsidl
 	cd {{proto_dir}} && cargo fmt
 
+# Regenerate every package in memory and fail on Rust/docs/ABI or stale-output drift.
+gen-check:
+	cd {{tools_dir}} && cargo run --quiet -- --check --rust-dir ../../{{proto_dir}}/src --docs-dir ../../../docs/gen ../../idl/*.lsidl
+
+# Explicitly accept an intentional pre-release breaking ABI-manifest change.
+gen-accept-breaking:
+	cd {{tools_dir}} && cargo run --quiet -- --accept-breaking --rust-dir ../../{{proto_dir}}/src --docs-dir ../../../docs/gen ../../idl/*.lsidl
+	cd {{proto_dir}} && cargo fmt
+
 # Build + boot one architecture through the unified QEMU runner. With no architecture,
 # use the host architecture; an explicit first target runs natively or under emulation.
 # A display may still be the first argument: `just run vnc` remains native.
@@ -272,7 +281,7 @@ fmt-check:
 	cd {{fat_dir}} && cargo fmt --check
 	cd {{iso9660_dir}} && cargo fmt --check
 	cd {{udf_dir}} && cargo fmt --check
-	shfmt -d ../setup.sh boot/qemu-common.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh
+	shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh
 
 # clean build artifacts
 clean:

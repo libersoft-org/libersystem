@@ -1,0 +1,29 @@
+package liber:network@1
+record ipv4-addr(a:u8,b:u8,c:u8,d:u8)
+record endpoint(addr:ipv4-addr,port:u16)
+record neighbor(addr:ipv4-addr,mac:list<u8>)
+record net-info(addr:ipv4-addr,mac:list<u8>,mtu:u16,gateway:ipv4-addr,neighbors:list<neighbor>)
+record net-capacity(clients:u32,sockets:u32,listeners:u32,connections:u32)
+enum ping-status(reply=0,timeout=1,unreachable=2)
+record ping-reply(status:ping-status,ttl:u8,rtt-us:u32)
+record tcp-request(ep:endpoint,request:list<u8>)
+enum sock-state(closed=0,syn-sent=1,syn-rcvd=2,established=3,fin-wait=4,listen=5)
+record sock-info(local-port:u16,remote:endpoint,state:sock-state)
+interface network
+method network.info op=1 () -> result<net-info, liber:base@1::error>
+method network.resolve op=2 (name:string:rights=) -> result<ipv4-addr, liber:base@1::error>
+method network.ping op=3 (addr:ipv4-addr:rights=) -> result<ping-reply, liber:base@1::error>
+method network.fetch op=4 (req:tcp-request:rights=) -> result<list<u8>, liber:base@1::error>
+method network.connect op=5 (ep:endpoint:rights=) -> result<handle<channel>, liber:base@1::error>
+method network.open op=6 () -> result<handle<channel>, liber:base@1::error>
+method network.listen op=7 (port:u16:rights=) -> result<handle<channel>, liber:base@1::error>
+method network.sockets op=8 () -> result<list<sock-info>, liber:base@1::error>
+method network.sntp op=9 (server:ipv4-addr:rights=) -> result<u64, liber:base@1::error>
+method network.capacity op=10 () -> result<net-capacity, liber:base@1::error>
+interface socket
+method socket.send op=1 (data:buffer:rights=) -> result<u32, liber:base@1::error>
+method socket.recv op=2 () -> stream<chunk>
+method socket.close op=3 () -> result<unit, liber:base@1::error>
+record chunk(data:list<u8>)
+interface listener
+method listener.accept op=1 () -> result<handle<channel>, liber:base@1::error>

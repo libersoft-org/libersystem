@@ -183,7 +183,8 @@ unsafe fn serve(service: u64, raws: [u64; 2], forward: u64, state: &mut Input) {
 // event then travels as its own framed message on the producer endpoint, and closing
 // the producer marks end-of-stream.
 fn stream_subscribe(service: u64, request: &[u8], state: &mut Input) {
-	let (corr, items): (u32, Vec<PointerEvent>) = match input::subscribe_open(state, request) {
+	let mut request_handle: u64 = 0;
+	let (corr, items): (u32, Vec<PointerEvent>) = match input::subscribe_open(state, request, &mut request_handle) {
 		Some(v) => v,
 		None => return,
 	};
@@ -197,10 +198,15 @@ fn stream_subscribe(service: u64, request: &[u8], state: &mut Input) {
 	}
 	let mut frame: [u8; 32] = [0u8; 32];
 	for (seq, item) in items.iter().enumerate() {
-		if let Some(n) = input::subscribe_frame(seq as u32, item, &mut frame) {
+		let mut frame_handle: u64 = 0;
+		if let Some(n) = input::subscribe_frame(seq as u32, item, &mut frame, &mut frame_handle) {
 			unsafe {
-				send_blocking(producer, &frame[..n], 0);
+				if !send_blocking(producer, &frame[..n], frame_handle) && frame_handle != 0 {
+					close(frame_handle);
+				}
 			}
+		} else if frame_handle != 0 {
+			unsafe { close(frame_handle) };
 		}
 	}
 	unsafe {

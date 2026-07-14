@@ -1,0 +1,4 @@
+package liber:input@1
+record pointer-event(col:u16,row:u16,buttons:u8)
+interface input
+method input.subscribe op=1 () -> stream<pointer-event>

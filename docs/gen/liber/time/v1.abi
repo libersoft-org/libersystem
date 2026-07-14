@@ -1,0 +1,4 @@
+package liber:time@1
+record timestamp(unix-secs:u64)
+interface time
+method time.now op=1 () -> result<timestamp, liber:base@1::error>

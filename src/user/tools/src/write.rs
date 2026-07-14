@@ -95,7 +95,7 @@ unsafe fn write(storage: u64, uri: &[u8], text: &[u8]) {
 				w.u16(volume::OP_WRITE_STREAM)?;
 				w.u32(1)?;
 				w.bytes_lp(uri)?;
-				w.set_handle(consumer);
+				w.set_handle(consumer)?;
 				w.u32(0)?;
 				Some(())
 			};

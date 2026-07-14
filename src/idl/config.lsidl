@@ -1,0 +1,40 @@
+//! LiberSystem config package - configuration and file picker services.
+
+package liber:config@1;
+
+use liber:base@1.{error};
+use liber:storage@1.{file as storage-file};
+
+/// One configuration node: a dotted-path key (the tree path, e.g. "system.name")
+/// and its string value. The hierarchy lives in the key; the typed entry is the
+/// node - configuration is structured data, never parsed from text.
+record config-entry {
+	key:   string,
+	value: string,
+}
+
+/// The Config service contract: read a node by key, enumerate the whole tree, or
+/// write a node. Configuration is a typed tree, not a parsed text file; a textual
+/// form would only ever be an editable representation of these nodes.
+interface config {
+	@op(1) get:  func(key: string) -> result<string, error>;
+	@op(2) list: func() -> result<list<config-entry>, error>;
+	@op(3) set:  func(entry: config-entry) -> result<unit, error>;
+}
+
+/// A file the user picked: a capability to its bytes (transferred out-of-band as
+/// handle<file>) plus its length and name. The capability is granted by the act of
+/// picking - the powerbox pattern, where authority flows from the user's choice
+/// rather than from ambient filesystem access.
+record picked {
+	file: handle<storage-file>,
+	size: u64,
+	name: string,
+}
+
+/// The file-picker contract: `pick` prompts the user and hands back the chosen file
+/// as a capability. A caller with no filesystem access gains access to exactly the
+/// picked file, and to nothing else.
+interface picker {
+	@op(1) pick: func() -> result<picked, error>;
+}

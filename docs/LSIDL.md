@@ -17,7 +17,7 @@ LSIDL borrows its type vocabulary from WIT (records, enums, variants, results,
 lists, tuples, options) and adds three first-class system types WIT lacks:
 `handle<T>`, `buffer`, and `stream<T>`.
 
-- Status: design draft.
+- Status: implemented language and generator contract.
 - File extension: `.lsidl`
 - Generator: `lsidl-gen` (host tool), driven by `just gen`
 - Generated output: the `proto` crate (`no_std`) plus `docs/gen/`
@@ -45,8 +45,10 @@ A minimal LSIDL file declares a versioned package, some shared types, and one or
 more interfaces:
 
 ```lsidl
-// system.lsidl
-package liber:system@1;
+//! Structured logging contracts.
+package liber:log@1;
+
+use liber:base@1.{error};
 
 enum severity {
 	trace, debug, info, warn, error, fatal,
@@ -123,6 +125,8 @@ Example: `liber:system@1`, `liber:storage@1`.
 // line comment
 /* block
    comment */
+/// documentation for the next declaration or member
+//! package documentation before `package`
 ```
 
 ### Annotations
@@ -133,14 +137,15 @@ Annotations attach metadata to declarations. They begin with `@`:
 | --- | --- | --- |
 | `@op(n)` | method | the method's stable opcode (required) |
 | `@reserved(n)` | interface, enum | a retired opcode or ordinal that must never be reused |
-| `@rights(r, ...)` | `handle<T>` param | the minimum capability rights the method requires |
-| `@since(v)` | any item | the package version the item was added in (documentation) |
+| `@rights(r, ...)` | `handle<T>` param | validated contract metadata; runtime enforcement is not generated yet |
+| `@since(v)` | declaration/member | package version where it was added; stored, validated, and emitted |
+| `@deprecated(v)` | declaration/member | package version where it was deprecated; the adjacent doc comment carries the reason |
 
 ### Keywords
 
 ```text
 package  use  interface  func
-record   enum  variant  flags  resource
+record   enum  variant  flags  resource  type
 handle   buffer  stream
 result   option  list  tuple  unit
 bool  u8 u16 u32 u64  i8 i16 i32 i64  f32 f64  string
@@ -157,7 +162,7 @@ among themselves; forward references are allowed).
 ```lsidl
 package liber:storage@1;
 
-use liber:system.{error, severity};
+use liber:base@1.{error};
 
 resource file;
 
@@ -168,15 +173,34 @@ interface volume { /* ... */ }
 
 ### `use` imports
 
-`use` brings named items from another package into scope:
+`use` resolves explicit named exports from one exact package version:
 
 ```lsidl
-use liber:system.{error};          // import the `error` type
-use liber:system.{error, severity};
+use liber:base@1.{error};
+use liber:storage@1.{file, error as storage-error};
 ```
 
-Imported names are referenced unqualified. A `use` does not re-export; it only
-makes the names visible in the current file.
+The generator loads every CLI input as one compilation unit, resolves exact package
+identities in topological order, verifies each exported name and concrete kind,
+rejects missing packages/versions/names, duplicate identities, self-imports and
+cycles, and emits one qualified reference to the owning canonical Rust type.
+Imported names are direct and unqualified locally; imports do not re-export. One
+exact version of each package path may be loaded at a time; side-by-side versions
+remain deferred until a real migration requires them.
+
+### Wire-transparent aliases
+
+Non-generic aliases name units and intent without changing bytes:
+
+```lsidl
+type koid = u64;
+type ticks = u64;
+type name = string;
+```
+
+Aliases cannot form cycles. Validation, handle-cardinality analysis and generated
+codecs expand through the underlying wire type; Rust still exposes a normal `type`
+alias with its canonical package identity.
 
 ### `resource` declarations
 
@@ -287,15 +311,16 @@ interface volume {
 }
 ```
 
-`@rights(...)` documents and enforces the minimum rights the method needs on that
-handle; the generated server rejects an under-privileged handle with
-`error::denied` before dispatch.
+`@rights(...)` currently validates every named right and retains the requirement on
+the AST parameter, but generated dispatch does not inspect the received handle's
+rights. Kernel operations still enforce their own handle rights; generated
+pre-dispatch enforcement awaits a host-supplied `HandleInspector` boundary.
 
-**`buffer`** - a shared, zero-copy memory region backed by a DMA buffer object
-(`SYS_DMA_BUFFER_CREATE` / `_MAP` / `_PHYS`). The bytes are never copied into the
-message; the stream carries only a descriptor `[dma-id u32][offset u64][len u64]`
-that the receiver maps. `buffer` is how bulk I/O (disk sectors, network frames)
-moves without per-message copies.
+**`buffer`** - a shared, zero-copy memory region backed by a transferable memory
+object. The bytes are never copied into the message. The current wire carries one
+out-of-band handle plus `[len u64]` in the byte stream; there is no dma-id or offset
+field. The receiver maps the transferred object and validates the claimed length
+against the object's real size.
 
 **`stream<T>`** - a backpressured sequence of `T`. A method returning `stream<T>`
 replies with a `handle<channel>` to a freshly created sub-channel; the producer
@@ -316,14 +341,15 @@ or reply pair identified by an explicit opcode.
 interface log {
 	@op(1) emit:  func(e: entry) -> result<unit, error>;
 	@op(2) query: func(q: query) -> result<list<entry>, error>;
-	@op(3) tail:  func(q: query) -> result<stream<entry>, error>;
+	@op(3) tail:  func(q: query) -> stream<entry>;
 }
 ```
 
 - A method takes zero or more named parameters and returns exactly one type,
   conventionally a `result<T, error>`.
 - A method that returns nothing meaningful uses `result<unit, error>`.
-- The opcode `@op(n)` is **mandatory** and must be unique within the interface.
+- The opcode `@op(n)` is **mandatory**, must be unique within the interface, and
+	must be in `1..=65531` (`0xfffc..=0xffff` are runtime control messages).
   Opcodes are declared, never derived from position, so reordering or inserting
   methods never shifts the wire (see [Versioning](#8-versioning-and-compatibility)).
 
@@ -334,7 +360,8 @@ interface log {
 ### Message framing
 
 Every method call is a request frame answered by a reply frame on the same
-channel. Correlation ids let multiple calls be in flight at once.
+channel. Correlation ids make future demultiplexing wire-compatible, but today's
+`Transport::call` is synchronous and permits one in-flight call per transport.
 
 ```text
 request = [ op u16 ][ corr u32 ]( arg... )      args in declared order
@@ -370,7 +397,7 @@ the layout is exactly as written.
 | `variant` | `[tag u8][payload?]` |
 | `result<T,E>` | `[is-ok u8][T or E]` |
 | `handle<R>` | `[placeholder u32]`; the capability rides the message's out-of-band handle slot |
-| `buffer` | `[dma-id u32][offset u64][len u64]` |
+| `buffer` | `[len u64]`; one transferred memory-object handle rides out-of-band |
 | `stream<T>` | returned as `handle<channel>` |
 
 `string` and `list` length prefixes are `u16`, capping either at 65535 elements
@@ -385,13 +412,14 @@ Larger payloads belong in a `buffer`, not inline.
 
 | Output | Destination | Contents |
 | --- | --- | --- |
-| binary codec | `proto` crate (`no_std`) | `encode` / `decode` for every type |
+| binary codec | `proto::generated::<package path>::vN` (`no_std`) | `encode` / `decode` for every type |
 | Rust client | `proto` crate | one method per `func`, returning a decoded result |
 | Rust server | `proto` crate | a trait plus an opcode `dispatch` the service implements |
 | JSON / CBOR | `proto` crate | the same value rendered as JSON or CBOR |
 | CLI formatter | `proto` crate | human-readable rendering of a request or record |
-| reference docs | `docs/gen/<package>.md` | per-interface tables, opcode list, type layouts |
-| compat tests | `proto` crate tests | golden wire bytes per type and opcode |
+| reference docs | `docs/gen/<package path>/vN.md` | linked imports, source prose, interfaces and layouts |
+| ABI manifest | `docs/gen/<package path>/vN.abi` | deterministic structural compatibility contract |
+| compat tests | generated Rust tests | golden wire bytes per type and opcode |
 
 Name mapping: kebab-case identifiers become `CamelCase` for Rust types and
 `snake_case` for Rust fields and methods (`min-severity` -> `min_severity`,
@@ -403,6 +431,13 @@ link it. `lsidl-gen` itself is an ordinary host binary (it may use `std`).
 The per-interface docs under `docs/gen/` are **generated** - they are not edited
 by hand. This file (`docs/LSIDL.md`) is the hand-written language spec; the two
 must not be confused.
+
+Generation parses, resolves, validates and renders every output in memory before
+touching disk. Destination collisions fail early; successful writes use per-file
+temporary replacements and a checked output manifest removes stale package files.
+`just gen-check` performs the whole operation without writing and fails on Rust,
+docs, ABI or stale-output drift. A breaking ABI-manifest delta is refused by normal
+generation; `just gen-accept-breaking` is the explicit pre-release acceptance path.
 
 ---
 
@@ -422,9 +457,10 @@ deliberate.
   existing record is a breaking change**. Either add it as a new type/method, or
   bump the package version.
 
-**The package version** (`@N`) is the ABI generation. Bump it on any breaking
-change. A client and a service that disagree on the major version do not
-interoperate; the generated handshake refuses the mismatch.
+**The package version** (`@N`) identifies the intended ABI generation. There is no
+generated runtime package-version handshake today, so a mismatched client and
+service are not automatically detected. Runtime negotiation needs a separately
+designed reserved control operation; source package resolution can land without it.
 
 **Compatibility tests** capture golden wire bytes for each type and opcode. Any
 change that shifts the bytes fails the test, forcing an explicit version bump
@@ -433,6 +469,17 @@ rather than a silent break.
 > Forward-compatible *extensible records* (a length-prefixed record whose unknown
 > trailing fields are skipped by older decoders) are a possible future addition.
 > The MVP keeps records fixed and positional, matching the existing log codec.
+
+### Implementation conformance checklist
+
+For every parser, validator, wire or code-generation change, update this file in
+the same changeset and verify all of the following against code and golden tests:
+
+- grammar accepted by the parser is distinguished from semantically implemented behavior;
+- byte layout, out-of-band handle cardinality and failure ownership match `proto::codec`;
+- generated client/server behavior, including synchronous transport limits, is stated honestly;
+- annotations are described as enforced only when their metadata reaches the enforcing layer;
+- generated `docs/gen/*.md` are regenerated, but never treated as a replacement for this specification.
 
 ---
 
@@ -445,10 +492,12 @@ package     = "package" package-name ";" ;
 package-name= ident ( ":" ident )* "@" version ;
 version     = digit+ ;
 
-use         = "use" package-path "." "{" ident ( "," ident )* "}" ";" ;
+use         = "use" package-name "." "{" import-name ( "," import-name )* "}" ";" ;
+import-name = ident ( "as" ident )? ;
 package-path= ident ( ":" ident )* ;
 
-item        = annotation* ( record | enum | variant | flags | resource | interface ) ;
+item        = doc* annotation* ( alias | record | enum | variant | flags | resource | interface ) ;
+alias       = "type" ident "=" type ";" ;
 
 record      = "record" ident "{" field ( "," field )* ","? "}" ;
 field       = annotation* ident ":" type ;
@@ -459,7 +508,8 @@ enum-entry  = annotation* ident ( "=" digit+ )? | reserved ;
 variant     = "variant" ident "{" var-case ( "," var-case )* ","? "}" ;
 var-case    = annotation* ident ( "(" type ")" )? ;
 
-flags       = "flags" ident "{" ident ( "," ident )* ","? "}" ;
+flags       = "flags" ident "{" field-name ( "," field-name )* ","? "}" ;
+field-name  = doc* annotation* ident ;
 
 resource    = "resource" ident ";" ;
 
@@ -490,6 +540,7 @@ arg         = ident | digit+ ;
 ident       = lower ( lower | digit | "-" )* ;
 lower       = "a".."z" ;
 digit       = "0".."9" ;
+doc         = "///" text | "//!" text ;
 ```
 
 ---
@@ -501,10 +552,10 @@ record encoding is defined to reproduce the existing hand-written `abi::log` wir
 layout **byte for byte**, so `LogService` can switch to the generated codec
 without changing a single stored byte.
 
-### 10.1 `src/idl/system.lsidl`
+### 10.1 `src/idl/base.lsidl` and `src/idl/log.lsidl`
 
 ```lsidl
-package liber:system@1;
+package liber:base@1;
 
 // A common error, rendered identically in binary / JSON / CLI. Each case names a
 // kernel ERR_* condition, but the wire value is the enum's own 0-based ordinal
@@ -516,6 +567,12 @@ enum error {
 	again,      // ~ ERR_WOULD_BLOCK
 	closed,     // ~ ERR_PEER_CLOSED
 }
+
+```
+
+```lsidl
+package liber:log@1;
+use liber:base@1.{error};
 
 enum severity {
 	trace = 0, debug = 1, info = 2, warn = 3, error = 4, fatal = 5,
@@ -543,7 +600,7 @@ record query {
 interface log {
 	@op(1) emit:  func(e: entry) -> result<unit, error>;
 	@op(2) query: func(q: query) -> result<list<entry>, error>;
-	@op(3) tail:  func(q: query) -> result<stream<entry>, error>;
+	@op(3) tail:  func(q: query) -> stream<entry>;
 }
 ```
 

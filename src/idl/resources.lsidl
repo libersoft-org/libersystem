@@ -1,0 +1,48 @@
+//! LiberSystem resources package - resource accounting and budgeting.
+
+package liber:resources@1;
+
+use liber:base@1.{error};
+
+/// The types of resource the kernel accounts and the ResourceManager budgets per Domain:
+/// physical memory held, live handles, live threads, in-transit IPC message bytes,
+/// pinned DMA memory, and user stack (whose limit is the per-thread ceiling). The typed
+/// vocabulary a budget is written in - each names a counter the kernel already charges
+/// and enforces; the policy only sets the cap.
+enum resource-type {
+	memory,
+	handles,
+	threads,
+	ipc-queue,
+	dma,
+	stack,
+}
+
+/// One line of a Domain's budget: a resource type, how much of it is currently used, and
+/// the cap (u64::MAX means uncapped). The live used/limit pair the kernel tracks for one
+/// of a Domain's counters, read back over the typed API so usage is observable.
+record resource-usage {
+	type:  resource-type,
+	used:  u64,
+	limit: u64,
+}
+
+/// A Domain's budget: its name and the live usage of every accounted resource. The typed
+/// form of one Domain's resource account - what the `usage` command renders and what
+/// `set-limit` adjusts. A budget groups the per-Domain limits a policy assigns (e.g. all
+/// apps share one memory budget).
+record budget {
+	name:  string,
+	usage: list<resource-usage>,
+}
+
+/// The ResourceManager contract: the policy over the kernel's resource accounting.
+/// `usage` returns the live budget of every managed Domain (used vs limit per resource,
+/// read straight from the kernel's counters); `set-limit` adjusts one Domain's cap for
+/// one resource at runtime and returns its updated budget. The kernel enforces the caps -
+/// an over-budget allocation fails with a typed error, contained to the offending Domain -
+/// this interface is the policy that sets and observes them.
+interface resources {
+	@op(1) usage:     func() -> result<list<budget>, error>;
+	@op(2) set-limit: func(name: string, type: resource-type, limit: u64) -> result<budget, error>;
+}

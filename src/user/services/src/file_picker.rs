@@ -70,7 +70,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 256] = [0u8; 256];
 	unsafe {
-		serve(service, &mut request, &mut reply, |req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { picker::dispatch(&mut picker, req, handle, out, reply_handle) });
+		serve(service, &mut request, &mut reply, |req: &[u8], handle: &mut u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { picker::dispatch(&mut picker, req, handle, out, reply_handle) });
 	}
 	exit();
 }

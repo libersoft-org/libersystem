@@ -33,12 +33,39 @@ impl<'a> Lexer<'a> {
 	}
 
 	// Skip whitespace and `//` / `/* */` comments; error on an unterminated block.
-	fn skip_trivia(&mut self) -> Result<(), Error> {
+	// Returns any doc comment (/// or //!) tokens that should be preserved.
+	fn skip_trivia(&mut self) -> Result<Vec<Token>, Error> {
+		let mut docs = Vec::new();
 		loop {
 			let c = self.at(0);
 			if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' {
 				self.bump();
+			} else if c == b'/' && self.at(1) == b'/' && self.at(2) == b'/' {
+				// /// doc comment
+				let span = self.span();
+				self.bump();
+				self.bump();
+				self.bump();
+				let start = self.i;
+				while self.at(0) != 0 && self.at(0) != b'\n' {
+					self.bump();
+				}
+				let text = String::from_utf8_lossy(&self.b[start..self.i]).into_owned();
+				docs.push(Token { tok: Tok::DocComment(text), span });
+			} else if c == b'/' && self.at(1) == b'/' && self.at(2) == b'!' {
+				// //! package doc
+				let span = self.span();
+				self.bump();
+				self.bump();
+				self.bump();
+				let start = self.i;
+				while self.at(0) != 0 && self.at(0) != b'\n' {
+					self.bump();
+				}
+				let text = String::from_utf8_lossy(&self.b[start..self.i]).into_owned();
+				docs.push(Token { tok: Tok::PackageDoc(text), span });
 			} else if c == b'/' && self.at(1) == b'/' {
+				// ordinary comment, discarded
 				while self.at(0) != 0 && self.at(0) != b'\n' {
 					self.bump();
 				}
@@ -58,7 +85,7 @@ impl<'a> Lexer<'a> {
 					self.bump();
 				}
 			} else {
-				return Ok(());
+				return Ok(docs);
 			}
 		}
 	}
@@ -100,7 +127,8 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, Error> {
 	let mut lx = Lexer { b: src.as_bytes(), i: 0, line: 1, col: 1 };
 	let mut out: Vec<Token> = Vec::new();
 	loop {
-		lx.skip_trivia()?;
+		let docs = lx.skip_trivia()?;
+		out.extend(docs);
 		let span = lx.span();
 		let c = lx.at(0);
 		if c == 0 {

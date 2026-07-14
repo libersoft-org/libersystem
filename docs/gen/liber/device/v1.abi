@@ -1,0 +1,9 @@
+package liber:device@1
+enum device-type(unknown=0,net=1,block=2,console=3,usb=4)
+record device-entry(index:u32,type:device-type,mmio-len:u64)
+interface device
+method device.list op=1 () -> result<list<device-entry>, liber:base@1::error>
+method device.get op=2 (index:u32:rights=) -> result<device-entry, liber:base@1::error>
+record usb-device(port:u32,speed:string,vendor:u32,product:u32,class:u32,type:string)
+interface usb
+method usb.list op=1 () -> result<list<usb-device>, liber:base@1::error>

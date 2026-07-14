@@ -1,0 +1,16 @@
+package liber:session@1
+record job-info(id:u32,name:string,stopped:bool)
+record job-entry(info:job-info,proc:handle<liber:process@1::task>)
+record env-var(name:string,value:string)
+interface session
+method session.cwd op=1 () -> result<string, liber:base@1::error>
+method session.chdir op=2 (path:string:rights=) -> result<unit, liber:base@1::error>
+method session.job-register op=3 (name:string:rights=,stopped:bool:rights=,proc:handle<liber:process@1::task>:rights=) -> result<u32, liber:base@1::error>
+method session.job-take op=4 (id:u32:rights=) -> result<job-entry, liber:base@1::error>
+method session.job-list op=5 () -> result<list<job-info>, liber:base@1::error>
+method session.job-reap op=6 () -> result<list<job-info>, liber:base@1::error>
+method session.job-resume op=7 (id:u32:rights=) -> result<job-info, liber:base@1::error>
+method session.env-get op=8 (name:string:rights=) -> result<string, liber:base@1::error>
+method session.env-set op=9 (name:string:rights=,value:string:rights=) -> result<unit, liber:base@1::error>
+method session.env-unset op=10 (name:string:rights=) -> result<unit, liber:base@1::error>
+method session.env-list op=11 () -> result<list<env-var>, liber:base@1::error>

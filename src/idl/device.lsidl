@@ -1,0 +1,50 @@
+//! LiberSystem device package - device and USB enumeration services.
+
+package liber:device@1;
+
+use liber:base@1.{error};
+
+/// The class of a discovered device, mirroring the kernel's device type codes.
+enum device-type {
+	unknown = 0,
+	net     = 1,
+	block   = 2,
+	console = 3,
+	usb     = 4,
+}
+
+/// One discovered device: its kernel-table index, class, and the size of the MMIO
+/// window its driver maps.
+record device-entry {
+	index:    u32,
+	type:     device-type,
+	mmio-len: u64,
+}
+
+/// The Device service contract: enumerate the devices the kernel discovered on the
+/// bus, or look one up by its table index. Typed enumeration over the kernel device
+/// table (the same table DeviceManager binds drivers to).
+interface device {
+	@op(1) list: func() -> result<list<device-entry>, error>;
+	@op(2) get:  func(index: u32) -> result<device-entry, error>;
+}
+
+/// One enumerated USB device, as the xHCI driver addressed it: the root port it hangs
+/// off (a device behind a hub reports the hub's root port), its speed, the vendor and
+/// product ids from its device descriptor, its class code, and the role the driver
+/// bound it to ("hub", "keyboard", "storage", or "device" for an unclaimed one).
+record usb-device {
+	port:    u32,
+	speed:   string,
+	vendor:  u32,
+	product: u32,
+	class:   u32,
+	type:    string,
+}
+
+/// The USB bus contract, served by the xHCI driver itself (the owner of the bus
+/// state): enumerate the devices it addressed, live - hot-plugged and detached
+/// devices come and go from the list. The `lsusb` inventory reads this.
+interface usb {
+	@op(1) list: func() -> result<list<usb-device>, error>;
+}

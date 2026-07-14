@@ -262,10 +262,13 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 			let mut total: u64 = 0;
 			loop {
 				match recv_vec_blocking(consumer) {
-					ReceivedVec::Message { bytes, .. } => {
-						if let Some(f) = volume::list_read(&bytes) {
+					ReceivedVec::Message { bytes, mut handle } => {
+						if let Some(f) = volume::list_read(&bytes, &mut handle) {
 							let shown: usize = f.name.len() + if f.r#type == FileType::Dir { 1 } else { 0 };
 							row(&f, shown, size_text(&f, unit).len(), unit, &mut dirs, &mut plain, &mut total);
+						}
+						if handle != 0 {
+							close(handle);
 						}
 					}
 					ReceivedVec::Closed => break,

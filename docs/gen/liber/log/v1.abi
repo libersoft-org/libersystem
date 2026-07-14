@@ -1,0 +1,9 @@
+package liber:log@1
+enum severity(trace=0,debug=1,info=2,warn=3,error=4,fatal=5)
+record field(key:string,value:string)
+record entry(timestamp:u64,severity:severity,source:string,fields:list<field>)
+record query(since:option<u64>,min-severity:option<severity>,source:option<string>,boot:option<u32>,limit:u32)
+interface log
+method log.emit op=1 (e:entry:rights=) -> result<unit, liber:base@1::error>
+method log.query op=2 (q:query:rights=) -> result<list<entry>, liber:base@1::error>
+method log.tail op=3 (q:query:rights=) -> stream<entry>

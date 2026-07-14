@@ -1,0 +1,137 @@
+//! LiberSystem network package - networking, sockets, and TCP services.
+
+package liber:network@1;
+
+use liber:base@1.{error};
+
+/// A 32-bit IPv4 address as four octets - the canonical typed network address, never
+/// a parsed string on the wire (a textual form is only ever a rendering of these
+/// octets).
+record ipv4-addr {
+	a: u8,
+	b: u8,
+	c: u8,
+	d: u8,
+}
+
+/// A transport endpoint: an IPv4 address and a port.
+record endpoint {
+	addr: ipv4-addr,
+	port: u16,
+}
+
+/// A neighbor-cache entry: an on-link address and the MAC (6 bytes) it resolved to.
+record neighbor {
+	addr: ipv4-addr,
+	mac:  list<u8>,
+}
+
+/// The interface's L3 state: our address, our MAC (6 bytes), the interface MTU,
+/// the gateway, and the neighbor cache - the typed form of what the `ip` / `net`
+/// command renders.
+record net-info {
+    addr:      ipv4-addr,
+    mac:       list<u8>,
+    mtu:       u16,
+	gateway:   ipv4-addr,
+	neighbors: list<neighbor>,
+}
+
+/// The NetworkService pool utilization: how many client, socket and listener channels
+/// the serve loop currently stands on, and how many live TCP connections the stack holds.
+/// Every pool grows on demand (the domain's handle budget is the only ceiling), so these
+/// are the live counts `ss` reports and the graph folds in - observability, not a cap.
+record net-capacity {
+	clients:     u32,
+	sockets:     u32,
+	listeners:   u32,
+	connections: u32,
+}
+
+/// The outcome of a ping: a reply arrived, it timed out, or the target was
+/// unreachable (no route / no ARP).
+enum ping-status {
+	reply,
+	timeout,
+	unreachable,
+}
+
+/// The result of one ping echo: the outcome, the reply packet's IP TTL, and the
+/// measured round-trip time in microseconds. `ttl` and `rtt-us` are meaningful only
+/// when `status` is `reply` (zero otherwise).
+record ping-reply {
+	status: ping-status,
+	ttl:    u8,
+	rtt-us: u32,
+}
+
+/// A one-shot TCP exchange: connect to `ep`, send `request`, and read the response.
+record tcp-request {
+	ep:      endpoint,
+	request: list<u8>,
+}
+
+/// A live socket's TCP state - the typed form of the state column `ss` prints.
+enum sock-state {
+	closed,
+	syn-sent,
+	syn-rcvd,
+	established,
+	fin-wait,
+	listen,
+}
+
+/// A live socket in the NetworkService table: its local port, the remote endpoint it
+/// talks to (zeros for a listening socket), and its TCP state - the typed form of one
+/// row `ss` lists.
+record sock-info {
+	local-port: u16,
+	remote:     endpoint,
+	state:      sock-state,
+}
+
+/// The NetworkService contract: the interface state, name resolution, ping, a
+/// one-shot TCP fetch, `connect` - which opens a TCP connection and hands the client a
+/// socket as a capability (the channel a `socket` interface is served on) - and
+/// `listen`, which opens a listening socket for inbound connections. `connect` /
+/// `listen` return their channel out-of-band as a `handle<channel>`; the client wraps
+/// it in a `socket` / `listener` client. So the network is reachable through the typed
+/// API like every other service.
+interface network {
+	@op(1) info:    func() -> result<net-info, error>;
+	@op(2) resolve: func(name: string) -> result<ipv4-addr, error>;
+	@op(3) ping:    func(addr: ipv4-addr) -> result<ping-reply, error>;
+	@op(4) fetch:   func(req: tcp-request) -> result<list<u8>, error>;
+	@op(5) connect: func(ep: endpoint) -> result<handle<channel>, error>;
+	@op(6) open:    func() -> result<handle<channel>, error>;
+	@op(7) listen:  func(port: u16) -> result<handle<channel>, error>;
+	@op(8) sockets: func() -> result<list<sock-info>, error>;
+	@op(9) sntp:    func(server: ipv4-addr) -> result<u64, error>;
+	@op(10) capacity: func() -> result<net-capacity, error>;
+}
+
+/// A connected TCP socket, served on the channel `network.connect` hands back as a
+/// capability: send bytes (passed zero-copy as a `buffer` - a shared-memory handle,
+/// so the payload never crosses the channel), receive incoming bytes as a
+/// wait-drained event stream of chunks (the producer closes when the peer closes -
+/// end of stream), and close. The socket is the canonical object; each net tool asks
+/// NetworkService for the socket it needs and talks this contract.
+interface socket {
+	@op(1) send:  func(data: buffer) -> result<u32, error>;
+	@op(2) recv:  func() -> stream<chunk>;
+	@op(3) close: func() -> result<unit, error>;
+}
+
+/// One chunk of received socket data, the element of the `socket.recv` stream.
+record chunk {
+	data: list<u8>,
+}
+
+/// A listening socket from `network.listen`, served on the channel it hands back.
+/// `accept` waits until an inbound connection completes its handshake, then hands it
+/// back as a `socket` capability (the channel a `socket` interface is served on) - the
+/// passive-open counterpart to `network.connect`. The server calls `accept` in a loop,
+/// each call yielding the next connection.
+interface listener {
+	@op(1) accept: func() -> result<handle<channel>, error>;
+}

@@ -94,6 +94,33 @@ fn encode_rejects_small_buffer() {
 	assert_eq!(e.encode(&mut buf), None);
 }
 
+#[test]
+fn codec_rejects_duplicate_handle_writes_and_reads() {
+	let mut writer = VecWriter::new();
+	assert_eq!(writer.set_handle(11), Some(()));
+	assert_eq!(writer.set_handle(22), None);
+	assert_eq!(writer.handle(), 11);
+
+	let mut reader = crate::codec::Reader::with_handle(&[], 33);
+	assert_eq!(reader.take_handle(), Some(33));
+	assert_eq!(reader.take_handle(), None);
+
+	let mut zero = crate::codec::Reader::with_handle(&[], 0);
+	assert!(zero.has_handle(), "occupancy is explicit, not inferred from handle != 0");
+	assert_eq!(zero.take_handle(), Some(0));
+}
+
+#[test]
+fn malformed_dispatch_leaves_the_request_handle_with_the_host() {
+	let mut service = MemLog::default();
+	let mut request_handle = 77;
+	let mut reply_handle = 0;
+	let mut out = [0u8; 32];
+	assert_eq!(log::dispatch(&mut service, &[1], &mut request_handle, &mut out, &mut reply_handle), None);
+	assert_eq!(request_handle, 77);
+	assert_eq!(reply_handle, 0);
+}
+
 // An in-memory loopback transport that dispatches a request straight into a
 // Service and returns the encoded reply - the host stand-in for a channel.
 struct Loopback<S: log::Service> {
@@ -104,7 +131,9 @@ impl<S: log::Service> crate::codec::Transport for Loopback<S> {
 	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)> {
 		let mut out = [0u8; 4096];
 		let mut reply_handle = 0u64;
-		let n = log::dispatch(&mut self.service, request, request_handle, &mut out, &mut reply_handle)?;
+		let mut request_handle = request_handle;
+		let n = log::dispatch(&mut self.service, request, &mut request_handle, &mut out, &mut reply_handle)?;
+		assert_eq!(request_handle, 0);
 		Some((out[..n].to_vec(), reply_handle))
 	}
 }
@@ -158,14 +187,17 @@ fn tail_stream_round_trip() {
 	q.write(w).unwrap();
 	let request = writer.into_inner();
 
-	let (corr, items) = log::tail_open(&mut service, &request).unwrap();
+	let mut request_handle = 0;
+	let (corr, items) = log::tail_open(&mut service, &request, &mut request_handle).unwrap();
 	assert_eq!(corr, 7);
 	assert_eq!(items.len(), 2);
 
 	let mut frame = [0u8; 256];
 	for (seq, item) in items.iter().enumerate() {
-		let n = log::tail_frame(seq as u32, item, &mut frame).unwrap();
-		assert_eq!(log::tail_read(&frame[..n]), Some(item.clone()));
+		let mut frame_handle = 0;
+		let n = log::tail_frame(seq as u32, item, &mut frame, &mut frame_handle).unwrap();
+		assert_eq!(log::tail_read(&frame[..n], &mut frame_handle), Some(item.clone()));
+		assert_eq!(frame_handle, 0);
 	}
 }
 
@@ -253,7 +285,9 @@ impl<S: volume::Service> crate::codec::Transport for VolLoopback<S> {
 	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)> {
 		let mut out = [0u8; 256];
 		let mut reply_handle = 0u64;
-		let n = volume::dispatch(&mut self.service, request, request_handle, &mut out, &mut reply_handle)?;
+		let mut request_handle = request_handle;
+		let n = volume::dispatch(&mut self.service, request, &mut request_handle, &mut out, &mut reply_handle)?;
+		assert_eq!(request_handle, 0);
 		Some((out[..n].to_vec(), reply_handle))
 	}
 }
@@ -297,15 +331,57 @@ fn oversized_reply_degrades_to_a_typed_error() {
 	request.extend_from_slice(&7u32.to_le_bytes()); // correlation id
 	let mut out = [0u8; 6];
 	let mut reply_handle = 0u64;
-	let n = volume::dispatch(&mut VolStub, &request, 0, &mut out, &mut reply_handle).expect("the fallback reply should be produced");
+	let mut request_handle = 0u64;
+	let n = volume::dispatch(&mut VolStub, &request, &mut request_handle, &mut out, &mut reply_handle).expect("the fallback reply should be produced");
 	assert_eq!(&out[..4], &7u32.to_le_bytes(), "the fallback keeps the correlation id");
 	assert_eq!(out[4], 0, "the fallback is the error arm");
 	assert_eq!(Error::decode(&out[5..n]), Some(Error::Again), "the fallback error is `again`");
 	// with room to spare the same call succeeds normally.
 	let mut big = [0u8; 256];
-	let n = volume::dispatch(&mut VolStub, &request, 0, &mut big, &mut reply_handle).expect("the real reply fits");
+	let n = volume::dispatch(&mut VolStub, &request, &mut request_handle, &mut big, &mut reply_handle).expect("the real reply fits");
 	assert_eq!(big[4], 1, "the roomy reply is the ok arm");
 	assert!(n > 6, "the ok reply carries the snapshot list");
+}
+
+#[test]
+fn partial_reply_encode_returns_the_unsent_handle_to_the_host() {
+	let opts = OpenOpts { path: String::from("/x"), write: false, create: false };
+	let mut request = VecWriter::new();
+	request.u16(volume::OP_OPEN).unwrap();
+	request.u32(9).unwrap();
+	opts.write(&mut request).unwrap();
+	let request = request.into_inner();
+	let mut request_handle = 0;
+	let mut reply_handle = 0;
+	let mut out = [0u8; 9]; // corr + ok tag + handle placeholder fits; size does not
+	assert_eq!(volume::dispatch(&mut VolStub, &request, &mut request_handle, &mut out, &mut reply_handle), None);
+	assert_eq!(reply_handle, 0xCAFE);
+}
+
+struct UnexpectedHandleTransport {
+	discarded: u64,
+}
+
+impl crate::codec::Transport for UnexpectedHandleTransport {
+	fn call(&mut self, request: &[u8], _request_handle: u64) -> Option<(Vec<u8>, u64)> {
+		let corr = u32::from_le_bytes(request[2..6].try_into().ok()?);
+		let mut reply = corr.to_le_bytes().to_vec();
+		reply.extend_from_slice(&[1, 0]); // Ok(()) for log.emit
+		Some((reply, 0xBAD))
+	}
+
+	fn discard_handle(&mut self, handle: u64) {
+		self.discarded = handle;
+	}
+}
+
+#[test]
+fn client_discards_an_unexpected_reply_handle() {
+	let transport = UnexpectedHandleTransport { discarded: 0 };
+	let mut client = log::Client::new(transport);
+	let entry = Entry { timestamp: 1, severity: Severity::Info, source: String::new(), fields: Vec::new() };
+	assert_eq!(client.emit(&entry), None);
+	assert_eq!(client.into_transport().discarded, 0xBAD);
 }
 
 #[test]
@@ -529,7 +605,7 @@ fn graph_round_trips() {
 		],
 		spans: alloc::vec![TraceSpan { name: String::from("device.list"), duration_ns: 1234 }],
 	};
-	let bytes = g.encode_vec();
+	let bytes = g.encode_vec().expect("encode");
 	assert_eq!(Graph::decode(&bytes), Some(g));
 }
 

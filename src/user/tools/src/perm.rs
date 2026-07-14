@@ -57,8 +57,8 @@ unsafe fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
 		let mut first: bool = true;
 		loop {
 			match recv_vec_blocking(consumer) {
-				ReceivedVec::Message { bytes, .. } => {
-					if let Some(e) = permission::audit_read(&bytes) {
+				ReceivedVec::Message { bytes, mut handle } => {
+					if let Some(e) = permission::audit_read(&bytes, &mut handle) {
 						if mode.is_some() {
 							if !first {
 								out.push(',');
@@ -69,6 +69,9 @@ unsafe fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
 							print(e.to_text().as_bytes());
 							print(b"\n");
 						}
+					}
+					if handle != 0 {
+						close(handle);
 					}
 				}
 				ReceivedVec::Closed => break,

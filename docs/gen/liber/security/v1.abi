@@ -1,0 +1,8 @@
+package liber:security@1
+enum capability(log=0,storage=1,network=2,device=3,config=4,time=5,audio=6,input=7,graph=8,resource=9,process=10,permission=11,supervisor=12,volumes=13,services=14,usb=15)
+record manifest(component:string,requested:list<capability>,grants:list<capability>)
+record audit-entry(component:string,capability:capability,granted:bool,dynamic:bool)
+interface permission
+method permission.lookup op=1 (component:string:rights=) -> result<manifest, liber:base@1::error>
+method permission.audit op=2 () -> stream<audit-entry>
+method permission.run op=3 (name:string:rights=,args:string:rights=,cwd:string:rights=,stdout:handle<channel>:rights=) -> result<liber:process@1::start-result, liber:base@1::error>

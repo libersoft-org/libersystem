@@ -223,7 +223,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
-		serve_multi(service, &mut request, &mut reply, |_chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { config::dispatch(&mut config, req, handle, out, reply_handle) });
+		serve_multi(service, &mut request, &mut reply, |_chan: u64, req: &[u8], handle: &mut u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { config::dispatch(&mut config, req, handle, out, reply_handle) });
 	}
 	exit();
 }

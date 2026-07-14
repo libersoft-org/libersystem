@@ -19,7 +19,7 @@ pub trait Sink {
 
 	// Record the out-of-band handle to transfer with this message (at most one per
 	// message, matching the kernel channel's single-handle limit).
-	fn set_handle(&mut self, h: u64);
+	fn set_handle(&mut self, h: u64) -> Option<()>;
 
 	fn raw(&mut self, s: &[u8]) -> Option<()> {
 		for &b in s {
@@ -89,11 +89,12 @@ pub struct SliceWriter<'a> {
 	buf: &'a mut [u8],
 	pos: usize,
 	handle: u64,
+	handle_occupied: bool,
 }
 
 impl<'a> SliceWriter<'a> {
 	pub fn new(buf: &'a mut [u8]) -> SliceWriter<'a> {
-		SliceWriter { buf, pos: 0, handle: 0 }
+		SliceWriter { buf, pos: 0, handle: 0, handle_occupied: false }
 	}
 
 	// The number of bytes written so far.
@@ -106,11 +107,16 @@ impl<'a> SliceWriter<'a> {
 		self.handle
 	}
 
+	pub fn has_handle(&self) -> bool {
+		self.handle_occupied
+	}
+
 	// Rewind to an empty buffer, dropping anything written and any recorded handle,
 	// so a failed encode can be replaced in place - the dispatch overflow fallback.
 	pub fn reset(&mut self) {
 		self.pos = 0;
 		self.handle = 0;
+		self.handle_occupied = false;
 	}
 }
 
@@ -121,8 +127,13 @@ impl<'a> Sink for SliceWriter<'a> {
 		Some(())
 	}
 
-	fn set_handle(&mut self, h: u64) {
+	fn set_handle(&mut self, h: u64) -> Option<()> {
+		if self.handle_occupied {
+			return None;
+		}
 		self.handle = h;
+		self.handle_occupied = true;
+		Some(())
 	}
 }
 
@@ -132,11 +143,12 @@ impl<'a> Sink for SliceWriter<'a> {
 pub struct VecWriter {
 	buf: Vec<u8>,
 	handle: u64,
+	handle_occupied: bool,
 }
 
 impl VecWriter {
 	pub fn new() -> VecWriter {
-		VecWriter { buf: Vec::new(), handle: 0 }
+		VecWriter { buf: Vec::new(), handle: 0, handle_occupied: false }
 	}
 
 	// The out-of-band handle recorded during encoding (0 = none).
@@ -156,8 +168,13 @@ impl Sink for VecWriter {
 		Some(())
 	}
 
-	fn set_handle(&mut self, h: u64) {
+	fn set_handle(&mut self, h: u64) -> Option<()> {
+		if self.handle_occupied {
+			return None;
+		}
 		self.handle = h;
+		self.handle_occupied = true;
+		Some(())
 	}
 }
 
@@ -167,6 +184,10 @@ pub trait Transport {
 	// Send a request (bytes plus an optional transferred handle, 0 = none) and
 	// receive the reply (bytes plus an optional transferred handle).
 	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)>;
+
+	// Release a reply handle that could not be decoded or was not expected by the
+	// schema. Host test transports need no action; the runtime closes it.
+	fn discard_handle(&mut self, _handle: u64) {}
 }
 
 // A cursor that reads from a borrowed buffer.
@@ -174,21 +195,30 @@ pub struct Reader<'a> {
 	buf: &'a [u8],
 	pos: usize,
 	handle: u64,
+	handle_available: bool,
 }
 
 impl<'a> Reader<'a> {
 	pub fn new(buf: &'a [u8]) -> Reader<'a> {
-		Reader { buf, pos: 0, handle: 0 }
+		Reader { buf, pos: 0, handle: 0, handle_available: false }
 	}
 
 	// A reader for a message that arrived with an out-of-band transferred handle.
 	pub fn with_handle(buf: &'a [u8], handle: u64) -> Reader<'a> {
-		Reader { buf, pos: 0, handle }
+		Reader { buf, pos: 0, handle, handle_available: true }
 	}
 
 	// The out-of-band handle that arrived with the message (0 = none).
-	pub fn take_handle(&self) -> u64 {
-		self.handle
+	pub fn take_handle(&mut self) -> Option<u64> {
+		if !self.handle_available {
+			return None;
+		}
+		self.handle_available = false;
+		Some(self.handle)
+	}
+
+	pub fn has_handle(&self) -> bool {
+		self.handle_available
 	}
 
 	// The number of bytes consumed so far.

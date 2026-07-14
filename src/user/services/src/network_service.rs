@@ -326,7 +326,7 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClo
 				let slot: usize = slot_of[ready];
 				let chan: u64 = clients[slot];
 				match recv_blocking(chan, &mut req) {
-					Received::Message { len, handle } => {
+					Received::Message { len, mut handle } => {
 						let mut new_sock: u64 = 0;
 						let mut new_sock_ci: usize = 0;
 						let mut new_client: u64 = 0;
@@ -343,9 +343,14 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClo
 						{
 							let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], new_sock: &mut new_sock, new_sock_ci: &mut new_sock_ci, new_client: &mut new_client, new_listener: &mut new_listener, new_listener_port: &mut new_listener_port, sock_room, client_room, listener_room, clients_used, sockets_used, listeners_used };
 							let mut reply_handle: u64 = 0;
-							if let Some(n2) = network::dispatch(&mut svc, &req[..len], handle, &mut out, &mut reply_handle) {
-								send_blocking(chan, &out[..n2], reply_handle);
+							if let Some(n2) = network::dispatch(&mut svc, &req[..len], &mut handle, &mut out, &mut reply_handle) {
+								if !send_blocking(chan, &out[..n2], reply_handle) && reply_handle != 0 {
+									close(reply_handle);
+								}
 							}
+						}
+						if handle != 0 {
+							close(handle);
 						}
 						if new_sock != 0 {
 							place_sock(&mut socks, SockSlot { chan: new_sock, ci: new_sock_ci, stream_prod: 0, stream_seq: 0 });
@@ -399,13 +404,13 @@ unsafe fn serve_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: 
 		let chan: u64 = slot.chan;
 		let ci: usize = slot.ci;
 		match recv_blocking(chan, req) {
-			Received::Message { len, handle } => {
+			Received::Message { len, mut handle } => {
 				let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
 				let mut closing: bool = false;
 				{
 					let mut svc: Sock = Sock { ci, frames, stack: &mut *stack, tx, closing: &mut closing };
 					if op == socket::OP_RECV {
-						if let Some((corr, items)) = socket::recv_open(&mut svc, &req[..len]) {
+						if let Some((corr, items)) = socket::recv_open(&mut svc, &req[..len], &mut handle) {
 							if slot.stream_prod != 0 {
 								close(slot.stream_prod);
 								slot.stream_prod = 0;
@@ -414,9 +419,14 @@ unsafe fn serve_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: 
 								send_blocking(chan, &corr.to_le_bytes(), consumer);
 								slot.stream_seq = 0;
 								for item in &items {
-									if let Some(fl) = socket::recv_frame(slot.stream_seq, item, out) {
-										send_blocking(producer, &out[..fl], 0);
+									let mut frame_handle: u64 = 0;
+									if let Some(fl) = socket::recv_frame(slot.stream_seq, item, out, &mut frame_handle) {
+										if !send_blocking(producer, &out[..fl], frame_handle) && frame_handle != 0 {
+											close(frame_handle);
+										}
 										slot.stream_seq += 1;
+									} else if frame_handle != 0 {
+										close(frame_handle);
 									}
 								}
 								slot.stream_prod = producer;
@@ -424,9 +434,14 @@ unsafe fn serve_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: 
 						}
 					} else {
 						let mut reply_handle: u64 = 0;
-						if let Some(n2) = socket::dispatch(&mut svc, &req[..len], handle, out, &mut reply_handle) {
-							send_blocking(chan, &out[..n2], reply_handle);
+						if let Some(n2) = socket::dispatch(&mut svc, &req[..len], &mut handle, out, &mut reply_handle) {
+							if !send_blocking(chan, &out[..n2], reply_handle) && reply_handle != 0 {
+								close(reply_handle);
+							}
 						}
+					}
+					if handle != 0 {
+						close(handle);
 					}
 				}
 				if closing {
@@ -1231,15 +1246,24 @@ unsafe fn stream_pump(ci: usize, frames: u64, stack: &mut Stack, tx: &mut [u8], 
 			// the frame grows with the chunk: encoded exactly, sent as one message
 			// (the consumer receives it exactly-sized via the peek).
 			let mut frame: Vec<u8> = alloc::vec![0u8; 8 + chunk.data.len() + 16];
-			match socket::recv_frame(*seq, &chunk, &mut frame) {
+			let mut frame_handle: u64 = 0;
+			match socket::recv_frame(*seq, &chunk, &mut frame, &mut frame_handle) {
 				Some(fl) => {
-					if !send_blocking(producer, &frame[..fl], 0) {
+					if !send_blocking(producer, &frame[..fl], frame_handle) {
+						if frame_handle != 0 {
+							close(frame_handle);
+						}
 						close(producer);
 						return 0;
 					}
 					*seq += 1;
 				}
-				None => return producer,
+				None => {
+					if frame_handle != 0 {
+						close(frame_handle);
+					}
+					return producer;
+				}
 			}
 		}
 	}

@@ -1,0 +1,8 @@
+package liber:process@1
+record process-info(koid:u64,name:string)
+resource task
+record start-result(task:handle<task>,info:process-info)
+interface process
+method process.start op=1 (name:string:rights=) -> result<process-info, liber:base@1::error>
+method process.list op=2 () -> result<list<process-info>, liber:base@1::error>
+method process.launch op=3 (name:string:rights=,bootstrap:handle<channel>:rights=) -> result<start-result, liber:base@1::error>

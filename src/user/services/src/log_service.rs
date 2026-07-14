@@ -80,7 +80,7 @@ impl Disk {
 	// Record one entry for the disk: encode it and evict the oldest frames past
 	// the per-boot cap. Cheap - no IO happens here.
 	fn record(&mut self, entry: &Entry) {
-		let encoded: Vec<u8> = entry.encode_vec();
+		let Some(encoded) = entry.encode_vec() else { return };
 		self.total += 4 + encoded.len();
 		self.frames.push_back(encoded);
 		let cap: usize = if self.cap != 0 { self.cap as usize } else { DISK_CAP_FALLBACK as usize };
@@ -339,16 +339,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut request: [u8; 1024] = [0u8; 1024];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
-		serve_multi_ticked(service, &[bootstrap], FLUSH_TICKS, &mut request, &mut reply, |chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
+		serve_multi_ticked(service, &[bootstrap], FLUSH_TICKS, &mut request, &mut reply, |chan: u64, req: &[u8], handle: &mut u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
 			if chan == 0 {
 				journal.disk.flush();
 				return None;
 			}
 			if chan == bootstrap {
-				if req == b"STORAGE" && handle != 0 {
-					journal.disk.attach(handle);
-				} else if req == b"CONFIG" && handle != 0 {
-					journal.adopt_config(handle);
+				if req == b"STORAGE" && *handle != 0 {
+					journal.disk.attach(core::mem::take(handle));
+				} else if req == b"CONFIG" && *handle != 0 {
+					journal.adopt_config(core::mem::take(handle));
 				} else if req == b"FLUSH" {
 					// The supervisor asks for a flush before a graceful shutdown tears us
 					// down, so the last batch (records emitted since the previous
@@ -363,7 +363,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// request arrived on, so each client gets its own tail.
 			let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
 			if op == log::OP_TAIL {
-				stream_tail(&mut journal, chan, req);
+				stream_tail(&mut journal, chan, req, handle);
 				None
 			} else {
 				log::dispatch(&mut journal, req, handle, out, reply_handle)
@@ -378,8 +378,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // channel carries just the correlation id and the consumer endpoint (out-of-band);
 // each entry then travels as its own framed message on the producer endpoint, and
 // closing the producer tells the client the stream has ended.
-fn stream_tail(journal: &mut Journal, service: u64, request: &[u8]) {
-	let (corr, items): (u32, Vec<Entry>) = match log::tail_open(journal, request) {
+fn stream_tail(journal: &mut Journal, service: u64, request: &[u8], request_handle: &mut u64) {
+	let (corr, items): (u32, Vec<Entry>) = match log::tail_open(journal, request, request_handle) {
 		Some(v) => v,
 		None => return,
 	};
@@ -393,10 +393,15 @@ fn stream_tail(journal: &mut Journal, service: u64, request: &[u8]) {
 	}
 	let mut frame: [u8; 1024] = [0u8; 1024];
 	for (seq, item) in items.iter().enumerate() {
-		if let Some(n) = log::tail_frame(seq as u32, item, &mut frame) {
+		let mut frame_handle: u64 = 0;
+		if let Some(n) = log::tail_frame(seq as u32, item, &mut frame, &mut frame_handle) {
 			unsafe {
-				send_blocking(producer, &frame[..n], 0);
+				if !send_blocking(producer, &frame[..n], frame_handle) && frame_handle != 0 {
+					close(frame_handle);
+				}
 			}
+		} else if frame_handle != 0 {
+			unsafe { close(frame_handle) };
 		}
 	}
 	unsafe {

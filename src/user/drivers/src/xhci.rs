@@ -1016,12 +1016,17 @@ unsafe fn service_loop(hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut sto
 			loop {
 				let mut qreq: [u8; 64] = [0u8; 64];
 				match try_recv(usbq, &mut qreq) {
-					Polled::Message { len, handle } => {
+					Polled::Message { len, mut handle } => {
 						let mut api: UsbApi = UsbApi { slots };
 						let mut reply: [u8; 4096] = [0u8; 4096];
 						let mut reply_handle: u64 = 0;
-						if let Some(n) = usb::dispatch(&mut api, &qreq[..len], handle, &mut reply, &mut reply_handle) {
-							send_blocking(usbq, &reply[..n], reply_handle);
+						if let Some(n) = usb::dispatch(&mut api, &qreq[..len], &mut handle, &mut reply, &mut reply_handle) {
+							if !send_blocking(usbq, &reply[..n], reply_handle) && reply_handle != 0 {
+								close(reply_handle);
+							}
+						}
+						if handle != 0 {
+							close(handle);
 						}
 					}
 					Polled::Empty => break,

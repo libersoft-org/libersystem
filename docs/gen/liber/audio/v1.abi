@@ -1,0 +1,3 @@
+package liber:audio@1
+interface audio
+method audio.beep op=1 (freq:u16:rights=,millis:u32:rights=) -> result<unit, liber:base@1::error>

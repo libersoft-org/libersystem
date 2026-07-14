@@ -1,0 +1,22 @@
+//! LiberSystem input package - pointer and input event services.
+
+package liber:input@1;
+
+/// One pointer event mapped to the text-cell grid: the cursor's column and row, and
+/// the button bitmask (bit 0 left, bit 1 right, bit 2 middle). The canonical typed
+/// form of a mouse position - the framebuffer console grid coordinates, never raw
+/// device units (a pixel form would only ever be a rendering of these cells).
+record pointer-event {
+	col:     u16,
+	row:     u16,
+	buttons: u8,
+}
+
+/// InputService: typed pointer/button events from the virtio-input pointer device,
+/// mapped to the text-cell grid. `subscribe` hands back a wait-drained event stream of
+/// the recent pointer events (the bounded-snapshot form; a continuously live
+/// stream is a later refinement). The device is reached as a capability, never as
+/// ambient input access - the plumbing a future TUI consumes.
+interface input {
+	@op(1) subscribe: func() -> stream<pointer-event>;
+}

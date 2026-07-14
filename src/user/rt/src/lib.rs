@@ -551,14 +551,17 @@ pub unsafe fn recv_vec_blocking(channel: u64) -> ReceivedVec {
 // and collect the items (the producer closing the channel marks end-of-stream).
 // The consumer handle is closed. A consumer that renders incrementally loops over
 // `recv_vec_blocking` by hand instead.
-pub unsafe fn drain_stream<T, F: Fn(&[u8]) -> Option<T>>(consumer: u64, read: F) -> alloc::vec::Vec<T> {
+pub unsafe fn drain_stream<T, F: Fn(&[u8], &mut u64) -> Option<T>>(consumer: u64, read: F) -> alloc::vec::Vec<T> {
 	unsafe {
 		let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();
 		loop {
 			match recv_vec_blocking(consumer) {
-				ReceivedVec::Message { bytes, .. } => {
-					if let Some(item) = read(&bytes) {
+				ReceivedVec::Message { bytes, mut handle } => {
+					if let Some(item) = read(&bytes, &mut handle) {
 						items.push(item);
+					}
+					if handle != 0 {
+						close(handle);
 					}
 				}
 				ReceivedVec::Closed => break,
@@ -822,13 +825,13 @@ pub unsafe fn recv_package(channel: u64, buf: &mut [u8]) -> Option<(u64, &'stati
 // which is how a streaming op that replies out of band opts out of the byte reply.
 pub unsafe fn serve<F>(service: u64, request: &mut [u8], reply: &mut [u8], mut handle_request: F)
 where
-	F: FnMut(&[u8], u64, &mut [u8], &mut u64) -> Option<usize>,
+	F: FnMut(&[u8], &mut u64, &mut [u8], &mut u64) -> Option<usize>,
 {
 	unsafe {
 		loop {
 			match recv_blocking(service, request) {
 				Received::Message { len, .. } if len == 0 => break,
-				Received::Message { len, handle } => {
+				Received::Message { len, mut handle } => {
 					// the reserved heartbeat probe: answer it uniformly without invoking the
 					// typed dispatch, so the supervisor's watchdog can prove this service is
 					// still responsive (a service wedged inside a request never returns here
@@ -838,8 +841,15 @@ where
 						continue;
 					}
 					let mut reply_handle: u64 = 0;
-					if let Some(n) = handle_request(&request[..len], handle, reply, &mut reply_handle) {
-						send_blocking(service, &reply[..n], reply_handle);
+					if let Some(n) = handle_request(&request[..len], &mut handle, reply, &mut reply_handle) {
+						if !send_blocking(service, &reply[..n], reply_handle) && reply_handle != 0 {
+							close(reply_handle);
+						}
+					} else if reply_handle != 0 {
+						close(reply_handle);
+					}
+					if handle != 0 {
+						close(handle);
 					}
 				}
 				Received::Closed => break,
@@ -854,7 +864,6 @@ where
 // A service wedged inside a request never returns to its serve loop to answer, so the
 // probe times out - the watchdog's hung (alive-but-unresponsive) detection. No typed
 // interface uses opcode 0xfffe, so it never collides with a real request.
-pub const HEARTBEAT_OP: u16 = 0xfffe;
 
 // The reserved control opcode a holder of a multi-client service's channel sends to
 // mint its own independent client connection (the generic equivalent of
@@ -862,7 +871,6 @@ pub const HEARTBEAT_OP: u16 = 0xfffe;
 // dispatch and replies with a fresh client endpoint; the matching service endpoint
 // joins its wait set. No typed interface uses opcode 0xffff, so it never collides
 // with a real request.
-pub const CONNECT_OP: u16 = 0xffff;
 
 // Multi-client serve loop: like `serve`, but multiplexes a growing set of client
 // channels (starting with `root`) with `wait_any`, so several independent clients
@@ -875,7 +883,7 @@ pub const CONNECT_OP: u16 = 0xffff;
 // quit sentinel) is dropped from the set; the loop ends when the root closes.
 pub unsafe fn serve_multi<F>(root: u64, request: &mut [u8], reply: &mut [u8], handle_request: F)
 where
-	F: FnMut(u64, &[u8], u64, &mut [u8], &mut u64) -> Option<usize>,
+	F: FnMut(u64, &[u8], &mut u64, &mut [u8], &mut u64) -> Option<usize>,
 {
 	unsafe {
 		serve_multi_seeded(root, &[], request, reply, handle_request);
@@ -889,7 +897,7 @@ where
 // from the set; only `root` closing ends the service.
 pub unsafe fn serve_multi_seeded<F>(root: u64, seed: &[u64], request: &mut [u8], reply: &mut [u8], handle_request: F)
 where
-	F: FnMut(u64, &[u8], u64, &mut [u8], &mut u64) -> Option<usize>,
+	F: FnMut(u64, &[u8], &mut u64, &mut [u8], &mut u64) -> Option<usize>,
 {
 	unsafe {
 		serve_multi_ticked(root, seed, 0, request, reply, handle_request);
@@ -903,7 +911,7 @@ where
 // never counts as pending progress for the scheduler's boot driver.
 pub unsafe fn serve_multi_ticked<F>(root: u64, seed: &[u64], period: u64, request: &mut [u8], reply: &mut [u8], mut handle_request: F)
 where
-	F: FnMut(u64, &[u8], u64, &mut [u8], &mut u64) -> Option<usize>,
+	F: FnMut(u64, &[u8], &mut u64, &mut [u8], &mut u64) -> Option<usize>,
 {
 	unsafe {
 		let mut chans: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
@@ -915,7 +923,8 @@ where
 				if ready == ERR_TIMED_OUT && period != 0 {
 					// the housekeeping tick: no channel is ready, let the handler flush.
 					let mut reply_handle: u64 = 0;
-					let _ = handle_request(0, &[], 0, reply, &mut reply_handle);
+					let mut handle: u64 = 0;
+					let _ = handle_request(0, &[], &mut handle, reply, &mut reply_handle);
 				}
 				continue;
 			}
@@ -930,7 +939,7 @@ where
 					close(chan);
 					chans.swap_remove(idx);
 				}
-				Received::Message { len, handle } => {
+				Received::Message { len, mut handle } => {
 					if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == HEARTBEAT_OP {
 						// the reserved heartbeat probe: answer uniformly, like serve (above).
 						send_blocking(chan, b"PONG", 0);
@@ -947,8 +956,15 @@ where
 						}
 					} else {
 						let mut reply_handle: u64 = 0;
-						if let Some(n) = handle_request(chan, &request[..len], handle, reply, &mut reply_handle) {
-							send_blocking(chan, &reply[..n], reply_handle);
+						if let Some(n) = handle_request(chan, &request[..len], &mut handle, reply, &mut reply_handle) {
+							if !send_blocking(chan, &reply[..n], reply_handle) && reply_handle != 0 {
+								close(reply_handle);
+							}
+						} else if reply_handle != 0 {
+							close(reply_handle);
+						}
+						if handle != 0 {
+							close(handle);
 						}
 					}
 				}
@@ -1014,7 +1030,6 @@ pub unsafe fn service_connect(factory: u64) -> Option<u64> {
 // This is the durable-name / disposable-channel pattern (Fuchsia routing, Genode
 // sessions, Minix reincarnation): the client's lasting reference is the NAME.
 // No typed interface uses opcode 0xfffd, so it never collides with a real request.
-pub const RESOLVE_OP: u16 = 0xfffd;
 
 // A managed service announces a CLEAN exit to the supervisor by sending `GOODBYE_OP`
 // on its bootstrap / report channel just before it exits, so the supervisor records a
@@ -1022,7 +1037,6 @@ pub const RESOLVE_OP: u16 = 0xfffd;
 // interactive shell exits at runtime (a logout); every other service is meant to stand
 // for the life of the system, so a bare peer-close from one of them stays a crash.
 // No typed interface uses opcode 0xfffc, so it never collides with a real request.
-pub const GOODBYE_OP: u16 = 0xfffc;
 
 // Announce a clean exit on `channel` (the bootstrap / report channel the supervisor
 // watches). Call it right before `exit()` so a logout reads as a deliberate stop.
@@ -1094,6 +1108,12 @@ impl proto::codec::Transport for ChannelTransport {
 				ReceivedVec::Message { bytes, handle } => Some((bytes, handle)),
 				ReceivedVec::Closed => None,
 			}
+		}
+	}
+
+	fn discard_handle(&mut self, handle: u64) {
+		if handle != 0 {
+			unsafe { close(handle) };
 		}
 	}
 }
@@ -1171,6 +1191,12 @@ impl proto::codec::Transport for SvcTransport {
 					None
 				}
 			}
+		}
+	}
+
+	fn discard_handle(&mut self, handle: u64) {
+		if handle != 0 {
+			unsafe { close(handle) };
 		}
 	}
 }

@@ -1,0 +1,26 @@
+package liber:storage@1
+resource file
+record open-opts(path:string,write:bool,create:bool)
+record open-result(file:handle<file>,size:u64)
+enum file-type(file=0,dir=1)
+record file-info(name:string,size:u64,type:file-type,mtime:u64,ctime:u64)
+record snapshot-info(name:string,generation:u64)
+record volume-status(label:string,total-bytes:u64,free-bytes:u64,compression:bool,read-only:bool,filesystem:string)
+record fsck-report(checksum-failures:u32,damaged:list<string>)
+interface volume
+method volume.open op=1 (o:open-opts:rights=) -> result<open-result, liber:base@1::error>
+method volume.list op=2 (path:string:rights=) -> stream<file-info>
+method volume.write op=3 (path:string:rights=,data:buffer:rights=) -> result<unit, liber:base@1::error>
+method volume.remove op=4 (path:string:rights=) -> result<unit, liber:base@1::error>
+method volume.snap-create op=5 (name:string:rights=) -> result<unit, liber:base@1::error>
+method volume.snap-list op=6 () -> result<list<snapshot-info>, liber:base@1::error>
+method volume.snap-delete op=7 (name:string:rights=) -> result<unit, liber:base@1::error>
+method volume.snap-open op=8 (snapshot:string:rights=,path:string:rights=) -> result<open-result, liber:base@1::error>
+method volume.mkdir op=9 (path:string:rights=) -> result<unit, liber:base@1::error>
+method volume.rmdir op=10 (path:string:rights=) -> result<unit, liber:base@1::error>
+method volume.capacity op=11 () -> result<u64, liber:base@1::error>
+method volume.status op=12 () -> result<volume-status, liber:base@1::error>
+method volume.set-compression op=13 (enabled:bool:rights=) -> result<unit, liber:base@1::error>
+method volume.fsck op=14 () -> result<fsck-report, liber:base@1::error>
+method volume.restore op=15 (path:string:rights=,snapshot:string:rights=) -> result<unit, liber:base@1::error>
+method volume.write-stream op=16 (path:string:rights=,data:handle<channel>:rights=) -> result<unit, liber:base@1::error>

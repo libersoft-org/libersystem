@@ -1374,8 +1374,8 @@ unsafe fn mouse_cmd(inputsvc: u64) {
 		let mut count: usize = 0;
 		loop {
 			match recv_blocking(consumer, &mut buf) {
-				Received::Message { len, .. } => {
-					if let Some(event) = input::subscribe_read(&buf[..len]) {
+				Received::Message { len, mut handle } => {
+					if let Some(event) = input::subscribe_read(&buf[..len], &mut handle) {
 						print(b"  (");
 						print_usize(event.col as usize);
 						print(b", ");
@@ -1384,6 +1384,9 @@ unsafe fn mouse_cmd(inputsvc: u64) {
 						print_usize(event.buttons as usize);
 						print(b"\n");
 						count += 1;
+					}
+					if handle != 0 {
+						close(handle);
 					}
 				}
 				Received::Closed => break,

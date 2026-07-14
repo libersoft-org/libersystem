@@ -4,3 +4,6 @@ name = "lsidl-gen"
 # version is unused here and omitted.
 edition = "2024"
 description = "LSIDL (LiberSystem Interface Definition Language) front-end and binding generator"
+
+[dependencies]
+abi = { path = "../../abi" }

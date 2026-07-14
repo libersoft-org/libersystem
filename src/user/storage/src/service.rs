@@ -137,7 +137,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
-		serve_multi(service, &mut buf, &mut reply, |chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
+		serve_multi(service, &mut buf, &mut reply, |chan: u64, req: &[u8], handle: &mut u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
 			// stamp the wall clock onto the filesystem before each request, so a
 			// mutation's inode timestamps carry real time (the RTC's Unix seconds; the
 			// NTP-disciplined policy clock lives in TimeService). A no-op on the backends
@@ -148,7 +148,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// reply. Everything else dispatches to a single reply.
 			let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
 			if op == volume::OP_LIST {
-				stream_list(&mut vol, chan, req);
+				stream_list(&mut vol, chan, req, handle);
 				return None;
 			}
 			volume::dispatch(&mut vol, req, handle, out, reply_handle)
@@ -163,13 +163,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // bad path replies the correlation id with NO consumer handle - the generated
 // client reads that as "no stream" - so an error stays distinguishable from an
 // empty directory (`cd` validates paths this way).
-fn stream_list(vol: &mut Volume, service: u64, request: &[u8]) {
-	let mut reader = proto::codec::Reader::new(request);
+fn stream_list(vol: &mut Volume, service: u64, request: &[u8], request_handle: &mut u64) {
+	let mut reader = if *request_handle == 0 { proto::codec::Reader::new(request) } else { proto::codec::Reader::with_handle(request, *request_handle) };
 	let r = &mut reader;
 	let (corr, path): (u32, String) = match (|| Some((r.u16()?, r.u32()?, r.string_lp()?)))() {
 		Some((_op, corr, path)) => (corr, path),
 		None => return,
 	};
+	if r.has_handle() {
+		return;
+	}
+	*request_handle = 0;
 	let corr_bytes: [u8; 4] = corr.to_le_bytes();
 	let items: Vec<FileInfo> = match vol.list_entries(&path) {
 		Ok(items) => items,
@@ -189,10 +193,15 @@ fn stream_list(vol: &mut Volume, service: u64, request: &[u8]) {
 	}
 	let mut frame: [u8; 1024] = [0u8; 1024];
 	for (seq, item) in items.iter().enumerate() {
-		if let Some(n) = volume::list_frame(seq as u32, item, &mut frame) {
+		let mut frame_handle: u64 = 0;
+		if let Some(n) = volume::list_frame(seq as u32, item, &mut frame, &mut frame_handle) {
 			unsafe {
-				send_blocking(producer, &frame[..n], 0);
+				if !send_blocking(producer, &frame[..n], frame_handle) && frame_handle != 0 {
+					close(frame_handle);
+				}
 			}
+		} else if frame_handle != 0 {
+			unsafe { close(frame_handle) };
 		}
 	}
 	unsafe {

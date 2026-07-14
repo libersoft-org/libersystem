@@ -1,0 +1,75 @@
+//! LiberSystem security package - permissions and capability management.
+
+package liber:security@1;
+
+use liber:base@1.{error};
+use liber:process@1.{start-result as process-start-result};
+
+/// The kinds of capability a component may be declared to receive: a connection to one
+/// of the system services. The typed vocabulary a permission manifest is written in - a
+/// grant names a service the component may reach, never an ambient right. A component
+/// holds exactly the capabilities its manifest lists and can reach nothing else.
+enum capability {
+	log,
+	storage,
+	network,
+	device,
+	config,
+	time,
+	audio,
+	input,
+	graph,
+	resource,
+	process,
+	permission,
+	supervisor,
+	volumes,
+	services,
+	usb,
+}
+
+/// A component's permission manifest: its name, the capabilities it requests (the
+/// set a packaged component will ship on disk), and the exact set it is granted -
+/// the audited intersection of the request with the manager's policy. This typed
+/// object is the source of truth for what a component may be granted - never a
+/// parsed text / JSON file. A launched component starts with the granted
+/// capabilities and nothing else (the sandbox); a requested capability the policy
+/// withholds surfaces as an audited denial, and the textual form a tool might
+/// render is only ever a view of this object.
+record manifest {
+	component: string,
+	requested: list<capability>,
+	grants:    list<capability>,
+}
+
+/// One decision in the PermissionManager audit trail: the component a grant decision was
+/// made for, the capability in question, whether it was granted, and whether the decision
+/// was a runtime permission request rather than a static manifest grant. A `dynamic` entry
+/// records a capability the component asked for at launch that its manifest did not declare -
+/// decided by the headless policy default and recorded back into the same store - while a
+/// static (`dynamic` false) entry is a decision over the component's declared manifest. The
+/// policy layer's record of every authority decision, queryable over the typed API the same
+/// way the journal is.
+record audit-entry {
+	component:  string,
+	capability: capability,
+	granted:    bool,
+	dynamic:    bool,
+}
+
+/// The PermissionManager contract: the policy over the kernel's capability mechanism.
+/// `lookup` returns a component's declared permission manifest (the typed source of
+/// truth); `audit` returns the trail of every grant / deny decision the manager has
+/// made; `run` is the launcher / granter primitive - it starts a named system tool (a
+/// shell command run as its own ELF) under its manifest, granting it exactly its declared
+/// capabilities and nothing else, forwards the caller's stdout console, argument string,
+/// and inherited working directory to it, and returns the live process handle for job
+/// control. The granted clients are transferred to the new process out-of-band over the
+/// bootstrap channel the manager drives ProcessService to create; the manager is the
+/// launcher / granter, ProcessService the mechanism. A caller (the shell) reaches the OS
+/// tools only through this op, never the raw kernel loader.
+interface permission {
+	@op(1) lookup: func(component: string) -> result<manifest, error>;
+	@op(2) audit:  func() -> stream<audit-entry>;
+	@op(3) run:    func(name: string, args: string, cwd: string, stdout: handle<channel>) -> result<process-start-result, error>;
+}

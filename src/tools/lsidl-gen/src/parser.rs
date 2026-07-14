@@ -98,7 +98,28 @@ impl Parser {
 		}
 	}
 
+	// Collect consecutive doc comment tokens (/// or //!).
+	fn doc_comments(&mut self) -> Vec<Doc> {
+		let mut docs = Vec::new();
+		while let Tok::DocComment(text) = self.peek() {
+			docs.push(Doc { text: text.clone(), span: self.span() });
+			self.bump();
+		}
+		docs
+	}
+
+	// Collect consecutive package doc comment tokens (//!).
+	fn package_docs(&mut self) -> Vec<Doc> {
+		let mut docs = Vec::new();
+		while let Tok::PackageDoc(text) = self.peek() {
+			docs.push(Doc { text: text.clone(), span: self.span() });
+			self.bump();
+		}
+		docs
+	}
+
 	fn file(&mut self) -> Result<File, Error> {
+		let package_doc = self.package_docs();
 		let package = self.package()?;
 		let mut uses = Vec::new();
 		while self.is_kw("use") {
@@ -108,7 +129,7 @@ impl Parser {
 		while !self.is(&Tok::Eof) {
 			items.push(self.item()?);
 		}
-		Ok(File { package, uses, items })
+		Ok(File { package, package_doc, uses, items })
 	}
 
 	fn package(&mut self) -> Result<Package, Error> {
@@ -132,19 +153,34 @@ impl Parser {
 			self.bump();
 			path.push(self.ident()?.0);
 		}
+		self.eat(&Tok::At)?;
+		let (version, version_span) = self.number()?;
+		let version = u32::try_from(version).map_err(|_| Error::new(version_span, "imported package version must fit in u32"))?;
 		self.eat(&Tok::Dot)?;
 		self.eat(&Tok::LBrace)?;
-		let mut names = vec![self.ident()?.0];
+		let mut names = vec![self.import_name()?];
 		while self.is(&Tok::Comma) {
 			self.bump();
 			if self.is(&Tok::RBrace) {
 				break;
 			}
-			names.push(self.ident()?.0);
+			names.push(self.import_name()?);
 		}
 		self.eat(&Tok::RBrace)?;
 		self.eat(&Tok::Semi)?;
-		Ok(Use { path, names, span })
+		Ok(Use { path, version, names, span })
+	}
+
+	fn import_name(&mut self) -> Result<ImportName, Error> {
+		let (name, span) = self.ident()?;
+		let (alias, alias_span) = if self.is_kw("as") {
+			self.bump();
+			let (alias, span) = self.ident()?;
+			(Some(alias), Some(span))
+		} else {
+			(None, None)
+		};
+		Ok(ImportName { name, alias, span, alias_span })
 	}
 
 	fn annotations(&mut self) -> Result<Vec<Ann>, Error> {
@@ -189,32 +225,45 @@ impl Parser {
 	}
 
 	fn item(&mut self) -> Result<Item, Error> {
+		let doc = self.doc_comments();
 		let anns = self.annotations()?;
-		reject_anns_except(&anns, &["since"])?;
+		reject_anns_except(&anns, &["since", "deprecated"])?;
+		let evolution = parse_evolution(&anns)?;
 		let span = self.span();
 		let (kw, _) = self.ident()?;
 		match kw.as_str() {
-			"record" => Ok(Item::Record(self.record()?)),
-			"enum" => Ok(Item::Enum(self.enum_decl()?)),
-			"variant" => Ok(Item::Variant(self.variant()?)),
-			"flags" => Ok(Item::Flags(self.flags()?)),
-			"resource" => Ok(Item::Resource(self.resource()?)),
-			"interface" => Ok(Item::Interface(self.interface()?)),
+			"type" => Ok(Item::Alias(self.alias(doc, evolution)?)),
+			"record" => Ok(Item::Record(self.record(doc, evolution)?)),
+			"enum" => Ok(Item::Enum(self.enum_decl(doc, evolution)?)),
+			"variant" => Ok(Item::Variant(self.variant(doc, evolution)?)),
+			"flags" => Ok(Item::Flags(self.flags(doc, evolution)?)),
+			"resource" => Ok(Item::Resource(self.resource(doc, evolution)?)),
+			"interface" => Ok(Item::Interface(self.interface(doc, evolution)?)),
 			other => Err(Error::new(span, format!("expected a type or interface declaration, found `{other}`"))),
 		}
 	}
 
-	fn record(&mut self) -> Result<Record, Error> {
+	fn alias(&mut self, doc: Vec<Doc>, evolution: Evolution) -> Result<Alias, Error> {
+		let (name, span) = self.ident()?;
+		self.eat(&Tok::Eq)?;
+		let ty = self.ty()?;
+		self.eat(&Tok::Semi)?;
+		Ok(Alias { name, ty, doc, evolution, span })
+	}
+
+	fn record(&mut self, doc: Vec<Doc>, evolution: Evolution) -> Result<Record, Error> {
 		let (name, span) = self.ident()?;
 		self.eat(&Tok::LBrace)?;
 		let mut fields = Vec::new();
 		while !self.is(&Tok::RBrace) {
+			let fdoc = self.doc_comments();
 			let anns = self.annotations()?;
-			reject_anns_except(&anns, &["since"])?;
+			reject_anns_except(&anns, &["since", "deprecated"])?;
+			let evolution = parse_evolution(&anns)?;
 			let (fname, fsp) = self.ident()?;
 			self.eat(&Tok::Colon)?;
 			let ty = self.ty()?;
-			fields.push(Field { name: fname, ty, span: fsp });
+			fields.push(Field { name: fname, ty, doc: fdoc, evolution, span: fsp });
 			if self.is(&Tok::Comma) {
 				self.bump();
 			} else {
@@ -222,21 +271,23 @@ impl Parser {
 			}
 		}
 		self.eat(&Tok::RBrace)?;
-		Ok(Record { name, fields, span })
+		Ok(Record { name, fields, doc, evolution, span })
 	}
 
-	fn enum_decl(&mut self) -> Result<Enum, Error> {
+	fn enum_decl(&mut self, doc: Vec<Doc>, evolution: Evolution) -> Result<Enum, Error> {
 		let (name, span) = self.ident()?;
 		self.eat(&Tok::LBrace)?;
 		let mut cases = Vec::new();
 		let mut reserved = Vec::new();
 		while !self.is(&Tok::RBrace) {
+			let cdoc = self.doc_comments();
 			let anns = self.annotations()?;
 			// A lone `@reserved(n)` with no following identifier reserves an ordinal.
 			if anns.len() == 1 && anns[0].name == "reserved" && (self.is(&Tok::Comma) || self.is(&Tok::RBrace)) {
 				reserved.push(reserved_value(&anns[0])?);
 			} else {
-				reject_anns_except(&anns, &["since"])?;
+				reject_anns_except(&anns, &["since", "deprecated"])?;
+				let evolution = parse_evolution(&anns)?;
 				let (cname, csp) = self.ident()?;
 				let ordinal = if self.is(&Tok::Eq) {
 					self.bump();
@@ -245,7 +296,7 @@ impl Parser {
 				} else {
 					None
 				};
-				cases.push(EnumCase { name: cname, ordinal, span: csp });
+				cases.push(EnumCase { name: cname, ordinal, doc: cdoc, evolution, span: csp });
 			}
 			if self.is(&Tok::Comma) {
 				self.bump();
@@ -254,16 +305,18 @@ impl Parser {
 			}
 		}
 		self.eat(&Tok::RBrace)?;
-		Ok(Enum { name, cases, reserved, span })
+		Ok(Enum { name, cases, reserved, doc, evolution, span })
 	}
 
-	fn variant(&mut self) -> Result<Variant, Error> {
+	fn variant(&mut self, doc: Vec<Doc>, evolution: Evolution) -> Result<Variant, Error> {
 		let (name, span) = self.ident()?;
 		self.eat(&Tok::LBrace)?;
 		let mut cases = Vec::new();
 		while !self.is(&Tok::RBrace) {
+			let cdoc = self.doc_comments();
 			let anns = self.annotations()?;
-			reject_anns_except(&anns, &["since"])?;
+			reject_anns_except(&anns, &["since", "deprecated"])?;
+			let evolution = parse_evolution(&anns)?;
 			let (cname, csp) = self.ident()?;
 			let payload = if self.is(&Tok::LParen) {
 				self.bump();
@@ -273,7 +326,7 @@ impl Parser {
 			} else {
 				None
 			};
-			cases.push(VarCase { name: cname, payload, span: csp });
+			cases.push(VarCase { name: cname, payload, doc: cdoc, evolution, span: csp });
 			if self.is(&Tok::Comma) {
 				self.bump();
 			} else {
@@ -281,15 +334,20 @@ impl Parser {
 			}
 		}
 		self.eat(&Tok::RBrace)?;
-		Ok(Variant { name, cases, span })
+		Ok(Variant { name, cases, doc, evolution, span })
 	}
 
-	fn flags(&mut self) -> Result<Flags, Error> {
+	fn flags(&mut self, doc: Vec<Doc>, evolution: Evolution) -> Result<Flags, Error> {
 		let (name, span) = self.ident()?;
 		self.eat(&Tok::LBrace)?;
 		let mut flags = Vec::new();
 		while !self.is(&Tok::RBrace) {
-			flags.push(self.ident()?.0);
+			let fdoc = self.doc_comments();
+			let anns = self.annotations()?;
+			reject_anns_except(&anns, &["since", "deprecated"])?;
+			let flag_evolution = parse_evolution(&anns)?;
+			let (fname, fsp) = self.ident()?;
+			flags.push(FlagCase { name: fname, doc: fdoc, evolution: flag_evolution, span: fsp });
 			if self.is(&Tok::Comma) {
 				self.bump();
 			} else {
@@ -297,21 +355,22 @@ impl Parser {
 			}
 		}
 		self.eat(&Tok::RBrace)?;
-		Ok(Flags { name, flags, span })
+		Ok(Flags { name, flags, doc, evolution, span })
 	}
 
-	fn resource(&mut self) -> Result<Resource, Error> {
+	fn resource(&mut self, doc: Vec<Doc>, evolution: Evolution) -> Result<Resource, Error> {
 		let (name, span) = self.ident()?;
 		self.eat(&Tok::Semi)?;
-		Ok(Resource { name, span })
+		Ok(Resource { name, doc, evolution, span })
 	}
 
-	fn interface(&mut self) -> Result<Interface, Error> {
+	fn interface(&mut self, doc: Vec<Doc>, evolution: Evolution) -> Result<Interface, Error> {
 		let (name, span) = self.ident()?;
 		self.eat(&Tok::LBrace)?;
 		let mut methods = Vec::new();
 		let mut reserved = Vec::new();
 		while !self.is(&Tok::RBrace) {
+			let mdoc = self.doc_comments();
 			let anns = self.annotations()?;
 			// `@reserved(n);` retires an opcode.
 			if anns.len() == 1 && anns[0].name == "reserved" && self.is(&Tok::Semi) {
@@ -319,14 +378,15 @@ impl Parser {
 				self.bump();
 				continue;
 			}
-			methods.push(self.method(anns)?);
+			methods.push(self.method(mdoc, anns)?);
 		}
 		self.eat(&Tok::RBrace)?;
-		Ok(Interface { name, methods, reserved, span })
+		Ok(Interface { name, methods, reserved, doc, evolution, span })
 	}
 
-	fn method(&mut self, anns: Vec<Ann>) -> Result<Method, Error> {
-		reject_anns_except(&anns, &["op", "since"])?;
+	fn method(&mut self, doc: Vec<Doc>, anns: Vec<Ann>) -> Result<Method, Error> {
+		reject_anns_except(&anns, &["op", "since", "deprecated"])?;
+		let evolution = parse_evolution(&anns)?;
 		let op = self.require_op(&anns)?;
 		let (name, span) = self.ident()?;
 		self.eat(&Tok::Colon)?;
@@ -347,7 +407,7 @@ impl Parser {
 		self.eat(&Tok::Arrow)?;
 		let ret = self.ty()?;
 		self.eat(&Tok::Semi)?;
-		Ok(Method { name, op, params, ret, span })
+		Ok(Method { name, op, params, ret, doc, evolution, span })
 	}
 
 	fn require_op(&self, anns: &[Ann]) -> Result<u32, Error> {
@@ -368,13 +428,15 @@ impl Parser {
 	}
 
 	fn param(&mut self) -> Result<Param, Error> {
+		let pdoc = self.doc_comments();
 		let anns = self.annotations()?;
-		reject_anns_except(&anns, &["rights", "since"])?;
+		reject_anns_except(&anns, &["rights", "since", "deprecated"])?;
+		let evolution = parse_evolution(&anns)?;
 		let rights = collect_rights(&anns);
 		let (name, span) = self.ident()?;
 		self.eat(&Tok::Colon)?;
 		let ty = self.ty()?;
-		Ok(Param { name, ty, rights, span })
+		Ok(Param { name, ty, rights, doc: pdoc, evolution, span })
 	}
 
 	fn ty(&mut self) -> Result<Type, Error> {
@@ -441,6 +503,22 @@ fn reject_anns_except(anns: &[Ann], allowed: &[&str]) -> Result<(), Error> {
 		}
 	}
 	Ok(())
+}
+
+fn parse_evolution(anns: &[Ann]) -> Result<Evolution, Error> {
+	fn one(anns: &[Ann], name: &str) -> Result<Option<u32>, Error> {
+		let found: Vec<&Ann> = anns.iter().filter(|ann| ann.name == name).collect();
+		match found.as_slice() {
+			[] => Ok(None),
+			[ann] if ann.args.len() == 1 => match ann.args[0] {
+				Arg::Num(value) => u32::try_from(value).map(Some).map_err(|_| Error::new(ann.span, format!("`@{name}` version must fit in u32"))),
+				Arg::Name(_) => Err(Error::new(ann.span, format!("`@{name}` takes one numeric package version"))),
+			},
+			[ann] => Err(Error::new(ann.span, format!("`@{name}` takes exactly one numeric package version"))),
+			_ => Err(Error::new(found[1].span, format!("duplicate `@{name}` annotation"))),
+		}
+	}
+	Ok(Evolution { since: one(anns, "since")?, deprecated: one(anns, "deprecated")? })
 }
 
 fn reserved_value(a: &Ann) -> Result<u32, Error> {

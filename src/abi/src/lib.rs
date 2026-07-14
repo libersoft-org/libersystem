@@ -21,6 +21,14 @@
 // against a different revision is stopped at startup instead of misbehaving.
 pub const ABI_VERSION: u32 = 1;
 
+// Control messages intercepted by the userspace runtime before typed LSIDL
+// dispatch. Typed interface opcodes must stay at or below TYPED_OP_MAX.
+pub const TYPED_OP_MAX: u16 = 0xfffb;
+pub const GOODBYE_OP: u16 = 0xfffc;
+pub const RESOLVE_OP: u16 = 0xfffd;
+pub const HEARTBEAT_OP: u16 = 0xfffe;
+pub const CONNECT_OP: u16 = 0xffff;
+
 // The canonical structured-log record type and its representations (text, JSON,
 // CBOR), shared by emitters, LogService, and the kernel.
 pub mod log;

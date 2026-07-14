@@ -1,0 +1,9 @@
+package liber:config@1
+record config-entry(key:string,value:string)
+interface config
+method config.get op=1 (key:string:rights=) -> result<string, liber:base@1::error>
+method config.list op=2 () -> result<list<config-entry>, liber:base@1::error>
+method config.set op=3 (entry:config-entry:rights=) -> result<unit, liber:base@1::error>
+record picked(file:handle<liber:storage@1::file>,size:u64,name:string)
+interface picker
+method picker.pick op=1 () -> result<picked, liber:base@1::error>

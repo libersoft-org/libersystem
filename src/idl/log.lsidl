@@ -1,0 +1,43 @@
+//! LiberSystem log package - structured journal service.
+
+package liber:log@1;
+
+use liber:base@1.{error};
+
+/// Log severity, ordered least to most urgent. The ordinal is the stable wire
+/// encoding and matches abi::log::Severity byte for byte.
+enum severity {
+	trace = 0, debug = 1, info = 2, warn = 3, error = 4, fatal = 5,
+}
+
+/// One structured key/value pair on a log entry.
+record field {
+	key:   string,
+	value: string,
+}
+
+/// A structured log record. Its binary encoding reproduces the abi::log wire
+/// layout byte for byte.
+record entry {
+	timestamp: u64,
+	severity:  severity,
+	source:    string,
+	fields:    list<field>,
+}
+
+/// A query over the journal. `boot` selects a previous boot's on-disk journal
+/// (1 = the oldest kept); absent means the live in-memory journal of this boot.
+record query {
+	since:        option<u64>,
+	min-severity: option<severity>,
+	source:       option<string>,
+	boot:         option<u32>,
+	limit:        u32,
+}
+
+/// The Log service contract.
+interface log {
+	@op(1) emit:  func(e: entry) -> result<unit, error>;
+	@op(2) query: func(q: query) -> result<list<entry>, error>;
+	@op(3) tail:  func(q: query) -> stream<entry>;
+}

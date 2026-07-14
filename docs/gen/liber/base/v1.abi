@@ -1,0 +1,8 @@
+package liber:base@1
+alias koid=u64
+meta alias koid since=1 deprecated=-
+alias ticks=u64
+meta alias ticks since=1 deprecated=-
+alias name=string
+meta alias name since=1 deprecated=-
+enum error(denied=0,not-found=1,invalid=2,again=3,closed=4)

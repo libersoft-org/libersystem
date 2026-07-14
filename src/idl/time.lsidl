@@ -1,0 +1,21 @@
+//! LiberSystem time package - wall clock service.
+
+package liber:time@1;
+
+use liber:base@1.{error};
+
+/// A wall-clock instant: seconds since the Unix epoch (1970-01-01 UTC). The canonical
+/// time object - the CLI renders it as ISO-8601 / epoch / human, all representations
+/// of these seconds.
+record timestamp {
+	unix-secs: u64,
+}
+
+/// TimeService: the wall clock. `now` returns the current UTC instant, computed as the
+/// monotonic clock plus an offset disciplined at boot from the RTC and an SNTP query.
+/// The offset is set only by TimeService's own RTC/NTP logic (it alone holds the
+/// network capability it needs) - there is no client-facing "set the clock" op, so no
+/// ambient authority can move wall time.
+interface time {
+	@op(1) now: func() -> result<timestamp, error>;
+}

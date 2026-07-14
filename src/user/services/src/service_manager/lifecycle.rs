@@ -142,15 +142,20 @@ pub(super) fn verify_shutdown_order(order: &[usize], state: &[State; N]) -> bool
 // gone, so the standing supervisor drops that channel from its wait set.
 pub(super) unsafe fn serve_stats_once(stats: u64, state: &[State; N], sup: &[Supervised; N], reason: &[String; N], canary_sup: &Supervised, drivers: &[(&'static [u8], bool)], buf: &mut [u8]) -> bool {
 	unsafe {
-		let (len, handle): (usize, u64) = match recv_blocking(stats, buf) {
+		let (len, mut handle): (usize, u64) = match recv_blocking(stats, buf) {
 			Received::Message { len, handle } => (len, handle),
 			Received::Closed => return false,
 		};
 		let mut api = StatsApi { state, sup, reason, canary_sup, drivers };
 		let mut reply: [u8; 4096] = [0u8; 4096];
 		let mut reply_handle: u64 = 0;
-		if let Some(n) = supervisor::dispatch(&mut api, &buf[..len], handle, &mut reply, &mut reply_handle) {
-			send_blocking(stats, &reply[..n], reply_handle);
+		if let Some(n) = supervisor::dispatch(&mut api, &buf[..len], &mut handle, &mut reply, &mut reply_handle) {
+			if !send_blocking(stats, &reply[..n], reply_handle) && reply_handle != 0 {
+				close(reply_handle);
+			}
+		}
+		if handle != 0 {
+			close(handle);
 		}
 		true
 	}

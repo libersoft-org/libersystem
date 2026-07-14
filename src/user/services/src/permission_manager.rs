@@ -651,10 +651,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
-		serve_multi_seeded(service, &[perm_self_server], &mut request, &mut reply, |chan: u64, req: &[u8], handle: u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
+		serve_multi_seeded(service, &[perm_self_server], &mut request, &mut reply, |chan: u64, req: &[u8], handle: &mut u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
 			let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
 			if op == permission::OP_AUDIT {
-				stream_audit(&mut manager, chan, req);
+				stream_audit(&mut manager, chan, req, handle);
 				return None;
 			}
 			permission::dispatch(&mut manager, req, handle, out, reply_handle)
@@ -666,8 +666,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // Serve one OP_AUDIT request: gather the trail snapshot, then stream the entries to
 // the client over a fresh sub-channel (the reply carries the correlation id and the
 // consumer endpoint out-of-band; closing the producer marks end-of-stream).
-fn stream_audit(manager: &mut Manager, service: u64, request: &[u8]) {
-	let (corr, items): (u32, Vec<AuditEntry>) = match permission::audit_open(manager, request) {
+fn stream_audit(manager: &mut Manager, service: u64, request: &[u8], request_handle: &mut u64) {
+	let (corr, items): (u32, Vec<AuditEntry>) = match permission::audit_open(manager, request, request_handle) {
 		Some(v) => v,
 		None => return,
 	};
@@ -681,10 +681,15 @@ fn stream_audit(manager: &mut Manager, service: u64, request: &[u8]) {
 	}
 	let mut frame: [u8; 1024] = [0u8; 1024];
 	for (seq, item) in items.iter().enumerate() {
-		if let Some(n) = permission::audit_frame(seq as u32, item, &mut frame) {
+		let mut frame_handle: u64 = 0;
+		if let Some(n) = permission::audit_frame(seq as u32, item, &mut frame, &mut frame_handle) {
 			unsafe {
-				send_blocking(producer, &frame[..n], 0);
+				if !send_blocking(producer, &frame[..n], frame_handle) && frame_handle != 0 {
+					close(frame_handle);
+				}
 			}
+		} else if frame_handle != 0 {
+			unsafe { close(frame_handle) };
 		}
 	}
 	unsafe {

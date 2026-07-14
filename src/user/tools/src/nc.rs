@@ -148,9 +148,12 @@ unsafe fn drain(sock: &mut socket::Client<ChannelTransport>) {
 			let mut frame: [u8; 1024] = [0u8; 1024];
 			loop {
 				match recv_blocking(rxstream, &mut frame) {
-					Received::Message { len, .. } => {
-						if let Some(chunk) = socket::recv_read(&frame[..len]) {
+					Received::Message { len, mut handle } => {
+						if let Some(chunk) = socket::recv_read(&frame[..len], &mut handle) {
 							print(&chunk.data);
+						}
+						if handle != 0 {
+							close(handle);
 						}
 					}
 					Received::Closed => break,

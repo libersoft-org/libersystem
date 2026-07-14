@@ -1,0 +1,7 @@
+package liber:resources@1
+enum resource-type(memory=0,handles=1,threads=2,ipc-queue=3,dma=4,stack=5)
+record resource-usage(type:resource-type,used:u64,limit:u64)
+record budget(name:string,usage:list<resource-usage>)
+interface resources
+method resources.usage op=1 () -> result<list<budget>, liber:base@1::error>
+method resources.set-limit op=2 (name:string:rights=,type:resource-type:rights=,limit:u64:rights=) -> result<budget, liber:base@1::error>

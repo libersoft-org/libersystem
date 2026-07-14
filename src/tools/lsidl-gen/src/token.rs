@@ -47,6 +47,8 @@ pub enum Tok {
 	Eq,
 	At,
 	Arrow,
+	DocComment(String), // /// declaration/member doc
+	PackageDoc(String), // //! package doc
 	Eof,
 }
 
@@ -68,6 +70,8 @@ impl fmt::Display for Tok {
 			Tok::Eq => f.write_str("`=`"),
 			Tok::At => f.write_str("`@`"),
 			Tok::Arrow => f.write_str("`->`"),
+			Tok::DocComment(_) => f.write_str("doc comment"),
+			Tok::PackageDoc(_) => f.write_str("package doc"),
 			Tok::Eof => f.write_str("end of file"),
 		}
 	}

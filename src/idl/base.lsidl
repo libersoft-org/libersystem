@@ -1,0 +1,31 @@
+//! LiberSystem base package - common error enum shared across all services.
+
+package liber:base@1;
+
+/// A kernel object identifier.
+@since(1)
+type koid = u64;
+
+/// Monotonic scheduler ticks.
+@since(1)
+type ticks = u64;
+
+/// A semantic name carried as UTF-8 text.
+@since(1)
+type name = string;
+
+/// A common error enum rendered identically in binary, JSON, and CLI.
+/// Each case names a kernel ERR_* condition; the wire value is the enum's
+/// own 0-based ordinal, not the negative ERR_* number.
+enum error {
+	/// Access denied (~ ERR_ACCESS_DENIED).
+	denied,
+	/// No such object exists.
+	not-found,
+	/// Invalid argument or state (~ ERR_INVALID).
+	invalid,
+	/// Would block, try again later (~ ERR_WOULD_BLOCK).
+	again,
+	/// Peer closed connection (~ ERR_PEER_CLOSED).
+	closed,
+}
