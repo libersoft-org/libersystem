@@ -26,6 +26,9 @@ enum capability {
 	volumes,
 	services,
 	usb,
+	display,
+	input-keys,
+	audio-stream,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

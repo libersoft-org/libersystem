@@ -2,6 +2,8 @@
 
 package liber:input@1;
 
+use liber:base@1.{error};
+
 /// One pointer event mapped to the text-cell grid: the cursor's column and row, and
 /// the button bitmask (bit 0 left, bit 1 right, bit 2 middle). The canonical typed
 /// form of a mouse position - the framebuffer console grid coordinates, never raw
@@ -34,4 +36,10 @@ record key-event {
 interface input {
 	@op(1) subscribe:      func() -> stream<pointer-event>;
 	@op(2) subscribe-keys: func(focus: handle<channel>) -> stream<key-event>;
+}
+
+/// Privileged launcher boundary that mints a factory restricted to raw-key
+/// subscriptions. Connections produced from it cannot call the pointer snapshot op.
+interface input-admin {
+	@op(1) open-keys: func() -> result<handle<channel>, error>;
 }

@@ -34,6 +34,9 @@ pub enum Capability {
 	Volumes = 13,
 	Services = 14,
 	Usb = 15,
+	Display = 16,
+	InputKeys = 17,
+	AudioStream = 18,
 }
 
 impl Capability {
@@ -71,6 +74,9 @@ impl Capability {
 			13 => Some(Capability::Volumes),
 			14 => Some(Capability::Services),
 			15 => Some(Capability::Usb),
+			16 => Some(Capability::Display),
+			17 => Some(Capability::InputKeys),
+			18 => Some(Capability::AudioStream),
 			_ => None,
 		}
 	}
@@ -479,6 +485,9 @@ impl Capability {
 			Capability::Volumes => out.push_str("\"volumes\""),
 			Capability::Services => out.push_str("\"services\""),
 			Capability::Usb => out.push_str("\"usb\""),
+			Capability::Display => out.push_str("\"display\""),
+			Capability::InputKeys => out.push_str("\"input-keys\""),
+			Capability::AudioStream => out.push_str("\"audio-stream\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -499,6 +508,9 @@ impl Capability {
 			Capability::Volumes => out.push_str("volumes"),
 			Capability::Services => out.push_str("services"),
 			Capability::Usb => out.push_str("usb"),
+			Capability::Display => out.push_str("display"),
+			Capability::InputKeys => out.push_str("input-keys"),
+			Capability::AudioStream => out.push_str("audio-stream"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -519,6 +531,9 @@ impl Capability {
 			Capability::Volumes => crate::codec::cbor::text(out, "volumes"),
 			Capability::Services => crate::codec::cbor::text(out, "services"),
 			Capability::Usb => crate::codec::cbor::text(out, "usb"),
+			Capability::Display => crate::codec::cbor::text(out, "display"),
+			Capability::InputKeys => crate::codec::cbor::text(out, "input-keys"),
+			Capability::AudioStream => crate::codec::cbor::text(out, "audio-stream"),
 		}
 	}
 }

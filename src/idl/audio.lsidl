@@ -24,3 +24,9 @@ interface pcm-stream {
 	@op(1) write: func(data: buffer) -> result<u32, error>;
 	@op(2) close: func() -> result<unit, error>;
 }
+
+/// Privileged launcher boundary that mints a factory restricted to `open-stream`.
+/// Connections produced from it cannot queue `beep` tones.
+interface audio-admin {
+	@op(1) open-streams: func() -> result<handle<channel>, error>;
+}

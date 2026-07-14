@@ -1,6 +1,8 @@
 # Bugs / changes
 
 - audio player (different formats)
+- audio recorder (microphone)
+- web camera viewer / recorder
 - tests are taking too long after every small task - optimization needed
 - Can it run Doom?
 - text selection by mouse lags horribly

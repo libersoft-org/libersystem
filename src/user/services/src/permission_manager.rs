@@ -45,6 +45,9 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use proto::system::audio_admin;
+use proto::system::display_admin;
+use proto::system::input_admin;
 use proto::system::permission::{self, Service};
 use proto::system::{AuditEntry, Capability, Error, Manifest, StartResult, process};
 use rt::*;
@@ -85,7 +88,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // client only for the ones the supervisor wired it (the rest stay 0 - declared in the
 // vocabulary, not yet grantable - so a manifest naming them records the decision but hands
 // over nothing).
-const VOCABULARY: [Capability; 16] = [
+const VOCABULARY: [Capability; 19] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -102,6 +105,9 @@ const VOCABULARY: [Capability; 16] = [
 	Capability::Volumes,
 	Capability::Services,
 	Capability::Usb,
+	Capability::Display,
+	Capability::InputKeys,
+	Capability::AudioStream,
 ];
 
 // A store row where the policy allows everything the component requests - the
@@ -144,6 +150,9 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"config" => Some(granted("config", alloc::vec![Capability::Config])),
 		b"set" => Some(granted("set", alloc::vec![Capability::Config])),
 		b"beep" => Some(granted("beep", alloc::vec![Capability::Audio])),
+		b"view" => Some(granted("view", alloc::vec![Capability::Volumes, Capability::Display, Capability::InputKeys])),
+		b"play" => Some(granted("play", alloc::vec![Capability::Volumes, Capability::AudioStream])),
+		b"graphics_probe" => Some(granted("graphics_probe", alloc::vec![Capability::Display, Capability::InputKeys, Capability::AudioStream])),
 		b"usage" => Some(granted("usage", alloc::vec![Capability::Resource])),
 		b"ps" => Some(granted("ps", alloc::vec![Capability::Resource, Capability::Process])),
 		b"run" => Some(granted("run", alloc::vec![Capability::Process])),
@@ -211,6 +220,9 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::Volumes => b"VOLUMES",
 		Capability::Services => b"SERVICES",
 		Capability::Usb => b"USB",
+		Capability::Display => b"DISPLAY",
+		Capability::InputKeys => b"INPUT_KEYS",
+		Capability::AudioStream => b"AUDIO_STREAM",
 	}
 }
 
@@ -247,6 +259,9 @@ struct Clients {
 	storage_iso: u64,
 	storage_udf: u64,
 	storage_usb: u64,
+	display_admin: u64,
+	input_admin: u64,
+	audio_admin: u64,
 }
 
 impl Clients {
@@ -268,10 +283,56 @@ impl Clients {
 			Capability::Supervisor => self.supervisor,
 			Capability::Services => self.services,
 			Capability::Usb => self.usb,
+			Capability::Display | Capability::InputKeys | Capability::AudioStream => 0,
 			// The `volumes` capability has no single representative client - it is granted as a
 			// bundle of five channels by `grant_volumes`, never through this single-channel path.
 			// The system volume stands in here for the (headless-denied) dynamic-request path.
 			Capability::Volumes => self.storage,
+		}
+	}
+}
+
+// Mint a launch-scoped capability. Display binding consumes a duplicate of the exact
+// task ProcessService just returned and atomically returns its associated connection;
+// input/audio admins mint connections narrowed to their advertised operation subset.
+unsafe fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64) -> u64 {
+	unsafe {
+		match cap {
+			Capability::Display => {
+				if clients.display_admin == 0 {
+					return 0;
+				}
+				let bound_task: i64 = duplicate(task, RIGHT_MANAGE | RIGHT_TRANSFER);
+				if bound_task < 0 {
+					return 0;
+				}
+				match display_admin::Client::new(ChannelTransport { chan: clients.display_admin }).bind(&(bound_task as u64)) {
+					Some(Ok(display)) => display,
+					_ => {
+						close(bound_task as u64);
+						0
+					}
+				}
+			}
+			Capability::InputKeys => {
+				if clients.input_admin == 0 {
+					return 0;
+				}
+				match input_admin::Client::new(ChannelTransport { chan: clients.input_admin }).open_keys() {
+					Some(Ok(input)) => input,
+					_ => 0,
+				}
+			}
+			Capability::AudioStream => {
+				if clients.audio_admin == 0 {
+					return 0;
+				}
+				match audio_admin::Client::new(ChannelTransport { chan: clients.audio_admin }).open_streams() {
+					Some(Ok(audio)) => audio,
+					_ => 0,
+				}
+			}
+			_ => grant_handle(clients, cap),
 		}
 	}
 }
@@ -370,7 +431,7 @@ unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Cl
 		for &cap in VOCABULARY.iter() {
 			let granted: bool = manifest.grants.contains(&cap);
 			if granted {
-				let handle: u64 = grant_handle(clients, cap);
+				let handle: u64 = grant_for_task(clients, cap, task);
 				if handle == 0 || !send_blocking(manager_side, tag_for(cap), handle) {
 					close(manager_side);
 					close(task);
@@ -456,7 +517,7 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 				let ok: bool = if cap == Capability::Volumes {
 					grant_volumes(manager_side, clients)
 				} else {
-					let handle: u64 = grant_handle(clients, cap);
+					let handle: u64 = grant_for_task(clients, cap, started.task);
 					handle != 0 && send_blocking(manager_side, tag_for(cap), handle)
 				};
 				if !ok {
@@ -562,11 +623,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    service, process so the governed `ps` / `run` commands can list / start processes - a
 	//    dedicated ProcessService connection, kept separate from the launch mechanism below -, and
 	//    supervisor so the governed `stop` command can drive the supervisor's teardown path over a
-	//    dedicated ServiceManager admin channel); the permission capability is not received but
-	//    minted locally below (a self-connection to the manager's own serve channel); the remaining
-	//    vocabulary capabilities (input, graph) are declared in the store but not wired - held 0, so
-	//    a manifest naming one records the decision yet hands over nothing (input / graph are
-	//    single-client and cannot be proxied at all).
+	//    dedicated ServiceManager admin channel). Private display/input/audio admin clients mint
+	//    process-bound display, key-only input and playback-only audio grants; applications never
+	//    receive those admin interfaces. The permission capability is minted locally below as a
+	//    self-connection. Legacy broad `input` and `graph` remain declared but unwired.
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or(0);
 	let log: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or(0);
 	let network: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NETWORK") }.unwrap_or(0);
@@ -574,6 +634,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let config: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONFIG") }.unwrap_or(0);
 	let device: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DEVICE") }.unwrap_or(0);
 	let audio: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"AUDIO") }.unwrap_or(0);
+	let display_admin: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DISPLAY_ADMIN") }.unwrap_or(0);
+	let input_admin: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"INPUT_ADMIN") }.unwrap_or(0);
+	let audio_admin: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"AUDIO_ADMIN") }.unwrap_or(0);
 	let resource: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"RESOURCE") }.unwrap_or(0);
 	let process: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS_GRANT") }.unwrap_or(0);
 	// The admin channel the manager grants to the governed `stop` command (whose manifest
@@ -605,7 +668,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection") });
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, broker: bootstrap };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, display_admin, input_admin, audio_admin, broker: bootstrap };
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"process", b"process client not delivered") });
 
 	// 2. wait for the serve channel clients reach us on.

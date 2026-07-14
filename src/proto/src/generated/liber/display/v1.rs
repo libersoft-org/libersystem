@@ -513,6 +513,129 @@ pub mod display {
 	}
 }
 
+/// Privileged launcher boundary. PermissionManager transfers the Process capability
+/// returned by ProcessService and receives a fresh display connection bound to that
+/// exact process. Ordinary display clients never receive this interface and cannot
+/// bind themselves or another task; emergency revocation signals the bound task.
+// interface `display-admin` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod display_admin {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_BIND: u16 = 1;
+
+	pub trait Service {
+		fn bind(&mut self, task: u64) -> Result<u64, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		match op {
+			OP_BIND => {
+				let task = {
+					let _ = r.u32()?;
+					r.take_handle()?
+				};
+				if r.has_handle() {
+					return None;
+				}
+				*request_handle = 0;
+				let result = service.bind(task);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v8) => {
+							w.u8(1)?;
+							w.set_handle(*v8)?;
+							w.u32(0)?;
+						}
+						Err(v9) => {
+							w.u8(0)?;
+							v9.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						*reply_handle = writer.handle();
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn bind(&mut self, task: &u64) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_BIND)?;
+			w.u32(corr)?;
+			w.set_handle(*task)?;
+			w.u32(0)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				Some(if r.u8()? != 0 {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				})
+			})();
+			if decoded.is_none() || reader.has_handle() {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			decoded
+		}
+	}
+}
+
 impl PixelFormat {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();

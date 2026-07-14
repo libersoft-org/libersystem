@@ -3,6 +3,7 @@
 package liber:display@1;
 
 use liber:base@1.{error};
+use liber:process@1.{task};
 
 /// Pixel layouts accepted by DisplayService. The first format matches the existing
 /// virtio-gpu scanout and ConsoleService representation: in memory B, G, R, unused;
@@ -50,4 +51,12 @@ interface display {
 	/// client transfers it to `input.subscribe-keys`; a background or released
 	/// surface has no proof, and changing foreground revokes the previous peer.
 	@op(5) input-focus: func() -> result<handle<channel>, error>;
+}
+
+/// Privileged launcher boundary. PermissionManager transfers the Process capability
+/// returned by ProcessService and receives a fresh display connection bound to that
+/// exact process. Ordinary display clients never receive this interface and cannot
+/// bind themselves or another task; emergency revocation signals the bound task.
+interface display-admin {
+	@op(1) bind: func(task: handle<task>) -> result<handle<channel>, error>;
 }

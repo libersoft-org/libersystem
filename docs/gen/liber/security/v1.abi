@@ -1,5 +1,5 @@
 package liber:security@1
-enum capability(log=0,storage=1,network=2,device=3,config=4,time=5,audio=6,input=7,graph=8,resource=9,process=10,permission=11,supervisor=12,volumes=13,services=14,usb=15)
+enum capability(log=0,storage=1,network=2,device=3,config=4,time=5,audio=6,input=7,graph=8,resource=9,process=10,permission=11,supervisor=12,volumes=13,services=14,usb=15,display=16,input-keys=17,audio-stream=18)
 record manifest(component:string,requested:list<capability>,grants:list<capability>)
 record audit-entry(component:string,capability:capability,granted:bool,dynamic:bool)
 interface permission

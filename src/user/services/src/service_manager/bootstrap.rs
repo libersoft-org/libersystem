@@ -82,7 +82,7 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-pub(super) unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, snd_client: &mut u64, audio_client: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
+pub(super) unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -143,13 +143,13 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_
 		if name == b"time_service" && !bootstrap_time_service(manager_side, *net_client, time_client) {
 			return State::Failed;
 		}
-		if name == b"audio_service" && !bootstrap_audio_service(manager_side, *snd_client, audio_client) {
+		if name == b"audio_service" && !bootstrap_audio_service(manager_side, *snd_client, audio_client, audio_admin) {
 			return State::Failed;
 		}
-		if name == b"input_service" && !bootstrap_input(manager_side, *input_raw, *usb_pointer, *raw_keys, input_client, input_focus, input_kill, pointer_console) {
+		if name == b"input_service" && !bootstrap_input(manager_side, *input_raw, *usb_pointer, *raw_keys, input_client, input_admin, input_focus, input_kill, pointer_console) {
 			return State::Failed;
 		}
-		if name == b"display_service" && !bootstrap_display_service(manager_side, *gpu_client, *input_focus, *input_kill, display_client) {
+		if name == b"display_service" && !bootstrap_display_service(manager_side, *gpu_client, *input_focus, *input_kill, display_client, display_admin) {
 			return State::Failed;
 		}
 		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *display_client, *time_client, *audio_client, *session_client, *perm_client, *pointer_console, console_client, console_control) {
@@ -158,7 +158,7 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
 			return State::Failed;
 		}
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *usbq_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *res_client, *process_client, perm_client, admin_server2, stats_server2) {
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *usbq_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, perm_client, admin_server2, stats_server2) {
 			return State::Failed;
 		}
 		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, pkg_handle, pkg_len, buf) {
@@ -533,16 +533,18 @@ unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], st
 // holds, and can be seen to withhold, a capability it possesses), a fresh TimeService
 // connection (the one capability the governed `date` command may reach), then fresh
 // ConfigService, DeviceService, and AudioService connections (the capabilities the governed
-// `config` / `set`, `lsdev`, and `beep` commands may reach) - then a fresh ProcessService
+// `config` / `set`, `lsdev`, and `beep` commands may reach), then private display/input/audio
+// admin clients for scoped graphical grants, followed by a fresh ProcessService
 // connection (the loading mechanism it drives to start the components it governs) and the
 // channel its clients reach it on ("SERVE", the client end kept in `*perm_client` for the
 // shell's `perm` command). The order matches PermissionManager's receive order: STORAGE,
-// LOG, NETWORK, TIME, CONFIG, DEVICE, AUDIO, RESOURCE, PROCESS_GRANT, PROCESS, SERVE. The
+// LOG, NETWORK, TIME, CONFIG, DEVICE, AUDIO, DISPLAY_ADMIN, INPUT_ADMIN, AUDIO_ADMIN,
+// RESOURCE, PROCESS_GRANT, PROCESS, SERVE. The
 // grantable clients carry RIGHT_DUPLICATE so the manager can attenuate and hand a strictly
 // narrower client to each component it sandboxes. (The grantable permission capability - a
 // connection to the manager's own serve channel - is not passed here: the manager mints that
 // self-connection itself.)
-unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, usbq_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, resource_client: u64, process_client: u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
+unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, usbq_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
 	unsafe {
 		// A fresh StorageService connection for the manager (independent of the shell's),
 		// duplicable so the manager can grant a narrowed copy to a sandboxed component.
@@ -603,6 +605,15 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			None => return false,
 		};
 		if !send_blocking(manager_side, b"AUDIO", audio_conn) {
+			return false;
+		}
+		if !send_blocking(manager_side, b"DISPLAY_ADMIN", display_admin) {
+			return false;
+		}
+		if !send_blocking(manager_side, b"INPUT_ADMIN", input_admin) {
+			return false;
+		}
+		if !send_blocking(manager_side, b"AUDIO_ADMIN", audio_admin) {
 			return false;
 		}
 		// A fresh ResourceManager connection the manager grants to the governed `usage` command
@@ -777,9 +788,10 @@ unsafe fn bootstrap_config_service(manager_side: u64, storage_client: u64, confi
 // event over it to ConsoleService, whose end is kept in `*pointer_console` for
 // ConsoleService's own bootstrap (it starts later, since it declares input_service as
 // a dependency). "KEYS" carries the merged keyboard-driver consumer, while private
-// "FOCUS" and "KILL" pairs connect InputService to DisplayService. The order matches
-// InputService's receive order: SERVE, INPUT, INPUT2, FORWARD, KEYS, FOCUS, KILL.
-unsafe fn bootstrap_input(manager_side: u64, input_raw: u64, usb_pointer: u64, raw_keys: u64, input_client: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64) -> bool {
+// "FOCUS" and "KILL" pairs connect InputService to DisplayService; "ADMIN" lets only
+// PermissionManager mint key-only clients. The order matches InputService's receive
+// order: SERVE, INPUT, INPUT2, FORWARD, KEYS, FOCUS, KILL, ADMIN.
+unsafe fn bootstrap_input(manager_side: u64, input_raw: u64, usb_pointer: u64, raw_keys: u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64) -> bool {
 	unsafe {
 		if !bootstrap_serve(manager_side, input_client) {
 			return false;
@@ -817,6 +829,14 @@ unsafe fn bootstrap_input(manager_side: u64, input_raw: u64, usb_pointer: u64, r
 			return false;
 		}
 		*input_kill = display_end;
+		let (service_admin, manager_admin): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"ADMIN", service_admin) {
+			return false;
+		}
+		*input_admin = manager_admin;
 		true
 	}
 }
@@ -960,24 +980,35 @@ unsafe fn bootstrap_time_service(manager_side: u64, net_client: u64, time_client
 }
 
 // Hand AudioService the virtio-snd driver's control channel ("SND" - a 0 handle when
-// no sound device is present, routed up from the snd driver via DeviceManager) and the
-// channel its clients reach it on ("SERVE"). The service-channel client end is kept in
+// no sound device is present, routed up from the snd driver via DeviceManager), a private
+// ADMIN channel for playback-only grants, and the channel its clients reach on ("SERVE").
+// The service-channel client end is kept in
 // `*audio_client` and later handed to the shell (and to ConsoleService as a factory)
 // for the `beep` command. (AudioService depends on device_manager, so `snd_client` is
 // already set by the time this runs; it is 0 when there is no sound device, and
 // AudioService then answers `beep` with a not-found error.)
-unsafe fn bootstrap_audio_service(manager_side: u64, snd_client: u64, audio_client: &mut u64) -> bool {
+unsafe fn bootstrap_audio_service(manager_side: u64, snd_client: u64, audio_client: &mut u64, audio_admin: &mut u64) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"SND", snd_client) {
 			return false;
 		}
+		let (service_admin, manager_admin): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"ADMIN", service_admin) {
+			return false;
+		}
+		*audio_admin = manager_admin;
 		bootstrap_serve(manager_side, audio_client)
 	}
 }
 
-// Hand DisplayService the raw virtio-gpu channel and create the typed multi-client
-// display root. With no gpu, the service maps the boot framebuffer instead.
-unsafe fn bootstrap_display_service(manager_side: u64, gpu_client: u64, input_focus: u64, input_kill: u64, display_client: &mut u64) -> bool {
+// Hand DisplayService the raw virtio-gpu channel, private focus/kill links to InputService,
+// and an ADMIN channel only PermissionManager can use to bind Process handles to fresh
+// display clients. Then create the ordinary display root. With no gpu, the service maps
+// the boot framebuffer instead.
+unsafe fn bootstrap_display_service(manager_side: u64, gpu_client: u64, input_focus: u64, input_kill: u64, display_client: &mut u64, display_admin: &mut u64) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"GPU", gpu_client) {
 			return false;
@@ -988,6 +1019,14 @@ unsafe fn bootstrap_display_service(manager_side: u64, gpu_client: u64, input_fo
 		if !send_blocking(manager_side, b"KILL", input_kill) {
 			return false;
 		}
+		let (service_admin, manager_admin): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"ADMIN", service_admin) {
+			return false;
+		}
+		*display_admin = manager_admin;
 		bootstrap_serve(manager_side, display_client)
 	}
 }

@@ -2444,7 +2444,7 @@ layer exists.
   preferred-size changes. Fixed-size clients may ignore them and stay scaled;
   ConsoleService reacquires and reflows. Center/scale smaller surfaces with
   nearest-neighbor first.
-- [ ] Fullscreen handoff and guaranteed return: the foreground VT hands the
+- [x] Fullscreen handoff and guaranteed return: the foreground VT hands the
       display to the app for the surface's lifetime; `release()`, process exit,
       or a CRASH (surface channel peer-close) always restores the text console
       with a full repaint - a dead app can never leave a black screen. Plus the
@@ -2490,7 +2490,7 @@ layer exists.
       machinery generalized), and a look at the blit hot path's build profile.
       Record the numbers in docs/PERF.md - this also attacks the standing NOTES
       complaints (selection lag, paging lag) at their shared root.
-- [ ] Capability vocabulary: `display`, `input-keys`, and `audio-stream` join
+- [x] Capability vocabulary: `display`, `input-keys`, and `audio-stream` join
       the `capability` enum and PermissionManager's grant table, so a graphical
       app's manifest is exactly "display + input-keys + audio-stream + volumes"
       and nothing else - the sandbox showcase: a game that can draw, hear keys,

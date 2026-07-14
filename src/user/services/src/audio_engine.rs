@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use proto::codec::Buffer;
 use proto::system::Error;
 use proto::system::audio::{self, Service as AudioService};
+use proto::system::audio_admin::{self, Service as AdminService};
 use proto::system::pcm_stream::{self, Service as PcmService};
 use rt::*;
 
@@ -136,6 +137,17 @@ struct Audio {
 	driver_pending: DriverPending,
 	driver_running: bool,
 	period: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+	Full,
+	StreamOnly,
+}
+
+struct Client {
+	chan: u64,
+	scope: Scope,
 }
 
 impl Audio {
@@ -310,10 +322,14 @@ impl Audio {
 
 struct RootCall<'a> {
 	audio: &'a mut Audio,
+	scope: Scope,
 }
 
 impl AudioService for RootCall<'_> {
 	fn beep(&mut self, freq: u16, millis: u32) -> Result<(), Error> {
+		if self.scope != Scope::Full {
+			return Err(Error::Denied);
+		}
 		if self.audio.snd == 0 {
 			return Err(Error::NotFound);
 		}
@@ -343,6 +359,18 @@ impl AudioService for RootCall<'_> {
 	}
 }
 
+struct AdminCall<'a> {
+	clients: &'a mut Vec<Client>,
+}
+
+impl AdminService for AdminCall<'_> {
+	fn open_streams(&mut self) -> Result<u64, Error> {
+		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		self.clients.push(Client { chan: server, scope: Scope::StreamOnly });
+		Ok(client)
+	}
+}
+
 struct StreamCall<'a> {
 	stream: &'a mut Stream,
 }
@@ -365,15 +393,16 @@ pub fn run(bootstrap: u64) -> ! {
 			Received::Message { len, handle } if len >= 3 && &bootstrap_buf[..3] == b"SND" => handle,
 			_ => fail_bootstrap(bootstrap, b"snd", b"driver channel not delivered"),
 		};
+		let admin: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"ADMIN").unwrap_or_else(|| fail_bootstrap(bootstrap, b"admin", b"audio admin channel not delivered"));
 		let root: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
 		send_blocking(bootstrap, b"AudioService: online", 0);
-		serve(root, Audio::new(snd));
+		serve(root, admin, Audio::new(snd));
 	}
 }
 
-unsafe fn serve(root: u64, mut state: Audio) -> ! {
+unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 	unsafe {
-		let mut clients: Vec<u64> = alloc::vec![root];
+		let mut clients: Vec<Client> = alloc::vec![Client { chan: root, scope: Scope::Full }];
 		let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
 		let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
 		loop {
@@ -383,11 +412,12 @@ unsafe fn serve(root: u64, mut state: Audio) -> ! {
 			state.pump();
 
 			let driver_first: bool = state.snd != 0 && state.driver_pending != DriverPending::None;
-			let mut waits: Vec<u64> = Vec::with_capacity(driver_first as usize + clients.len() + state.streams.len());
+			let mut waits: Vec<u64> = Vec::with_capacity(driver_first as usize + clients.len() + state.streams.len() + 1);
 			if driver_first {
 				waits.push(state.snd);
 			}
-			waits.extend_from_slice(&clients);
+			waits.push(admin);
+			waits.extend(clients.iter().map(|client| client.chan));
 			for stream in &state.streams {
 				if stream.chan != 0 {
 					waits.push(stream.chan);
@@ -405,20 +435,41 @@ unsafe fn serve(root: u64, mut state: Audio) -> ! {
 				}
 				continue;
 			}
-			if let Some(index) = clients.iter().position(|client| *client == ready_chan) {
+			if ready_chan == admin {
+				match recv_blocking(admin, &mut request) {
+					Received::Message { len, mut handle } => {
+						let mut reply_handle: u64 = 0;
+						let mut call = AdminCall { clients: &mut clients };
+						if let Some(reply_len) = audio_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
+							if !send_blocking(admin, &reply[..reply_len], reply_handle) && reply_handle != 0 {
+								close(reply_handle);
+							}
+						} else if reply_handle != 0 {
+							close(reply_handle);
+						}
+						if handle != 0 {
+							close(handle);
+						}
+					}
+					Received::Closed => exit(),
+				}
+				continue;
+			}
+			if let Some(index) = clients.iter().position(|client| client.chan == ready_chan) {
+				let scope: Scope = clients[index].scope;
 				match recv_blocking(ready_chan, &mut request) {
 					Received::Message { len, mut handle } => {
 						let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 						if op == HEARTBEAT_OP {
 							send_blocking(ready_chan, b"PONG", 0);
-						} else if op == CONNECT_OP {
+						} else if op == CONNECT_OP && scope == Scope::Full {
 							if let Some((server, client)) = channel() {
-								clients.push(server);
+								clients.push(Client { chan: server, scope });
 								send_blocking(ready_chan, &[], client);
 							}
 						} else {
 							let mut reply_handle: u64 = 0;
-							let mut call = RootCall { audio: &mut state };
+							let mut call = RootCall { audio: &mut state, scope };
 							if let Some(reply_len) = audio::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
 								if !send_blocking(ready_chan, &reply[..reply_len], reply_handle) && reply_handle != 0 {
 									close(reply_handle);

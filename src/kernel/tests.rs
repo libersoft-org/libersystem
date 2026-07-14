@@ -244,7 +244,7 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 // probe_read, probe_summary, date_read, date_summary, request_read, request_summary,
 // cat_read): the file straight from the volume, then each component's proof and decisions
 // summary, then the bytes `cat` printed through the run launcher.
-fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
+fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
 	use object::channel::Channel;
 	use object::rights::Rights;
 
@@ -263,7 +263,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let (storage_server, storage_client) = Channel::create();
 	let (process_server, process_client) = Channel::create();
 	let (time_server, time_client) = Channel::create();
-	let (perm_server, _perm_client) = Channel::create();
+	let (perm_server, perm_client) = Channel::create();
 	// The manager's log grant: a real, duplicable client whose service peer is dropped, so
 	// the sandboxed probe's best-effort log emit fails fast instead of blocking (no
 	// LogService runs in this scenario). The capability is still granted and audited.
@@ -319,6 +319,12 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	// would receive a narrowed copy, is not among them).
 	let (usb_server, usb_client) = Channel::create();
 	core::mem::drop(usb_server);
+	let (display_admin_server, display_admin_client) = Channel::create();
+	let (input_admin_server, input_admin_client) = Channel::create();
+	let (audio_admin_server, audio_admin_client) = Channel::create();
+	let (_display_scope_server, display_scope_client) = Channel::create();
+	let (_input_scope_server, input_scope_client) = Channel::create();
+	let (_audio_scope_server, audio_scope_client) = Channel::create();
 
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
@@ -358,6 +364,9 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	send_cap(&pm_boot_kernel, b"CONFIG", config_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"DEVICE", device_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"AUDIO", audio_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"DISPLAY_ADMIN", display_admin_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"INPUT_ADMIN", input_admin_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"AUDIO_ADMIN", audio_admin_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"RESOURCE", resource_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"PROCESS_GRANT", process_grant_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"SUPERVISOR", supervisor_client, Rights::ALL)?;
@@ -387,7 +396,38 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let request_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no dynamic-request verdict")?;
 	let request_summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no dynamic-request decisions summary")?;
 	let cat_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no cat output")?;
-	Ok((expected, probe_read.bytes, probe_summary.bytes, date_read.bytes, date_summary.bytes, request_read.bytes, request_summary.bytes, cat_read.bytes))
+
+	// Prequeue one successful admin mint on each private connection. PermissionManager's
+	// generated clients all start at correlation id 0; DisplayService additionally receives
+	// the exact Process handle in the bind request queued at `display_admin_server`.
+	let admin_reply = |channel: &Channel, capability: alloc::sync::Arc<dyn object::KernelObject>| -> Result<(), &'static str> {
+		let mut bytes = alloc::vec::Vec::new();
+		bytes.extend_from_slice(&0u32.to_le_bytes());
+		bytes.push(1);
+		bytes.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(channel, &bytes, capability, Rights::ALL)
+	};
+	admin_reply(&display_admin_server, display_scope_client)?;
+	admin_reply(&input_admin_server, input_scope_client)?;
+	admin_reply(&audio_admin_server, audio_scope_client)?;
+
+	let (graphics_output, graphics_stdout) = Channel::create();
+	let mut run = alloc::vec::Vec::new();
+	run.extend_from_slice(&3u16.to_le_bytes());
+	run.extend_from_slice(&0u32.to_le_bytes());
+	for value in [&b"graphics_probe"[..], &b""[..], &b"vol://system"[..]] {
+		run.extend_from_slice(&(value.len() as u16).to_le_bytes());
+		run.extend_from_slice(value);
+	}
+	run.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&perm_client, &run, graphics_stdout, Rights::ALL)?;
+	sched::run_until_idle();
+	let run_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer graphics_probe run")?;
+	if run_reply.bytes.len() < 5 || run_reply.bytes[4] == 0 {
+		return Err("PermissionManager refused graphics_probe");
+	}
+	let graphics_read = graphics_output.recv().map_err(|_| "graphics_probe received incomplete grants")?;
+	Ok((expected, probe_read.bytes, probe_summary.bytes, date_read.bytes, date_summary.bytes, request_read.bytes, request_summary.bytes, cat_read.bytes, graphics_read.bytes))
 }
 
 // Build the component topology and run it to completion. A StorageService serves
@@ -2887,6 +2927,8 @@ fn input_service_streams_pointer_events() {
 	send_cap(&boot_kernel, b"KEYS", key_consumer, Rights::ALL).expect("key raw bootstrap");
 	send_cap(&boot_kernel, b"FOCUS", focus_input, Rights::ALL).expect("focus bootstrap");
 	boot_kernel.send(Message::new(b"KILL".to_vec(), alloc::vec::Vec::new(), 0)).expect("kill bootstrap");
+	let (_admin_peer, admin) = Channel::create();
+	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("input admin bootstrap");
 
 	// Inject two normalized pointer events as the driver would. The grid is COLS = 80
 	// x ROWS = 50 over the 0..0x10000 normalized span, so col = (x * 80) / 0x10000 and
@@ -2955,7 +2997,7 @@ fn input_service_streams_keys_only_with_display_focus() {
 	let package = pkg::Package::parse(init).expect("init package parses");
 	let service_elf = program_elf(&package, volume, b"input_service").expect("input_service in the package or volume");
 	let (boot_kernel, boot_user) = Channel::create();
-	let (service_server, service_client) = Channel::create();
+	let (service_server, _service_client) = Channel::create();
 	let (_pointer_a, pointer_b) = Channel::create();
 	let (console_focus, forward_b) = Channel::create();
 	let (keys_driver, keys_input) = Channel::create();
@@ -2969,18 +3011,34 @@ fn input_service_streams_keys_only_with_display_focus() {
 	send_cap(&boot_kernel, b"KEYS", keys_input, Rights::ALL).expect("keys bootstrap");
 	send_cap(&boot_kernel, b"FOCUS", focus_input, Rights::ALL).expect("focus bootstrap");
 	send_cap(&boot_kernel, b"KILL", kill_input, Rights::ALL).expect("kill bootstrap");
+	let (input_admin, admin) = Channel::create();
+	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("input admin bootstrap");
 	sched::run_until_idle();
 	let online = boot_kernel.recv().expect("InputService online report");
 	assert_eq!(&online.bytes[..], b"InputService: online");
+	let mut open_keys = alloc::vec::Vec::new();
+	open_keys.extend_from_slice(&1u16.to_le_bytes());
+	open_keys.extend_from_slice(&40u32.to_le_bytes());
+	input_admin.send(Message::new(open_keys, alloc::vec::Vec::new(), 0)).expect("open key-only connection");
+	sched::run_until_idle();
+	let reply = input_admin.recv().expect("key-only connection reply");
+	let scoped = reply.caps.first().expect("key-only connection").object().into_any_arc().downcast::<Channel>().expect("key-only grant is a channel");
+	let mut pointer_request = alloc::vec::Vec::new();
+	pointer_request.extend_from_slice(&1u16.to_le_bytes());
+	pointer_request.extend_from_slice(&41u32.to_le_bytes());
+	scoped.send(Message::new(pointer_request, alloc::vec::Vec::new(), 0)).expect("forbidden pointer snapshot");
+	sched::run_until_idle();
+	let denied = scoped.recv().expect("pointer scope denial");
+	assert!(denied.caps.is_empty(), "key-only connection cannot open a pointer stream");
 
 	// An unrelated channel is not a display-minted peer and cannot open the stream.
 	let (forged, _forged_peer) = Channel::create();
-	assert!(subscribe(&service_client, 1, forged).is_none(), "a forged focus proof must be refused");
+	assert!(subscribe(&scoped, 1, forged).is_none(), "a forged focus proof must be refused");
 
 	// DisplayService registers one peer and transfers its counterpart to the client.
 	let (proof, registered) = Channel::create();
 	send_cap(&focus_display, b"SET", registered, Rights::ALL).expect("register focus peer");
-	let stream = subscribe(&service_client, 2, proof).expect("active display proof opens the key stream");
+	let stream = subscribe(&scoped, 2, proof).expect("active display proof opens the key stream");
 	let focus_ack = focus_display.recv().expect("focus acknowledgement");
 	assert_eq!(&focus_ack.bytes[..], b"OK");
 	let suppressed = console_focus.recv().expect("console focus suppression");
@@ -3011,7 +3069,7 @@ fn input_service_streams_keys_only_with_display_focus() {
 	// Ctrl+Alt+Esc is consumed as the emergency display-revocation chord.
 	let (proof2, registered2) = Channel::create();
 	send_cap(&focus_display, b"SET", registered2, Rights::ALL).expect("register second focus peer");
-	let stream2 = subscribe(&service_client, 3, proof2).expect("second active proof opens a stream");
+	let stream2 = subscribe(&scoped, 3, proof2).expect("second active proof opens a stream");
 	let second_ack = focus_display.recv().expect("second focus acknowledgement");
 	assert_eq!(&second_ack.bytes[..], b"OK");
 	for event in [[0xe0, 0, 1], [0xe2, 0, 1], [0x29, 0, 1]] {
@@ -3029,9 +3087,11 @@ fn input_service_streams_keys_only_with_display_focus() {
 
 tagged_test!(display_service_restores_the_console_surface, [Service, Console, Display, Memory]);
 fn display_service_restores_the_console_surface() {
+	use object::address_space::AddressSpace;
 	use object::channel::{Channel, Message};
 	use object::dma_buffer::DmaBuffer;
 	use object::memory_object::MemoryObject;
+	use object::process::Process;
 	use object::rights::Rights;
 
 	fn request(op: u16, corr: u32, args: &[u32]) -> Message {
@@ -3108,6 +3168,8 @@ fn display_service_restores_the_console_surface() {
 	send_cap(&boot_kernel, b"GPU", gpu_user, Rights::ALL).expect("gpu bootstrap");
 	send_cap(&boot_kernel, b"FOCUS", focus_display, Rights::ALL).expect("focus bootstrap");
 	send_cap(&boot_kernel, b"KILL", kill_display, Rights::ALL).expect("kill bootstrap");
+	let (display_admin, admin) = Channel::create();
+	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("display admin bootstrap");
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 
 	// Answer the driver's FB handshake with a 4x4 B8G8R8X8 DMA scanout.
@@ -3171,7 +3233,19 @@ fn display_service_restores_the_console_surface() {
 	assert_eq!(scanout_pixel(&scanout), 0x0011_2233, "release restores the console surface");
 
 	// The private emergency command revokes a frozen foreground display connection.
-	let frozen = connect(&console_client);
+	let process = Process::new(AddressSpace::create().expect("bound process address space"), sched::root_domain());
+	let mut bind = alloc::vec::Vec::new();
+	bind.extend_from_slice(&1u16.to_le_bytes());
+	bind.extend_from_slice(&50u32.to_le_bytes());
+	bind.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&display_admin, &bind, process.clone(), Rights::MANAGE | Rights::TRANSFER).expect("bind process to display connection");
+	sched::run_until_idle();
+	let bind_reply = display_admin.recv().expect("bound display reply");
+	assert_eq!(bind_reply.bytes[4], 1, "display-admin bind succeeds");
+	let frozen = bind_reply.caps.first().expect("bound display connection").object().into_any_arc().downcast::<Channel>().expect("bound display is a channel");
+	frozen.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("bound factory escape attempt");
+	sched::run_until_idle();
+	assert!(frozen.recv().is_err(), "process-bound display connection cannot mint an unbound child");
 	let frozen_surface = acquire(&frozen, &focus_input, b"SET", 9, 2, 2);
 	fill(&frozen_surface, 0x0000_77dd, 4);
 	frozen.send(request(2, 10, &[0, 0, 2, 2])).expect("frozen app present");
@@ -3180,6 +3254,7 @@ fn display_service_restores_the_console_surface() {
 	acknowledge_focus(&focus_input, b"CONSOLE");
 	acknowledge_present(&gpu_kernel, None);
 	assert!(frozen.is_peer_closed(), "emergency revoke closes the foreground display connection");
+	assert!(process.is_killed(), "emergency revoke SIG_KILLs the process bound by PermissionManager");
 	assert_eq!(scanout_pixel(&scanout), 0x0011_2233, "emergency revoke restores the console surface");
 
 	// A crashed client has the same restoration guarantee through channel peer-close.
@@ -3263,11 +3338,31 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	let (snd_host, snd_service) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn AudioService");
 	send_cap(&boot_kernel, b"SND", snd_service, Rights::ALL).expect("snd bootstrap");
+	let (audio_admin, admin) = Channel::create();
+	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("audio admin bootstrap");
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 	sched::run_until_idle();
 	let online = boot_kernel.recv().expect("AudioService online report");
 	assert_eq!(&online.bytes[..], b"AudioService: online");
 	assert!(open(&service_client, 1, 4_000, 1).is_err(), "unsupported sample rate is refused");
+	let mut open_scoped = alloc::vec::Vec::new();
+	open_scoped.extend_from_slice(&1u16.to_le_bytes());
+	open_scoped.extend_from_slice(&30u32.to_le_bytes());
+	audio_admin.send(Message::new(open_scoped, alloc::vec::Vec::new(), 0)).expect("open playback-only connection");
+	sched::run_until_idle();
+	let scoped_reply = audio_admin.recv().expect("playback-only connection reply");
+	let scoped = scoped_reply.caps.first().expect("playback-only connection").object().into_any_arc().downcast::<Channel>().expect("audio-stream grant is a channel");
+	let mut denied_beep = alloc::vec::Vec::new();
+	denied_beep.extend_from_slice(&1u16.to_le_bytes());
+	denied_beep.extend_from_slice(&31u32.to_le_bytes());
+	denied_beep.extend_from_slice(&440u16.to_le_bytes());
+	denied_beep.extend_from_slice(&10u32.to_le_bytes());
+	scoped.send(Message::new(denied_beep, alloc::vec::Vec::new(), 0)).expect("scoped beep request");
+	sched::run_until_idle();
+	let denied = scoped.recv().expect("scoped beep denial");
+	assert_eq!(denied.bytes[4], 0, "audio-stream scope denies beep");
+	let scoped_stream = open(&scoped, 32, 48_000, 2).expect("audio-stream scope permits playback");
+	drop(scoped_stream);
 
 	let stereo = open(&service_client, 2, 48_000, 2).expect("48 kHz stereo stream");
 	let mono = open(&service_client, 3, 24_000, 1).expect("24 kHz mono stream");
@@ -4745,10 +4840,10 @@ fn permission_manager_sandboxes_a_component() {
 	// mark that refusal as dynamic - each component was given exactly its manifest and nothing
 	// more. Finally `cat`'s output must equal that file (the storage grant reaches it through
 	// the on-demand launcher).
-	let (expected, probe_read, probe_summary, date_read, date_summary, request_read, request_summary, cat_read) = run_permission_scenario().expect("the permission scenario should run");
+	let (expected, probe_read, probe_summary, date_read, date_summary, request_read, request_summary, cat_read, graphics_read) = run_permission_scenario().expect("the permission scenario should run");
 	assert!(!expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(probe_read, expected, "the sandboxed component read its one granted file through the storage grant");
-	assert_eq!(probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
+	assert_eq!(probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
 	// `date` reached its one granted capability: its output is a well-formed ISO-8601 UTC
 	// instant "YYYY-MM-DDTHH:MM:SSZ" (the exact moment varies, so check the shape, not the
 	// value - its presence proves the time grant is live).
@@ -4759,16 +4854,17 @@ fn permission_manager_sandboxes_a_component() {
 	assert_eq!(date_read[13], b':', "the date instant has a time separator after the hour");
 	assert_eq!(date_read[16], b':', "the date instant has a time separator after the minute");
 	assert_eq!(date_read[19], b'Z', "the date instant is UTC, terminated by 'Z'");
-	assert_eq!(date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny", "date was granted exactly its manifest - time - and denied every other capability in the vocabulary");
+	assert_eq!(date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "date was granted exactly its manifest - time - and denied every other capability in the vocabulary");
 	// request_probe asked for storage at runtime - a capability outside its manifest. The
 	// headless policy default refused it, so the request comes back denied and its summary
 	// carries the static grants followed by the refused runtime request marked `(dynamic)`.
 	assert_eq!(request_read.as_slice(), b"storage denied", "request_probe's runtime request for an undeclared capability was refused by the headless policy default");
-	assert_eq!(request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny storage=deny(dynamic)", "request_probe was granted exactly its manifest - log - and its runtime storage request was refused and recorded as a dynamic denial");
+	assert_eq!(request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny storage=deny(dynamic)", "request_probe was granted exactly its manifest - log - and its runtime storage request was refused and recorded as a dynamic denial");
 	// The on-demand `cat` tool, launched through PermissionManager's `run` op under a manifest
 	// granting only storage, printed the file it was given through that grant to the stdout the
 	// manager forwarded it: the bytes it rendered must equal the file straight from the volume.
 	assert_eq!(cat_read, expected, "the cat tool printed its file argument through the storage grant the run launcher gave it, forwarded to the captured stdout");
+	assert_eq!(graphics_read.as_slice(), b"graphics grants\n", "the governed graphics probe received process-bound display, key-only input and playback-only audio grants");
 }
 
 tagged_test!(component_host_runs_an_sdk_component, [Service, Slow]);

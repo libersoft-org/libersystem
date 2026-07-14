@@ -14,6 +14,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use proto::codec::Buffer;
 use proto::system::display::{self, Service};
+use proto::system::display_admin::{self, Service as AdminService};
 use proto::system::{DisplayEvent, Error, PixelFormat, SurfaceInfo};
 use rt::*;
 
@@ -54,6 +55,11 @@ struct EventStream {
 	chan: u64,
 	producer: u64,
 	seq: u32,
+}
+
+struct Client {
+	chan: u64,
+	task: u64,
 }
 
 struct DisplayState {
@@ -449,6 +455,27 @@ impl Service for DisplayCall<'_> {
 	}
 }
 
+struct AdminCall<'a> {
+	clients: &'a mut Vec<Client>,
+}
+
+impl AdminService for AdminCall<'_> {
+	fn bind(&mut self, task: u64) -> Result<u64, Error> {
+		if task == 0 {
+			return Err(Error::Invalid);
+		}
+		let (server, client): (u64, u64) = match unsafe { channel() } {
+			Some(pair) => pair,
+			None => {
+				unsafe { close(task) };
+				return Err(Error::Again);
+			}
+		};
+		self.clients.push(Client { chan: server, task });
+		Ok(client)
+	}
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 128] = [0; 128];
@@ -465,13 +492,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Message { len, handle } if len >= 4 && &buf[..4] == b"KILL" => handle,
 			_ => fail_bootstrap(bootstrap, b"kill", b"emergency input channel not delivered"),
 		};
+		let admin: u64 = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } if len >= 5 && &buf[..5] == b"ADMIN" => handle,
+			_ => fail_bootstrap(bootstrap, b"admin", b"display admin channel not delivered"),
+		};
 		let service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
 		let scanout: Scanout = init_scanout(gpu, &mut buf);
 		if !scanout.available() {
 			fail_bootstrap(bootstrap, b"display", b"no framebuffer available");
 		}
 		send_blocking(bootstrap, b"DisplayService: online", 0);
-		serve_display(service, DisplayState::new(scanout, focus_control, kill_control));
+		serve_display(service, admin, DisplayState::new(scanout, focus_control, kill_control));
 	}
 }
 
@@ -502,20 +533,21 @@ unsafe fn init_scanout(gpu: u64, buf: &mut [u8]) -> Scanout {
 	}
 }
 
-unsafe fn serve_display(root: u64, mut state: DisplayState) -> ! {
+unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 	unsafe {
-		let mut clients: Vec<u64> = alloc::vec![root];
+		let mut clients: Vec<Client> = alloc::vec![Client { chan: root, task: 0 }];
 		let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
 		let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
 		loop {
-			let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + 2);
+			let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + 3);
 			if state.scanout.gpu != 0 {
 				waits.push(state.scanout.gpu);
 			}
 			if state.kill_control != 0 {
 				waits.push(state.kill_control);
 			}
-			waits.extend_from_slice(&clients);
+			waits.push(admin);
+			waits.extend(clients.iter().map(|client| client.chan));
 			let ready: i64 = wait_any(&waits, 0);
 			if ready < 0 {
 				continue;
@@ -544,20 +576,47 @@ unsafe fn serve_display(root: u64, mut state: DisplayState) -> ! {
 						if len >= 4
 							&& &request[..4] == b"KILL"
 							&& state.active != 0 && state.active != state.console
-							&& let Some(victim) = clients.iter().position(|client| *client == state.active)
+							&& let Some(victim) = clients.iter().position(|client| client.chan == state.active)
 						{
-							let chan: u64 = clients[victim];
+							let chan: u64 = clients[victim].chan;
+							if clients[victim].task != 0 {
+								let _ = signal(clients[victim].task, SIG_KILL);
+							}
 							state.drop_client(chan);
 							close(chan);
-							clients.swap_remove(victim);
+							let victim: Client = clients.swap_remove(victim);
+							if victim.task != 0 {
+								close(victim.task);
+							}
 						}
 					}
 					Received::Closed => state.kill_control = 0,
 				}
 				continue;
 			}
-			let client_index: usize = ready as usize - gpu_first as usize - kill_present as usize;
-			let chan: u64 = clients[client_index];
+			let admin_index: usize = gpu_first as usize + kill_present as usize;
+			if ready as usize == admin_index {
+				match recv_blocking(admin, &mut request) {
+					Received::Message { len, mut handle } => {
+						let mut reply_handle: u64 = 0;
+						let mut call = AdminCall { clients: &mut clients };
+						if let Some(n) = display_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
+							if !send_blocking(admin, &reply[..n], reply_handle) && reply_handle != 0 {
+								close(reply_handle);
+							}
+						} else if reply_handle != 0 {
+							close(reply_handle);
+						}
+						if handle != 0 {
+							close(handle);
+						}
+					}
+					Received::Closed => exit(),
+				}
+				continue;
+			}
+			let client_index: usize = ready as usize - admin_index - 1;
+			let chan: u64 = clients[client_index].chan;
 			match recv_blocking(chan, &mut request) {
 				Received::Message { len, handle } if len == 0 => {
 					if handle != 0 {
@@ -574,10 +633,10 @@ unsafe fn serve_display(root: u64, mut state: DisplayState) -> ! {
 					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 					if op == HEARTBEAT_OP {
 						send_blocking(chan, b"PONG", 0);
-					} else if op == CONNECT_OP {
+					} else if op == CONNECT_OP && clients[client_index].task == 0 {
 						match channel() {
 							Some((mine, theirs)) => {
-								clients.push(mine);
+								clients.push(Client { chan: mine, task: 0 });
 								send_blocking(chan, &[], theirs);
 							}
 							None => {
@@ -607,7 +666,10 @@ unsafe fn serve_display(root: u64, mut state: DisplayState) -> ! {
 					}
 					state.drop_client(chan);
 					close(chan);
-					clients.swap_remove(client_index);
+					let client: Client = clients.swap_remove(client_index);
+					if client.task != 0 {
+						close(client.task);
+					}
 				}
 			}
 		}

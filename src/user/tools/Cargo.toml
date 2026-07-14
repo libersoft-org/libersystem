@@ -80,6 +80,10 @@ name = "beep"
 path = "src/beep.rs"
 
 [[bin]]
+name = "graphics_probe"
+path = "src/graphics_probe.rs"
+
+[[bin]]
 name = "usage"
 path = "src/usage.rs"
 

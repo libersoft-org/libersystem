@@ -5,3 +5,5 @@ method audio.open-stream op=2 (rate:u32:rights=,channels:u8:rights=) -> result<h
 interface pcm-stream
 method pcm-stream.write op=1 (data:buffer:rights=) -> result<u32, liber:base@1::error>
 method pcm-stream.close op=2 () -> result<unit, liber:base@1::error>
+interface audio-admin
+method audio-admin.open-streams op=1 () -> result<handle<channel>, liber:base@1::error>

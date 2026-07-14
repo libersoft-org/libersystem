@@ -24,7 +24,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use proto::system::input;
-use proto::system::{KeyEvent, PointerEvent};
+use proto::system::input_admin::{self, Service as AdminService};
+use proto::system::{Error, KeyEvent, PointerEvent};
 use rt::*;
 
 // The default text-cell grid the normalized pointer position maps onto: the boot
@@ -57,6 +58,29 @@ struct KeyStream {
 	owner: u64,
 	producer: u64,
 	seq: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+	Full,
+	Keys,
+}
+
+struct Client {
+	chan: u64,
+	scope: Scope,
+}
+
+struct AdminCall<'a> {
+	clients: &'a mut Vec<Client>,
+}
+
+impl AdminService for AdminCall<'_> {
+	fn open_keys(&mut self) -> Result<u64, Error> {
+		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		self.clients.push(Client { chan: server, scope: Scope::Keys });
+		Ok(client)
+	}
 }
 
 impl Input {
@@ -230,6 +254,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Received::Message { len, handle } if len >= 4 && &buf[..4] == b"KILL" => handle,
 		_ => 0,
 	};
+	let admin: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if len >= 5 && &buf[..5] == b"ADMIN" => handle,
+		_ => 0,
+	};
 
 	// 2. report in to the supervisor that started us.
 	unsafe {
@@ -239,7 +267,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 3. serve until the client side closes.
 	let mut state: Input = Input::new(kill);
 	unsafe {
-		serve(service, [raw, raw2], forward, keys, focus, &mut state);
+		serve(service, admin, [raw, raw2], forward, keys, focus, &mut state);
 	}
 	exit();
 }
@@ -249,15 +277,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // one client request. Returns when the client side closes (no more clients). Once
 // a raw channel closes (its pointer driver retired), it is dropped from the wait
 // set so a peer-closed channel cannot spin the loop.
-unsafe fn serve(service: u64, raws: [u64; 2], forward: u64, keys: u64, focus: u64, state: &mut Input) {
+unsafe fn serve(service: u64, admin: u64, raws: [u64; 2], forward: u64, keys: u64, focus: u64, state: &mut Input) {
 	unsafe {
 		let mut req: [u8; 64] = [0u8; 64];
 		let mut open: [bool; 2] = [raws[0] != 0, raws[1] != 0];
-		let mut clients: Vec<u64> = alloc::vec![service];
+		let mut clients: Vec<Client> = alloc::vec![Client { chan: service, scope: Scope::Full }];
 		let mut keys_open: bool = keys != 0;
 		let mut focus_open: bool = focus != 0;
 		loop {
-			let mut waitset: Vec<u64> = Vec::with_capacity(clients.len() + 4);
+			let mut waitset: Vec<u64> = Vec::with_capacity(clients.len() + 5);
 			if focus_open {
 				waitset.push(focus);
 			}
@@ -269,7 +297,10 @@ unsafe fn serve(service: u64, raws: [u64; 2], forward: u64, keys: u64, focus: u6
 					waitset.push(raw);
 				}
 			}
-			waitset.extend_from_slice(&clients);
+			if admin != 0 {
+				waitset.push(admin);
+			}
+			waitset.extend(clients.iter().map(|client| client.chan));
 			let ready: i64 = wait_any(&waitset, 0);
 			if ready < 0 {
 				continue;
@@ -350,20 +381,44 @@ unsafe fn serve(service: u64, raws: [u64; 2], forward: u64, keys: u64, focus: u6
 				}
 				continue;
 			}
-			let Some(client_index) = clients.iter().position(|client| *client == ready_handle) else { continue };
-			let client: u64 = clients[client_index];
+			if admin != 0 && ready_handle == admin {
+				match recv_blocking(admin, &mut req) {
+					Received::Message { len, mut handle } => {
+						let mut reply: [u8; 64] = [0; 64];
+						let mut reply_handle: u64 = 0;
+						let mut call = AdminCall { clients: &mut clients };
+						if let Some(n) = input_admin::dispatch(&mut call, &req[..len], &mut handle, &mut reply, &mut reply_handle) {
+							if !send_blocking(admin, &reply[..n], reply_handle) && reply_handle != 0 {
+								close(reply_handle);
+							}
+						} else if reply_handle != 0 {
+							close(reply_handle);
+						}
+						if handle != 0 {
+							close(handle);
+						}
+					}
+					Received::Closed => return,
+				}
+				continue;
+			}
+			let Some(client_index) = clients.iter().position(|client| client.chan == ready_handle) else { continue };
+			let client: u64 = clients[client_index].chan;
+			let scope: Scope = clients[client_index].scope;
 			match recv_blocking(client, &mut req) {
 				Received::Message { len, mut handle } => {
 					let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
-					if op == CONNECT_OP {
+					if op == CONNECT_OP && scope == Scope::Full {
 						if let Some((mine, theirs)) = channel() {
-							clients.push(mine);
+							clients.push(Client { chan: mine, scope });
 							send_blocking(client, &[], theirs);
 						}
-					} else if op == input::OP_SUBSCRIBE {
+					} else if op == input::OP_SUBSCRIBE && scope == Scope::Full {
 						stream_subscribe(client, &req[..len], state);
 					} else if op == input::OP_SUBSCRIBE_KEYS {
 						stream_subscribe_keys(client, &req[..len], &mut handle, state);
+					} else if len >= 6 {
+						send_blocking(client, &req[2..6], 0);
 					}
 					if handle != 0 {
 						close(handle);
