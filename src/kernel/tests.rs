@@ -776,6 +776,7 @@ define_test_tags! {
 	ArchAarch64 => "arch-aarch64",
 	ArchRiscv64 => "arch-riscv64",
 	ArchX86_64 => "arch-x86_64",
+	Audio => "audio",
 	Boot => "boot",
 	Console => "console",
 	Display => "display",
@@ -3192,6 +3193,158 @@ fn display_service_restores_the_console_surface() {
 	acknowledge_focus(&focus_input, b"CONSOLE");
 	acknowledge_present(&gpu_kernel, None);
 	assert_eq!(scanout_pixel(&scanout), 0x0011_2233, "peer-close restores the console surface");
+}
+
+tagged_test!(audio_service_mixes_pcm_streams_with_backpressure, [Service, Audio]);
+fn audio_service_mixes_pcm_streams_with_backpressure() {
+	use object::channel::{Channel, Message};
+	use object::memory_object::MemoryObject;
+	use object::rights::Rights;
+
+	fn open(root: &Channel, corr: u32, rate: u32, channels: u8) -> Result<alloc::sync::Arc<Channel>, u8> {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&2u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&rate.to_le_bytes());
+		request.push(channels);
+		root.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("open-stream request");
+		sched::run_until_idle();
+		let reply = root.recv().expect("open-stream reply");
+		assert_eq!(le_u32(&reply.bytes, 0), corr);
+		if reply.bytes[4] == 0 {
+			return Err(reply.bytes[5]);
+		}
+		let cap = reply.caps.first().expect("PCM stream channel");
+		Ok(cap.object().into_any_arc().downcast::<Channel>().expect("PCM stream is a channel"))
+	}
+
+	fn pcm(frames: usize, channels: usize, sample: i16) -> alloc::vec::Vec<u8> {
+		let mut bytes = alloc::vec::Vec::with_capacity(frames * channels * 2);
+		for _ in 0..frames * channels {
+			bytes.extend_from_slice(&sample.to_le_bytes());
+		}
+		bytes
+	}
+
+	fn send_write(stream: &Channel, corr: u32, bytes: &[u8]) {
+		let object = MemoryObject::create(bytes.len()).expect("PCM MemoryObject");
+		copy_into_object(&object, bytes);
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&1u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+		send_cap(stream, &request, object, Rights::READ | Rights::MAP | Rights::TRANSFER).expect("PCM write request");
+	}
+
+	fn write_reply(stream: &Channel, corr: u32, frames: u32) {
+		let reply = stream.recv().expect("PCM write reply");
+		assert_eq!(le_u32(&reply.bytes, 0), corr);
+		assert_eq!(reply.bytes[4], 1, "PCM write succeeds");
+		assert_eq!(le_u32(&reply.bytes, 5), frames, "accepted source frames");
+	}
+
+	fn close_stream(stream: &Channel, corr: u32) {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&2u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		stream.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("PCM close request");
+	}
+
+	fn sample(message: &Message) -> i16 {
+		i16::from_le_bytes([message.bytes[0], message.bytes[1]])
+	}
+
+	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = program_elf(&package, volume, b"audio_service").expect("audio_service in the package or volume");
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+	let (snd_host, snd_service) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn AudioService");
+	send_cap(&boot_kernel, b"SND", snd_service, Rights::ALL).expect("snd bootstrap");
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	sched::run_until_idle();
+	let online = boot_kernel.recv().expect("AudioService online report");
+	assert_eq!(&online.bytes[..], b"AudioService: online");
+	assert!(open(&service_client, 1, 4_000, 1).is_err(), "unsupported sample rate is refused");
+
+	let stereo = open(&service_client, 2, 48_000, 2).expect("48 kHz stereo stream");
+	let mono = open(&service_client, 3, 24_000, 1).expect("24 kHz mono stream");
+	send_write(&stereo, 4, &pcm(1_536, 2, 30_000));
+	sched::run_until_idle();
+	write_reply(&stereo, 4, 1_536);
+	let first = snd_host.recv().expect("first hardware period");
+	assert_eq!(first.bytes.len(), 2_048);
+	assert_eq!(sample(&first), 30_000, "first stream plays alone");
+
+	// Queue the second stream and beep while the first hardware period is pending.
+	send_write(&mono, 5, &pcm(512, 1, 3_000));
+	let mut beep = alloc::vec::Vec::new();
+	beep.extend_from_slice(&1u16.to_le_bytes());
+	beep.extend_from_slice(&6u32.to_le_bytes());
+	beep.extend_from_slice(&1_000u16.to_le_bytes());
+	beep.extend_from_slice(&30u32.to_le_bytes());
+	service_client.send(Message::new(beep, alloc::vec::Vec::new(), 0)).expect("beep request");
+	sched::run_until_idle();
+	write_reply(&mono, 5, 512);
+	let beep_reply = service_client.recv().expect("beep reply");
+	assert_eq!(beep_reply.bytes[4], 1, "beep queues into the mixer");
+
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("first period ACK");
+	sched::run_until_idle();
+	let second = snd_host.recv().expect("mixed second period");
+	assert_eq!(sample(&second), i16::MAX, "two streams plus beep saturate instead of wrapping");
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("second period ACK");
+	sched::run_until_idle();
+	let third = snd_host.recv().expect("resampled third period");
+	assert_eq!(sample(&third), 27_000, "24 kHz mono is duplicated and survives for two output periods");
+
+	close_stream(&stereo, 7);
+	close_stream(&mono, 8);
+	sched::run_until_idle();
+	assert_eq!(stereo.recv().expect("stereo close reply").bytes[4], 1);
+	assert_eq!(mono.recv().expect("mono close reply").bytes[4], 1);
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("third period ACK");
+	sched::run_until_idle();
+	let fourth = snd_host.recv().expect("beep tail period");
+	assert_eq!(sample(&fourth), 6_000, "beep continues through the shared mixer after streams drain");
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("fourth period ACK");
+	sched::run_until_idle();
+	let stop = snd_host.recv().expect("hardware stop sentinel");
+	assert!(stop.bytes.is_empty(), "idle mixer releases the hardware stream");
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("stop ACK");
+	sched::run_until_idle();
+
+	// Fill the bounded queue: the third write stays unanswered until two hardware
+	// periods advance the playback clock and create source-frame capacity.
+	let bounded = open(&service_client, 9, 48_000, 2).expect("bounded stream");
+	send_write(&bounded, 10, &pcm(4_096, 2, 100));
+	sched::run_until_idle();
+	write_reply(&bounded, 10, 4_096);
+	let period = snd_host.recv().expect("bounded period one");
+	assert_eq!(sample(&period), 100);
+	send_write(&bounded, 11, &pcm(512, 2, 100));
+	sched::run_until_idle();
+	write_reply(&bounded, 11, 512);
+	send_write(&bounded, 12, &pcm(512, 2, 100));
+	sched::run_until_idle();
+	assert!(bounded.recv().is_err(), "full queue defers the write reply");
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("bounded period one ACK");
+	sched::run_until_idle();
+	let period = snd_host.recv().expect("bounded period two");
+	assert_eq!(sample(&period), 100);
+	assert!(bounded.recv().is_err(), "one ACK has not yet made bounded capacity visible");
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("bounded period two ACK");
+	sched::run_until_idle();
+	write_reply(&bounded, 12, 512);
+	let period = snd_host.recv().expect("bounded period three");
+	assert_eq!(sample(&period), 100);
+	drop(bounded);
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("bounded period three ACK");
+	sched::run_until_idle();
+	let stop = snd_host.recv().expect("peer-close stop sentinel");
+	assert!(stop.bytes.is_empty(), "peer-close drops queued source frames before another period");
 }
 
 tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow]);

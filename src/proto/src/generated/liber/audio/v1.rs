@@ -10,11 +10,12 @@ use core::fmt::Write as _;
 
 use crate::generated::liber::base::v1::Error;
 
-/// AudioService: headless PCM playback over the virtio-sound device. `beep` plays a
-/// tone of the given frequency (Hz) and duration (milliseconds) - the device is
+/// AudioService: headless PCM playback over the virtio-sound device. `beep` queues a
+/// tone of the given frequency (Hz) and duration (milliseconds) into the same mixer - the device is
 /// reached as a capability (the channel this interface is served on), never as
 /// ambient device access. `open-stream` returns a sub-channel served as `pcm-stream`;
-/// the service validates the rate and channel count before creating it.
+/// rates from 8 through 48 kHz and one or two channels are accepted, then converted
+/// to the hardware's fixed 48 kHz stereo periods.
 // interface `audio` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod audio {
 	use super::*;
@@ -199,8 +200,8 @@ pub mod audio {
 
 /// A playback stream returned by `audio.open-stream`. Samples are signed 16-bit
 /// little-endian, interleaved by channel; one `write` contains whole sample frames.
-/// `write` returns the number of frames accepted only after bounded playback capacity
-/// is available, making synchronous IPC backpressure the playback clock. Closing the
+/// `write` returns the number of source frames accepted (possibly a prefix) only after
+/// bounded playback capacity is available, making synchronous IPC backpressure the playback clock. Closing the
 /// channel is equivalent to `close`; explicit close drains accepted samples first.
 // interface `pcm-stream` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod pcm_stream {

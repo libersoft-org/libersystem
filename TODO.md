@@ -2473,7 +2473,7 @@ layer exists.
       a future relative-motion stream (`dx`, `dy`, wheel delta, button state)
       scoped to the same focus capability; absolute cell events remain the console
       path.
-- [ ] PCM audio playback: extend `liber:audio@1` with
+- [x] PCM audio playback: extend `liber:audio@1` with
       `open-stream(rate: u32, channels: u8) -> result<handle<channel>, error>`;
   the returned channel serves a typed `pcm-stream` interface with
   `write(data: buffer) -> result<u32, error>` and `close()`. Samples are signed
