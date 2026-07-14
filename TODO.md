@@ -2414,6 +2414,199 @@ Result (M120 Phase 0/A/B complete, Phase C deliberately separate): LSIDL is now 
 - M35a / M35f (pluggable non-US keyboard layouts + dead-key / compose) are optional.
 - When phase 2 truly closes: reconcile the implementation against CONCEPT_EN.md / CONCEPT_CZ.md, and review THREAT_MODEL.md for currency + link it from the README (NOTES.md items).
 
+## M121 - Application graphics, raw input, and PCM audio (the app-platform layer)
+
+Applications are prisoners of the text console: the framebuffer belongs to
+ConsoleService, the keyboard arrives as cooked text bytes, and AudioService can
+only `beep`. This milestone builds the GENERAL application platform layer - a
+capability-scoped display surface, stateful raw key events, and a real PCM
+stream - calibrated against the most demanding minimal consumer (a Doom-class
+game: software renderer, ~35 FPS, held keys, sound effects) but shaped for every
+future graphical program: image viewer, video player, plotting tools, and the
+phase 4-5 compositor these contracts grow into. The game itself is explicitly
+NOT pulled into this repository; an external port becomes possible once this
+layer exists.
+
+- [ ] A display surface contract, compositor-shaped from day one: a new
+      `liber:display@1` package with `acquire(width, height) -> result<surface-info, error>`
+      (`surface-info { pixels: buffer, width: u32, height: u32, pitch: u32, format }`),
+      `present(x, y, width, height) -> result<unit, error>`, and `release()`.
+      The first implementation serves only the fullscreen single-client case
+      (ConsoleService or a thin DisplayService over the existing gpu backing),
+      but the CONTRACT is written so a later compositor is a server-side upgrade,
+      not an API break: the client never learns it is fullscreen, presents damage
+      rectangles, and owns nothing but its own buffer. The service scales or
+      centers a smaller surface onto the scanout (nearest-neighbor first).
+- [ ] Fullscreen handoff and guaranteed return: the foreground VT hands the
+      display to the app for the surface's lifetime; `release()`, process exit,
+      or a CRASH (surface channel peer-close) always restores the text console
+      with a full repaint - a dead app can never leave a black screen. Plus the
+      emergency kill chord: a reserved console chord (e.g. Ctrl+Alt+Esc, chosen
+      like the existing VT chords) SIG_KILLs the foreground graphical app and
+      restores the console, so a frozen fullscreen app never locks the machine.
+- [ ] Raw stateful key input: extend `liber:input@1` with
+      `record key-event { code: u16, pressed: bool }` and a
+      `subscribe-keys() -> stream<key-event>` op delivering key-DOWN and key-UP
+      events (both keyboard drivers already see releases internally - virtio-input
+      diffs EV_KEY, xHCI HID diffs boot reports - today they only feed the cooked
+      console path). Delivery is foreground-only: focus IS the capability, keys
+      go solely to the app owning the display. Decide the pointer-capture
+      contract in the same pass (relative-motion mode for a captured pointer vs
+      the existing absolute cell events), even if capture ships later.
+- [ ] PCM audio playback: extend `liber:audio@1` with
+      `open-stream(rate: u32, channels: u8) -> result<handle<channel>, error>`;
+      the client pushes raw PCM chunks on the sub-channel (the `write-stream`
+      pattern: bounded-channel backpressure IS the playback clock) and closes to
+      end. AudioService gains a small software mixer (at least 2 simultaneous
+      streams plus the beep path reimplemented on top), so two apps can sound at
+      once without exclusive device ownership.
+- [ ] Presentation performance, measured: the nearest-neighbor scaler in the
+      present path, a per-frame ms/present measurement (the game budget is ~28 ms
+      per frame end to end), dirty-rectangle presents for app surfaces (the M104
+      machinery generalized), and a look at the blit hot path's build profile.
+      Record the numbers in docs/PERF.md - this also attacks the standing NOTES
+      complaints (selection lag, paging lag) at their shared root.
+- [ ] Capability vocabulary: `display`, `input-keys`, and `audio-stream` join
+      the `capability` enum and PermissionManager's grant table, so a graphical
+      app's manifest is exactly "display + input-keys + audio-stream + volumes"
+      and nothing else - the sandbox showcase: a game that can draw, hear keys,
+      play sound, read its data file, and reach nothing else.
+- [ ] Shared application library groundwork: small single-concern app-side
+      crates (the M123 split: pixel/image vocabulary, surface helpers,
+      key-event decoding, PCM chunking - separate crates with dependencies,
+      not one "libapp") so every graphical app does not reimplement the
+      plumbing; plus a size/startup pass
+      on staged tools (the NOTES "apps are huge" and "every command has a start
+      delay" items) - measure whether a release/opt profile for staged binaries
+      pays before considering anything as heavy as dynamic linking. Apps link
+      system-provided libraries at build time for now; per-app bundled libraries
+      wait for the phase-3 package format.
+- Explicitly deferred, by decision (2026-07-14): the app package format (M42,
+      phase 3); per-app data directories (phase 3 - needs user accounts);
+      dynamic permission PROMPTS (needs a GUI to prompt in; the headless policy
+      default stands); gamepad input (small xHCI HID extension when wanted);
+      non-US keyboard layouts (the raw-keycode stream makes a layout a pure
+      DATA problem - a ConfigService-selected keycode-to-glyph table, no engine
+      work - so it waits for a concrete need, M35f); a graphical task switcher
+      (console-era app switching already exists as VT switching Ctrl+N / Ctrl+];
+      a graphical alt-tab belongs to the compositor phase).
+- Done when: a sandboxed app acquires the display, renders fullscreen at a
+      measured stable frame rate, receives key-down/key-up events, plays a PCM
+      stream mixed with a concurrent beep, and every exit path - clean release,
+      crash, or the kill chord - returns the text console intact; the grants are
+      typed manifest capabilities; tests green (host + targeted kernel tags).
+- Concept: deployment targets (apps beyond the CLI), System API model (the
+      display/input/audio surfaces are typed capabilities, never ambient device
+      access), the phase 4-5 compositor these contracts seed, M44/M47 (the gpu
+      and layered-console work this builds on), M45 (the PCM half it completes).
+
+## M122 - Image viewer (the first graphical application)
+
+The first real consumer of M121, runnable from the console before any game
+exists: `view vol://system/photo.png` takes the screen, shows the image, and a
+keypress returns to the shell. Deliberately small - it proves the whole platform
+loop (grant -> acquire -> decode -> present -> input -> release) end to end.
+
+- [ ] Dependency-free `no_std` image decoders: BMP (uncompressed + RLE) and PNG
+      (a vendored inflate, the same zero-dependency discipline as the LZ4 coder).
+      Decoders follow the fs-track hostile-input rules: every count, length,
+      offset and dimension off the file is bounded before allocation or use - a
+      malformed or malicious image errors cleanly, never panics or OOMs
+      (host-tested with corrupt fixtures, like the filesystem crates).
+- [ ] The `view` tool: a governed ELF (`view <vol://...>`) with the manifest
+      grants `volumes + display + input-keys`; it decodes the image, scales it
+      to fit the screen (reusing the M121 scaler contract), presents it, and
+      serves keys - Esc/q to quit, arrows to pan when the image is larger than
+      the screen, +/- zoom as a stretch goal. Exiting (or crashing) returns the
+      console per the M121 guarantee.
+- [ ] Tests: host decoder suites over golden and corrupt fixtures; a kernel test
+      that launches the staged `view` against a stand-in display service and
+      asserts the acquire/present/release + key-quit sequence; a live QEMU pass
+      showing an actual image on the virtio-gpu scanout (screenshot-verified).
+- Done when: `view` opens a BMP and a PNG from any mounted volume fullscreen,
+      pans/quits by keyboard, survives hostile image files, and returns the
+      console on every exit path - the first end-to-end proof a sandboxed
+      graphical application can live on this platform, tests green.
+- Concept: M121 (the platform layer this consumes), the powerbox/file-picker
+      model (a viewer is the natural first picker client later), the NOTES
+      "demo showing graphics capabilities" item this realizes.
+
+## M123 - Shared system libraries (dynamic linking)
+
+Today every governed ELF statically links the whole userspace runtime and the
+generated protocol code, and once M121/M122 land, the surface helpers and image
+decoders join that duplication - N staged binaries times the same code is the
+root of the NOTES "apps are huge" and "every command has a start delay" items.
+This milestone makes the system's OWN libraries genuinely shared: one copy on
+disk, one read-only copy in RAM, mapped into every process that links it. It is
+explicitly gated on the M121 size/startup measurement: if a release/opt build
+profile alone recovers most of the size, parts of this can wait.
+
+- [ ] The compatibility model, decided first and written down: Rust has no
+      stable ABI, so the SYSTEM IMAGE is the unit of compatibility - every
+      shared library and every app in one image is built together by the pinned
+      toolchain and shipped together (the OpenBSD-base model). No cross-image
+      dylib promises, no library sonames pretending otherwise; per-app bundled
+      third-party libraries (which would need a stable C-ABI boundary) stay
+      with the phase-3 package format.
+- [ ] Loader support: dynamically linked apps and the libraries become PIE
+      (`relocation-model=pic`); the kernel loader - or a small userspace
+      dynamic linker, decide which - parses `PT_DYNAMIC`, applies relative +
+      symbol relocations on all three architectures, and maps library
+      text/rodata read-only SHARED across processes (one physical frame set,
+      many mappings) with W^X intact. Dynamic sections are hostile input like
+      every other parser in this repository: every offset/count/index bounded
+      before use, corrupt-ELF fixtures in the test suite, a malformed library
+      fails the load cleanly and never panics the kernel.
+- [ ] The library set, atomized - one library, one concern, with real
+      dependencies between them, so an app links exactly what it uses and new
+      formats arrive as new leaves instead of growing a monolith:
+      `liblsrt` (the userspace runtime every binary carries - entry, syscalls,
+      allocator, channels, serve loops, formatting; the root of the graph);
+      `libproto` (the generated LSIDL codecs and clients - the single biggest
+      duplicated blob; depends on liblsrt); `libpix` (the shared pixel/image
+      VOCABULARY - pixel formats, an image descriptor, convert/blit helpers -
+      so decoders and display consumers interoperate without depending on each
+      other); `libinflate` (DEFLATE decompression alone - what PNG needs today
+      and gzip/zip need later); one library PER image format - first `libbmp`
+      (depends on libpix) and `libpng` (depends on libpix + libinflate), the
+      M122 pair; agreed further leaves (2026-07-14), in rough cost order:
+      `libppm` + `libqoi` (trivial, good test/internal formats), `libtga` +
+      `libpcx` (trivial RLE + palettes), `libico` (a container over
+      libbmp/libpng - near-free reuse), `libapng` (a small fcTL/fdAT extension
+      of libpng - animation frames), `libicns` (modern PNG-based icons via
+      libpng; the legacy RLE variants; embedded JPEG 2000 refused with a typed
+      error - that codec is out), `libgif`
+      (LZW + palettes; animation frames come free), `libjpeg` (baseline
+      ITU T.81, ~2-3k lines - Huffman, IDCT, YCbCr; progressive scans refused
+      with a typed error until implemented), `libwebp` (lossless + lossy VP8,
+      ~11-15k lines total, the largest accepted leaf). Rejected by decision:
+      AVIF and JPEG XL (open but each a video-codec-class decoder, ~40-100k
+      lines - wait for a concrete need), HEIC (patent-encumbered - never);
+      `libsurface` (display-client
+      helpers: acquire/present, damage, scaling; depends on libproto + libpix);
+      `libkeys` (key-event decoding and, later, the keycode-to-glyph layout
+      tables; depends on libproto); `libpcm` (PCM chunking/mixing helpers;
+      depends on libproto). Example: `view` links liblsrt + libproto + libpix +
+      libbmp + libpng + libsurface + libkeys and nothing else. Staged into the
+      system image next to the binaries.
+- [ ] Conversion + measurement: convert the existing tools and services to
+      link the libraries dynamically, and record before/after numbers
+      (per-binary size, total image size, cold-start latency, resident RAM
+      across N concurrent processes) in docs/PERF.md - the numbers, not the
+      ideology, decide how far the conversion goes and whether small
+      single-purpose tools stay static.
+- Done when: at least the staged tools link `liblsrt` + `libproto`
+      dynamically on all three architectures, library text is verifiably
+      shared between two concurrent processes, a corrupt library cannot panic
+      the loader, and the measured size/startup deltas are recorded in
+      docs/PERF.md; tests green (host + targeted kernel tags).
+- Concept: the image as the compatibility unit (immutable phase-3 system
+      images make this model stronger, not weaker), W^X and the hostile-input
+      discipline extended to the dynamic loader, the NOTES size/start-delay
+      items this closes, M121/M122 (the crates that become the first shared
+      libraries).
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
