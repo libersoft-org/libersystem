@@ -25,6 +25,7 @@ wav_dir := "user/wav"
 wavpack_dir := "user/wavpack"
 abi_dir := "abi"
 tools_dir := "tools/lsidl-gen"
+audio_bench_dir := "tools/audio-bench"
 proto_dir := "proto"
 wasm_dir := "wasm"
 sdk_dir := "sdk"
@@ -277,6 +278,10 @@ app-libs-test:
 	cargo test --manifest-path {{wav_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 	cargo test --manifest-path {{wavpack_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 
+# Measure every staged decoder in an optimized host build and fail below real time.
+audio-bench:
+	cargo run --release --manifest-path {{audio_bench_dir}}/Cargo.toml
+
 # format all code (Rust via rustfmt, shell via shfmt)
 fmt:
 	cd {{abi_dir}} && cargo fmt
@@ -303,6 +308,7 @@ fmt:
 	cd {{drivers_dir}} && cargo fmt
 	cd {{usertools_dir}} && cargo fmt
 	cd {{tools_dir}} && cargo fmt
+	cd {{audio_bench_dir}} && cargo fmt
 	cd {{proto_dir}} && cargo fmt
 	cd {{wasm_dir}} && cargo fmt
 	cd {{sdk_dir}} && cargo fmt
@@ -342,6 +348,7 @@ fmt-check:
 	cd {{drivers_dir}} && cargo fmt --check
 	cd {{usertools_dir}} && cargo fmt --check
 	cd {{tools_dir}} && cargo fmt --check
+	cd {{audio_bench_dir}} && cargo fmt --check
 	cd {{proto_dir}} && cargo fmt --check
 	cd {{wasm_dir}} && cargo fmt --check
 	cd {{sdk_dir}} && cargo fmt --check

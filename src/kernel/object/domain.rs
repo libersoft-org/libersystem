@@ -36,16 +36,21 @@ pub const DEFAULT_STACK_CEILING: u64 = 8 * 1024 * 1024;
 // correct when several cores charge the same Domain concurrently.
 pub struct ResourceCounter {
 	used: AtomicU64,
+	peak: AtomicU64,
 	limit: AtomicU64,
 }
 
 impl ResourceCounter {
 	const fn new(limit: u64) -> Self {
-		Self { used: AtomicU64::new(0), limit: AtomicU64::new(limit) }
+		Self { used: AtomicU64::new(0), peak: AtomicU64::new(0), limit: AtomicU64::new(limit) }
 	}
 
 	pub fn used(&self) -> u64 {
 		self.used.load(Ordering::Acquire)
+	}
+
+	pub fn peak(&self) -> u64 {
+		self.peak.load(Ordering::Acquire)
 	}
 
 	pub fn limit(&self) -> u64 {
@@ -78,7 +83,12 @@ impl ResourceCounter {
 	// must always succeed (e.g. installing a transferred capability) but still
 	// keep the count exact; the limit is enforced at the create boundaries.
 	fn charge(&self, amount: u64) {
-		self.used.fetch_add(amount, Ordering::AcqRel);
+		let next = self.used.fetch_add(amount, Ordering::AcqRel).saturating_add(amount);
+		self.peak.fetch_max(next, Ordering::AcqRel);
+	}
+
+	fn observe_peak(&self) {
+		self.peak.fetch_max(self.used(), Ordering::AcqRel);
 	}
 
 	// Return `amount` to the pool, saturating at zero so an accounting slip can
@@ -266,6 +276,7 @@ impl Domain {
 				return false;
 			}
 		}
+		select(&self.account).observe_peak();
 		true
 	}
 

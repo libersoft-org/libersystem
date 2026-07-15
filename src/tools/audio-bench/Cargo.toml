@@ -1,0 +1,12 @@
+[package]
+name = "audio-bench"
+edition = "2024"
+description = "Host-only release throughput gate for LiberSystem audio decoder leaves"
+
+[dependencies]
+aiff = { path = "../../user/aiff" }
+flac = { path = "../../user/flac" }
+mp3 = { path = "../../user/mp3" }
+vorbis = { path = "../../user/vorbis" }
+wav = { path = "../../user/wav" }
+wavpack = { path = "../../user/wavpack" }

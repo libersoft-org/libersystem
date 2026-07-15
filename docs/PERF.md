@@ -4,6 +4,62 @@ Measured numbers for the changes whose goal includes a before/after
 comparison. Methodology per entry; machine noise applies, so treat the times as
 orders, not precision instruments.
 
+## Audio decoding and governed playback (2026-07-15)
+
+`just audio-bench` is the standing optimized-host throughput gate. The host-only
+benchmark depends on the same atomized decoder leaves as `play`, reparses each staged
+fixture on every iteration, drains signed-i16 output in bounded 1,024-frame chunks, and
+decodes at least 60 seconds of logical audio per row. It fails if any path falls below
+real time. One x86 host run produced:
+
+| codec/container | staged rate | fixture frames | iterations | wall | realtime |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| WAV PCM | 8,000 Hz | 512 | 938 | 0.002 s | 39,777.8x |
+| WAV IMA ADPCM | 8,000 Hz | 512 | 938 | 0.017 s | 3,489.2x |
+| WAV MS ADPCM | 8,000 Hz | 512 | 938 | 0.008 s | 7,196.3x |
+| AIFF PCM | 8,000 Hz | 512 | 938 | 0.001 s | 44,265.8x |
+| AIFC PCM | 8,000 Hz | 512 | 938 | 0.002 s | 36,019.2x |
+| FLAC | 8,000 Hz | 512 | 938 | 0.043 s | 1,384.6x |
+| MP3 | 16,000 Hz | 1,728 | 556 | 0.019 s | 3,146.1x |
+| Ogg Vorbis | 8,000 Hz | 256 | 1,875 | 1.736 s | 34.6x |
+| WavPack mono | 8,000 Hz | 512 | 938 | 0.017 s | 3,494.4x |
+| WavPack stereo | 8,000 Hz | 512 | 938 | 0.025 s | 2,419.8x |
+
+The focused x86 KVM `audio` test now connects two real `play` processes to one real
+StorageService and AudioService through separate playback-only scopes. It holds WAV's
+first hardware period pending, queues Ogg Vorbis behind it, and then acknowledges the
+driver period. The next 48 kHz output starts with `-3642`, exactly WAV source frame 85
+(`-3649`) plus Vorbis source frame 0 (`7`). Six hardware periods arrive continuously,
+with no stop sentinel between them. Across three debug-profile KVM runs:
+
+| governed playback metric | measured |
+| --- | ---: |
+| launch to first hardware period | 14.40-15.50 ms |
+| Vorbis launch, parse, decode and queue | 36.63-52.08 ms |
+| driver ACK to mixed period | 0.347-0.422 ms |
+| peak queued source frames during overlap | 683 |
+| WAV peak working set | 1,090,638 B |
+| Vorbis peak working set | 1,120,943 B |
+| underruns across six expected periods | 0 |
+
+The working-set counters combine resident ELF/stack pages, the child Domain's private
+MemoryObject high-water mark, and the mapped input file. Domain high-water accounting is
+transactional: a failed ancestor-limit charge is rolled back without raising the peak,
+and refunds do not erase an observed peak. A separate long-WavPack path delivers caught
+`SIG_INT` while `play` is blocked by bounded backpressure. The player explicitly closes
+and exits; AudioService drains 50 already accepted periods (bounded below the asserted
+64-period ceiling), emits its stop sentinel, and releases the hardware stream.
+
+Live output is verified reproducibly with QEMU's WAV backend rather than relying only on
+a listener and a particular SPICE client. Booting with
+`AUDIO_WAV=/tmp/libersystem-audio.wav just lab boot --fresh`, running
+`just lab sh play sample-long.wv`, and then `just lab quit` captured exactly 10.000 s:
+441,000 stereo i16 frames at the backend's 44.1 kHz rate, peak amplitude 4,095 and RMS
+2,890.5. AudioService supplies 48 kHz stereo; QEMU's WAV backend performs the observed
+48-to-44.1 kHz host conversion. This proves the live shell -> governed player ->
+StorageService -> WavPack -> AudioService -> virtio-sound -> host-audio path and keeps the
+result inspectable in CI or headless development.
+
 ## Application surface presentation (2026-07-14)
 
 Measured by the tagged x86 KVM display test (`cd src && just test-tags display`).

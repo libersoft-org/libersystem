@@ -2765,14 +2765,24 @@ growing "libaudio" monolith.
   Ctrl+C. Space pause/resume and left/right seek are follow-ups after the basic
   foreground console path is reliable; seeking is exposed only by codecs whose
   container has a bounded seek/index implementation.
-- [ ] Integration and performance: stand-in StorageService + AudioService kernel
+- [x] Integration and performance: stand-in StorageService + AudioService kernel
   tests prove read -> sniff -> decode -> PCM writes -> close for WAV PCM,
   WAV IMA/MS ADPCM, AIFF/AIFC PCM, FLAC, MP3, Ogg Vorbis and WavPack; a second
   test plays two files concurrently and verifies the M121 mixer rather than
-  exclusive device ownership. Live QEMU/SPICE playback is manually audible and
-  records decode CPU, first-sample latency, queue depth/underruns and peak memory
-  in docs/PERF.md. Decoder throughput must stay ahead of real time in the staged
-  release/opt profile on all supported sample rates.
+  exclusive device ownership. Live QEMU playback is captured through its WAV
+  backend, and decode CPU, first-sample latency, queue depth/underruns and peak
+  memory are recorded in docs/PERF.md. Decoder throughput must stay ahead of real
+  time in the staged release/opt profile on all staged sample rates.
+  - Result (2026-07-15): two real `play` processes decode WAV and Ogg Vorbis over
+    separate playback-only scopes into one real AudioService. Their second period
+    starts with the exact mixed sample, runs six periods with zero underruns and
+    releases the hardware stream; caught Ctrl+C on a backpressured long WavPack
+    drains only its bounded accepted tail and closes. KVM measures 14.40-15.50 ms
+    to first hardware audio, 36.63-52.08 ms for Vorbis launch/decode/queue,
+    0.347-0.422 ms ACK-to-mix and 1.09/1.12 MB WAV/Vorbis peak working sets.
+    `just audio-bench` keeps every staged release decoder above real time (slowest:
+    Ogg Vorbis at 34.6x), while live QEMU WAV capture pins ten seconds of non-silent
+    stereo output through the complete shell-to-virtio-sound path.
 - Explicit non-goals: encoding/recording (microphone capture is a separate app and
   AudioService input contract), DRM, proprietary WMA/RealAudio, patent-licensed
   AAC/HE-AAC/E-AC-3, video containers, network radio, playlists/library indexing,

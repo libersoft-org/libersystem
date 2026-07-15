@@ -16,6 +16,7 @@
 #   DISPLAYS= space-separated list of vnc and/or spice (empty = headless)
 #   VNC_ADDR= VNC bind address (default 0.0.0.0:0)
 #   SPICE_PORT= SPICE TCP port (default 5930)
+#   AUDIO_WAV= capture virtio-sound output to this WAV file (overrides spice/none)
 #   QEMU_EXTRA= extra QEMU arguments
 #   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
 #   UEFI=1    boot through own UEFI loader (aarch64/riscv64 only)
@@ -48,6 +49,17 @@ qemu_parse_displays() {
 	fi
 	if [[ "$want_spice" == "1" ]]; then
 		DISPLAY_ARGS+=(-spice "port=${SPICE_PORT:-5930},addr=0.0.0.0,disable-ticketing=on")
+	fi
+}
+
+qemu_append_audio() {
+	local -n arr="$1"
+	if [[ -n "${AUDIO_WAV:-}" ]]; then
+		arr+=(-audiodev "wav,id=snd0,path=$AUDIO_WAV")
+	elif [[ "$want_spice" == "1" ]]; then
+		arr+=(-audiodev "spice,id=snd0")
+	else
+		arr+=(-audiodev "none,id=snd0")
 	fi
 }
 
@@ -217,11 +229,7 @@ qemu_attach_virt_interactive() {
 		-device "virtconsole,chardev=vcon"
 		-chardev "file,id=vcon,path=$vcon_out"
 	)
-	if [[ "$want_spice" == "1" ]]; then
-		arr+=(-audiodev "spice,id=snd0")
-	else
-		arr+=(-audiodev "none,id=snd0")
-	fi
+	qemu_append_audio arr
 	arr+=(-device "virtio-sound-pci,audiodev=snd0")
 }
 
@@ -425,11 +433,7 @@ qemu_run_x86_64() {
 	qemu_args+=(-device virtio-keyboard-pci,disable-legacy=on)
 	qemu_args+=(-device virtio-tablet-pci,disable-legacy=on)
 	qemu_args+=(-vga none -device virtio-vga)
-	if [[ "$want_spice" == "1" ]]; then
-		qemu_args+=(-audiodev "spice,id=snd0")
-	else
-		qemu_args+=(-audiodev "none,id=snd0")
-	fi
+	qemu_append_audio qemu_args
 	qemu_args+=(-device virtio-sound-pci,audiodev=snd0)
 
 	# USB passthrough: real USB device (interactive only).

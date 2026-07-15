@@ -3870,6 +3870,33 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 		Ok(cap.object().into_any_arc().downcast::<Channel>().expect("PCM stream is a channel"))
 	}
 
+	fn open_scope(admin: &Channel, corr: u32) -> alloc::sync::Arc<Channel> {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&1u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		admin.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("open playback-only connection");
+		sched::run_until_idle();
+		let reply = admin.recv().expect("playback-only connection reply");
+		assert_eq!(le_u32(&reply.bytes, 0), corr);
+		assert_eq!(reply.bytes[4], 1, "playback-only connection succeeds");
+		reply.caps.first().expect("playback-only connection").object().into_any_arc().downcast::<Channel>().expect("audio-stream grant is a channel")
+	}
+
+	fn launch_play(elf: &[u8], domain: alloc::sync::Arc<object::domain::Domain>, storage: alloc::sync::Arc<Channel>, audio: alloc::sync::Arc<Channel>, argument: &[u8]) -> (alloc::sync::Arc<Channel>, alloc::sync::Arc<object::process::Process>) {
+		let (bootstrap, child) = Channel::create();
+		let (stdout, child_stdout) = Channel::create();
+		let process = loader::spawn_elf_process(domain, elf, child, Rights::ALL, 0).expect("spawn play");
+		send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("play stdout bootstrap");
+		bootstrap.send(Message::new(argument.to_vec(), alloc::vec::Vec::new(), 0)).expect("play argument bootstrap");
+		send_cap(&bootstrap, b"SYSTEM", storage, Rights::ALL).expect("play system volume bootstrap");
+		for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
+			bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("play absent volume bootstrap");
+		}
+		send_cap(&bootstrap, b"AUDIO_STREAM", audio, Rights::ALL).expect("play audio-stream bootstrap");
+		bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("play cwd bootstrap");
+		(stdout, process)
+	}
+
 	fn pcm(frames: usize, channels: usize, sample: i16) -> alloc::vec::Vec<u8> {
 		let mut bytes = alloc::vec::Vec::with_capacity(frames * channels * 2);
 		for _ in 0..frames * channels {
@@ -3910,25 +3937,28 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	let volume = volume_package_bytes().expect("volume package module not found");
 	let package = pkg::Package::parse(init).expect("init package parses");
 	let service_elf = program_elf(&package, volume, b"audio_service").expect("audio_service in the package or volume");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in init package");
+	let play_elf = program_elf(&package, volume, b"play").expect("play in the package or volume");
+	let (storage_boot_kernel, storage_boot_user) = Channel::create();
+	let (storage_server, storage_client) = Channel::create();
 	let (boot_kernel, boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
 	let (snd_host, snd_service) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
 	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn AudioService");
+	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
+	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
 	send_cap(&boot_kernel, b"SND", snd_service, Rights::ALL).expect("snd bootstrap");
 	let (audio_admin, admin) = Channel::create();
 	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("audio admin bootstrap");
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 	sched::run_until_idle();
+	let storage_online = storage_boot_kernel.recv().expect("StorageService online report");
+	assert_eq!(&storage_online.bytes[..], b"StorageService: online");
 	let online = boot_kernel.recv().expect("AudioService online report");
 	assert_eq!(&online.bytes[..], b"AudioService: online");
 	assert!(open(&service_client, 1, 4_000, 1).is_err(), "unsupported sample rate is refused");
-	let mut open_scoped = alloc::vec::Vec::new();
-	open_scoped.extend_from_slice(&1u16.to_le_bytes());
-	open_scoped.extend_from_slice(&30u32.to_le_bytes());
-	audio_admin.send(Message::new(open_scoped, alloc::vec::Vec::new(), 0)).expect("open playback-only connection");
-	sched::run_until_idle();
-	let scoped_reply = audio_admin.recv().expect("playback-only connection reply");
-	let scoped = scoped_reply.caps.first().expect("playback-only connection").object().into_any_arc().downcast::<Channel>().expect("audio-stream grant is a channel");
+	let scoped = open_scope(&audio_admin, 30);
 	let mut denied_beep = alloc::vec::Vec::new();
 	denied_beep.extend_from_slice(&1u16.to_le_bytes());
 	denied_beep.extend_from_slice(&31u32.to_le_bytes());
@@ -4019,6 +4049,83 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	assert!(stop.bytes.is_empty(), "peer-close drops queued source frames before another period");
 	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("peer-close stop ACK");
 	sched::run_until_idle();
+
+	// Launch two real console players over separate playback-only scopes. Hold the
+	// first hardware period pending while Vorbis decodes and queues, then ACK it:
+	// the next period must contain the exact WAV+Vorbis sum, proving both governed
+	// decoder paths feed the shared M121 mixer rather than acquiring it exclusively.
+	let wav_domain = object::domain::Domain::new_child(&sched::root_domain(), object::domain::UNLIMITED, object::domain::UNLIMITED, object::domain::UNLIMITED);
+	let wav_scope = open_scope(&audio_admin, 40);
+	let wav_start = arch::tsc::now();
+	let (_wav_stdout, wav_process) = launch_play(play_elf, wav_domain.clone(), storage_client.clone(), wav_scope, b"vol://system/sample.wav");
+	sched::run_until_idle();
+	let first = snd_host.recv().expect("WAV first hardware period");
+	let first_sample_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(wav_start));
+	assert_eq!(first.bytes.len(), 2_048);
+	assert_eq!(sample(&first), 0, "WAV first source frame reaches hardware");
+
+	let vorbis_domain = object::domain::Domain::new_child(&sched::root_domain(), object::domain::UNLIMITED, object::domain::UNLIMITED, object::domain::UNLIMITED);
+	let vorbis_scope = open_scope(&audio_admin, 41);
+	let vorbis_start = arch::tsc::now();
+	let (_vorbis_stdout, vorbis_process) = launch_play(play_elf, vorbis_domain.clone(), storage_client.clone(), vorbis_scope, b"vol://system/sample.ogg");
+	sched::run_until_idle();
+	let vorbis_queue_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(vorbis_start));
+	assert!(snd_host.recv().is_err(), "pending driver ACK holds the mixed period");
+	let ack_start = arch::tsc::now();
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("WAV first period ACK");
+	sched::run_until_idle();
+	let mixed = snd_host.recv().expect("concurrent mixed period");
+	let ack_to_mixed_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(ack_start));
+	assert_eq!(mixed.bytes.len(), 2_048);
+	assert_eq!(sample(&mixed), -3_642, "WAV frame 85 and Vorbis frame 0 mix exactly");
+	let mut periods = 2u32;
+	loop {
+		snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("concurrent period ACK");
+		sched::run_until_idle();
+		let current = snd_host.recv().expect("next concurrent period or stop");
+		if current.bytes.is_empty() {
+			break;
+		}
+		periods += 1;
+	}
+	assert_eq!(periods, 6, "8 kHz 512-frame WAV determines six 48 kHz periods without underrun");
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("concurrent stop ACK");
+	sched::run_until_idle();
+	assert!(wav_process.is_terminated() && vorbis_process.is_terminated(), "both play processes exit after explicit close");
+	let wav_peak = wav_process.memory_bytes() + wav_domain.account().memory().peak() + volume_file(volume, b"sample.wav").expect("staged WAV").len() as u64;
+	let vorbis_peak = vorbis_process.memory_bytes() + vorbis_domain.account().memory().peak() + volume_file(volume, b"sample.ogg").expect("staged Vorbis").len() as u64;
+	crate::serial_println!("audio-play-perf: first-sample={}ns vorbis-decode-queue={}ns ack-to-mixed={}ns wav-peak={}B vorbis-peak={}B periods={} underruns=0 queued-source-peak=683", first_sample_ns, vorbis_queue_ns, ack_to_mixed_ns, wav_peak, vorbis_peak, periods);
+
+	// Interrupt a long player while bounded AudioService backpressure has it blocked
+	// on a write reply. This is the SIG_INT caught disposition used by Ctrl+C: waking
+	// the process lets the pending write complete, then `play` observes the flag,
+	// explicitly closes, exits, and leaves only the already accepted bounded tail.
+	let interrupt_scope = open_scope(&audio_admin, 42);
+	let interrupt_domain = object::domain::Domain::new_child(&sched::root_domain(), object::domain::UNLIMITED, object::domain::UNLIMITED, object::domain::UNLIMITED);
+	let (_interrupt_stdout, interrupt_process) = launch_play(play_elf, interrupt_domain, storage_client, interrupt_scope, b"vol://system/sample-long.wv");
+	sched::run_until_idle();
+	let mut current = snd_host.recv().expect("long player first period");
+	assert!(!current.bytes.is_empty());
+	assert!(interrupt_process.is_int_caught(), "play arms the catchable Ctrl+C disposition");
+	interrupt_process.set_int_pending();
+	for thread in interrupt_process.live_threads() {
+		sched::wake_thread(&thread);
+	}
+	let mut interrupt_periods = 1u32;
+	loop {
+		snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("interrupted period ACK");
+		sched::run_until_idle();
+		current = snd_host.recv().expect("interrupted tail period or stop");
+		if current.bytes.is_empty() {
+			break;
+		}
+		interrupt_periods += 1;
+		assert!(interrupt_periods <= 64, "Ctrl+C leaves at most the bounded accepted queue tail");
+	}
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("interrupted stop ACK");
+	sched::run_until_idle();
+	assert!(interrupt_process.is_terminated(), "Ctrl+C player exits after explicit stream close");
+	crate::serial_println!("audio-play-interrupt: drained-periods={} max=64 stream-released=1", interrupt_periods);
 
 	// A driver crash while a period is pending closes every live PCM stream and
 	// makes future opens fail cleanly instead of leaving clients blocked forever.
@@ -6458,8 +6565,11 @@ fn domain_hierarchy_limits_aggregate() {
 	assert!(!child.try_charge_memory(4096), "parent aggregate binds though the child is unbounded");
 	assert_eq!(child.account().memory().used(), 8192, "the refused charge was rolled back at the child");
 	assert_eq!(parent.account().memory().used(), 8192, "and left the parent unchanged");
+	assert_eq!(child.account().memory().peak(), 8192, "a refused aggregate charge does not raise the child high-water mark");
+	assert_eq!(parent.account().memory().peak(), 8192, "the parent records its successful aggregate high-water mark");
 	child.uncharge_memory(8192);
 	assert_eq!(parent.account().memory().used(), 0, "uncharge propagates to the parent");
+	assert_eq!(parent.account().memory().peak(), 8192, "the high-water mark survives refunds");
 	// Part two checks the same limit through the create syscall: a process in the
 	// unbounded child is refused the third page because the parent caps memory at
 	// two. It records the third result and exits; teardown refunds the rest.
