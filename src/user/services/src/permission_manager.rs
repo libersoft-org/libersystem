@@ -51,6 +51,7 @@ use proto::system::input_admin;
 use proto::system::permission::{self, Service};
 use proto::system::{AuditEntry, Capability, Error, Manifest, StartResult, process};
 use rt::*;
+use services::executable;
 
 // The governed component the manager launches, and the rights a granted client is
 // duplicated with before it is transferred (send + receive + wait + transfer onward - the
@@ -383,7 +384,8 @@ struct Manager {
 
 impl Service for Manager {
 	fn lookup(&mut self, component: String) -> Result<Manifest, Error> {
-		manifest_for(component.as_bytes()).ok_or(Error::NotFound)
+		let identity = executable::lookup_identity(&component).ok_or(Error::NotFound)?;
+		manifest_for(identity.as_bytes()).ok_or(Error::NotFound)
 	}
 	// The audit trail, streamed entry by entry (the serve loop frames the vector
 	// onto a sub-channel): the trail grows with every launch and never has to fit
@@ -410,17 +412,33 @@ impl Service for Manager {
 // capabilities are live), or None if the launch failed.
 unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Option<Vec<u8>> {
 	unsafe {
-		let manifest: Manifest = manifest_for(component)?;
 		let (manager_side, child_side): (u64, u64) = channel()?;
 		// Hand the child end to ProcessService, which loads the component and starts it with
 		// that end as its bootstrap; the manager keeps `manager_side` to grant over. The
 		// returned process handle is the manager's job-control handle on the component.
 		let name: String = String::from_utf8_lossy(component).into_owned();
 		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
-		let task: u64 = match process_client.launch(&name, &child_side) {
-			Some(Ok(started)) => started.task,
+		let started: StartResult = match process_client.launch(&name, &child_side) {
+			Some(Ok(started)) => started,
 			_ => {
 				close(manager_side);
+				return None;
+			}
+		};
+		let task: u64 = started.task;
+		let policy_name: String = match executable::logical_name(&started.info.name) {
+			Some(name) => String::from(name),
+			None => {
+				close(manager_side);
+				close(task);
+				return None;
+			}
+		};
+		let manifest: Manifest = match manifest_for(policy_name.as_bytes()) {
+			Some(manifest) => manifest,
+			None => {
+				close(manager_side);
+				close(task);
 				return None;
 			}
 		};
@@ -438,7 +456,7 @@ unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Cl
 					return None;
 				}
 			}
-			audit.push(AuditEntry { component: String::from_utf8_lossy(component).into_owned(), capability: cap, granted, dynamic: false });
+			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
 		}
 		// Handle any runtime permission requests, then capture the component's final report. A
 		// request is `REQUEST` + a capability ordinal for a capability outside the manifest;
@@ -450,8 +468,8 @@ unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Cl
 			match recv_blocking(manager_side, buf) {
 				Received::Message { len, .. } => {
 					if let Some(cap) = parse_request(&buf[..len]) {
-						let granted: bool = grant_dynamic(component, cap, clients, manager_side);
-						audit.push(AuditEntry { component: String::from_utf8_lossy(component).into_owned(), capability: cap, granted, dynamic: true });
+						let granted: bool = grant_dynamic(policy_name.as_bytes(), cap, clients, manager_side);
+						audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: true });
 						continue;
 					}
 					break Some(buf[..len].to_vec());
@@ -492,7 +510,6 @@ unsafe fn grant_dynamic(component: &[u8], cap: Capability, clients: &mut Clients
 // the tool has no manifest, the argument is not a known program name, or the launch fails.
 unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], stdout: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<StartResult> {
 	unsafe {
-		let manifest: Manifest = manifest_for(name)?;
 		let name_str: &str = core::str::from_utf8(name).ok()?;
 		let (manager_side, child_side): (u64, u64) = channel()?;
 		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
@@ -500,6 +517,22 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 			Some(Ok(s)) => s,
 			_ => {
 				close(manager_side);
+				return None;
+			}
+		};
+		let policy_name: String = match executable::logical_name(&started.info.name) {
+			Some(name) => String::from(name),
+			None => {
+				close(manager_side);
+				close(started.task);
+				return None;
+			}
+		};
+		let manifest: Manifest = match manifest_for(policy_name.as_bytes()) {
+			Some(manifest) => manifest,
+			None => {
+				close(manager_side);
+				close(started.task);
 				return None;
 			}
 		};
@@ -525,7 +558,7 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 					return None;
 				}
 			}
-			audit.push(AuditEntry { component: String::from_utf8_lossy(name).into_owned(), capability: cap, granted, dynamic: false });
+			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
 		}
 		// Hand over the inherited working directory last, after the capability grants. It is
 		// plain data (no handle), so a tool resolves a relative path argument against it; a

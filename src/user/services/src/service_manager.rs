@@ -614,7 +614,7 @@ fn is_pinned(name: &[u8]) -> bool {
 // stopping DeviceManager - which drops virtio_blk, so the system volume is unavailable.
 unsafe fn spawn_canary(package: &Package, buf: &mut [u8]) -> (u64, u64) {
 	unsafe {
-		let elf: &[u8] = match package.lookup(b"watchdog_probe") {
+		let elf: &[u8] = match package.lookup(b"watchdog_probe.lsexe") {
 			Some(e) => e,
 			None => return (0, 0),
 		};

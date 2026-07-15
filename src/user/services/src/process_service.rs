@@ -31,8 +31,7 @@ use proto::system::process::{self, Service};
 use proto::system::volume;
 use proto::system::{Error, OpenOpts, ProcessInfo, StartResult};
 use rt::*;
-
-mod executable;
+use services::executable;
 
 // Where the on-disk program binaries live on the system volume (staged there by the
 // factory-seed pipeline). A named program is loaded from `<PROGRAM_DIR><name>`.
@@ -178,9 +177,16 @@ impl<'a> Processes<'a> {
 	// is malformed, absent or cannot be spawned.
 	unsafe fn spawn_program(&self, name: &str, bootstrap: u64) -> Option<(i64, String)> {
 		unsafe {
+			if let Some((path, basename)) = executable::explicit_path(name) {
+				if self.storage == 0 {
+					return None;
+				}
+				let handle = spawn_from_path(self.storage, path, bootstrap)?;
+				return (handle >= 0).then(|| (handle, String::from(basename)));
+			}
 			for artifact in executable::launch_candidates(name)? {
 				let handle = if self.storage != 0 {
-					match spawn_from_storage(self.storage, &artifact, bootstrap) {
+					match spawn_from_path(self.storage, &alloc::format!("{PROGRAM_DIR}{artifact}"), bootstrap) {
 						Some(handle) => handle,
 						None => continue,
 					}
@@ -197,13 +203,13 @@ impl<'a> Processes<'a> {
 	}
 }
 
-// Read `vol://system/bin/<name>` through the storage client, map its shared buffer,
+// Read one exact `.lsexe` path through the storage client, map its shared buffer,
 // create a process from the mapped ELF image, then release the mapping. Returns the new
 // process handle. None means the named artifact was absent; a present but invalid
 // artifact returns a negative handle so resolution never falls through to another name.
-unsafe fn spawn_from_storage(storage: u64, name: &str, bootstrap: u64) -> Option<i64> {
+unsafe fn spawn_from_path(storage: u64, path: &str, bootstrap: u64) -> Option<i64> {
 	unsafe {
-		let main = MappedFile::open(storage, alloc::format!("{PROGRAM_DIR}{name}"))?;
+		let main = MappedFile::open(storage, String::from(path))?;
 		Some(spawn_program_bytes(storage, main.bytes(), bootstrap))
 	}
 }

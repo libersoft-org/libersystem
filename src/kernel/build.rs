@@ -344,6 +344,12 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 fn build_package(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 	use abi::{PKG_ENTRY_LEN as ENTRY_LEN, PKG_HEADER_LEN as HEADER_LEN, PKG_NAME_LEN as NAME_LEN};
 
+	for (index, (name, _)) in entries.iter().enumerate() {
+		for (other, _) in &entries[index + 1..] {
+			assert!(!abi::executable_aliases_ambiguous(name.as_bytes(), other.as_bytes()), "ambiguous executable artifacts: {name} and {other}");
+		}
+	}
+
 	let table_len: usize = HEADER_LEN + ENTRY_LEN * entries.len();
 	let mut out: Vec<u8> = Vec::new();
 	out.extend_from_slice(abi::PKG_MAGIC);

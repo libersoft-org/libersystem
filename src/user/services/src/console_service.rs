@@ -19,6 +19,7 @@
 use rt::*;
 
 use proto::system::{config, network, process};
+use services::executable;
 use surface::{Client as DisplayClient, Mapping, Rect};
 
 // The shell's command vocabulary, shared with the shell itself: the line discipline
@@ -730,7 +731,7 @@ unsafe fn command_vocab(console: &mut Console) -> Vec<Vec<u8>> {
 			if let Some(storage) = service_connect(console.facs.storage) {
 				let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
 				if let Some(consumer) = client.list("vol://system/bin") {
-					names = drain_stream(consumer, proto::system::volume::list_read).into_iter().map(|f| f.name.into_bytes()).collect();
+					names = drain_stream(consumer, proto::system::volume::list_read).into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect();
 				}
 				close(storage);
 			}

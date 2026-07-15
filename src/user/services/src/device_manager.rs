@@ -121,7 +121,7 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 				i += 1;
 				continue;
 			}
-			let elf: &[u8] = match package.lookup(driver_name) {
+			let elf: &[u8] = match package.lookup(b"virtio_blk.lsexe") {
 				Some(e) => e,
 				None => {
 					i += 1;
@@ -248,13 +248,14 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 	}
 }
 
-// Open vol://system/drivers/<name> through the StorageService client and map its bytes,
+// Open vol://system/drivers/<name>.lsexe through the StorageService client and map its bytes,
 // returning (file handle, mapped address, size) so the caller can spawn from the image and
 // then release the mapping. None if the driver cannot be read.
 unsafe fn read_driver(storage: u64, name: &[u8]) -> Option<(u64, u64, usize)> {
 	unsafe {
 		let mut path: alloc::string::String = alloc::string::String::from(DRIVER_DIR);
 		path.push_str(&alloc::string::String::from_utf8_lossy(name));
+		path.push_str(services::executable::SUFFIX);
 		let opts: OpenOpts = OpenOpts { path, write: false, create: false };
 		let result = match volume::Client::new(ChannelTransport { chan: storage }).open(&opts) {
 			Some(Ok(r)) => r,

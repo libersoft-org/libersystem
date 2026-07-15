@@ -55,12 +55,14 @@ fn volume_file(volume: &[u8], name: &[u8]) -> Result<alloc::vec::Vec<u8>, &'stat
 // under `bin/`, so fall back to the volume there. The returned slice borrows
 // the 'static module data, so it outlives the temporary volume Package.
 fn program_elf(package: &pkg::Package<'static>, volume: &'static [u8], name: &[u8]) -> Option<&'static [u8]> {
-	if let Some(elf) = package.lookup(name) {
+	let mut artifact: alloc::vec::Vec<u8> = name.to_vec();
+	artifact.extend_from_slice(b".lsexe");
+	if let Some(elf) = package.lookup(&artifact) {
 		return Some(elf);
 	}
 	let mut path: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
 	path.extend_from_slice(b"bin/");
-	path.extend_from_slice(name);
+	path.extend_from_slice(&artifact);
 	pkg::Package::parse(volume).and_then(|p| p.lookup(&path))
 }
 
@@ -114,7 +116,7 @@ fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), 
 	// userspace programs from the init package
 	let (volume, package) = scenario_packages()?;
 	let expected = volume_file(volume, b"hello.txt")?;
-	let service_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
+	let service_elf = package.lookup(b"storage_service.lsexe").ok_or("storage_service.lsexe missing from the init package")?;
 	let client_elf = program_elf(&package, volume, b"storage_client").ok_or("storage_client missing from the package or volume")?;
 
 	// channels: a bootstrap per process, plus the service<->client request channel
@@ -153,7 +155,7 @@ fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'s
 
 	let (volume, package) = scenario_packages()?;
 	let expected = volume_file(volume, b"hello.txt")?;
-	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
+	let storage_elf = package.lookup(b"storage_service.lsexe").ok_or("storage_service.lsexe missing from the init package")?;
 	let host_elf = program_elf(&package, volume, b"wasi_host").ok_or("wasi_host missing from the package or volume")?;
 
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
@@ -192,7 +194,7 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 
 	let (volume, package) = scenario_packages()?;
 	let expected = volume_file(volume, b"motd.txt")?;
-	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
+	let storage_elf = package.lookup(b"storage_service.lsexe").ok_or("storage_service.lsexe missing from the init package")?;
 	let picker_elf = program_elf(&package, volume, b"file_picker").ok_or("file_picker missing from the package or volume")?;
 	let host_elf = program_elf(&package, volume, b"wasi_host").ok_or("wasi_host missing from the package or volume")?;
 
@@ -255,8 +257,8 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let (volume, package) = scenario_packages()?;
 	let init = init_package_bytes().ok_or("init package module not found")?;
 	let expected = volume_file(volume, b"hello.txt")?;
-	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
-	let process_elf = package.lookup(b"process_service").ok_or("process_service missing from the init package")?;
+	let storage_elf = package.lookup(b"storage_service.lsexe").ok_or("storage_service.lsexe missing from the init package")?;
+	let process_elf = package.lookup(b"process_service.lsexe").ok_or("process_service.lsexe missing from the init package")?;
 	let time_elf = program_elf(&package, volume, b"time_service").ok_or("time_service missing from the package or volume")?;
 	let pm_elf = program_elf(&package, volume, b"permission_manager").ok_or("permission_manager missing from the package or volume")?;
 
@@ -736,8 +738,8 @@ fn run_component_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>,
 	let (volume, package) = scenario_packages()?;
 	let raw = volume_file(volume, b"hello.txt")?;
 	let expected: alloc::vec::Vec<u8> = raw.iter().map(|b: &u8| b.to_ascii_uppercase()).collect();
-	let storage_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
-	let log_elf = package.lookup(b"log_service").ok_or("log_service missing from the init package")?;
+	let storage_elf = package.lookup(b"storage_service.lsexe").ok_or("storage_service.lsexe missing from the init package")?;
+	let log_elf = package.lookup(b"log_service.lsexe").ok_or("log_service.lsexe missing from the init package")?;
 	let host_elf = program_elf(&package, volume, b"component_host").ok_or("component_host missing from the package or volume")?;
 
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
@@ -829,7 +831,7 @@ fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
 	let volume = volume_package_bytes().ok_or("volume package module not found")?;
 	let init = init_package_bytes().ok_or("init package module not found")?;
 	let package = pkg::Package::parse(init).ok_or("init package is malformed")?;
-	let service_elf = package.lookup(b"storage_service").ok_or("storage_service missing from the init package")?;
+	let service_elf = package.lookup(b"storage_service.lsexe").ok_or("storage_service.lsexe missing from the init package")?;
 
 	// the ramdisk: a MemoryObject filled with the volume archive via the HHDM
 	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
@@ -3004,7 +3006,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// their report descriptors parsed, which the report's keyboard and pointer
 	// markers prove), and the stick (its Bulk-Only transport brought up).
 	let (volume, _package) = scenario_packages().expect("boot modules should be present");
-	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/xhci")).expect("the xhci driver should be staged on the volume under drivers/");
+	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/xhci.lsexe")).expect("the xhci.lsexe driver should be staged on the volume under drivers/");
 
 	// find the controller in the device table and mint its MMIO capability.
 	let mut found: Option<(abi::DeviceInfo, u64, u64, usize)> = None;
@@ -3100,7 +3102,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// image - the same bytes the seed laid down from volume/. The kernel's block
 	// endpoint moves to the service whole: the service is its consumer now.
 	let (volume2, package) = scenario_packages().expect("boot modules should be present");
-	let service_elf = package.lookup(b"storage_service").expect("storage_service should be in the init package");
+	let service_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe should be in the init package");
 	let (service_boot_kernel, service_boot_user) = object::channel::Channel::create();
 	let (service_server, service_client) = object::channel::Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), service_elf, service_boot_user, Rights::ALL, 0).expect("the StorageService should load");
@@ -3264,7 +3266,7 @@ fn a_service_reports_a_bootstrap_failure() {
 
 	let init = init_package_bytes().expect("init package module not found");
 	let package = pkg::Package::parse(init).expect("init package parses");
-	let device_elf = package.lookup(b"device_manager").expect("device_manager in the init package");
+	let device_elf = package.lookup(b"device_manager.lsexe").expect("device_manager.lsexe in the init package");
 	let (boot_kernel, boot_user) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), device_elf, boot_user, Rights::ALL, 0).expect("spawn device_manager");
 	// Where the "PACKAGE" grant should be, hand it a plain message with no transferred
@@ -4208,21 +4210,28 @@ fn process_service_starts_a_program() {
 	// pre-queued so the cooperative service drains it in one pass and exits.
 	let (boot_kernel, service_client) = spawn_service_with_package(b"process_service");
 
-	// START a pinned program by name (log_service is in the init package, which this
+	// START a pinned program by short name (log_service is in the init package, which this
 	// ProcessService falls back to since it has no storage client): [op = 1 u16][corr
 	// u32][name: [len u16][utf8]].
 	let name: &[u8] = b"log_service";
+	let artifact: &[u8] = b"log_service.lsexe";
 	let mut start = alloc::vec::Vec::new();
 	start.extend_from_slice(&1u16.to_le_bytes());
 	start.extend_from_slice(&1u32.to_le_bytes());
 	start.extend_from_slice(&(name.len() as u16).to_le_bytes());
 	start.extend_from_slice(name);
 	service_client.send(Message::new(start, alloc::vec::Vec::new(), 0)).expect("start request");
+	let mut explicit = alloc::vec::Vec::new();
+	explicit.extend_from_slice(&1u16.to_le_bytes());
+	explicit.extend_from_slice(&2u32.to_le_bytes());
+	explicit.extend_from_slice(&(artifact.len() as u16).to_le_bytes());
+	explicit.extend_from_slice(artifact);
+	service_client.send(Message::new(explicit, alloc::vec::Vec::new(), 0)).expect("explicit start request");
 
 	// LIST: [op = 2 u16][corr u32]. Then an empty quit sentinel.
 	let mut list = alloc::vec::Vec::new();
 	list.extend_from_slice(&2u16.to_le_bytes());
-	list.extend_from_slice(&2u32.to_le_bytes());
+	list.extend_from_slice(&3u32.to_le_bytes());
 	service_client.send(Message::new(list, alloc::vec::Vec::new(), 0)).expect("list request");
 	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
 
@@ -4240,14 +4249,94 @@ fn process_service_starts_a_program() {
 	let koid = le_u64(b, 5);
 	assert!(koid >= 1, "the started process has a koid");
 	let name_len = le_u16(b, 13) as usize;
-	assert_eq!(&b[15..15 + name_len], name, "the reply echoes the launched program name");
+	assert_eq!(&b[15..15 + name_len], artifact, "the short launch reports the canonical artifact name");
 
-	// The list reply is [corr u32 = 2][ok u8 = 1][count u16 = 1][process-info].
+	let reply = service_client.recv().expect("explicit start reply");
+	let b = &reply.bytes;
+	assert_eq!(le_u32(b, 0), 2, "explicit start reply echoes the correlation id");
+	assert_eq!(b[4], 1, "explicit start succeeded");
+	let name_len = le_u16(b, 13) as usize;
+	assert_eq!(&b[15..15 + name_len], artifact, "the explicit launch reports the same canonical artifact name");
+
+	// The list reply records both launches under their complete physical identity.
 	let reply = service_client.recv().expect("list reply");
 	let b = &reply.bytes;
-	assert_eq!(le_u32(b, 0), 2, "list reply echoes the correlation id");
+	assert_eq!(le_u32(b, 0), 3, "list reply echoes the correlation id");
 	assert_eq!(b[4], 1, "list succeeded");
-	assert_eq!(le_u16(b, 5), 1, "the started process is listed");
+	assert_eq!(le_u16(b, 5), 2, "both started processes are listed");
+}
+
+tagged_test!(process_service_resolves_one_final_executable_suffix, [Service, Process]);
+fn process_service_resolves_one_final_executable_suffix() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let init = init_package_bytes().expect("init package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let process_elf = package.lookup(b"process_service.lsexe").expect("ProcessService image");
+	let source_index = (0..package.len()).find(|&index| package.name(index) == Some(&b"log_service.lsexe"[..])).expect("source executable entry");
+	let mut repeated_package = init.to_vec();
+	let name_start = abi::PKG_HEADER_LEN + source_index * abi::PKG_ENTRY_LEN;
+	repeated_package[name_start..name_start + abi::PKG_NAME_LEN].fill(0);
+	let repeated_artifact = b"ping.lsexe.lsexe";
+	repeated_package[name_start..name_start + repeated_artifact.len()].copy_from_slice(repeated_artifact);
+
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), process_elf, boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+	send_package(&boot_kernel, &repeated_package).expect("custom package bootstrap");
+	boot_kernel.send(Message::new(b"STORAGE".to_vec(), alloc::vec::Vec::new(), 0)).expect("empty storage bootstrap");
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+
+	for (corr, name) in [(1u32, &b"ping"[..]), (2, &b"ping.lsexe"[..]), (3, &b"ping.lsexe.lsexe"[..])] {
+		let mut start = alloc::vec::Vec::new();
+		start.extend_from_slice(&1u16.to_le_bytes());
+		start.extend_from_slice(&corr.to_le_bytes());
+		start.extend_from_slice(&(name.len() as u16).to_le_bytes());
+		start.extend_from_slice(name);
+		service_client.send(Message::new(start, alloc::vec::Vec::new(), 0)).expect("start request");
+	}
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	sched::run_until_idle();
+
+	assert_eq!(&boot_kernel.recv().expect("ProcessService online report").bytes, b"ProcessService: online");
+	let bare = service_client.recv().expect("bare-name reply");
+	assert_eq!(le_u32(&bare.bytes, 0), 1);
+	assert_eq!(bare.bytes[4], 0, "ping must not skip two suffix levels");
+	for corr in [2u32, 3] {
+		let reply = service_client.recv().expect("repeated-suffix launch reply");
+		let bytes = &reply.bytes;
+		assert_eq!(le_u32(bytes, 0), corr);
+		assert_eq!(bytes[4], 1, "short or exact repeated-suffix launch succeeds");
+		let name_len = le_u16(bytes, 13) as usize;
+		assert_eq!(&bytes[15..15 + name_len], repeated_artifact, "ProcessInfo preserves the full physical basename");
+	}
+}
+
+tagged_test!(system_packages_use_canonical_executable_names, [Boot, Storage]);
+fn system_packages_use_canonical_executable_names() {
+	let init = pkg::Package::parse(init_package_bytes().expect("init package present")).expect("init package parses");
+	let volume = pkg::Package::parse(volume_package_bytes().expect("volume package present")).expect("volume package parses");
+	for index in 0..init.len() {
+		let name = init.name(index).expect("init entry name");
+		assert!(name.ends_with(b".lsexe"), "init package contains an extensionless native artifact");
+	}
+	for index in 0..volume.len() {
+		let name = volume.name(index).expect("volume entry name");
+		if name.starts_with(b"bin/") || name.starts_with(b"drivers/") {
+			assert!(name.ends_with(b".lsexe"), "system volume contains an extensionless native artifact");
+		}
+	}
+	for package in [&init, &volume] {
+		for index in 0..package.len() {
+			let name = package.name(index).expect("package entry name");
+			if name.ends_with(b".lsexe") {
+				let mut collision = name.to_vec();
+				collision.extend_from_slice(b".lsexe");
+				assert!(package.lookup(&collision).is_none(), "package contains an ambiguous executable alias pair");
+			}
+		}
+	}
 }
 
 tagged_test!(process_service_loads_a_program_from_system_bin, [Service, Process, Storage]);
@@ -4260,13 +4349,13 @@ fn process_service_loads_a_program_from_system_bin() {
 	// `bin/` through a StorageService client, not the init package. Stand up a
 	// StorageService over the factory volume archive (which stages the tools under
 	// `bin/`) and a ProcessService wired to its client, then START a staged tool by name:
-	// ProcessService resolves it to `vol://system/bin/<name>` and loads it off the volume,
+	// ProcessService resolves it to `vol://system/bin/<name>.lsexe` and loads it off the volume,
 	// proving the on-disk load path the shell's `run` and ConsoleService's shell spawn now
 	// take.
 	let (volume, package) = scenario_packages().expect("scenario packages");
 	let init = init_package_bytes().expect("init package module not found");
-	let storage_elf = package.lookup(b"storage_service").expect("storage_service in the init package");
-	let process_elf = package.lookup(b"process_service").expect("process_service in the init package");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
+	let process_elf = package.lookup(b"process_service.lsexe").expect("process_service.lsexe in the init package");
 
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (process_boot_kernel, process_boot_user) = Channel::create();
@@ -4313,7 +4402,24 @@ fn process_service_loads_a_program_from_system_bin() {
 	let koid = le_u64(b, 5);
 	assert!(koid >= 1, "the started process has a koid");
 	let name_len = le_u16(b, 13) as usize;
-	assert_eq!(&b[15..15 + name_len], name, "the reply echoes the launched program name");
+	assert_eq!(&b[15..15 + name_len], b"ptyecho.lsexe", "the reply reports the canonical artifact name");
+
+	for (corr, path, succeeds) in [(10u32, &b"vol://system/bin/ptyecho.lsexe"[..], true), (11, &b"vol://system/bin/ptyecho"[..], false)] {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&1u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		process_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("explicit-path start request");
+		sched::run_until_idle();
+		let reply = process_client.recv().expect("explicit-path start reply");
+		assert_eq!(le_u32(&reply.bytes, 0), corr);
+		assert_eq!(reply.bytes[4] == 1, succeeds, "only a real path ending in .lsexe is executable");
+		if succeeds {
+			let name_len = le_u16(&reply.bytes, 13) as usize;
+			assert_eq!(&reply.bytes[15..15 + name_len], b"ptyecho.lsexe", "an explicit path records only the canonical basename");
+		}
+	}
 
 	// LAUNCH the ET_DYN probe with a bootstrap channel. ProcessService must resolve
 	// pix.lslib -> lsrt.lslib from vol://system/lib, load providers first, relocate the
@@ -4457,7 +4563,7 @@ fn config_set_survives_a_service_reboot() {
 	// another minted connection: the set value AND the seeded defaults both serve.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
 	let (scenario_volume, package) = scenario_packages().expect("scenario packages");
-	let storage_elf = package.lookup(b"storage_service").expect("storage_service in the init package");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
 	let config_elf = program_elf(&package, scenario_volume, b"config_service").expect("config_service in the package or volume");
 
 	// StorageService over the sparse in-memory disk: no superblock and no archive,
@@ -4671,8 +4777,8 @@ fn pty_hosts_a_program() {
 	let (volume, package) = scenario_packages().expect("scenario packages");
 	let init = init_package_bytes().expect("init package module not found");
 	let console_elf = program_elf(&package, volume, b"console_service").expect("console_service in the package or volume");
-	let storage_elf = package.lookup(b"storage_service").expect("storage_service in the init package");
-	let process_elf = package.lookup(b"process_service").expect("process_service in the init package");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
+	let process_elf = package.lookup(b"process_service.lsexe").expect("process_service.lsexe in the init package");
 
 	// ConsoleService's bootstrap channel and the channels its __user_main expects: VT 1's
 	// data (CLIENT) + control (CONTROL), a factory per service (FSTORAGE..FNET; only FPROCESS
@@ -4686,7 +4792,7 @@ fn pty_hosts_a_program() {
 	loader::spawn_elf_process(sched::root_domain(), console_elf, boot_user, Rights::ALL, 0).expect("spawn ConsoleService");
 
 	// A StorageService over the factory volume (which stages ptyecho under bin/), so the
-	// ProcessService below can load the ptyecho slave from vol://system/bin/ptyecho.
+	// ProcessService below can load the ptyecho slave from vol://system/bin/ptyecho.lsexe.
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (storage_server, storage_client) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
@@ -4794,7 +4900,7 @@ fn du_reports_a_directory_tree_size() {
 	// then the inherited cwd. `-s` prints just the total line: a nonzero byte count and
 	// the path (the volume root holds the seed files).
 	let (volume, package) = scenario_packages().expect("scenario packages");
-	let storage_elf = package.lookup(b"storage_service").expect("storage_service in the init package");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
 	let du_elf = program_elf(&package, volume, b"du").expect("du in the package or volume");
 
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
@@ -4952,7 +5058,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 	let expected_pool: u64 = (CAPACITY - FACTORY_START_SECTOR * SECTOR as u64) / 4096;
 
 	let (_volume, package) = scenario_packages().expect("boot modules should be present");
-	let elf = package.lookup(b"storage_service").expect("storage_service should be in the init package");
+	let elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe should be in the init package");
 
 	let (boot_kernel, boot_user) = Channel::create();
 	let (blk_host, blk_child) = Channel::create();
@@ -5116,7 +5222,7 @@ fn system_volume_lands_in_a_gpt_partition() {
 	disk.insert(2, entries);
 
 	let (_volume, package) = scenario_packages().expect("boot modules should be present");
-	let elf = package.lookup(b"storage_service").expect("storage_service should be in the init package");
+	let elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe should be in the init package");
 	let (boot_kernel, boot_user) = Channel::create();
 	let (blk_host, blk_child) = Channel::create();
 	let (serve_server, _serve_client) = Channel::create();
@@ -5173,7 +5279,7 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	disk.insert(2, entries);
 
 	let (_volume, package) = scenario_packages().expect("boot modules should be present");
-	let elf = package.lookup(b"storage_service").expect("storage_service should be in the init package");
+	let elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe should be in the init package");
 	let (boot_kernel, boot_user) = Channel::create();
 	let (blk_host, blk_child) = Channel::create();
 	let (serve_server, _serve_client) = Channel::create();
@@ -5221,7 +5327,7 @@ fn a_lying_seed_archive_cannot_kill_the_storage_service() {
 	disk.insert(0, header);
 
 	let (_volume, package) = scenario_packages().expect("boot modules should be present");
-	let elf = package.lookup(b"storage_service").expect("storage_service should be in the init package");
+	let elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe should be in the init package");
 	let (boot_kernel, boot_user) = Channel::create();
 	let (blk_host, blk_child) = Channel::create();
 	let (serve_server, _serve_client) = Channel::create();
@@ -5387,7 +5493,7 @@ fn userspace_spawn_syscalls_start_a_second_process() {
 	}
 	let bytes = init_package_bytes().expect("init package present");
 	let package = pkg::Package::parse(bytes).expect("init package parses");
-	let elf = package.lookup(b"log_service").expect("log_service image");
+	let elf = package.lookup(b"log_service.lsexe").expect("log_service.lsexe image");
 	ELF_PTR.store(elf.as_ptr() as u64, Ordering::SeqCst);
 	ELF_LEN.store(elf.len() as u64, Ordering::SeqCst);
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
@@ -5776,7 +5882,7 @@ fn storage_serves_staged_tool_binary() {
 	// lays that archive at LBA 0, and StorageService seeds it into the freshly-formatted
 	// LiberFS). Reading one back through StorageService must return a valid ELF image -
 	// proof the whole staging path works end to end.
-	let actual = storage_read(b"vol://system/bin/cat").expect("the staged tool read should succeed");
+	let actual = storage_read(b"vol://system/bin/cat.lsexe").expect("the staged tool read should succeed");
 	assert!(actual.len() > 4, "the staged tool should not be empty");
 	assert_eq!(&actual[..4], b"\x7fELF", "the staged tool should be an ELF image");
 }

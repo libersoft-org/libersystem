@@ -37,7 +37,6 @@ use rt::*;
 
 // The governed component the manager launches, and the name of the budget the manager
 // assigns its Domain (the shared app sandbox).
-const PROBE_NAME: &[u8] = b"resource_probe";
 const BUDGET_NAME: &str = "apps";
 
 // One page, the unit the kernel charges memory in. The probe allocates one-page objects,
@@ -119,7 +118,7 @@ unsafe fn drive(channel: u64, command: &[u8], buf: &mut [u8]) -> bool {
 // observing its live usage.
 unsafe fn govern(package: &Package, domain: u64, buf: &mut [u8]) -> (u64, u64, u64) {
 	unsafe {
-		let elf: &[u8] = match package.lookup(PROBE_NAME) {
+		let elf: &[u8] = match package.lookup(b"resource_probe.lsexe") {
 			Some(e) => e,
 			None => return (0, 0, 0),
 		};

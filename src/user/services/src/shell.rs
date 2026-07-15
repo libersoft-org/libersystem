@@ -19,6 +19,7 @@ use proto::path;
 use proto::shell::{parse_and_expand, parse_assignment, trim};
 use proto::system::{Component, EnvVar, JobEntry, JobInfo, TraceSpan, input, network, permission, process, session, system_graph, volume};
 use rt::*;
+use services::executable;
 
 // The shell's builtins, shared with ConsoleService's line discipline: Tab completes the
 // command word over the builtins plus the live bin/ listing, and the shell prints the
@@ -1464,7 +1465,7 @@ unsafe fn print_hex(bytes: &[u8]) {
 fn bin_names(storage: u64) -> Vec<Vec<u8>> {
 	let mut client = volume::Client::new(ChannelTransport { chan: storage });
 	match client.list("vol://system/bin") {
-		Some(consumer) => unsafe { drain_stream(consumer, volume::list_read) }.into_iter().map(|f| f.name.into_bytes()).collect(),
+		Some(consumer) => unsafe { drain_stream(consumer, volume::list_read) }.into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect(),
 		None => Vec::new(),
 	}
 }

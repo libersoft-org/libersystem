@@ -94,7 +94,9 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], up: u64, pkg_
 		// udf storage are extra instances of the pinned storage_service binary.
 		let proc: i64 = if is_pinned(name) {
 			let elf_name: &[u8] = if name == b"media_storage" || name == b"iso_storage" || name == b"udf_storage" || name == b"usb_storage" { b"storage_service" } else { name };
-			match package.lookup(elf_name) {
+			let mut artifact: Vec<u8> = elf_name.to_vec();
+			artifact.extend_from_slice(services::executable::SUFFIX.as_bytes());
+			match package.lookup(&artifact) {
 				Some(elf) => spawn(elf, service_side),
 				None => return State::Failed,
 			}

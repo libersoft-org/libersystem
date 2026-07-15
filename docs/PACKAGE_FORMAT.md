@@ -30,8 +30,8 @@ maps anything.
   extension classifies the artifact: an extensionless file is not a native
   executable, and removing exactly one final `.lsexe` forms its short command name.
   Thus `ping.lsexe.lsexe` is an executable whose short name is `ping.lsexe`, not
-  `ping`. This naming migration is specified by M125; until it is complete, existing
-  system images may still contain legacy extensionless program entries.
+  `ping`. M125 completed this migration; image construction rejects extensionless
+  native program entries and ambiguous one-suffix alias pairs.
 - **`.lslib` - native shared library.** A library uses `<name>.lslib`, never the
   Unix-style `lib<name>.so`. The complete filename is its image-internal identity:
   it is used as the ELF `DT_SONAME`, appears unchanged in consumers' `DT_NEEDED`

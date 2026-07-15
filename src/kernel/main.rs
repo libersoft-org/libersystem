@@ -301,7 +301,7 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 
 	let bytes = init_package_bytes().ok_or("init package module not found")?;
 	let package = pkg::Package::parse(bytes).ok_or("init package is malformed")?;
-	let elf_image = package.lookup(b"system_manager").ok_or("system_manager missing from init package")?;
+	let elf_image = package.lookup(b"system_manager.lsexe").ok_or("system_manager.lsexe missing from init package")?;
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
 	let process = loader::spawn_elf_process(sched::root_domain(), elf_image, user_ep, Rights::ALL, 0).map_err(|_| "failed to load SystemManager")?;
 	let sm_koid = process.header().koid();

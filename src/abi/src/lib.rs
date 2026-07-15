@@ -502,6 +502,15 @@ pub const RIGHT_WAIT: u32 = 1 << 11;
 // Every currently defined right.
 pub const RIGHTS_ALL: u32 = 0xfff;
 
+pub const EXECUTABLE_SUFFIX: &str = ".lsexe";
+
+pub fn executable_aliases_ambiguous(first: &[u8], second: &[u8]) -> bool {
+	fn expands_to(shorter: &[u8], longer: &[u8]) -> bool {
+		longer.len() == shorter.len() + EXECUTABLE_SUFFIX.len() && longer.starts_with(shorter) && longer[shorter.len()..] == *EXECUTABLE_SUFFIX.as_bytes()
+	}
+	expands_to(first, second) || expands_to(second, first)
+}
+
 // PKGARCH1 archive format - a 16-byte header (8-byte magic, u32 entry count, u32
 // reserved), then one 40-byte entry per file (32-byte NUL-padded name, u32 blob
 // offset, u32 size), then the concatenated blobs. All integers little-endian.
@@ -585,5 +594,17 @@ impl<'a> Package<'a> {
 			return Some(&self.bytes[offset..end]);
 		}
 		None
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::executable_aliases_ambiguous;
+
+	#[test]
+	fn executable_alias_collision_is_exactly_one_suffix_level() {
+		assert!(executable_aliases_ambiguous(b"bin/ping.lsexe", b"bin/ping.lsexe.lsexe"));
+		assert!(!executable_aliases_ambiguous(b"bin/ping.lsexe", b"bin/ping.lsexe.lsexe.lsexe"));
+		assert!(!executable_aliases_ambiguous(b"bin/ping.lsexe", b"drivers/ping.lsexe.lsexe"));
 	}
 }

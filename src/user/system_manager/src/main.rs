@@ -53,7 +53,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 2. find ServiceManager in the package and spawn it, handing it one end of a
 	//    fresh control channel as its bootstrap.
 	let archive: &[u8] = unsafe { core::slice::from_raw_parts(pkg_base as *const u8, pkg_len) };
-	let svc_elf: &[u8] = match Package::parse(archive).and_then(|p| p.lookup(b"service_manager")) {
+	let svc_elf: &[u8] = match Package::parse(archive).and_then(|p| p.lookup(b"service_manager.lsexe")) {
 		Some(elf) => elf,
 		None => exit(),
 	};

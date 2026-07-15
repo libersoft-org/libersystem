@@ -22,6 +22,9 @@ fn main() {
 // ELF object format). Build scripts run with the crate dir as the working
 // directory, so the `../` paths resolve into this user/ directory.
 fn select_linker_script() {
+	if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("none") {
+		return;
+	}
 	let arch: String = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 	let script: &str = match arch.as_str() {
 		"aarch64" => "../user-aarch64.ld",
