@@ -1,7 +1,144 @@
 #![no_std]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 #[cfg(test)]
 extern crate std;
+
+pub const MAX_DIMENSION: u32 = 16_384;
+pub const MAX_PIXELS: u64 = 16_777_216;
+pub const MAX_ANIMATION_FRAMES: usize = 4_096;
+pub const MAX_ANIMATION_PIXELS: u64 = 67_108_864;
+pub const MAX_ANIMATION_DURATION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+	Invalid,
+	TooLarge,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RgbaImage {
+	pub width: u32,
+	pub height: u32,
+	pub pitch: u32,
+	pub pixels: Vec<u8>,
+}
+
+impl RgbaImage {
+	pub fn new(width: u32, height: u32, pixels: Vec<u8>) -> Result<Self, Error> {
+		validate_geometry(width, height)?;
+		let pitch = width.checked_mul(4).ok_or(Error::TooLarge)?;
+		let expected = usize::try_from(pitch).ok().and_then(|pitch| pitch.checked_mul(height as usize)).ok_or(Error::TooLarge)?;
+		if pixels.len() != expected {
+			return Err(Error::Invalid);
+		}
+		Ok(Self { width, height, pitch, pixels })
+	}
+
+	pub fn pixel_count(&self) -> u64 {
+		self.width as u64 * self.height as u64
+	}
+
+	pub fn as_rgba(&self) -> Rgba<'_> {
+		Rgba { data: &self.pixels, width: self.width, height: self.height, pitch: self.pitch }
+	}
+
+	pub fn to_bgrx(&self) -> Result<Vec<u8>, Error> {
+		let mut output = Vec::new();
+		output.try_reserve_exact(self.pixels.len()).map_err(|_| Error::TooLarge)?;
+		for pixel in self.pixels.chunks_exact(4) {
+			let alpha = pixel[3] as u16;
+			output.push((pixel[2] as u16 * alpha / 255) as u8);
+			output.push((pixel[1] as u16 * alpha / 255) as u8);
+			output.push((pixel[0] as u16 * alpha / 255) as u8);
+			output.push(0);
+		}
+		Ok(output)
+	}
+}
+
+#[derive(Clone, Copy)]
+pub struct Rgba<'a> {
+	pub data: &'a [u8],
+	pub width: u32,
+	pub height: u32,
+	pub pitch: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blend {
+	Source,
+	Over,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposal {
+	Keep,
+	Background,
+	Previous,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+	pub image: RgbaImage,
+	pub x: u32,
+	pub y: u32,
+	pub duration_ms: u32,
+	pub blend: Blend,
+	pub disposal: Disposal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Animation {
+	pub width: u32,
+	pub height: u32,
+	pub loop_count: u32,
+	pub frames: Vec<Frame>,
+}
+
+impl Animation {
+	pub fn new(width: u32, height: u32, loop_count: u32, frames: Vec<Frame>) -> Result<Self, Error> {
+		validate_geometry(width, height)?;
+		if frames.is_empty() || frames.len() > MAX_ANIMATION_FRAMES {
+			return Err(if frames.is_empty() { Error::Invalid } else { Error::TooLarge });
+		}
+		let mut cumulative_pixels = 0u64;
+		let mut cumulative_duration = 0u64;
+		for frame in &frames {
+			let end_x = frame.x.checked_add(frame.image.width).ok_or(Error::TooLarge)?;
+			let end_y = frame.y.checked_add(frame.image.height).ok_or(Error::TooLarge)?;
+			if end_x > width || end_y > height || frame.duration_ms == 0 {
+				return Err(Error::Invalid);
+			}
+			cumulative_pixels = cumulative_pixels.checked_add(frame.image.pixel_count()).ok_or(Error::TooLarge)?;
+			if cumulative_pixels > MAX_ANIMATION_PIXELS {
+				return Err(Error::TooLarge);
+			}
+			cumulative_duration = cumulative_duration.checked_add(frame.duration_ms as u64).ok_or(Error::TooLarge)?;
+			if cumulative_duration > MAX_ANIMATION_DURATION_MS {
+				return Err(Error::TooLarge);
+			}
+		}
+		Ok(Self { width, height, loop_count, frames })
+	}
+
+	pub fn still(image: RgbaImage) -> Self {
+		Self { width: image.width, height: image.height, loop_count: 1, frames: alloc::vec![Frame { image, x: 0, y: 0, duration_ms: 1, blend: Blend::Source, disposal: Disposal::Keep }] }
+	}
+}
+
+fn validate_geometry(width: u32, height: u32) -> Result<(), Error> {
+	if width == 0 || height == 0 {
+		return Err(Error::Invalid);
+	}
+	if width > MAX_DIMENSION || height > MAX_DIMENSION || width as u64 * height as u64 > MAX_PIXELS {
+		return Err(Error::TooLarge);
+	}
+	Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -158,6 +295,22 @@ mod tests {
 	use super::*;
 	use std::vec;
 	use std::vec::Vec;
+
+	#[test]
+	fn rgba_preserves_straight_alpha_and_converts_only_for_display() {
+		let image = RgbaImage::new(2, 1, vec![255, 128, 64, 128, 1, 2, 3, 0]).unwrap();
+		assert_eq!(image.pixels, vec![255, 128, 64, 128, 1, 2, 3, 0]);
+		assert_eq!(image.to_bgrx().unwrap(), vec![32, 64, 128, 0, 0, 0, 0, 0]);
+	}
+
+	#[test]
+	fn animation_bounds_frames_geometry_duration_and_cumulative_pixels() {
+		let image = RgbaImage::new(2, 2, vec![0; 16]).unwrap();
+		let animation = Animation::new(4, 4, 0, vec![Frame { image, x: 1, y: 1, duration_ms: 20, blend: Blend::Over, disposal: Disposal::Previous }]).unwrap();
+		assert_eq!(animation.frames.len(), 1);
+		let outside = RgbaImage::new(2, 2, vec![0; 16]).unwrap();
+		assert_eq!(Animation::new(2, 2, 1, vec![Frame { image: outside, x: 1, y: 0, duration_ms: 20, blend: Blend::Source, disposal: Disposal::Keep }]), Err(Error::Invalid));
+	}
 
 	fn bytes(pixels: &[u32]) -> Vec<u8> {
 		pixels.iter().flat_map(|pixel| pixel.to_le_bytes()).collect()

@@ -4,5 +4,6 @@ edition = "2024"
 description = "Dependency-free bounded PNG decoder"
 
 [dependencies]
+deflate = { path = "../deflate" }
 inflate = { path = "../inflate" }
 pix = { path = "../pix" }

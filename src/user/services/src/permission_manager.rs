@@ -49,7 +49,7 @@ use proto::system::audio_admin;
 use proto::system::display_admin;
 use proto::system::input_admin;
 use proto::system::permission::{self, Service};
-use proto::system::{AuditEntry, Capability, Error, Manifest, StartResult, process};
+use proto::system::{process, AuditEntry, Capability, Error, Manifest, StartResult};
 use rt::*;
 use services::executable;
 
@@ -152,6 +152,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"set" => Some(granted("set", alloc::vec![Capability::Config])),
 		b"beep" => Some(granted("beep", alloc::vec![Capability::Audio])),
 		b"imgview" => Some(granted("imgview", alloc::vec![Capability::Volumes, Capability::Display, Capability::InputKeys])),
+		b"imgconv" => Some(granted("imgconv", alloc::vec![Capability::Volumes])),
 		b"play" => Some(granted("play", alloc::vec![Capability::Volumes, Capability::AudioStream])),
 		b"graphics_probe" => Some(granted("graphics_probe", alloc::vec![Capability::Display, Capability::InputKeys, Capability::AudioStream])),
 		b"usage" => Some(granted("usage", alloc::vec![Capability::Resource])),
@@ -368,7 +369,11 @@ unsafe fn grant_handle(clients: &mut Clients, cap: Capability) -> u64 {
 		// Narrow the minted connection to a client's rights, like every other grant.
 		let dup: i64 = duplicate(minted, GRANT_RIGHTS);
 		close(minted);
-		if dup >= 0 { dup as u64 } else { 0 }
+		if dup >= 0 {
+			dup as u64
+		} else {
+			0
+		}
 	}
 }
 

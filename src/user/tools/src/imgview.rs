@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use keys::usage;
 use pix::{Image, Rect, Target};
 use proto::path;
-use proto::system::{OpenOpts, input, volume};
+use proto::system::{input, volume, OpenOpts};
 use rt::*;
 
 struct DecodedImage {
@@ -108,13 +108,10 @@ unsafe fn load_image(storage: u64, uri: &str) -> Option<DecodedImage> {
 			}
 		};
 		let bytes = core::slice::from_raw_parts(mapped as *const u8, len);
-		let decoded = if bytes.starts_with(b"BM") {
-			bmp::decode(bytes).ok().map(|image| DecodedImage { width: image.width, height: image.height, pitch: image.pitch, pixels: image.pixels })
-		} else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-			png::decode(bytes).ok().map(|image| DecodedImage { width: image.width, height: image.height, pitch: image.pitch, pixels: image.pixels })
-		} else {
-			None
-		};
+		let decoded = imgconv::decode_frame(bytes, 0).ok().and_then(|(_, image)| {
+			let pixels = image.to_bgrx().ok()?;
+			Some(DecodedImage { width: image.width, height: image.height, pitch: image.pitch, pixels })
+		});
 		unmap_object(opened.file);
 		close(opened.file);
 		match decoded {

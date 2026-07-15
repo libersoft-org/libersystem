@@ -1,0 +1,9 @@
+[package]
+name = "image-bench"
+edition = "2024"
+description = "Host release encode/decode benchmark for LiberSystem image leaves"
+
+[dependencies]
+imgconv = { path = "../../user/imgconv" }
+pix = { path = "../../user/pix" }
+png = { path = "../../user/png" }

@@ -1,0 +1,8 @@
+[package]
+name = "apng"
+edition = "2024"
+description = "Bounded no_std APNG RGBA8 animation container"
+
+[dependencies]
+pix = { path = "../pix" }
+png = { path = "../png" }

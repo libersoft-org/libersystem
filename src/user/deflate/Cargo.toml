@@ -1,0 +1,10 @@
+[package]
+name = "deflate"
+edition = "2024"
+description = "Bounded no_std zlib and DEFLATE encoder"
+
+[dependencies]
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+
+[dev-dependencies]
+inflate = { path = "../inflate" }

@@ -92,6 +92,10 @@ name = "imgview"
 path = "src/imgview.rs"
 
 [[bin]]
+name = "imgconv"
+path = "src/imgconv.rs"
+
+[[bin]]
 name = "usage"
 path = "src/usage.rs"
 
@@ -214,6 +218,7 @@ proto = { path = "../../proto" }
 
 bmp = { path = "../bmp" }
 keys = { path = "../keys" }
+imgconv = { path = "../imgconv" }
 pix = { path = "../pix" }
 png = { path = "../png" }
 surface = { path = "../surface" }

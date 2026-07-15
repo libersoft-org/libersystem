@@ -81,8 +81,19 @@ library   lsrt                  rt        volume
 library   proto                 proto     volume
 library   pix                   pix    volume
 library   inflate               inflate volume
+library   deflate               deflate volume
 library   bmp                   bmp    volume
 library   png                   png    volume
+library   apng                  apng   volume
+library   gif                   gif    volume
+library   ico                   ico    volume
+library   icns                  icns   volume
+library   jpeg                  jpeg   volume
+library   pcx                   pcx    volume
+library   ppm                   ppm    volume
+library   qoi                   qoi    volume
+library   tga                   tga    volume
+library   webp                  webp   volume
 library   keys                  keys   volume
 library   pcm                   pcm    volume
 library   surface               surface volume
@@ -115,6 +126,7 @@ tool      beep       tools  volume
 tool      play       tools  volume
 tool      graphics_probe tools volume
 tool      imgview    tools  volume
+tool      imgconv    tools  volume
 tool      usage      tools  volume
 tool      ps         tools  volume
 tool      run        tools  volume

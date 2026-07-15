@@ -1,0 +1,9 @@
+[package]
+name = "webp"
+edition = "2024"
+description = "Bounded no_std WebP VP8/VP8L decoder and VP8L encoder"
+
+[dependencies]
+pix = { path = "../pix" }
+ai-image-webp = { version = "0.2.4", default-features = false }
+no_std_io = { version = "0.6", default-features = false, features = ["alloc"] }

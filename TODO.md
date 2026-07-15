@@ -2878,7 +2878,7 @@ noise.
 
 ## M126 - Image conversion tool (`imgconv`)
 
-Status: PLANNED.
+Status: IN PROGRESS (2026-07-15).
 
 The next console application after `imgview` and `play`: `imgconv <input> <output>`
 converts every image format LiberSystem supports without gaining display, input or
@@ -2888,7 +2888,7 @@ selected from the destination suffix (`.jpg` and `.jpeg` are aliases) or an expl
 different mounted volumes. The implementation preserves the atomized M123 model: one
 codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image crate.
 
-- [ ] Canonical conversion model before more codecs: extend `pix` (or add one small
+- [x] Canonical conversion model before more codecs: extend `pix` (or add one small
   dependency-free image-vocabulary leaf if keeping display pixels separate is
   cleaner) with a bounded owned RGBA8 image and an animation sequence carrying
   per-frame duration, canvas size, blend/disposal mode and loop count. Decoders must
@@ -2918,7 +2918,16 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     and HEIC retain the M123 rejection/defer decisions and are not hidden aliases.
   Shared palette quantization and dithering live in one reusable leaf used by
   GIF/indexed PNG/PCX/BMP rather than four format-local implementations.
-- [ ] Exact CLI and option semantics, parsed by shared host-tested helpers:
+  - Partial result (2026-07-15): twelve prefix-free no_std leaves now share the
+    straight-RGBA/animation model and are wired into `imgconv` and `imgview`: BMP,
+    PNG, PPM, QOI, TGA, PCX, ICO, ICNS, baseline JPEG, WebP, APNG and GIF. BMP/PNG
+    retain compatibility decode APIs and add encoders; APNG/GIF preserve frame
+    rectangles, timing, loop, blend/disposal, while animated WebP is normalized to
+    visual full-canvas frames because the available decoder hides source subframes.
+    Remaining matrix work is shared palette quantization/indexed output, legacy ICNS
+    RLE, exact animated-WebP subframe metadata, WebP animation encode and a no_std
+    lossy VP8 encoder.
+- [x] Exact CLI and option semantics, parsed by shared host-tested helpers:
   `imgconv [options] <input> <output>`. `--format <name>` overrides only output
   suffix selection; an unknown or mismatched suffix is an error. `--force` permits
   replacement, otherwise an existing destination is refused. `--resize WxH` is an
@@ -2945,6 +2954,14 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   encoder fail before opening the output. Defaults and each accepted/rejected option
   are represented by one data-driven format-capability table shared by parser, help
   text and tests, so behavior cannot drift by codec.
+  - Partial result (2026-07-15): one capability table drives validation and effective
+    defaults. PNG/APNG/ICO/ICNS expose compression 0..100; JPEG exposes quality
+    0..100 and lossy mode; WebP defaults lossless and currently supports genuine
+    encoder endpoints 0 (no predictor) and 100 (predictor), rejecting intermediate
+    effort, `--lossy` and `--quality` until a real multi-level/lossy VP8 encoder
+    exists. Audited alternatives (`webpx`, `fast-webp`) wrap unsafe libwebp C FFI;
+    `oxideav-webp` is a std-heavy scaffold, so none satisfy the bare-metal rule.
+    Fixed-compression formats reject controls instead of ignoring them.
 - [ ] Bounded, failure-safe output path: decode and transform under checked image/frame
   budgets, compute every row/table/chunk size with checked arithmetic, cap encoded
   output relative to the validated source model, and propagate allocation failures as
@@ -2953,13 +2970,20 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   trailer validation complete; on failure, interruption or out-of-space, remove the
   incomplete output and leave an existing file untouched. Converting a path onto
   itself requires `--force` and still decodes the original before replacement.
-- [ ] Governed `imgconv.lsexe`: register the tool in the manifest and shell completion
+- [x] Governed `imgconv.lsexe`: register the tool in the manifest and shell completion
   with exactly `volumes`, add dependencies only on the selected codec leaves and
   shared conversion helpers, print one compact result line (source format/dimensions,
   destination format/dimensions, mode/quality/compression and byte size), and return a
   distinct failure for invalid options, unsupported codec/profile, corrupt input,
   destination conflict and storage failure. No DisplayService or InputService grant
   is needed; `imgview` remains the separate inspection tool.
+  - Result (2026-07-15): the staged canonical tool has exactly `volumes`; input and
+    output route independently across the five volume grants, input is decoded and
+    output fully encoded before StorageService write, existing output is refused
+    unless `--force`, and compact output reports effective options, dimensions, size
+    and metadata stripping. PermissionManager launches the conflict path under policy;
+    a writable-LiberFS scenario converts BMP to PNG, reopens it and independently
+    proves exact RGBA pixels. `imgview` uses the same central sniffer/frame compositor.
 - [ ] Conformance, hostile-input and option tests: lossless format round-trips compare
   exact RGBA frames/timing; lossy JPEG/WebP vectors compare dimensions plus bounded
   PSNR/error thresholds and deterministic hashes; compression 0 and 100 must decode
@@ -2977,6 +3001,16 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   quality/compression endpoints; common desktop-sized fixtures must finish within a
   documented budget. Full userspace/package builds remain green on x86_64, aarch64
   and riscv64, with focused x86 storage/process/service/display integration green.
+  - Partial result (2026-07-15): `just image-bench` covers fifteen 512x512 output
+    profiles; the slowest measured encode is 26.9 ms and decode 17.8 ms, both well
+    below the 5 s gate. The complete application-library suite is 123/123, focused
+    x86 process/service/storage/display/input is 55/55, and full shared-library plus
+    userspace builds pass on x86_64, aarch64 and riscv64. The strict x86 image graph
+    includes APNG 12,648 B, GIF 75,776 B, ICO 12,416 B, ICNS 17,320 B, JPEG
+    325,424 B, PCX 8,368 B, PPM 9,376 B, QOI 16,552 B, TGA 10,216 B and WebP
+    309,080 B with canonical prefix-free SONAME/NEEDED edges. Remaining gate work is
+    cross-volume mutation, failure cleanup/transactional publish, lossy-WebP quality
+    endpoints and viewer launch on a newly converted non-PNG format.
 - Done when: `imgconv` converts every implemented M126 format through the same RGBA/frame
   model, WebP can explicitly choose lossless or lossy, applicable encoders honor
   validated 0..100 quality/compression controls, alpha and animation are never dropped

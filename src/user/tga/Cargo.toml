@@ -1,0 +1,7 @@
+[package]
+name = "tga"
+edition = "2024"
+description = "Bounded no_std TGA true-color decoder and raw/RLE encoder"
+
+[dependencies]
+pix = { path = "../pix" }

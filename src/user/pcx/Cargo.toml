@@ -1,0 +1,7 @@
+[package]
+name = "pcx"
+edition = "2024"
+description = "Bounded no_std PCX indexed/RGB decoder and 24-bit encoder"
+
+[dependencies]
+pix = { path = "../pix" }

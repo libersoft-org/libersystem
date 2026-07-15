@@ -1,0 +1,7 @@
+[package]
+name = "ppm"
+edition = "2024"
+description = "Bounded no_std PPM P3/P6 decoder and P6 encoder"
+
+[dependencies]
+pix = { path = "../pix" }

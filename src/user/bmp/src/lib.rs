@@ -67,6 +67,56 @@ pub fn decode(data: &[u8]) -> Result<Image, Error> {
 	Ok(Image { width: header.width, height: header.height, pitch, pixels })
 }
 
+pub fn decode_rgba(data: &[u8]) -> Result<pix::RgbaImage, Error> {
+	let image = decode(data)?;
+	let mut pixels = Vec::new();
+	pixels.try_reserve_exact(image.pixels.len()).map_err(|_| Error::TooLarge)?;
+	for pixel in image.pixels.chunks_exact(4) {
+		pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+	}
+	pix::RgbaImage::new(image.width, image.height, pixels).map_err(|error| match error {
+		pix::Error::Invalid => Error::Invalid,
+		pix::Error::TooLarge => Error::TooLarge,
+	})
+}
+
+pub fn encode_rgba(image: &pix::RgbaImage) -> Result<Vec<u8>, Error> {
+	let source_row = usize::try_from(image.width).ok().and_then(|width| width.checked_mul(4)).ok_or(Error::TooLarge)?;
+	let expected = source_row.checked_mul(image.height as usize).ok_or(Error::TooLarge)?;
+	if image.width == 0 || image.height == 0 || image.width > MAX_DIMENSION || image.height > MAX_DIMENSION || image.width as u64 * image.height as u64 > MAX_PIXELS || image.pitch as usize != source_row || image.pixels.len() != expected {
+		return Err(Error::Invalid);
+	}
+	if image.pixels.chunks_exact(4).any(|pixel| pixel[3] != 255) {
+		return Err(Error::Unsupported);
+	}
+	let row_stride = usize::try_from(image.width).ok().and_then(|width| width.checked_mul(3)).and_then(|bytes| bytes.checked_add(3)).map(|bytes| bytes & !3).ok_or(Error::TooLarge)?;
+	let pixel_len = row_stride.checked_mul(image.height as usize).ok_or(Error::TooLarge)?;
+	let file_len = FILE_HEADER_LEN.checked_add(INFO_HEADER_LEN).and_then(|header| header.checked_add(pixel_len)).ok_or(Error::TooLarge)?;
+	let mut output = Vec::new();
+	output.try_reserve_exact(file_len).map_err(|_| Error::TooLarge)?;
+	output.resize(file_len, 0);
+	output[..2].copy_from_slice(b"BM");
+	output[2..6].copy_from_slice(&u32::try_from(file_len).map_err(|_| Error::TooLarge)?.to_le_bytes());
+	let pixel_offset = FILE_HEADER_LEN + INFO_HEADER_LEN;
+	output[10..14].copy_from_slice(&(pixel_offset as u32).to_le_bytes());
+	output[14..18].copy_from_slice(&(INFO_HEADER_LEN as u32).to_le_bytes());
+	output[18..22].copy_from_slice(&(image.width as i32).to_le_bytes());
+	output[22..26].copy_from_slice(&(image.height as i32).to_le_bytes());
+	output[26..28].copy_from_slice(&1u16.to_le_bytes());
+	output[28..30].copy_from_slice(&24u16.to_le_bytes());
+	output[34..38].copy_from_slice(&u32::try_from(pixel_len).map_err(|_| Error::TooLarge)?.to_le_bytes());
+	for file_y in 0..image.height as usize {
+		let source_y = image.height as usize - 1 - file_y;
+		let source = &image.pixels[source_y * source_row..(source_y + 1) * source_row];
+		let target = pixel_offset + file_y * row_stride;
+		for x in 0..image.width as usize {
+			let source = &source[x * 4..x * 4 + 4];
+			output[target + x * 3..target + x * 3 + 3].copy_from_slice(&[source[2], source[1], source[0]]);
+		}
+	}
+	Ok(output)
+}
+
 fn zeroed(len: usize) -> Result<Vec<u8>, Error> {
 	let mut output = Vec::new();
 	output.try_reserve_exact(len).map_err(|_| Error::TooLarge)?;
@@ -393,6 +443,7 @@ mod tests {
 		let expected = vec![0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0x00ff_ffff];
 		assert_eq!(colors(&decode(&bottom_up).unwrap()), expected);
 		assert_eq!(colors(&decode(&top_down).unwrap()), expected);
+		assert_eq!(decode_rgba(&bottom_up).unwrap().pixels, vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]);
 	}
 
 	#[test]
@@ -436,5 +487,13 @@ mod tests {
 		let image = decode(include_bytes!("../../../volume/sample.bmp")).unwrap();
 		assert_eq!((image.width, image.height, image.pitch), (2, 2, 8));
 		assert_eq!(image.pixels.len(), 16);
+	}
+
+	#[test]
+	fn encodes_opaque_rgba_and_refuses_alpha_loss() {
+		let image = pix::RgbaImage::new(2, 2, vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 1, 2, 3, 255]).unwrap();
+		assert_eq!(decode_rgba(&encode_rgba(&image).unwrap()).unwrap(), image);
+		let transparent = pix::RgbaImage::new(1, 1, vec![1, 2, 3, 4]).unwrap();
+		assert_eq!(encode_rgba(&transparent), Err(Error::Unsupported));
 	}
 }

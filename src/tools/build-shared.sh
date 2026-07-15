@@ -117,11 +117,76 @@ for spec in "$@"; do
 	proto | pix | inflate | pcm | adpcm | ogg)
 		link_deps=("$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
+	deflate)
+		miniz_archive="$(find "$deps" -maxdepth 1 -name 'libminiz_oxide-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		adler_archive="$(find "$deps" -maxdepth 1 -name 'libadler2-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		if [[ -z "$miniz_archive" || -z "$adler_archive" ]]; then
+			echo "build-shared: missing miniz_oxide/adler2 archive for deflate.lslib" >&2
+			exit 1
+		fi
+		link_inputs=(--whole-archive "$rlib" "$miniz_archive" "$adler_archive" --no-whole-archive)
+		link_deps=("$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
 	bmp)
 		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
+	pcx | ppm | tga)
+		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
+	qoi)
+		qoi_codec_archive="$(find "$deps" -maxdepth 1 -name 'libqoi-*.rlib' ! -samefile "$rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		bytemuck_archive="$(find "$deps" -maxdepth 1 -name 'libbytemuck-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		if [[ -z "$qoi_codec_archive" || -z "$bytemuck_archive" ]]; then
+			echo "build-shared: missing qoi/bytemuck archive for qoi.lslib" >&2
+			exit 1
+		fi
+		link_inputs=(--whole-archive "$rlib" "$qoi_codec_archive" "$bytemuck_archive" --no-whole-archive)
+		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
 	png)
-		link_deps=("$(library_file pix)" "$(library_file inflate)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		link_deps=("$(library_file pix)" "$(library_file inflate)" "$(library_file deflate)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
+	apng)
+		link_deps=("$(library_file png)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
+	gif)
+		weezl_archive="$(find "$deps" -maxdepth 1 -name 'libweezl-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		if [[ -z "$weezl_archive" ]]; then
+			echo "build-shared: missing weezl archive for gif.lslib" >&2
+			exit 1
+		fi
+		link_inputs=(--whole-archive "$rlib" "$weezl_archive" --no-whole-archive)
+		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
+	ico)
+		link_deps=("$(library_file png)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
+	icns)
+		link_deps=("$(library_file png)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
+	jpeg)
+		jpeg_encoder_archive="$(find "$deps" -maxdepth 1 -name 'libjpeg_encoder-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		zune_core_archive="$(find "$deps" -maxdepth 1 -name 'libzune_core-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		zune_jpeg_archive="$(find "$deps" -maxdepth 1 -name 'libzune_jpeg-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		if [[ -z "$jpeg_encoder_archive" || -z "$zune_core_archive" || -z "$zune_jpeg_archive" ]]; then
+			echo "build-shared: missing JPEG engine archives for jpeg.lslib" >&2
+			exit 1
+		fi
+		link_inputs=(--whole-archive "$rlib" "$jpeg_encoder_archive" "$zune_core_archive" "$zune_jpeg_archive" --no-whole-archive)
+		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
+	webp)
+		webp_archives=()
+		for dependency in ai_byteorder_lite ai_image_webp ai_quick_error allocator_api2 equivalent foldhash hashbrown memchr no_std_io; do
+			archive="$(find "$deps" -maxdepth 1 -name "lib${dependency}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+			if [[ -z "$archive" ]]; then
+				echo "build-shared: missing $dependency archive for webp.lslib" >&2
+				exit 1
+			fi
+			webp_archives+=("$archive")
+		done
+		link_inputs=(--whole-archive "$rlib" "${webp_archives[@]}" --no-whole-archive)
+		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	keys)
 		link_deps=("$(library_file proto)" "$(library_file lsrt)" --no-allow-shlib-undefined)

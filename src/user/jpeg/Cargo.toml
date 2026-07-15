@@ -1,0 +1,10 @@
+[package]
+name = "jpeg"
+edition = "2024"
+description = "Bounded no_std baseline JPEG decoder and quality encoder"
+
+[dependencies]
+pix = { path = "../pix" }
+zune-core = { version = "0.5.1", default-features = false }
+zune-jpeg = { version = "0.5.15", default-features = false }
+jpeg-encoder = { version = "0.7.0", default-features = false }

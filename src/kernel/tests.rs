@@ -540,6 +540,35 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 		return Err("imgview did not exit after releasing the surface");
 	}
 
+	// Launch imgconv through PermissionManager on the read-only scenario volume.
+	// The destination already exists and --force is absent, so this proves its
+	// volumes-only grant and conflict policy without attempting a mutation here;
+	// the separate writable-block test proves the conversion/write path.
+	let (convert_output, convert_stdout) = Channel::create();
+	let mut convert_run = alloc::vec::Vec::new();
+	convert_run.extend_from_slice(&3u16.to_le_bytes());
+	convert_run.extend_from_slice(&20u32.to_le_bytes());
+	for value in [&b"imgconv"[..], &b"vol://system/sample.bmp vol://system/sample.png"[..], &b"vol://system"[..]] {
+		convert_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
+		convert_run.extend_from_slice(value);
+	}
+	convert_run.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&perm_client, &convert_run, convert_stdout, Rights::ALL)?;
+	sched::run_until_idle();
+	let convert_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer imgconv run")?;
+	if convert_reply.bytes.len() < 5 || convert_reply.bytes[4] == 0 {
+		return Err("PermissionManager refused imgconv");
+	}
+	let convert_process = convert_reply.caps.first().ok_or("imgconv run returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "imgconv run handle was not a Process")?;
+	let conflict = convert_output.recv().map_err(|_| "imgconv printed no conflict")?;
+	if conflict.bytes != b"imgconv: destination exists (use --force)\n" {
+		return Err("imgconv conflict result was invalid");
+	}
+	sched::run_until_idle();
+	if !convert_process.is_terminated() {
+		return Err("imgconv did not exit after destination conflict");
+	}
+
 	// Launch the governed WAV player with a fresh playback-only AudioService scope.
 	// The stand-in accepts only a prefix of the first write, proving `play` retries the
 	// unaccepted suffix in a new buffer before explicitly closing the stream.
@@ -4656,6 +4685,98 @@ fn config_service_serves_the_tree() {
 	assert_eq!(b[4], 1, "get-back succeeded");
 	let vlen = le_u16(b, 5) as usize;
 	assert_eq!(&b[7..7 + vlen], b"hi", "the value just set reads back");
+}
+
+tagged_test!(imgconv_writes_lossless_png_through_writable_storage, [Service, Storage, Process]);
+fn imgconv_writes_lossless_png_through_writable_storage() {
+	use alloc::collections::BTreeMap;
+	use object::channel::{Channel, Message};
+	use object::memory_object::MemoryObject;
+	use object::rights::Rights;
+
+	const CAPACITY: u64 = 64 * 1024 * 1024;
+	const SECTOR: usize = 512;
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in init package");
+	let imgconv_elf = program_elf(&package, volume, b"imgconv").expect("canonical imgconv.lsexe in system volume");
+	let source = bmp::decode_rgba(&volume_file(volume, b"sample.bmp").expect("staged BMP")).expect("staged BMP decodes");
+
+	let (storage_boot, storage_boot_user) = Channel::create();
+	let (blk_host, blk_child) = Channel::create();
+	let (storage_server, storage_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn writable StorageService");
+	send_cap(&storage_boot, b"BLOCK", blk_child, Rights::ALL).expect("BLOCK bootstrap");
+	send_cap(&storage_boot, b"SERVE", storage_server, Rights::ALL).expect("SERVE bootstrap");
+	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
+	for (lba, chunk) in volume.chunks(SECTOR).enumerate() {
+		let mut sector = alloc::vec![0u8; SECTOR];
+		sector[..chunk.len()].copy_from_slice(chunk);
+		disk.insert(lba as u64, sector);
+	}
+	let mut online = false;
+	for _ in 0..100_000 {
+		sched::run_until_idle();
+		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
+		if let Ok(report) = storage_boot.recv() {
+			assert_eq!(&report.bytes[..], b"StorageService: online");
+			online = true;
+			break;
+		}
+	}
+	assert!(online, "writable seeded StorageService reports online");
+
+	let (bootstrap, child) = Channel::create();
+	let (stdout, child_stdout) = Channel::create();
+	let process = loader::spawn_elf_process(sched::root_domain(), imgconv_elf, child, Rights::ALL, 0).expect("spawn imgconv.lsexe");
+	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("stdout bootstrap");
+	bootstrap.send(Message::new(b"--compression 100 vol://system/sample.bmp vol://system/converted.png".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv args");
+	send_cap(&bootstrap, b"SYSTEM", storage_client.clone(), Rights::ALL).expect("SYSTEM bootstrap");
+	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("absent volume bootstrap");
+	}
+	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("cwd bootstrap");
+
+	let mut line = None;
+	for _ in 0..100_000 {
+		sched::run_until_idle();
+		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
+		if line.is_none()
+			&& let Ok(message) = stdout.recv()
+		{
+			line = Some(message.bytes);
+		}
+		if line.is_some() && process.is_terminated() {
+			break;
+		}
+	}
+	let line = line.expect("imgconv prints a result");
+	assert!(line.starts_with(b"imgconv: BMP 2x2 -> PNG 2x2 compression=100 bytes="));
+	assert!(line.ends_with(b" metadata=stripped\n"));
+	assert!(process.is_terminated(), "imgconv exits after writing output");
+
+	let path = b"vol://system/converted.png";
+	let corr = 0x1260u32;
+	let mut request = alloc::vec::Vec::new();
+	request.extend_from_slice(&1u16.to_le_bytes());
+	request.extend_from_slice(&corr.to_le_bytes());
+	request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+	request.extend_from_slice(path);
+	request.push(0);
+	request.push(0);
+	storage_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("open converted output");
+	let reply = loop {
+		sched::run_until_idle();
+		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
+		if let Ok(reply) = storage_client.recv() {
+			break reply;
+		}
+	};
+	assert_eq!(le_u32(&reply.bytes, 0), corr);
+	assert_eq!(reply.bytes[4], 1, "converted output opens");
+	let size = le_u64(&reply.bytes, 9) as usize;
+	let output = reply.caps.first().expect("converted output buffer").object().into_any_arc().downcast::<MemoryObject>().expect("converted output is a MemoryObject");
+	let decoded = png::decode_rgba(&read_from_object(&output, size)).expect("converted output independently decodes");
+	assert_eq!(decoded, source, "lossless conversion preserves exact RGBA pixels");
 }
 
 tagged_test!(config_set_survives_a_service_reboot, [Service, Storage]);

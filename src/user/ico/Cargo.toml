@@ -1,0 +1,8 @@
+[package]
+name = "ico"
+edition = "2024"
+description = "Bounded no_std ICO container over PNG and 32-bit BMP entries"
+
+[dependencies]
+pix = { path = "../pix" }
+png = { path = "../png" }

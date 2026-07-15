@@ -40,6 +40,17 @@ pub struct Image {
 	pub pixels: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeOptions {
+	pub compression: u8,
+}
+
+impl Default for EncodeOptions {
+	fn default() -> Self {
+		Self { compression: 50 }
+	}
+}
+
 impl Image {
 	pub fn as_pix(&self) -> pix::Image<'_> {
 		pix::Image { data: &self.pixels, width: self.width, height: self.height, pitch: self.pitch }
@@ -65,6 +76,15 @@ enum Transparency {
 }
 
 pub fn decode(data: &[u8]) -> Result<Image, Error> {
+	let rgba = decode_rgba(data)?;
+	let pixels = rgba.to_bgrx().map_err(|error| match error {
+		pix::Error::Invalid => Error::Invalid,
+		pix::Error::TooLarge => Error::TooLarge,
+	})?;
+	Ok(Image { width: rgba.width, height: rgba.height, pitch: rgba.pitch, pixels })
+}
+
+pub fn decode_rgba(data: &[u8]) -> Result<pix::RgbaImage, Error> {
 	let png = parse(data)?;
 	let expected = filtered_len(&png)?;
 	let filtered = inflate::zlib(&png.compressed, expected)?;
@@ -72,7 +92,77 @@ pub fn decode(data: &[u8]) -> Result<Image, Error> {
 	let output_len = (pitch as usize).checked_mul(png.height as usize).ok_or(Error::TooLarge)?;
 	let mut pixels = zeroed(output_len)?;
 	decode_passes(&png, &filtered, &mut pixels)?;
-	Ok(Image { width: png.width, height: png.height, pitch, pixels })
+	pix::RgbaImage::new(png.width, png.height, pixels).map_err(|error| match error {
+		pix::Error::Invalid => Error::Invalid,
+		pix::Error::TooLarge => Error::TooLarge,
+	})
+}
+
+pub fn encode_rgba(image: &pix::RgbaImage, options: EncodeOptions) -> Result<Vec<u8>, Error> {
+	let compressed = encode_rgba_payload(image, options.compression)?;
+	let mut output = SIGNATURE.to_vec();
+	let mut header = Vec::new();
+	header.extend_from_slice(&image.width.to_be_bytes());
+	header.extend_from_slice(&image.height.to_be_bytes());
+	header.extend_from_slice(&[8, 6, 0, 0, 0]);
+	append_chunk(&mut output, b"IHDR", &header)?;
+	append_chunk(&mut output, b"IDAT", &compressed)?;
+	append_chunk(&mut output, b"IEND", &[])?;
+	Ok(output)
+}
+
+pub fn encode_rgba_payload(image: &pix::RgbaImage, compression: u8) -> Result<Vec<u8>, Error> {
+	let row_bytes = usize::try_from(image.width).ok().and_then(|width| width.checked_mul(4)).ok_or(Error::TooLarge)?;
+	let expected = row_bytes.checked_mul(image.height as usize).ok_or(Error::TooLarge)?;
+	if image.width == 0 || image.height == 0 || image.width > MAX_DIMENSION || image.height > MAX_DIMENSION || image.width as u64 * image.height as u64 > MAX_PIXELS || image.pitch as usize != row_bytes || image.pixels.len() != expected {
+		return Err(Error::Invalid);
+	}
+	let filtered_len = row_bytes.checked_add(1).and_then(|row| row.checked_mul(image.height as usize)).ok_or(Error::TooLarge)?;
+	let mut filtered = Vec::new();
+	filtered.try_reserve_exact(filtered_len).map_err(|_| Error::TooLarge)?;
+	for row in image.pixels.chunks_exact(row_bytes) {
+		filtered.push(0);
+		filtered.extend_from_slice(row);
+	}
+	deflate::zlib(&filtered, compression).map_err(|error| match error {
+		deflate::Error::Invalid => Error::Invalid,
+		deflate::Error::TooLarge => Error::TooLarge,
+	})
+}
+
+pub fn decode_rgba_payload(width: u32, height: u32, compressed: &[u8]) -> Result<pix::RgbaImage, Error> {
+	let row_bytes = usize::try_from(width).ok().and_then(|width| width.checked_mul(4)).ok_or(Error::TooLarge)?;
+	let expected = row_bytes.checked_add(1).and_then(|row| row.checked_mul(height as usize)).ok_or(Error::TooLarge)?;
+	let filtered = inflate::zlib(compressed, expected)?;
+	let mut pixels = zeroed(row_bytes.checked_mul(height as usize).ok_or(Error::TooLarge)?)?;
+	let mut previous = vec![0u8; row_bytes];
+	let mut current = vec![0u8; row_bytes];
+	let mut cursor = 0usize;
+	for y in 0..height as usize {
+		let filter = *filtered.get(cursor).ok_or(Error::Truncated)?;
+		cursor += 1;
+		let end = cursor.checked_add(row_bytes).ok_or(Error::TooLarge)?;
+		current.copy_from_slice(filtered.get(cursor..end).ok_or(Error::Truncated)?);
+		cursor = end;
+		unfilter(filter, &mut current, &previous, 4)?;
+		pixels[y * row_bytes..(y + 1) * row_bytes].copy_from_slice(&current);
+		core::mem::swap(&mut current, &mut previous);
+	}
+	pix::RgbaImage::new(width, height, pixels).map_err(|error| match error {
+		pix::Error::Invalid => Error::Invalid,
+		pix::Error::TooLarge => Error::TooLarge,
+	})
+}
+
+fn append_chunk(output: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) -> Result<(), Error> {
+	let length = u32::try_from(body.len()).map_err(|_| Error::TooLarge)?;
+	let additional = body.len().checked_add(12).ok_or(Error::TooLarge)?;
+	output.try_reserve(additional).map_err(|_| Error::TooLarge)?;
+	output.extend_from_slice(&length.to_be_bytes());
+	output.extend_from_slice(kind);
+	output.extend_from_slice(body);
+	output.extend_from_slice(&crc32(kind.iter().chain(body.iter()).copied()).to_be_bytes());
+	Ok(())
 }
 
 fn zeroed(len: usize) -> Result<Vec<u8>, Error> {
@@ -308,7 +398,7 @@ fn paeth(left: u8, above: u8, upper_left: u8) -> u8 {
 	}
 }
 
-fn pixel_color(png: &Parsed, row: &[u8], x: usize, channel_count: usize) -> Result<u32, Error> {
+fn pixel_color(png: &Parsed, row: &[u8], x: usize, channel_count: usize) -> Result<[u8; 4], Error> {
 	let base = x.checked_mul(channel_count).ok_or(Error::Invalid)?;
 	let sample = |channel: usize| read_sample(row, png.bit_depth, base + channel);
 	let (red, green, blue, alpha) = match png.color_type {
@@ -339,8 +429,7 @@ fn pixel_color(png: &Parsed, row: &[u8], x: usize, channel_count: usize) -> Resu
 		6 => (scale_sample(sample(0)?, png.bit_depth), scale_sample(sample(1)?, png.bit_depth), scale_sample(sample(2)?, png.bit_depth), scale_sample(sample(3)?, png.bit_depth)),
 		_ => return Err(Error::Unsupported),
 	};
-	let blend = |value: u8| (value as u16 * alpha as u16 / 255) as u32;
-	Ok(blend(red) << 16 | blend(green) << 8 | blend(blue))
+	Ok([red, green, blue, alpha])
 }
 
 fn read_sample(row: &[u8], bit_depth: u8, index: usize) -> Result<u16, Error> {
@@ -366,9 +455,9 @@ fn scale_sample(value: u16, bit_depth: u8) -> u8 {
 	(value as u32 * 255 / maximum) as u8
 }
 
-fn write_pixel(output: &mut [u8], width: u32, x: u32, y: u32, color: u32) -> Result<(), Error> {
+fn write_pixel(output: &mut [u8], width: u32, x: u32, y: u32, color: [u8; 4]) -> Result<(), Error> {
 	let offset = (y as usize).checked_mul(width as usize).and_then(|row| row.checked_add(x as usize)).and_then(|pixel| pixel.checked_mul(4)).ok_or(Error::Invalid)?;
-	output.get_mut(offset..offset + 4).ok_or(Error::Invalid)?.copy_from_slice(&color.to_le_bytes());
+	output.get_mut(offset..offset + 4).ok_or(Error::Invalid)?.copy_from_slice(&color);
 	Ok(())
 }
 
@@ -488,6 +577,7 @@ mod tests {
 	fn decodes_indexed_transparency_and_all_row_filters() {
 		let indexed = png(2, 1, 1, 3, 0, &[[255, 0, 0], [0, 255, 0]], &[255, 0], &[0, 0b0100_0000]);
 		assert_eq!(colors(&decode(&indexed).unwrap()), vec![0x00ff_0000, 0]);
+		assert_eq!(decode_rgba(&indexed).unwrap().pixels, vec![255, 0, 0, 255, 0, 255, 0, 0]);
 
 		let previous = [10, 20, 30, 40, 50, 60];
 		for filter in 0..=4 {
@@ -520,5 +610,15 @@ mod tests {
 		assert_eq!((image.width, image.height, image.pitch), (2, 2, 8));
 		assert_eq!(image.pixels.len(), 16);
 		assert!(image.pixels.iter().any(|byte| *byte != 0));
+	}
+
+	#[test]
+	fn encodes_straight_rgba_at_compression_endpoints() {
+		let image = pix::RgbaImage::new(2, 2, vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 1, 2, 3, 4]).unwrap();
+		for compression in [0, 100] {
+			let encoded = encode_rgba(&image, EncodeOptions { compression }).unwrap();
+			assert_eq!(decode_rgba(&encoded).unwrap(), image);
+		}
+		assert_eq!(encode_rgba(&image, EncodeOptions { compression: 101 }), Err(Error::Invalid));
 	}
 }

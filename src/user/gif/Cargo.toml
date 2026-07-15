@@ -1,0 +1,8 @@
+[package]
+name = "gif"
+edition = "2024"
+description = "Bounded no_std GIF animation container over LZW"
+
+[dependencies]
+pix = { path = "../pix" }
+weezl = { version = "0.2.1", default-features = false, features = ["alloc"] }

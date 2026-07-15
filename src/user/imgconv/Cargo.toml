@@ -1,0 +1,19 @@
+[package]
+name = "imgconv"
+edition = "2024"
+description = "Bounded image conversion orchestration and option validation"
+
+[dependencies]
+apng = { path = "../apng" }
+bmp = { path = "../bmp" }
+gif = { path = "../gif" }
+ico = { path = "../ico" }
+icns = { path = "../icns" }
+jpeg = { path = "../jpeg" }
+pcx = { path = "../pcx" }
+pix = { path = "../pix" }
+png = { path = "../png" }
+ppm = { path = "../ppm" }
+qoi = { path = "../qoi" }
+tga = { path = "../tga" }
+webp = { path = "../webp" }
