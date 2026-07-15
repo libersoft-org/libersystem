@@ -16,8 +16,10 @@ intrinsics may change in the next image without compatibility shims.
 - System libraries live under `vol://system/lib/`. Per-application third-party
   libraries remain part of the phase-3 package format rather than entering the global
   namespace.
-- System-library filenames use the LiberSystem-specific `.lslib` suffix and no Unix
-  `lib` prefix: for example, `png.lslib`, `proto.lslib`, and `lsrt.lslib`.
+- System-library filenames follow the central [artifact filename
+  conventions](PACKAGE_FORMAT.md#artifact-filename-conventions): they use the
+  LiberSystem-specific `.lslib` suffix and no Unix `lib` prefix, for example
+  `png.lslib`, `proto.lslib`, and `lsrt.lslib`.
 - Library crates also use prefix-free owner directories. A normal leaf lives at
   `src/user/<name>/`, and its generated objects stay with that owner under
   `src/user/<name>/shared/<target>/<name>.lslib`. The runtime and generated protocol

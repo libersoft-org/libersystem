@@ -15,6 +15,38 @@ static-PIE with a hand-written PE header (the Linux EFI-stub technique). All thr
 read the same files off a FAT boot filesystem and hand the kernel the same
 `BootInfo`.
 
+## Artifact filename conventions
+
+A LiberSystem-specific suffix identifies the loader contract a native artifact is
+intended to satisfy. It does not replace format validation: every consumer still
+validates the complete ELF structure and its own bounded input contract before it
+maps anything.
+
+- **`.lsexe` - native userspace executable.** Tools, services, components, probes
+  and userspace drivers all use the canonical physical basename `<name>.lsexe`;
+  their role and capability policy come from the system manifest, not from another
+  filename suffix. The shell may expose the convenient short command `<name>`, but
+  ProcessService records and reports the complete physical basename. Only the final
+  extension classifies the artifact: an extensionless file is not a native
+  executable, and removing exactly one final `.lsexe` forms its short command name.
+  Thus `ping.lsexe.lsexe` is an executable whose short name is `ping.lsexe`, not
+  `ping`. This naming migration is specified by M125; until it is complete, existing
+  system images may still contain legacy extensionless program entries.
+- **`.lslib` - native shared library.** A library uses `<name>.lslib`, never the
+  Unix-style `lib<name>.so`. The complete filename is its image-internal identity:
+  it is used as the ELF `DT_SONAME`, appears unchanged in consumers' `DT_NEEDED`
+  entries, and resolves under `vol://system/lib/`. A `.lslib` is a load-time provider
+  for a `.lsexe`, not a directly launchable program. These libraries are rebuilt as
+  part of one immutable system image and are not a stable cross-release or
+  third-party ABI; see [Dynamic linking](DYNAMIC_LINKING.md).
+
+These suffixes do not replace standard formats outside the native program loader.
+WebAssembly components remain `.wasm`, UEFI applications remain `.efi`, and bootable
+media remain `.iso` or `.img`. Data and media extensions are hints to applications,
+which validate or sniff the file contents. The current `init.pkg` and `volume.pkg`
+files are internal `PKGARCH1` boot archives described below; no filename suffix has
+yet been chosen for a future installable application package.
+
 ## 1. The program ELF contract
 
 Every userspace program (services, drivers, tools) is a freestanding
