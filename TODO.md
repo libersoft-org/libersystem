@@ -2876,6 +2876,117 @@ noise.
   16/16, including exact `vol://...lsexe` execution, extensionless-path rejection,
   canonical package inventory and the lone `ping.lsexe.lsexe` three-way contract.
 
+## M126 - Image conversion tool (`imgconv`)
+
+Status: PLANNED.
+
+The next console application after `imgview` and `play`: `imgconv <input> <output>`
+converts every image format LiberSystem supports without gaining display, input or
+device authority. Input is identified by bounded content sniffing; the output codec is
+selected from the destination suffix (`.jpg` and `.jpeg` are aliases) or an explicit
+`--format`. The tool receives only `volumes`, so source and destination may live on
+different mounted volumes. The implementation preserves the atomized M123 model: one
+codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image crate.
+
+- [ ] Canonical conversion model before more codecs: extend `pix` (or add one small
+  dependency-free image-vocabulary leaf if keeping display pixels separate is
+  cleaner) with a bounded owned RGBA8 image and an animation sequence carrying
+  per-frame duration, canvas size, blend/disposal mode and loop count. Decoders must
+  retain straight alpha; display conversion/premultiplication happens only when
+  `imgview` renders. This replaces the current conversion-hostile behavior where PNG
+  transparency is blended against black into B8G8R8X8 and cannot be recovered.
+  Every dimension, pitch, frame count, cumulative animation pixels and duration is
+  checked before allocation. `imgview` migrates to the same decoded model without
+  changing its visible fit/pan behavior.
+- [ ] Complete decode + encode leaf matrix. Existing `bmp` and `png` gain encoders;
+  implement the already accepted M123 leaves for PPM, QOI, TGA, PCX, ICO, APNG,
+  ICNS, GIF, baseline JPEG and WebP. `imgconv` supports all of them as both source
+  and destination where the format has a writable representation:
+  - BMP: indexed/direct output, uncompressed or RLE where legal;
+  - PNG: grayscale/RGB/RGBA/indexed lossless output with filter selection and a
+    separate bounded `deflate` compressor leaf (the existing `inflate` remains a
+    decoder, not a mixed compressor/decompressor module);
+  - PPM: P6 binary RGB output (P3 may be accepted as input, never emitted by
+    default); QOI: RGB/RGBA; TGA: raw/RLE true-color; PCX: indexed/RGB RLE;
+  - ICO: BMP- or PNG-backed icon entries; ICNS: supported classic entries plus
+    modern PNG-backed entries, while embedded JPEG 2000 remains typed Unsupported;
+  - APNG and GIF: full frame timing, loop, blend/disposal and animation output;
+  - JPEG: baseline sequential decode/encode with grayscale and YCbCr output;
+    progressive input/output remains typed Unsupported until its scan machinery is
+    implemented rather than partially decoded;
+  - WebP: static and animated lossless plus lossy VP8 decode/encode. AVIF, JPEG XL
+    and HEIC retain the M123 rejection/defer decisions and are not hidden aliases.
+  Shared palette quantization and dithering live in one reusable leaf used by
+  GIF/indexed PNG/PCX/BMP rather than four format-local implementations.
+- [ ] Exact CLI and option semantics, parsed by shared host-tested helpers:
+  `imgconv [options] <input> <output>`. `--format <name>` overrides only output
+  suffix selection; an unknown or mismatched suffix is an error. `--force` permits
+  replacement, otherwise an existing destination is refused. `--resize WxH` is an
+  optional exact resize with `--filter nearest|bilinear`; no resize preserves source
+  dimensions. Static output from animated input requires explicit `--frame N` so the
+  tool never silently drops animation; animated destinations preserve all frames by
+  default, and a static source becomes one frame. `--loop N` may override a writable
+  animation loop count. Version one preserves pixels, alpha and animation timing but
+  deliberately strips EXIF/ICC/XMP/text metadata; this is printed in the compact
+  result and documented, rather than pretending metadata round-trips.
+- [ ] Format controls are normalized but never ambiguously overloaded:
+  `--quality 0..100` controls lossy fidelity (0 = smallest/lowest fidelity, 100 =
+  highest fidelity) for JPEG and lossy WebP, and palette quantization fidelity for
+  GIF/indexed outputs. `--compression 0..100` controls lossless encoder effort
+  (0 = fastest/largest, 100 = slowest/smallest, identical decoded pixels) for PNG
+  and APNG; containers embedding PNG inherit that setting. WebP accepts compression
+  effort in both modes: in lossy mode `--quality` controls fidelity while
+  `--compression` independently controls search effort; in lossless mode only
+  compression effort applies and decoded pixels remain identical.
+  `--lossless` / `--lossy` selects the WebP mode; WebP defaults to lossless so a
+  plain conversion does not unexpectedly damage pixels. JPEG is always lossy and
+  rejects `--lossless`; inherently lossless formats reject `--lossy`; formats with
+  fixed compression reject `--compression`; options that do not apply to the chosen
+  encoder fail before opening the output. Defaults and each accepted/rejected option
+  are represented by one data-driven format-capability table shared by parser, help
+  text and tests, so behavior cannot drift by codec.
+- [ ] Bounded, failure-safe output path: decode and transform under checked image/frame
+  budgets, compute every row/table/chunk size with checked arithmetic, cap encoded
+  output relative to the validated source model, and propagate allocation failures as
+  typed errors. Encoders write deterministic bytes for the same input/options. The
+  destination is not exposed as a successful file until encoding and final checksum/
+  trailer validation complete; on failure, interruption or out-of-space, remove the
+  incomplete output and leave an existing file untouched. Converting a path onto
+  itself requires `--force` and still decodes the original before replacement.
+- [ ] Governed `imgconv.lsexe`: register the tool in the manifest and shell completion
+  with exactly `volumes`, add dependencies only on the selected codec leaves and
+  shared conversion helpers, print one compact result line (source format/dimensions,
+  destination format/dimensions, mode/quality/compression and byte size), and return a
+  distinct failure for invalid options, unsupported codec/profile, corrupt input,
+  destination conflict and storage failure. No DisplayService or InputService grant
+  is needed; `imgview` remains the separate inspection tool.
+- [ ] Conformance, hostile-input and option tests: lossless format round-trips compare
+  exact RGBA frames/timing; lossy JPEG/WebP vectors compare dimensions plus bounded
+  PSNR/error thresholds and deterministic hashes; compression 0 and 100 must decode
+  identically while exercising different encoder effort; quality endpoints must meet
+  explicit fidelity floors. Cover alpha, grayscale, indexed palettes, odd dimensions,
+  animation disposal/blend, ICO/ICNS multi-entry selection, truncation, corrupt
+  checksums/tables, oversized geometry/frame counts and deterministic mutations.
+  Every rejected format-option combination in the capability table has a test.
+- [ ] End-to-end and performance gates: a kernel scenario launches governed `imgconv`
+  through PermissionManager, reads a staged image from StorageService, writes at least
+  one lossless and one lossy destination, reopens both and decodes them independently,
+  then launches `imgview` on a converted result. Test cross-volume conversion,
+  destination conflict, cleanup after failure and canonical `imgconv.lsexe` identity.
+  `just image-bench` records encode/decode throughput, peak memory and output size for
+  quality/compression endpoints; common desktop-sized fixtures must finish within a
+  documented budget. Full userspace/package builds remain green on x86_64, aarch64
+  and riscv64, with focused x86 storage/process/service/display integration green.
+- Done when: `imgconv` converts every implemented M126 format through the same RGBA/frame
+  model, WebP can explicitly choose lossless or lossy, applicable encoders honor
+  validated 0..100 quality/compression controls, alpha and animation are never dropped
+  implicitly, unsupported options/profiles fail before output mutation, incomplete
+  files are cleaned up, converted files reopen in independent decoders and `imgview`,
+  and host + targeted kernel + tri-architecture build/performance gates are green.
+- Concept: M121/M122 (pixel/surface vocabulary and the first image consumer), M123
+  (one codec per `.lslib` leaf), M125 (canonical `imgconv.lsexe` artifact), the
+  capability rule (`volumes` only), and the NOTES image-conversion-tool item.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
