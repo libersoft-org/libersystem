@@ -1,0 +1,10 @@
+[package]
+name = "wavpack"
+edition = "2024"
+description = "Bounded WavPack lossless stream decoder"
+
+[dependencies]
+pcm = { path = "../pcm" }
+
+[dev-dependencies]
+wav = { path = "../wav" }

@@ -108,6 +108,7 @@ dependencies = [
  "rt",
  "surface",
  "wav",
+ "wavpack",
 ]
 
 [[package]]
@@ -115,5 +116,12 @@ name = "wav"
 version = "0.0.0"
 dependencies = [
  "adpcm",
+ "pcm",
+]
+
+[[package]]
+name = "wavpack"
+version = "0.0.0"
+dependencies = [
  "pcm",
 ]

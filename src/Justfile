@@ -21,6 +21,7 @@ flac_dir := "user/flac"
 mp3_dir := "user/mp3"
 ogg_dir := "user/ogg"
 wav_dir := "user/wav"
+wavpack_dir := "user/wavpack"
 abi_dir := "abi"
 tools_dir := "tools/lsidl-gen"
 proto_dir := "proto"
@@ -42,13 +43,13 @@ default: run
 
 # build the first system-image shared-object pilot
 shared-libs:
-	tools/build-shared.sh x86_64-unknown-none lsrt=rt proto=proto pix=pix inflate=inflate bmp=bmp png=png keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg wav=wav
+	tools/build-shared.sh x86_64-unknown-none lsrt=rt proto=proto pix=pix inflate=inflate bmp=bmp png=png keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg wav=wav wavpack=wavpack
 
 shared-libs-aarch64:
-	tools/build-shared.sh aarch64-unknown-none lsrt=rt proto=proto pix=pix inflate=inflate bmp=bmp png=png keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg wav=wav
+	tools/build-shared.sh aarch64-unknown-none lsrt=rt proto=proto pix=pix inflate=inflate bmp=bmp png=png keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg wav=wav wavpack=wavpack
 
 shared-libs-riscv64:
-	tools/build-shared.sh riscv64gc-unknown-none-elf lsrt=rt proto=proto pix=pix inflate=inflate bmp=bmp png=png keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg wav=wav
+	tools/build-shared.sh riscv64gc-unknown-none-elf lsrt=rt proto=proto pix=pix inflate=inflate bmp=bmp png=png keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg wav=wav wavpack=wavpack
 
 # build the userspace programs that make up the init package
 user: shared-libs
@@ -272,6 +273,7 @@ app-libs-test:
 	cargo test --manifest-path {{mp3_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 	cargo test --manifest-path {{ogg_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 	cargo test --manifest-path {{wav_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{wavpack_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 
 # format all code (Rust via rustfmt, shell via shfmt)
 fmt:
@@ -290,6 +292,7 @@ fmt:
 	cd {{mp3_dir}} && cargo fmt
 	cd {{ogg_dir}} && cargo fmt
 	cd {{wav_dir}} && cargo fmt
+	cd {{wavpack_dir}} && cargo fmt
 	cd {{kernel_dir}} && cargo fmt
 	cd {{user_dir}} && cargo fmt
 	cd {{services_dir}} && cargo fmt
@@ -327,6 +330,7 @@ fmt-check:
 	cd {{mp3_dir}} && cargo fmt --check
 	cd {{ogg_dir}} && cargo fmt --check
 	cd {{wav_dir}} && cargo fmt --check
+	cd {{wavpack_dir}} && cargo fmt --check
 	cd {{kernel_dir}} && cargo fmt --check
 	cd {{user_dir}} && cargo fmt --check
 	cd {{services_dir}} && cargo fmt --check

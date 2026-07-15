@@ -92,6 +92,7 @@ library   flac                  flac   volume
 library   mp3                   mp3    volume
 library   ogg                   ogg    volume
 library   wav                   wav    volume
+library   wavpack               wavpack volume
 dynamic   dyn_probe             dyn_probe volume
 
 # command-line tools - loaded from the system volume under bin/.

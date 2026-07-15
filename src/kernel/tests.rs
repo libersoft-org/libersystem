@@ -613,6 +613,8 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 		(5u32, &b"vol://system/sample.aiff"[..], 1u8, 1_024u64),
 		(6u32, &b"vol://system/sample.aifc"[..], 1u8, 1_024u64),
 		(7u32, &b"vol://system/sample.flac"[..], 2u8, 2_048u64),
+		(8u32, &b"vol://system/sample.wv"[..], 1u8, 1_024u64),
+		(9u32, &b"vol://system/sample-stereo.wv"[..], 2u8, 2_048u64),
 	] {
 		let (audio_server, audio_client) = Channel::create();
 		admin_reply(&audio_admin_server, audio_client, 0)?;
@@ -670,7 +672,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let (mp3_output, mp3_stdout) = Channel::create();
 	let mut mp3_run = alloc::vec::Vec::new();
 	mp3_run.extend_from_slice(&3u16.to_le_bytes());
-	mp3_run.extend_from_slice(&8u32.to_le_bytes());
+	mp3_run.extend_from_slice(&10u32.to_le_bytes());
 	for value in [&b"play"[..], &b"vol://system/sample.mp3"[..], &b"vol://system"[..]] {
 		mp3_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
 		mp3_run.extend_from_slice(value);

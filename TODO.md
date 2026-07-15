@@ -2712,14 +2712,29 @@ growing "libaudio" monolith.
   parses AIFF and AIFC PCM, including big-endian samples and bounded extended
   sample-rate metadata. Container and codec boundaries remain explicit rather
   than accumulating unrelated decoders in `wav`.
-- [ ] Lossless compressed leaves: `flac` implements native FLAC metadata and
+- [x] Lossless compressed leaves: `flac` implements native FLAC metadata and
   frame/subframe decode, fixed/LPC prediction, Rice residuals and CRC;
-  `libwavpack` implements bounded WavPack lossless stream and block decoding.
+  `wavpack` implements bounded WavPack lossless stream and block decoding.
   Both are no_std parsers over a bounded reader and emit `pcm` source frames;
   neither allocates the whole file or input-controlled unbounded tables.
+  - Result (2026-07-15): the prefix-free `wavpack` leaf validates versioned
+    `wvpk` headers, checked word-sized metadata (including large/odd items),
+    exact APEv2 trailers and contiguous multi-block sample indexes. Its integer
+    entropy reader, adaptive decorrelation terms/weights/history, joint-stereo
+    reconstruction and per-block CRC stream mono, true-stereo and false-stereo
+    PCM in bounded chunks; hybrid, float, extended-integer and multichannel
+    profiles fail typed as unsupported. Seven host tests pin mono/stereo
+    bit-exact output, a 10-second two-block sample-count + hash golden,
+    second-block corruption, truncation and 256 deterministic mutations. The
+    governed `play` path sniffs `wvpk`, transfers non-silent PCM through its
+    scoped AudioService stream and closes it for both mono and true-stereo
+    fixtures. The complete app-library suite and focused x86
+    audio/process/service/storage selection (54/54) are green; aarch64 and
+    riscv64 build the full userspace/package graph, and the final x86
+    `wavpack.lslib` is 18,400 bytes with only `pcm.lslib` + `lsrt.lslib` edges.
 - [ ] Common lossy leaves: `mp3` implements MPEG-1/2 Layer III, including
   bounded ID3 skip/metadata handling; `ogg` handles only Ogg page/packet
-  framing and `libvorbis` depends on it for Vorbis codebook, floor, residue and
+  framing and `vorbis` depends on it for Vorbis codebook, floor, residue and
   MDCT decode. Each unsupported profile or version fails with a typed error,
   never a partial misdecode. Opus, AAC and other codecs are outside M124.
 - [ ] Hostile-input discipline and conformance: every chunk length, sample rate,

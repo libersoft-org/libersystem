@@ -129,7 +129,7 @@ for spec in "$@"; do
 	surface)
 		link_deps=("$(library_file proto)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
-	aiff | flac)
+	aiff | flac | wavpack)
 		link_deps=("$(library_file pcm)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	mp3)
