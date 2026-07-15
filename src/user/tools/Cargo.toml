@@ -220,6 +220,7 @@ surface = { path = "../surface" }
 aiff = { path = "../aiff" }
 flac = { path = "../flac" }
 mp3 = { path = "../mp3" }
+vorbis = { path = "../vorbis" }
 wav = { path = "../wav" }
 wavpack = { path = "../wavpack" }
 

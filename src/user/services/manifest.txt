@@ -91,6 +91,7 @@ library   aiff                  aiff   volume
 library   flac                  flac   volume
 library   mp3                   mp3    volume
 library   ogg                   ogg    volume
+library   vorbis                vorbis volume
 library   wav                   wav    volume
 library   wavpack               wavpack volume
 dynamic   dyn_probe             dyn_probe volume

@@ -2732,19 +2732,32 @@ growing "libaudio" monolith.
     audio/process/service/storage selection (54/54) are green; aarch64 and
     riscv64 build the full userspace/package graph, and the final x86
     `wavpack.lslib` is 18,400 bytes with only `pcm.lslib` + `lsrt.lslib` edges.
-- [ ] Common lossy leaves: `mp3` implements MPEG-1/2 Layer III, including
+- [x] Common lossy leaves: `mp3` implements MPEG-1/2 Layer III, including
   bounded ID3 skip/metadata handling; `ogg` handles only Ogg page/packet
   framing and `vorbis` depends on it for Vorbis codebook, floor, residue and
   MDCT decode. Each unsupported profile or version fails with a typed error,
   never a partial misdecode. Opus, AAC and other codecs are outside M124.
-- [ ] Hostile-input discipline and conformance: every chunk length, sample rate,
+  - Result (2026-07-15): the prefix-free `vorbis` leaf is a narrowly audited
+    no_std packet-decoder fork of Lewton's MIT/Apache-licensed core, with Ogg,
+    async, C API and examples excluded. LiberSystem's bounded `ogg` leaf owns
+    page/packet CRC, sequence, continuation and granule framing; `vorbis` owns
+    identification/comment/setup headers, Huffman/codebook, floor 0/1, residue,
+    coupling, IMDCT, overlap and final-granule trimming, and emits the shared
+    `pcm` format. Thirty-two host tests include retained core vectors, malformed
+    headers/CRC/truncation, chunked reads and a full 256-frame FFmpeg PCM golden
+    with at most one i16 quantization step of float-decoder variance. Governed
+    `play` streams the staged Ogg fixture through AudioService and closes it;
+    the complete app-library suite and focused x86 selection (54/54) are green,
+    both cross-userspace builds pass, and x86 `vorbis.lslib` is 258,672 bytes
+    with only `ogg.lslib` + `pcm.lslib` + `lsrt.lslib` runtime edges.
+- [x] Hostile-input discipline and conformance: every chunk length, sample rate,
   channel count, frame size, seek offset, codebook/table count and output-frame
   multiplication is checked before allocation or indexing; host suites use
   public conformance/golden vectors plus truncated, corrupt, oversized and
   randomized fixtures. Decoder output is compared by sample count + hash (and
   exact samples where the format guarantees bit-exact decode); a malformed file
   errors cleanly, never panics, hangs or OOMs.
-- [ ] The governed `play` tool: `play <vol://...>` receives exactly
+- [x] The governed `play` tool: `play <vol://...>` receives exactly
   `volumes + audio-stream`, sniffs by content (extension is only a hint), opens
   the appropriate decoder, streams bounded chunks with AudioService
   backpressure, prints compact metadata/progress, and exits cleanly at EOF or

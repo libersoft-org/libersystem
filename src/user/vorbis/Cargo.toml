@@ -1,0 +1,11 @@
+[package]
+name = "vorbis"
+edition = "2024"
+description = "Bounded no_std Vorbis packet decoder over the LiberSystem Ogg framer"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+libm = "0.2"
+ogg = { path = "../ogg" }
+pcm = { path = "../pcm" }
+tinyvec = { version = "1", default-features = false, features = ["alloc"] }

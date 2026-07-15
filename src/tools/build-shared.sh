@@ -141,6 +141,15 @@ for spec in "$@"; do
 		link_inputs=(--whole-archive "$rlib" "$nanomp3_archive" --no-whole-archive)
 		link_deps=("$(library_file pcm)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
+	vorbis)
+		libm_archive="$(find "$deps" -maxdepth 1 -name 'liblibm-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		if [[ -z "$libm_archive" ]]; then
+			echo "build-shared: missing libm archive for vorbis.lslib" >&2
+			exit 1
+		fi
+		link_inputs=(--whole-archive "$rlib" "$libm_archive" --no-whole-archive)
+		link_deps=("$(library_file ogg)" "$(library_file pcm)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
 	wav)
 		link_deps=("$(library_file adpcm)" "$(library_file pcm)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;

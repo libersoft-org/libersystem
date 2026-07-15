@@ -18,6 +18,7 @@ pub enum Error {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Packet {
 	pub data: Vec<u8>,
+	pub page_granule_position: Option<u64>,
 	pub granule_position: Option<u64>,
 	pub bos: bool,
 	pub eos: bool,
@@ -78,8 +79,9 @@ impl<'a> PacketReader<'a> {
 			self.segment_index += 1;
 			if length < 255 {
 				let is_last_complete = self.bytes[self.segments_start + self.segment_index..self.segments_start + self.segment_count].iter().all(|length| *length == 255);
-				let granule_position = if is_last_complete && self.page_granule != u64::MAX { Some(self.page_granule) } else { None };
-				let packet = Packet { data: core::mem::take(&mut self.pending), granule_position, bos: self.packet_index == 0 && self.page_flags & 0x02 != 0, eos: is_last_complete && self.page_flags & 0x04 != 0 };
+				let page_granule_position = (self.page_granule != u64::MAX).then_some(self.page_granule);
+				let granule_position = if is_last_complete { page_granule_position } else { None };
+				let packet = Packet { data: core::mem::take(&mut self.pending), page_granule_position, granule_position, bos: self.packet_index == 0 && self.page_flags & 0x02 != 0, eos: is_last_complete && self.page_flags & 0x04 != 0 };
 				self.packet_index = self.packet_index.checked_add(1).ok_or(Error::TooLarge)?;
 				if packet.eos {
 					if self.segment_index != self.segment_count || self.page_end != self.bytes.len() {
@@ -181,6 +183,7 @@ mod tests {
 		let second = reader.next_packet().unwrap().unwrap();
 		assert_eq!(second.data.len(), 257);
 		assert_eq!(&second.data[255..], b"bc");
+		assert_eq!(second.page_granule_position, Some(123));
 		assert_eq!(second.granule_position, None);
 		let third = reader.next_packet().unwrap().unwrap();
 		assert_eq!(third.data, b"!");

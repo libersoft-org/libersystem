@@ -16,8 +16,9 @@ use alloc::vec::Vec;
 use flac::Flac;
 use mp3::Mp3;
 use proto::path;
-use proto::system::{OpenOpts, audio, pcm_stream, volume};
+use proto::system::{audio, pcm_stream, volume, OpenOpts};
 use rt::*;
+use vorbis::Vorbis;
 use wav::Wav;
 use wavpack::WavPack;
 
@@ -132,6 +133,11 @@ unsafe fn play_audio(audio_channel: u64, bytes: &[u8]) -> Result<(), ()> {
 		let metadata = wavpack.metadata();
 		return unsafe { play_decoded(audio_channel, "WavPack", metadata.rate, metadata.channels, metadata.frames, wavpack.decoder()) };
 	}
+	if bytes.starts_with(b"OggS") {
+		let vorbis = Vorbis::parse(bytes).map_err(|_| ())?;
+		let metadata = vorbis.metadata();
+		return unsafe { play_decoded(audio_channel, "Ogg Vorbis", metadata.rate, metadata.channels, metadata.frames, vorbis.decoder()) };
+	}
 	if bytes.starts_with(b"ID3") || bytes.first() == Some(&0xff) && bytes.get(1).is_some_and(|byte| byte & 0xe0 == 0xe0) {
 		let mp3 = Mp3::parse(bytes).map_err(|_| ())?;
 		let metadata = mp3.metadata();
@@ -186,6 +192,16 @@ impl PcmDecoder for mp3::Decoder<'_> {
 }
 
 impl PcmDecoder for wavpack::Decoder<'_> {
+	fn remaining_frames(&self) -> u64 {
+		self.remaining_frames()
+	}
+
+	fn read_i16_le(&mut self, max_frames: usize, output: &mut Vec<u8>) -> Result<usize, ()> {
+		self.read_i16_le(max_frames, output).map_err(|_| ())
+	}
+}
+
+impl PcmDecoder for vorbis::Decoder<'_> {
 	fn remaining_frames(&self) -> u64 {
 		self.remaining_frames()
 	}

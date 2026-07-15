@@ -615,6 +615,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 		(7u32, &b"vol://system/sample.flac"[..], 2u8, 2_048u64),
 		(8u32, &b"vol://system/sample.wv"[..], 1u8, 1_024u64),
 		(9u32, &b"vol://system/sample-stereo.wv"[..], 2u8, 2_048u64),
+		(10u32, &b"vol://system/sample.ogg"[..], 1u8, 512u64),
 	] {
 		let (audio_server, audio_client) = Channel::create();
 		admin_reply(&audio_admin_server, audio_client, 0)?;
@@ -655,7 +656,8 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 			return Err("audio play decoded silence");
 		}
 		let write_corr = le_u32(&write.bytes, 2);
-		stream_server.send(Message::new([write_corr.to_le_bytes().as_slice(), &[1], &512u32.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "audio PCM reply failed")?;
+		let accepted_frames = (pcm_bytes / channels as u64 / 2) as u32;
+		stream_server.send(Message::new([write_corr.to_le_bytes().as_slice(), &[1], &accepted_frames.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "audio PCM reply failed")?;
 		sched::run_until_idle();
 		let close_request = stream_server.recv().map_err(|_| "audio play did not close")?;
 		let close_corr = le_u32(&close_request.bytes, 2);
@@ -672,7 +674,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let (mp3_output, mp3_stdout) = Channel::create();
 	let mut mp3_run = alloc::vec::Vec::new();
 	mp3_run.extend_from_slice(&3u16.to_le_bytes());
-	mp3_run.extend_from_slice(&10u32.to_le_bytes());
+	mp3_run.extend_from_slice(&11u32.to_le_bytes());
 	for value in [&b"play"[..], &b"vol://system/sample.mp3"[..], &b"vol://system"[..]] {
 		mp3_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
 		mp3_run.extend_from_slice(value);
