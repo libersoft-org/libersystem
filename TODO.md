@@ -2622,35 +2622,35 @@ profile alone recovers most of the size, parts of this can wait.
 - [x] The library set, atomized - one library, one concern, with real
       dependencies between them, so an app links exactly what it uses and new
       formats arrive as new leaves instead of growing a monolith:
-      `liblsrt` (the userspace runtime every binary carries - entry, syscalls,
+      `lsrt.lslib` (the userspace runtime every binary carries - entry, syscalls,
       allocator, channels, serve loops, formatting; the root of the graph);
-      `libproto` (the generated LSIDL codecs and clients - the single biggest
-      duplicated blob; depends on liblsrt); `libpix` (the shared pixel/image
+      `proto.lslib` (the generated LSIDL codecs and clients - the single biggest
+      duplicated blob; depends on lsrt.lslib); `pix.lslib` (the shared pixel/image
       VOCABULARY - pixel formats, an image descriptor, convert/blit helpers -
       so decoders and display consumers interoperate without depending on each
-      other); `libinflate` (DEFLATE decompression alone - what PNG needs today
-      and gzip/zip need later); one library PER image format - first `libbmp`
-      (depends on libpix) and `libpng` (depends on libpix + libinflate), the
+      other); `inflate.lslib` (DEFLATE decompression alone - what PNG needs today
+      and gzip/zip need later); one library PER image format - first `bmp.lslib`
+      (depends on pix.lslib) and `png.lslib` (depends on pix.lslib + inflate.lslib), the
       M122 pair; agreed further leaves (2026-07-14), in rough cost order:
-      `libppm` + `libqoi` (trivial, good test/internal formats), `libtga` +
-      `libpcx` (trivial RLE + palettes), `libico` (a container over
-      libbmp/libpng - near-free reuse), `libapng` (a small fcTL/fdAT extension
-      of libpng - animation frames), `libicns` (modern PNG-based icons via
-      libpng; the legacy RLE variants; embedded JPEG 2000 refused with a typed
-      error - that codec is out), `libgif`
-      (LZW + palettes; animation frames come free), `libjpeg` (baseline
+      `ppm.lslib` + `qoi.lslib` (trivial, good test/internal formats), `tga.lslib` +
+      `pcx.lslib` (trivial RLE + palettes), `ico.lslib` (a container over
+      bmp.lslib/png.lslib - near-free reuse), `apng.lslib` (a small fcTL/fdAT extension
+      of png.lslib - animation frames), `icns.lslib` (modern PNG-based icons via
+      png.lslib; the legacy RLE variants; embedded JPEG 2000 refused with a typed
+      error - that codec is out), `gif.lslib`
+      (LZW + palettes; animation frames come free), `jpeg.lslib` (baseline
       ITU T.81, ~2-3k lines - Huffman, IDCT, YCbCr; progressive scans refused
-      with a typed error until implemented), `libwebp` (lossless + lossy VP8,
+      with a typed error until implemented), `webp.lslib` (lossless + lossy VP8,
       ~11-15k lines total, the largest accepted leaf). Rejected by decision:
       AVIF and JPEG XL (open but each a video-codec-class decoder, ~40-100k
       lines - wait for a concrete need), HEIC (patent-encumbered - never);
-      `libsurface` (display-client
-      helpers: acquire/present, damage, scaling; depends on libproto + libpix);
-      `libkeys` (key-event decoding and, later, the keycode-to-glyph layout
-      tables; depends on libproto); `libpcm` (PCM chunking/mixing helpers;
+      `surface.lslib` (display-client
+      helpers: acquire/present, damage, scaling; depends on proto.lslib + pix.lslib);
+      `keys.lslib` (key-event decoding and, later, the keycode-to-glyph layout
+      tables; depends on proto.lslib); `pcm.lslib` (PCM chunking/mixing helpers;
       a pure sample-format leaf with no service/proto dependency). Example:
-      `imgview` links liblsrt + libproto + libpix +
-      libbmp + libpng + libsurface + libkeys and nothing else. Staged into the
+      `imgview` links lsrt.lslib + proto.lslib + pix.lslib +
+      bmp.lslib + png.lslib + surface.lslib + keys.lslib and nothing else. Staged into the
       system image next to the binaries.
 - [x] Conversion + measurement: convert the existing tools and services to
       link the libraries dynamically, and record before/after numbers
@@ -2658,7 +2658,7 @@ profile alone recovers most of the size, parts of this can wait.
       across N concurrent processes) in docs/PERF.md - the numbers, not the
       ideology, decide how far the conversion goes and whether small
       single-purpose tools stay static.
-- Done when: at least the staged tools link `liblsrt` + `libproto`
+- Done when: at least the staged tools link `lsrt.lslib` + `proto.lslib`
       dynamically on all three architectures, library text is verifiably
       shared between two concurrent processes, a corrupt library cannot panic
       the loader, and the measured size/startup deltas are recorded in
@@ -2680,12 +2680,13 @@ three architectures, rejects W+X/text relocations/unresolved strong symbols, and
 rolls failed loads back before a thread can start. Exact immutable pages are cached
 by content and mapped read-only into every consumer; RW/BSS/GOT remain private.
 
-The staged graph contains `liblsrt`, `libproto`, `libpix`, extracted `libinflate`,
-`libbmp`, `libpng`, `libkeys`, `libpcm` and `libsurface`, with strict real dependency
+The staged graph contains `lsrt.lslib`, `proto.lslib`, `pix.lslib`, extracted
+`inflate.lslib`, `bmp.lslib`, `png.lslib`, `keys.lslib`, `pcm.lslib` and
+`surface.lslib`, with strict real dependency
 edges, plus a 2.6 KiB ET_DYN probe. The probe is built on x86_64/aarch64/riscv64;
 on x86 it launches through real StorageService + ProcessService, loads
-liblsrt/libproto/libpix, calls both shared exports and reports from userspace. Two
-concurrent launches map the same physical liblsrt text frame: 32 private pages plus
+lsrt.lslib/proto.lslib/pix.lslib, calls both shared exports and reports from userspace. Two
+concurrent launches map the same physical lsrt.lslib text frame: 32 private pages plus
 149 unique shared pages instead of 330 unshared pages (610,304 B saved at N=2).
 Host ELF parser tests are 6/6; focused x86 memory/process is 37/37 and
 service/process/storage is 52/52. Both TCG targets build the full test image but retain

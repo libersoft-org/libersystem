@@ -80,7 +80,7 @@ The profile win is already two orders of magnitude, so a stripped/release staged
 profile should be measured before paying the loader/ABI cost of dynamic linking. Later
 shared-library work still measures aggregate image and resident-memory sharing: static release binaries may
 remain the better choice for small tools, while duplicated runtime/protocol text across
-many concurrent processes can still justify `liblsrt`/`libproto` sharing.
+many concurrent processes can still justify `lsrt.lslib`/`proto.lslib` sharing.
 
 ## System-image dynamic linking (2026-07-14)
 
@@ -89,7 +89,7 @@ Rust targets support neither Cargo `dylib` nor `cdylib`, so the reproducible bui
 full-graph PIC rlibs and links their object members with the pinned `rust-lld -shared`.
 The x86 KVM integration launches an assembly-only staged `dyn_probe` through the real
 StorageService and ProcessService. ProcessService reads its `DT_NEEDED` DAG
-(`libpix.so`, `libproto.so`, `liblsrt.so`), the kernel eagerly applies RELA/PLT symbol
+(`pix.lslib`, `proto.lslib`, `lsrt.lslib`), the kernel eagerly applies RELA/PLT symbol
 relocations, and the probe calls exports from both leaf providers before its first IPC.
 
 Cold start is measured from sending the ProcessService `launch` request to receiving
@@ -117,11 +117,12 @@ $$
 $$
 
 The measured saving at $N=2$ is 149 pages, or 610,304 bytes. The test additionally
-compares the two processes' first `liblsrt` text mappings and requires the exact same
+compares the two processes' first `lsrt.lslib` text mappings and requires the exact same
 physical frame. RW relocation targets remain private and text relocations are rejected.
 
-The complete first shared graph is atomized as `liblsrt`, `libproto`, `libpix`,
-`libinflate`, `libbmp`, `libpng`, `libkeys`, `libpcm`, and `libsurface`. Raw x86 release
+The complete first shared graph is atomized as `lsrt.lslib`, `proto.lslib`, `pix.lslib`,
+`inflate.lslib`, `bmp.lslib`, `png.lslib`, `keys.lslib`, `pcm.lslib`, and
+`surface.lslib`. Raw x86 release
 objects plus the probe total 799,648 bytes. After package staging strips non-runtime
 symbols, their payload is 644,904 bytes plus 320 bytes of archive entries; the factory
 `volume.pkg` is 12,193,577 bytes versus a computed 11,548,353-byte image with those
@@ -129,15 +130,15 @@ entries removed.
 
 | x86 shared artifact | raw release ELF |
 | --- | ---: |
-| `liblsrt.so` | 414,920 B |
-| `libproto.so` | 317,200 B |
-| `libpix.so` | 7,552 B |
-| `libinflate.so` | 14,008 B |
-| `libbmp.so` | 10,224 B |
-| `libpng.so` | 13,952 B |
-| `libkeys.so` | 5,264 B |
-| `libpcm.so` | 4,080 B |
-| `libsurface.so` | 9,872 B |
+| `lsrt.lslib` | 414,920 B |
+| `proto.lslib` | 317,200 B |
+| `pix.lslib` | 7,552 B |
+| `inflate.lslib` | 14,008 B |
+| `bmp.lslib` | 10,224 B |
+| `png.lslib` | 13,952 B |
+| `keys.lslib` | 5,264 B |
+| `pcm.lslib` | 4,080 B |
+| `surface.lslib` | 9,872 B |
 | `dyn_probe` | 2,576 B |
 
 Decision: keep the loader, tri-architecture shared graph, and staged dynamic probe, but

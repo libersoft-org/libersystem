@@ -39,6 +39,8 @@ command -v llvm-strip >/dev/null
 
 out_dir="user/shared/$target"
 mkdir -p "$out_dir"
+# Do not leave the pre-.lslib naming scheme beside the current system image.
+find "$out_dir" -maxdepth 1 -type f -name 'lib*.so' -delete
 
 artifacts=()
 for spec in "$@"; do
@@ -48,6 +50,10 @@ for spec in "$@"; do
 	else
 		artifact="$spec"
 		crate="$spec"
+	fi
+	if [[ ! "$artifact" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ || "$artifact" == lib* ]]; then
+		echo "build-shared: invalid LiberSystem library name '$artifact'" >&2
+		exit 2
 	fi
 	if [[ "$crate" == "proto" ]]; then
 		crate_dir="proto"
@@ -60,7 +66,7 @@ for spec in "$@"; do
 		exit 1
 	fi
 	features=()
-	if [[ "$artifact" == "liblsrt" ]]; then
+	if [[ "$artifact" == "lsrt" ]]; then
 		features=(--no-default-features --features shared-image)
 	fi
 	(cd "$crate_dir" && RUST_MIN_STACK=16777216 RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib "${features[@]}")
@@ -70,24 +76,24 @@ for spec in "$@"; do
 		echo "build-shared: no rlib produced for $crate" >&2
 		exit 1
 	fi
-	out="$out_dir/$artifact.so"
+	out="$out_dir/$artifact.lslib"
 	link_deps=()
 	export_flags=()
 	symbolic_flags=(-Bsymbolic)
 	archives=("$rlib")
 	link_inputs=()
-	if [[ "$artifact" == "liblsrt" ]]; then
+	if [[ "$artifact" == "lsrt" ]]; then
 		symbolic_flags=()
 		archives=()
 		for dependency in core alloc compiler_builtins abi rt; do
 			archive="$(find "$deps" -maxdepth 1 -name "lib${dependency}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 			if [[ -z "$archive" ]]; then
-				echo "build-shared: missing PIC archive $dependency for liblsrt" >&2
+				echo "build-shared: missing PIC archive $dependency for lsrt.lslib" >&2
 				exit 1
 			fi
 			archives+=("$archive")
 		done
-		object_root="$out_dir/.objects-liblsrt"
+		object_root="$out_dir/.objects-lsrt"
 		rm -rf "$object_root"
 		mkdir -p "$object_root"
 		for archive in "${archives[@]}"; do
@@ -103,38 +109,38 @@ for spec in "$@"; do
 		link_inputs=(--whole-archive "${archives[@]}" --no-whole-archive)
 	fi
 	case "$artifact" in
-	libproto | libpix | libinflate | libpcm | libadpcm | libogg)
-		link_deps=(-L "$out_dir" -l:liblsrt.so --no-allow-shlib-undefined)
+	proto | pix | inflate | pcm | adpcm | ogg)
+		link_deps=(-L "$out_dir" -l:lsrt.lslib --no-allow-shlib-undefined)
 		;;
-	libbmp)
-		link_deps=(-L "$out_dir" -l:libpix.so -l:liblsrt.so --no-allow-shlib-undefined)
+	bmp)
+		link_deps=(-L "$out_dir" -l:pix.lslib -l:lsrt.lslib --no-allow-shlib-undefined)
 		;;
-	libpng)
-		link_deps=(-L "$out_dir" -l:libpix.so -l:libinflate.so -l:liblsrt.so --no-allow-shlib-undefined)
+	png)
+		link_deps=(-L "$out_dir" -l:pix.lslib -l:inflate.lslib -l:lsrt.lslib --no-allow-shlib-undefined)
 		;;
-	libkeys)
-		link_deps=(-L "$out_dir" -l:libproto.so -l:liblsrt.so --no-allow-shlib-undefined)
+	keys)
+		link_deps=(-L "$out_dir" -l:proto.lslib -l:lsrt.lslib --no-allow-shlib-undefined)
 		;;
-	libsurface)
-		link_deps=(-L "$out_dir" -l:libproto.so -l:libpix.so -l:liblsrt.so --no-allow-shlib-undefined)
+	surface)
+		link_deps=(-L "$out_dir" -l:proto.lslib -l:pix.lslib -l:lsrt.lslib --no-allow-shlib-undefined)
 		;;
-	libaiff | libflac)
-		link_deps=(-L "$out_dir" -l:libpcm.so -l:liblsrt.so --no-allow-shlib-undefined)
+	aiff | flac)
+		link_deps=(-L "$out_dir" -l:pcm.lslib -l:lsrt.lslib --no-allow-shlib-undefined)
 		;;
-	libmp3)
+	mp3)
 		nanomp3_archive="$(find "$deps" -maxdepth 1 -name 'libnanomp3-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 		if [[ -z "$nanomp3_archive" ]]; then
-			echo "build-shared: missing nanomp3 archive for libmp3" >&2
+			echo "build-shared: missing nanomp3 archive for mp3.lslib" >&2
 			exit 1
 		fi
 		link_inputs=(--whole-archive "$rlib" "$nanomp3_archive" --no-whole-archive)
-		link_deps=(-L "$out_dir" -l:libpcm.so -l:liblsrt.so --no-allow-shlib-undefined)
+		link_deps=(-L "$out_dir" -l:pcm.lslib -l:lsrt.lslib --no-allow-shlib-undefined)
 		;;
-	libwav)
-		link_deps=(-L "$out_dir" -l:libadpcm.so -l:libpcm.so -l:liblsrt.so --no-allow-shlib-undefined)
+	wav)
+		link_deps=(-L "$out_dir" -l:adpcm.lslib -l:pcm.lslib -l:lsrt.lslib --no-allow-shlib-undefined)
 		;;
 	esac
-	"$lld" -flavor gnu -m "$emulation" -shared --hash-style=sysv "${symbolic_flags[@]}" --gc-sections "${export_flags[@]}" "${link_inputs[@]}" "${link_deps[@]}" -soname "$artifact.so" -o "$out"
+	"$lld" -flavor gnu -m "$emulation" -shared --hash-style=sysv "${symbolic_flags[@]}" --gc-sections "${export_flags[@]}" "${link_inputs[@]}" "${link_deps[@]}" -soname "$artifact.lslib" -o "$out"
 	llvm-strip --strip-debug "$out"
 	if ! llvm-readelf -h "$out" | grep -q 'Type:.*DYN'; then
 		echo "build-shared: $out is not ET_DYN" >&2
@@ -150,15 +156,15 @@ for spec in "$@"; do
 	artifacts+=("$artifact")
 done
 
-if printf '%s\n' "${artifacts[@]}" | grep -qx libpix; then
+if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	probe="user/dyn_probe"
 	(cd "$probe" && RUST_MIN_STACK=16777216 RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
 	probe_rlib="$(find "$probe/target/$target/release/deps" -maxdepth 1 -name 'libdyn_probe-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 	probe_out="$out_dir/dyn_probe"
-	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv -e _start --whole-archive "$probe_rlib" --no-whole-archive -L "$out_dir" -l:libpix.so -l:libproto.so -l:liblsrt.so --no-allow-shlib-undefined -o "$probe_out"
+	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv -e _start --whole-archive "$probe_rlib" --no-whole-archive -L "$out_dir" -l:pix.lslib -l:proto.lslib -l:lsrt.lslib --no-allow-shlib-undefined -o "$probe_out"
 	llvm-strip --strip-debug "$probe_out"
-	if ! llvm-readelf -h "$probe_out" | grep -q 'Type:.*DYN' || ! llvm-readelf -d "$probe_out" | grep -q 'NEEDED.*libpix.so'; then
-		echo "build-shared: $probe_out is not a libpix-linked ET_DYN" >&2
+	if ! llvm-readelf -h "$probe_out" | grep -q 'Type:.*DYN' || ! llvm-readelf -d "$probe_out" | grep -q 'NEEDED.*pix.lslib'; then
+		echo "build-shared: $probe_out is not a pix.lslib-linked ET_DYN" >&2
 		exit 1
 	fi
 	echo "build-shared: $probe_out ($(stat -c %s "$probe_out") bytes)"

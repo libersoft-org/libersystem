@@ -152,7 +152,7 @@ fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 }
 
 fn user_shared_path(manifest: &Path, name: &str) -> PathBuf {
-	manifest.join(format!("../user/shared/{}/{}.so", user_target(), name))
+	manifest.join(format!("../user/shared/{}/{}.lslib", user_target(), name))
 }
 
 fn user_dynamic_path(manifest: &Path, name: &str) -> PathBuf {
@@ -307,7 +307,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			"tool" => format!("bin/{}", row.name),
 			"service" | "component" if row.stage == "volume" => format!("bin/{}", row.name),
 			"driver" if row.stage == "volume" => format!("drivers/{}", row.name),
-			"library" if row.stage == "volume" => format!("lib/{}.so", row.name),
+			"library" if row.stage == "volume" => format!("lib/{}.lslib", row.name),
 			"dynamic" if row.stage == "volume" => format!("bin/{}", row.name),
 			_ => continue,
 		};

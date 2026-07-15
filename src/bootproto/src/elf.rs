@@ -588,7 +588,7 @@ mod tests {
 		let table_len = core::mem::size_of::<[ProgramHeader; 2]>();
 		let payload_offset = header_len + table_len;
 		let load_address = 0x6000u64;
-		let strings = b"liblsrt.so\0libproto.so\0";
+		let strings = b"lsrt.lslib\0proto.lslib\0";
 		let dynamic = [
 			DynamicEntry { tag: DT_STRTAB, value: load_address },
 			DynamicEntry { tag: DT_STRSZ, value: strings.len() as u64 },
@@ -606,7 +606,7 @@ mod tests {
 		let bytes = image(ET_DYN, &segments, &payload);
 		let elf = Elf::parse(&bytes).unwrap();
 		let info = elf.dynamic_info().unwrap().unwrap();
-		assert_eq!(elf.needed_names(&info).unwrap().collect::<Vec<_>>(), vec!["liblsrt.so", "libproto.so"]);
+		assert_eq!(elf.needed_names(&info).unwrap().collect::<Vec<_>>(), vec!["lsrt.lslib", "proto.lslib"]);
 
 		let mut bad = bytes;
 		bad[payload_offset + strings.len() - 1] = b'x';

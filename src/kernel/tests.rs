@@ -4316,7 +4316,7 @@ fn process_service_loads_a_program_from_system_bin() {
 	assert_eq!(&b[15..15 + name_len], name, "the reply echoes the launched program name");
 
 	// LAUNCH the ET_DYN probe with a bootstrap channel. ProcessService must resolve
-	// libpix.so -> liblsrt.so from vol://system/lib, load providers first, relocate the
+	// pix.lslib -> lsrt.lslib from vol://system/lib, load providers first, relocate the
 	// probe's PLT call, and only then start it. Wire: op, corr, name, handle marker.
 	let dynamic_name: &[u8] = b"dyn_probe";
 	let (dynamic_report, dynamic_bootstrap) = Channel::create();

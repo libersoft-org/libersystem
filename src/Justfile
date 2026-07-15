@@ -42,13 +42,13 @@ default: run
 
 # build the first system-image shared-object pilot
 shared-libs:
-	tools/build-shared.sh x86_64-unknown-none liblsrt=rt libproto=proto libpix=libpix libinflate=libinflate libbmp=libbmp libpng=libpng libkeys=libkeys libpcm=libpcm libsurface=libsurface libadpcm=libadpcm libaiff=libaiff libflac=libflac libmp3=libmp3 libogg=libogg libwav=libwav
+	tools/build-shared.sh x86_64-unknown-none lsrt=rt proto=proto pix=libpix inflate=libinflate bmp=libbmp png=libpng keys=libkeys pcm=libpcm surface=libsurface adpcm=libadpcm aiff=libaiff flac=libflac mp3=libmp3 ogg=libogg wav=libwav
 
 shared-libs-aarch64:
-	tools/build-shared.sh aarch64-unknown-none liblsrt=rt libproto=proto libpix=libpix libinflate=libinflate libbmp=libbmp libpng=libpng libkeys=libkeys libpcm=libpcm libsurface=libsurface libadpcm=libadpcm libaiff=libaiff libflac=libflac libmp3=libmp3 libogg=libogg libwav=libwav
+	tools/build-shared.sh aarch64-unknown-none lsrt=rt proto=proto pix=libpix inflate=libinflate bmp=libbmp png=libpng keys=libkeys pcm=libpcm surface=libsurface adpcm=libadpcm aiff=libaiff flac=libflac mp3=libmp3 ogg=libogg wav=libwav
 
 shared-libs-riscv64:
-	tools/build-shared.sh riscv64gc-unknown-none-elf liblsrt=rt libproto=proto libpix=libpix libinflate=libinflate libbmp=libbmp libpng=libpng libkeys=libkeys libpcm=libpcm libsurface=libsurface libadpcm=libadpcm libaiff=libaiff libflac=libflac libmp3=libmp3 libogg=libogg libwav=libwav
+	tools/build-shared.sh riscv64gc-unknown-none-elf lsrt=rt proto=proto pix=libpix inflate=libinflate bmp=libbmp png=libpng keys=libkeys pcm=libpcm surface=libsurface adpcm=libadpcm aiff=libaiff flac=libflac mp3=libmp3 ogg=libogg wav=libwav
 
 # build the userspace programs that make up the init package
 user: shared-libs

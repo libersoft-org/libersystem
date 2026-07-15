@@ -139,7 +139,8 @@ impl Resolver {
 }
 
 fn valid_library_name(name: &str) -> bool {
-	name.len() >= 7 && name.len() <= 64 && name.starts_with("lib") && name.ends_with(".so") && !name.contains("..") && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+	let Some(stem) = name.strip_suffix(".lslib") else { return false };
+	!stem.is_empty() && !stem.starts_with("lib") && name.len() <= 64 && stem.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn dependencies(elf: &bootproto::elf::Elf<'_>, dynamic: &bootproto::elf::DynamicInfo) -> Option<Vec<String>> {

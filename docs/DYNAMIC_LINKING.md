@@ -16,6 +16,10 @@ intrinsics may change in the next image without compatibility shims.
 - System libraries live under `vol://system/lib/`. Per-application third-party
   libraries remain part of the phase-3 package format rather than entering the global
   namespace.
+- System-library filenames use the LiberSystem-specific `.lslib` suffix and no Unix
+  `lib` prefix: for example, `png.lslib`, `proto.lslib`, and `lsrt.lslib`. Cargo crate
+  names such as `libpng` remain internal build identifiers and are not installed
+  filenames.
 - Resolution is eager and deterministic. Lazy PLT binding, `LD_PRELOAD`, environment
   search paths, runtime library replacement, symbol interposition, and unload are not
   supported.
@@ -32,11 +36,11 @@ steps:
    target emulation and soname. The output must be ELF64 `ET_DYN` with separate R,
    RX, and RW `PT_LOAD` segments and no W+X segment.
 
-`liblsrt` is linked from the extracted PIC object members of `core`, `alloc`,
+`lsrt.lslib` is linked from the extracted PIC object members of `core`, `alloc`,
 `compiler_builtins`, `abi`, and `rt`; direct object linking preserves the root
 provider's dynamic exports. `rt`'s generated-protocol transport adapter is an optional
-default feature excluded from this root, removing a dependency cycle. `libproto` is the
-only generated-protocol provider and depends on `liblsrt`. Leaf rlibs remain archive
+default feature excluded from this root, removing a dependency cycle. `proto.lslib` is
+the only generated-protocol provider and depends on `lsrt.lslib`. Leaf rlibs remain archive
 linked against their explicit provider set.
 
 Because Cargo cannot consume a Rust dylib on these targets, consumers cross a generated
@@ -54,9 +58,9 @@ that the loader contract recognizes are:
 | aarch64 | `R_AARCH64_RELATIVE` (1027) | `R_AARCH64_GLOB_DAT` (1025), `R_AARCH64_JUMP_SLOT` (1026) |
 | riscv64 | `R_RISCV_RELATIVE` (3) | `R_RISCV_64` (2), `R_RISCV_JUMP_SLOT` (5) |
 
-`liblsrt` is the root symbol provider. In addition to the runtime API it owns compiler
-support exports such as `memcpy`, `memset`, and the pinned core panic paths. `libproto`
-depends on `liblsrt`; higher leaves depend only on their declared lower libraries.
+`lsrt.lslib` is the root symbol provider. In addition to the runtime API it owns compiler
+support exports such as `memcpy`, `memset`, and the pinned core panic paths. `proto.lslib`
+depends on `lsrt.lslib`; higher leaves depend only on their declared lower libraries.
 Cycles are rejected by the image builder and by ProcessService.
 
 ## Ownership split

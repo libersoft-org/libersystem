@@ -75,22 +75,23 @@ driver    xhci                  drivers   volume
 
 # system-image shared libraries - built as PIC rlibs and linked to ET_DYN by
 # tools/build-shared.sh, then staged under lib/. Consumers remain static until the
-# M123 module loader and symbol registry are complete.
-library   liblsrt               rt        volume
-library   libproto              proto     volume
-library   libpix                libpix    volume
-library   libinflate            libinflate volume
-library   libbmp                libbmp    volume
-library   libpng                libpng    volume
-library   libkeys               libkeys   volume
-library   libpcm                libpcm    volume
-library   libsurface            libsurface volume
-library   libadpcm              libadpcm  volume
-library   libaiff               libaiff   volume
-library   libflac               libflac   volume
-library   libmp3                libmp3    volume
-library   libogg                libogg    volume
-library   libwav                libwav    volume
+# M123 module loader and symbol registry are complete. Artifact names omit the Cargo
+# crate's `lib` prefix; the builder and image staging append `.lslib`.
+library   lsrt                  rt        volume
+library   proto                 proto     volume
+library   pix                   libpix    volume
+library   inflate               libinflate volume
+library   bmp                   libbmp    volume
+library   png                   libpng    volume
+library   keys                  libkeys   volume
+library   pcm                   libpcm    volume
+library   surface               libsurface volume
+library   adpcm                 libadpcm  volume
+library   aiff                  libaiff   volume
+library   flac                  libflac   volume
+library   mp3                   libmp3    volume
+library   ogg                   libogg    volume
+library   wav                   libwav    volume
 dynamic   dyn_probe             dyn_probe volume
 
 # command-line tools - loaded from the system volume under bin/.
