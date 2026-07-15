@@ -21,7 +21,14 @@ git config user.name "$NAME"
 git config user.email "$EMAIL"
 
 if command -v just >/dev/null 2>&1; then
-	(cd src && just fmt) || echo "commit.sh: 'just fmt' failed - committing without a fresh format pass"
+	if ! (cd src && just fmt); then
+		echo "commit.sh: 'just fmt' failed - refusing to commit"
+		exit 1
+	fi
+	if ! (cd src && just --list >/dev/null); then
+		echo "commit.sh: Justfile parser check failed - refusing to commit"
+		exit 1
+	fi
 fi
 
 git status

@@ -2743,12 +2743,13 @@ growing "libaudio" monolith.
     page/packet CRC, sequence, continuation and granule framing; `vorbis` owns
     identification/comment/setup headers, Huffman/codebook, floor 0/1, residue,
     coupling, IMDCT, overlap and final-granule trimming, and emits the shared
-    `pcm` format. Thirty-two host tests include retained core vectors, malformed
-    headers/CRC/truncation, chunked reads and a full 256-frame FFmpeg PCM golden
-    with at most one i16 quantization step of float-decoder variance. Governed
-    `play` streams the staged Ogg fixture through AudioService and closes it;
-    the complete app-library suite and focused x86 selection (54/54) are green,
-    both cross-userspace builds pass, and x86 `vorbis.lslib` is 258,672 bytes
+    `pcm` format. Thirty-three host tests include retained core vectors, malformed
+    headers/CRC/truncation, compact oversized codebook/comment declarations,
+    chunked reads and a full 256-frame FFmpeg PCM golden with at most one i16
+    quantization step of float-decoder variance. Governed `play` streams the staged
+    Ogg fixture through AudioService and closes it; the complete app-library suite
+    and focused x86 selection (54/54) are green, both cross-userspace builds pass,
+    and x86 `vorbis.lslib` is 259,280 bytes
     with only `ogg.lslib` + `pcm.lslib` + `lsrt.lslib` runtime edges.
 - [x] Hostile-input discipline and conformance: every chunk length, sample rate,
   channel count, frame size, seek offset, codebook/table count and output-frame

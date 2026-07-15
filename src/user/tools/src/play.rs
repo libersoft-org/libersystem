@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use flac::Flac;
 use mp3::Mp3;
 use proto::path;
-use proto::system::{audio, pcm_stream, volume, OpenOpts};
+use proto::system::{OpenOpts, audio, pcm_stream, volume};
 use rt::*;
 use vorbis::Vorbis;
 use wav::Wav;

@@ -27,7 +27,7 @@ use core::error;
 use core::fmt;
 
 use crate::bitpacking::BitpackCursor;
-use crate::header_cached::{compute_bark_map_cos_omega, CachedBlocksizeDerived};
+use crate::header_cached::{CachedBlocksizeDerived, compute_bark_map_cos_omega};
 use crate::huffman_tree::{HuffmanError, VorbisHuffmanTree};
 
 const MAX_COMMENTS: usize = 4_096;
