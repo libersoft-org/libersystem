@@ -8,19 +8,19 @@ storage_dir := "user/storage"
 drivers_dir := "user/drivers"
 usertools_dir := "user/tools"
 rt_dir := "user/rt"
-libpix_dir := "user/libpix"
-libkeys_dir := "user/libkeys"
-libpcm_dir := "user/libpcm"
-libsurface_dir := "user/libsurface"
-libbmp_dir := "user/libbmp"
-libinflate_dir := "user/libinflate"
-libpng_dir := "user/libpng"
-libadpcm_dir := "user/libadpcm"
-libaiff_dir := "user/libaiff"
-libflac_dir := "user/libflac"
-libmp3_dir := "user/libmp3"
-libogg_dir := "user/libogg"
-libwav_dir := "user/libwav"
+pix_dir := "user/pix"
+keys_dir := "user/keys"
+pcm_dir := "user/pcm"
+surface_dir := "user/surface"
+bmp_dir := "user/bmp"
+inflate_dir := "user/inflate"
+png_dir := "user/png"
+adpcm_dir := "user/adpcm"
+aiff_dir := "user/aiff"
+flac_dir := "user/flac"
+mp3_dir := "user/mp3"
+ogg_dir := "user/ogg"
+wav_dir := "user/wav"
 abi_dir := "abi"
 tools_dir := "tools/lsidl-gen"
 proto_dir := "proto"
@@ -42,13 +42,13 @@ default: run
 
 # build the first system-image shared-object pilot
 shared-libs:
-	tools/build-shared.sh x86_64-unknown-none lsrt=rt proto=proto pix=libpix inflate=libinflate bmp=libbmp png=libpng keys=libkeys pcm=libpcm surface=libsurface adpcm=libadpcm aiff=libaiff flac=libflac mp3=libmp3 ogg=libogg wav=libwav
+	tools/build-shared.sh x86_64-unknown-none lsrt=rt proto=proto pix=pix inflate=inflate bmp=bmp png=png keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg wav=wav
 
 shared-libs-aarch64:
-	tools/build-shared.sh aarch64-unknown-none lsrt=rt proto=proto pix=libpix inflate=libinflate bmp=libbmp png=libpng keys=libkeys pcm=libpcm surface=libsurface adpcm=libadpcm aiff=libaiff flac=libflac mp3=libmp3 ogg=libogg wav=libwav
+	tools/build-shared.sh aarch64-unknown-none lsrt=rt proto=proto pix=pix inflate=inflate bmp=bmp png=png keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg wav=wav
 
 shared-libs-riscv64:
-	tools/build-shared.sh riscv64gc-unknown-none-elf lsrt=rt proto=proto pix=libpix inflate=libinflate bmp=libbmp png=libpng keys=libkeys pcm=libpcm surface=libsurface adpcm=libadpcm aiff=libaiff flac=libflac mp3=libmp3 ogg=libogg wav=libwav
+	tools/build-shared.sh riscv64gc-unknown-none-elf lsrt=rt proto=proto pix=pix inflate=inflate bmp=bmp png=png keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg wav=wav
 
 # build the userspace programs that make up the init package
 user: shared-libs
@@ -260,36 +260,36 @@ img size="64M" strip="debug": build
 
 # host-test pure application-side pixel, input, PCM and image helpers
 app-libs-test:
-	cargo test --manifest-path {{libpix_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
-	cargo test --manifest-path {{libkeys_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
-	cargo test --manifest-path {{libpcm_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
-	cargo test --manifest-path {{libbmp_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
-	cargo test --manifest-path {{libinflate_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
-	cargo test --manifest-path {{libpng_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
-	cargo test --manifest-path {{libadpcm_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
-	cargo test --manifest-path {{libaiff_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
-	cargo test --manifest-path {{libflac_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
-	cargo test --manifest-path {{libmp3_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
-	cargo test --manifest-path {{libogg_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
-	cargo test --manifest-path {{libwav_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{pix_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{keys_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{pcm_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{bmp_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{inflate_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{png_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{adpcm_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{aiff_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{flac_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{mp3_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{ogg_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{wav_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 
 # format all code (Rust via rustfmt, shell via shfmt)
 fmt:
 	cd {{abi_dir}} && cargo fmt
 	cd {{rt_dir}} && cargo fmt
-	cd {{libpix_dir}} && cargo fmt
-	cd {{libkeys_dir}} && cargo fmt
-	cd {{libpcm_dir}} && cargo fmt
-	cd {{libsurface_dir}} && cargo fmt
-	cd {{libbmp_dir}} && cargo fmt
-	cd {{libinflate_dir}} && cargo fmt
-	cd {{libpng_dir}} && cargo fmt
-	cd {{libadpcm_dir}} && cargo fmt
-	cd {{libaiff_dir}} && cargo fmt
-	cd {{libflac_dir}} && cargo fmt
-	cd {{libmp3_dir}} && cargo fmt
-	cd {{libogg_dir}} && cargo fmt
-	cd {{libwav_dir}} && cargo fmt
+	cd {{pix_dir}} && cargo fmt
+	cd {{keys_dir}} && cargo fmt
+	cd {{pcm_dir}} && cargo fmt
+	cd {{surface_dir}} && cargo fmt
+	cd {{bmp_dir}} && cargo fmt
+	cd {{inflate_dir}} && cargo fmt
+	cd {{png_dir}} && cargo fmt
+	cd {{adpcm_dir}} && cargo fmt
+	cd {{aiff_dir}} && cargo fmt
+	cd {{flac_dir}} && cargo fmt
+	cd {{mp3_dir}} && cargo fmt
+	cd {{ogg_dir}} && cargo fmt
+	cd {{wav_dir}} && cargo fmt
 	cd {{kernel_dir}} && cargo fmt
 	cd {{user_dir}} && cargo fmt
 	cd {{services_dir}} && cargo fmt
@@ -314,19 +314,19 @@ fmt:
 fmt-check:
 	cd {{abi_dir}} && cargo fmt --check
 	cd {{rt_dir}} && cargo fmt --check
-	cd {{libpix_dir}} && cargo fmt --check
-	cd {{libkeys_dir}} && cargo fmt --check
-	cd {{libpcm_dir}} && cargo fmt --check
-	cd {{libsurface_dir}} && cargo fmt --check
-	cd {{libbmp_dir}} && cargo fmt --check
-	cd {{libinflate_dir}} && cargo fmt --check
-	cd {{libpng_dir}} && cargo fmt --check
-	cd {{libadpcm_dir}} && cargo fmt --check
-	cd {{libaiff_dir}} && cargo fmt --check
-	cd {{libflac_dir}} && cargo fmt --check
-	cd {{libmp3_dir}} && cargo fmt --check
-	cd {{libogg_dir}} && cargo fmt --check
-	cd {{libwav_dir}} && cargo fmt --check
+	cd {{pix_dir}} && cargo fmt --check
+	cd {{keys_dir}} && cargo fmt --check
+	cd {{pcm_dir}} && cargo fmt --check
+	cd {{surface_dir}} && cargo fmt --check
+	cd {{bmp_dir}} && cargo fmt --check
+	cd {{inflate_dir}} && cargo fmt --check
+	cd {{png_dir}} && cargo fmt --check
+	cd {{adpcm_dir}} && cargo fmt --check
+	cd {{aiff_dir}} && cargo fmt --check
+	cd {{flac_dir}} && cargo fmt --check
+	cd {{mp3_dir}} && cargo fmt --check
+	cd {{ogg_dir}} && cargo fmt --check
+	cd {{wav_dir}} && cargo fmt --check
 	cd {{kernel_dir}} && cargo fmt --check
 	cd {{user_dir}} && cargo fmt --check
 	cd {{services_dir}} && cargo fmt --check

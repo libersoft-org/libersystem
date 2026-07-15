@@ -5,7 +5,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use libpcm::{Format, OUTPUT_RATE};
+use pcm::{Format, OUTPUT_RATE};
 use proto::codec::Buffer;
 use proto::system::Error;
 use proto::system::audio::{self, Service as AudioService};

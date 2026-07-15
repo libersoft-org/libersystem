@@ -4336,7 +4336,7 @@ fn process_service_loads_a_program_from_system_bin() {
 	assert_eq!(b[4], 1, "the staged dynamic executable loaded with its providers");
 	assert!(!reply.caps.is_empty(), "dynamic launch returns the Process capability");
 	let dynamic_process = reply.caps[0].object().into_any_arc().downcast::<Process>().expect("dynamic launch capability is a Process");
-	let report = dynamic_report.recv().expect("dynamic probe called its shared libpix symbol");
+	let report = dynamic_report.recv().expect("dynamic probe called its shared pix symbol");
 	assert_eq!(&report.bytes, b"dynamic link ok");
 	let dynamic_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(dynamic_started));
 	crate::serial_println!("dynamic-start-perf: {}ns private-pages={} shared-pages={}", dynamic_ns, dynamic_process.private_image_pages(), dynamic_process.shared_image_pages());

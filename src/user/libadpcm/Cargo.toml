@@ -1,6 +1,0 @@
-[package]
-name = "libadpcm"
-edition = "2024"
-description = "Dependency-free bounded IMA and Microsoft ADPCM block decoders"
-
-[dependencies]

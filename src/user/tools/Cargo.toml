@@ -212,15 +212,15 @@ rt = { path = "../rt" }
 # (`network` / `socket`) via the proto codec + generated clients.
 proto = { path = "../../proto" }
 
-libbmp = { path = "../libbmp" }
-libkeys = { path = "../libkeys" }
-libpix = { path = "../libpix" }
-libpng = { path = "../libpng" }
-libsurface = { path = "../libsurface" }
-libaiff = { path = "../libaiff" }
-libflac = { path = "../libflac" }
-libmp3 = { path = "../libmp3" }
-libwav = { path = "../libwav" }
+bmp = { path = "../bmp" }
+keys = { path = "../keys" }
+pix = { path = "../pix" }
+png = { path = "../png" }
+surface = { path = "../surface" }
+aiff = { path = "../aiff" }
+flac = { path = "../flac" }
+mp3 = { path = "../mp3" }
+wav = { path = "../wav" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so we
 # do not set `panic = "abort"` per-profile (same reasoning as the kernel).

@@ -151,12 +151,13 @@ fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 	manifest.join(format!("../user/{crate_dir}/target/{}/debug/{name}", user_target()))
 }
 
-fn user_shared_path(manifest: &Path, name: &str) -> PathBuf {
-	manifest.join(format!("../user/shared/{}/{}.lslib", user_target(), name))
+fn user_shared_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
+	let root = if crate_dir == "proto" { manifest.join("../proto") } else { manifest.join(format!("../user/{crate_dir}")) };
+	root.join(format!("shared/{}/{}.lslib", user_target(), name))
 }
 
-fn user_dynamic_path(manifest: &Path, name: &str) -> PathBuf {
-	manifest.join(format!("../user/shared/{}/{}", user_target(), name))
+fn user_dynamic_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
+	manifest.join(format!("../user/{crate_dir}/shared/{}/{}", user_target(), name))
 }
 
 // The userspace target triple matching the kernel's target arch.
@@ -312,8 +313,8 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			_ => continue,
 		};
 		let path: PathBuf = match row.kind.as_str() {
-			"library" => user_shared_path(&manifest, &row.name),
-			"dynamic" => user_dynamic_path(&manifest, &row.name),
+			"library" => user_shared_path(&manifest, &row.crate_dir, &row.name),
+			"dynamic" => user_dynamic_path(&manifest, &row.crate_dir, &row.name),
 			_ => user_elf_path(&manifest, &row.crate_dir, &row.name),
 		};
 		println!("cargo:rerun-if-changed={}", path.display());

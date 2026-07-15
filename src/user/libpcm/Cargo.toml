@@ -1,6 +1,0 @@
-[package]
-name = "libpcm"
-edition = "2024"
-description = "Bounded signed-i16 PCM format and queue helpers"
-
-[dependencies]

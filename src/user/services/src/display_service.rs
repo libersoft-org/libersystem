@@ -12,7 +12,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use libpix::{Image, Rect, Target};
+use pix::{Image, Rect, Target};
 use proto::codec::Buffer;
 use proto::system::display::{self, Service};
 use proto::system::display_admin::{self, Service as AdminService};
@@ -158,7 +158,7 @@ impl DisplayState {
 		}
 		let source_pixels: u64 = width as u64 * height as u64;
 		let start_ns: u64 = unsafe { clock_ns() };
-		let blit: libpix::BlitResult = self.blit(index, Rect { x, y, width, height });
+		let blit: pix::BlitResult = self.blit(index, Rect { x, y, width, height });
 		let blit_done_ns: u64 = unsafe { clock_ns() };
 		let result: Result<(), Error> = self.flush((blit.rect.x, blit.rect.y, blit.rect.width, blit.rect.height));
 		let done_ns: u64 = unsafe { clock_ns() };
@@ -319,11 +319,11 @@ impl DisplayState {
 		let Some(index) = self.surface_index(self.active) else { return };
 		let width: u32 = self.surfaces[index].width;
 		let height: u32 = self.surfaces[index].height;
-		let blit: libpix::BlitResult = self.blit(index, Rect { x: 0, y: 0, width, height });
+		let blit: pix::BlitResult = self.blit(index, Rect { x: 0, y: 0, width, height });
 		let _ = self.flush((blit.rect.x, blit.rect.y, blit.rect.width, blit.rect.height));
 	}
 
-	fn blit(&mut self, index: usize, damage: Rect) -> libpix::BlitResult {
+	fn blit(&mut self, index: usize, damage: Rect) -> pix::BlitResult {
 		let first: bool = !self.surfaces[index].initialized;
 		self.surfaces[index].initialized = true;
 		let surface: &Surface = &self.surfaces[index];
@@ -331,7 +331,7 @@ impl DisplayState {
 		let target_len: usize = self.scanout.fb.pitch as usize * self.scanout.height as usize;
 		let source: &[u8] = unsafe { core::slice::from_raw_parts(surface.addr as *const u8, source_len) };
 		let target: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(self.scanout.addr as *mut u8, target_len) };
-		libpix::blit(Image { data: source, width: surface.width, height: surface.height, pitch: surface.pitch }, Target { data: target, width: self.scanout.width, height: self.scanout.height, pitch: self.scanout.fb.pitch, bytes_per_pixel: self.scanout.fb.bytes_per_pixel, red_shift: self.scanout.fb.red_shift, red_size: self.scanout.fb.red_size, green_shift: self.scanout.fb.green_shift, green_size: self.scanout.fb.green_size, blue_shift: self.scanout.fb.blue_shift, blue_size: self.scanout.fb.blue_size }, damage, first).expect("DisplayService validates surface and scanout bounds before blitting")
+		pix::blit(Image { data: source, width: surface.width, height: surface.height, pitch: surface.pitch }, Target { data: target, width: self.scanout.width, height: self.scanout.height, pitch: self.scanout.fb.pitch, bytes_per_pixel: self.scanout.fb.bytes_per_pixel, red_shift: self.scanout.fb.red_shift, red_size: self.scanout.fb.red_size, green_shift: self.scanout.fb.green_shift, green_size: self.scanout.fb.green_size, blue_shift: self.scanout.fb.blue_shift, blue_size: self.scanout.fb.blue_size }, damage, first).expect("DisplayService validates surface and scanout bounds before blitting")
 	}
 
 	fn flush(&mut self, rect: (u32, u32, u32, u32)) -> Result<(), Error> {

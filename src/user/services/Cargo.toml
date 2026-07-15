@@ -123,16 +123,16 @@ wasm = { path = "../../wasm" }
 
 # Shared pixel vocabulary and direct/scaled blitters. Kept as a separate crate so
 # graphical applications and DisplayService use exactly the same geometry semantics.
-libpix = { path = "../libpix" }
-libkeys = { path = "../libkeys" }
-libpcm = { path = "../libpcm" }
-libsurface = { path = "../libsurface" }
+pix = { path = "../pix" }
+keys = { path = "../keys" }
+pcm = { path = "../pcm" }
+surface = { path = "../surface" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).
 
 # Pixel loops are the display hot path; optimize this small dependency while keeping
 # service control flow and symbols in the ordinary debuggable dev profile.
-[profile.dev.package.libpix]
+[profile.dev.package.pix]
 opt-level = 2
 # The parent dev profile still retains debug information.

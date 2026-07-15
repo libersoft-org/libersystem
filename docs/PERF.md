@@ -13,10 +13,10 @@ synchronous `PRESENT` / `OK` protocol as the driver. Its private typed counters 
 acknowledgement. The benchmark scales a Doom-class 320x200 B8G8R8X8 surface into a
 1024x768 scanout (1024x640 output, centered) and then presents a 32x20 source damage
 rectangle. Two debug-profile KVM runs establish the unoptimized range; the final column
-optimizes only the small shared `libpix` dependency at opt-level 2 while retaining debug
+optimizes only the small shared `pix` dependency at opt-level 2 while retaining debug
 information and unoptimized service control flow.
 
-| scenario | debug baseline | incremental damage, debug | incremental damage + optimized `libpix` |
+| scenario | debug baseline | incremental damage, debug | incremental damage + optimized `pix` |
 | --- | --- | --- | --- |
 | CPU blit/scale | 234-252 ms | 2.37-2.40 ms | 0.085 ms |
 | synchronous driver ACK | 0.045-0.065 ms | 0.028 ms | 0.018-0.033 ms |
@@ -32,7 +32,7 @@ Scanout resize invalidates this initialized state and forces another full safe r
 
 Build-profile result: optimizing the whole `services` package was rejected because its
 test boot fell back from the 4x4 stand-in GPU backing to the boot framebuffer. Isolating
-the hot loop in host-tested `libpix` preserved behavior and changed the debug
+the hot loop in host-tested `pix` preserved behavior and changed the debug
 `display_service` ELF from 4,314,224 to 4,315,888 bytes (+1,664 B). Current comparison
 sizes (debug information included) are: ConsoleService 5,641,624 B, shell 5,470,632 B,
 and the governed graphics grant probe 3,653,528 B. These numbers reinforce the later
@@ -46,12 +46,12 @@ Treat the latency as a regression metric and budget gate, not a physical-GPU pre
 ## Application library factoring and startup (2026-07-14)
 
 The first application-side libraries are single-concern no_std crates with real standing
-consumers: `libpix` (pixel vocabulary and bounded blitters, used by DisplayService),
-`libsurface` (typed DisplayService client plus RAII MemoryObject mapping, used by
-ConsoleService), `libkeys` (canonical HID usages and held-key edge state, used by
-InputService), and `libpcm` (format/frame validation, little-endian sample decoding,
+consumers: `pix` (pixel vocabulary and bounded blitters, used by DisplayService),
+`surface` (typed DisplayService client plus RAII MemoryObject mapping, used by
+ConsoleService), `keys` (canonical HID usages and held-key edge state, used by
+InputService), and `pcm` (format/frame validation, little-endian sample decoding,
 mono expansion and rate phase, used by AudioService). Pure helpers run nine host tests
-through `just app-libs-test`; libsurface lifecycle is exercised by the live console and
+through `just app-libs-test`; surface lifecycle is exercised by the live console and
 display tagged tests.
 
 Cold start is measured in the permission integration scenario with the guest monotonic
@@ -123,22 +123,22 @@ physical frame. RW relocation targets remain private and text relocations are re
 The complete first shared graph is atomized as `lsrt.lslib`, `proto.lslib`, `pix.lslib`,
 `inflate.lslib`, `bmp.lslib`, `png.lslib`, `keys.lslib`, `pcm.lslib`, and
 `surface.lslib`. Raw x86 release
-objects plus the probe total 799,648 bytes. After package staging strips non-runtime
-symbols, their payload is 644,904 bytes plus 320 bytes of archive entries; the factory
-`volume.pkg` is 12,193,577 bytes versus a computed 11,548,353-byte image with those
+objects plus the probe total 799,448 bytes. After package staging strips non-runtime
+symbols, their payload is 644,840 bytes plus 320 bytes of archive entries; the equivalent
+factory `volume.pkg` is 12,193,513 bytes versus a computed 11,548,353-byte image with those
 entries removed.
 
 | x86 shared artifact | raw release ELF |
 | --- | ---: |
 | `lsrt.lslib` | 414,920 B |
 | `proto.lslib` | 317,200 B |
-| `pix.lslib` | 7,552 B |
-| `inflate.lslib` | 14,008 B |
-| `bmp.lslib` | 10,224 B |
-| `png.lslib` | 13,952 B |
-| `keys.lslib` | 5,264 B |
-| `pcm.lslib` | 4,080 B |
-| `surface.lslib` | 9,872 B |
+| `pix.lslib` | 7,528 B |
+| `inflate.lslib` | 13,984 B |
+| `bmp.lslib` | 10,200 B |
+| `png.lslib` | 13,936 B |
+| `keys.lslib` | 5,232 B |
+| `pcm.lslib` | 4,064 B |
+| `surface.lslib` | 9,808 B |
 | `dyn_probe` | 2,576 B |
 
 Decision: keep the loader, tri-architecture shared graph, and staged dynamic probe, but

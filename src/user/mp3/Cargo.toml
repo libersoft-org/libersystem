@@ -1,0 +1,8 @@
+[package]
+name = "mp3"
+edition = "2024"
+description = "Bounded MPEG-1/2 Layer III stream decoder"
+
+[dependencies]
+pcm = { path = "../pcm" }
+nanomp3 = { version = "0.1.1", default-features = false }

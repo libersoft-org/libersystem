@@ -7,80 +7,47 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
-name = "libadpcm"
+name = "adpcm"
 version = "0.0.0"
 
 [[package]]
-name = "libaiff"
+name = "aiff"
 version = "0.0.0"
 dependencies = [
- "libpcm",
+ "pcm",
 ]
 
 [[package]]
-name = "libbmp"
+name = "bmp"
 version = "0.0.0"
 dependencies = [
- "libpix",
+ "pix",
 ]
 
 [[package]]
-name = "libflac"
+name = "flac"
 version = "0.0.0"
 dependencies = [
- "libpcm",
+ "pcm",
 ]
 
 [[package]]
-name = "libinflate"
+name = "inflate"
 version = "0.0.0"
 
 [[package]]
-name = "libkeys"
+name = "keys"
 version = "0.0.0"
 dependencies = [
  "proto",
 ]
 
 [[package]]
-name = "libmp3"
+name = "mp3"
 version = "0.0.0"
 dependencies = [
- "libpcm",
  "nanomp3",
-]
-
-[[package]]
-name = "libpcm"
-version = "0.0.0"
-
-[[package]]
-name = "libpix"
-version = "0.0.0"
-
-[[package]]
-name = "libpng"
-version = "0.0.0"
-dependencies = [
- "libinflate",
- "libpix",
-]
-
-[[package]]
-name = "libsurface"
-version = "0.0.0"
-dependencies = [
- "libpix",
- "proto",
- "rt",
-]
-
-[[package]]
-name = "libwav"
-version = "0.0.0"
-dependencies = [
- "libadpcm",
- "libpcm",
+ "pcm",
 ]
 
 [[package]]
@@ -88,6 +55,22 @@ name = "nanomp3"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f69bdf7e634dc76798adc292ebd4f6e8e125cde6843a264fe398c52c3f7e8541"
+
+[[package]]
+name = "pcm"
+version = "0.0.0"
+
+[[package]]
+name = "pix"
+version = "0.0.0"
+
+[[package]]
+name = "png"
+version = "0.0.0"
+dependencies = [
+ "inflate",
+ "pix",
+]
 
 [[package]]
 name = "proto"
@@ -102,18 +85,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "surface"
+version = "0.0.0"
+dependencies = [
+ "pix",
+ "proto",
+ "rt",
+]
+
+[[package]]
 name = "tools"
 version = "0.0.0"
 dependencies = [
- "libaiff",
- "libbmp",
- "libflac",
- "libkeys",
- "libmp3",
- "libpix",
- "libpng",
- "libsurface",
- "libwav",
+ "aiff",
+ "bmp",
+ "flac",
+ "keys",
+ "mp3",
+ "pix",
+ "png",
  "proto",
  "rt",
+ "surface",
+ "wav",
+]
+
+[[package]]
+name = "wav"
+version = "0.0.0"
+dependencies = [
+ "adpcm",
+ "pcm",
 ]

@@ -11,28 +11,19 @@ name = "bootproto"
 version = "0.0.0"
 
 [[package]]
-name = "libkeys"
+name = "keys"
 version = "0.0.0"
 dependencies = [
  "proto",
 ]
 
 [[package]]
-name = "libpcm"
+name = "pcm"
 version = "0.0.0"
 
 [[package]]
-name = "libpix"
+name = "pix"
 version = "0.0.0"
-
-[[package]]
-name = "libsurface"
-version = "0.0.0"
-dependencies = [
- "libpix",
- "proto",
- "rt",
-]
 
 [[package]]
 name = "proto"
@@ -51,14 +42,23 @@ name = "services"
 version = "0.0.0"
 dependencies = [
  "bootproto",
- "libkeys",
- "libpcm",
- "libpix",
- "libsurface",
+ "keys",
+ "pcm",
+ "pix",
  "proto",
  "rt",
+ "surface",
  "term",
  "wasm",
+]
+
+[[package]]
+name = "surface"
+version = "0.0.0"
+dependencies = [
+ "pix",
+ "proto",
+ "rt",
 ]
 
 [[package]]

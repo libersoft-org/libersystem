@@ -1,0 +1,6 @@
+[package]
+name = "adpcm"
+edition = "2024"
+description = "Dependency-free bounded IMA and Microsoft ADPCM block decoders"
+
+[dependencies]

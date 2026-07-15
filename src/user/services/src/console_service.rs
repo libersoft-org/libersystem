@@ -18,8 +18,8 @@
 
 use rt::*;
 
-use libsurface::{Client as DisplayClient, Mapping, Rect};
 use proto::system::{config, network, process};
+use surface::{Client as DisplayClient, Mapping, Rect};
 
 // The shell's command vocabulary, shared with the shell itself: the line discipline
 // completes the command word on Tab, and the shell prints the matches on a double Tab.
@@ -49,7 +49,7 @@ impl Surface for DisplaySurface {
 		&self.raster
 	}
 	fn present(&self, x: u32, y: u32, w: u32, h: u32) {
-		let _ = libsurface::present(&self.client, Rect { x, y, width: w, height: h });
+		let _ = surface::present(&self.client, Rect { x, y, width: w, height: h });
 	}
 }
 
@@ -330,9 +330,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 2. Acquire one native-size logical surface for all display VTs. DisplayService
 		//    owns the boot framebuffer or virtio-gpu scanout; this process maps only its
 		//    client surface and receives host resize events on a separate sub-channel.
-		let display: DisplayClient = libsurface::connect(display_chan);
-		let surface: Option<Mapping> = if display_chan == 0 { None } else { libsurface::acquire(&display, 0, 0).and_then(Result::ok) };
-		let display_events: u64 = if display_chan == 0 { 0 } else { libsurface::events(&display).unwrap_or(0) };
+		let display: DisplayClient = surface::connect(display_chan);
+		let surface: Option<Mapping> = if display_chan == 0 { None } else { surface::acquire(&display, 0, 0).and_then(Result::ok) };
+		let display_events: u64 = if display_chan == 0 { 0 } else { surface::events(&display).unwrap_or(0) };
 		let (addr, fb): (u64, Framebuffer) = surface.as_ref().map_or((0, Framebuffer::default()), |surface| (surface.addr(), surface.framebuffer()));
 		let cur_w: u32 = fb.width;
 		let cur_h: u32 = fb.height;
@@ -1105,13 +1105,13 @@ unsafe fn handle_display_resize(console: &mut Console) {
 				return;
 			}
 		};
-		if libsurface::read_event(&frame[..len], &mut handle).is_none() {
+		if surface::read_event(&frame[..len], &mut handle).is_none() {
 			if handle != 0 {
 				close(handle);
 			}
 			return;
 		}
-		let Some(new_surface) = libsurface::acquire(&console.display, 0, 0).and_then(Result::ok) else {
+		let Some(new_surface) = surface::acquire(&console.display, 0, 0).and_then(Result::ok) else {
 			return;
 		};
 		let new_addr: u64 = new_surface.addr();

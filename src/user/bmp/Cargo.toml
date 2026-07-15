@@ -1,0 +1,7 @@
+[package]
+name = "bmp"
+edition = "2024"
+description = "Dependency-free bounded BMP decoder"
+
+[dependencies]
+pix = { path = "../pix" }

@@ -23,7 +23,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use libkeys::KeyState;
+use keys::KeyState;
 use proto::system::input;
 use proto::system::input_admin::{self, Service as AdminService};
 use proto::system::{Error, KeyEvent, PointerEvent};

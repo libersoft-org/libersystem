@@ -12,8 +12,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use libkeys::usage;
-use libpix::{Image, Rect, Target};
+use keys::usage;
+use pix::{Image, Rect, Target};
 use proto::path;
 use proto::system::{OpenOpts, input, volume};
 use rt::*;
@@ -109,9 +109,9 @@ unsafe fn load_image(storage: u64, uri: &str) -> Option<DecodedImage> {
 		};
 		let bytes = core::slice::from_raw_parts(mapped as *const u8, len);
 		let decoded = if bytes.starts_with(b"BM") {
-			libbmp::decode(bytes).ok().map(|image| DecodedImage { width: image.width, height: image.height, pitch: image.pitch, pixels: image.pixels })
+			bmp::decode(bytes).ok().map(|image| DecodedImage { width: image.width, height: image.height, pitch: image.pitch, pixels: image.pixels })
 		} else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-			libpng::decode(bytes).ok().map(|image| DecodedImage { width: image.width, height: image.height, pitch: image.pitch, pixels: image.pixels })
+			png::decode(bytes).ok().map(|image| DecodedImage { width: image.width, height: image.height, pitch: image.pitch, pixels: image.pixels })
 		} else {
 			None
 		};
@@ -129,8 +129,8 @@ unsafe fn load_image(storage: u64, uri: &str) -> Option<DecodedImage> {
 
 unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 	unsafe {
-		let display = libsurface::connect(display_channel);
-		let Some(surface) = libsurface::acquire(&display, 0, 0).and_then(Result::ok) else {
+		let display = surface::connect(display_channel);
+		let Some(surface) = surface::acquire(&display, 0, 0).and_then(Result::ok) else {
 			print(b"imgview: cannot acquire display\n");
 			return;
 		};
@@ -142,20 +142,20 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 		let target = core::slice::from_raw_parts_mut(surface.addr() as *mut u8, target_len);
 		let presented = render_fit(&image, framebuffer, target);
 		let Some(blit) = presented else {
-			let _ = libsurface::release(&display);
+			let _ = surface::release(&display);
 			return;
 		};
-		if !matches!(libsurface::present(&display, blit.rect), Some(Ok(()))) {
-			let _ = libsurface::release(&display);
+		if !matches!(surface::present(&display, blit.rect), Some(Ok(()))) {
+			let _ = surface::release(&display);
 			return;
 		}
-		let Some(focus) = libsurface::input_focus(&display).and_then(Result::ok) else {
-			let _ = libsurface::release(&display);
+		let Some(focus) = surface::input_focus(&display).and_then(Result::ok) else {
+			let _ = surface::release(&display);
 			return;
 		};
 		let mut input_client = input::Client::new(ChannelTransport { chan: input_channel });
 		let Some(key_stream) = input_client.subscribe_keys(&focus) else {
-			let _ = libsurface::release(&display);
+			let _ = surface::release(&display);
 			return;
 		};
 		let mut frame: [u8; 32] = [0; 32];
@@ -191,11 +191,11 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 			}
 			let target = core::slice::from_raw_parts_mut(surface.addr() as *mut u8, target_len);
 			if let Some(blit) = render_crop(&image, framebuffer, target, pan_x, pan_y) {
-				let _ = libsurface::present(&display, blit.rect);
+				let _ = surface::present(&display, blit.rect);
 			}
 		}
 		close(key_stream);
-		let _ = libsurface::release(&display);
+		let _ = surface::release(&display);
 	}
 }
 
@@ -203,10 +203,10 @@ fn target(data: &mut [u8], framebuffer: Framebuffer) -> Target<'_> {
 	Target { data, width: framebuffer.width, height: framebuffer.height, pitch: framebuffer.pitch, bytes_per_pixel: framebuffer.bytes_per_pixel, red_shift: framebuffer.red_shift, red_size: framebuffer.red_size, green_shift: framebuffer.green_shift, green_size: framebuffer.green_size, blue_shift: framebuffer.blue_shift, blue_size: framebuffer.blue_size }
 }
 
-fn render_fit(image: &DecodedImage, framebuffer: Framebuffer, output: &mut [u8]) -> Option<libpix::BlitResult> {
-	libpix::blit(Image { data: &image.pixels, width: image.width, height: image.height, pitch: image.pitch }, target(output, framebuffer), Rect { x: 0, y: 0, width: image.width, height: image.height }, true)
+fn render_fit(image: &DecodedImage, framebuffer: Framebuffer, output: &mut [u8]) -> Option<pix::BlitResult> {
+	pix::blit(Image { data: &image.pixels, width: image.width, height: image.height, pitch: image.pitch }, target(output, framebuffer), Rect { x: 0, y: 0, width: image.width, height: image.height }, true)
 }
 
-fn render_crop(image: &DecodedImage, framebuffer: Framebuffer, output: &mut [u8], pan_x: u32, pan_y: u32) -> Option<libpix::BlitResult> {
-	libpix::blit_crop(Image { data: &image.pixels, width: image.width, height: image.height, pitch: image.pitch }, target(output, framebuffer), pan_x, pan_y)
+fn render_crop(image: &DecodedImage, framebuffer: Framebuffer, output: &mut [u8], pan_x: u32, pan_y: u32) -> Option<pix::BlitResult> {
+	pix::blit_crop(Image { data: &image.pixels, width: image.width, height: image.height, pitch: image.pitch }, target(output, framebuffer), pan_x, pan_y)
 }

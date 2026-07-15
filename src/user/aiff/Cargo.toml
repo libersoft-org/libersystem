@@ -1,0 +1,7 @@
+[package]
+name = "aiff"
+edition = "2024"
+description = "Dependency-free bounded AIFF/AIFC PCM decoder"
+
+[dependencies]
+pcm = { path = "../pcm" }

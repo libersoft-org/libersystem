@@ -75,23 +75,23 @@ driver    xhci                  drivers   volume
 
 # system-image shared libraries - built as PIC rlibs and linked to ET_DYN by
 # tools/build-shared.sh, then staged under lib/. Consumers remain static until the
-# M123 module loader and symbol registry are complete. Artifact names omit the Cargo
-# crate's `lib` prefix; the builder and image staging append `.lslib`.
+# M123 module loader and symbol registry are complete. Prefix-free crate directories own
+# their generated shared/<target>/ output; image staging appends `.lslib` to the name.
 library   lsrt                  rt        volume
 library   proto                 proto     volume
-library   pix                   libpix    volume
-library   inflate               libinflate volume
-library   bmp                   libbmp    volume
-library   png                   libpng    volume
-library   keys                  libkeys   volume
-library   pcm                   libpcm    volume
-library   surface               libsurface volume
-library   adpcm                 libadpcm  volume
-library   aiff                  libaiff   volume
-library   flac                  libflac   volume
-library   mp3                   libmp3    volume
-library   ogg                   libogg    volume
-library   wav                   libwav    volume
+library   pix                   pix    volume
+library   inflate               inflate volume
+library   bmp                   bmp    volume
+library   png                   png    volume
+library   keys                  keys   volume
+library   pcm                   pcm    volume
+library   surface               surface volume
+library   adpcm                 adpcm  volume
+library   aiff                  aiff   volume
+library   flac                  flac   volume
+library   mp3                   mp3    volume
+library   ogg                   ogg    volume
+library   wav                   wav    volume
 dynamic   dyn_probe             dyn_probe volume
 
 # command-line tools - loaded from the system volume under bin/.

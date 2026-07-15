@@ -2534,7 +2534,7 @@ down/up streams while synchronously suppressing the background cooked console; A
 provides bounded typed PCM streams, rate conversion and a saturating multi-source mixer with
 beep on the same path. PermissionManager grants narrowly scoped display/input-keys/audio-stream
 connections and a governed probe proves the full launch path. Reusable app plumbing lives in
-single-concern libpix/libsurface/libkeys/libpcm crates. The 320x200-to-1024x768 scaler is
+single-concern pix/surface/keys/pcm crates. The 320x200-to-1024x768 scaler is
 8.41 ms under x86 KVM (32x20 damage 0.085 ms), governed cold start is 1.347 ms, and six
 representative release ELFs total 491,832 B versus 27,910,344 B debug. Validation: x86
 display 10/10 and integrated process/service/input/audio/display 51/51, proto 94/94,
@@ -2578,8 +2578,8 @@ Result: `imgview` is a governed console-launched ELF with exactly
 `volumes + display + input-keys`; it content-sniffs BMP/PNG, decodes into bounded
 B8G8R8X8 storage, fits to the acquired surface, switches oversized images to a
 native crop on arrow input, and exits on Esc/q with explicit release. Atomic no_std
-`libbmp` supports indexed/direct Windows and OS/2 rows, bitfields and RLE4/RLE8;
-`libpng` verifies chunks and zlib Adler-32, handles stored/fixed/dynamic DEFLATE,
+`bmp` supports indexed/direct Windows and OS/2 rows, bitfields and RLE4/RLE8;
+`png` verifies chunks and zlib Adler-32, handles stored/fixed/dynamic DEFLATE,
 all standard color types/bit depths, all five filters, transparency and Adam7.
 Hostile sizes, tables, runs, chunks and output allocations are checked and capped.
 Validation: 22/22 app-library host tests (12 decoder tests including staged golden
@@ -2703,22 +2703,22 @@ The second real application-platform consumer, runnable from the console:
 pushes bounded signed-i16 chunks through the M121 `audio-stream` capability,
 and never needs device access or enough memory to hold the whole track. The
 decoder graph follows the same rule as image support: one library per codec or
-container, shared `libpcm` vocabulary, real dependencies between leaves, and no
+container, shared `pcm` vocabulary, real dependencies between leaves, and no
 growing "libaudio" monolith.
 
-- [x] Uncompressed and ADPCM containers: `libwav` parses RIFF/WAVE and delegates
-  PCM 8/16/24/32-bit mono/stereo conversion to `libpcm`; a separate `libadpcm`
-  leaf decodes both IMA ADPCM and Microsoft ADPCM blocks used by WAV. `libaiff`
+- [x] Uncompressed and ADPCM containers: `wav` parses RIFF/WAVE and delegates
+  PCM 8/16/24/32-bit mono/stereo conversion to `pcm`; a separate `adpcm`
+  leaf decodes both IMA ADPCM and Microsoft ADPCM blocks used by WAV. `aiff`
   parses AIFF and AIFC PCM, including big-endian samples and bounded extended
   sample-rate metadata. Container and codec boundaries remain explicit rather
-  than accumulating unrelated decoders in `libwav`.
-- [ ] Lossless compressed leaves: `libflac` implements native FLAC metadata and
+  than accumulating unrelated decoders in `wav`.
+- [ ] Lossless compressed leaves: `flac` implements native FLAC metadata and
   frame/subframe decode, fixed/LPC prediction, Rice residuals and CRC;
   `libwavpack` implements bounded WavPack lossless stream and block decoding.
-  Both are no_std parsers over a bounded reader and emit `libpcm` source frames;
+  Both are no_std parsers over a bounded reader and emit `pcm` source frames;
   neither allocates the whole file or input-controlled unbounded tables.
-- [ ] Common lossy leaves: `libmp3` implements MPEG-1/2 Layer III, including
-  bounded ID3 skip/metadata handling; `libogg` handles only Ogg page/packet
+- [ ] Common lossy leaves: `mp3` implements MPEG-1/2 Layer III, including
+  bounded ID3 skip/metadata handling; `ogg` handles only Ogg page/packet
   framing and `libvorbis` depends on it for Vorbis codebook, floor, residue and
   MDCT decode. Each unsupported profile or version fails with a typed error,
   never a partial misdecode. Opus, AAC and other codecs are outside M124.

@@ -1,0 +1,8 @@
+[package]
+name = "png"
+edition = "2024"
+description = "Dependency-free bounded PNG decoder"
+
+[dependencies]
+inflate = { path = "../inflate" }
+pix = { path = "../pix" }

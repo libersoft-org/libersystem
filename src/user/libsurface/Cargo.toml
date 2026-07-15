@@ -1,9 +1,0 @@
-[package]
-name = "libsurface"
-edition = "2024"
-description = "Owned DisplayService client surfaces and presentation helpers"
-
-[dependencies]
-proto = { path = "../../proto" }
-rt = { path = "../rt" }
-libpix = { path = "../libpix" }

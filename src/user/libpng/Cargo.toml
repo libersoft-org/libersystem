@@ -1,8 +1,0 @@
-[package]
-name = "libpng"
-edition = "2024"
-description = "Dependency-free bounded PNG decoder"
-
-[dependencies]
-libinflate = { path = "../libinflate" }
-libpix = { path = "../libpix" }

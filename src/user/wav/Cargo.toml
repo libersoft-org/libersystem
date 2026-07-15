@@ -1,0 +1,8 @@
+[package]
+name = "wav"
+edition = "2024"
+description = "Dependency-free bounded RIFF/WAVE PCM decoder"
+
+[dependencies]
+adpcm = { path = "../adpcm" }
+pcm = { path = "../pcm" }

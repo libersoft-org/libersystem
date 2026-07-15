@@ -1,7 +1,0 @@
-[package]
-name = "libaiff"
-edition = "2024"
-description = "Dependency-free bounded AIFF/AIFC PCM decoder"
-
-[dependencies]
-libpcm = { path = "../libpcm" }

@@ -10,15 +10,15 @@
 
 extern crate alloc;
 
+use aiff::Aiff;
 use alloc::string::String;
 use alloc::vec::Vec;
-use libaiff::Aiff;
-use libflac::Flac;
-use libmp3::Mp3;
-use libwav::Wav;
+use flac::Flac;
+use mp3::Mp3;
 use proto::path;
 use proto::system::{OpenOpts, audio, pcm_stream, volume};
 use rt::*;
+use wav::Wav;
 
 const CHUNK_FRAMES: usize = 1_024;
 
@@ -139,7 +139,7 @@ trait PcmDecoder {
 	fn read_i16_le(&mut self, max_frames: usize, output: &mut Vec<u8>) -> Result<usize, ()>;
 }
 
-impl PcmDecoder for libwav::Decoder<'_> {
+impl PcmDecoder for wav::Decoder<'_> {
 	fn remaining_frames(&self) -> u64 {
 		self.remaining_frames()
 	}
@@ -149,7 +149,7 @@ impl PcmDecoder for libwav::Decoder<'_> {
 	}
 }
 
-impl PcmDecoder for libaiff::Decoder<'_> {
+impl PcmDecoder for aiff::Decoder<'_> {
 	fn remaining_frames(&self) -> u64 {
 		self.remaining_frames()
 	}
@@ -159,7 +159,7 @@ impl PcmDecoder for libaiff::Decoder<'_> {
 	}
 }
 
-impl PcmDecoder for libflac::Decoder<'_> {
+impl PcmDecoder for flac::Decoder<'_> {
 	fn remaining_frames(&self) -> u64 {
 		self.remaining_frames()
 	}
@@ -169,7 +169,7 @@ impl PcmDecoder for libflac::Decoder<'_> {
 	}
 }
 
-impl PcmDecoder for libmp3::Decoder<'_> {
+impl PcmDecoder for mp3::Decoder<'_> {
 	fn remaining_frames(&self) -> u64 {
 		self.remaining_frames()
 	}

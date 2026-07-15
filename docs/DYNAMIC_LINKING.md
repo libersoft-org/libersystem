@@ -17,9 +17,13 @@ intrinsics may change in the next image without compatibility shims.
   libraries remain part of the phase-3 package format rather than entering the global
   namespace.
 - System-library filenames use the LiberSystem-specific `.lslib` suffix and no Unix
-  `lib` prefix: for example, `png.lslib`, `proto.lslib`, and `lsrt.lslib`. Cargo crate
-  names such as `libpng` remain internal build identifiers and are not installed
-  filenames.
+  `lib` prefix: for example, `png.lslib`, `proto.lslib`, and `lsrt.lslib`.
+- Library crates also use prefix-free owner directories. A normal leaf lives at
+  `src/user/<name>/`, and its generated objects stay with that owner under
+  `src/user/<name>/shared/<target>/<name>.lslib`. The runtime and generated protocol
+  providers use the equivalent `src/user/rt/shared/` and `src/proto/shared/` paths.
+  The system image still installs all of them into the flat, resolver-owned
+  `vol://system/lib/` namespace.
 - Resolution is eager and deterministic. Lazy PLT binding, `LD_PRELOAD`, environment
   search paths, runtime library replacement, symbol interposition, and unload are not
   supported.
