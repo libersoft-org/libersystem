@@ -1,0 +1,4 @@
+[package]
+name = "libogg"
+edition = "2024"
+description = "Dependency-free bounded Ogg page and packet framer"

@@ -15,6 +15,12 @@ libsurface_dir := "user/libsurface"
 libbmp_dir := "user/libbmp"
 libinflate_dir := "user/libinflate"
 libpng_dir := "user/libpng"
+libadpcm_dir := "user/libadpcm"
+libaiff_dir := "user/libaiff"
+libflac_dir := "user/libflac"
+libmp3_dir := "user/libmp3"
+libogg_dir := "user/libogg"
+libwav_dir := "user/libwav"
 abi_dir := "abi"
 tools_dir := "tools/lsidl-gen"
 proto_dir := "proto"
@@ -36,13 +42,13 @@ default: run
 
 # build the first system-image shared-object pilot
 shared-libs:
-	tools/build-shared.sh x86_64-unknown-none liblsrt=rt libproto=proto libpix=libpix libinflate=libinflate libbmp=libbmp libpng=libpng libkeys=libkeys libpcm=libpcm libsurface=libsurface
+	tools/build-shared.sh x86_64-unknown-none liblsrt=rt libproto=proto libpix=libpix libinflate=libinflate libbmp=libbmp libpng=libpng libkeys=libkeys libpcm=libpcm libsurface=libsurface libadpcm=libadpcm libaiff=libaiff libflac=libflac libmp3=libmp3 libogg=libogg libwav=libwav
 
 shared-libs-aarch64:
-	tools/build-shared.sh aarch64-unknown-none liblsrt=rt libproto=proto libpix=libpix libinflate=libinflate libbmp=libbmp libpng=libpng libkeys=libkeys libpcm=libpcm libsurface=libsurface
+	tools/build-shared.sh aarch64-unknown-none liblsrt=rt libproto=proto libpix=libpix libinflate=libinflate libbmp=libbmp libpng=libpng libkeys=libkeys libpcm=libpcm libsurface=libsurface libadpcm=libadpcm libaiff=libaiff libflac=libflac libmp3=libmp3 libogg=libogg libwav=libwav
 
 shared-libs-riscv64:
-	tools/build-shared.sh riscv64gc-unknown-none-elf liblsrt=rt libproto=proto libpix=libpix libinflate=libinflate libbmp=libbmp libpng=libpng libkeys=libkeys libpcm=libpcm libsurface=libsurface
+	tools/build-shared.sh riscv64gc-unknown-none-elf liblsrt=rt libproto=proto libpix=libpix libinflate=libinflate libbmp=libbmp libpng=libpng libkeys=libkeys libpcm=libpcm libsurface=libsurface libadpcm=libadpcm libaiff=libaiff libflac=libflac libmp3=libmp3 libogg=libogg libwav=libwav
 
 # build the userspace programs that make up the init package
 user: shared-libs
@@ -260,6 +266,12 @@ app-libs-test:
 	cargo test --manifest-path {{libbmp_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 	cargo test --manifest-path {{libinflate_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 	cargo test --manifest-path {{libpng_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{libadpcm_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{libaiff_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{libflac_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{libmp3_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{libogg_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
+	cargo test --manifest-path {{libwav_dir}}/Cargo.toml --target x86_64-unknown-linux-gnu
 
 # format all code (Rust via rustfmt, shell via shfmt)
 fmt:
@@ -272,6 +284,12 @@ fmt:
 	cd {{libbmp_dir}} && cargo fmt
 	cd {{libinflate_dir}} && cargo fmt
 	cd {{libpng_dir}} && cargo fmt
+	cd {{libadpcm_dir}} && cargo fmt
+	cd {{libaiff_dir}} && cargo fmt
+	cd {{libflac_dir}} && cargo fmt
+	cd {{libmp3_dir}} && cargo fmt
+	cd {{libogg_dir}} && cargo fmt
+	cd {{libwav_dir}} && cargo fmt
 	cd {{kernel_dir}} && cargo fmt
 	cd {{user_dir}} && cargo fmt
 	cd {{services_dir}} && cargo fmt
@@ -303,6 +321,12 @@ fmt-check:
 	cd {{libbmp_dir}} && cargo fmt --check
 	cd {{libinflate_dir}} && cargo fmt --check
 	cd {{libpng_dir}} && cargo fmt --check
+	cd {{libadpcm_dir}} && cargo fmt --check
+	cd {{libaiff_dir}} && cargo fmt --check
+	cd {{libflac_dir}} && cargo fmt --check
+	cd {{libmp3_dir}} && cargo fmt --check
+	cd {{libogg_dir}} && cargo fmt --check
+	cd {{libwav_dir}} && cargo fmt --check
 	cd {{kernel_dir}} && cargo fmt --check
 	cd {{user_dir}} && cargo fmt --check
 	cd {{services_dir}} && cargo fmt --check

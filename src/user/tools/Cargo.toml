@@ -80,6 +80,10 @@ name = "beep"
 path = "src/beep.rs"
 
 [[bin]]
+name = "play"
+path = "src/play.rs"
+
+[[bin]]
 name = "graphics_probe"
 path = "src/graphics_probe.rs"
 
@@ -213,6 +217,10 @@ libkeys = { path = "../libkeys" }
 libpix = { path = "../libpix" }
 libpng = { path = "../libpng" }
 libsurface = { path = "../libsurface" }
+libaiff = { path = "../libaiff" }
+libflac = { path = "../libflac" }
+libmp3 = { path = "../libmp3" }
+libwav = { path = "../libwav" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so we
 # do not set `panic = "abort"` per-profile (same reasoning as the kernel).

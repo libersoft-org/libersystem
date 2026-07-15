@@ -85,6 +85,12 @@ library   libpng                libpng    volume
 library   libkeys               libkeys   volume
 library   libpcm                libpcm    volume
 library   libsurface            libsurface volume
+library   libadpcm              libadpcm  volume
+library   libaiff               libaiff   volume
+library   libflac               libflac   volume
+library   libmp3                libmp3    volume
+library   libogg                libogg    volume
+library   libwav                libwav    volume
 dynamic   dyn_probe             dyn_probe volume
 
 # command-line tools - loaded from the system volume under bin/.
@@ -103,6 +109,7 @@ tool      lsdev      tools  volume
 tool      config     tools  volume
 tool      set        tools  volume
 tool      beep       tools  volume
+tool      play       tools  volume
 tool      graphics_probe tools volume
 tool      imgview    tools  volume
 tool      usage      tools  volume

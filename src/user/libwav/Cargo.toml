@@ -1,0 +1,8 @@
+[package]
+name = "libwav"
+edition = "2024"
+description = "Dependency-free bounded RIFF/WAVE PCM decoder"
+
+[dependencies]
+libadpcm = { path = "../libadpcm" }
+libpcm = { path = "../libpcm" }

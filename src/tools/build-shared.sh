@@ -103,7 +103,7 @@ for spec in "$@"; do
 		link_inputs=(--whole-archive "${archives[@]}" --no-whole-archive)
 	fi
 	case "$artifact" in
-	libproto | libpix | libinflate | libpcm)
+	libproto | libpix | libinflate | libpcm | libadpcm | libogg)
 		link_deps=(-L "$out_dir" -l:liblsrt.so --no-allow-shlib-undefined)
 		;;
 	libbmp)
@@ -117,6 +117,21 @@ for spec in "$@"; do
 		;;
 	libsurface)
 		link_deps=(-L "$out_dir" -l:libproto.so -l:libpix.so -l:liblsrt.so --no-allow-shlib-undefined)
+		;;
+	libaiff | libflac)
+		link_deps=(-L "$out_dir" -l:libpcm.so -l:liblsrt.so --no-allow-shlib-undefined)
+		;;
+	libmp3)
+		nanomp3_archive="$(find "$deps" -maxdepth 1 -name 'libnanomp3-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		if [[ -z "$nanomp3_archive" ]]; then
+			echo "build-shared: missing nanomp3 archive for libmp3" >&2
+			exit 1
+		fi
+		link_inputs=(--whole-archive "$rlib" "$nanomp3_archive" --no-whole-archive)
+		link_deps=(-L "$out_dir" -l:libpcm.so -l:liblsrt.so --no-allow-shlib-undefined)
+		;;
+	libwav)
+		link_deps=(-L "$out_dir" -l:libadpcm.so -l:libpcm.so -l:liblsrt.so --no-allow-shlib-undefined)
 		;;
 	esac
 	"$lld" -flavor gnu -m "$emulation" -shared --hash-style=sysv "${symbolic_flags[@]}" --gc-sections "${export_flags[@]}" "${link_inputs[@]}" "${link_deps[@]}" -soname "$artifact.so" -o "$out"

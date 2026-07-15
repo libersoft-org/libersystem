@@ -2705,7 +2705,7 @@ decoder graph follows the same rule as image support: one library per codec or
 container, shared `libpcm` vocabulary, real dependencies between leaves, and no
 growing "libaudio" monolith.
 
-- [ ] Uncompressed and ADPCM containers: `libwav` parses RIFF/WAVE and delegates
+- [x] Uncompressed and ADPCM containers: `libwav` parses RIFF/WAVE and delegates
   PCM 8/16/24/32-bit mono/stereo conversion to `libpcm`; a separate `libadpcm`
   leaf decodes both IMA ADPCM and Microsoft ADPCM blocks used by WAV. `libaiff`
   parses AIFF and AIFC PCM, including big-endian samples and bounded extended

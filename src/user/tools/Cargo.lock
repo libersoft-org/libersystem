@@ -7,10 +7,28 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "libadpcm"
+version = "0.0.0"
+
+[[package]]
+name = "libaiff"
+version = "0.0.0"
+dependencies = [
+ "libpcm",
+]
+
+[[package]]
 name = "libbmp"
 version = "0.0.0"
 dependencies = [
  "libpix",
+]
+
+[[package]]
+name = "libflac"
+version = "0.0.0"
+dependencies = [
+ "libpcm",
 ]
 
 [[package]]
@@ -23,6 +41,18 @@ version = "0.0.0"
 dependencies = [
  "proto",
 ]
+
+[[package]]
+name = "libmp3"
+version = "0.0.0"
+dependencies = [
+ "libpcm",
+ "nanomp3",
+]
+
+[[package]]
+name = "libpcm"
+version = "0.0.0"
 
 [[package]]
 name = "libpix"
@@ -46,6 +76,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "libwav"
+version = "0.0.0"
+dependencies = [
+ "libadpcm",
+ "libpcm",
+]
+
+[[package]]
+name = "nanomp3"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f69bdf7e634dc76798adc292ebd4f6e8e125cde6843a264fe398c52c3f7e8541"
+
+[[package]]
 name = "proto"
 version = "0.0.0"
 
@@ -61,11 +105,15 @@ dependencies = [
 name = "tools"
 version = "0.0.0"
 dependencies = [
+ "libaiff",
  "libbmp",
+ "libflac",
  "libkeys",
+ "libmp3",
  "libpix",
  "libpng",
  "libsurface",
+ "libwav",
  "proto",
  "rt",
 ]

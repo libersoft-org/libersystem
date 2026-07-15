@@ -1,0 +1,7 @@
+[package]
+name = "libflac"
+edition = "2024"
+description = "Dependency-free bounded native FLAC decoder"
+
+[dependencies]
+libpcm = { path = "../libpcm" }

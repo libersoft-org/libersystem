@@ -531,11 +531,188 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 		return Err("imgview sent an invalid release request");
 	}
 	let release_corr = le_u32(&release.bytes, 2);
-	view_display_server.send(Message::new([release_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "view release reply failed")?;
+	view_display_server.send(Message::new([release_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "imgview release reply failed")?;
 	core::mem::drop(view_output);
 	sched::run_until_idle();
 	if !view_process.is_terminated() {
 		return Err("imgview did not exit after releasing the surface");
+	}
+
+	// Launch the governed WAV player with a fresh playback-only AudioService scope.
+	// The stand-in accepts only a prefix of the first write, proving `play` retries the
+	// unaccepted suffix in a new buffer before explicitly closing the stream.
+	let (play_audio_server, play_audio_client) = Channel::create();
+	admin_reply(&audio_admin_server, play_audio_client, 0)?;
+	let (play_output, play_stdout) = Channel::create();
+	let mut play_run = alloc::vec::Vec::new();
+	play_run.extend_from_slice(&3u16.to_le_bytes());
+	play_run.extend_from_slice(&2u32.to_le_bytes());
+	for value in [&b"play"[..], &b"vol://system/sample.wav"[..], &b"vol://system"[..]] {
+		play_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
+		play_run.extend_from_slice(value);
+	}
+	play_run.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&perm_client, &play_run, play_stdout, Rights::ALL)?;
+	sched::run_until_idle();
+	let play_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer play run")?;
+	if play_reply.bytes.len() < 5 || play_reply.bytes[4] == 0 {
+		return Err("PermissionManager refused play");
+	}
+	let play_process = play_reply.caps.first().ok_or("play run returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "play run handle was not a Process")?;
+
+	let open = play_audio_server.recv().map_err(|_| "play did not open an audio stream")?;
+	if open.bytes.len() < 11 || le_u16(&open.bytes, 0) != 2 || le_u32(&open.bytes, 6) != 8_000 || open.bytes[10] != 1 {
+		return Err("play opened the wrong WAV format");
+	}
+	let open_corr = le_u32(&open.bytes, 2);
+	let (pcm_server, pcm_client) = Channel::create();
+	let mut open_reply = alloc::vec::Vec::new();
+	open_reply.extend_from_slice(&open_corr.to_le_bytes());
+	open_reply.push(1);
+	open_reply.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&play_audio_server, &open_reply, pcm_client, Rights::ALL)?;
+	sched::run_until_idle();
+
+	let first_write = pcm_server.recv().map_err(|_| "play sent no first PCM write")?;
+	if first_write.bytes.len() < 14 || le_u16(&first_write.bytes, 0) != 1 || le_u64(&first_write.bytes, 6) != 1_024 || first_write.caps.len() != 1 {
+		return Err("play sent an invalid first PCM write");
+	}
+	let first_buffer = first_write.caps[0].object().into_any_arc().downcast::<MemoryObject>().map_err(|_| "play PCM write did not transfer a MemoryObject")?;
+	if !read_from_object(&first_buffer, 1_024).iter().any(|byte| *byte != 0) {
+		return Err("play decoded silent PCM from the non-silent WAV fixture");
+	}
+	let first_corr = le_u32(&first_write.bytes, 2);
+	pcm_server.send(Message::new([first_corr.to_le_bytes().as_slice(), &[1], &128u32.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "first PCM write reply failed")?;
+	sched::run_until_idle();
+
+	let second_write = pcm_server.recv().map_err(|_| "play did not retry the unaccepted PCM suffix")?;
+	if second_write.bytes.len() < 14 || le_u16(&second_write.bytes, 0) != 1 || le_u64(&second_write.bytes, 6) != 768 || second_write.caps.len() != 1 {
+		return Err("play retried the wrong PCM suffix");
+	}
+	let second_corr = le_u32(&second_write.bytes, 2);
+	pcm_server.send(Message::new([second_corr.to_le_bytes().as_slice(), &[1], &384u32.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "second PCM write reply failed")?;
+	sched::run_until_idle();
+
+	let close_request = pcm_server.recv().map_err(|_| "play did not explicitly close its PCM stream")?;
+	if close_request.bytes.len() < 6 || le_u16(&close_request.bytes, 0) != 2 {
+		return Err("play sent an invalid PCM close");
+	}
+	let close_corr = le_u32(&close_request.bytes, 2);
+	pcm_server.send(Message::new([close_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "PCM close reply failed")?;
+	core::mem::drop(play_output);
+	sched::run_until_idle();
+	if !play_process.is_terminated() {
+		return Err("play did not exit after closing its PCM stream");
+	}
+
+	for (run_corr, uri, channels, pcm_bytes) in [
+		(3u32, &b"vol://system/sample-ima.wav"[..], 1u8, 1_024u64),
+		(4u32, &b"vol://system/sample-ms.wav"[..], 1u8, 1_024u64),
+		(5u32, &b"vol://system/sample.aiff"[..], 1u8, 1_024u64),
+		(6u32, &b"vol://system/sample.aifc"[..], 1u8, 1_024u64),
+		(7u32, &b"vol://system/sample.flac"[..], 2u8, 2_048u64),
+	] {
+		let (audio_server, audio_client) = Channel::create();
+		admin_reply(&audio_admin_server, audio_client, 0)?;
+		let (output, stdout) = Channel::create();
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&3u16.to_le_bytes());
+		request.extend_from_slice(&run_corr.to_le_bytes());
+		for value in [&b"play"[..], uri, &b"vol://system"[..]] {
+			request.extend_from_slice(&(value.len() as u16).to_le_bytes());
+			request.extend_from_slice(value);
+		}
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&perm_client, &request, stdout, Rights::ALL)?;
+		sched::run_until_idle();
+		let reply = perm_client.recv().map_err(|_| "PermissionManager did not answer audio play run")?;
+		if reply.bytes.len() < 5 || reply.bytes[4] == 0 {
+			return Err("PermissionManager refused audio play");
+		}
+		let process = reply.caps.first().ok_or("audio play returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "audio play handle was not a Process")?;
+		let open = audio_server.recv().map_err(|_| "audio play did not open an audio stream")?;
+		if open.bytes.len() < 11 || le_u16(&open.bytes, 0) != 2 || le_u32(&open.bytes, 6) != 8_000 || open.bytes[10] != channels {
+			return Err("audio play opened the wrong format");
+		}
+		let (stream_server, stream_client) = Channel::create();
+		let open_corr = le_u32(&open.bytes, 2);
+		let mut open_reply = alloc::vec::Vec::new();
+		open_reply.extend_from_slice(&open_corr.to_le_bytes());
+		open_reply.push(1);
+		open_reply.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&audio_server, &open_reply, stream_client, Rights::ALL)?;
+		sched::run_until_idle();
+		let write = stream_server.recv().map_err(|_| "audio play sent no PCM write")?;
+		if write.bytes.len() < 14 || le_u16(&write.bytes, 0) != 1 || le_u64(&write.bytes, 6) != pcm_bytes || write.caps.len() != 1 {
+			return Err("audio play sent invalid decoded PCM");
+		}
+		let buffer = write.caps[0].object().into_any_arc().downcast::<MemoryObject>().map_err(|_| "audio play did not transfer PCM memory")?;
+		if !read_from_object(&buffer, pcm_bytes as usize).iter().any(|byte| *byte != 0) {
+			return Err("audio play decoded silence");
+		}
+		let write_corr = le_u32(&write.bytes, 2);
+		stream_server.send(Message::new([write_corr.to_le_bytes().as_slice(), &[1], &512u32.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "audio PCM reply failed")?;
+		sched::run_until_idle();
+		let close_request = stream_server.recv().map_err(|_| "audio play did not close")?;
+		let close_corr = le_u32(&close_request.bytes, 2);
+		stream_server.send(Message::new([close_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "audio close reply failed")?;
+		core::mem::drop(output);
+		sched::run_until_idle();
+		if !process.is_terminated() {
+			return Err("audio play did not exit");
+		}
+	}
+
+	let (mp3_audio_server, mp3_audio_client) = Channel::create();
+	admin_reply(&audio_admin_server, mp3_audio_client, 0)?;
+	let (mp3_output, mp3_stdout) = Channel::create();
+	let mut mp3_run = alloc::vec::Vec::new();
+	mp3_run.extend_from_slice(&3u16.to_le_bytes());
+	mp3_run.extend_from_slice(&8u32.to_le_bytes());
+	for value in [&b"play"[..], &b"vol://system/sample.mp3"[..], &b"vol://system"[..]] {
+		mp3_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
+		mp3_run.extend_from_slice(value);
+	}
+	mp3_run.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&perm_client, &mp3_run, mp3_stdout, Rights::ALL)?;
+	sched::run_until_idle();
+	let mp3_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer MP3 play run")?;
+	if mp3_reply.bytes.len() < 5 || mp3_reply.bytes[4] == 0 {
+		return Err("PermissionManager refused MP3 play");
+	}
+	let mp3_process = mp3_reply.caps.first().ok_or("MP3 play returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "MP3 play handle was not a Process")?;
+	let mp3_open = mp3_audio_server.recv().map_err(|_| "MP3 play did not open an audio stream")?;
+	if mp3_open.bytes.len() < 11 || le_u16(&mp3_open.bytes, 0) != 2 || le_u32(&mp3_open.bytes, 6) != 16_000 || mp3_open.bytes[10] != 1 {
+		return Err("MP3 play opened the wrong format");
+	}
+	let (mp3_stream_server, mp3_stream_client) = Channel::create();
+	let mp3_open_corr = le_u32(&mp3_open.bytes, 2);
+	let mut mp3_open_reply = alloc::vec::Vec::new();
+	mp3_open_reply.extend_from_slice(&mp3_open_corr.to_le_bytes());
+	mp3_open_reply.push(1);
+	mp3_open_reply.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&mp3_audio_server, &mp3_open_reply, mp3_stream_client, Rights::ALL)?;
+	sched::run_until_idle();
+	for (pcm_bytes, accepted_frames) in [(2_048u64, 1_024u32), (1_408u64, 704u32)] {
+		let write = mp3_stream_server.recv().map_err(|_| "MP3 play sent too few PCM writes")?;
+		if write.bytes.len() < 14 || le_u16(&write.bytes, 0) != 1 || le_u64(&write.bytes, 6) != pcm_bytes || write.caps.len() != 1 {
+			return Err("MP3 play sent invalid decoded PCM");
+		}
+		let buffer = write.caps[0].object().into_any_arc().downcast::<MemoryObject>().map_err(|_| "MP3 play did not transfer PCM memory")?;
+		if !read_from_object(&buffer, pcm_bytes as usize).iter().any(|byte| *byte != 0) {
+			return Err("MP3 play decoded silence");
+		}
+		let correlation = le_u32(&write.bytes, 2);
+		mp3_stream_server.send(Message::new([correlation.to_le_bytes().as_slice(), &[1], &accepted_frames.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "MP3 PCM reply failed")?;
+		sched::run_until_idle();
+	}
+	let mp3_close = mp3_stream_server.recv().map_err(|_| "MP3 play did not close")?;
+	let mp3_close_corr = le_u32(&mp3_close.bytes, 2);
+	mp3_stream_server.send(Message::new([mp3_close_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "MP3 close reply failed")?;
+	core::mem::drop(mp3_output);
+	sched::run_until_idle();
+	if !mp3_process.is_terminated() {
+		return Err("MP3 play did not exit");
 	}
 	Ok((expected, probe_read.bytes, probe_summary.bytes, date_read.bytes, date_summary.bytes, request_read.bytes, request_summary.bytes, cat_read.bytes, graphics_read.bytes, graphics_start_ns))
 }
