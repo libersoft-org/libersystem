@@ -2760,6 +2760,71 @@ growing "libaudio" monolith.
   (`volumes + audio-stream`, no ambient device/network), and the NOTES audio
   player item this realizes.
 
+## M125 - Native executable artifacts (`.lsexe`)
+
+Give every native LiberSystem userspace executable an explicit, system-identifying
+artifact suffix while keeping command entry ergonomic. The canonical staged file and
+process image name is `<name>.lsexe`; both `ping` and `ping.lsexe` launch that one
+artifact, `ps` displays the complete canonical name `ping.lsexe`, and command-word
+completion lists the short name `ping` rather than exposing storage naming as shell
+noise.
+
+- [ ] Canonical artifacts and staging: tools, managed services, components, probes and
+  userspace drivers are staged exactly once as `<logical-name>.lsexe` in their existing
+  package namespace (`bin/`, `drivers/`, or the pinned init package). There is no
+  extensionless duplicate. Kernel images, UEFI applications, WebAssembly components,
+  data files and `.lslib` providers retain their own format-specific naming.
+- [ ] One launch normalizer: the shell, PermissionManager and ProcessService share one
+  bounded command-name rule. Executability is determined only by the final extension:
+  the resolver first tries an input ending in `.lsexe` as an exact physical artifact;
+  it also forms the short-name candidate by appending exactly one `.lsexe` to the
+  complete command basename. Thus bare `ping` and explicit `ping.lsexe` both reach
+  physical `ping.lsexe`. If the only artifact is `ping.lsexe.lsexe`, then `ping`
+  fails (its candidate `ping.lsexe` does not exist), while `ping.lsexe` reaches the
+  one-suffix-appended artifact and `ping.lsexe.lsexe` reaches it by its exact name.
+  Its logical stem is `ping.lsexe`. Dots and suffix-looking text inside the stem are
+  ordinary name bytes; only malformed names, path separators and `..` path segments
+  are rejected. Explicit `vol://` execution accepts only a real path whose final
+  extension is `.lsexe`.
+- [ ] Ambiguity is rejected at image construction, not by misclassifying a filename:
+  the image may contain `ping.lsexe` or `ping.lsexe.lsexe`, but not both, because input
+  `ping.lsexe` would then mean the full name of the first artifact and the short name of
+  the second. Resolution first tries the exact `.lsexe` artifact and, when absent, the
+  one-suffix-appended short form. Therefore a lone `ping.lsexe.lsexe` remains runnable
+  as both `ping.lsexe` and `ping.lsexe.lsexe`; manifest/build validation prevents only
+  the genuinely ambiguous pair.
+- [ ] Policy cannot be bypassed by spelling: capability lookup, command aliases,
+  foreground/background job routing and audit decisions use the normalized logical
+  identity. `ping` and `ping.lsexe` therefore receive exactly the same grant set and
+  invoke the same tool shape; aliases such as `host` -> `nslookup` remain explicit
+  shell policy rather than extra files.
+- [ ] Full process identity: ProcessService records the canonical artifact basename,
+  including `.lsexe`, in `ProcessInfo`. Plain `ps`, `ps -i`, JSON output, process logs
+  and diagnostics consequently show `ping.lsexe`; they do not shorten it back to the
+  command alias that initiated the launch.
+- [ ] Short shell discovery: command-word completion strips one validated `.lsexe`
+  suffix from the live `bin/` listing, merges those short labels with builtins and
+  aliases, sorts and deduplicates them. A double Tab lists `ping`, not `ping.lsexe`;
+  completion may still accept a user who explicitly started typing `ping.lsexe`, but
+  its normal advertised form remains the short command.
+- [ ] Hostile-input and integration coverage: host tests pin canonicalization and all
+  rejection cases, including acceptance of repeated suffix text and rejection of an
+  ambiguous artifact pair. Focused shell/process/permission/storage tests prove both
+  launch spellings reach the same staged bytes and grants; with only
+  `ping.lsexe.lsexe` staged they also prove `ping` fails while `ping.lsexe` and the
+  full name succeed. Extensionless opens fail, double Tab exposes only short names,
+  and text/live/JSON `ps` preserve the full `.lsexe` process name on x86_64. The
+  complete userspace and package build remains green for aarch64 and riscv64.
+- Done when: the system image contains no extensionless native userspace executable,
+  `ping` and `ping.lsexe` are equivalent launch requests without a policy distinction,
+  and a lone `ping.lsexe.lsexe` is executable as `ping.lsexe` or by its full name but
+  not as `ping`; `ps` reports the complete physical basename, double-Tab discovery
+  reports the one-suffix-shortened name, invalid paths fail before process creation,
+  and host + targeted tri-architecture build/runtime gates are green.
+- Concept: M123's `.lslib` artifact identity, the image manifest as the single staging
+  source of truth, M54/M79 shell completion, M57 PermissionManager policy, and M19/M104
+  ProcessService inventory and live `ps` views.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
