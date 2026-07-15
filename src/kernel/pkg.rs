@@ -6,7 +6,7 @@
 //
 // Layout (all integers little-endian):
 //   header  : magic [8] = b"PKGARCH1", count u32, reserved u32        (16 bytes)
-//   entries : count * { name [24] NUL-padded, offset u32, size u32 }  (32 bytes each)
+//   entries : count * { name [32] NUL-padded, offset u32, size u32 }  (40 bytes each)
 //   blobs   : the file contents, concatenated; each entry's offset/size is an
 //             absolute byte range into the package.
 

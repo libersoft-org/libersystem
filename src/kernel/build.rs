@@ -160,6 +160,10 @@ fn user_dynamic_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 	manifest.join(format!("../user/{crate_dir}/shared/{}/{}", user_target(), name))
 }
 
+fn executable_artifact_name(name: &str) -> String {
+	format!("{name}.lsexe")
+}
+
 // The userspace target triple matching the kernel's target arch.
 fn user_target() -> &'static str {
 	match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
@@ -239,7 +243,7 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	let mut sources: Vec<(String, PathBuf)> = Vec::new();
 	for row in read_manifest(&manifest) {
 		if row.stage == "pinned" && row.crate_dir != "-" {
-			sources.push((row.name.clone(), user_elf_path(&manifest, &row.crate_dir, &row.name)));
+			sources.push((executable_artifact_name(&row.name), user_elf_path(&manifest, &row.crate_dir, &row.name)));
 		}
 	}
 
@@ -305,11 +309,11 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	// unstrippable ELF is skipped.
 	for row in read_manifest(&manifest) {
 		let dest: String = match row.kind.as_str() {
-			"tool" => format!("bin/{}", row.name),
-			"service" | "component" if row.stage == "volume" => format!("bin/{}", row.name),
-			"driver" if row.stage == "volume" => format!("drivers/{}", row.name),
+			"tool" => format!("bin/{}", executable_artifact_name(&row.name)),
+			"service" | "component" if row.stage == "volume" => format!("bin/{}", executable_artifact_name(&row.name)),
+			"driver" if row.stage == "volume" => format!("drivers/{}", executable_artifact_name(&row.name)),
 			"library" if row.stage == "volume" => format!("lib/{}.lslib", row.name),
-			"dynamic" if row.stage == "volume" => format!("bin/{}", row.name),
+			"dynamic" if row.stage == "volume" => format!("bin/{}", executable_artifact_name(&row.name)),
 			_ => continue,
 		};
 		let path: PathBuf = match row.kind.as_str() {
@@ -333,8 +337,8 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	fs::write(&out_pkg, &package).unwrap_or_else(|e: std::io::Error| panic!("cannot write {}: {e}", out_pkg.display()));
 }
 
-// Serialize the init package: an 8-byte magic, a u32 entry count and a reserved
-// u32, then one 32-byte entry per file (a 24-byte NUL-padded name, a u32 absolute
+// Serialize a boot package: an 8-byte magic, a u32 entry count and a reserved
+// u32, then one 40-byte entry per file (a 32-byte NUL-padded name, a u32 absolute
 // byte offset and a u32 size), then the concatenated file blobs. All integers are
 // little-endian. Must match the parser in src/kernel/pkg.rs.
 fn build_package(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
@@ -351,8 +355,8 @@ fn build_package(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 	for (name, data) in entries {
 		let mut name_field: [u8; NAME_LEN] = [0u8; NAME_LEN];
 		let name_bytes: &[u8] = name.as_bytes();
-		let copy: usize = name_bytes.len().min(NAME_LEN);
-		name_field[..copy].copy_from_slice(&name_bytes[..copy]);
+		assert!(name_bytes.len() <= NAME_LEN, "package entry name exceeds {NAME_LEN} bytes: {name}");
+		name_field[..name_bytes.len()].copy_from_slice(name_bytes);
 		out.extend_from_slice(&name_field);
 		out.extend_from_slice(&(blob_offset as u32).to_le_bytes());
 		out.extend_from_slice(&(data.len() as u32).to_le_bytes());

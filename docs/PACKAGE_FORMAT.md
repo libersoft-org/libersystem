@@ -95,10 +95,10 @@ Header (PKG_HEADER_LEN = 16 bytes)
   8      4    entry count (u32)
  12      4    reserved (u32, 0)
 
-Entry table: `count` entries, PKG_ENTRY_LEN = 32 bytes each
-  0     24    name, NUL-padded (PKG_NAME_LEN); compared up to the first NUL
- 24      4    blob offset from the start of the archive (u32)
- 28      4    blob size in bytes (u32)
+Entry table: `count` entries, PKG_ENTRY_LEN = 40 bytes each
+  0     32    name, NUL-padded (PKG_NAME_LEN); compared up to the first NUL
+ 32      4    blob offset from the start of the archive (u32)
+ 36      4    blob size in bytes (u32)
 
 Blobs
   the file bodies, concatenated, each at the offset its entry names

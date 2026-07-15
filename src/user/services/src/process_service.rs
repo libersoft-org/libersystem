@@ -32,6 +32,8 @@ use proto::system::volume;
 use proto::system::{Error, OpenOpts, ProcessInfo, StartResult};
 use rt::*;
 
+mod executable;
+
 // Where the on-disk program binaries live on the system volume (staged there by the
 // factory-seed pipeline). A named program is loaded from `<PROGRAM_DIR><name>`.
 const PROGRAM_DIR: &str = "vol://system/bin/";
@@ -172,33 +174,51 @@ impl<'a> Processes<'a> {
 	// Load program `name` and create a process from it, handing the child `bootstrap` as
 	// its bootstrap capability. With a storage client wired, the binary is read from the
 	// system volume's `bin/`; with none, it comes from the built-in package. Returns the
-	// new process handle, or a negative value if the binary cannot be read or spawned.
-	unsafe fn spawn_program(&self, name: &str, bootstrap: u64) -> i64 {
+	// new process handle plus its canonical physical basename, or None if the command
+	// is malformed, absent or cannot be spawned.
+	unsafe fn spawn_program(&self, name: &str, bootstrap: u64) -> Option<(i64, String)> {
 		unsafe {
-			if self.storage != 0 {
-				return spawn_from_storage(self.storage, name, bootstrap);
+			for artifact in executable::launch_candidates(name)? {
+				let handle = if self.storage != 0 {
+					match spawn_from_storage(self.storage, &artifact, bootstrap) {
+						Some(handle) => handle,
+						None => continue,
+					}
+				} else {
+					match self.package.lookup(artifact.as_bytes()) {
+						Some(elf) => spawn_program_bytes(self.storage, elf, bootstrap),
+						None => continue,
+					}
+				};
+				return (handle >= 0).then_some((handle, artifact));
 			}
-			match self.package.lookup(name.as_bytes()) {
-				Some(elf) => spawn(elf, bootstrap),
-				None => -1,
-			}
+			None
 		}
 	}
 }
 
 // Read `vol://system/bin/<name>` through the storage client, map its shared buffer,
 // create a process from the mapped ELF image, then release the mapping. Returns the new
-// process handle, or a negative value if the binary cannot be read or spawned.
-unsafe fn spawn_from_storage(storage: u64, name: &str, bootstrap: u64) -> i64 {
+// process handle. None means the named artifact was absent; a present but invalid
+// artifact returns a negative handle so resolution never falls through to another name.
+unsafe fn spawn_from_storage(storage: u64, name: &str, bootstrap: u64) -> Option<i64> {
 	unsafe {
-		let Some(main) = MappedFile::open(storage, alloc::format!("{PROGRAM_DIR}{name}")) else { return -1 };
-		let bytes = main.bytes();
+		let main = MappedFile::open(storage, alloc::format!("{PROGRAM_DIR}{name}"))?;
+		Some(spawn_program_bytes(storage, main.bytes(), bootstrap))
+	}
+}
+
+unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], bootstrap: u64) -> i64 {
+	unsafe {
 		let Some(elf) = bootproto::elf::Elf::parse(bytes) else { return -1 };
 		let Some(dynamic) = elf.dynamic_info() else { return -1 };
 		let Some(dynamic) = dynamic else { return spawn(bytes, bootstrap) };
 		let Some(dependencies) = dependencies(&elf, &dynamic) else { return -1 };
 		if dependencies.is_empty() {
 			return spawn(bytes, bootstrap);
+		}
+		if storage == 0 {
+			return -1;
 		}
 		let process = process_create(0);
 		if process < 0 {
@@ -229,13 +249,10 @@ impl<'a> Service for Processes<'a> {
 	fn start(&mut self, name: String) -> Result<ProcessInfo, Error> {
 		// spawn with no bootstrap capability (phase 1: started processes run
 		// unattended), then read back the new process's koid and record it.
-		let handle: i64 = unsafe { self.spawn_program(&name, 0) };
-		if handle < 0 {
-			return Err(Error::NotFound);
-		}
+		let (handle, artifact) = unsafe { self.spawn_program(&name, 0) }.ok_or(Error::NotFound)?;
 		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
 		unsafe { close(handle as u64) };
-		let info: ProcessInfo = ProcessInfo { koid, name };
+		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
 		self.started.push(info.clone());
 		Ok(info)
 	}
@@ -249,12 +266,9 @@ impl<'a> Service for Processes<'a> {
 		// the new process's bootstrap), then read back the new process's koid. The live
 		// process handle is handed back to the caller for job control - so unlike `start`
 		// we do not close it here; it is transferred out as the reply's handle.
-		let handle: i64 = unsafe { self.spawn_program(&name, bootstrap) };
-		if handle < 0 {
-			return Err(Error::NotFound);
-		}
+		let (handle, artifact) = unsafe { self.spawn_program(&name, bootstrap) }.ok_or(Error::NotFound)?;
 		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
-		let info: ProcessInfo = ProcessInfo { koid, name };
+		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
 		self.started.push(info.clone());
 		Ok(StartResult { task: handle as u64, info })
 	}
