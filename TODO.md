@@ -2903,7 +2903,7 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   Every dimension, pitch, frame count, cumulative animation pixels and duration is
   checked before allocation. `imgview` migrates to the same decoded model without
   changing its visible fit/pan behavior.
-- [ ] Complete decode + encode leaf matrix. Existing `bmp` and `png` gain encoders;
+- [x] Complete decode + encode leaf matrix. Existing `bmp` and `png` gain encoders;
   implement the already accepted M123 leaves for PPM, QOI, TGA, PCX, ICO, APNG,
   ICNS, GIF, baseline JPEG and WebP. `imgconv` supports all of them as both source
   and destination where the format has a writable representation:
@@ -2947,9 +2947,17 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     blend/disposal implementation used by previews and converters. Lossless animated
     WebP output canonicalizes each displayed frame to a full-canvas VP8L `ANMF`,
     preserving visual pixels, timing and representable loop counts. Remaining codec
-    work is a no_std lossy VP8 encoder; the current lossless engine exposes only a real
-    predictor on/off effort switch, so intermediate 1..99 effort remains typed
-    Unsupported rather than being faked.
+    work at that checkpoint was a no_std lossy VP8 encoder. The lossless engine exposes
+    only a real predictor on/off effort switch, so intermediate 1..99 effort remains
+    typed Unsupported rather than being faked.
+  - Result (2026-07-16): the WebP leaf now contains a native no_std VP8 keyframe
+    encoder built from the RFC 6386 bitstream model: boolean entropy coding, B_PRED
+    luma, DC/V/H/TM chroma search, full 4x4 DCT/IDCT, DC/AC quantization, coefficient
+    bands, neighbor contexts, zero runs and category tokens. Quality 0..100 controls
+    the quantizer; independent compression effort progressively admits chroma
+    predictor candidates. Opaque output uses canonical simple `VP8 ` WebP, while
+    transparent output uses `VP8X + ALPH + VP8 ` and preserves alpha exactly.
+    Lossy animated output remains explicitly unsupported rather than dropping frames.
 - [x] Exact CLI and option semantics, parsed by shared host-tested helpers:
   `imgconv [options] <input> <output>`. `--format <name>` overrides only output
   suffix selection; an unknown or mismatched suffix is an error. `--force` permits
@@ -2984,12 +2992,18 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     while omission preserves their true-color output. JPEG exposes quality 0..100 and
     lossy mode. GIF quality 0..100 selects the same real palette budget, defaults to 100
     and always uses bounded dithering. WebP defaults lossless, supports static and
-    animated VP8L output, and currently has genuine encoder effort endpoints 0 (no
-    predictor) and 100 (predictor), rejecting intermediate effort, `--lossy` and
-    `--quality` until a real multi-level/lossy VP8 encoder exists. Audited alternatives
+    animated VP8L output, and has genuine lossless effort endpoints 0 (no predictor)
+    and 100 (predictor), rejecting intermediate lossless effort. Audited alternatives
     (`webpx`, `fast-webp`) wrap unsafe libwebp C FFI;
     `oxideav-webp` is a std-heavy scaffold, so none satisfy the bare-metal rule.
     Fixed-compression formats reject controls instead of ignoring them.
+  - Partial result (2026-07-16): lossy WebP now accepts independent quality and
+    compression controls across 0..100. Compression effort 0/25/50/75 progressively
+    searches DC, vertical, horizontal and true-motion chroma predictors, with
+    deterministic tie-breaking; omitted lossy quality/effort default to 90/100.
+    Lossless WebP still has only the dependency's genuine predictor-off/on endpoints
+    and continues to reject 1..99. A native multi-level VP8L search remains the last
+    format-control item; intermediate values will not be aliases for two outcomes.
 - [x] Bounded, failure-safe output path: decode and transform under checked image/frame
   budgets, compute every row/table/chunk size with checked arithmetic, cap encoded
   output relative to the validated source model, and propagate allocation failures as
@@ -3030,6 +3044,12 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   animation disposal/blend, ICO/ICNS multi-entry selection, truncation, corrupt
   checksums/tables, oversized geometry/frame counts and deterministic mutations.
   Every rejected format-option combination in the capability table has a test.
+  - Partial result (2026-07-16): lossy VP8 tests independently decode odd 19x17
+    quality endpoints, exercise every chroma-search threshold, require deterministic
+    bytes, distinguish simple opaque from extended-alpha containers, preserve alpha
+    exactly and reject bad quality/effort, truncation and a corrupted frame sync code.
+    The optimized 512x512 gate requires quality 100 RGB MSE <= 300 and improvement
+    over quality 0; measured MSE is 250 versus 923.
 - [ ] End-to-end and performance gates: a kernel scenario launches governed `imgconv`
   through PermissionManager, reads a staged image from StorageService, writes at least
   one lossless and one lossy destination, reopens both and decodes them independently,
@@ -3057,8 +3077,15 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     SONAME/NEEDED edges. The cross-volume governed scenario also launches the real
     `imgview.lsexe` on the newly created `vol://media/CROSS.BMP`, observes a nonblank
     display present, grants focused key input, sends `q`, and verifies surface release +
-    process exit. Remaining gate work is the lossy-WebP quality endpoint and broader
-    conformance/fault vectors around that future encoder.
+    process exit.
+  - Partial result (2026-07-16): the same dual-StorageService scenario now runs the
+    real `imgconv.lsexe --lossy --quality 100 --compression 100` across system LiberFS
+    to media FAT16, reopens `CROSS.WEBP`, verifies the canonical simple `VP8 ` RIFF
+    profile and independently decodes dimensions plus bounded RGB error. The focused
+    x86 capability/storage/process/filesystem selection is green 57/57. Full shared
+    libraries and userspace, including `imgconv.lsexe`, build on x86_64, AArch64 and
+    RISC-V; `webp.lslib` is 347,608 / 441,088 / 381,688 bytes respectively. Remaining
+    benchmark work is peak-memory accounting, alongside the VP8L effort item above.
 - Done when: `imgconv` converts every implemented M126 format through the same RGBA/frame
   model, WebP can explicitly choose lossless or lossy, applicable encoders honor
   validated 0..100 quality/compression controls, alpha and animation are never dropped

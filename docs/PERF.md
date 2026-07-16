@@ -9,34 +9,39 @@ orders, not precision instruments.
 `just image-bench` builds the same no_std leaves used by `imgconv` in an optimized
 host profile and converts a deterministic 512x512 true-color RGBA fixture. Each row
 measures full container encode and independent content-sniff/decode; the standing gate
-fails if either side exceeds five seconds. One x86 host run produced:
+fails if either side exceeds five seconds. RGB MSE covers profiles that retain the
+fixture dimensions. One x86 host run produced:
 
-| output profile | bytes | encode | decode |
-| --- | ---: | ---: | ---: |
-| BMP 24-bit | 786,486 | 28.0 ms | 1.5 ms |
-| BMP indexed quality 0, 16 colors | 262,262 | 50.1 ms | 1.8 ms |
-| BMP indexed quality 100, up to 256 colors | 263,222 | 149.7 ms | 1.8 ms |
-| PNG compression 0 | 1,049,321 | 43.4 ms | 19.0 ms |
-| PNG compression 100 | 441,032 | 65.7 ms | 26.5 ms |
-| PNG indexed quality 0, 16 colors | 57,625 | 56.7 ms | 5.7 ms |
-| PNG indexed quality 100, up to 256 colors | 114,191 | 167.3 ms | 8.7 ms |
-| PCX 24-bit RLE | 664,704 | 32.1 ms | 2.6 ms |
-| PCX indexed quality 0, 16 colors | 200,451 | 50.0 ms | 1.9 ms |
-| PCX indexed quality 100, up to 256 colors | 276,657 | 154.9 ms | 2.2 ms |
-| PPM P6 | 786,447 | 26.7 ms | 3.1 ms |
-| QOI RGBA | 1,048,595 | 27.7 ms | 0.9 ms |
-| TGA RLE | 788,498 | 27.8 ms | 0.9 ms |
-| ICO, 256x256 PNG-backed | 213,193 | 40.6 ms | 10.0 ms |
-| ICNS, 32x32 classic RGB RLE + alpha | 3,176 | 27.3 ms | 0.02 ms |
-| ICNS, 512x512 PNG-backed | 441,048 | 70.9 ms | 26.9 ms |
-| JPEG quality 10 | 10,008 | 30.3 ms | 1.5 ms |
-| JPEG quality 100 | 433,763 | 35.3 ms | 6.9 ms |
-| WebP lossless effort 0 | 786,522 | 29.6 ms | 4.2 ms |
-| WebP lossless effort 100 | 282 | 27.6 ms | 0.3 ms |
-| APNG, one frame | 441,090 | 65.6 ms | 23.8 ms |
-| GIF quality 0, 16 colors | 73,146 | 54.5 ms | 6.2 ms |
-| GIF quality 100, up to 256 colors | 150,236 | 156.6 ms | 7.7 ms |
-| WebP lossless animation, 256x256, 2 frames | 458 | 0.68 ms | 0.18 ms |
+| output profile | bytes | RGB MSE | encode | decode |
+| --- | ---: | ---: | ---: | ---: |
+| BMP 24-bit | 786,486 | 0 | 27.8 ms | 1.6 ms |
+| BMP indexed quality 0, 16 colors | 262,262 | 1,390 | 49.9 ms | 1.8 ms |
+| BMP indexed quality 100, up to 256 colors | 263,222 | 239 | 150.3 ms | 1.8 ms |
+| PNG compression 0 | 1,049,321 | 0 | 42.1 ms | 19.1 ms |
+| PNG compression 100 | 441,032 | 0 | 65.0 ms | 25.8 ms |
+| PNG indexed quality 0, 16 colors | 57,625 | 1,390 | 56.5 ms | 5.5 ms |
+| PNG indexed quality 100, up to 256 colors | 114,191 | 239 | 165.0 ms | 8.5 ms |
+| PCX 24-bit RLE | 664,704 | 0 | 30.4 ms | 2.5 ms |
+| PCX indexed quality 0, 16 colors | 200,451 | 1,390 | 50.6 ms | 2.0 ms |
+| PCX indexed quality 100, up to 256 colors | 276,657 | 239 | 153.2 ms | 2.1 ms |
+| PPM P6 | 786,447 | 0 | 27.0 ms | 3.0 ms |
+| QOI RGBA | 1,048,595 | 0 | 27.6 ms | 1.0 ms |
+| TGA RLE | 788,498 | 0 | 28.1 ms | 0.9 ms |
+| ICO, 256x256 PNG-backed | 213,193 | - | 40.4 ms | 10.1 ms |
+| ICNS, 32x32 classic RGB RLE + alpha | 3,176 | - | 25.9 ms | 0.01 ms |
+| ICNS, 512x512 PNG-backed | 441,048 | 0 | 70.9 ms | 25.6 ms |
+| JPEG quality 10 | 10,008 | 890 | 30.0 ms | 1.5 ms |
+| JPEG quality 100 | 433,763 | 0 | 35.6 ms | 6.7 ms |
+| WebP lossless effort 0 | 786,522 | 0 | 29.7 ms | 3.9 ms |
+| WebP lossless effort 100 | 282 | 0 | 27.7 ms | 0.3 ms |
+| WebP lossy quality 0, effort 100 | 7,104 | 923 | 34.5 ms | 2.8 ms |
+| WebP lossy quality 100, effort 100 | 219,842 | 250 | 60.9 ms | 12.8 ms |
+| WebP lossy quality 90, effort 0 | 91,104 | 256 | 44.8 ms | 7.6 ms |
+| WebP lossy quality 90, effort 100 | 91,140 | 256 | 46.0 ms | 7.6 ms |
+| APNG, one frame | 441,090 | 0 | 66.1 ms | 22.1 ms |
+| GIF quality 0, 16 colors | 73,146 | 1,390 | 54.5 ms | 6.3 ms |
+| GIF quality 100, up to 256 colors | 150,236 | 239 | 157.2 ms | 7.1 ms |
+| WebP lossless animation, 256x256, 2 frames | 458 | 0 | 0.80 ms | 0.20 ms |
 
 GIF, explicit indexed PNG, indexed BMP and indexed PCX use the same bounded no_std
 `quantize.lslib`. It builds one deterministic weighted
@@ -61,6 +66,13 @@ for static previews and cross-format conversion. Lossless WebP animation output 
 canonical full-canvas VP8L frames, preserving displayed pixels and timing while avoiding
 format-local duplicate compositing code.
 
+Lossy WebP uses the native no_std VP8 keyframe encoder. Quality maps to the normative
+DC/AC quantizer tables; independent effort progressively searches DC, vertical,
+horizontal and true-motion chroma prediction. The benchmark requires quality 100 to
+beat quality 0 and caps its RGB MSE at 300. Effort endpoints at fixed quality must
+produce different deterministic bitstreams, proving the control is not ignored. Raw
+`ALPH` chunks preserve alpha exactly outside the lossy VP8 color payload.
+
 The first governed integration uses a seeded writable LiberFS block stand-in:
 `imgconv.lsexe` receives only the system volume slot, converts staged BMP to indexed PNG
 at quality and compression 100, exits, and the kernel reopens the destination through
@@ -81,8 +93,17 @@ every free cluster allocated and an existing `KEEP.BMP`; forced resized conversi
 returns a storage failure and the old bytes remain exactly unchanged, pinning the
 filesystem publication guarantee end to end.
 
-Current limits are deliberate and typed: WebP lossy encoding is not available in the
-current no_std engine, intermediate WebP effort is not faked, ICNS JPEG2000
+The same governed process also writes a quality-100/effort-100 lossy `CROSS.WEBP`
+across the volume boundary. StorageService reopens it, the test verifies the simple
+opaque `RIFF/WEBP/VP8 ` profile and the independent WebP decoder checks dimensions plus
+bounded RGB error. The focused x86 capability/storage/process/filesystem run is 57/57.
+Complete shared libraries and userspace build on x86_64, AArch64 and RISC-V; the native
+encoder changes `webp.lslib` to 347,608 / 441,088 / 381,688 bytes respectively.
+
+Current limits are deliberate and typed: the published VP8L encoder exposes only a
+predictor-off/on switch, so lossless WebP effort 1..99 remains unsupported rather than
+aliasing two outcomes. Lossy animated WebP output is also unsupported rather than
+silently flattening frames. ICNS JPEG2000
 entries remain unsupported, and image output is deliberately a fully encoded whole-file
 StorageService write. LiberFS publishes that write through its CoW transaction and FAT
 uses allocate/write/new-entry-swap/free-old ordering, so a failed backend write preserves

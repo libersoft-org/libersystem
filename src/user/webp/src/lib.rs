@@ -6,6 +6,8 @@ use ai_image_webp::{ColorType, EncoderParams, WebPDecoder, WebPEncoder};
 use alloc::vec::Vec;
 use no_std_io::io::Cursor;
 
+mod vp8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
 	Invalid,
@@ -149,6 +151,31 @@ pub fn encode_lossless(image: &pix::RgbaImage, compression: u8) -> Result<Vec<u8
 	Ok(output)
 }
 
+pub fn encode_lossy(image: &pix::RgbaImage, quality: u8, effort: u8) -> Result<Vec<u8>, Error> {
+	if quality > 100 || effort > 100 {
+		return Err(Error::Unsupported);
+	}
+	let frame = vp8::encode_keyframe(image, quality, effort)?;
+	let has_alpha = image.pixels.chunks_exact(4).any(|pixel| pixel[3] != 255);
+	let mut output = Vec::new();
+	output.try_reserve_exact(frame.len().checked_add(if has_alpha { image.pixels.len() / 4 + 48 } else { 20 }).ok_or(Error::TooLarge)?).map_err(|_| Error::TooLarge)?;
+	output.extend_from_slice(b"RIFF");
+	output.extend_from_slice(&0u32.to_le_bytes());
+	output.extend_from_slice(b"WEBP");
+	if has_alpha {
+		let mut vp8x = Vec::new();
+		vp8x.extend_from_slice(&[0x10, 0, 0, 0]);
+		put_u24(&mut vp8x, image.width - 1)?;
+		put_u24(&mut vp8x, image.height - 1)?;
+		append_chunk(&mut output, b"VP8X", &vp8x)?;
+		append_alpha(&mut output, &image.pixels)?;
+	}
+	append_chunk(&mut output, b"VP8 ", &frame)?;
+	let riff_size = u32::try_from(output.len().checked_sub(8).ok_or(Error::Invalid)?).map_err(|_| Error::TooLarge)?;
+	output[4..8].copy_from_slice(&riff_size.to_le_bytes());
+	Ok(output)
+}
+
 pub fn encode_animation(animation: &pix::Animation, compression: u8) -> Result<Vec<u8>, Error> {
 	let loop_count = u16::try_from(animation.loop_count).map_err(|_| Error::Unsupported)?;
 	let mut output = Vec::new();
@@ -249,6 +276,21 @@ fn append_chunk(output: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) -> Result<
 	Ok(())
 }
 
+fn append_alpha(output: &mut Vec<u8>, rgba: &[u8]) -> Result<(), Error> {
+	let count = rgba.len() / 4;
+	let length = u32::try_from(count.checked_add(1).ok_or(Error::TooLarge)?).map_err(|_| Error::TooLarge)?;
+	let padding = usize::from(length & 1 != 0);
+	output.try_reserve(9usize.checked_add(count).and_then(|size| size.checked_add(padding)).ok_or(Error::TooLarge)?).map_err(|_| Error::TooLarge)?;
+	output.extend_from_slice(b"ALPH");
+	output.extend_from_slice(&length.to_le_bytes());
+	output.push(0);
+	output.extend(rgba.chunks_exact(4).map(|pixel| pixel[3]));
+	if padding != 0 {
+		output.push(0);
+	}
+	Ok(())
+}
+
 fn put_u24(output: &mut Vec<u8>, value: u32) -> Result<(), Error> {
 	if value > 0x00ff_ffff {
 		return Err(Error::TooLarge);
@@ -291,6 +333,47 @@ mod tests {
 		let image = pix::RgbaImage::new(1, 1, vec![0, 0, 0, 255]).unwrap();
 		assert_eq!(encode_lossless(&image, 50), Err(Error::Unsupported));
 		assert_eq!(decode(b"RIFF"), Err(Error::Invalid));
+	}
+
+	#[test]
+	fn lossy_quality_improves_rgb_and_preserves_alpha() {
+		let mut pixels = Vec::new();
+		for y in 0..17u8 {
+			for x in 0..19u8 {
+				pixels.extend_from_slice(&[x.wrapping_mul(11), y.wrapping_mul(13), x.wrapping_mul(5).wrapping_add(y.wrapping_mul(7)), x.wrapping_mul(17).wrapping_add(y.wrapping_mul(3))]);
+			}
+		}
+		let source = pix::RgbaImage::new(19, 17, pixels).unwrap();
+		let low_bytes = encode_lossy(&source, 0, 100).unwrap();
+		let high_bytes = encode_lossy(&source, 100, 100).unwrap();
+		assert_eq!(high_bytes, encode_lossy(&source, 100, 100).unwrap());
+		assert_ne!(encode_lossy(&source, 80, 0).unwrap(), encode_lossy(&source, 80, 100).unwrap());
+		assert_eq!(&high_bytes[12..16], b"VP8X");
+		assert!(high_bytes.windows(4).any(|window| window == b"ALPH"));
+		for effort in [0, 24, 25, 49, 50, 74, 75, 100] {
+			let decoded = decode(&encode_lossy(&source, 80, effort).unwrap()).unwrap();
+			assert_eq!((decoded.width, decoded.height), (19, 17));
+		}
+		let low = decode(&low_bytes).unwrap();
+		let high = decode(&high_bytes).unwrap();
+		let error = |actual: &pix::RgbaImage| -> u64 { actual.pixels.chunks_exact(4).zip(source.pixels.chunks_exact(4)).map(|(actual, expected)| (0..3).map(|channel| u64::from(actual[channel].abs_diff(expected[channel]))).sum::<u64>()).sum() };
+		assert!(error(&high) < error(&low));
+		for actual in [low, high] {
+			assert_eq!((actual.width, actual.height), (source.width, source.height));
+			assert_eq!(actual.pixels.iter().skip(3).step_by(4).copied().collect::<Vec<_>>(), source.pixels.iter().skip(3).step_by(4).copied().collect::<Vec<_>>());
+		}
+		assert_eq!(encode_lossy(&source, 101, 100), Err(Error::Unsupported));
+		assert_eq!(encode_lossy(&source, 100, 101), Err(Error::Unsupported));
+
+		let opaque = pix::RgbaImage::new(1, 1, vec![31, 127, 223, 255]).unwrap();
+		let opaque = encode_lossy(&opaque, 100, 100).unwrap();
+		assert_eq!(&opaque[12..16], b"VP8 ");
+		for end in [0, 4, 12, 20, opaque.len() / 2] {
+			assert_eq!(decode(&opaque[..end]), Err(Error::Invalid));
+		}
+		let mut corrupt = opaque;
+		corrupt[23] ^= 0xff;
+		assert_eq!(decode(&corrupt), Err(Error::Invalid));
 	}
 
 	#[test]

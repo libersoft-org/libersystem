@@ -5692,6 +5692,17 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	assert_eq!(bmp::decode_rgba(&converted).expect("cross-volume BMP decodes"), source);
 	run_imgview_harness(imgview_elf, b"vol://media/CROSS.BMP", &mut system, &mut media);
 
+	let line = run_imgconv_harness(imgconv_elf, b"--lossy --quality 100 --compression 100 vol://system/sample.bmp vol://media/CROSS.WEBP", &mut system, &mut media);
+	assert!(line.starts_with(b"imgconv: BMP 2x2 -> WebP 2x2 mode=lossy quality=100 compression=100 bytes="));
+	let converted = media.open(b"vol://media/CROSS.WEBP", 0xc2056).expect("cross-volume WebP opens");
+	assert_eq!(&converted[..4], b"RIFF", "lossy WebP uses the canonical RIFF container");
+	assert_eq!(&converted[8..12], b"WEBP", "lossy WebP uses the canonical WEBP form type");
+	assert_eq!(&converted[12..16], b"VP8 ", "opaque lossy WebP uses a simple VP8 chunk");
+	let decoded = webp::decode(&converted).expect("cross-volume lossy WebP decodes");
+	assert_eq!((decoded.width, decoded.height), (source.width, source.height));
+	let squared_error: u64 = decoded.pixels.chunks_exact(4).zip(source.pixels.chunks_exact(4)).flat_map(|(actual, expected)| (0..3).map(move |channel| i64::from(actual[channel]) - i64::from(expected[channel]))).map(|difference| difference.unsigned_abs().pow(2)).sum();
+	assert!(squared_error <= u64::from(source.width) * u64::from(source.height) * 3 * 5_000, "governed 2x2 lossy WebP exceeds its bounded RGB MSE");
+
 	let previous = b"previous destination";
 	let full_image = fat16_image(&[(*b"KEEP    BMP", previous)], true);
 	let mut full_media = StorageHarness::start(storage_elf, b"FATBLOCK", &full_image, full_image.len() as u64);

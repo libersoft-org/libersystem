@@ -107,7 +107,7 @@ pub const fn capabilities(format: Format) -> Capabilities {
 		Format::Pcx => Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false },
 		Format::Ppm => Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false },
 		Format::Qoi | Format::Tga => Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
-		Format::WebP => Capabilities { quality: false, compression: true, lossless_mode: true, lossy_mode: false, animation: true, alpha: true },
+		Format::WebP => Capabilities { quality: true, compression: true, lossless_mode: true, lossy_mode: true, animation: true, alpha: true },
 	}
 }
 
@@ -240,8 +240,17 @@ pub fn parse_args(args: &[u8]) -> Result<Config, Error> {
 			mode.get_or_insert(Mode::Lossy);
 		}
 		Format::WebP => {
-			compression.get_or_insert(100);
 			mode.get_or_insert(Mode::Lossless);
+			match mode {
+				Some(Mode::Lossless) => {
+					compression.get_or_insert(100);
+				}
+				Some(Mode::Lossy) => {
+					quality.get_or_insert(90);
+					compression.get_or_insert(100);
+				}
+				None => unreachable!(),
+			}
 		}
 		_ => {}
 	};
@@ -255,6 +264,9 @@ pub fn parse_args(args: &[u8]) -> Result<Config, Error> {
 	if matches!(mode, Some(Mode::Lossless)) && !caps.lossless_mode || matches!(mode, Some(Mode::Lossy)) && !caps.lossy_mode {
 		return Err(Error::UnsupportedOption);
 	}
+	if format == Format::WebP && matches!(mode, Some(Mode::Lossless)) && quality.is_some() {
+		return Err(Error::UnsupportedOption);
+	}
 	if loop_count.is_some() && !caps.animation {
 		return Err(Error::UnsupportedOption);
 	}
@@ -265,6 +277,9 @@ pub fn convert(input: &[u8], config: &Config) -> Result<(Vec<u8>, ResultInfo), E
 	let (input_format, decoded) = decode_input(input)?;
 	let (source_width, source_height) = decoded.dimensions();
 	let animated_webp = config.format == Format::WebP && config.frame.is_none() && matches!(&decoded, Decoded::Animation(_));
+	if animated_webp && matches!(config.mode, Some(Mode::Lossy)) {
+		return Err(Error::UnsupportedOption);
+	}
 	if matches!(config.format, Format::Apng | Format::Gif) || animated_webp {
 		let mut animation = match decoded {
 			Decoded::Still(image) => pix::Animation::still(match config.resize {
@@ -322,7 +337,11 @@ pub fn convert(input: &[u8], config: &Config) -> Result<(Vec<u8>, ResultInfo), E
 		Format::Ppm => ppm::encode(&image).map_err(map_ppm_error)?,
 		Format::Qoi => qoi::encode(&image).map_err(map_qoi_error)?,
 		Format::Tga => tga::encode(&image, tga::EncodeOptions { rle: true }).map_err(map_tga_error)?,
-		Format::WebP => webp::encode_lossless(&image, config.compression.ok_or(Error::InvalidOptions)?).map_err(map_webp_error)?,
+		Format::WebP => match config.mode {
+			Some(Mode::Lossless) => webp::encode_lossless(&image, config.compression.ok_or(Error::InvalidOptions)?).map_err(map_webp_error)?,
+			Some(Mode::Lossy) => webp::encode_lossy(&image, config.quality.ok_or(Error::InvalidOptions)?, config.compression.ok_or(Error::InvalidOptions)?).map_err(map_webp_error)?,
+			None => return Err(Error::InvalidOptions),
+		},
 	};
 	let info = ResultInfo { input_format, output_format: config.format, source_width, source_height, output_width: image.width, output_height: image.height, output_bytes: encoded.len(), quality: config.quality, compression: config.compression, mode: config.mode };
 	Ok((encoded, info))
@@ -616,8 +635,12 @@ mod tests {
 		assert_eq!(parse_args(b"--quality 75 in.png out.pcx").unwrap().quality, Some(75));
 		let webp = parse_args(b"--lossless --compression 100 in.png out.webp").unwrap();
 		assert_eq!(webp.mode, Some(Mode::Lossless));
-		assert_eq!(parse_args(b"--lossy in.png out.webp"), Err(Error::UnsupportedOption));
+		let lossy_webp = parse_args(b"--lossy --quality 80 in.png out.webp").unwrap();
+		assert_eq!((lossy_webp.mode, lossy_webp.quality, lossy_webp.compression), (Some(Mode::Lossy), Some(80), Some(100)));
+		assert_eq!(parse_args(b"--lossy in.png out.webp").unwrap().quality, Some(90));
 		assert_eq!(parse_args(b"--quality 80 in.png out.webp"), Err(Error::UnsupportedOption));
+		assert_eq!(parse_args(b"--lossless --quality 80 in.png out.webp"), Err(Error::UnsupportedOption));
+		assert_eq!(parse_args(b"--lossy --compression 0 in.png out.webp").unwrap().compression, Some(0));
 		assert_eq!(parse_args(b"--format bmp in.png out.png"), Err(Error::InvalidOptions));
 	}
 
@@ -713,6 +736,31 @@ mod tests {
 		}
 		let config = parse_args(b"--lossless --compression 50 in.png out.webp").unwrap();
 		assert_eq!(convert(include_bytes!("../../../volume/sample.png"), &config), Err(Error::UnsupportedFormat));
+	}
+
+	#[test]
+	fn converts_png_to_lossy_webp_with_quality_and_alpha() {
+		let mut pixels = Vec::new();
+		for y in 0..17u8 {
+			for x in 0..19u8 {
+				pixels.extend_from_slice(&[x.wrapping_mul(11), y.wrapping_mul(13), x.wrapping_mul(5).wrapping_add(y.wrapping_mul(7)), x.wrapping_mul(17).wrapping_add(y.wrapping_mul(3))]);
+			}
+		}
+		let source = pix::RgbaImage::new(19, 17, pixels).unwrap();
+		let source_png = png::encode_rgba(&source, png::EncodeOptions { compression: 0 }).unwrap();
+		let (low_bytes, low_info) = convert(&source_png, &parse_args(b"--lossy --quality 0 in.png out.webp").unwrap()).unwrap();
+		let (high_bytes, high_info) = convert(&source_png, &parse_args(b"--lossy --quality 100 in.png out.webp").unwrap()).unwrap();
+		assert_ne!(low_bytes, high_bytes);
+		assert_eq!((low_info.mode, low_info.quality, low_info.compression), (Some(Mode::Lossy), Some(0), Some(100)));
+		assert_eq!((high_info.mode, high_info.quality, high_info.compression), (Some(Mode::Lossy), Some(100), Some(100)));
+		let low = webp::decode(&low_bytes).unwrap();
+		let high = webp::decode(&high_bytes).unwrap();
+		let error = |actual: &pix::RgbaImage| -> u64 { actual.pixels.chunks_exact(4).zip(source.pixels.chunks_exact(4)).map(|(actual, expected)| (0..3).map(|channel| u64::from(actual[channel].abs_diff(expected[channel]))).sum::<u64>()).sum() };
+		assert!(error(&high) < error(&low));
+		for actual in [low, high] {
+			assert_eq!((actual.width, actual.height), (source.width, source.height));
+			assert_eq!(actual.pixels.iter().skip(3).step_by(4).copied().collect::<Vec<_>>(), source.pixels.iter().skip(3).step_by(4).copied().collect::<Vec<_>>());
+		}
 	}
 
 	#[test]

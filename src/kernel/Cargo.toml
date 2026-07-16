@@ -27,6 +27,7 @@ abi = { path = "../abi" }
 [dev-dependencies]
 bmp = { path = "../user/bmp" }
 png = { path = "../user/png" }
+webp = { path = "../user/webp" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we deliberately do NOT set `panic = "abort"` per-profile. Doing so makes cargo
