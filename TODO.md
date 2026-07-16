@@ -2788,21 +2788,76 @@ growing "libaudio" monolith.
     `just audio-bench` keeps every staged release decoder above real time (slowest:
     Ogg Vorbis at 34.6x), while live QEMU WAV capture pins ten seconds of non-silent
     stereo output through the complete shell-to-virtio-sound path.
-- Explicit non-goals: encoding/recording (microphone capture is a separate app and
-  AudioService input contract), DRM, proprietary WMA/RealAudio, patent-licensed
+- [ ] Add one bounded streaming encoder contract beside the shared `pcm` vocabulary,
+  without creating a monolithic audio library. A decoder yields canonical signed-i16
+  interleaved frames plus rate/channel metadata; optional shared transforms perform
+  checked mono/stereo remixing and deterministic sample-rate conversion; each output
+  codec remains owned by its existing leaf and writes incrementally through a fallible
+  byte sink. Final frame counts, checksums, seek tables and container sizes must be
+  correct without retaining an unbounded track in memory. If a format requires fields
+  known only at EOF, finalize into bounded block metadata or a private staged output
+  and publish atomically; interruption, encode failure and out-of-space must not expose
+  a successful partial destination or replace an existing file.
+- [ ] Complete encoders for every format/profile that `play` currently accepts, with
+  no host FFmpeg dependency in the target implementation:
+  - WAV: PCM 8/16/24/32-bit plus IMA ADPCM and Microsoft ADPCM, including canonical
+    `fmt`, `fact` and padded `data` chunks;
+  - AIFF/AIFC: big-endian AIFF PCM and AIFC `NONE`/`sowt` PCM with exact 80-bit sample
+    rate, frame count and SSND layout;
+  - FLAC: STREAMINFO, fixed/LPC subframes, Rice residuals, frame/footer CRCs and a
+    deterministic compression-effort search;
+  - WavPack: bounded mono/stereo lossless blocks, decorrelation, entropy metadata,
+    sample indexes and CRC; hybrid/float/multichannel output remains typed Unsupported;
+  - Ogg Vorbis: Vorbis identification/comment/setup and audio packets plus Ogg page
+    lacing, granule positions, sequence numbers and CRC, with deterministic stream ID;
+  - MP3: MPEG-1/2 Layer III mono/stereo with legal frame headers, bit reservoir,
+    psychoacoustic/quantization decisions and Xing/Info plus gapless delay/padding
+    metadata. Unsupported MPEG versions or channel modes fail explicitly rather than
+    emitting a mislabeled approximation.
+  Encoder source and test-vector provenance must satisfy the project license policy;
+  externally produced fixtures may be used for interoperability tests but are not
+  copied implementations. Each lossless output round-trips sample-exactly through an
+  independent decoder; lossy outputs meet documented quality/error thresholds.
+- [ ] Add governed `audioconv [options] <input> <output>`. Input is selected by the
+  same structural content sniffer as `play`; output is selected by the destination
+  suffix or matching `--format`. The first complete matrix accepts every playable
+  input and emits WAV/WAV-IMA/WAV-MS, AIFF/AIFC, FLAC, WavPack, Ogg Vorbis and MP3.
+  `--force` controls replacement; `--rate`, `--channels` and applicable `--bits`
+  select PCM transformation; normalized `--quality 0..100` controls lossy MP3/Vorbis
+  fidelity and `--compression 0..100` controls lossless FLAC/WavPack effort without
+  changing decoded samples. Inapplicable or contradictory options are rejected from
+  one capability/default table shared by parser, help and tests. Version one strips
+  tags, pictures and arbitrary metadata deliberately and reports that fact together
+  with source/destination format, rate, channels, frames, duration and byte count.
+  The tool receives only the volume bundle, never AudioService or device authority,
+  and supports cross-volume conversion through StorageService.
+- [ ] Add encoder and end-to-end gates. Independent host tools decode every emitted
+  profile and verify container structure, frame count, rate/channels, duration,
+  checksums, gapless trim and deterministic output. Hostile tests cover truncation,
+  oversized declarations, allocation failure, interruption and destination rollback.
+  `just audio-bench` gains encode throughput, peak heap and output-size rows at quality/
+  compression endpoints; common tracks must encode within documented memory and time
+  budgets on x86_64, AArch64 and RISC-V. A governed kernel scenario launches the real
+  `audioconv.lsexe`, converts at least one lossless and one lossy file across two
+  StorageService volumes, reopens and independently decodes both, then plays a result
+  through the existing scoped `play` path.
+- Explicit non-goals: recording (microphone capture is a separate app and AudioService
+  input contract), DRM, proprietary WMA/RealAudio, patent-licensed
   AAC/HE-AAC/E-AC-3, video containers, network radio, playlists/library indexing,
   DSP/equalizer and a graphical player UI. CAF, ALAC, Opus, tracker modules and
   Speex remain optional leaves triggered by a concrete file/workload.
 - Done when: `play` streams WAV PCM, WAV IMA/MS ADPCM, AIFF/AIFC PCM, FLAC, MP3,
-  Ogg Vorbis and WavPack from any mounted volume through its scoped
-  `audio-stream` grant, bounded memory and backpressure remain observable,
-  corrupt inputs fail safely, two players mix concurrently, Ctrl+C stops without
-  leaving the device stream open, and host + targeted kernel tests are green.
+  Ogg Vorbis and WavPack from any mounted volume through its scoped `audio-stream`
+  grant; `audioconv` accepts that complete input matrix and emits every corresponding
+  implemented encoder profile across mounted volumes with bounded memory, atomic
+  destination semantics and independently verified lossless/lossy fidelity; corrupt
+  inputs fail safely, two players mix concurrently, Ctrl+C stops without leaving the
+  device stream open, and host + targeted tri-architecture tests are green.
 - Concept: M121 (typed PCM streams and mixer), M123 (codec leaves become candidates
   for system-image sharing only after size/RAM measurement), the Unix small-tool
-  model (`play` is one focused console program), capability sandboxing
-  (`volumes + audio-stream`, no ambient device/network), and the NOTES audio
-  player item this realizes.
+  model (`play` and `audioconv` remain separate focused console programs), capability
+  sandboxing (`play`: `volumes + audio-stream`; `audioconv`: `volumes` only, with no
+  ambient device/network), and the NOTES audio player/conversion items this realizes.
 
 ## M125 - Native executable artifacts (`.lsexe`)
 
