@@ -552,11 +552,7 @@ fn parse_samples(mut bytes: &[u8], passes: &mut [DecorrPass], channels: u8) -> R
 		}
 		bytes = &bytes[needed..];
 	}
-	if bytes.is_empty() {
-		Ok(())
-	} else {
-		Err(Error::Invalid)
-	}
+	if bytes.is_empty() { Ok(()) } else { Err(Error::Invalid) }
 }
 
 fn parse_entropy(bytes: &[u8], channels: u8) -> Result<Entropy, Error> {
