@@ -73,8 +73,11 @@ interlacing, transparency, frame rectangles, delay and disposal. Output is GIF89
 with a deterministic global palette, LZW image data, graphic controls and the
 Netscape loop extension. Plain Text, Comment and unknown Application extensions
 are non-rendering data and may be ignored safely; malformed block sizes and
-reserved values remain errors. Status: **Verified profile**, pending an external
-89a corpus for deferred-clear and unusual sub-block boundaries.
+reserved values remain errors. Zero delay is preserved. The logical-screen
+background index is not yet represented because its interaction with per-frame
+transparency differs across deployed decoders; background disposal therefore
+remains a **Gap** pending an external browser/tool corpus. Deferred-clear and
+unusual sub-block boundaries need the same independent coverage.
 
 ### JPEG/JFIF
 
@@ -163,18 +166,23 @@ lossy animation is a typed **Subset**.
 The native VP8 encoder's boolean coding, prediction, transform, quantization and
 coefficient tokens are covered by independent decode and fidelity tests. VP8L
 encoding uses the local no_std dependency implementation and must remain covered by
-external decoding rather than only its paired decoder. Remaining **gaps** are strict
-reserved-bit/chunk-order validation, zero-duration preservation (the container
-allows implementation-defined zero rather than requiring coercion to one), and
-background-color semantics during disposal: the shared animation vocabulary
-currently models transparent-background disposal only.
+external decoding rather than only its paired decoder. Animation preserves the
+`ANIM` BGRA background as RGBA and raw 24-bit frame durations including zero. The
+shared compositor initializes and disposes frame rectangles to that background;
+preview and static-frame extraction use the same path. APNG/GIF destinations with
+no equivalent represented background are canonicalized to displayed full-canvas
+frames so cross-format conversion preserves visuals and timing. The parser requires
+`VP8X` first, `ANIM` before `ANMF`, reconstruction chunks before trailing metadata,
+zero RIFF padding and zero reserved bits in `VP8X`/`ANMF`. Status: **Verified
+profile** for the implemented animation subset; independent external decoding remains
+required for the corpus gate.
 
 ## Closure order
 
-1. Resolve WebP zero-duration and animation background-color representation, then
-   pin reserved bits and chunk ordering.
-2. Complete BMP alpha-mask and ICO DIB/mask precedence audits against Microsoft
+1. Complete BMP alpha-mask and ICO DIB/mask precedence audits against Microsoft
    fixtures.
+2. Resolve GIF logical-screen background versus transparent-index interoperability
+  against independent browser/tool output.
 3. Add independent corpora for the remaining verified/subset claims, prioritizing
    ICNS, PCX and TGA where the primary-source chain is weakest.
 

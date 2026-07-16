@@ -3115,6 +3115,16 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     multi-`IDAT` and separate-default-image regressions pass; APNG is 4/4 and
     `imgconv` is 14/14. Independent external fixtures and the remaining per-format
     field audits keep this item open.
+  - Partial result (2026-07-17): the shared animation vocabulary now carries an RGBA
+    background and preserves raw zero frame durations. WebP maps `ANIM` BGRA exactly,
+    uses that color for initial canvas and background disposal, preserves duration 0,
+    writes it back deterministically and validates `VP8X`/`ANMF` reserved bits, zero
+    RIFF padding and top-level reconstruction/metadata order. `imgconv` uses the same
+    compositor for preview and frame extraction; APNG/GIF output canonicalizes a
+    nontransparent WebP background into visual full-canvas frames. APNG and GIF also
+    stop coercing legal zero delays. Focused suites pass: pix 8/8, WebP 11/11, APNG
+    4/4, GIF 3/3 and `imgconv` 15/15. GIF logical-screen background-index semantics
+    remain explicitly open for an independent interoperability corpus.
 - [ ] Make content sniffing structural and collision-resistant. APNG detection must
   walk real PNG chunk boundaries instead of finding `acTL` in arbitrary compressed
   bytes; PCX detection must validate its header fields instead of claiming every file

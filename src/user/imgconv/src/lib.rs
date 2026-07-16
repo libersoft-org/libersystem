@@ -299,6 +299,9 @@ pub fn convert(input: &[u8], config: &Config) -> Result<(Vec<u8>, ResultInfo), E
 			}
 		};
 		animation.loop_count = config.loop_count.unwrap_or(animation.loop_count);
+		if matches!(config.format, Format::Apng | Format::Gif) && animation.background != [0; 4] {
+			animation = canonicalize_animation(&animation)?;
+		}
 		let encoded = match config.format {
 			Format::Apng => apng::encode(&animation, config.compression.ok_or(Error::InvalidOptions)?).map_err(map_apng_error)?,
 			Format::Gif => gif::encode_with_options(&animation, gif::EncodeOptions { quality: config.quality.ok_or(Error::InvalidOptions)?, dither: true, alpha_threshold: 128 }).map_err(map_gif_error)?,
@@ -441,7 +444,7 @@ fn composite_frame(animation: &pix::Animation, target: usize) -> Result<pix::Rgb
 	if target >= animation.frames.len() {
 		return Err(Error::InvalidOptions);
 	}
-	let mut compositor = pix::Compositor::new(animation.width, animation.height).map_err(map_pix_error)?;
+	let mut compositor = pix::Compositor::new_with_background(animation.width, animation.height, animation.background).map_err(map_pix_error)?;
 	for (index, frame) in animation.frames.iter().enumerate() {
 		let displayed = compositor.render(frame).map_err(map_pix_error)?;
 		if index == target {
@@ -449,6 +452,16 @@ fn composite_frame(animation: &pix::Animation, target: usize) -> Result<pix::Rgb
 		}
 	}
 	Err(Error::InvalidOptions)
+}
+
+fn canonicalize_animation(animation: &pix::Animation) -> Result<pix::Animation, Error> {
+	let mut compositor = pix::Compositor::new_with_background(animation.width, animation.height, animation.background).map_err(map_pix_error)?;
+	let mut frames = Vec::new();
+	frames.try_reserve_exact(animation.frames.len()).map_err(|_| Error::TooLarge)?;
+	for frame in &animation.frames {
+		frames.push(pix::Frame { image: compositor.render(frame).map_err(map_pix_error)?, x: 0, y: 0, duration_ms: frame.duration_ms, blend: pix::Blend::Source, disposal: pix::Disposal::Keep });
+	}
+	pix::Animation::new(animation.width, animation.height, animation.loop_count, frames).map_err(map_pix_error)
 }
 
 fn format_from_path(path: &str) -> Option<Format> {
@@ -810,6 +823,33 @@ mod tests {
 		assert_eq!(png::decode_rgba(&frame).unwrap(), webp::decode_animation(source).unwrap().frames[1].image);
 		let (apng, _) = convert(source, &parse_args(b"--compression 100 in.webp out.apng").unwrap()).unwrap();
 		assert_eq!(apng::decode(&apng).unwrap().frames.len(), 2);
+	}
+
+	#[test]
+	fn webp_background_is_composited_when_apng_cannot_represent_it() {
+		let background = [7, 17, 27, 255];
+		let animation = pix::Animation::new_with_background(
+			2,
+			1,
+			background,
+			2,
+			alloc::vec![
+				pix::Frame { image: pix::RgbaImage::new(1, 1, alloc::vec![255, 0, 0, 255]).unwrap(), x: 0, y: 0, duration_ms: 0, blend: pix::Blend::Source, disposal: pix::Disposal::Background },
+				pix::Frame { image: pix::RgbaImage::new(1, 1, alloc::vec![0, 255, 0, 255]).unwrap(), x: 1, y: 0, duration_ms: 30, blend: pix::Blend::Source, disposal: pix::Disposal::Keep },
+			],
+		)
+		.unwrap();
+		let mut source_compositor = pix::Compositor::new_with_background(2, 1, background).unwrap();
+		let expected: Vec<_> = animation.frames.iter().map(|frame| source_compositor.render(frame).unwrap()).collect();
+		let source = webp::encode_animation(&animation, 100).unwrap();
+		let (encoded, _) = convert(&source, &parse_args(b"in.webp out.apng").unwrap()).unwrap();
+		let decoded = apng::decode(&encoded).unwrap();
+		assert_eq!(decoded.frames.iter().map(|frame| frame.duration_ms).collect::<Vec<_>>(), alloc::vec![0, 30]);
+		let mut target_compositor = pix::Compositor::new(decoded.width, decoded.height).unwrap();
+		let actual: Vec<_> = decoded.frames.iter().map(|frame| target_compositor.render(frame).unwrap()).collect();
+		assert_eq!(actual, expected);
+		let (still, _) = convert(&source, &parse_args(b"--frame 1 in.webp out.png").unwrap()).unwrap();
+		assert_eq!(png::decode_rgba(&still).unwrap(), expected[1]);
 	}
 
 	#[test]

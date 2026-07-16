@@ -19,7 +19,7 @@ pub fn decode(data: &[u8]) -> Result<pix::RgbaImage, Error> {
 	let mut decoder = WebPDecoder::new(Cursor::new(data)).map_err(|_| Error::Invalid)?;
 	if decoder.is_animated() {
 		let animation = decode_animation(data)?;
-		let mut compositor = pix::Compositor::new(animation.width, animation.height).map_err(map_pix)?;
+		let mut compositor = pix::Compositor::new_with_background(animation.width, animation.height, animation.background).map_err(map_pix)?;
 		return compositor.render(animation.frames.first().ok_or(Error::Invalid)?).map_err(map_pix);
 	}
 	let (width, height) = decoder.dimensions();
@@ -43,8 +43,10 @@ pub fn decode_animation(data: &[u8]) -> Result<pix::Animation, Error> {
 	}
 	let mut cursor = 12usize;
 	let mut canvas = None;
+	let mut background = None;
 	let mut loop_count = None;
 	let mut frames = Vec::new();
+	let mut trailing = false;
 	while cursor < data.len() {
 		let header = data.get(cursor..cursor + 8).ok_or(Error::Invalid)?;
 		let kind: [u8; 4] = header[..4].try_into().map_err(|_| Error::Invalid)?;
@@ -55,11 +57,18 @@ pub fn decode_animation(data: &[u8]) -> Result<pix::Animation, Error> {
 		if end > data.len() {
 			return Err(Error::Invalid);
 		}
+		if length & 1 != 0 && data[payload_start + length] != 0 {
+			return Err(Error::Invalid);
+		}
 		let payload = &data[payload_start..payload_start + length];
 		match &kind {
+			b"VP8 " | b"VP8L" if cursor == 12 => return Err(Error::Unsupported),
 			b"VP8X" => {
-				if payload.len() != 10 || payload[0] & 0x02 == 0 || canvas.is_some() {
+				if cursor != 12 || payload.len() != 10 || payload[0] & 0xc1 != 0 || payload[1..4] != [0; 3] || canvas.is_some() {
 					return Err(Error::Invalid);
+				}
+				if payload[0] & 0x02 == 0 {
+					return Err(Error::Unsupported);
 				}
 				let width = read_u24(&payload[4..7])?.checked_add(1).ok_or(Error::TooLarge)?;
 				let height = read_u24(&payload[7..10])?.checked_add(1).ok_or(Error::TooLarge)?;
@@ -69,34 +78,41 @@ pub fn decode_animation(data: &[u8]) -> Result<pix::Animation, Error> {
 				canvas = Some((width, height));
 			}
 			b"ANIM" => {
-				if payload.len() != 6 || loop_count.is_some() {
+				if canvas.is_none() || payload.len() != 6 || loop_count.is_some() || trailing {
 					return Err(Error::Invalid);
 				}
+				background = Some([payload[2], payload[1], payload[0], payload[3]]);
 				loop_count = Some(u16::from_le_bytes([payload[4], payload[5]]) as u32);
 			}
 			b"ANMF" => {
 				let (canvas_width, canvas_height) = canvas.ok_or(Error::Invalid)?;
-				if payload.len() < 24 || frames.len() >= pix::MAX_ANIMATION_FRAMES {
+				if loop_count.is_none() || trailing || payload.len() < 24 || frames.len() >= pix::MAX_ANIMATION_FRAMES {
 					return Err(if frames.len() >= pix::MAX_ANIMATION_FRAMES { Error::TooLarge } else { Error::Invalid });
 				}
 				let x = read_u24(&payload[0..3])?.checked_mul(2).ok_or(Error::TooLarge)?;
 				let y = read_u24(&payload[3..6])?.checked_mul(2).ok_or(Error::TooLarge)?;
 				let width = read_u24(&payload[6..9])?.checked_add(1).ok_or(Error::TooLarge)?;
 				let height = read_u24(&payload[9..12])?.checked_add(1).ok_or(Error::TooLarge)?;
-				let duration_ms = read_u24(&payload[12..15])?.max(1);
+				let duration_ms = read_u24(&payload[12..15])?;
 				if x.checked_add(width).filter(|end| *end <= canvas_width).is_none() || y.checked_add(height).filter(|end| *end <= canvas_height).is_none() {
 					return Err(Error::Invalid);
 				}
 				let image = decode_frame_chunks(&payload[16..], width, height)?;
 				let flags = payload[15];
+				if flags & 0xfc != 0 {
+					return Err(Error::Invalid);
+				}
 				frames.push(pix::Frame { image, x, y, duration_ms, blend: if flags & 0x02 == 0 { pix::Blend::Over } else { pix::Blend::Source }, disposal: if flags & 0x01 == 0 { pix::Disposal::Keep } else { pix::Disposal::Background } });
 			}
-			_ => {}
+			b"ICCP" if loop_count.is_none() && !trailing => {}
+			b"EXIF" | b"XMP " if !frames.is_empty() => trailing = true,
+			_ if !frames.is_empty() => trailing = true,
+			_ => return Err(Error::Invalid),
 		}
 		cursor = end;
 	}
 	let (width, height) = canvas.ok_or(Error::Unsupported)?;
-	pix::Animation::new(width, height, loop_count.ok_or(Error::Invalid)?, frames).map_err(map_pix)
+	pix::Animation::new_with_background(width, height, background.ok_or(Error::Invalid)?, loop_count.ok_or(Error::Invalid)?, frames).map_err(map_pix)
 }
 
 fn decode_frame_chunks(chunks: &[u8], width: u32, height: u32) -> Result<pix::RgbaImage, Error> {
@@ -229,11 +245,11 @@ pub fn encode_animation(animation: &pix::Animation, compression: u8) -> Result<V
 	append_chunk(&mut output, b"VP8X", &vp8x)?;
 	let mut anim = Vec::new();
 	anim.try_reserve_exact(6).map_err(|_| Error::TooLarge)?;
-	anim.extend_from_slice(&[0, 0, 0, 0]);
+	anim.extend_from_slice(&[animation.background[2], animation.background[1], animation.background[0], animation.background[3]]);
 	anim.extend_from_slice(&loop_count.to_le_bytes());
 	append_chunk(&mut output, b"ANIM", &anim)?;
 
-	let mut compositor = pix::Compositor::new(animation.width, animation.height).map_err(map_pix)?;
+	let mut compositor = pix::Compositor::new_with_background(animation.width, animation.height, animation.background).map_err(map_pix)?;
 	for frame in &animation.frames {
 		if frame.duration_ms > 0x00ff_ffff {
 			return Err(Error::TooLarge);
@@ -357,6 +373,27 @@ mod tests {
 	use super::*;
 	use alloc::vec;
 
+	fn insert_chunk(data: &mut Vec<u8>, offset: usize, kind: &[u8; 4], payload: &[u8]) {
+		let mut chunk = Vec::new();
+		append_chunk(&mut chunk, kind, payload).unwrap();
+		data.splice(offset..offset, chunk);
+		let size = u32::try_from(data.len() - 8).unwrap();
+		data[4..8].copy_from_slice(&size.to_le_bytes());
+	}
+
+	fn top_level_offsets(data: &[u8], target: &[u8; 4]) -> Vec<usize> {
+		let mut offsets = Vec::new();
+		let mut cursor = 12usize;
+		while cursor < data.len() {
+			let length = u32::from_le_bytes(data[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+			if &data[cursor..cursor + 4] == target {
+				offsets.push(cursor);
+			}
+			cursor += 8 + length + (length & 1);
+		}
+		offsets
+	}
+
 	#[test]
 	fn lossless_endpoints_round_trip_rgba() {
 		let image = pix::RgbaImage::new(3, 2, vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]).unwrap();
@@ -472,6 +509,39 @@ mod tests {
 	}
 
 	#[test]
+	fn animation_preserves_background_zero_duration_and_disposal() {
+		let background = [9, 19, 29, 200];
+		let source = pix::Animation::new_with_background(
+			2,
+			1,
+			background,
+			3,
+			vec![
+				pix::Frame { image: pix::RgbaImage::new(1, 1, vec![255, 0, 0, 255]).unwrap(), x: 0, y: 0, duration_ms: 0, blend: pix::Blend::Source, disposal: pix::Disposal::Background },
+				pix::Frame { image: pix::RgbaImage::new(1, 1, vec![0, 255, 0, 255]).unwrap(), x: 1, y: 0, duration_ms: 30, blend: pix::Blend::Source, disposal: pix::Disposal::Keep },
+			],
+		)
+		.unwrap();
+		let mut compositor = pix::Compositor::new_with_background(2, 1, background).unwrap();
+		let expected: Vec<pix::RgbaImage> = source.frames.iter().map(|frame| compositor.render(frame).unwrap()).collect();
+		let encoded = encode_animation(&source, 100).unwrap();
+		let anim = encoded.windows(4).position(|window| window == b"ANIM").unwrap();
+		assert_eq!(&encoded[anim + 8..anim + 12], &[background[2], background[1], background[0], background[3]]);
+		let decoded = decode_animation(&encoded).unwrap();
+		assert_eq!(decoded.background, background);
+		assert_eq!(decoded.frames.iter().map(|frame| frame.duration_ms).collect::<Vec<_>>(), vec![0, 30]);
+		assert_eq!(decoded.frames.into_iter().map(|frame| frame.image).collect::<Vec<_>>(), expected);
+		assert_eq!(decode(&encoded).unwrap(), expected[0]);
+		let mut before_header = encoded.clone();
+		insert_chunk(&mut before_header, 12, b"JUNK", &[]);
+		assert_eq!(decode_animation(&before_header), Err(Error::Invalid));
+		let mut between_frames = encoded.clone();
+		let second_frame = top_level_offsets(&between_frames, b"ANMF")[1];
+		insert_chunk(&mut between_frames, second_frame, b"EXIF", &[]);
+		assert_eq!(decode_animation(&between_frames), Err(Error::Invalid));
+	}
+
+	#[test]
 	fn animation_refuses_unrepresentable_loop_and_duration() {
 		let image = pix::RgbaImage::new(1, 1, vec![0, 0, 0, 255]).unwrap();
 		let loop_overflow = pix::Animation::new(1, 1, 65_536, vec![pix::Frame { image: image.clone(), x: 0, y: 0, duration_ms: 1, blend: pix::Blend::Source, disposal: pix::Disposal::Keep }]).unwrap();
@@ -490,5 +560,13 @@ mod tests {
 		let mut bad_size = source.to_vec();
 		bad_size[0x30..0x34].copy_from_slice(&u32::MAX.to_le_bytes());
 		assert_eq!(decode_animation(&bad_size), Err(Error::Invalid));
+		let mut reserved_vp8x = source.to_vec();
+		let vp8x = reserved_vp8x.windows(4).position(|window| window == b"VP8X").unwrap();
+		reserved_vp8x[vp8x + 8] |= 1;
+		assert_eq!(decode_animation(&reserved_vp8x), Err(Error::Invalid));
+		let mut reserved_anmf = source.to_vec();
+		let anmf = reserved_anmf.windows(4).position(|window| window == b"ANMF").unwrap();
+		reserved_anmf[anmf + 8 + 15] |= 0x80;
+		assert_eq!(decode_animation(&reserved_anmf), Err(Error::Invalid));
 	}
 }

@@ -151,6 +151,9 @@ pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 }
 
 pub fn encode(animation: &Animation, compression: u8) -> Result<Vec<u8>, Error> {
+	if animation.background != [0; 4] {
+		return Err(Error::Unsupported);
+	}
 	let validated = Animation::new(animation.width, animation.height, animation.loop_count, animation.frames.clone()).map_err(map_pix)?;
 	let mut output = SIGNATURE.to_vec();
 	let mut header = Vec::new();
@@ -217,7 +220,7 @@ fn parse_control(body: &[u8]) -> Result<Control, Error> {
 		1 => Blend::Over,
 		_ => return Err(Error::Invalid),
 	};
-	Ok(Control { width: read_u32(body, 4)?, height: read_u32(body, 8)?, x: read_u32(body, 12)?, y: read_u32(body, 16)?, duration_ms: duration_ms.max(1), blend, disposal })
+	Ok(Control { width: read_u32(body, 4)?, height: read_u32(body, 8)?, x: read_u32(body, 12)?, y: read_u32(body, 16)?, duration_ms, blend, disposal })
 }
 
 fn finish_frame(frames: &mut Vec<Frame>, control: Option<Control>, compressed: &mut Vec<u8>, profile: &PngProfile) -> Result<(), Error> {
@@ -331,12 +334,15 @@ mod tests {
 			2,
 			3,
 			vec![
-				Frame { image: first, x: 0, y: 0, duration_ms: 20, blend: Blend::Source, disposal: Disposal::Keep },
+				Frame { image: first, x: 0, y: 0, duration_ms: 0, blend: Blend::Source, disposal: Disposal::Keep },
 				Frame { image: second, x: 1, y: 0, duration_ms: 35, blend: Blend::Over, disposal: Disposal::Previous },
 			],
 		)
 		.unwrap();
 		assert_eq!(decode(&encode(&animation, 100).unwrap()).unwrap(), animation);
+		let mut unsupported_background = animation;
+		unsupported_background.background = [1, 2, 3, 255];
+		assert_eq!(encode(&unsupported_background, 100), Err(Error::Unsupported));
 	}
 
 	#[test]

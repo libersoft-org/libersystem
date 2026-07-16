@@ -95,12 +95,17 @@ pub struct Frame {
 pub struct Animation {
 	pub width: u32,
 	pub height: u32,
+	pub background: [u8; 4],
 	pub loop_count: u32,
 	pub frames: Vec<Frame>,
 }
 
 impl Animation {
 	pub fn new(width: u32, height: u32, loop_count: u32, frames: Vec<Frame>) -> Result<Self, Error> {
+		Self::new_with_background(width, height, [0; 4], loop_count, frames)
+	}
+
+	pub fn new_with_background(width: u32, height: u32, background: [u8; 4], loop_count: u32, frames: Vec<Frame>) -> Result<Self, Error> {
 		validate_geometry(width, height)?;
 		if frames.is_empty() || frames.len() > MAX_ANIMATION_FRAMES {
 			return Err(if frames.is_empty() { Error::Invalid } else { Error::TooLarge });
@@ -110,7 +115,7 @@ impl Animation {
 		for frame in &frames {
 			let end_x = frame.x.checked_add(frame.image.width).ok_or(Error::TooLarge)?;
 			let end_y = frame.y.checked_add(frame.image.height).ok_or(Error::TooLarge)?;
-			if end_x > width || end_y > height || frame.duration_ms == 0 {
+			if end_x > width || end_y > height {
 				return Err(Error::Invalid);
 			}
 			cumulative_pixels = cumulative_pixels.checked_add(frame.image.pixel_count()).ok_or(Error::TooLarge)?;
@@ -122,28 +127,37 @@ impl Animation {
 				return Err(Error::TooLarge);
 			}
 		}
-		Ok(Self { width, height, loop_count, frames })
+		Ok(Self { width, height, background, loop_count, frames })
 	}
 
 	pub fn still(image: RgbaImage) -> Self {
-		Self { width: image.width, height: image.height, loop_count: 1, frames: alloc::vec![Frame { image, x: 0, y: 0, duration_ms: 1, blend: Blend::Source, disposal: Disposal::Keep }] }
+		Self { width: image.width, height: image.height, background: [0; 4], loop_count: 1, frames: alloc::vec![Frame { image, x: 0, y: 0, duration_ms: 1, blend: Blend::Source, disposal: Disposal::Keep }] }
 	}
 }
 
 pub struct Compositor {
 	canvas: RgbaImage,
+	background: [u8; 4],
 }
 
 impl Compositor {
 	pub fn new(width: u32, height: u32) -> Result<Self, Error> {
+		Self::new_with_background(width, height, [0; 4])
+	}
+
+	pub fn new_with_background(width: u32, height: u32, background: [u8; 4]) -> Result<Self, Error> {
 		let length = usize::try_from(width).ok().and_then(|width| width.checked_mul(height as usize)).and_then(|pixels| pixels.checked_mul(4)).ok_or(Error::TooLarge)?;
-		Ok(Self { canvas: RgbaImage::new(width, height, alloc::vec![0; length])? })
+		let mut pixels = alloc::vec![0; length];
+		for pixel in pixels.chunks_exact_mut(4) {
+			pixel.copy_from_slice(&background);
+		}
+		Ok(Self { canvas: RgbaImage::new(width, height, pixels)?, background })
 	}
 
 	pub fn render(&mut self, frame: &Frame) -> Result<RgbaImage, Error> {
 		let end_x = frame.x.checked_add(frame.image.width).ok_or(Error::TooLarge)?;
 		let end_y = frame.y.checked_add(frame.image.height).ok_or(Error::TooLarge)?;
-		if end_x > self.canvas.width || end_y > self.canvas.height || frame.duration_ms == 0 {
+		if end_x > self.canvas.width || end_y > self.canvas.height {
 			return Err(Error::Invalid);
 		}
 		let previous = matches!(frame.disposal, Disposal::Previous).then(|| self.canvas.pixels.clone());
@@ -165,7 +179,9 @@ impl Compositor {
 			Disposal::Background => {
 				for y in 0..frame.image.height {
 					let start = (frame.y + y) as usize * self.canvas.pitch as usize + frame.x as usize * 4;
-					self.canvas.pixels[start..start + frame.image.width as usize * 4].fill(0);
+					for pixel in self.canvas.pixels[start..start + frame.image.width as usize * 4].chunks_exact_mut(4) {
+						pixel.copy_from_slice(&self.background);
+					}
 				}
 			}
 			Disposal::Previous => self.canvas.pixels = previous.ok_or(Error::Invalid)?,
@@ -383,6 +399,20 @@ mod tests {
 		assert_eq!(shown.pixels[7], 255);
 		let shown = compositor.render(&Frame { image: RgbaImage::new(1, 1, vec![1, 2, 3, 255]).unwrap(), x: 0, y: 0, duration_ms: 10, blend: Blend::Source, disposal: Disposal::Keep }).unwrap();
 		assert_eq!(&shown.pixels[4..8], &[0, 0, 0, 0]);
+	}
+
+	#[test]
+	fn animation_preserves_zero_duration_and_compositor_background() {
+		let background = [9, 8, 7, 6];
+		let image = RgbaImage::new(1, 1, vec![1, 2, 3, 255]).unwrap();
+		let animation = Animation::new_with_background(2, 1, background, 0, vec![Frame { image, x: 0, y: 0, duration_ms: 0, blend: Blend::Source, disposal: Disposal::Background }]).unwrap();
+		assert_eq!(animation.background, background);
+		assert_eq!(animation.frames[0].duration_ms, 0);
+		let mut compositor = Compositor::new_with_background(animation.width, animation.height, animation.background).unwrap();
+		let shown = compositor.render(&animation.frames[0]).unwrap();
+		assert_eq!(shown.pixels, vec![1, 2, 3, 255, 9, 8, 7, 6]);
+		let shown = compositor.render(&Frame { image: RgbaImage::new(1, 1, vec![4, 5, 6, 255]).unwrap(), x: 1, y: 0, duration_ms: 1, blend: Blend::Source, disposal: Disposal::Keep }).unwrap();
+		assert_eq!(shown.pixels, vec![9, 8, 7, 6, 4, 5, 6, 255]);
 	}
 
 	fn bytes(pixels: &[u32]) -> Vec<u8> {

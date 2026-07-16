@@ -48,7 +48,7 @@ pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 	} else {
 		None
 	};
-	let mut control = GraphicsControl { delay: 1, disposal: Disposal::Keep, transparent: None };
+	let mut control = GraphicsControl { delay: 0, disposal: Disposal::Keep, transparent: None };
 	let mut loop_count = 1u32;
 	let mut frames = Vec::new();
 	loop {
@@ -62,7 +62,7 @@ pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 					if body[0] != 4 || body[5] != 0 {
 						return Err(Error::Invalid);
 					}
-					control.delay = u16::from_le_bytes([body[2], body[3]]).max(1);
+					control.delay = u16::from_le_bytes([body[2], body[3]]);
 					control.disposal = match (body[1] >> 2) & 7 {
 						0 | 1 => Disposal::Keep,
 						2 => Disposal::Background,
@@ -121,7 +121,7 @@ pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 				}
 				let image = pix::RgbaImage::new(frame_width, frame_height, pixels).map_err(map_pix)?;
 				frames.push(Frame { image, x, y, duration_ms: control.delay as u32 * 10, blend: Blend::Over, disposal: control.disposal });
-				control = GraphicsControl { delay: 1, disposal: Disposal::Keep, transparent: None };
+				control = GraphicsControl { delay: 0, disposal: Disposal::Keep, transparent: None };
 			}
 			0x3b => {
 				cursor += 1;
@@ -141,6 +141,9 @@ pub fn encode(animation: &Animation) -> Result<Vec<u8>, Error> {
 }
 
 pub fn encode_with_options(animation: &Animation, options: EncodeOptions) -> Result<Vec<u8>, Error> {
+	if animation.background != [0; 4] {
+		return Err(Error::Unsupported);
+	}
 	let validated = Animation::new(animation.width, animation.height, animation.loop_count, animation.frames.clone()).map_err(map_pix)?;
 	if validated.width > u16::MAX as u32 || validated.height > u16::MAX as u32 || validated.loop_count > u16::MAX as u32 {
 		return Err(Error::TooLarge);
@@ -164,7 +167,7 @@ pub fn encode_with_options(animation: &Animation, options: EncodeOptions) -> Res
 	output.push(0);
 	let transparent = palette.transparent_index;
 	for frame in &validated.frames {
-		let delay = u16::try_from(frame.duration_ms.div_ceil(10)).map_err(|_| Error::TooLarge)?.max(1);
+		let delay = u16::try_from(frame.duration_ms.div_ceil(10)).map_err(|_| Error::TooLarge)?;
 		let disposal = match frame.disposal {
 			Disposal::Keep => 1,
 			Disposal::Background => 2,
@@ -261,12 +264,15 @@ mod tests {
 			1,
 			5,
 			vec![
-				Frame { image: first, x: 0, y: 0, duration_ms: 20, blend: Blend::Over, disposal: Disposal::Background },
+				Frame { image: first, x: 0, y: 0, duration_ms: 0, blend: Blend::Over, disposal: Disposal::Background },
 				Frame { image: second, x: 1, y: 0, duration_ms: 30, blend: Blend::Over, disposal: Disposal::Previous },
 			],
 		)
 		.unwrap();
 		assert_eq!(decode(&encode(&animation).unwrap()).unwrap(), animation);
+		let mut unsupported_background = animation;
+		unsupported_background.background = [1, 2, 3, 255];
+		assert_eq!(encode(&unsupported_background), Err(Error::Unsupported));
 	}
 
 	#[test]
