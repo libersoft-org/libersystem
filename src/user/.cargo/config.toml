@@ -1,14 +1,17 @@
 [build]
-target = "x86_64-unknown-none"
+target = "x86_64-unknown-none.json"
 
 [unstable]
 build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true
 
 [target.x86_64-unknown-none]
 # Force a non-PIE, fixed-address ET_EXEC: the kernel's minimal ELF loader maps
 # segments at their link-time p_vaddr and applies no relocations, so the program
-# must use absolute addressing rather than a position-independent layout.
+# must use absolute addressing rather than a position-independent layout. The
+# kernel eagerly preserves x87/SSE state; the custom target selects the mandatory
+# x86_64 SSE2 hard-float ABI instead of the built-in target's soft-float ABI.
 rustflags = ["-C", "relocation-model=static"]
 
 [target.aarch64-unknown-none]

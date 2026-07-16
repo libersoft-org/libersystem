@@ -8,11 +8,16 @@ fi
 
 target="$1"
 shift
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cargo_target="$target"
+cargo_target_flags=()
 
 case "$target" in
 x86_64-unknown-none)
 	emulation="elf_x86_64"
 	rustflags="-C relocation-model=pic"
+	cargo_target="$root/user/x86_64-unknown-none.json"
+	cargo_target_flags=(-Z json-target-spec)
 	;;
 aarch64-unknown-none)
 	emulation="aarch64elf"
@@ -74,7 +79,7 @@ for spec in "$@"; do
 	if [[ "$artifact" == "lsrt" ]]; then
 		features=(--no-default-features --features shared-image)
 	fi
-	(cd "$crate_dir" && RUST_MIN_STACK=16777216 RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib "${features[@]}")
+	(cd "$crate_dir" && RUST_MIN_STACK=16777216 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$cargo_target" --lib "${features[@]}")
 	deps="$crate_dir/target/$target/release/deps"
 	rlib="$(find "$deps" -maxdepth 1 -name "lib${crate}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 	if [[ -z "$rlib" ]]; then

@@ -28,6 +28,7 @@ use self::port::{inb, outb, outw};
 // plus supervisor-mode access/execution prevention (SMAP + SMEP) before any
 // USER-flagged mapping exists
 pub fn init() {
+	context::enable_fpu();
 	gdt::init();
 	idt::init();
 	paging::enable_nx();
@@ -66,6 +67,7 @@ pub fn init_bsp_percpu(lapic_id: u32) {
 // and USER-flagged leaves), load the shared descriptor tables, set up per-CPU
 // data, and enable its LAPIC.
 pub fn init_ap(cpu_id: usize, lapic_id: u32) {
+	context::enable_fpu();
 	paging::enable_nx();
 	paging::enable_smap_smep();
 	gdt::load_ap(cpu_id);

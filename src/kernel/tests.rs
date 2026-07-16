@@ -1934,6 +1934,35 @@ fn scheduler_multiplexes_threads() {
 	assert_eq!(COUNTER.load(Ordering::SeqCst), threads * iters);
 }
 
+#[cfg(target_arch = "x86_64")]
+tagged_test!(scheduler_preserves_xmm_state, [Scheduler]);
+#[cfg(target_arch = "x86_64")]
+fn scheduler_preserves_xmm_state() {
+	use core::arch::asm;
+	use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+	static FAILED: AtomicBool = AtomicBool::new(false);
+	static DONE: AtomicU32 = AtomicU32::new(0);
+	extern "C" fn worker(value: u64) {
+		unsafe { asm!("movq xmm15, {}", in(reg) value, options(nostack, preserves_flags)) };
+		for _ in 0..64 {
+			sched::yield_now();
+			let mut observed: u64;
+			unsafe { asm!("movq {}, xmm15", out(reg) observed, options(nostack, preserves_flags)) };
+			if observed != value {
+				FAILED.store(true, Ordering::SeqCst);
+			}
+		}
+		DONE.fetch_add(1, Ordering::SeqCst);
+	}
+	FAILED.store(false, Ordering::SeqCst);
+	DONE.store(0, Ordering::SeqCst);
+	sched::spawn(worker, 0x1122_3344_5566_7788);
+	sched::spawn(worker, 0x8877_6655_4433_2211);
+	sched::run_until_idle();
+	assert_eq!(DONE.load(Ordering::SeqCst), 2);
+	assert!(!FAILED.load(Ordering::SeqCst), "one thread observed another thread's XMM state");
+}
+
 tagged_test!(preemption_preempts_a_cpu_bound_thread, [Scheduler]);
 fn preemption_preempts_a_cpu_bound_thread() {
 	use core::sync::atomic::{AtomicBool, Ordering};

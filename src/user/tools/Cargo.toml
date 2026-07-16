@@ -8,8 +8,8 @@ edition = "2024"
 build = "../build.rs"
 description = "Standalone foreground tools the shell spawns"
 
-# MP3 is predecoded before opening the live stream so synthesis bursts cannot cause
-# underruns. Optimize only this hot path to keep its debug-image startup bounded.
+# MP3 synthesis is a sustained playback hot path. Optimize only this package pair;
+# x86 hardware float is selected by the shared userspace target configuration.
 [profile.dev.package.mp3]
 opt-level = 3
 

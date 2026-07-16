@@ -150,14 +150,18 @@ frame itself is not rendered. The staged stream therefore exposes the same 328,1
 frames as the independent FFmpeg PCM golden instead of 330,624 raw decoder frames;
 full-stream mean sample error is at most two. `play` is launched as the tty foreground
 job, so ConsoleService delivers Ctrl+C to its Process handle and the caught interrupt
-closes the PCM stream cleanly. Because an unoptimized MP3 synthesis burst can empty the
-cooperatively scheduled live queue, `play` predecodes the staged 656,208-byte PCM before
-opening AudioService (with a 64 MiB hard cap); only the `mp3` and `nanomp3` packages use
-dev opt-level 3 to bound that visible startup. The governed test requires twelve
-consecutive nonempty MP3 hardware periods before interrupt cleanup. A QEMU WAV capture
-measures 7.435 s and 174.86 dB PSNR
-against playback of the derived WAV, with the same source-silence intervals and no added
-underrun gaps.
+closes the PCM stream cleanly. The built-in Rust `x86_64-unknown-none` target uses a
+soft-float ABI and disables SSE, making `nanomp3` execute its float-heavy synthesis
+through compiler-builtins helpers; guest profiling measured 4,236 ms of decode work.
+The LiberSystem x86 userspace target instead selects the normal SSE2 hard-float ABI,
+after the kernel enables x87/SSE on every core and eagerly preserves each thread's
+FXSAVE state. The same decode work then measures 44 ms. `play` therefore keeps the
+bounded 1,024-frame streaming path with no whole-file predecode or startup pause; only
+the `mp3` and `nanomp3` packages use dev opt-level 3. Live playback completes in 7.375 s
+for the 7.44-second fixture. The governed test requires twelve consecutive nonempty MP3
+hardware periods before interrupt cleanup. A QEMU WAV capture measures 7.445 s and
+174.86 dB PSNR against playback of the derived WAV, with the same source-silence
+intervals and no added underrun gaps.
 
 The focused x86 KVM `audio` test now connects two real `play` processes to one real
 StorageService and AudioService through separate playback-only scopes. It holds WAV's
