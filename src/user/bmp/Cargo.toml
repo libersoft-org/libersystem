@@ -5,3 +5,4 @@ description = "Dependency-free bounded BMP decoder"
 
 [dependencies]
 pix = { path = "../pix" }
+quantize = { path = "../quantize" }

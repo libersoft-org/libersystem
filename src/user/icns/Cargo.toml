@@ -1,7 +1,7 @@
 [package]
 name = "icns"
 edition = "2024"
-description = "Bounded no_std modern PNG-backed ICNS container"
+description = "Bounded no_std classic and PNG-backed ICNS container"
 
 [dependencies]
 pix = { path = "../pix" }

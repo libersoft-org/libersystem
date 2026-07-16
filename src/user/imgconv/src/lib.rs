@@ -98,15 +98,16 @@ pub struct Capabilities {
 pub const fn capabilities(format: Format) -> Capabilities {
 	match format {
 		Format::Apng => Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: true, alpha: true },
-		Format::Bmp => Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false },
+		Format::Bmp => Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false },
 		Format::Gif => Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: false, animation: true, alpha: true },
 		Format::Ico => Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
 		Format::Icns => Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
 		Format::Jpeg => Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: true, animation: false, alpha: false },
 		Format::Png => Capabilities { quality: true, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
-		Format::Pcx | Format::Ppm => Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false },
+		Format::Pcx => Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false },
+		Format::Ppm => Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false },
 		Format::Qoi | Format::Tga => Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
-		Format::WebP => Capabilities { quality: false, compression: true, lossless_mode: true, lossy_mode: false, animation: false, alpha: true },
+		Format::WebP => Capabilities { quality: false, compression: true, lossless_mode: true, lossy_mode: false, animation: true, alpha: true },
 	}
 }
 
@@ -263,7 +264,8 @@ pub fn parse_args(args: &[u8]) -> Result<Config, Error> {
 pub fn convert(input: &[u8], config: &Config) -> Result<(Vec<u8>, ResultInfo), Error> {
 	let (input_format, decoded) = decode_input(input)?;
 	let (source_width, source_height) = decoded.dimensions();
-	if matches!(config.format, Format::Apng | Format::Gif) {
+	let animated_webp = config.format == Format::WebP && config.frame.is_none() && matches!(&decoded, Decoded::Animation(_));
+	if matches!(config.format, Format::Apng | Format::Gif) || animated_webp {
 		let mut animation = match decoded {
 			Decoded::Still(image) => pix::Animation::still(match config.resize {
 				Some((width, height)) => resize(&image, width, height, config.filter)?,
@@ -285,6 +287,7 @@ pub fn convert(input: &[u8], config: &Config) -> Result<(Vec<u8>, ResultInfo), E
 		let encoded = match config.format {
 			Format::Apng => apng::encode(&animation, config.compression.ok_or(Error::InvalidOptions)?).map_err(map_apng_error)?,
 			Format::Gif => gif::encode_with_options(&animation, gif::EncodeOptions { quality: config.quality.ok_or(Error::InvalidOptions)?, dither: true, alpha_threshold: 128 }).map_err(map_gif_error)?,
+			Format::WebP => webp::encode_animation(&animation, config.compression.ok_or(Error::InvalidOptions)?).map_err(map_webp_error)?,
 			_ => return Err(Error::InvalidOptions),
 		};
 		let info = ResultInfo { input_format, output_format: config.format, source_width, source_height, output_width: animation.width, output_height: animation.height, output_bytes: encoded.len(), quality: config.quality, compression: config.compression, mode: config.mode };
@@ -300,7 +303,10 @@ pub fn convert(input: &[u8], config: &Config) -> Result<(Vec<u8>, ResultInfo), E
 	};
 	let encoded = match config.format {
 		Format::Apng => return Err(Error::InvalidOptions),
-		Format::Bmp => bmp::encode_rgba(&image).map_err(map_bmp_error)?,
+		Format::Bmp => match config.quality {
+			Some(quality) => bmp::encode_indexed(&image, quality).map_err(map_bmp_error)?,
+			None => bmp::encode_rgba(&image).map_err(map_bmp_error)?,
+		},
 		Format::Gif => return Err(Error::InvalidOptions),
 		Format::Ico => ico::encode(core::slice::from_ref(&image), config.compression.ok_or(Error::InvalidOptions)?).map_err(map_ico_error)?,
 		Format::Icns => icns::encode(core::slice::from_ref(&image), config.compression.ok_or(Error::InvalidOptions)?).map_err(map_icns_error)?,
@@ -309,7 +315,10 @@ pub fn convert(input: &[u8], config: &Config) -> Result<(Vec<u8>, ResultInfo), E
 			Some(quality) => png::encode_indexed(&image, config.compression.ok_or(Error::InvalidOptions)?, quality).map_err(map_png_error)?,
 			None => png::encode_rgba(&image, png::EncodeOptions { compression: config.compression.ok_or(Error::InvalidOptions)? }).map_err(map_png_error)?,
 		},
-		Format::Pcx => pcx::encode(&image).map_err(map_pcx_error)?,
+		Format::Pcx => match config.quality {
+			Some(quality) => pcx::encode_indexed(&image, quality).map_err(map_pcx_error)?,
+			None => pcx::encode(&image).map_err(map_pcx_error)?,
+		},
 		Format::Ppm => ppm::encode(&image).map_err(map_ppm_error)?,
 		Format::Qoi => qoi::encode(&image).map_err(map_qoi_error)?,
 		Format::Tga => tga::encode(&image, tga::EncodeOptions { rle: true }).map_err(map_tga_error)?,
@@ -386,51 +395,14 @@ fn composite_frame(animation: &pix::Animation, target: usize) -> Result<pix::Rgb
 	if target >= animation.frames.len() {
 		return Err(Error::InvalidOptions);
 	}
-	let mut canvas = pix::RgbaImage::new(animation.width, animation.height, alloc::vec![0; animation.width as usize * animation.height as usize * 4]).map_err(map_pix_error)?;
+	let mut compositor = pix::Compositor::new(animation.width, animation.height).map_err(map_pix_error)?;
 	for (index, frame) in animation.frames.iter().enumerate() {
-		let previous = matches!(frame.disposal, pix::Disposal::Previous).then(|| canvas.pixels.clone());
-		for y in 0..frame.image.height {
-			for x in 0..frame.image.width {
-				let source = (y as usize * frame.image.pitch as usize + x as usize * 4) as usize;
-				let destination = ((frame.y + y) as usize * canvas.pitch as usize + (frame.x + x) as usize * 4) as usize;
-				let pixel: [u8; 4] = frame.image.pixels[source..source + 4].try_into().map_err(|_| Error::InvalidImage)?;
-				if frame.blend == pix::Blend::Source {
-					canvas.pixels[destination..destination + 4].copy_from_slice(&pixel);
-				} else {
-					blend_over(&mut canvas.pixels[destination..destination + 4], pixel);
-				}
-			}
-		}
+		let displayed = compositor.render(frame).map_err(map_pix_error)?;
 		if index == target {
-			return Ok(canvas);
-		}
-		match frame.disposal {
-			pix::Disposal::Keep => {}
-			pix::Disposal::Background => {
-				for y in 0..frame.image.height {
-					let start = (frame.y + y) as usize * canvas.pitch as usize + frame.x as usize * 4;
-					canvas.pixels[start..start + frame.image.width as usize * 4].fill(0);
-				}
-			}
-			pix::Disposal::Previous => canvas.pixels = previous.ok_or(Error::InvalidImage)?,
+			return Ok(displayed);
 		}
 	}
 	Err(Error::InvalidOptions)
-}
-
-fn blend_over(destination: &mut [u8], source: [u8; 4]) {
-	let source_alpha = source[3] as u32;
-	let destination_alpha = destination[3] as u32;
-	let out_alpha = source_alpha + (destination_alpha * (255 - source_alpha) + 127) / 255;
-	if out_alpha == 0 {
-		destination.fill(0);
-		return;
-	}
-	for channel in 0..3 {
-		let numerator = source[channel] as u32 * source_alpha * 255 + destination[channel] as u32 * destination_alpha * (255 - source_alpha);
-		destination[channel] = ((numerator + out_alpha * 127) / (out_alpha * 255)) as u8;
-	}
-	destination[3] = out_alpha as u8;
 }
 
 fn format_from_path(path: &str) -> Option<Format> {
@@ -640,6 +612,8 @@ mod tests {
 		let gif = parse_args(b"--quality 25 in.png out.gif").unwrap();
 		assert_eq!(gif.quality, Some(25));
 		assert_eq!(parse_args(b"in.png out.gif").unwrap().quality, Some(100));
+		assert_eq!(parse_args(b"--quality 25 in.png out.bmp").unwrap().quality, Some(25));
+		assert_eq!(parse_args(b"--quality 75 in.png out.pcx").unwrap().quality, Some(75));
 		let webp = parse_args(b"--lossless --compression 100 in.png out.webp").unwrap();
 		assert_eq!(webp.mode, Some(Mode::Lossless));
 		assert_eq!(parse_args(b"--lossy in.png out.webp"), Err(Error::UnsupportedOption));
@@ -667,6 +641,25 @@ mod tests {
 		assert!(encoded.windows(4).any(|window| window == b"PLTE"));
 		assert_eq!(png::decode_rgba(&encoded).unwrap(), source);
 		assert_eq!((info.quality, info.compression), (Some(0), Some(100)));
+	}
+
+	#[test]
+	fn converts_true_color_to_explicit_indexed_bmp_and_pcx() {
+		let mut pixels = Vec::new();
+		for value in 0..512u32 {
+			pixels.extend_from_slice(&[value as u8, (value >> 1) as u8, value.wrapping_mul(47) as u8, 255]);
+		}
+		let source = pix::RgbaImage::new(512, 1, pixels).unwrap();
+		let source_png = png::encode_rgba(&source, png::EncodeOptions { compression: 0 }).unwrap();
+		let (bmp_bytes, bmp_info) = convert(&source_png, &parse_args(b"--quality 0 in.png out.bmp").unwrap()).unwrap();
+		assert_eq!(u16::from_le_bytes([bmp_bytes[28], bmp_bytes[29]]), 8);
+		assert_eq!(bmp_info.quality, Some(0));
+		assert_eq!(bmp::decode_rgba(&bmp_bytes).unwrap().width, source.width);
+
+		let (pcx_bytes, pcx_info) = convert(&source_png, &parse_args(b"--quality 100 in.png out.pcx").unwrap()).unwrap();
+		assert_eq!(pcx_bytes[65], 1);
+		assert_eq!(pcx_info.quality, Some(100));
+		assert_eq!(pcx::decode(&pcx_bytes).unwrap().width, source.width);
 	}
 
 	#[test]
@@ -742,6 +735,17 @@ mod tests {
 	}
 
 	#[test]
+	fn converts_resized_png_to_classic_rle_icns() {
+		let config = parse_args(b"--resize 32x32 --compression 100 in.png out.icns").unwrap();
+		let (encoded, info) = convert(include_bytes!("../../../volume/sample.png"), &config).unwrap();
+		assert!(encoded.windows(4).any(|window| window == b"il32"));
+		assert!(encoded.windows(4).any(|window| window == b"l8mk"));
+		let decoded = icns::decode(&encoded).unwrap();
+		assert_eq!((decoded.width, decoded.height), (32, 32));
+		assert_eq!(info.output_format, Format::Icns);
+	}
+
+	#[test]
 	fn preserves_apng_or_extracts_only_an_explicit_composited_frame() {
 		let first = pix::RgbaImage::new(2, 1, alloc::vec![255, 0, 0, 255, 0, 0, 0, 0]).unwrap();
 		let second = pix::RgbaImage::new(1, 1, alloc::vec![0, 255, 0, 128]).unwrap();
@@ -788,5 +792,13 @@ mod tests {
 		assert_eq!(decoded.loop_count, 7);
 		assert_eq!(decoded.frames, animation.frames);
 		assert_eq!(info.quality, Some(100));
+
+		let (webp_bytes, webp_info) = convert(&source, &parse_args(b"--loop 7 --lossless --compression 100 in.gif out.webp").unwrap()).unwrap();
+		let webp_animation = webp::decode_animation(&webp_bytes).unwrap();
+		assert_eq!(webp_animation.loop_count, 7);
+		assert_eq!(webp_animation.frames.iter().map(|frame| frame.duration_ms).collect::<Vec<_>>(), alloc::vec![20, 30]);
+		assert_eq!(webp_info.mode, Some(Mode::Lossless));
+		let (still_bytes, _) = convert(&source, &parse_args(b"--frame 1 --lossless --compression 100 in.gif out.webp").unwrap()).unwrap();
+		assert!(webp::decode_animation(&still_bytes).is_err());
 	}
 }

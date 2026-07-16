@@ -7,8 +7,16 @@ name = "bmp"
 version = "0.0.0"
 dependencies = [
  "pix",
+ "quantize",
 ]
 
 [[package]]
 name = "pix"
 version = "0.0.0"
+
+[[package]]
+name = "quantize"
+version = "0.0.0"
+dependencies = [
+ "pix",
+]

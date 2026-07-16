@@ -130,6 +130,65 @@ impl Animation {
 	}
 }
 
+pub struct Compositor {
+	canvas: RgbaImage,
+}
+
+impl Compositor {
+	pub fn new(width: u32, height: u32) -> Result<Self, Error> {
+		let length = usize::try_from(width).ok().and_then(|width| width.checked_mul(height as usize)).and_then(|pixels| pixels.checked_mul(4)).ok_or(Error::TooLarge)?;
+		Ok(Self { canvas: RgbaImage::new(width, height, alloc::vec![0; length])? })
+	}
+
+	pub fn render(&mut self, frame: &Frame) -> Result<RgbaImage, Error> {
+		let end_x = frame.x.checked_add(frame.image.width).ok_or(Error::TooLarge)?;
+		let end_y = frame.y.checked_add(frame.image.height).ok_or(Error::TooLarge)?;
+		if end_x > self.canvas.width || end_y > self.canvas.height || frame.duration_ms == 0 {
+			return Err(Error::Invalid);
+		}
+		let previous = matches!(frame.disposal, Disposal::Previous).then(|| self.canvas.pixels.clone());
+		for y in 0..frame.image.height {
+			for x in 0..frame.image.width {
+				let source = y as usize * frame.image.pitch as usize + x as usize * 4;
+				let destination = (frame.y + y) as usize * self.canvas.pitch as usize + (frame.x + x) as usize * 4;
+				let pixel: [u8; 4] = frame.image.pixels.get(source..source + 4).ok_or(Error::Invalid)?.try_into().map_err(|_| Error::Invalid)?;
+				if frame.blend == Blend::Source {
+					self.canvas.pixels[destination..destination + 4].copy_from_slice(&pixel);
+				} else {
+					blend_over(&mut self.canvas.pixels[destination..destination + 4], pixel);
+				}
+			}
+		}
+		let displayed = self.canvas.clone();
+		match frame.disposal {
+			Disposal::Keep => {}
+			Disposal::Background => {
+				for y in 0..frame.image.height {
+					let start = (frame.y + y) as usize * self.canvas.pitch as usize + frame.x as usize * 4;
+					self.canvas.pixels[start..start + frame.image.width as usize * 4].fill(0);
+				}
+			}
+			Disposal::Previous => self.canvas.pixels = previous.ok_or(Error::Invalid)?,
+		}
+		Ok(displayed)
+	}
+}
+
+fn blend_over(destination: &mut [u8], source: [u8; 4]) {
+	let source_alpha = source[3] as u32;
+	let destination_alpha = destination[3] as u32;
+	let out_alpha = source_alpha + (destination_alpha * (255 - source_alpha) + 127) / 255;
+	if out_alpha == 0 {
+		destination.fill(0);
+		return;
+	}
+	for channel in 0..3 {
+		let numerator = source[channel] as u32 * source_alpha * 255 + destination[channel] as u32 * destination_alpha * (255 - source_alpha);
+		destination[channel] = ((numerator + out_alpha * 127) / (out_alpha * 255)) as u8;
+	}
+	destination[3] = out_alpha as u8;
+}
+
 fn validate_geometry(width: u32, height: u32) -> Result<(), Error> {
 	if width == 0 || height == 0 {
 		return Err(Error::Invalid);
@@ -310,6 +369,20 @@ mod tests {
 		assert_eq!(animation.frames.len(), 1);
 		let outside = RgbaImage::new(2, 2, vec![0; 16]).unwrap();
 		assert_eq!(Animation::new(2, 2, 1, vec![Frame { image: outside, x: 1, y: 0, duration_ms: 20, blend: Blend::Source, disposal: Disposal::Keep }]), Err(Error::Invalid));
+	}
+
+	#[test]
+	fn compositor_applies_blend_and_disposal_between_frames() {
+		let first = RgbaImage::new(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255]).unwrap();
+		let overlay = RgbaImage::new(1, 1, vec![0, 255, 0, 128]).unwrap();
+		let mut compositor = Compositor::new(2, 1).unwrap();
+		let shown = compositor.render(&Frame { image: first, x: 0, y: 0, duration_ms: 10, blend: Blend::Source, disposal: Disposal::Keep }).unwrap();
+		assert_eq!(shown.pixels, vec![255, 0, 0, 255, 0, 0, 255, 255]);
+		let shown = compositor.render(&Frame { image: overlay, x: 1, y: 0, duration_ms: 10, blend: Blend::Over, disposal: Disposal::Background }).unwrap();
+		assert_eq!(&shown.pixels[..4], &[255, 0, 0, 255]);
+		assert_eq!(shown.pixels[7], 255);
+		let shown = compositor.render(&Frame { image: RgbaImage::new(1, 1, vec![1, 2, 3, 255]).unwrap(), x: 0, y: 0, duration_ms: 10, blend: Blend::Source, disposal: Disposal::Keep }).unwrap();
+		assert_eq!(&shown.pixels[4..8], &[0, 0, 0, 0]);
 	}
 
 	fn bytes(pixels: &[u32]) -> Vec<u8> {

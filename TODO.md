@@ -2934,9 +2934,22 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     Floyd-Steinberg mapping. GIF consumes it across every animation frame and accepts
     true-color input. Explicit PNG `--quality` now emits the smallest legal indexed
     depth with PLTE/tRNS, independent `--compression`, binary alpha and typed rejection
-    of partial alpha; default PNG remains exact RGBA. Indexed PCX/BMP integration
-    remains. Other matrix work is legacy ICNS RLE, exact animated-WebP subframe
-    metadata, WebP animation encode and a no_std lossy VP8 encoder.
+    of partial alpha; default PNG remains exact RGBA. BMP and PCX now consume the same
+    quantizer when `--quality 0..100` is explicit: BMP emits bottom-up padded 8-bit
+    BI_RGB rows plus a bounded palette, PCX emits one RLE index plane plus its required
+    256-entry trailing palette, and both preserve their existing true-color encoders
+    when quality is omitted. Both remain honestly opaque-only. ICNS now decodes classic
+    `is32/il32/ih32/it32` component-RLE entries paired with `s8mk/l8mk/h8mk/t8mk`
+    alpha masks and encodes canonical 16/32/48-pixel classic entries, while 128+
+    output stays modern PNG-backed. WebP now parses bounded `ANMF` chunks itself so
+    frame x/y/size, duration, blend and background disposal survive instead of being
+    flattened by the high-level decoder; `pix::Compositor` is the one shared visual
+    blend/disposal implementation used by previews and converters. Lossless animated
+    WebP output canonicalizes each displayed frame to a full-canvas VP8L `ANMF`,
+    preserving visual pixels, timing and representable loop counts. Remaining codec
+    work is a no_std lossy VP8 encoder; the current lossless engine exposes only a real
+    predictor on/off effort switch, so intermediate 1..99 effort remains typed
+    Unsupported rather than being faked.
 - [x] Exact CLI and option semantics, parsed by shared host-tested helpers:
   `imgconv [options] <input> <output>`. `--format <name>` overrides only output
   suffix selection; an unknown or mismatched suffix is an error. `--force` permits
@@ -2964,16 +2977,17 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   encoder fail before opening the output. Defaults and each accepted/rejected option
   are represented by one data-driven format-capability table shared by parser, help
   text and tests, so behavior cannot drift by codec.
-  - Partial result (2026-07-15): one capability table drives validation and effective
+  - Partial result (2026-07-16): one capability table drives validation and effective
     defaults. PNG/APNG/ICO/ICNS expose compression 0..100; explicit PNG quality
     0..100 selects indexed output with a real 16..256-entry palette budget, while no
-    quality keeps exact RGBA. JPEG exposes quality 0..100 and lossy mode. GIF quality
-    0..100 selects the same real palette budget, defaults to 100 and always uses
-    bounded dithering. WebP defaults
-    lossless and currently supports genuine
-    encoder endpoints 0 (no predictor) and 100 (predictor), rejecting intermediate
-    effort, `--lossy` and `--quality` until a real multi-level/lossy VP8 encoder
-    exists. Audited alternatives (`webpx`, `fast-webp`) wrap unsafe libwebp C FFI;
+    quality keeps exact RGBA. Explicit BMP/PCX quality selects the same palette budget,
+    while omission preserves their true-color output. JPEG exposes quality 0..100 and
+    lossy mode. GIF quality 0..100 selects the same real palette budget, defaults to 100
+    and always uses bounded dithering. WebP defaults lossless, supports static and
+    animated VP8L output, and currently has genuine encoder effort endpoints 0 (no
+    predictor) and 100 (predictor), rejecting intermediate effort, `--lossy` and
+    `--quality` until a real multi-level/lossy VP8 encoder exists. Audited alternatives
+    (`webpx`, `fast-webp`) wrap unsafe libwebp C FFI;
     `oxideav-webp` is a std-heavy scaffold, so none satisfy the bare-metal rule.
     Fixed-compression formats reject controls instead of ignoring them.
 - [ ] Bounded, failure-safe output path: decode and transform under checked image/frame
@@ -3016,18 +3030,23 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   quality/compression endpoints; common desktop-sized fixtures must finish within a
   documented budget. Full userspace/package builds remain green on x86_64, aarch64
   and riscv64, with focused x86 storage/process/service/display integration green.
-  - Partial result (2026-07-16): `just image-bench` covers eighteen 512x512 true-color
-    output profiles; the slowest measured encode is indexed PNG quality 100 at 167.3 ms
-    and decode is RGBA PNG compression 100 at 26.6 ms, both well below the 5 s gate.
-    The complete application-library suite is 131/131, focused
-    x86 process/service/storage/display/input is 55/55, and full shared-library plus
-    userspace builds pass on x86_64, aarch64 and riscv64. The strict x86 image graph
-    includes PNG 23,576 B, APNG 12,648 B, quantize 17,008 B, GIF 75,856 B,
-    ICO 12,416 B, ICNS 17,320 B, JPEG
-    325,424 B, PCX 8,368 B, PPM 9,376 B, QOI 16,552 B, TGA 10,216 B and WebP
-    309,080 B with canonical prefix-free SONAME/NEEDED edges. Remaining gate work is
-    cross-volume mutation, failure cleanup/transactional publish, lossy-WebP quality
-    endpoints and viewer launch on a newly converted non-PNG format.
+  - Partial result (2026-07-16): `just image-bench` covers twenty-three 512x512 true-color
+    output profiles plus a two-frame lossless animated WebP profile, adding indexed
+    BMP/PCX quality 0 and 100 plus classic 32-pixel ICNS.
+    The slowest measured
+    encode is indexed PNG quality 100 at 164.5 ms; indexed BMP/PCX quality 100 take
+    149.2/173.2 ms, classic ICNS takes 25.3 ms and animated WebP takes 0.7 ms, all well
+    below the 5 s gate. The
+    complete application-library suite is green, focused x86 process/service/storage/
+    display/input is 55/55, and full
+    shared-library plus userspace builds pass on x86_64, aarch64 and riscv64. The strict
+    x86 image graph includes BMP 15,952 B and PCX 11,968 B, both with a direct
+    `quantize.lslib` edge, plus PNG 23,576 B, APNG 12,648 B, quantize 17,008 B,
+    GIF 75,856 B, ICO 12,416 B, ICNS 34,496 B, JPEG 325,424 B, PPM 9,376 B,
+    QOI 16,552 B, TGA 10,216 B and WebP 313,304 B with canonical prefix-free
+    SONAME/NEEDED edges. Remaining gate work is cross-volume mutation, failure cleanup/
+    transactional publication evidence, lossy-WebP quality endpoints and viewer launch on a newly
+    converted non-PNG format.
 - Done when: `imgconv` converts every implemented M126 format through the same RGBA/frame
   model, WebP can explicitly choose lossless or lossy, applicable encoders honor
   validated 0..100 quality/compression controls, alpha and animation are never dropped

@@ -128,10 +128,13 @@ for spec in "$@"; do
 		link_deps=("$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	bmp)
+		link_deps=("$(library_file quantize)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
+	ppm | tga)
 		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
-	pcx | ppm | tga)
-		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+	pcx)
+		link_deps=("$(library_file quantize)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	qoi)
 		qoi_codec_archive="$(find "$deps" -maxdepth 1 -name 'libqoi-*.rlib' ! -samefile "$rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"

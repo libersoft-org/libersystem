@@ -73,25 +73,13 @@ pub fn decode(data: &[u8]) -> Result<pix::RgbaImage, Error> {
 }
 
 pub fn encode(image: &pix::RgbaImage) -> Result<Vec<u8>, Error> {
+	validate_opaque(image)?;
 	if image.width > u16::MAX as u32 || image.height > u16::MAX as u32 {
 		return Err(Error::TooLarge);
 	}
-	if image.pixels.chunks_exact(4).any(|pixel| pixel[3] != 255) {
-		return Err(Error::Unsupported);
-	}
 	let bytes_per_line = (image.width as usize + 1) & !1;
-	let mut output = alloc::vec![0u8; HEADER_LEN];
-	output[0] = 0x0a;
-	output[1] = 5;
-	output[2] = 1;
-	output[3] = 8;
-	output[8..10].copy_from_slice(&(image.width as u16 - 1).to_le_bytes());
-	output[10..12].copy_from_slice(&(image.height as u16 - 1).to_le_bytes());
-	output[12..14].copy_from_slice(&72u16.to_le_bytes());
-	output[14..16].copy_from_slice(&72u16.to_le_bytes());
+	let mut output = header(image, bytes_per_line)?;
 	output[65] = 3;
-	output[66..68].copy_from_slice(&(bytes_per_line as u16).to_le_bytes());
-	output[68..70].copy_from_slice(&1u16.to_le_bytes());
 	for y in 0..image.height as usize {
 		for channel in 0..3 {
 			let mut row = Vec::new();
@@ -104,6 +92,64 @@ pub fn encode(image: &pix::RgbaImage) -> Result<Vec<u8>, Error> {
 		}
 	}
 	Ok(output)
+}
+
+pub fn encode_indexed(image: &pix::RgbaImage, quality: u8) -> Result<Vec<u8>, Error> {
+	validate_opaque(image)?;
+	if image.width > u16::MAX as u32 || image.height > u16::MAX as u32 {
+		return Err(Error::TooLarge);
+	}
+	if quality > 100 {
+		return Err(Error::Invalid);
+	}
+	let palette = quantize::build_palette(&[image.as_rgba()], quantize::Options { quality, dither: true, alpha_threshold: 1 }).map_err(map_quantize)?;
+	let indices = quantize::map_image(image.as_rgba(), &palette).map_err(map_quantize)?;
+	let bytes_per_line = (image.width as usize + 1) & !1;
+	let mut output = header(image, bytes_per_line)?;
+	output[65] = 1;
+	for y in 0..image.height as usize {
+		let source = y.checked_mul(image.width as usize).ok_or(Error::TooLarge)?;
+		let mut row = Vec::new();
+		row.try_reserve_exact(bytes_per_line).map_err(|_| Error::TooLarge)?;
+		row.extend_from_slice(&indices[source..source + image.width as usize]);
+		row.resize(bytes_per_line, 0);
+		encode_rle(&row, &mut output);
+	}
+	output.try_reserve_exact(PALETTE_LEN).map_err(|_| Error::TooLarge)?;
+	output.push(0x0c);
+	for index in 0..256 {
+		let color = palette.colors.get(index).copied().unwrap_or([0, 0, 0, 255]);
+		output.extend_from_slice(&color[..3]);
+	}
+	Ok(output)
+}
+
+fn header(image: &pix::RgbaImage, bytes_per_line: usize) -> Result<Vec<u8>, Error> {
+	let bytes_per_line = u16::try_from(bytes_per_line).map_err(|_| Error::TooLarge)?;
+	let mut output = alloc::vec![0u8; HEADER_LEN];
+	output[0] = 0x0a;
+	output[1] = 5;
+	output[2] = 1;
+	output[3] = 8;
+	output[8..10].copy_from_slice(&(image.width as u16 - 1).to_le_bytes());
+	output[10..12].copy_from_slice(&(image.height as u16 - 1).to_le_bytes());
+	output[12..14].copy_from_slice(&72u16.to_le_bytes());
+	output[14..16].copy_from_slice(&72u16.to_le_bytes());
+	output[66..68].copy_from_slice(&bytes_per_line.to_le_bytes());
+	output[68..70].copy_from_slice(&1u16.to_le_bytes());
+	Ok(output)
+}
+
+fn validate_opaque(image: &pix::RgbaImage) -> Result<(), Error> {
+	let row_bytes = image.width.checked_mul(4).ok_or(Error::TooLarge)?;
+	let expected = (image.pitch as usize).checked_mul(image.height as usize).ok_or(Error::TooLarge)?;
+	if image.width == 0 || image.height == 0 || image.pitch != row_bytes || image.pixels.len() != expected {
+		return Err(Error::Invalid);
+	}
+	if image.pixels.chunks_exact(4).any(|pixel| pixel[3] != 255) {
+		return Err(Error::Unsupported);
+	}
+	Ok(())
 }
 
 fn decode_rle(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
@@ -159,6 +205,13 @@ fn map_pix(error: pix::Error) -> Error {
 	}
 }
 
+fn map_quantize(error: quantize::Error) -> Error {
+	match error {
+		quantize::Error::Invalid => Error::Invalid,
+		quantize::Error::TooLarge => Error::TooLarge,
+	}
+}
+
 #[cfg(test)]
 extern crate std;
 
@@ -171,6 +224,25 @@ mod tests {
 	fn rgb_round_trips_odd_width_and_escaped_bytes() {
 		let image = pix::RgbaImage::new(3, 2, vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 192, 193, 194, 255, 1, 2, 3, 255, 4, 5, 6, 255]).unwrap();
 		assert_eq!(decode(&encode(&image).unwrap()).unwrap(), image);
+	}
+
+	#[test]
+	fn indexed_round_trips_exact_colors_and_honors_quality_budget() {
+		let exact = pix::RgbaImage::new(3, 1, vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255]).unwrap();
+		let encoded = encode_indexed(&exact, 100).unwrap();
+		assert_eq!(encoded[65], 1);
+		assert_eq!(encoded[encoded.len() - PALETTE_LEN], 0x0c);
+		assert_eq!(decode(&encoded).unwrap(), exact);
+
+		let mut pixels = Vec::new();
+		for value in 0..512u32 {
+			pixels.extend_from_slice(&[value as u8, (value >> 1) as u8, value.wrapping_mul(47) as u8, 255]);
+		}
+		let true_color = pix::RgbaImage::new(512, 1, pixels).unwrap();
+		let low = encode_indexed(&true_color, 0).unwrap();
+		let high = encode_indexed(&true_color, 100).unwrap();
+		assert_ne!(&low[low.len() - 768..], &high[high.len() - 768..]);
+		assert_eq!(decode(&low).unwrap().width, true_color.width);
 	}
 
 	#[test]

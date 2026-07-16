@@ -81,14 +81,7 @@ pub fn decode_rgba(data: &[u8]) -> Result<pix::RgbaImage, Error> {
 }
 
 pub fn encode_rgba(image: &pix::RgbaImage) -> Result<Vec<u8>, Error> {
-	let source_row = usize::try_from(image.width).ok().and_then(|width| width.checked_mul(4)).ok_or(Error::TooLarge)?;
-	let expected = source_row.checked_mul(image.height as usize).ok_or(Error::TooLarge)?;
-	if image.width == 0 || image.height == 0 || image.width > MAX_DIMENSION || image.height > MAX_DIMENSION || image.width as u64 * image.height as u64 > MAX_PIXELS || image.pitch as usize != source_row || image.pixels.len() != expected {
-		return Err(Error::Invalid);
-	}
-	if image.pixels.chunks_exact(4).any(|pixel| pixel[3] != 255) {
-		return Err(Error::Unsupported);
-	}
+	let source_row = validate_opaque(image)?;
 	let row_stride = usize::try_from(image.width).ok().and_then(|width| width.checked_mul(3)).and_then(|bytes| bytes.checked_add(3)).map(|bytes| bytes & !3).ok_or(Error::TooLarge)?;
 	let pixel_len = row_stride.checked_mul(image.height as usize).ok_or(Error::TooLarge)?;
 	let file_len = FILE_HEADER_LEN.checked_add(INFO_HEADER_LEN).and_then(|header| header.checked_add(pixel_len)).ok_or(Error::TooLarge)?;
@@ -115,6 +108,61 @@ pub fn encode_rgba(image: &pix::RgbaImage) -> Result<Vec<u8>, Error> {
 		}
 	}
 	Ok(output)
+}
+
+pub fn encode_indexed(image: &pix::RgbaImage, quality: u8) -> Result<Vec<u8>, Error> {
+	validate_opaque(image)?;
+	if quality > 100 {
+		return Err(Error::Invalid);
+	}
+	let palette = quantize::build_palette(&[image.as_rgba()], quantize::Options { quality, dither: true, alpha_threshold: 1 }).map_err(map_quantize)?;
+	let indices = quantize::map_image(image.as_rgba(), &palette).map_err(map_quantize)?;
+	let palette_len = palette.colors.len().checked_mul(4).ok_or(Error::TooLarge)?;
+	let row_stride = usize::try_from(image.width).ok().and_then(|width| width.checked_add(3)).map(|bytes| bytes & !3).ok_or(Error::TooLarge)?;
+	let pixel_len = row_stride.checked_mul(image.height as usize).ok_or(Error::TooLarge)?;
+	let pixel_offset = FILE_HEADER_LEN.checked_add(INFO_HEADER_LEN).and_then(|header| header.checked_add(palette_len)).ok_or(Error::TooLarge)?;
+	let file_len = pixel_offset.checked_add(pixel_len).ok_or(Error::TooLarge)?;
+	let mut output = zeroed(file_len)?;
+	output[..2].copy_from_slice(b"BM");
+	output[2..6].copy_from_slice(&u32::try_from(file_len).map_err(|_| Error::TooLarge)?.to_le_bytes());
+	output[10..14].copy_from_slice(&u32::try_from(pixel_offset).map_err(|_| Error::TooLarge)?.to_le_bytes());
+	output[14..18].copy_from_slice(&(INFO_HEADER_LEN as u32).to_le_bytes());
+	output[18..22].copy_from_slice(&(image.width as i32).to_le_bytes());
+	output[22..26].copy_from_slice(&(image.height as i32).to_le_bytes());
+	output[26..28].copy_from_slice(&1u16.to_le_bytes());
+	output[28..30].copy_from_slice(&8u16.to_le_bytes());
+	output[34..38].copy_from_slice(&u32::try_from(pixel_len).map_err(|_| Error::TooLarge)?.to_le_bytes());
+	output[46..50].copy_from_slice(&u32::try_from(palette.colors.len()).map_err(|_| Error::TooLarge)?.to_le_bytes());
+	for (index, color) in palette.colors.iter().enumerate() {
+		let offset = FILE_HEADER_LEN + INFO_HEADER_LEN + index * 4;
+		output[offset..offset + 4].copy_from_slice(&[color[2], color[1], color[0], 0]);
+	}
+	for file_y in 0..image.height as usize {
+		let source_y = image.height as usize - 1 - file_y;
+		let source = source_y.checked_mul(image.width as usize).ok_or(Error::TooLarge)?;
+		let target = pixel_offset.checked_add(file_y.checked_mul(row_stride).ok_or(Error::TooLarge)?).ok_or(Error::TooLarge)?;
+		output[target..target + image.width as usize].copy_from_slice(&indices[source..source + image.width as usize]);
+	}
+	Ok(output)
+}
+
+fn validate_opaque(image: &pix::RgbaImage) -> Result<usize, Error> {
+	let source_row = usize::try_from(image.width).ok().and_then(|width| width.checked_mul(4)).ok_or(Error::TooLarge)?;
+	let expected = source_row.checked_mul(image.height as usize).ok_or(Error::TooLarge)?;
+	if image.width == 0 || image.height == 0 || image.width > MAX_DIMENSION || image.height > MAX_DIMENSION || image.width as u64 * image.height as u64 > MAX_PIXELS || image.pitch as usize != source_row || image.pixels.len() != expected {
+		return Err(Error::Invalid);
+	}
+	if image.pixels.chunks_exact(4).any(|pixel| pixel[3] != 255) {
+		return Err(Error::Unsupported);
+	}
+	Ok(source_row)
+}
+
+fn map_quantize(error: quantize::Error) -> Error {
+	match error {
+		quantize::Error::Invalid => Error::Invalid,
+		quantize::Error::TooLarge => Error::TooLarge,
+	}
 }
 
 fn zeroed(len: usize) -> Result<Vec<u8>, Error> {
@@ -495,5 +543,25 @@ mod tests {
 		assert_eq!(decode_rgba(&encode_rgba(&image).unwrap()).unwrap(), image);
 		let transparent = pix::RgbaImage::new(1, 1, vec![1, 2, 3, 4]).unwrap();
 		assert_eq!(encode_rgba(&transparent), Err(Error::Unsupported));
+	}
+
+	#[test]
+	fn encodes_quantized_eight_bit_rows_with_quality_budget() {
+		let exact = pix::RgbaImage::new(3, 1, vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255]).unwrap();
+		let encoded = encode_indexed(&exact, 100).unwrap();
+		assert_eq!(read_u16(&encoded, 28).unwrap(), 8);
+		assert_eq!(read_u32(&encoded, 46).unwrap(), 3);
+		assert_eq!(decode_rgba(&encoded).unwrap(), exact);
+
+		let mut pixels = Vec::new();
+		for value in 0..512u32 {
+			pixels.extend_from_slice(&[value as u8, (value >> 1) as u8, value.wrapping_mul(47) as u8, 255]);
+		}
+		let true_color = pix::RgbaImage::new(512, 1, pixels).unwrap();
+		let low = encode_indexed(&true_color, 0).unwrap();
+		let high = encode_indexed(&true_color, 100).unwrap();
+		assert!(read_u32(&low, 46).unwrap() <= 16);
+		assert!(read_u32(&high, 46).unwrap() > read_u32(&low, 46).unwrap());
+		assert_eq!(decode_rgba(&low).unwrap().width, true_color.width);
 	}
 }

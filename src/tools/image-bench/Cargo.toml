@@ -7,3 +7,4 @@ description = "Host release encode/decode benchmark for LiberSystem image leaves
 imgconv = { path = "../../user/imgconv" }
 pix = { path = "../../user/pix" }
 png = { path = "../../user/png" }
+webp = { path = "../../user/webp" }
