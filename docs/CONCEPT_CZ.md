@@ -971,9 +971,11 @@ Detailní bezpečnostní politika a její fázování (co platí od MVP, co se o
 
 Drivery jsou mimo kernel jako izolované služby.
 
-#### MVP: jen virtio na QEMU/KVM
+#### Fáze 2: virtio plus univerzální standardizované ovladače
 
-Aby projekt nezamrzl na ovladačích reálného (a buggy) hardwaru, **první cíl je výhradně virtio na QEMU/KVM.** Virtio je čisté, dobře dokumentované a stačí na plnohodnotný systém ve virtuálu:
+Aby projekt nezamrzl na ovladačích libovolného reálného (a chybového) hardwaru,
+**transportem pro VM v prvním cíli je virtio na QEMU/KVM.** Virtio je čisté, dobře
+dokumentované a stačí na plnohodnotný systém ve virtuálu:
 
 ```text
 driver.virtio-blk      # blokové úložiště
@@ -981,23 +983,27 @@ driver.virtio-net      # síť
 driver.virtio-console  # sériová konzole / log
 driver.virtio-gpu      # framebuffer / 2D, později akcelerace
 driver.virtio-input    # klávesnice / myš
+driver.virtio-snd      # transport PCM přehrávání / záznamu
 ```
 
-Reálný HW (USB, NVMe, AHCI, GPU, Wi-Fi, audio) se přidává **postupně a podle potřeby** - když to někdo chce nasadit na konkrétní stroj. Vlastní GPU/Wi-Fi stack se v dohledné době záměrně nepíše (je to nejčastější hřbitov nových OS).
+Fáze 2 není omezena jen na virtio: může obsahovat také záměrně malou sadu
+**univerzálních ovladačů řízených veřejným standardem**, jejichž rozhraní je společné
+napříč výrobci a užitečné na mnoha strojích. První taková cesta už existuje:
+`driver.xhci` plus USB HID a USB mass-storage class podpora. Tyto ovladače vybíráme
+podle pokrytí protokolu, ne pro jedno product ID nebo jednu desku.
 
-#### Cílové ovladače (později)
+Fáze 2 se tím nestává obecnou fází podpory bare-metal hardwaru. Širokou podporu GPU,
+Wi-Fi a vendor zařízení nadále záměrně odkládáme (jde o nejčastější hřbitov nových OS).
+Další univerzální ovladače řadičů, protokolů a tříd přidáváme pouze tehdy, když jejich
+přenositelnost a hodnota pro appliance/edge ospravedlní omezené implementační náklady.
 
-```text
-driver.usb
-driver.nvme
-driver.gpu
-driver.audio
-driver.network
-driver.fs.liberfs
-driver.fs.fat
-driver.fs.iso9660
-driver.fs.udf
-```
+#### Ovladače konkrétních zařízení (později)
+
+Fáze 4 uvádí do provozu vybrané reálné stroje. Její nové ovladače jsou proto specifické
+pro konkrétní nasazení: určitý NIC, GPU, Wi-Fi/audio čip, storage řadič, periferní blok
+SoC nebo desku. DeviceManager je nadále váže za stejnými typovanými kontrakty služeb,
+zatímco dříve vytvořené univerzální ovladače zůstávají sdílenými stavebními bloky.
+Filesystemové služby nejsou hardwarové ovladače a do tohoto seznamu nepatří.
 
 #### Pád driveru
 
@@ -1558,7 +1564,12 @@ jednoduché CLI
 základní System Graph
 ```
 
-**Ovladače v MVP:** pouze virtio (viz sekce Drivery). **Aplikační ABI je rozhodnuté** - WebAssembly komponenty + WASI (viz *Aplikační model*), jakmile poběží core IPC a služby, je blízkým cílem **minimální WASI host, který spustí první komponentu**. MVP samotné ale stojí na nativních Rust službách, Wasm host přichází hned v navazující fázi (viz *Roadmapa*).
+**Ovladače v MVP jádra začínají u virtio; fáze 2 přidává také omezenou sadu
+univerzálních ovladačů založených na standardech (viz sekce Drivery).** Aplikační ABI
+je rozhodnuté - WebAssembly komponenty + WASI (viz *Aplikační model*); jakmile poběží
+core IPC a služby, je blízkým cílem **minimální WASI host, který spustí první
+komponentu**. MVP samotné ale stojí na nativních Rust službách, Wasm host přichází hned
+v navazující fázi (viz *Roadmapa*).
 
 Záměrně neřešit v MVP:
 
@@ -1586,7 +1597,7 @@ Roadmapa je milníková, ne časová (záměrně bez termínů):
 - Pořadí fází sleduje nasazovací cíle appliance/edge → server → desktop (viz *Proč tento OS místo Linuxu*).
 - Nasazení na reálný hardware přichází po serverové fázi, AI platforma jako závěrečná evoluce nad desktopem.
 
-**Jak číst horizont fází.** Fáze 0-2 cílí na appliance/edge a představují **reálný, blízký cíl** jednoho člověka nebo malého týmu (bootovatelný capability microkernel + první WASI komponenta + virtio + síť). Je třeba je chápat jako *úplný* projekt, nikoli jako odrazový můstek k něčemu většímu - i samotná appliance/edge platforma je dokončený, smysluplný produkt.
+**Jak číst horizont fází.** Fáze 0-2 cílí na appliance/edge a představují **reálný, blízký cíl** jednoho člověka nebo malého týmu (bootovatelný capability microkernel + první WASI komponenta + virtio + omezená sada univerzálních ovladačů + síť). Je třeba je chápat jako *úplný* projekt, nikoli jako odrazový můstek k něčemu většímu - i samotná appliance/edge platforma je dokončený, smysluplný produkt.
 
 **Fáze 3-6 nejsou plánem, ale vizí - a platí pouze za předpokladu, že kolem projektu vznikne komunita.** Fáze 3 (server), Fáze 4 (reálný hardware), Fáze 5 (plnohodnotný desktop) a Fáze 6 (AI platforma) představují stovky člověko-roků. Jsou proto vědomě formulovány jako *směr*, kam systém **může** růst díky své architektuře s příchodem dalších přispěvatelů.
 
@@ -1620,6 +1631,7 @@ prototyp file pickeru (powerbox)
 
 ```text
 síťový stack nad virtio-net (priorita - na edge je síť jádro)
+standardizované univerzální ovladače s širokým využitím, počínaje xHCI USB plus třídami HID a mass storage; žádná matice podpory vendor zařízení
 interaktivní konzole: vstup z klávesnice + userspace řádkový editor (historie příkazů, pohyb kurzoru, editace uvnitř řádku, ANSI sekvence pro šipky) - kernel konzole zůstává hloupým bajtovým kanálem, řádkový editor žije v shellu
 jednoduché pointer/myš plumbing nad virtio-input (pointer v textových buňkách + události tlačítek pro TUI aplikace typu správce souborů); zatím žádný myší stack ani touch (ty jsou až desktopová fáze)
 observabilita: plný System Graph, JSON/CBOR/CLI reprezentace, tracing, counters (JSON/CBOR formy jsou network-friendly; vystavení a správa po síti je fáze 3)
@@ -1651,7 +1663,7 @@ CLI package manager (hledání / instalace / aktualizace / odebrání vlastních
 ```text
 POSIX-like kompatibilní vrstva (relibc-style) - pro cizí serverový software
 driver binding model v praxi: DeviceManager páruje reálná zařízení → drivery
-výběrové ovladače reálného HW dle nasazení (NVMe, NIC, úložiště, sběrnice)
+ovladače konkrétních zařízení a desek vybrané podle nasazení (konkrétní NIC/GPU/Wi-Fi/audio/storage řadiče a periferní bloky SoC)
 podpora konkrétních serverů a SBC (single-board computers)
 ARM64 / RISC-V reálné desky vedle x86-64 (portace z fáze 2 přenesená z QEMU na bare metal)
 power management dle nasazení (ACPI, idle/suspend)
@@ -1764,7 +1776,9 @@ Fáze 0 a 1 jsou hotové (kernel MVP a první použitelný userspace - viz *Road
 2. Boot chain: SystemManager -> ServiceManager -> DeviceManager + core služby, s recovery.
 3. IDL toolchain (vlastní, LSIDL) a jeho generátory: binární kodek, Rust client/server, JSON + CLI renderery, docs, kompatibilní testy.
 4. Core služby přes generované bindingy: Log, Storage (nad reálným virtio-blk zařízením), Process, Device, Config.
-5. virtio drivery (blk, net, console) izolované pod DeviceManagerem; minimální WASI host spouštějící první Wasm komponentu; powerbox file picker předávající jednu file capability.
+5. virtio drivery (blk, net, console, input, gpu, snd) a univerzální xHCI USB cesta
+  (HID + mass storage) izolované pod DeviceManagerem; minimální WASI host spouštějící
+  první Wasm komponentu; powerbox file picker předávající jednu file capability.
 ```
 
 Doporučený další krok je tedy **Fáze 2 (appliance/edge platforma)**. Její prioritou je síťový stack nad virtio-net - na edge je síť jádrem - následovaný zbytkem fáze (plný System Graph + observabilita, security hardening + PermissionManager, ResourceManager policy, ServiceManager restart/watchdog, plný Component Model + WASI preview 2 + SDK, jednoduchý perzistentní nativní filesystem a portace kernelu + vlastního UEFI loaderu na ARM64/RISC-V testovaná v QEMU); viz *Roadmapa*.

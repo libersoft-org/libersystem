@@ -3033,6 +3033,545 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   (one codec per `.lslib` leaf), M125 (canonical `imgconv.lsexe` artifact), the
   capability rule (`volumes` only), and the NOTES image-conversion-tool item.
 
+## M127 - Userspace source and system-volume layout cleanup
+
+Status: PLANNED AFTER M126. Do not start this migration until the image-conversion
+milestone is complete, so codec work and path churn never share one change set.
+
+The userspace grew from a few peer crates into runtimes, services, drivers, applications
+and atomized libraries, but `src/user/` still exposes all crate roots in one flat list.
+The factory system volume has the same historical debt: executables, libraries and
+drivers have directories, while `app.wasm`, text files and every image/audio fixture sit
+loose in its root. This milestone is a mechanical ownership/layout migration, not a
+rename or behavioral redesign. Cargo package names, logical manifest names, canonical
+`.lsexe` basenames, prefix-free `.lslib` SONAME/DT_NEEDED identities, `PKGARCH1` and
+capability policy remain unchanged.
+
+- [ ] Freeze one complete old-path -> new-path inventory before moving files. The only
+  direct children of `src/user/` after the migration are these five role directories:
+  - `runtime/`: `rt` and any future process-runtime support crates;
+  - `services/`: the current aggregate `services` crate plus `storage` and
+    `system_manager` (physical subdirectory names may avoid `services/services`, but
+    package and artifact names do not change);
+  - `drivers/`: the current aggregate `drivers` crate and future driver-only crates;
+  - `apps/`: `tools`, `dyn_probe` and future user-facing or test applications;
+  - `libs/`: every reusable leaf (`pix`, `surface`, `keys`, image/audio/compression
+    codecs and helpers such as `quantize`). Do not add deeper image/audio taxonomy in
+    this milestone; the conservative role split is sufficient.
+- [ ] Remove the build system's `user/<crate>` assumption before the physical move.
+  Give each manifest row or shared-build specification an explicit crate path, then
+  update `kernel/build.rs`, `user/services/build.rs`, `tools/build-shared.sh`, the
+  `Justfile` and Cargo path dependencies to consume it. Reject duplicate logical names,
+  paths outside the workspace and missing manifests. Artifact identity must be derived
+  from the manifest name, never from the final path component.
+- [ ] Move the crates mechanically into the five role directories and update lockfiles,
+  rust-toolchain/config discovery, include paths, test fixtures, build scripts and docs.
+  No source-level API refactor belongs in the move. A repository check fails if a Cargo
+  crate remains directly under `src/user/`, if an old `src/user/<crate>` path survives,
+  or if two physical paths claim the same logical artifact.
+- [ ] Define the factory `vol://system` hierarchy so its root contains directories only:
+  - `bin/`: user-invoked `.lsexe` tools;
+  - `libexec/`: volume-loaded services and internal native helpers not invoked by users;
+  - `lib/`: canonical `.lslib` shared libraries;
+  - `drivers/`: non-bootstrap driver executables;
+  - `components/`: Wasm/component payloads such as the current `app.wasm`;
+  - `etc/`: persisted system configuration and presentation files, including
+    `config.tree` and the MOTD seed;
+  - `var/log/`: LogService's persistent journal;
+  - `share/examples/images/`, `share/examples/audio/` and `share/examples/text/`:
+    staged conformance/demo fixtures, including today's loose `sample.*` and
+    `hello.txt` files.
+- [ ] Make the service/artifact manifest the single source of truth for destination
+  paths as well as source crate paths. `kernel/build.rs` must stage each artifact into
+  its declared class instead of hard-coding every non-driver executable under `bin/`;
+  factory-volume packing must create parent directories deterministically, reject path
+  collisions/traversal and retain reproducible ordering. Bootstrap-only artifacts stay
+  in `init.pkg` and are not duplicated onto the system volume unless explicitly listed.
+- [ ] Migrate every runtime consumer atomically: ProcessService and ServiceManager load
+  tools from `bin/` and services from `libexec/`; DeviceManager keeps `drivers/`;
+  component hosts use `components/`; ConfigService uses `etc/config.tree`; LogService
+  uses `var/log/`; shell completion enumerates only user commands from `bin/`; tests,
+  benchmarks, SDK staging and documentation use the new `share/examples/...` paths.
+  Do not leave silent root-level compatibility copies or path aliases in this
+  pre-release tree: stale paths must fail so the migration is complete and auditable.
+- [ ] Add layout conformance gates. Host/build tests assert the exact generated volume
+  entry classes, root contains no loose files, canonical names have one destination and
+  no old paths remain. A writable-volume QEMU scenario boots from a freshly seeded disk,
+  reaches the shell, launches one tool, one volume service/component and one driver from
+  their new locations, reads image/audio/text examples, persists config and a log under
+  `etc/`/`var/`, and reopens both after service restart. Existing-disk policy must be
+  explicit before implementation (fresh pre-release rebuild versus an on-disk migration)
+  and tested rather than accidentally mounting stale layout data.
+- [ ] Run the full host suite, generated-artifact checks, package/staging audits, ELF
+  SONAME/DT_NEEDED checks, and x86_64/aarch64/riscv64 userspace plus QEMU gates. Record
+  before/after source and volume trees in the architecture/package documentation.
+- Done when: `src/user/` contains only `runtime/`, `services/`, `drivers/`, `apps/` and
+  `libs/`; the system-volume root contains only the declared directories; every build,
+  runtime and documentation path comes from one explicit manifest mapping; no logical
+  crate or staged artifact identity changed; no compatibility duplicate hides an old
+  path; and clean tri-architecture builds and governed boot/storage tests pass.
+- Concept: M61/M87 (volume-loaded programs and manifest ownership), M123/M125
+  (prefix-free shared/executable identities), M126 (the codec growth that exposed the
+  flat userspace layout), and the persistent-system-volume ownership model.
+
+## M128 - Declarative driver binding and lifecycle core
+
+Status: PLANNED AFTER M127; HARD PREREQUISITE FOR M129. This milestone changes no
+hardware coverage. The existing virtio drivers and the implemented xHCI USB host,
+recursive hub, descriptor-driven HID keyboard/pointer and BOT/SCSI mass-storage paths
+are the baseline used to prove the new binding machinery. They migrate onto the target
+model first, preserving behavior while deleting the fixed arrays, singleton handles,
+source-level match table and bring-up-only supervision. Its tests deliberately include
+absent devices, duplicate controllers, composite USB, hotplug and post-online failure.
+No concrete universal driver in M129 may start until this milestone's completion gate
+passes; otherwise each new driver would deepen the architecture M128 exists to remove.
+
+- [ ] Shared driver foundations before new device families: make DeviceManager binding
+  select by standard PCI class/subclass/interface, USB interface descriptors and
+  ACPI/FDT compatible identities rather than product-name strings. Keep one isolated,
+  restartable process per controller; support multiple instances, hotplug/removal,
+  bounded DMA/ring allocation, MSI/MSI-X or handed IRQ capabilities, teardown after
+  faults and deterministic rebinding. Vendor/product IDs may select a narrowly tested
+  standards-compliance quirk, never become the primary binding mechanism.
+- [ ] Make driver presence distinct from driver activation. The system image may stage
+  every supported `.lsexe`, but DeviceManager loads and starts one only after a present
+  hardware/function/interface node matches it. An absent device costs no process,
+  mapped ELF, DMA, IRQ or service capability; an unmatched present device remains
+  visibly `unbound`, and a matched device whose binary is unavailable is visibly
+  `driver-missing`. Bus/controller drivers remain online with no current child because
+  they own discovery and must observe later hotplug.
+- [ ] Replace `driver_for(device_type)` and ServiceManager's fixed driver array with a
+  checked declarative driver registry generated from the artifact manifest. Each entry
+  names the canonical executable, lifecycle class (`boot-critical`, `controller`,
+  `function` or `interface`), match rules, priority/specificity, required resources,
+  provided typed contracts and restart policy. Validate duplicate identities, equally
+  ranked ambiguous matches, impossible resource requests and a staged path that does
+  not exist. DeviceManager consumes this registry; no driver selection is compiled into
+  a source `match` statement.
+- [ ] Broaden kernel/firmware discovery without moving policy into the kernel. Retain
+  every PCI/PCIe function plus bounded BAR/capability metadata, ACPI-enumerated devices,
+  FDT compatible nodes and firmware/platform devices in one immutable discovery
+  vocabulary. The kernel resolves and capability-wraps MMIO/PIO, IRQ, DMA/IOMMU and
+  firmware resources; DeviceManager chooses a driver. Unsupported functions remain
+  inventory-visible but never receive an MMIO or bus-master capability.
+- [ ] Bind at the correct unit: a PCI function or standalone platform device normally
+  has one exclusive controller claim; a multifunction device may bind per function;
+  a USB composite device may bind several class drivers to disjoint interfaces. A
+  controller/bus driver publishes a typed child-device stream carrying attenuated
+  interface/endpoint capabilities, and DeviceManager applies the same registry to each
+  arrival. Claim tokens make overlap impossible and are revoked recursively when a
+  parent controller disappears or crashes.
+- [ ] Define deterministic match arbitration and fallback. Prefer an exact standardized
+  compatible/class revision over a broader class match, then an explicit tested quirk
+  over the generic path only when necessary; never choose by enumeration order. Probe
+  metadata before process creation rather than launching every possible driver to see
+  which one succeeds. A failed bind may try the next compatible fallback only after the
+  first process and all of its resources are fully torn down; record the rejected match
+  and reason in the audit trail.
+- [ ] Generalize service publication and multi-instance routing. Drivers register zero
+  or more typed provider instances (`block`, `frame`, `display`, `input`, `serial`,
+  `PCM`, `camera`, `entropy`, etc.) keyed by stable device identity; owning services
+  subscribe to provider add/remove events instead of receiving one hard-coded NET/GPU/
+  SND/INPUT handle during boot. Several NICs, disks, controllers, sound devices and USB
+  class interfaces must coexist, and removing one provider must not reset unrelated
+  instances.
+- [ ] Finish the complete driver lifecycle, not only bring-up retries. Track
+  `discovered -> unbound -> binding -> online -> stopping/restarting -> failed/removed`
+  per binding; supervise the process after its online report, close and revoke every
+  child/provider/DMA/IRQ/MMIO capability on crash or unplug, then rebind under a bounded
+  backoff/restart policy. A hardware-owning driver restores connection by re-probing the
+  device rather than pretending in-memory state survived. Quarantine a repeatedly
+  failing device without destabilizing DeviceManager or its bus siblings.
+- [ ] Keep the bootstrap exception explicit and minimal. Only drivers required to mount
+  the system volume (today the matching system `virtio-blk` instance) live in `init.pkg`;
+  DeviceManager still discovers hardware before launching them and does not start a
+  boot driver for absent hardware. Once the system volume is mounted, the same registry
+  loads ordinary drivers from `vol://system/drivers/`. Detect and reject dependency
+  cycles where a staged driver is needed to reach the volume containing itself.
+- [ ] Replace summary booleans with live binding observability. `lsdev`, `lssvc`, the
+  System Graph and logs show every discovered node, selected driver artifact, binding
+  unit, match rule, process/Domain, state/restart count, granted resources and published
+  providers. Controller health is independent of child roles: an online xHCI controller
+  with only a keyboard is online even when it publishes no USB block provider. Preserve
+  state across hotplug by stable firmware/PCI/USB topology identity where available,
+  without treating a vendor/product pair as globally unique.
+- [ ] Define one versioned driver bootstrap/control protocol before migrating drivers.
+  Every instance receives its stable binding identity, monotonically increasing
+  generation, matched registry entry, bounded configuration and only its resolved
+  resource capabilities through the same handshake. Standard control/events include
+  `READY`, `FAILED`, `PROVIDER_ADD`, `PROVIDER_REMOVE`, `HEARTBEAT`, `QUIESCE`,
+  `SUSPEND`, `RESUME`, `STOP` and `STOPPED`, with exact handle ownership and timeout
+  semantics. Reject a driver built for an incompatible protocol before granting device
+  resources; no family invents a private online/stop/provider wire.
+- [ ] Make bind and teardown transactional. Claiming the binding unit, acquiring MMIO/
+  PIO, IRQ, DMA/IOMMU and firmware capabilities, charging its Domain, loading/spawning
+  the ELF, completing the handshake and publishing providers form one staged operation.
+  Providers become visible only at commit; failure at any earlier step stops the
+  process, closes every transferred/retained handle, undoes IOMMU mappings and accounting,
+  releases the claim and leaves the node `unbound` or `failed` with the exact reason.
+  Unbind removes providers first and releases hardware resources only after in-flight
+  work is quiesced; an interrupted rollback is idempotent.
+- [ ] Give every bind/rebind attempt a generation token and require it on every driver
+  report, child event and provider publication. A late `READY`, exit notification,
+  heartbeat, IRQ completion, child attach or `PROVIDER_ADD/REMOVE` from an old process
+  is ignored and its handles are closed; it can never mutate the replacement's state.
+  Reusing the same PCI/USB topology identity after unplug creates a new generation, not
+  continuity with the removed device. Generation wrap/reuse is refused rather than
+  making stale messages current.
+- [ ] Serialize each binding's event state machine. Discovery/removal, driver exit,
+  watchdog expiry, explicit stop, provider events, fallback and restart requests enter
+  one ordered queue (or equivalent lock/actor discipline) per binding, with parent-child
+  ordering across buses. Define legal transitions and idempotent duplicate events so a
+  crash racing unplug/restart cannot double-spawn, double-free, publish after removal or
+  leave a claim stuck. DeviceManager itself may process independent bindings in parallel
+  only after their state and resource ownership are disjoint.
+- [ ] Generalize dependencies into a checked `requires`/`provides` graph. A registry
+  entry may wait for bus, IOMMU, clock/reset/power, firmware transport or typed service
+  providers; provider arrival retries eligible pending binds and removal tears dependents
+  down in reverse order. Detect all dependency cycles and unsatisfied boot-critical
+  chains at registry-build time where static, and report dynamic unresolved dependencies
+  explicitly. The system-volume self-hosting cycle is one instance of this general rule,
+  not a special-case-only checker.
+- [ ] Separate driver readiness from provider readiness. `READY` means the controller/
+  interface process is initialized and supervised; each provider is published only
+  after its own probe/configure path is complete and carries independent identity,
+  generation and health. A driver may be online with zero providers, add/remove them
+  later and fail one child/provider without taking unrelated siblings down. Consumers
+  acknowledge provider removal before its channel/resources are revoked, subject to a
+  bounded deadline and forced teardown fallback.
+- [ ] Detect hung drivers as well as exited ones. Apply the shared watchdog/backoff
+  policy after `READY`: heartbeat and request/IRQ progress deadlines are appropriate to
+  the driver's declared activity (an idle device is not failure), while a wedged control
+  path or permanently outstanding operation triggers diagnostic capture, transactional
+  teardown and rebind/quarantine. A driver cannot pet its watchdog through an unrelated
+  busy child, and a provider-specific stall need not restart a healthy whole controller
+  when the protocol supports narrower recovery.
+- [ ] Complete planned-stop and power lifecycle. `QUIESCE` stops accepting new work and
+  drains or explicitly cancels in-flight DMA/requests; storage flushes durable state;
+  `STOP` reaches `STOPPED` before normal resource revocation. `SUSPEND`/`RESUME` preserve
+  only state the protocol declares restorable and otherwise re-probe/rebind as a new
+  generation. Shutdown, parent-bus removal and system suspend traverse dependents in
+  reverse order with bounded deadlines; panic/emergency paths may force revoke but must
+  never claim a clean flush occurred.
+- [ ] Account every driver resource to its Domain and binding: resident/private/shared
+  image pages, handles, IPC queues, MMIO/PIO windows, IRQ/vector slots, DMA-pinned bytes,
+  IOMMU mappings, ring/descriptor memory, child nodes and providers. Registry policy sets
+  per-instance bounds derived from hardware-reported limits under system maxima; failed
+  bind/restart/unplug returns the counters exactly to baseline. Resource exhaustion is a
+  typed bind failure and cannot leave a half-online provider or consume another device's
+  reserved boot resources.
+- [ ] Add a standing concurrency/fault stress gate for the binder itself, independent of
+  individual driver conformance. Deterministically permute unplug during bind, crash
+  during provider commit, crash with in-flight DMA, simultaneous crash+remove+restart,
+  stale reports after replacement, rapid replug at the same topology, two identical
+  controllers, competing compatible matches, missing/corrupt ELF, watchdog expiry and
+  DeviceManager restart. After every round assert one claim owner at most, no stale
+  provider, no leaked process/Domain/handle/IRQ/DMA/IOMMU/accounting resource and a state
+  reproducible from the event log; run long randomized SMP stress in the `stress` tag.
+- Done when: the existing virtio and xHCI set boots entirely through the
+  generated registry with no `driver_for` or fixed ServiceManager driver-state array;
+  a topology with an absent staged driver starts no process for it; two controllers and
+  two same-class devices produce independent providers; a composite USB device binds
+  disjoint interfaces without a claim conflict; hot-add binds and publishes, hot-remove
+  recursively revokes and unbinds; bind failure at every handshake step rolls all
+  resources/accounting back; a driver killed or hung after reporting online loses every
+  resource/provider and is cleanly rebound or quarantined by policy; stale-generation
+  and simultaneous crash/unplug/restart events cannot alter or duplicate the replacement;
+  provider readiness/removal and reverse dependency teardown are ordered; quiesce,
+  flush, stop and suspend/resume meet their deadlines or force-revoke honestly; an
+  ambiguous match or dependency cycle is rejected at registry-build time; a missing
+  artifact and an unsupported device stay visibly distinct; and `lsdev`, `lssvc` plus
+  the System Graph agree on every live state and resource count. The versioned driver
+  protocol, transaction rollback, generation/state-machine, dependency/provider,
+  watchdog/power and accounting host tests, fake-bus lifecycle/fault stress tests and
+  focused x86 QEMU tests pass before M129 begins; aarch64/riscv64 cross-build the
+  same generated registry and protocol.
+- Concept: the DeviceManager capability/binding model, M40/M119 service supervision and
+  resolver lifecycle, M62/M110 USB hotplug, M109's data-driven artifact manifest, the
+  ResourceManager accounting policy, and M129 as the first consumer of the completed
+  binder rather than another extension of today's hard-coded path.
+
+## M129 - Universal standards-based driver set
+
+Status: PLANNED AFTER M128; M128 IS A HARD GATE. This milestone adds every approved
+driver candidate whose controller, protocol or device-class interface is standardized
+across vendors. It does not promise support for arbitrary real machines: PCI/USB/ACPI/
+FDT discovery, IRQ/DMA attachment, clocks, resets, pinmux and power can still require
+platform glue, while Phase 4 owns drivers and quirks for concrete chips, products, SoCs
+and boards. Every task below consumes M128's generated registry, claims, transactional
+bind, generation/state machine, provider events, watchdog, accounting and power
+lifecycle. None may add a private launch path, singleton service handoff, source `match`
+arm or product-ID-first binding shortcut.
+
+- [ ] **USB CDC-ACM** serial class: bind communication/data interfaces and alternate
+  settings, parse functional descriptors, serve bounded RX/TX with line-coding and
+  control-line operations, propagate disconnects, stalls and short packets, and define
+  one typed serial/byte-stream contract reusable by console tools, MCU links and modems.
+  Exercise composite devices and several simultaneous adapters; do not expose a global
+  ambient `/dev/tty*` namespace.
+- [ ] **USB CDC-ECM and CDC-NCM** network classes: share descriptor/control plumbing but
+  keep their frame formats separate; validate MAC/MTU/filter descriptors, bound NCM
+  NTB/datagram tables and malformed offsets, and feed the same capability-scoped frame
+  transport NetworkService already consumes from `virtio-net`. Cover link transitions,
+  zero-length/short transfers, disconnect and backpressure without a second network
+  stack inside the driver.
+- [ ] **NVMe** generic PCIe storage controller: controller reset/enable, admin plus I/O
+  queues, identify controller/namespaces, PRP transfers, flush, read/write, status and
+  timeout recovery behind the existing block contract used by `virtio-blk` and USB
+  storage. Bound queue depth and transfer size, validate every completion ID/phase,
+  support multiple namespaces/controllers and cleanly fail unsupported metadata,
+  protection, zoned or vendor commands rather than partially interpreting them.
+- [ ] **SDHCI** standard SD/eMMC host controller: command/data inhibit handling,
+  capabilities, voltage/clock negotiation, card identification, block addressing,
+  PIO first and bounded ADMA only after the simple path is proven; expose removable
+  media through the existing block contract. Keep the SD protocol core independent of
+  PCI/ACPI/FDT attachment so board-specific clock, reset, regulator and pinmux glue can
+  remain outside the universal driver. Cover insertion/removal and read-only cards.
+- [ ] **USB Audio Class 1/2**: parse audio-control topology and streaming alternate
+  settings, choose only explicitly supported PCM formats/rates/channels, schedule
+  bounded isochronous transfers and adapt clock/feedback endpoints without unbounded
+  drift. Present the same PCM transport contract as `virtio-snd` to AudioService;
+  support playback and capture independently, propagate unplug/xrun, and reject DSP,
+  MIDI and vendor extensions until their own vocabularies exist.
+- [ ] **AHCI/SATA** standard HBA: enumerate implemented ports, identify SATA devices,
+  issue bounded DMA read/write/flush commands, handle NCQ only after the single-command
+  path, detect hotplug and recover a failed port without resetting unrelated ports.
+  Serve the existing block contract and reject unsupported ATAPI/port-multiplier paths
+  explicitly. Keep controller quirks and non-AHCI vendor modes in Phase 4.
+- [ ] **Generic USB HID expansion** beyond the implemented keyboard and pointer paths:
+  extend the shared report-descriptor parser and InputService vocabulary for gamepads,
+  joysticks, consumer controls, tablets and multi-touch collections. Preserve usage
+  page/id, logical ranges, units, contact identity and simultaneous controls instead of
+  flattening every device into keys or a mouse. Bound report sizes, collection depth,
+  contact count and malformed descriptors; existing keyboard/pointer behavior must not
+  regress.
+- [ ] **USB Attached SCSI (UAS)**: reuse the bounded SCSI command/sense layer from BOT
+  while implementing UAS command/status/data pipes, stream IDs, tagged concurrency,
+  task management, timeout and endpoint recovery. Expose the same block contract and
+  retain BOT as a negotiated fallback for devices that offer both. Cap outstanding
+  commands and reject duplicate/unknown tags or inconsistent residue deterministically.
+- [ ] **USB Video Class (UVC)**: first add a bounded camera vocabulary for format/frame
+  enumeration, negotiated stream parameters, timestamps and capability-scoped frame
+  buffers; do not tunnel video through DisplayService. Then parse UVC control/streaming
+  descriptors, negotiate uncompressed or already supported compressed formats, assemble
+  payload headers into bounded frames over isochronous/bulk endpoints, and recover from
+  frame loss, malformed FID/EOF sequences and unplug. No image decoder is duplicated in
+  the driver; consumers use the M123/M126 codec leaves.
+- [ ] **High Definition Audio (HDA)** standard PCI controller: reset and enumerate
+  codecs/function groups/widgets, build a minimal deterministic pin -> converter route,
+  configure stream descriptor/BDL/rate/format and expose playback/capture through the
+  same PCM contract as `virtio-snd` and USB Audio. Bound CORB/RIRB and unsolicited
+  responses, isolate codec/controller failure, and leave vendor DSP firmware, jack
+  policy and machine-specific routing quirks to Phase 4.
+- [ ] **virtio-rng**: add a bounded entropy-source driver and a typed kernel/security
+  ingestion contract that credits source quality conservatively, mixes rather than
+  exposes raw host bytes, handles short/failing requests and never treats one VM source
+  as proof of cryptographic health. Cover deterministic test injection, startup without
+  entropy and driver restart without repeating previously delivered output.
+- [ ] **virtio-vsock**: implement bounded host/guest stream connections with negotiated
+  CID, port capability, credit accounting, reset/shutdown and connection limits. Expose
+  it as an explicit local transport for provisioning, diagnostics and agents, not as an
+  ambient bypass around NetworkService, PermissionManager or authenticated remote-admin
+  policy. Test hostile credit updates, peer reset and host disappearance.
+- [ ] **TPM 2.0 TIS/CRB**: discover either standardized transport, serialize bounded TPM
+  commands, enforce locality/timeout/cancel, validate response headers and expose only
+  typed operations needed for random data, PCR measurement/quote and sealed keys.
+  Applications never receive raw MMIO or unrestricted command passthrough; integrate
+  with future measured/verified boot and identity policy without making TPM presence a
+  boot requirement. Vendor firmware and proprietary security processors remain Phase 4.
+- [ ] **USB CDC-MBIM**: bind the standard mobile-broadband control/data interfaces,
+  validate fragmented control messages and session/NDP tables, model SIM/network/link
+  state through a typed modem service and pass IP datagrams to NetworkService under an
+  explicit grant. Bound outstanding transactions and datagrams; no modem-management
+  command or subscription identity becomes ambient authority.
+- [ ] **USB MIDI**: support MIDI 1.0 event packets and the standardized USB MIDI 2.0/UMP
+  path only after a shared bounded event/timestamp vocabulary exists. Preserve cable/
+  group identity, ordering and timestamps, cap queues and SysEx size, recover from
+  malformed packets/unplug and keep MIDI routing outside AudioService's PCM stream.
+- [ ] **USB CCID** smart-card class: parse class/slot capabilities, power and negotiate
+  card parameters, exchange bounded APDUs with timeout/abort and surface insertion/
+  removal through a capability-scoped smart-card service. Do not place PIN handling or
+  authentication policy inside the transport driver; malformed lengths, sequence IDs
+  and unsolicited slot changes get deterministic tests.
+- [ ] **HID over I2C**: reuse the generic HID report parser and expanded InputService
+  vocabulary over the standardized HID-I2C descriptor/register protocol. Keep the HID
+  transport independent of concrete I2C controllers; ACPI/FDT attachment supplies only
+  the bus capability, address, IRQ/reset and descriptor location. Bound report lengths,
+  power/reset transitions and interrupt storms; support touchpads/touchscreens without
+  product-ID bindings.
+- [ ] **UEFI GOP / simple-framebuffer handoff**: formalize the already implemented boot
+  framebuffer discovery as one architecture-neutral immutable descriptor and a generic
+  early-display provider with checked geometry/pixel masks/cache policy. Define the
+  ownership handoff to DisplayService/real GPU drivers, retain console output when no
+  GPU binds and test x86_64/aarch64/riscv64 UEFI plus direct-boot simple-framebuffer
+  paths. This is consolidation of existing paths, not a second framebuffer stack.
+- [ ] **16550 UART**: retain the minimal existing kernel early-console path, then hand a
+  discovered standard UART's MMIO/PIO and IRQ capabilities to a restartable userspace
+  serial driver after DeviceManager is online. Support FIFO, RX/TX interrupt flow and
+  bounded buffering behind the canonical serial contract; isolate baud/clock/platform
+  description from the common 16550 register engine and preserve panic output fallback.
+- [ ] **ARM PL011 UART**: perform the same early-console -> userspace handoff for the
+  existing PL011 path, sharing the serial contract, buffering, lifecycle and tests with
+  16550 while retaining its distinct register/interrupt implementation. Bind through
+  ACPI/FDT compatible identity and supplied clock/IRQ data, not a QEMU address constant.
+- [ ] **ACPI power button, battery and thermal classes**: parse only the required bounded
+  AML namespace/resources behind a platform service, publish typed power-button,
+  battery/AC and thermal-zone state, and capability-gate shutdown/suspend requests.
+  Validate package/object depth and event storms; keep board EC methods, fan curves and
+  vendor power policy in Phase 4. FDT platforms use equivalent typed providers rather
+  than pretending ACPI is universal across firmware ecosystems.
+- [ ] **USB Device Firmware Upgrade (DFU)**: enumerate/download/upload/status state
+  machines with transfer-size and manifestation handling, but expose mutating firmware
+  operations only through a dedicated high-risk capability and explicit trusted UI/
+  admin policy. Validate target identity and, where available, signed image metadata;
+  survive disconnect and failed manifestation without claiming rollback the device
+  cannot provide. Runtime mode is supported before DFU bootloader quirks.
+- [ ] **USB Picture Transfer Protocol (PTP)**: enumerate storage/object metadata and
+  stream bounded object chunks through a media/import service rather than mounting a
+  camera as an arbitrary block volume. Validate container length/transaction ID,
+  paginate large object sets, preserve read-only operation first and capability-gate
+  delete/capture. MTP/vendor extensions remain typed unsupported until separately
+  specified.
+- [ ] **USB printer class**: implement standard bulk printer transport, port status and
+  reset behind a bounded spool/stream service; applications receive a job capability,
+  not raw endpoints. Begin with already-rendered printer languages and explicit status;
+  page description/rendering, discovery UI and vendor maintenance protocols live above
+  or outside the driver. Cover backpressure, paper/error status and unplug mid-job.
+- [ ] **EHCI** standard USB 2 host controller as a lower-priority compatibility path:
+  reuse USB enumeration/class drivers above one host-controller interface, implement
+  bounded async/periodic schedules, split transactions and root-hub events, and prove
+  HID/storage/class parity with xHCI. It must not fork USB descriptors, class state or
+  policy. Add only after current xHCI is the measured reference implementation.
+- [ ] **OHCI and UHCI** legacy USB 1.x host controllers as the final compatibility wave:
+  separate controller engines share the same USB core/class contracts, bounded transfer
+  ownership and hotplug semantics. Require QEMU fixture coverage and a demonstrated
+  target need before enabling either by default; no legacy polling path may weaken IRQ,
+  DMA cleanup or controller-process isolation.
+- [ ] **virtio-scsi**: negotiate transport features, enumerate bounded targets/LUNs,
+  reuse the common SCSI command/sense layer, support read/write/flush and hotplug behind
+  the canonical block contract, and cap queues, CDB/sense lengths and outstanding tags.
+  It complements rather than replaces `virtio-blk`; unsupported passthrough commands are
+  not exposed to ordinary storage clients.
+- [ ] **virtio-balloon and virtio-mem**: add separate policy-controlled VM memory
+  providers only after ResourceManager has explicit reclaim/hotplug contracts and the
+  kernel can safely offline, pin and return pages. Bound request batches, never reclaim
+  DMA/mapped/unevictable pages, survive host cancellation and report pressure without
+  letting the host directly choose a victim Domain. Keep both protocols distinct.
+- [ ] **virtio-iommu**: introduce a generic IOMMU/domain-mapping contract first, then
+  implement virtio endpoint discovery, attach/detach, map/unmap, probe and fault events
+  with checked ranges, permissions and invalidation ordering. Device DMA remains denied
+  until attachment succeeds; driver crash tears mappings down. Native VT-d, AMD-Vi and
+  ARM SMMU implementations are separate Phase-4 backends to the same contract.
+- [ ] **virtio-fs** as an explicit development-only integration backend: run it behind
+  StorageService's capability-scoped Volume API, require an opt-in QEMU/developer flag,
+  bound requests/names/xattrs and prevent path traversal or host-node identity leakage.
+  It is never the system-volume format, production default or an ambient host-filesystem
+  mount; LiberFS and the ordinary package/staging pipeline remain canonical. Test that a
+  process without the granted volume cannot observe the host share.
+- [ ] **USB Type-C Connector System Software Interface (UCSI)**: discover firmware-
+  described connectors, consume bounded notifications and expose connector, data/power
+  role, orientation, alternate-mode and charging state through a typed Type-C service.
+  Capability-gate role swaps and power-policy changes; keep USB-PD policy in the owning
+  service and vendor retimers/EC transports in Phase 4. Test notification storms,
+  connector removal and firmware timeouts.
+- [ ] **USB Bluetooth HCI transport**: bind the standard USB Bluetooth class endpoints,
+  carry bounded HCI command/event/ACL/ISO packets over a capability-scoped controller
+  transport and recover stalls/unplug. The driver stops at HCI: pairing, keys, L2CAP,
+  profiles and radio policy belong to a separately sandboxed Bluetooth service, whose
+  size/risk does not leak into xHCI or the transport process.
+- [ ] **PCIe hotplug, AER and PME** shared bus infrastructure: process standardized slot
+  notifications, enumerate/remove functions dynamically, surface corrected/uncorrected
+  Advanced Error Reporting records and power-management events, and coordinate safe
+  driver stop before resource removal. Bound capability walks and event storms; a fatal
+  error quarantines the affected function/subtree rather than resetting unrelated PCIe
+  devices. Native platform slot controllers remain firmware glue behind this contract.
+- [ ] **ACPI WDAT hardware watchdog**: parse the bounded watchdog action table, validate
+  register regions/instruction sequences, expose arm/pet/disarm/status through a narrow
+  watchdog service and integrate ownership with ServiceManager's unattended recovery
+  policy. Never execute arbitrary AML or table writes from an untrusted client; prove
+  expiry/reset in a fake platform and preserve a clean no-watchdog boot path.
+- [ ] **IPMI KCS, BT and SSIF transports**: implement the standardized host-to-BMC
+  transports behind one bounded IPMI message contract, with request serialization,
+  sequence/timeout recovery and explicit BMC disappearance. A higher management service
+  owns sensors, SEL, chassis and authentication policy; raw commands require an admin
+  capability. Prefer this in the server deployment wave and leave vendor BMC extensions
+  unsupported by default.
+- [ ] **USB HID Power Device class**: extend the common HID usage/value machinery for
+  UPS, battery, load, voltage, runtime and alarm reports, publishing normalized state to
+  the platform power service. Capability-gate output switching and shutdown commands;
+  bound collection/report complexity and preserve unknown vendor usages without
+  interpreting them. Reuse generic HID transport instead of adding a UPS-specific USB
+  parser.
+- [ ] **EDID/DDC display discovery**: add one bounded EDID parser and typed monitor mode/
+  physical-size/capability vocabulary shared by simple framebuffer, virtio-gpu and later
+  real display drivers. Verify header/checksums, cap extension blocks and reject malformed
+  timings before arithmetic. DDC/I2C/AUX are transport backends supplied by the bound
+  display controller; EDID is a helper/provider contract, not an independent process
+  poking arbitrary buses.
+- [ ] **ACPI Time and Alarm Device**: bind the standardized ACPI000E device, expose
+  bounded read/set/alarm operations as one optional TimeService source and preserve RTC/
+  NTP fallback. Validate GAS/register widths and alarm ranges, capability-gate clock and
+  wake changes, and keep vendor RTC/EC implementations in Phase 4. Absence never blocks
+  boot or wall-clock service.
+- [ ] **virtio-serial multiport**: generalize `virtio-console` from one debug console to
+  dynamically named, hotpluggable ports with bounded control messages, per-port queues,
+  open/close state and independent capability-scoped byte streams. Reserve the emergency
+  console path, but let provisioning/diagnostic agents use separate ports instead of
+  multiplexing an ad-hoc protocol over console bytes.
+- [ ] **virtio-crypto**: negotiate only explicitly supported algorithms and create
+  bounded session/key handles for selected symmetric/hash operations through a typed
+  crypto-provider contract. Secret key material is transferred once under a narrow
+  capability, never readable back, zeroized on teardown and not assumed safer than the
+  host. Keep software cryptography as the correctness baseline and reject migration/
+  replay-sensitive offload until its threat model is written.
+- [ ] **ACPI NFIT / NVDIMM**: parse bounded SPA ranges, region mappings, flush hints and
+  health records, expose persistent-memory namespaces as typed block or direct-access
+  providers only after persistence ordering and poison handling are defined. Validate
+  overlap/alignment against the physical map and never map firmware control regions into
+  clients. This is a server-priority universal path; vendor management commands and
+  platform-specific interleave quirks remain Phase 4.
+- [ ] Implement M129 in risk-ordered waves while keeping every landed wave independently
+  useful: (1) virtio-rng/vsock/serial plus CDC-ACM and
+  CDC-ECM/NCM; (2) NVMe and SDHCI for modern
+  appliance/edge storage; (3) TPM, UCSI, WDAT, CDC-MBIM, USB Audio/MIDI/CCID and AHCI;
+  (4) expanded USB HID, HID Power, HID-I2C, Bluetooth HCI and UAS; (5) UVC, EDID and HDA
+  after their camera/audio/display vocabularies and isochronous machinery are proven;
+  (6) GOP/UART handoff plus ACPI power/time platform classes and PCIe hotplug/AER/PME;
+  (7) virtio-scsi, crypto, memory and IOMMU policy devices; (8) server-priority IPMI and
+  NFIT/NVDIMM; (9) lower-value DFU/PTP/printer and legacy EHCI/OHCI/UHCI compatibility;
+  (10) opt-in development-only virtio-fs. A later wave never blocks shipping or testing
+  an earlier completed wave.
+- [ ] Conformance and hostile-device gates for every family: pure descriptor/register/
+  ring parsers get host tests and deterministic malformed mutations before MMIO/DMA;
+  fake-controller tests cover completion ordering, timeout, reset, disconnect and
+  resource cleanup; QEMU models or USB fixtures prove the real governed process,
+  DeviceManager binding and destination service contract. Test at least two instances
+  where the standard permits them and assert no DMA, handle, IRQ or service capability
+  survives driver termination.
+- [ ] Integration and performance gates: fresh x86_64/aarch64/riscv64 userspace builds
+  remain green; each architecture runs every controller QEMU can expose there, with
+  explicit documented skips only for unavailable models. Storage drivers format/mount,
+  read/write/flush and reopen through StorageService; network classes exchange frames
+  through NetworkService; input classes reach InputService; audio drivers sustain
+  bounded playback/capture through AudioService; UVC reaches a camera client. Record
+  queue/transfer limits, throughput, latency, peak memory and recovery times.
+- Done when: CDC-ACM, CDC-ECM/NCM, NVMe, SDHCI, USB Audio Class 1/2, AHCI/SATA,
+  expanded USB HID, UAS, UVC, HDA, virtio-rng, virtio-vsock, TPM 2.0,
+  CDC-MBIM, USB MIDI, CCID, HID-I2C, GOP/simple framebuffer, 16550, PL011, ACPI power/
+  battery/thermal, DFU, PTP, USB printer, EHCI, OHCI/UHCI, virtio-scsi, balloon/mem,
+  virtio-iommu, opt-in virtio-fs, UCSI, USB Bluetooth HCI, PCIe hotplug/AER/PME, WDAT,
+  IPMI KCS/BT/SSIF, USB HID Power, EDID/DDC, ACPI Time and Alarm, virtio-serial
+  multiport, virtio-crypto and NFIT/NVDIMM each have the bounded contract and
+  implementation scope above; bind by public standards rather than product whitelists;
+  survive hostile descriptors/completions and removal without escaping their Domains;
+  release all resources on crash; and pass available QEMU/fixture plus tri-architecture
+  build gates. Device-specific hardware support remains explicitly in Phase 4, and
+  development-only virtio-fs never becomes an ambient or production storage path.
+- Concept: M128 (the completed binder/lifecycle foundation every task must use), the
+  Phase-2 virtio-plus-universal-driver policy in `docs/CONCEPT_CZ.md` and
+  `docs/CONCEPT_EN.md`, the existing xHCI USB class stack, and the Phase-4
+  device-/board-specific boundary.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a

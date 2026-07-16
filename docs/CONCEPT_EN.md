@@ -971,9 +971,11 @@ The detailed security policy and its phasing (what holds from the MVP, what is d
 
 Drivers are outside the kernel as isolated services.
 
-#### MVP: only virtio on QEMU/KVM
+#### Phase 2: virtio plus universal standards-based drivers
 
-So the project does not freeze on drivers for real (and buggy) hardware, **the first target is exclusively virtio on QEMU/KVM.** Virtio is clean, well documented, and enough for a full-fledged system in a VM:
+So the project does not freeze on drivers for arbitrary real (and buggy) hardware,
+**the VM transport in the first target is virtio on QEMU/KVM.** Virtio is clean, well
+documented, and enough for a full-fledged system in a VM:
 
 ```text
 driver.virtio-blk      # block storage
@@ -981,23 +983,27 @@ driver.virtio-net      # network
 driver.virtio-console  # serial console / log
 driver.virtio-gpu      # framebuffer / 2D, later acceleration
 driver.virtio-input    # keyboard / mouse
+driver.virtio-snd      # PCM playback / capture transport
 ```
 
-Real HW (USB, NVMe, AHCI, GPU, Wi-Fi, audio) is added **gradually and as needed** - when someone wants to deploy it on a specific machine. We deliberately do not write our own GPU/Wi-Fi stack any time soon (it is the most common graveyard of new OSes).
+Phase 2 is not virtio-only: it may also contain a deliberately small set of
+**universal, specification-driven drivers** whose interface is shared across vendors
+and useful on many machines. The first such path already exists: `driver.xhci` plus
+USB HID and USB mass-storage class support. These drivers are selected for protocol
+coverage, not for one product ID or board.
 
-#### Target drivers (later)
+This does not turn Phase 2 into a general bare-metal hardware-support phase. We still
+deliberately avoid broad GPU/Wi-Fi and vendor-device work (the most common graveyard of
+new OSes). Additional universal controller/protocol/class drivers are added only when
+their portability and appliance/edge value justify the bounded implementation cost.
 
-```text
-driver.usb
-driver.nvme
-driver.gpu
-driver.audio
-driver.network
-driver.fs.liberfs
-driver.fs.fat
-driver.fs.iso9660
-driver.fs.udf
-```
+#### Device-specific drivers (later)
+
+Phase 4 brings up selected real machines. Its new drivers are therefore specific to
+the concrete deployment: a particular NIC, GPU, Wi-Fi/audio chip, storage controller,
+SoC peripheral block or board. DeviceManager still binds them behind the same typed
+service contracts, while the universal drivers created earlier remain shared building
+blocks. Filesystem services are not hardware drivers and are kept outside this list.
 
 #### Driver crash
 
@@ -1558,7 +1564,12 @@ a simple CLI
 a basic System Graph
 ```
 
-**Drivers in the MVP:** virtio only (see the Drivers section). **The application ABI is decided** - WebAssembly components + WASI (see *Application model*); once the core IPC and services are running, a near-term goal is a **minimal WASI host that runs the first component**. The MVP itself, however, rests on native Rust services; the Wasm host comes right in the following phase (see *Roadmap*).
+**Drivers in the kernel MVP start with virtio; Phase 2 adds a bounded set of universal,
+standards-based drivers as well (see the Drivers section).** The application ABI is
+decided - WebAssembly components + WASI (see *Application model*); once the core IPC
+and services are running, a near-term goal is a **minimal WASI host that runs the first
+component**. The MVP itself, however, rests on native Rust services; the Wasm host comes
+right in the following phase (see *Roadmap*).
 
 Deliberately not addressed in the MVP:
 
@@ -1586,7 +1597,7 @@ The roadmap is milestone-based, not time-based (deliberately without dates):
 - The order of the phases follows the deployment targets appliance/edge -> server -> desktop (see *Why this OS instead of Linux*).
 - Deployment on real hardware comes after the server phase; the AI platform as the final evolution on top of the desktop.
 
-**How to read the phase horizon.** Phases 0-2 target appliance/edge and represent a **real, near-term goal** for one person or a small team (a bootable capability microkernel + the first WASI component + virtio + networking). They should be understood as a *complete* project, not as a stepping stone to something bigger - even the appliance/edge platform alone is a finished, meaningful product.
+**How to read the phase horizon.** Phases 0-2 target appliance/edge and represent a **real, near-term goal** for one person or a small team (a bootable capability microkernel + the first WASI component + virtio + a bounded universal-driver set + networking). They should be understood as a *complete* project, not as a stepping stone to something bigger - even the appliance/edge platform alone is a finished, meaningful product.
 
 **Phases 3-6 are not a plan but a vision - and they hold only on the assumption that a community forms around the project.** Phase 3 (server), Phase 4 (real hardware), Phase 5 (a full-fledged desktop), and Phase 6 (the AI platform) represent hundreds of person-years. They are therefore deliberately phrased as a *direction* in which the system **can** grow thanks to its architecture as more contributors arrive.
 
@@ -1620,6 +1631,7 @@ a prototype file picker (powerbox)
 
 ```text
 a network stack over virtio-net (a priority - on the edge, networking is the core)
+standards-based universal drivers with broad reuse, starting with xHCI USB plus HID and mass-storage classes; no vendor-device support matrix
 an interactive console: keyboard input + a userspace line editor (command history, cursor movement, in-line editing, ANSI key sequences for arrows) - the kernel console stays a dumb byte sink, the line editor lives in the shell
 simple pointer/mouse plumbing over virtio-input (text-cell pointer + button events for TUI apps such as a file manager); no mouse stack or touch yet (those are the desktop phase)
 observability: full System Graph, JSON/CBOR/CLI representations, tracing, counters (the JSON/CBOR forms are network-friendly; exposing and administering it over the network is phase 3)
@@ -1651,7 +1663,7 @@ a CLI package manager (search / install / update / remove of first-party package
 ```text
 a POSIX-like compatibility layer (relibc-style) - for foreign server software
 the driver binding model in practice: DeviceManager pairs real devices -> drivers
-selective real-HW drivers per deployment (NVMe, NIC, storage, buses)
+device- and board-specific drivers selected per deployment (concrete NIC/GPU/Wi-Fi/audio/storage controllers and SoC peripheral blocks)
 support for specific servers and SBCs (single-board computers)
 ARM64 / RISC-V real boards alongside x86-64 (the phase-2 QEMU ports brought to bare metal)
 power management per deployment (ACPI, idle/suspend)
@@ -1764,7 +1776,9 @@ Phases 0 and 1 are complete (the kernel MVP and the first usable userspace - see
 2. Boot chain: SystemManager -> ServiceManager -> DeviceManager + the core services, with recovery.
 3. The IDL toolchain (our own, LSIDL) and its generators: binary codec, Rust client/server, JSON + CLI renderers, docs, compatibility tests.
 4. Core services over generated bindings: Log, Storage (over a real virtio-blk device), Process, Device, Config.
-5. virtio drivers (blk, net, console) isolated under DeviceManager; a minimal WASI host running the first Wasm component; a powerbox file picker handing out a single file capability.
+5. virtio drivers (blk, net, console, input, gpu, snd) and the universal xHCI USB path
+  (HID + mass storage) isolated under DeviceManager; a minimal WASI host running the
+  first Wasm component; a powerbox file picker handing out a single file capability.
 ```
 
 The recommended next step is therefore **Phase 2 (the appliance/edge platform)**. Its priority is a network stack over virtio-net - on the edge, networking is the core - followed by the rest of the phase (full System Graph + observability, security hardening + PermissionManager, the ResourceManager policy, ServiceManager restart/watchdog, the full Component Model + WASI preview 2 + an SDK, a simple persistent native filesystem, and the kernel + own UEFI loader ported to ARM64/RISC-V and tested under QEMU); see the *Roadmap*.
