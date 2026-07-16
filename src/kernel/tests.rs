@@ -4164,7 +4164,7 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	// explicitly closes, exits, and leaves only the already accepted bounded tail.
 	let interrupt_scope = open_scope(&audio_admin, 42);
 	let interrupt_domain = object::domain::Domain::new_child(&sched::root_domain(), object::domain::UNLIMITED, object::domain::UNLIMITED, object::domain::UNLIMITED);
-	let (_interrupt_stdout, interrupt_process) = launch_play(play_elf, interrupt_domain, storage_client, interrupt_scope, b"vol://system/test.wv");
+	let (_interrupt_stdout, interrupt_process) = launch_play(play_elf, interrupt_domain, storage_client.clone(), interrupt_scope, b"vol://system/test.wv");
 	sched::run_until_idle();
 	let mut current = snd_host.recv().expect("long player first period");
 	assert!(!current.bytes.is_empty());
@@ -4188,6 +4188,41 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	sched::run_until_idle();
 	assert!(interrupt_process.is_terminated(), "Ctrl+C player exits after explicit stream close");
 	crate::serial_println!("audio-play-interrupt: drained-periods={} max=64 stream-released=1", interrupt_periods);
+
+	// MP3 is fully decoded before opening its stream: the debug decoder's burst latency
+	// must never empty the live queue and stretch playback with stop/restart gaps.
+	let mp3_scope = open_scope(&audio_admin, 43);
+	let mp3_domain = object::domain::Domain::new_child(&sched::root_domain(), object::domain::UNLIMITED, object::domain::UNLIMITED, object::domain::UNLIMITED);
+	let (_mp3_stdout, mp3_process) = launch_play(play_elf, mp3_domain, storage_client, mp3_scope, b"vol://system/test.mp3");
+	sched::run_until_idle();
+	let mut mp3_period = snd_host.recv().expect("MP3 first hardware period");
+	assert!(!mp3_period.bytes.is_empty(), "MP3 starts with an audio period");
+	let mut mp3_periods = 1u32;
+	while mp3_periods < 12 {
+		snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("MP3 period ACK");
+		sched::run_until_idle();
+		mp3_period = snd_host.recv().expect("next MP3 period");
+		assert!(!mp3_period.bytes.is_empty(), "MP3 queue underrun stopped the hardware stream");
+		mp3_periods += 1;
+	}
+	mp3_process.set_int_pending();
+	for thread in mp3_process.live_threads() {
+		sched::wake_thread(&thread);
+	}
+	let mut mp3_tail = 0u32;
+	loop {
+		snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("MP3 tail ACK");
+		sched::run_until_idle();
+		mp3_period = snd_host.recv().expect("MP3 tail period or stop");
+		if mp3_period.bytes.is_empty() {
+			break;
+		}
+		mp3_tail += 1;
+		assert!(mp3_tail <= 64, "interrupted MP3 leaves at most the bounded accepted queue tail");
+	}
+	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("MP3 stop ACK");
+	sched::run_until_idle();
+	assert!(mp3_process.is_terminated(), "interrupted MP3 player closes and exits");
 
 	// A driver crash while a period is pending closes every live PCM stream and
 	// makes future opens fail cleanly instead of leaving clients blocked forever.

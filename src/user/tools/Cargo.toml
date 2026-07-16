@@ -8,6 +8,14 @@ edition = "2024"
 build = "../build.rs"
 description = "Standalone foreground tools the shell spawns"
 
+# MP3 is predecoded before opening the live stream so synthesis bursts cannot cause
+# underruns. Optimize only this hot path to keep its debug-image startup bounded.
+[profile.dev.package.mp3]
+opt-level = 3
+
+[profile.dev.package.nanomp3]
+opt-level = 3
+
 # The helpers the tools share (trimming, tokenizing, decimal/port parsing, decimal
 # formatting, and the receive-and-parse-a-JsonMode handshake). Each bin pulls them in
 # with `use tools::*`, so the parsing and formatting cannot drift between tools.

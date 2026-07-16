@@ -23,6 +23,7 @@ use wav::Wav;
 use wavpack::WavPack;
 
 const CHUNK_FRAMES: usize = 1_024;
+const MAX_PREDECODED_BYTES: usize = 64 * 1024 * 1024;
 
 struct MappedFile {
 	handle: u64,
@@ -141,7 +142,11 @@ unsafe fn play_audio(audio_channel: u64, bytes: &[u8]) -> Result<(), ()> {
 	if bytes.starts_with(b"ID3") || bytes.first() == Some(&0xff) && bytes.get(1).is_some_and(|byte| byte & 0xe0 == 0xe0) {
 		let mp3 = Mp3::parse(bytes).map_err(|_| ())?;
 		let metadata = mp3.metadata();
-		return unsafe { play_decoded(audio_channel, "MP3", metadata.rate, metadata.channels, metadata.frames, mp3.decoder()) };
+		unsafe { print(b"play: decoding MP3...\n") };
+		let Some(decoder) = (unsafe { buffer_decoder(mp3.decoder(), metadata.channels) })? else {
+			return Ok(());
+		};
+		return unsafe { play_decoded(audio_channel, "MP3", metadata.rate, metadata.channels, metadata.frames, decoder) };
 	}
 	Err(())
 }
@@ -149,6 +154,51 @@ unsafe fn play_audio(audio_channel: u64, bytes: &[u8]) -> Result<(), ()> {
 trait PcmDecoder {
 	fn remaining_frames(&self) -> u64;
 	fn read_i16_le(&mut self, max_frames: usize, output: &mut Vec<u8>) -> Result<usize, ()>;
+}
+
+struct BufferedDecoder {
+	pcm: Vec<u8>,
+	channels: usize,
+	frame: usize,
+}
+
+impl PcmDecoder for BufferedDecoder {
+	fn remaining_frames(&self) -> u64 {
+		(self.pcm.len() / (self.channels * 2) - self.frame) as u64
+	}
+
+	fn read_i16_le(&mut self, max_frames: usize, output: &mut Vec<u8>) -> Result<usize, ()> {
+		let frames = usize::try_from(self.remaining_frames().min(max_frames as u64)).map_err(|_| ())?;
+		let frame_bytes = self.channels.checked_mul(2).ok_or(())?;
+		let start = self.frame.checked_mul(frame_bytes).ok_or(())?;
+		let bytes = frames.checked_mul(frame_bytes).ok_or(())?;
+		output.clear();
+		output.try_reserve_exact(bytes).map_err(|_| ())?;
+		output.extend_from_slice(self.pcm.get(start..start + bytes).ok_or(())?);
+		self.frame += frames;
+		Ok(frames)
+	}
+}
+
+unsafe fn buffer_decoder(mut decoder: impl PcmDecoder, channels: u8) -> Result<Option<BufferedDecoder>, ()> {
+	let channels = usize::from(channels);
+	let mut pcm = Vec::new();
+	let mut chunk = Vec::new();
+	while decoder.remaining_frames() != 0 {
+		if unsafe { interrupted() } {
+			return Ok(None);
+		}
+		let frames = decoder.read_i16_le(4_096, &mut chunk)?;
+		if frames == 0 {
+			break;
+		}
+		if pcm.len().checked_add(chunk.len()).filter(|length| *length <= MAX_PREDECODED_BYTES).is_none() {
+			return Err(());
+		}
+		pcm.try_reserve(chunk.len()).map_err(|_| ())?;
+		pcm.extend_from_slice(&chunk);
+	}
+	Ok(Some(BufferedDecoder { pcm, channels, frame: 0 }))
 }
 
 impl PcmDecoder for wav::Decoder<'_> {

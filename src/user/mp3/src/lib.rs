@@ -310,28 +310,30 @@ mod tests {
 	fn decodes_staged_mpeg1_stream_in_bounded_chunks() {
 		let mp3 = Mp3::parse(include_bytes!("../../../volume/test.mp3")).unwrap();
 		assert_eq!(mp3.metadata(), Metadata { rate: 44_100, channels: 1, frames: 328_104, duration_ms: 7_440 });
-		let mut decoder = mp3.decoder();
-		let mut chunk = Vec::new();
-		let mut decoded = Vec::new();
-		loop {
-			let frames = decoder.read_i16_le(127, &mut chunk).unwrap();
-			if frames == 0 {
-				break;
+		for chunk_frames in [127, 1_024] {
+			let mut decoder = mp3.decoder();
+			let mut chunk = Vec::new();
+			let mut decoded = Vec::new();
+			loop {
+				let frames = decoder.read_i16_le(chunk_frames, &mut chunk).unwrap();
+				if frames == 0 {
+					break;
+				}
+				assert!(frames <= chunk_frames);
+				decoded.extend_from_slice(&chunk);
 			}
-			assert!(frames <= 127);
-			decoded.extend_from_slice(&chunk);
+			let golden = include_bytes!("../tests/test.pcm");
+			assert_eq!(decoded.len(), golden.len());
+			let errors = decoded.chunks_exact(2).zip(golden.chunks_exact(2)).map(|(actual, expected)| {
+				let actual = i16::from_le_bytes([actual[0], actual[1]]) as i32;
+				let expected = i16::from_le_bytes([expected[0], expected[1]]) as i32;
+				actual.abs_diff(expected)
+			});
+			let total_error: u64 = errors.clone().map(u64::from).sum();
+			let peak_error = errors.max().unwrap_or(0);
+			assert!(total_error / mp3.metadata().frames <= 2, "MP3 output diverges from the independent PCM golden");
+			assert!(peak_error <= 16, "MP3 output contains an impulsive error of {peak_error} samples");
+			assert_eq!(decoder.remaining_frames(), 0);
 		}
-		let golden = include_bytes!("../tests/test.pcm");
-		assert_eq!(decoded.len(), golden.len());
-		let errors = decoded.chunks_exact(2).zip(golden.chunks_exact(2)).map(|(actual, expected)| {
-			let actual = i16::from_le_bytes([actual[0], actual[1]]) as i32;
-			let expected = i16::from_le_bytes([expected[0], expected[1]]) as i32;
-			actual.abs_diff(expected)
-		});
-		let total_error: u64 = errors.clone().map(u64::from).sum();
-		let peak_error = errors.max().unwrap_or(0);
-		assert!(total_error / mp3.metadata().frames <= 2, "MP3 output diverges from the independent PCM golden");
-		assert!(peak_error <= 16, "MP3 output contains an impulsive error of {peak_error} samples");
-		assert_eq!(decoder.remaining_frames(), 0);
 	}
 }
