@@ -3268,6 +3268,153 @@ passes; otherwise each new driver would deepen the architecture M128 exists to r
   DeviceManager restart. After every round assert one claim owner at most, no stale
   provider, no leaked process/Domain/handle/IRQ/DMA/IOMMU/accounting resource and a state
   reproducible from the event log; run long randomized SMP stress in the `stress` tag.
+- [ ] Make DeviceManager itself recoverable without inheriting ambiguous live ownership.
+  It runs in a supervisor-owned Domain above a driver/child-Domain subtree; if it crashes,
+  ServiceManager atomically withdraws all provider roots, kills that entire subtree,
+  waits for kernel revocation/refunds, restarts the pinned DeviceManager and reconstructs
+  bindings from the immutable discovery snapshot, checked registry and persisted operator
+  policy. It does not adopt orphan driver processes or replay resource-acquire side
+  effects. Binding generations come from a supervisor-owned monotonic epoch so a restarted
+  manager cannot accept pre-crash events; subscribers see providers disappear/reappear
+  through the ordinary churn protocol. If the boot-volume provider cannot be restored
+  from the pinned set, recovery escalates explicitly to SystemManager/reboot rather than
+  running with a half-mounted system.
+- [ ] Define kernel-owned device containment and reset ordering for crash/forced unbind.
+  Cooperative `QUIESCE` remains the clean path, but safety cannot depend on a crashed
+  driver: mask its interrupt sources, block new submissions, disable PCI bus mastering
+  or the equivalent transport master, perform the strongest safe standardized reset
+  available (queue/controller stop, FLR, function/bus/platform reset), detach and flush
+  IOMMU translations, then release DMA memory and MMIO/PIO claims. BAR assignment and
+  privileged config-space writes stay kernel-owned behind typed, offset/bit-masked ops;
+  drivers never receive arbitrary PCI config mutation. If reset/containment cannot prove
+  DMA stopped, quarantine the device and keep affected pages pinned or escalate to a
+  platform reset - never recycle memory the device may still reach.
+- [ ] Specify one portable DMA contract rather than exposing only physical addresses.
+  Each mapping declares device-read (`to-device`), device-write (`from-device`) or
+  bidirectional direction, address width, alignment, segment/count and coherency needs;
+  the kernel enforces ranges and permissions, builds scatter/gather or bounded bounce
+  buffers for address-limited devices, and provides explicit `sync-for-device` /
+  `sync-for-cpu` operations with the required cache maintenance and memory barriers on
+  non-coherent aarch64/riscv64 as well as coherent x86. Completion precedes CPU reuse;
+  revoke drains/cancels DMA, synchronizes caches, invalidates IOMMU/device translation
+  state and only then refunds pages. Host/fake-device tests model stale caches, wrong
+  direction, out-of-range descriptors and 32-bit DMA limits.
+- [ ] State the IOMMU-absent threat model honestly. Capability isolation cannot contain
+  a malicious bus-mastering device/driver without translated DMA: bounce buffers solve
+  reachability/coherency, not an attacker programming an arbitrary address. Registry
+  policy marks a driver `iommu-required` or trusted-for-untranslated-DMA; an untrusted
+  DMA driver refuses to bind without an enforcing IOMMU, while the minimal boot-critical
+  trusted set may bind under a loud audited degraded-isolation state. Mixed translated/
+  untranslated devices remain separate Domains and accounting pools. Native VT-d,
+  AMD-Vi and ARM SMMU are later backends to the M128 contract; `virtio-iommu` is M129's
+  first planned provider, but M128 defines the policy and clean no-IOMMU behavior now.
+- [ ] Define the complete interrupt resource contract. Discovery records controller,
+  vector/source, trigger mode, polarity, shareability and supported MSI/MSI-X count;
+  binding requests exclusive or shared lines and one or more vectors under registry
+  bounds. The kernel owns routing, affinity, mask/unmask and teardown; edge and level
+  ACK ordering are explicit, a shared level source wakes every registered claimant
+  without one driver completing it for its peers, and revoking one claimant does not
+  disable the rest. Per-binding rate/progress accounting detects storms, masks or
+  throttles the offending source, captures diagnostics and resets/quarantines it without
+  starving unrelated devices. Fake-controller plus x86/aarch64/riscv64 tests cover
+  multi-vector MSI, shared legacy IRQ, affinity, stuck level lines and revocation races.
+- [ ] Add a capability-gated, persistent operator binding policy above the immutable
+  registry. An administrator can disable/enable a registry entry or individual binding,
+  request re-probe/retry, clear quarantine, select another already-compatible declared
+  candidate and set bounded diagnostic/quirk flags; every change is audited and takes
+  effect through the normal transactional lifecycle. Policy may narrow or choose among
+  build-validated matches but cannot invent a match, widen resources, bypass protocol/
+  artifact verification or grant an incompatible driver. A malformed policy falls back
+  to the image registry with a visible error; boot-critical disables require an explicit
+  recovery-safe confirmation and cannot silently make the next boot unmountable.
+- [ ] Bind every registry entry to the exact staged artifact. The generated registry
+  records canonical `.lsexe` identity, byte length, cryptographic content digest, native
+  ABI revision and driver-protocol version; DeviceManager verifies all of them before
+  granting hardware resources or spawning, and rejects stale, truncated, substituted or
+  malformed ELFs with a distinct state. Package construction proves every referenced
+  artifact exists exactly once and detects registry/artifact drift across `init.pkg` and
+  the system volume. This is image-internal consistency, not a false verified-boot claim:
+  signing the whole immutable image, trust anchors, key rotation and revocation remain
+  the phase-3 verified-boot/package security milestone.
+- [ ] Treat every driver message and metadata field as hostile protocol input even for
+  a first-party image. Decode through the versioned typed codec; bound names, strings,
+  lists, child/provider counts, descriptor metadata and event rates; accept only provider
+  types/resources declared by the selected registry entry; validate binding identity +
+  generation + legal state transition + exact handle cardinality/rights; close every
+  unexpected or stale transferred handle. Escape/sanitize human rendering in logs,
+  `lsdev` and the System Graph. Repeated malformed, oversized or flooding events consume
+  the driver's accounted quota and lead to diagnostics plus quarantine, never memory/
+  log exhaustion or an undeclared provider.
+- [ ] Make provider churn atomic and define consumer-visible completion/errors. A clean
+  removal first publishes `PROVIDER_REMOVING(id, generation, deadline)`; subscribers stop
+  new work, drain/cancel in-flight operations and ACK before DeviceManager withdraws the
+  provider and proceeds to hardware teardown. A crash publishes immediate `LOST`; the
+  provider channel closes and every pending request completes with a typed lost/removed
+  error rather than hanging or being replayed implicitly. Deadline expiry force-revokes
+  a non-acknowledging consumer and records it. Replacement is a new generation/provider
+  event; consumers opt into reconnect/session reconstruction and never have old and new
+  handles simultaneously active under one identity.
+- [ ] Define a bounded, privacy-aware driver diagnostic snapshot instead of an undefined
+  "capture". On bind failure, watchdog, crash, forced unbind or storm, retain the last N
+  state transitions with timestamps/generations, selected match/fallback, process fault,
+  resource/accounting snapshot, provider/child set, pending operation summaries and last
+  heartbeat/IRQ/progress samples. Do not dump arbitrary DMA buffers, heap/stack contents,
+  keys or user payloads by default. Keep a size/count-bounded rotating journal through
+  LogService (with an in-memory emergency fallback), expose it through capability-gated
+  `lsdev`/diagnostic tooling and ensure logging failure cannot block teardown or recovery.
+- [ ] Put device authority and claim exclusivity in the kernel, not in DeviceManager
+  convention or PermissionManager policy. Read-only inventory (`device_count/info`) may
+  remain broadly queryable, but the kernel gives only the pinned DeviceManager a
+  non-forgeable `DeviceRoot`/manager capability. Replace ambient index-only acquire APIs
+  with an atomic `claim(root, node, generation, target-domain) -> Binding` operation that
+  rejects an already claimed/removed node and records the exclusive owner, generation
+  and parent claim before minting anything. MMIO/PIO mapping, IRQ/vector allocation,
+  DMA/IOMMU mapping, config-space operations, reset and power control all derive from
+  that binding capability and revalidate its live generation. Binding/root authority is
+  MANAGE-only, never inferred from executable name, process badge or membership in a
+  userspace allowlist; directly launching `drivers/foo.lsexe` grants no hardware access.
+- [ ] Seal and attenuate every resource capability derived from a Binding. DeviceManager
+  installs the final capability into the target driver with only the operation rights it
+  needs and no `DUPLICATE`, onward `TRANSFER`, `REVOKE` or manager rights; the current
+  transfer mechanism must gain transfer-time rights attenuation or a kernel-mediated
+  install rather than forcing the recipient to inherit `TRANSFER`. A capability carries
+  binding identity + generation and fails after claim revocation even if another process
+  retained a stale handle. Bus drivers create child claims only through the parent
+  Binding: PCI functions/platform children get validated resource subranges, while USB
+  class drivers receive mediated interface/endpoint channels and never the xHCI BAR.
+  Parent removal/manager epoch change recursively revokes every descendant in-kernel.
+- [ ] Make claim acquisition/removal race-free with the live discovery graph. Discovery,
+  atomic claim, resource derivation and surprise removal share one kernel ownership
+  transaction: removal wins by marking the node absent and revoking the generation, or
+  claim wins and the immediately queued removal drives normal teardown; no window can
+  mint a capability for an already-gone device. A driver report is authenticated by its
+  unique per-binding control channel plus generation, not by a payload-supplied binding
+  id. Tests cover malicious duplicate claims, removal at every claim/resource step,
+  stale mapped handles and IRQs after rebind, attempted capability retransfer and a child
+  attempting to widen its parent-scoped authority.
+- [ ] Identify the boot-volume backing explicitly instead of using discovery order. The
+  own loader/boot protocol and generated image metadata carry a stable root-device
+  locator appropriate to the topology (firmware device path or PCI BDF chain plus the
+  LiberFS partition GUID/volume UUID); DeviceManager resolves exactly that present node,
+  and StorageService proves the mounted `vol://system` identity before phase-two driver
+  loading. Additional matching block devices become ordinary providers and cannot steal
+  system/media/ISO/UDF roles by enumerating first. A missing, duplicate or ambiguous root
+  locator is a typed boot failure with emergency diagnostics and explicit SystemManager
+  escalation; DeviceManager cold reconstruction must select the same backing or refuse,
+  never silently switch the live system volume.
+- [ ] Pin the remaining cross-cutting wire/identity rules. All bind, watchdog, quiesce,
+  provider-removal and recovery deadlines use the monotonic kernel clock (wall-clock
+  changes cannot expire or extend them), with registry-declared bounded defaults and
+  system maxima. The generated registry has an explicit magic/schema version, canonical
+  deterministic encoding and immutable per-boot snapshot; an unsupported schema fails
+  before discovery grants, while additive optional fields use specified fail-closed
+  defaults. Stable node identities are canonical by bus (PCI domain:BDF/function,
+  ACPI namespace path, FDT node path/phandle, USB controller identity + route/interface)
+  and always pair with a generation; user labels are aliases, not authority. One shared
+  typed failure vocabulary distinguishes `unbound`, `claimed`, `removed`, `driver-missing`,
+  `artifact-mismatch`, `abi/protocol-mismatch`, `dependency-pending`, `iommu-required`,
+  `irq-exhausted`, `resource-exhausted`, `hung`, `quarantined` and clean/lost removal,
+  and every observable surface renders the same cause without collapsing it to `failed`.
 - Done when: the existing virtio and xHCI set boots entirely through the
   generated registry with no `driver_for` or fixed ServiceManager driver-state array;
   a topology with an absent staged driver starts no process for it; two controllers and
@@ -3280,12 +3427,39 @@ passes; otherwise each new driver would deepen the architecture M128 exists to r
   provider readiness/removal and reverse dependency teardown are ordered; quiesce,
   flush, stop and suspend/resume meet their deadlines or force-revoke honestly; an
   ambiguous match or dependency cycle is rejected at registry-build time; a missing
-  artifact and an unsupported device stay visibly distinct; and `lsdev`, `lssvc` plus
-  the System Graph agree on every live state and resource count. The versioned driver
-  protocol, transaction rollback, generation/state-machine, dependency/provider,
-  watchdog/power and accounting host tests, fake-bus lifecycle/fault stress tests and
-  focused x86 QEMU tests pass before M129 begins; aarch64/riscv64 cross-build the
-  same generated registry and protocol.
+  artifact and an unsupported device stay visibly distinct; DeviceManager crash performs
+  a cold subtree reconstruction with a new epoch and restores or explicitly escalates
+  the boot-volume path; forced unbind proves bus mastering/interrupts are disabled and
+  reset/IOMMU teardown completed before any DMA page is reused; directional DMA plus
+  bounce/cache-sync paths round-trip on coherent and modeled non-coherent devices; an
+  IOMMU-required binding refuses honestly without one and untranslated trusted DMA is
+  reported as degraded isolation; exclusive/shared, edge/level and multi-vector IRQs
+  survive storms, affinity changes and partial claimant removal; operator policy can
+  disable/retry/select only declared candidates and cannot widen authority; registry
+  digest/size/ABI checks reject a substituted driver before resource grant; malformed or
+  flooding driver metadata cannot publish undeclared providers or exhaust the manager;
+  clean/lost provider churn completes every in-flight request without a hang; bounded
+  diagnostics survive even when persistent logging fails; an ordinary process and a
+  directly launched driver ELF cannot claim, map, reset or arm any device; DeviceRoot
+  authority mints one exclusive generation-bound Binding, a competing claim fails, and
+  all derived capabilities become unusable on revoke; the final driver cannot duplicate
+  or transfer them onward and a USB child cannot widen its mediated interface into the
+  parent xHCI authority; surprise removal at every claim/resource step either prevents
+  minting or triggers complete teardown with no stale mapping/IRQ left usable; two
+  otherwise identical block devices still resolve the boot-protocol root locator to the
+  same verified `vol://system` backing across a DeviceManager reconstruction, while an
+  ambiguous locator fails loudly; every lifecycle timeout is monotonic, unsupported
+  registry schemas fail before a claim, stable bus identities plus generations do not
+  alias, the canonical typed error survives through logs/inventory/graph; and `lsdev`,
+  `lssvc` plus the System Graph agree on every live state and resource count. The
+  versioned driver protocol, transaction rollback, generation/state-machine,
+  dependency/provider, watchdog/power, DeviceManager recovery, containment/reset,
+  kernel DeviceRoot/Binding authority, capability attenuation/revocation, atomic
+  claim/removal, root-device resolution, registry schema/identity/errors, DMA/IOMMU,
+  IRQ, operator policy, artifact-integrity, hostile-protocol, provider-churn, diagnostics
+  and accounting host tests, fake-bus lifecycle/fault stress tests and focused x86 QEMU
+  tests pass before M129 begins; aarch64/riscv64 cross-build the same generated registry
+  and protocol and run the architecture-specific DMA/cache/IRQ checks available there.
 - Concept: the DeviceManager capability/binding model, M40/M119 service supervision and
   resolver lifecycle, M62/M110 USB hotplug, M109's data-driven artifact manifest, the
   ResourceManager accounting policy, and M129 as the first consumer of the completed
