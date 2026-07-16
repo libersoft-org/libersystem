@@ -5,4 +5,5 @@ description = "Bounded no_std GIF animation container over LZW"
 
 [dependencies]
 pix = { path = "../pix" }
+quantize = { path = "../quantize" }
 weezl = { version = "0.2.1", default-features = false, features = ["alloc"] }

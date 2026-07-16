@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use keys::usage;
 use pix::{Image, Rect, Target};
 use proto::path;
-use proto::system::{input, volume, OpenOpts};
+use proto::system::{OpenOpts, input, volume};
 use rt::*;
 
 struct DecodedImage {

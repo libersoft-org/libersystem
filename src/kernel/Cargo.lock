@@ -65,6 +65,14 @@ dependencies = [
  "deflate",
  "inflate",
  "pix",
+ "quantize",
+]
+
+[[package]]
+name = "quantize"
+version = "0.0.0"
+dependencies = [
+ "pix",
 ]
 
 [[package]]

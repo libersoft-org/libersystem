@@ -4,7 +4,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use pix::{Animation, Blend, Disposal, Frame};
-use weezl::{decode::Decoder, encode::Encoder, BitOrder};
+use weezl::{BitOrder, decode::Decoder, encode::Encoder};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -12,6 +12,13 @@ pub enum Error {
 	Invalid,
 	Unsupported,
 	TooLarge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeOptions {
+	pub quality: u8,
+	pub dither: bool,
+	pub alpha_threshold: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -130,26 +137,17 @@ pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 }
 
 pub fn encode(animation: &Animation) -> Result<Vec<u8>, Error> {
+	encode_with_options(animation, EncodeOptions { quality: 100, dither: true, alpha_threshold: 128 })
+}
+
+pub fn encode_with_options(animation: &Animation, options: EncodeOptions) -> Result<Vec<u8>, Error> {
 	let validated = Animation::new(animation.width, animation.height, animation.loop_count, animation.frames.clone()).map_err(map_pix)?;
 	if validated.width > u16::MAX as u32 || validated.height > u16::MAX as u32 || validated.loop_count > u16::MAX as u32 {
 		return Err(Error::TooLarge);
 	}
-	let mut palette: Vec<[u8; 4]> = Vec::new();
-	for frame in &validated.frames {
-		for pixel in frame.image.pixels.chunks_exact(4) {
-			if !matches!(pixel[3], 0 | 255) {
-				return Err(Error::Unsupported);
-			}
-			let color = if pixel[3] == 0 { [0, 0, 0, 0] } else { [pixel[0], pixel[1], pixel[2], 255] };
-			if !palette.contains(&color) {
-				if palette.len() == 256 {
-					return Err(Error::Unsupported);
-				}
-				palette.push(color);
-			}
-		}
-	}
-	let table_size = palette.len().max(2).next_power_of_two();
+	let images: Vec<_> = validated.frames.iter().map(|frame| frame.image.as_rgba()).collect();
+	let palette = quantize::build_palette(&images, quantize::Options { quality: options.quality, dither: options.dither, alpha_threshold: options.alpha_threshold }).map_err(map_quantize)?;
+	let table_size = palette.colors.len().max(2).next_power_of_two();
 	let size_bits = table_size.trailing_zeros() as u8 - 1;
 	let minimum = (size_bits + 1).max(2);
 	let mut output = b"GIF89a".to_vec();
@@ -158,13 +156,13 @@ pub fn encode(animation: &Animation) -> Result<Vec<u8>, Error> {
 	output.push(0x80 | 0x70 | size_bits);
 	output.extend_from_slice(&[0, 0]);
 	for index in 0..table_size {
-		let color = palette.get(index).copied().unwrap_or([0; 4]);
+		let color = palette.colors.get(index).copied().unwrap_or([0; 4]);
 		output.extend_from_slice(&color[..3]);
 	}
 	output.extend_from_slice(b"\x21\xff\x0bNETSCAPE2.0\x03\x01");
 	output.extend_from_slice(&(validated.loop_count as u16).to_le_bytes());
 	output.push(0);
-	let transparent = palette.iter().position(|color| color[3] == 0).map(|index| index as u8);
+	let transparent = palette.transparent_index;
 	for frame in &validated.frames {
 		let delay = u16::try_from(frame.duration_ms.div_ceil(10)).map_err(|_| Error::TooLarge)?.max(1);
 		let disposal = match frame.disposal {
@@ -181,15 +179,7 @@ pub fn encode(animation: &Animation) -> Result<Vec<u8>, Error> {
 		output.extend_from_slice(&(frame.image.width as u16).to_le_bytes());
 		output.extend_from_slice(&(frame.image.height as u16).to_le_bytes());
 		output.push(0);
-		let indices: Vec<u8> = frame
-			.image
-			.pixels
-			.chunks_exact(4)
-			.map(|pixel| {
-				let color = if pixel[3] == 0 { [0, 0, 0, 0] } else { [pixel[0], pixel[1], pixel[2], 255] };
-				palette.iter().position(|entry| *entry == color).unwrap() as u8
-			})
-			.collect();
+		let indices = quantize::map_image(frame.image.as_rgba(), &palette).map_err(map_quantize)?;
 		let compressed = Encoder::new(BitOrder::Lsb, minimum).encode(&indices).map_err(|_| Error::Invalid)?;
 		output.push(minimum);
 		write_subblocks(&mut output, &compressed);
@@ -247,6 +237,13 @@ fn map_pix(error: pix::Error) -> Error {
 	}
 }
 
+fn map_quantize(error: quantize::Error) -> Error {
+	match error {
+		quantize::Error::Invalid => Error::Invalid,
+		quantize::Error::TooLarge => Error::TooLarge,
+	}
+}
+
 #[cfg(test)]
 extern crate std;
 
@@ -273,14 +270,31 @@ mod tests {
 	}
 
 	#[test]
-	fn rejects_partial_alpha_and_more_than_256_exact_colors() {
+	fn quantizes_partial_alpha_and_more_than_256_exact_colors() {
 		let partial = Animation::still(pix::RgbaImage::new(1, 1, vec![1, 2, 3, 4]).unwrap());
-		assert_eq!(encode(&partial), Err(Error::Unsupported));
+		let partial = decode(&encode(&partial).unwrap()).unwrap();
+		assert_eq!(partial.frames[0].image.pixels, vec![0, 0, 0, 0]);
 		let mut pixels = Vec::new();
 		for value in 0..257u16 {
 			pixels.extend_from_slice(&[(value & 255) as u8, (value >> 8) as u8, 0, 255]);
 		}
 		let many = Animation::still(pix::RgbaImage::new(257, 1, pixels).unwrap());
-		assert_eq!(encode(&many), Err(Error::Unsupported));
+		let decoded = decode(&encode(&many).unwrap()).unwrap();
+		assert_eq!(decoded.frames[0].image.width, 257);
+		assert!(decoded.frames[0].image.pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
+	}
+
+	#[test]
+	fn quality_changes_palette_budget() {
+		let mut pixels = Vec::new();
+		for value in 0..1024u32 {
+			pixels.extend_from_slice(&[(value & 255) as u8, ((value * 37) & 255) as u8, ((value * 91) & 255) as u8, 255]);
+		}
+		let animation = Animation::still(pix::RgbaImage::new(32, 32, pixels).unwrap());
+		let low = encode_with_options(&animation, EncodeOptions { quality: 0, dither: true, alpha_threshold: 128 }).unwrap();
+		let high = encode_with_options(&animation, EncodeOptions { quality: 100, dither: true, alpha_threshold: 128 }).unwrap();
+		assert!(low.len() < high.len());
+		assert_eq!(decode(&low).unwrap().frames[0].image.width, 32);
+		assert_eq!(decode(&high).unwrap().frames[0].image.width, 32);
 	}
 }

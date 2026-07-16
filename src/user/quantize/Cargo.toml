@@ -1,0 +1,7 @@
+[package]
+name = "quantize"
+edition = "2024"
+description = "Bounded no_std palette quantization and dithering"
+
+[dependencies]
+pix = { path = "../pix" }

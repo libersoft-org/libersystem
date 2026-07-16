@@ -49,7 +49,7 @@ use proto::system::audio_admin;
 use proto::system::display_admin;
 use proto::system::input_admin;
 use proto::system::permission::{self, Service};
-use proto::system::{process, AuditEntry, Capability, Error, Manifest, StartResult};
+use proto::system::{AuditEntry, Capability, Error, Manifest, StartResult, process};
 use rt::*;
 use services::executable;
 
@@ -369,11 +369,7 @@ unsafe fn grant_handle(clients: &mut Clients, cap: Capability) -> u64 {
 		// Narrow the minted connection to a client's rights, like every other grant.
 		let dup: i64 = duplicate(minted, GRANT_RIGHTS);
 		close(minted);
-		if dup >= 0 {
-			dup as u64
-		} else {
-			0
-		}
+		if dup >= 0 { dup as u64 } else { 0 }
 	}
 }
 

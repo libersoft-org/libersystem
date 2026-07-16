@@ -7,12 +7,20 @@ name = "gif"
 version = "0.0.0"
 dependencies = [
  "pix",
+ "quantize",
  "weezl",
 ]
 
 [[package]]
 name = "pix"
 version = "0.0.0"
+
+[[package]]
+name = "quantize"
+version = "0.0.0"
+dependencies = [
+ "pix",
+]
 
 [[package]]
 name = "weezl"

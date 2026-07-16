@@ -108,6 +108,7 @@ name = "gif"
 version = "0.0.0"
 dependencies = [
  "pix",
+ "quantize",
  "weezl",
 ]
 
@@ -254,6 +255,7 @@ dependencies = [
  "deflate",
  "inflate",
  "pix",
+ "quantize",
 ]
 
 [[package]]
@@ -282,6 +284,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "quantize"
+version = "0.0.0"
+dependencies = [
+ "pix",
 ]
 
 [[package]]

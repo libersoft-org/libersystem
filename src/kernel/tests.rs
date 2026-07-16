@@ -4687,8 +4687,8 @@ fn config_service_serves_the_tree() {
 	assert_eq!(&b[7..7 + vlen], b"hi", "the value just set reads back");
 }
 
-tagged_test!(imgconv_writes_lossless_png_through_writable_storage, [Service, Storage, Process]);
-fn imgconv_writes_lossless_png_through_writable_storage() {
+tagged_test!(imgconv_writes_indexed_png_through_writable_storage, [Service, Storage, Process]);
+fn imgconv_writes_indexed_png_through_writable_storage() {
 	use alloc::collections::BTreeMap;
 	use object::channel::{Channel, Message};
 	use object::memory_object::MemoryObject;
@@ -4729,7 +4729,7 @@ fn imgconv_writes_lossless_png_through_writable_storage() {
 	let (stdout, child_stdout) = Channel::create();
 	let process = loader::spawn_elf_process(sched::root_domain(), imgconv_elf, child, Rights::ALL, 0).expect("spawn imgconv.lsexe");
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("stdout bootstrap");
-	bootstrap.send(Message::new(b"--compression 100 vol://system/sample.bmp vol://system/converted.png".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv args");
+	bootstrap.send(Message::new(b"--quality 100 --compression 100 vol://system/sample.bmp vol://system/converted.png".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv args");
 	send_cap(&bootstrap, b"SYSTEM", storage_client.clone(), Rights::ALL).expect("SYSTEM bootstrap");
 	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("absent volume bootstrap");
@@ -4750,7 +4750,7 @@ fn imgconv_writes_lossless_png_through_writable_storage() {
 		}
 	}
 	let line = line.expect("imgconv prints a result");
-	assert!(line.starts_with(b"imgconv: BMP 2x2 -> PNG 2x2 compression=100 bytes="));
+	assert!(line.starts_with(b"imgconv: BMP 2x2 -> PNG 2x2 quality=100 compression=100 bytes="));
 	assert!(line.ends_with(b" metadata=stripped\n"));
 	assert!(process.is_terminated(), "imgconv exits after writing output");
 
@@ -4776,7 +4776,7 @@ fn imgconv_writes_lossless_png_through_writable_storage() {
 	let size = le_u64(&reply.bytes, 9) as usize;
 	let output = reply.caps.first().expect("converted output buffer").object().into_any_arc().downcast::<MemoryObject>().expect("converted output is a MemoryObject");
 	let decoded = png::decode_rgba(&read_from_object(&output, size)).expect("converted output independently decodes");
-	assert_eq!(decoded, source, "lossless conversion preserves exact RGBA pixels");
+	assert_eq!(decoded, source, "indexed conversion preserves an exactly representable source palette");
 }
 
 tagged_test!(config_set_survives_a_service_reboot, [Service, Storage]);

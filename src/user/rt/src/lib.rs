@@ -114,6 +114,27 @@ pub unsafe extern "C" fn liber_memcpy_impl(destination: *mut u8, source: *const 
 	destination
 }
 
+unsafe fn move_bytes(destination: *mut u8, source: *const u8, len: usize) {
+	let destination_address = destination as usize;
+	let source_address = source as usize;
+	if destination_address <= source_address || destination_address - source_address >= len {
+		for index in 0..len {
+			unsafe { destination.add(index).write_volatile(source.add(index).read_volatile()) };
+		}
+	} else {
+		for index in (0..len).rev() {
+			unsafe { destination.add(index).write_volatile(source.add(index).read_volatile()) };
+		}
+	}
+}
+
+#[cfg(feature = "shared-image")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn liber_memmove_impl(destination: *mut u8, source: *const u8, len: usize) -> *mut u8 {
+	unsafe { move_bytes(destination, source, len) };
+	destination
+}
+
 #[cfg(feature = "shared-image")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn liber_memset_impl(destination: *mut u8, value: i32, len: usize) -> *mut u8 {
@@ -141,13 +162,13 @@ pub unsafe extern "C" fn liber_memcmp_impl(left: *const u8, right: *const u8, le
 }
 
 #[cfg(all(feature = "shared-image", target_arch = "x86_64"))]
-global_asm!(".global memcpy", ".type memcpy,@function", "memcpy:", "jmp liber_memcpy_impl", ".global memset", ".type memset,@function", "memset:", "jmp liber_memset_impl", ".global memcmp", ".type memcmp,@function", "memcmp:", "jmp liber_memcmp_impl",);
+global_asm!(".global memcpy", ".type memcpy,@function", "memcpy:", "jmp liber_memcpy_impl", ".global memmove", ".type memmove,@function", "memmove:", "jmp liber_memmove_impl", ".global memset", ".type memset,@function", "memset:", "jmp liber_memset_impl", ".global memcmp", ".type memcmp,@function", "memcmp:", "jmp liber_memcmp_impl",);
 
 #[cfg(all(feature = "shared-image", target_arch = "aarch64"))]
-global_asm!(".global memcpy", ".type memcpy,%function", "memcpy:", "b liber_memcpy_impl", ".global memset", ".type memset,%function", "memset:", "b liber_memset_impl", ".global memcmp", ".type memcmp,%function", "memcmp:", "b liber_memcmp_impl",);
+global_asm!(".global memcpy", ".type memcpy,%function", "memcpy:", "b liber_memcpy_impl", ".global memmove", ".type memmove,%function", "memmove:", "b liber_memmove_impl", ".global memset", ".type memset,%function", "memset:", "b liber_memset_impl", ".global memcmp", ".type memcmp,%function", "memcmp:", "b liber_memcmp_impl",);
 
 #[cfg(all(feature = "shared-image", target_arch = "riscv64"))]
-global_asm!(".global memcpy", ".type memcpy,@function", "memcpy:", "tail liber_memcpy_impl", ".global memset", ".type memset,@function", "memset:", "tail liber_memset_impl", ".global memcmp", ".type memcmp,@function", "memcmp:", "tail liber_memcmp_impl",);
+global_asm!(".global memcpy", ".type memcpy,@function", "memcpy:", "tail liber_memcpy_impl", ".global memmove", ".type memmove,@function", "memmove:", "tail liber_memmove_impl", ".global memset", ".type memset,@function", "memset:", "tail liber_memset_impl", ".global memcmp", ".type memcmp,@function", "memcmp:", "tail liber_memcmp_impl",);
 
 // Issue a syscall: number in rax, up to four args in rdi/rsi/rdx/r10. The
 // `syscall` instruction clobbers rcx and r11; the kernel also uses r8/r9. The

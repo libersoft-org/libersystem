@@ -7,3 +7,4 @@ description = "Dependency-free bounded PNG decoder"
 deflate = { path = "../deflate" }
 inflate = { path = "../inflate" }
 pix = { path = "../pix" }
+quantize = { path = "../quantize" }

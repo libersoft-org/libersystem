@@ -99,11 +99,11 @@ pub const fn capabilities(format: Format) -> Capabilities {
 	match format {
 		Format::Apng => Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: true, alpha: true },
 		Format::Bmp => Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false },
-		Format::Gif => Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: true, alpha: true },
+		Format::Gif => Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: false, animation: true, alpha: true },
 		Format::Ico => Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
 		Format::Icns => Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
 		Format::Jpeg => Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: true, animation: false, alpha: false },
-		Format::Png => Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
+		Format::Png => Capabilities { quality: true, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
 		Format::Pcx | Format::Ppm => Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false },
 		Format::Qoi | Format::Tga => Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
 		Format::WebP => Capabilities { quality: false, compression: true, lossless_mode: true, lossy_mode: false, animation: false, alpha: true },
@@ -231,6 +231,9 @@ pub fn parse_args(args: &[u8]) -> Result<Config, Error> {
 		Format::Apng | Format::Ico | Format::Icns | Format::Png => {
 			compression.get_or_insert(50);
 		}
+		Format::Gif => {
+			quality.get_or_insert(100);
+		}
 		Format::Jpeg => {
 			quality.get_or_insert(90);
 			mode.get_or_insert(Mode::Lossy);
@@ -281,7 +284,7 @@ pub fn convert(input: &[u8], config: &Config) -> Result<(Vec<u8>, ResultInfo), E
 		animation.loop_count = config.loop_count.unwrap_or(animation.loop_count);
 		let encoded = match config.format {
 			Format::Apng => apng::encode(&animation, config.compression.ok_or(Error::InvalidOptions)?).map_err(map_apng_error)?,
-			Format::Gif => gif::encode(&animation).map_err(map_gif_error)?,
+			Format::Gif => gif::encode_with_options(&animation, gif::EncodeOptions { quality: config.quality.ok_or(Error::InvalidOptions)?, dither: true, alpha_threshold: 128 }).map_err(map_gif_error)?,
 			_ => return Err(Error::InvalidOptions),
 		};
 		let info = ResultInfo { input_format, output_format: config.format, source_width, source_height, output_width: animation.width, output_height: animation.height, output_bytes: encoded.len(), quality: config.quality, compression: config.compression, mode: config.mode };
@@ -302,7 +305,10 @@ pub fn convert(input: &[u8], config: &Config) -> Result<(Vec<u8>, ResultInfo), E
 		Format::Ico => ico::encode(core::slice::from_ref(&image), config.compression.ok_or(Error::InvalidOptions)?).map_err(map_ico_error)?,
 		Format::Icns => icns::encode(core::slice::from_ref(&image), config.compression.ok_or(Error::InvalidOptions)?).map_err(map_icns_error)?,
 		Format::Jpeg => jpeg::encode(&image, config.quality.ok_or(Error::InvalidOptions)?).map_err(map_jpeg_error)?,
-		Format::Png => png::encode_rgba(&image, png::EncodeOptions { compression: config.compression.ok_or(Error::InvalidOptions)? }).map_err(map_png_error)?,
+		Format::Png => match config.quality {
+			Some(quality) => png::encode_indexed(&image, config.compression.ok_or(Error::InvalidOptions)?, quality).map_err(map_png_error)?,
+			None => png::encode_rgba(&image, png::EncodeOptions { compression: config.compression.ok_or(Error::InvalidOptions)? }).map_err(map_png_error)?,
+		},
 		Format::Pcx => pcx::encode(&image).map_err(map_pcx_error)?,
 		Format::Ppm => ppm::encode(&image).map_err(map_ppm_error)?,
 		Format::Qoi => qoi::encode(&image).map_err(map_qoi_error)?,
@@ -626,10 +632,14 @@ mod tests {
 		assert_eq!(png.resize, Some((4, 3)));
 		assert_eq!(png.compression, Some(100));
 		assert_eq!(parse_args(b"--compression 1 in.png out.bmp"), Err(Error::UnsupportedOption));
-		assert_eq!(parse_args(b"--quality 90 in.png out.png"), Err(Error::UnsupportedOption));
+		let indexed_png = parse_args(b"--quality 90 --compression 75 in.png out.png").unwrap();
+		assert_eq!((indexed_png.quality, indexed_png.compression), (Some(90), Some(75)));
 		let jpeg = parse_args(b"--quality 90 --lossy in.png out.jpeg").unwrap();
 		assert_eq!((jpeg.quality, jpeg.mode), (Some(90), Some(Mode::Lossy)));
 		assert_eq!(parse_args(b"--lossless in.png out.jpg"), Err(Error::UnsupportedOption));
+		let gif = parse_args(b"--quality 25 in.png out.gif").unwrap();
+		assert_eq!(gif.quality, Some(25));
+		assert_eq!(parse_args(b"in.png out.gif").unwrap().quality, Some(100));
 		let webp = parse_args(b"--lossless --compression 100 in.png out.webp").unwrap();
 		assert_eq!(webp.mode, Some(Mode::Lossless));
 		assert_eq!(parse_args(b"--lossy in.png out.webp"), Err(Error::UnsupportedOption));
@@ -647,6 +657,16 @@ mod tests {
 		let bmp_config = parse_args(b"in.png out.bmp").unwrap();
 		let (encoded, _) = convert(include_bytes!("../../../volume/sample.png"), &bmp_config).unwrap();
 		assert_eq!(bmp::decode_rgba(&encoded).unwrap().pixels.len(), 16);
+	}
+
+	#[test]
+	fn converts_opaque_bmp_to_explicit_indexed_png() {
+		let source = bmp::decode_rgba(include_bytes!("../../../volume/sample.bmp")).unwrap();
+		let config = parse_args(b"--quality 0 --compression 100 in.bmp out.png").unwrap();
+		let (encoded, info) = convert(include_bytes!("../../../volume/sample.bmp"), &config).unwrap();
+		assert!(encoded.windows(4).any(|window| window == b"PLTE"));
+		assert_eq!(png::decode_rgba(&encoded).unwrap(), source);
+		assert_eq!((info.quality, info.compression), (Some(0), Some(100)));
 	}
 
 	#[test]
@@ -763,9 +783,10 @@ mod tests {
 		.unwrap();
 		let source = gif::encode(&animation).unwrap();
 		assert_eq!(convert(&source, &parse_args(b"in.gif out.png").unwrap()), Err(Error::InvalidOptions));
-		let (encoded, _) = convert(&source, &parse_args(b"--loop 7 in.gif out.gif").unwrap()).unwrap();
+		let (encoded, info) = convert(&source, &parse_args(b"--loop 7 --quality 100 in.gif out.gif").unwrap()).unwrap();
 		let decoded = gif::decode(&encoded).unwrap();
 		assert_eq!(decoded.loop_count, 7);
 		assert_eq!(decoded.frames, animation.frames);
+		assert_eq!(info.quality, Some(100));
 	}
 }

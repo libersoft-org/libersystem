@@ -11,6 +11,8 @@ fn main() {
 		("BMP", "in.png out.bmp"),
 		("PNG fast", "--compression 0 in.png out.png"),
 		("PNG compact", "--compression 100 in.png out.png"),
+		("PNG indexed q0", "--quality 0 --compression 100 in.png out.png"),
+		("PNG indexed q100", "--quality 100 --compression 100 in.png out.png"),
 		("PCX", "in.png out.pcx"),
 		("PPM", "in.png out.ppm"),
 		("QOI", "in.png out.qoi"),
@@ -22,7 +24,8 @@ fn main() {
 		("WebP fast", "--lossless --compression 0 in.png out.webp"),
 		("WebP compact", "--lossless --compression 100 in.png out.webp"),
 		("APNG", "--compression 100 in.png out.apng"),
-		("GIF", "in.png out.gif"),
+		("GIF q0", "--quality 0 in.png out.gif"),
+		("GIF q100", "--quality 100 in.png out.gif"),
 	] {
 		let config = imgconv::parse_args(arguments.as_bytes()).unwrap();
 		let start = Instant::now();
@@ -42,7 +45,7 @@ fn fixture(width: u32, height: u32) -> pix::RgbaImage {
 	let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
 	for y in 0..height {
 		for x in 0..width {
-			pixels.extend_from_slice(&[((x / 64) * 32) as u8, ((y / 64) * 32) as u8, (((x + y) / 128) * 32) as u8, 255]);
+			pixels.extend_from_slice(&[x as u8, y as u8, (x.wrapping_mul(13) + y.wrapping_mul(7)) as u8, 255]);
 		}
 	}
 	pix::RgbaImage::new(width, height, pixels).unwrap()

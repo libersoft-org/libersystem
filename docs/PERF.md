@@ -7,42 +7,56 @@ orders, not precision instruments.
 ## Image conversion (2026-07-15)
 
 `just image-bench` builds the same no_std leaves used by `imgconv` in an optimized
-host profile and converts a deterministic 512x512, 64-color RGBA fixture. Each row
+host profile and converts a deterministic 512x512 true-color RGBA fixture. Each row
 measures full container encode and independent content-sniff/decode; the standing gate
 fails if either side exceeds five seconds. One x86 host run produced:
 
 | output profile | bytes | encode | decode |
 | --- | ---: | ---: | ---: |
-| BMP 24-bit | 786,486 | 15.8 ms | 2.1 ms |
-| PNG compression 0 | 1,049,321 | 26.9 ms | 17.8 ms |
-| PNG compression 100 | 8,587 | 20.0 ms | 10.1 ms |
-| PCX 24-bit RLE | 34,950 | 12.3 ms | 0.9 ms |
-| PPM P6 | 786,447 | 10.7 ms | 2.9 ms |
-| QOI RGBA | 32,594 | 10.9 ms | 0.1 ms |
-| TGA RLE | 24,466 | 10.7 ms | 0.4 ms |
-| ICO, 256x256 PNG-backed | 4,813 | 14.9 ms | 2.6 ms |
-| ICNS, 512x512 PNG-backed | 8,603 | 25.3 ms | 10.1 ms |
-| JPEG quality 10 | 4,901 | 13.3 ms | 1.0 ms |
-| JPEG quality 100 | 30,144 | 17.2 ms | 1.3 ms |
-| WebP lossless effort 0 | 12,834 | 11.2 ms | 0.5 ms |
-| WebP lossless effort 100 | 3,790 | 10.9 ms | 0.4 ms |
-| APNG, one frame | 8,645 | 19.8 ms | 6.9 ms |
-| GIF, exact palette | 16,855 | 25.1 ms | 5.2 ms |
+| BMP 24-bit | 786,486 | 27.8 ms | 1.6 ms |
+| PNG compression 0 | 1,049,321 | 43.4 ms | 19.0 ms |
+| PNG compression 100 | 441,032 | 65.7 ms | 26.5 ms |
+| PNG indexed quality 0, 16 colors | 57,625 | 56.7 ms | 5.7 ms |
+| PNG indexed quality 100, up to 256 colors | 114,191 | 167.3 ms | 8.7 ms |
+| PCX 24-bit RLE | 664,704 | 29.3 ms | 2.3 ms |
+| PPM P6 | 786,447 | 26.7 ms | 3.1 ms |
+| QOI RGBA | 1,048,595 | 27.7 ms | 0.9 ms |
+| TGA RLE | 788,498 | 27.8 ms | 0.9 ms |
+| ICO, 256x256 PNG-backed | 213,193 | 40.6 ms | 10.0 ms |
+| ICNS, 512x512 PNG-backed | 441,048 | 70.9 ms | 26.9 ms |
+| JPEG quality 10 | 10,008 | 30.3 ms | 1.5 ms |
+| JPEG quality 100 | 433,763 | 35.3 ms | 6.9 ms |
+| WebP lossless effort 0 | 786,522 | 29.6 ms | 4.2 ms |
+| WebP lossless effort 100 | 282 | 27.6 ms | 0.3 ms |
+| APNG, one frame | 441,090 | 65.6 ms | 23.8 ms |
+| GIF quality 0, 16 colors | 73,146 | 54.5 ms | 6.2 ms |
+| GIF quality 100, up to 256 colors | 150,236 | 156.6 ms | 7.7 ms |
+
+GIF and explicit indexed PNG use the same bounded no_std `quantize.lslib`, which is
+also intended for indexed PCX and BMP output. It builds one deterministic weighted
+median-cut palette across all supplied images, preserves exact palettes when they fit,
+reserves one binary-transparency entry when needed and maps rows with bounded
+Floyd-Steinberg error buffers. Quality 0 through 100 maps to 16 through 256 total
+entries; tests require quality 100 to beat quality 0 on RGB squared error and cap its
+mean squared error at 256. PNG without `--quality` remains exact RGBA. Supplying
+`--quality` explicitly selects indexed output; partial alpha is rejected rather than
+silently thresholded, while binary alpha is represented by PLTE/tRNS.
 
 The first governed integration uses a seeded writable LiberFS block stand-in:
-`imgconv.lsexe` receives only the system volume slot, converts staged BMP to PNG at
-compression 100, exits, and the kernel reopens the destination through StorageService
-and independently decodes it to exact RGBA. A separate PermissionManager run reaches the
+`imgconv.lsexe` receives only the system volume slot, converts staged BMP to indexed PNG
+at quality and compression 100, exits, and the kernel reopens the destination through
+StorageService and independently decodes its exactly representable palette to exact
+RGBA. A separate PermissionManager run reaches the
 destination-conflict path under the `volumes`-only policy without mutating its read-only
 scenario volume. `imgview` now calls the same central content sniffer and converts straight
 RGBA to display BGRX only at render time, so viewer and converter support cannot drift and
 transparent pixels are not destroyed at decode time.
 
 Current limits are deliberate and typed: WebP lossy/animation encoding is not available
-in the current no_std engine, intermediate WebP effort is not faked, GIF encoding accepts
-only binary alpha and at most 256 exact colors until the shared quantizer lands, modern
-ICNS uses PNG-backed entries while legacy RLE/JPEG2000 remains unsupported, and output
-publication is a whole-file StorageService write rather than transactional temp+rename.
+in the current no_std engine, intermediate WebP effort is not faked, indexed PCX/BMP
+output does not yet consume the shared quantizer, modern ICNS uses PNG-backed entries
+while legacy RLE/JPEG2000 remains unsupported, and output publication is a whole-file
+StorageService write rather than transactional temp+rename.
 
 ## Audio decoding and governed playback (2026-07-15)
 

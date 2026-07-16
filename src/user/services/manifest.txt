@@ -82,6 +82,7 @@ library   proto                 proto     volume
 library   pix                   pix    volume
 library   inflate               inflate volume
 library   deflate               deflate volume
+library   quantize              quantize volume
 library   bmp                   bmp    volume
 library   png                   png    volume
 library   apng                  apng   volume

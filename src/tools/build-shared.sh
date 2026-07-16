@@ -107,7 +107,7 @@ for spec in "$@"; do
 			(cd "$object_root/$archive_name" && llvm-ar x "$OLDPWD/$archive")
 		done
 		while IFS= read -r -d '' object; do
-			llvm-objcopy --set-symbol-visibility=memcpy=default --set-symbol-visibility=memset=default --set-symbol-visibility=memcmp=default "$object"
+			llvm-objcopy --set-symbol-visibility=memcpy=default --set-symbol-visibility=memmove=default --set-symbol-visibility=memset=default --set-symbol-visibility=memcmp=default "$object"
 			link_inputs+=("$object")
 		done < <(find "$object_root" -name '*.o' -print0)
 	else
@@ -144,10 +144,13 @@ for spec in "$@"; do
 		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	png)
-		link_deps=("$(library_file pix)" "$(library_file inflate)" "$(library_file deflate)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		link_deps=("$(library_file quantize)" "$(library_file pix)" "$(library_file inflate)" "$(library_file deflate)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	apng)
 		link_deps=("$(library_file png)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
+	quantize)
+		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	gif)
 		weezl_archive="$(find "$deps" -maxdepth 1 -name 'libweezl-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
@@ -156,7 +159,7 @@ for spec in "$@"; do
 			exit 1
 		fi
 		link_inputs=(--whole-archive "$rlib" "$weezl_archive" --no-whole-archive)
-		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		link_deps=("$(library_file quantize)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	ico)
 		link_deps=("$(library_file png)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)

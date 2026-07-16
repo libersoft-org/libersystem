@@ -111,6 +111,55 @@ pub fn encode_rgba(image: &pix::RgbaImage, options: EncodeOptions) -> Result<Vec
 	Ok(output)
 }
 
+pub fn encode_indexed(image: &pix::RgbaImage, compression: u8, quality: u8) -> Result<Vec<u8>, Error> {
+	if image.pixels.chunks_exact(4).any(|pixel| !matches!(pixel[3], 0 | 255)) {
+		return Err(Error::Unsupported);
+	}
+	let palette = quantize::build_palette(&[image.as_rgba()], quantize::Options { quality, dither: true, alpha_threshold: 128 }).map_err(map_quantize)?;
+	let indices = quantize::map_image(image.as_rgba(), &palette).map_err(map_quantize)?;
+	let bit_depth = match palette.colors.len() {
+		0..=2 => 1,
+		3..=4 => 2,
+		5..=16 => 4,
+		_ => 8,
+	};
+	let row_bytes = (image.width as usize).checked_mul(bit_depth as usize).ok_or(Error::TooLarge)?.div_ceil(8);
+	let filtered_len = row_bytes.checked_add(1).and_then(|row| row.checked_mul(image.height as usize)).ok_or(Error::TooLarge)?;
+	let mut filtered = zeroed(filtered_len)?;
+	for y in 0..image.height as usize {
+		let row_start = y * (row_bytes + 1) + 1;
+		for x in 0..image.width as usize {
+			let bit = x * bit_depth as usize;
+			let shift = 8 - bit_depth as usize - bit % 8;
+			filtered[row_start + bit / 8] |= indices[y * image.width as usize + x] << shift;
+		}
+	}
+	let compressed = deflate::zlib(&filtered, compression).map_err(|error| match error {
+		deflate::Error::Invalid => Error::Invalid,
+		deflate::Error::TooLarge => Error::TooLarge,
+	})?;
+	let mut output = SIGNATURE.to_vec();
+	let mut header = Vec::new();
+	header.extend_from_slice(&image.width.to_be_bytes());
+	header.extend_from_slice(&image.height.to_be_bytes());
+	header.extend_from_slice(&[bit_depth, 3, 0, 0, 0]);
+	append_chunk(&mut output, b"IHDR", &header)?;
+	let mut palette_bytes = Vec::new();
+	palette_bytes.try_reserve_exact(palette.colors.len() * 3).map_err(|_| Error::TooLarge)?;
+	for color in &palette.colors {
+		palette_bytes.extend_from_slice(&color[..3]);
+	}
+	append_chunk(&mut output, b"PLTE", &palette_bytes)?;
+	if let Some(transparent) = palette.transparent_index {
+		let mut alpha = alloc::vec![255; transparent as usize + 1];
+		alpha[transparent as usize] = 0;
+		append_chunk(&mut output, b"tRNS", &alpha)?;
+	}
+	append_chunk(&mut output, b"IDAT", &compressed)?;
+	append_chunk(&mut output, b"IEND", &[])?;
+	Ok(output)
+}
+
 pub fn encode_rgba_payload(image: &pix::RgbaImage, compression: u8) -> Result<Vec<u8>, Error> {
 	let row_bytes = usize::try_from(image.width).ok().and_then(|width| width.checked_mul(4)).ok_or(Error::TooLarge)?;
 	let expected = row_bytes.checked_mul(image.height as usize).ok_or(Error::TooLarge)?;
@@ -170,6 +219,13 @@ fn zeroed(len: usize) -> Result<Vec<u8>, Error> {
 	output.try_reserve_exact(len).map_err(|_| Error::TooLarge)?;
 	output.resize(len, 0);
 	Ok(output)
+}
+
+fn map_quantize(error: quantize::Error) -> Error {
+	match error {
+		quantize::Error::Invalid => Error::Invalid,
+		quantize::Error::TooLarge => Error::TooLarge,
+	}
 }
 
 fn parse(data: &[u8]) -> Result<Parsed, Error> {
@@ -620,5 +676,31 @@ mod tests {
 			assert_eq!(decode_rgba(&encoded).unwrap(), image);
 		}
 		assert_eq!(encode_rgba(&image, EncodeOptions { compression: 101 }), Err(Error::Invalid));
+	}
+
+	#[test]
+	fn encodes_indexed_palette_depth_and_binary_transparency() {
+		let image = pix::RgbaImage::new(5, 1, vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 0, 0, 255, 9, 8, 7, 0]).unwrap();
+		let encoded = encode_indexed(&image, 100, 100).unwrap();
+		let parsed = parse(&encoded).unwrap();
+		assert_eq!((parsed.color_type, parsed.bit_depth), (3, 2));
+		let mut expected = image;
+		expected.pixels[16..20].copy_from_slice(&[0, 0, 0, 0]);
+		assert_eq!(decode_rgba(&encoded).unwrap(), expected);
+	}
+
+	#[test]
+	fn indexed_quality_quantizes_true_color_but_rejects_partial_alpha() {
+		let mut pixels = Vec::new();
+		for value in 0..1024u32 {
+			pixels.extend_from_slice(&[(value & 255) as u8, ((value >> 2) & 255) as u8, ((value * 91) & 255) as u8, 255]);
+		}
+		let image = pix::RgbaImage::new(32, 32, pixels).unwrap();
+		let low = encode_indexed(&image, 50, 0).unwrap();
+		let high = encode_indexed(&image, 50, 100).unwrap();
+		assert_eq!(parse(&low).unwrap().palette.len(), 16);
+		assert!(parse(&high).unwrap().palette.len() > 16);
+		let partial = pix::RgbaImage::new(1, 1, vec![1, 2, 3, 128]).unwrap();
+		assert_eq!(encode_indexed(&partial, 50, 100), Err(Error::Unsupported));
 	}
 }
