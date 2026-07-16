@@ -5423,6 +5423,283 @@ fn pump_block_stand_in(blk_host: &object::channel::Channel, disk: &mut alloc::co
 	}
 }
 
+struct StorageHarness {
+	boot: alloc::sync::Arc<object::channel::Channel>,
+	block: alloc::sync::Arc<object::channel::Channel>,
+	client: alloc::sync::Arc<object::channel::Channel>,
+	disk: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>,
+	capacity: u64,
+}
+
+impl StorageHarness {
+	fn start(storage_elf: &[u8], tag: &[u8], image: &[u8], capacity: u64) -> Self {
+		use object::channel::Channel;
+		use object::rights::Rights;
+		const SECTOR: usize = 512;
+		let (boot, boot_user) = Channel::create();
+		let (block, block_child) = Channel::create();
+		let (server, client) = Channel::create();
+		loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, Rights::ALL, 0).expect("spawn StorageService harness");
+		send_cap(&boot, tag, block_child, Rights::ALL).expect("storage block bootstrap");
+		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
+		let mut disk = alloc::collections::BTreeMap::new();
+		for (lba, chunk) in image.chunks(SECTOR).enumerate() {
+			let mut sector = alloc::vec![0u8; SECTOR];
+			sector[..chunk.len()].copy_from_slice(chunk);
+			disk.insert(lba as u64, sector);
+		}
+		let mut harness = Self { boot, block, client, disk, capacity };
+		for _ in 0..100_000 {
+			harness.pump();
+			if let Ok(report) = harness.boot.recv() {
+				assert_eq!(&report.bytes[..], b"StorageService: online");
+				return harness;
+			}
+		}
+		panic!("StorageService harness did not report online");
+	}
+
+	fn pump(&mut self) {
+		sched::run_until_idle();
+		pump_block_stand_in(&self.block, &mut self.disk, self.capacity);
+	}
+
+	fn open(&mut self, path: &[u8], corr: u32) -> Option<alloc::vec::Vec<u8>> {
+		use object::channel::Message;
+		use object::memory_object::MemoryObject;
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&1u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.extend_from_slice(&[0, 0]);
+		self.client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage open request");
+		for _ in 0..100_000 {
+			self.pump();
+			if let Ok(reply) = self.client.recv() {
+				if le_u32(&reply.bytes, 0) != corr || reply.bytes.get(4) != Some(&1) {
+					return None;
+				}
+				let size = le_u64(&reply.bytes, 9) as usize;
+				let object = reply.caps.first()?.object().into_any_arc().downcast::<MemoryObject>().ok()?;
+				return Some(read_from_object(&object, size));
+			}
+		}
+		None
+	}
+}
+
+fn fat16_image(files: &[([u8; 11], &[u8])], fill_free: bool) -> alloc::vec::Vec<u8> {
+	const SECTOR: usize = 512;
+	const CLUSTERS: usize = 5_000;
+	const RESERVED: usize = 1;
+	const ROOT_ENTRIES: usize = 512;
+	let fat_sectors = ((CLUSTERS + 2) * 2).div_ceil(SECTOR);
+	let root_sectors = (ROOT_ENTRIES * 32).div_ceil(SECTOR);
+	let first_data = RESERVED + fat_sectors + root_sectors;
+	let total = first_data + CLUSTERS;
+	let mut image = alloc::vec![0u8; total * SECTOR];
+	let fat_offset = RESERVED * SECTOR;
+	image[fat_offset..fat_offset + 2].copy_from_slice(&0xfff8u16.to_le_bytes());
+	image[fat_offset + 2..fat_offset + 4].copy_from_slice(&0xffffu16.to_le_bytes());
+	let root_offset = (RESERVED + fat_sectors) * SECTOR;
+	for (index, (name, data)) in files.iter().enumerate() {
+		assert!(data.len() <= SECTOR && index < ROOT_ENTRIES);
+		let cluster = index + 2;
+		let fat = fat_offset + cluster * 2;
+		image[fat..fat + 2].copy_from_slice(&0xffffu16.to_le_bytes());
+		let data_offset = (first_data + cluster - 2) * SECTOR;
+		image[data_offset..data_offset + data.len()].copy_from_slice(data);
+		let entry = root_offset + index * 32;
+		image[entry..entry + 11].copy_from_slice(name);
+		image[entry + 11] = 0x20;
+		image[entry + 26..entry + 28].copy_from_slice(&(cluster as u16).to_le_bytes());
+		image[entry + 28..entry + 32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+	}
+	if fill_free {
+		for cluster in files.len() + 2..CLUSTERS + 2 {
+			let fat = fat_offset + cluster * 2;
+			image[fat..fat + 2].copy_from_slice(&0xffffu16.to_le_bytes());
+		}
+	}
+	image[11..13].copy_from_slice(&(SECTOR as u16).to_le_bytes());
+	image[13] = 1;
+	image[14..16].copy_from_slice(&(RESERVED as u16).to_le_bytes());
+	image[16] = 1;
+	image[17..19].copy_from_slice(&(ROOT_ENTRIES as u16).to_le_bytes());
+	image[19..21].copy_from_slice(&(total as u16).to_le_bytes());
+	image[22..24].copy_from_slice(&(fat_sectors as u16).to_le_bytes());
+	image[510] = 0x55;
+	image[511] = 0xaa;
+	image
+}
+
+tagged_test!(storage_harness_mounts_seeded_fat16, [Storage, Filesystem]);
+fn storage_harness_mounts_seeded_fat16() {
+	let (_, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let image = fat16_image(&[(*b"HELLO   TXT", b"hello")], false);
+	let mut storage = StorageHarness::start(storage_elf, b"FATBLOCK", &image, image.len() as u64);
+	assert_eq!(storage.open(b"vol://media/HELLO.TXT", 0xfa16), Some(b"hello".to_vec()));
+}
+
+fn run_imgconv_harness(imgconv_elf: &[u8], args: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) -> alloc::vec::Vec<u8> {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+	let (bootstrap, child) = Channel::create();
+	let (stdout, child_stdout) = Channel::create();
+	let process = loader::spawn_elf_process(sched::root_domain(), imgconv_elf, child, Rights::ALL, 0).expect("spawn imgconv harness");
+	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgconv stdout");
+	bootstrap.send(Message::new(args.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv args");
+	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgconv system volume");
+	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgconv media volume");
+	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv absent volume");
+	}
+	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv cwd");
+	let mut line = None;
+	for _ in 0..100_000 {
+		system.pump();
+		media.pump();
+		if line.is_none()
+			&& let Ok(message) = stdout.recv()
+		{
+			line = Some(message.bytes);
+		}
+		if line.is_some() && process.is_terminated() {
+			break;
+		}
+	}
+	assert!(process.is_terminated(), "imgconv harness exits");
+	line.expect("imgconv harness prints a result")
+}
+
+fn run_imgview_harness(imgview_elf: &[u8], path: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) {
+	use object::channel::{Channel, Message};
+	use object::memory_object::MemoryObject;
+	use object::rights::Rights;
+	let (bootstrap, child) = Channel::create();
+	let (_stdout, child_stdout) = Channel::create();
+	let (display, display_client) = Channel::create();
+	let (input, input_client) = Channel::create();
+	let process = loader::spawn_elf_process(sched::root_domain(), imgview_elf, child, Rights::ALL, 0).expect("spawn imgview harness");
+	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgview stdout");
+	bootstrap.send(Message::new(path.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview args");
+	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview system volume");
+	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgview media volume");
+	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview absent volume");
+	}
+	send_cap(&bootstrap, b"DISPLAY", display_client, Rights::ALL).expect("imgview display");
+	send_cap(&bootstrap, b"INPUT_KEYS", input_client, Rights::ALL).expect("imgview input");
+	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview cwd");
+
+	let acquire = loop {
+		system.pump();
+		media.pump();
+		if let Ok(request) = display.recv() {
+			break request;
+		}
+	};
+	assert_eq!(le_u16(&acquire.bytes, 0), 1, "imgview acquires a surface");
+	let surface = MemoryObject::create(16).expect("imgview surface");
+	let mut reply = alloc::vec::Vec::new();
+	reply.extend_from_slice(&le_u32(&acquire.bytes, 2).to_le_bytes());
+	reply.push(1);
+	reply.extend_from_slice(&16u64.to_le_bytes());
+	reply.extend_from_slice(&2u32.to_le_bytes());
+	reply.extend_from_slice(&2u32.to_le_bytes());
+	reply.extend_from_slice(&8u32.to_le_bytes());
+	reply.push(0);
+	send_cap(&display, &reply, surface.clone(), Rights::ALL).expect("imgview acquire reply");
+
+	let present = loop {
+		system.pump();
+		media.pump();
+		if let Ok(request) = display.recv() {
+			break request;
+		}
+	};
+	assert_eq!(le_u16(&present.bytes, 0), 2, "imgview presents converted image");
+	assert!(read_from_object(&surface, 16).iter().any(|byte| *byte != 0), "imgview presents nonblank converted pixels");
+	display.send(Message::new([le_u32(&present.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview present reply");
+
+	let focus = loop {
+		system.pump();
+		media.pump();
+		if let Ok(request) = display.recv() {
+			break request;
+		}
+	};
+	assert_eq!(le_u16(&focus.bytes, 0), 5, "imgview requests focus");
+	let (_focus_server, focus_client) = Channel::create();
+	let mut focus_reply = alloc::vec::Vec::new();
+	focus_reply.extend_from_slice(&le_u32(&focus.bytes, 2).to_le_bytes());
+	focus_reply.push(1);
+	focus_reply.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&display, &focus_reply, focus_client, Rights::ALL).expect("imgview focus reply");
+
+	let subscribe = loop {
+		system.pump();
+		media.pump();
+		if let Ok(request) = input.recv() {
+			break request;
+		}
+	};
+	assert_eq!(le_u16(&subscribe.bytes, 0), 2, "imgview subscribes to keys");
+	let (keys, key_consumer) = Channel::create();
+	send_cap(&input, &le_u32(&subscribe.bytes, 2).to_le_bytes(), key_consumer, Rights::ALL).expect("imgview key stream");
+	for _ in 0..100 {
+		system.pump();
+		media.pump();
+	}
+	keys.send(Message::new(alloc::vec![0, 0, 0, 0, 0x14, 0, 1], alloc::vec::Vec::new(), 0)).expect("imgview q key");
+
+	let release = loop {
+		system.pump();
+		media.pump();
+		if let Ok(request) = display.recv() {
+			break request;
+		}
+	};
+	assert_eq!(le_u16(&release.bytes, 0), 3, "imgview releases its surface");
+	display.send(Message::new([le_u32(&release.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview release reply");
+	for _ in 0..100_000 {
+		system.pump();
+		media.pump();
+		if process.is_terminated() {
+			return;
+		}
+	}
+	panic!("imgview harness did not exit");
+}
+
+tagged_test!(imgconv_cross_volume_and_failed_overwrite_preserve_destination, [Service, Storage, Process, Filesystem]);
+fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let imgconv_elf = program_elf(&package, volume, b"imgconv").expect("imgconv tool");
+	let imgview_elf = program_elf(&package, volume, b"imgview").expect("imgview tool");
+	let source = bmp::decode_rgba(&volume_file(volume, b"sample.bmp").expect("staged BMP")).expect("staged BMP decodes");
+	let mut system = StorageHarness::start(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+
+	let media_image = fat16_image(&[], false);
+	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
+	let line = run_imgconv_harness(imgconv_elf, b"--quality 100 vol://system/sample.bmp vol://media/CROSS.BMP", &mut system, &mut media);
+	assert!(line.starts_with(b"imgconv: BMP 2x2 -> BMP 2x2 quality=100 bytes="));
+	let converted = media.open(b"vol://media/CROSS.BMP", 0xc2055).expect("cross-volume BMP opens");
+	assert_eq!(bmp::decode_rgba(&converted).expect("cross-volume BMP decodes"), source);
+	run_imgview_harness(imgview_elf, b"vol://media/CROSS.BMP", &mut system, &mut media);
+
+	let previous = b"previous destination";
+	let full_image = fat16_image(&[(*b"KEEP    BMP", previous)], true);
+	let mut full_media = StorageHarness::start(storage_elf, b"FATBLOCK", &full_image, full_image.len() as u64);
+	let failure = run_imgconv_harness(imgconv_elf, b"--force --resize 64x64 vol://system/sample.bmp vol://media/KEEP.BMP", &mut system, &mut full_media);
+	assert_eq!(failure, b"imgconv: cannot write output\n");
+	assert_eq!(full_media.open(b"vol://media/KEEP.BMP", 0xfa11), Some(previous.to_vec()), "failed overwrite preserves the previous destination byte-for-byte");
+}
+
 tagged_test!(system_volume_lands_in_a_gpt_partition, [Service, Storage, Filesystem, Slow]);
 fn system_volume_lands_in_a_gpt_partition() {
 	use alloc::collections::BTreeMap;

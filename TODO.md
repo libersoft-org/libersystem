@@ -2990,7 +2990,7 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     (`webpx`, `fast-webp`) wrap unsafe libwebp C FFI;
     `oxideav-webp` is a std-heavy scaffold, so none satisfy the bare-metal rule.
     Fixed-compression formats reject controls instead of ignoring them.
-- [ ] Bounded, failure-safe output path: decode and transform under checked image/frame
+- [x] Bounded, failure-safe output path: decode and transform under checked image/frame
   budgets, compute every row/table/chunk size with checked arithmetic, cap encoded
   output relative to the validated source model, and propagate allocation failures as
   typed errors. Encoders write deterministic bytes for the same input/options. The
@@ -2998,6 +2998,15 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   trailer validation complete; on failure, interruption or out-of-space, remove the
   incomplete output and leave an existing file untouched. Converting a path onto
   itself requires `--force` and still decodes the original before replacement.
+  - Partial result (2026-07-16): `imgconv` already fully encodes/checks the bounded
+    output in memory before one StorageService whole-file write. LiberFS publishes that
+    write through CoW and FAT uses allocate/write/new-entry-swap/free-old ordering. A
+    governed dual-StorageService test now converts system BMP -> media indexed BMP over
+    real `BLOCK` LiberFS plus `FATBLOCK` FAT16 clients, reopens it byte-for-byte through
+    StorageService, and independently decodes exact RGBA. A second full FAT fixture
+    forces `--force --resize` to fail with no free cluster and proves the previous
+    destination remains byte-identical. Tool interruption before the single write cannot
+    expose output; a backend failure is covered by the same atomic filesystem contracts.
 - [x] Governed `imgconv.lsexe`: register the tool in the manifest and shell completion
   with exactly `volumes`, add dependencies only on the selected codec leaves and
   shared conversion helpers, print one compact result line (source format/dimensions,
@@ -3037,16 +3046,19 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     encode is indexed PNG quality 100 at 164.5 ms; indexed BMP/PCX quality 100 take
     149.2/173.2 ms, classic ICNS takes 25.3 ms and animated WebP takes 0.7 ms, all well
     below the 5 s gate. The
-    complete application-library suite is green, focused x86 process/service/storage/
-    display/input is 55/55, and full
+    complete application-library suite is green; the new focused x86 storage/process/
+    display/input scenario is 43/43 (the broader process/service/storage/display/input
+    selection remains 55/55), and full
     shared-library plus userspace builds pass on x86_64, aarch64 and riscv64. The strict
     x86 image graph includes BMP 15,952 B and PCX 11,968 B, both with a direct
     `quantize.lslib` edge, plus PNG 23,576 B, APNG 12,648 B, quantize 17,008 B,
     GIF 75,856 B, ICO 12,416 B, ICNS 34,496 B, JPEG 325,424 B, PPM 9,376 B,
     QOI 16,552 B, TGA 10,216 B and WebP 313,304 B with canonical prefix-free
-    SONAME/NEEDED edges. Remaining gate work is cross-volume mutation, failure cleanup/
-    transactional publication evidence, lossy-WebP quality endpoints and viewer launch on a newly
-    converted non-PNG format.
+    SONAME/NEEDED edges. The cross-volume governed scenario also launches the real
+    `imgview.lsexe` on the newly created `vol://media/CROSS.BMP`, observes a nonblank
+    display present, grants focused key input, sends `q`, and verifies surface release +
+    process exit. Remaining gate work is the lossy-WebP quality endpoint and broader
+    conformance/fault vectors around that future encoder.
 - Done when: `imgconv` converts every implemented M126 format through the same RGBA/frame
   model, WebP can explicitly choose lossless or lossy, applicable encoders honor
   validated 0..100 quality/compression controls, alpha and animation are never dropped

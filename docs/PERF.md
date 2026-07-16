@@ -71,6 +71,16 @@ scenario volume. `imgview` now calls the same central content sniffer and conver
 RGBA to display BGRX only at render time, so viewer and converter support cannot drift and
 transparent pixels are not destroyed at decode time.
 
+The expanded governed integration runs two real StorageService instances: writable
+LiberFS as `vol://system` and writable FAT16 as `vol://media`. `imgconv.lsexe` converts
+the staged system BMP into an indexed media BMP, StorageService reopens it, and the BMP
+leaf independently verifies exact RGBA. The same output is then opened by the real
+`imgview.lsexe`; its display/input stand-ins observe nonblank presentation, focus-scoped
+key subscription, `q`, surface release and clean process exit. A second FAT16 image has
+every free cluster allocated and an existing `KEEP.BMP`; forced resized conversion
+returns a storage failure and the old bytes remain exactly unchanged, pinning the
+filesystem publication guarantee end to end.
+
 Current limits are deliberate and typed: WebP lossy encoding is not available in the
 current no_std engine, intermediate WebP effort is not faked, ICNS JPEG2000
 entries remain unsupported, and image output is deliberately a fully encoded whole-file
