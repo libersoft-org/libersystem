@@ -29,6 +29,11 @@ intrinsics may change in the next image without compatibility shims.
 - Resolution is eager and deterministic. Lazy PLT binding, `LD_PRELOAD`, environment
   search paths, runtime library replacement, symbol interposition, and unload are not
   supported.
+- Every native executable staged under `vol://system/bin/` is a PIE `ET_DYN` consumer
+  of system libraries. A static `/bin` executable is an image-construction error. Pinned
+  boot-critical programs in `init.pkg` may remain self-contained until their providers
+  are available before StorageService, but this exception never creates a static copy on
+  the mounted system volume.
 
 ## Build model
 
@@ -68,6 +73,28 @@ that the loader contract recognizes are:
 support exports such as `memcpy`, `memset`, and the pinned core panic paths. `proto.lslib`
 depends on `lsrt.lslib`; higher leaves depend only on their declared lower libraries.
 Cycles are rejected by the image builder and by ProcessService.
+
+The production executable graph must compile providers and consumers with one pinned
+toolchain/profile/feature identity. The M123 pilot built `lsrt` without the optional
+`proto-transport` feature to avoid a dependency cycle while ordinary tools compiled a
+different `rt` identity; Rust-mangled imports from those tools therefore cannot resolve
+to the pilot provider. The full conversion splits transport ownership instead:
+
+- `lsrt.lslib` owns core/alloc/compiler builtins, allocator, syscalls, channels, waits,
+  stdio and process primitives;
+- `wire.lslib` owns transport-independent codec readers/writers, `Transport`, buffers and
+  representation modes;
+- `ipc-client.lslib` owns `ChannelTransport` and resolver transport over `wire + lsrt`;
+- generated LSIDL domain-client libraries depend on those roots, remain separate by
+  contract domain and export concrete channel/resolver clients. The generic
+  `Client<T: Transport>` remains available for tests/special transports but is not
+  monomorphized into production `/bin` executables;
+- a generated architecture entry object supplies `_start` and calls the executable's
+  `__user_main` without statically linking another runtime.
+
+This is an image-internal Rust ABI, never a cross-image promise. The image builder
+rejects duplicate compiled identities for one provider and duplicate allocator/panic/
+compiler-runtime ownership.
 
 ## Ownership split
 
@@ -121,10 +148,16 @@ Limits are explicit: bounded module count, dependency depth, symbol count, strin
 bytes, relocation count, and mapped bytes per process/domain. Failed loads release all
 private frames and shared-cache references acquired by that transaction.
 
-## Measurement gate
+## Measurement and optimization
 
-Dynamic conversion is retained only where aggregate image and resident-memory numbers
-beat optimized static release builds. `docs/PERF.md` records per-binary size, system
-volume size, cold-start latency, and resident frames for concurrent processes. Small
-single-purpose tools may remain static when the loader and relocation cost outweighs
-sharing.
+Dynamic linking is the required `/bin` architecture, not an optional optimization gate.
+`docs/PERF.md` records per-binary PIE size, direct/transitive provider bytes, system-volume
+size, cold/warm launch latency, relocation/symbol-lookup cost, private pages and shared
+resident frames. Measurements drive optimization of provider atomization, relocation
+batching, symbol lookup/cache, page I/O and build profiles. They do not authorize static
+copies of runtime, generated protocols or codecs inside utility executables.
+
+The 2026-07-16 baseline is 48 static stripped tools totaling 11,885,992 bytes: ordinary
+tools account for 6,202,912 bytes and `imgview`/`play`/`imgconv` for 5,683,080 bytes. The
+existing shared `lsrt` and `proto` roots total roughly 733 KiB before further domain
+splitting. M126a in `TODO.md` owns the complete conversion and its tri-architecture gates.

@@ -2592,7 +2592,9 @@ console after each run, and the VM shut down cleanly.
 
 ## M123 - Shared system libraries (dynamic linking)
 
-Status: DONE (2026-07-14).
+Status: DONE (2026-07-14) AS THE LOADER/PROVIDER PILOT. The originally worded broad
+executable rollout did not land here; M126a owns and hard-gates it after the full `/bin`
+audit.
 
 Today every governed ELF statically links the whole userspace runtime and the
 generated protocol code, and once M121/M122 land, the surface helpers and image
@@ -2652,17 +2654,18 @@ profile alone recovers most of the size, parts of this can wait.
       `imgview` links lsrt.lslib + proto.lslib + pix.lslib +
       bmp.lslib + png.lslib + surface.lslib + keys.lslib and nothing else. Staged into the
       system image next to the binaries.
-- [x] Conversion + measurement: convert the existing tools and services to
-      link the libraries dynamically, and record before/after numbers
-      (per-binary size, total image size, cold-start latency, resident RAM
-      across N concurrent processes) in docs/PERF.md - the numbers, not the
-      ideology, decide how far the conversion goes and whether small
-      single-purpose tools stay static.
-- Done when: at least the staged tools link `lsrt.lslib` + `proto.lslib`
-      dynamically on all three architectures, library text is verifiably
-      shared between two concurrent processes, a corrupt library cannot panic
-      the loader, and the measured size/startup deltas are recorded in
-      docs/PERF.md; tests green (host + targeted kernel tags).
+- [x] Pilot conversion + measurement: build the complete provider graph and one real
+  staged PIE probe linked through `lsrt.lslib` + `proto.lslib` + `pix.lslib`, launch
+  it through StorageService/ProcessService, prove immutable text sharing between two
+  concurrent processes and record size/startup/resident-memory numbers in
+  docs/PERF.md. This validates the mechanism and its trade-offs; it does not claim
+  that ordinary tools or services were converted.
+- Done when: the complete atomized provider graph and a staged PIE consumer build on all
+  three architectures; the x86 governed path resolves `DT_NEEDED`, relocates and
+  launches that consumer; library text is verifiably shared between two concurrent
+  processes; a corrupt library cannot panic the loader; and pilot size/startup deltas
+  are recorded in docs/PERF.md with host + targeted kernel gates green. Broad `/bin`
+  conversion is explicitly M126a's completion gate.
 - Concept: the image as the compatibility unit (immutable phase-3 system
       images make this model stronger, not weaker), W^X and the hostile-input
       discipline extended to the dynamic loader, the NOTES size/start-delay
@@ -2695,6 +2698,8 @@ show 95-212 ms dynamic start versus 2.1-2.4 ms for the small static probe and a
 644,904 B stripped shared payload. Therefore the loader/pilot stay, but broad conversion
 of small tools is deliberately deferred; large/concurrent apps opt in when their measured
 RAM/image break-even justifies it. Future image/audio formats arrive as new leaf libraries.
+This was the M123 decision at the time; M126a supersedes the static-tool deferral after the
+full `/bin` size audit and makes dynamic linking mandatory for every system utility.
 
 ## M124 - Audio player (streaming decoders over AudioService)
 
@@ -3033,10 +3038,195 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   (one codec per `.lslib` leaf), M125 (canonical `imgconv.lsexe` artifact), the
   capability rule (`volumes` only), and the NOTES image-conversion-tool item.
 
+## M126a - Dynamically linked system executables (no static `/bin` tools)
+
+Status: PLANNED AFTER M126; HARD PREREQUISITE FOR M127 AND EVERY NEW M130/M131
+EXECUTABLE. M123 delivered the loader, relocations, immutable-page sharing and atomized
+`.lslib` providers, but deliberately converted only `dyn_probe`: all 48 current tools
+are still static `ET_EXEC` files with no dynamic section or `DT_NEEDED`. That deferral is
+now rejected. Every native executable staged under `vol://system/bin/` must be a PIE
+`ET_DYN` consumer of system libraries; image construction fails on a static tool. Loader
+latency is an optimization target after correctness/size, not permission to duplicate
+runtime/protocol/codec code into every executable.
+
+Measured x86_64 baseline (2026-07-16, the same `llvm-strip --strip-all` staging uses):
+48 tool ELFs total 11,885,992 bytes. The ordinary 45 tools account for 6,202,912 bytes;
+the codec-heavy `imgview`, `play` and `imgconv` account for 5,683,080 bytes alone
+(1,856,088 / 1,147,608 / 2,679,384). Every one reports no dynamic section. In contrast,
+the existing shared roots are `lsrt.lslib` 415,848 bytes and `proto.lslib` 317,200 bytes,
+the atomized codec/provider leaves are already staged once, and the dynamic probe is a
+few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sections
+(raw Cargo debug ELFs are much larger but are stripped before staging).
+
+- [ ] Make the image build own one coherent PIC provider/consumer graph. Today
+  `lsrt.lslib` builds `rt` with `shared-image` and without `proto-transport`, while a
+  normal tool compiles `rt` with the opposite feature set; Rust crate hashes therefore
+  differ and ordinary mangled imports cannot resolve even though `lsrt` exports 652
+  functions. Split the dependency cycle instead of adding hundreds of stable-C wrappers:
+  `lsrt` owns entry-independent `core`/`alloc`/compiler-builtins, allocator, syscall,
+  channel, wait, stdio and process primitives; a separate `ipc-client` leaf owns
+  `ChannelTransport`/resolver transport over `wire + lsrt`; `wire` is the extracted
+  heap-aware but service-agnostic codec foundation (`Sink`, readers/writers, `Transport`,
+  buffers and representation mode), breaking today's `rt -> proto -> rt` feature cycle.
+  Build every provider and
+  consumer with the same pinned toolchain, profile, feature identity, cfg and metadata
+  seed in one deterministic whole-image invocation. Emit a build-graph identity record
+  per crate (`package`, source digest, rustc commit, target, profile/codegen flags,
+  enabled features and dependency identities), embed its digest in provider/consumer
+  notes and reject two identities for the same system crate before linking. Do not infer
+  identity merely from a Rust mangled hash or whichever incremental rlib has the newest
+  timestamp.
+- [ ] Add a tiny generated executable-start object per architecture, not a static runtime
+  archive in every program. It exports `_start`, aligns/initializes the ABI-required
+  registers, performs the native ABI revision check through `lsrt`, and calls the tool's
+  unmangled `__user_main(bootstrap)`. x86_64/aarch64/riscv64 entry behavior must stay
+  byte/semantics-equivalent to today's `rt` stubs. Panic/alloc/compiler-intrinsic ownership
+  is singular in `lsrt`; a consumer must not define a second allocator, panic handler,
+  alloc shim, `memcpy` or runtime global. The start object is intentionally linked into
+  every PIE as a few instructions of per-executable glue; that tiny duplicate is not a
+  system library and contains no allocator, formatting, IPC or protocol implementation.
+  One checked source/generator emits all three architecture variants and is owned by the
+  system image linker, not LSIDL.
+- [ ] Generalize `tools/build-shared.sh` into a manifest-driven system image linker that
+  builds both `.lslib` providers and `.lsexe` consumers. For each tool, ask rustc for
+  release PIC objects without using Cargo's final static executable link, then invoke
+  `rust-lld -pie --no-dynamic-linker` with the generated start object and only the direct
+  system libraries the manifest/build graph names. Emit `ET_DYN`, canonical `DT_NEEDED`
+  names and deterministic provider order; strip debug/symbol-table baggage after the
+  dynamic symbol/relocation tables are fixed. The pinned nightly path is explicit and
+  test-pinned: `cargo rustc --release --bin <name> -- --emit=obj` already produces a PIC
+  object for a real existing tool; the builder consumes Cargo's machine-readable artifact
+  messages to select that exact output rather than scraping the newest file from `target/`,
+  and intentionally ignores Cargo's ordinary final-link failure/output. Do not require
+  one Cargo package per command: the existing multi-bin tools package emits one object set
+  per `[[bin]]`. A rustc/Cargo update that changes this internal contract fails a focused
+  builder test before any package is staged.
+- [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
+  than hiding edges in shell `case` arms. Each `library` row records logical identity,
+  crate/source owner, output class/path, direct providers and build-feature set; each
+  native executable row records logical command/artifact identity, crate + bin target,
+  output path, start profile and direct providers. Generated LSIDL-domain rows come from
+  the IDL package graph. Validate unknown fields/providers, duplicate logical/output
+  identities, source/bin mismatch, an edge omitted from or unused by ELF imports,
+  incompatible feature identities and target-specific edge drift. Sort rows and edges
+  canonically so source/manifest enumeration order cannot change bytes.
+- [ ] Enforce a strict executable graph at image construction: every native `/bin`
+  artifact is `ET_DYN`, contains `PT_DYNAMIC` + terminated dynamic table, has at least
+  `DT_NEEDED=lsrt.lslib`, carries no interpreter/RPATH/RUNPATH, and names only canonical
+  prefix-free staged `.lslib` providers. Reject unresolved symbols, duplicate providers,
+  unexpected exported globals, W+X/text relocations, unused direct `DT_NEEDED` edges,
+  cycles, a statically included `core`/`alloc`/`rt`/`proto` copy and any `.lsexe` whose
+  allocated code duplicates a provider-owned symbol. Keep ProcessService's existing
+  eager bounded DAG resolution and start-only-after-relocation transaction. The image
+  linker implements these checks from ELF facts: undefined dynamic symbols/relocations
+  must resolve to exactly one provider in the declared transitive closure; every direct
+  `DT_NEEDED` edge must provide at least one symbol not already satisfied by an earlier
+  direct provider; defined-symbol ownership plus graph-identity notes detect static
+  provider copies. This is a build-time graph audit, not runtime guesswork.
+- [ ] Canonicalize runtime provider loading. ProcessService currently assigns each
+  `LIBRARY_SLOT_SIZE` bias in DFS/`DT_NEEDED` encounter order. Parse the complete bounded
+  graph first, reject duplicate symbol providers, compute one provider-before-consumer
+  topological order with a lexicographic canonical-name tie-break, then load in that order
+  and derive biases from it. The image linker computes and tests the same order; a launch
+  refuses if the runtime graph differs. Equivalent link/manifest input therefore yields
+  identical module addresses on every run, independent of archive/hash-map iteration.
+- [ ] Keep libraries atomized by ownership; do not replace static bloat with one giant
+  `tools.lslib`, `image.lslib` or `audio.lslib`. Required foundation layers:
+  - `lsrt.lslib`: runtime/core/alloc/compiler primitives used by every executable;
+  - `wire.lslib`: transport-independent codec primitives and representation helpers;
+  - `ipc-client.lslib`: channel/resolver transports over `wire + lsrt`;
+  - LSIDL domain clients/codecs split from today's monolithic `proto.lslib` (base plus
+    storage, process, device, network, log/observability, config, time, security,
+    resources, input/display/audio/session as measured). A tool depends only on the
+    domains it imports; keep a compatibility `proto.lslib` only for not-yet-migrated
+    non-`/bin` consumers and remove it after the whole image moves;
+  - `cli.lslib`: the current small `tools/src/lib.rs` argument/range/port/JSON-mode and
+    formatting helpers, grown only with genuinely cross-tool parsing/rendering;
+  - `volume-client.lslib`: launch-context volume bundle adoption, URI/path resolution,
+    client routing, streaming open/read and common typed storage errors. It is client
+    plumbing, not filesystem policy, and receives no ambient volume authority itself;
+  - existing single-concern `pix`, `surface`, `keys`, `pcm`, compression and individual
+    image/audio codec leaves. Applications name leaves directly; no aggregate codec lib.
+  Add another library only when at least two consumers share meaningful implementation,
+  or when it is an owning protocol/format boundary; do not turn five lines of glue into a
+  permanent ABI surface merely to reduce an ELF by a few bytes.
+- [ ] Prevent generic generated clients from defeating the library split. Today's
+  generated `Client<T: Transport>` methods are monomorphized for
+  `Client<ChannelTransport>` in every tool, so merely putting their source types in a
+  domain `.lslib` still duplicates request encoding/reply decoding in `/bin`. Extend
+  LSIDL generation with one concrete, non-generic channel/resolver client per interface,
+  implemented and exported by its domain-client `.lslib` over `ipc-client`; tools call
+  that concrete API. Keep generic `Client<T>` for host tests and specialized in-process
+  transports, but image auditing rejects its method instantiations in production `/bin`
+  artifacts. Apply the same rule to generic render/codec helpers whose measured
+  monomorphizations recur broadly: either expose a concrete domain function or prove the
+  residual instantiation is command-specific and smaller than a library call boundary.
+- [ ] Migrate in measured, independently runnable waves:
+  1. `echo`, `uname`, `uptime`, `dmesg`, `free`, `lscpu`, `lsmem`, `lsirq`, `lspci`,
+     `ptyecho`, `readln`, `script`: `lsrt` plus only the domain/CLI leaves they use;
+  2. storage/path tools (`cat`, `write`, `rm`, `ls`, `du`, `mkdir`, `rmdir`, `snap`,
+     `volume`, `lsvol`, `lsblk`) through `volume-client` + storage-domain bindings;
+  3. query/admin tools (`date`, `log`, `config`, `set`, `lsdev`, `lsusb`, `lssvc`,
+     `usage`, `ps`, `run`, `perm`, `stop`, `beep`) through only their typed domain clients;
+  4. network tools (`ping`, `ip`, `nslookup`, `tcp`, `nc`, `arp`, `httpd`, `ss`) through
+     the network-domain client, shared address formatting and CLI leaf;
+  5. `imgview`, `imgconv`, `play` and `graphics_probe` against their direct existing
+     display/input/audio/pixel/surface/codec leaves. Verify that the three large `.lsexe`
+     no longer contain JPEG/WebP/Vorbis/MP3/etc. implementation symbols already present
+     in `.lslib`; every selected format provider loads exactly once per process graph and
+     immutable pages are shared across concurrent consumers.
+- [ ] Update dependency declarations so source ownership matches binary ownership. The
+  current `tools/Cargo.toml` may retain several `[[bin]]` targets, but codec dependencies
+  move behind the exact binaries/provider crates that use them and the generated image
+  graph records actual direct imports. Cargo's package-wide dependency list is not proof
+  that every binary contains every codec (the linker already removes unreachable crates),
+  so validate with ELF symbols/`DT_NEEDED`, not manifest guesses. Add a source/import ->
+  expected provider audit and fail when a tool silently starts depending on an unrelated
+  subsystem.
+- [ ] Convert all future M130/M131 tools through this builder from their first runnable
+  slice; no static bootstrap exception exists for user-invoked commands. The shell,
+  services, internal helpers and non-bootstrap drivers should migrate to the same model
+  in follow-up waves during M127's path move, but `/bin` is the hard first gate. Pinned
+  boot-critical executables in `init.pkg` may remain self-contained until their library
+  loading source is available before StorageService; that exception never permits a
+  duplicate static artifact on the mounted system volume.
+- [ ] Size, sharing and startup gates per wave: record raw object, stripped PIE, direct +
+  transitive library bytes, private/RW pages, shared RX/R pages and cold/warm launch time
+  in `docs/PERF.md`. Size acceptance is structural, not a regression percentage: an
+  ordinary command PIE contains its command logic/rodata/relocations, not a second core,
+  allocator, protocol renderer or transport. Two simultaneous unrelated tools map the
+  same `lsrt`/domain-client frames; two codec consumers map the same codec text frames.
+  Optimize relocation batching, symbol lookup/cache and page I/O later if launch latency
+  is high; do not restore static linking as the optimization.
+- [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
+  x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
+  dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,
+  duplicate allocator/runtime symbol, static-tool rejection and per-tool undeclared-edge
+  test. Scan the complete generated graph on every architecture and fail on any relocation
+  type outside the loader's explicit allowlist (including accidental TLS, COPY, text or
+  architecture-specific forms); do not rely only on the historical M123 probe subset.
+  Focused governed tests launch at least one command from every wave and prove arguments/
+  cwd/stdio/capability grants, exit/job control and outputs are unchanged. Each wave's
+  checked report lists every migrated tool, its direct source imports, declared/direct/
+  transitive providers, PIE/private byte counts and test command, so “wave complete” is
+  reproducible rather than a prose grouping.
+- Done when: all 48 current `/bin` artifacts and every newly added M130/M131 command are
+  PIE `ET_DYN` files with canonical `DT_NEEDED` edges; no `/bin` artifact statically
+  contains `core`/`alloc`/`rt`/generated-protocol or codec implementations owned by a
+  system `.lslib`; all current commands retain behavior and least-privilege grants; the
+  staged `/bin` plus unique transitive providers is measured on all three architectures;
+  concurrent processes demonstrably share provider text; static `/bin` injection fails
+  the build; and launch-performance work cannot reintroduce static tools.
+- Concept: M123's completed loader/provider pilot, M125 canonical `.lsexe` identity,
+  M126's full codec graph, the system image as the Rust ABI compatibility unit, and the
+  user's explicit decision that system utilities are dynamically linked regardless of
+  the initial cold-start cost.
+
 ## M127 - Userspace source and system-volume layout cleanup
 
-Status: PLANNED AFTER M126. Do not start this migration until the image-conversion
-milestone is complete, so codec work and path churn never share one change set.
+Status: PLANNED AFTER M126a. Do not start this migration until the image-conversion
+milestone and the dynamically linked `/bin` conversion are complete, so codec/linker
+work and path churn never share one change set.
 
 The userspace grew from a few peer crates into runtimes, services, drivers, applications
 and atomized libraries, but `src/user/` still exposes all crate roots in one flat list.
@@ -3048,7 +3238,10 @@ rename or behavioral redesign. Cargo package names, logical manifest names, cano
 capability policy remain unchanged.
 
 - [ ] Freeze one complete old-path -> new-path inventory before moving files. The only
-  direct children of `src/user/` after the migration are these five role directories:
+  Cargo crate directories directly under `src/user/` after the migration are these five
+  role directories; shared workspace infrastructure (`.cargo`, `rust-toolchain.toml`,
+  linker scripts and the common build script) is inventoried explicitly and may remain at
+  `src/user/` or move to `src/`, but is not disguised as a sixth crate role:
   - `runtime/`: `rt` and any future process-runtime support crates;
   - `services/`: the current aggregate `services` crate plus `storage` and
     `system_manager` (physical subdirectory names may avoid `services/services`, but
@@ -3070,46 +3263,72 @@ capability policy remain unchanged.
   crate remains directly under `src/user/`, if an old `src/user/<crate>` path survives,
   or if two physical paths claim the same logical artifact.
 - [ ] Define the factory `vol://system` hierarchy so its root contains directories only:
-  - `bin/`: user-invoked `.lsexe` tools;
-  - `libexec/`: volume-loaded services and internal native helpers not invoked by users;
+  - `bin/`: user-invoked `.lsexe` tools. A stateless single-file command may live
+    directly here; an application/suite with private configuration, assets, logs or
+    several executables owns one subdirectory containing its binaries and those files
+    together (for example `bin/lico/{lico.lsexe,licoedit.lsexe,licoview.lsexe,...}`);
+  - `libexec/`: volume-loaded services and internal native helpers not invoked by users.
+    A component that persists private configuration/state/logs owns a subdirectory here
+    with its `.lsexe`; for example ConfigService owns
+    `libexec/config_service/{config_service.lsexe,config.tree}`;
   - `lib/`: canonical `.lslib` shared libraries;
-  - `drivers/`: non-bootstrap driver executables;
-  - `components/`: Wasm/component payloads such as the current `app.wasm`;
-  - `etc/`: persisted system configuration and presentation files, including
-    `config.tree` and the MOTD seed;
-  - `var/log/`: LogService's persistent journal;
-  - `share/examples/images/`, `share/examples/audio/` and `share/examples/text/`:
-    staged conformance/demo fixtures, including today's loose `sample.*` and
-    `hello.txt` files.
+  - `drivers/`: non-bootstrap driver executables, with an owner subdirectory only when a
+    driver has its own accompanying files;
+  - `components/`: non-native Wasm/component payloads, with one owner directory for a
+    payload plus its private files when needed;
+  - `log/`: only the system-wide structured journal owned by LogService;
+  - `test/`: one flat directory for staged conformance/demo fixtures, including today's
+    `sample.*`, `hello.txt` and `motd.txt` files. Do not classify fixtures into nested
+    image/audio/text trees.
+  There is deliberately no `etc/`, `var/`, `share/` or other imported Unix hierarchy.
+  Configuration and non-system logs belong to the program that owns them and live beside
+  its binary in that program's artifact directory; only the machine-wide journal is the
+  root `log/` exception. The artifact manifest maps a logical command/service name to its
+  exact path, so an app subdirectory does not leak into command spelling.
 - [ ] Make the service/artifact manifest the single source of truth for destination
   paths as well as source crate paths. `kernel/build.rs` must stage each artifact into
   its declared class instead of hard-coding every non-driver executable under `bin/`;
   factory-volume packing must create parent directories deterministically, reject path
   collisions/traversal and retain reproducible ordering. Bootstrap-only artifacts stay
   in `init.pkg` and are not duplicated onto the system volume unless explicitly listed.
+  Native internal executables currently classified as components/probes (for example
+  `component_host`, `wasi_host`, `file_picker`, `sandbox_probe` and `storage_client`)
+  belong in `libexec/`; `components/` holds payloads consumed by a component host, not
+  native ELFs that ProcessService launches.
 - [ ] Migrate every runtime consumer atomically: ProcessService and ServiceManager load
-  tools from `bin/` and services from `libexec/`; DeviceManager keeps `drivers/`;
-  component hosts use `components/`; ConfigService uses `etc/config.tree`; LogService
-  uses `var/log/`; shell completion enumerates only user commands from `bin/`; tests,
-  benchmarks, SDK staging and documentation use the new `share/examples/...` paths.
+  tools and services from their exact manifest paths under `bin/` and `libexec/` rather
+  than reconstructing `<class>/<name>`; DeviceManager keeps `drivers/`;
+  ProcessService resolves native internal helpers from `libexec/` while component hosts
+  load non-native payloads from `components/`; ConfigService uses its own
+  `libexec/config_service/config.tree`; LogService uses the root `log/` journal; shell
+  completion advertises only user commands declared from `bin/`, including commands whose
+  physical artifact is in an app subdirectory; tests, benchmarks, SDK staging and
+  documentation use the flat `test/` paths.
   Do not leave silent root-level compatibility copies or path aliases in this
   pre-release tree: stale paths must fail so the migration is complete and auditable.
 - [ ] Add layout conformance gates. Host/build tests assert the exact generated volume
   entry classes, root contains no loose files, canonical names have one destination and
   no old paths remain. A writable-volume QEMU scenario boots from a freshly seeded disk,
-  reaches the shell, launches one tool, one volume service/component and one driver from
-  their new locations, reads image/audio/text examples, persists config and a log under
-  `etc/`/`var/`, and reopens both after service restart. Existing-disk policy must be
-  explicit before implementation (fresh pre-release rebuild versus an on-disk migration)
-  and tested rather than accidentally mounting stale layout data.
+  reaches the shell, launches one tool, one volume-loaded service, one component and one
+  driver from their new locations, reads several flat `test/` fixtures, persists
+  ConfigService's tree beside its binary and the system journal under `log/`, and reopens
+  both after service restart. It also proves an app-owned config/log cannot be opened by
+  an unrelated program without a grant to that app directory. Existing-disk policy must
+  be explicit before implementation (fresh pre-release rebuild versus an on-disk
+  migration) and tested rather than accidentally mounting stale layout data.
 - [ ] Run the full host suite, generated-artifact checks, package/staging audits, ELF
   SONAME/DT_NEEDED checks, and x86_64/aarch64/riscv64 userspace plus QEMU gates. Record
   before/after source and volume trees in the architecture/package documentation.
-- Done when: `src/user/` contains only `runtime/`, `services/`, `drivers/`, `apps/` and
-  `libs/`; the system-volume root contains only the declared directories; every build,
-  runtime and documentation path comes from one explicit manifest mapping; no logical
-  crate or staged artifact identity changed; no compatibility duplicate hides an old
-  path; and clean tri-architecture builds and governed boot/storage tests pass.
+- Done when: every Cargo crate below `src/user/` is under `runtime/`, `services/`,
+  `drivers/`, `apps/` or `libs/`, with only explicitly inventoried shared build/toolchain
+  files allowed beside those directories; the system-volume root contains only the
+  declared directories and contains no `etc`, `var` or `share`; program-private config/
+  state/log files are colocated with their owning artifact, the root `log/` contains only
+  the system journal, and all fixtures are directly under `test/`; every build, runtime
+  and documentation path comes from one explicit manifest mapping; native internal ELFs
+  and non-native component payloads are not conflated; no logical crate or staged artifact
+  identity changed; no compatibility duplicate hides an old path; and clean tri-
+  architecture builds and governed boot/storage tests pass.
 - Concept: M61/M87 (volume-loaded programs and manifest ownership), M123/M125
   (prefix-free shared/executable identities), M126 (the codec growth that exposed the
   flat userspace layout), and the persistent-system-volume ownership model.
@@ -3129,10 +3348,11 @@ passes; otherwise each new driver would deepen the architecture M128 exists to r
 - [ ] Shared driver foundations before new device families: make DeviceManager binding
   select by standard PCI class/subclass/interface, USB interface descriptors and
   ACPI/FDT compatible identities rather than product-name strings. Keep one isolated,
-  restartable process per controller; support multiple instances, hotplug/removal,
-  bounded DMA/ring allocation, MSI/MSI-X or handed IRQ capabilities, teardown after
-  faults and deterministic rebinding. Vendor/product IDs may select a narrowly tested
-  standards-compliance quirk, never become the primary binding mechanism.
+  restartable process per exclusive binding unit (controller, PCI function, platform
+  device or mediated USB interface as defined below); support multiple instances,
+  hotplug/removal, bounded DMA/ring allocation, MSI/MSI-X or handed IRQ capabilities,
+  teardown after faults and deterministic rebinding. Vendor/product IDs may select a
+  narrowly tested standards-compliance quirk, never become the primary binding mechanism.
 - [ ] Make driver presence distinct from driver activation. The system image may stage
   every supported `.lsexe`, but DeviceManager loads and starts one only after a present
   hardware/function/interface node matches it. An absent device costs no process,
@@ -3705,16 +3925,19 @@ arm or product-ID-first binding shortcut.
   clients. This is a server-priority universal path; vendor management commands and
   platform-specific interleave quirks remain Phase 4.
 - [ ] Implement M129 in risk-ordered waves while keeping every landed wave independently
-  useful: (1) virtio-rng/vsock/serial plus CDC-ACM and
-  CDC-ECM/NCM; (2) NVMe and SDHCI for modern
+  useful: (1) virtio-iommu first where QEMU exposes it, then virtio-rng/vsock/serial plus
+  CDC-ACM and CDC-ECM/NCM; (2) NVMe and SDHCI for modern
   appliance/edge storage; (3) TPM, UCSI, WDAT, CDC-MBIM, USB Audio/MIDI/CCID and AHCI;
   (4) expanded USB HID, HID Power, HID-I2C, Bluetooth HCI and UAS; (5) UVC, EDID and HDA
   after their camera/audio/display vocabularies and isochronous machinery are proven;
   (6) GOP/UART handoff plus ACPI power/time platform classes and PCIe hotplug/AER/PME;
-  (7) virtio-scsi, crypto, memory and IOMMU policy devices; (8) server-priority IPMI and
+  (7) virtio-scsi, crypto and memory policy devices; (8) server-priority IPMI and
   NFIT/NVDIMM; (9) lower-value DFU/PTP/printer and legacy EHCI/OHCI/UHCI compatibility;
-  (10) opt-in development-only virtio-fs. A later wave never blocks shipping or testing
-  an earlier completed wave.
+  (10) opt-in development-only virtio-fs. On a target without an enforcing IOMMU, every
+  earlier DMA driver still follows M128's explicit `iommu-required` versus audited
+  trusted-untranslated policy; moving virtio-iommu earlier does not pretend it protects a
+  native platform where that paravirtual provider is absent. A later wave never blocks
+  shipping or testing an earlier completed wave.
 - [ ] Conformance and hostile-device gates for every family: pure descriptor/register/
   ring parsers get host tests and deterministic malformed mutations before MMIO/DMA;
   fake-controller tests cover completion ordering, timeout, reset, disconnect and
@@ -3748,8 +3971,11 @@ arm or product-ID-first binding shortcut.
 
 ## M130 - LiberCommander (`lico`, `licoedit`, `licoview`)
 
-Status: PLANNED. Build one keyboard-first, mouse-capable orthodox file-management
-suite for the Phase-2 console: `lico.lsexe` is the two-panel manager,
+Status: PLANNED AFTER M127. The panel/TUI, viewer and editor slices may start then, but
+M130 cannot complete until M131's public storage/transactional-writer foundation exists;
+M132 later extends the command bar with pipelines/redirection but is not required for
+M130's single-command completion gate. Build one keyboard-first, mouse-capable orthodox
+file-management suite for the Phase-2 console: `lico.lsexe` is the two-panel manager,
 `licoedit.lsexe` is the standalone text editor and `licoview.lsexe` is the standalone
 text/raw/hex viewer. All three are ordinary governed executables, share bounded no_std
 TUI, text-buffer and syntax-description libraries, and operate only on the terminal,
@@ -3767,16 +3993,20 @@ the ordinary governed launch path, not a second long-lived or hidden shell.
   terminal mode, cursor and mouse reporting.
 - [ ] Define a versioned, declarative syntax-description format and one bounded parser/
   matcher shared by `licoedit` and `licoview`. Keep one independently addable descriptor
-  per language under `share/lico/syntax/` (initially Rust, LSIDL, TOML, JSON, Markdown
-  and shell/config text); each descriptor names file globs and optional first-line
-  recognition, lexical contexts, delimiters, escapes, keywords and style classes. A new
-  language is added by installing another descriptor, not by recompiling either app.
+  per language beside the suite under `bin/lico/syntax/` (initially Rust, LSIDL, TOML,
+  JSON, Markdown and shell/config text); each descriptor names file globs and optional
+  first-line recognition, lexical contexts, delimiters, escapes, keywords and style
+  classes. A new language is added by installing another descriptor, not by recompiling
+  either app.
   Descriptors contain no executable commands, paths or capability requests; reject
   unknown versions, duplicate/conflicting rules, invalid UTF-8, excessive rules/nesting/
   token lengths and non-progressing matches before highlighting begins. A missing or bad
   descriptor falls back to plain text and cannot prevent opening the file.
-- [ ] Load the system syntax directory through one read-only capability and compile only
-  the selected language's rules into a bounded matcher. Define deterministic precedence
+- [ ] Expose the installed `bin/lico/` syntax descriptors as a manifest-enumerated
+  read-only asset bundle (or an equivalent app-directory view capability) and compile
+  only the selected language's rules into a bounded matcher. Do not call the current
+  whole-system-volume client an app-directory capability: the standalone viewer/editor
+  must not gain unrelated files merely to highlight text. Define deterministic precedence
   for filename versus first-line matches, a reload operation, stable style names mapped
   through the current theme, and incremental line-state caching so edits and scrolling
   re-highlight only the affected viewport/range. Host tests share golden source samples
@@ -3809,7 +4039,9 @@ the ordinary governed launch path, not a second long-lived or hidden shell.
   word editing, quoted arguments, command/path completion, bounded history, inserting
   the selected name/full URI and clear/cancel. Launch a canonical governed executable
   through PermissionManager with the active panel URI as its working directory and the
-  current SessionService environment overlay; foreground commands temporarily own the
+  immutable bounded environment snapshot supplied by M131's governed launch context
+  (today PermissionManager forwards only args, cwd and stdout, so this is an explicit
+  contract change, not assumed inheritance). Foreground commands temporarily own the
   terminal and restore the exact panel screen on return, while an explicit trailing `&`
   registers a normal session job. `cd` is handled as panel navigation (and optionally
   synchronizes the owning session cwd only by an explicit setting); other state-mutating
@@ -3837,6 +4069,16 @@ the ordinary governed launch path, not a second long-lived or hidden shell.
   real volume URIs; view/edit/copy/delete on a result uses that URI and the original
   capability check. No result list, recursive stack or content window grows without a
   Domain-enforced bound.
+- [ ] Define one launch-scoped selected-file grant before wiring associations: a typed
+  input carries the already-open read-only `storage.file`, stable display name and URI,
+  plus a separate optional write-back/publication capability when the user chose edit.
+  PermissionManager/StorageService mint this attenuated grant from the panel's authority;
+  the target gets neither the panel's whole five-volume bundle nor permission to reopen a
+  sibling path. Migrate `licoview`/`licoedit` and existing `imgview`/`play` to accept this
+  input (today the latter two resolve a path through all five volume clients), while
+  preserving ordinary direct path launch under their own declared manifests. A stale or
+  replaced target is detected at save/publication rather than silently writing another
+  object that later acquired the same name.
 - [ ] File associations are declarative data mapping validated type/extension rules to
   an action and canonical executable name. Ship only explicit safe defaults (text ->
   `licoview`/`licoedit`, known images -> existing `imgview`, known audio -> existing
@@ -3870,24 +4112,29 @@ the ordinary governed launch path, not a second long-lived or hidden shell.
   all with literal and shared-regex modes. Clipboard and undo memory live within explicit
   Domain budgets; an oversized edit fails without corrupting the buffer or saved file.
 - [ ] Safe editor persistence: detect read-only grants and external file replacement,
-  require an explicit reload/overwrite/save-as decision on conflict, write a temporary
-  sibling, flush it and atomically rename only after the complete write succeeds. Keep
-  the old file on allocation, no-space, disconnect or validation failure; optional
-  backup/recovery data is bounded, versioned and never mistaken for the canonical file.
-  Files above the supported editable-buffer limit or detected as binary open read-only
-  in `licoview` instead of being truncated, decoded lossily or partially editable.
+  require an explicit reload/overwrite/save-as decision on conflict, and use M131's
+  transactional writer/write-back grant so temporary naming, flush, atomic publication
+  and abort live in StorageService rather than the editor. Keep the old file on allocation,
+  no-space, disconnect or validation failure; optional backup/recovery data is bounded,
+  versioned and never mistaken for the canonical file. Files above the supported editable-
+  buffer limit or detected as binary open read-only in `licoview` instead of being
+  truncated, decoded lossily or partially editable.
 - [ ] Persist non-authority preferences (panel layout/columns/sort, key map, theme,
-  bookmarks, editor indentation and recent positions) as typed configuration with
-  bounded histories and schema versioning. Never persist handles, granted volume lists,
-  selected-file authority or credentials. Corrupt/unknown settings fall back field by
-  field, and a narrow terminal always has a usable single-panel/editor/viewer layout.
+  bookmarks, editor indentation and recent positions) in a bounded, versioned Lico-owned
+  file beside the suite under `bin/lico/`, not in a global config hierarchy. Publish it
+  through the transactional writer and grant only the suite access to that app directory.
+  Never persist handles, granted volume lists, selected-file authority or credentials.
+  Corrupt/unknown settings fall back field by field, and a narrow terminal always has a
+  usable single-panel/editor/viewer layout.
 - [ ] Register exactly one `lico.lsexe`, `licoedit.lsexe` and `licoview.lsexe` in the
-  artifact manifest, system `bin/`, shell help/completion and PermissionManager policy.
+  artifact manifest under the shared system `bin/lico/` owner directory, plus their three
+  logical command names in shell help/completion and PermissionManager policy.
   Direct launch and launch from `lico` have identical behavior and file semantics;
-  manager/editor get only their declared write grants, viewer remains read-only, and
-  `lico` gets only the narrow governed-launch broker needed by approved file associations
-  and its command bar, never raw process creation, another program's handles or authority
-  to expand a launched executable's manifest grants.
+  the manager gets only its declared panel volume grants, an associated editor gets the
+  selected file's explicit write-back grant, the viewer remains read-only, and `lico`
+  gets only the narrow governed-launch broker needed by approved file associations and
+  its command bar, never raw process creation, unrelated file handles or authority to
+  expand a launched executable's manifest grants.
 - [ ] Validation gates: host-test syntax descriptors/matching, text editing, undo/redo,
   search (including hex), file-operation planning, history/bookmarks, command-bar parse/
   completion/history/working-directory semantics and resize layout;
@@ -3909,15 +4156,20 @@ the ordinary governed launch path, not a second long-lived or hidden shell.
 - Concept: M35i/M36 (PTY and pointer-capable terminal), M38/M61/M119/M125
   (PermissionManager, volume-loaded governed executables, session state and `.lsexe`),
   M43-M111 (capability-scoped writable volumes), M126 (existing external image action),
-  M127 (organized `bin/`, `etc/` and `share/` volume layout), M132 (shared pipeline and
+  M127 (owner directories plus the `bin`/`libexec`/`lib`/`log`/`test` volume layout), M132 (shared pipeline and
   redirection grammar once available), and the orthodox two-panel interaction model
   established by Norton Commander, Midnight Commander and Total Commander without
   importing their ambient POSIX/Windows authority assumptions.
 
 ## M131 - Additional system utilities
 
-Status: PLANNED. Add the ordinary small programs the appliance/edge console still
-lacks. Every command is one canonical `<name>.lsexe` staged under `bin/`, launched by
+Status: PLANNED AFTER M127, WITH AN EXPLICIT M132 INTERLEAVE. First land the public
+storage/writer, launch-context and shared parser/walker foundations plus path-based tool
+modes; then M132 lands stdio streams/process groups/redirection; finally complete the
+stdin-native M131 modes (`tee` in particular) and the full M131 gate. M132 depends only
+on that named foundation slice, not on M131 being complete, so the milestones have no
+circular completion dependency. Add the ordinary small programs the appliance/edge
+console still lacks. Every command is one canonical `<name>.lsexe` staged under `bin/`, launched by
 PermissionManager with the minimum typed capabilities it needs; no implementation is
 folded back into the shell. `uptime.lsexe` already exists and is retained as the
 conformance baseline. `clear` moves from its current shell-builtin implementation to
@@ -3930,8 +4182,12 @@ treated as a typo for the conventional `which.lsexe`; no nonstandard alias is st
 - [ ] Storage and stream primitives required by the tools, added once to
   `liber:storage` rather than re-created in each binary: file `stat`; bounded/streaming
   reads; atomic same-volume `rename`; `truncate`; timestamp update/create (`touch`);
-  and a `watch(path) -> stream<file-event>` contract for change/remove/replace. Extend
-  every writable backend honestly and return typed unsupported/denied for read-only or
+  and a `watch(path) -> stream<file-event>` contract for change/remove/replace. Add one
+  transactional writer resource for sequential and bounded positioned writes, explicit
+  append mode, truncate, flush, commit/publish and abort; this is the shared primitive for
+  editor safe-save, audio-header finalization, `tee` and M132 redirects, rather than each
+  client inventing temporary names or rewriting a whole file to append. Extend every
+  writable backend honestly and return typed unsupported/denied for read-only or
   incapable backends. Cross-volume move is never mislabeled atomic: copy -> verify ->
   publish -> delete source, leaving the source intact on any pre-delete failure.
 - [ ] Shared bounded utility helpers: one path walker over `volume.list` streams, one
@@ -3940,6 +4196,15 @@ treated as a typo for the conventional `which.lsexe`; no nonstandard alias is st
   `grep`/`find` adopt regex syntax; malformed patterns fail before opening output.
   Utilities process chunks rather than loading unbounded files or trees, check every
   offset/size/count and propagate allocation/resource failures as typed errors.
+- [ ] Replace PermissionManager's ad-hoc `(args, cwd, stdout)` bootstrap sequence with a
+  versioned bounded launch context carrying arguments, canonical cwd and an immutable
+  snapshot of the SessionService string-variable table (there is no separate export flag
+  today). The launcher validates variable names/count/total bytes; a child can read but
+  not mutate its parent/session snapshot, and handles/capabilities never enter it. Values
+  intended as secrets do not belong in this ordinary environment table. Preserve today's
+  `$NAME` shell expansion, but make `PATH` available to `which` and the M130 command bar
+  without granting either a mutable SessionService capability. M132 extends this same
+  context with stdin/stdout/stderr endpoints instead of creating a second bootstrap format.
 - [ ] **`less.lsexe`**: an interactive pager for a path (and later a pipeline input)
   using the existing PTY/alternate-screen/raw-input contract. Stream large files,
   support line/page/home/end movement, forward/backward fixed-text search, repeat search,
@@ -3980,11 +4245,16 @@ treated as a typo for the conventional `which.lsexe`; no nonstandard alias is st
   file/buffer capability.
 - [ ] **`audiorec.lsexe`**: capability-scoped PCM capture through AudioService, never
   direct sound-device access. Complete the typed capture-stream contract if playback is
-  all the service currently exposes; negotiate supported rate/channels, write a valid
-  WAV stream incrementally, finalize its header on normal stop and handle Ctrl+C,
-  backpressure, overrun and device loss without leaving an apparently valid truncated
-  file. Report duration, format, dropped frames and peak memory; optional AIFF output
-  reuses its existing leaf after WAV is proven.
+  all the service currently exposes (as it is today), including a distinct launch-scoped
+  capture grant rather than reusing playback-only `audio-stream`. Add a bounded PCM WAV
+  writer (the current `wav` leaf decodes but does not encode), stream samples into the
+  transactional storage writer and patch/finalize checked RIFF/data lengths before
+  commit. Handle Ctrl+C, backpressure, overrun and device loss by aborting rather than
+  leaving an apparently valid truncated file. Initial WAV output refuses or cleanly rolls
+  to a new file before classic RIFF's 32-bit chunk-size limit; RF64 is unsupported until
+  implemented explicitly. Report duration, format, dropped frames and peak memory; AIFF
+  output waits for a real AIFF encoder and is not claimed as reuse of today's decode-only
+  leaf.
 - [ ] **`pwd.lsexe`**: print the inherited session working URI exactly and optionally its
   canonical volume identity. It consumes only the cwd delivered by the launcher, needs
   no volume authority and must agree with the shell prompt before/after `cd` and across a
@@ -3992,26 +4262,32 @@ treated as a typo for the conventional `which.lsexe`; no nonstandard alias is st
 - [ ] **`which.lsexe`**: resolve one or more command names through the inherited typed
   session `PATH` plus the canonical `.lsexe` normalizer, printing the exact physical
   artifact URI. It validates executable names, preserves the one-final-suffix rule,
-  distinguishes builtin/alias/tool where requested, reports ambiguity and never grants
-  execution or opens directories outside the caller's volume capabilities.
+  distinguishes a shared-table shell builtin from a staged tool where requested (there
+  is no alias mechanism today), reports ambiguity and never grants execution or opens
+  directories outside the caller's volume capabilities.
 - [ ] **`tree.lsexe`**: streamed directory tree with depth limit, files-only/dirs-only,
   optional sizes and JSON output. Use the shared iterative walker, stable sorting per
   directory and cycle/volume-boundary defense; a huge tree begins rendering immediately
   and is bounded by resource policy rather than a compile-time entry count.
 - [ ] **`touch.lsexe`** and **`truncate.lsexe`**: create missing files when requested and
-  update mtime through the storage contract; set/shrink/extend logical length with zeroed
-  extension semantics and checked absolute/relative sizes. Preserve existing data outside
-  the requested change, reject directories/read-only backends and make sparse behavior
-  explicit per filesystem rather than silently allocating or materializing gaps.
+  update mtime through the storage contract, with `touch` obtaining the current wall-clock
+  timestamp from an explicit TimeService grant (or accepting a validated user-supplied
+  timestamp) and passing the value to StorageService rather than letting the filesystem
+  guess UTC; set/shrink/extend logical length with zeroed extension semantics and checked
+  absolute/relative sizes. Preserve existing data outside the requested change, reject
+  directories/read-only backends and make sparse behavior explicit per filesystem rather
+  than silently allocating or materializing gaps.
 - [ ] **`wc.lsexe`**: streaming bytes, lines, words and Unicode-scalar counts for one or
   more files, with totals and stable JSON. Define words over bounded UTF-8 decoding,
   expose raw-byte behavior for malformed input and accumulate with checked/saturating
   counters so hostile or enormous streams cannot wrap.
 - [ ] **`sort.lsexe`**: deterministic bytewise/UTF-8 text line ordering, reverse,
   numeric-key and unique modes. Sort in memory only while inside the Domain budget, then
-  spill sorted runs to a capability-scoped temporary area and k-way merge under bounded
-  open-run/backpressure limits; never assume all input fits RAM. Locale collation waits
-  for the localization phase and is not faked.
+  spill sorted runs through an explicitly granted per-launch scratch directory/writer
+  and k-way merge under bounded open-run/backpressure limits; never assume all input fits
+  RAM or that an ambient `/tmp` exists. Bound or externally spill one oversized logical
+  line as well as the aggregate input. Locale collation waits for the localization phase
+  and is not faked.
 - [ ] **`cut.lsexe`**: streaming byte, character and delimiter-separated field selection
   with validated ranges, complement and output delimiter. Handle UTF-8 characters
   incrementally across chunk boundaries, define malformed input behavior and cap one
@@ -4027,9 +4303,12 @@ treated as a typo for the conventional `which.lsexe`; no nonstandard alias is st
   gain capabilities beyond the watched command's own manifest.
 - [ ] **`kill.lsexe`**: signal a session-owned job/process capability, not an ambient
   numeric-PID namespace. Default authority is the caller's SessionService jobs; an admin
-  process target requires an explicit process-manage grant from PermissionManager.
-  Support TERM/KILL/INT/STOP/CONT with typed names, refuse protected/system processes by
-  policy, audit every request and report already-exited/not-owned distinctly.
+  process target requires an explicit process-manage grant from PermissionManager. Add a
+  typed `job-signal` SessionService operation so the tool asks the owner to act without
+  taking its Process handle; M132 generalizes the same operation from a single Process to
+  a ProcessGroup. Support TERM/KILL/INT/STOP/CONT with typed names, refuse protected/
+  system processes by policy, audit every request and report already-exited/not-owned
+  distinctly.
 - [x] **`uptime.lsexe`** already exists: retain its zero-capability monotonic-clock
   implementation, canonical artifact and standing inventory test. M131 adds only shared
   CLI/JSON/help consistency if the rest of the utility family adopts it; it does not
@@ -4046,9 +4325,11 @@ treated as a typo for the conventional `which.lsexe`; no nonstandard alias is st
 - [ ] Register every new executable once in the artifact manifest, shell command/help/
   completion tables and PermissionManager policy. `less`, `watch` and other interactive
   commands receive the foreground full-duplex tty; volume tools receive only the volume
-  bundle; `pwd`/`clear`/`uptime` receive none; network/audio commands receive only their
-  service scopes. Unknown options, malformed paths/patterns and inapplicable capabilities
-  fail before output mutation or child launch.
+  bundle (with `touch` additionally receiving TimeService); `pwd`/`clear`/`uptime` receive
+  no service grant; network/audio commands receive only their service scopes. Inherited
+  stdio and immutable launch-context data are listed separately from manifest service
+  grants. Unknown options, malformed paths/patterns and inapplicable capabilities fail
+  before output mutation or child launch.
 - [ ] Host and governed integration gates: pure parsers, matchers, range handling,
   sorting/merge, text decoding and format writers get hostile/mutation tests; a writable
   StorageService scenario covers same/cross-volume copy/move, no-space rollback,
@@ -4071,13 +4352,16 @@ treated as a typo for the conventional `which.lsexe`; no nonstandard alias is st
 
 ## M132 - Capability-native pipes and redirection
 
-Status: PLANNED. Add pipelines and input/output redirection as native composition of
-bounded stream capabilities, not as a POSIX file-descriptor table or ambient filesystem
-escape. This milestone completes M35j's deliberately deferred multi-process process
-groups and gives M131 stream utilities one consistent stdin/stdout/stderr contract.
-Each stage remains an independently governed executable with its own PermissionManager
-manifest; connecting byte streams never transfers the producer's or consumer's other
-capabilities.
+Status: PLANNED AFTER THE M131 FOUNDATION SLICE, BEFORE M131 COMPLETION. It consumes the
+public transactional writer, launch context and a small available set of path-based
+stream tools, but does not wait for every M131 executable; M131's final stdin-native
+integration runs after this milestone. Add pipelines and input/output redirection as
+native composition of bounded stream capabilities, not as a POSIX file-descriptor table
+or ambient filesystem escape. This milestone completes M35j's deliberately deferred
+multi-process process groups and gives M131 stream utilities one consistent stdin/stdout/
+stderr contract. Each stage remains an independently governed executable with its own
+PermissionManager manifest; connecting byte streams never transfers the producer's or
+consumer's other capabilities.
 
 - [ ] Specify one versioned byte-stream contract used by runtime stdio, pipelines and
   StorageService adapters: bounded chunks, blocking/backpressured write, readable/
@@ -4086,11 +4370,18 @@ capabilities.
   maximum queued bytes/chunks and fair wake ordering; a slow or stopped stage cannot
   make another Domain allocate unbounded memory.
 - [ ] Generalize the runtime launch context from the existing stdin/stdout channels to
-  three explicit endpoints: stdin (read), stdout (write) and stderr (write), each absent,
-  terminal-backed, pipeline-backed or storage-backed by transferred capability. Preserve
-  the current terminal behavior for ordinary launches, keep stdout and stderr separate
-  by default, close inherited duplicates promptly and expose no numeric descriptor API,
-  arbitrary endpoint lookup or ambient inheritance.
+  three explicit endpoints in M131's versioned context: stdin (read), stdout (write) and
+  stderr (write), each absent, terminal-backed, pipeline-backed or storage-backed by
+  transferred capability. Preserve the current terminal behavior for ordinary launches,
+  keep stdout and stderr separate by default, close inherited duplicates promptly and
+  expose no numeric descriptor API, arbitrary endpoint lookup or ambient inheritance.
+- [ ] Add a typed process-completion result before defining pipeline status: clean exit
+  carries a bounded integer code, signal/fault/forced teardown carries a distinct reason,
+  and waiting on a Process or ProcessGroup returns that immutable result after readiness.
+  Today's Process handle exposes only terminated/killed readiness and `rt::exit()` has no
+  status, so `pipefail`, per-stage diagnostics and success-gated publication must not infer
+  success from mere closure. Preserve the first terminal cause and define group status
+  over the ordered stage results without exposing ambient PIDs.
 - [ ] Add a kernel `ProcessGroup` object (or an equally explicit capability object) that
   owns a bounded set of live process references and supports group wait plus capability-
   gated INT/TERM/KILL/STOP/CONT. Membership is fixed by the trusted launcher at spawn,
@@ -4105,6 +4396,7 @@ capabilities.
 - [ ] Replace line-prefix dispatch with a bounded lexer/parser that produces an explicit
   command/pipeline/redirection AST while preserving existing variable expansion and
   canonical option normalization. Recognize operators only outside quoted/escaped text,
+  lex operators before variable expansion and never reinterpret expanded data as syntax,
   reject empty stages, duplicate/conflicting redirects, unsupported descriptor numbers,
   dangling operators, excessive stages/arguments/expanded bytes and recursive expansion
   before any file is opened or process spawned. Keep assignment/session-state builtins
@@ -4117,10 +4409,13 @@ capabilities.
   parent-shell use retains today's persistent SessionService semantics.
 - [ ] Build a pipeline transaction in the trusted shell/launch broker: parse and resolve
   every executable/path, authorize every stage independently, allocate all stream pairs
-  and redirection adapters, create the process group, then spawn/register the complete
-  graph before making it runnable. Any failure closes endpoints, terminates/reaps already
-  created stages, removes temporary outputs and leaves no job entry; no stage observes a
-  half-built graph or inherits a handle intended for another edge.
+  and redirection adapters, create the process group, then create every stage behind an
+  explicit start gate (a suspended-launch or equivalent ProcessService primitive), install
+  all endpoints, register the complete graph and release the stages together. The current
+  launch starts immediately, so this gate is a required mechanism, not an assumed ordering.
+  Any failure closes endpoints, terminates/reaps already created stages, removes temporary
+  outputs and leaves no job entry; no stage observes a half-built graph or inherits a
+  handle intended for another edge.
 - [ ] For each `A | B` edge, transfer only A's write endpoint as stdout and B's read
   endpoint as stdin. Pipelines of more than two stages compose the same primitive and
   obey a configured stage/endpoint budget. Stderr remains on the terminal unless
@@ -4132,12 +4427,14 @@ capabilities.
   before launch. The child receives only the stream endpoint, not the source volume or
   reusable file capability, unless its own manifest separately grants one.
 - [ ] Replace output redirection (`>`/`2>`) writes to a bounded temporary sibling through
-  StorageService and publishes by flush + atomic rename only when the owning command or
-  complete pipeline succeeds according to the chosen policy. Failure, signal or no-space
-  preserves the previous destination and removes the temporary file. Append (`>>`/`2>>`)
-  uses an explicit atomic append-stream storage operation with per-write ordering; never
-  emulate append by read-whole-file plus rewrite or silently degrade it on an incapable/
-  read-only backend.
+  M131's transactional writer and publishes only when the owning command or complete
+  pipeline closes the redirected stream normally. A clean non-zero exit still publishes
+  by default (`grep` with no match and diff-like tools may produce intentional output);
+  launch failure, signal, fault, adapter/storage failure or inability to finalize aborts
+  the writer and preserves the previous destination. An optional strict-success policy
+  may additionally require code zero, but is never implicit. Append (`>>`/`2>>`) uses the
+  writer's explicit append mode with per-write ordering; never emulate append by reading
+  and rewriting the whole file or silently degrade it on an incapable/read-only backend.
 - [ ] Define lifecycle propagation precisely: natural producer close delivers EOF;
   consumer early exit closes its read end and wakes the producer with broken pipe;
   terminal interrupt/quit targets the whole ProcessGroup; stop preserves queued bounded
@@ -4150,12 +4447,14 @@ capabilities.
   rightmost failed stage. Background completion reports one job with a concise failing
   stage, and SystemGraph/counters expose stage count, queued bytes, blocked writers,
   transferred bytes and cancellation without logging stream contents.
-- [ ] Make M131 stream tools genuine composition participants: `cat`, `grep`, `head`,
-  `tail`, `sort`, `cut`, `tee`, `wc`, `less` and `hexdump` consume stdin when no path is
-  supplied and write only stdout/stderr endpoints. `head`/`less` early close exercises
-  broken-pipe propagation; `tee` applies backpressure across all selected outputs; tools
-  do not detect pipelines through environment variables or receive broader volume grants
-  merely because a path was redirected by the shell.
+- [ ] Prove the contract with current `cat`/`readln` plus whichever M131 path tools are
+  available in the foundation slice, and publish one migration checklist/API for the
+  remaining `grep`, `head`, `tail`, `sort`, `cut`, `tee`, `wc`, `less` and `hexdump`.
+  M131 then makes each consume stdin when no path is supplied and write only stdout/stderr
+  endpoints. At least one early-closing consumer exercises broken-pipe propagation and
+  one fan-out probe exercises backpressure; tools do not detect pipelines through
+  environment variables or receive broader volume grants merely because the shell
+  redirected a path.
 - [ ] Capability and hostile-input tests prove no pipeline edge leaks service/file/
   process handles, a stage cannot signal its group without MANAGE authority, redirects
   cannot escape granted volumes, and `2>&1` aliases only the intended stream. Fuzz the
@@ -4172,8 +4471,9 @@ capabilities.
   explicit stdin/stdout/stderr capabilities; redirection is volume-scoped and failure-
   safe; one ProcessGroup is one session/terminal job; signals, stop/resume, EOF, broken
   pipe, rollback and status semantics are deterministic; no fd/PID/global-filesystem
-  ambient authority was introduced; and M131 stream utilities interoperate without
-  private adapters.
+  ambient authority was introduced; current tools plus the available M131 foundation
+  tools interoperate through the public contract without private adapters; and the
+  remaining M131 tool migration is an API-conformance task, not a missing pipe primitive.
 - Concept: M30/M71 (typed event and bounded streaming IPC), M35i/M35j (PTY, signals and
   the deferred process-group step), M38/M61/M119 (PermissionManager, governed launch and
   persistent jobs), M43-M111/M131 (streaming and transactional storage operations), and
