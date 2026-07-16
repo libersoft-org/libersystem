@@ -8,9 +8,11 @@ orders, not precision instruments.
 
 `just image-bench` builds the same no_std leaves used by `imgconv` in an optimized
 host profile and converts a deterministic 512x512 true-color RGBA fixture. Each row
-measures full container encode and independent content-sniff/decode; the standing gate
-fails if either side exceeds five seconds. RGB MSE covers profiles that retain the
-fixture dimensions. One x86 host run produced:
+measures full container encode and independent content-sniff/decode. A tracking global
+allocator reports incremental peak heap above the live input/output baseline. The
+standing gate is five seconds and 8 MiB per operation; WebP is held to 4 MiB encode and
+2 MiB decode. RGB MSE covers profiles that retain the fixture dimensions. One x86 host
+run produced:
 
 | output profile | bytes | RGB MSE | encode | decode |
 | --- | ---: | ---: | ---: | ---: |
@@ -33,6 +35,9 @@ fixture dimensions. One x86 host run produced:
 | JPEG quality 10 | 10,008 | 890 | 30.0 ms | 1.5 ms |
 | JPEG quality 100 | 433,763 | 0 | 35.6 ms | 6.7 ms |
 | WebP lossless effort 0 | 786,522 | 0 | 29.7 ms | 3.9 ms |
+| WebP lossless effort 25 | 282 | 0 | 27.8 ms | 0.3 ms |
+| WebP lossless effort 50 | 282 | 0 | 27.4 ms | 0.3 ms |
+| WebP lossless effort 75 | 282 | 0 | 28.1 ms | 0.3 ms |
 | WebP lossless effort 100 | 282 | 0 | 27.7 ms | 0.3 ms |
 | WebP lossy quality 0, effort 100 | 7,104 | 923 | 34.5 ms | 2.8 ms |
 | WebP lossy quality 100, effort 100 | 219,842 | 250 | 60.9 ms | 12.8 ms |
@@ -66,6 +71,13 @@ for static previews and cross-format conversion. Lossless WebP animation output 
 canonical full-canvas VP8L frames, preserving displayed pixels and timing while avoiding
 format-local duplicate compositing code.
 
+Lossless WebP effort is a deterministic search over the encoder's valid plain and
+predictor VP8L profiles. Effort 0 emits plain; intermediate levels analyze a growing
+row sample and choose from residual variation; effort 100 encodes both and selects the
+smaller output. On this smooth fixture efforts 25/50/75 choose the 282-byte predictor
+profile with 2,542,735-byte encode heap, while exhaustive effort 100 uses 3,670,706
+bytes and proves no larger than either candidate. Decode peaks at 1,052,892 bytes.
+
 Lossy WebP uses the native no_std VP8 keyframe encoder. Quality maps to the normative
 DC/AC quantizer tables; independent effort progressively searches DC, vertical,
 horizontal and true-motion chroma prediction. The benchmark requires quality 100 to
@@ -98,12 +110,12 @@ across the volume boundary. StorageService reopens it, the test verifies the sim
 opaque `RIFF/WEBP/VP8 ` profile and the independent WebP decoder checks dimensions plus
 bounded RGB error. The focused x86 capability/storage/process/filesystem run is 57/57.
 Complete shared libraries and userspace build on x86_64, AArch64 and RISC-V; the native
-encoder changes `webp.lslib` to 347,608 / 441,088 / 381,688 bytes respectively.
+encoder plus VP8L search changes `webp.lslib` to 349,912 / 442,936 / 384,000 bytes
+respectively. The governed scenario also emits lossless `CROSSL.WEBP` at effort 50,
+reopens it through FAT16 StorageService and verifies exact RGBA independently.
 
-Current limits are deliberate and typed: the published VP8L encoder exposes only a
-predictor-off/on switch, so lossless WebP effort 1..99 remains unsupported rather than
-aliasing two outcomes. Lossy animated WebP output is also unsupported rather than
-silently flattening frames. ICNS JPEG2000
+Current limits are deliberate and typed: lossy animated WebP output is unsupported
+rather than silently flattening frames. ICNS JPEG2000
 entries remain unsupported, and image output is deliberately a fully encoded whole-file
 StorageService write. LiberFS publishes that write through its CoW transaction and FAT
 uses allocate/write/new-entry-swap/free-old ordering, so a failed backend write preserves

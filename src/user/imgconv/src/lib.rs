@@ -635,6 +635,7 @@ mod tests {
 		assert_eq!(parse_args(b"--quality 75 in.png out.pcx").unwrap().quality, Some(75));
 		let webp = parse_args(b"--lossless --compression 100 in.png out.webp").unwrap();
 		assert_eq!(webp.mode, Some(Mode::Lossless));
+		assert_eq!(parse_args(b"--lossless --compression 50 in.png out.webp").unwrap().compression, Some(50));
 		let lossy_webp = parse_args(b"--lossy --quality 80 in.png out.webp").unwrap();
 		assert_eq!((lossy_webp.mode, lossy_webp.quality, lossy_webp.compression), (Some(Mode::Lossy), Some(80), Some(100)));
 		assert_eq!(parse_args(b"--lossy in.png out.webp").unwrap().quality, Some(90));
@@ -726,16 +727,14 @@ mod tests {
 	}
 
 	#[test]
-	fn converts_png_to_lossless_webp_endpoints() {
+	fn converts_png_to_lossless_webp_effort_range() {
 		let source = png::decode_rgba(include_bytes!("../../../volume/sample.png")).unwrap();
-		for compression in [0, 100] {
-			let arguments = if compression == 0 { b"--lossless --compression 0 in.png out.webp".as_slice() } else { b"--lossless --compression 100 in.png out.webp".as_slice() };
-			let (encoded, info) = convert(include_bytes!("../../../volume/sample.png"), &parse_args(arguments).unwrap()).unwrap();
+		for compression in [0, 1, 25, 50, 75, 99, 100] {
+			let arguments = alloc::format!("--lossless --compression {compression} in.png out.webp");
+			let (encoded, info) = convert(include_bytes!("../../../volume/sample.png"), &parse_args(arguments.as_bytes()).unwrap()).unwrap();
 			assert_eq!(webp::decode(&encoded).unwrap(), source);
-			assert_eq!(info.mode, Some(Mode::Lossless));
+			assert_eq!((info.mode, info.compression), (Some(Mode::Lossless), Some(compression)));
 		}
-		let config = parse_args(b"--lossless --compression 50 in.png out.webp").unwrap();
-		assert_eq!(convert(include_bytes!("../../../volume/sample.png"), &config), Err(Error::UnsupportedFormat));
 	}
 
 	#[test]

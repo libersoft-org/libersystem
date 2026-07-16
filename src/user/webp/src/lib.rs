@@ -137,11 +137,19 @@ fn expand_rgba(decoded: Vec<u8>, has_alpha: bool) -> Result<Vec<u8>, Error> {
 }
 
 pub fn encode_lossless(image: &pix::RgbaImage, compression: u8) -> Result<Vec<u8>, Error> {
-	let predictor = match compression {
-		0 => false,
-		100 => true,
-		_ => return Err(Error::Unsupported),
-	};
+	if compression > 100 {
+		return Err(Error::Unsupported);
+	}
+	if compression == 100 {
+		let plain = encode_lossless_profile(image, false)?;
+		let predicted = encode_lossless_profile(image, true)?;
+		return Ok(if predicted.len() < plain.len() { predicted } else { plain });
+	}
+	let predictor = compression != 0 && predictor_is_promising(image, compression);
+	encode_lossless_profile(image, predictor)
+}
+
+fn encode_lossless_profile(image: &pix::RgbaImage, predictor: bool) -> Result<Vec<u8>, Error> {
 	let mut output = Vec::new();
 	let mut encoder = WebPEncoder::new(&mut output);
 	let mut params = EncoderParams::default();
@@ -149,6 +157,35 @@ pub fn encode_lossless(image: &pix::RgbaImage, compression: u8) -> Result<Vec<u8
 	encoder.set_params(params);
 	encoder.encode(&image.pixels, image.width, image.height, ColorType::Rgba8).map_err(|_| Error::Invalid)?;
 	Ok(output)
+}
+
+fn predictor_is_promising(image: &pix::RgbaImage, effort: u8) -> bool {
+	let width = image.width as usize;
+	let height = image.height as usize;
+	let rows = height.saturating_mul(usize::from(effort)).div_ceil(100).max(1);
+	let mut raw_variation = 0u64;
+	let mut predicted_variation = 0u64;
+	for y in 0..rows.min(height) {
+		for x in 0..width {
+			let pixel = (y * width + x) * 4;
+			for channel in 0..4usize {
+				let value = image.pixels[pixel + channel];
+				let prediction = if x != 0 {
+					image.pixels[pixel + channel - 4]
+				} else if y != 0 {
+					image.pixels[pixel + channel - width * 4]
+				} else if channel == 3 {
+					255
+				} else {
+					0
+				};
+				raw_variation += u64::from(value.min(255 - value));
+				let residual = value.wrapping_sub(prediction);
+				predicted_variation += u64::from(residual.min(255 - residual));
+			}
+		}
+	}
+	predicted_variation < raw_variation
 }
 
 pub fn encode_lossy(image: &pix::RgbaImage, quality: u8, effort: u8) -> Result<Vec<u8>, Error> {
@@ -323,15 +360,34 @@ mod tests {
 	#[test]
 	fn lossless_endpoints_round_trip_rgba() {
 		let image = pix::RgbaImage::new(3, 2, vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]).unwrap();
-		for compression in [0, 100] {
-			assert_eq!(decode(&encode_lossless(&image, compression).unwrap()).unwrap(), image);
+		let plain = encode_lossless_profile(&image, false).unwrap();
+		let predicted = encode_lossless_profile(&image, true).unwrap();
+		for compression in [0, 1, 24, 25, 49, 50, 74, 75, 99, 100] {
+			let encoded = encode_lossless(&image, compression).unwrap();
+			assert_eq!(encoded, encode_lossless(&image, compression).unwrap());
+			assert_eq!(decode(&encoded).unwrap(), image);
 		}
+		let compact = encode_lossless(&image, 100).unwrap();
+		assert!(compact.len() <= plain.len() && compact.len() <= predicted.len());
+
+		let mut pixels = Vec::new();
+		for x in 0..16usize {
+			let value = if x & 1 == 0 { 0 } else { 255 };
+			pixels.extend_from_slice(&[value, value, value, 255]);
+		}
+		for _ in 0..48 {
+			pixels.extend_from_slice(&[128, 128, 128, 255]);
+		}
+		let search_fixture = pix::RgbaImage::new(16, 4, pixels).unwrap();
+		assert!(!predictor_is_promising(&search_fixture, 25));
+		assert!(predictor_is_promising(&search_fixture, 50));
+		assert_ne!(encode_lossless(&search_fixture, 25).unwrap(), encode_lossless(&search_fixture, 50).unwrap());
 	}
 
 	#[test]
-	fn rejects_unimplemented_intermediate_effort_and_bad_input() {
+	fn rejects_out_of_range_effort_and_bad_input() {
 		let image = pix::RgbaImage::new(1, 1, vec![0, 0, 0, 255]).unwrap();
-		assert_eq!(encode_lossless(&image, 50), Err(Error::Unsupported));
+		assert_eq!(encode_lossless(&image, 101), Err(Error::Unsupported));
 		assert_eq!(decode(b"RIFF"), Err(Error::Invalid));
 	}
 
@@ -406,11 +462,13 @@ mod tests {
 		.unwrap();
 		let mut compositor = pix::Compositor::new(2, 1).unwrap();
 		let expected: Vec<pix::RgbaImage> = source.frames.iter().map(|frame| compositor.render(frame).unwrap()).collect();
-		let encoded = encode_animation(&source, 100).unwrap();
-		let decoded = decode_animation(&encoded).unwrap();
-		assert_eq!((decoded.width, decoded.height, decoded.loop_count), (2, 1, 7));
-		assert_eq!(decoded.frames.iter().map(|frame| frame.duration_ms).collect::<Vec<_>>(), vec![20, 30]);
-		assert_eq!(decoded.frames.into_iter().map(|frame| frame.image).collect::<Vec<_>>(), expected);
+		for effort in [50, 100] {
+			let encoded = encode_animation(&source, effort).unwrap();
+			let decoded = decode_animation(&encoded).unwrap();
+			assert_eq!((decoded.width, decoded.height, decoded.loop_count), (2, 1, 7));
+			assert_eq!(decoded.frames.iter().map(|frame| frame.duration_ms).collect::<Vec<_>>(), vec![20, 30]);
+			assert_eq!(decoded.frames.into_iter().map(|frame| frame.image).collect::<Vec<_>>(), expected);
+		}
 	}
 
 	#[test]

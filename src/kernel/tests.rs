@@ -5692,6 +5692,11 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	assert_eq!(bmp::decode_rgba(&converted).expect("cross-volume BMP decodes"), source);
 	run_imgview_harness(imgview_elf, b"vol://media/CROSS.BMP", &mut system, &mut media);
 
+	let line = run_imgconv_harness(imgconv_elf, b"--lossless --compression 50 vol://system/sample.bmp vol://media/CROSSL.WEBP", &mut system, &mut media);
+	assert!(line.starts_with(b"imgconv: BMP 2x2 -> WebP 2x2 mode=lossless compression=50 bytes="));
+	let converted = media.open(b"vol://media/CROSSL.WEBP", 0xc2057).expect("cross-volume lossless WebP opens");
+	assert_eq!(webp::decode(&converted).expect("cross-volume lossless WebP decodes"), source);
+
 	let line = run_imgconv_harness(imgconv_elf, b"--lossy --quality 100 --compression 100 vol://system/sample.bmp vol://media/CROSS.WEBP", &mut system, &mut media);
 	assert!(line.starts_with(b"imgconv: BMP 2x2 -> WebP 2x2 mode=lossy quality=100 compression=100 bytes="));
 	let converted = media.open(b"vol://media/CROSS.WEBP", 0xc2056).expect("cross-volume WebP opens");
