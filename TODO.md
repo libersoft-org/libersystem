@@ -3746,6 +3746,439 @@ arm or product-ID-first binding shortcut.
   `docs/CONCEPT_EN.md`, the existing xHCI USB class stack, and the Phase-4
   device-/board-specific boundary.
 
+## M130 - LiberCommander (`lico`, `licoedit`, `licoview`)
+
+Status: PLANNED. Build one keyboard-first, mouse-capable orthodox file-management
+suite for the Phase-2 console: `lico.lsexe` is the two-panel manager,
+`licoedit.lsexe` is the standalone text editor and `licoview.lsexe` is the standalone
+text/raw/hex viewer. All three are ordinary governed executables, share bounded no_std
+TUI, text-buffer and syntax-description libraries, and operate only on the terminal,
+session state and volume capabilities PermissionManager explicitly grants. This slice
+does not include file/directory comparison or synchronization, multi-rename, browsing
+archives/packages as directories, image/audio/media viewing, remote filesystems, a
+plugin ABI, or plugin execution. The bottom command bar is included, but it is a UI over
+the ordinary governed launch path, not a second long-lived or hidden shell.
+
+- [ ] Factor a shared `lico` no_std library for terminal capability negotiation,
+  alternate-screen/raw-mode ownership, resize and pointer events, focus/dialog/menu
+  widgets, key binding dispatch, bounded text decoding, file-type detection and error/
+  progress presentation. The three executables use one implementation rather than
+  drifting copies; every normal, error, signal and service-disconnect exit restores the
+  terminal mode, cursor and mouse reporting.
+- [ ] Define a versioned, declarative syntax-description format and one bounded parser/
+  matcher shared by `licoedit` and `licoview`. Keep one independently addable descriptor
+  per language under `share/lico/syntax/` (initially Rust, LSIDL, TOML, JSON, Markdown
+  and shell/config text); each descriptor names file globs and optional first-line
+  recognition, lexical contexts, delimiters, escapes, keywords and style classes. A new
+  language is added by installing another descriptor, not by recompiling either app.
+  Descriptors contain no executable commands, paths or capability requests; reject
+  unknown versions, duplicate/conflicting rules, invalid UTF-8, excessive rules/nesting/
+  token lengths and non-progressing matches before highlighting begins. A missing or bad
+  descriptor falls back to plain text and cannot prevent opening the file.
+- [ ] Load the system syntax directory through one read-only capability and compile only
+  the selected language's rules into a bounded matcher. Define deterministic precedence
+  for filename versus first-line matches, a reload operation, stable style names mapped
+  through the current theme, and incremental line-state caching so edits and scrolling
+  re-highlight only the affected viewport/range. Host tests share golden source samples
+  between editor and viewer and prove identical token spans, chunk-boundary behavior and
+  hostile-descriptor rejection.
+- [ ] Implement `lico.lsexe` as two independent directory panels with a clearly active
+  panel, `Tab`/pointer focus switching, panel swap and separate current URI, selection,
+  scroll, sort, filter and history state. Each panel may show a different granted volume;
+  an ungranted volume is neither listed nor probeable, and disconnect/read-only state is
+  visible without freezing or closing the other panel.
+- [ ] Panel modes: ordinary file list, directory tree, selected-entry information and
+  passive-panel quick text view. List mode offers stable name/extension/size/mtime/type
+  sorting, directories-first toggle, concise/long columns, hidden-file toggle, explicit
+  refresh and free-space/status display. Tree construction is iterative and lazy; quick
+  view embeds the same bounded read-only text renderer as `licoview` without duplicating
+  its parser or gaining edit authority.
+- [ ] Preserve the orthodox keyboard contract and expose the same actions through menus
+  and pointer input: `F1` help, `F2` actions, `F3` view, `F4` edit, `F5` copy, `F6`
+  move/rename, `F7` mkdir, `F8` delete, `F9` menu and `F10` exit. `Enter` enters a
+  directory or invokes the approved association for a file; `Insert` tags/untags and
+  advances; group select/unselect/invert use the shared bounded glob matcher. Key labels
+  adapt to terminal width without hiding the active operation or overlapping panel text.
+- [ ] Quick filename search while typing, persistent panel filter, next/previous match,
+  direct URI entry, parent/root navigation, per-panel back/forward directory history and
+  named bookmarks/hotlist. Persist only ordinary UI state through typed configuration;
+  validate a saved URI against the capabilities of the new launch rather than treating
+  history or a bookmark as authority.
+- [ ] Add the orthodox bottom command bar beneath the panels, separate from the F-key
+  label row. Typing while the panels have focus opens/edits the bar; support cursor and
+  word editing, quoted arguments, command/path completion, bounded history, inserting
+  the selected name/full URI and clear/cancel. Launch a canonical governed executable
+  through PermissionManager with the active panel URI as its working directory and the
+  current SessionService environment overlay; foreground commands temporarily own the
+  terminal and restore the exact panel screen on return, while an explicit trailing `&`
+  registers a normal session job. `cd` is handled as panel navigation (and optionally
+  synchronizes the owning session cwd only by an explicit setting); other state-mutating
+  shell builtins are not silently emulated. The bar initially launches one executable
+  plus arguments through the same shared parser/launcher as the shell; when M132 lands it
+  gains that exact pipeline/redirection grammar and process-group behavior rather than
+  implementing private pipes. Command history/text carries no authority, and `lico`
+  neither embeds nor keeps a hidden child shell alive between commands.
+- [ ] File operations over one or many tagged entries: copy, same-volume move/rename,
+  safe cross-volume move, mkdir and file/empty-or-recursive-directory delete. Reuse the
+  M131 storage primitives and shared walkers; show current file plus per-file/total bytes,
+  support pause/resume/cancel, retry/skip/skip-all and explicit overwrite/skip/newer/
+  rename-target policies. Compute totals lazily or under an explicit pre-scan, refuse
+  source/destination subtree cycles and preserve source/existing destination data on
+  interruption, no-space, disconnect or failed publication.
+- [ ] Run copy/move/delete as bounded background operation jobs so panel navigation,
+  viewing and editing remain responsive. Provide one operation queue/status dialog with
+  progress, current path, rate, errors and pause/resume/cancel; cap concurrent workers
+  and queued paths, retain skipped/failed entries as selected, and make application exit
+  ask whether to wait, cancel safely or leave only work explicitly transferred to a
+  session-owned service. A crashed UI never leaves an unowned worker or claims success.
+- [ ] File search from a chosen panel root by name/glob and optionally text content,
+  with type, size, mtime and depth filters. Stream bounded results as they arrive, allow
+  stop/resume and turn the result set into a temporary panel whose entries retain their
+  real volume URIs; view/edit/copy/delete on a result uses that URI and the original
+  capability check. No result list, recursive stack or content window grows without a
+  Domain-enforced bound.
+- [ ] File associations are declarative data mapping validated type/extension rules to
+  an action and canonical executable name. Ship only explicit safe defaults (text ->
+  `licoview`/`licoedit`, known images -> existing `imgview`, known audio -> existing
+  `play`); invocation goes through PermissionManager and the target receives only the
+  selected file capability plus its own manifest grants. Association data cannot embed
+  a shell command, arguments that reinterpret another file, or extra capabilities, and
+  an unknown file defaults to `licoview` rather than execution.
+- [ ] Launch `licoview.lsexe [path]` independently and from `lico`/file associations.
+  It is strictly a non-editing text/raw/hex file viewer in M130: stream files larger than
+  memory; support UTF-8 text with explicit malformed-byte markers, raw byte-preserving
+  text, wrap/no-wrap, horizontal scrolling, line numbers, goto line/byte offset/percent,
+  beginning/end, page/line movement, marks and resize-stable logical position. Text mode
+  uses the shared syntax descriptors and offers plain/highlighted toggling; there is no
+  image, animation, audio, waveform, archive or rich-document renderer.
+- [ ] `licoview` search supports forward/backward text with case/whole-word options and
+  a separate hexadecimal-byte query mode (for example `48 65 6c 6c 6f`) usable from
+  both raw and hex views. Validate the complete byte pattern before scanning, define
+  spacing/case and optional wildcard syntax explicitly, bound reverse-search indexes and
+  cross-chunk overlap, expose next/previous match and never silently reinterpret an odd
+  nibble or malformed token as text. Hex view renders checked offsets, fixed byte groups
+  and ASCII safely for any file length.
+- [ ] Launch `licoedit.lsexe [path ...]` independently and from `lico`. Support multiple
+  open buffers with a bounded screen/buffer switcher, cursor/scroll restoration, new
+  files, line numbers, insert/overwrite, configurable tabs-versus-spaces, auto-indent,
+  wrap/no-wrap, visible whitespace and LF/CRLF preservation. Use the shared syntax
+  descriptors with plain/highlighted toggling and incremental re-highlighting; syntax
+  selection may be automatic or an explicit language override for the current buffer.
+- [ ] Editor operations: character/word/line and shift-movement selection, copy/cut/
+  paste, block indent/unindent, duplicate/delete/move line, bounded undo/redo with clean
+  save points, goto line, forward/backward search and deterministic replace-one/replace-
+  all with literal and shared-regex modes. Clipboard and undo memory live within explicit
+  Domain budgets; an oversized edit fails without corrupting the buffer or saved file.
+- [ ] Safe editor persistence: detect read-only grants and external file replacement,
+  require an explicit reload/overwrite/save-as decision on conflict, write a temporary
+  sibling, flush it and atomically rename only after the complete write succeeds. Keep
+  the old file on allocation, no-space, disconnect or validation failure; optional
+  backup/recovery data is bounded, versioned and never mistaken for the canonical file.
+  Files above the supported editable-buffer limit or detected as binary open read-only
+  in `licoview` instead of being truncated, decoded lossily or partially editable.
+- [ ] Persist non-authority preferences (panel layout/columns/sort, key map, theme,
+  bookmarks, editor indentation and recent positions) as typed configuration with
+  bounded histories and schema versioning. Never persist handles, granted volume lists,
+  selected-file authority or credentials. Corrupt/unknown settings fall back field by
+  field, and a narrow terminal always has a usable single-panel/editor/viewer layout.
+- [ ] Register exactly one `lico.lsexe`, `licoedit.lsexe` and `licoview.lsexe` in the
+  artifact manifest, system `bin/`, shell help/completion and PermissionManager policy.
+  Direct launch and launch from `lico` have identical behavior and file semantics;
+  manager/editor get only their declared write grants, viewer remains read-only, and
+  `lico` gets only the narrow governed-launch broker needed by approved file associations
+  and its command bar, never raw process creation, another program's handles or authority
+  to expand a launched executable's manifest grants.
+- [ ] Validation gates: host-test syntax descriptors/matching, text editing, undo/redo,
+  search (including hex), file-operation planning, history/bookmarks, command-bar parse/
+  completion/history/working-directory semantics and resize layout;
+  PTY tests drive all F-key, pointer, alternate-screen and signal exits; governed tests
+  cover two volumes, read-only/removal/no-space/crash cases, background cancellation,
+  safe save, association authority, foreground/background bar launches, terminal restore
+  and denial of capability escalation. Benchmark huge directories, large text viewing,
+  highlighting, search and copy with peak memory/latency, and keep fresh x86_64/aarch64/
+  riscv64 userspace builds plus focused QEMU scenarios green.
+- Done when: the three canonical executables work standalone and together; two granted
+  volumes can be navigated and manipulated without ambient access; background operations
+  and editor saves are failure-safe; viewer/editor consume the same independently
+  installable syntax descriptors and agree on highlighting; `licoview` remains text/raw/
+  hex only and finds literal or hexadecimal byte patterns; every terminal exit restores
+  state; the bottom command bar launches governed foreground/background commands from the
+  active panel without a hidden shell or capability escalation; and the explicitly
+  excluded compare/sync, multi-rename, archive/package, media, remote and plugin surfaces
+  have not leaked into the implementation.
+- Concept: M35i/M36 (PTY and pointer-capable terminal), M38/M61/M119/M125
+  (PermissionManager, volume-loaded governed executables, session state and `.lsexe`),
+  M43-M111 (capability-scoped writable volumes), M126 (existing external image action),
+  M127 (organized `bin/`, `etc/` and `share/` volume layout), M132 (shared pipeline and
+  redirection grammar once available), and the orthodox two-panel interaction model
+  established by Norton Commander, Midnight Commander and Total Commander without
+  importing their ambient POSIX/Windows authority assumptions.
+
+## M131 - Additional system utilities
+
+Status: PLANNED. Add the ordinary small programs the appliance/edge console still
+lacks. Every command is one canonical `<name>.lsexe` staged under `bin/`, launched by
+PermissionManager with the minimum typed capabilities it needs; no implementation is
+folded back into the shell. `uptime.lsexe` already exists and is retained as the
+conformance baseline. `clear` moves from its current shell-builtin implementation to
+`clear.lsexe`, because it changes no session state. The requested `shich` spelling is
+treated as a typo for the conventional `which.lsexe`; no nonstandard alias is staged.
+`env` is deliberately not duplicated here: SessionService already owns typed cwd,
+`PATH` and environment variables and the shell already implements `NAME=VALUE`, `$NAME`,
+`env` and `unset` over that persistent per-session state.
+
+- [ ] Storage and stream primitives required by the tools, added once to
+  `liber:storage` rather than re-created in each binary: file `stat`; bounded/streaming
+  reads; atomic same-volume `rename`; `truncate`; timestamp update/create (`touch`);
+  and a `watch(path) -> stream<file-event>` contract for change/remove/replace. Extend
+  every writable backend honestly and return typed unsupported/denied for read-only or
+  incapable backends. Cross-volume move is never mislabeled atomic: copy -> verify ->
+  publish -> delete source, leaving the source intact on any pre-delete failure.
+- [ ] Shared bounded utility helpers: one path walker over `volume.list` streams, one
+  byte/text streaming vocabulary with backpressure, one deterministic glob/pattern
+  matcher and one argument/size/range parser. A regex engine is added only once if
+  `grep`/`find` adopt regex syntax; malformed patterns fail before opening output.
+  Utilities process chunks rather than loading unbounded files or trees, check every
+  offset/size/count and propagate allocation/resource failures as typed errors.
+- [ ] **`less.lsexe`**: an interactive pager for a path (and later a pipeline input)
+  using the existing PTY/alternate-screen/raw-input contract. Stream large files,
+  support line/page/home/end movement, forward/backward fixed-text search, repeat search,
+  line numbers, wrap/no-wrap, horizontal scroll and follow mode; resize reflows without
+  losing the logical position and every exit path restores the terminal. It is a text
+  pager, while M130's `licoview` is the richer standalone file viewer.
+- [ ] **`cp.lsexe`**: copy one or many files or directory trees within or across granted
+  volumes, preserving representable timestamps and directory shape, with explicit
+  overwrite/skip/newer policy, recursive opt-in, progress, cancellation and source/
+  destination identity checks. Stream bytes under backpressure, verify size plus digest
+  before publication for cross-volume copies, refuse copying a directory into itself
+  and leave existing destinations/source data intact on failure.
+- [ ] **`mv.lsexe`**: use atomic `volume.rename` for a same-volume move; across volumes
+  use the verified `cp` transaction and remove the source only after destination commit.
+  Handle file/directory replacement policy and subtree cycles explicitly; interruption,
+  no-space or destination failure never loses the source or exposes a falsely complete
+  destination.
+- [ ] **`find.lsexe`**: iterative recursive walk from one or more paths, streaming each
+  match immediately. Filters cover name/glob, file or directory type, size range and
+  mtime range, with max-depth and explicit volume-boundary policy; no ambient traversal
+  into an ungranted volume, no recursion stack overflow and no unbounded result list.
+  Mutation/execution expressions stay out initially: `find` selects and prints paths.
+- [ ] **`grep.lsexe`**: streaming text/byte search over files selected explicitly or by
+  recursive opt-in; fixed string first plus one shared bounded regex mode when its engine
+  is ready. Support case-sensitive/insensitive, whole-word, invert, line number, count,
+  files-with-match and context lines. Bound the rolling match/context windows, define
+  binary-file behavior and UTF-8 versus raw-byte semantics, and never decode malformed
+  text lossily without telling the user.
+- [ ] **`tail.lsexe`** and **`head.lsexe`**: byte or line counts over streaming files,
+  multiple-file headers and clean broken-input behavior. `tail` uses a bounded ring for
+  the last N lines and `--follow` rides `volume.watch` across append, truncate, replace
+  and remove without polling; `head` closes its input as soon as its requested prefix is
+  complete so upstream backpressure/cancellation propagates.
+- [ ] **`hexdump.lsexe`**: canonical offset, hexadecimal bytes and ASCII rendering with
+  repeated-line folding, selectable byte/group width, start offset and bounded length.
+  Stream any file size, use checked offsets and offer a stable plain/JSON form useful for
+  binary-format diagnostics; no direct block-device access without a separately granted
+  file/buffer capability.
+- [ ] **`audiorec.lsexe`**: capability-scoped PCM capture through AudioService, never
+  direct sound-device access. Complete the typed capture-stream contract if playback is
+  all the service currently exposes; negotiate supported rate/channels, write a valid
+  WAV stream incrementally, finalize its header on normal stop and handle Ctrl+C,
+  backpressure, overrun and device loss without leaving an apparently valid truncated
+  file. Report duration, format, dropped frames and peak memory; optional AIFF output
+  reuses its existing leaf after WAV is proven.
+- [ ] **`pwd.lsexe`**: print the inherited session working URI exactly and optionally its
+  canonical volume identity. It consumes only the cwd delivered by the launcher, needs
+  no volume authority and must agree with the shell prompt before/after `cd` and across a
+  shell restart.
+- [ ] **`which.lsexe`**: resolve one or more command names through the inherited typed
+  session `PATH` plus the canonical `.lsexe` normalizer, printing the exact physical
+  artifact URI. It validates executable names, preserves the one-final-suffix rule,
+  distinguishes builtin/alias/tool where requested, reports ambiguity and never grants
+  execution or opens directories outside the caller's volume capabilities.
+- [ ] **`tree.lsexe`**: streamed directory tree with depth limit, files-only/dirs-only,
+  optional sizes and JSON output. Use the shared iterative walker, stable sorting per
+  directory and cycle/volume-boundary defense; a huge tree begins rendering immediately
+  and is bounded by resource policy rather than a compile-time entry count.
+- [ ] **`touch.lsexe`** and **`truncate.lsexe`**: create missing files when requested and
+  update mtime through the storage contract; set/shrink/extend logical length with zeroed
+  extension semantics and checked absolute/relative sizes. Preserve existing data outside
+  the requested change, reject directories/read-only backends and make sparse behavior
+  explicit per filesystem rather than silently allocating or materializing gaps.
+- [ ] **`wc.lsexe`**: streaming bytes, lines, words and Unicode-scalar counts for one or
+  more files, with totals and stable JSON. Define words over bounded UTF-8 decoding,
+  expose raw-byte behavior for malformed input and accumulate with checked/saturating
+  counters so hostile or enormous streams cannot wrap.
+- [ ] **`sort.lsexe`**: deterministic bytewise/UTF-8 text line ordering, reverse,
+  numeric-key and unique modes. Sort in memory only while inside the Domain budget, then
+  spill sorted runs to a capability-scoped temporary area and k-way merge under bounded
+  open-run/backpressure limits; never assume all input fits RAM. Locale collation waits
+  for the localization phase and is not faked.
+- [ ] **`cut.lsexe`**: streaming byte, character and delimiter-separated field selection
+  with validated ranges, complement and output delimiter. Handle UTF-8 characters
+  incrementally across chunk boundaries, define malformed input behavior and cap one
+  logical record so a missing newline cannot grow memory without bound.
+- [ ] **`tee.lsexe`**: copy the input stream to stdout and one or more granted files,
+  append or replace by explicit option, honoring backpressure on every sink. Define
+  failure policy (`fail-fast` by default, optional continue), publish file outputs safely
+  and propagate downstream closure/cancellation instead of buffering indefinitely.
+- [ ] **`watch.lsexe`**: repeatedly launch a governed command through PermissionManager,
+  render its latest output in the alternate screen and show interval/exit status/diff
+  highlighting. Use monotonic periodic waits, one child at a time by default, bound
+  captured output, support immediate quit/Ctrl+C and restore terminal modes; it cannot
+  gain capabilities beyond the watched command's own manifest.
+- [ ] **`kill.lsexe`**: signal a session-owned job/process capability, not an ambient
+  numeric-PID namespace. Default authority is the caller's SessionService jobs; an admin
+  process target requires an explicit process-manage grant from PermissionManager.
+  Support TERM/KILL/INT/STOP/CONT with typed names, refuse protected/system processes by
+  policy, audit every request and report already-exited/not-owned distinctly.
+- [x] **`uptime.lsexe`** already exists: retain its zero-capability monotonic-clock
+  implementation, canonical artifact and standing inventory test. M131 adds only shared
+  CLI/JSON/help consistency if the rest of the utility family adopts it; it does not
+  create a duplicate command.
+- [ ] **`clear.lsexe`**: move the existing ANSI clear+home behavior out of the shell
+  builtin into a zero-capability executable, preserving command completion/help and all
+  terminal backends. The shell keeps only stateful builtins; a failed launch must not
+  leave a half-emitted escape sequence or alter session state.
+- [ ] **`traceroute.lsexe`**: extend NetworkService with a typed bounded probe operation
+  that varies IPv4 TTL and correlates ICMP Time Exceeded/Echo replies; the tool never
+  receives raw NIC access. Support numeric and resolved destinations, per-hop timeout,
+  several probes, max-hop ceiling, cancellation and stable text/JSON output; rate-limit
+  probes and treat unreachable, filtered and timeout as distinct results.
+- [ ] Register every new executable once in the artifact manifest, shell command/help/
+  completion tables and PermissionManager policy. `less`, `watch` and other interactive
+  commands receive the foreground full-duplex tty; volume tools receive only the volume
+  bundle; `pwd`/`clear`/`uptime` receive none; network/audio commands receive only their
+  service scopes. Unknown options, malformed paths/patterns and inapplicable capabilities
+  fail before output mutation or child launch.
+- [ ] Host and governed integration gates: pure parsers, matchers, range handling,
+  sorting/merge, text decoding and format writers get hostile/mutation tests; a writable
+  StorageService scenario covers same/cross-volume copy/move, no-space rollback,
+  rename/truncate/touch/watch and very large streamed files; PTY tests cover pager/watch/
+  clear restoration; SessionService tests cover `pwd`/`which`/`kill`; AudioService and
+  NetworkService scenarios cover `audiorec`/`traceroute`. Record throughput and peak
+  memory for recursive copy/search, large sort, tail-follow and audio capture, and keep
+  x86_64/aarch64/riscv64 userspace builds plus relevant focused QEMU tests green.
+- Done when: every requested command has exactly one canonical artifact (`less`, `cp`,
+  `mv`, `find`, `grep`, `tail`, `head`, `hexdump`, `audiorec`, `pwd`, `which`, `tree`,
+  `touch`, `truncate`, `wc`, `sort`, `cut`, `tee`, `watch`, `kill`, existing `uptime`,
+  executable `clear`, and `traceroute`); commands stream and stay bounded, destructive
+  operations are failure-safe, authority follows capabilities/session ownership rather
+  than POSIX uid/PID conventions, interactive modes always restore the tty, and host +
+  governed + tri-architecture gates pass.
+- Concept: M61/M125 (thin shell and canonical executables), M35i/M35j/M104/M119
+  (PTY, signals, SessionService environment/jobs and tagged tests), M71 (streaming IPC),
+  M43-M111 (writable volumes and unified filesystem contract), M121/M124 (PCM service and
+  codecs), and the Phase-2 small-tool/appliance administration goal.
+
+## M132 - Capability-native pipes and redirection
+
+Status: PLANNED. Add pipelines and input/output redirection as native composition of
+bounded stream capabilities, not as a POSIX file-descriptor table or ambient filesystem
+escape. This milestone completes M35j's deliberately deferred multi-process process
+groups and gives M131 stream utilities one consistent stdin/stdout/stderr contract.
+Each stage remains an independently governed executable with its own PermissionManager
+manifest; connecting byte streams never transfers the producer's or consumer's other
+capabilities.
+
+- [ ] Specify one versioned byte-stream contract used by runtime stdio, pipelines and
+  StorageService adapters: bounded chunks, blocking/backpressured write, readable/
+  writable readiness, writer-close -> EOF, reader-close -> broken-pipe/cancellation and
+  an idempotent explicit error close where ordinary EOF is insufficient. Define the
+  maximum queued bytes/chunks and fair wake ordering; a slow or stopped stage cannot
+  make another Domain allocate unbounded memory.
+- [ ] Generalize the runtime launch context from the existing stdin/stdout channels to
+  three explicit endpoints: stdin (read), stdout (write) and stderr (write), each absent,
+  terminal-backed, pipeline-backed or storage-backed by transferred capability. Preserve
+  the current terminal behavior for ordinary launches, keep stdout and stderr separate
+  by default, close inherited duplicates promptly and expose no numeric descriptor API,
+  arbitrary endpoint lookup or ambient inheritance.
+- [ ] Add a kernel `ProcessGroup` object (or an equally explicit capability object) that
+  owns a bounded set of live process references and supports group wait plus capability-
+  gated INT/TERM/KILL/STOP/CONT. Membership is fixed by the trusted launcher at spawn,
+  cannot be joined by an untrusted process and is removed on exit. ConsoleService holds
+  one MANAGE-scoped group capability for the foreground job, so Ctrl+C/Ctrl+Z/Ctrl+\
+  affect every live pipeline stage and no unrelated process.
+- [ ] Extend SessionService jobs from one Process handle to one job handle representing
+  either a single process or ProcessGroup, plus the ordered display command and aggregate
+  running/stopped/completed state. `&`, `jobs`, `fg`, `bg`, shell restart and completion
+  reaping work identically for single commands and pipelines; a partially exited group
+  remains a job until every stage is reaped, and all handles close on session teardown.
+- [ ] Replace line-prefix dispatch with a bounded lexer/parser that produces an explicit
+  command/pipeline/redirection AST while preserving existing variable expansion and
+  canonical option normalization. Recognize operators only outside quoted/escaped text,
+  reject empty stages, duplicate/conflicting redirects, unsupported descriptor numbers,
+  dangling operators, excessive stages/arguments/expanded bytes and recursive expansion
+  before any file is opened or process spawned. Keep assignment/session-state builtins
+  explicit rather than accidentally applying them in a child pipeline context.
+- [ ] Initial shell grammar: `A | B`, `< path`, `> path`, `>> path`, `2> path`,
+  `2>> path` and `2>&1`, with left-to-right redirection ordering documented and tested.
+  Compound shell language, command substitution, here-documents, arbitrary `N>&M`, shell
+  scripts and POSIX descriptor emulation remain out of scope. A state-mutating builtin
+  such as `cd`, assignment, `unset`, `fg` or `bg` is rejected as a pipeline stage; simple
+  parent-shell use retains today's persistent SessionService semantics.
+- [ ] Build a pipeline transaction in the trusted shell/launch broker: parse and resolve
+  every executable/path, authorize every stage independently, allocate all stream pairs
+  and redirection adapters, create the process group, then spawn/register the complete
+  graph before making it runnable. Any failure closes endpoints, terminates/reaps already
+  created stages, removes temporary outputs and leaves no job entry; no stage observes a
+  half-built graph or inherits a handle intended for another edge.
+- [ ] For each `A | B` edge, transfer only A's write endpoint as stdout and B's read
+  endpoint as stdin. Pipelines of more than two stages compose the same primitive and
+  obey a configured stage/endpoint budget. Stderr remains on the terminal unless
+  redirected; `2>&1` duplicates the current stdout stream capability at that exact point
+  in left-to-right evaluation without granting authority over its eventual destination.
+- [ ] Input redirection resolves a path against the shell's current URI and granted
+  volume, opens it read-only and pumps it through the M131 bounded streaming-read adapter.
+  A directory, missing/read-denied file, unsupported backend or oversized path fails
+  before launch. The child receives only the stream endpoint, not the source volume or
+  reusable file capability, unless its own manifest separately grants one.
+- [ ] Replace output redirection (`>`/`2>`) writes to a bounded temporary sibling through
+  StorageService and publishes by flush + atomic rename only when the owning command or
+  complete pipeline succeeds according to the chosen policy. Failure, signal or no-space
+  preserves the previous destination and removes the temporary file. Append (`>>`/`2>>`)
+  uses an explicit atomic append-stream storage operation with per-write ordering; never
+  emulate append by read-whole-file plus rewrite or silently degrade it on an incapable/
+  read-only backend.
+- [ ] Define lifecycle propagation precisely: natural producer close delivers EOF;
+  consumer early exit closes its read end and wakes the producer with broken pipe;
+  terminal interrupt/quit targets the whole ProcessGroup; stop preserves queued bounded
+  data without accepting more than the cap; resume restarts all live stages; killing one
+  stage closes its outputs so downstream cannot hang forever. Adapter or storage failure
+  signals the owning job and is surfaced separately from an executable exit.
+- [ ] Add observable per-stage completion records and a stable pipeline status policy.
+  Default interactive status is the last stage's result while launch/adapter failures are
+  always failures; provide an explicit `pipefail` session setting that returns the
+  rightmost failed stage. Background completion reports one job with a concise failing
+  stage, and SystemGraph/counters expose stage count, queued bytes, blocked writers,
+  transferred bytes and cancellation without logging stream contents.
+- [ ] Make M131 stream tools genuine composition participants: `cat`, `grep`, `head`,
+  `tail`, `sort`, `cut`, `tee`, `wc`, `less` and `hexdump` consume stdin when no path is
+  supplied and write only stdout/stderr endpoints. `head`/`less` early close exercises
+  broken-pipe propagation; `tee` applies backpressure across all selected outputs; tools
+  do not detect pipelines through environment variables or receive broader volume grants
+  merely because a path was redirected by the shell.
+- [ ] Capability and hostile-input tests prove no pipeline edge leaks service/file/
+  process handles, a stage cannot signal its group without MANAGE authority, redirects
+  cannot escape granted volumes, and `2>&1` aliases only the intended stream. Fuzz the
+  lexer/parser and launch rollback; stress full queues, zero-byte chunks, close races,
+  stopped groups, stage crash, shell crash/restart, consumer early exit, disk full,
+  append concurrency and destination replacement under strict Domain budgets.
+- [ ] Governed end-to-end gates cover foreground/background two- and multi-stage
+  pipelines, every redirect form and ordering combination, Ctrl+C/Ctrl+Z/fg/bg, EOF,
+  broken pipe, `pipefail`, transactional replacement and append on supported/read-only
+  volumes. Record throughput, context switches, queued-memory peaks and cancellation
+  latency for large streams, then keep x86_64/aarch64/riscv64 builds and focused QEMU
+  tests green with no regression for ordinary non-pipeline launches.
+- Done when: arbitrary bounded chains within the configured stage limit compose through
+  explicit stdin/stdout/stderr capabilities; redirection is volume-scoped and failure-
+  safe; one ProcessGroup is one session/terminal job; signals, stop/resume, EOF, broken
+  pipe, rollback and status semantics are deterministic; no fd/PID/global-filesystem
+  ambient authority was introduced; and M131 stream utilities interoperate without
+  private adapters.
+- Concept: M30/M71 (typed event and bounded streaming IPC), M35i/M35j (PTY, signals and
+  the deferred process-group step), M38/M61/M119 (PermissionManager, governed launch and
+  persistent jobs), M43-M111/M131 (streaming and transactional storage operations), and
+  the existing `rt` stdin/stdout capability channels.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
