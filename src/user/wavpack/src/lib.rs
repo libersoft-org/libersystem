@@ -552,7 +552,11 @@ fn parse_samples(mut bytes: &[u8], passes: &mut [DecorrPass], channels: u8) -> R
 		}
 		bytes = &bytes[needed..];
 	}
-	if bytes.is_empty() { Ok(()) } else { Err(Error::Invalid) }
+	if bytes.is_empty() {
+		Ok(())
+	} else {
+		Err(Error::Invalid)
+	}
 }
 
 fn parse_entropy(bytes: &[u8], channels: u8) -> Result<Entropy, Error> {
@@ -1011,14 +1015,21 @@ mod tests {
 
 	#[test]
 	fn decodes_staged_lossless_stream_bit_exactly_in_bounded_chunks() {
-		let wavpack = WavPack::parse(include_bytes!("../../../volume/sample.wv")).unwrap();
-		assert_eq!(wavpack.metadata(), Metadata { rate: 8_000, channels: 1, bits_per_sample: 16, frames: 512, duration_ms: 64 });
+		let wavpack = WavPack::parse(include_bytes!("../../../volume/test.wv")).unwrap();
+		assert_eq!(wavpack.metadata(), Metadata { rate: 44_100, channels: 1, bits_per_sample: 16, frames: 328_104, duration_ms: 7_440 });
 		let mut decoder = wavpack.decoder();
 		let mut chunk = Vec::new();
 		let mut decoded = Vec::new();
-		let wav = wav::Wav::parse(include_bytes!("../../../volume/sample.wav")).unwrap();
+		let wav = wav::Wav::parse(include_bytes!("../../../volume/test.wav")).unwrap();
+		let mut wav_decoder = wav.decoder();
 		let mut expected = Vec::new();
-		assert_eq!(wav.decoder().read_i16_le(1_024, &mut expected), Ok(512));
+		loop {
+			let frames = wav_decoder.read_i16_le(1_024, &mut chunk).unwrap();
+			if frames == 0 {
+				break;
+			}
+			expected.extend_from_slice(&chunk);
+		}
 		while decoder.remaining_frames() != 0 {
 			let frames = decoder.read_i16_le(127, &mut chunk).unwrap();
 			assert!((1..=127).contains(&frames));
@@ -1029,11 +1040,19 @@ mod tests {
 
 	#[test]
 	fn decodes_true_stereo_with_independent_channel_state() {
-		let wavpack = WavPack::parse(include_bytes!("../../../volume/sample-stereo.wv")).unwrap();
-		assert_eq!(wavpack.metadata(), Metadata { rate: 8_000, channels: 2, bits_per_sample: 16, frames: 512, duration_ms: 64 });
-		let wav = wav::Wav::parse(include_bytes!("../../../volume/sample.wav")).unwrap();
+		let wavpack = WavPack::parse(include_bytes!("../../../volume/test-stereo.wv")).unwrap();
+		assert_eq!(wavpack.metadata(), Metadata { rate: 44_100, channels: 2, bits_per_sample: 16, frames: 328_104, duration_ms: 7_440 });
+		let wav = wav::Wav::parse(include_bytes!("../../../volume/test.wav")).unwrap();
+		let mut wav_decoder = wav.decoder();
 		let mut mono = Vec::new();
-		assert_eq!(wav.decoder().read_i16_le(1_024, &mut mono), Ok(512));
+		let mut mono_chunk = Vec::new();
+		loop {
+			let frames = wav_decoder.read_i16_le(1_024, &mut mono_chunk).unwrap();
+			if frames == 0 {
+				break;
+			}
+			mono.extend_from_slice(&mono_chunk);
+		}
 		let mut expected = Vec::new();
 		for bytes in mono.chunks_exact(2) {
 			let sample = i16::from_le_bytes([bytes[0], bytes[1]]);
@@ -1053,10 +1072,10 @@ mod tests {
 
 	#[test]
 	fn streams_multiple_blocks_and_checks_each_crc() {
-		let source = include_bytes!("../../../volume/sample-long.wv");
+		let source = include_bytes!("../../../volume/test.wv");
 		let wavpack = WavPack::parse(source).unwrap();
-		assert_eq!(wavpack.metadata().frames, 80_000);
-		assert_eq!(wavpack.blocks.len(), 2);
+		assert_eq!(wavpack.metadata().frames, 328_104);
+		assert!(wavpack.blocks.len() > 2);
 		let mut decoder = wavpack.decoder();
 		let mut chunk = Vec::new();
 		let mut bytes = 0usize;
@@ -1069,8 +1088,8 @@ mod tests {
 				hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
 			}
 		}
-		assert_eq!(bytes, 160_000);
-		assert_eq!(hash, 0x1c09_1ddc_d056_e971);
+		assert_eq!(bytes, 656_208);
+		assert_eq!(hash, 0x3a09_ed82_4ddc_9e5d);
 
 		let mut corrupt = source.to_vec();
 		let second = corrupt.windows(4).enumerate().filter(|(_, bytes)| *bytes == b"wvpk").nth(1).unwrap().0;
@@ -1088,13 +1107,13 @@ mod tests {
 
 	#[test]
 	fn malformed_streams_fail_without_panicking_or_stalling() {
-		let source = include_bytes!("../../../volume/sample-stereo.wv");
-		for len in (0..source.len()).step_by(31) {
+		let source = include_bytes!("../tests/test-stereo-short.wv");
+		for len in (0..source.len()).step_by(source.len().div_ceil(256)) {
 			if let Ok(wavpack) = WavPack::parse(&source[..len]) {
 				let mut decoder = wavpack.decoder();
 				let mut chunk = Vec::new();
 				for _ in 0..wavpack.blocks.len() * 2 + 2 {
-					if decoder.remaining_frames() == 0 || decoder.read_i16_le(257, &mut chunk).is_err() {
+					if decoder.remaining_frames() == 0 || decoder.read_i16_le(4_096, &mut chunk).is_err() {
 						break;
 					}
 				}
@@ -1113,13 +1132,15 @@ mod tests {
 				let mut decoder = wavpack.decoder();
 				let mut chunk = Vec::new();
 				let mut steps = 0usize;
-				while decoder.remaining_frames() != 0 && steps <= wavpack.blocks.len() * 4 + 4 {
-					if decoder.read_i16_le(257, &mut chunk).is_err() {
+				let mut rejected = false;
+				while decoder.remaining_frames() != 0 && steps < 128 {
+					if decoder.read_i16_le(4_096, &mut chunk).is_err() {
+						rejected = true;
 						break;
 					}
 					steps += 1;
 				}
-				assert!(decoder.remaining_frames() == 0 || steps <= wavpack.blocks.len() * 4 + 4, "mutated stream stalled the decoder");
+				assert!(rejected || decoder.remaining_frames() == 0, "mutated stream stalled the decoder");
 			}
 		}
 	}

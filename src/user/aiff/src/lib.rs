@@ -320,14 +320,14 @@ mod tests {
 
 	#[test]
 	fn decodes_staged_ffmpeg_aiff_and_aifc() {
-		for bytes in [include_bytes!("../../../volume/sample.aiff").as_slice(), include_bytes!("../../../volume/sample.aifc").as_slice()] {
+		for bytes in [include_bytes!("../../../volume/test.aiff").as_slice(), include_bytes!("../../../volume/test.aifc").as_slice()] {
 			let parsed = Aiff::parse(bytes).unwrap();
-			assert_eq!(parsed.metadata().rate, 8_000);
+			assert_eq!(parsed.metadata().rate, 44_100);
 			assert_eq!(parsed.metadata().channels, 1);
-			assert_eq!(parsed.metadata().frames, 512);
+			assert_eq!(parsed.metadata().frames, 328_104);
 			let mut output = Vec::new();
-			assert_eq!(parsed.decoder().read_i16_le(1_024, &mut output), Ok(512));
-			assert_eq!(output.len(), 1_024);
+			assert_eq!(parsed.decoder().read_i16_le(1_024, &mut output), Ok(1_024));
+			assert_eq!(output.len(), 2_048);
 			assert!(output.iter().any(|byte| *byte != 0));
 		}
 	}

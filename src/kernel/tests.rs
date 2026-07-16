@@ -578,7 +578,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let mut play_run = alloc::vec::Vec::new();
 	play_run.extend_from_slice(&3u16.to_le_bytes());
 	play_run.extend_from_slice(&2u32.to_le_bytes());
-	for value in [&b"play"[..], &b"vol://system/sample.wav"[..], &b"vol://system"[..]] {
+	for value in [&b"play"[..], &b"vol://system/test.wav"[..], &b"vol://system"[..]] {
 		play_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
 		play_run.extend_from_slice(value);
 	}
@@ -592,7 +592,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let play_process = play_reply.caps.first().ok_or("play run returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "play run handle was not a Process")?;
 
 	let open = play_audio_server.recv().map_err(|_| "play did not open an audio stream")?;
-	if open.bytes.len() < 11 || le_u16(&open.bytes, 0) != 2 || le_u32(&open.bytes, 6) != 8_000 || open.bytes[10] != 1 {
+	if open.bytes.len() < 11 || le_u16(&open.bytes, 0) != 2 || le_u32(&open.bytes, 6) != 44_100 || open.bytes[10] != 1 {
 		return Err("play opened the wrong WAV format");
 	}
 	let open_corr = le_u32(&open.bytes, 2);
@@ -605,11 +605,11 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	sched::run_until_idle();
 
 	let first_write = pcm_server.recv().map_err(|_| "play sent no first PCM write")?;
-	if first_write.bytes.len() < 14 || le_u16(&first_write.bytes, 0) != 1 || le_u64(&first_write.bytes, 6) != 1_024 || first_write.caps.len() != 1 {
+	if first_write.bytes.len() < 14 || le_u16(&first_write.bytes, 0) != 1 || le_u64(&first_write.bytes, 6) != 2_048 || first_write.caps.len() != 1 {
 		return Err("play sent an invalid first PCM write");
 	}
 	let first_buffer = first_write.caps[0].object().into_any_arc().downcast::<MemoryObject>().map_err(|_| "play PCM write did not transfer a MemoryObject")?;
-	if !read_from_object(&first_buffer, 1_024).iter().any(|byte| *byte != 0) {
+	if !read_from_object(&first_buffer, 2_048).iter().any(|byte| *byte != 0) {
 		return Err("play decoded silent PCM from the non-silent WAV fixture");
 	}
 	let first_corr = le_u32(&first_write.bytes, 2);
@@ -617,11 +617,15 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	sched::run_until_idle();
 
 	let second_write = pcm_server.recv().map_err(|_| "play did not retry the unaccepted PCM suffix")?;
-	if second_write.bytes.len() < 14 || le_u16(&second_write.bytes, 0) != 1 || le_u64(&second_write.bytes, 6) != 768 || second_write.caps.len() != 1 {
+	if second_write.bytes.len() < 14 || le_u16(&second_write.bytes, 0) != 1 || le_u64(&second_write.bytes, 6) != 1_792 || second_write.caps.len() != 1 {
 		return Err("play retried the wrong PCM suffix");
 	}
+	play_process.set_int_pending();
+	for thread in play_process.live_threads() {
+		sched::wake_thread(&thread);
+	}
 	let second_corr = le_u32(&second_write.bytes, 2);
-	pcm_server.send(Message::new([second_corr.to_le_bytes().as_slice(), &[1], &384u32.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "second PCM write reply failed")?;
+	pcm_server.send(Message::new([second_corr.to_le_bytes().as_slice(), &[1], &896u32.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "second PCM write reply failed")?;
 	sched::run_until_idle();
 
 	let close_request = pcm_server.recv().map_err(|_| "play did not explicitly close its PCM stream")?;
@@ -637,14 +641,14 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	}
 
 	for (run_corr, uri, channels, pcm_bytes) in [
-		(3u32, &b"vol://system/sample-ima.wav"[..], 1u8, 1_024u64),
-		(4u32, &b"vol://system/sample-ms.wav"[..], 1u8, 1_024u64),
-		(5u32, &b"vol://system/sample.aiff"[..], 1u8, 1_024u64),
-		(6u32, &b"vol://system/sample.aifc"[..], 1u8, 1_024u64),
-		(7u32, &b"vol://system/sample.flac"[..], 2u8, 2_048u64),
-		(8u32, &b"vol://system/sample.wv"[..], 1u8, 1_024u64),
-		(9u32, &b"vol://system/sample-stereo.wv"[..], 2u8, 2_048u64),
-		(10u32, &b"vol://system/sample.ogg"[..], 1u8, 512u64),
+		(3u32, &b"vol://system/test-ima.wav"[..], 1u8, 2_048u64),
+		(4u32, &b"vol://system/test-ms.wav"[..], 1u8, 2_048u64),
+		(5u32, &b"vol://system/test.aiff"[..], 1u8, 2_048u64),
+		(6u32, &b"vol://system/test.aifc"[..], 1u8, 2_048u64),
+		(7u32, &b"vol://system/test.flac"[..], 1u8, 2_048u64),
+		(8u32, &b"vol://system/test.wv"[..], 1u8, 2_048u64),
+		(9u32, &b"vol://system/test-stereo.wv"[..], 2u8, 4_096u64),
+		(10u32, &b"vol://system/test.ogg"[..], 1u8, 2_048u64),
 	] {
 		let (audio_server, audio_client) = Channel::create();
 		admin_reply(&audio_admin_server, audio_client, 0)?;
@@ -665,7 +669,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 		}
 		let process = reply.caps.first().ok_or("audio play returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "audio play handle was not a Process")?;
 		let open = audio_server.recv().map_err(|_| "audio play did not open an audio stream")?;
-		if open.bytes.len() < 11 || le_u16(&open.bytes, 0) != 2 || le_u32(&open.bytes, 6) != 8_000 || open.bytes[10] != channels {
+		if open.bytes.len() < 11 || le_u16(&open.bytes, 0) != 2 || le_u32(&open.bytes, 6) != 44_100 || open.bytes[10] != channels {
 			return Err("audio play opened the wrong format");
 		}
 		let (stream_server, stream_client) = Channel::create();
@@ -686,6 +690,10 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 		}
 		let write_corr = le_u32(&write.bytes, 2);
 		let accepted_frames = (pcm_bytes / channels as u64 / 2) as u32;
+		process.set_int_pending();
+		for thread in process.live_threads() {
+			sched::wake_thread(&thread);
+		}
 		stream_server.send(Message::new([write_corr.to_le_bytes().as_slice(), &[1], &accepted_frames.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "audio PCM reply failed")?;
 		sched::run_until_idle();
 		let close_request = stream_server.recv().map_err(|_| "audio play did not close")?;
@@ -704,7 +712,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let mut mp3_run = alloc::vec::Vec::new();
 	mp3_run.extend_from_slice(&3u16.to_le_bytes());
 	mp3_run.extend_from_slice(&11u32.to_le_bytes());
-	for value in [&b"play"[..], &b"vol://system/sample.mp3"[..], &b"vol://system"[..]] {
+	for value in [&b"play"[..], &b"vol://system/test.mp3"[..], &b"vol://system"[..]] {
 		mp3_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
 		mp3_run.extend_from_slice(value);
 	}
@@ -717,7 +725,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	}
 	let mp3_process = mp3_reply.caps.first().ok_or("MP3 play returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "MP3 play handle was not a Process")?;
 	let mp3_open = mp3_audio_server.recv().map_err(|_| "MP3 play did not open an audio stream")?;
-	if mp3_open.bytes.len() < 11 || le_u16(&mp3_open.bytes, 0) != 2 || le_u32(&mp3_open.bytes, 6) != 16_000 || mp3_open.bytes[10] != 1 {
+	if mp3_open.bytes.len() < 11 || le_u16(&mp3_open.bytes, 0) != 2 || le_u32(&mp3_open.bytes, 6) != 44_100 || mp3_open.bytes[10] != 1 {
 		return Err("MP3 play opened the wrong format");
 	}
 	let (mp3_stream_server, mp3_stream_client) = Channel::create();
@@ -728,18 +736,29 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	mp3_open_reply.extend_from_slice(&0u32.to_le_bytes());
 	send_cap(&mp3_audio_server, &mp3_open_reply, mp3_stream_client, Rights::ALL)?;
 	sched::run_until_idle();
-	for (pcm_bytes, accepted_frames) in [(2_048u64, 1_024u32), (1_408u64, 704u32)] {
+	let mut heard_audio = false;
+	for _ in 0..8 {
 		let write = mp3_stream_server.recv().map_err(|_| "MP3 play sent too few PCM writes")?;
-		if write.bytes.len() < 14 || le_u16(&write.bytes, 0) != 1 || le_u64(&write.bytes, 6) != pcm_bytes || write.caps.len() != 1 {
+		if write.bytes.len() < 14 || le_u16(&write.bytes, 0) != 1 || le_u64(&write.bytes, 6) != 2_048 || write.caps.len() != 1 {
 			return Err("MP3 play sent invalid decoded PCM");
 		}
 		let buffer = write.caps[0].object().into_any_arc().downcast::<MemoryObject>().map_err(|_| "MP3 play did not transfer PCM memory")?;
-		if !read_from_object(&buffer, pcm_bytes as usize).iter().any(|byte| *byte != 0) {
-			return Err("MP3 play decoded silence");
+		heard_audio |= read_from_object(&buffer, 2_048).iter().any(|byte| *byte != 0);
+		if heard_audio {
+			mp3_process.set_int_pending();
+			for thread in mp3_process.live_threads() {
+				sched::wake_thread(&thread);
+			}
 		}
 		let correlation = le_u32(&write.bytes, 2);
-		mp3_stream_server.send(Message::new([correlation.to_le_bytes().as_slice(), &[1], &accepted_frames.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "MP3 PCM reply failed")?;
+		mp3_stream_server.send(Message::new([correlation.to_le_bytes().as_slice(), &[1], &1_024u32.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "MP3 PCM reply failed")?;
 		sched::run_until_idle();
+		if heard_audio {
+			break;
+		}
+	}
+	if !heard_audio {
+		return Err("MP3 play decoded only silence after its bounded delay");
 	}
 	let mp3_close = mp3_stream_server.recv().map_err(|_| "MP3 play did not close")?;
 	let mp3_close_corr = le_u32(&mp3_close.bytes, 2);
@@ -4086,17 +4105,17 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	let wav_domain = object::domain::Domain::new_child(&sched::root_domain(), object::domain::UNLIMITED, object::domain::UNLIMITED, object::domain::UNLIMITED);
 	let wav_scope = open_scope(&audio_admin, 40);
 	let wav_start = arch::tsc::now();
-	let (_wav_stdout, wav_process) = launch_play(play_elf, wav_domain.clone(), storage_client.clone(), wav_scope, b"vol://system/sample.wav");
+	let (_wav_stdout, wav_process) = launch_play(play_elf, wav_domain.clone(), storage_client.clone(), wav_scope, b"vol://system/test.wav");
 	sched::run_until_idle();
 	let first = snd_host.recv().expect("WAV first hardware period");
 	let first_sample_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(wav_start));
 	assert_eq!(first.bytes.len(), 2_048);
-	assert_eq!(sample(&first), 0, "WAV first source frame reaches hardware");
+	assert_eq!(sample(&first), 2, "WAV first source frame reaches hardware");
 
 	let vorbis_domain = object::domain::Domain::new_child(&sched::root_domain(), object::domain::UNLIMITED, object::domain::UNLIMITED, object::domain::UNLIMITED);
 	let vorbis_scope = open_scope(&audio_admin, 41);
 	let vorbis_start = arch::tsc::now();
-	let (_vorbis_stdout, vorbis_process) = launch_play(play_elf, vorbis_domain.clone(), storage_client.clone(), vorbis_scope, b"vol://system/sample.ogg");
+	let (_vorbis_stdout, vorbis_process) = launch_play(play_elf, vorbis_domain.clone(), storage_client.clone(), vorbis_scope, b"vol://system/test.ogg");
 	sched::run_until_idle();
 	let vorbis_queue_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(vorbis_start));
 	assert!(snd_host.recv().is_err(), "pending driver ACK holds the mixed period");
@@ -4106,23 +4125,37 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	let mixed = snd_host.recv().expect("concurrent mixed period");
 	let ack_to_mixed_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(ack_start));
 	assert_eq!(mixed.bytes.len(), 2_048);
-	assert_eq!(sample(&mixed), -3_642, "WAV frame 85 and Vorbis frame 0 mix exactly");
+	assert_eq!(sample(&mixed), 2, "the corresponding WAV and Vorbis source frames mix exactly");
 	let mut periods = 2u32;
-	loop {
+	while periods < 6 {
 		snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("concurrent period ACK");
 		sched::run_until_idle();
-		let current = snd_host.recv().expect("next concurrent period or stop");
+		let current = snd_host.recv().expect("next concurrent mixed period");
+		assert!(!current.bytes.is_empty(), "long fixtures must sustain six mixed periods");
+		periods += 1;
+	}
+	for process in [&wav_process, &vorbis_process] {
+		process.set_int_pending();
+		for thread in process.live_threads() {
+			sched::wake_thread(&thread);
+		}
+	}
+	let mut tail = 0u32;
+	loop {
+		snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("concurrent tail ACK");
+		sched::run_until_idle();
+		let current = snd_host.recv().expect("concurrent tail period or stop");
 		if current.bytes.is_empty() {
 			break;
 		}
-		periods += 1;
+		tail += 1;
+		assert!(tail <= 64, "interrupted players leave at most the bounded accepted queue tail");
 	}
-	assert_eq!(periods, 6, "8 kHz 512-frame WAV determines six 48 kHz periods without underrun");
 	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("concurrent stop ACK");
 	sched::run_until_idle();
 	assert!(wav_process.is_terminated() && vorbis_process.is_terminated(), "both play processes exit after explicit close");
-	let wav_peak = wav_process.memory_bytes() + wav_domain.account().memory().peak() + volume_file(volume, b"sample.wav").expect("staged WAV").len() as u64;
-	let vorbis_peak = vorbis_process.memory_bytes() + vorbis_domain.account().memory().peak() + volume_file(volume, b"sample.ogg").expect("staged Vorbis").len() as u64;
+	let wav_peak = wav_process.memory_bytes() + wav_domain.account().memory().peak() + volume_file(volume, b"test.wav").expect("staged WAV").len() as u64;
+	let vorbis_peak = vorbis_process.memory_bytes() + vorbis_domain.account().memory().peak() + volume_file(volume, b"test.ogg").expect("staged Vorbis").len() as u64;
 	crate::serial_println!("audio-play-perf: first-sample={}ns vorbis-decode-queue={}ns ack-to-mixed={}ns wav-peak={}B vorbis-peak={}B periods={} underruns=0 queued-source-peak=683", first_sample_ns, vorbis_queue_ns, ack_to_mixed_ns, wav_peak, vorbis_peak, periods);
 
 	// Interrupt a long player while bounded AudioService backpressure has it blocked
@@ -4131,7 +4164,7 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	// explicitly closes, exits, and leaves only the already accepted bounded tail.
 	let interrupt_scope = open_scope(&audio_admin, 42);
 	let interrupt_domain = object::domain::Domain::new_child(&sched::root_domain(), object::domain::UNLIMITED, object::domain::UNLIMITED, object::domain::UNLIMITED);
-	let (_interrupt_stdout, interrupt_process) = launch_play(play_elf, interrupt_domain, storage_client, interrupt_scope, b"vol://system/sample-long.wv");
+	let (_interrupt_stdout, interrupt_process) = launch_play(play_elf, interrupt_domain, storage_client, interrupt_scope, b"vol://system/test.wv");
 	sched::run_until_idle();
 	let mut current = snd_host.recv().expect("long player first period");
 	assert!(!current.bytes.is_empty());

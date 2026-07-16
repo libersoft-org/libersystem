@@ -3,16 +3,16 @@ use std::time::Instant;
 const LOGICAL_SECONDS: u64 = 60;
 const CHUNK_FRAMES: usize = 1_024;
 
-const WAV: &[u8] = include_bytes!("../../../volume/sample.wav");
-const WAV_IMA: &[u8] = include_bytes!("../../../volume/sample-ima.wav");
-const WAV_MS: &[u8] = include_bytes!("../../../volume/sample-ms.wav");
-const AIFF: &[u8] = include_bytes!("../../../volume/sample.aiff");
-const AIFC: &[u8] = include_bytes!("../../../volume/sample.aifc");
-const FLAC: &[u8] = include_bytes!("../../../volume/sample.flac");
-const MP3: &[u8] = include_bytes!("../../../volume/sample.mp3");
-const OGG: &[u8] = include_bytes!("../../../volume/sample.ogg");
-const WAVPACK: &[u8] = include_bytes!("../../../volume/sample.wv");
-const WAVPACK_STEREO: &[u8] = include_bytes!("../../../volume/sample-stereo.wv");
+const WAV: &[u8] = include_bytes!("../../../volume/test.wav");
+const WAV_IMA: &[u8] = include_bytes!("../../../volume/test-ima.wav");
+const WAV_MS: &[u8] = include_bytes!("../../../volume/test-ms.wav");
+const AIFF: &[u8] = include_bytes!("../../../volume/test.aiff");
+const AIFC: &[u8] = include_bytes!("../../../volume/test.aifc");
+const FLAC: &[u8] = include_bytes!("../../../volume/test.flac");
+const MP3: &[u8] = include_bytes!("../../../volume/test.mp3");
+const OGG: &[u8] = include_bytes!("../../../volume/test.ogg");
+const WAVPACK: &[u8] = include_bytes!("../../../volume/test.wv");
+const WAVPACK_STEREO: &[u8] = include_bytes!("../../../volume/test-stereo.wv");
 
 trait Decoder {
 	fn read_i16_le(&mut self, max_frames: usize, output: &mut Vec<u8>) -> Result<usize, ()>;

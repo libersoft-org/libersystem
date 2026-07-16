@@ -225,7 +225,7 @@ mod tests {
 
 	#[test]
 	fn frames_staged_vorbis_stream() {
-		let mut reader = PacketReader::new(include_bytes!("../../../volume/sample.ogg"));
+		let mut reader = PacketReader::new(include_bytes!("../../../volume/test.ogg"));
 		for signature in [b"\x01vorbis".as_slice(), b"\x03vorbis".as_slice(), b"\x05vorbis".as_slice()] {
 			let packet = reader.next_packet().unwrap().unwrap();
 			assert!(packet.data.starts_with(signature));
@@ -239,7 +239,7 @@ mod tests {
 			saw_eos |= packet.eos;
 		}
 		assert!(audio_packets != 0);
-		assert_eq!(final_granule, Some(512));
+		assert_eq!(final_granule, Some(328_104));
 		assert!(saw_eos);
 	}
 }

@@ -208,9 +208,9 @@ mod tests {
 	}
 
 	#[test]
-	fn decodes_staged_mpeg2_stream_in_bounded_chunks() {
-		let mp3 = Mp3::parse(include_bytes!("../../../volume/sample.mp3")).unwrap();
-		assert_eq!(mp3.metadata().rate, 16_000);
+	fn decodes_staged_mpeg1_stream_in_bounded_chunks() {
+		let mp3 = Mp3::parse(include_bytes!("../../../volume/test.mp3")).unwrap();
+		assert_eq!(mp3.metadata().rate, 44_100);
 		assert_eq!(mp3.metadata().channels, 1);
 		let mut decoder = mp3.decoder();
 		let mut chunk = Vec::new();
@@ -224,8 +224,8 @@ mod tests {
 			decoded.extend_from_slice(&chunk);
 		}
 		let hash = decoded.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ *byte as u64).wrapping_mul(0x100_0000_01b3));
-		assert_eq!(decoded.len() / 2, 1_728);
-		assert_eq!(hash, 0xdc70_57b9_334b_1113);
+		assert_eq!(decoded.len() / 2, 330_624);
+		assert_eq!(hash, 0xbbe8_a394_77bd_0712);
 		assert!(decoded.iter().any(|byte| *byte != 0));
 	}
 }

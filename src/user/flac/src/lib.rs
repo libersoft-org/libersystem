@@ -582,11 +582,11 @@ mod tests {
 
 	#[test]
 	fn decodes_staged_flac_bit_exactly_in_bounded_chunks() {
-		let flac = Flac::parse(include_bytes!("../../../volume/sample.flac")).unwrap();
-		assert_eq!(flac.metadata().rate, 8_000);
-		assert_eq!(flac.metadata().channels, 2);
-		assert_eq!(flac.metadata().bits_per_sample, 24);
-		assert_eq!(flac.metadata().frames, 512);
+		let flac = Flac::parse(include_bytes!("../../../volume/test.flac")).unwrap();
+		assert_eq!(flac.metadata().rate, 44_100);
+		assert_eq!(flac.metadata().channels, 1);
+		assert_eq!(flac.metadata().bits_per_sample, 16);
+		assert_eq!(flac.metadata().frames, 328_104);
 		let mut decoder = flac.decoder();
 		let mut chunk = Vec::new();
 		let mut decoded = Vec::new();
@@ -595,21 +595,40 @@ mod tests {
 			assert!((1..=127).contains(&frames));
 			decoded.extend_from_slice(&chunk);
 		}
-		assert_eq!(decoded, include_bytes!("../tests/data/sample-s16le.pcm"));
+		assert_eq!(decoded, include_bytes!("../tests/data/test-s16le.pcm"));
 	}
 
 	#[test]
 	fn rejects_truncated_and_corrupt_frames() {
-		let source = include_bytes!("../../../volume/sample.flac");
+		let source = include_bytes!("../../../volume/test.flac");
 		for len in [0, 1, 4, 8, 41, source.len() - 1] {
 			let result = Flac::parse(&source[..len]);
 			if let Ok(flac) = result {
-				assert!(flac.decoder().read_i16_le(1_024, &mut Vec::new()).is_err());
+				let mut decoder = flac.decoder();
+				let mut chunk = Vec::new();
+				loop {
+					match decoder.read_i16_le(1_024, &mut chunk) {
+						Err(_) => break,
+						Ok(0) => panic!("truncated FLAC reached a clean end"),
+						Ok(_) => {}
+					}
+				}
 			}
 		}
 		let mut corrupt = source.to_vec();
 		*corrupt.last_mut().unwrap() ^= 1;
 		let flac = Flac::parse(&corrupt).unwrap();
-		assert_eq!(flac.decoder().read_i16_le(1_024, &mut Vec::new()), Err(Error::Checksum));
+		let mut decoder = flac.decoder();
+		let mut chunk = Vec::new();
+		loop {
+			match decoder.read_i16_le(1_024, &mut chunk) {
+				Err(error) => {
+					assert_eq!(error, Error::Checksum);
+					break;
+				}
+				Ok(0) => panic!("corrupt FLAC reached a clean end"),
+				Ok(_) => {}
+			}
+		}
 	}
 }

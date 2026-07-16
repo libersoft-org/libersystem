@@ -291,8 +291,8 @@ mod tests {
 
 	#[test]
 	fn decodes_staged_stream_to_independent_golden() {
-		let vorbis = Vorbis::parse(include_bytes!("../../../volume/sample.ogg")).unwrap();
-		assert_eq!(vorbis.metadata(), Metadata { rate: 8_000, channels: 1, frames: 256, duration_ms: 32 });
+		let vorbis = Vorbis::parse(include_bytes!("../../../volume/test.ogg")).unwrap();
+		assert_eq!(vorbis.metadata(), Metadata { rate: 44_100, channels: 1, frames: 328_104, duration_ms: 7_440 });
 		let mut decoder = vorbis.decoder();
 		let mut pcm = Vec::new();
 		let mut chunk = Vec::new();
@@ -303,8 +303,8 @@ mod tests {
 			}
 			pcm.extend_from_slice(&chunk);
 		}
-		assert_eq!(pcm.len(), 512);
-		let golden = include_bytes!("../tests/sample.pcm");
+		assert_eq!(pcm.len(), 656_208);
+		let golden = include_bytes!("../tests/test.pcm");
 		for (actual, expected) in pcm.chunks_exact(2).zip(golden.chunks_exact(2)) {
 			let actual = i16::from_le_bytes([actual[0], actual[1]]) as i32;
 			let expected = i16::from_le_bytes([expected[0], expected[1]]) as i32;
@@ -315,7 +315,7 @@ mod tests {
 
 	#[test]
 	fn rejects_truncated_corrupt_and_non_vorbis_streams() {
-		let source = include_bytes!("../../../volume/sample.ogg");
+		let source = include_bytes!("../../../volume/test.ogg");
 		for length in [0, 4, 26, source.len() - 1] {
 			assert!(Vorbis::parse(&source[..length]).is_err());
 		}
@@ -332,7 +332,7 @@ mod tests {
 
 	#[test]
 	fn rejects_zero_frame_reads() {
-		let vorbis = Vorbis::parse(include_bytes!("../../../volume/sample.ogg")).unwrap();
+		let vorbis = Vorbis::parse(include_bytes!("../../../volume/test.ogg")).unwrap();
 		let mut decoder = vorbis.decoder();
 		assert_eq!(decoder.read_i16_le(0, &mut Vec::new()), Err(Error::Invalid));
 	}

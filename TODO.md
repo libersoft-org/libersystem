@@ -3038,6 +3038,57 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     a writable-LiberFS scenario converts BMP to indexed PNG at quality/compression 100,
     reopens it and independently proves exact RGBA pixels for the representable source
     palette. `imgview` uses the same central sniffer/frame compositor.
+- [ ] Audit every supported image format against its current authoritative
+  specification before declaring the codec matrix complete. Cover BMP/DIB, PNG and
+  APNG, GIF89a, ICO/CUR, ICNS, baseline/progressive JPEG, PCX, Netpbm PPM/PNM, QOI,
+  TGA, and WebP including RIFF, VP8, VP8L, ALPH and ANIM/ANMF. For each format record
+  the specification/revision/date and authoritative source in one maintained image
+  conformance document, then compare every accepted and emitted profile, field,
+  limit, color/alpha rule, frame semantic and required checksum against that source.
+  Classify every discovered gap explicitly as implement now, typed Unsupported, or a
+  documented future profile; add an independently sourced fixture and regression test
+  for every behavior that changes. Where no current vendor standard exists, record the
+  best surviving primary specification and the interoperability convention followed.
+- [ ] Make content sniffing structural and collision-resistant. APNG detection must
+  walk real PNG chunk boundaries instead of finding `acTL` in arbitrary compressed
+  bytes; PCX detection must validate its header fields instead of claiming every file
+  whose first byte is `0x0a`, which currently shadows legal TGA files with a ten-byte
+  image ID. Audit every other signature/heuristic pair for the same prefix collision,
+  distinguish unknown format from corrupt recognized format, and pin adversarial
+  collision fixtures through both `decode_frame` and the real tools.
+- [ ] Add an independent interoperability corpus and host-only conformance runner.
+  Decode externally produced golden files for every supported input profile, and
+  validate our encoded BMP, PNG/APNG, GIF, PCX, TGA, ICO, ICNS, PPM, QOI, JPEG and
+  WebP output with implementations that do not share our encoder/decoder code. Keep
+  those host dependencies out of the no_std leaves, record fixture provenance and
+  licensing, and pin deterministic hashes for canonical output so byte drift is an
+  explicit review event. Prioritize the currently thin custom ICO, TGA and PCX suites;
+  self-round-trip alone is not an interoperability proof.
+- [ ] Add a deterministic hostile-input and mutation harness shared by all image
+  decoders. Exercise every prefix truncation for small golden files plus bounded
+  mutations of dimensions, offsets, lengths, palette/table counts, checksums, RLE,
+  LZW and deflate runs, frame rectangles and loop/duration fields. A mutation may
+  decode to a changed image or return a typed error, but it must never panic, stall, overrun the
+  declared geometry budget or allocate from an attacker-controlled unchecked size.
+  Run the same corpus through the central sniffer so format misclassification is also
+  covered, not only leaf parsers.
+- [ ] Measure and bound the real governed `imgconv.lsexe` working set, not only the
+  incremental codec heap. Account together for the mapped source, the userspace input
+  copy, decoded RGBA/animation model, encoder workspace, encoded `Vec`, staging
+  MemoryObject, ELF/shared pages and stack. Add representative 1920x1080 and 4K
+  conversions plus a bounded animation under a child Domain with a deliberate memory
+  limit; record high-water usage and require clean typed failure with destination
+  preservation when the limit is exceeded. Use the measurement to remove avoidable
+  copies, lower the 16,777,216-pixel / 67,108,864-animation-pixel limits, or set a tool
+  quota rather than assuming the current unlimited launch Domain is acceptable.
+- [ ] Close the user-facing viewer/converter contract. Generate `imgconv --help` from
+  the same capability/default table used by parsing and tests, and give `imgview` a
+  concise usage contract. State explicitly that version one renders the composited
+  frame 0 of an animation rather than playing it. Extend the governed viewer scenario
+  beyond opaque BMP to a transparent PNG and an animated input, verifying alpha
+  conversion into display pixels, the documented first-frame result, focus-scoped
+  input, release and clean exit. Keep animation playback as a later feature unless it is deliberately
+  added with timing, disposal, focus and resource-budget tests.
 - [ ] Conformance, hostile-input and option tests: lossless format round-trips compare
   exact RGBA frames/timing; lossy JPEG/WebP vectors compare dimensions plus bounded
   PSNR/error thresholds and deterministic hashes; compression 0 and 100 must decode
@@ -3083,21 +3134,29 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   - Result (2026-07-16): the same dual-StorageService scenario runs
     `imgconv.lsexe --lossless --compression 50` and independently verifies exact RGBA,
     then runs the real `imgconv.lsexe --lossy --quality 100 --compression 100` across
-    system LiberFS
-    to media FAT16, reopens `CROSS.WEBP`, verifies the canonical simple `VP8 ` RIFF
-    profile and independently decodes dimensions plus bounded RGB error. The focused
+    system LiberFS to media FAT16, reopens `CROSS.WEBP`, verifies the canonical simple
+    `VP8 ` RIFF profile and independently decodes dimensions plus bounded RGB error. The focused
     x86 capability/storage/process/filesystem selection is green 57/57. Full shared
     libraries and userspace, including `imgconv.lsexe`, build on x86_64, AArch64 and
     RISC-V; `webp.lslib` is 349,912 / 442,936 / 384,000 bytes respectively. The
     benchmark's tracking allocator gates every static profile at 8 MiB and WebP at
     4 MiB encode / 2 MiB decode. Measured VP8L effort-100 peaks are 3,670,706 / 1,049,888
     bytes; VP8 quality-100 peaks are 2,542,735 / 1,835,124 bytes.
+- Deliberate non-blocking deferrals after the closure work above: timed animation
+  playback in `imgview`, metadata round-trip, progressive JPEG output, JPEG 2000 ICNS,
+  AVIF/JPEG XL/HEIC, additional resize filters and streaming encoders. Keep each typed
+  Unsupported or explicitly documented; do not expand M126 into those features merely
+  to avoid moving to the next milestone.
 - Done when: `imgconv` converts every implemented M126 format through the same RGBA/frame
   model, WebP can explicitly choose lossless or lossy, applicable encoders honor
   validated 0..100 quality/compression controls, alpha and animation are never dropped
   implicitly, unsupported options/profiles fail before output mutation, incomplete
-  files are cleaned up, converted files reopen in independent decoders and `imgview`,
-  and host + targeted kernel + tri-architecture build/performance gates are green.
+  files are cleaned up, structural sniffing has no known prefix collisions, the current
+  authoritative specifications and independent implementations agree with every
+  claimed profile, hostile mutations stay bounded, the full governed process meets its
+  measured memory quota, converted files reopen in independent decoders and `imgview`,
+  the CLI/viewer behavior is documented from shared capability data, and host + targeted
+  kernel + tri-architecture build/performance gates are green.
 - Concept: M121/M122 (pixel/surface vocabulary and the first image consumer), M123
   (one codec per `.lslib` leaf), M125 (canonical `imgconv.lsexe` artifact), the
   capability rule (`volumes` only), and the NOTES image-conversion-tool item.

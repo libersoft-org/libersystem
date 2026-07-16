@@ -397,26 +397,26 @@ mod tests {
 	}
 
 	#[test]
-	fn staged_sample_is_512_frames_of_non_silent_pcm() {
-		let wav = Wav::parse(include_bytes!("../../../volume/sample.wav")).unwrap();
-		assert_eq!(wav.metadata(), Metadata { rate: 8_000, channels: 1, bits_per_sample: 16, frames: 512, duration_ms: 64 });
+	fn staged_test_is_long_non_silent_pcm() {
+		let wav = Wav::parse(include_bytes!("../../../volume/test.wav")).unwrap();
+		assert_eq!(wav.metadata(), Metadata { rate: 44_100, channels: 1, bits_per_sample: 16, frames: 328_104, duration_ms: 7_440 });
 		let mut output = Vec::new();
-		assert_eq!(wav.decoder().read_i16_le(1_024, &mut output), Ok(512));
-		assert_eq!(output.len(), 1_024);
+		assert_eq!(wav.decoder().read_i16_le(1_024, &mut output), Ok(1_024));
+		assert_eq!(output.len(), 2_048);
 		assert!(output.iter().any(|byte| *byte != 0));
 	}
 
 	#[test]
-	fn staged_adpcm_samples_decode_through_the_container_boundary() {
-		for bytes in [include_bytes!("../../../volume/sample-ima.wav").as_slice(), include_bytes!("../../../volume/sample-ms.wav").as_slice()] {
+	fn staged_adpcm_tests_decode_through_the_container_boundary() {
+		for bytes in [include_bytes!("../../../volume/test-ima.wav").as_slice(), include_bytes!("../../../volume/test-ms.wav").as_slice()] {
 			let wav = Wav::parse(bytes).unwrap();
-			assert_eq!(wav.metadata().rate, 8_000);
+			assert_eq!(wav.metadata().rate, 44_100);
 			assert_eq!(wav.metadata().channels, 1);
 			assert_eq!(wav.metadata().bits_per_sample, 4);
-			assert_eq!(wav.metadata().frames, 512);
+			assert_eq!(wav.metadata().frames, 328_104);
 			let mut output = Vec::new();
-			assert_eq!(wav.decoder().read_i16_le(1_024, &mut output), Ok(512));
-			assert_eq!(output.len(), 1_024);
+			assert_eq!(wav.decoder().read_i16_le(1_024, &mut output), Ok(1_024));
+			assert_eq!(output.len(), 2_048);
 			assert!(output.iter().any(|byte| *byte != 0));
 		}
 	}
