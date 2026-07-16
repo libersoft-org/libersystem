@@ -1,8 +1,8 @@
 # Bugs / changes
 
-- "play" doesn't play any sound file
+- add audio conversion tool
+- after all audio tests remove all audio test files except original .mp3
 - check where in directory structures are non-system-essential apps (like image viewer, audio player etc.) and move them somewhere else
-- add audio test file (.mp3 - "the audio system works correctly...")
 - audio player (different formats)
 - audio recorder (microphone)
 - audio device selector tool (both input and output, when system has multiple sound devices)

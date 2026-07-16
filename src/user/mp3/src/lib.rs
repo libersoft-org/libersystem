@@ -7,6 +7,8 @@ use pcm::Format;
 
 const MAX_ID3_SIZE: usize = 16 * 1024 * 1024;
 const MAX_SYNC_SCAN: usize = 64 * 1024;
+// nanomp3's synthesis filter emits the conventional Layer III decoder delay.
+const DECODER_DELAY: u64 = 529;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -30,6 +32,7 @@ pub struct Mp3<'a> {
 	start: usize,
 	format: Format,
 	metadata: Metadata,
+	skip_frames: u64,
 }
 
 impl<'a> Mp3<'a> {
@@ -50,7 +53,10 @@ impl<'a> Mp3<'a> {
 			}
 		};
 		let format = Format::new(header.rate, header.channels).ok_or(Error::Unsupported)?;
-		Ok(Mp3 { bytes, start, format, metadata: Metadata { rate: header.rate, channels: header.channels, frames: 0, duration_ms: 0 } })
+		let gapless = gapless_info(bytes, start, header);
+		let frames = gapless.map_or(0, |info| info.frames);
+		let duration_ms = frames.saturating_mul(1_000) / u64::from(header.rate);
+		Ok(Mp3 { bytes, start, format, metadata: Metadata { rate: header.rate, channels: header.channels, frames, duration_ms }, skip_frames: gapless.map_or(0, |info| info.skip_frames) })
 	}
 
 	pub const fn metadata(&self) -> Metadata {
@@ -62,7 +68,7 @@ impl<'a> Mp3<'a> {
 	}
 
 	pub fn decoder(&self) -> Decoder<'_> {
-		Decoder { mp3: self, engine: nanomp3::Decoder::new(), cursor: self.start, pcm: [0.0; nanomp3::MAX_SAMPLES_PER_FRAME], pending_samples: 0, pending_sample: 0, emitted: 0, done: false }
+		Decoder { mp3: self, engine: nanomp3::Decoder::new(), cursor: self.start, pcm: [0.0; nanomp3::MAX_SAMPLES_PER_FRAME], pending_samples: 0, pending_sample: 0, skip_frames: self.skip_frames, emitted: 0, done: false }
 	}
 }
 
@@ -86,9 +92,12 @@ fn id3v2_end(bytes: &[u8]) -> Result<usize, Error> {
 	Ok(end)
 }
 
+#[derive(Clone, Copy)]
 struct FrameHeader {
 	rate: u32,
 	channels: u8,
+	version: u8,
+	has_crc: bool,
 }
 
 impl FrameHeader {
@@ -108,8 +117,68 @@ impl FrameHeader {
 		let base_rates = [44_100, 48_000, 32_000];
 		let rate = if version == 3 { base_rates[rate_index as usize] } else { base_rates[rate_index as usize] / 2 };
 		let channels = if bytes[3] >> 6 == 3 { 1 } else { 2 };
-		Ok(FrameHeader { rate, channels })
+		Ok(FrameHeader { rate, channels, version, has_crc: bytes[1] & 1 == 0 })
 	}
+
+	const fn samples(self) -> u64 {
+		if self.version == 3 { 1_152 } else { 576 }
+	}
+
+	const fn side_info_bytes(self) -> usize {
+		match (self.version, self.channels) {
+			(3, 1) => 17,
+			(3, _) => 32,
+			(_, 1) => 9,
+			(_, _) => 17,
+		}
+	}
+}
+
+#[derive(Clone, Copy)]
+struct GaplessInfo {
+	frames: u64,
+	skip_frames: u64,
+}
+
+fn gapless_info(bytes: &[u8], frame_start: usize, header: FrameHeader) -> Option<GaplessInfo> {
+	let xing = frame_start.checked_add(4 + usize::from(header.has_crc) * 2 + header.side_info_bytes())?;
+	let marker_end = xing.checked_add(4)?;
+	if !matches!(bytes.get(xing..marker_end), Some(b"Xing") | Some(b"Info")) {
+		return None;
+	}
+	let flags = read_be_u32(bytes, marker_end)?;
+	let mut cursor = xing.checked_add(8)?;
+	let frame_count = if flags & 1 != 0 {
+		let count = read_be_u32(bytes, cursor)?;
+		cursor = cursor.checked_add(4)?;
+		Some(count)
+	} else {
+		None
+	};
+	if flags & 2 != 0 {
+		cursor = cursor.checked_add(4)?;
+	}
+	if flags & 4 != 0 {
+		cursor = cursor.checked_add(100)?;
+	}
+	if flags & 8 != 0 {
+		cursor = cursor.checked_add(4)?;
+	}
+	if !matches!(bytes.get(cursor..cursor.checked_add(4)?), Some(b"LAME") | Some(b"Lavf") | Some(b"Lavc") | Some(b"GOGO")) {
+		return None;
+	}
+	let delay_start = cursor.checked_add(21)?;
+	let delay = bytes.get(delay_start..delay_start.checked_add(3)?)?;
+	let encoder_delay = u64::from(delay[0]) << 4 | u64::from(delay[1] >> 4);
+	let padding = u64::from(delay[1] & 0x0f) << 8 | u64::from(delay[2]);
+	let encoded_frames = u64::from(frame_count?).checked_mul(header.samples())?;
+	let frames = encoded_frames.checked_sub(encoder_delay.checked_add(padding)?)?;
+	let skip_frames = header.samples().checked_add(encoder_delay)?.checked_add(DECODER_DELAY)?;
+	Some(GaplessInfo { frames, skip_frames })
+}
+
+fn read_be_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+	Some(u32::from_be_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?))
 }
 
 pub struct Decoder<'a> {
@@ -119,12 +188,16 @@ pub struct Decoder<'a> {
 	pcm: [f32; nanomp3::MAX_SAMPLES_PER_FRAME],
 	pending_samples: usize,
 	pending_sample: usize,
+	skip_frames: u64,
 	emitted: u64,
 	done: bool,
 }
 
 impl Decoder<'_> {
 	pub fn remaining_frames(&self) -> u64 {
+		if self.mp3.metadata.frames != 0 {
+			return self.mp3.metadata.frames.saturating_sub(self.emitted);
+		}
 		if self.done && self.pending_sample == self.pending_samples { 0 } else { u64::MAX - self.emitted }
 	}
 
@@ -135,6 +208,10 @@ impl Decoder<'_> {
 		output.clear();
 		let channels = self.mp3.format.channels() as usize;
 		while output.len() / (channels * 2) < max_frames {
+			if self.mp3.metadata.frames != 0 && self.emitted == self.mp3.metadata.frames {
+				self.done = true;
+				break;
+			}
 			if self.pending_sample == self.pending_samples {
 				self.pending_sample = 0;
 				self.pending_samples = 0;
@@ -157,9 +234,14 @@ impl Decoder<'_> {
 				if self.pending_samples > self.pcm.len() {
 					return Err(Error::Invalid);
 				}
+				let available_frames = self.pending_samples / channels;
+				let skipped = usize::try_from(self.skip_frames.min(available_frames as u64)).map_err(|_| Error::TooLarge)?;
+				self.pending_sample = skipped.checked_mul(channels).ok_or(Error::TooLarge)?;
+				self.skip_frames -= skipped as u64;
 			}
 			let available_frames = (self.pending_samples - self.pending_sample) / channels;
-			let wanted = max_frames - output.len() / (channels * 2);
+			let remaining = if self.mp3.metadata.frames == 0 { u64::MAX } else { self.mp3.metadata.frames - self.emitted };
+			let wanted = usize::try_from(remaining.min((max_frames - output.len() / (channels * 2)) as u64)).map_err(|_| Error::TooLarge)?;
 			let frames = available_frames.min(wanted);
 			let samples = frames.checked_mul(channels).ok_or(Error::TooLarge)?;
 			output.try_reserve(samples.checked_mul(2).ok_or(Error::TooLarge)?).map_err(|_| Error::TooLarge)?;
@@ -208,10 +290,26 @@ mod tests {
 	}
 
 	#[test]
+	fn parses_info_gapless_range() {
+		let header = FrameHeader::parse(&[0xff, 0xfb, 0x90, 0xc0]).unwrap();
+		let mut frame = vec![0u8; 200];
+		frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0xc0]);
+		let xing = 4 + header.side_info_bytes();
+		frame[xing..xing + 4].copy_from_slice(b"Info");
+		frame[xing + 4..xing + 8].copy_from_slice(&1u32.to_be_bytes());
+		frame[xing + 8..xing + 12].copy_from_slice(&286u32.to_be_bytes());
+		let encoder = xing + 12;
+		frame[encoder..encoder + 9].copy_from_slice(b"LAME3.100");
+		frame[encoder + 21..encoder + 24].copy_from_slice(&[0x24, 0x03, 0x18]);
+		let info = gapless_info(&frame, 0, header).unwrap();
+		assert_eq!(info.frames, 328_104);
+		assert_eq!(info.skip_frames, 2_257);
+	}
+
+	#[test]
 	fn decodes_staged_mpeg1_stream_in_bounded_chunks() {
 		let mp3 = Mp3::parse(include_bytes!("../../../volume/test.mp3")).unwrap();
-		assert_eq!(mp3.metadata().rate, 44_100);
-		assert_eq!(mp3.metadata().channels, 1);
+		assert_eq!(mp3.metadata(), Metadata { rate: 44_100, channels: 1, frames: 328_104, duration_ms: 7_440 });
 		let mut decoder = mp3.decoder();
 		let mut chunk = Vec::new();
 		let mut decoded = Vec::new();
@@ -223,9 +321,17 @@ mod tests {
 			assert!(frames <= 127);
 			decoded.extend_from_slice(&chunk);
 		}
-		let hash = decoded.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ *byte as u64).wrapping_mul(0x100_0000_01b3));
-		assert_eq!(decoded.len() / 2, 330_624);
-		assert_eq!(hash, 0xbbe8_a394_77bd_0712);
-		assert!(decoded.iter().any(|byte| *byte != 0));
+		let golden = include_bytes!("../tests/test.pcm");
+		assert_eq!(decoded.len(), golden.len());
+		let errors = decoded.chunks_exact(2).zip(golden.chunks_exact(2)).map(|(actual, expected)| {
+			let actual = i16::from_le_bytes([actual[0], actual[1]]) as i32;
+			let expected = i16::from_le_bytes([expected[0], expected[1]]) as i32;
+			actual.abs_diff(expected)
+		});
+		let total_error: u64 = errors.clone().map(u64::from).sum();
+		let peak_error = errors.max().unwrap_or(0);
+		assert!(total_error / mp3.metadata().frames <= 2, "MP3 output diverges from the independent PCM golden");
+		assert!(peak_error <= 16, "MP3 output contains an impulsive error of {peak_error} samples");
+		assert_eq!(decoder.remaining_frames(), 0);
 	}
 }

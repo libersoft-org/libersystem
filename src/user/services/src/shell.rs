@@ -667,6 +667,8 @@ enum Shape {
 	Rest,
 	// `name <rest>` only, no bare form (e.g. `cat <path>`).
 	Args,
+	// `name <rest>` as a controlling-terminal foreground job (e.g. `play <path>`).
+	InteractiveArgs,
 }
 
 // The governed tools PermissionManager launches, each by command word and launch shape.
@@ -693,7 +695,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"config", Shape::Rest),
 	(b"lssvc", Shape::Rest),
 	(b"beep", Shape::Rest),
-	(b"play", Shape::Args),
+	(b"play", Shape::InteractiveArgs),
 	(b"ls", Shape::Rest),
 	(b"du", Shape::Rest),
 	(b"stop", Shape::Args),
@@ -763,7 +765,7 @@ unsafe fn print_help(cmd: Option<&[u8]>) {
 	}
 }
 
-unsafe fn dispatch_tool(line: &[u8], permsvc: u64, cwd: &[u8]) -> bool {
+unsafe fn dispatch_tool(line: &[u8], jobs: &mut Jobs, permsvc: u64, cwd: &[u8]) -> bool {
 	unsafe {
 		for &(name, shape) in TOOLS {
 			match shape {
@@ -796,6 +798,12 @@ unsafe fn dispatch_tool(line: &[u8], permsvc: u64, cwd: &[u8]) -> bool {
 				Shape::Args => {
 					if let Some(rest) = strip_word(line, name) {
 						run_tool(permsvc, name, trim(rest), cwd);
+						return true;
+					}
+				}
+				Shape::InteractiveArgs => {
+					if let Some(rest) = strip_word(line, name) {
+						run_tool_interactive(jobs, permsvc, name, trim(rest), cwd);
 						return true;
 					}
 				}
@@ -1095,7 +1103,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			return false;
 		}
 		// everything else is a governed tool: match it against the tool table.
-		if dispatch_tool(line, permsvc, cwd.as_bytes()) {
+		if dispatch_tool(line, jobs, permsvc, cwd.as_bytes()) {
 			return false;
 		}
 		print(b"\x1b[31munknown command: ");

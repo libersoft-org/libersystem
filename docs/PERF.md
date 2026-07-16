@@ -139,10 +139,18 @@ signal with an inverted right channel. One x86 host run produced:
 | AIFF PCM | 44,100 Hz | 328,104 | 9 | 0.009 s | 7,555.9x |
 | AIFC PCM | 44,100 Hz | 328,104 | 9 | 0.008 s | 8,403.2x |
 | FLAC | 44,100 Hz | 328,104 | 9 | 0.163 s | 411.5x |
-| MP3 | 44,100 Hz | 330,624 | 9 | 0.065 s | 1,033.7x |
+| MP3 | 44,100 Hz | 328,104 | 9 | 0.065 s | 1,022.5x |
 | Ogg Vorbis | 44,100 Hz | 328,104 | 9 | 0.136 s | 492.7x |
 | WavPack mono | 44,100 Hz | 328,104 | 9 | 0.159 s | 420.4x |
 | WavPack stereo | 44,100 Hz | 328,104 | 9 | 0.271 s | 246.9x |
+
+MP3 playback parses the first-frame Xing/Info tag and applies its 12-bit encoder
+delay/end-padding fields together with the decoder synthesis delay. The informational
+frame itself is not rendered. The staged stream therefore exposes the same 328,104
+frames as the independent FFmpeg PCM golden instead of 330,624 raw decoder frames;
+full-stream mean sample error is at most two. `play` is launched as the tty foreground
+job, so ConsoleService delivers Ctrl+C to its Process handle and the caught interrupt
+closes the PCM stream cleanly.
 
 The focused x86 KVM `audio` test now connects two real `play` processes to one real
 StorageService and AudioService through separate playback-only scopes. It holds WAV's
