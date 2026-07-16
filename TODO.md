@@ -3104,6 +3104,17 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   documented future profile; add an independently sourced fixture and regression test
   for every behavior that changes. Where no current vendor standard exists, record the
   best surviving primary specification and the interoperability convention followed.
+  - Partial result (2026-07-17): `docs/IMAGE_FORMATS.md` now records the current
+    normative or best surviving primary source, implemented decode/encode subset and
+    classified gaps for every M126 format, including PNG Third Edition (2025) with
+    APNG, GIF89a, T.81/JFIF, Microsoft BMP/ICO material, Apple ICNS guidance, ZSoft
+    PCX lineage, Netpbm PPM, QOI 1.0, Truevision TGA 2.0 and WebP RIFF/VP8/VP8L.
+    The first resolved spec gap routes APNG frames through the complete static PNG
+    pipeline, accepts inherited indexed/grayscale/RGB/alpha/16-bit/Adam7 profiles,
+    multiple `IDAT` chunks and the legal static-image-not-a-frame layout. Indexed
+    multi-`IDAT` and separate-default-image regressions pass; APNG is 4/4 and
+    `imgconv` is 14/14. Independent external fixtures and the remaining per-format
+    field audits keep this item open.
 - [ ] Make content sniffing structural and collision-resistant. APNG detection must
   walk real PNG chunk boundaries instead of finding `acTL` in arbitrary compressed
   bytes; PCX detection must validate its header fields instead of claiming every file
@@ -3111,6 +3122,15 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   image ID. Audit every other signature/heuristic pair for the same prefix collision,
   distinguish unknown format from corrupt recognized format, and pin adversarial
   collision fixtures through both `decode_frame` and the real tools.
+  - Partial result (2026-07-17): central APNG detection now walks bounded PNG chunks
+    and accepts `acTL` only before the first `IDAT`; a static PNG whose pixel payload
+    contains the literal bytes `acTL` remains PNG. PCX detection validates its full
+    128-byte header shape before selection, while TGA validates its 18-byte header,
+    geometry, selected true-color profile, reserved descriptor bits and image-ID
+    extent. A legal TGA with `id_length=10` exercises the former `0x0a` PCX collision
+    through public `decode_frame`. Focused `imgconv` is 14/14 and PCX/TGA leaves are
+    3/3 and 2/2. The broader signature audit, corrupt-recognized error split and real
+    tool collision path keep this item open.
 - [ ] Add an independent interoperability corpus and host-only conformance runner.
   Decode externally produced golden files for every supported input profile, and
   validate our encoded BMP, PNG/APNG, GIF, PCX, TGA, ICO, ICNS, PPM, QOI, JPEG and

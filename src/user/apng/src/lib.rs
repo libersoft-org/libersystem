@@ -26,19 +26,27 @@ struct Control {
 	disposal: Disposal,
 }
 
+struct PngProfile {
+	ihdr_tail: [u8; 5],
+	palette: Option<Vec<u8>>,
+	transparency: Option<Vec<u8>>,
+}
+
 pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 	if data.get(..8) != Some(SIGNATURE) {
 		return Err(if data.len() < 8 { Error::Truncated } else { Error::Invalid });
 	}
 	let mut cursor = 8usize;
 	let mut canvas = None;
+	let mut profile = None;
 	let mut declared_frames = None;
 	let mut loop_count = 0u32;
 	let mut sequence = 0u32;
 	let mut control = None;
 	let mut compressed = Vec::new();
 	let mut frames = Vec::new();
-	let mut saw_idat = false;
+	let mut idat_frame = None;
+	let mut idat_closed = false;
 	while cursor < data.len() {
 		let length = read_u32(data, cursor)? as usize;
 		let kind: &[u8; 4] = data.get(cursor + 4..cursor + 8).ok_or(Error::Truncated)?.try_into().map_err(|_| Error::Truncated)?;
@@ -49,10 +57,13 @@ pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 		if crc32(kind.iter().chain(body.iter()).copied()) != read_u32(data, end)? {
 			return Err(Error::Invalid);
 		}
+		if idat_frame.is_some() && kind != b"IDAT" {
+			idat_closed = true;
+		}
 		match kind {
 			b"IHDR" => {
-				if canvas.is_some() || body.len() != 13 || body[8..] != [8, 6, 0, 0, 0] {
-					return Err(Error::Unsupported);
+				if canvas.is_some() || body.len() != 13 {
+					return Err(Error::Invalid);
 				}
 				let width = read_u32(body, 0)?;
 				let height = read_u32(body, 4)?;
@@ -60,9 +71,24 @@ pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 					return Err(Error::TooLarge);
 				}
 				canvas = Some((width, height));
+				profile = Some(PngProfile { ihdr_tail: body[8..13].try_into().map_err(|_| Error::Invalid)?, palette: None, transparency: None });
+			}
+			b"PLTE" => {
+				let profile = profile.as_mut().ok_or(Error::Invalid)?;
+				if profile.palette.is_some() || idat_frame.is_some() {
+					return Err(Error::Invalid);
+				}
+				profile.palette = Some(body.to_vec());
+			}
+			b"tRNS" => {
+				let profile = profile.as_mut().ok_or(Error::Invalid)?;
+				if profile.transparency.is_some() || idat_frame.is_some() {
+					return Err(Error::Invalid);
+				}
+				profile.transparency = Some(body.to_vec());
 			}
 			b"acTL" => {
-				if declared_frames.is_some() || body.len() != 8 || saw_idat {
+				if profile.is_none() || declared_frames.is_some() || body.len() != 8 || idat_frame.is_some() {
 					return Err(Error::Invalid);
 				}
 				let count = read_u32(body, 0)?;
@@ -73,29 +99,42 @@ pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 				loop_count = read_u32(body, 4)?;
 			}
 			b"fcTL" => {
-				finish_frame(&mut frames, control.take(), &mut compressed)?;
+				finish_frame(&mut frames, control.take(), &mut compressed, profile.as_ref().ok_or(Error::Invalid)?)?;
 				if body.len() != 26 || read_u32(body, 0)? != sequence {
 					return Err(Error::Invalid);
 				}
 				sequence = sequence.checked_add(1).ok_or(Error::TooLarge)?;
-				control = Some(parse_control(body)?);
+				let next = parse_control(body)?;
+				if idat_frame.is_none() {
+					let (width, height) = canvas.ok_or(Error::Invalid)?;
+					if next.x != 0 || next.y != 0 || next.width != width || next.height != height {
+						return Err(Error::Invalid);
+					}
+				}
+				control = Some(next);
 			}
 			b"IDAT" => {
-				if saw_idat || control.is_none() {
+				let belongs_to_animation = control.is_some();
+				if idat_closed || idat_frame.is_some_and(|expected| expected != belongs_to_animation) {
 					return Err(Error::Invalid);
 				}
-				saw_idat = true;
-				compressed.extend_from_slice(body);
+				idat_frame = Some(belongs_to_animation);
+				if belongs_to_animation {
+					compressed.extend_from_slice(body);
+				}
 			}
 			b"fdAT" => {
-				if body.len() < 4 || read_u32(body, 0)? != sequence || control.is_none() {
+				if body.len() < 4 || read_u32(body, 0)? != sequence || control.is_none() || idat_frame.is_none() {
 					return Err(Error::Invalid);
 				}
 				sequence = sequence.checked_add(1).ok_or(Error::TooLarge)?;
 				compressed.extend_from_slice(&body[4..]);
 			}
 			b"IEND" => {
-				finish_frame(&mut frames, control.take(), &mut compressed)?;
+				if !body.is_empty() {
+					return Err(Error::Invalid);
+				}
+				finish_frame(&mut frames, control.take(), &mut compressed, profile.as_ref().ok_or(Error::Invalid)?)?;
 				cursor = crc_end;
 				break;
 			}
@@ -181,7 +220,7 @@ fn parse_control(body: &[u8]) -> Result<Control, Error> {
 	Ok(Control { width: read_u32(body, 4)?, height: read_u32(body, 8)?, x: read_u32(body, 12)?, y: read_u32(body, 16)?, duration_ms: duration_ms.max(1), blend, disposal })
 }
 
-fn finish_frame(frames: &mut Vec<Frame>, control: Option<Control>, compressed: &mut Vec<u8>) -> Result<(), Error> {
+fn finish_frame(frames: &mut Vec<Frame>, control: Option<Control>, compressed: &mut Vec<u8>, profile: &PngProfile) -> Result<(), Error> {
 	let Some(control) = control else {
 		if compressed.is_empty() {
 			return Ok(());
@@ -191,7 +230,21 @@ fn finish_frame(frames: &mut Vec<Frame>, control: Option<Control>, compressed: &
 	if compressed.is_empty() {
 		return Err(Error::Invalid);
 	}
-	let image = png::decode_rgba_payload(control.width, control.height, compressed).map_err(map_png)?;
+	let mut encoded = SIGNATURE.to_vec();
+	let mut header = Vec::new();
+	header.extend_from_slice(&control.width.to_be_bytes());
+	header.extend_from_slice(&control.height.to_be_bytes());
+	header.extend_from_slice(&profile.ihdr_tail);
+	chunk(&mut encoded, b"IHDR", &header)?;
+	if let Some(palette) = &profile.palette {
+		chunk(&mut encoded, b"PLTE", palette)?;
+	}
+	if let Some(transparency) = &profile.transparency {
+		chunk(&mut encoded, b"tRNS", transparency)?;
+	}
+	chunk(&mut encoded, b"IDAT", compressed)?;
+	chunk(&mut encoded, b"IEND", &[])?;
+	let image = png::decode_rgba(&encoded).map_err(map_png)?;
 	frames.push(Frame { image, x: control.x, y: control.y, duration_ms: control.duration_ms, blend: control.blend, disposal: control.disposal });
 	compressed.clear();
 	Ok(())
@@ -244,6 +297,31 @@ mod tests {
 	use super::*;
 	use alloc::vec;
 
+	fn png_chunks(data: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
+		let mut chunks = Vec::new();
+		let mut cursor = 8usize;
+		while cursor < data.len() {
+			let length = read_u32(data, cursor).unwrap() as usize;
+			let kind = data[cursor + 4..cursor + 8].try_into().unwrap();
+			let start = cursor + 8;
+			chunks.push((kind, data[start..start + length].to_vec()));
+			cursor = start + length + 4;
+		}
+		chunks
+	}
+
+	fn control(sequence: u32, width: u32, height: u32) -> Vec<u8> {
+		let mut body = Vec::new();
+		body.extend_from_slice(&sequence.to_be_bytes());
+		body.extend_from_slice(&width.to_be_bytes());
+		body.extend_from_slice(&height.to_be_bytes());
+		body.extend_from_slice(&[0; 8]);
+		body.extend_from_slice(&1u16.to_be_bytes());
+		body.extend_from_slice(&1_000u16.to_be_bytes());
+		body.extend_from_slice(&[0, 0]);
+		body
+	}
+
 	#[test]
 	fn frame_rect_timing_blend_disposal_and_loop_round_trip() {
 		let first = pix::RgbaImage::new(2, 2, vec![1; 16]).unwrap();
@@ -259,6 +337,66 @@ mod tests {
 		)
 		.unwrap();
 		assert_eq!(decode(&encode(&animation, 100).unwrap()).unwrap(), animation);
+	}
+
+	#[test]
+	fn decodes_indexed_frame_split_across_multiple_idat_chunks() {
+		let image = pix::RgbaImage::new(2, 1, vec![255, 0, 0, 0, 0, 255, 0, 255]).unwrap();
+		let source = png::encode_indexed(&image, 0, 100).unwrap();
+		let expected = png::decode_rgba(&source).unwrap();
+		let chunks = png_chunks(&source);
+		let mut encoded = SIGNATURE.to_vec();
+		for kind in [b"IHDR", b"PLTE", b"tRNS"] {
+			if let Some((_, body)) = chunks.iter().find(|(candidate, _)| candidate == kind) {
+				chunk(&mut encoded, kind, body).unwrap();
+			}
+		}
+		let mut animation_header = Vec::new();
+		animation_header.extend_from_slice(&1u32.to_be_bytes());
+		animation_header.extend_from_slice(&0u32.to_be_bytes());
+		chunk(&mut encoded, b"acTL", &animation_header).unwrap();
+		chunk(&mut encoded, b"fcTL", &control(0, 2, 1)).unwrap();
+		let (_, payload) = chunks.iter().find(|(kind, _)| kind == b"IDAT").unwrap();
+		let split = payload.len() / 2;
+		chunk(&mut encoded, b"IDAT", &payload[..split]).unwrap();
+		let second_idat = encoded.len();
+		chunk(&mut encoded, b"IDAT", &payload[split..]).unwrap();
+		chunk(&mut encoded, b"IEND", &[]).unwrap();
+		let mut nonconsecutive = encoded.clone();
+		let mut ancillary = Vec::new();
+		chunk(&mut ancillary, b"tEXt", b"key\0value").unwrap();
+		nonconsecutive.splice(second_idat..second_idat, ancillary);
+		assert_eq!(decode(&nonconsecutive), Err(Error::Invalid));
+
+		let animation = decode(&encoded).unwrap();
+		assert_eq!(animation.frames.len(), 1);
+		assert_eq!(animation.frames[0].image, expected);
+	}
+
+	#[test]
+	fn decodes_animation_whose_static_image_is_not_a_frame() {
+		let static_image = pix::RgbaImage::new(1, 1, vec![1, 2, 3, 255]).unwrap();
+		let frame = pix::RgbaImage::new(1, 1, vec![4, 5, 6, 128]).unwrap();
+		let source = png::encode_rgba(&static_image, png::EncodeOptions::default()).unwrap();
+		let chunks = png_chunks(&source);
+		let mut encoded = SIGNATURE.to_vec();
+		let (_, header) = chunks.iter().find(|(kind, _)| kind == b"IHDR").unwrap();
+		chunk(&mut encoded, b"IHDR", header).unwrap();
+		let mut animation_header = Vec::new();
+		animation_header.extend_from_slice(&1u32.to_be_bytes());
+		animation_header.extend_from_slice(&0u32.to_be_bytes());
+		chunk(&mut encoded, b"acTL", &animation_header).unwrap();
+		let (_, default_payload) = chunks.iter().find(|(kind, _)| kind == b"IDAT").unwrap();
+		chunk(&mut encoded, b"IDAT", default_payload).unwrap();
+		chunk(&mut encoded, b"fcTL", &control(0, 1, 1)).unwrap();
+		let mut frame_data = 1u32.to_be_bytes().to_vec();
+		frame_data.extend_from_slice(&png::encode_rgba_payload(&frame, 50).unwrap());
+		chunk(&mut encoded, b"fdAT", &frame_data).unwrap();
+		chunk(&mut encoded, b"IEND", &[]).unwrap();
+
+		let animation = decode(&encoded).unwrap();
+		assert_eq!(animation.frames.len(), 1);
+		assert_eq!(animation.frames[0].image, frame);
 	}
 
 	#[test]

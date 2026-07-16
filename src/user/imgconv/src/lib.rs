@@ -374,7 +374,7 @@ fn decode_input(input: &[u8]) -> Result<(Format, Decoded), Error> {
 		(Format::Png, Decoded::Still(png::decode_rgba(input).map_err(map_png_error)?))
 	} else if input.starts_with(b"P3") || input.starts_with(b"P6") {
 		(Format::Ppm, Decoded::Still(ppm::decode(input).map_err(map_ppm_error)?))
-	} else if input.first() == Some(&0x0a) {
+	} else if looks_like_pcx(input) {
 		(Format::Pcx, Decoded::Still(pcx::decode(input).map_err(map_pcx_error)?))
 	} else if input.starts_with(b"qoif") {
 		(Format::Qoi, Decoded::Still(qoi::decode(input).map_err(map_qoi_error)?))
@@ -407,7 +407,34 @@ impl Decoded {
 }
 
 fn is_apng(input: &[u8]) -> bool {
-	input.starts_with(b"\x89PNG\r\n\x1a\n") && input.windows(4).any(|window| window == b"acTL")
+	if !input.starts_with(b"\x89PNG\r\n\x1a\n") {
+		return false;
+	}
+	let mut cursor = 8usize;
+	while let Some(header) = input.get(cursor..cursor + 8) {
+		let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+		let Some(end) = cursor.checked_add(12).and_then(|end| end.checked_add(length)) else {
+			return false;
+		};
+		if end > input.len() {
+			return false;
+		}
+		match &header[4..8] {
+			b"acTL" => return true,
+			b"IDAT" | b"IEND" => return false,
+			_ => cursor = end,
+		}
+	}
+	false
+}
+
+fn looks_like_pcx(input: &[u8]) -> bool {
+	let Some(header) = input.get(..128) else {
+		return false;
+	};
+	let width = u16::from_le_bytes([header[8], header[9]]).checked_sub(u16::from_le_bytes([header[4], header[5]]));
+	let height = u16::from_le_bytes([header[10], header[11]]).checked_sub(u16::from_le_bytes([header[6], header[7]]));
+	header[0] == 0x0a && header[2] == 1 && header[3] == 8 && width.is_some() && height.is_some() && matches!(header[65], 1 | 3) && u16::from_le_bytes([header[66], header[67]]) > width.unwrap_or(0)
 }
 
 fn composite_frame(animation: &pix::Animation, target: usize) -> Result<pix::RgbaImage, Error> {
@@ -430,7 +457,7 @@ fn format_from_path(path: &str) -> Option<Format> {
 }
 
 fn looks_like_tga(input: &[u8]) -> bool {
-	input.len() >= 18 && input[1] == 0 && matches!(input[2], 2 | 10) && matches!(input[16], 24 | 32)
+	input.len() >= 18 && input[1] == 0 && matches!(input[2], 2 | 10) && u16::from_le_bytes([input[12], input[13]]) != 0 && u16::from_le_bytes([input[14], input[15]]) != 0 && matches!(input[16], 24 | 32) && input[17] & 0xc0 == 0 && 18usize.checked_add(input[0] as usize).is_some_and(|start| start <= input.len())
 }
 
 fn parse_size(value: &[u8]) -> Result<(u32, u32), Error> {
@@ -655,6 +682,19 @@ mod tests {
 		let bmp_config = parse_args(b"in.png out.bmp").unwrap();
 		let (encoded, _) = convert(include_bytes!("../../../volume/sample.png"), &bmp_config).unwrap();
 		assert_eq!(bmp::decode_rgba(&encoded).unwrap().pixels.len(), 16);
+	}
+
+	#[test]
+	fn structurally_distinguishes_static_png_payload_and_tga_id_from_apng_and_pcx() {
+		let pixel = pix::RgbaImage::new(1, 1, alloc::vec![b'a', b'c', b'T', b'L']).unwrap();
+		let png = png::encode_rgba(&pixel, png::EncodeOptions { compression: 0 }).unwrap();
+		assert!(png.windows(4).any(|window| window == b"acTL"));
+		assert_eq!(decode_frame(&png, 0).unwrap(), (Format::Png, pixel.clone()));
+
+		let mut tga = tga::encode(&pixel, tga::EncodeOptions { rle: false }).unwrap();
+		tga[0] = 10;
+		tga.splice(18..18, *b"0123456789");
+		assert_eq!(decode_frame(&tga, 0).unwrap(), (Format::Tga, pixel));
 	}
 
 	#[test]

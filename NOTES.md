@@ -1,12 +1,17 @@
 # Bugs / changes
 
+- voribis - LICENSE file
+- check if we have our implementations only (not licensed !!!)
+- make boot faster (multicore + other optimizations)
+- why tests are in lib.rs and not tests.rs??
 - add audio conversion tool
 - after all audio tests remove all audio test files except original .mp3
 - check where in directory structures are non-system-essential apps (like image viewer, audio player etc.) and move them somewhere else
-- audio player (different formats)
 - audio recorder (microphone)
 - audio device selector tool (both input and output, when system has multiple sound devices)
+- kernel/tests.rs - too big - atomize
 - create image conversion tool
+- opengl / vulkan + renter tests
 - web camera viewer / recorder
 - tests are taking too long after every small task - optimization needed
 - Can it run Doom?
