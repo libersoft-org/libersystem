@@ -119,12 +119,17 @@ backed by PNG or the selected 32bpp DIB profile, and selects the largest support
 image. For 32bpp DIB entries, the XOR bitmap's BGRA alpha is authoritative for every
 pixel: the legacy 1-bit AND mask is ignored even when all XOR alpha bytes are zero,
 and may be absent. This matches ImageMagick 7.1.1-43 and the deployed image-rs/Pillow/
-Wine convention. Synthetic conflict, all-zero-alpha and maskless fixtures pin the
-same RGBA results. Lower-depth DIB entries that require the AND mask, CUR hotspots and
-cursor output are intentional **Subsets**. Output uses PNG-backed entries. Directory
-zero-as-256 dimensions, doubled DIB height and payload range validation are covered;
-zero-sized or overlapping entries are invalid. Status: **Verified profile** for PNG
-and 32bpp DIB icon entries.
+Wine convention. The independent ImageMagick corpus covers PNG-backed, ordinary 32bpp
+DIB and all-zero XOR-alpha DIB entries. ImageMagick and icoutils 0.32.3 produce exact
+RGBA for every standard fixture; a maskless derivative preserves the XOR bytes and is
+accepted by ImageMagick while strict icoutils rejects its missing AND bitmap. Complete
+decoded buffers are pinned by FNV-1a. The reciprocal `just ico-conformance` gate
+requires exact ImageMagick/icoutils pixels for LiberSystem PNG-backed 32/256 output.
+Lower-depth DIB entries that require the AND mask, CUR hotspots and cursor output are
+intentional **Subsets**. Directory zero-as-256 dimensions, doubled DIB height and
+payload range validation are covered; zero-sized or overlapping entries are invalid.
+Status: **Verified profile** for PNG and standard 32bpp DIB icon entries; maskless
+32bpp DIB remains a documented deployed-convention subset.
 
 ### ICNS
 

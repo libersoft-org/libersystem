@@ -41,6 +41,9 @@ APT_PACKAGES=(
 	mtools            # mformat/mcopy: populate the FAT boot partition without root
 	netpbm            # pnmtopng/pnmtojpeg: convert QEMU framebuffer screendumps
 	imagemagick       # convert: framebuffer screenshots to png/jpg/webp/...
+	icoutils          # icotool: independent ICO conformance extraction
+	icnsutils         # png2icns/icns2png: independent ICNS conformance
+	libicns-dev       # libicns: legacy 128px ICNS fixture generation from Rust
 	socat             # drive the QEMU monitor unix socket for screenshots
 	qemu-system-x86   # qemu-system-x86_64 (the native x86_64 build)
 	qemu-system-arm   # qemu-system-aarch64 (the ARM64 build, emulated on an x86 host)

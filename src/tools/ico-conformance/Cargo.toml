@@ -1,0 +1,8 @@
+[package]
+name = "ico-conformance"
+edition = "2024"
+description = "Host interoperability gate for LiberSystem ICO output"
+
+[dependencies]
+ico = { path = "../../user/ico" }
+pix = { path = "../../user/pix" }

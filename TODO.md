@@ -3182,6 +3182,18 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     then compares independent 48/legacy-128 decoding in both implementations.
     ICNS is 4/4; an Apple-generated provenance fixture and the rest of the format
     matrix keep this item open.
+  - Partial result (2026-07-17): ICO now has external ImageMagick 7.1.1-43
+    fixtures for PNG-backed 256px and 32bpp DIB/BGRA entries with ordinary alpha,
+    all-zero XOR alpha and a maskless derivative. ImageMagick and icoutils 0.32.3
+    produce byte-identical RGBA for the standard fixtures, including authoritative
+    all-zero XOR alpha; ImageMagick accepts the maskless deployed convention while
+    strict icoutils rejects its missing AND bitmap, so that profile remains explicitly
+    classified as a convention subset. Leaf tests pin payload type, geometry, alpha,
+    whole-buffer FNV-1a and artifact SHA-256 under `user/ico/tests/data`. The reciprocal
+    host-only `just ico-conformance` gate requires exact ImageMagick/icoutils pixels for
+    LiberSystem PNG-backed 32/256 output and independently checks every external input.
+    ICO is 4/4; lower-depth DIB/AND and CUR remain typed subsets while the rest of the
+    matrix stays open.
   - Partial result (2026-07-17): PCX now has external ImageMagick 7.1.1-43 fixtures
     for version-5 indexed one-plane RLE with trailing palette and RGB three-plane RLE.
     Their odd 17/19-byte declared row strides exercise interoperability beyond our

@@ -145,6 +145,10 @@ mod tests {
 	use super::*;
 	use alloc::vec;
 
+	fn fnv1a(bytes: &[u8]) -> u64 {
+		bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3))
+	}
+
 	fn dib_icon(xor: &[u8], mask: &[u8]) -> Vec<u8> {
 		let payload_len = 40 + xor.len() + mask.len();
 		let mut icon = vec![0; 22 + payload_len];
@@ -198,5 +202,31 @@ mod tests {
 		let mut empty = overlap;
 		empty[14..18].fill(0);
 		assert_eq!(decode(&empty), Err(Error::Invalid));
+	}
+
+	#[test]
+	fn decodes_external_imagemagick_png_and_dib_profiles() {
+		let png = include_bytes!("../tests/data/external-png.ico");
+		let offset = u32::from_le_bytes(png[18..22].try_into().unwrap()) as usize;
+		assert_eq!(&png[offset..offset + 8], b"\x89PNG\r\n\x1a\n");
+		let image = decode(png).unwrap();
+		assert_eq!((image.width, image.height, fnv1a(&image.pixels)), (256, 256, 0x58a2_1c35_7737_84bc));
+
+		for (data, expected_hash) in [
+			(include_bytes!("../tests/data/external-dib-alpha.ico").as_slice(), 0x2cae_8d72_a65b_cac1),
+			(include_bytes!("../tests/data/external-dib-maskless.ico").as_slice(), 0x2cae_8d72_a65b_cac1),
+			(include_bytes!("../tests/data/external-dib-zero-alpha.ico").as_slice(), 0x8fa6_b411_bfca_0325),
+		] {
+			let offset = u32::from_le_bytes(data[18..22].try_into().unwrap()) as usize;
+			assert_eq!(&data[offset..offset + 4], &40u32.to_le_bytes());
+			let image = decode(data).unwrap();
+			assert_eq!((image.width, image.height, fnv1a(&image.pixels)), (32, 32, expected_hash));
+		}
+
+		let zero = include_bytes!("../tests/data/external-dib-zero-alpha.ico");
+		let offset = u32::from_le_bytes(zero[18..22].try_into().unwrap()) as usize;
+		assert!(zero[offset + 43..offset + 40 + 32 * 32 * 4].iter().step_by(4).all(|alpha| *alpha == 0));
+		let maskless = include_bytes!("../tests/data/external-dib-maskless.ico");
+		assert_eq!(u32::from_le_bytes(maskless[14..18].try_into().unwrap()) as usize, 40 + 32 * 32 * 4);
 	}
 }
