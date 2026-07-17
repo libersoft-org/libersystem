@@ -6,3 +6,4 @@ interface process
 method process.start op=1 (name:string:rights=) -> result<process-info, liber:base@1::error>
 method process.list op=2 () -> result<list<process-info>, liber:base@1::error>
 method process.launch op=3 (name:string:rights=,bootstrap:handle<channel>:rights=) -> result<start-result, liber:base@1::error>
+method process.launch-bounded op=4 (name:string:rights=,memory-limit:u64:rights=,bootstrap:handle<channel>:rights=) -> result<start-result, liber:base@1::error>

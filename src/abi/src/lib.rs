@@ -370,6 +370,7 @@ pub const PROC_STATE_FAILED: u64 = 2;
 #[derive(Clone, Copy, Default)]
 pub struct DomainStats {
 	pub memory_used: u64,
+	pub memory_peak: u64,
 	pub memory_limit: u64,
 	pub handles_used: u64,
 	pub handles_limit: u64,

@@ -1580,10 +1580,14 @@ fn sys_domain_stats_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	let account = domain.account();
-	let out = DomainStats { memory_used: account.memory().used(), memory_limit: account.memory().limit(), handles_used: account.handles().used(), handles_limit: account.handles().limit(), threads_used: account.threads().used(), threads_limit: account.threads().limit(), ipc_used: account.ipc_queue().used(), ipc_limit: account.ipc_queue().limit(), dma_used: account.dma().used(), dma_limit: account.dma().limit(), stack_used: account.stack().used(), stack_limit: account.stack().limit() };
+	let out = domain_stats_snapshot(&domain);
 	write_user(buf_ptr, out);
 	1
+}
+
+pub(crate) fn domain_stats_snapshot(domain: &Domain) -> DomainStats {
+	let account = domain.account();
+	DomainStats { memory_used: account.memory().used(), memory_peak: account.memory().peak(), memory_limit: account.memory().limit(), handles_used: account.handles().used(), handles_limit: account.handles().limit(), threads_used: account.threads().used(), threads_limit: account.threads().limit(), ipc_used: account.ipc_queue().used(), ipc_limit: account.ipc_queue().limit(), dma_used: account.dma().used(), dma_limit: account.dma().limit(), stack_used: account.stack().used(), stack_limit: account.stack().limit() }
 }
 
 // Kill the Domain named by `handle` and its whole subtree: every descendant

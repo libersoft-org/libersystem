@@ -30,10 +30,14 @@ record start-result {
 /// so far, and `launch` is the full launcher primitive - it loads and starts a program
 /// with a caller-provided bootstrap channel (so a policy front end like PermissionManager
 /// can grant the new process its capabilities over that channel) and returns the live
-/// process handle for job control. The service holds no service clients and decides no
-/// grants - it is mechanism only.
+/// process handle for job control. `launch-bounded` is the same mechanism under a reusable
+/// child Domain keyed by the caller's memory limit; concurrent processes with the same
+/// limit share that aggregate budget. The policy front end chooses the limit, while
+/// ProcessService remains responsible only for loading. The service holds no grantable
+/// clients and decides no capability grants.
 interface process {
 	@op(1) start:  func(name: string) -> result<process-info, error>;
 	@op(2) list:   func() -> result<list<process-info>, error>;
 	@op(3) launch: func(name: string, bootstrap: handle<channel>) -> result<start-result, error>;
+	@op(4) launch-bounded: func(name: string, memory-limit: u64, bootstrap: handle<channel>) -> result<start-result, error>;
 }

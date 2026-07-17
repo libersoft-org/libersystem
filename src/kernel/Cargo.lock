@@ -77,6 +77,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "gif"
+version = "0.0.0"
+dependencies = [
+ "pix",
+ "quantize",
+ "weezl",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -98,6 +107,7 @@ dependencies = [
  "abi",
  "bmp",
  "bootproto",
+ "gif",
  "png",
  "term",
  "webp",
@@ -160,3 +170,9 @@ dependencies = [
  "no_std_io",
  "pix",
 ]
+
+[[package]]
+name = "weezl"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4ca08e5ef825b65b056d9efbd95c8750683f0a6d0466d02e96dc2e4e360f3d2"

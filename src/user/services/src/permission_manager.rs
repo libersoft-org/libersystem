@@ -75,6 +75,9 @@ const GRANT_RIGHTS: u32 = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSF
 // stdout console (so its `print` output renders on the launching terminal) under this tag,
 // then its argument string.
 const STDOUT_TAG: &[u8] = b"STDOUT";
+// The measured 4K imgconv whole-Domain peak is 84,475,904 bytes. Keep bounded headroom
+// for allocator granularity and profile variation without leaving the tool unlimited.
+const IMGCONV_MEMORY_LIMIT: u64 = 96 * 1024 * 1024;
 
 // A runtime permission request rides a launched component's bootstrap channel as this tag
 // followed by the requested capability's ordinal byte; the manager replies with the granted
@@ -514,7 +517,7 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 		let name_str: &str = core::str::from_utf8(name).ok()?;
 		let (manager_side, child_side): (u64, u64) = channel()?;
 		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
-		let started: StartResult = match process_client.launch(name_str, &child_side) {
+		let started: StartResult = match if name == b"imgconv" { process_client.launch_bounded(name_str, &IMGCONV_MEMORY_LIMIT, &child_side) } else { process_client.launch(name_str, &child_side) } {
 			Some(Ok(s)) => s,
 			_ => {
 				close(manager_side);

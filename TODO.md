@@ -3310,7 +3310,7 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     and 2,304 seeded SplitMix64 multi-bit mutations then run through both paths. The
     finite corpus covers dimensions, offsets, lengths, palettes/tables, CRCs, compressed
     streams and animation controls without introducing third-party code into the target.
-- [ ] Measure and bound the real governed `imgconv.lsexe` working set, not only the
+- [x] Measure and bound the real governed `imgconv.lsexe` working set, not only the
   incremental codec heap. Account together for the mapped source, the userspace input
   copy, decoded RGBA/animation model, encoder workspace, encoded `Vec`, staging
   MemoryObject, ELF/shared pages and stack. Add representative 1920x1080 and 4K
@@ -3319,6 +3319,18 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   preservation when the limit is exceeded. Use the measurement to remove avoidable
   copies, lower the 16,777,216-pixel / 67,108,864-animation-pixel limits, or set a tool
   quota rather than assuming the current unlimited launch Domain is acceptable.
+  - Completed (2026-07-17): `DomainStats` now exports the kernel's monotonic memory
+    high-water counter and the dedicated `just test-tags image` QEMU gate runs the real
+    dynamically linked `imgconv.lsexe` with real StorageService clients in isolated child
+    Domains. BMP-to-PNG resize peaks at 21,995,520 bytes for 1920x1080 and 84,475,904
+    bytes for 3840x2160; a two-frame 23x15 WebP-to-GIF conversion peaks at 2,105,344
+    bytes. PermissionManager consequently launches `imgconv` through the additive typed
+    `process.launch-bounded` operation with a reusable 96 MiB aggregate memory budget,
+    while other tools keep the original launch path. Repeated launches reuse one child
+    Domain instead of accumulating empty accounting nodes, and concurrent imgconv processes
+    share the cap. A deliberate 80 MiB 4K run is refused at the allocator's
+    backing-object boundary, prints `imgconv: out of memory`, exits cleanly, never exceeds
+    its Domain limit and preserves the pre-existing destination byte-for-byte.
 - [ ] Close the user-facing viewer/converter contract. Generate `imgconv --help` from
   the same capability/default table used by parsing and tests, and give `imgview` a
   concise usage contract. State explicitly that version one renders the composited

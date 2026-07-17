@@ -18,7 +18,7 @@ extern crate alloc;
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 // Syscall numbers, error codes, and capability rights bits all come from the
 // shared abi crate (the single source of truth), re-exported so the programs that
@@ -90,6 +90,15 @@ pub static __rust_no_alloc_shim_is_unstable_v2: u8 = 0;
 #[cfg(feature = "shared-image")]
 #[unsafe(no_mangle)]
 pub extern "C" fn __rust_alloc_error_handler(_size: usize, _align: usize) -> ! {
+	alloc_failure()
+}
+
+fn alloc_failure() -> ! {
+	let pointer = ALLOC_ERROR_MESSAGE.load(Ordering::Relaxed);
+	let length = ALLOC_ERROR_MESSAGE_LEN.load(Ordering::Relaxed);
+	if !pointer.is_null() && length != 0 {
+		unsafe { print(core::slice::from_raw_parts(pointer, length)) };
+	}
 	exit()
 }
 
@@ -304,6 +313,14 @@ pub fn set_stdout(channel: u64) {
 // launcher duplicates it to hand its children the same console.
 pub fn stdout() -> u64 {
 	STDOUT.load(Ordering::Relaxed)
+}
+
+static ALLOC_ERROR_MESSAGE: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static ALLOC_ERROR_MESSAGE_LEN: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_alloc_error_message(message: &'static [u8]) {
+	ALLOC_ERROR_MESSAGE.store(message.as_ptr().cast_mut(), Ordering::Relaxed);
+	ALLOC_ERROR_MESSAGE_LEN.store(message.len(), Ordering::Relaxed);
 }
 
 // The console channel a program reads its input (stdin) from, or 0 for none. A
@@ -1687,8 +1704,8 @@ pub unsafe fn domain_set_limit(domain: u64, prop: u64, limit: u64) -> i64 {
 	unsafe { syscall(SYS_OBJECT_PROPERTY_SET, domain, prop, limit, 0) as i64 }
 }
 
-// Read the live per-Domain resource counters behind a Domain `handle` (the used and
-// limit of memory, handles, threads, IPC queue bytes and DMA). The handle must carry
+// Read the live per-Domain resource counters behind a Domain `handle` (the used,
+// high-water and limit of memory plus the other resource counters). The handle must carry
 // RIGHT_READ. Returns None if the handle is unknown or not a Domain; a ResourceManager
 // uses this to observe a governed Domain's usage against the budgets it set.
 pub unsafe fn domain_stats(handle: u64) -> Option<DomainStats> {

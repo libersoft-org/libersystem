@@ -26,6 +26,7 @@ abi = { path = "../abi" }
 
 [dev-dependencies]
 bmp = { path = "../user/bmp" }
+gif = { path = "../user/gif" }
 png = { path = "../user/png" }
 webp = { path = "../user/webp" }
 

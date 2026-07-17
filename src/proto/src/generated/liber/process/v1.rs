@@ -89,8 +89,11 @@ impl StartResult {
 /// so far, and `launch` is the full launcher primitive - it loads and starts a program
 /// with a caller-provided bootstrap channel (so a policy front end like PermissionManager
 /// can grant the new process its capabilities over that channel) and returns the live
-/// process handle for job control. The service holds no service clients and decides no
-/// grants - it is mechanism only.
+/// process handle for job control. `launch-bounded` is the same mechanism under a reusable
+/// child Domain keyed by the caller's memory limit; concurrent processes with the same
+/// limit share that aggregate budget. The policy front end chooses the limit, while
+/// ProcessService remains responsible only for loading. The service holds no grantable
+/// clients and decides no capability grants.
 // interface `process` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod process {
 	use super::*;
@@ -100,11 +103,13 @@ pub mod process {
 	pub const OP_START: u16 = 1;
 	pub const OP_LIST: u16 = 2;
 	pub const OP_LAUNCH: u16 = 3;
+	pub const OP_LAUNCH_BOUNDED: u16 = 4;
 
 	pub trait Service {
 		fn start(&mut self, name: String) -> Result<ProcessInfo, Error>;
 		fn list(&mut self) -> Result<Vec<ProcessInfo>, Error>;
 		fn launch(&mut self, name: String, bootstrap: u64) -> Result<StartResult, Error>;
+		fn launch_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -231,6 +236,47 @@ pub mod process {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_LAUNCH_BOUNDED => {
+				let name = r.string_lp()?;
+				let memory_limit = r.u64()?;
+				let bootstrap = {
+					let _ = r.u32()?;
+					r.take_handle()?
+				};
+				if r.has_handle() {
+					return None;
+				}
+				*request_handle = 0;
+				let result = service.launch_bounded(name, memory_limit, bootstrap);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v7) => {
+							w.u8(1)?;
+							v7.write(w)?;
+						}
+						Err(v8) => {
+							w.u8(0)?;
+							v8.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						*reply_handle = writer.handle();
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		*reply_handle = writer.handle();
@@ -297,12 +343,12 @@ pub mod process {
 				}
 				Some(if r.u8()? != 0 {
 					Ok({
-						let v7 = r.u16()? as usize;
-						let mut v8 = Vec::new();
-						for _ in 0..v7 {
-							v8.push(ProcessInfo::read(r)?);
+						let v9 = r.u16()? as usize;
+						let mut v10 = Vec::new();
+						for _ in 0..v9 {
+							v10.push(ProcessInfo::read(r)?);
 						}
-						v8
+						v10
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -323,6 +369,35 @@ pub mod process {
 			w.u16(OP_LAUNCH)?;
 			w.u32(corr)?;
 			w.bytes_lp(name.as_bytes())?;
+			w.set_handle(*bootstrap)?;
+			w.u32(0)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				Some(if r.u8()? != 0 { Ok(StartResult::read(r)?) } else { Err(Error::read(r)?) })
+			})();
+			if decoded.is_none() || reader.has_handle() {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			decoded
+		}
+		pub fn launch_bounded(&mut self, name: &str, memory_limit: &u64, bootstrap: &u64) -> Option<Result<StartResult, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LAUNCH_BOUNDED)?;
+			w.u32(corr)?;
+			w.bytes_lp(name.as_bytes())?;
+			w.u64(*memory_limit)?;
 			w.set_handle(*bootstrap)?;
 			w.u32(0)?;
 			let request_handle = writer.handle();

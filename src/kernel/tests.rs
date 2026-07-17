@@ -544,29 +544,42 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	// The destination already exists and --force is absent, so this proves its
 	// volumes-only grant and conflict policy without attempting a mutation here;
 	// the separate writable-block test proves the conversion/write path.
-	let (convert_output, convert_stdout) = Channel::create();
-	let mut convert_run = alloc::vec::Vec::new();
-	convert_run.extend_from_slice(&3u16.to_le_bytes());
-	convert_run.extend_from_slice(&20u32.to_le_bytes());
-	for value in [&b"imgconv"[..], &b"vol://system/sample.bmp vol://system/sample.png"[..], &b"vol://system"[..]] {
-		convert_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
-		convert_run.extend_from_slice(value);
+	let launch_imgconv_conflict = |correlation: u32| -> Result<(), &'static str> {
+		let (convert_output, convert_stdout) = Channel::create();
+		let mut convert_run = alloc::vec::Vec::new();
+		convert_run.extend_from_slice(&3u16.to_le_bytes());
+		convert_run.extend_from_slice(&correlation.to_le_bytes());
+		for value in [&b"imgconv"[..], &b"vol://system/sample.bmp vol://system/sample.png"[..], &b"vol://system"[..]] {
+			convert_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
+			convert_run.extend_from_slice(value);
+		}
+		convert_run.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&perm_client, &convert_run, convert_stdout, Rights::ALL)?;
+		sched::run_until_idle();
+		let convert_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer imgconv run")?;
+		if convert_reply.bytes.len() < 5 || convert_reply.bytes[4] == 0 {
+			return Err("PermissionManager refused imgconv");
+		}
+		let convert_process = convert_reply.caps.first().ok_or("imgconv run returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "imgconv run handle was not a Process")?;
+		let conflict = convert_output.recv().map_err(|_| "imgconv printed no conflict")?;
+		if conflict.bytes != b"imgconv: destination exists (use --force)\n" {
+			return Err("imgconv conflict result was invalid");
+		}
+		sched::run_until_idle();
+		if !convert_process.is_terminated() {
+			return Err("imgconv did not exit after destination conflict");
+		}
+		Ok(())
+	};
+	let bounded_before = sched::root_domain().child_domains().len();
+	launch_imgconv_conflict(20)?;
+	let bounded_after_first = sched::root_domain().child_domains().len();
+	if bounded_after_first != bounded_before + 1 {
+		return Err("first bounded imgconv launch did not create exactly one budget Domain");
 	}
-	convert_run.extend_from_slice(&0u32.to_le_bytes());
-	send_cap(&perm_client, &convert_run, convert_stdout, Rights::ALL)?;
-	sched::run_until_idle();
-	let convert_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer imgconv run")?;
-	if convert_reply.bytes.len() < 5 || convert_reply.bytes[4] == 0 {
-		return Err("PermissionManager refused imgconv");
-	}
-	let convert_process = convert_reply.caps.first().ok_or("imgconv run returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "imgconv run handle was not a Process")?;
-	let conflict = convert_output.recv().map_err(|_| "imgconv printed no conflict")?;
-	if conflict.bytes != b"imgconv: destination exists (use --force)\n" {
-		return Err("imgconv conflict result was invalid");
-	}
-	sched::run_until_idle();
-	if !convert_process.is_terminated() {
-		return Err("imgconv did not exit after destination conflict");
+	launch_imgconv_conflict(21)?;
+	if sched::root_domain().child_domains().len() != bounded_after_first {
+		return Err("repeated bounded imgconv launch leaked another budget Domain");
 	}
 
 	// Launch the governed WAV player with a fresh playback-only AudioService scope.
@@ -1163,6 +1176,7 @@ define_test_tags! {
 	Display => "display",
 	Drivers => "drivers",
 	Filesystem => "filesystem",
+	Image => "image",
 	Input => "input",
 	Ipc => "ipc",
 	Kernel => "kernel",
@@ -5640,12 +5654,12 @@ fn storage_harness_mounts_seeded_fat16() {
 	assert_eq!(storage.open(b"vol://media/HELLO.TXT", 0xfa16), Some(b"hello".to_vec()));
 }
 
-fn run_imgconv_harness(imgconv_elf: &[u8], args: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) -> alloc::vec::Vec<u8> {
+fn run_imgconv_harness_result(domain: alloc::sync::Arc<object::domain::Domain>, imgconv_elf: &[u8], args: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) -> (Option<alloc::vec::Vec<u8>>, u64) {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 	let (bootstrap, child) = Channel::create();
 	let (stdout, child_stdout) = Channel::create();
-	let process = loader::spawn_elf_process(sched::root_domain(), imgconv_elf, child, Rights::ALL, 0).expect("spawn imgconv harness");
+	let process = loader::spawn_elf_process(domain.clone(), imgconv_elf, child, Rights::ALL, 0).expect("spawn imgconv harness");
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgconv stdout");
 	bootstrap.send(Message::new(args.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgconv system volume");
@@ -5668,7 +5682,16 @@ fn run_imgconv_harness(imgconv_elf: &[u8], args: &[u8], system: &mut StorageHarn
 		}
 	}
 	assert!(process.is_terminated(), "imgconv harness exits");
-	line.expect("imgconv harness prints a result")
+	(line, domain.account().memory().peak())
+}
+
+fn run_imgconv_harness_in(domain: alloc::sync::Arc<object::domain::Domain>, imgconv_elf: &[u8], args: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) -> (alloc::vec::Vec<u8>, u64) {
+	let (line, peak) = run_imgconv_harness_result(domain, imgconv_elf, args, system, media);
+	(line.expect("imgconv harness prints a result"), peak)
+}
+
+fn run_imgconv_harness(imgconv_elf: &[u8], args: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) -> alloc::vec::Vec<u8> {
+	run_imgconv_harness_in(sched::root_domain(), imgconv_elf, args, system, media).0
 }
 
 fn run_imgview_harness(imgview_elf: &[u8], path: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) {
@@ -5811,6 +5834,59 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	let failure = run_imgconv_harness(imgconv_elf, b"--force --resize 64x64 vol://system/sample.bmp vol://media/KEEP.BMP", &mut system, &mut full_media);
 	assert_eq!(failure, b"imgconv: cannot write output\n");
 	assert_eq!(full_media.open(b"vol://media/KEEP.BMP", 0xfa11), Some(previous.to_vec()), "failed overwrite preserves the previous destination byte-for-byte");
+}
+
+tagged_test!(imgconv_governed_working_set_is_measured, [Image, Memory, Process, Service, Storage]);
+fn imgconv_governed_working_set_is_measured() {
+	use object::domain::{Domain, UNLIMITED};
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	const IMGCONV_MEMORY_LIMIT: u64 = 96 * 1024 * 1024;
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let imgconv_elf = program_elf(&package, volume, b"imgconv").expect("imgconv tool");
+	let mut system = StorageHarness::start(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+
+	let media_image = fat16_image(&[], false);
+	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
+	let full_hd_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED);
+	let (full_hd, full_hd_peak) = run_imgconv_harness_in(full_hd_domain, imgconv_elf, b"--resize 1920x1080 --compression 100 vol://system/sample.bmp vol://media/FHD.PNG", &mut system, &mut media);
+	assert!(full_hd.starts_with(b"imgconv: BMP 2x2 -> PNG 1920x1080 compression=100 bytes="));
+	let full_hd_output = media.open(b"vol://media/FHD.PNG", 0xf1080).expect("1080p output opens");
+	let full_hd_image = png::decode_rgba(&full_hd_output).expect("1080p output decodes");
+	assert_eq!((full_hd_image.width, full_hd_image.height), (1920, 1080));
+
+	let media_image = fat16_image(&[], false);
+	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
+	let ultra_hd_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED);
+	let (ultra_hd, ultra_hd_peak) = run_imgconv_harness_in(ultra_hd_domain, imgconv_elf, b"--resize 3840x2160 --compression 100 vol://system/sample.bmp vol://media/UHD.PNG", &mut system, &mut media);
+	assert!(ultra_hd.starts_with(b"imgconv: BMP 2x2 -> PNG 3840x2160 compression=100 bytes="));
+	let ultra_hd_output = media.open(b"vol://media/UHD.PNG", 0xf2160).expect("4K output opens");
+	let ultra_hd_image = png::decode_rgba(&ultra_hd_output).expect("4K output decodes");
+	assert_eq!((ultra_hd_image.width, ultra_hd_image.height), (3840, 2160));
+
+	let animation = include_bytes!("../user/webp/tests/data/external-animation.webp");
+	let media_image = fat16_image(&[(*b"ANIM    WEB", animation)], false);
+	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
+	let animation_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED);
+	let (animation_line, animation_peak) = run_imgconv_harness_in(animation_domain, imgconv_elf, b"vol://media/ANIM.WEB vol://media/ANIM.GIF", &mut system, &mut media);
+	assert!(animation_line.starts_with(b"imgconv: WebP 23x15 -> GIF 23x15 quality=100 bytes="));
+	let animation_output = media.open(b"vol://media/ANIM.GIF", 0xa11).expect("animation output opens");
+	let converted_animation = gif::decode(&animation_output).expect("animation output decodes");
+	assert_eq!((converted_animation.width, converted_animation.height, converted_animation.frames.len()), (23, 15, 2));
+	assert!(full_hd_peak > 1920 * 1080 * 4, "1080p peak includes more than the final RGBA buffer");
+	assert!(ultra_hd_peak > 3840 * 2160 * 4, "4K peak includes more than the final RGBA buffer");
+	assert!(ultra_hd_peak > full_hd_peak, "4K conversion has a larger whole-process peak");
+	assert!(ultra_hd_peak < IMGCONV_MEMORY_LIMIT, "measured 4K conversion fits the production quota");
+
+	let previous = b"preserved after quota failure";
+	let media_image = fat16_image(&[(*b"KEEP    PNG", previous)], false);
+	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
+	let limited_domain = Domain::new_child(&sched::root_domain(), 80 * 1024 * 1024, UNLIMITED, UNLIMITED);
+	let (failure, limited_peak) = run_imgconv_harness_result(limited_domain, imgconv_elf, b"--force --resize 3840x2160 --compression 100 vol://system/sample.bmp vol://media/KEEP.PNG", &mut system, &mut media);
+	assert_eq!(failure, Some(b"imgconv: out of memory\n".to_vec()), "quota failure reports a typed diagnostic");
+	assert_eq!(media.open(b"vol://media/KEEP.PNG", 0xfa17), Some(previous.to_vec()), "quota failure preserves the previous destination byte-for-byte");
+	assert!(limited_peak <= 80 * 1024 * 1024, "quota failure never exceeds its Domain limit");
+	serial_println!("imgconv governed memory: 1920x1080={} bytes, 3840x2160={} bytes, animation={} bytes", full_hd_peak, ultra_hd_peak, animation_peak);
 }
 
 tagged_test!(system_volume_lands_in_a_gpt_partition, [Service, Storage, Filesystem, Slow]);
@@ -7081,6 +7157,9 @@ fn domain_hierarchy_limits_aggregate() {
 	child.uncharge_memory(8192);
 	assert_eq!(parent.account().memory().used(), 0, "uncharge propagates to the parent");
 	assert_eq!(parent.account().memory().peak(), 8192, "the high-water mark survives refunds");
+	let stats = syscall::domain_stats_snapshot(&parent);
+	assert_eq!(stats.memory_used, 0, "Domain stats reports the refunded live usage");
+	assert_eq!(stats.memory_peak, 8192, "Domain stats preserves the observed memory high-water mark");
 	// Part two checks the same limit through the create syscall: a process in the
 	// unbounded child is refused the third page because the parent caps memory at
 	// two. It records the third result and exits; teardown refunds the rest.

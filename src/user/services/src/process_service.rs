@@ -7,10 +7,10 @@
 // wired) and a "SERVE" channel its clients reach it on. Over that channel clients speak
 // the generated `liber:system` Process bindings: they START a named program unattended,
 // LAUNCH one with a caller-provided bootstrap channel (so a policy front end like
-// PermissionManager can grant the new process its capabilities over that channel) and
-// receive back the live process handle for job control, and LIST the processes started
-// so far as typed `process-info` records (koid + name) that render as CLI / JSON on the
-// client.
+// PermissionManager can grant the new process its capabilities over that channel), LAUNCH
+// BOUNDED with the same bootstrap under a reusable aggregate memory-limited child Domain,
+// receive back the live process handle for job control, and LIST the processes started so
+// far as typed `process-info` records (koid + name) that render as CLI / JSON on the client.
 //
 // The storage client is the loading mechanism only - reading its own binaries off the
 // system volume; the service holds no grantable service clients and decides no grants,
@@ -167,32 +167,46 @@ struct Processes<'a> {
 	package: Package<'a>,
 	storage: u64,
 	started: Vec<ProcessInfo>,
+	bounded_domains: Vec<(u64, u64)>,
 }
 
 impl<'a> Processes<'a> {
+	unsafe fn bounded_domain(&mut self, memory_limit: u64) -> Result<u64, Error> {
+		if let Some((_, domain)) = self.bounded_domains.iter().find(|(limit, _)| *limit == memory_limit) {
+			return Ok(*domain);
+		}
+		let domain = unsafe { domain_create(memory_limit, u64::MAX, u64::MAX) };
+		if domain < 0 {
+			return Err(Error::Again);
+		}
+		let domain = domain as u64;
+		self.bounded_domains.push((memory_limit, domain));
+		Ok(domain)
+	}
+
 	// Load program `name` and create a process from it, handing the child `bootstrap` as
 	// its bootstrap capability. With a storage client wired, the binary is read from the
 	// system volume's `bin/`; with none, it comes from the built-in package. Returns the
 	// new process handle plus its canonical physical basename, or None if the command
 	// is malformed, absent or cannot be spawned.
-	unsafe fn spawn_program(&self, name: &str, bootstrap: u64) -> Option<(i64, String)> {
+	unsafe fn spawn_program(&self, name: &str, bootstrap: u64, domain: u64) -> Option<(i64, String)> {
 		unsafe {
 			if let Some((path, basename)) = executable::explicit_path(name) {
 				if self.storage == 0 {
 					return None;
 				}
-				let handle = spawn_from_path(self.storage, path, bootstrap)?;
+				let handle = spawn_from_path(self.storage, path, bootstrap, domain)?;
 				return (handle >= 0).then(|| (handle, String::from(basename)));
 			}
 			for artifact in executable::launch_candidates(name)? {
 				let handle = if self.storage != 0 {
-					match spawn_from_path(self.storage, &alloc::format!("{PROGRAM_DIR}{artifact}"), bootstrap) {
+					match spawn_from_path(self.storage, &alloc::format!("{PROGRAM_DIR}{artifact}"), bootstrap, domain) {
 						Some(handle) => handle,
 						None => continue,
 					}
 				} else {
 					match self.package.lookup(artifact.as_bytes()) {
-						Some(elf) => spawn_program_bytes(self.storage, elf, bootstrap),
+						Some(elf) => spawn_program_bytes(self.storage, elf, bootstrap, domain),
 						None => continue,
 					}
 				};
@@ -207,18 +221,18 @@ impl<'a> Processes<'a> {
 // create a process from the mapped ELF image, then release the mapping. Returns the new
 // process handle. None means the named artifact was absent; a present but invalid
 // artifact returns a negative handle so resolution never falls through to another name.
-unsafe fn spawn_from_path(storage: u64, path: &str, bootstrap: u64) -> Option<i64> {
+unsafe fn spawn_from_path(storage: u64, path: &str, bootstrap: u64, domain: u64) -> Option<i64> {
 	unsafe {
 		let main = MappedFile::open(storage, String::from(path))?;
-		Some(spawn_program_bytes(storage, main.bytes(), bootstrap))
+		Some(spawn_program_bytes(storage, main.bytes(), bootstrap, domain))
 	}
 }
 
-unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], bootstrap: u64) -> i64 {
+unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], bootstrap: u64, domain: u64) -> i64 {
 	unsafe {
 		let Some(elf) = bootproto::elf::Elf::parse(bytes) else { return -1 };
 		let Some(dynamic) = elf.dynamic_info() else { return -1 };
-		let Some(dynamic) = dynamic else { return spawn(bytes, bootstrap) };
+		let Some(dynamic) = dynamic else { return spawn_in(bytes, bootstrap, domain) };
 		let Some(dependencies) = dependencies(&elf, &dynamic) else { return -1 };
 		if dependencies.is_empty() {
 			return spawn(bytes, bootstrap);
@@ -226,7 +240,7 @@ unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], bootstrap: u64) -> i64
 		if storage == 0 {
 			return -1;
 		}
-		let process = process_create(0);
+		let process = process_create(domain);
 		if process < 0 {
 			return process;
 		}
@@ -255,7 +269,7 @@ impl<'a> Service for Processes<'a> {
 	fn start(&mut self, name: String) -> Result<ProcessInfo, Error> {
 		// spawn with no bootstrap capability (phase 1: started processes run
 		// unattended), then read back the new process's koid and record it.
-		let (handle, artifact) = unsafe { self.spawn_program(&name, 0) }.ok_or(Error::NotFound)?;
+		let (handle, artifact) = unsafe { self.spawn_program(&name, 0, 0) }.ok_or(Error::NotFound)?;
 		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
 		unsafe { close(handle as u64) };
 		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
@@ -272,9 +286,18 @@ impl<'a> Service for Processes<'a> {
 		// the new process's bootstrap), then read back the new process's koid. The live
 		// process handle is handed back to the caller for job control - so unlike `start`
 		// we do not close it here; it is transferred out as the reply's handle.
-		let (handle, artifact) = unsafe { self.spawn_program(&name, bootstrap) }.ok_or(Error::NotFound)?;
+		let (handle, artifact) = unsafe { self.spawn_program(&name, bootstrap, 0) }.ok_or(Error::NotFound)?;
 		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
 		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
+		self.started.push(info.clone());
+		Ok(StartResult { task: handle as u64, info })
+	}
+
+	fn launch_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error> {
+		let domain = unsafe { self.bounded_domain(memory_limit)? };
+		let (handle, artifact) = unsafe { self.spawn_program(&name, bootstrap, domain) }.ok_or(Error::NotFound)?;
+		let koid = unsafe { object_info(handle as u64) }.map(|info| info.koid).ok_or(Error::Again)?;
+		let info = ProcessInfo { koid, name: artifact };
 		self.started.push(info.clone());
 		Ok(StartResult { task: handle as u64, info })
 	}
@@ -302,7 +325,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	// 5. serve generated start/list requests until the client side closes.
-	let mut procs: Processes = Processes { package, storage, started: Vec::new() };
+	let mut procs: Processes = Processes { package, storage, started: Vec::new(), bounded_domains: Vec::new() };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {

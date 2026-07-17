@@ -193,14 +193,14 @@ impl Drop for HeapGuard<'_> {
 
 unsafe impl GlobalAlloc for LockedHeap {
 	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-		unsafe {
+		let pointer = unsafe {
 			let mut heap = self.lock();
 			heap.ensure_init();
 			// A degenerate layout (align/size overflow) can never be satisfied: return
 			// null (the GlobalAlloc contract) rather than panicking the process.
 			let (size, align) = match Heap::size_align(layout) {
 				Some(sa) => sa,
-				None => return ptr::null_mut(),
+				None => crate::alloc_failure(),
 			};
 			let region = match heap.find_region(size, align) {
 				Some(found) => Some(found),
@@ -224,7 +224,11 @@ unsafe impl GlobalAlloc for LockedHeap {
 				}
 				None => ptr::null_mut(),
 			}
+		};
+		if pointer.is_null() {
+			crate::alloc_failure()
 		}
+		pointer
 	}
 
 	unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {

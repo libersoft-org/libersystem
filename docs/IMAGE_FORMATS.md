@@ -293,6 +293,22 @@ SplitMix64 multi-bit mutations per fixture may decode or return a typed error bu
 not panic or stall. This currently exercises 11,392 prefixes, 34,296 targeted mutations
 and 2,304 seeded mutations in an optimized host build.
 
+## Resource governance
+
+`just test-tags image` boots the real dynamically linked `imgconv.lsexe` with real
+StorageService clients under isolated child Domains. Its whole-Domain memory high-water
+marks are 21,995,520 bytes for a 1920x1080 BMP-to-PNG resize, 84,475,904 bytes for the
+same conversion at 3840x2160, and 2,105,344 bytes for a bounded two-frame WebP-to-GIF
+conversion. These figures include the executable and shared mappings, stack, input copy,
+decoded model, resize/encoder workspace, encoded vector and staged output object.
+
+PermissionManager launches `imgconv` through `process.launch-bounded` with a reusable
+96 MiB aggregate Domain memory limit. Repeated launches reuse one child Domain rather than
+leaving empty accounting nodes, and concurrent imgconv processes share the cap. A deliberate
+80 MiB 4K run must report `imgconv: out of memory`, exit without exceeding the limit and
+leave an existing destination byte-for-byte intact. The runtime emits this registered
+diagnostic directly at the failed heap-backing boundary, without requiring another allocation.
+
 ## Closure order
 
 1. Add independent corpora for the remaining verified/subset claims, prioritizing
