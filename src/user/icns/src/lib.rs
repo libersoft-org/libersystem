@@ -279,6 +279,10 @@ mod tests {
 	use super::*;
 	use alloc::vec;
 
+	fn fnv1a(bytes: &[u8]) -> u64 {
+		bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3))
+	}
+
 	fn solid(size: u32, color: [u8; 4]) -> pix::RgbaImage {
 		let mut pixels = Vec::new();
 		pixels.resize(size as usize * size as usize * 4, 0);
@@ -295,6 +299,14 @@ mod tests {
 		let encoded = encode(&[large.clone(), small.clone()], 100).unwrap();
 		assert_eq!(decode_all(&encoded).unwrap(), vec![small, large.clone()]);
 		assert_eq!(decode(&encoded).unwrap(), large);
+	}
+
+	#[test]
+	fn decodes_external_icnsutils_classic_and_modern_corpus() {
+		let decoded = decode_all(include_bytes!("../tests/data/external-gradient.icns")).unwrap();
+		assert_eq!(decoded.iter().map(|image| image.width).collect::<Vec<_>>(), vec![16, 32, 128]);
+		assert_eq!(decoded.iter().map(|image| fnv1a(&image.pixels)).collect::<Vec<_>>(), vec![0x40df_aed0_3a6f_7825, 0x1f5c_3caa_89bf_3ee5, 0xcec7_119d_af9c_2425]);
+		assert_eq!(fnv1a(&decode(include_bytes!("../tests/data/external-gradient.icns")).unwrap().pixels), 0xcec7_119d_af9c_2425);
 	}
 
 	#[test]

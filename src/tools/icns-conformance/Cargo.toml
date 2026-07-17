@@ -1,0 +1,8 @@
+[package]
+name = "icns-conformance"
+edition = "2024"
+description = "Host interoperability gate for LiberSystem ICNS output"
+
+[dependencies]
+icns = { path = "../../user/icns" }
+pix = { path = "../../user/pix" }

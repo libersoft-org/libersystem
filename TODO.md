@@ -3169,6 +3169,17 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   licensing, and pin deterministic hashes for canonical output so byte drift is an
   explicit review event. Prioritize the currently thin custom ICO, TGA and PCX suites;
   self-round-trip alone is not an interoperability proof.
+  - Partial result (2026-07-17): ICNS now has a 2,661-byte external corpus generated
+    by Debian `icnsutils 0.8.1.83.g921f972` from deterministic ImageMagick 7.1.1-43
+    RGBA gradients. It covers classic `is32+s8mk`, `il32+l8mk` and PNG-backed `ic07`;
+    the leaf test pins every decoded RGBA byte with FNV-1a and records artifact/source
+    provenance plus SHA-256 under `user/icns/tests/data`. The reciprocal host-only
+    `just icns-conformance` gate encodes all three profiles with LiberSystem, extracts
+    classic entries through `icns2png`, decodes output PNG through ImageMagick and
+    compares exact pixels. The runner validates modern `ic07` through its embedded PNG
+    because the pinned `icns2png` version itself drops alpha while exporting that
+    profile. ICNS is 4/4; independent `ih32`/`it32`, PCX, TGA and the rest of the
+    matrix keep this item open.
 - [ ] Add a deterministic hostile-input and mutation harness shared by all image
   decoders. Exercise every prefix truncation for small golden files plus bounded
   mutations of dimensions, offsets, lengths, palette/table counts, checksums, RLE,
