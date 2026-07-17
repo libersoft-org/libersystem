@@ -3588,7 +3588,10 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     the QEMU gate compares its StorageService-backed output byte-for-byte with the staged
     file. `write` links directly to `proto + wire + lsrt`, is 7,320/7,864/9,152 bytes,
     and a block-backed QEMU workflow streams a new file through StorageService before the
-    dynamic cat reads the exact bytes back. The remaining executable set is still open.
+    dynamic cat reads the exact bytes back. `rm` uses `proto + ipc-client + wire + lsrt`,
+    is 8,184/8,640/9,576 bytes, and extends that workflow through deletion and an exact
+    `cat: <uri>: cannot open` negative read-back. The remaining executable set is still
+    open.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,
   crate/source owner, output class/path, direct providers and build-feature set; each

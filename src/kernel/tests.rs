@@ -4792,6 +4792,71 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(&cat_output.expect("dynamic cat read-back").bytes, b"dynamic write");
 	assert_eq!(&cat_stdout_kernel.recv().expect("dynamic cat read-back newline").bytes, b"\n");
 
+	let rm_name: &[u8] = b"rm";
+	let (rm_stdout_kernel, rm_stdout_user) = Channel::create();
+	let (rm_bootstrap_kernel, rm_bootstrap_user) = Channel::create();
+	let mut rm_launch = alloc::vec::Vec::new();
+	rm_launch.extend_from_slice(&3u16.to_le_bytes());
+	rm_launch.extend_from_slice(&24u32.to_le_bytes());
+	rm_launch.extend_from_slice(&(rm_name.len() as u16).to_le_bytes());
+	rm_launch.extend_from_slice(rm_name);
+	rm_launch.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&process_client, &rm_launch, rm_bootstrap_user, Rights::ALL).expect("dynamic rm launch request");
+	sched::run_until_idle();
+	let rm_reply = process_client.recv().expect("dynamic rm launch reply");
+	assert_eq!(le_u32(&rm_reply.bytes, 0), 24);
+	assert_eq!(rm_reply.bytes[4], 1, "the rm PIE loaded with its manifest providers");
+	send_cap(&rm_bootstrap_kernel, b"STDOUT", rm_stdout_user, Rights::ALL).expect("dynamic rm stdout bootstrap");
+	rm_bootstrap_kernel.send(Message::new(b"vol://system/dynamic-write.txt".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic rm arguments");
+	send_cap(&rm_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("dynamic rm system volume");
+	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..]] {
+		rm_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic rm absent volume");
+	}
+	rm_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic rm cwd");
+	let mut rm_prefix = None;
+	for _ in 0..100_000 {
+		writable_storage.pump();
+		if let Ok(message) = rm_stdout_kernel.recv() {
+			rm_prefix = Some(message);
+			break;
+		}
+	}
+	assert_eq!(&rm_prefix.expect("dynamic rm confirmation prefix").bytes, b"removed ");
+	assert_eq!(&rm_stdout_kernel.recv().expect("dynamic rm confirmation path").bytes, b"vol://system/dynamic-write.txt");
+	assert_eq!(&rm_stdout_kernel.recv().expect("dynamic rm confirmation newline").bytes, b"\n");
+
+	let (missing_stdout_kernel, missing_stdout_user) = Channel::create();
+	let (missing_bootstrap_kernel, missing_bootstrap_user) = Channel::create();
+	let mut missing_launch = alloc::vec::Vec::new();
+	missing_launch.extend_from_slice(&3u16.to_le_bytes());
+	missing_launch.extend_from_slice(&25u32.to_le_bytes());
+	missing_launch.extend_from_slice(&(cat_name.len() as u16).to_le_bytes());
+	missing_launch.extend_from_slice(cat_name);
+	missing_launch.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&process_client, &missing_launch, missing_bootstrap_user, Rights::ALL).expect("missing-file cat launch request");
+	sched::run_until_idle();
+	let missing_reply = process_client.recv().expect("missing-file cat launch reply");
+	assert_eq!(le_u32(&missing_reply.bytes, 0), 25);
+	assert_eq!(missing_reply.bytes[4], 1, "the cat PIE loaded for negative read-back");
+	send_cap(&missing_bootstrap_kernel, b"STDOUT", missing_stdout_user, Rights::ALL).expect("missing-file cat stdout bootstrap");
+	missing_bootstrap_kernel.send(Message::new(b"vol://system/dynamic-write.txt".to_vec(), alloc::vec::Vec::new(), 0)).expect("missing-file cat arguments");
+	send_cap(&missing_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("missing-file cat system volume");
+	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..]] {
+		missing_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("missing-file cat absent volume");
+	}
+	missing_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("missing-file cat cwd");
+	let mut missing_prefix = None;
+	for _ in 0..100_000 {
+		writable_storage.pump();
+		if let Ok(message) = missing_stdout_kernel.recv() {
+			missing_prefix = Some(message);
+			break;
+		}
+	}
+	assert_eq!(&missing_prefix.expect("missing-file cat error prefix").bytes, b"cat: ");
+	assert_eq!(&missing_stdout_kernel.recv().expect("missing-file cat error path").bytes, b"vol://system/dynamic-write.txt");
+	assert_eq!(&missing_stdout_kernel.recv().expect("missing-file cat error suffix").bytes, b": cannot open\n");
+
 	// LAUNCH the ET_DYN probe with a bootstrap channel. ProcessService must resolve
 	// pix.lslib -> lsrt.lslib from vol://system/lib, load providers first, relocate the
 	// probe's PLT call, and only then start it. Wire: op, corr, name, handle marker.
