@@ -329,6 +329,9 @@ audio-fixtures:
 image-bench:
 	cargo run --release --manifest-path {{image_bench_dir}}/Cargo.toml
 
+# Validate every supported image profile with independent host implementations.
+image-conformance: bmp-conformance gif-conformance ico-conformance icns-conformance jpeg-conformance pcx-conformance png-conformance ppm-conformance qoi-conformance tga-conformance webp-conformance
+
 # Validate BMP decode/encode profiles with ImageMagick.
 bmp-conformance:
 	cargo run --release --manifest-path {{bmp_conformance_dir}}/Cargo.toml

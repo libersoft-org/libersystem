@@ -292,6 +292,21 @@ VP8L, ALPH and canonical full-canvas animation through webpinfo, dwebp, anim_dum
 and ImageMagick. Status: **Verified profile** for the implemented static and
 animation subsets.
 
+## Interoperability gate
+
+`just image-conformance` runs the complete independent host matrix as one review/CI
+entry point. Its 11 reciprocal recipes cover all 12 formats: PNG and APNG intentionally
+share `png-conformance`; every other format has its own recipe. Depending on the profile,
+the external consumers/producers are ImageMagick, Pillow, Netpbm, gifsicle, icoutils,
+icnsutils/libicns, pngcheck, APNG Disassembler and libwebp. No claimed supported input or
+emitted profile is accepted solely because LiberSystem can decode its own output.
+
+The checked-in fixtures contain deterministic asymmetric pixels, provenance and artifact
+hashes; leaf regressions pin complete RGBA or bounded lossy error. An Apple-generated ICNS
+fixture would strengthen provenance for that source-uncertain family, but it is not a known
+behavior gap: libicns/icnsutils and ImageMagick independently cover every supported classic
+and PNG-backed ICNS entry.
+
 ## Hostile-input gate
 
 `just image-mutate` runs 18 small corpus fixtures spanning every format above through
@@ -333,11 +348,11 @@ governed `just test-tags image` gate compares the complete 2x2 BGRX display buff
 opaque BMP, a PNG with partial and zero alpha, and frame 0 of an external two-frame WebP,
 then verifies focus-scoped quit input, surface release and clean process exit for every case.
 
-## Closure order
+## Optional provenance follow-up
 
-1. Add independent corpora for the remaining verified/subset claims, prioritizing
-  formats still covered only by self-round-trip and adding an Apple-generated ICNS
-  fixture when one is available.
+Add an Apple-generated ICNS fixture when one is available under terms compatible with the
+repository. It must agree with the existing independent libicns/icnsutils corpus; disagreement
+would reopen the affected profile rather than silently changing the deployed contract.
 
 No format moves from **Gap** or **Source uncertain** to **Verified** without an
 independently sourced fixture or a structural test that directly exercises the cited

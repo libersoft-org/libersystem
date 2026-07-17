@@ -3211,7 +3211,7 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     governed `image` gate runs the real `imgconv.lsexe` over unknown bytes, signature-only
     corrupt PNG and a valid `id_length=10` TGA: the first two print distinct diagnostics,
     while the collision file is identified as TGA, converted to BMP and pixel-checked.
-- [ ] Add an independent interoperability corpus and host-only conformance runner.
+- [x] Add an independent interoperability corpus and host-only conformance runner.
   Decode externally produced golden files for every supported input profile, and
   validate our encoded BMP, PNG/APNG, GIF, PCX, TGA, ICO, ICNS, PPM, QOI, JPEG and
   WebP output with implementations that do not share our encoder/decoder code. Keep
@@ -3305,6 +3305,18 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     on LiberSystem's conservative P6/255 output through the reciprocal host-only
     `just ppm-conformance` gate. PPM is 3/3; the rest of the matrix keeps this item
     open.
+  - Completed (2026-07-17): no claimed supported profile remains self-roundtrip-only.
+    The umbrella `just image-conformance` gate runs 11 reciprocal host recipes covering
+    all 12 formats (PNG and APNG share their standards/toolchain gate): BMP and indexed
+    output through ImageMagick/Netpbm; GIF timing/disposal/loop through gifsicle and
+    ImageMagick; ICO through ImageMagick/icoutils; ICNS through icnsutils/libicns and
+    ImageMagick; JPEG and PNG through ImageMagick/Pillow, with pngcheck/APNG Disassembler;
+    PCX/PPM/QOI through ImageMagick/Netpbm; TGA through ImageMagick; and VP8/VP8L/ALPH/
+    ANIM through libwebp and ImageMagick. The complete aggregate passes on the pinned
+    external corpus and independently decodes every emitted supported profile. An
+    Apple-generated ICNS artifact remains welcome provenance strengthening for a source-
+    uncertain family, but libicns/icnsutils already supplies independent behavioral proof
+    for every supported classic and PNG-backed ICNS entry, so it is not a closure blocker.
 - [x] Add a deterministic hostile-input and mutation harness shared by all image
   decoders. Exercise every prefix truncation for small golden files plus bounded
   mutations of dimensions, offsets, lengths, palette/table counts, checksums, RLE,
