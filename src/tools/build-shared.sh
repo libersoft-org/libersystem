@@ -46,6 +46,7 @@ library_file() {
 	case "$1" in
 	lsrt) printf 'user/rt/shared/%s/lsrt.lslib' "$target" ;;
 	proto) printf 'proto/shared/%s/proto.lslib' "$target" ;;
+	wire) printf 'wire/shared/%s/wire.lslib' "$target" ;;
 	*) printf 'user/%s/shared/%s/%s.lslib' "$1" "$target" "$1" ;;
 	esac
 }
@@ -59,15 +60,15 @@ for spec in "$@"; do
 		artifact="$spec"
 		crate="$spec"
 	fi
+	crate_rust="${crate//-/_}"
 	if [[ ! "$artifact" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ || "$artifact" == lib* ]]; then
 		echo "build-shared: invalid LiberSystem library name '$artifact'" >&2
 		exit 2
 	fi
-	if [[ "$crate" == "proto" ]]; then
-		crate_dir="proto"
-	else
-		crate_dir="user/$crate"
-	fi
+	case "$crate" in
+	proto | wire) crate_dir="$crate" ;;
+	*) crate_dir="user/$crate" ;;
+	esac
 	manifest="$crate_dir/Cargo.toml"
 	if [[ ! -f "$manifest" ]]; then
 		echo "build-shared: missing $manifest" >&2
@@ -78,10 +79,12 @@ for spec in "$@"; do
 	features=()
 	if [[ "$artifact" == "lsrt" ]]; then
 		features=(--no-default-features --features shared-image)
+	elif [[ "$artifact" == "ipc-client" ]]; then
+		features=(--no-default-features --features shared-image)
 	fi
-	(cd "$crate_dir" && RUST_MIN_STACK=16777216 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$cargo_target" --lib "${features[@]}")
+	(cd "$crate_dir" && RUST_MIN_STACK=33554432 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$cargo_target" --lib "${features[@]}")
 	deps="$crate_dir/target/$target/release/deps"
-	rlib="$(find "$deps" -maxdepth 1 -name "lib${crate}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+	rlib="$(find "$deps" -maxdepth 1 -name "lib${crate_rust}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 	if [[ -z "$rlib" ]]; then
 		echo "build-shared: no rlib produced for $crate" >&2
 		exit 1
@@ -119,8 +122,14 @@ for spec in "$@"; do
 		link_inputs=(--whole-archive "${archives[@]}" --no-whole-archive)
 	fi
 	case "$artifact" in
-	proto | pix | inflate | pcm | adpcm | ogg)
+	wire | pix | inflate | pcm | adpcm | ogg)
 		link_deps=("$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
+	proto)
+		link_deps=("$(library_file wire)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
+	ipc-client)
+		link_deps=("$(library_file wire)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	deflate)
 		miniz_archive="$(find "$deps" -maxdepth 1 -name 'libminiz_oxide-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
@@ -232,6 +241,34 @@ for spec in "$@"; do
 	esac
 	"$lld" -flavor gnu -m "$emulation" -shared --hash-style=sysv "${symbolic_flags[@]}" --gc-sections "${export_flags[@]}" "${link_inputs[@]}" "${link_deps[@]}" -soname "$artifact.lslib" -o "$out"
 	llvm-strip --strip-debug "$out"
+	case "$artifact" in
+	wire | ipc-client | proto)
+		actual_needed="$(llvm-readelf -d "$out" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sort)"
+		case "$artifact" in
+		wire) expected_needed="lsrt.lslib" ;;
+		ipc-client | proto) expected_needed="$(printf '%s\n' lsrt.lslib wire.lslib | sort)" ;;
+		esac
+		if [[ "$actual_needed" != "$expected_needed" ]]; then
+			echo "build-shared: $out has unexpected providers: $actual_needed" >&2
+			exit 1
+		fi
+		;;
+	esac
+	if [[ "$artifact" == "ipc-client" ]]; then
+		actual_imports="$(llvm-readelf --wide --dyn-syms "$out" | awk '$7 == "UND" && $8 != "" {print $8}' | sort -u)"
+		expected_imports="$(printf '%s\n' recv_vec_blocking resolve | sort)"
+		if [[ "$actual_imports" != "$expected_imports" ]]; then
+			echo "build-shared: $out has unexpected runtime imports: $actual_imports" >&2
+			exit 1
+		fi
+		for symbol in $actual_imports; do
+			count="$(llvm-readelf --wide --dyn-syms "$(library_file lsrt)" | awk -v symbol="$symbol" '$7 != "UND" && $8 == symbol { count++ } END { print count + 0 }')"
+			if [[ "$count" != 1 ]]; then
+				echo "build-shared: $symbol has $count providers in lsrt.lslib (expected 1)" >&2
+				exit 1
+			fi
+		done
+	fi
 	if ! llvm-readelf -h "$out" | grep -q 'Type:.*DYN'; then
 		echo "build-shared: $out is not ET_DYN" >&2
 		exit 1
@@ -248,7 +285,7 @@ done
 
 if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	probe="user/dyn_probe"
-	(cd "$probe" && RUST_MIN_STACK=16777216 RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
+	(cd "$probe" && RUST_MIN_STACK=33554432 RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
 	probe_rlib="$(find "$probe/target/$target/release/deps" -maxdepth 1 -name 'libdyn_probe-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 	probe_dir="$probe/shared/$target"
 	mkdir -p "$probe_dir"

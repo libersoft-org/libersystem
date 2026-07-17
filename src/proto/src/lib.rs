@@ -18,7 +18,7 @@ pub extern "C" fn liber_proto_probe() -> u64 {
 	0x5052_4f54_4f4f_4b21
 }
 
-pub mod codec;
+pub use wire as codec;
 pub mod generated;
 pub mod system;
 

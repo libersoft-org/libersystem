@@ -1,4 +1,5 @@
 use super::*;
+use ipc_client::ChannelTransport;
 
 // Load a non-pinned service from the system volume's `bin/` through ProcessService,
 // handing the new process `bootstrap` as its bootstrap channel. Mints a dedicated

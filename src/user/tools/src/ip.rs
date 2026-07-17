@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+use ipc_client::ChannelTransport;
 use proto::addr::write_mac;
 use proto::system::network;
 use rt::*;

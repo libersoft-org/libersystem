@@ -7,17 +7,10 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
-name = "drivers"
+name = "ipc-client"
 version = "0.0.0"
 dependencies = [
- "proto",
  "rt",
-]
-
-[[package]]
-name = "proto"
-version = "0.0.0"
-dependencies = [
  "wire",
 ]
 

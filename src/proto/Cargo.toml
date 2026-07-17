@@ -4,3 +4,6 @@ name = "proto"
 # version is unused here and omitted.
 edition = "2024"
 description = "Generated LSIDL bindings (wire codec, clients, servers) for LiberSystem"
+
+[dependencies]
+wire = { path = "../wire" }

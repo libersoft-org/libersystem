@@ -8,6 +8,7 @@ storage_dir := "user/storage"
 drivers_dir := "user/drivers"
 usertools_dir := "user/tools"
 rt_dir := "user/rt"
+ipc_client_dir := "user/ipc-client"
 pix_dir := "user/pix"
 keys_dir := "user/keys"
 pcm_dir := "user/pcm"
@@ -37,6 +38,7 @@ vorbis_dir := "user/vorbis"
 wav_dir := "user/wav"
 wavpack_dir := "user/wavpack"
 abi_dir := "abi"
+wire_dir := "wire"
 tools_dir := "tools/lsidl-gen"
 audio_bench_dir := "tools/audio-bench"
 image_bench_dir := "tools/image-bench"
@@ -71,13 +73,13 @@ default: run
 
 # build the first system-image shared-object pilot
 shared-libs:
-	tools/build-shared.sh x86_64-unknown-none lsrt=rt proto=proto pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack
+	tools/build-shared.sh x86_64-unknown-none lsrt=rt wire=wire ipc-client=ipc-client proto=proto pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack
 
 shared-libs-aarch64:
-	tools/build-shared.sh aarch64-unknown-none lsrt=rt proto=proto pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack
+	tools/build-shared.sh aarch64-unknown-none lsrt=rt wire=wire ipc-client=ipc-client proto=proto pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack
 
 shared-libs-riscv64:
-	tools/build-shared.sh riscv64gc-unknown-none-elf lsrt=rt proto=proto pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack
+	tools/build-shared.sh riscv64gc-unknown-none-elf lsrt=rt wire=wire ipc-client=ipc-client proto=proto pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack
 
 # build the userspace programs that make up the init package
 user: shared-libs
@@ -383,7 +385,9 @@ image-mutate:
 # format all code (Rust via rustfmt, shell via shfmt)
 fmt:
 	cd {{abi_dir}} && cargo fmt
+	cd {{wire_dir}} && cargo fmt
 	cd {{rt_dir}} && cargo fmt
+	cd {{ipc_client_dir}} && cargo fmt
 	cd {{pix_dir}} && cargo fmt
 	cd {{keys_dir}} && cargo fmt
 	cd {{pcm_dir}} && cargo fmt
@@ -449,7 +453,9 @@ fmt:
 # check formatting without writing changes (CI-friendly)
 fmt-check:
 	cd {{abi_dir}} && cargo fmt --check
+	cd {{wire_dir}} && cargo fmt --check
 	cd {{rt_dir}} && cargo fmt --check
+	cd {{ipc_client_dir}} && cargo fmt --check
 	cd {{pix_dir}} && cargo fmt --check
 	cd {{keys_dir}} && cargo fmt --check
 	cd {{pcm_dir}} && cargo fmt --check
@@ -515,7 +521,9 @@ fmt-check:
 # clean build artifacts
 clean:
 	cd {{abi_dir}} && cargo clean
+	cd {{wire_dir}} && cargo clean
 	cd {{rt_dir}} && cargo clean
+	cd {{ipc_client_dir}} && cargo clean
 	cd {{kernel_dir}} && cargo clean
 	cd {{user_dir}} && cargo clean
 	cd {{services_dir}} && cargo clean

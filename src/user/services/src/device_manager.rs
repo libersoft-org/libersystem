@@ -15,6 +15,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use ipc_client::ChannelTransport;
 use proto::system::{OpenOpts, volume};
 use rt::*;
 

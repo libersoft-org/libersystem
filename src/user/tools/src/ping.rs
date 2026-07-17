@@ -24,6 +24,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
+use ipc_client::ChannelTransport;
 use proto::codec::{JsonMode, json_escape};
 use proto::system::{Ipv4Addr, PingReply, PingStatus, network};
 use rt::*;

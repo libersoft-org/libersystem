@@ -27,6 +27,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use ipc_client::{ChannelTransport, make_buffer};
 use proto::system::config::{self, Service};
 use proto::system::{ConfigEntry, Error, OpenOpts, volume};
 use rt::*;

@@ -627,6 +627,8 @@ pub unsafe fn channel_peek(channel: u64) -> i64 {
 // Receive one message sized exactly, blocking while the channel is empty: peek the
 // pending message's length, allocate precisely, and receive into it. No ceiling
 // stands anywhere in this path - a reply is as large as the sender made it.
+#[unsafe(no_mangle)]
+// Image-internal transport boundary consumed by ipc-client.lslib.
 pub unsafe fn recv_vec_blocking(channel: u64) -> ReceivedVec {
 	unsafe {
 		loop {
@@ -1158,6 +1160,8 @@ pub unsafe fn announce_exit(channel: u64) {
 // send `RESOLVE_OP` + `name` and block for the broker's answer. Returns the fresh
 // client channel to the current live instance, or None when the broker denies the
 // name, the service is gone for good, or the broker itself is gone.
+#[unsafe(no_mangle)]
+// Image-internal transport boundary consumed by ipc-client.lslib.
 pub unsafe fn resolve(broker: u64, name: &[u8]) -> Option<u64> {
 	unsafe {
 		let mut req: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(2 + name.len());
@@ -1195,135 +1199,6 @@ pub unsafe fn connect_or_resolve(held: &mut u64, broker: u64, name: &[u8]) -> Op
 	}
 }
 
-// A proto Transport over an rt channel: send the request (with any out-of-band
-// handle), then block for the reply (whose own out-of-band handle is returned
-// alongside the bytes). Every userspace program that drives a generated service
-// client - the shell, the supervisor, the demo clients - reaches its service
-// through this one implementation, instead of each repeating the send/recv glue.
-#[cfg(feature = "proto-transport")]
-pub struct ChannelTransport {
-	pub chan: u64,
-}
-
-#[cfg(feature = "proto-transport")]
-impl proto::codec::Transport for ChannelTransport {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
-		unsafe {
-			if !send_blocking(self.chan, request, request_handle) {
-				return None;
-			}
-			// The reply is received sized exactly (peek + recv), so a typed reply is
-			// as large as the service made it - no wire ceiling stands here.
-			match recv_vec_blocking(self.chan) {
-				ReceivedVec::Message { bytes, handle } => Some((bytes, handle)),
-				ReceivedVec::Closed => None,
-			}
-		}
-	}
-
-	fn discard_handle(&mut self, handle: u64) {
-		if handle != 0 {
-			unsafe { close(handle) };
-		}
-	}
-}
-
-// A proto Transport that survives a service restart: like ChannelTransport, but the
-// durable reference is the capability NAME, re-resolved over the broker (bootstrap)
-// channel when the live channel dies. When the send itself fails (the service
-// crashed BETWEEN requests - the common case, nothing was delivered), the request
-// is transparently retried once on a freshly resolved channel: at-most-once
-// semantics hold, so the retry is always safe. When the service dies MID-request
-// (the send succeeded but the reply never came), the call returns None and only the
-// NEXT call reconnects: the request may have been half-applied, so replaying it is
-// the caller's protocol-level decision, not the transport's - the honest limit of
-// connection-level transparency.
-#[cfg(feature = "proto-transport")]
-pub struct SvcTransport {
-	// The broker (bootstrap) channel resolves are sent over. Borrowed, never closed.
-	broker: u64,
-	// The capability tag this connection re-resolves as (e.g. CAP_CONFIG).
-	name: &'static [u8],
-	// The current live channel (0 = not connected; resolved on the next call).
-	chan: u64,
-}
-
-#[cfg(feature = "proto-transport")]
-impl SvcTransport {
-	// Wrap a bootstrap-granted channel: `chan` serves until it peer-closes, then the
-	// name takes over. `chan` 0 is valid (the first call resolves).
-	pub const fn new(broker: u64, name: &'static [u8], chan: u64) -> SvcTransport {
-		SvcTransport { broker, name, chan }
-	}
-
-	// The current live channel, resolving through the broker when there is none.
-	// 0 when the broker cannot (or will not) provide one.
-	pub unsafe fn channel(&mut self) -> u64 {
-		if self.chan == 0 {
-			self.chan = unsafe { resolve(self.broker, self.name) }.unwrap_or(0);
-		}
-		self.chan
-	}
-
-	// Drop the dead channel and resolve a fresh connection to the current live
-	// instance. False when the broker denies or the service is gone for good.
-	pub unsafe fn reconnect(&mut self) -> bool {
-		unsafe {
-			if self.chan != 0 {
-				close(self.chan);
-				self.chan = 0;
-			}
-			self.channel() != 0
-		}
-	}
-}
-
-#[cfg(feature = "proto-transport")]
-impl proto::codec::Transport for SvcTransport {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
-		unsafe {
-			let chan: u64 = self.channel();
-			if chan == 0 {
-				return None;
-			}
-			if !send_blocking(chan, request, request_handle) {
-				// Nothing was delivered: reconnect and retry once (at-most-once holds).
-				if !self.reconnect() {
-					return None;
-				}
-				if !send_blocking(self.chan, request, request_handle) {
-					return None;
-				}
-			}
-			match recv_vec_blocking(self.chan) {
-				ReceivedVec::Message { bytes, handle } => Some((bytes, handle)),
-				ReceivedVec::Closed => {
-					// Died mid-request: reconnect for the NEXT call, report this one
-					// failed (replaying a possibly half-applied request is not ours).
-					let _ = self.reconnect();
-					None
-				}
-			}
-		}
-	}
-
-	fn discard_handle(&mut self, handle: u64) {
-		if handle != 0 {
-			unsafe { close(handle) };
-		}
-	}
-}
-
-// A long-lived holder drives its generated client through a mutable borrow, so the
-// transport's reconnect state (the current channel) persists across calls:
-// `device::Client::new(&mut self.device)` each snapshot, one SvcTransport for life.
-#[cfg(feature = "proto-transport")]
-impl proto::codec::Transport for &mut SvcTransport {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
-		(**self).call(request, request_handle)
-	}
-}
-
 // Close `handle`, releasing the object reference it names. A no-op-safe wrapper
 // over the close syscall (the kernel ignores an unknown handle), so callers need
 // not repeat the raw syscall.
@@ -1353,38 +1228,6 @@ pub unsafe fn map_object(handle: u64) -> Option<u64> {
 pub unsafe fn unmap_object(handle: u64) {
 	unsafe {
 		syscall(SYS_MEMORY_UNMAP, handle, 0, 0, 0);
-	}
-}
-
-// Stage bytes in a shared buffer for a zero-copy typed call (a volume write, a
-// framed payload): create a memory object, copy `bytes` in, and return a
-// read+map+transfer duplicate as the proto Buffer that travels with the request;
-// our own handle is closed. The shared "hand bytes to a service" path (LogService's
-// journal flush, ConfigService's persisted tree). None when the object cannot be
-// created or mapped.
-#[cfg(feature = "proto-transport")]
-pub unsafe fn make_buffer(bytes: &[u8]) -> Option<proto::codec::Buffer> {
-	unsafe {
-		let obj: i64 = memory_object_create(bytes.len().max(1) as u64);
-		if obj < 0 {
-			return None;
-		}
-		let obj: u64 = obj as u64;
-		let mapped: u64 = match map_object(obj) {
-			Some(base) => base,
-			None => {
-				close(obj);
-				return None;
-			}
-		};
-		core::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped as *mut u8, bytes.len());
-		unmap_object(obj);
-		let granted: i64 = duplicate(obj, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
-		close(obj);
-		if granted < 0 {
-			return None;
-		}
-		Some(proto::codec::Buffer { handle: granted as u64, len: bytes.len() as u64 })
 	}
 }
 

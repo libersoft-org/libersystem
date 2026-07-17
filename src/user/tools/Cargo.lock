@@ -164,6 +164,14 @@ name = "inflate"
 version = "0.0.0"
 
 [[package]]
+name = "ipc-client"
+version = "0.0.0"
+dependencies = [
+ "rt",
+ "wire",
+]
+
+[[package]]
 name = "jpeg"
 version = "0.0.0"
 dependencies = [
@@ -270,6 +278,9 @@ dependencies = [
 [[package]]
 name = "proto"
 version = "0.0.0"
+dependencies = [
+ "wire",
+]
 
 [[package]]
 name = "qoi"
@@ -300,13 +311,13 @@ name = "rt"
 version = "0.0.0"
 dependencies = [
  "abi",
- "proto",
 ]
 
 [[package]]
 name = "surface"
 version = "0.0.0"
 dependencies = [
+ "ipc-client",
  "pix",
  "proto",
  "rt",
@@ -342,6 +353,7 @@ dependencies = [
  "bmp",
  "flac",
  "imgconv",
+ "ipc-client",
  "keys",
  "mp3",
  "pix",
@@ -393,6 +405,10 @@ name = "weezl"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4ca08e5ef825b65b056d9efbd95c8750683f0a6d0466d02e96dc2e4e360f3d2"
+
+[[package]]
+name = "wire"
+version = "0.0.0"
 
 [[package]]
 name = "zune-core"

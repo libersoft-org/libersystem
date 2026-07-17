@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+use ipc_client::ChannelTransport;
 use proto::codec::Buffer;
 use proto::system::{Endpoint, Error, Ipv4Addr, network, socket};
 use rt::*;

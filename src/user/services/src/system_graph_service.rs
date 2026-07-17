@@ -28,6 +28,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use ipc_client::{ChannelTransport, SvcTransport};
 use proto::system::{Component, ComponentState, ComponentType, Counters, DeviceEntry, DeviceType, Error, Graph, TraceSpan, device, supervisor, system_graph};
 use rt::*;
 

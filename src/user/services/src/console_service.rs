@@ -16,6 +16,7 @@
 #![no_std]
 #![no_main]
 
+use ipc_client::ChannelTransport;
 use rt::*;
 
 use proto::system::{config, network, process};

@@ -14,6 +14,7 @@ use aiff::Aiff;
 use alloc::string::String;
 use alloc::vec::Vec;
 use flac::Flac;
+use ipc_client::{ChannelTransport, make_buffer};
 use mp3::Mp3;
 use proto::path;
 use proto::system::{OpenOpts, audio, pcm_stream, volume};

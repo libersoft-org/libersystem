@@ -21,6 +21,7 @@ mod net;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use ipc_client::ChannelTransport;
 use rt::*;
 
 use crate::net::{DHCP_ACK, DHCP_NAK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, NEIGH_MAX, SockEntry, SockEntryState, Stack, TCP_SEGMENT_OVERHEAD};

@@ -74,10 +74,12 @@ driver    virtio_snd            drivers   volume
 driver    xhci                  drivers   volume
 
 # system-image shared libraries - built as PIC rlibs and linked to ET_DYN by
-# tools/build-shared.sh, then staged under lib/. Consumers remain static until the
-# M123 module loader and symbol registry are complete. Prefix-free crate directories own
+# tools/build-shared.sh, then staged under lib/. Consumers remain static during the
+# executable-linker migration. Prefix-free crate directories own
 # their generated shared/<target>/ output; image staging appends `.lslib` to the name.
 library   lsrt                  rt        volume
+library   wire                  wire      volume
+library   ipc-client            ipc-client volume
 library   proto                 proto     volume
 library   pix                   pix    volume
 library   inflate               inflate volume

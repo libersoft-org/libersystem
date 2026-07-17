@@ -4,6 +4,7 @@ edition = "2024"
 description = "Owned DisplayService client surfaces and presentation helpers"
 
 [dependencies]
+ipc-client = { path = "../ipc-client" }
 proto = { path = "../../proto" }
 rt = { path = "../rt" }
 pix = { path = "../pix" }

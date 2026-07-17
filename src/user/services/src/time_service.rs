@@ -20,6 +20,7 @@
 
 extern crate alloc;
 
+use ipc_client::ChannelTransport;
 use proto::system::time::{self, Service};
 use proto::system::{Error, Timestamp, network};
 use rt::*;

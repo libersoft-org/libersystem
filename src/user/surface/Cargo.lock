@@ -7,26 +7,41 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "ipc-client"
+version = "0.0.0"
+dependencies = [
+ "rt",
+ "wire",
+]
+
+[[package]]
 name = "pix"
 version = "0.0.0"
 
 [[package]]
 name = "proto"
 version = "0.0.0"
+dependencies = [
+ "wire",
+]
 
 [[package]]
 name = "rt"
 version = "0.0.0"
 dependencies = [
  "abi",
- "proto",
 ]
 
 [[package]]
 name = "surface"
 version = "0.0.0"
 dependencies = [
+ "ipc-client",
  "pix",
  "proto",
  "rt",
 ]
+
+[[package]]
+name = "wire"
+version = "0.0.0"

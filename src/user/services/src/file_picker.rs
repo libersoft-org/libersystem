@@ -20,6 +20,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use ipc_client::ChannelTransport;
 use proto::system::picker::{self, Service};
 use proto::system::{Error, OpenOpts, Picked, volume};
 use rt::*;

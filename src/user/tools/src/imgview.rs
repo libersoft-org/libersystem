@@ -12,6 +12,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use ipc_client::ChannelTransport;
 use keys::usage;
 use pix::{Image, Rect, Target};
 use proto::path;

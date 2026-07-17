@@ -4,8 +4,9 @@ extern crate alloc;
 
 use alloc::rc::Rc;
 use core::cell::RefCell;
+use ipc_client::ChannelTransport;
 use proto::system::{DisplayEvent, Error, PixelFormat, SurfaceInfo, display};
-use rt::{ChannelTransport, Framebuffer, close, map_object, unmap_object};
+use rt::{Framebuffer, close, map_object, unmap_object};
 
 pub use pix::{BlitResult, Image, Rect, Target};
 

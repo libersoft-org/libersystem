@@ -17,6 +17,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
 use proto::system::{process, resources};
 use rt::*;

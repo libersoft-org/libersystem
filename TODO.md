@@ -3481,7 +3481,7 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
 
 ## M126a - Dynamically linked system executables (no static `/bin` tools)
 
-Status: PLANNED AFTER M126; HARD PREREQUISITE FOR M127 AND EVERY NEW M130/M131
+Status: IN PROGRESS (2026-07-17); HARD PREREQUISITE FOR M127 AND EVERY NEW M130/M131
 EXECUTABLE. M123 delivered the loader, relocations, immutable-page sharing and atomized
 `.lslib` providers, but deliberately converted only `dyn_probe`: all 48 current tools
 are still static `ET_EXEC` files with no dynamic section or `DT_NEEDED`. That deferral is
@@ -3517,6 +3517,22 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   notes and reject two identities for the same system crate before linking. Do not infer
   identity merely from a Rust mangled hash or whichever incremental rlib has the newest
   timestamp.
+  - Partial result (2026-07-17): the dependency cycle is split at its real ownership
+    boundaries. New root `wire` owns the unchanged transport-independent codec,
+    `Buffer`, JSON/CBOR representation helpers and `Transport`; `proto::codec` remains a
+    source-compatible re-export and all 94 wire/client/server golden tests pass. New
+    `ipc-client` owns `ChannelTransport`, restart-resolving `SvcTransport` and shared-buffer
+    staging over only `wire + rt`; `rt` now depends solely on `abi` and no longer has
+    a proto feature or dependency. The image graph stages `wire.lslib` (16,184 bytes) and
+    `ipc-client.lslib` (4,000 bytes); `proto.lslib` shrank to 284,464 bytes and depends on
+    `wire + lsrt`. The transport provider imports exactly two image-internal runtime
+    functions, `recv_vec_blocking` and `resolve`, exported by `lsrt` under explicit stable
+    names. `build-shared.sh` now rejects provider-set drift and requires each transport
+    import to have exactly one `lsrt` definition. Source packages compile and the complete
+    provider graph links on all three architectures; RISC-V build-std uses the compiler-
+    recommended 32 MB worker stack. Whole-image identity records, a single deterministic
+    invocation and the executable-side identity audit remain open with the start-object/
+    image-linker work below.
 - [ ] Add a tiny generated executable-start object per architecture, not a static runtime
   archive in every program. It exports `_start`, aligns/initializes the ABI-required
   registers, performs the native ABI revision check through `lsrt`, and calls the tool's

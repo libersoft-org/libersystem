@@ -8,6 +8,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use imgconv::Error;
+use ipc_client::{ChannelTransport, make_buffer};
 use proto::path;
 use proto::system::{OpenOpts, volume};
 use rt::*;

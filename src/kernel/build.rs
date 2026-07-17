@@ -152,7 +152,7 @@ fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 }
 
 fn user_shared_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
-	let root = if crate_dir == "proto" { manifest.join("../proto") } else { manifest.join(format!("../user/{crate_dir}")) };
+	let root = if matches!(crate_dir, "proto" | "wire") { manifest.join(format!("../{crate_dir}")) } else { manifest.join(format!("../user/{crate_dir}")) };
 	root.join(format!("shared/{}/{}.lslib", user_target(), name))
 }
 

@@ -216,6 +216,7 @@ name = "readln"
 path = "src/readln.rs"
 
 [dependencies]
+ipc-client = { path = "../ipc-client" }
 # Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
 # the syscall/IPC helpers); it re-exports the abi constants.
 rt = { path = "../rt" }

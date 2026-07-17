@@ -1,0 +1,12 @@
+[package]
+name = "ipc-client"
+edition = "2024"
+description = "Userspace channel and restart-resolving transports over wire and lsrt"
+
+[features]
+default = []
+shared-image = ["rt/shared-image"]
+
+[dependencies]
+rt = { path = "../rt", default-features = false }
+wire = { path = "../../wire" }

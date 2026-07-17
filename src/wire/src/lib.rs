@@ -1,10 +1,14 @@
-//! Shared wire primitives for the generated codecs.
+//! Transport-independent wire primitives for generated LSIDL codecs.
 //!
 //! All integers are little-endian and there is no padding or alignment, so the
 //! byte layout is exactly as written. Encoding writes into a caller buffer and
 //! returns `None` on overflow; decoding returns `None` on a short or malformed
 //! buffer. Everything is heap-free except `string_lp`, which allocates the
 //! decoded `String`.
+
+#![no_std]
+
+extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;

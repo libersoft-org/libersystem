@@ -13,6 +13,7 @@
 
 extern crate alloc;
 
+use ipc_client::ChannelTransport;
 use proto::codec::Buffer;
 use proto::system::{listener, network, socket};
 use rt::*;

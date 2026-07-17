@@ -49,10 +49,18 @@ steps:
 
 `lsrt.lslib` is linked from the extracted PIC object members of `core`, `alloc`,
 `compiler_builtins`, `abi`, and `rt`; direct object linking preserves the root
-provider's dynamic exports. `rt`'s generated-protocol transport adapter is an optional
-default feature excluded from this root, removing a dependency cycle. `proto.lslib` is
-the only generated-protocol provider and depends on `lsrt.lslib`. Leaf rlibs remain archive
-linked against their explicit provider set.
+provider's dynamic exports. `rt` depends only on `abi`. The transport-independent
+codec and representation foundation is `wire.lslib`, which depends on `lsrt.lslib`;
+`ipc-client.lslib` owns channel and resolver transports over `wire + lsrt`.
+`proto.lslib` contains generated domain types/clients/servers, re-exports `wire` as
+`proto::codec` for source compatibility, and depends on `wire + lsrt`. Leaf rlibs remain
+archive linked against their explicit provider set.
+
+The shared-image builder checks this foundation graph after each link: `wire` must need
+only `lsrt`, `ipc-client` and `proto` must need exactly `wire + lsrt`, and every direct
+runtime import of `ipc-client` must have one definition in `lsrt`. RISC-V build-std uses
+a 32 MB rustc worker stack; smaller stacks have crashed the pinned compiler while
+elaborating drops in `core`.
 
 Because Cargo cannot consume a Rust dylib on these targets, consumers cross a generated
 image-internal export boundary. A small explicit unmangled smoke ABI currently pins this
@@ -75,16 +83,17 @@ depends on `lsrt.lslib`; higher leaves depend only on their declared lower libra
 Cycles are rejected by the image builder and by ProcessService.
 
 The production executable graph must compile providers and consumers with one pinned
-toolchain/profile/feature identity. The M123 pilot built `lsrt` without the optional
-`proto-transport` feature to avoid a dependency cycle while ordinary tools compiled a
-different `rt` identity; Rust-mangled imports from those tools therefore cannot resolve
-to the pilot provider. The full conversion splits transport ownership instead:
+toolchain/profile/feature identity. The initial pilot compiled runtime providers and
+ordinary tools under different feature identities, so arbitrary Rust-mangled imports
+could not be assumed to resolve. Transport ownership is now split as follows:
 
 - `lsrt.lslib` owns core/alloc/compiler builtins, allocator, syscalls, channels, waits,
   stdio and process primitives;
 - `wire.lslib` owns transport-independent codec readers/writers, `Transport`, buffers and
   representation modes;
-- `ipc-client.lslib` owns `ChannelTransport` and resolver transport over `wire + lsrt`;
+- `ipc-client.lslib` owns `ChannelTransport`, resolver transport and shared-buffer staging
+  over `wire + lsrt`; its only direct runtime imports currently cross explicit
+  image-internal `recv_vec_blocking` and `resolve` symbols;
 - generated LSIDL domain-client libraries depend on those roots, remain separate by
   contract domain and export concrete channel/resolver clients. The generic
   `Client<T: Transport>` remains available for tests/special transports but is not
@@ -159,5 +168,5 @@ copies of runtime, generated protocols or codecs inside utility executables.
 
 The 2026-07-16 baseline is 48 static stripped tools totaling 11,885,992 bytes: ordinary
 tools account for 6,202,912 bytes and `imgview`/`play`/`imgconv` for 5,683,080 bytes. The
-existing shared `lsrt` and `proto` roots total roughly 733 KiB before further domain
-splitting. M126a in `TODO.md` owns the complete conversion and its tri-architecture gates.
+existing shared runtime/protocol roots are being split further by ownership before the
+complete tri-architecture executable conversion.

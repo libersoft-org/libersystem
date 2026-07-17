@@ -18,6 +18,14 @@ name = "fscore"
 version = "0.0.0"
 
 [[package]]
+name = "ipc-client"
+version = "0.0.0"
+dependencies = [
+ "rt",
+ "wire",
+]
+
+[[package]]
 name = "iso9660"
 version = "0.0.0"
 dependencies = [
@@ -34,13 +42,15 @@ dependencies = [
 [[package]]
 name = "proto"
 version = "0.0.0"
+dependencies = [
+ "wire",
+]
 
 [[package]]
 name = "rt"
 version = "0.0.0"
 dependencies = [
  "abi",
- "proto",
 ]
 
 [[package]]
@@ -48,6 +58,7 @@ name = "storage"
 version = "0.0.0"
 dependencies = [
  "fat",
+ "ipc-client",
  "iso9660",
  "liberfs",
  "proto",
@@ -61,3 +72,7 @@ version = "0.0.0"
 dependencies = [
  "fscore",
 ]
+
+[[package]]
+name = "wire"
+version = "0.0.0"

@@ -28,6 +28,7 @@ use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use ipc_client::{ChannelTransport, make_buffer};
 use proto::system::log::{self, Service};
 use proto::system::{Entry, Error, OpenOpts, Query, Severity, config, volume};
 use rt::*;

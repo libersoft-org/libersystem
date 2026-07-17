@@ -12,3 +12,10 @@ dependencies = [
 [[package]]
 name = "proto"
 version = "0.0.0"
+dependencies = [
+ "wire",
+]
+
+[[package]]
+name = "wire"
+version = "0.0.0"

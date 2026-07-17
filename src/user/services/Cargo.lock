@@ -11,6 +11,14 @@ name = "bootproto"
 version = "0.0.0"
 
 [[package]]
+name = "ipc-client"
+version = "0.0.0"
+dependencies = [
+ "rt",
+ "wire",
+]
+
+[[package]]
 name = "keys"
 version = "0.0.0"
 dependencies = [
@@ -28,13 +36,15 @@ version = "0.0.0"
 [[package]]
 name = "proto"
 version = "0.0.0"
+dependencies = [
+ "wire",
+]
 
 [[package]]
 name = "rt"
 version = "0.0.0"
 dependencies = [
  "abi",
- "proto",
 ]
 
 [[package]]
@@ -43,6 +53,7 @@ version = "0.0.0"
 dependencies = [
  "abi",
  "bootproto",
+ "ipc-client",
  "keys",
  "pcm",
  "pix",
@@ -57,6 +68,7 @@ dependencies = [
 name = "surface"
 version = "0.0.0"
 dependencies = [
+ "ipc-client",
  "pix",
  "proto",
  "rt",
@@ -68,4 +80,8 @@ version = "0.0.0"
 
 [[package]]
 name = "wasm"
+version = "0.0.0"
+
+[[package]]
+name = "wire"
 version = "0.0.0"

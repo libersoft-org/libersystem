@@ -13,6 +13,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use ipc_client::ChannelTransport;
 use proto::system::audio;
 use rt::*;
 use tools::{parse_u64, split_args};

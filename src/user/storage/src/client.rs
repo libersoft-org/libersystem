@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+use ipc_client::ChannelTransport;
 use proto::system::{OpenOpts, volume};
 use rt::*;
 
