@@ -1,0 +1,8 @@
+[package]
+name = "qoi-conformance"
+edition = "2024"
+description = "Host interoperability gate for LiberSystem QOI output"
+
+[dependencies]
+qoi = { path = "../../user/qoi" }
+pix = { path = "../../user/pix" }

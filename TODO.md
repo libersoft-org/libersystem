@@ -3200,6 +3200,15 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     `just tga-conformance` gate encodes raw/RLE 24/32-bit output with LiberSystem and
     requires exact ImageMagick pixels. TGA is 3/3; the rest of the matrix keeps this
     item open.
+  - Partial result (2026-07-17): QOI now has external Netpbm 11.10.2 RGB and RGBA
+    fixtures decoded byte-identically by Netpbm `qoitopam` and ImageMagick 7.1.1-43.
+    The RGB stream deliberately covers INDEX, DIFF, LUMA, RUN and RGB while the alpha
+    stream covers RGBA; leaf tests pin exact opcode inventories, headers, complete
+    RGBA FNV-1a and artifact SHA-256 under `user/qoi/tests/data`. The audit also fixed
+    opaque output to emit the real three-channel profile instead of always storing an
+    RGBA stream. The reciprocal host-only `just qoi-conformance` gate requires exact
+    RGB/RGBA pixels from both independent decoders. QOI is 3/3; the rest of the format
+    matrix keeps this item open.
 - [ ] Add a deterministic hostile-input and mutation harness shared by all image
   decoders. Exercise every prefix truncation for small golden files plus bounded
   mutations of dimensions, offsets, lengths, palette/table counts, checksums, RLE,

@@ -179,8 +179,13 @@ description; alpha input is rejected for output rather than silently composited.
 The leaf accepts and emits QOI 1.0 with three or four channels, validates the
 header, dimensions, run/index/diff/luma/RGB/RGBA opcodes, exact pixel count and
 eight-byte end marker, and preserves RGBA8 exactly. The colorspace byte is a
-declarative hint and does not alter samples. Status: **Verified profile**, pending
-independent decoder coverage for both channel counts and opcode families.
+declarative hint and does not alter samples. Opaque output uses the three-channel
+profile; an image with any non-opaque pixel uses four channels. The independent
+Netpbm 11.10.2 corpus covers both channel counts and all six opcode families;
+ImageMagick 7.1.1-43 and Netpbm `qoitopam` produce byte-identical RGBA, pinned by
+whole-buffer FNV-1a. The reciprocal `just qoi-conformance` gate requires exact
+pixels from both decoders for LiberSystem RGB and RGBA output. Status: **Verified
+profile** for QOI 1.0 RGB/RGBA input and output.
 
 ### TGA
 
