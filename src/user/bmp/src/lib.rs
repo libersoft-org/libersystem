@@ -50,9 +50,18 @@ struct Header {
 	palette_entries: usize,
 	palette_entry_len: usize,
 	masks: Option<[u32; 3]>,
+	alpha_mask: Option<u32>,
 }
 
 pub fn decode(data: &[u8]) -> Result<Image, Error> {
+	let (mut image, _) = decode_pixels(data)?;
+	for pixel in image.pixels.chunks_exact_mut(4) {
+		pixel[3] = 0;
+	}
+	Ok(image)
+}
+
+fn decode_pixels(data: &[u8]) -> Result<(Image, bool), Error> {
 	let header = parse_header(data)?;
 	let pitch = header.width.checked_mul(4).ok_or(Error::TooLarge)?;
 	let output_len = (pitch as usize).checked_mul(header.height as usize).ok_or(Error::TooLarge)?;
@@ -64,15 +73,16 @@ pub fn decode(data: &[u8]) -> Result<Image, Error> {
 		BI_RLE4 => decode_rle(data, &header, &palette, &mut pixels, true)?,
 		_ => return Err(Error::Unsupported),
 	}
-	Ok(Image { width: header.width, height: header.height, pitch, pixels })
+	let has_alpha = header.alpha_mask.is_some();
+	Ok((Image { width: header.width, height: header.height, pitch, pixels }, has_alpha))
 }
 
 pub fn decode_rgba(data: &[u8]) -> Result<pix::RgbaImage, Error> {
-	let image = decode(data)?;
+	let (image, has_alpha) = decode_pixels(data)?;
 	let mut pixels = Vec::new();
 	pixels.try_reserve_exact(image.pixels.len()).map_err(|_| Error::TooLarge)?;
 	for pixel in image.pixels.chunks_exact(4) {
-		pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+		pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], if has_alpha { pixel[3] } else { 255 }]);
 	}
 	pix::RgbaImage::new(image.width, image.height, pixels).map_err(|error| match error {
 		pix::Error::Invalid => Error::Invalid,
@@ -221,12 +231,11 @@ fn parse_header(data: &[u8]) -> Result<Header, Error> {
 	validate_geometry(width, height)?;
 	validate_format(bits_per_pixel, compression, top_down)?;
 
-	let external_mask_len = if dib_size >= 52 || !matches!(compression, BI_BITFIELDS | BI_ALPHA_BITFIELDS) {
-		0
-	} else if compression == BI_ALPHA_BITFIELDS {
-		16
-	} else {
-		12
+	let external_mask_len = match compression {
+		BI_BITFIELDS if dib_size < 52 => 12,
+		BI_ALPHA_BITFIELDS if dib_size < 52 => 16,
+		BI_ALPHA_BITFIELDS if dib_size < 56 => 4,
+		_ => 0,
 	};
 	let palette_offset = header_end.checked_add(external_mask_len).ok_or(Error::Invalid)?;
 	if palette_offset > pixel_offset {
@@ -235,13 +244,29 @@ fn parse_header(data: &[u8]) -> Result<Header, Error> {
 	let masks = if matches!(compression, BI_BITFIELDS | BI_ALPHA_BITFIELDS) {
 		let mask_offset = if dib_size >= 52 { FILE_HEADER_LEN + 40 } else { header_end };
 		let masks = [read_u32(data, mask_offset)?, read_u32(data, mask_offset + 4)?, read_u32(data, mask_offset + 8)?];
-		validate_masks(masks)?;
 		Some(masks)
 	} else if bits_per_pixel == 16 {
 		Some([0x7c00, 0x03e0, 0x001f])
 	} else {
 		None
 	};
+	let alpha_mask = if compression == BI_ALPHA_BITFIELDS {
+		let offset = if dib_size >= 56 {
+			FILE_HEADER_LEN + 52
+		} else if dib_size >= 52 {
+			header_end
+		} else {
+			header_end + 12
+		};
+		Some(Some(read_u32(data, offset)?).filter(|mask| *mask != 0).ok_or(Error::Invalid)?)
+	} else if compression == BI_BITFIELDS && dib_size >= 56 {
+		Some(read_u32(data, FILE_HEADER_LEN + 52)?).filter(|mask| *mask != 0)
+	} else {
+		None
+	};
+	if let Some(masks) = masks {
+		validate_masks(masks, alpha_mask, bits_per_pixel)?;
+	}
 	let palette_entries = if bits_per_pixel <= 8 {
 		let maximum = 1usize << bits_per_pixel;
 		let entries = if colors_used == 0 { maximum } else { colors_used as usize };
@@ -256,7 +281,7 @@ fn parse_header(data: &[u8]) -> Result<Header, Error> {
 	if palette_offset.checked_add(palette_len).ok_or(Error::Invalid)? > pixel_offset {
 		return Err(Error::Truncated);
 	}
-	Ok(Header { width, height, top_down, bits_per_pixel, compression, pixel_offset, pixel_limit, palette_offset, palette_entries, palette_entry_len, masks })
+	Ok(Header { width, height, top_down, bits_per_pixel, compression, pixel_offset, pixel_limit, palette_offset, palette_entries, palette_entry_len, masks, alpha_mask })
 }
 
 fn validate_geometry(width: u32, height: u32) -> Result<(), Error> {
@@ -280,11 +305,24 @@ fn validate_format(bits_per_pixel: u16, compression: u32, top_down: bool) -> Res
 	if valid { Ok(()) } else { Err(Error::Unsupported) }
 }
 
-fn validate_masks(masks: [u32; 3]) -> Result<(), Error> {
-	if masks.iter().any(|mask| *mask == 0) || masks[0] & masks[1] != 0 || masks[0] & masks[2] != 0 || masks[1] & masks[2] != 0 {
+fn validate_masks(masks: [u32; 3], alpha_mask: Option<u32>, bits_per_pixel: u16) -> Result<(), Error> {
+	let all = [Some(masks[0]), Some(masks[1]), Some(masks[2]), alpha_mask];
+	if masks.iter().any(|mask| *mask == 0 || !mask_is_contiguous(*mask)) || alpha_mask.is_some_and(|mask| !mask_is_contiguous(mask)) {
 		return Err(Error::Invalid);
 	}
+	let mut combined = 0u32;
+	for mask in all.into_iter().flatten() {
+		if combined & mask != 0 || bits_per_pixel < 32 && mask >> bits_per_pixel != 0 {
+			return Err(Error::Invalid);
+		}
+		combined |= mask;
+	}
 	Ok(())
+}
+
+fn mask_is_contiguous(mask: u32) -> bool {
+	let shifted = mask >> mask.trailing_zeros();
+	shifted & shifted.wrapping_add(1) == 0
 }
 
 fn read_palette(data: &[u8], header: &Header) -> Result<Vec<u32>, Error> {
@@ -317,7 +355,7 @@ fn decode_rows(data: &[u8], header: &Header, palette: &[u32], output: &mut [u8])
 				8 => palette_color(palette, row[x as usize] as usize)?,
 				16 => {
 					let offset = x as usize * 2;
-					masked_color(u16::from_le_bytes([row[offset], row[offset + 1]]) as u32, header.masks.ok_or(Error::Invalid)?)
+					masked_color(u16::from_le_bytes([row[offset], row[offset + 1]]) as u32, header.masks.ok_or(Error::Invalid)?, header.alpha_mask)
 				}
 				24 => {
 					let offset = x as usize * 3;
@@ -325,7 +363,7 @@ fn decode_rows(data: &[u8], header: &Header, palette: &[u32], output: &mut [u8])
 				}
 				32 if header.masks.is_some() => {
 					let offset = x as usize * 4;
-					masked_color(u32::from_le_bytes(row[offset..offset + 4].try_into().map_err(|_| Error::Truncated)?), header.masks.ok_or(Error::Invalid)?)
+					masked_color(u32::from_le_bytes(row[offset..offset + 4].try_into().map_err(|_| Error::Truncated)?), header.masks.ok_or(Error::Invalid)?, header.alpha_mask)
 				}
 				32 => {
 					let offset = x as usize * 4;
@@ -417,11 +455,12 @@ fn palette_color(palette: &[u32], index: usize) -> Result<u32, Error> {
 	palette.get(index).copied().ok_or(Error::Invalid)
 }
 
-fn masked_color(value: u32, masks: [u32; 3]) -> u32 {
+fn masked_color(value: u32, masks: [u32; 3], alpha_mask: Option<u32>) -> u32 {
 	let red = scale_mask(value, masks[0]);
 	let green = scale_mask(value, masks[1]);
 	let blue = scale_mask(value, masks[2]);
-	red << 16 | green << 8 | blue
+	let alpha = alpha_mask.map_or(0, |mask| scale_mask(value, mask));
+	alpha << 24 | red << 16 | green << 8 | blue
 }
 
 fn scale_mask(value: u32, mask: u32) -> u32 {
@@ -480,6 +519,29 @@ mod tests {
 		bmp
 	}
 
+	fn bitfield_bmp(dib_size: usize, compression: u32, masks: [u32; 4], pixels: &[u8]) -> Vec<u8> {
+		let external = if dib_size >= 56 { 0 } else { 16 };
+		let pixel_offset = FILE_HEADER_LEN + dib_size + external;
+		let file_len = pixel_offset + pixels.len();
+		let mut bmp = vec![0; file_len];
+		bmp[..2].copy_from_slice(b"BM");
+		bmp[2..6].copy_from_slice(&(file_len as u32).to_le_bytes());
+		bmp[10..14].copy_from_slice(&(pixel_offset as u32).to_le_bytes());
+		bmp[14..18].copy_from_slice(&(dib_size as u32).to_le_bytes());
+		bmp[18..22].copy_from_slice(&2i32.to_le_bytes());
+		bmp[22..26].copy_from_slice(&1i32.to_le_bytes());
+		bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+		bmp[28..30].copy_from_slice(&32u16.to_le_bytes());
+		bmp[30..34].copy_from_slice(&compression.to_le_bytes());
+		bmp[34..38].copy_from_slice(&(pixels.len() as u32).to_le_bytes());
+		let mask_offset = FILE_HEADER_LEN + 40;
+		for (index, mask) in masks.iter().enumerate() {
+			bmp[mask_offset + index * 4..mask_offset + index * 4 + 4].copy_from_slice(&mask.to_le_bytes());
+		}
+		bmp[pixel_offset..].copy_from_slice(pixels);
+		bmp
+	}
+
 	fn colors(image: &Image) -> Vec<u32> {
 		image.pixels.chunks_exact(4).map(|pixel| u32::from_le_bytes(pixel.try_into().unwrap())).collect()
 	}
@@ -492,6 +554,18 @@ mod tests {
 		assert_eq!(colors(&decode(&bottom_up).unwrap()), expected);
 		assert_eq!(colors(&decode(&top_down).unwrap()), expected);
 		assert_eq!(decode_rgba(&bottom_up).unwrap().pixels, vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]);
+	}
+
+	#[test]
+	fn decodes_explicit_alpha_masks_but_ignores_bi_rgb_high_byte() {
+		let masks = [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0xff00_0000];
+		let pixels = [0, 0, 255, 128, 0, 255, 0, 0];
+		for bmp in [bitfield_bmp(108, BI_BITFIELDS, masks, &pixels), bitfield_bmp(40, BI_ALPHA_BITFIELDS, masks, &pixels)] {
+			assert_eq!(decode_rgba(&bmp).unwrap().pixels, vec![255, 0, 0, 128, 0, 255, 0, 0]);
+			assert_eq!(colors(&decode(&bmp).unwrap()), vec![0x00ff_0000, 0x0000_ff00]);
+		}
+		let rgb = info_bmp(2, 1, 32, BI_RGB, &[], &pixels);
+		assert_eq!(decode_rgba(&rgb).unwrap().pixels, vec![255, 0, 0, 255, 0, 255, 0, 255]);
 	}
 
 	#[test]

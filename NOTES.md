@@ -15,6 +15,8 @@
 - web camera viewer / recorder
 - tests are taking too long after every small task - optimization needed
 - Can it run Doom?
+- rename shell
+- shell scripts
 - text selection by mouse lags horribly
 - when I press and hold enter in shell, sometimes it writes "vol://system> vol://system>" on the same row (not just "vol://system>" on next row)
 - why there is a "help" command again when it was deleted already?

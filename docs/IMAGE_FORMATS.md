@@ -96,18 +96,28 @@ orientation. Output is bottom-up 24-bit `BI_RGB` or 8-bit indexed `BI_RGB` with
 `RGBQUAD` palette. Those emitted profiles are **Verified** against Microsoft GDI
 layout. OS/2 headers, embedded JPEG/PNG, color-management payloads and unimplemented
 compression modes are **Subsets** and must return `Unsupported` after a structural
-BMP match. Alpha-mask behavior in V4/V5 and `BI_BITFIELDS` input still needs a
-profile-by-profile audit before the decoder can claim alpha-capable BMP support.
+BMP match. For 16/32bpp `BI_BITFIELDS` and `BI_ALPHABITFIELDS`, RGB masks must be
+nonzero, contiguous, disjoint and inside the declared pixel width. A nonzero fourth
+mask in a 56-byte-or-larger V3/V4/V5 header, or the required external fourth mask
+for `BI_ALPHABITFIELDS`, supplies straight alpha to RGBA decode. In contrast,
+Microsoft defines the high byte of 32bpp `BI_RGB` as unused, so it remains opaque.
+The legacy `decode` API remains BGRX while `decode_rgba` exposes explicit masked
+alpha. Embedded V4 and external four-mask regressions pin alpha 0/128/255. Status:
+**Verified profile** for these mask layouts.
 
 ### ICO
 
-The ICO leaf accepts icon directories with bounded entries backed by supported
-DIB/BMP or PNG payloads, applies the DIB XOR image and 1-bit AND transparency
-mask, and selects the best supported size/depth. Output uses PNG-backed entries.
-CUR hotspots and cursor output are an intentional **Subset**. The remaining audit
-must pin directory width/height zero-as-256, doubled DIB height, AND-row padding,
-32-bit alpha versus AND-mask precedence and overlapping entry ranges against
-vendor-generated fixtures.
+The ICO leaf accepts icon directories with bounded, nonempty, nonoverlapping entries
+backed by PNG or the selected 32bpp DIB profile, and selects the largest supported
+image. For 32bpp DIB entries, the XOR bitmap's BGRA alpha is authoritative for every
+pixel: the legacy 1-bit AND mask is ignored even when all XOR alpha bytes are zero,
+and may be absent. This matches ImageMagick 7.1.1-43 and the deployed image-rs/Pillow/
+Wine convention. Synthetic conflict, all-zero-alpha and maskless fixtures pin the
+same RGBA results. Lower-depth DIB entries that require the AND mask, CUR hotspots and
+cursor output are intentional **Subsets**. Output uses PNG-backed entries. Directory
+zero-as-256 dimensions, doubled DIB height and payload range validation are covered;
+zero-sized or overlapping entries are invalid. Status: **Verified profile** for PNG
+and 32bpp DIB icon entries.
 
 ### ICNS
 
@@ -179,11 +189,9 @@ required for the corpus gate.
 
 ## Closure order
 
-1. Complete BMP alpha-mask and ICO DIB/mask precedence audits against Microsoft
-   fixtures.
-2. Resolve GIF logical-screen background versus transparent-index interoperability
+1. Resolve GIF logical-screen background versus transparent-index interoperability
   against independent browser/tool output.
-3. Add independent corpora for the remaining verified/subset claims, prioritizing
+2. Add independent corpora for the remaining verified/subset claims, prioritizing
    ICNS, PCX and TGA where the primary-source chain is weakest.
 
 No format moves from **Gap** or **Source uncertain** to **Verified** without an

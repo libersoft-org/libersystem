@@ -3125,6 +3125,16 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     stop coercing legal zero delays. Focused suites pass: pix 8/8, WebP 11/11, APNG
     4/4, GIF 3/3 and `imgconv` 15/15. GIF logical-screen background-index semantics
     remain explicitly open for an independent interoperability corpus.
+  - Partial result (2026-07-17): BMP now distinguishes explicit alpha masks from the
+    unused high byte of 32bpp `BI_RGB`. V3/V4/V5 `BI_BITFIELDS` and external
+    `BI_ALPHABITFIELDS` masks are checked for nonzero contiguous disjoint ranges and
+    `decode_rgba` preserves masked alpha while the legacy BGRX API remains stable.
+    The supported 32bpp ICO DIB profile now treats XOR BGRA alpha as authoritative,
+    ignores the AND mask even for all-zero alpha and accepts its absence, matching
+    ImageMagick 7.1.1-43 plus the image-rs/Pillow/Wine convention. ICO also rejects
+    zero-sized and overlapping directory payloads. Conflict, all-zero, maskless,
+    embedded-mask and external-mask regressions pass; BMP is 9/9, ICO 3/3 and
+    `imgconv` 15/15. Lower-depth ICO DIB/AND-mask profiles remain typed Unsupported.
 - [ ] Make content sniffing structural and collision-resistant. APNG detection must
   walk real PNG chunk boundaries instead of finding `acTL` in arbitrary compressed
   bytes; PCX detection must validate its header fields instead of claiming every file

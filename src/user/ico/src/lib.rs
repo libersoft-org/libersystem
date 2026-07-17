@@ -29,17 +29,20 @@ pub fn decode_all(data: &[u8]) -> Result<Vec<pix::RgbaImage>, Error> {
 	let table_end = 6usize.checked_add(count.checked_mul(16).ok_or(Error::TooLarge)?).ok_or(Error::TooLarge)?;
 	let table = data.get(6..table_end).ok_or(Error::Truncated)?;
 	let mut images = Vec::new();
+	let mut ranges = Vec::new();
 	images.try_reserve_exact(count).map_err(|_| Error::TooLarge)?;
+	ranges.try_reserve_exact(count).map_err(|_| Error::TooLarge)?;
 	for entry in table.chunks_exact(16) {
 		let width = if entry[0] == 0 { 256 } else { entry[0] as u32 };
 		let height = if entry[1] == 0 { 256 } else { entry[1] as u32 };
 		let size = u32::from_le_bytes(entry[8..12].try_into().map_err(|_| Error::Truncated)?) as usize;
 		let offset = u32::from_le_bytes(entry[12..16].try_into().map_err(|_| Error::Truncated)?) as usize;
 		let end = offset.checked_add(size).ok_or(Error::TooLarge)?;
-		if offset < table_end {
+		if size == 0 || offset < table_end || ranges.iter().any(|(start, previous_end)| offset < *previous_end && *start < end) {
 			return Err(Error::Invalid);
 		}
 		let payload = data.get(offset..end).ok_or(Error::Truncated)?;
+		ranges.push((offset, end));
 		let image = if payload.starts_with(b"\x89PNG\r\n\x1a\n") { png::decode_rgba(payload).map_err(map_png)? } else { decode_bmp_entry(payload, width, height)? };
 		if image.width != width || image.height != height {
 			return Err(Error::Invalid);
@@ -106,30 +109,13 @@ fn decode_bmp_entry(data: &[u8], expected_width: u32, expected_height: u32) -> R
 	let xor_len = width as usize * height as usize * 4;
 	let xor_end = header_len.checked_add(xor_len).ok_or(Error::TooLarge)?;
 	let xor = data.get(header_len..xor_end).ok_or(Error::Truncated)?;
-	let mask_stride = (width as usize).div_ceil(32) * 4;
-	let mask_len = mask_stride.checked_mul(height as usize).ok_or(Error::TooLarge)?;
-	let mask_end = xor_end.checked_add(mask_len).ok_or(Error::TooLarge)?;
-	let mask = data.get(xor_end..mask_end).ok_or(Error::Truncated)?;
-	let has_alpha = xor.chunks_exact(4).any(|pixel| pixel[3] != 0);
 	let mut pixels = alloc::vec![0u8; xor_len];
 	for file_y in 0..height as usize {
 		let y = height as usize - 1 - file_y;
 		for x in 0..width as usize {
 			let source = (file_y * width as usize + x) * 4;
 			let target = (y * width as usize + x) * 4;
-			let transparent = mask[file_y * mask_stride + x / 8] & (0x80 >> (x % 8)) != 0;
-			pixels[target..target + 4].copy_from_slice(&[
-				xor[source + 2],
-				xor[source + 1],
-				xor[source],
-				if transparent {
-					0
-				} else if has_alpha {
-					xor[source + 3]
-				} else {
-					255
-				},
-			]);
+			pixels[target..target + 4].copy_from_slice(&[xor[source + 2], xor[source + 1], xor[source], xor[source + 3]]);
 		}
 	}
 	pix::RgbaImage::new(width, height, pixels).map_err(map_pix)
@@ -159,6 +145,27 @@ mod tests {
 	use super::*;
 	use alloc::vec;
 
+	fn dib_icon(xor: &[u8], mask: &[u8]) -> Vec<u8> {
+		let payload_len = 40 + xor.len() + mask.len();
+		let mut icon = vec![0; 22 + payload_len];
+		icon[..6].copy_from_slice(&[0, 0, 1, 0, 1, 0]);
+		icon[6..10].copy_from_slice(&[2, 1, 0, 0]);
+		icon[10..12].copy_from_slice(&1u16.to_le_bytes());
+		icon[12..14].copy_from_slice(&32u16.to_le_bytes());
+		icon[14..18].copy_from_slice(&(payload_len as u32).to_le_bytes());
+		icon[18..22].copy_from_slice(&22u32.to_le_bytes());
+		let dib = &mut icon[22..62];
+		dib[..4].copy_from_slice(&40u32.to_le_bytes());
+		dib[4..8].copy_from_slice(&2i32.to_le_bytes());
+		dib[8..12].copy_from_slice(&2i32.to_le_bytes());
+		dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+		dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+		dib[20..24].copy_from_slice(&(xor.len() as u32).to_le_bytes());
+		icon[62..62 + xor.len()].copy_from_slice(xor);
+		icon[62 + xor.len()..].copy_from_slice(mask);
+		icon
+	}
+
 	#[test]
 	fn png_entries_round_trip_and_best_size_wins() {
 		let small = pix::RgbaImage::new(1, 1, vec![1, 2, 3, 4]).unwrap();
@@ -169,9 +176,27 @@ mod tests {
 	}
 
 	#[test]
+	fn thirty_two_bit_xor_alpha_ignores_and_mask_and_needs_no_fallback() {
+		let nonzero = dib_icon(&[0, 0, 255, 128, 0, 255, 0, 255], &[0xc0, 0, 0, 0]);
+		assert_eq!(decode(&nonzero).unwrap().pixels, vec![255, 0, 0, 128, 0, 255, 0, 255]);
+		let all_zero = dib_icon(&[0, 0, 255, 0, 0, 255, 0, 0], &[0x80, 0, 0, 0]);
+		assert_eq!(decode(&all_zero).unwrap().pixels, vec![255, 0, 0, 0, 0, 255, 0, 0]);
+		let no_mask = dib_icon(&[0, 0, 255, 128, 0, 255, 0, 255], &[]);
+		assert_eq!(decode(&no_mask).unwrap().pixels, vec![255, 0, 0, 128, 0, 255, 0, 255]);
+	}
+
+	#[test]
 	fn rejects_bad_table_and_oversized_entry() {
 		assert_eq!(decode(&[]), Err(Error::Truncated));
 		let large = pix::RgbaImage::new(257, 1, vec![0; 257 * 4]).unwrap();
 		assert_eq!(encode(&[large], 50), Err(Error::Unsupported));
+		let image = pix::RgbaImage::new(1, 1, vec![1, 2, 3, 255]).unwrap();
+		let mut overlap = encode(&[image.clone(), image], 50).unwrap();
+		let first_offset = overlap[18..22].to_vec();
+		overlap[34..38].copy_from_slice(&first_offset);
+		assert_eq!(decode(&overlap), Err(Error::Invalid));
+		let mut empty = overlap;
+		empty[14..18].fill(0);
+		assert_eq!(decode(&empty), Err(Error::Invalid));
 	}
 }
