@@ -116,7 +116,7 @@ dynamic   dyn_probe             dyn_probe volume pix proto lsrt
 # command-line tools - loaded from the system volume under bin/.
 dynamic   date       tools  volume proto ipc-client wire lsrt
 dynamic   cat        tools  volume proto ipc-client wire lsrt
-tool      write      tools  volume
+dynamic   write      tools  volume proto wire lsrt
 tool      rm         tools  volume
 tool      ls         tools  volume
 tool      du         tools  volume

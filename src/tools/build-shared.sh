@@ -63,7 +63,7 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 	set +e
 	(
 		cd "$root/user/tools"
-		CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK=33554432 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --release --target "$cargo_target" --bin date --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$image_seed"
+		CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK=67108864 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --release --target "$cargo_target" --bin date --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$image_seed"
 	) >"$image_graph" 2>"$image_graph_errors"
 	graph_status=$?
 	set -e
@@ -124,7 +124,7 @@ for spec in "$@"; do
 		deps="$image_target/$target/release/deps"
 		rlib="$(graph_archive "$crate_dir")"
 	else
-		(cd "$crate_dir" && RUST_MIN_STACK=33554432 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$cargo_target" --lib "${features[@]}")
+		(cd "$crate_dir" && RUST_MIN_STACK=67108864 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$cargo_target" --lib "${features[@]}")
 		deps="$crate_dir/target/$target/release/deps"
 		rlib="$(find "$deps" -maxdepth 1 -name "lib${crate_rust}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 	fi
@@ -367,7 +367,7 @@ if [[ -n "$image_graph" ]]; then
 		set +e
 		(
 			cd "$consumer_dir"
-			CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK=33554432 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --quiet --release --target "$cargo_target" --bin "$consumer" --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$consumer_obj"
+			CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK=67108864 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --quiet --release --target "$cargo_target" --bin "$consumer" --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$consumer_obj"
 		) >/dev/null 2>"$consumer_errors"
 		consumer_status=$?
 		set -e
@@ -437,7 +437,7 @@ fi
 
 if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	probe="user/dyn_probe"
-	(cd "$probe" && RUST_MIN_STACK=33554432 RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
+	(cd "$probe" && RUST_MIN_STACK=67108864 RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
 	probe_rlib="$(find "$probe/target/$target/release/deps" -maxdepth 1 -name 'libdyn_probe-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 	probe_dir="$probe/shared/$target"
 	mkdir -p "$probe_dir"

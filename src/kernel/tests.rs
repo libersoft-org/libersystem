@@ -4616,6 +4616,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
 	loader::spawn_elf_process(domain, process_elf, process_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+	let mut writable_storage = StorageHarness::start(storage_elf, b"BLOCK", volume, 64 * 1024 * 1024);
 
 	// StorageService: the ramdisk volume archive (staging the tools under bin/) and its
 	// service channel.
@@ -4626,7 +4627,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	// StorageService client it loads binaries from, then its own service channel. The
 	// receive order matches ProcessService's: package, storage, serve.
 	send_package(&process_boot_kernel, init).expect("process package bootstrap");
-	send_cap(&process_boot_kernel, b"STORAGE", storage_client, Rights::ALL).expect("process storage bootstrap");
+	send_cap(&process_boot_kernel, b"STORAGE", storage_client.clone(), Rights::ALL).expect("process storage bootstrap");
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
 
 	// START a staged static tool: [op = 1 u16][corr u32][name: [len u16][utf8]].
@@ -4722,6 +4723,74 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(date_reply.bytes[4], 1, "the date PIE loaded with its manifest providers");
 	drop(date_bootstrap_kernel);
 	sched::run_until_idle();
+
+	// Write through the first mutable ordinary PIE, then launch the dynamic cat against the
+	// same live StorageService and read the new file back. This proves the manifest graph
+	// supports streamed capability-gated writes, persistent storage and a second PIE reader.
+	let write_name: &[u8] = b"write";
+	let (write_stdout_kernel, write_stdout_user) = Channel::create();
+	let (write_bootstrap_kernel, write_bootstrap_user) = Channel::create();
+	let mut write_launch = alloc::vec::Vec::new();
+	write_launch.extend_from_slice(&3u16.to_le_bytes());
+	write_launch.extend_from_slice(&22u32.to_le_bytes());
+	write_launch.extend_from_slice(&(write_name.len() as u16).to_le_bytes());
+	write_launch.extend_from_slice(write_name);
+	write_launch.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&process_client, &write_launch, write_bootstrap_user, Rights::ALL).expect("dynamic write launch request");
+	sched::run_until_idle();
+	let write_reply = process_client.recv().expect("dynamic write launch reply");
+	assert_eq!(le_u32(&write_reply.bytes, 0), 22);
+	assert_eq!(write_reply.bytes[4], 1, "the write PIE loaded with its manifest providers");
+	send_cap(&write_bootstrap_kernel, b"STDOUT", write_stdout_user, Rights::ALL).expect("dynamic write stdout bootstrap");
+	write_bootstrap_kernel.send(Message::new(b"vol://system/dynamic-write.txt dynamic write".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic write arguments");
+	send_cap(&write_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("dynamic write system volume");
+	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..]] {
+		write_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic write absent volume");
+	}
+	write_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic write cwd");
+	let mut write_prefix = None;
+	for _ in 0..100_000 {
+		writable_storage.pump();
+		if let Ok(message) = write_stdout_kernel.recv() {
+			write_prefix = Some(message);
+			break;
+		}
+	}
+	assert_eq!(&write_prefix.expect("dynamic write confirmation prefix").bytes, b"wrote ");
+	assert_eq!(&write_stdout_kernel.recv().expect("dynamic write confirmation path").bytes, b"vol://system/dynamic-write.txt");
+	assert_eq!(&write_stdout_kernel.recv().expect("dynamic write confirmation newline").bytes, b"\n");
+
+	let cat_name: &[u8] = b"cat";
+	let (cat_stdout_kernel, cat_stdout_user) = Channel::create();
+	let (cat_bootstrap_kernel, cat_bootstrap_user) = Channel::create();
+	let mut cat_launch = alloc::vec::Vec::new();
+	cat_launch.extend_from_slice(&3u16.to_le_bytes());
+	cat_launch.extend_from_slice(&23u32.to_le_bytes());
+	cat_launch.extend_from_slice(&(cat_name.len() as u16).to_le_bytes());
+	cat_launch.extend_from_slice(cat_name);
+	cat_launch.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&process_client, &cat_launch, cat_bootstrap_user, Rights::ALL).expect("dynamic cat launch request");
+	sched::run_until_idle();
+	let cat_reply = process_client.recv().expect("dynamic cat launch reply");
+	assert_eq!(le_u32(&cat_reply.bytes, 0), 23);
+	assert_eq!(cat_reply.bytes[4], 1, "the cat PIE loaded for write read-back");
+	send_cap(&cat_bootstrap_kernel, b"STDOUT", cat_stdout_user, Rights::ALL).expect("dynamic cat stdout bootstrap");
+	cat_bootstrap_kernel.send(Message::new(b"vol://system/dynamic-write.txt".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic cat arguments");
+	send_cap(&cat_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("dynamic cat system volume");
+	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..]] {
+		cat_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic cat absent volume");
+	}
+	cat_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic cat cwd");
+	let mut cat_output = None;
+	for _ in 0..100_000 {
+		writable_storage.pump();
+		if let Ok(message) = cat_stdout_kernel.recv() {
+			cat_output = Some(message);
+			break;
+		}
+	}
+	assert_eq!(&cat_output.expect("dynamic cat read-back").bytes, b"dynamic write");
+	assert_eq!(&cat_stdout_kernel.recv().expect("dynamic cat read-back newline").bytes, b"\n");
 
 	// LAUNCH the ET_DYN probe with a bootstrap channel. ProcessService must resolve
 	// pix.lslib -> lsrt.lslib from vol://system/lib, load providers first, relocate the

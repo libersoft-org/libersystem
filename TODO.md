@@ -3529,8 +3529,8 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     functions, `recv_vec_blocking` and `resolve`, exported by `lsrt` under explicit stable
     names. `build-shared.sh` now rejects provider-set drift and requires each transport
     import to have exactly one `lsrt` definition. Source packages compile and the complete
-    provider graph links on all three architectures; RISC-V build-std uses the compiler-
-    recommended 32 MB worker stack. Whole-image identity records, a single deterministic
+    provider graph links on all three architectures; cross-target build-std uses the compiler-
+    recommended 64 MB worker stack. Whole-image identity records, a single deterministic
     invocation and the executable-side identity audit remain open with the start-object/
     image-linker work below.
   - Partial result (2026-07-17): one clean Cargo invocation now owns the actual image
@@ -3586,7 +3586,9 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     `date` reaches TimeService through `proto + ipc-client + wire + lsrt` and renders its
     ISO-8601 result. `cat` uses the same provider set, is 8,704/9,088/10,064 bytes, and
     the QEMU gate compares its StorageService-backed output byte-for-byte with the staged
-    file. The remaining executable set is still open.
+    file. `write` links directly to `proto + wire + lsrt`, is 7,320/7,864/9,152 bytes,
+    and a block-backed QEMU workflow streams a new file through StorageService before the
+    dynamic cat reads the exact bytes back. The remaining executable set is still open.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,
   crate/source owner, output class/path, direct providers and build-feature set; each
