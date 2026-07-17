@@ -3194,6 +3194,18 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     LiberSystem PNG-backed 32/256 output and independently checks every external input.
     ICO is 4/4; lower-depth DIB/AND and CUR remain typed subsets while the rest of the
     matrix stays open.
+  - Partial result (2026-07-17): BMP now has a corpus covering direct ImageMagick
+    24bpp `BI_RGB` and V5 RGBA masks, direct Netpbm indexed 8bpp `BI_RGB`, plus
+    header-only V3/V4 alpha-mask and 32bpp `BI_RGB` derivatives retaining the
+    externally generated pixel bytes. ImageMagick 7.1.1-43 and Pillow 11.1 agree
+    exactly on V3/V4/V5 alpha. For 32bpp `BI_RGB`, Pillow and Netpbm 11.10.2
+    ignore the non-opaque high bytes as Microsoft specifies and match LiberSystem;
+    ImageMagick interprets them as alpha, a documented implementation divergence.
+    Leaf tests pin exact headers, whole-buffer FNV-1a and artifact SHA-256 under
+    `user/bmp/tests/data`. The reciprocal host-only `just bmp-conformance` gate
+    requires exact ImageMagick/Netpbm pixels for LiberSystem 24bpp and indexed
+    8bpp output. BMP is 10/10; remaining lower-depth/OS2/RLE profiles and the rest
+    of the matrix stay open.
   - Partial result (2026-07-17): PCX now has external ImageMagick 7.1.1-43 fixtures
     for version-5 indexed one-plane RLE with trailing palette and RGB three-plane RLE.
     Their odd 17/19-byte declared row strides exercise interoperability beyond our

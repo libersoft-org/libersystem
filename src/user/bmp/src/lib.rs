@@ -496,6 +496,10 @@ mod tests {
 	use super::*;
 	use alloc::vec;
 
+	fn fnv1a(bytes: &[u8]) -> u64 {
+		bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3))
+	}
+
 	fn info_bmp(width: i32, height: i32, bits: u16, compression: u32, palette: &[[u8; 4]], pixels: &[u8]) -> Vec<u8> {
 		let pixel_offset = FILE_HEADER_LEN + INFO_HEADER_LEN + palette.len() * 4;
 		let file_len = pixel_offset + pixels.len();
@@ -637,5 +641,28 @@ mod tests {
 		assert!(read_u32(&low, 46).unwrap() <= 16);
 		assert!(read_u32(&high, 46).unwrap() > read_u32(&low, 46).unwrap());
 		assert_eq!(decode_rgba(&low).unwrap().width, true_color.width);
+	}
+
+	#[test]
+	fn decodes_external_truecolor_indexed_and_alpha_mask_profiles() {
+		for (data, dib, depth, compression, width, height, hash) in [
+			(include_bytes!("../tests/data/external-rgb24.bmp").as_slice(), 40, 24, BI_RGB, 19, 7, 0xe625_4907_e10a_8c80),
+			(include_bytes!("../tests/data/derived-rgb32.bmp").as_slice(), 40, 32, BI_RGB, 19, 7, 0xad99_3a39_14fe_5247),
+			(include_bytes!("../tests/data/external-indexed8.bmp").as_slice(), 40, 8, BI_RGB, 37, 7, 0x2941_c44b_e6b7_19ed),
+			(include_bytes!("../tests/data/derived-v3-alpha.bmp").as_slice(), 56, 32, BI_BITFIELDS, 19, 7, 0xf61b_87cd_e45b_3532),
+			(include_bytes!("../tests/data/derived-v4-alpha.bmp").as_slice(), 108, 32, BI_BITFIELDS, 19, 7, 0xf61b_87cd_e45b_3532),
+			(include_bytes!("../tests/data/external-v5-alpha.bmp").as_slice(), 124, 32, BI_BITFIELDS, 19, 7, 0xf61b_87cd_e45b_3532),
+		] {
+			assert_eq!(read_u32(data, 14).unwrap(), dib);
+			assert_eq!(read_u16(data, 28).unwrap(), depth);
+			assert_eq!(read_u32(data, 30).unwrap(), compression);
+			let image = decode_rgba(data).unwrap();
+			assert_eq!((image.width, image.height, fnv1a(&image.pixels)), (width, height, hash));
+		}
+
+		let rgb32 = include_bytes!("../tests/data/derived-rgb32.bmp");
+		let offset = read_u32(rgb32, 10).unwrap() as usize;
+		assert!(rgb32[offset + 3..].iter().step_by(4).any(|high| *high != 255));
+		assert!(decode_rgba(rgb32).unwrap().pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
 	}
 }

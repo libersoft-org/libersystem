@@ -110,7 +110,15 @@ for `BI_ALPHABITFIELDS`, supplies straight alpha to RGBA decode. In contrast,
 Microsoft defines the high byte of 32bpp `BI_RGB` as unused, so it remains opaque.
 The legacy `decode` API remains BGRX while `decode_rgba` exposes explicit masked
 alpha. Embedded V4 and external four-mask regressions pin alpha 0/128/255. Status:
-**Verified profile** for these mask layouts.
+**Verified profile** for these mask layouts. The independent corpus adds direct
+ImageMagick 24bpp `BI_RGB` and V5 RGBA-mask files, direct Netpbm indexed 8bpp
+`BI_RGB`, and header-only V3/V4 derivatives retaining the V5 masks and pixels.
+ImageMagick and Pillow agree exactly on V3/V4/V5 alpha. A derived 32bpp `BI_RGB`
+file deliberately carries non-opaque high bytes: Pillow and Netpbm ignore them
+and match LiberSystem/Microsoft semantics, while ImageMagick interprets them as
+alpha, a documented implementation divergence. Complete RGBA buffers are pinned
+by FNV-1a. The reciprocal `just bmp-conformance` gate requires exact ImageMagick
+and Netpbm pixels for LiberSystem 24bpp and indexed 8bpp output.
 
 ### ICO
 
