@@ -309,6 +309,18 @@ leaving empty accounting nodes, and concurrent imgconv processes share the cap. 
 leave an existing destination byte-for-byte intact. The runtime emits this registered
 diagnostic directly at the failed heap-backing boundary, without requiring another allocation.
 
+## Tool contract
+
+`imgconv --help` is generated from the same `FORMAT_PROFILES` table that argument parsing
+uses for output capabilities and defaults. The command accepts two paths plus the documented
+format, resize, frame, loop, quality, compression and WebP mode options; metadata is stripped.
+
+`imgview` accepts exactly one image path. Version one displays a still image or composited
+animation frame 0 and does not play animations. `imgview --help` states this explicitly. The
+governed `just test-tags image` gate compares the complete 2x2 BGRX display buffer for an
+opaque BMP, a PNG with partial and zero alpha, and frame 0 of an external two-frame WebP,
+then verifies focus-scoped quit input, surface release and clean process exit for every case.
+
 ## Closure order
 
 1. Add independent corpora for the remaining verified/subset claims, prioritizing

@@ -4,6 +4,7 @@ extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::fmt::Write as _;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -95,20 +96,91 @@ pub struct Capabilities {
 	pub alpha: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormatProfile {
+	pub format: Format,
+	pub capabilities: Capabilities,
+	pub default_quality: Option<u8>,
+	pub default_compression: Option<u8>,
+	pub default_mode: Option<Mode>,
+	pub lossy_quality: Option<u8>,
+	pub lossy_compression: Option<u8>,
+}
+
+pub const FORMAT_PROFILES: &[FormatProfile] = &[
+	FormatProfile { format: Format::Apng, capabilities: Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: true, alpha: true }, default_quality: None, default_compression: Some(50), default_mode: None, lossy_quality: None, lossy_compression: None },
+	FormatProfile { format: Format::Bmp, capabilities: Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false }, default_quality: None, default_compression: None, default_mode: None, lossy_quality: None, lossy_compression: None },
+	FormatProfile { format: Format::Gif, capabilities: Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: false, animation: true, alpha: true }, default_quality: Some(100), default_compression: None, default_mode: None, lossy_quality: None, lossy_compression: None },
+	FormatProfile { format: Format::Ico, capabilities: Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true }, default_quality: None, default_compression: Some(50), default_mode: None, lossy_quality: None, lossy_compression: None },
+	FormatProfile { format: Format::Icns, capabilities: Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true }, default_quality: None, default_compression: Some(50), default_mode: None, lossy_quality: None, lossy_compression: None },
+	FormatProfile { format: Format::Jpeg, capabilities: Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: true, animation: false, alpha: false }, default_quality: Some(90), default_compression: None, default_mode: Some(Mode::Lossy), lossy_quality: Some(90), lossy_compression: None },
+	FormatProfile { format: Format::Png, capabilities: Capabilities { quality: true, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true }, default_quality: None, default_compression: Some(50), default_mode: None, lossy_quality: None, lossy_compression: None },
+	FormatProfile { format: Format::Pcx, capabilities: Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false }, default_quality: None, default_compression: None, default_mode: None, lossy_quality: None, lossy_compression: None },
+	FormatProfile { format: Format::Ppm, capabilities: Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false }, default_quality: None, default_compression: None, default_mode: None, lossy_quality: None, lossy_compression: None },
+	FormatProfile { format: Format::Qoi, capabilities: Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: true }, default_quality: None, default_compression: None, default_mode: None, lossy_quality: None, lossy_compression: None },
+	FormatProfile { format: Format::Tga, capabilities: Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: true }, default_quality: None, default_compression: None, default_mode: None, lossy_quality: None, lossy_compression: None },
+	FormatProfile { format: Format::WebP, capabilities: Capabilities { quality: true, compression: true, lossless_mode: true, lossy_mode: true, animation: true, alpha: true }, default_quality: None, default_compression: Some(100), default_mode: Some(Mode::Lossless), lossy_quality: Some(90), lossy_compression: Some(100) },
+];
+
+pub fn profile(format: Format) -> &'static FormatProfile {
+	FORMAT_PROFILES.iter().find(|profile| profile.format == format).expect("complete format profile table")
+}
+
 pub const fn capabilities(format: Format) -> Capabilities {
-	match format {
-		Format::Apng => Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: true, alpha: true },
-		Format::Bmp => Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false },
-		Format::Gif => Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: false, animation: true, alpha: true },
-		Format::Ico => Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
-		Format::Icns => Capabilities { quality: false, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
-		Format::Jpeg => Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: true, animation: false, alpha: false },
-		Format::Png => Capabilities { quality: true, compression: true, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
-		Format::Pcx => Capabilities { quality: true, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false },
-		Format::Ppm => Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: false },
-		Format::Qoi | Format::Tga => Capabilities { quality: false, compression: false, lossless_mode: false, lossy_mode: false, animation: false, alpha: true },
-		Format::WebP => Capabilities { quality: true, compression: true, lossless_mode: true, lossy_mode: true, animation: true, alpha: true },
+	FORMAT_PROFILES[format as usize].capabilities
+}
+
+pub fn help_text() -> String {
+	let mut help = String::from("Usage: imgconv [options] <input> <output>\n\nOptions:\n  --format <name>       Output format (must match output suffix)\n  --force               Replace an existing destination\n  --resize <WxH>        Resize output within image geometry limits\n  --filter <name>       nearest or bilinear (default: bilinear)\n  --frame <index>       Extract one composited animation frame\n  --loop <count>        Override animation loop count\n  --quality <0..100>    Palette/lossy quality where supported\n  --compression <0..100> Encoder effort where supported\n  --lossless            Select lossless WebP mode\n  --lossy               Select lossy JPEG/WebP mode\n  --help                 Show this help\n\nOutput profiles:\n");
+	for profile in FORMAT_PROFILES {
+		let caps = profile.capabilities;
+		let _ = write!(help, "  {:<5} options:", profile.format.name());
+		if caps.quality {
+			help.push_str(" quality");
+		}
+		if caps.compression {
+			help.push_str(" compression");
+		}
+		if caps.lossless_mode {
+			help.push_str(" lossless");
+		}
+		if caps.lossy_mode {
+			help.push_str(" lossy");
+		}
+		if caps.animation {
+			help.push_str(" animation");
+		}
+		if !caps.quality && !caps.compression && !caps.lossless_mode && !caps.lossy_mode && !caps.animation {
+			help.push_str(" none");
+		}
+		help.push_str("; defaults:");
+		if let Some(mode) = profile.default_mode {
+			help.push_str(match mode {
+				Mode::Lossless => " mode=lossless",
+				Mode::Lossy => " mode=lossy",
+			});
+		}
+		if let Some(quality) = profile.default_quality {
+			let _ = write!(help, " quality={quality}");
+		}
+		if let Some(compression) = profile.default_compression {
+			let _ = write!(help, " compression={compression}");
+		}
+		if profile.default_mode.is_none() && profile.default_quality.is_none() && profile.default_compression.is_none() {
+			help.push_str(" none");
+		}
+		if profile.default_mode != Some(Mode::Lossy) && (profile.lossy_quality.is_some() || profile.lossy_compression.is_some()) {
+			help.push_str("; lossy defaults:");
+			if let Some(quality) = profile.lossy_quality {
+				let _ = write!(help, " quality={quality}");
+			}
+			if let Some(compression) = profile.lossy_compression {
+				let _ = write!(help, " compression={compression}");
+			}
+		}
+		help.push('\n');
 	}
+	help
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,33 +300,16 @@ pub fn parse_args(args: &[u8]) -> Result<Config, Error> {
 	if format != suffix_format {
 		return Err(Error::InvalidOptions);
 	}
-	match format {
-		Format::Apng | Format::Ico | Format::Icns | Format::Png => {
-			compression.get_or_insert(50);
-		}
-		Format::Gif => {
-			quality.get_or_insert(100);
-		}
-		Format::Jpeg => {
-			quality.get_or_insert(90);
-			mode.get_or_insert(Mode::Lossy);
-		}
-		Format::WebP => {
-			mode.get_or_insert(Mode::Lossless);
-			match mode {
-				Some(Mode::Lossless) => {
-					compression.get_or_insert(100);
-				}
-				Some(Mode::Lossy) => {
-					quality.get_or_insert(90);
-					compression.get_or_insert(100);
-				}
-				None => unreachable!(),
-			}
-		}
-		_ => {}
-	};
-	let caps = capabilities(format);
+	let profile = profile(format);
+	mode = mode.or(profile.default_mode);
+	if mode == Some(Mode::Lossy) {
+		quality = quality.or(profile.lossy_quality);
+		compression = compression.or(profile.lossy_compression);
+	} else {
+		quality = quality.or(profile.default_quality);
+		compression = compression.or(profile.default_compression);
+	}
+	let caps = profile.capabilities;
 	if compression.is_some() && !caps.compression {
 		return Err(Error::UnsupportedOption);
 	}
@@ -683,6 +738,30 @@ mod tests {
 		assert_eq!(parse_args(b"--lossless --quality 80 in.png out.webp"), Err(Error::UnsupportedOption));
 		assert_eq!(parse_args(b"--lossy --compression 0 in.png out.webp").unwrap().compression, Some(0));
 		assert_eq!(parse_args(b"--format bmp in.png out.png"), Err(Error::InvalidOptions));
+	}
+
+	#[test]
+	fn help_and_parser_defaults_follow_format_profiles() {
+		let help = help_text();
+		assert!(help.starts_with("Usage: imgconv [options] <input> <output>\n"));
+		assert_eq!(FORMAT_PROFILES.len(), 12);
+		for profile in FORMAT_PROFILES {
+			assert_eq!(capabilities(profile.format), profile.capabilities);
+			assert!(help.contains(&alloc::format!("  {:<5} options:", profile.format.name())));
+		}
+		assert!(help.contains("WebP  options: quality compression lossless lossy animation; defaults: mode=lossless compression=100; lossy defaults: quality=90 compression=100"));
+		for (output, expected) in [
+			("out.apng", (None, Some(50), None)),
+			("out.gif", (Some(100), None, None)),
+			("out.jpg", (Some(90), None, Some(Mode::Lossy))),
+			("out.png", (None, Some(50), None)),
+			("out.webp", (None, Some(100), Some(Mode::Lossless))),
+		] {
+			let config = parse_args(alloc::format!("in.bmp {output}").as_bytes()).unwrap();
+			assert_eq!((config.quality, config.compression, config.mode), expected);
+		}
+		let lossy = parse_args(b"--lossy in.bmp out.webp").unwrap();
+		assert_eq!((lossy.quality, lossy.compression, lossy.mode), (Some(90), Some(100), Some(Mode::Lossy)));
 	}
 
 	#[test]

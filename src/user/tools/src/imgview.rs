@@ -18,6 +18,8 @@ use proto::path;
 use proto::system::{OpenOpts, input, volume};
 use rt::*;
 
+const USAGE: &[u8] = b"Usage: imgview <image>\nDisplays a still image or composited animation frame 0; animation playback is not supported.\n";
+
 struct DecodedImage {
 	width: u32,
 	height: u32,
@@ -47,6 +49,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
 		let arg = tools::trim(&arg);
+		if arg == b"--help" {
+			print(USAGE);
+			close_if_present(display_channel);
+			close_if_present(input_channel);
+			exit();
+		}
+		if arg.is_empty() || arg.iter().any(u8::is_ascii_whitespace) {
+			print(USAGE);
+			close_if_present(display_channel);
+			close_if_present(input_channel);
+			exit();
+		}
 		let Some(uri) = path::resolve(cwd, arg) else {
 			print(b"imgview: invalid path\n");
 			exit();

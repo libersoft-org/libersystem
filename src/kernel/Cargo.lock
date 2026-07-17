@@ -108,6 +108,7 @@ dependencies = [
  "bmp",
  "bootproto",
  "gif",
+ "pix",
  "png",
  "term",
  "webp",

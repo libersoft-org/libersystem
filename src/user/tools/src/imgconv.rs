@@ -32,6 +32,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Closed => Vec::new(),
 		};
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
+		if tools::trim(&args) == b"--help" {
+			print(imgconv::help_text().as_bytes());
+			exit();
+		}
 		let config = match imgconv::parse_args(&args) {
 			Ok(config) => config,
 			Err(error) => fail(error),

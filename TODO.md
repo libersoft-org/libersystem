@@ -3331,7 +3331,7 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     share the cap. A deliberate 80 MiB 4K run is refused at the allocator's
     backing-object boundary, prints `imgconv: out of memory`, exits cleanly, never exceeds
     its Domain limit and preserves the pre-existing destination byte-for-byte.
-- [ ] Close the user-facing viewer/converter contract. Generate `imgconv --help` from
+- [x] Close the user-facing viewer/converter contract. Generate `imgconv --help` from
   the same capability/default table used by parsing and tests, and give `imgview` a
   concise usage contract. State explicitly that version one renders the composited
   frame 0 of an animation rather than playing it. Extend the governed viewer scenario
@@ -3339,6 +3339,15 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   conversion into display pixels, the documented first-frame result, focus-scoped
   input, release and clean exit. Keep animation playback as a later feature unless it is deliberately
   added with timing, disposal, focus and resource-budget tests.
+  - Completed (2026-07-17): the public `FORMAT_PROFILES` table now owns every output
+    format's capabilities and lossless/lossy defaults; argument parsing and generated
+    `imgconv --help` consume that same table, with a regression covering all 12 rows and
+    their defaults. `imgview --help` defines the one-path contract and states that version
+    one displays composited animation frame 0 without playback. The governed `image` QEMU
+    gate runs both real help paths, then compares all 16 BGRX framebuffer bytes for opaque
+    BMP, a 2x2 PNG containing partial and zero alpha, and composited frame 0 of an external
+    two-frame WebP. Every viewer run acquires/presents, obtains focus-scoped key input,
+    releases its surface on `q` and exits cleanly.
 - [ ] Conformance, hostile-input and option tests: lossless format round-trips compare
   exact RGBA frames/timing; lossy JPEG/WebP vectors compare dimensions plus bounded
   PSNR/error thresholds and deterministic hashes; compression 0 and 100 must decode

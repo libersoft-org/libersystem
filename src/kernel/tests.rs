@@ -5694,7 +5694,47 @@ fn run_imgconv_harness(imgconv_elf: &[u8], args: &[u8], system: &mut StorageHarn
 	run_imgconv_harness_in(sched::root_domain(), imgconv_elf, args, system, media).0
 }
 
-fn run_imgview_harness(imgview_elf: &[u8], path: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) {
+fn viewer_surface(image: &pix::RgbaImage) -> alloc::vec::Vec<u8> {
+	let source = image.to_bgrx().expect("viewer source converts to BGRX");
+	let mut output = alloc::vec![0u8; 16];
+	let result = pix::blit(pix::Image { data: &source, width: image.width, height: image.height, pitch: image.pitch }, pix::Target { data: &mut output, width: 2, height: 2, pitch: 8, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8 }, pix::Rect { x: 0, y: 0, width: image.width, height: image.height }, true);
+	assert!(result.is_some(), "expected viewer pixels render");
+	output
+}
+
+fn run_imgview_help_harness(imgview_elf: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+	let (bootstrap, child) = Channel::create();
+	let (stdout, child_stdout) = Channel::create();
+	let process = loader::spawn_elf_process(sched::root_domain(), imgview_elf, child, Rights::ALL, 0).expect("spawn imgview help harness");
+	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgview help stdout");
+	bootstrap.send(Message::new(b"--help".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help args");
+	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview help system volume");
+	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgview help media volume");
+	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"DISPLAY".as_slice(), b"INPUT_KEYS".as_slice()] {
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help absent capability");
+	}
+	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help cwd");
+	let output = loop {
+		system.pump();
+		media.pump();
+		if let Ok(message) = stdout.recv() {
+			break message.bytes;
+		}
+	};
+	assert_eq!(output, b"Usage: imgview <image>\nDisplays a still image or composited animation frame 0; animation playback is not supported.\n");
+	for _ in 0..100_000 {
+		system.pump();
+		media.pump();
+		if process.is_terminated() {
+			return;
+		}
+	}
+	panic!("imgview help harness did not exit");
+}
+
+fn run_imgview_harness(imgview_elf: &[u8], path: &[u8], expected: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) {
 	use object::channel::{Channel, Message};
 	use object::memory_object::MemoryObject;
 	use object::rights::Rights;
@@ -5741,7 +5781,7 @@ fn run_imgview_harness(imgview_elf: &[u8], path: &[u8], system: &mut StorageHarn
 		}
 	};
 	assert_eq!(le_u16(&present.bytes, 0), 2, "imgview presents converted image");
-	assert!(read_from_object(&surface, 16).iter().any(|byte| *byte != 0), "imgview presents nonblank converted pixels");
+	assert_eq!(read_from_object(&surface, 16), expected, "imgview presents the expected alpha-converted composited frame");
 	display.send(Message::new([le_u32(&present.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview present reply");
 
 	let focus = loop {
@@ -5794,7 +5834,7 @@ fn run_imgview_harness(imgview_elf: &[u8], path: &[u8], system: &mut StorageHarn
 	panic!("imgview harness did not exit");
 }
 
-tagged_test!(imgconv_cross_volume_and_failed_overwrite_preserve_destination, [Service, Storage, Process, Filesystem]);
+tagged_test!(imgconv_cross_volume_and_failed_overwrite_preserve_destination, [Image, Service, Storage, Process, Filesystem]);
 fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
 	let (volume, package) = scenario_packages().expect("scenario packages");
@@ -5806,11 +5846,24 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 
 	let media_image = fat16_image(&[], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
+	let help = run_imgconv_harness(imgconv_elf, b"--help", &mut system, &mut media);
+	assert!(help.starts_with(b"Usage: imgconv [options] <input> <output>\n\nOptions:\n"));
+	assert!(help.windows(b"WebP  options: quality compression lossless lossy animation; defaults: mode=lossless compression=100".len()).any(|window| window == b"WebP  options: quality compression lossless lossy animation; defaults: mode=lossless compression=100"));
 	let line = run_imgconv_harness(imgconv_elf, b"--quality 100 vol://system/sample.bmp vol://media/CROSS.BMP", &mut system, &mut media);
 	assert!(line.starts_with(b"imgconv: BMP 2x2 -> BMP 2x2 quality=100 bytes="));
 	let converted = media.open(b"vol://media/CROSS.BMP", 0xc2055).expect("cross-volume BMP opens");
 	assert_eq!(bmp::decode_rgba(&converted).expect("cross-volume BMP decodes"), source);
-	run_imgview_harness(imgview_elf, b"vol://media/CROSS.BMP", &mut system, &mut media);
+	run_imgview_help_harness(imgview_elf, &mut system, &mut media);
+	run_imgview_harness(imgview_elf, b"vol://media/CROSS.BMP", &viewer_surface(&source), &mut system, &mut media);
+
+	let transparent = pix::RgbaImage::new(2, 2, alloc::vec![255, 0, 0, 128, 0, 255, 0, 255, 0, 0, 255, 0, 255, 255, 255, 64]).expect("transparent viewer fixture");
+	let transparent_png = png::encode_rgba(&transparent, png::EncodeOptions { compression: 100 }).expect("encode transparent viewer fixture");
+	let animation_webp = include_bytes!("../user/webp/tests/data/external-animation.webp");
+	let viewer_image = fat16_image(&[(*b"ALPHA   PNG", &transparent_png), (*b"ANIM    WEB", animation_webp)], false);
+	let mut viewer_media = StorageHarness::start(storage_elf, b"FATBLOCK", &viewer_image, viewer_image.len() as u64);
+	run_imgview_harness(imgview_elf, b"vol://media/ALPHA.PNG", &viewer_surface(&transparent), &mut system, &mut viewer_media);
+	let animation_first = webp::decode(animation_webp).expect("composited WebP frame 0");
+	run_imgview_harness(imgview_elf, b"vol://media/ANIM.WEB", &viewer_surface(&animation_first), &mut system, &mut viewer_media);
 
 	let line = run_imgconv_harness(imgconv_elf, b"--lossless --compression 50 vol://system/sample.bmp vol://media/CROSSL.WEBP", &mut system, &mut media);
 	assert!(line.starts_with(b"imgconv: BMP 2x2 -> WebP 2x2 mode=lossless compression=50 bytes="));
