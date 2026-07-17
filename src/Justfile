@@ -42,6 +42,7 @@ audio_bench_dir := "tools/audio-bench"
 image_bench_dir := "tools/image-bench"
 icns_conformance_dir := "tools/icns-conformance"
 pcx_conformance_dir := "tools/pcx-conformance"
+tga_conformance_dir := "tools/tga-conformance"
 proto_dir := "proto"
 wasm_dir := "wasm"
 sdk_dir := "sdk"
@@ -327,6 +328,10 @@ icns-conformance:
 pcx-conformance:
 	cargo run --release --manifest-path {{pcx_conformance_dir}}/Cargo.toml
 
+# Validate TGA decode/encode profiles with ImageMagick.
+tga-conformance:
+	cargo run --release --manifest-path {{tga_conformance_dir}}/Cargo.toml
+
 # format all code (Rust via rustfmt, shell via shfmt)
 fmt:
 	cd {{abi_dir}} && cargo fmt
@@ -370,6 +375,7 @@ fmt:
 	cd {{image_bench_dir}} && cargo fmt
 	cd {{icns_conformance_dir}} && cargo fmt
 	cd {{pcx_conformance_dir}} && cargo fmt
+	cd {{tga_conformance_dir}} && cargo fmt
 	cd {{proto_dir}} && cargo fmt
 	cd {{wasm_dir}} && cargo fmt
 	cd {{sdk_dir}} && cargo fmt
@@ -426,6 +432,7 @@ fmt-check:
 	cd {{image_bench_dir}} && cargo fmt --check
 	cd {{icns_conformance_dir}} && cargo fmt --check
 	cd {{pcx_conformance_dir}} && cargo fmt --check
+	cd {{tga_conformance_dir}} && cargo fmt --check
 	cd {{proto_dir}} && cargo fmt --check
 	cd {{wasm_dir}} && cargo fmt --check
 	cd {{sdk_dir}} && cargo fmt --check

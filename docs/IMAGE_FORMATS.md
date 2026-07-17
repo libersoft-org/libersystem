@@ -187,6 +187,15 @@ The central probe now validates the 18-byte header, no-color-map selected profil
 type, nonzero geometry, depth, reserved descriptor bits and bounded image-ID start.
 The PCX/TGA image-ID collision is covered through the public `decode_frame` path.
 
+The independent ImageMagick 7.1.1-43 corpus contains raw and RLE 24/32-bit
+true-color files spanning all four top/bottom and left/right origin combinations.
+An asymmetric alpha-bearing source makes every orientation observable, and one
+bottom-right raw 32-bit fixture carries a 22-byte image-ID payload. Complete
+canonical RGBA buffers are pinned by FNV-1a after independent `-auto-orient`
+decoding. The reciprocal `just tga-conformance` gate encodes raw and RLE 24/32-bit
+profiles with LiberSystem and requires exact pixels from ImageMagick. Status:
+**Verified profile** for the selected true-color subset.
+
 ### WebP, VP8 and VP8L
 
 The container parser covers simple `VP8 `, simple `VP8L`, extended `VP8X`, raw
@@ -215,8 +224,8 @@ required for the corpus gate.
 ## Closure order
 
 1. Add independent corpora for the remaining verified/subset claims, prioritizing
-  TGA plus the uncovered ICNS `ih32`/`it32` profiles where the primary-source
-  chain is weakest.
+  the uncovered ICNS `ih32`/`it32` profiles where the primary-source chain is
+  weakest.
 
 No format moves from **Gap** or **Source uncertain** to **Verified** without an
 independently sourced fixture or a structural test that directly exercises the cited

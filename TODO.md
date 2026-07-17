@@ -3191,6 +3191,14 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     selected version-5 profile and type older versions/depths as Unsupported. PCX is
     4/4; independent TGA, uncovered ICNS profiles and the rest of the matrix keep this
     item open.
+  - Partial result (2026-07-17): TGA now has an external ImageMagick 7.1.1-43 corpus
+    covering raw and RLE true-color at 24/32 bits, every top/bottom and left/right
+    origin combination, alpha and a nonempty 22-byte image-ID payload. Leaf tests pin
+    complete canonical RGBA buffers and every selected header field, with fixture
+    provenance and SHA-256 under `user/tga/tests/data`. The reciprocal host-only
+    `just tga-conformance` gate encodes raw/RLE 24/32-bit output with LiberSystem and
+    requires exact ImageMagick pixels. TGA is 3/3; uncovered ICNS `ih32`/`it32` and
+    the rest of the matrix keep this item open.
 - [ ] Add a deterministic hostile-input and mutation harness shared by all image
   decoders. Exercise every prefix truncation for small golden files plus bounded
   mutations of dimensions, offsets, lengths, palette/table counts, checksums, RLE,
