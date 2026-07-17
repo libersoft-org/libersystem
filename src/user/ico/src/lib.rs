@@ -180,6 +180,22 @@ mod tests {
 	}
 
 	#[test]
+	fn compression_endpoints_preserve_png_entry_and_exercise_distinct_streams() {
+		let mut pixels = Vec::new();
+		for y in 0..32u32 {
+			for x in 0..32u32 {
+				pixels.extend_from_slice(&[((x * 17 + y * 3) & 255) as u8, ((x * 5 + y * 23) & 255) as u8, ((x * 11 + y * 7) & 255) as u8, ((x * 9 + y * 13) & 255) as u8]);
+			}
+		}
+		let image = pix::RgbaImage::new(32, 32, pixels).unwrap();
+		let fast = encode(core::slice::from_ref(&image), 0).unwrap();
+		let compact = encode(core::slice::from_ref(&image), 100).unwrap();
+		assert_ne!(fast, compact, "ICO compression endpoints must exercise distinct embedded PNG streams");
+		assert_eq!(decode(&fast).unwrap(), image);
+		assert_eq!(decode(&compact).unwrap(), image);
+	}
+
+	#[test]
 	fn thirty_two_bit_xor_alpha_ignores_and_mask_and_needs_no_fallback() {
 		let nonzero = dib_icon(&[0, 0, 255, 128, 0, 255, 0, 255], &[0xc0, 0, 0, 0]);
 		assert_eq!(decode(&nonzero).unwrap().pixels, vec![255, 0, 0, 128, 0, 255, 0, 255]);

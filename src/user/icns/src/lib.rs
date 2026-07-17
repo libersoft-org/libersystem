@@ -302,6 +302,22 @@ mod tests {
 	}
 
 	#[test]
+	fn compression_endpoints_preserve_modern_entry_and_exercise_distinct_streams() {
+		let mut pixels = Vec::new();
+		for y in 0..128u32 {
+			for x in 0..128u32 {
+				pixels.extend_from_slice(&[((x * 17 + y * 3) & 255) as u8, ((x * 5 + y * 23) & 255) as u8, ((x * 11 + y * 7) & 255) as u8, ((x * 9 + y * 13) & 255) as u8]);
+			}
+		}
+		let image = pix::RgbaImage::new(128, 128, pixels).unwrap();
+		let fast = encode(core::slice::from_ref(&image), 0).unwrap();
+		let compact = encode(core::slice::from_ref(&image), 100).unwrap();
+		assert_ne!(fast, compact, "ICNS compression endpoints must exercise distinct embedded PNG streams");
+		assert_eq!(decode(&fast).unwrap(), image);
+		assert_eq!(decode(&compact).unwrap(), image);
+	}
+
+	#[test]
 	fn decodes_external_icnsutils_classic_and_modern_corpus() {
 		let decoded = decode_all(include_bytes!("../tests/data/external-gradient.icns")).unwrap();
 		assert_eq!(decoded.iter().map(|image| image.width).collect::<Vec<_>>(), vec![16, 32, 128]);

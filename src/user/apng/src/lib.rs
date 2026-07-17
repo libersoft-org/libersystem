@@ -355,6 +355,39 @@ mod tests {
 	}
 
 	#[test]
+	fn compression_endpoints_preserve_frames_and_exercise_distinct_streams() {
+		let image = |seed: u32| {
+			let mut pixels = Vec::new();
+			for y in 0..19u32 {
+				for x in 0..31u32 {
+					pixels.extend_from_slice(&[
+						((x * 17 + y * 3 + seed) & 255) as u8,
+						((x * 5 + y * 23 + seed * 2) & 255) as u8,
+						((x * 11 + y * 7 + seed * 3) & 255) as u8,
+						((x * 9 + y * 13 + seed * 5) & 255) as u8,
+					]);
+				}
+			}
+			pix::RgbaImage::new(31, 19, pixels).unwrap()
+		};
+		let animation = Animation::new(
+			31,
+			19,
+			3,
+			vec![
+				Frame { image: image(1), x: 0, y: 0, duration_ms: 40, blend: Blend::Source, disposal: Disposal::Keep },
+				Frame { image: image(7), x: 0, y: 0, duration_ms: 75, blend: Blend::Source, disposal: Disposal::Previous },
+			],
+		)
+		.unwrap();
+		let fast = encode(&animation, 0).unwrap();
+		let compact = encode(&animation, 100).unwrap();
+		assert_ne!(fast, compact, "APNG compression endpoints must exercise distinct deflate streams");
+		assert_eq!(decode(&fast).unwrap(), animation);
+		assert_eq!(decode(&compact).unwrap(), animation);
+	}
+
+	#[test]
 	fn decodes_indexed_frame_split_across_multiple_idat_chunks() {
 		let image = pix::RgbaImage::new(2, 1, vec![255, 0, 0, 0, 0, 255, 0, 255]).unwrap();
 		let source = png::encode_indexed(&image, 0, 100).unwrap();

@@ -341,6 +341,9 @@ format, resize, frame, loop, quality, compression and WebP mode options; metadat
 The parser gate evaluates five profile-driven option families across all 12 output formats:
 17 supported combinations must preserve the requested value, 43 unsupported combinations
 must return `UnsupportedOption`, and lossless WebP must reject quality.
+Every compression-capable output profile has explicit effort endpoints. PNG, APNG, ICO,
+modern PNG-backed ICNS and lossless WebP encode at 0 and 100 with different bytes/search
+while decoding identically; lossy WebP keeps quality fixed while effort changes its search.
 
 `imgview` accepts exactly one image path. Version one displays a still image or composited
 animation frame 0 and does not play animations. `imgview --help` states this explicitly. The

@@ -2938,7 +2938,7 @@ noise.
 
 ## M126 - Image conversion tool (`imgconv`)
 
-Status: IN PROGRESS (2026-07-15).
+Status: COMPLETE (2026-07-17).
 
 The next console application after `imgview` and `play`: `imgconv <input> <output>`
 converts every image format LiberSystem supports without gaining display, input or
@@ -3093,7 +3093,7 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     a writable-LiberFS scenario converts BMP to indexed PNG at quality/compression 100,
     reopens it and independently proves exact RGBA pixels for the representable source
     palette. `imgview` uses the same central sniffer/frame compositor.
-- [ ] Audit every supported image format against its current authoritative
+- [x] Audit every supported image format against its current authoritative
   specification before declaring the codec matrix complete. Cover BMP/DIB, PNG and
   APNG, GIF89a, ICO/CUR, ICNS, baseline/progressive JPEG, PCX, Netpbm PPM/PNM, QOI,
   TGA, and WebP including RIFF, VP8, VP8L, ALPH and ANIM/ANMF. For each format record
@@ -3185,6 +3185,12 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     background plus displayed canvases. An ImageMagick 7.1.1-43 byte fixture pins both
     opaque and transparent conventions. GIF is 5/5, `imgconv` 15/15 and the standing
     image benchmark remains below all time/heap/fidelity limits.
+  - Completed (2026-07-17): `docs/IMAGE_FORMATS.md` is the maintained authoritative
+    audit for all 12 formats. Every accepted/emitted profile is classified as verified,
+    a typed subset or a documented deployed convention; the registry records the current
+    normative source or best surviving primary material with revision/date. No known
+    behavioral gap remains hidden behind a source-uncertain label, and every behavior
+    changed by the audit has an independent fixture or direct structural regression.
 - [x] Make content sniffing structural and collision-resistant. APNG detection must
   walk real PNG chunk boundaries instead of finding `acTL` in arbitrary compressed
   bytes; PCX detection must validate its header fields instead of claiming every file
@@ -3370,7 +3376,7 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     BMP, a 2x2 PNG containing partial and zero alpha, and composited frame 0 of an external
     two-frame WebP. Every viewer run acquires/presents, obtains focus-scoped key input,
     releases its surface on `q` and exits cleanly.
-- [ ] Conformance, hostile-input and option tests: lossless format round-trips compare
+- [x] Conformance, hostile-input and option tests: lossless format round-trips compare
   exact RGBA frames/timing; lossy JPEG/WebP vectors compare dimensions plus bounded
   PSNR/error thresholds and deterministic hashes; compression 0 and 100 must decode
   identically while exercising different encoder effort; quality endpoints must meet
@@ -3392,6 +3398,14 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     for quality and reject quality in lossless mode. The matrix consumes the same profile
     rows as parsing and generated help, so adding a format or changing one capability
     changes the gate rather than leaving a hand-maintained rejection list stale.
+  - Completed (2026-07-17): APNG, ICO and modern PNG-backed ICNS now explicitly encode
+    asymmetric fixtures at compression 0 and 100, require distinct container/deflate
+    bytes and decode both endpoints to exactly the same frames, timing, loop and RGBA.
+    Together with existing PNG and lossless/lossy WebP endpoint gates, all five
+    compression-capable `FORMAT_PROFILES` now prove effort changes bytes/search without
+    changing lossless output. Quality-capable profiles retain their deterministic endpoint
+    fidelity gates, and all 60 format-option combinations plus two WebP mode conflicts are
+    covered by the shared parser matrix.
 - [x] End-to-end and performance gates: a kernel scenario launches governed `imgconv`
   through PermissionManager, reads a staged image from StorageService, writes at least
   one lossless and one lossy destination, reopens both and decodes them independently,
@@ -3446,6 +3460,21 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   measured memory quota, converted files reopen in independent decoders and `imgview`,
   the CLI/viewer behavior is documented from shared capability data, and host + targeted
   kernel + tri-architecture build/performance gates are green.
+- Result (2026-07-17): M126 is complete. Twelve atomized no_std codec/container leaves
+  share the bounded straight-RGBA/animation model and convert through one structural
+  sniffer; unknown and corrupt-recognized inputs remain distinct. The maintained
+  authoritative audit classifies every supported/subset profile, and `just
+  image-conformance` validates every emitted supported profile plus the independent input
+  corpus with 11 external-tool recipes covering all 12 formats. `just image-mutate` passes
+  11,392 prefixes, 34,296 targeted mutations and 2,304 seeded mutations through leaves and
+  the central sniffer. The complete quality/compression and option matrix is pinned,
+  including APNG/ICO/ICNS compression endpoints. Real `imgconv.lsexe` runs under a reusable
+  96 MiB aggregate Domain budget (4K peak 84,475,904 bytes), reports typed OOM below that
+  budget and preserves destinations. Governed `imgconv`/`imgview` scenarios cover
+  cross-volume lossless/lossy conversion, transparent display pixels, composited animation
+  frame 0, focus/release and clean exit. Host, QEMU image, benchmark and x86_64/AArch64/
+  RISC-V build gates are green; the listed future profiles remain deliberate non-blocking
+  typed subsets.
 - Concept: M121/M122 (pixel/surface vocabulary and the first image consumer), M123
   (one codec per `.lslib` leaf), M125 (canonical `imgconv.lsexe` artifact), the
   capability rule (`volumes` only), and the NOTES image-conversion-tool item.
