@@ -149,10 +149,19 @@ The selected profile accepts and emits ZSoft version-5, 8-bit-per-plane RLE:
 one indexed plane with trailing 256-color palette or three RGB planes. Earlier
 1/2/4-bit and monochrome variants are **Subsets**. Output is opaque because these
 profiles define no alpha. The central sniffer now requires the 128-byte header,
-manufacturer and RLE marker, 8-bit samples, ordered bounds, one or three planes
-and a sufficient bytes-per-line value before claiming PCX. A legal TGA with
-image-ID length `0x0a` proves that the old first-byte collision is closed. PCX
-version handling remains a leaf-profile audit item.
+manufacturer, version 5, RLE marker, 8-bit samples, ordered bounds, one or three
+planes and a sufficient bytes-per-line value before claiming PCX. Older versions
+and other depths return typed `Unsupported`. A legal TGA with image-ID length
+`0x0a` proves that the old first-byte collision is closed.
+
+The independent ImageMagick 7.1.1-43 corpus contains a 17x9 indexed one-plane
+file with trailing 256-color palette and a 19x7 RGB three-plane file. Both use
+odd `bytes_per_line` equal to width, demonstrating that readers must honor the
+declared stride rather than impose common even-padding advice. ImageMagick and
+Netpbm `pcxtoppm` produce byte-identical RGBA results; the leaf pins complete
+buffers with FNV-1a. The reciprocal `just pcx-conformance` gate encodes both
+profiles with LiberSystem and requires exact pixels from both independent
+decoders. Status: **Verified profile** for version-5 indexed and RGB RLE.
 
 ### PPM/PNM
 
@@ -206,7 +215,7 @@ required for the corpus gate.
 ## Closure order
 
 1. Add independent corpora for the remaining verified/subset claims, prioritizing
-  PCX and TGA plus the uncovered ICNS `ih32`/`it32` profiles where the primary-source
+  TGA plus the uncovered ICNS `ih32`/`it32` profiles where the primary-source
   chain is weakest.
 
 No format moves from **Gap** or **Source uncertain** to **Verified** without an

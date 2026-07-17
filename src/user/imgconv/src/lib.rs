@@ -437,7 +437,7 @@ fn looks_like_pcx(input: &[u8]) -> bool {
 	};
 	let width = u16::from_le_bytes([header[8], header[9]]).checked_sub(u16::from_le_bytes([header[4], header[5]]));
 	let height = u16::from_le_bytes([header[10], header[11]]).checked_sub(u16::from_le_bytes([header[6], header[7]]));
-	header[0] == 0x0a && header[2] == 1 && header[3] == 8 && width.is_some() && height.is_some() && matches!(header[65], 1 | 3) && u16::from_le_bytes([header[66], header[67]]) > width.unwrap_or(0)
+	header[0] == 0x0a && header[1] == 5 && header[2] == 1 && header[3] == 8 && width.is_some() && height.is_some() && matches!(header[65], 1 | 3) && u16::from_le_bytes([header[66], header[67]]) > width.unwrap_or(0)
 }
 
 fn composite_frame(animation: &pix::Animation, target: usize) -> Result<pix::RgbaImage, Error> {

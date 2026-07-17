@@ -3178,8 +3178,19 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     classic entries through `icns2png`, decodes output PNG through ImageMagick and
     compares exact pixels. The runner validates modern `ic07` through its embedded PNG
     because the pinned `icns2png` version itself drops alpha while exporting that
-    profile. ICNS is 4/4; independent `ih32`/`it32`, PCX, TGA and the rest of the
+    profile. ICNS is 4/4; independent `ih32`/`it32`, TGA and the rest of the
     matrix keep this item open.
+  - Partial result (2026-07-17): PCX now has external ImageMagick 7.1.1-43 fixtures
+    for version-5 indexed one-plane RLE with trailing palette and RGB three-plane RLE.
+    Their odd 17/19-byte declared row strides exercise interoperability beyond our
+    even-padded writer. ImageMagick and Netpbm `pcxtoppm` independently produce
+    byte-identical RGBA; leaf tests pin full-buffer FNV-1a plus artifact provenance
+    and SHA-256 under `user/pcx/tests/data`. The reciprocal host-only
+    `just pcx-conformance` gate encodes both profiles with LiberSystem and requires
+    exact output from both decoders. The leaf and central sniffer now enforce the
+    selected version-5 profile and type older versions/depths as Unsupported. PCX is
+    4/4; independent TGA, uncovered ICNS profiles and the rest of the matrix keep this
+    item open.
 - [ ] Add a deterministic hostile-input and mutation harness shared by all image
   decoders. Exercise every prefix truncation for small golden files plus bounded
   mutations of dimensions, offsets, lengths, palette/table counts, checksums, RLE,
