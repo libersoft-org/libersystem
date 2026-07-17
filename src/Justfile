@@ -43,6 +43,7 @@ image_bench_dir := "tools/image-bench"
 bmp_conformance_dir := "tools/bmp-conformance"
 ico_conformance_dir := "tools/ico-conformance"
 icns_conformance_dir := "tools/icns-conformance"
+jpeg_conformance_dir := "tools/jpeg-conformance"
 pcx_conformance_dir := "tools/pcx-conformance"
 ppm_conformance_dir := "tools/ppm-conformance"
 qoi_conformance_dir := "tools/qoi-conformance"
@@ -336,6 +337,10 @@ ico-conformance:
 icns-conformance:
 	cargo run --release --manifest-path {{icns_conformance_dir}}/Cargo.toml
 
+# Validate baseline JPEG profiles with ImageMagick and Pillow.
+jpeg-conformance:
+	cargo run --release --manifest-path {{jpeg_conformance_dir}}/Cargo.toml
+
 # Validate PCX decode/encode profiles with ImageMagick and Netpbm.
 pcx-conformance:
 	cargo run --release --manifest-path {{pcx_conformance_dir}}/Cargo.toml
@@ -396,6 +401,7 @@ fmt:
 	cd {{bmp_conformance_dir}} && cargo fmt
 	cd {{ico_conformance_dir}} && cargo fmt
 	cd {{icns_conformance_dir}} && cargo fmt
+	cd {{jpeg_conformance_dir}} && cargo fmt
 	cd {{pcx_conformance_dir}} && cargo fmt
 	cd {{ppm_conformance_dir}} && cargo fmt
 	cd {{qoi_conformance_dir}} && cargo fmt
@@ -457,6 +463,7 @@ fmt-check:
 	cd {{bmp_conformance_dir}} && cargo fmt --check
 	cd {{ico_conformance_dir}} && cargo fmt --check
 	cd {{icns_conformance_dir}} && cargo fmt --check
+	cd {{jpeg_conformance_dir}} && cargo fmt --check
 	cd {{pcx_conformance_dir}} && cargo fmt --check
 	cd {{ppm_conformance_dir}} && cargo fmt --check
 	cd {{qoi_conformance_dir}} && cargo fmt --check

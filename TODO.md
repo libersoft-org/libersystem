@@ -3206,6 +3206,18 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     requires exact ImageMagick/Netpbm pixels for LiberSystem 24bpp and indexed
     8bpp output. BMP is 10/10; remaining lower-depth/OS2/RLE profiles and the rest
     of the matrix stay open.
+  - Partial result (2026-07-17): JPEG now has external ImageMagick 7.1.1-43
+    fixtures for SOF0 grayscale, SOF0 three-component YCbCr and SOF2 progressive.
+    ImageMagick and Pillow 11.1 produce byte-identical canonical RGBA; LiberSystem
+    is exact for grayscale and its independent zune IDCT/chroma path stays within
+    max 2 / mean 0.232 byte error for YCbCr. The real progressive file is typed
+    `Unsupported` before decode. Leaf tests pin markers, dimensions, deterministic
+    RGBA hashes, the bounded error and artifact SHA-256 under `user/jpeg/tests/data`.
+    The reciprocal host-only `just jpeg-conformance` gate requires deterministic
+    three-component SOF0/JFIF quality-10/100 output, exact ImageMagick/Pillow decode,
+    quality improvement and a quality-100 RGB MSE <= 25 (measured 0.566 versus
+    2755.800 at quality 10). JPEG is 3/3; arithmetic/lossless/12-bit/CMYK remain
+    typed subsets while the rest of the matrix stays open.
   - Partial result (2026-07-17): PCX now has external ImageMagick 7.1.1-43 fixtures
     for version-5 indexed one-plane RLE with trailing palette and RGB three-plane RLE.
     Their odd 17/19-byte declared row strides exercise interoperability beyond our

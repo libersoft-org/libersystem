@@ -1,0 +1,8 @@
+[package]
+name = "jpeg-conformance"
+edition = "2024"
+description = "Host interoperability gate for LiberSystem JPEG output"
+
+[dependencies]
+jpeg = { path = "../../user/jpeg" }
+pix = { path = "../../user/pix" }

@@ -93,7 +93,15 @@ with Huffman coding and grayscale or YCbCr components. Progressive, arithmetic,
 hierarchical, lossless, 12-bit and CMYK/YCCK JPEG are typed `Unsupported`; they
 must never be partially rendered as baseline. Output is JFIF-compatible baseline
 JPEG and has no alpha. Status: **Subset**. Independent baseline output validation
-and explicit progressive rejection fixtures remain required.
+now covers ImageMagick SOF0 grayscale and three-component YCbCr plus a real SOF2
+progressive rejection fixture. ImageMagick and Pillow produce identical canonical
+RGBA; LiberSystem is exact for grayscale and stays within max 2 / mean 0.232 byte
+error for the independent YCbCr IDCT/chroma path. The reciprocal
+`just jpeg-conformance` gate requires three-component SOF0/JFIF output, exact
+ImageMagick/Pillow agreement, deterministic quality-10/100 artifact hashes and a
+quality-100 RGB MSE floor. Status: **Verified profile** for 8-bit baseline
+grayscale/YCbCr input and baseline RGB-derived output; progressive remains a typed
+**Subset**.
 
 ### BMP/DIB
 
