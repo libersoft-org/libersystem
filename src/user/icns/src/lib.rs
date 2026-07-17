@@ -307,6 +307,10 @@ mod tests {
 		assert_eq!(decoded.iter().map(|image| image.width).collect::<Vec<_>>(), vec![16, 32, 128]);
 		assert_eq!(decoded.iter().map(|image| fnv1a(&image.pixels)).collect::<Vec<_>>(), vec![0x40df_aed0_3a6f_7825, 0x1f5c_3caa_89bf_3ee5, 0xcec7_119d_af9c_2425]);
 		assert_eq!(fnv1a(&decode(include_bytes!("../tests/data/external-gradient.icns")).unwrap().pixels), 0xcec7_119d_af9c_2425);
+		let classic_48 = decode(include_bytes!("../tests/data/external-48.icns")).unwrap();
+		assert_eq!((classic_48.width, classic_48.height, fnv1a(&classic_48.pixels)), (48, 48, 0x2fc2_7b31_ff9d_8545));
+		let classic_128 = decode(include_bytes!("../tests/data/external-128-legacy.icns")).unwrap();
+		assert_eq!((classic_128.width, classic_128.height, fnv1a(&classic_128.pixels)), (128, 128, 0xcec7_119d_af9c_2425));
 	}
 
 	#[test]

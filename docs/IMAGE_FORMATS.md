@@ -133,15 +133,19 @@ The leaf accepts modern PNG-backed icon types and classic
 `s8mk/l8mk/h8mk/t8mk` alpha masks. It emits classic 16/32/48-pixel entries and
 PNG-backed entries from 128 pixels upward. JPEG 2000 payloads are typed
 `Unsupported`. The independent `icnsutils 0.8.1.83.g921f972` corpus contains
-`is32+s8mk`, `il32+l8mk` and PNG-backed `ic07` generated from deterministic
-ImageMagick RGBA gradients. Complete decoded pixel buffers are pinned by FNV-1a;
-classic entries round-trip through `icns2png`, while the modern embedded PNG is
-validated directly with ImageMagick because this `icns2png` version drops alpha
-during `ic07` export. The reciprocal `just icns-conformance` gate encodes those
-three profiles with LiberSystem and externally decodes every output pixel. Status:
-**Verified profile** for 16/32 classic and 128 modern entries, under a **Source
-uncertain** format family. Independent 48-pixel `ih32+h8mk`, legacy 128-pixel
-`it32+t8mk`, and Apple-generated fixtures remain open.
+classic `is32+s8mk`, `il32+l8mk`, `ih32+h8mk` and `it32+t8mk`, plus PNG-backed
+`ic07`, generated from deterministic ImageMagick RGBA gradients. `png2icns`
+directly emits the 16/32/48 and modern 128 profiles; a reproducible host-only
+helper requests the legacy 128 types through the public libicns API. Complete
+decoded pixel buffers are pinned by FNV-1a. Classic entries round-trip through
+`icns2png`, while the modern embedded PNG is validated directly with ImageMagick
+because this `icns2png` version drops alpha during `ic07` export. The reciprocal
+`just icns-conformance` gate externally validates LiberSystem's classic 16/32/48
+and modern 128 output, then compares independent 48 and legacy 128 decoding in
+both implementations. Status: **Verified profile** for every supported classic
+entry and modern `ic07`, under a **Source uncertain** format family. An
+Apple-generated fixture remains open as provenance strengthening, not a known
+codec behavior gap.
 
 ### PCX
 
@@ -224,8 +228,8 @@ required for the corpus gate.
 ## Closure order
 
 1. Add independent corpora for the remaining verified/subset claims, prioritizing
-  the uncovered ICNS `ih32`/`it32` profiles where the primary-source chain is
-  weakest.
+  formats still covered only by self-round-trip and adding an Apple-generated ICNS
+  fixture when one is available.
 
 No format moves from **Gap** or **Source uncertain** to **Verified** without an
 independently sourced fixture or a structural test that directly exercises the cited

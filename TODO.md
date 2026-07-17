@@ -3169,16 +3169,18 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   licensing, and pin deterministic hashes for canonical output so byte drift is an
   explicit review event. Prioritize the currently thin custom ICO, TGA and PCX suites;
   self-round-trip alone is not an interoperability proof.
-  - Partial result (2026-07-17): ICNS now has a 2,661-byte external corpus generated
-    by Debian `icnsutils 0.8.1.83.g921f972` from deterministic ImageMagick 7.1.1-43
-    RGBA gradients. It covers classic `is32+s8mk`, `il32+l8mk` and PNG-backed `ic07`;
-    the leaf test pins every decoded RGBA byte with FNV-1a and records artifact/source
-    provenance plus SHA-256 under `user/icns/tests/data`. The reciprocal host-only
-    `just icns-conformance` gate encodes all three profiles with LiberSystem, extracts
-    classic entries through `icns2png`, decodes output PNG through ImageMagick and
-    compares exact pixels. The runner validates modern `ic07` through its embedded PNG
-    because the pinned `icns2png` version itself drops alpha while exporting that
-    profile. ICNS is 4/4; independent `ih32`/`it32`, TGA and the rest of the
+  - Partial result (2026-07-17): ICNS now has an external Debian
+    `icnsutils/libicns 0.8.1.83.g921f972` corpus generated from deterministic
+    ImageMagick 7.1.1-43 RGBA gradients. It covers classic `is32+s8mk`,
+    `il32+l8mk`, `ih32+h8mk`, legacy `it32+t8mk` and PNG-backed `ic07`.
+    `png2icns` emits the first three classic sizes and modern 128; a checked-in
+    host-only helper requests the explicit legacy 128 types through the public
+    libicns API and reproduces its fixture byte-for-byte. Leaf tests pin every
+    decoded RGBA byte with FNV-1a and record artifact/source provenance plus
+    SHA-256 under `user/icns/tests/data`. The reciprocal `just icns-conformance`
+    gate externally validates LiberSystem classic 16/32/48 and modern 128 output,
+    then compares independent 48/legacy-128 decoding in both implementations.
+    ICNS is 4/4; an Apple-generated provenance fixture and the rest of the format
     matrix keep this item open.
   - Partial result (2026-07-17): PCX now has external ImageMagick 7.1.1-43 fixtures
     for version-5 indexed one-plane RLE with trailing palette and RGB three-plane RLE.
@@ -3189,16 +3191,15 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     `just pcx-conformance` gate encodes both profiles with LiberSystem and requires
     exact output from both decoders. The leaf and central sniffer now enforce the
     selected version-5 profile and type older versions/depths as Unsupported. PCX is
-    4/4; independent TGA, uncovered ICNS profiles and the rest of the matrix keep this
-    item open.
+    4/4; TGA, ICNS and the rest of the matrix keep this item open.
   - Partial result (2026-07-17): TGA now has an external ImageMagick 7.1.1-43 corpus
     covering raw and RLE true-color at 24/32 bits, every top/bottom and left/right
     origin combination, alpha and a nonempty 22-byte image-ID payload. Leaf tests pin
     complete canonical RGBA buffers and every selected header field, with fixture
     provenance and SHA-256 under `user/tga/tests/data`. The reciprocal host-only
     `just tga-conformance` gate encodes raw/RLE 24/32-bit output with LiberSystem and
-    requires exact ImageMagick pixels. TGA is 3/3; uncovered ICNS `ih32`/`it32` and
-    the rest of the matrix keep this item open.
+    requires exact ImageMagick pixels. TGA is 3/3; the rest of the matrix keeps this
+    item open.
 - [ ] Add a deterministic hostile-input and mutation harness shared by all image
   decoders. Exercise every prefix truncation for small golden files plus bounded
   mutations of dimensions, offsets, lengths, palette/table counts, checksums, RLE,
