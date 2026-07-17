@@ -283,6 +283,16 @@ VP8L, ALPH and canonical full-canvas animation through webpinfo, dwebp, anim_dum
 and ImageMagick. Status: **Verified profile** for the implemented static and
 animation subsets.
 
+## Hostile-input gate
+
+`just image-mutate` runs 18 small corpus fixtures spanning every format above through
+both the owning leaf decoder and the central `imgconv` sniffer. Complete fixtures must
+decode as their expected format. Every strict prefix, every byte changed to zero, `0xff`
+and its high-bit inverse, whole-field zero/`0xff` mutations, and 128 deterministic
+SplitMix64 multi-bit mutations per fixture may decode or return a typed error but must
+not panic or stall. This currently exercises 11,392 prefixes, 34,296 targeted mutations
+and 2,304 seeded mutations in an optimized host build.
+
 ## Closure order
 
 1. Add independent corpora for the remaining verified/subset claims, prioritizing

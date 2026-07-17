@@ -3295,7 +3295,7 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     on LiberSystem's conservative P6/255 output through the reciprocal host-only
     `just ppm-conformance` gate. PPM is 3/3; the rest of the matrix keeps this item
     open.
-- [ ] Add a deterministic hostile-input and mutation harness shared by all image
+- [x] Add a deterministic hostile-input and mutation harness shared by all image
   decoders. Exercise every prefix truncation for small golden files plus bounded
   mutations of dimensions, offsets, lengths, palette/table counts, checksums, RLE,
   LZW and deflate runs, frame rectangles and loop/duration fields. A mutation may
@@ -3303,6 +3303,13 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
   declared geometry budget or allocate from an attacker-controlled unchecked size.
   Run the same corpus through the central sniffer so format misclassification is also
   covered, not only leaf parsers.
+  - Completed (2026-07-17): the host-only Rust `just image-mutate` gate covers 18
+    independently sourced or derived fixtures across all 12 recognized formats. Every
+    complete fixture must pass its owning leaf and `imgconv::decode_frame` with the
+    expected format; 11,392 strict prefixes, 34,296 deterministic byte/field mutations
+    and 2,304 seeded SplitMix64 multi-bit mutations then run through both paths. The
+    finite corpus covers dimensions, offsets, lengths, palettes/tables, CRCs, compressed
+    streams and animation controls without introducing third-party code into the target.
 - [ ] Measure and bound the real governed `imgconv.lsexe` working set, not only the
   incremental codec heap. Account together for the mapped source, the userspace input
   copy, decoded RGBA/animation model, encoder workspace, encoded `Vec`, staging
