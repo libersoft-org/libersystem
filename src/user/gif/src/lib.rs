@@ -280,6 +280,60 @@ mod tests {
 	use super::*;
 	use alloc::vec;
 
+	fn fnv1a(bytes: &[u8]) -> u64 {
+		bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3))
+	}
+
+	fn displayed_hashes(animation: &Animation) -> Vec<u64> {
+		let mut compositor = pix::Compositor::new_with_background(animation.width, animation.height, animation.background).unwrap();
+		animation.frames.iter().map(|frame| fnv1a(&compositor.render(frame).unwrap().pixels)).collect()
+	}
+
+	fn image_structure(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
+		let packed = data[10];
+		let mut cursor = 13 + if packed & 0x80 != 0 { (1usize << ((packed & 7) + 1)) * 3 } else { 0 };
+		let mut images = Vec::new();
+		while data[cursor] != 0x3b {
+			if data[cursor] == 0x21 {
+				cursor += 2;
+				if data[cursor - 1] == 0xf9 {
+					cursor += 6;
+				} else {
+					let fixed = data[cursor] as usize;
+					cursor += fixed + 1;
+					loop {
+						let length = data[cursor] as usize;
+						cursor += 1;
+						if length == 0 {
+							break;
+						}
+						cursor += length;
+					}
+				}
+				continue;
+			}
+			assert_eq!(data[cursor], 0x2c);
+			let descriptor = data[cursor + 9];
+			cursor += 10;
+			if descriptor & 0x80 != 0 {
+				cursor += (1usize << ((descriptor & 7) + 1)) * 3;
+			}
+			cursor += 1;
+			let mut blocks = Vec::new();
+			loop {
+				let length = data[cursor];
+				cursor += 1;
+				if length == 0 {
+					break;
+				}
+				blocks.push(length);
+				cursor += length as usize;
+			}
+			images.push((descriptor, blocks));
+		}
+		images
+	}
+
 	const IMAGEMAGICK_BACKGROUND_GIF: &[u8] = &[
 		0x47,
 		0x49,
@@ -469,5 +523,27 @@ mod tests {
 		assert!(low.len() < high.len());
 		assert_eq!(decode(&low).unwrap().frames[0].image.width, 32);
 		assert_eq!(decode(&high).unwrap().frames[0].image.width, 32);
+	}
+
+	#[test]
+	fn decodes_external_interlace_local_palette_disposal_and_subblocks() {
+		for data in [include_bytes!("../tests/data/external-animation.gif").as_slice(), include_bytes!("../tests/data/derived-local-subblocks.gif").as_slice()] {
+			let animation = decode(data).unwrap();
+			assert_eq!((animation.width, animation.height, animation.loop_count, animation.frames.len()), (29, 17, 2, 3));
+			assert_eq!(animation.frames.iter().map(|frame| (frame.x, frame.y, frame.image.width, frame.image.height)).collect::<Vec<_>>(), vec![(0, 0, 29, 17), (5, 4, 11, 9), (12, 2, 9, 7)]);
+			assert_eq!(animation.frames.iter().map(|frame| frame.duration_ms).collect::<Vec<_>>(), vec![0, 30, 50]);
+			assert_eq!(animation.frames.iter().map(|frame| frame.disposal).collect::<Vec<_>>(), vec![Disposal::Keep, Disposal::Background, Disposal::Previous]);
+			assert_eq!(displayed_hashes(&animation), vec![0x16b2_57ac_54ae_dc1c, 0xc053_dfb1_daa4_c81e, 0x1e5f_d5b6_c7a7_055a]);
+		}
+
+		let external = include_bytes!("../tests/data/external-animation.gif");
+		let derived = include_bytes!("../tests/data/derived-local-subblocks.gif");
+		let external_structure = image_structure(external);
+		let derived_structure = image_structure(derived);
+		assert_eq!(external_structure.len(), 3);
+		assert!(external_structure.iter().all(|(descriptor, _)| descriptor & 0x40 != 0 && descriptor & 0x80 == 0));
+		assert!(derived_structure.iter().all(|(descriptor, _)| descriptor & 0x40 != 0));
+		assert!(derived_structure[1].0 & 0x80 != 0);
+		assert!(derived_structure.iter().flat_map(|(_, blocks)| blocks).any(|length| *length == 1));
 	}
 }

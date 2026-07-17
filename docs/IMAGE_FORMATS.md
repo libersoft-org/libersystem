@@ -94,7 +94,15 @@ for transparent background, makes the first frame use that transparent index.
 Opaque and transparent-colored backgrounds round-trip exactly; partial background
 alpha is typed `Unsupported`. An ImageMagick 7.1.1-43 fixture pins initial and
 disposed canvases. Status: **Verified profile** for background/transparency;
-deferred-clear and unusual sub-block boundaries still need independent coverage.
+the independent gifsicle 1.96 corpus now also covers interlaced full/positioned
+frames, a local color table, disposal 1/2/3, zero and nonzero delays, loop count
+and image-data sub-blocks as short as one byte. LiberSystem and
+`gifsicle --unoptimize` produce identical displayed canvases. ImageMagick differs
+only after disposal 2 by clearing to transparent rather than the logical-screen
+background, a documented implementation divergence. The reciprocal
+`just gif-conformance` gate validates our timing/disposal/loop metadata with
+gifsicle and all composited pixels through gifsicle plus ImageMagick. Status:
+**Verified profile** for the implemented GIF87a/GIF89a animation subset.
 
 ### JPEG/JFIF
 

@@ -3138,6 +3138,19 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     stop coercing legal zero delays. Focused suites pass: pix 8/8, WebP 11/11, APNG
     4/4, GIF 3/3 and `imgconv` 15/15. GIF logical-screen background semantics were
     audited separately against an independent interoperability fixture.
+  - Partial result (2026-07-17): GIF now has an external ImageMagick/gifsicle 1.96
+    corpus with three interlaced full/positioned frames, disposal 1/2/3, delay
+    0/30/50 ms and loop 2. A structural derivative copies the global palette into a
+    frame-local table and repartitions unchanged LZW bytes into 1/2/3/5/... byte
+    image-data sub-blocks. Leaf tests pin descriptor flags, block lengths, rectangles,
+    timing/disposal and full-canvas FNV-1a plus artifact SHA-256 under
+    `user/gif/tests/data`. LiberSystem and `gifsicle --unoptimize` agree exactly on
+    every displayed canvas; ImageMagick differs only by clearing disposal-2 pixels
+    to transparent instead of the logical-screen background, a documented convention
+    divergence. The reciprocal host-only `just gif-conformance` gate checks our
+    timing/disposal/loop metadata and composited pixels through gifsicle/ImageMagick.
+    GIF is 6/6; non-rendering extension payloads remain intentionally ignored while
+    the rest of the matrix stays open.
   - Partial result (2026-07-17): BMP now distinguishes explicit alpha masks from the
     unused high byte of 32bpp `BI_RGB`. V3/V4/V5 `BI_BITFIELDS` and external
     `BI_ALPHABITFIELDS` masks are checked for nonzero contiguous disjoint ranges and
