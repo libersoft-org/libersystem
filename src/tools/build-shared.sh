@@ -41,6 +41,7 @@ fi
 command -v llvm-ar >/dev/null
 command -v llvm-readelf >/dev/null
 command -v llvm-strip >/dev/null
+command -v jq >/dev/null
 
 library_file() {
 	case "$1" in
@@ -282,6 +283,67 @@ for spec in "$@"; do
 	echo "build-shared: $out ($(stat -c %s "$out") bytes)"
 	artifacts+=("$artifact")
 done
+
+if printf '%s\n' "${artifacts[@]}" | grep -qx lsrt; then
+	consumer="echo"
+	consumer_dir="user/tools"
+	out_dir="$consumer_dir/shared/$target"
+	consumer_obj="$out_dir/.$consumer.o"
+	start_obj="$out_dir/.exe-start.o"
+	out="$out_dir/$consumer"
+	mkdir -p "$out_dir"
+	"$root/tools/build-exe-start.sh" "$target" "$start_obj"
+	artifact_messages="$(
+		cd "$consumer_dir"
+		RUST_MIN_STACK=33554432 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --quiet --release --target "$cargo_target" --bin "$consumer" --message-format=json-render-diagnostics -- --emit="obj=$root/$consumer_obj"
+	)"
+	if ! jq -e --arg target "$consumer" 'select(.reason == "compiler-artifact" and .target.kind == ["bin"] and .target.name == $target and .profile.opt_level == "3")' >/dev/null <<<"$artifact_messages"; then
+		echo "build-shared: Cargo did not report the release $consumer bin artifact" >&2
+		exit 1
+	fi
+	if ! llvm-readelf -h "$consumer_obj" | grep -q 'Type:.*REL'; then
+		echo "build-shared: $consumer_obj is not ET_REL" >&2
+		exit 1
+	fi
+	consumer_definitions="$(llvm-readelf --wide --symbols "$consumer_obj" | awk '$5 == "GLOBAL" && $7 != "UND" && $8 != "" {print $8}' | sort -u)"
+	if [[ "$consumer_definitions" != "__user_main" ]]; then
+		echo "build-shared: $consumer_obj defines globals outside __user_main: $consumer_definitions" >&2
+		exit 1
+	fi
+	consumer_imports="$(llvm-readelf --wide --symbols "$consumer_obj" | awk '$5 == "GLOBAL" && $7 == "UND" && $8 != "" {print $8}' | sort -u)"
+	for symbol in $consumer_imports; do
+		count="$(llvm-readelf --wide --dyn-syms "$(library_file lsrt)" | awk -v symbol="$symbol" '$7 != "UND" && $8 == symbol { count++ } END { print count + 0 }')"
+		if [[ "$count" != 1 ]]; then
+			echo "build-shared: $consumer import $symbol has $count providers in lsrt.lslib (expected 1)" >&2
+			exit 1
+		fi
+	done
+	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv --gc-sections --build-id=none -e _start "$start_obj" "$consumer_obj" "$(library_file lsrt)" --no-allow-shlib-undefined -o "$out"
+	if ! llvm-readelf -h "$out" | grep -q 'Type:.*DYN'; then
+		echo "build-shared: $out is not ET_DYN" >&2
+		exit 1
+	fi
+	actual_needed="$(llvm-readelf -d "$out" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p')"
+	if [[ "$actual_needed" != "lsrt.lslib" ]]; then
+		echo "build-shared: $out has unexpected providers: $actual_needed" >&2
+		exit 1
+	fi
+	if llvm-readelf -l "$out" | grep -q 'INTERP' || llvm-readelf -d "$out" | grep -Eq '\((RPATH|RUNPATH|TEXTREL)\)'; then
+		echo "build-shared: $out has a forbidden dynamic-loader contract" >&2
+		exit 1
+	fi
+	if ! llvm-readelf -l "$out" | awk '$1 == "LOAD" && $0 ~ /W/ && $0 ~ /E/ { bad = 1 } END { exit bad }'; then
+		echo "build-shared: $out contains a writable executable segment" >&2
+		exit 1
+	fi
+	forbidden_definitions="$(llvm-readelf --wide --symbols "$out" | awk '$7 != "UND" && $8 ~ /^(__rust_alloc|__rust_dealloc|rust_begin_unwind|memcpy|memmove|memset|memcmp|liber_rt_start|print|inherit_stdout)$/ {print $8}')"
+	if [[ -n "$forbidden_definitions" ]]; then
+		echo "build-shared: $out contains runtime/provider definitions: $forbidden_definitions" >&2
+		exit 1
+	fi
+	llvm-strip --strip-debug "$out"
+	echo "build-shared: $out ($(stat -c %s "$out") bytes, PIE pilot)"
+fi
 
 if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	probe="user/dyn_probe"

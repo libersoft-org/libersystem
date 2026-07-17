@@ -3533,7 +3533,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     recommended 32 MB worker stack. Whole-image identity records, a single deterministic
     invocation and the executable-side identity audit remain open with the start-object/
     image-linker work below.
-- [ ] Add a tiny generated executable-start object per architecture, not a static runtime
+- [x] Add a tiny generated executable-start object per architecture, not a static runtime
   archive in every program. It exports `_start`, aligns/initializes the ABI-required
   registers, performs the native ABI revision check through `lsrt`, and calls the tool's
   unmangled `__user_main(bootstrap)`. x86_64/aarch64/riscv64 entry behavior must stay
@@ -3544,6 +3544,14 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   system library and contains no allocator, formatting, IPC or protocol implementation.
   One checked source/generator emits all three architecture variants and is owned by the
   system image linker, not LSIDL.
+  - Result (2026-07-17): `tools/exe-start.rs` emits one architecture-specific `_start`
+    from checked Rust source and `build-exe-start.sh` assembles and audits its exact symbol
+    and relocation boundary. The x86_64/AArch64/RISC-V objects are 688/736/776 bytes;
+    RISC-V is explicitly RV64GC `lp64d`, matching consumer ELF flags. `lsrt` now owns the
+    shared ABI-check entry `liber_rt_start`; the generated object preserves the bootstrap
+    register, passes `__user_main`, and contains no runtime implementation. All three
+    targets link an ordinary echo PIE, and the x86 ProcessService QEMU gate launches the
+    staged image through `lsrt.lslib` and observes its stdout output.
 - [ ] Generalize `tools/build-shared.sh` into a manifest-driven system image linker that
   builds both `.lslib` providers and `.lsexe` consumers. For each tool, ask rustc for
   release PIC objects without using Cargo's final static executable link, then invoke
@@ -3558,6 +3566,14 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   one Cargo package per command: the existing multi-bin tools package emits one object set
   per `[[bin]]`. A rustc/Cargo update that changes this internal contract fails a focused
   builder test before any package is staged.
+  - Partial result (2026-07-17): the existing image builder now proves the contract with
+    `echo`: Cargo emits its release PIC object to a builder-owned exact path while JSON
+    output confirms the requested bin target and profile. The builder links only the
+    generated start object and `lsrt.lslib`, then rejects non-ET_DYN output, provider drift,
+    unresolved imports, interpreter/RPATH/TEXTREL, W+X segments and duplicated runtime,
+    allocator, panic or memory primitives. The stripped pilots are 3,440/3,736/4,032 bytes
+    on x86_64/AArch64/RISC-V. General manifest-driven provider edges and the remaining
+    executable set are still open.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,
   crate/source owner, output class/path, direct providers and build-feature set; each

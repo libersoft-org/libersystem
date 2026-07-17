@@ -59,12 +59,17 @@ global_asm!(".text", ".global _start", "_start:", "andi sp, sp, -16", "mv s0, ze
 #[unsafe(no_mangle)]
 #[cfg(not(feature = "shared-image"))]
 pub extern "C" fn __rt_start(bootstrap: u64) -> ! {
+	liber_rt_start(bootstrap, __user_main)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn liber_rt_start(bootstrap: u64, main: unsafe extern "C" fn(u64) -> !) -> ! {
 	unsafe {
 		if sys_is_err(syscall(SYS_ABI_CHECK, ABI_VERSION as u64, 0, 0, 0)) {
 			print(b"rt: refusing to run - built against a different kernel ABI revision\n");
 			exit();
 		}
-		__user_main(bootstrap)
+		main(bootstrap)
 	}
 }
 
@@ -258,6 +263,7 @@ pub unsafe fn yield_now() {
 
 // Write `bytes` to the debug console. The only output path a ring-3 program has when no
 // stdout console channel is set (the real console service routes through that channel).
+#[unsafe(no_mangle)]
 pub unsafe fn print(bytes: &[u8]) {
 	unsafe {
 		// If a stdout console channel is set, the program's terminal output goes there
@@ -499,6 +505,7 @@ pub fn perf_mark_val(label: &[u8], val: u64) {
 // grants it SEND|RECV and `read_line` then reads input from it; a background launch
 // grants only SEND, so reads return end-of-input. A no-op if the first message is not a
 // STDOUT one (the handle 0 then restores the debug-port fallback and leaves stdin empty).
+#[unsafe(no_mangle)]
 pub unsafe fn inherit_stdout(bootstrap: u64) {
 	unsafe {
 		let mut buf: [u8; 16] = [0u8; 16];

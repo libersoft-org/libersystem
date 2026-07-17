@@ -4672,6 +4672,29 @@ fn process_service_loads_a_program_from_system_bin() {
 		}
 	}
 
+	// Launch the first ordinary PIE tool, hand its bootstrap a stdout channel and
+	// arguments, and observe output produced through lsrt. This covers the generated
+	// start object and the echo.lsexe -> lsrt.lslib provider edge after volume staging.
+	let echo_name: &[u8] = b"echo";
+	let (echo_stdout_kernel, echo_stdout_user) = Channel::create();
+	let (echo_bootstrap_kernel, echo_bootstrap_user) = Channel::create();
+	let mut echo_launch = alloc::vec::Vec::new();
+	echo_launch.extend_from_slice(&3u16.to_le_bytes());
+	echo_launch.extend_from_slice(&20u32.to_le_bytes());
+	echo_launch.extend_from_slice(&(echo_name.len() as u16).to_le_bytes());
+	echo_launch.extend_from_slice(echo_name);
+	echo_launch.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&process_client, &echo_launch, echo_bootstrap_user, Rights::ALL).expect("dynamic echo launch request");
+	sched::run_until_idle();
+	let echo_reply = process_client.recv().expect("dynamic echo launch reply");
+	assert_eq!(le_u32(&echo_reply.bytes, 0), 20);
+	assert_eq!(echo_reply.bytes[4], 1, "the ordinary PIE tool loaded with lsrt");
+	send_cap(&echo_bootstrap_kernel, b"STDOUT", echo_stdout_user, Rights::ALL).expect("dynamic echo stdout bootstrap");
+	echo_bootstrap_kernel.send(Message::new(b"dynamic echo".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic echo arguments");
+	sched::run_until_idle();
+	assert_eq!(&echo_stdout_kernel.recv().expect("dynamic echo output").bytes, b"dynamic echo");
+	assert_eq!(&echo_stdout_kernel.recv().expect("dynamic echo newline").bytes, b"\n");
+
 	// LAUNCH the ET_DYN probe with a bootstrap channel. ProcessService must resolve
 	// pix.lslib -> lsrt.lslib from vol://system/lib, load providers first, relocate the
 	// probe's PLT call, and only then start it. Wire: op, corr, name, handle marker.

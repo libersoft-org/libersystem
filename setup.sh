@@ -36,6 +36,7 @@ APT_PACKAGES=(
 	build-essential # gcc, make, ...
 	git
 	curl
+	jq                # parse Cargo's machine-readable executable artifact records
 	xorriso           # ISO creation (UEFI)
 	gdisk             # sgdisk: GPT partitioning for the disk image
 	mtools            # mformat/mcopy: populate the FAT boot partition without root

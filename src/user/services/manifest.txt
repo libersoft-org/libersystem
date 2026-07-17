@@ -6,12 +6,13 @@
 # code - the runtime table and the staging lists can no longer drift apart.
 #
 # columns: kind  name  crate  stage  [restart  deps...]
-#   kind : launcher | service | instance | probe | driver | tool | component
+#   kind : launcher | service | instance | probe | driver | tool | dynamic | component
 #          - service : a managed service with its own ELF (ServiceManager supervises it)
 #          - instance: a managed service backed by another program's ELF (no own binary)
 #          - launcher: spawned from the init package, not supervised as a managed service
 #          - probe   : a self-test helper spawned by the supervisor
-#          - driver / tool / component: staged programs the managed services load
+#          - driver / tool / component: statically linked staged programs
+#          - dynamic: staged ET_DYN programs built by the system-image linker
 #   crate: crate directory under src/user (or '-' for an instance with no own ELF)
 #   stage: pinned (kept in init.pkg) | volume (staged on the system volume) | none
 #   restart: the supervisor's crash policy (service and instance rows only) -
@@ -74,8 +75,9 @@ driver    virtio_snd            drivers   volume
 driver    xhci                  drivers   volume
 
 # system-image shared libraries - built as PIC rlibs and linked to ET_DYN by
-# tools/build-shared.sh, then staged under lib/. Consumers remain static during the
-# executable-linker migration. Prefix-free crate directories own
+# tools/build-shared.sh, then staged under lib/. The echo PIE is the first ordinary
+# executable consumer; the remaining static programs migrate behind its standing gate.
+# Prefix-free crate directories own
 # their generated shared/<target>/ output; image staging appends `.lslib` to the name.
 library   lsrt                  rt        volume
 library   wire                  wire      volume
@@ -147,7 +149,7 @@ tool      lspci      tools  volume
 tool      lssvc      tools  volume
 tool      lsblk      tools  volume
 tool      lsusb      tools  volume
-tool      echo       tools  volume
+dynamic   echo       tools  volume
 tool      ping       tools  volume
 tool      ip         tools  volume
 tool      nslookup   tools  volume
