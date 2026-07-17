@@ -60,6 +60,16 @@ operations. Both normative layouts are accepted: the static image may be the fir
 animation frame or may be separate from the animation. Indexed multi-`IDAT` and
 static-image-not-a-frame regressions directly pin these behaviors.
 
+The independent static corpus covers 4-bit grayscale, indexed color with `tRNS`,
+16-bit RGBA, Adam7 RGB and a three-chunk consecutive-IDAT derivative preserving
+the exact compressed stream. ImageMagick and Pillow produce exact RGBA8; every
+file passes pngcheck 3.0.3. APNG Assembler 2.91 supplies ordinary three-frame and
+`-f` separate-default-image files; APNG Disassembler 2.9 confirms full-canvas
+pixels, 60 ms delays and loop count 2. The reciprocal `just png-conformance`
+gate requires pngcheck-clean compression-0/100 PNG with exact ImageMagick/Pillow
+pixels and APNG output with exact apngdis frames/timing. Status: **Verified
+profile** for the listed static PNG profiles and both normative APNG layouts.
+
 The central APNG sniffer walks bounded PNG chunks and recognizes `acTL` only
 before the first `IDAT`; bytes inside compressed image data cannot reclassify a
 static PNG. A regression fixture embeds the literal bytes `acTL` in a static

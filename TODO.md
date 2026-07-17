@@ -3112,9 +3112,22 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     The first resolved spec gap routes APNG frames through the complete static PNG
     pipeline, accepts inherited indexed/grayscale/RGB/alpha/16-bit/Adam7 profiles,
     multiple `IDAT` chunks and the legal static-image-not-a-frame layout. Indexed
-    multi-`IDAT` and separate-default-image regressions pass; APNG is 4/4 and
+    multi-`IDAT` and separate-default-image regressions pass; APNG is 5/5 and
     `imgconv` is 14/14. Independent external fixtures and the remaining per-format
     field audits keep this item open.
+  - Partial result (2026-07-17): PNG/APNG now has an external ImageMagick/Pillow
+    corpus for 4-bit grayscale, indexed+tRNS, 16-bit RGBA, Adam7 RGB and a
+    three-chunk consecutive-IDAT derivative preserving the compressed stream.
+    APNG Assembler 2.91 supplies ordinary three-frame and `-f` separate-default
+    files; APNG Disassembler 2.9 pins full-canvas pixels, 60 ms timing, loop 2 and
+    proves the fallback IDAT is not exposed as an animation frame. All containers
+    pass pngcheck 3.0.3; leaf tests pin IHDR/chunk layouts, composited RGBA FNV-1a
+    and artifact SHA-256 under `user/png/tests/data` and `user/apng/tests/data`.
+    The reciprocal host-only `just png-conformance` gate requires exact
+    ImageMagick/Pillow pixels for compression 0/100 PNG and exact apngdis frames
+    plus timing for LiberSystem APNG output. PNG is 8/8 and APNG 5/5; metadata
+    round-trip remains deliberately out of scope while the rest of the matrix stays
+    open.
   - Partial result (2026-07-17): the shared animation vocabulary now carries an RGBA
     background and preserves raw zero frame durations. WebP maps `ANIM` BGRA exactly,
     uses that color for initial canvas and background disposal, preserves duration 0,

@@ -300,6 +300,15 @@ mod tests {
 	use super::*;
 	use alloc::vec;
 
+	fn fnv1a(bytes: &[u8]) -> u64 {
+		bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3))
+	}
+
+	fn displayed_hashes(animation: &Animation) -> Vec<u64> {
+		let mut compositor = pix::Compositor::new_with_background(animation.width, animation.height, animation.background).unwrap();
+		animation.frames.iter().map(|frame| fnv1a(&compositor.render(frame).unwrap().pixels)).collect()
+	}
+
 	fn png_chunks(data: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
 		let mut chunks = Vec::new();
 		let mut cursor = 8usize;
@@ -414,5 +423,18 @@ mod tests {
 		let fctl = encoded.windows(4).position(|window| window == b"fcTL").unwrap();
 		encoded[fctl + 4] ^= 1;
 		assert_eq!(decode(&encoded), Err(Error::Invalid));
+	}
+
+	#[test]
+	fn decodes_external_apng_and_separate_default_image() {
+		let animation = decode(include_bytes!("../tests/data/external-animation.png")).unwrap();
+		assert_eq!((animation.width, animation.height, animation.loop_count, animation.frames.len()), (31, 19, 2, 3));
+		assert!(animation.frames.iter().all(|frame| frame.duration_ms == 60));
+		assert_eq!(displayed_hashes(&animation), vec![0x5fad_a2ef_c37e_917f, 0xfa2f_ff14_7b88_5f15, 0x566d_1dac_d369_b6ab]);
+
+		let separate = decode(include_bytes!("../tests/data/external-separate-default.png")).unwrap();
+		assert_eq!((separate.width, separate.height, separate.loop_count, separate.frames.len()), (31, 19, 2, 2));
+		assert!(separate.frames.iter().all(|frame| frame.duration_ms == 60));
+		assert_eq!(displayed_hashes(&separate), vec![0xfa2f_ff14_7b88_5f15, 0x566d_1dac_d369_b6ab]);
 	}
 }

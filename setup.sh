@@ -45,6 +45,9 @@ APT_PACKAGES=(
 	icnsutils         # png2icns/icns2png: independent ICNS conformance
 	libicns-dev       # libicns: legacy 128px ICNS fixture generation from Rust
 	python3-pil       # Pillow: independent alpha-aware BMP conformance decoder
+	pngcheck          # structural PNG/APNG CRC and chunk validation
+	apngasm           # independent APNG fixture assembly
+	apngdis           # independent APNG frame extraction
 	socat             # drive the QEMU monitor unix socket for screenshots
 	qemu-system-x86   # qemu-system-x86_64 (the native x86_64 build)
 	qemu-system-arm   # qemu-system-aarch64 (the ARM64 build, emulated on an x86 host)

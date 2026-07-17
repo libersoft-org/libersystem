@@ -539,6 +539,21 @@ extern crate std;
 mod tests {
 	use super::*;
 
+	fn fnv1a(bytes: &[u8]) -> u64 {
+		bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3))
+	}
+
+	fn chunk_kinds(data: &[u8]) -> Vec<[u8; 4]> {
+		let mut kinds = Vec::new();
+		let mut cursor = SIGNATURE.len();
+		while cursor < data.len() {
+			let length = read_u32(data, cursor).unwrap() as usize;
+			kinds.push(data[cursor + 4..cursor + 8].try_into().unwrap());
+			cursor += length + 12;
+		}
+		kinds
+	}
+
 	fn adler32(data: &[u8]) -> u32 {
 		let mut a = 1u32;
 		let mut b = 0u32;
@@ -702,5 +717,25 @@ mod tests {
 		assert!(parse(&high).unwrap().palette.len() > 16);
 		let partial = pix::RgbaImage::new(1, 1, vec![1, 2, 3, 128]).unwrap();
 		assert_eq!(encode_indexed(&partial, 50, 100), Err(Error::Unsupported));
+	}
+
+	#[test]
+	fn decodes_external_profiles_and_consecutive_multi_idat() {
+		for (data, profile, dimensions, hash) in [
+			(include_bytes!("../tests/data/external-gray4.png").as_slice(), [4, 0, 0], (17, 9), 0xaa3a_7646_5cdc_dbf8),
+			(include_bytes!("../tests/data/external-indexed-trns.png").as_slice(), [8, 3, 0], (19, 7), 0x9016_c6cb_8c8b_27d1),
+			(include_bytes!("../tests/data/external-rgba16.png").as_slice(), [16, 6, 0], (13, 11), 0x1658_7931_a19e_490a),
+			(include_bytes!("../tests/data/external-adam7-rgb.png").as_slice(), [8, 2, 1], (23, 15), 0x8cb7_e5da_66d8_51a1),
+			(include_bytes!("../tests/data/derived-multi-idat.png").as_slice(), [8, 2, 1], (23, 15), 0x8cb7_e5da_66d8_51a1),
+		] {
+			assert_eq!([data[24], data[25], data[28]], profile);
+			let image = decode_rgba(data).unwrap();
+			assert_eq!((image.width, image.height, fnv1a(&image.pixels)), (dimensions.0, dimensions.1, hash));
+		}
+		let indexed = chunk_kinds(include_bytes!("../tests/data/external-indexed-trns.png"));
+		assert!(indexed.contains(b"PLTE") && indexed.contains(b"tRNS"));
+		let multi = chunk_kinds(include_bytes!("../tests/data/derived-multi-idat.png"));
+		assert_eq!(multi.iter().filter(|kind| kind.as_slice() == b"IDAT").count(), 3);
+		assert_eq!(multi.windows(3).filter(|window| window.iter().all(|kind| kind.as_slice() == b"IDAT")).count(), 1);
 	}
 }
