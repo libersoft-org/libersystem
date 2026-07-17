@@ -3584,7 +3584,9 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     remains 3,440/3,736/4,032 bytes and `date` is 5,944/6,336/6,648 bytes on
     x86_64/AArch64/RISC-V. The x86 QEMU service/process gate executes both staged PIEs;
     `date` reaches TimeService through `proto + ipc-client + wire + lsrt` and renders its
-    ISO-8601 result. The remaining executable set is still open.
+    ISO-8601 result. `cat` uses the same provider set, is 8,704/9,088/10,064 bytes, and
+    the QEMU gate compares its StorageService-backed output byte-for-byte with the staged
+    file. The remaining executable set is still open.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,
   crate/source owner, output class/path, direct providers and build-feature set; each
@@ -3600,6 +3602,14 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     to have exactly one declared provider, and requires `DT_NEEDED` to equal the manifest
     edge set. `dyn_probe` also records its existing direct edges. Library feature/output
     schema, generated rows and cross-target identity records remain open.
+  - Runtime hardening result (2026-07-17): the first blocking ordinary PIEs exposed two
+    latent ABI defects that static codegen had masked. The x86 syscall entry now preserves
+    `rdi/rsi/rdx/r10` across `syscall_dispatch`, matching the documented userspace inline-
+    asm contract; otherwise an optimized `recv_blocking` reused a clobbered channel after
+    `WOULD_BLOCK`. The mangled Rust allocator-presence shim is now exported by `lsrt` as
+    the function consumers actually call, while the unmangled compiler sentinel remains
+    an object. The image builder pins that symbol type and the ProcessService QEMU gate
+    exercises a blocking dynamic echo before the alloc-using date/cat workflows.
 - [ ] Enforce a strict executable graph at image construction: every native `/bin`
   artifact is `ET_DYN`, contains `PT_DYNAMIC` + terminated dynamic table, has at least
   `DT_NEEDED=lsrt.lslib`, carries no interpreter/RPATH/RUNPATH, and names only canonical

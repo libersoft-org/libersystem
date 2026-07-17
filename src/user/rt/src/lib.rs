@@ -109,7 +109,7 @@ fn alloc_failure() -> ! {
 
 #[cfg(feature = "shared-image")]
 #[unsafe(export_name = "_RNvCshfEkAwg4zv6_7___rustc35___rust_no_alloc_shim_is_unstable_v2")]
-pub static RUST_NO_ALLOC_SHIM_ALIAS: u8 = 0;
+pub extern "C" fn rust_no_alloc_shim_alias() {}
 
 #[cfg(feature = "shared-image")]
 #[unsafe(export_name = "_RNvCshfEkAwg4zv6_7___rustc26___rust_alloc_error_handler")]

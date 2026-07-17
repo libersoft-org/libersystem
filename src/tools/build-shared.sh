@@ -313,6 +313,13 @@ for spec in "$@"; do
 			fi
 		done
 	fi
+	if [[ "$artifact" == "lsrt" ]]; then
+		alloc_shim="$(llvm-readelf --wide --dyn-syms "$out" | awk '$8 == "_RNvCshfEkAwg4zv6_7___rustc35___rust_no_alloc_shim_is_unstable_v2" {print $4}')"
+		if [[ "$alloc_shim" != "FUNC" ]]; then
+			echo "build-shared: lsrt allocator shim alias is not one function" >&2
+			exit 1
+		fi
+	fi
 	if ! llvm-readelf -h "$out" | grep -q 'Type:.*DYN'; then
 		echo "build-shared: $out is not ET_DYN" >&2
 		exit 1

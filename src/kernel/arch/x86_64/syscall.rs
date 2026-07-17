@@ -66,6 +66,10 @@ global_asm!(
 	"push r9",
 	"push r11",
 	"push rcx",
+	"push rdi",
+	"push rsi",
+	"push rdx",
+	"push r10",
 	"sub rsp, 8",
 	"mov qword ptr gs:[{fu}], 1",
 	"mov r8, r10",
@@ -78,6 +82,10 @@ global_asm!(
 	// Restore the user registers from this thread's stack and return to ring 3
 	// (rip <- rcx, rflags <- r11, rsp <- the saved user stack pointer).
 	"add rsp, 8",
+	"pop r10",
+	"pop rdx",
+	"pop rsi",
+	"pop rdi",
 	"pop rcx",
 	"pop r11",
 	"pop rsp",

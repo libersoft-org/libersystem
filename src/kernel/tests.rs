@@ -4590,8 +4590,8 @@ fn system_packages_use_canonical_executable_names() {
 	}
 }
 
-tagged_test!(process_service_loads_a_program_from_system_bin, [Service, Process, Storage]);
-fn process_service_loads_a_program_from_system_bin() {
+tagged_test!(dynamic_process_service_loads_programs_from_system_bin, [Service, Process, Storage]);
+fn dynamic_process_service_loads_programs_from_system_bin() {
 	use object::channel::{Channel, Message};
 	use object::process::Process;
 	use object::rights::Rights;
@@ -4689,11 +4689,39 @@ fn process_service_loads_a_program_from_system_bin() {
 	let echo_reply = process_client.recv().expect("dynamic echo launch reply");
 	assert_eq!(le_u32(&echo_reply.bytes, 0), 20);
 	assert_eq!(echo_reply.bytes[4], 1, "the ordinary PIE tool loaded with lsrt");
+	let echo_process = echo_reply.caps[0].object().into_any_arc().downcast::<Process>().expect("dynamic echo launch capability is a Process");
+	assert!(!echo_process.is_terminated(), "dynamic echo remains blocked on its live bootstrap after launch");
+	assert!(echo_process.handle_count() >= 1, "dynamic echo owns its bootstrap handle");
+	assert!(!echo_bootstrap_kernel.is_peer_closed(), "dynamic echo bootstrap peer is open before initialization");
 	send_cap(&echo_bootstrap_kernel, b"STDOUT", echo_stdout_user, Rights::ALL).expect("dynamic echo stdout bootstrap");
 	echo_bootstrap_kernel.send(Message::new(b"dynamic echo".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic echo arguments");
+	assert!(!echo_bootstrap_kernel.is_peer_closed(), "dynamic echo bootstrap peer remains open after initialization is queued");
 	sched::run_until_idle();
-	assert_eq!(&echo_stdout_kernel.recv().expect("dynamic echo output").bytes, b"dynamic echo");
+	let echo_output = echo_stdout_kernel.recv().unwrap_or_else(|error| {
+		let fault = echo_process.fault_info();
+		panic!("dynamic echo output: {error:?}; fault={:?} terminated={} sent={} received={}", fault.map(|info| (info.kind, info.error_code, info.address, info.instruction_pointer)), echo_process.is_terminated(), echo_process.messages_sent(), echo_process.messages_received())
+	});
+	assert_eq!(&echo_output.bytes, b"dynamic echo");
 	assert_eq!(&echo_stdout_kernel.recv().expect("dynamic echo newline").bytes, b"\n");
+
+	// Load the generated date PIE directly as well. Its capability protocol is covered by
+	// PermissionManager; this assertion isolates staging, provider-DAG loading and relocation
+	// from that policy layer so a loader failure cannot collapse into an empty tool result.
+	let date_name: &[u8] = b"date";
+	let (date_bootstrap_kernel, date_bootstrap_user) = Channel::create();
+	let mut date_launch = alloc::vec::Vec::new();
+	date_launch.extend_from_slice(&3u16.to_le_bytes());
+	date_launch.extend_from_slice(&21u32.to_le_bytes());
+	date_launch.extend_from_slice(&(date_name.len() as u16).to_le_bytes());
+	date_launch.extend_from_slice(date_name);
+	date_launch.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&process_client, &date_launch, date_bootstrap_user, Rights::ALL).expect("dynamic date launch request");
+	sched::run_until_idle();
+	let date_reply = process_client.recv().expect("dynamic date launch reply");
+	assert_eq!(le_u32(&date_reply.bytes, 0), 21);
+	assert_eq!(date_reply.bytes[4], 1, "the date PIE loaded with its manifest providers");
+	drop(date_bootstrap_kernel);
+	sched::run_until_idle();
 
 	// LAUNCH the ET_DYN probe with a bootstrap channel. ProcessService must resolve
 	// pix.lslib -> lsrt.lslib from vol://system/lib, load providers first, relocate the
