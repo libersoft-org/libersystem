@@ -173,6 +173,14 @@ The leaf accepts one P3 plain or P6 raw RGB image and emits the conservative P6
 subset with `Maxval=255`. PBM, PGM, PAM, concatenated images and 16-bit PPM output
 are **Subsets**. Input scaling and comments must follow the current Netpbm PPM
 description; alpha input is rejected for output rather than silently composited.
+The independent Netpbm 11.10.2 corpus covers commented P3 with `Maxval=31` and
+P6 with `Maxval=65535` two-byte big-endian samples. Complete RGBA buffers are
+pinned by FNV-1a. Netpbm nearest-rounding matches the decoder for low-Maxval P3;
+ImageMagick 7.1.1-43 truncates some converted 8-bit samples by one, a documented
+consumer quantization difference. Both agree exactly on the 16-bit P6 fixture.
+The reciprocal `just ppm-conformance` gate requires exact LiberSystem P6/255
+output from both implementations. Status: **Verified profile** for selected P3
+and P6 input plus conservative P6/255 output.
 
 ### QOI
 

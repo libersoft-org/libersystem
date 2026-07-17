@@ -1,0 +1,8 @@
+[package]
+name = "ppm-conformance"
+edition = "2024"
+description = "Host interoperability gate for LiberSystem PPM output"
+
+[dependencies]
+ppm = { path = "../../user/ppm" }
+pix = { path = "../../user/pix" }
