@@ -299,7 +299,7 @@ pub fn convert(input: &[u8], config: &Config) -> Result<(Vec<u8>, ResultInfo), E
 			}
 		};
 		animation.loop_count = config.loop_count.unwrap_or(animation.loop_count);
-		if matches!(config.format, Format::Apng | Format::Gif) && animation.background != [0; 4] {
+		if config.format == Format::Apng && animation.background != [0; 4] || config.format == Format::Gif && !matches!(animation.background[3], 0 | 255) {
 			animation = canonicalize_animation(&animation)?;
 		}
 		let encoded = match config.format {
@@ -850,6 +850,12 @@ mod tests {
 		assert_eq!(actual, expected);
 		let (still, _) = convert(&source, &parse_args(b"--frame 1 in.webp out.png").unwrap()).unwrap();
 		assert_eq!(png::decode_rgba(&still).unwrap(), expected[1]);
+		let (encoded, _) = convert(&source, &parse_args(b"--quality 100 in.webp out.gif").unwrap()).unwrap();
+		let decoded = gif::decode(&encoded).unwrap();
+		assert_eq!(decoded.background, background);
+		let mut target_compositor = pix::Compositor::new_with_background(decoded.width, decoded.height, decoded.background).unwrap();
+		let actual: Vec<_> = decoded.frames.iter().map(|frame| target_compositor.render(frame).unwrap()).collect();
+		assert_eq!(actual, expected);
 	}
 
 	#[test]

@@ -48,9 +48,15 @@ pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 	} else {
 		None
 	};
+	let background_index = screen[5];
+	let background_rgb = global.as_ref().and_then(|palette| palette.get(background_index as usize)).copied();
+	if global.is_some() && background_rgb.is_none() {
+		return Err(Error::Invalid);
+	}
 	let mut control = GraphicsControl { delay: 0, disposal: Disposal::Keep, transparent: None };
 	let mut loop_count = 1u32;
 	let mut frames = Vec::new();
+	let mut background = None;
 	loop {
 		match *data.get(cursor).ok_or(Error::Truncated)? {
 			0x21 => {
@@ -59,7 +65,7 @@ pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 				cursor += 1;
 				if label == 0xf9 {
 					let body = data.get(cursor..cursor + 6).ok_or(Error::Truncated)?;
-					if body[0] != 4 || body[5] != 0 {
+					if body[0] != 4 || body[1] & 0xe0 != 0 || body[5] != 0 {
 						return Err(Error::Invalid);
 					}
 					control.delay = u16::from_le_bytes([body[2], body[3]]);
@@ -120,6 +126,9 @@ pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 					pixels.extend_from_slice(&[color[0], color[1], color[2], if control.transparent == Some(index) { 0 } else { 255 }]);
 				}
 				let image = pix::RgbaImage::new(frame_width, frame_height, pixels).map_err(map_pix)?;
+				if background.is_none() {
+					background = Some(background_rgb.map_or([0; 4], |color| [color[0], color[1], color[2], if control.transparent == Some(background_index) { 0 } else { 255 }]));
+				}
 				frames.push(Frame { image, x, y, duration_ms: control.delay as u32 * 10, blend: Blend::Over, disposal: control.disposal });
 				control = GraphicsControl { delay: 0, disposal: Disposal::Keep, transparent: None };
 			}
@@ -133,7 +142,7 @@ pub fn decode(data: &[u8]) -> Result<Animation, Error> {
 	if cursor != data.len() {
 		return Err(Error::Invalid);
 	}
-	Animation::new(width, height, loop_count, frames).map_err(map_pix)
+	Animation::new_with_background(width, height, background.ok_or(Error::Invalid)?, loop_count, frames).map_err(map_pix)
 }
 
 pub fn encode(animation: &Animation) -> Result<Vec<u8>, Error> {
@@ -141,15 +150,30 @@ pub fn encode(animation: &Animation) -> Result<Vec<u8>, Error> {
 }
 
 pub fn encode_with_options(animation: &Animation, options: EncodeOptions) -> Result<Vec<u8>, Error> {
-	if animation.background != [0; 4] {
+	if !matches!(animation.background[3], 0 | 255) {
 		return Err(Error::Unsupported);
 	}
-	let validated = Animation::new(animation.width, animation.height, animation.loop_count, animation.frames.clone()).map_err(map_pix)?;
+	let validated = Animation::new_with_background(animation.width, animation.height, animation.background, animation.loop_count, animation.frames.clone()).map_err(map_pix)?;
 	if validated.width > u16::MAX as u32 || validated.height > u16::MAX as u32 || validated.loop_count > u16::MAX as u32 {
 		return Err(Error::TooLarge);
 	}
-	let images: Vec<_> = validated.frames.iter().map(|frame| frame.image.as_rgba()).collect();
-	let palette = quantize::build_palette(&images, quantize::Options { quality: options.quality, dither: options.dither, alpha_threshold: options.alpha_threshold }).map_err(map_quantize)?;
+	let background_image = pix::RgbaImage::new(1, 1, validated.background.to_vec()).map_err(map_pix)?;
+	let mut images: Vec<_> = validated.frames.iter().map(|frame| frame.image.as_rgba()).collect();
+	images.push(background_image.as_rgba());
+	let mut palette = quantize::build_palette(&images, quantize::Options { quality: options.quality, dither: options.dither, alpha_threshold: options.alpha_threshold }).map_err(map_quantize)?;
+	let background_index = if validated.background[3] == 0 {
+		let index = palette.transparent_index.ok_or(Error::Invalid)?;
+		palette.colors[index as usize] = validated.background;
+		index
+	} else if let Some(index) = palette.colors.iter().position(|color| color[..3] == validated.background[..3] && color[3] == 255) {
+		index as u8
+	} else if palette.colors.len() < 256 {
+		palette.colors.push(validated.background);
+		(palette.colors.len() - 1) as u8
+	} else {
+		palette.colors[255] = validated.background;
+		255
+	};
 	let table_size = palette.colors.len().max(2).next_power_of_two();
 	let size_bits = table_size.trailing_zeros() as u8 - 1;
 	let minimum = (size_bits + 1).max(2);
@@ -157,7 +181,7 @@ pub fn encode_with_options(animation: &Animation, options: EncodeOptions) -> Res
 	output.extend_from_slice(&(validated.width as u16).to_le_bytes());
 	output.extend_from_slice(&(validated.height as u16).to_le_bytes());
 	output.push(0x80 | 0x70 | size_bits);
-	output.extend_from_slice(&[0, 0]);
+	output.extend_from_slice(&[background_index, 0]);
 	for index in 0..table_size {
 		let color = palette.colors.get(index).copied().unwrap_or([0; 4]);
 		output.extend_from_slice(&color[..3]);
@@ -166,16 +190,17 @@ pub fn encode_with_options(animation: &Animation, options: EncodeOptions) -> Res
 	output.extend_from_slice(&(validated.loop_count as u16).to_le_bytes());
 	output.push(0);
 	let transparent = palette.transparent_index;
-	for frame in &validated.frames {
+	for (frame_index, frame) in validated.frames.iter().enumerate() {
 		let delay = u16::try_from(frame.duration_ms.div_ceil(10)).map_err(|_| Error::TooLarge)?;
 		let disposal = match frame.disposal {
 			Disposal::Keep => 1,
 			Disposal::Background => 2,
 			Disposal::Previous => 3,
 		};
-		output.extend_from_slice(&[0x21, 0xf9, 4, disposal << 2 | u8::from(transparent.is_some())]);
+		let frame_transparent = if frame_index == 0 && validated.background[3] == 0 { Some(background_index) } else { transparent };
+		output.extend_from_slice(&[0x21, 0xf9, 4, disposal << 2 | u8::from(frame_transparent.is_some())]);
 		output.extend_from_slice(&delay.to_le_bytes());
-		output.extend_from_slice(&[transparent.unwrap_or(0), 0]);
+		output.extend_from_slice(&[frame_transparent.unwrap_or(0), 0]);
 		output.push(0x2c);
 		output.extend_from_slice(&(frame.x as u16).to_le_bytes());
 		output.extend_from_slice(&(frame.y as u16).to_le_bytes());
@@ -255,6 +280,100 @@ mod tests {
 	use super::*;
 	use alloc::vec;
 
+	const IMAGEMAGICK_BACKGROUND_GIF: &[u8] = &[
+		0x47,
+		0x49,
+		0x46,
+		0x38,
+		0x39,
+		0x61,
+		0x02,
+		0x00,
+		0x01,
+		0x00,
+		0xf1,
+		0x01,
+		0x00,
+		0xff,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0xff,
+		0x00,
+		0x80,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x21,
+		0xff,
+		0x0b,
+		0x4e,
+		0x45,
+		0x54,
+		0x53,
+		0x43,
+		0x41,
+		0x50,
+		0x45,
+		0x32,
+		0x2e,
+		0x30,
+		0x03,
+		0x01,
+		0x00,
+		0x00,
+		0x00,
+		0x21,
+		0xf9,
+		0x04,
+		0x04,
+		0x03,
+		0x00,
+		0x00,
+		0x00,
+		0x2c,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		0x02,
+		0x00,
+		0x01,
+		0x00,
+		0x00,
+		0x02,
+		0x02,
+		0x0c,
+		0x0a,
+		0x00,
+		0x21,
+		0xf9,
+		0x04,
+		0x04,
+		0x03,
+		0x00,
+		0x00,
+		0x00,
+		0x2c,
+		0x01,
+		0x00,
+		0x00,
+		0x00,
+		0x01,
+		0x00,
+		0x01,
+		0x00,
+		0x00,
+		0x02,
+		0x02,
+		0x54,
+		0x01,
+		0x00,
+		0x3b,
+	];
+
 	#[test]
 	fn timing_loop_disposal_and_binary_alpha_round_trip() {
 		let first = pix::RgbaImage::new(2, 1, vec![255, 0, 0, 255, 0, 0, 0, 0]).unwrap();
@@ -270,9 +389,57 @@ mod tests {
 		)
 		.unwrap();
 		assert_eq!(decode(&encode(&animation).unwrap()).unwrap(), animation);
-		let mut unsupported_background = animation;
-		unsupported_background.background = [1, 2, 3, 255];
-		assert_eq!(encode(&unsupported_background), Err(Error::Unsupported));
+	}
+
+	#[test]
+	fn logical_screen_background_matches_imagemagick_transparency_convention() {
+		let opaque = decode(IMAGEMAGICK_BACKGROUND_GIF).unwrap();
+		assert_eq!(opaque.background, [0, 0, 255, 255]);
+		let mut compositor = pix::Compositor::new_with_background(opaque.width, opaque.height, opaque.background).unwrap();
+		let displayed: Vec<_> = opaque.frames.iter().map(|frame| compositor.render(frame).unwrap()).collect();
+		assert_eq!(displayed[0].pixels, vec![0, 0, 255, 255, 255, 0, 0, 255]);
+		assert_eq!(displayed[1].pixels, vec![0, 0, 255, 255, 0, 128, 0, 255]);
+
+		let mut transparent = IMAGEMAGICK_BACKGROUND_GIF.to_vec();
+		transparent[47] |= 1;
+		transparent[50] = transparent[11];
+		let transparent = decode(&transparent).unwrap();
+		assert_eq!(transparent.background, [0, 0, 255, 0]);
+
+		let mut later_only = IMAGEMAGICK_BACKGROUND_GIF.to_vec();
+		later_only[70] |= 1;
+		later_only[73] = later_only[11];
+		assert_eq!(decode(&later_only).unwrap().background, [0, 0, 255, 255]);
+
+		let mut bad_background = IMAGEMAGICK_BACKGROUND_GIF.to_vec();
+		bad_background[11] = 4;
+		assert_eq!(decode(&bad_background), Err(Error::Invalid));
+		let mut reserved_control = IMAGEMAGICK_BACKGROUND_GIF.to_vec();
+		reserved_control[47] |= 0x20;
+		assert_eq!(decode(&reserved_control), Err(Error::Invalid));
+	}
+
+	#[test]
+	fn opaque_and_transparent_background_round_trip_exactly() {
+		for background in [[7, 17, 27, 255], [7, 17, 27, 0]] {
+			let animation = Animation::new_with_background(
+				2,
+				1,
+				background,
+				2,
+				vec![
+					Frame { image: pix::RgbaImage::new(1, 1, vec![255, 0, 0, 255]).unwrap(), x: 0, y: 0, duration_ms: 0, blend: Blend::Over, disposal: Disposal::Background },
+					Frame { image: pix::RgbaImage::new(1, 1, vec![0, 255, 0, 255]).unwrap(), x: 1, y: 0, duration_ms: 30, blend: Blend::Over, disposal: Disposal::Keep },
+				],
+			)
+			.unwrap();
+			let encoded = encode(&animation).unwrap();
+			let background_index = encoded[11] as usize;
+			assert_eq!(&encoded[13 + background_index * 3..16 + background_index * 3], &background[..3]);
+			assert_eq!(decode(&encoded).unwrap(), animation);
+		}
+		let partial = Animation::new_with_background(1, 1, [1, 2, 3, 128], 1, vec![Frame { image: pix::RgbaImage::new(1, 1, vec![4, 5, 6, 255]).unwrap(), x: 0, y: 0, duration_ms: 1, blend: Blend::Over, disposal: Disposal::Keep }]).unwrap();
+		assert_eq!(encode(&partial), Err(Error::Unsupported));
 	}
 
 	#[test]

@@ -74,10 +74,17 @@ with a deterministic global palette, LZW image data, graphic controls and the
 Netscape loop extension. Plain Text, Comment and unknown Application extensions
 are non-rendering data and may be ignored safely; malformed block sizes and
 reserved values remain errors. Zero delay is preserved. The logical-screen
-background index is not yet represented because its interaction with per-frame
-transparency differs across deployed decoders; background disposal therefore
-remains a **Gap** pending an external browser/tool corpus. Deferred-clear and
-unusual sub-block boundaries need the same independent coverage.
+background index selects an exact Global Color Table RGB value. Following the
+deployed ImageMagick/browser convention, it is transparent only when the first
+frame's Graphic Control Extension names that same index as transparent; later
+frame transparency does not alter the global background. The shared compositor
+uses that RGBA value for initial canvas and disposal method 2. Encoding reserves
+an exact background palette entry, writes the matching logical-screen index and,
+for transparent background, makes the first frame use that transparent index.
+Opaque and transparent-colored backgrounds round-trip exactly; partial background
+alpha is typed `Unsupported`. An ImageMagick 7.1.1-43 fixture pins initial and
+disposed canvases. Status: **Verified profile** for background/transparency;
+deferred-clear and unusual sub-block boundaries still need independent coverage.
 
 ### JPEG/JFIF
 
@@ -179,9 +186,11 @@ encoding uses the local no_std dependency implementation and must remain covered
 external decoding rather than only its paired decoder. Animation preserves the
 `ANIM` BGRA background as RGBA and raw 24-bit frame durations including zero. The
 shared compositor initializes and disposes frame rectangles to that background;
-preview and static-frame extraction use the same path. APNG/GIF destinations with
-no equivalent represented background are canonicalized to displayed full-canvas
-frames so cross-format conversion preserves visuals and timing. The parser requires
+preview and static-frame extraction use the same path. APNG destinations with no
+equivalent represented background, and GIF destinations with unrepresentable partial
+background alpha, are canonicalized to displayed full-canvas frames so cross-format
+conversion preserves visuals and timing. Representable GIF backgrounds remain exact.
+The parser requires
 `VP8X` first, `ANIM` before `ANMF`, reconstruction chunks before trailing metadata,
 zero RIFF padding and zero reserved bits in `VP8X`/`ANMF`. Status: **Verified
 profile** for the implemented animation subset; independent external decoding remains
@@ -189,9 +198,7 @@ required for the corpus gate.
 
 ## Closure order
 
-1. Resolve GIF logical-screen background versus transparent-index interoperability
-  against independent browser/tool output.
-2. Add independent corpora for the remaining verified/subset claims, prioritizing
+1. Add independent corpora for the remaining verified/subset claims, prioritizing
    ICNS, PCX and TGA where the primary-source chain is weakest.
 
 No format moves from **Gap** or **Source uncertain** to **Verified** without an

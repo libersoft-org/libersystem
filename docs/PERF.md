@@ -44,8 +44,8 @@ run produced:
 | WebP lossy quality 90, effort 0 | 91,104 | 256 | 44.8 ms | 7.6 ms |
 | WebP lossy quality 90, effort 100 | 91,140 | 256 | 46.0 ms | 7.6 ms |
 | APNG, one frame | 441,090 | 0 | 66.1 ms | 22.1 ms |
-| GIF quality 0, 16 colors | 73,146 | 1,390 | 54.5 ms | 6.3 ms |
-| GIF quality 100, up to 256 colors | 150,236 | 239 | 157.2 ms | 7.1 ms |
+| GIF quality 0, 16 colors | 71,170 | 1,450 | 49.8 ms | 7.2 ms |
+| GIF quality 100, up to 256 colors | 149,950 | 240 | 153.3 ms | 6.9 ms |
 | WebP lossless animation, 256x256, 2 frames | 458 | 0 | 0.80 ms | 0.20 ms |
 
 GIF, explicit indexed PNG, indexed BMP and indexed PCX use the same bounded no_std
@@ -59,6 +59,11 @@ RGBA/true-color output. Supplying `--quality` explicitly selects indexed output;
 partial alpha is rejected rather than silently thresholded, while binary alpha is
 represented by PLTE/tRNS. BMP/PCX remain opaque-only because their selected output
 profiles carry no alpha.
+
+GIF also reserves an exact Global Color Table entry for the logical-screen
+background. Its alpha follows the first-frame transparent-index convention measured
+with ImageMagick; subsequent disposal restores that RGBA value. This may consume one
+palette slot, but prevents conversion from silently changing partial-frame visuals.
 
 Classic ICNS output uses the format's component-wise PackBits variant for
 `is32/il32/ih32` RGB and pairs it with `s8mk/l8mk/h8mk` 8-bit alpha. The decoder also

@@ -3120,11 +3120,11 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     uses that color for initial canvas and background disposal, preserves duration 0,
     writes it back deterministically and validates `VP8X`/`ANMF` reserved bits, zero
     RIFF padding and top-level reconstruction/metadata order. `imgconv` uses the same
-    compositor for preview and frame extraction; APNG/GIF output canonicalizes a
-    nontransparent WebP background into visual full-canvas frames. APNG and GIF also
+    compositor for preview and frame extraction; APNG output and GIF output with
+    partial background alpha canonicalize into visual full-canvas frames. APNG and GIF also
     stop coercing legal zero delays. Focused suites pass: pix 8/8, WebP 11/11, APNG
-    4/4, GIF 3/3 and `imgconv` 15/15. GIF logical-screen background-index semantics
-    remain explicitly open for an independent interoperability corpus.
+    4/4, GIF 3/3 and `imgconv` 15/15. GIF logical-screen background semantics were
+    audited separately against an independent interoperability fixture.
   - Partial result (2026-07-17): BMP now distinguishes explicit alpha masks from the
     unused high byte of 32bpp `BI_RGB`. V3/V4/V5 `BI_BITFIELDS` and external
     `BI_ALPHABITFIELDS` masks are checked for nonzero contiguous disjoint ranges and
@@ -3135,6 +3135,16 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     zero-sized and overlapping directory payloads. Conflict, all-zero, maskless,
     embedded-mask and external-mask regressions pass; BMP is 9/9, ICO 3/3 and
     `imgconv` 15/15. Lower-depth ICO DIB/AND-mask profiles remain typed Unsupported.
+  - Partial result (2026-07-17): GIF now carries the Logical Screen background index
+    into the shared RGBA animation model. Background RGB comes from the Global Color
+    Table; alpha is zero only when the first frame declares the same transparent
+    index, while later frame transparency leaves it unchanged. Disposal method 2 uses
+    that exact RGBA value. The encoder reserves an exact palette entry and emits the
+    matching background/first-frame transparent indices; opaque and transparent-color
+    backgrounds round-trip, partial alpha is typed Unsupported, and WebP -> GIF keeps
+    background plus displayed canvases. An ImageMagick 7.1.1-43 byte fixture pins both
+    opaque and transparent conventions. GIF is 5/5, `imgconv` 15/15 and the standing
+    image benchmark remains below all time/heap/fidelity limits.
 - [ ] Make content sniffing structural and collision-resistant. APNG detection must
   walk real PNG chunk boundaries instead of finding `acTL` in arbitrary compressed
   bytes; PCX detection must validate its header fields instead of claiming every file
