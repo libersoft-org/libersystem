@@ -765,6 +765,76 @@ mod tests {
 	}
 
 	#[test]
+	fn every_profile_driven_option_combination_matches_capabilities() {
+		fn suffix(format: Format) -> &'static str {
+			match format {
+				Format::Apng => "apng",
+				Format::Bmp => "bmp",
+				Format::Gif => "gif",
+				Format::Ico => "ico",
+				Format::Icns => "icns",
+				Format::Jpeg => "jpg",
+				Format::Png => "png",
+				Format::Pcx => "pcx",
+				Format::Ppm => "ppm",
+				Format::Qoi => "qoi",
+				Format::Tga => "tga",
+				Format::WebP => "webp",
+			}
+		}
+
+		let mut accepted = 0usize;
+		let mut rejected = 0usize;
+		for profile in FORMAT_PROFILES {
+			let output = alloc::format!("out.{}", suffix(profile.format));
+			let quality = if profile.format == Format::WebP { alloc::format!("--lossy --quality 17 in.png {output}") } else { alloc::format!("--quality 17 in.png {output}") };
+			match parse_args(quality.as_bytes()) {
+				Ok(config) if profile.capabilities.quality => {
+					assert_eq!(config.quality, Some(17), "{} quality value", profile.format.name());
+					accepted += 1;
+				}
+				Err(Error::UnsupportedOption) if !profile.capabilities.quality => rejected += 1,
+				result => panic!("{} quality capability mismatch: {result:?}", profile.format.name()),
+			}
+
+			let compression = alloc::format!("--compression 17 in.png {output}");
+			match parse_args(compression.as_bytes()) {
+				Ok(config) if profile.capabilities.compression => {
+					assert_eq!(config.compression, Some(17), "{} compression value", profile.format.name());
+					accepted += 1;
+				}
+				Err(Error::UnsupportedOption) if !profile.capabilities.compression => rejected += 1,
+				result => panic!("{} compression capability mismatch: {result:?}", profile.format.name()),
+			}
+
+			for (argument, mode, supported) in [("--lossless", Mode::Lossless, profile.capabilities.lossless_mode), ("--lossy", Mode::Lossy, profile.capabilities.lossy_mode)] {
+				let arguments = alloc::format!("{argument} in.png {output}");
+				match parse_args(arguments.as_bytes()) {
+					Ok(config) if supported => {
+						assert_eq!(config.mode, Some(mode), "{} {argument} mode", profile.format.name());
+						accepted += 1;
+					}
+					Err(Error::UnsupportedOption) if !supported => rejected += 1,
+					result => panic!("{} {argument} capability mismatch: {result:?}", profile.format.name()),
+				}
+			}
+
+			let loop_count = alloc::format!("--loop 7 in.png {output}");
+			match parse_args(loop_count.as_bytes()) {
+				Ok(config) if profile.capabilities.animation => {
+					assert_eq!(config.loop_count, Some(7), "{} loop count", profile.format.name());
+					accepted += 1;
+				}
+				Err(Error::UnsupportedOption) if !profile.capabilities.animation => rejected += 1,
+				result => panic!("{} animation capability mismatch: {result:?}", profile.format.name()),
+			}
+		}
+		assert_eq!((accepted, rejected), (17, 43));
+		assert_eq!(parse_args(b"--quality 17 in.png out.webp"), Err(Error::UnsupportedOption), "WebP quality requires explicit lossy mode");
+		assert_eq!(parse_args(b"--lossless --quality 17 in.png out.webp"), Err(Error::UnsupportedOption), "lossless WebP rejects quality");
+	}
+
+	#[test]
 	fn converts_staged_bmp_png_and_resizes() {
 		let png_config = parse_args(b"--compression 100 --resize 4x4 in.bmp out.png").unwrap();
 		let (encoded, info) = convert(include_bytes!("../../../volume/sample.bmp"), &png_config).unwrap();

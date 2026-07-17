@@ -3362,6 +3362,14 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     exactly and reject bad quality/effort, truncation and a corrupted frame sync code.
     The optimized 512x512 gate requires quality 100 RGB MSE <= 300 and improvement
     over quality 0; measured MSE is 250 versus 923.
+  - Partial result (2026-07-17): a generated parser matrix now evaluates quality,
+    compression, lossless mode, lossy mode and loop-count against every one of the 12
+    `FORMAT_PROFILES`: all 60 format-option combinations are exercised, with 17 accepted
+    values checked in `Config` and all 43 unsupported combinations required to return
+    exactly `UnsupportedOption`. Two additional WebP conflicts require explicit lossy mode
+    for quality and reject quality in lossless mode. The matrix consumes the same profile
+    rows as parsing and generated help, so adding a format or changing one capability
+    changes the gate rather than leaving a hand-maintained rejection list stale.
 - [x] End-to-end and performance gates: a kernel scenario launches governed `imgconv`
   through PermissionManager, reads a staged image from StorageService, writes at least
   one lossless and one lossy destination, reopens both and decodes them independently,

@@ -314,6 +314,9 @@ diagnostic directly at the failed heap-backing boundary, without requiring anoth
 `imgconv --help` is generated from the same `FORMAT_PROFILES` table that argument parsing
 uses for output capabilities and defaults. The command accepts two paths plus the documented
 format, resize, frame, loop, quality, compression and WebP mode options; metadata is stripped.
+The parser gate evaluates five profile-driven option families across all 12 output formats:
+17 supported combinations must preserve the requested value, 43 unsupported combinations
+must return `UnsupportedOption`, and lossless WebP must reject quality.
 
 `imgview` accepts exactly one image path. Version one displays a still image or composited
 animation frame 0 and does not play animations. `imgview --help` states this explicitly. The
