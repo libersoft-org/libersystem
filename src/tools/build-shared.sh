@@ -52,6 +52,43 @@ library_file() {
 	esac
 }
 
+image_graph=""
+if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
+	image_target="$root/boot/.build/image-cargo-$target"
+	image_graph="$root/boot/.build/image-cargo-$target.jsonl"
+	image_graph_errors="$root/boot/.build/image-cargo-$target.stderr"
+	image_seed="$root/boot/.build/image-seed-$target.o"
+	rm -rf "$image_target"
+	rm -f "$image_seed"
+	set +e
+	(
+		cd "$root/user/tools"
+		CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK=33554432 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --release --target "$cargo_target" --bin date --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$image_seed"
+	) >"$image_graph" 2>"$image_graph_errors"
+	graph_status=$?
+	set -e
+	if [[ "$graph_status" != 101 || ! -f "$image_seed" ]] || ! llvm-readelf -h "$image_seed" | grep -q 'Type:.*REL'; then
+		echo "build-shared: Cargo image graph did not stop after emitting its ET_REL seed object" >&2
+		exit 1
+	fi
+	if ! grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$image_graph_errors" || ! grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$image_graph_errors"; then
+		echo "build-shared: Cargo image graph failed outside the expected final-link shim boundary" >&2
+		exit 1
+	fi
+fi
+
+graph_archive() {
+	local crate_dir="$1"
+	local package_prefix="path+file://$root/$crate_dir#"
+	local archives
+	archives="$(jq -r --arg prefix "$package_prefix" 'select(.reason == "compiler-artifact" and (.package_id | startswith($prefix))) | .filenames[] | select(endswith(".rlib"))' "$image_graph" | sort -u)"
+	if [[ "$(wc -l <<<"$archives")" != 1 || -z "$archives" ]]; then
+		echo "build-shared: Cargo image graph has no unique archive for $crate_dir" >&2
+		exit 1
+	fi
+	printf '%s' "$archives"
+}
+
 artifacts=()
 for spec in "$@"; do
 	if [[ "$spec" == *=* ]]; then
@@ -83,9 +120,14 @@ for spec in "$@"; do
 	elif [[ "$artifact" == "ipc-client" ]]; then
 		features=(--no-default-features --features shared-image)
 	fi
-	(cd "$crate_dir" && RUST_MIN_STACK=33554432 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$cargo_target" --lib "${features[@]}")
-	deps="$crate_dir/target/$target/release/deps"
-	rlib="$(find "$deps" -maxdepth 1 -name "lib${crate_rust}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+	if [[ -n "$image_graph" ]]; then
+		deps="$image_target/$target/release/deps"
+		rlib="$(graph_archive "$crate_dir")"
+	else
+		(cd "$crate_dir" && RUST_MIN_STACK=33554432 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$cargo_target" --lib "${features[@]}")
+		deps="$crate_dir/target/$target/release/deps"
+		rlib="$(find "$deps" -maxdepth 1 -name "lib${crate_rust}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+	fi
 	if [[ -z "$rlib" ]]; then
 		echo "build-shared: no rlib produced for $crate" >&2
 		exit 1
@@ -111,9 +153,10 @@ for spec in "$@"; do
 		rm -rf "$object_root"
 		mkdir -p "$object_root"
 		for archive in "${archives[@]}"; do
+			archive_path="$(realpath "$archive")"
 			archive_name="$(basename "$archive" .rlib)"
 			mkdir -p "$object_root/$archive_name"
-			(cd "$object_root/$archive_name" && llvm-ar x "$OLDPWD/$archive")
+			(cd "$object_root/$archive_name" && llvm-ar x "$archive_path")
 		done
 		while IFS= read -r -d '' object; do
 			llvm-objcopy --set-symbol-visibility=memcpy=default --set-symbol-visibility=memmove=default --set-symbol-visibility=memset=default --set-symbol-visibility=memcmp=default "$object"
@@ -284,65 +327,105 @@ for spec in "$@"; do
 	artifacts+=("$artifact")
 done
 
-if printf '%s\n' "${artifacts[@]}" | grep -qx lsrt; then
-	consumer="echo"
-	consumer_dir="user/tools"
-	out_dir="$consumer_dir/shared/$target"
-	consumer_obj="$out_dir/.$consumer.o"
-	start_obj="$out_dir/.exe-start.o"
-	out="$out_dir/$consumer"
-	mkdir -p "$out_dir"
+if [[ -n "$image_graph" ]]; then
+	start_obj="$root/boot/.build/exe-start-$target.o"
 	"$root/tools/build-exe-start.sh" "$target" "$start_obj"
-	artifact_messages="$(
-		cd "$consumer_dir"
-		RUST_MIN_STACK=33554432 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --quiet --release --target "$cargo_target" --bin "$consumer" --message-format=json-render-diagnostics -- --emit="obj=$root/$consumer_obj"
-	)"
-	if ! jq -e --arg target "$consumer" 'select(.reason == "compiler-artifact" and .target.kind == ["bin"] and .target.name == $target and .profile.opt_level == "3")' >/dev/null <<<"$artifact_messages"; then
-		echo "build-shared: Cargo did not report the release $consumer bin artifact" >&2
+	dynamic_rows="$(awk '$1 == "dynamic" && $3 == "tools" && $4 == "volume" {print}' "$root/user/services/manifest.txt" | sort -k2,2)"
+	duplicate_consumer="$(awk '{print $2}' <<<"$dynamic_rows" | uniq -d | head -n1)"
+	if [[ -n "$duplicate_consumer" ]]; then
+		echo "build-shared: duplicate dynamic executable $duplicate_consumer" >&2
 		exit 1
 	fi
-	if ! llvm-readelf -h "$consumer_obj" | grep -q 'Type:.*REL'; then
-		echo "build-shared: $consumer_obj is not ET_REL" >&2
-		exit 1
-	fi
-	consumer_definitions="$(llvm-readelf --wide --symbols "$consumer_obj" | awk '$5 == "GLOBAL" && $7 != "UND" && $8 != "" {print $8}' | sort -u)"
-	if [[ "$consumer_definitions" != "__user_main" ]]; then
-		echo "build-shared: $consumer_obj defines globals outside __user_main: $consumer_definitions" >&2
-		exit 1
-	fi
-	consumer_imports="$(llvm-readelf --wide --symbols "$consumer_obj" | awk '$5 == "GLOBAL" && $7 == "UND" && $8 != "" {print $8}' | sort -u)"
-	for symbol in $consumer_imports; do
-		count="$(llvm-readelf --wide --dyn-syms "$(library_file lsrt)" | awk -v symbol="$symbol" '$7 != "UND" && $8 == symbol { count++ } END { print count + 0 }')"
-		if [[ "$count" != 1 ]]; then
-			echo "build-shared: $consumer import $symbol has $count providers in lsrt.lslib (expected 1)" >&2
+	while read -r kind consumer crate stage providers; do
+		if [[ "$kind" != dynamic || "$crate" != tools || "$stage" != volume ]]; then
+			continue
+		fi
+		if [[ -z "$providers" ]]; then
+			echo "build-shared: dynamic $consumer has no direct providers" >&2
 			exit 1
 		fi
-	done
-	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv --gc-sections --build-id=none -e _start "$start_obj" "$consumer_obj" "$(library_file lsrt)" --no-allow-shlib-undefined -o "$out"
-	if ! llvm-readelf -h "$out" | grep -q 'Type:.*DYN'; then
-		echo "build-shared: $out is not ET_DYN" >&2
-		exit 1
-	fi
-	actual_needed="$(llvm-readelf -d "$out" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p')"
-	if [[ "$actual_needed" != "lsrt.lslib" ]]; then
-		echo "build-shared: $out has unexpected providers: $actual_needed" >&2
-		exit 1
-	fi
-	if llvm-readelf -l "$out" | grep -q 'INTERP' || llvm-readelf -d "$out" | grep -Eq '\((RPATH|RUNPATH|TEXTREL)\)'; then
-		echo "build-shared: $out has a forbidden dynamic-loader contract" >&2
-		exit 1
-	fi
-	if ! llvm-readelf -l "$out" | awk '$1 == "LOAD" && $0 ~ /W/ && $0 ~ /E/ { bad = 1 } END { exit bad }'; then
-		echo "build-shared: $out contains a writable executable segment" >&2
-		exit 1
-	fi
-	forbidden_definitions="$(llvm-readelf --wide --symbols "$out" | awk '$7 != "UND" && $8 ~ /^(__rust_alloc|__rust_dealloc|rust_begin_unwind|memcpy|memmove|memset|memcmp|liber_rt_start|print|inherit_stdout)$/ {print $8}')"
-	if [[ -n "$forbidden_definitions" ]]; then
-		echo "build-shared: $out contains runtime/provider definitions: $forbidden_definitions" >&2
-		exit 1
-	fi
-	llvm-strip --strip-debug "$out"
-	echo "build-shared: $out ($(stat -c %s "$out") bytes, PIE pilot)"
+		provider_count="$(wc -w <<<"$providers")"
+		providers="$(tr ' ' '\n' <<<"$providers" | sort -u | xargs)"
+		if [[ "$(wc -w <<<"$providers")" != "$provider_count" ]]; then
+			echo "build-shared: dynamic $consumer repeats a direct provider" >&2
+			exit 1
+		fi
+		consumer_dir="$root/user/$crate"
+		out_dir="$consumer_dir/shared/$target"
+		consumer_obj="$out_dir/.$consumer.o"
+		consumer_errors="$out_dir/.$consumer.stderr"
+		out="$out_dir/$consumer"
+		mkdir -p "$out_dir"
+		rm -f "$consumer_obj"
+		set +e
+		(
+			cd "$consumer_dir"
+			CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK=33554432 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --quiet --release --target "$cargo_target" --bin "$consumer" --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$consumer_obj"
+		) >/dev/null 2>"$consumer_errors"
+		consumer_status=$?
+		set -e
+		if [[ "$consumer_status" != 101 || ! -f "$consumer_obj" ]] || ! llvm-readelf -h "$consumer_obj" | grep -q 'Type:.*REL'; then
+			echo "build-shared: $consumer did not stop after emitting its ET_REL object" >&2
+			exit 1
+		fi
+		if ! grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$consumer_errors" || ! grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$consumer_errors"; then
+			echo "build-shared: $consumer failed outside the expected final-link shim boundary" >&2
+			exit 1
+		fi
+		consumer_definitions="$(llvm-readelf --wide --symbols "$consumer_obj" | awk '$5 == "GLOBAL" && $7 != "UND" && $8 != "" {print $8}' | sort -u)"
+		if [[ "$consumer_definitions" != "__user_main" ]]; then
+			echo "build-shared: $consumer_obj defines globals outside __user_main: $consumer_definitions" >&2
+			exit 1
+		fi
+		provider_inputs=()
+		expected_needed=""
+		for provider in $providers; do
+			if ! printf '%s\n' "${artifacts[@]}" | grep -qx "$provider"; then
+				echo "build-shared: dynamic $consumer names unavailable provider $provider" >&2
+				exit 1
+			fi
+			provider_inputs+=("$(library_file "$provider")")
+			expected_needed+="$provider.lslib"$'\n'
+		done
+		expected_needed="$(sort -u <<<"$expected_needed" | sed '/^$/d')"
+		consumer_imports="$(llvm-readelf --wide --symbols "$consumer_obj" | awk '$5 == "GLOBAL" && $7 == "UND" && $8 != "" {print $8}' | sort -u)"
+		for symbol in $consumer_imports; do
+			count=0
+			for provider_file in "${provider_inputs[@]}"; do
+				matches="$(llvm-readelf --wide --dyn-syms "$provider_file" | awk -v symbol="$symbol" '$7 != "UND" && $8 == symbol { count++ } END { print count + 0 }')"
+				count=$((count + matches))
+			done
+			if [[ "$count" != 1 ]]; then
+				echo "build-shared: $consumer import $symbol has $count declared providers (expected 1)" >&2
+				exit 1
+			fi
+		done
+		"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv --gc-sections --build-id=none -e _start "$start_obj" "$consumer_obj" "${provider_inputs[@]}" --no-allow-shlib-undefined -o "$out"
+		if ! llvm-readelf -h "$out" | grep -q 'Type:.*DYN'; then
+			echo "build-shared: $out is not ET_DYN" >&2
+			exit 1
+		fi
+		actual_needed="$(llvm-readelf -d "$out" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sort -u)"
+		if [[ "$actual_needed" != "$expected_needed" ]]; then
+			echo "build-shared: $out providers differ from its manifest: $actual_needed" >&2
+			exit 1
+		fi
+		if llvm-readelf -l "$out" | grep -q 'INTERP' || llvm-readelf -d "$out" | grep -Eq '\((RPATH|RUNPATH|TEXTREL)\)'; then
+			echo "build-shared: $out has a forbidden dynamic-loader contract" >&2
+			exit 1
+		fi
+		if ! llvm-readelf -l "$out" | awk '$1 == "LOAD" && $0 ~ /W/ && $0 ~ /E/ { bad = 1 } END { exit bad }'; then
+			echo "build-shared: $out contains a writable executable segment" >&2
+			exit 1
+		fi
+		forbidden_definitions="$(llvm-readelf --wide --symbols "$out" | awk '$7 != "UND" && $8 ~ /^(__rust_alloc|__rust_dealloc|rust_begin_unwind|memcpy|memmove|memset|memcmp|liber_rt_start|print|inherit_stdout)$/ {print $8}')"
+		if [[ -n "$forbidden_definitions" ]]; then
+			echo "build-shared: $out contains runtime/provider definitions: $forbidden_definitions" >&2
+			exit 1
+		fi
+		llvm-strip --strip-debug "$out"
+		echo "build-shared: $out ($(stat -c %s "$out") bytes, PIE)"
+	done <<<"$dynamic_rows"
 fi
 
 if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then

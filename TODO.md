@@ -3533,6 +3533,15 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     recommended 32 MB worker stack. Whole-image identity records, a single deterministic
     invocation and the executable-side identity audit remain open with the start-object/
     image-linker work below.
+  - Partial result (2026-07-17): one clean Cargo invocation now owns the actual image
+    graph for all current providers and ordinary PIE consumers. Its machine-readable
+    artifact records select each local-path `rlib` exactly, including the local/crates.io
+    `qoi` name collision, and preserve one shared feature/dependency identity through
+    `lsrt`, `wire`, `ipc-client`, `proto` and every codec leaf. The intentional Cargo
+    final-link failure is pinned to the duplicate allocator shims after an exact-path
+    `ET_REL` seed exists; any other failure aborts construction. The complete provider
+    graph and its consumers link on all three architectures. Embedded identity notes and
+    source/toolchain digests remain open.
 - [x] Add a tiny generated executable-start object per architecture, not a static runtime
   archive in every program. It exports `_start`, aligns/initializes the ABI-required
   registers, performs the native ABI revision check through `lsrt`, and calls the tool's
@@ -3566,14 +3575,16 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   one Cargo package per command: the existing multi-bin tools package emits one object set
   per `[[bin]]`. A rustc/Cargo update that changes this internal contract fails a focused
   builder test before any package is staged.
-  - Partial result (2026-07-17): the existing image builder now proves the contract with
-    `echo`: Cargo emits its release PIC object to a builder-owned exact path while JSON
-    output confirms the requested bin target and profile. The builder links only the
-    generated start object and `lsrt.lslib`, then rejects non-ET_DYN output, provider drift,
-    unresolved imports, interpreter/RPATH/TEXTREL, W+X segments and duplicated runtime,
-    allocator, panic or memory primitives. The stripped pilots are 3,440/3,736/4,032 bytes
-    on x86_64/AArch64/RISC-V. General manifest-driven provider edges and the remaining
-    executable set are still open.
+  - Partial result (2026-07-17): the image builder now consumes every ordinary `dynamic`
+    tools row instead of naming a pilot in shell. Cargo emits each release PIC object to a
+    builder-owned exact path in the coherent image graph; the builder links the generated
+    start object and only the row's direct providers, then rejects non-ET_DYN output,
+    provider/import drift, unresolved or duplicate providers, interpreter/RPATH/TEXTREL,
+    W+X segments and duplicated runtime, allocator, panic or memory primitives. `echo`
+    remains 3,440/3,736/4,032 bytes and `date` is 5,944/6,336/6,648 bytes on
+    x86_64/AArch64/RISC-V. The x86 QEMU service/process gate executes both staged PIEs;
+    `date` reaches TimeService through `proto + ipc-client + wire + lsrt` and renders its
+    ISO-8601 result. The remaining executable set is still open.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,
   crate/source owner, output class/path, direct providers and build-feature set; each
@@ -3583,6 +3594,12 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   identities, source/bin mismatch, an edge omitted from or unused by ELF imports,
   incompatible feature identities and target-specific edge drift. Sort rows and edges
   canonically so source/manifest enumeration order cannot change bytes.
+  - Partial result (2026-07-17): ordinary dynamic rows now list direct prefix-free
+    providers. The builder sorts executable rows and edges, rejects duplicate executable
+    identities, repeated/unknown/unavailable providers, requires every undefined symbol
+    to have exactly one declared provider, and requires `DT_NEEDED` to equal the manifest
+    edge set. `dyn_probe` also records its existing direct edges. Library feature/output
+    schema, generated rows and cross-target identity records remain open.
 - [ ] Enforce a strict executable graph at image construction: every native `/bin`
   artifact is `ET_DYN`, contains `PT_DYNAMIC` + terminated dynamic table, has at least
   `DT_NEEDED=lsrt.lslib`, carries no interpreter/RPATH/RUNPATH, and names only canonical

@@ -5,7 +5,7 @@
 # lists from every row. Adding a normal service is one row here plus the service's own
 # code - the runtime table and the staging lists can no longer drift apart.
 #
-# columns: kind  name  crate  stage  [restart  deps...]
+# columns: kind  name  crate  stage  [policy/providers...]
 #   kind : launcher | service | instance | probe | driver | tool | dynamic | component
 #          - service : a managed service with its own ELF (ServiceManager supervises it)
 #          - instance: a managed service backed by another program's ELF (no own binary)
@@ -19,6 +19,7 @@
 #          transparent (restart per the ladder; clients re-resolve through the broker)
 #          or escalate (record Failed; today's default until a service migrates)
 #   deps : the services that must be Running first (service and instance rows only)
+#   providers: direct prefix-free library names for dynamic rows
 
 # managed services - ServiceManager brings these up in dependency order. The row order
 # is deliberately NOT the start order (DeviceManager and the shell are listed before
@@ -110,10 +111,10 @@ library   ogg                   ogg    volume
 library   vorbis                vorbis volume
 library   wav                   wav    volume
 library   wavpack               wavpack volume
-dynamic   dyn_probe             dyn_probe volume
+dynamic   dyn_probe             dyn_probe volume pix proto lsrt
 
 # command-line tools - loaded from the system volume under bin/.
-tool      date       tools  volume
+dynamic   date       tools  volume proto ipc-client wire lsrt
 tool      cat        tools  volume
 tool      write      tools  volume
 tool      rm         tools  volume
@@ -149,7 +150,7 @@ tool      lspci      tools  volume
 tool      lssvc      tools  volume
 tool      lsblk      tools  volume
 tool      lsusb      tools  volume
-dynamic   echo       tools  volume
+dynamic   echo       tools  volume lsrt
 tool      ping       tools  volume
 tool      ip         tools  volume
 tool      nslookup   tools  volume

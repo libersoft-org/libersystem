@@ -215,6 +215,10 @@ path = "src/ptyecho.rs"
 name = "readln"
 path = "src/readln.rs"
 
+[features]
+default = []
+shared-image = ["ipc-client/shared-image", "rt/shared-image"]
+
 [dependencies]
 ipc-client = { path = "../ipc-client" }
 # Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
