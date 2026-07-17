@@ -3590,8 +3590,11 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     and a block-backed QEMU workflow streams a new file through StorageService before the
     dynamic cat reads the exact bytes back. `rm` uses `proto + ipc-client + wire + lsrt`,
     is 8,184/8,640/9,576 bytes, and extends that workflow through deletion and an exact
-    `cat: <uri>: cannot open` negative read-back. The remaining executable set is still
-    open.
+    `cat: <uri>: cannot open` negative read-back. `mkdir` and `rmdir` use the same provider
+    set and sizes as `rm`; the same block-backed gate creates a directory, writes and reads
+    a file inside it, rejects removal while non-empty, removes the file, removes the empty
+    directory and confirms the nested file stays absent. The remaining executable set is
+    still open.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,
   crate/source owner, output class/path, direct providers and build-feature set; each

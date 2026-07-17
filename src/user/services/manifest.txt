@@ -120,8 +120,8 @@ dynamic   write      tools  volume proto wire lsrt
 dynamic   rm         tools  volume proto ipc-client wire lsrt
 tool      ls         tools  volume
 tool      du         tools  volume
-tool      mkdir      tools  volume
-tool      rmdir      tools  volume
+dynamic   mkdir      tools  volume proto ipc-client wire lsrt
+dynamic   rmdir      tools  volume proto ipc-client wire lsrt
 tool      log        tools  volume
 tool      snap       tools  volume
 tool      volume     tools  volume
