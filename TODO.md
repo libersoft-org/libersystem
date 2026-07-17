@@ -3185,7 +3185,7 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     background plus displayed canvases. An ImageMagick 7.1.1-43 byte fixture pins both
     opaque and transparent conventions. GIF is 5/5, `imgconv` 15/15 and the standing
     image benchmark remains below all time/heap/fidelity limits.
-- [ ] Make content sniffing structural and collision-resistant. APNG detection must
+- [x] Make content sniffing structural and collision-resistant. APNG detection must
   walk real PNG chunk boundaries instead of finding `acTL` in arbitrary compressed
   bytes; PCX detection must validate its header fields instead of claiming every file
   whose first byte is `0x0a`, which currently shadows legal TGA files with a ten-byte
@@ -3201,6 +3201,16 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     through public `decode_frame`. Focused `imgconv` is 14/14 and PCX/TGA leaves are
     3/3 and 2/2. The broader signature audit, corrupt-recognized error split and real
     tool collision path keep this item open.
+  - Completed (2026-07-17): all central classification now passes through one ordered
+    `sniff_format` function. Exact PNG/APNG, GIF, BMP, ICO, ICNS, JPEG, PPM, PCX, QOI,
+    WebP and TGA signatures/predicates run before bounded GIF/PCX/TGA family fallbacks,
+    so a malformed recognized header reaches its leaf while arbitrary bytes remain
+    unknown. Unit regressions require `UnsupportedFormat` for unknown data and
+    `InvalidImage` for truncation behind every supported signature family plus corrupt
+    APNG and reserved-bit TGA. The TGA leaf now rejects those reserved bits itself. The
+    governed `image` gate runs the real `imgconv.lsexe` over unknown bytes, signature-only
+    corrupt PNG and a valid `id_length=10` TGA: the first two print distinct diagnostics,
+    while the collision file is identified as TGA, converted to BMP and pixel-checked.
 - [ ] Add an independent interoperability corpus and host-only conformance runner.
   Decode externally produced golden files for every supported input profile, and
   validate our encoded BMP, PNG/APNG, GIF, PCX, TGA, ICO, ICNS, PPM, QOI, JPEG and

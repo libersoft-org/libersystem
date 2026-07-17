@@ -111,6 +111,7 @@ dependencies = [
  "pix",
  "png",
  "term",
+ "tga",
  "webp",
 ]
 
@@ -162,6 +163,13 @@ dependencies = [
 [[package]]
 name = "term"
 version = "0.0.0"
+
+[[package]]
+name = "tga"
+version = "0.0.0"
+dependencies = [
+ "pix",
+]
 
 [[package]]
 name = "webp"

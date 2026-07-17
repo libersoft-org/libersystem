@@ -416,38 +416,72 @@ pub fn decode_frame(input: &[u8], frame: usize) -> Result<(Format, pix::RgbaImag
 }
 
 fn decode_input(input: &[u8]) -> Result<(Format, Decoded), Error> {
-	let decoded = if is_apng(input) {
-		(Format::Apng, Decoded::Animation(apng::decode(input).map_err(map_apng_error)?))
-	} else if matches!(input.get(..6), Some(b"GIF87a") | Some(b"GIF89a")) {
-		(Format::Gif, Decoded::Animation(gif::decode(input).map_err(map_gif_error)?))
-	} else if input.starts_with(b"BM") {
-		(Format::Bmp, Decoded::Still(bmp::decode_rgba(input).map_err(map_bmp_error)?))
-	} else if input.starts_with(b"\x00\x00\x01\x00") {
-		(Format::Ico, Decoded::Still(ico::decode(input).map_err(map_ico_error)?))
-	} else if input.starts_with(b"icns") {
-		(Format::Icns, Decoded::Still(icns::decode(input).map_err(map_icns_error)?))
-	} else if input.starts_with(b"\xff\xd8") {
-		(Format::Jpeg, Decoded::Still(jpeg::decode(input).map_err(map_jpeg_error)?))
-	} else if input.starts_with(b"\x89PNG\r\n\x1a\n") {
-		(Format::Png, Decoded::Still(png::decode_rgba(input).map_err(map_png_error)?))
-	} else if input.starts_with(b"P3") || input.starts_with(b"P6") {
-		(Format::Ppm, Decoded::Still(ppm::decode(input).map_err(map_ppm_error)?))
-	} else if looks_like_pcx(input) {
-		(Format::Pcx, Decoded::Still(pcx::decode(input).map_err(map_pcx_error)?))
-	} else if input.starts_with(b"qoif") {
-		(Format::Qoi, Decoded::Still(qoi::decode(input).map_err(map_qoi_error)?))
-	} else if input.starts_with(b"RIFF") && input.get(8..12) == Some(b"WEBP") {
-		match webp::decode_animation(input) {
-			Ok(animation) => (Format::WebP, Decoded::Animation(animation)),
-			Err(webp::Error::Unsupported) => (Format::WebP, Decoded::Still(webp::decode(input).map_err(map_webp_error)?)),
+	let format = sniff_format(input).ok_or(Error::UnsupportedFormat)?;
+	let decoded = match format {
+		Format::Apng => Decoded::Animation(apng::decode(input).map_err(map_apng_error)?),
+		Format::Bmp => Decoded::Still(bmp::decode_rgba(input).map_err(map_bmp_error)?),
+		Format::Gif => Decoded::Animation(gif::decode(input).map_err(map_gif_error)?),
+		Format::Ico => Decoded::Still(ico::decode(input).map_err(map_ico_error)?),
+		Format::Icns => Decoded::Still(icns::decode(input).map_err(map_icns_error)?),
+		Format::Jpeg => Decoded::Still(jpeg::decode(input).map_err(map_jpeg_error)?),
+		Format::Png => Decoded::Still(png::decode_rgba(input).map_err(map_png_error)?),
+		Format::Pcx => Decoded::Still(pcx::decode(input).map_err(map_pcx_error)?),
+		Format::Ppm => Decoded::Still(ppm::decode(input).map_err(map_ppm_error)?),
+		Format::Qoi => Decoded::Still(qoi::decode(input).map_err(map_qoi_error)?),
+		Format::Tga => Decoded::Still(tga::decode(input).map_err(map_tga_error)?),
+		Format::WebP => match webp::decode_animation(input) {
+			Ok(animation) => Decoded::Animation(animation),
+			Err(webp::Error::Unsupported) => Decoded::Still(webp::decode(input).map_err(map_webp_error)?),
 			Err(error) => return Err(map_webp_error(error)),
-		}
-	} else if looks_like_tga(input) {
-		(Format::Tga, Decoded::Still(tga::decode(input).map_err(map_tga_error)?))
-	} else {
-		return Err(Error::UnsupportedFormat);
+		},
 	};
-	Ok(decoded)
+	Ok((format, decoded))
+}
+
+fn sniff_format(input: &[u8]) -> Option<Format> {
+	if input.starts_with(b"\x89PNG\r\n\x1a\n") {
+		return Some(if is_apng(input) { Format::Apng } else { Format::Png });
+	}
+	if matches!(input.get(..6), Some(b"GIF87a") | Some(b"GIF89a")) {
+		return Some(Format::Gif);
+	}
+	if input.starts_with(b"BM") {
+		return Some(Format::Bmp);
+	}
+	if input.starts_with(b"\x00\x00\x01\x00") {
+		return Some(Format::Ico);
+	}
+	if input.starts_with(b"icns") {
+		return Some(Format::Icns);
+	}
+	if input.starts_with(b"\xff\xd8") {
+		return Some(Format::Jpeg);
+	}
+	if input.starts_with(b"P3") || input.starts_with(b"P6") {
+		return Some(Format::Ppm);
+	}
+	if looks_like_pcx(input) {
+		return Some(Format::Pcx);
+	}
+	if input.starts_with(b"qoif") {
+		return Some(Format::Qoi);
+	}
+	if input.starts_with(b"RIFF") && input.get(8..12) == Some(b"WEBP") {
+		return Some(Format::WebP);
+	}
+	if looks_like_tga(input) {
+		return Some(Format::Tga);
+	}
+	if input.starts_with(b"GIF") {
+		return Some(Format::Gif);
+	}
+	if looks_like_pcx_family(input) {
+		return Some(Format::Pcx);
+	}
+	if looks_like_tga_family(input) {
+		return Some(Format::Tga);
+	}
+	None
 }
 
 enum Decoded {
@@ -495,6 +529,10 @@ fn looks_like_pcx(input: &[u8]) -> bool {
 	header[0] == 0x0a && header[1] == 5 && header[2] == 1 && header[3] == 8 && width.is_some() && height.is_some() && matches!(header[65], 1 | 3) && u16::from_le_bytes([header[66], header[67]]) > width.unwrap_or(0)
 }
 
+fn looks_like_pcx_family(input: &[u8]) -> bool {
+	input.get(..4) == Some(&[0x0a, 5, 1, 8])
+}
+
 fn composite_frame(animation: &pix::Animation, target: usize) -> Result<pix::RgbaImage, Error> {
 	if target >= animation.frames.len() {
 		return Err(Error::InvalidOptions);
@@ -526,6 +564,10 @@ fn format_from_path(path: &str) -> Option<Format> {
 
 fn looks_like_tga(input: &[u8]) -> bool {
 	input.len() >= 18 && input[1] == 0 && matches!(input[2], 2 | 10) && u16::from_le_bytes([input[12], input[13]]) != 0 && u16::from_le_bytes([input[14], input[15]]) != 0 && matches!(input[16], 24 | 32) && input[17] & 0xc0 == 0 && 18usize.checked_add(input[0] as usize).is_some_and(|start| start <= input.len())
+}
+
+fn looks_like_tga_family(input: &[u8]) -> bool {
+	input.get(1) == Some(&0) && matches!(input.get(2), Some(2 | 10))
 }
 
 fn parse_size(value: &[u8]) -> Result<(u32, u32), Error> {
@@ -857,6 +899,39 @@ mod tests {
 		tga[0] = 10;
 		tga.splice(18..18, *b"0123456789");
 		assert_eq!(decode_frame(&tga, 0).unwrap(), (Format::Tga, pixel));
+	}
+
+	#[test]
+	fn distinguishes_unknown_from_corrupt_recognized_formats() {
+		assert_eq!(sniff_format(b"not an image"), None);
+		assert_eq!(decode_frame(b"not an image", 0), Err(Error::UnsupportedFormat));
+		for (name, input, format) in [
+			("BMP", b"BM".as_slice(), Format::Bmp),
+			("GIF", b"GIF89a".as_slice(), Format::Gif),
+			("ICO", b"\0\0\x01\0".as_slice(), Format::Ico),
+			("ICNS", b"icns".as_slice(), Format::Icns),
+			("JPEG", b"\xff\xd8".as_slice(), Format::Jpeg),
+			("PNG", b"\x89PNG\r\n\x1a\n".as_slice(), Format::Png),
+			("PPM", b"P6 ".as_slice(), Format::Ppm),
+			("PCX", b"\x0a\x05\x01\x08".as_slice(), Format::Pcx),
+			("QOI", b"qoif".as_slice(), Format::Qoi),
+			("WebP", b"RIFF\0\0\0\0WEBP".as_slice(), Format::WebP),
+			("TGA", b"\0\0\x02".as_slice(), Format::Tga),
+		] {
+			assert_eq!(sniff_format(input), Some(format), "{name} family classification");
+			assert_eq!(decode_frame(input, 0), Err(Error::InvalidImage), "{name} corrupt classification");
+		}
+
+		let mut apng = include_bytes!("../../apng/tests/data/external-animation.png").to_vec();
+		let control = apng.windows(4).position(|window| window == b"acTL").unwrap();
+		apng[control + 12] ^= 1;
+		assert_eq!(sniff_format(&apng), Some(Format::Apng));
+		assert_eq!(decode_frame(&apng, 0), Err(Error::InvalidImage));
+
+		let mut tga = tga::encode(&pix::RgbaImage::new(1, 1, alloc::vec![1, 2, 3, 255]).unwrap(), tga::EncodeOptions { rle: false }).unwrap();
+		tga[17] |= 0x40;
+		assert_eq!(sniff_format(&tga), Some(Format::Tga));
+		assert_eq!(decode_frame(&tga, 0), Err(Error::InvalidImage));
 	}
 
 	#[test]

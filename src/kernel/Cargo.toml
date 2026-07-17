@@ -29,6 +29,7 @@ bmp = { path = "../user/bmp" }
 gif = { path = "../user/gif" }
 pix = { path = "../user/pix" }
 png = { path = "../user/png" }
+tga = { path = "../user/tga" }
 webp = { path = "../user/webp" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so

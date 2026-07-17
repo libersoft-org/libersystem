@@ -73,8 +73,9 @@ profile** for the listed static PNG profiles and both normative APNG layouts.
 The central APNG sniffer walks bounded PNG chunks and recognizes `acTL` only
 before the first `IDAT`; bytes inside compressed image data cannot reclassify a
 static PNG. A regression fixture embeds the literal bytes `acTL` in a static
-pixel payload and remains classified as PNG. Corrupt recognized APNG versus
-corrupt static PNG still needs explicit error-classification coverage.
+pixel payload and remains classified as PNG. A CRC-corrupt `acTL` stream stays
+classified as APNG and returns `InvalidImage`; signature-only corrupt static PNG does
+the same as PNG, while arbitrary unknown bytes return `UnsupportedFormat`.
 
 ### GIF89a
 
@@ -241,7 +242,15 @@ both image origins, and emits type-10 RLE with top-left origin. Color-mapped,
 grayscale, 15/16-bit, extension-area and developer-area profiles are **Subsets**.
 The central probe now validates the 18-byte header, no-color-map selected profile,
 type, nonzero geometry, depth, reserved descriptor bits and bounded image-ID start.
-The PCX/TGA image-ID collision is covered through the public `decode_frame` path.
+The leaf independently rejects reserved descriptor bits. The PCX/TGA image-ID collision
+is covered through both public `decode_frame` and the real governed `imgconv.lsexe` path.
+
+Central classification has one ordered implementation: exact strong signatures and the
+full PCX/TGA structural predicates run before GIF/PCX/TGA family fallbacks. The fallbacks
+exist only to route malformed recognized headers into their leaves, where they become
+`InvalidImage` or a typed unsupported profile; they never precede an exact competing
+format. Regression coverage distinguishes arbitrary unknown data from truncation behind
+every supported signature family.
 
 The independent ImageMagick 7.1.1-43 corpus contains raw and RLE 24/32-bit
 true-color files spanning all four top/bottom and left/right origin combinations.

@@ -5865,6 +5865,22 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	let animation_first = webp::decode(animation_webp).expect("composited WebP frame 0");
 	run_imgview_harness(imgview_elf, b"vol://media/ANIM.WEB", &viewer_surface(&animation_first), &mut system, &mut viewer_media);
 
+	let collision_pixel = pix::RgbaImage::new(1, 1, alloc::vec![17, 34, 51, 255]).expect("TGA collision pixel");
+	let mut collision_tga = tga::encode(&collision_pixel, tga::EncodeOptions { rle: false }).expect("encode TGA collision");
+	collision_tga[0] = 10;
+	collision_tga.splice(18..18, *b"0123456789");
+	let classification_image = fat16_image(&[(*b"UNKNOWN BIN", b"not an image"), (*b"BAD     PNG", b"\x89PNG\r\n\x1a\n"), (*b"COLLIDE TGA", &collision_tga)], false);
+	let mut classification_media = StorageHarness::start(storage_elf, b"FATBLOCK", &classification_image, classification_image.len() as u64);
+	let unknown = run_imgconv_harness(imgconv_elf, b"vol://media/UNKNOWN.BIN vol://media/UNKNOWN.BMP", &mut system, &mut classification_media);
+	assert_eq!(unknown, b"imgconv: unsupported image format\n");
+	let corrupt = run_imgconv_harness(imgconv_elf, b"vol://media/BAD.PNG vol://media/BAD.BMP", &mut system, &mut classification_media);
+	assert_eq!(corrupt, b"imgconv: invalid or corrupt image\n");
+	let collision = run_imgconv_harness(imgconv_elf, b"vol://media/COLLIDE.TGA vol://media/COLLIDE.BMP", &mut system, &mut classification_media);
+	assert!(collision.starts_with(b"imgconv: TGA 1x1 -> BMP 1x1 bytes="));
+	let collision_output = classification_media.open(b"vol://media/COLLIDE.BMP", 0xc0111de).expect("collision output opens");
+	assert_eq!(bmp::decode_rgba(&collision_output).expect("collision output decodes"), collision_pixel);
+	run_imgview_harness(imgview_elf, b"vol://media/COLLIDE.TGA", &viewer_surface(&collision_pixel), &mut system, &mut classification_media);
+
 	let line = run_imgconv_harness(imgconv_elf, b"--lossless --compression 50 vol://system/sample.bmp vol://media/CROSSL.WEBP", &mut system, &mut media);
 	assert!(line.starts_with(b"imgconv: BMP 2x2 -> WebP 2x2 mode=lossless compression=50 bytes="));
 	let converted = media.open(b"vol://media/CROSSL.WEBP", 0xc2057).expect("cross-volume lossless WebP opens");

@@ -41,6 +41,9 @@ pub fn decode(data: &[u8]) -> Result<pix::RgbaImage, Error> {
 		32 => 4,
 		_ => return Err(Error::Unsupported),
 	};
+	if header[17] & 0xc0 != 0 {
+		return Err(Error::Invalid);
+	}
 	let right_to_left = header[17] & 0x10 != 0;
 	let top_down = header[17] & 0x20 != 0;
 	let count = usize::try_from(width).ok().and_then(|width| width.checked_mul(height as usize)).ok_or(Error::TooLarge)?;
@@ -192,6 +195,10 @@ mod tests {
 		header[1] = 1;
 		header[2] = 2;
 		assert_eq!(decode(&header), Err(Error::Unsupported));
+		let image = pix::RgbaImage::new(1, 1, vec![1, 2, 3, 255]).unwrap();
+		let mut reserved = encode(&image, EncodeOptions { rle: false }).unwrap();
+		reserved[17] |= 0x40;
+		assert_eq!(decode(&reserved), Err(Error::Invalid));
 	}
 
 	#[test]
