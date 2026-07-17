@@ -101,15 +101,6 @@ fn compute_bitreverse(blocksize: u8) -> Vec<u32> {
 	return rev;
 }
 
-#[test]
-fn test_compute_bitreverse() {
-	let br = compute_bitreverse(8);
-	// The output was generated from the output of the
-	// original stb_vorbis function.
-	let cmp_arr = &[0, 64, 32, 96, 16, 80, 48, 112, 8, 72, 40, 104, 24, 88, 56, 120, 4, 68, 36, 100, 20, 84, 52, 116, 12, 76, 44, 108, 28, 92, 60, 124];
-	assert_eq!(br, cmp_arr);
-}
-
 #[inline]
 fn bark(x: f32) -> f32 {
 	13.1 * libm::atanf(0.00074 * x) + 2.24 * libm::atanf(0.0000000185 * x * x) + 0.0001 * x
@@ -139,3 +130,7 @@ pub fn compute_bark_map_cos_omega(n: u16, floor0_rate: u16, floor0_bark_map_size
 	}
 	return res;
 }
+
+#[cfg(test)]
+#[path = "header_cached/tests.rs"]
+mod tests;

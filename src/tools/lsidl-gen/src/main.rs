@@ -153,6 +153,17 @@ fn process_all(paths: &[String], dump: bool, check: bool, accept_breaking: bool,
 				}
 			};
 			rust_outputs.push(Output { path, contents });
+			let mut compat_path = Path::new(dir).join("generated");
+			for component in package.id.file_components() {
+				compat_path.push(component);
+			}
+			compat_path.push(format!("v{}", package.id.version));
+			compat_path.push("compat.rs");
+			if !destinations.insert(compat_path.clone()) {
+				eprintln!("{}: error: generated destination collision at {}", source.path, compat_path.display());
+				return false;
+			}
+			rust_outputs.push(Output { path: compat_path, contents: codegen::compat_rust(&source.file, &package.imports) });
 		}
 		if let Some(dir) = docs_dir {
 			let mut path = Path::new(dir).to_path_buf();

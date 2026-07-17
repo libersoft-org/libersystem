@@ -492,7 +492,4 @@ pub mod audio_admin {
 }
 
 #[cfg(test)]
-mod compat {
-	use super::*;
-	use alloc::string::String;
-}
+mod compat;

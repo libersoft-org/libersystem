@@ -44,8 +44,22 @@ pub fn rust(file: &File, source: &str, imports: &HashMap<String, ResolvedSymbol>
 	for item in &file.items {
 		cg.render_item(item)?;
 	}
-	cg.compat_tests(file);
+	cg.line("#[cfg(test)]");
+	cg.line("mod compat;");
+	cg.line("");
 	Ok(cg.out)
+}
+
+pub fn compat_rust(file: &File, imports: &HashMap<String, ResolvedSymbol>) -> String {
+	let mut aliases: HashMap<String, Type> = file.items.iter().filter_map(|item| if let Item::Alias(alias) = item { Some((alias.name.clone(), alias.ty.clone())) } else { None }).collect();
+	for (local, symbol) in imports {
+		if let Some(wire_type) = &symbol.wire_type {
+			aliases.insert(local.clone(), wire_type.clone());
+		}
+	}
+	let mut cg = Cg { out: String::new(), tmp: 0, again_enums: std::collections::HashSet::new(), aliases };
+	cg.compat_tests(file);
+	cg.out
 }
 
 struct Cg {
@@ -1037,10 +1051,8 @@ impl Cg {
 	// so an accidental ABI change shows up as a byte diff in review.
 	fn compat_tests(&mut self, file: &File) {
 		let defs = Defs::build(file, &self.aliases);
-		self.line("#[cfg(test)]");
-		self.line("mod compat {");
-		self.line("\tuse super::*;");
-		self.line("\tuse alloc::string::String;");
+		self.line("use super::*;");
+		self.line("use alloc::string::String;");
 		self.line("");
 		for item in &file.items {
 			let name = match item {
@@ -1054,18 +1066,16 @@ impl Cg {
 			if let Some((expr, bytes)) = sample(&Type::Named(name.clone()), &defs) {
 				let ty = camel(name);
 				let golden = bytes.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", ");
-				self.line("\t#[test]");
-				self.line(&format!("\tfn {}_wire_is_stable() {{", field_ident(name)));
-				self.line(&format!("\t\tlet sample = {expr};"));
-				self.line("\t\tlet bytes = sample.encode_vec().expect(\"encode\");");
-				self.line(&format!("\t\tlet golden: &[u8] = &[{golden}];"));
-				self.line("\t\tassert_eq!(bytes, golden);");
-				self.line(&format!("\t\tassert_eq!({ty}::decode(&bytes).unwrap(), sample);"));
-				self.line("\t}");
+				self.line("#[test]");
+				self.line(&format!("fn {}_wire_is_stable() {{", field_ident(name)));
+				self.line(&format!("\tlet sample = {expr};"));
+				self.line("\tlet bytes = sample.encode_vec().expect(\"encode\");");
+				self.line(&format!("\tlet golden: &[u8] = &[{golden}];"));
+				self.line("\tassert_eq!(bytes, golden);");
+				self.line(&format!("\tassert_eq!({ty}::decode(&bytes).unwrap(), sample);"));
+				self.line("}");
 			}
 		}
-		self.line("}");
-		self.line("");
 	}
 }
 
