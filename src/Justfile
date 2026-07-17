@@ -50,6 +50,7 @@ png_conformance_dir := "tools/png-conformance"
 ppm_conformance_dir := "tools/ppm-conformance"
 qoi_conformance_dir := "tools/qoi-conformance"
 tga_conformance_dir := "tools/tga-conformance"
+webp_conformance_dir := "tools/webp-conformance"
 proto_dir := "proto"
 wasm_dir := "wasm"
 sdk_dir := "sdk"
@@ -367,6 +368,10 @@ qoi-conformance:
 tga-conformance:
 	cargo run --release --manifest-path {{tga_conformance_dir}}/Cargo.toml
 
+# Validate VP8, VP8L, ALPH and animated WebP with libwebp and ImageMagick.
+webp-conformance:
+	cargo run --release --manifest-path {{webp_conformance_dir}}/Cargo.toml
+
 # format all code (Rust via rustfmt, shell via shfmt)
 fmt:
 	cd {{abi_dir}} && cargo fmt
@@ -418,6 +423,7 @@ fmt:
 	cd {{ppm_conformance_dir}} && cargo fmt
 	cd {{qoi_conformance_dir}} && cargo fmt
 	cd {{tga_conformance_dir}} && cargo fmt
+	cd {{webp_conformance_dir}} && cargo fmt
 	cd {{proto_dir}} && cargo fmt
 	cd {{wasm_dir}} && cargo fmt
 	cd {{sdk_dir}} && cargo fmt
@@ -482,6 +488,7 @@ fmt-check:
 	cd {{ppm_conformance_dir}} && cargo fmt --check
 	cd {{qoi_conformance_dir}} && cargo fmt --check
 	cd {{tga_conformance_dir}} && cargo fmt --check
+	cd {{webp_conformance_dir}} && cargo fmt --check
 	cd {{proto_dir}} && cargo fmt --check
 	cd {{wasm_dir}} && cargo fmt --check
 	cd {{sdk_dir}} && cargo fmt --check

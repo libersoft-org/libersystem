@@ -49,6 +49,7 @@ APT_PACKAGES=(
 	apngasm           # independent APNG fixture assembly
 	apngdis           # independent APNG frame extraction
 	gifsicle          # independent GIF structure/disposal validation
+	webp              # libwebp cwebp/dwebp/webpmux/webpinfo/anim_dump conformance tools
 	socat             # drive the QEMU monitor unix socket for screenshots
 	qemu-system-x86   # qemu-system-x86_64 (the native x86_64 build)
 	qemu-system-arm   # qemu-system-aarch64 (the ARM64 build, emulated on an x86 host)

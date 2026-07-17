@@ -262,9 +262,10 @@ when alpha is present. Lossless animation emits full-canvas VP8L `ANMF` frames;
 lossy animation is a typed **Subset**.
 
 The native VP8 encoder's boolean coding, prediction, transform, quantization and
-coefficient tokens are covered by independent decode and fidelity tests. VP8L
-encoding uses the local no_std dependency implementation and must remain covered by
-external decoding rather than only its paired decoder. Animation preserves the
+coefficient tokens are covered by independent decode and fidelity tests. The
+libwebp 1.5.0 corpus covers simple VP8, extended `VP8X+ALPH+VP8`, simple VP8L and
+`VP8X+ANIM+ANMF`; `dwebp` and ImageMagick agree exactly on every static RGBA
+buffer. Animation preserves the
 `ANIM` BGRA background as RGBA and raw 24-bit frame durations including zero. The
 shared compositor initializes and disposes frame rectangles to that background;
 preview and static-frame extraction use the same path. APNG destinations with no
@@ -273,9 +274,14 @@ background alpha, are canonicalized to displayed full-canvas frames so cross-for
 conversion preserves visuals and timing. Representable GIF backgrounds remain exact.
 The parser requires
 `VP8X` first, `ANIM` before `ANMF`, reconstruction chunks before trailing metadata,
-zero RIFF padding and zero reserved bits in `VP8X`/`ANMF`. Status: **Verified
-profile** for the implemented animation subset; independent external decoding remains
-required for the corpus gate.
+zero RIFF padding and zero reserved bits in `VP8X`/`ANMF`. libwebp `anim_dump`
+clears background-disposed rectangles to transparent black and ImageMagick keeps
+alpha-zero source RGB, while LiberSystem uses the declared ANIM background; raw
+ANMF frames and metadata agree and this viewer-policy divergence is documented.
+The reciprocal `just webp-conformance` gate validates our VP8 quality endpoints,
+VP8L, ALPH and canonical full-canvas animation through webpinfo, dwebp, anim_dump
+and ImageMagick. Status: **Verified profile** for the implemented static and
+animation subsets.
 
 ## Closure order
 

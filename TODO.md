@@ -3135,9 +3135,23 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
     RIFF padding and top-level reconstruction/metadata order. `imgconv` uses the same
     compositor for preview and frame extraction; APNG output and GIF output with
     partial background alpha canonicalize into visual full-canvas frames. APNG and GIF also
-    stop coercing legal zero delays. Focused suites pass: pix 8/8, WebP 11/11, APNG
-    4/4, GIF 3/3 and `imgconv` 15/15. GIF logical-screen background semantics were
+    stop coercing legal zero delays. Focused suites pass: pix 8/8, WebP 12/12, APNG
+    5/5, GIF 6/6 and `imgconv` 15/15. GIF logical-screen background semantics were
     audited separately against an independent interoperability fixture.
+  - Partial result (2026-07-17): WebP now has a libwebp 1.5.0 corpus covering
+    simple VP8, extended `VP8X+ALPH+VP8`, simple VP8L and animated
+    `VP8X+ANIM+ANMF`. dwebp and ImageMagick 7.1.1-43 produce byte-identical static
+    RGBA; leaf tests pin top-level chunks, whole-buffer FNV-1a, raw ANMF pixels,
+    background, loop, rectangles, zero/37 ms duration, blend/disposal and artifact
+    SHA-256 under `user/webp/tests/data`. libwebp anim_dump clears a
+    background-disposed rectangle to transparent black and ImageMagick retains
+    alpha-zero source RGB, while LiberSystem follows the declared ANIM background;
+    this external viewer-policy divergence is documented without weakening the
+    container semantics. The reciprocal host-only `just webp-conformance` gate
+    validates VP8 q0/q100 fidelity improvement, VP8L exactness, ALPH exact alpha and
+    full-canvas animation through webpinfo, dwebp, anim_dump and ImageMagick. WebP
+    is 12/12; lossy animation remains typed Unsupported while the rest of the matrix
+    stays open.
   - Partial result (2026-07-17): GIF now has an external ImageMagick/gifsicle 1.96
     corpus with three interlaced full/positioned frames, disposal 1/2/3, delay
     0/30/50 ms and loop 2. A structural derivative copies the global palette into a

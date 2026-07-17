@@ -35,7 +35,7 @@ cd src
 
 This will install:
 
-- system packages: `build-essential`, `git`, `curl`, `xorriso`, `gdisk`, `mtools`, `netpbm`, `imagemagick`, `icoutils`, `icnsutils`, `libicns-dev`, `python3-pil`, `pngcheck`, `apngasm`, `apngdis`, `gifsicle`, `socat`, `qemu-system-x86`, `qemu-system-arm`, `qemu-system-riscv`, `qemu-utils`, `ovmf`, `qemu-efi-aarch64`, `u-boot-qemu`, `gdb`, `lld`, `llvm`, `clang` (`icoutils`, `icnsutils`, `libicns-dev`, `python3-pil`, `pngcheck`, `apngasm`, `apngdis` and `gifsicle` are host-only image-conformance tools; `qemu-system-arm` + `qemu-efi-aarch64` are the ARM64 emulator and its UEFI firmware, `qemu-system-riscv` + `u-boot-qemu` the RISC-V emulator and its U-Boot UEFI firmware; omit the foreign-architecture packages if you only build for x86_64)
+- system packages: `build-essential`, `git`, `curl`, `xorriso`, `gdisk`, `mtools`, `netpbm`, `imagemagick`, `icoutils`, `icnsutils`, `libicns-dev`, `python3-pil`, `pngcheck`, `apngasm`, `apngdis`, `gifsicle`, `webp`, `socat`, `qemu-system-x86`, `qemu-system-arm`, `qemu-system-riscv`, `qemu-utils`, `ovmf`, `qemu-efi-aarch64`, `u-boot-qemu`, `gdb`, `lld`, `llvm`, `clang` (`icoutils`, `icnsutils`, `libicns-dev`, `python3-pil`, `pngcheck`, `apngasm`, `apngdis`, `gifsicle` and `webp` are host-only image-conformance tools; `qemu-system-arm` + `qemu-efi-aarch64` are the ARM64 emulator and its UEFI firmware, `qemu-system-riscv` + `u-boot-qemu` the RISC-V emulator and its U-Boot UEFI firmware; omit the foreign-architecture packages if you only build for x86_64)
 - `rustup` with the **nightly** toolchain plus the `rust-src` and `llvm-tools-preview` components (required for `build-std` and the kernel build)
 - `just`, the task runner
 

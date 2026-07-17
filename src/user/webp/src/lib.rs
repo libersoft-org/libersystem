@@ -373,6 +373,21 @@ mod tests {
 	use super::*;
 	use alloc::vec;
 
+	fn fnv1a(bytes: &[u8]) -> u64 {
+		bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3))
+	}
+
+	fn top_level_kinds(data: &[u8]) -> Vec<[u8; 4]> {
+		let mut kinds = Vec::new();
+		let mut cursor = 12usize;
+		while cursor < data.len() {
+			let length = u32::from_le_bytes(data[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+			kinds.push(data[cursor..cursor + 4].try_into().unwrap());
+			cursor += 8 + length + (length & 1);
+		}
+		kinds
+	}
+
 	fn insert_chunk(data: &mut Vec<u8>, offset: usize, kind: &[u8; 4], payload: &[u8]) {
 		let mut chunk = Vec::new();
 		append_chunk(&mut chunk, kind, payload).unwrap();
@@ -568,5 +583,27 @@ mod tests {
 		let anmf = reserved_anmf.windows(4).position(|window| window == b"ANMF").unwrap();
 		reserved_anmf[anmf + 8 + 15] |= 0x80;
 		assert_eq!(decode_animation(&reserved_anmf), Err(Error::Invalid));
+	}
+
+	#[test]
+	fn decodes_external_libwebp_static_and_animation_profiles() {
+		for (data, kinds, dimensions, hash) in [
+			(include_bytes!("../tests/data/external-vp8.webp").as_slice(), vec![*b"VP8 "], (23, 15), 0xf2da_7877_eabb_5d1e),
+			(include_bytes!("../tests/data/external-alph-vp8.webp").as_slice(), vec![*b"VP8X", *b"ALPH", *b"VP8 "], (19, 13), 0x3bb4_6987_825a_b3fc),
+			(include_bytes!("../tests/data/external-vp8l.webp").as_slice(), vec![*b"VP8L"], (19, 13), 0x35fa_330e_0391_3460),
+		] {
+			assert_eq!(top_level_kinds(data), kinds);
+			let image = decode(data).unwrap();
+			assert_eq!((image.width, image.height, fnv1a(&image.pixels)), (dimensions.0, dimensions.1, hash));
+		}
+
+		let data = include_bytes!("../tests/data/external-animation.webp");
+		assert_eq!(top_level_kinds(data), vec![*b"VP8X", *b"ANIM", *b"ANMF", *b"ANMF"]);
+		let animation = decode_animation(data).unwrap();
+		assert_eq!((animation.width, animation.height, animation.background, animation.loop_count, animation.frames.len()), (23, 15, [9, 19, 29, 200], 3, 2));
+		assert_eq!(animation.frames.iter().map(|frame| (frame.x, frame.y, frame.image.width, frame.image.height, frame.duration_ms, frame.blend, frame.disposal)).collect::<Vec<_>>(), vec![(0, 0, 23, 15, 0, pix::Blend::Source, pix::Disposal::Background), (2, 2, 19, 13, 37, pix::Blend::Over, pix::Disposal::Keep)]);
+		assert_eq!(animation.frames.iter().map(|frame| fnv1a(&frame.image.pixels)).collect::<Vec<_>>(), vec![0x8cb7_e5da_66d8_51a1, 0x35fa_330e_0391_3460]);
+		let mut compositor = pix::Compositor::new_with_background(animation.width, animation.height, animation.background).unwrap();
+		assert_eq!(animation.frames.iter().map(|frame| fnv1a(&compositor.render(frame).unwrap().pixels)).collect::<Vec<_>>(), vec![0x8cb7_e5da_66d8_51a1, 0xa9ed_68c4_c84d_1792]);
 	}
 }
