@@ -119,6 +119,7 @@ struct ManifestRow {
 	name: String,
 	crate_dir: String,
 	stage: String,
+	features: Option<String>,
 	providers: Vec<String>,
 }
 
@@ -140,8 +141,9 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 		let name: String = fields.next().expect("manifest row missing name").to_string();
 		let crate_dir: String = fields.next().expect("manifest row missing crate").to_string();
 		let stage: String = fields.next().expect("manifest row missing stage").to_string();
+		let features = (kind == "library").then(|| fields.next().expect("library manifest row missing feature set").to_string());
 		let providers: Vec<String> = fields.map(String::from).collect();
-		rows.push(ManifestRow { kind, name, crate_dir, stage, providers });
+		rows.push(ManifestRow { kind, name, crate_dir, stage, features, providers });
 	}
 	rows
 }
@@ -150,7 +152,7 @@ fn valid_library_name(name: &str) -> bool {
 	!name.is_empty() && !name.starts_with("lib") && name.len() <= 58 && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-fn audit_dynamic_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String]) {
+fn audit_linked_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String], require_lsrt: bool) {
 	const PT_INTERP: u32 = 3;
 	const DT_RPATH: i64 = 15;
 	const DT_TEXTREL: i64 = 22;
@@ -166,26 +168,28 @@ fn audit_dynamic_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String])
 		})
 		.collect();
 	expected.sort();
-	assert!(!expected.is_empty(), "dynamic {} has no providers", row.name);
-	assert!(!expected.windows(2).any(|pair| pair[0] == pair[1]), "dynamic {} repeats a provider", row.name);
-	assert!(expected.binary_search(&String::from("lsrt.lslib")).is_ok(), "dynamic {} does not directly need lsrt.lslib", row.name);
+	assert!(!expected.windows(2).any(|pair| pair[0] == pair[1]), "{} {} repeats a provider", row.kind, row.name);
+	if require_lsrt {
+		assert!(!expected.is_empty(), "{} {} has no providers", row.kind, row.name);
+		assert!(expected.binary_search(&String::from("lsrt.lslib")).is_ok(), "{} {} does not directly need lsrt.lslib", row.kind, row.name);
+	}
 
-	let image = bootproto::elf::Elf::parse_for_machine(bytes, user_elf_machine()).unwrap_or_else(|| panic!("dynamic {} is not a valid target ELF", row.name));
-	assert_eq!(image.image_type, bootproto::elf::ET_DYN, "dynamic {} is not ET_DYN", row.name);
-	let dynamic = image.dynamic_info().flatten().unwrap_or_else(|| panic!("dynamic {} has no valid terminated PT_DYNAMIC", row.name));
-	for entry in image.dynamic_entries().flatten().unwrap_or_else(|| panic!("dynamic {} has no PT_DYNAMIC", row.name)) {
-		assert!(!matches!(entry.tag, DT_RPATH | DT_RUNPATH | DT_TEXTREL), "dynamic {} has forbidden dynamic tag {}", row.name, entry.tag);
+	let image = bootproto::elf::Elf::parse_for_machine(bytes, user_elf_machine()).unwrap_or_else(|| panic!("{} {} is not a valid target ELF", row.kind, row.name));
+	assert_eq!(image.image_type, bootproto::elf::ET_DYN, "{} {} is not ET_DYN", row.kind, row.name);
+	let dynamic = image.dynamic_info().flatten().unwrap_or_else(|| panic!("{} {} has no valid terminated PT_DYNAMIC", row.kind, row.name));
+	for entry in image.dynamic_entries().flatten().unwrap_or_else(|| panic!("{} {} has no PT_DYNAMIC", row.kind, row.name)) {
+		assert!(!matches!(entry.tag, DT_RPATH | DT_RUNPATH | DT_TEXTREL), "{} {} has forbidden dynamic tag {}", row.kind, row.name, entry.tag);
 	}
 	for index in 0..image.segment_count() {
-		let segment = image.segment(index).unwrap_or_else(|| panic!("dynamic {} has a malformed program-header table", row.name));
-		assert_ne!(segment.p_type, PT_INTERP, "dynamic {} has PT_INTERP", row.name);
-		assert!(segment.p_flags & (bootproto::elf::PF_W | bootproto::elf::PF_X) != (bootproto::elf::PF_W | bootproto::elf::PF_X), "dynamic {} has a W+X segment", row.name);
+		let segment = image.segment(index).unwrap_or_else(|| panic!("{} {} has a malformed program-header table", row.kind, row.name));
+		assert_ne!(segment.p_type, PT_INTERP, "{} {} has PT_INTERP", row.kind, row.name);
+		assert!(segment.p_flags & (bootproto::elf::PF_W | bootproto::elf::PF_X) != (bootproto::elf::PF_W | bootproto::elf::PF_X), "{} {} has a W+X segment", row.kind, row.name);
 	}
 
-	let mut actual: Vec<String> = image.needed_names(&dynamic).unwrap_or_else(|| panic!("dynamic {} has malformed DT_NEEDED names", row.name)).map(String::from).collect();
+	let mut actual: Vec<String> = image.needed_names(&dynamic).unwrap_or_else(|| panic!("{} {} has malformed DT_NEEDED names", row.kind, row.name)).map(String::from).collect();
 	actual.sort();
-	assert!(!actual.windows(2).any(|pair| pair[0] == pair[1]), "dynamic {} repeats a DT_NEEDED provider", row.name);
-	assert_eq!(actual, expected, "dynamic {} DT_NEEDED providers differ from the manifest", row.name);
+	assert!(!actual.windows(2).any(|pair| pair[0] == pair[1]), "{} {} repeats a DT_NEEDED provider", row.kind, row.name);
+	assert_eq!(actual, expected, "{} {} DT_NEEDED providers differ from the manifest", row.kind, row.name);
 }
 
 fn audit_dynamic_order(row: &ManifestRow, bytes: &[u8], libraries: &[String]) {
@@ -382,6 +386,10 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	// only the program image), keeping the seed archive to a few megabytes. A missing or
 	// unstrippable ELF is skipped.
 	for row in rows {
+		if row.kind == "library" {
+			let features = row.features.as_deref().expect("library feature set");
+			assert!(features == "-" || features.split(',').all(valid_library_name), "library {} has invalid feature set {features:?}", row.name);
+		}
 		let dest: String = match row.kind.as_str() {
 			"tool" => format!("bin/{}", executable_artifact_name(&row.name)),
 			"service" | "component" if row.stage == "volume" => format!("bin/{}", executable_artifact_name(&row.name)),
@@ -402,12 +410,14 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		match read_stripped(&path).or_else(|| fs::read(&path).ok()) {
 			Some(bytes) => {
 				if row.kind == "dynamic" {
-					audit_dynamic_artifact(&row, &bytes, &libraries);
+					audit_linked_artifact(&row, &bytes, &libraries, true);
 					let order_path = user_dynamic_order_path(&manifest, &row.crate_dir, &row.name);
 					println!("cargo:rerun-if-changed={}", order_path.display());
 					let order = fs::read(&order_path).unwrap_or_else(|error| panic!("cannot read canonical order for dynamic {} at {}: {error}", row.name, order_path.display()));
 					audit_dynamic_order(&row, &order, &libraries);
 					files.push((format!("order/{}", row.name), order));
+				} else if row.kind == "library" {
+					audit_linked_artifact(&row, &bytes, &libraries, row.name != "lsrt");
 				}
 				files.push((dest, bytes));
 			}

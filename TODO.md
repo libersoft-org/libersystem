@@ -3669,6 +3669,22 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     to have exactly one declared provider, and requires `DT_NEEDED` to equal the manifest
     edge set. `dyn_probe` also records its existing direct edges. Library feature/output
     schema, generated rows and cross-target identity records remain open.
+  - Library-schema result (2026-07-18): all 32 `library` rows now record an explicit
+    Cargo feature set and direct provider edges. The image builder requires exact
+    manifest/invocation identity, validates feature/provider syntax, duplicates,
+    self-edges and topological availability, and compares every resulting library's
+    `DT_NEEDED` set with its row. Undefined symbols resolve to exactly one owner in the
+    declared transitive closure; every direct edge must contribute a uniquely reachable
+    imported owner. The same unused-direct-provider gate covers all 48 tool consumers,
+    and the volume packager independently audits the final stripped `.lslib` files.
+    Measurement removed type-only runtime edges `ipc-client -> wire`, `quantize -> pix`,
+    `keys -> proto` and `surface -> pix`, while the closure audit exposed and fixed the
+    previously ambient `surface -> ipc-client` dependency. All checks pass on x86_64,
+    AArch64 and RISC-V. The builder keeps its 64 MiB rustc worker-stack default but now
+    honors a caller override; the final x86 userspace/QEMU pass used rustc's recommended
+    128 MiB after one transient build-std SIGSEGV. This setting does not enter target
+    artifacts. Explicit output/start profiles, generated LSIDL rows and graph identity
+    records remain open.
   - Runtime hardening result (2026-07-17): the first blocking ordinary PIEs exposed two
     latent ABI defects that static codegen had masked. The x86 syscall entry now preserves
     `rdi/rsi/rdx/r10` across `syscall_dispatch`, matching the documented userspace inline-

@@ -5,7 +5,7 @@
 # lists from every row. Adding a normal service is one row here plus the service's own
 # code - the runtime table and the staging lists can no longer drift apart.
 #
-# columns: kind  name  crate  stage  [policy/providers...]
+# columns: kind  name  crate  stage  [policy/features/providers...]
 #   kind : launcher | service | instance | probe | driver | tool | dynamic | component
 #          - service : a managed service with its own ELF (ServiceManager supervises it)
 #          - instance: a managed service backed by another program's ELF (no own binary)
@@ -19,7 +19,8 @@
 #          transparent (restart per the ladder; clients re-resolve through the broker)
 #          or escalate (record Failed; today's default until a service migrates)
 #   deps : the services that must be Running first (service and instance rows only)
-#   providers: direct prefix-free library names for dynamic rows
+#   features: `-` for defaults or a comma-separated Cargo feature set for library rows
+#   providers: direct prefix-free library names for library and dynamic rows
 
 # managed services - ServiceManager brings these up in dependency order. The row order
 # is deliberately NOT the start order (DeviceManager and the shell are listed before
@@ -78,40 +79,40 @@ driver    xhci                  drivers   volume
 # system-image shared libraries - built as PIC rlibs and linked to ET_DYN by
 # tools/build-shared.sh, then staged under lib/. The echo PIE is the first ordinary
 # executable consumer; the remaining static programs migrate behind its standing gate.
-# Prefix-free crate directories own
-# their generated shared/<target>/ output; image staging appends `.lslib` to the name.
-library   lsrt                  rt        volume
-library   wire                  wire      volume
-library   ipc-client            ipc-client volume
-library   proto                 proto     volume
-library   pix                   pix    volume
-library   inflate               inflate volume
-library   deflate               deflate volume
-library   quantize              quantize volume
-library   bmp                   bmp    volume
-library   png                   png    volume
-library   apng                  apng   volume
-library   gif                   gif    volume
-library   ico                   ico    volume
-library   icns                  icns   volume
-library   jpeg                  jpeg   volume
-library   pcx                   pcx    volume
-library   ppm                   ppm    volume
-library   qoi                   qoi    volume
-library   tga                   tga    volume
-library   webp                  webp   volume
-library   keys                  keys   volume
-library   pcm                   pcm    volume
-library   surface               surface volume
-library   imgconv               imgconv volume
-library   adpcm                 adpcm  volume
-library   aiff                  aiff   volume
-library   flac                  flac   volume
-library   mp3                   mp3    volume
-library   ogg                   ogg    volume
-library   vorbis                vorbis volume
-library   wav                   wav    volume
-library   wavpack               wavpack volume
+# Prefix-free crate directories own their generated shared/<target>/ output; image
+# staging appends `.lslib` to the name. Library rows record build features before edges.
+library   lsrt                  rt         volume shared-image
+library   wire                  wire       volume -            lsrt
+library   ipc-client            ipc-client volume shared-image lsrt
+library   proto                 proto      volume -            wire lsrt
+library   pix                   pix        volume -            lsrt
+library   inflate               inflate    volume -            lsrt
+library   deflate               deflate    volume -            lsrt
+library   quantize              quantize   volume -            lsrt
+library   bmp                   bmp        volume -            quantize pix lsrt
+library   png                   png        volume -            quantize pix inflate deflate lsrt
+library   apng                  apng       volume -            png pix lsrt
+library   gif                   gif        volume -            quantize pix lsrt
+library   ico                   ico        volume -            png pix lsrt
+library   icns                  icns       volume -            png pix lsrt
+library   jpeg                  jpeg       volume -            pix lsrt
+library   pcx                   pcx        volume -            quantize pix lsrt
+library   ppm                   ppm        volume -            pix lsrt
+library   qoi                   qoi        volume -            pix lsrt
+library   tga                   tga        volume -            pix lsrt
+library   webp                  webp       volume -            pix lsrt
+library   keys                  keys       volume -            lsrt
+library   pcm                   pcm        volume -            lsrt
+library   surface               surface    volume -            proto ipc-client lsrt
+library   imgconv               imgconv    volume -            apng bmp gif icns ico jpeg pcx png ppm qoi tga webp pix lsrt
+library   adpcm                 adpcm      volume -            lsrt
+library   aiff                  aiff       volume -            pcm lsrt
+library   flac                  flac       volume -            pcm lsrt
+library   mp3                   mp3        volume -            pcm lsrt
+library   ogg                   ogg        volume -            lsrt
+library   vorbis                vorbis     volume -            ogg pcm lsrt
+library   wav                   wav        volume -            adpcm pcm lsrt
+library   wavpack               wavpack    volume -            pcm lsrt
 dynamic   dyn_probe             dyn_probe volume pix proto lsrt
 
 # command-line tools - loaded from the system volume under bin/.

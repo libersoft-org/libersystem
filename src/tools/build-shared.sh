@@ -9,6 +9,7 @@ fi
 target="$1"
 shift
 root="$(cd "$(dirname "$0")/.." && pwd)"
+rust_min_stack="${RUST_MIN_STACK:-67108864}"
 cargo_target="$target"
 cargo_target_flags=()
 
@@ -52,6 +53,18 @@ library_file() {
 	esac
 }
 
+manifest_library_row() {
+	awk -v artifact="$1" '$1 == "library" && $2 == artifact {print; count++} END {if (count != 1) exit 1}' "$root/user/services/manifest.txt"
+}
+
+manifest_specs="$(awk '$1 == "library" {print $2 "=" $3}' "$root/user/services/manifest.txt" | sort)"
+requested_specs="$(for spec in "$@"; do if [[ "$spec" == *=* ]]; then printf '%s\n' "$spec"; else printf '%s=%s\n' "$spec" "$spec"; fi; done | sort)"
+if [[ "$requested_specs" != "$manifest_specs" ]]; then
+	echo "build-shared: requested libraries differ from the manifest" >&2
+	diff -u <(printf '%s\n' "$manifest_specs") <(printf '%s\n' "$requested_specs") >&2 || true
+	exit 1
+fi
+
 image_graph=""
 if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 	image_target="$root/boot/.build/image-cargo-$target"
@@ -63,7 +76,7 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 	set +e
 	(
 		cd "$root/user/tools"
-		CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK=67108864 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --release --target "$cargo_target" --bin date --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$image_seed"
+		CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --release --target "$cargo_target" --bin date --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$image_seed"
 	) >"$image_graph" 2>"$image_graph_errors"
 	graph_status=$?
 	set -e
@@ -158,6 +171,15 @@ for spec in "$@"; do
 		echo "build-shared: invalid LiberSystem library name '$artifact'" >&2
 		exit 2
 	fi
+	row="$(manifest_library_row "$artifact")" || {
+		echo "build-shared: $artifact has no unique library manifest row" >&2
+		exit 1
+	}
+	read -r row_kind row_artifact row_crate row_stage row_features row_providers <<<"$row"
+	if [[ "$row_kind" != library || "$row_artifact" != "$artifact" || "$row_crate" != "$crate" || "$row_stage" != volume || -z "$row_features" ]]; then
+		echo "build-shared: $artifact invocation differs from its library manifest row" >&2
+		exit 1
+	fi
 	case "$crate" in
 	proto | wire) crate_dir="$crate" ;;
 	*) crate_dir="user/$crate" ;;
@@ -170,16 +192,22 @@ for spec in "$@"; do
 	out_dir="$crate_dir/shared/$target"
 	mkdir -p "$out_dir"
 	features=()
-	if [[ "$artifact" == "lsrt" ]]; then
-		features=(--no-default-features --features shared-image)
-	elif [[ "$artifact" == "ipc-client" ]]; then
-		features=(--no-default-features --features shared-image)
+	if [[ "$row_features" != - ]]; then
+		if [[ ! "$row_features" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
+			echo "build-shared: $artifact has invalid feature set '$row_features'" >&2
+			exit 1
+		fi
+		if [[ "$(tr ',' '\n' <<<"$row_features" | sort | uniq -d | head -n1)" != "" ]]; then
+			echo "build-shared: $artifact repeats a build feature" >&2
+			exit 1
+		fi
+		features=(--no-default-features --features "$row_features")
 	fi
 	if [[ -n "$image_graph" ]]; then
 		deps="$image_target/$target/release/deps"
 		rlib="$(graph_archive "$crate_dir")"
 	else
-		(cd "$crate_dir" && RUST_MIN_STACK=67108864 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$cargo_target" --lib "${features[@]}")
+		(cd "$crate_dir" && RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$cargo_target" --lib "${features[@]}")
 		deps="$crate_dir/target/$target/release/deps"
 		rlib="$(find "$deps" -maxdepth 1 -name "lib${crate_rust}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 	fi
@@ -221,15 +249,6 @@ for spec in "$@"; do
 		link_inputs=(--whole-archive "${archives[@]}" --no-whole-archive)
 	fi
 	case "$artifact" in
-	wire | pix | inflate | pcm | adpcm | ogg)
-		link_deps=("$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	proto)
-		link_deps=("$(library_file wire)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	ipc-client)
-		link_deps=("$(library_file wire)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
 	deflate)
 		miniz_archive="$(find "$deps" -maxdepth 1 -name 'libminiz_oxide-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 		adler_archive="$(find "$deps" -maxdepth 1 -name 'libadler2-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
@@ -238,16 +257,6 @@ for spec in "$@"; do
 			exit 1
 		fi
 		link_inputs=(--whole-archive "$rlib" "$miniz_archive" "$adler_archive" --no-whole-archive)
-		link_deps=("$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	bmp)
-		link_deps=("$(library_file quantize)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	ppm | tga)
-		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	pcx)
-		link_deps=("$(library_file quantize)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	qoi)
 		qoi_codec_archive="$(find "$deps" -maxdepth 1 -name 'libqoi-*.rlib' ! -samefile "$rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
@@ -257,16 +266,6 @@ for spec in "$@"; do
 			exit 1
 		fi
 		link_inputs=(--whole-archive "$rlib" "$qoi_codec_archive" "$bytemuck_archive" --no-whole-archive)
-		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	png)
-		link_deps=("$(library_file quantize)" "$(library_file pix)" "$(library_file inflate)" "$(library_file deflate)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	apng)
-		link_deps=("$(library_file png)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	quantize)
-		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	gif)
 		weezl_archive="$(find "$deps" -maxdepth 1 -name 'libweezl-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
@@ -275,13 +274,6 @@ for spec in "$@"; do
 			exit 1
 		fi
 		link_inputs=(--whole-archive "$rlib" "$weezl_archive" --no-whole-archive)
-		link_deps=("$(library_file quantize)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	ico)
-		link_deps=("$(library_file png)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	icns)
-		link_deps=("$(library_file png)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	jpeg)
 		jpeg_encoder_archive="$(find "$deps" -maxdepth 1 -name 'libjpeg_encoder-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
@@ -292,7 +284,6 @@ for spec in "$@"; do
 			exit 1
 		fi
 		link_inputs=(--whole-archive "$rlib" "$jpeg_encoder_archive" "$zune_core_archive" "$zune_jpeg_archive" --no-whole-archive)
-		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	webp)
 		webp_archives=()
@@ -305,19 +296,6 @@ for spec in "$@"; do
 			webp_archives+=("$archive")
 		done
 		link_inputs=(--whole-archive "$rlib" "${webp_archives[@]}" --no-whole-archive)
-		link_deps=("$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	keys)
-		link_deps=("$(library_file proto)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	surface)
-		link_deps=("$(library_file proto)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	imgconv)
-		link_deps=("$(library_file apng)" "$(library_file bmp)" "$(library_file gif)" "$(library_file icns)" "$(library_file ico)" "$(library_file jpeg)" "$(library_file pcx)" "$(library_file png)" "$(library_file ppm)" "$(library_file qoi)" "$(library_file tga)" "$(library_file webp)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	aiff | flac | wavpack)
-		link_deps=("$(library_file pcm)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	mp3)
 		nanomp3_archive="$(find "$deps" -maxdepth 1 -name 'libnanomp3-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
@@ -326,7 +304,6 @@ for spec in "$@"; do
 			exit 1
 		fi
 		link_inputs=(--whole-archive "$rlib" "$nanomp3_archive" --no-whole-archive)
-		link_deps=("$(library_file pcm)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	vorbis)
 		libm_archive="$(find "$deps" -maxdepth 1 -name 'liblibm-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
@@ -335,27 +312,84 @@ for spec in "$@"; do
 			exit 1
 		fi
 		link_inputs=(--whole-archive "$rlib" "$libm_archive" --no-whole-archive)
-		link_deps=("$(library_file ogg)" "$(library_file pcm)" "$(library_file lsrt)" --no-allow-shlib-undefined)
-		;;
-	wav)
-		link_deps=("$(library_file adpcm)" "$(library_file pcm)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
 	esac
-	"$lld" -flavor gnu -m "$emulation" -shared --hash-style=sysv "${symbolic_flags[@]}" --gc-sections "${export_flags[@]}" "${link_inputs[@]}" "${link_deps[@]}" -soname "$artifact.lslib" -o "$out"
-	llvm-strip --strip-debug "$out"
-	case "$artifact" in
-	wire | ipc-client | proto)
-		actual_needed="$(llvm-readelf -d "$out" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sort)"
-		case "$artifact" in
-		wire) expected_needed="lsrt.lslib" ;;
-		ipc-client | proto) expected_needed="$(printf '%s\n' lsrt.lslib wire.lslib | sort)" ;;
-		esac
-		if [[ "$actual_needed" != "$expected_needed" ]]; then
-			echo "build-shared: $out has unexpected providers: $actual_needed" >&2
+	expected_needed=""
+	provider_count=0
+	for provider in $row_providers; do
+		if [[ "$provider" == "$artifact" || ! "$provider" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ || "$provider" == lib* ]] || ! printf '%s\n' "${artifacts[@]}" | grep -qx "$provider"; then
+			echo "build-shared: library $artifact names invalid or unavailable provider $provider" >&2
 			exit 1
 		fi
-		;;
-	esac
+		if grep -qx "$provider.lslib" <<<"$expected_needed"; then
+			echo "build-shared: library $artifact repeats provider $provider" >&2
+			exit 1
+		fi
+		link_deps+=("$(library_file "$provider")")
+		expected_needed+="$provider.lslib"$'\n'
+		provider_count=$((provider_count + 1))
+	done
+	if [[ "$artifact" != lsrt && "$provider_count" == 0 ]]; then
+		echo "build-shared: library $artifact has no direct providers" >&2
+		exit 1
+	fi
+	link_deps+=(--no-allow-shlib-undefined)
+	"$lld" -flavor gnu -m "$emulation" -shared --hash-style=sysv "${symbolic_flags[@]}" --gc-sections "${export_flags[@]}" "${link_inputs[@]}" "${link_deps[@]}" -soname "$artifact.lslib" -o "$out"
+	llvm-strip --strip-debug "$out"
+	actual_needed="$(llvm-readelf -d "$out" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sort -u)"
+	expected_needed="$(sort -u <<<"$expected_needed" | sed '/^$/d')"
+	if [[ "$actual_needed" != "$expected_needed" ]]; then
+		echo "build-shared: $out providers differ from its manifest: $actual_needed" >&2
+		exit 1
+	fi
+	imports="$(llvm-readelf --wide --dyn-syms "$out" | awk '$7 == "UND" && $8 != "" {print $8}' | sort -u)"
+	declare -A used_providers=()
+	declare -A provider_closures=()
+	closure_providers=""
+	for provider in $row_providers; do
+		provider_closures[$provider]="$(canonical_provider_order "$provider" | sed 's/\.lslib$//')"
+		closure_providers+="${provider_closures[$provider]}"$'\n'
+	done
+	closure_providers="$(sort -u <<<"$closure_providers" | sed '/^$/d')"
+	for symbol in $imports; do
+		owner=""
+		for provider in $closure_providers; do
+			if llvm-readelf --wide --dyn-syms "$(library_file "$provider")" | awk -v symbol="$symbol" '$7 != "UND" && $8 == symbol {found=1} END {exit !found}'; then
+				if [[ -n "$owner" ]]; then
+					echo "build-shared: library $artifact import $symbol has duplicate providers $owner and $provider" >&2
+					exit 1
+				fi
+				owner="$provider"
+			fi
+		done
+		if [[ -z "$owner" ]]; then
+			echo "build-shared: library $artifact import $symbol has no direct provider" >&2
+			exit 1
+		fi
+		if grep -qw "$owner" <<<"$row_providers"; then
+			used_providers[$owner]=1
+		else
+			owner_root=""
+			for provider in $row_providers; do
+				if grep -qx "$owner" <<<"${provider_closures[$provider]}"; then
+					if [[ -n "$owner_root" ]]; then
+						owner_root="ambiguous"
+						break
+					fi
+					owner_root="$provider"
+				fi
+			done
+			if [[ -n "$owner_root" && "$owner_root" != ambiguous ]]; then
+				used_providers[$owner_root]=1
+			fi
+		fi
+	done
+	for provider in $row_providers; do
+		if [[ -z "${used_providers[$provider]:-}" ]]; then
+			echo "build-shared: library $artifact provider $provider satisfies no direct import" >&2
+			exit 1
+		fi
+	done
 	if [[ "$artifact" == "ipc-client" ]]; then
 		actual_imports="$(llvm-readelf --wide --dyn-syms "$out" | awk '$7 == "UND" && $8 != "" {print $8}' | sort -u)"
 		expected_imports="$(printf '%s\n' recv_vec_blocking resolve | sort)"
@@ -438,7 +472,7 @@ if [[ -n "$image_graph" ]]; then
 		set +e
 		(
 			cd "$consumer_dir"
-			CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK=67108864 RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --quiet --release --target "$cargo_target" --bin "$consumer" --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$consumer_obj"
+			CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --quiet --release --target "$cargo_target" --bin "$consumer" --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$consumer_obj"
 		) >/dev/null 2>"$consumer_errors"
 		consumer_status=$?
 		set -e
@@ -467,14 +501,27 @@ if [[ -n "$image_graph" ]]; then
 		done
 		expected_needed="$(sort -u <<<"$expected_needed" | sed '/^$/d')"
 		consumer_imports="$(llvm-readelf --wide --symbols "$consumer_obj" | awk '$5 == "GLOBAL" && $7 == "UND" && $8 != "" {print $8}' | sort -u)"
+		declare -A used_consumer_providers=()
 		for symbol in $consumer_imports; do
 			count=0
-			for provider_file in "${provider_inputs[@]}"; do
+			owner=""
+			for provider in $providers; do
+				provider_file="$(library_file "$provider")"
 				matches="$(llvm-readelf --wide --dyn-syms "$provider_file" | awk -v symbol="$symbol" '$7 != "UND" && $8 == symbol { count++ } END { print count + 0 }')"
 				count=$((count + matches))
+				if [[ "$matches" == 1 ]]; then
+					owner="$provider"
+				fi
 			done
 			if [[ "$count" != 1 ]]; then
 				echo "build-shared: $consumer import $symbol has $count declared providers (expected 1)" >&2
+				exit 1
+			fi
+			used_consumer_providers[$owner]=1
+		done
+		for provider in $providers; do
+			if [[ -z "${used_consumer_providers[$provider]:-}" ]]; then
+				echo "build-shared: dynamic $consumer provider $provider satisfies no direct import" >&2
 				exit 1
 			fi
 		done
@@ -509,7 +556,7 @@ fi
 
 if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	probe="user/dyn_probe"
-	(cd "$probe" && RUST_MIN_STACK=67108864 RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
+	(cd "$probe" && RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
 	probe_rlib="$(find "$probe/target/$target/release/deps" -maxdepth 1 -name 'libdyn_probe-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 	probe_dir="$probe/shared/$target"
 	mkdir -p "$probe_dir"
