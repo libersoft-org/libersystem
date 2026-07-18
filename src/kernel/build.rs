@@ -219,7 +219,7 @@ fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 }
 
 fn user_shared_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
-	let root = if matches!(crate_dir, "proto" | "wire" | "wasm") { manifest.join(format!("../{crate_dir}")) } else { manifest.join(format!("../user/{crate_dir}")) };
+	let root = if matches!(crate_dir, "proto" | "wire" | "wasm" | "term") { manifest.join(format!("../{crate_dir}")) } else { manifest.join(format!("../user/{crate_dir}")) };
 	root.join(format!("shared/{}/{}.lslib", user_target(), name))
 }
 
@@ -453,8 +453,6 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			assert!(features == "-" || features.split(',').all(valid_library_name), "library {} has invalid feature set {features:?}", row.name);
 		}
 		let dest: String = match row.kind.as_str() {
-			"tool" => format!("bin/{}", executable_artifact_name(&row.name)),
-			"service" | "component" if row.stage == "volume" => format!("bin/{}", executable_artifact_name(&row.name)),
 			"driver" if row.stage == "volume" => format!("drivers/{}", executable_artifact_name(&row.name)),
 			"library" if row.stage == "volume" => format!("lib/{}.lslib", row.name),
 			"dynamic" | "dynamic-service" if row.stage == "volume" => format!("bin/{}", executable_artifact_name(&row.name)),
@@ -469,7 +467,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		if row.kind == "dynamic" || row.kind == "dynamic-service" || row.kind == "library" {
 			let identity = audit_identity(&row, &path, &library_rows, &expected_rustc_commit);
 			let identity_kind = if row.kind == "library" { "lib" } else { "bin" };
-			files.push((format!("identity/{identity_kind}/{}", row.name), identity));
+			files.push((format!("id/{identity_kind}/{}", row.name), identity));
 		}
 		// Strip the ELF to its loadable image; fall back to the raw ELF when no
 		// `strip` supports the target (the host binutils cannot strip aarch64), so
@@ -492,6 +490,12 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		}
 	}
 	files.sort_by(|a, b| a.0.cmp(&b.0));
+	for (name, bytes) in &files {
+		if name.starts_with("bin/") && name.ends_with(abi::EXECUTABLE_SUFFIX) {
+			let image = bootproto::elf::Elf::parse_for_machine(bytes, user_elf_machine()).unwrap_or_else(|| panic!("staged /{name} is not a valid target ELF"));
+			assert_eq!(image.image_type, bootproto::elf::ET_DYN, "staged /{name} is static ET_EXEC");
+		}
+	}
 
 	let entries: Vec<(&str, Vec<u8>)> = files.iter().map(|(name, data): &(String, Vec<u8>)| (name.as_str(), data.clone())).collect();
 	let package: Vec<u8> = build_package(&entries);

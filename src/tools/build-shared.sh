@@ -58,6 +58,8 @@ library_file() {
 	proto) printf 'proto/shared/%s/proto.lslib' "$target" ;;
 	wire) printf 'wire/shared/%s/wire.lslib' "$target" ;;
 	wasm) printf 'wasm/shared/%s/wasm.lslib' "$target" ;;
+	term) printf 'term/shared/%s/term.lslib' "$target" ;;
+	service-util) printf 'user/services/shared/%s/service-util.lslib' "$target" ;;
 	*) printf 'user/%s/shared/%s/%s.lslib' "$1" "$target" "$1" ;;
 	esac
 }
@@ -287,7 +289,7 @@ for spec in "$@"; do
 		exit 1
 	fi
 	case "$crate" in
-	proto | wire | wasm) crate_dir="$crate" ;;
+	proto | wire | wasm | term) crate_dir="$crate" ;;
 	*) crate_dir="user/$crate" ;;
 	esac
 	manifest="$crate_dir/Cargo.toml"

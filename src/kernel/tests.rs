@@ -336,7 +336,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
 	loader::spawn_elf_process(domain.clone(), process_elf, process_boot_user, Rights::ALL, 0).map_err(|_| "failed to load ProcessService")?;
 	let _time = spawn_dynamic_test_process(domain.clone(), time_elf, time_boot_user);
-	loader::spawn_elf_process(domain, pm_elf, pm_boot_user, Rights::ALL, 0).map_err(|_| "failed to load PermissionManager")?;
+	let _permission_manager = spawn_dynamic_test_process(domain, pm_elf, pm_boot_user);
 
 	// StorageService: the ramdisk volume and its service channel.
 	send_ramdisk(&storage_boot_kernel, volume)?;
@@ -3791,7 +3791,7 @@ fn display_service_restores_the_console_surface() {
 	let (gpu_kernel, gpu_user) = Channel::create();
 	let (focus_input, focus_display) = Channel::create();
 	let (kill_input, kill_display) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn DisplayService");
+	let _display_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
 	send_cap(&boot_kernel, b"GPU", gpu_user, Rights::ALL).expect("gpu bootstrap");
 	send_cap(&boot_kernel, b"FOCUS", focus_display, Rights::ALL).expect("focus bootstrap");
 	send_cap(&boot_kernel, b"KILL", kill_display, Rights::ALL).expect("kill bootstrap");
@@ -4623,13 +4623,13 @@ fn system_packages_use_canonical_executable_names() {
 	let mut executable_identities = 0usize;
 	for index in 0..volume.len() {
 		let name = volume.name(index).expect("volume entry name");
-		library_identities += usize::from(name.starts_with(b"identity/lib/"));
-		executable_identities += usize::from(name.starts_with(b"identity/bin/"));
+		library_identities += usize::from(name.starts_with(b"id/lib/"));
+		executable_identities += usize::from(name.starts_with(b"id/bin/"));
 	}
-	assert_eq!(library_identities, 33, "every staged library has one identity record");
-	assert_eq!(executable_identities, 63, "every staged dynamic executable has one identity record");
-	assert!(volume.lookup(b"identity/lib/imgconv").is_some(), "library identity namespace preserves imgconv");
-	assert!(volume.lookup(b"identity/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");
+	assert_eq!(library_identities, 35, "every staged library has one identity record");
+	assert_eq!(executable_identities, 68, "every staged dynamic executable has one identity record");
+	assert!(volume.lookup(b"id/lib/imgconv").is_some(), "library identity namespace preserves imgconv");
+	assert!(volume.lookup(b"id/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");
 }
 
 tagged_test!(dynamic_process_service_loads_programs_from_system_bin, [Service, Process, Storage]);
@@ -5678,7 +5678,7 @@ fn pty_hosts_a_program() {
 	let (ctl_console, ctl_shell) = Channel::create();
 	let (dummy_a, _dummy_b) = Channel::create();
 
-	loader::spawn_elf_process(sched::root_domain(), console_elf, boot_user, Rights::ALL, 0).expect("spawn ConsoleService");
+	let _console_service = spawn_dynamic_test_process(sched::root_domain(), console_elf, boot_user);
 
 	// A StorageService over the factory volume (which stages ptyecho under bin/), so the
 	// ProcessService below can load the ptyecho slave from vol://system/bin/ptyecho.lsexe.

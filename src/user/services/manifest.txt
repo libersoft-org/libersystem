@@ -34,18 +34,18 @@ instance  iso_storage           -         none    escalate     log_service devic
 instance  udf_storage           -         none    escalate     log_service device_manager
 instance  usb_storage           -         none    escalate     log_service storage_service
 dynamic-service network_service services volume escalate      log_service device_manager process_service config_service -- proto ipc-client wire lsrt
-service   shell                 services  volume  escalate     storage_service media_storage iso_storage udf_storage usb_storage device_service process_service config_service network_service time_service console_service audio_service input_service permission_manager resource_manager system_graph_service session_service
+dynamic-service shell services volume escalate storage_service media_storage iso_storage udf_storage usb_storage device_service process_service config_service network_service time_service console_service audio_service input_service permission_manager resource_manager system_graph_service session_service -- service-util proto ipc-client wire lsrt
 service   log_service           services  pinned  escalate
 dynamic-service device_service services  volume  transparent  log_service process_service -- wire lsrt
 service   process_service       services  pinned  escalate     log_service storage_service
 dynamic-service config_service services  volume  transparent  log_service process_service -- proto ipc-client wire lsrt
 dynamic-service time_service services volume escalate         log_service network_service process_service -- proto ipc-client wire lsrt
-service   display_service       services  volume  escalate     log_service device_manager process_service input_service
-service   console_service       services  volume  escalate     log_service time_service audio_service input_service display_service session_service process_service permission_manager
+dynamic-service display_service services volume escalate      log_service device_manager process_service input_service -- pix proto wire lsrt
+dynamic-service console_service services volume escalate      log_service time_service audio_service input_service display_service session_service process_service permission_manager -- service-util term surface proto ipc-client wire lsrt
 dynamic-service audio_service services volume escalate        log_service device_manager process_service -- pcm wire lsrt
 dynamic-service input_service services volume escalate        log_service device_manager process_service -- keys proto wire lsrt
-service   system_graph_service  services  volume  escalate     log_service device_manager storage_service network_service device_service process_service config_service time_service console_service audio_service input_service permission_manager resource_manager
-service   permission_manager    services  volume  escalate     log_service storage_service media_storage iso_storage udf_storage usb_storage network_service time_service config_service device_service audio_service process_service resource_manager
+dynamic-service system_graph_service services volume escalate log_service device_manager storage_service network_service device_service process_service config_service time_service console_service audio_service input_service permission_manager resource_manager -- proto ipc-client wire lsrt
+dynamic-service permission_manager services volume escalate   log_service storage_service media_storage iso_storage udf_storage usb_storage network_service time_service config_service device_service audio_service process_service resource_manager -- service-util proto ipc-client wire lsrt
 dynamic-service resource_manager services volume escalate     log_service process_service -- proto wire lsrt
 dynamic-service session_service services volume escalate      log_service process_service -- wire lsrt
 
@@ -109,6 +109,8 @@ library   vorbis                vorbis     volume -            ogg pcm lsrt
 library   wav                   wav        volume -            adpcm pcm lsrt
 library   wavpack               wavpack    volume -            pcm lsrt
 library   wasm                  wasm       volume -            lsrt
+library   term                  term       volume -            lsrt
+library   service-util          services   volume -            lsrt
 dynamic   dyn_probe             dyn_probe volume pix proto lsrt
 dynamic   sandbox_probe         services  volume proto ipc-client wire lsrt
 dynamic   request_probe         services  volume proto ipc-client wire lsrt

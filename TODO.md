@@ -3481,7 +3481,9 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
 
 ## M126a - Dynamically linked system executables (no static `/bin` tools)
 
-Status: IN PROGRESS (2026-07-17); HARD PREREQUISITE FOR M127 AND EVERY NEW M130/M131
+Status: IN PROGRESS (2026-07-18); ALL `/bin` ARTIFACTS ARE DYNAMIC AND THE STATIC
+INJECTION GATE IS ACTIVE, WHILE DOMAIN-CLIENT/SIZE/PERFORMANCE HARDENING REMAINS.
+HARD PREREQUISITE FOR M127 AND EVERY NEW M130/M131
 EXECUTABLE. M123 delivered the loader, relocations, immutable-page sharing and atomized
 `.lslib` providers, but deliberately converted only `dyn_probe`: all 48 current tools
 are still static `ET_EXEC` files with no dynamic section or `DT_NEEDED`. That deferral is
@@ -3541,7 +3543,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     final-link failure is pinned to the duplicate allocator shims after an exact-path
     `ET_REL` seed exists; any other failure aborts construction. The complete provider
     graph and its consumers link on all three architectures.
-  - Identity result (2026-07-18): all 33 providers and 63 dynamic executables emit one
+  - Identity result (2026-07-18): all 35 providers and 68 dynamic executables emit one
     canonical `liber-image-identity-v1` record containing artifact/package identity, a
     sorted source-tree SHA-256, the image rustc commit, target, release profile, exact
     codegen flags, feature set and sorted direct-provider record digests. Each ELF embeds
@@ -3549,10 +3551,11 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     survives package `--strip-all`. The volume packager independently checks record
     structure, one image-wide toolchain identity rooted at `lsrt`, target/profile/flags,
     the complete provider digest chain and byte-exact note equality before staging records
-    under collision-free `identity/lib/` and `identity/bin/` paths. A complete x86 rebuild
+    under collision-free `id/lib/` and `id/bin/` paths (short enough for `PKGARCH1`'s
+    32-byte names even for `system_graph_service`). A complete x86 rebuild
     reproduced the aggregate hash of the original 81-record tool graph exactly; after the
-    second managed-service migration, x86_64, AArch64 and RISC-V each produce and package
-    96 records plus 96 notes. The process, boot/storage and broad service integration suites pass
+    final managed-service migration, x86_64, AArch64 and RISC-V each produce and package
+    103 records plus 103 notes. The process, boot/storage and broad service integration suites pass
     with the identity-bearing graph.
   - Component result (2026-07-18): all six volume components are now manifest-driven PIE:
     `sandbox_probe` (8,208/8,000/8,192 bytes), `request_probe` (6,152/6,168/6,536),
@@ -3585,6 +3588,17 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     preserves DHCP/network, wall-clock, PCM mixing/playback and pointer/key behavior. All
     three target graphs and package audits pass with 96 identities/notes, and one 60-test
     `service,process,storage,network,audio,input` x86 QEMU selection passes.
+  - Final volume-service result (M126a, 2026-07-18): every native `bin/*.lsexe` is now
+    manifest-driven PIE. `display_service` is 23,760/26,384/25,520 bytes;
+    `console_service` 66,336/71,344/79,840; `system_graph_service`
+    22,952/24,800/21,800; `permission_manager` 36,320/40,608/43,696; and `shell`
+    85,928/90,504/106,760 on x86_64/AArch64/RISC-V. Console's shared terminal model moved
+    behind atomized `term.lslib` (129,408/126,520/128,520), while the executable-name
+    normalizer shared by Console/Permission/Shell is the narrow `service-util.lslib`
+    (8,816/10,368/10,056), not a catch-all services provider. All original Escalate
+    policies and dependencies remain. Provider-aware tests preserve display restoration,
+    PTY/console, permission sandboxing, SystemGraph and full SystemManager-to-Shell boot;
+    one 60-test `boot,service,process,storage,display,console,shell` x86 selection passes.
 - [x] Add a tiny generated executable-start object per architecture, not a static runtime
   archive in every program. It exports `_start`, aligns/initializes the ABI-required
   registers, performs the native ABI revision check through `lsrt`, and calls the tool's
@@ -3736,7 +3750,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     the function consumers actually call, while the unmangled compiler sentinel remains
     an object. The image builder pins that symbol type and the ProcessService QEMU gate
     exercises a blocking dynamic echo before the alloc-using date/cat workflows.
-- [ ] Enforce a strict executable graph at image construction: every native `/bin`
+- [x] Enforce a strict executable graph at image construction: every native `/bin`
   artifact is `ET_DYN`, contains `PT_DYNAMIC` + terminated dynamic table, has at least
   `DT_NEEDED=lsrt.lslib`, carries no interpreter/RPATH/RUNPATH, and names only canonical
   prefix-free staged `.lslib` providers. Reject unresolved symbols, duplicate providers,
@@ -3749,16 +3763,19 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   `DT_NEEDED` edge must provide at least one symbol not already satisfied by an earlier
   direct provider; defined-symbol ownership plus graph-identity notes detect static
   provider copies. This is a build-time graph audit, not runtime guesswork.
-  - Partial result (2026-07-18): the final volume packager now re-parses the stripped
+  - Result (2026-07-18): the final volume packager re-parses the stripped
     bytes of every manifest-declared `dynamic` executable with the same bounded ELF
     reader as the runtime. It rejects a wrong target machine, non-`ET_DYN`, missing,
     duplicate or unterminated `PT_DYNAMIC`, W+X, `PT_INTERP`, RPATH/RUNPATH/TEXTREL,
     malformed or duplicate `DT_NEEDED`, missing direct `lsrt.lslib`, invalid/unstaged
     provider names and any difference between `DT_NEEDED` and the manifest edge set.
     The host build script selects the staged target machine explicitly, and x86_64,
-    AArch64 and RISC-V package checks pass. The absolute all-`/bin` `ET_DYN` gate and
-    transitive symbol/identity audit remain blocked on migrating volume services and
-    components.
+    AArch64 and RISC-V package checks pass. Legacy static tool/service/component staging
+    branches are removed, and a final package inventory pass rejects every `bin/*.lsexe`
+    whose parsed type is not `ET_DYN`, including an injected loose volume artifact. The
+    linker audits undefined-symbol ownership and unused direct edges over the declared
+    transitive closure; canonical identity notes/records bind all 35 providers and 68
+    executables. Static `/bin` injection therefore fails before `volume.pkg` is written.
 - [x] Canonicalize runtime provider loading. ProcessService assigns each
   `LIBRARY_SLOT_SIZE` bias in DFS/`DT_NEEDED` encounter order. Parse the complete bounded
   graph first, reject duplicate symbol providers, compute one provider-before-consumer
@@ -3773,9 +3790,9 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     the image linker independently derives that order from the completed provider ELFs and
     emits one bounded sidecar per executable. The volume packager requires and validates
     those records; ProcessService refuses a missing, malformed or different order before
-    creating a process. All 49 executable records are byte-identical on x86_64, AArch64
-    and RISC-V, and the 35-test `process` QEMU suite pins both all 48 dynamic tools and an
-    explicit linker/runtime drift rejection.
+    creating a process. Every dynamic executable carries a bounded order record on all
+    three targets, and the process suite pins both all 48 tools and an explicit
+    linker/runtime drift rejection.
 - [ ] Keep libraries atomized by ownership; do not replace static bloat with one giant
   `tools.lslib`, `image.lslib` or `audio.lslib`. Required foundation layers:
   - `lsrt.lslib`: runtime/core/alloc/compiler primitives used by every executable;
