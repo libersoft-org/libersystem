@@ -3700,19 +3700,23 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     AArch64 and RISC-V package checks pass. The absolute all-`/bin` `ET_DYN` gate and
     transitive symbol/identity audit remain blocked on migrating volume services and
     components.
-- [ ] Canonicalize runtime provider loading. ProcessService currently assigns each
+- [x] Canonicalize runtime provider loading. ProcessService assigns each
   `LIBRARY_SLOT_SIZE` bias in DFS/`DT_NEEDED` encounter order. Parse the complete bounded
   graph first, reject duplicate symbol providers, compute one provider-before-consumer
   topological order with a lexicographic canonical-name tie-break, then load in that order
   and derive biases from it. The image linker computes and tests the same order; a launch
   refuses if the runtime graph differs. Equivalent link/manifest input therefore yields
   identical module addresses on every run, independent of archive/hash-map iteration.
-  - Runtime result (2026-07-18): ProcessService now maps and validates the complete bounded
+  - Result (2026-07-18): ProcessService maps and validates the complete bounded
     dependency graph before loading anything, then repeatedly selects the lexicographically
     smallest provider whose dependencies are already loaded. Slot biases therefore follow
     one provider-before-consumer canonical order rather than `DT_NEEDED` encounter order;
-    the 34-test `process` QEMU suite, including all 48 dynamic tools, passes. Emitting and
-    comparing the same order in the image linker remains open.
+    the image linker independently derives that order from the completed provider ELFs and
+    emits one bounded sidecar per executable. The volume packager requires and validates
+    those records; ProcessService refuses a missing, malformed or different order before
+    creating a process. All 49 executable records are byte-identical on x86_64, AArch64
+    and RISC-V, and the 35-test `process` QEMU suite pins both all 48 dynamic tools and an
+    explicit linker/runtime drift rejection.
 - [ ] Keep libraries atomized by ownership; do not replace static bloat with one giant
   `tools.lslib`, `image.lslib` or `audio.lslib`. Required foundation layers:
   - `lsrt.lslib`: runtime/core/alloc/compiler primitives used by every executable;

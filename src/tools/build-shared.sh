@@ -89,6 +89,61 @@ graph_archive() {
 	printf '%s' "$archives"
 }
 
+canonical_provider_order() {
+	local roots="$1"
+	local name dependency dependencies candidate ready
+	local -A present=()
+	local -A edges=()
+	local -A visiting=()
+	local -a pending=()
+	local -a order=()
+	read -r -a pending <<<"$roots"
+	while ((${#pending[@]})); do
+		name="${pending[0]}"
+		pending=("${pending[@]:1}")
+		[[ -n "$name" ]] || continue
+		if [[ -n "${present[$name]:-}" ]]; then
+			continue
+		fi
+		if ! printf '%s\n' "${artifacts[@]}" | grep -qx "$name"; then
+			echo "build-shared: canonical graph names unavailable provider $name" >&2
+			return 1
+		fi
+		dependencies="$(llvm-readelf -d "$(library_file "$name")" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sed 's/\.lslib$//' | sort -u)"
+		present[$name]=1
+		edges[$name]="$dependencies"
+		for dependency in $dependencies; do
+			pending+=("$dependency")
+		done
+	done
+	while ((${#order[@]} < ${#present[@]})); do
+		candidate=""
+		while read -r name; do
+			[[ -n "$name" ]] || continue
+			if printf '%s\n' "${order[@]}" | grep -qx "$name"; then
+				continue
+			fi
+			ready=1
+			for dependency in ${edges[$name]}; do
+				if ! printf '%s\n' "${order[@]}" | grep -qx "$dependency"; then
+					ready=0
+					break
+				fi
+			done
+			if [[ "$ready" == 1 ]]; then
+				candidate="$name"
+				break
+			fi
+		done < <(printf '%s\n' "${!present[@]}" | sort)
+		if [[ -z "$candidate" ]]; then
+			echo "build-shared: provider graph contains a cycle" >&2
+			return 1
+		fi
+		order+=("$candidate")
+	done
+	printf '%s.lslib\n' "${order[@]}"
+}
+
 artifacts=()
 for spec in "$@"; do
 	if [[ "$spec" == *=* ]]; then
@@ -447,6 +502,7 @@ if [[ -n "$image_graph" ]]; then
 			exit 1
 		fi
 		llvm-strip --strip-debug "$out"
+		canonical_provider_order "$providers" >"$out.order"
 		echo "build-shared: $out ($(stat -c %s "$out") bytes, PIE)"
 	done <<<"$dynamic_rows"
 fi
@@ -464,5 +520,6 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 		echo "build-shared: $probe_out is not a pix.lslib-linked ET_DYN" >&2
 		exit 1
 	fi
+	canonical_provider_order "pix proto lsrt" >"$probe_out.order"
 	echo "build-shared: $probe_out ($(stat -c %s "$probe_out") bytes)"
 fi

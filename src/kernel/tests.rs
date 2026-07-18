@@ -5205,6 +5205,54 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	sched::run_until_idle();
 }
 
+tagged_test!(dynamic_process_service_rejects_linker_order_drift, [Service, Process, Storage]);
+fn dynamic_process_service_rejects_linker_order_drift() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let init = init_package_bytes().expect("init package module not found");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
+	let process_elf = package.lookup(b"process_service.lsexe").expect("process_service.lsexe in the init package");
+	let mut drifted_volume = volume.to_vec();
+	let order_offset = {
+		let archive = pkg::Package::parse(&drifted_volume).expect("volume package parses");
+		let order = archive.lookup(b"order/echo").expect("echo canonical order is staged");
+		assert_eq!(order, b"lsrt.lslib\n", "echo has one runtime provider");
+		order.as_ptr() as usize - drifted_volume.as_ptr() as usize
+	};
+	drifted_volume[order_offset..order_offset + b"wire.lslib\n".len()].copy_from_slice(b"wire.lslib\n");
+
+	let (storage_boot_kernel, storage_boot_user) = Channel::create();
+	let (process_boot_kernel, process_boot_user) = Channel::create();
+	let (storage_server, storage_client) = Channel::create();
+	let (process_server, process_client) = Channel::create();
+	let domain = sched::root_domain();
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
+	loader::spawn_elf_process(domain, process_elf, process_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+	send_ramdisk(&storage_boot_kernel, &drifted_volume).expect("drifted storage ramdisk bootstrap");
+	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
+	send_package(&process_boot_kernel, init).expect("process package bootstrap");
+	send_cap(&process_boot_kernel, b"STORAGE", storage_client, Rights::ALL).expect("process storage bootstrap");
+	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
+
+	let name = b"echo";
+	let mut start = alloc::vec::Vec::new();
+	start.extend_from_slice(&1u16.to_le_bytes());
+	start.extend_from_slice(&77u32.to_le_bytes());
+	start.extend_from_slice(&(name.len() as u16).to_le_bytes());
+	start.extend_from_slice(name);
+	process_client.send(Message::new(start, alloc::vec::Vec::new(), 0)).expect("drifted echo start request");
+	sched::run_until_idle();
+	assert_eq!(&process_boot_kernel.recv().expect("ProcessService online report").bytes, b"ProcessService: online");
+	let reply = process_client.recv().expect("drifted echo start reply");
+	assert_eq!(le_u32(&reply.bytes, 0), 77);
+	assert_eq!(reply.bytes[4], 0, "ProcessService rejects linker/runtime provider-order drift");
+	assert!(reply.caps.is_empty(), "a rejected provider order creates no process capability");
+	process_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	sched::run_until_idle();
+}
+
 tagged_test!(config_service_serves_the_tree, [Service]);
 fn config_service_serves_the_tree() {
 	use object::channel::Message;

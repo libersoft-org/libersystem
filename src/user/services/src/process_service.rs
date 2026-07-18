@@ -38,6 +38,7 @@ use services::executable;
 // factory-seed pipeline). A named program is loaded from `<PROGRAM_DIR><name>`.
 const PROGRAM_DIR: &str = "vol://system/bin/";
 const LIBRARY_DIR: &str = "vol://system/lib/";
+const ORDER_DIR: &str = "vol://system/order/";
 const LIBRARY_BASE: u64 = 0x2000_0000;
 const LIBRARY_SLOT_SIZE: u64 = 0x0100_0000;
 // Per-process dependency-graph limits. MAX_MODULES counts unique loaded libraries
@@ -101,7 +102,6 @@ struct Module {
 
 struct Resolver {
 	storage: u64,
-	process: u64,
 	modules: Vec<Module>,
 	visiting: Vec<String>,
 }
@@ -142,18 +142,23 @@ impl Resolver {
 		}
 	}
 
-	unsafe fn load(self) -> bool {
+	fn order(&self) -> Option<Vec<String>> {
+		let mut order = Vec::with_capacity(self.modules.len());
+		while order.len() < self.modules.len() {
+			let module = self.modules.iter().filter(|module| !order.iter().any(|name: &String| name == &module.name) && module.dependencies.iter().all(|dependency| order.iter().any(|name| name == dependency))).min_by(|left, right| left.name.cmp(&right.name))?;
+			order.push(module.name.clone());
+		}
+		Some(order)
+	}
+
+	unsafe fn load(self, process: u64, order: &[String]) -> bool {
 		unsafe {
-			let mut loaded = Vec::with_capacity(self.modules.len());
-			while loaded.len() < self.modules.len() {
-				let Some(module) = self.modules.iter().filter(|module| !loaded.iter().any(|name: &String| name == &module.name) && module.dependencies.iter().all(|dependency| loaded.iter().any(|name| name == dependency))).min_by(|left, right| left.name.cmp(&right.name)) else {
-					return false;
-				};
-				let Some(bias) = LIBRARY_BASE.checked_add((loaded.len() as u64).checked_mul(LIBRARY_SLOT_SIZE).unwrap_or(u64::MAX)) else { return false };
-				if process_load_module(self.process, module.file.bytes(), bias) < 0 {
+			for (index, name) in order.iter().enumerate() {
+				let Some(module) = self.modules.iter().find(|module| &module.name == name) else { return false };
+				let Some(bias) = LIBRARY_BASE.checked_add((index as u64).checked_mul(LIBRARY_SLOT_SIZE).unwrap_or(u64::MAX)) else { return false };
+				if process_load_module(process, module.file.bytes(), bias) < 0 {
 					return false;
 				}
-				loaded.push(module.name.clone());
 			}
 			true
 		}
@@ -174,6 +179,21 @@ fn dependencies(elf: &bootproto::elf::Elf<'_>, dynamic: &bootproto::elf::Dynamic
 		dependencies.push(String::from(name));
 	}
 	Some(dependencies)
+}
+
+fn parse_order(bytes: &[u8]) -> Option<Vec<String>> {
+	if bytes.is_empty() || bytes.len() > MAX_MODULES * 65 || bytes.last() != Some(&b'\n') {
+		return None;
+	}
+	let text = core::str::from_utf8(bytes).ok()?;
+	let mut order = Vec::new();
+	for name in text.lines() {
+		if order.len() >= MAX_MODULES || !valid_library_name(name) || order.iter().any(|loaded: &String| loaded == name) {
+			return None;
+		}
+		order.push(String::from(name));
+	}
+	(!order.is_empty()).then_some(order)
 }
 
 // The processes started so far (in order), the StorageService client the on-disk
@@ -216,18 +236,18 @@ impl<'a> Processes<'a> {
 				if self.storage == 0 {
 					return None;
 				}
-				let handle = spawn_from_path(self.storage, path, bootstrap, domain)?;
+				let handle = spawn_from_path(self.storage, path, basename, bootstrap, domain)?;
 				return (handle >= 0).then(|| (handle, String::from(basename)));
 			}
 			for artifact in executable::launch_candidates(name)? {
 				let handle = if self.storage != 0 {
-					match spawn_from_path(self.storage, &alloc::format!("{PROGRAM_DIR}{artifact}"), bootstrap, domain) {
+					match spawn_from_path(self.storage, &alloc::format!("{PROGRAM_DIR}{artifact}"), &artifact, bootstrap, domain) {
 						Some(handle) => handle,
 						None => continue,
 					}
 				} else {
 					match self.package.lookup(artifact.as_bytes()) {
-						Some(elf) => spawn_program_bytes(self.storage, elf, bootstrap, domain),
+						Some(elf) => spawn_program_bytes(self.storage, elf, None, bootstrap, domain),
 						None => continue,
 					}
 				};
@@ -242,14 +262,16 @@ impl<'a> Processes<'a> {
 // create a process from the mapped ELF image, then release the mapping. Returns the new
 // process handle. None means the named artifact was absent; a present but invalid
 // artifact returns a negative handle so resolution never falls through to another name.
-unsafe fn spawn_from_path(storage: u64, path: &str, bootstrap: u64, domain: u64) -> Option<i64> {
+unsafe fn spawn_from_path(storage: u64, path: &str, artifact: &str, bootstrap: u64, domain: u64) -> Option<i64> {
 	unsafe {
 		let main = MappedFile::open(storage, String::from(path))?;
-		Some(spawn_program_bytes(storage, main.bytes(), bootstrap, domain))
+		let logical_name = executable::logical_name(artifact)?;
+		let order = MappedFile::open(storage, alloc::format!("{ORDER_DIR}{logical_name}"));
+		Some(spawn_program_bytes(storage, main.bytes(), order.as_ref().map(|file| file.bytes()), bootstrap, domain))
 	}
 }
 
-unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], bootstrap: u64, domain: u64) -> i64 {
+unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], expected_order: Option<&[u8]>, bootstrap: u64, domain: u64) -> i64 {
 	unsafe {
 		let Some(elf) = bootproto::elf::Elf::parse(bytes) else { return -1 };
 		let Some(dynamic) = elf.dynamic_info() else { return -1 };
@@ -261,19 +283,23 @@ unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], bootstrap: u64, domain
 		if storage == 0 {
 			return -1;
 		}
+		let mut resolver = Resolver { storage, modules: Vec::new(), visiting: Vec::new() };
+		for dependency in dependencies {
+			if !resolver.collect(&dependency, 0) {
+				return -1;
+			}
+		}
+		let Some(order) = resolver.order() else { return -1 };
+		let Some(expected_order) = expected_order.and_then(parse_order) else { return -1 };
+		if order != expected_order {
+			return -1;
+		}
 		let process = process_create(domain);
 		if process < 0 {
 			return process;
 		}
 		let process = process as u64;
-		let mut resolver = Resolver { storage, process, modules: Vec::new(), visiting: Vec::new() };
-		for dependency in dependencies {
-			if !resolver.collect(&dependency, 0) {
-				close(process);
-				return -1;
-			}
-		}
-		if !resolver.load() {
+		if !resolver.load(process, &order) {
 			close(process);
 			return -1;
 		}

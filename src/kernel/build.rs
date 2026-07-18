@@ -188,6 +188,19 @@ fn audit_dynamic_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String])
 	assert_eq!(actual, expected, "dynamic {} DT_NEEDED providers differ from the manifest", row.name);
 }
 
+fn audit_dynamic_order(row: &ManifestRow, bytes: &[u8], libraries: &[String]) {
+	assert!(!bytes.is_empty() && bytes.len() <= 64 * 65 && bytes.last() == Some(&b'\n'), "dynamic {} has malformed canonical provider order", row.name);
+	let text = core::str::from_utf8(bytes).unwrap_or_else(|_| panic!("dynamic {} provider order is not UTF-8", row.name));
+	let mut names: Vec<&str> = Vec::new();
+	for name in text.lines() {
+		let stem = name.strip_suffix(".lslib").unwrap_or_else(|| panic!("dynamic {} order names non-library {name:?}", row.name));
+		assert!(valid_library_name(stem) && libraries.binary_search(&String::from(stem)).is_ok(), "dynamic {} order names invalid or unstaged provider {name}", row.name);
+		assert!(!names.contains(&name), "dynamic {} repeats provider {name} in canonical order", row.name);
+		names.push(name);
+	}
+	assert!(!names.is_empty() && names.len() <= 64, "dynamic {} has an empty or oversized canonical provider order", row.name);
+}
+
 // The debug-build target path of a userspace ELF: each crate builds to its own target dir.
 // The target triple follows the kernel's target arch, so an aarch64 kernel stages the
 // aarch64 userspace ELFs (and x86_64 the x86_64 ones).
@@ -202,6 +215,10 @@ fn user_shared_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 
 fn user_dynamic_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 	manifest.join(format!("../user/{crate_dir}/shared/{}/{}", user_target(), name))
+}
+
+fn user_dynamic_order_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
+	manifest.join(format!("../user/{crate_dir}/shared/{}/{}.order", user_target(), name))
 }
 
 fn executable_artifact_name(name: &str) -> String {
@@ -386,6 +403,11 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			Some(bytes) => {
 				if row.kind == "dynamic" {
 					audit_dynamic_artifact(&row, &bytes, &libraries);
+					let order_path = user_dynamic_order_path(&manifest, &row.crate_dir, &row.name);
+					println!("cargo:rerun-if-changed={}", order_path.display());
+					let order = fs::read(&order_path).unwrap_or_else(|error| panic!("cannot read canonical order for dynamic {} at {}: {error}", row.name, order_path.display()));
+					audit_dynamic_order(&row, &order, &libraries);
+					files.push((format!("order/{}", row.name), order));
 				}
 				files.push((dest, bytes));
 			}
