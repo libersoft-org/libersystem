@@ -40,7 +40,7 @@ fn select_linker_script() {
 // (services/manifest.txt, the single source of truth the kernel build script also
 // reads for its staging lists). Only the services crate holds ServiceManager, so the
 // table is emitted only there; service_manager.rs includes it via env!("OUT_DIR").
-// Each `service` / `instance` row becomes one `Service { name, restart, deps }`
+// Each `service` / `dynamic-service` / `instance` row becomes one `Service { name, restart, deps }`
 // entry, in the manifest's row order (the resolver derives the real start order from
 // the deps). The `restart` column is the supervisor's crash policy: `transparent`
 // (restart per the ladder, clients re-resolve through the broker) or `escalate`.
@@ -61,7 +61,7 @@ fn generate_service_manifest() {
 		}
 		let mut fields = trimmed.split_whitespace();
 		let kind: &str = fields.next().expect("manifest row missing kind");
-		if kind != "service" && kind != "instance" {
+		if kind != "service" && kind != "dynamic-service" && kind != "instance" {
 			continue;
 		}
 		let name: &str = fields.next().expect("manifest row missing name");
@@ -73,7 +73,7 @@ fn generate_service_manifest() {
 			other => panic!("manifest row {name}: unknown restart policy {other:?} (transparent | escalate)"),
 		};
 		let mut deps: String = String::new();
-		for dep in fields {
+		for dep in fields.take_while(|field| *field != "--") {
 			if !deps.is_empty() {
 				deps.push_str(", ");
 			}

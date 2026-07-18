@@ -143,7 +143,12 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 		let crate_dir: String = fields.next().expect("manifest row missing crate").to_string();
 		let stage: String = fields.next().expect("manifest row missing stage").to_string();
 		let features = (kind == "library").then(|| fields.next().expect("library manifest row missing feature set").to_string());
-		let providers: Vec<String> = fields.map(String::from).collect();
+		let providers: Vec<String> = if kind == "dynamic-service" {
+			fields.by_ref().find(|field| *field == "--").expect("dynamic-service row missing -- separator");
+			fields.map(String::from).collect()
+		} else {
+			fields.map(String::from).collect()
+		};
 		rows.push(ManifestRow { kind, name, crate_dir, stage, features, providers });
 	}
 	rows
@@ -452,16 +457,16 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			"service" | "component" if row.stage == "volume" => format!("bin/{}", executable_artifact_name(&row.name)),
 			"driver" if row.stage == "volume" => format!("drivers/{}", executable_artifact_name(&row.name)),
 			"library" if row.stage == "volume" => format!("lib/{}.lslib", row.name),
-			"dynamic" if row.stage == "volume" => format!("bin/{}", executable_artifact_name(&row.name)),
+			"dynamic" | "dynamic-service" if row.stage == "volume" => format!("bin/{}", executable_artifact_name(&row.name)),
 			_ => continue,
 		};
 		let path: PathBuf = match row.kind.as_str() {
 			"library" => user_shared_path(&manifest, &row.crate_dir, &row.name),
-			"dynamic" => user_dynamic_path(&manifest, &row.crate_dir, &row.name),
+			"dynamic" | "dynamic-service" => user_dynamic_path(&manifest, &row.crate_dir, &row.name),
 			_ => user_elf_path(&manifest, &row.crate_dir, &row.name),
 		};
 		println!("cargo:rerun-if-changed={}", path.display());
-		if row.kind == "dynamic" || row.kind == "library" {
+		if row.kind == "dynamic" || row.kind == "dynamic-service" || row.kind == "library" {
 			let identity = audit_identity(&row, &path, &library_rows, &expected_rustc_commit);
 			let identity_kind = if row.kind == "library" { "lib" } else { "bin" };
 			files.push((format!("identity/{identity_kind}/{}", row.name), identity));
@@ -471,7 +476,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		// the program is still staged - the loader ignores the extra sections.
 		match read_stripped(&path).or_else(|| fs::read(&path).ok()) {
 			Some(bytes) => {
-				if row.kind == "dynamic" {
+				if row.kind == "dynamic" || row.kind == "dynamic-service" {
 					audit_linked_artifact(&row, &bytes, &libraries, true);
 					let order_path = user_dynamic_order_path(&manifest, &row.crate_dir, &row.name);
 					println!("cargo:rerun-if-changed={}", order_path.display());

@@ -3541,7 +3541,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     final-link failure is pinned to the duplicate allocator shims after an exact-path
     `ET_REL` seed exists; any other failure aborts construction. The complete provider
     graph and its consumers link on all three architectures.
-  - Identity result (2026-07-18): all 33 providers and 55 dynamic executables emit one
+  - Identity result (2026-07-18): all 33 providers and 59 dynamic executables emit one
     canonical `liber-image-identity-v1` record containing artifact/package identity, a
     sorted source-tree SHA-256, the image rustc commit, target, release profile, exact
     codegen flags, feature set and sorted direct-provider record digests. Each ELF embeds
@@ -3551,8 +3551,8 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     the complete provider digest chain and byte-exact note equality before staging records
     under collision-free `identity/lib/` and `identity/bin/` paths. A complete x86 rebuild
     reproduced the aggregate hash of the original 81-record tool graph exactly; after the
-    component migration, x86_64, AArch64 and RISC-V each produce and package 88 records
-    plus 88 notes. The process, boot/storage and broad service integration suites pass
+    managed-service migration, x86_64, AArch64 and RISC-V each produce and package 92
+    records plus 92 notes. The process, boot/storage and broad service integration suites pass
     with the identity-bearing graph.
   - Component result (2026-07-18): all six volume components are now manifest-driven PIE:
     `sandbox_probe` (8,208/8,000/8,192 bytes), `request_probe` (6,152/6,168/6,536),
@@ -3564,6 +3564,18 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     volume `component` rows. Provider-aware test loading preserves storage client, WASI,
     picker, permission and SDK component behavior; one 60-test service/process/storage
     QEMU selection passes.
+  - Managed-service result (M126a, 2026-07-18): the manifest now has an explicit
+    `dynamic-service` row whose `--` delimiter preserves supervisor restart/dependency
+    columns while separating linker providers. `config_service` keeps Transparent restart
+    and `log_service + process_service` dependencies at 20,880/22,656/20,592 bytes;
+    `device_service` keeps the same policy/deps at 9,904/10,384/9,952;
+    `resource_manager` remains Escalate at 15,624/17,792/17,248; and `session_service`
+    remains Escalate at 22,840/26,344/20,736. Generated ServiceManager state still has all
+    21 managed entries. Measured direct providers are `config_service -> proto +
+    ipc-client + wire + lsrt`, `resource_manager -> proto + wire + lsrt`, and the two
+    server-only services use `wire + lsrt`. Package identity inventory is 59 executables;
+    all three target graphs/package audits pass, and the 60-test service/process/storage
+    QEMU suite preserves Config persistence/restart, DeviceService and resource behavior.
 - [x] Add a tiny generated executable-start object per architecture, not a static runtime
   archive in every program. It exports `_start`, aligns/initializes the ABI-required
   registers, performs the native ABI revision check through `lsrt`, and calls the tool's

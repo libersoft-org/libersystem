@@ -862,7 +862,7 @@ fn run_resource_scenario() -> Result<alloc::vec::Vec<u8>, &'static str> {
 	let (resource_server, _resource_client) = Channel::create();
 
 	let domain = sched::root_domain();
-	loader::spawn_elf_process(domain, rm_elf, rm_boot_user, Rights::ALL, 0).map_err(|_| "failed to load ResourceManager")?;
+	let _resource_manager = spawn_dynamic_test_process(domain, rm_elf, rm_boot_user);
 
 	// ResourceManager: the init package (to launch the probe from) and the channel its
 	// clients reach it on. The order matches ResourceManager's receive order: PACKAGE, SERVE.
@@ -3327,7 +3327,12 @@ fn spawn_service(name: &[u8]) -> (alloc::sync::Arc<object::channel::Channel>, al
 	let service_elf = program_elf(&package, volume, name).expect("service in the init package or volume");
 	let (boot_kernel, boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn service");
+	let _service = if bootproto::elf::Elf::parse(service_elf).is_some_and(|elf| elf.image_type == bootproto::elf::ET_DYN) {
+		Some(spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user))
+	} else {
+		loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn service");
+		None
+	};
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 	(boot_kernel, service_client)
 }
@@ -4622,7 +4627,7 @@ fn system_packages_use_canonical_executable_names() {
 		executable_identities += usize::from(name.starts_with(b"identity/bin/"));
 	}
 	assert_eq!(library_identities, 33, "every staged library has one identity record");
-	assert_eq!(executable_identities, 55, "every staged dynamic executable has one identity record");
+	assert_eq!(executable_identities, 59, "every staged dynamic executable has one identity record");
 	assert!(volume.lookup(b"identity/lib/imgconv").is_some(), "library identity namespace preserves imgconv");
 	assert!(volume.lookup(b"identity/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");
 }
@@ -5491,7 +5496,7 @@ fn config_set_survives_a_service_reboot() {
 	let vol1 = mint_volume(&storage_client, &blk_host, &mut disk, CAPACITY);
 	let (cfg1_boot, cfg1_boot_user) = Channel::create();
 	let (cfg1_server, cfg1_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), config_elf, cfg1_boot_user, Rights::ALL, 0).expect("spawn ConfigService 1");
+	let _config1 = spawn_dynamic_test_process(sched::root_domain(), config_elf, cfg1_boot_user);
 	send_cap(&cfg1_boot, b"STORAGE", vol1, Rights::ALL).expect("STORAGE bootstrap 1");
 	send_cap(&cfg1_boot, b"SERVE", cfg1_server, Rights::ALL).expect("SERVE bootstrap 1");
 
@@ -5526,7 +5531,7 @@ fn config_set_survives_a_service_reboot() {
 	let vol2 = mint_volume(&storage_client, &blk_host, &mut disk, CAPACITY);
 	let (cfg2_boot, cfg2_boot_user) = Channel::create();
 	let (cfg2_server, cfg2_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), config_elf, cfg2_boot_user, Rights::ALL, 0).expect("spawn ConfigService 2");
+	let _config2 = spawn_dynamic_test_process(sched::root_domain(), config_elf, cfg2_boot_user);
 	send_cap(&cfg2_boot, b"STORAGE", vol2, Rights::ALL).expect("STORAGE bootstrap 2");
 	send_cap(&cfg2_boot, b"SERVE", cfg2_server, Rights::ALL).expect("SERVE bootstrap 2");
 	let get = |corr: u32, key: &[u8]| -> alloc::vec::Vec<u8> {

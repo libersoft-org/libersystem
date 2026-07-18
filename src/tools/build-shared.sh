@@ -140,6 +140,19 @@ if awk '$1 == "component" && $4 == "volume" {found=1} END {exit !found}' "$root/
 	exit 1
 fi
 
+dynamic_rows() {
+	awk '
+		$1 == "dynamic" && $2 != "dyn_probe" && $4 == "volume" {print; next}
+		$1 == "dynamic-service" && $4 == "volume" {
+			for (i = 5; i <= NF && $i != "--"; i++) {}
+			if (i > NF) {exit 1}
+			printf "dynamic %s %s %s", $2, $3, $4
+			for (i = i + 1; i <= NF; i++) printf " %s", $i
+			printf "\n"
+		}
+	' "$root/user/services/manifest.txt" | sort -k2,2
+}
+
 image_graph=""
 if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 	image_target="$root/boot/.build/image-cargo-$target"
@@ -529,7 +542,7 @@ done
 if [[ -n "$image_graph" ]]; then
 	start_obj="$root/boot/.build/exe-start-$target.o"
 	"$root/tools/build-exe-start.sh" "$target" "$start_obj"
-	dynamic_rows="$(awk '$1 == "dynamic" && $2 != "dyn_probe" && $4 == "volume" {print}' "$root/user/services/manifest.txt" | sort -k2,2)"
+	dynamic_rows="$(dynamic_rows)"
 	manifest_tools="$(awk '$3 == "tools" {print $2}' <<<"$dynamic_rows")"
 	cargo_tools="$(cd "$root/user/tools" && cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tools") | .targets[] | select(.kind == ["bin"]) | .name' | sort)"
 	if [[ "$manifest_tools" != "$cargo_tools" ]]; then
