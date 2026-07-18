@@ -43,6 +43,14 @@ command -v llvm-ar >/dev/null
 command -v llvm-readelf >/dev/null
 command -v llvm-strip >/dev/null
 command -v jq >/dev/null
+command -v sha256sum >/dev/null
+command -v xxd >/dev/null
+
+rustc_commit="$(rustc -vV | sed -n 's/^commit-hash: //p')"
+if [[ ! "$rustc_commit" =~ ^[0-9a-f]{40}$ ]]; then
+	echo "build-shared: rustc did not report one commit hash" >&2
+	exit 1
+fi
 
 library_file() {
 	case "$1" in
@@ -51,6 +59,68 @@ library_file() {
 	wire) printf 'wire/shared/%s/wire.lslib' "$target" ;;
 	*) printf 'user/%s/shared/%s/%s.lslib' "$1" "$target" "$1" ;;
 	esac
+}
+
+library_identity_file() {
+	printf '%s.identity' "$(library_file "$1")"
+}
+
+source_digest() {
+	local crate_dir="$1"
+	(
+		cd "$root"
+		find "$crate_dir" -path '*/target' -prune -o -path '*/shared' -prune -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' \) -print0 |
+			sort -z |
+			while IFS= read -r -d '' source; do
+				printf '%s\n' "$source"
+				sha256sum "$source"
+			done
+	) | sha256sum | awk '{print $1}'
+}
+
+emit_identity() {
+	local kind="$1"
+	local artifact="$2"
+	local package="$3"
+	local crate_dir="$4"
+	local feature_set="$5"
+	local providers="$6"
+	local elf="$7"
+	local identity="$elf.identity"
+	local provider digest note
+	{
+		printf 'format=liber-image-identity-v1\n'
+		printf 'kind=%s\n' "$kind"
+		printf 'artifact=%s\n' "$artifact"
+		printf 'package=%s\n' "$package"
+		printf 'source-sha256=%s\n' "$(source_digest "$crate_dir")"
+		printf 'rustc-commit=%s\n' "$rustc_commit"
+		printf 'target=%s\n' "$target"
+		printf 'profile=release\n'
+		printf 'rustflags=%s\n' "$rustflags"
+		printf 'features=%s\n' "$feature_set"
+		for provider in $(tr ' ' '\n' <<<"$providers" | sort); do
+			[[ -n "$provider" ]] || continue
+			if [[ ! -f "$(library_identity_file "$provider")" ]]; then
+				echo "build-shared: $artifact has no identity for provider $provider" >&2
+				return 1
+			fi
+			digest="$(sha256sum "$(library_identity_file "$provider")" | awk '{print $1}')"
+			printf 'provider=%s:%s\n' "$provider" "$digest"
+		done
+	} >"$identity"
+	digest="$(sha256sum "$identity" | awk '{print $1}')"
+	note="$elf.identity.note"
+	printf '0600000020000000010000004c49424552000000' | xxd -r -p >"$note"
+	printf '%s' "$digest" | xxd -r -p >>"$note"
+	llvm-objcopy --add-section .note.liber.identity="$note" --set-section-flags .note.liber.identity=alloc,readonly "$elf"
+	dumped_note="$elf.identity.note.dump"
+	llvm-objcopy --dump-section .note.liber.identity="$dumped_note" "$elf"
+	if ! cmp -s "$note" "$dumped_note"; then
+		echo "build-shared: $artifact identity note differs from its record" >&2
+		exit 1
+	fi
+	rm -f "$note" "$dumped_note"
 }
 
 manifest_library_row() {
@@ -428,6 +498,7 @@ for spec in "$@"; do
 		echo "build-shared: $out contains a writable executable segment" >&2
 		exit 1
 	fi
+	emit_identity library "$artifact" "$crate" "$crate_dir" "$row_features" "$row_providers" "$out"
 	echo "build-shared: $out ($(stat -c %s "$out") bytes)"
 	artifacts+=("$artifact")
 done
@@ -549,6 +620,7 @@ if [[ -n "$image_graph" ]]; then
 			exit 1
 		fi
 		llvm-strip --strip-debug "$out"
+		emit_identity executable "$consumer" "$crate" "$consumer_dir" shared-image "$providers" "$out"
 		canonical_provider_order "$providers" >"$out.order"
 		echo "build-shared: $out ($(stat -c %s "$out") bytes, PIE)"
 	done <<<"$dynamic_rows"
@@ -567,6 +639,7 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 		echo "build-shared: $probe_out is not a pix.lslib-linked ET_DYN" >&2
 		exit 1
 	fi
+	emit_identity executable dyn_probe dyn_probe "$probe" - "pix proto lsrt" "$probe_out"
 	canonical_provider_order "pix proto lsrt" >"$probe_out.order"
 	echo "build-shared: $probe_out ($(stat -c %s "$probe_out") bytes)"
 fi

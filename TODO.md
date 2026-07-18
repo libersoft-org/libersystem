@@ -3499,7 +3499,7 @@ the atomized codec/provider leaves are already staged once, and the dynamic prob
 few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sections
 (raw Cargo debug ELFs are much larger but are stripped before staging).
 
-- [ ] Make the image build own one coherent PIC provider/consumer graph. Today
+- [x] Make the image build own one coherent PIC provider/consumer graph. Today
   `lsrt.lslib` builds `rt` with `shared-image` and without `proto-transport`, while a
   normal tool compiles `rt` with the opposite feature set; Rust crate hashes therefore
   differ and ordinary mangled imports cannot resolve even though `lsrt` exports 652
@@ -3530,9 +3530,9 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     names. `build-shared.sh` now rejects provider-set drift and requires each transport
     import to have exactly one `lsrt` definition. Source packages compile and the complete
     provider graph links on all three architectures; cross-target build-std uses the compiler-
-    recommended 64 MB worker stack. Whole-image identity records, a single deterministic
-    invocation and the executable-side identity audit remain open with the start-object/
-    image-linker work below.
+    recommended 64 MB worker stack. At that increment, whole-image identity records, a
+    single deterministic invocation and the executable-side identity audit were still
+    open; the subsequent results below complete them.
   - Partial result (2026-07-17): one clean Cargo invocation now owns the actual image
     graph for all current providers and ordinary PIE consumers. Its machine-readable
     artifact records select each local-path `rlib` exactly, including the local/crates.io
@@ -3540,8 +3540,19 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     `lsrt`, `wire`, `ipc-client`, `proto` and every codec leaf. The intentional Cargo
     final-link failure is pinned to the duplicate allocator shims after an exact-path
     `ET_REL` seed exists; any other failure aborts construction. The complete provider
-    graph and its consumers link on all three architectures. Embedded identity notes and
-    source/toolchain digests remain open.
+    graph and its consumers link on all three architectures.
+  - Identity result (2026-07-18): all 32 providers and 49 dynamic executables emit one
+    canonical `liber-image-identity-v1` record containing artifact/package identity, a
+    sorted source-tree SHA-256, the image rustc commit, target, release profile, exact
+    codegen flags, feature set and sorted direct-provider record digests. Each ELF embeds
+    the record SHA-256 as a valid 32-byte `LIBER` `.note.liber.identity` payload that
+    survives package `--strip-all`. The volume packager independently checks record
+    structure, one image-wide toolchain identity rooted at `lsrt`, target/profile/flags,
+    the complete provider digest chain and byte-exact note equality before staging records
+    under collision-free `identity/lib/` and `identity/bin/` paths. A complete x86 rebuild
+    reproduced the aggregate hash of all 81 records exactly; x86_64, AArch64 and RISC-V
+    each produce and package 81 records plus 81 notes. The 35-test process suite and
+    21-test boot/storage suite pass with the identity-bearing graph.
 - [x] Add a tiny generated executable-start object per architecture, not a static runtime
   archive in every program. It exports `_start`, aligns/initializes the ABI-required
   registers, performs the native ABI revision check through `lsrt`, and calls the tool's

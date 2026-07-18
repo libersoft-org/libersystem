@@ -4614,6 +4614,17 @@ fn system_packages_use_canonical_executable_names() {
 			}
 		}
 	}
+	let mut library_identities = 0usize;
+	let mut executable_identities = 0usize;
+	for index in 0..volume.len() {
+		let name = volume.name(index).expect("volume entry name");
+		library_identities += usize::from(name.starts_with(b"identity/lib/"));
+		executable_identities += usize::from(name.starts_with(b"identity/bin/"));
+	}
+	assert_eq!(library_identities, 32, "every staged library has one identity record");
+	assert_eq!(executable_identities, 49, "every staged dynamic executable has one identity record");
+	assert!(volume.lookup(b"identity/lib/imgconv").is_some(), "library identity namespace preserves imgconv");
+	assert!(volume.lookup(b"identity/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");
 }
 
 tagged_test!(dynamic_process_service_loads_programs_from_system_bin, [Service, Process, Storage]);

@@ -114,6 +114,7 @@ fn conf_get<'a>(conf: &'a [(String, String)], key: &str) -> &'a str {
 
 // A staged program parsed from a manifest row: its kind, its package entry name, the
 // crate directory under ../user that builds it, and where it is staged.
+#[derive(Clone)]
 struct ManifestRow {
 	kind: String,
 	name: String,
@@ -223,6 +224,56 @@ fn user_dynamic_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 
 fn user_dynamic_order_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
 	manifest.join(format!("../user/{crate_dir}/shared/{}/{}.order", user_target(), name))
+}
+
+fn identity_path(artifact: &Path) -> PathBuf {
+	PathBuf::from(format!("{}.identity", artifact.display()))
+}
+
+fn sha256_file(path: &Path) -> String {
+	let output = Command::new("sha256sum").arg(path).output().unwrap_or_else(|error| panic!("cannot hash {}: {error}", path.display()));
+	assert!(output.status.success(), "sha256sum failed for {}", path.display());
+	String::from_utf8(output.stdout).expect("sha256sum output is UTF-8").split_whitespace().next().expect("sha256sum digest").to_string()
+}
+
+fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow], expected_rustc_commit: &str) -> Vec<u8> {
+	let path = identity_path(artifact);
+	let bytes = fs::read(&path).unwrap_or_else(|error| panic!("cannot read identity for {} at {}: {error}", row.name, path.display()));
+	let text = core::str::from_utf8(&bytes).unwrap_or_else(|_| panic!("identity for {} is not UTF-8", row.name));
+	let lines: Vec<&str> = text.lines().collect();
+	assert!(lines.len() >= 10 && lines[0] == "format=liber-image-identity-v1", "{} has malformed identity record", row.name);
+	let expected_kind = if row.kind == "library" { "library" } else { "executable" };
+	assert_eq!(lines[1], format!("kind={expected_kind}"), "{} identity kind", row.name);
+	assert_eq!(lines[2], format!("artifact={}", row.name), "{} identity artifact", row.name);
+	assert_eq!(lines[3], format!("package={}", row.crate_dir), "{} identity package", row.name);
+	assert!(lines[4].strip_prefix("source-sha256=").is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())), "{} identity source digest", row.name);
+	assert_eq!(lines[5], format!("rustc-commit={expected_rustc_commit}"), "{} identity toolchain", row.name);
+	assert_eq!(lines[6], format!("target={}", user_target()), "{} identity target", row.name);
+	assert_eq!(lines[7], "profile=release", "{} identity profile", row.name);
+	assert!(lines[8].starts_with("rustflags=-C relocation-model=pic"), "{} identity codegen flags", row.name);
+	assert!(lines[9].starts_with("features="), "{} identity features", row.name);
+	let mut expected_providers: Vec<String> = row
+		.providers
+		.iter()
+		.map(|provider| {
+			let provider_row = libraries.iter().find(|candidate| candidate.name == *provider).unwrap_or_else(|| panic!("{} identity names unknown provider {provider}", row.name));
+			let provider_artifact = user_shared_path(&PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")), &provider_row.crate_dir, provider);
+			format!("provider={provider}:{}", sha256_file(&identity_path(&provider_artifact)))
+		})
+		.collect();
+	expected_providers.sort();
+	assert_eq!(&lines[10..], expected_providers.as_slice(), "{} identity provider chain", row.name);
+
+	let digest = sha256_file(&path);
+	let note_path = env::temp_dir().join(format!("liber-identity-note-{}-{}", std::process::id(), row.name));
+	let status = Command::new("llvm-objcopy").arg("--dump-section").arg(format!(".note.liber.identity={}", note_path.display())).arg(artifact).status().unwrap_or_else(|error| panic!("cannot read identity note from {}: {error}", artifact.display()));
+	assert!(status.success(), "{} has no readable identity note", row.name);
+	let note = fs::read(&note_path).unwrap_or_else(|error| panic!("cannot read {}: {error}", note_path.display()));
+	let _ = fs::remove_file(&note_path);
+	assert!(note.len() == 52 && &note[..20] == b"\x06\0\0\0\x20\0\0\0\x01\0\0\0LIBER\0\0\0", "{} has malformed identity note", row.name);
+	let note_digest: String = note[20..].iter().map(|byte| format!("{byte:02x}")).collect();
+	assert_eq!(note_digest, digest, "{} identity note differs from its record", row.name);
+	bytes
 }
 
 fn executable_artifact_name(name: &str) -> String {
@@ -376,6 +427,12 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	}
 
 	let rows = read_manifest(&manifest);
+	let library_rows: Vec<ManifestRow> = rows.iter().filter(|row| row.kind == "library" && row.stage == "volume").cloned().collect();
+	let lsrt_row = library_rows.iter().find(|row| row.name == "lsrt").expect("lsrt library row");
+	let lsrt_artifact = user_shared_path(&manifest, &lsrt_row.crate_dir, &lsrt_row.name);
+	let lsrt_identity = fs::read_to_string(identity_path(&lsrt_artifact)).expect("lsrt identity record");
+	let expected_rustc_commit = lsrt_identity.lines().find_map(|line| line.strip_prefix("rustc-commit=")).expect("lsrt rustc identity").to_string();
+	assert!(expected_rustc_commit.len() == 40 && expected_rustc_commit.bytes().all(|byte| byte.is_ascii_hexdigit()), "lsrt rustc identity is malformed");
 	let mut libraries: Vec<String> = rows.iter().filter(|row| row.kind == "library" && row.stage == "volume").map(|row| row.name.clone()).collect();
 	libraries.sort();
 	assert!(!libraries.windows(2).any(|pair| pair[0] == pair[1]), "duplicate staged library identity");
@@ -404,6 +461,11 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			_ => user_elf_path(&manifest, &row.crate_dir, &row.name),
 		};
 		println!("cargo:rerun-if-changed={}", path.display());
+		if row.kind == "dynamic" || row.kind == "library" {
+			let identity = audit_identity(&row, &path, &library_rows, &expected_rustc_commit);
+			let identity_kind = if row.kind == "library" { "lib" } else { "bin" };
+			files.push((format!("identity/{identity_kind}/{}", row.name), identity));
+		}
 		// Strip the ELF to its loadable image; fall back to the raw ELF when no
 		// `strip` supports the target (the host binutils cannot strip aarch64), so
 		// the program is still staged - the loader ignores the extra sections.
