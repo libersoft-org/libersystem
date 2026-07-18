@@ -4732,6 +4732,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 		(b"dmesg" as &[u8], 35u32),
 		(b"lsmem" as &[u8], 36u32),
 		(b"lsirq" as &[u8], 37u32),
+		(b"lspci" as &[u8], 38u32),
 	] {
 		let (output_kernel, output_user) = Channel::create();
 		let (tool_bootstrap_kernel, tool_bootstrap_user) = Channel::create();
@@ -4771,6 +4772,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 			b"dmesg" => assert!(!captured.is_empty(), "dynamic dmesg rendered the kernel boot log or its empty-log diagnostic"),
 			b"lsmem" => assert!(contains(b" usable\n"), "dynamic lsmem rendered a usable memory region"),
 			b"lsirq" => assert!(contains(b"vector  type   bound  device  device-type") && contains(b"fixed"), "dynamic lsirq rendered its aligned vector table"),
+			b"lspci" => assert!(contains(b"1af4:") && contains(b"(network controller)"), "dynamic lspci rendered the retained virtio bus scan"),
 			_ => unreachable!(),
 		}
 	}
@@ -5620,33 +5622,6 @@ fn du_reports_a_directory_tree_size() {
 	assert_eq!(needed, alloc::vec!["ipc-client.lslib", "lsrt.lslib", "proto.lslib", "wire.lslib"]);
 }
 
-// Run one no-argument, no-capability tool from the volume the way the launcher does
-// - spawn its staged ELF, hand it a console channel as STDOUT and an empty argv -
-// and return everything it printed. The zero-capability inventory commands (uname,
-// uptime, dmesg, lscpu, free, lsmem, lsirq) are driven through this.
-fn run_inventory_tool(name: &[u8]) -> alloc::vec::Vec<u8> {
-	use object::channel::{Channel, Message};
-	use object::rights::Rights;
-
-	let init = init_package_bytes().expect("init package module not found");
-	let volume = volume_package_bytes().expect("volume package module not found");
-	let package = pkg::Package::parse(init).expect("init package parses");
-	let elf = program_elf(&package, volume, name).expect("the tool should be staged");
-
-	let (boot_kernel, boot_user) = Channel::create();
-	let (console_host, console_child) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL, 0).expect("the tool should spawn");
-	send_cap(&boot_kernel, b"STDOUT", console_child, Rights::ALL).expect("STDOUT bootstrap");
-	boot_kernel.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("argv bootstrap");
-	sched::run_until_idle();
-
-	let mut captured = alloc::vec::Vec::new();
-	while let Ok(msg) = console_host.recv() {
-		captured.extend_from_slice(&msg.bytes);
-	}
-	captured
-}
-
 fn assert_dynamic_inventory_providers(name: &[u8], expected: &[&str]) {
 	let init = init_package_bytes().expect("init package present");
 	let volume = volume_package_bytes().expect("volume package present");
@@ -5679,16 +5654,12 @@ fn inventory_tools_report_the_hardware() {
 	// a free syscall reading state the kernel now retains past boot - the CPU set
 	// (lscpu), the frame-pool and heap totals (free), the boot memory map (lsmem),
 	// and the device-interrupt vector table (lsirq).
-	let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
-
 	assert_dynamic_inventory_providers(b"lscpu", &["lsrt.lslib", "wire.lslib"]);
 	assert_dynamic_inventory_providers(b"free", &["lsrt.lslib"]);
 
 	assert_dynamic_inventory_providers(b"lsmem", &["lsrt.lslib", "wire.lslib"]);
 	assert_dynamic_inventory_providers(b"lsirq", &["lsrt.lslib", "wire.lslib"]);
-
-	let lspci = run_inventory_tool(b"lspci");
-	assert!(contains(&lspci, b"1af4:") && contains(&lspci, b"(network controller)"), "lspci should report the retained bus scan with the virtio functions");
+	assert_dynamic_inventory_providers(b"lspci", &["lsrt.lslib", "wire.lslib"]);
 }
 
 // The sector where StorageService lays the fixed factory LiberFS layout when a disk

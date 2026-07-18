@@ -146,7 +146,7 @@ dynamic   lscpu      tools  volume wire lsrt
 dynamic   free       tools  volume lsrt
 dynamic   lsmem      tools  volume wire lsrt
 dynamic   lsirq      tools  volume wire lsrt
-tool      lspci      tools  volume
+dynamic   lspci      tools  volume wire lsrt
 tool      lssvc      tools  volume
 tool      lsblk      tools  volume
 tool      lsusb      tools  volume
