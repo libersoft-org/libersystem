@@ -15,7 +15,6 @@ extern crate alloc;
 use alloc::string::String;
 use proto::codec::JsonMode;
 use rt::*;
-use tools::recv_json_mode;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -26,7 +25,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string - the sub-form ("" for text, "json" /
 		//    "json-min" for JSON).
-		let mode: Option<JsonMode> = recv_json_mode(bootstrap, &mut buf);
+		let mode: Option<JsonMode> = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, .. } => JsonMode::parse(&buf[..len]),
+			Received::Closed => exit(),
+		};
 		let json: bool = mode.is_some();
 		// 3. walk both vector windows and render every vector in use.
 		let mut out = String::new();

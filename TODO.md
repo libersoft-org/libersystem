@@ -3601,8 +3601,11 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     (7,728/9,080/10,120 bytes) over only `lsrt`, plus `lscpu`
     (9,216/10,296/11,024 bytes) over `wire + lsrt`; QEMU preserves their identity,
     clock, memory and CPU output contracts. Two tiny package-local `tools` helper imports
-    were moved into their owning binaries rather than creating a catch-all provider. The
-    remaining executable set is still open.
+    were moved into their owning binaries rather than creating a catch-all provider.
+    `dmesg` now uses only `lsrt` at 4,520/4,872/5,304 bytes; `lsmem` and `lsirq` use
+    `wire + lsrt` at 9,424/10,600/12,160 and 10,176/12,208/13,200 bytes. QEMU executes
+    all three through ProcessService and retains their boot-log, usable-memory-region and
+    aligned interrupt-table contracts. The remaining executable set is still open.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,
   crate/source owner, output class/path, direct providers and build-feature set; each

@@ -4724,7 +4724,15 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	drop(date_bootstrap_kernel);
 	sched::run_until_idle();
 
-	for (tool, correlation) in [(b"uname" as &[u8], 31u32), (b"uptime" as &[u8], 32u32), (b"free" as &[u8], 33u32), (b"lscpu" as &[u8], 34u32)] {
+	for (tool, correlation) in [
+		(b"uname" as &[u8], 31u32),
+		(b"uptime" as &[u8], 32u32),
+		(b"free" as &[u8], 33u32),
+		(b"lscpu" as &[u8], 34u32),
+		(b"dmesg" as &[u8], 35u32),
+		(b"lsmem" as &[u8], 36u32),
+		(b"lsirq" as &[u8], 37u32),
+	] {
 		let (output_kernel, output_user) = Channel::create();
 		let (tool_bootstrap_kernel, tool_bootstrap_user) = Channel::create();
 		let mut tool_launch = alloc::vec::Vec::new();
@@ -4760,6 +4768,9 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 			b"uptime" => assert!(captured.starts_with(b"up ") && captured.ends_with(b"\n"), "dynamic uptime rendered time since boot"),
 			b"free" => assert!(captured.starts_with(b"Mem:  total ") && contains(b"Heap: total "), "dynamic free rendered memory pools"),
 			b"lscpu" => assert!(contains(b"arch: ") && contains(b"name: ") && contains(b"cpu0: lapic "), "dynamic lscpu rendered CPU inventory"),
+			b"dmesg" => assert!(!captured.is_empty(), "dynamic dmesg rendered the kernel boot log or its empty-log diagnostic"),
+			b"lsmem" => assert!(contains(b" usable\n"), "dynamic lsmem rendered a usable memory region"),
+			b"lsirq" => assert!(contains(b"vector  type   bound  device  device-type") && contains(b"fixed"), "dynamic lsirq rendered its aligned vector table"),
 			_ => unreachable!(),
 		}
 	}
@@ -5659,8 +5670,7 @@ fn inventory_tools_print_the_system_identity() {
 	assert_dynamic_inventory_providers(b"uname", &["lsrt.lslib"]);
 	assert_dynamic_inventory_providers(b"uptime", &["lsrt.lslib"]);
 
-	let dmesg = run_inventory_tool(b"dmesg");
-	assert!(!dmesg.is_empty(), "dmesg should print the kernel boot log (or report there is none)");
+	assert_dynamic_inventory_providers(b"dmesg", &["lsrt.lslib"]);
 }
 
 tagged_test!(inventory_tools_report_the_hardware, [Service, Shell, Drivers]);
@@ -5674,23 +5684,8 @@ fn inventory_tools_report_the_hardware() {
 	assert_dynamic_inventory_providers(b"lscpu", &["lsrt.lslib", "wire.lslib"]);
 	assert_dynamic_inventory_providers(b"free", &["lsrt.lslib"]);
 
-	let lsmem = run_inventory_tool(b"lsmem");
-	assert!(contains(&lsmem, b" usable\n"), "lsmem should print the retained boot memory map with a usable region");
-
-	let lsirq = run_inventory_tool(b"lsirq");
-	// lsirq renders an aligned column table (header + rows), like lsvol. The kernel's
-	// own fixed vector - the LAPIC timer (32) on x86, the EL1 physical-timer PPI (30)
-	// on aarch64, the S-mode timer (scause code 5) on riscv - appears as a `fixed` row
-	// (right-aligned vector in a width-6 column, two-space gutter, then the type).
-	let timer_row: &[u8] = if cfg!(target_arch = "aarch64") {
-		b"    30  fixed"
-	} else if cfg!(target_arch = "riscv64") {
-		b"     5  fixed"
-	} else {
-		b"    32  fixed"
-	};
-	assert!(contains(&lsirq, b"vector  type   bound  device  device-type"), "lsirq should print the aligned table header");
-	assert!(contains(&lsirq, timer_row), "lsirq should report the kernel timer's fixed vector as an aligned table row");
+	assert_dynamic_inventory_providers(b"lsmem", &["lsrt.lslib", "wire.lslib"]);
+	assert_dynamic_inventory_providers(b"lsirq", &["lsrt.lslib", "wire.lslib"]);
 
 	let lspci = run_inventory_tool(b"lspci");
 	assert!(contains(&lspci, b"1af4:") && contains(&lspci, b"(network controller)"), "lspci should report the retained bus scan with the virtio functions");

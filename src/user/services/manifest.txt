@@ -141,11 +141,11 @@ tool      stop       tools  volume
 tool      lsvol      tools  volume
 dynamic   uname      tools  volume lsrt
 dynamic   uptime     tools  volume lsrt
-tool      dmesg      tools  volume
+dynamic   dmesg      tools  volume lsrt
 dynamic   lscpu      tools  volume wire lsrt
 dynamic   free       tools  volume lsrt
-tool      lsmem      tools  volume
-tool      lsirq      tools  volume
+dynamic   lsmem      tools  volume wire lsrt
+dynamic   lsirq      tools  volume wire lsrt
 tool      lspci      tools  volume
 tool      lssvc      tools  volume
 tool      lsblk      tools  volume
