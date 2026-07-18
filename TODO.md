@@ -3833,7 +3833,12 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     public provider symbols, and an image-build gate rejects `ChannelClient`,
     `ChannelTransport`, `VecWriter` or private implementation imports in those production
     objects. The complete 36-provider/68-executable graph passes on x86_64, AArch64 and
-    RISC-V; the wider domain-client rollout and monolithic protocol-codec split remain open.
+    RISC-V. The focused x86_64 network/process runtime suite passes all 35 selected tests,
+    including dynamic load/order checks. The host runner now requires an explicit
+    kernel-emitted completion marker, so a premature successful QEMU exit cannot masquerade
+    as a green suite; its transparent-image smoke fixture uses the existing compact RGBA16
+    PNG instead of running an unrelated encoder on the kernel test stack. The wider
+    domain-client rollout and monolithic protocol-codec split remain open.
 - [ ] Migrate in measured, independently runnable waves:
   1. `echo`, `uname`, `uptime`, `dmesg`, `free`, `lscpu`, `lsmem`, `lsirq`, `lspci`,
      `ptyecho`, `readln`, `script`: `lsrt` plus only the domain/CLI leaves they use;

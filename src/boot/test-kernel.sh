@@ -51,4 +51,8 @@ if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
 	echo "[test-$ARCH] TIMEOUT after $LIMIT; last test: $last" >&2
 	exit 124
 fi
+if [[ "$status" -eq 0 ]] && ! grep -hEq '^test suite complete: [0-9]+ passed' "$RUN_LOG" "$GUEST_LOG"; then
+	echo "[test-$ARCH] INCOMPLETE: QEMU exited successfully without the test-suite completion marker" >&2
+	exit 1
+fi
 exit "$status"

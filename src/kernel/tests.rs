@@ -1235,6 +1235,7 @@ pub(crate) fn test_runner(tests: &[&dyn Testable]) {
 		for test in tests {
 			test.run();
 		}
+		serial_println!("test suite complete: {} passed", tests.len());
 		arch::exit_qemu(true);
 	};
 
@@ -1282,6 +1283,7 @@ pub(crate) fn test_runner(tests: &[&dyn Testable]) {
 			test.run();
 		}
 	}
+	serial_println!("test suite complete: {selected} passed");
 	arch::exit_qemu(true);
 }
 
@@ -6319,10 +6321,10 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	run_imgview_help_harness(imgview_elf, &mut system, &mut media);
 	run_imgview_harness(imgview_elf, b"vol://media/CROSS.BMP", &viewer_surface(&source), &mut system, &mut media);
 
-	let transparent = pix::RgbaImage::new(2, 2, alloc::vec![255, 0, 0, 128, 0, 255, 0, 255, 0, 0, 255, 0, 255, 255, 255, 64]).expect("transparent viewer fixture");
-	let transparent_png = png::encode_rgba(&transparent, png::EncodeOptions { compression: 100 }).expect("encode transparent viewer fixture");
+	let transparent_png = include_bytes!("../user/png/tests/data/external-rgba16.png");
+	let transparent = png::decode_rgba(transparent_png).expect("decode transparent viewer fixture");
 	let animation_webp = include_bytes!("../user/webp/tests/data/external-animation.webp");
-	let viewer_image = fat16_image(&[(*b"ALPHA   PNG", &transparent_png), (*b"ANIM    WEB", animation_webp)], false);
+	let viewer_image = fat16_image(&[(*b"ALPHA   PNG", transparent_png.as_slice()), (*b"ANIM    WEB", animation_webp)], false);
 	let mut viewer_media = StorageHarness::start(storage_elf, b"FATBLOCK", &viewer_image, viewer_image.len() as u64);
 	run_imgview_harness(imgview_elf, b"vol://media/ALPHA.PNG", &viewer_surface(&transparent), &mut system, &mut viewer_media);
 	let animation_first = webp::decode(animation_webp).expect("composited WebP frame 0");
