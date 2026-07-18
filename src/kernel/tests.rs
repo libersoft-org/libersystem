@@ -4735,6 +4735,15 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 		b"lssvc" as &[u8],
 		b"lsblk" as &[u8],
 		b"lsusb" as &[u8],
+		b"usage" as &[u8],
+		b"ps" as &[u8],
+		b"run" as &[u8],
+		b"perm" as &[u8],
+		b"stop" as &[u8],
+		b"beep" as &[u8],
+		b"readln" as &[u8],
+		b"ptyecho" as &[u8],
+		b"script" as &[u8],
 	]
 	.iter()
 	.enumerate()
@@ -4755,6 +4764,32 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 		drop(tool_bootstrap_kernel);
 		sched::run_until_idle();
 	}
+
+	let (readln_output, readln_console) = Channel::create();
+	let (readln_bootstrap_kernel, readln_bootstrap_user) = Channel::create();
+	let mut readln_launch = alloc::vec::Vec::new();
+	readln_launch.extend_from_slice(&3u16.to_le_bytes());
+	readln_launch.extend_from_slice(&59u32.to_le_bytes());
+	readln_launch.extend_from_slice(&6u16.to_le_bytes());
+	readln_launch.extend_from_slice(b"readln");
+	readln_launch.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&process_client, &readln_launch, readln_bootstrap_user, Rights::ALL).expect("dynamic readln launch request");
+	sched::run_until_idle();
+	let readln_reply = process_client.recv().expect("dynamic readln launch reply");
+	assert_eq!(le_u32(&readln_reply.bytes, 0), 59);
+	assert_eq!(readln_reply.bytes[4], 1, "dynamic readln loaded with lsrt");
+	send_cap(&readln_bootstrap_kernel, b"STDOUT", readln_console, Rights::ALL).expect("dynamic readln console bootstrap");
+	readln_bootstrap_kernel.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("dynamic readln arguments");
+	sched::run_until_idle();
+	readln_output.send(Message::new(b"hello\n".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic readln input");
+	sched::run_until_idle();
+	readln_output.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("dynamic readln EOF");
+	sched::run_until_idle();
+	let mut readln_captured = alloc::vec::Vec::new();
+	while let Ok(message) = readln_output.recv() {
+		readln_captured.extend_from_slice(&message.bytes);
+	}
+	assert!(readln_captured.windows(b"in> hello".len()).any(|window| window == b"in> hello"), "dynamic readln echoed cooked input");
 
 	for (tool, correlation) in [
 		(b"uname" as &[u8], 31u32),
@@ -5597,46 +5632,17 @@ fn pty_hosts_a_program() {
 
 tagged_test!(interactive_tool_reads_stdin, [Service, Shell, Console, Input]);
 fn interactive_tool_reads_stdin() {
-	use object::channel::{Channel, Message};
-	use object::rights::Rights;
-
-	// A foreground tool reads its standard input, not just prints: the shell hands a
-	// foreground child a full-duplex dup of its console (the controlling terminal), so the
-	// child reads cooked input lines back from the same channel it prints to. Here we stand
-	// in for the shell and drive a `readln` child - spawn it, hand it a console channel as its
-	// STDOUT (which `rt::inherit_stdout` adopts as stdin too), deliver a cooked line the way
-	// ConsoleService's line discipline would, and observe readln echo it back prefixed.
+	// The provider-aware ProcessService scenario above drives readln's full-duplex console
+	// behavior. Independently pin its staged graph here: raw-spawning an ET_DYN consumer
+	// without ProcessService would skip its provider resolution and is not a valid test path.
 	let init = init_package_bytes().expect("init package module not found");
 	let volume = volume_package_bytes().expect("volume package module not found");
 	let package = pkg::Package::parse(init).expect("init package parses");
 	let readln_elf = program_elf(&package, volume, b"readln").expect("readln in the package or volume");
-
-	// readln's bootstrap channel, and the console channel that is its stdout + stdin: the
-	// child holds one end (transferred as STDOUT), we keep the other and act as the terminal.
-	let (boot_kernel, boot_user) = Channel::create();
-	let (console_host, console_child) = Channel::create();
-
-	loader::spawn_elf_process(sched::root_domain(), readln_elf, boot_user, Rights::ALL, 0).expect("spawn readln");
-
-	// Hand the child the console as STDOUT (its `inherit_stdout` adopts it as stdin too),
-	// then an empty argv message - readln takes no arguments.
-	send_cap(&boot_kernel, b"STDOUT", console_child, Rights::ALL).expect("STDOUT bootstrap");
-	boot_kernel.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("argv bootstrap");
-	sched::run_until_idle();
-
-	// deliver one cooked input line (with its trailing newline, as the line discipline does),
-	// then end input (a zero-byte read is the tty's EOF) so readln echoes it and exits.
-	console_host.send(Message::new(b"hello\n".to_vec(), alloc::vec::Vec::new(), 0)).expect("write a line to the child's stdin");
-	sched::run_until_idle();
-	console_host.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("send EOF to the child");
-	sched::run_until_idle();
-
-	// readln echoes the line back on the same console, prefixed with "in> ".
-	let mut captured = alloc::vec::Vec::new();
-	while let Ok(msg) = console_host.recv() {
-		captured.extend_from_slice(&msg.bytes);
-	}
-	assert!(captured.windows(b"in> hello".len()).any(|w| w == b"in> hello"), "the foreground tool reads its stdin and echoes it back");
+	let elf = bootproto::elf::Elf::parse(readln_elf).expect("readln is ELF");
+	assert_eq!(elf.image_type, bootproto::elf::ET_DYN, "readln is staged as PIE");
+	let dynamic = elf.dynamic_info().expect("readln dynamic metadata parses").expect("readln has PT_DYNAMIC");
+	assert_eq!(elf.needed_names(&dynamic).expect("readln dependencies parse").collect::<alloc::vec::Vec<_>>(), alloc::vec!["lsrt.lslib"]);
 }
 
 tagged_test!(du_reports_a_directory_tree_size, [Service, Storage, Shell]);

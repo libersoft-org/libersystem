@@ -3620,6 +3620,17 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     loop validates staging, provider DAGs, relocation and start for the whole batch; one
     66-test QEMU selection validates it together with the owning Config, Log, Device,
     Storage and USB service contracts.
+  - Control/terminal batch result (2026-07-18): nine more consumers migrated together.
+    Generated-client tools use `proto + ipc-client + wire + lsrt`: `usage`
+    (13,200/13,744/13,792 bytes), `ps` (14,904/15,576/16,152), `run`
+    (7,704/8,104/8,688), `perm` (8,816/9,144/9,304) and `beep`
+    (7,000/7,408/7,840). Runtime-only consumers use just `lsrt`: `stop`
+    (5,408/5,792/6,856), `readln` (4,176/4,504/4,728), `ptyecho`
+    (3,496/3,536/3,744) and `script` (4,336/4,688/5,408), again ordered
+    x86_64/AArch64/RISC-V. One shared ProcessService loop validates the batch; dynamic
+    readln retains full-duplex stdin and the existing ConsoleService PTY scenario now loads
+    dynamic ptyecho. A 56-test QEMU selection validates these paths with Permission,
+    Resource, Audio, Console and Input service behavior.
     The remaining executable set is still open.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,

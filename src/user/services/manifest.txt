@@ -128,16 +128,16 @@ dynamic   volume     tools  volume proto ipc-client wire lsrt
 dynamic   lsdev      tools  volume proto ipc-client wire lsrt
 dynamic   config     tools  volume proto ipc-client wire lsrt
 dynamic   set        tools  volume proto ipc-client wire lsrt
-tool      beep       tools  volume
+dynamic   beep       tools  volume proto ipc-client wire lsrt
 tool      play       tools  volume
 tool      graphics_probe tools volume
 tool      imgview    tools  volume
 tool      imgconv    tools  volume
-tool      usage      tools  volume
-tool      ps         tools  volume
-tool      run        tools  volume
-tool      perm       tools  volume
-tool      stop       tools  volume
+dynamic   usage      tools  volume proto ipc-client wire lsrt
+dynamic   ps         tools  volume proto ipc-client wire lsrt
+dynamic   run        tools  volume proto ipc-client wire lsrt
+dynamic   perm       tools  volume proto ipc-client wire lsrt
+dynamic   stop       tools  volume lsrt
 dynamic   lsvol      tools  volume proto ipc-client wire lsrt
 dynamic   uname      tools  volume lsrt
 dynamic   uptime     tools  volume lsrt
@@ -159,6 +159,6 @@ tool      nc         tools  volume
 tool      arp        tools  volume
 tool      httpd      tools  volume
 tool      ss         tools  volume
-tool      script     tools  volume
-tool      ptyecho    tools  volume
-tool      readln     tools  volume
+dynamic   script     tools  volume lsrt
+dynamic   ptyecho    tools  volume lsrt
+dynamic   readln     tools  volume lsrt
