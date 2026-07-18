@@ -1323,6 +1323,16 @@ fn frame_alloc_distinct() {
 	mem::frame::deallocate(b);
 }
 
+tagged_test!(dynamic_symbol_names_accept_rust_mangling_with_a_bound, [Memory, Process]);
+fn dynamic_symbol_names_accept_rust_mangling_with_a_bound() {
+	let address_space = object::address_space::AddressSpace::create().expect("address space");
+	let process = object::process::Process::new(address_space, sched::root_domain());
+	let accepted = alloc::string::String::from_utf8(alloc::vec![b'x'; elf::MAX_DYNAMIC_SYMBOL_NAME]).expect("ASCII symbol");
+	assert!(process.register_dynamic_symbols(&[(accepted, 0x2000_1000)]), "the bounded Rust symbol is accepted");
+	let rejected = alloc::string::String::from_utf8(alloc::vec![b'y'; elf::MAX_DYNAMIC_SYMBOL_NAME + 1]).expect("ASCII symbol");
+	assert!(!process.register_dynamic_symbols(&[(rejected, 0x2000_2000)]), "an overlong symbol is rejected");
+}
+
 tagged_test!(elf_dyn_applies_relative_relocations_and_rejects_symbols, [Memory, Process]);
 fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 	use crate::elf::ElfError;
@@ -3973,10 +3983,22 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 		reply.caps.first().expect("playback-only connection").object().into_any_arc().downcast::<Channel>().expect("audio-stream grant is a channel")
 	}
 
-	fn launch_play(elf: &[u8], domain: alloc::sync::Arc<object::domain::Domain>, storage: alloc::sync::Arc<Channel>, audio: alloc::sync::Arc<Channel>, argument: &[u8]) -> (alloc::sync::Arc<Channel>, alloc::sync::Arc<object::process::Process>) {
+	fn launch_play(process_service: &Channel, storage: alloc::sync::Arc<Channel>, audio: alloc::sync::Arc<Channel>, argument: &[u8]) -> (alloc::sync::Arc<Channel>, alloc::sync::Arc<object::process::Process>) {
 		let (bootstrap, child) = Channel::create();
 		let (stdout, child_stdout) = Channel::create();
-		let process = loader::spawn_elf_process(domain, elf, child, Rights::ALL, 0).expect("spawn play");
+		let mut launch = alloc::vec::Vec::new();
+		launch.extend_from_slice(&4u16.to_le_bytes());
+		launch.extend_from_slice(&1u32.to_le_bytes());
+		launch.extend_from_slice(&4u16.to_le_bytes());
+		launch.extend_from_slice(b"play");
+		launch.extend_from_slice(&(128u64 * 1024 * 1024).to_le_bytes());
+		launch.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(process_service, &launch, child, Rights::ALL).expect("bounded play launch request");
+		sched::run_until_idle();
+		let reply = process_service.recv().expect("bounded play launch reply");
+		assert_eq!(le_u32(&reply.bytes, 0), 1);
+		assert_eq!(reply.bytes[4], 1, "dynamic play loaded with its providers");
+		let process = reply.caps[0].object().into_any_arc().downcast::<object::process::Process>().expect("play launch returns a Process");
 		send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("play stdout bootstrap");
 		bootstrap.send(Message::new(argument.to_vec(), alloc::vec::Vec::new(), 0)).expect("play argument bootstrap");
 		send_cap(&bootstrap, b"SYSTEM", storage, Rights::ALL).expect("play system volume bootstrap");
@@ -4029,16 +4051,22 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	let package = pkg::Package::parse(init).expect("init package parses");
 	let service_elf = program_elf(&package, volume, b"audio_service").expect("audio_service in the package or volume");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in init package");
-	let play_elf = program_elf(&package, volume, b"play").expect("play in the package or volume");
+	let process_elf = package.lookup(b"process_service.lsexe").expect("process_service.lsexe in init package");
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (storage_server, storage_client) = Channel::create();
+	let (process_boot_kernel, process_boot_user) = Channel::create();
+	let (process_server, process_client) = Channel::create();
 	let (boot_kernel, boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
 	let (snd_host, snd_service) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
+	loader::spawn_elf_process(sched::root_domain(), process_elf, process_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
 	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn AudioService");
 	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
+	send_package(&process_boot_kernel, init).expect("process package bootstrap");
+	send_cap(&process_boot_kernel, b"STORAGE", storage_client.clone(), Rights::ALL).expect("process storage bootstrap");
+	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
 	send_cap(&boot_kernel, b"SND", snd_service, Rights::ALL).expect("snd bootstrap");
 	let (audio_admin, admin) = Channel::create();
 	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("audio admin bootstrap");
@@ -4145,20 +4173,20 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	// first hardware period pending while Vorbis decodes and queues, then ACK it:
 	// the next period must contain the exact WAV+Vorbis sum, proving both governed
 	// decoder paths feed the shared M121 mixer rather than acquiring it exclusively.
-	let wav_domain = object::domain::Domain::new_child(&sched::root_domain(), object::domain::UNLIMITED, object::domain::UNLIMITED, object::domain::UNLIMITED);
 	let wav_scope = open_scope(&audio_admin, 40);
 	let wav_start = arch::tsc::now();
-	let (_wav_stdout, wav_process) = launch_play(play_elf, wav_domain.clone(), storage_client.clone(), wav_scope, b"vol://system/test.wav");
+	let (_wav_stdout, wav_process) = launch_play(&process_client, storage_client.clone(), wav_scope, b"vol://system/test.wav");
+	let wav_domain = wav_process.domain().clone();
 	sched::run_until_idle();
 	let first = snd_host.recv().expect("WAV first hardware period");
 	let first_sample_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(wav_start));
 	assert_eq!(first.bytes.len(), 2_048);
 	assert_eq!(sample(&first), 2, "WAV first source frame reaches hardware");
 
-	let vorbis_domain = object::domain::Domain::new_child(&sched::root_domain(), object::domain::UNLIMITED, object::domain::UNLIMITED, object::domain::UNLIMITED);
 	let vorbis_scope = open_scope(&audio_admin, 41);
 	let vorbis_start = arch::tsc::now();
-	let (_vorbis_stdout, vorbis_process) = launch_play(play_elf, vorbis_domain.clone(), storage_client.clone(), vorbis_scope, b"vol://system/test.ogg");
+	let (_vorbis_stdout, vorbis_process) = launch_play(&process_client, storage_client.clone(), vorbis_scope, b"vol://system/test.ogg");
+	let vorbis_domain = vorbis_process.domain().clone();
 	sched::run_until_idle();
 	let vorbis_queue_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(vorbis_start));
 	assert!(snd_host.recv().is_err(), "pending driver ACK holds the mixed period");
@@ -4206,8 +4234,7 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	// the process lets the pending write complete, then `play` observes the flag,
 	// explicitly closes, exits, and leaves only the already accepted bounded tail.
 	let interrupt_scope = open_scope(&audio_admin, 42);
-	let interrupt_domain = object::domain::Domain::new_child(&sched::root_domain(), object::domain::UNLIMITED, object::domain::UNLIMITED, object::domain::UNLIMITED);
-	let (_interrupt_stdout, interrupt_process) = launch_play(play_elf, interrupt_domain, storage_client.clone(), interrupt_scope, b"vol://system/test.wv");
+	let (_interrupt_stdout, interrupt_process) = launch_play(&process_client, storage_client.clone(), interrupt_scope, b"vol://system/test.wv");
 	sched::run_until_idle();
 	let mut current = snd_host.recv().expect("long player first period");
 	assert!(!current.bytes.is_empty());
@@ -4235,8 +4262,7 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	// MP3 is fully decoded before opening its stream: the debug decoder's burst latency
 	// must never empty the live queue and stretch playback with stop/restart gaps.
 	let mp3_scope = open_scope(&audio_admin, 43);
-	let mp3_domain = object::domain::Domain::new_child(&sched::root_domain(), object::domain::UNLIMITED, object::domain::UNLIMITED, object::domain::UNLIMITED);
-	let (_mp3_stdout, mp3_process) = launch_play(play_elf, mp3_domain, storage_client, mp3_scope, b"vol://system/test.mp3");
+	let (_mp3_stdout, mp3_process) = launch_play(&process_client, storage_client, mp3_scope, b"vol://system/test.mp3");
 	sched::run_until_idle();
 	let mut mp3_period = snd_host.recv().expect("MP3 first hardware period");
 	assert!(!mp3_period.bytes.is_empty(), "MP3 starts with an audio period");
@@ -4725,6 +4751,10 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	sched::run_until_idle();
 
 	for (index, tool) in [
+		b"play" as &[u8],
+		b"graphics_probe" as &[u8],
+		b"imgview" as &[u8],
+		b"imgconv" as &[u8],
 		b"config" as &[u8],
 		b"set" as &[u8],
 		b"log" as &[u8],
@@ -4768,7 +4798,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 		sched::run_until_idle();
 		let tool_reply = process_client.recv().expect("service-tool batch launch reply");
 		assert_eq!(le_u32(&tool_reply.bytes, 0), correlation);
-		assert_eq!(tool_reply.bytes[4], 1, "service-oriented PIE loaded with its manifest providers");
+		assert_eq!(tool_reply.bytes[4], 1, "service-oriented PIE {} loaded with its manifest providers", core::str::from_utf8(tool).unwrap_or("<invalid>"));
 		drop(tool_bootstrap_kernel);
 		sched::run_until_idle();
 	}
@@ -5290,7 +5320,7 @@ fn imgconv_writes_indexed_png_through_writable_storage() {
 
 	let (bootstrap, child) = Channel::create();
 	let (stdout, child_stdout) = Channel::create();
-	let process = loader::spawn_elf_process(sched::root_domain(), imgconv_elf, child, Rights::ALL, 0).expect("spawn imgconv.lsexe");
+	let process = spawn_dynamic_test_process(sched::root_domain(), imgconv_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("stdout bootstrap");
 	bootstrap.send(Message::new(b"--quality 100 --compression 100 vol://system/sample.bmp vol://system/converted.png".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv args");
 	send_cap(&bootstrap, b"SYSTEM", storage_client.clone(), Rights::ALL).expect("SYSTEM bootstrap");
@@ -5986,12 +6016,49 @@ fn storage_harness_mounts_seeded_fat16() {
 	assert_eq!(storage.open(b"vol://media/HELLO.TXT", 0xfa16), Some(b"hello".to_vec()));
 }
 
+fn spawn_dynamic_test_process(domain: alloc::sync::Arc<object::domain::Domain>, main: &[u8], bootstrap: alloc::sync::Arc<object::channel::Channel>) -> alloc::sync::Arc<object::process::Process> {
+	fn load(package: &pkg::Package<'_>, process: &object::process::Process, name: &str, loaded: &mut alloc::vec::Vec<alloc::string::String>, visiting: &mut alloc::vec::Vec<alloc::string::String>) {
+		if loaded.iter().any(|item| item == name) {
+			return;
+		}
+		assert!(!visiting.iter().any(|item| item == name), "dynamic test provider cycle");
+		visiting.push(alloc::string::String::from(name));
+		let path = alloc::format!("lib/{name}");
+		let bytes = package.lookup(path.as_bytes()).expect("dynamic test provider is staged");
+		let elf = bootproto::elf::Elf::parse(bytes).expect("dynamic test provider is ELF");
+		let dynamic = elf.dynamic_info().expect("provider dynamic metadata parses").expect("provider has PT_DYNAMIC");
+		for dependency in elf.needed_names(&dynamic).expect("provider dependencies parse") {
+			load(package, process, dependency, loaded, visiting);
+		}
+		let bias = 0x2000_0000 + loaded.len() as u64 * 0x0100_0000;
+		loader::load_module_into(process, bytes, bias).expect("load dynamic test provider");
+		visiting.pop();
+		loaded.push(alloc::string::String::from(name));
+	}
+
+	let volume = volume_package_bytes().expect("volume package present");
+	let package = pkg::Package::parse(volume).expect("volume package parses");
+	let process = object::process::Process::new(object::address_space::AddressSpace::create().expect("dynamic test address space"), domain);
+	let elf = bootproto::elf::Elf::parse(main).expect("dynamic test main is ELF");
+	let dynamic = elf.dynamic_info().expect("main dynamic metadata parses").expect("main has PT_DYNAMIC");
+	let mut loaded = alloc::vec::Vec::new();
+	let mut visiting = alloc::vec::Vec::new();
+	for dependency in elf.needed_names(&dynamic).expect("main dependencies parse") {
+		load(&package, &process, dependency, &mut loaded, &mut visiting);
+	}
+	let entry = loader::load_image_into(&process, main).expect("load dynamic test main");
+	let bootstrap = process.install(bootstrap, object::rights::Rights::ALL, 0);
+	let thread = loader::create_user_thread(&process, entry, memlayout::USER_STACK_TOP, bootstrap).expect("create dynamic test thread");
+	assert!(sched::thread_start(thread), "start dynamic test thread");
+	process
+}
+
 fn run_imgconv_harness_result(domain: alloc::sync::Arc<object::domain::Domain>, imgconv_elf: &[u8], args: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) -> (Option<alloc::vec::Vec<u8>>, u64) {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 	let (bootstrap, child) = Channel::create();
 	let (stdout, child_stdout) = Channel::create();
-	let process = loader::spawn_elf_process(domain.clone(), imgconv_elf, child, Rights::ALL, 0).expect("spawn imgconv harness");
+	let process = spawn_dynamic_test_process(domain.clone(), imgconv_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgconv stdout");
 	bootstrap.send(Message::new(args.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgconv system volume");
@@ -6039,7 +6106,7 @@ fn run_imgview_help_harness(imgview_elf: &[u8], system: &mut StorageHarness, med
 	use object::rights::Rights;
 	let (bootstrap, child) = Channel::create();
 	let (stdout, child_stdout) = Channel::create();
-	let process = loader::spawn_elf_process(sched::root_domain(), imgview_elf, child, Rights::ALL, 0).expect("spawn imgview help harness");
+	let process = spawn_dynamic_test_process(sched::root_domain(), imgview_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgview help stdout");
 	bootstrap.send(Message::new(b"--help".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview help system volume");
@@ -6074,7 +6141,7 @@ fn run_imgview_harness(imgview_elf: &[u8], path: &[u8], expected: &[u8], system:
 	let (_stdout, child_stdout) = Channel::create();
 	let (display, display_client) = Channel::create();
 	let (input, input_client) = Channel::create();
-	let process = loader::spawn_elf_process(sched::root_domain(), imgview_elf, child, Rights::ALL, 0).expect("spawn imgview harness");
+	let process = spawn_dynamic_test_process(sched::root_domain(), imgview_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgview stdout");
 	bootstrap.send(Message::new(path.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview system volume");

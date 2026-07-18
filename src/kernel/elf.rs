@@ -25,6 +25,7 @@ const DYNAMIC_MODULE_SLOT_SIZE: u64 = 0x0100_0000;
 const MAX_DYNAMIC_MODULES: u64 = 64;
 const MAX_SHARED_CACHE_KEYS: usize = 16_384;
 const MAX_HASH_COLLISIONS: usize = 8;
+pub const MAX_DYNAMIC_SYMBOL_NAME: usize = 512;
 
 pub struct SharedPage {
 	frame: u64,
@@ -309,7 +310,7 @@ fn collect_exports(image: &bootproto::elf::Elf<'_>, loaded: &[LoadedSegment], bi
 		if !symbol.is_defined() || !matches!(symbol.binding(), 1 | 2) || !matches!(symbol.symbol_type(), 0..=2) || !matches!(symbol.visibility(), 0 | 3) || name.is_empty() {
 			continue;
 		}
-		if name.len() > 255 || exports.len() >= 65_536 {
+		if name.len() > MAX_DYNAMIC_SYMBOL_NAME || exports.len() >= 65_536 {
 			return Err(ElfError::BadImage);
 		}
 		let address = bias.checked_add(symbol.value).ok_or(ElfError::BadImage)?;

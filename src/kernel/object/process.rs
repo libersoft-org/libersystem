@@ -138,7 +138,7 @@ impl Process {
 
 	pub fn register_dynamic_symbols(&self, symbols: &[(String, u64)]) -> bool {
 		let mut registry = self.dynamic_symbols.lock();
-		if registry.len().checked_add(symbols.len()).is_none_or(|len| len > 65_536) || symbols.iter().any(|(name, _)| name.is_empty() || name.len() > 255 || registry.contains_key(name)) {
+		if registry.len().checked_add(symbols.len()).is_none_or(|len| len > 65_536) || symbols.iter().any(|(name, _)| name.is_empty() || name.len() > crate::elf::MAX_DYNAMIC_SYMBOL_NAME || registry.contains_key(name)) {
 			return false;
 		}
 		for (name, address) in symbols {

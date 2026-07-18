@@ -49,7 +49,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Closed => Vec::new(),
 		};
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
-		let arg = tools::trim(&arg);
+		let arg = trim(&arg);
 		if arg == b"--help" {
 			print(USAGE);
 			close_if_present(display_channel);
@@ -83,6 +83,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		close(display_channel);
 	}
 	exit();
+}
+
+fn trim(mut bytes: &[u8]) -> &[u8] {
+	while bytes.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
+		bytes = &bytes[1..];
+	}
+	while bytes.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
+		bytes = &bytes[..bytes.len() - 1];
+	}
+	bytes
 }
 
 unsafe fn close_if_present(handle: u64) {

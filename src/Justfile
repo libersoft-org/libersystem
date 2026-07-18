@@ -73,13 +73,13 @@ default: run
 
 # build the first system-image shared-object pilot
 shared-libs:
-	tools/build-shared.sh x86_64-unknown-none lsrt=rt wire=wire ipc-client=ipc-client proto=proto pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack
+	tools/build-shared.sh x86_64-unknown-none lsrt=rt wire=wire ipc-client=ipc-client proto=proto pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface imgconv=imgconv adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack
 
 shared-libs-aarch64:
-	tools/build-shared.sh aarch64-unknown-none lsrt=rt wire=wire ipc-client=ipc-client proto=proto pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack
+	tools/build-shared.sh aarch64-unknown-none lsrt=rt wire=wire ipc-client=ipc-client proto=proto pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface imgconv=imgconv adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack
 
 shared-libs-riscv64:
-	tools/build-shared.sh riscv64gc-unknown-none-elf lsrt=rt wire=wire ipc-client=ipc-client proto=proto pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack
+	tools/build-shared.sh riscv64gc-unknown-none-elf lsrt=rt wire=wire ipc-client=ipc-client proto=proto pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface imgconv=imgconv adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack
 
 # build the userspace programs that make up the init package
 user: shared-libs

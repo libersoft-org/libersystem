@@ -103,6 +103,7 @@ library   webp                  webp   volume
 library   keys                  keys   volume
 library   pcm                   pcm    volume
 library   surface               surface volume
+library   imgconv               imgconv volume
 library   adpcm                 adpcm  volume
 library   aiff                  aiff   volume
 library   flac                  flac   volume
@@ -129,10 +130,10 @@ dynamic   lsdev      tools  volume proto ipc-client wire lsrt
 dynamic   config     tools  volume proto ipc-client wire lsrt
 dynamic   set        tools  volume proto ipc-client wire lsrt
 dynamic   beep       tools  volume proto ipc-client wire lsrt
-tool      play       tools  volume
-tool      graphics_probe tools volume
-tool      imgview    tools  volume
-tool      imgconv    tools  volume
+dynamic   play       tools  volume aiff flac mp3 vorbis wav wavpack proto ipc-client wire lsrt
+dynamic   graphics_probe tools volume lsrt
+dynamic   imgview    tools  volume imgconv pix surface proto ipc-client wire lsrt
+dynamic   imgconv    tools  volume imgconv proto ipc-client wire lsrt
 dynamic   usage      tools  volume proto ipc-client wire lsrt
 dynamic   ps         tools  volume proto ipc-client wire lsrt
 dynamic   run        tools  volume proto ipc-client wire lsrt

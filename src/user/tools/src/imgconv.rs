@@ -33,7 +33,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Closed => Vec::new(),
 		};
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
-		if tools::trim(&args) == b"--help" {
+		if trim(&args) == b"--help" {
 			print(imgconv::help_text().as_bytes());
 			exit();
 		}
@@ -85,15 +85,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut line = String::from("imgconv: ");
 		line.push_str(info.input_format.name());
 		line.push(' ');
-		tools::push_decimal(&mut line, info.source_width as u64);
+		push_decimal(&mut line, info.source_width as u64);
 		line.push('x');
-		tools::push_decimal(&mut line, info.source_height as u64);
+		push_decimal(&mut line, info.source_height as u64);
 		line.push_str(" -> ");
 		line.push_str(info.output_format.name());
 		line.push(' ');
-		tools::push_decimal(&mut line, info.output_width as u64);
+		push_decimal(&mut line, info.output_width as u64);
 		line.push('x');
-		tools::push_decimal(&mut line, info.output_height as u64);
+		push_decimal(&mut line, info.output_height as u64);
 		if let Some(mode) = info.mode {
 			line.push_str(match mode {
 				imgconv::Mode::Lossless => " mode=lossless",
@@ -102,18 +102,45 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		if let Some(quality) = info.quality {
 			line.push_str(" quality=");
-			tools::push_decimal(&mut line, quality as u64);
+			push_decimal(&mut line, quality as u64);
 		}
 		if let Some(compression) = info.compression {
 			line.push_str(" compression=");
-			tools::push_decimal(&mut line, compression as u64);
+			push_decimal(&mut line, compression as u64);
 		}
 		line.push_str(" bytes=");
-		tools::push_decimal(&mut line, info.output_bytes as u64);
+		push_decimal(&mut line, info.output_bytes as u64);
 		line.push_str(" metadata=stripped\n");
 		print(line.as_bytes());
 	}
 	exit();
+}
+
+fn trim(mut bytes: &[u8]) -> &[u8] {
+	while bytes.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
+		bytes = &bytes[1..];
+	}
+	while bytes.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
+		bytes = &bytes[..bytes.len() - 1];
+	}
+	bytes
+}
+
+fn push_decimal(out: &mut String, value: u64) {
+	let mut digits = [0u8; 20];
+	let mut value = value;
+	let mut len = 0;
+	loop {
+		digits[len] = b'0' + (value % 10) as u8;
+		value /= 10;
+		len += 1;
+		if value == 0 {
+			break;
+		}
+	}
+	for index in (0..len).rev() {
+		out.push(digits[index] as char);
+	}
 }
 
 unsafe fn read_file(storage: u64, uri: &str) -> Option<Vec<u8>> {

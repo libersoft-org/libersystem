@@ -159,7 +159,7 @@ for spec in "$@"; do
 			(cd "$object_root/$archive_name" && llvm-ar x "$archive_path")
 		done
 		while IFS= read -r -d '' object; do
-			llvm-objcopy --set-symbol-visibility=memcpy=default --set-symbol-visibility=memmove=default --set-symbol-visibility=memset=default --set-symbol-visibility=memcmp=default --set-symbol-visibility=__udivti3=default "$object"
+			llvm-objcopy --set-symbol-visibility=memcpy=default --set-symbol-visibility=memmove=default --set-symbol-visibility=memset=default --set-symbol-visibility=memcmp=default --set-symbol-visibility=__udivti3=default --set-symbol-visibility=__umodti3=default "$object"
 			link_inputs+=("$object")
 		done < <(find "$object_root" -name '*.o' -print0)
 	else
@@ -258,6 +258,9 @@ for spec in "$@"; do
 	surface)
 		link_deps=("$(library_file proto)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
+	imgconv)
+		link_deps=("$(library_file apng)" "$(library_file bmp)" "$(library_file gif)" "$(library_file icns)" "$(library_file ico)" "$(library_file jpeg)" "$(library_file pcx)" "$(library_file png)" "$(library_file ppm)" "$(library_file qoi)" "$(library_file tga)" "$(library_file webp)" "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined)
+		;;
 	aiff | flac | wavpack)
 		link_deps=("$(library_file pcm)" "$(library_file lsrt)" --no-allow-shlib-undefined)
 		;;
@@ -319,10 +322,12 @@ for spec in "$@"; do
 			echo "build-shared: lsrt allocator shim alias is not one function" >&2
 			exit 1
 		fi
-		if [[ "$(llvm-readelf --wide --dyn-syms "$out" | awk '$7 != "UND" && $8 == "__udivti3" {count++} END {print count+0}')" != 1 ]]; then
-			echo "build-shared: lsrt does not export exactly one __udivti3 compiler intrinsic" >&2
-			exit 1
-		fi
+		for intrinsic in __udivti3 __umodti3; do
+			if [[ "$(llvm-readelf --wide --dyn-syms "$out" | awk -v symbol="$intrinsic" '$7 != "UND" && $8 == symbol {count++} END {print count+0}')" != 1 ]]; then
+				echo "build-shared: lsrt does not export exactly one $intrinsic compiler intrinsic" >&2
+				exit 1
+			fi
+		done
 	fi
 	if ! llvm-readelf -h "$out" | grep -q 'Type:.*DYN'; then
 		echo "build-shared: $out is not ET_DYN" >&2
@@ -342,6 +347,13 @@ if [[ -n "$image_graph" ]]; then
 	start_obj="$root/boot/.build/exe-start-$target.o"
 	"$root/tools/build-exe-start.sh" "$target" "$start_obj"
 	dynamic_rows="$(awk '$1 == "dynamic" && $3 == "tools" && $4 == "volume" {print}' "$root/user/services/manifest.txt" | sort -k2,2)"
+	manifest_tools="$(awk '{print $2}' <<<"$dynamic_rows")"
+	cargo_tools="$(cd "$root/user/tools" && cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tools") | .targets[] | select(.kind == ["bin"]) | .name' | sort)"
+	if [[ "$manifest_tools" != "$cargo_tools" ]]; then
+		echo "build-shared: tools-package bins differ from dynamic volume manifest rows" >&2
+		diff -u <(printf '%s\n' "$cargo_tools") <(printf '%s\n' "$manifest_tools") >&2 || true
+		exit 1
+	fi
 	duplicate_consumer="$(awk '{print $2}' <<<"$dynamic_rows" | uniq -d | head -n1)"
 	if [[ -n "$duplicate_consumer" ]]; then
 		echo "build-shared: duplicate dynamic executable $duplicate_consumer" >&2

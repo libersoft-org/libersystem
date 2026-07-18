@@ -3561,7 +3561,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     register, passes `__user_main`, and contains no runtime implementation. All three
     targets link an ordinary echo PIE, and the x86 ProcessService QEMU gate launches the
     staged image through `lsrt.lslib` and observes its stdout output.
-- [ ] Generalize `tools/build-shared.sh` into a manifest-driven system image linker that
+- [x] Generalize `tools/build-shared.sh` into a manifest-driven system image linker that
   builds both `.lslib` providers and `.lsexe` consumers. For each tool, ask rustc for
   release PIC objects without using Cargo's final static executable link, then invoke
   `rust-lld -pie --no-dynamic-linker` with the generated start object and only the direct
@@ -3642,7 +3642,18 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     weak function `__udivti3` rather than duplicating it in the consumer. One shared
     ProcessService gate validates the entire batch and one 56-test QEMU selection covers it
     with the owning NetworkService ICMP, DNS, ARP, socket, TCP and listener behavior.
-    The remaining executable set is still open.
+  - Final tools-package result (2026-07-18): all 48 Cargo bin targets are manifest-driven
+    PIE consumers on all three architectures. Cargo metadata must exactly equal the sorted
+    `dynamic tools volume` manifest rows, so adding, omitting or reverting a command to the
+    static path fails image construction. The final multimedia wave added `imgconv.lslib`
+    as a 33,480/35,840/41,048-byte codec aggregator over existing atomized leaves and moved
+    `play` (24,616/25,240/25,952), `graphics_probe` (3,424/3,536/3,904), `imgview`
+    (14,088/14,472/15,808) and `imgconv` (16,512/17,512/20,744) to PIE. Dynamic play keeps
+    WAV/Vorbis/WavPack/MP3 mixing, interruption and memory-peak coverage; provider-aware
+    image harnesses retain conversion, viewer and quota coverage. Vorbis required the
+    compiler-owned weak `__umodti3` export alongside `__udivti3`. JPEG's legitimate
+    345-byte Rust v0 symbol raised the bounded runtime registry limit to 512 bytes, with
+    an executable boundary test. No package-local `tools` symbols remain in these consumers.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,
   crate/source owner, output class/path, direct providers and build-feature set; each

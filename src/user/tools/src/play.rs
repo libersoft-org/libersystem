@@ -91,7 +91,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Closed => Vec::new(),
 		};
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
-		let arg = tools::trim(&arg);
+		let arg = trim(&arg);
 		let Some(uri) = path::resolve(cwd, arg) else {
 			print(b"play: invalid path\n");
 			exit();
@@ -111,6 +111,33 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 	exit();
+}
+
+fn trim(mut bytes: &[u8]) -> &[u8] {
+	while bytes.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
+		bytes = &bytes[1..];
+	}
+	while bytes.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
+		bytes = &bytes[..bytes.len() - 1];
+	}
+	bytes
+}
+
+fn push_decimal(out: &mut String, value: u64) {
+	let mut digits = [0u8; 20];
+	let mut value = value;
+	let mut len = 0;
+	loop {
+		digits[len] = b'0' + (value % 10) as u8;
+		value /= 10;
+		len += 1;
+		if value == 0 {
+			break;
+		}
+	}
+	for index in (0..len).rev() {
+		out.push(digits[index] as char);
+	}
 }
 
 unsafe fn play_audio(audio_channel: u64, bytes: &[u8]) -> Result<(), ()> {
@@ -250,11 +277,11 @@ fn print_metadata(container: &str, rate: u32, channels: u8, frames: u64) {
 	let mut line = String::from("play: ");
 	line.push_str(container);
 	line.push(' ');
-	tools::push_decimal(&mut line, rate as u64);
+	push_decimal(&mut line, rate as u64);
 	line.push_str(" Hz, ");
-	tools::push_decimal(&mut line, channels as u64);
+	push_decimal(&mut line, channels as u64);
 	line.push_str(if channels == 1 { " channel, " } else { " channels, " });
-	tools::push_decimal(&mut line, frames);
+	push_decimal(&mut line, frames);
 	line.push_str(" frames\n");
 	unsafe { print(line.as_bytes()) };
 }
