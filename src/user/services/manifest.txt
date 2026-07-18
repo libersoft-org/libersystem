@@ -6,12 +6,12 @@
 # code - the runtime table and the staging lists can no longer drift apart.
 #
 # columns: kind  name  crate  stage  [policy/features/providers...]
-#   kind : launcher | service | instance | probe | driver | tool | dynamic | component
+#   kind : launcher | service | instance | probe | driver | tool | dynamic
 #          - service : a managed service with its own ELF (ServiceManager supervises it)
 #          - instance: a managed service backed by another program's ELF (no own binary)
 #          - launcher: spawned from the init package, not supervised as a managed service
 #          - probe   : a self-test helper spawned by the supervisor
-#          - driver / tool / component: statically linked staged programs
+#          - driver / tool: statically linked staged programs pending migration
 #          - dynamic: staged ET_DYN programs built by the system-image linker
 #   crate: crate directory under src/user (or '-' for an instance with no own ELF)
 #   stage: pinned (kept in init.pkg) | volume (staged on the system volume) | none
@@ -58,13 +58,7 @@ launcher  service_manager       services        pinned
 probe     watchdog_probe        services  pinned
 probe     resource_probe        services  pinned
 
-# demo and host components - loaded from the system volume by the managed services.
-component sandbox_probe         services  volume
-component request_probe         services  volume
-component wasi_host             services  volume
-component component_host        services  volume
-component file_picker           services  volume
-component storage_client        storage   volume
+# Demo and host components are manifest-driven PIE consumers listed below the providers.
 
 # drivers - the bootstrap block driver backs the system volume, so it ships in the init
 # package; every other driver loads from the volume under drivers/.
@@ -113,7 +107,14 @@ library   ogg                   ogg        volume -            lsrt
 library   vorbis                vorbis     volume -            ogg pcm lsrt
 library   wav                   wav        volume -            adpcm pcm lsrt
 library   wavpack               wavpack    volume -            pcm lsrt
+library   wasm                  wasm       volume -            lsrt
 dynamic   dyn_probe             dyn_probe volume pix proto lsrt
+dynamic   sandbox_probe         services  volume proto ipc-client wire lsrt
+dynamic   request_probe         services  volume proto ipc-client wire lsrt
+dynamic   wasi_host             services  volume wasm proto ipc-client wire lsrt
+dynamic   component_host        services  volume wasm proto ipc-client wire lsrt
+dynamic   file_picker           services  volume proto ipc-client wire lsrt
+dynamic   storage_client        storage   volume proto ipc-client wire lsrt
 
 # command-line tools - loaded from the system volume under bin/.
 dynamic   date       tools  volume proto ipc-client wire lsrt

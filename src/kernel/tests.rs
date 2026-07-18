@@ -127,7 +127,7 @@ fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), 
 	// spawn the two processes with their bootstrap endpoints
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), service_elf, service_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
-	loader::spawn_elf_process(domain, client_elf, client_boot_user, Rights::ALL, 0).map_err(|_| "failed to load the storage client")?;
+	let _client = spawn_dynamic_test_process(domain, client_elf, client_boot_user);
 
 	// hand the service its ramdisk (with the volume length) and its service
 	// endpoint, then hand the client the other end of that service channel.
@@ -164,7 +164,7 @@ fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'s
 
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
-	loader::spawn_elf_process(domain, host_elf, host_boot_user, Rights::ALL, 0).map_err(|_| "failed to load wasi_host")?;
+	let _host = spawn_dynamic_test_process(domain, host_elf, host_boot_user);
 
 	// storage bootstrap: the ramdisk volume and its service channel; the host gets
 	// only the StorageService client - the one capability it is granted.
@@ -206,8 +206,8 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
-	loader::spawn_elf_process(domain.clone(), picker_elf, picker_boot_user, Rights::ALL, 0).map_err(|_| "failed to load file_picker")?;
-	loader::spawn_elf_process(domain, host_elf, host_boot_user, Rights::ALL, 0).map_err(|_| "failed to load wasi_host")?;
+	let _picker = spawn_dynamic_test_process(domain.clone(), picker_elf, picker_boot_user);
+	let _host = spawn_dynamic_test_process(domain, host_elf, host_boot_user);
 
 	// StorageService: the ramdisk volume and its service channel. file_picker: the
 	// trusted StorageService client and its own service channel. wasi_host: only the
@@ -816,7 +816,7 @@ fn run_component_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>,
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
 	loader::spawn_elf_process(domain.clone(), log_elf, log_boot_user, Rights::ALL, 0).map_err(|_| "failed to load LogService")?;
-	loader::spawn_elf_process(domain, host_elf, host_boot_user, Rights::ALL, 0).map_err(|_| "failed to load component_host")?;
+	let _host = spawn_dynamic_test_process(domain, host_elf, host_boot_user);
 
 	// StorageService: the ramdisk volume and its service channel. LogService: its
 	// service channel. component_host: the StorageService client, then the LogService
@@ -4621,8 +4621,8 @@ fn system_packages_use_canonical_executable_names() {
 		library_identities += usize::from(name.starts_with(b"identity/lib/"));
 		executable_identities += usize::from(name.starts_with(b"identity/bin/"));
 	}
-	assert_eq!(library_identities, 32, "every staged library has one identity record");
-	assert_eq!(executable_identities, 49, "every staged dynamic executable has one identity record");
+	assert_eq!(library_identities, 33, "every staged library has one identity record");
+	assert_eq!(executable_identities, 55, "every staged dynamic executable has one identity record");
 	assert!(volume.lookup(b"identity/lib/imgconv").is_some(), "library identity namespace preserves imgconv");
 	assert!(volume.lookup(b"identity/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");
 }

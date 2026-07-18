@@ -8,6 +8,10 @@ edition = "2024"
 build = "../build.rs"
 description = "Core userspace system services (ServiceManager, ...)"
 
+[features]
+default = []
+shared-image = ["ipc-client/shared-image", "rt/shared-image"]
+
 [[bin]]
 name = "service_manager"
 path = "src/service_manager.rs"

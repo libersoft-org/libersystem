@@ -8,6 +8,10 @@ edition = "2024"
 build = "../build.rs"
 description = "StorageService service and demo client"
 
+[features]
+default = []
+shared-image = ["ipc-client/shared-image", "rt/shared-image"]
+
 [[bin]]
 name = "storage_service"
 path = "src/service.rs"

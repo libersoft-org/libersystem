@@ -3541,7 +3541,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     final-link failure is pinned to the duplicate allocator shims after an exact-path
     `ET_REL` seed exists; any other failure aborts construction. The complete provider
     graph and its consumers link on all three architectures.
-  - Identity result (2026-07-18): all 32 providers and 49 dynamic executables emit one
+  - Identity result (2026-07-18): all 33 providers and 55 dynamic executables emit one
     canonical `liber-image-identity-v1` record containing artifact/package identity, a
     sorted source-tree SHA-256, the image rustc commit, target, release profile, exact
     codegen flags, feature set and sorted direct-provider record digests. Each ELF embeds
@@ -3550,9 +3550,20 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     structure, one image-wide toolchain identity rooted at `lsrt`, target/profile/flags,
     the complete provider digest chain and byte-exact note equality before staging records
     under collision-free `identity/lib/` and `identity/bin/` paths. A complete x86 rebuild
-    reproduced the aggregate hash of all 81 records exactly; x86_64, AArch64 and RISC-V
-    each produce and package 81 records plus 81 notes. The 35-test process suite and
-    21-test boot/storage suite pass with the identity-bearing graph.
+    reproduced the aggregate hash of the original 81-record tool graph exactly; after the
+    component migration, x86_64, AArch64 and RISC-V each produce and package 88 records
+    plus 88 notes. The process, boot/storage and broad service integration suites pass
+    with the identity-bearing graph.
+  - Component result (2026-07-18): all six volume components are now manifest-driven PIE:
+    `sandbox_probe` (8,208/8,000/8,192 bytes), `request_probe` (6,152/6,168/6,536),
+    `wasi_host` (9,968/10,088/10,384), `component_host` (14,856/14,912/15,512),
+    `file_picker` (8,992/10,024/9,520) and `storage_client` (6,608/6,808/6,944).
+    A new atomized `wasm.lslib` provider is 97,736/83,896/102,992 bytes. The image
+    builder owns one additional services/wasm Cargo seed, links every non-probe dynamic
+    manifest row through the same ELF/import/identity/order gates, and rejects legacy
+    volume `component` rows. Provider-aware test loading preserves storage client, WASI,
+    picker, permission and SDK component behavior; one 60-test service/process/storage
+    QEMU selection passes.
 - [x] Add a tiny generated executable-start object per architecture, not a static runtime
   archive in every program. It exports `_start`, aligns/initializes the ABI-required
   registers, performs the native ABI revision check through `lsrt`, and calls the tool's

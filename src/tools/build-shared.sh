@@ -57,6 +57,7 @@ library_file() {
 	lsrt) printf 'user/rt/shared/%s/lsrt.lslib' "$target" ;;
 	proto) printf 'proto/shared/%s/proto.lslib' "$target" ;;
 	wire) printf 'wire/shared/%s/wire.lslib' "$target" ;;
+	wasm) printf 'wasm/shared/%s/wasm.lslib' "$target" ;;
 	*) printf 'user/%s/shared/%s/%s.lslib' "$1" "$target" "$1" ;;
 	esac
 }
@@ -134,6 +135,10 @@ if [[ "$requested_specs" != "$manifest_specs" ]]; then
 	diff -u <(printf '%s\n' "$manifest_specs") <(printf '%s\n' "$requested_specs") >&2 || true
 	exit 1
 fi
+if awk '$1 == "component" && $4 == "volume" {found=1} END {exit !found}' "$root/user/services/manifest.txt"; then
+	echo "build-shared: volume components must use dynamic manifest rows" >&2
+	exit 1
+fi
 
 image_graph=""
 if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
@@ -156,6 +161,24 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 	fi
 	if ! grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$image_graph_errors" || ! grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$image_graph_errors"; then
 		echo "build-shared: Cargo image graph failed outside the expected final-link shim boundary" >&2
+		exit 1
+	fi
+	service_seed="$root/boot/.build/image-services-seed-$target.o"
+	service_seed_errors="$root/boot/.build/image-services-seed-$target.stderr"
+	rm -f "$service_seed"
+	set +e
+	(
+		cd "$root/user/services"
+		CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --release --target "$cargo_target" --bin component_host --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$service_seed"
+	) >>"$image_graph" 2>"$service_seed_errors"
+	service_seed_status=$?
+	set -e
+	if [[ "$service_seed_status" != 101 || ! -f "$service_seed" ]] || ! llvm-readelf -h "$service_seed" | grep -q 'Type:.*REL'; then
+		echo "build-shared: services image graph did not stop after emitting its ET_REL seed object" >&2
+		exit 1
+	fi
+	if ! grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$service_seed_errors" || ! grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$service_seed_errors"; then
+		echo "build-shared: services image graph failed outside the expected final-link shim boundary" >&2
 		exit 1
 	fi
 fi
@@ -251,7 +274,7 @@ for spec in "$@"; do
 		exit 1
 	fi
 	case "$crate" in
-	proto | wire) crate_dir="$crate" ;;
+	proto | wire | wasm) crate_dir="$crate" ;;
 	*) crate_dir="user/$crate" ;;
 	esac
 	manifest="$crate_dir/Cargo.toml"
@@ -506,8 +529,8 @@ done
 if [[ -n "$image_graph" ]]; then
 	start_obj="$root/boot/.build/exe-start-$target.o"
 	"$root/tools/build-exe-start.sh" "$target" "$start_obj"
-	dynamic_rows="$(awk '$1 == "dynamic" && $3 == "tools" && $4 == "volume" {print}' "$root/user/services/manifest.txt" | sort -k2,2)"
-	manifest_tools="$(awk '{print $2}' <<<"$dynamic_rows")"
+	dynamic_rows="$(awk '$1 == "dynamic" && $2 != "dyn_probe" && $4 == "volume" {print}' "$root/user/services/manifest.txt" | sort -k2,2)"
+	manifest_tools="$(awk '$3 == "tools" {print $2}' <<<"$dynamic_rows")"
 	cargo_tools="$(cd "$root/user/tools" && cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tools") | .targets[] | select(.kind == ["bin"]) | .name' | sort)"
 	if [[ "$manifest_tools" != "$cargo_tools" ]]; then
 		echo "build-shared: tools-package bins differ from dynamic volume manifest rows" >&2
@@ -520,7 +543,7 @@ if [[ -n "$image_graph" ]]; then
 		exit 1
 	fi
 	while read -r kind consumer crate stage providers; do
-		if [[ "$kind" != dynamic || "$crate" != tools || "$stage" != volume ]]; then
+		if [[ "$kind" != dynamic || "$stage" != volume ]]; then
 			continue
 		fi
 		if [[ -z "$providers" ]]; then
