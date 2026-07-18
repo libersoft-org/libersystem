@@ -4724,6 +4724,38 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	drop(date_bootstrap_kernel);
 	sched::run_until_idle();
 
+	for (index, tool) in [
+		b"config" as &[u8],
+		b"set" as &[u8],
+		b"log" as &[u8],
+		b"snap" as &[u8],
+		b"volume" as &[u8],
+		b"lsdev" as &[u8],
+		b"lsvol" as &[u8],
+		b"lssvc" as &[u8],
+		b"lsblk" as &[u8],
+		b"lsusb" as &[u8],
+	]
+	.iter()
+	.enumerate()
+	{
+		let correlation = 40 + index as u32;
+		let (tool_bootstrap_kernel, tool_bootstrap_user) = Channel::create();
+		let mut tool_launch = alloc::vec::Vec::new();
+		tool_launch.extend_from_slice(&3u16.to_le_bytes());
+		tool_launch.extend_from_slice(&correlation.to_le_bytes());
+		tool_launch.extend_from_slice(&(tool.len() as u16).to_le_bytes());
+		tool_launch.extend_from_slice(tool);
+		tool_launch.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&process_client, &tool_launch, tool_bootstrap_user, Rights::ALL).expect("service-tool batch launch request");
+		sched::run_until_idle();
+		let tool_reply = process_client.recv().expect("service-tool batch launch reply");
+		assert_eq!(le_u32(&tool_reply.bytes, 0), correlation);
+		assert_eq!(tool_reply.bytes[4], 1, "service-oriented PIE loaded with its manifest providers");
+		drop(tool_bootstrap_kernel);
+		sched::run_until_idle();
+	}
+
 	for (tool, correlation) in [
 		(b"uname" as &[u8], 31u32),
 		(b"uptime" as &[u8], 32u32),

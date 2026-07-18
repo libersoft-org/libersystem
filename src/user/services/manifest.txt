@@ -122,12 +122,12 @@ dynamic   ls         tools  volume proto ipc-client wire lsrt
 dynamic   du         tools  volume proto ipc-client wire lsrt
 dynamic   mkdir      tools  volume proto ipc-client wire lsrt
 dynamic   rmdir      tools  volume proto ipc-client wire lsrt
-tool      log        tools  volume
-tool      snap       tools  volume
-tool      volume     tools  volume
-tool      lsdev      tools  volume
-tool      config     tools  volume
-tool      set        tools  volume
+dynamic   log        tools  volume proto ipc-client wire lsrt
+dynamic   snap       tools  volume proto ipc-client wire lsrt
+dynamic   volume     tools  volume proto ipc-client wire lsrt
+dynamic   lsdev      tools  volume proto ipc-client wire lsrt
+dynamic   config     tools  volume proto ipc-client wire lsrt
+dynamic   set        tools  volume proto ipc-client wire lsrt
 tool      beep       tools  volume
 tool      play       tools  volume
 tool      graphics_probe tools volume
@@ -138,7 +138,7 @@ tool      ps         tools  volume
 tool      run        tools  volume
 tool      perm       tools  volume
 tool      stop       tools  volume
-tool      lsvol      tools  volume
+dynamic   lsvol      tools  volume proto ipc-client wire lsrt
 dynamic   uname      tools  volume lsrt
 dynamic   uptime     tools  volume lsrt
 dynamic   dmesg      tools  volume lsrt
@@ -147,9 +147,9 @@ dynamic   free       tools  volume lsrt
 dynamic   lsmem      tools  volume wire lsrt
 dynamic   lsirq      tools  volume wire lsrt
 dynamic   lspci      tools  volume wire lsrt
-tool      lssvc      tools  volume
-tool      lsblk      tools  volume
-tool      lsusb      tools  volume
+dynamic   lssvc      tools  volume proto ipc-client wire lsrt
+dynamic   lsblk      tools  volume proto ipc-client wire lsrt
+dynamic   lsusb      tools  volume proto ipc-client wire lsrt
 dynamic   echo       tools  volume lsrt
 tool      ping       tools  volume
 tool      ip         tools  volume

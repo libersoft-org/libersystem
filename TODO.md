@@ -3608,6 +3608,18 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     aligned interrupt-table contracts. `lspci` also uses `wire + lsrt` at
     9,720/11,000/12,416 bytes and preserves the retained virtio bus scan. All inventory
     behavior now runs through ProcessService; the obsolete raw-spawn helper is removed.
+  - Service-tool batch result (2026-07-18): ten generated-client consumers migrated in one
+    graph change, all over `proto + ipc-client + wire + lsrt`: `config`
+    (12,248/12,128/12,960 bytes), `set` (7,544/7,864/8,592), `log`
+    (16,504/16,864/16,720), `snap` (14,840/15,760/17,208), `volume`
+    (17,008/17,856/20,936), `lsdev` (9,896/10,352/10,480), `lsvol`
+    (18,848/20,032/20,744), `lssvc` (11,032/11,400/11,544), `lsblk`
+    (13,520/14,256/16,296) and `lsusb` (10,328/10,632/10,904) on
+    x86_64/AArch64/RISC-V. Package-local trim/JSON bootstrap helpers moved into their
+    four owning binaries rather than creating a broad tools provider. One ProcessService
+    loop validates staging, provider DAGs, relocation and start for the whole batch; one
+    66-test QEMU selection validates it together with the owning Config, Log, Device,
+    Storage and USB service contracts.
     The remaining executable set is still open.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,

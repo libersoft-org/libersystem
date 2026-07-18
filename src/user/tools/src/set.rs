@@ -17,7 +17,6 @@ use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::system::{ConfigEntry, config};
 use rt::*;
-use tools::trim;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -72,4 +71,12 @@ unsafe fn set_config(cfgsvc: u64, rest: &[u8]) {
 	}
 }
 
-// `trim` comes from the shared tools crate.
+fn trim(mut bytes: &[u8]) -> &[u8] {
+	while bytes.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
+		bytes = &bytes[1..];
+	}
+	while bytes.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
+		bytes = &bytes[..bytes.len() - 1];
+	}
+	bytes
+}
