@@ -93,24 +93,30 @@ impl Drop for MappedFile {
 	}
 }
 
+struct Module {
+	name: String,
+	file: MappedFile,
+	dependencies: Vec<String>,
+}
+
 struct Resolver {
 	storage: u64,
 	process: u64,
-	loaded: Vec<String>,
+	modules: Vec<Module>,
 	visiting: Vec<String>,
 }
 
 impl Resolver {
-	unsafe fn load(&mut self, name: &str, depth: usize) -> bool {
+	unsafe fn collect(&mut self, name: &str, depth: usize) -> bool {
 		unsafe {
-			if self.loaded.iter().any(|loaded| loaded == name) {
+			if self.modules.iter().any(|module| module.name == name) {
 				return true;
 			}
-			if depth >= MAX_DEPENDENCY_DEPTH || self.loaded.len() >= MAX_MODULES || self.visiting.iter().any(|visiting| visiting == name) || !valid_library_name(name) {
+			if depth >= MAX_DEPENDENCY_DEPTH || self.modules.len() >= MAX_MODULES || self.visiting.iter().any(|visiting| visiting == name) || !valid_library_name(name) {
 				return false;
 			}
 			self.visiting.push(String::from(name));
-			let loaded = (|| {
+			let module = (|| {
 				let file = MappedFile::open(self.storage, alloc::format!("{LIBRARY_DIR}{name}"))?;
 				let bytes = file.bytes();
 				let elf = bootproto::elf::Elf::parse(bytes)?;
@@ -119,23 +125,37 @@ impl Resolver {
 				}
 				let dynamic = elf.dynamic_info()??;
 				let dependencies = dependencies(&elf, &dynamic)?;
-				for dependency in dependencies {
-					if !self.load(&dependency, depth + 1) {
+				for dependency in &dependencies {
+					if !self.collect(dependency, depth + 1) {
 						return None;
 					}
 				}
-				let bias = LIBRARY_BASE.checked_add((self.loaded.len() as u64).checked_mul(LIBRARY_SLOT_SIZE)?)?;
-				if process_load_module(self.process, bytes, bias) < 0 {
-					return None;
-				}
-				Some(())
-			})()
-			.is_some();
+				Some(Module { name: String::from(name), file, dependencies })
+			})();
 			self.visiting.pop();
-			if loaded {
-				self.loaded.push(String::from(name));
+			if let Some(module) = module {
+				self.modules.push(module);
+				true
+			} else {
+				false
 			}
-			loaded
+		}
+	}
+
+	unsafe fn load(self) -> bool {
+		unsafe {
+			let mut loaded = Vec::with_capacity(self.modules.len());
+			while loaded.len() < self.modules.len() {
+				let Some(module) = self.modules.iter().filter(|module| !loaded.iter().any(|name: &String| name == &module.name) && module.dependencies.iter().all(|dependency| loaded.iter().any(|name| name == dependency))).min_by(|left, right| left.name.cmp(&right.name)) else {
+					return false;
+				};
+				let Some(bias) = LIBRARY_BASE.checked_add((loaded.len() as u64).checked_mul(LIBRARY_SLOT_SIZE).unwrap_or(u64::MAX)) else { return false };
+				if process_load_module(self.process, module.file.bytes(), bias) < 0 {
+					return false;
+				}
+				loaded.push(module.name.clone());
+			}
+			true
 		}
 	}
 }
@@ -246,12 +266,16 @@ unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], bootstrap: u64, domain
 			return process;
 		}
 		let process = process as u64;
-		let mut resolver = Resolver { storage, process, loaded: Vec::new(), visiting: Vec::new() };
+		let mut resolver = Resolver { storage, process, modules: Vec::new(), visiting: Vec::new() };
 		for dependency in dependencies {
-			if !resolver.load(&dependency, 0) {
+			if !resolver.collect(&dependency, 0) {
 				close(process);
 				return -1;
 			}
+		}
+		if !resolver.load() {
+			close(process);
+			return -1;
 		}
 		let entry = process_load_main(process, bytes);
 		if entry < 0 {

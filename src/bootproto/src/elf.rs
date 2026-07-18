@@ -15,9 +15,9 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 pub const ET_EXEC: u16 = 2;
 pub const ET_DYN: u16 = 3;
-const EM_X86_64: u16 = 62;
-const EM_AARCH64: u16 = 183;
-const EM_RISCV: u16 = 243;
+pub const EM_X86_64: u16 = 62;
+pub const EM_AARCH64: u16 = 183;
+pub const EM_RISCV: u16 = 243;
 
 // The machine an image must target: the loader and the kernel each load images for
 // their own build architecture, so the expected e_machine is the build arch's.
@@ -171,6 +171,12 @@ impl<'a> Elf<'a> {
 	// location. Returns None if the bytes are not a little-endian 64-bit ET_EXEC /
 	// ET_DYN image for this build's architecture, or are truncated.
 	pub fn parse(bytes: &'a [u8]) -> Option<Self> {
+		Self::parse_for_machine(bytes, EXPECTED_MACHINE)
+	}
+
+	// Host-side image builders audit artifacts for architectures other than their
+	// own. Runtime callers use `parse`; builders pass the machine they are staging.
+	pub fn parse_for_machine(bytes: &'a [u8], expected_machine: u16) -> Option<Self> {
 		if bytes.len() < core::mem::size_of::<Elf64Header>() {
 			return None;
 		}
@@ -183,7 +189,7 @@ impl<'a> Elf<'a> {
 		if header.e_ident[4] != ELFCLASS64 || header.e_ident[5] != ELFDATA2LSB {
 			return None;
 		}
-		if (header.e_type != ET_EXEC && header.e_type != ET_DYN) || header.e_machine != EXPECTED_MACHINE || header.e_ehsize as usize != core::mem::size_of::<Elf64Header>() || header.e_phentsize as usize != core::mem::size_of::<ProgramHeader>() {
+		if (header.e_type != ET_EXEC && header.e_type != ET_DYN) || header.e_machine != expected_machine || header.e_ehsize as usize != core::mem::size_of::<Elf64Header>() || header.e_phentsize as usize != core::mem::size_of::<ProgramHeader>() {
 			return None;
 		}
 		let table_len = (header.e_phnum as usize).checked_mul(header.e_phentsize as usize)?;

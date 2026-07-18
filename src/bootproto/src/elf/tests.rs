@@ -50,6 +50,16 @@ fn malformed_header_and_dynamic_ranges_are_rejected() {
 }
 
 #[test]
+fn explicit_machine_parser_supports_cross_target_audits() {
+	let mut bytes = image(ET_DYN, &[], &[]);
+	let other_machine = if EXPECTED_MACHINE == EM_AARCH64 { EM_RISCV } else { EM_AARCH64 };
+	let header = unsafe { &mut *(bytes.as_mut_ptr() as *mut Elf64Header) };
+	header.e_machine = other_machine;
+	assert!(Elf::parse(&bytes).is_none());
+	assert!(Elf::parse_for_machine(&bytes, other_machine).is_some());
+}
+
+#[test]
 fn rela_metadata_uses_virtual_addresses_and_rejects_partial_tables() {
 	let header_len = core::mem::size_of::<Elf64Header>();
 	let table_len = core::mem::size_of::<[ProgramHeader; 2]>();

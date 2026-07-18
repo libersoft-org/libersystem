@@ -23,6 +23,7 @@ term = { path = "../term" }
 # abi is also a build-dependency so build.rs packs with the same constants.
 [build-dependencies]
 abi = { path = "../abi" }
+bootproto = { path = "../bootproto" }
 
 [dev-dependencies]
 bmp = { path = "../user/bmp" }

@@ -119,6 +119,7 @@ struct ManifestRow {
 	name: String,
 	crate_dir: String,
 	stage: String,
+	providers: Vec<String>,
 }
 
 // Read and parse the shared service manifest, keeping every row that names a staged
@@ -139,9 +140,52 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 		let name: String = fields.next().expect("manifest row missing name").to_string();
 		let crate_dir: String = fields.next().expect("manifest row missing crate").to_string();
 		let stage: String = fields.next().expect("manifest row missing stage").to_string();
-		rows.push(ManifestRow { kind, name, crate_dir, stage });
+		let providers: Vec<String> = fields.map(String::from).collect();
+		rows.push(ManifestRow { kind, name, crate_dir, stage, providers });
 	}
 	rows
+}
+
+fn valid_library_name(name: &str) -> bool {
+	!name.is_empty() && !name.starts_with("lib") && name.len() <= 58 && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn audit_dynamic_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String]) {
+	const PT_INTERP: u32 = 3;
+	const DT_RPATH: i64 = 15;
+	const DT_TEXTREL: i64 = 22;
+	const DT_RUNPATH: i64 = 29;
+
+	let mut expected: Vec<String> = row
+		.providers
+		.iter()
+		.map(|provider| {
+			assert!(valid_library_name(provider), "dynamic {} names invalid provider {provider:?}", row.name);
+			assert!(libraries.binary_search(provider).is_ok(), "dynamic {} names unstaged provider {provider}", row.name);
+			format!("{provider}.lslib")
+		})
+		.collect();
+	expected.sort();
+	assert!(!expected.is_empty(), "dynamic {} has no providers", row.name);
+	assert!(!expected.windows(2).any(|pair| pair[0] == pair[1]), "dynamic {} repeats a provider", row.name);
+	assert!(expected.binary_search(&String::from("lsrt.lslib")).is_ok(), "dynamic {} does not directly need lsrt.lslib", row.name);
+
+	let image = bootproto::elf::Elf::parse_for_machine(bytes, user_elf_machine()).unwrap_or_else(|| panic!("dynamic {} is not a valid target ELF", row.name));
+	assert_eq!(image.image_type, bootproto::elf::ET_DYN, "dynamic {} is not ET_DYN", row.name);
+	let dynamic = image.dynamic_info().flatten().unwrap_or_else(|| panic!("dynamic {} has no valid terminated PT_DYNAMIC", row.name));
+	for entry in image.dynamic_entries().flatten().unwrap_or_else(|| panic!("dynamic {} has no PT_DYNAMIC", row.name)) {
+		assert!(!matches!(entry.tag, DT_RPATH | DT_RUNPATH | DT_TEXTREL), "dynamic {} has forbidden dynamic tag {}", row.name, entry.tag);
+	}
+	for index in 0..image.segment_count() {
+		let segment = image.segment(index).unwrap_or_else(|| panic!("dynamic {} has a malformed program-header table", row.name));
+		assert_ne!(segment.p_type, PT_INTERP, "dynamic {} has PT_INTERP", row.name);
+		assert!(segment.p_flags & (bootproto::elf::PF_W | bootproto::elf::PF_X) != (bootproto::elf::PF_W | bootproto::elf::PF_X), "dynamic {} has a W+X segment", row.name);
+	}
+
+	let mut actual: Vec<String> = image.needed_names(&dynamic).unwrap_or_else(|| panic!("dynamic {} has malformed DT_NEEDED names", row.name)).map(String::from).collect();
+	actual.sort();
+	assert!(!actual.windows(2).any(|pair| pair[0] == pair[1]), "dynamic {} repeats a DT_NEEDED provider", row.name);
+	assert_eq!(actual, expected, "dynamic {} DT_NEEDED providers differ from the manifest", row.name);
 }
 
 // The debug-build target path of a userspace ELF: each crate builds to its own target dir.
@@ -170,6 +214,14 @@ fn user_target() -> &'static str {
 		Ok("aarch64") => "aarch64-unknown-none",
 		Ok("riscv64") => "riscv64gc-unknown-none-elf",
 		_ => "x86_64-unknown-none",
+	}
+}
+
+fn user_elf_machine() -> u16 {
+	match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+		Ok("aarch64") => bootproto::elf::EM_AARCH64,
+		Ok("riscv64") => bootproto::elf::EM_RISCV,
+		_ => bootproto::elf::EM_X86_64,
 	}
 }
 
@@ -302,12 +354,17 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		println!("cargo:warning=volume directory not found at {} - writing an empty volume package", vol_dir.display());
 	}
 
+	let rows = read_manifest(&manifest);
+	let mut libraries: Vec<String> = rows.iter().filter(|row| row.kind == "library" && row.stage == "volume").map(|row| row.name.clone()).collect();
+	libraries.sort();
+	assert!(!libraries.windows(2).any(|pair| pair[0] == pair[1]), "duplicate staged library identity");
+
 	// Also stage the tool and non-bootstrap driver ELFs onto the system volume
 	// under bin/ and drivers/, so they can later be loaded from there. They are stripped
 	// of symbol/debug sections (the on-disk copies are executed by the loader, which needs
 	// only the program image), keeping the seed archive to a few megabytes. A missing or
 	// unstrippable ELF is skipped.
-	for row in read_manifest(&manifest) {
+	for row in rows {
 		let dest: String = match row.kind.as_str() {
 			"tool" => format!("bin/{}", executable_artifact_name(&row.name)),
 			"service" | "component" if row.stage == "volume" => format!("bin/{}", executable_artifact_name(&row.name)),
@@ -326,7 +383,12 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		// `strip` supports the target (the host binutils cannot strip aarch64), so
 		// the program is still staged - the loader ignores the extra sections.
 		match read_stripped(&path).or_else(|| fs::read(&path).ok()) {
-			Some(bytes) => files.push((dest, bytes)),
+			Some(bytes) => {
+				if row.kind == "dynamic" {
+					audit_dynamic_artifact(&row, &bytes, &libraries);
+				}
+				files.push((dest, bytes));
+			}
 			None => println!("cargo:warning={} ELF not found at {} - omitting from system volume (run `just user` or `just build`)", row.name, path.display()),
 		}
 	}

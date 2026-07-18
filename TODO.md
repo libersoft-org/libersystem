@@ -3690,6 +3690,16 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   `DT_NEEDED` edge must provide at least one symbol not already satisfied by an earlier
   direct provider; defined-symbol ownership plus graph-identity notes detect static
   provider copies. This is a build-time graph audit, not runtime guesswork.
+  - Partial result (2026-07-18): the final volume packager now re-parses the stripped
+    bytes of every manifest-declared `dynamic` executable with the same bounded ELF
+    reader as the runtime. It rejects a wrong target machine, non-`ET_DYN`, missing,
+    duplicate or unterminated `PT_DYNAMIC`, W+X, `PT_INTERP`, RPATH/RUNPATH/TEXTREL,
+    malformed or duplicate `DT_NEEDED`, missing direct `lsrt.lslib`, invalid/unstaged
+    provider names and any difference between `DT_NEEDED` and the manifest edge set.
+    The host build script selects the staged target machine explicitly, and x86_64,
+    AArch64 and RISC-V package checks pass. The absolute all-`/bin` `ET_DYN` gate and
+    transitive symbol/identity audit remain blocked on migrating volume services and
+    components.
 - [ ] Canonicalize runtime provider loading. ProcessService currently assigns each
   `LIBRARY_SLOT_SIZE` bias in DFS/`DT_NEEDED` encounter order. Parse the complete bounded
   graph first, reject duplicate symbol providers, compute one provider-before-consumer
@@ -3697,6 +3707,12 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   and derive biases from it. The image linker computes and tests the same order; a launch
   refuses if the runtime graph differs. Equivalent link/manifest input therefore yields
   identical module addresses on every run, independent of archive/hash-map iteration.
+  - Runtime result (2026-07-18): ProcessService now maps and validates the complete bounded
+    dependency graph before loading anything, then repeatedly selects the lexicographically
+    smallest provider whose dependencies are already loaded. Slot biases therefore follow
+    one provider-before-consumer canonical order rather than `DT_NEEDED` encounter order;
+    the 34-test `process` QEMU suite, including all 48 dynamic tools, passes. Emitting and
+    comparing the same order in the image linker remains open.
 - [ ] Keep libraries atomized by ownership; do not replace static bloat with one giant
   `tools.lslib`, `image.lslib` or `audio.lslib`. Required foundation layers:
   - `lsrt.lslib`: runtime/core/alloc/compiler primitives used by every executable;
