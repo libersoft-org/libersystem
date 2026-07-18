@@ -4825,6 +4825,47 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(&cat_output.expect("dynamic cat read-back").bytes, b"dynamic write");
 	assert_eq!(&cat_stdout_kernel.recv().expect("dynamic cat read-back newline").bytes, b"\n");
 
+	for (tool, correlation, arguments) in [(b"ls" as &[u8], 29u32, b"vol://system/dynamic-dir" as &[u8]), (b"du" as &[u8], 30u32, b"-s vol://system/dynamic-dir" as &[u8])] {
+		let (output_kernel, output_user) = Channel::create();
+		let (tool_bootstrap_kernel, tool_bootstrap_user) = Channel::create();
+		let mut tool_launch = alloc::vec::Vec::new();
+		tool_launch.extend_from_slice(&3u16.to_le_bytes());
+		tool_launch.extend_from_slice(&correlation.to_le_bytes());
+		tool_launch.extend_from_slice(&(tool.len() as u16).to_le_bytes());
+		tool_launch.extend_from_slice(tool);
+		tool_launch.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&process_client, &tool_launch, tool_bootstrap_user, Rights::ALL).expect("dynamic traversal tool launch request");
+		sched::run_until_idle();
+		let tool_reply = process_client.recv().expect("dynamic traversal tool launch reply");
+		assert_eq!(le_u32(&tool_reply.bytes, 0), correlation);
+		assert_eq!(tool_reply.bytes[4], 1, "the traversal PIE loaded with its manifest providers");
+		let tool_process = tool_reply.caps[0].object().into_any_arc().downcast::<Process>().expect("dynamic traversal capability is a Process");
+		send_cap(&tool_bootstrap_kernel, b"STDOUT", output_user, Rights::ALL).expect("dynamic traversal stdout bootstrap");
+		tool_bootstrap_kernel.send(Message::new(arguments.to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic traversal arguments");
+		send_cap(&tool_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("dynamic traversal system volume");
+		for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..]] {
+			tool_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic traversal absent volume");
+		}
+		tool_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic traversal cwd");
+		let mut captured = alloc::vec::Vec::new();
+		for _ in 0..100_000 {
+			writable_storage.pump();
+			while let Ok(message) = output_kernel.recv() {
+				captured.extend_from_slice(&message.bytes);
+			}
+			if tool_process.is_terminated() {
+				break;
+			}
+		}
+		assert!(tool_process.is_terminated(), "dynamic traversal tool completed");
+		if tool == b"ls" {
+			assert!(captured.windows(b"dynamic-write.txt".len()).any(|window| window == b"dynamic-write.txt"), "dynamic ls listed the written file");
+			assert!(captured.windows(b"1 file".len()).any(|window| window == b"1 file"), "dynamic ls rendered its summary");
+		} else {
+			assert_eq!(&captured, b"13\tvol://system/dynamic-dir\n", "dynamic du summed the nested file exactly");
+		}
+	}
+
 	let rmdir_name: &[u8] = b"rmdir";
 	let (full_rmdir_stdout_kernel, full_rmdir_stdout_user) = Channel::create();
 	let (full_rmdir_bootstrap_kernel, full_rmdir_bootstrap_user) = Channel::create();
@@ -5515,50 +5556,17 @@ fn interactive_tool_reads_stdin() {
 
 tagged_test!(du_reports_a_directory_tree_size, [Service, Storage, Shell]);
 fn du_reports_a_directory_tree_size() {
-	use object::channel::{Channel, Message};
-	use object::rights::Rights;
-
-	// `du` walks a directory tree through its `volumes` grant and sums every file's
-	// size - the recursive disk usage no other tool reports. Stand up a StorageService
-	// over the scenario volume, then drive `du -s vol://system` the way PermissionManager
-	// would: a console as STDOUT, the arg string, the five volume caps the `volumes`
-	// bundle carries (SYSTEM live, the rest absent = a tagged message with no handle),
-	// then the inherited cwd. `-s` prints just the total line: a nonzero byte count and
-	// the path (the volume root holds the seed files).
+	// The provider-aware ProcessService scenario above executes du against a live tree.
+	// Keep this independently tagged test as the package contract: du must now be a PIE
+	// with the four direct providers required by its recursive alloc/proto traversal.
 	let (volume, package) = scenario_packages().expect("scenario packages");
-	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
 	let du_elf = program_elf(&package, volume, b"du").expect("du in the package or volume");
-
-	let (storage_boot_kernel, storage_boot_user) = Channel::create();
-	let (storage_server, storage_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
-	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
-	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
-
-	let (du_boot, du_boot_user) = Channel::create();
-	let (console_host, console_child) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), du_elf, du_boot_user, Rights::ALL, 0).expect("spawn du");
-	// The launcher bootstrap: STDOUT, the arg string, the five volume tags (only SYSTEM
-	// carries a handle), then the cwd - matching du's receive order.
-	send_cap(&du_boot, b"STDOUT", console_child, Rights::ALL).expect("STDOUT bootstrap");
-	du_boot.send(Message::new(b"-s vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("argv bootstrap");
-	send_cap(&du_boot, b"SYSTEM", storage_client, Rights::ALL).expect("SYSTEM volume grant");
-	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..]] {
-		du_boot.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("absent volume tag");
-	}
-	du_boot.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("cwd bootstrap");
-	sched::run_until_idle();
-
-	let mut captured = alloc::vec::Vec::new();
-	while let Ok(msg) = console_host.recv() {
-		captured.extend_from_slice(&msg.bytes);
-	}
-	// The -s output is one line: "<bytes>\tvol://system\n". The path must be there and
-	// the byte count nonzero (the volume holds the seed files).
-	assert!(captured.windows(b"vol://system".len()).any(|w| w == b"vol://system"), "du should report the walked directory's path, got {:?}", core::str::from_utf8(&captured));
-	let tab: usize = captured.iter().position(|&b| b == b'\t').expect("du prints a size, a tab, then the path");
-	let size: u64 = core::str::from_utf8(&captured[..tab]).ok().and_then(|s| s.trim().parse::<u64>().ok()).expect("the size column is a byte count");
-	assert!(size > 0, "du should sum a nonzero total for the volume root");
+	let elf = bootproto::elf::Elf::parse(du_elf).expect("du is ELF");
+	assert_eq!(elf.image_type, bootproto::elf::ET_DYN, "du is staged as PIE");
+	let dynamic = elf.dynamic_info().expect("du dynamic metadata parses").expect("du has PT_DYNAMIC");
+	let mut needed = elf.needed_names(&dynamic).expect("du dependencies parse").collect::<alloc::vec::Vec<_>>();
+	needed.sort_unstable();
+	assert_eq!(needed, alloc::vec!["ipc-client.lslib", "lsrt.lslib", "proto.lslib", "wire.lslib"]);
 }
 
 // Run one no-argument, no-capability tool from the volume the way the launcher does

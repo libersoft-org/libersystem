@@ -3593,8 +3593,10 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     `cat: <uri>: cannot open` negative read-back. `mkdir` and `rmdir` use the same provider
     set and sizes as `rm`; the same block-backed gate creates a directory, writes and reads
     a file inside it, rejects removal while non-empty, removes the file, removes the empty
-    directory and confirms the nested file stays absent. The remaining executable set is
-    still open.
+    directory and confirms the nested file stays absent. `ls` and `du` use the same four
+    providers; `ls` is 30,752/31,304/36,040 bytes and proves the live directory entry plus
+    summary, while `du` is 15,712/16,560/18,296 bytes and reports the nested file's exact
+    13-byte subtree total. The remaining executable set is still open.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,
   crate/source owner, output class/path, direct providers and build-feature set; each
