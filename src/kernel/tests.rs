@@ -4744,6 +4744,14 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 		b"readln" as &[u8],
 		b"ptyecho" as &[u8],
 		b"script" as &[u8],
+		b"ping" as &[u8],
+		b"ip" as &[u8],
+		b"nslookup" as &[u8],
+		b"tcp" as &[u8],
+		b"nc" as &[u8],
+		b"arp" as &[u8],
+		b"ss" as &[u8],
+		b"httpd" as &[u8],
 	]
 	.iter()
 	.enumerate()

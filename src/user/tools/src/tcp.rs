@@ -18,7 +18,6 @@ use ipc_client::ChannelTransport;
 use proto::codec::Buffer;
 use proto::system::{Endpoint, Error, Ipv4Addr, network, socket};
 use rt::*;
-use tools::{parse_port, trim};
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 128] = [0u8; 128];
@@ -33,6 +32,30 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		close(netsvc);
 	}
 	exit();
+}
+
+fn trim(mut bytes: &[u8]) -> &[u8] {
+	while bytes.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
+		bytes = &bytes[1..];
+	}
+	while bytes.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
+		bytes = &bytes[..bytes.len() - 1];
+	}
+	bytes
+}
+
+fn parse_port(bytes: &[u8]) -> Option<u16> {
+	if bytes.is_empty() || bytes.len() > 5 {
+		return None;
+	}
+	let mut value: u32 = 0;
+	for &byte in bytes {
+		if !byte.is_ascii_digit() {
+			return None;
+		}
+		value = value.checked_mul(10)?.checked_add((byte - b'0') as u32)?;
+	}
+	u16::try_from(value).ok()
 }
 
 // Parse `<ip> <port>`, open the connection, send a probe, and stream the response.

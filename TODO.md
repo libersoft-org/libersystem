@@ -3631,6 +3631,17 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     readln retains full-duplex stdin and the existing ConsoleService PTY scenario now loads
     dynamic ptyecho. A 56-test QEMU selection validates these paths with Permission,
     Resource, Audio, Console and Input service behavior.
+  - Network batch result (2026-07-18): all eight native network commands migrated together
+    over `proto + ipc-client + wire + lsrt`: `ping` (21,112/21,424/24,304 bytes),
+    `ip` (8,224/8,528/9,928), `nslookup` (6,520/6,800/7,712), `tcp`
+    (9,936/10,264/10,704), `nc` (9,992/10,224/10,312), `arp`
+    (7,368/7,528/8,040), `ss` (11,120/11,888/12,912) and `httpd`
+    (7,072/6,944/7,128), ordered x86_64/AArch64/RISC-V. `tcp`/`nc` now own their
+    small argument parsers instead of importing the package helper. Ping exposed the first
+    ordinary compiler intrinsic boundary: `lsrt` now exports and pins compiler-builtins'
+    weak function `__udivti3` rather than duplicating it in the consumer. One shared
+    ProcessService gate validates the entire batch and one 56-test QEMU selection covers it
+    with the owning NetworkService ICMP, DNS, ARP, socket, TCP and listener behavior.
     The remaining executable set is still open.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,

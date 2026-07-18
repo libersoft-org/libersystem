@@ -151,14 +151,14 @@ dynamic   lssvc      tools  volume proto ipc-client wire lsrt
 dynamic   lsblk      tools  volume proto ipc-client wire lsrt
 dynamic   lsusb      tools  volume proto ipc-client wire lsrt
 dynamic   echo       tools  volume lsrt
-tool      ping       tools  volume
-tool      ip         tools  volume
-tool      nslookup   tools  volume
-tool      tcp        tools  volume
-tool      nc         tools  volume
-tool      arp        tools  volume
-tool      httpd      tools  volume
-tool      ss         tools  volume
+dynamic   ping       tools  volume proto ipc-client wire lsrt
+dynamic   ip         tools  volume proto ipc-client wire lsrt
+dynamic   nslookup   tools  volume proto ipc-client wire lsrt
+dynamic   tcp        tools  volume proto ipc-client wire lsrt
+dynamic   nc         tools  volume proto ipc-client wire lsrt
+dynamic   arp        tools  volume proto ipc-client wire lsrt
+dynamic   httpd      tools  volume proto ipc-client wire lsrt
+dynamic   ss         tools  volume proto ipc-client wire lsrt
 dynamic   script     tools  volume lsrt
 dynamic   ptyecho    tools  volume lsrt
 dynamic   readln     tools  volume lsrt

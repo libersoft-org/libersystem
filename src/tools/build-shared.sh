@@ -159,7 +159,7 @@ for spec in "$@"; do
 			(cd "$object_root/$archive_name" && llvm-ar x "$archive_path")
 		done
 		while IFS= read -r -d '' object; do
-			llvm-objcopy --set-symbol-visibility=memcpy=default --set-symbol-visibility=memmove=default --set-symbol-visibility=memset=default --set-symbol-visibility=memcmp=default "$object"
+			llvm-objcopy --set-symbol-visibility=memcpy=default --set-symbol-visibility=memmove=default --set-symbol-visibility=memset=default --set-symbol-visibility=memcmp=default --set-symbol-visibility=__udivti3=default "$object"
 			link_inputs+=("$object")
 		done < <(find "$object_root" -name '*.o' -print0)
 	else
@@ -317,6 +317,10 @@ for spec in "$@"; do
 		alloc_shim="$(llvm-readelf --wide --dyn-syms "$out" | awk '$8 == "_RNvCshfEkAwg4zv6_7___rustc35___rust_no_alloc_shim_is_unstable_v2" {print $4}')"
 		if [[ "$alloc_shim" != "FUNC" ]]; then
 			echo "build-shared: lsrt allocator shim alias is not one function" >&2
+			exit 1
+		fi
+		if [[ "$(llvm-readelf --wide --dyn-syms "$out" | awk '$7 != "UND" && $8 == "__udivti3" {count++} END {print count+0}')" != 1 ]]; then
+			echo "build-shared: lsrt does not export exactly one __udivti3 compiler intrinsic" >&2
 			exit 1
 		fi
 	fi
