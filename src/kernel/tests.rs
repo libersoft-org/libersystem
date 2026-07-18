@@ -335,7 +335,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let domain = sched::root_domain();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
 	loader::spawn_elf_process(domain.clone(), process_elf, process_boot_user, Rights::ALL, 0).map_err(|_| "failed to load ProcessService")?;
-	loader::spawn_elf_process(domain.clone(), time_elf, time_boot_user, Rights::ALL, 0).map_err(|_| "failed to load TimeService")?;
+	let _time = spawn_dynamic_test_process(domain.clone(), time_elf, time_boot_user);
 	loader::spawn_elf_process(domain, pm_elf, pm_boot_user, Rights::ALL, 0).map_err(|_| "failed to load PermissionManager")?;
 
 	// StorageService: the ramdisk volume and its service channel.
@@ -3524,7 +3524,7 @@ fn input_service_streams_pointer_events() {
 	// channel stays open (InputService mirrors each raw event to it), but does not assert
 	// on it here - the forwarding path is exercised by the live console.
 	let (_forward_drain, forward_input) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn InputService");
+	let _input_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 	send_cap(&boot_kernel, b"INPUT", raw_consumer, Rights::ALL).expect("input raw bootstrap");
 	// no USB pointer in this scenario: the second raw channel is absent (handle 0).
@@ -3609,7 +3609,7 @@ fn input_service_streams_keys_only_with_display_focus() {
 	let (keys_driver, keys_input) = Channel::create();
 	let (focus_display, focus_input) = Channel::create();
 	let (kill_display, kill_input) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn InputService");
+	let _input_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 	send_cap(&boot_kernel, b"INPUT", pointer_b, Rights::ALL).expect("pointer bootstrap");
 	boot_kernel.send(Message::new(b"INPUT2".to_vec(), alloc::vec::Vec::new(), 0)).expect("second pointer bootstrap");
@@ -4066,7 +4066,7 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	let (snd_host, snd_service) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
 	loader::spawn_elf_process(sched::root_domain(), process_elf, process_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
-	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn AudioService");
+	let _audio_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
 	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
 	send_package(&process_boot_kernel, init).expect("process package bootstrap");
@@ -4405,7 +4405,7 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	let (boot_kernel, boot_user) = Channel::create();
 	let (frames_kernel, frames_user) = Channel::create();
 	let (_serve_kernel, serve_user) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn NetworkService");
+	let _network_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
 	send_cap(&boot_kernel, b"FRAMES", frames_user, Rights::ALL).expect("frames bootstrap");
 	// no config tree serves this scenario: CONFIG with no handle tells the service
 	// to fall back to its compiled-in defaults (the neighbor-cache size).
@@ -4627,7 +4627,7 @@ fn system_packages_use_canonical_executable_names() {
 		executable_identities += usize::from(name.starts_with(b"identity/bin/"));
 	}
 	assert_eq!(library_identities, 33, "every staged library has one identity record");
-	assert_eq!(executable_identities, 59, "every staged dynamic executable has one identity record");
+	assert_eq!(executable_identities, 63, "every staged dynamic executable has one identity record");
 	assert!(volume.lookup(b"identity/lib/imgconv").is_some(), "library identity namespace preserves imgconv");
 	assert!(volume.lookup(b"identity/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");
 }

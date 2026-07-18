@@ -3541,7 +3541,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     final-link failure is pinned to the duplicate allocator shims after an exact-path
     `ET_REL` seed exists; any other failure aborts construction. The complete provider
     graph and its consumers link on all three architectures.
-  - Identity result (2026-07-18): all 33 providers and 59 dynamic executables emit one
+  - Identity result (2026-07-18): all 33 providers and 63 dynamic executables emit one
     canonical `liber-image-identity-v1` record containing artifact/package identity, a
     sorted source-tree SHA-256, the image rustc commit, target, release profile, exact
     codegen flags, feature set and sorted direct-provider record digests. Each ELF embeds
@@ -3551,8 +3551,8 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     the complete provider digest chain and byte-exact note equality before staging records
     under collision-free `identity/lib/` and `identity/bin/` paths. A complete x86 rebuild
     reproduced the aggregate hash of the original 81-record tool graph exactly; after the
-    managed-service migration, x86_64, AArch64 and RISC-V each produce and package 92
-    records plus 92 notes. The process, boot/storage and broad service integration suites pass
+    second managed-service migration, x86_64, AArch64 and RISC-V each produce and package
+    96 records plus 96 notes. The process, boot/storage and broad service integration suites pass
     with the identity-bearing graph.
   - Component result (2026-07-18): all six volume components are now manifest-driven PIE:
     `sandbox_probe` (8,208/8,000/8,192 bytes), `request_probe` (6,152/6,168/6,536),
@@ -3576,6 +3576,15 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     server-only services use `wire + lsrt`. Package identity inventory is 59 executables;
     all three target graphs/package audits pass, and the 60-test service/process/storage
     QEMU suite preserves Config persistence/restart, DeviceService and resource behavior.
+  - Second managed-service result (M126a, 2026-07-18): four domain services retain their
+    original Escalate policy and supervisor dependencies as manifest-driven PIE.
+    `network_service` is 51,632/61,208/57,632 bytes and uses `proto + ipc-client + wire +
+    lsrt`; `time_service` is 10,568/11,032/11,560 with the same client profile;
+    `audio_service` is 19,520/19,984/20,664 over `pcm + wire + lsrt`; and `input_service`
+    is 18,312/18,048/17,624 over `keys + proto + wire + lsrt`. Provider-aware test loading
+    preserves DHCP/network, wall-clock, PCM mixing/playback and pointer/key behavior. All
+    three target graphs and package audits pass with 96 identities/notes, and one 60-test
+    `service,process,storage,network,audio,input` x86 QEMU selection passes.
 - [x] Add a tiny generated executable-start object per architecture, not a static runtime
   archive in every program. It exports `_start`, aligns/initializes the ABI-required
   registers, performs the native ABI revision check through `lsrt`, and calls the tool's
