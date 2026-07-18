@@ -1,0 +1,11 @@
+[package]
+name = "network-client-provider"
+edition = "2024"
+description = "ELF trampoline provider for concrete LiberSystem network channel clients"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = []

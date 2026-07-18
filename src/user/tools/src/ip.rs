@@ -11,9 +11,8 @@
 
 extern crate alloc;
 
-use ipc_client::ChannelTransport;
+use network_client::NetworkClient;
 use proto::addr::write_mac;
-use proto::system::network;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -36,7 +35,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // neighbors.
 unsafe fn show(netsvc: u64) {
 	unsafe {
-		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
+		let mut client = NetworkClient::new(netsvc);
 		match client.info() {
 			Some(Ok(info)) => {
 				let mut tmp: [u8; 18] = [0u8; 18];

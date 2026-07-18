@@ -449,6 +449,30 @@ pub mod permission {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_security_permission_lookup")]
+	fn channel_invoke_lookup(chan: u64, component: &str) -> Option<Result<Manifest, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.lookup(component)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_security_permission_audit")]
+	fn channel_invoke_audit(chan: u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.audit()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_security_permission_run")]
+	fn channel_invoke_run(chan: u64, name: &str, args: &str, cwd: &str, stdout: &u64) -> Option<Result<ProcessStartResult, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.run(name, args, cwd, stdout)
+	}
 }
 
 impl Capability {

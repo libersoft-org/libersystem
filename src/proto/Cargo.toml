@@ -5,5 +5,11 @@ name = "proto"
 edition = "2024"
 description = "Generated LSIDL bindings (wire codec, clients, servers) for LiberSystem"
 
+[features]
+default = []
+channel-client-impl = ["dep:ipc-client"]
+shared-image = ["channel-client-impl", "ipc-client/shared-image"]
+
 [dependencies]
 wire = { path = "../wire" }
+ipc-client = { path = "../user/ipc-client", optional = true }

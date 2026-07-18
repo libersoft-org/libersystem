@@ -14,9 +14,9 @@
 
 extern crate alloc;
 
-use ipc_client::ChannelTransport;
+use network_client::{NetworkClient, SocketClient};
 use proto::codec::Buffer;
-use proto::system::{Endpoint, Error, Ipv4Addr, network, socket};
+use proto::system::{Endpoint, Error, Ipv4Addr, socket};
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -92,7 +92,7 @@ unsafe fn connect(netsvc: u64, args: &[u8]) {
 			}
 		};
 		// connect() returns the socket as a capability (the channel it is served on).
-		let mut net = network::Client::new(ChannelTransport { chan: netsvc });
+		let mut net = NetworkClient::new(netsvc);
 		let ep: Endpoint = Endpoint { addr, port };
 		let sockh: u64 = match net.connect(&ep) {
 			Some(Ok(h)) => h,
@@ -113,7 +113,7 @@ unsafe fn connect(netsvc: u64, args: &[u8]) {
 				return;
 			}
 		};
-		let mut sock = socket::Client::new(ChannelTransport { chan: sockh });
+		let mut sock = SocketClient::new(sockh);
 		print(b"nc ");
 		print(host);
 		print(b": connected\n");
@@ -137,7 +137,7 @@ unsafe fn connect(netsvc: u64, args: &[u8]) {
 // as a zero-copy buffer: the bytes live in a fresh shared memory object whose handle
 // is transferred by the send (consumed by the transfer, so we map-fill-unmap but do
 // not close it). Returns whether the send succeeded.
-unsafe fn send_request(sock: &mut socket::Client<ChannelTransport>, request: &[u8]) -> bool {
+unsafe fn send_request(sock: &mut SocketClient, request: &[u8]) -> bool {
 	unsafe {
 		let n: usize = request.len();
 		if n > 256 {
@@ -166,7 +166,7 @@ unsafe fn send_request(sock: &mut socket::Client<ChannelTransport>, request: &[u
 
 // Drain the socket's received-data stream (a sub-channel of framed chunks), printing
 // each chunk, until the producer closes - end of stream (the peer's FIN).
-unsafe fn drain(sock: &mut socket::Client<ChannelTransport>) {
+unsafe fn drain(sock: &mut SocketClient) {
 	unsafe {
 		if let Some(rxstream) = sock.recv() {
 			let mut frame: [u8; 1024] = [0u8; 1024];

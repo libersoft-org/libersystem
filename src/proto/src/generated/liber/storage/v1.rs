@@ -1399,6 +1399,134 @@ pub mod volume {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_open")]
+	fn channel_invoke_open(chan: u64, o: &OpenOpts) -> Option<Result<OpenResult, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open(o)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_list")]
+	fn channel_invoke_list(chan: u64, path: &str) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.list(path)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_write")]
+	fn channel_invoke_write(chan: u64, path: &str, data: &crate::codec::Buffer) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.write(path, data)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_remove")]
+	fn channel_invoke_remove(chan: u64, path: &str) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.remove(path)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_snap_create")]
+	fn channel_invoke_snap_create(chan: u64, name: &str) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.snap_create(name)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_snap_list")]
+	fn channel_invoke_snap_list(chan: u64) -> Option<Result<Vec<SnapshotInfo>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.snap_list()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_snap_delete")]
+	fn channel_invoke_snap_delete(chan: u64, name: &str) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.snap_delete(name)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_snap_open")]
+	fn channel_invoke_snap_open(chan: u64, snapshot: &str, path: &str) -> Option<Result<OpenResult, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.snap_open(snapshot, path)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_mkdir")]
+	fn channel_invoke_mkdir(chan: u64, path: &str) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.mkdir(path)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_rmdir")]
+	fn channel_invoke_rmdir(chan: u64, path: &str) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.rmdir(path)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_capacity")]
+	fn channel_invoke_capacity(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.capacity()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_status")]
+	fn channel_invoke_status(chan: u64) -> Option<Result<VolumeStatus, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.status()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_set_compression")]
+	fn channel_invoke_set_compression(chan: u64, enabled: &bool) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_compression(enabled)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_fsck")]
+	fn channel_invoke_fsck(chan: u64) -> Option<Result<FsckReport, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.fsck()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_restore")]
+	fn channel_invoke_restore(chan: u64, path: &str, snapshot: &str) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.restore(path, snapshot)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_write_stream")]
+	fn channel_invoke_write_stream(chan: u64, path: &str, data: &u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.write_stream(path, data)
+	}
 }
 
 impl OpenOpts {

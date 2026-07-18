@@ -57,6 +57,7 @@ library_file() {
 	lsrt) printf 'user/rt/shared/%s/lsrt.lslib' "$target" ;;
 	proto) printf 'proto/shared/%s/proto.lslib' "$target" ;;
 	wire) printf 'wire/shared/%s/wire.lslib' "$target" ;;
+	network-client) printf 'user/network-client-provider/shared/%s/network-client.lslib' "$target" ;;
 	wasm) printf 'wasm/shared/%s/wasm.lslib' "$target" ;;
 	term) printf 'term/shared/%s/term.lslib' "$target" ;;
 	service-util) printf 'user/services/shared/%s/service-util.lslib' "$target" ;;
@@ -610,6 +611,18 @@ if [[ -n "$image_graph" ]]; then
 		done
 		expected_needed="$(sort -u <<<"$expected_needed" | sed '/^$/d')"
 		consumer_imports="$(llvm-readelf --wide --symbols "$consumer_obj" | awk '$5 == "GLOBAL" && $7 == "UND" && $8 != "" {print $8}' | sort -u)"
+		case "$consumer" in
+		arp | httpd | ip | nc | nslookup | ping | ss | tcp)
+			if ! grep -q '^liber_channel_liber_network_' <<<"$consumer_imports"; then
+				echo "build-shared: $consumer does not import the concrete network client provider" >&2
+				exit 1
+			fi
+			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_network_' <<<"$consumer_imports"; then
+				echo "build-shared: $consumer bypasses the concrete network client provider" >&2
+				exit 1
+			fi
+			;;
+		esac
 		declare -A used_consumer_providers=()
 		for symbol in $consumer_imports; do
 			count=0

@@ -24,9 +24,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use ipc_client::ChannelTransport;
+use network_client::NetworkClient;
 use proto::codec::{JsonMode, json_escape};
-use proto::system::{Ipv4Addr, PingReply, PingStatus, network};
+use proto::system::{Ipv4Addr, PingReply, PingStatus};
 use rt::*;
 use tools::parse_u64;
 
@@ -108,7 +108,7 @@ unsafe fn ping(netsvc: u64, args: &[u8]) {
 			(OutputFormat::Json(_), None) => Some(4),
 			_ => count,
 		};
-		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
+		let mut client = NetworkClient::new(netsvc);
 		// Resolve the target: a dotted-decimal address parses directly, otherwise ask
 		// NetworkService to resolve the name over DNS.
 		let addr: Ipv4Addr = match Ipv4Addr::parse(target) {

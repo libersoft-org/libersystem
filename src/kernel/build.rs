@@ -158,7 +158,7 @@ fn valid_library_name(name: &str) -> bool {
 	!name.is_empty() && !name.starts_with("lib") && name.len() <= 58 && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-fn audit_linked_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String], require_lsrt: bool) {
+fn audit_linked_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String], require_provider: bool) {
 	const PT_INTERP: u32 = 3;
 	const DT_RPATH: i64 = 15;
 	const DT_TEXTREL: i64 = 22;
@@ -175,9 +175,8 @@ fn audit_linked_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String], 
 		.collect();
 	expected.sort();
 	assert!(!expected.windows(2).any(|pair| pair[0] == pair[1]), "{} {} repeats a provider", row.kind, row.name);
-	if require_lsrt {
+	if require_provider {
 		assert!(!expected.is_empty(), "{} {} has no providers", row.kind, row.name);
-		assert!(expected.binary_search(&String::from("lsrt.lslib")).is_ok(), "{} {} does not directly need lsrt.lslib", row.kind, row.name);
 	}
 
 	let image = bootproto::elf::Elf::parse_for_machine(bytes, user_elf_machine()).unwrap_or_else(|| panic!("{} {} is not a valid target ELF", row.kind, row.name));

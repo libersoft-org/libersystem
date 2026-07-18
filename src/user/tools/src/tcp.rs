@@ -14,9 +14,9 @@
 
 extern crate alloc;
 
-use ipc_client::ChannelTransport;
+use network_client::{NetworkClient, SocketClient};
 use proto::codec::Buffer;
-use proto::system::{Endpoint, Error, Ipv4Addr, network, socket};
+use proto::system::{Endpoint, Error, Ipv4Addr, socket};
 use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -84,7 +84,7 @@ unsafe fn connect(netsvc: u64, args: &[u8]) {
 			}
 		};
 		// connect() returns the socket as a capability (the channel it is served on).
-		let mut net = network::Client::new(ChannelTransport { chan: netsvc });
+		let mut net = NetworkClient::new(netsvc);
 		let ep: Endpoint = Endpoint { addr, port };
 		let sockh: u64 = match net.connect(&ep) {
 			Some(Ok(h)) => h,
@@ -105,7 +105,7 @@ unsafe fn connect(netsvc: u64, args: &[u8]) {
 				return;
 			}
 		};
-		let mut sock = socket::Client::new(ChannelTransport { chan: sockh });
+		let mut sock = SocketClient::new(sockh);
 		print(b"tcp ");
 		print(host);
 		print(b": connected\n");

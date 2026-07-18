@@ -12,8 +12,7 @@
 
 extern crate alloc;
 
-use ipc_client::ChannelTransport;
-use proto::system::network;
+use network_client::NetworkClient;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -47,7 +46,7 @@ unsafe fn resolve(netsvc: u64, name: &[u8]) {
 				return;
 			}
 		};
-		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
+		let mut client = NetworkClient::new(netsvc);
 		match client.resolve(name_str) {
 			Some(Ok(addr)) => {
 				print(name);

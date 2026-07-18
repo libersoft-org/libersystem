@@ -196,6 +196,22 @@ pub mod audio {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_beep")]
+	fn channel_invoke_beep(chan: u64, freq: &u16, millis: &u32) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.beep(freq, millis)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_open_stream")]
+	fn channel_invoke_open_stream(chan: u64, rate: &u32, channels: &u8) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open_stream(rate, channels)
+	}
 }
 
 /// A playback stream returned by `audio.open-stream`. Samples are signed 16-bit
@@ -374,6 +390,22 @@ pub mod pcm_stream {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_pcm_stream_write")]
+	fn channel_invoke_write(chan: u64, data: &crate::codec::Buffer) -> Option<Result<u32, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.write(data)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_pcm_stream_close")]
+	fn channel_invoke_close(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.close()
+	}
 }
 
 /// Privileged launcher boundary that mints a factory restricted to `open-stream`.
@@ -488,6 +520,14 @@ pub mod audio_admin {
 			}
 			decoded
 		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_audio_audio_admin_open_streams")]
+	fn channel_invoke_open_streams(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open_streams()
 	}
 }
 

@@ -12,8 +12,8 @@
 
 extern crate alloc;
 
-use ipc_client::ChannelTransport;
-use proto::system::{SockState, network};
+use network_client::NetworkClient;
+use proto::system::SockState;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -36,7 +36,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // row per socket - a listening socket shows `*` for its peer.
 unsafe fn show(netsvc: u64) {
 	unsafe {
-		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
+		let mut client = NetworkClient::new(netsvc);
 		match client.sockets() {
 			Some(Ok(socks)) => {
 				if socks.is_empty() {

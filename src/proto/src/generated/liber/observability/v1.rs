@@ -407,6 +407,14 @@ pub mod system_graph {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_observability_system_graph_snapshot")]
+	fn channel_invoke_snapshot(chan: u64) -> Option<Result<Graph, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.snapshot()
+	}
 }
 
 /// One component's supervisor state, as the ServiceManager supervisor tracks it: how
@@ -580,6 +588,14 @@ pub mod supervisor {
 			}
 			decoded
 		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_observability_supervisor_status")]
+	fn channel_invoke_status(chan: u64) -> Option<Result<Vec<SupervisorStat>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.status()
 	}
 }
 

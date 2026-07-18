@@ -565,6 +565,46 @@ pub mod display {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_display_acquire")]
+	fn channel_invoke_acquire(chan: u64, width: &u32, height: &u32) -> Option<Result<SurfaceInfo, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.acquire(width, height)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_display_present")]
+	fn channel_invoke_present(chan: u64, x: &u32, y: &u32, width: &u32, height: &u32) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.present(x, y, width, height)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_display_release")]
+	fn channel_invoke_release(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.release()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_display_events")]
+	fn channel_invoke_events(chan: u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.events()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_display_input_focus")]
+	fn channel_invoke_input_focus(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.input_focus()
+	}
 }
 
 /// Privileged launcher boundary. PermissionManager transfers the Process capability
@@ -733,6 +773,22 @@ pub mod display_admin {
 			}
 			decoded
 		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_display_admin_bind")]
+	fn channel_invoke_bind(chan: u64, task: &u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.bind(task)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_display_admin_stats")]
+	fn channel_invoke_stats(chan: u64) -> Option<PresentationStats> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.stats()
 	}
 }
 

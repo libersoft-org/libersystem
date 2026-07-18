@@ -337,6 +337,22 @@ pub mod resources {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_resources_resources_usage")]
+	fn channel_invoke_usage(chan: u64) -> Option<Result<Vec<Budget>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.usage()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_resources_resources_set_limit")]
+	fn channel_invoke_set_limit(chan: u64, name: &str, r#type: &ResourceType, limit: &u64) -> Option<Result<Budget, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_limit(name, r#type, limit)
+	}
 }
 
 impl ResourceType {

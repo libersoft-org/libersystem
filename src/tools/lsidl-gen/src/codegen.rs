@@ -35,7 +35,7 @@ pub fn rust(file: &File, source: &str, imports: &HashMap<String, ResolvedSymbol>
 			aliases.insert(local.clone(), wire_type.clone());
 		}
 	}
-	let mut cg = Cg { out: String::new(), tmp: 0, again_enums, aliases };
+	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), again_enums, aliases };
 	cg.file(file, source);
 	cg.imports(imports);
 	for item in &file.items {
@@ -57,7 +57,7 @@ pub fn compat_rust(file: &File, imports: &HashMap<String, ResolvedSymbol>) -> St
 			aliases.insert(local.clone(), wire_type.clone());
 		}
 	}
-	let mut cg = Cg { out: String::new(), tmp: 0, again_enums: std::collections::HashSet::new(), aliases };
+	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), again_enums: std::collections::HashSet::new(), aliases };
 	cg.compat_tests(file);
 	cg.out
 }
@@ -65,6 +65,7 @@ pub fn compat_rust(file: &File, imports: &HashMap<String, ResolvedSymbol>) -> St
 struct Cg {
 	out: String,
 	tmp: u32,
+	package: String,
 	// Error-enum names that carry an `again` case, so a dispatch whose reply
 	// overflows the caller's buffer can degrade to a typed error.
 	again_enums: std::collections::HashSet<String>,
@@ -605,6 +606,21 @@ impl Cg {
 			self.line("\t\t}");
 		}
 		self.line("\t}");
+		self.line("");
+		for m in &supported {
+			let params = client_params(m)?;
+			let args = m.params.iter().map(|param| field_ident(&param.name)).collect::<Vec<_>>().join(", ");
+			let ret = if matches!(m.ret, Type::Stream(_)) { "u64".to_string() } else { rust_ty(&m.ret).map_err(|error| Error::new(m.span, error))? };
+			let symbol = format!("liber_channel_impl_{}_{}_{}", symbol_ident(&self.package), symbol_ident(&i.name), symbol_ident(&m.name));
+			self.line("");
+			self.line("\t#[cfg(feature = \"channel-client-impl\")]");
+			self.line("\t#[inline(never)]");
+			self.line(&format!("\t#[unsafe(export_name = \"{symbol}\")]"));
+			self.line(&format!("\tfn channel_invoke_{}(chan: u64{params}) -> Option<{ret}> {{", field_ident(&m.name)));
+			self.line("\t\tlet mut client = Client::new(ipc_client::ChannelTransport { chan });");
+			self.line(&format!("\t\tclient.{}({args})", field_ident(&m.name)));
+			self.line("\t}");
+		}
 		self.line("}");
 		self.line("");
 		Ok(())
@@ -1097,6 +1113,10 @@ fn camel(name: &str) -> String {
 fn field_ident(name: &str) -> String {
 	let s = name.replace('-', "_");
 	if is_rust_keyword(&s) { format!("r#{s}") } else { s }
+}
+
+fn symbol_ident(name: &str) -> String {
+	name.bytes().map(|byte| if byte.is_ascii_alphanumeric() { byte as char } else { '_' }).collect()
 }
 
 // Map a kebab-case name to a SCREAMING_SNAKE_CASE constant identifier.

@@ -1181,6 +1181,86 @@ pub mod network {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_info")]
+	fn channel_invoke_info(chan: u64) -> Option<Result<NetInfo, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.info()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_resolve")]
+	fn channel_invoke_resolve(chan: u64, name: &str) -> Option<Result<Ipv4Addr, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.resolve(name)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_ping")]
+	fn channel_invoke_ping(chan: u64, addr: &Ipv4Addr) -> Option<Result<PingReply, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.ping(addr)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_fetch")]
+	fn channel_invoke_fetch(chan: u64, req: &TcpRequest) -> Option<Result<Vec<u8>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.fetch(req)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_connect")]
+	fn channel_invoke_connect(chan: u64, ep: &Endpoint) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.connect(ep)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_open")]
+	fn channel_invoke_open(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_listen")]
+	fn channel_invoke_listen(chan: u64, port: &u16) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.listen(port)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_sockets")]
+	fn channel_invoke_sockets(chan: u64) -> Option<Result<Vec<SockInfo>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.sockets()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_sntp")]
+	fn channel_invoke_sntp(chan: u64, server: &Ipv4Addr) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.sntp(server)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_capacity")]
+	fn channel_invoke_capacity(chan: u64) -> Option<Result<NetCapacity, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.capacity()
+	}
 }
 
 /// A connected TCP socket, served on the channel `network.connect` hands back as a
@@ -1422,6 +1502,30 @@ pub mod socket {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_socket_send")]
+	fn channel_invoke_send(chan: u64, data: &crate::codec::Buffer) -> Option<Result<u32, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.send(data)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_socket_recv")]
+	fn channel_invoke_recv(chan: u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.recv()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_socket_close")]
+	fn channel_invoke_close(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.close()
+	}
 }
 
 /// One chunk of received socket data, the element of the `socket.recv` stream.
@@ -1582,6 +1686,14 @@ pub mod listener {
 			}
 			decoded
 		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_listener_accept")]
+	fn channel_invoke_accept(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.accept()
 	}
 }
 

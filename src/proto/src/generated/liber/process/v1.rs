@@ -420,6 +420,38 @@ pub mod process {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_process_start")]
+	fn channel_invoke_start(chan: u64, name: &str) -> Option<Result<ProcessInfo, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.start(name)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_process_list")]
+	fn channel_invoke_list(chan: u64) -> Option<Result<Vec<ProcessInfo>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.list()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_process_launch")]
+	fn channel_invoke_launch(chan: u64, name: &str, bootstrap: &u64) -> Option<Result<StartResult, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.launch(name, bootstrap)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_process_launch_bounded")]
+	fn channel_invoke_launch_bounded(chan: u64, name: &str, memory_limit: &u64, bootstrap: &u64) -> Option<Result<StartResult, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.launch_bounded(name, memory_limit, bootstrap)
+	}
 }
 
 impl ProcessInfo {

@@ -150,6 +150,14 @@ pub mod time {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_time_time_now")]
+	fn channel_invoke_now(chan: u64) -> Option<Result<Timestamp, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.now()
+	}
 }
 
 impl Timestamp {

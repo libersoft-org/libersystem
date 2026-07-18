@@ -274,6 +274,22 @@ pub mod device {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_device_list")]
+	fn channel_invoke_list(chan: u64) -> Option<Result<Vec<DeviceEntry>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.list()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_device_get")]
+	fn channel_invoke_get(chan: u64, index: &u32) -> Option<Result<DeviceEntry, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.get(index)
+	}
 }
 
 /// One enumerated USB device, as the xHCI driver addressed it: the root port it hangs
@@ -446,6 +462,14 @@ pub mod usb {
 			}
 			decoded
 		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_usb_list")]
+	fn channel_invoke_list(chan: u64) -> Option<Result<Vec<UsbDevice>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.list()
 	}
 }
 

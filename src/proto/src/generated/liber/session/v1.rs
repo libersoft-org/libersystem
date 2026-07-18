@@ -942,6 +942,94 @@ pub mod session {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_session_session_cwd")]
+	fn channel_invoke_cwd(chan: u64) -> Option<Result<String, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.cwd()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_session_session_chdir")]
+	fn channel_invoke_chdir(chan: u64, path: &str) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.chdir(path)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_session_session_job_register")]
+	fn channel_invoke_job_register(chan: u64, name: &str, stopped: &bool, proc: &u64) -> Option<Result<u32, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.job_register(name, stopped, proc)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_session_session_job_take")]
+	fn channel_invoke_job_take(chan: u64, id: &u32) -> Option<Result<JobEntry, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.job_take(id)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_session_session_job_list")]
+	fn channel_invoke_job_list(chan: u64) -> Option<Result<Vec<JobInfo>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.job_list()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_session_session_job_reap")]
+	fn channel_invoke_job_reap(chan: u64) -> Option<Result<Vec<JobInfo>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.job_reap()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_session_session_job_resume")]
+	fn channel_invoke_job_resume(chan: u64, id: &u32) -> Option<Result<JobInfo, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.job_resume(id)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_session_session_env_get")]
+	fn channel_invoke_env_get(chan: u64, name: &str) -> Option<Result<String, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.env_get(name)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_session_session_env_set")]
+	fn channel_invoke_env_set(chan: u64, name: &str, value: &str) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.env_set(name, value)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_session_session_env_unset")]
+	fn channel_invoke_env_unset(chan: u64, name: &str) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.env_unset(name)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_session_session_env_list")]
+	fn channel_invoke_env_list(chan: u64) -> Option<Result<Vec<EnvVar>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.env_list()
+	}
 }
 
 impl JobInfo {

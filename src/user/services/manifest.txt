@@ -36,7 +36,7 @@ instance  usb_storage           -         none    escalate     log_service stora
 dynamic-service network_service services volume escalate      log_service device_manager process_service config_service -- proto ipc-client wire lsrt
 dynamic-service shell services volume escalate storage_service media_storage iso_storage udf_storage usb_storage device_service process_service config_service network_service time_service console_service audio_service input_service permission_manager resource_manager system_graph_service session_service -- service-util proto ipc-client wire lsrt
 service   log_service           services  pinned  escalate
-dynamic-service device_service services  volume  transparent  log_service process_service -- wire lsrt
+dynamic-service device_service services  volume  transparent  log_service process_service -- proto wire lsrt
 service   process_service       services  pinned  escalate     log_service storage_service
 dynamic-service config_service services  volume  transparent  log_service process_service -- proto ipc-client wire lsrt
 dynamic-service time_service services volume escalate         log_service network_service process_service -- proto ipc-client wire lsrt
@@ -47,7 +47,7 @@ dynamic-service input_service services volume escalate        log_service device
 dynamic-service system_graph_service services volume escalate log_service device_manager storage_service network_service device_service process_service config_service time_service console_service audio_service input_service permission_manager resource_manager -- proto ipc-client wire lsrt
 dynamic-service permission_manager services volume escalate   log_service storage_service media_storage iso_storage udf_storage usb_storage network_service time_service config_service device_service audio_service process_service resource_manager -- service-util proto ipc-client wire lsrt
 dynamic-service resource_manager services volume escalate     log_service process_service -- proto wire lsrt
-dynamic-service session_service services volume escalate      log_service process_service -- wire lsrt
+dynamic-service session_service services volume escalate      log_service process_service -- proto wire lsrt
 
 # launchers - spawned from the init package, not supervised as managed services.
 launcher  system_manager        system_manager  pinned
@@ -79,7 +79,8 @@ driver    xhci                  drivers   volume
 library   lsrt                  rt         volume shared-image
 library   wire                  wire       volume -            lsrt
 library   ipc-client            ipc-client volume shared-image lsrt
-library   proto                 proto      volume -            wire lsrt
+library   proto                 proto      volume -            ipc-client wire lsrt
+library   network-client        network-client-provider volume shared-image proto
 library   pix                   pix        volume -            lsrt
 library   inflate               inflate    volume -            lsrt
 library   deflate               deflate    volume -            lsrt
@@ -157,14 +158,14 @@ dynamic   lssvc      tools  volume proto ipc-client wire lsrt
 dynamic   lsblk      tools  volume proto ipc-client wire lsrt
 dynamic   lsusb      tools  volume proto ipc-client wire lsrt
 dynamic   echo       tools  volume lsrt
-dynamic   ping       tools  volume proto ipc-client wire lsrt
-dynamic   ip         tools  volume proto ipc-client wire lsrt
-dynamic   nslookup   tools  volume proto ipc-client wire lsrt
-dynamic   tcp        tools  volume proto ipc-client wire lsrt
-dynamic   nc         tools  volume proto ipc-client wire lsrt
-dynamic   arp        tools  volume proto ipc-client wire lsrt
-dynamic   httpd      tools  volume proto ipc-client wire lsrt
-dynamic   ss         tools  volume proto ipc-client wire lsrt
+dynamic   ping       tools  volume network-client proto wire lsrt
+dynamic   ip         tools  volume network-client proto lsrt
+dynamic   nslookup   tools  volume network-client proto lsrt
+dynamic   tcp        tools  volume network-client proto lsrt
+dynamic   nc         tools  volume network-client proto lsrt
+dynamic   arp        tools  volume network-client proto lsrt
+dynamic   httpd      tools  volume network-client lsrt
+dynamic   ss         tools  volume network-client proto lsrt
 dynamic   script     tools  volume lsrt
 dynamic   ptyecho    tools  volume lsrt
 dynamic   readln     tools  volume lsrt

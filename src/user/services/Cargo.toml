@@ -10,7 +10,7 @@ description = "Core userspace system services (ServiceManager, ...)"
 
 [features]
 default = []
-shared-image = ["ipc-client/shared-image", "rt/shared-image"]
+shared-image = ["ipc-client/shared-image", "proto/shared-image", "rt/shared-image"]
 
 [[bin]]
 name = "service_manager"

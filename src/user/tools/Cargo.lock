@@ -230,6 +230,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f69bdf7e634dc76798adc292ebd4f6e8e125cde6843a264fe398c52c3f7e8541"
 
 [[package]]
+name = "network-client"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "network-client-provider"
+version = "0.0.0"
+
+[[package]]
 name = "no_std_io"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -279,6 +290,7 @@ dependencies = [
 name = "proto"
 version = "0.0.0"
 dependencies = [
+ "ipc-client",
  "wire",
 ]
 
@@ -356,6 +368,8 @@ dependencies = [
  "ipc-client",
  "keys",
  "mp3",
+ "network-client",
+ "network-client-provider",
  "pix",
  "png",
  "proto",

@@ -13,9 +13,8 @@
 
 extern crate alloc;
 
-use ipc_client::ChannelTransport;
+use network_client::{ListenerClient, NetworkClient, SocketClient};
 use proto::codec::Buffer;
-use proto::system::{listener, network, socket};
 use rt::*;
 
 // The port we listen on, and the canned response - `Connection: close` so the client
@@ -42,7 +41,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // Open the listening socket and accept connections forever, serving each one.
 unsafe fn serve(netsvc: u64) {
 	unsafe {
-		let mut net = network::Client::new(ChannelTransport { chan: netsvc });
+		let mut net = NetworkClient::new(netsvc);
 		let listen_chan: u64 = match net.listen(&HTTP_PORT) {
 			Some(Ok(h)) => h,
 			_ => {
@@ -51,7 +50,7 @@ unsafe fn serve(netsvc: u64) {
 			}
 		};
 		print(b"httpd: listening on port 80\n");
-		let mut lis = listener::Client::new(ChannelTransport { chan: listen_chan });
+		let mut lis = ListenerClient::new(listen_chan);
 		// accept() blocks until an inbound connection completes; the loop ends when the
 		// listener channel closes (NetworkService gone).
 		loop {
@@ -72,7 +71,7 @@ unsafe fn serve(netsvc: u64) {
 // not blocking on a read keeps a request-less connection from wedging the accept loop.
 unsafe fn respond(sockh: u64) {
 	unsafe {
-		let mut sock = socket::Client::new(ChannelTransport { chan: sockh });
+		let mut sock = SocketClient::new(sockh);
 		match make_buffer(RESPONSE) {
 			Some(body) => {
 				let _ = sock.send(&body);

@@ -295,6 +295,30 @@ pub mod config {
 			decoded
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_config_config_get")]
+	fn channel_invoke_get(chan: u64, key: &str) -> Option<Result<String, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.get(key)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_config_config_list")]
+	fn channel_invoke_list(chan: u64) -> Option<Result<Vec<ConfigEntry>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.list()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_config_config_set")]
+	fn channel_invoke_set(chan: u64, entry: &ConfigEntry) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set(entry)
+	}
 }
 
 /// A file the user picked: a capability to its bytes (transferred out-of-band as
@@ -445,6 +469,14 @@ pub mod picker {
 			}
 			decoded
 		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_config_picker_pick")]
+	fn channel_invoke_pick(chan: u64) -> Option<Result<Picked, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.pick()
 	}
 }
 

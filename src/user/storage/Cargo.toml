@@ -10,7 +10,7 @@ description = "StorageService service and demo client"
 
 [features]
 default = []
-shared-image = ["ipc-client/shared-image", "rt/shared-image"]
+shared-image = ["ipc-client/shared-image", "proto/shared-image", "rt/shared-image"]
 
 [[bin]]
 name = "storage_service"

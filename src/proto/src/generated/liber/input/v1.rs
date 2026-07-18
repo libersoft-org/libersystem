@@ -257,6 +257,22 @@ pub mod input {
 			Some(reply_handle)
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_input_input_subscribe")]
+	fn channel_invoke_subscribe(chan: u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.subscribe()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_input_input_subscribe_keys")]
+	fn channel_invoke_subscribe_keys(chan: u64, focus: &u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.subscribe_keys(focus)
+	}
 }
 
 /// Privileged launcher boundary that mints a factory restricted to raw-key
@@ -371,6 +387,14 @@ pub mod input_admin {
 			}
 			decoded
 		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_input_input_admin_open_keys")]
+	fn channel_invoke_open_keys(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open_keys()
 	}
 }
 

@@ -3824,6 +3824,16 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   artifacts. Apply the same rule to generic render/codec helpers whose measured
   monomorphizations recur broadly: either expose a concrete domain function or prove the
   residual instantiation is command-specific and smaller than a library call boundary.
+  - Network pilot result (M126a, 2026-07-18): LSIDL generation emits 14 concrete
+    `ChannelTransport` implementation thunks in `proto.lslib`; the new 7,016/7,208/7,448-byte
+    `network-client.lslib` owns architecture-specific public tail-call trampolines and has
+    only `proto.lslib` in `DT_NEEDED`. A declaration-only `network-client` source crate
+    exposes `NetworkClient`, `SocketClient` and `ListenerClient` without making generic
+    transport or codec MIR visible to consumers. All eight network tools now import the
+    public provider symbols, and an image-build gate rejects `ChannelClient`,
+    `ChannelTransport`, `VecWriter` or private implementation imports in those production
+    objects. The complete 36-provider/68-executable graph passes on x86_64, AArch64 and
+    RISC-V; the wider domain-client rollout and monolithic protocol-codec split remain open.
 - [ ] Migrate in measured, independently runnable waves:
   1. `echo`, `uname`, `uptime`, `dmesg`, `free`, `lscpu`, `lsmem`, `lsirq`, `lspci`,
      `ptyecho`, `readln`, `script`: `lsrt` plus only the domain/CLI leaves they use;

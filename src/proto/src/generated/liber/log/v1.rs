@@ -464,6 +464,30 @@ pub mod log {
 			Some(reply_handle)
 		}
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_log_log_emit")]
+	fn channel_invoke_emit(chan: u64, e: &Entry) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.emit(e)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_log_log_query")]
+	fn channel_invoke_query(chan: u64, q: &Query) -> Option<Result<Vec<Entry>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.query(q)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_log_log_tail")]
+	fn channel_invoke_tail(chan: u64, q: &Query) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.tail(q)
+	}
 }
 
 impl Severity {
