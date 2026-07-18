@@ -14,7 +14,6 @@ extern crate alloc;
 use alloc::string::String;
 use proto::codec::JsonMode;
 use rt::*;
-use tools::recv_json_mode;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -25,7 +24,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string - the sub-form ("" for text, "json" /
 		//    "json-min" for JSON).
-		let mode: Option<JsonMode> = recv_json_mode(bootstrap, &mut buf);
+		let mode: Option<JsonMode> = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, .. } => JsonMode::parse(&buf[..len]),
+			Received::Closed => exit(),
+		};
 		// 3. read the online CPU set and the CPU model, and render them.
 		let mut ids: [u32; 64] = [0u32; 64];
 		let count: i64 = cpu_info(&mut ids);

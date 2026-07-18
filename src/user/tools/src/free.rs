@@ -14,7 +14,6 @@ extern crate alloc;
 
 use alloc::string::String;
 use rt::*;
-use tools::push_decimal;
 
 // Bytes per physical frame.
 const FRAME_SIZE: u64 = 4096;
@@ -80,4 +79,19 @@ fn push_size(out: &mut String, bytes: u64, human: bool) {
 	out.push_str(" B");
 }
 
-// `push_decimal` comes from the shared tools crate.
+fn push_decimal(out: &mut String, value: u64) {
+	let mut digits: [u8; 20] = [0u8; 20];
+	let mut value = value;
+	let mut len = 0;
+	loop {
+		digits[len] = b'0' + (value % 10) as u8;
+		value /= 10;
+		len += 1;
+		if value == 0 {
+			break;
+		}
+	}
+	for index in (0..len).rev() {
+		out.push(digits[index] as char);
+	}
+}

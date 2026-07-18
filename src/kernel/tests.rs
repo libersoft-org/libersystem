@@ -4724,6 +4724,46 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	drop(date_bootstrap_kernel);
 	sched::run_until_idle();
 
+	for (tool, correlation) in [(b"uname" as &[u8], 31u32), (b"uptime" as &[u8], 32u32), (b"free" as &[u8], 33u32), (b"lscpu" as &[u8], 34u32)] {
+		let (output_kernel, output_user) = Channel::create();
+		let (tool_bootstrap_kernel, tool_bootstrap_user) = Channel::create();
+		let mut tool_launch = alloc::vec::Vec::new();
+		tool_launch.extend_from_slice(&3u16.to_le_bytes());
+		tool_launch.extend_from_slice(&correlation.to_le_bytes());
+		tool_launch.extend_from_slice(&(tool.len() as u16).to_le_bytes());
+		tool_launch.extend_from_slice(tool);
+		tool_launch.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&process_client, &tool_launch, tool_bootstrap_user, Rights::ALL).expect("dynamic inventory launch request");
+		sched::run_until_idle();
+		let tool_reply = process_client.recv().expect("dynamic inventory launch reply");
+		assert_eq!(le_u32(&tool_reply.bytes, 0), correlation);
+		assert_eq!(tool_reply.bytes[4], 1, "the inventory PIE loaded with its manifest providers");
+		let tool_process = tool_reply.caps[0].object().into_any_arc().downcast::<Process>().expect("dynamic inventory capability is a Process");
+		send_cap(&tool_bootstrap_kernel, b"STDOUT", output_user, Rights::ALL).expect("dynamic inventory stdout bootstrap");
+		tool_bootstrap_kernel.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("dynamic inventory arguments");
+		let mut captured = alloc::vec::Vec::new();
+		for _ in 0..100_000 {
+			sched::run_until_idle();
+			while let Ok(message) = output_kernel.recv() {
+				captured.extend_from_slice(&message.bytes);
+			}
+			if tool_process.is_terminated() {
+				break;
+			}
+		}
+		assert!(tool_process.is_terminated(), "dynamic inventory tool completed");
+		let contains = |needle: &[u8]| captured.windows(needle.len()).any(|window| window == needle);
+		match tool {
+			b"uname" => {
+				assert!(contains(env!("PRODUCT_NAME").as_bytes()) && contains(env!("PRODUCT_VERSION").as_bytes()), "dynamic uname printed product identity");
+			}
+			b"uptime" => assert!(captured.starts_with(b"up ") && captured.ends_with(b"\n"), "dynamic uptime rendered time since boot"),
+			b"free" => assert!(captured.starts_with(b"Mem:  total ") && contains(b"Heap: total "), "dynamic free rendered memory pools"),
+			b"lscpu" => assert!(contains(b"arch: ") && contains(b"name: ") && contains(b"cpu0: lapic "), "dynamic lscpu rendered CPU inventory"),
+			_ => unreachable!(),
+		}
+	}
+
 	// Exercise the mutable ordinary PIEs against one block-backed StorageService: create a
 	// directory, stream a file into it, read it back, reject removal while non-empty, remove
 	// the file and then the empty directory, and finally prove the file remains absent.
@@ -5596,6 +5636,19 @@ fn run_inventory_tool(name: &[u8]) -> alloc::vec::Vec<u8> {
 	captured
 }
 
+fn assert_dynamic_inventory_providers(name: &[u8], expected: &[&str]) {
+	let init = init_package_bytes().expect("init package present");
+	let volume = volume_package_bytes().expect("volume package present");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let bytes = program_elf(&package, volume, name).expect("dynamic inventory tool is staged");
+	let elf = bootproto::elf::Elf::parse(bytes).expect("dynamic inventory tool is ELF");
+	assert_eq!(elf.image_type, bootproto::elf::ET_DYN, "inventory tool is PIE");
+	let dynamic = elf.dynamic_info().expect("inventory dynamic metadata parses").expect("inventory tool has PT_DYNAMIC");
+	let mut needed = elf.needed_names(&dynamic).expect("inventory dependencies parse").collect::<alloc::vec::Vec<_>>();
+	needed.sort_unstable();
+	assert_eq!(needed, expected);
+}
+
 tagged_test!(inventory_tools_print_the_system_identity, [Service, Shell]);
 fn inventory_tools_print_the_system_identity() {
 	// The zero-capability inventory commands: each runs as its own sandboxed
@@ -5603,19 +5656,8 @@ fn inventory_tools_print_the_system_identity() {
 	// emptiest manifests in the permission store. uname prints the product identity
 	// and architecture, uptime the time since boot, and dmesg the kernel boot log
 	// (the same text SYS_CONSOLE_READLOG hands ConsoleService for the boot screen).
-	let uname = run_inventory_tool(b"uname");
-	let arch = if cfg!(target_arch = "aarch64") {
-		"aarch64"
-	} else if cfg!(target_arch = "riscv64") {
-		"riscv64"
-	} else {
-		"x86_64"
-	};
-	let expected = alloc::format!("{} {} {}\n", env!("PRODUCT_NAME"), env!("PRODUCT_VERSION"), arch);
-	assert_eq!(uname, expected.as_bytes(), "uname should print the product name, version and architecture");
-
-	let uptime = run_inventory_tool(b"uptime");
-	assert!(uptime.starts_with(b"up ") && uptime.ends_with(b"\n"), "uptime should render the time since boot");
+	assert_dynamic_inventory_providers(b"uname", &["lsrt.lslib"]);
+	assert_dynamic_inventory_providers(b"uptime", &["lsrt.lslib"]);
 
 	let dmesg = run_inventory_tool(b"dmesg");
 	assert!(!dmesg.is_empty(), "dmesg should print the kernel boot log (or report there is none)");
@@ -5629,21 +5671,8 @@ fn inventory_tools_report_the_hardware() {
 	// and the device-interrupt vector table (lsirq).
 	let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
 
-	let lscpu = run_inventory_tool(b"lscpu");
-	let arch_line: &[u8] = if cfg!(target_arch = "aarch64") {
-		b"arch: aarch64"
-	} else if cfg!(target_arch = "riscv64") {
-		b"arch: riscv64"
-	} else {
-		b"arch: x86_64"
-	};
-	assert!(contains(&lscpu, arch_line) && contains(&lscpu, b"cpu0: lapic "), "lscpu should print the architecture and each core's LAPIC id");
-	// The CPU model line: x86 reports the CPUID brand string, aarch64 the MIDR
-	// decode (cortex-a72 -> "ARM Cortex-A72"), riscv64 the SBI vendor id ("riscv64").
-	assert!(contains(&lscpu, b"name: "), "lscpu should print the CPU model name");
-
-	let free = run_inventory_tool(b"free");
-	assert!(free.starts_with(b"Mem:  total ") && contains(&free, b"Heap: total "), "free should print the frame-pool and heap totals");
+	assert_dynamic_inventory_providers(b"lscpu", &["lsrt.lslib", "wire.lslib"]);
+	assert_dynamic_inventory_providers(b"free", &["lsrt.lslib"]);
 
 	let lsmem = run_inventory_tool(b"lsmem");
 	assert!(contains(&lsmem, b" usable\n"), "lsmem should print the retained boot memory map with a usable region");

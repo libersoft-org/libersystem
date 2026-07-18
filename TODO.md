@@ -3596,7 +3596,13 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     directory and confirms the nested file stays absent. `ls` and `du` use the same four
     providers; `ls` is 30,752/31,304/36,040 bytes and proves the live directory entry plus
     summary, while `du` is 15,712/16,560/18,296 bytes and reports the nested file's exact
-    13-byte subtree total. The remaining executable set is still open.
+    13-byte subtree total. The zero-capability inventory group now includes PIE `uname`
+    (3,040/3,208/3,824 bytes), `uptime` (4,040/4,368/4,784 bytes) and `free`
+    (7,728/9,080/10,120 bytes) over only `lsrt`, plus `lscpu`
+    (9,216/10,296/11,024 bytes) over `wire + lsrt`; QEMU preserves their identity,
+    clock, memory and CPU output contracts. Two tiny package-local `tools` helper imports
+    were moved into their owning binaries rather than creating a catch-all provider. The
+    remaining executable set is still open.
 - [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,
   crate/source owner, output class/path, direct providers and build-feature set; each
