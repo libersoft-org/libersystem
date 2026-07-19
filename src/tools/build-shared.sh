@@ -73,9 +73,12 @@ library_file() {
 	wire) printf 'wire/shared/%s/wire.lslib' "$target" ;;
 	config-client) printf 'user/config-client-provider/shared/%s/config-client.lslib' "$target" ;;
 	device-client) printf 'user/device-client-provider/shared/%s/device-client.lslib' "$target" ;;
+	log-client) printf 'user/log-client-provider/shared/%s/log-client.lslib' "$target" ;;
 	network-client) printf 'user/network-client-provider/shared/%s/network-client.lslib' "$target" ;;
+	observability-client) printf 'user/observability-client-provider/shared/%s/observability-client.lslib' "$target" ;;
 	process-client) printf 'user/process-client-provider/shared/%s/process-client.lslib' "$target" ;;
 	resources-client) printf 'user/resources-client-provider/shared/%s/resources-client.lslib' "$target" ;;
+	time-client) printf 'user/time-client-provider/shared/%s/time-client.lslib' "$target" ;;
 	wasm) printf 'wasm/shared/%s/wasm.lslib' "$target" ;;
 	term) printf 'term/shared/%s/term.lslib' "$target" ;;
 	service-util) printf 'user/services/shared/%s/service-util.lslib' "$target" ;;
@@ -865,6 +868,34 @@ if [[ -n "$image_graph" ]]; then
 			fi
 			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_device_' <<<"$consumer_imports"; then
 				echo "build-shared: $consumer bypasses the concrete device client provider" >&2
+				exit 1
+			fi
+			;;
+		log)
+			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter' <<<"$consumer_imports"; then
+				echo "build-shared: log contains a generic channel client implementation" >&2
+				exit 1
+			fi
+			for domain in log time; do
+				if ! grep -q "^liber_channel_liber_${domain}_" <<<"$consumer_imports"; then
+					echo "build-shared: log does not import the concrete $domain client provider" >&2
+					exit 1
+				fi
+				if grep -Eq "^liber_channel_impl_liber_${domain}_" <<<"$consumer_imports"; then
+					echo "build-shared: log bypasses the concrete $domain client provider" >&2
+					exit 1
+				fi
+			done
+			;;
+		date)
+			if ! grep -q '^liber_channel_liber_time_' <<<"$consumer_imports" || grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_time_' <<<"$consumer_imports"; then
+				echo "build-shared: date bypasses the concrete time client provider" >&2
+				exit 1
+			fi
+			;;
+		lssvc)
+			if ! grep -q '^liber_channel_liber_observability_' <<<"$consumer_imports" || grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_observability_' <<<"$consumer_imports"; then
+				echo "build-shared: lssvc bypasses the concrete observability client provider" >&2
 				exit 1
 			fi
 			;;

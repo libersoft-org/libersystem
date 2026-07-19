@@ -83,8 +83,11 @@ library   proto                 proto      volume -            ipc-client wire l
 library   network-client        network-client-provider volume shared-image proto
 library   config-client         config-client-provider volume shared-image proto
 library   device-client         device-client-provider volume shared-image proto
+library   log-client            log-client-provider volume shared-image proto
 library   process-client        process-client-provider volume shared-image proto
 library   resources-client      resources-client-provider volume shared-image proto
+library   observability-client  observability-client-provider volume shared-image proto
+library   time-client           time-client-provider volume shared-image proto
 library   pix                   pix        volume -            lsrt
 library   inflate               inflate    volume -            lsrt
 library   deflate               deflate    volume -            lsrt
@@ -125,7 +128,7 @@ dynamic   file_picker           services  volume proto ipc-client wire lsrt
 dynamic   storage_client        storage   volume proto ipc-client wire lsrt
 
 # command-line tools - loaded from the system volume under bin/.
-dynamic   date       tools  volume proto ipc-client wire lsrt
+dynamic   date       tools  volume time-client proto lsrt
 dynamic   cat        tools  volume proto ipc-client wire lsrt
 dynamic   write      tools  volume proto wire lsrt
 dynamic   rm         tools  volume proto ipc-client wire lsrt
@@ -133,7 +136,7 @@ dynamic   ls         tools  volume proto ipc-client wire lsrt
 dynamic   du         tools  volume proto ipc-client wire lsrt
 dynamic   mkdir      tools  volume proto ipc-client wire lsrt
 dynamic   rmdir      tools  volume proto ipc-client wire lsrt
-dynamic   log        tools  volume proto ipc-client wire lsrt
+dynamic   log        tools  volume log-client time-client proto wire lsrt
 dynamic   snap       tools  volume proto ipc-client wire lsrt
 dynamic   volume     tools  volume proto ipc-client wire lsrt
 dynamic   lsdev      tools  volume device-client proto wire lsrt
@@ -158,7 +161,7 @@ dynamic   free       tools  volume lsrt
 dynamic   lsmem      tools  volume wire lsrt
 dynamic   lsirq      tools  volume wire lsrt
 dynamic   lspci      tools  volume wire lsrt
-dynamic   lssvc      tools  volume proto ipc-client wire lsrt
+dynamic   lssvc      tools  volume observability-client proto wire lsrt
 dynamic   lsblk      tools  volume proto ipc-client wire lsrt
 dynamic   lsusb      tools  volume device-client proto wire lsrt
 dynamic   echo       tools  volume lsrt

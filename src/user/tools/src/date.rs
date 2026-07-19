@@ -11,9 +11,9 @@
 #![no_std]
 #![no_main]
 
-use ipc_client::ChannelTransport;
-use proto::system::{Timestamp, time};
+use proto::system::Timestamp;
 use rt::*;
+use time_client::TimeClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -38,7 +38,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // the first message reads exactly the rendered instant.
 unsafe fn date(timesvc: u64) {
 	unsafe {
-		let mut client = time::Client::new(ChannelTransport { chan: timesvc });
+		let mut client = TimeClient::new(timesvc);
 		let ts: Timestamp = match client.now() {
 			Some(Ok(t)) => t,
 			_ => {

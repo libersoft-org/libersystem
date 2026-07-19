@@ -3861,6 +3861,17 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     service/shell runtime coverage passes 39/39 and boot/storage package coverage passes
     21/21. The broader `service,shell,drivers` selection separately exposes a pre-existing
     x86 paging overflow in the driver-crash teardown and is not counted as green here.
+  - Log/time/observability result (M126a, 2026-07-19): `log-client.lslib`
+    (3,120/3,240/3,512 bytes) owns three log query/emit/tail trampolines,
+    `time-client.lslib` (2,496/2,568/2,840 bytes) owns `time.now`, and
+    `observability-client.lslib` (2,992/3,072/3,344 bytes) owns system-graph and
+    supervisor-status trampolines; each directly needs only `proto.lslib`. `date`, `log`
+    and `lssvc` import 1/3/1 public concrete symbols with no generic transport/client,
+    `VecWriter` or private implementation imports, pinned by the image gate. On x86_64,
+    the tools shrank from 6,080/16,560/11,224 to 4,280/11,720/8,128 bytes. The complete
+    43-provider/68-executable graph passes on x86_64, AArch64 and RISC-V, and focused
+    service/shell runtime coverage passes 39/39; boot/storage package coverage passes
+    21/21.
 - [ ] Migrate in measured, independently runnable waves:
   1. `echo`, `uname`, `uptime`, `dmesg`, `free`, `lscpu`, `lsmem`, `lsirq`, `lspci`,
      `ptyecho`, `readln`, `script`: `lsrt` plus only the domain/CLI leaves they use;

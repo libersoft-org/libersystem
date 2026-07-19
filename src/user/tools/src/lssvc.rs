@@ -16,9 +16,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
+use observability_client::SupervisorClient;
 use proto::codec::JsonMode;
-use proto::system::supervisor;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -60,7 +59,7 @@ fn parse_args(args: &[u8]) -> (Option<JsonMode>, &[u8]) {
 // starts with `filter`, as text (the default) or as a JSON array.
 unsafe fn query_services(statsvc: u64, mode: Option<JsonMode>, filter: &[u8]) {
 	unsafe {
-		let mut client = supervisor::Client::new(ChannelTransport { chan: statsvc });
+		let mut client = SupervisorClient::new(statsvc);
 		match client.status() {
 			Some(Ok(entries)) => {
 				if let Some(mode) = mode {

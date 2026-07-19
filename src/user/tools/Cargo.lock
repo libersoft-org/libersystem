@@ -223,6 +223,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "log-client"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "log-client-provider"
+version = "0.0.0"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -270,6 +281,17 @@ checksum = "7fa5f306a6f2c01b4fd172f29bb46195b1764061bf926c75e96ff55df3178208"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "observability-client"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "observability-client-provider"
+version = "0.0.0"
 
 [[package]]
 name = "ogg"
@@ -387,6 +409,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "time-client"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "time-client-provider"
+version = "0.0.0"
+
+[[package]]
 name = "tinyvec"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -415,9 +448,13 @@ dependencies = [
  "imgconv",
  "ipc-client",
  "keys",
+ "log-client",
+ "log-client-provider",
  "mp3",
  "network-client",
  "network-client-provider",
+ "observability-client",
+ "observability-client-provider",
  "pix",
  "png",
  "process-client",
@@ -427,6 +464,8 @@ dependencies = [
  "resources-client-provider",
  "rt",
  "surface",
+ "time-client",
+ "time-client-provider",
  "vorbis",
  "wav",
  "wavpack",

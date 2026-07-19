@@ -4628,7 +4628,7 @@ fn system_packages_use_canonical_executable_names() {
 		library_identities += usize::from(name.starts_with(b"id/lib/"));
 		executable_identities += usize::from(name.starts_with(b"id/bin/"));
 	}
-	assert_eq!(library_identities, 40, "every staged library has one identity record");
+	assert_eq!(library_identities, 43, "every staged library has one identity record");
 	assert_eq!(executable_identities, 68, "every staged dynamic executable has one identity record");
 	assert!(volume.lookup(b"id/lib/imgconv").is_some(), "library identity namespace preserves imgconv");
 	assert!(volume.lookup(b"id/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");

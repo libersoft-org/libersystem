@@ -17,10 +17,11 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
+use log_client::LogClient;
 use proto::codec::JsonMode;
-use proto::system::{Entry, Query, Timestamp, log, time};
+use proto::system::{Entry, Query, Timestamp, log};
 use rt::*;
+use time_client::TimeClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -79,7 +80,7 @@ unsafe fn query_log(logsvc: u64, timesvc: u64, boot: Option<u32>, mode: Option<J
 	unsafe {
 		let q = Query { since: None, min_severity: None, source: None, boot, limit: 32 };
 		let epoch: Option<u64> = if boot.is_none() { boot_epoch(timesvc) } else { None };
-		let mut client = log::Client::new(ChannelTransport { chan: logsvc });
+		let mut client = LogClient::new(logsvc);
 		match client.query(&q) {
 			Some(Ok(entries)) => {
 				if let Some(mode) = mode {
@@ -116,7 +117,7 @@ unsafe fn tail_log(logsvc: u64, timesvc: u64, mode: Option<JsonMode>) {
 	unsafe {
 		let q = Query { since: None, min_severity: None, source: None, boot: None, limit: 0 };
 		let epoch: Option<u64> = boot_epoch(timesvc);
-		let mut client = log::Client::new(ChannelTransport { chan: logsvc });
+		let mut client = LogClient::new(logsvc);
 		let consumer: u64 = match client.tail(&q) {
 			Some(h) => h,
 			None => {
@@ -152,7 +153,7 @@ unsafe fn tail_log(logsvc: u64, timesvc: u64, mode: Option<JsonMode>) {
 // clock, so a record's tick can be rendered as wall-clock time. None if time is unavailable.
 unsafe fn boot_epoch(timesvc: u64) -> Option<u64> {
 	unsafe {
-		let mut client = time::Client::new(ChannelTransport { chan: timesvc });
+		let mut client = TimeClient::new(timesvc);
 		match client.now() {
 			Some(Ok(ts)) => Some(ts.unix_secs.saturating_sub(clock() / 100)),
 			_ => None,
