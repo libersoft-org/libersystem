@@ -1,6 +1,57 @@
 #![no_std]
 
 use core::arch::global_asm;
+use proto::system::{volume, Error};
+use rt::{close, recv_vec_blocking, send_blocking, ReceivedVec};
+use wire::{Sink, VecWriter};
+
+#[unsafe(export_name = "liber_channel_liber_storage_volume_write_stream_begin")]
+pub unsafe fn write_stream_begin(chan: u64, correlation: u32, path: &str, data: u64) -> bool {
+	unsafe {
+		let mut writer = VecWriter::new();
+		let encoded = (|| {
+			writer.u16(volume::OP_WRITE_STREAM)?;
+			writer.u32(correlation)?;
+			writer.bytes_lp(path.as_bytes())?;
+			writer.set_handle(data)?;
+			writer.u32(0)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			close(data);
+			return false;
+		}
+		let request_handle = writer.handle();
+		let request = writer.into_inner();
+		if send_blocking(chan, &request, request_handle) {
+			true
+		} else {
+			close(data);
+			false
+		}
+	}
+}
+
+#[unsafe(export_name = "liber_channel_liber_storage_volume_write_stream_finish")]
+pub unsafe fn write_stream_finish(chan: u64, correlation: u32) -> Option<Result<(), Error>> {
+	unsafe {
+		let ReceivedVec::Message { bytes, handle } = recv_vec_blocking(chan) else { return None };
+		if handle != 0 {
+			close(handle);
+			return None;
+		}
+		if bytes.len() < 5 || u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != correlation {
+			return None;
+		}
+		if bytes[4] != 0 {
+			return if bytes.len() == 5 { Some(Ok(())) } else { None };
+		}
+		if bytes.len() != 6 {
+			return None;
+		}
+		Some(Err(Error::decode(&bytes[5..])?))
+	}
+}
 
 #[cfg(target_arch = "x86_64")]
 macro_rules! forward {

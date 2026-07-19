@@ -3918,6 +3918,18 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     its reply arrives only after drain, so wrapping it in the generated blocking
     `write-stream` thunk would deadlock. Its concrete boundary must preserve that async
     request/data/reply ordering.
+  - Async volume-write result (M126a, 2026-07-19): `volume-client.lslib` now owns a
+    split write-stream begin/finish boundary that sends the request and transferred data
+    channel before blocking for its reply. An opaque, non-cloneable pending token carries
+    the exact channel/correlation into finish; the provider rejects a wrong correlation,
+    trailing bytes or an unexpected reply handle and decodes typed service errors. `write`
+    retains only its bounded 32 kB chunk pump and imports the two public split symbols,
+    with no opcode, `VecWriter`, generic channel client or private storage implementation
+    left in the executable. The provider is 5,712/5,968/5,840 bytes over direct
+    `proto + wire + lsrt`; `write` falls from 7,456/8,000/9,288 to
+    7,008/7,656/8,984 bytes on x86_64/AArch64/RISC-V. All three image graphs pass;
+    focused service/storage streamed write/read/mutation coverage passes 41/41 and
+    boot/storage package coverage passes 21/21.
 - [ ] Migrate in measured, independently runnable waves:
   1. `echo`, `uname`, `uptime`, `dmesg`, `free`, `lscpu`, `lsmem`, `lsirq`, `lspci`,
      `ptyecho`, `readln`, `script`: `lsrt` plus only the domain/CLI leaves they use;

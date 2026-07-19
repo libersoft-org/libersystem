@@ -90,7 +90,7 @@ library   resources-client      resources-client-provider volume shared-image pr
 library   security-client       security-client-provider volume shared-image proto
 library   observability-client  observability-client-provider volume shared-image proto
 library   time-client           time-client-provider volume shared-image proto
-library   volume-client         volume-client-provider volume shared-image proto
+library   volume-client         volume-client-provider volume shared-image proto wire lsrt
 library   pix                   pix        volume -            lsrt
 library   inflate               inflate    volume -            lsrt
 library   deflate               deflate    volume -            lsrt
@@ -133,7 +133,7 @@ dynamic   storage_client        storage   volume proto ipc-client wire lsrt
 # command-line tools - loaded from the system volume under bin/.
 dynamic   date       tools  volume time-client proto lsrt
 dynamic   cat        tools  volume volume-client proto lsrt
-dynamic   write      tools  volume proto wire lsrt
+dynamic   write      tools  volume volume-client proto lsrt
 dynamic   rm         tools  volume volume-client proto lsrt
 dynamic   ls         tools  volume proto ipc-client wire lsrt
 dynamic   du         tools  volume proto ipc-client wire lsrt

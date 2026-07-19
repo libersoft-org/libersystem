@@ -966,6 +966,18 @@ if [[ -n "$image_graph" ]]; then
 				exit 1
 			fi
 			;;
+		write)
+			for phase in begin finish; do
+				if ! grep -q "^liber_channel_liber_storage_volume_write_stream_${phase}$" <<<"$consumer_imports"; then
+					echo "build-shared: write does not import concrete write-stream $phase" >&2
+					exit 1
+				fi
+			done
+			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_storage_' <<<"$consumer_imports"; then
+				echo "build-shared: write bypasses the concrete volume client provider" >&2
+				exit 1
+			fi
+			;;
 		perm)
 			if ! grep -q '^liber_channel_liber_security_' <<<"$consumer_imports" || grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_security_' <<<"$consumer_imports"; then
 				echo "build-shared: perm bypasses the concrete security client provider" >&2

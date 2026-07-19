@@ -17,8 +17,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::path;
-use proto::system::volume;
 use rt::*;
+use volume_client::VolumeClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -61,7 +61,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		// route the path to the client for the volume it names.
 		let storage: u64 = path::volume_client(cwd_str, path_arg, system, media, iso, udf, usb);
-		write(storage, uri.as_bytes(), text);
+		write(storage, &uri, text);
 	}
 	exit();
 }
@@ -73,12 +73,9 @@ const WRITE_CHUNK: usize = 32 * 1024;
 
 // Send the text through the storage grant's streaming write form - the file's bytes
 // travel as plain messages on a fresh channel (closed = end of data), so a file's
-// size is bounded by the filesystem, never by one transfer. The request wire is
-// built by hand: the generated blocking client would await the reply before the
-// data is sent, and the reply only comes once the data channel is drained.
-unsafe fn write(storage: u64, uri: &[u8], text: &[u8]) {
+// size is bounded by the filesystem, never by one transfer.
+unsafe fn write(storage: u64, uri: &str, text: &[u8]) {
 	unsafe {
-		use proto::codec::{Sink, VecWriter};
 		let (producer, consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => {
@@ -86,49 +83,29 @@ unsafe fn write(storage: u64, uri: &[u8], text: &[u8]) {
 				return;
 			}
 		};
-		// the OP_WRITE_STREAM request: [op u16][corr u32][path][handle marker u32],
-		// the data channel's consumer end riding out-of-band (the same wire the
-		// generated client builds).
-		let request: Vec<u8> = {
-			let mut w = VecWriter::new();
-			let build = |w: &mut VecWriter| -> Option<()> {
-				w.u16(volume::OP_WRITE_STREAM)?;
-				w.u32(1)?;
-				w.bytes_lp(uri)?;
-				w.set_handle(consumer)?;
-				w.u32(0)?;
-				Some(())
-			};
-			if build(&mut w).is_none() {
-				print(b"write: out of memory\n");
+		let pending = match VolumeClient::new(storage).begin_write_stream(uri, consumer) {
+			Some(pending) => pending,
+			None => {
+				close(producer);
+				print(b"write: could not write ");
+				print(uri.as_bytes());
+				print(b"\n");
 				return;
 			}
-			w.into_inner()
 		};
-		if !send_blocking(storage, &request, consumer) {
-			print(b"write: could not write ");
-			print(uri);
-			print(b"\n");
-			return;
-		}
 		for chunk in text.chunks(WRITE_CHUNK) {
 			if !send_blocking(producer, chunk, 0) {
 				break;
 			}
 		}
 		close(producer);
-		// the reply arrives once the whole file is written: [corr u32][ok u8].
-		let ok: bool = match recv_vec_blocking(storage) {
-			ReceivedVec::Message { bytes, .. } => bytes.len() >= 5 && bytes[4] == 1,
-			ReceivedVec::Closed => false,
-		};
-		if ok {
+		if matches!(pending.finish(), Some(Ok(()))) {
 			print(b"wrote ");
-			print(uri);
+			print(uri.as_bytes());
 			print(b"\n");
 		} else {
 			print(b"write: could not write ");
-			print(uri);
+			print(uri.as_bytes());
 			print(b"\n");
 		}
 	}

@@ -8,4 +8,9 @@ path = "src/lib.rs"
 
 [features]
 default = []
-shared-image = []
+shared-image = ["proto/shared-image", "rt/shared-image"]
+
+[dependencies]
+proto = { path = "../../proto" }
+rt = { path = "../rt" }
+wire = { path = "../../wire" }

@@ -509,6 +509,11 @@ dependencies = [
 [[package]]
 name = "volume-client-provider"
 version = "0.0.0"
+dependencies = [
+ "proto",
+ "rt",
+ "wire",
+]
 
 [[package]]
 name = "vorbis"
