@@ -14,7 +14,7 @@ fn main() {
 	export_product_metadata(&conf);
 	assemble_init_package(&conf);
 	assemble_volume_package(&conf);
-	embed_aarch64_demo();
+	export_cross_arch_volume();
 }
 
 fn select_linker_script() {
@@ -30,29 +30,12 @@ fn select_linker_script() {
 	println!("cargo:rerun-if-changed=build.rs");
 }
 
-// On aarch64 / riscv64, embed the pre-built `echo` userspace ELF so the kernel can load
-// and run a real rt-based program as an end-to-end bring-up demo. Written to OUT_DIR
-// (empty when the ELF is absent, e.g. a bare `cargo build` without the userspace
-// built first), so the kernel always builds and the demo simply does not run. On
-// x86_64 the embedded blob is empty (it routes userspace via the init package instead).
-fn embed_aarch64_demo() {
-	let out_dir: PathBuf = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-	let dest: PathBuf = out_dir.join("echo_demo.elf");
+// Expose the assembled volume package at a stable path so the direct AArch64/RISC-V QEMU
+// runners can lay the factory archive onto virtio-blk at LBA 0.
+fn export_cross_arch_volume() {
 	let arch: String = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-	let bytes: Vec<u8> = if arch == "aarch64" || arch == "riscv64" {
-		let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-		let elf: PathBuf = PathBuf::from(&manifest_dir).join(format!("../user/tools/target/{}/debug/echo", user_target()));
-		println!("cargo:rerun-if-changed={}", elf.display());
-		fs::read(&elf).unwrap_or_default()
-	} else {
-		Vec::new()
-	};
-	fs::write(&dest, &bytes).unwrap_or_else(|e: std::io::Error| panic!("cannot write {}: {e}", dest.display()));
-
-	// Expose the assembled volume package at a stable path so the aarch64 QEMU
-	// runner can lay it (the factory archive) onto a virtio-blk disk at LBA 0, which
-	// StorageService reads to format and seed the vol://system volume.
 	if arch == "aarch64" || arch == "riscv64" {
+		let out_dir: PathBuf = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
 		let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
 		let build_dir: PathBuf = PathBuf::from(&manifest_dir).join("../boot/.build");
 		let _ = fs::create_dir_all(&build_dir);

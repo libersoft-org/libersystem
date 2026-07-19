@@ -87,7 +87,6 @@ user: shared-libs
 	cd {{services_dir}} && cargo build
 	cd {{storage_dir}} && cargo build
 	cd {{drivers_dir}} && cargo build
-	cd {{usertools_dir}} && cargo build
 
 # build the userspace programs for aarch64 (the aarch64 kernel build.rs reads them
 # from each crate's aarch64-unknown-none target dir)
@@ -96,7 +95,6 @@ user-aarch64: shared-libs-aarch64
 	cd {{services_dir}} && cargo build --target aarch64-unknown-none
 	cd {{storage_dir}} && cargo build --target aarch64-unknown-none
 	cd {{drivers_dir}} && cargo build --target aarch64-unknown-none
-	cd {{usertools_dir}} && cargo build --target aarch64-unknown-none
 
 # build the WebAssembly component SDK example (the `liber` world guest) for
 # wasm32-unknown-unknown and stage it into the ramdisk volume as app.wasm, where
@@ -244,7 +242,6 @@ user-riscv64: shared-libs-riscv64
 	cd {{services_dir}} && cargo build --target riscv64gc-unknown-none-elf
 	cd {{storage_dir}} && cargo build --target riscv64gc-unknown-none-elf
 	cd {{drivers_dir}} && cargo build --target riscv64gc-unknown-none-elf
-	cd {{usertools_dir}} && cargo build --target riscv64gc-unknown-none-elf
 
 # build + boot the riscv64 build in QEMU over OpenSBI (emulated on an x86 host),
 # reaching the pinned userspace service chain over the serial console. The system

@@ -12,7 +12,7 @@
 - audio device selector tool (both input and output, when system has multiple sound devices)
 - kernel/tests.rs - too big - atomize
 - create image conversion tool
-- opengl / vulkan + render tests
+- sw render / opengl / vulkan + render tests
 - web camera viewer / recorder
 - tests are taking too long after every small task - optimization needed
 - Can it run Doom?

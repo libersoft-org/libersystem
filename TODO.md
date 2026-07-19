@@ -3898,6 +3898,56 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   same `lsrt`/domain-client frames; two codec consumers map the same codec text frames.
   Optimize relocation batching, symbol lookup/cache and page I/O later if launch latency
   is high; do not restore static linking as the optimization.
+- [ ] Make the manifest-driven image build safely incremental so the ordinary
+  `just run spice` edit/run loop does not clean-rebuild all providers and 68 executables.
+  Correctness is the hard gate: a cache hit is permitted only when a content-addressed
+  fingerprint proves that every input affecting the artifact is identical; a missing,
+  malformed or unrecognized input/fingerprint always rebuilds. Never use mtime, newest
+  `.rlib`, output existence or a developer-maintained dependency list as proof of a hit.
+  - Preserve the coherent Cargo target directory instead of unconditional `rm -rf`, but
+    namespace/invalidate it by rustc commit, Cargo version, target-spec bytes, profile,
+    complete rustflags/codegen settings, build-std settings, enabled features,
+    `Cargo.toml`/`Cargo.lock`, build scripts and relevant environment. Cargo remains the
+    owner of source/dependency freshness inside that namespace; changing any global graph
+    identity creates a miss rather than selecting an archive from another graph.
+  - Give every provider a recorded key over its complete source-tree digest, generated
+    inputs, selected Cargo artifact identity, feature set, linker/build-script version,
+    direct-provider identity digests and target/toolchain identity. Give every executable
+    a key over its bin source plus shared crate/build inputs, emitted-object identity,
+    start-object/linker settings, exact direct-provider identity digests and all audit/
+    identity tooling. A changed provider invalidates the reverse dependency closure and
+    every consumer that directly or transitively binds its identity; an unrelated leaf
+    does not invalidate other branches.
+  - Split build state from validated artifact state. Publish a `.lslib`/`.lsexe`, identity
+    record and order sidecar atomically only after compile, link and all current ELF/
+    ownership/W^X/relocation/provider audits pass. Interrupted or failed builds leave the
+    previous validated set untouched but marked unusable whenever its expected key changed.
+    Cache hits still verify bounded metadata, key/identity equality and output hashes;
+    full ELF audits may use keyed audit-result records, never be silently skipped.
+  - Parse each provider ELF once per invocation into a symbol-owner/`DT_NEEDED`/segment/
+    relocation index and reuse it for every consumer, rather than spawning
+    `llvm-readelf` for every import/provider pair. Cache canonical provider orders by the
+    sorted root-provider identity set. Parallelize only independent link/audit jobs after
+    measuring Cargo/rustc stability; do not run competing Cargo writers against one target
+    directory or weaken the expected ET_REL boundary to gain speed.
+  - Keep two explicit modes: incremental is the default for `just run*`; a clean
+    `shared-libs-verify`/CI mode rebuilds from an empty cache, compares generated identities
+    and output hashes where reproducibility is expected, and runs the complete graph audit
+    on x86_64/AArch64/RISC-V. Both modes produce the same manifest inventory and security
+    decisions. Print per-stage timings plus cache hit/miss counts and a concise miss reason
+    (`source`, `feature`, `toolchain`, `provider`, `linker`, `audit-schema`, etc.).
+  - Add an invalidation matrix test before enabling incremental mode by default: no-change
+    rebuild, one tool source, shared tools source, one leaf provider, provider dependency,
+    generated LSIDL output, `proto`, `wire`, `lsrt`, manifest edge, feature, lockfile,
+    target spec, rustflags, linker/start object and audit script. For every mutation, assert
+    the exact required rebuild set is a subset of the actual set and no affected artifact
+    reports a hit; also assert unrelated graph branches remain hits. Finally compare a
+    warm incremental result byte-for-byte/identity-for-identity with a clean verify build.
+  - Acceptance target on the documented development host: a no-change `just run spice`
+    reaches kernel/QEMU launch in seconds rather than minutes, and editing one ordinary
+    tool rebuilds only that tool plus package assembly. Record cold/warm and representative
+    leaf/root invalidation timings in `docs/PERF.md`; performance never permits stale
+    artifacts, skipped ownership checks or restoration of static tool builds.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,
