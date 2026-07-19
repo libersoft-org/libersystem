@@ -3948,6 +3948,23 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     tool rebuilds only that tool plus package assembly. Record cold/warm and representative
     leaf/root invalidation timings in `docs/PERF.md`; performance never permits stale
     artifacts, skipped ownership checks or restoration of static tool builds.
+  - Incremental foundation result (M126a, 2026-07-19): the coherent Cargo cache is
+    namespaced by toolchain/target/codegen/build-std/config identity instead of deleted on
+    every invocation. Providers and executables have content-addressed source/provider/
+    build-tool keys plus output hashes; a hit revalidates identity bytes and embedded note,
+    ET_DYN, exact `DT_NEEDED`, W^X/dynamic tags and canonical order before reuse. Metadata
+    lives only under ignored `boot/.build`; `LIBER_IMAGE_REBUILD=1` and
+    `just shared-libs-verify` force the original empty-cache compile/link/audit path.
+    Keys include each executable's complete Cargo-resolved local dependency source closure
+    while keeping sibling tool bins independent. The x86_64 no-change graph fell from
+    399-423 s to 67-72 s with 40/40 provider and 68/68 executable hits; final warm
+    AArch64/RISC-V graphs take 75 s with the same 40/68 hit counts. A one-tool source
+    change rebuilt only `echo`; a provider change
+    rebuilt only `config-client` plus `config`/`set`; a forced clean rebuild produced all
+    284 public ELF/identity/order files byte-for-byte identical to the warm graph. Still
+    open in this item: automate the full mutation matrix, add cache timing/miss summaries
+    as structured output and reduce the remaining ~70 s repeated ELF-process overhead
+    with a parsed provider index.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

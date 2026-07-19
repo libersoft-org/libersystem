@@ -10,8 +10,15 @@ target="$1"
 shift
 root="$(cd "$(dirname "$0")/.." && pwd)"
 rust_min_stack="${RUST_MIN_STACK:-67108864}"
+force_rebuild="${LIBER_IMAGE_REBUILD:-0}"
+artifact_cache_dir="$root/boot/.build/image-artifacts-$target"
 cargo_target="$target"
 cargo_target_flags=()
+
+if [[ "$force_rebuild" != 0 && "$force_rebuild" != 1 ]]; then
+	echo "build-shared: LIBER_IMAGE_REBUILD must be 0 or 1" >&2
+	exit 2
+fi
 
 case "$target" in
 x86_64-unknown-none)
@@ -52,6 +59,13 @@ if [[ ! "$rustc_commit" =~ ^[0-9a-f]{40}$ ]]; then
 	exit 1
 fi
 
+build_tool_digest="$({
+	sha256sum "$root/tools/build-shared.sh" "$root/tools/build-exe-start.sh" "$root/tools/exe-start.rs" "$lld"
+	for tool in llvm-objcopy llvm-readelf llvm-strip; do
+		sha256sum "$(command -v "$tool")"
+	done
+} | sha256sum | awk '{print $1}')"
+
 library_file() {
 	case "$1" in
 	lsrt) printf 'user/rt/shared/%s/lsrt.lslib' "$target" ;;
@@ -75,9 +89,17 @@ library_identity_file() {
 
 source_digest() {
 	local crate_dir="$1"
+	local api_dir=""
+	if [[ "$crate_dir" == user/*-client-provider ]]; then
+		api_dir="${crate_dir%-provider}"
+		if [[ ! -f "$root/$api_dir/Cargo.toml" ]]; then
+			echo "build-shared: $crate_dir has no public API crate $api_dir" >&2
+			return 1
+		fi
+	fi
 	(
 		cd "$root"
-		find "$crate_dir" -path '*/target' -prune -o -path '*/shared' -prune -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' \) -print0 |
+		find "$crate_dir" ${api_dir:+"$api_dir"} -path '*/target' -prune -o -path '*/shared' -prune -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' \) -print0 |
 			sort -z |
 			while IFS= read -r -d '' source; do
 				printf '%s\n' "$source"
@@ -86,22 +108,76 @@ source_digest() {
 	) | sha256sum | awk '{print $1}'
 }
 
-emit_identity() {
+executable_source_digest() {
+	local crate_dir="$1"
+	local package="$2"
+	local artifact="$3"
+	if [[ "$package" == tools ]]; then
+		(
+			cd "$root"
+			printf 'dependency-closure=%s\n' "${package_source_digests[$package]}"
+			for source in "$crate_dir/Cargo.toml" "$crate_dir/Cargo.lock" "$crate_dir/src/lib.rs" "$crate_dir/src/$artifact.rs" user/build.rs user/user.ld user/user-aarch64.ld user/user-riscv64.ld ../product.conf; do
+				if [[ ! -f "$source" ]]; then
+					printf 'missing:%s\n' "$source"
+					continue
+				fi
+				printf '%s\n' "$source"
+				sha256sum "$source"
+			done
+		) | sha256sum | awk '{print $1}'
+		return
+	fi
+	{
+		printf 'dependency-closure=%s\n' "${package_source_digests[$package]:-$(source_digest "$crate_dir")}"
+		for source in "$root/user/build.rs" "$root/user/user.ld" "$root/user/user-aarch64.ld" "$root/user/user-riscv64.ld" "$root/../product.conf"; do
+			if [[ -f "$source" ]]; then
+				sha256sum "$source"
+			else
+				printf 'missing:%s\n' "$source"
+			fi
+		done
+		if [[ "$package" == services ]]; then
+			sha256sum "$root/user/services/manifest.txt"
+		fi
+	} | sha256sum | awk '{print $1}'
+}
+
+local_dependency_source_digest() {
+	local crate_dir="$1"
+	local exclude_root="${2:-0}"
+	local metadata
+	metadata="$(cd "$root" && cargo metadata --format-version 1 --manifest-path "$crate_dir/Cargo.toml")"
+	(
+		cd "$root"
+		jq -r --arg root "$root/$crate_dir/Cargo.toml" --arg exclude "$exclude_root" '.packages[] | select(.source == null and ($exclude != "1" or .manifest_path != $root)) | .manifest_path' <<<"$metadata" |
+			while IFS= read -r manifest_path; do
+				package_dir="$(dirname "$manifest_path")"
+				package_dir="${package_dir#"$root/"}"
+				find "$package_dir" -path '*/target' -prune -o -path '*/shared' -prune -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' \) -print
+			done |
+			sort -u |
+			while IFS= read -r source; do
+				printf '%s\n' "$source"
+				sha256sum "$source"
+			done
+	) | sha256sum | awk '{print $1}'
+}
+
+write_identity_record() {
 	local kind="$1"
 	local artifact="$2"
 	local package="$3"
-	local crate_dir="$4"
+	local source_sha="$4"
 	local feature_set="$5"
 	local providers="$6"
-	local elf="$7"
-	local identity="$elf.identity"
-	local provider digest note
+	local identity="$7"
+	local provider digest
 	{
 		printf 'format=liber-image-identity-v1\n'
 		printf 'kind=%s\n' "$kind"
 		printf 'artifact=%s\n' "$artifact"
 		printf 'package=%s\n' "$package"
-		printf 'source-sha256=%s\n' "$(source_digest "$crate_dir")"
+		printf 'source-sha256=%s\n' "$source_sha"
 		printf 'rustc-commit=%s\n' "$rustc_commit"
 		printf 'target=%s\n' "$target"
 		printf 'profile=release\n'
@@ -117,6 +193,35 @@ emit_identity() {
 			printf 'provider=%s:%s\n' "$provider" "$digest"
 		done
 	} >"$identity"
+}
+
+verify_identity_note() {
+	local elf="$1"
+	local identity="$2"
+	local digest note dumped_note
+	digest="$(sha256sum "$identity" | awk '{print $1}')"
+	note="$elf.identity.note.$$.expected"
+	dumped_note="$elf.identity.note.$$.dump"
+	printf '0600000020000000010000004c49424552000000' | xxd -r -p >"$note"
+	printf '%s' "$digest" | xxd -r -p >>"$note"
+	if ! llvm-objcopy --dump-section .note.liber.identity="$dumped_note" "$elf" 2>/dev/null || ! cmp -s "$note" "$dumped_note"; then
+		rm -f "$note" "$dumped_note"
+		return 1
+	fi
+	rm -f "$note" "$dumped_note"
+}
+
+emit_identity() {
+	local kind="$1"
+	local artifact="$2"
+	local package="$3"
+	local source_sha="$4"
+	local feature_set="$5"
+	local providers="$6"
+	local elf="$7"
+	local identity="$elf.identity"
+	local digest note dumped_note
+	write_identity_record "$kind" "$artifact" "$package" "$source_sha" "$feature_set" "$providers" "$identity"
 	digest="$(sha256sum "$identity" | awk '{print $1}')"
 	note="$elf.identity.note"
 	printf '0600000020000000010000004c49424552000000' | xxd -r -p >"$note"
@@ -129,6 +234,53 @@ emit_identity() {
 		exit 1
 	fi
 	rm -f "$note" "$dumped_note"
+}
+
+artifact_cache_key() {
+	local kind="$1"
+	local manifest_row="$2"
+	local identity="$3"
+	local extra="$4"
+	{
+		printf 'format=liber-image-artifact-cache-v1\n'
+		printf 'build-tools=%s\n' "$build_tool_digest"
+		printf 'kind=%s\n' "$kind"
+		printf 'manifest=%s\n' "$manifest_row"
+		printf 'extra=%s\n' "$extra"
+		cat "$identity"
+	} | sha256sum | awk '{print $1}'
+}
+
+artifact_cache_valid() {
+	local out="$1"
+	local cache_prefix="$2"
+	local expected_key="$3"
+	local expected_identity="$4"
+	local expected_needed="$5"
+	local actual_needed actual_hash
+	[[ -f "$out" && -f "$out.identity" && -f "$cache_prefix.build-key" && -f "$cache_prefix.sha256" ]] || return 1
+	[[ "$(cat "$cache_prefix.build-key")" == "$expected_key" ]] || return 1
+	cmp -s "$expected_identity" "$out.identity" || return 1
+	actual_hash="$(sha256sum "$out" | awk '{print $1}')" || return 1
+	[[ "$(cat "$cache_prefix.sha256")" == "$actual_hash" ]] || return 1
+	llvm-readelf -h "$out" | grep -q 'Type:.*DYN' || return 1
+	actual_needed="$(llvm-readelf -d "$out" 2>/dev/null | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sort -u)" || return 1
+	[[ "$actual_needed" == "$expected_needed" ]] || return 1
+	! llvm-readelf -l "$out" | grep -q 'INTERP' || return 1
+	! llvm-readelf -d "$out" | grep -Eq '\((RPATH|RUNPATH|TEXTREL)\)' || return 1
+	llvm-readelf -l "$out" | awk '$1 == "LOAD" && $0 ~ /W/ && $0 ~ /E/ {bad=1} END {exit bad}' || return 1
+	verify_identity_note "$out" "$out.identity"
+}
+
+record_artifact_cache() {
+	local out="$1"
+	local cache_prefix="$2"
+	local key="$3"
+	mkdir -p "$artifact_cache_dir"
+	printf '%s\n' "$key" >"$cache_prefix.build-key.tmp"
+	sha256sum "$out" | awk '{print $1}' >"$cache_prefix.sha256.tmp"
+	mv "$cache_prefix.build-key.tmp" "$cache_prefix.build-key"
+	mv "$cache_prefix.sha256.tmp" "$cache_prefix.sha256"
 }
 
 manifest_library_row() {
@@ -163,10 +315,42 @@ dynamic_rows() {
 image_graph=""
 if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 	image_target="$root/boot/.build/image-cargo-$target"
+	image_target_config="$root/boot/.build/image-cargo-$target.config"
 	image_graph="$root/boot/.build/image-cargo-$target.jsonl"
 	image_graph_errors="$root/boot/.build/image-cargo-$target.stderr"
 	image_seed="$root/boot/.build/image-seed-$target.o"
-	rm -rf "$image_target"
+	target_spec_digest="$(if [[ -f "$cargo_target" ]]; then sha256sum "$cargo_target" | awk '{print $1}'; else printf '%s' "$cargo_target" | sha256sum | awk '{print $1}'; fi)"
+	image_target_config_value="$({
+		printf 'format=liber-image-cargo-cache-v1\n'
+		printf 'workspace=%s\n' "$root"
+		printf 'rustc=%s\n' "$(rustc -vV | sha256sum | awk '{print $1}')"
+		printf 'cargo=%s\n' "$(cargo -V)"
+		printf 'target=%s\n' "$target"
+		printf 'target-spec=%s\n' "$target_spec_digest"
+		printf 'profile=release\n'
+		printf 'rustflags=%s\n' "$rustflags"
+		printf 'cargo-target-flags=%s\n' "${cargo_target_flags[*]}"
+		printf 'build-std=core,alloc,compiler_builtins\n'
+		printf 'build-std-features=compiler-builtins-mem\n'
+		printf 'features=shared-image\n'
+		for config in "$root/user/.cargo/config.toml" "$root/user/rust-toolchain.toml"; do
+			if [[ -f "$config" ]]; then
+				printf 'config=%s:%s\n' "${config#"$root/"}" "$(sha256sum "$config" | awk '{print $1}')"
+			fi
+		done
+		for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTUP_TOOLCHAIN; do
+			printf 'env-%s=%s\n' "$variable" "${!variable-}"
+		done
+	} | sha256sum | awk '{print $1}')"
+	if [[ "$force_rebuild" == 1 || ! -f "$image_target_config" || "$(cat "$image_target_config")" != "$image_target_config_value" ]]; then
+		echo "build-shared: Cargo cache miss (global build configuration)"
+		rm -rf "$image_target"
+		mkdir -p "$(dirname "$image_target_config")"
+		printf '%s\n' "$image_target_config_value" >"$image_target_config.tmp"
+		mv "$image_target_config.tmp" "$image_target_config"
+	else
+		echo "build-shared: Cargo cache hit (global build configuration)"
+	fi
 	rm -f "$image_seed"
 	set +e
 	(
@@ -329,6 +513,19 @@ for spec in "$@"; do
 		exit 1
 	fi
 	out="$out_dir/$artifact.lslib"
+	provider_source_sha="$(source_digest "$crate_dir")"
+	provider_expected_identity="$out.identity.$$.expected"
+	write_identity_record library "$artifact" "$crate" "$provider_source_sha" "$row_features" "$row_providers" "$provider_expected_identity"
+	provider_expected_needed="$(for provider in $row_providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
+	provider_cache_key="$(artifact_cache_key library "$row" "$provider_expected_identity" "cargo=${image_target_config_value:-standalone} rlib=$(sha256sum "$rlib" | awk '{print $1}')")"
+	provider_cache_prefix="$artifact_cache_dir/library-$artifact"
+	if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$out" "$provider_cache_prefix" "$provider_cache_key" "$provider_expected_identity" "$provider_expected_needed"; then
+		echo "build-shared: provider cache hit $artifact"
+		rm -f "$provider_expected_identity"
+		artifacts+=("$artifact")
+		continue
+	fi
+	echo "build-shared: provider cache miss $artifact"
 	link_deps=()
 	export_flags=()
 	symbolic_flags=(-Bsymbolic)
@@ -541,7 +738,9 @@ for spec in "$@"; do
 		echo "build-shared: $out contains a writable executable segment" >&2
 		exit 1
 	fi
-	emit_identity library "$artifact" "$crate" "$crate_dir" "$row_features" "$row_providers" "$out"
+	emit_identity library "$artifact" "$crate" "$provider_source_sha" "$row_features" "$row_providers" "$out"
+	record_artifact_cache "$out" "$provider_cache_prefix" "$provider_cache_key"
+	rm -f "$provider_expected_identity"
 	echo "build-shared: $out ($(stat -c %s "$out") bytes)"
 	artifacts+=("$artifact")
 done
@@ -550,6 +749,15 @@ if [[ -n "$image_graph" ]]; then
 	start_obj="$root/boot/.build/exe-start-$target.o"
 	"$root/tools/build-exe-start.sh" "$target" "$start_obj"
 	dynamic_rows="$(dynamic_rows)"
+	declare -A package_source_digests=()
+	while read -r package; do
+		[[ -n "$package" ]] || continue
+		if [[ "$package" == tools ]]; then
+			package_source_digests[$package]="$(local_dependency_source_digest "user/$package" 1)"
+		else
+			package_source_digests[$package]="$(local_dependency_source_digest "user/$package")"
+		fi
+	done < <(awk '{print $3}' <<<"$dynamic_rows" | sort -u)
 	manifest_tools="$(awk '$3 == "tools" {print $2}' <<<"$dynamic_rows")"
 	cargo_tools="$(cd "$root/user/tools" && cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tools") | .targets[] | select(.kind == ["bin"]) | .name' | sort)"
 	if [[ "$manifest_tools" != "$cargo_tools" ]]; then
@@ -582,6 +790,20 @@ if [[ -n "$image_graph" ]]; then
 		consumer_errors="$out_dir/.$consumer.stderr"
 		out="$out_dir/$consumer"
 		mkdir -p "$out_dir"
+		consumer_source_sha="$(executable_source_digest "$consumer_dir" "$crate" "$consumer")"
+		consumer_expected_identity="$out.identity.$$.expected"
+		write_identity_record executable "$consumer" "$crate" "$consumer_source_sha" shared-image "$providers" "$consumer_expected_identity"
+		consumer_expected_needed="$(for provider in $providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
+		consumer_expected_order="$out.order.$$.expected"
+		canonical_provider_order "$providers" >"$consumer_expected_order"
+		consumer_cache_key="$(artifact_cache_key executable "$kind $consumer $crate $stage $providers" "$consumer_expected_identity" "cargo=$image_target_config_value start=$(sha256sum "$start_obj" | awk '{print $1}')")"
+		consumer_cache_prefix="$artifact_cache_dir/executable-$consumer"
+		if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$out" "$consumer_cache_prefix" "$consumer_cache_key" "$consumer_expected_identity" "$consumer_expected_needed" && [[ -f "$out.order" ]] && cmp -s "$consumer_expected_order" "$out.order"; then
+			echo "build-shared: executable cache hit $consumer"
+			rm -f "$consumer_expected_identity" "$consumer_expected_order"
+			continue
+		fi
+		echo "build-shared: executable cache miss $consumer"
 		rm -f "$consumer_obj"
 		set +e
 		(
@@ -723,26 +945,44 @@ if [[ -n "$image_graph" ]]; then
 			exit 1
 		fi
 		llvm-strip --strip-debug "$out"
-		emit_identity executable "$consumer" "$crate" "$consumer_dir" shared-image "$providers" "$out"
-		canonical_provider_order "$providers" >"$out.order"
+		emit_identity executable "$consumer" "$crate" "$consumer_source_sha" shared-image "$providers" "$out"
+		mv "$consumer_expected_order" "$out.order"
+		record_artifact_cache "$out" "$consumer_cache_prefix" "$consumer_cache_key"
+		rm -f "$consumer_expected_identity"
 		echo "build-shared: $out ($(stat -c %s "$out") bytes, PIE)"
 	done <<<"$dynamic_rows"
 fi
 
 if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	probe="user/dyn_probe"
+	probe_dir="$probe/shared/$target"
+	probe_out="$probe_dir/dyn_probe"
+	mkdir -p "$probe_dir"
+	probe_source_sha="$(source_digest "$probe")"
+	probe_expected_identity="$probe_out.identity.$$.expected"
+	write_identity_record executable dyn_probe dyn_probe "$probe_source_sha" - "pix proto lsrt" "$probe_expected_identity"
+	probe_expected_needed="$(printf '%s\n' pix.lslib proto.lslib lsrt.lslib | sort -u)"
+	probe_expected_order="$probe_out.order.$$.expected"
+	canonical_provider_order "pix proto lsrt" >"$probe_expected_order"
+	probe_cache_key="$(artifact_cache_key executable "dynamic dyn_probe dyn_probe volume pix proto lsrt" "$probe_expected_identity" "cargo=$image_target_config_value")"
+	probe_cache_prefix="$artifact_cache_dir/executable-dyn_probe"
+	if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$probe_out" "$probe_cache_prefix" "$probe_cache_key" "$probe_expected_identity" "$probe_expected_needed" && [[ -f "$probe_out.order" ]] && cmp -s "$probe_expected_order" "$probe_out.order"; then
+		echo "build-shared: executable cache hit dyn_probe"
+		rm -f "$probe_expected_identity" "$probe_expected_order"
+		exit 0
+	fi
+	echo "build-shared: executable cache miss dyn_probe"
 	(cd "$probe" && RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
 	probe_rlib="$(find "$probe/target/$target/release/deps" -maxdepth 1 -name 'libdyn_probe-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
-	probe_dir="$probe/shared/$target"
-	mkdir -p "$probe_dir"
-	probe_out="$probe_dir/dyn_probe"
 	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv -e _start --whole-archive "$probe_rlib" --no-whole-archive "$(library_file pix)" "$(library_file proto)" "$(library_file lsrt)" --no-allow-shlib-undefined -o "$probe_out"
 	llvm-strip --strip-debug "$probe_out"
 	if ! llvm-readelf -h "$probe_out" | grep -q 'Type:.*DYN' || ! llvm-readelf -d "$probe_out" | grep -q 'NEEDED.*pix.lslib'; then
 		echo "build-shared: $probe_out is not a pix.lslib-linked ET_DYN" >&2
 		exit 1
 	fi
-	emit_identity executable dyn_probe dyn_probe "$probe" - "pix proto lsrt" "$probe_out"
-	canonical_provider_order "pix proto lsrt" >"$probe_out.order"
+	emit_identity executable dyn_probe dyn_probe "$probe_source_sha" - "pix proto lsrt" "$probe_out"
+	mv "$probe_expected_order" "$probe_out.order"
+	record_artifact_cache "$probe_out" "$probe_cache_prefix" "$probe_cache_key"
+	rm -f "$probe_expected_identity"
 	echo "build-shared: $probe_out ($(stat -c %s "$probe_out") bytes)"
 fi
