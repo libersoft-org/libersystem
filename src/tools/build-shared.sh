@@ -958,6 +958,14 @@ if [[ -n "$image_graph" ]]; then
 				exit 1
 			fi
 			;;
+		rm | mkdir | rmdir)
+			method="$consumer"
+			if [[ "$consumer" == rm ]]; then method=remove; fi
+			if ! grep -q "^liber_channel_liber_storage_volume_${method}$" <<<"$consumer_imports" || grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_storage_' <<<"$consumer_imports"; then
+				echo "build-shared: $consumer bypasses the concrete volume client provider" >&2
+				exit 1
+			fi
+			;;
 		perm)
 			if ! grep -q '^liber_channel_liber_security_' <<<"$consumer_imports" || grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_security_' <<<"$consumer_imports"; then
 				echo "build-shared: perm bypasses the concrete security client provider" >&2

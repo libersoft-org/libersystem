@@ -134,11 +134,11 @@ dynamic   storage_client        storage   volume proto ipc-client wire lsrt
 dynamic   date       tools  volume time-client proto lsrt
 dynamic   cat        tools  volume volume-client proto lsrt
 dynamic   write      tools  volume proto wire lsrt
-dynamic   rm         tools  volume proto ipc-client wire lsrt
+dynamic   rm         tools  volume volume-client proto lsrt
 dynamic   ls         tools  volume proto ipc-client wire lsrt
 dynamic   du         tools  volume proto ipc-client wire lsrt
-dynamic   mkdir      tools  volume proto ipc-client wire lsrt
-dynamic   rmdir      tools  volume proto ipc-client wire lsrt
+dynamic   mkdir      tools  volume volume-client proto lsrt
+dynamic   rmdir      tools  volume volume-client proto lsrt
 dynamic   log        tools  volume log-client time-client proto wire lsrt
 dynamic   snap       tools  volume proto ipc-client wire lsrt
 dynamic   volume     tools  volume proto ipc-client wire lsrt

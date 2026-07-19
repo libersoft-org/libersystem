@@ -3905,6 +3905,19 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     nor `wire.lslib` directly. The complete 46-provider/68-executable graph passes on
     all three architectures; focused audio/service/storage coverage passes 41/41 and
     boot/storage package coverage passes 21/21.
+  - Volume-mutation result (M126a, 2026-07-19): `volume-client.lslib` grows to
+    3,552/3,688/3,968 bytes and owns concrete remove/mkdir/rmdir alongside open.
+    `rm`, `mkdir` and `rmdir` import exactly their public storage symbol with no generic
+    channel client, `VecWriter` or private implementation import. Their
+    x86_64/AArch64/RISC-V sizes fall from 8,320/8,776/9,712 bytes each to
+    6,760/7,304/8,328, 6,760/7,320/8,344 and 6,760/7,320/8,344 bytes respectively.
+    All three image graphs pass; focused service/storage mutation coverage passes 41/41
+    through create, streamed write/read, non-empty rejection, file removal and final empty
+    directory removal, while boot/storage package coverage passes 21/21. `write` remains
+    deliberately separate: its request must be sent before streaming the data channel and
+    its reply arrives only after drain, so wrapping it in the generated blocking
+    `write-stream` thunk would deadlock. Its concrete boundary must preserve that async
+    request/data/reply ordering.
 - [ ] Migrate in measured, independently runnable waves:
   1. `echo`, `uname`, `uptime`, `dmesg`, `free`, `lscpu`, `lsmem`, `lsirq`, `lspci`,
      `ptyecho`, `readln`, `script`: `lsrt` plus only the domain/CLI leaves they use;
