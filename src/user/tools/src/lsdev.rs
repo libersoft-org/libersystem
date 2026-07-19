@@ -15,9 +15,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
+use device_client::DeviceClient;
 use proto::codec::JsonMode;
-use proto::system::device;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -44,7 +43,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // a JSON array, rendered on the client side - reporting a concise error if the query fails.
 unsafe fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
 	unsafe {
-		let mut client = device::Client::new(ChannelTransport { chan: devsvc });
+		let mut client = DeviceClient::new(devsvc);
 		match client.list() {
 			Some(Ok(entries)) => {
 				if let Some(mode) = mode {

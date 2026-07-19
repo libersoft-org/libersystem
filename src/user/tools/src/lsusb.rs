@@ -13,9 +13,8 @@
 extern crate alloc;
 
 use alloc::string::String;
-use ipc_client::ChannelTransport;
+use device_client::UsbClient;
 use proto::codec::JsonMode;
-use proto::system::usb;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -42,7 +41,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // (the default) or as a JSON array.
 unsafe fn query_bus(ussvc: u64, mode: Option<JsonMode>) {
 	unsafe {
-		let mut client = usb::Client::new(ChannelTransport { chan: ussvc });
+		let mut client = UsbClient::new(ussvc);
 		match client.list() {
 			Some(Ok(entries)) => {
 				if let Some(mode) = mode {

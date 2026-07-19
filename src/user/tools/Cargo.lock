@@ -79,11 +79,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6aedf8ae72766347502cf3cb4f41cf5e9cc37d28bee90f1fdaaae15f9cf9424"
 
 [[package]]
+name = "config-client"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "config-client-provider"
+version = "0.0.0"
+
+[[package]]
 name = "deflate"
 version = "0.0.0"
 dependencies = [
  "miniz_oxide",
 ]
+
+[[package]]
+name = "device-client"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "device-client-provider"
+version = "0.0.0"
 
 [[package]]
 name = "equivalent"
@@ -385,6 +407,10 @@ version = "0.0.0"
 dependencies = [
  "aiff",
  "bmp",
+ "config-client",
+ "config-client-provider",
+ "device-client",
+ "device-client-provider",
  "flac",
  "imgconv",
  "ipc-client",

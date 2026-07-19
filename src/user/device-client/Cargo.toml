@@ -1,0 +1,14 @@
+[package]
+name = "device-client"
+edition = "2024"
+description = "Dynamic channel-client boundary for the LiberSystem device LSIDL domain"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = []
+
+[dependencies]
+proto = { path = "../../proto" }

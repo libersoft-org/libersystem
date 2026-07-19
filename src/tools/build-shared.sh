@@ -57,6 +57,8 @@ library_file() {
 	lsrt) printf 'user/rt/shared/%s/lsrt.lslib' "$target" ;;
 	proto) printf 'proto/shared/%s/proto.lslib' "$target" ;;
 	wire) printf 'wire/shared/%s/wire.lslib' "$target" ;;
+	config-client) printf 'user/config-client-provider/shared/%s/config-client.lslib' "$target" ;;
+	device-client) printf 'user/device-client-provider/shared/%s/device-client.lslib' "$target" ;;
 	network-client) printf 'user/network-client-provider/shared/%s/network-client.lslib' "$target" ;;
 	process-client) printf 'user/process-client-provider/shared/%s/process-client.lslib' "$target" ;;
 	resources-client) printf 'user/resources-client-provider/shared/%s/resources-client.lslib' "$target" ;;
@@ -621,6 +623,26 @@ if [[ -n "$image_graph" ]]; then
 			fi
 			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_network_' <<<"$consumer_imports"; then
 				echo "build-shared: $consumer bypasses the concrete network client provider" >&2
+				exit 1
+			fi
+			;;
+		config | set)
+			if ! grep -q '^liber_channel_liber_config_' <<<"$consumer_imports"; then
+				echo "build-shared: $consumer does not import the concrete config client provider" >&2
+				exit 1
+			fi
+			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_config_' <<<"$consumer_imports"; then
+				echo "build-shared: $consumer bypasses the concrete config client provider" >&2
+				exit 1
+			fi
+			;;
+		lsdev | lsusb)
+			if ! grep -q '^liber_channel_liber_device_' <<<"$consumer_imports"; then
+				echo "build-shared: $consumer does not import the concrete device client provider" >&2
+				exit 1
+			fi
+			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_device_' <<<"$consumer_imports"; then
+				echo "build-shared: $consumer bypasses the concrete device client provider" >&2
 				exit 1
 			fi
 			;;

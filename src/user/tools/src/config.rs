@@ -17,9 +17,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
+use config_client::ConfigClient;
 use proto::system::ConfigEntry;
-use proto::system::config;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -50,7 +49,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // List the whole configuration store through the grant, printing each node as one text line.
 unsafe fn list_config(cfgsvc: u64) {
 	unsafe {
-		let mut client = config::Client::new(ChannelTransport { chan: cfgsvc });
+		let mut client = ConfigClient::new(cfgsvc);
 		match client.list() {
 			Some(Ok(entries)) => {
 				for e in &entries {
@@ -74,7 +73,7 @@ unsafe fn get_config(cfgsvc: u64, key: &[u8]) {
 				return;
 			}
 		};
-		let mut client = config::Client::new(ChannelTransport { chan: cfgsvc });
+		let mut client = ConfigClient::new(cfgsvc);
 		match client.get(key) {
 			Some(Ok(value)) => {
 				print(value.as_bytes());
@@ -109,7 +108,7 @@ unsafe fn set_config(cfgsvc: u64, rest: &[u8]) {
 			}
 		};
 		let entry: ConfigEntry = ConfigEntry { key: String::from(key), value: String::from(value) };
-		let mut client = config::Client::new(ChannelTransport { chan: cfgsvc });
+		let mut client = ConfigClient::new(cfgsvc);
 		match client.set(&entry) {
 			Some(Ok(())) => {
 				print(entry.to_text().as_bytes());

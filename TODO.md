@@ -3849,6 +3849,18 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     the complete 38-provider/68-executable graph passes on x86_64, AArch64 and RISC-V.
     The focused x86_64 process/service runtime suite passes all 58 selected tests; the
     `ps -i` harness now loads its declared provider graph instead of raw-spawning the PIE.
+  - Config/device result (M126a, 2026-07-19): `config-client.lslib`
+    (3,512/3,656/3,928 bytes) owns four public config/picker trampolines and
+    `device-client.lslib` (3,176/3,296/3,568 bytes) owns three device/USB trampolines;
+    each directly needs only `proto.lslib`. `config`, `set`, `lsdev` and `lsusb` import
+    only their public concrete symbols with no generic transport/client or private
+    implementation imports, pinned by the image gate on all three targets. On x86_64,
+    the tools shrank from 11,808/7,688/10,088/10,440 to
+    7,192/5,912/7,464/7,320 bytes respectively. The complete
+    40-provider/68-executable graph passes on x86_64, AArch64 and RISC-V; focused
+    service/shell runtime coverage passes 39/39 and boot/storage package coverage passes
+    21/21. The broader `service,shell,drivers` selection separately exposes a pre-existing
+    x86 paging overflow in the driver-crash teardown and is not counted as green here.
 - [ ] Migrate in measured, independently runnable waves:
   1. `echo`, `uname`, `uptime`, `dmesg`, `free`, `lscpu`, `lsmem`, `lsirq`, `lspci`,
      `ptyecho`, `readln`, `script`: `lsrt` plus only the domain/CLI leaves they use;

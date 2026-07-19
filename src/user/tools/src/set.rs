@@ -14,8 +14,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
-use proto::system::{ConfigEntry, config};
+use config_client::ConfigClient;
+use proto::system::ConfigEntry;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -62,7 +62,7 @@ unsafe fn set_config(cfgsvc: u64, rest: &[u8]) {
 			}
 		};
 		let entry = ConfigEntry { key: String::from(key), value: String::from(value) };
-		let mut client = config::Client::new(ChannelTransport { chan: cfgsvc });
+		let mut client = ConfigClient::new(cfgsvc);
 		match client.set(&entry) {
 			Some(Ok(())) => print(b"ok\n"),
 			Some(Err(_)) => print(b"set: error\n"),
