@@ -217,7 +217,7 @@ path = "src/readln.rs"
 
 [features]
 default = []
-shared-image = ["ipc-client/shared-image", "config-client/shared-image", "dep:config-client-provider", "device-client/shared-image", "dep:device-client-provider", "log-client/shared-image", "dep:log-client-provider", "network-client/shared-image", "dep:network-client-provider", "observability-client/shared-image", "dep:observability-client-provider", "process-client/shared-image", "dep:process-client-provider", "resources-client/shared-image", "dep:resources-client-provider", "time-client/shared-image", "dep:time-client-provider", "proto/shared-image", "rt/shared-image"]
+shared-image = ["ipc-client/shared-image", "audio-client/shared-image", "dep:audio-client-provider", "config-client/shared-image", "dep:config-client-provider", "device-client/shared-image", "dep:device-client-provider", "log-client/shared-image", "dep:log-client-provider", "network-client/shared-image", "dep:network-client-provider", "observability-client/shared-image", "dep:observability-client-provider", "process-client/shared-image", "dep:process-client-provider", "resources-client/shared-image", "dep:resources-client-provider", "security-client/shared-image", "dep:security-client-provider", "time-client/shared-image", "dep:time-client-provider", "proto/shared-image", "rt/shared-image"]
 
 [dependencies]
 ipc-client = { path = "../ipc-client" }
@@ -228,6 +228,8 @@ rt = { path = "../rt" }
 # Generated LSIDL bindings: the net tools speak the NetworkService contracts
 # (`network` / `socket`) via the proto codec + generated clients.
 proto = { path = "../../proto" }
+audio-client = { path = "../audio-client", optional = true }
+audio-client-provider = { path = "../audio-client-provider", optional = true }
 network-client = { path = "../network-client", optional = true }
 network-client-provider = { path = "../network-client-provider", optional = true }
 config-client = { path = "../config-client", optional = true }
@@ -242,6 +244,8 @@ process-client = { path = "../process-client", optional = true }
 process-client-provider = { path = "../process-client-provider", optional = true }
 resources-client = { path = "../resources-client", optional = true }
 resources-client-provider = { path = "../resources-client-provider", optional = true }
+security-client = { path = "../security-client", optional = true }
+security-client-provider = { path = "../security-client-provider", optional = true }
 time-client = { path = "../time-client", optional = true }
 time-client-provider = { path = "../time-client-provider", optional = true }
 

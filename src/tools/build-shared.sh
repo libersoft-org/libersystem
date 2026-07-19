@@ -71,6 +71,7 @@ library_file() {
 	lsrt) printf 'user/rt/shared/%s/lsrt.lslib' "$target" ;;
 	proto) printf 'proto/shared/%s/proto.lslib' "$target" ;;
 	wire) printf 'wire/shared/%s/wire.lslib' "$target" ;;
+	audio-client) printf 'user/audio-client-provider/shared/%s/audio-client.lslib' "$target" ;;
 	config-client) printf 'user/config-client-provider/shared/%s/config-client.lslib' "$target" ;;
 	device-client) printf 'user/device-client-provider/shared/%s/device-client.lslib' "$target" ;;
 	log-client) printf 'user/log-client-provider/shared/%s/log-client.lslib' "$target" ;;
@@ -78,6 +79,7 @@ library_file() {
 	observability-client) printf 'user/observability-client-provider/shared/%s/observability-client.lslib' "$target" ;;
 	process-client) printf 'user/process-client-provider/shared/%s/process-client.lslib' "$target" ;;
 	resources-client) printf 'user/resources-client-provider/shared/%s/resources-client.lslib' "$target" ;;
+	security-client) printf 'user/security-client-provider/shared/%s/security-client.lslib' "$target" ;;
 	time-client) printf 'user/time-client-provider/shared/%s/time-client.lslib' "$target" ;;
 	wasm) printf 'wasm/shared/%s/wasm.lslib' "$target" ;;
 	term) printf 'term/shared/%s/term.lslib' "$target" ;;
@@ -924,6 +926,18 @@ if [[ -n "$image_graph" ]]; then
 			fi
 			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_resources_' <<<"$consumer_imports"; then
 				echo "build-shared: $consumer bypasses the concrete resources client provider" >&2
+				exit 1
+			fi
+			;;
+		beep)
+			if ! grep -q '^liber_channel_liber_audio_' <<<"$consumer_imports" || grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_audio_' <<<"$consumer_imports"; then
+				echo "build-shared: beep bypasses the concrete audio client provider" >&2
+				exit 1
+			fi
+			;;
+		perm)
+			if ! grep -q '^liber_channel_liber_security_' <<<"$consumer_imports" || grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_security_' <<<"$consumer_imports"; then
+				echo "build-shared: perm bypasses the concrete security client provider" >&2
 				exit 1
 			fi
 			;;

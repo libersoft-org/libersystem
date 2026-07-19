@@ -65,6 +65,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio-client"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "audio-client-provider"
+version = "0.0.0"
+
+[[package]]
 name = "bmp"
 version = "0.0.0"
 dependencies = [
@@ -392,6 +403,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "security-client"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "security-client-provider"
+version = "0.0.0"
+
+[[package]]
 name = "surface"
 version = "0.0.0"
 dependencies = [
@@ -439,6 +461,8 @@ name = "tools"
 version = "0.0.0"
 dependencies = [
  "aiff",
+ "audio-client",
+ "audio-client-provider",
  "bmp",
  "config-client",
  "config-client-provider",
@@ -463,6 +487,8 @@ dependencies = [
  "resources-client",
  "resources-client-provider",
  "rt",
+ "security-client",
+ "security-client-provider",
  "surface",
  "time-client",
  "time-client-provider",

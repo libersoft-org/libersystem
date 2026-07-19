@@ -3872,6 +3872,17 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     43-provider/68-executable graph passes on x86_64, AArch64 and RISC-V, and focused
     service/shell runtime coverage passes 39/39; boot/storage package coverage passes
     21/21.
+  - Security/audio result (M126a, 2026-07-19): `security-client.lslib`
+    (3,272/3,392/3,664 bytes) owns all three permission lookup/audit/run trampolines,
+    while `audio-client.lslib` (3,944/4,112/4,384 bytes) owns five audio, PCM-stream
+    and audio-admin trampolines; each directly needs only `proto.lslib`. `perm` and
+    `beep` each import one public concrete symbol with no generic transport/client,
+    `VecWriter` or private implementation imports, pinned by the image gate. Their
+    x86_64/AArch64/RISC-V sizes fell from 8,816/9,144/9,304 to 7,992/8,480/8,688 bytes
+    and from 7,000/7,408/7,840 to 5,536/6,056/6,584 bytes respectively. The complete
+    45-provider/68-executable graph passes on all three architectures; focused
+    service/shell/audio runtime coverage passes 39/39 and boot/storage package coverage
+    passes 21/21.
 - [ ] Migrate in measured, independently runnable waves:
   1. `echo`, `uname`, `uptime`, `dmesg`, `free`, `lscpu`, `lsmem`, `lsirq`, `lspci`,
      `ptyecho`, `readln`, `script`: `lsrt` plus only the domain/CLI leaves they use;

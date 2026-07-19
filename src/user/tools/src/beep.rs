@@ -13,8 +13,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
-use proto::system::audio;
+use audio_client::AudioClient;
 use rt::*;
 use tools::{parse_u64, split_args};
 
@@ -63,7 +62,7 @@ unsafe fn beep(audiosvc: u64, args: &[u8]) {
 				}
 			}
 		}
-		let mut client = audio::Client::new(ChannelTransport { chan: audiosvc });
+		let mut client = AudioClient::new(audiosvc);
 		match client.beep(&freq, &millis) {
 			Some(Ok(())) => {}
 			Some(Err(_)) => print(b"beep: no audio device\n"),

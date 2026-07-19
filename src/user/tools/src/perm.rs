@@ -16,10 +16,10 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
 use proto::system::permission;
 use rt::*;
+use security_client::PermissionClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -46,7 +46,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // stream of entries, rendered as they arrive - it never has to fit one reply.
 unsafe fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
 	unsafe {
-		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
+		let mut client = PermissionClient::new(permsvc);
 		let consumer: u64 = match client.audit() {
 			Some(c) => c,
 			None => {
