@@ -345,6 +345,34 @@ their cold start is far lower. Large applications and many concurrent consumers 
 cross the RAM break-even; conversion remains per-target and measurement-gated rather
 than ideological.
 
+### Image-build cache (2026-07-19)
+
+The manifest-driven image builder separates four validated layers: Cargo's coherent
+target graph, content-addressed consumer ET_REL objects, linked ELF/identity/order
+artifacts, and keyed audit results. ET_REL keys include the dedicated compile helper,
+toolchain/target/build-std/features, exact bin/package sources and recursive provider API
+identities. Linked keys additionally bind the whole linker/audit builder, start object
+and binary provider identities. Audit hits still hash and compare the ELF, identity,
+build key and expected `DT_NEEDED`; a mismatch runs the full ELF/note/W^X audit.
+
+Measured on the 52-core development host after the graph was warm:
+
+| x86 image-build scenario | wall time | invalidation |
+| --- | ---: | --- |
+| cold object/link population | 405-408 s | 46 providers, 67 consumers |
+| previous no-change cache | 78-80 s | 46/46 provider and 67/67 executable hits |
+| split seed/object/link/audit cache | 49-58 s | same complete hit set |
+| one tool source edit | 75 s | `echo` only: one object + one executable miss |
+| one provider implementation edit | 75 s | `volume-client` rebuild; six consumer relinks, six object hits |
+
+Warm AArch64 and RISC-V graphs retain 46/46 provider and 67/67 executable hits at
+73-74 s. `just shared-cache-check quick` pins no-change, one-tool and restored-variant
+reuse; `just shared-cache-check provider` derives the direct `volume-client` consumers
+from the manifest and requires every relink to reuse its ET_REL object. Consumer Cargo
+jobs remain sequential for cold misses. Parallel Cargo writers against one target
+directory are deferred until a cold-build measurement justifies their locking and memory
+cost; ordinary edits no longer expose enough independent compilation to benefit.
+
 ## Kernel wake path (2026-07-06)
 
 Measured live in QEMU/KVM as the end-to-end round-trip of a shell command typed

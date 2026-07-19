@@ -14,6 +14,20 @@ force_rebuild="${LIBER_IMAGE_REBUILD:-0}"
 artifact_cache_dir="$root/boot/.build/image-artifacts-$target"
 cargo_target="$target"
 cargo_target_flags=()
+build_started=$SECONDS
+provider_cache_hits=0
+provider_cache_misses=0
+object_cache_hits=0
+object_cache_misses=0
+executable_cache_hits=0
+executable_cache_misses=0
+
+report_build_summary() {
+	local status=$?
+	echo "build-shared: summary target=$target seconds=$((SECONDS - build_started)) providers=$provider_cache_hits/$provider_cache_misses objects=$object_cache_hits/$object_cache_misses executables=$executable_cache_hits/$executable_cache_misses status=$status"
+}
+
+trap report_build_summary EXIT
 
 if [[ "$force_rebuild" != 0 && "$force_rebuild" != 1 ]]; then
 	echo "build-shared: LIBER_IMAGE_REBUILD must be 0 or 1" >&2
@@ -65,6 +79,7 @@ build_tool_digest="$({
 		sha256sum "$(command -v "$tool")"
 	done
 } | sha256sum | awk '{print $1}')"
+object_tool_digest="$(sha256sum "$root/tools/build-consumer-object.sh" | awk '{print $1}')"
 
 library_file() {
 	case "$1" in
@@ -121,7 +136,6 @@ executable_source_digest() {
 	if [[ "$package" == tools ]]; then
 		(
 			cd "$root"
-			printf 'dependency-closure=%s\n' "${package_source_digests[$package]}"
 			for source in "$crate_dir/Cargo.toml" "$crate_dir/Cargo.lock" "$crate_dir/src/lib.rs" "$crate_dir/src/$artifact.rs" user/build.rs user/user.ld user/user-aarch64.ld user/user-riscv64.ld ../product.conf; do
 				if [[ ! -f "$source" ]]; then
 					printf 'missing:%s\n' "$source"
@@ -263,19 +277,34 @@ artifact_cache_valid() {
 	local expected_key="$3"
 	local expected_identity="$4"
 	local expected_needed="$5"
-	local actual_needed actual_hash
+	local actual_needed actual_hash identity_hash needed_hash audit_key
 	[[ -f "$out" && -f "$out.identity" && -f "$cache_prefix.build-key" && -f "$cache_prefix.sha256" ]] || return 1
 	[[ "$(cat "$cache_prefix.build-key")" == "$expected_key" ]] || return 1
 	cmp -s "$expected_identity" "$out.identity" || return 1
 	actual_hash="$(sha256sum "$out" | awk '{print $1}')" || return 1
 	[[ "$(cat "$cache_prefix.sha256")" == "$actual_hash" ]] || return 1
+	identity_hash="$(sha256sum "$out.identity" | awk '{print $1}')" || return 1
+	needed_hash="$(printf '%s' "$expected_needed" | sha256sum | awk '{print $1}')"
+	audit_key="$({
+		printf 'format=liber-image-audit-cache-v1\n'
+		printf 'schema=elf64-et-dyn-needed-wx-note-v1\n'
+		printf 'build-key=%s\n' "$expected_key"
+		printf 'elf=%s\n' "$actual_hash"
+		printf 'identity=%s\n' "$identity_hash"
+		printf 'needed=%s\n' "$needed_hash"
+	} | sha256sum | awk '{print $1}')"
+	if [[ -f "$cache_prefix.audit-key" && "$(cat "$cache_prefix.audit-key")" == "$audit_key" ]]; then
+		return 0
+	fi
 	llvm-readelf -h "$out" | grep -q 'Type:.*DYN' || return 1
 	actual_needed="$(llvm-readelf -d "$out" 2>/dev/null | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sort -u)" || return 1
 	[[ "$actual_needed" == "$expected_needed" ]] || return 1
 	! llvm-readelf -l "$out" | grep -q 'INTERP' || return 1
 	! llvm-readelf -d "$out" | grep -Eq '\((RPATH|RUNPATH|TEXTREL)\)' || return 1
 	llvm-readelf -l "$out" | awk '$1 == "LOAD" && $0 ~ /W/ && $0 ~ /E/ {bad=1} END {exit bad}' || return 1
-	verify_identity_note "$out" "$out.identity"
+	verify_identity_note "$out" "$out.identity" || return 1
+	printf '%s\n' "$audit_key" >"$cache_prefix.audit-key.tmp"
+	mv "$cache_prefix.audit-key.tmp" "$cache_prefix.audit-key"
 }
 
 record_artifact_cache() {
@@ -285,6 +314,51 @@ record_artifact_cache() {
 	mkdir -p "$artifact_cache_dir"
 	printf '%s\n' "$key" >"$cache_prefix.build-key.tmp"
 	sha256sum "$out" | awk '{print $1}' >"$cache_prefix.sha256.tmp"
+	mv "$cache_prefix.build-key.tmp" "$cache_prefix.build-key"
+	mv "$cache_prefix.sha256.tmp" "$cache_prefix.sha256"
+	rm -f "$cache_prefix.audit-key"
+}
+
+object_cache_key() {
+	local consumer="$1"
+	local package="$2"
+	local source_sha="$3"
+	local providers="$4"
+	local provider
+	{
+		printf 'format=liber-image-object-cache-v1\n'
+		printf 'compile-tool=%s\n' "$object_tool_digest"
+		printf 'cargo-config=%s\n' "$image_target_config_value"
+		printf 'consumer=%s\n' "$consumer"
+		printf 'package=%s\n' "$package"
+		printf 'source=%s\n' "$source_sha"
+		printf 'features=shared-image\n'
+		for provider in $providers; do
+			printf 'provider-api=%s:%s\n' "$provider" "${provider_compile_digests[$provider]}"
+		done
+	} | sha256sum | awk '{print $1}'
+}
+
+object_cache_valid() {
+	local object="$1"
+	local cache_prefix="$2"
+	local expected_key="$3"
+	local actual_hash definitions
+	[[ -f "$object" && -f "$cache_prefix.build-key" && -f "$cache_prefix.sha256" ]] || return 1
+	[[ "$(cat "$cache_prefix.build-key")" == "$expected_key" ]] || return 1
+	actual_hash="$(sha256sum "$object" | awk '{print $1}')" || return 1
+	[[ "$(cat "$cache_prefix.sha256")" == "$actual_hash" ]] || return 1
+	llvm-readelf -h "$object" | grep -q 'Type:.*REL' || return 1
+	definitions="$(llvm-readelf --wide --symbols "$object" | awk '$5 == "GLOBAL" && $7 != "UND" && $8 != "" {print $8}' | sort -u)"
+	[[ "$definitions" == __user_main ]]
+}
+
+record_object_cache() {
+	local object="$1"
+	local cache_prefix="$2"
+	local key="$3"
+	printf '%s\n' "$key" >"$cache_prefix.build-key.tmp"
+	sha256sum "$object" | awk '{print $1}' >"$cache_prefix.sha256.tmp"
 	mv "$cache_prefix.build-key.tmp" "$cache_prefix.build-key"
 	mv "$cache_prefix.sha256.tmp" "$cache_prefix.sha256"
 }
@@ -357,39 +431,66 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 	else
 		echo "build-shared: Cargo cache hit (global build configuration)"
 	fi
-	rm -f "$image_seed"
-	set +e
-	(
-		cd "$root/user/tools"
-		CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --release --target "$cargo_target" --bin date --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$image_seed"
-	) >"$image_graph" 2>"$image_graph_errors"
-	graph_status=$?
-	set -e
-	if [[ "$graph_status" != 101 || ! -f "$image_seed" ]] || ! llvm-readelf -h "$image_seed" | grep -q 'Type:.*REL'; then
-		echo "build-shared: Cargo image graph did not stop after emitting its ET_REL seed object" >&2
-		exit 1
-	fi
-	if ! grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$image_graph_errors" || ! grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$image_graph_errors"; then
-		echo "build-shared: Cargo image graph failed outside the expected final-link shim boundary" >&2
-		exit 1
-	fi
 	service_seed="$root/boot/.build/image-services-seed-$target.o"
 	service_seed_errors="$root/boot/.build/image-services-seed-$target.stderr"
-	rm -f "$service_seed"
-	set +e
-	(
-		cd "$root/user/services"
-		CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --release --target "$cargo_target" --bin component_host --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$service_seed"
-	) >>"$image_graph" 2>"$service_seed_errors"
-	service_seed_status=$?
-	set -e
-	if [[ "$service_seed_status" != 101 || ! -f "$service_seed" ]] || ! llvm-readelf -h "$service_seed" | grep -q 'Type:.*REL'; then
-		echo "build-shared: services image graph did not stop after emitting its ET_REL seed object" >&2
-		exit 1
-	fi
-	if ! grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$service_seed_errors" || ! grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$service_seed_errors"; then
-		echo "build-shared: services image graph failed outside the expected final-link shim boundary" >&2
-		exit 1
+	image_graph_key_file="$root/boot/.build/image-cargo-$target.graph-key"
+	image_graph_source_digest="$({
+		while read -r crate; do
+			case "$crate" in
+			proto | wire | wasm | term) crate_dir="$crate" ;;
+			*) crate_dir="user/$crate" ;;
+			esac
+			printf '%s=%s\n' "$crate_dir" "$(source_digest "$crate_dir")"
+		done < <(awk '$1 == "library" {print $3}' "$root/user/services/manifest.txt" | sort -u)
+		for source in "$root/user/build.rs" "$root/../product.conf"; do
+			sha256sum "$source"
+		done
+	} | sha256sum | awk '{print $1}')"
+	image_graph_key="$({
+		printf 'format=liber-image-graph-cache-v1\n'
+		printf 'build-tools=%s\n' "$build_tool_digest"
+		printf 'cargo-config=%s\n' "$image_target_config_value"
+		printf 'provider-sources=%s\n' "$image_graph_source_digest"
+	} | sha256sum | awk '{print $1}')"
+	image_graph_valid=0
+	if [[ "$force_rebuild" == 0 && -f "$image_graph_key_file" && "$(cat "$image_graph_key_file")" == "$image_graph_key" && -f "$image_graph" && -f "$image_graph_errors" && -f "$image_seed" && -f "$service_seed" && -f "$service_seed_errors" ]] && llvm-readelf -h "$image_seed" | grep -q 'Type:.*REL' && llvm-readelf -h "$service_seed" | grep -q 'Type:.*REL' && grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$image_graph_errors" && grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$image_graph_errors" && grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$service_seed_errors" && grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$service_seed_errors"; then
+		image_graph_valid=1
+		echo "build-shared: Cargo image graph cache hit"
+	else
+		echo "build-shared: Cargo image graph cache miss"
+		rm -f "$image_seed" "$service_seed"
+		set +e
+		(
+			cd "$root/user/tools"
+			CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --release --target "$cargo_target" --bin date --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$image_seed"
+		) >"$image_graph" 2>"$image_graph_errors"
+		graph_status=$?
+		set -e
+		if [[ "$graph_status" != 101 || ! -f "$image_seed" ]] || ! llvm-readelf -h "$image_seed" | grep -q 'Type:.*REL'; then
+			echo "build-shared: Cargo image graph did not stop after emitting its ET_REL seed object" >&2
+			exit 1
+		fi
+		if ! grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$image_graph_errors" || ! grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$image_graph_errors"; then
+			echo "build-shared: Cargo image graph failed outside the expected final-link shim boundary" >&2
+			exit 1
+		fi
+		set +e
+		(
+			cd "$root/user/services"
+			CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --release --target "$cargo_target" --bin component_host --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$service_seed"
+		) >>"$image_graph" 2>"$service_seed_errors"
+		service_seed_status=$?
+		set -e
+		if [[ "$service_seed_status" != 101 || ! -f "$service_seed" ]] || ! llvm-readelf -h "$service_seed" | grep -q 'Type:.*REL'; then
+			echo "build-shared: services image graph did not stop after emitting its ET_REL seed object" >&2
+			exit 1
+		fi
+		if ! grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$service_seed_errors" || ! grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$service_seed_errors"; then
+			echo "build-shared: services image graph failed outside the expected final-link shim boundary" >&2
+			exit 1
+		fi
+		printf '%s\n' "$image_graph_key" >"$image_graph_key_file.tmp"
+		mv "$image_graph_key_file.tmp" "$image_graph_key_file"
 	fi
 fi
 
@@ -405,9 +506,16 @@ graph_archive() {
 	printf '%s' "$archives"
 }
 
+declare -A canonical_order_cache=()
+
 canonical_provider_order() {
 	local roots="$1"
-	local name dependency dependencies candidate ready
+	local cache_key name dependency dependencies candidate ready result
+	cache_key="$(tr ' ' '\n' <<<"$roots" | sort -u | xargs)"
+	if [[ -n "${canonical_order_cache[$cache_key]:-}" ]]; then
+		printf '%s' "${canonical_order_cache[$cache_key]}"
+		return
+	fi
 	local -A present=()
 	local -A edges=()
 	local -A visiting=()
@@ -457,10 +565,13 @@ canonical_provider_order() {
 		fi
 		order+=("$candidate")
 	done
-	printf '%s.lslib\n' "${order[@]}"
+	result="$(printf '%s.lslib\n' "${order[@]}")"$'\n'
+	canonical_order_cache[$cache_key]="$result"
+	printf '%s' "$result"
 }
 
 artifacts=()
+declare -A provider_compile_digests=()
 for spec in "$@"; do
 	if [[ "$spec" == *=* ]]; then
 		artifact="${spec%%=*}"
@@ -520,6 +631,23 @@ for spec in "$@"; do
 	fi
 	out="$out_dir/$artifact.lslib"
 	provider_source_sha="$(source_digest "$crate_dir")"
+	if [[ "$crate_dir" == user/*-client-provider ]]; then
+		provider_compile_source="$(source_digest "${crate_dir%-provider}")"
+	else
+		provider_compile_source="$provider_source_sha"
+	fi
+	provider_compile_digests[$artifact]="$({
+		printf 'format=liber-provider-compile-identity-v1\n'
+		printf 'source=%s\n' "$provider_compile_source"
+		printf 'features=%s\n' "$row_features"
+		for provider in $row_providers; do
+			if [[ -z "${provider_compile_digests[$provider]:-}" ]]; then
+				echo "build-shared: $artifact has no compile identity for provider $provider" >&2
+				exit 1
+			fi
+			printf 'provider=%s:%s\n' "$provider" "${provider_compile_digests[$provider]}"
+		done
+	} | sha256sum | awk '{print $1}')"
 	provider_expected_identity="$out.identity.$$.expected"
 	write_identity_record library "$artifact" "$crate" "$provider_source_sha" "$row_features" "$row_providers" "$provider_expected_identity"
 	provider_expected_needed="$(for provider in $row_providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
@@ -527,11 +655,13 @@ for spec in "$@"; do
 	provider_cache_prefix="$artifact_cache_dir/library-$artifact"
 	if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$out" "$provider_cache_prefix" "$provider_cache_key" "$provider_expected_identity" "$provider_expected_needed"; then
 		echo "build-shared: provider cache hit $artifact"
+		((provider_cache_hits += 1))
 		rm -f "$provider_expected_identity"
 		artifacts+=("$artifact")
 		continue
 	fi
 	echo "build-shared: provider cache miss $artifact"
+	((provider_cache_misses += 1))
 	link_deps=()
 	export_flags=()
 	symbolic_flags=(-Bsymbolic)
@@ -758,9 +888,7 @@ if [[ -n "$image_graph" ]]; then
 	declare -A package_source_digests=()
 	while read -r package; do
 		[[ -n "$package" ]] || continue
-		if [[ "$package" == tools ]]; then
-			package_source_digests[$package]="$(local_dependency_source_digest "user/$package" 1)"
-		else
+		if [[ "$package" != tools ]]; then
 			package_source_digests[$package]="$(local_dependency_source_digest "user/$package")"
 		fi
 	done < <(awk '{print $3}' <<<"$dynamic_rows" | sort -u)
@@ -792,7 +920,6 @@ if [[ -n "$image_graph" ]]; then
 		fi
 		consumer_dir="$root/user/$crate"
 		out_dir="$consumer_dir/shared/$target"
-		consumer_obj="$out_dir/.$consumer.o"
 		consumer_errors="$out_dir/.$consumer.stderr"
 		out="$out_dir/$consumer"
 		mkdir -p "$out_dir"
@@ -806,30 +933,26 @@ if [[ -n "$image_graph" ]]; then
 		consumer_cache_prefix="$artifact_cache_dir/executable-$consumer"
 		if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$out" "$consumer_cache_prefix" "$consumer_cache_key" "$consumer_expected_identity" "$consumer_expected_needed" && [[ -f "$out.order" ]] && cmp -s "$consumer_expected_order" "$out.order"; then
 			echo "build-shared: executable cache hit $consumer"
+			((executable_cache_hits += 1))
 			rm -f "$consumer_expected_identity" "$consumer_expected_order"
 			continue
 		fi
 		echo "build-shared: executable cache miss $consumer"
-		rm -f "$consumer_obj"
-		set +e
-		(
-			cd "$consumer_dir"
-			CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --quiet --release --target "$cargo_target" --bin "$consumer" --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$consumer_obj"
-		) >/dev/null 2>"$consumer_errors"
-		consumer_status=$?
-		set -e
-		if [[ "$consumer_status" != 101 || ! -f "$consumer_obj" ]] || ! llvm-readelf -h "$consumer_obj" | grep -q 'Type:.*REL'; then
-			echo "build-shared: $consumer did not stop after emitting its ET_REL object" >&2
-			exit 1
-		fi
-		if ! grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$consumer_errors" || ! grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$consumer_errors"; then
-			echo "build-shared: $consumer failed outside the expected final-link shim boundary" >&2
-			exit 1
-		fi
-		consumer_definitions="$(llvm-readelf --wide --symbols "$consumer_obj" | awk '$5 == "GLOBAL" && $7 != "UND" && $8 != "" {print $8}' | sort -u)"
-		if [[ "$consumer_definitions" != "__user_main" ]]; then
-			echo "build-shared: $consumer_obj defines globals outside __user_main: $consumer_definitions" >&2
-			exit 1
+		((executable_cache_misses += 1))
+		object_key="$(object_cache_key "$consumer" "$crate" "$consumer_source_sha" "$providers")"
+		object_cache_prefix="$artifact_cache_dir/object-$consumer-$object_key"
+		consumer_obj="$object_cache_prefix.o"
+		if [[ "$force_rebuild" == 0 ]] && object_cache_valid "$consumer_obj" "$object_cache_prefix" "$object_key"; then
+			echo "build-shared: object cache hit $consumer"
+			((object_cache_hits += 1))
+		else
+			echo "build-shared: object cache miss $consumer"
+			((object_cache_misses += 1))
+			consumer_obj_tmp="$consumer_obj.tmp.$$"
+			rm -f "$consumer_obj_tmp"
+			"$root/tools/build-consumer-object.sh" "$consumer_dir" "$image_target" "$rust_min_stack" "$rustflags" "$cargo_target" "$consumer" "$consumer_obj_tmp" "$consumer_errors" "${cargo_target_flags[@]}"
+			mv "$consumer_obj_tmp" "$consumer_obj"
+			record_object_cache "$consumer_obj" "$object_cache_prefix" "$object_key"
 		fi
 		provider_inputs=()
 		expected_needed=""

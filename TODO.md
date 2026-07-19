@@ -4034,6 +4034,25 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     open in this item: automate the full mutation matrix, add cache timing/miss summaries
     as structured output and reduce the remaining ~70 s repeated ELF-process overhead
     with a parsed provider index.
+  - Split-cache hardening result (M126a, 2026-07-19): executable compilation and
+    linking now have independent fail-closed caches. Content-addressed ET_REL objects
+    key the dedicated compile helper, toolchain/target/build-std/features, exact bin/package
+    sources and recursive compile-time provider API identities; linked artifacts key the
+    whole linker/audit builder, object/start hashes and exact binary provider identities.
+    Changing a tool recompiles only that tool, while changing a provider implementation
+    rebuilds the provider and relinks its direct consumers without recompiling them.
+    Cargo image-graph seeds are keyed by global configuration plus all provider sources;
+    validated audit-result records key the full artifact/identity/build/NEEDED hashes,
+    and any missing, corrupt or mismatched record falls back to the complete ELF/note/W^X
+    audit. Canonical provider orders are memoized only within one immutable invocation.
+    `just shared-cache-check quick|provider` safely mutates/restores sources and pins the
+    exact one-tool and six-consumer volume-provider invalidation sets. On the 52-core
+    development host, x86 no-change fell from 78-80 s to 49-58 s after warmup; a one-tool
+    edit rebuilt only `echo` (66 executable hits, one object miss), and a provider-only
+    edit rebuilt `volume-client`, relinked exactly six consumers and reused all six ET_REL
+    objects. Warm AArch64/RISC-V graphs retain complete 46-provider/67-executable hit sets.
+    A concurrent Cargo-writer pool remains deferred to measured cold-build work: the normal
+    edit loop no longer has independent consumer compilations to parallelize.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,
