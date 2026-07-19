@@ -145,7 +145,7 @@ dynamic   lsdev      tools  volume device-client proto wire lsrt
 dynamic   config     tools  volume config-client proto lsrt
 dynamic   set        tools  volume config-client lsrt
 dynamic   beep       tools  volume audio-client lsrt
-dynamic   play       tools  volume aiff flac mp3 vorbis wav wavpack proto ipc-client wire lsrt
+dynamic   play       tools  volume aiff flac mp3 vorbis wav wavpack audio-client proto ipc-client wire lsrt
 dynamic   graphics_probe tools volume lsrt
 dynamic   imgview    tools  volume imgconv pix surface proto ipc-client wire lsrt
 dynamic   imgconv    tools  volume imgconv proto ipc-client wire lsrt

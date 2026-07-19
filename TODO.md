@@ -3883,6 +3883,16 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     45-provider/68-executable graph passes on all three architectures; focused
     service/shell/audio runtime coverage passes 39/39 and boot/storage package coverage
     passes 21/21.
+  - Audio-stream consumer result (M126a, 2026-07-19): `play` now imports concrete
+    `audio.open-stream` plus `pcm-stream.write/close` from `audio-client.lslib`; its
+    remaining generic channel transport belongs only to the still-open volume-client
+    migration. The image audit pins all three public audio symbols and rejects private
+    audio implementation imports. Its x86_64/AArch64/RISC-V size fell from
+    24,752/25,376/26,088 to 22,816/23,416/24,544 bytes. All three image graphs pass,
+    and focused x86 audio/service/storage coverage passes 41/41 with two real dynamic
+    players, WAV/Vorbis mixing, backpressure and interrupt-close. The batch also restores
+    the recipe indentation accidentally removed from `Justfile`; its parser and complete
+    formatting gate cover every recipe again.
 - [ ] Migrate in measured, independently runnable waves:
   1. `echo`, `uname`, `uptime`, `dmesg`, `free`, `lscpu`, `lsmem`, `lsirq`, `lspci`,
      `ptyecho`, `readln`, `script`: `lsrt` plus only the domain/CLI leaves they use;

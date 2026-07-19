@@ -13,11 +13,12 @@ extern crate alloc;
 use aiff::Aiff;
 use alloc::string::String;
 use alloc::vec::Vec;
+use audio_client::{AudioClient, PcmStreamClient};
 use flac::Flac;
 use ipc_client::{ChannelTransport, make_buffer};
 use mp3::Mp3;
 use proto::path;
-use proto::system::{OpenOpts, audio, pcm_stream, volume};
+use proto::system::{OpenOpts, volume};
 use rt::*;
 use vorbis::Vorbis;
 use wav::Wav;
@@ -240,9 +241,9 @@ impl PcmDecoder for vorbis::Decoder<'_> {
 }
 
 unsafe fn play_decoded(audio_channel: u64, container: &str, rate: u32, channels: u8, frames_total: u64, mut decoder: impl PcmDecoder) -> Result<(), ()> {
-	let mut root = audio::Client::new(ChannelTransport { chan: audio_channel });
+	let mut root = AudioClient::new(audio_channel);
 	let stream_channel = root.open_stream(&rate, &channels).and_then(Result::ok).ok_or(())?;
-	let mut stream = pcm_stream::Client::new(ChannelTransport { chan: stream_channel });
+	let mut stream = PcmStreamClient::new(stream_channel);
 	print_metadata(container, rate, channels, frames_total);
 	let mut pcm = Vec::new();
 	while decoder.remaining_frames() != 0 {

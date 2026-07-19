@@ -935,6 +935,18 @@ if [[ -n "$image_graph" ]]; then
 				exit 1
 			fi
 			;;
+		play)
+			for symbol in audio_open_stream pcm_stream_write pcm_stream_close; do
+				if ! grep -q "^liber_channel_liber_audio_${symbol}$" <<<"$consumer_imports"; then
+					echo "build-shared: play does not import concrete audio symbol $symbol" >&2
+					exit 1
+				fi
+			done
+			if grep -Eq '^liber_channel_impl_liber_audio_' <<<"$consumer_imports"; then
+				echo "build-shared: play bypasses the concrete audio client provider" >&2
+				exit 1
+			fi
+			;;
 		perm)
 			if ! grep -q '^liber_channel_liber_security_' <<<"$consumer_imports" || grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_security_' <<<"$consumer_imports"; then
 				echo "build-shared: perm bypasses the concrete security client provider" >&2
