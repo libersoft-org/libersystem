@@ -81,6 +81,7 @@ library_file() {
 	resources-client) printf 'user/resources-client-provider/shared/%s/resources-client.lslib' "$target" ;;
 	security-client) printf 'user/security-client-provider/shared/%s/security-client.lslib' "$target" ;;
 	time-client) printf 'user/time-client-provider/shared/%s/time-client.lslib' "$target" ;;
+	volume-client) printf 'user/volume-client-provider/shared/%s/volume-client.lslib' "$target" ;;
 	wasm) printf 'wasm/shared/%s/wasm.lslib' "$target" ;;
 	term) printf 'term/shared/%s/term.lslib' "$target" ;;
 	service-util) printf 'user/services/shared/%s/service-util.lslib' "$target" ;;
@@ -944,6 +945,16 @@ if [[ -n "$image_graph" ]]; then
 			done
 			if grep -Eq '^liber_channel_impl_liber_audio_' <<<"$consumer_imports"; then
 				echo "build-shared: play bypasses the concrete audio client provider" >&2
+				exit 1
+			fi
+			if ! grep -q '^liber_channel_liber_storage_volume_open$' <<<"$consumer_imports" || grep -Eq '^liber_channel_impl_liber_storage_' <<<"$consumer_imports"; then
+				echo "build-shared: play bypasses the concrete volume client provider" >&2
+				exit 1
+			fi
+			;;
+		cat)
+			if ! grep -q '^liber_channel_liber_storage_volume_open$' <<<"$consumer_imports" || grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_storage_' <<<"$consumer_imports"; then
+				echo "build-shared: cat bypasses the concrete volume client provider" >&2
 				exit 1
 			fi
 			;;

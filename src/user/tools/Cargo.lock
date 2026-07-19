@@ -492,10 +492,23 @@ dependencies = [
  "surface",
  "time-client",
  "time-client-provider",
+ "volume-client",
+ "volume-client-provider",
  "vorbis",
  "wav",
  "wavpack",
 ]
+
+[[package]]
+name = "volume-client"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "volume-client-provider"
+version = "0.0.0"
 
 [[package]]
 name = "vorbis"

@@ -3893,6 +3893,18 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     players, WAV/Vorbis mixing, backpressure and interrupt-close. The batch also restores
     the recipe indentation accidentally removed from `Justfile`; its parser and complete
     formatting gate cover every recipe again.
+  - Volume-open result (M126a, 2026-07-19): the first `volume-client.lslib`
+    (2,528/2,600/2,872 bytes) owns the shared `volume.open` trampoline and directly
+    needs only `proto.lslib`; URI normalization and five-volume routing remain in the
+    existing `proto::path` vocabulary until the broader volume-client API moves. `cat`
+    and `play` import the public open symbol with no private storage implementation
+    import, pinned by the image gate; `cat` has no generic channel client left. Their
+    x86_64/AArch64/RISC-V sizes fell from 8,840/9,224/10,200 to
+    6,920/7,448/8,488 bytes and from 22,816/23,416/24,544 to
+    20,880/21,704/22,864 bytes respectively. `play` now needs neither `ipc-client.lslib`
+    nor `wire.lslib` directly. The complete 46-provider/68-executable graph passes on
+    all three architectures; focused audio/service/storage coverage passes 41/41 and
+    boot/storage package coverage passes 21/21.
 - [ ] Migrate in measured, independently runnable waves:
   1. `echo`, `uname`, `uptime`, `dmesg`, `free`, `lscpu`, `lsmem`, `lsirq`, `lspci`,
      `ptyecho`, `readln`, `script`: `lsrt` plus only the domain/CLI leaves they use;

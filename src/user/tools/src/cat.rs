@@ -16,10 +16,10 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
 use proto::path;
-use proto::system::{OpenOpts, volume};
+use proto::system::OpenOpts;
 use rt::*;
+use volume_client::VolumeClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -66,7 +66,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 unsafe fn cat(storage: u64, uri: &[u8]) {
 	unsafe {
 		let opts: OpenOpts = OpenOpts { path: String::from_utf8_lossy(uri).into_owned(), write: false, create: false };
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		let result = match client.open(&opts) {
 			Some(Ok(r)) => r,
 			_ => {

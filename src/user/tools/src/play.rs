@@ -15,11 +15,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use audio_client::{AudioClient, PcmStreamClient};
 use flac::Flac;
-use ipc_client::{ChannelTransport, make_buffer};
+use ipc_client::make_buffer;
 use mp3::Mp3;
 use proto::path;
-use proto::system::{OpenOpts, volume};
+use proto::system::OpenOpts;
 use rt::*;
+use volume_client::VolumeClient;
 use vorbis::Vorbis;
 use wav::Wav;
 use wavpack::WavPack;
@@ -35,7 +36,7 @@ struct MappedFile {
 impl MappedFile {
 	unsafe fn open(storage: u64, uri: String) -> Option<MappedFile> {
 		unsafe {
-			let mut client = volume::Client::new(ChannelTransport { chan: storage });
+			let mut client = VolumeClient::new(storage);
 			let opened = match client.open(&OpenOpts { path: uri, write: false, create: false })? {
 				Ok(opened) if opened.file != 0 && opened.size != 0 => opened,
 				_ => return None,
