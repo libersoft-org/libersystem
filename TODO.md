@@ -5179,6 +5179,213 @@ consumer's other capabilities.
   persistent jobs), M43-M111/M131 (streaming and transactional storage operations), and
   the existing `rt` stdin/stdout capability channels.
 
+## M133 - Future-ready 3D graphics foundation + software-rendered scene
+
+Status: FUTURE TRACK, PLANNED AFTER M126a AND M127; INDEPENDENT OF M132 AND NOT A
+PHASE-2 COMPLETION GATE. Build the OS-facing foundations that a later OpenGL, OpenGL ES
+or Vulkan implementation will need, then prove
+the complete application path with a bounded software 3D renderer and the polished
+**3D Test SW** scene. This milestone does NOT implement or port OpenGL, OpenGL ES, Vulkan, Mesa,
+Gallium, virglrenderer, Venus, a GLSL compiler or a SPIR-V compiler, and does not enable
+virtio-gpu 3D acceleration. Those are separate future milestones that must reuse the
+contracts and measurements established here rather than placing API policy in the kernel.
+
+The architectural split is deliberate: OpenGL/OpenGL ES/Vulkan are userspace API
+libraries; WSI, presentable images, synchronization, governed memory and access to a
+capability-scoped graphics device are OS contracts; virgl/Venus/native-device protocols
+belong to a backend/driver. The software renderer exercises the same window-system,
+resource-lifetime, resize and frame-pacing contracts but remains an ordinary CPU client of
+DisplayService. It is not a fake OpenGL implementation and no provisional `gl*`/`vk*` API
+is introduced merely to draw one demo.
+
+### M133a - API-neutral graphics and porting prerequisites
+
+- [ ] Write `docs/GRAPHICS.md` before adding interfaces. Freeze the ownership diagram and
+  future integration routes: OpenGL/OpenGL ES through EGL plus a Mesa state tracker and an
+  appropriate software or Gallium backend; Vulkan through a loader + ICD, with Venus as
+  the likely virtualized transport; DisplayService as the EGL/Vulkan WSI and presentation
+  owner; and the virtio-gpu driver as the device transport owner. Record which boundary
+  validates every untrusted length/opcode/resource reference. Do not invent a common
+  GL/Vulkan command language or expose virtqueue descriptors to applications.
+- [ ] Extend the M121 display contract with a versioned, bounded present-queue model while
+  preserving the current single-surface API as a compatibility path. A presentable surface
+  has an immutable pixel format, explicit extent, resize generation and two or three
+  images; `acquire-next` returns one available image, `present` consumes it with a damage
+  region and completion point, and release/process death returns every image. Define
+  FIFO frame ordering, maximum in-flight frames, backpressure, occluded/background
+  behavior, stale-generation/OUT_OF_DATE handling and console restoration. The initial
+  implementation uses CPU-mappable MemoryObjects and the existing synchronous 2D scanout,
+  but the contract must also permit a future non-mappable GPU image imported by
+  DisplayService without changing application WSI semantics.
+- [ ] Add a first-class synchronization capability suitable for graphics without making
+  it graphics-specific: a monotonic timeline/fence value, signal by its owning backend,
+  wait/poll integration with the scheduler, bounded waiter accounting, timeout and peer-
+  death/error completion. Values never decrease or wrap silently; forged future signals,
+  use-after-close, duplicate completion and wait storms fail closed. CPU rendering uses
+  the same completion path so the contract is tested before a GPU backend exists.
+- [ ] Define API-neutral graphics resource descriptors and checked layout helpers:
+  buffers and 1D/2D/3D images, extent/mip/layer/sample counts, row/slice pitch, format,
+  tiling, usage and host visibility. Every byte size/offset/subresource calculation is
+  checked before allocation or mapping. Import/export transfers explicit capabilities and
+  rights; it never accepts ambient integer names or raw host pointers. CPU-visible images
+  use MemoryObjects initially; future device-local resources may be opaque while retaining
+  the same lifetime, accounting and ownership rules.
+- [ ] Add a capability-scoped graphics adapter/device/context/queue vocabulary without
+  claiming an accelerated implementation. Adapter discovery reports stable identity,
+  backend/capset identifiers, limits, formats, queue kinds and supported synchronization
+  primitives. Contexts own all backend resources; queues accept only bounded command
+  envelopes for one advertised backend/capset and return a completion fence; reset or peer
+  death invalidates the context and wakes every waiter. Until a future backend installs a
+  protocol-specific validator and executor, accelerated context creation/submit returns a
+  typed `unsupported`, never a permissive opaque pass-through. Provide a null/reference
+  backend test that validates lifetime, limits, cancellation and fence behavior without
+  interpreting GPU commands.
+- [ ] Integrate graphics resources with ResourceManager and SystemGraph. Charge host-
+  visible bytes, device-local bytes, image count, buffer count, contexts, queued command
+  bytes and in-flight submissions to the creating Domain before allocation. Publish
+  bounded counters and reset/fault state without exposing command or image contents.
+  Exhaustion returns typed errors and releases partial transactions; killing a Domain
+  reclaims contexts, queues, mappings, imported images and waiters even if the backend is
+  wedged.
+- [ ] Specify pixel/color conventions once: coordinate origin, viewport orientation,
+  clip-space depth range, front-face winding, normalized channel order, alpha mode,
+  linear-light versus sRGB transfer, and conversion into M121's B8G8R8X8 scanout. The
+  software renderer follows these rules exactly; future GL/Vulkan WSI adapters perform
+  explicit conversions rather than relying on host-specific defaults.
+- [ ] Prepare the foreign-library/toolchain substrate needed before importing a large
+  upstream graphics stack, but import no stack in this milestone. Pin cross C/C++ compiler
+  and archive/link steps for the three targets; provide tested C ABI calls into allocator,
+  memory/string/math, monotonic time, atomics, TLS, threads, mutex/condition/event waits,
+  mapped MemoryObjects and dynamic-provider lookup. Maintain an exact required-symbol
+  inventory derived from a chosen Mesa/Vulkan-loader configuration; do not grow a general
+  POSIX layer or expose ambient files, processes or devices. Host build tooling must accept
+  reproducible Meson/CMake-generated object lists without bypassing M126a identity,
+  relocation, W^X, provider and license audits.
+- [ ] Record the future dependency and licensing policy before selecting upstream code.
+  LiberSystem-owned implementation remains Unlicense; imported Mesa, Vulkan loader,
+  compiler/runtime or conformance sources retain their own compatible notices and exact
+  source/version/patch provenance. The image identity records bind generated objects to
+  that inventory, and the build rejects an unreviewed license, downloaded-at-build source
+  or copied implementation with lost attribution. This milestone imports none of those
+  projects, but its synthetic build proves the inventory/audit path.
+- [ ] Reserve future loader/ICD discovery under M127's system layout. Implement a bounded,
+  versioned provider manifest schema for API name/version, architecture, entry provider,
+  backend/capset and required extensions. Paths are package-owned and signature/identity
+  checked; no environment-variable search path, current-directory plugin load or arbitrary
+  `dlopen` exists. In this milestone only a synthetic provider is discovered and rejected
+  or selected in tests; no GL/Vulkan ABI is exported.
+- [ ] Add hostile-input and lifecycle tests before any accelerated backend: malformed
+  format/extent/pitch/mip descriptors, overflowed image sizes, invalid generations,
+  duplicate acquire/present, fence races, context reset, backend death, command-envelope
+  truncation, unsupported capsets, forged imports, cross-Domain handles, budget exhaustion
+  and cleanup during in-flight presentation. Fuzz all parsers and checked layout helpers;
+  prove that a malicious graphics client cannot map another surface, submit to another
+  context, retain foreground input or leave the console scanout blank.
+
+### M133b - Bounded software 3D renderer
+
+- [ ] Add small atomized no_std libraries rather than a monolithic app framework:
+  `render-math` for `Vec2/Vec3/Vec4`, matrices, quaternions, transforms and camera
+  projection; `soft3d` for scene traversal, clipping and rasterization; and existing
+  `pix`/`surface` for pixel storage and presentation. Keep public scene data independent
+  of DisplayService and keep the CPU backend behind one renderer boundary so a later GPU
+  renderer can consume the same mesh/material/camera model without emulating OpenGL.
+  Build reusable implementation as M126a `.lslib` providers when at least two consumers
+  or a measured ownership boundary justifies it; the demo PIE must not duplicate shared
+  math/raster code.
+- [ ] Implement a complete triangle pipeline: model/view/projection transforms,
+  homogeneous frustum clipping (including the near plane), viewport/scissor conversion,
+  indexed triangles, deterministic back-face culling, top-left fill convention,
+  perspective-correct interpolation, 24- or 32-bit depth buffer, depth test/write and
+  checked raster bounds. Degenerate, non-finite, off-screen and sub-pixel triangles are
+  skipped deterministically and can never create an unbounded loop or out-of-range write.
+- [ ] Implement materials and lighting sufficient for a real scene rather than flat debug
+  triangles: per-face/base color, vertex normals, ambient term, normalized Lambert diffuse,
+  Blinn-Phong specular with bounded shininess, one directional key light and one animated
+  point/fill light with attenuation. Perform lighting in linear color and convert to the
+  declared display transfer function on output. Textures, normal maps, shadows, skeletal
+  animation and a programmable shader language remain optional future work, not hidden
+  completion requirements.
+- [ ] Add bounded scene resources: immutable vertex/index buffers, meshes, instances,
+  transforms, camera, materials and a fixed configured maximum number of lights/draws/
+  triangles per frame. Validate indices and finite transforms at ingestion, use checked
+  allocation for color/depth buffers, account peak memory to the process Domain and reuse
+  frame allocations. Scene traversal and clipping allocate no unbounded per-triangle
+  vectors from hostile geometry.
+- [ ] Add frame scheduling over the M133a present queue: render into the acquired image,
+  wait for completion before reuse, maintain at most the negotiated frames in flight and
+  pace against monotonic time instead of busy-spinning. Resize/out-of-date recreates color
+  and depth targets transactionally; allocation failure keeps or cleanly releases the old
+  scene and returns control to the console. A hidden/background scene blocks or throttles
+  and consumes no raw input.
+
+### M133c - 3D Test SW, the end-to-end scene
+
+- [ ] Add one governed PIE application named **3D Test SW**, with canonical artifact
+  `test3d-sw.lsexe` and only `display + input-keys` grants. It acquires a
+  native/preferred present queue and renders a continuously rotating
+  indexed cube above a simple ground plane. The six cube faces have visibly distinct
+  material colors, correct shared-edge depth/occlusion, smooth or deliberately hard face
+  normals, ambient + directional + animated point lighting and specular highlights. A
+  perspective camera, dark non-flat background and ground reference make rotation and
+  depth unmistakable; no face-order painter shortcut is accepted.
+- [ ] Make the scene interactive and recoverable: Esc/q exits, Space pauses, R resets,
+  arrow keys orbit the camera and +/- changes distance or field of view. Key-down/up state
+  comes through the M121 focus capability; focus loss clears held state. Resize recreates
+  targets and preserves camera/animation state. Clean exit, crash, allocation failure,
+  emergency kill and DisplayService restart always release images and restore the text
+  console.
+- [ ] Provide deterministic demo/test controls without exposing them in normal UI: fixed
+  simulation time/frame, fixed camera and fixed light seed. A host renderer test produces
+  a small golden/reference frame with tolerance-based color/depth comparisons rather than
+  requiring bit-identical cross-architecture floating point. The live app remains clock-
+  driven and visibly animated.
+- [ ] Host tests cover vector/matrix/quaternion identities, camera/frustum transforms,
+  clipping every plane, winding/culling, perspective interpolation, depth ordering,
+  shared-edge fill, non-finite/degenerate input, lighting/color transfer and guarded
+  canaries around color/depth targets. Property/fuzz tests feed hostile meshes, indices,
+  transforms, extents and viewport/scissor rectangles under strict allocation limits.
+- [ ] Governed kernel tests launch the staged PIE against stand-in Display/Input services
+  and assert acquire -> multiple distinct presents -> resize/recreate -> key interaction ->
+  release/exit, plus crash restoration and denied-capability behavior. Package audits prove
+  ET_DYN/provider identity/order, exact grants and no static duplicate renderer/runtime.
+- [ ] Live QEMU validation on x86_64 captures at least three timed frames and uses pixel
+  checks to prove the scene is nonblank, the projected cube occupies a bounded central
+  region, all six material colors appear across the captured rotation, depth occlusion and
+  lighting gradients exist, and successive frames differ while the background/console do
+  not leak through. Capture after resize on desktop and mobile-like aspect ratios; q must
+  restore the console. AArch64 and RISC-V must cross-build and run deterministic renderer
+  tests; live screenshot parity uses tolerances where emulation cost is practical.
+- [ ] Measure release performance and memory at 320x240, 640x480 and 800x600. The required
+  floor is a stable 30 FPS at 640x480 on the documented x86_64 QEMU/KVM host with no frame
+  allocation after warm-up, bounded present latency and a reported color/depth/scene peak.
+  Record transform, clipping, raster, lighting and present times separately in
+  `docs/PERF.md`; optimize tile/bin traversal or fixed-point edge evaluation only from
+  measurements, without architecture-specific output corruption or unsafe unchecked
+  indexing.
+- [ ] Publish `docs/SOFTWARE_3D.md`: coordinate/color conventions, pipeline stages,
+  clipping/raster rules, scene/material format, memory formulas, controls, performance
+  table and the exact boundary a future Mesa/Gallium/Vulkan backend replaces. Include a
+  screenshot of the actual 3D Test SW scene and a tri-architecture validation matrix.
+- Done when: the API-neutral WSI/synchronization/resource/lifecycle contracts are bounded,
+  capability-scoped, documented and hostile-input tested; the foreign-driver/provider
+  integration substrate has a reproducible synthetic proof but no accelerated API
+  implementation; `soft3d` renders clipped, depth-tested and lit indexed geometry; and a
+  governed dynamically linked `test3d-sw.lsexe` continuously shows the interactive
+  **3D Test SW** scene with its rotating six-color lit cube, survives
+  resize/focus loss/failure, restores the console on
+  every exit path, meets the measured 640x480 frame budget and passes host, package,
+  focused QEMU and tri-architecture gates.
+- Explicitly deferred: actual EGL/OpenGL/OpenGL ES/Vulkan entry points and conformance;
+  Mesa/Gallium, LLVM shader compilation, GLSL/SPIR-V compilation, virglrenderer/Venus,
+  virtio-gpu context/blob/3D command execution, native hardware drivers, compute, ray
+  tracing, compositor/windowed multi-app presentation and desktop effects. Each requires a
+  separately approved milestone and must consume M133 contracts rather than weakening
+  capability, validation, accounting or identity gates.
+- Concept: M44/M68 (virtio-gpu 2D scanout and resize), M121 (surface/input app platform),
+  M123/M126a (shared providers and PIE ownership), M127 (final userspace/system layout),
+  M37/M39 (observability and governed resources), and the future desktop/GPU phases.
+
 ## Definition of done (phase 2)
 Phase 2 is done when the appliance/edge platform stands on its own: a userspace
 network stack over virtio-net (RX + ARP/IPv4/ICMP + UDP/TCP) reachable through a
