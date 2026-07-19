@@ -3839,6 +3839,16 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     as a green suite; its transparent-image smoke fixture uses the existing compact RGBA16
     PNG instead of running an unrelated encoder on the kernel test stack. The wider
     domain-client rollout and monolithic protocol-codec split remain open.
+  - Process/resources result (M126a, 2026-07-19): `process-client.lslib`
+    (3,608/3,736/4,024 bytes) owns four public process trampolines and
+    `resources-client.lslib` (2,936/3,016/3,288 bytes) owns two resources trampolines;
+    each directly needs only `proto.lslib`. `ps`, `run` and `usage` import their public
+    concrete symbols with no `ChannelClient`, `ChannelTransport`, `VecWriter` or private
+    implementation imports. The image gate pins those boundaries on every target. On
+    x86_64, `ps` shrank from 15,032 to 9,960 bytes and `run` from 7,840 to 5,840 bytes;
+    the complete 38-provider/68-executable graph passes on x86_64, AArch64 and RISC-V.
+    The focused x86_64 process/service runtime suite passes all 58 selected tests; the
+    `ps -i` harness now loads its declared provider graph instead of raw-spawning the PIE.
 - [ ] Migrate in measured, independently runnable waves:
   1. `echo`, `uname`, `uptime`, `dmesg`, `free`, `lscpu`, `lsmem`, `lsirq`, `lspci`,
      `ptyecho`, `readln`, `script`: `lsrt` plus only the domain/CLI leaves they use;

@@ -17,9 +17,9 @@
 extern crate alloc;
 
 use alloc::string::String;
-use ipc_client::ChannelTransport;
+use process_client::ProcessClient;
 use proto::codec::JsonMode;
-use proto::system::{process, resources};
+use resources_client::ResourcesClient;
 use rt::*;
 
 // The refresh period of the live view, in clock ticks (~100 Hz, so ~1 s).
@@ -63,7 +63,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // text (the default), or as a JSON array rendered on the client.
 unsafe fn query_processes(procsvc: u64, mode: Option<JsonMode>) {
 	unsafe {
-		let mut client = process::Client::new(ChannelTransport { chan: procsvc });
+		let mut client = ProcessClient::new(procsvc);
 		match client.list() {
 			Some(Ok(procs)) => {
 				if let Some(mode) = mode {
@@ -148,7 +148,7 @@ unsafe fn render_frame(procsvc: u64, ressvc: u64) {
 	unsafe {
 		print(b"\x1b[H\x1b[2J");
 		print(b"\x1b[1mps - live process / resource view\x1b[0m (refresh 1s, q quits)\n\n");
-		let mut proc_client = process::Client::new(ChannelTransport { chan: procsvc });
+		let mut proc_client = ProcessClient::new(procsvc);
 		match proc_client.list() {
 			Some(Ok(procs)) => {
 				print(b"\x1b[4mprocesses\x1b[0m\n");
@@ -161,7 +161,7 @@ unsafe fn render_frame(procsvc: u64, ressvc: u64) {
 			_ => print(b"processes: unavailable\n"),
 		}
 		print(b"\n");
-		let mut res_client = resources::Client::new(ChannelTransport { chan: ressvc });
+		let mut res_client = ResourcesClient::new(ressvc);
 		match res_client.usage() {
 			Some(Ok(budgets)) => {
 				print(b"\x1b[4mdomain budgets\x1b[0m\n");

@@ -81,6 +81,8 @@ library   wire                  wire       volume -            lsrt
 library   ipc-client            ipc-client volume shared-image lsrt
 library   proto                 proto      volume -            ipc-client wire lsrt
 library   network-client        network-client-provider volume shared-image proto
+library   process-client        process-client-provider volume shared-image proto
+library   resources-client      resources-client-provider volume shared-image proto
 library   pix                   pix        volume -            lsrt
 library   inflate               inflate    volume -            lsrt
 library   deflate               deflate    volume -            lsrt
@@ -140,9 +142,9 @@ dynamic   play       tools  volume aiff flac mp3 vorbis wav wavpack proto ipc-cl
 dynamic   graphics_probe tools volume lsrt
 dynamic   imgview    tools  volume imgconv pix surface proto ipc-client wire lsrt
 dynamic   imgconv    tools  volume imgconv proto ipc-client wire lsrt
-dynamic   usage      tools  volume proto ipc-client wire lsrt
-dynamic   ps         tools  volume proto ipc-client wire lsrt
-dynamic   run        tools  volume proto ipc-client wire lsrt
+dynamic   usage      tools  volume resources-client proto wire lsrt
+dynamic   ps         tools  volume process-client resources-client proto wire lsrt
+dynamic   run        tools  volume process-client proto lsrt
 dynamic   perm       tools  volume proto ipc-client wire lsrt
 dynamic   stop       tools  volume lsrt
 dynamic   lsvol      tools  volume proto ipc-client wire lsrt

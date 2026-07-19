@@ -4628,7 +4628,7 @@ fn system_packages_use_canonical_executable_names() {
 		library_identities += usize::from(name.starts_with(b"id/lib/"));
 		executable_identities += usize::from(name.starts_with(b"id/bin/"));
 	}
-	assert_eq!(library_identities, 36, "every staged library has one identity record");
+	assert_eq!(library_identities, 38, "every staged library has one identity record");
 	assert_eq!(executable_identities, 68, "every staged dynamic executable has one identity record");
 	assert!(volume.lookup(b"id/lib/imgconv").is_some(), "library identity namespace preserves imgconv");
 	assert!(volume.lookup(b"id/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");
@@ -6608,7 +6608,7 @@ fn ps_live_view_drives_the_terminal_contract() {
 	let (console_host, console_child) = Channel::create();
 	let (res_host, res_child) = Channel::create();
 	let (proc_host, proc_child) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), ps_elf, boot_user, Rights::ALL, 0).expect("ps should spawn");
+	let _ps = spawn_dynamic_test_process(sched::root_domain(), ps_elf, boot_user);
 	send_cap(&boot_kernel, b"STDOUT", console_child, Rights::ALL).expect("STDOUT bootstrap");
 	boot_kernel.send(Message::new(b"-i".to_vec(), alloc::vec::Vec::new(), 0)).expect("argv bootstrap");
 	send_cap(&boot_kernel, b"RESOURCE", res_child, Rights::ALL).expect("RESOURCE bootstrap");

@@ -14,9 +14,9 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
-use proto::system::{Budget, resources};
+use proto::system::Budget;
+use resources_client::ResourcesClient;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -44,7 +44,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // UNLIMITED sentinel) shown as `unlimited` rather than the raw number.
 unsafe fn query_resource(ressvc: u64, mode: Option<JsonMode>) {
 	unsafe {
-		let mut client = resources::Client::new(ChannelTransport { chan: ressvc });
+		let mut client = ResourcesClient::new(ressvc);
 		match client.usage() {
 			Some(Ok(budgets)) => {
 				if let Some(mode) = mode {

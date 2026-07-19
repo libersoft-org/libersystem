@@ -14,8 +14,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
-use proto::system::process;
+use process_client::ProcessClient;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -47,7 +46,7 @@ unsafe fn run_process(procsvc: u64, name: &[u8]) {
 				return;
 			}
 		};
-		let mut client = process::Client::new(ChannelTransport { chan: procsvc });
+		let mut client = ProcessClient::new(procsvc);
 		match client.start(name) {
 			Some(Ok(info)) => {
 				print(b"started ");

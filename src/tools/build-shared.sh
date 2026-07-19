@@ -58,6 +58,8 @@ library_file() {
 	proto) printf 'proto/shared/%s/proto.lslib' "$target" ;;
 	wire) printf 'wire/shared/%s/wire.lslib' "$target" ;;
 	network-client) printf 'user/network-client-provider/shared/%s/network-client.lslib' "$target" ;;
+	process-client) printf 'user/process-client-provider/shared/%s/process-client.lslib' "$target" ;;
+	resources-client) printf 'user/resources-client-provider/shared/%s/resources-client.lslib' "$target" ;;
 	wasm) printf 'wasm/shared/%s/wasm.lslib' "$target" ;;
 	term) printf 'term/shared/%s/term.lslib' "$target" ;;
 	service-util) printf 'user/services/shared/%s/service-util.lslib' "$target" ;;
@@ -619,6 +621,34 @@ if [[ -n "$image_graph" ]]; then
 			fi
 			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_network_' <<<"$consumer_imports"; then
 				echo "build-shared: $consumer bypasses the concrete network client provider" >&2
+				exit 1
+			fi
+			;;
+		ps | run)
+			if ! grep -q '^liber_channel_liber_process_' <<<"$consumer_imports"; then
+				echo "build-shared: $consumer does not import the concrete process client provider" >&2
+				exit 1
+			fi
+			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_process_' <<<"$consumer_imports"; then
+				echo "build-shared: $consumer bypasses the concrete process client provider" >&2
+				exit 1
+			fi
+			if [[ "$consumer" == ps ]] && ! grep -q '^liber_channel_liber_resources_' <<<"$consumer_imports"; then
+				echo "build-shared: ps does not import the concrete resources client provider" >&2
+				exit 1
+			fi
+			if [[ "$consumer" == ps ]] && grep -Eq '^liber_channel_impl_liber_resources_' <<<"$consumer_imports"; then
+				echo "build-shared: ps bypasses the concrete resources client provider" >&2
+				exit 1
+			fi
+			;;
+		usage)
+			if ! grep -q '^liber_channel_liber_resources_' <<<"$consumer_imports"; then
+				echo "build-shared: $consumer does not import the concrete resources client provider" >&2
+				exit 1
+			fi
+			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_resources_' <<<"$consumer_imports"; then
+				echo "build-shared: $consumer bypasses the concrete resources client provider" >&2
 				exit 1
 			fi
 			;;

@@ -1,0 +1,11 @@
+[package]
+name = "process-client-provider"
+edition = "2024"
+description = "ELF trampoline provider for concrete LiberSystem process channel clients"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = []

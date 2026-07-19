@@ -287,6 +287,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "process-client"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "process-client-provider"
+version = "0.0.0"
+
+[[package]]
 name = "proto"
 version = "0.0.0"
 dependencies = [
@@ -317,6 +328,17 @@ version = "0.0.0"
 dependencies = [
  "pix",
 ]
+
+[[package]]
+name = "resources-client"
+version = "0.0.0"
+dependencies = [
+ "proto",
+]
+
+[[package]]
+name = "resources-client-provider"
+version = "0.0.0"
 
 [[package]]
 name = "rt"
@@ -372,7 +394,11 @@ dependencies = [
  "network-client-provider",
  "pix",
  "png",
+ "process-client",
+ "process-client-provider",
  "proto",
+ "resources-client",
+ "resources-client-provider",
  "rt",
  "surface",
  "vorbis",
