@@ -383,6 +383,19 @@ ET_REL hits, and no-change x86 remains 49-70 s because neither path previously s
 of its time in repeated ownership lookup. The remaining cost is source-tree hashing,
 provider/link work and shell process overhead, not consumer Rust compilation.
 
+The source-inventory pass resolves the manifest's local Cargo roots once and reads
+each relevant Rust/Cargo/toolchain/linker input once into a content-hashed in-memory
+inventory. Crate, API, package-closure, executable and image-graph digests reuse those
+bytes without mtime heuristics; their serialized digest format remains byte-compatible
+with the prior cache keys. A per-target `flock` serializes the coherent Cargo target
+directory and mutable artifact cache, while independent architectures remain parallel;
+the invalidation harness holds that same x86 lock across mutation and restore. On the
+final clean warm x86 graph the source stage is 0-1 s, graph validation 0-1 s, provider
+validation 7 s and consumer validation 24 s, for 34 s total with 46/46 provider and
+67/67 executable hits. Further source-digest optimization is therefore not justified;
+the remaining measured work is provider/consumer artifact validation and shell process
+overhead.
+
 ## Kernel wake path (2026-07-06)
 
 Measured live in QEMU/KVM as the end-to-end round-trip of a shell command typed

@@ -7,6 +7,11 @@ output="$(mktemp)"
 backup=""
 source=""
 
+command -v flock >/dev/null
+mkdir -p "$root/boot/.build"
+exec 8>"$root/boot/.build/image-build-x86_64-unknown-none.lock"
+flock 8
+
 cleanup() {
 	if [[ -n "$backup" && -n "$source" && -f "$backup" ]]; then cp "$backup" "$source"; fi
 	rm -f "$backup" "$output"
@@ -14,7 +19,7 @@ cleanup() {
 trap cleanup EXIT
 
 run_graph() {
-	(cd "$root" && just shared-libs) >"$output" 2>&1
+	(cd "$root" && LIBER_IMAGE_LOCK_HELD=1 just shared-libs) >"$output" 2>&1
 }
 
 summary_value() {
@@ -88,6 +93,21 @@ provider)
 			exit 1
 		fi
 	done
+	cp "$backup" "$source"
+	run_graph
+	expect_only_misses provider volume-client
+	expect_only_misses executable "${consumers[@]}"
+	for consumer in "${consumers[@]}"; do
+		if ! grep -q "^build-shared: object cache hit $consumer$" "$output"; then
+			echo "shared-cache-check: provider restore recompiled $consumer" >&2
+			exit 1
+		fi
+	done
+	run_graph
+	if [[ "$(summary_value providers)" != */0 || "$(summary_value executables)" != */0 ]]; then
+		echo "shared-cache-check: provider baseline did not return to a warm state" >&2
+		exit 1
+	fi
 	;;
 *)
 	echo "usage: $0 [quick|provider]" >&2

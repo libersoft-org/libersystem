@@ -4065,6 +4065,21 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     dominate that narrow path. No-change x86 remains variable at 49-70 s; the index does
     not pretend to improve a path that performs no ownership lookup. AArch64 and RISC-V
     complete the same graph, and `shared-cache-check quick|provider` remains green.
+  - Source-inventory result (M126a, 2026-07-20): every build invocation now resolves the
+    local Cargo roots needed by manifest libraries and dynamic packages once, reads each
+    relevant source file once into a content-hashed inventory, and derives crate, API,
+    package-closure, executable and image-graph digests from that immutable inventory.
+    It keeps the prior digest byte format exactly, including relative tool inputs and
+    absolute service inputs, so existing ET_REL identities remain reusable. Repeated
+    `cargo metadata`, `find` and per-file `sha256sum` walks are eliminated without using
+    mtime or relaxing a cache hit. A per-target `flock` serializes the coherent Cargo
+    target and mutable artifact cache, while independent architectures stay parallel; the
+    harness holds that same x86 lock across mutation and restore. Final clean x86 stage
+    timing is source 0-1 s, graph 0-1 s, providers 7 s and consumers 24 s (34 s total)
+    with 46/46 provider and 67/67 executable hits. Source hashing is no longer the
+    limiting path. Serial `shared-cache-check quick|provider` and all three target graphs
+    pass. Future work should target the measured provider/consumer artifact audit process
+    overhead, not further source-hash changes.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

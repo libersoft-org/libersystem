@@ -21,12 +21,21 @@ object_cache_hits=0
 object_cache_misses=0
 executable_cache_hits=0
 executable_cache_misses=0
+source_inventory_file=""
+source_metadata_dir=""
+source_inventory_seconds=0
+image_graph_seconds=0
+provider_seconds=0
+consumer_seconds=0
 
 report_build_summary() {
 	local status=$?
 	find "$root" -path "*/shared/$target/*.$$.expected" -delete 2>/dev/null || true
 	find "$artifact_cache_dir" -maxdepth 1 -type f -name "*.tmp.$$" -delete 2>/dev/null || true
-	echo "build-shared: summary target=$target seconds=$((SECONDS - build_started)) providers=$provider_cache_hits/$provider_cache_misses objects=$object_cache_hits/$object_cache_misses executables=$executable_cache_hits/$executable_cache_misses status=$status"
+	rm -f "$root/boot/.build/package-dirs.$$.tmp"
+	if [[ -n "$source_inventory_file" ]]; then rm -f "$source_inventory_file"; fi
+	if [[ -n "$source_metadata_dir" ]]; then rm -rf "$source_metadata_dir"; fi
+	echo "build-shared: summary target=$target seconds=$((SECONDS - build_started)) stages=source:$source_inventory_seconds,graph:$image_graph_seconds,providers:$provider_seconds,consumers:$consumer_seconds providers=$provider_cache_hits/$provider_cache_misses objects=$object_cache_hits/$object_cache_misses executables=$executable_cache_hits/$executable_cache_misses status=$status"
 }
 
 trap report_build_summary EXIT
@@ -34,6 +43,13 @@ trap report_build_summary EXIT
 if [[ "$force_rebuild" != 0 && "$force_rebuild" != 1 ]]; then
 	echo "build-shared: LIBER_IMAGE_REBUILD must be 0 or 1" >&2
 	exit 2
+fi
+
+command -v flock >/dev/null
+mkdir -p "$root/boot/.build"
+if [[ "${LIBER_IMAGE_LOCK_HELD:-0}" != 1 ]]; then
+	exec 9>"$root/boot/.build/image-build-$target.lock"
+	flock 9
 fi
 
 case "$target" in
@@ -68,6 +84,75 @@ command -v llvm-strip >/dev/null
 command -v jq >/dev/null
 command -v sha256sum >/dev/null
 command -v xxd >/dev/null
+
+declare -A source_file_hashes=()
+declare -A build_file_hashes=()
+source_inventory_started=$SECONDS
+source_inventory_file="$root/boot/.build/image-sources.$$.inventory"
+source_metadata_dir="$root/boot/.build/image-source-metadata.$$"
+source_roots_file="$source_metadata_dir/roots"
+mkdir -p "$(dirname "$source_inventory_file")"
+mkdir -p "$source_metadata_dir"
+
+while read -r crate; do
+	case "$crate" in
+	proto | wire | wasm | term) crate_dir="$crate" ;;
+	*) crate_dir="user/$crate" ;;
+	esac
+	printf '%s\n' "$crate_dir" >>"$source_roots_file"
+	if [[ "$crate_dir" == user/*-client-provider ]]; then printf '%s\n' "${crate_dir%-provider}" >>"$source_roots_file"; fi
+done < <(awk '$1 == "library" {print $3}' "$root/user/services/manifest.txt" | sort -u)
+
+while read -r package; do
+	[[ -n "$package" ]] || continue
+	package_dir="user/$package"
+	package_dirs="$source_metadata_dir/$package.dirs"
+	printf '%s\n' "$package_dir" >>"$source_roots_file"
+	(cd "$root" && cargo metadata --format-version 1 --manifest-path "$package_dir/Cargo.toml") |
+		jq -r --arg root "$root" '.packages[] | select(.source == null) | .manifest_path | sub("/Cargo.toml$"; "") | sub("^" + $root + "/"; "")' |
+		sort -u >"$package_dirs"
+	cat "$package_dirs" >>"$source_roots_file"
+done < <(awk '($1 == "dynamic" || $1 == "dynamic-service") && $4 == "volume" {print $3}' "$root/user/services/manifest.txt" | sort -u)
+sort -u -o "$source_roots_file" "$source_roots_file"
+
+while IFS= read -r -d '' record; do
+	hash="${record%% *}"
+	source="${record#* }"
+	source="${source# }"
+	source="${source#./}"
+	source_file_hashes[$source]="$hash"
+	printf '%s\t%s\n' "$source" "$hash" >>"$source_inventory_file"
+done < <(
+	cd "$root"
+	{
+		mapfile -t source_roots <"$source_roots_file"
+		find "${source_roots[@]}" -path '*/target' -prune -o -path '*/shared' -prune -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' -o -path 'user/services/manifest.txt' \) -print0
+		printf 'user/build.rs\0user/user.ld\0user/user-aarch64.ld\0user/user-riscv64.ld\0'
+		printf '../product.conf\0'
+	} | sort -z | xargs -0 sha256sum --zero
+)
+source_inventory_seconds=$((SECONDS - source_inventory_started))
+
+source_file_digest() {
+	local source="$1"
+	local display="${2:-$source}"
+	local key="${source#"$root/"}"
+	if [[ "$source" == "$root/../product.conf" ]]; then key="../product.conf"; fi
+	if [[ -z "${source_file_hashes[$key]:-}" ]]; then
+		printf 'missing:%s\n' "$key"
+		return
+	fi
+	printf '%s  %s\n' "${source_file_hashes[$key]}" "$display"
+}
+
+build_file_digest() {
+	local file="$1"
+	if [[ -n "${build_file_hashes[$file]:-}" ]]; then
+		printf '%s\n' "${build_file_hashes[$file]}"
+	else
+		sha256sum "$file" | awk '{print $1}'
+	fi
+}
 
 rustc_commit="$(rustc -vV | sed -n 's/^commit-hash: //p')"
 if [[ ! "$rustc_commit" =~ ^[0-9a-f]{40}$ ]]; then
@@ -110,7 +195,9 @@ library_identity_file() {
 	printf '%s.identity' "$(library_file "$1")"
 }
 
-source_digest() {
+declare -A crate_source_digests=()
+
+compute_source_digest() {
 	local crate_dir="$1"
 	local api_dir=""
 	if [[ "$crate_dir" == user/*-client-provider ]]; then
@@ -120,15 +207,24 @@ source_digest() {
 			return 1
 		fi
 	fi
-	(
-		cd "$root"
-		find "$crate_dir" ${api_dir:+"$api_dir"} -path '*/target' -prune -o -path '*/shared' -prune -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' \) -print0 |
-			sort -z |
-			while IFS= read -r -d '' source; do
-				printf '%s\n' "$source"
-				sha256sum "$source"
-			done
-	) | sha256sum | awk '{print $1}'
+	awk -F '\t' -v crate="$crate_dir/" -v api="${api_dir:+$api_dir/}" '
+		function source_file(path) {
+			return path ~ /\.rs$/ || path ~ /(^|\/)Cargo\.toml$/ || path ~ /(^|\/)Cargo\.lock$/ || path ~ /(^|\/)rust-toolchain\.toml$/
+		}
+		source_file($1) && (index($1, crate) == 1 || (api != "" && index($1, api) == 1)) {
+			print $1
+			print $2 "  " $1
+		}
+	' "$source_inventory_file" | sha256sum | awk '{print $1}'
+}
+
+source_digest() {
+	local crate_dir="$1"
+	if [[ -n "${crate_source_digests[$crate_dir]:-}" ]]; then
+		printf '%s\n' "${crate_source_digests[$crate_dir]}"
+	else
+		compute_source_digest "$crate_dir"
+	fi
 }
 
 executable_source_digest() {
@@ -137,14 +233,13 @@ executable_source_digest() {
 	local artifact="$3"
 	if [[ "$package" == tools ]]; then
 		(
-			cd "$root"
 			for source in "$crate_dir/Cargo.toml" "$crate_dir/Cargo.lock" "$crate_dir/src/lib.rs" "$crate_dir/src/$artifact.rs" user/build.rs user/user.ld user/user-aarch64.ld user/user-riscv64.ld ../product.conf; do
-				if [[ ! -f "$source" ]]; then
-					printf 'missing:%s\n' "$source"
-					continue
-				fi
 				printf '%s\n' "$source"
-				sha256sum "$source"
+				if [[ "$source" == /* ]]; then
+					source_file_digest "$source" "$source"
+				else
+					source_file_digest "$root/$source" "$source"
+				fi
 			done
 		) | sha256sum | awk '{print $1}'
 		return
@@ -152,14 +247,10 @@ executable_source_digest() {
 	{
 		printf 'dependency-closure=%s\n' "${package_source_digests[$package]:-$(source_digest "$crate_dir")}"
 		for source in "$root/user/build.rs" "$root/user/user.ld" "$root/user/user-aarch64.ld" "$root/user/user-riscv64.ld" "$root/../product.conf"; do
-			if [[ -f "$source" ]]; then
-				sha256sum "$source"
-			else
-				printf 'missing:%s\n' "$source"
-			fi
+			source_file_digest "$source"
 		done
 		if [[ "$package" == services ]]; then
-			sha256sum "$root/user/services/manifest.txt"
+			source_file_digest "$root/user/services/manifest.txt"
 		fi
 	} | sha256sum | awk '{print $1}'
 }
@@ -167,23 +258,43 @@ executable_source_digest() {
 local_dependency_source_digest() {
 	local crate_dir="$1"
 	local exclude_root="${2:-0}"
-	local metadata
-	metadata="$(cd "$root" && cargo metadata --format-version 1 --manifest-path "$crate_dir/Cargo.toml")"
-	(
-		cd "$root"
-		jq -r --arg root "$root/$crate_dir/Cargo.toml" --arg exclude "$exclude_root" '.packages[] | select(.source == null and ($exclude != "1" or .manifest_path != $root)) | .manifest_path' <<<"$metadata" |
-			while IFS= read -r manifest_path; do
-				package_dir="$(dirname "$manifest_path")"
-				package_dir="${package_dir#"$root/"}"
-				find "$package_dir" -path '*/target' -prune -o -path '*/shared' -prune -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' \) -print
-			done |
-			sort -u |
-			while IFS= read -r source; do
-				printf '%s\n' "$source"
-				sha256sum "$source"
-			done
-	) | sha256sum | awk '{print $1}'
+	local package package_dirs package_dir
+	package="${crate_dir#user/}"
+	package_dirs="$root/boot/.build/package-dirs.$$.tmp"
+	while IFS= read -r package_dir; do
+		if [[ "$exclude_root" == 1 && "$package_dir" == "$crate_dir" ]]; then continue; fi
+		printf '%s/\n' "$package_dir"
+	done <"$source_metadata_dir/$package.dirs" >"$package_dirs"
+	awk -F '\t' '
+		NR == FNR {prefix[$1] = 1; next}
+		{
+			if (!($1 ~ /\.rs$/ || $1 ~ /(^|\/)Cargo\.toml$/ || $1 ~ /(^|\/)Cargo\.lock$/ || $1 ~ /(^|\/)rust-toolchain\.toml$/)) next
+			for (dir in prefix) {
+				if (index($1, dir) == 1) {
+					print $1
+					print $2 "  " $1
+					break
+				}
+			}
+		}
+	' "$package_dirs" "$source_inventory_file" | sha256sum | awk '{print $1}'
+	rm -f "$package_dirs"
 }
+
+source_digest_roots="$source_metadata_dir/digest-roots"
+while read -r crate; do
+	case "$crate" in
+	proto | wire | wasm | term) crate_dir="$crate" ;;
+	*) crate_dir="user/$crate" ;;
+	esac
+	printf '%s\n' "$crate_dir" >>"$source_digest_roots"
+	if [[ "$crate_dir" == user/*-client-provider ]]; then printf '%s\n' "${crate_dir%-provider}" >>"$source_digest_roots"; fi
+done < <(awk '$1 == "library" {print $3}' "$root/user/services/manifest.txt" | sort -u)
+printf 'user/dyn_probe\n' >>"$source_digest_roots"
+sort -u -o "$source_digest_roots" "$source_digest_roots"
+while IFS= read -r crate_dir; do
+	crate_source_digests[$crate_dir]="$(compute_source_digest "$crate_dir")"
+done <"$source_digest_roots"
 
 write_identity_record() {
 	local kind="$1"
@@ -211,7 +322,7 @@ write_identity_record() {
 				echo "build-shared: $artifact has no identity for provider $provider" >&2
 				return 1
 			fi
-			digest="$(sha256sum "$(library_identity_file "$provider")" | awk '{print $1}')"
+			digest="$(build_file_digest "$(library_identity_file "$provider")")"
 			printf 'provider=%s:%s\n' "$provider" "$digest"
 		done
 	} >"$identity"
@@ -245,6 +356,7 @@ emit_identity() {
 	local digest note dumped_note
 	write_identity_record "$kind" "$artifact" "$package" "$source_sha" "$feature_set" "$providers" "$identity"
 	digest="$(sha256sum "$identity" | awk '{print $1}')"
+	build_file_hashes[$identity]="$digest"
 	note="$elf.identity.note"
 	printf '0600000020000000010000004c49424552000000' | xxd -r -p >"$note"
 	printf '%s' "$digest" | xxd -r -p >>"$note"
@@ -283,9 +395,9 @@ artifact_cache_valid() {
 	[[ -f "$out" && -f "$out.identity" && -f "$cache_prefix.build-key" && -f "$cache_prefix.sha256" ]] || return 1
 	[[ "$(cat "$cache_prefix.build-key")" == "$expected_key" ]] || return 1
 	cmp -s "$expected_identity" "$out.identity" || return 1
-	actual_hash="$(sha256sum "$out" | awk '{print $1}')" || return 1
+	actual_hash="$(build_file_digest "$out")" || return 1
 	[[ "$(cat "$cache_prefix.sha256")" == "$actual_hash" ]] || return 1
-	identity_hash="$(sha256sum "$out.identity" | awk '{print $1}')" || return 1
+	identity_hash="$(build_file_digest "$out.identity")" || return 1
 	needed_hash="$(printf '%s' "$expected_needed" | sha256sum | awk '{print $1}')"
 	audit_key="$({
 		printf 'format=liber-image-audit-cache-v1\n'
@@ -315,7 +427,8 @@ record_artifact_cache() {
 	local key="$3"
 	mkdir -p "$artifact_cache_dir"
 	printf '%s\n' "$key" >"$cache_prefix.build-key.tmp"
-	sha256sum "$out" | awk '{print $1}' >"$cache_prefix.sha256.tmp"
+	build_file_hashes[$out]="$(sha256sum "$out" | awk '{print $1}')"
+	printf '%s\n' "${build_file_hashes[$out]}" >"$cache_prefix.sha256.tmp"
 	mv "$cache_prefix.build-key.tmp" "$cache_prefix.build-key"
 	mv "$cache_prefix.sha256.tmp" "$cache_prefix.sha256"
 	rm -f "$cache_prefix.audit-key"
@@ -348,7 +461,7 @@ object_cache_valid() {
 	local actual_hash definitions
 	[[ -f "$object" && -f "$cache_prefix.build-key" && -f "$cache_prefix.sha256" ]] || return 1
 	[[ "$(cat "$cache_prefix.build-key")" == "$expected_key" ]] || return 1
-	actual_hash="$(sha256sum "$object" | awk '{print $1}')" || return 1
+	actual_hash="$(build_file_digest "$object")" || return 1
 	[[ "$(cat "$cache_prefix.sha256")" == "$actual_hash" ]] || return 1
 	llvm-readelf -h "$object" | grep -q 'Type:.*REL' || return 1
 	definitions="$(llvm-readelf --wide --symbols "$object" | awk '$5 == "GLOBAL" && $7 != "UND" && $8 != "" {print $8}' | sort -u)"
@@ -360,7 +473,8 @@ record_object_cache() {
 	local cache_prefix="$2"
 	local key="$3"
 	printf '%s\n' "$key" >"$cache_prefix.build-key.tmp"
-	sha256sum "$object" | awk '{print $1}' >"$cache_prefix.sha256.tmp"
+	build_file_hashes[$object]="$(sha256sum "$object" | awk '{print $1}')"
+	printf '%s\n' "${build_file_hashes[$object]}" >"$cache_prefix.sha256.tmp"
 	mv "$cache_prefix.build-key.tmp" "$cache_prefix.build-key"
 	mv "$cache_prefix.sha256.tmp" "$cache_prefix.sha256"
 }
@@ -394,6 +508,32 @@ dynamic_rows() {
 	' "$root/user/services/manifest.txt" | sort -k2,2
 }
 
+build_file_hash_inventory() {
+	local artifact file kind consumer crate stage providers record hash
+	while read -r artifact; do
+		file="$(library_file "$artifact")"
+		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
+		if [[ -f "$file.identity" ]]; then printf '%s\0' "$file.identity"; fi
+	done < <(awk '$1 == "library" {print $2}' "$root/user/services/manifest.txt")
+	while read -r kind consumer crate stage providers; do
+		file="user/$crate/shared/$target/$consumer"
+		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
+		if [[ -f "$file.identity" ]]; then printf '%s\0' "$file.identity"; fi
+	done < <(dynamic_rows)
+	file="user/dyn_probe/shared/$target/dyn_probe"
+	if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
+	if [[ -f "$file.identity" ]]; then printf '%s\0' "$file.identity"; fi
+	find "$artifact_cache_dir" -maxdepth 1 -type f -name 'object-*.o' -print0 2>/dev/null || true
+}
+
+while IFS= read -r -d '' record; do
+	hash="${record%% *}"
+	file="${record#* }"
+	file="${file# }"
+	build_file_hashes[$file]="$hash"
+done < <(build_file_hash_inventory | sort -z -u | xargs -0 -r sha256sum --zero)
+
+image_graph_started=$SECONDS
 image_graph=""
 if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 	image_target="$root/boot/.build/image-cargo-$target"
@@ -445,7 +585,7 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 			printf '%s=%s\n' "$crate_dir" "$(source_digest "$crate_dir")"
 		done < <(awk '$1 == "library" {print $3}' "$root/user/services/manifest.txt" | sort -u)
 		for source in "$root/user/build.rs" "$root/../product.conf"; do
-			sha256sum "$source"
+			source_file_digest "$source"
 		done
 	} | sha256sum | awk '{print $1}')"
 	image_graph_key="$({
@@ -495,6 +635,7 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 		mv "$image_graph_key_file.tmp" "$image_graph_key_file"
 	fi
 fi
+image_graph_seconds=$((SECONDS - image_graph_started))
 
 graph_archive() {
 	local crate_dir="$1"
@@ -607,6 +748,7 @@ canonical_provider_order() {
 	printf '%s' "$result"
 }
 
+provider_started=$SECONDS
 artifacts=()
 declare -A provider_compile_digests=()
 for spec in "$@"; do
@@ -917,8 +1059,10 @@ for spec in "$@"; do
 	echo "build-shared: $out ($(stat -c %s "$out") bytes)"
 	artifacts+=("$artifact")
 done
+provider_seconds=$((SECONDS - provider_started))
 
 if [[ -n "$image_graph" ]]; then
+	consumer_started=$SECONDS
 	start_obj="$root/boot/.build/exe-start-$target.o"
 	"$root/tools/build-exe-start.sh" "$target" "$start_obj"
 	dynamic_rows="$(dynamic_rows)"
@@ -1198,6 +1342,7 @@ if [[ -n "$image_graph" ]]; then
 		rm -f "$consumer_expected_identity"
 		echo "build-shared: $out ($(stat -c %s "$out") bytes, PIE)"
 	done <<<"$dynamic_rows"
+	consumer_seconds=$((SECONDS - consumer_started))
 fi
 
 if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
