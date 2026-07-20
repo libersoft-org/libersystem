@@ -24,6 +24,8 @@ executable_cache_misses=0
 
 report_build_summary() {
 	local status=$?
+	find "$root" -path "*/shared/$target/*.$$.expected" -delete 2>/dev/null || true
+	find "$artifact_cache_dir" -maxdepth 1 -type f -name "*.tmp.$$" -delete 2>/dev/null || true
 	echo "build-shared: summary target=$target seconds=$((SECONDS - build_started)) providers=$provider_cache_hits/$provider_cache_misses objects=$object_cache_hits/$object_cache_misses executables=$executable_cache_hits/$executable_cache_misses status=$status"
 }
 
@@ -507,6 +509,36 @@ graph_archive() {
 }
 
 declare -A canonical_order_cache=()
+declare -A provider_dependencies=()
+declare -A provider_symbols=()
+declare -A provider_symbols_indexed=()
+
+build_provider_index() {
+	local providers="$1"
+	local provider file kind value
+	for provider in $providers; do
+		if [[ -n "${provider_symbols_indexed[$provider]:-}" ]]; then continue; fi
+		file="$(library_file "$provider")"
+		if [[ ! -v "provider_dependencies[$provider]" ]]; then provider_dependencies[$provider]=""; fi
+		while IFS=$'\t' read -r kind value; do
+			case "$kind" in
+			D) provider_dependencies[$provider]+=" ${value%.lslib}" ;;
+			S) provider_symbols["$provider|$value"]=1 ;;
+			esac
+		done < <(llvm-readelf --wide -d --dyn-syms "$file" | awk '
+			/Shared library:/ {
+				name = $0
+				sub(/^.*Shared library: \[/, "", name)
+				sub(/\].*$/, "", name)
+				print "D\t" name
+				next
+			}
+			$1 ~ /^[0-9]+:$/ && $7 != "UND" && $8 != "" {print "S\t" $8}
+		')
+		provider_dependencies[$provider]="$(tr ' ' '\n' <<<"${provider_dependencies[$provider]}" | sed '/^$/d' | sort -u | xargs)"
+		provider_symbols_indexed[$provider]=1
+	done
+}
 
 canonical_provider_order() {
 	local roots="$1"
@@ -533,7 +565,12 @@ canonical_provider_order() {
 			echo "build-shared: canonical graph names unavailable provider $name" >&2
 			return 1
 		fi
-		dependencies="$(llvm-readelf -d "$(library_file "$name")" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sed 's/\.lslib$//' | sort -u)"
+		if [[ -v "provider_dependencies[$name]" ]]; then
+			dependencies="${provider_dependencies[$name]}"
+		else
+			dependencies="$(llvm-readelf -d "$(library_file "$name")" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sed 's/\.lslib$//' | sort -u | xargs)"
+			provider_dependencies[$name]="$dependencies"
+		fi
 		present[$name]=1
 		edges[$name]="$dependencies"
 		for dependency in $dependencies; do
@@ -966,6 +1003,7 @@ if [[ -n "$image_graph" ]]; then
 		done
 		expected_needed="$(sort -u <<<"$expected_needed" | sed '/^$/d')"
 		consumer_imports="$(llvm-readelf --wide --symbols "$consumer_obj" | awk '$5 == "GLOBAL" && $7 == "UND" && $8 != "" {print $8}' | sort -u)"
+		build_provider_index "$providers"
 		case "$consumer" in
 		arp | httpd | ip | nc | nslookup | ping | ss | tcp)
 			if ! grep -q '^liber_channel_liber_network_' <<<"$consumer_imports"; then
@@ -1113,10 +1151,8 @@ if [[ -n "$image_graph" ]]; then
 			count=0
 			owner=""
 			for provider in $providers; do
-				provider_file="$(library_file "$provider")"
-				matches="$(llvm-readelf --wide --dyn-syms "$provider_file" | awk -v symbol="$symbol" '$7 != "UND" && $8 == symbol { count++ } END { print count + 0 }')"
-				count=$((count + matches))
-				if [[ "$matches" == 1 ]]; then
+				if [[ -n "${provider_symbols["$provider|$symbol"]:-}" ]]; then
+					((count += 1))
 					owner="$provider"
 				fi
 			done

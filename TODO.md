@@ -4053,6 +4053,18 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     objects. Warm AArch64/RISC-V graphs retain complete 46-provider/67-executable hit sets.
     A concurrent Cargo-writer pool remains deferred to measured cold-build work: the normal
     edit loop no longer has independent consumer compilations to parallelize.
+  - Parsed provider-index result (M126a, 2026-07-20): provider dependency and dynamic
+    symbol metadata is indexed lazily from one combined `llvm-readelf -d --dyn-syms`
+    process per direct provider actually needed by a miss. Canonical-order dependency
+    walks reuse the same map; consumer symbol ownership is then an in-memory lookup rather
+    than `undefined symbols x direct providers` subprocesses. A fully warm artifact-hit
+    path skips the symbol index entirely. The broad audit-only relink of all 67 consumers,
+    with 67 ET_REL object hits, falls from 372 s to 203 s. A representative
+    `volume-client` implementation change still takes 52-53 s: it rebuilds one provider,
+    relinks exactly six consumers and recompiles none, so source hashing and link work now
+    dominate that narrow path. No-change x86 remains variable at 49-70 s; the index does
+    not pretend to improve a path that performs no ownership lookup. AArch64 and RISC-V
+    complete the same graph, and `shared-cache-check quick|provider` remains green.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

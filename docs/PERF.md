@@ -373,6 +373,16 @@ jobs remain sequential for cold misses. Parallel Cargo writers against one targe
 directory are deferred until a cold-build measurement justifies their locking and memory
 cost; ordinary edits no longer expose enough independent compilation to benefit.
 
+Provider metadata is parsed lazily for relinks. One combined
+`llvm-readelf -d --dyn-syms` invocation per needed direct provider populates dependency
+and symbol-owner maps; canonical ordering and every consumer ownership check reuse those
+maps. A warm artifact hit never builds the symbol index. This reduces a broad relink of
+all 67 consumers with 67 ET_REL hits from 372 s to 203 s. A narrow `volume-client`
+implementation change remains 52-53 s for one provider rebuild and six relinks with six
+ET_REL hits, and no-change x86 remains 49-70 s because neither path previously spent most
+of its time in repeated ownership lookup. The remaining cost is source-tree hashing,
+provider/link work and shell process overhead, not consumer Rust compilation.
+
 ## Kernel wake path (2026-07-06)
 
 Measured live in QEMU/KVM as the end-to-end round-trip of a shell command typed
