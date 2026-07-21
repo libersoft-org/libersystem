@@ -157,6 +157,14 @@ Limits are explicit: bounded module count, dependency depth, symbol count, strin
 bytes, relocation count, and mapped bytes per process/domain. Failed loads release all
 private frames and shared-cache references acquired by that transaction.
 
+The runtime loader and package staging audit use one relocation policy. Every staged
+provider and executable is scanned before packaging; the audit permits only
+`RELATIVE` with symbol index zero plus `64`, `GLOB_DAT` and `JUMP_SLOT` on x86_64;
+`RELATIVE` plus `ABS64`, `GLOB_DAT` and `JUMP_SLOT` on AArch64; and `RELATIVE`
+plus `64` and `JUMP_SLOT` on RISC-V. Any other relocation form, including TLS,
+COPY and architecture-specific forms outside this list, rejects the artifact before
+it reaches the system volume.
+
 The focused dynamic-link gate launches the staged `dyn_probe` through
 ProcessService and requires its `pix.lslib -> proto.lslib -> lsrt.lslib` dependency
 DAG to load, relocate and report successfully. It also mutates `echo.lsexe` in an

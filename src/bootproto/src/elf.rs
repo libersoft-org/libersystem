@@ -28,6 +28,46 @@ const EXPECTED_MACHINE: u16 = EM_AARCH64;
 #[cfg(target_arch = "riscv64")]
 const EXPECTED_MACHINE: u16 = EM_RISCV;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DynamicRelocationKind {
+	Relative,
+	Symbol,
+}
+
+impl DynamicRelocationKind {
+	pub const fn accepts_symbol(self, symbol: u32) -> bool {
+		match self {
+			Self::Relative => symbol == 0,
+			Self::Symbol => true,
+		}
+	}
+}
+
+pub const fn expected_machine() -> u16 {
+	EXPECTED_MACHINE
+}
+
+pub const fn dynamic_relocation_kind(machine: u16, relocation: u32) -> Option<DynamicRelocationKind> {
+	match machine {
+		EM_X86_64 => match relocation {
+			8 => Some(DynamicRelocationKind::Relative),
+			1 | 6 | 7 => Some(DynamicRelocationKind::Symbol),
+			_ => None,
+		},
+		EM_AARCH64 => match relocation {
+			1027 => Some(DynamicRelocationKind::Relative),
+			257 | 1025 | 1026 => Some(DynamicRelocationKind::Symbol),
+			_ => None,
+		},
+		EM_RISCV => match relocation {
+			3 => Some(DynamicRelocationKind::Relative),
+			2 | 5 => Some(DynamicRelocationKind::Symbol),
+			_ => None,
+		},
+		_ => None,
+	}
+}
+
 // Program-header types used by the program and shared-library loaders.
 pub const PT_LOAD: u32 = 1;
 pub const PT_DYNAMIC: u32 = 2;

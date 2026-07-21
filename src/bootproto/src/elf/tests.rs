@@ -60,6 +60,25 @@ fn explicit_machine_parser_supports_cross_target_audits() {
 }
 
 #[test]
+fn dynamic_relocation_policy_is_exact_for_every_supported_machine() {
+	let cases: &[(u16, u32, &[u32])] = &[(EM_X86_64, 8, &[1, 6, 7]), (EM_AARCH64, 1027, &[257, 1025, 1026]), (EM_RISCV, 3, &[2, 5])];
+	for &(machine, relative, symbols) in cases {
+		assert_eq!(dynamic_relocation_kind(machine, relative), Some(DynamicRelocationKind::Relative));
+		for &symbol in symbols {
+			assert_eq!(dynamic_relocation_kind(machine, symbol), Some(DynamicRelocationKind::Symbol));
+		}
+		assert_eq!(dynamic_relocation_kind(machine, 0), None);
+	}
+	assert!(DynamicRelocationKind::Relative.accepts_symbol(0));
+	assert!(!DynamicRelocationKind::Relative.accepts_symbol(1));
+	assert!(DynamicRelocationKind::Symbol.accepts_symbol(0));
+	assert_eq!(dynamic_relocation_kind(EM_X86_64, 1027), None);
+	assert_eq!(dynamic_relocation_kind(EM_AARCH64, 3), None);
+	assert_eq!(dynamic_relocation_kind(EM_RISCV, 8), None);
+	assert_eq!(expected_machine(), EXPECTED_MACHINE);
+}
+
+#[test]
 fn rela_metadata_uses_virtual_addresses_and_rejects_partial_tables() {
 	let header_len = core::mem::size_of::<Elf64Header>();
 	let table_len = core::mem::size_of::<[ProgramHeader; 2]>();

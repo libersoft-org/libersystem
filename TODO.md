@@ -4110,6 +4110,18 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     match `_start` rather than the secondary path. The broader service/process/storage
     scenario remains separately tagged because its full tool and storage workflow is
     intentionally more expensive under TCG.
+  - Relocation allowlist graph result (M126a, 2026-07-21): `bootproto::elf` now
+    owns the exact dynamic relocation policy shared by the kernel loader and the
+    host package-staging audit. Relative relocations require symbol index zero;
+    x86_64 permits `R_X86_64_{64,GLOB_DAT,JUMP_SLOT,RELATIVE}`, AArch64 permits
+    `R_AARCH64_{ABS64,GLOB_DAT,JUMP_SLOT,RELATIVE}`, and RISC-V permits
+    `R_RISCV_{64,JUMP_SLOT,RELATIVE}`. The staging build rejects every other
+    dynamic relocation before packaging any provider or executable, including TLS,
+    COPY and unsupported architecture forms. The shared unit test pins all three
+    lists, cross-target rejection and the relative-symbol rule. Each target graph
+    audited 114 ET_DYN artifacts and `test-tags dynamic` completed 11/11 on x86_64,
+    AArch64 and four-hart RISC-V. The broader hostile-input item remains open for
+    ABI identity, duplicate-runtime, static-injection and undeclared-edge gates.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

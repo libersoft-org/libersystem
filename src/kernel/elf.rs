@@ -276,26 +276,28 @@ fn apply_relocations(image: &bootproto::elf::Elf<'_>, loaded: &[LoadedSegment], 
 	let Some(info) = dynamic else { return Ok(()) };
 	for relocation in image.rela_entries(&info).ok_or(ElfError::BadImage)?.chain(image.plt_rela_entries(&info).ok_or(ElfError::BadImage)?) {
 		let target = relocation.offset.checked_add(bias).ok_or(ElfError::BadImage)?;
-		let value = if relocation.symbol() == 0 && relocation.relocation_type() == relative_relocation_type() {
-			bias.checked_add_signed(relocation.addend).ok_or(ElfError::BadImage)?
-		} else {
-			if !symbol_relocation_type(relocation.relocation_type()) {
-				return Err(ElfError::BadImage);
+		let kind = bootproto::elf::dynamic_relocation_kind(bootproto::elf::expected_machine(), relocation.relocation_type()).ok_or(ElfError::BadImage)?;
+		if !kind.accepts_symbol(relocation.symbol()) {
+			return Err(ElfError::BadImage);
+		}
+		let value = match kind {
+			bootproto::elf::DynamicRelocationKind::Relative => bias.checked_add_signed(relocation.addend).ok_or(ElfError::BadImage)?,
+			bootproto::elf::DynamicRelocationKind::Symbol => {
+				let (symbol, name) = image.symbol(&info, relocation.symbol()).ok_or(ElfError::BadImage)?;
+				if !matches!(symbol.symbol_type(), 0..=2) {
+					return Err(ElfError::BadImage);
+				}
+				let base = if symbol.is_defined() {
+					bias.checked_add(symbol.value).ok_or(ElfError::BadImage)?
+				} else if let Some(address) = resolve(name) {
+					address
+				} else if symbol.binding() == 2 {
+					0
+				} else {
+					return Err(ElfError::BadImage);
+				};
+				base.checked_add_signed(relocation.addend).ok_or(ElfError::BadImage)?
 			}
-			let (symbol, name) = image.symbol(&info, relocation.symbol()).ok_or(ElfError::BadImage)?;
-			if !matches!(symbol.symbol_type(), 0..=2) {
-				return Err(ElfError::BadImage);
-			}
-			let base = if symbol.is_defined() {
-				bias.checked_add(symbol.value).ok_or(ElfError::BadImage)?
-			} else if let Some(address) = resolve(name) {
-				address
-			} else if symbol.binding() == 2 {
-				0
-			} else {
-				return Err(ElfError::BadImage);
-			};
-			base.checked_add_signed(relocation.addend).ok_or(ElfError::BadImage)?
 		};
 		write_loaded_u64(loaded, frames, target, value)?;
 	}
@@ -338,28 +340,6 @@ fn write_loaded_u64(loaded: &[LoadedSegment], frames: &[u64], address: u64, valu
 		((hhdm_offset() + frame) as *mut u8).add(within).cast::<u64>().write_unaligned(value);
 	}
 	Ok(())
-}
-
-#[cfg(target_arch = "x86_64")]
-const RELATIVE_RELOCATION_TYPE: u32 = 8;
-#[cfg(target_arch = "aarch64")]
-const RELATIVE_RELOCATION_TYPE: u32 = 1027;
-#[cfg(target_arch = "riscv64")]
-const RELATIVE_RELOCATION_TYPE: u32 = 3;
-
-fn relative_relocation_type() -> u32 {
-	RELATIVE_RELOCATION_TYPE
-}
-
-#[cfg(target_arch = "x86_64")]
-const SYMBOL_RELOCATION_TYPES: &[u32] = &[1, 6, 7];
-#[cfg(target_arch = "aarch64")]
-const SYMBOL_RELOCATION_TYPES: &[u32] = &[257, 1025, 1026];
-#[cfg(target_arch = "riscv64")]
-const SYMBOL_RELOCATION_TYPES: &[u32] = &[2, 5];
-
-fn symbol_relocation_type(relocation: u32) -> bool {
-	SYMBOL_RELOCATION_TYPES.contains(&relocation)
 }
 
 const fn align_down(value: u64) -> u64 {

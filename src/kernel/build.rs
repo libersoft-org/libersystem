@@ -141,6 +141,15 @@ fn valid_library_name(name: &str) -> bool {
 	!name.is_empty() && !name.starts_with("lib") && name.len() <= 58 && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+fn audit_dynamic_relocations(row: &ManifestRow, image: &bootproto::elf::Elf<'_>, dynamic: &bootproto::elf::DynamicInfo) {
+	let rela = image.rela_entries(dynamic).unwrap_or_else(|| panic!("{} {} has malformed RELA metadata", row.kind, row.name));
+	let plt_rela = image.plt_rela_entries(dynamic).unwrap_or_else(|| panic!("{} {} has malformed PLT RELA metadata", row.kind, row.name));
+	for relocation in rela.chain(plt_rela) {
+		let kind = bootproto::elf::dynamic_relocation_kind(user_elf_machine(), relocation.relocation_type()).unwrap_or_else(|| panic!("{} {} uses dynamic relocation type {} outside the {} loader allowlist", row.kind, row.name, relocation.relocation_type(), user_target()));
+		assert!(kind.accepts_symbol(relocation.symbol()), "{} {} uses a relative relocation with symbol {}", row.kind, row.name, relocation.symbol());
+	}
+}
+
 fn audit_linked_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String], require_provider: bool) {
 	const PT_INTERP: u32 = 3;
 	const DT_RPATH: i64 = 15;
@@ -165,6 +174,7 @@ fn audit_linked_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String], 
 	let image = bootproto::elf::Elf::parse_for_machine(bytes, user_elf_machine()).unwrap_or_else(|| panic!("{} {} is not a valid target ELF", row.kind, row.name));
 	assert_eq!(image.image_type, bootproto::elf::ET_DYN, "{} {} is not ET_DYN", row.kind, row.name);
 	let dynamic = image.dynamic_info().flatten().unwrap_or_else(|| panic!("{} {} has no valid terminated PT_DYNAMIC", row.kind, row.name));
+	audit_dynamic_relocations(row, &image, &dynamic);
 	for entry in image.dynamic_entries().flatten().unwrap_or_else(|| panic!("{} {} has no PT_DYNAMIC", row.kind, row.name)) {
 		assert!(!matches!(entry.tag, DT_RPATH | DT_RUNPATH | DT_TEXTREL), "{} {} has forbidden dynamic tag {}", row.kind, row.name, entry.tag);
 	}
