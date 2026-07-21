@@ -385,31 +385,82 @@ artifact_cache_key() {
 	} | sha256sum | awk '{print $1}'
 }
 
+artifact_audit_cache_valid() {
+	local record_file="$1"
+	local expected_key="$2"
+	local actual_hash="$3"
+	local identity_hash="$4"
+	local expected_needed="$5"
+	local needed index last_index
+	local -a record=()
+	local -a expected_needed_lines=()
+	[[ -f "$record_file" ]] || return 1
+	mapfile -t record <"$record_file" || return 1
+	if ((${#record[@]} < 7)); then return 1; fi
+	last_index=$((${#record[@]} - 1))
+	if [[ "${record[0]}" != "format=liber-image-audit-cache-v2" || "${record[1]}" != "schema=elf64-et-dyn-needed-wx-note-v1" || "${record[2]}" != "build-key=$expected_key" || "${record[3]}" != "elf=$actual_hash" || "${record[4]}" != "identity=$identity_hash" || "${record[5]}" != "needed" || "${record[$last_index]}" != "end" ]]; then return 1; fi
+	while IFS= read -r needed; do
+		[[ -n "$needed" ]] || continue
+		expected_needed_lines+=("$needed")
+	done <<<"$expected_needed"
+	if ((${#expected_needed_lines[@]} != last_index - 6)); then return 1; fi
+	for ((index = 0; index < ${#expected_needed_lines[@]}; index += 1)); do
+		if [[ "${record[$((index + 6))]}" != "${expected_needed_lines[$index]}" ]]; then return 1; fi
+	done
+}
+
+record_artifact_audit() {
+	local record_file="$1"
+	local expected_key="$2"
+	local actual_hash="$3"
+	local identity_hash="$4"
+	local expected_needed="$5"
+	{
+		printf 'format=liber-image-audit-cache-v2\n'
+		printf 'schema=elf64-et-dyn-needed-wx-note-v1\n'
+		printf 'build-key=%s\n' "$expected_key"
+		printf 'elf=%s\n' "$actual_hash"
+		printf 'identity=%s\n' "$identity_hash"
+		printf 'needed\n'
+		if [[ -n "$expected_needed" ]]; then printf '%s\n' "$expected_needed"; fi
+		printf 'end\n'
+	} >"$record_file.tmp.$$"
+	mv "$record_file.tmp.$$" "$record_file"
+}
+
+artifact_order_cache_valid() {
+	local order="$1"
+	local cache_prefix="$2"
+	local actual_hash
+	[[ -f "$order" && -f "$cache_prefix.order.sha256" ]] || return 1
+	actual_hash="$(build_file_digest "$order")" || return 1
+	[[ "$(<"$cache_prefix.order.sha256")" == "$actual_hash" ]]
+}
+
+record_artifact_order_cache() {
+	local order="$1"
+	local cache_prefix="$2"
+	local order_hash
+	order_hash="$(sha256sum "$order" | awk '{print $1}')"
+	build_file_hashes[$order]="$order_hash"
+	printf '%s\n' "$order_hash" >"$cache_prefix.order.sha256.tmp"
+	mv "$cache_prefix.order.sha256.tmp" "$cache_prefix.order.sha256"
+}
+
 artifact_cache_valid() {
 	local out="$1"
 	local cache_prefix="$2"
 	local expected_key="$3"
 	local expected_identity="$4"
 	local expected_needed="$5"
-	local actual_needed actual_hash identity_hash needed_hash audit_key
+	local actual_needed actual_hash identity_hash
 	[[ -f "$out" && -f "$out.identity" && -f "$cache_prefix.build-key" && -f "$cache_prefix.sha256" ]] || return 1
-	[[ "$(cat "$cache_prefix.build-key")" == "$expected_key" ]] || return 1
+	[[ "$(<"$cache_prefix.build-key")" == "$expected_key" ]] || return 1
 	cmp -s "$expected_identity" "$out.identity" || return 1
 	actual_hash="$(build_file_digest "$out")" || return 1
-	[[ "$(cat "$cache_prefix.sha256")" == "$actual_hash" ]] || return 1
+	[[ "$(<"$cache_prefix.sha256")" == "$actual_hash" ]] || return 1
 	identity_hash="$(build_file_digest "$out.identity")" || return 1
-	needed_hash="$(printf '%s' "$expected_needed" | sha256sum | awk '{print $1}')"
-	audit_key="$({
-		printf 'format=liber-image-audit-cache-v1\n'
-		printf 'schema=elf64-et-dyn-needed-wx-note-v1\n'
-		printf 'build-key=%s\n' "$expected_key"
-		printf 'elf=%s\n' "$actual_hash"
-		printf 'identity=%s\n' "$identity_hash"
-		printf 'needed=%s\n' "$needed_hash"
-	} | sha256sum | awk '{print $1}')"
-	if [[ -f "$cache_prefix.audit-key" && "$(cat "$cache_prefix.audit-key")" == "$audit_key" ]]; then
-		return 0
-	fi
+	if artifact_audit_cache_valid "$cache_prefix.audit" "$expected_key" "$actual_hash" "$identity_hash" "$expected_needed"; then return 0; fi
 	llvm-readelf -h "$out" | grep -q 'Type:.*DYN' || return 1
 	actual_needed="$(llvm-readelf -d "$out" 2>/dev/null | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sort -u)" || return 1
 	[[ "$actual_needed" == "$expected_needed" ]] || return 1
@@ -417,8 +468,7 @@ artifact_cache_valid() {
 	! llvm-readelf -d "$out" | grep -Eq '\((RPATH|RUNPATH|TEXTREL)\)' || return 1
 	llvm-readelf -l "$out" | awk '$1 == "LOAD" && $0 ~ /W/ && $0 ~ /E/ {bad=1} END {exit bad}' || return 1
 	verify_identity_note "$out" "$out.identity" || return 1
-	printf '%s\n' "$audit_key" >"$cache_prefix.audit-key.tmp"
-	mv "$cache_prefix.audit-key.tmp" "$cache_prefix.audit-key"
+	record_artifact_audit "$cache_prefix.audit" "$expected_key" "$actual_hash" "$identity_hash" "$expected_needed"
 }
 
 record_artifact_cache() {
@@ -431,7 +481,7 @@ record_artifact_cache() {
 	printf '%s\n' "${build_file_hashes[$out]}" >"$cache_prefix.sha256.tmp"
 	mv "$cache_prefix.build-key.tmp" "$cache_prefix.build-key"
 	mv "$cache_prefix.sha256.tmp" "$cache_prefix.sha256"
-	rm -f "$cache_prefix.audit-key"
+	rm -f "$cache_prefix.audit-key" "$cache_prefix.audit"
 }
 
 object_cache_key() {
@@ -519,10 +569,12 @@ build_file_hash_inventory() {
 		file="user/$crate/shared/$target/$consumer"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 		if [[ -f "$file.identity" ]]; then printf '%s\0' "$file.identity"; fi
+		if [[ -f "$file.order" ]]; then printf '%s\0' "$file.order"; fi
 	done < <(dynamic_rows)
 	file="user/dyn_probe/shared/$target/dyn_probe"
 	if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	if [[ -f "$file.identity" ]]; then printf '%s\0' "$file.identity"; fi
+	if [[ -f "$file.order" ]]; then printf '%s\0' "$file.order"; fi
 	find "$artifact_cache_dir" -maxdepth 1 -type f -name 'object-*.o' -print0 2>/dev/null || true
 }
 
@@ -692,6 +744,7 @@ canonical_provider_order() {
 	local -A present=()
 	local -A edges=()
 	local -A visiting=()
+	local -A ordered=()
 	local -a pending=()
 	local -a order=()
 	read -r -a pending <<<"$roots"
@@ -702,7 +755,7 @@ canonical_provider_order() {
 		if [[ -n "${present[$name]:-}" ]]; then
 			continue
 		fi
-		if ! printf '%s\n' "${artifacts[@]}" | grep -qx "$name"; then
+		if [[ -z "${artifact_available[$name]:-}" ]]; then
 			echo "build-shared: canonical graph names unavailable provider $name" >&2
 			return 1
 		fi
@@ -722,12 +775,12 @@ canonical_provider_order() {
 		candidate=""
 		while read -r name; do
 			[[ -n "$name" ]] || continue
-			if printf '%s\n' "${order[@]}" | grep -qx "$name"; then
+			if [[ -n "${ordered[$name]:-}" ]]; then
 				continue
 			fi
 			ready=1
 			for dependency in ${edges[$name]}; do
-				if ! printf '%s\n' "${order[@]}" | grep -qx "$dependency"; then
+				if [[ -z "${ordered[$dependency]:-}" ]]; then
 					ready=0
 					break
 				fi
@@ -742,6 +795,7 @@ canonical_provider_order() {
 			return 1
 		fi
 		order+=("$candidate")
+		ordered[$candidate]=1
 	done
 	result="$(printf '%s.lslib\n' "${order[@]}")"$'\n'
 	canonical_order_cache[$cache_key]="$result"
@@ -750,6 +804,7 @@ canonical_provider_order() {
 
 provider_started=$SECONDS
 artifacts=()
+declare -A artifact_available=()
 declare -A provider_compile_digests=()
 for spec in "$@"; do
 	if [[ "$spec" == *=* ]]; then
@@ -837,6 +892,7 @@ for spec in "$@"; do
 		((provider_cache_hits += 1))
 		rm -f "$provider_expected_identity"
 		artifacts+=("$artifact")
+		artifact_available[$artifact]=1
 		continue
 	fi
 	echo "build-shared: provider cache miss $artifact"
@@ -1058,6 +1114,7 @@ for spec in "$@"; do
 	rm -f "$provider_expected_identity"
 	echo "build-shared: $out ($(stat -c %s "$out") bytes)"
 	artifacts+=("$artifact")
+	artifact_available[$artifact]=1
 done
 provider_seconds=$((SECONDS - provider_started))
 
@@ -1108,18 +1165,32 @@ if [[ -n "$image_graph" ]]; then
 		consumer_expected_identity="$out.identity.$$.expected"
 		write_identity_record executable "$consumer" "$crate" "$consumer_source_sha" shared-image "$providers" "$consumer_expected_identity"
 		consumer_expected_needed="$(for provider in $providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
-		consumer_expected_order="$out.order.$$.expected"
-		canonical_provider_order "$providers" >"$consumer_expected_order"
 		consumer_cache_key="$(artifact_cache_key executable "$kind $consumer $crate $stage $providers" "$consumer_expected_identity" "cargo=$image_target_config_value start=$(sha256sum "$start_obj" | awk '{print $1}')")"
 		consumer_cache_prefix="$artifact_cache_dir/executable-$consumer"
-		if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$out" "$consumer_cache_prefix" "$consumer_cache_key" "$consumer_expected_identity" "$consumer_expected_needed" && [[ -f "$out.order" ]] && cmp -s "$consumer_expected_order" "$out.order"; then
-			echo "build-shared: executable cache hit $consumer"
-			((executable_cache_hits += 1))
-			rm -f "$consumer_expected_identity" "$consumer_expected_order"
-			continue
+		consumer_expected_order=""
+		if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$out" "$consumer_cache_prefix" "$consumer_cache_key" "$consumer_expected_identity" "$consumer_expected_needed"; then
+			if artifact_order_cache_valid "$out.order" "$consumer_cache_prefix"; then
+				echo "build-shared: executable cache hit $consumer"
+				((executable_cache_hits += 1))
+				rm -f "$consumer_expected_identity"
+				continue
+			fi
+			consumer_expected_order="$out.order.$$.expected"
+			canonical_provider_order "$providers" >"$consumer_expected_order"
+			if cmp -s "$consumer_expected_order" "$out.order"; then
+				record_artifact_order_cache "$out.order" "$consumer_cache_prefix"
+				echo "build-shared: executable cache hit $consumer"
+				((executable_cache_hits += 1))
+				rm -f "$consumer_expected_identity" "$consumer_expected_order"
+				continue
+			fi
 		fi
 		echo "build-shared: executable cache miss $consumer"
 		((executable_cache_misses += 1))
+		if [[ -z "$consumer_expected_order" ]]; then
+			consumer_expected_order="$out.order.$$.expected"
+			canonical_provider_order "$providers" >"$consumer_expected_order"
+		fi
 		object_key="$(object_cache_key "$consumer" "$crate" "$consumer_source_sha" "$providers")"
 		object_cache_prefix="$artifact_cache_dir/object-$consumer-$object_key"
 		consumer_obj="$object_cache_prefix.o"
@@ -1339,6 +1410,7 @@ if [[ -n "$image_graph" ]]; then
 		emit_identity executable "$consumer" "$crate" "$consumer_source_sha" shared-image "$providers" "$out"
 		mv "$consumer_expected_order" "$out.order"
 		record_artifact_cache "$out" "$consumer_cache_prefix" "$consumer_cache_key"
+		record_artifact_order_cache "$out.order" "$consumer_cache_prefix"
 		rm -f "$consumer_expected_identity"
 		echo "build-shared: $out ($(stat -c %s "$out") bytes, PIE)"
 	done <<<"$dynamic_rows"

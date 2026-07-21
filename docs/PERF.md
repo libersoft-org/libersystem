@@ -281,7 +281,7 @@ many concurrent processes can still justify `lsrt.lslib`/`proto.lslib` sharing.
 
 ## System-image dynamic linking (2026-07-14)
 
-M123 adds an eager ELF64 module loader and an image-internal shared build. The bare-metal
+The system image uses an eager ELF64 module loader and an image-internal shared build. The bare-metal
 Rust targets support neither Cargo `dylib` nor `cdylib`, so the reproducible builder emits
 full-graph PIC rlibs and links their object members with the pinned `rust-lld -shared`.
 The x86 KVM integration launches an assembly-only staged `dyn_probe` through the real
@@ -352,8 +352,8 @@ target graph, content-addressed consumer ET_REL objects, linked ELF/identity/ord
 artifacts, and keyed audit results. ET_REL keys include the dedicated compile helper,
 toolchain/target/build-std/features, exact bin/package sources and recursive provider API
 identities. Linked keys additionally bind the whole linker/audit builder, start object
-and binary provider identities. Audit hits still hash and compare the ELF, identity,
-build key and expected `DT_NEEDED`; a mismatch runs the full ELF/note/W^X audit.
+and binary provider identities. Audit records compare the build key, ELF and identity
+content hashes, and exact `DT_NEEDED`; a mismatch runs the full ELF/note/W^X audit.
 
 Measured on the 52-core development host after the graph was warm:
 
@@ -362,6 +362,8 @@ Measured on the 52-core development host after the graph was warm:
 | cold object/link population | 405-408 s | 46 providers, 67 consumers |
 | previous no-change cache | 78-80 s | 46/46 provider and 67/67 executable hits |
 | split seed/object/link/audit cache | 49-58 s | same complete hit set |
+| source inventory and target locking | 34 s | same complete hit set |
+| memoized audit and order validation | 18-19 s | same complete hit set |
 | one tool source edit | 75 s | `echo` only: one object + one executable miss |
 | one provider implementation edit | 75 s | `volume-client` rebuild; six consumer relinks, six object hits |
 
@@ -393,8 +395,20 @@ the invalidation harness holds that same x86 lock across mutation and restore. O
 final clean warm x86 graph the source stage is 0-1 s, graph validation 0-1 s, provider
 validation 7 s and consumer validation 24 s, for 34 s total with 46/46 provider and
 67/67 executable hits. Further source-digest optimization is therefore not justified;
-the remaining measured work is provider/consumer artifact validation and shell process
+the remaining measured work was provider/consumer artifact validation and shell process
 overhead.
+
+The artifact-validation pass now stores a structured atomic audit record instead of
+recomputing an audit-key digest for every hit. Valid records compare in Bash without ELF
+tool subprocesses. Canonical provider ordering uses in-process availability and
+topological-membership maps; each executable's `.order` file has a content-hash sidecar.
+A missing or mismatched order sidecar recomputes the canonical order and only reuses the
+artifact when its saved order matches exactly. The cache harness deletes the `echo` order
+sidecar and corrupts its order file, proving that the former is restored after validation
+and the latter relinks only `echo` while reusing its ET_REL object. After the new sidecars
+are populated, x86 warm graphs take 18-19 s: source and graph validation each take 0-1 s,
+provider validation 5-6 s and consumer validation 10-11 s, still with 46/46 provider and
+67/67 executable hits. The complete AArch64 and RISC-V graphs remain valid.
 
 ## Kernel wake path (2026-07-06)
 

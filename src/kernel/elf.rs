@@ -1,7 +1,7 @@
 // Loads an ELF userspace image into a target address space. Fixed ET_EXEC images retain
 // their link-time addresses; ET_DYN images receive a deterministic base and may use
 // architecture-relative RELA relocations. Symbol relocations remain fail-closed until
-// the M123 module graph supplies an export registry. Page tables are edited through the
+// the module graph supplies an export registry. Page tables are edited through the
 // address space; segment contents and relocations are written through the HHDM, since
 // the target address space is not active.
 

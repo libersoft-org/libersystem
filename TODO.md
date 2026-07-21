@@ -4080,6 +4080,21 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     limiting path. Serial `shared-cache-check quick|provider` and all three target graphs
     pass. Future work should target the measured provider/consumer artifact audit process
     overhead, not further source-hash changes.
+  - Artifact-validation consolidation result (M126a, 2026-07-21): audit cache state is now
+    a structured atomic record that compares the linked build key, ELF and identity content
+    hashes, and exact `DT_NEEDED` directly in Bash; absent or mismatched state still runs
+    the complete ELF/note/W^X audit. Canonical provider order uses in-process provider
+    availability and selected-node maps instead of repeated shell membership pipelines.
+    Every executable additionally records the content hash of its saved `.order` file. A
+    missing or mismatched order sidecar recomputes the canonical order, restores the sidecar
+    on an exact match, and relinks only when the saved order differs. The cache harness now
+    proves both paths by deleting and corrupting `echo` order cache state, while retaining
+    object reuse on the necessary relink. After sidecar population, clean x86 warm graphs
+    take 18-19 s with source/graph 0-1 s, providers 5-6 s and consumers 10-11 s, retaining
+    46/46 provider and 67/67 executable hits. `shared-cache-check quick|provider`, format
+    and generation checks, and all three target graphs pass. The remaining warm work is
+    mostly required identity and cache-key derivation; do not weaken those comparisons
+    without a new profile and an explicit invalidation test.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

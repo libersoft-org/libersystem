@@ -54,6 +54,23 @@ prime_graph() {
 case "$mode" in
 quick)
 	prime_graph
+	order_file="$root/user/tools/shared/x86_64-unknown-none/echo.order"
+	order_cache="$root/boot/.build/image-artifacts-x86_64-unknown-none/executable-echo.order.sha256"
+	rm -f "$order_cache"
+	run_graph
+	expect_only_misses provider
+	expect_only_misses executable
+	if [[ ! -f "$order_cache" ]]; then
+		echo "shared-cache-check: missing echo order cache was not restored" >&2
+		exit 1
+	fi
+	printf 'corrupt-order\n' >"$order_file"
+	run_graph
+	expect_only_misses executable echo
+	if ! grep -q '^build-shared: object cache hit echo$' "$output"; then
+		echo "shared-cache-check: corrupt echo order did not reuse its content-addressed object" >&2
+		exit 1
+	fi
 	rm -f "$root/boot/.build/image-artifacts-x86_64-unknown-none/executable-echo.build-key"
 	run_graph
 	expect_only_misses executable echo

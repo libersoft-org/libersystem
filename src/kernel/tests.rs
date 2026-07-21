@@ -4179,7 +4179,7 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	// Launch two real console players over separate playback-only scopes. Hold the
 	// first hardware period pending while Vorbis decodes and queues, then ACK it:
 	// the next period must contain the exact WAV+Vorbis sum, proving both governed
-	// decoder paths feed the shared M121 mixer rather than acquiring it exclusively.
+	// decoder paths feed the shared audio mixer rather than acquiring it exclusively.
 	let wav_scope = open_scope(&audio_admin, 40);
 	let wav_start = arch::tsc::now();
 	let (_wav_stdout, wav_process) = launch_play(&process_client, storage_client.clone(), wav_scope, b"vol://system/test.wav");
