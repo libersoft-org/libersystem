@@ -244,6 +244,7 @@ Run `just --list` to see every available command. The most useful ones:
 | `just test` | Run the in-kernel test harness in QEMU. |
 | `just test-aarch64` | Run the in-kernel test harness for the ARM64 build under QEMU (Arm semihosting maps pass/fail; defaults to all host cores capped at 8 - the GICv2 limit - override with `SMP=<n>`). |
 | `just test-riscv64` | Run the in-kernel test harness for the RISC-V build under QEMU (RISC-V semihosting maps pass/fail; defaults to `SMP=4` - override with `SMP=<n>`). |
+| `just static-image-check` | Temporarily inject an `ET_EXEC` header into a staged dynamic executable on all three targets; package assembly must reject it before rewriting the system volume, then restore each artifact. |
 | `just lab <cmd>` | Drive a live instance for debugging (boot, run guest shell commands, logs, packet capture - see [docs/DEBUG.md](./docs/DEBUG.md)). |
 | `just debug` | Boot in QEMU and wait for GDB on `:1234`. |
 | `just gdb` | Attach GDB to a waiting QEMU instance. |

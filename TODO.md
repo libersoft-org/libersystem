@@ -4151,6 +4151,16 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     three secondary harts online. `shared-cache-check quick` preserves the established
     warm cache, order-sidecar and targeted relink behavior. The remaining hostile-input
     work is static executable injection and undeclared dependency edges.
+  - Static executable injection result (M126a, 2026-07-21): `static-image-check`
+    now prepares every target's shared-image graph, snapshots each target's staged
+    `echo` PIE and system-volume archive, then changes the ELF type to `ET_EXEC`.
+    The kernel package build must fail at the dynamic executable audit with
+    `dynamic echo is not ET_DYN` before it writes the archive. The harness verifies
+    the unchanged archive hash after rejection, restores the original executable,
+    rebuilds the package and requires the original archive hash again. x86_64,
+    AArch64 and RISC-V all pass this sequence, so a static executable cannot enter
+    a staged system volume or leave a failed packaging attempt behind. The remaining
+    hostile-input work is undeclared dependency edges.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

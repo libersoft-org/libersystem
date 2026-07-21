@@ -193,6 +193,11 @@ mutated to collide with a runtime export must therefore fail before ProcessServi
 returns a Process capability, even when its staged identity record and note remain
 well-formed.
 
+The package-stage static-image gate temporarily changes a staged dynamic executable's
+ELF type to `ET_EXEC` on every supported target. The kernel package build must reject
+that artifact before rewriting the target's system-volume archive; the gate then
+restores the original bytes and verifies the prior archive hash returns unchanged.
+
 ## Measurement and optimization
 
 Dynamic linking is the required `/bin` architecture, not an optional optimization gate.
