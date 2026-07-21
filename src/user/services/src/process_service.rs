@@ -38,9 +38,19 @@ use services::executable;
 // factory-seed pipeline). A named program is loaded from `<PROGRAM_DIR><name>`.
 const PROGRAM_DIR: &str = "vol://system/bin/";
 const LIBRARY_DIR: &str = "vol://system/lib/";
+const LIBRARY_IDENTITY_DIR: &str = "vol://system/id/lib/";
+const EXECUTABLE_IDENTITY_DIR: &str = "vol://system/id/bin/";
 const ORDER_DIR: &str = "vol://system/order/";
 const LIBRARY_BASE: u64 = 0x2000_0000;
 const LIBRARY_SLOT_SIZE: u64 = 0x0100_0000;
+const MAX_IDENTITY_BYTES: usize = 8 * 1024;
+const IDENTITY_FORMAT: &[u8] = b"format=liber-image-identity-v1";
+#[cfg(target_arch = "x86_64")]
+const IMAGE_TARGET: &str = "x86_64-unknown-none";
+#[cfg(target_arch = "aarch64")]
+const IMAGE_TARGET: &str = "aarch64-unknown-none";
+#[cfg(target_arch = "riscv64")]
+const IMAGE_TARGET: &str = "riscv64gc-unknown-none-elf";
 // Per-process dependency-graph limits. MAX_MODULES counts unique loaded libraries
 // (not every library installed in the image); MAX_DEPENDENCY_DEPTH bounds one DFS
 // branch. Together with `visiting` cycle detection they make hostile DT_NEEDED
@@ -94,10 +104,111 @@ impl Drop for MappedFile {
 	}
 }
 
+struct Identity {
+	digest: [u8; 32],
+	providers: Vec<(String, [u8; 32])>,
+}
+
+fn valid_identity_name(name: &str) -> bool {
+	!name.is_empty() && !name.starts_with("lib") && name.len() <= 58 && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn identity_value<'a>(line: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+	line.starts_with(key).then(|| &line[key.len()..])
+}
+
+fn identity_field_matches(line: &[u8], key: &[u8], value: &[u8]) -> bool {
+	identity_value(line, key).is_some_and(|actual| actual == value)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+	match byte {
+		b'0'..=b'9' => Some(byte - b'0'),
+		b'a'..=b'f' => Some(byte - b'a' + 10),
+		b'A'..=b'F' => Some(byte - b'A' + 10),
+		_ => None,
+	}
+}
+
+fn valid_hex(bytes: &[u8], len: usize) -> bool {
+	bytes.len() == len && bytes.iter().all(|byte| hex_value(*byte).is_some())
+}
+
+fn parse_digest(bytes: &[u8]) -> Option<[u8; 32]> {
+	if !valid_hex(bytes, 64) {
+		return None;
+	}
+	let mut digest = [0u8; 32];
+	for (index, pair) in bytes.chunks_exact(2).enumerate() {
+		digest[index] = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
+	}
+	Some(digest)
+}
+
+fn parse_identity(bytes: &[u8], kind: &str, artifact: &str) -> Option<Identity> {
+	if bytes.is_empty() || bytes.len() > MAX_IDENTITY_BYTES || !bytes.ends_with(b"\n") || !valid_identity_name(artifact) {
+		return None;
+	}
+	let mut lines = bytes[..bytes.len() - 1].split(|byte| *byte == b'\n');
+	if lines.next()? != IDENTITY_FORMAT || !identity_field_matches(lines.next()?, b"kind=", kind.as_bytes()) || !identity_field_matches(lines.next()?, b"artifact=", artifact.as_bytes()) {
+		return None;
+	}
+	let package = identity_value(lines.next()?, b"package=")?;
+	let source = identity_value(lines.next()?, b"source-sha256=")?;
+	let rustc = identity_value(lines.next()?, b"rustc-commit=")?;
+	if package.is_empty() || !valid_hex(source, 64) || !valid_hex(rustc, 40) || !identity_field_matches(lines.next()?, b"target=", IMAGE_TARGET.as_bytes()) || !identity_field_matches(lines.next()?, b"profile=", b"release") {
+		return None;
+	}
+	let rustflags = identity_value(lines.next()?, b"rustflags=")?;
+	let features = identity_value(lines.next()?, b"features=")?;
+	if !rustflags.starts_with(b"-C relocation-model=pic") || features.is_empty() {
+		return None;
+	}
+	let mut providers = Vec::new();
+	for line in lines {
+		let value = identity_value(line, b"provider=")?;
+		let separator = value.iter().position(|byte| *byte == b':')?;
+		let provider = core::str::from_utf8(&value[..separator]).ok()?;
+		if !valid_identity_name(provider) || providers.len() >= MAX_MODULES || providers.iter().any(|(name, _)| name == provider) {
+			return None;
+		}
+		providers.push((String::from(provider), parse_digest(&value[separator + 1..])?));
+	}
+	Some(Identity { digest: bootproto::sha256::digest(bytes), providers })
+}
+
+fn verify_identity(elf: &bootproto::elf::Elf<'_>, bytes: &[u8], kind: &str, artifact: &str) -> Option<Identity> {
+	let identity = parse_identity(bytes, kind, artifact)?;
+	(elf.liber_identity_note_digest()? == identity.digest).then_some(identity)
+}
+
+unsafe fn load_identity(storage: u64, directory: &str, kind: &str, artifact: &str, elf: &bootproto::elf::Elf<'_>) -> Option<Identity> {
+	unsafe {
+		let record = MappedFile::open(storage, alloc::format!("{directory}{artifact}"))?;
+		verify_identity(elf, record.bytes(), kind, artifact)
+	}
+}
+
 struct Module {
 	name: String,
 	file: MappedFile,
 	dependencies: Vec<String>,
+	identity: Identity,
+}
+
+fn identity_matches_dependencies(identity: &Identity, dependencies: &[String], modules: &[Module]) -> bool {
+	if identity.providers.len() != dependencies.len() {
+		return false;
+	}
+	for dependency in dependencies {
+		let Some(name) = dependency.strip_suffix(".lslib") else { return false };
+		let Some(module) = modules.iter().find(|module| module.name.as_str() == dependency.as_str()) else { return false };
+		let Some((_, digest)) = identity.providers.iter().find(|(provider, _)| provider.as_str() == name) else { return false };
+		if *digest != module.identity.digest {
+			return false;
+		}
+	}
+	true
 }
 
 struct Resolver {
@@ -123,6 +234,8 @@ impl Resolver {
 				if elf.image_type != bootproto::elf::ET_DYN {
 					return None;
 				}
+				let stem = name.strip_suffix(".lslib")?;
+				let identity = load_identity(self.storage, LIBRARY_IDENTITY_DIR, "library", stem, &elf)?;
 				let dynamic = elf.dynamic_info()??;
 				let dependencies = dependencies(&elf, &dynamic)?;
 				for dependency in &dependencies {
@@ -130,7 +243,10 @@ impl Resolver {
 						return None;
 					}
 				}
-				Some(Module { name: String::from(name), file, dependencies })
+				if !identity_matches_dependencies(&identity, &dependencies, &self.modules) {
+					return None;
+				}
+				Some(Module { name: String::from(name), file, dependencies, identity })
 			})();
 			self.visiting.pop();
 			if let Some(module) = module {
@@ -166,8 +282,7 @@ impl Resolver {
 }
 
 fn valid_library_name(name: &str) -> bool {
-	let Some(stem) = name.strip_suffix(".lslib") else { return false };
-	!stem.is_empty() && !stem.starts_with("lib") && name.len() <= 64 && stem.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+	name.strip_suffix(".lslib").is_some_and(valid_identity_name)
 }
 
 fn dependencies(elf: &bootproto::elf::Elf<'_>, dynamic: &bootproto::elf::DynamicInfo) -> Option<Vec<String>> {
@@ -247,7 +362,7 @@ impl<'a> Processes<'a> {
 					}
 				} else {
 					match self.package.lookup(artifact.as_bytes()) {
-						Some(elf) => spawn_program_bytes(self.storage, elf, None, bootstrap, domain),
+						Some(elf) => spawn_program_bytes(self.storage, elf, None, None, bootstrap, domain),
 						None => continue,
 					}
 				};
@@ -266,28 +381,42 @@ unsafe fn spawn_from_path(storage: u64, path: &str, artifact: &str, bootstrap: u
 	unsafe {
 		let main = MappedFile::open(storage, String::from(path))?;
 		let logical_name = executable::logical_name(artifact)?;
+		let identity = MappedFile::open(storage, alloc::format!("{EXECUTABLE_IDENTITY_DIR}{logical_name}"))?;
 		let order = MappedFile::open(storage, alloc::format!("{ORDER_DIR}{logical_name}"));
-		Some(spawn_program_bytes(storage, main.bytes(), order.as_ref().map(|file| file.bytes()), bootstrap, domain))
+		Some(spawn_program_bytes(storage, main.bytes(), Some((identity.bytes(), logical_name)), order.as_ref().map(|file| file.bytes()), bootstrap, domain))
 	}
 }
 
-unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], expected_order: Option<&[u8]>, bootstrap: u64, domain: u64) -> i64 {
+unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], expected_identity: Option<(&[u8], &str)>, expected_order: Option<&[u8]>, bootstrap: u64, domain: u64) -> i64 {
 	unsafe {
 		let Some(elf) = bootproto::elf::Elf::parse(bytes) else { return -1 };
 		let Some(dynamic) = elf.dynamic_info() else { return -1 };
-		let Some(dynamic) = dynamic else { return spawn_in(bytes, bootstrap, domain) };
+		let Some(dynamic) = dynamic else {
+			if expected_identity.is_none() {
+				return spawn_in(bytes, bootstrap, domain);
+			}
+			return -1;
+		};
+		let Some((identity_bytes, artifact)) = expected_identity else { return -1 };
+		let Some(identity) = verify_identity(&elf, identity_bytes, "executable", artifact) else { return -1 };
 		let Some(dependencies) = dependencies(&elf, &dynamic) else { return -1 };
 		if dependencies.is_empty() {
+			if !identity_matches_dependencies(&identity, &dependencies, &[]) {
+				return -1;
+			}
 			return spawn(bytes, bootstrap);
 		}
 		if storage == 0 {
 			return -1;
 		}
 		let mut resolver = Resolver { storage, modules: Vec::new(), visiting: Vec::new() };
-		for dependency in dependencies {
-			if !resolver.collect(&dependency, 0) {
+		for dependency in &dependencies {
+			if !resolver.collect(dependency, 0) {
 				return -1;
 			}
+		}
+		if !identity_matches_dependencies(&identity, &dependencies, &resolver.modules) {
+			return -1;
 		}
 		let Some(order) = resolver.order() else { return -1 };
 		let Some(expected_order) = expected_order.and_then(parse_order) else { return -1 };

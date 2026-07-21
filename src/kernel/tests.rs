@@ -5272,6 +5272,30 @@ fn replace_dynamic_needed(volume: &mut [u8], artifact: &[u8], expected: &str, re
 	volume[offset..offset + replacement.len()].copy_from_slice(replacement.as_bytes());
 }
 
+fn replace_volume_entry(volume: &mut [u8], destination: &[u8], source: &[u8]) {
+	let volume_base = volume.as_ptr() as usize;
+	let (destination_offset, destination_len, source_bytes) = {
+		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
+		let destination_bytes = archive.lookup(destination).expect("identity test destination is staged");
+		let source_bytes = archive.lookup(source).expect("identity test source is staged");
+		assert!(source_bytes.len() <= destination_bytes.len(), "identity test replacement does not fit its package entry");
+		(destination_bytes.as_ptr() as usize - volume_base, destination_bytes.len(), source_bytes.to_vec())
+	};
+	volume[destination_offset..destination_offset + destination_len].fill(0);
+	volume[destination_offset..destination_offset + source_bytes.len()].copy_from_slice(&source_bytes);
+}
+
+fn corrupt_volume_entry(volume: &mut [u8], entry: &[u8], field: &[u8]) {
+	let volume_base = volume.as_ptr() as usize;
+	let offset = {
+		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
+		let bytes = archive.lookup(entry).expect("identity test entry is staged");
+		let field_offset = bytes.windows(field.len()).position(|window| window == field).expect("identity test field is present");
+		bytes.as_ptr() as usize - volume_base + field_offset + field.len()
+	};
+	volume[offset] = if volume[offset] == b'0' { b'1' } else { b'0' };
+}
+
 fn launch_from_volume(volume: &[u8], name: &[u8], correlation: u32) -> object::channel::Message {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -5319,6 +5343,24 @@ fn dynamic_process_service_rejects_missing_or_substituted_provider() {
 		assert_eq!(reply.bytes[4], 0, "ProcessService rejects {replacement} as echo's direct provider");
 		assert!(reply.caps.is_empty(), "rejected {replacement} provider creates no process capability");
 	}
+}
+
+tagged_test!(dynamic_process_service_rejects_substituted_identity, [Dynamic, DynamicReject, Service, Process, Storage]);
+fn dynamic_process_service_rejects_substituted_identity() {
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	let mut substituted_provider = volume.to_vec();
+	replace_volume_entry(&mut substituted_provider, b"lib/lsrt.lslib", b"lib/wire.lslib");
+	let reply = launch_from_volume(&substituted_provider, b"echo", 80);
+	assert_eq!(le_u32(&reply.bytes, 0), 80);
+	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a valid provider substituted under lsrt.lslib");
+	assert!(reply.caps.is_empty(), "a substituted provider creates no process capability");
+
+	let mut corrupted_identity = volume.to_vec();
+	corrupt_volume_entry(&mut corrupted_identity, b"id/lib/lsrt", b"source-sha256=");
+	let reply = launch_from_volume(&corrupted_identity, b"echo", 81);
+	assert_eq!(le_u32(&reply.bytes, 0), 81);
+	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a provider identity whose note digest no longer matches");
+	assert!(reply.caps.is_empty(), "a corrupted provider identity creates no process capability");
 }
 
 tagged_test!(dynamic_process_service_rejects_linker_order_drift, [Dynamic, DynamicReject, Service, Process, Storage]);

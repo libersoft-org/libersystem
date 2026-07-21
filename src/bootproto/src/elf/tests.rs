@@ -19,6 +19,35 @@ fn image(image_type: u16, segments: &[ProgramHeader], payload: &[u8]) -> Vec<u8>
 	bytes
 }
 
+fn identity_note_image(digest: [u8; 32]) -> (Vec<u8>, usize, usize) {
+	let header_len = core::mem::size_of::<Elf64Header>();
+	let strings = b"\0.shstrtab\0.note.liber.identity\0";
+	let note_offset = header_len + strings.len();
+	let section_offset = note_offset + 52;
+	let sections = [
+		SectionHeader { sh_name: 0, sh_type: 0, sh_flags: 0, sh_addr: 0, sh_offset: 0, sh_size: 0, sh_link: 0, sh_info: 0, sh_addralign: 0, sh_entsize: 0 },
+		SectionHeader { sh_name: 1, sh_type: SHT_STRTAB, sh_flags: 0, sh_addr: 0, sh_offset: header_len as u64, sh_size: strings.len() as u64, sh_link: 0, sh_info: 0, sh_addralign: 1, sh_entsize: 0 },
+		SectionHeader { sh_name: 11, sh_type: SHT_NOTE, sh_flags: SHF_ALLOC, sh_addr: 0, sh_offset: note_offset as u64, sh_size: 52, sh_link: 0, sh_info: 0, sh_addralign: 4, sh_entsize: 0 },
+	];
+	let mut bytes = vec![0u8; section_offset + core::mem::size_of_val(&sections)];
+	let mut ident = [0u8; 16];
+	ident[..4].copy_from_slice(&ELF_MAGIC);
+	ident[4] = ELFCLASS64;
+	ident[5] = ELFDATA2LSB;
+	let header = Elf64Header { e_ident: ident, e_type: ET_DYN, e_machine: EXPECTED_MACHINE, e_version: 1, e_entry: 0, e_phoff: header_len as u64, e_shoff: section_offset as u64, e_flags: 0, e_ehsize: header_len as u16, e_phentsize: core::mem::size_of::<ProgramHeader>() as u16, e_phnum: 0, e_shentsize: core::mem::size_of::<SectionHeader>() as u16, e_shnum: sections.len() as u16, e_shstrndx: 1 };
+	unsafe {
+		core::ptr::write_unaligned(bytes.as_mut_ptr() as *mut Elf64Header, header);
+		core::ptr::copy_nonoverlapping(sections.as_ptr() as *const u8, bytes.as_mut_ptr().add(section_offset), core::mem::size_of_val(&sections));
+	}
+	bytes[header_len..note_offset].copy_from_slice(strings);
+	bytes[note_offset..note_offset + 4].copy_from_slice(&6u32.to_le_bytes());
+	bytes[note_offset + 4..note_offset + 8].copy_from_slice(&32u32.to_le_bytes());
+	bytes[note_offset + 8..note_offset + 12].copy_from_slice(&LIBER_IDENTITY_NOTE_TYPE.to_le_bytes());
+	bytes[note_offset + 12..note_offset + 18].copy_from_slice(LIBER_IDENTITY_NOTE_NAME);
+	bytes[note_offset + 20..note_offset + 52].copy_from_slice(&digest);
+	(bytes, note_offset, section_offset)
+}
+
 #[test]
 fn dynamic_entries_are_bounded_and_stop_at_dt_null() {
 	let entries = [DynamicEntry { tag: 7, value: 0x1234 }, DynamicEntry { tag: DT_NULL, value: 0 }, DynamicEntry { tag: 99, value: 1 }];
@@ -57,6 +86,22 @@ fn explicit_machine_parser_supports_cross_target_audits() {
 	header.e_machine = other_machine;
 	assert!(Elf::parse(&bytes).is_none());
 	assert!(Elf::parse_for_machine(&bytes, other_machine).is_some());
+}
+
+#[test]
+fn liber_identity_note_is_exact_and_unique() {
+	let digest = [0x5au8; 32];
+	let (bytes, note_offset, section_offset) = identity_note_image(digest);
+	assert_eq!(Elf::parse(&bytes).unwrap().liber_identity_note_digest(), Some(digest));
+
+	let (mut malformed, _, _) = identity_note_image(digest);
+	malformed[note_offset..note_offset + 4].copy_from_slice(&5u32.to_le_bytes());
+	assert!(Elf::parse(&malformed).unwrap().liber_identity_note_digest().is_none());
+
+	let (mut duplicate, _, _) = identity_note_image(digest);
+	let note_header = duplicate[section_offset + 2 * core::mem::size_of::<SectionHeader>()..section_offset + 3 * core::mem::size_of::<SectionHeader>()].to_vec();
+	duplicate[section_offset..section_offset + core::mem::size_of::<SectionHeader>()].copy_from_slice(&note_header);
+	assert!(Elf::parse(&duplicate).unwrap().liber_identity_note_digest().is_none());
 }
 
 #[test]

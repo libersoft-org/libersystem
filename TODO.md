@@ -4122,6 +4122,20 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     audited 114 ET_DYN artifacts and `test-tags dynamic` completed 11/11 on x86_64,
     AArch64 and four-hart RISC-V. The broader hostile-input item remains open for
     ABI identity, duplicate-runtime, static-injection and undeclared-edge gates.
+  - Runtime identity substitution result (M126a, 2026-07-21): ProcessService now
+    reads the staged `id/bin` record for the executable and an `id/lib` record for
+    every resolved provider before `process_create`. It computes SHA-256 in the
+    shared boot protocol crate, requires the digest to match the artifact's exact
+    `.note.liber.identity` payload, and checks each record's direct-provider digests
+    against the resolved DAG. Identity records are bounded, strictly structured and
+    target-specific; missing, malformed, substituted or mismatched state fails the
+    launch without a Process capability. The dynamic mutation gate replaces the valid
+    `lsrt.lslib` bytes with `wire.lslib` under the original path and separately corrupts
+    `id/lib/lsrt`; both fail on x86_64, AArch64 and four-hart RISC-V, while the valid
+    `dyn_probe` DAG still runs. The x86 service/process/storage gate completes 63/63.
+    The shared boot protocol suite pins SHA-256 standard vectors and exact, unique
+    identity-note parsing. The remaining hostile-input work is duplicate runtime
+    ownership, static executable injection and undeclared dependency edges.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

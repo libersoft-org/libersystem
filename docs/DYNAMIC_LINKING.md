@@ -110,12 +110,16 @@ compiler-runtime ownership.
 ProcessService owns dependency policy because it already holds the StorageService
 capability used to read `vol://system/bin/*`. For a launch it:
 
-1. reads the main ELF and its `DT_NEEDED` names;
-2. resolves only canonical names under `vol://system/lib/`;
+1. reads the main ELF and its matching `id/bin/*` record, whose SHA-256 must match
+  the ELF's embedded identity note;
+2. resolves only canonical names under `vol://system/lib/`, verifying each matching
+  `id/lib/*` record and identity note before the provider enters the graph;
 3. builds a bounded dependency DAG, rejects cycles/duplicates/missing libraries, and
    orders providers before consumers;
-4. asks the kernel to load each library, then the main image, into the new process;
-5. starts the entry thread only after every eager relocation succeeds.
+4. requires every identity record's direct-provider digests to match the resolved
+  provider identities;
+5. asks the kernel to load each library, then the main image, into the new process;
+6. starts the entry thread only after every eager relocation succeeds.
 
 The kernel never performs filesystem I/O and never invents search policy. It owns the
 mechanisms that require privilege: page allocation, shared-frame caching, mapping into
@@ -172,6 +176,12 @@ in-memory system-volume snapshot: replacing its `lsrt.lslib` dependency with eit
 the absent `none.lslib` or the staged but incompatible `wire.lslib` must return a
 failed launch reply with no Process capability. The same gate rejects a drifted
 canonical provider-order file. These checks run on x86_64, AArch64 and RISC-V.
+
+The identity gate also substitutes the valid `wire.lslib` bytes into the staged
+`lsrt.lslib` slot and independently corrupts `id/lib/lsrt`. Both mutations must
+fail before ProcessService creates a Process capability. This binds a staged name,
+its artifact bytes, its identity record and its direct provider chain into one
+runtime-checked launch contract.
 
 ## Measurement and optimization
 

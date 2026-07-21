@@ -13,6 +13,12 @@
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
+const SHT_STRTAB: u32 = 3;
+const SHT_NOTE: u32 = 7;
+const SHF_ALLOC: u64 = 1 << 1;
+const LIBER_IDENTITY_SECTION: &[u8] = b".note.liber.identity";
+const LIBER_IDENTITY_NOTE_NAME: &[u8] = b"LIBER\0";
+const LIBER_IDENTITY_NOTE_TYPE: u32 = 1;
 pub const ET_EXEC: u16 = 2;
 pub const ET_DYN: u16 = 3;
 pub const EM_X86_64: u16 = 62;
@@ -127,6 +133,21 @@ pub struct ProgramHeader {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct SectionHeader {
+	sh_name: u32,
+	sh_type: u32,
+	sh_flags: u64,
+	sh_addr: u64,
+	sh_offset: u64,
+	sh_size: u64,
+	sh_link: u32,
+	sh_info: u32,
+	sh_addralign: u64,
+	sh_entsize: u64,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DynamicEntry {
 	pub tag: i64,
@@ -204,6 +225,10 @@ pub struct Elf<'a> {
 	phoff: u64,
 	phentsize: u16,
 	phnum: u16,
+	shoff: u64,
+	shentsize: u16,
+	shnum: u16,
+	shstrndx: u16,
 }
 
 impl<'a> Elf<'a> {
@@ -238,7 +263,7 @@ impl<'a> Elf<'a> {
 		if table_end > bytes.len() {
 			return None;
 		}
-		Some(Self { bytes, image_type: header.e_type, entry: header.e_entry, phoff: header.e_phoff, phentsize: header.e_phentsize, phnum: header.e_phnum })
+		Some(Self { bytes, image_type: header.e_type, entry: header.e_entry, phoff: header.e_phoff, phentsize: header.e_phentsize, phnum: header.e_phnum, shoff: header.e_shoff, shentsize: header.e_shentsize, shnum: header.e_shnum, shstrndx: header.e_shstrndx })
 	}
 
 	// The number of program headers.
@@ -266,6 +291,44 @@ impl<'a> Elf<'a> {
 		let start = usize::try_from(ph.p_offset).ok()?;
 		let end = start.checked_add(usize::try_from(ph.p_filesz).ok()?)?;
 		self.bytes.get(start..end)
+	}
+
+	fn section(&self, index: usize) -> Option<SectionHeader> {
+		if self.shentsize as usize != core::mem::size_of::<SectionHeader>() || index >= self.shnum as usize {
+			return None;
+		}
+		let start = usize::try_from(self.shoff).ok()?.checked_add(index.checked_mul(self.shentsize as usize)?)?;
+		let end = start.checked_add(core::mem::size_of::<SectionHeader>())?;
+		Some(unsafe { core::ptr::read_unaligned(self.bytes.get(start..end)?.as_ptr() as *const SectionHeader) })
+	}
+
+	fn section_data(&self, section: &SectionHeader) -> Option<&'a [u8]> {
+		let start = usize::try_from(section.sh_offset).ok()?;
+		let end = start.checked_add(usize::try_from(section.sh_size).ok()?)?;
+		self.bytes.get(start..end)
+	}
+
+	pub fn liber_identity_note_digest(&self) -> Option<[u8; 32]> {
+		if self.shnum == 0 || self.shstrndx >= self.shnum {
+			return None;
+		}
+		let strings = self.section_data(&self.section(self.shstrndx as usize)?)?;
+		let mut digest = None;
+		for index in 0..self.shnum as usize {
+			let section = self.section(index)?;
+			if section.sh_type != SHT_NOTE || section.sh_flags & SHF_ALLOC == 0 || section_name(strings, section.sh_name)? != LIBER_IDENTITY_SECTION {
+				continue;
+			}
+			let note = self.section_data(&section)?;
+			if note.len() != 52 || u32::from_le_bytes(note[0..4].try_into().ok()?) != LIBER_IDENTITY_NOTE_NAME.len() as u32 || u32::from_le_bytes(note[4..8].try_into().ok()?) != 32 || u32::from_le_bytes(note[8..12].try_into().ok()?) != LIBER_IDENTITY_NOTE_TYPE || &note[12..18] != LIBER_IDENTITY_NOTE_NAME || &note[18..20] != b"\0\0" {
+				return None;
+			}
+			let value: [u8; 32] = note[20..52].try_into().ok()?;
+			if digest.replace(value).is_some() {
+				return None;
+			}
+		}
+		digest
 	}
 
 	// Translate an image virtual address range to its file-backed bytes. Dynamic
@@ -514,6 +577,12 @@ fn string_at(strings: &[u8], offset: u64) -> Option<&str> {
 	let tail = strings.get(start..)?;
 	let end = tail.iter().position(|byte| *byte == 0)?;
 	core::str::from_utf8(&tail[..end]).ok()
+}
+
+fn section_name(strings: &[u8], offset: u32) -> Option<&[u8]> {
+	let tail = strings.get(offset as usize..)?;
+	let end = tail.iter().position(|byte| *byte == 0)?;
+	Some(&tail[..end])
 }
 
 pub struct Symbols<'a> {
