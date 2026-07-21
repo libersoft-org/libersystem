@@ -157,6 +157,14 @@ Limits are explicit: bounded module count, dependency depth, symbol count, strin
 bytes, relocation count, and mapped bytes per process/domain. Failed loads release all
 private frames and shared-cache references acquired by that transaction.
 
+The focused dynamic-link gate launches the staged `dyn_probe` through
+ProcessService and requires its `pix.lslib -> proto.lslib -> lsrt.lslib` dependency
+DAG to load, relocate and report successfully. It also mutates `echo.lsexe` in an
+in-memory system-volume snapshot: replacing its `lsrt.lslib` dependency with either
+the absent `none.lslib` or the staged but incompatible `wire.lslib` must return a
+failed launch reply with no Process capability. The same gate rejects a drifted
+canonical provider-order file. These checks run on x86_64, AArch64 and RISC-V.
+
 ## Measurement and optimization
 
 Dynamic linking is the required `/bin` architecture, not an optional optimization gate.

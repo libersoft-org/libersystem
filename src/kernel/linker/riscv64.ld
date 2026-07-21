@@ -32,6 +32,7 @@ SECTIONS
 	. = 0x80200000;
 
 	.boot : {
+		KEEP(*(.text.boot.entry))
 		KEEP(*(.text.boot))
 		*(.data.boot)
 		. = ALIGN(4096);

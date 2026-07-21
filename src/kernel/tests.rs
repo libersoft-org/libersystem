@@ -1175,6 +1175,8 @@ define_test_tags! {
 	Console => "console",
 	Display => "display",
 	Drivers => "drivers",
+	Dynamic => "dynamic",
+	DynamicReject => "dynamic-reject",
 	Filesystem => "filesystem",
 	Image => "image",
 	Input => "input",
@@ -4634,6 +4636,61 @@ fn system_packages_use_canonical_executable_names() {
 	assert!(volume.lookup(b"id/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");
 }
 
+fn start_process_service_from_volume(volume: &[u8]) -> (alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::channel::Channel>) {
+	use object::channel::Channel;
+	use object::rights::Rights;
+
+	let (_, package) = scenario_packages().expect("scenario packages");
+	let init = init_package_bytes().expect("init package module not found");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
+	let process_elf = package.lookup(b"process_service.lsexe").expect("process_service.lsexe in the init package");
+
+	let (storage_boot_kernel, storage_boot_user) = Channel::create();
+	let (process_boot_kernel, process_boot_user) = Channel::create();
+	let (storage_server, storage_client) = Channel::create();
+	let (process_server, process_client) = Channel::create();
+
+	let domain = sched::root_domain();
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
+	loader::spawn_elf_process(domain, process_elf, process_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
+	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
+	send_package(&process_boot_kernel, init).expect("process package bootstrap");
+	send_cap(&process_boot_kernel, b"STORAGE", storage_client.clone(), Rights::ALL).expect("process storage bootstrap");
+	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
+	(process_boot_kernel, storage_boot_kernel, process_client)
+}
+
+tagged_test!(dynamic_process_service_loads_probe, [Dynamic, Service, Process, Storage]);
+fn dynamic_process_service_loads_probe() {
+	use object::channel::{Channel, Message};
+	use object::process::Process;
+	use object::rights::Rights;
+
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	let (process_boot_kernel, _storage_boot_kernel, process_client) = start_process_service_from_volume(volume);
+	sched::run_until_idle();
+	assert_eq!(&process_boot_kernel.recv().expect("ProcessService online report").bytes, b"ProcessService: online");
+	let dynamic_name = b"dyn_probe";
+	let (report, bootstrap) = Channel::create();
+	let mut launch = alloc::vec::Vec::new();
+	launch.extend_from_slice(&3u16.to_le_bytes());
+	launch.extend_from_slice(&2u32.to_le_bytes());
+	launch.extend_from_slice(&(dynamic_name.len() as u16).to_le_bytes());
+	launch.extend_from_slice(dynamic_name);
+	launch.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&process_client, &launch, bootstrap, Rights::ALL).expect("dynamic probe launch request");
+	sched::run_until_idle();
+	let reply = process_client.recv().expect("dynamic probe launch reply");
+	assert_eq!(le_u32(&reply.bytes, 0), 2);
+	assert_eq!(reply.bytes[4], 1, "the staged dynamic probe loaded with its providers");
+	let process = reply.caps[0].object().into_any_arc().downcast::<Process>().expect("dynamic probe launch capability is a Process");
+	assert_eq!(&report.recv().expect("dynamic probe report").bytes, b"dynamic link ok");
+	assert!(process.private_image_pages() != 0 && process.shared_image_pages() != 0, "dynamic probe has private and shared mappings");
+	process_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	sched::run_until_idle();
+}
+
 tagged_test!(dynamic_process_service_loads_programs_from_system_bin, [Service, Process, Storage]);
 fn dynamic_process_service_loads_programs_from_system_bin() {
 	use object::channel::{Channel, Message};
@@ -4648,31 +4705,9 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	// proving the on-disk load path the shell's `run` and ConsoleService's shell spawn now
 	// take.
 	let (volume, package) = scenario_packages().expect("scenario packages");
-	let init = init_package_bytes().expect("init package module not found");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
-	let process_elf = package.lookup(b"process_service.lsexe").expect("process_service.lsexe in the init package");
-
-	let (storage_boot_kernel, storage_boot_user) = Channel::create();
-	let (process_boot_kernel, process_boot_user) = Channel::create();
-	let (storage_server, storage_client) = Channel::create();
-	let (process_server, process_client) = Channel::create();
-
-	let domain = sched::root_domain();
-	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
-	loader::spawn_elf_process(domain, process_elf, process_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+	let (process_boot_kernel, _storage_boot_kernel, process_client) = start_process_service_from_volume(volume);
 	let mut writable_storage = StorageHarness::start(storage_elf, b"BLOCK", volume, 64 * 1024 * 1024);
-
-	// StorageService: the ramdisk volume archive (staging the tools under bin/) and its
-	// service channel.
-	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
-	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
-
-	// ProcessService: the init package (the bring-up fallback, unused here), the live
-	// StorageService client it loads binaries from, then its own service channel. The
-	// receive order matches ProcessService's: package, storage, serve.
-	send_package(&process_boot_kernel, init).expect("process package bootstrap");
-	send_cap(&process_boot_kernel, b"STORAGE", storage_client.clone(), Rights::ALL).expect("process storage bootstrap");
-	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
 
 	// START a staged static tool: [op = 1 u16][corr u32][name: [len u16][utf8]].
 	let name: &[u8] = b"ptyecho";
@@ -5223,7 +5258,70 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	sched::run_until_idle();
 }
 
-tagged_test!(dynamic_process_service_rejects_linker_order_drift, [Service, Process, Storage]);
+fn replace_dynamic_needed(volume: &mut [u8], artifact: &[u8], expected: &str, replacement: &str) {
+	assert_eq!(expected.len(), replacement.len(), "dynamic dependency replacement changes ELF string layout");
+	let volume_base = volume.as_ptr() as usize;
+	let offset = {
+		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
+		let bytes = archive.lookup(artifact).expect("dynamic test executable is staged");
+		let elf = bootproto::elf::Elf::parse(bytes).expect("dynamic test executable is ELF");
+		let dynamic = elf.dynamic_info().expect("dynamic test executable metadata parses").expect("dynamic test executable has PT_DYNAMIC");
+		let dependency = elf.needed_names(&dynamic).expect("dynamic test executable dependencies parse").find(|name| *name == expected).expect("dynamic test executable names expected provider");
+		dependency.as_ptr() as usize - volume_base
+	};
+	volume[offset..offset + replacement.len()].copy_from_slice(replacement.as_bytes());
+}
+
+fn launch_from_volume(volume: &[u8], name: &[u8], correlation: u32) -> object::channel::Message {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let (_, package) = scenario_packages().expect("scenario packages");
+	let init = init_package_bytes().expect("init package module not found");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
+	let process_elf = package.lookup(b"process_service.lsexe").expect("process_service.lsexe in the init package");
+	let (storage_boot_kernel, storage_boot_user) = Channel::create();
+	let (process_boot_kernel, process_boot_user) = Channel::create();
+	let (storage_server, storage_client) = Channel::create();
+	let (process_server, process_client) = Channel::create();
+	let (_, bootstrap) = Channel::create();
+	let domain = sched::root_domain();
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
+	loader::spawn_elf_process(domain, process_elf, process_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+	send_ramdisk(&storage_boot_kernel, volume).expect("test storage ramdisk bootstrap");
+	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
+	send_package(&process_boot_kernel, init).expect("process package bootstrap");
+	send_cap(&process_boot_kernel, b"STORAGE", storage_client, Rights::ALL).expect("process storage bootstrap");
+	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
+	let mut launch = alloc::vec::Vec::new();
+	launch.extend_from_slice(&3u16.to_le_bytes());
+	launch.extend_from_slice(&correlation.to_le_bytes());
+	launch.extend_from_slice(&(name.len() as u16).to_le_bytes());
+	launch.extend_from_slice(name);
+	launch.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&process_client, &launch, bootstrap, Rights::ALL).expect("dynamic test launch request");
+	sched::run_until_idle();
+	assert_eq!(&process_boot_kernel.recv().expect("ProcessService online report").bytes, b"ProcessService: online");
+	let reply = process_client.recv().expect("dynamic test launch reply");
+	process_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	sched::run_until_idle();
+	reply
+}
+
+tagged_test!(dynamic_process_service_rejects_missing_or_substituted_provider, [Dynamic, DynamicReject, Service, Process, Storage]);
+fn dynamic_process_service_rejects_missing_or_substituted_provider() {
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	for (correlation, replacement) in [(78u32, "none.lslib"), (79u32, "wire.lslib")] {
+		let mut mutated_volume = volume.to_vec();
+		replace_dynamic_needed(&mut mutated_volume, b"bin/echo.lsexe", "lsrt.lslib", replacement);
+		let reply = launch_from_volume(&mutated_volume, b"echo", correlation);
+		assert_eq!(le_u32(&reply.bytes, 0), correlation);
+		assert_eq!(reply.bytes[4], 0, "ProcessService rejects {replacement} as echo's direct provider");
+		assert!(reply.caps.is_empty(), "rejected {replacement} provider creates no process capability");
+	}
+}
+
+tagged_test!(dynamic_process_service_rejects_linker_order_drift, [Dynamic, DynamicReject, Service, Process, Storage]);
 fn dynamic_process_service_rejects_linker_order_drift() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;

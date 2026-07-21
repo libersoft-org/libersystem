@@ -4095,6 +4095,21 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     and generation checks, and all three target graphs pass. The remaining warm work is
     mostly required identity and cache-key derivation; do not weaken those comparisons
     without a new profile and an explicit invalidation test.
+  - Dynamic provider gate result (M126a, 2026-07-21): the focused `dynamic` tag now
+    starts `dyn_probe` through StorageService and ProcessService, requiring its
+    `pix.lslib -> proto.lslib -> lsrt.lslib` provider DAG, relocation and bootstrap
+    report to complete. It also mutates `echo.lsexe` in a system-volume snapshot to
+    name an absent `none.lslib` and an incompatible staged `wire.lslib`; both must
+    return a failed launch reply without a Process capability. Canonical provider-order
+    drift remains a separate negative case under the same gate. The x86_64, AArch64
+    and RISC-V focused runs each complete 11/11 tests; the RISC-V normal four-hart run
+    also reports all three secondary harts online. Cross-target test runners now retain
+    their selected serial backend while keeping semihosting test exit enabled, so early
+    guest boot output is captured. The RISC-V linker places the BSP `.text.boot.entry`
+    before the secondary-hart trampoline, making the direct-boot entry at `0x80200000`
+    match `_start` rather than the secondary path. The broader service/process/storage
+    scenario remains separately tagged because its full tool and storage workflow is
+    intentionally more expensive under TCG.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

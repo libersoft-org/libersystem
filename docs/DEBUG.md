@@ -83,6 +83,15 @@ the volume only when the image is created, so a stale image runs stale binaries.
 That stale-volume trap also applies to live boots; `just lab boot --fresh` is
 the shortcut that avoids it.
 
+The focused dynamic-link gate exercises a real provider DAG plus hostile provider
+and canonical-order inputs without the full service integration workload:
+
+```sh
+just test-tags dynamic
+just test-tags-aarch64 dynamic
+just test-tags-riscv64 dynamic
+```
+
 ## Reading what the machine did
 
 - Serial log: `boot/.build/lab-serial.log` under the harness (`lab log`), or

@@ -489,11 +489,10 @@ qemu_run_aarch64() {
 	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$USB_DISK")
 	qemu_attach_xhci qemu_args vusb
 
-	# Test mode: enable Arm semihosting, route serial to stdout.
+	# Test mode: enable Arm semihosting while retaining the selected serial backend.
 	local test_args=()
 	if [[ "${TEST:-0}" == "1" ]]; then
 		test_args+=(-semihosting)
-		serial="stdio"
 	else
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 		qemu_attach_virt_interactive qemu_args -aarch64 "disable-legacy=on"
@@ -593,11 +592,10 @@ qemu_run_riscv64() {
 	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$USB_DISK")
 	qemu_attach_xhci qemu_args vusb
 
-	# Test mode: enable RISC-V semihosting, route serial to stdout.
+	# Test mode: enable RISC-V semihosting while retaining the selected serial backend.
 	local test_args=()
 	if [[ "${TEST:-0}" == "1" ]]; then
 		test_args+=(-semihosting)
-		serial="stdio"
 	else
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 		qemu_attach_virt_interactive qemu_args -riscv64 ""

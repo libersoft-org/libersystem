@@ -26,7 +26,7 @@ global_asm!(
 .Lp_bss_start: .quad __bss_start
 .Lp_bss_end:   .quad __bss_end
 
-.section .text.boot, "ax"
+.section .text.boot.entry, "ax"
 .global _start
 _start:
 	mv      s0, a0                  // save hartid
