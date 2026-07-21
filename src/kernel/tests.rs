@@ -1337,7 +1337,7 @@ fn dynamic_symbol_names_accept_rust_mangling_with_a_bound() {
 	assert!(!process.register_dynamic_symbols(&[(rejected, 0x2000_2000)]), "an overlong symbol is rejected");
 }
 
-tagged_test!(elf_dyn_applies_relative_relocations_and_rejects_symbols, [Memory, Process]);
+tagged_test!(elf_dyn_applies_relative_relocations_and_rejects_symbols, [Dynamic, DynamicReject, Memory, Process]);
 fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 	use crate::elf::ElfError;
 	use crate::object::address_space::AddressSpace;
@@ -1402,7 +1402,7 @@ fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 		bytes
 	}
 
-	fn symbol_image(provider: bool) -> Vec<u8> {
+	fn symbol_image(provider: bool, code: u8) -> Vec<u8> {
 		const CODE_OFFSET: usize = 0x200;
 		const DATA_OFFSET: usize = 0x300;
 		const DATA_ADDRESS: u64 = 0x2000;
@@ -1429,7 +1429,7 @@ fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 		program_header(&mut bytes, 1, 1, 6, DATA_OFFSET as u64, DATA_ADDRESS, DATA_LEN as u64, DATA_LEN as u64);
 		let dynamic_entries = if provider { 6 } else { 9 };
 		program_header(&mut bytes, 2, 2, 6, (DATA_OFFSET + DYNAMIC_OFFSET) as u64, DATA_ADDRESS + DYNAMIC_OFFSET as u64, dynamic_entries * 16, dynamic_entries * 16);
-		bytes[CODE_OFFSET] = 0xc3;
+		bytes[CODE_OFFSET] = code;
 		bytes[DATA_OFFSET..DATA_OFFSET + strings.len()].copy_from_slice(strings);
 		let symbol = DATA_OFFSET + SYMBOL_OFFSET + 24;
 		put32(&mut bytes, symbol, 1);
@@ -1495,16 +1495,18 @@ fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 	}
 
 	let process = Process::new(AddressSpace::create().expect("dynamic module process address space"), sched::root_domain());
-	let provider = symbol_image(true);
-	let consumer = symbol_image(false);
+	let provider = symbol_image(true, 0xc3);
+	let consumer = symbol_image(false, 0xc3);
+	let colliding_provider = symbol_image(true, 0x90);
 	crate::loader::load_module_into(&process, &provider, 0x2000_0000).expect("provider module loads and registers exports");
 	assert_eq!(process.resolve_dynamic_symbol("shared_value"), Some(0x2000_0000));
 	crate::loader::load_module_into(&process, &consumer, 0x2100_0000).expect("consumer resolves provider symbol eagerly");
 	let consumer_data = process.address_space().unmap(0x2100_2000).expect("consumer data mapping");
 	let imported = unsafe { ((mem::hhdm_offset() + consumer_data + 0x110) as *const u64).read_unaligned() };
 	assert_eq!(imported, 0x2000_0005);
-	assert!(matches!(crate::loader::load_module_into(&process, &provider, 0x2200_0000), Err(crate::loader::LoadError::BadImage)), "duplicate provider is rejected");
-	assert!(process.address_space().unmap(0x2200_0000).is_none(), "duplicate provider mapping is rolled back");
+	assert_ne!(provider, colliding_provider, "colliding providers are distinct images");
+	assert!(matches!(crate::loader::load_module_into(&process, &colliding_provider, 0x2200_0000), Err(crate::loader::LoadError::BadImage)), "distinct providers with a duplicate export are rejected");
+	assert!(process.address_space().unmap(0x2200_0000).is_none(), "duplicate-export provider mapping is rolled back");
 	let second = Process::new(AddressSpace::create().expect("second module process address space"), sched::root_domain());
 	crate::loader::load_module_into(&second, &provider, 0x2000_0000).expect("same provider loads in a second process");
 	let first_text = process.address_space().unmap(0x2000_0000).expect("first provider text mapping");
@@ -5296,6 +5298,37 @@ fn corrupt_volume_entry(volume: &mut [u8], entry: &[u8], field: &[u8]) {
 	volume[offset] = if volume[offset] == b'0' { b'1' } else { b'0' };
 }
 
+fn loader_visible_dynamic_export(symbol: bootproto::elf::Symbol, name: &str) -> bool {
+	symbol.is_defined() && matches!(symbol.binding(), 1 | 2) && matches!(symbol.symbol_type(), 0..=2) && matches!(symbol.visibility(), 0 | 3) && !name.is_empty()
+}
+
+fn replace_provider_export(volume: &mut [u8], provider_entry: &[u8], runtime_entry: &[u8]) {
+	let volume_base = volume.as_ptr() as usize;
+	let (offset, replacement) = {
+		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
+		let provider_bytes = archive.lookup(provider_entry).expect("provider export test provider is staged");
+		let provider = bootproto::elf::Elf::parse(provider_bytes).expect("provider export test provider is ELF");
+		let provider_dynamic = provider.dynamic_info().expect("provider export test provider metadata parses").expect("provider export test provider has PT_DYNAMIC");
+		let runtime_bytes = archive.lookup(runtime_entry).expect("provider export test runtime is staged");
+		let runtime = bootproto::elf::Elf::parse(runtime_bytes).expect("provider export test runtime is ELF");
+		let runtime_dynamic = runtime.dynamic_info().expect("provider export test runtime metadata parses").expect("provider export test runtime has PT_DYNAMIC");
+		let runtime_exports: alloc::vec::Vec<&str> = runtime.symbols(&runtime_dynamic).expect("provider export test runtime symbols parse").filter_map(|(symbol, name)| loader_visible_dynamic_export(symbol, name).then_some(name)).collect();
+		let (source, replacement) = provider
+			.symbols(&provider_dynamic)
+			.expect("provider export test provider symbols parse")
+			.find_map(|(symbol, name)| {
+				if !loader_visible_dynamic_export(symbol, name) {
+					return None;
+				}
+				runtime_exports.iter().copied().find(|candidate| candidate.len() == name.len() && *candidate != name).map(|candidate| (name, candidate))
+			})
+			.expect("provider export test finds equal-length provider and runtime exports");
+		assert_eq!(source.len(), replacement.len(), "provider export replacement preserves the ELF string layout");
+		(source.as_ptr() as usize - volume_base, replacement.as_bytes().to_vec())
+	};
+	volume[offset..offset + replacement.len()].copy_from_slice(&replacement);
+}
+
 fn launch_from_volume(volume: &[u8], name: &[u8], correlation: u32) -> object::channel::Message {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -5361,6 +5394,17 @@ fn dynamic_process_service_rejects_substituted_identity() {
 	assert_eq!(le_u32(&reply.bytes, 0), 81);
 	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a provider identity whose note digest no longer matches");
 	assert!(reply.caps.is_empty(), "a corrupted provider identity creates no process capability");
+}
+
+tagged_test!(dynamic_process_service_rejects_duplicate_provider_export, [Dynamic, DynamicReject, Service, Process, Storage]);
+fn dynamic_process_service_rejects_duplicate_provider_export() {
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	let mut duplicated_export = volume.to_vec();
+	replace_provider_export(&mut duplicated_export, b"lib/pix.lslib", b"lib/lsrt.lslib");
+	let reply = launch_from_volume(&duplicated_export, b"dyn_probe", 82);
+	assert_eq!(le_u32(&reply.bytes, 0), 82);
+	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a provider that duplicates a runtime export");
+	assert!(reply.caps.is_empty(), "a duplicate provider export creates no process capability");
 }
 
 tagged_test!(dynamic_process_service_rejects_linker_order_drift, [Dynamic, DynamicReject, Service, Process, Storage]);

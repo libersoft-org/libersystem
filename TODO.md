@@ -4136,6 +4136,21 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     The shared boot protocol suite pins SHA-256 standard vectors and exact, unique
     identity-note parsing. The remaining hostile-input work is duplicate runtime
     ownership, static executable injection and undeclared dependency edges.
+  - Duplicate provider-export result (M126a, 2026-07-21): the image linker now
+    indexes every closure's defined global or weak `NOTYPE`, `OBJECT` and `FUNC`
+    exports with default or protected visibility, using the same eligibility rules as
+    the kernel loader. It rejects two providers in one closure that claim the same
+    symbol before accepting a provider graph or any consumer cache hit. The loader
+    test now uses two distinct ET_DYN images with one shared export and proves that
+    the second module is rejected with its mapped slot rolled back. The ProcessService
+    mutation gate selects equal-length loader-visible `pix` and `lsrt` exports for the
+    active target, rewrites the staged `pix` dynamic string table to duplicate the
+    runtime export while retaining valid identity records and notes, then requires
+    `dyn_probe` launch to fail without a Process capability. The focused dynamic gate
+    completes 14/14 on x86_64, AArch64 and four-hart RISC-V; the RISC-V run reports all
+    three secondary harts online. `shared-cache-check quick` preserves the established
+    warm cache, order-sidecar and targeted relink behavior. The remaining hostile-input
+    work is static executable injection and undeclared dependency edges.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

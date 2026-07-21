@@ -704,11 +704,13 @@ graph_archive() {
 declare -A canonical_order_cache=()
 declare -A provider_dependencies=()
 declare -A provider_symbols=()
+declare -A provider_exports=()
 declare -A provider_symbols_indexed=()
+declare -A provider_export_audit_cache=()
 
 build_provider_index() {
 	local providers="$1"
-	local provider file kind value
+	local provider file kind value symbol_key
 	for provider in $providers; do
 		if [[ -n "${provider_symbols_indexed[$provider]:-}" ]]; then continue; fi
 		file="$(library_file "$provider")"
@@ -716,7 +718,13 @@ build_provider_index() {
 		while IFS=$'\t' read -r kind value; do
 			case "$kind" in
 			D) provider_dependencies[$provider]+=" ${value%.lslib}" ;;
-			S) provider_symbols["$provider|$value"]=1 ;;
+			S)
+				symbol_key="$provider|$value"
+				if [[ -z "${provider_symbols[$symbol_key]:-}" ]]; then
+					provider_symbols[$symbol_key]=1
+					provider_exports[$provider]+="$value"$'\n'
+				fi
+				;;
 			esac
 		done < <(llvm-readelf --wide -d --dyn-syms "$file" | awk '
 			/Shared library:/ {
@@ -726,7 +734,7 @@ build_provider_index() {
 				print "D\t" name
 				next
 			}
-			$1 ~ /^[0-9]+:$/ && $7 != "UND" && $8 != "" {print "S\t" $8}
+			$1 ~ /^[0-9]+:$/ && $7 != "UND" && ($5 == "GLOBAL" || $5 == "WEAK") && ($4 == "NOTYPE" || $4 == "OBJECT" || $4 == "FUNC") && ($6 == "DEFAULT" || $6 == "PROTECTED") && $8 != "" {print "S\t" $8}
 		')
 		provider_dependencies[$provider]="$(tr ' ' '\n' <<<"${provider_dependencies[$provider]}" | sed '/^$/d' | sort -u | xargs)"
 		provider_symbols_indexed[$provider]=1
@@ -800,6 +808,32 @@ canonical_provider_order() {
 	result="$(printf '%s.lslib\n' "${order[@]}")"$'\n'
 	canonical_order_cache[$cache_key]="$result"
 	printf '%s' "$result"
+}
+
+audit_provider_export_ownership() {
+	local roots="$1"
+	local cache_key order provider symbol owner
+	cache_key="$(tr ' ' '\n' <<<"$roots" | sort -u | xargs)"
+	if [[ -n "${provider_export_audit_cache[$cache_key]:-}" ]]; then return; fi
+	order="$(canonical_provider_order "$roots")" || return 1
+	local -A owners=()
+	while IFS= read -r provider; do
+		provider="${provider%.lslib}"
+		if [[ -z "${provider_symbols_indexed[$provider]:-}" ]]; then
+			echo "build-shared: dynamic graph provider $provider has no export index" >&2
+			return 1
+		fi
+		while IFS= read -r symbol; do
+			[[ -n "$symbol" ]] || continue
+			owner="${owners[$symbol]:-}"
+			if [[ -n "$owner" && "$owner" != "$provider" ]]; then
+				echo "build-shared: dynamic graph providers $owner and $provider both export $symbol" >&2
+				return 1
+			fi
+			owners[$symbol]="$provider"
+		done <<<"${provider_exports[$provider]:-}"
+	done <<<"$order"
+	provider_export_audit_cache[$cache_key]=1
 }
 
 provider_started=$SECONDS
@@ -1116,6 +1150,10 @@ for spec in "$@"; do
 	artifacts+=("$artifact")
 	artifact_available[$artifact]=1
 done
+build_provider_index "${artifacts[*]}"
+for artifact in "${artifacts[@]}"; do
+	audit_provider_export_ownership "$artifact"
+done
 provider_seconds=$((SECONDS - provider_started))
 
 if [[ -n "$image_graph" ]]; then
@@ -1156,6 +1194,7 @@ if [[ -n "$image_graph" ]]; then
 			echo "build-shared: dynamic $consumer repeats a direct provider" >&2
 			exit 1
 		fi
+		audit_provider_export_ownership "$providers"
 		consumer_dir="$root/user/$crate"
 		out_dir="$consumer_dir/shared/$target"
 		consumer_errors="$out_dir/.$consumer.stderr"
@@ -1428,6 +1467,7 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	probe_expected_needed="$(printf '%s\n' pix.lslib proto.lslib lsrt.lslib | sort -u)"
 	probe_expected_order="$probe_out.order.$$.expected"
 	canonical_provider_order "pix proto lsrt" >"$probe_expected_order"
+	audit_provider_export_ownership "pix proto lsrt"
 	probe_cache_key="$(artifact_cache_key executable "dynamic dyn_probe dyn_probe volume pix proto lsrt" "$probe_expected_identity" "cargo=$image_target_config_value")"
 	probe_cache_prefix="$artifact_cache_dir/executable-dyn_probe"
 	if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$probe_out" "$probe_cache_prefix" "$probe_cache_key" "$probe_expected_identity" "$probe_expected_needed" && [[ -f "$probe_out.order" ]] && cmp -s "$probe_expected_order" "$probe_out.order"; then

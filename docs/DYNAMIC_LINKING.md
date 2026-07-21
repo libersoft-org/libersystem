@@ -183,6 +183,16 @@ fail before ProcessService creates a Process capability. This binds a staged nam
 its artifact bytes, its identity record and its direct provider chain into one
 runtime-checked launch contract.
 
+Every resolved provider closure has exactly one owner for each loader-visible
+dynamic export. Package staging indexes defined global or weak `NOTYPE`, `OBJECT`
+and `FUNC` symbols with default or protected visibility using the same eligibility
+rules as the kernel loader. A duplicate owner rejects the graph before an artifact
+is accepted; the loader repeats the check while adding a module's exports and rolls
+back the module mapping on failure. A provider whose dynamic string table is
+mutated to collide with a runtime export must therefore fail before ProcessService
+returns a Process capability, even when its staged identity record and note remain
+well-formed.
+
 ## Measurement and optimization
 
 Dynamic linking is the required `/bin` architecture, not an optional optimization gate.
