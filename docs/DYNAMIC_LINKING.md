@@ -210,6 +210,12 @@ string-table offset without altering the identity record or note. Package stagin
 the repeated provider before archive output changes, while ProcessService rejects the
 duplicate dependency name before resolving or loading modules.
 
+The malformed dynamic-metadata gate independently injects a second `PT_DYNAMIC`
+program header, removes every `DT_NULL` terminator, and duplicates the singleton
+`DT_STRTAB` tag. The shared ELF parser, package staging and ProcessService must reject
+each form before a Process capability is created. The package check restores the artifact
+after every mutation and verifies that no failed form rewrites the system-volume archive.
+
 ## Measurement and optimization
 
 Dynamic linking is the required `/bin` architecture, not an optional optimization gate.

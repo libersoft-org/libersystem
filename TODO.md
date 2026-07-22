@@ -4183,6 +4183,17 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     mutation and receives a failed reply without a Process capability because duplicate
     dependency names fail before resolver traversal. The remaining hostile-input work is
     malformed dynamic table forms beyond the existing bounded parser coverage.
+  - Malformed dynamic-metadata result (M126a, 2026-07-22): the shared ELF parser now
+    pins fail-closed handling for a second `PT_DYNAMIC` segment, a dynamic table without
+    `DT_NULL`, and repeated singleton `DT_STRTAB` metadata. `malformed-dynamic-check`
+    applies each mutation independently to staged `dyn_probe` on x86_64, AArch64 and
+    RISC-V. Every package build rejects the malformed table before archive output changes,
+    restores the artifact, rebuilds a fresh baseline and preserves the resulting archive.
+    The ProcessService mutation gate applies all three forms to an in-memory volume and
+    each launch fails without a Process capability before resolver traversal. The focused
+    dynamic gate remains green on every architecture, including RISC-V four-hart SMP.
+    The remaining hostile-input work is malformed symbol, relocation and dependency graph
+    metadata beyond these bounded dynamic-table forms.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

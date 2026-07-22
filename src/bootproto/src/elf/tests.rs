@@ -79,6 +79,48 @@ fn malformed_header_and_dynamic_ranges_are_rejected() {
 }
 
 #[test]
+fn malformed_dynamic_tables_fail_closed() {
+	let entry_len = core::mem::size_of::<DynamicEntry>();
+	let header_len = core::mem::size_of::<Elf64Header>();
+	let duplicate_offset = header_len + core::mem::size_of::<[ProgramHeader; 2]>();
+	let terminator = [DynamicEntry { tag: DT_NULL, value: 0 }];
+	let terminator_bytes = unsafe { core::slice::from_raw_parts(terminator.as_ptr() as *const u8, core::mem::size_of_val(&terminator)) };
+	let duplicate_segments = [
+		ProgramHeader { p_type: PT_DYNAMIC, p_flags: PF_R, p_offset: duplicate_offset as u64, p_vaddr: 0x2000, p_paddr: 0, p_filesz: entry_len as u64, p_memsz: entry_len as u64, p_align: 8 },
+		ProgramHeader { p_type: PT_DYNAMIC, p_flags: PF_R, p_offset: duplicate_offset as u64, p_vaddr: 0x3000, p_paddr: 0, p_filesz: entry_len as u64, p_memsz: entry_len as u64, p_align: 8 },
+	];
+	let duplicate = image(ET_DYN, &duplicate_segments, terminator_bytes);
+	assert!(Elf::parse(&duplicate).unwrap().dynamic_entries().is_none());
+
+	let missing_offset = header_len + core::mem::size_of::<ProgramHeader>();
+	let unterminated = [DynamicEntry { tag: DT_NEEDED, value: 0 }];
+	let unterminated_bytes = unsafe { core::slice::from_raw_parts(unterminated.as_ptr() as *const u8, core::mem::size_of_val(&unterminated)) };
+	let missing_segment = ProgramHeader { p_type: PT_DYNAMIC, p_flags: PF_R, p_offset: missing_offset as u64, p_vaddr: 0x4000, p_paddr: 0, p_filesz: entry_len as u64, p_memsz: entry_len as u64, p_align: 8 };
+	let missing = image(ET_DYN, &[missing_segment], unterminated_bytes);
+	assert!(Elf::parse(&missing).unwrap().dynamic_entries().is_none());
+
+	let table_len = core::mem::size_of::<[ProgramHeader; 2]>();
+	let payload_offset = header_len + table_len;
+	let load_address = 0x5000u64;
+	let strings = b"provider.lslib\0";
+	let dynamic = [
+		DynamicEntry { tag: DT_STRTAB, value: load_address },
+		DynamicEntry { tag: DT_STRTAB, value: load_address },
+		DynamicEntry { tag: DT_STRSZ, value: strings.len() as u64 },
+		DynamicEntry { tag: DT_NULL, value: 0 },
+	];
+	let mut payload = strings.to_vec();
+	let dynamic_offset = payload.len();
+	payload.extend_from_slice(unsafe { core::slice::from_raw_parts(dynamic.as_ptr() as *const u8, core::mem::size_of_val(&dynamic)) });
+	let singleton_segments = [
+		ProgramHeader { p_type: PT_LOAD, p_flags: PF_R, p_offset: payload_offset as u64, p_vaddr: load_address, p_paddr: 0, p_filesz: payload.len() as u64, p_memsz: payload.len() as u64, p_align: 1 },
+		ProgramHeader { p_type: PT_DYNAMIC, p_flags: PF_R, p_offset: (payload_offset + dynamic_offset) as u64, p_vaddr: load_address + dynamic_offset as u64, p_paddr: 0, p_filesz: core::mem::size_of_val(&dynamic) as u64, p_memsz: core::mem::size_of_val(&dynamic) as u64, p_align: 8 },
+	];
+	let duplicate_singleton = image(ET_DYN, &singleton_segments, &payload);
+	assert!(Elf::parse(&duplicate_singleton).unwrap().dynamic_info().is_none());
+}
+
+#[test]
 fn explicit_machine_parser_supports_cross_target_audits() {
 	let mut bytes = image(ET_DYN, &[], &[]);
 	let other_machine = if EXPECTED_MACHINE == EM_AARCH64 { EM_RISCV } else { EM_AARCH64 };

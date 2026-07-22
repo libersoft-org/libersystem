@@ -5300,6 +5300,73 @@ fn duplicate_dynamic_needed(volume: &mut [u8], artifact: &[u8]) {
 	volume[offset..offset + core::mem::size_of::<u64>()].copy_from_slice(&replacement.to_le_bytes());
 }
 
+fn program_header_file_offset(bytes: &[u8], index: usize) -> usize {
+	let table_offset = usize::try_from(u64::from_le_bytes(bytes[32..40].try_into().expect("program-header table offset bytes"))).expect("program-header table offset fits");
+	let entry_len = usize::from(u16::from_le_bytes(bytes[54..56].try_into().expect("program-header entry length bytes")));
+	let count = usize::from(u16::from_le_bytes(bytes[56..58].try_into().expect("program-header count bytes")));
+	assert!(index < count, "program-header index is in range");
+	table_offset.checked_add(index.checked_mul(entry_len).expect("program-header entry offset fits")).expect("program-header file offset fits")
+}
+
+fn dynamic_segment_file_offset(elf: &bootproto::elf::Elf<'_>) -> (usize, bootproto::elf::ProgramHeader) {
+	let (_, segment) = (0..elf.segment_count())
+		.find_map(|index| {
+			let segment = elf.segment(index)?;
+			(segment.p_type == bootproto::elf::PT_DYNAMIC).then_some((index, segment))
+		})
+		.expect("dynamic metadata test executable has PT_DYNAMIC");
+	(usize::try_from(segment.p_offset).expect("dynamic segment file offset fits"), segment)
+}
+
+fn dynamic_entry_file_offset(elf: &bootproto::elf::Elf<'_>, index: usize) -> usize {
+	let (offset, segment) = dynamic_segment_file_offset(elf);
+	let entry_len = core::mem::size_of::<bootproto::elf::DynamicEntry>();
+	assert!(index.checked_add(1).and_then(|count| count.checked_mul(entry_len)).is_some_and(|bytes| bytes <= segment.p_filesz as usize), "dynamic entry index is in range");
+	offset + index * entry_len
+}
+
+fn duplicate_dynamic_segment(volume: &mut [u8], artifact: &[u8]) {
+	let volume_base = volume.as_ptr() as usize;
+	let offset = {
+		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
+		let bytes = archive.lookup(artifact).expect("duplicate segment test executable is staged");
+		let elf = bootproto::elf::Elf::parse(bytes).expect("duplicate segment test executable is ELF");
+		let index = (0..elf.segment_count()).find(|index| elf.segment(*index).is_some_and(|segment| segment.p_type != bootproto::elf::PT_DYNAMIC && segment.p_filesz != 0)).expect("duplicate segment test finds a nonempty non-dynamic segment");
+		let header_offset = program_header_file_offset(bytes, index);
+		assert_ne!(u32::from_le_bytes(bytes[header_offset..header_offset + core::mem::size_of::<u32>()].try_into().expect("duplicate segment type bytes")), bootproto::elf::PT_DYNAMIC);
+		bytes.as_ptr() as usize - volume_base + header_offset
+	};
+	volume[offset..offset + core::mem::size_of::<u32>()].copy_from_slice(&bootproto::elf::PT_DYNAMIC.to_le_bytes());
+}
+
+fn remove_dynamic_terminator(volume: &mut [u8], artifact: &[u8]) {
+	let volume_base = volume.as_ptr() as usize;
+	let offsets = {
+		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
+		let bytes = archive.lookup(artifact).expect("missing terminator test executable is staged");
+		let elf = bootproto::elf::Elf::parse(bytes).expect("missing terminator test executable is ELF");
+		elf.dynamic_entries().expect("missing terminator test dynamic entries parse").expect("missing terminator test executable has one dynamic table").enumerate().filter_map(|(index, entry)| (entry.tag == bootproto::elf::DT_NULL).then_some(bytes.as_ptr() as usize - volume_base + dynamic_entry_file_offset(&elf, index))).collect::<alloc::vec::Vec<usize>>()
+	};
+	assert!(!offsets.is_empty(), "missing terminator test finds a terminator");
+	for offset in offsets {
+		volume[offset..offset + core::mem::size_of::<i64>()].copy_from_slice(&0x6fff_ffffi64.to_le_bytes());
+	}
+}
+
+fn duplicate_dynamic_singleton(volume: &mut [u8], artifact: &[u8]) {
+	let volume_base = volume.as_ptr() as usize;
+	let offset = {
+		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
+		let bytes = archive.lookup(artifact).expect("duplicate singleton test executable is staged");
+		let elf = bootproto::elf::Elf::parse(bytes).expect("duplicate singleton test executable is ELF");
+		let entries: alloc::vec::Vec<(usize, bootproto::elf::DynamicEntry)> = elf.dynamic_entries().expect("duplicate singleton test dynamic entries parse").expect("duplicate singleton test executable has one dynamic table").enumerate().collect();
+		assert!(entries.iter().any(|(_, entry)| entry.tag == bootproto::elf::DT_STRTAB), "duplicate singleton test has DT_STRTAB");
+		let index = entries.iter().find_map(|(index, entry)| (entry.tag != bootproto::elf::DT_STRTAB && entry.tag != bootproto::elf::DT_NULL).then_some(*index)).expect("duplicate singleton test finds a non-singleton entry");
+		bytes.as_ptr() as usize - volume_base + dynamic_entry_file_offset(&elf, index)
+	};
+	volume[offset..offset + core::mem::size_of::<i64>()].copy_from_slice(&bootproto::elf::DT_STRTAB.to_le_bytes());
+}
+
 fn replace_volume_entry(volume: &mut [u8], destination: &[u8], source: &[u8]) {
 	let volume_base = volume.as_ptr() as usize;
 	let (destination_offset, destination_len, source_bytes) = {
@@ -5422,6 +5489,23 @@ fn dynamic_process_service_rejects_duplicate_provider_edge() {
 	assert_eq!(le_u32(&reply.bytes, 0), 80);
 	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a duplicate provider edge");
 	assert!(reply.caps.is_empty(), "a duplicate provider edge creates no process capability");
+}
+
+tagged_test!(dynamic_process_service_rejects_malformed_dynamic_metadata, [Dynamic, DynamicReject, Service, Process, Storage]);
+fn dynamic_process_service_rejects_malformed_dynamic_metadata() {
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	for (correlation, mutate) in [
+		(83u32, duplicate_dynamic_segment as fn(&mut [u8], &[u8])),
+		(84, remove_dynamic_terminator as fn(&mut [u8], &[u8])),
+		(85, duplicate_dynamic_singleton as fn(&mut [u8], &[u8])),
+	] {
+		let mut mutated_volume = volume.to_vec();
+		mutate(&mut mutated_volume, b"bin/dyn_probe.lsexe");
+		let reply = launch_from_volume(&mutated_volume, b"dyn_probe", correlation);
+		assert_eq!(le_u32(&reply.bytes, 0), correlation);
+		assert_eq!(reply.bytes[4], 0, "ProcessService rejects malformed dynamic metadata");
+		assert!(reply.caps.is_empty(), "malformed dynamic metadata creates no process capability");
+	}
 }
 
 tagged_test!(dynamic_process_service_rejects_substituted_identity, [Dynamic, DynamicReject, Service, Process, Storage]);

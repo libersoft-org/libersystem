@@ -247,6 +247,7 @@ Run `just --list` to see every available command. The most useful ones:
 | `just static-image-check` | Temporarily inject an `ET_EXEC` header into a staged dynamic executable on all three targets; package assembly must reject it before rewriting the system volume, then restore each artifact. |
 | `just undeclared-edge-check` | Temporarily change a staged executable's `DT_NEEDED` provider from declared `lsrt.lslib` to staged but undeclared `wire.lslib` on all three targets; package assembly must reject it before rewriting the system volume, then restore each artifact. |
 | `just duplicate-edge-check` | Temporarily make two staged `DT_NEEDED` entries name the same provider on all three targets; package assembly must reject the duplicate before rewriting the system volume, then restore each artifact. |
+| `just malformed-dynamic-check` | Temporarily inject a second `PT_DYNAMIC`, remove `DT_NULL`, and duplicate `DT_STRTAB` metadata in a staged executable on all three targets; package assembly must reject each form before rewriting the system volume, then restore each artifact. |
 | `just lab <cmd>` | Drive a live instance for debugging (boot, run guest shell commands, logs, packet capture - see [docs/DEBUG.md](./docs/DEBUG.md)). |
 | `just debug` | Boot in QEMU and wait for GDB on `:1234`. |
 | `just gdb` | Attach GDB to a waiting QEMU instance. |
