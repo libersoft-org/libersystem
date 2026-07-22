@@ -174,6 +174,7 @@ fn audit_linked_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String], 
 	let image = bootproto::elf::Elf::parse_for_machine(bytes, user_elf_machine()).unwrap_or_else(|| panic!("{} {} is not a valid target ELF", row.kind, row.name));
 	assert_eq!(image.image_type, bootproto::elf::ET_DYN, "{} {} is not ET_DYN", row.kind, row.name);
 	let dynamic = image.dynamic_info().flatten().unwrap_or_else(|| panic!("{} {} has no valid terminated PT_DYNAMIC", row.kind, row.name));
+	image.symbols(&dynamic).unwrap_or_else(|| panic!("{} {} has malformed dynamic symbols", row.kind, row.name)).for_each(drop);
 	audit_dynamic_relocations(row, &image, &dynamic);
 	for entry in image.dynamic_entries().flatten().unwrap_or_else(|| panic!("{} {} has no PT_DYNAMIC", row.kind, row.name)) {
 		assert!(!matches!(entry.tag, DT_RPATH | DT_RUNPATH | DT_TEXTREL), "{} {} has forbidden dynamic tag {}", row.kind, row.name, entry.tag);

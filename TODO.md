@@ -4194,6 +4194,18 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     dynamic gate remains green on every architecture, including RISC-V four-hart SMP.
     The remaining hostile-input work is malformed symbol, relocation and dependency graph
     metadata beyond these bounded dynamic-table forms.
+  - Malformed symbol and relocation metadata result (M126a, 2026-07-22): package staging
+    now walks the complete bounded dynamic symbol table through the shared ELF parser,
+    closing the prior gap where only runtime loading validated the SysV hash count and
+    every symbol name. `malformed-symbol-relocation-check` independently changes
+    `DT_SYMENT` from 24 to 23, expands the SysV hash symbol count to `u32::MAX`, and
+    changes `DT_PLTRELSZ` from 48 to 47 in staged `dyn_probe`. Package assembly rejects
+    each form before archive output changes, restores the artifact, and reproduces the
+    baseline archive on x86_64, AArch64 and RISC-V. The ProcessService gate applies the
+    same three mutations to in-memory volume entries; each launch fails without a Process
+    capability. Host parser tests pin both metadata-size branches and the bounded hash
+    walk. The remaining hostile-input work is malformed dependency graph metadata and
+    governed command coverage.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

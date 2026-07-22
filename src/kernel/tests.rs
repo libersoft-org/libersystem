@@ -5367,6 +5367,39 @@ fn duplicate_dynamic_singleton(volume: &mut [u8], artifact: &[u8]) {
 	volume[offset..offset + core::mem::size_of::<i64>()].copy_from_slice(&bootproto::elf::DT_STRTAB.to_le_bytes());
 }
 
+fn replace_dynamic_value(volume: &mut [u8], artifact: &[u8], tag: i64, replacement: u64) {
+	let volume_base = volume.as_ptr() as usize;
+	let offset = {
+		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
+		let bytes = archive.lookup(artifact).expect("dynamic metadata test executable is staged");
+		let elf = bootproto::elf::Elf::parse(bytes).expect("dynamic metadata test executable is ELF");
+		let index = elf.dynamic_entries().expect("dynamic metadata test entries parse").expect("dynamic metadata test executable has one dynamic table").enumerate().find_map(|(index, entry)| (entry.tag == tag).then_some(index)).expect("dynamic metadata test finds the requested tag");
+		bytes.as_ptr() as usize - volume_base + dynamic_entry_file_offset(&elf, index) + core::mem::size_of::<i64>()
+	};
+	volume[offset..offset + core::mem::size_of::<u64>()].copy_from_slice(&replacement.to_le_bytes());
+}
+
+fn invalidate_dynamic_symbol_entry_size(volume: &mut [u8], artifact: &[u8]) {
+	replace_dynamic_value(volume, artifact, bootproto::elf::DT_SYMENT, 23);
+}
+
+fn overflow_dynamic_symbol_count(volume: &mut [u8], artifact: &[u8]) {
+	let volume_base = volume.as_ptr() as usize;
+	let offset = {
+		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
+		let bytes = archive.lookup(artifact).expect("dynamic symbol test executable is staged");
+		let elf = bootproto::elf::Elf::parse(bytes).expect("dynamic symbol test executable is ELF");
+		let dynamic = elf.dynamic_info().expect("dynamic symbol test metadata parses").expect("dynamic symbol test executable has PT_DYNAMIC");
+		let hash = elf.virtual_data(dynamic.hash.expect("dynamic symbol test executable has DT_HASH"), 8).expect("dynamic symbol test hash header is file-backed");
+		hash.as_ptr() as usize - volume_base + core::mem::size_of::<u32>()
+	};
+	volume[offset..offset + core::mem::size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+}
+
+fn invalidate_plt_relocation_size(volume: &mut [u8], artifact: &[u8]) {
+	replace_dynamic_value(volume, artifact, bootproto::elf::DT_PLTRELSZ, 47);
+}
+
 fn replace_volume_entry(volume: &mut [u8], destination: &[u8], source: &[u8]) {
 	let volume_base = volume.as_ptr() as usize;
 	let (destination_offset, destination_len, source_bytes) = {
@@ -5505,6 +5538,23 @@ fn dynamic_process_service_rejects_malformed_dynamic_metadata() {
 		assert_eq!(le_u32(&reply.bytes, 0), correlation);
 		assert_eq!(reply.bytes[4], 0, "ProcessService rejects malformed dynamic metadata");
 		assert!(reply.caps.is_empty(), "malformed dynamic metadata creates no process capability");
+	}
+}
+
+tagged_test!(dynamic_process_service_rejects_malformed_symbol_and_relocation_metadata, [Dynamic, DynamicReject, Service, Process, Storage]);
+fn dynamic_process_service_rejects_malformed_symbol_and_relocation_metadata() {
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	for (correlation, mutate) in [
+		(86u32, invalidate_dynamic_symbol_entry_size as fn(&mut [u8], &[u8])),
+		(87, overflow_dynamic_symbol_count as fn(&mut [u8], &[u8])),
+		(88, invalidate_plt_relocation_size as fn(&mut [u8], &[u8])),
+	] {
+		let mut mutated_volume = volume.to_vec();
+		mutate(&mut mutated_volume, b"bin/dyn_probe.lsexe");
+		let reply = launch_from_volume(&mutated_volume, b"dyn_probe", correlation);
+		assert_eq!(le_u32(&reply.bytes, 0), correlation);
+		assert_eq!(reply.bytes[4], 0, "ProcessService rejects malformed symbol or relocation metadata");
+		assert!(reply.caps.is_empty(), "malformed symbol or relocation metadata creates no process capability");
 	}
 }
 

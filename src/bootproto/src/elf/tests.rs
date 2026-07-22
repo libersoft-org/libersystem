@@ -271,6 +271,11 @@ fn sysv_hash_bounds_the_dynamic_symbol_table() {
 	let bad_info = bad_elf.dynamic_info().unwrap().unwrap();
 	assert!(bad_elf.symbols(&bad_info).is_none());
 
+	let mut bad_syment = bytes.clone();
+	let syment_value = payload_offset + dynamic_offset + 3 * core::mem::size_of::<DynamicEntry>() + 8;
+	bad_syment[syment_value..syment_value + 8].copy_from_slice(&23u64.to_le_bytes());
+	assert!(Elf::parse(&bad_syment).unwrap().dynamic_info().is_none());
+
 	let mut bad_name = bytes;
 	bad_name[payload_offset + symbols_offset + core::mem::size_of::<Symbol>()..payload_offset + symbols_offset + core::mem::size_of::<Symbol>() + 4].copy_from_slice(&u32::MAX.to_le_bytes());
 	let bad_name_elf = Elf::parse(&bad_name).unwrap();
@@ -302,6 +307,11 @@ fn plt_rela_metadata_is_complete_and_bounded() {
 	let elf = Elf::parse(&bytes).unwrap();
 	let info = elf.dynamic_info().unwrap().unwrap();
 	assert_eq!(elf.plt_rela_entries(&info).unwrap().collect::<Vec<_>>(), vec![relocation]);
+
+	let mut bad_size = bytes.clone();
+	let size_value = payload_offset + dynamic_offset + core::mem::size_of::<DynamicEntry>() + 8;
+	bad_size[size_value..size_value + 8].copy_from_slice(&23u64.to_le_bytes());
+	assert!(Elf::parse(&bad_size).unwrap().dynamic_info().is_none());
 
 	let mut bad = bytes;
 	let kind_value = payload_offset + dynamic_offset + 2 * core::mem::size_of::<DynamicEntry>() + 8;

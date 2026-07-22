@@ -13,13 +13,13 @@ failure_log=""
 restore_log=""
 
 case "$first" in
-static | undeclared-edge | duplicate-edge | malformed-dynamic)
+static | undeclared-edge | duplicate-edge | malformed-dynamic | malformed-symbol-relocation)
 	kind="$first"
 	mode="${2:-all}"
 	;;
 all | x86_64 | aarch64 | riscv64) mode="$first" ;;
 *)
-	echo "usage: $0 [static|undeclared-edge|duplicate-edge|malformed-dynamic] [all|x86_64|aarch64|riscv64]" >&2
+	echo "usage: $0 [static|undeclared-edge|duplicate-edge|malformed-dynamic|malformed-symbol-relocation] [all|x86_64|aarch64|riscv64]" >&2
 	exit 2
 	;;
 esac
@@ -99,9 +99,39 @@ dynamic_words() {
 	printf '%s %s\n' "$dynamic_offset" "$dynamic_size"
 }
 
+dynamic_value_offset() {
+	local requested_tag="$1"
+	local dynamic_offset dynamic_size word_index
+	local -a words=()
+	read -r dynamic_offset dynamic_size < <(dynamic_words)
+	mapfile -t words < <(od -An -v -tu8 -j "$dynamic_offset" -N "$dynamic_size" "$artifact" | tr -s ' ' '\n' | sed '/^$/d')
+	for ((word_index = 0; word_index + 1 < ${#words[@]}; word_index += 2)); do
+		if [[ "${words[word_index]}" == "$requested_tag" ]]; then
+			printf '%s\n' "$((dynamic_offset + (word_index / 2) * 16 + 8))"
+			return
+		fi
+	done
+	echo "image-injection-check: $mutation found no dynamic tag $requested_tag in $artifact" >&2
+	return 1
+}
+
+virtual_file_offset() {
+	local requested="$1"
+	local file_offset virtual_address file_size
+	while read -r file_offset virtual_address file_size; do
+		if ((requested >= virtual_address && requested < virtual_address + file_size)); then
+			printf '%s\n' "$((file_offset + requested - virtual_address))"
+			return
+		fi
+	done < <(llvm-readelf -lW "$artifact" | awk '$1 == "LOAD" {print $2, $3, $5}')
+	echo "image-injection-check: $mutation virtual address $requested is not file-backed in $artifact" >&2
+	return 1
+}
+
 injection_cases() {
 	case "$kind" in
 	malformed-dynamic) printf '%s\n' duplicate-segment missing-terminator duplicate-singleton ;;
+	malformed-symbol-relocation) printf '%s\n' bad-syment bad-hash-count bad-pltrelsz ;;
 	*) printf '%s\n' "$kind" ;;
 	esac
 }
@@ -200,6 +230,19 @@ inject_artifact() {
 		fi
 		write_u64_le 5 "$target_offset"
 		;;
+	bad-syment)
+		write_u64_le 23 "$(dynamic_value_offset 11)"
+		;;
+	bad-hash-count)
+		local hash_value_offset hash_address hash_file_offset
+		hash_value_offset="$(dynamic_value_offset 4)"
+		hash_address="$(od -An -v -tu8 -j "$hash_value_offset" -N 8 "$artifact" | tr -d ' ')"
+		hash_file_offset="$(virtual_file_offset "$hash_address")"
+		write_u32_le 4294967295 "$((hash_file_offset + 4))"
+		;;
+	bad-pltrelsz)
+		write_u64_le 47 "$(dynamic_value_offset 2)"
+		;;
 	esac
 }
 
@@ -209,6 +252,8 @@ rejection_pattern() {
 	undeclared-edge) printf '%s\n' 'dynamic echo DT_NEEDED providers differ from the manifest' ;;
 	duplicate-edge) printf '%s\n' 'dynamic dyn_probe repeats a DT_NEEDED provider' ;;
 	duplicate-segment | missing-terminator | duplicate-singleton) printf '%s\n' 'dynamic dyn_probe has no valid terminated PT_DYNAMIC' ;;
+	bad-syment | bad-pltrelsz) printf '%s\n' 'dynamic dyn_probe has no valid terminated PT_DYNAMIC' ;;
+	bad-hash-count) printf '%s\n' 'dynamic dyn_probe has malformed dynamic symbols' ;;
 	esac
 }
 
@@ -218,7 +263,7 @@ check_target() {
 	local volume_name="$3"
 	local volume="$root/boot/.build/$volume_name"
 	local artifact_hash before after_failure after_restore
-	if [[ "$kind" == duplicate-edge || "$kind" == malformed-dynamic ]]; then
+	if [[ "$kind" == duplicate-edge || "$kind" == malformed-dynamic || "$kind" == malformed-symbol-relocation ]]; then
 		artifact="$root/user/dyn_probe/shared/$target/dyn_probe"
 	else
 		artifact="$root/user/tools/shared/$target/echo"
@@ -288,7 +333,7 @@ x86_64) check_target x86_64 x86_64-unknown-none volume.pkg ;;
 aarch64) check_target aarch64 aarch64-unknown-none volume-aarch64.pkg ;;
 riscv64) check_target riscv64 riscv64gc-unknown-none-elf volume-riscv64.pkg ;;
 *)
-	echo "usage: $0 [static|undeclared-edge|duplicate-edge|malformed-dynamic] [all|x86_64|aarch64|riscv64]" >&2
+	echo "usage: $0 [static|undeclared-edge|duplicate-edge|malformed-dynamic|malformed-symbol-relocation] [all|x86_64|aarch64|riscv64]" >&2
 	exit 2
 	;;
 esac

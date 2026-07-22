@@ -216,6 +216,13 @@ program header, removes every `DT_NULL` terminator, and duplicates the singleton
 each form before a Process capability is created. The package check restores the artifact
 after every mutation and verifies that no failed form rewrites the system-volume archive.
 
+The malformed symbol and relocation gate sets `DT_SYMENT` to a non-ELF64 size, makes
+the SysV hash symbol count exceed the parser limit, and makes `DT_PLTRELSZ` indivisible
+by the ELF64 RELA entry size. Package staging walks the complete bounded dynamic symbol
+table in addition to relocation records, and ProcessService applies the same parser
+rules before resolver traversal. Each mutation must fail without rewriting the archive
+or creating a Process capability.
+
 ## Measurement and optimization
 
 Dynamic linking is the required `/bin` architecture, not an optional optimization gate.
