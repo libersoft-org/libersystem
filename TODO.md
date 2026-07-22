@@ -4161,6 +4161,28 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     AArch64 and RISC-V all pass this sequence, so a static executable cannot enter
     a staged system volume or leave a failed packaging attempt behind. The remaining
     hostile-input work is undeclared dependency edges.
+  - Undeclared dependency-edge result (M126a, 2026-07-22): the shared image
+    injection harness now also replaces `echo`'s declared `lsrt.lslib` `DT_NEEDED`
+    string with the equally sized, staged but undeclared `wire.lslib` string. Package
+    staging rejects the mismatch with `dynamic echo DT_NEEDED providers differ from the
+    manifest` before it writes any target archive, verifies the original archive hash
+    stayed intact, restores the artifact and reproduces the original hash. x86_64,
+    AArch64 and RISC-V all pass the sequence. The focused ProcessService mutation gate
+    splits absent and staged-but-undeclared provider cases: each returns a failed reply
+    with no Process capability, and the latter is specifically rejected because its
+    identity provider digest chain no longer matches the loaded graph. The remaining
+    hostile-input work is malformed graph metadata beyond the existing bounded parser
+    cases.
+  - Duplicate dependency-edge result (M126a, 2026-07-22): `duplicate-edge-check`
+    now parses the staged `dyn_probe` `PT_DYNAMIC` table, changes only the second
+    `DT_NEEDED` value to the first provider's string-table offset, and preserves the
+    artifact identity record and note. Package staging rejects the repeated provider with
+    `dynamic dyn_probe repeats a DT_NEEDED provider` before it changes the target archive,
+    then restores the executable and confirms the original archive hash on x86_64,
+    AArch64 and RISC-V. The focused ProcessService gate makes the same in-memory volume
+    mutation and receives a failed reply without a Process capability because duplicate
+    dependency names fail before resolver traversal. The remaining hostile-input work is
+    malformed dynamic table forms beyond the existing bounded parser coverage.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

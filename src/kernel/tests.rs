@@ -5274,6 +5274,32 @@ fn replace_dynamic_needed(volume: &mut [u8], artifact: &[u8], expected: &str, re
 	volume[offset..offset + replacement.len()].copy_from_slice(replacement.as_bytes());
 }
 
+fn duplicate_dynamic_needed(volume: &mut [u8], artifact: &[u8]) {
+	let volume_base = volume.as_ptr() as usize;
+	let (offset, replacement) = {
+		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
+		let bytes = archive.lookup(artifact).expect("duplicate edge test executable is staged");
+		let elf = bootproto::elf::Elf::parse(bytes).expect("duplicate edge test executable is ELF");
+		let segment = (0..elf.segment_count())
+			.find_map(|index| {
+				let segment = elf.segment(index)?;
+				(segment.p_type == bootproto::elf::PT_DYNAMIC).then_some(segment)
+			})
+			.expect("duplicate edge test executable has PT_DYNAMIC");
+		let needed: alloc::vec::Vec<(usize, u64)> = elf.dynamic_entries().expect("duplicate edge test dynamic entries parse").expect("duplicate edge test executable has one dynamic table").enumerate().filter_map(|(index, entry)| (entry.tag == bootproto::elf::DT_NEEDED).then_some((index, entry.value))).collect();
+		assert!(needed.len() >= 2, "duplicate edge test executable has two providers");
+		let (_, first_value) = needed[0];
+		let (second_index, second_value) = needed[1];
+		let entry_len = core::mem::size_of::<bootproto::elf::DynamicEntry>();
+		let tag_len = core::mem::size_of::<i64>();
+		let value_offset = usize::try_from(segment.p_offset).expect("duplicate edge dynamic offset fits") + second_index * entry_len + tag_len;
+		assert_eq!(i64::from_le_bytes(bytes[value_offset - tag_len..value_offset].try_into().expect("duplicate edge tag bytes")), bootproto::elf::DT_NEEDED);
+		assert_eq!(u64::from_le_bytes(bytes[value_offset..value_offset + core::mem::size_of::<u64>()].try_into().expect("duplicate edge value bytes")), second_value);
+		(bytes.as_ptr() as usize - volume_base + value_offset, first_value)
+	};
+	volume[offset..offset + core::mem::size_of::<u64>()].copy_from_slice(&replacement.to_le_bytes());
+}
+
 fn replace_volume_entry(volume: &mut [u8], destination: &[u8], source: &[u8]) {
 	let volume_base = volume.as_ptr() as usize;
 	let (destination_offset, destination_len, source_bytes) = {
@@ -5365,17 +5391,37 @@ fn launch_from_volume(volume: &[u8], name: &[u8], correlation: u32) -> object::c
 	reply
 }
 
-tagged_test!(dynamic_process_service_rejects_missing_or_substituted_provider, [Dynamic, DynamicReject, Service, Process, Storage]);
-fn dynamic_process_service_rejects_missing_or_substituted_provider() {
+tagged_test!(dynamic_process_service_rejects_missing_provider, [Dynamic, DynamicReject, Service, Process, Storage]);
+fn dynamic_process_service_rejects_missing_provider() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
-	for (correlation, replacement) in [(78u32, "none.lslib"), (79u32, "wire.lslib")] {
-		let mut mutated_volume = volume.to_vec();
-		replace_dynamic_needed(&mut mutated_volume, b"bin/echo.lsexe", "lsrt.lslib", replacement);
-		let reply = launch_from_volume(&mutated_volume, b"echo", correlation);
-		assert_eq!(le_u32(&reply.bytes, 0), correlation);
-		assert_eq!(reply.bytes[4], 0, "ProcessService rejects {replacement} as echo's direct provider");
-		assert!(reply.caps.is_empty(), "rejected {replacement} provider creates no process capability");
-	}
+	let mut mutated_volume = volume.to_vec();
+	replace_dynamic_needed(&mut mutated_volume, b"bin/echo.lsexe", "lsrt.lslib", "none.lslib");
+	let reply = launch_from_volume(&mutated_volume, b"echo", 78);
+	assert_eq!(le_u32(&reply.bytes, 0), 78);
+	assert_eq!(reply.bytes[4], 0, "ProcessService rejects an absent direct provider");
+	assert!(reply.caps.is_empty(), "an absent provider creates no process capability");
+}
+
+tagged_test!(dynamic_process_service_rejects_undeclared_provider_edge, [Dynamic, DynamicReject, Service, Process, Storage]);
+fn dynamic_process_service_rejects_undeclared_provider_edge() {
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	let mut mutated_volume = volume.to_vec();
+	replace_dynamic_needed(&mut mutated_volume, b"bin/echo.lsexe", "lsrt.lslib", "wire.lslib");
+	let reply = launch_from_volume(&mutated_volume, b"echo", 79);
+	assert_eq!(le_u32(&reply.bytes, 0), 79);
+	assert_eq!(reply.bytes[4], 0, "ProcessService rejects an undeclared provider edge");
+	assert!(reply.caps.is_empty(), "an undeclared provider edge creates no process capability");
+}
+
+tagged_test!(dynamic_process_service_rejects_duplicate_provider_edge, [Dynamic, DynamicReject, Service, Process, Storage]);
+fn dynamic_process_service_rejects_duplicate_provider_edge() {
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	let mut mutated_volume = volume.to_vec();
+	duplicate_dynamic_needed(&mut mutated_volume, b"bin/dyn_probe.lsexe");
+	let reply = launch_from_volume(&mutated_volume, b"dyn_probe", 80);
+	assert_eq!(le_u32(&reply.bytes, 0), 80);
+	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a duplicate provider edge");
+	assert!(reply.caps.is_empty(), "a duplicate provider edge creates no process capability");
 }
 
 tagged_test!(dynamic_process_service_rejects_substituted_identity, [Dynamic, DynamicReject, Service, Process, Storage]);

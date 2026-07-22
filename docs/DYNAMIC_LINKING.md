@@ -198,6 +198,18 @@ ELF type to `ET_EXEC` on every supported target. The kernel package build must r
 that artifact before rewriting the target's system-volume archive; the gate then
 restores the original bytes and verifies the prior archive hash returns unchanged.
 
+The package-stage undeclared-edge gate similarly replaces an executable's declared
+`lsrt.lslib` `DT_NEEDED` entry with the staged but undeclared `wire.lslib` entry.
+The exact manifest comparison must reject it before archive output changes. At runtime,
+ProcessService separately rejects the same mutated edge because the executable identity
+record's provider digest chain does not match the resolved graph, and it returns no
+Process capability.
+
+The duplicate-edge gate changes a second `DT_NEEDED` value to the first provider's
+string-table offset without altering the identity record or note. Package staging rejects
+the repeated provider before archive output changes, while ProcessService rejects the
+duplicate dependency name before resolving or loading modules.
+
 ## Measurement and optimization
 
 Dynamic linking is the required `/bin` architecture, not an optional optimization gate.
