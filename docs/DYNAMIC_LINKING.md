@@ -247,6 +247,18 @@ answers its typed `network.info` request, verifies the complete rendered stdout 
 exit, and requires an audit containing only the network grant. Existing focused scenarios
 cover the runtime/inventory, storage/path, query/admin and multimedia waves.
 
+`docs/DYNAMIC_EXECUTABLES.tsv` is the checked inventory of all dynamic command waves on
+x86_64, AArch64 and RISC-V. Each row records the linked ELF's complete undefined import
+set, manifest-declared providers, independently parsed `DT_NEEDED` set, canonical
+transitive provider order, stripped PIE bytes, private image bytes and governed test
+command. Private image bytes are the page-rounded writable `PT_LOAD` ranges of the
+executable plus every provider in its closure, matching the loader's private-frame rule;
+immutable ranges are shared and therefore excluded. `just dynamic-report-check` rebuilds
+the three target graphs and requires the report to reproduce byte for byte. It also fails
+if the five wave lists do not partition the manifest's tool inventory exactly, a direct
+provider differs from `DT_NEEDED`, a sidecar omits a root, or an artifact/provider is
+missing. `just dynamic-report-update` is the explicit regeneration command.
+
 ## Measurement and optimization
 
 Dynamic linking is the required `/bin` architecture, not an optional optimization gate.

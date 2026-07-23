@@ -4240,6 +4240,20 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     query/admin and multimedia scenarios, every migration wave now has a governed runnable
     representative. The remaining M126a reporting work is the checked per-wave source/import,
     provider, size and test-command report.
+  - Checked wave-report result (M126a, 2026-07-23): `docs/DYNAMIC_EXECUTABLES.tsv`
+    contains one deterministic row for every 48-tool x three-target combination, grouped
+    into the exact five migration waves. Each row lists all undefined ELF imports,
+    manifest-declared direct providers, independently parsed `DT_NEEDED`, canonical
+    transitive providers, stripped PIE bytes, page-rounded private writable bytes across
+    the executable and its provider closure, and the governed test command. The checker
+    requires the wave inventory to partition the manifest tools exactly and fails on
+    missing artifacts/providers, direct-edge drift, duplicate or incomplete order
+    sidecars, malformed row counts or any byte difference from the checked report.
+    `dynamic-report-check` verifies the report after building all three graphs, while
+    `dynamic-report-update` is the explicit regeneration path. The initial report is
+    144 data rows with 10 fields each and reproduces byte for byte on an immediate check.
+    Remaining M126a work is atomization/source-ownership completion and the broader
+    size/sharing/startup acceptance gates, not wave inventory reproducibility.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,
