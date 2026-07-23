@@ -171,7 +171,6 @@ object_tool_digest="$(sha256sum "$root/tools/build-consumer-object.sh" | awk '{p
 library_file() {
 	case "$1" in
 	lsrt) printf 'user/rt/shared/%s/lsrt.lslib' "$target" ;;
-	proto) printf 'proto/shared/%s/proto.lslib' "$target" ;;
 	wire) printf 'wire/shared/%s/wire.lslib' "$target" ;;
 	audio-client) printf 'user/audio-client-provider/shared/%s/audio-client.lslib' "$target" ;;
 	config-client) printf 'user/config-client-provider/shared/%s/config-client.lslib' "$target" ;;
@@ -1475,7 +1474,7 @@ if [[ -n "$image_graph" ]]; then
 					echo "build-shared: volume does not import concrete volume symbol $method" >&2
 					exit 1
 				fi
-				done
+			done
 			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_storage_' <<<"$consumer_imports"; then
 				echo "build-shared: volume bypasses the concrete volume client provider" >&2
 				exit 1
@@ -1569,12 +1568,12 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	mkdir -p "$probe_dir"
 	probe_source_sha="$(source_digest "$probe")"
 	probe_expected_identity="$probe_out.identity.$$.expected"
-	write_identity_record executable dyn_probe dyn_probe "$probe_source_sha" - "pix proto lsrt" "$probe_expected_identity"
-	probe_expected_needed="$(printf '%s\n' pix.lslib proto.lslib lsrt.lslib | sort -u)"
+	write_identity_record executable dyn_probe dyn_probe "$probe_source_sha" - "pix lsrt" "$probe_expected_identity"
+	probe_expected_needed="$(printf '%s\n' pix.lslib lsrt.lslib | sort -u)"
 	probe_expected_order="$probe_out.order.$$.expected"
-	canonical_provider_order "pix proto lsrt" >"$probe_expected_order"
-	audit_provider_export_ownership "pix proto lsrt"
-	probe_cache_key="$(artifact_cache_key executable "dynamic dyn_probe dyn_probe volume pix proto lsrt" "$probe_expected_identity" "cargo=$image_target_config_value")"
+	canonical_provider_order "pix lsrt" >"$probe_expected_order"
+	audit_provider_export_ownership "pix lsrt"
+	probe_cache_key="$(artifact_cache_key executable "dynamic dyn_probe dyn_probe volume pix lsrt" "$probe_expected_identity" "cargo=$image_target_config_value")"
 	probe_cache_prefix="$artifact_cache_dir/executable-dyn_probe"
 	if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$probe_out" "$probe_cache_prefix" "$probe_cache_key" "$probe_expected_identity" "$probe_expected_needed" && [[ -f "$probe_out.order" ]] && cmp -s "$probe_expected_order" "$probe_out.order"; then
 		echo "build-shared: executable cache hit dyn_probe"
@@ -1584,13 +1583,13 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	echo "build-shared: executable cache miss dyn_probe"
 	(cd "$probe" && RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
 	probe_rlib="$(find "$probe/target/$target/release/deps" -maxdepth 1 -name 'libdyn_probe-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
-	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv -e _start --whole-archive "$probe_rlib" --no-whole-archive "$(library_file pix)" "$(library_file proto)" "$(library_file lsrt)" --no-allow-shlib-undefined -o "$probe_out"
+	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv -e _start --whole-archive "$probe_rlib" --no-whole-archive "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined -o "$probe_out"
 	llvm-strip --strip-debug "$probe_out"
 	if ! llvm-readelf -h "$probe_out" | grep -q 'Type:.*DYN' || ! llvm-readelf -d "$probe_out" | grep -q 'NEEDED.*pix.lslib'; then
 		echo "build-shared: $probe_out is not a pix.lslib-linked ET_DYN" >&2
 		exit 1
 	fi
-	emit_identity executable dyn_probe dyn_probe "$probe_source_sha" - "pix proto lsrt" "$probe_out"
+	emit_identity executable dyn_probe dyn_probe "$probe_source_sha" - "pix lsrt" "$probe_out"
 	mv "$probe_expected_order" "$probe_out.order"
 	record_artifact_cache "$probe_out" "$probe_cache_prefix" "$probe_cache_key"
 	rm -f "$probe_expected_identity"

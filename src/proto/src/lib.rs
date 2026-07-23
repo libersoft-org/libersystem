@@ -11,13 +11,6 @@
 
 extern crate alloc;
 
-// Image-internal dynamic-link smoke symbol. Like the generated Rust ABI around it,
-// this is rebuilt with the complete system image and carries no cross-image promise.
-#[unsafe(no_mangle)]
-pub extern "C" fn liber_proto_probe() -> u64 {
-	0x5052_4f54_4f4f_4b21
-}
-
 pub use wire as codec;
 pub mod generated;
 pub mod system;
@@ -25,12 +18,7 @@ pub mod system;
 pub use network_proto::addr;
 pub use time_proto::clock;
 
-// Hand-written `vol://` path resolution shared by the shell and the sandboxed tools.
-pub mod path;
-
-// The shell's pure line language (trim, flag normalization, `$NAME` expansion, and
-// `NAME=VALUE` detection) - host-tested so it is exercised without booting.
-pub mod shell;
+pub use storage_proto::path;
 
 #[cfg(test)]
 mod tests;

@@ -14,9 +14,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use keys::usage;
 use pix::{Image, Rect, Target};
-use proto::path;
 use proto::system::{OpenOpts, input};
 use rt::*;
+use storage_proto::path;
 use volume_client::VolumeClient;
 
 const USAGE: &[u8] = b"Usage: imgview <image>\nDisplays a still image or composited animation frame 0; animation playback is not supported.\n";

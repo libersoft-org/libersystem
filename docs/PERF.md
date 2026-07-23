@@ -277,14 +277,15 @@ The profile win is already two orders of magnitude, so a stripped/release staged
 profile should be measured before paying the loader/ABI cost of dynamic linking. Later
 shared-library work still measures aggregate image and resident-memory sharing: static release binaries may
 remain the better choice for small tools, while duplicated runtime/protocol text across
-many concurrent processes can still justify `lsrt.lslib`/`proto.lslib` sharing.
+many concurrent processes can still justify `lsrt.lslib` and package-specific protocol
+provider sharing.
 
 ## System-image dynamic linking (2026-07-14)
 
 The system image uses an eager ELF64 module loader and an image-internal shared build. The bare-metal
 Rust targets support neither Cargo `dylib` nor `cdylib`, so the reproducible builder emits
 full-graph PIC rlibs and links their object members with the pinned `rust-lld -shared`.
-The x86 KVM integration launches an assembly-only staged `dyn_probe` through the real
+The original x86 KVM integration launched an assembly-only staged `dyn_probe` through the real
 StorageService and ProcessService. ProcessService reads its `DT_NEEDED` DAG
 (`pix.lslib`, `proto.lslib`, `lsrt.lslib`), the kernel eagerly applies RELA/PLT symbol
 relocations, and the probe calls exports from both leaf providers before its first IPC.

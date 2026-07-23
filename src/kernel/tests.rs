@@ -4661,7 +4661,7 @@ fn system_packages_use_canonical_executable_names() {
 		library_identities += usize::from(name.starts_with(b"id/lib/"));
 		executable_identities += usize::from(name.starts_with(b"id/bin/"));
 	}
-	assert_eq!(library_identities, 61, "every staged library has one identity record");
+	assert_eq!(library_identities, 60, "every staged library has one identity record");
 	assert_eq!(executable_identities, 68, "every staged dynamic executable has one identity record");
 	assert!(volume.lookup(b"id/lib/imgconv").is_some(), "library identity namespace preserves imgconv");
 	assert!(volume.lookup(b"id/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");
@@ -5353,26 +5353,26 @@ fn dynamic_wave_launch_metrics_are_structurally_sound() {
 	#[cfg(target_arch = "x86_64")]
 	let representatives = [
 		(1u8, b"echo" as &[u8], 100u32, 14usize, 80usize),
-		(2, b"cat" as &[u8], 102, 22, 107),
+		(2, b"cat" as &[u8], 102, 22, 104),
 		(3, b"date" as &[u8], 104, 21, 93),
 		(4, b"ip" as &[u8], 106, 21, 106),
-		(5, b"imgconv" as &[u8], 108, 46, 370),
+		(5, b"imgconv" as &[u8], 108, 46, 367),
 	];
 	#[cfg(target_arch = "aarch64")]
 	let representatives = [
 		(1u8, b"echo" as &[u8], 100u32, 14usize, 88usize),
-		(2, b"cat" as &[u8], 102, 29, 117),
+		(2, b"cat" as &[u8], 102, 26, 115),
 		(3, b"date" as &[u8], 104, 25, 103),
 		(4, b"ip" as &[u8], 106, 26, 116),
-		(5, b"imgconv" as &[u8], 108, 71, 387),
+		(5, b"imgconv" as &[u8], 108, 68, 385),
 	];
 	#[cfg(target_arch = "riscv64")]
 	let representatives = [
 		(1u8, b"echo" as &[u8], 100u32, 14usize, 72usize),
-		(2, b"cat" as &[u8], 102, 27, 97),
+		(2, b"cat" as &[u8], 102, 25, 94),
 		(3, b"date" as &[u8], 104, 25, 85),
 		(4, b"ip" as &[u8], 106, 25, 96),
-		(5, b"imgconv" as &[u8], 108, 67, 290),
+		(5, b"imgconv" as &[u8], 108, 65, 287),
 	];
 	for (wave, name, correlation, private_pages, shared_pages) in representatives {
 		measure_dynamic_wave_launch(&process_client, wave, name, correlation, private_pages, shared_pages);
@@ -6261,7 +6261,7 @@ tagged_test!(du_reports_a_directory_tree_size, [Service, Storage, Shell]);
 fn du_reports_a_directory_tree_size() {
 	// The provider-aware ProcessService scenario above executes du against a live tree.
 	// Keep this independently tagged test as the package contract: du must now be a PIE
-	// with the four direct providers required by its recursive alloc/proto traversal.
+	// with the direct providers required by its recursive allocation and storage traversal.
 	let (volume, package) = scenario_packages().expect("scenario packages");
 	let du_elf = program_elf(&package, volume, b"du").expect("du in the package or volume");
 	let elf = bootproto::elf::Elf::parse(du_elf).expect("du is ELF");
@@ -6269,7 +6269,7 @@ fn du_reports_a_directory_tree_size() {
 	let dynamic = elf.dynamic_info().expect("du dynamic metadata parses").expect("du has PT_DYNAMIC");
 	let mut needed = elf.needed_names(&dynamic).expect("du dependencies parse").collect::<alloc::vec::Vec<_>>();
 	needed.sort_unstable();
-	assert_eq!(needed, alloc::vec!["lsrt.lslib", "proto.lslib", "storage-proto.lslib", "volume-client.lslib", "wire.lslib"]);
+	assert_eq!(needed, alloc::vec!["lsrt.lslib", "storage-proto.lslib", "volume-client.lslib", "wire.lslib"]);
 }
 
 fn assert_dynamic_inventory_providers(name: &[u8], expected: &[&str]) {

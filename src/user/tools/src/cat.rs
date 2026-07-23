@@ -16,9 +16,9 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::path;
 use proto::system::OpenOpts;
 use rt::*;
+use storage_proto::path;
 use volume_client::VolumeClient;
 
 #[unsafe(no_mangle)]

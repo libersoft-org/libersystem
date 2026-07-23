@@ -19,11 +19,11 @@ intrinsics may change in the next image without compatibility shims.
 - System-library filenames follow the central [artifact filename
   conventions](PACKAGE_FORMAT.md#artifact-filename-conventions): they use the
   LiberSystem-specific `.lslib` suffix and no Unix `lib` prefix, for example
-  `png.lslib`, `proto.lslib`, and `lsrt.lslib`.
+  `png.lslib`, `storage-proto.lslib`, and `lsrt.lslib`.
 - Library crates also use prefix-free owner directories. A normal leaf lives at
   `src/user/<name>/`, and its generated objects stay with that owner under
   `src/user/<name>/shared/<target>/<name>.lslib`. The runtime and generated protocol
-  providers use the equivalent `src/user/rt/shared/` and `src/proto/shared/` paths.
+  providers use equivalent owner-specific `src/user/<name>/shared/` paths.
   The system image still installs all of them into the flat, resolver-owned
   `vol://system/lib/` namespace.
 - Resolution is eager and deterministic. Lazy PLT binding, `LD_PRELOAD`, environment
@@ -61,11 +61,11 @@ implementation thunks. Network address parsing/rendering lives with `network-pro
 timestamp rendering with `time-proto`, because inherent methods must be defined by the
 crate that owns their generated type.
 
-`proto.lslib` is no longer a generated-protocol monolith. It is a small compatibility
-provider that reexports all package crates and retains only the hand-written path and
-shell helpers plus its image probe. It directly needs only `lsrt.lslib`. `wire` remains
-available as `proto::codec` for source compatibility. Leaf rlibs are archive linked
-against their explicit provider set.
+The `proto` Rust crate remains a compile-time compatibility facade that reexports all
+package crates. It emits no runtime provider. `wire` remains available as `proto::codec`
+and storage path resolution as `proto::path` for source compatibility. The path
+implementation and runtime symbols belong to `storage-proto`; shell parsing belongs to
+`service-util`. Leaf rlibs are archive linked against their explicit provider set.
 
 `lsidl-gen` resolves the complete input graph for validation and documentation, then may
 emit selected Rust packages into separate crate roots. An external-package map replaces
@@ -97,8 +97,8 @@ that the loader contract recognizes are:
 | riscv64 | `R_RISCV_RELATIVE` (3) | `R_RISCV_64` (2), `R_RISCV_JUMP_SLOT` (5) |
 
 `lsrt.lslib` is the root symbol provider. In addition to the runtime API it owns compiler
-support exports such as `memcpy`, `memset`, and the pinned core panic paths. `proto.lslib`
-depends on `lsrt.lslib`; higher leaves depend only on their declared lower libraries.
+support exports such as `memcpy`, `memset`, and the pinned core panic paths. Higher leaves
+depend only on their declared lower libraries.
 Cycles are rejected by the image builder and by ProcessService.
 
 The production executable graph must compile providers and consumers with one pinned
@@ -189,8 +189,8 @@ COPY and architecture-specific forms outside this list, rejects the artifact bef
 it reaches the system volume.
 
 The focused dynamic-link gate launches the staged `dyn_probe` through
-ProcessService and requires its `pix.lslib -> proto.lslib -> lsrt.lslib` dependency
-DAG to load, relocate and report successfully. It also mutates `echo.lsexe` in an
+ProcessService and requires its `pix.lslib -> lsrt.lslib` dependency DAG to load,
+relocate and report successfully. It also mutates `echo.lsexe` in an
 in-memory system-volume snapshot: replacing its `lsrt.lslib` dependency with either
 the absent `none.lslib` or the staged but incompatible `wire.lslib` must return a
 failed launch reply with no Process capability. The same gate rejects a drifted

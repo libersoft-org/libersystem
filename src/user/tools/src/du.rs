@@ -27,9 +27,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::codec::JsonMode;
-use proto::path;
 use proto::system::{FileInfo, FileType, volume};
 use rt::*;
+use storage_proto::path;
 use volume_client::VolumeClient;
 
 const USAGE: &[u8] = b"usage: du [-s] [-h] [json | json-min] [path]

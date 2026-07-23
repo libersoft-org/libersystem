@@ -4,3 +4,4 @@ extern crate alloc;
 
 pub use wire as codec;
 pub mod generated;
+pub mod path;

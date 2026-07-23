@@ -4419,6 +4419,20 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     drivers/device, process, shell and storage/package suites pass 9/9, 20/20, 46/46,
     14/14 and 31/31. Generated package atomization is complete; only the helper-only
     compatibility boundary remains for a separate ownership decision.
+  - Helper compatibility-provider removal result (M126a, 2026-07-23): the final runtime
+    `proto.lslib` is removed. `storage-proto.lslib` now owns `vol://` path resolution,
+    while `service-util.lslib` owns shell trimming, expansion, assignment parsing and
+    flag normalization. The `proto` Rust crate remains only as a compile-time reexport
+    facade and emits no provider or probe symbol. All path consumers name
+    `storage-proto` directly, and `dyn_probe` now validates `pix.lslib -> lsrt.lslib`.
+    Each architecture contains 60 providers. On x86_64/AArch64/RISC-V,
+    `storage-proto.lslib` is 61,664/71,984/62,048 bytes and `dyn_probe` is
+    2,520/2,616/2,960 bytes. Exact-edge builds pass all 60 providers and 67 dynamic
+    executables on every target with no unresolved, duplicate or undeclared runtime
+    edge. The checked report covers 48 tools across all three targets and 15 waves.
+    Dynamic runtime coverage passes 21/21 on x86_64, AArch64 and RISC-V. A combined
+    x86 shell/storage gate passes 36/36, including path resolution, cross-volume image
+    conversion, package staging, PTY and shell workflows.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

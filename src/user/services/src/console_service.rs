@@ -763,7 +763,7 @@ unsafe fn path_vocab(console: &mut Console, fg: usize, tok_start: usize) -> Vec<
 			Some(s) => &token[..s],
 			None => b"",
 		};
-		let target: String = match proto::path::resolve(&cwd, dir_arg) {
+		let target: String = match storage_proto::path::resolve(&cwd, dir_arg) {
 			Some(t) => t,
 			None => return Vec::new(),
 		};

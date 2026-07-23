@@ -14,10 +14,6 @@ _start:
 	mov rcx, 0x4c49425049584f4b
 	cmp rax, rcx
 	jne 1f
-	call liber_proto_probe
-	mov rcx, 0x50524f544f4f4b21
-	cmp rax, rcx
-	jne 1f
 	mov rdi, r12
 	lea rsi, [rip + .Lsuccess]
 	mov rdx, 15
@@ -49,13 +45,6 @@ _start:
 	movk x1, #0x4c49, lsl #48
 	cmp x0, x1
 	b.ne 1f
-	bl liber_proto_probe
-	movz x1, #0x4b21
-	movk x1, #0x4f4f, lsl #16
-	movk x1, #0x4f54, lsl #32
-	movk x1, #0x5052, lsl #48
-	cmp x0, x1
-	b.ne 1f
 	mov x0, x19
 	adr x1, .Lsuccess
 	mov x2, #15
@@ -82,9 +71,6 @@ _start:
 	mv s0, a0
 	call liber_pix_probe
 	li t0, 0x4c49425049584f4b
-	bne a0, t0, 1f
-	call liber_proto_probe
-	li t0, 0x50524f544f4f4b21
 	bne a0, t0, 1f
 	mv a0, s0
 	lla a1, .Lsuccess

@@ -685,6 +685,7 @@ dependencies = [
  "rt",
  "security-client",
  "security-client-provider",
+ "storage-proto",
  "surface",
  "time-client",
  "time-client-provider",

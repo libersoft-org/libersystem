@@ -16,11 +16,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
-use proto::path;
-use proto::shell::{parse_and_expand, parse_assignment, trim};
 use proto::system::{Component, EnvVar, JobEntry, JobInfo, TraceSpan, input, network, permission, process, session, system_graph, volume};
 use rt::*;
 use services::executable;
+use services::shell_language::{parse_and_expand, parse_assignment, trim};
+use storage_proto::path;
 
 // The shell's builtins, shared with ConsoleService's line discipline: Tab completes the
 // command word over the builtins plus the live bin/ listing, and the shell prints the

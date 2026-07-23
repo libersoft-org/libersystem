@@ -10,7 +10,7 @@ description = "Core userspace system services (ServiceManager, ...)"
 
 [features]
 default = []
-shared-image = ["ipc-client/shared-image", "proto/shared-image", "rt/shared-image"]
+shared-image = ["ipc-client/shared-image", "proto/shared-image", "rt/shared-image", "storage-proto/shared-image"]
 
 [[bin]]
 name = "service_manager"
@@ -117,6 +117,7 @@ rt = { path = "../rt" }
 # Generated LSIDL bindings (the proto codec, clients, and servers) - LogService
 # serves them and the shell + ServiceManager speak them over the log channel.
 proto = { path = "../../proto" }
+storage-proto = { path = "../storage-proto" }
 bootproto = { path = "../../bootproto" }
 abi = { path = "../../abi" }
 

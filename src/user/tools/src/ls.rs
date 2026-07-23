@@ -31,9 +31,9 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::codec::JsonMode;
-use proto::path;
 use proto::system::{FileInfo, FileType, Timestamp, volume};
 use rt::*;
+use storage_proto::path;
 use volume_client::VolumeClient;
 
 // What the listing is ordered by; directories group first under every key but None.
