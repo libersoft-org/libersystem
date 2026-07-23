@@ -44,11 +44,14 @@ declare -A object_bytes_cache=()
 declare -A provider_size_cache=()
 declare -A provider_private_cache=()
 declare -A provider_shared_cache=()
+declare -A provider_exports=()
+declare -A generic_residual_tools=()
 for tool in echo uname uptime dmesg free lscpu lsmem lsirq lspci ptyecho readln script; do waves[$tool]=1; done
 for tool in cat write rm ls du mkdir rmdir snap volume lsvol lsblk; do waves[$tool]=2; done
 for tool in date log config set lsdev lsusb lssvc usage ps run perm stop beep; do waves[$tool]=3; done
 for tool in ping ip nslookup tcp nc arp httpd ss; do waves[$tool]=4; done
 for tool in imgview imgconv play graphics_probe; do waves[$tool]=5; done
+for tool in du imgconv imgview ls lsblk lsvol snap volume; do generic_residual_tools[$tool]=1; done
 tests[1]='just test-tags service,process,storage'
 tests[2]='just test-tags service,process,storage'
 tests[3]='just test-tags service,process,storage'
@@ -208,8 +211,68 @@ provider_metrics() {
 		provider_size_cache[$key]="$(stat -c %s "$provider_file")"
 		provider_private_cache[$key]="$(writable_load_bytes "$provider_file")"
 		provider_shared_cache[$key]="$(immutable_load_bytes "$provider_file")"
+		while IFS= read -r symbol; do
+			[[ -n "$symbol" ]] || continue
+			provider_exports["$target|$symbol"]+="$provider "
+		done < <(llvm-readelf --dyn-syms -W "$provider_file" | awk '$7 != "UND" && ($5 == "GLOBAL" || $5 == "WEAK") && ($4 == "NOTYPE" || $4 == "OBJECT" || $4 == "FUNC") && ($6 == "DEFAULT" || $6 == "PROTECTED") && $8 != "" {print $8}' | sort -u)
 	fi
 	printf '%s %s %s\n' "${provider_size_cache[$key]}" "${provider_private_cache[$key]}" "${provider_shared_cache[$key]}"
+}
+
+resolve_import_owners() {
+	local target="$1"
+	local tool="$2"
+	local imports="$3"
+	local transitive="$4"
+	local import provider owners count owner residuals="" residual_count=0 transport_residual=0 writer_residual=0
+	local -A closure=()
+	local -a import_list=()
+	while IFS= read -r provider; do closure["${provider%.lslib}"]=1; done <<<"$transitive"
+	local result=""
+	IFS=',' read -r -a import_list <<<"$imports"
+	for import in "${import_list[@]}"; do
+		[[ -n "$import" && "$import" != - ]] || continue
+		owners="${provider_exports["$target|$import"]:-}"
+		count=0
+		owner=""
+		for provider in $owners; do
+			if [[ -n "${closure[$provider]:-}" ]]; then
+				count=$((count + 1))
+				owner="$provider"
+			fi
+		done
+		[[ "$count" == 1 ]] || {
+			echo "dynamic-report: $target $tool import $import has $count owners in its provider closure" >&2
+			return 1
+		}
+		if [[ -n "$result" ]]; then result+=","; fi
+		result+="$import=$owner"
+		if [[ "$import" =~ liber_channel_impl_|ChannelClient ]]; then
+			echo "dynamic-report: $target $tool imports private generated client implementation $import" >&2
+			return 1
+		fi
+		if [[ "$import" =~ ChannelTransport|VecWriter ]]; then
+			[[ -n "${generic_residual_tools[$tool]:-}" && ("$owner" == ipc-client || "$owner" == wire) ]] || {
+				echo "dynamic-report: $target $tool has an unapproved generic transport residual $import=$owner" >&2
+				return 1
+			}
+			if [[ -n "$residuals" ]]; then residuals+=","; fi
+			residuals+="$import=$owner"
+			residual_count=$((residual_count + 1))
+			if [[ "$import" =~ ChannelTransport.*Transport4call && "$owner" == ipc-client ]]; then transport_residual=1; fi
+			if [[ "$import" =~ VecWriter.*Sink3put && "$owner" == wire ]]; then writer_residual=1; fi
+		fi
+	done
+	if [[ -n "${generic_residual_tools[$tool]:-}" ]]; then
+		[[ "$residual_count" == 2 && "$transport_residual" == 1 && "$writer_residual" == 1 ]] || {
+			echo "dynamic-report: $target $tool generic residual baseline differs" >&2
+			return 1
+		}
+	elif [[ "$residual_count" != 0 ]]; then
+		echo "dynamic-report: $target $tool unexpectedly carries generic residuals" >&2
+		return 1
+	fi
+	printf '%s\t%s\n' "${result:--}" "${residuals:--}"
 }
 
 preload_metrics() {
@@ -227,9 +290,9 @@ join_lines() {
 }
 
 generate_report() {
-	printf 'format=liber-dynamic-executable-report-v3\n'
-	printf 'wave\ttarget\ttool\tundefined_imports\tdeclared_providers\tdt_needed\ttransitive_providers\tobject_bytes\tpie_bytes\tprovider_bytes\tprivate_bytes\tshared_bytes\ttest_command\n'
-	local target wave key provider_key image_provider_key tool candidate row providers artifact order imports actual_needed declared transitive expected_transitive object_bytes pie_bytes provider_bytes private_bytes shared_bytes provider provider_size provider_private provider_shared
+	printf 'format=liber-dynamic-executable-report-v4\n'
+	printf 'wave\ttarget\ttool\tundefined_imports\timport_owners\tgeneric_residuals\tdeclared_providers\tdt_needed\ttransitive_providers\tobject_bytes\tpie_bytes\tprovider_bytes\tprivate_bytes\tshared_bytes\ttest_command\n'
+	local target wave key provider_key image_provider_key tool candidate row providers artifact order imports import_owners generic_residuals owner_record actual_needed declared transitive expected_transitive object_bytes pie_bytes provider_bytes private_bytes shared_bytes provider provider_size provider_private provider_shared
 	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
 		for wave in 1 2 3 4 5; do
 			key="$target|$wave"
@@ -256,6 +319,9 @@ generate_report() {
 					diff -u <(printf '%s\n' "$expected_transitive") <(printf '%s\n' "$transitive") >&2 || true
 					return 1
 				fi
+				owner_record="$(resolve_import_owners "$target" "$tool" "$imports" "$transitive")"
+				import_owners="${owner_record%%$'\t'*}"
+				generic_residuals="${owner_record#*$'\t'}"
 				pie_bytes="$(stat -c %s "$artifact")"
 				object_bytes="$(current_object_bytes "$target" "$tool")"
 				provider_bytes=0
@@ -290,7 +356,7 @@ generate_report() {
 				image_pie_bytes[$target]=$((${image_pie_bytes[$target]:-0} + pie_bytes))
 				image_private_bytes[$target]=$((${image_private_bytes[$target]:-0} + private_bytes))
 				image_shared_executable_bytes[$target]=$((${image_shared_executable_bytes[$target]:-0} + $(immutable_load_bytes "$artifact")))
-				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$wave" "$target" "$tool" "$imports" "$(join_lines <<<"$declared")" "$(join_lines <<<"$actual_needed")" "$(join_lines <<<"$transitive")" "$object_bytes" "$pie_bytes" "$provider_bytes" "$private_bytes" "$shared_bytes" "${tests[$wave]}"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$wave" "$target" "$tool" "$imports" "$import_owners" "$generic_residuals" "$(join_lines <<<"$declared")" "$(join_lines <<<"$actual_needed")" "$(join_lines <<<"$transitive")" "$object_bytes" "$pie_bytes" "$provider_bytes" "$private_bytes" "$shared_bytes" "${tests[$wave]}"
 			done
 		done
 	done

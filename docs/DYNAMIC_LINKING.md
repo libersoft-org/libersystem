@@ -270,6 +270,20 @@ objects may coexist without ambiguity. `docs/DYNAMIC_IMAGE.tsv` sums all 48 curr
 objects and PIE files per target, adds each provider file exactly once, and checks that
 staged bytes equal PIE plus unique-provider bytes.
 
+The detailed report also maps every undefined executable import to exactly one
+loader-visible owner in that executable's canonical provider closure. The checker indexes
+defined global or weak `NOTYPE`, `OBJECT` and `FUNC` exports with default or protected
+visibility, matching the loader and linker ownership rules. Zero or multiple closure
+owners fail the report even on a warm artifact hit. Private generated implementation
+symbols and `ChannelClient` are forbidden in every `/bin` object.
+
+The remaining generic transport debt is explicit and bounded: `du`, `ls`, `lsblk`,
+`lsvol`, `snap`, `volume`, `imgconv` and `imgview` each retain exactly one
+`ChannelTransport::call` owned by `ipc-client.lslib` and one `VecWriter::put` owned by
+`wire.lslib`. No other tool may carry either family, and the approved tools may not add a
+third residual. This checked baseline prevents spread while their remaining storage
+methods move behind concrete provider APIs; it is not treated as completed atomization.
+
 Physical sharing is pinned across different executable graphs, not only repeated launches
 of one binary. Canonical provider order places `volume-client.lslib` in slot 4 for both
 `cat` and `write`, and `jpeg.lslib` in slot 5 for both `imgconv` and `imgview` on every

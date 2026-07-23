@@ -4292,6 +4292,19 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     x86 pass retains 46/46 provider and 67/67 executable hits with no object misses.
     Remaining M126a work is atomization/source-ownership completion and any literal
     hostile-input requirements not already covered, not size/sharing/startup accounting.
+  - Import ownership audit result (M126a, 2026-07-23): the checked detailed report now
+    records `symbol=provider` for every undefined import in all 144 tool/target objects.
+    It independently indexes loader-visible provider exports and rejects zero or multiple
+    owners inside the executable's canonical closure, including on warm cache hits. Every
+    row has exactly as many owner records as imports; representative mappings bind runtime
+    symbols to `lsrt`, concrete domain calls to their domain-client provider and codec
+    helpers to their owning leaf. Private `liber_channel_impl_*` and `ChannelClient`
+    imports are forbidden globally. The remaining generic debt is hard-bounded to eight
+    tools (`du`, `ls`, `lsblk`, `lsvol`, `snap`, `volume`, `imgconv`, `imgview`), each with
+    exactly one `ChannelTransport::call` owned by `ipc-client` and one `VecWriter::put`
+    owned by `wire` on every target; no other tool or third residual is accepted. The
+    source/import ownership audit is complete, while the generic-client checklist remains
+    open until those storage methods cross concrete provider APIs.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,
