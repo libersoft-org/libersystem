@@ -4,7 +4,7 @@ pub use base_proto::generated::liber::base;
 pub mod config;
 pub mod device;
 pub mod display;
-pub mod input;
+pub use input_proto::generated::liber::input;
 pub mod log;
 pub mod network;
 pub mod observability;

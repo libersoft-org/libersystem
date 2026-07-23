@@ -1,0 +1,14 @@
+[package]
+name = "input-proto"
+edition = "2024"
+description = "Generated LSIDL input bindings for LiberSystem"
+
+[features]
+default = []
+channel-client-impl = ["dep:ipc-client"]
+shared-image = ["channel-client-impl", "ipc-client/shared-image"]
+
+[dependencies]
+base-proto = { path = "../base-proto" }
+wire = { path = "../../wire" }
+ipc-client = { path = "../ipc-client", optional = true }

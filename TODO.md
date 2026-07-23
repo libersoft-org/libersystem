@@ -4335,6 +4335,18 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     coverage passes 21/21 on each target and focused x86 service/process/storage/image/
     audio behavior passes 71/71. Other generated domains remain in the compatibility
     provider and are the next atomization work.
+  - Generated input-package split result (M126a, 2026-07-23): `input-proto.lslib`
+    (18,528/21,448/20,600 bytes) now exclusively owns `liber:input@1` types, stream
+    helpers and concrete channel implementation thunks. The compatibility provider
+    reexports that package and shrinks to 310,112/359,688/321,624 bytes. `input_service`
+    removes its monolithic protocol dependency and directly needs only `keys`,
+    `input-proto`, `wire` and `lsrt`; `shell` and `imgview` name the input leaf for their
+    stream decoders. `surface` and PermissionManager retain no false runtime edge because
+    their small request paths inline completely. All three image graphs pass exact-edge
+    auditing, the checked 144-row report retains zero generic residuals, dynamic runtime
+    coverage passes 21/21 on x86_64, AArch64 and RISC-V, and focused x86 input/display/
+    image/service/process behavior passes 69/69; storage/package coverage passes 31/31.
+    The remaining generated domains stay in the compatibility provider.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

@@ -53,18 +53,19 @@ provider's dynamic exports. `rt` depends only on `abi`. The transport-independen
 codec and representation foundation is `wire.lslib`, which depends on `lsrt.lslib`;
 `ipc-client.lslib` owns channel and resolver transports over `wire + lsrt`.
 Generated protocol ownership is package-scoped. `base-proto.lslib` owns
-`liber:base@1`; `storage-proto.lslib` owns `liber:storage@1` and its concrete channel
-implementation thunks. The compatibility `proto.lslib` reexports those external
-generated modules while retaining the unsplit packages and hand-written helpers such as
-path, address and time rendering. `wire` remains available as `proto::codec` for source
-compatibility. Leaf rlibs are archive linked against their explicit provider set.
+`liber:base@1`; `input-proto.lslib` owns `liber:input@1`; `storage-proto.lslib` owns
+`liber:storage@1`. Domain leaves own their generated types, codecs, stream helpers and
+concrete channel implementation thunks. The compatibility `proto.lslib` reexports those
+external generated modules while retaining the unsplit packages and hand-written helpers
+such as path, address and time rendering. `wire` remains available as `proto::codec` for
+source compatibility. Leaf rlibs are archive linked against their explicit provider set.
 
 `lsidl-gen` resolves the complete input graph for validation and documentation, then may
 emit selected Rust packages into separate crate roots. An external-package map replaces
 the corresponding compatibility module with a reexport, so one package has exactly one
 Rust type identity. Generated value codec primitives are public across these internal
-crate boundaries. Generation and check recipes cover the base, storage and compatibility
-roots together, including stale-output manifests.
+crate boundaries. Generation and check recipes cover the base, input, storage and
+compatibility roots together, including stale-output manifests.
 
 The shared-image builder checks every provider's exact runtime edges after each link.
 Cargo type dependencies that inline completely do not create a false `DT_NEEDED` edge;

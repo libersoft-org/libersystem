@@ -34,7 +34,7 @@ instance  iso_storage           -         none    escalate     log_service devic
 instance  udf_storage           -         none    escalate     log_service device_manager
 instance  usb_storage           -         none    escalate     log_service storage_service
 dynamic-service network_service services volume escalate      log_service device_manager process_service config_service -- proto base-proto ipc-client wire lsrt
-dynamic-service shell services volume escalate storage_service media_storage iso_storage udf_storage usb_storage device_service process_service config_service network_service time_service console_service audio_service input_service permission_manager resource_manager system_graph_service session_service -- service-util proto base-proto storage-proto ipc-client wire lsrt
+dynamic-service shell services volume escalate storage_service media_storage iso_storage udf_storage usb_storage device_service process_service config_service network_service time_service console_service audio_service input_service permission_manager resource_manager system_graph_service session_service -- service-util proto base-proto input-proto storage-proto ipc-client wire lsrt
 service   log_service           services  pinned  escalate
 dynamic-service device_service services  volume  transparent  log_service process_service -- proto wire lsrt
 service   process_service       services  pinned  escalate     log_service storage_service
@@ -43,7 +43,7 @@ dynamic-service time_service services volume escalate         log_service networ
 dynamic-service display_service services volume escalate      log_service device_manager process_service input_service -- pix proto wire lsrt
 dynamic-service console_service services volume escalate      log_service time_service audio_service input_service display_service session_service process_service permission_manager -- service-util term surface proto base-proto storage-proto ipc-client wire lsrt
 dynamic-service audio_service services volume escalate        log_service device_manager process_service -- pcm wire lsrt
-dynamic-service input_service services volume escalate        log_service device_manager process_service -- keys proto wire lsrt
+dynamic-service input_service services volume escalate        log_service device_manager process_service -- keys input-proto wire lsrt
 dynamic-service system_graph_service services volume escalate log_service device_manager storage_service network_service device_service process_service config_service time_service console_service audio_service input_service permission_manager resource_manager -- proto base-proto ipc-client wire lsrt
 dynamic-service permission_manager services volume escalate   log_service storage_service media_storage iso_storage udf_storage usb_storage network_service time_service config_service device_service audio_service process_service resource_manager -- service-util proto base-proto ipc-client wire lsrt
 dynamic-service resource_manager services volume escalate     log_service process_service -- proto wire lsrt
@@ -80,6 +80,7 @@ library   lsrt                  rt         volume shared-image
 library   wire                  wire       volume -            lsrt
 library   ipc-client            ipc-client volume shared-image lsrt
 library   base-proto            base-proto volume -            wire lsrt
+library   input-proto           input-proto volume shared-image base-proto ipc-client wire lsrt
 library   storage-proto         storage-proto volume shared-image base-proto ipc-client wire lsrt
 library   proto                 proto      volume -            base-proto storage-proto ipc-client wire lsrt
 library   audio-client          audio-client-provider volume shared-image proto
@@ -150,7 +151,7 @@ dynamic   set        tools  volume config-client lsrt
 dynamic   beep       tools  volume audio-client lsrt
 dynamic   play       tools  volume aiff flac mp3 vorbis wav wavpack audio-client volume-client proto lsrt
 dynamic   graphics_probe tools volume lsrt
-dynamic   imgview    tools  volume imgconv pix surface volume-client proto lsrt
+dynamic   imgview    tools  volume imgconv pix surface volume-client input-proto proto lsrt
 dynamic   imgconv    tools  volume imgconv volume-client proto lsrt
 dynamic   usage      tools  volume resources-client proto wire lsrt
 dynamic   ps         tools  volume process-client resources-client proto wire lsrt

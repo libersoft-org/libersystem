@@ -22,10 +22,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "input-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
 name = "proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "input-proto",
  "storage-proto",
  "wire",
 ]

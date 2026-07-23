@@ -1,6 +1,7 @@
 # Bugs / changes
 
 - add "ls" parameters (filters like *.txt etc.)
+- manifest.txt - use JSON instead?
 - Native compilers - wasm
 - create a live video about LiberSystem
 - voribis - LICENSE file
