@@ -55,6 +55,7 @@ dependencies = [
  "input-proto",
  "process-proto",
  "security-proto",
+ "session-proto",
  "storage-proto",
  "wire",
 ]
@@ -68,6 +69,15 @@ dependencies = [
 
 [[package]]
 name = "security-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "session-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",

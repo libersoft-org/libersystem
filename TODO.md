@@ -4376,6 +4376,19 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     x86_64, AArch64 and RISC-V; focused x86 process/PermissionManager and storage/package
     slices pass 46/46 and 31/31. Other generated domains remain in the compatibility
     provider.
+  - Generated session-package split result (M126a, 2026-07-23):
+    `session-proto.lslib` (34,240/38,840/32,744 bytes) now exclusively owns
+    `liber:session@1` job, environment and cwd types/codecs plus concrete channel
+    implementation thunks. Its imported process `task` is a Cargo type dependency but
+    creates no false runtime edge because handle codecs inline. `session_service`
+    removes its monolithic, base and process runtime edges and directly needs only
+    `session-proto`, `wire` and `lsrt`; shell names the session leaf for its out-of-line
+    job/environment helpers. The compatibility provider shrinks to
+    219,928/254,936/229,312 bytes. Exact-edge graphs and the checked 144-row report pass
+    on all targets with zero generic residuals. Dynamic runtime coverage passes 21/21 on
+    x86_64, AArch64 and RISC-V; focused x86 shell, process and storage/package slices
+    pass 14/14, 46/46 and 31/31. Other generated domains remain in the compatibility
+    provider.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

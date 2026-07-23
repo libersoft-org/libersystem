@@ -34,7 +34,7 @@ instance  iso_storage           -         none    escalate     log_service devic
 instance  udf_storage           -         none    escalate     log_service device_manager
 instance  usb_storage           -         none    escalate     log_service storage_service
 dynamic-service network_service services volume escalate      log_service device_manager process_service config_service -- proto base-proto ipc-client wire lsrt
-dynamic-service shell services volume escalate storage_service media_storage iso_storage udf_storage usb_storage device_service process_service config_service network_service time_service console_service audio_service input_service permission_manager resource_manager system_graph_service session_service -- service-util proto base-proto input-proto process-proto storage-proto ipc-client wire lsrt
+dynamic-service shell services volume escalate storage_service media_storage iso_storage udf_storage usb_storage device_service process_service config_service network_service time_service console_service audio_service input_service permission_manager resource_manager system_graph_service session_service -- service-util proto base-proto input-proto process-proto session-proto storage-proto ipc-client wire lsrt
 service   log_service           services  pinned  escalate
 dynamic-service device_service services  volume  transparent  log_service process_service -- proto wire lsrt
 service   process_service       services  pinned  escalate     log_service storage_service
@@ -47,7 +47,7 @@ dynamic-service input_service services volume escalate        log_service device
 dynamic-service system_graph_service services volume escalate log_service device_manager storage_service network_service device_service process_service config_service time_service console_service audio_service input_service permission_manager resource_manager -- proto base-proto ipc-client wire lsrt
 dynamic-service permission_manager services volume escalate   log_service storage_service media_storage iso_storage udf_storage usb_storage network_service time_service config_service device_service audio_service process_service resource_manager -- service-util base-proto process-proto security-proto ipc-client wire lsrt
 dynamic-service resource_manager services volume escalate     log_service process_service -- proto wire lsrt
-dynamic-service session_service services volume escalate      log_service process_service -- proto wire lsrt
+dynamic-service session_service services volume escalate      log_service process_service -- session-proto wire lsrt
 
 # launchers - spawned from the init package, not supervised as managed services.
 launcher  system_manager        system_manager  pinned
@@ -84,6 +84,7 @@ library   process-proto         process-proto volume shared-image base-proto ipc
 library   display-proto         display-proto volume shared-image base-proto ipc-client wire lsrt
 library   input-proto           input-proto volume shared-image base-proto ipc-client wire lsrt
 library   security-proto        security-proto volume shared-image base-proto process-proto ipc-client wire lsrt
+library   session-proto         session-proto volume shared-image base-proto ipc-client wire lsrt
 library   storage-proto         storage-proto volume shared-image base-proto ipc-client wire lsrt
 library   proto                 proto      volume -            base-proto storage-proto ipc-client wire lsrt
 library   audio-client          audio-client-provider volume shared-image proto

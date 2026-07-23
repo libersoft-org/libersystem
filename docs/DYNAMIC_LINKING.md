@@ -55,19 +55,21 @@ codec and representation foundation is `wire.lslib`, which depends on `lsrt.lsli
 Generated protocol ownership is package-scoped. `base-proto.lslib` owns
 `liber:base@1`; `process-proto.lslib` owns `liber:process@1`; `display-proto.lslib`
 owns `liber:display@1`; `input-proto.lslib` owns `liber:input@1`;
-`security-proto.lslib` owns `liber:security@1`; and `storage-proto.lslib` owns
-`liber:storage@1`. Domain leaves own their generated types, codecs, stream helpers and
-concrete channel implementation thunks. The compatibility `proto.lslib` reexports those
-external generated modules while retaining the unsplit packages and hand-written helpers
-such as path, address and time rendering. `wire` remains available as `proto::codec` for
-source compatibility. Leaf rlibs are archive linked against their explicit provider set.
+`security-proto.lslib` owns `liber:security@1`; `session-proto.lslib` owns
+`liber:session@1`; and `storage-proto.lslib` owns `liber:storage@1`. Domain leaves own
+their generated types, codecs, stream helpers and concrete channel implementation
+thunks. The compatibility `proto.lslib` reexports those external generated modules while
+retaining the unsplit packages and hand-written helpers such as path, address and time
+rendering. `wire` remains available as `proto::codec` for source compatibility. Leaf
+rlibs are archive linked against their explicit provider set.
 
 `lsidl-gen` resolves the complete input graph for validation and documentation, then may
 emit selected Rust packages into separate crate roots. An external-package map replaces
 the corresponding compatibility module with a reexport, so one package has exactly one
 Rust type identity. Generated value codec primitives are public across these internal
 crate boundaries. Generation and check recipes cover the base, process, display, input,
-security, storage and compatibility roots together, including stale-output manifests.
+security, session, storage and compatibility roots together, including stale-output
+manifests.
 
 The shared-image builder checks every provider's exact runtime edges after each link.
 Cargo type dependencies that inline completely do not create a false `DT_NEEDED` edge;

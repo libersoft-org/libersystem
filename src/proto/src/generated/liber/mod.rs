@@ -11,6 +11,6 @@ pub mod observability;
 pub use process_proto::generated::liber::process;
 pub mod resources;
 pub use security_proto::generated::liber::security;
-pub mod session;
+pub use session_proto::generated::liber::session;
 pub use storage_proto::generated::liber::storage;
 pub mod time;

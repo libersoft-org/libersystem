@@ -1,17 +1,17 @@
 format=liber-dynamic-wave-report-v2
 target	wave	tools	object_bytes	pie_bytes	unique_provider_bytes	private_bytes	shared_bytes	test_command
 x86_64-unknown-none	1	12	74328	74960	429592	311296	454656	just test-tags service,process,storage
-x86_64-unknown-none	2	11	159064	129432	756096	593920	770048	just test-tags service,process,storage
-x86_64-unknown-none	3	13	86016	97176	825864	696320	864256	just test-tags service,process,storage
-x86_64-unknown-none	4	8	67784	62896	753480	430080	712704	just test-tags service,process
-x86_64-unknown-none	5	4	57360	50112	2343360	475136	2183168	just test-tags image,audio,service,process,storage
+x86_64-unknown-none	2	11	159064	129440	728072	593920	745472	just test-tags service,process,storage
+x86_64-unknown-none	3	13	86024	97176	797840	696320	839680	just test-tags service,process,storage
+x86_64-unknown-none	4	8	67784	62896	725456	430080	688128	just test-tags service,process
+x86_64-unknown-none	5	4	57360	50112	2315336	475136	2158592	just test-tags image,audio,service,process,storage
 aarch64-unknown-none	1	12	87784	83744	500160	327680	495616	just test-tags service,process,storage
-aarch64-unknown-none	2	11	175360	140064	877872	843776	831488	just test-tags service,process,storage
-aarch64-unknown-none	3	13	95400	104392	957200	995328	933888	just test-tags service,process,storage
-aarch64-unknown-none	4	8	75040	67816	875112	626688	774144	just test-tags service,process
-aarch64-unknown-none	5	4	62648	52992	2568872	737280	2265088	just test-tags image,audio,service,process,storage
+aarch64-unknown-none	2	11	175352	140056	846048	843776	806912	just test-tags service,process,storage
+aarch64-unknown-none	3	13	95408	104392	925376	995328	909312	just test-tags service,process,storage
+aarch64-unknown-none	4	8	75040	67816	843288	626688	749568	just test-tags service,process
+aarch64-unknown-none	5	4	62648	52992	2537048	737280	2240512	just test-tags image,audio,service,process,storage
 riscv64gc-unknown-none-elf	1	12	94552	92384	507016	327680	421888	just test-tags service,process,storage
-riscv64gc-unknown-none-elf	2	11	188392	160216	844112	790528	679936	just test-tags service,process,storage
-riscv64gc-unknown-none-elf	3	13	95920	112224	923104	937984	778240	just test-tags service,process,storage
-riscv64gc-unknown-none-elf	4	8	79296	77432	841760	598016	618496	just test-tags service,process
-riscv64gc-unknown-none-elf	5	4	66696	59384	2447360	700416	1761280	just test-tags image,audio,service,process,storage
+riscv64gc-unknown-none-elf	2	11	188352	160152	818800	819200	659456	just test-tags service,process,storage
+riscv64gc-unknown-none-elf	3	13	95920	112208	897792	978944	757760	just test-tags service,process,storage
+riscv64gc-unknown-none-elf	4	8	79288	77408	816448	630784	598016	just test-tags service,process
+riscv64gc-unknown-none-elf	5	4	66688	59368	2422048	712704	1740800	just test-tags image,audio,service,process,storage
