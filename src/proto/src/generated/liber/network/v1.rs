@@ -35,14 +35,14 @@ impl Ipv4Addr {
 	pub fn decode(bytes: &[u8]) -> Option<Ipv4Addr> {
 		Ipv4Addr::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(self.a)?;
 		w.u8(self.b)?;
 		w.u8(self.c)?;
 		w.u8(self.d)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Ipv4Addr> {
+	pub fn read(r: &mut Reader) -> Option<Ipv4Addr> {
 		let a = r.u8()?;
 		let b = r.u8()?;
 		let c = r.u8()?;
@@ -72,12 +72,12 @@ impl Endpoint {
 	pub fn decode(bytes: &[u8]) -> Option<Endpoint> {
 		Endpoint::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		self.addr.write(w)?;
 		w.u16(self.port)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Endpoint> {
+	pub fn read(r: &mut Reader) -> Option<Endpoint> {
 		let addr = Ipv4Addr::read(r)?;
 		let port = r.u16()?;
 		Some(Endpoint { addr, port })
@@ -105,7 +105,7 @@ impl Neighbor {
 	pub fn decode(bytes: &[u8]) -> Option<Neighbor> {
 		Neighbor::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		self.addr.write(w)?;
 		if self.mac.len() > u16::MAX as usize {
 			return None;
@@ -116,7 +116,7 @@ impl Neighbor {
 		}
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Neighbor> {
+	pub fn read(r: &mut Reader) -> Option<Neighbor> {
 		let addr = Ipv4Addr::read(r)?;
 		let mac = {
 			let v1 = r.u16()? as usize;
@@ -156,7 +156,7 @@ impl NetInfo {
 	pub fn decode(bytes: &[u8]) -> Option<NetInfo> {
 		NetInfo::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		self.addr.write(w)?;
 		if self.mac.len() > u16::MAX as usize {
 			return None;
@@ -176,7 +176,7 @@ impl NetInfo {
 		}
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<NetInfo> {
+	pub fn read(r: &mut Reader) -> Option<NetInfo> {
 		let addr = Ipv4Addr::read(r)?;
 		let mac = {
 			let v5 = r.u16()? as usize;
@@ -226,14 +226,14 @@ impl NetCapacity {
 	pub fn decode(bytes: &[u8]) -> Option<NetCapacity> {
 		NetCapacity::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u32(self.clients)?;
 		w.u32(self.sockets)?;
 		w.u32(self.listeners)?;
 		w.u32(self.connections)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<NetCapacity> {
+	pub fn read(r: &mut Reader) -> Option<NetCapacity> {
 		let clients = r.u32()?;
 		let sockets = r.u32()?;
 		let listeners = r.u32()?;
@@ -266,10 +266,10 @@ impl PingStatus {
 	pub fn decode(bytes: &[u8]) -> Option<PingStatus> {
 		PingStatus::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<PingStatus> {
+	pub fn read(r: &mut Reader) -> Option<PingStatus> {
 		match r.u8()? {
 			0 => Some(PingStatus::Reply),
 			1 => Some(PingStatus::Timeout),
@@ -303,13 +303,13 @@ impl PingReply {
 	pub fn decode(bytes: &[u8]) -> Option<PingReply> {
 		PingReply::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		self.status.write(w)?;
 		w.u8(self.ttl)?;
 		w.u32(self.rtt_us)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<PingReply> {
+	pub fn read(r: &mut Reader) -> Option<PingReply> {
 		let status = PingStatus::read(r)?;
 		let ttl = r.u8()?;
 		let rtt_us = r.u32()?;
@@ -338,7 +338,7 @@ impl TcpRequest {
 	pub fn decode(bytes: &[u8]) -> Option<TcpRequest> {
 		TcpRequest::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		self.ep.write(w)?;
 		if self.request.len() > u16::MAX as usize {
 			return None;
@@ -349,7 +349,7 @@ impl TcpRequest {
 		}
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<TcpRequest> {
+	pub fn read(r: &mut Reader) -> Option<TcpRequest> {
 		let ep = Endpoint::read(r)?;
 		let request = {
 			let v10 = r.u16()? as usize;
@@ -389,10 +389,10 @@ impl SockState {
 	pub fn decode(bytes: &[u8]) -> Option<SockState> {
 		SockState::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<SockState> {
+	pub fn read(r: &mut Reader) -> Option<SockState> {
 		match r.u8()? {
 			0 => Some(SockState::Closed),
 			1 => Some(SockState::SynSent),
@@ -429,13 +429,13 @@ impl SockInfo {
 	pub fn decode(bytes: &[u8]) -> Option<SockInfo> {
 		SockInfo::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u16(self.local_port)?;
 		self.remote.write(w)?;
 		self.state.write(w)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<SockInfo> {
+	pub fn read(r: &mut Reader) -> Option<SockInfo> {
 		let local_port = r.u16()?;
 		let remote = Endpoint::read(r)?;
 		let state = SockState::read(r)?;
@@ -1548,7 +1548,7 @@ impl Chunk {
 	pub fn decode(bytes: &[u8]) -> Option<Chunk> {
 		Chunk::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		if self.data.len() > u16::MAX as usize {
 			return None;
 		}
@@ -1558,7 +1558,7 @@ impl Chunk {
 		}
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Chunk> {
+	pub fn read(r: &mut Reader) -> Option<Chunk> {
 		let data = {
 			let v43 = r.u16()? as usize;
 			let mut v44 = Vec::new();

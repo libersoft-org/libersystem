@@ -32,13 +32,13 @@ impl OpenOpts {
 	pub fn decode(bytes: &[u8]) -> Option<OpenOpts> {
 		OpenOpts::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.path.as_bytes())?;
 		w.boolean(self.write)?;
 		w.boolean(self.create)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<OpenOpts> {
+	pub fn read(r: &mut Reader) -> Option<OpenOpts> {
 		let path = r.string_lp()?;
 		let write = r.boolean()?;
 		let create = r.boolean()?;
@@ -69,13 +69,13 @@ impl OpenResult {
 	pub fn decode(bytes: &[u8]) -> Option<OpenResult> {
 		OpenResult::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.set_handle(self.file)?;
 		w.u32(0)?;
 		w.u64(self.size)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<OpenResult> {
+	pub fn read(r: &mut Reader) -> Option<OpenResult> {
 		let file = {
 			let _ = r.u32()?;
 			r.take_handle()?
@@ -108,10 +108,10 @@ impl FileType {
 	pub fn decode(bytes: &[u8]) -> Option<FileType> {
 		FileType::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<FileType> {
+	pub fn read(r: &mut Reader) -> Option<FileType> {
 		match r.u8()? {
 			0 => Some(FileType::File),
 			1 => Some(FileType::Dir),
@@ -147,7 +147,7 @@ impl FileInfo {
 	pub fn decode(bytes: &[u8]) -> Option<FileInfo> {
 		FileInfo::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
 		w.u64(self.size)?;
 		self.r#type.write(w)?;
@@ -155,7 +155,7 @@ impl FileInfo {
 		w.u64(self.ctime)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<FileInfo> {
+	pub fn read(r: &mut Reader) -> Option<FileInfo> {
 		let name = r.string_lp()?;
 		let size = r.u64()?;
 		let r#type = FileType::read(r)?;
@@ -187,12 +187,12 @@ impl SnapshotInfo {
 	pub fn decode(bytes: &[u8]) -> Option<SnapshotInfo> {
 		SnapshotInfo::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
 		w.u64(self.generation)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<SnapshotInfo> {
+	pub fn read(r: &mut Reader) -> Option<SnapshotInfo> {
 		let name = r.string_lp()?;
 		let generation = r.u64()?;
 		Some(SnapshotInfo { name, generation })
@@ -229,7 +229,7 @@ impl VolumeStatus {
 	pub fn decode(bytes: &[u8]) -> Option<VolumeStatus> {
 		VolumeStatus::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.label.as_bytes())?;
 		w.u64(self.total_bytes)?;
 		w.u64(self.free_bytes)?;
@@ -238,7 +238,7 @@ impl VolumeStatus {
 		w.bytes_lp(self.filesystem.as_bytes())?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<VolumeStatus> {
+	pub fn read(r: &mut Reader) -> Option<VolumeStatus> {
 		let label = r.string_lp()?;
 		let total_bytes = r.u64()?;
 		let free_bytes = r.u64()?;
@@ -271,7 +271,7 @@ impl FsckReport {
 	pub fn decode(bytes: &[u8]) -> Option<FsckReport> {
 		FsckReport::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u32(self.checksum_failures)?;
 		if self.damaged.len() > u16::MAX as usize {
 			return None;
@@ -282,7 +282,7 @@ impl FsckReport {
 		}
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<FsckReport> {
+	pub fn read(r: &mut Reader) -> Option<FsckReport> {
 		let checksum_failures = r.u32()?;
 		let damaged = {
 			let v1 = r.u16()? as usize;

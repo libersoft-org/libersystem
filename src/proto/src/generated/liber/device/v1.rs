@@ -35,10 +35,10 @@ impl DeviceType {
 	pub fn decode(bytes: &[u8]) -> Option<DeviceType> {
 		DeviceType::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<DeviceType> {
+	pub fn read(r: &mut Reader) -> Option<DeviceType> {
 		match r.u8()? {
 			0 => Some(DeviceType::Unknown),
 			1 => Some(DeviceType::Net),
@@ -73,13 +73,13 @@ impl DeviceEntry {
 	pub fn decode(bytes: &[u8]) -> Option<DeviceEntry> {
 		DeviceEntry::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u32(self.index)?;
 		self.r#type.write(w)?;
 		w.u64(self.mmio_len)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<DeviceEntry> {
+	pub fn read(r: &mut Reader) -> Option<DeviceEntry> {
 		let index = r.u32()?;
 		let r#type = DeviceType::read(r)?;
 		let mmio_len = r.u64()?;
@@ -320,7 +320,7 @@ impl UsbDevice {
 	pub fn decode(bytes: &[u8]) -> Option<UsbDevice> {
 		UsbDevice::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u32(self.port)?;
 		w.bytes_lp(self.speed.as_bytes())?;
 		w.u32(self.vendor)?;
@@ -329,7 +329,7 @@ impl UsbDevice {
 		w.bytes_lp(self.r#type.as_bytes())?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<UsbDevice> {
+	pub fn read(r: &mut Reader) -> Option<UsbDevice> {
 		let port = r.u32()?;
 		let speed = r.string_lp()?;
 		let vendor = r.u32()?;

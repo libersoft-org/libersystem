@@ -4319,6 +4319,22 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     behavior passes 71/71. The generic-client checklist is complete; the remaining
     atomization work is the broader protocol-codec split and any shared CLI boundary
     justified by measured recurring implementation.
+  - Generated storage-package split result (M126a, 2026-07-23): `lsidl-gen` now emits
+    selected Rust packages into separate crate roots and replaces externally owned
+    compatibility modules with generated reexports. `base-proto.lslib`
+    (6,600/7,800/9,024 bytes) owns `liber:base@1`; `storage-proto.lslib`
+    (58,216/68,176/58,808 bytes) owns `liber:storage@1` plus its concrete channel
+    implementation thunks. Generated imported-value codecs are public across these
+    image-internal crate boundaries, while one package retains one Rust type identity.
+    The remaining compatibility `proto.lslib` shrinks to 321,272/372,200/333,520 bytes.
+    `component_host`, `file_picker`, `sandbox_probe`, `request_probe`, `storage_client`
+    and `lsvol` remove their direct monolithic protocol edge; list-stream tools name the
+    storage leaf directly, and `volume-client.lslib` routes concrete storage calls to it.
+    Generation drift checks and all 36 generator tests pass. The checked image graph
+    passes on x86_64, AArch64 and RISC-V with zero generic residuals; dynamic runtime
+    coverage passes 21/21 on each target and focused x86 service/process/storage/image/
+    audio behavior passes 71/71. Other generated domains remain in the compatibility
+    provider and are the next atomization work.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

@@ -7,6 +7,13 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "base-proto"
+version = "0.0.0"
+dependencies = [
+ "wire",
+]
+
+[[package]]
 name = "bootproto"
 version = "0.0.0"
 
@@ -37,7 +44,9 @@ version = "0.0.0"
 name = "proto"
 version = "0.0.0"
 dependencies = [
+ "base-proto",
  "ipc-client",
+ "storage-proto",
  "wire",
 ]
 
@@ -63,6 +72,15 @@ dependencies = [
  "surface",
  "term",
  "wasm",
+]
+
+[[package]]
+name = "storage-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
 ]
 
 [[package]]

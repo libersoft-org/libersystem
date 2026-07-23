@@ -41,6 +41,8 @@ fn main() -> ExitCode {
 	let mut accept_breaking = false;
 	let mut rust_dir: Option<String> = None;
 	let mut docs_dir: Option<String> = None;
+	let mut rust_packages: Vec<String> = Vec::new();
+	let mut external_rust_packages: BTreeMap<String, String> = BTreeMap::new();
 	let mut paths: Vec<String> = Vec::new();
 	let mut args = std::env::args().skip(1);
 	while let Some(a) = args.next() {
@@ -62,8 +64,27 @@ fn main() -> ExitCode {
 					return ExitCode::FAILURE;
 				}
 			},
+			"--rust-package" => match args.next() {
+				Some(package) => rust_packages.push(package),
+				None => {
+					eprintln!("lsidl-gen: --rust-package needs a package identifier");
+					return ExitCode::FAILURE;
+				}
+			},
+			"--external-rust-package" => match args.next().and_then(|value| value.split_once('=').map(|(package, path)| (package.to_string(), path.to_string()))) {
+				Some((package, path)) if !package.is_empty() && !path.is_empty() => {
+					if external_rust_packages.insert(package.clone(), path).is_some() {
+						eprintln!("lsidl-gen: duplicate external Rust package {package}");
+						return ExitCode::FAILURE;
+					}
+				}
+				_ => {
+					eprintln!("lsidl-gen: --external-rust-package needs PACKAGE=RUST_PATH");
+					return ExitCode::FAILURE;
+				}
+			},
 			"-h" | "--help" => {
-				println!("usage: lsidl-gen [--dump] [--check] [--accept-breaking] [--rust-dir <dir>] [--docs-dir <dir>] <file.lsidl>...");
+				println!("usage: lsidl-gen [--dump] [--check] [--accept-breaking] [--rust-dir <dir>] [--rust-package <package>] [--external-rust-package <package=path>] [--docs-dir <dir>] <file.lsidl>...");
 				return ExitCode::SUCCESS;
 			}
 			_ => paths.push(a),
@@ -78,10 +99,10 @@ fn main() -> ExitCode {
 		eprintln!("lsidl-gen: --check and --accept-breaking are mutually exclusive");
 		return ExitCode::FAILURE;
 	}
-	if process_all(&paths, dump, check, accept_breaking, rust_dir.as_deref(), docs_dir.as_deref()) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+	if process_all(&paths, dump, check, accept_breaking, rust_dir.as_deref(), docs_dir.as_deref(), &rust_packages, &external_rust_packages) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
-fn process_all(paths: &[String], dump: bool, check: bool, accept_breaking: bool, rust_dir: Option<&str>, docs_dir: Option<&str>) -> bool {
+fn process_all(paths: &[String], dump: bool, check: bool, accept_breaking: bool, rust_dir: Option<&str>, docs_dir: Option<&str>, rust_packages: &[String], external_rust_packages: &BTreeMap<String, String>) -> bool {
 	let mut sources = Vec::new();
 	for path in paths {
 		let src = match std::fs::read_to_string(path) {
@@ -118,6 +139,13 @@ fn process_all(paths: &[String], dump: bool, check: bool, accept_breaking: bool,
 			return false;
 		}
 	};
+	let package_names: HashSet<String> = packages.iter().map(|package| package.id.display()).collect();
+	for package in rust_packages.iter().chain(external_rust_packages.keys()) {
+		if !package_names.contains(package) {
+			eprintln!("lsidl-gen: configured Rust package {package} is not present in the input graph");
+			return false;
+		}
+	}
 
 	let mut valid = true;
 	for package in &packages {
@@ -135,7 +163,9 @@ fn process_all(paths: &[String], dump: bool, check: bool, accept_breaking: bool,
 	let mut destinations = HashSet::new();
 	for package in &packages {
 		let source = &sources[package.file];
-		if let Some(dir) = rust_dir {
+		let package_name = package.id.display();
+		let emit_rust = rust_packages.is_empty() || rust_packages.iter().any(|selected| selected == &package_name);
+		if let Some(dir) = rust_dir.filter(|_| emit_rust && !external_rust_packages.contains_key(&package_name)) {
 			let mut path = Path::new(dir).join("generated");
 			for component in package.id.file_components() {
 				path.push(component);
@@ -189,7 +219,7 @@ fn process_all(paths: &[String], dump: bool, check: bool, accept_breaking: bool,
 		}
 	}
 	if let Some(dir) = rust_dir {
-		if !add_module_indexes(Path::new(dir), &packages, &mut destinations, &mut rust_outputs) {
+		if !add_module_indexes(Path::new(dir), &packages, rust_packages, external_rust_packages, &mut destinations, &mut rust_outputs) {
 			return false;
 		}
 	}
@@ -365,16 +395,29 @@ fn rush_outputs(outputs: &mut [Output]) {
 	outputs.sort_by(|a, b| a.path.cmp(&b.path));
 }
 
-fn add_module_indexes(root: &Path, packages: &[resolve::ResolvedPackage], destinations: &mut HashSet<PathBuf>, outputs: &mut Vec<Output>) -> bool {
+fn add_module_indexes(root: &Path, packages: &[resolve::ResolvedPackage], rust_packages: &[String], external_rust_packages: &BTreeMap<String, String>, destinations: &mut HashSet<PathBuf>, outputs: &mut Vec<Output>) -> bool {
 	let generated = root.join("generated");
 	let mut modules: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
 	for package in packages {
+		let package_name = package.id.display();
+		if !rust_packages.is_empty() && !rust_packages.iter().any(|selected| selected == &package_name) && !external_rust_packages.contains_key(&package_name) {
+			continue;
+		}
 		let mut parent = generated.clone();
-		for (module, file) in package.id.rust_components().into_iter().zip(package.id.file_components()) {
+		let components = package.id.rust_components();
+		for (index, (module, file)) in components.into_iter().zip(package.id.file_components()).enumerate() {
+			if index + 1 == package.id.rust_components().len() {
+				if let Some(path) = external_rust_packages.get(&package_name) {
+					modules.entry(parent.join("mod.rs")).or_default().insert(format!("{module}|{path}"));
+					break;
+				}
+			}
 			modules.entry(parent.join("mod.rs")).or_default().insert(module);
 			parent.push(file);
 		}
-		modules.entry(parent.join("mod.rs")).or_default().insert(format!("v{}", package.id.version));
+		if !external_rust_packages.contains_key(&package_name) {
+			modules.entry(parent.join("mod.rs")).or_default().insert(format!("v{}", package.id.version));
+		}
 	}
 	for (path, children) in modules {
 		if !destinations.insert(path.clone()) {
@@ -383,7 +426,11 @@ fn add_module_indexes(root: &Path, packages: &[resolve::ResolvedPackage], destin
 		}
 		let mut contents = String::from("// @generated by lsidl-gen. Do not edit; run `just gen`.\n");
 		for child in children {
-			contents.push_str(&format!("pub mod {child};\n"));
+			if let Some((module, external)) = child.split_once('|') {
+				contents.push_str(&format!("pub use {external} as {module};\n"));
+			} else {
+				contents.push_str(&format!("pub mod {child};\n"));
+			}
 		}
 		outputs.push(Output { path, contents });
 	}

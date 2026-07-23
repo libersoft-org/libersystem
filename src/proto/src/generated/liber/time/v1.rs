@@ -32,11 +32,11 @@ impl Timestamp {
 	pub fn decode(bytes: &[u8]) -> Option<Timestamp> {
 		Timestamp::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u64(self.unix_secs)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Timestamp> {
+	pub fn read(r: &mut Reader) -> Option<Timestamp> {
 		let unix_secs = r.u64()?;
 		Some(Timestamp { unix_secs })
 	}

@@ -76,6 +76,13 @@ name = "audio-client-provider"
 version = "0.0.0"
 
 [[package]]
+name = "base-proto"
+version = "0.0.0"
+dependencies = [
+ "wire",
+]
+
+[[package]]
 name = "bmp"
 version = "0.0.0"
 dependencies = [
@@ -356,7 +363,9 @@ version = "0.0.0"
 name = "proto"
 version = "0.0.0"
 dependencies = [
+ "base-proto",
  "ipc-client",
+ "storage-proto",
  "wire",
 ]
 
@@ -412,6 +421,15 @@ dependencies = [
 [[package]]
 name = "security-client-provider"
 version = "0.0.0"
+
+[[package]]
+name = "storage-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "surface"
@@ -503,15 +521,17 @@ dependencies = [
 name = "volume-client"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
+ "storage-proto",
 ]
 
 [[package]]
 name = "volume-client-provider"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
  "rt",
+ "storage-proto",
  "wire",
 ]
 

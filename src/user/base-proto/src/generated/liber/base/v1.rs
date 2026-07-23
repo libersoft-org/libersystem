@@ -52,10 +52,10 @@ impl Error {
 	pub fn decode(bytes: &[u8]) -> Option<Error> {
 		Error::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Error> {
+	pub fn read(r: &mut Reader) -> Option<Error> {
 		match r.u8()? {
 			0 => Some(Error::Denied),
 			1 => Some(Error::NotFound),

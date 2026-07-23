@@ -3,8 +3,9 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::codec::Buffer;
-use proto::system::{Error, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus};
+use base_proto::generated::liber::base::v1::Error;
+use storage_proto::codec::Buffer;
+use storage_proto::generated::liber::storage::v1::{FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_storage_volume_open"]

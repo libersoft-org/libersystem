@@ -33,12 +33,12 @@ impl ProcessInfo {
 	pub fn decode(bytes: &[u8]) -> Option<ProcessInfo> {
 		ProcessInfo::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u64(self.koid)?;
 		w.bytes_lp(self.name.as_bytes())?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<ProcessInfo> {
+	pub fn read(r: &mut Reader) -> Option<ProcessInfo> {
 		let koid = r.u64()?;
 		let name = r.string_lp()?;
 		Some(ProcessInfo { koid, name })
@@ -68,13 +68,13 @@ impl StartResult {
 	pub fn decode(bytes: &[u8]) -> Option<StartResult> {
 		StartResult::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.set_handle(self.task)?;
 		w.u32(0)?;
 		self.info.write(w)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<StartResult> {
+	pub fn read(r: &mut Reader) -> Option<StartResult> {
 		let task = {
 			let _ = r.u32()?;
 			r.take_handle()?

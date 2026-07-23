@@ -52,15 +52,26 @@ steps:
 provider's dynamic exports. `rt` depends only on `abi`. The transport-independent
 codec and representation foundation is `wire.lslib`, which depends on `lsrt.lslib`;
 `ipc-client.lslib` owns channel and resolver transports over `wire + lsrt`.
-`proto.lslib` contains generated domain types/clients/servers, re-exports `wire` as
-`proto::codec` for source compatibility, and depends on `wire + lsrt`. Leaf rlibs remain
-archive linked against their explicit provider set.
+Generated protocol ownership is package-scoped. `base-proto.lslib` owns
+`liber:base@1`; `storage-proto.lslib` owns `liber:storage@1` and its concrete channel
+implementation thunks. The compatibility `proto.lslib` reexports those external
+generated modules while retaining the unsplit packages and hand-written helpers such as
+path, address and time rendering. `wire` remains available as `proto::codec` for source
+compatibility. Leaf rlibs are archive linked against their explicit provider set.
 
-The shared-image builder checks this foundation graph after each link: `wire` must need
-only `lsrt`, `ipc-client` and `proto` must need exactly `wire + lsrt`, and every direct
-runtime import of `ipc-client` must have one definition in `lsrt`. RISC-V build-std uses
-a 32 MB rustc worker stack; smaller stacks have crashed the pinned compiler while
-elaborating drops in `core`.
+`lsidl-gen` resolves the complete input graph for validation and documentation, then may
+emit selected Rust packages into separate crate roots. An external-package map replaces
+the corresponding compatibility module with a reexport, so one package has exactly one
+Rust type identity. Generated value codec primitives are public across these internal
+crate boundaries. Generation and check recipes cover the base, storage and compatibility
+roots together, including stale-output manifests.
+
+The shared-image builder checks every provider's exact runtime edges after each link.
+Cargo type dependencies that inline completely do not create a false `DT_NEEDED` edge;
+out-of-line imported codecs require their package owner directly. Every direct runtime
+import has exactly one owner in the declared closure. RISC-V build-std uses a 32 MB rustc
+worker stack; smaller stacks have crashed the pinned compiler while elaborating drops in
+`core`.
 
 Because Cargo cannot consume a Rust dylib on these targets, consumers cross a generated
 image-internal export boundary. A small explicit unmangled smoke ABI currently pins this

@@ -33,12 +33,12 @@ impl ConfigEntry {
 	pub fn decode(bytes: &[u8]) -> Option<ConfigEntry> {
 		ConfigEntry::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.key.as_bytes())?;
 		w.bytes_lp(self.value.as_bytes())?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<ConfigEntry> {
+	pub fn read(r: &mut Reader) -> Option<ConfigEntry> {
 		let key = r.string_lp()?;
 		let value = r.string_lp()?;
 		Some(ConfigEntry { key, value })
@@ -346,14 +346,14 @@ impl Picked {
 	pub fn decode(bytes: &[u8]) -> Option<Picked> {
 		Picked::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.set_handle(self.file)?;
 		w.u32(0)?;
 		w.u64(self.size)?;
 		w.bytes_lp(self.name.as_bytes())?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Picked> {
+	pub fn read(r: &mut Reader) -> Option<Picked> {
 		let file = {
 			let _ = r.u32()?;
 			r.take_handle()?

@@ -1,8 +1,9 @@
 #![no_std]
 
+use base_proto::generated::liber::base::v1::Error;
 use core::arch::global_asm;
-use proto::system::{Error, volume};
-use rt::{ReceivedVec, close, recv_vec_blocking, send_blocking};
+use rt::{close, recv_vec_blocking, send_blocking, ReceivedVec};
+use storage_proto::generated::liber::storage::v1::volume;
 use wire::{Sink, VecWriter};
 
 #[unsafe(export_name = "liber_channel_liber_storage_volume_write_stream_begin")]

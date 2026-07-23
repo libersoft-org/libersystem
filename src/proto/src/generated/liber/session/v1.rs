@@ -35,13 +35,13 @@ impl JobInfo {
 	pub fn decode(bytes: &[u8]) -> Option<JobInfo> {
 		JobInfo::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u32(self.id)?;
 		w.bytes_lp(self.name.as_bytes())?;
 		w.boolean(self.stopped)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<JobInfo> {
+	pub fn read(r: &mut Reader) -> Option<JobInfo> {
 		let id = r.u32()?;
 		let name = r.string_lp()?;
 		let stopped = r.boolean()?;
@@ -73,13 +73,13 @@ impl JobEntry {
 	pub fn decode(bytes: &[u8]) -> Option<JobEntry> {
 		JobEntry::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		self.info.write(w)?;
 		w.set_handle(self.proc)?;
 		w.u32(0)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<JobEntry> {
+	pub fn read(r: &mut Reader) -> Option<JobEntry> {
 		let info = JobInfo::read(r)?;
 		let proc = {
 			let _ = r.u32()?;
@@ -113,12 +113,12 @@ impl EnvVar {
 	pub fn decode(bytes: &[u8]) -> Option<EnvVar> {
 		EnvVar::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
 		w.bytes_lp(self.value.as_bytes())?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<EnvVar> {
+	pub fn read(r: &mut Reader) -> Option<EnvVar> {
 		let name = r.string_lp()?;
 		let value = r.string_lp()?;
 		Some(EnvVar { name, value })

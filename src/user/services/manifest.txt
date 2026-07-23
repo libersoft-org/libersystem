@@ -33,19 +33,19 @@ instance  media_storage         -         none    escalate     log_service devic
 instance  iso_storage           -         none    escalate     log_service device_manager
 instance  udf_storage           -         none    escalate     log_service device_manager
 instance  usb_storage           -         none    escalate     log_service storage_service
-dynamic-service network_service services volume escalate      log_service device_manager process_service config_service -- proto ipc-client wire lsrt
-dynamic-service shell services volume escalate storage_service media_storage iso_storage udf_storage usb_storage device_service process_service config_service network_service time_service console_service audio_service input_service permission_manager resource_manager system_graph_service session_service -- service-util proto ipc-client wire lsrt
+dynamic-service network_service services volume escalate      log_service device_manager process_service config_service -- proto base-proto ipc-client wire lsrt
+dynamic-service shell services volume escalate storage_service media_storage iso_storage udf_storage usb_storage device_service process_service config_service network_service time_service console_service audio_service input_service permission_manager resource_manager system_graph_service session_service -- service-util proto base-proto storage-proto ipc-client wire lsrt
 service   log_service           services  pinned  escalate
 dynamic-service device_service services  volume  transparent  log_service process_service -- proto wire lsrt
 service   process_service       services  pinned  escalate     log_service storage_service
-dynamic-service config_service services  volume  transparent  log_service process_service -- proto ipc-client wire lsrt
-dynamic-service time_service services volume escalate         log_service network_service process_service -- proto ipc-client wire lsrt
+dynamic-service config_service services  volume  transparent  log_service process_service -- proto base-proto storage-proto ipc-client wire lsrt
+dynamic-service time_service services volume escalate         log_service network_service process_service -- proto base-proto ipc-client wire lsrt
 dynamic-service display_service services volume escalate      log_service device_manager process_service input_service -- pix proto wire lsrt
-dynamic-service console_service services volume escalate      log_service time_service audio_service input_service display_service session_service process_service permission_manager -- service-util term surface proto ipc-client wire lsrt
+dynamic-service console_service services volume escalate      log_service time_service audio_service input_service display_service session_service process_service permission_manager -- service-util term surface proto base-proto storage-proto ipc-client wire lsrt
 dynamic-service audio_service services volume escalate        log_service device_manager process_service -- pcm wire lsrt
 dynamic-service input_service services volume escalate        log_service device_manager process_service -- keys proto wire lsrt
-dynamic-service system_graph_service services volume escalate log_service device_manager storage_service network_service device_service process_service config_service time_service console_service audio_service input_service permission_manager resource_manager -- proto ipc-client wire lsrt
-dynamic-service permission_manager services volume escalate   log_service storage_service media_storage iso_storage udf_storage usb_storage network_service time_service config_service device_service audio_service process_service resource_manager -- service-util proto ipc-client wire lsrt
+dynamic-service system_graph_service services volume escalate log_service device_manager storage_service network_service device_service process_service config_service time_service console_service audio_service input_service permission_manager resource_manager -- proto base-proto ipc-client wire lsrt
+dynamic-service permission_manager services volume escalate   log_service storage_service media_storage iso_storage udf_storage usb_storage network_service time_service config_service device_service audio_service process_service resource_manager -- service-util proto base-proto ipc-client wire lsrt
 dynamic-service resource_manager services volume escalate     log_service process_service -- proto wire lsrt
 dynamic-service session_service services volume escalate      log_service process_service -- proto wire lsrt
 
@@ -79,7 +79,9 @@ driver    xhci                  drivers   volume
 library   lsrt                  rt         volume shared-image
 library   wire                  wire       volume -            lsrt
 library   ipc-client            ipc-client volume shared-image lsrt
-library   proto                 proto      volume -            ipc-client wire lsrt
+library   base-proto            base-proto volume -            wire lsrt
+library   storage-proto         storage-proto volume shared-image base-proto ipc-client wire lsrt
+library   proto                 proto      volume -            base-proto storage-proto ipc-client wire lsrt
 library   audio-client          audio-client-provider volume shared-image proto
 library   network-client        network-client-provider volume shared-image proto
 library   config-client         config-client-provider volume shared-image proto
@@ -90,7 +92,7 @@ library   resources-client      resources-client-provider volume shared-image pr
 library   security-client       security-client-provider volume shared-image proto
 library   observability-client  observability-client-provider volume shared-image proto
 library   time-client           time-client-provider volume shared-image proto
-library   volume-client         volume-client-provider volume shared-image proto wire lsrt
+library   volume-client         volume-client-provider volume shared-image base-proto storage-proto wire lsrt
 library   pix                   pix        volume -            lsrt
 library   inflate               inflate    volume -            lsrt
 library   deflate               deflate    volume -            lsrt
@@ -123,20 +125,20 @@ library   wasm                  wasm       volume -            lsrt
 library   term                  term       volume -            lsrt
 library   service-util          services   volume -            lsrt
 dynamic   dyn_probe             dyn_probe volume pix proto lsrt
-dynamic   sandbox_probe         services  volume proto ipc-client wire lsrt
-dynamic   request_probe         services  volume proto ipc-client wire lsrt
-dynamic   wasi_host             services  volume wasm proto ipc-client wire lsrt
-dynamic   component_host        services  volume wasm proto ipc-client wire lsrt
-dynamic   file_picker           services  volume proto ipc-client wire lsrt
-dynamic   storage_client        storage   volume proto ipc-client wire lsrt
+dynamic   sandbox_probe         services  volume base-proto storage-proto ipc-client wire lsrt
+dynamic   request_probe         services  volume base-proto ipc-client wire lsrt
+dynamic   wasi_host             services  volume wasm proto base-proto storage-proto ipc-client wire lsrt
+dynamic   component_host        services  volume wasm base-proto storage-proto ipc-client wire lsrt
+dynamic   file_picker           services  volume base-proto storage-proto ipc-client wire lsrt
+dynamic   storage_client        storage   volume base-proto storage-proto ipc-client wire lsrt
 
 # command-line tools - loaded from the system volume under bin/.
 dynamic   date       tools  volume time-client proto lsrt
 dynamic   cat        tools  volume volume-client proto lsrt
 dynamic   write      tools  volume volume-client proto lsrt
 dynamic   rm         tools  volume volume-client proto lsrt
-dynamic   ls         tools  volume volume-client proto wire lsrt
-dynamic   du         tools  volume volume-client proto wire lsrt
+dynamic   ls         tools  volume volume-client storage-proto proto wire lsrt
+dynamic   du         tools  volume volume-client storage-proto proto wire lsrt
 dynamic   mkdir      tools  volume volume-client proto lsrt
 dynamic   rmdir      tools  volume volume-client proto lsrt
 dynamic   log        tools  volume log-client time-client proto wire lsrt
@@ -155,7 +157,7 @@ dynamic   ps         tools  volume process-client resources-client proto wire ls
 dynamic   run        tools  volume process-client proto lsrt
 dynamic   perm       tools  volume security-client proto wire lsrt
 dynamic   stop       tools  volume lsrt
-dynamic   lsvol      tools  volume volume-client proto wire lsrt
+dynamic   lsvol      tools  volume volume-client storage-proto wire lsrt
 dynamic   uname      tools  volume lsrt
 dynamic   uptime     tools  volume lsrt
 dynamic   dmesg      tools  volume lsrt

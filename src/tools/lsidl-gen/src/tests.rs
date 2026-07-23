@@ -355,19 +355,46 @@ fn pipeline_failure_and_check_mode_never_write() {
 	std::fs::write(&invalid, "package liber:invalid@1; use liber:missing@1.{value};").unwrap();
 	let sentinel = rust.join("sentinel");
 	std::fs::write(&sentinel, "keep").unwrap();
-	assert!(!crate::process_all(&[invalid.to_string_lossy().into_owned()], false, false, false, rust.to_str(), docs.to_str()));
+	assert!(!crate::process_all(&[invalid.to_string_lossy().into_owned()], false, false, false, rust.to_str(), docs.to_str(), &[], &Default::default()));
 	assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
 	assert!(!rust.join(".lsidl-generated.manifest").exists());
 
 	let valid = input.join("valid.lsidl");
 	std::fs::write(&valid, "//! Test package.\npackage liber:valid@1; record value { number: u32 }").unwrap();
 	let paths = [valid.to_string_lossy().into_owned()];
-	assert!(crate::process_all(&paths, false, false, false, rust.to_str(), docs.to_str()));
-	assert!(crate::process_all(&paths, false, true, false, rust.to_str(), docs.to_str()));
+	assert!(crate::process_all(&paths, false, false, false, rust.to_str(), docs.to_str(), &[], &Default::default()));
+	assert!(crate::process_all(&paths, false, true, false, rust.to_str(), docs.to_str(), &[], &Default::default()));
 	let generated = rust.join("generated/liber/valid/v1.rs");
 	std::fs::write(&generated, "drift\n").unwrap();
-	assert!(!crate::process_all(&paths, false, true, false, rust.to_str(), docs.to_str()));
+	assert!(!crate::process_all(&paths, false, true, false, rust.to_str(), docs.to_str(), &[], &Default::default()));
 	assert_eq!(std::fs::read_to_string(&generated).unwrap(), "drift\n");
+	let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_package_selection_and_external_ownership_are_explicit() {
+	let root = temp_dir("package-selection");
+	let input = root.join("input");
+	let selected = root.join("selected");
+	let external = root.join("external");
+	std::fs::create_dir_all(&input).unwrap();
+	let base = input.join("base.lsidl");
+	let storage = input.join("storage.lsidl");
+	std::fs::write(&base, "package liber:base@1; enum error { failed = 1 }").unwrap();
+	std::fs::write(&storage, "package liber:storage@1; use liber:base@1.{error}; record status { error: error }").unwrap();
+	let paths = [base.to_string_lossy().into_owned(), storage.to_string_lossy().into_owned()];
+	let packages = ["liber:base@1".to_string()];
+	assert!(crate::process_all(&paths, false, false, false, selected.to_str(), None, &packages, &Default::default()));
+	assert!(selected.join("generated/liber/base/v1.rs").is_file());
+	assert!(!selected.join("generated/liber/storage/v1.rs").exists());
+
+	let owners = std::collections::BTreeMap::from([("liber:storage@1".to_string(), "storage_proto::generated::liber::storage".to_string())]);
+	assert!(crate::process_all(&paths, false, false, false, external.to_str(), None, &[], &owners));
+	assert!(!external.join("generated/liber/storage/v1.rs").exists());
+	let index = std::fs::read_to_string(external.join("generated/liber/mod.rs")).unwrap();
+	assert!(index.contains("pub use storage_proto::generated::liber::storage;"));
+	let missing = ["liber:missing@1".to_string()];
+	assert!(!crate::process_all(&paths, false, false, false, external.to_str(), None, &missing, &Default::default()));
 	let _ = std::fs::remove_dir_all(root);
 }
 

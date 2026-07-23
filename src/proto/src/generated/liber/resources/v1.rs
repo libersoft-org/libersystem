@@ -40,10 +40,10 @@ impl ResourceType {
 	pub fn decode(bytes: &[u8]) -> Option<ResourceType> {
 		ResourceType::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<ResourceType> {
+	pub fn read(r: &mut Reader) -> Option<ResourceType> {
 		match r.u8()? {
 			0 => Some(ResourceType::Memory),
 			1 => Some(ResourceType::Handles),
@@ -80,13 +80,13 @@ impl ResourceUsage {
 	pub fn decode(bytes: &[u8]) -> Option<ResourceUsage> {
 		ResourceUsage::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		self.r#type.write(w)?;
 		w.u64(self.used)?;
 		w.u64(self.limit)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<ResourceUsage> {
+	pub fn read(r: &mut Reader) -> Option<ResourceUsage> {
 		let r#type = ResourceType::read(r)?;
 		let used = r.u64()?;
 		let limit = r.u64()?;
@@ -118,7 +118,7 @@ impl Budget {
 	pub fn decode(bytes: &[u8]) -> Option<Budget> {
 		Budget::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
 		if self.usage.len() > u16::MAX as usize {
 			return None;
@@ -129,7 +129,7 @@ impl Budget {
 		}
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Budget> {
+	pub fn read(r: &mut Reader) -> Option<Budget> {
 		let name = r.string_lp()?;
 		let usage = {
 			let v1 = r.u16()? as usize;

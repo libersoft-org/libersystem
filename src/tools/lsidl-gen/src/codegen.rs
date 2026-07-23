@@ -226,7 +226,7 @@ impl Cg {
 		self.line("");
 		self.line(&format!("impl {ty} {{"));
 		self.codec_methods(&ty);
-		self.line("\tpub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {");
+		self.line("\tpub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {");
 		for f in &r.fields {
 			let place = format!("self.{}", field_ident(&f.name));
 			let code = self.write_place(&f.ty, &place, false).map_err(|m| Error::new(f.span, m))?;
@@ -234,7 +234,7 @@ impl Cg {
 		}
 		self.line("\t\tSome(())");
 		self.line("\t}");
-		self.line(&format!("\tpub(crate) fn read(r: &mut Reader) -> Option<{ty}> {{"));
+		self.line(&format!("\tpub fn read(r: &mut Reader) -> Option<{ty}> {{"));
 		for f in &r.fields {
 			let expr = self.read_value(&f.ty).map_err(|m| Error::new(f.span, m))?;
 			self.line(&format!("\t\tlet {} = {expr};", field_ident(&f.name)));
@@ -264,10 +264,10 @@ impl Cg {
 		self.line("");
 		self.line(&format!("impl {ty} {{"));
 		self.codec_methods(&ty);
-		self.line("\tpub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {");
+		self.line("\tpub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {");
 		self.line("\t\tw.u8(*self as u8)");
 		self.line("\t}");
-		self.line(&format!("\tpub(crate) fn read(r: &mut Reader) -> Option<{ty}> {{"));
+		self.line(&format!("\tpub fn read(r: &mut Reader) -> Option<{ty}> {{"));
 		self.line("\t\tmatch r.u8()? {");
 		for (c, ord) in e.cases.iter().zip(&ords) {
 			self.line(&format!("\t\t\t{ord} => Some({ty}::{}),", camel(&c.name)));
@@ -300,7 +300,7 @@ impl Cg {
 		self.line("");
 		self.line(&format!("impl {ty} {{"));
 		self.codec_methods(&ty);
-		self.line("\tpub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {");
+		self.line("\tpub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {");
 		self.line("\t\tmatch self {");
 		for (tag, c) in v.cases.iter().enumerate() {
 			match &c.payload {
@@ -315,7 +315,7 @@ impl Cg {
 		self.line("\t\t}");
 		self.line("\t\tSome(())");
 		self.line("\t}");
-		self.line(&format!("\tpub(crate) fn read(r: &mut Reader) -> Option<{ty}> {{"));
+		self.line(&format!("\tpub fn read(r: &mut Reader) -> Option<{ty}> {{"));
 		self.line("\t\tmatch r.u8()? {");
 		for (tag, c) in v.cases.iter().enumerate() {
 			match &c.payload {
@@ -349,10 +349,10 @@ impl Cg {
 			self.line(&format!("\tpub const {}: {width} = 1 << {i};", screaming(&flag.name)));
 		}
 		self.codec_methods(&ty);
-		self.line("\tpub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {");
+		self.line("\tpub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {");
 		self.line(&format!("\t\tw.{width}(self.0)"));
 		self.line("\t}");
-		self.line(&format!("\tpub(crate) fn read(r: &mut Reader) -> Option<{ty}> {{"));
+		self.line(&format!("\tpub fn read(r: &mut Reader) -> Option<{ty}> {{"));
 		self.line(&format!("\t\tSome({ty}(r.{width}()?))"));
 		self.line("\t}");
 		self.line("}");

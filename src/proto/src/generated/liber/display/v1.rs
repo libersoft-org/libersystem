@@ -33,10 +33,10 @@ impl PixelFormat {
 	pub fn decode(bytes: &[u8]) -> Option<PixelFormat> {
 		PixelFormat::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<PixelFormat> {
+	pub fn read(r: &mut Reader) -> Option<PixelFormat> {
 		match r.u8()? {
 			0 => Some(PixelFormat::B8g8r8x8),
 			_ => None,
@@ -72,7 +72,7 @@ impl SurfaceInfo {
 	pub fn decode(bytes: &[u8]) -> Option<SurfaceInfo> {
 		SurfaceInfo::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.set_handle(self.pixels.handle)?;
 		w.u64(self.pixels.len)?;
 		w.u32(self.width)?;
@@ -81,7 +81,7 @@ impl SurfaceInfo {
 		self.format.write(w)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<SurfaceInfo> {
+	pub fn read(r: &mut Reader) -> Option<SurfaceInfo> {
 		let pixels = {
 			let len = r.u64()?;
 			let handle = r.take_handle()?;
@@ -118,12 +118,12 @@ impl DisplayEvent {
 	pub fn decode(bytes: &[u8]) -> Option<DisplayEvent> {
 		DisplayEvent::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u32(self.width)?;
 		w.u32(self.height)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<DisplayEvent> {
+	pub fn read(r: &mut Reader) -> Option<DisplayEvent> {
 		let width = r.u32()?;
 		let height = r.u32()?;
 		Some(DisplayEvent { width, height })
@@ -160,7 +160,7 @@ impl PresentationStats {
 	pub fn decode(bytes: &[u8]) -> Option<PresentationStats> {
 		PresentationStats::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u64(self.presents)?;
 		w.u64(self.direct_presents)?;
 		w.u64(self.scaled_presents)?;
@@ -171,7 +171,7 @@ impl PresentationStats {
 		w.u64(self.max_present_ns)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<PresentationStats> {
+	pub fn read(r: &mut Reader) -> Option<PresentationStats> {
 		let presents = r.u64()?;
 		let direct_presents = r.u64()?;
 		let scaled_presents = r.u64()?;

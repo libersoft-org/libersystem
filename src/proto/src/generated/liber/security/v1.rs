@@ -53,10 +53,10 @@ impl Capability {
 	pub fn decode(bytes: &[u8]) -> Option<Capability> {
 		Capability::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Capability> {
+	pub fn read(r: &mut Reader) -> Option<Capability> {
 		match r.u8()? {
 			0 => Some(Capability::Log),
 			1 => Some(Capability::Storage),
@@ -111,7 +111,7 @@ impl Manifest {
 	pub fn decode(bytes: &[u8]) -> Option<Manifest> {
 		Manifest::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.component.as_bytes())?;
 		if self.requested.len() > u16::MAX as usize {
 			return None;
@@ -129,7 +129,7 @@ impl Manifest {
 		}
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Manifest> {
+	pub fn read(r: &mut Reader) -> Option<Manifest> {
 		let component = r.string_lp()?;
 		let requested = {
 			let v2 = r.u16()? as usize;
@@ -181,14 +181,14 @@ impl AuditEntry {
 	pub fn decode(bytes: &[u8]) -> Option<AuditEntry> {
 		AuditEntry::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.component.as_bytes())?;
 		self.capability.write(w)?;
 		w.boolean(self.granted)?;
 		w.boolean(self.dynamic)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<AuditEntry> {
+	pub fn read(r: &mut Reader) -> Option<AuditEntry> {
 		let component = r.string_lp()?;
 		let capability = Capability::read(r)?;
 		let granted = r.boolean()?;

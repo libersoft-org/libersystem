@@ -35,13 +35,13 @@ impl PointerEvent {
 	pub fn decode(bytes: &[u8]) -> Option<PointerEvent> {
 		PointerEvent::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u16(self.col)?;
 		w.u16(self.row)?;
 		w.u8(self.buttons)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<PointerEvent> {
+	pub fn read(r: &mut Reader) -> Option<PointerEvent> {
 		let col = r.u16()?;
 		let row = r.u16()?;
 		let buttons = r.u8()?;
@@ -73,12 +73,12 @@ impl KeyEvent {
 	pub fn decode(bytes: &[u8]) -> Option<KeyEvent> {
 		KeyEvent::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u16(self.code)?;
 		w.boolean(self.pressed)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<KeyEvent> {
+	pub fn read(r: &mut Reader) -> Option<KeyEvent> {
 		let code = r.u16()?;
 		let pressed = r.boolean()?;
 		Some(KeyEvent { code, pressed })

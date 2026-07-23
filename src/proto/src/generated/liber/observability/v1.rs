@@ -35,10 +35,10 @@ impl ComponentType {
 	pub fn decode(bytes: &[u8]) -> Option<ComponentType> {
 		ComponentType::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<ComponentType> {
+	pub fn read(r: &mut Reader) -> Option<ComponentType> {
 		match r.u8()? {
 			0 => Some(ComponentType::Service),
 			1 => Some(ComponentType::Driver),
@@ -76,10 +76,10 @@ impl ComponentState {
 	pub fn decode(bytes: &[u8]) -> Option<ComponentState> {
 		ComponentState::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<ComponentState> {
+	pub fn read(r: &mut Reader) -> Option<ComponentState> {
 		match r.u8()? {
 			0 => Some(ComponentState::Running),
 			1 => Some(ComponentState::Stopped),
@@ -123,7 +123,7 @@ impl Counters {
 	pub fn decode(bytes: &[u8]) -> Option<Counters> {
 		Counters::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u64(self.messages_sent)?;
 		w.u64(self.messages_received)?;
 		w.u64(self.handles)?;
@@ -133,7 +133,7 @@ impl Counters {
 		w.bytes_lp(self.last_failure.as_bytes())?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Counters> {
+	pub fn read(r: &mut Reader) -> Option<Counters> {
 		let messages_sent = r.u64()?;
 		let messages_received = r.u64()?;
 		let handles = r.u64()?;
@@ -172,7 +172,7 @@ impl Component {
 	pub fn decode(bytes: &[u8]) -> Option<Component> {
 		Component::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
 		self.r#type.write(w)?;
 		self.state.write(w)?;
@@ -186,7 +186,7 @@ impl Component {
 		self.counters.write(w)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Component> {
+	pub fn read(r: &mut Reader) -> Option<Component> {
 		let name = r.string_lp()?;
 		let r#type = ComponentType::read(r)?;
 		let state = ComponentState::read(r)?;
@@ -227,12 +227,12 @@ impl TraceSpan {
 	pub fn decode(bytes: &[u8]) -> Option<TraceSpan> {
 		TraceSpan::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
 		w.u64(self.duration_ns)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<TraceSpan> {
+	pub fn read(r: &mut Reader) -> Option<TraceSpan> {
 		let name = r.string_lp()?;
 		let duration_ns = r.u64()?;
 		Some(TraceSpan { name, duration_ns })
@@ -262,7 +262,7 @@ impl Graph {
 	pub fn decode(bytes: &[u8]) -> Option<Graph> {
 		Graph::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		if self.components.len() > u16::MAX as usize {
 			return None;
 		}
@@ -279,7 +279,7 @@ impl Graph {
 		}
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Graph> {
+	pub fn read(r: &mut Reader) -> Option<Graph> {
 		let components = {
 			let v5 = r.u16()? as usize;
 			let mut v6 = Vec::new();
@@ -446,7 +446,7 @@ impl SupervisorStat {
 	pub fn decode(bytes: &[u8]) -> Option<SupervisorStat> {
 		SupervisorStat::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
 		w.bytes_lp(self.state.as_bytes())?;
 		w.u32(self.restarts)?;
@@ -454,7 +454,7 @@ impl SupervisorStat {
 		w.bytes_lp(self.last_failure.as_bytes())?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<SupervisorStat> {
+	pub fn read(r: &mut Reader) -> Option<SupervisorStat> {
 		let name = r.string_lp()?;
 		let state = r.string_lp()?;
 		let restarts = r.u32()?;

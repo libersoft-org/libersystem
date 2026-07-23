@@ -37,10 +37,10 @@ impl Severity {
 	pub fn decode(bytes: &[u8]) -> Option<Severity> {
 		Severity::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Severity> {
+	pub fn read(r: &mut Reader) -> Option<Severity> {
 		match r.u8()? {
 			0 => Some(Severity::Trace),
 			1 => Some(Severity::Debug),
@@ -74,12 +74,12 @@ impl Field {
 	pub fn decode(bytes: &[u8]) -> Option<Field> {
 		Field::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.key.as_bytes())?;
 		w.bytes_lp(self.value.as_bytes())?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Field> {
+	pub fn read(r: &mut Reader) -> Option<Field> {
 		let key = r.string_lp()?;
 		let value = r.string_lp()?;
 		Some(Field { key, value })
@@ -110,7 +110,7 @@ impl Entry {
 	pub fn decode(bytes: &[u8]) -> Option<Entry> {
 		Entry::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u64(self.timestamp)?;
 		self.severity.write(w)?;
 		w.bytes_lp(self.source.as_bytes())?;
@@ -123,7 +123,7 @@ impl Entry {
 		}
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Entry> {
+	pub fn read(r: &mut Reader) -> Option<Entry> {
 		let timestamp = r.u64()?;
 		let severity = Severity::read(r)?;
 		let source = r.string_lp()?;
@@ -164,7 +164,7 @@ impl Query {
 	pub fn decode(bytes: &[u8]) -> Option<Query> {
 		Query::read(&mut Reader::new(bytes))
 	}
-	pub(crate) fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		match &self.since {
 			Some(v3) => {
 				w.u8(1)?;
@@ -204,7 +204,7 @@ impl Query {
 		w.u32(self.limit)?;
 		Some(())
 	}
-	pub(crate) fn read(r: &mut Reader) -> Option<Query> {
+	pub fn read(r: &mut Reader) -> Option<Query> {
 		let since = if r.u8()? != 0 { Some(r.u64()?) } else { None };
 		let min_severity = if r.u8()? != 0 { Some(Severity::read(r)?) } else { None };
 		let source = if r.u8()? != 0 { Some(r.string_lp()?) } else { None };
