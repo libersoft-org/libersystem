@@ -3711,7 +3711,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     compiler-owned weak `__umodti3` export alongside `__udivti3`. JPEG's legitimate
     345-byte Rust v0 symbol raised the bounded runtime registry limit to 512 bytes, with
     an executable boundary test. No package-local `tools` symbols remain in these consumers.
-- [ ] Extend the artifact manifest with an explicit, checked image-link schema rather
+- [x] Extend the artifact manifest with an explicit, checked image-link schema rather
   than hiding edges in shell `case` arms. Each `library` row records logical identity,
   crate/source owner, output class/path, direct providers and build-feature set; each
   native executable row records logical command/artifact identity, crate + bin target,
@@ -3793,7 +3793,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     creating a process. Every dynamic executable carries a bounded order record on all
     three targets, and the process suite pins both all 48 tools and an explicit
     linker/runtime drift rejection.
-- [ ] Keep libraries atomized by ownership; do not replace static bloat with one giant
+- [x] Keep libraries atomized by ownership; do not replace static bloat with one giant
   `tools.lslib`, `image.lslib` or `audio.lslib`. Required foundation layers:
   - `lsrt.lslib`: runtime/core/alloc/compiler primitives used by every executable;
   - `wire.lslib`: transport-independent codec primitives and representation helpers;
@@ -3930,7 +3930,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     7,008/7,656/8,984 bytes on x86_64/AArch64/RISC-V. All three image graphs pass;
     focused service/storage streamed write/read/mutation coverage passes 41/41 and
     boot/storage package coverage passes 21/21.
-- [ ] Migrate in measured, independently runnable waves:
+- [x] Migrate in measured, independently runnable waves:
   1. `echo`, `uname`, `uptime`, `dmesg`, `free`, `lscpu`, `lsmem`, `lsirq`, `lspci`,
      `ptyecho`, `readln`, `script`: `lsrt` plus only the domain/CLI leaves they use;
   2. storage/path tools (`cat`, `write`, `rm`, `ls`, `du`, `mkdir`, `rmdir`, `snap`,
@@ -3944,7 +3944,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
      no longer contain JPEG/WebP/Vorbis/MP3/etc. implementation symbols already present
      in `.lslib`; every selected format provider loads exactly once per process graph and
      immutable pages are shared across concurrent consumers.
-- [ ] Update dependency declarations so source ownership matches binary ownership. The
+- [x] Update dependency declarations so source ownership matches binary ownership. The
   current `tools/Cargo.toml` may retain several `[[bin]]` targets, but codec dependencies
   move behind the exact binaries/provider crates that use them and the generated image
   graph records actual direct imports. Cargo's package-wide dependency list is not proof
@@ -3959,7 +3959,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   boot-critical executables in `init.pkg` may remain self-contained until their library
   loading source is available before StorageService; that exception never permits a
   duplicate static artifact on the mounted system volume.
-- [ ] Size, sharing and startup gates per wave: record raw object, stripped PIE, direct +
+- [x] Size, sharing and startup gates per wave: record raw object, stripped PIE, direct +
   transitive library bytes, private/RW pages, shared RX/R pages and cold/warm launch time
   in `docs/PERF.md`. Size acceptance is structural, not a regression percentage: an
   ordinary command PIE contains its command logic/rodata/relocations, not a second core,
@@ -3967,7 +3967,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   same `lsrt`/domain-client frames; two codec consumers map the same codec text frames.
   Optimize relocation batching, symbol lookup/cache and page I/O later if launch latency
   is high; do not restore static linking as the optimization.
-- [ ] Make the manifest-driven image build safely incremental so the ordinary
+- [x] Make the manifest-driven image build safely incremental so the ordinary
   `just run spice` edit/run loop does not clean-rebuild all providers and 68 executables.
   Correctness is the hard gate: a cache hit is permitted only when a content-addressed
   fingerprint proves that every input affecting the artifact is identical; a missing,
@@ -4433,7 +4433,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     Dynamic runtime coverage passes 21/21 on x86_64, AArch64 and RISC-V. A combined
     x86 shell/storage gate passes 36/36, including path resolution, cross-volume image
     conversion, package staging, PTY and shell workflows.
-- [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
+- [x] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,
   duplicate allocator/runtime symbol, static-tool rejection and per-tool undeclared-edge
@@ -4445,6 +4445,20 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   checked report lists every migrated tool, its direct source imports, declared/direct/
   transitive providers, PIE/private byte counts and test command, so “wave complete” is
   reproducible rather than a prose grouping.
+  - Final gate result (M126a, 2026-07-23): all 60 providers and 67 dynamic executables
+    pass exact-edge graph construction on x86_64, AArch64 and RISC-V. Package staging
+    parses every provider and executable, walks its complete `RELA` and PLT relocation
+    tables, and rejects any relocation outside the target loader allowlist as well as
+    symbolic relative relocations, TLS/COPY/text relocations, `PT_INTERP`, W+X segments,
+    malformed dynamic metadata and identity or canonical-order drift. Build-time
+    injection gates preserve each target archive while rejecting static tools,
+    undeclared or duplicate dependencies and malformed dynamic, symbol, relocation and
+    dependency metadata. ProcessService independently rejects missing, substituted,
+    duplicate-export and cyclic providers without returning a Process capability.
+    Governed runtime representatives cover every migration wave, including arguments,
+    working directories, stdio, capability grants, clean exit and job control. Dynamic
+    runtime coverage passes 21/21 on every architecture, and the checked reports cover
+    all 48 tools across three targets, 15 target/wave rows and three whole images.
 - Done when: all 48 current `/bin` artifacts and every newly added M130/M131 command are
   PIE `ET_DYN` files with canonical `DT_NEEDED` edges; no `/bin` artifact statically
   contains `core`/`alloc`/`rt`/generated-protocol or codec implementations owned by a
