@@ -22,12 +22,8 @@ pub use wire as codec;
 pub mod generated;
 pub mod system;
 
-// Hand-written helpers on the generated wire types (e.g. `Ipv4Addr::parse` /
-// `Ipv4Addr::render` and MAC rendering).
-pub mod addr;
-
-// Hand-written ISO-8601 rendering for the generated `Timestamp` type.
-pub mod clock;
+pub use network_proto::addr;
+pub use time_proto::clock;
 
 // Hand-written `vol://` path resolution shared by the shell and the sandboxed tools.
 pub mod path;

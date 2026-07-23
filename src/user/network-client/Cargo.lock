@@ -3,5 +3,29 @@
 version = 4
 
 [[package]]
+name = "base-proto"
+version = "0.0.0"
+dependencies = [
+ "wire",
+]
+
+[[package]]
 name = "network-client"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "network-proto",
+ "wire",
+]
+
+[[package]]
+name = "network-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "wire"
 version = "0.0.0"

@@ -3,7 +3,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::{Error, Graph, SupervisorStat};
+use base_proto::generated::liber::base::v1::Error;
+use observability_proto::generated::liber::observability::v1::{Graph, SupervisorStat};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_observability_system_graph_snapshot"]

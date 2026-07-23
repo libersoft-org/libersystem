@@ -8,4 +8,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-shared-image = []
+shared-image = ["observability-proto/shared-image"]
+
+[dependencies]
+observability-proto = { path = "../observability-proto" }

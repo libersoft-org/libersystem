@@ -3,7 +3,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::{Budget, Error, ResourceType};
+use base_proto::generated::liber::base::v1::Error;
+use resources_proto::generated::liber::resources::v1::{Budget, ResourceType};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_resources_resources_usage"]

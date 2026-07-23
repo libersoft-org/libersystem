@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "proto"
+name = "base-proto"
 version = "0.0.0"
 dependencies = [
  "wire",
@@ -13,7 +13,16 @@ dependencies = [
 name = "resources-client"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
+ "resources-proto",
+]
+
+[[package]]
+name = "resources-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
 ]
 
 [[package]]

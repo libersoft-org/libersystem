@@ -8,4 +8,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-shared-image = []
+shared-image = ["network-proto/shared-image"]
+
+[dependencies]
+network-proto = { path = "../network-proto" }

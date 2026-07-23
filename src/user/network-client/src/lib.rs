@@ -3,8 +3,9 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
-use proto::codec::Buffer;
-use proto::system::{Endpoint, Error, Ipv4Addr, NetCapacity, NetInfo, PingReply, SockInfo, TcpRequest};
+use base_proto::generated::liber::base::v1::Error;
+use network_proto::generated::liber::network::v1::{Endpoint, Ipv4Addr, NetCapacity, NetInfo, PingReply, SockInfo, TcpRequest};
+use wire::Buffer;
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_network_network_info"]

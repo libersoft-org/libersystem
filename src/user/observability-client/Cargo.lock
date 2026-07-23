@@ -3,16 +3,25 @@
 version = 4
 
 [[package]]
-name = "observability-client"
+name = "base-proto"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "wire",
 ]
 
 [[package]]
-name = "proto"
+name = "observability-client"
 version = "0.0.0"
 dependencies = [
+ "base-proto",
+ "observability-proto",
+]
+
+[[package]]
+name = "observability-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
  "wire",
 ]
 

@@ -1,5 +1,7 @@
 [dependencies]
-proto = { path = "../../proto" }
+base-proto = { path = "../base-proto" }
+network-proto = { path = "../network-proto" }
+wire = { path = "../../wire" }
 [package]
 name = "network-client"
 edition = "2024"

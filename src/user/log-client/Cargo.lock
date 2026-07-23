@@ -3,16 +3,25 @@
 version = 4
 
 [[package]]
-name = "log-client"
+name = "base-proto"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "wire",
 ]
 
 [[package]]
-name = "proto"
+name = "log-client"
 version = "0.0.0"
 dependencies = [
+ "base-proto",
+ "log-proto",
+]
+
+[[package]]
+name = "log-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
  "wire",
 ]
 

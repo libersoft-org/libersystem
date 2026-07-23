@@ -1,6 +1,7 @@
 #![no_std]
 
-use proto::system::{Error, Timestamp};
+use base_proto::generated::liber::base::v1::Error;
+use time_proto::generated::liber::time::v1::Timestamp;
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_time_time_now"]

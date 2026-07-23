@@ -8,16 +8,23 @@ description = "Generated LSIDL bindings (wire codec, clients, servers) for Liber
 [features]
 default = []
 channel-client-impl = ["dep:ipc-client"]
-shared-image = ["channel-client-impl", "config-proto/shared-image", "display-proto/shared-image", "input-proto/shared-image", "ipc-client/shared-image", "process-proto/shared-image", "security-proto/shared-image", "session-proto/shared-image", "storage-proto/shared-image"]
+shared-image = ["audio-proto/shared-image", "channel-client-impl", "config-proto/shared-image", "device-proto/shared-image", "display-proto/shared-image", "input-proto/shared-image", "ipc-client/shared-image", "log-proto/shared-image", "network-proto/shared-image", "observability-proto/shared-image", "process-proto/shared-image", "resources-proto/shared-image", "security-proto/shared-image", "session-proto/shared-image", "storage-proto/shared-image", "time-proto/shared-image"]
 
 [dependencies]
+audio-proto = { path = "../user/audio-proto" }
 base-proto = { path = "../user/base-proto" }
 config-proto = { path = "../user/config-proto" }
+device-proto = { path = "../user/device-proto" }
 display-proto = { path = "../user/display-proto" }
 input-proto = { path = "../user/input-proto" }
+log-proto = { path = "../user/log-proto" }
+network-proto = { path = "../user/network-proto" }
+observability-proto = { path = "../user/observability-proto" }
 process-proto = { path = "../user/process-proto" }
+resources-proto = { path = "../user/resources-proto" }
 security-proto = { path = "../user/security-proto" }
 session-proto = { path = "../user/session-proto" }
 storage-proto = { path = "../user/storage-proto" }
+time-proto = { path = "../user/time-proto" }
 wire = { path = "../wire" }
 ipc-client = { path = "../user/ipc-client", optional = true }

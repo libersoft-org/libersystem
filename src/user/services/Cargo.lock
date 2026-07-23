@@ -7,6 +7,15 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "audio-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "base-proto"
 version = "0.0.0"
 dependencies = [
@@ -24,6 +33,15 @@ dependencies = [
  "base-proto",
  "ipc-client",
  "storage-proto",
+ "wire",
+]
+
+[[package]]
+name = "device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
  "wire",
 ]
 
@@ -62,6 +80,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "log-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "network-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "observability-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "pcm"
 version = "0.0.0"
 
@@ -82,15 +127,31 @@ dependencies = [
 name = "proto"
 version = "0.0.0"
 dependencies = [
+ "audio-proto",
  "base-proto",
  "config-proto",
+ "device-proto",
  "display-proto",
  "input-proto",
  "ipc-client",
+ "log-proto",
+ "network-proto",
+ "observability-proto",
  "process-proto",
+ "resources-proto",
  "security-proto",
  "session-proto",
  "storage-proto",
+ "time-proto",
+ "wire",
+]
+
+[[package]]
+name = "resources-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
  "wire",
 ]
 
@@ -162,6 +223,15 @@ dependencies = [
 [[package]]
 name = "term"
 version = "0.0.0"
+
+[[package]]
+name = "time-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "wasm"

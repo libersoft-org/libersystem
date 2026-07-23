@@ -4661,7 +4661,7 @@ fn system_packages_use_canonical_executable_names() {
 		library_identities += usize::from(name.starts_with(b"id/lib/"));
 		executable_identities += usize::from(name.starts_with(b"id/bin/"));
 	}
-	assert_eq!(library_identities, 54, "every staged library has one identity record");
+	assert_eq!(library_identities, 61, "every staged library has one identity record");
 	assert_eq!(executable_identities, 68, "every staged dynamic executable has one identity record");
 	assert!(volume.lookup(b"id/lib/imgconv").is_some(), "library identity namespace preserves imgconv");
 	assert!(volume.lookup(b"id/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");
@@ -5353,26 +5353,26 @@ fn dynamic_wave_launch_metrics_are_structurally_sound() {
 	#[cfg(target_arch = "x86_64")]
 	let representatives = [
 		(1u8, b"echo" as &[u8], 100u32, 14usize, 80usize),
-		(2, b"cat" as &[u8], 102, 22, 145),
-		(3, b"date" as &[u8], 104, 21, 144),
-		(4, b"ip" as &[u8], 106, 22, 144),
-		(5, b"imgconv" as &[u8], 108, 46, 408),
+		(2, b"cat" as &[u8], 102, 22, 107),
+		(3, b"date" as &[u8], 104, 21, 93),
+		(4, b"ip" as &[u8], 106, 21, 106),
+		(5, b"imgconv" as &[u8], 108, 46, 370),
 	];
 	#[cfg(target_arch = "aarch64")]
 	let representatives = [
 		(1u8, b"echo" as &[u8], 100u32, 14usize, 88usize),
-		(2, b"cat" as &[u8], 102, 28, 160),
-		(3, b"date" as &[u8], 104, 27, 159),
-		(4, b"ip" as &[u8], 106, 28, 159),
-		(5, b"imgconv" as &[u8], 108, 70, 430),
+		(2, b"cat" as &[u8], 102, 29, 117),
+		(3, b"date" as &[u8], 104, 25, 103),
+		(4, b"ip" as &[u8], 106, 26, 116),
+		(5, b"imgconv" as &[u8], 108, 71, 387),
 	];
 	#[cfg(target_arch = "riscv64")]
 	let representatives = [
 		(1u8, b"echo" as &[u8], 100u32, 14usize, 72usize),
-		(2, b"cat" as &[u8], 102, 27, 128),
-		(3, b"date" as &[u8], 104, 26, 127),
-		(4, b"ip" as &[u8], 106, 26, 127),
-		(5, b"imgconv" as &[u8], 108, 67, 321),
+		(2, b"cat" as &[u8], 102, 27, 97),
+		(3, b"date" as &[u8], 104, 25, 85),
+		(4, b"ip" as &[u8], 106, 25, 96),
+		(5, b"imgconv" as &[u8], 108, 67, 290),
 	];
 	for (wave, name, correlation, private_pages, shared_pages) in representatives {
 		measure_dynamic_wave_launch(&process_client, wave, name, correlation, private_pages, shared_pages);
@@ -5696,7 +5696,7 @@ fn dynamic_process_service_rejects_provider_cycle() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut mutated_volume = volume.to_vec();
 	replace_dynamic_needed(&mut mutated_volume, b"lib/wire.lslib", "lsrt.lslib", "wire.lslib");
-	let reply = launch_from_volume(&mutated_volume, b"dyn_probe", 89);
+	let reply = launch_from_volume(&mutated_volume, b"lscpu", 89);
 	assert_eq!(le_u32(&reply.bytes, 0), 89);
 	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a provider dependency cycle");
 	assert!(reply.caps.is_empty(), "a provider dependency cycle creates no process capability");

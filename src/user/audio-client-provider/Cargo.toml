@@ -8,4 +8,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-shared-image = []
+shared-image = ["audio-proto/shared-image"]
+
+[dependencies]
+audio-proto = { path = "../audio-proto" }

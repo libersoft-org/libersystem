@@ -3,16 +3,25 @@
 version = 4
 
 [[package]]
-name = "device-client"
+name = "base-proto"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "wire",
 ]
 
 [[package]]
-name = "proto"
+name = "device-client"
 version = "0.0.0"
 dependencies = [
+ "base-proto",
+ "device-proto",
+]
+
+[[package]]
+name = "device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
  "wire",
 ]
 

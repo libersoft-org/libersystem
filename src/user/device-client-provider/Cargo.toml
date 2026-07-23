@@ -8,4 +8,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-shared-image = []
+shared-image = ["device-proto/shared-image"]
+
+[dependencies]
+device-proto = { path = "../device-proto" }

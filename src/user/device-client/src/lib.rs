@@ -3,7 +3,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::{DeviceEntry, Error, UsbDevice};
+use base_proto::generated::liber::base::v1::Error;
+use device_proto::generated::liber::device::v1::{DeviceEntry, UsbDevice};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_device_device_list"]

@@ -8,4 +8,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-shared-image = []
+shared-image = ["time-proto/shared-image"]
+
+[dependencies]
+time-proto = { path = "../time-proto" }

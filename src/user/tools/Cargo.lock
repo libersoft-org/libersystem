@@ -68,12 +68,25 @@ dependencies = [
 name = "audio-client"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
+ "wire",
 ]
 
 [[package]]
 name = "audio-client-provider"
 version = "0.0.0"
+dependencies = [
+ "audio-proto",
+]
+
+[[package]]
+name = "audio-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "base-proto"
@@ -132,12 +145,25 @@ dependencies = [
 name = "device-client"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
+ "device-proto",
 ]
 
 [[package]]
 name = "device-client-provider"
 version = "0.0.0"
+dependencies = [
+ "device-proto",
+]
+
+[[package]]
+name = "device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "display-proto"
@@ -277,12 +303,25 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 name = "log-client"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
+ "log-proto",
 ]
 
 [[package]]
 name = "log-client-provider"
 version = "0.0.0"
+dependencies = [
+ "log-proto",
+]
+
+[[package]]
+name = "log-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "memchr"
@@ -317,12 +356,26 @@ checksum = "f69bdf7e634dc76798adc292ebd4f6e8e125cde6843a264fe398c52c3f7e8541"
 name = "network-client"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
+ "network-proto",
+ "wire",
 ]
 
 [[package]]
 name = "network-client-provider"
 version = "0.0.0"
+dependencies = [
+ "network-proto",
+]
+
+[[package]]
+name = "network-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "no_std_io"
@@ -337,12 +390,25 @@ dependencies = [
 name = "observability-client"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
+ "observability-proto",
 ]
 
 [[package]]
 name = "observability-client-provider"
 version = "0.0.0"
+dependencies = [
+ "observability-proto",
+]
+
+[[package]]
+name = "observability-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "ogg"
@@ -409,15 +475,22 @@ dependencies = [
 name = "proto"
 version = "0.0.0"
 dependencies = [
+ "audio-proto",
  "base-proto",
  "config-proto",
+ "device-proto",
  "display-proto",
  "input-proto",
  "ipc-client",
+ "log-proto",
+ "network-proto",
+ "observability-proto",
  "process-proto",
+ "resources-proto",
  "security-proto",
  "session-proto",
  "storage-proto",
+ "time-proto",
  "wire",
 ]
 
@@ -449,12 +522,25 @@ dependencies = [
 name = "resources-client"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
+ "resources-proto",
 ]
 
 [[package]]
 name = "resources-client-provider"
 version = "0.0.0"
+dependencies = [
+ "resources-proto",
+]
+
+[[package]]
+name = "resources-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "rt"
@@ -531,12 +617,25 @@ dependencies = [
 name = "time-client"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
+ "time-proto",
 ]
 
 [[package]]
 name = "time-client-provider"
 version = "0.0.0"
+dependencies = [
+ "time-proto",
+]
+
+[[package]]
+name = "time-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "tinyvec"

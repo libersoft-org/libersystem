@@ -1,13 +1,8 @@
-// Hand-written rendering for the generated `Timestamp` wire type: the canonical
-// time object renders itself as ISO-8601 (one representation of the same seconds),
-// the way `Ipv4Addr` renders its octets. The wall-clock policy (the offset, NTP)
-// lives in the userspace TimeService; this is purely how the value is displayed.
+//! Hand-written ISO-8601 rendering for the generated time wire type.
 
-use crate::system::Timestamp;
+use crate::generated::liber::time::v1::Timestamp;
 
 impl Timestamp {
-	// Render this instant as ISO-8601 UTC "YYYY-MM-DDTHH:MM:SSZ" into `out` (which
-	// must hold at least 20 bytes), returning the number of bytes written.
 	pub fn render(&self, out: &mut [u8]) -> usize {
 		let secs: i64 = self.unix_secs as i64;
 		let days: i64 = secs.div_euclid(86400);
@@ -39,8 +34,6 @@ impl Timestamp {
 	}
 }
 
-// The civil date (year, month, day) for a count of days since the Unix epoch, via
-// Howard Hinnant's `civil_from_days` (the inverse of `days_from_civil`).
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
 	let z: i64 = days + 719468;
 	let era: i64 = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -55,14 +48,12 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 	(year, month as u32, day as u32)
 }
 
-// Write a zero-padded 2-digit field into `out`, returning 2.
 fn write_u2(v: u32, out: &mut [u8]) -> usize {
 	out[0] = b'0' + (v / 10 % 10) as u8;
 	out[1] = b'0' + (v % 10) as u8;
 	2
 }
 
-// Write a zero-padded 4-digit field into `out`, returning 4 (years past 9999 wrap).
 fn write_u4(v: i64, out: &mut [u8]) -> usize {
 	let v: u32 = (v.rem_euclid(10000)) as u32;
 	out[0] = b'0' + (v / 1000 % 10) as u8;

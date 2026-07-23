@@ -4402,6 +4402,23 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     x86_64, AArch64 and RISC-V; focused x86 shell, process/config-service and
     storage/package slices pass 14/14, 46/46 and 31/31. Other generated domains remain in
     the compatibility provider.
+  - Final generated-package split result (M126a, 2026-07-23): all remaining LSIDL
+    packages now have dedicated providers. x86_64/AArch64/RISC-V sizes are
+    `audio-proto` 7,056/7,728/6,880 bytes, `device-proto` 26,024/30,512/29,704,
+    `log-proto` 34,824/42,936/37,592, `network-proto` 75,792/87,336/83,800,
+    `observability-proto` 53,312/63,608/58,592, `resources-proto`
+    25,792/29,888/28,656 and `time-proto` 13,096/15,152/16,912. Their concrete client
+    crates no longer depend on compatibility `proto`; network address helpers and time
+    rendering move to the crates that own `Ipv4Addr` and `Timestamp`. Services, tools
+    and stream/render consumers name exact package owners, while inline-only calls carry
+    no false runtime edge. `proto.lslib` is now a helper-only compatibility provider over
+    `lsrt`, sized 10,848/12,176/11,152 bytes. The image contains 61 providers. Exact-edge
+    triarch graphs and the checked 144-row report pass with zero generic residuals.
+    Dynamic runtime coverage passes 21/21 on every target, including the provider-cycle
+    hostile fixture retargeted to the current `lscpu -> wire` closure. Focused x86 audio,
+    drivers/device, process, shell and storage/package suites pass 9/9, 20/20, 46/46,
+    14/14 and 31/31. Generated package atomization is complete; only the helper-only
+    compatibility boundary remains for a separate ownership decision.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

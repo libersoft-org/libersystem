@@ -1,7 +1,7 @@
 #![no_std]
 
-use proto::codec::Buffer;
-use proto::system::Error;
+use base_proto::generated::liber::base::v1::Error;
+use wire::Buffer;
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_audio_audio_beep"]
