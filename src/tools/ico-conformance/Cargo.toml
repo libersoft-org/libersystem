@@ -4,5 +4,5 @@ edition = "2024"
 description = "Host interoperability gate for LiberSystem ICO output"
 
 [dependencies]
-ico = { path = "../../user/ico" }
-pix = { path = "../../user/pix" }
+ico = { path = "../../user/libs/ico" }
+pix = { path = "../../user/libs/pix" }

@@ -4,9 +4,9 @@ edition = "2024"
 description = "Host-only release throughput gate for LiberSystem audio decoder leaves"
 
 [dependencies]
-aiff = { path = "../../user/aiff" }
-flac = { path = "../../user/flac" }
-mp3 = { path = "../../user/mp3" }
-vorbis = { path = "../../user/vorbis" }
-wav = { path = "../../user/wav" }
-wavpack = { path = "../../user/wavpack" }
+aiff = { path = "../../user/libs/aiff" }
+flac = { path = "../../user/libs/flac" }
+mp3 = { path = "../../user/libs/mp3" }
+vorbis = { path = "../../user/libs/vorbis" }
+wav = { path = "../../user/libs/wav" }
+wavpack = { path = "../../user/libs/wavpack" }

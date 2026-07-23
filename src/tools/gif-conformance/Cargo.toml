@@ -4,5 +4,5 @@ edition = "2024"
 description = "Host interoperability gate for LiberSystem GIF output"
 
 [dependencies]
-gif = { path = "../../user/gif" }
-pix = { path = "../../user/pix" }
+gif = { path = "../../user/libs/gif" }
+pix = { path = "../../user/libs/pix" }

@@ -4,5 +4,5 @@ edition = "2024"
 description = "Host interoperability gate for LiberSystem ICNS output"
 
 [dependencies]
-icns = { path = "../../user/icns" }
-pix = { path = "../../user/pix" }
+icns = { path = "../../user/libs/icns" }
+pix = { path = "../../user/libs/pix" }

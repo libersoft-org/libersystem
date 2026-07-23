@@ -1,0 +1,48 @@
+[package]
+name = "drivers"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted. The drivers crate produces the userspace
+# virtio drivers DeviceManager launches, one isolated process per device.
+edition = "2024"
+build = "../../build.rs"
+description = "Userspace virtio drivers (blk, net, console, input)"
+
+[[bin]]
+name = "virtio_blk"
+path = "src/virtio_blk.rs"
+
+[[bin]]
+name = "virtio_net"
+path = "src/virtio_net.rs"
+
+[[bin]]
+name = "virtio_console"
+path = "src/virtio_console.rs"
+
+[[bin]]
+name = "virtio_input"
+path = "src/virtio_input.rs"
+
+[[bin]]
+name = "virtio_gpu"
+path = "src/virtio_gpu.rs"
+
+[[bin]]
+name = "virtio_snd"
+path = "src/virtio_snd.rs"
+
+[[bin]]
+name = "xhci"
+path = "src/xhci.rs"
+
+[dependencies]
+# Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
+# the syscall/IPC helpers); it re-exports the abi constants.
+rt = { path = "../../runtime/rt" }
+
+# The generated liber:system bindings - the xHCI driver serves the typed `usb`
+# inventory contract on its query channel.
+proto = { path = "../../../proto" }
+
+# Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
+# we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

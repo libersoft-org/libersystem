@@ -14,7 +14,7 @@ fn main() {
 	let user_root: PathBuf = find_user_root();
 	select_linker_script(&user_root);
 	export_product_metadata(&user_root);
-	generate_service_manifest();
+	generate_service_manifest(&user_root);
 }
 
 fn find_user_root() -> PathBuf {
@@ -54,13 +54,13 @@ fn select_linker_script(user_root: &PathBuf) {
 // entry, in the manifest's row order (the resolver derives the real start order from
 // the deps). The `restart` column is the supervisor's crash policy: `transparent`
 // (restart per the ladder, clients re-resolve through the broker) or `escalate`.
-fn generate_service_manifest() {
+fn generate_service_manifest(user_root: &PathBuf) {
 	if env::var("CARGO_PKG_NAME").as_deref() != Ok("services") {
 		return;
 	}
-	let path: PathBuf = PathBuf::from("manifest.txt");
+	let path: PathBuf = user_root.join("services/manifest.txt");
 	let text: String = fs::read_to_string(&path).unwrap_or_else(|e: std::io::Error| panic!("cannot read {}: {e}", path.display()));
-	println!("cargo:rerun-if-changed=manifest.txt");
+	println!("cargo:rerun-if-changed={}", path.display());
 
 	let mut out: String = String::new();
 	let mut count: usize = 0;

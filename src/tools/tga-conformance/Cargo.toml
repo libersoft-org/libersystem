@@ -4,5 +4,5 @@ edition = "2024"
 description = "Host interoperability gate for LiberSystem TGA output"
 
 [dependencies]
-tga = { path = "../../user/tga" }
-pix = { path = "../../user/pix" }
+tga = { path = "../../user/libs/tga" }
+pix = { path = "../../user/libs/pix" }

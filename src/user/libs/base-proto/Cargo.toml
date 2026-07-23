@@ -1,0 +1,7 @@
+[package]
+name = "base-proto"
+edition = "2024"
+description = "Generated LSIDL base bindings for LiberSystem"
+
+[dependencies]
+wire = { path = "../../../wire" }

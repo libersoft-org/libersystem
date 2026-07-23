@@ -67,8 +67,8 @@ fn main() {
 	fs::write(&modern, modern_png(&encoded, b"ic07")).unwrap();
 	let raw = decode_png_with_magick(&modern, &root.join("128.rgba"));
 	assert_eq!(raw, images[3].pixels, "external modern ICNS payload decode differs");
-	validate_external_decode(&root, "external-48", include_bytes!("../../../user/icns/tests/data/external-48.icns"));
-	validate_external_decode(&root, "external-128-legacy", include_bytes!("../../../user/icns/tests/data/external-128-legacy.icns"));
+	validate_external_decode(&root, "external-48", include_bytes!("../../../user/libs/icns/tests/data/external-48.icns"));
+	validate_external_decode(&root, "external-128-legacy", include_bytes!("../../../user/libs/icns/tests/data/external-128-legacy.icns"));
 	fs::remove_dir_all(&root).unwrap();
 	println!("ICNS interoperability: classic 16/32/48, legacy 128 decode, and PNG-backed 128 profiles passed");
 }

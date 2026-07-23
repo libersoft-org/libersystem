@@ -4,6 +4,6 @@ edition = "2024"
 description = "Host interoperability gate for LiberSystem PNG and APNG output"
 
 [dependencies]
-apng = { path = "../../user/apng" }
-png = { path = "../../user/png" }
-pix = { path = "../../user/pix" }
+apng = { path = "../../user/libs/apng" }
+png = { path = "../../user/libs/png" }
+pix = { path = "../../user/libs/pix" }

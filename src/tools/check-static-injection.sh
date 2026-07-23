@@ -280,11 +280,11 @@ check_target() {
 	local volume="$root/boot/.build/$volume_name"
 	local artifact_hash before after_failure after_restore
 	if [[ "$kind" == dependency-graph ]]; then
-		artifact="$root/$(source_path dyn_probe)/shared/$target/dyn_probe.order"
+		artifact="$root/boot/.build/system-image/$target/bin/dyn_probe.order"
 	elif [[ "$kind" == duplicate-edge || "$kind" == malformed-dynamic || "$kind" == malformed-symbol-relocation ]]; then
-		artifact="$root/$(source_path dyn_probe)/shared/$target/dyn_probe"
+		artifact="$root/boot/.build/system-image/$target/bin/dyn_probe"
 	else
-		artifact="$root/$(source_path tools)/shared/$target/echo"
+		artifact="$root/boot/.build/system-image/$target/bin/echo"
 	fi
 	[[ -f "$artifact" ]] || {
 		echo "image-injection-check: missing staged $label artifact for $kind" >&2

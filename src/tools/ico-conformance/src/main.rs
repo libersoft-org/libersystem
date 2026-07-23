@@ -61,10 +61,10 @@ fn main() {
 	fs::create_dir_all(&root).unwrap();
 	validate_encoded(&root, 32);
 	validate_encoded(&root, 256);
-	validate_external(&root, "external-png", include_bytes!("../../../user/ico/tests/data/external-png.ico"), true);
-	validate_external(&root, "external-dib-alpha", include_bytes!("../../../user/ico/tests/data/external-dib-alpha.ico"), true);
-	validate_external(&root, "external-dib-zero-alpha", include_bytes!("../../../user/ico/tests/data/external-dib-zero-alpha.ico"), true);
-	validate_external(&root, "external-dib-maskless", include_bytes!("../../../user/ico/tests/data/external-dib-maskless.ico"), false);
+	validate_external(&root, "external-png", include_bytes!("../../../user/libs/ico/tests/data/external-png.ico"), true);
+	validate_external(&root, "external-dib-alpha", include_bytes!("../../../user/libs/ico/tests/data/external-dib-alpha.ico"), true);
+	validate_external(&root, "external-dib-zero-alpha", include_bytes!("../../../user/libs/ico/tests/data/external-dib-zero-alpha.ico"), true);
+	validate_external(&root, "external-dib-maskless", include_bytes!("../../../user/libs/ico/tests/data/external-dib-maskless.ico"), false);
 	fs::remove_dir_all(&root).unwrap();
 	println!("ICO interoperability: PNG-backed output and 32-bit DIB input profiles passed");
 }

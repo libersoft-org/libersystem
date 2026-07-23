@@ -4,7 +4,7 @@ edition = "2024"
 description = "Host release encode/decode benchmark for LiberSystem image leaves"
 
 [dependencies]
-imgconv = { path = "../../user/imgconv" }
-pix = { path = "../../user/pix" }
-png = { path = "../../user/png" }
-webp = { path = "../../user/webp" }
+imgconv = { path = "../../user/libs/imgconv" }
+pix = { path = "../../user/libs/pix" }
+png = { path = "../../user/libs/png" }
+webp = { path = "../../user/libs/webp" }

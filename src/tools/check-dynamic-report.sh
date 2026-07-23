@@ -71,9 +71,7 @@ fi
 library_file() {
 	local target="$1"
 	local provider="$2"
-	local crate
-	crate="$(awk -v provider="$provider" '$1 == "library" && $2 == provider {print $3; count++} END {if (count != 1) exit 1}' "$manifest")"
-	printf '%s/%s/shared/%s/%s.lslib\n' "$root" "$(source_path "$crate")" "$target" "$provider"
+	printf '%s/boot/.build/system-image/%s/lib/%s.lslib\n' "$root" "$target" "$provider"
 }
 
 canonical_manifest_order() {
@@ -282,7 +280,7 @@ generate_report() {
 			for tool in $(for candidate in "${!waves[@]}"; do if [[ "${waves[$candidate]}" == "$wave" ]]; then printf '%s\n' "$candidate"; fi; done | sort); do
 				row="$(awk -v tool="$tool" '$1 == "dynamic" && $2 == tool && $3 == "tools" && $4 == "volume" {print; count++} END {if (count != 1) exit 1}' "$manifest")"
 				providers="$(cut -d' ' -f5- <<<"$(tr -s ' ' <<<"$row")")"
-				artifact="$root/$(source_path tools)/shared/$target/$tool"
+				artifact="$root/boot/.build/system-image/$target/bin/$tool"
 				order="$artifact.order"
 				[[ -f "$artifact" && -f "$order" ]] || {
 					echo "dynamic-report: missing $target artifact or order for $tool" >&2

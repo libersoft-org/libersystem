@@ -4562,7 +4562,7 @@ capability policy remain unchanged.
     volume-staged manifest rows exactly once: 48 commands, 20 internal executables, six
     drivers and 60 libraries. It also accounted for every one of the 15 loose factory
     files. No physical path has moved in this inventory step.
-- [ ] Remove the build system's `user/<crate>` assumption before the physical move.
+- [x] Remove the build system's `user/<crate>` assumption before the physical move.
   Give each manifest row or shared-build specification an explicit crate path, then
   update `kernel/build.rs`, `user/services/build.rs`, `tools/build-shared.sh`, the
   `Justfile` and Cargo path dependencies to consume it. Reject duplicate logical names,
@@ -4596,6 +4596,15 @@ capability policy remain unchanged.
   No source-level API refactor belongs in the move. A repository check fails if a Cargo
   crate remains directly under `src/user/`, if an old `src/user/<crate>` path survives,
   or if two physical paths claim the same logical artifact.
+  - Physical-move result (2026-07-23): all 73 crates now live under `runtime/`,
+    `services/`, `drivers/`, `apps/` or `libs/`, with Cargo paths and manifest source
+    rows updated while logical package and artifact identities remain unchanged. Shared
+    providers, executables, identity records, order records and build logs are emitted
+    only below `src/boot/.build/system-image/<target>/`; no build output is written into
+    a crate directory. Repository-wide ignore rules cover `.lslib`, `.lsexe`, `shared/`
+    and `target/`, and the commit gate rejects either physical or tracked source-tree
+    artifacts. Remaining work is the complete three-architecture graph validation and
+    the permanent stale-path check.
 - [ ] Define the factory `vol://system` hierarchy so its root contains directories only:
   - `bin/`: user-invoked `.lsexe` tools. A stateless single-file command may live
     directly here; an application/suite with private configuration, assets, logs or

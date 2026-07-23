@@ -267,16 +267,16 @@ fn user_elf_path(manifest: &Path, crate_path: &str, name: &str) -> PathBuf {
 	manifest.join("..").join(crate_path).join(format!("target/{}/debug/{name}", user_target()))
 }
 
-fn user_shared_path(manifest: &Path, crate_path: &str, name: &str) -> PathBuf {
-	manifest.join("..").join(crate_path).join(format!("shared/{}/{}.lslib", user_target(), name))
+fn user_shared_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
+	manifest.join(format!("../boot/.build/system-image/{}/lib/{name}.lslib", user_target()))
 }
 
-fn user_dynamic_path(manifest: &Path, crate_path: &str, name: &str) -> PathBuf {
-	manifest.join("..").join(crate_path).join(format!("shared/{}/{}", user_target(), name))
+fn user_dynamic_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
+	manifest.join(format!("../boot/.build/system-image/{}/bin/{name}", user_target()))
 }
 
-fn user_dynamic_order_path(manifest: &Path, crate_path: &str, name: &str) -> PathBuf {
-	manifest.join("..").join(crate_path).join(format!("shared/{}/{}.order", user_target(), name))
+fn user_dynamic_order_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
+	manifest.join(format!("../boot/.build/system-image/{}/bin/{name}.order", user_target()))
 }
 
 fn identity_path(artifact: &Path) -> PathBuf {

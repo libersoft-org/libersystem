@@ -6829,9 +6829,9 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	run_imgview_help_harness(imgview_elf, &mut system, &mut media);
 	run_imgview_harness(imgview_elf, b"vol://media/CROSS.BMP", &viewer_surface(&source), &mut system, &mut media);
 
-	let transparent_png = include_bytes!("../user/png/tests/data/external-rgba16.png");
+	let transparent_png = include_bytes!("../user/libs/png/tests/data/external-rgba16.png");
 	let transparent = png::decode_rgba(transparent_png).expect("decode transparent viewer fixture");
-	let animation_webp = include_bytes!("../user/webp/tests/data/external-animation.webp");
+	let animation_webp = include_bytes!("../user/libs/webp/tests/data/external-animation.webp");
 	let viewer_image = fat16_image(&[(*b"ALPHA   PNG", transparent_png.as_slice()), (*b"ANIM    WEB", animation_webp)], false);
 	let mut viewer_media = StorageHarness::start(storage_elf, b"FATBLOCK", &viewer_image, viewer_image.len() as u64);
 	run_imgview_harness(imgview_elf, b"vol://media/ALPHA.PNG", &viewer_surface(&transparent), &mut system, &mut viewer_media);
@@ -6906,7 +6906,7 @@ fn imgconv_governed_working_set_is_measured() {
 	let ultra_hd_image = png::decode_rgba(&ultra_hd_output).expect("4K output decodes");
 	assert_eq!((ultra_hd_image.width, ultra_hd_image.height), (3840, 2160));
 
-	let animation = include_bytes!("../user/webp/tests/data/external-animation.webp");
+	let animation = include_bytes!("../user/libs/webp/tests/data/external-animation.webp");
 	let media_image = fat16_image(&[(*b"ANIM    WEB", animation)], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
 	let animation_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED);

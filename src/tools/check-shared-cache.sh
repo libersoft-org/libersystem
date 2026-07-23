@@ -59,7 +59,7 @@ prime_graph() {
 case "$mode" in
 quick)
 	prime_graph
-	order_file="$root/$(source_path tools)/shared/x86_64-unknown-none/echo.order"
+	order_file="$root/boot/.build/system-image/x86_64-unknown-none/bin/echo.order"
 	order_cache="$root/boot/.build/image-artifacts-x86_64-unknown-none/executable-echo.order.sha256"
 	rm -f "$order_cache"
 	run_graph

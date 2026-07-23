@@ -1,0 +1,67 @@
+[package]
+name = "storage"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted. The storage crate
+# produces the userspace StorageService service and a small demo client, both
+# loaded from the init package.
+edition = "2024"
+build = "../../build.rs"
+description = "StorageService service and demo client"
+
+[features]
+default = []
+shared-image = ["ipc-client/shared-image", "proto/shared-image", "rt/shared-image"]
+
+[[bin]]
+name = "storage_service"
+path = "src/service.rs"
+
+[[bin]]
+name = "storage_client"
+path = "src/client.rs"
+
+[dependencies]
+ipc-client = { path = "../../libs/ipc-client" }
+# Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
+# the syscall/IPC/volume helpers); it re-exports the abi constants.
+rt = { path = "../../runtime/rt" }
+
+# Generated LSIDL bindings: StorageService serves the Storage.Volume contract and
+# the demo client speaks it, both via the proto codec + dispatch/client.
+proto = { path = "../../../proto" }
+
+# The writable on-disk filesystem (LiberFS) StorageService mounts on the virtio-blk
+# disk for the persistent volume.
+liberfs = { path = "../../../fs/liberfs" }
+
+# The read-only FAT12/16/32 and exFAT backend StorageService mounts on a second
+# virtio-blk disk for the foreign-media volume.
+fat = { path = "../../../fs/fat" }
+
+# The read-only ISO9660 backend StorageService mounts on a third virtio-blk disk for
+# the optical / install-media volume.
+iso9660 = { path = "../../../fs/iso9660" }
+
+# The read-only UDF backend StorageService mounts on a fourth virtio-blk disk for the
+# DVD / Blu-ray volume.
+udf = { path = "../../../fs/udf" }
+
+# Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
+# we do not set `panic = "abort"` per-profile (same reasoning as the kernel).
+
+# The dev build keeps this service debuggable but optimizes the filesystem crates
+# it links: LiberFS verifies a CRC32C per block it reads, and the unoptimized
+# checksum dominates every file open (a ~30 ms fixed cost on loading even a small
+# binary - the same lesson as the LiberFS crate, applied to the service build; opt-level 2 makes an
+# open I/O-bound again).
+[profile.dev.package.liberfs]
+opt-level = 2
+
+[profile.dev.package.fat]
+opt-level = 2
+
+[profile.dev.package.iso9660]
+opt-level = 2
+
+[profile.dev.package.udf]
+opt-level = 2

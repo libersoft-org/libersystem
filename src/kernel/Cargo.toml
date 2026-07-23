@@ -26,12 +26,12 @@ abi = { path = "../abi" }
 bootproto = { path = "../bootproto" }
 
 [dev-dependencies]
-bmp = { path = "../user/bmp" }
-gif = { path = "../user/gif" }
-pix = { path = "../user/pix" }
-png = { path = "../user/png" }
-tga = { path = "../user/tga" }
-webp = { path = "../user/webp" }
+bmp = { path = "../user/libs/bmp" }
+gif = { path = "../user/libs/gif" }
+pix = { path = "../user/libs/pix" }
+png = { path = "../user/libs/png" }
+tga = { path = "../user/libs/tga" }
+webp = { path = "../user/libs/webp" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we deliberately do NOT set `panic = "abort"` per-profile. Doing so makes cargo

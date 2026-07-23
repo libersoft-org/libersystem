@@ -10,6 +10,10 @@ target="$1"
 shift
 root="$(cd "$(dirname "$0")/.." && pwd)"
 artifact_manifest="$root/user/services/manifest.txt"
+artifact_output_root="$root/boot/.build/system-image/$target"
+provider_output_dir="$artifact_output_root/lib"
+executable_output_dir="$artifact_output_root/bin"
+artifact_log_dir="$artifact_output_root/logs"
 rust_min_stack="${RUST_MIN_STACK:-67108864}"
 force_rebuild="${LIBER_IMAGE_REBUILD:-0}"
 artifact_cache_dir="$root/boot/.build/image-artifacts-$target"
@@ -31,7 +35,7 @@ consumer_seconds=0
 
 report_build_summary() {
 	local status=$?
-	find "$root" -path "*/shared/$target/*.$$.expected" -delete 2>/dev/null || true
+	find "$artifact_output_root" -type f -name "*.$$.expected" -delete 2>/dev/null || true
 	find "$artifact_cache_dir" -maxdepth 1 -type f -name "*.tmp.$$" -delete 2>/dev/null || true
 	rm -f "$root/boot/.build/package-dirs.$$.tmp"
 	if [[ -n "$source_inventory_file" ]]; then rm -f "$source_inventory_file"; fi
@@ -47,7 +51,7 @@ if [[ "$force_rebuild" != 0 && "$force_rebuild" != 1 ]]; then
 fi
 
 command -v flock >/dev/null
-mkdir -p "$root/boot/.build"
+mkdir -p "$root/boot/.build" "$provider_output_dir" "$executable_output_dir" "$artifact_log_dir"
 if [[ "${LIBER_IMAGE_LOCK_HELD:-0}" != 1 ]]; then
 	exec 9>"$root/boot/.build/image-build-$target.lock"
 	flock 9
@@ -199,9 +203,8 @@ object_tool_digest="$(sha256sum "$root/tools/build-consumer-object.sh" | awk '{p
 
 library_file() {
 	local artifact="$1"
-	local owner
-	owner="$(awk -v artifact="$artifact" '$1 == "library" && $2 == artifact {print $3; count++} END {if (count != 1) exit 1}' "$artifact_manifest")" || return 1
-	printf '%s/shared/%s/%s.lslib' "$(source_path "$owner")" "$target" "$artifact"
+	awk -v artifact="$artifact" '$1 == "library" && $2 == artifact {found++} END {if (found != 1) exit 1}' "$artifact_manifest" || return 1
+	printf '%s/%s.lslib' "$provider_output_dir" "$artifact"
 }
 
 library_identity_file() {
@@ -607,12 +610,12 @@ build_file_hash_inventory() {
 		if [[ -f "$file.identity" ]]; then printf '%s\0' "$file.identity"; fi
 	done < <(awk '$1 == "library" {print $2}' "$artifact_manifest")
 	while read -r kind consumer crate stage providers; do
-		file="$(source_path "$crate")/shared/$target/$consumer"
+		file="$executable_output_dir/$consumer"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 		if [[ -f "$file.identity" ]]; then printf '%s\0' "$file.identity"; fi
 		if [[ -f "$file.order" ]]; then printf '%s\0' "$file.order"; fi
 	done < <(dynamic_rows)
-	file="$(source_path dyn_probe)/shared/$target/dyn_probe"
+	file="$executable_output_dir/dyn_probe"
 	if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	if [[ -f "$file.identity" ]]; then printf '%s\0' "$file.identity"; fi
 	if [[ -f "$file.order" ]]; then printf '%s\0' "$file.order"; fi
@@ -906,7 +909,7 @@ for spec in "$@"; do
 		echo "build-shared: missing $manifest" >&2
 		exit 1
 	fi
-	out_dir="$crate_dir/shared/$target"
+	out_dir="$provider_output_dir"
 	mkdir -p "$out_dir"
 	features=()
 	if [[ "$row_features" != - ]]; then
@@ -1009,7 +1012,12 @@ for spec in "$@"; do
 		link_inputs=(--whole-archive "$rlib" "$miniz_archive" "$adler_archive" --no-whole-archive)
 		;;
 	qoi)
-		qoi_codec_archive="$(find "$deps" -maxdepth 1 -name 'libqoi-*.rlib' ! -samefile "$rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		if [[ -n "$image_graph" ]]; then
+			qoi_codec_archive="$(jq -r 'select(.reason == "compiler-artifact" and (.package_id | startswith("registry+") and endswith("#qoi@0.4.1"))) | .filenames[] | select(endswith(".rlib"))' "$image_graph" | sort -u)"
+		else
+			qoi_codec_archive="$(find "$deps" -maxdepth 1 -name 'libqoi-*.rlib' ! -samefile "$rlib" -print | while read -r candidate; do if ! llvm-readelf --wide --symbols "$candidate" | grep -q 'pix.*RgbaImage'; then printf '%s\n' "$candidate"; fi; done | sort -u)"
+		fi
+		if [[ "$(wc -l <<<"$qoi_codec_archive")" != 1 ]]; then qoi_codec_archive=""; fi
 		bytemuck_archive="$(find "$deps" -maxdepth 1 -name 'libbytemuck-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 		if [[ -z "$qoi_codec_archive" || -z "$bytemuck_archive" ]]; then
 			echo "build-shared: missing qoi/bytemuck archive for qoi.lslib" >&2
@@ -1231,8 +1239,8 @@ if [[ -n "$image_graph" ]]; then
 		fi
 		audit_provider_export_ownership "$providers"
 		consumer_dir="$root/$(source_path "$crate")"
-		out_dir="$consumer_dir/shared/$target"
-		consumer_errors="$out_dir/.$consumer.stderr"
+		out_dir="$executable_output_dir"
+		consumer_errors="$artifact_log_dir/$consumer.stderr"
 		out="$out_dir/$consumer"
 		mkdir -p "$out_dir"
 		consumer_source_sha="$(executable_source_digest "$consumer_dir" "$crate" "$consumer")"
@@ -1569,7 +1577,7 @@ fi
 
 if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	probe="$(source_path dyn_probe)"
-	probe_dir="$probe/shared/$target"
+	probe_dir="$executable_output_dir"
 	probe_out="$probe_dir/dyn_probe"
 	mkdir -p "$probe_dir"
 	probe_source_sha="$(source_digest "$probe")"
