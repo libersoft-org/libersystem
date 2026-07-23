@@ -4581,9 +4581,16 @@ capability policy remain unchanged.
     root regardless of crate nesting. A complete x86 graph passes 60/60 providers and
     67/67 executables, kernel and services build-script checks pass, all 144 checked
     report rows resolve, and LSIDL stale-output checks remain green. Remaining before the
-    physical move: route the LSIDL generation output paths through the same map and update
-    Cargo `path`/`build` attributes atomically with their target directories, because
-    Cargo manifests cannot interpolate an external source map.
+    physical move: update Cargo `path`/`build` attributes atomically with their target
+    directories, because Cargo manifests cannot interpolate an external source map.
+  - LSIDL/Justfile source-path result (2026-07-23): all generated package output,
+    stale-check, breaking-acceptance and formatting recipes resolve the 15 package roots
+    and the compatibility root through the manifest source map. No hard-coded
+    `user/*-proto` path remains in the `Justfile`; `gen-check` passes for every package.
+    A small fail-closed `tools/source-path.sh` helper gives Just 1.53 native `shell()`
+    variables stable owner lookup. This replaces formatter-unstable command substitutions
+    and restores canonical recipe indentation; `just --fmt` is byte-stable and the parser,
+    complete x86 graph, checked report and targeted cache invalidation gate pass.
 - [ ] Move the crates mechanically into the five role directories and update lockfiles,
   rust-toolchain/config discovery, include paths, test fixtures, build scripts and docs.
   No source-level API refactor belongs in the move. A repository check fails if a Cargo
