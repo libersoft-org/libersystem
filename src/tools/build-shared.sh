@@ -9,6 +9,7 @@ fi
 target="$1"
 shift
 root="$(cd "$(dirname "$0")/.." && pwd)"
+artifact_manifest="$root/user/services/manifest.txt"
 rust_min_stack="${RUST_MIN_STACK:-67108864}"
 force_rebuild="${LIBER_IMAGE_REBUILD:-0}"
 artifact_cache_dir="$root/boot/.build/image-artifacts-$target"
@@ -85,6 +86,31 @@ command -v jq >/dev/null
 command -v sha256sum >/dev/null
 command -v xxd >/dev/null
 
+source_path() {
+	local owner="$1"
+	awk -v owner="$owner" '$1 == "source" && $2 == owner {print $3; count++} END {if (count != 1) exit 1}' "$artifact_manifest"
+}
+
+declare -A source_owners=()
+declare -A source_paths=()
+while read -r source_kind source_owner source_crate_path trailing; do
+	[[ "$source_kind" == source ]] || continue
+	if [[ -n "$trailing" || ! "$source_owner" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ || ! "$source_crate_path" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ || "$source_crate_path" =~ (^|/)\.\.?(/|$) ]]; then
+		echo "build-shared: invalid source row for $source_owner" >&2
+		exit 1
+	fi
+	if [[ -n "${source_owners[$source_owner]:-}" || -n "${source_paths[$source_crate_path]:-}" ]]; then
+		echo "build-shared: duplicate source owner or path $source_owner $source_crate_path" >&2
+		exit 1
+	fi
+	if [[ ! -f "$root/$source_crate_path/Cargo.toml" ]]; then
+		echo "build-shared: source $source_owner has no Cargo.toml at $source_crate_path" >&2
+		exit 1
+	fi
+	source_owners[$source_owner]="$source_crate_path"
+	source_paths[$source_crate_path]="$source_owner"
+done <"$artifact_manifest"
+
 declare -A source_file_hashes=()
 declare -A build_file_hashes=()
 source_inventory_started=$SECONDS
@@ -95,24 +121,27 @@ mkdir -p "$(dirname "$source_inventory_file")"
 mkdir -p "$source_metadata_dir"
 
 while read -r crate; do
-	case "$crate" in
-	proto | wire | wasm | term) crate_dir="$crate" ;;
-	*) crate_dir="user/$crate" ;;
-	esac
+	crate_dir="$(source_path "$crate")" || {
+		echo "build-shared: library owner $crate has no unique source path" >&2
+		exit 1
+	}
 	printf '%s\n' "$crate_dir" >>"$source_roots_file"
-	if [[ "$crate_dir" == user/*-client-provider ]]; then printf '%s\n' "${crate_dir%-provider}" >>"$source_roots_file"; fi
-done < <(awk '$1 == "library" {print $3}' "$root/user/services/manifest.txt" | sort -u)
+	if [[ "$crate" == *-client-provider ]]; then printf '%s\n' "$(source_path "${crate%-provider}")" >>"$source_roots_file"; fi
+done < <(awk '$1 == "library" {print $3}' "$artifact_manifest" | sort -u)
 
 while read -r package; do
 	[[ -n "$package" ]] || continue
-	package_dir="user/$package"
+	package_dir="$(source_path "$package")" || {
+		echo "build-shared: executable owner $package has no unique source path" >&2
+		exit 1
+	}
 	package_dirs="$source_metadata_dir/$package.dirs"
 	printf '%s\n' "$package_dir" >>"$source_roots_file"
 	(cd "$root" && cargo metadata --format-version 1 --manifest-path "$package_dir/Cargo.toml") |
 		jq -r --arg root "$root" '.packages[] | select(.source == null) | .manifest_path | sub("/Cargo.toml$"; "") | sub("^" + $root + "/"; "")' |
 		sort -u >"$package_dirs"
 	cat "$package_dirs" >>"$source_roots_file"
-done < <(awk '($1 == "dynamic" || $1 == "dynamic-service") && $4 == "volume" {print $3}' "$root/user/services/manifest.txt" | sort -u)
+done < <(awk '($1 == "dynamic" || $1 == "dynamic-service") && $4 == "volume" {print $3}' "$artifact_manifest" | sort -u)
 sort -u -o "$source_roots_file" "$source_roots_file"
 
 while IFS= read -r -d '' record; do
@@ -169,25 +198,10 @@ build_tool_digest="$({
 object_tool_digest="$(sha256sum "$root/tools/build-consumer-object.sh" | awk '{print $1}')"
 
 library_file() {
-	case "$1" in
-	lsrt) printf 'user/rt/shared/%s/lsrt.lslib' "$target" ;;
-	wire) printf 'wire/shared/%s/wire.lslib' "$target" ;;
-	audio-client) printf 'user/audio-client-provider/shared/%s/audio-client.lslib' "$target" ;;
-	config-client) printf 'user/config-client-provider/shared/%s/config-client.lslib' "$target" ;;
-	device-client) printf 'user/device-client-provider/shared/%s/device-client.lslib' "$target" ;;
-	log-client) printf 'user/log-client-provider/shared/%s/log-client.lslib' "$target" ;;
-	network-client) printf 'user/network-client-provider/shared/%s/network-client.lslib' "$target" ;;
-	observability-client) printf 'user/observability-client-provider/shared/%s/observability-client.lslib' "$target" ;;
-	process-client) printf 'user/process-client-provider/shared/%s/process-client.lslib' "$target" ;;
-	resources-client) printf 'user/resources-client-provider/shared/%s/resources-client.lslib' "$target" ;;
-	security-client) printf 'user/security-client-provider/shared/%s/security-client.lslib' "$target" ;;
-	time-client) printf 'user/time-client-provider/shared/%s/time-client.lslib' "$target" ;;
-	volume-client) printf 'user/volume-client-provider/shared/%s/volume-client.lslib' "$target" ;;
-	wasm) printf 'wasm/shared/%s/wasm.lslib' "$target" ;;
-	term) printf 'term/shared/%s/term.lslib' "$target" ;;
-	service-util) printf 'user/services/shared/%s/service-util.lslib' "$target" ;;
-	*) printf 'user/%s/shared/%s/%s.lslib' "$1" "$target" "$1" ;;
-	esac
+	local artifact="$1"
+	local owner
+	owner="$(awk -v artifact="$artifact" '$1 == "library" && $2 == artifact {print $3; count++} END {if (count != 1) exit 1}' "$artifact_manifest")" || return 1
+	printf '%s/shared/%s/%s.lslib' "$(source_path "$owner")" "$target" "$artifact"
 }
 
 library_identity_file() {
@@ -199,8 +213,9 @@ declare -A crate_source_digests=()
 compute_source_digest() {
 	local crate_dir="$1"
 	local api_dir=""
-	if [[ "$crate_dir" == user/*-client-provider ]]; then
-		api_dir="${crate_dir%-provider}"
+	local owner="${source_paths[$crate_dir]:-}"
+	if [[ "$owner" == *-client-provider ]]; then
+		api_dir="$(source_path "${owner%-provider}")"
 		if [[ ! -f "$root/$api_dir/Cargo.toml" ]]; then
 			echo "build-shared: $crate_dir has no public API crate $api_dir" >&2
 			return 1
@@ -256,9 +271,9 @@ executable_source_digest() {
 
 local_dependency_source_digest() {
 	local crate_dir="$1"
-	local exclude_root="${2:-0}"
-	local package package_dirs package_dir
-	package="${crate_dir#user/}"
+	local package="$2"
+	local exclude_root="${3:-0}"
+	local package_dirs package_dir
 	package_dirs="$root/boot/.build/package-dirs.$$.tmp"
 	while IFS= read -r package_dir; do
 		if [[ "$exclude_root" == 1 && "$package_dir" == "$crate_dir" ]]; then continue; fi
@@ -282,14 +297,11 @@ local_dependency_source_digest() {
 
 source_digest_roots="$source_metadata_dir/digest-roots"
 while read -r crate; do
-	case "$crate" in
-	proto | wire | wasm | term) crate_dir="$crate" ;;
-	*) crate_dir="user/$crate" ;;
-	esac
+	crate_dir="$(source_path "$crate")"
 	printf '%s\n' "$crate_dir" >>"$source_digest_roots"
-	if [[ "$crate_dir" == user/*-client-provider ]]; then printf '%s\n' "${crate_dir%-provider}" >>"$source_digest_roots"; fi
-done < <(awk '$1 == "library" {print $3}' "$root/user/services/manifest.txt" | sort -u)
-printf 'user/dyn_probe\n' >>"$source_digest_roots"
+	if [[ "$crate" == *-client-provider ]]; then printf '%s\n' "$(source_path "${crate%-provider}")" >>"$source_digest_roots"; fi
+done < <(awk '$1 == "library" {print $3}' "$artifact_manifest" | sort -u)
+printf '%s\n' "$(source_path dyn_probe)" >>"$source_digest_roots"
 sort -u -o "$source_digest_roots" "$source_digest_roots"
 while IFS= read -r crate_dir; do
 	crate_source_digests[$crate_dir]="$(compute_source_digest "$crate_dir")"
@@ -559,17 +571,17 @@ record_object_reference() {
 }
 
 manifest_library_row() {
-	awk -v artifact="$1" '$1 == "library" && $2 == artifact {print; count++} END {if (count != 1) exit 1}' "$root/user/services/manifest.txt"
+	awk -v artifact="$1" '$1 == "library" && $2 == artifact {print; count++} END {if (count != 1) exit 1}' "$artifact_manifest"
 }
 
-manifest_specs="$(awk '$1 == "library" {print $2 "=" $3}' "$root/user/services/manifest.txt" | sort)"
+manifest_specs="$(awk '$1 == "library" {print $2 "=" $3}' "$artifact_manifest" | sort)"
 requested_specs="$(for spec in "$@"; do if [[ "$spec" == *=* ]]; then printf '%s\n' "$spec"; else printf '%s=%s\n' "$spec" "$spec"; fi; done | sort)"
 if [[ "$requested_specs" != "$manifest_specs" ]]; then
 	echo "build-shared: requested libraries differ from the manifest" >&2
 	diff -u <(printf '%s\n' "$manifest_specs") <(printf '%s\n' "$requested_specs") >&2 || true
 	exit 1
 fi
-if awk '$1 == "component" && $4 == "volume" {found=1} END {exit !found}' "$root/user/services/manifest.txt"; then
+if awk '$1 == "component" && $4 == "volume" {found=1} END {exit !found}' "$artifact_manifest"; then
 	echo "build-shared: volume components must use dynamic manifest rows" >&2
 	exit 1
 fi
@@ -584,7 +596,7 @@ dynamic_rows() {
 			for (i = i + 1; i <= NF; i++) printf " %s", $i
 			printf "\n"
 		}
-	' "$root/user/services/manifest.txt" | sort -k2,2
+	' "$artifact_manifest" | sort -k2,2
 }
 
 build_file_hash_inventory() {
@@ -593,14 +605,14 @@ build_file_hash_inventory() {
 		file="$(library_file "$artifact")"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 		if [[ -f "$file.identity" ]]; then printf '%s\0' "$file.identity"; fi
-	done < <(awk '$1 == "library" {print $2}' "$root/user/services/manifest.txt")
+	done < <(awk '$1 == "library" {print $2}' "$artifact_manifest")
 	while read -r kind consumer crate stage providers; do
-		file="user/$crate/shared/$target/$consumer"
+		file="$(source_path "$crate")/shared/$target/$consumer"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 		if [[ -f "$file.identity" ]]; then printf '%s\0' "$file.identity"; fi
 		if [[ -f "$file.order" ]]; then printf '%s\0' "$file.order"; fi
 	done < <(dynamic_rows)
-	file="user/dyn_probe/shared/$target/dyn_probe"
+	file="$(source_path dyn_probe)/shared/$target/dyn_probe"
 	if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	if [[ -f "$file.identity" ]]; then printf '%s\0' "$file.identity"; fi
 	if [[ -f "$file.order" ]]; then printf '%s\0' "$file.order"; fi
@@ -659,12 +671,9 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 	image_graph_key_file="$root/boot/.build/image-cargo-$target.graph-key"
 	image_graph_source_digest="$({
 		while read -r crate; do
-			case "$crate" in
-			proto | wire | wasm | term) crate_dir="$crate" ;;
-			*) crate_dir="user/$crate" ;;
-			esac
+			crate_dir="$(source_path "$crate")"
 			printf '%s=%s\n' "$crate_dir" "$(source_digest "$crate_dir")"
-		done < <(awk '$1 == "library" {print $3}' "$root/user/services/manifest.txt" | sort -u)
+		done < <(awk '$1 == "library" {print $3}' "$artifact_manifest" | sort -u)
 		for source in "$root/user/build.rs" "$root/../product.conf"; do
 			source_file_digest "$source"
 		done
@@ -684,7 +693,7 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 		rm -f "$image_seed" "$service_seed"
 		set +e
 		(
-			cd "$root/user/tools"
+			cd "$root/$(source_path tools)"
 			CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --release --target "$cargo_target" --bin date --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$image_seed"
 		) >"$image_graph" 2>"$image_graph_errors"
 		graph_status=$?
@@ -699,7 +708,7 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 		fi
 		set +e
 		(
-			cd "$root/user/services"
+			cd "$root/$(source_path services)"
 			CARGO_TARGET_DIR="$image_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem rustc --release --target "$cargo_target" --bin component_host --no-default-features --features shared-image --message-format=json-render-diagnostics -- --emit="obj=$service_seed"
 		) >>"$image_graph" 2>"$service_seed_errors"
 		service_seed_status=$?
@@ -891,10 +900,7 @@ for spec in "$@"; do
 		echo "build-shared: $artifact invocation differs from its library manifest row" >&2
 		exit 1
 	fi
-	case "$crate" in
-	proto | wire | wasm | term) crate_dir="$crate" ;;
-	*) crate_dir="user/$crate" ;;
-	esac
+	crate_dir="$(source_path "$crate")"
 	manifest="$crate_dir/Cargo.toml"
 	if [[ ! -f "$manifest" ]]; then
 		echo "build-shared: missing $manifest" >&2
@@ -928,8 +934,8 @@ for spec in "$@"; do
 	fi
 	out="$out_dir/$artifact.lslib"
 	provider_source_sha="$(source_digest "$crate_dir")"
-	if [[ "$crate_dir" == user/*-client-provider ]]; then
-		provider_compile_source="$(source_digest "${crate_dir%-provider}")"
+	if [[ "$row_crate" == *-client-provider ]]; then
+		provider_compile_source="$(source_digest "$(source_path "${row_crate%-provider}")")"
 	else
 		provider_compile_source="$provider_source_sha"
 	fi
@@ -1194,11 +1200,11 @@ if [[ -n "$image_graph" ]]; then
 	while read -r package; do
 		[[ -n "$package" ]] || continue
 		if [[ "$package" != tools ]]; then
-			package_source_digests[$package]="$(local_dependency_source_digest "user/$package")"
+			package_source_digests[$package]="$(local_dependency_source_digest "$(source_path "$package")" "$package")"
 		fi
 	done < <(awk '{print $3}' <<<"$dynamic_rows" | sort -u)
 	manifest_tools="$(awk '$3 == "tools" {print $2}' <<<"$dynamic_rows")"
-	cargo_tools="$(cd "$root/user/tools" && cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tools") | .targets[] | select(.kind == ["bin"]) | .name' | sort)"
+	cargo_tools="$(cd "$root/$(source_path tools)" && cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tools") | .targets[] | select(.kind == ["bin"]) | .name' | sort)"
 	if [[ "$manifest_tools" != "$cargo_tools" ]]; then
 		echo "build-shared: tools-package bins differ from dynamic volume manifest rows" >&2
 		diff -u <(printf '%s\n' "$cargo_tools") <(printf '%s\n' "$manifest_tools") >&2 || true
@@ -1224,7 +1230,7 @@ if [[ -n "$image_graph" ]]; then
 			exit 1
 		fi
 		audit_provider_export_ownership "$providers"
-		consumer_dir="$root/user/$crate"
+		consumer_dir="$root/$(source_path "$crate")"
 		out_dir="$consumer_dir/shared/$target"
 		consumer_errors="$out_dir/.$consumer.stderr"
 		out="$out_dir/$consumer"
@@ -1562,7 +1568,7 @@ if [[ -n "$image_graph" ]]; then
 fi
 
 if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
-	probe="user/dyn_probe"
+	probe="$(source_path dyn_probe)"
 	probe_dir="$probe/shared/$target"
 	probe_out="$probe_dir/dyn_probe"
 	mkdir -p "$probe_dir"

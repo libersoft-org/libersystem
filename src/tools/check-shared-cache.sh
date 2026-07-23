@@ -2,10 +2,15 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+manifest="$root/user/services/manifest.txt"
 mode="${1:-quick}"
 output="$(mktemp)"
 backup=""
 source=""
+
+source_path() {
+	awk -v owner="$1" '$1 == "source" && $2 == owner {print $3; count++} END {if (count != 1) exit 1}' "$manifest"
+}
 
 command -v flock >/dev/null
 mkdir -p "$root/boot/.build"
@@ -54,7 +59,7 @@ prime_graph() {
 case "$mode" in
 quick)
 	prime_graph
-	order_file="$root/user/tools/shared/x86_64-unknown-none/echo.order"
+	order_file="$root/$(source_path tools)/shared/x86_64-unknown-none/echo.order"
 	order_cache="$root/boot/.build/image-artifacts-x86_64-unknown-none/executable-echo.order.sha256"
 	rm -f "$order_cache"
 	run_graph
@@ -79,7 +84,7 @@ quick)
 		echo "shared-cache-check: echo baseline did not return to a warm state" >&2
 		exit 1
 	fi
-	source="$root/user/tools/src/echo.rs"
+	source="$root/$(source_path tools)/src/echo.rs"
 	backup="$(mktemp)"
 	cp "$source" "$backup"
 	printf '\n// shared-cache-check-%s\n' "$$" >>"$source"
@@ -96,13 +101,13 @@ quick)
 	;;
 provider)
 	prime_graph
-	source="$root/user/volume-client-provider/src/lib.rs"
+	source="$root/$(source_path volume-client-provider)/src/lib.rs"
 	backup="$(mktemp)"
 	cp "$source" "$backup"
 	printf '\n// shared-cache-check-%s\n' "$$" >>"$source"
 	run_graph
 	expect_only_misses provider volume-client
-	mapfile -t consumers < <(awk '$1 == "dynamic" && $4 == "volume" {for (i = 5; i <= NF; i++) if ($i == "volume-client") {print $2; break}}' "$root/user/services/manifest.txt" | sort)
+	mapfile -t consumers < <(awk '$1 == "dynamic" && $4 == "volume" {for (i = 5; i <= NF; i++) if ($i == "volume-client") {print $2; break}}' "$manifest" | sort)
 	expect_only_misses executable "${consumers[@]}"
 	for consumer in "${consumers[@]}"; do
 		if ! grep -q "^build-shared: object cache hit $consumer$" "$output"; then

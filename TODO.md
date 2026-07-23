@@ -4568,6 +4568,22 @@ capability policy remain unchanged.
   `Justfile` and Cargo path dependencies to consume it. Reject duplicate logical names,
   paths outside the workspace and missing manifests. Artifact identity must be derived
   from the manifest name, never from the final path component.
+  - Explicit source-schema result (2026-07-23): the artifact manifest now declares one
+    `source <logical-owner> <workspace-relative-path>` row for all 77 Cargo roots in this
+    build graph: every one of the 73 `src/user/` crates plus `proto`, `term`, `wasm` and
+    `wire`. Validation rejects duplicate owners or paths, absolute/traversal paths and
+    missing `Cargo.toml` files; every artifact row must name one declared logical owner.
+    Artifact and package identities still use the logical owner and never a path basename.
+    `kernel/build.rs`, the shared-image linker, dynamic report, static-injection and cache
+    gates resolve source/output/order paths through this map. The `Justfile` resolves its
+    user crate directories by logical owner, and the common userspace build script finds
+    linker scripts and product metadata through the stable `src/user/` infrastructure
+    root regardless of crate nesting. A complete x86 graph passes 60/60 providers and
+    67/67 executables, kernel and services build-script checks pass, all 144 checked
+    report rows resolve, and LSIDL stale-output checks remain green. Remaining before the
+    physical move: route the LSIDL generation output paths through the same map and update
+    Cargo `path`/`build` attributes atomically with their target directories, because
+    Cargo manifests cannot interpolate an external source map.
 - [ ] Move the crates mechanically into the five role directories and update lockfiles,
   rust-toolchain/config discovery, include paths, test fixtures, build scripts and docs.
   No source-level API refactor belongs in the move. A repository check fails if a Cargo

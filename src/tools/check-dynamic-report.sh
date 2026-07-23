@@ -22,6 +22,10 @@ command -v llvm-readelf >/dev/null
 command -v sha256sum >/dev/null
 command -v stat >/dev/null
 
+source_path() {
+	awk -v owner="$1" '$1 == "source" && $2 == owner {print $3; count++} END {if (count != 1) exit 1}' "$manifest"
+}
+
 declare -A waves=()
 declare -A tests=()
 declare -A wave_tools_count=()
@@ -69,10 +73,7 @@ library_file() {
 	local provider="$2"
 	local crate
 	crate="$(awk -v provider="$provider" '$1 == "library" && $2 == provider {print $3; count++} END {if (count != 1) exit 1}' "$manifest")"
-	case "$crate" in
-	proto | wire | wasm | term) printf '%s/%s/shared/%s/%s.lslib\n' "$root" "$crate" "$target" "$provider" ;;
-	*) printf '%s/user/%s/shared/%s/%s.lslib\n' "$root" "$crate" "$target" "$provider" ;;
-	esac
+	printf '%s/%s/shared/%s/%s.lslib\n' "$root" "$(source_path "$crate")" "$target" "$provider"
 }
 
 canonical_manifest_order() {
@@ -281,7 +282,7 @@ generate_report() {
 			for tool in $(for candidate in "${!waves[@]}"; do if [[ "${waves[$candidate]}" == "$wave" ]]; then printf '%s\n' "$candidate"; fi; done | sort); do
 				row="$(awk -v tool="$tool" '$1 == "dynamic" && $2 == tool && $3 == "tools" && $4 == "volume" {print; count++} END {if (count != 1) exit 1}' "$manifest")"
 				providers="$(cut -d' ' -f5- <<<"$(tr -s ' ' <<<"$row")")"
-				artifact="$root/user/tools/shared/$target/$tool"
+				artifact="$root/$(source_path tools)/shared/$target/$tool"
 				order="$artifact.order"
 				[[ -f "$artifact" && -f "$order" ]] || {
 					echo "dynamic-report: missing $target artifact or order for $tool" >&2

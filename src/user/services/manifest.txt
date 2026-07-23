@@ -5,7 +5,8 @@
 # lists from every row. Adding a normal service is one row here plus the service's own
 # code - the runtime table and the staging lists can no longer drift apart.
 #
-# columns: kind  name  crate  stage  [policy/features/providers...]
+# source rows: source  logical-owner  workspace-relative-crate-path
+# artifact columns: kind  name  crate  stage  [policy/features/providers...]
 #   kind : launcher | service | dynamic-service | instance | probe | driver | tool | dynamic
 #          - service : a managed service with its own ELF (ServiceManager supervises it)
 #          - dynamic-service: a managed ET_DYN service; `--` separates deps/providers
@@ -14,7 +15,7 @@
 #          - probe   : a self-test helper spawned by the supervisor
 #          - driver / tool: statically linked staged programs pending migration
 #          - dynamic: staged ET_DYN programs built by the system-image linker
-#   crate: crate directory under src/user (or '-' for an instance with no own ELF)
+#   crate: logical source owner declared by one source row (or '-' for an instance)
 #   stage: pinned (kept in init.pkg) | volume (staged on the system volume) | none
 #   restart: the supervisor's crash policy (managed service and instance rows only) -
 #          transparent (restart per the ladder; clients re-resolve through the broker)
@@ -22,6 +23,87 @@
 #   deps : the services that must be Running first (managed service and instance rows)
 #   features: `-` for defaults or a comma-separated Cargo feature set for library rows
 #   providers: direct prefix-free library names for library and dynamic rows
+
+# Physical Cargo roots are explicit and independent of logical artifact identities.
+# Paths are relative to src/ and change during physical layout migrations; artifact rows
+# continue to name logical owners so path components never become runtime identities.
+source adpcm                          user/adpcm
+source aiff                           user/aiff
+source apng                           user/apng
+source audio-client                   user/audio-client
+source audio-client-provider          user/audio-client-provider
+source audio-proto                    user/audio-proto
+source base-proto                     user/base-proto
+source bmp                            user/bmp
+source config-client                  user/config-client
+source config-client-provider         user/config-client-provider
+source config-proto                   user/config-proto
+source deflate                        user/deflate
+source device-client                  user/device-client
+source device-client-provider         user/device-client-provider
+source device-proto                   user/device-proto
+source display-proto                  user/display-proto
+source drivers                        user/drivers
+source dyn_probe                      user/dyn_probe
+source flac                           user/flac
+source gif                            user/gif
+source icns                           user/icns
+source ico                            user/ico
+source imgconv                        user/imgconv
+source inflate                        user/inflate
+source input-proto                    user/input-proto
+source ipc-client                     user/ipc-client
+source jpeg                           user/jpeg
+source keys                           user/keys
+source log-client                     user/log-client
+source log-client-provider            user/log-client-provider
+source log-proto                      user/log-proto
+source mp3                            user/mp3
+source network-client                 user/network-client
+source network-client-provider        user/network-client-provider
+source network-proto                  user/network-proto
+source observability-client           user/observability-client
+source observability-client-provider  user/observability-client-provider
+source observability-proto            user/observability-proto
+source ogg                            user/ogg
+source pcm                            user/pcm
+source pcx                            user/pcx
+source pix                            user/pix
+source png                            user/png
+source ppm                            user/ppm
+source process-client                 user/process-client
+source process-client-provider        user/process-client-provider
+source process-proto                  user/process-proto
+source proto                          proto
+source qoi                            user/qoi
+source quantize                       user/quantize
+source resources-client               user/resources-client
+source resources-client-provider      user/resources-client-provider
+source resources-proto                user/resources-proto
+source rt                             user/rt
+source security-client                user/security-client
+source security-client-provider       user/security-client-provider
+source security-proto                 user/security-proto
+source services                       user/services
+source session-proto                  user/session-proto
+source storage                        user/storage
+source storage-proto                  user/storage-proto
+source surface                        user/surface
+source system_manager                 user/system_manager
+source term                           term
+source tga                            user/tga
+source time-client                    user/time-client
+source time-client-provider           user/time-client-provider
+source time-proto                     user/time-proto
+source tools                          user/tools
+source volume-client                  user/volume-client
+source volume-client-provider         user/volume-client-provider
+source vorbis                         user/vorbis
+source wasm                           wasm
+source wav                            user/wav
+source wavpack                        user/wavpack
+source webp                           user/webp
+source wire                           wire
 
 # managed services - ServiceManager brings these up in dependency order. The row order
 # is deliberately NOT the start order (DeviceManager and the shell are listed before

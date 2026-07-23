@@ -4,7 +4,7 @@
 
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -89,19 +89,21 @@ fn conf_get<'a>(conf: &'a [(String, String)], key: &str) -> &'a str {
 // The userspace programs staged at boot, read from the shared service manifest
 // (../user/services/manifest.txt) - the single source of truth ServiceManager also
 // generates its dependency table from, so the runtime service set and the staged
-// programs cannot drift. Each staged program is one manifest row: `kind name crate
-// stage [deps...]`. The kind and stage columns sort a row into the init package (the
-// pinned bootstrap set on the path to mounting the system volume, plus the bootstrap
-// block driver that backs it) or onto the system volume (every other service, driver,
-// tool and demo component, loaded from there once it is mounted).
+// programs cannot drift. Source rows map logical owners to workspace-relative Cargo
+// roots; artifact rows retain `kind name crate stage [deps...]`. The kind and stage
+// columns sort a row into the init package (the pinned bootstrap set on the path to
+// mounting the system volume, plus the bootstrap block driver that backs it) or onto the
+// system volume (every other service, driver, tool and demo component, loaded from there
+// once it is mounted).
 
-// A staged program parsed from a manifest row: its kind, its package entry name, the
-// crate directory under ../user that builds it, and where it is staged.
+// A staged program parsed from a manifest row: its kind, package entry name, logical
+// owner, explicit source path and staging class.
 #[derive(Clone)]
 struct ManifestRow {
 	kind: String,
 	name: String,
 	crate_dir: String,
+	crate_path: String,
 	stage: String,
 	features: Option<String>,
 	providers: Vec<String>,
@@ -114,6 +116,27 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 	let path: PathBuf = manifest.join("../user/services/manifest.txt");
 	let text: String = fs::read_to_string(&path).unwrap_or_else(|e: std::io::Error| panic!("cannot read {}: {e}", path.display()));
 	println!("cargo:rerun-if-changed={}", path.display());
+	let workspace: PathBuf = manifest.join("..");
+	let mut sources: Vec<(String, String)> = Vec::new();
+	for line in text.lines() {
+		let trimmed: &str = line.trim();
+		if trimmed.is_empty() || trimmed.starts_with('#') {
+			continue;
+		}
+		let mut fields = trimmed.split_whitespace();
+		if fields.next() != Some("source") {
+			continue;
+		}
+		let owner: String = fields.next().expect("source row missing logical owner").to_string();
+		let crate_path: String = fields.next().expect("source row missing crate path").to_string();
+		assert!(fields.next().is_none(), "source {owner} has trailing fields");
+		assert!(valid_library_name(&owner), "source row has invalid logical owner {owner:?}");
+		assert!(!Path::new(&crate_path).is_absolute() && Path::new(&crate_path).components().all(|component| matches!(component, Component::Normal(_))), "source {owner} has invalid workspace-relative path {crate_path:?}");
+		assert!(!sources.iter().any(|(known, _)| known == &owner), "duplicate source logical owner {owner}");
+		assert!(!sources.iter().any(|(_, known)| known == &crate_path), "duplicate source path {crate_path}");
+		assert!(workspace.join(&crate_path).join("Cargo.toml").is_file(), "source {owner} has no Cargo.toml at {crate_path}");
+		sources.push((owner, crate_path));
+	}
 	let mut rows: Vec<ManifestRow> = Vec::new();
 	for line in text.lines() {
 		let trimmed: &str = line.trim();
@@ -122,8 +145,12 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 		}
 		let mut fields = trimmed.split_whitespace();
 		let kind: String = fields.next().expect("manifest row missing kind").to_string();
+		if kind == "source" {
+			continue;
+		}
 		let name: String = fields.next().expect("manifest row missing name").to_string();
 		let crate_dir: String = fields.next().expect("manifest row missing crate").to_string();
+		let crate_path: String = if crate_dir == "-" { String::new() } else { sources.iter().find(|(owner, _)| owner == &crate_dir).unwrap_or_else(|| panic!("manifest row {name} names undeclared source owner {crate_dir}")).1.clone() };
 		let stage: String = fields.next().expect("manifest row missing stage").to_string();
 		let features = (kind == "library").then(|| fields.next().expect("library manifest row missing feature set").to_string());
 		let providers: Vec<String> = if kind == "dynamic-service" {
@@ -132,7 +159,7 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 		} else {
 			fields.map(String::from).collect()
 		};
-		rows.push(ManifestRow { kind, name, crate_dir, stage, features, providers });
+		rows.push(ManifestRow { kind, name, crate_dir, crate_path, stage, features, providers });
 	}
 	rows
 }
@@ -236,21 +263,20 @@ fn audit_dynamic_order(row: &ManifestRow, bytes: &[u8], libraries: &[ManifestRow
 // The debug-build target path of a userspace ELF: each crate builds to its own target dir.
 // The target triple follows the kernel's target arch, so an aarch64 kernel stages the
 // aarch64 userspace ELFs (and x86_64 the x86_64 ones).
-fn user_elf_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
-	manifest.join(format!("../user/{crate_dir}/target/{}/debug/{name}", user_target()))
+fn user_elf_path(manifest: &Path, crate_path: &str, name: &str) -> PathBuf {
+	manifest.join("..").join(crate_path).join(format!("target/{}/debug/{name}", user_target()))
 }
 
-fn user_shared_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
-	let root = if matches!(crate_dir, "proto" | "wire" | "wasm" | "term") { manifest.join(format!("../{crate_dir}")) } else { manifest.join(format!("../user/{crate_dir}")) };
-	root.join(format!("shared/{}/{}.lslib", user_target(), name))
+fn user_shared_path(manifest: &Path, crate_path: &str, name: &str) -> PathBuf {
+	manifest.join("..").join(crate_path).join(format!("shared/{}/{}.lslib", user_target(), name))
 }
 
-fn user_dynamic_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
-	manifest.join(format!("../user/{crate_dir}/shared/{}/{}", user_target(), name))
+fn user_dynamic_path(manifest: &Path, crate_path: &str, name: &str) -> PathBuf {
+	manifest.join("..").join(crate_path).join(format!("shared/{}/{}", user_target(), name))
 }
 
-fn user_dynamic_order_path(manifest: &Path, crate_dir: &str, name: &str) -> PathBuf {
-	manifest.join(format!("../user/{crate_dir}/shared/{}/{}.order", user_target(), name))
+fn user_dynamic_order_path(manifest: &Path, crate_path: &str, name: &str) -> PathBuf {
+	manifest.join("..").join(crate_path).join(format!("shared/{}/{}.order", user_target(), name))
 }
 
 fn identity_path(artifact: &Path) -> PathBuf {
@@ -284,7 +310,7 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 		.iter()
 		.map(|provider| {
 			let provider_row = libraries.iter().find(|candidate| candidate.name == *provider).unwrap_or_else(|| panic!("{} identity names unknown provider {provider}", row.name));
-			let provider_artifact = user_shared_path(&PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")), &provider_row.crate_dir, provider);
+			let provider_artifact = user_shared_path(&PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")), &provider_row.crate_path, provider);
 			format!("provider={provider}:{}", sha256_file(&identity_path(&provider_artifact)))
 		})
 		.collect();
@@ -394,7 +420,7 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	let mut sources: Vec<(String, PathBuf)> = Vec::new();
 	for row in read_manifest(&manifest) {
 		if row.stage == "pinned" && row.crate_dir != "-" {
-			sources.push((executable_artifact_name(&row.name), user_elf_path(&manifest, &row.crate_dir, &row.name)));
+			sources.push((executable_artifact_name(&row.name), user_elf_path(&manifest, &row.crate_path, &row.name)));
 		}
 	}
 
@@ -456,7 +482,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	let rows = read_manifest(&manifest);
 	let library_rows: Vec<ManifestRow> = rows.iter().filter(|row| row.kind == "library" && row.stage == "volume").cloned().collect();
 	let lsrt_row = library_rows.iter().find(|row| row.name == "lsrt").expect("lsrt library row");
-	let lsrt_artifact = user_shared_path(&manifest, &lsrt_row.crate_dir, &lsrt_row.name);
+	let lsrt_artifact = user_shared_path(&manifest, &lsrt_row.crate_path, &lsrt_row.name);
 	let lsrt_identity = fs::read_to_string(identity_path(&lsrt_artifact)).expect("lsrt identity record");
 	let expected_rustc_commit = lsrt_identity.lines().find_map(|line| line.strip_prefix("rustc-commit=")).expect("lsrt rustc identity").to_string();
 	assert!(expected_rustc_commit.len() == 40 && expected_rustc_commit.bytes().all(|byte| byte.is_ascii_hexdigit()), "lsrt rustc identity is malformed");
@@ -481,9 +507,9 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			_ => continue,
 		};
 		let path: PathBuf = match row.kind.as_str() {
-			"library" => user_shared_path(&manifest, &row.crate_dir, &row.name),
-			"dynamic" | "dynamic-service" => user_dynamic_path(&manifest, &row.crate_dir, &row.name),
-			_ => user_elf_path(&manifest, &row.crate_dir, &row.name),
+			"library" => user_shared_path(&manifest, &row.crate_path, &row.name),
+			"dynamic" | "dynamic-service" => user_dynamic_path(&manifest, &row.crate_path, &row.name),
+			_ => user_elf_path(&manifest, &row.crate_path, &row.name),
 		};
 		println!("cargo:rerun-if-changed={}", path.display());
 		if row.kind == "dynamic" || row.kind == "dynamic-service" || row.kind == "library" {
@@ -498,7 +524,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			Some(bytes) => {
 				if row.kind == "dynamic" || row.kind == "dynamic-service" {
 					audit_linked_artifact(&row, &bytes, &libraries, true);
-					let order_path = user_dynamic_order_path(&manifest, &row.crate_dir, &row.name);
+					let order_path = user_dynamic_order_path(&manifest, &row.crate_path, &row.name);
 					println!("cargo:rerun-if-changed={}", order_path.display());
 					let order = fs::read(&order_path).unwrap_or_else(|error| panic!("cannot read canonical order for dynamic {} at {}: {error}", row.name, order_path.display()));
 					audit_dynamic_order(&row, &order, &library_rows);

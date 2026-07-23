@@ -2,6 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+manifest="$root/user/services/manifest.txt"
 first="${1:-static}"
 kind="static"
 mode="all"
@@ -30,6 +31,10 @@ command -v llvm-readelf >/dev/null
 command -v od >/dev/null
 command -v sha256sum >/dev/null
 command -v timeout >/dev/null
+
+source_path() {
+	awk -v owner="$1" '$1 == "source" && $2 == owner {print $3; count++} END {if (count != 1) exit 1}' "$manifest"
+}
 mkdir -p "$root/boot/.build"
 exec 8>"$root/boot/.build/image-build-x86_64-unknown-none.lock"
 exec 9>"$root/boot/.build/image-build-aarch64-unknown-none.lock"
@@ -275,11 +280,11 @@ check_target() {
 	local volume="$root/boot/.build/$volume_name"
 	local artifact_hash before after_failure after_restore
 	if [[ "$kind" == dependency-graph ]]; then
-		artifact="$root/user/dyn_probe/shared/$target/dyn_probe.order"
+		artifact="$root/$(source_path dyn_probe)/shared/$target/dyn_probe.order"
 	elif [[ "$kind" == duplicate-edge || "$kind" == malformed-dynamic || "$kind" == malformed-symbol-relocation ]]; then
-		artifact="$root/user/dyn_probe/shared/$target/dyn_probe"
+		artifact="$root/$(source_path dyn_probe)/shared/$target/dyn_probe"
 	else
-		artifact="$root/user/tools/shared/$target/echo"
+		artifact="$root/$(source_path tools)/shared/$target/echo"
 	fi
 	[[ -f "$artifact" ]] || {
 		echo "image-injection-check: missing staged $label artifact for $kind" >&2
