@@ -229,13 +229,14 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 // onward - a duplicable StorageService client, a duplicable (but dead-peer) LogService
 // client, and a TimeService client - plus a NetworkService client it holds but is NOT to
 // grant, a ProcessService client it drives to load components, and the channel its clients
-// reach it on. PermissionManager governs four components through ProcessService, each under
-// a typed permission manifest. Two are report-back probes: sandbox_probe (granted storage and
+// reach it on. PermissionManager governs components through ProcessService, each under a
+// typed permission manifest. Two are report-back probes: sandbox_probe (granted storage and
 // log but not network - it transfers exactly those two clients and withholds the network one)
 // and request_probe (granted only log, which then asks for an undeclared capability - storage
-// - at runtime), recording every decision. The other two it launches on demand through its
-// `run` op (the launcher / granter path), each printing to a captured stdout: `date` (granted
-// only time) renders the wall clock, and `cat` (granted only storage) prints a file. Each
+// - at runtime), recording every decision. Three tools launch on demand through its `run`
+// op, each printing to a captured stdout: `date` (granted
+// only time) renders the wall clock, `cat` (granted only volumes) prints a file, and `ip`
+// (granted only network) renders typed interface state over a fresh client. Each
 // sandboxed component reaches only its granted capabilities: sandbox_probe reads its one
 // granted file vol://system/hello.txt through the storage grant and reports the bytes back;
 // `date` reads the wall clock through the time grant and prints the rendered instant to its
@@ -248,7 +249,7 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 // probe_read, probe_summary, date_read, date_summary, request_read, request_summary,
 // cat_read): the file straight from the volume, then each component's proof and decisions
 // summary, then the bytes `cat` printed through the run launcher.
-fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, u64), &'static str> {
+fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, u64), &'static str> {
 	use object::channel::{Channel, Message};
 	use object::memory_object::MemoryObject;
 	use object::process::Process;
@@ -276,7 +277,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let (log_server, log_client) = Channel::create();
 	core::mem::drop(log_server);
 	// The manager's network capability: held, but never granted to the probe.
-	let (_net_server, net_client) = Channel::create();
+	let (net_server, net_client) = Channel::create();
 	// TimeService's own network client: a real, dead-peer client whose service peer is
 	// dropped, so its best-effort SNTP discipline fails fast (PeerClosed) instead of
 	// blocking on a reply that never comes (no NetworkService runs in this scenario). It
@@ -386,6 +387,32 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	send_cap(&pm_boot_kernel, b"SERVE", perm_server, Rights::ALL)?;
 
 	sched::run_until_idle();
+	let open_request = net_server.recv().map_err(|_| "PermissionManager did not request a fresh NetworkService client")?;
+	if open_request.bytes.len() != 6 || le_u16(&open_request.bytes, 0) != 6 {
+		return Err("PermissionManager sent an invalid NetworkService open request");
+	}
+	let (tool_net_server, tool_net_client) = Channel::create();
+	let mut open_reply = alloc::vec::Vec::new();
+	open_reply.extend_from_slice(&open_request.bytes[2..6]);
+	open_reply.push(1);
+	open_reply.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&net_server, &open_reply, tool_net_client, Rights::ALL)?;
+	sched::run_until_idle();
+	let info_request = tool_net_server.recv().map_err(|_| "governed ip did not query its fresh NetworkService client")?;
+	if info_request.bytes.len() != 6 || le_u16(&info_request.bytes, 0) != 1 {
+		return Err("governed ip sent an invalid NetworkService info request");
+	}
+	let mut info_reply = alloc::vec::Vec::new();
+	info_reply.extend_from_slice(&info_request.bytes[2..6]);
+	info_reply.push(1);
+	info_reply.extend_from_slice(&[10, 0, 2, 15]);
+	info_reply.extend_from_slice(&6u16.to_le_bytes());
+	info_reply.extend_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+	info_reply.extend_from_slice(&1500u16.to_le_bytes());
+	info_reply.extend_from_slice(&[10, 0, 2, 2]);
+	info_reply.extend_from_slice(&0u16.to_le_bytes());
+	tool_net_server.send(Message::new(info_reply, alloc::vec::Vec::new(), 0)).map_err(|_| "could not answer governed ip NetworkService request")?;
+	sched::run_until_idle();
 
 	// PermissionManager reports its "online" line, then each governed component's proof and
 	// decisions summary: the bytes sandbox_probe read through its one granted storage
@@ -402,6 +429,8 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let request_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no dynamic-request verdict")?;
 	let request_summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no dynamic-request decisions summary")?;
 	let cat_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no cat output")?;
+	let ip_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip output")?;
+	let ip_summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip decisions summary")?;
 
 	// Prequeue one successful admin mint on each private connection. PermissionManager's
 	// generated clients all start at correlation id 0; DisplayService additionally receives
@@ -781,7 +810,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	if !mp3_process.is_terminated() {
 		return Err("MP3 play did not exit");
 	}
-	Ok((expected, probe_read.bytes, probe_summary.bytes, date_read.bytes, date_summary.bytes, request_read.bytes, request_summary.bytes, cat_read.bytes, graphics_read.bytes, graphics_start_ns))
+	Ok((expected, probe_read.bytes, probe_summary.bytes, date_read.bytes, date_summary.bytes, request_read.bytes, request_summary.bytes, cat_read.bytes, ip_read.bytes, ip_summary.bytes, graphics_read.bytes, graphics_start_ns))
 }
 
 // Build the component topology and run it to completion. A StorageService serves
@@ -7154,17 +7183,16 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 
 tagged_test!(permission_manager_sandboxes_a_component, [Service, Process]);
 fn permission_manager_sandboxes_a_component() {
-	// The PermissionManager governs four components under typed permission manifests. Two are
+	// PermissionManager governs components under typed permission manifests. Two are
 	// report-back probes. sandbox_probe is granted storage and log but not network: it starts
 	// with only its manifest's capabilities - the manager transfers exactly the storage and
 	// log clients to it and withholds the network one it holds, recording every decision - and
 	// reads its one granted file through the storage capability, reporting the bytes back.
 	// request_probe is granted only log and then asks for an undeclared capability (storage)
 	// at runtime: the headless policy default refuses it (least privilege) and the manager
-	// records that refusal as a dynamic decision. The other two are real system tools the
-	// manager launches on demand through its `run` op, each printing to a captured stdout:
-	// `date` (granted only time) reaches the wall clock through that one capability and prints
-	// the rendered instant, and `cat` (granted only storage) prints its one file argument. The
+	// records that refusal as a dynamic decision. Three real system tools launch on demand
+	// through its `run` op, each printing to a captured stdout:
+	// `date` reaches time, `cat` reaches volumes, and `ip` reaches a fresh network client. The
 	// probe's bytes must equal the file straight from the volume (the storage grant is live
 	// and reaches exactly that file) and its summary must show storage and log granted and
 	// every other capability denied; `date`'s output must be a well-formed ISO-8601 UTC instant
@@ -7173,20 +7201,21 @@ fn permission_manager_sandboxes_a_component() {
 	// mark that refusal as dynamic - each component was given exactly its manifest and nothing
 	// more. Finally `cat`'s output must equal that file (the storage grant reaches it through
 	// the on-demand launcher).
-	let (expected, probe_read, probe_summary, date_read, date_summary, request_read, request_summary, cat_read, graphics_read, graphics_start_ns) = run_permission_scenario().expect("the permission scenario should run");
+	let (expected, probe_read, probe_summary, date_read, date_summary, request_read, request_summary, cat_read, ip_read, ip_summary, graphics_read, graphics_start_ns) = run_permission_scenario().expect("the permission scenario should run");
 	assert!(!expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(probe_read, expected, "the sandboxed component read its one granted file through the storage grant");
 	assert_eq!(probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
 	// `date` reached its one granted capability: its output is a well-formed ISO-8601 UTC
 	// instant "YYYY-MM-DDTHH:MM:SSZ" (the exact moment varies, so check the shape, not the
 	// value - its presence proves the time grant is live).
-	assert_eq!(date_read.len(), 20, "the date command rendered a 20-byte ISO-8601 UTC instant through its time grant");
+	assert_eq!(date_read.len(), 21, "the date command rendered a 20-byte ISO-8601 UTC instant and newline through its time grant");
 	assert_eq!(date_read[4], b'-', "the date instant has a date separator after the year");
 	assert_eq!(date_read[7], b'-', "the date instant has a date separator after the month");
 	assert_eq!(date_read[10], b'T', "the date instant separates date and time with 'T'");
 	assert_eq!(date_read[13], b':', "the date instant has a time separator after the hour");
 	assert_eq!(date_read[16], b':', "the date instant has a time separator after the minute");
 	assert_eq!(date_read[19], b'Z', "the date instant is UTC, terminated by 'Z'");
+	assert_eq!(date_read[20], b'\n', "the date instant ends its stdout line");
 	assert_eq!(date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "date was granted exactly its manifest - time - and denied every other capability in the vocabulary");
 	// request_probe asked for storage at runtime - a capability outside its manifest. The
 	// headless policy default refused it, so the request comes back denied and its summary
@@ -7197,6 +7226,8 @@ fn permission_manager_sandboxes_a_component() {
 	// granting only storage, printed the file it was given through that grant to the stdout the
 	// manager forwarded it: the bytes it rendered must equal the file straight from the volume.
 	assert_eq!(cat_read, expected, "the cat tool printed its file argument through the storage grant the run launcher gave it, forwarded to the captured stdout");
+	assert_eq!(ip_read.as_slice(), b"net0: 10.0.2.15  mac 52:54:00:12:34:56  mtu 1500  gateway 10.0.2.2\n", "the governed ip tool queried its typed NetworkService grant and rendered the interface state to stdout");
+	assert_eq!(ip_summary.as_slice(), b"storage=deny log=deny network=grant device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "ip was granted exactly its network-only manifest and denied every unrelated capability");
 	assert_eq!(graphics_read.as_slice(), b"graphics grants\n", "the governed graphics probe received process-bound display, key-only input and playback-only audio grants");
 	assert!(graphics_start_ns != 0, "the governed app cold-start path is measured");
 }

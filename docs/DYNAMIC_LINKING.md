@@ -238,6 +238,15 @@ path that exceeds the depth limit. Host boundary tests pin acceptance at 63 load
 modules and depth 15, rejection at 64 loaded modules and depth 16, saturated hostile
 counts, and active-path re-entry.
 
+Governed command coverage includes a runnable representative from every migration wave.
+The network wave uses `ip`: PermissionManager grants all eight network tools exactly one
+fresh client minted through `network.open`, never a duplicate of the shared root request
+channel. Each tool consumes the standard governed bootstrap sequence of arguments,
+tagged grants and cwd. The focused scenario launches `ip` through PermissionManager,
+answers its typed `network.info` request, verifies the complete rendered stdout and clean
+exit, and requires an audit containing only the network grant. Existing focused scenarios
+cover the runtime/inventory, storage/path, query/admin and multimedia waves.
+
 ## Measurement and optimization
 
 Dynamic linking is the required `/bin` architecture, not an optional optimization gate.

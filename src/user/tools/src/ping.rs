@@ -42,13 +42,13 @@ enum OutputFormat {
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	unsafe {
-		// The shell hands us our argument (the target plus any flags) and our
-		// NetworkService client channel as a transferred capability, in one message.
+		// Governed launch sends arguments first, then the tagged NetworkService grant.
 		inherit_stdout(bootstrap);
-		let (len, netsvc): (usize, u64) = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } => (len, handle),
+		let len: usize = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, .. } => len,
 			Received::Closed => exit(),
 		};
+		let netsvc: u64 = recv_tagged(bootstrap, &mut buf, b"NETWORK").unwrap_or_else(|| exit());
 		ping(netsvc, &buf[..len]);
 		// Drop our client channel (NetworkService reclaims the slot) and exit; the
 		// kernel closes the bootstrap with the process, which is what a waiting

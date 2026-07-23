@@ -22,12 +22,13 @@ use rt::*;
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 128] = [0u8; 128];
 	unsafe {
-		// The shell hands us `<ip> <port>` plus our NetworkService client channel.
+		// Governed launch sends arguments first, then the tagged NetworkService grant.
 		inherit_stdout(bootstrap);
-		let (len, netsvc): (usize, u64) = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } => (len, handle),
+		let len: usize = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, .. } => len,
 			Received::Closed => exit(),
 		};
+		let netsvc: u64 = recv_tagged(bootstrap, &mut buf, b"NETWORK").unwrap_or_else(|| exit());
 		connect(netsvc, &buf[..len]);
 		close(netsvc);
 	}

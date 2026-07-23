@@ -4228,6 +4228,18 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     occurrence from masking an over-deep alternate DAG path. The existing tri-architecture
     self-cycle mutation continues to exercise the helper through the full ProcessService
     launch path. The remaining hostile-input work is governed command coverage.
+  - Governed network-wave result (M126a, 2026-07-23): all eight network tools now have
+    network-only PermissionManager manifests and consume the standard governed bootstrap
+    sequence instead of the obsolete shell-direct message that combined arguments with a
+    capability. PermissionManager mints a fresh client through `network.open` for every
+    launch, preventing concurrent tools from sharing one reply queue. Its standing `ip`
+    proof launches the real PIE through ProcessService, requires the fresh-client open and
+    typed `network.info` exchange, drains stdout through clean process exit, checks the exact
+    interface rendering and requires an audit with network granted and every unrelated
+    capability denied. Together with the existing runtime/inventory, storage/path,
+    query/admin and multimedia scenarios, every migration wave now has a governed runnable
+    representative. The remaining M126a reporting work is the checked per-wave source/import,
+    provider, size and test-command report.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

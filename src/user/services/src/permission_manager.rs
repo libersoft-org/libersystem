@@ -49,6 +49,7 @@ use ipc_client::ChannelTransport;
 use proto::system::audio_admin;
 use proto::system::display_admin;
 use proto::system::input_admin;
+use proto::system::network;
 use proto::system::permission::{self, Service};
 use proto::system::{AuditEntry, Capability, Error, Manifest, StartResult, process};
 use rt::*;
@@ -70,6 +71,9 @@ const REQUEST_NAME: &[u8] = b"request_probe";
 // own sandboxed ELF, which prints a file to a captured stdout; its manifest grants it exactly
 // one capability (storage).
 const CAT_NAME: &[u8] = b"cat";
+// The network-wave representative: it receives exactly NetworkService, queries the typed
+// interface state and renders it to the caller's stdout.
+const IP_NAME: &[u8] = b"ip";
 const GRANT_RIGHTS: u32 = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER;
 
 // A system tool launched through `run` receives, before its manifest grants, the caller's
@@ -168,6 +172,14 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"lssvc" => Some(granted("lssvc", alloc::vec![Capability::Services])),
 		b"lsblk" => Some(granted("lsblk", alloc::vec![Capability::Volumes])),
 		b"lsusb" => Some(granted("lsusb", alloc::vec![Capability::Usb])),
+		b"ping" => Some(granted("ping", alloc::vec![Capability::Network])),
+		b"ip" => Some(granted("ip", alloc::vec![Capability::Network])),
+		b"nslookup" => Some(granted("nslookup", alloc::vec![Capability::Network])),
+		b"tcp" => Some(granted("tcp", alloc::vec![Capability::Network])),
+		b"nc" => Some(granted("nc", alloc::vec![Capability::Network])),
+		b"arp" => Some(granted("arp", alloc::vec![Capability::Network])),
+		b"httpd" => Some(granted("httpd", alloc::vec![Capability::Network])),
+		b"ss" => Some(granted("ss", alloc::vec![Capability::Network])),
 		// The inventory commands need no capability at all: the system identity and the
 		// uptime are compile-time / free-syscall data, and the boot log, CPU set, memory
 		// totals, memory map and vector table are read over their own free syscalls -
@@ -343,19 +355,26 @@ unsafe fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64) -> u
 	}
 }
 
-// Mint the handle actually granted for `cap`. The re-resolvable capabilities (config
-// and device - their services restart transparently) are granted as a FRESH
-// sub-connection minted from the held client, so every tool gets its own connection
-// (no shared reply queue between concurrent tools), and a dead held client - the
-// service crashed and was restarted out from under it - is replaced by re-resolving
-// the name through the broker before minting: the grant reaches the live instance,
-// which is what makes a service restart transparent to the governed tools. Every
-// other capability is granted as a narrowed duplicate of the held client, as before.
+// Mint the handle actually granted for `cap`. Network is always a fresh `open`
+// sub-connection, so concurrent tools never share one reply queue. Config and device
+// are likewise fresh sub-connections and additionally re-resolve a dead held client
+// through the broker, making their service restarts transparent. Every other capability
+// is granted as a narrowed duplicate of the held client.
 // Returns 0 when no live client can be produced. (A re-resolving grant assumes the
 // broker peer answers RESOLVE - ServiceManager does; a scenario that grants config or
 // device must stand in for the broker or keep the service alive.)
 unsafe fn grant_handle(clients: &mut Clients, cap: Capability) -> u64 {
 	unsafe {
+		if cap == Capability::Network {
+			let mut client = network::Client::new(ChannelTransport { chan: clients.network });
+			let minted = match client.open() {
+				Some(Ok(minted)) => minted,
+				_ => return 0,
+			};
+			let dup = duplicate(minted, GRANT_RIGHTS);
+			close(minted);
+			return if dup >= 0 { dup as u64 } else { 0 };
+		}
 		let (held, name): (&mut u64, &'static [u8]) = match cap {
 			Capability::Config => (&mut clients.config, CAP_CONFIG),
 			Capability::Device => (&mut clients.device, CAP_DEVICE),
@@ -600,8 +619,8 @@ unsafe fn grant_volumes(manager_side: u64, clients: &Clients) -> bool {
 
 // Demonstrate the on-demand tool launcher (the `run` op's mechanism) at startup: stand in
 // for the shell by handing the tool a captured stdout console, run it under its manifest,
-// and read back what it printed - proof the tool reached its one granted capability and that
-// its output was forwarded to the caller's terminal. The shell reaches this same path live
+// and drain everything it prints until clean exit - proof the tool reached its one granted
+// capability and that its complete output was forwarded to the caller's terminal. The shell reaches this same path live
 // over the `run` op; here the manager plays both launcher and terminal so the path is
 // exercised end to end. Returns the bytes the tool printed, or empty if it could not start.
 unsafe fn demonstrate_tool(procsvc: u64, name: &[u8], args: &[u8], clients: &mut Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Vec<u8> {
@@ -617,10 +636,13 @@ unsafe fn demonstrate_tool(procsvc: u64, name: &[u8], args: &[u8], clients: &mut
 				return Vec::new();
 			}
 		};
-		let printed: Vec<u8> = match recv_blocking(output, buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => Vec::new(),
-		};
+		let mut printed: Vec<u8> = Vec::new();
+		loop {
+			match recv_blocking(output, buf) {
+				Received::Message { len, .. } => printed.extend_from_slice(&buf[..len]),
+				Received::Closed => break,
+			}
+		}
 		close(output);
 		close(started.task);
 		printed
@@ -717,21 +739,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    reports the bytes back; `date` (granted only time) is launched on demand through the
 	//    `run` op and renders the wall clock to a captured stdout; request_probe (granted only
 	//    log) asks for an undeclared capability at runtime to exercise the dynamic-request
-	//    path; and `cat` (granted only storage) is likewise launched through `run`, printing a
-	//    file to a captured stdout.
+	//    path; `cat` (granted only volumes) prints a file; and `ip` (granted only network)
+	//    queries a fresh NetworkService sub-connection and renders it to captured stdout.
 	let mut audit: Vec<AuditEntry> = Vec::new();
 	let probe_read: Vec<u8> = unsafe { launch_under_manifest(procsvc, PROBE_NAME, &mut clients, &mut audit, &mut buf) }.unwrap_or_default();
 	let date_read: Vec<u8> = unsafe { demonstrate_tool(procsvc, DATE_NAME, b"", &mut clients, &mut audit, &mut buf) };
 	let request_read: Vec<u8> = unsafe { launch_under_manifest(procsvc, REQUEST_NAME, &mut clients, &mut audit, &mut buf) }.unwrap_or_default();
 	let cat_read: Vec<u8> = unsafe { demonstrate_tool(procsvc, CAT_NAME, b"vol://system/hello.txt", &mut clients, &mut audit, &mut buf) };
+	let ip_read: Vec<u8> = unsafe { demonstrate_tool(procsvc, IP_NAME, b"", &mut clients, &mut audit, &mut buf) };
 
 	// 4. report in to the supervisor, then relay each governed component's proof and its
 	//    decisions summary (exactly which capabilities it was and was not given): the bytes
 	//    sandbox_probe read through its storage grant, the instant `date` printed through its
 	//    time grant to a captured stdout, request_probe's verdict on its runtime request for an
 	//    undeclared capability (its summary marks that refused request as a dynamic decision),
-	//    then the bytes the on-demand `cat` tool printed through its storage grant to the
-	//    forwarded stdout.
+	//    then the complete stdout from the on-demand `cat` and `ip` tools plus `ip`'s exact
+	//    network-only capability decisions.
 	unsafe {
 		send_blocking(bootstrap, b"PermissionManager: online", 0);
 		send_blocking(bootstrap, &probe_read, 0);
@@ -741,6 +764,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(bootstrap, &request_read, 0);
 		send_blocking(bootstrap, &summarize_for(&audit, REQUEST_NAME), 0);
 		send_blocking(bootstrap, &cat_read, 0);
+		send_blocking(bootstrap, &ip_read, 0);
+		send_blocking(bootstrap, &summarize_for(&audit, IP_NAME), 0);
 	}
 
 	// 5. serve generated lookup/audit/run requests until the supervisor drops the channel. The
