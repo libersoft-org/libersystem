@@ -1,0 +1,5 @@
+format=liber-dynamic-image-report-v1
+target	tools	object_bytes	pie_bytes	unique_provider_bytes	staged_bytes	private_bytes	shared_bytes	test_command
+x86_64-unknown-none	48	467840	435304	2375232	2810536	2162688	2744320	just dynamic-report-check
+aarch64-unknown-none	48	516056	466296	2602128	3068424	2764800	2834432	just dynamic-report-check
+riscv64gc-unknown-none-elf	48	543280	517864	2476064	2993928	2748416	2289664	just dynamic-report-check

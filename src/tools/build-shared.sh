@@ -529,6 +529,36 @@ record_object_cache() {
 	mv "$cache_prefix.sha256.tmp" "$cache_prefix.sha256"
 }
 
+object_reference_valid() {
+	local reference="$1"
+	local object="$2"
+	local key="$3"
+	local cache_prefix="$4"
+	local object_hash object_bytes
+	local -a record=()
+	[[ -f "$reference" && -f "$object" && -f "$cache_prefix.build-key" && -f "$cache_prefix.sha256" ]] || return 1
+	[[ "$(<"$cache_prefix.build-key")" == "$key" ]] || return 1
+	object_hash="$(<"$cache_prefix.sha256")"
+	object_bytes="$(stat -c %s "$object")"
+	mapfile -t record <"$reference" || return 1
+	[[ "${#record[@]}" == 5 && "${record[0]}" == "format=liber-image-object-reference-v1" && "${record[1]}" == "key=$key" && "${record[2]}" == "file=$(basename "$object")" && "${record[3]}" == "sha256=$object_hash" && "${record[4]}" == "bytes=$object_bytes" ]]
+}
+
+record_object_reference() {
+	local reference="$1"
+	local object="$2"
+	local key="$3"
+	local cache_prefix="$4"
+	{
+		printf 'format=liber-image-object-reference-v1\n'
+		printf 'key=%s\n' "$key"
+		printf 'file=%s\n' "$(basename "$object")"
+		printf 'sha256=%s\n' "$(<"$cache_prefix.sha256")"
+		printf 'bytes=%s\n' "$(stat -c %s "$object")"
+	} >"$reference.tmp.$$"
+	mv "$reference.tmp.$$" "$reference"
+}
+
 manifest_library_row() {
 	awk -v artifact="$1" '$1 == "library" && $2 == artifact {print; count++} END {if (count != 1) exit 1}' "$root/user/services/manifest.txt"
 }
@@ -1206,9 +1236,20 @@ if [[ -n "$image_graph" ]]; then
 		consumer_expected_needed="$(for provider in $providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
 		consumer_cache_key="$(artifact_cache_key executable "$kind $consumer $crate $stage $providers" "$consumer_expected_identity" "cargo=$image_target_config_value start=$(sha256sum "$start_obj" | awk '{print $1}')")"
 		consumer_cache_prefix="$artifact_cache_dir/executable-$consumer"
+		object_key="$(object_cache_key "$consumer" "$crate" "$consumer_source_sha" "$providers")"
+		object_cache_prefix="$artifact_cache_dir/object-$consumer-$object_key"
+		consumer_obj="$object_cache_prefix.o"
+		object_reference="$consumer_cache_prefix.object"
 		consumer_expected_order=""
 		if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$out" "$consumer_cache_prefix" "$consumer_cache_key" "$consumer_expected_identity" "$consumer_expected_needed"; then
 			if artifact_order_cache_valid "$out.order" "$consumer_cache_prefix"; then
+				if ! object_reference_valid "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"; then
+					object_cache_valid "$consumer_obj" "$object_cache_prefix" "$object_key" || {
+						echo "build-shared: dynamic $consumer has no valid current ET_REL object" >&2
+						exit 1
+					}
+					record_object_reference "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"
+				fi
 				echo "build-shared: executable cache hit $consumer"
 				((executable_cache_hits += 1))
 				rm -f "$consumer_expected_identity"
@@ -1218,6 +1259,13 @@ if [[ -n "$image_graph" ]]; then
 			canonical_provider_order "$providers" >"$consumer_expected_order"
 			if cmp -s "$consumer_expected_order" "$out.order"; then
 				record_artifact_order_cache "$out.order" "$consumer_cache_prefix"
+				if ! object_reference_valid "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"; then
+					object_cache_valid "$consumer_obj" "$object_cache_prefix" "$object_key" || {
+						echo "build-shared: dynamic $consumer has no valid current ET_REL object" >&2
+						exit 1
+					}
+					record_object_reference "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"
+				fi
 				echo "build-shared: executable cache hit $consumer"
 				((executable_cache_hits += 1))
 				rm -f "$consumer_expected_identity" "$consumer_expected_order"
@@ -1230,9 +1278,6 @@ if [[ -n "$image_graph" ]]; then
 			consumer_expected_order="$out.order.$$.expected"
 			canonical_provider_order "$providers" >"$consumer_expected_order"
 		fi
-		object_key="$(object_cache_key "$consumer" "$crate" "$consumer_source_sha" "$providers")"
-		object_cache_prefix="$artifact_cache_dir/object-$consumer-$object_key"
-		consumer_obj="$object_cache_prefix.o"
 		if [[ "$force_rebuild" == 0 ]] && object_cache_valid "$consumer_obj" "$object_cache_prefix" "$object_key"; then
 			echo "build-shared: object cache hit $consumer"
 			((object_cache_hits += 1))
@@ -1245,6 +1290,7 @@ if [[ -n "$image_graph" ]]; then
 			mv "$consumer_obj_tmp" "$consumer_obj"
 			record_object_cache "$consumer_obj" "$object_cache_prefix" "$object_key"
 		fi
+		record_object_reference "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"
 		provider_inputs=()
 		expected_needed=""
 		for provider in $providers; do

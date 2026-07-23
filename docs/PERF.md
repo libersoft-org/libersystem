@@ -397,6 +397,21 @@ three targets, so the test addresses are deterministic. The comparison happens a
 clean process exit while both Process handles retain their address spaces, avoiding any
 interference with a live instruction stream.
 
+The whole command image now has a checked aggregate that includes the exact current
+ET_REL objects, not an ambiguous historical object-cache glob. Staged bytes count 48 PIE
+files plus every provider needed by any command exactly once; archive framing, identity
+records and non-tool volume entries are intentionally outside this graph payload metric.
+
+| target | current ET_REL objects | PIE bytes | unique provider bytes | staged graph bytes | private bytes | shared bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| x86_64 | 467,840 | 435,304 | 2,375,232 | 2,810,536 | 2,162,688 | 2,744,320 |
+| AArch64 | 516,056 | 466,296 | 2,602,128 | 3,068,424 | 2,764,800 | 2,834,432 |
+| RISC-V | 543,280 | 517,864 | 2,476,064 | 2,993,928 | 2,748,416 | 2,289,664 |
+
+`docs/DYNAMIC_IMAGE.tsv` is the machine-checked source for this table. Its acceptance
+gate requires 48 current objects on every target, valid ET_REL identity/hash records,
+positive footprint fields, exact staged-byte arithmetic and byte-for-byte regeneration.
+
 ### Image-build cache (2026-07-19)
 
 The manifest-driven image builder separates four validated layers: Cargo's coherent

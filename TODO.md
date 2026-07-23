@@ -4278,6 +4278,20 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     order is identical on x86_64, AArch64 and RISC-V, and the focused x86 dynamic gate
     passes 21/21. Remaining work in the broader size/startup item is its raw-object and
     whole-image acceptance detail, not proof of cross-tool provider sharing.
+  - Raw-object and whole-image acceptance result (M126a, 2026-07-23): the linker now
+    atomically publishes one current ET_REL record per accepted executable, binding the
+    exact content-addressed object key, basename, SHA-256 and byte count. Cache hits
+    validate or restore that record, so hundreds of retained historical objects cannot be
+    mistaken for the current input. The report checker recomputes the hash, requires
+    `ET_REL` with exactly one global `__user_main`, and records object bytes per tool and
+    wave. New `docs/DYNAMIC_IMAGE.tsv` has one row per target with all 48 current object
+    bytes, 48 PIE bytes, every command provider counted once, staged graph bytes and
+    private/shared footprints. x86_64 is 467,840 B objects + 435,304 B PIE + 2,375,232 B
+    unique providers = 2,810,536 B staged graph; AArch64 is 516,056 + 466,296 + 2,602,128
+    = 3,068,424 B; RISC-V is 543,280 + 517,864 + 2,476,064 = 2,993,928 B. The second warm
+    x86 pass retains 46/46 provider and 67/67 executable hits with no object misses.
+    Remaining M126a work is atomization/source-ownership completion and any literal
+    hostile-input requirements not already covered, not size/sharing/startup accounting.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

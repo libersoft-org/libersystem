@@ -250,7 +250,7 @@ cover the runtime/inventory, storage/path, query/admin and multimedia waves.
 `docs/DYNAMIC_EXECUTABLES.tsv` is the checked inventory of all dynamic command waves on
 x86_64, AArch64 and RISC-V. Each row records the linked ELF's complete undefined import
 set, manifest-declared providers, independently parsed `DT_NEEDED` set, canonical
-transitive provider order, stripped PIE bytes, provider bytes, private image bytes,
+transitive provider order, validated ET_REL object bytes, stripped PIE bytes, provider bytes, private image bytes,
 immutable shared bytes and the governed test command. `docs/DYNAMIC_WAVES.tsv` aggregates
 the same data with providers deduplicated inside each target/wave. Private image bytes are
 the page-rounded writable `PT_LOAD` ranges of the executable plus every provider in its
@@ -259,6 +259,16 @@ the three target graphs and requires the report to reproduce byte for byte. It a
 if the five wave lists do not partition the manifest's tool inventory exactly, a direct
 provider differs from `DT_NEEDED`, a sidecar omits a root, or an artifact/provider is
 missing. `just dynamic-report-update` is the explicit regeneration command.
+
+ET_REL attribution never selects the newest or only object matching a filename pattern.
+The image builder atomically publishes one current-object record per accepted executable,
+binding its exact object key, basename, SHA-256 and byte count. Cache hits validate or
+restore that record from the independently validated object cache. The report checker
+requires the referenced file and sidecars, recomputes its SHA-256, requires ELF `ET_REL`
+and exactly one global `__user_main` definition, then records its size. Historical cache
+objects may coexist without ambiguity. `docs/DYNAMIC_IMAGE.tsv` sums all 48 current
+objects and PIE files per target, adds each provider file exactly once, and checks that
+staged bytes equal PIE plus unique-provider bytes.
 
 Physical sharing is pinned across different executable graphs, not only repeated launches
 of one binary. Canonical provider order places `volume-client.lslib` in slot 4 for both
