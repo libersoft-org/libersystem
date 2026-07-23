@@ -14,6 +14,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "display-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
 name = "input-proto"
 version = "0.0.0"
 dependencies = [
@@ -31,12 +41,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "process-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "display-proto",
  "input-proto",
  "ipc-client",
+ "process-proto",
  "storage-proto",
  "wire",
 ]

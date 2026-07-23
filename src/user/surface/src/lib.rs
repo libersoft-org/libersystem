@@ -3,9 +3,11 @@
 extern crate alloc;
 
 use alloc::rc::Rc;
+use base_proto::generated::liber::base::v1::Error;
 use core::cell::RefCell;
+use display_proto::generated::liber::display::v1::{DisplayEvent, PixelFormat, SurfaceInfo, display};
+use input_proto::generated::liber::input::v1::input;
 use ipc_client::ChannelTransport;
-use proto::system::{DisplayEvent, Error, PixelFormat, SurfaceInfo, display, input};
 use rt::{Framebuffer, close, map_object, unmap_object};
 
 pub use pix::{BlitResult, Image, Rect, Target};

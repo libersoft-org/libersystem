@@ -3,7 +3,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use proto::system::{Error, ProcessInfo, StartResult};
+use base_proto::generated::liber::base::v1::Error;
+use process_proto::generated::liber::process::v1::{ProcessInfo, StartResult};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_process_process_start"]

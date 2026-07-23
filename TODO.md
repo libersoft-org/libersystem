@@ -4347,6 +4347,22 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     coverage passes 21/21 on x86_64, AArch64 and RISC-V, and focused x86 input/display/
     image/service/process behavior passes 69/69; storage/package coverage passes 31/31.
     The remaining generated domains stay in the compatibility provider.
+  - Generated process/display-package split result (M126a, 2026-07-23): dependency-
+    ordered generation now gives `process-proto.lslib` (21,416/24,376/21,720 bytes)
+    sole ownership of `liber:process@1` and `display-proto.lslib`
+    (32,744/38,056/38,096 bytes) sole ownership of `liber:display@1`. Display retains a
+    Cargo type dependency on the process `task` resource, but no false runtime edge when
+    that handle codec inlines. `process-client.lslib` routes its concrete calls to the
+    process leaf; `surface.lslib` uses the display leaf directly. `display_service` and
+    `run` remove their monolithic protocol edges, while security/session imports keep the
+    compatibility provider's explicit process-leaf dependency. The remaining
+    `proto.lslib` is 270,112/315,432/281,760 bytes. Exact-edge image graphs and the
+    checked 144-row report pass on all targets with zero generic residuals. Dynamic
+    runtime coverage passes 21/21 on x86_64, AArch64 and RISC-V; focused x86
+    display/input/image, process and storage/package slices pass 14/14, 46/46 and 31/31.
+    The broad x86 service-tag union still reaches its existing cumulative test-stack
+    double fault, so it is not counted as green here. Other generated domains remain in
+    the compatibility provider.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

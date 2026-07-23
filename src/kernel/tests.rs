@@ -4661,7 +4661,7 @@ fn system_packages_use_canonical_executable_names() {
 		library_identities += usize::from(name.starts_with(b"id/lib/"));
 		executable_identities += usize::from(name.starts_with(b"id/bin/"));
 	}
-	assert_eq!(library_identities, 49, "every staged library has one identity record");
+	assert_eq!(library_identities, 51, "every staged library has one identity record");
 	assert_eq!(executable_identities, 68, "every staged dynamic executable has one identity record");
 	assert!(volume.lookup(b"id/lib/imgconv").is_some(), "library identity namespace preserves imgconv");
 	assert!(volume.lookup(b"id/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");
@@ -5353,26 +5353,26 @@ fn dynamic_wave_launch_metrics_are_structurally_sound() {
 	#[cfg(target_arch = "x86_64")]
 	let representatives = [
 		(1u8, b"echo" as &[u8], 100u32, 14usize, 80usize),
-		(2, b"cat" as &[u8], 102, 23, 167),
-		(3, b"date" as &[u8], 104, 22, 166),
-		(4, b"ip" as &[u8], 106, 23, 166),
-		(5, b"imgconv" as &[u8], 108, 47, 430),
+		(2, b"cat" as &[u8], 102, 24, 164),
+		(3, b"date" as &[u8], 104, 23, 163),
+		(4, b"ip" as &[u8], 106, 24, 163),
+		(5, b"imgconv" as &[u8], 108, 48, 427),
 	];
 	#[cfg(target_arch = "aarch64")]
 	let representatives = [
 		(1u8, b"echo" as &[u8], 100u32, 14usize, 88usize),
-		(2, b"cat" as &[u8], 102, 29, 184),
-		(3, b"date" as &[u8], 104, 28, 183),
-		(4, b"ip" as &[u8], 106, 29, 183),
-		(5, b"imgconv" as &[u8], 108, 71, 454),
+		(2, b"cat" as &[u8], 102, 31, 181),
+		(3, b"date" as &[u8], 104, 30, 180),
+		(4, b"ip" as &[u8], 106, 31, 180),
+		(5, b"imgconv" as &[u8], 108, 73, 451),
 	];
 	#[cfg(target_arch = "riscv64")]
 	let representatives = [
 		(1u8, b"echo" as &[u8], 100u32, 14usize, 72usize),
-		(2, b"cat" as &[u8], 102, 28, 145),
-		(3, b"date" as &[u8], 104, 27, 144),
-		(4, b"ip" as &[u8], 106, 27, 144),
-		(5, b"imgconv" as &[u8], 108, 68, 338),
+		(2, b"cat" as &[u8], 102, 29, 144),
+		(3, b"date" as &[u8], 104, 28, 143),
+		(4, b"ip" as &[u8], 106, 28, 143),
+		(5, b"imgconv" as &[u8], 108, 69, 337),
 	];
 	for (wave, name, correlation, private_pages, shared_pages) in representatives {
 		measure_dynamic_wave_launch(&process_client, wave, name, correlation, private_pages, shared_pages);

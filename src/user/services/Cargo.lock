@@ -18,6 +18,16 @@ name = "bootproto"
 version = "0.0.0"
 
 [[package]]
+name = "display-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
 name = "input-proto"
 version = "0.0.0"
 dependencies = [
@@ -50,12 +60,23 @@ name = "pix"
 version = "0.0.0"
 
 [[package]]
+name = "process-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "display-proto",
  "input-proto",
  "ipc-client",
+ "process-proto",
  "storage-proto",
  "wire",
 ]
@@ -97,9 +118,11 @@ dependencies = [
 name = "surface"
 version = "0.0.0"
 dependencies = [
+ "base-proto",
+ "display-proto",
+ "input-proto",
  "ipc-client",
  "pix",
- "proto",
  "rt",
 ]
 

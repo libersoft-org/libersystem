@@ -359,20 +359,20 @@ three targets.
 | target | wave | tools | PIE bytes | unique provider bytes | private bytes | shared bytes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | x86_64 | 1 | 12 | 74,960 | 429,592 | 311,296 | 454,656 |
-| x86_64 | 2 | 11 | 129,432 | 818,256 | 622,592 | 819,200 |
-| x86_64 | 3 | 13 | 97,024 | 837,680 | 745,472 | 864,256 |
-| x86_64 | 4 | 8 | 62,896 | 815,640 | 462,848 | 761,856 |
-| x86_64 | 5 | 4 | 50,104 | 2,372,688 | 479,232 | 2,203,648 |
+| x86_64 | 2 | 11 | 129,440 | 799,672 | 651,264 | 806,912 |
+| x86_64 | 3 | 13 | 97,056 | 819,096 | 782,336 | 851,968 |
+| x86_64 | 4 | 8 | 62,888 | 797,056 | 495,616 | 749,568 |
+| x86_64 | 5 | 4 | 50,104 | 2,386,936 | 499,712 | 2,220,032 |
 | AArch64 | 1 | 12 | 83,744 | 500,160 | 327,680 | 495,616 |
-| AArch64 | 2 | 11 | 140,064 | 950,800 | 872,448 | 888,832 |
-| AArch64 | 3 | 13 | 104,200 | 970,752 | 1,032,192 | 937,984 |
-| AArch64 | 4 | 8 | 67,816 | 948,040 | 659,456 | 831,488 |
-| AArch64 | 5 | 4 | 52,984 | 2,603,672 | 741,376 | 2,289,664 |
+| AArch64 | 2 | 11 | 140,064 | 930,920 | 929,792 | 876,544 |
+| AArch64 | 3 | 13 | 104,312 | 950,888 | 1,114,112 | 925,696 |
+| AArch64 | 4 | 8 | 67,816 | 928,160 | 724,992 | 819,200 |
+| AArch64 | 5 | 4 | 52,992 | 2,621,920 | 774,144 | 2,310,144 |
 | RISC-V | 1 | 12 | 92,384 | 507,016 | 327,680 | 421,888 |
-| RISC-V | 2 | 11 | 160,216 | 911,112 | 819,200 | 720,896 |
-| RISC-V | 3 | 13 | 112,072 | 933,608 | 987,136 | 774,144 |
-| RISC-V | 4 | 8 | 77,432 | 908,760 | 630,784 | 659,456 |
-| RISC-V | 5 | 4 | 59,368 | 2,476,176 | 704,512 | 1,773,568 |
+| RISC-V | 2 | 11 | 160,216 | 892,968 | 847,872 | 716,800 |
+| RISC-V | 3 | 13 | 112,168 | 915,464 | 1,019,904 | 770,048 |
+| RISC-V | 4 | 8 | 77,432 | 890,616 | 663,552 | 655,360 |
+| RISC-V | 5 | 4 | 59,376 | 2,496,216 | 724,992 | 1,798,144 |
 
 The dynamic runtime gate launches one representative from each wave twice through
 StorageService and ProcessService. It requires both timings to be nonzero, identical
@@ -384,10 +384,10 @@ first-versus-warm ordering flaky. One x86 KVM debug run measured:
 | wave representative | first launch | repeated launch | private pages | shared pages |
 | --- | ---: | ---: | ---: | ---: |
 | `echo` | 185.869 ms | 186.510 ms | 14 | 80 |
-| `cat` | 245.242 ms | 249.176 ms | 23 | 167 |
-| `date` | 243.670 ms | 245.442 ms | 22 | 166 |
-| `ip` | 244.464 ms | 246.684 ms | 23 | 166 |
-| `imgconv` | 337.806 ms | 336.565 ms | 47 | 430 |
+| `cat` | 245.242 ms | 249.176 ms | 24 | 164 |
+| `date` | 243.670 ms | 245.442 ms | 23 | 163 |
+| `ip` | 244.464 ms | 246.684 ms | 24 | 163 |
+| `imgconv` | 337.806 ms | 336.565 ms | 48 | 427 |
 
 Sharing is also verified between different executables. Concurrent `cat` and `write`
 processes map the same physical first text page of `volume-client.lslib`; concurrent
@@ -404,9 +404,9 @@ records and non-tool volume entries are intentionally outside this graph payload
 
 | target | current ET_REL objects | PIE bytes | unique provider bytes | staged graph bytes | private bytes | shared bytes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| x86_64 | 444,488 | 414,416 | 2,404,816 | 2,819,232 | 2,621,440 | 2,756,608 |
-| AArch64 | 496,176 | 448,808 | 2,637,024 | 3,085,832 | 3,633,152 | 2,850,816 |
-| RISC-V | 524,792 | 501,472 | 2,512,048 | 3,013,520 | 3,469,312 | 2,306,048 |
+| x86_64 | 444,496 | 414,448 | 2,419,064 | 2,833,512 | 2,740,224 | 2,772,992 |
+| AArch64 | 496,208 | 448,928 | 2,655,288 | 3,104,216 | 3,870,720 | 2,871,296 |
+| RISC-V | 524,824 | 501,576 | 2,532,088 | 3,033,664 | 3,584,000 | 2,330,624 |
 
 `docs/DYNAMIC_IMAGE.tsv` is the machine-checked source for this table. Its acceptance
 gate requires 48 current objects on every target, valid ET_REL identity/hash records,

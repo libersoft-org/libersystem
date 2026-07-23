@@ -7,9 +7,6 @@ generated/liber/config/v1.rs
 generated/liber/device/mod.rs
 generated/liber/device/v1/compat.rs
 generated/liber/device/v1.rs
-generated/liber/display/mod.rs
-generated/liber/display/v1/compat.rs
-generated/liber/display/v1.rs
 generated/liber/log/mod.rs
 generated/liber/log/v1/compat.rs
 generated/liber/log/v1.rs
@@ -20,9 +17,6 @@ generated/liber/network/v1.rs
 generated/liber/observability/mod.rs
 generated/liber/observability/v1/compat.rs
 generated/liber/observability/v1.rs
-generated/liber/process/mod.rs
-generated/liber/process/v1/compat.rs
-generated/liber/process/v1.rs
 generated/liber/resources/mod.rs
 generated/liber/resources/v1/compat.rs
 generated/liber/resources/v1.rs

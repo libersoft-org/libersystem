@@ -8,4 +8,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-shared-image = []
+shared-image = ["process-proto/shared-image"]
+
+[dependencies]
+process-proto = { path = "../process-proto" }

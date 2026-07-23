@@ -7,6 +7,30 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "base-proto"
+version = "0.0.0"
+dependencies = [
+ "wire",
+]
+
+[[package]]
+name = "display-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "input-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
 name = "ipc-client"
 version = "0.0.0"
 dependencies = [
@@ -19,9 +43,10 @@ name = "pix"
 version = "0.0.0"
 
 [[package]]
-name = "proto"
+name = "process-proto"
 version = "0.0.0"
 dependencies = [
+ "base-proto",
  "wire",
 ]
 
@@ -36,9 +61,11 @@ dependencies = [
 name = "surface"
 version = "0.0.0"
 dependencies = [
+ "base-proto",
+ "display-proto",
+ "input-proto",
  "ipc-client",
  "pix",
- "proto",
  "rt",
 ]
 

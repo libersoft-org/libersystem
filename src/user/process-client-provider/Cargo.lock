@@ -3,5 +3,47 @@
 version = 4
 
 [[package]]
+name = "abi"
+version = "0.0.0"
+
+[[package]]
+name = "base-proto"
+version = "0.0.0"
+dependencies = [
+ "wire",
+]
+
+[[package]]
+name = "ipc-client"
+version = "0.0.0"
+dependencies = [
+ "rt",
+ "wire",
+]
+
+[[package]]
 name = "process-client-provider"
+version = "0.0.0"
+dependencies = [
+ "process-proto",
+]
+
+[[package]]
+name = "process-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "rt"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
+name = "wire"
 version = "0.0.0"

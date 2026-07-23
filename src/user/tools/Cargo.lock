@@ -126,6 +126,16 @@ name = "device-client-provider"
 version = "0.0.0"
 
 [[package]]
+name = "display-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -361,20 +371,35 @@ dependencies = [
 name = "process-client"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
+ "process-proto",
 ]
 
 [[package]]
 name = "process-client-provider"
 version = "0.0.0"
+dependencies = [
+ "process-proto",
+]
+
+[[package]]
+name = "process-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "display-proto",
  "input-proto",
  "ipc-client",
+ "process-proto",
  "storage-proto",
  "wire",
 ]
@@ -445,9 +470,11 @@ dependencies = [
 name = "surface"
 version = "0.0.0"
 dependencies = [
+ "base-proto",
+ "display-proto",
+ "input-proto",
  "ipc-client",
  "pix",
- "proto",
  "rt",
 ]
 
