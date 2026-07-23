@@ -10,7 +10,7 @@ pub mod network;
 pub mod observability;
 pub use process_proto::generated::liber::process;
 pub mod resources;
-pub mod security;
+pub use security_proto::generated::liber::security;
 pub mod session;
 pub use storage_proto::generated::liber::storage;
 pub mod time;

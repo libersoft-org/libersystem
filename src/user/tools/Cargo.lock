@@ -400,6 +400,7 @@ dependencies = [
  "input-proto",
  "ipc-client",
  "process-proto",
+ "security-proto",
  "storage-proto",
  "wire",
 ]
@@ -450,12 +451,27 @@ dependencies = [
 name = "security-client"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
+ "process-proto",
+ "security-proto",
 ]
 
 [[package]]
 name = "security-client-provider"
 version = "0.0.0"
+dependencies = [
+ "security-proto",
+]
+
+[[package]]
+name = "security-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
 
 [[package]]
 name = "storage-proto"

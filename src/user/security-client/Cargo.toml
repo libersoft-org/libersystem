@@ -11,4 +11,6 @@ default = []
 shared-image = []
 
 [dependencies]
-proto = { path = "../../proto" }
+base-proto = { path = "../base-proto" }
+process-proto = { path = "../process-proto" }
+security-proto = { path = "../security-proto" }

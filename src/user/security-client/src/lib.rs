@@ -1,6 +1,8 @@
 #![no_std]
 
-use proto::system::{Error, Manifest, StartResult};
+use base_proto::generated::liber::base::v1::Error;
+use process_proto::generated::liber::process::v1::StartResult;
+use security_proto::generated::liber::security::v1::Manifest;
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_security_permission_lookup"]

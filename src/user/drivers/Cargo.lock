@@ -54,6 +54,7 @@ dependencies = [
  "display-proto",
  "input-proto",
  "process-proto",
+ "security-proto",
  "storage-proto",
  "wire",
 ]
@@ -63,6 +64,15 @@ name = "rt"
 version = "0.0.0"
 dependencies = [
  "abi",
+]
+
+[[package]]
+name = "security-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "process-proto",
+ "wire",
 ]
 
 [[package]]

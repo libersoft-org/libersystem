@@ -4354,7 +4354,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     Cargo type dependency on the process `task` resource, but no false runtime edge when
     that handle codec inlines. `process-client.lslib` routes its concrete calls to the
     process leaf; `surface.lslib` uses the display leaf directly. `display_service` and
-    `run` remove their monolithic protocol edges, while security/session imports keep the
+    `run` remove their monolithic protocol edges. At this point security imports kept the
     compatibility provider's explicit process-leaf dependency. The remaining
     `proto.lslib` is 270,112/315,432/281,760 bytes. Exact-edge image graphs and the
     checked 144-row report pass on all targets with zero generic residuals. Dynamic
@@ -4363,6 +4363,19 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     The broad x86 service-tag union still reaches its existing cumulative test-stack
     double fault, so it is not counted as green here. Other generated domains remain in
     the compatibility provider.
+  - Generated security-package split result (M126a, 2026-07-23):
+    `security-proto.lslib` (28,928/34,984/34,776 bytes) now exclusively owns
+    `liber:security@1` types, permission codecs, audit stream helpers and concrete channel
+    implementation thunks. `security-client.lslib` routes lookup/audit/run to this leaf
+    and uses `process-proto`'s imported `StartResult` identity. `permission_manager` and
+    `perm` remove their monolithic protocol edges; shell request encoding remains inline
+    and carries no false security edge. With security externalized, the compatibility
+    provider no longer has any runtime process-leaf dependency and shrinks to
+    247,952/286,760/254,624 bytes. Exact-edge graphs and the checked 144-row report pass
+    on all targets with zero generic residuals. Dynamic runtime coverage passes 21/21 on
+    x86_64, AArch64 and RISC-V; focused x86 process/PermissionManager and storage/package
+    slices pass 46/46 and 31/31. Other generated domains remain in the compatibility
+    provider.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,
