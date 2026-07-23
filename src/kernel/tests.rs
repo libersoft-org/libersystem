@@ -5558,6 +5558,17 @@ fn dynamic_process_service_rejects_malformed_symbol_and_relocation_metadata() {
 	}
 }
 
+tagged_test!(dynamic_process_service_rejects_provider_cycle, [Dynamic, DynamicReject, Service, Process, Storage]);
+fn dynamic_process_service_rejects_provider_cycle() {
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	let mut mutated_volume = volume.to_vec();
+	replace_dynamic_needed(&mut mutated_volume, b"lib/wire.lslib", "lsrt.lslib", "wire.lslib");
+	let reply = launch_from_volume(&mutated_volume, b"dyn_probe", 89);
+	assert_eq!(le_u32(&reply.bytes, 0), 89);
+	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a provider dependency cycle");
+	assert!(reply.caps.is_empty(), "a provider dependency cycle creates no process capability");
+}
+
 tagged_test!(dynamic_process_service_rejects_substituted_identity, [Dynamic, DynamicReject, Service, Process, Storage]);
 fn dynamic_process_service_rejects_substituted_identity() {
 	let (volume, _) = scenario_packages().expect("scenario packages");

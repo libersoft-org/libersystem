@@ -249,6 +249,7 @@ Run `just --list` to see every available command. The most useful ones:
 | `just duplicate-edge-check` | Temporarily make two staged `DT_NEEDED` entries name the same provider on all three targets; package assembly must reject the duplicate before rewriting the system volume, then restore each artifact. |
 | `just malformed-dynamic-check` | Temporarily inject a second `PT_DYNAMIC`, remove `DT_NULL`, and duplicate `DT_STRTAB` metadata in a staged executable on all three targets; package assembly must reject each form before rewriting the system volume, then restore each artifact. |
 | `just malformed-symbol-relocation-check` | Temporarily inject an invalid `DT_SYMENT`, oversized SysV symbol count, and misaligned `DT_PLTRELSZ` into a staged executable on all three targets; package assembly must reject each form before rewriting the system volume, then restore each artifact. |
+| `just dependency-graph-check` | Temporarily reorder a staged executable's canonical provider sidecar on all three targets; package assembly independently recomputes the manifest graph and must reject the drift before rewriting the system volume, then restore the sidecar. |
 | `just lab <cmd>` | Drive a live instance for debugging (boot, run guest shell commands, logs, packet capture - see [docs/DEBUG.md](./docs/DEBUG.md)). |
 | `just debug` | Boot in QEMU and wait for GDB on `:1234`. |
 | `just gdb` | Attach GDB to a waiting QEMU instance. |

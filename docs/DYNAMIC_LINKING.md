@@ -223,6 +223,14 @@ table in addition to relocation records, and ProcessService applies the same par
 rules before resolver traversal. Each mutation must fail without rewriting the archive
 or creating a Process capability.
 
+Package staging independently reconstructs each executable's complete provider closure
+from the manifest and derives the lexicographically deterministic provider-before-
+consumer topological order. The staged order sidecar must match that exact sequence, not
+merely contain valid unique library names. The dependency-graph gate swaps two valid
+sidecar entries and requires package rejection without archive changes. Its runtime half
+changes `wire.lslib` to depend on itself; ProcessService's bounded DFS cycle guard must
+reject the launch before loading a module or creating a Process capability.
+
 ## Measurement and optimization
 
 Dynamic linking is the required `/bin` architecture, not an optional optimization gate.

@@ -13,13 +13,13 @@ failure_log=""
 restore_log=""
 
 case "$first" in
-static | undeclared-edge | duplicate-edge | malformed-dynamic | malformed-symbol-relocation)
+static | undeclared-edge | duplicate-edge | malformed-dynamic | malformed-symbol-relocation | dependency-graph)
 	kind="$first"
 	mode="${2:-all}"
 	;;
 all | x86_64 | aarch64 | riscv64) mode="$first" ;;
 *)
-	echo "usage: $0 [static|undeclared-edge|duplicate-edge|malformed-dynamic|malformed-symbol-relocation] [all|x86_64|aarch64|riscv64]" >&2
+	echo "usage: $0 [static|undeclared-edge|duplicate-edge|malformed-dynamic|malformed-symbol-relocation|dependency-graph] [all|x86_64|aarch64|riscv64]" >&2
 	exit 2
 	;;
 esac
@@ -243,6 +243,16 @@ inject_artifact() {
 	bad-pltrelsz)
 		write_u64_le 47 "$(dynamic_value_offset 2)"
 		;;
+	dependency-graph)
+		local -a order=()
+		mapfile -t order <"$artifact"
+		if [[ "${#order[@]}" -lt 2 || -z "${order[0]}" || -z "${order[1]}" ]]; then
+			echo "image-injection-check: $mutation expected a multi-provider order in $artifact" >&2
+			return 1
+		fi
+		printf '%s\n%s\n' "${order[1]}" "${order[0]}" >"$artifact"
+		printf '%s\n' "${order[@]:2}" >>"$artifact"
+		;;
 	esac
 }
 
@@ -254,6 +264,7 @@ rejection_pattern() {
 	duplicate-segment | missing-terminator | duplicate-singleton) printf '%s\n' 'dynamic dyn_probe has no valid terminated PT_DYNAMIC' ;;
 	bad-syment | bad-pltrelsz) printf '%s\n' 'dynamic dyn_probe has no valid terminated PT_DYNAMIC' ;;
 	bad-hash-count) printf '%s\n' 'dynamic dyn_probe has malformed dynamic symbols' ;;
+	dependency-graph) printf '%s\n' 'dynamic dyn_probe provider order differs from the manifest graph' ;;
 	esac
 }
 
@@ -263,7 +274,9 @@ check_target() {
 	local volume_name="$3"
 	local volume="$root/boot/.build/$volume_name"
 	local artifact_hash before after_failure after_restore
-	if [[ "$kind" == duplicate-edge || "$kind" == malformed-dynamic || "$kind" == malformed-symbol-relocation ]]; then
+	if [[ "$kind" == dependency-graph ]]; then
+		artifact="$root/user/dyn_probe/shared/$target/dyn_probe.order"
+	elif [[ "$kind" == duplicate-edge || "$kind" == malformed-dynamic || "$kind" == malformed-symbol-relocation ]]; then
 		artifact="$root/user/dyn_probe/shared/$target/dyn_probe"
 	else
 		artifact="$root/user/tools/shared/$target/echo"
@@ -333,7 +346,7 @@ x86_64) check_target x86_64 x86_64-unknown-none volume.pkg ;;
 aarch64) check_target aarch64 aarch64-unknown-none volume-aarch64.pkg ;;
 riscv64) check_target riscv64 riscv64gc-unknown-none-elf volume-riscv64.pkg ;;
 *)
-	echo "usage: $0 [static|undeclared-edge|duplicate-edge|malformed-dynamic|malformed-symbol-relocation] [all|x86_64|aarch64|riscv64]" >&2
+	echo "usage: $0 [static|undeclared-edge|duplicate-edge|malformed-dynamic|malformed-symbol-relocation|dependency-graph] [all|x86_64|aarch64|riscv64]" >&2
 	exit 2
 	;;
 esac

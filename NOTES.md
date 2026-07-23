@@ -1,6 +1,7 @@
 # Bugs / changes
 
 - add "ls" parameters (filters like *.txt etc.)
+- Native compilers - wasm
 - create a live video about LiberSystem
 - voribis - LICENSE file
 - check if we have our implementations only (not licensed !!!)

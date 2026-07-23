@@ -191,17 +191,35 @@ fn audit_linked_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String], 
 	assert_eq!(actual, expected, "{} {} DT_NEEDED providers differ from the manifest", row.kind, row.name);
 }
 
-fn audit_dynamic_order(row: &ManifestRow, bytes: &[u8], libraries: &[String]) {
+fn audit_dynamic_order(row: &ManifestRow, bytes: &[u8], libraries: &[ManifestRow]) {
 	assert!(!bytes.is_empty() && bytes.len() <= 64 * 65 && bytes.last() == Some(&b'\n'), "dynamic {} has malformed canonical provider order", row.name);
 	let text = core::str::from_utf8(bytes).unwrap_or_else(|_| panic!("dynamic {} provider order is not UTF-8", row.name));
-	let mut names: Vec<&str> = Vec::new();
+	let mut actual: Vec<String> = Vec::new();
 	for name in text.lines() {
 		let stem = name.strip_suffix(".lslib").unwrap_or_else(|| panic!("dynamic {} order names non-library {name:?}", row.name));
-		assert!(valid_library_name(stem) && libraries.binary_search(&String::from(stem)).is_ok(), "dynamic {} order names invalid or unstaged provider {name}", row.name);
-		assert!(!names.contains(&name), "dynamic {} repeats provider {name} in canonical order", row.name);
-		names.push(name);
+		assert!(valid_library_name(stem) && libraries.iter().any(|library| library.name == stem), "dynamic {} order names invalid or unstaged provider {name}", row.name);
+		assert!(!actual.iter().any(|loaded| loaded == name), "dynamic {} repeats provider {name} in canonical order", row.name);
+		actual.push(String::from(name));
 	}
-	assert!(!names.is_empty() && names.len() <= 64, "dynamic {} has an empty or oversized canonical provider order", row.name);
+	assert!(!actual.is_empty() && actual.len() <= 64, "dynamic {} has an empty or oversized canonical provider order", row.name);
+
+	let mut closure: Vec<&ManifestRow> = Vec::new();
+	let mut pending: Vec<&str> = row.providers.iter().map(String::as_str).collect();
+	while let Some(name) = pending.pop() {
+		if closure.iter().any(|library| library.name == name) {
+			continue;
+		}
+		let library = libraries.iter().find(|library| library.name == name).unwrap_or_else(|| panic!("dynamic {} order closure names unstaged provider {name}", row.name));
+		assert!(closure.len() < 64, "dynamic {} has an oversized provider closure", row.name);
+		closure.push(library);
+		pending.extend(library.providers.iter().map(String::as_str));
+	}
+	let mut expected: Vec<String> = Vec::with_capacity(closure.len());
+	while expected.len() < closure.len() {
+		let next = closure.iter().filter(|library| !expected.iter().any(|name| name == &format!("{}.lslib", library.name)) && library.providers.iter().all(|provider| expected.iter().any(|name| name == &format!("{provider}.lslib")))).min_by(|left, right| left.name.cmp(&right.name)).unwrap_or_else(|| panic!("dynamic {} provider graph contains a cycle", row.name));
+		expected.push(format!("{}.lslib", next.name));
+	}
+	assert_eq!(actual, expected, "dynamic {} provider order differs from the manifest graph", row.name);
 }
 
 // The debug-build target path of a userspace ELF: each crate builds to its own target dir.
@@ -472,7 +490,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 					let order_path = user_dynamic_order_path(&manifest, &row.crate_dir, &row.name);
 					println!("cargo:rerun-if-changed={}", order_path.display());
 					let order = fs::read(&order_path).unwrap_or_else(|error| panic!("cannot read canonical order for dynamic {} at {}: {error}", row.name, order_path.display()));
-					audit_dynamic_order(&row, &order, &libraries);
+					audit_dynamic_order(&row, &order, &library_rows);
 					files.push((format!("order/{}", row.name), order));
 				} else if row.kind == "library" {
 					audit_linked_artifact(&row, &bytes, &libraries, row.name != "lsrt");

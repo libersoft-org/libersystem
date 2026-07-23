@@ -4206,6 +4206,18 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     capability. Host parser tests pin both metadata-size branches and the bounded hash
     walk. The remaining hostile-input work is malformed dependency graph metadata and
     governed command coverage.
+  - Dependency graph integrity result (M126a, 2026-07-23): package staging now
+    independently reconstructs every executable's complete provider closure from the
+    manifest and derives the deterministic provider-before-consumer topological order.
+    A sidecar containing valid staged library names is no longer sufficient: its exact
+    sequence must match the recomputed graph. `dependency-graph-check` swaps the first
+    two valid `dyn_probe` order entries on x86_64, AArch64 and RISC-V; every package build
+    rejects the drift before archive output changes, then restores the sidecar and
+    reproduces the baseline archive. The ProcessService mutation gate independently
+    changes `wire.lslib` from depending on `lsrt.lslib` to depending on itself without
+    changing ELF layout. The bounded DFS visiting-set guard rejects the resulting cycle
+    before module loading and returns no Process capability. The remaining hostile-input
+    work is governed command coverage and explicit graph depth/module-limit pressure.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,
