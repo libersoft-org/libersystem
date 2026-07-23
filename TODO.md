@@ -4254,6 +4254,20 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     144 data rows with 10 fields each and reproduces byte for byte on an immediate check.
     Remaining M126a work is atomization/source-ownership completion and the broader
     size/sharing/startup acceptance gates, not wave inventory reproducibility.
+  - Wave footprint and launch acceptance result (M126a, 2026-07-23): the detailed report
+    now also records total provider bytes and page-rounded immutable shared bytes per
+    executable graph. `docs/DYNAMIC_WAVES.tsv` aggregates 15 target/wave rows with each
+    provider counted once per wave, simultaneous private writable footprints and shared
+    immutable footprints; both reports regenerate and compare byte-for-byte behind the
+    same triarch gate. A dynamic kernel test launches `echo`, `cat`, `date`, `ip` and
+    `imgconv` twice through the real StorageService/ProcessService path. For each target it
+    requires exact private counts equal to checked writable image pages plus the eight-page
+    stack, exact checked immutable shared counts, stable repeated footprints, clean exit
+    and one physically shared `lsrt` text frame. First/repeated times are emitted and must
+    be nonzero but have no flaky KVM/TCG ordering threshold. The x86 baseline is 14/80,
+    20/164, 19/164, 20/164 and 43/425 private/shared pages across waves 1 through 5.
+    Remaining M126a work is atomization/source-ownership completion and any unresolved
+    whole-image acceptance items, not per-wave size/sharing/startup measurement.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

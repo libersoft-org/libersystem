@@ -345,6 +345,50 @@ their cold start is far lower. Large applications and many concurrent consumers 
 cross the RAM break-even; conversion remains per-target and measurement-gated rather
 than ideological.
 
+### Dynamic executable waves (2026-07-23)
+
+The completed dynamic command graph has a checked structural baseline in
+`docs/DYNAMIC_EXECUTABLES.tsv` and its per-wave aggregate in
+`docs/DYNAMIC_WAVES.tsv`. `pie_bytes` sums stripped executable files.
+`unique_provider_bytes` counts each provider file once per wave. `private_bytes` is the
+simultaneous per-process sum of page-rounded writable executable and provider ranges;
+`shared_bytes` sums immutable executable ranges plus each wave provider once. The report
+checker independently reconstructs every closure and reproduces these values on all
+three targets.
+
+| target | wave | tools | PIE bytes | unique provider bytes | private bytes | shared bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| x86_64 | 1 | 12 | 74,960 | 429,592 | 311,296 | 454,656 |
+| x86_64 | 2 | 11 | 145,104 | 807,896 | 471,040 | 819,200 |
+| x86_64 | 3 | 13 | 97,024 | 831,240 | 598,016 | 856,064 |
+| x86_64 | 4 | 8 | 62,896 | 809,200 | 364,544 | 753,664 |
+| x86_64 | 5 | 4 | 55,320 | 2,343,104 | 417,792 | 2,179,072 |
+| AArch64 | 1 | 12 | 83,744 | 500,160 | 327,680 | 495,616 |
+| AArch64 | 2 | 11 | 152,896 | 938,104 | 593,920 | 888,832 |
+| AArch64 | 3 | 13 | 104,200 | 962,224 | 737,280 | 929,792 |
+| AArch64 | 4 | 8 | 67,816 | 939,512 | 462,848 | 823,296 |
+| AArch64 | 5 | 4 | 57,640 | 2,568,776 | 643,072 | 2,260,992 |
+| RISC-V | 1 | 12 | 92,384 | 507,016 | 327,680 | 421,888 |
+| RISC-V | 2 | 11 | 172,256 | 896,264 | 593,920 | 716,800 |
+| RISC-V | 3 | 13 | 112,064 | 922,976 | 741,376 | 761,856 |
+| RISC-V | 4 | 8 | 77,432 | 898,128 | 466,944 | 647,168 |
+| RISC-V | 5 | 4 | 63,728 | 2,440,192 | 618,496 | 1,744,896 |
+
+The dynamic runtime gate launches one representative from each wave twice through
+StorageService and ProcessService. It requires both timings to be nonzero, identical
+first/repeated page counts, exact target-specific counts derived from the checked ELF
+reports, clean exit after bootstrap closure, and one physically shared `lsrt` text frame.
+Timing is observational rather than a threshold: host load and KVM/TCG make a strict
+first-versus-warm ordering flaky. One x86 KVM debug run measured:
+
+| wave representative | first launch | repeated launch | private pages | shared pages |
+| --- | ---: | ---: | ---: | ---: |
+| `echo` | 185.869 ms | 186.510 ms | 14 | 80 |
+| `cat` | 245.242 ms | 249.176 ms | 20 | 164 |
+| `date` | 243.670 ms | 245.442 ms | 19 | 164 |
+| `ip` | 244.464 ms | 246.684 ms | 20 | 164 |
+| `imgconv` | 337.806 ms | 336.565 ms | 43 | 425 |
+
 ### Image-build cache (2026-07-19)
 
 The manifest-driven image builder separates four validated layers: Cargo's coherent

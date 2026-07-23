@@ -250,10 +250,11 @@ cover the runtime/inventory, storage/path, query/admin and multimedia waves.
 `docs/DYNAMIC_EXECUTABLES.tsv` is the checked inventory of all dynamic command waves on
 x86_64, AArch64 and RISC-V. Each row records the linked ELF's complete undefined import
 set, manifest-declared providers, independently parsed `DT_NEEDED` set, canonical
-transitive provider order, stripped PIE bytes, private image bytes and governed test
-command. Private image bytes are the page-rounded writable `PT_LOAD` ranges of the
-executable plus every provider in its closure, matching the loader's private-frame rule;
-immutable ranges are shared and therefore excluded. `just dynamic-report-check` rebuilds
+transitive provider order, stripped PIE bytes, provider bytes, private image bytes,
+immutable shared bytes and the governed test command. `docs/DYNAMIC_WAVES.tsv` aggregates
+the same data with providers deduplicated inside each target/wave. Private image bytes are
+the page-rounded writable `PT_LOAD` ranges of the executable plus every provider in its
+closure; immutable ranges use the loader's shared-frame rule. `just dynamic-report-check` rebuilds
 the three target graphs and requires the report to reproduce byte for byte. It also fails
 if the five wave lists do not partition the manifest's tool inventory exactly, a direct
 provider differs from `DT_NEEDED`, a sidecar omits a root, or an artifact/provider is

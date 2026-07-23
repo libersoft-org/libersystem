@@ -4,6 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 manifest="$root/user/services/manifest.txt"
 report="$root/../docs/DYNAMIC_EXECUTABLES.tsv"
+wave_report="$root/../docs/DYNAMIC_WAVES.tsv"
 mode="${1:---check}"
 
 case "$mode" in
@@ -21,6 +22,13 @@ command -v stat >/dev/null
 
 declare -A waves=()
 declare -A tests=()
+declare -A wave_tools_count=()
+declare -A wave_pie_bytes=()
+declare -A wave_private_bytes=()
+declare -A wave_shared_executable_bytes=()
+declare -A wave_provider_seen=()
+declare -A wave_provider_bytes=()
+declare -A wave_provider_shared_bytes=()
 for tool in echo uname uptime dmesg free lscpu lsmem lsirq lspci ptyecho readln script; do waves[$tool]=1; done
 for tool in cat write rm ls du mkdir rmdir snap volume lsvol lsblk; do waves[$tool]=2; done
 for tool in date log config set lsdev lsusb lssvc usage ps run perm stop beep; do waves[$tool]=3; done
@@ -106,6 +114,19 @@ writable_load_bytes() {
 	printf '%s\n' "$total"
 }
 
+immutable_load_bytes() {
+	local image="$1"
+	local total=0
+	local kind offset address physical file_size memory_size flags
+	while read -r kind offset address physical file_size memory_size flags; do
+		[[ "$kind" == LOAD && "$flags" != *W* ]] || continue
+		local start=$((address & -4096))
+		local end=$(((address + memory_size + 4095) & -4096))
+		total=$((total + end - start))
+	done < <(llvm-readelf -lW "$image")
+	printf '%s\n' "$total"
+}
+
 join_lines() {
 	local joined
 	joined="$(sed '/^$/d' | paste -sd, -)"
@@ -113,11 +134,12 @@ join_lines() {
 }
 
 generate_report() {
-	printf 'format=liber-dynamic-executable-report-v1\n'
-	printf 'wave\ttarget\ttool\tundefined_imports\tdeclared_providers\tdt_needed\ttransitive_providers\tpie_bytes\tprivate_bytes\ttest_command\n'
-	local target wave tool candidate row providers artifact order imports actual_needed declared transitive expected_transitive pie_bytes private_bytes provider provider_file
+	printf 'format=liber-dynamic-executable-report-v2\n'
+	printf 'wave\ttarget\ttool\tundefined_imports\tdeclared_providers\tdt_needed\ttransitive_providers\tpie_bytes\tprovider_bytes\tprivate_bytes\tshared_bytes\ttest_command\n'
+	local target wave key provider_key tool candidate row providers artifact order imports actual_needed declared transitive expected_transitive pie_bytes provider_bytes private_bytes shared_bytes provider provider_file provider_size provider_shared
 	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
 		for wave in 1 2 3 4 5; do
+			key="$target|$wave"
 			for tool in $(for candidate in "${!waves[@]}"; do if [[ "${waves[$candidate]}" == "$wave" ]]; then printf '%s\n' "$candidate"; fi; done | sort); do
 				row="$(awk -v tool="$tool" '$1 == "dynamic" && $2 == tool && $3 == "tools" && $4 == "volume" {print; count++} END {if (count != 1) exit 1}' "$manifest")"
 				providers="$(cut -d' ' -f5- <<<"$(tr -s ' ' <<<"$row")")"
@@ -142,7 +164,9 @@ generate_report() {
 					return 1
 				fi
 				pie_bytes="$(stat -c %s "$artifact")"
+				provider_bytes=0
 				private_bytes="$(writable_load_bytes "$artifact")"
+				shared_bytes="$(immutable_load_bytes "$artifact")"
 				while IFS= read -r provider; do
 					provider="${provider%.lslib}"
 					provider_file="$(library_file "$target" "$provider")"
@@ -150,29 +174,63 @@ generate_report() {
 						echo "dynamic-report: missing $target transitive provider $provider for $tool" >&2
 						return 1
 					}
+					provider_size="$(stat -c %s "$provider_file")"
+					provider_shared="$(immutable_load_bytes "$provider_file")"
+					provider_bytes=$((provider_bytes + provider_size))
 					private_bytes=$((private_bytes + $(writable_load_bytes "$provider_file")))
+					shared_bytes=$((shared_bytes + provider_shared))
+					provider_key="$key|$provider"
+					if [[ -z "${wave_provider_seen[$provider_key]:-}" ]]; then
+						wave_provider_seen[$provider_key]=1
+						wave_provider_bytes[$key]=$((${wave_provider_bytes[$key]:-0} + provider_size))
+						wave_provider_shared_bytes[$key]=$((${wave_provider_shared_bytes[$key]:-0} + provider_shared))
+					fi
 				done <<<"$transitive"
-				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$wave" "$target" "$tool" "$imports" "$(join_lines <<<"$declared")" "$(join_lines <<<"$actual_needed")" "$(join_lines <<<"$transitive")" "$pie_bytes" "$private_bytes" "${tests[$wave]}"
+				wave_tools_count[$key]=$((${wave_tools_count[$key]:-0} + 1))
+				wave_pie_bytes[$key]=$((${wave_pie_bytes[$key]:-0} + pie_bytes))
+				wave_private_bytes[$key]=$((${wave_private_bytes[$key]:-0} + private_bytes))
+				wave_shared_executable_bytes[$key]=$((${wave_shared_executable_bytes[$key]:-0} + $(immutable_load_bytes "$artifact")))
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$wave" "$target" "$tool" "$imports" "$(join_lines <<<"$declared")" "$(join_lines <<<"$actual_needed")" "$(join_lines <<<"$transitive")" "$pie_bytes" "$provider_bytes" "$private_bytes" "$shared_bytes" "${tests[$wave]}"
 			done
 		done
 	done
 }
 
+generate_wave_report() {
+	printf 'format=liber-dynamic-wave-report-v1\n'
+	printf 'target\twave\ttools\tpie_bytes\tunique_provider_bytes\tprivate_bytes\tshared_bytes\ttest_command\n'
+	local target wave key shared_bytes
+	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
+		for wave in 1 2 3 4 5; do
+			key="$target|$wave"
+			shared_bytes=$((${wave_shared_executable_bytes[$key]} + ${wave_provider_shared_bytes[$key]}))
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$target" "$wave" "${wave_tools_count[$key]}" "${wave_pie_bytes[$key]}" "${wave_provider_bytes[$key]}" "${wave_private_bytes[$key]}" "$shared_bytes" "${tests[$wave]}"
+		done
+	done
+}
+
 temporary="$(mktemp)"
-trap 'rm -f "$temporary"' EXIT
+wave_temporary="$(mktemp)"
+trap 'rm -f "$temporary" "$wave_temporary"' EXIT
 generate_report >"$temporary"
+generate_wave_report >"$wave_temporary"
 if [[ "$(wc -l <"$temporary")" != 146 ]]; then
 	echo "dynamic-report: expected format, header and 144 target/tool rows" >&2
+	exit 1
+fi
+if [[ "$(wc -l <"$wave_temporary")" != 17 ]]; then
+	echo "dynamic-report: expected format, header and 15 target/wave rows" >&2
 	exit 1
 fi
 
 if [[ "$mode" == --write ]]; then
 	mv "$temporary" "$report"
+	mv "$wave_temporary" "$wave_report"
 	trap - EXIT
-	echo "dynamic-report: wrote $report"
+	echo "dynamic-report: wrote $report and $wave_report"
 else
-	[[ -f "$report" ]] || {
-		echo "dynamic-report: missing $report; run $0 --write" >&2
+	[[ -f "$report" && -f "$wave_report" ]] || {
+		echo "dynamic-report: missing checked report; run $0 --write" >&2
 		exit 1
 	}
 	if ! cmp -s "$temporary" "$report"; then
@@ -180,5 +238,10 @@ else
 		diff -u "$report" "$temporary" >&2 || true
 		exit 1
 	fi
-	echo "dynamic-report: 48 tools x 3 targets match"
+	if ! cmp -s "$wave_temporary" "$wave_report"; then
+		echo "dynamic-report: $wave_report is stale" >&2
+		diff -u "$wave_report" "$wave_temporary" >&2 || true
+		exit 1
+	fi
+	echo "dynamic-report: 48 tools x 3 targets and 15 wave summaries match"
 fi
