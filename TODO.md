@@ -3481,13 +3481,13 @@ codec/container per leaf, shared pixel/frame vocabulary, and no monolithic image
 
 ## M126a - Dynamically linked system executables (no static `/bin` tools)
 
-Status: IN PROGRESS (2026-07-18); ALL `/bin` ARTIFACTS ARE DYNAMIC AND THE STATIC
-INJECTION GATE IS ACTIVE, WHILE DOMAIN-CLIENT/SIZE/PERFORMANCE HARDENING REMAINS.
-HARD PREREQUISITE FOR M127 AND EVERY NEW M130/M131
-EXECUTABLE. M123 delivered the loader, relocations, immutable-page sharing and atomized
-`.lslib` providers, but deliberately converted only `dyn_probe`: all 48 current tools
-are still static `ET_EXEC` files with no dynamic section or `DT_NEEDED`. That deferral is
-now rejected. Every native executable staged under `vol://system/bin/` must be a PIE
+Status: COMPLETED (2026-07-23). All current `/bin` artifacts are dynamic, the static
+injection gate is active, and domain-client, size, sharing, startup and hostile-input
+hardening is complete. This remains a standing prerequisite for M127 and every new
+M130/M131 executable. M123 delivered the loader, relocations, immutable-page sharing and
+atomized `.lslib` providers, but deliberately converted only `dyn_probe`; M126a converted
+all 48 current tools and made that earlier static deferral a build error. Every native
+executable staged under `vol://system/bin/` must be a PIE
 `ET_DYN` consumer of system libraries; image construction fails on a static tool. Loader
 latency is an optimization target after correctness/size, not permission to duplicate
 runtime/protocol/codec code into every executable.
@@ -3952,13 +3952,22 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   so validate with ELF symbols/`DT_NEEDED`, not manifest guesses. Add a source/import ->
   expected provider audit and fail when a tool silently starts depending on an unrelated
   subsystem.
-- [ ] Convert all future M130/M131 tools through this builder from their first runnable
-  slice; no static bootstrap exception exists for user-invoked commands. The shell,
+- [x] Establish the permanent rule and build gates that require future M130/M131 tools
+  to use this builder from their first runnable slice; no static bootstrap exception
+  exists for user-invoked commands. The shell,
   services, internal helpers and non-bootstrap drivers should migrate to the same model
   in follow-up waves during M127's path move, but `/bin` is the hard first gate. Pinned
   boot-critical executables in `init.pkg` may remain self-contained until their library
   loading source is available before StorageService; that exception never permits a
   duplicate static artifact on the mounted system volume.
+  - Result (M126a, 2026-07-23): Cargo metadata for the `tools` package must exactly match
+    its sorted `dynamic tools volume` rows, so every future M131 bin target fails image
+    construction until it enters the dynamic graph. Package staging independently rejects
+    every non-`ET_DYN` artifact under `vol://system/bin`, including loose injected files,
+    so no command package can introduce a static bootstrap path. M130's own standing
+    inventory gate remains responsible for requiring exactly `lico`, `licoedit` and
+    `licoview` because those commands will live outside the `tools` package; that is an
+    M130 registration acceptance check, not unfinished M126a implementation.
 - [x] Size, sharing and startup gates per wave: record raw object, stripped PIE, direct +
   transitive library bytes, private/RW pages, shared RX/R pages and cold/warm launch time
   in `docs/PERF.md`. Size acceptance is structural, not a regression percentage: an
@@ -4459,13 +4468,15 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     working directories, stdio, capability grants, clean exit and job control. Dynamic
     runtime coverage passes 21/21 on every architecture, and the checked reports cover
     all 48 tools across three targets, 15 target/wave rows and three whole images.
-- Done when: all 48 current `/bin` artifacts and every newly added M130/M131 command are
-  PIE `ET_DYN` files with canonical `DT_NEEDED` edges; no `/bin` artifact statically
-  contains `core`/`alloc`/`rt`/generated-protocol or codec implementations owned by a
-  system `.lslib`; all current commands retain behavior and least-privilege grants; the
-  staged `/bin` plus unique transitive providers is measured on all three architectures;
-  concurrent processes demonstrably share provider text; static `/bin` injection fails
-  the build; and launch-performance work cannot reintroduce static tools.
+- Done when: all 48 current `/bin` artifacts are PIE `ET_DYN` files with canonical
+  `DT_NEEDED` edges, and permanent image-construction gates require every future
+  M130/M131 command to satisfy the same invariant from its first staged build; no `/bin`
+  artifact statically contains `core`/`alloc`/`rt`/generated-protocol or codec
+  implementations owned by a system `.lslib`; all current commands retain behavior and
+  least-privilege grants; the staged `/bin` plus unique transitive providers is measured
+  on all three architectures; concurrent processes demonstrably share provider text;
+  static `/bin` injection fails the build; and launch-performance work cannot reintroduce
+  static tools.
 - Concept: M123's completed loader/provider pilot, M125 canonical `.lsexe` identity,
   M126's full codec graph, the system image as the Rust ABI compatibility unit, and the
   user's explicit decision that system utilities are dynamically linked regardless of
