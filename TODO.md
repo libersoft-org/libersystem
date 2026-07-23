@@ -4268,6 +4268,16 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     20/164, 19/164, 20/164 and 43/425 private/shared pages across waves 1 through 5.
     Remaining M126a work is atomization/source-ownership completion and any unresolved
     whole-image acceptance items, not per-wave size/sharing/startup measurement.
+  - Cross-consumer sharing result (M126a, 2026-07-23): the runtime gate now proves sharing
+    between different executable graphs rather than only two instances of one binary.
+    Concurrent `cat` and `write` retain the same physical `volume-client.lslib` text frame
+    at canonical provider slot 4; concurrent `imgconv` and `imgview` retain the same
+    physical `jpeg.lslib` text frame at slot 5. Both pairs are loaded through the real
+    StorageService/ProcessService path, kept alive together, cleanly terminated by closing
+    their bootstraps and compared through their retained process page tables. The sidecar
+    order is identical on x86_64, AArch64 and RISC-V, and the focused x86 dynamic gate
+    passes 21/21. Remaining work in the broader size/startup item is its raw-object and
+    whole-image acceptance detail, not proof of cross-tool provider sharing.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

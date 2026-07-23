@@ -389,6 +389,14 @@ first-versus-warm ordering flaky. One x86 KVM debug run measured:
 | `ip` | 244.464 ms | 246.684 ms | 20 | 164 |
 | `imgconv` | 337.806 ms | 336.565 ms | 43 | 425 |
 
+Sharing is also verified between different executables. Concurrent `cat` and `write`
+processes map the same physical first text page of `volume-client.lslib`; concurrent
+`imgconv` and `imgview` processes map the same physical first text page of `jpeg.lslib`.
+The checked canonical orders place those providers at slots 4 and 5 respectively on all
+three targets, so the test addresses are deterministic. The comparison happens after
+clean process exit while both Process handles retain their address spaces, avoiding any
+interference with a live instruction stream.
+
 ### Image-build cache (2026-07-19)
 
 The manifest-driven image builder separates four validated layers: Cargo's coherent

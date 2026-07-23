@@ -260,6 +260,14 @@ if the five wave lists do not partition the manifest's tool inventory exactly, a
 provider differs from `DT_NEEDED`, a sidecar omits a root, or an artifact/provider is
 missing. `just dynamic-report-update` is the explicit regeneration command.
 
+Physical sharing is pinned across different executable graphs, not only repeated launches
+of one binary. Canonical provider order places `volume-client.lslib` in slot 4 for both
+`cat` and `write`, and `jpeg.lslib` in slot 5 for both `imgconv` and `imgview` on every
+target. The dynamic gate holds each pair concurrently, closes both bootstraps, then
+requires the corresponding provider virtual address in both process page tables to name
+the same physical text frame. This proves domain-client and codec text reuse between
+unrelated consumers while their writable mappings remain private.
+
 ## Measurement and optimization
 
 Dynamic linking is the required `/bin` architecture, not an optional optimization gate.

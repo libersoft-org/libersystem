@@ -5289,32 +5289,32 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	sched::run_until_idle();
 }
 
-fn measure_dynamic_wave_launch(process_client: &alloc::sync::Arc<object::channel::Channel>, wave: u8, name: &[u8], correlation: u32, expected_private_pages: usize, expected_shared_pages: usize) {
+fn launch_dynamic_for_measurement(process_client: &alloc::sync::Arc<object::channel::Channel>, name: &[u8], correlation: u32) -> (alloc::sync::Arc<object::process::Process>, alloc::sync::Arc<object::channel::Channel>, u64) {
 	use object::channel::Channel;
 	use object::process::Process;
 	use object::rights::Rights;
 
-	let launch = |correlation: u32| -> (alloc::sync::Arc<Process>, alloc::sync::Arc<Channel>, u64) {
-		let (bootstrap_kernel, bootstrap_user) = Channel::create();
-		let mut request = alloc::vec::Vec::new();
-		request.extend_from_slice(&3u16.to_le_bytes());
-		request.extend_from_slice(&correlation.to_le_bytes());
-		request.extend_from_slice(&(name.len() as u16).to_le_bytes());
-		request.extend_from_slice(name);
-		request.extend_from_slice(&0u32.to_le_bytes());
-		let started = arch::tsc::now();
-		send_cap(process_client, &request, bootstrap_user, Rights::ALL).expect("wave launch request");
-		sched::run_until_idle();
-		let reply = process_client.recv().expect("wave launch reply");
-		assert_eq!(le_u32(&reply.bytes, 0), correlation);
-		assert_eq!(reply.bytes[4], 1, "wave representative loaded");
-		let process = reply.caps[0].object().into_any_arc().downcast::<Process>().expect("wave launch capability is a Process");
-		let elapsed = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(started));
-		(process, bootstrap_kernel, elapsed)
-	};
+	let (bootstrap_kernel, bootstrap_user) = Channel::create();
+	let mut request = alloc::vec::Vec::new();
+	request.extend_from_slice(&3u16.to_le_bytes());
+	request.extend_from_slice(&correlation.to_le_bytes());
+	request.extend_from_slice(&(name.len() as u16).to_le_bytes());
+	request.extend_from_slice(name);
+	request.extend_from_slice(&0u32.to_le_bytes());
+	let started = arch::tsc::now();
+	send_cap(process_client, &request, bootstrap_user, Rights::ALL).expect("measured launch request");
+	sched::run_until_idle();
+	let reply = process_client.recv().expect("measured launch reply");
+	assert_eq!(le_u32(&reply.bytes, 0), correlation);
+	assert_eq!(reply.bytes[4], 1, "measured dynamic executable loaded");
+	let process = reply.caps[0].object().into_any_arc().downcast::<Process>().expect("measured launch capability is a Process");
+	let elapsed = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(started));
+	(process, bootstrap_kernel, elapsed)
+}
 
-	let (first, first_bootstrap, first_ns) = launch(correlation);
-	let (second, second_bootstrap, warm_ns) = launch(correlation + 1);
+fn measure_dynamic_wave_launch(process_client: &alloc::sync::Arc<object::channel::Channel>, wave: u8, name: &[u8], correlation: u32, expected_private_pages: usize, expected_shared_pages: usize) {
+	let (first, first_bootstrap, first_ns) = launch_dynamic_for_measurement(process_client, name, correlation);
+	let (second, second_bootstrap, warm_ns) = launch_dynamic_for_measurement(process_client, name, correlation + 1);
 	let private_pages = first.private_image_pages();
 	let shared_pages = first.shared_image_pages();
 	assert!(first_ns != 0 && warm_ns != 0, "wave launch timings are nonzero");
@@ -5330,6 +5330,18 @@ fn measure_dynamic_wave_launch(process_client: &alloc::sync::Arc<object::channel
 	let second_provider_frame = second.address_space().unmap(0x2000_0000).expect("second wave representative lsrt text page");
 	assert_eq!(first_provider_frame, second_provider_frame, "repeated wave launches share one physical lsrt text page");
 	crate::serial_println!("dynamic-wave-perf: wave={} tool={} first={}ns warm={}ns private-pages={} shared-pages={}", wave, core::str::from_utf8(name).unwrap_or("invalid"), first_ns, warm_ns, private_pages, shared_pages);
+}
+
+fn assert_unrelated_dynamic_consumers_share(process_client: &alloc::sync::Arc<object::channel::Channel>, first_name: &[u8], second_name: &[u8], correlation: u32, provider_address: u64, provider: &str) {
+	let (first, first_bootstrap, _) = launch_dynamic_for_measurement(process_client, first_name, correlation);
+	let (second, second_bootstrap, _) = launch_dynamic_for_measurement(process_client, second_name, correlation + 1);
+	drop(first_bootstrap);
+	drop(second_bootstrap);
+	sched::run_until_idle();
+	assert!(first.is_terminated() && second.is_terminated(), "unrelated dynamic consumers exit after bootstrap closure");
+	let first_frame = first.address_space().unmap(provider_address).expect("first unrelated consumer provider text page");
+	let second_frame = second.address_space().unmap(provider_address).expect("second unrelated consumer provider text page");
+	assert_eq!(first_frame, second_frame, "unrelated dynamic consumers share one physical {provider} text page");
 }
 
 tagged_test!(dynamic_wave_launch_metrics_are_structurally_sound, [Dynamic, Service, Process, Storage]);
@@ -5365,6 +5377,18 @@ fn dynamic_wave_launch_metrics_are_structurally_sound() {
 	for (wave, name, correlation, private_pages, shared_pages) in representatives {
 		measure_dynamic_wave_launch(&process_client, wave, name, correlation, private_pages, shared_pages);
 	}
+	process_client.send(object::channel::Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	sched::run_until_idle();
+}
+
+tagged_test!(unrelated_dynamic_consumers_share_domain_and_codec_text, [Dynamic, Service, Process, Storage]);
+fn unrelated_dynamic_consumers_share_domain_and_codec_text() {
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	let (process_boot_kernel, _storage_boot_kernel, process_client) = start_process_service_from_volume(volume);
+	sched::run_until_idle();
+	assert_eq!(&process_boot_kernel.recv().expect("ProcessService online report").bytes, b"ProcessService: online");
+	assert_unrelated_dynamic_consumers_share(&process_client, b"cat", b"write", 120, 0x2400_0000, "volume-client");
+	assert_unrelated_dynamic_consumers_share(&process_client, b"imgconv", b"imgview", 122, 0x2500_0000, "jpeg");
 	process_client.send(object::channel::Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
 	sched::run_until_idle();
 }
