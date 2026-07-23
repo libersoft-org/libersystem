@@ -45,13 +45,11 @@ declare -A provider_size_cache=()
 declare -A provider_private_cache=()
 declare -A provider_shared_cache=()
 declare -A provider_exports=()
-declare -A generic_residual_tools=()
 for tool in echo uname uptime dmesg free lscpu lsmem lsirq lspci ptyecho readln script; do waves[$tool]=1; done
 for tool in cat write rm ls du mkdir rmdir snap volume lsvol lsblk; do waves[$tool]=2; done
 for tool in date log config set lsdev lsusb lssvc usage ps run perm stop beep; do waves[$tool]=3; done
 for tool in ping ip nslookup tcp nc arp httpd ss; do waves[$tool]=4; done
 for tool in imgview imgconv play graphics_probe; do waves[$tool]=5; done
-for tool in du imgconv imgview ls lsblk lsvol snap volume; do generic_residual_tools[$tool]=1; done
 tests[1]='just test-tags service,process,storage'
 tests[2]='just test-tags service,process,storage'
 tests[3]='just test-tags service,process,storage'
@@ -224,7 +222,7 @@ resolve_import_owners() {
 	local tool="$2"
 	local imports="$3"
 	local transitive="$4"
-	local import provider owners count owner residuals="" residual_count=0 transport_residual=0 writer_residual=0
+	local import provider owners count owner
 	local -A closure=()
 	local -a import_list=()
 	while IFS= read -r provider; do closure["${provider%.lslib}"]=1; done <<<"$transitive"
@@ -252,27 +250,11 @@ resolve_import_owners() {
 			return 1
 		fi
 		if [[ "$import" =~ ChannelTransport|VecWriter ]]; then
-			[[ -n "${generic_residual_tools[$tool]:-}" && ("$owner" == ipc-client || "$owner" == wire) ]] || {
-				echo "dynamic-report: $target $tool has an unapproved generic transport residual $import=$owner" >&2
-				return 1
-			}
-			if [[ -n "$residuals" ]]; then residuals+=","; fi
-			residuals+="$import=$owner"
-			residual_count=$((residual_count + 1))
-			if [[ "$import" =~ ChannelTransport.*Transport4call && "$owner" == ipc-client ]]; then transport_residual=1; fi
-			if [[ "$import" =~ VecWriter.*Sink3put && "$owner" == wire ]]; then writer_residual=1; fi
+			echo "dynamic-report: $target $tool has a generic transport residual $import=$owner" >&2
+			return 1
 		fi
 	done
-	if [[ -n "${generic_residual_tools[$tool]:-}" ]]; then
-		[[ "$residual_count" == 2 && "$transport_residual" == 1 && "$writer_residual" == 1 ]] || {
-			echo "dynamic-report: $target $tool generic residual baseline differs" >&2
-			return 1
-		}
-	elif [[ "$residual_count" != 0 ]]; then
-		echo "dynamic-report: $target $tool unexpectedly carries generic residuals" >&2
-		return 1
-	fi
-	printf '%s\t%s\n' "${result:--}" "${residuals:--}"
+	printf '%s\t-\n' "${result:--}"
 }
 
 preload_metrics() {

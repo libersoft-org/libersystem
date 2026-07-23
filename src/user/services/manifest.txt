@@ -135,27 +135,27 @@ dynamic   date       tools  volume time-client proto lsrt
 dynamic   cat        tools  volume volume-client proto lsrt
 dynamic   write      tools  volume volume-client proto lsrt
 dynamic   rm         tools  volume volume-client proto lsrt
-dynamic   ls         tools  volume proto ipc-client wire lsrt
-dynamic   du         tools  volume proto ipc-client wire lsrt
+dynamic   ls         tools  volume volume-client proto wire lsrt
+dynamic   du         tools  volume volume-client proto wire lsrt
 dynamic   mkdir      tools  volume volume-client proto lsrt
 dynamic   rmdir      tools  volume volume-client proto lsrt
 dynamic   log        tools  volume log-client time-client proto wire lsrt
-dynamic   snap       tools  volume proto ipc-client wire lsrt
-dynamic   volume     tools  volume proto ipc-client wire lsrt
+dynamic   snap       tools  volume volume-client lsrt
+dynamic   volume     tools  volume volume-client lsrt
 dynamic   lsdev      tools  volume device-client proto wire lsrt
 dynamic   config     tools  volume config-client proto lsrt
 dynamic   set        tools  volume config-client lsrt
 dynamic   beep       tools  volume audio-client lsrt
 dynamic   play       tools  volume aiff flac mp3 vorbis wav wavpack audio-client volume-client proto lsrt
 dynamic   graphics_probe tools volume lsrt
-dynamic   imgview    tools  volume imgconv pix surface proto ipc-client wire lsrt
-dynamic   imgconv    tools  volume imgconv proto ipc-client wire lsrt
+dynamic   imgview    tools  volume imgconv pix surface volume-client proto lsrt
+dynamic   imgconv    tools  volume imgconv volume-client proto lsrt
 dynamic   usage      tools  volume resources-client proto wire lsrt
 dynamic   ps         tools  volume process-client resources-client proto wire lsrt
 dynamic   run        tools  volume process-client proto lsrt
 dynamic   perm       tools  volume security-client proto wire lsrt
 dynamic   stop       tools  volume lsrt
-dynamic   lsvol      tools  volume proto ipc-client wire lsrt
+dynamic   lsvol      tools  volume volume-client proto wire lsrt
 dynamic   uname      tools  volume lsrt
 dynamic   uptime     tools  volume lsrt
 dynamic   dmesg      tools  volume lsrt
@@ -165,7 +165,7 @@ dynamic   lsmem      tools  volume wire lsrt
 dynamic   lsirq      tools  volume wire lsrt
 dynamic   lspci      tools  volume wire lsrt
 dynamic   lssvc      tools  volume observability-client proto wire lsrt
-dynamic   lsblk      tools  volume proto ipc-client wire lsrt
+dynamic   lsblk      tools  volume volume-client wire lsrt
 dynamic   lsusb      tools  volume device-client proto wire lsrt
 dynamic   echo       tools  volume lsrt
 dynamic   ping       tools  volume network-client proto wire lsrt

@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::rc::Rc;
 use core::cell::RefCell;
 use ipc_client::ChannelTransport;
-use proto::system::{DisplayEvent, Error, PixelFormat, SurfaceInfo, display};
+use proto::system::{DisplayEvent, Error, PixelFormat, SurfaceInfo, display, input};
 use rt::{Framebuffer, close, map_object, unmap_object};
 
 pub use pix::{BlitResult, Image, Rect, Target};
@@ -86,4 +86,8 @@ pub fn read_event(message: &[u8], handle: &mut u64) -> Option<DisplayEvent> {
 
 pub fn input_focus(client: &Client) -> Option<Result<u64, Error>> {
 	client.borrow_mut().input_focus()
+}
+
+pub fn subscribe_keys(channel: u64, focus: u64) -> Option<u64> {
+	input::Client::new(ChannelTransport { chan: channel }).subscribe_keys(&focus)
 }

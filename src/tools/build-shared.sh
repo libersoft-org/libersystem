@@ -1439,6 +1439,66 @@ if [[ -n "$image_graph" ]]; then
 				exit 1
 			fi
 			;;
+		du | ls | lsvol)
+			if ! grep -q '^liber_channel_liber_storage_volume_list$' <<<"$consumer_imports" || grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_storage_' <<<"$consumer_imports"; then
+				echo "build-shared: $consumer bypasses the concrete volume list client" >&2
+				exit 1
+			fi
+			;;
+		lsblk)
+			for method in status capacity; do
+				if ! grep -q "^liber_channel_liber_storage_volume_${method}$" <<<"$consumer_imports"; then
+					echo "build-shared: lsblk does not import concrete volume symbol $method" >&2
+					exit 1
+				fi
+			done
+			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_storage_' <<<"$consumer_imports"; then
+				echo "build-shared: lsblk bypasses the concrete volume client provider" >&2
+				exit 1
+			fi
+			;;
+		snap)
+			for method in snap_create snap_list snap_delete snap_open; do
+				if ! grep -q "^liber_channel_liber_storage_volume_${method}$" <<<"$consumer_imports"; then
+					echo "build-shared: snap does not import concrete volume symbol $method" >&2
+					exit 1
+				fi
+			done
+			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_storage_' <<<"$consumer_imports"; then
+				echo "build-shared: snap bypasses the concrete volume client provider" >&2
+				exit 1
+			fi
+			;;
+		volume)
+			for method in status set_compression fsck restore; do
+				if ! grep -q "^liber_channel_liber_storage_volume_${method}$" <<<"$consumer_imports"; then
+					echo "build-shared: volume does not import concrete volume symbol $method" >&2
+					exit 1
+				fi
+				done
+			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_storage_' <<<"$consumer_imports"; then
+				echo "build-shared: volume bypasses the concrete volume client provider" >&2
+				exit 1
+			fi
+			;;
+		imgconv)
+			for method in open write; do
+				if ! grep -q "^liber_channel_liber_storage_volume_${method}$" <<<"$consumer_imports"; then
+					echo "build-shared: imgconv does not import concrete volume symbol $method" >&2
+					exit 1
+				fi
+			done
+			if grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_storage_' <<<"$consumer_imports"; then
+				echo "build-shared: imgconv bypasses the concrete volume client provider" >&2
+				exit 1
+			fi
+			;;
+		imgview)
+			if ! grep -q '^liber_channel_liber_storage_volume_open$' <<<"$consumer_imports" || grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_storage_' <<<"$consumer_imports"; then
+				echo "build-shared: imgview bypasses the concrete volume client provider" >&2
+				exit 1
+			fi
+			;;
 		perm)
 			if ! grep -q '^liber_channel_liber_security_' <<<"$consumer_imports" || grep -Eq 'ChannelClient|ChannelTransport|VecWriter|^liber_channel_impl_liber_security_' <<<"$consumer_imports"; then
 				echo "build-shared: perm bypasses the concrete security client provider" >&2

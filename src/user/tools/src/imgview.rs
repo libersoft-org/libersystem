@@ -12,12 +12,12 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
 use keys::usage;
 use pix::{Image, Rect, Target};
 use proto::path;
-use proto::system::{OpenOpts, input, volume};
+use proto::system::{OpenOpts, input};
 use rt::*;
+use volume_client::VolumeClient;
 
 const USAGE: &[u8] = b"Usage: imgview <image>\nDisplays a still image or composited animation frame 0; animation playback is not supported.\n";
 
@@ -108,7 +108,7 @@ unsafe fn load_image(storage: u64, uri: &str) -> Option<DecodedImage> {
 			return None;
 		}
 		let opts = OpenOpts { path: String::from(uri), write: false, create: false };
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		let opened = match client.open(&opts) {
 			Some(Ok(opened)) if opened.file != 0 => opened,
 			_ => {
@@ -175,8 +175,7 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 			let _ = surface::release(&display);
 			return;
 		};
-		let mut input_client = input::Client::new(ChannelTransport { chan: input_channel });
-		let Some(key_stream) = input_client.subscribe_keys(&focus) else {
+		let Some(key_stream) = surface::subscribe_keys(input_channel, focus) else {
 			let _ = surface::release(&display);
 			return;
 		};

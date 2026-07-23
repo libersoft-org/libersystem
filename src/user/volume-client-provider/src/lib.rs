@@ -1,8 +1,8 @@
 #![no_std]
 
 use core::arch::global_asm;
-use proto::system::{volume, Error};
-use rt::{close, recv_vec_blocking, send_blocking, ReceivedVec};
+use proto::system::{Error, volume};
+use rt::{ReceivedVec, close, recv_vec_blocking, send_blocking};
 use wire::{Sink, VecWriter};
 
 #[unsafe(export_name = "liber_channel_liber_storage_volume_write_stream_begin")]
@@ -78,3 +78,14 @@ forward!("liber_channel_liber_storage_volume_open", "liber_channel_impl_liber_st
 forward!("liber_channel_liber_storage_volume_remove", "liber_channel_impl_liber_storage_volume_remove");
 forward!("liber_channel_liber_storage_volume_mkdir", "liber_channel_impl_liber_storage_volume_mkdir");
 forward!("liber_channel_liber_storage_volume_rmdir", "liber_channel_impl_liber_storage_volume_rmdir");
+forward!("liber_channel_liber_storage_volume_list", "liber_channel_impl_liber_storage_volume_list");
+forward!("liber_channel_liber_storage_volume_write", "liber_channel_impl_liber_storage_volume_write");
+forward!("liber_channel_liber_storage_volume_snap_create", "liber_channel_impl_liber_storage_volume_snap_create");
+forward!("liber_channel_liber_storage_volume_snap_list", "liber_channel_impl_liber_storage_volume_snap_list");
+forward!("liber_channel_liber_storage_volume_snap_delete", "liber_channel_impl_liber_storage_volume_snap_delete");
+forward!("liber_channel_liber_storage_volume_snap_open", "liber_channel_impl_liber_storage_volume_snap_open");
+forward!("liber_channel_liber_storage_volume_capacity", "liber_channel_impl_liber_storage_volume_capacity");
+forward!("liber_channel_liber_storage_volume_status", "liber_channel_impl_liber_storage_volume_status");
+forward!("liber_channel_liber_storage_volume_set_compression", "liber_channel_impl_liber_storage_volume_set_compression");
+forward!("liber_channel_liber_storage_volume_fsck", "liber_channel_impl_liber_storage_volume_fsck");
+forward!("liber_channel_liber_storage_volume_restore", "liber_channel_impl_liber_storage_volume_restore");

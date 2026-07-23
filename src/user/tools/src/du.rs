@@ -26,11 +26,11 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
 use proto::path;
 use proto::system::{FileInfo, FileType, volume};
 use rt::*;
+use volume_client::VolumeClient;
 
 const USAGE: &[u8] = b"usage: du [-s] [-h] [json | json-min] [path]
   -s  summary only: just the total for the path
@@ -109,7 +109,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // cumulative size (children before their parent), the whole tree's total last.
 unsafe fn du(storage: u64, uri: String, summary_only: bool, human: bool, mode: Option<JsonMode>) {
 	unsafe {
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		let mut usage: Vec<DirUsage> = Vec::new();
 		let total: Option<u64> = walk(&mut client, &uri, 0, &mut usage);
 		let total: u64 = match total {
@@ -151,7 +151,7 @@ unsafe fn du(storage: u64, uri: String, summary_only: bool, human: bool, mode: O
 // child is recorded before its parent). Returns the subtree's total bytes, or None if
 // this directory itself cannot be listed (the caller reports it for the root; a deeper
 // unreadable directory contributes 0 rather than aborting the whole walk).
-unsafe fn walk(client: &mut volume::Client<ChannelTransport>, uri: &str, depth: u32, usage: &mut Vec<DirUsage>) -> Option<u64> {
+unsafe fn walk(client: &mut VolumeClient, uri: &str, depth: u32, usage: &mut Vec<DirUsage>) -> Option<u64> {
 	unsafe {
 		let consumer: u64 = client.list(uri)?;
 		let entries: Vec<FileInfo> = drain_stream(consumer, volume::list_read);

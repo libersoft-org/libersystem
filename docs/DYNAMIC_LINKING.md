@@ -277,12 +277,13 @@ visibility, matching the loader and linker ownership rules. Zero or multiple clo
 owners fail the report even on a warm artifact hit. Private generated implementation
 symbols and `ChannelClient` are forbidden in every `/bin` object.
 
-The remaining generic transport debt is explicit and bounded: `du`, `ls`, `lsblk`,
-`lsvol`, `snap`, `volume`, `imgconv` and `imgview` each retain exactly one
-`ChannelTransport::call` owned by `ipc-client.lslib` and one `VecWriter::put` owned by
-`wire.lslib`. No other tool may carry either family, and the approved tools may not add a
-third residual. This checked baseline prevents spread while their remaining storage
-methods move behind concrete provider APIs; it is not treated as completed atomization.
+Every `/bin` import now crosses a concrete provider or single-concern leaf boundary.
+`du`, `ls`, `lsblk`, `lsvol`, `snap`, `volume`, `imgconv` and `imgview` route their
+storage operations through `volume-client.lslib`; `imgview` also routes key subscription
+through `surface.lslib`. The image builder pins each tool's required concrete entry points
+and rejects private generated storage implementations, `ChannelClient`,
+`ChannelTransport` and `VecWriter`. The checked report permits no generic transport
+residual in any target/tool row.
 
 Physical sharing is pinned across different executable graphs, not only repeated launches
 of one binary. Canonical provider order places `volume-client.lslib` in slot 4 for both

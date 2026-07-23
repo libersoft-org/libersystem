@@ -5353,26 +5353,26 @@ fn dynamic_wave_launch_metrics_are_structurally_sound() {
 	#[cfg(target_arch = "x86_64")]
 	let representatives = [
 		(1u8, b"echo" as &[u8], 100u32, 14usize, 80usize),
-		(2, b"cat" as &[u8], 102, 20, 164),
+		(2, b"cat" as &[u8], 102, 20, 165),
 		(3, b"date" as &[u8], 104, 19, 164),
 		(4, b"ip" as &[u8], 106, 20, 164),
-		(5, b"imgconv" as &[u8], 108, 43, 425),
+		(5, b"imgconv" as &[u8], 108, 44, 428),
 	];
 	#[cfg(target_arch = "aarch64")]
 	let representatives = [
 		(1u8, b"echo" as &[u8], 100u32, 14usize, 88usize),
-		(2, b"cat" as &[u8], 102, 23, 181),
+		(2, b"cat" as &[u8], 102, 23, 182),
 		(3, b"date" as &[u8], 104, 22, 181),
 		(4, b"ip" as &[u8], 106, 23, 181),
-		(5, b"imgconv" as &[u8], 108, 64, 449),
+		(5, b"imgconv" as &[u8], 108, 65, 452),
 	];
 	#[cfg(target_arch = "riscv64")]
 	let representatives = [
 		(1u8, b"echo" as &[u8], 100u32, 14usize, 72usize),
-		(2, b"cat" as &[u8], 102, 23, 141),
+		(2, b"cat" as &[u8], 102, 23, 142),
 		(3, b"date" as &[u8], 104, 22, 141),
 		(4, b"ip" as &[u8], 106, 22, 141),
-		(5, b"imgconv" as &[u8], 108, 61, 332),
+		(5, b"imgconv" as &[u8], 108, 63, 335),
 	];
 	for (wave, name, correlation, private_pages, shared_pages) in representatives {
 		measure_dynamic_wave_launch(&process_client, wave, name, correlation, private_pages, shared_pages);
@@ -6269,7 +6269,7 @@ fn du_reports_a_directory_tree_size() {
 	let dynamic = elf.dynamic_info().expect("du dynamic metadata parses").expect("du has PT_DYNAMIC");
 	let mut needed = elf.needed_names(&dynamic).expect("du dependencies parse").collect::<alloc::vec::Vec<_>>();
 	needed.sort_unstable();
-	assert_eq!(needed, alloc::vec!["ipc-client.lslib", "lsrt.lslib", "proto.lslib", "wire.lslib"]);
+	assert_eq!(needed, alloc::vec!["lsrt.lslib", "proto.lslib", "volume-client.lslib", "wire.lslib"]);
 }
 
 fn assert_dynamic_inventory_providers(name: &[u8], expected: &[&str]) {

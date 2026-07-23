@@ -15,9 +15,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
-use proto::system::volume;
 use rt::*;
+use volume_client::VolumeClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -69,7 +68,7 @@ unsafe fn snap(storage: u64, args: &[u8]) {
 // List the volume's named snapshots (each as name + pinned generation), oldest first.
 unsafe fn snap_list(storage: u64) {
 	unsafe {
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		let snaps = match client.snap_list() {
 			Some(Ok(s)) => s,
 			_ => {
@@ -94,7 +93,7 @@ unsafe fn snap_list(storage: u64) {
 unsafe fn snap_create(storage: u64, name: &[u8]) {
 	unsafe {
 		let snapshot: String = String::from_utf8_lossy(name).into_owned();
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		match client.snap_create(&snapshot) {
 			Some(Ok(())) => {
 				print(b"created snapshot ");
@@ -114,7 +113,7 @@ unsafe fn snap_create(storage: u64, name: &[u8]) {
 unsafe fn snap_delete(storage: u64, name: &[u8]) {
 	unsafe {
 		let snapshot: String = String::from_utf8_lossy(name).into_owned();
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		match client.snap_delete(&snapshot) {
 			Some(Ok(())) => {
 				print(b"deleted snapshot ");
@@ -136,7 +135,7 @@ unsafe fn snap_cat(storage: u64, name: &[u8], uri: &[u8]) -> bool {
 	unsafe {
 		let snapshot: String = String::from_utf8_lossy(name).into_owned();
 		let path: String = String::from_utf8_lossy(uri).into_owned();
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		let result = match client.snap_open(&snapshot, &path) {
 			Some(Ok(r)) => r,
 			_ => return false,

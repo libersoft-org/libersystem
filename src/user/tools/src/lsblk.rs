@@ -15,10 +15,9 @@
 extern crate alloc;
 
 use alloc::string::String;
-use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
-use proto::system::volume;
 use rt::*;
+use volume_client::VolumeClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -89,7 +88,7 @@ fn volume_filesystem(chan: u64) -> Option<String> {
 	if chan == 0 {
 		return None;
 	}
-	let mut client = volume::Client::new(ChannelTransport { chan });
+	let mut client = VolumeClient::new(chan);
 	match client.status() {
 		Some(Ok(st)) => Some(st.filesystem),
 		_ => None,
@@ -102,7 +101,7 @@ fn volume_capacity(chan: u64) -> Option<u64> {
 	if chan == 0 {
 		return None;
 	}
-	let mut client = volume::Client::new(ChannelTransport { chan });
+	let mut client = VolumeClient::new(chan);
 	match client.capacity() {
 		Some(Ok(bytes)) => Some(bytes),
 		_ => None,

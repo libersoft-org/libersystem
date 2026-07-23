@@ -8,10 +8,11 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use imgconv::Error;
-use ipc_client::{ChannelTransport, make_buffer};
+use ipc_client::make_buffer;
 use proto::path;
-use proto::system::{OpenOpts, volume};
+use proto::system::OpenOpts;
 use rt::*;
+use volume_client::VolumeClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -77,7 +78,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				exit();
 			}
 		};
-		let mut client = volume::Client::new(ChannelTransport { chan: output_storage });
+		let mut client = VolumeClient::new(output_storage);
 		if !matches!(client.write(&output_uri, &staged), Some(Ok(()))) {
 			print(b"imgconv: cannot write output\n");
 			exit();
@@ -145,7 +146,7 @@ fn push_decimal(out: &mut String, value: u64) {
 
 unsafe fn read_file(storage: u64, uri: &str) -> Option<Vec<u8>> {
 	unsafe {
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		let opened = client.open(&OpenOpts { path: String::from(uri), write: false, create: false })?.ok()?;
 		let len = usize::try_from(opened.size).ok()?;
 		if opened.file == 0 || len == 0 {
@@ -164,7 +165,7 @@ unsafe fn read_file(storage: u64, uri: &str) -> Option<Vec<u8>> {
 
 unsafe fn exists(storage: u64, uri: &str) -> bool {
 	unsafe {
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		match client.open(&OpenOpts { path: String::from(uri), write: false, create: false }) {
 			Some(Ok(opened)) => {
 				if opened.file != 0 {

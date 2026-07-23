@@ -18,9 +18,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
-use proto::system::volume;
 use rt::*;
+use volume_client::VolumeClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -71,7 +70,7 @@ unsafe fn run(storage: u64, args: &[u8]) {
 // switch, and whether the mount is read-only.
 unsafe fn status(storage: u64) {
 	unsafe {
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		let st = match client.status() {
 			Some(Ok(st)) => st,
 			_ => {
@@ -98,7 +97,7 @@ unsafe fn status(storage: u64) {
 // Flip transparent compression for new whole-file writes.
 unsafe fn set_compression(storage: u64, enabled: bool) {
 	unsafe {
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		match client.set_compression(&enabled) {
 			Some(Ok(())) => print(if enabled { b"compression on (new writes compress)\n" as &[u8] } else { b"compression off (new writes stay raw)\n" }),
 			Some(Err(_)) => print(b"volume compress: refused (read-only volume?)\n"),
@@ -110,7 +109,7 @@ unsafe fn set_compression(storage: u64, enabled: bool) {
 // Verify every live block against its checksum and name the damaged files.
 unsafe fn fsck(storage: u64) {
 	unsafe {
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		let report = match client.fsck() {
 			Some(Ok(r)) => r,
 			_ => {
@@ -141,7 +140,7 @@ unsafe fn restore(storage: u64, uri: &[u8], snapshot: &[u8]) {
 	unsafe {
 		let path: String = String::from_utf8_lossy(uri).into_owned();
 		let snap: String = String::from_utf8_lossy(snapshot).into_owned();
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		match client.restore(&path, &snap) {
 			Some(Ok(())) => {
 				print(b"restored ");

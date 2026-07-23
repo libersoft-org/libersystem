@@ -18,10 +18,10 @@
 extern crate alloc;
 
 use alloc::string::String;
-use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
 use proto::system::{VolumeStatus, volume};
 use rt::*;
+use volume_client::VolumeClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -172,7 +172,7 @@ fn volume_status(chan: u64) -> Option<VolumeStatus> {
 	if chan == 0 {
 		return None;
 	}
-	let mut client = volume::Client::new(ChannelTransport { chan });
+	let mut client = VolumeClient::new(chan);
 	match client.status() {
 		Some(Ok(st)) => Some(st),
 		_ => None,
@@ -185,7 +185,7 @@ unsafe fn volume_count(storage: u64, uri: &str) -> usize {
 	if storage == 0 {
 		return 0;
 	}
-	let mut client = volume::Client::new(ChannelTransport { chan: storage });
+	let mut client = VolumeClient::new(storage);
 	match client.list(uri) {
 		Some(consumer) => unsafe { drain_stream(consumer, volume::list_read) }.len(),
 		None => 0,

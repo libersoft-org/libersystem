@@ -3813,7 +3813,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
   Add another library only when at least two consumers share meaningful implementation,
   or when it is an owning protocol/format boundary; do not turn five lines of glue into a
   permanent ABI surface merely to reduce an ELF by a few bytes.
-- [ ] Prevent generic generated clients from defeating the library split. Today's
+- [x] Prevent generic generated clients from defeating the library split. Today's
   generated `Client<T: Transport>` methods are monomorphized for
   `Client<ChannelTransport>` in every tool, so merely putting their source types in a
   domain `.lslib` still duplicates request encoding/reply decoding in `/bin`. Extend
@@ -4305,6 +4305,20 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     owned by `wire` on every target; no other tool or third residual is accepted. The
     source/import ownership audit is complete, while the generic-client checklist remains
     open until those storage methods cross concrete provider APIs.
+  - Final concrete storage-client result (M126a, 2026-07-23): `volume-client.lslib`
+    now owns list, one-shot write, snapshot create/list/delete/open, capacity/status,
+    compression, fsck and restore entry points in addition to open, mutation and split
+    streamed write. `du`, `ls`, `lsblk`, `lsvol`, `snap`, `volume`, `imgconv` and
+    `imgview` import the exact concrete symbols required by their behavior; `imgview`
+    also routes key subscription through `surface.lslib`. The image build rejects a
+    missing concrete entry point and every generic/private storage import in these tools.
+    All 144 detailed target/tool rows have an exact provider owner for every import and
+    zero `ChannelTransport`, `VecWriter`, `ChannelClient` or private generated residuals.
+    The checked tri-architecture graph and reports pass; the dynamic runtime suite passes
+    21/21 on x86_64, AArch64 and RISC-V, and focused x86 service/process/storage/image/audio
+    behavior passes 71/71. The generic-client checklist is complete; the remaining
+    atomization work is the broader protocol-codec split and any shared CLI boundary
+    justified by measured recurring implementation.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

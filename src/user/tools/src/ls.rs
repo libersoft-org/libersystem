@@ -30,11 +30,11 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
 use proto::path;
 use proto::system::{FileInfo, FileType, Timestamp, volume};
 use rt::*;
+use volume_client::VolumeClient;
 
 // What the listing is ordered by; directories group first under every key but None.
 #[derive(Clone, Copy, PartialEq)]
@@ -224,7 +224,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 				return;
 			}
 		};
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let mut client = VolumeClient::new(storage);
 		// the listing arrives as a stream of entries (one frame each), so a big
 		// directory never has to fit one reply.
 		let consumer: u64 = match client.list(path) {
