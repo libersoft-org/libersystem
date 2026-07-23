@@ -4,7 +4,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use proto::system::{ConfigEntry, Error, Picked};
+use base_proto::generated::liber::base::v1::Error;
+use config_proto::generated::liber::config::v1::{ConfigEntry, Picked};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_config_config_get"]

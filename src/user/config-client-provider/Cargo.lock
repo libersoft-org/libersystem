@@ -3,5 +3,56 @@
 version = 4
 
 [[package]]
+name = "abi"
+version = "0.0.0"
+
+[[package]]
+name = "base-proto"
+version = "0.0.0"
+dependencies = [
+ "wire",
+]
+
+[[package]]
 name = "config-client-provider"
+version = "0.0.0"
+dependencies = [
+ "config-proto",
+]
+
+[[package]]
+name = "config-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "storage-proto",
+ "wire",
+]
+
+[[package]]
+name = "ipc-client"
+version = "0.0.0"
+dependencies = [
+ "rt",
+ "wire",
+]
+
+[[package]]
+name = "rt"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
+name = "storage-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "wire"
 version = "0.0.0"

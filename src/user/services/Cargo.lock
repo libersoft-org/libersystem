@@ -18,6 +18,16 @@ name = "bootproto"
 version = "0.0.0"
 
 [[package]]
+name = "config-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "storage-proto",
+ "wire",
+]
+
+[[package]]
 name = "display-proto"
 version = "0.0.0"
 dependencies = [
@@ -73,6 +83,7 @@ name = "proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "config-proto",
  "display-proto",
  "input-proto",
  "ipc-client",

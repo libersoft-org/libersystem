@@ -1,9 +1,6 @@
 generated/liber/audio/mod.rs
 generated/liber/audio/v1/compat.rs
 generated/liber/audio/v1.rs
-generated/liber/config/mod.rs
-generated/liber/config/v1/compat.rs
-generated/liber/config/v1.rs
 generated/liber/device/mod.rs
 generated/liber/device/v1/compat.rs
 generated/liber/device/v1.rs

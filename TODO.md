@@ -4389,6 +4389,19 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     x86_64, AArch64 and RISC-V; focused x86 shell, process and storage/package slices
     pass 14/14, 46/46 and 31/31. Other generated domains remain in the compatibility
     provider.
+  - Generated config-package split result (M126a, 2026-07-23):
+    `config-proto.lslib` (20,944/25,312/21,024 bytes) now exclusively owns
+    `liber:config@1` configuration/picker types, codecs and concrete channel thunks. Its
+    imported storage file resource remains a Cargo type dependency but creates no false
+    runtime edge. `config-client.lslib` routes config and picker calls to the leaf;
+    `config_service` removes its monolithic edge, `set` needs only the concrete client,
+    and `wasi_host` names `config-proto` for the out-of-line `Picked` decoder while
+    removing `proto`. The compatibility provider shrinks to
+    200,528/235,248/216,744 bytes. Exact-edge graphs and the checked 144-row report pass
+    on all targets with zero generic residuals. Dynamic runtime coverage passes 21/21 on
+    x86_64, AArch64 and RISC-V; focused x86 shell, process/config-service and
+    storage/package slices pass 14/14, 46/46 and 31/31. Other generated domains remain in
+    the compatibility provider.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

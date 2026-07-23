@@ -8,10 +8,11 @@ description = "Generated LSIDL bindings (wire codec, clients, servers) for Liber
 [features]
 default = []
 channel-client-impl = ["dep:ipc-client"]
-shared-image = ["channel-client-impl", "display-proto/shared-image", "input-proto/shared-image", "ipc-client/shared-image", "process-proto/shared-image", "security-proto/shared-image", "session-proto/shared-image", "storage-proto/shared-image"]
+shared-image = ["channel-client-impl", "config-proto/shared-image", "display-proto/shared-image", "input-proto/shared-image", "ipc-client/shared-image", "process-proto/shared-image", "security-proto/shared-image", "session-proto/shared-image", "storage-proto/shared-image"]
 
 [dependencies]
 base-proto = { path = "../user/base-proto" }
+config-proto = { path = "../user/config-proto" }
 display-proto = { path = "../user/display-proto" }
 input-proto = { path = "../user/input-proto" }
 process-proto = { path = "../user/process-proto" }

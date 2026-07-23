@@ -100,12 +100,26 @@ checksum = "d6aedf8ae72766347502cf3cb4f41cf5e9cc37d28bee90f1fdaaae15f9cf9424"
 name = "config-client"
 version = "0.0.0"
 dependencies = [
- "proto",
+ "base-proto",
+ "config-proto",
 ]
 
 [[package]]
 name = "config-client-provider"
 version = "0.0.0"
+dependencies = [
+ "config-proto",
+]
+
+[[package]]
+name = "config-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "storage-proto",
+ "wire",
+]
 
 [[package]]
 name = "deflate"
@@ -396,6 +410,7 @@ name = "proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "config-proto",
  "display-proto",
  "input-proto",
  "ipc-client",

@@ -53,8 +53,9 @@ provider's dynamic exports. `rt` depends only on `abi`. The transport-independen
 codec and representation foundation is `wire.lslib`, which depends on `lsrt.lslib`;
 `ipc-client.lslib` owns channel and resolver transports over `wire + lsrt`.
 Generated protocol ownership is package-scoped. `base-proto.lslib` owns
-`liber:base@1`; `process-proto.lslib` owns `liber:process@1`; `display-proto.lslib`
-owns `liber:display@1`; `input-proto.lslib` owns `liber:input@1`;
+`liber:base@1`; `config-proto.lslib` owns `liber:config@1`;
+`process-proto.lslib` owns `liber:process@1`; `display-proto.lslib` owns
+`liber:display@1`; `input-proto.lslib` owns `liber:input@1`;
 `security-proto.lslib` owns `liber:security@1`; `session-proto.lslib` owns
 `liber:session@1`; and `storage-proto.lslib` owns `liber:storage@1`. Domain leaves own
 their generated types, codecs, stream helpers and concrete channel implementation
@@ -67,9 +68,9 @@ rlibs are archive linked against their explicit provider set.
 emit selected Rust packages into separate crate roots. An external-package map replaces
 the corresponding compatibility module with a reexport, so one package has exactly one
 Rust type identity. Generated value codec primitives are public across these internal
-crate boundaries. Generation and check recipes cover the base, process, display, input,
-security, session, storage and compatibility roots together, including stale-output
-manifests.
+crate boundaries. Generation and check recipes cover the base, config, process, display,
+input, security, session, storage and compatibility roots together, including
+stale-output manifests.
 
 The shared-image builder checks every provider's exact runtime edges after each link.
 Cargo type dependencies that inline completely do not create a false `DT_NEEDED` edge;
