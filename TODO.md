@@ -4484,9 +4484,10 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
 
 ## M127 - Userspace source and system-volume layout cleanup
 
-Status: PLANNED AFTER M126a. Do not start this migration until the image-conversion
-milestone and the dynamically linked `/bin` conversion are complete, so codec/linker
-work and path churn never share one change set.
+Status: IN PROGRESS (2026-07-23). The image-conversion and dynamically linked `/bin`
+prerequisites are complete. The source/artifact path inventory is frozen before build
+schema changes or physical moves, so codec/linker work and path churn do not share one
+change set.
 
 The userspace grew from a few peer crates into runtimes, services, drivers, applications
 and atomized libraries, but `src/user/` still exposes all crate roots in one flat list.
@@ -4497,7 +4498,7 @@ rename or behavioral redesign. Cargo package names, logical manifest names, cano
 `.lsexe` basenames, prefix-free `.lslib` SONAME/DT_NEEDED identities, `PKGARCH1` and
 capability policy remain unchanged.
 
-- [ ] Freeze one complete old-path -> new-path inventory before moving files. The only
+- [x] Freeze one complete old-path -> new-path inventory before moving files. The only
   Cargo crate directories directly under `src/user/` after the migration are these five
   role directories; shared workspace infrastructure (`.cargo`, `rust-toolchain.toml`,
   linker scripts and the common build script) is inventoried explicitly and may remain at
@@ -4511,6 +4512,56 @@ capability policy remain unchanged.
   - `libs/`: every reusable leaf (`pix`, `surface`, `keys`, image/audio/compression
     codecs and helpers such as `quantize`). Do not add deeper image/audio taxonomy in
     this milestone; the conservative role split is sufficient.
+  - Frozen source inventory (2026-07-23): all 73 Cargo crates currently directly below
+    `src/user/` have exactly one destination. `src/user/rt` moves to
+    `src/user/runtime/rt`. The service owners move as `src/user/services` ->
+    `src/user/services/core`, `src/user/storage` -> `src/user/services/storage` and
+    `src/user/system_manager` -> `src/user/services/system_manager`. The aggregate driver
+    crate moves as `src/user/drivers` -> `src/user/drivers/core`. Applications move as
+    `src/user/tools` -> `src/user/apps/tools` and `src/user/dyn_probe` ->
+    `src/user/apps/dyn_probe`.
+  - The 66 reusable leaves move from `src/user/<name>` to `src/user/libs/<name>`:
+    `adpcm`, `aiff`, `apng`, `audio-client`, `audio-client-provider`, `audio-proto`,
+    `base-proto`, `bmp`, `config-client`, `config-client-provider`, `config-proto`,
+    `deflate`, `device-client`, `device-client-provider`, `device-proto`, `display-proto`,
+    `flac`, `gif`, `icns`, `ico`, `imgconv`, `inflate`, `input-proto`, `ipc-client`,
+    `jpeg`, `keys`, `log-client`, `log-client-provider`, `log-proto`, `mp3`,
+    `network-client`, `network-client-provider`, `network-proto`, `observability-client`,
+    `observability-client-provider`, `observability-proto`, `ogg`, `pcm`, `pcx`, `pix`,
+    `png`, `ppm`, `process-client`, `process-client-provider`, `process-proto`, `qoi`,
+    `quantize`, `resources-client`, `resources-client-provider`, `resources-proto`,
+    `security-client`, `security-client-provider`, `security-proto`, `session-proto`,
+    `storage-proto`, `surface`, `tga`, `time-client`, `time-client-provider`, `time-proto`,
+    `volume-client`, `volume-client-provider`, `vorbis`, `wav`, `wavpack` and `webp`.
+    Package, crate, library, executable and protocol identities remain unchanged.
+  - Shared infrastructure remains at `src/user/`: `.cargo/`, `build.rs`,
+    `rust-toolchain.toml`, `user.ld`, `user-aarch64.ld`, `user-riscv64.ld` and
+    `x86_64-unknown-none.json`. The peer roots `src/proto`, `src/term`, `src/wasm` and
+    `src/wire` are outside this physical migration and remain unchanged.
+  - Frozen staged-artifact inventory: all 48 `dynamic <name> tools volume` rows remain
+    `bin/<name>.lsexe`. The 20 volume-loaded internal executables move from
+    `bin/<name>.lsexe` to `libexec/<name>.lsexe`: `audio_service`, `component_host`,
+    `console_service`, `device_service`, `display_service`, `dyn_probe`, `file_picker`,
+    `input_service`, `network_service`, `permission_manager`, `request_probe`,
+    `resource_manager`, `sandbox_probe`, `session_service`, `shell`, `storage_client`,
+    `system_graph_service`, `time_service` and `wasi_host`; `config_service` instead moves
+    to `libexec/config_service/config_service.lsexe` beside its private state. The six
+    volume drivers remain `drivers/<name>.lsexe`, and all 60 shared providers remain
+    `lib/<name>.lslib`. The nine pinned launchers, services, probes and bootstrap block
+    driver remain only in `init.pkg` and gain no system-volume copy.
+  - Frozen data inventory: `volume/app.wasm` moves to
+    `components/liber_component/app.wasm`. The other 14 factory files move unchanged by
+    basename into the flat `test/` directory: `hello.txt`, `motd.txt`, `sample.bmp`,
+    `sample.png`, `test.aifc`, `test.aiff`, `test.flac`, `test-ima.wav`, `test.mp3`,
+    `test-ms.wav`, `test.ogg`, `test-stereo.wv`, `test.wav` and `test.wv`. Runtime-created
+    `config.tree` moves from the volume root to `libexec/config_service/config.tree`;
+    LogService's `log/boot-<n>` journal location is unchanged. The target root therefore
+    contains only `bin/`, `libexec/`, `lib/`, `drivers/`, `components/`, `log/` and
+    `test/`.
+  - Inventory validation counted 73 unique source crates and classified all 134
+    volume-staged manifest rows exactly once: 48 commands, 20 internal executables, six
+    drivers and 60 libraries. It also accounted for every one of the 15 loose factory
+    files. No physical path has moved in this inventory step.
 - [ ] Remove the build system's `user/<crate>` assumption before the physical move.
   Give each manifest row or shared-build specification an explicit crate path, then
   update `kernel/build.rs`, `user/services/build.rs`, `tools/build-shared.sh`, the
