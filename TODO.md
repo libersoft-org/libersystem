@@ -4218,6 +4218,16 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     changing ELF layout. The bounded DFS visiting-set guard rejects the resulting cycle
     before module loading and returns no Process capability. The remaining hostile-input
     work is governed command coverage and explicit graph depth/module-limit pressure.
+  - Dependency graph bounds result (M126a, 2026-07-23): ProcessService's resolver
+    admission rule now lives in a shared pure helper with separate host tests that pin
+    the exact hostile-input boundaries: depth 15 and 63 already loaded modules are
+    accepted, depth 16, 64 already loaded modules, saturated `usize` values and an
+    active-path re-entry are rejected before recursion or allocation. Package staging
+    enforces the same 64-module and 16-depth contract while reconstructing each manifest
+    closure. It tracks the longest path reaching every provider, preventing a shallow
+    occurrence from masking an over-deep alternate DAG path. The existing tri-architecture
+    self-cycle mutation continues to exercise the helper through the full ProcessService
+    launch path. The remaining hostile-input work is governed command coverage.
 - [ ] Hostile-input and tri-architecture gates: generate all provider/consumer graphs on
   x86_64/aarch64/riscv64; retain M123's malformed dynamic/string/hash/symbol/relocation/
   dependency tests; add a missing/substituted provider, ABI/crate-identity mismatch,

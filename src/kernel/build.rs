@@ -192,7 +192,7 @@ fn audit_linked_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String], 
 }
 
 fn audit_dynamic_order(row: &ManifestRow, bytes: &[u8], libraries: &[ManifestRow]) {
-	assert!(!bytes.is_empty() && bytes.len() <= 64 * 65 && bytes.last() == Some(&b'\n'), "dynamic {} has malformed canonical provider order", row.name);
+	assert!(!bytes.is_empty() && bytes.len() <= bootproto::elf::MAX_DYNAMIC_MODULES * 65 && bytes.last() == Some(&b'\n'), "dynamic {} has malformed canonical provider order", row.name);
 	let text = core::str::from_utf8(bytes).unwrap_or_else(|_| panic!("dynamic {} provider order is not UTF-8", row.name));
 	let mut actual: Vec<String> = Vec::new();
 	for name in text.lines() {
@@ -201,18 +201,29 @@ fn audit_dynamic_order(row: &ManifestRow, bytes: &[u8], libraries: &[ManifestRow
 		assert!(!actual.iter().any(|loaded| loaded == name), "dynamic {} repeats provider {name} in canonical order", row.name);
 		actual.push(String::from(name));
 	}
-	assert!(!actual.is_empty() && actual.len() <= 64, "dynamic {} has an empty or oversized canonical provider order", row.name);
+	assert!(!actual.is_empty() && actual.len() <= bootproto::elf::MAX_DYNAMIC_MODULES, "dynamic {} has an empty or oversized canonical provider order", row.name);
 
 	let mut closure: Vec<&ManifestRow> = Vec::new();
-	let mut pending: Vec<&str> = row.providers.iter().map(String::as_str).collect();
-	while let Some(name) = pending.pop() {
-		if closure.iter().any(|library| library.name == name) {
+	let mut depths: Vec<(&str, usize)> = Vec::new();
+	let mut pending: Vec<(&str, usize)> = row.providers.iter().map(|provider| (provider.as_str(), 0)).collect();
+	while let Some((name, depth)) = pending.pop() {
+		assert!(depth < bootproto::elf::MAX_DYNAMIC_DEPENDENCY_DEPTH, "dynamic {} provider graph exceeds dependency depth {}", row.name, bootproto::elf::MAX_DYNAMIC_DEPENDENCY_DEPTH);
+		if let Some((_, known_depth)) = depths.iter_mut().find(|(provider, _)| *provider == name) {
+			if *known_depth >= depth {
+				continue;
+			}
+			*known_depth = depth;
+		} else {
+			depths.push((name, depth));
+		}
+		if let Some(library) = closure.iter().find(|library| library.name == name) {
+			pending.extend(library.providers.iter().map(|provider| (provider.as_str(), depth + 1)));
 			continue;
 		}
 		let library = libraries.iter().find(|library| library.name == name).unwrap_or_else(|| panic!("dynamic {} order closure names unstaged provider {name}", row.name));
-		assert!(closure.len() < 64, "dynamic {} has an oversized provider closure", row.name);
+		assert!(closure.len() < bootproto::elf::MAX_DYNAMIC_MODULES, "dynamic {} has an oversized provider closure", row.name);
 		closure.push(library);
-		pending.extend(library.providers.iter().map(String::as_str));
+		pending.extend(library.providers.iter().map(|provider| (provider.as_str(), depth + 1)));
 	}
 	let mut expected: Vec<String> = Vec::with_capacity(closure.len());
 	while expected.len() < closure.len() {

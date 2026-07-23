@@ -33,6 +33,7 @@ use proto::system::volume;
 use proto::system::{Error, OpenOpts, ProcessInfo, StartResult};
 use rt::*;
 use services::executable;
+use services::graph_limits;
 
 // Where the on-disk program binaries live on the system volume (staged there by the
 // factory-seed pipeline). A named program is loaded from `<PROGRAM_DIR><name>`.
@@ -51,12 +52,6 @@ const IMAGE_TARGET: &str = "x86_64-unknown-none";
 const IMAGE_TARGET: &str = "aarch64-unknown-none";
 #[cfg(target_arch = "riscv64")]
 const IMAGE_TARGET: &str = "riscv64gc-unknown-none-elf";
-// Per-process dependency-graph limits. MAX_MODULES counts unique loaded libraries
-// (not every library installed in the image); MAX_DEPENDENCY_DEPTH bounds one DFS
-// branch. Together with `visiting` cycle detection they make hostile DT_NEEDED
-// graphs consume bounded storage reads, allocations, recursion and address slots.
-const MAX_MODULES: usize = 64;
-const MAX_DEPENDENCY_DEPTH: usize = 16;
 
 struct MappedFile {
 	handle: u64,
@@ -169,7 +164,7 @@ fn parse_identity(bytes: &[u8], kind: &str, artifact: &str) -> Option<Identity> 
 		let value = identity_value(line, b"provider=")?;
 		let separator = value.iter().position(|byte| *byte == b':')?;
 		let provider = core::str::from_utf8(&value[..separator]).ok()?;
-		if !valid_identity_name(provider) || providers.len() >= MAX_MODULES || providers.iter().any(|(name, _)| name == provider) {
+		if !valid_identity_name(provider) || providers.len() >= graph_limits::MAX_MODULES || providers.iter().any(|(name, _)| name == provider) {
 			return None;
 		}
 		providers.push((String::from(provider), parse_digest(&value[separator + 1..])?));
@@ -223,7 +218,7 @@ impl Resolver {
 			if self.modules.iter().any(|module| module.name == name) {
 				return true;
 			}
-			if depth >= MAX_DEPENDENCY_DEPTH || self.modules.len() >= MAX_MODULES || self.visiting.iter().any(|visiting| visiting == name) || !valid_library_name(name) {
+			if !graph_limits::can_visit(depth, self.modules.len(), self.visiting.iter().any(|visiting| visiting == name)) || !valid_library_name(name) {
 				return false;
 			}
 			self.visiting.push(String::from(name));
@@ -297,13 +292,13 @@ fn dependencies(elf: &bootproto::elf::Elf<'_>, dynamic: &bootproto::elf::Dynamic
 }
 
 fn parse_order(bytes: &[u8]) -> Option<Vec<String>> {
-	if bytes.is_empty() || bytes.len() > MAX_MODULES * 65 || bytes.last() != Some(&b'\n') {
+	if bytes.is_empty() || bytes.len() > graph_limits::MAX_MODULES * 65 || bytes.last() != Some(&b'\n') {
 		return None;
 	}
 	let text = core::str::from_utf8(bytes).ok()?;
 	let mut order = Vec::new();
 	for name in text.lines() {
-		if order.len() >= MAX_MODULES || !valid_library_name(name) || order.iter().any(|loaded: &String| loaded == name) {
+		if order.len() >= graph_limits::MAX_MODULES || !valid_library_name(name) || order.iter().any(|loaded: &String| loaded == name) {
 			return None;
 		}
 		order.push(String::from(name));

@@ -94,6 +94,8 @@ pub const DT_STRSZ: i64 = 10;
 pub const DT_SYMENT: i64 = 11;
 pub const DT_SONAME: i64 = 14;
 pub const DT_RELACOUNT: i64 = 0x6fff_fff9;
+pub const MAX_DYNAMIC_MODULES: usize = 64;
+pub const MAX_DYNAMIC_DEPENDENCY_DEPTH: usize = 16;
 
 // Program-header flags (p_flags).
 pub const PF_X: u32 = 1;

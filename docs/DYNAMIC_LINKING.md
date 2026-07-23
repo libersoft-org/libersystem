@@ -231,6 +231,13 @@ sidecar entries and requires package rejection without archive changes. Its runt
 changes `wire.lslib` to depend on itself; ProcessService's bounded DFS cycle guard must
 reject the launch before loading a module or creating a Process capability.
 
+The reconstructed closure and runtime resolver share hard admission bounds: at most 64
+unique provider modules and dependency depths 0 through 15. Package staging propagates
+the longest path reaching each provider, so a shallow occurrence cannot hide a second
+path that exceeds the depth limit. Host boundary tests pin acceptance at 63 loaded
+modules and depth 15, rejection at 64 loaded modules and depth 16, saturated hostile
+counts, and active-path re-entry.
+
 ## Measurement and optimization
 
 Dynamic linking is the required `/bin` architecture, not an optional optimization gate.
