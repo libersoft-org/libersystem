@@ -1,5 +1,17 @@
 use super::*;
 use alloc::vec;
+use std::path::PathBuf;
+use std::process::Command;
+
+fn ffmpeg_golden() -> Vec<u8> {
+	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../..");
+	let source = root.join("src/volume/audio/test.mp3");
+	let output = root.join(".build/testdata/mp3/test.pcm");
+	std::fs::create_dir_all(output.parent().unwrap()).expect("failed to create MP3 testdata directory");
+	let status = Command::new("ffmpeg").args(["-v", "error", "-y", "-i"]).arg(&source).args(["-map_metadata", "-1", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "44100"]).arg(&output).status().expect("ffmpeg is required to generate the MP3 PCM golden");
+	assert!(status.success(), "ffmpeg failed to generate the MP3 PCM golden");
+	std::fs::read(output).expect("failed to read the generated MP3 PCM golden")
+}
 
 #[test]
 fn skips_bounded_id3v2_metadata() {
@@ -41,6 +53,7 @@ fn parses_info_gapless_range() {
 fn decodes_staged_mpeg1_stream_in_bounded_chunks() {
 	let mp3 = Mp3::parse(include_bytes!("../../../../volume/audio/test.mp3")).unwrap();
 	assert_eq!(mp3.metadata(), Metadata { rate: 44_100, channels: 1, frames: 328_104, duration_ms: 7_440 });
+	let golden = ffmpeg_golden();
 	for chunk_frames in [127, 1_024] {
 		let mut decoder = mp3.decoder();
 		let mut chunk = Vec::new();
@@ -53,7 +66,6 @@ fn decodes_staged_mpeg1_stream_in_bounded_chunks() {
 			assert!(frames <= chunk_frames);
 			decoded.extend_from_slice(&chunk);
 		}
-		let golden = include_bytes!("../tests/test.pcm");
 		assert_eq!(decoded.len(), golden.len());
 		let errors = decoded.chunks_exact(2).zip(golden.chunks_exact(2)).map(|(actual, expected)| {
 			let actual = i16::from_le_bytes([actual[0], actual[1]]) as i32;
