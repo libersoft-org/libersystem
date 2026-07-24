@@ -1038,6 +1038,7 @@ define_test_tags! {
 	Mouse => "mouse",
 	Network => "network",
 	Process => "process",
+	ProcessService => "process-service",
 	Scheduler => "scheduler",
 	Service => "service",
 	Shell => "shell",
@@ -4210,72 +4211,61 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	assert!(arch::apic::ticks() - acked_at >= 75, "the renewal came at the restarted T1, not the retransmit pace");
 }
 
-tagged_test!(process_service_starts_a_program, [Service, Process]);
-fn process_service_starts_a_program() {
+fn run_process_service_requests(starts: &[(u32, &[u8])], list_correlation: Option<u32>) -> (alloc::vec::Vec<alloc::vec::Vec<u8>>, Option<alloc::vec::Vec<u8>>) {
 	use object::channel::Message;
 
-	// Drive the real userspace ProcessService over its generated Process bindings:
-	// spawn it, hand it the init package (to launch from) and a serve channel, then
-	// START a program and LIST it back. The wire is the proto framing - request [op
-	// u16][corr u32][args], reply [corr u32][result]; `start` takes a string name and
-	// replies result<process-info, error> = [koid u64][name string]. Everything is
-	// pre-queued so the cooperative service drains it in one pass and exits.
 	let (boot_kernel, service_client) = spawn_service_with_package(b"process_service");
-
-	// START a pinned program by short name (log_service is in the init package, which this
-	// ProcessService falls back to since it has no storage client): [op = 1 u16][corr
-	// u32][name: [len u16][utf8]].
-	let name: &[u8] = b"log_service";
-	let artifact: &[u8] = b"log_service.lsexe";
-	let mut start = alloc::vec::Vec::new();
-	start.extend_from_slice(&1u16.to_le_bytes());
-	start.extend_from_slice(&1u32.to_le_bytes());
-	start.extend_from_slice(&(name.len() as u16).to_le_bytes());
-	start.extend_from_slice(name);
-	service_client.send(Message::new(start, alloc::vec::Vec::new(), 0)).expect("start request");
-	let mut explicit = alloc::vec::Vec::new();
-	explicit.extend_from_slice(&1u16.to_le_bytes());
-	explicit.extend_from_slice(&2u32.to_le_bytes());
-	explicit.extend_from_slice(&(artifact.len() as u16).to_le_bytes());
-	explicit.extend_from_slice(artifact);
-	service_client.send(Message::new(explicit, alloc::vec::Vec::new(), 0)).expect("explicit start request");
-
-	// LIST: [op = 2 u16][corr u32]. Then an empty quit sentinel.
-	let mut list = alloc::vec::Vec::new();
-	list.extend_from_slice(&2u16.to_le_bytes());
-	list.extend_from_slice(&3u32.to_le_bytes());
-	service_client.send(Message::new(list, alloc::vec::Vec::new(), 0)).expect("list request");
+	for &(correlation, name) in starts {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&1u16.to_le_bytes());
+		request.extend_from_slice(&correlation.to_le_bytes());
+		request.extend_from_slice(&(name.len() as u16).to_le_bytes());
+		request.extend_from_slice(name);
+		service_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("start request");
+	}
+	if let Some(correlation) = list_correlation {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&2u16.to_le_bytes());
+		request.extend_from_slice(&correlation.to_le_bytes());
+		service_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("list request");
+	}
 	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
-
 	sched::run_until_idle();
-
-	// the service reports in on its bootstrap channel before it serves
 	let online = boot_kernel.recv().expect("ProcessService online report");
 	assert_eq!(&online.bytes[..], b"ProcessService: online", "ProcessService reports in");
+	let replies = starts.iter().map(|_| service_client.recv().expect("start reply").bytes).collect();
+	let list = list_correlation.map(|_| service_client.recv().expect("list reply").bytes);
+	(replies, list)
+}
 
-	// The start reply is [corr u32 = 1][ok u8 = 1][koid u64][name: [len u16][utf8]].
-	let reply = service_client.recv().expect("start reply");
-	let b = &reply.bytes;
-	assert_eq!(le_u32(b, 0), 1, "start reply echoes the correlation id");
-	assert_eq!(b[4], 1, "start succeeded");
-	let koid = le_u64(b, 5);
-	assert!(koid >= 1, "the started process has a koid");
-	let name_len = le_u16(b, 13) as usize;
-	assert_eq!(&b[15..15 + name_len], artifact, "the short launch reports the canonical artifact name");
+fn assert_process_start_reply(reply: &[u8], correlation: u32, artifact: &[u8]) {
+	assert_eq!(le_u32(reply, 0), correlation, "start reply echoes the correlation id");
+	assert_eq!(reply[4], 1, "start succeeded");
+	assert!(le_u64(reply, 5) >= 1, "the started process has a koid");
+	let name_len = le_u16(reply, 13) as usize;
+	assert_eq!(&reply[15..15 + name_len], artifact, "the launch reports the canonical artifact name");
+}
 
-	let reply = service_client.recv().expect("explicit start reply");
-	let b = &reply.bytes;
-	assert_eq!(le_u32(b, 0), 2, "explicit start reply echoes the correlation id");
-	assert_eq!(b[4], 1, "explicit start succeeded");
-	let name_len = le_u16(b, 13) as usize;
-	assert_eq!(&b[15..15 + name_len], artifact, "the explicit launch reports the same canonical artifact name");
+tagged_test!(process_service_canonicalizes_short_and_explicit_program_names, [Service, Process, ProcessService]);
+fn process_service_canonicalizes_short_and_explicit_program_names() {
+	// ProcessService falls back to the init package without a storage client. Both a
+	// short logical name and its explicit physical basename must report one identity.
+	let artifact: &[u8] = b"log_service.lsexe";
+	let (replies, list) = run_process_service_requests(&[(1, b"log_service"), (2, artifact)], None);
+	assert!(list.is_none());
+	assert_process_start_reply(&replies[0], 1, artifact);
+	assert_process_start_reply(&replies[1], 2, artifact);
+}
 
-	// The list reply records both launches under their complete physical identity.
-	let reply = service_client.recv().expect("list reply");
-	let b = &reply.bytes;
-	assert_eq!(le_u32(b, 0), 3, "list reply echoes the correlation id");
-	assert_eq!(b[4], 1, "list succeeded");
-	assert_eq!(le_u16(b, 5), 2, "both started processes are listed");
+tagged_test!(process_service_lists_every_started_program, [Service, Process, ProcessService]);
+fn process_service_lists_every_started_program() {
+	let (replies, list) = run_process_service_requests(&[(11, b"log_service"), (12, b"device_manager")], Some(13));
+	assert_process_start_reply(&replies[0], 11, b"log_service.lsexe");
+	assert_process_start_reply(&replies[1], 12, b"device_manager.lsexe");
+	let list = list.expect("list reply");
+	assert_eq!(le_u32(&list, 0), 13, "list reply echoes the correlation id");
+	assert_eq!(list[4], 1, "list succeeded");
+	assert_eq!(le_u16(&list, 5), 2, "both started processes are listed");
 }
 
 tagged_test!(process_service_resolves_one_final_executable_suffix, [Service, Process]);

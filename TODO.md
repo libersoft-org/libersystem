@@ -4837,6 +4837,15 @@ capability policy remain unchanged.
     online reports, while the 10 causally ordered restart/stop/shutdown reports remain
     exact. Focused boot QEMU passes 9/9, including the live supervisor shutdown-order
     drill. Remaining work is compound-scenario separation and thematic QEMU modules.
+  - ProcessService split result (2026-07-24): the former compound start/list scenario
+    is now two descriptors sharing one request harness. One independently proves that a
+    short logical name and explicit `.lsexe` basename resolve to the same canonical
+    process identity; the other independently proves LIST reports every successfully
+    started process. A dedicated canonical `process-service` tag runs these contracts
+    without unrelated process/image scenarios, and focused x86_64 QEMU passes 9/9 with
+    the smoke set. Kernel test compilation and tag validation pass. Remaining compound
+    work is the audio mixer/backpressure/decoder/driver-failure scenario and the
+    permission probe/tool/grant scenario, followed by thematic QEMU modules.
 - [ ] Define the factory `vol://system` hierarchy so its root contains only `hello.txt`,
   `motd.txt` and the declared directories:
   - `bin/`: user-invoked `.lsexe` tools. A stateless single-file command may live
