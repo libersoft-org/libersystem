@@ -72,7 +72,9 @@ fi
 library_file() {
 	local target="$1"
 	local provider="$2"
-	printf '%s/system-image/%s/lib/%s.lslib\n' "$build_root" "$target" "$provider"
+	local destination
+	destination="$(awk -v provider="$provider" '$1 == "library" && $2 == provider {print $5; count++} END {if (count != 1) exit 1}' "$manifest")"
+	printf '%s/system-image/%s/%s\n' "$build_root" "$target" "$destination"
 }
 
 canonical_manifest_order() {
@@ -107,7 +109,7 @@ canonical_manifest_order() {
 				echo "dynamic-report: manifest provider graph exceeds module limit $max_modules" >&2
 				return 1
 			fi
-			edges[$name]="$(awk -v provider="$name" '$1 == "library" && $2 == provider {for (i = 6; i <= NF; i++) {if (i > 6) printf " "; printf "%s", $i} found++} END {if (found != 1) exit 1}' "$manifest")"
+			edges[$name]="$(awk -v provider="$name" '$1 == "library" && $2 == provider {for (i = 7; i <= NF; i++) {if (i > 7) printf " "; printf "%s", $i} found++} END {if (found != 1) exit 1}' "$manifest")"
 			present[$name]=1
 		fi
 		for provider in ${edges[$name]}; do

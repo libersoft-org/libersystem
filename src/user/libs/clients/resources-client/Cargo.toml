@@ -1,0 +1,15 @@
+[package]
+name = "resources-client"
+edition = "2024"
+description = "Dynamic channel-client boundary for the LiberSystem resources LSIDL domain"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = []
+
+[dependencies]
+base-proto = { path = "../../protocol/base-proto" }
+resources-proto = { path = "../../protocol/resources-proto" }

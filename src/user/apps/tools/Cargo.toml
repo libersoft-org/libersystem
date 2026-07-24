@@ -220,7 +220,7 @@ default = []
 shared-image = ["ipc-client/shared-image", "audio-client/shared-image", "audio-client-provider/shared-image", "config-client/shared-image", "config-client-provider/shared-image", "device-client/shared-image", "device-client-provider/shared-image", "log-client/shared-image", "log-client-provider/shared-image", "network-client/shared-image", "network-client-provider/shared-image", "observability-client/shared-image", "observability-client-provider/shared-image", "process-client/shared-image", "process-client-provider/shared-image", "resources-client/shared-image", "resources-client-provider/shared-image", "security-client/shared-image", "security-client-provider/shared-image", "time-client/shared-image", "time-client-provider/shared-image", "volume-client/shared-image", "volume-client-provider/shared-image", "proto/shared-image", "rt/shared-image", "storage-proto/shared-image"]
 
 [dependencies]
-ipc-client = { path = "../../libs/ipc-client" }
+ipc-client = { path = "../../libs/ipc/ipc-client" }
 # Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
 # the syscall/IPC helpers); it re-exports the abi constants.
 rt = { path = "../../runtime/rt" }
@@ -228,42 +228,42 @@ rt = { path = "../../runtime/rt" }
 # Generated LSIDL bindings: the net tools speak the NetworkService contracts
 # (`network` / `socket`) via the proto codec + generated clients.
 proto = { path = "../../../proto" }
-storage-proto = { path = "../../libs/storage-proto" }
-audio-client = { path = "../../libs/audio-client", optional = true }
-audio-client-provider = { path = "../../libs/audio-client-provider", optional = true }
-network-client = { path = "../../libs/network-client", optional = true }
-network-client-provider = { path = "../../libs/network-client-provider", optional = true }
-config-client = { path = "../../libs/config-client", optional = true }
-config-client-provider = { path = "../../libs/config-client-provider", optional = true }
-device-client = { path = "../../libs/device-client", optional = true }
-device-client-provider = { path = "../../libs/device-client-provider", optional = true }
-log-client = { path = "../../libs/log-client", optional = true }
-log-client-provider = { path = "../../libs/log-client-provider", optional = true }
-observability-client = { path = "../../libs/observability-client", optional = true }
-observability-client-provider = { path = "../../libs/observability-client-provider", optional = true }
-process-client = { path = "../../libs/process-client", optional = true }
-process-client-provider = { path = "../../libs/process-client-provider", optional = true }
-resources-client = { path = "../../libs/resources-client", optional = true }
-resources-client-provider = { path = "../../libs/resources-client-provider", optional = true }
-security-client = { path = "../../libs/security-client", optional = true }
-security-client-provider = { path = "../../libs/security-client-provider", optional = true }
-time-client = { path = "../../libs/time-client", optional = true }
-time-client-provider = { path = "../../libs/time-client-provider", optional = true }
-volume-client = { path = "../../libs/volume-client", optional = true }
-volume-client-provider = { path = "../../libs/volume-client-provider", optional = true }
+storage-proto = { path = "../../libs/protocol/storage-proto" }
+audio-client = { path = "../../libs/clients/audio-client", optional = true }
+audio-client-provider = { path = "../../libs/clients/audio-client-provider", optional = true }
+network-client = { path = "../../libs/clients/network-client", optional = true }
+network-client-provider = { path = "../../libs/clients/network-client-provider", optional = true }
+config-client = { path = "../../libs/clients/config-client", optional = true }
+config-client-provider = { path = "../../libs/clients/config-client-provider", optional = true }
+device-client = { path = "../../libs/clients/device-client", optional = true }
+device-client-provider = { path = "../../libs/clients/device-client-provider", optional = true }
+log-client = { path = "../../libs/clients/log-client", optional = true }
+log-client-provider = { path = "../../libs/clients/log-client-provider", optional = true }
+observability-client = { path = "../../libs/clients/observability-client", optional = true }
+observability-client-provider = { path = "../../libs/clients/observability-client-provider", optional = true }
+process-client = { path = "../../libs/clients/process-client", optional = true }
+process-client-provider = { path = "../../libs/clients/process-client-provider", optional = true }
+resources-client = { path = "../../libs/clients/resources-client", optional = true }
+resources-client-provider = { path = "../../libs/clients/resources-client-provider", optional = true }
+security-client = { path = "../../libs/clients/security-client", optional = true }
+security-client-provider = { path = "../../libs/clients/security-client-provider", optional = true }
+time-client = { path = "../../libs/clients/time-client", optional = true }
+time-client-provider = { path = "../../libs/clients/time-client-provider", optional = true }
+volume-client = { path = "../../libs/clients/volume-client", optional = true }
+volume-client-provider = { path = "../../libs/clients/volume-client-provider", optional = true }
 
-bmp = { path = "../../libs/bmp" }
-keys = { path = "../../libs/keys" }
-imgconv = { path = "../../libs/imgconv" }
-pix = { path = "../../libs/pix" }
-png = { path = "../../libs/png" }
-surface = { path = "../../libs/surface" }
-aiff = { path = "../../libs/aiff" }
-flac = { path = "../../libs/flac" }
-mp3 = { path = "../../libs/mp3" }
-vorbis = { path = "../../libs/vorbis" }
-wav = { path = "../../libs/wav" }
-wavpack = { path = "../../libs/wavpack" }
+bmp = { path = "../../libs/image/bmp" }
+keys = { path = "../../libs/input/keys" }
+imgconv = { path = "../../libs/image/imgconv" }
+pix = { path = "../../libs/image/pix" }
+png = { path = "../../libs/image/png" }
+surface = { path = "../../libs/display/surface" }
+aiff = { path = "../../libs/audio/aiff" }
+flac = { path = "../../libs/audio/flac" }
+mp3 = { path = "../../libs/audio/mp3" }
+vorbis = { path = "../../libs/audio/vorbis" }
+wav = { path = "../../libs/audio/wav" }
+wavpack = { path = "../../libs/audio/wavpack" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so we
 # do not set `panic = "abort"` per-profile (same reasoning as the kernel).

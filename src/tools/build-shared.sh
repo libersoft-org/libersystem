@@ -12,7 +12,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 build_root="$root/../.build"
 artifact_manifest="$root/user/services/manifest.txt"
 artifact_output_root="$build_root/system-image/$target"
-provider_output_dir="$artifact_output_root/lib"
+provider_output_dir="$artifact_output_root"
 executable_output_dir="$artifact_output_root/bin"
 artifact_log_dir="$artifact_output_root/logs"
 rust_min_stack="${RUST_MIN_STACK:-67108864}"
@@ -207,8 +207,9 @@ object_tool_digest="$(sha256sum "$root/tools/build-consumer-object.sh" | awk '{p
 
 library_file() {
 	local artifact="$1"
-	awk -v artifact="$artifact" '$1 == "library" && $2 == artifact {found++} END {if (found != 1) exit 1}' "$artifact_manifest" || return 1
-	printf '%s/%s.lslib' "$provider_output_dir" "$artifact"
+	local destination
+	destination="$(awk -v artifact="$artifact" '$1 == "library" && $2 == artifact {print $5; found++} END {if (found != 1) exit 1}' "$artifact_manifest")" || return 1
+	printf '%s/%s' "$provider_output_dir" "$destination"
 }
 
 declare -A crate_source_digests=()
@@ -562,6 +563,17 @@ manifest_library_row() {
 	awk -v artifact="$1" '$1 == "library" && $2 == artifact {print; count++} END {if (count != 1) exit 1}' "$artifact_manifest"
 }
 
+audit_library_destinations() {
+	local expected actual
+	expected="$(awk '$1 == "library" && $4 == "volume" {print $5}' "$artifact_manifest" | sort)"
+	actual="$(find "$provider_output_dir/lib" -type f -name '*.lslib' -printf 'lib/%P\n' 2>/dev/null | sort)"
+	if [[ "$actual" != "$expected" ]]; then
+		echo "build-shared: staged library paths differ from the manifest" >&2
+		diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
+		exit 1
+	fi
+}
+
 manifest_specs="$(awk '$1 == "library" {print $2 "=" $3}' "$artifact_manifest" | sort)"
 requested_specs="$(for spec in "$@"; do if [[ "$spec" == *=* ]]; then printf '%s\n' "$spec"; else printf '%s=%s\n' "$spec" "$spec"; fi; done | sort)"
 if [[ "$requested_specs" != "$manifest_specs" ]]; then
@@ -898,8 +910,8 @@ for spec in "$@"; do
 		echo "build-shared: $artifact has no unique library manifest row" >&2
 		exit 1
 	}
-	read -r row_kind row_artifact row_crate row_stage row_features row_providers <<<"$row"
-	if [[ "$row_kind" != library || "$row_artifact" != "$artifact" || "$row_crate" != "$crate" || "$row_stage" != volume || -z "$row_features" ]]; then
+	read -r row_kind row_artifact row_crate row_stage row_destination row_features row_providers <<<"$row"
+	if [[ "$row_kind" != library || "$row_artifact" != "$artifact" || "$row_crate" != "$crate" || "$row_stage" != volume || ! "$row_destination" =~ ^lib/[a-z0-9][a-z0-9_-]*/$artifact\.lslib$ || -z "$row_features" ]]; then
 		echo "build-shared: $artifact invocation differs from its library manifest row" >&2
 		exit 1
 	fi
@@ -909,7 +921,8 @@ for spec in "$@"; do
 		echo "build-shared: missing $manifest" >&2
 		exit 1
 	fi
-	out_dir="$provider_output_dir"
+	out="$(library_file "$artifact")"
+	out_dir="$(dirname "$out")"
 	mkdir -p "$out_dir"
 	features=()
 	if [[ "$row_features" != - ]]; then
@@ -935,7 +948,6 @@ for spec in "$@"; do
 		echo "build-shared: no rlib produced for $crate" >&2
 		exit 1
 	fi
-	out="$out_dir/$artifact.lslib"
 	provider_source_sha="$(source_digest "$crate_dir")"
 	if [[ "$row_crate" == *-client-provider ]]; then
 		provider_compile_source="$(source_digest "$(source_path "${row_crate%-provider}")")"
@@ -1570,6 +1582,7 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 		canonical_provider_order "pix lsrt" >/dev/null
 		echo "build-shared: executable cache hit dyn_probe"
 		rm -f "$probe_expected_identity"
+		audit_library_destinations
 		exit 0
 	fi
 	echo "build-shared: executable cache miss dyn_probe"
@@ -1586,3 +1599,5 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	rm -f "$probe_expected_identity"
 	echo "build-shared: $probe_out ($(stat -c %s "$probe_out") bytes)"
 fi
+
+audit_library_destinations

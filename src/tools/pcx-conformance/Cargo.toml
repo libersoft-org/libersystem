@@ -4,5 +4,5 @@ edition = "2024"
 description = "Host interoperability gate for LiberSystem PCX output"
 
 [dependencies]
-pcx = { path = "../../user/libs/pcx" }
-pix = { path = "../../user/libs/pix" }
+pcx = { path = "../../user/libs/image/pcx" }
+pix = { path = "../../user/libs/image/pix" }

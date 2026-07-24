@@ -109,7 +109,7 @@ name = "shell"
 path = "src/shell.rs"
 
 [dependencies]
-ipc-client = { path = "../../libs/ipc-client" }
+ipc-client = { path = "../../libs/ipc/ipc-client" }
 # Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
 # the syscall/IPC/volume helpers); it re-exports the abi constants.
 rt = { path = "../../runtime/rt" }
@@ -117,7 +117,7 @@ rt = { path = "../../runtime/rt" }
 # Generated LSIDL bindings (the proto codec, clients, and servers) - LogService
 # serves them and the shell + ServiceManager speak them over the log channel.
 proto = { path = "../../../proto" }
-storage-proto = { path = "../../libs/storage-proto" }
+storage-proto = { path = "../../libs/protocol/storage-proto" }
 bootproto = { path = "../../../bootproto" }
 abi = { path = "../../../abi" }
 
@@ -130,10 +130,10 @@ wasm = { path = "../../../wasm" }
 
 # Shared pixel vocabulary and direct/scaled blitters. Kept as a separate crate so
 # graphical applications and DisplayService use exactly the same geometry semantics.
-pix = { path = "../../libs/pix" }
-keys = { path = "../../libs/keys" }
-pcm = { path = "../../libs/pcm" }
-surface = { path = "../../libs/surface" }
+pix = { path = "../../libs/image/pix" }
+keys = { path = "../../libs/input/keys" }
+pcm = { path = "../../libs/audio/pcm" }
+surface = { path = "../../libs/display/surface" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

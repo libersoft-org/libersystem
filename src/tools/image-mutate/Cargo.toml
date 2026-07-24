@@ -4,16 +4,16 @@ edition = "2024"
 description = "Deterministic hostile-input and mutation gate for LiberSystem image decoders"
 
 [dependencies]
-apng = { path = "../../user/libs/apng" }
-bmp = { path = "../../user/libs/bmp" }
-gif = { path = "../../user/libs/gif" }
-ico = { path = "../../user/libs/ico" }
-icns = { path = "../../user/libs/icns" }
-imgconv = { path = "../../user/libs/imgconv" }
-jpeg = { path = "../../user/libs/jpeg" }
-pcx = { path = "../../user/libs/pcx" }
-png = { path = "../../user/libs/png" }
-ppm = { path = "../../user/libs/ppm" }
-qoi = { path = "../../user/libs/qoi" }
-tga = { path = "../../user/libs/tga" }
-webp = { path = "../../user/libs/webp" }
+apng = { path = "../../user/libs/image/apng" }
+bmp = { path = "../../user/libs/image/bmp" }
+gif = { path = "../../user/libs/image/gif" }
+ico = { path = "../../user/libs/image/ico" }
+icns = { path = "../../user/libs/image/icns" }
+imgconv = { path = "../../user/libs/image/imgconv" }
+jpeg = { path = "../../user/libs/image/jpeg" }
+pcx = { path = "../../user/libs/image/pcx" }
+png = { path = "../../user/libs/image/png" }
+ppm = { path = "../../user/libs/image/ppm" }
+qoi = { path = "../../user/libs/image/qoi" }
+tga = { path = "../../user/libs/image/tga" }
+webp = { path = "../../user/libs/image/webp" }

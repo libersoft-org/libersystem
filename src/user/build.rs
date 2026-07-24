@@ -15,6 +15,7 @@ fn main() {
 	select_linker_script(&user_root);
 	export_product_metadata(&user_root);
 	generate_service_manifest(&user_root);
+	generate_library_paths(&user_root);
 }
 
 fn find_user_root() -> PathBuf {
@@ -98,6 +99,59 @@ fn generate_service_manifest(user_root: &PathBuf) {
 	let generated: String = format!("// @generated from services/manifest.txt by build.rs - do not edit.\nconst N: usize = {count};\nconst MANIFEST: [Service; N] = [\n{out}];\n");
 	let out_dir: String = env::var("OUT_DIR").expect("OUT_DIR not set");
 	let dest: PathBuf = PathBuf::from(&out_dir).join("manifest.rs");
+	fs::write(&dest, generated).unwrap_or_else(|e: std::io::Error| panic!("cannot write {}: {e}", dest.display()));
+}
+
+fn generate_library_paths(user_root: &PathBuf) {
+	if env::var("CARGO_PKG_NAME").as_deref() != Ok("services") {
+		return;
+	}
+	let path: PathBuf = user_root.join("services/manifest.txt");
+	let text: String = fs::read_to_string(&path).unwrap_or_else(|e: std::io::Error| panic!("cannot read {}: {e}", path.display()));
+	println!("cargo:rerun-if-changed={}", path.display());
+	let mut arms = String::new();
+	let mut sources: Vec<(String, String)> = Vec::new();
+	for line in text.lines() {
+		let mut fields = line.split_whitespace();
+		if fields.next() == Some("source") {
+			sources.push((fields.next().expect("source row missing owner").to_string(), fields.next().expect("source row missing path").to_string()));
+		}
+	}
+	for line in text.lines() {
+		let trimmed = line.trim();
+		if trimmed.is_empty() || trimmed.starts_with('#') {
+			continue;
+		}
+		let mut fields = trimmed.split_whitespace();
+		if fields.next() != Some("library") {
+			continue;
+		}
+		let name = fields.next().expect("library row missing name");
+		let owner = fields.next().expect("library row missing owner");
+		let stage = fields.next().expect("library row missing stage");
+		let destination = fields.next().expect("library row missing destination");
+		assert_eq!(stage, "volume", "library {name} is not volume staged");
+		let source = sources.iter().find(|(known, _)| known == owner).unwrap_or_else(|| panic!("library {name} has unknown source owner {owner}")).1.as_str();
+		let category = if let Some(relative) = source.strip_prefix("user/libs/") {
+			let (category, leaf) = relative.split_once('/').unwrap_or_else(|| panic!("library {name} source has no category"));
+			assert_eq!(leaf, owner, "library {name} source category drifts from owner");
+			category
+		} else {
+			match (name, owner, source) {
+				("lsrt", "rt", "user/runtime/rt") => "runtime",
+				("wire", "wire", "wire") => "ipc",
+				("wasm", "wasm", "wasm") => "component",
+				("term", "term", "term") => "terminal",
+				("service-util", "services", "user/services/core") => "service",
+				_ => panic!("library {name} has no ownership category"),
+			}
+		};
+		assert_eq!(destination, format!("lib/{category}/{name}.lslib"), "library {name} has invalid destination");
+		arms.push_str(&format!("\t\"{name}.lslib\" => Some(\"vol://system/{destination}\"),\n"));
+	}
+	let generated = format!("// @generated from services/manifest.txt by build.rs - do not edit.\nfn library_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{arms}\t\t_ => None,\n\t}}\n}}\n");
+	let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+	let dest = out_dir.join("library_paths.rs");
 	fs::write(&dest, generated).unwrap_or_else(|e: std::io::Error| panic!("cannot write {}: {e}", dest.display()));
 }
 

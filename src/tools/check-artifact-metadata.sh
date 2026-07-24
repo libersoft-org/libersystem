@@ -49,7 +49,7 @@ while IFS= read -r artifact; do
 	fi
 done < <(
 	awk -v root="$image_root" '
-		$1 == "library" && $4 == "volume" {print root "/lib/" $2 ".lslib"}
+		$1 == "library" && $4 == "volume" {print root "/" $5}
 		($1 == "dynamic" || $1 == "dynamic-service") && $4 == "volume" {print root "/bin/" $2}
 	' "$manifest" | sort
 )

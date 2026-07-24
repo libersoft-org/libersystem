@@ -1,0 +1,15 @@
+[package]
+name = "config-client"
+edition = "2024"
+description = "Dynamic channel-client boundary for the LiberSystem config LSIDL domain"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = []
+
+[dependencies]
+base-proto = { path = "../../protocol/base-proto" }
+config-proto = { path = "../../protocol/config-proto" }

@@ -1,0 +1,16 @@
+[package]
+name = "security-client"
+edition = "2024"
+description = "Dynamic channel-client boundary for the LiberSystem security LSIDL domain"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = []
+
+[dependencies]
+base-proto = { path = "../../protocol/base-proto" }
+process-proto = { path = "../../protocol/process-proto" }
+security-proto = { path = "../../protocol/security-proto" }

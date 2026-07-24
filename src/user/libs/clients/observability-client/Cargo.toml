@@ -1,0 +1,15 @@
+[package]
+name = "observability-client"
+edition = "2024"
+description = "Dynamic channel-client boundary for the LiberSystem observability LSIDL domain"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = []
+
+[dependencies]
+base-proto = { path = "../../protocol/base-proto" }
+observability-proto = { path = "../../protocol/observability-proto" }

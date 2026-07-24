@@ -1,0 +1,10 @@
+[package]
+name = "png"
+edition = "2024"
+description = "Dependency-free bounded PNG decoder"
+
+[dependencies]
+deflate = { path = "../../compression/deflate" }
+inflate = { path = "../../compression/inflate" }
+pix = { path = "../pix" }
+quantize = { path = "../quantize" }

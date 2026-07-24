@@ -513,14 +513,14 @@ pub fn executable_aliases_ambiguous(first: &[u8], second: &[u8]) -> bool {
 }
 
 // PKGARCH1 archive format - a 16-byte header (8-byte magic, u32 entry count, u32
-// reserved), then one 40-byte entry per file (32-byte NUL-padded name, u32 blob
+// reserved), then one 72-byte entry per file (64-byte NUL-padded name, u32 blob
 // offset, u32 size), then the concatenated blobs. All integers little-endian.
 // Written by the kernel build.rs, read by the kernel pkg.rs and the userspace
 // storage runtime.
 pub const PKG_MAGIC: &[u8; 8] = b"PKGARCH1";
 pub const PKG_HEADER_LEN: usize = 16;
-pub const PKG_ENTRY_LEN: usize = 40;
-pub const PKG_NAME_LEN: usize = 32;
+pub const PKG_ENTRY_LEN: usize = 72;
+pub const PKG_NAME_LEN: usize = 64;
 
 // A parsed PKGARCH1 archive borrowing the underlying bytes. The single reader for
 // the format: the kernel (init/volume packages) and the userspace storage runtime

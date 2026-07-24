@@ -1,0 +1,12 @@
+[package]
+name = "surface"
+edition = "2024"
+description = "Owned DisplayService client surfaces and presentation helpers"
+
+[dependencies]
+base-proto = { path = "../../protocol/base-proto" }
+display-proto = { path = "../../protocol/display-proto" }
+input-proto = { path = "../../protocol/input-proto" }
+ipc-client = { path = "../../ipc/ipc-client" }
+rt = { path = "../../../runtime/rt" }
+pix = { path = "../../image/pix" }

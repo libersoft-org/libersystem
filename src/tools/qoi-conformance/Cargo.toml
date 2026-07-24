@@ -4,5 +4,5 @@ edition = "2024"
 description = "Host interoperability gate for LiberSystem QOI output"
 
 [dependencies]
-qoi = { path = "../../user/libs/qoi" }
-pix = { path = "../../user/libs/pix" }
+qoi = { path = "../../user/libs/image/qoi" }
+pix = { path = "../../user/libs/image/pix" }

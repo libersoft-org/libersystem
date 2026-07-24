@@ -4,5 +4,5 @@ edition = "2024"
 description = "Host interoperability gate for LiberSystem WebP output"
 
 [dependencies]
-webp = { path = "../../user/libs/webp" }
-pix = { path = "../../user/libs/pix" }
+webp = { path = "../../user/libs/image/webp" }
+pix = { path = "../../user/libs/image/pix" }

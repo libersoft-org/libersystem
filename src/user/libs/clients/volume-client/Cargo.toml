@@ -1,0 +1,15 @@
+[package]
+name = "volume-client"
+edition = "2024"
+description = "Dynamic channel-client boundary for the LiberSystem volume LSIDL interface"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = []
+
+[dependencies]
+base-proto = { path = "../../protocol/base-proto" }
+storage-proto = { path = "../../protocol/storage-proto" }

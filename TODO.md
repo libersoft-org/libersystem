@@ -4618,7 +4618,7 @@ capability policy remain unchanged.
     of every physical userspace Cargo root and rejects permanent references to the old
     `src/user/<logical-owner>/` paths outside `TODO.md` and `NOTES.md`. The current and
     reachable-history modes share these physical/source-map checks.
-- [ ] Define and apply one ownership-based library taxonomy mirrored between source and
+- [x] Define and apply one ownership-based library taxonomy mirrored between source and
   the system volume. At minimum separate audio codecs/containers and vocabulary under
   `user/libs/audio/`, image codecs/conversion vocabulary under `user/libs/image/`, and
   general compression primitives under `user/libs/compression/`; classify protocol,
@@ -4633,6 +4633,22 @@ capability policy remain unchanged.
   flat compatibility copies, and update Cargo paths, build scripts, tests and docs
   atomically. A new leaf must declare exactly one category; moving a leaf between
   categories changes no runtime ABI or dependency edge.
+  - Library-taxonomy result (2026-07-24): all 66 reusable userspace crates now live
+    under exactly one of `audio`, `image`, `compression`, `protocol`, `clients`,
+    `display`, `input` or `ipc`; all 60 shared providers mirror their owning category
+    below `lib/`, with additional explicit `runtime`, `terminal`, `component` and
+    `service` destinations for peer-root owners. The manifest carries every exact
+    source and volume path, generates ProcessService and kernel-test lookup tables,
+    and rejects source/destination category drift, duplicate destinations and stale
+    flat provider copies. Package entry names grew from 32 to 64 bytes so canonical
+    nested paths fit without abbreviating logical identities. Prefix-free SONAMEs,
+    `DT_NEEDED`, package names and manifest owner names remain unchanged. Complete
+    x86_64, AArch64 and RISC-V shared-image builds each produced 60 providers and 67
+    consumers in the categorized layout; source hygiene, artifact metadata, triarch
+    dynamic reports, kernel compilation and every focused dynamic runtime scenario
+    passed. The broader focused-tag run continued into an unrelated lossy WebP smoke
+    assertion after all taxonomy scenarios passed and failed its existing RGB MSE
+    bound.
 - [x] Remove the redundant `order/` namespace and generated `.order` sidecars. The
   complete provider graph is already bound and cross-checked by each executable/library
   identity record and its exact `DT_NEEDED` edges, while both the image builder and

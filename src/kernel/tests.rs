@@ -13,6 +13,8 @@ use alloc::vec::Vec;
 // (per-process page tables / CR3 isolation are a later refinement).
 use crate::memlayout::{USER_CODE_VA, USER_STACK_VA};
 
+include!(concat!(env!("OUT_DIR"), "/library_paths.rs"));
+
 // Kernel-thread body that runs a ring-3 program. It maps a USER code and stack
 // page, copies the embedded position-independent program in, and drops to ring 3
 // with its bootstrap Channel handle. The program makes a capability-gated channel
@@ -5034,11 +5036,11 @@ fn dynamic_wave_launch_metrics_are_structurally_sound() {
 	assert_eq!(&process_boot_kernel.recv().expect("ProcessService online report").bytes, b"ProcessService: online");
 	#[cfg(target_arch = "x86_64")]
 	let representatives = [
-		(1u8, b"echo" as &[u8], 100u32, 14usize, 80usize),
-		(2, b"cat" as &[u8], 102, 22, 104),
-		(3, b"date" as &[u8], 104, 21, 93),
-		(4, b"ip" as &[u8], 106, 21, 106),
-		(5, b"imgconv" as &[u8], 108, 46, 367),
+		(1u8, b"echo" as &[u8], 100u32, 13usize, 81usize),
+		(2, b"cat" as &[u8], 102, 21, 105),
+		(3, b"date" as &[u8], 104, 20, 94),
+		(4, b"ip" as &[u8], 106, 20, 107),
+		(5, b"imgconv" as &[u8], 108, 45, 368),
 	];
 	#[cfg(target_arch = "aarch64")]
 	let representatives = [
@@ -5396,7 +5398,7 @@ tagged_test!(dynamic_process_service_rejects_provider_cycle, [Dynamic, DynamicRe
 fn dynamic_process_service_rejects_provider_cycle() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut mutated_volume = volume.to_vec();
-	replace_dynamic_needed(&mut mutated_volume, b"lib/wire.lslib", "lsrt.lslib", "wire.lslib");
+	replace_dynamic_needed(&mut mutated_volume, b"lib/ipc/wire.lslib", "lsrt.lslib", "wire.lslib");
 	let reply = launch_from_volume(&mutated_volume, b"lscpu", 89);
 	assert_eq!(le_u32(&reply.bytes, 0), 89);
 	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a provider dependency cycle");
@@ -5407,14 +5409,14 @@ tagged_test!(dynamic_process_service_rejects_substituted_or_corrupted_identity_n
 fn dynamic_process_service_rejects_substituted_or_corrupted_identity_note() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut substituted_provider = volume.to_vec();
-	replace_volume_entry(&mut substituted_provider, b"lib/lsrt.lslib", b"lib/wire.lslib");
+	replace_volume_entry(&mut substituted_provider, b"lib/runtime/lsrt.lslib", b"lib/ipc/wire.lslib");
 	let reply = launch_from_volume(&substituted_provider, b"echo", 80);
 	assert_eq!(le_u32(&reply.bytes, 0), 80);
 	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a valid provider substituted under lsrt.lslib");
 	assert!(reply.caps.is_empty(), "a substituted provider creates no process capability");
 
 	let mut corrupted_identity = volume.to_vec();
-	corrupt_identity_note(&mut corrupted_identity, b"lib/lsrt.lslib", b"profile=");
+	corrupt_identity_note(&mut corrupted_identity, b"lib/runtime/lsrt.lslib", b"profile=");
 	let reply = launch_from_volume(&corrupted_identity, b"echo", 81);
 	assert_eq!(le_u32(&reply.bytes, 0), 81);
 	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a provider whose embedded identity record is malformed");
@@ -5425,7 +5427,7 @@ tagged_test!(dynamic_process_service_rejects_duplicate_provider_export, [Dynamic
 fn dynamic_process_service_rejects_duplicate_provider_export() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut duplicated_export = volume.to_vec();
-	replace_provider_export(&mut duplicated_export, b"lib/pix.lslib", b"lib/lsrt.lslib");
+	replace_provider_export(&mut duplicated_export, b"lib/image/pix.lslib", b"lib/runtime/lsrt.lslib");
 	let reply = launch_from_volume(&duplicated_export, b"dyn_probe", 82);
 	assert_eq!(le_u32(&reply.bytes, 0), 82);
 	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a provider that duplicates a runtime export");
@@ -6110,7 +6112,7 @@ fn spawn_dynamic_test_process(domain: alloc::sync::Arc<object::domain::Domain>, 
 		}
 		assert!(!visiting.iter().any(|item| item == name), "dynamic test provider cycle");
 		visiting.push(alloc::string::String::from(name));
-		let path = alloc::format!("lib/{name}");
+		let path = test_library_path(name).expect("dynamic test provider has a manifest destination");
 		let bytes = package.lookup(path.as_bytes()).expect("dynamic test provider is staged");
 		let elf = bootproto::elf::Elf::parse(bytes).expect("dynamic test provider is ELF");
 		let dynamic = elf.dynamic_info().expect("provider dynamic metadata parses").expect("provider has PT_DYNAMIC");
@@ -6343,9 +6345,9 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	run_imgview_help_harness(imgview_elf, &mut system, &mut media);
 	run_imgview_harness(imgview_elf, b"vol://system/CROSS.BMP", &viewer_surface(&source), &mut system, &mut media);
 
-	let transparent_png = include_bytes!("../user/libs/png/tests/data/external-rgba16.png");
+	let transparent_png = include_bytes!("../user/libs/image/png/tests/data/external-rgba16.png");
 	let transparent = png::decode_rgba(transparent_png).expect("decode transparent viewer fixture");
-	let animation_webp = include_bytes!("../user/libs/webp/tests/data/external-animation.webp");
+	let animation_webp = include_bytes!("../user/libs/image/webp/tests/data/external-animation.webp");
 	let viewer_image = fat16_image(&[(*b"ALPHA   PNG", transparent_png.as_slice()), (*b"ANIM    WEB", animation_webp)], false);
 	let mut viewer_media = StorageHarness::start(storage_elf, b"FATBLOCK", &viewer_image, viewer_image.len() as u64);
 	run_imgview_harness(imgview_elf, b"vol://media/ALPHA.PNG", &viewer_surface(&transparent), &mut system, &mut viewer_media);
@@ -6422,7 +6424,7 @@ fn imgconv_governed_working_set_is_measured() {
 	let ultra_hd_image = png::decode_rgba(&ultra_hd_output).expect("4K output decodes");
 	assert_eq!((ultra_hd_image.width, ultra_hd_image.height), (3840, 2160));
 
-	let animation = include_bytes!("../user/libs/webp/tests/data/external-animation.webp");
+	let animation = include_bytes!("../user/libs/image/webp/tests/data/external-animation.webp");
 	let media_image = fat16_image(&[(*b"ANIM    WEB", animation)], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
 	let animation_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED);

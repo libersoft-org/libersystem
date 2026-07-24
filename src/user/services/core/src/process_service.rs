@@ -38,7 +38,6 @@ use services::graph_limits;
 // Where the on-disk program binaries live on the system volume (staged there by the
 // factory-seed pipeline). A named program is loaded from `<PROGRAM_DIR><name>`.
 const PROGRAM_DIR: &str = "vol://system/bin/";
-const LIBRARY_DIR: &str = "vol://system/lib/";
 const LIBRARY_BASE: u64 = 0x2000_0000;
 const LIBRARY_SLOT_SIZE: u64 = 0x0100_0000;
 const IDENTITY_FORMAT: &[u8] = b"format=liber-image-identity-v1";
@@ -48,6 +47,8 @@ const IMAGE_TARGET: &str = "x86_64-unknown-none";
 const IMAGE_TARGET: &str = "aarch64-unknown-none";
 #[cfg(target_arch = "riscv64")]
 const IMAGE_TARGET: &str = "riscv64gc-unknown-none-elf";
+
+include!(concat!(env!("OUT_DIR"), "/library_paths.rs"));
 
 struct MappedFile {
 	handle: u64,
@@ -211,7 +212,7 @@ impl Resolver {
 			}
 			self.visiting.push(String::from(name));
 			let module = (|| {
-				let file = MappedFile::open(self.storage, alloc::format!("{LIBRARY_DIR}{name}"))?;
+				let file = MappedFile::open(self.storage, String::from(library_path(name)?))?;
 				let bytes = file.bytes();
 				let elf = bootproto::elf::Elf::parse(bytes)?;
 				if elf.image_type != bootproto::elf::ET_DYN {

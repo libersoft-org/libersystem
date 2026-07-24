@@ -105,6 +105,7 @@ struct ManifestRow {
 	crate_dir: String,
 	crate_path: String,
 	stage: String,
+	destination: Option<String>,
 	features: Option<String>,
 	providers: Vec<String>,
 }
@@ -138,6 +139,7 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 		sources.push((owner, crate_path));
 	}
 	let mut rows: Vec<ManifestRow> = Vec::new();
+	let mut library_destinations: Vec<String> = Vec::new();
 	for line in text.lines() {
 		let trimmed: &str = line.trim();
 		if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -152,6 +154,7 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 		let crate_dir: String = fields.next().expect("manifest row missing crate").to_string();
 		let crate_path: String = if crate_dir == "-" { String::new() } else { sources.iter().find(|(owner, _)| owner == &crate_dir).unwrap_or_else(|| panic!("manifest row {name} names undeclared source owner {crate_dir}")).1.clone() };
 		let stage: String = fields.next().expect("manifest row missing stage").to_string();
+		let destination = (kind == "library").then(|| fields.next().expect("library manifest row missing destination path").to_string());
 		let features = (kind == "library").then(|| fields.next().expect("library manifest row missing feature set").to_string());
 		let providers: Vec<String> = if kind == "dynamic-service" {
 			fields.by_ref().find(|field| *field == "--").expect("dynamic-service row missing -- separator");
@@ -159,9 +162,40 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 		} else {
 			fields.map(String::from).collect()
 		};
-		rows.push(ManifestRow { kind, name, crate_dir, crate_path, stage, features, providers });
+		if let Some(path) = destination.as_deref() {
+			let category: &str = if let Some(relative) = crate_path.strip_prefix("user/libs/") {
+				let (category, leaf) = relative.split_once('/').unwrap_or_else(|| panic!("library {name} source path has no category: {crate_path}"));
+				assert!(leaf == crate_dir && !category.is_empty() && !category.contains('/'), "library {name} source path drifts from owner {crate_dir}: {crate_path}");
+				category
+			} else {
+				match (name.as_str(), crate_dir.as_str(), crate_path.as_str()) {
+					("lsrt", "rt", "user/runtime/rt") => "runtime",
+					("wire", "wire", "wire") => "ipc",
+					("wasm", "wasm", "wasm") => "component",
+					("term", "term", "term") => "terminal",
+					("service-util", "services", "user/services/core") => "service",
+					_ => panic!("library {name} has no ownership category for {crate_dir} at {crate_path}"),
+				}
+			};
+			let expected = format!("lib/{category}/{name}.lslib");
+			assert!(path == expected, "library {name} has non-canonical destination {path:?}, expected {expected:?}");
+			assert!(!library_destinations.iter().any(|known| known == path), "duplicate library destination {path}");
+			library_destinations.push(path.to_string());
+		}
+		rows.push(ManifestRow { kind, name, crate_dir, crate_path, stage, destination, features, providers });
 	}
 	rows
+}
+
+fn generate_test_library_paths(rows: &[ManifestRow]) {
+	let mut arms = String::new();
+	for row in rows.iter().filter(|row| row.kind == "library" && row.stage == "volume") {
+		let destination = row.destination.as_deref().expect("library destination");
+		arms.push_str(&format!("\t\"{}.lslib\" => Some(\"{}\"),\n", row.name, destination));
+	}
+	let source = format!("// @generated from user/services/manifest.txt by build.rs - do not edit.\nfn test_library_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{arms}\t\t_ => None,\n\t}}\n}}\n");
+	let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+	fs::write(out_dir.join("library_paths.rs"), source).expect("write test library paths");
 }
 
 fn valid_library_name(name: &str) -> bool {
@@ -256,8 +290,8 @@ fn user_elf_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
 	manifest.join(format!("../../.build/cargo/user/{}/debug/{name}", user_target()))
 }
 
-fn user_shared_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
-	manifest.join(format!("../../.build/system-image/{}/lib/{name}.lslib", user_target()))
+fn user_shared_path(manifest: &Path, destination: &str) -> PathBuf {
+	manifest.join(format!("../../.build/system-image/{}/{}", user_target(), destination))
 }
 
 fn user_dynamic_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
@@ -295,7 +329,7 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 		.iter()
 		.map(|provider| {
 			let provider_row = libraries.iter().find(|candidate| candidate.name == *provider).unwrap_or_else(|| panic!("{} identity names unknown provider {provider}", row.name));
-			let provider_artifact = user_shared_path(&PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")), &provider_row.crate_path, provider);
+			let provider_artifact = user_shared_path(&PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")), provider_row.destination.as_deref().expect("provider destination"));
 			format!("provider={provider}:{}", sha256_hex(&identity_record(&provider_artifact)))
 		})
 		.collect();
@@ -477,9 +511,10 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	}
 
 	let rows = read_manifest(&manifest);
+	generate_test_library_paths(&rows);
 	let library_rows: Vec<ManifestRow> = rows.iter().filter(|row| row.kind == "library" && row.stage == "volume").cloned().collect();
 	let lsrt_row = library_rows.iter().find(|row| row.name == "lsrt").expect("lsrt library row");
-	let lsrt_artifact = user_shared_path(&manifest, &lsrt_row.crate_path, &lsrt_row.name);
+	let lsrt_artifact = user_shared_path(&manifest, lsrt_row.destination.as_deref().expect("lsrt destination"));
 	let lsrt_identity = identity_record(&lsrt_artifact);
 	let expected_rustc_commit = core::str::from_utf8(&lsrt_identity).expect("lsrt identity record is UTF-8").lines().find_map(|line| line.strip_prefix("rustc-commit=")).expect("lsrt rustc identity").to_string();
 	assert!(expected_rustc_commit.len() == 40 && expected_rustc_commit.bytes().all(|byte| byte.is_ascii_hexdigit()), "lsrt rustc identity is malformed");
@@ -499,12 +534,12 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		}
 		let dest: String = match row.kind.as_str() {
 			"driver" if row.stage == "volume" => format!("drivers/{}", executable_artifact_name(&row.name)),
-			"library" if row.stage == "volume" => format!("lib/{}.lslib", row.name),
+			"library" if row.stage == "volume" => row.destination.clone().expect("library destination"),
 			"dynamic" | "dynamic-service" if row.stage == "volume" => format!("bin/{}", executable_artifact_name(&row.name)),
 			_ => continue,
 		};
 		let path: PathBuf = match row.kind.as_str() {
-			"library" => user_shared_path(&manifest, &row.crate_path, &row.name),
+			"library" => user_shared_path(&manifest, row.destination.as_deref().expect("library destination")),
 			"dynamic" | "dynamic-service" => user_dynamic_path(&manifest, &row.crate_path, &row.name),
 			_ => user_elf_path(&manifest, &row.crate_path, &row.name),
 		};
@@ -544,7 +579,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 }
 
 // Serialize a boot package: an 8-byte magic, a u32 entry count and a reserved
-// u32, then one 40-byte entry per file (a 32-byte NUL-padded name, a u32 absolute
+// u32, then one 72-byte entry per file (a 64-byte NUL-padded name, a u32 absolute
 // byte offset and a u32 size), then the concatenated file blobs. All integers are
 // little-endian. Must match the parser in src/kernel/pkg.rs.
 fn build_package(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
