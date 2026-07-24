@@ -2,6 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+build_root="$root/../.build"
 manifest="$root/user/services/manifest.txt"
 mode="${1:-quick}"
 output="$(mktemp)"
@@ -13,8 +14,8 @@ source_path() {
 }
 
 command -v flock >/dev/null
-mkdir -p "$root/boot/.build"
-exec 8>"$root/boot/.build/image-build-x86_64-unknown-none.lock"
+mkdir -p "$build_root"
+exec 8>"$build_root/image-build-x86_64-unknown-none.lock"
 flock 8
 
 cleanup() {
@@ -59,8 +60,8 @@ prime_graph() {
 case "$mode" in
 quick)
 	prime_graph
-	order_file="$root/boot/.build/system-image/x86_64-unknown-none/bin/echo.order"
-	order_cache="$root/boot/.build/image-artifacts-x86_64-unknown-none/executable-echo.order.sha256"
+	order_file="$build_root/system-image/x86_64-unknown-none/bin/echo.order"
+	order_cache="$build_root/image-artifacts-x86_64-unknown-none/executable-echo.order.sha256"
 	rm -f "$order_cache"
 	run_graph
 	expect_only_misses provider
@@ -76,7 +77,7 @@ quick)
 		echo "shared-cache-check: corrupt echo order did not reuse its content-addressed object" >&2
 		exit 1
 	fi
-	rm -f "$root/boot/.build/image-artifacts-x86_64-unknown-none/executable-echo.build-key"
+	rm -f "$build_root/image-artifacts-x86_64-unknown-none/executable-echo.build-key"
 	run_graph
 	expect_only_misses executable echo
 	run_graph

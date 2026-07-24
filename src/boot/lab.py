@@ -57,7 +57,8 @@ Usage (via `just lab ...` from src/, or boot/lab.py directly):
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.dirname(HERE)
-BUILD = os.path.join(HERE, '.build')
+REPO = os.path.dirname(SRC)
+BUILD = os.path.join(REPO, '.build', 'boot')
 SERIAL_SOCK = os.path.join(BUILD, 'lab-serial.sock')
 CTL_SOCK = os.path.join(BUILD, 'lab-ctl.sock')
 SERIAL_LOG = os.path.join(BUILD, 'lab-serial.log')

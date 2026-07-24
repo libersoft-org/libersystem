@@ -2,6 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+build_root="$root/../.build"
 manifest="$root/user/services/manifest.txt"
 report="$root/../docs/DYNAMIC_EXECUTABLES.tsv"
 wave_report="$root/../docs/DYNAMIC_WAVES.tsv"
@@ -71,7 +72,7 @@ fi
 library_file() {
 	local target="$1"
 	local provider="$2"
-	printf '%s/boot/.build/system-image/%s/lib/%s.lslib\n' "$root" "$target" "$provider"
+	printf '%s/system-image/%s/lib/%s.lslib\n' "$build_root" "$target" "$provider"
 }
 
 canonical_manifest_order() {
@@ -145,7 +146,7 @@ immutable_load_bytes() {
 current_object_bytes() {
 	local target="$1"
 	local tool="$2"
-	local directory="$root/boot/.build/image-artifacts-$target"
+	local directory="$build_root/image-artifacts-$target"
 	local reference="$directory/executable-$tool.object"
 	local key file expected_hash expected_bytes object prefix actual_hash definitions
 	local -a record=()
@@ -280,7 +281,7 @@ generate_report() {
 			for tool in $(for candidate in "${!waves[@]}"; do if [[ "${waves[$candidate]}" == "$wave" ]]; then printf '%s\n' "$candidate"; fi; done | sort); do
 				row="$(awk -v tool="$tool" '$1 == "dynamic" && $2 == tool && $3 == "tools" && $4 == "volume" {print; count++} END {if (count != 1) exit 1}' "$manifest")"
 				providers="$(cut -d' ' -f5- <<<"$(tr -s ' ' <<<"$row")")"
-				artifact="$root/boot/.build/system-image/$target/bin/$tool"
+				artifact="$build_root/system-image/$target/bin/$tool"
 				order="$artifact.order"
 				[[ -f "$artifact" && -f "$order" ]] || {
 					echo "dynamic-report: missing $target artifact or order for $tool" >&2

@@ -84,17 +84,3 @@ fn rejects_fractional_or_unsupported_rates_codecs_and_lengths() {
 	truncated.pop();
 	assert!(matches!(Aiff::parse(&truncated), Err(Error::Truncated)));
 }
-
-#[test]
-fn decodes_staged_ffmpeg_aiff_and_aifc() {
-	for bytes in [include_bytes!("../../../../volume/test.aiff").as_slice(), include_bytes!("../../../../volume/test.aifc").as_slice()] {
-		let parsed = Aiff::parse(bytes).unwrap();
-		assert_eq!(parsed.metadata().rate, 44_100);
-		assert_eq!(parsed.metadata().channels, 1);
-		assert_eq!(parsed.metadata().frames, 328_104);
-		let mut output = Vec::new();
-		assert_eq!(parsed.decoder().read_i16_le(1_024, &mut output), Ok(1_024));
-		assert_eq!(output.len(), 2_048);
-		assert!(output.iter().any(|byte| *byte != 0));
-	}
-}

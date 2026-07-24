@@ -6,7 +6,7 @@ target/
 **/target/
 *.rs.bk
 
-# Bootloader / ISO build output (src/boot/.build)
+# Repository build output
 .build/
 
 # Build artifacts
@@ -40,5 +40,3 @@ target/
 .DS_Store
 Thumbs.db
 desktop.ini
-# Component SDK build artifact staged into the ramdisk volume (built by `just sdk`)
-src/volume/app.wasm

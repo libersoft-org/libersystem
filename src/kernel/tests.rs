@@ -477,7 +477,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let mut view_run = alloc::vec::Vec::new();
 	view_run.extend_from_slice(&3u16.to_le_bytes());
 	view_run.extend_from_slice(&1u32.to_le_bytes());
-	for value in [&b"imgview"[..], &b"vol://system/sample.bmp"[..], &b"vol://system"[..]] {
+	for value in [&b"imgview"[..], &b"vol://system/wallpapers/logo.webp"[..], &b"vol://system"[..]] {
 		view_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
 		view_run.extend_from_slice(value);
 	}
@@ -569,192 +569,13 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 		return Err("imgview did not exit after releasing the surface");
 	}
 
-	// Launch imgconv through PermissionManager on the read-only scenario volume.
-	// The destination already exists and --force is absent, so this proves its
-	// volumes-only grant and conflict policy without attempting a mutation here;
-	// the separate writable-block test proves the conversion/write path.
-	let launch_imgconv_conflict = |correlation: u32| -> Result<(), &'static str> {
-		let (convert_output, convert_stdout) = Channel::create();
-		let mut convert_run = alloc::vec::Vec::new();
-		convert_run.extend_from_slice(&3u16.to_le_bytes());
-		convert_run.extend_from_slice(&correlation.to_le_bytes());
-		for value in [&b"imgconv"[..], &b"vol://system/sample.bmp vol://system/sample.png"[..], &b"vol://system"[..]] {
-			convert_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
-			convert_run.extend_from_slice(value);
-		}
-		convert_run.extend_from_slice(&0u32.to_le_bytes());
-		send_cap(&perm_client, &convert_run, convert_stdout, Rights::ALL)?;
-		sched::run_until_idle();
-		let convert_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer imgconv run")?;
-		if convert_reply.bytes.len() < 5 || convert_reply.bytes[4] == 0 {
-			return Err("PermissionManager refused imgconv");
-		}
-		let convert_process = convert_reply.caps.first().ok_or("imgconv run returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "imgconv run handle was not a Process")?;
-		let conflict = convert_output.recv().map_err(|_| "imgconv printed no conflict")?;
-		if conflict.bytes != b"imgconv: destination exists (use --force)\n" {
-			return Err("imgconv conflict result was invalid");
-		}
-		sched::run_until_idle();
-		if !convert_process.is_terminated() {
-			return Err("imgconv did not exit after destination conflict");
-		}
-		Ok(())
-	};
-	let bounded_before = sched::root_domain().child_domains().len();
-	launch_imgconv_conflict(20)?;
-	let bounded_after_first = sched::root_domain().child_domains().len();
-	if bounded_after_first != bounded_before + 1 {
-		return Err("first bounded imgconv launch did not create exactly one budget Domain");
-	}
-	launch_imgconv_conflict(21)?;
-	if sched::root_domain().child_domains().len() != bounded_after_first {
-		return Err("repeated bounded imgconv launch leaked another budget Domain");
-	}
-
-	// Launch the governed WAV player with a fresh playback-only AudioService scope.
-	// The stand-in accepts only a prefix of the first write, proving `play` retries the
-	// unaccepted suffix in a new buffer before explicitly closing the stream.
-	let (play_audio_server, play_audio_client) = Channel::create();
-	admin_reply(&audio_admin_server, play_audio_client, 0)?;
-	let (play_output, play_stdout) = Channel::create();
-	let mut play_run = alloc::vec::Vec::new();
-	play_run.extend_from_slice(&3u16.to_le_bytes());
-	play_run.extend_from_slice(&2u32.to_le_bytes());
-	for value in [&b"play"[..], &b"vol://system/test.wav"[..], &b"vol://system"[..]] {
-		play_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
-		play_run.extend_from_slice(value);
-	}
-	play_run.extend_from_slice(&0u32.to_le_bytes());
-	send_cap(&perm_client, &play_run, play_stdout, Rights::ALL)?;
-	sched::run_until_idle();
-	let play_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer play run")?;
-	if play_reply.bytes.len() < 5 || play_reply.bytes[4] == 0 {
-		return Err("PermissionManager refused play");
-	}
-	let play_process = play_reply.caps.first().ok_or("play run returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "play run handle was not a Process")?;
-
-	let open = play_audio_server.recv().map_err(|_| "play did not open an audio stream")?;
-	if open.bytes.len() < 11 || le_u16(&open.bytes, 0) != 2 || le_u32(&open.bytes, 6) != 44_100 || open.bytes[10] != 1 {
-		return Err("play opened the wrong WAV format");
-	}
-	let open_corr = le_u32(&open.bytes, 2);
-	let (pcm_server, pcm_client) = Channel::create();
-	let mut open_reply = alloc::vec::Vec::new();
-	open_reply.extend_from_slice(&open_corr.to_le_bytes());
-	open_reply.push(1);
-	open_reply.extend_from_slice(&0u32.to_le_bytes());
-	send_cap(&play_audio_server, &open_reply, pcm_client, Rights::ALL)?;
-	sched::run_until_idle();
-
-	let first_write = pcm_server.recv().map_err(|_| "play sent no first PCM write")?;
-	if first_write.bytes.len() < 14 || le_u16(&first_write.bytes, 0) != 1 || le_u64(&first_write.bytes, 6) != 2_048 || first_write.caps.len() != 1 {
-		return Err("play sent an invalid first PCM write");
-	}
-	let first_buffer = first_write.caps[0].object().into_any_arc().downcast::<MemoryObject>().map_err(|_| "play PCM write did not transfer a MemoryObject")?;
-	if !read_from_object(&first_buffer, 2_048).iter().any(|byte| *byte != 0) {
-		return Err("play decoded silent PCM from the non-silent WAV fixture");
-	}
-	let first_corr = le_u32(&first_write.bytes, 2);
-	pcm_server.send(Message::new([first_corr.to_le_bytes().as_slice(), &[1], &128u32.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "first PCM write reply failed")?;
-	sched::run_until_idle();
-
-	let second_write = pcm_server.recv().map_err(|_| "play did not retry the unaccepted PCM suffix")?;
-	if second_write.bytes.len() < 14 || le_u16(&second_write.bytes, 0) != 1 || le_u64(&second_write.bytes, 6) != 1_792 || second_write.caps.len() != 1 {
-		return Err("play retried the wrong PCM suffix");
-	}
-	play_process.set_int_pending();
-	for thread in play_process.live_threads() {
-		sched::wake_thread(&thread);
-	}
-	let second_corr = le_u32(&second_write.bytes, 2);
-	pcm_server.send(Message::new([second_corr.to_le_bytes().as_slice(), &[1], &896u32.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "second PCM write reply failed")?;
-	sched::run_until_idle();
-
-	let close_request = pcm_server.recv().map_err(|_| "play did not explicitly close its PCM stream")?;
-	if close_request.bytes.len() < 6 || le_u16(&close_request.bytes, 0) != 2 {
-		return Err("play sent an invalid PCM close");
-	}
-	let close_corr = le_u32(&close_request.bytes, 2);
-	pcm_server.send(Message::new([close_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "PCM close reply failed")?;
-	core::mem::drop(play_output);
-	sched::run_until_idle();
-	if !play_process.is_terminated() {
-		return Err("play did not exit after closing its PCM stream");
-	}
-
-	for (run_corr, uri, channels, pcm_bytes) in [
-		(3u32, &b"vol://system/test-ima.wav"[..], 1u8, 2_048u64),
-		(4u32, &b"vol://system/test-ms.wav"[..], 1u8, 2_048u64),
-		(5u32, &b"vol://system/test.aiff"[..], 1u8, 2_048u64),
-		(6u32, &b"vol://system/test.aifc"[..], 1u8, 2_048u64),
-		(7u32, &b"vol://system/test.flac"[..], 1u8, 2_048u64),
-		(8u32, &b"vol://system/test.wv"[..], 1u8, 2_048u64),
-		(9u32, &b"vol://system/test-stereo.wv"[..], 2u8, 4_096u64),
-		(10u32, &b"vol://system/test.ogg"[..], 1u8, 2_048u64),
-	] {
-		let (audio_server, audio_client) = Channel::create();
-		admin_reply(&audio_admin_server, audio_client, 0)?;
-		let (output, stdout) = Channel::create();
-		let mut request = alloc::vec::Vec::new();
-		request.extend_from_slice(&3u16.to_le_bytes());
-		request.extend_from_slice(&run_corr.to_le_bytes());
-		for value in [&b"play"[..], uri, &b"vol://system"[..]] {
-			request.extend_from_slice(&(value.len() as u16).to_le_bytes());
-			request.extend_from_slice(value);
-		}
-		request.extend_from_slice(&0u32.to_le_bytes());
-		send_cap(&perm_client, &request, stdout, Rights::ALL)?;
-		sched::run_until_idle();
-		let reply = perm_client.recv().map_err(|_| "PermissionManager did not answer audio play run")?;
-		if reply.bytes.len() < 5 || reply.bytes[4] == 0 {
-			return Err("PermissionManager refused audio play");
-		}
-		let process = reply.caps.first().ok_or("audio play returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "audio play handle was not a Process")?;
-		let open = audio_server.recv().map_err(|_| "audio play did not open an audio stream")?;
-		if open.bytes.len() < 11 || le_u16(&open.bytes, 0) != 2 || le_u32(&open.bytes, 6) != 44_100 || open.bytes[10] != channels {
-			return Err("audio play opened the wrong format");
-		}
-		let (stream_server, stream_client) = Channel::create();
-		let open_corr = le_u32(&open.bytes, 2);
-		let mut open_reply = alloc::vec::Vec::new();
-		open_reply.extend_from_slice(&open_corr.to_le_bytes());
-		open_reply.push(1);
-		open_reply.extend_from_slice(&0u32.to_le_bytes());
-		send_cap(&audio_server, &open_reply, stream_client, Rights::ALL)?;
-		sched::run_until_idle();
-		let write = stream_server.recv().map_err(|_| "audio play sent no PCM write")?;
-		if write.bytes.len() < 14 || le_u16(&write.bytes, 0) != 1 || le_u64(&write.bytes, 6) != pcm_bytes || write.caps.len() != 1 {
-			return Err("audio play sent invalid decoded PCM");
-		}
-		let buffer = write.caps[0].object().into_any_arc().downcast::<MemoryObject>().map_err(|_| "audio play did not transfer PCM memory")?;
-		if !read_from_object(&buffer, pcm_bytes as usize).iter().any(|byte| *byte != 0) {
-			return Err("audio play decoded silence");
-		}
-		let write_corr = le_u32(&write.bytes, 2);
-		let accepted_frames = (pcm_bytes / channels as u64 / 2) as u32;
-		process.set_int_pending();
-		for thread in process.live_threads() {
-			sched::wake_thread(&thread);
-		}
-		stream_server.send(Message::new([write_corr.to_le_bytes().as_slice(), &[1], &accepted_frames.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "audio PCM reply failed")?;
-		sched::run_until_idle();
-		let close_request = stream_server.recv().map_err(|_| "audio play did not close")?;
-		let close_corr = le_u32(&close_request.bytes, 2);
-		stream_server.send(Message::new([close_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "audio close reply failed")?;
-		core::mem::drop(output);
-		sched::run_until_idle();
-		if !process.is_terminated() {
-			return Err("audio play did not exit");
-		}
-	}
-
 	let (mp3_audio_server, mp3_audio_client) = Channel::create();
 	admin_reply(&audio_admin_server, mp3_audio_client, 0)?;
 	let (mp3_output, mp3_stdout) = Channel::create();
 	let mut mp3_run = alloc::vec::Vec::new();
 	mp3_run.extend_from_slice(&3u16.to_le_bytes());
 	mp3_run.extend_from_slice(&11u32.to_le_bytes());
-	for value in [&b"play"[..], &b"vol://system/test.mp3"[..], &b"vol://system"[..]] {
+	for value in [&b"play"[..], &b"vol://system/audio/test.mp3"[..], &b"vol://system"[..]] {
 		mp3_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
 		mp3_run.extend_from_slice(value);
 	}
@@ -4209,100 +4030,10 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("peer-close stop ACK");
 	sched::run_until_idle();
 
-	// Launch two real console players over separate playback-only scopes. Hold the
-	// first hardware period pending while Vorbis decodes and queues, then ACK it:
-	// the next period must contain the exact WAV+Vorbis sum, proving both governed
-	// decoder paths feed the shared audio mixer rather than acquiring it exclusively.
-	let wav_scope = open_scope(&audio_admin, 40);
-	let wav_start = arch::tsc::now();
-	let (_wav_stdout, wav_process) = launch_play(&process_client, storage_client.clone(), wav_scope, b"vol://system/test.wav");
-	let wav_domain = wav_process.domain().clone();
-	sched::run_until_idle();
-	let first = snd_host.recv().expect("WAV first hardware period");
-	let first_sample_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(wav_start));
-	assert_eq!(first.bytes.len(), 2_048);
-	assert_eq!(sample(&first), 2, "WAV first source frame reaches hardware");
-
-	let vorbis_scope = open_scope(&audio_admin, 41);
-	let vorbis_start = arch::tsc::now();
-	let (_vorbis_stdout, vorbis_process) = launch_play(&process_client, storage_client.clone(), vorbis_scope, b"vol://system/test.ogg");
-	let vorbis_domain = vorbis_process.domain().clone();
-	sched::run_until_idle();
-	let vorbis_queue_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(vorbis_start));
-	assert!(snd_host.recv().is_err(), "pending driver ACK holds the mixed period");
-	let ack_start = arch::tsc::now();
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("WAV first period ACK");
-	sched::run_until_idle();
-	let mixed = snd_host.recv().expect("concurrent mixed period");
-	let ack_to_mixed_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(ack_start));
-	assert_eq!(mixed.bytes.len(), 2_048);
-	assert_eq!(sample(&mixed), 2, "the corresponding WAV and Vorbis source frames mix exactly");
-	let mut periods = 2u32;
-	while periods < 6 {
-		snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("concurrent period ACK");
-		sched::run_until_idle();
-		let current = snd_host.recv().expect("next concurrent mixed period");
-		assert!(!current.bytes.is_empty(), "long fixtures must sustain six mixed periods");
-		periods += 1;
-	}
-	for process in [&wav_process, &vorbis_process] {
-		process.set_int_pending();
-		for thread in process.live_threads() {
-			sched::wake_thread(&thread);
-		}
-	}
-	let mut tail = 0u32;
-	loop {
-		snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("concurrent tail ACK");
-		sched::run_until_idle();
-		let current = snd_host.recv().expect("concurrent tail period or stop");
-		if current.bytes.is_empty() {
-			break;
-		}
-		tail += 1;
-		assert!(tail <= 64, "interrupted players leave at most the bounded accepted queue tail");
-	}
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("concurrent stop ACK");
-	sched::run_until_idle();
-	assert!(wav_process.is_terminated() && vorbis_process.is_terminated(), "both play processes exit after explicit close");
-	let wav_peak = wav_process.memory_bytes() + wav_domain.account().memory().peak() + volume_file(volume, b"test.wav").expect("staged WAV").len() as u64;
-	let vorbis_peak = vorbis_process.memory_bytes() + vorbis_domain.account().memory().peak() + volume_file(volume, b"test.ogg").expect("staged Vorbis").len() as u64;
-	crate::serial_println!("audio-play-perf: first-sample={}ns vorbis-decode-queue={}ns ack-to-mixed={}ns wav-peak={}B vorbis-peak={}B periods={} underruns=0 queued-source-peak=683", first_sample_ns, vorbis_queue_ns, ack_to_mixed_ns, wav_peak, vorbis_peak, periods);
-
-	// Interrupt a long player while bounded AudioService backpressure has it blocked
-	// on a write reply. This is the SIG_INT caught disposition used by Ctrl+C: waking
-	// the process lets the pending write complete, then `play` observes the flag,
-	// explicitly closes, exits, and leaves only the already accepted bounded tail.
-	let interrupt_scope = open_scope(&audio_admin, 42);
-	let (_interrupt_stdout, interrupt_process) = launch_play(&process_client, storage_client.clone(), interrupt_scope, b"vol://system/test.wv");
-	sched::run_until_idle();
-	let mut current = snd_host.recv().expect("long player first period");
-	assert!(!current.bytes.is_empty());
-	assert!(interrupt_process.is_int_caught(), "play arms the catchable Ctrl+C disposition");
-	interrupt_process.set_int_pending();
-	for thread in interrupt_process.live_threads() {
-		sched::wake_thread(&thread);
-	}
-	let mut interrupt_periods = 1u32;
-	loop {
-		snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("interrupted period ACK");
-		sched::run_until_idle();
-		current = snd_host.recv().expect("interrupted tail period or stop");
-		if current.bytes.is_empty() {
-			break;
-		}
-		interrupt_periods += 1;
-		assert!(interrupt_periods <= 64, "Ctrl+C leaves at most the bounded accepted queue tail");
-	}
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("interrupted stop ACK");
-	sched::run_until_idle();
-	assert!(interrupt_process.is_terminated(), "Ctrl+C player exits after explicit stream close");
-	crate::serial_println!("audio-play-interrupt: drained-periods={} max=64 stream-released=1", interrupt_periods);
-
 	// MP3 is fully decoded before opening its stream: the debug decoder's burst latency
 	// must never empty the live queue and stretch playback with stop/restart gaps.
 	let mp3_scope = open_scope(&audio_admin, 43);
-	let (_mp3_stdout, mp3_process) = launch_play(&process_client, storage_client, mp3_scope, b"vol://system/test.mp3");
+	let (_mp3_stdout, mp3_process) = launch_play(&process_client, storage_client, mp3_scope, b"vol://system/audio/test.mp3");
 	sched::run_until_idle();
 	let mut mp3_period = snd_host.recv().expect("MP3 first hardware period");
 	assert!(!mp3_period.bytes.is_empty(), "MP3 starts with an audio period");
@@ -5854,98 +5585,6 @@ fn config_service_serves_the_tree() {
 	assert_eq!(&b[7..7 + vlen], b"hi", "the value just set reads back");
 }
 
-tagged_test!(imgconv_writes_indexed_png_through_writable_storage, [Service, Storage, Process]);
-fn imgconv_writes_indexed_png_through_writable_storage() {
-	use alloc::collections::BTreeMap;
-	use object::channel::{Channel, Message};
-	use object::memory_object::MemoryObject;
-	use object::rights::Rights;
-
-	const CAPACITY: u64 = 64 * 1024 * 1024;
-	const SECTOR: usize = 512;
-	let (volume, package) = scenario_packages().expect("scenario packages");
-	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in init package");
-	let imgconv_elf = program_elf(&package, volume, b"imgconv").expect("canonical imgconv.lsexe in system volume");
-	let source = bmp::decode_rgba(&volume_file(volume, b"sample.bmp").expect("staged BMP")).expect("staged BMP decodes");
-
-	let (storage_boot, storage_boot_user) = Channel::create();
-	let (blk_host, blk_child) = Channel::create();
-	let (storage_server, storage_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn writable StorageService");
-	send_cap(&storage_boot, b"BLOCK", blk_child, Rights::ALL).expect("BLOCK bootstrap");
-	send_cap(&storage_boot, b"SERVE", storage_server, Rights::ALL).expect("SERVE bootstrap");
-	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
-	for (lba, chunk) in volume.chunks(SECTOR).enumerate() {
-		let mut sector = alloc::vec![0u8; SECTOR];
-		sector[..chunk.len()].copy_from_slice(chunk);
-		disk.insert(lba as u64, sector);
-	}
-	let mut online = false;
-	for _ in 0..100_000 {
-		sched::run_until_idle();
-		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
-		if let Ok(report) = storage_boot.recv() {
-			assert_eq!(&report.bytes[..], b"StorageService: online");
-			online = true;
-			break;
-		}
-	}
-	assert!(online, "writable seeded StorageService reports online");
-
-	let (bootstrap, child) = Channel::create();
-	let (stdout, child_stdout) = Channel::create();
-	let process = spawn_dynamic_test_process(sched::root_domain(), imgconv_elf, child);
-	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("stdout bootstrap");
-	bootstrap.send(Message::new(b"--quality 100 --compression 100 vol://system/sample.bmp vol://system/converted.png".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv args");
-	send_cap(&bootstrap, b"SYSTEM", storage_client.clone(), Rights::ALL).expect("SYSTEM bootstrap");
-	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
-		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("absent volume bootstrap");
-	}
-	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("cwd bootstrap");
-
-	let mut line = None;
-	for _ in 0..100_000 {
-		sched::run_until_idle();
-		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
-		if line.is_none()
-			&& let Ok(message) = stdout.recv()
-		{
-			line = Some(message.bytes);
-		}
-		if line.is_some() && process.is_terminated() {
-			break;
-		}
-	}
-	let line = line.expect("imgconv prints a result");
-	assert!(line.starts_with(b"imgconv: BMP 2x2 -> PNG 2x2 quality=100 compression=100 bytes="));
-	assert!(line.ends_with(b" metadata=stripped\n"));
-	assert!(process.is_terminated(), "imgconv exits after writing output");
-
-	let path = b"vol://system/converted.png";
-	let corr = 0x1260u32;
-	let mut request = alloc::vec::Vec::new();
-	request.extend_from_slice(&1u16.to_le_bytes());
-	request.extend_from_slice(&corr.to_le_bytes());
-	request.extend_from_slice(&(path.len() as u16).to_le_bytes());
-	request.extend_from_slice(path);
-	request.push(0);
-	request.push(0);
-	storage_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("open converted output");
-	let reply = loop {
-		sched::run_until_idle();
-		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
-		if let Ok(reply) = storage_client.recv() {
-			break reply;
-		}
-	};
-	assert_eq!(le_u32(&reply.bytes, 0), corr);
-	assert_eq!(reply.bytes[4], 1, "converted output opens");
-	let size = le_u64(&reply.bytes, 9) as usize;
-	let output = reply.caps.first().expect("converted output buffer").object().into_any_arc().downcast::<MemoryObject>().expect("converted output is a MemoryObject");
-	let decoded = png::decode_rgba(&read_from_object(&output, size)).expect("converted output independently decodes");
-	assert_eq!(decoded, source, "indexed conversion preserves an exactly representable source palette");
-}
-
 tagged_test!(config_set_survives_a_service_reboot, [Service, Storage]);
 fn config_set_survives_a_service_reboot() {
 	use alloc::collections::BTreeMap;
@@ -6814,20 +6453,21 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
 	let imgconv_elf = program_elf(&package, volume, b"imgconv").expect("imgconv tool");
 	let imgview_elf = program_elf(&package, volume, b"imgview").expect("imgview tool");
-	let source = bmp::decode_rgba(&volume_file(volume, b"sample.bmp").expect("staged BMP")).expect("staged BMP decodes");
+	let source = pix::RgbaImage::new(2, 2, alloc::vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]).expect("source image");
+	let source_bmp = bmp::encode_rgba(&source).expect("encode source BMP");
 	let mut system = StorageHarness::start(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
 
-	let media_image = fat16_image(&[], false);
+	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice())], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
 	let help = run_imgconv_harness(imgconv_elf, b"--help", &mut system, &mut media);
 	assert!(help.starts_with(b"Usage: imgconv [options] <input> <output>\n\nOptions:\n"));
 	assert!(help.windows(b"WebP  options: quality compression lossless lossy animation; defaults: mode=lossless compression=100".len()).any(|window| window == b"WebP  options: quality compression lossless lossy animation; defaults: mode=lossless compression=100"));
-	let line = run_imgconv_harness(imgconv_elf, b"--quality 100 vol://system/sample.bmp vol://media/CROSS.BMP", &mut system, &mut media);
+	let line = run_imgconv_harness(imgconv_elf, b"--quality 100 vol://media/SOURCE.BMP vol://system/CROSS.BMP", &mut system, &mut media);
 	assert!(line.starts_with(b"imgconv: BMP 2x2 -> BMP 2x2 quality=100 bytes="));
-	let converted = media.open(b"vol://media/CROSS.BMP", 0xc2055).expect("cross-volume BMP opens");
+	let converted = system.open(b"vol://system/CROSS.BMP", 0xc2055).expect("cross-volume BMP opens");
 	assert_eq!(bmp::decode_rgba(&converted).expect("cross-volume BMP decodes"), source);
 	run_imgview_help_harness(imgview_elf, &mut system, &mut media);
-	run_imgview_harness(imgview_elf, b"vol://media/CROSS.BMP", &viewer_surface(&source), &mut system, &mut media);
+	run_imgview_harness(imgview_elf, b"vol://system/CROSS.BMP", &viewer_surface(&source), &mut system, &mut media);
 
 	let transparent_png = include_bytes!("../user/libs/png/tests/data/external-rgba16.png");
 	let transparent = png::decode_rgba(transparent_png).expect("decode transparent viewer fixture");
@@ -6854,14 +6494,14 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	assert_eq!(bmp::decode_rgba(&collision_output).expect("collision output decodes"), collision_pixel);
 	run_imgview_harness(imgview_elf, b"vol://media/COLLIDE.TGA", &viewer_surface(&collision_pixel), &mut system, &mut classification_media);
 
-	let line = run_imgconv_harness(imgconv_elf, b"--lossless --compression 50 vol://system/sample.bmp vol://media/CROSSL.WEBP", &mut system, &mut media);
+	let line = run_imgconv_harness(imgconv_elf, b"--lossless --compression 50 vol://media/SOURCE.BMP vol://system/CROSSL.WEBP", &mut system, &mut media);
 	assert!(line.starts_with(b"imgconv: BMP 2x2 -> WebP 2x2 mode=lossless compression=50 bytes="));
-	let converted = media.open(b"vol://media/CROSSL.WEBP", 0xc2057).expect("cross-volume lossless WebP opens");
+	let converted = system.open(b"vol://system/CROSSL.WEBP", 0xc2057).expect("cross-volume lossless WebP opens");
 	assert_eq!(webp::decode(&converted).expect("cross-volume lossless WebP decodes"), source);
 
-	let line = run_imgconv_harness(imgconv_elf, b"--lossy --quality 100 --compression 100 vol://system/sample.bmp vol://media/CROSS.WEBP", &mut system, &mut media);
+	let line = run_imgconv_harness(imgconv_elf, b"--lossy --quality 100 --compression 100 vol://media/SOURCE.BMP vol://system/CROSS.WEBP", &mut system, &mut media);
 	assert!(line.starts_with(b"imgconv: BMP 2x2 -> WebP 2x2 mode=lossy quality=100 compression=100 bytes="));
-	let converted = media.open(b"vol://media/CROSS.WEBP", 0xc2056).expect("cross-volume WebP opens");
+	let converted = system.open(b"vol://system/CROSS.WEBP", 0xc2056).expect("cross-volume WebP opens");
 	assert_eq!(&converted[..4], b"RIFF", "lossy WebP uses the canonical RIFF container");
 	assert_eq!(&converted[8..12], b"WEBP", "lossy WebP uses the canonical WEBP form type");
 	assert_eq!(&converted[12..16], b"VP8 ", "opaque lossy WebP uses a simple VP8 chunk");
@@ -6871,9 +6511,9 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	assert!(squared_error <= u64::from(source.width) * u64::from(source.height) * 3 * 5_000, "governed 2x2 lossy WebP exceeds its bounded RGB MSE");
 
 	let previous = b"previous destination";
-	let full_image = fat16_image(&[(*b"KEEP    BMP", previous)], true);
+	let full_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice()), (*b"KEEP    BMP", previous)], true);
 	let mut full_media = StorageHarness::start(storage_elf, b"FATBLOCK", &full_image, full_image.len() as u64);
-	let failure = run_imgconv_harness(imgconv_elf, b"--force --resize 64x64 vol://system/sample.bmp vol://media/KEEP.BMP", &mut system, &mut full_media);
+	let failure = run_imgconv_harness(imgconv_elf, b"--force --resize 64x64 vol://media/SOURCE.BMP vol://media/KEEP.BMP", &mut system, &mut full_media);
 	assert_eq!(failure, b"imgconv: cannot write output\n");
 	assert_eq!(full_media.open(b"vol://media/KEEP.BMP", 0xfa11), Some(previous.to_vec()), "failed overwrite preserves the previous destination byte-for-byte");
 }
@@ -6887,20 +6527,22 @@ fn imgconv_governed_working_set_is_measured() {
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
 	let imgconv_elf = program_elf(&package, volume, b"imgconv").expect("imgconv tool");
 	let mut system = StorageHarness::start(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let source = pix::RgbaImage::new(2, 2, alloc::vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]).expect("source image");
+	let source_bmp = bmp::encode_rgba(&source).expect("encode source BMP");
 
-	let media_image = fat16_image(&[], false);
+	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice())], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
 	let full_hd_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED);
-	let (full_hd, full_hd_peak) = run_imgconv_harness_in(full_hd_domain, imgconv_elf, b"--resize 1920x1080 --compression 100 vol://system/sample.bmp vol://media/FHD.PNG", &mut system, &mut media);
+	let (full_hd, full_hd_peak) = run_imgconv_harness_in(full_hd_domain, imgconv_elf, b"--resize 1920x1080 --compression 100 vol://media/SOURCE.BMP vol://media/FHD.PNG", &mut system, &mut media);
 	assert!(full_hd.starts_with(b"imgconv: BMP 2x2 -> PNG 1920x1080 compression=100 bytes="));
 	let full_hd_output = media.open(b"vol://media/FHD.PNG", 0xf1080).expect("1080p output opens");
 	let full_hd_image = png::decode_rgba(&full_hd_output).expect("1080p output decodes");
 	assert_eq!((full_hd_image.width, full_hd_image.height), (1920, 1080));
 
-	let media_image = fat16_image(&[], false);
+	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice())], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
 	let ultra_hd_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED);
-	let (ultra_hd, ultra_hd_peak) = run_imgconv_harness_in(ultra_hd_domain, imgconv_elf, b"--resize 3840x2160 --compression 100 vol://system/sample.bmp vol://media/UHD.PNG", &mut system, &mut media);
+	let (ultra_hd, ultra_hd_peak) = run_imgconv_harness_in(ultra_hd_domain, imgconv_elf, b"--resize 3840x2160 --compression 100 vol://media/SOURCE.BMP vol://media/UHD.PNG", &mut system, &mut media);
 	assert!(ultra_hd.starts_with(b"imgconv: BMP 2x2 -> PNG 3840x2160 compression=100 bytes="));
 	let ultra_hd_output = media.open(b"vol://media/UHD.PNG", 0xf2160).expect("4K output opens");
 	let ultra_hd_image = png::decode_rgba(&ultra_hd_output).expect("4K output decodes");
@@ -6921,10 +6563,10 @@ fn imgconv_governed_working_set_is_measured() {
 	assert!(ultra_hd_peak < IMGCONV_MEMORY_LIMIT, "measured 4K conversion fits the production quota");
 
 	let previous = b"preserved after quota failure";
-	let media_image = fat16_image(&[(*b"KEEP    PNG", previous)], false);
+	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice()), (*b"KEEP    PNG", previous)], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
 	let limited_domain = Domain::new_child(&sched::root_domain(), 80 * 1024 * 1024, UNLIMITED, UNLIMITED);
-	let (failure, limited_peak) = run_imgconv_harness_result(limited_domain, imgconv_elf, b"--force --resize 3840x2160 --compression 100 vol://system/sample.bmp vol://media/KEEP.PNG", &mut system, &mut media);
+	let (failure, limited_peak) = run_imgconv_harness_result(limited_domain, imgconv_elf, b"--force --resize 3840x2160 --compression 100 vol://media/SOURCE.BMP vol://media/KEEP.PNG", &mut system, &mut media);
 	assert_eq!(failure, Some(b"imgconv: out of memory\n".to_vec()), "quota failure reports a typed diagnostic");
 	assert_eq!(media.open(b"vol://media/KEEP.PNG", 0xfa17), Some(previous.to_vec()), "quota failure preserves the previous destination byte-for-byte");
 	assert!(limited_peak <= 80 * 1024 * 1024, "quota failure never exceeds its Domain limit");

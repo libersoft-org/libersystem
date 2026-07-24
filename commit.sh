@@ -24,22 +24,12 @@ if command -v just >/dev/null 2>&1; then
 	(cd src && just fmt) || echo "commit.sh: 'just fmt' failed - committing without a fresh format pass"
 fi
 
-SOURCE_ARTIFACTS=$(find src -path 'src/boot/.build' -prune -o \( -type d \( -name target -o -name shared \) -o -type f \( -name '*.lslib' -o -name '*.lsexe' \) \) -print)
-if [ -n "$SOURCE_ARTIFACTS" ]; then
-	echo "ERROR: compiled artifacts are forbidden in the source tree:" >&2
-	echo "$SOURCE_ARTIFACTS" >&2
-	exit 1
-fi
+src/tools/check-source-hygiene.sh --current
 
 git status
 git add .
 
-TRACKED_ARTIFACTS=$(git ls-files | grep -E '\.(lslib|lsexe)$|(^|/)(target|shared)/' || true)
-if [ -n "$TRACKED_ARTIFACTS" ]; then
-	echo "ERROR: compiled artifacts are tracked by Git:" >&2
-	echo "$TRACKED_ARTIFACTS" >&2
-	exit 1
-fi
+src/tools/check-source-hygiene.sh --current
 
 git status
 

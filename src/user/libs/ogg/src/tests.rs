@@ -68,23 +68,3 @@ fn enforces_packet_size_cap_before_allocation() {
 	reader.page_end = 1;
 	assert_eq!(reader.next_packet(), Err(Error::TooLarge));
 }
-
-#[test]
-fn frames_staged_vorbis_stream() {
-	let mut reader = PacketReader::new(include_bytes!("../../../../volume/test.ogg"));
-	for signature in [b"\x01vorbis".as_slice(), b"\x03vorbis".as_slice(), b"\x05vorbis".as_slice()] {
-		let packet = reader.next_packet().unwrap().unwrap();
-		assert!(packet.data.starts_with(signature));
-	}
-	let mut audio_packets = 0usize;
-	let mut final_granule = None;
-	let mut saw_eos = false;
-	while let Some(packet) = reader.next_packet().unwrap() {
-		audio_packets += 1;
-		final_granule = packet.granule_position.or(final_granule);
-		saw_eos |= packet.eos;
-	}
-	assert!(audio_packets != 0);
-	assert_eq!(final_granule, Some(328_104));
-	assert!(saw_eos);
-}

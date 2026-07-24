@@ -137,10 +137,10 @@ fn rejects_crc_truncation_and_oversized_dimensions() {
 }
 
 #[test]
-fn staged_sample_image_is_a_valid_two_by_two_png() {
-	let image = decode(include_bytes!("../../../../volume/sample.png")).unwrap();
-	assert_eq!((image.width, image.height, image.pitch), (2, 2, 8));
-	assert_eq!(image.pixels.len(), 16);
+fn external_adam7_rgb_image_decodes() {
+	let image = decode(include_bytes!("../tests/data/external-adam7-rgb.png")).unwrap();
+	assert_eq!((image.width, image.height, image.pitch), (23, 15, 92));
+	assert_eq!(image.pixels.len(), 1_380);
 	assert!(image.pixels.iter().any(|byte| *byte != 0));
 }
 

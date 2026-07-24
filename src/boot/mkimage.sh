@@ -20,7 +20,7 @@
 #   STRIP=all              also drop the symbol table for the smallest image
 # Both only remove non-loadable sections, so booting is unaffected either way.
 #
-# The artifact is written to boot/.build/<product-slug>.{iso,img}; its path is
+# The artifact is written to .build/boot/<product-slug>.{iso,img}; its path is
 # printed to stdout (progress goes to stderr) so callers can capture it.
 
 set -euo pipefail
@@ -28,13 +28,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # The own UEFI loader's EFI binary, staged into the boot image as BOOTX64.EFI.
-LOADER_EFI="${LOADER_EFI:-$REPO_ROOT/src/loader/target/x86_64-unknown-uefi/debug/libersystem-loader.efi}"
+LOADER_EFI="${LOADER_EFI:-$REPO_ROOT/.build/cargo/loader/x86_64-unknown-uefi/debug/libersystem-loader.efi}"
 
 # product metadata (single source of truth)
 # shellcheck source=/dev/null
 source "$REPO_ROOT/product.conf"
 
-BUILD="$HERE/.build"
+BUILD="$REPO_ROOT/.build/boot"
 SLUG="$(echo "$PRODUCT_NAME" | tr '[:upper:]' '[:lower:]')"
 
 # operate on raw partition offsets without tripping mtools' geometry checks

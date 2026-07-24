@@ -4031,7 +4031,7 @@ few KiB with `DT_NEEDED` edges. The bulk is real duplicated code, not debug sect
     every invocation. Providers and executables have content-addressed source/provider/
     build-tool keys plus output hashes; a hit revalidates identity bytes and embedded note,
     ET_DYN, exact `DT_NEEDED`, W^X/dynamic tags and canonical order before reuse. Metadata
-    lives only under ignored `boot/.build`; `LIBER_IMAGE_REBUILD=1` and
+    lives only under the ignored repository-root `.build/`; `LIBER_IMAGE_REBUILD=1` and
     `just shared-libs-verify` force the original empty-cache compile/link/audit path.
     Keys include each executable's complete Cargo-resolved local dependency source closure
     while keeping sibling tool bins independent. The x86_64 no-change graph fell from
@@ -4549,15 +4549,15 @@ capability policy remain unchanged.
     volume drivers remain `drivers/<name>.lsexe`, and all 60 shared providers remain
     `lib/<name>.lslib`. The nine pinned launchers, services, probes and bootstrap block
     driver remain only in `init.pkg` and gain no system-volume copy.
-  - Frozen data inventory: `volume/app.wasm` moves to
-    `components/liber_component/app.wasm`. The other 14 factory files move unchanged by
-    basename into the flat `test/` directory: `hello.txt`, `motd.txt`, `sample.bmp`,
-    `sample.png`, `test.aifc`, `test.aiff`, `test.flac`, `test-ima.wav`, `test.mp3`,
-    `test-ms.wav`, `test.ogg`, `test-stereo.wv`, `test.wav` and `test.wv`. Runtime-created
-    `config.tree` moves from the volume root to `libexec/config_service/config.tree`;
-    LogService's `log/boot-<n>` journal location is unchanged. The target root therefore
-    contains only `bin/`, `libexec/`, `lib/`, `drivers/`, `components/`, `log/` and
-    `test/`.
+  - The subsequent factory-data cleanup supersedes the frozen data portion of the
+    inventory. The SDK build stages `app.wasm` directly into
+    `components/liber_component/app.wasm`; it is not copied through `src/volume`.
+    `sample.bmp`, `sample.png` and every audio file except MP3 are deleted rather than
+    moved or retained as factory test data. The source factory volume contains only
+    `hello.txt`, `motd.txt`, `audio/test.mp3` and `wallpapers/logo.webp`; codec tests use
+    owner-local corpora or generated data. Runtime-created `config.tree` moves from the
+    volume root to `libexec/config_service/config.tree`, while LogService's
+    `log/boot-<n>` journal location is unchanged.
   - Inventory validation counted 73 unique source crates and classified all 134
     volume-staged manifest rows exactly once: 48 commands, 20 internal executables, six
     drivers and 60 libraries. It also accounted for every one of the 15 loose factory
@@ -4600,12 +4600,29 @@ capability policy remain unchanged.
     `services/`, `drivers/`, `apps/` or `libs/`, with Cargo paths and manifest source
     rows updated while logical package and artifact identities remain unchanged. Shared
     providers, executables, identity records, order records and build logs are emitted
-    only below `src/boot/.build/system-image/<target>/`; no build output is written into
-    a crate directory. Repository-wide ignore rules cover `.lslib`, `.lsexe`, `shared/`
-    and `target/`, and the commit gate rejects either physical or tracked source-tree
-    artifacts. Remaining work is the complete three-architecture graph validation and
-    the permanent stale-path check.
-- [ ] Define the factory `vol://system` hierarchy so its root contains directories only:
+    only below the repository-root `.build/system-image/<target>/`; Cargo outputs use
+    `.build/cargo/<owner>/`, and boot/QEMU state uses `.build/boot/`. No build output is
+    written anywhere below `src/`. One source-hygiene gate rejects forbidden paths,
+    generated extensions and compiled binary content in the physical tree and Git index,
+    with a separate reachable-history mode. Complete x86_64, AArch64 and RISC-V image
+    builds each produce 60 providers and 68 consumers only below `.build/`, while the
+    source tree remains clean after concurrent cross-target builds. Reachable `main`
+    history was rewritten to remove the earlier `term`, `wasm` and `wire` build outputs;
+    the rewritten tip is byte-identical and the history gate reports zero generated
+    artifact paths. Remaining work is the permanent stale-source-path check.
+- [ ] Restore test ownership after the physical move and decompose the monolithic kernel
+  QEMU suite. Delete the trivial assertion; move the log record round-trip into the ABI
+  crate; move executable inventory, stdin capability and other metadata-only assertions
+  into manifest/build-graph checks; and add owner-crate host tests for pure application
+  and service parsing, rendering and state transitions. Split the remaining kernel QEMU
+  tests into thematic modules for kernel primitives, hardware, dynamic loading,
+  boot/packages, services and applications, with module-local `tests.rs` files where
+  production module resolution permits. Break compound process-service, audio and
+  permission scenarios into independently tagged cases. Keep ELF loading, ring-3,
+  capability, syscall, cross-service and hardware behavior as end-to-end QEMU tests, so
+  the ownership cleanup preserves the existing system-level coverage.
+- [ ] Define the factory `vol://system` hierarchy so its root contains only `hello.txt`,
+  `motd.txt` and the declared directories:
   - `bin/`: user-invoked `.lsexe` tools. A stateless single-file command may live
     directly here; an application/suite with private configuration, assets, logs or
     several executables owns one subdirectory containing its binaries and those files
@@ -4620,9 +4637,8 @@ capability policy remain unchanged.
   - `components/`: non-native Wasm/component payloads, with one owner directory for a
     payload plus its private files when needed;
   - `log/`: only the system-wide structured journal owned by LogService;
-  - `test/`: one flat directory for staged conformance/demo fixtures, including today's
-    `sample.*`, `hello.txt` and `motd.txt` files. Do not classify fixtures into nested
-    image/audio/text trees.
+  - `audio/`: the single factory MP3 demonstration file;
+  - `wallpapers/`: factory wallpapers, currently `logo.webp`.
   There is deliberately no `etc/`, `var/`, `share/` or other imported Unix hierarchy.
   Configuration and non-system logs belong to the program that owns them and live beside
   its binary in that program's artifact directory; only the machine-wide journal is the
@@ -4646,32 +4662,33 @@ capability policy remain unchanged.
   `libexec/config_service/config.tree`; LogService uses the root `log/` journal; shell
   completion advertises only user commands declared from `bin/`, including commands whose
   physical artifact is in an app subdirectory; tests, benchmarks, SDK staging and
-  documentation use the flat `test/` paths.
+  documentation use owner-local corpora or the explicit `audio/` and `wallpapers/`
+  factory paths.
   Do not leave silent root-level compatibility copies or path aliases in this
   pre-release tree: stale paths must fail so the migration is complete and auditable.
 - [ ] Add layout conformance gates. Host/build tests assert the exact generated volume
   entry classes, root contains no loose files, canonical names have one destination and
   no old paths remain. A writable-volume QEMU scenario boots from a freshly seeded disk,
   reaches the shell, launches one tool, one volume-loaded service, one component and one
-  driver from their new locations, reads several flat `test/` fixtures, persists
-  ConfigService's tree beside its binary and the system journal under `log/`, and reopens
-  both after service restart. It also proves an app-owned config/log cannot be opened by
-  an unrelated program without a grant to that app directory. Existing-disk policy must
-  be explicit before implementation (fresh pre-release rebuild versus an on-disk
-  migration) and tested rather than accidentally mounting stale layout data.
+  driver from their new locations, reads the factory text, MP3 and wallpaper files,
+  persists ConfigService's tree beside its binary and the system journal under `log/`,
+  and reopens both after service restart. It also proves an app-owned config/log cannot
+  be opened by an unrelated program without a grant to that app directory. Existing-disk
+  policy must be explicit before implementation (fresh pre-release rebuild versus an
+  on-disk migration) and tested rather than accidentally mounting stale layout data.
 - [ ] Run the full host suite, generated-artifact checks, package/staging audits, ELF
   SONAME/DT_NEEDED checks, and x86_64/aarch64/riscv64 userspace plus QEMU gates. Record
   before/after source and volume trees in the architecture/package documentation.
 - Done when: every Cargo crate below `src/user/` is under `runtime/`, `services/`,
   `drivers/`, `apps/` or `libs/`, with only explicitly inventoried shared build/toolchain
-  files allowed beside those directories; the system-volume root contains only the
-  declared directories and contains no `etc`, `var` or `share`; program-private config/
-  state/log files are colocated with their owning artifact, the root `log/` contains only
-  the system journal, and all fixtures are directly under `test/`; every build, runtime
-  and documentation path comes from one explicit manifest mapping; native internal ELFs
-  and non-native component payloads are not conflated; no logical crate or staged artifact
-  identity changed; no compatibility duplicate hides an old path; and clean tri-
-  architecture builds and governed boot/storage tests pass.
+  files allowed beside those directories; the system-volume root contains only
+  `hello.txt`, `motd.txt` and the declared directories and contains no `etc`, `var`,
+  `share` or generic factory test corpus; program-private config/state/log files are
+  colocated with their owning artifact, and the root `log/` contains only the system
+  journal; every build, runtime and documentation path comes from one explicit manifest
+  mapping; native internal ELFs and non-native component payloads are not conflated; no
+  logical crate or staged artifact identity changed; no compatibility duplicate hides an
+  old path; and clean tri-architecture builds and governed boot/storage tests pass.
 - Concept: M61/M87 (volume-loaded programs and manifest ownership), M123/M125
   (prefix-free shared/executable identities), M126 (the codec growth that exposed the
   flat userspace layout), and the persistent-system-volume ownership model.

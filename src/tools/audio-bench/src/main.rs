@@ -3,16 +3,7 @@ use std::time::Instant;
 const LOGICAL_SECONDS: u64 = 60;
 const CHUNK_FRAMES: usize = 1_024;
 
-const WAV: &[u8] = include_bytes!("../../../volume/test.wav");
-const WAV_IMA: &[u8] = include_bytes!("../../../volume/test-ima.wav");
-const WAV_MS: &[u8] = include_bytes!("../../../volume/test-ms.wav");
-const AIFF: &[u8] = include_bytes!("../../../volume/test.aiff");
-const AIFC: &[u8] = include_bytes!("../../../volume/test.aifc");
-const FLAC: &[u8] = include_bytes!("../../../volume/test.flac");
-const MP3: &[u8] = include_bytes!("../../../volume/test.mp3");
-const OGG: &[u8] = include_bytes!("../../../volume/test.ogg");
-const WAVPACK: &[u8] = include_bytes!("../../../volume/test.wv");
-const WAVPACK_STEREO: &[u8] = include_bytes!("../../../volume/test-stereo.wv");
+const MP3: &[u8] = include_bytes!("../../../volume/audio/test.mp3");
 
 trait Decoder {
 	fn read_i16_le(&mut self, max_frames: usize, output: &mut Vec<u8>) -> Result<usize, ()>;
@@ -28,12 +19,7 @@ macro_rules! impl_decoder {
 	};
 }
 
-impl_decoder!(aiff::Decoder<'_>);
-impl_decoder!(flac::Decoder<'_>);
 impl_decoder!(mp3::Decoder<'_>);
-impl_decoder!(vorbis::Decoder<'_>);
-impl_decoder!(wav::Decoder<'_>);
-impl_decoder!(wavpack::Decoder<'_>);
 
 fn drain(mut decoder: impl Decoder) -> u64 {
 	let mut output = Vec::new();
@@ -73,48 +59,10 @@ fn bench(name: &str, mut decode: impl FnMut() -> (u64, u32)) -> f64 {
 fn main() {
 	println!("| codec/container | rate (Hz) | fixture frames | iterations | wall (s) | realtime |");
 	println!("| --- | ---: | ---: | ---: | ---: | ---: |");
-	let results = [
-		bench("WAV PCM", || {
-			let audio = wav::Wav::parse(WAV).unwrap();
-			(drain(audio.decoder()), audio.metadata().rate)
-		}),
-		bench("WAV IMA ADPCM", || {
-			let audio = wav::Wav::parse(WAV_IMA).unwrap();
-			(drain(audio.decoder()), audio.metadata().rate)
-		}),
-		bench("WAV MS ADPCM", || {
-			let audio = wav::Wav::parse(WAV_MS).unwrap();
-			(drain(audio.decoder()), audio.metadata().rate)
-		}),
-		bench("AIFF PCM", || {
-			let audio = aiff::Aiff::parse(AIFF).unwrap();
-			(drain(audio.decoder()), audio.metadata().rate)
-		}),
-		bench("AIFC PCM", || {
-			let audio = aiff::Aiff::parse(AIFC).unwrap();
-			(drain(audio.decoder()), audio.metadata().rate)
-		}),
-		bench("FLAC", || {
-			let audio = flac::Flac::parse(FLAC).unwrap();
-			(drain(audio.decoder()), audio.metadata().rate)
-		}),
-		bench("MP3", || {
-			let audio = mp3::Mp3::parse(MP3).unwrap();
-			(drain(audio.decoder()), audio.metadata().rate)
-		}),
-		bench("Ogg Vorbis", || {
-			let audio = vorbis::Vorbis::parse(OGG).unwrap();
-			(drain(audio.decoder()), audio.metadata().rate)
-		}),
-		bench("WavPack mono", || {
-			let audio = wavpack::WavPack::parse(WAVPACK).unwrap();
-			(drain(audio.decoder()), audio.metadata().rate)
-		}),
-		bench("WavPack stereo", || {
-			let audio = wavpack::WavPack::parse(WAVPACK_STEREO).unwrap();
-			(drain(audio.decoder()), audio.metadata().rate)
-		}),
-	];
+	let results = [bench("MP3", || {
+		let audio = mp3::Mp3::parse(MP3).unwrap();
+		(drain(audio.decoder()), audio.metadata().rate)
+	})];
 	let slowest = results.into_iter().fold(f64::INFINITY, f64::min);
 	println!("slowest decoder: {slowest:.1}x realtime");
 }

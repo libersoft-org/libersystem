@@ -1,7 +1,7 @@
 // The component SDK example: a Rust guest built against the `liber` world.
 //
-// `just sdk` compiles this crate for wasm32-unknown-unknown and copies the module
-// into src/volume, where StorageService serves it as vol://system/app.wasm. The
+// `just sdk` compiles this crate for wasm32-unknown-unknown, and the package builder
+// stages it into the system volume where StorageService serves vol://system/app.wasm. The
 // kernel's component_host loads it from storage, wires its three imports to typed
 // services with no ambient authority, and invokes its exports.
 //

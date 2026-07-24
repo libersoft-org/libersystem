@@ -9,14 +9,16 @@ fi
 target="$1"
 shift
 root="$(cd "$(dirname "$0")/.." && pwd)"
+build_root="$root/../.build"
 artifact_manifest="$root/user/services/manifest.txt"
-artifact_output_root="$root/boot/.build/system-image/$target"
+artifact_output_root="$build_root/system-image/$target"
 provider_output_dir="$artifact_output_root/lib"
 executable_output_dir="$artifact_output_root/bin"
 artifact_log_dir="$artifact_output_root/logs"
 rust_min_stack="${RUST_MIN_STACK:-67108864}"
 force_rebuild="${LIBER_IMAGE_REBUILD:-0}"
-artifact_cache_dir="$root/boot/.build/image-artifacts-$target"
+artifact_cache_dir="$build_root/image-artifacts-$target"
+provider_cargo_target="$build_root/cargo/provider-$target"
 cargo_target="$target"
 cargo_target_flags=()
 build_started=$SECONDS
@@ -37,7 +39,7 @@ report_build_summary() {
 	local status=$?
 	find "$artifact_output_root" -type f -name "*.$$.expected" -delete 2>/dev/null || true
 	find "$artifact_cache_dir" -maxdepth 1 -type f -name "*.tmp.$$" -delete 2>/dev/null || true
-	rm -f "$root/boot/.build/package-dirs.$$.tmp"
+	rm -f "$build_root/package-dirs.$$.tmp"
 	if [[ -n "$source_inventory_file" ]]; then rm -f "$source_inventory_file"; fi
 	if [[ -n "$source_metadata_dir" ]]; then rm -rf "$source_metadata_dir"; fi
 	echo "build-shared: summary target=$target seconds=$((SECONDS - build_started)) stages=source:$source_inventory_seconds,graph:$image_graph_seconds,providers:$provider_seconds,consumers:$consumer_seconds providers=$provider_cache_hits/$provider_cache_misses objects=$object_cache_hits/$object_cache_misses executables=$executable_cache_hits/$executable_cache_misses status=$status"
@@ -51,9 +53,9 @@ if [[ "$force_rebuild" != 0 && "$force_rebuild" != 1 ]]; then
 fi
 
 command -v flock >/dev/null
-mkdir -p "$root/boot/.build" "$provider_output_dir" "$executable_output_dir" "$artifact_log_dir"
+mkdir -p "$build_root" "$provider_output_dir" "$executable_output_dir" "$artifact_log_dir"
 if [[ "${LIBER_IMAGE_LOCK_HELD:-0}" != 1 ]]; then
-	exec 9>"$root/boot/.build/image-build-$target.lock"
+	exec 9>"$build_root/image-build-$target.lock"
 	flock 9
 fi
 
@@ -118,8 +120,8 @@ done <"$artifact_manifest"
 declare -A source_file_hashes=()
 declare -A build_file_hashes=()
 source_inventory_started=$SECONDS
-source_inventory_file="$root/boot/.build/image-sources.$$.inventory"
-source_metadata_dir="$root/boot/.build/image-source-metadata.$$"
+source_inventory_file="$build_root/image-sources.$$.inventory"
+source_metadata_dir="$build_root/image-source-metadata.$$"
 source_roots_file="$source_metadata_dir/roots"
 mkdir -p "$(dirname "$source_inventory_file")"
 mkdir -p "$source_metadata_dir"
@@ -277,7 +279,7 @@ local_dependency_source_digest() {
 	local package="$2"
 	local exclude_root="${3:-0}"
 	local package_dirs package_dir
-	package_dirs="$root/boot/.build/package-dirs.$$.tmp"
+	package_dirs="$build_root/package-dirs.$$.tmp"
 	while IFS= read -r package_dir; do
 		if [[ "$exclude_root" == 1 && "$package_dir" == "$crate_dir" ]]; then continue; fi
 		printf '%s/\n' "$package_dir"
@@ -632,11 +634,11 @@ done < <(build_file_hash_inventory | sort -z -u | xargs -0 -r sha256sum --zero)
 image_graph_started=$SECONDS
 image_graph=""
 if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
-	image_target="$root/boot/.build/image-cargo-$target"
-	image_target_config="$root/boot/.build/image-cargo-$target.config"
-	image_graph="$root/boot/.build/image-cargo-$target.jsonl"
-	image_graph_errors="$root/boot/.build/image-cargo-$target.stderr"
-	image_seed="$root/boot/.build/image-seed-$target.o"
+	image_target="$build_root/image-cargo-$target"
+	image_target_config="$build_root/image-cargo-$target.config"
+	image_graph="$build_root/image-cargo-$target.jsonl"
+	image_graph_errors="$build_root/image-cargo-$target.stderr"
+	image_seed="$build_root/image-seed-$target.o"
 	target_spec_digest="$(if [[ -f "$cargo_target" ]]; then sha256sum "$cargo_target" | awk '{print $1}'; else printf '%s' "$cargo_target" | sha256sum | awk '{print $1}'; fi)"
 	image_target_config_value="$({
 		printf 'format=liber-image-cargo-cache-v1\n'
@@ -669,9 +671,9 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 	else
 		echo "build-shared: Cargo cache hit (global build configuration)"
 	fi
-	service_seed="$root/boot/.build/image-services-seed-$target.o"
-	service_seed_errors="$root/boot/.build/image-services-seed-$target.stderr"
-	image_graph_key_file="$root/boot/.build/image-cargo-$target.graph-key"
+	service_seed="$build_root/image-services-seed-$target.o"
+	service_seed_errors="$build_root/image-services-seed-$target.stderr"
+	image_graph_key_file="$build_root/image-cargo-$target.graph-key"
 	image_graph_source_digest="$({
 		while read -r crate; do
 			crate_dir="$(source_path "$crate")"
@@ -927,8 +929,8 @@ for spec in "$@"; do
 		deps="$image_target/$target/release/deps"
 		rlib="$(graph_archive "$crate_dir")"
 	else
-		(cd "$crate_dir" && RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$cargo_target" --lib "${features[@]}")
-		deps="$crate_dir/target/$target/release/deps"
+		(cd "$crate_dir" && CARGO_TARGET_DIR="$provider_cargo_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$cargo_target" --lib "${features[@]}")
+		deps="$provider_cargo_target/$target/release/deps"
 		rlib="$(find "$deps" -maxdepth 1 -name "lib${crate_rust}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 	fi
 	if [[ -z "$rlib" ]]; then
@@ -1201,7 +1203,7 @@ provider_seconds=$((SECONDS - provider_started))
 
 if [[ -n "$image_graph" ]]; then
 	consumer_started=$SECONDS
-	start_obj="$root/boot/.build/exe-start-$target.o"
+	start_obj="$build_root/exe-start-$target.o"
 	"$root/tools/build-exe-start.sh" "$target" "$start_obj"
 	dynamic_rows="$(dynamic_rows)"
 	declare -A package_source_digests=()
@@ -1595,8 +1597,8 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 		exit 0
 	fi
 	echo "build-shared: executable cache miss dyn_probe"
-	(cd "$probe" && RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
-	probe_rlib="$(find "$probe/target/$target/release/deps" -maxdepth 1 -name 'libdyn_probe-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+	(cd "$probe" && CARGO_TARGET_DIR="$provider_cargo_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
+	probe_rlib="$(find "$provider_cargo_target/$target/release/deps" -maxdepth 1 -name 'libdyn_probe-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv -e _start --whole-archive "$probe_rlib" --no-whole-archive "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined -o "$probe_out"
 	llvm-strip --strip-debug "$probe_out"
 	if ! llvm-readelf -h "$probe_out" | grep -q 'Type:.*DYN' || ! llvm-readelf -d "$probe_out" | grep -q 'NEEDED.*pix.lslib'; then

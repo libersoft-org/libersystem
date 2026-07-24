@@ -81,7 +81,11 @@ iso9660_dir := "fs/iso9660"
 udf_dir := "fs/udf"
 fscore_dir := "fs/core"
 target := "x86_64-unknown-none"
-kernel_elf := kernel_dir / "target" / target / "debug" / "kernel"
+build_root := "../.build"
+cargo_kernel_dir := build_root / "cargo/kernel"
+cargo_loader_dir := build_root / "cargo/loader"
+cargo_sdk_dir := build_root / "cargo/sdk"
+kernel_elf := cargo_kernel_dir / target / "debug" / "kernel"
 
 # default: build and run in QEMU
 default: run
@@ -152,11 +156,9 @@ user-aarch64: shared-libs-aarch64
     cd {{ drivers_dir }} && cargo build --target aarch64-unknown-none
 
 # build the WebAssembly component SDK example (the `liber` world guest) for
-# wasm32-unknown-unknown and stage it into the ramdisk volume as app.wasm, where
-# StorageService serves it over vol:// for the component_host to load and run
+# wasm32-unknown-unknown; the package builder stages it directly from .build
 sdk:
     cd {{ sdk_dir }} && cargo build --release --target wasm32-unknown-unknown
-    cp {{ sdk_dir }}/target/wasm32-unknown-unknown/release/liber_component.wasm volume/app.wasm
 
 # build the kernel (its build.rs assembles the init package from the userspace build)
 # and the own UEFI loader (staged into the boot image as BOOTX64.EFI)
@@ -338,6 +340,14 @@ test-all: sdk user user-aarch64 user-riscv64 test-tags-check
 test-tags-check:
     boot/check-test-tags.sh
 
+# Reject generated or compiled artifacts anywhere below src or in the Git index.
+source-hygiene:
+    tools/check-source-hygiene.sh --current
+
+# Reject generated artifacts anywhere in reachable Git history.
+source-history-hygiene:
+    tools/check-source-hygiene.sh --history
+
 # build the own UEFI loader for aarch64 (staged into the boot image as BOOTAA64.EFI)
 loader-aarch64:
     cd {{ loader_dir }} && cargo build --target aarch64-unknown-uefi
@@ -349,13 +359,12 @@ loader-aarch64:
 # script (loader/riscv64-pe.ld); llvm-objcopy then flattens it into a valid EFI
 # application, padded to the image end so its section raw data is fully backed.
 loader-riscv64:
-    cd {{ loader_dir }} &&
-    RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-T$PWD/riscv64-pe.ld" \
-        cargo build --target riscv64gc-unknown-none-elf &&
-    END=$(llvm-readelf -s target/riscv64gc-unknown-none-elf/debug/libersystem-loader | awk '/ _pe_image_end$/{print "0x"$2; exit}') &&
+    RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-T$PWD/loader/riscv64-pe.ld" \
+        cargo build --manifest-path {{ loader_dir }}/Cargo.toml --target riscv64gc-unknown-none-elf &&
+    END=$(llvm-readelf -s {{ cargo_loader_dir }}/riscv64gc-unknown-none-elf/debug/libersystem-loader | awk '/ _pe_image_end$/{print "0x"$2; exit}') &&
     llvm-objcopy -O binary --pad-to "$END" \
-        target/riscv64gc-unknown-none-elf/debug/libersystem-loader \
-        target/riscv64gc-unknown-none-elf/debug/libersystem-loader.efi
+        {{ cargo_loader_dir }}/riscv64gc-unknown-none-elf/debug/libersystem-loader \
+        {{ cargo_loader_dir }}/riscv64gc-unknown-none-elf/debug/libersystem-loader.efi
 
 # build + boot the ARM64 build in QEMU (native on an aarch64 host, emulated on an x86
 # host), reaching the interactive shell over the serial console. Uses QEMU's direct
@@ -363,7 +372,7 @@ loader-riscv64:
 # own UEFI loader. Add live displays as arguments (combinable): `just run-aarch64 vnc spice`.
 run-aarch64 *displays: sdk user-aarch64
     cd {{ kernel_dir }} && cargo build --target aarch64-unknown-none
-    DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh aarch64 {{ kernel_dir }}/target/aarch64-unknown-none/debug/kernel
+    DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh aarch64 {{ cargo_kernel_dir }}/aarch64-unknown-none/debug/kernel
 
 # build the userspace programs for riscv64 (the riscv64 kernel build.rs reads them from
 # each crate's riscv64gc-unknown-none-elf target dir)
@@ -379,7 +388,7 @@ user-riscv64: shared-libs-riscv64
 # it), so no per-device interrupt path is needed for the core chain.
 run-riscv64 *displays: sdk user-riscv64
     cd {{ kernel_dir }} && cargo build --target riscv64gc-unknown-none-elf
-    DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh riscv64 {{ kernel_dir }}/target/riscv64gc-unknown-none-elf/debug/kernel
+    DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh riscv64 {{ cargo_kernel_dir }}/riscv64gc-unknown-none-elf/debug/kernel
 
 # build + boot the full riscv64 system through the own UEFI loader under U-Boot (the
 # qemu-riscv64 S-mode U-Boot on OpenSBI, instead of QEMU's direct -kernel load): U-Boot's
@@ -388,14 +397,14 @@ run-riscv64 *displays: sdk user-riscv64
 # kernel's boot stub - the same entry state OpenSBI's -kernel boot produces.
 run-riscv64-uefi *displays: sdk user-riscv64 loader-riscv64
     cd {{ kernel_dir }} && cargo build --target riscv64gc-unknown-none-elf
-    UEFI=1 DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh riscv64 {{ kernel_dir }}/target/riscv64gc-unknown-none-elf/debug/kernel
+    UEFI=1 DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh riscv64 {{ cargo_kernel_dir }}/riscv64gc-unknown-none-elf/debug/kernel
 
 # build + boot the full aarch64 system through the own UEFI loader under the AAVMF
 # firmware (instead of QEMU's direct -kernel load), reaching the interactive shell.
 # Add live displays as arguments (combinable): `just run-aarch64-uefi vnc spice`.
 run-aarch64-uefi *displays: sdk user-aarch64 loader-aarch64
     cd {{ kernel_dir }} && cargo build --target aarch64-unknown-none
-    UEFI=1 DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh aarch64 {{ kernel_dir }}/target/aarch64-unknown-none/debug/kernel
+    UEFI=1 DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh aarch64 {{ cargo_kernel_dir }}/aarch64-unknown-none/debug/kernel
 
 # screenshot the framebuffer to a file (format by extension: png/jpg/webp/...);
 # snaps a live `just run` if one is up, else boots a throwaway. e.g. just screenshot shot.png
@@ -408,7 +417,7 @@ screenshot path: build
 lab *args:
     boot/lab.py {{ args }}
 
-# build a bootable hybrid ISO (BIOS + UEFI) -> boot/.build/<product>.iso; STRIP=debug|all
+# build a bootable hybrid ISO (BIOS + UEFI) -> .build/boot/<product>.iso; STRIP=debug|all
 iso strip="debug": build
     STRIP={{ strip }} boot/mkimage.sh iso {{ kernel_elf }}
 
@@ -446,13 +455,9 @@ app-libs-test:
     cargo test --manifest-path {{ wav_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
     cargo test --manifest-path {{ wavpack_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
 
-# Measure every staged decoder in an optimized host build and fail below real time.
+# Measure the staged MP3 decoder in an optimized host build and fail below real time.
 audio-bench:
     cargo run --release --manifest-path {{ audio_bench_dir }}/Cargo.toml
-
-# Regenerate every staged audio format and independent PCM golden from volume/test.mp3.
-audio-fixtures:
-    tools/generate-audio-tests.sh
 
 # Measure current image encode/decode profiles in an optimized host build.
 image-bench:
@@ -643,31 +648,8 @@ fmt-check:
     cd {{ fat_dir }} && cargo fmt --check
     cd {{ iso9660_dir }} && cargo fmt --check
     cd {{ udf_dir }} && cargo fmt --check
-    shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-dynamic-report.sh tools/check-shared-cache.sh tools/check-static-injection.sh tools/source-path.sh
+    shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-dynamic-report.sh tools/check-shared-cache.sh tools/check-source-hygiene.sh tools/check-static-injection.sh tools/source-path.sh
 
 # clean build artifacts
 clean:
-    cd {{ abi_dir }} && cargo clean
-    cd {{ wire_dir }} && cargo clean
-    cd {{ rt_dir }} && cargo clean
-    cd {{ ipc_client_dir }} && cargo clean
-    cd {{ kernel_dir }} && cargo clean
-    cd {{ user_dir }} && cargo clean
-    cd {{ services_dir }} && cargo clean
-    cd {{ storage_dir }} && cargo clean
-    cd {{ drivers_dir }} && cargo clean
-    cd {{ usertools_dir }} && cargo clean
-    cd {{ tools_dir }} && cargo clean
-    cd {{ proto_dir }} && cargo clean
-    cd {{ wasm_dir }} && cargo clean
-    cd {{ sdk_dir }} && cargo clean
-    cd {{ term_dir }} && cargo clean
-    cd {{ bootproto_dir }} && cargo clean
-    cd {{ loader_dir }} && cargo clean
-    cd {{ fscore_dir }} && cargo clean
-    cd {{ liberfs_dir }} && cargo clean
-    cd {{ fat_dir }} && cargo clean
-    cd {{ iso9660_dir }} && cargo clean
-    cd {{ udf_dir }} && cargo clean
-    rm -f volume/app.wasm
-    rm -rf boot/.build
+    rm -rf {{ build_root }}

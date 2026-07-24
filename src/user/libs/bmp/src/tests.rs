@@ -114,10 +114,10 @@ fn rejects_truncation_oversized_geometry_and_out_of_bounds_rle() {
 }
 
 #[test]
-fn staged_sample_image_is_a_valid_two_by_two_bmp() {
-	let image = decode(include_bytes!("../../../../volume/sample.bmp")).unwrap();
-	assert_eq!((image.width, image.height, image.pitch), (2, 2, 8));
-	assert_eq!(image.pixels.len(), 16);
+fn external_rgb24_image_decodes() {
+	let image = decode(include_bytes!("../tests/data/external-rgb24.bmp")).unwrap();
+	assert_eq!((image.width, image.height, image.pitch), (19, 7, 76));
+	assert_eq!(image.pixels.len(), 532);
 }
 
 #[test]

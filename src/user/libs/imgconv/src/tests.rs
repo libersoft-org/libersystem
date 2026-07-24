@@ -126,13 +126,13 @@ fn every_profile_driven_option_combination_matches_capabilities() {
 #[test]
 fn converts_staged_bmp_png_and_resizes() {
 	let png_config = parse_args(b"--compression 100 --resize 4x4 in.bmp out.png").unwrap();
-	let (encoded, info) = convert(include_bytes!("../../../../volume/sample.bmp"), &png_config).unwrap();
+	let (encoded, info) = convert(include_bytes!("../../bmp/tests/data/external-rgb24.bmp"), &png_config).unwrap();
 	let decoded = png::decode_rgba(&encoded).unwrap();
 	assert_eq!((decoded.width, decoded.height), (4, 4));
 	assert_eq!(info.input_format, Format::Bmp);
 	let bmp_config = parse_args(b"in.png out.bmp").unwrap();
-	let (encoded, _) = convert(include_bytes!("../../../../volume/sample.png"), &bmp_config).unwrap();
-	assert_eq!(bmp::decode_rgba(&encoded).unwrap().pixels.len(), 16);
+	let (encoded, _) = convert(include_bytes!("../../png/tests/data/external-adam7-rgb.png"), &bmp_config).unwrap();
+	assert_eq!(bmp::decode_rgba(&encoded).unwrap().pixels.len(), 1_380);
 }
 
 #[test]
@@ -183,9 +183,9 @@ fn distinguishes_unknown_from_corrupt_recognized_formats() {
 
 #[test]
 fn converts_opaque_bmp_to_explicit_indexed_png() {
-	let source = bmp::decode_rgba(include_bytes!("../../../../volume/sample.bmp")).unwrap();
+	let source = bmp::decode_rgba(include_bytes!("../../bmp/tests/data/external-rgb24.bmp")).unwrap();
 	let config = parse_args(b"--quality 0 --compression 100 in.bmp out.png").unwrap();
-	let (encoded, info) = convert(include_bytes!("../../../../volume/sample.bmp"), &config).unwrap();
+	let (encoded, info) = convert(include_bytes!("../../bmp/tests/data/external-rgb24.bmp"), &config).unwrap();
 	assert!(encoded.windows(4).any(|window| window == b"PLTE"));
 	assert_eq!(png::decode_rgba(&encoded).unwrap(), source);
 	assert_eq!((info.quality, info.compression), (Some(0), Some(100)));
@@ -212,7 +212,7 @@ fn converts_true_color_to_explicit_indexed_bmp_and_pcx() {
 
 #[test]
 fn converts_png_to_ico_pcx_ppm_qoi_and_tga() {
-	let source = png::decode_rgba(include_bytes!("../../../../volume/sample.png")).unwrap();
+	let source = png::decode_rgba(include_bytes!("../../png/tests/data/external-adam7-rgb.png")).unwrap();
 	for (arguments, expected) in [
 		(b"--compression 100 in.png out.ico".as_slice(), Format::Ico),
 		(b"in.png out.pcx".as_slice(), Format::Pcx),
@@ -221,7 +221,7 @@ fn converts_png_to_ico_pcx_ppm_qoi_and_tga() {
 		(b"in.png out.tga".as_slice(), Format::Tga),
 	] {
 		let config = parse_args(arguments).unwrap();
-		let converted = convert(include_bytes!("../../../../volume/sample.png"), &config);
+		let converted = convert(include_bytes!("../../png/tests/data/external-adam7-rgb.png"), &config);
 		if matches!(expected, Format::Pcx | Format::Ppm) && source.pixels.chunks_exact(4).any(|pixel| pixel[3] != 255) {
 			assert_eq!(converted, Err(Error::UnsupportedFormat));
 			continue;
@@ -242,9 +242,9 @@ fn converts_png_to_ico_pcx_ppm_qoi_and_tga() {
 
 #[test]
 fn converts_opaque_bmp_to_quality_jpeg() {
-	let source = bmp::decode_rgba(include_bytes!("../../../../volume/sample.bmp")).unwrap();
+	let source = bmp::decode_rgba(include_bytes!("../../bmp/tests/data/external-rgb24.bmp")).unwrap();
 	let config = parse_args(b"--quality 100 in.bmp out.jpg").unwrap();
-	let (encoded, info) = convert(include_bytes!("../../../../volume/sample.bmp"), &config).unwrap();
+	let (encoded, info) = convert(include_bytes!("../../bmp/tests/data/external-rgb24.bmp"), &config).unwrap();
 	let decoded = jpeg::decode(&encoded).unwrap();
 	assert_eq!((decoded.width, decoded.height), (source.width, source.height));
 	assert_eq!(info.quality, Some(100));
@@ -252,10 +252,10 @@ fn converts_opaque_bmp_to_quality_jpeg() {
 
 #[test]
 fn converts_png_to_lossless_webp_effort_range() {
-	let source = png::decode_rgba(include_bytes!("../../../../volume/sample.png")).unwrap();
+	let source = png::decode_rgba(include_bytes!("../../png/tests/data/external-adam7-rgb.png")).unwrap();
 	for compression in [0, 1, 25, 50, 75, 99, 100] {
 		let arguments = alloc::format!("--lossless --compression {compression} in.png out.webp");
-		let (encoded, info) = convert(include_bytes!("../../../../volume/sample.png"), &parse_args(arguments.as_bytes()).unwrap()).unwrap();
+		let (encoded, info) = convert(include_bytes!("../../png/tests/data/external-adam7-rgb.png"), &parse_args(arguments.as_bytes()).unwrap()).unwrap();
 		assert_eq!(webp::decode(&encoded).unwrap(), source);
 		assert_eq!((info.mode, info.compression), (Some(Mode::Lossless), Some(compression)));
 	}
@@ -332,7 +332,7 @@ fn webp_background_is_composited_when_apng_cannot_represent_it() {
 #[test]
 fn converts_resized_png_to_modern_icns() {
 	let config = parse_args(b"--resize 128x128 --compression 100 in.png out.icns").unwrap();
-	let (encoded, info) = convert(include_bytes!("../../../../volume/sample.png"), &config).unwrap();
+	let (encoded, info) = convert(include_bytes!("../../png/tests/data/external-adam7-rgb.png"), &config).unwrap();
 	let decoded = icns::decode(&encoded).unwrap();
 	assert_eq!((decoded.width, decoded.height), (128, 128));
 	assert_eq!(info.output_format, Format::Icns);
@@ -341,7 +341,7 @@ fn converts_resized_png_to_modern_icns() {
 #[test]
 fn converts_resized_png_to_classic_rle_icns() {
 	let config = parse_args(b"--resize 32x32 --compression 100 in.png out.icns").unwrap();
-	let (encoded, info) = convert(include_bytes!("../../../../volume/sample.png"), &config).unwrap();
+	let (encoded, info) = convert(include_bytes!("../../png/tests/data/external-adam7-rgb.png"), &config).unwrap();
 	assert!(encoded.windows(4).any(|window| window == b"il32"));
 	assert!(encoded.windows(4).any(|window| window == b"l8mk"));
 	let decoded = icns::decode(&encoded).unwrap();

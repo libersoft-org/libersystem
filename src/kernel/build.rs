@@ -37,7 +37,7 @@ fn export_cross_arch_volume() {
 	if arch == "aarch64" || arch == "riscv64" {
 		let out_dir: PathBuf = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
 		let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-		let build_dir: PathBuf = PathBuf::from(&manifest_dir).join("../boot/.build");
+		let build_dir: PathBuf = PathBuf::from(&manifest_dir).join("../../.build/boot");
 		let _ = fs::create_dir_all(&build_dir);
 		let vol_src: PathBuf = out_dir.join("volume.pkg");
 		if vol_src.exists() {
@@ -263,20 +263,20 @@ fn audit_dynamic_order(row: &ManifestRow, bytes: &[u8], libraries: &[ManifestRow
 // The debug-build target path of a userspace ELF: each crate builds to its own target dir.
 // The target triple follows the kernel's target arch, so an aarch64 kernel stages the
 // aarch64 userspace ELFs (and x86_64 the x86_64 ones).
-fn user_elf_path(manifest: &Path, crate_path: &str, name: &str) -> PathBuf {
-	manifest.join("..").join(crate_path).join(format!("target/{}/debug/{name}", user_target()))
+fn user_elf_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
+	manifest.join(format!("../../.build/cargo/user/{}/debug/{name}", user_target()))
 }
 
 fn user_shared_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
-	manifest.join(format!("../boot/.build/system-image/{}/lib/{name}.lslib", user_target()))
+	manifest.join(format!("../../.build/system-image/{}/lib/{name}.lslib", user_target()))
 }
 
 fn user_dynamic_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
-	manifest.join(format!("../boot/.build/system-image/{}/bin/{name}", user_target()))
+	manifest.join(format!("../../.build/system-image/{}/bin/{name}", user_target()))
 }
 
 fn user_dynamic_order_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
-	manifest.join(format!("../boot/.build/system-image/{}/bin/{name}.order", user_target()))
+	manifest.join(format!("../../.build/system-image/{}/bin/{name}.order", user_target()))
 }
 
 fn identity_path(artifact: &Path) -> PathBuf {
@@ -353,12 +353,12 @@ fn user_elf_machine() -> u16 {
 // Where the assembled packages are written. On aarch64 and riscv64 there is no
 // bootloader module hand-off (the kernel is booted directly via `-kernel`), so the
 // packages go to OUT_DIR and are embedded into the kernel image; on x86_64 they go to
-// boot/.build for mkimage.sh to place as boot modules (the loader loads them alongside
+// the repository build root for mkimage.sh to place as boot modules (the loader loads them alongside
 // the kernel and hands their addresses to it in the BootInfo).
 fn package_out_dir(manifest: &Path) -> PathBuf {
 	match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
 		Ok("aarch64") | Ok("riscv64") => PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set")),
-		_ => manifest.join("../boot/.build"),
+		_ => manifest.join("../../.build/boot"),
 	}
 }
 
@@ -398,7 +398,7 @@ fn read_stripped(path: &Path) -> Option<Vec<u8>> {
 // Assemble the init package that the kernel loads as a boot module. The package
 // is a tiny archive (a header plus fixed-size entries plus the concatenated file
 // blobs) holding the userspace programs - SystemManager plus the StorageService
-// and its demo client. It is written to boot/.build/init.pkg, where mkimage.sh
+// and its demo client. It is written to .build/boot/init.pkg, where mkimage.sh
 // picks it up.
 //
 // The userspace ELFs are built separately (the `just user` recipe, a dependency
@@ -444,10 +444,38 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	fs::write(&out_pkg, &package).unwrap_or_else(|e: std::io::Error| panic!("cannot write {}: {e}", out_pkg.display()));
 }
 
+fn collect_volume_files(root: &Path, directory: &Path, files: &mut Vec<(String, Vec<u8>)>) {
+	let read_dir = fs::read_dir(directory).unwrap_or_else(|error| panic!("cannot read {}: {error}", directory.display()));
+	for entry in read_dir {
+		let entry = entry.unwrap_or_else(|error| panic!("cannot read entry under {}: {error}", directory.display()));
+		let path = entry.path();
+		let file_type = entry.file_type().unwrap_or_else(|error| panic!("cannot inspect {}: {error}", path.display()));
+		if file_type.is_dir() {
+			collect_volume_files(root, &path, files);
+			continue;
+		}
+		if !file_type.is_file() {
+			continue;
+		}
+		let relative = path.strip_prefix(root).unwrap_or_else(|_| panic!("{} escaped {}", path.display(), root.display()));
+		let mut components: Vec<&str> = Vec::new();
+		for component in relative.components() {
+			match component {
+				std::path::Component::Normal(name) => components.push(name.to_str().unwrap_or_else(|| panic!("non-UTF-8 volume path: {}", path.display()))),
+				_ => panic!("invalid volume path: {}", path.display()),
+			}
+		}
+		assert!(!components.is_empty(), "empty volume path");
+		let name = components.join("/");
+		let bytes = fs::read(&path).unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+		println!("cargo:rerun-if-changed={}", path.display());
+		files.push((name, bytes));
+	}
+}
+
 // Assemble the ramdisk volume package: every regular file under src/volume is
-// packed into boot/.build/volume.pkg using the same archive format as the init
-// package, keyed by its file name. The kernel loads it as a second boot module
-// and serves its files through the userspace StorageService over vol://.
+// packed into .build/boot/volume.pkg using its relative path. The kernel loads it
+// as a second boot module and serves its files through StorageService over vol://.
 fn assemble_volume_package(conf: &[(String, String)]) {
 	let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
 	let manifest: PathBuf = PathBuf::from(&manifest_dir);
@@ -458,25 +486,19 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	println!("cargo:rerun-if-changed={}", vol_dir.display());
 	fs::create_dir_all(&out_dir).unwrap_or_else(|e: std::io::Error| panic!("cannot create {}: {e}", out_dir.display()));
 
-	// Collect (name, bytes) for every regular file, sorted by name for a stable
-	// archive layout. A missing or empty directory yields an empty package.
+	// Collect (relative path, bytes) for every regular file. Sorting below makes
+	// archive layout independent of filesystem enumeration order.
 	let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-	if let Ok(read_dir) = fs::read_dir(&vol_dir) {
-		for entry in read_dir.flatten() {
-			let path: PathBuf = entry.path();
-			if !path.is_file() {
-				continue;
-			}
-			let name: String = match path.file_name().and_then(|n| n.to_str()) {
-				Some(n) => n.to_string(),
-				None => continue,
-			};
-			let bytes: Vec<u8> = fs::read(&path).unwrap_or_else(|e: std::io::Error| panic!("cannot read {}: {e}", path.display()));
-			println!("cargo:rerun-if-changed={}", path.display());
-			files.push((name, bytes));
-		}
+	if vol_dir.is_dir() {
+		collect_volume_files(&vol_dir, &vol_dir, &mut files);
 	} else {
 		println!("cargo:warning=volume directory not found at {} - writing an empty volume package", vol_dir.display());
+	}
+	let component: PathBuf = manifest.join("../../.build/cargo/sdk/wasm32-unknown-unknown/release/liber_component.wasm");
+	println!("cargo:rerun-if-changed={}", component.display());
+	match fs::read(&component) {
+		Ok(bytes) => files.push(("app.wasm".to_string(), bytes)),
+		Err(error) => println!("cargo:warning=SDK component not found at {} ({error}) - omitting app.wasm from volume package", component.display()),
 	}
 
 	let rows = read_manifest(&manifest);

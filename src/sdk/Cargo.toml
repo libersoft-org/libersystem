@@ -10,7 +10,7 @@ description = "LiberSystem component SDK: a Rust guest built against the liber w
 [lib]
 # A cdylib so the toolchain emits a WebAssembly module (imports + exports), not a
 # host archive. The build recipe (`just sdk`) compiles it for wasm32-unknown-unknown
-# and copies the artifact into src/volume so StorageService serves it over vol://.
+# and the package builder stages it directly from the repository build root.
 crate-type = ["cdylib"]
 
 [profile.release]

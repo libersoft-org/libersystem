@@ -22,7 +22,8 @@ set -euo pipefail
 OUT="${1:?usage: screenshot.sh <output-path> (e.g. screenshot.png, shot.jpg, shot.webp)}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD="$HERE/.build"
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+BUILD="$REPO_ROOT/.build/boot"
 RUN_MON="$BUILD/qemu-monitor.sock" # control monitor exposed by a live `just run`
 PPM="$BUILD/.screenshot.ppm"
 
@@ -84,7 +85,7 @@ if socket_live "$RUN_MON"; then
 fi
 
 # Fallback: boot a throwaway headless instance and capture once it has booted.
-KERNEL="$HERE/../kernel/target/x86_64-unknown-none/debug/kernel"
+KERNEL="$REPO_ROOT/.build/cargo/kernel/x86_64-unknown-none/debug/kernel"
 [[ -f "$KERNEL" ]] || {
 	echo "screenshot: kernel ELF not found ($KERNEL) - run 'just build' first" >&2
 	exit 1

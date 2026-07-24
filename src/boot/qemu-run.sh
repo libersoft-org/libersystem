@@ -315,15 +315,16 @@ else
 fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 QEMU_BOOT_DIR="$HERE"
-QEMU_BUILD_DIR="$HERE/.build"
+QEMU_BUILD_DIR="$REPO_ROOT/.build/boot"
 mkdir -p "$QEMU_BUILD_DIR"
 
 if [[ -z "$KERNEL_ELF" ]]; then
 	case "$TARGET_ARCH" in
-	x86_64) KERNEL_ELF="$HERE/../kernel/target/x86_64-unknown-none/debug/kernel" ;;
-	aarch64) KERNEL_ELF="$HERE/../kernel/target/aarch64-unknown-none/debug/kernel" ;;
-	riscv64) KERNEL_ELF="$HERE/../kernel/target/riscv64gc-unknown-none-elf/debug/kernel" ;;
+	x86_64) KERNEL_ELF="$REPO_ROOT/.build/cargo/kernel/x86_64-unknown-none/debug/kernel" ;;
+	aarch64) KERNEL_ELF="$REPO_ROOT/.build/cargo/kernel/aarch64-unknown-none/debug/kernel" ;;
+	riscv64) KERNEL_ELF="$REPO_ROOT/.build/cargo/kernel/riscv64gc-unknown-none-elf/debug/kernel" ;;
 	esac
 fi
 
@@ -501,7 +502,7 @@ qemu_run_aarch64() {
 
 	if [[ "$uefi" == "1" ]]; then
 		# Boot through the own UEFI loader under AAVMF.
-		local loader_efi="${LOADER_EFI:-$HERE/../loader/target/aarch64-unknown-uefi/debug/libersystem-loader.efi}"
+		local loader_efi="${LOADER_EFI:-$REPO_ROOT/.build/cargo/loader/aarch64-unknown-uefi/debug/libersystem-loader.efi}"
 		[[ -f "$loader_efi" ]] || {
 			echo "qemu-run: loader EFI not found: $loader_efi (run 'just loader-aarch64')" >&2
 			exit 1
@@ -604,7 +605,7 @@ qemu_run_riscv64() {
 
 	if [[ "$uefi" == "1" ]]; then
 		# Boot through the own UEFI loader under U-Boot.
-		local loader_efi="${LOADER_EFI:-$HERE/../loader/target/riscv64gc-unknown-none-elf/debug/libersystem-loader.efi}"
+		local loader_efi="${LOADER_EFI:-$REPO_ROOT/.build/cargo/loader/riscv64gc-unknown-none-elf/debug/libersystem-loader.efi}"
 		[[ -f "$loader_efi" ]] || {
 			echo "qemu-run: loader EFI not found: $loader_efi (run 'just loader-riscv64')" >&2
 			exit 1

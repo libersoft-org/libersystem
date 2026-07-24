@@ -128,13 +128,11 @@ the previous destination without requiring a temporary filename in the tool.
 
 ## Audio decoding and governed playback (2026-07-15)
 
-`just audio-bench` is the standing optimized-host throughput gate. The host-only
-benchmark depends on the same atomized decoder leaves as `play`, reparses each staged
-fixture on every iteration, drains signed-i16 output in bounded 1,024-frame chunks, and
-decodes at least 60 seconds of logical audio per row. It fails if any path falls below
-real time. `tools/generate-audio-tests.sh` derives every fixture from the user-facing
-7.44-second, 44.1 kHz mono `volume/test.mp3`; the stereo WavPack variant uses the same
-signal with an inverted right channel. One x86 host run produced:
+`just audio-bench` is the standing optimized-host MP3 throughput gate. The host-only
+benchmark uses the same atomized decoder leaf as `play`, reparses the staged
+`volume/audio/test.mp3` on every iteration, drains signed-i16 output in bounded
+1,024-frame chunks and decodes at least 60 seconds of logical audio. It fails below
+real time. One x86 host run produced:
 
 | codec/container | staged rate | fixture frames | iterations | wall | realtime |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -197,8 +195,8 @@ and exits; AudioService drains 11 already accepted periods (bounded below the as
 Live output remains reproducibly inspectable with QEMU's WAV backend rather than a
 listener and a particular SPICE client. Boot with
 `AUDIO_WAV=/tmp/libersystem-audio.wav just lab boot --fresh`, run
-`just lab sh play test.wv`, then `just lab quit`; the captured WAV traverses the live
-shell -> governed player -> StorageService -> WavPack -> AudioService -> virtio-sound
+`just lab sh play audio/test.mp3`, then `just lab quit`; the captured WAV traverses the live
+shell -> governed player -> StorageService -> MP3 -> AudioService -> virtio-sound
 -> host-audio path and remains inspectable in CI or headless development.
 
 ## Application surface presentation (2026-07-14)

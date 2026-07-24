@@ -2,6 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+build_root="$root/../.build"
 manifest="$root/user/services/manifest.txt"
 first="${1:-static}"
 kind="static"
@@ -35,10 +36,10 @@ command -v timeout >/dev/null
 source_path() {
 	awk -v owner="$1" '$1 == "source" && $2 == owner {print $3; count++} END {if (count != 1) exit 1}' "$manifest"
 }
-mkdir -p "$root/boot/.build"
-exec 8>"$root/boot/.build/image-build-x86_64-unknown-none.lock"
-exec 9>"$root/boot/.build/image-build-aarch64-unknown-none.lock"
-exec 10>"$root/boot/.build/image-build-riscv64gc-unknown-none-elf.lock"
+mkdir -p "$build_root"
+exec 8>"$build_root/image-build-x86_64-unknown-none.lock"
+exec 9>"$build_root/image-build-aarch64-unknown-none.lock"
+exec 10>"$build_root/image-build-riscv64gc-unknown-none-elf.lock"
 flock 8
 flock 9
 flock 10
@@ -277,14 +278,14 @@ check_target() {
 	local label="$1"
 	local target="$2"
 	local volume_name="$3"
-	local volume="$root/boot/.build/$volume_name"
+	local volume="$build_root/boot/$volume_name"
 	local artifact_hash before after_failure after_restore
 	if [[ "$kind" == dependency-graph ]]; then
-		artifact="$root/boot/.build/system-image/$target/bin/dyn_probe.order"
+		artifact="$build_root/system-image/$target/bin/dyn_probe.order"
 	elif [[ "$kind" == duplicate-edge || "$kind" == malformed-dynamic || "$kind" == malformed-symbol-relocation ]]; then
-		artifact="$root/boot/.build/system-image/$target/bin/dyn_probe"
+		artifact="$build_root/system-image/$target/bin/dyn_probe"
 	else
-		artifact="$root/boot/.build/system-image/$target/bin/echo"
+		artifact="$build_root/system-image/$target/bin/echo"
 	fi
 	[[ -f "$artifact" ]] || {
 		echo "image-injection-check: missing staged $label artifact for $kind" >&2
