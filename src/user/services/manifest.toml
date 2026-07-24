@@ -1,0 +1,2169 @@
+# LiberSystem userspace ownership, deployment, supervision, and dynamic-image manifest.
+# This is the only hand-edited source of truth. tools/system-manifest owns parsing,
+# canonicalization, cross-reference validation, graph bounds, and machine projections.
+schema = 1
+
+[[sources]]
+owner = "adpcm"
+path = "user/libs/audio/adpcm"
+
+[[sources]]
+owner = "aiff"
+path = "user/libs/audio/aiff"
+
+[[sources]]
+owner = "apng"
+path = "user/libs/image/apng"
+
+[[sources]]
+owner = "audio-client"
+path = "user/libs/clients/audio-client"
+
+[[sources]]
+owner = "audio-client-provider"
+path = "user/libs/clients/audio-client-provider"
+
+[[sources]]
+owner = "audio-proto"
+path = "user/libs/protocol/audio-proto"
+
+[[sources]]
+owner = "base-proto"
+path = "user/libs/protocol/base-proto"
+
+[[sources]]
+owner = "bmp"
+path = "user/libs/image/bmp"
+
+[[sources]]
+owner = "config-client"
+path = "user/libs/clients/config-client"
+
+[[sources]]
+owner = "config-client-provider"
+path = "user/libs/clients/config-client-provider"
+
+[[sources]]
+owner = "config-proto"
+path = "user/libs/protocol/config-proto"
+
+[[sources]]
+owner = "deflate"
+path = "user/libs/compression/deflate"
+
+[[sources]]
+owner = "device-client"
+path = "user/libs/clients/device-client"
+
+[[sources]]
+owner = "device-client-provider"
+path = "user/libs/clients/device-client-provider"
+
+[[sources]]
+owner = "device-proto"
+path = "user/libs/protocol/device-proto"
+
+[[sources]]
+owner = "display-proto"
+path = "user/libs/protocol/display-proto"
+
+[[sources]]
+owner = "drivers"
+path = "user/drivers/core"
+
+[[sources]]
+owner = "dyn_probe"
+path = "user/apps/dyn_probe"
+
+[[sources]]
+owner = "flac"
+path = "user/libs/audio/flac"
+
+[[sources]]
+owner = "gif"
+path = "user/libs/image/gif"
+
+[[sources]]
+owner = "icns"
+path = "user/libs/image/icns"
+
+[[sources]]
+owner = "ico"
+path = "user/libs/image/ico"
+
+[[sources]]
+owner = "imgconv"
+path = "user/libs/image/imgconv"
+
+[[sources]]
+owner = "inflate"
+path = "user/libs/compression/inflate"
+
+[[sources]]
+owner = "input-proto"
+path = "user/libs/protocol/input-proto"
+
+[[sources]]
+owner = "ipc-client"
+path = "user/libs/ipc/ipc-client"
+
+[[sources]]
+owner = "jpeg"
+path = "user/libs/image/jpeg"
+
+[[sources]]
+owner = "keys"
+path = "user/libs/input/keys"
+
+[[sources]]
+owner = "log-client"
+path = "user/libs/clients/log-client"
+
+[[sources]]
+owner = "log-client-provider"
+path = "user/libs/clients/log-client-provider"
+
+[[sources]]
+owner = "log-proto"
+path = "user/libs/protocol/log-proto"
+
+[[sources]]
+owner = "mp3"
+path = "user/libs/audio/mp3"
+
+[[sources]]
+owner = "network-client"
+path = "user/libs/clients/network-client"
+
+[[sources]]
+owner = "network-client-provider"
+path = "user/libs/clients/network-client-provider"
+
+[[sources]]
+owner = "network-proto"
+path = "user/libs/protocol/network-proto"
+
+[[sources]]
+owner = "observability-client"
+path = "user/libs/clients/observability-client"
+
+[[sources]]
+owner = "observability-client-provider"
+path = "user/libs/clients/observability-client-provider"
+
+[[sources]]
+owner = "observability-proto"
+path = "user/libs/protocol/observability-proto"
+
+[[sources]]
+owner = "ogg"
+path = "user/libs/audio/ogg"
+
+[[sources]]
+owner = "pcm"
+path = "user/libs/audio/pcm"
+
+[[sources]]
+owner = "pcx"
+path = "user/libs/image/pcx"
+
+[[sources]]
+owner = "pix"
+path = "user/libs/image/pix"
+
+[[sources]]
+owner = "png"
+path = "user/libs/image/png"
+
+[[sources]]
+owner = "ppm"
+path = "user/libs/image/ppm"
+
+[[sources]]
+owner = "process-client"
+path = "user/libs/clients/process-client"
+
+[[sources]]
+owner = "process-client-provider"
+path = "user/libs/clients/process-client-provider"
+
+[[sources]]
+owner = "process-proto"
+path = "user/libs/protocol/process-proto"
+
+[[sources]]
+owner = "proto"
+path = "proto"
+
+[[sources]]
+owner = "qoi"
+path = "user/libs/image/qoi"
+
+[[sources]]
+owner = "quantize"
+path = "user/libs/image/quantize"
+
+[[sources]]
+owner = "resources-client"
+path = "user/libs/clients/resources-client"
+
+[[sources]]
+owner = "resources-client-provider"
+path = "user/libs/clients/resources-client-provider"
+
+[[sources]]
+owner = "resources-proto"
+path = "user/libs/protocol/resources-proto"
+
+[[sources]]
+owner = "rt"
+path = "user/runtime/rt"
+
+[[sources]]
+owner = "security-client"
+path = "user/libs/clients/security-client"
+
+[[sources]]
+owner = "security-client-provider"
+path = "user/libs/clients/security-client-provider"
+
+[[sources]]
+owner = "security-proto"
+path = "user/libs/protocol/security-proto"
+
+[[sources]]
+owner = "services"
+path = "user/services/core"
+
+[[sources]]
+owner = "session-proto"
+path = "user/libs/protocol/session-proto"
+
+[[sources]]
+owner = "storage"
+path = "user/services/storage"
+
+[[sources]]
+owner = "storage-proto"
+path = "user/libs/protocol/storage-proto"
+
+[[sources]]
+owner = "surface"
+path = "user/libs/display/surface"
+
+[[sources]]
+owner = "system_manager"
+path = "user/services/system_manager"
+
+[[sources]]
+owner = "term"
+path = "term"
+
+[[sources]]
+owner = "tga"
+path = "user/libs/image/tga"
+
+[[sources]]
+owner = "time-client"
+path = "user/libs/clients/time-client"
+
+[[sources]]
+owner = "time-client-provider"
+path = "user/libs/clients/time-client-provider"
+
+[[sources]]
+owner = "time-proto"
+path = "user/libs/protocol/time-proto"
+
+[[sources]]
+owner = "tools"
+path = "user/apps/tools"
+
+[[sources]]
+owner = "volume-client"
+path = "user/libs/clients/volume-client"
+
+[[sources]]
+owner = "volume-client-provider"
+path = "user/libs/clients/volume-client-provider"
+
+[[sources]]
+owner = "vorbis"
+path = "user/libs/audio/vorbis"
+
+[[sources]]
+owner = "wasm"
+path = "wasm"
+
+[[sources]]
+owner = "wav"
+path = "user/libs/audio/wav"
+
+[[sources]]
+owner = "wavpack"
+path = "user/libs/audio/wavpack"
+
+[[sources]]
+owner = "webp"
+path = "user/libs/image/webp"
+
+[[sources]]
+owner = "wire"
+path = "wire"
+
+[[programs]]
+name = "arp"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/arp.lsexe"
+providers = [
+    "network-client",
+    "network-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "audio_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/audio_service.lsexe"
+providers = [
+    "pcm",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "beep"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/beep.lsexe"
+providers = [
+    "audio-client",
+    "lsrt",
+]
+
+[[programs]]
+name = "cat"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/cat.lsexe"
+providers = [
+    "volume-client",
+    "storage-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "component_host"
+owner = "services"
+role = "helper"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/component_host.lsexe"
+providers = [
+    "wasm",
+    "base-proto",
+    "storage-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "config"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/config.lsexe"
+providers = [
+    "config-client",
+    "config-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "config_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/config_service.lsexe"
+providers = [
+    "config-proto",
+    "base-proto",
+    "storage-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "console_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/console_service.lsexe"
+providers = [
+    "service-util",
+    "term",
+    "surface",
+    "base-proto",
+    "process-proto",
+    "storage-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "date"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/date.lsexe"
+providers = [
+    "time-client",
+    "time-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "device_manager"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "pinned"
+destination = "device_manager.lsexe"
+providers = []
+
+[[programs]]
+name = "device_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/device_service.lsexe"
+providers = [
+    "device-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "display_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/display_service.lsexe"
+providers = [
+    "pix",
+    "display-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "dmesg"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/dmesg.lsexe"
+providers = ["lsrt"]
+
+[[programs]]
+name = "du"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/du.lsexe"
+providers = [
+    "volume-client",
+    "storage-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "dyn_probe"
+owner = "dyn_probe"
+role = "probe"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/dyn_probe.lsexe"
+providers = [
+    "pix",
+    "lsrt",
+]
+
+[[programs]]
+name = "echo"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/echo.lsexe"
+providers = ["lsrt"]
+
+[[programs]]
+name = "file_picker"
+owner = "services"
+role = "helper"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/file_picker.lsexe"
+providers = [
+    "base-proto",
+    "storage-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "free"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/free.lsexe"
+providers = ["lsrt"]
+
+[[programs]]
+name = "graphics_probe"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/graphics_probe.lsexe"
+providers = ["lsrt"]
+
+[[programs]]
+name = "httpd"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/httpd.lsexe"
+providers = [
+    "network-client",
+    "lsrt",
+]
+
+[[programs]]
+name = "imgconv"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/imgconv.lsexe"
+providers = [
+    "imgconv",
+    "volume-client",
+    "storage-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "imgview"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/imgview.lsexe"
+providers = [
+    "imgconv",
+    "pix",
+    "surface",
+    "volume-client",
+    "input-proto",
+    "storage-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "input_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/input_service.lsexe"
+providers = [
+    "keys",
+    "input-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "ip"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/ip.lsexe"
+providers = [
+    "network-client",
+    "network-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "log"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/log.lsexe"
+providers = [
+    "log-client",
+    "time-client",
+    "log-proto",
+    "time-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "log_service"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "pinned"
+destination = "log_service.lsexe"
+providers = []
+
+[[programs]]
+name = "ls"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/ls.lsexe"
+providers = [
+    "volume-client",
+    "storage-proto",
+    "time-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "lsblk"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/lsblk.lsexe"
+providers = [
+    "volume-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "lscpu"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/lscpu.lsexe"
+providers = [
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "lsdev"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/lsdev.lsexe"
+providers = [
+    "device-client",
+    "device-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "lsirq"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/lsirq.lsexe"
+providers = [
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "lsmem"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/lsmem.lsexe"
+providers = [
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "lspci"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/lspci.lsexe"
+providers = [
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "lssvc"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/lssvc.lsexe"
+providers = [
+    "observability-client",
+    "observability-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "lsusb"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/lsusb.lsexe"
+providers = [
+    "device-client",
+    "device-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "lsvol"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/lsvol.lsexe"
+providers = [
+    "volume-client",
+    "storage-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "mkdir"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/mkdir.lsexe"
+providers = [
+    "volume-client",
+    "storage-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "nc"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/nc.lsexe"
+providers = [
+    "network-client",
+    "network-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "network_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/network_service.lsexe"
+providers = [
+    "network-proto",
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "nslookup"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/nslookup.lsexe"
+providers = [
+    "network-client",
+    "network-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "perm"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/perm.lsexe"
+providers = [
+    "security-client",
+    "security-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "permission_manager"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/permission_manager.lsexe"
+providers = [
+    "service-util",
+    "base-proto",
+    "process-proto",
+    "security-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "ping"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/ping.lsexe"
+providers = [
+    "network-client",
+    "network-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "play"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/play.lsexe"
+providers = [
+    "aiff",
+    "flac",
+    "mp3",
+    "vorbis",
+    "wav",
+    "wavpack",
+    "audio-client",
+    "volume-client",
+    "storage-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "process_service"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "pinned"
+destination = "process_service.lsexe"
+providers = []
+
+[[programs]]
+name = "ps"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/ps.lsexe"
+providers = [
+    "process-client",
+    "resources-client",
+    "process-proto",
+    "resources-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "ptyecho"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/ptyecho.lsexe"
+providers = ["lsrt"]
+
+[[programs]]
+name = "readln"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/readln.lsexe"
+providers = ["lsrt"]
+
+[[programs]]
+name = "request_probe"
+owner = "services"
+role = "probe"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/request_probe.lsexe"
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "resource_manager"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/resource_manager.lsexe"
+providers = [
+    "resources-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "resource_probe"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "pinned"
+destination = "resource_probe.lsexe"
+providers = []
+
+[[programs]]
+name = "rm"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/rm.lsexe"
+providers = [
+    "volume-client",
+    "storage-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "rmdir"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/rmdir.lsexe"
+providers = [
+    "volume-client",
+    "storage-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "run"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/run.lsexe"
+providers = [
+    "process-client",
+    "process-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "sandbox_probe"
+owner = "services"
+role = "probe"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/sandbox_probe.lsexe"
+providers = [
+    "base-proto",
+    "storage-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "script"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/script.lsexe"
+providers = ["lsrt"]
+
+[[programs]]
+name = "service_manager"
+owner = "services"
+role = "launcher"
+linkage = "static"
+stage = "pinned"
+destination = "service_manager.lsexe"
+providers = []
+
+[[programs]]
+name = "session_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/session_service.lsexe"
+providers = [
+    "session-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "set"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/set.lsexe"
+providers = [
+    "config-client",
+    "lsrt",
+]
+
+[[programs]]
+name = "shell"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/shell.lsexe"
+providers = [
+    "service-util",
+    "base-proto",
+    "input-proto",
+    "observability-proto",
+    "process-proto",
+    "session-proto",
+    "storage-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "snap"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/snap.lsexe"
+providers = [
+    "volume-client",
+    "lsrt",
+]
+
+[[programs]]
+name = "ss"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/ss.lsexe"
+providers = [
+    "network-client",
+    "network-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "stop"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/stop.lsexe"
+providers = ["lsrt"]
+
+[[programs]]
+name = "storage_client"
+owner = "storage"
+role = "helper"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/storage_client.lsexe"
+providers = [
+    "base-proto",
+    "storage-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "storage_service"
+owner = "storage"
+role = "service"
+linkage = "static"
+stage = "pinned"
+destination = "storage_service.lsexe"
+providers = []
+
+[[programs]]
+name = "system_graph_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/system_graph_service.lsexe"
+providers = [
+    "observability-proto",
+    "device-proto",
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "system_manager"
+owner = "system_manager"
+role = "launcher"
+linkage = "static"
+stage = "pinned"
+destination = "system_manager.lsexe"
+providers = []
+
+[[programs]]
+name = "tcp"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/tcp.lsexe"
+providers = [
+    "network-client",
+    "network-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "time_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/time_service.lsexe"
+providers = [
+    "network-proto",
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "uname"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/uname.lsexe"
+providers = ["lsrt"]
+
+[[programs]]
+name = "uptime"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/uptime.lsexe"
+providers = ["lsrt"]
+
+[[programs]]
+name = "usage"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/usage.lsexe"
+providers = [
+    "resources-client",
+    "resources-proto",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "virtio_blk"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "pinned"
+destination = "virtio_blk.lsexe"
+providers = []
+
+[[programs]]
+name = "virtio_console"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_console.lsexe"
+providers = []
+
+[[programs]]
+name = "virtio_gpu"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_gpu.lsexe"
+providers = []
+
+[[programs]]
+name = "virtio_input"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_input.lsexe"
+providers = []
+
+[[programs]]
+name = "virtio_net"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_net.lsexe"
+providers = []
+
+[[programs]]
+name = "virtio_snd"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_snd.lsexe"
+providers = []
+
+[[programs]]
+name = "volume"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/volume.lsexe"
+providers = [
+    "volume-client",
+    "lsrt",
+]
+
+[[programs]]
+name = "wasi_host"
+owner = "services"
+role = "helper"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/wasi_host.lsexe"
+providers = [
+    "wasm",
+    "base-proto",
+    "config-proto",
+    "storage-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[programs]]
+name = "watchdog_probe"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "pinned"
+destination = "watchdog_probe.lsexe"
+providers = []
+
+[[programs]]
+name = "write"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/write.lsexe"
+providers = [
+    "volume-client",
+    "storage-proto",
+    "lsrt",
+]
+
+[[programs]]
+name = "xhci"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/xhci.lsexe"
+providers = []
+
+[[services]]
+name = "audio_service"
+program = "audio_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "device_manager",
+    "process_service",
+]
+
+[[services]]
+name = "config_service"
+program = "config_service"
+restart = "transparent"
+dependencies = [
+    "log_service",
+    "process_service",
+]
+
+[[services]]
+name = "console_service"
+program = "console_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "time_service",
+    "audio_service",
+    "input_service",
+    "display_service",
+    "session_service",
+    "process_service",
+    "permission_manager",
+]
+
+[[services]]
+name = "device_manager"
+program = "device_manager"
+restart = "escalate"
+dependencies = ["log_service"]
+
+[[services]]
+name = "device_service"
+program = "device_service"
+restart = "transparent"
+dependencies = [
+    "log_service",
+    "process_service",
+]
+
+[[services]]
+name = "display_service"
+program = "display_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "device_manager",
+    "process_service",
+    "input_service",
+]
+
+[[services]]
+name = "input_service"
+program = "input_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "device_manager",
+    "process_service",
+]
+
+[[services]]
+name = "iso_storage"
+program = "storage_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "device_manager",
+]
+
+[[services]]
+name = "log_service"
+program = "log_service"
+restart = "escalate"
+dependencies = []
+
+[[services]]
+name = "media_storage"
+program = "storage_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "device_manager",
+]
+
+[[services]]
+name = "network_service"
+program = "network_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "device_manager",
+    "process_service",
+    "config_service",
+]
+
+[[services]]
+name = "permission_manager"
+program = "permission_manager"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "storage_service",
+    "media_storage",
+    "iso_storage",
+    "udf_storage",
+    "usb_storage",
+    "network_service",
+    "time_service",
+    "config_service",
+    "device_service",
+    "audio_service",
+    "process_service",
+    "resource_manager",
+]
+
+[[services]]
+name = "process_service"
+program = "process_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "storage_service",
+]
+
+[[services]]
+name = "resource_manager"
+program = "resource_manager"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "process_service",
+]
+
+[[services]]
+name = "session_service"
+program = "session_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "process_service",
+]
+
+[[services]]
+name = "shell"
+program = "shell"
+restart = "escalate"
+dependencies = [
+    "storage_service",
+    "media_storage",
+    "iso_storage",
+    "udf_storage",
+    "usb_storage",
+    "device_service",
+    "process_service",
+    "config_service",
+    "network_service",
+    "time_service",
+    "console_service",
+    "audio_service",
+    "input_service",
+    "permission_manager",
+    "resource_manager",
+    "system_graph_service",
+    "session_service",
+]
+
+[[services]]
+name = "storage_service"
+program = "storage_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "device_manager",
+]
+
+[[services]]
+name = "system_graph_service"
+program = "system_graph_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "device_manager",
+    "storage_service",
+    "network_service",
+    "device_service",
+    "process_service",
+    "config_service",
+    "time_service",
+    "console_service",
+    "audio_service",
+    "input_service",
+    "permission_manager",
+    "resource_manager",
+]
+
+[[services]]
+name = "time_service"
+program = "time_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "network_service",
+    "process_service",
+]
+
+[[services]]
+name = "udf_storage"
+program = "storage_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "device_manager",
+]
+
+[[services]]
+name = "usb_storage"
+program = "storage_service"
+restart = "escalate"
+dependencies = [
+    "log_service",
+    "storage_service",
+]
+
+[[libraries]]
+name = "adpcm"
+owner = "adpcm"
+destination = "lib/audio/adpcm.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "aiff"
+owner = "aiff"
+destination = "lib/audio/aiff.lslib"
+features = []
+providers = [
+    "pcm",
+    "lsrt",
+]
+
+[[libraries]]
+name = "apng"
+owner = "apng"
+destination = "lib/image/apng.lslib"
+features = []
+providers = [
+    "png",
+    "pix",
+    "lsrt",
+]
+
+[[libraries]]
+name = "audio-client"
+owner = "audio-client-provider"
+destination = "lib/clients/audio-client.lslib"
+features = ["shared-image"]
+providers = ["audio-proto"]
+
+[[libraries]]
+name = "audio-proto"
+owner = "audio-proto"
+destination = "lib/protocol/audio-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "base-proto"
+owner = "base-proto"
+destination = "lib/protocol/base-proto.lslib"
+features = []
+providers = [
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "bmp"
+owner = "bmp"
+destination = "lib/image/bmp.lslib"
+features = []
+providers = [
+    "quantize",
+    "pix",
+    "lsrt",
+]
+
+[[libraries]]
+name = "config-client"
+owner = "config-client-provider"
+destination = "lib/clients/config-client.lslib"
+features = ["shared-image"]
+providers = ["config-proto"]
+
+[[libraries]]
+name = "config-proto"
+owner = "config-proto"
+destination = "lib/protocol/config-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "deflate"
+owner = "deflate"
+destination = "lib/compression/deflate.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "device-client"
+owner = "device-client-provider"
+destination = "lib/clients/device-client.lslib"
+features = ["shared-image"]
+providers = ["device-proto"]
+
+[[libraries]]
+name = "device-proto"
+owner = "device-proto"
+destination = "lib/protocol/device-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "display-proto"
+owner = "display-proto"
+destination = "lib/protocol/display-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "flac"
+owner = "flac"
+destination = "lib/audio/flac.lslib"
+features = []
+providers = [
+    "pcm",
+    "lsrt",
+]
+
+[[libraries]]
+name = "gif"
+owner = "gif"
+destination = "lib/image/gif.lslib"
+features = []
+providers = [
+    "quantize",
+    "pix",
+    "lsrt",
+]
+
+[[libraries]]
+name = "icns"
+owner = "icns"
+destination = "lib/image/icns.lslib"
+features = []
+providers = [
+    "png",
+    "pix",
+    "lsrt",
+]
+
+[[libraries]]
+name = "ico"
+owner = "ico"
+destination = "lib/image/ico.lslib"
+features = []
+providers = [
+    "png",
+    "pix",
+    "lsrt",
+]
+
+[[libraries]]
+name = "imgconv"
+owner = "imgconv"
+destination = "lib/image/imgconv.lslib"
+features = []
+providers = [
+    "apng",
+    "bmp",
+    "gif",
+    "icns",
+    "ico",
+    "jpeg",
+    "pcx",
+    "png",
+    "ppm",
+    "qoi",
+    "tga",
+    "webp",
+    "pix",
+    "lsrt",
+]
+
+[[libraries]]
+name = "inflate"
+owner = "inflate"
+destination = "lib/compression/inflate.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "input-proto"
+owner = "input-proto"
+destination = "lib/protocol/input-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "ipc-client"
+owner = "ipc-client"
+destination = "lib/ipc/ipc-client.lslib"
+features = ["shared-image"]
+providers = ["lsrt"]
+
+[[libraries]]
+name = "jpeg"
+owner = "jpeg"
+destination = "lib/image/jpeg.lslib"
+features = []
+providers = [
+    "pix",
+    "lsrt",
+]
+
+[[libraries]]
+name = "keys"
+owner = "keys"
+destination = "lib/input/keys.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "log-client"
+owner = "log-client-provider"
+destination = "lib/clients/log-client.lslib"
+features = ["shared-image"]
+providers = ["log-proto"]
+
+[[libraries]]
+name = "log-proto"
+owner = "log-proto"
+destination = "lib/protocol/log-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "lsrt"
+owner = "rt"
+destination = "lib/runtime/lsrt.lslib"
+features = ["shared-image"]
+providers = []
+
+[[libraries]]
+name = "mp3"
+owner = "mp3"
+destination = "lib/audio/mp3.lslib"
+features = []
+providers = [
+    "pcm",
+    "lsrt",
+]
+
+[[libraries]]
+name = "network-client"
+owner = "network-client-provider"
+destination = "lib/clients/network-client.lslib"
+features = ["shared-image"]
+providers = ["network-proto"]
+
+[[libraries]]
+name = "network-proto"
+owner = "network-proto"
+destination = "lib/protocol/network-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "observability-client"
+owner = "observability-client-provider"
+destination = "lib/clients/observability-client.lslib"
+features = ["shared-image"]
+providers = ["observability-proto"]
+
+[[libraries]]
+name = "observability-proto"
+owner = "observability-proto"
+destination = "lib/protocol/observability-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "ogg"
+owner = "ogg"
+destination = "lib/audio/ogg.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "pcm"
+owner = "pcm"
+destination = "lib/audio/pcm.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "pcx"
+owner = "pcx"
+destination = "lib/image/pcx.lslib"
+features = []
+providers = [
+    "quantize",
+    "pix",
+    "lsrt",
+]
+
+[[libraries]]
+name = "pix"
+owner = "pix"
+destination = "lib/image/pix.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "png"
+owner = "png"
+destination = "lib/image/png.lslib"
+features = []
+providers = [
+    "quantize",
+    "pix",
+    "inflate",
+    "deflate",
+    "lsrt",
+]
+
+[[libraries]]
+name = "ppm"
+owner = "ppm"
+destination = "lib/image/ppm.lslib"
+features = []
+providers = [
+    "pix",
+    "lsrt",
+]
+
+[[libraries]]
+name = "process-client"
+owner = "process-client-provider"
+destination = "lib/clients/process-client.lslib"
+features = ["shared-image"]
+providers = ["process-proto"]
+
+[[libraries]]
+name = "process-proto"
+owner = "process-proto"
+destination = "lib/protocol/process-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "qoi"
+owner = "qoi"
+destination = "lib/image/qoi.lslib"
+features = []
+providers = [
+    "pix",
+    "lsrt",
+]
+
+[[libraries]]
+name = "quantize"
+owner = "quantize"
+destination = "lib/image/quantize.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "resources-client"
+owner = "resources-client-provider"
+destination = "lib/clients/resources-client.lslib"
+features = ["shared-image"]
+providers = ["resources-proto"]
+
+[[libraries]]
+name = "resources-proto"
+owner = "resources-proto"
+destination = "lib/protocol/resources-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "security-client"
+owner = "security-client-provider"
+destination = "lib/clients/security-client.lslib"
+features = ["shared-image"]
+providers = ["security-proto"]
+
+[[libraries]]
+name = "security-proto"
+owner = "security-proto"
+destination = "lib/protocol/security-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "process-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "service-util"
+owner = "services"
+destination = "lib/service/service-util.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "session-proto"
+owner = "session-proto"
+destination = "lib/protocol/session-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "storage-proto"
+owner = "storage-proto"
+destination = "lib/protocol/storage-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "surface"
+owner = "surface"
+destination = "lib/display/surface.lslib"
+features = []
+providers = [
+    "base-proto",
+    "display-proto",
+    "ipc-client",
+    "lsrt",
+]
+
+[[libraries]]
+name = "term"
+owner = "term"
+destination = "lib/terminal/term.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "tga"
+owner = "tga"
+destination = "lib/image/tga.lslib"
+features = []
+providers = [
+    "pix",
+    "lsrt",
+]
+
+[[libraries]]
+name = "time-client"
+owner = "time-client-provider"
+destination = "lib/clients/time-client.lslib"
+features = ["shared-image"]
+providers = ["time-proto"]
+
+[[libraries]]
+name = "time-proto"
+owner = "time-proto"
+destination = "lib/protocol/time-proto.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "ipc-client",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "volume-client"
+owner = "volume-client-provider"
+destination = "lib/clients/volume-client.lslib"
+features = ["shared-image"]
+providers = [
+    "base-proto",
+    "storage-proto",
+    "wire",
+    "lsrt",
+]
+
+[[libraries]]
+name = "vorbis"
+owner = "vorbis"
+destination = "lib/audio/vorbis.lslib"
+features = []
+providers = [
+    "ogg",
+    "pcm",
+    "lsrt",
+]
+
+[[libraries]]
+name = "wasm"
+owner = "wasm"
+destination = "lib/component/wasm.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "wav"
+owner = "wav"
+destination = "lib/audio/wav.lslib"
+features = []
+providers = [
+    "adpcm",
+    "pcm",
+    "lsrt",
+]
+
+[[libraries]]
+name = "wavpack"
+owner = "wavpack"
+destination = "lib/audio/wavpack.lslib"
+features = []
+providers = [
+    "pcm",
+    "lsrt",
+]
+
+[[libraries]]
+name = "webp"
+owner = "webp"
+destination = "lib/image/webp.lslib"
+features = []
+providers = [
+    "pix",
+    "lsrt",
+]
+
+[[libraries]]
+name = "wire"
+owner = "wire"
+destination = "lib/ipc/wire.lslib"
+features = []
+providers = ["lsrt"]

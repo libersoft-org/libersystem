@@ -1,0 +1,13 @@
+[package]
+name = "system-manifest"
+edition = "2024"
+description = "Typed LiberSystem source, deployment, service, and dynamic-image manifest"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+toml = "0.9.12"
+
+[[bin]]
+name = "system-manifest"
+path = "src/main.rs"

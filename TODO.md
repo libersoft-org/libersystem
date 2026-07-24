@@ -4649,7 +4649,7 @@ capability policy remain unchanged.
     passed. The broader focused-tag run continued into an unrelated lossy WebP smoke
     assertion after all taxonomy scenarios passed and failed its existing RGB MSE
     bound.
-- [ ] Replace the positional `user/services/manifest.txt` line protocol with one typed,
+- [x] Replace the positional `user/services/manifest.txt` line protocol with one typed,
   fully validated `user/services/manifest.toml` and a single owner for every
   interpretation of it. Add a host-only `tools/system-manifest` Rust crate whose library
   is the only TOML deserializer, canonicalizer and semantic validator, with a thin CLI
@@ -4728,6 +4728,28 @@ capability policy remain unchanged.
     compilation, and focused QEMU service/process/storage/dynamic scenarios. A manifest
     edit that preserves canonical semantics must produce byte-identical generated tables
     and no unrelated image-cache invalidation.
+  - Typed-manifest result (2026-07-24): `user/services/manifest.toml` is now the only
+    hand-edited userspace ownership/deployment source. Its normalized 77 sources, 83
+    programs, 21 supervised services and 60 libraries are parsed into validated name
+    and path types plus deterministic maps by the host-only `system-manifest` library;
+    its CLI exposes checked source lookup, canonical JSON, inventories, consumers and
+    staged paths through one locked content-keyed bootstrap binary. The validator
+    rejects unknown/schema fields, malformed or missing source roots, incomplete
+    userspace crate coverage, duplicate names/paths/destinations/edges, invalid
+    role/linkage/stage and suffix combinations, unknown references, category drift,
+    executable aliases, service/provider cycles and the provider depth/module bounds,
+    reporting independent errors in stable order. Kernel and the services-only build
+    wrapper consume the library directly; shell tools consume one canonical JSON model
+    per process, and source hygiene enforces the direct-reader ownership boundary.
+    Storage instances now explicitly reference `storage_service` in generated runtime
+    data, removing the supervisor's hard-coded executable alias. The positional file,
+    importer and every field-index parser are gone without a compatibility copy.
+    Three owner tests, kernel and service builds, source/metadata gates, warm and
+    one-tool cache checks, static/provider-edge/identity mutation gates, complete
+    x86_64/AArch64/RISC-V 60-provider/67-consumer builds and triarch reports passed.
+    Focused QEMU passed every service/process/storage/dynamic manifest scenario and all
+    five exact dynamic-wave checks before the broader smoke set reached the unrelated
+    existing lossy WebP RGB-MSE failure.
 - [x] Remove the redundant `order/` namespace and generated `.order` sidecars. The
   complete provider graph is already bound and cross-checked by each executable/library
   identity record and its exact `DT_NEEDED` edges, while both the image builder and

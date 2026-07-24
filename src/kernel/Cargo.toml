@@ -24,6 +24,7 @@ term = { path = "../term" }
 [build-dependencies]
 abi = { path = "../abi" }
 bootproto = { path = "../bootproto" }
+system-manifest = { path = "../tools/system-manifest" }
 
 [dev-dependencies]
 bmp = { path = "../user/libs/image/bmp" }

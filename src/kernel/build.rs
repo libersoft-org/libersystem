@@ -4,7 +4,7 @@
 
 use std::env;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -87,7 +87,7 @@ fn conf_get<'a>(conf: &'a [(String, String)], key: &str) -> &'a str {
 }
 
 // The userspace programs staged at boot, read from the shared service manifest
-// (../user/services/manifest.txt) - the single source of truth ServiceManager also
+// (../user/services/manifest.toml) - the single source of truth ServiceManager also
 // generates its dependency table from, so the runtime service set and the staged
 // programs cannot drift. Source rows map logical owners to workspace-relative Cargo
 // roots; artifact rows retain `kind name crate stage [deps...]`. The kind and stage
@@ -114,75 +114,41 @@ struct ManifestRow {
 // program (an `instance` row is a managed service backed by another program's ELF, so
 // it stages nothing of its own - its `crate` is `-` and its `stage` is `none`).
 fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
-	let path: PathBuf = manifest.join("../user/services/manifest.txt");
-	let text: String = fs::read_to_string(&path).unwrap_or_else(|e: std::io::Error| panic!("cannot read {}: {e}", path.display()));
-	println!("cargo:rerun-if-changed={}", path.display());
-	let workspace: PathBuf = manifest.join("..");
-	let mut sources: Vec<(String, String)> = Vec::new();
-	for line in text.lines() {
-		let trimmed: &str = line.trim();
-		if trimmed.is_empty() || trimmed.starts_with('#') {
-			continue;
-		}
-		let mut fields = trimmed.split_whitespace();
-		if fields.next() != Some("source") {
-			continue;
-		}
-		let owner: String = fields.next().expect("source row missing logical owner").to_string();
-		let crate_path: String = fields.next().expect("source row missing crate path").to_string();
-		assert!(fields.next().is_none(), "source {owner} has trailing fields");
-		assert!(valid_library_name(&owner), "source row has invalid logical owner {owner:?}");
-		assert!(!Path::new(&crate_path).is_absolute() && Path::new(&crate_path).components().all(|component| matches!(component, Component::Normal(_))), "source {owner} has invalid workspace-relative path {crate_path:?}");
-		assert!(!sources.iter().any(|(known, _)| known == &owner), "duplicate source logical owner {owner}");
-		assert!(!sources.iter().any(|(_, known)| known == &crate_path), "duplicate source path {crate_path}");
-		assert!(workspace.join(&crate_path).join("Cargo.toml").is_file(), "source {owner} has no Cargo.toml at {crate_path}");
-		sources.push((owner, crate_path));
-	}
+	use system_manifest::{Linkage, ProgramRole, Stage};
+
+	let workspace = manifest.join("..");
+	let model = system_manifest::Manifest::load_workspace(&workspace).unwrap_or_else(|error| panic!("{error}"));
 	let mut rows: Vec<ManifestRow> = Vec::new();
-	let mut library_destinations: Vec<String> = Vec::new();
-	for line in text.lines() {
-		let trimmed: &str = line.trim();
-		if trimmed.is_empty() || trimmed.starts_with('#') {
-			continue;
-		}
-		let mut fields = trimmed.split_whitespace();
-		let kind: String = fields.next().expect("manifest row missing kind").to_string();
-		if kind == "source" {
-			continue;
-		}
-		let name: String = fields.next().expect("manifest row missing name").to_string();
-		let crate_dir: String = fields.next().expect("manifest row missing crate").to_string();
-		let crate_path: String = if crate_dir == "-" { String::new() } else { sources.iter().find(|(owner, _)| owner == &crate_dir).unwrap_or_else(|| panic!("manifest row {name} names undeclared source owner {crate_dir}")).1.clone() };
-		let stage: String = fields.next().expect("manifest row missing stage").to_string();
-		let destination = (kind == "library").then(|| fields.next().expect("library manifest row missing destination path").to_string());
-		let features = (kind == "library").then(|| fields.next().expect("library manifest row missing feature set").to_string());
-		let providers: Vec<String> = if kind == "dynamic-service" {
-			fields.by_ref().find(|field| *field == "--").expect("dynamic-service row missing -- separator");
-			fields.map(String::from).collect()
-		} else {
-			fields.map(String::from).collect()
+	for library in model.libraries.values() {
+		let source = model.sources.get(&library.owner).expect("validated library owner");
+		let features = if library.features.is_empty() { String::from("-") } else { library.features.iter().map(|feature| feature.as_str()).collect::<Vec<_>>().join(",") };
+		rows.push(ManifestRow { kind: String::from("library"), name: library.name.as_str().to_string(), crate_dir: library.owner.as_str().to_string(), crate_path: source.path.as_str().to_string(), stage: String::from("volume"), destination: Some(library.destination.as_str().to_string()), features: Some(features), providers: library.providers.iter().map(|provider| provider.as_str().to_string()).collect() });
+	}
+	for program in model.programs.values() {
+		let source = model.sources.get(&program.owner).expect("validated program owner");
+		let kind = match (program.role, program.linkage) {
+			(ProgramRole::Service, Linkage::Dynamic) => "dynamic-service",
+			(ProgramRole::Service, Linkage::Static) => "service",
+			(ProgramRole::Launcher, _) => "launcher",
+			(ProgramRole::Driver, _) => "driver",
+			(ProgramRole::Probe, Linkage::Static) => "probe",
+			(ProgramRole::Probe | ProgramRole::Tool | ProgramRole::Helper, Linkage::Dynamic) => "dynamic",
+			(ProgramRole::Tool | ProgramRole::Helper, Linkage::Static) => panic!("validated static tool/helper"),
 		};
-		if let Some(path) = destination.as_deref() {
-			let category: &str = if let Some(relative) = crate_path.strip_prefix("user/libs/") {
-				let (category, leaf) = relative.split_once('/').unwrap_or_else(|| panic!("library {name} source path has no category: {crate_path}"));
-				assert!(leaf == crate_dir && !category.is_empty() && !category.contains('/'), "library {name} source path drifts from owner {crate_dir}: {crate_path}");
-				category
-			} else {
-				match (name.as_str(), crate_dir.as_str(), crate_path.as_str()) {
-					("lsrt", "rt", "user/runtime/rt") => "runtime",
-					("wire", "wire", "wire") => "ipc",
-					("wasm", "wasm", "wasm") => "component",
-					("term", "term", "term") => "terminal",
-					("service-util", "services", "user/services/core") => "service",
-					_ => panic!("library {name} has no ownership category for {crate_dir} at {crate_path}"),
-				}
-			};
-			let expected = format!("lib/{category}/{name}.lslib");
-			assert!(path == expected, "library {name} has non-canonical destination {path:?}, expected {expected:?}");
-			assert!(!library_destinations.iter().any(|known| known == path), "duplicate library destination {path}");
-			library_destinations.push(path.to_string());
-		}
-		rows.push(ManifestRow { kind, name, crate_dir, crate_path, stage, destination, features, providers });
+		rows.push(ManifestRow {
+			kind: kind.to_string(),
+			name: program.name.as_str().to_string(),
+			crate_dir: program.owner.as_str().to_string(),
+			crate_path: source.path.as_str().to_string(),
+			stage: match program.stage {
+				Stage::Pinned => "pinned",
+				Stage::Volume => "volume",
+			}
+			.to_string(),
+			destination: Some(program.destination.as_str().to_string()),
+			features: None,
+			providers: program.providers.iter().map(|provider| provider.as_str().to_string()).collect(),
+		});
 	}
 	rows
 }
@@ -193,7 +159,7 @@ fn generate_test_library_paths(rows: &[ManifestRow]) {
 		let destination = row.destination.as_deref().expect("library destination");
 		arms.push_str(&format!("\t\"{}.lslib\" => Some(\"{}\"),\n", row.name, destination));
 	}
-	let source = format!("// @generated from user/services/manifest.txt by build.rs - do not edit.\nfn test_library_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{arms}\t\t_ => None,\n\t}}\n}}\n");
+	let source = format!("// @generated from user/services/manifest.toml by build.rs - do not edit.\nfn test_library_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{arms}\t\t_ => None,\n\t}}\n}}\n");
 	let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
 	fs::write(out_dir.join("library_paths.rs"), source).expect("write test library paths");
 }
@@ -533,9 +499,9 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			assert!(features == "-" || features.split(',').all(valid_library_name), "library {} has invalid feature set {features:?}", row.name);
 		}
 		let dest: String = match row.kind.as_str() {
-			"driver" if row.stage == "volume" => format!("drivers/{}", executable_artifact_name(&row.name)),
+			"driver" if row.stage == "volume" => row.destination.clone().expect("driver destination"),
 			"library" if row.stage == "volume" => row.destination.clone().expect("library destination"),
-			"dynamic" | "dynamic-service" if row.stage == "volume" => format!("bin/{}", executable_artifact_name(&row.name)),
+			"dynamic" | "dynamic-service" if row.stage == "volume" => row.destination.clone().expect("program destination"),
 			_ => continue,
 		};
 		let path: PathBuf = match row.kind.as_str() {

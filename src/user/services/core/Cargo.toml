@@ -5,7 +5,7 @@ name = "services"
 # system services started across the boot chain (ServiceManager first), loaded
 # from the init package.
 edition = "2024"
-build = "../../build.rs"
+build = "build.rs"
 description = "Core userspace system services (ServiceManager, ...)"
 
 [features]
@@ -134,6 +134,9 @@ pix = { path = "../../libs/image/pix" }
 keys = { path = "../../libs/input/keys" }
 pcm = { path = "../../libs/audio/pcm" }
 surface = { path = "../../libs/display/surface" }
+
+[build-dependencies]
+system-manifest = { path = "../../../tools/system-manifest" }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

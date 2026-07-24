@@ -3,7 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
-manifest="src/user/services/manifest.txt"
+manifest_json="$(src/tools/system-manifest.sh export-json)"
 
 mode="${1:---current}"
 case "$mode" in
@@ -54,6 +54,15 @@ if [[ "$actual_user_root" != "$expected_user_root" ]]; then
 	exit 1
 fi
 
+manifest_pattern='(read_to_string|join).*user/services/manifest[.]toml'
+manifest_readers="$(grep -RIlE "$manifest_pattern" src --include='*.rs' --include='*.sh' | sort || true)"
+allowed_manifest_readers="$(printf '%s\n' src/tools/system-manifest/src/lib.rs src/tools/system-manifest/src/main.rs | sort)"
+if [[ "$manifest_readers" != "$allowed_manifest_readers" ]]; then
+	echo "source-hygiene: direct manifest readers differ from the ownership allowlist:" >&2
+	diff -u <(printf '%s\n' "$allowed_manifest_readers") <(printf '%s\n' "$manifest_readers") >&2 || true
+	exit 1
+fi
+
 if find src/user -mindepth 2 -maxdepth 2 -name Cargo.toml -print -quit | grep -q .; then
 	echo "source-hygiene: a Cargo crate remains directly under src/user:" >&2
 	find src/user -mindepth 2 -maxdepth 2 -name Cargo.toml -print >&2
@@ -64,7 +73,7 @@ source_rows="$(mktemp)"
 physical_user_crates="$(mktemp)"
 declared_user_crates="$(mktemp)"
 trap 'rm -f "$source_rows" "$physical_user_crates" "$declared_user_crates"' EXIT
-awk '$1 == "source" {print $2 "\t" $3}' "$manifest" | sort >"$source_rows"
+jq -r '.sources[] | [.owner, .path] | @tsv' <<<"$manifest_json" | sort >"$source_rows"
 duplicate_owner="$(cut -f1 "$source_rows" | uniq -d | head -n1)"
 duplicate_path="$(cut -f2 "$source_rows" | sort | uniq -d | head -n1)"
 if [[ -n "$duplicate_owner" || -n "$duplicate_path" ]]; then

@@ -3,14 +3,14 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 build_root="$root/../.build"
-manifest="$root/user/services/manifest.txt"
+manifest_json="$("$root/tools/system-manifest.sh" export-json)"
 mode="${1:-quick}"
 output="$(mktemp)"
 backup=""
 source=""
 
 source_path() {
-	awk -v owner="$1" '$1 == "source" && $2 == owner {print $3; count++} END {if (count != 1) exit 1}' "$manifest"
+	jq -er --arg owner "$1" '.sources[$owner].path' <<<"$manifest_json"
 }
 
 command -v flock >/dev/null
@@ -98,7 +98,7 @@ provider)
 	printf '\n// shared-cache-check-%s\n' "$$" >>"$source"
 	run_graph
 	expect_only_misses provider volume-client
-	mapfile -t consumers < <(awk '$1 == "dynamic" && $4 == "volume" {for (i = 5; i <= NF; i++) if ($i == "volume-client") {print $2; break}}' "$manifest" | sort)
+	mapfile -t consumers < <(jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume" and (.providers | index("volume-client"))) | .name' <<<"$manifest_json" | sort)
 	expect_only_misses executable "${consumers[@]}"
 	for consumer in "${consumers[@]}"; do
 		if ! grep -q "^build-shared: object cache hit $consumer$" "$output"; then

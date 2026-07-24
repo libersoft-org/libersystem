@@ -3,7 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 build_root="$root/../.build"
-manifest="$root/user/services/manifest.txt"
+manifest_json="$("$root/tools/system-manifest.sh" export-json)"
 first="${1:-static}"
 kind="static"
 mode="all"
@@ -34,7 +34,7 @@ command -v sha256sum >/dev/null
 command -v timeout >/dev/null
 
 source_path() {
-	awk -v owner="$1" '$1 == "source" && $2 == owner {print $3; count++} END {if (count != 1) exit 1}' "$manifest"
+	jq -er --arg owner "$1" '.sources[$owner].path' <<<"$manifest_json"
 }
 mkdir -p "$build_root"
 exec 8>"$build_root/image-build-x86_64-unknown-none.lock"

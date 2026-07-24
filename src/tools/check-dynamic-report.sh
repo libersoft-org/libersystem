@@ -3,7 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 build_root="$root/../.build"
-manifest="$root/user/services/manifest.txt"
+manifest_json="$("$root/tools/system-manifest.sh" export-json)"
 report="$root/../docs/DYNAMIC_EXECUTABLES.tsv"
 wave_report="$root/../docs/DYNAMIC_WAVES.tsv"
 image_report="$root/../docs/DYNAMIC_IMAGE.tsv"
@@ -24,7 +24,7 @@ command -v sha256sum >/dev/null
 command -v stat >/dev/null
 
 source_path() {
-	awk -v owner="$1" '$1 == "source" && $2 == owner {print $3; count++} END {if (count != 1) exit 1}' "$manifest"
+	jq -er --arg owner "$1" '.sources[$owner].path' <<<"$manifest_json"
 }
 
 declare -A waves=()
@@ -61,7 +61,7 @@ tests[3]='just test-tags service,process,storage'
 tests[4]='just test-tags service,process'
 tests[5]='just test-tags image,audio,service,process,storage'
 
-manifest_tools="$(awk '$1 == "dynamic" && $3 == "tools" && $4 == "volume" {print $2}' "$manifest" | sort)"
+manifest_tools="$(jq -r '.programs[] | select(.role == "tool" and .linkage == "dynamic" and .stage == "volume") | .name' <<<"$manifest_json" | sort)"
 wave_tools="$(printf '%s\n' "${!waves[@]}" | sort)"
 if [[ "$manifest_tools" != "$wave_tools" ]]; then
 	echo "dynamic-report: wave inventory differs from the manifest tools" >&2
@@ -73,7 +73,7 @@ library_file() {
 	local target="$1"
 	local provider="$2"
 	local destination
-	destination="$(awk -v provider="$provider" '$1 == "library" && $2 == provider {print $5; count++} END {if (count != 1) exit 1}' "$manifest")"
+	destination="$(jq -er --arg provider "$provider" '.libraries[$provider].destination' <<<"$manifest_json")"
 	printf '%s/system-image/%s/%s\n' "$build_root" "$target" "$destination"
 }
 
@@ -109,7 +109,7 @@ canonical_manifest_order() {
 				echo "dynamic-report: manifest provider graph exceeds module limit $max_modules" >&2
 				return 1
 			fi
-			edges[$name]="$(awk -v provider="$name" '$1 == "library" && $2 == provider {for (i = 7; i <= NF; i++) {if (i > 7) printf " "; printf "%s", $i} found++} END {if (found != 1) exit 1}' "$manifest")"
+			edges[$name]="$(jq -er --arg provider "$name" '.libraries[$provider].providers | join(" ")' <<<"$manifest_json")"
 			present[$name]=1
 		fi
 		for provider in ${edges[$name]}; do
@@ -287,7 +287,7 @@ preload_metrics() {
 	local target tool provider
 	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
 		while IFS= read -r tool; do current_object_bytes "$target" "$tool" >/dev/null; done <<<"$manifest_tools"
-		while IFS= read -r provider; do provider_metrics "$target" "$provider" >/dev/null; done < <(awk '$1 == "library" {print $2}' "$manifest")
+		while IFS= read -r provider; do provider_metrics "$target" "$provider" >/dev/null; done < <(jq -r '.libraries[].name' <<<"$manifest_json")
 	done
 }
 
@@ -305,8 +305,8 @@ generate_report() {
 		for wave in 1 2 3 4 5; do
 			key="$target|$wave"
 			for tool in $(for candidate in "${!waves[@]}"; do if [[ "${waves[$candidate]}" == "$wave" ]]; then printf '%s\n' "$candidate"; fi; done | sort); do
-				row="$(awk -v tool="$tool" '$1 == "dynamic" && $2 == tool && $3 == "tools" && $4 == "volume" {print; count++} END {if (count != 1) exit 1}' "$manifest")"
-				providers="$(cut -d' ' -f5- <<<"$(tr -s ' ' <<<"$row")")"
+				row="$(jq -er --arg tool "$tool" '.programs[$tool] | select(.role == "tool" and .linkage == "dynamic" and .stage == "volume") | "dynamic \(.name) \(.owner) \(.stage) \(.providers | join(" "))"' <<<"$manifest_json")"
+				providers="$(cut -d' ' -f5- <<<"$row")"
 				artifact="$build_root/system-image/$target/bin/$tool"
 				[[ -f "$artifact" ]] || {
 					echo "dynamic-report: missing $target artifact for $tool" >&2

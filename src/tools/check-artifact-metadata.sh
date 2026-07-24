@@ -2,26 +2,26 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-manifest="$root/user/services/manifest.txt"
+manifest_json="$("$root/tools/system-manifest.sh" export-json)"
 build_root="$root/../.build"
 image_root="$build_root/system-image/x86_64-unknown-none"
 
 expected="$(
 	cat <<'EOF'
 dynamic dmesg tools volume lsrt
-dynamic du tools volume volume-client storage-proto wire lsrt
+dynamic du tools volume lsrt storage-proto volume-client wire
 dynamic free tools volume lsrt
-dynamic lscpu tools volume wire lsrt
-dynamic lsirq tools volume wire lsrt
-dynamic lsmem tools volume wire lsrt
-dynamic lspci tools volume wire lsrt
+dynamic lscpu tools volume lsrt wire
+dynamic lsirq tools volume lsrt wire
+dynamic lsmem tools volume lsrt wire
+dynamic lspci tools volume lsrt wire
 dynamic readln tools volume lsrt
 dynamic uname tools volume lsrt
 dynamic uptime tools volume lsrt
 EOF
 )"
 
-actual="$(awk '$1 == "dynamic" && $2 ~ /^(dmesg|du|free|lscpu|lsirq|lsmem|lspci|readln|uname|uptime)$/ {$1=$1; print}' "$manifest" | sort)"
+actual="$(jq -r '.programs[] | select(.linkage == "dynamic" and (.name | test("^(dmesg|du|free|lscpu|lsirq|lsmem|lspci|readln|uname|uptime)$"))) | "dynamic \(.name) \(.owner) \(.stage) \(.providers | join(" "))"' <<<"$manifest_json" | sort)"
 if [[ "$actual" != "$expected" ]]; then
 	echo "artifact-metadata: executable contracts differ from the manifest" >&2
 	diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
@@ -48,10 +48,7 @@ while IFS= read -r artifact; do
 		exit 1
 	fi
 done < <(
-	awk -v root="$image_root" '
-		$1 == "library" && $4 == "volume" {print root "/" $5}
-		($1 == "dynamic" || $1 == "dynamic-service") && $4 == "volume" {print root "/bin/" $2}
-	' "$manifest" | sort
+	jq -r --arg root "$image_root" '(.libraries[].destination | "\($root)/\(.)"), (.programs[] | select(.linkage == "dynamic" and .stage == "volume") | "\($root)/bin/\(.name)")' <<<"$manifest_json" | sort
 )
 
 echo "artifact-metadata: clean"

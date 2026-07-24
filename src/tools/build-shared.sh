@@ -10,7 +10,8 @@ target="$1"
 shift
 root="$(cd "$(dirname "$0")/.." && pwd)"
 build_root="$root/../.build"
-artifact_manifest="$root/user/services/manifest.txt"
+manifest_json="$("$root/tools/system-manifest.sh" export-json)"
+manifest_digest="$(sha256sum <<<"$manifest_json" | awk '{print $1}')"
 artifact_output_root="$build_root/system-image/$target"
 provider_output_dir="$artifact_output_root"
 executable_output_dir="$artifact_output_root/bin"
@@ -96,28 +97,15 @@ command -v xxd >/dev/null
 
 source_path() {
 	local owner="$1"
-	awk -v owner="$owner" '$1 == "source" && $2 == owner {print $3; count++} END {if (count != 1) exit 1}' "$artifact_manifest"
+	jq -er --arg owner "$owner" '.sources[$owner].path' <<<"$manifest_json"
 }
 
 declare -A source_owners=()
 declare -A source_paths=()
-while read -r source_kind source_owner source_crate_path trailing; do
-	[[ "$source_kind" == source ]] || continue
-	if [[ -n "$trailing" || ! "$source_owner" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ || ! "$source_crate_path" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ || "$source_crate_path" =~ (^|/)\.\.?(/|$) ]]; then
-		echo "build-shared: invalid source row for $source_owner" >&2
-		exit 1
-	fi
-	if [[ -n "${source_owners[$source_owner]:-}" || -n "${source_paths[$source_crate_path]:-}" ]]; then
-		echo "build-shared: duplicate source owner or path $source_owner $source_crate_path" >&2
-		exit 1
-	fi
-	if [[ ! -f "$root/$source_crate_path/Cargo.toml" ]]; then
-		echo "build-shared: source $source_owner has no Cargo.toml at $source_crate_path" >&2
-		exit 1
-	fi
+while IFS=$'\t' read -r source_owner source_crate_path; do
 	source_owners[$source_owner]="$source_crate_path"
 	source_paths[$source_crate_path]="$source_owner"
-done <"$artifact_manifest"
+done < <(jq -r '.sources[] | [.owner, .path] | @tsv' <<<"$manifest_json")
 
 declare -A source_file_hashes=()
 declare -A build_file_hashes=()
@@ -135,7 +123,7 @@ while read -r crate; do
 	}
 	printf '%s\n' "$crate_dir" >>"$source_roots_file"
 	if [[ "$crate" == *-client-provider ]]; then printf '%s\n' "$(source_path "${crate%-provider}")" >>"$source_roots_file"; fi
-done < <(awk '$1 == "library" {print $3}' "$artifact_manifest" | sort -u)
+done < <(jq -r '.libraries[].owner' <<<"$manifest_json" | sort -u)
 
 while read -r package; do
 	[[ -n "$package" ]] || continue
@@ -149,7 +137,7 @@ while read -r package; do
 		jq -r --arg root "$root" '.packages[] | select(.source == null) | .manifest_path | sub("/Cargo.toml$"; "") | sub("^" + $root + "/"; "")' |
 		sort -u >"$package_dirs"
 	cat "$package_dirs" >>"$source_roots_file"
-done < <(awk '($1 == "dynamic" || $1 == "dynamic-service") && $4 == "volume" {print $3}' "$artifact_manifest" | sort -u)
+done < <(jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume") | .owner' <<<"$manifest_json" | sort -u)
 sort -u -o "$source_roots_file" "$source_roots_file"
 
 while IFS= read -r -d '' record; do
@@ -163,7 +151,7 @@ done < <(
 	cd "$root"
 	{
 		mapfile -t source_roots <"$source_roots_file"
-		find "${source_roots[@]}" -path '*/target' -prune -o -path '*/shared' -prune -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' -o -path 'user/services/manifest.txt' \) -print0
+		find "${source_roots[@]}" -path '*/target' -prune -o -path '*/shared' -prune -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) -print0
 		printf 'user/build.rs\0user/user.ld\0user/user-aarch64.ld\0user/user-riscv64.ld\0'
 		printf '../product.conf\0'
 	} | sort -z | xargs -0 sha256sum --zero
@@ -208,7 +196,7 @@ object_tool_digest="$(sha256sum "$root/tools/build-consumer-object.sh" | awk '{p
 library_file() {
 	local artifact="$1"
 	local destination
-	destination="$(awk -v artifact="$artifact" '$1 == "library" && $2 == artifact {print $5; found++} END {if (found != 1) exit 1}' "$artifact_manifest")" || return 1
+	destination="$(jq -er --arg artifact "$artifact" '.libraries[$artifact].destination' <<<"$manifest_json")" || return 1
 	printf '%s/%s' "$provider_output_dir" "$destination"
 }
 
@@ -269,7 +257,7 @@ executable_source_digest() {
 			source_file_digest "$source"
 		done
 		if [[ "$package" == services ]]; then
-			source_file_digest "$root/user/services/manifest.txt"
+			printf 'manifest=%s\n' "$manifest_digest"
 		fi
 	} | sha256sum | awk '{print $1}'
 }
@@ -305,7 +293,7 @@ while read -r crate; do
 	crate_dir="$(source_path "$crate")"
 	printf '%s\n' "$crate_dir" >>"$source_digest_roots"
 	if [[ "$crate" == *-client-provider ]]; then printf '%s\n' "$(source_path "${crate%-provider}")" >>"$source_digest_roots"; fi
-done < <(awk '$1 == "library" {print $3}' "$artifact_manifest" | sort -u)
+done < <(jq -r '.libraries[].owner' <<<"$manifest_json" | sort -u)
 printf '%s\n' "$(source_path dyn_probe)" >>"$source_digest_roots"
 sort -u -o "$source_digest_roots" "$source_digest_roots"
 while IFS= read -r crate_dir; do
@@ -560,12 +548,12 @@ record_object_reference() {
 }
 
 manifest_library_row() {
-	awk -v artifact="$1" '$1 == "library" && $2 == artifact {print; count++} END {if (count != 1) exit 1}' "$artifact_manifest"
+	jq -er --arg artifact "$1" '.libraries[$artifact] | ["library", .name, .owner, "volume", .destination, (if (.features | length) == 0 then "-" else (.features | join(",")) end), (.providers | join(" "))] | @tsv' <<<"$manifest_json"
 }
 
 audit_library_destinations() {
 	local expected actual
-	expected="$(awk '$1 == "library" && $4 == "volume" {print $5}' "$artifact_manifest" | sort)"
+	expected="$(jq -r '.libraries[].destination' <<<"$manifest_json" | sort)"
 	actual="$(find "$provider_output_dir/lib" -type f -name '*.lslib' -printf 'lib/%P\n' 2>/dev/null | sort)"
 	if [[ "$actual" != "$expected" ]]; then
 		echo "build-shared: staged library paths differ from the manifest" >&2
@@ -574,29 +562,15 @@ audit_library_destinations() {
 	fi
 }
 
-manifest_specs="$(awk '$1 == "library" {print $2 "=" $3}' "$artifact_manifest" | sort)"
+manifest_specs="$(jq -r '.libraries[] | "\(.name)=\(.owner)"' <<<"$manifest_json" | sort)"
 requested_specs="$(for spec in "$@"; do if [[ "$spec" == *=* ]]; then printf '%s\n' "$spec"; else printf '%s=%s\n' "$spec" "$spec"; fi; done | sort)"
 if [[ "$requested_specs" != "$manifest_specs" ]]; then
 	echo "build-shared: requested libraries differ from the manifest" >&2
 	diff -u <(printf '%s\n' "$manifest_specs") <(printf '%s\n' "$requested_specs") >&2 || true
 	exit 1
 fi
-if awk '$1 == "component" && $4 == "volume" {found=1} END {exit !found}' "$artifact_manifest"; then
-	echo "build-shared: volume components must use dynamic manifest rows" >&2
-	exit 1
-fi
-
 dynamic_rows() {
-	awk '
-		$1 == "dynamic" && $2 != "dyn_probe" && $4 == "volume" {print; next}
-		$1 == "dynamic-service" && $4 == "volume" {
-			for (i = 5; i <= NF && $i != "--"; i++) {}
-			if (i > NF) {exit 1}
-			printf "dynamic %s %s %s", $2, $3, $4
-			for (i = i + 1; i <= NF; i++) printf " %s", $i
-			printf "\n"
-		}
-	' "$artifact_manifest" | sort -k2,2
+	jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume" and .name != "dyn_probe") | ["dynamic", .name, .owner, "volume", (.providers | join(" "))] | @tsv' <<<"$manifest_json" | sort -k2,2
 }
 
 build_file_hash_inventory() {
@@ -604,7 +578,7 @@ build_file_hash_inventory() {
 	while read -r artifact; do
 		file="$(library_file "$artifact")"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
-	done < <(awk '$1 == "library" {print $2}' "$artifact_manifest")
+	done < <(jq -r '.libraries[].name' <<<"$manifest_json")
 	while read -r kind consumer crate stage providers; do
 		file="$executable_output_dir/$consumer"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
@@ -668,7 +642,7 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 		while read -r crate; do
 			crate_dir="$(source_path "$crate")"
 			printf '%s=%s\n' "$crate_dir" "$(source_digest "$crate_dir")"
-		done < <(awk '$1 == "library" {print $3}' "$artifact_manifest" | sort -u)
+		done < <(jq -r '.libraries[].owner' <<<"$manifest_json" | sort -u)
 		for source in "$root/user/build.rs" "$root/../product.conf"; do
 			source_file_digest "$source"
 		done

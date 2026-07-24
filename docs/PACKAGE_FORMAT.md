@@ -113,10 +113,9 @@ package mapped `'static` (a boot module) hands out `'static` program slices.
 ## 3. The two build-time packages
 
 The kernel's `build.rs` assembles two `PKGARCH1` archives from the shared service
-manifest (`src/user/services/manifest.txt`), keyed by each program's manifest
+manifest (`src/user/services/manifest.toml`), keyed by each program's manifest
 name:
 
-- **`init.pkg`** - the pinned bootstrap set: the services on the path to
   mounting the system volume (LogService, DeviceManager, StorageService and its
   media/iso/udf/usb instances' binary, ProcessService) plus the bootstrap
   `virtio_blk` driver, and `SystemManager` / `ServiceManager` themselves. These
