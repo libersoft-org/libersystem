@@ -77,19 +77,43 @@ library_file() {
 
 canonical_manifest_order() {
 	local roots="$1"
-	local name provider candidate ready
+	local name depth provider candidate ready
+	local max_modules=64
+	local max_depth=16
 	local -A present=()
 	local -A edges=()
+	local -A depths=()
 	local -A ordered=()
-	local -a pending=($roots)
+	local -a pending_names=()
+	local -a pending_depths=()
 	local -a order=()
-	while ((${#pending[@]})); do
-		name="${pending[0]}"
-		pending=("${pending[@]:1}")
-		if [[ -n "${present[$name]:-}" ]]; then continue; fi
-		edges[$name]="$(awk -v provider="$name" '$1 == "library" && $2 == provider {for (i = 6; i <= NF; i++) {if (i > 6) printf " "; printf "%s", $i} found++} END {if (found != 1) exit 1}' "$manifest")"
-		present[$name]=1
-		for provider in ${edges[$name]}; do pending+=("$provider"); done
+	for name in $roots; do
+		pending_names+=("$name")
+		pending_depths+=(0)
+	done
+	while ((${#pending_names[@]})); do
+		name="${pending_names[0]}"
+		depth="${pending_depths[0]}"
+		pending_names=("${pending_names[@]:1}")
+		pending_depths=("${pending_depths[@]:1}")
+		if ((depth >= max_depth)); then
+			echo "dynamic-report: manifest provider graph exceeds dependency depth $max_depth" >&2
+			return 1
+		fi
+		if [[ -n "${depths[$name]:-}" ]] && ((${depths[$name]} >= depth)); then continue; fi
+		depths[$name]="$depth"
+		if [[ -z "${present[$name]:-}" ]]; then
+			if ((${#present[@]} >= max_modules)); then
+				echo "dynamic-report: manifest provider graph exceeds module limit $max_modules" >&2
+				return 1
+			fi
+			edges[$name]="$(awk -v provider="$name" '$1 == "library" && $2 == provider {for (i = 6; i <= NF; i++) {if (i > 6) printf " "; printf "%s", $i} found++} END {if (found != 1) exit 1}' "$manifest")"
+			present[$name]=1
+		fi
+		for provider in ${edges[$name]}; do
+			pending_names+=("$provider")
+			pending_depths+=($((depth + 1)))
+		done
 	done
 	while ((${#order[@]} < ${#present[@]})); do
 		candidate=""
@@ -274,7 +298,7 @@ join_lines() {
 generate_report() {
 	printf 'format=liber-dynamic-executable-report-v4\n'
 	printf 'wave\ttarget\ttool\tundefined_imports\timport_owners\tgeneric_residuals\tdeclared_providers\tdt_needed\ttransitive_providers\tobject_bytes\tpie_bytes\tprovider_bytes\tprivate_bytes\tshared_bytes\ttest_command\n'
-	local target wave key provider_key image_provider_key tool candidate row providers artifact order imports import_owners generic_residuals owner_record actual_needed declared transitive expected_transitive object_bytes pie_bytes provider_bytes private_bytes shared_bytes provider provider_size provider_private provider_shared
+	local target wave key provider_key image_provider_key tool candidate row providers artifact imports import_owners generic_residuals owner_record actual_needed declared transitive reversed_roots reversed_transitive object_bytes pie_bytes provider_bytes private_bytes shared_bytes provider provider_size provider_private provider_shared
 	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
 		for wave in 1 2 3 4 5; do
 			key="$target|$wave"
@@ -282,9 +306,8 @@ generate_report() {
 				row="$(awk -v tool="$tool" '$1 == "dynamic" && $2 == tool && $3 == "tools" && $4 == "volume" {print; count++} END {if (count != 1) exit 1}' "$manifest")"
 				providers="$(cut -d' ' -f5- <<<"$(tr -s ' ' <<<"$row")")"
 				artifact="$build_root/system-image/$target/bin/$tool"
-				order="$artifact.order"
-				[[ -f "$artifact" && -f "$order" ]] || {
-					echo "dynamic-report: missing $target artifact or order for $tool" >&2
+				[[ -f "$artifact" ]] || {
+					echo "dynamic-report: missing $target artifact for $tool" >&2
 					return 1
 				}
 				imports="$(llvm-readelf --dyn-syms -W "$artifact" | awk '$7 == "UND" && $8 != "" {print $8}' | sort -u | join_lines)"
@@ -294,11 +317,13 @@ generate_report() {
 					echo "dynamic-report: $target $tool DT_NEEDED differs from its manifest" >&2
 					return 1
 				fi
-				transitive="$(sed '/^$/d' "$order")"
-				expected_transitive="$(canonical_manifest_order "$providers")"
-				if [[ "$transitive" != "$expected_transitive" ]]; then
-					echo "dynamic-report: $target $tool provider order differs from the manifest graph" >&2
-					diff -u <(printf '%s\n' "$expected_transitive") <(printf '%s\n' "$transitive") >&2 || true
+				transitive="$(canonical_manifest_order "$providers")"
+				reversed_roots=""
+				for provider in $providers; do reversed_roots="$provider $reversed_roots"; done
+				reversed_transitive="$(canonical_manifest_order "$reversed_roots")"
+				if [[ "$transitive" != "$reversed_transitive" ]]; then
+					echo "dynamic-report: $target $tool provider derivation depends on DT_NEEDED enumeration order" >&2
+					diff -u <(printf '%s\n' "$transitive") <(printf '%s\n' "$reversed_transitive") >&2 || true
 					return 1
 				fi
 				owner_record="$(resolve_import_owners "$target" "$tool" "$imports" "$transitive")"

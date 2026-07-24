@@ -60,23 +60,13 @@ prime_graph() {
 case "$mode" in
 quick)
 	prime_graph
-	order_file="$build_root/system-image/x86_64-unknown-none/bin/echo.order"
-	order_cache="$build_root/image-artifacts-x86_64-unknown-none/executable-echo.order.sha256"
-	rm -f "$order_cache"
+	if find "$build_root/system-image/x86_64-unknown-none" -type f \( -name '*.identity' -o -name '*.order' \) -print -quit | grep -q . || find "$build_root/image-artifacts-x86_64-unknown-none" -maxdepth 1 -type f -name '*.order.sha256' -print -quit | grep -q .; then
+		echo "shared-cache-check: obsolete identity or provider-order sidecar remains" >&2
+		exit 1
+	fi
 	run_graph
 	expect_only_misses provider
 	expect_only_misses executable
-	if [[ ! -f "$order_cache" ]]; then
-		echo "shared-cache-check: missing echo order cache was not restored" >&2
-		exit 1
-	fi
-	printf 'corrupt-order\n' >"$order_file"
-	run_graph
-	expect_only_misses executable echo
-	if ! grep -q '^build-shared: object cache hit echo$' "$output"; then
-		echo "shared-cache-check: corrupt echo order did not reuse its content-addressed object" >&2
-		exit 1
-	fi
 	rm -f "$build_root/image-artifacts-x86_64-unknown-none/executable-echo.build-key"
 	run_graph
 	expect_only_misses executable echo

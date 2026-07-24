@@ -122,9 +122,9 @@ malformed-dynamic-check: sdk user user-aarch64 user-riscv64
 malformed-symbol-relocation-check: sdk user user-aarch64 user-riscv64
     tools/check-static-injection.sh malformed-symbol-relocation
 
-# Reject canonical provider-order drift before it can rewrite any target's system volume.
-dependency-graph-check: sdk user user-aarch64 user-riscv64
-    tools/check-static-injection.sh dependency-graph
+# Reject a malformed embedded identity record before it can rewrite any target's system volume.
+identity-note-check: sdk user user-aarch64 user-riscv64
+    tools/check-static-injection.sh identity-note
 
 # Verify the checked dynamic executable report against all three staged target graphs.
 dynamic-report-check: sdk user user-aarch64 user-riscv64

@@ -218,18 +218,7 @@ fn audit_linked_artifact(row: &ManifestRow, bytes: &[u8], libraries: &[String], 
 	assert_eq!(actual, expected, "{} {} DT_NEEDED providers differ from the manifest", row.kind, row.name);
 }
 
-fn audit_dynamic_order(row: &ManifestRow, bytes: &[u8], libraries: &[ManifestRow]) {
-	assert!(!bytes.is_empty() && bytes.len() <= bootproto::elf::MAX_DYNAMIC_MODULES * 65 && bytes.last() == Some(&b'\n'), "dynamic {} has malformed canonical provider order", row.name);
-	let text = core::str::from_utf8(bytes).unwrap_or_else(|_| panic!("dynamic {} provider order is not UTF-8", row.name));
-	let mut actual: Vec<String> = Vec::new();
-	for name in text.lines() {
-		let stem = name.strip_suffix(".lslib").unwrap_or_else(|| panic!("dynamic {} order names non-library {name:?}", row.name));
-		assert!(valid_library_name(stem) && libraries.iter().any(|library| library.name == stem), "dynamic {} order names invalid or unstaged provider {name}", row.name);
-		assert!(!actual.iter().any(|loaded| loaded == name), "dynamic {} repeats provider {name} in canonical order", row.name);
-		actual.push(String::from(name));
-	}
-	assert!(!actual.is_empty() && actual.len() <= bootproto::elf::MAX_DYNAMIC_MODULES, "dynamic {} has an empty or oversized canonical provider order", row.name);
-
+fn derive_dynamic_order(row: &ManifestRow, libraries: &[ManifestRow]) -> Vec<String> {
 	let mut closure: Vec<&ManifestRow> = Vec::new();
 	let mut depths: Vec<(&str, usize)> = Vec::new();
 	let mut pending: Vec<(&str, usize)> = row.providers.iter().map(|provider| (provider.as_str(), 0)).collect();
@@ -257,7 +246,7 @@ fn audit_dynamic_order(row: &ManifestRow, bytes: &[u8], libraries: &[ManifestRow
 		let next = closure.iter().filter(|library| !expected.iter().any(|name| name == &format!("{}.lslib", library.name)) && library.providers.iter().all(|provider| expected.iter().any(|name| name == &format!("{provider}.lslib")))).min_by(|left, right| left.name.cmp(&right.name)).unwrap_or_else(|| panic!("dynamic {} provider graph contains a cycle", row.name));
 		expected.push(format!("{}.lslib", next.name));
 	}
-	assert_eq!(actual, expected, "dynamic {} provider order differs from the manifest graph", row.name);
+	expected
 }
 
 // The debug-build target path of a userspace ELF: each crate builds to its own target dir.
@@ -275,23 +264,19 @@ fn user_dynamic_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf 
 	manifest.join(format!("../../.build/system-image/{}/bin/{name}", user_target()))
 }
 
-fn user_dynamic_order_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
-	manifest.join(format!("../../.build/system-image/{}/bin/{name}.order", user_target()))
+fn identity_record(artifact: &Path) -> Vec<u8> {
+	let bytes = fs::read(artifact).unwrap_or_else(|error| panic!("cannot read {}: {error}", artifact.display()));
+	let image = bootproto::elf::Elf::parse_for_machine(&bytes, user_elf_machine()).unwrap_or_else(|| panic!("{} has no valid target ELF", artifact.display()));
+	image.liber_identity_note().unwrap_or_else(|| panic!("{} has no valid identity note", artifact.display())).to_vec()
 }
 
-fn identity_path(artifact: &Path) -> PathBuf {
-	PathBuf::from(format!("{}.identity", artifact.display()))
-}
-
-fn sha256_file(path: &Path) -> String {
-	let output = Command::new("sha256sum").arg(path).output().unwrap_or_else(|error| panic!("cannot hash {}: {error}", path.display()));
-	assert!(output.status.success(), "sha256sum failed for {}", path.display());
-	String::from_utf8(output.stdout).expect("sha256sum output is UTF-8").split_whitespace().next().expect("sha256sum digest").to_string()
+fn sha256_hex(bytes: &[u8]) -> String {
+	bootproto::sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow], expected_rustc_commit: &str) -> Vec<u8> {
-	let path = identity_path(artifact);
-	let bytes = fs::read(&path).unwrap_or_else(|error| panic!("cannot read identity for {} at {}: {error}", row.name, path.display()));
+	let bytes = identity_record(artifact);
+	assert!(bytes.ends_with(b"\n"), "{} identity record is not newline terminated", row.name);
 	let text = core::str::from_utf8(&bytes).unwrap_or_else(|_| panic!("identity for {} is not UTF-8", row.name));
 	let lines: Vec<&str> = text.lines().collect();
 	assert!(lines.len() >= 10 && lines[0] == "format=liber-image-identity-v1", "{} has malformed identity record", row.name);
@@ -311,21 +296,11 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 		.map(|provider| {
 			let provider_row = libraries.iter().find(|candidate| candidate.name == *provider).unwrap_or_else(|| panic!("{} identity names unknown provider {provider}", row.name));
 			let provider_artifact = user_shared_path(&PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")), &provider_row.crate_path, provider);
-			format!("provider={provider}:{}", sha256_file(&identity_path(&provider_artifact)))
+			format!("provider={provider}:{}", sha256_hex(&identity_record(&provider_artifact)))
 		})
 		.collect();
 	expected_providers.sort();
 	assert_eq!(&lines[10..], expected_providers.as_slice(), "{} identity provider chain", row.name);
-
-	let digest = sha256_file(&path);
-	let note_path = env::temp_dir().join(format!("liber-identity-note-{}-{}", std::process::id(), row.name));
-	let status = Command::new("llvm-objcopy").arg("--dump-section").arg(format!(".note.liber.identity={}", note_path.display())).arg(artifact).status().unwrap_or_else(|error| panic!("cannot read identity note from {}: {error}", artifact.display()));
-	assert!(status.success(), "{} has no readable identity note", row.name);
-	let note = fs::read(&note_path).unwrap_or_else(|error| panic!("cannot read {}: {error}", note_path.display()));
-	let _ = fs::remove_file(&note_path);
-	assert!(note.len() == 52 && &note[..20] == b"\x06\0\0\0\x20\0\0\0\x01\0\0\0LIBER\0\0\0", "{} has malformed identity note", row.name);
-	let note_digest: String = note[20..].iter().map(|byte| format!("{byte:02x}")).collect();
-	assert_eq!(note_digest, digest, "{} identity note differs from its record", row.name);
 	bytes
 }
 
@@ -505,8 +480,8 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	let library_rows: Vec<ManifestRow> = rows.iter().filter(|row| row.kind == "library" && row.stage == "volume").cloned().collect();
 	let lsrt_row = library_rows.iter().find(|row| row.name == "lsrt").expect("lsrt library row");
 	let lsrt_artifact = user_shared_path(&manifest, &lsrt_row.crate_path, &lsrt_row.name);
-	let lsrt_identity = fs::read_to_string(identity_path(&lsrt_artifact)).expect("lsrt identity record");
-	let expected_rustc_commit = lsrt_identity.lines().find_map(|line| line.strip_prefix("rustc-commit=")).expect("lsrt rustc identity").to_string();
+	let lsrt_identity = identity_record(&lsrt_artifact);
+	let expected_rustc_commit = core::str::from_utf8(&lsrt_identity).expect("lsrt identity record is UTF-8").lines().find_map(|line| line.strip_prefix("rustc-commit=")).expect("lsrt rustc identity").to_string();
 	assert!(expected_rustc_commit.len() == 40 && expected_rustc_commit.bytes().all(|byte| byte.is_ascii_hexdigit()), "lsrt rustc identity is malformed");
 	let mut libraries: Vec<String> = rows.iter().filter(|row| row.kind == "library" && row.stage == "volume").map(|row| row.name.clone()).collect();
 	libraries.sort();
@@ -534,23 +509,19 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			_ => user_elf_path(&manifest, &row.crate_path, &row.name),
 		};
 		println!("cargo:rerun-if-changed={}", path.display());
-		if row.kind == "dynamic" || row.kind == "dynamic-service" || row.kind == "library" {
-			let identity = audit_identity(&row, &path, &library_rows, &expected_rustc_commit);
-			let identity_kind = if row.kind == "library" { "lib" } else { "bin" };
-			files.push((format!("id/{identity_kind}/{}", row.name), identity));
-		}
+		let identity = if row.kind == "dynamic" || row.kind == "dynamic-service" || row.kind == "library" { Some(audit_identity(&row, &path, &library_rows, &expected_rustc_commit)) } else { None };
 		// Strip the ELF to its loadable image; fall back to the raw ELF when no
 		// `strip` supports the target (the host binutils cannot strip aarch64), so
 		// the program is still staged - the loader ignores the extra sections.
 		match read_stripped(&path).or_else(|| fs::read(&path).ok()) {
 			Some(bytes) => {
+				if let Some(identity) = identity.as_deref() {
+					let image = bootproto::elf::Elf::parse_for_machine(&bytes, user_elf_machine()).unwrap_or_else(|| panic!("staged {} is not a valid target ELF", row.name));
+					assert_eq!(image.liber_identity_note(), Some(identity), "staged {} identity record differs from its source ELF", row.name);
+				}
 				if row.kind == "dynamic" || row.kind == "dynamic-service" {
 					audit_linked_artifact(&row, &bytes, &libraries, true);
-					let order_path = user_dynamic_order_path(&manifest, &row.crate_path, &row.name);
-					println!("cargo:rerun-if-changed={}", order_path.display());
-					let order = fs::read(&order_path).unwrap_or_else(|error| panic!("cannot read canonical order for dynamic {} at {}: {error}", row.name, order_path.display()));
-					audit_dynamic_order(&row, &order, &library_rows);
-					files.push((format!("order/{}", row.name), order));
+					let _order = derive_dynamic_order(&row, &library_rows);
 				} else if row.kind == "library" {
 					audit_linked_artifact(&row, &bytes, &libraries, row.name != "lsrt");
 				}

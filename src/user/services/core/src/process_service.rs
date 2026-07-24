@@ -39,12 +39,8 @@ use services::graph_limits;
 // factory-seed pipeline). A named program is loaded from `<PROGRAM_DIR><name>`.
 const PROGRAM_DIR: &str = "vol://system/bin/";
 const LIBRARY_DIR: &str = "vol://system/lib/";
-const LIBRARY_IDENTITY_DIR: &str = "vol://system/id/lib/";
-const EXECUTABLE_IDENTITY_DIR: &str = "vol://system/id/bin/";
-const ORDER_DIR: &str = "vol://system/order/";
 const LIBRARY_BASE: u64 = 0x2000_0000;
 const LIBRARY_SLOT_SIZE: u64 = 0x0100_0000;
-const MAX_IDENTITY_BYTES: usize = 8 * 1024;
 const IDENTITY_FORMAT: &[u8] = b"format=liber-image-identity-v1";
 #[cfg(target_arch = "x86_64")]
 const IMAGE_TARGET: &str = "x86_64-unknown-none";
@@ -141,7 +137,7 @@ fn parse_digest(bytes: &[u8]) -> Option<[u8; 32]> {
 }
 
 fn parse_identity(bytes: &[u8], kind: &str, artifact: &str) -> Option<Identity> {
-	if bytes.is_empty() || bytes.len() > MAX_IDENTITY_BYTES || !bytes.ends_with(b"\n") || !valid_identity_name(artifact) {
+	if bytes.is_empty() || bytes.len() > bootproto::elf::MAX_LIBER_IDENTITY_RECORD_BYTES || !bytes.ends_with(b"\n") || !valid_identity_name(artifact) {
 		return None;
 	}
 	let mut lines = bytes[..bytes.len() - 1].split(|byte| *byte == b'\n');
@@ -159,12 +155,12 @@ fn parse_identity(bytes: &[u8], kind: &str, artifact: &str) -> Option<Identity> 
 	if !rustflags.starts_with(b"-C relocation-model=pic") || features.is_empty() {
 		return None;
 	}
-	let mut providers = Vec::new();
+	let mut providers: Vec<(String, [u8; 32])> = Vec::new();
 	for line in lines {
 		let value = identity_value(line, b"provider=")?;
 		let separator = value.iter().position(|byte| *byte == b':')?;
 		let provider = core::str::from_utf8(&value[..separator]).ok()?;
-		if !valid_identity_name(provider) || providers.len() >= graph_limits::MAX_MODULES || providers.iter().any(|(name, _)| name == provider) {
+		if !valid_identity_name(provider) || providers.len() >= graph_limits::MAX_MODULES || providers.last().is_some_and(|(previous, _)| provider <= previous.as_str()) {
 			return None;
 		}
 		providers.push((String::from(provider), parse_digest(&value[separator + 1..])?));
@@ -172,16 +168,8 @@ fn parse_identity(bytes: &[u8], kind: &str, artifact: &str) -> Option<Identity> 
 	Some(Identity { digest: bootproto::sha256::digest(bytes), providers })
 }
 
-fn verify_identity(elf: &bootproto::elf::Elf<'_>, bytes: &[u8], kind: &str, artifact: &str) -> Option<Identity> {
-	let identity = parse_identity(bytes, kind, artifact)?;
-	(elf.liber_identity_note_digest()? == identity.digest).then_some(identity)
-}
-
-unsafe fn load_identity(storage: u64, directory: &str, kind: &str, artifact: &str, elf: &bootproto::elf::Elf<'_>) -> Option<Identity> {
-	unsafe {
-		let record = MappedFile::open(storage, alloc::format!("{directory}{artifact}"))?;
-		verify_identity(elf, record.bytes(), kind, artifact)
-	}
+fn verify_identity(elf: &bootproto::elf::Elf<'_>, kind: &str, artifact: &str) -> Option<Identity> {
+	parse_identity(elf.liber_identity_note()?, kind, artifact)
 }
 
 struct Module {
@@ -230,7 +218,7 @@ impl Resolver {
 					return None;
 				}
 				let stem = name.strip_suffix(".lslib")?;
-				let identity = load_identity(self.storage, LIBRARY_IDENTITY_DIR, "library", stem, &elf)?;
+				let identity = verify_identity(&elf, "library", stem)?;
 				let dynamic = elf.dynamic_info()??;
 				let dependencies = dependencies(&elf, &dynamic)?;
 				for dependency in &dependencies {
@@ -291,21 +279,6 @@ fn dependencies(elf: &bootproto::elf::Elf<'_>, dynamic: &bootproto::elf::Dynamic
 	Some(dependencies)
 }
 
-fn parse_order(bytes: &[u8]) -> Option<Vec<String>> {
-	if bytes.is_empty() || bytes.len() > graph_limits::MAX_MODULES * 65 || bytes.last() != Some(&b'\n') {
-		return None;
-	}
-	let text = core::str::from_utf8(bytes).ok()?;
-	let mut order = Vec::new();
-	for name in text.lines() {
-		if order.len() >= graph_limits::MAX_MODULES || !valid_library_name(name) || order.iter().any(|loaded: &String| loaded == name) {
-			return None;
-		}
-		order.push(String::from(name));
-	}
-	(!order.is_empty()).then_some(order)
-}
-
 // The processes started so far (in order), the StorageService client the on-disk
 // binaries are loaded through, and the init package they fall back to.
 //
@@ -357,7 +330,7 @@ impl<'a> Processes<'a> {
 					}
 				} else {
 					match self.package.lookup(artifact.as_bytes()) {
-						Some(elf) => spawn_program_bytes(self.storage, elf, None, None, bootstrap, domain),
+						Some(elf) => spawn_program_bytes(self.storage, elf, None, bootstrap, domain),
 						None => continue,
 					}
 				};
@@ -376,13 +349,11 @@ unsafe fn spawn_from_path(storage: u64, path: &str, artifact: &str, bootstrap: u
 	unsafe {
 		let main = MappedFile::open(storage, String::from(path))?;
 		let logical_name = executable::logical_name(artifact)?;
-		let identity = MappedFile::open(storage, alloc::format!("{EXECUTABLE_IDENTITY_DIR}{logical_name}"))?;
-		let order = MappedFile::open(storage, alloc::format!("{ORDER_DIR}{logical_name}"));
-		Some(spawn_program_bytes(storage, main.bytes(), Some((identity.bytes(), logical_name)), order.as_ref().map(|file| file.bytes()), bootstrap, domain))
+		Some(spawn_program_bytes(storage, main.bytes(), Some(logical_name), bootstrap, domain))
 	}
 }
 
-unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], expected_identity: Option<(&[u8], &str)>, expected_order: Option<&[u8]>, bootstrap: u64, domain: u64) -> i64 {
+unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], expected_identity: Option<&str>, bootstrap: u64, domain: u64) -> i64 {
 	unsafe {
 		let Some(elf) = bootproto::elf::Elf::parse(bytes) else { return -1 };
 		let Some(dynamic) = elf.dynamic_info() else { return -1 };
@@ -392,8 +363,8 @@ unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], expected_identity: Opt
 			}
 			return -1;
 		};
-		let Some((identity_bytes, artifact)) = expected_identity else { return -1 };
-		let Some(identity) = verify_identity(&elf, identity_bytes, "executable", artifact) else { return -1 };
+		let Some(artifact) = expected_identity else { return -1 };
+		let Some(identity) = verify_identity(&elf, "executable", artifact) else { return -1 };
 		let Some(dependencies) = dependencies(&elf, &dynamic) else { return -1 };
 		if dependencies.is_empty() {
 			if !identity_matches_dependencies(&identity, &dependencies, &[]) {
@@ -414,10 +385,6 @@ unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], expected_identity: Opt
 			return -1;
 		}
 		let Some(order) = resolver.order() else { return -1 };
-		let Some(expected_order) = expected_order.and_then(parse_order) else { return -1 };
-		if order != expected_order {
-			return -1;
-		}
 		let process = process_create(domain);
 		if process < 0 {
 			return process;

@@ -20,12 +20,12 @@ intrinsics may change in the next image without compatibility shims.
   conventions](PACKAGE_FORMAT.md#artifact-filename-conventions): they use the
   LiberSystem-specific `.lslib` suffix and no Unix `lib` prefix, for example
   `png.lslib`, `storage-proto.lslib`, and `lsrt.lslib`.
-- Library crates also use prefix-free owner directories. A normal leaf lives at
-  `src/user/<name>/`, and its generated objects stay with that owner under
-  `src/user/<name>/shared/<target>/<name>.lslib`. The runtime and generated protocol
-  providers use equivalent owner-specific `src/user/<name>/shared/` paths.
-  The system image still installs all of them into the flat, resolver-owned
-  `vol://system/lib/` namespace.
+- Library crates use prefix-free, manifest-declared owner directories. A normal reusable
+  leaf lives under `src/user/libs/<name>/`; runtime, service-utility and generated
+  protocol providers use their declared role or peer-root paths. Cargo and linker outputs
+  belong only below the repository-root `.build/`, including
+  `.build/system-image/<target>/lib/`. The system image still installs all providers into
+  the flat, resolver-owned `vol://system/lib/` namespace.
 - Resolution is eager and deterministic. Lazy PLT binding, `LD_PRELOAD`, environment
   search paths, runtime library replacement, symbol interposition, and unload are not
   supported.
@@ -81,6 +81,14 @@ import has exactly one owner in the declared closure. RISC-V build-std uses a 32
 worker stack; smaller stacks have crashed the pinned compiler while elaborating drops in
 `core`.
 
+Every dynamic executable and provider carries one allocated `.note.liber.identity` ELF
+note. Its bounded `liber-image-identity-v1` payload records the kind, logical artifact
+name, package, source digest, Rust compiler revision, target, profile, Rust flags,
+features, and direct-provider record digests. The builder emits the canonical record
+directly into the note, validates the exact note bytes on cache hits, and uses the
+SHA-256 of those bytes as the provider-chain identity. There are no separate identity
+files in the image, cache, or system volume.
+
 Because Cargo cannot consume a Rust dylib on these targets, consumers cross a generated
 image-internal export boundary. A small explicit unmangled smoke ABI currently pins this
 path; ordinary Rust-mangled exports remain available to components built in the same
@@ -129,13 +137,14 @@ compiler-runtime ownership.
 ProcessService owns dependency policy because it already holds the StorageService
 capability used to read `vol://system/bin/*`. For a launch it:
 
-1. reads the main ELF and its matching `id/bin/*` record, whose SHA-256 must match
-  the ELF's embedded identity note;
-2. resolves only canonical names under `vol://system/lib/`, verifying each matching
-  `id/lib/*` record and identity note before the provider enters the graph;
-3. builds a bounded dependency DAG, rejects cycles/duplicates/missing libraries, and
-   orders providers before consumers;
-4. requires every identity record's direct-provider digests to match the resolved
+1. reads the main ELF and parses its one bounded identity record directly from
+  `.note.liber.identity`;
+2. resolves only canonical names under `vol://system/lib/`, parsing each provider's
+  embedded identity record before it enters the graph;
+3. builds a bounded dependency DAG from verified `DT_NEEDED` edges, rejects
+  cycles/duplicates/missing libraries, and derives a lexical provider-before-consumer
+  order independent of `DT_NEEDED` enumeration;
+4. requires every embedded record's direct-provider digests to match the resolved
   provider identities;
 5. asks the kernel to load each library, then the main image, into the new process;
 6. starts the entry thread only after every eager relocation succeeds.
@@ -193,14 +202,15 @@ ProcessService and requires its `pix.lslib -> lsrt.lslib` dependency DAG to load
 relocate and report successfully. It also mutates `echo.lsexe` in an
 in-memory system-volume snapshot: replacing its `lsrt.lslib` dependency with either
 the absent `none.lslib` or the staged but incompatible `wire.lslib` must return a
-failed launch reply with no Process capability. The same gate rejects a drifted
-canonical provider-order file. These checks run on x86_64, AArch64 and RISC-V.
+failed launch reply with no Process capability. A second launch swaps the two valid
+`dyn_probe` `DT_NEEDED` entries and requires the same provider frames in the same
+canonical slots. These checks run on x86_64, AArch64 and RISC-V.
 
 The identity gate also substitutes the valid `wire.lslib` bytes into the staged
-`lsrt.lslib` slot and independently corrupts `id/lib/lsrt`. Both mutations must
-fail before ProcessService creates a Process capability. This binds a staged name,
-its artifact bytes, its identity record and its direct provider chain into one
-runtime-checked launch contract.
+`lsrt.lslib` slot and independently corrupts the embedded `lsrt.lslib` identity
+record. Both mutations must fail before ProcessService creates a Process capability.
+This binds a staged name, its artifact bytes, its embedded identity record and its
+direct provider chain into one runtime-checked launch contract.
 
 Every resolved provider closure has exactly one owner for each loader-visible
 dynamic export. Package staging indexes defined global or weak `NOTYPE`, `OBJECT`
@@ -235,6 +245,11 @@ program header, removes every `DT_NULL` terminator, and duplicates the singleton
 each form before a Process capability is created. The package check restores the artifact
 after every mutation and verifies that no failed form rewrites the system-volume archive.
 
+The embedded-identity gate changes the note's required `profile=release` field before
+package staging. The package audit must reject the malformed record without rewriting
+the archive, and ProcessService repeats that rejection when the mutation appears in a
+staged provider ELF.
+
 The malformed symbol and relocation gate sets `DT_SYMENT` to a non-ELF64 size, makes
 the SysV hash symbol count exceed the parser limit, and makes `DT_PLTRELSZ` indivisible
 by the ELF64 RELA entry size. Package staging walks the complete bounded dynamic symbol
@@ -243,12 +258,12 @@ rules before resolver traversal. Each mutation must fail without rewriting the a
 or creating a Process capability.
 
 Package staging independently reconstructs each executable's complete provider closure
-from the manifest and derives the lexicographically deterministic provider-before-
-consumer topological order. The staged order sidecar must match that exact sequence, not
-merely contain valid unique library names. The dependency-graph gate swaps two valid
-sidecar entries and requires package rejection without archive changes. Its runtime half
-changes `wire.lslib` to depend on itself; ProcessService's bounded DFS cycle guard must
-reject the launch before loading a module or creating a Process capability.
+from the manifest after checking its exact `DT_NEEDED` set, then derives the
+lexicographically deterministic provider-before-consumer topological order in memory.
+The checked report repeats that derivation with reversed roots and requires the same
+result. No order sidecar is emitted, cached, packaged, or opened at runtime. Its runtime
+cycle case changes `wire.lslib` to depend on itself; ProcessService's bounded DFS cycle
+guard must reject the launch before loading a module or creating a Process capability.
 
 The reconstructed closure and runtime resolver share hard admission bounds: at most 64
 unique provider modules and dependency depths 0 through 15. Package staging propagates
@@ -276,15 +291,16 @@ the page-rounded writable `PT_LOAD` ranges of the executable plus every provider
 closure; immutable ranges use the loader's shared-frame rule. `just dynamic-report-check` rebuilds
 the three target graphs and requires the report to reproduce byte for byte. It also fails
 if the five wave lists do not partition the manifest's tool inventory exactly, a direct
-provider differs from `DT_NEEDED`, a sidecar omits a root, or an artifact/provider is
-missing. `just dynamic-report-update` is the explicit regeneration command.
+provider differs from `DT_NEEDED`, reversed-root derivation differs, or an
+artifact/provider is missing. `just dynamic-report-update` is the explicit regeneration
+command.
 
 ET_REL attribution never selects the newest or only object matching a filename pattern.
 The image builder atomically publishes one current-object record per accepted executable,
 binding its exact object key, basename, SHA-256 and byte count. Cache hits validate or
 restore that record from the independently validated object cache. The report checker
-requires the referenced file and sidecars, recomputes its SHA-256, requires ELF `ET_REL`
-and exactly one global `__user_main` definition, then records its size. Historical cache
+requires the referenced file, recomputes its SHA-256, requires ELF `ET_REL` and exactly
+one global `__user_main` definition, then records its size. Historical cache
 objects may coexist without ambiguity. `docs/DYNAMIC_IMAGE.tsv` sums all 48 current
 objects and PIE files per target, adds each provider file exactly once, and checks that
 staged bytes equal PIE plus unique-provider bytes.

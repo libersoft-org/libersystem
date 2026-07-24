@@ -4347,17 +4347,6 @@ fn system_packages_use_canonical_executable_names() {
 			}
 		}
 	}
-	let mut library_identities = 0usize;
-	let mut executable_identities = 0usize;
-	for index in 0..volume.len() {
-		let name = volume.name(index).expect("volume entry name");
-		library_identities += usize::from(name.starts_with(b"id/lib/"));
-		executable_identities += usize::from(name.starts_with(b"id/bin/"));
-	}
-	assert_eq!(library_identities, 60, "every staged library has one identity record");
-	assert_eq!(executable_identities, 68, "every staged dynamic executable has one identity record");
-	assert!(volume.lookup(b"id/lib/imgconv").is_some(), "library identity namespace preserves imgconv");
-	assert!(volume.lookup(b"id/bin/imgconv").is_some(), "executable identity namespace preserves imgconv");
 }
 
 fn start_process_service_from_volume(volume: &[u8]) -> (alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::channel::Channel>) {
@@ -5126,6 +5115,23 @@ fn duplicate_dynamic_needed(volume: &mut [u8], artifact: &[u8]) {
 	volume[offset..offset + core::mem::size_of::<u64>()].copy_from_slice(&replacement.to_le_bytes());
 }
 
+fn swap_dynamic_needed_order(volume: &mut [u8], artifact: &[u8]) {
+	let volume_base = volume.as_ptr() as usize;
+	let (first_offset, first_value, second_offset, second_value) = {
+		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
+		let bytes = archive.lookup(artifact).expect("dynamic order test executable is staged");
+		let elf = bootproto::elf::Elf::parse(bytes).expect("dynamic order test executable is ELF");
+		let needed: alloc::vec::Vec<(usize, u64)> = elf.dynamic_entries().expect("dynamic order test metadata parses").expect("dynamic order test executable has one dynamic table").enumerate().filter_map(|(index, entry)| (entry.tag == bootproto::elf::DT_NEEDED).then_some((index, entry.value))).collect();
+		assert!(needed.len() >= 2, "dynamic order test executable has two providers");
+		let (first_index, first_value) = needed[0];
+		let (second_index, second_value) = needed[1];
+		let value_offset = core::mem::size_of::<i64>();
+		(bytes.as_ptr() as usize - volume_base + dynamic_entry_file_offset(&elf, first_index) + value_offset, first_value, bytes.as_ptr() as usize - volume_base + dynamic_entry_file_offset(&elf, second_index) + value_offset, second_value)
+	};
+	volume[first_offset..first_offset + core::mem::size_of::<u64>()].copy_from_slice(&second_value.to_le_bytes());
+	volume[second_offset..second_offset + core::mem::size_of::<u64>()].copy_from_slice(&first_value.to_le_bytes());
+}
+
 fn program_header_file_offset(bytes: &[u8], index: usize) -> usize {
 	let table_offset = usize::try_from(u64::from_le_bytes(bytes[32..40].try_into().expect("program-header table offset bytes"))).expect("program-header table offset fits");
 	let entry_len = usize::from(u16::from_le_bytes(bytes[54..56].try_into().expect("program-header entry length bytes")));
@@ -5239,13 +5245,15 @@ fn replace_volume_entry(volume: &mut [u8], destination: &[u8], source: &[u8]) {
 	volume[destination_offset..destination_offset + source_bytes.len()].copy_from_slice(&source_bytes);
 }
 
-fn corrupt_volume_entry(volume: &mut [u8], entry: &[u8], field: &[u8]) {
+fn corrupt_identity_note(volume: &mut [u8], artifact: &[u8], field: &[u8]) {
 	let volume_base = volume.as_ptr() as usize;
 	let offset = {
 		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
-		let bytes = archive.lookup(entry).expect("identity test entry is staged");
-		let field_offset = bytes.windows(field.len()).position(|window| window == field).expect("identity test field is present");
-		bytes.as_ptr() as usize - volume_base + field_offset + field.len()
+		let bytes = archive.lookup(artifact).expect("identity test artifact is staged");
+		let elf = bootproto::elf::Elf::parse(bytes).expect("identity test artifact is ELF");
+		let record = elf.liber_identity_note().expect("identity test artifact carries a record");
+		let field_offset = record.windows(field.len()).position(|window| window == field).expect("identity test field is present");
+		record.as_ptr() as usize - volume_base + field_offset + field.len()
 	};
 	volume[offset] = if volume[offset] == b'0' { b'1' } else { b'0' };
 }
@@ -5395,8 +5403,8 @@ fn dynamic_process_service_rejects_provider_cycle() {
 	assert!(reply.caps.is_empty(), "a provider dependency cycle creates no process capability");
 }
 
-tagged_test!(dynamic_process_service_rejects_substituted_identity, [Dynamic, DynamicReject, Service, Process, Storage]);
-fn dynamic_process_service_rejects_substituted_identity() {
+tagged_test!(dynamic_process_service_rejects_substituted_or_corrupted_identity_note, [Dynamic, DynamicReject, Service, Process, Storage]);
+fn dynamic_process_service_rejects_substituted_or_corrupted_identity_note() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut substituted_provider = volume.to_vec();
 	replace_volume_entry(&mut substituted_provider, b"lib/lsrt.lslib", b"lib/wire.lslib");
@@ -5406,11 +5414,11 @@ fn dynamic_process_service_rejects_substituted_identity() {
 	assert!(reply.caps.is_empty(), "a substituted provider creates no process capability");
 
 	let mut corrupted_identity = volume.to_vec();
-	corrupt_volume_entry(&mut corrupted_identity, b"id/lib/lsrt", b"source-sha256=");
+	corrupt_identity_note(&mut corrupted_identity, b"lib/lsrt.lslib", b"profile=");
 	let reply = launch_from_volume(&corrupted_identity, b"echo", 81);
 	assert_eq!(le_u32(&reply.bytes, 0), 81);
-	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a provider identity whose note digest no longer matches");
-	assert!(reply.caps.is_empty(), "a corrupted provider identity creates no process capability");
+	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a provider whose embedded identity record is malformed");
+	assert!(reply.caps.is_empty(), "a corrupted embedded identity record creates no process capability");
 }
 
 tagged_test!(dynamic_process_service_rejects_duplicate_provider_export, [Dynamic, DynamicReject, Service, Process, Storage]);
@@ -5424,52 +5432,26 @@ fn dynamic_process_service_rejects_duplicate_provider_export() {
 	assert!(reply.caps.is_empty(), "a duplicate provider export creates no process capability");
 }
 
-tagged_test!(dynamic_process_service_rejects_linker_order_drift, [Dynamic, DynamicReject, Service, Process, Storage]);
-fn dynamic_process_service_rejects_linker_order_drift() {
-	use object::channel::{Channel, Message};
-	use object::rights::Rights;
+tagged_test!(dynamic_process_service_derives_provider_slots_independently_of_needed_order, [Dynamic, Service, Process, Storage]);
+fn dynamic_process_service_derives_provider_slots_independently_of_needed_order() {
+	use object::process::Process;
 
-	let (volume, package) = scenario_packages().expect("scenario packages");
-	let init = init_package_bytes().expect("init package module not found");
-	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
-	let process_elf = package.lookup(b"process_service.lsexe").expect("process_service.lsexe in the init package");
-	let mut drifted_volume = volume.to_vec();
-	let order_offset = {
-		let archive = pkg::Package::parse(&drifted_volume).expect("volume package parses");
-		let order = archive.lookup(b"order/echo").expect("echo canonical order is staged");
-		assert_eq!(order, b"lsrt.lslib\n", "echo has one runtime provider");
-		order.as_ptr() as usize - drifted_volume.as_ptr() as usize
-	};
-	drifted_volume[order_offset..order_offset + b"wire.lslib\n".len()].copy_from_slice(b"wire.lslib\n");
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	let baseline_reply = launch_from_volume(volume, b"dyn_probe", 90);
+	assert_eq!(baseline_reply.bytes[4], 1, "baseline dynamic graph loads");
+	let baseline = baseline_reply.caps[0].object().into_any_arc().downcast::<Process>().expect("baseline dynamic launch returns a Process");
 
-	let (storage_boot_kernel, storage_boot_user) = Channel::create();
-	let (process_boot_kernel, process_boot_user) = Channel::create();
-	let (storage_server, storage_client) = Channel::create();
-	let (process_server, process_client) = Channel::create();
-	let domain = sched::root_domain();
-	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
-	loader::spawn_elf_process(domain, process_elf, process_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
-	send_ramdisk(&storage_boot_kernel, &drifted_volume).expect("drifted storage ramdisk bootstrap");
-	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
-	send_package(&process_boot_kernel, init).expect("process package bootstrap");
-	send_cap(&process_boot_kernel, b"STORAGE", storage_client, Rights::ALL).expect("process storage bootstrap");
-	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
+	let mut reordered_volume = volume.to_vec();
+	swap_dynamic_needed_order(&mut reordered_volume, b"bin/dyn_probe.lsexe");
+	let reordered_reply = launch_from_volume(&reordered_volume, b"dyn_probe", 91);
+	assert_eq!(reordered_reply.bytes[4], 1, "reordered DT_NEEDED graph loads");
+	let reordered = reordered_reply.caps[0].object().into_any_arc().downcast::<Process>().expect("reordered dynamic launch returns a Process");
 
-	let name = b"echo";
-	let mut start = alloc::vec::Vec::new();
-	start.extend_from_slice(&1u16.to_le_bytes());
-	start.extend_from_slice(&77u32.to_le_bytes());
-	start.extend_from_slice(&(name.len() as u16).to_le_bytes());
-	start.extend_from_slice(name);
-	process_client.send(Message::new(start, alloc::vec::Vec::new(), 0)).expect("drifted echo start request");
-	sched::run_until_idle();
-	assert_eq!(&process_boot_kernel.recv().expect("ProcessService online report").bytes, b"ProcessService: online");
-	let reply = process_client.recv().expect("drifted echo start reply");
-	assert_eq!(le_u32(&reply.bytes, 0), 77);
-	assert_eq!(reply.bytes[4], 0, "ProcessService rejects linker/runtime provider-order drift");
-	assert!(reply.caps.is_empty(), "a rejected provider order creates no process capability");
-	process_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
-	sched::run_until_idle();
+	for provider_slot in [0x2000_0000u64, 0x2100_0000] {
+		let baseline_frame = baseline.address_space().unmap(provider_slot).expect("baseline provider occupies its canonical slot");
+		let reordered_frame = reordered.address_space().unmap(provider_slot).expect("reordered provider occupies its canonical slot");
+		assert_eq!(reordered_frame, baseline_frame, "provider slot {provider_slot:#x} is independent of DT_NEEDED enumeration order");
+	}
 }
 
 tagged_test!(config_service_serves_the_tree, [Service]);

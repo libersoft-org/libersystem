@@ -4626,7 +4626,7 @@ capability policy remain unchanged.
   flat compatibility copies, and update Cargo paths, build scripts, tests and docs
   atomically. A new leaf must declare exactly one category; moving a leaf between
   categories changes no runtime ABI or dependency edge.
-- [ ] Remove the redundant `order/` namespace and generated `.order` sidecars. The
+- [x] Remove the redundant `order/` namespace and generated `.order` sidecars. The
   complete provider graph is already bound and cross-checked by each executable/library
   identity record and its exact `DT_NEEDED` edges, while both the image builder and
   ProcessService can independently derive the same provider-before-consumer topological
@@ -4638,7 +4638,17 @@ capability policy remain unchanged.
   enumeration order. Remove the old order-drift injection tests and replace them with
   derivation determinism and malformed/cyclic graph tests; no compatibility `order/`
   files remain in the pre-release system volume.
-- [ ] Remove the redundant `id/` namespace by embedding each complete bounded
+  - Provider-order result (2026-07-24): the shared-image builder no longer emits,
+    hashes or caches `.order` files. It derives its canonical lexical topological order
+    directly from verified provider `DT_NEEDED` edges; package staging separately checks
+    each direct manifest edge then derives the same bounded closure in memory.
+    ProcessService retains its bounded DFS, duplicate/cycle/depth/module checks and
+    stable slots while deriving the lexical provider-before-consumer order from the live
+    ELF graph. The dynamic report repeats manifest derivation with reversed roots, and a
+    focused runtime scenario swaps two valid `dyn_probe` `DT_NEEDED` entries while
+    requiring the same provider frames in the same slots. No `order/` volume entry,
+    `.order` artifact or order-cache record remains.
+- [x] Remove the redundant `id/` namespace by embedding each complete bounded
   `liber-image-identity-v1` record directly in its executable or library ELF note, not
   only the record's digest. The record retains artifact kind/name, package, source digest,
   rustc commit, target, profile, rustflags, features and exact direct-provider identity
@@ -4652,6 +4662,17 @@ capability policy remain unchanged.
   image-internal build consistency, not artifact signing or verified boot; an attacker
   able to replace the whole system image remains outside this check until the signed-image
   work adds a trust root.
+  - Embedded-identity result (2026-07-24): `.note.liber.identity` now contains the
+    complete bounded canonical record with ELF note padding, not a digest. The image
+    builder computes direct-provider record digests in memory, validates exact embedded
+    bytes on cache hits and leaves no `.identity` artifact or cache file. Package staging
+    validates the source record and verifies it survives stripping before archive output.
+    ProcessService parses the one allocated note directly, hashes its record for the
+    provider chain and rejects missing, duplicate, malformed, oversized,
+    target-incompatible or dependency-mismatched records before creating a process.
+    The former identity-file mutation now corrupts the staged provider ELF note; the
+    package gate independently mutates the note profile and requires archive rejection.
+    This remains an image-internal consistency check only.
 - [ ] Restore test ownership after the physical move and decompose the monolithic kernel
   QEMU suite. Delete the trivial assertion; move the log record round-trip into the ABI
   crate; move executable inventory, stdin capability and other metadata-only assertions
@@ -4675,6 +4696,11 @@ capability policy remain unchanged.
     binary compiles with the pinned nightly toolchain. Remaining work is owner-crate
     application/service logic coverage, compound-scenario separation and thematic QEMU
     modules.
+  - Dynamic-link ownership result (2026-07-24): identity/order inventory and absence
+    checks now run in `tools/check-artifact-metadata.sh`, alongside allocated-note
+    verification for every staged x86_64 dynamic image. Kernel QEMU coverage retains only
+    runtime behavior: direct ELF-note rejection, provider-chain substitution, malformed
+    dynamic metadata, cycle bounds, duplicate exports and deterministic provider slots.
 - [ ] Define the factory `vol://system` hierarchy so its root contains only `hello.txt`,
   `motd.txt` and the declared directories:
   - `bin/`: user-invoked `.lsexe` tools. A stateless single-file command may live

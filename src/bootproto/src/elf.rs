@@ -16,6 +16,7 @@ const ELFDATA2LSB: u8 = 1;
 const SHT_STRTAB: u32 = 3;
 const SHT_NOTE: u32 = 7;
 const SHF_ALLOC: u64 = 1 << 1;
+pub const MAX_LIBER_IDENTITY_RECORD_BYTES: usize = 8 * 1024;
 const LIBER_IDENTITY_SECTION: &[u8] = b".note.liber.identity";
 const LIBER_IDENTITY_NOTE_NAME: &[u8] = b"LIBER\0";
 const LIBER_IDENTITY_NOTE_TYPE: u32 = 1;
@@ -310,27 +311,33 @@ impl<'a> Elf<'a> {
 		self.bytes.get(start..end)
 	}
 
-	pub fn liber_identity_note_digest(&self) -> Option<[u8; 32]> {
+	pub fn liber_identity_note(&self) -> Option<&'a [u8]> {
 		if self.shnum == 0 || self.shstrndx >= self.shnum {
 			return None;
 		}
 		let strings = self.section_data(&self.section(self.shstrndx as usize)?)?;
-		let mut digest = None;
+		let mut record = None;
 		for index in 0..self.shnum as usize {
 			let section = self.section(index)?;
 			if section.sh_type != SHT_NOTE || section.sh_flags & SHF_ALLOC == 0 || section_name(strings, section.sh_name)? != LIBER_IDENTITY_SECTION {
 				continue;
 			}
 			let note = self.section_data(&section)?;
-			if note.len() != 52 || u32::from_le_bytes(note[0..4].try_into().ok()?) != LIBER_IDENTITY_NOTE_NAME.len() as u32 || u32::from_le_bytes(note[4..8].try_into().ok()?) != 32 || u32::from_le_bytes(note[8..12].try_into().ok()?) != LIBER_IDENTITY_NOTE_TYPE || &note[12..18] != LIBER_IDENTITY_NOTE_NAME || &note[18..20] != b"\0\0" {
+			let name_len = usize::try_from(u32::from_le_bytes(note.get(0..4)?.try_into().ok()?)).ok()?;
+			let record_len = usize::try_from(u32::from_le_bytes(note.get(4..8)?.try_into().ok()?)).ok()?;
+			let name_end = 12usize.checked_add(name_len)?;
+			let record_start = name_end.checked_add(3)? & !3;
+			let record_end = record_start.checked_add(record_len)?;
+			let padded_record_end = record_end.checked_add(3)? & !3;
+			if record_len == 0 || record_len > MAX_LIBER_IDENTITY_RECORD_BYTES || u32::from_le_bytes(note.get(8..12)?.try_into().ok()?) != LIBER_IDENTITY_NOTE_TYPE || note.get(12..name_end)? != LIBER_IDENTITY_NOTE_NAME || note.get(name_end..record_start)?.iter().any(|byte| *byte != 0) || note.get(record_end..padded_record_end)?.iter().any(|byte| *byte != 0) || note.len() != padded_record_end {
 				return None;
 			}
-			let value: [u8; 32] = note[20..52].try_into().ok()?;
-			if digest.replace(value).is_some() {
+			let value = note.get(record_start..record_end)?;
+			if record.replace(value).is_some() {
 				return None;
 			}
 		}
-		digest
+		record
 	}
 
 	// Translate an image virtual address range to its file-backed bytes. Dynamic

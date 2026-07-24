@@ -19,15 +19,16 @@ fn image(image_type: u16, segments: &[ProgramHeader], payload: &[u8]) -> Vec<u8>
 	bytes
 }
 
-fn identity_note_image(digest: [u8; 32]) -> (Vec<u8>, usize, usize) {
+fn identity_note_image(record: &[u8]) -> (Vec<u8>, usize, usize) {
 	let header_len = core::mem::size_of::<Elf64Header>();
 	let strings = b"\0.shstrtab\0.note.liber.identity\0";
 	let note_offset = header_len + strings.len();
-	let section_offset = note_offset + 52;
+	let note_len = 20 + ((record.len() + 3) & !3);
+	let section_offset = note_offset + note_len;
 	let sections = [
 		SectionHeader { sh_name: 0, sh_type: 0, sh_flags: 0, sh_addr: 0, sh_offset: 0, sh_size: 0, sh_link: 0, sh_info: 0, sh_addralign: 0, sh_entsize: 0 },
 		SectionHeader { sh_name: 1, sh_type: SHT_STRTAB, sh_flags: 0, sh_addr: 0, sh_offset: header_len as u64, sh_size: strings.len() as u64, sh_link: 0, sh_info: 0, sh_addralign: 1, sh_entsize: 0 },
-		SectionHeader { sh_name: 11, sh_type: SHT_NOTE, sh_flags: SHF_ALLOC, sh_addr: 0, sh_offset: note_offset as u64, sh_size: 52, sh_link: 0, sh_info: 0, sh_addralign: 4, sh_entsize: 0 },
+		SectionHeader { sh_name: 11, sh_type: SHT_NOTE, sh_flags: SHF_ALLOC, sh_addr: 0, sh_offset: note_offset as u64, sh_size: note_len as u64, sh_link: 0, sh_info: 0, sh_addralign: 4, sh_entsize: 0 },
 	];
 	let mut bytes = vec![0u8; section_offset + core::mem::size_of_val(&sections)];
 	let mut ident = [0u8; 16];
@@ -41,10 +42,10 @@ fn identity_note_image(digest: [u8; 32]) -> (Vec<u8>, usize, usize) {
 	}
 	bytes[header_len..note_offset].copy_from_slice(strings);
 	bytes[note_offset..note_offset + 4].copy_from_slice(&6u32.to_le_bytes());
-	bytes[note_offset + 4..note_offset + 8].copy_from_slice(&32u32.to_le_bytes());
+	bytes[note_offset + 4..note_offset + 8].copy_from_slice(&(record.len() as u32).to_le_bytes());
 	bytes[note_offset + 8..note_offset + 12].copy_from_slice(&LIBER_IDENTITY_NOTE_TYPE.to_le_bytes());
 	bytes[note_offset + 12..note_offset + 18].copy_from_slice(LIBER_IDENTITY_NOTE_NAME);
-	bytes[note_offset + 20..note_offset + 52].copy_from_slice(&digest);
+	bytes[note_offset + 20..note_offset + 20 + record.len()].copy_from_slice(record);
 	(bytes, note_offset, section_offset)
 }
 
@@ -132,18 +133,22 @@ fn explicit_machine_parser_supports_cross_target_audits() {
 
 #[test]
 fn liber_identity_note_is_exact_and_unique() {
-	let digest = [0x5au8; 32];
-	let (bytes, note_offset, section_offset) = identity_note_image(digest);
-	assert_eq!(Elf::parse(&bytes).unwrap().liber_identity_note_digest(), Some(digest));
+	let record = b"format=liber-image-identity-v1\n";
+	let (bytes, note_offset, section_offset) = identity_note_image(record);
+	assert_eq!(Elf::parse(&bytes).unwrap().liber_identity_note(), Some(&record[..]));
 
-	let (mut malformed, _, _) = identity_note_image(digest);
+	let (mut malformed, _, _) = identity_note_image(record);
 	malformed[note_offset..note_offset + 4].copy_from_slice(&5u32.to_le_bytes());
-	assert!(Elf::parse(&malformed).unwrap().liber_identity_note_digest().is_none());
+	assert!(Elf::parse(&malformed).unwrap().liber_identity_note().is_none());
 
-	let (mut duplicate, _, _) = identity_note_image(digest);
+	let (mut duplicate, _, _) = identity_note_image(record);
 	let note_header = duplicate[section_offset + 2 * core::mem::size_of::<SectionHeader>()..section_offset + 3 * core::mem::size_of::<SectionHeader>()].to_vec();
 	duplicate[section_offset..section_offset + core::mem::size_of::<SectionHeader>()].copy_from_slice(&note_header);
-	assert!(Elf::parse(&duplicate).unwrap().liber_identity_note_digest().is_none());
+	assert!(Elf::parse(&duplicate).unwrap().liber_identity_note().is_none());
+
+	let oversized = vec![b'x'; MAX_LIBER_IDENTITY_RECORD_BYTES + 1];
+	let (oversized, _, _) = identity_note_image(&oversized);
+	assert!(Elf::parse(&oversized).unwrap().liber_identity_note().is_none());
 }
 
 #[test]

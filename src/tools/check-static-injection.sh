@@ -15,13 +15,13 @@ failure_log=""
 restore_log=""
 
 case "$first" in
-static | undeclared-edge | duplicate-edge | malformed-dynamic | malformed-symbol-relocation | dependency-graph)
+static | undeclared-edge | duplicate-edge | malformed-dynamic | malformed-symbol-relocation | identity-note)
 	kind="$first"
 	mode="${2:-all}"
 	;;
 all | x86_64 | aarch64 | riscv64) mode="$first" ;;
 *)
-	echo "usage: $0 [static|undeclared-edge|duplicate-edge|malformed-dynamic|malformed-symbol-relocation|dependency-graph] [all|x86_64|aarch64|riscv64]" >&2
+	echo "usage: $0 [static|undeclared-edge|duplicate-edge|malformed-dynamic|malformed-symbol-relocation|identity-note] [all|x86_64|aarch64|riscv64]" >&2
 	exit 2
 	;;
 esac
@@ -62,8 +62,10 @@ build_kernel() {
 	local status
 	pushd "$root/kernel" >/dev/null
 	if [[ "$target" == x86_64-unknown-none ]]; then
+		timeout 600 cargo clean -p kernel >/dev/null 2>&1
 		if timeout 600 cargo build >"$output" 2>&1; then status=0; else status=$?; fi
 	else
+		timeout 600 cargo clean -p kernel --target "$target" >/dev/null 2>&1
 		if timeout 600 cargo build --target "$target" >"$output" 2>&1; then status=0; else status=$?; fi
 	fi
 	popd >/dev/null
@@ -249,15 +251,25 @@ inject_artifact() {
 	bad-pltrelsz)
 		write_u64_le 47 "$(dynamic_value_offset 2)"
 		;;
-	dependency-graph)
-		local -a order=()
-		mapfile -t order <"$artifact"
-		if [[ "${#order[@]}" -lt 2 || -z "${order[0]}" || -z "${order[1]}" ]]; then
-			echo "image-injection-check: $mutation expected a multi-provider order in $artifact" >&2
+	identity-note)
+		local note_offset_hex note_size_hex note_offset note_size profile_offset
+		read -r note_offset_hex note_size_hex < <(llvm-readelf -SW "$artifact" | awk '$2 == ".note.liber.identity" {print $5, $6; exit}')
+		if [[ -z "$note_offset_hex" || -z "$note_size_hex" ]]; then
+			echo "image-injection-check: $mutation found no identity note in $artifact" >&2
 			return 1
 		fi
-		printf '%s\n%s\n' "${order[1]}" "${order[0]}" >"$artifact"
-		printf '%s\n' "${order[@]:2}" >>"$artifact"
+		note_offset=$((0x$note_offset_hex))
+		note_size=$((0x$note_size_hex))
+		profile_offset="$(dd if="$artifact" bs=1 skip="$note_offset" count="$note_size" status=none | LC_ALL=C grep -aob 'profile=release' | cut -d: -f1)"
+		if [[ "$(wc -w <<<"$profile_offset")" != 1 ]]; then
+			echo "image-injection-check: $mutation found no unique identity profile in the note" >&2
+			return 1
+		fi
+		printf 'x' | dd of="$artifact" bs=1 seek="$((note_offset + profile_offset + 8))" conv=notrunc status=none
+		if dd if="$artifact" bs=1 skip="$note_offset" count="$note_size" status=none | LC_ALL=C grep -aq 'profile=release'; then
+			echo "image-injection-check: $mutation did not corrupt the identity profile" >&2
+			return 1
+		fi
 		;;
 	esac
 }
@@ -270,7 +282,7 @@ rejection_pattern() {
 	duplicate-segment | missing-terminator | duplicate-singleton) printf '%s\n' 'dynamic dyn_probe has no valid terminated PT_DYNAMIC' ;;
 	bad-syment | bad-pltrelsz) printf '%s\n' 'dynamic dyn_probe has no valid terminated PT_DYNAMIC' ;;
 	bad-hash-count) printf '%s\n' 'dynamic dyn_probe has malformed dynamic symbols' ;;
-	dependency-graph) printf '%s\n' 'dynamic dyn_probe provider order differs from the manifest graph' ;;
+	identity-note) printf '%s\n' 'echo identity profile' ;;
 	esac
 }
 
@@ -280,9 +292,7 @@ check_target() {
 	local volume_name="$3"
 	local volume="$build_root/boot/$volume_name"
 	local artifact_hash before after_failure after_restore
-	if [[ "$kind" == dependency-graph ]]; then
-		artifact="$build_root/system-image/$target/bin/dyn_probe.order"
-	elif [[ "$kind" == duplicate-edge || "$kind" == malformed-dynamic || "$kind" == malformed-symbol-relocation ]]; then
+	if [[ "$kind" == duplicate-edge || "$kind" == malformed-dynamic || "$kind" == malformed-symbol-relocation ]]; then
 		artifact="$build_root/system-image/$target/bin/dyn_probe"
 	else
 		artifact="$build_root/system-image/$target/bin/echo"
@@ -291,12 +301,12 @@ check_target() {
 		echo "image-injection-check: missing staged $label artifact for $kind" >&2
 		return 1
 	}
-	[[ -f "$volume" ]] || {
-		echo "image-injection-check: missing staged $label volume package" >&2
-		return 1
-	}
 	baseline_log="$(mktemp)"
 	build_kernel "$target" "$baseline_log"
+	[[ -f "$volume" ]] || {
+		echo "image-injection-check: kernel build did not export $label volume package" >&2
+		return 1
+	}
 	backup="$(mktemp)"
 	failure_log="$(mktemp)"
 	restore_log="$(mktemp)"
@@ -309,6 +319,7 @@ check_target() {
 		cp "$backup" "$artifact"
 		inject_artifact
 		if build_kernel "$target" "$failure_log"; then
+			cat "$failure_log" >&2
 			echo "image-injection-check: $label $mutation injection unexpectedly built" >&2
 			return 1
 		fi
@@ -352,7 +363,7 @@ x86_64) check_target x86_64 x86_64-unknown-none volume.pkg ;;
 aarch64) check_target aarch64 aarch64-unknown-none volume-aarch64.pkg ;;
 riscv64) check_target riscv64 riscv64gc-unknown-none-elf volume-riscv64.pkg ;;
 *)
-	echo "usage: $0 [static|undeclared-edge|duplicate-edge|malformed-dynamic|malformed-symbol-relocation|dependency-graph] [all|x86_64|aarch64|riscv64]" >&2
+	echo "usage: $0 [static|undeclared-edge|duplicate-edge|malformed-dynamic|malformed-symbol-relocation|identity-note] [all|x86_64|aarch64|riscv64]" >&2
 	exit 2
 	;;
 esac
