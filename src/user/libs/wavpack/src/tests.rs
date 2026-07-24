@@ -1,7 +1,19 @@
 extern crate alloc;
+extern crate std;
 
 use super::*;
 use alloc::vec::Vec;
+use std::path::PathBuf;
+use std::process::Command;
+
+fn ffmpeg_fixture() -> Vec<u8> {
+	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../..");
+	let output = root.join(".build/testdata/wavpack/test-stereo-short.wv");
+	std::fs::create_dir_all(output.parent().unwrap()).expect("failed to create WavPack testdata directory");
+	let status = Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=997:sample_rate=44100:duration=0.1"]).args(["-filter_complex", "[0:a]pan=stereo|c0=c0|c1=-1*c0[out]", "-map", "[out]", "-c:a", "wavpack"]).arg(&output).status().expect("ffmpeg is required to generate the WavPack mutation fixture");
+	assert!(status.success(), "ffmpeg failed to generate the WavPack mutation fixture");
+	std::fs::read(output).expect("failed to read the generated WavPack mutation fixture")
+}
 
 fn item(id: u8, data: &[u8], large: bool) -> Vec<u8> {
 	let padded = data.len() + (data.len() & 1);
@@ -77,7 +89,7 @@ fn rejects_truncation_missing_bitstream_and_unsupported_profiles() {
 
 #[test]
 fn malformed_streams_fail_without_panicking_or_stalling() {
-	let source = include_bytes!("../tests/test-stereo-short.wv");
+	let source = ffmpeg_fixture();
 	for len in (0..source.len()).step_by(source.len().div_ceil(256)) {
 		if let Ok(wavpack) = WavPack::parse(&source[..len]) {
 			let mut decoder = wavpack.decoder();
