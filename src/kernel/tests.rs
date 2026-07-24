@@ -1139,11 +1139,6 @@ pub(crate) fn test_runner(tests: &[&dyn Testable]) {
 	arch::exit_qemu(true);
 }
 
-tagged_test!(trivial_assertion, [Kernel, Smoke]);
-fn trivial_assertion() {
-	assert_eq!(1 + 1, 2);
-}
-
 tagged_test!(
 	#[cfg(target_arch = "x86_64")]
 	breakpoint_exception_returns,
@@ -3134,39 +3129,6 @@ fn dma_buffer_maps_and_reports_phys() {
 	assert!(DONE.load(Ordering::SeqCst), "the DMA buffer thread did not complete");
 	assert!(PHYS.load(Ordering::SeqCst) != 0, "the DMA buffer should report a non-zero physical base");
 	assert_eq!(READBACK.load(Ordering::SeqCst), MARK, "the bytes written through the mapping must be visible at the physical base");
-}
-
-tagged_test!(log_record_roundtrip_and_renders, [Service]);
-fn log_record_roundtrip_and_renders() {
-	use abi::log::{LogRecord, Severity, encode, render_cbor, render_json, render_text};
-	// A LogRecord is the canonical structured object; text/JSON/CBOR are derived
-	// representations. Encode one, parse it back (the fields survive), then render
-	// the SAME record three ways and check each representation byte-for-byte.
-	let fields: [(&[u8], &[u8]); 2] = [(b"event", b"online"), (b"files", b"2")];
-	let mut wire: [u8; 128] = [0u8; 128];
-	let n: usize = encode(42, Severity::Info, b"storage_service", &fields, &mut wire).expect("encode fits");
-	let rec: LogRecord<'_> = LogRecord::parse(&wire[..n]).expect("parse round-trips");
-	assert_eq!(rec.ts(), 42);
-	assert_eq!(rec.severity(), Severity::Info);
-	assert_eq!(rec.source(), b"storage_service");
-	assert_eq!(rec.field_count(), 2);
-	let mut it = rec.fields();
-	assert_eq!(it.next(), Some((&b"event"[..], &b"online"[..])));
-	assert_eq!(it.next(), Some((&b"files"[..], &b"2"[..])));
-	assert_eq!(it.next(), None);
-	// human text
-	let mut tbuf: [u8; 128] = [0u8; 128];
-	let tn: usize = render_text(&rec, &mut tbuf).expect("text fits");
-	assert_eq!(&tbuf[..tn], b"[42] INFO storage_service: event=online files=2");
-	// JSON
-	let mut jbuf: [u8; 256] = [0u8; 256];
-	let jn: usize = render_json(&rec, &mut jbuf).expect("json fits");
-	assert_eq!(&jbuf[..jn], br#"{"ts":42,"severity":"INFO","source":"storage_service","fields":{"event":"online","files":"2"}}"#);
-	// CBOR: map(4); spot-check the head and that the source text is embedded
-	let mut cbuf: [u8; 128] = [0u8; 128];
-	let cn: usize = render_cbor(&rec, &mut cbuf).expect("cbor fits");
-	assert_eq!(cbuf[0], 0xA4, "CBOR record is a 4-entry map");
-	assert!(cbuf[..cn].windows(b"storage_service".len()).any(|w: &[u8]| w == b"storage_service"), "source string present in CBOR");
 }
 
 // Spawn a userspace service from the init package and hand it the channel its
@@ -5879,76 +5841,6 @@ fn pty_hosts_a_program() {
 		captured.extend_from_slice(&msg.bytes);
 	}
 	assert!(captured.windows(b"pty:hello".len()).any(|w| w == b"pty:hello"), "the slave's reply is forwarded back out the master");
-}
-
-tagged_test!(interactive_tool_reads_stdin, [Service, Shell, Console, Input]);
-fn interactive_tool_reads_stdin() {
-	// The provider-aware ProcessService scenario above drives readln's full-duplex console
-	// behavior. Independently pin its staged graph here: raw-spawning an ET_DYN consumer
-	// without ProcessService would skip its provider resolution and is not a valid test path.
-	let init = init_package_bytes().expect("init package module not found");
-	let volume = volume_package_bytes().expect("volume package module not found");
-	let package = pkg::Package::parse(init).expect("init package parses");
-	let readln_elf = program_elf(&package, volume, b"readln").expect("readln in the package or volume");
-	let elf = bootproto::elf::Elf::parse(readln_elf).expect("readln is ELF");
-	assert_eq!(elf.image_type, bootproto::elf::ET_DYN, "readln is staged as PIE");
-	let dynamic = elf.dynamic_info().expect("readln dynamic metadata parses").expect("readln has PT_DYNAMIC");
-	assert_eq!(elf.needed_names(&dynamic).expect("readln dependencies parse").collect::<alloc::vec::Vec<_>>(), alloc::vec!["lsrt.lslib"]);
-}
-
-tagged_test!(du_reports_a_directory_tree_size, [Service, Storage, Shell]);
-fn du_reports_a_directory_tree_size() {
-	// The provider-aware ProcessService scenario above executes du against a live tree.
-	// Keep this independently tagged test as the package contract: du must now be a PIE
-	// with the direct providers required by its recursive allocation and storage traversal.
-	let (volume, package) = scenario_packages().expect("scenario packages");
-	let du_elf = program_elf(&package, volume, b"du").expect("du in the package or volume");
-	let elf = bootproto::elf::Elf::parse(du_elf).expect("du is ELF");
-	assert_eq!(elf.image_type, bootproto::elf::ET_DYN, "du is staged as PIE");
-	let dynamic = elf.dynamic_info().expect("du dynamic metadata parses").expect("du has PT_DYNAMIC");
-	let mut needed = elf.needed_names(&dynamic).expect("du dependencies parse").collect::<alloc::vec::Vec<_>>();
-	needed.sort_unstable();
-	assert_eq!(needed, alloc::vec!["lsrt.lslib", "storage-proto.lslib", "volume-client.lslib", "wire.lslib"]);
-}
-
-fn assert_dynamic_inventory_providers(name: &[u8], expected: &[&str]) {
-	let init = init_package_bytes().expect("init package present");
-	let volume = volume_package_bytes().expect("volume package present");
-	let package = pkg::Package::parse(init).expect("init package parses");
-	let bytes = program_elf(&package, volume, name).expect("dynamic inventory tool is staged");
-	let elf = bootproto::elf::Elf::parse(bytes).expect("dynamic inventory tool is ELF");
-	assert_eq!(elf.image_type, bootproto::elf::ET_DYN, "inventory tool is PIE");
-	let dynamic = elf.dynamic_info().expect("inventory dynamic metadata parses").expect("inventory tool has PT_DYNAMIC");
-	let mut needed = elf.needed_names(&dynamic).expect("inventory dependencies parse").collect::<alloc::vec::Vec<_>>();
-	needed.sort_unstable();
-	assert_eq!(needed, expected);
-}
-
-tagged_test!(inventory_tools_print_the_system_identity, [Service, Shell]);
-fn inventory_tools_print_the_system_identity() {
-	// The zero-capability inventory commands: each runs as its own sandboxed
-	// ELF and prints compile-time / free-syscall data - no service client, the
-	// emptiest manifests in the permission store. uname prints the product identity
-	// and architecture, uptime the time since boot, and dmesg the kernel boot log
-	// (the same text SYS_CONSOLE_READLOG hands ConsoleService for the boot screen).
-	assert_dynamic_inventory_providers(b"uname", &["lsrt.lslib"]);
-	assert_dynamic_inventory_providers(b"uptime", &["lsrt.lslib"]);
-
-	assert_dynamic_inventory_providers(b"dmesg", &["lsrt.lslib"]);
-}
-
-tagged_test!(inventory_tools_report_the_hardware, [Service, Shell, Drivers]);
-fn inventory_tools_report_the_hardware() {
-	// The hardware-inventory commands: each runs as its own sandboxed ELF over
-	// a free syscall reading state the kernel now retains past boot - the CPU set
-	// (lscpu), the frame-pool and heap totals (free), the boot memory map (lsmem),
-	// and the device-interrupt vector table (lsirq).
-	assert_dynamic_inventory_providers(b"lscpu", &["lsrt.lslib", "wire.lslib"]);
-	assert_dynamic_inventory_providers(b"free", &["lsrt.lslib"]);
-
-	assert_dynamic_inventory_providers(b"lsmem", &["lsrt.lslib", "wire.lslib"]);
-	assert_dynamic_inventory_providers(b"lsirq", &["lsrt.lslib", "wire.lslib"]);
-	assert_dynamic_inventory_providers(b"lspci", &["lsrt.lslib", "wire.lslib"]);
 }
 
 // The sector where StorageService lays the fixed factory LiberFS layout when a disk

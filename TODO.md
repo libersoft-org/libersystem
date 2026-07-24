@@ -4626,6 +4626,32 @@ capability policy remain unchanged.
   flat compatibility copies, and update Cargo paths, build scripts, tests and docs
   atomically. A new leaf must declare exactly one category; moving a leaf between
   categories changes no runtime ABI or dependency edge.
+- [ ] Remove the redundant `order/` namespace and generated `.order` sidecars. The
+  complete provider graph is already bound and cross-checked by each executable/library
+  identity record and its exact `DT_NEEDED` edges, while both the image builder and
+  ProcessService can independently derive the same provider-before-consumer topological
+  order with a lexical tie-break. Stop emitting, caching, hashing, packaging, opening,
+  parsing and comparing per-executable order files; retain the bounded cycle/depth/module
+  checks and deterministic slot assignment over the runtime-derived order. Build/package
+  gates must still reject dependency drift directly from the manifest plus ELF graph, and runtime
+  tests must prove equivalent graphs map providers identically regardless of `DT_NEEDED`
+  enumeration order. Remove the old order-drift injection tests and replace them with
+  derivation determinism and malformed/cyclic graph tests; no compatibility `order/`
+  files remain in the pre-release system volume.
+- [ ] Remove the redundant `id/` namespace by embedding each complete bounded
+  `liber-image-identity-v1` record directly in its executable or library ELF note, not
+  only the record's digest. The record retains artifact kind/name, package, source digest,
+  rustc commit, target, profile, rustflags, features and exact direct-provider identity
+  digests. ProcessService parses the note in place, computes its canonical record digest
+  for provider-chain comparison and rejects a missing, duplicate, malformed, oversized,
+  target-incompatible or dependency-mismatched identity before loading. The image builder
+  emits and audits the same canonical note bytes, and cache/report keys bind those bytes
+  without publishing separate `id/bin/*` or `id/lib/*` files. Replace identity-file
+  substitution/corruption tests with equivalent embedded-note mutations, remove every
+  identity-record open/staging path and leave no compatibility `id/` directory. This is
+  image-internal build consistency, not artifact signing or verified boot; an attacker
+  able to replace the whole system image remains outside this check until the signed-image
+  work adds a trust root.
 - [ ] Restore test ownership after the physical move and decompose the monolithic kernel
   QEMU suite. Delete the trivial assertion; move the log record round-trip into the ABI
   crate; move executable inventory, stdin capability and other metadata-only assertions
@@ -4637,6 +4663,18 @@ capability policy remain unchanged.
   permission scenarios into independently tagged cases. Keep ELF loading, ring-3,
   capability, syscall, cross-service and hardware behavior as end-to-end QEMU tests, so
   the ownership cleanup preserves the existing system-level coverage.
+  - Ownership-cleanup result (2026-07-24, first slice): removed the tautological kernel
+    assertion and moved the structured log encode/parse/text/JSON/CBOR round-trip into
+    the ABI crate's sibling `tests.rs`. The metadata-only `readln`, `du`, `uname`,
+    `uptime`, `dmesg`, `lscpu`, `free`, `lsmem`, `lsirq` and `lspci` PIE/provider
+    assertions moved out of QEMU into `tools/check-artifact-metadata.sh`; the existing
+    image builder remains the stronger gate over their actual `ET_DYN` and exact
+    `DT_NEEDED` metadata. `test-tags-check` runs the new manifest gate before every QEMU
+    recipe. Kernel descriptors fell from 138 to 132 without removing any behavioral
+    scenario. ABI tests pass 2/2, both host metadata checks pass, and the kernel test
+    binary compiles with the pinned nightly toolchain. Remaining work is owner-crate
+    application/service logic coverage, compound-scenario separation and thematic QEMU
+    modules.
 - [ ] Define the factory `vol://system` hierarchy so its root contains only `hello.txt`,
   `motd.txt` and the declared directories:
   - `bin/`: user-invoked `.lsexe` tools. A stateless single-file command may live

@@ -336,9 +336,13 @@ test-tags-riscv64 tags: sdk user-riscv64 test-tags-check
 test-all: sdk user user-aarch64 user-riscv64 test-tags-check
     boot/test-all.sh
 
-# A cheap source check; the Rust type system separately rejects unknown/empty tags.
-test-tags-check:
+# Cheap source and manifest checks; the Rust type system separately rejects
+# unknown/empty tags, and the image builder verifies actual ELF metadata.
+test-tags-check: artifact-metadata-check
     boot/check-test-tags.sh
+
+artifact-metadata-check:
+    tools/check-artifact-metadata.sh
 
 # Reject generated or compiled artifacts anywhere below src or in the Git index.
 source-hygiene:
