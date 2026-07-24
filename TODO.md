@@ -4846,6 +4846,16 @@ capability policy remain unchanged.
     the smoke set. Kernel test compilation and tag validation pass. Remaining compound
     work is the audio mixer/backpressure/decoder/driver-failure scenario and the
     permission probe/tool/grant scenario, followed by thematic QEMU modules.
+  - AudioService split result (2026-07-24): the former mixer/backpressure/decoder/
+    driver-failure descriptor is now four independent tests over one shared bootstrap
+    and request harness. Scope restriction plus saturating/resampling mixer behavior,
+    bounded write backpressure plus peer-close queue teardown, uninterrupted MP3
+    playback plus bounded interrupt tail, and live-stream/future-open failure after a
+    sound-driver crash each have their own descriptor. A dedicated canonical
+    `audio-service` tag selects only these contracts; focused x86_64 QEMU passes 11/11
+    with the smoke set, and kernel test compilation/tag validation pass. Remaining
+    compound work is the permission probe/tool/grant scenario, followed by thematic
+    QEMU modules.
 - [ ] Define the factory `vol://system` hierarchy so its root contains only `hello.txt`,
   `motd.txt` and the declared directories:
   - `bin/`: user-invoked `.lsexe` tools. A stateless single-file command may live

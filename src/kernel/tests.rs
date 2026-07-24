@@ -1023,6 +1023,7 @@ define_test_tags! {
 	ArchRiscv64 => "arch-riscv64",
 	ArchX86_64 => "arch-x86_64",
 	Audio => "audio",
+	AudioService => "audio-service",
 	Boot => "boot",
 	Console => "console",
 	Display => "display",
@@ -3774,8 +3775,15 @@ fn display_service_restores_the_console_surface() {
 	acknowledge_present(&gpu_kernel, Some((&benchmark, 76)));
 }
 
-tagged_test!(audio_service_mixes_pcm_streams_with_backpressure, [Service, Audio]);
-fn audio_service_mixes_pcm_streams_with_backpressure() {
+#[derive(Clone, Copy)]
+enum AudioServiceScenario {
+	ScopeAndMixing,
+	Backpressure,
+	Mp3Continuity,
+	DriverFailure,
+}
+
+fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	use object::channel::{Channel, Message};
 	use object::memory_object::MemoryObject;
 	use object::rights::Rights;
@@ -3902,145 +3910,165 @@ fn audio_service_mixes_pcm_streams_with_backpressure() {
 	assert_eq!(&storage_online.bytes[..], b"StorageService: online");
 	let online = boot_kernel.recv().expect("AudioService online report");
 	assert_eq!(&online.bytes[..], b"AudioService: online");
-	assert!(open(&service_client, 1, 4_000, 1).is_err(), "unsupported sample rate is refused");
-	let scoped = open_scope(&audio_admin, 30);
-	let mut denied_beep = alloc::vec::Vec::new();
-	denied_beep.extend_from_slice(&1u16.to_le_bytes());
-	denied_beep.extend_from_slice(&31u32.to_le_bytes());
-	denied_beep.extend_from_slice(&440u16.to_le_bytes());
-	denied_beep.extend_from_slice(&10u32.to_le_bytes());
-	scoped.send(Message::new(denied_beep, alloc::vec::Vec::new(), 0)).expect("scoped beep request");
-	sched::run_until_idle();
-	let denied = scoped.recv().expect("scoped beep denial");
-	assert_eq!(denied.bytes[4], 0, "audio-stream scope denies beep");
-	let scoped_stream = open(&scoped, 32, 48_000, 2).expect("audio-stream scope permits playback");
-	drop(scoped_stream);
+	match scenario {
+		AudioServiceScenario::ScopeAndMixing => {
+			assert!(open(&service_client, 1, 4_000, 1).is_err(), "unsupported sample rate is refused");
+			let scoped = open_scope(&audio_admin, 30);
+			let mut denied_beep = alloc::vec::Vec::new();
+			denied_beep.extend_from_slice(&1u16.to_le_bytes());
+			denied_beep.extend_from_slice(&31u32.to_le_bytes());
+			denied_beep.extend_from_slice(&440u16.to_le_bytes());
+			denied_beep.extend_from_slice(&10u32.to_le_bytes());
+			scoped.send(Message::new(denied_beep, alloc::vec::Vec::new(), 0)).expect("scoped beep request");
+			sched::run_until_idle();
+			let denied = scoped.recv().expect("scoped beep denial");
+			assert_eq!(denied.bytes[4], 0, "audio-stream scope denies beep");
+			let scoped_stream = open(&scoped, 32, 48_000, 2).expect("audio-stream scope permits playback");
+			drop(scoped_stream);
 
-	let stereo = open(&service_client, 2, 48_000, 2).expect("48 kHz stereo stream");
-	let mono = open(&service_client, 3, 24_000, 1).expect("24 kHz mono stream");
-	send_write(&stereo, 4, &pcm(1_536, 2, 30_000));
-	sched::run_until_idle();
-	write_reply(&stereo, 4, 1_536);
-	let first = snd_host.recv().expect("first hardware period");
-	assert_eq!(first.bytes.len(), 2_048);
-	assert_eq!(sample(&first), 30_000, "first stream plays alone");
+			let stereo = open(&service_client, 2, 48_000, 2).expect("48 kHz stereo stream");
+			let mono = open(&service_client, 3, 24_000, 1).expect("24 kHz mono stream");
+			send_write(&stereo, 4, &pcm(1_536, 2, 30_000));
+			sched::run_until_idle();
+			write_reply(&stereo, 4, 1_536);
+			let first = snd_host.recv().expect("first hardware period");
+			assert_eq!(first.bytes.len(), 2_048);
+			assert_eq!(sample(&first), 30_000, "first stream plays alone");
 
-	// Queue the second stream and beep while the first hardware period is pending.
-	send_write(&mono, 5, &pcm(512, 1, 3_000));
-	let mut beep = alloc::vec::Vec::new();
-	beep.extend_from_slice(&1u16.to_le_bytes());
-	beep.extend_from_slice(&6u32.to_le_bytes());
-	beep.extend_from_slice(&1_000u16.to_le_bytes());
-	beep.extend_from_slice(&30u32.to_le_bytes());
-	service_client.send(Message::new(beep, alloc::vec::Vec::new(), 0)).expect("beep request");
-	sched::run_until_idle();
-	write_reply(&mono, 5, 512);
-	let beep_reply = service_client.recv().expect("beep reply");
-	assert_eq!(beep_reply.bytes[4], 1, "beep queues into the mixer");
+			send_write(&mono, 5, &pcm(512, 1, 3_000));
+			let mut beep = alloc::vec::Vec::new();
+			beep.extend_from_slice(&1u16.to_le_bytes());
+			beep.extend_from_slice(&6u32.to_le_bytes());
+			beep.extend_from_slice(&1_000u16.to_le_bytes());
+			beep.extend_from_slice(&30u32.to_le_bytes());
+			service_client.send(Message::new(beep, alloc::vec::Vec::new(), 0)).expect("beep request");
+			sched::run_until_idle();
+			write_reply(&mono, 5, 512);
+			let beep_reply = service_client.recv().expect("beep reply");
+			assert_eq!(beep_reply.bytes[4], 1, "beep queues into the mixer");
 
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("first period ACK");
-	sched::run_until_idle();
-	let second = snd_host.recv().expect("mixed second period");
-	assert_eq!(sample(&second), i16::MAX, "two streams plus beep saturate instead of wrapping");
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("second period ACK");
-	sched::run_until_idle();
-	let third = snd_host.recv().expect("resampled third period");
-	assert_eq!(sample(&third), 27_000, "24 kHz mono is duplicated and survives for two output periods");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("first period ACK");
+			sched::run_until_idle();
+			let second = snd_host.recv().expect("mixed second period");
+			assert_eq!(sample(&second), i16::MAX, "two streams plus beep saturate instead of wrapping");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("second period ACK");
+			sched::run_until_idle();
+			let third = snd_host.recv().expect("resampled third period");
+			assert_eq!(sample(&third), 27_000, "24 kHz mono is duplicated and survives for two output periods");
 
-	close_stream(&stereo, 7);
-	close_stream(&mono, 8);
-	sched::run_until_idle();
-	assert_eq!(stereo.recv().expect("stereo close reply").bytes[4], 1);
-	assert_eq!(mono.recv().expect("mono close reply").bytes[4], 1);
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("third period ACK");
-	sched::run_until_idle();
-	let fourth = snd_host.recv().expect("beep tail period");
-	assert_eq!(sample(&fourth), 6_000, "beep continues through the shared mixer after streams drain");
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("fourth period ACK");
-	sched::run_until_idle();
-	let stop = snd_host.recv().expect("hardware stop sentinel");
-	assert!(stop.bytes.is_empty(), "idle mixer releases the hardware stream");
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("stop ACK");
-	sched::run_until_idle();
-
-	// Fill the bounded queue: the third write stays unanswered until two hardware
-	// periods advance the playback clock and create source-frame capacity.
-	let bounded = open(&service_client, 9, 48_000, 2).expect("bounded stream");
-	send_write(&bounded, 10, &pcm(4_096, 2, 100));
-	sched::run_until_idle();
-	write_reply(&bounded, 10, 4_096);
-	let period = snd_host.recv().expect("bounded period one");
-	assert_eq!(sample(&period), 100);
-	send_write(&bounded, 11, &pcm(512, 2, 100));
-	sched::run_until_idle();
-	write_reply(&bounded, 11, 512);
-	send_write(&bounded, 12, &pcm(512, 2, 100));
-	sched::run_until_idle();
-	assert!(bounded.recv().is_err(), "full queue defers the write reply");
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("bounded period one ACK");
-	sched::run_until_idle();
-	let period = snd_host.recv().expect("bounded period two");
-	assert_eq!(sample(&period), 100);
-	assert!(bounded.recv().is_err(), "one ACK has not yet made bounded capacity visible");
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("bounded period two ACK");
-	sched::run_until_idle();
-	write_reply(&bounded, 12, 512);
-	let period = snd_host.recv().expect("bounded period three");
-	assert_eq!(sample(&period), 100);
-	drop(bounded);
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("bounded period three ACK");
-	sched::run_until_idle();
-	let stop = snd_host.recv().expect("peer-close stop sentinel");
-	assert!(stop.bytes.is_empty(), "peer-close drops queued source frames before another period");
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("peer-close stop ACK");
-	sched::run_until_idle();
-
-	// MP3 is fully decoded before opening its stream: the debug decoder's burst latency
-	// must never empty the live queue and stretch playback with stop/restart gaps.
-	let mp3_scope = open_scope(&audio_admin, 43);
-	let (_mp3_stdout, mp3_process) = launch_play(&process_client, storage_client, mp3_scope, b"vol://system/audio/test.mp3");
-	sched::run_until_idle();
-	let mut mp3_period = snd_host.recv().expect("MP3 first hardware period");
-	assert!(!mp3_period.bytes.is_empty(), "MP3 starts with an audio period");
-	let mut mp3_periods = 1u32;
-	while mp3_periods < 12 {
-		snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("MP3 period ACK");
-		sched::run_until_idle();
-		mp3_period = snd_host.recv().expect("next MP3 period");
-		assert!(!mp3_period.bytes.is_empty(), "MP3 queue underrun stopped the hardware stream");
-		mp3_periods += 1;
-	}
-	mp3_process.set_int_pending();
-	for thread in mp3_process.live_threads() {
-		sched::wake_thread(&thread);
-	}
-	let mut mp3_tail = 0u32;
-	loop {
-		snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("MP3 tail ACK");
-		sched::run_until_idle();
-		mp3_period = snd_host.recv().expect("MP3 tail period or stop");
-		if mp3_period.bytes.is_empty() {
-			break;
+			close_stream(&stereo, 7);
+			close_stream(&mono, 8);
+			sched::run_until_idle();
+			assert_eq!(stereo.recv().expect("stereo close reply").bytes[4], 1);
+			assert_eq!(mono.recv().expect("mono close reply").bytes[4], 1);
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("third period ACK");
+			sched::run_until_idle();
+			let fourth = snd_host.recv().expect("beep tail period");
+			assert_eq!(sample(&fourth), 6_000, "beep continues through the shared mixer after streams drain");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("fourth period ACK");
+			sched::run_until_idle();
+			let stop = snd_host.recv().expect("hardware stop sentinel");
+			assert!(stop.bytes.is_empty(), "idle mixer releases the hardware stream");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("stop ACK");
+			sched::run_until_idle();
 		}
-		mp3_tail += 1;
-		assert!(mp3_tail <= 64, "interrupted MP3 leaves at most the bounded accepted queue tail");
+		AudioServiceScenario::Backpressure => {
+			let bounded = open(&service_client, 9, 48_000, 2).expect("bounded stream");
+			send_write(&bounded, 10, &pcm(4_096, 2, 100));
+			sched::run_until_idle();
+			write_reply(&bounded, 10, 4_096);
+			let period = snd_host.recv().expect("bounded period one");
+			assert_eq!(sample(&period), 100);
+			send_write(&bounded, 11, &pcm(512, 2, 100));
+			sched::run_until_idle();
+			write_reply(&bounded, 11, 512);
+			send_write(&bounded, 12, &pcm(512, 2, 100));
+			sched::run_until_idle();
+			assert!(bounded.recv().is_err(), "full queue defers the write reply");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("bounded period one ACK");
+			sched::run_until_idle();
+			let period = snd_host.recv().expect("bounded period two");
+			assert_eq!(sample(&period), 100);
+			assert!(bounded.recv().is_err(), "one ACK has not yet made bounded capacity visible");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("bounded period two ACK");
+			sched::run_until_idle();
+			write_reply(&bounded, 12, 512);
+			let period = snd_host.recv().expect("bounded period three");
+			assert_eq!(sample(&period), 100);
+			drop(bounded);
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("bounded period three ACK");
+			sched::run_until_idle();
+			let stop = snd_host.recv().expect("peer-close stop sentinel");
+			assert!(stop.bytes.is_empty(), "peer-close drops queued source frames before another period");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("peer-close stop ACK");
+			sched::run_until_idle();
+		}
+		AudioServiceScenario::Mp3Continuity => {
+			let mp3_scope = open_scope(&audio_admin, 43);
+			let (_mp3_stdout, mp3_process) = launch_play(&process_client, storage_client, mp3_scope, b"vol://system/audio/test.mp3");
+			sched::run_until_idle();
+			let mut mp3_period = snd_host.recv().expect("MP3 first hardware period");
+			assert!(!mp3_period.bytes.is_empty(), "MP3 starts with an audio period");
+			let mut mp3_periods = 1u32;
+			while mp3_periods < 12 {
+				snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("MP3 period ACK");
+				sched::run_until_idle();
+				mp3_period = snd_host.recv().expect("next MP3 period");
+				assert!(!mp3_period.bytes.is_empty(), "MP3 queue underrun stopped the hardware stream");
+				mp3_periods += 1;
+			}
+			mp3_process.set_int_pending();
+			for thread in mp3_process.live_threads() {
+				sched::wake_thread(&thread);
+			}
+			let mut mp3_tail = 0u32;
+			loop {
+				snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("MP3 tail ACK");
+				sched::run_until_idle();
+				mp3_period = snd_host.recv().expect("MP3 tail period or stop");
+				if mp3_period.bytes.is_empty() {
+					break;
+				}
+				mp3_tail += 1;
+				assert!(mp3_tail <= 64, "interrupted MP3 leaves at most the bounded accepted queue tail");
+			}
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("MP3 stop ACK");
+			sched::run_until_idle();
+			assert!(mp3_process.is_terminated(), "interrupted MP3 player closes and exits");
+		}
+		AudioServiceScenario::DriverFailure => {
+			let doomed = open(&service_client, 13, 48_000, 2).expect("stream before driver crash");
+			send_write(&doomed, 14, &pcm(512, 2, 200));
+			sched::run_until_idle();
+			write_reply(&doomed, 14, 512);
+			let period = snd_host.recv().expect("period pending at driver crash");
+			assert_eq!(sample(&period), 200);
+			drop(snd_host);
+			sched::run_until_idle();
+			assert!(doomed.is_peer_closed(), "driver crash closes live PCM streams");
+			assert!(open(&service_client, 15, 48_000, 2).is_err(), "driver crash makes future opens fail");
+		}
 	}
-	snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("MP3 stop ACK");
-	sched::run_until_idle();
-	assert!(mp3_process.is_terminated(), "interrupted MP3 player closes and exits");
+}
 
-	// A driver crash while a period is pending closes every live PCM stream and
-	// makes future opens fail cleanly instead of leaving clients blocked forever.
-	let doomed = open(&service_client, 13, 48_000, 2).expect("stream before driver crash");
-	send_write(&doomed, 14, &pcm(512, 2, 200));
-	sched::run_until_idle();
-	write_reply(&doomed, 14, 512);
-	let period = snd_host.recv().expect("period pending at driver crash");
-	assert_eq!(sample(&period), 200);
-	drop(snd_host);
-	sched::run_until_idle();
-	assert!(doomed.is_peer_closed(), "driver crash closes live PCM streams");
-	assert!(open(&service_client, 15, 48_000, 2).is_err(), "driver crash makes future opens fail");
+tagged_test!(audio_service_enforces_scope_and_mixes_streams, [Service, Audio, AudioService]);
+fn audio_service_enforces_scope_and_mixes_streams() {
+	run_audio_service_scenario(AudioServiceScenario::ScopeAndMixing);
+}
+
+tagged_test!(audio_service_applies_bounded_backpressure, [Service, Audio, AudioService]);
+fn audio_service_applies_bounded_backpressure() {
+	run_audio_service_scenario(AudioServiceScenario::Backpressure);
+}
+
+tagged_test!(audio_service_keeps_mp3_playback_continuous, [Service, Audio, AudioService]);
+fn audio_service_keeps_mp3_playback_continuous() {
+	run_audio_service_scenario(AudioServiceScenario::Mp3Continuity);
+}
+
+tagged_test!(audio_service_closes_streams_after_driver_failure, [Service, Audio, AudioService]);
+fn audio_service_closes_streams_after_driver_failure() {
+	run_audio_service_scenario(AudioServiceScenario::DriverFailure);
 }
 
 tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow]);
