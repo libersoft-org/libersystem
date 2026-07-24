@@ -5953,7 +5953,7 @@ fn inventory_tools_report_the_hardware() {
 
 // The sector where StorageService lays the fixed factory LiberFS layout when a disk
 // carries no GPT partition for it - it must mirror the storage service's own
-// FS_START_SECTOR (src/user/storage/src/service.rs), which sits past the largest
+// FS_START_SECTOR (src/user/services/storage/src/service.rs), which sits past the largest
 // architecture's factory archive so the seed always fits ahead of the filesystem.
 const FACTORY_START_SECTOR: u64 = 65536;
 

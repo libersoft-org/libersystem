@@ -2,7 +2,7 @@
 //
 // A LiberSystem component is a WebAssembly module that imports this small,
 // capability-oriented world and exports an entry point. The host
-// (src/user/services/src/component_host.rs) resolves each import by name and wires
+// (src/user/services/core/src/component_host.rs) resolves each import by name and wires
 // it to a typed system service - never to ambient authority:
 //
 //   liber.read(ptr, max) -> n     a granted file, read through StorageService
