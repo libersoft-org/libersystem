@@ -100,15 +100,15 @@ while IFS=$'\t' read -r owner path; do
 	[[ "$path" == user/*/* ]] || continue
 	if [[ "$path" == "user/$owner/"* ]]; then
 		for suffix in Cargo.toml Cargo.lock rust-toolchain.toml src/; do
-			if git grep --untracked -n -F "src/user/$owner/$suffix" -- ':!TODO.md' ':!NOTES.md' >/dev/null; then
+			if git grep --untracked -n -F "src/user/$owner/$suffix" -- ':(exclude,glob)docs/todo/**' ':!NOTES.md' >/dev/null; then
 				echo "source-hygiene: stale pre-move path src/user/$owner/$suffix remains:" >&2
-				git grep --untracked -n -F "src/user/$owner/$suffix" -- ':!TODO.md' ':!NOTES.md' >&2
+				git grep --untracked -n -F "src/user/$owner/$suffix" -- ':(exclude,glob)docs/todo/**' ':!NOTES.md' >&2
 				exit 1
 			fi
 		done
-	elif git grep --untracked -n -F "src/user/$owner/" -- ':!TODO.md' ':!NOTES.md' >/dev/null; then
+	elif git grep --untracked -n -F "src/user/$owner/" -- ':(exclude,glob)docs/todo/**' ':!NOTES.md' >/dev/null; then
 		echo "source-hygiene: stale pre-move path src/user/$owner/ remains:" >&2
-		git grep --untracked -n -F "src/user/$owner/" -- ':!TODO.md' ':!NOTES.md' >&2
+		git grep --untracked -n -F "src/user/$owner/" -- ':(exclude,glob)docs/todo/**' ':!NOTES.md' >&2
 		exit 1
 	fi
 done <"$source_rows"
