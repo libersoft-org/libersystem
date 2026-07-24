@@ -225,6 +225,28 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 	Ok((expected, result.bytes))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PermissionScenario {
+	Probes,
+	GovernedTools,
+	ScopedGrants,
+}
+
+struct PermissionScenarioResult {
+	expected: alloc::vec::Vec<u8>,
+	probe_read: alloc::vec::Vec<u8>,
+	probe_summary: alloc::vec::Vec<u8>,
+	date_read: alloc::vec::Vec<u8>,
+	date_summary: alloc::vec::Vec<u8>,
+	request_read: alloc::vec::Vec<u8>,
+	request_summary: alloc::vec::Vec<u8>,
+	cat_read: alloc::vec::Vec<u8>,
+	ip_read: alloc::vec::Vec<u8>,
+	ip_summary: alloc::vec::Vec<u8>,
+	graphics_read: alloc::vec::Vec<u8>,
+	graphics_start_ns: u64,
+}
+
 // Build the permission topology and run it to completion. A StorageService serves
 // the ramdisk volume; a ProcessService is the loading mechanism; a TimeService serves the
 // wall clock; the permission_manager (PermissionManager) is given the clients it may grant
@@ -245,13 +267,11 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 // captured stdout; request_probe's runtime request is refused by the headless policy default
 // (least privilege - an undeclared capability is never granted) and recorded as a dynamic
 // denial; and `cat` prints that file through its storage grant to the forwarded stdout. The
-// scenario also launches `imgview` over a staged BMP and display/input stand-ins, proving its
-// acquire -> present -> focus -> key-quit -> release sequence. The kernel only brokers the
-// initial capabilities. Returns (expected,
-// probe_read, probe_summary, date_read, date_summary, request_read, request_summary,
-// cat_read): the file straight from the volume, then each component's proof and decisions
-// summary, then the bytes `cat` printed through the run launcher.
-fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, u64), &'static str> {
+// scoped-grant scenario also launches `imgview` over a staged image and display/input
+// stand-ins, proving its acquire -> present -> focus -> key-quit -> release sequence, then
+// launches `play` through a playback-only audio grant. The kernel only brokers the initial
+// capabilities.
+fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionScenarioResult, &'static str> {
 	use object::channel::{Channel, Message};
 	use object::memory_object::MemoryObject;
 	use object::process::Process;
@@ -433,6 +453,9 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	let cat_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no cat output")?;
 	let ip_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip output")?;
 	let ip_summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip decisions summary")?;
+	if scenario != PermissionScenario::ScopedGrants {
+		return Ok(PermissionScenarioResult { expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
+	}
 
 	// Prequeue one successful admin mint on each private connection. PermissionManager's
 	// generated clients all start at correlation id 0; DisplayService additionally receives
@@ -633,7 +656,7 @@ fn run_permission_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>
 	if !mp3_process.is_terminated() {
 		return Err("MP3 play did not exit");
 	}
-	Ok((expected, probe_read.bytes, probe_summary.bytes, date_read.bytes, date_summary.bytes, request_read.bytes, request_summary.bytes, cat_read.bytes, ip_read.bytes, ip_summary.bytes, graphics_read.bytes, graphics_start_ns))
+	Ok(PermissionScenarioResult { expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: graphics_read.bytes, graphics_start_ns })
 }
 
 // Build the component topology and run it to completion. A StorageService serves
@@ -1040,6 +1063,7 @@ define_test_tags! {
 	Network => "network",
 	Process => "process",
 	ProcessService => "process-service",
+	PermissionService => "permission-service",
 	Scheduler => "scheduler",
 	Service => "service",
 	Shell => "shell",
@@ -6832,55 +6856,38 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 	assert_eq!(actual, expected, "the component read the user-picked file through the picker");
 }
 
-tagged_test!(permission_manager_sandboxes_a_component, [Service, Process]);
-fn permission_manager_sandboxes_a_component() {
-	// PermissionManager governs components under typed permission manifests. Two are
-	// report-back probes. sandbox_probe is granted storage and log but not network: it starts
-	// with only its manifest's capabilities - the manager transfers exactly the storage and
-	// log clients to it and withholds the network one it holds, recording every decision - and
-	// reads its one granted file through the storage capability, reporting the bytes back.
-	// request_probe is granted only log and then asks for an undeclared capability (storage)
-	// at runtime: the headless policy default refuses it (least privilege) and the manager
-	// records that refusal as a dynamic decision. Three real system tools launch on demand
-	// through its `run` op, each printing to a captured stdout:
-	// `date` reaches time, `cat` reaches volumes, and `ip` reaches a fresh network client. The
-	// probe's bytes must equal the file straight from the volume (the storage grant is live
-	// and reaches exactly that file) and its summary must show storage and log granted and
-	// every other capability denied; `date`'s output must be a well-formed ISO-8601 UTC instant
-	// (the time grant is live) and its summary must show only time granted and every other
-	// capability denied; request_probe's runtime request must be denied and its summary must
-	// mark that refusal as dynamic - each component was given exactly its manifest and nothing
-	// more. Finally `cat`'s output must equal that file (the storage grant reaches it through
-	// the on-demand launcher).
-	let (expected, probe_read, probe_summary, date_read, date_summary, request_read, request_summary, cat_read, ip_read, ip_summary, graphics_read, graphics_start_ns) = run_permission_scenario().expect("the permission scenario should run");
-	assert!(!expected.is_empty(), "the granted file should not be empty");
-	assert_eq!(probe_read, expected, "the sandboxed component read its one granted file through the storage grant");
-	assert_eq!(probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
-	// `date` reached its one granted capability: its output is a well-formed ISO-8601 UTC
-	// instant "YYYY-MM-DDTHH:MM:SSZ" (the exact moment varies, so check the shape, not the
-	// value - its presence proves the time grant is live).
-	assert_eq!(date_read.len(), 21, "the date command rendered a 20-byte ISO-8601 UTC instant and newline through its time grant");
-	assert_eq!(date_read[4], b'-', "the date instant has a date separator after the year");
-	assert_eq!(date_read[7], b'-', "the date instant has a date separator after the month");
-	assert_eq!(date_read[10], b'T', "the date instant separates date and time with 'T'");
-	assert_eq!(date_read[13], b':', "the date instant has a time separator after the hour");
-	assert_eq!(date_read[16], b':', "the date instant has a time separator after the minute");
-	assert_eq!(date_read[19], b'Z', "the date instant is UTC, terminated by 'Z'");
-	assert_eq!(date_read[20], b'\n', "the date instant ends its stdout line");
-	assert_eq!(date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "date was granted exactly its manifest - time - and denied every other capability in the vocabulary");
-	// request_probe asked for storage at runtime - a capability outside its manifest. The
-	// headless policy default refused it, so the request comes back denied and its summary
-	// carries the static grants followed by the refused runtime request marked `(dynamic)`.
-	assert_eq!(request_read.as_slice(), b"storage denied", "request_probe's runtime request for an undeclared capability was refused by the headless policy default");
-	assert_eq!(request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny storage=deny(dynamic)", "request_probe was granted exactly its manifest - log - and its runtime storage request was refused and recorded as a dynamic denial");
-	// The on-demand `cat` tool, launched through PermissionManager's `run` op under a manifest
-	// granting only storage, printed the file it was given through that grant to the stdout the
-	// manager forwarded it: the bytes it rendered must equal the file straight from the volume.
-	assert_eq!(cat_read, expected, "the cat tool printed its file argument through the storage grant the run launcher gave it, forwarded to the captured stdout");
-	assert_eq!(ip_read.as_slice(), b"net0: 10.0.2.15  mac 52:54:00:12:34:56  mtu 1500  gateway 10.0.2.2\n", "the governed ip tool queried its typed NetworkService grant and rendered the interface state to stdout");
-	assert_eq!(ip_summary.as_slice(), b"storage=deny log=deny network=grant device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "ip was granted exactly its network-only manifest and denied every unrelated capability");
-	assert_eq!(graphics_read.as_slice(), b"graphics grants\n", "the governed graphics probe received process-bound display, key-only input and playback-only audio grants");
-	assert!(graphics_start_ns != 0, "the governed app cold-start path is measured");
+tagged_test!(permission_manager_enforces_static_and_dynamic_probe_policy, [Service, Process, PermissionService]);
+fn permission_manager_enforces_static_and_dynamic_probe_policy() {
+	let result = run_permission_scenario(PermissionScenario::Probes).expect("the permission probe scenario should run");
+	assert!(!result.expected.is_empty(), "the granted file should not be empty");
+	assert_eq!(result.probe_read, result.expected, "the sandboxed component read its one granted file through the storage grant");
+	assert_eq!(result.probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
+	assert_eq!(result.request_read.as_slice(), b"storage denied", "request_probe's undeclared storage request was refused by the headless policy default");
+	assert_eq!(result.request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny storage=deny(dynamic)", "request_probe's static grants and dynamic denial were recorded independently");
+}
+
+tagged_test!(permission_manager_runs_tools_with_minimal_grants, [Service, Process, PermissionService]);
+fn permission_manager_runs_tools_with_minimal_grants() {
+	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
+	assert_eq!(result.date_read.len(), 21, "date rendered a 20-byte ISO-8601 UTC instant and newline");
+	assert_eq!(result.date_read[4], b'-', "date separates the year and month");
+	assert_eq!(result.date_read[7], b'-', "date separates the month and day");
+	assert_eq!(result.date_read[10], b'T', "date separates the date and time");
+	assert_eq!(result.date_read[13], b':', "date separates the hour and minute");
+	assert_eq!(result.date_read[16], b':', "date separates the minute and second");
+	assert_eq!(result.date_read[19], b'Z', "date reports UTC");
+	assert_eq!(result.date_read[20], b'\n', "date ended its stdout line");
+	assert_eq!(result.date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "date received only its time grant");
+	assert_eq!(result.cat_read, result.expected, "cat printed its file through the storage grant");
+	assert_eq!(result.ip_read.as_slice(), b"net0: 10.0.2.15  mac 52:54:00:12:34:56  mtu 1500  gateway 10.0.2.2\n", "ip rendered state from its typed NetworkService grant");
+	assert_eq!(result.ip_summary.as_slice(), b"storage=deny log=deny network=grant device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "ip received only its network grant");
+}
+
+tagged_test!(permission_manager_mints_scoped_application_grants, [Service, Process, PermissionService]);
+fn permission_manager_mints_scoped_application_grants() {
+	let result = run_permission_scenario(PermissionScenario::ScopedGrants).expect("the scoped application grant scenario should run");
+	assert_eq!(result.graphics_read.as_slice(), b"graphics grants\n", "the graphics probe received process-bound display, key-only input and playback-only audio grants");
+	assert!(result.graphics_start_ns != 0, "the governed app cold-start path is measured");
 }
 
 tagged_test!(component_host_runs_an_sdk_component, [Service, Slow]);

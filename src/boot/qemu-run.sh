@@ -335,6 +335,8 @@ fi
 
 qemu_run_x86_64() {
 	local kernel="$1"
+	local artifact_suffix=""
+	[[ "${TEST:-0}" == "1" ]] && artifact_suffix="-test"
 	# Build the own UEFI loader (its EFI binary is staged into the boot image as
 	# BOOTX64.EFI); it lives in its own crate with its own UEFI target.
 	(cd "$HERE/../loader" && cargo build) >&2
@@ -374,12 +376,12 @@ qemu_run_x86_64() {
 
 	# System volume disk: holds the factory archive at LBA 0.
 	local volume_pkg="$QEMU_BUILD_DIR/volume.pkg"
-	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk.img"
+	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${artifact_suffix}.img"
 	qemu_prepare_system_disk "$volume_pkg" "$virtio_disk" || true
 	qemu_attach_virtio_blk qemu_args "$virtio_disk" vblk "disable-legacy=on"
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
-	qemu_prepare_media_images "" "" loop,ro=0 1
+	qemu_prepare_media_images "$artifact_suffix" "$artifact_suffix" loop,ro=0 1
 
 	# Network: user-mode NIC with optional hostfwd for interactive runs.
 	local hostfwd=""
@@ -390,11 +392,11 @@ qemu_run_x86_64() {
 	qemu_args+=(
 		-device virtio-serial-pci,disable-legacy=on
 		-device virtconsole,chardev=vcon
-		-chardev "file,id=vcon,path=$QEMU_BUILD_DIR/virtio-console.out"
+		-chardev "file,id=vcon,path=$QEMU_BUILD_DIR/virtio-console${artifact_suffix}.out"
 	)
 
 	# xHCI USB host controller + hub with keyboard, tablet, and optional storage.
-	qemu_prepare_usb_image ""
+	qemu_prepare_usb_image "$artifact_suffix"
 	local usb_storage_id=""
 	if [[ "${TEST:-0}" == "1" || -z "${USB_HOST:-}" ]]; then
 		usb_storage_id="vusb"
