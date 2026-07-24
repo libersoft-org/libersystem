@@ -100,6 +100,10 @@ qemu_prepare_media_images() {
 	local udf_mount_options="${3:-loop}"
 	local allow_fallbacks="${4:-0}"
 	local voldir="$QEMU_BOOT_DIR/../volume"
+	if [[ "${TEST:-0}" == "1" ]] && ! command -v mkfs.udf >/dev/null; then
+		echo "qemu-run: mkfs.udf is required for the test UDF fixture (install udftools)" >&2
+		exit 1
+	fi
 
 	FAT_DISK="$QEMU_BUILD_DIR/fat-media${suffix}.img"
 	if [[ ! -f "$FAT_DISK" ]] && command -v mkfs.exfat >/dev/null; then
