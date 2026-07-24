@@ -4510,8 +4510,9 @@ capability policy remain unchanged.
   - `drivers/`: the current aggregate `drivers` crate and future driver-only crates;
   - `apps/`: `tools`, `dyn_probe` and future user-facing or test applications;
   - `libs/`: every reusable leaf (`pix`, `surface`, `keys`, image/audio/compression
-    codecs and helpers such as `quantize`). Do not add deeper image/audio taxonomy in
-    this milestone; the conservative role split is sufficient.
+    codecs and helpers such as `quantize`). The first mechanical move uses this flat
+    role directory; the dedicated taxonomy task below performs the deeper categorization
+    only after every crate has reached its correct role.
   - Frozen source inventory (2026-07-23): all 73 Cargo crates currently directly below
     `src/user/` have exactly one destination. `src/user/rt` moves to
     `src/user/runtime/rt`. The service owners move as `src/user/services` ->
@@ -4610,6 +4611,21 @@ capability policy remain unchanged.
     history was rewritten to remove the earlier `term`, `wasm` and `wire` build outputs;
     the rewritten tip is byte-identical and the history gate reports zero generated
     artifact paths. Remaining work is the permanent stale-source-path check.
+- [ ] Define and apply one ownership-based library taxonomy mirrored between source and
+  the system volume. At minimum separate audio codecs/containers and vocabulary under
+  `user/libs/audio/`, image codecs/conversion vocabulary under `user/libs/image/`, and
+  general compression primitives under `user/libs/compression/`; classify protocol,
+  client/provider, input, terminal and other leaves by their actual owning domain rather
+  than forcing every crate into one of those three examples. Mirror the same categories
+  below `vol://system/lib/`, for example source `user/libs/audio/mp3/` stages as
+  `lib/audio/mp3.lslib`. Physical directories and staged paths are not identities:
+  Cargo package/crate names, prefix-free `.lslib` SONAMEs, `DT_NEEDED`, manifest logical
+  owners and generated protocol identities remain unchanged. Extend the manifest with
+  explicit source and destination paths, teach ProcessService/package staging to resolve
+  a canonical library identity to its nested path, reject category/path drift and stale
+  flat compatibility copies, and update Cargo paths, build scripts, tests and docs
+  atomically. A new leaf must declare exactly one category; moving a leaf between
+  categories changes no runtime ABI or dependency edge.
 - [ ] Restore test ownership after the physical move and decompose the monolithic kernel
   QEMU suite. Delete the trivial assertion; move the log record round-trip into the ABI
   crate; move executable inventory, stdin capability and other metadata-only assertions
@@ -4680,8 +4696,10 @@ capability policy remain unchanged.
   SONAME/DT_NEEDED checks, and x86_64/aarch64/riscv64 userspace plus QEMU gates. Record
   before/after source and volume trees in the architecture/package documentation.
 - Done when: every Cargo crate below `src/user/` is under `runtime/`, `services/`,
-  `drivers/`, `apps/` or `libs/`, with only explicitly inventoried shared build/toolchain
-  files allowed beside those directories; the system-volume root contains only
+  `drivers/`, `apps/` or the declared `libs/` categories, with only explicitly
+  inventoried shared build/toolchain files allowed beside those directories; every
+  source library category is mirrored below `vol://system/lib/` without changing its
+  logical name, SONAME or dependency identity; the system-volume root contains only
   `hello.txt`, `motd.txt` and the declared directories and contains no `etc`, `var`,
   `share` or generic factory test corpus; program-private config/state/log files are
   colocated with their owning artifact, and the root `log/` contains only the system
