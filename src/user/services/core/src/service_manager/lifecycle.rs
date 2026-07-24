@@ -2,20 +2,13 @@ use super::*;
 
 // Whether component `i` depends on any component currently in the teardown scope.
 pub(super) fn depends_on_scoped(i: usize, scope: &[bool; N]) -> bool {
-	for &dep in MANIFEST[i].deps {
-		if let Some(d) = index_of(dep) {
-			if scope[d] {
-				return true;
-			}
-		}
-	}
-	false
+	services::service_lifecycle::depends_on_any(i, N, |node| scope[node], index_of_dep)
 }
 
 // Whether any in-scope Running component still depends on component `i` - i.e. `i` is
 // not yet a leaf of the scoped subgraph and must not be stopped this round.
 pub(super) fn has_running_dependent(i: usize, scope: &[bool; N], state: &[State; N]) -> bool {
-	has_active_dependent(i, scope, |j| state[j] == State::Running)
+	services::service_lifecycle::has_active_dependent(i, N, |node| scope[node] && state[node] == State::Running, index_of_dep)
 }
 
 // Whether component `j` declares component `i` among its dependencies.
@@ -33,50 +26,8 @@ fn index_of_dep(j: usize, i: usize) -> bool {
 // supervised Process here), ordered so a dependent always precedes every dependency it
 // declares. Computed by repeatedly taking the current leaves of the scoped subgraph.
 pub(super) fn shutdown_order(state: &[State; N]) -> Vec<usize> {
-	let mut scope: [bool; N] = [false; N];
-	let mut i: usize = 0;
-	while i < N {
-		if state[i] == State::Running {
-			scope[i] = true;
-		}
-		i += 1;
-	}
-	if let Some(sh) = index_of(b"shell") {
-		scope[sh] = false;
-	}
-	let mut dropped: [bool; N] = [false; N];
-	let mut order: Vec<usize> = Vec::new();
-	loop {
-		let mut progress: bool = false;
-		let mut i: usize = 0;
-		while i < N {
-			if scope[i] && !dropped[i] && !has_scoped_undropped_dependent(i, &scope, &dropped) {
-				dropped[i] = true;
-				order.push(i);
-				progress = true;
-			}
-			i += 1;
-		}
-		if !progress {
-			break;
-		}
-	}
-	order
-}
-
-fn has_scoped_undropped_dependent(i: usize, scope: &[bool; N], dropped: &[bool; N]) -> bool {
-	has_active_dependent(i, scope, |j| !dropped[j])
-}
-
-fn has_active_dependent(i: usize, scope: &[bool; N], mut active: impl FnMut(usize) -> bool) -> bool {
-	let mut j: usize = 0;
-	while j < N {
-		if j != i && scope[j] && active(j) && index_of_dep(j, i) {
-			return true;
-		}
-		j += 1;
-	}
-	false
+	let shell = index_of(b"shell");
+	services::service_lifecycle::reverse_dependency_order(N, |node| state[node] == State::Running && Some(node) != shell, index_of_dep).unwrap_or_default()
 }
 
 // Tear the whole service tree down for a graceful power-off. LogService flushes first;
@@ -114,28 +65,7 @@ pub(super) unsafe fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N
 // and each dependent appears before every dependency that is also in the order.
 pub(super) fn verify_shutdown_order(order: &[usize], state: &[State; N]) -> bool {
 	let shell: Option<usize> = index_of(b"shell");
-	let mut i: usize = 0;
-	while i < N {
-		if state[i] == State::Running && Some(i) != shell && !order.contains(&i) {
-			return false;
-		}
-		i += 1;
-	}
-	let mut pos: usize = 0;
-	while pos < order.len() {
-		let x: usize = order[pos];
-		for &dep in MANIFEST[x].deps {
-			if let Some(d) = index_of(dep) {
-				if let Some(dpos) = order.iter().position(|&s| s == d) {
-					if dpos < pos {
-						return false;
-					}
-				}
-			}
-		}
-		pos += 1;
-	}
-	true
+	services::service_lifecycle::verify_reverse_dependency_order(order, N, |node| state[node] == State::Running && Some(node) != shell, index_of_dep)
 }
 
 // Answer one request on a supervisor stats channel. Returns false once the peer is

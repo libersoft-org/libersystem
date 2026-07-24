@@ -4825,6 +4825,18 @@ capability policy remain unchanged.
     verification for every staged x86_64 dynamic image. Kernel QEMU coverage retains only
     runtime behavior: direct ELF-note rejection, provider-chain substitution, malformed
     dynamic metadata, cycle bounds, duplicate exports and deterministic provider slots.
+  - Service-lifecycle ownership result (2026-07-24): pure dependency predicates,
+    reverse-dependency shutdown planning, cycle detection and order verification moved
+    from the ServiceManager binary into the services library with sibling owner tests.
+    Chain, diamond, partial-scope, duplicate/missing-order and cycle cases now run on the
+    host; all 18 services library tests pass from a dedicated
+    `.build/cargo/services-host` cache, and `test-tags-check` runs them before every
+    tagged QEMU suite. ServiceManager retains only the generated-manifest adapter and
+    its bare-metal build passes. The boot-chain QEMU test no longer treats incidental
+    manifest row order as a semantic tie-break: it checks the complete multiset of 21
+    online reports, while the 10 causally ordered restart/stop/shutdown reports remain
+    exact. Focused boot QEMU passes 9/9, including the live supervisor shutdown-order
+    drill. Remaining work is compound-scenario separation and thematic QEMU modules.
 - [ ] Define the factory `vol://system` hierarchy so its root contains only `hello.txt`,
   `motd.txt` and the declared directories:
   - `bin/`: user-invoked `.lsexe` tools. A stateless single-file command may live

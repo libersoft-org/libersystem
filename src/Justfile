@@ -339,7 +339,7 @@ test-all: sdk user user-aarch64 user-riscv64 test-tags-check
 
 # Cheap source and manifest checks; the Rust type system separately rejects
 # unknown/empty tags, and the image builder verifies actual ELF metadata.
-test-tags-check: artifact-metadata-check
+test-tags-check: artifact-metadata-check services-host-test
     boot/check-test-tags.sh
 
 artifact-metadata-check:
@@ -459,6 +459,10 @@ app-libs-test:
     cargo test --manifest-path {{ vorbis_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
     cargo test --manifest-path {{ wav_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
     cargo test --manifest-path {{ wavpack_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
+
+# Host-test pure service parsing, graph bounds, and lifecycle planning.
+services-host-test:
+    CARGO_TARGET_DIR={{ build_root }}/cargo/services-host cargo test --manifest-path {{ services_dir }}/Cargo.toml --lib --target x86_64-unknown-linux-gnu
 
 # Measure the staged MP3 decoder in an optimized host build and fail below real time.
 audio-bench:

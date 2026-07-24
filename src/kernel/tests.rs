@@ -5662,7 +5662,7 @@ fn config_set_survives_a_service_reboot() {
 	sched::run_until_idle();
 }
 
-// This end-to-end test asserts the EXACT boot-chain report order, which requires the
+// This end-to-end test asserts the complete boot-chain report set, which requires the
 // interrupt-driven services (NetworkService over virtio-net, and its transitive
 // dependents TimeService/PermissionManager/ConsoleService/SystemGraphService/Shell) to
 // all settle inside the harness's single `run_until_idle()`. It was previously gated off
@@ -5707,7 +5707,7 @@ fn init_package_starts_system_manager() {
 	// path uses is valid against the live manifest), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let reports: [&[u8]; 31] = [
+	let online_reports: [&[u8]; 21] = [
 		b"LogService: online",
 		b"DeviceManager: online",
 		b"StorageService: online",
@@ -5729,6 +5729,17 @@ fn init_package_starts_system_manager() {
 		b"ConsoleService: online",
 		b"SystemGraphService: online",
 		b"Shell: online",
+	];
+	let mut actual_online_reports = alloc::vec::Vec::new();
+	for _ in 0..online_reports.len() {
+		actual_online_reports.push(kernel_ep.recv().expect("a service online report should arrive").bytes);
+	}
+	actual_online_reports.sort();
+	let mut expected_online_reports = online_reports.iter().map(|report| report.to_vec()).collect::<alloc::vec::Vec<_>>();
+	expected_online_reports.sort();
+	assert_eq!(actual_online_reports, expected_online_reports, "every manifest service reports online; independent ready services may use any deterministic tie order");
+
+	let lifecycle_reports: [&[u8]; 10] = [
 		b"WatchdogProbe: online",
 		b"WatchdogProbe: restarted",
 		b"WatchdogProbe: recovered",
@@ -5740,9 +5751,9 @@ fn init_package_starts_system_manager() {
 		b"ServiceManager: online",
 		b"SystemManager: online",
 	];
-	for expected in reports {
+	for expected in lifecycle_reports {
 		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
-		assert_eq!(&message.bytes[..], expected, "boot-chain reports must arrive in dependency order");
+		assert_eq!(&message.bytes[..], expected, "lifecycle drill reports must preserve their causal order");
 	}
 }
 
