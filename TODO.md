@@ -4592,7 +4592,7 @@ capability policy remain unchanged.
     variables stable owner lookup. This replaces formatter-unstable command substitutions
     and restores canonical recipe indentation; `just --fmt` is byte-stable and the parser,
     complete x86 graph, checked report and targeted cache invalidation gate pass.
-- [ ] Move the crates mechanically into the five role directories and update lockfiles,
+- [x] Move the crates mechanically into the five role directories and update lockfiles,
   rust-toolchain/config discovery, include paths, test fixtures, build scripts and docs.
   No source-level API refactor belongs in the move. A repository check fails if a Cargo
   crate remains directly under `src/user/`, if an old `src/user/<crate>` path survives,
@@ -4600,8 +4600,8 @@ capability policy remain unchanged.
   - Physical-move result (2026-07-23): all 73 crates now live under `runtime/`,
     `services/`, `drivers/`, `apps/` or `libs/`, with Cargo paths and manifest source
     rows updated while logical package and artifact identities remain unchanged. Shared
-    providers, executables, identity records, order records and build logs are emitted
-    only below the repository-root `.build/system-image/<target>/`; Cargo outputs use
+    providers, executables and build logs are emitted only below the repository-root
+    `.build/system-image/<target>/`; Cargo outputs use
     `.build/cargo/<owner>/`, and boot/QEMU state uses `.build/boot/`. No build output is
     written anywhere below `src/`. One source-hygiene gate rejects forbidden paths,
     generated extensions and compiled binary content in the physical tree and Git index,
@@ -4610,7 +4610,14 @@ capability policy remain unchanged.
     source tree remains clean after concurrent cross-target builds. Reachable `main`
     history was rewritten to remove the earlier `term`, `wasm` and `wire` build outputs;
     the rewritten tip is byte-identical and the history gate reports zero generated
-    artifact paths. Remaining work is the permanent stale-source-path check.
+    artifact paths.
+  - Permanent layout gate (2026-07-24): `check-source-hygiene.sh` now accepts only the
+    five role directories plus the seven inventoried userspace infrastructure entries,
+    rejects a Cargo crate directly under `src/user/`, validates unique manifest source
+    owners and physical paths with present `Cargo.toml` files, requires exact 1:1 coverage
+    of every physical userspace Cargo root and rejects permanent references to the old
+    `src/user/<logical-owner>/` paths outside `TODO.md` and `NOTES.md`. The current and
+    reachable-history modes share these physical/source-map checks.
 - [ ] Define and apply one ownership-based library taxonomy mirrored between source and
   the system volume. At minimum separate audio codecs/containers and vocabulary under
   `user/libs/audio/`, image codecs/conversion vocabulary under `user/libs/image/`, and
