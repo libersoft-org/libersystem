@@ -4649,6 +4649,85 @@ capability policy remain unchanged.
     passed. The broader focused-tag run continued into an unrelated lossy WebP smoke
     assertion after all taxonomy scenarios passed and failed its existing RGB MSE
     bound.
+- [ ] Replace the positional `user/services/manifest.txt` line protocol with one typed,
+  fully validated `user/services/manifest.toml` and a single owner for every
+  interpretation of it. Add a host-only `tools/system-manifest` Rust crate whose library
+  is the only TOML deserializer, canonicalizer and semantic validator, with a thin CLI
+  over the same API. Kernel packaging and the services-specific build script must use
+  that library as a host build dependency; shell tools must call its CLI and must never
+  parse TOML themselves. Delete the text manifest and every positional `awk`, `read` or
+  field-index interpretation atomically, with no compatibility copy or independently
+  maintained generated manifest.
+  - Normalize the source schema instead of transliterating the overloaded artifact
+    rows. Define separate `sources`, `programs`, `services` and `libraries` table arrays:
+    a source maps one logical owner to one workspace-relative Cargo root; a program owns
+    its artifact name, source owner, role, static/dynamic linkage, staging class, exact
+    destination and direct providers; a service owns its supervision name, referenced
+    program, restart policy and service dependencies; a library owns its prefix-free
+    canonical name, source owner, exact destination, Cargo features and direct
+    providers. Represent the current storage instances as services that explicitly
+    reference `storage_service`, so ServiceManager no longer hard-codes
+    `media_storage`/`iso_storage`/`udf_storage`/`usb_storage` to a different executable.
+    Program role, linkage and staging are orthogonal typed enums rather than additional
+    combined row kinds. Physical paths and destinations remain non-identity metadata;
+    package names, service names, SONAMEs, `DT_NEEDED` and protocol identities do not
+    change in this migration.
+  - Deserialize into private raw TOML structs with unknown-field rejection, then convert
+    once into a public canonical `Manifest` built from validated name/path newtypes and
+    deterministic `BTreeMap` indexes. Declaration order must carry no hidden semantics:
+    canonical sources, programs, services, libraries, features, dependencies and
+    providers are lexically ordered where order is not part of the contract, while
+    service and provider startup/load order continues to come from bounded graph
+    derivation. Require an exact integer schema version and reject unsupported versions
+    before interpreting any entity. Report all independent validation errors in stable
+    entity/field order rather than stopping at the first typo; build scripts may turn
+    that complete diagnostic into a build failure only after the library returns it.
+  - Fully validate the model against the workspace before exposing it: unique logical
+    names and physical source paths; normalized relative paths with no absolute or
+    parent traversal components; an existing `Cargo.toml` at every source root; exact
+    1:1 coverage of physical userspace Cargo crates; valid owner, program, service and
+    provider references; no duplicate/self dependency or provider edge; acyclic service
+    and provider graphs; the existing depth-16 and module-64 dynamic graph bounds;
+    valid role/linkage/stage combinations; unique normalized destinations across the
+    staged image; required `.lsexe`/`.lslib` suffixes and stage/destination agreement;
+    executable alias unambiguity; source/destination ownership-category agreement; and
+    rejection of stale flat library destinations. Keep build-artifact/ELF auditing as a
+    separate post-build operation over this already validated model rather than mixing
+    mutable output state into TOML parsing.
+  - Give the CLI stable structured operations for `check`, `source-path <owner>`,
+    canonical JSON export, program/library inventories, provider consumers and staged
+    paths. JSON is a transient machine projection written to stdout or `.build` only,
+    never a second checked-in source of truth. A shell consumer may load one canonical
+    JSON projection and query named fields with `jq`, but schema defaults, conditional
+    rules, graph semantics and validation remain exclusively in the Rust library. Add a
+    small locked bootstrap wrapper that builds the host CLI under the repository
+    `.build/cargo/system-manifest/` only when absent or stale and then executes the
+    binary directly; it may manage the tool binary but may not inspect manifest data.
+    This preserves the many `Justfile` source-path lookups without forty `cargo run`
+    startups.
+  - Split the common userspace build-script boundary so ordinary crates retain only
+    linker/product setup, while the `services` package has a local wrapper build script
+    with `system-manifest` as its build dependency. Generate ServiceManager's typed
+    service/program/dependency table and ProcessService's canonical SONAME-to-volume-path
+    table from the validated model into `OUT_DIR`. Add the same crate as a kernel build
+    dependency so init/system package assembly, identity audits and test path generation
+    consume `Manifest` directly, without an intermediate file or nested Cargo process.
+    Refactor `build-shared.sh`, dynamic reports, cache/static-injection checks, artifact
+    metadata, source hygiene and `Justfile` path resolution onto the CLI API; retain each
+    tool's domain-specific cache, ELF or filesystem checks but remove its private
+    manifest interpretation.
+  - Land the migration in discriminating slices: first add the crate, TOML schema and
+    positive/negative owner-crate tests while proving exact source/program/service/
+    library identities, edges and destinations against the old manifest; then switch
+    kernel and services generation; then switch every shell/Just consumer; add a gate
+    allowing direct `manifest.toml` reads only inside `tools/system-manifest`; delete
+    `manifest.txt` and the temporary equivalence check last. Do not commit generated
+    JSON or Rust tables. Finish with formatter/lint and manifest negative tests, source
+    hygiene, artifact metadata, warm/provider cache checks, static/edge/identity
+    injection gates, triarch complete shared-image builds and reports, kernel package
+    compilation, and focused QEMU service/process/storage/dynamic scenarios. A manifest
+    edit that preserves canonical semantics must produce byte-identical generated tables
+    and no unrelated image-cache invalidation.
 - [x] Remove the redundant `order/` namespace and generated `.order` sidecars. The
   complete provider graph is already bound and cross-checked by each executable/library
   identity record and its exact `DT_NEEDED` edges, while both the image builder and

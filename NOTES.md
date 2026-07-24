@@ -1,7 +1,7 @@
 # Bugs / changes
 
+- imgconv - does it have compression level?
 - add "ls" parameters (filters like *.txt etc.)
-- manifest.txt - use JSON instead?
 - Native compilers - wasm
 - create a live video about LiberSystem
 - voribis - LICENSE file
