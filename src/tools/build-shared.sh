@@ -8,6 +8,7 @@ fi
 
 target="$1"
 shift
+requested_arguments=("$@")
 root="$(cd "$(dirname "$0")/.." && pwd)"
 build_root="$root/../.build"
 manifest_json="$("$root/tools/system-manifest.sh" export-json)"
@@ -35,14 +36,22 @@ source_inventory_seconds=0
 image_graph_seconds=0
 provider_seconds=0
 consumer_seconds=0
+warm_snapshot_file=""
+warm_snapshot_hit=0
 
 report_build_summary() {
 	local status=$?
 	find "$artifact_output_root" -type f -name "*.$$.expected" -delete 2>/dev/null || true
 	find "$artifact_cache_dir" -maxdepth 1 -type f -name "*.tmp.$$" -delete 2>/dev/null || true
+	rm -f "$build_root/image-warm-$target.state.inputs.current.$$" "$build_root/image-warm-$target.state.inputs.tmp.$$" "$build_root/image-warm-$target.state.tmp.$$"
 	rm -f "$build_root/package-dirs.$$.tmp"
 	if [[ -n "$source_inventory_file" ]]; then rm -f "$source_inventory_file"; fi
 	if [[ -n "$source_metadata_dir" ]]; then rm -rf "$source_metadata_dir"; fi
+	if [[ $status == 0 && $warm_snapshot_hit == 0 && -n "$warm_snapshot_file" ]] && declare -F write_warm_snapshot >/dev/null; then
+		write_warm_snapshot || rm -f "$warm_snapshot_file"
+	elif [[ $status != 0 && -n "$warm_snapshot_file" ]]; then
+		rm -f "$warm_snapshot_file"
+	fi
 	echo "build-shared: summary target=$target seconds=$((SECONDS - build_started)) stages=source:$source_inventory_seconds,graph:$image_graph_seconds,providers:$provider_seconds,consumers:$consumer_seconds providers=$provider_cache_hits/$provider_cache_misses objects=$object_cache_hits/$object_cache_misses executables=$executable_cache_hits/$executable_cache_misses status=$status"
 }
 
@@ -93,7 +102,88 @@ command -v llvm-readelf >/dev/null
 command -v llvm-strip >/dev/null
 command -v jq >/dev/null
 command -v sha256sum >/dev/null
+command -v stat >/dev/null
 command -v xxd >/dev/null
+
+warm_snapshot_file="$build_root/image-warm-$target.state"
+warm_input_inventory_file="$warm_snapshot_file.inputs"
+
+warm_input_inventory() {
+	{
+		printf 'format=liber-image-warm-input-v1\n'
+		printf 'target=%s\n' "$target"
+		printf 'manifest=%s\n' "$manifest_digest"
+		printf 'spec=%s\n' "${requested_arguments[@]}"
+		printf 'rustflags=%s\n' "$rustflags"
+		printf 'cargo-target=%s\n' "$cargo_target"
+		printf 'rustc=%s\n' "$(rustc -vV | sha256sum | awk '{print $1}')"
+		for tool in "$(command -v cargo)" "$(command -v rustc)" "$(command -v llvm-mc)" "$lld" "$(command -v llvm-ar)" "$(command -v llvm-objcopy)" "$(command -v llvm-readelf)" "$(command -v llvm-strip)"; do
+			stat -c 'tool\t%n\t%s\t%y' "$tool"
+		done
+		for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTUP_TOOLCHAIN; do
+			printf 'env-%s=%s\n' "$variable" "${!variable-}"
+		done
+		find "$root/user" "$root/abi" "$root/bootproto" "$root/fs" "$root/proto" "$root/term" "$root/wasm" "$root/wire" "$root/tools/system-manifest" -type f -printf 'input\t%p\t%s\t%T@\n'
+		for input in "$root/tools/build-shared.sh" "$root/tools/build-consumer-object.sh" "$root/tools/build-exe-start.sh" "$root/tools/exe-start.rs" "$root/tools/system-manifest.sh" "$root/../product.conf"; do
+			stat -c 'input\t%n\t%s\t%y' "$input"
+		done
+	} | sort
+}
+
+warm_input_fingerprint() {
+	warm_input_inventory | sha256sum | awk '{print $1}'
+}
+
+warm_output_fingerprint() {
+	{
+		find "$artifact_output_root" -type f ! -path "$artifact_log_dir/*" -printf 'output\t%p\t%s\t%T@\n' 2>/dev/null || true
+		find "$artifact_cache_dir" -type f -printf 'cache\t%p\t%s\t%T@\n' 2>/dev/null || true
+		for output in "$build_root/exe-start-$target.o" "$build_root/exe-start-$target.o.build-key"; do
+			if [[ -f "$output" ]]; then stat -c 'output\t%n\t%s\t%y' "$output"; fi
+		done
+	} | sort | sha256sum | awk '{print $1}'
+}
+
+write_warm_snapshot() {
+	local input output temporary temporary_inputs
+	temporary_inputs="$warm_input_inventory_file.tmp.$$"
+	warm_input_inventory >"$temporary_inputs"
+	input="$(sha256sum "$temporary_inputs" | awk '{print $1}')"
+	output="$(warm_output_fingerprint)"
+	temporary="$warm_snapshot_file.tmp.$$"
+	{
+		printf 'format=liber-image-warm-state-v1\n'
+		printf 'input=%s\n' "$input"
+		printf 'output=%s\n' "$output"
+	} >"$temporary"
+	mv "$temporary" "$warm_snapshot_file"
+	mv "$temporary_inputs" "$warm_input_inventory_file"
+}
+
+find "$artifact_output_root" -type f -name '*.expected' -delete 2>/dev/null || true
+find "$artifact_cache_dir" -maxdepth 1 -type f -name '*.tmp.*' -delete 2>/dev/null || true
+if [[ "$force_rebuild" == 0 && -f "$warm_snapshot_file" ]]; then
+	warm_expected_input="$(sed -n 's/^input=//p' "$warm_snapshot_file")"
+	warm_expected_output="$(sed -n 's/^output=//p' "$warm_snapshot_file")"
+	warm_actual_inputs="$warm_input_inventory_file.current.$$"
+	warm_input_inventory >"$warm_actual_inputs"
+	warm_actual_input="$(sha256sum "$warm_actual_inputs" | awk '{print $1}')"
+	warm_actual_output="$(warm_output_fingerprint)"
+	if [[ -n "$warm_expected_input" && -n "$warm_expected_output" && "$warm_expected_input" == "$warm_actual_input" && "$warm_expected_output" == "$warm_actual_output" ]]; then
+		provider_cache_hits="$(jq '.libraries | length' <<<"$manifest_json")"
+		executable_cache_hits="$(jq '[.programs[] | select(.linkage == "dynamic" and .stage == "volume" and .name != "dyn_probe")] | length' <<<"$manifest_json")"
+		warm_snapshot_hit=1
+		echo "build-shared: warm image snapshot hit"
+		rm -f "$warm_actual_inputs"
+		exit 0
+	fi
+	if [[ "$warm_expected_input" != "$warm_actual_input" ]]; then
+		echo "build-shared: warm image snapshot miss (inputs)"
+		if [[ -f "$warm_input_inventory_file" ]]; then diff -u "$warm_input_inventory_file" "$warm_actual_inputs" || true; fi
+	fi
+	if [[ "$warm_expected_output" != "$warm_actual_output" ]]; then echo "build-shared: warm image snapshot miss (outputs)"; fi
+	rm -f "$warm_actual_inputs"
+fi
 
 source_path() {
 	local owner="$1"

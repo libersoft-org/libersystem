@@ -4750,6 +4750,44 @@ capability policy remain unchanged.
     Focused QEMU passed every service/process/storage/dynamic manifest scenario and all
     five exact dynamic-wave checks before the broader smoke set reached the unrelated
     existing lossy WebP RGB-MSE failure.
+- [x] Make a fully warm shared-image build a genuine fast path instead of repeating the
+  cryptographic and ELF audit of every cached artifact. A no-change x86_64 run currently
+  takes about 87 seconds despite 60/60 provider and 67/67 executable hits; source and
+  Cargo-graph checks account for only about four seconds, while serial provider/consumer
+  cache validation spends roughly 79 seconds rehashing outputs and extracting embedded
+  identity notes. Add one atomic target-scoped trusted-local snapshot that binds the
+  canonical manifest, requested artifact set, target/toolchain/config/environment,
+  build-relevant input metadata and exact output/cache-sidecar metadata. If that snapshot
+  is unchanged, skip source hashing, Cargo metadata, per-artifact hashing, identity-note
+  extraction and ELF audits entirely; any metadata change falls back to the existing
+  fine-grained content-addressed path. The snapshot is a local build optimization, not a
+  trust boundary: `shared-libs-verify`, CI and mutation gates retain full content hashes,
+  identity extraction and ELF checks. Write state only after a successful audited build,
+  under the existing target lock, and update it atomically. Missing/extra outputs,
+  removed sidecars, source edits, manifest/tool/config/env changes and interrupted builds
+  must all reject the fast path. Cache `exe-start-<target>.o` and its tiny host generator
+  by source/toolchain/assembler/target key so a warm run invokes neither `rustc` nor
+  `llvm-mc`. Extend cache tests for snapshot hits, one-tool/provider invalidation,
+  sidecar/output deletion, stale-flat output rejection and explicit full verification;
+  measure cold, fine-grained incremental and fully warm timings, with a fully warm target
+  below five seconds on the current host.
+  - Warm-snapshot result (2026-07-24): each target now publishes one atomic trusted-local
+    state plus a canonical diagnostic input inventory only after a successful audited
+    build. It binds the manifest and requested artifact set, source/tool/config/env
+    metadata, every staged output, every artifact-cache sidecar and the target
+    `exe-start` object/key. An unchanged run exits before Cargo metadata, source/output
+    content hashing, identity extraction and all provider/consumer loops; two consecutive
+    x86_64 hits took 4.700 and 4.670 seconds versus the previous approximately 87
+    seconds, reported 60/60 providers and 67/67 executables, and did not rewrite the
+    state. Any input/output metadata change emits a bounded inventory diff and falls
+    through to the existing fine-grained content-addressed graph. The quick cache gate
+    now proves snapshot hits, missing-output recovery through the cached object, removed
+    build-key invalidation, one-tool source invalidation/object reuse and return to the
+    snapshot fast path. `exe-start` caches both its host generator and target ET_REL
+    object by source/toolchain/assembler/target key; a normal hit preserves the object
+    mtime, while `LIBER_IMAGE_REBUILD=1` forces regeneration. Full verification bypassed
+    the snapshot, rebuilt/audited 60 providers and 67 executables in 396 seconds with
+    status 0, then returned immediately to a 4.935-second snapshot hit.
 - [x] Remove the redundant `order/` namespace and generated `.order` sidecars. The
   complete provider graph is already bound and cross-checked by each executable/library
   identity record and its exact `DT_NEEDED` edges, while both the image builder and

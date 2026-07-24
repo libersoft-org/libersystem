@@ -8,6 +8,7 @@ mode="${1:-quick}"
 output="$(mktemp)"
 backup=""
 source=""
+stale_output=""
 
 source_path() {
 	jq -er --arg owner "$1" '.sources[$owner].path' <<<"$manifest_json"
@@ -19,7 +20,8 @@ exec 8>"$build_root/image-build-x86_64-unknown-none.lock"
 flock 8
 
 cleanup() {
-	if [[ -n "$backup" && -n "$source" && -f "$backup" ]]; then cp "$backup" "$source"; fi
+	if [[ -n "$backup" && -n "$source" && -f "$backup" ]] && ! cmp -s "$backup" "$source"; then cp "$backup" "$source"; fi
+	if [[ -n "$stale_output" ]]; then rm -f "$stale_output"; fi
 	rm -f "$backup" "$output"
 }
 trap cleanup EXIT
@@ -67,6 +69,41 @@ quick)
 	run_graph
 	expect_only_misses provider
 	expect_only_misses executable
+	if ! grep -q '^build-shared: warm image snapshot hit$' "$output"; then
+		echo "shared-cache-check: unchanged graph did not use the warm image snapshot" >&2
+		exit 1
+	fi
+	rm -f "$build_root/system-image/x86_64-unknown-none/bin/echo"
+	run_graph
+	expect_only_misses provider
+	expect_only_misses executable echo
+	if ! grep -q '^build-shared: object cache hit echo$' "$output"; then
+		echo "shared-cache-check: missing echo output did not reuse its object" >&2
+		exit 1
+	fi
+	run_graph
+	if ! grep -q '^build-shared: warm image snapshot hit$' "$output"; then
+		echo "shared-cache-check: restored output did not return to a snapshot hit" >&2
+		exit 1
+	fi
+	stale_output="$build_root/system-image/x86_64-unknown-none/lib/stale-flat.lslib"
+	cp "$build_root/system-image/x86_64-unknown-none/lib/runtime/lsrt.lslib" "$stale_output"
+	if run_graph; then
+		echo "shared-cache-check: stale flat provider passed the output audit" >&2
+		exit 1
+	fi
+	if ! grep -q '^build-shared: staged library paths differ from the manifest$' "$output"; then
+		echo "shared-cache-check: stale flat provider failed outside the destination audit" >&2
+		exit 1
+	fi
+	rm -f "$stale_output"
+	stale_output=""
+	prime_graph
+	run_graph
+	if ! grep -q '^build-shared: warm image snapshot hit$' "$output"; then
+		echo "shared-cache-check: stale-output recovery did not return to a snapshot hit" >&2
+		exit 1
+	fi
 	rm -f "$build_root/image-artifacts-x86_64-unknown-none/executable-echo.build-key"
 	run_graph
 	expect_only_misses executable echo

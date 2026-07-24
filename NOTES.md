@@ -1,6 +1,7 @@
 # Bugs / changes
 
-- imgconv - does it have compression level?
+- TODO.md is huge - merge it to multiple files + main file with the list of milestones?
+- imgconv - does it have compression level settings?
 - add "ls" parameters (filters like *.txt etc.)
 - Native compilers - wasm
 - create a live video about LiberSystem
@@ -49,7 +50,6 @@
 - df, du
 - lsblk is showing the type of block device (virtio-blk), mountpoint (vol://...) and size, but not the name of the device in device tree... also there should be table headers (device, type, volume, size)
 - Selecting something from console by mouse is lagging a lot... the whole console lags a lot even when paging (shift + pg up/down)
-- Console does not autocomplete by tab key as on Linux - it should autocomplete commands and local files (like cat ./mot -> should complete cat ./motd.txt)
 - Where is vol://system/ physically stored? On ram disk or hard disk?
 - Where are system tools stored? When I enter "ls" in vol://system/, I can see just 2 .txt files
 - Is our shell a separated binary (like on Linux - bash, dash, fish etc.)?
