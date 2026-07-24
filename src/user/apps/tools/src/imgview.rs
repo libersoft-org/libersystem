@@ -13,19 +13,189 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use keys::usage;
-use pix::{Image, Rect, Target};
+use pix::{Image, Target};
 use proto::system::{OpenOpts, input};
 use rt::*;
 use storage_proto::path;
 use volume_client::VolumeClient;
 
-const USAGE: &[u8] = b"Usage: imgview <image>\nDisplays a still image or composited animation frame 0; animation playback is not supported.\n";
+const USAGE: &[u8] = b"Usage: imgview <image>\nDisplays a still image or composited animation frame 0; animation playback is not supported.\nControls: +/= zoom in, - zoom out, hold arrows to pan, Esc/q quit.\n";
+const TTY_RAW_ON: &[u8] = b"\x1b[?9001h";
+const TTY_RAW_OFF: &[u8] = b"\x1b[?9001l";
+const ZOOM_MIN: u32 = 100;
+const ZOOM_MAX: u32 = 800;
+const ZOOM_STEP: u32 = 25;
+const PAN_REPEAT_TICKS: u64 = 2;
+const PAN_STEP_DIVISOR: u32 = 64;
+const HELD_LEFT: u8 = 1 << 0;
+const HELD_RIGHT: u8 = 1 << 1;
+const HELD_UP: u8 = 1 << 2;
+const HELD_DOWN: u8 = 1 << 3;
 
 struct DecodedImage {
 	width: u32,
 	height: u32,
 	pitch: u32,
 	pixels: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct Viewport {
+	base_width: u32,
+	base_height: u32,
+	zoom: u32,
+	width: u32,
+	height: u32,
+	pan_x: u32,
+	pan_y: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewAction {
+	None,
+	Redraw,
+	Exit,
+}
+
+impl Viewport {
+	fn new(image: &DecodedImage, framebuffer: Framebuffer) -> Option<Self> {
+		let (base_width, base_height) = fit_dimensions(image.width, image.height, framebuffer)?;
+		Some(Viewport { base_width, base_height, zoom: ZOOM_MIN, width: base_width, height: base_height, pan_x: 0, pan_y: 0 })
+	}
+
+	fn set_zoom(&mut self, zoom: u32, framebuffer: Framebuffer) -> bool {
+		let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+		if zoom == self.zoom {
+			return false;
+		}
+		let old_width = self.width.max(1);
+		let old_height = self.height.max(1);
+		let old_center_x = visible_center(self.width, self.pan_x, framebuffer.width);
+		let old_center_y = visible_center(self.height, self.pan_y, framebuffer.height);
+		let Some(width) = scaled_dimension(self.base_width, zoom) else {
+			return false;
+		};
+		let Some(height) = scaled_dimension(self.base_height, zoom) else {
+			return false;
+		};
+		self.zoom = zoom;
+		self.width = width;
+		self.height = height;
+		let center_x = old_center_x * width as u64 / old_width as u64;
+		let center_y = old_center_y * height as u64 / old_height as u64;
+		self.pan_x = pan_for_center(center_x, width, framebuffer.width);
+		self.pan_y = pan_for_center(center_y, height, framebuffer.height);
+		true
+	}
+
+	fn zoom_in(&mut self, framebuffer: Framebuffer) -> bool {
+		self.set_zoom(self.zoom.saturating_add(ZOOM_STEP), framebuffer)
+	}
+
+	fn zoom_out(&mut self, framebuffer: Framebuffer) -> bool {
+		self.set_zoom(self.zoom.saturating_sub(ZOOM_STEP), framebuffer)
+	}
+
+	fn can_pan(&self, framebuffer: Framebuffer) -> bool {
+		self.width > framebuffer.width || self.height > framebuffer.height
+	}
+
+	fn pan(&mut self, code: u16, framebuffer: Framebuffer) -> bool {
+		let old_x = self.pan_x;
+		let old_y = self.pan_y;
+		let step_x = (framebuffer.width / PAN_STEP_DIVISOR).max(1);
+		let step_y = (framebuffer.height / PAN_STEP_DIVISOR).max(1);
+		match code {
+			usage::LEFT => self.pan_x = self.pan_x.saturating_sub(step_x),
+			usage::RIGHT => self.pan_x = self.pan_x.saturating_add(step_x).min(self.width.saturating_sub(framebuffer.width)),
+			usage::UP => self.pan_y = self.pan_y.saturating_sub(step_y),
+			usage::DOWN => self.pan_y = self.pan_y.saturating_add(step_y).min(self.height.saturating_sub(framebuffer.height)),
+			_ => {}
+		}
+		self.pan_x != old_x || self.pan_y != old_y
+	}
+}
+
+fn fit_dimensions(width: u32, height: u32, framebuffer: Framebuffer) -> Option<(u32, u32)> {
+	if width == 0 || height == 0 || framebuffer.width == 0 || framebuffer.height == 0 {
+		return None;
+	}
+	if framebuffer.width as u64 * height as u64 <= framebuffer.height as u64 * width as u64 { Some((framebuffer.width, ((height as u64 * framebuffer.width as u64) / width as u64).max(1) as u32)) } else { Some((((width as u64 * framebuffer.height as u64) / height as u64).max(1) as u32, framebuffer.height)) }
+}
+
+fn scaled_dimension(base: u32, zoom: u32) -> Option<u32> {
+	let scaled = (base as u64 * zoom as u64).div_ceil(100).max(if zoom > ZOOM_MIN { base as u64 + 1 } else { base as u64 });
+	u32::try_from(scaled).ok()
+}
+
+fn visible_center(width: u32, pan: u32, viewport: u32) -> u64 {
+	if width > viewport { pan as u64 + viewport as u64 / 2 } else { width as u64 / 2 }
+}
+
+fn pan_for_center(center: u64, width: u32, viewport: u32) -> u32 {
+	if width <= viewport { 0 } else { center.saturating_sub(viewport as u64 / 2).min(width.saturating_sub(viewport) as u64) as u32 }
+}
+
+fn arrow_mask(code: u16) -> u8 {
+	match code {
+		usage::LEFT => HELD_LEFT,
+		usage::RIGHT => HELD_RIGHT,
+		usage::UP => HELD_UP,
+		usage::DOWN => HELD_DOWN,
+		_ => 0,
+	}
+}
+
+fn handle_code(code: u16, pressed: bool, viewport: &mut Viewport, framebuffer: Framebuffer, held: &mut u8) -> ViewAction {
+	if pressed && matches!(code, usage::ESCAPE | usage::Q) {
+		return ViewAction::Exit;
+	}
+	if pressed && code == usage::PLUS {
+		return if viewport.zoom_in(framebuffer) { ViewAction::Redraw } else { ViewAction::None };
+	}
+	if pressed && code == usage::MINUS {
+		return if viewport.zoom_out(framebuffer) { ViewAction::Redraw } else { ViewAction::None };
+	}
+	let mask = arrow_mask(code);
+	if mask == 0 {
+		return ViewAction::None;
+	}
+	if pressed {
+		if !viewport.can_pan(framebuffer) {
+			return ViewAction::None;
+		}
+		*held |= mask;
+		if viewport.pan(code, framebuffer) { ViewAction::Redraw } else { ViewAction::None }
+	} else {
+		*held &= !mask;
+		ViewAction::None
+	}
+}
+
+fn handle_raw_byte(byte: u8, viewport: &mut Viewport, framebuffer: Framebuffer, held: &mut u8) -> ViewAction {
+	match byte {
+		0x1b | b'q' => ViewAction::Exit,
+		b'+' | b'=' => handle_code(usage::PLUS, true, viewport, framebuffer, held),
+		b'-' => handle_code(usage::MINUS, true, viewport, framebuffer, held),
+		_ => ViewAction::None,
+	}
+}
+
+fn pan_held(viewport: &mut Viewport, framebuffer: Framebuffer, held: u8) -> bool {
+	let mut changed = false;
+	if held & HELD_LEFT != 0 {
+		changed |= viewport.pan(usage::LEFT, framebuffer);
+	}
+	if held & HELD_RIGHT != 0 {
+		changed |= viewport.pan(usage::RIGHT, framebuffer);
+	}
+	if held & HELD_UP != 0 {
+		changed |= viewport.pan(usage::UP, framebuffer);
+	}
+	if held & HELD_DOWN != 0 {
+		changed |= viewport.pan(usage::DOWN, framebuffer);
+	}
+	changed
 }
 
 #[unsafe(no_mangle)]
@@ -161,13 +331,11 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 			Some(len) => len,
 			None => return,
 		};
-		let target = core::slice::from_raw_parts_mut(surface.addr() as *mut u8, target_len);
-		let presented = render_fit(&image, framebuffer, target);
-		let Some(blit) = presented else {
+		let Some(mut viewport) = Viewport::new(&image, framebuffer) else {
 			let _ = surface::release(&display);
 			return;
 		};
-		if !matches!(surface::present(&display, blit.rect), Some(Ok(()))) {
+		if !present_view(&display, &surface, framebuffer, target_len, &image, &viewport) {
 			let _ = surface::release(&display);
 			return;
 		}
@@ -179,43 +347,83 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 			let _ = surface::release(&display);
 			return;
 		};
-		let mut frame: [u8; 32] = [0; 32];
-		let pannable = image.width > framebuffer.width || image.height > framebuffer.height;
-		let mut native = false;
-		let mut pan_x = 0u32;
-		let mut pan_y = 0u32;
-		while let Received::Message { len, handle } = recv_blocking(key_stream, &mut frame) {
-			let mut frame_handle = handle;
-			let event = input::subscribe_keys_read(&frame[..len], &mut frame_handle);
-			if frame_handle != 0 {
-				close(frame_handle);
+		let stdin_channel = stdin();
+		if stdin_channel != 0 {
+			print(TTY_RAW_ON);
+		}
+		let mut key_frame: [u8; 32] = [0; 32];
+		let mut stdin_frame: [u8; 32] = [0; 32];
+		let mut held: u8 = 0;
+		let mut next_repeat = clock().saturating_add(PAN_REPEAT_TICKS);
+		let mut exit_requested = false;
+		while !exit_requested {
+			let deadline = if held != 0 && viewport.can_pan(framebuffer) { next_repeat } else { 0 };
+			let ready = if stdin_channel != 0 {
+				let waits = [key_stream, stdin_channel];
+				if deadline != 0 { wait_any_periodic(&waits, deadline) } else { wait_any(&waits, 0) }
+			} else {
+				let waits = [key_stream];
+				if deadline != 0 { wait_any_periodic(&waits, deadline) } else { wait_any(&waits, 0) }
+			};
+			if ready == ERR_TIMED_OUT {
+				let now = clock();
+				if now >= next_repeat {
+					if pan_held(&mut viewport, framebuffer, held) {
+						let _ = present_view(&display, &surface, framebuffer, target_len, &image, &viewport);
+					}
+					next_repeat = now.saturating_add(PAN_REPEAT_TICKS);
+				}
+				continue;
 			}
-			if matches!(event, Some(ref event) if event.pressed && matches!(event.code, usage::ESCAPE | usage::Q)) {
+			if ready < 0 {
 				break;
 			}
-			let Some(event) = event.filter(|event| event.pressed && pannable && matches!(event.code, usage::LEFT | usage::RIGHT | usage::UP | usage::DOWN)) else {
-				continue;
-			};
-			if !native {
-				native = true;
-				pan_x = image.width.saturating_sub(framebuffer.width) / 2;
-				pan_y = image.height.saturating_sub(framebuffer.height) / 2;
-			}
-			let step_x = (framebuffer.width / 8).max(1);
-			let step_y = (framebuffer.height / 8).max(1);
-			match event.code {
-				usage::LEFT => pan_x = pan_x.saturating_sub(step_x),
-				usage::RIGHT => pan_x = pan_x.saturating_add(step_x).min(image.width.saturating_sub(framebuffer.width)),
-				usage::UP => pan_y = pan_y.saturating_sub(step_y),
-				usage::DOWN => pan_y = pan_y.saturating_add(step_y).min(image.height.saturating_sub(framebuffer.height)),
-				_ => {}
-			}
-			let target = core::slice::from_raw_parts_mut(surface.addr() as *mut u8, target_len);
-			if let Some(blit) = render_crop(&image, framebuffer, target, pan_x, pan_y) {
-				let _ = surface::present(&display, blit.rect);
+			if ready == 0 {
+				match recv_blocking(key_stream, &mut key_frame) {
+					Received::Message { len, handle } => {
+						let mut frame_handle = handle;
+						if let Some(event) = input::subscribe_keys_read(&key_frame[..len], &mut frame_handle) {
+							let action = handle_code(event.code, event.pressed, &mut viewport, framebuffer, &mut held);
+							if action == ViewAction::Exit {
+								exit_requested = true;
+							} else if action == ViewAction::Redraw {
+								next_repeat = clock().saturating_add(PAN_REPEAT_TICKS);
+								let _ = present_view(&display, &surface, framebuffer, target_len, &image, &viewport);
+							}
+						}
+						if frame_handle != 0 {
+							close(frame_handle);
+						}
+					}
+					Received::Closed => break,
+				}
+			} else if stdin_channel != 0 {
+				match recv_blocking(stdin_channel, &mut stdin_frame) {
+					Received::Message { len, handle } => {
+						if handle != 0 {
+							close(handle);
+						}
+						for &byte in &stdin_frame[..len] {
+							let action = handle_raw_byte(byte, &mut viewport, framebuffer, &mut held);
+							if action == ViewAction::Exit {
+								exit_requested = true;
+								break;
+							}
+							if action == ViewAction::Redraw {
+								next_repeat = clock().saturating_add(PAN_REPEAT_TICKS);
+								let _ = present_view(&display, &surface, framebuffer, target_len, &image, &viewport);
+							}
+						}
+					}
+					Received::Closed => break,
+				}
 			}
 		}
 		close(key_stream);
+		if stdin_channel != 0 {
+			print(TTY_RAW_OFF);
+			set_stdin(0);
+		}
 		let _ = surface::release(&display);
 	}
 }
@@ -224,10 +432,10 @@ fn target(data: &mut [u8], framebuffer: Framebuffer) -> Target<'_> {
 	Target { data, width: framebuffer.width, height: framebuffer.height, pitch: framebuffer.pitch, bytes_per_pixel: framebuffer.bytes_per_pixel, red_shift: framebuffer.red_shift, red_size: framebuffer.red_size, green_shift: framebuffer.green_shift, green_size: framebuffer.green_size, blue_shift: framebuffer.blue_shift, blue_size: framebuffer.blue_size }
 }
 
-fn render_fit(image: &DecodedImage, framebuffer: Framebuffer, output: &mut [u8]) -> Option<pix::BlitResult> {
-	pix::blit(Image { data: &image.pixels, width: image.width, height: image.height, pitch: image.pitch }, target(output, framebuffer), Rect { x: 0, y: 0, width: image.width, height: image.height }, true)
-}
-
-fn render_crop(image: &DecodedImage, framebuffer: Framebuffer, output: &mut [u8], pan_x: u32, pan_y: u32) -> Option<pix::BlitResult> {
-	pix::blit_crop(Image { data: &image.pixels, width: image.width, height: image.height, pitch: image.pitch }, target(output, framebuffer), pan_x, pan_y)
+unsafe fn present_view(display: &surface::Client, surface: &surface::Mapping, framebuffer: Framebuffer, target_len: usize, image: &DecodedImage, viewport: &Viewport) -> bool {
+	let output = core::slice::from_raw_parts_mut(surface.addr() as *mut u8, target_len);
+	let Some(blit) = pix::blit_view(Image { data: &image.pixels, width: image.width, height: image.height, pitch: image.pitch }, target(output, framebuffer), viewport.width, viewport.height, viewport.pan_x, viewport.pan_y) else {
+		return false;
+	};
+	matches!(surface::present(display, blit.rect), Some(Ok(())))
 }

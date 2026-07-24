@@ -7,6 +7,8 @@ use proto::system::KeyEvent;
 
 pub mod usage {
 	pub const A: u16 = 0x04;
+	pub const MINUS: u16 = 0x2d;
+	pub const PLUS: u16 = 0x2e;
 	pub const Q: u16 = 0x14;
 	pub const ESCAPE: u16 = 0x29;
 	pub const RIGHT: u16 = 0x4f;

@@ -207,7 +207,7 @@ board-specific real-hardware support remains later work.
 - [x] [M119 - Pre-phase-3 hardening (finish before the server platform)](M0119.md)
 - [ ] [M120 - LSIDL package imports, modular generation, and language hardening](M0120.md)
 - [x] [M121 - Application graphics, raw input, and PCM audio (the app-platform layer)](M0121.md)
-- [ ] [M122 - Image viewer (the first graphical application)](M0122.md)
+- [x] [M122 - Image viewer (the first graphical application)](M0122.md)
 - [x] [M123 - Shared system libraries (dynamic linking)](M0123.md)
 - [ ] [M124 - Audio player (streaming decoders over AudioService)](M0124.md)
 - [x] [M125 - Native executable artifacts (`.lsexe`)](M0125.md)

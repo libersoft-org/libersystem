@@ -100,3 +100,18 @@ fn native_crop_uses_the_requested_source_origin_and_clears_the_target() {
 	assert_eq!(&letterbox[..4], &[0; 4]);
 	assert_eq!(u32::from_le_bytes(letterbox[4..8].try_into().unwrap()), 3);
 }
+
+#[test]
+fn viewport_blit_scales_and_clamps_a_centered_crop() {
+	let source = bytes(&[1, 2, 3, 4]);
+	let mut output = vec![0xaau8; 16];
+	let result = blit_view(Image { data: &source, width: 2, height: 2, pitch: 8 }, target(&mut output, 2, 2), 4, 4, 1, 1).unwrap();
+	assert_eq!(result.rect, Rect { x: 0, y: 0, width: 2, height: 2 });
+	assert_eq!(output, bytes(&[1, 2, 3, 4]));
+
+	let mut letterbox = vec![0xaau8; 64];
+	blit_view(Image { data: &source, width: 2, height: 2, pitch: 8 }, target(&mut letterbox, 4, 4), 2, 2, 99, 99).unwrap();
+	assert_eq!(&letterbox[..16], &[0; 16]);
+	assert_eq!(&letterbox[48..], &[0; 16]);
+	assert_eq!(u32::from_le_bytes(letterbox[20..24].try_into().unwrap()), 1);
+}

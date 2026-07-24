@@ -324,6 +324,50 @@ pub fn blit_crop(source: Image<'_>, mut target: Target<'_>, source_x: u32, sourc
 	Some(BlitResult { rect: Rect { x: 0, y: 0, width: target.width, height: target.height }, pixels: target.width as u64 * target.height as u64, direct: false })
 }
 
+pub fn blit_view(source: Image<'_>, mut target: Target<'_>, view_width: u32, view_height: u32, view_x: u32, view_y: u32) -> Option<BlitResult> {
+	validate(&source, &target, Rect { x: 0, y: 0, width: source.width, height: source.height })?;
+	if view_width == 0 || view_height == 0 {
+		return None;
+	}
+	let max_x = view_width.saturating_sub(target.width);
+	let max_y = view_height.saturating_sub(target.height);
+	let view_x = view_x.min(max_x);
+	let view_y = view_y.min(max_y);
+	let offset_x = target.width.saturating_sub(view_width) / 2;
+	let offset_y = target.height.saturating_sub(view_height) / 2;
+	target.data.fill(0);
+	for output_y in 0..target.height {
+		let display_y = if view_height > target.height {
+			view_y as u64 + output_y as u64
+		} else if output_y < offset_y {
+			continue;
+		} else {
+			(output_y - offset_y) as u64
+		};
+		if display_y >= view_height as u64 {
+			continue;
+		}
+		let source_y = (display_y * source.height as u64 / view_height as u64).min(source.height as u64 - 1) as u32;
+		for output_x in 0..target.width {
+			let display_x = if view_width > target.width {
+				view_x as u64 + output_x as u64
+			} else if output_x < offset_x {
+				continue;
+			} else {
+				(output_x - offset_x) as u64
+			};
+			if display_x >= view_width as u64 {
+				continue;
+			}
+			let source_x = (display_x * source.width as u64 / view_width as u64).min(source.width as u64 - 1) as u32;
+			let source_offset = source_y as usize * source.pitch as usize + source_x as usize * 4;
+			let pixel = u32::from_le_bytes(source.data[source_offset..source_offset + 4].try_into().ok()?);
+			write_pixel(&mut target, output_x, output_y, pixel);
+		}
+	}
+	Some(BlitResult { rect: Rect { x: 0, y: 0, width: target.width, height: target.height }, pixels: target.width as u64 * target.height as u64, direct: false })
+}
+
 fn validate(source: &Image<'_>, target: &Target<'_>, damage: Rect) -> Option<()> {
 	if source.width == 0 || source.height == 0 || target.width == 0 || target.height == 0 {
 		return None;

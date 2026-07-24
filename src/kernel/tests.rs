@@ -1055,6 +1055,7 @@ define_test_tags! {
 	DynamicReject => "dynamic-reject",
 	Filesystem => "filesystem",
 	Image => "image",
+	Imgview => "imgview",
 	Input => "input",
 	Ipc => "ipc",
 	Kernel => "kernel",
@@ -6264,7 +6265,7 @@ fn run_imgview_help_harness(imgview_elf: &[u8], system: &mut StorageHarness, med
 			break message.bytes;
 		}
 	};
-	assert_eq!(output, b"Usage: imgview <image>\nDisplays a still image or composited animation frame 0; animation playback is not supported.\n");
+	assert_eq!(output, b"Usage: imgview <image>\nDisplays a still image or composited animation frame 0; animation playback is not supported.\nControls: +/= zoom in, - zoom out, hold arrows to pan, Esc/q quit.\n");
 	for _ in 0..100_000 {
 		system.pump();
 		media.pump();
@@ -6275,12 +6276,24 @@ fn run_imgview_help_harness(imgview_elf: &[u8], system: &mut StorageHarness, med
 	panic!("imgview help harness did not exit");
 }
 
+#[derive(Clone, Copy)]
+enum ImgviewExit {
+	KeyQ,
+	KeyEscape,
+	RawEscape,
+	ZoomAndHold,
+}
+
 fn run_imgview_harness(imgview_elf: &[u8], path: &[u8], expected: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) {
+	run_imgview_harness_with_exit(imgview_elf, path, expected, system, media, ImgviewExit::KeyQ);
+}
+
+fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8], system: &mut StorageHarness, media: &mut StorageHarness, exit: ImgviewExit) {
 	use object::channel::{Channel, Message};
 	use object::memory_object::MemoryObject;
 	use object::rights::Rights;
 	let (bootstrap, child) = Channel::create();
-	let (_stdout, child_stdout) = Channel::create();
+	let (stdout, child_stdout) = Channel::create();
 	let (display, display_client) = Channel::create();
 	let (input, input_client) = Channel::create();
 	let process = spawn_dynamic_test_process(sched::root_domain(), imgview_elf, child);
@@ -6350,11 +6363,74 @@ fn run_imgview_harness(imgview_elf: &[u8], path: &[u8], expected: &[u8], system:
 	assert_eq!(le_u16(&subscribe.bytes, 0), 2, "imgview subscribes to keys");
 	let (keys, key_consumer) = Channel::create();
 	send_cap(&input, &le_u32(&subscribe.bytes, 2).to_le_bytes(), key_consumer, Rights::ALL).expect("imgview key stream");
-	for _ in 0..100 {
-		system.pump();
-		media.pump();
+	match exit {
+		ImgviewExit::KeyQ => {
+			keys.send(Message::new(alloc::vec![0, 0, 0, 0, 0x14, 0, 1], alloc::vec::Vec::new(), 0)).expect("imgview q key");
+		}
+		ImgviewExit::KeyEscape => {
+			keys.send(Message::new(alloc::vec![0, 0, 0, 0, 0x29, 0, 1], alloc::vec::Vec::new(), 0)).expect("imgview escape key");
+		}
+		ImgviewExit::RawEscape => {
+			stdout.send(Message::new(alloc::vec![0x1b], alloc::vec::Vec::new(), 0)).expect("imgview raw escape");
+		}
+		ImgviewExit::ZoomAndHold => {
+			let send_key = |code: u16, pressed: bool| {
+				keys.send(Message::new(alloc::vec![0, 0, 0, 0, code as u8, (code >> 8) as u8, pressed as u8], alloc::vec::Vec::new(), 0)).expect("imgview interaction key");
+			};
+			send_key(0x4f, true);
+			system.pump();
+			media.pump();
+			assert!(display.recv().is_err(), "fit-to-screen arrow must not redraw or auto-zoom");
+			send_key(0x4f, false);
+			for _ in 0..8 {
+				send_key(0x2e, true);
+				let request = loop {
+					system.pump();
+					media.pump();
+					if let Ok(request) = display.recv() {
+						break request;
+					}
+				};
+				assert_eq!(le_u16(&request.bytes, 0), 2, "imgview interaction redraws with a present request");
+				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview interaction present reply");
+				send_key(0x2e, false);
+			}
+			send_key(0x2d, true);
+			let request = loop {
+				system.pump();
+				media.pump();
+				if let Ok(request) = display.recv() {
+					break request;
+				}
+			};
+			assert_eq!(le_u16(&request.bytes, 0), 2, "imgview interaction zooms out with a present request");
+			display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview zoom-out present reply");
+			send_key(0x2d, false);
+			send_key(0x4f, true);
+			let mut repeat_presents = 0usize;
+			for _ in 0..1_000 {
+				system.pump();
+				media.pump();
+				while let Ok(request) = display.recv() {
+					assert_eq!(le_u16(&request.bytes, 0), 2, "imgview held arrow redraws with a present request");
+					display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview held-arrow present reply");
+					repeat_presents += 1;
+				}
+				if repeat_presents >= 2 {
+					break;
+				}
+				arch::idle_halt();
+			}
+			assert!(repeat_presents >= 2, "held arrow must produce repeated pan redraws");
+			send_key(0x4f, false);
+			for _ in 0..10 {
+				system.pump();
+				media.pump();
+				assert!(display.recv().is_err(), "released arrow must stop repeated pan redraws");
+			}
+			send_key(0x14, true);
+		}
 	}
-	keys.send(Message::new(alloc::vec![0, 0, 0, 0, 0x14, 0, 1], alloc::vec::Vec::new(), 0)).expect("imgview q key");
 
 	let release = loop {
 		system.pump();
@@ -6373,6 +6449,22 @@ fn run_imgview_harness(imgview_elf: &[u8], path: &[u8], expected: &[u8], system:
 		}
 	}
 	panic!("imgview harness did not exit");
+}
+
+tagged_test!(imgview_interactions, [Imgview, Image, Display, Input, Process, Service, Storage]);
+fn imgview_interactions() {
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let imgview_elf = program_elf(&package, volume, b"imgview").expect("imgview tool");
+	let source = pix::RgbaImage::new(2, 2, alloc::vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]).expect("source image");
+	let source_bmp = bmp::encode_rgba(&source).expect("encode source BMP");
+	let mut system = StorageHarness::start(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice())], false);
+	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
+	run_imgview_harness_with_exit(imgview_elf, b"vol://media/SOURCE.BMP", &viewer_surface(&source), &mut system, &mut media, ImgviewExit::ZoomAndHold);
+	run_imgview_harness_with_exit(imgview_elf, b"vol://media/SOURCE.BMP", &viewer_surface(&source), &mut system, &mut media, ImgviewExit::KeyEscape);
+	run_imgview_harness_with_exit(imgview_elf, b"vol://media/SOURCE.BMP", &viewer_surface(&source), &mut system, &mut media, ImgviewExit::RawEscape);
 }
 
 tagged_test!(imgconv_cross_volume_and_failed_overwrite_preserve_destination, [Image, Service, Storage, Process, Filesystem]);
