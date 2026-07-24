@@ -3,6 +3,11 @@
 	"editor.insertSpaces": false,
 	"editor.formatOnSave": true,
 	"editor.defaultFormatter": "esbenp.prettier-vscode",
+	"evenBetterToml.formatter.indentString": "\t",
+	"evenBetterToml.formatter.columnWidth": 100,
+	"evenBetterToml.formatter.reorderKeys": false,
+	"evenBetterToml.formatter.reorderArrays": false,
+	"evenBetterToml.formatter.reorderInlineTables": false,
 	"rust-analyzer.linkedProjects": ["src/kernel/Cargo.toml"],
 	"rust-analyzer.cargo.targetDir": "../../.build/cargo/rust-analyzer",
 	"[rust]": {
@@ -14,6 +19,12 @@
 		"editor.defaultFormatter": "mkhl.shfmt",
 		"editor.tabSize": 1,
 		"editor.insertSpaces": false
+	},
+	"[toml]": {
+		"editor.defaultFormatter": "tamasfe.even-better-toml",
+		"editor.tabSize": 1,
+		"editor.insertSpaces": false,
+		"editor.formatOnSave": true
 	},
 	"[markdown]": {
 		"editor.formatOnSave": false

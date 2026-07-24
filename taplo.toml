@@ -1,0 +1,7 @@
+include = ["**/*.toml"]
+exclude = [".build/**", ".git/**", ".venv/**"]
+
+[formatting]
+indent_string = "\t"
+column_width = 100
+reorder_keys = false

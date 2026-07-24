@@ -217,7 +217,34 @@ path = "src/readln.rs"
 
 [features]
 default = []
-shared-image = ["ipc-client/shared-image", "audio-client/shared-image", "audio-client-provider/shared-image", "config-client/shared-image", "config-client-provider/shared-image", "device-client/shared-image", "device-client-provider/shared-image", "log-client/shared-image", "log-client-provider/shared-image", "network-client/shared-image", "network-client-provider/shared-image", "observability-client/shared-image", "observability-client-provider/shared-image", "process-client/shared-image", "process-client-provider/shared-image", "resources-client/shared-image", "resources-client-provider/shared-image", "security-client/shared-image", "security-client-provider/shared-image", "time-client/shared-image", "time-client-provider/shared-image", "volume-client/shared-image", "volume-client-provider/shared-image", "proto/shared-image", "rt/shared-image", "storage-proto/shared-image"]
+shared-image = [
+	"ipc-client/shared-image",
+	"audio-client/shared-image",
+	"audio-client-provider/shared-image",
+	"config-client/shared-image",
+	"config-client-provider/shared-image",
+	"device-client/shared-image",
+	"device-client-provider/shared-image",
+	"log-client/shared-image",
+	"log-client-provider/shared-image",
+	"network-client/shared-image",
+	"network-client-provider/shared-image",
+	"observability-client/shared-image",
+	"observability-client-provider/shared-image",
+	"process-client/shared-image",
+	"process-client-provider/shared-image",
+	"resources-client/shared-image",
+	"resources-client-provider/shared-image",
+	"security-client/shared-image",
+	"security-client-provider/shared-image",
+	"time-client/shared-image",
+	"time-client-provider/shared-image",
+	"volume-client/shared-image",
+	"volume-client-provider/shared-image",
+	"proto/shared-image",
+	"rt/shared-image",
+	"storage-proto/shared-image",
+]
 
 [dependencies]
 ipc-client = { path = "../../libs/ipc/ipc-client" }

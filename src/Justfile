@@ -69,6 +69,7 @@ qoi_conformance_dir := "tools/qoi-conformance"
 tga_conformance_dir := "tools/tga-conformance"
 webp_conformance_dir := "tools/webp-conformance"
 image_mutate_dir := "tools/image-mutate"
+system_manifest_dir := "tools/system-manifest"
 proto_dir := shell("tools/source-path.sh proto")
 wasm_dir := shell("tools/source-path.sh wasm")
 sdk_dir := "sdk"
@@ -520,6 +521,7 @@ image-mutate:
 
 # format all code (Rust via rustfmt, shell via shfmt)
 fmt:
+    cd {{ system_manifest_dir }} && cargo fmt
     cd {{ abi_dir }} && cargo fmt
     cd {{ wire_dir }} && cargo fmt
     cd {{ rt_dir }} && cargo fmt
@@ -585,9 +587,11 @@ fmt:
     cd {{ iso9660_dir }} && cargo fmt
     cd {{ udf_dir }} && cargo fmt
     shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-shared-cache.sh tools/check-static-injection.sh tools/source-path.sh
+    cd .. && taplo fmt
 
 # check formatting without writing changes (CI-friendly)
 fmt-check:
+    cd {{ system_manifest_dir }} && cargo fmt --check
     cd {{ abi_dir }} && cargo fmt --check
     cd {{ wire_dir }} && cargo fmt --check
     cd {{ rt_dir }} && cargo fmt --check
@@ -653,6 +657,7 @@ fmt-check:
     cd {{ iso9660_dir }} && cargo fmt --check
     cd {{ udf_dir }} && cargo fmt --check
     shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-dynamic-report.sh tools/check-shared-cache.sh tools/check-source-hygiene.sh tools/check-static-injection.sh tools/source-path.sh
+    cd .. && taplo fmt --check
 
 # clean build artifacts
 clean:

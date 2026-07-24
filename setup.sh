@@ -63,6 +63,7 @@ APT_PACKAGES=(
 	lld               # LLVM linker (ld.lld)
 	llvm              # llvm-objcopy and friends
 	clang
+	libssl-dev # OpenSSL headers required to build Taplo schema support
 )
 
 info "Updating apt and installing packages..."
@@ -93,10 +94,19 @@ else
 	info "'just' is installed."
 fi
 
+# taplo (TOML formatter) - shared by CLI format gates and VS Code format-on-save
+TAPLO_VERSION="0.10.0"
+if ! command -v taplo >/dev/null 2>&1 || [[ "$(taplo --version)" != "taplo $TAPLO_VERSION" ]]; then
+	info "Installing taplo $TAPLO_VERSION via cargo..."
+	cargo install taplo-cli --version "$TAPLO_VERSION" --locked --force
+else
+	info "taplo $TAPLO_VERSION is installed."
+fi
+
 echo
 info "${BOLD}Done.${RESET}"
 echo "  - Rust nightly + rust-src + llvm-tools-preview"
-echo "  - QEMU (x86_64 + aarch64), gdb, lld, xorriso, gdisk, mtools, just"
+echo "  - QEMU (x86_64 + aarch64), gdb, lld, xorriso, gdisk, mtools, just, taplo"
 echo
 echo "Next step: cd src/kernel && cargo build"
 echo "Note: the project selects nightly via rust-toolchain.toml, no global switch needed."
