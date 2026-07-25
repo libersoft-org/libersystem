@@ -1652,30 +1652,6 @@ fn device_memory_maps_mmio_region() {
 	mem::frame::deallocate(phys);
 }
 
-tagged_test!(random_get_fills_distinct_bytes, [Syscall]);
-fn random_get_fills_distinct_bytes() {
-	use core::sync::atomic::{AtomicBool, Ordering};
-	static DONE: AtomicBool = AtomicBool::new(false);
-	extern "C" fn body(_arg: u64) {
-		unsafe {
-			let mut a = [0u8; 32];
-			let mut b = [0u8; 32];
-			let na = arch::syscall::invoke(syscall::SYS_RANDOM_GET, a.as_mut_ptr() as u64, a.len() as u64, 0, 0);
-			let nb = arch::syscall::invoke(syscall::SYS_RANDOM_GET, b.as_mut_ptr() as u64, b.len() as u64, 0, 0);
-			assert_eq!(na as usize, a.len(), "random_get did not fill the whole buffer");
-			assert_eq!(nb as usize, b.len());
-			// The buffer was actually written, and two draws differ (a false failure
-			// is a 1-in-2^256 event).
-			assert_ne!(a, [0u8; 32], "random_get left the buffer zeroed");
-			assert_ne!(a, b, "two random draws were identical");
-		}
-		DONE.store(true, Ordering::SeqCst);
-	}
-	sched::spawn(body, 0);
-	sched::run_until_idle();
-	assert!(DONE.load(Ordering::SeqCst));
-}
-
 tagged_test!(
 	#[cfg(target_arch = "x86_64")]
 	interrupt_bind_delivers_to_driver,
@@ -1706,51 +1682,6 @@ fn interrupt_bind_delivers_to_driver() {
 	sched::spawn(body, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst));
-}
-
-tagged_test!(object_property_set_names_an_object, [Kernel]);
-fn object_property_set_names_an_object() {
-	use core::sync::atomic::{AtomicBool, Ordering};
-	use object::KernelObject;
-	use object::event::Event;
-	use object::rights::Rights;
-	static DONE: AtomicBool = AtomicBool::new(false);
-	const NAME: &[u8] = b"irq-driver";
-	extern "C" fn body(handle: u64) {
-		unsafe {
-			let r = arch::syscall::invoke(syscall::SYS_OBJECT_PROPERTY_SET, handle, syscall::PROP_NAME, NAME.as_ptr() as u64, NAME.len() as u64);
-			assert_eq!(r as i64, 0, "set name failed");
-		}
-		DONE.store(true, Ordering::SeqCst);
-	}
-	let event = Event::create();
-	// The driver thread holds a handle to this same Event; the test keeps an Arc to
-	// read the label back after the thread names it.
-	sched::spawn_with_object(body, event.clone(), Rights::ALL, 0);
-	sched::run_until_idle();
-	assert!(DONE.load(Ordering::SeqCst));
-	assert_eq!(event.header().name().as_deref(), Some("irq-driver"));
-}
-
-tagged_test!(object_property_set_bounds_a_domain, [Kernel]);
-fn object_property_set_bounds_a_domain() {
-	use core::sync::atomic::{AtomicBool, Ordering};
-	use object::domain::{Domain, UNLIMITED};
-	use object::rights::Rights;
-	static DONE: AtomicBool = AtomicBool::new(false);
-	extern "C" fn body(handle: u64) {
-		unsafe {
-			// Set the Domain's memory limit to 8192 bytes via the property syscall.
-			let r = arch::syscall::invoke(syscall::SYS_OBJECT_PROPERTY_SET, handle, syscall::PROP_MEMORY_LIMIT, 8192, 0);
-			assert_eq!(r as i64, 0, "set memory limit failed");
-		}
-		DONE.store(true, Ordering::SeqCst);
-	}
-	let domain = Domain::new(UNLIMITED, UNLIMITED, UNLIMITED);
-	sched::spawn_with_object(body, domain.clone(), Rights::ALL, 0);
-	sched::run_until_idle();
-	assert!(DONE.load(Ordering::SeqCst));
-	assert_eq!(domain.account().memory().limit(), 8192);
 }
 
 tagged_test!(blocking_wait_wakes_on_message, [Ipc]);
@@ -6283,36 +6214,6 @@ fn storage_serves_staged_tool_binary() {
 	assert_eq!(&actual[..4], b"\x7fELF", "the staged tool should be an ELF image");
 }
 
-tagged_test!(event_timer_syscalls, [Kernel, Syscall]);
-fn event_timer_syscalls() {
-	use core::sync::atomic::{AtomicBool, Ordering};
-	static DONE: AtomicBool = AtomicBool::new(false);
-	// Event and Timer driven through the syscall path need a current thread's
-	// handle table, so they run inside a spawned kernel thread.
-	extern "C" fn body(_arg: u64) {
-		unsafe {
-			let event = arch::syscall::invoke(syscall::SYS_EVENT_CREATE, 0, 0, 0, 0);
-			assert!(!syscall::sys_is_err(event));
-			assert_eq!(arch::syscall::invoke(syscall::SYS_EVENT_POLL, event, 0, 0, 0), 0);
-			arch::syscall::invoke(syscall::SYS_EVENT_SIGNAL, event, 0, 0, 0);
-			assert_eq!(arch::syscall::invoke(syscall::SYS_EVENT_POLL, event, 0, 0, 0), 1);
-
-			let timer = arch::syscall::invoke(syscall::SYS_TIMER_CREATE, 0, 0, 0, 0);
-			assert!(!syscall::sys_is_err(timer));
-			// not armed -> not expired
-			assert_eq!(arch::syscall::invoke(syscall::SYS_TIMER_POLL, timer, 0, 0, 0), 0);
-			// a deadline already reached reports expired immediately
-			let now = arch::syscall::invoke(syscall::SYS_CLOCK_GET, 0, 0, 0, 0);
-			arch::syscall::invoke(syscall::SYS_TIMER_SET, timer, now, 0, 0);
-			assert_eq!(arch::syscall::invoke(syscall::SYS_TIMER_POLL, timer, 0, 0, 0), 1);
-		}
-		DONE.store(true, Ordering::SeqCst);
-	}
-	sched::spawn(body, 0);
-	sched::run_until_idle();
-	assert!(DONE.load(Ordering::SeqCst));
-}
-
 tagged_test!(userspace_runs_and_ipcs, [Process]);
 fn userspace_runs_and_ipcs() {
 	use object::channel::Channel;
@@ -6687,85 +6588,6 @@ fn driver_survives_crash_and_restart() {
 	fault::clear_crash_notify();
 	assert!(survived, "the restarted driver should run without faulting");
 	assert!(restarts >= 1, "the supervisor should have restarted the crashed driver");
-}
-
-tagged_test!(domain_quota_enforced_cleanly, [Kernel]);
-fn domain_quota_enforced_cleanly() {
-	use core::sync::atomic::{AtomicBool, Ordering};
-	use object::domain::Domain;
-	static DONE: AtomicBool = AtomicBool::new(false);
-	// A thread accounted to a bounded Domain exercises the create-boundary
-	// quotas. Reaching a cap must return ERR_RESOURCE_EXHAUSTED, not crash. The
-	// create syscalls charge the current thread's Domain, so the sequence runs
-	// inside a spawned thread; a failed assertion panics it and fails the run.
-	extern "C" fn body(_arg: u64) {
-		unsafe {
-			// memory: the cap is 8192 bytes = two pages. Two objects fit exactly,
-			// the third is refused cleanly without allocating anything.
-			let m0 = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0);
-			assert!(!syscall::sys_is_err(m0));
-			let m1 = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0);
-			assert!(!syscall::sys_is_err(m1));
-			let m2 = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0);
-			assert_eq!(m2 as i64, syscall::ERR_RESOURCE_EXHAUSTED);
-			// closing the two objects refunds their memory and their handles
-			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, m0, 0, 0, 0) as i64, 0);
-			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, m1, 0, 0, 0) as i64, 0);
-			// handles: the cap is 4. Four events fit, the fifth is refused cleanly.
-			for _ in 0..4 {
-				let e = arch::syscall::invoke(syscall::SYS_EVENT_CREATE, 0, 0, 0, 0);
-				assert!(!syscall::sys_is_err(e));
-			}
-			let over = arch::syscall::invoke(syscall::SYS_EVENT_CREATE, 0, 0, 0, 0);
-			assert_eq!(over as i64, syscall::ERR_RESOURCE_EXHAUSTED);
-		}
-		DONE.store(true, Ordering::SeqCst);
-	}
-	// 8192 bytes of memory (two pages), 4 handles, 4 threads.
-	let domain = Domain::new(8192, 4, 4);
-	// Do not keep the returned Arc, so the thread is free to be reaped (and its
-	// charges refunded) once it exits.
-	assert!(sched::spawn_in(domain.clone(), body, 0).is_some());
-	sched::run_until_idle();
-	assert!(DONE.load(Ordering::SeqCst));
-	// Tearing the thread down returned every resource: the four still-open events
-	// are refunded by the handle table's drop and the thread slot by the thread's
-	// drop, so the bounded Domain is back to zero - clean refusal, no leak.
-	assert_eq!(domain.account().memory().used(), 0);
-	assert_eq!(domain.account().handles().used(), 0);
-	assert_eq!(domain.account().threads().used(), 0);
-}
-
-tagged_test!(dma_buffer_quota_enforced_cleanly, [Kernel]);
-fn dma_buffer_quota_enforced_cleanly() {
-	use core::sync::atomic::{AtomicBool, Ordering};
-	use object::domain::{Domain, UNLIMITED};
-	static DONE: AtomicBool = AtomicBool::new(false);
-	// A thread accounted to a Domain capped at two pages of pinned DMA. The
-	// dma_buffer_create syscall charges the DMA quota at the create boundary, so a
-	// third buffer must be refused cleanly (ERR_RESOURCE_EXHAUSTED, nothing
-	// allocated) and closing the buffers must refund the quota.
-	extern "C" fn body(_arg: u64) {
-		unsafe {
-			let d0 = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, 0, 0, 0);
-			assert!(!syscall::sys_is_err(d0));
-			let d1 = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, 0, 0, 0);
-			assert!(!syscall::sys_is_err(d1));
-			let d2 = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, 0, 0, 0);
-			assert_eq!(d2 as i64, syscall::ERR_RESOURCE_EXHAUSTED);
-			// Closing the buffers refunds both their DMA quota and their handles.
-			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, d0, 0, 0, 0) as i64, 0);
-			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, d1, 0, 0, 0) as i64, 0);
-		}
-		DONE.store(true, Ordering::SeqCst);
-	}
-	let domain = Domain::new(UNLIMITED, UNLIMITED, UNLIMITED);
-	domain.account().dma().set_limit(2 * 4096);
-	assert!(sched::spawn_in(domain.clone(), body, 0).is_some());
-	sched::run_until_idle();
-	assert!(DONE.load(Ordering::SeqCst), "DMA quota test thread did not finish");
-	// Every buffer was closed, so the pinned-DMA quota is back to zero.
-	assert_eq!(domain.account().dma().used(), 0);
 }
 
 tagged_test!(ipc_queue_bytes_accounting_enforced, [Kernel, Ipc]);

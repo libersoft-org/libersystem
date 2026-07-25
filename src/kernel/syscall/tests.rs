@@ -35,3 +35,27 @@ fn abi_check_accepts_the_matching_revision_and_refuses_a_mismatch() {
 		assert!(sys_is_err(mismatch));
 	}
 }
+
+crate::tagged_test!(random_get_fills_distinct_bytes, [Syscall]);
+fn random_get_fills_distinct_bytes() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let mut first = [0u8; 32];
+			let mut second = [0u8; 32];
+			let first_len = arch::syscall::invoke(SYS_RANDOM_GET, first.as_mut_ptr() as u64, first.len() as u64, 0, 0);
+			let second_len = arch::syscall::invoke(SYS_RANDOM_GET, second.as_mut_ptr() as u64, second.len() as u64, 0, 0);
+			assert_eq!(first_len as usize, first.len(), "random_get did not fill the whole buffer");
+			assert_eq!(second_len as usize, second.len());
+			// The buffer was actually written, and two draws differ (a false failure
+			// is a 1-in-2^256 event).
+			assert_ne!(first, [0u8; 32], "random_get left the buffer zeroed");
+			assert_ne!(first, second, "two random draws were identical");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	crate::sched::spawn(body, 0);
+	crate::sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+}

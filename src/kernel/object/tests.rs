@@ -103,3 +103,25 @@ fn handle_refcount_lifetime() {
 	table.close(handle).expect("close");
 	assert_eq!(Arc::strong_count(&obj), 1);
 }
+
+crate::tagged_test!(object_property_set_names_an_object, [Object, Kernel, Syscall]);
+fn object_property_set_names_an_object() {
+	use super::event::Event;
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	const NAME: &[u8] = b"irq-driver";
+	extern "C" fn body(handle: u64) {
+		unsafe {
+			let result = crate::arch::syscall::invoke(crate::syscall::SYS_OBJECT_PROPERTY_SET, handle, crate::syscall::PROP_NAME, NAME.as_ptr() as u64, NAME.len() as u64);
+			assert_eq!(result as i64, 0, "set name failed");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	let event = Event::create();
+	// The driver thread holds a handle to this same Event; the test keeps an Arc to
+	// read the label back after the thread names it.
+	crate::sched::spawn_with_object(body, event.clone(), Rights::ALL, 0);
+	crate::sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+	assert_eq!(event.header().name().as_deref(), Some("irq-driver"));
+}

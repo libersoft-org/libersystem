@@ -17,3 +17,27 @@ fn timer_object_expires_and_cancels() {
 	timer.cancel();
 	assert!(!timer.is_expired());
 }
+
+crate::tagged_test!(timer_syscall_arms_and_polls, [Object, Kernel, Syscall]);
+fn timer_syscall_arms_and_polls() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	// The syscall path needs a current thread's handle table, so it runs inside a
+	// spawned kernel thread.
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let timer = crate::arch::syscall::invoke(crate::syscall::SYS_TIMER_CREATE, 0, 0, 0, 0);
+			assert!(!crate::syscall::sys_is_err(timer));
+			// Not armed means not expired.
+			assert_eq!(crate::arch::syscall::invoke(crate::syscall::SYS_TIMER_POLL, timer, 0, 0, 0), 0);
+			// A deadline already reached reports expired immediately.
+			let now = crate::arch::syscall::invoke(crate::syscall::SYS_CLOCK_GET, 0, 0, 0, 0);
+			crate::arch::syscall::invoke(crate::syscall::SYS_TIMER_SET, timer, now, 0, 0);
+			assert_eq!(crate::arch::syscall::invoke(crate::syscall::SYS_TIMER_POLL, timer, 0, 0, 0), 1);
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	crate::sched::spawn(body, 0);
+	crate::sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+}
