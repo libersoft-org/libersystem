@@ -31,7 +31,7 @@ fi
 git status
 git add .
 
-src/tools/check-source-hygiene.sh --current
+src/tools/check-source-hygiene.sh --added
 
 git status
 

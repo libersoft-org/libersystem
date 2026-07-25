@@ -3,18 +3,84 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
-manifest_json="$(src/tools/system-manifest.sh export-json)"
 
 mode="${1:---current}"
 case "$mode" in
---current | --history) ;;
+--added | --current | --history) ;;
 *)
-	echo "usage: $0 [--current|--history]" >&2
+	echo "usage: $0 [--added|--current|--history]" >&2
 	exit 2
 	;;
 esac
 
 path_pattern='\.(lslib|lsexe|rlib|rmeta|wasm|o|a)$|(^|/)(\.build|target|shared)/'
+
+check_added_paths() {
+	local -a added_paths=()
+	local path
+	local type
+	local user_root
+	local manifest_pattern='(read_to_string|join).*user/services/manifest[.]toml'
+
+	if git rev-parse --verify HEAD >/dev/null 2>&1; then
+		mapfile -d '' -t added_paths < <(git diff --cached --name-only -z --diff-filter=A HEAD)
+	else
+		mapfile -d '' -t added_paths < <(git diff --cached --name-only -z --diff-filter=A --root)
+	fi
+
+	for path in "${added_paths[@]}"; do
+		if [[ "$path" =~ $path_pattern ]]; then
+			echo "source-hygiene: generated artifact is newly staged: $path" >&2
+			exit 1
+		fi
+
+		[[ "$path" == src/* && -f "$path" ]] || continue
+
+		type="$(file --brief --mime-type "$path")"
+		case "$type" in
+		application/wasm | application/x-archive | application/x-executable | application/x-object | application/x-pie-executable | application/x-sharedlib | application/x-dosexec | application/vnd.microsoft.portable-executable)
+			echo "source-hygiene: compiled binary content is newly staged: $path ($type)" >&2
+			exit 1
+			;;
+		esac
+
+		if [[ "$path" == src/user/* ]]; then
+			user_root="${path#src/user/}"
+			user_root="${user_root%%/*}"
+			case "$user_root" in
+			.cargo | apps | drivers | libs | runtime | services | build.rs | rust-toolchain.toml | user.ld | user-aarch64.ld | user-riscv64.ld | x86_64-unknown-none.json) ;;
+			*)
+				echo "source-hygiene: undeclared src/user root is newly staged: $path" >&2
+				exit 1
+				;;
+			esac
+			if [[ "$path" =~ ^src/user/[^/]+/Cargo.toml$ ]]; then
+				echo "source-hygiene: a Cargo crate is newly staged directly under src/user: $path" >&2
+				exit 1
+			fi
+		fi
+
+		case "$path" in
+		src/tools/system-manifest/src/lib.rs | src/tools/system-manifest/src/main.rs) ;;
+		*.rs | *.sh)
+			if grep -Eq "$manifest_pattern" "$path"; then
+				echo "source-hygiene: direct manifest reader is newly staged outside tools/system-manifest: $path" >&2
+				exit 1
+			fi
+			;;
+		esac
+	done
+
+	echo "source-hygiene: clean (--added; ${#added_paths[@]} new files)"
+}
+
+if [[ "$mode" == --added ]]; then
+	check_added_paths
+	exit 0
+fi
+
+manifest_json="$(src/tools/system-manifest.sh export-json)"
+
 physical="$(find src \( -type d \( -name .build -o -name target -o -name shared \) -o -type f \( -name '*.lslib' -o -name '*.lsexe' -o -name '*.rlib' -o -name '*.rmeta' -o -name '*.wasm' -o -name '*.o' -o -name '*.a' \) \) -print)"
 if [[ -n "$physical" ]]; then
 	echo "source-hygiene: generated artifacts exist under src:" >&2
