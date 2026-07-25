@@ -319,3 +319,6 @@ fn report(cpu_id: usize, lapic_id: u32, is_bsp: bool) {
 	let role = if is_bsp { "BSP" } else { "AP" };
 	crate::serial_println!("cpu {} ({}) online, lapic_id {}", cpu_id, role, lapic_id);
 }
+
+#[cfg(test)]
+mod tests;

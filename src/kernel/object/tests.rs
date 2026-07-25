@@ -38,7 +38,7 @@ impl KernelObject for TestObject {
 	}
 }
 
-crate::tagged_test!(handle_create_lookup_close, [Object, Kernel, Smoke]);
+crate::tagged_test!(handle_create_lookup_close, [Handle, Object, Kernel, Smoke]);
 fn handle_create_lookup_close() {
 	let mut table = HandleTable::new();
 	let obj = TestObject::new(42);
@@ -51,7 +51,7 @@ fn handle_create_lookup_close() {
 	assert!(matches!(table.lookup(handle, Rights::READ), Err(HandleError::BadHandle)));
 }
 
-crate::tagged_test!(handle_rights_enforced, [Object, Kernel]);
+crate::tagged_test!(handle_rights_enforced, [Handle, Object, Kernel]);
 fn handle_rights_enforced() {
 	let mut table = HandleTable::new();
 	let handle = table.insert_object(TestObject::new(7), Rights::READ, 0);
@@ -59,7 +59,7 @@ fn handle_rights_enforced() {
 	assert!(matches!(table.lookup(handle, Rights::WRITE), Err(HandleError::AccessDenied)));
 }
 
-crate::tagged_test!(handle_duplicate_attenuates, [Object, Kernel]);
+crate::tagged_test!(handle_duplicate_attenuates, [Handle, Object, Kernel]);
 fn handle_duplicate_attenuates() {
 	let mut table = HandleTable::new();
 	let handle = table.insert_object(TestObject::new(1), Rights::READ | Rights::WRITE | Rights::DUPLICATE, 0);
@@ -71,7 +71,7 @@ fn handle_duplicate_attenuates() {
 	assert!(matches!(table.duplicate(plain, Rights::READ), Err(HandleError::AccessDenied)));
 }
 
-crate::tagged_test!(handle_revocation_invalidates, [Object, Kernel]);
+crate::tagged_test!(handle_revocation_invalidates, [Handle, Object, Kernel]);
 fn handle_revocation_invalidates() {
 	let mut table = HandleTable::new();
 	let obj = TestObject::new(99);
@@ -81,7 +81,7 @@ fn handle_revocation_invalidates() {
 	assert!(matches!(table.lookup(handle, Rights::READ), Err(HandleError::Revoked)));
 }
 
-crate::tagged_test!(handle_type_sealing, [Object, Kernel]);
+crate::tagged_test!(handle_type_sealing, [Handle, Object, Kernel]);
 fn handle_type_sealing() {
 	let mut table = HandleTable::new();
 	let handle = table.insert_object(TestObject::new(5), Rights::READ, 0);
@@ -89,7 +89,7 @@ fn handle_type_sealing() {
 	assert!(matches!(table.lookup_typed(handle, ObjectType::Channel, Rights::READ), Err(HandleError::WrongType)));
 }
 
-crate::tagged_test!(handle_refcount_lifetime, [Object, Kernel]);
+crate::tagged_test!(handle_refcount_lifetime, [Handle, Object, Kernel]);
 fn handle_refcount_lifetime() {
 	let mut table = HandleTable::new();
 	let obj = TestObject::new(3);

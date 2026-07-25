@@ -349,3 +349,6 @@ impl Drop for Process {
 }
 
 impl_kernel_object!(Process, Process);
+
+#[cfg(test)]
+mod tests;

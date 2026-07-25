@@ -197,3 +197,6 @@ extern "x86-interrupt" fn generic_with_code(frame: InterruptStackFrame, error_co
 	crate::serial_println!("EXCEPTION: unhandled fault (code {:#x}) at {:#x}", error_code, frame.instruction_pointer);
 	super::halt_loop();
 }
+
+#[cfg(test)]
+mod tests;

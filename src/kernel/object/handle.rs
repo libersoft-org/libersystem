@@ -339,3 +339,6 @@ impl Drop for HandleTable {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests;

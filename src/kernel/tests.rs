@@ -6,7 +6,6 @@
 // SystemManager spawn and the supervise ladder) stay in main.rs.
 
 use super::*;
-use crate::object::tests::TestObject;
 use alloc::vec::Vec;
 
 // Userspace (ring 3) page layout for the test: one USER page for the program,
@@ -1059,7 +1058,9 @@ define_test_tags! {
 	DynamicReject => "dynamic-reject",
 	Filesystem => "filesystem",
 	Frame => "frame",
+	Handle => "handle",
 	Image => "image",
+	Idt => "idt",
 	Imgview => "imgview",
 	Input => "input",
 	Interrupt => "interrupt",
@@ -1077,6 +1078,7 @@ define_test_tags! {
 	Scheduler => "scheduler",
 	Service => "service",
 	Shell => "shell",
+	Smp => "smp",
 	Smoke => "smoke",
 	Slow => "slow",
 	Storage => "storage",
@@ -1177,17 +1179,6 @@ pub(crate) fn test_runner(tests: &[&dyn Testable]) {
 }
 
 tagged_test!(
-	#[cfg(target_arch = "x86_64")]
-	breakpoint_exception_returns,
-	[Kernel, ArchX86_64]
-);
-#[cfg(target_arch = "x86_64")]
-fn breakpoint_exception_returns() {
-	// reaching the next line proves the IDT breakpoint handler returned cleanly
-	unsafe { core::arch::asm!("int3") };
-}
-
-tagged_test!(
 	#[cfg(target_arch = "riscv64")]
 	breakpoint_exception_returns,
 	[Kernel, ArchRiscv64]
@@ -1198,16 +1189,6 @@ fn breakpoint_exception_returns() {
 	// the trapped instruction width (2 bytes for a compressed c.ebreak, else 4) and
 	// advances sepc, the riscv analogue of x86's int3 breakpoint round-trip.
 	unsafe { core::arch::asm!("ebreak") };
-}
-
-tagged_test!(dynamic_symbol_names_accept_rust_mangling_with_a_bound, [Memory, Process]);
-fn dynamic_symbol_names_accept_rust_mangling_with_a_bound() {
-	let address_space = object::address_space::AddressSpace::create().expect("address space");
-	let process = object::process::Process::new(address_space, sched::root_domain());
-	let accepted = alloc::string::String::from_utf8(alloc::vec![b'x'; elf::MAX_DYNAMIC_SYMBOL_NAME]).expect("ASCII symbol");
-	assert!(process.register_dynamic_symbols(&[(accepted, 0x2000_1000)]), "the bounded Rust symbol is accepted");
-	let rejected = alloc::string::String::from_utf8(alloc::vec![b'y'; elf::MAX_DYNAMIC_SYMBOL_NAME + 1]).expect("ASCII symbol");
-	assert!(!process.register_dynamic_symbols(&[(rejected, 0x2000_2000)]), "an overlong symbol is rejected");
 }
 
 tagged_test!(elf_dyn_applies_relative_relocations_and_rejects_symbols, [Dynamic, DynamicReject, Memory, Process]);
@@ -1419,14 +1400,6 @@ const fn relative_relocation_type() -> u32 {
 const fn import_relocation_type() -> u32 {
 	TEST_IMPORT_RELOCATION
 }
-tagged_test!(smp_all_cores_online, [Kernel, Smoke]);
-fn smp_all_cores_online() {
-	// init_smp ran before the tests and waited for every core to report in, so
-	// the online count must equal the managed core count (and exceed one when
-	// QEMU is given more than a single CPU).
-	assert_eq!(smp::online_count(), smp::cpu_count());
-}
-
 tagged_test!(a_cpu_bound_ring3_thread_is_preempted, [Scheduler, Process]);
 fn a_cpu_bound_ring3_thread_is_preempted() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -6330,93 +6303,6 @@ fn resource_manager_contains_a_domain() {
 	// live.
 	let summary = run_resource_scenario().expect("the resource scenario should run");
 	assert_eq!(summary.as_slice(), b"granted=4 denied=1 regranted=4", "the kernel enforced the Domain's memory budget, contained the over-budget refusal, and honored the runtime raise");
-}
-
-tagged_test!(capability_grants_no_operation_beyond_rights, [Kernel]);
-fn capability_grants_no_operation_beyond_rights() {
-	// Property: a handle grants no operation beyond the rights it carries. Across many random
-	// granted-rights sets and random probe rights, a rights-checked lookup succeeds exactly
-	// when the probe is a subset of the granted set - never a superset. (Fixed-seed xorshift,
-	// so the run is deterministic.)
-	use object::handle::HandleTable;
-	use object::rights::Rights;
-	let mut seed: u64 = 0x5eed_1238_d38a_77c1;
-	let mut next = || -> u64 {
-		seed ^= seed << 13;
-		seed ^= seed >> 7;
-		seed ^= seed << 17;
-		seed
-	};
-	let mut table = HandleTable::new();
-	for _ in 0..512 {
-		let granted = Rights::from_bits(next() as u32);
-		let probe = Rights::from_bits(next() as u32);
-		let h = table.insert_object(TestObject::new(1), granted, 0);
-		assert_eq!(table.lookup(h, probe).is_ok(), granted.contains(probe), "a lookup must succeed iff the probe rights are a subset of the granted rights");
-		table.close(h).expect("close");
-	}
-}
-
-tagged_test!(capability_attenuation_only_narrows, [Kernel]);
-fn capability_attenuation_only_narrows() {
-	// Property: duplicating a capability can only narrow it, never widen it. Across many
-	// random grants (carrying the DUPLICATE right) and random requests, duplication succeeds
-	// exactly when the request is a subset of the grant, and the derived handle carries
-	// exactly the requested rights - no right the original lacked, and none outside the
-	// request. There is no path by which a derived capability gains authority.
-	use object::handle::HandleTable;
-	use object::rights::Rights;
-	let mut seed: u64 = 0xabcd_0042_1357_9bdf;
-	let mut next = || -> u64 {
-		seed ^= seed << 13;
-		seed ^= seed >> 7;
-		seed ^= seed << 17;
-		seed
-	};
-	let mut table = HandleTable::new();
-	for _ in 0..512 {
-		let granted = Rights::from_bits(next() as u32) | Rights::DUPLICATE;
-		let requested = Rights::from_bits(next() as u32);
-		let h = table.insert_object(TestObject::new(2), granted, 0);
-		match table.duplicate(h, requested) {
-			Ok(dup) => {
-				// Duplication is allowed only when the request is within the grant...
-				assert!(granted.contains(requested), "duplication widened the rights beyond the original");
-				// ...and the derived handle carries exactly the requested rights, never more.
-				let probe = Rights::from_bits(next() as u32);
-				assert_eq!(table.lookup(dup, probe).is_ok(), requested.contains(probe), "the derived capability carries exactly the requested rights");
-				table.close(dup).expect("close dup");
-			}
-			Err(_) => {
-				// The grant carries DUPLICATE, so the only reason to refuse is that the request
-				// asked for a right outside the grant - widening, which is forbidden.
-				assert!(!granted.contains(requested), "duplication refused a request that was within the grant");
-			}
-		}
-		table.close(h).expect("close");
-	}
-}
-
-tagged_test!(no_ambient_authority_fresh_table_empty, [Kernel]);
-fn no_ambient_authority_fresh_table_empty() {
-	// A newly created handle table holds nothing: a process begins with no ambient authority
-	// and can reach only capabilities explicitly handed to it. The table is empty, and every
-	// lookup into it - across a wide range of handle values - is rejected as a bad handle.
-	use object::handle::{Handle, HandleError, HandleTable};
-	use object::rights::Rights;
-	let table = HandleTable::new();
-	assert_eq!(table.len(), 0, "a fresh handle table must be empty");
-	let mut seed: u64 = 0x0f0f_1234_dead_c0de;
-	let mut next = || -> u64 {
-		seed ^= seed << 13;
-		seed ^= seed >> 7;
-		seed ^= seed << 17;
-		seed
-	};
-	for _ in 0..256 {
-		let handle = Handle::from_raw(next());
-		assert!(matches!(table.lookup(handle, Rights::NONE), Err(HandleError::BadHandle)), "an empty table must resolve no handle");
-	}
 }
 
 tagged_test!(syscall_fuzz_rejects_invalid_calls, [Syscall]);
