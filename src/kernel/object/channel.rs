@@ -225,3 +225,6 @@ impl Drop for Channel {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests;

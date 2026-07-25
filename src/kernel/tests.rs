@@ -1049,12 +1049,14 @@ define_test_tags! {
 	Audio => "audio",
 	AudioService => "audio-service",
 	Boot => "boot",
+	Channel => "channel",
 	Console => "console",
 	Display => "display",
 	Drivers => "drivers",
 	Dynamic => "dynamic",
 	DynamicReject => "dynamic-reject",
 	Filesystem => "filesystem",
+	Frame => "frame",
 	Image => "image",
 	Imgview => "imgview",
 	Input => "input",
@@ -1191,15 +1193,6 @@ fn breakpoint_exception_returns() {
 	// the trapped instruction width (2 bytes for a compressed c.ebreak, else 4) and
 	// advances sepc, the riscv analogue of x86's int3 breakpoint round-trip.
 	unsafe { core::arch::asm!("ebreak") };
-}
-
-tagged_test!(frame_alloc_distinct, [Memory, Smoke]);
-fn frame_alloc_distinct() {
-	let a = mem::frame::allocate().expect("frame a");
-	let b = mem::frame::allocate().expect("frame b");
-	assert_ne!(a, b);
-	mem::frame::deallocate(a);
-	mem::frame::deallocate(b);
 }
 
 tagged_test!(dynamic_symbol_names_accept_rust_mangling_with_a_bound, [Memory, Process]);
@@ -1453,37 +1446,6 @@ fn contiguous_frames_and_dma_spans() {
 	assert_eq!(dma.phys_base(), frames[0]);
 	drop(dma);
 	assert_eq!(domain.account().dma().used(), 0, "the DMA charge is refunded");
-}
-
-tagged_test!(the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free, [Memory]);
-fn the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free() {
-	use mem::frame::{self, PAGE_SIZE};
-	// The run table is heap-backed after boot, so pathological fragmentation grows
-	// it instead of leaking frames past a fixed size: freeing every other page of a
-	// 4096-page span leaves 2048 disjoint single-page runs - far past the old fixed
-	// table - and none may be lost. Freeing the other half re-coalesces the span
-	// whole (the free count round-trips exactly and a big contiguous fit works).
-	let before = frame::free_count();
-	let base = frame::allocate_contiguous(4096).expect("a 16 MB span");
-	for i in (0..4096u64).step_by(2) {
-		frame::deallocate(base + i * PAGE_SIZE);
-	}
-	for i in (1..4096u64).step_by(2) {
-		frame::deallocate(base + i * PAGE_SIZE);
-	}
-	assert_eq!(frame::free_count(), before, "every fragmented page returned to the pool");
-	let again = frame::allocate_contiguous(4096).expect("the span re-coalesced whole");
-	// A double free is refused: freeing a page inside the pool's free runs must
-	// not be honored (it would let the same frame be handed out twice).
-	frame::deallocate(again);
-	let after_free = frame::free_count();
-	frame::deallocate(again);
-	assert_eq!(frame::free_count(), after_free, "a double free adds nothing to the pool");
-	// Hand the rest of the span back (page 0 is already free).
-	for i in 1..4096u64 {
-		frame::deallocate(again + i * PAGE_SIZE);
-	}
-	assert_eq!(frame::free_count(), before, "the pool round-trips exactly");
 }
 
 tagged_test!(concurrent_maps_on_shared_tables_strand_nothing, [Memory, Stress]);
@@ -2366,58 +2328,6 @@ fn object_property_set_bounds_a_domain() {
 	assert_eq!(domain.account().memory().limit(), 8192);
 }
 
-tagged_test!(channel_message_and_capability_transfer, [Ipc]);
-fn channel_message_and_capability_transfer() {
-	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-	static OK: AtomicBool = AtomicBool::new(false);
-	static MARKER: AtomicU64 = AtomicU64::new(0);
-	// One thread holds each end of a channel. The sender writes a marker into a
-	// memory object and transfers it alongside a byte payload; the receiver reads
-	// the bytes and the marker back through the handle it is granted. A failed
-	// assertion inside a thread panics it, which fails the test run.
-	extern "C" fn sender(ch: u64) {
-		unsafe {
-			let mo = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0);
-			let virt = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, mo, 0, 0, 0);
-			(virt as *mut u64).write_volatile(0x5151_5151);
-			arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, mo, 0, 0, 0);
-			let payload = *b"hi";
-			let sent = arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, ch, payload.as_ptr() as u64, payload.len() as u64, mo);
-			assert!(!syscall::sys_is_err(sent));
-			// the transferred handle was consumed on success
-			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, mo, 0, 0, 0) as i64, syscall::ERR_BAD_HANDLE);
-		}
-	}
-	extern "C" fn receiver(ch: u64) {
-		unsafe {
-			let mut buf = [0u8; 8];
-			let mut xfer: u64 = 0;
-			let mut n;
-			loop {
-				n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, ch, buf.as_mut_ptr() as u64, buf.len() as u64, &mut xfer as *mut u64 as u64);
-				if !syscall::sys_is_err(n) {
-					break;
-				}
-				assert_eq!(n as i64, syscall::ERR_WOULD_BLOCK);
-				sched::yield_now();
-			}
-			assert_eq!(&buf[..n as usize], b"hi");
-			assert_ne!(xfer, 0);
-			let virt = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, xfer, 0, 0, 0);
-			MARKER.store((virt as *const u64).read_volatile(), Ordering::SeqCst);
-			arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, xfer, 0, 0, 0);
-			arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, xfer, 0, 0, 0);
-			OK.store(true, Ordering::SeqCst);
-		}
-	}
-	let (ep0, ep1) = object::channel::Channel::create();
-	sched::spawn_with_object(sender, ep0, object::rights::Rights::ALL, 0);
-	sched::spawn_with_object(receiver, ep1, object::rights::Rights::ALL, 0);
-	sched::run_until_idle();
-	assert!(OK.load(Ordering::SeqCst));
-	assert_eq!(MARKER.load(Ordering::SeqCst), 0x5151_5151);
-}
-
 tagged_test!(blocking_wait_wakes_on_message, [Ipc]);
 fn blocking_wait_wakes_on_message() {
 	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -2453,66 +2363,6 @@ fn blocking_wait_wakes_on_message() {
 	sched::run_until_idle();
 	assert!(OK.load(Ordering::SeqCst));
 	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 0);
-}
-
-tagged_test!(a_sender_on_a_full_channel_blocks_and_wakes_on_drain, [Ipc]);
-fn a_sender_on_a_full_channel_blocks_and_wakes_on_drain() {
-	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-	static SENDER_REFUSED: AtomicBool = AtomicBool::new(false);
-	static SENDER_DONE: AtomicBool = AtomicBool::new(false);
-	static RECEIVED: AtomicU64 = AtomicU64::new(0);
-	// Backpressure without spinning: a channel created with a queue depth of 2
-	// refuses the third send with WOULD_BLOCK (the depth is a creation parameter,
-	// not a hardwired constant), the sender then BLOCKS in SYS_WAIT with
-	// WAIT_WRITABLE, and the receiver's first recv - the queue leaving its full
-	// state - wakes it to deliver the rest. If the drain never woke the sender, it
-	// would stay blocked forever and SENDER_DONE would read false.
-	extern "C" fn sender(ch: u64) {
-		unsafe {
-			for msg in [b"m1", b"m2", b"m3"] {
-				loop {
-					let sent = arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, ch, msg.as_ptr() as u64, msg.len() as u64, 0);
-					if sent as i64 == syscall::ERR_WOULD_BLOCK {
-						SENDER_REFUSED.store(true, Ordering::SeqCst);
-						let ret = arch::syscall::invoke(syscall::SYS_WAIT, ch, 0, abi::WAIT_WRITABLE, 0);
-						assert_eq!(ret as i64, 0, "the writable wait returns ready");
-						continue;
-					}
-					assert!(!syscall::sys_is_err(sent));
-					break;
-				}
-			}
-			SENDER_DONE.store(true, Ordering::SeqCst);
-		}
-	}
-	extern "C" fn receiver(ch: u64) {
-		unsafe {
-			let mut buf = [0u8; 8];
-			let mut xfer: u64 = 0;
-			while RECEIVED.load(Ordering::SeqCst) < 3 {
-				let n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, ch, buf.as_mut_ptr() as u64, buf.len() as u64, &mut xfer as *mut u64 as u64);
-				if n as i64 == syscall::ERR_WOULD_BLOCK {
-					arch::syscall::invoke(syscall::SYS_WAIT, ch, 0, 0, 0);
-					continue;
-				}
-				assert!(!syscall::sys_is_err(n), "recv failed");
-				RECEIVED.fetch_add(1, Ordering::SeqCst);
-			}
-		}
-	}
-	let (ep0, ep1) = object::channel::Channel::create_with_depth(2);
-	// Run the sender ALONE first so it deterministically fills the depth-2 queue, is
-	// refused on the third send and blocks - without the receiver interleaving to drain a
-	// slot before that third send (a scheduling race that made this flaky on riscv-TCG,
-	// where a timer tick could switch to the receiver mid-fill).
-	sched::spawn_with_object(sender, ep0, object::rights::Rights::ALL, 0);
-	sched::run_until_idle();
-	assert!(SENDER_REFUSED.load(Ordering::SeqCst), "the depth-2 queue refused the third send");
-	// Now the receiver drains, which must wake the blocked sender to deliver the rest.
-	sched::spawn_with_object(receiver, ep1, object::rights::Rights::ALL, 0);
-	sched::run_until_idle();
-	assert!(SENDER_DONE.load(Ordering::SeqCst), "the drain woke the blocked sender");
-	assert_eq!(RECEIVED.load(Ordering::SeqCst), 3, "every message was delivered");
 }
 
 tagged_test!(blocking_wait_times_out_on_deadline, [Scheduler]);
@@ -2692,48 +2542,6 @@ fn signal_terminate_wakes_a_blocked_thread() {
 	sched::run_until_idle();
 	assert!(!PAST_WAIT.load(Ordering::SeqCst), "the killed thread must retire at the wait, not resume past it");
 	assert_eq!(victim_thread.state(), ThreadState::Exited, "the victim thread has exited");
-}
-
-tagged_test!(channel_endpoint_semantics, [Ipc]);
-fn channel_endpoint_semantics() {
-	use object::channel::{Channel, ChannelError, Message};
-	let (a, b) = Channel::create();
-	// an empty inbox reports would-block while the peer is open
-	assert!(matches!(b.recv(), Err(ChannelError::Empty)));
-	// a message carries its byte payload and the sender badge to the peer
-	a.send(Message::new(alloc::vec![1, 2, 3], alloc::vec::Vec::new(), 0x99)).unwrap();
-	let message = b.recv().unwrap();
-	assert_eq!(message.bytes, alloc::vec![1, 2, 3]);
-	assert_eq!(message.badge, 0x99);
-	// once the peer is dropped and the inbox drained, recv reports peer-closed
-	drop(a);
-	assert!(b.is_peer_closed());
-	assert!(matches!(b.recv(), Err(ChannelError::PeerClosed)));
-}
-
-tagged_test!(channel_peek_reports_the_pending_length, [Ipc]);
-fn channel_peek_reports_the_pending_length() {
-	use object::channel::{Channel, ChannelError, Message};
-	// The peek that retires the wire ceiling: a receiver learns the next pending
-	// message's exact byte length without dequeuing it, sizes its buffer, and the
-	// recv that follows loses nothing - demonstrated well past the old 4096 B
-	// reply convention.
-	let (a, b) = Channel::create();
-	assert!(matches!(b.peek_len(), Err(ChannelError::Empty)));
-	let big: alloc::vec::Vec<u8> = (0..20_000u32).map(|i| i as u8).collect();
-	a.send(Message::new(big.clone(), alloc::vec::Vec::new(), 0)).unwrap();
-	a.send(Message::new(alloc::vec![7u8; 3], alloc::vec::Vec::new(), 0)).unwrap();
-	// the peek names the FRONT message and does not consume it
-	assert_eq!(b.peek_len().unwrap(), 20_000);
-	assert_eq!(b.peek_len().unwrap(), 20_000, "peek does not dequeue");
-	let first = b.recv().unwrap();
-	assert_eq!(first.bytes, big, "the exactly-sized recv loses nothing");
-	assert_eq!(b.peek_len().unwrap(), 3, "the next message's length follows");
-	let _ = b.recv().unwrap();
-	// empty again while the peer is open, peer-closed once it is gone
-	assert!(matches!(b.peek_len(), Err(ChannelError::Empty)));
-	drop(a);
-	assert!(matches!(b.peek_len(), Err(ChannelError::PeerClosed)));
 }
 
 tagged_test!(pci_scan_finds_virtio_devices, [Drivers]);

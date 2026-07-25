@@ -1,93 +1,80 @@
 # Bugs / changes
 
+- "exit" command gracefully stops everything and then halts, but poweroff doesn't... do the same gracefullness for poweroff
 - "ps -i" - escape doesn't work (both terminal console and directly using keyboard, "q" works well on both)
 - "ps -i" - it doesn't show up CPU cores usage
 - "ps -i" - it shows JSON instead of table
-- TODO.md is huge - merge it to multiple files + main file with the list of milestones?
-- imgconv - does it have compression level settings?
-- add "ls" parameters (filters like *.txt etc.)
-- Native compilers - wasm
-- create a live video about LiberSystem
-- voribis - LICENSE file
-- check if we have our implementations only (not licensed !!!)
-- make boot faster (multicore + other optimizations)
-- why tests are in lib.rs and not tests.rs??
-- add audio conversion tool
-- after all audio tests remove all audio test files except original .mp3
-- check where in directory structures are non-system-essential apps (like image viewer, audio player etc.) and move them somewhere else
-- audio recorder (microphone)
-- audio device selector tool (both input and output, when system has multiple sound devices)
-- kernel/tests.rs - too big - atomize
-- create image conversion tool
-- sw render / opengl / vulkan + render tests
-- web camera viewer / recorder
-- tests are taking too long after every small task - optimization needed
-- Can it run Doom?
-- rename shell
-- shell scripts
-- text selection by mouse lags horribly
+- rename shell (lssh?)
 - when I press and hold enter in shell, sometimes it writes "vol://system> vol://system>" on the same row (not just "vol://system>" on next row)
-- why there is a "help" command again when it was deleted already?
 - qemu - be on the same network like host
-- lsvol - add column - device
+- vorbis - LICENSE file
+- check if we have our implementations only (not licensed !!!)
+- add "ls" parameters (filters like *.txt etc.)
+- kernel/tests.rs - too big - atomize
+- Native compilers - wasm
+- make boot faster (multicore + other optimizations)
+- tests are taking too long after every small task - optimization needed
+- why there is a "help" command again when it was deleted already?
+- commands.rs shows up the list of builtin shell commands - some of them should be separated binaries
 - mountpoints as mount://
-- liberfs - access time
+- liberfs - access time (optional)
 - disk quotas per user (??)
 - limits for subprocesses?
+- lsvol - add column - device
 - lsblk doesn't show device id
 - lsblk size doesn't corespond with volume size - find out why
 - lscpu --json doesn't show the name and other attributes
 - lsdev, lssvc - without --json parameter it still shows json, not a CLI text output
 - lsirq - show as table with columns (same like lsvol)
 - ls* - find out what should it show
-- find out what other ls* should be added (lsof etc.)
-- Is OS loading only drivers it detected or all?
-- src/boot/qemu-*.sh scripts - find duplicities and make it one script only with parameters, use it in Justfile and fix it in documentation
-- Remove Limine mentioning everywhere
-- Add nvme and other generic drivers (add to CONCEPT_*.md that generic drivers will be available already in phase 2)
 - Apps in vol://storage/bin/ are huge (hundreds of kB) - find out why
 - Some commands are missing --help parameter
 - How does the format of our binary files look like? describe it somewhere
 - Every command (even simple ones as ls or lsvol) has the delay at the beginning for no reason ... something that linux shows instantly - find out why and fix.
 - Some tools in vol://storage/bin/ miss --json and --json-min (of course not all of them can have it - like cat, echo, beep etc. - those are excluded for obvious reason)
-- df, du
 - lsblk is showing the type of block device (virtio-blk), mountpoint (vol://...) and size, but not the name of the device in device tree... also there should be table headers (device, type, volume, size)
-- Selecting something from console by mouse is lagging a lot... the whole console lags a lot even when paging (shift + pg up/down)
-- Where is vol://system/ physically stored? On ram disk or hard disk?
-- Where are system tools stored? When I enter "ls" in vol://system/, I can see just 2 .txt files
+- Test copy-paste features using mouse + CTRL+INSERT / CTRL+SHIFT+C (cut), SHIFT+INSERT / CTRL+SHIFT+V (paste), ??? (cut)
 - Is our shell a separated binary (like on Linux - bash, dash, fish etc.)?
-- commands.rs shows up the list of builtin shell commands - some of them should be separated binaries
-- Add commands for listing hw resources - lsblk, lspci etc.
 - Search for big source code files, sort them by number of lines, create a plan to atomize them
-- GPU driver keeps failing probably (screen sometimes blinking after few minutes - probably restarting driver or something)
-- "exit" command should not halt the machine, but just exits the shell and shows up the parent shell (shell that started this console). If there is no parent, just reload the whole shell
-- "exit" command gracefully stops everything and then halts, but poweroff doesn't... do the same gracefullness for poweroff
+- Check why there is a blank screen for 2 seconds during the boot
 - Check what is in coreutils package (Debian)
+- Optimize the code
+- Find the dead code
+- Find the duplicate / repetitive code
+- Boot log - [ OK ] [FAIL] [INFO] [WARN]
+- Nicer OS boot - colours in shell
 
 # New features
 
+- Add video player and video codecs
+- Add commands for listing hw resources - lsblk, lspci etc.
+- find out what other ls* should be added (lsof etc.)
+- df, du
+- sw render / opengl / vulkan + render tests
+- audio recorder (microphone)
+- audio device selector tool (both input and output, when system has multiple sound devices)
+- create a live video about LiberSystem
+- imgconv - does it have compression level settings?
+- add audio conversion tool
+- web camera viewer / recorder
+- shell scripts
+- Rust Doom?
 - M42 - app package format
 - M35k - console login and lock
 - M35f - non-US keyboard layout
 - When phase 2 is done, check if all matches with CONCEPT_EN/CZ.md
-- THREAT_MODEL.md - check if everything in this document is correct and current, add it to README as a link
 - Look for other FS compatibility (NTFS, ext4, xfs etc.)
-- add "cd" command
 - check for necessary utilities - https://popcon.debian.org/by_inst
 - add "route" command
-- add mc-like commander (lc?), mcedit-like editor and mcview file viewer
-- Boot log - [ OK ] [FAIL] [INFO] [WARN]
-- just run spice -> run spice - it doesnt show boot log, only >
-- Nicer OS boot - colours in shell
-- Optimize the code
-- Find the dead code
-- Find the duplicate / repetitive code
 - There are "build" / "target" directories in "src", should it be somewhere else (a directory above)?
 - SSH server
+- THREAT_MODEL.md - check if everything in this document is correct and current, add it to README as a link
 
 # Questions / other
 
+- Where is vol://system/ physically stored? On ram disk or hard disk?
+- Non-system-essential apps (like image viewer, audio player etc.) - move them somewhere else?
+- Is OS loading only drivers it detected or all?
 - How does ramdisk work? Does it have some file system?
 - What is the difference between SYS_CLOCK_GET, SYS_CLOCK_RTC and SYS_CLOCK_MONO_NS? Also clock(), clock_rtc() and clock_ns()?
 - Virtio drivers - MSI-X only? Remove the old IRQ?
-- Demo showing graphics and sound capabilities

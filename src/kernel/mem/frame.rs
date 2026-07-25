@@ -317,3 +317,6 @@ pub fn free_pages(frames: &[u64]) {
 const fn align_up(value: u64, align: u64) -> u64 {
 	(value + align - 1) & !(align - 1)
 }
+
+#[cfg(test)]
+mod tests;
