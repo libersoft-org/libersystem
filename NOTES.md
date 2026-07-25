@@ -1,5 +1,8 @@
 # Bugs / changes
 
+- "ps -i" - escape doesn't work (both terminal console and directly using keyboard, "q" works well on both)
+- "ps -i" - it doesn't show up CPU cores usage
+- "ps -i" - it shows JSON instead of table
 - TODO.md is huge - merge it to multiple files + main file with the list of milestones?
 - imgconv - does it have compression level settings?
 - add "ls" parameters (filters like *.txt etc.)

@@ -16,6 +16,8 @@ use alloc::vec::Vec;
 use crate::object::channel::{Channel, Message};
 use crate::sync::SpinLock;
 
+pub const SERIAL_INPUT_MARKER: u8 = 0;
+
 // The channel the kernel sends console input bytes on; the shell holds the peer
 // endpoint and receives them. None until a shell attaches.
 static CONSOLE: SpinLock<Option<Arc<Channel>>> = SpinLock::new(None);
@@ -46,6 +48,14 @@ pub fn feed(byte: u8) -> bool {
 	let channel = CONSOLE.lock().clone();
 	match channel {
 		Some(channel) => channel.send(Message::new(alloc::vec![byte], Vec::new(), 0)).is_ok(),
+		None => false,
+	}
+}
+
+pub fn feed_serial(byte: u8) -> bool {
+	let channel = CONSOLE.lock().clone();
+	match channel {
+		Some(channel) => channel.send(Message::new(alloc::vec![SERIAL_INPUT_MARKER, byte], Vec::new(), 0)).is_ok(),
 		None => false,
 	}
 }

@@ -6382,8 +6382,9 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 			media.pump();
 			assert!(display.recv().is_err(), "fit-to-screen arrow must not redraw or auto-zoom");
 			send_key(0x4f, false);
-			for _ in 0..8 {
-				send_key(0x2e, true);
+			for iteration in 0..8 {
+				let zoom_in_code = if iteration % 2 == 0 { 0x2e } else { 0x57 };
+				send_key(zoom_in_code, true);
 				let request = loop {
 					system.pump();
 					media.pump();
@@ -6393,9 +6394,35 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 				};
 				assert_eq!(le_u16(&request.bytes, 0), 2, "imgview interaction redraws with a present request");
 				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview interaction present reply");
-				send_key(0x2e, false);
+				send_key(zoom_in_code, false);
 			}
-			send_key(0x2d, true);
+			for zoom_out_code in [0x56, 0x2d] {
+				send_key(zoom_out_code, true);
+				let request = loop {
+					system.pump();
+					media.pump();
+					if let Ok(request) = display.recv() {
+						break request;
+					}
+				};
+				assert_eq!(le_u16(&request.bytes, 0), 2, "imgview interaction zooms out with a present request");
+				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview zoom-out present reply");
+				send_key(zoom_out_code, false);
+			}
+			for _ in 0..20 {
+				send_key(0x57, true);
+				let request = loop {
+					system.pump();
+					media.pump();
+					if let Ok(request) = display.recv() {
+						break request;
+					}
+				};
+				assert_eq!(le_u16(&request.bytes, 0), 2, "imgview interaction zooms with keypad plus");
+				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview keypad zoom present reply");
+				send_key(0x57, false);
+			}
+			stdout.send(Message::new(alloc::vec![0x1b, b'[', b'C'], alloc::vec::Vec::new(), 0)).expect("imgview serial right arrow");
 			let request = loop {
 				system.pump();
 				media.pump();
@@ -6403,9 +6430,8 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 					break request;
 				}
 			};
-			assert_eq!(le_u16(&request.bytes, 0), 2, "imgview interaction zooms out with a present request");
-			display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview zoom-out present reply");
-			send_key(0x2d, false);
+			assert_eq!(le_u16(&request.bytes, 0), 2, "imgview serial arrow redraws with a present request");
+			display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview serial-arrow present reply");
 			send_key(0x4f, true);
 			let mut repeat_presents = 0usize;
 			for _ in 0..1_000 {
@@ -6428,7 +6454,7 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 				media.pump();
 				assert!(display.recv().is_err(), "released arrow must stop repeated pan redraws");
 			}
-			send_key(0x14, true);
+			stdout.send(Message::new(alloc::vec![0x1b], alloc::vec::Vec::new(), 0)).expect("imgview serial escape");
 		}
 	}
 

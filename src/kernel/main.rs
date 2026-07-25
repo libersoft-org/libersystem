@@ -200,14 +200,14 @@ fn serial_console_pump() {
 	static NUDGED: AtomicBool = AtomicBool::new(false);
 	if !NUDGED.load(Ordering::Relaxed) && console_input::shell_listening() {
 		NUDGED.store(true, Ordering::Relaxed);
-		console_input::feed(b'\n');
+		console_input::feed_serial(b'\n');
 	}
 	// Drain the whole serial RX FIFO each wake: the BSP now halts between idle passes
 	// (~100 Hz timer wakes) instead of busy-spinning, so polling one byte per pass could
 	// let a fast paste overrun the 16-byte UART FIFO. Reading until empty keeps serial
 	// input lossless at the lower poll rate.
 	while let Some(byte) = arch::serial::read_byte() {
-		console_input::feed(byte);
+		console_input::feed_serial(byte);
 	}
 }
 
@@ -242,10 +242,10 @@ pub(crate) fn console_shell_loop() {
 	// the shell must be pumped whenever an interrupt arrives, not only when a serial
 	// byte does. Polling serial (rather than blocking on it) keeps that interrupt
 	// path live while no one is typing on the wire.
-	console_input::feed(b'\n');
+	console_input::feed_serial(b'\n');
 	while console_input::shell_listening() {
 		if let Some(byte) = arch::serial::read_byte() {
-			if !console_input::feed(byte) {
+			if !console_input::feed_serial(byte) {
 				break;
 			}
 		}
@@ -384,7 +384,7 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, mut spawn: 
 #[cfg(not(test))]
 fn serial_rx_interrupt(_vector: u8) {
 	while let Some(byte) = arch::serial::read_byte() {
-		console_input::feed(byte);
+		console_input::feed_serial(byte);
 	}
 }
 

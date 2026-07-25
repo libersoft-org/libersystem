@@ -458,6 +458,8 @@ unsafe fn run(console: &mut Console) -> ! {
 				if r == 0 {
 					// keystrokes from the kernel console input.
 					if let Received::Message { len, .. } = recv_blocking(console.input, &mut keys) {
+						let serial_input: bool = len == 2 && keys[0] == 0;
+						let key_bytes: &[u8] = if serial_input { &keys[1..2] } else { &keys[..len] };
 						if console.pointer != 0 {
 							loop {
 								match try_recv(console.pointer, &mut out) {
@@ -470,9 +472,7 @@ unsafe fn run(console: &mut Console) -> ! {
 								}
 							}
 						}
-						if console.display_focused {
-							handle_keys(console, &keys[..len]);
-						}
+						handle_keys(console, key_bytes, serial_input);
 					}
 				} else if have_display_events && r == display_idx {
 					handle_display_resize(console);
@@ -635,9 +635,9 @@ unsafe fn drain_serial(console: &mut Console) {
 // shell); otherwise the foreground VT's line discipline handles the byte - cooking it
 // into the line editor and delivering a whole line on Enter, or (in raw mode) passing it
 // straight through to the shell.
-unsafe fn handle_keys(console: &mut Console, keys: &[u8]) {
+unsafe fn handle_keys(console: &mut Console, keys: &[u8], serial_input: bool) {
 	unsafe {
-		if !console.display_focused {
+		if !console.display_focused && !serial_input {
 			return;
 		}
 		for &b in keys {

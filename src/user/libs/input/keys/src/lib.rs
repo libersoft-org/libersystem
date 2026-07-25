@@ -8,7 +8,9 @@ use proto::system::KeyEvent;
 pub mod usage {
 	pub const A: u16 = 0x04;
 	pub const MINUS: u16 = 0x2d;
+	pub const KEYPAD_MINUS: u16 = 0x56;
 	pub const PLUS: u16 = 0x2e;
+	pub const KEYPAD_PLUS: u16 = 0x57;
 	pub const Q: u16 = 0x14;
 	pub const ESCAPE: u16 = 0x29;
 	pub const RIGHT: u16 = 0x4f;

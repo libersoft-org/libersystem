@@ -24,13 +24,18 @@ const TTY_RAW_ON: &[u8] = b"\x1b[?9001h";
 const TTY_RAW_OFF: &[u8] = b"\x1b[?9001l";
 const ZOOM_MIN: u32 = 100;
 const ZOOM_MAX: u32 = 800;
-const ZOOM_STEP: u32 = 25;
+const ZOOM_STEP: u32 = 5;
 const PAN_REPEAT_TICKS: u64 = 2;
+const SERIAL_ESCAPE_TICKS: u64 = 2;
 const PAN_STEP_DIVISOR: u32 = 64;
 const HELD_LEFT: u8 = 1 << 0;
 const HELD_RIGHT: u8 = 1 << 1;
 const HELD_UP: u8 = 1 << 2;
 const HELD_DOWN: u8 = 1 << 3;
+const HELD_ZOOM_IN: u8 = 1 << 4;
+const HELD_ZOOM_OUT: u8 = 1 << 5;
+const HELD_PAN: u8 = HELD_LEFT | HELD_RIGHT | HELD_UP | HELD_DOWN;
+const HELD_ZOOM: u8 = HELD_ZOOM_IN | HELD_ZOOM_OUT;
 
 struct DecodedImage {
 	width: u32,
@@ -55,6 +60,13 @@ enum ViewAction {
 	None,
 	Redraw,
 	Exit,
+}
+
+#[derive(Clone, Copy)]
+enum SerialInput {
+	Ground,
+	Escape,
+	Csi,
 }
 
 impl Viewport {
@@ -150,11 +162,21 @@ fn handle_code(code: u16, pressed: bool, viewport: &mut Viewport, framebuffer: F
 	if pressed && matches!(code, usage::ESCAPE | usage::Q) {
 		return ViewAction::Exit;
 	}
-	if pressed && code == usage::PLUS {
-		return if viewport.zoom_in(framebuffer) { ViewAction::Redraw } else { ViewAction::None };
+	if matches!(code, usage::PLUS | usage::KEYPAD_PLUS) {
+		if pressed {
+			*held = (*held & !HELD_ZOOM_OUT) | HELD_ZOOM_IN;
+			return if viewport.zoom_in(framebuffer) { ViewAction::Redraw } else { ViewAction::None };
+		}
+		*held &= !HELD_ZOOM_IN;
+		return ViewAction::None;
 	}
-	if pressed && code == usage::MINUS {
-		return if viewport.zoom_out(framebuffer) { ViewAction::Redraw } else { ViewAction::None };
+	if matches!(code, usage::MINUS | usage::KEYPAD_MINUS) {
+		if pressed {
+			*held = (*held & !HELD_ZOOM_IN) | HELD_ZOOM_OUT;
+			return if viewport.zoom_out(framebuffer) { ViewAction::Redraw } else { ViewAction::None };
+		}
+		*held &= !HELD_ZOOM_OUT;
+		return ViewAction::None;
 	}
 	let mask = arrow_mask(code);
 	if mask == 0 {
@@ -172,13 +194,60 @@ fn handle_code(code: u16, pressed: bool, viewport: &mut Viewport, framebuffer: F
 	}
 }
 
-fn handle_raw_byte(byte: u8, viewport: &mut Viewport, framebuffer: Framebuffer, held: &mut u8) -> ViewAction {
-	match byte {
-		0x1b | b'q' => ViewAction::Exit,
-		b'+' | b'=' => handle_code(usage::PLUS, true, viewport, framebuffer, held),
-		b'-' => handle_code(usage::MINUS, true, viewport, framebuffer, held),
-		_ => ViewAction::None,
+fn handle_serial_byte(state: &mut SerialInput, escape_deadline: &mut u64, byte: u8, viewport: &mut Viewport, framebuffer: Framebuffer) -> ViewAction {
+	match *state {
+		SerialInput::Ground => match byte {
+			0x1b => {
+				*state = SerialInput::Escape;
+				*escape_deadline = unsafe { clock() }.saturating_add(SERIAL_ESCAPE_TICKS);
+				ViewAction::None
+			}
+			b'q' => ViewAction::Exit,
+			b'+' | b'=' => {
+				if viewport.zoom_in(framebuffer) {
+					ViewAction::Redraw
+				} else {
+					ViewAction::None
+				}
+			}
+			b'-' => {
+				if viewport.zoom_out(framebuffer) {
+					ViewAction::Redraw
+				} else {
+					ViewAction::None
+				}
+			}
+			_ => ViewAction::None,
+		},
+		SerialInput::Escape => {
+			*escape_deadline = 0;
+			*state = if byte == b'[' { SerialInput::Csi } else { SerialInput::Ground };
+			if byte == b'[' { ViewAction::None } else { ViewAction::Exit }
+		}
+		SerialInput::Csi => {
+			*escape_deadline = 0;
+			*state = SerialInput::Ground;
+			let code = match byte {
+				b'A' => usage::UP,
+				b'B' => usage::DOWN,
+				b'C' => usage::RIGHT,
+				b'D' => usage::LEFT,
+				_ => return ViewAction::None,
+			};
+			if viewport.can_pan(framebuffer) && viewport.pan(code, framebuffer) { ViewAction::Redraw } else { ViewAction::None }
+		}
 	}
+}
+
+fn zoom_held(viewport: &mut Viewport, framebuffer: Framebuffer, held: u8) -> bool {
+	let mut changed = false;
+	if held & HELD_ZOOM_IN != 0 {
+		changed |= viewport.zoom_in(framebuffer);
+	}
+	if held & HELD_ZOOM_OUT != 0 {
+		changed |= viewport.zoom_out(framebuffer);
+	}
+	changed
 }
 
 fn pan_held(viewport: &mut Viewport, framebuffer: Framebuffer, held: u8) -> bool {
@@ -354,21 +423,47 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 		let mut key_frame: [u8; 32] = [0; 32];
 		let mut stdin_frame: [u8; 32] = [0; 32];
 		let mut held: u8 = 0;
+		let mut serial_input = SerialInput::Ground;
+		let mut serial_escape_deadline: u64 = 0;
 		let mut next_repeat = clock().saturating_add(PAN_REPEAT_TICKS);
 		let mut exit_requested = false;
 		while !exit_requested {
-			let deadline = if held != 0 && viewport.can_pan(framebuffer) { next_repeat } else { 0 };
+			let repeat_pan = held & HELD_PAN != 0 && viewport.can_pan(framebuffer);
+			let repeat_zoom = held & HELD_ZOOM != 0;
+			let repeat_deadline = if repeat_pan || repeat_zoom { next_repeat } else { 0 };
+			let deadline = match (repeat_deadline, serial_escape_deadline) {
+				(0, 0) => 0,
+				(0, deadline) | (deadline, 0) => deadline,
+				(repeat, escape) => repeat.min(escape),
+			};
+			let wait_for_escape = serial_escape_deadline != 0 && (repeat_deadline == 0 || serial_escape_deadline <= repeat_deadline);
 			let ready = if stdin_channel != 0 {
 				let waits = [key_stream, stdin_channel];
-				if deadline != 0 { wait_any_periodic(&waits, deadline) } else { wait_any(&waits, 0) }
+				if deadline == 0 {
+					wait_any(&waits, 0)
+				} else if wait_for_escape {
+					wait_any(&waits, deadline)
+				} else {
+					wait_any_periodic(&waits, deadline)
+				}
 			} else {
 				let waits = [key_stream];
-				if deadline != 0 { wait_any_periodic(&waits, deadline) } else { wait_any(&waits, 0) }
+				if deadline == 0 {
+					wait_any(&waits, 0)
+				} else if wait_for_escape {
+					wait_any(&waits, deadline)
+				} else {
+					wait_any_periodic(&waits, deadline)
+				}
 			};
 			if ready == ERR_TIMED_OUT {
 				let now = clock();
+				if serial_escape_deadline != 0 && now >= serial_escape_deadline {
+					exit_requested = true;
+					continue;
+				}
 				if now >= next_repeat {
-					if pan_held(&mut viewport, framebuffer, held) {
+					if zoom_held(&mut viewport, framebuffer, held) || pan_held(&mut viewport, framebuffer, held) {
 						let _ = present_view(&display, &surface, framebuffer, target_len, &image, &viewport);
 					}
 					next_repeat = now.saturating_add(PAN_REPEAT_TICKS);
@@ -404,7 +499,7 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 							close(handle);
 						}
 						for &byte in &stdin_frame[..len] {
-							let action = handle_raw_byte(byte, &mut viewport, framebuffer, &mut held);
+							let action = handle_serial_byte(&mut serial_input, &mut serial_escape_deadline, byte, &mut viewport, framebuffer);
 							if action == ViewAction::Exit {
 								exit_requested = true;
 								break;

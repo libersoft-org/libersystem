@@ -375,7 +375,7 @@ qemu_run_x86_64() {
 		-drive "if=pflash,format=raw,file=$ovmf_vars"
 		-cdrom "$iso"
 		-boot d
-		-serial "${SERIAL:-mon:stdio}"
+		-serial "${SERIAL:-stdio}"
 	)
 
 	# System volume disk: holds the factory archive at LBA 0.

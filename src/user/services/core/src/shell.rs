@@ -703,7 +703,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"run", Shape::Args),
 	(b"set", Shape::Args),
 	(b"cat", Shape::Args),
-	(b"imgview", Shape::Args),
+	(b"imgview", Shape::InteractiveArgs),
 	(b"imgconv", Shape::Args),
 	(b"write", Shape::Args),
 	(b"rm", Shape::Args),
@@ -1321,14 +1321,14 @@ unsafe fn run_tool_interactive(jobs: &mut Jobs, permsvc: u64, name: &[u8], args:
 		if so == 0 {
 			return false;
 		}
-		let dup: i64 = duplicate(so, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_TRANSFER);
+		let dup: i64 = duplicate(so, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
 		if dup < 0 {
 			return false;
 		}
 		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
 		let task: u64 = match client.run(name_str, args_str, cwd_str, &(dup as u64)) {
 			Some(Ok(started)) => started.task,
-			_ => return false,
+			Some(Err(_)) | None => return false,
 		};
 		jobs.run_foreground_tracked(Job { proc: task, name: name.to_vec() });
 		true
