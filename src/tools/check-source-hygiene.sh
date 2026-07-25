@@ -102,6 +102,23 @@ if [[ -n "$magic" ]]; then
 	exit 1
 fi
 
+invalid_test_modules="$({
+	find src/kernel -type f -path '*/tests.rs' ! -path 'src/kernel/tests.rs' -print0 |
+		while IFS= read -r -d '' tests; do
+			module_dir="$(dirname "$tests")"
+			module_name="$(basename "$module_dir")"
+			parent_dir="$(dirname "$module_dir")"
+			if [[ ! -f "$module_dir/mod.rs" || -f "$parent_dir/$module_name.rs" ]]; then
+				printf '%s\n' "$module_dir"
+			fi
+		done
+} | sort -u)"
+if [[ -n "$invalid_test_modules" ]]; then
+	echo "source-hygiene: every non-root kernel tests.rs module requires mod.rs without a sibling module file:" >&2
+	printf '%s\n' "$invalid_test_modules" >&2
+	exit 1
+fi
+
 tracked="$(git ls-files | grep -E "$path_pattern" || true)"
 if [[ -n "$tracked" ]]; then
 	echo "source-hygiene: generated artifacts are tracked by Git:" >&2
