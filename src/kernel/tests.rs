@@ -1538,38 +1538,6 @@ fn concurrent_maps_on_shared_tables_strand_nothing() {
 	frame::deallocate(FRAMES[1].load(Ordering::SeqCst));
 }
 
-tagged_test!(map_degrades_to_error_when_out_of_frames, [Memory]);
-fn map_degrades_to_error_when_out_of_frames() {
-	use mem::frame;
-	use object::address_space::AddressSpace;
-	// A userspace-triggered map must degrade, not panic, when the frame pool is
-	// empty: the walk cannot allocate an intermediate page table and returns an
-	// error the map syscalls turn into ERR_NO_MEMORY. A fresh address space has an
-	// empty user half, so mapping a low (user) VA is guaranteed to need a new
-	// intermediate table.
-	let space = AddressSpace::create().expect("a fresh address space");
-	let leaf = frame::allocate().expect("one frame to point the leaf at");
-	// Drain the rest of the pool. Reserve the holding vector first so it never
-	// grows (mapping a heap page) inside the drained window.
-	let mut held: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-	held.reserve(frame::free_count() + 8);
-	while let Some(f) = frame::allocate() {
-		held.push(f);
-	}
-	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER | arch::paging::NO_EXECUTE;
-	let result = space.try_map(0x1_0000, leaf, flags);
-	// Refill the pool BEFORE asserting, so a failed assertion never leaves it
-	// drained. `leaf` stays ours until the end.
-	for f in held {
-		frame::deallocate(f);
-	}
-	assert!(result.is_err(), "an out-of-frames map must fail cleanly, not panic");
-	// The failed map left nothing behind: the same VA maps fine now the pool is back.
-	space.try_map(0x1_0000, leaf, flags).expect("the map succeeds once frames are available");
-	space.unmap(0x1_0000);
-	frame::deallocate(leaf);
-}
-
 tagged_test!(paging_map_unmap, [Memory]);
 fn paging_map_unmap() {
 	let phys = mem::frame::allocate().expect("scratch frame");
@@ -1589,18 +1557,6 @@ fn paging_map_unmap() {
 	let unmapped = arch::paging::unmap_page(virt).expect("was mapped");
 	assert_eq!(unmapped, phys);
 	mem::frame::deallocate(phys);
-}
-
-tagged_test!(heap_box_vec, [Memory, Smoke]);
-fn heap_box_vec() {
-	let boxed = alloc::boxed::Box::new(42u64);
-	assert_eq!(*boxed, 42);
-	let mut v = alloc::vec::Vec::new();
-	for i in 0u64..1000 {
-		v.push(i);
-	}
-	let sum: u64 = v.iter().sum();
-	assert_eq!(sum, 1000 * 999 / 2);
 }
 
 tagged_test!(timer_ticks_advance, [Kernel]);

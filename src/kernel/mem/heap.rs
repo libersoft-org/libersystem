@@ -256,3 +256,6 @@ unsafe impl GlobalAlloc for LockedHeap {
 const fn align_up(value: usize, align: usize) -> usize {
 	(value + align - 1) & !(align - 1)
 }
+
+#[cfg(test)]
+mod tests;

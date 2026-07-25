@@ -73,3 +73,6 @@ impl Drop for AddressSpace {
 }
 
 impl_kernel_object!(AddressSpace, AddressSpace);
+
+#[cfg(test)]
+mod tests;
