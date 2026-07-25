@@ -6,6 +6,7 @@
 // SystemManager spawn and the supervise ladder) stay in main.rs.
 
 use super::*;
+use crate::object::tests::TestObject;
 use alloc::vec::Vec;
 
 // Userspace (ring 3) page layout for the test: one USER page for the program,
@@ -1062,6 +1063,7 @@ define_test_tags! {
 	Memory => "memory",
 	Mouse => "mouse",
 	Network => "network",
+	Object => "object",
 	Process => "process",
 	ProcessService => "process-service",
 	PermissionService => "permission-service",
@@ -1077,9 +1079,9 @@ define_test_tags! {
 }
 
 pub(crate) struct TaggedTest {
-	name: &'static str,
-	tags: &'static [TestTag],
-	run: fn(),
+	pub(crate) name: &'static str,
+	pub(crate) tags: &'static [TestTag],
+	pub(crate) run: fn(),
 }
 
 impl Testable for TaggedTest {
@@ -1094,16 +1096,15 @@ impl Testable for TaggedTest {
 	}
 }
 
+#[macro_export]
 macro_rules! tagged_test {
 	($(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?]) => {
 		$(#[$attr])*
 		mod $name {
-			use super::*;
-
 			#[test_case]
-			static CASE: TaggedTest = TaggedTest {
+			static CASE: $crate::tests::TaggedTest = $crate::tests::TaggedTest {
 				name: stringify!($name),
-				tags: &[TestTag::$first_tag $(, TestTag::$tag)*],
+				tags: &[$crate::tests::TestTag::$first_tag $(, $crate::tests::TestTag::$tag)*],
 				run: super::$name,
 			};
 		}
@@ -1676,142 +1677,6 @@ fn smp_all_cores_online() {
 	// the online count must equal the managed core count (and exceed one when
 	// QEMU is given more than a single CPU).
 	assert_eq!(smp::online_count(), smp::cpu_count());
-}
-
-// A minimal kernel object used only to exercise the object/capability core.
-struct TestObject {
-	header: object::ObjectHeader,
-	value: u64,
-}
-
-impl TestObject {
-	fn new(value: u64) -> alloc::sync::Arc<Self> {
-		alloc::sync::Arc::new(Self { header: object::ObjectHeader::new(), value })
-	}
-
-	fn value(&self) -> u64 {
-		self.value
-	}
-}
-
-impl object::KernelObject for TestObject {
-	fn header(&self) -> &object::ObjectHeader {
-		&self.header
-	}
-
-	fn object_type(&self) -> object::ObjectType {
-		object::ObjectType::Event
-	}
-
-	fn as_any(&self) -> &dyn core::any::Any {
-		self
-	}
-
-	fn into_any_arc(self: alloc::sync::Arc<Self>) -> alloc::sync::Arc<dyn core::any::Any + Send + Sync> {
-		self
-	}
-}
-
-tagged_test!(handle_create_lookup_close, [Kernel, Smoke]);
-fn handle_create_lookup_close() {
-	use object::handle::{HandleError, HandleTable};
-	use object::rights::Rights;
-	let mut table = HandleTable::new();
-	let obj = TestObject::new(42);
-	let h = table.insert_object(obj, Rights::READ | Rights::WRITE, 0);
-	assert_eq!(table.len(), 1);
-	let looked = table.lookup(h, Rights::READ).expect("lookup");
-	assert_eq!(looked.as_any().downcast_ref::<TestObject>().unwrap().value(), 42);
-	table.close(h).expect("close");
-	assert_eq!(table.len(), 0);
-	// A closed handle must no longer resolve.
-	assert!(matches!(table.lookup(h, Rights::READ), Err(HandleError::BadHandle)));
-}
-
-tagged_test!(handle_rights_enforced, [Kernel]);
-fn handle_rights_enforced() {
-	use object::handle::{HandleError, HandleTable};
-	use object::rights::Rights;
-	let mut table = HandleTable::new();
-	let h = table.insert_object(TestObject::new(7), Rights::READ, 0);
-	assert!(table.lookup(h, Rights::READ).is_ok());
-	// A right the handle does not carry is denied.
-	assert!(matches!(table.lookup(h, Rights::WRITE), Err(HandleError::AccessDenied)));
-}
-
-tagged_test!(handle_duplicate_attenuates, [Kernel]);
-fn handle_duplicate_attenuates() {
-	use object::handle::{HandleError, HandleTable};
-	use object::rights::Rights;
-	let mut table = HandleTable::new();
-	let h = table.insert_object(TestObject::new(1), Rights::READ | Rights::WRITE | Rights::DUPLICATE, 0);
-	// A duplicate may drop rights...
-	let weak = table.duplicate(h, Rights::READ).expect("duplicate");
-	assert!(table.lookup(weak, Rights::READ).is_ok());
-	assert!(matches!(table.lookup(weak, Rights::WRITE), Err(HandleError::AccessDenied)));
-	// ...but never gain a right the original lacked.
-	assert!(matches!(table.duplicate(h, Rights::EXECUTE), Err(HandleError::AccessDenied)));
-	// Without the DUPLICATE right, duplication itself is denied.
-	let plain = table.insert_object(TestObject::new(2), Rights::READ, 0);
-	assert!(matches!(table.duplicate(plain, Rights::READ), Err(HandleError::AccessDenied)));
-}
-
-tagged_test!(handle_revocation_invalidates, [Kernel]);
-fn handle_revocation_invalidates() {
-	use object::handle::{HandleError, HandleTable};
-	use object::rights::Rights;
-	let mut table = HandleTable::new();
-	let obj = TestObject::new(99);
-	let h = table.insert_object(obj.clone(), Rights::READ, 0);
-	assert!(table.lookup(h, Rights::READ).is_ok());
-	// Revoking the object invalidates every existing handle to it at once.
-	obj.header.revoke();
-	assert!(matches!(table.lookup(h, Rights::READ), Err(HandleError::Revoked)));
-}
-
-tagged_test!(handle_type_sealing, [Kernel]);
-fn handle_type_sealing() {
-	use object::ObjectType;
-	use object::handle::{HandleError, HandleTable};
-	use object::rights::Rights;
-	let mut table = HandleTable::new();
-	let h = table.insert_object(TestObject::new(5), Rights::READ, 0);
-	assert!(table.lookup_typed(h, ObjectType::Event, Rights::READ).is_ok());
-	// The same handle cannot be used where a different object type is expected.
-	assert!(matches!(table.lookup_typed(h, ObjectType::Channel, Rights::READ), Err(HandleError::WrongType)));
-}
-
-tagged_test!(handle_refcount_lifetime, [Kernel]);
-fn handle_refcount_lifetime() {
-	use alloc::sync::Arc;
-	use object::handle::HandleTable;
-	use object::rights::Rights;
-	let mut table = HandleTable::new();
-	let obj = TestObject::new(3);
-	assert_eq!(Arc::strong_count(&obj), 1);
-	let h = table.insert_object(obj.clone(), Rights::READ, 0);
-	assert_eq!(Arc::strong_count(&obj), 2);
-	let looked = table.lookup(h, Rights::READ).expect("lookup");
-	assert_eq!(Arc::strong_count(&obj), 3);
-	drop(looked);
-	assert_eq!(Arc::strong_count(&obj), 2);
-	// Closing the handle drops the kernel's last reference held via the table.
-	table.close(h).expect("close");
-	assert_eq!(Arc::strong_count(&obj), 1);
-}
-
-tagged_test!(thread_object_basics, [Process, Smoke]);
-fn thread_object_basics() {
-	use object::address_space::AddressSpace;
-	use object::process::Process;
-	use object::thread::{Thread, ThreadState};
-	use object::{KernelObject, ObjectType};
-	extern "C" fn noop(_arg: u64) {}
-	let process = Process::new(AddressSpace::kernel(), sched::root_domain());
-	let thread = Thread::new(noop, 0, process);
-	assert_eq!(thread.object_type(), ObjectType::Thread);
-	assert_eq!(thread.state(), ThreadState::Ready);
-	assert!(thread.tid() >= 1);
 }
 
 tagged_test!(scheduler_multiplexes_threads, [Scheduler, Smoke]);
@@ -7299,34 +7164,6 @@ fn storage_serves_staged_tool_binary() {
 	let actual = storage_read(b"vol://system/bin/cat.lsexe").expect("the staged tool read should succeed");
 	assert!(actual.len() > 4, "the staged tool should not be empty");
 	assert_eq!(&actual[..4], b"\x7fELF", "the staged tool should be an ELF image");
-}
-
-tagged_test!(event_timer_objects, [Kernel]);
-fn event_timer_objects() {
-	use object::event::Event;
-	use object::timer::Timer;
-	let event = Event::create();
-	assert!(!event.is_signaled());
-	event.signal();
-	assert!(event.is_signaled());
-	event.clear();
-	assert!(!event.is_signaled());
-
-	let timer = Timer::create();
-	// not armed -> never expired
-	assert!(!timer.is_expired());
-	let deadline = arch::apic::ticks() + 2;
-	timer.set(deadline);
-	// bounded wait for the tick counter to reach the deadline
-	let mut spins = 0u64;
-	while !timer.is_expired() {
-		core::hint::spin_loop();
-		spins += 1;
-		assert!(spins < 2_000_000_000, "timer never expired");
-	}
-	assert!(timer.is_expired());
-	timer.cancel();
-	assert!(!timer.is_expired());
 }
 
 tagged_test!(event_timer_syscalls, [Kernel, Syscall]);

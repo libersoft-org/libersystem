@@ -49,3 +49,6 @@ impl Timer {
 }
 
 impl_kernel_object!(Timer, Timer);
+
+#[cfg(test)]
+mod tests;

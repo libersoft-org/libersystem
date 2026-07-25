@@ -21,6 +21,9 @@ pub mod rights;
 pub mod thread;
 pub mod timer;
 
+#[cfg(test)]
+pub(crate) mod tests;
+
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::any::Any;

@@ -186,3 +186,6 @@ impl Drop for Thread {
 }
 
 impl_kernel_object!(Thread, Thread);
+
+#[cfg(test)]
+mod tests;

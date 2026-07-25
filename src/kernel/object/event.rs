@@ -43,3 +43,6 @@ impl Event {
 }
 
 impl_kernel_object!(Event, Event);
+
+#[cfg(test)]
+mod tests;
