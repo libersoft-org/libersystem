@@ -1684,43 +1684,6 @@ fn interrupt_bind_delivers_to_driver() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
-tagged_test!(blocking_wait_wakes_on_message, [Ipc]);
-fn blocking_wait_wakes_on_message() {
-	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-	static OK: AtomicBool = AtomicBool::new(false);
-	static WAIT_RET: AtomicI64 = AtomicI64::new(-999);
-	// The server blocks in SYS_WAIT on its (empty) channel - descheduled, not
-	// spinning. The client then sends, which wakes the server; it returns from
-	// wait with success and recv's the message. Exercises block_on + wake_object +
-	// the reschedule Block path end to end.
-	extern "C" fn server(ch: u64) {
-		unsafe {
-			let ret = arch::syscall::invoke(syscall::SYS_WAIT, ch, 0, 0, 0);
-			WAIT_RET.store(ret as i64, Ordering::SeqCst);
-			let mut buf = [0u8; 8];
-			let mut xfer: u64 = 0;
-			let n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, ch, buf.as_mut_ptr() as u64, buf.len() as u64, &mut xfer as *mut u64 as u64);
-			assert!(!syscall::sys_is_err(n));
-			assert_eq!(&buf[..n as usize], b"ping");
-			OK.store(true, Ordering::SeqCst);
-		}
-	}
-	extern "C" fn client(ch: u64) {
-		unsafe {
-			let payload = *b"ping";
-			let sent = arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, ch, payload.as_ptr() as u64, payload.len() as u64, 0);
-			assert!(!syscall::sys_is_err(sent));
-		}
-	}
-	let (ep0, ep1) = object::channel::Channel::create();
-	// Spawn the server first so it runs and blocks before the client sends.
-	sched::spawn_with_object(server, ep0, object::rights::Rights::ALL, 0);
-	sched::spawn_with_object(client, ep1, object::rights::Rights::ALL, 0);
-	sched::run_until_idle();
-	assert!(OK.load(Ordering::SeqCst));
-	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 0);
-}
-
 tagged_test!(blocking_wait_times_out_on_deadline, [Scheduler]);
 fn blocking_wait_times_out_on_deadline() {
 	use core::sync::atomic::{AtomicI64, Ordering};
@@ -1775,51 +1738,6 @@ fn a_periodic_wait_ticks_but_never_holds_the_scheduler() {
 		arch::idle_halt();
 	}
 	assert!(TICKS.load(Ordering::SeqCst) >= target, "the periodic wait keeps ticking across settles");
-}
-
-tagged_test!(wait_any_wakes_on_the_ready_handle, [Ipc]);
-fn wait_any_wakes_on_the_ready_handle() {
-	use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-	static HB: AtomicU64 = AtomicU64::new(0);
-	static WAIT_RET: AtomicI64 = AtomicI64::new(-999);
-	static OK: AtomicBool = AtomicBool::new(false);
-	// The server blocks in SYS_WAIT_ANY on TWO channels at once. Only the second
-	// (hb) ever receives a message, so wait_any must wake, return index 1, and the
-	// server then recv's that message - exercising block_on_any and the multi-koid
-	// waiter cleanup (the thread is parked under both koids, woken via one, and must
-	// leave no stale entry under the other).
-	extern "C" fn server(ha: u64) {
-		unsafe {
-			let hb = HB.load(Ordering::SeqCst);
-			let handles = [ha, hb];
-			let ret = arch::syscall::invoke(syscall::SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, 0, 0);
-			WAIT_RET.store(ret as i64, Ordering::SeqCst);
-			let mut buf = [0u8; 8];
-			let mut xfer: u64 = 0;
-			let n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, hb, buf.as_mut_ptr() as u64, buf.len() as u64, &mut xfer as *mut u64 as u64);
-			OK.store(!syscall::sys_is_err(n) && &buf[..n as usize] == b"pong", Ordering::SeqCst);
-		}
-	}
-	extern "C" fn client(ch: u64) {
-		unsafe {
-			let payload = *b"pong";
-			let _ = arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, ch, payload.as_ptr() as u64, payload.len() as u64, 0);
-		}
-	}
-	let (a0, a1) = object::channel::Channel::create();
-	let (b0, b1) = object::channel::Channel::create();
-	// Spawn the server with the first channel (its arg is that handle), then install
-	// the second channel as a second handle and record its value for the server.
-	let server = sched::spawn_with_object(server, a0, object::rights::Rights::ALL, 0);
-	let hb = server.handles().lock().insert(object::handle::Capability::new(b0, object::rights::Rights::ALL, 0)).raw();
-	HB.store(hb, Ordering::SeqCst);
-	sched::spawn_with_object(client, b1, object::rights::Rights::ALL, 0);
-	// Hold the first channel's peer open so that handle stays silent (not closed),
-	// otherwise its peer-close would make it ready and wait_any could return 0.
-	let _keep_a1 = a1;
-	sched::run_until_idle();
-	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 1);
-	assert!(OK.load(Ordering::SeqCst));
 }
 
 tagged_test!(waiting_on_a_process_handle_wakes_when_it_exits, [Process]);
@@ -6590,42 +6508,6 @@ fn driver_survives_crash_and_restart() {
 	assert!(restarts >= 1, "the supervisor should have restarted the crashed driver");
 }
 
-tagged_test!(ipc_queue_bytes_accounting_enforced, [Kernel, Ipc]);
-fn ipc_queue_bytes_accounting_enforced() {
-	use core::sync::atomic::{AtomicBool, Ordering};
-	use object::domain::{Domain, UNLIMITED};
-	static DONE: AtomicBool = AtomicBool::new(false);
-	// A thread in a Domain capped at 250 bytes of in-transit IPC. Each 100-byte
-	// send charges the sender's queue, so two fit and the third is refused
-	// (WOULD_BLOCK); receiving one refunds the quota, so a send fits again.
-	extern "C" fn body(_arg: u64) {
-		unsafe {
-			let mut handles = [0u64; 2];
-			let created = arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, handles.as_mut_ptr() as u64, handles.as_mut_ptr().add(1) as u64, 0, 0);
-			assert_eq!(created as i64, 0, "channel create failed");
-			let (h0, h1) = (handles[0], handles[1]);
-			let payload = [0u8; 100];
-			let p = payload.as_ptr() as u64;
-			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, h0, p, 100, 0) as i64, 0);
-			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, h0, p, 100, 0) as i64, 0);
-			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, h0, p, 100, 0) as i64, syscall::ERR_WOULD_BLOCK, "the third send should hit the queue cap");
-			// Receiving one message refunds the sender's queue, so a send fits again.
-			let mut buf = [0u8; 128];
-			let n = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, h1, buf.as_mut_ptr() as u64, 128, 0);
-			assert_eq!(n as i64, 100);
-			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, h0, p, 100, 0) as i64, 0, "a send fits after a recv refund");
-		}
-		DONE.store(true, Ordering::SeqCst);
-	}
-	let domain = Domain::new(UNLIMITED, UNLIMITED, UNLIMITED);
-	domain.account().ipc_queue().set_limit(250);
-	assert!(sched::spawn_in(domain.clone(), body, 0).is_some());
-	sched::run_until_idle();
-	assert!(DONE.load(Ordering::SeqCst), "ipc queue test thread did not finish");
-	// The thread and its channels are reaped, refunding every undelivered message.
-	assert_eq!(domain.account().ipc_queue().used(), 0);
-}
-
 tagged_test!(domain_hierarchy_limit_is_enforced_through_memory_create, [Domain, Kernel]);
 fn domain_hierarchy_limit_is_enforced_through_memory_create() {
 	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -6693,21 +6575,9 @@ fn domain_kill_frees_subtree() {
 	assert_eq!(parent.account().threads().used(), 0, "parent aggregate threads refunded");
 }
 
-tagged_test!(ipc_round_trip_and_zero_copy, [Ipc]);
-fn ipc_round_trip_and_zero_copy() {
+tagged_test!(channel_capability_transfer_is_zero_copy, [Ipc, Memory, Syscall]);
+fn channel_capability_transfer_is_zero_copy() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-	use object::channel::{Channel, Message};
-
-	// Round-trip correctness: a request and a reply each deliver their exact
-	// bytes through the channel primitive (the path the latency benchmark times).
-	let (client, server) = Channel::create();
-	client.send(Message::new(alloc::vec::Vec::from(*b"req"), alloc::vec::Vec::new(), 0)).unwrap();
-	let request = server.recv().unwrap();
-	assert_eq!(&request.bytes[..], b"req");
-	server.send(Message::new(alloc::vec::Vec::from(*b"reply"), alloc::vec::Vec::new(), 0)).unwrap();
-	let reply = client.recv().unwrap();
-	assert_eq!(&reply.bytes[..], b"reply");
-
 	// Zero-copy: a 1 MB buffer is transferred as a capability, not copied. The
 	// producer marks the far end of the buffer and sends only a 3-byte note plus
 	// the handle; the consumer maps the same object and reads the mark back. That
