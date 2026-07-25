@@ -324,3 +324,6 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 	crate::serial_println!("riscv64: unhandled kernel trap - halting");
 	super::halt_loop()
 }
+
+#[cfg(test)]
+mod tests;

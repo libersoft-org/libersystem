@@ -156,3 +156,6 @@ pub fn register(_vector: u8, _handler: HandlerFn) {}
 // The IMSIC is brought up per hart in boot.rs / smp.rs (imsic::init_hart), so there is
 // nothing left to initialize here.
 pub fn init() {}
+
+#[cfg(test)]
+mod tests;

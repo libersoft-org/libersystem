@@ -1178,19 +1178,6 @@ pub(crate) fn test_runner(tests: &[&dyn Testable]) {
 	arch::exit_qemu(true);
 }
 
-tagged_test!(
-	#[cfg(target_arch = "riscv64")]
-	breakpoint_exception_returns,
-	[Kernel, ArchRiscv64]
-);
-#[cfg(target_arch = "riscv64")]
-fn breakpoint_exception_returns() {
-	// reaching the next line proves the trap handler resumed past the ebreak: it decodes
-	// the trapped instruction width (2 bytes for a compressed c.ebreak, else 4) and
-	// advances sepc, the riscv analogue of x86's int3 breakpoint round-trip.
-	unsafe { core::arch::asm!("ebreak") };
-}
-
 tagged_test!(elf_dyn_applies_relative_relocations_and_rejects_symbols, [Dynamic, DynamicReject, Memory, Process]);
 fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 	use crate::elf::ElfError;
@@ -1813,78 +1800,6 @@ fn gicv2m_msi_inventory_reports_the_timer_and_msi_vectors() {
 	// makes it appear in the inventory as an MSI vector owned by that device index.
 	let table = frame::allocate().expect("a frame for the fake MSI-X table");
 	let vector = arch::interrupts::acquire_msi(table, 0, 9).expect("acquire an MSI SPI");
-	let mut seen = false;
-	for i in 1..arch::interrupts::irq_info_len() {
-		if let Some(info) = arch::interrupts::irq_info(i)
-			&& info.vector == vector as u32
-		{
-			assert_eq!(info.kind, abi::IRQ_KIND_MSI, "an acquired vector reports as MSI");
-			assert_eq!(info.device, 9, "the inventory records the owning device index");
-			seen = true;
-		}
-	}
-	assert!(seen, "the acquired MSI vector appears in the inventory");
-	arch::interrupts::unbind(vector);
-	frame::deallocate(table);
-}
-
-// The riscv64 counterpart of the x86 INTx and aarch64 GICv2m interrupt tests: on riscv
-// (QEMU `virt,aia=aplic-imsic`) every device interrupt is an MSI-X-delivered EID pended in
-// a hart's IMSIC S-file (imsic.rs) - there is no bindable wired vector. These exercise the
-// AIA/IMSIC MSI path directly: acquire an EID, bind a driver Interrupt, dispatch the EID.
-tagged_test!(
-	#[cfg(target_arch = "riscv64")]
-	imsic_msi_binds_and_dispatch_signals_the_driver,
-	[Drivers, ArchRiscv64]
-);
-#[cfg(target_arch = "riscv64")]
-fn imsic_msi_binds_and_dispatch_signals_the_driver() {
-	use mem::frame;
-	use object::interrupt::Interrupt;
-	// A frame stands in for a device's MSI-X table: acquire_msi programs entry 0 into it
-	// (message address = the acquiring hart's IMSIC S-file, message data = the EID).
-	let table = frame::allocate().expect("a frame for the fake MSI-X table");
-	// Acquire a per-device MSI vector (an IMSIC EID). `dest` (the x86 LAPIC target) is
-	// unused on riscv; `owner` is a fake discovered-device index.
-	let vector = arch::interrupts::acquire_msi(table, 0, 3).expect("acquire_msi hands out a free EID");
-	// Bind a driver Interrupt to the vector; a second live bind is refused.
-	let intr = Interrupt::new(vector);
-	assert!(arch::interrupts::bind_msi(vector, &intr), "the first bind succeeds");
-	assert!(arch::interrupts::is_bound(vector), "the vector reads as bound");
-	let intr2 = Interrupt::new(vector);
-	assert!(!arch::interrupts::bind_msi(vector, &intr2), "a second live bind is refused");
-	// Dispatching the EID - what imsic::handle_external does when the EID fires - marks the
-	// bound Interrupt pending (its wait readiness).
-	assert!(!intr.is_pending(), "not pending before the EID fires");
-	assert!(arch::interrupts::dispatch_msi(vector as u32), "dispatch_msi claims its own EID");
-	assert!(intr.is_pending(), "dispatch signalled the bound Interrupt");
-	// EID 0 is "no interrupt" - outside the MSI window - so it dispatches to no one.
-	assert!(!arch::interrupts::dispatch_msi(0), "EID 0 is not one of the device MSI EIDs");
-	// Unbinding frees the slot for re-use.
-	arch::interrupts::unbind(vector);
-	assert!(!arch::interrupts::is_bound(vector), "unbind drops the binding");
-	frame::deallocate(table);
-}
-
-tagged_test!(
-	#[cfg(target_arch = "riscv64")]
-	imsic_msi_inventory_reports_the_timer_and_msi_vectors,
-	[Drivers, ArchRiscv64]
-);
-#[cfg(target_arch = "riscv64")]
-fn imsic_msi_inventory_reports_the_timer_and_msi_vectors() {
-	use mem::frame;
-	// Index 0 of the riscv IRQ inventory (what `lsirq` reads) is the kernel's own S-mode
-	// timer interrupt (SCAUSE code 5), always in use and reported as a fixed vector - the
-	// riscv analogue of x86's fixed LAPIC-timer entry and aarch64's timer PPI.
-	let timer = arch::interrupts::irq_info(0).expect("the inventory has a timer entry");
-	assert_eq!(timer.kind, abi::IRQ_KIND_FIXED, "index 0 is the fixed S-mode timer");
-	assert_eq!(timer.vector, 5, "the riscv timer is the S-mode timer interrupt (scause code 5)");
-	assert_eq!(timer.bound, 1, "the timer is always the kernel's own");
-	// After the timer, each entry is an IMSIC MSI EID. Acquiring one for a fake device
-	// makes it appear in the inventory as an MSI vector owned by that device index.
-	let table = frame::allocate().expect("a frame for the fake MSI-X table");
-	let vector = arch::interrupts::acquire_msi(table, 0, 9).expect("acquire an MSI EID");
 	let mut seen = false;
 	for i in 1..arch::interrupts::irq_info_len() {
 		if let Some(info) = arch::interrupts::irq_info(i)
