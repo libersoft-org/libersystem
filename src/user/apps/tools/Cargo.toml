@@ -281,6 +281,7 @@ volume-client-provider = { path = "../../libs/clients/volume-client-provider", o
 
 bmp = { path = "../../libs/image/bmp" }
 keys = { path = "../../libs/input/keys" }
+lico = { path = "../../libs/terminal/lico" }
 imgconv = { path = "../../libs/image/imgconv" }
 pix = { path = "../../libs/image/pix" }
 png = { path = "../../libs/image/png" }

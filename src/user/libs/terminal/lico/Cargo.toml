@@ -1,0 +1,8 @@
+[package]
+name = "lico"
+edition = "2024"
+description = "Shared bounded terminal interaction core for LiberCommander"
+
+[features]
+default = []
+shared-image = []

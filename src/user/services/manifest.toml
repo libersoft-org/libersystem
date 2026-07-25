@@ -116,6 +116,10 @@ owner = "keys"
 path = "user/libs/input/keys"
 
 [[sources]]
+owner = "lico"
+path = "user/libs/terminal/lico"
+
+[[sources]]
 owner = "log-client"
 path = "user/libs/clients/log-client"
 
@@ -1509,6 +1513,13 @@ name = "keys"
 owner = "keys"
 destination = "lib/input/keys.lslib"
 features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "lico"
+owner = "lico"
+destination = "lib/terminal/lico.lslib"
+features = ["shared-image"]
 providers = ["lsrt"]
 
 [[libraries]]
