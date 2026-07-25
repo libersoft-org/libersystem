@@ -1,5 +1,6 @@
 # Bugs / changes
 
+- init.pkg is not on vol://system/ ... find out why?
 - tests are taking too long after every small task - optimization needed
 - make boot faster (multicore + other optimizations)
 - "exit" command gracefully stops everything and then halts, but poweroff doesn't... do the same gracefullness for poweroff

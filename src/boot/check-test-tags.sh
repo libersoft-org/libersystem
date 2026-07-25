@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT_TESTS="$ROOT/kernel/tests.rs"
-mapfile -t TEST_FILES < <(find "$ROOT/kernel" -type f -name tests.rs -print | sort)
+mapfile -t TEST_FILES < <(find "$ROOT/kernel" -type f \( -name tests.rs -o -path "$ROOT/kernel/test_suites/*.rs" \) -print | sort)
 count="$(grep -h '#\[test_case\]' "${TEST_FILES[@]}" | wc -l)"
 if [[ "$count" -ne 1 ]]; then
 	echo "test tag check: expected only tagged_test!'s generated #[test_case], found $count occurrences" >&2
