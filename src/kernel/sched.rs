@@ -767,3 +767,6 @@ fn stash_prev(inner: &mut CpuSchedInner, sched: &CpuSched, prev: Option<Arc<Thre
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests;
