@@ -320,3 +320,6 @@ pub fn init() {
 	idt::set_gate(TIMER_VECTOR as usize, timer);
 	idt::set_gate(SPURIOUS_VECTOR as usize, spurious);
 }
+
+#[cfg(test)]
+mod tests;

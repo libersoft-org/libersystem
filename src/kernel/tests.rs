@@ -1061,6 +1061,7 @@ define_test_tags! {
 	Image => "image",
 	Imgview => "imgview",
 	Input => "input",
+	Interrupt => "interrupt",
 	Ipc => "ipc",
 	Kernel => "kernel",
 	Memory => "memory",
@@ -1426,25 +1427,6 @@ fn timer_ticks_advance() {
 		core::hint::spin_loop();
 	}
 	assert!(arch::apic::ticks() > start);
-}
-
-tagged_test!(
-	#[cfg(target_arch = "x86_64")]
-	handler_registration_dispatch,
-	[Kernel, ArchX86_64]
-);
-#[cfg(target_arch = "x86_64")]
-fn handler_registration_dispatch() {
-	use core::sync::atomic::{AtomicBool, Ordering};
-	static FIRED: AtomicBool = AtomicBool::new(false);
-	fn handler(_vector: u8) {
-		FIRED.store(true, Ordering::SeqCst);
-	}
-	// Register on an unused device vector and trigger it with a software
-	// interrupt: proves registration and dispatch wiring without a device.
-	arch::interrupts::register(47, handler);
-	unsafe { core::arch::asm!("int 0x2f", options(nomem, nostack)) };
-	assert!(FIRED.load(Ordering::SeqCst));
 }
 
 tagged_test!(smp_all_cores_online, [Kernel, Smoke]);
