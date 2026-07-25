@@ -212,7 +212,7 @@ board-specific real-hardware support remains later work.
 - [ ] [M124 - Audio player (streaming decoders over AudioService)](M0124.md)
 - [x] [M125 - Native executable artifacts (`.lsexe`)](M0125.md)
 - [x] [M126 - Image conversion tool (`imgconv`)](M0126.md)
-- [ ] [M127 - Userspace source and system-volume layout cleanup](M0127.md)
+- [x] [M127 - Userspace source and system-volume layout cleanup](M0127.md)
 - [ ] [M128 - Declarative driver binding and lifecycle core](M0128.md)
 - [ ] [M129 - Universal standards-based driver set](M0129.md)
 - [ ] [M130 - LiberCommander (`lico`, `licoedit`, `licoview`)](M0130.md)
