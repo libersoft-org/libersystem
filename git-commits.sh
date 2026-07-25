@@ -64,24 +64,60 @@ commit_stats() {
 total_added=0
 total_removed=0
 listed_commits=0
+removed_width=7
+added_width=5
+net_width=3
+commit_ids=()
+commit_messages=()
+commit_removed=()
+commit_added=()
+commit_net=()
 commit_args=(--reverse)
 if [[ -n "$commit_count" ]]; then
 	commit_args+=(--max-count="$commit_count")
 fi
 
-printf '%-7s %-50s %s %s %s\n' "Commit" "Message" "Removed" "Added" "Net"
-printf '%-7s %-50s %s %s %s\n' "-------" "--------------------------------------------------" "-------" "-----" "---"
+separator() {
+	printf '%*s' "$1" '' | tr ' ' '-'
+}
 
 while IFS= read -r commit; do
 	read -r added removed < <(commit_stats "$commit")
+	commit_id="$(git show -s --format=%h "$commit")"
 	message="$(truncate_message "$(git show -s --format=%s "$commit")")"
 	net=$((added - removed))
+	removed_text="-$removed"
+	added_text="+$added"
+	printf -v net_text '%+d' "$net"
 	total_added=$((total_added + added))
 	total_removed=$((total_removed + removed))
 	listed_commits=$((listed_commits + 1))
+	commit_ids+=("$commit_id")
+	commit_messages+=("$message")
+	commit_removed+=("$removed_text")
+	commit_added+=("$added_text")
+	commit_net+=("$net_text")
 
-	printf '%-7s %-50s %s-%d%s %s+%d%s %+d\n' "$(git show -s --format=%h "$commit")" "$message" "$RED" "$removed" "$RESET" "$GREEN" "$added" "$RESET" "$net"
+	if ((${#removed_text} > removed_width)); then
+		removed_width=${#removed_text}
+	fi
+	if ((${#added_text} > added_width)); then
+		added_width=${#added_text}
+	fi
+	if ((${#net_text} > net_width)); then
+		net_width=${#net_text}
+	fi
 done < <(git rev-list "${commit_args[@]}" HEAD)
+
+printf '%-7s %-50s %*s %*s %*s\n' "Commit" "Message" "$removed_width" "Removed" "$added_width" "Added" "$net_width" "Net"
+printf '%-7s %-50s %s %s %s\n' "-------" "--------------------------------------------------" "$(separator "$removed_width")" "$(separator "$added_width")" "$(separator "$net_width")"
+
+for index in "${!commit_ids[@]}"; do
+	printf '%-7s %-50s ' "${commit_ids[index]}" "${commit_messages[index]}"
+	printf '%s%*s%s ' "$RED" "$removed_width" "${commit_removed[index]}" "$RESET"
+	printf '%s%*s%s ' "$GREEN" "$added_width" "${commit_added[index]}" "$RESET"
+	printf '%*s\n' "$net_width" "${commit_net[index]}"
+done
 
 total_net=$((total_added - total_removed))
 
