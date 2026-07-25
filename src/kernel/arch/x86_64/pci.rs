@@ -87,3 +87,6 @@ pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
 pub fn msix_enable(bus: u8, dev: u8, func: u8, cap: u16) {
 	common::msix_enable::<Access>(bus, dev, func, cap);
 }
+
+#[cfg(test)]
+mod tests;
