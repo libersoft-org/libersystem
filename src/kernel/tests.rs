@@ -1051,6 +1051,7 @@ define_test_tags! {
 	Boot => "boot",
 	Channel => "channel",
 	Console => "console",
+	Dma => "dma",
 	Display => "display",
 	Drivers => "drivers",
 	Dynamic => "dynamic",
@@ -1415,40 +1416,6 @@ const fn relative_relocation_type() -> u32 {
 const fn import_relocation_type() -> u32 {
 	TEST_IMPORT_RELOCATION
 }
-tagged_test!(contiguous_frames_and_dma_spans, [Memory, Drivers]);
-fn contiguous_frames_and_dma_spans() {
-	use mem::frame::{self, PAGE_SIZE};
-	use object::domain::Domain;
-	// The contiguous-run allocator: a multi-page allocation is one physical span,
-	// freeing re-coalesces it, and a DmaBuffer built on it reports strictly
-	// consecutive frames - the property virtqueue rings, whole-request block data
-	// stages and jumbo frames stand on.
-	let base = frame::allocate_contiguous(64).expect("a 256 kB span");
-	// the span is really ours page by page: freeing it and re-fitting a LARGER
-	// span still succeeds (coalescing reassembled the run rather than splitting it)
-	for i in 0..64u64 {
-		frame::deallocate(base + i * PAGE_SIZE);
-	}
-	let again = frame::allocate_contiguous(128).expect("a 512 kB span after coalescing");
-	for i in 0..128u64 {
-		frame::deallocate(again + i * PAGE_SIZE);
-	}
-	// a DmaBuffer's frames are consecutive, so a device sees one run
-	let domain = Domain::new(1 << 24, 8, 4);
-	let dma = match object::dma_buffer::DmaBuffer::create_in(&domain, 6 * PAGE_SIZE as usize) {
-		Ok(d) => d,
-		Err(_) => panic!("a 6-page DMA buffer should allocate"),
-	};
-	let frames = dma.frames();
-	assert_eq!(frames.len(), 6);
-	for pair in frames.windows(2) {
-		assert_eq!(pair[1], pair[0] + PAGE_SIZE, "DMA frames are physically contiguous");
-	}
-	assert_eq!(dma.phys_base(), frames[0]);
-	drop(dma);
-	assert_eq!(domain.account().dma().used(), 0, "the DMA charge is refunded");
-}
-
 tagged_test!(timer_ticks_advance, [Kernel]);
 fn timer_ticks_advance() {
 	// Interrupts are enabled by kmain before the tests run, so the periodic

@@ -1,5 +1,7 @@
 # Bugs / changes
 
+- tests are taking too long after every small task - optimization needed
+- make boot faster (multicore + other optimizations)
 - "exit" command gracefully stops everything and then halts, but poweroff doesn't... do the same gracefullness for poweroff
 - "ps -i" - escape doesn't work (both terminal console and directly using keyboard, "q" works well on both)
 - "ps -i" - it doesn't show up CPU cores usage
@@ -12,8 +14,6 @@
 - add "ls" parameters (filters like *.txt etc.)
 - kernel/tests.rs - too big - atomize
 - Native compilers - wasm
-- make boot faster (multicore + other optimizations)
-- tests are taking too long after every small task - optimization needed
 - why there is a "help" command again when it was deleted already?
 - commands.rs shows up the list of builtin shell commands - some of them should be separated binaries
 - mountpoints as mount://

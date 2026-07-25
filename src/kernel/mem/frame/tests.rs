@@ -32,3 +32,15 @@ fn the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free() {
 	}
 	assert_eq!(free_count(), before, "the pool round-trips exactly");
 }
+
+crate::tagged_test!(contiguous_frame_runs_recoalesce, [Frame, Memory]);
+fn contiguous_frame_runs_recoalesce() {
+	let base = allocate_contiguous(64).expect("a 256 kB span");
+	for index in 0..64u64 {
+		deallocate(base + index * PAGE_SIZE);
+	}
+	let again = allocate_contiguous(128).expect("a 512 kB span after coalescing");
+	for index in 0..128u64 {
+		deallocate(again + index * PAGE_SIZE);
+	}
+}

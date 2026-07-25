@@ -6,10 +6,8 @@
 // is a distinct, separately capped resource (the anti-DoS rule for drivers) - and
 // the frames are freed and the quota refunded when the last reference drops.
 //
-// The MVP allocates frame by frame (not guaranteed physically contiguous). A
-// single-page buffer is trivially contiguous, and virtio's scatter-gather rings
-// consume a per-page physical list, so contiguous multi-page allocation is a
-// later refinement.
+// Every buffer uses one physically contiguous frame run, so a device receives a
+// single physical span for a virtqueue ring, block-data stage or jumbo frame.
 
 #![allow(dead_code)]
 
@@ -105,3 +103,6 @@ impl Drop for DmaBuffer {
 		self.domain.uncharge_dma(self.size as u64);
 	}
 }
+
+#[cfg(test)]
+mod tests;
